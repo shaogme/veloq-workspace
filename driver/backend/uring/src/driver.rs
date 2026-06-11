@@ -356,28 +356,8 @@ impl<'a> Driver for UringDriver<'a> {
         };
         let op: UringOp = op;
         let strategy = op.vtable.strategy;
-        if strategy == crate::op::SubmissionStrategy::BackgroundOnly {
-            *op_in = Some(op);
-            return DriverSubmitResult::failed(
-                UringError::Unsupported.report(
-                    "uring.driver.submit",
-                    "background op cannot be submitted normally",
-                ),
-                SubmitStatus::Void,
-            );
-        }
 
         match strategy {
-            crate::op::SubmissionStrategy::BackgroundOnly => DriverSubmitResult::failed(
-                UringError::InvalidState
-                    .report(
-                        "driver.submit",
-                        "background strategy reached normal submit path",
-                    )
-                    .push_ctx("scope", "uring.driver.submit")
-                    .attach_note("background strategy reached normal submit path"),
-                SubmitStatus::Void,
-            ),
             crate::op::SubmissionStrategy::SubmitSqe => self.submit_sqe_internal(token, op, op_in),
             crate::op::SubmissionStrategy::SoftwareTimer => {
                 self.submit_timer_internal(token, op, op_in)

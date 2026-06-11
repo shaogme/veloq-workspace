@@ -239,6 +239,31 @@ impl<'a> UringDriver<'a> {
         Ok(())
     }
 
+    pub(crate) fn unregister_close_owned_fd(&mut self, fd: IoFd) -> UringResult<()> {
+        if !self.file_table_initialized {
+            return Ok(());
+        }
+        let idx = fd.fixed_index();
+        let index = idx as usize;
+        if index >= self.registered_files.len() {
+            return Ok(());
+        }
+        if self.file_generations.get(index).copied() != Some(fd.generation()) {
+            return Ok(());
+        }
+        let Some(entry) = self.registered_files[index].take() else {
+            return Ok(());
+        };
+        if let Err(e) = self.ring.submitter().register_files_update(idx, &[-1]) {
+            self.registered_files[index] = Some(entry);
+            return Err(UringError::Registration.io_report("driver.unregister_close_owned_fd", e));
+        }
+        self.free_file_slots.push(idx);
+        Self::advance_file_generation(&mut self.file_generations[index]);
+        let _ = std::mem::ManuallyDrop::new(entry);
+        Ok(())
+    }
+
     pub(crate) fn replace_registered_fixed_fd(
         &mut self,
         fixed_fd: IoFd,

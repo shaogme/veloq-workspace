@@ -54,8 +54,6 @@ pub(crate) enum SubmissionStrategy {
     SubmitSqe,
     /// Handled by software timer wheel (no SQE submitted)
     SoftwareTimer,
-    /// Only for background operations (e.g. Close)
-    BackgroundOnly,
 }
 
 pub(crate) struct OpVTable {

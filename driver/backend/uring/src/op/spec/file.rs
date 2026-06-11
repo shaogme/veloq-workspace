@@ -146,7 +146,7 @@ impl UringOpSpec for Close {
     type Completion = usize;
 
     const PAYLOAD_KIND: OpKind = OpKind::Close;
-    const STRATEGY: SubmissionStrategy = SubmissionStrategy::BackgroundOnly;
+    const STRATEGY: SubmissionStrategy = SubmissionStrategy::SubmitSqe;
 
     fn new_kernel_payload(user: &Self) -> Self::KernelPayload {
         payload::kernel_ref(user)

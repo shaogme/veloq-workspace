@@ -158,6 +158,19 @@ pub(crate) unsafe fn make_sqe_close(
     driver: &mut UringDriver,
     _token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
+    let idx = close_op.fd.fixed_index() as usize;
+    if let Some(crate::driver::RegisteredFileEntry::BorrowedFd { .. }) =
+        driver.registered_files.get(idx).and_then(|e| e.as_ref())
+    {
+        return Err(UringError::InvalidInput
+            .report(
+                "uring.op.submit.make_sqe_close",
+                "Close is only valid for owned registered file descriptors",
+            )
+            .push_ctx("scope", "uring.op.submit.make_sqe_close")
+            .with_ctx("fd_fixed_index", close_op.fd.fixed_index())
+            .attach_note("borrowed fd Close rejected"));
+    }
     let fixed_fd = resolve_any_fd(
         &driver.registered_files,
         &driver.file_generations,

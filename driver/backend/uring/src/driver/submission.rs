@@ -187,10 +187,6 @@ impl<'a> UringDriver<'a> {
                     ))
                 }
             }
-            _ => Err(UringError::Unsupported.report(
-                "driver.submit_from_slot_raw.strategy",
-                "Unsupported strategy for slot submission",
-            )),
         }
     }
 

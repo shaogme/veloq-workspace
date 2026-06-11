@@ -8,7 +8,8 @@ use tracing::{debug, error, trace, warn};
 use crate::diagnostics::UringCompletionDiagnostics;
 use crate::driver::{PendingCancel, UringDriver};
 use crate::error::{UringDriverResult, UringError, UringResult, uring_report_to_event_res};
-use crate::op::Slot;
+use crate::op::{Slot, UringUserPayload};
+use veloq_driver_core::IoFd;
 use veloq_driver_core::driver::{
     CancelCompletionId, CancelMode, CompletionAnomaly, CompletionBackend, CompletionBackendHooks,
     CompletionCleanupGuard, CompletionControl, CompletionEnvelope, CompletionFlowExt,
@@ -57,6 +58,7 @@ struct UringPostCompletionEffects {
     resubmit_waker: bool,
     flush_backlog: bool,
     cancel_enoent: Vec<(CancelCompletionId, PendingCancel, RawCompletion)>,
+    close_unregister: Vec<IoFd>,
 }
 
 enum UringBackendEffect {
@@ -68,6 +70,9 @@ enum UringBackendEffect {
         cancel_id: CancelCompletionId,
         request: PendingCancel,
         raw: RawCompletion,
+    },
+    CloseCompleted {
+        fd: IoFd,
     },
 }
 
@@ -287,6 +292,9 @@ impl CompletionBackendHooks<crate::op::UringSlotSpec> for UringCompletionHooks<'
             } => {
                 self.post.cancel_enoent.push((cancel_id, request, raw));
             }
+            UringBackendEffect::CloseCompleted { fd } => {
+                self.post.close_unregister.push(fd);
+            }
         }
     }
 }
@@ -455,6 +463,10 @@ impl<'a> UringDriver<'a> {
             self.record_cancel_enoent_if_target_active(cancel_id, request, raw)?;
         }
 
+        for fd in post.close_unregister {
+            self.unregister_close_owned_fd(fd)?;
+        }
+
         if post.rebuild_waker {
             self.completion_diagnostics.backend().inc_waker_rebuild();
             self.rebuild_waker_fd()
@@ -552,6 +564,16 @@ fn complete_kernel_waiting_slot(
         drop(detail);
         return lost_completed_slot_completion(completed, raw, cleanup);
     };
+
+    let effect = if final_res.is_ok() {
+        match &payload {
+            UringUserPayload::Close(close) => UringBackendEffect::CloseCompleted { fd: close.fd },
+            _ => UringBackendEffect::None,
+        }
+    } else {
+        UringBackendEffect::None
+    };
+
     if detail.is_none()
         && let Err(err) = final_res
     {
@@ -564,7 +586,7 @@ fn complete_kernel_waiting_slot(
         payload,
         detail,
         cleanup,
-        effect: UringBackendEffect::None,
+        effect,
     }
 }
 
