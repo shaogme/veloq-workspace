@@ -13,7 +13,7 @@ use crate::utils::storage::{StateInt, StateLock, StateWakerQueue, Storage};
 
 // --- 系统级同步原语 (WaitOnAddress / Futex) ---
 
-mod sys {
+pub(crate) mod sys {
     use std::sync::atomic::AtomicU32;
     use std::time::Duration;
 

@@ -1,10 +1,17 @@
 use crate::runtime::RuntimeSharedBase;
+use crate::runtime::primitives::sys;
 use crate::task::{ScopeRef, SendTaskRef, TaskHandleRef};
-use crate::utils::storage::{StateInt, StateLock, StateOptionPtr, Storage, ThreadSafeStorage};
+use crate::utils::storage::{
+    AtomicOptionPtr, StateInt, StateLock, StateOptionPtr, Storage, ThreadSafeStorage,
+};
 use std::cell::UnsafeCell;
+use std::hint::spin_loop;
+use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
-use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::{RawWaker, RawWakerVTable, Waker};
+use std::thread::yield_now;
 use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 
 pub const STATE_COMPLETED: usize = 1 << 0;
@@ -14,12 +21,126 @@ pub const STATE_CANCELLED: usize = 1 << 3;
 pub const STATE_POLLING: usize = 1 << 4;
 pub const STATE_WOKEN: usize = 1 << 5;
 pub const STATE_PINNED: usize = 1 << 6;
+const WAKE_TOKEN_ALIVE: u32 = 1 << 0;
+const WAKE_TOKEN_ACTIVE_SHIFT: u32 = 1;
+const WAKE_TOKEN_ACTIVE_UNIT: u32 = 1 << WAKE_TOKEN_ACTIVE_SHIFT;
+const SPIN_LIMIT: u32 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PollStatus {
     Proceed,
     Yield,
     Complete,
+}
+
+pub struct TaskWakeToken<S: Storage> {
+    state: AtomicU32,
+    header: AtomicOptionPtr<GenericTaskHeader<S>>,
+    marker: std::marker::PhantomData<fn() -> S>,
+}
+
+struct TaskWakeGuard<'a, S: Storage> {
+    token: &'a TaskWakeToken<S>,
+}
+
+impl<S: Storage> TaskWakeToken<S> {
+    pub fn new() -> Self {
+        Self {
+            state: AtomicU32::new(WAKE_TOKEN_ALIVE),
+            header: AtomicOptionPtr::new(None),
+            marker: std::marker::PhantomData,
+        }
+    }
+
+    #[inline]
+    pub fn bind_header(&self, header: NonNull<GenericTaskHeader<S>>) {
+        let header_ptr = Some(header);
+        let current = self.header.load(Ordering::Acquire);
+        debug_assert!(current.is_none() || current == header_ptr);
+        self.header.store(header_ptr, Ordering::Release);
+    }
+
+    #[inline]
+    fn header(&self) -> Option<&GenericTaskHeader<S>> {
+        if self.state.load(Ordering::Acquire) & WAKE_TOKEN_ALIVE == 0 {
+            return None;
+        }
+
+        let header = self.header.load(Ordering::Acquire)?;
+        Some(unsafe { header.as_ref() })
+    }
+
+    #[inline]
+    fn try_acquire(&self) -> Option<TaskWakeGuard<'_, S>> {
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            if state & WAKE_TOKEN_ALIVE == 0 {
+                return None;
+            }
+
+            match self.state.compare_exchange_weak(
+                state,
+                state + WAKE_TOKEN_ACTIVE_UNIT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(TaskWakeGuard { token: self }),
+                Err(actual) => {
+                    state = actual;
+                    spin_loop();
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn wake_impl(&self) {
+        let Some(_guard) = self.try_acquire() else {
+            return;
+        };
+
+        let Some(header) = self.header() else {
+            return;
+        };
+
+        header.wake_by_ref();
+    }
+
+    #[inline]
+    fn deactivate_and_wait(&self) {
+        let _prev = self.state.fetch_and(!WAKE_TOKEN_ALIVE, Ordering::AcqRel);
+        let mut spin_count = 0;
+        loop {
+            let curr = self.state.load(Ordering::Acquire);
+            if curr == 0 {
+                break;
+            }
+
+            if spin_count < SPIN_LIMIT {
+                spin_loop();
+                spin_count += 1;
+            } else if spin_count == SPIN_LIMIT {
+                yield_now();
+                spin_count += 1;
+            } else {
+                unsafe { sys::wait(&self.state, curr) };
+                spin_count = 0;
+            }
+        }
+        self.header.store(None, Ordering::Release);
+    }
+}
+
+impl<'a, S: Storage> Drop for TaskWakeGuard<'a, S> {
+    fn drop(&mut self) {
+        let prev = self
+            .token
+            .state
+            .fetch_sub(WAKE_TOKEN_ACTIVE_UNIT, Ordering::AcqRel);
+        if prev == WAKE_TOKEN_ACTIVE_UNIT {
+            unsafe { sys::wake_all(&self.token.state) };
+        }
+    }
 }
 
 pub struct TaskVTable<S: Storage> {
@@ -41,6 +162,7 @@ pub struct GenericTaskHeader<S: Storage> {
     state: S::Usize,
     ref_count: S::Usize,
     wakers: S::Lock<LinkedList<WakerAdapter<S>>>,
+    wake_token: Arc<TaskWakeToken<S>>,
     scope: UnsafeCell<ScopeRef<S>>,
     runtime: UnsafeCell<Option<NonNull<RuntimeSharedBase>>>,
     worker_id: S::Usize,
@@ -70,6 +192,7 @@ impl<S: Storage> GenericTaskHeader<S> {
             state: S::Usize::new(0),
             ref_count: S::Usize::new(1),
             wakers: S::Lock::new(LinkedList::new(WakerAdapter::<S>::new())),
+            wake_token: Arc::new(TaskWakeToken::new()),
             scope: UnsafeCell::new(ScopeRef::dummy()),
             runtime: UnsafeCell::new(None),
             worker_id: S::Usize::new(0),
@@ -277,31 +400,23 @@ impl<S: Storage> GenericTaskHeader<S> {
     }
 
     pub fn create_waker(&self, vtable: &'static RawWakerVTable) -> Waker {
-        let data = self as *const Self as *const ();
+        self.wake_token.bind_header(NonNull::from(self));
+        let data = Arc::into_raw(Arc::clone(&self.wake_token)) as *const ();
         unsafe { Waker::from_raw(RawWaker::new(data, vtable)) }
     }
 
-    /// 从 RawWaker 的 data 指针安全（带对齐检查）地转换为 NonNull<Self>
-    ///
     /// # Safety
-    ///
-    /// 调用者必须确保 `data` 是由 `create_waker` 生成的有效指针，且指向的对象尚未被释放。
-    #[inline]
-    pub unsafe fn from_raw_data(data: *const ()) -> NonNull<Self> {
-        debug_assert!(!data.is_null());
-        debug_assert!((data as usize).is_multiple_of(std::mem::align_of::<Self>()));
-        unsafe { NonNull::new_unchecked(data as *mut Self) }
-    }
-
-    /// # Safety
-    /// The `waker` must have been created by a call to `create_waker` on a `TaskHeader` instance,
-    /// and `vtable` must match the vtable used for its creation.
+    /// The `waker` must have been created by a call to `create_waker` on a `TaskHeader`
+    /// instance, and `vtable` must match the vtable used for its creation.
+    /// When the underlying task has already been deactivated and physically dropped, this
+    /// returns `None`.
     pub unsafe fn from_waker<'a>(
         waker: &'a Waker,
         vtable: &'static RawWakerVTable,
     ) -> Option<&'a Self> {
         if std::ptr::eq(waker.vtable(), vtable) {
-            unsafe { Some(&*(waker.data() as *const Self)) }
+            let token = unsafe { &*(waker.data() as *const TaskWakeToken<S>) };
+            token.header()
         } else {
             None
         }
@@ -414,27 +529,61 @@ impl<S: Storage> GenericTaskHeader<S> {
 }
 
 pub static INTRUSIVE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    |data| RawWaker::new(data, &INTRUSIVE_WAKER_VTABLE),
-    |data| unsafe {
-        let header = GenericTaskHeader::<crate::utils::storage::AtomicStorage>::from_raw_data(data);
-        GenericTaskHeader::wake(header);
+    |data| {
+        unsafe {
+            Arc::increment_strong_count(
+                data as *const TaskWakeToken<crate::utils::storage::AtomicStorage>,
+            );
+        }
+        RawWaker::new(data, &INTRUSIVE_WAKER_VTABLE)
     },
     |data| unsafe {
-        let header = GenericTaskHeader::<crate::utils::storage::AtomicStorage>::from_raw_data(data);
-        header.as_ref().wake_by_ref();
+        let token =
+            Arc::from_raw(data as *const TaskWakeToken<crate::utils::storage::AtomicStorage>);
+        token.wake_impl();
     },
-    |_data| {},
+    |data| unsafe {
+        let token = ManuallyDrop::new(Arc::from_raw(
+            data as *const TaskWakeToken<crate::utils::storage::AtomicStorage>,
+        ));
+        token.wake_impl();
+    },
+    |data| unsafe {
+        drop(Arc::from_raw(
+            data as *const TaskWakeToken<crate::utils::storage::AtomicStorage>,
+        ));
+    },
 );
 
 pub static LOCAL_INTRUSIVE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    |data| RawWaker::new(data, &LOCAL_INTRUSIVE_WAKER_VTABLE),
-    |data| unsafe {
-        let header = GenericTaskHeader::<crate::utils::storage::LocalStorage>::from_raw_data(data);
-        GenericTaskHeader::wake(header);
+    |data| {
+        unsafe {
+            Arc::increment_strong_count(
+                data as *const TaskWakeToken<crate::utils::storage::LocalStorage>,
+            );
+        }
+        RawWaker::new(data, &LOCAL_INTRUSIVE_WAKER_VTABLE)
     },
     |data| unsafe {
-        let header = GenericTaskHeader::<crate::utils::storage::LocalStorage>::from_raw_data(data);
-        header.as_ref().wake_by_ref();
+        let token =
+            Arc::from_raw(data as *const TaskWakeToken<crate::utils::storage::LocalStorage>);
+        token.wake_impl();
     },
-    |_data| {},
+    |data| unsafe {
+        let token = ManuallyDrop::new(Arc::from_raw(
+            data as *const TaskWakeToken<crate::utils::storage::LocalStorage>,
+        ));
+        token.wake_impl();
+    },
+    |data| unsafe {
+        drop(Arc::from_raw(
+            data as *const TaskWakeToken<crate::utils::storage::LocalStorage>,
+        ));
+    },
 );
+
+impl<S: Storage> Drop for GenericTaskHeader<S> {
+    fn drop(&mut self) {
+        self.wake_token.deactivate_and_wait();
+    }
+}
