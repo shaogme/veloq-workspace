@@ -1,6 +1,6 @@
 use std::future::Future;
 use std::num::NonZeroUsize;
-use std::ops::{AsyncFn, AsyncFnOnce};
+use std::ops::AsyncFnOnce;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::thread;
@@ -14,8 +14,7 @@ pub mod primitives;
 pub mod shared;
 
 pub use context::{
-    IdleDecision, IdleHook, IdleWaitStrategy, RuntimeContext, RuntimeScopeContext,
-    WorkerInitContext, WorkerTickHook,
+    IdleDecision, IdleHook, IdleWaitStrategy, RuntimeContext, RuntimeScopeContext, WorkerTickHook,
 };
 pub use primitives::GenericCancellationToken;
 pub use shared::{RuntimeShared, RuntimeSharedBase};
@@ -23,41 +22,34 @@ pub use shared::{RuntimeShared, RuntimeSharedBase};
 use primitives::{Signal, create_waker};
 use shared::{Receivers, init_runtime_components};
 
-pub struct Runtime<I, T, WF> {
+pub struct Runtime<T, WF> {
     pub(crate) shared: RuntimeShared<T>,
     pub(crate) receivers: Option<Receivers>,
-    pub(crate) worker_init: Option<I>,
     pub(crate) worker_factory: Option<WF>,
     marker: std::marker::PhantomData<T>,
 }
 
-pub fn noop_worker_init<T>(_: WorkerInitContext<'_, T>) -> std::future::Ready<()> {
-    std::future::ready(())
-}
-
-pub type DefaultWorkerInit = for<'a> fn(WorkerInitContext<'a, ()>) -> std::future::Ready<()>;
 pub type DefaultWorkerFactory = fn(usize, &RuntimeShared<()>) -> ();
 
-pub type DefaultWorkerInitFor<T> = for<'a> fn(WorkerInitContext<'a, T>) -> std::future::Ready<()>;
 pub type DefaultWorkerFactoryFor<T> = fn(usize, &RuntimeShared<T>) -> T;
 
-impl<T> Runtime<DefaultWorkerInitFor<T>, T, DefaultWorkerFactoryFor<T>> {
+impl Runtime<(), DefaultWorkerFactoryFor<()>> {
     pub fn new() -> Self {
         RuntimeBuilder::new().build()
     }
 
-    pub fn builder() -> RuntimeBuilder<DefaultWorkerInitFor<T>, T, DefaultWorkerFactoryFor<T>> {
+    pub fn builder() -> RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
         RuntimeBuilder::new()
     }
 }
 
-impl<T> Default for Runtime<DefaultWorkerInitFor<T>, T, DefaultWorkerFactoryFor<T>> {
+impl Default for Runtime<(), DefaultWorkerFactoryFor<()>> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<I, T, WF> Runtime<I, T, WF> {
+impl<T, WF> Runtime<T, WF> {
     pub fn worker_count(&self) -> NonZeroUsize {
         self.shared.worker_count()
     }
@@ -66,7 +58,6 @@ impl<I, T, WF> Runtime<I, T, WF> {
     where
         T: 'run,
         WF: Fn(usize, &'run RuntimeShared<T>) -> T + Send + Sync,
-        I: AsyncFn(WorkerInitContext<'run, T>) -> () + Send + Sync,
         F: AsyncFnOnce(RuntimeScopeContext<'run, T>) -> R,
     {
         struct TlsCleanupGuard<'a, T>(&'a veloq_tls::Tls<T>);
@@ -80,7 +71,6 @@ impl<I, T, WF> Runtime<I, T, WF> {
         let ctx = RuntimeScopeContext::new(shared_ref);
 
         let worker_count = shared_ref.worker_count();
-        let worker_init = self.worker_init.take().expect("worker_init already taken");
         let worker_factory = self
             .worker_factory
             .take()
@@ -103,7 +93,6 @@ impl<I, T, WF> Runtime<I, T, WF> {
                 let rrx = remote_receivers.pop().expect("remote receivers exhausted");
                 let prx = pinned_receivers.pop().expect("pinned receivers exhausted");
                 let lrx = local_receivers.pop().expect("local receivers exhausted");
-                let worker_init_ref = &worker_init;
                 let worker_factory_ref = &worker_factory;
 
                 let context = RuntimeContext {
@@ -127,12 +116,7 @@ impl<I, T, WF> Runtime<I, T, WF> {
                     let _tls_cleanup = TlsCleanupGuard(&shared_ref.base.tls);
                     let _extra_cleanup = TlsCleanupGuard(&shared_ref.extra_tls);
 
-                    let init_ctx = WorkerInitContext::new(shared_ref, worker_id, worker_count);
-                    let init_fut = std::pin::pin!(worker_init_ref(init_ctx));
-                    shared_ref.drive_worker_with_init::<AtomicStorage, ArcOwnership, _>(
-                        None,
-                        Some(init_fut),
-                    );
+                    shared_ref.drive_worker::<AtomicStorage, ArcOwnership>(None);
                 });
             }
 
@@ -169,10 +153,7 @@ impl<I, T, WF> Runtime<I, T, WF> {
             let waker = create_waker(signal.clone());
             let mut cx = Context::from_waker(&waker);
 
-            let init_ctx = WorkerInitContext::new(shared_ref, 0, worker_count);
-            let init_fut = std::pin::pin!(worker_init(init_ctx));
-            shared_ref
-                .drive_worker_with_init::<AtomicStorage, ArcOwnership, _>(None, Some(init_fut));
+            shared_ref.drive_worker::<AtomicStorage, ArcOwnership>(None);
 
             let mut fut = std::pin::pin!(f(ctx));
             loop {
@@ -197,37 +178,33 @@ impl<I, T, WF> Runtime<I, T, WF> {
     }
 }
 
-pub struct RuntimeBuilder<I, T, WF> {
+pub struct RuntimeBuilder<T, WF> {
     worker_count: Option<usize>,
     queue_capacity: usize,
-    worker_init: Option<I>,
     worker_factory: Option<WF>,
     idle_hook: Option<IdleHook<T>>,
     worker_tick_hook: Option<WorkerTickHook>,
-    _phantom: std::marker::PhantomData<T>,
 }
 
-impl<T> RuntimeBuilder<DefaultWorkerInitFor<T>, T, DefaultWorkerFactoryFor<T>> {
+impl RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
     pub fn new() -> Self {
         RuntimeBuilder {
             worker_count: None,
             queue_capacity: 1024,
-            worker_init: Some(noop_worker_init),
-            worker_factory: Some(|_, _| unsafe { std::mem::zeroed() }),
+            worker_factory: Some(|_, _| ()),
             idle_hook: None,
             worker_tick_hook: None,
-            _phantom: std::marker::PhantomData,
         }
     }
 }
 
-impl<T> Default for RuntimeBuilder<DefaultWorkerInitFor<T>, T, DefaultWorkerFactoryFor<T>> {
+impl Default for RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<I, T, WF> RuntimeBuilder<I, T, WF> {
+impl<T, WF> RuntimeBuilder<T, WF> {
     pub fn worker_count(mut self, count: NonZeroUsize) -> Self {
         self.worker_count = Some(count.get());
         self
@@ -248,9 +225,14 @@ impl<I, T, WF> RuntimeBuilder<I, T, WF> {
         self
     }
 
-    pub fn with_idle_hook(mut self, hook: IdleHook<T>) -> Self {
-        self.idle_hook = Some(hook);
-        self
+    pub fn with_idle_hook<NewT>(self, hook: IdleHook<NewT>) -> RuntimeBuilder<NewT, WF> {
+        RuntimeBuilder {
+            idle_hook: Some(hook),
+            worker_count: self.worker_count,
+            queue_capacity: self.queue_capacity,
+            worker_factory: self.worker_factory,
+            worker_tick_hook: self.worker_tick_hook,
+        }
     }
 
     pub fn with_worker_tick_hook(mut self, hook: WorkerTickHook) -> Self {
@@ -258,31 +240,17 @@ impl<I, T, WF> RuntimeBuilder<I, T, WF> {
         self
     }
 
-    pub fn with_worker_init<NI>(self, init: NI) -> RuntimeBuilder<NI, T, WF> {
+    pub fn with_worker_factory<NWF>(self, factory: NWF) -> RuntimeBuilder<T, NWF> {
         RuntimeBuilder {
             worker_count: self.worker_count,
             queue_capacity: self.queue_capacity,
-            worker_init: Some(init),
-            worker_factory: self.worker_factory,
-            idle_hook: self.idle_hook,
-            worker_tick_hook: self.worker_tick_hook,
-            _phantom: std::marker::PhantomData,
-        }
-    }
-
-    pub fn with_worker_extra<NWF>(self, factory: NWF) -> RuntimeBuilder<I, T, NWF> {
-        RuntimeBuilder {
-            worker_count: self.worker_count,
-            queue_capacity: self.queue_capacity,
-            worker_init: self.worker_init,
             worker_factory: Some(factory),
             idle_hook: self.idle_hook,
             worker_tick_hook: self.worker_tick_hook,
-            _phantom: std::marker::PhantomData,
         }
     }
 
-    pub fn build(self) -> Runtime<I, T, WF> {
+    pub fn build(self) -> Runtime<T, WF> {
         let count = self
             .worker_count
             .unwrap_or_else(|| thread::available_parallelism().map_or(1, |n| n.get()));
@@ -302,7 +270,6 @@ impl<I, T, WF> RuntimeBuilder<I, T, WF> {
         Runtime {
             shared,
             receivers: Some(receivers),
-            worker_init: self.worker_init,
             worker_factory: self.worker_factory,
             marker: std::marker::PhantomData,
         }

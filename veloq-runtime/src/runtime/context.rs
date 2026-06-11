@@ -293,68 +293,6 @@ impl<'rt, T> RuntimeScopeContext<'rt, T> {
 pub type IdleHook<T> = fn(&RuntimeShared<T>) -> IdleDecision;
 pub type WorkerTickHook = fn();
 
-/// Worker initialization context passed to the injected worker init step.
-pub struct WorkerInitContext<'scope, T> {
-    shared: &'scope RuntimeShared<T>,
-    worker_id: usize,
-    worker_count: NonZeroUsize,
-}
-
-impl<'scope, T> Clone for WorkerInitContext<'scope, T> {
-    fn clone(&self) -> Self {
-        Self {
-            shared: self.shared,
-            worker_id: self.worker_id,
-            worker_count: self.worker_count,
-        }
-    }
-}
-
-impl<'scope, T> WorkerInitContext<'scope, T> {
-    pub(crate) fn new(
-        shared: &'scope RuntimeShared<T>,
-        worker_id: usize,
-        worker_count: NonZeroUsize,
-    ) -> Self {
-        Self {
-            shared,
-            worker_id,
-            worker_count,
-        }
-    }
-
-    pub fn shared(&self) -> &'scope RuntimeShared<T> {
-        self.shared
-    }
-
-    /// Returns the current worker id.
-    #[inline]
-    pub fn worker_id(&self) -> usize {
-        self.worker_id
-    }
-
-    /// Returns the total worker count in the runtime.
-    #[inline]
-    pub fn worker_count(&self) -> NonZeroUsize {
-        self.worker_count
-    }
-
-    /// Returns the runtime scope context.
-    #[inline]
-    pub fn scope(&self) -> RuntimeScopeContext<'scope, T> {
-        RuntimeScopeContext::new(self.shared)
-    }
-
-    /// Returns the custom worker extra state.
-    #[inline]
-    pub fn extra<R>(&self, f: impl FnOnce(&T) -> R) -> R {
-        self.shared
-            .extra_tls
-            .try_with(|extra| f(extra))
-            .expect("extra TLS accessed outside of a worker thread")
-    }
-}
-
 pub struct RouteCell<T> {
     value: Mutex<Option<T>>,
     waker: AtomicWaker,

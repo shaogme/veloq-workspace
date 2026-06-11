@@ -145,7 +145,7 @@ impl<T: PoolTopology> Runtime<T> {
             .with_worker_count(worker_count.get())
             .with_queue_capacity(config.get_queue_capacity().get())
             .with_idle_hook(poll_current_driver)
-            .with_worker_extra(move |worker_id, shared| {
+            .with_worker_factory(move |worker_id, shared| {
                 let topology = topology.clone();
                 let state = state.clone();
                 let config = config.clone();

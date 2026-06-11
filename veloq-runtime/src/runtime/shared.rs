@@ -1,11 +1,8 @@
-use std::future::Future;
 use std::num::NonZeroUsize;
-use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::task::{Context, Poll};
 
 use super::context::{IdleHook, RuntimeContext, WorkerTickHook};
 use crate::error::{Result, RuntimeError};
@@ -439,19 +436,6 @@ impl<T> RuntimeShared<T> {
         &self,
         completion: Option<&O::Shared<GenericScopeCompletion<S, O>>>,
     ) {
-        self.drive_worker_with_init::<S, O, std::future::Ready<()>>(completion, None);
-    }
-
-    pub fn drive_worker_with_init<
-        'scope_ref,
-        S: ScopeStorage,
-        O: Ownership + 'scope_ref,
-        F: Future<Output = ()>,
-    >(
-        &self,
-        completion: Option<&O::Shared<GenericScopeCompletion<S, O>>>,
-        mut init_fut: Option<Pin<&mut F>>,
-    ) {
         self.base.tls.with(move |ctx| {
             let worker_id = ctx.worker_id;
 
@@ -459,7 +443,6 @@ impl<T> RuntimeShared<T> {
 
             let waker =
                 primitives::create_unpark_waker(self.base.registry.unparkers[worker_id].clone());
-            let mut init_cx = Context::from_waker(&waker);
             let mut completion_registration =
                 completion.map(|c| ScopeCompletionRegistration::new(&**c, &waker));
 
@@ -467,31 +450,18 @@ impl<T> RuntimeShared<T> {
             const INJECTOR_CHECK_INTERVAL: u32 = 61;
             let mut processed_tasks = 0u32;
 
-            while init_fut.is_some() || !self.base.shutdown.load(Ordering::Acquire) {
+            while !self.base.shutdown.load(Ordering::Acquire) {
                 let mut progressed = false;
 
                 if let Some(hook) = worker_tick_hook {
                     hook();
                 }
 
-                if let Some(fut) = init_fut.as_mut() {
-                    match fut.as_mut().poll(&mut init_cx) {
-                        Poll::Ready(()) => {
-                            init_fut = None;
-                            progressed = true;
-                            if completion.is_none() && worker_id == 0 {
-                                return;
-                            }
-                        }
-                        Poll::Pending => {}
-                    }
-                }
-
-                if init_fut.is_none() && completion.map(|c| c.is_done()).unwrap_or(false) {
+                if completion.map(|c| c.is_done()).unwrap_or(false) {
                     return;
                 }
 
-                if init_fut.is_none() && completion.is_none() && worker_id == 0 {
+                if completion.is_none() && worker_id == 0 {
                     return;
                 }
 
