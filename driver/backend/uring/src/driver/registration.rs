@@ -12,6 +12,12 @@ const MIN_FILE_TABLE_CAPACITY: usize = 1;
 const INITIAL_FILE_GENERATION: u64 = 1;
 
 #[derive(Debug)]
+pub(crate) struct FileSlot {
+    pub(crate) entry: Option<RegisteredFileEntry>,
+    pub(crate) generation: u64,
+}
+
+#[derive(Debug)]
 pub(crate) enum RegisteredFileEntry {
     BorrowedFd { fd: i32, kind: RawHandleKind },
     OwnedHandle(OwnedRawHandle),
@@ -36,15 +42,14 @@ impl RegisteredFileEntry {
 }
 
 pub(crate) fn resolve_registered_fixed_fd(
-    registered_files: &[Option<RegisteredFileEntry>],
-    file_generations: &[u64],
+    file_slots: &[FileSlot],
     fd: IoFd,
     expected_kind: Option<RawHandleKind>,
     scope: &'static str,
 ) -> UringResult<u32> {
     let idx = fd.fixed_index();
     let index = idx as usize;
-    let Some(slot) = registered_files.get(index) else {
+    let Some(slot) = file_slots.get(index) else {
         return Err(UringError::ResolveFd
             .to_report()
             .push_ctx("scope", scope)
@@ -53,21 +58,18 @@ pub(crate) fn resolve_registered_fixed_fd(
             .attach_note("registered file descriptor index out of bounds"));
     };
 
-    let current_generation = file_generations.get(index).copied();
-    if current_generation != Some(fd.generation()) {
+    if slot.generation != fd.generation() {
         let mut report = UringError::ResolveFd
             .to_report()
             .push_ctx("scope", scope)
             .with_ctx("fd_fixed_index", idx)
             .with_ctx("fd_generation", fd.generation())
             .attach_note("stale registered file descriptor generation");
-        if let Some(current_generation) = current_generation {
-            report = report.with_ctx("current_generation", current_generation);
-        }
+        report = report.with_ctx("current_generation", slot.generation);
         return Err(report);
     }
 
-    let Some(entry) = slot.as_ref() else {
+    let Some(entry) = slot.entry.as_ref() else {
         return Err(UringError::ResolveFd
             .to_report()
             .push_ctx("scope", scope)
@@ -186,22 +188,22 @@ impl<'a> UringDriver<'a> {
         scope: &'static str,
     ) -> UringResult<()> {
         let index = idx as usize;
-        if index >= self.registered_files.len() {
+        if index >= self.file_slots.len() {
             return Ok(());
         }
 
-        let Some(entry) = self.registered_files[index].take() else {
+        let Some(entry) = self.file_slots[index].entry.take() else {
             return Ok(());
         };
 
         if let Err(e) = self.ring.submitter().register_files_update(idx, &[-1]) {
-            self.registered_files[index] = Some(entry);
+            self.file_slots[index].entry = Some(entry);
             return Err(UringError::Registration.io_report(scope, e));
         }
 
         self.free_file_slots.push(idx);
         if advance_generation {
-            Self::advance_file_generation(&mut self.file_generations[index]);
+            Self::advance_file_generation(&mut self.file_slots[index].generation);
         }
         Ok(())
     }
@@ -230,8 +232,8 @@ impl<'a> UringDriver<'a> {
         }
         let idx = fd.fixed_index();
         let index = idx as usize;
-        if index < self.registered_files.len() {
-            if self.file_generations.get(index).copied() != Some(fd.generation()) {
+        if index < self.file_slots.len() {
+            if self.file_slots[index].generation != fd.generation() {
                 return Ok(());
             }
             self.unregister_file_slot(idx, true, "driver.unregister_fixed_fd")?;
@@ -245,21 +247,21 @@ impl<'a> UringDriver<'a> {
         }
         let idx = fd.fixed_index();
         let index = idx as usize;
-        if index >= self.registered_files.len() {
+        if index >= self.file_slots.len() {
             return Ok(());
         }
-        if self.file_generations.get(index).copied() != Some(fd.generation()) {
+        if self.file_slots[index].generation != fd.generation() {
             return Ok(());
         }
-        let Some(entry) = self.registered_files[index].take() else {
+        let Some(entry) = self.file_slots[index].entry.take() else {
             return Ok(());
         };
         if let Err(e) = self.ring.submitter().register_files_update(idx, &[-1]) {
-            self.registered_files[index] = Some(entry);
+            self.file_slots[index].entry = Some(entry);
             return Err(UringError::Registration.io_report("driver.unregister_close_owned_fd", e));
         }
         self.free_file_slots.push(idx);
-        Self::advance_file_generation(&mut self.file_generations[index]);
+        Self::advance_file_generation(&mut self.file_slots[index].generation);
         let _ = std::mem::ManuallyDrop::new(entry);
         Ok(())
     }
@@ -279,7 +281,7 @@ impl<'a> UringDriver<'a> {
 
         let idx = fixed_fd.fixed_index();
         let index = idx as usize;
-        let Some(slot) = self.registered_files.get_mut(index) else {
+        let Some(slot) = self.file_slots.get_mut(index) else {
             return Err(UringError::InvalidState
                 .to_report()
                 .push_ctx("scope", "driver.replace_registered_fixed_fd")
@@ -287,7 +289,7 @@ impl<'a> UringDriver<'a> {
                 .with_ctx("fd_generation", fixed_fd.generation())
                 .attach_note("registered file index out of bounds"));
         };
-        if self.file_generations.get(index).copied() != Some(fixed_fd.generation()) {
+        if slot.generation != fixed_fd.generation() {
             return Err(UringError::InvalidState
                 .to_report()
                 .push_ctx("scope", "driver.replace_registered_fixed_fd")
@@ -295,7 +297,7 @@ impl<'a> UringDriver<'a> {
                 .with_ctx("fd_generation", fixed_fd.generation())
                 .attach_note("registered file generation mismatch while replacing fd"));
         }
-        if slot.is_none() {
+        if slot.entry.is_none() {
             return Err(UringError::InvalidState
                 .to_report()
                 .push_ctx("scope", "driver.replace_registered_fixed_fd")
@@ -314,7 +316,7 @@ impl<'a> UringDriver<'a> {
                     e,
                 )
             })?;
-        *slot = Some(RegisteredFileEntry::BorrowedFd {
+        slot.entry = Some(RegisteredFileEntry::BorrowedFd {
             fd,
             kind: raw.kind(),
         });
@@ -332,8 +334,12 @@ impl<'a> UringDriver<'a> {
             UringError::Registration.io_report("driver.ensure_file_table_initialized", e)
         })?;
 
-        self.registered_files = (0..capacity).map(|_| None).collect();
-        self.file_generations = vec![INITIAL_FILE_GENERATION; capacity];
+        self.file_slots = (0..capacity)
+            .map(|_| FileSlot {
+                entry: None,
+                generation: INITIAL_FILE_GENERATION,
+            })
+            .collect();
         self.free_file_slots = (0..capacity as u32).rev().collect();
         self.file_table_initialized = true;
         Ok(())
@@ -380,10 +386,10 @@ impl<'a> UringDriver<'a> {
                 }
                 return Err(report);
             }
-            self.registered_files[idx as usize] = Some(entry);
+            let slot = &mut self.file_slots[idx as usize];
+            slot.entry = Some(entry);
             registered_slots.push(idx);
-            let generation = self.file_generations[idx as usize];
-            fixed_fds.push(IoFd::fixed_with_generation(idx, generation));
+            fixed_fds.push(IoFd::fixed_with_generation(idx, slot.generation));
         }
         Ok(fixed_fds)
     }

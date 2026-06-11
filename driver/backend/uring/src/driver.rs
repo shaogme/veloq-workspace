@@ -29,7 +29,7 @@ mod submission;
 
 pub use lifecycle::UringOpState;
 pub(crate) use registration::{
-    MAX_CHUNKS, RegisteredFileEntry, UringRegistrationStats, resolve_registered_fixed_fd,
+    FileSlot, MAX_CHUNKS, RegisteredFileEntry, UringRegistrationStats, resolve_registered_fixed_fd,
 };
 
 use crate::op::{UringOpRegistry, UringSlotSpec};
@@ -144,8 +144,7 @@ pub struct UringDriver<'a> {
     pub(crate) registration_stats: UringRegistrationStats,
     pub(crate) registration_mode: BufferRegistrationMode,
     pub(crate) chunk_register_failures_recent: HashMap<veloq_buf::heap::ChunkId, Instant>,
-    pub(crate) registered_files: Vec<Option<RegisteredFileEntry>>,
-    pub(crate) file_generations: Vec<u64>,
+    pub(crate) file_slots: Vec<FileSlot>,
     pub(crate) free_file_slots: Vec<u32>,
     pub(crate) file_table_initialized: bool,
 }
@@ -215,8 +214,7 @@ impl<'a> UringDriver<'a> {
             registration_stats: UringRegistrationStats::default(),
             registration_mode: config.registration_mode,
             chunk_register_failures_recent: HashMap::new(),
-            registered_files: Vec::new(),
-            file_generations: Vec::new(),
+            file_slots: Vec::new(),
             free_file_slots: Vec::new(),
             file_table_initialized: false,
         };

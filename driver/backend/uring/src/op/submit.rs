@@ -5,7 +5,7 @@ pub(super) use file::*;
 pub(super) use net::*;
 
 use crate::config::{IoFd, RawHandleKind};
-use crate::driver::{RegisteredFileEntry, UringDriver, resolve_registered_fixed_fd};
+use crate::driver::{FileSlot, UringDriver, resolve_registered_fixed_fd};
 use crate::error::{UringDriverResult as DriverResult, UringError};
 use crate::op::{Timeout, Wakeup};
 use diagweave::prelude::*;
@@ -29,47 +29,30 @@ fn invalid_buf_io_range(scope: &'static str, err: BufIoRangeError) -> Report<Uri
 
 #[inline]
 fn resolve_file_fd(
-    registered_files: &[Option<RegisteredFileEntry>],
-    file_generations: &[u64],
+    file_slots: &[FileSlot],
     fd: IoFd,
     scope: &'static str,
 ) -> DriverResult<types::Fixed> {
-    resolve_registered_fixed_fd(
-        registered_files,
-        file_generations,
-        fd,
-        Some(RawHandleKind::File),
-        scope,
-    )
-    .map(types::Fixed)
+    resolve_registered_fixed_fd(file_slots, fd, Some(RawHandleKind::File), scope).map(types::Fixed)
 }
 
 #[inline]
 fn resolve_socket_fd(
-    registered_files: &[Option<RegisteredFileEntry>],
-    file_generations: &[u64],
+    file_slots: &[FileSlot],
     fd: IoFd,
     scope: &'static str,
 ) -> DriverResult<types::Fixed> {
-    resolve_registered_fixed_fd(
-        registered_files,
-        file_generations,
-        fd,
-        Some(RawHandleKind::Socket),
-        scope,
-    )
-    .map(types::Fixed)
+    resolve_registered_fixed_fd(file_slots, fd, Some(RawHandleKind::Socket), scope)
+        .map(types::Fixed)
 }
 
 #[inline]
 fn resolve_any_fd(
-    registered_files: &[Option<RegisteredFileEntry>],
-    file_generations: &[u64],
+    file_slots: &[FileSlot],
     fd: IoFd,
     scope: &'static str,
 ) -> DriverResult<types::Fixed> {
-    resolve_registered_fixed_fd(registered_files, file_generations, fd, None, scope)
-        .map(types::Fixed)
+    resolve_registered_fixed_fd(file_slots, fd, None, scope).map(types::Fixed)
 }
 
 pub(crate) fn completion_cleanup_close_raw_fd(result: i32) -> CompletionCleanupGuard {
@@ -116,8 +99,7 @@ pub(crate) unsafe fn make_sqe_wakeup(
     _token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
     let fixed_fd = resolve_file_fd(
-        &driver.registered_files,
-        &driver.file_generations,
+        &driver.file_slots,
         user.fd,
         "uring.op.submit.make_sqe_wakeup",
     )?;

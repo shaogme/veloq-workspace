@@ -25,8 +25,7 @@ pub(crate) unsafe fn make_sqe_read_fixed(
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_read_fixed", err))?;
     let offset = rw_op.offset;
     let fixed_fd = resolve_file_fd(
-        &driver.registered_files,
-        &driver.file_generations,
+        &driver.file_slots,
         rw_op.fd,
         "uring.op.submit.make_sqe_read_fixed",
     )?;
@@ -93,8 +92,7 @@ pub(crate) unsafe fn make_sqe_write_fixed(
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_write_fixed", err))?;
     let offset = rw_op.offset;
     let fixed_fd = resolve_file_fd(
-        &driver.registered_files,
-        &driver.file_generations,
+        &driver.file_slots,
         rw_op.fd,
         "uring.op.submit.make_sqe_write_fixed",
     )?;
@@ -160,7 +158,7 @@ pub(crate) unsafe fn make_sqe_close(
 ) -> DriverResult<squeue::Entry> {
     let idx = close_op.fd.fixed_index() as usize;
     if let Some(crate::driver::RegisteredFileEntry::BorrowedFd { .. }) =
-        driver.registered_files.get(idx).and_then(|e| e.as_ref())
+        driver.file_slots.get(idx).and_then(|s| s.entry.as_ref())
     {
         return Err(UringError::InvalidInput
             .report(
@@ -172,8 +170,7 @@ pub(crate) unsafe fn make_sqe_close(
             .attach_note("borrowed fd Close rejected"));
     }
     let fixed_fd = resolve_any_fd(
-        &driver.registered_files,
-        &driver.file_generations,
+        &driver.file_slots,
         close_op.fd,
         "uring.op.submit.make_sqe_close",
     )?;
@@ -193,8 +190,7 @@ pub(crate) unsafe fn make_sqe_fsync(
     };
 
     let fixed_fd = resolve_file_fd(
-        &driver.registered_files,
-        &driver.file_generations,
+        &driver.file_slots,
         fsync_op.fd,
         "uring.op.submit.make_sqe_fsync",
     )?;
@@ -239,8 +235,7 @@ pub(crate) unsafe fn make_sqe_sync_range(
     };
 
     let fixed_fd = resolve_file_fd(
-        &driver.registered_files,
-        &driver.file_generations,
+        &driver.file_slots,
         sync_op.fd,
         "uring.op.submit.make_sqe_sync_range",
     )?;
@@ -285,8 +280,7 @@ pub(crate) unsafe fn make_sqe_fallocate(
     _token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
     let fixed_fd = resolve_file_fd(
-        &driver.registered_files,
-        &driver.file_generations,
+        &driver.file_slots,
         fallocate_op.fd,
         "uring.op.submit.make_sqe_fallocate",
     )?;

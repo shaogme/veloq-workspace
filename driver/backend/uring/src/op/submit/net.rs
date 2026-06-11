@@ -16,12 +16,7 @@ pub(crate) unsafe fn make_sqe_recv(
 ) -> DriverResult<squeue::Entry> {
     let (ptr, len) = checked_read_buf_range(&mut val.buf, val.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_recv", err))?;
-    let fixed_fd = resolve_socket_fd(
-        &driver.registered_files,
-        &driver.file_generations,
-        val.fd,
-        "uring.op.submit.make_sqe_recv",
-    )?;
+    let fixed_fd = resolve_socket_fd(&driver.file_slots, val.fd, "uring.op.submit.make_sqe_recv")?;
     Ok(opcode::Recv::new(fixed_fd, ptr, len).build())
 }
 
@@ -33,12 +28,7 @@ pub(crate) unsafe fn make_sqe_send(
 ) -> DriverResult<squeue::Entry> {
     let (ptr, len) = checked_write_buf_range(&val.buf, val.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_send", err))?;
-    let fixed_fd = resolve_socket_fd(
-        &driver.registered_files,
-        &driver.file_generations,
-        val.fd,
-        "uring.op.submit.make_sqe_send",
-    )?;
+    let fixed_fd = resolve_socket_fd(&driver.file_slots, val.fd, "uring.op.submit.make_sqe_send")?;
     Ok(opcode::Send::new(fixed_fd, ptr, len).build())
 }
 
@@ -51,8 +41,7 @@ pub(crate) unsafe fn make_sqe_udp_recv(
     let (ptr, len) = checked_read_buf_range(&mut val.buf, val.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_udp_recv", err))?;
     let fixed_fd = resolve_socket_fd(
-        &driver.registered_files,
-        &driver.file_generations,
+        &driver.file_slots,
         val.fd,
         "uring.op.submit.make_sqe_udp_recv",
     )?;
@@ -68,8 +57,7 @@ pub(crate) unsafe fn make_sqe_udp_send(
     let (ptr, len) = checked_write_buf_range(&val.buf, val.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_udp_send", err))?;
     let fixed_fd = resolve_socket_fd(
-        &driver.registered_files,
-        &driver.file_generations,
+        &driver.file_slots,
         val.fd,
         "uring.op.submit.make_sqe_udp_send",
     )?;
@@ -83,8 +71,7 @@ pub(crate) unsafe fn make_sqe_connect(
     _token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
     let fixed_fd = resolve_socket_fd(
-        &driver.registered_files,
-        &driver.file_generations,
+        &driver.file_slots,
         val.fd,
         "uring.op.submit.make_sqe_connect",
     )?;
@@ -98,8 +85,7 @@ pub(crate) unsafe fn make_sqe_udp_connect(
     _token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
     let fixed_fd = resolve_socket_fd(
-        &driver.registered_files,
-        &driver.file_generations,
+        &driver.file_slots,
         val.fd,
         "uring.op.submit.make_sqe_udp_connect",
     )?;
@@ -113,8 +99,7 @@ pub(crate) unsafe fn make_sqe_accept(
     _token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
     let fixed_fd = resolve_socket_fd(
-        &driver.registered_files,
-        &driver.file_generations,
+        &driver.file_slots,
         val.fd,
         "uring.op.submit.make_sqe_accept",
     )?;
@@ -173,8 +158,7 @@ pub(crate) unsafe fn make_sqe_send_to(
     kernel.msghdr.msg_iovlen = 1;
 
     let fixed_fd = resolve_socket_fd(
-        &driver.registered_files,
-        &driver.file_generations,
+        &driver.file_slots,
         user.fd,
         "uring.op.submit.make_sqe_send_to",
     )?;
@@ -201,8 +185,7 @@ pub(crate) unsafe fn make_sqe_udp_recv_from(
     kernel.msghdr.msg_iovlen = 1;
 
     let fixed_fd = resolve_socket_fd(
-        &driver.registered_files,
-        &driver.file_generations,
+        &driver.file_slots,
         fd,
         "uring.op.submit.make_sqe_udp_recv_from",
     )?;
