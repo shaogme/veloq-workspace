@@ -17,7 +17,6 @@ pub struct Deque<T: Copy> {
 }
 
 unsafe impl<T: Copy + Send> Send for Deque<T> {}
-unsafe impl<T: Copy + Send> Sync for Deque<T> {}
 
 impl<T: Copy> Deque<T> {
     pub fn new(capacity: NonZeroUsize) -> Self {
@@ -63,10 +62,8 @@ impl<T: Copy> Deque<T> {
         let t = self.top.load(Ordering::Relaxed);
 
         if b.wrapping_sub(t) >= 0 {
-            let item = unsafe {
-                let slot = self.buffer.get_unchecked((b & self.mask) as usize).get();
-                ptr::read(slot)
-            };
+            let slot = unsafe { self.buffer.get_unchecked((b & self.mask) as usize).get() };
+            let item = unsafe { ptr::read(slot) };
 
             if t == b {
                 if self
@@ -79,6 +76,11 @@ impl<T: Copy> Deque<T> {
                 }
                 self.bottom.store(b.wrapping_add(1), Ordering::Relaxed);
             }
+
+            // 成功弹出，清理槽位
+            unsafe {
+                ptr::write(slot as *mut Option<T>, None);
+            }
             item
         } else {
             self.bottom.store(b.wrapping_add(1), Ordering::Relaxed);
@@ -89,25 +91,24 @@ impl<T: Copy> Deque<T> {
     /// 由 Stealers 调用：窃取任务 (FIFO)
     pub fn steal(&self) -> Steal<T> {
         let t = self.top.load(Ordering::Acquire);
-
         fence(Ordering::SeqCst);
-
         let b = self.bottom.load(Ordering::Acquire);
 
         if b.wrapping_sub(t) > 0 {
-            let item = unsafe {
-                let slot = self.buffer.get_unchecked((t & self.mask) as usize).get();
-                ptr::read(slot)
-            };
-
+            // 先尝试 CAS 抢占 top 槽位
             if self
                 .top
                 .compare_exchange(t, t.wrapping_add(1), Ordering::SeqCst, Ordering::Relaxed)
                 .is_ok()
             {
-                match item {
-                    Some(i) => Steal::Success(i),
-                    None => Steal::Retry,
+                unsafe {
+                    let slot = self.buffer.get_unchecked((t & self.mask) as usize).get();
+                    let item = ptr::read(slot);
+                    ptr::write(slot as *mut Option<T>, None); // 清理槽位
+                    match item {
+                        Some(i) => Steal::Success(i),
+                        None => Steal::Retry,
+                    }
                 }
             } else {
                 Steal::Retry
@@ -120,27 +121,14 @@ impl<T: Copy> Deque<T> {
     /// 由 Stealers 调用：批量窃取任务
     pub fn steal_batch(&self) -> Steal<BatchStealResult<T>> {
         let t = self.top.load(Ordering::Acquire);
-
         fence(Ordering::SeqCst);
-
         let b = self.bottom.load(Ordering::Acquire);
 
         let n = b.wrapping_sub(t);
         if n > 0 {
             let num_to_steal = (n + 1) / 2;
 
-            // 先拷贝到本地临时变量
-            let mut temp = Vec::with_capacity(num_to_steal as usize);
-            for i in 0..num_to_steal {
-                let slot = unsafe {
-                    self.buffer
-                        .get_unchecked((t.wrapping_add(i) & self.mask) as usize)
-                        .get()
-                };
-                let item = unsafe { ptr::read(slot) };
-                temp.push(item);
-            }
-
+            // 先尝试 CAS 抢占这一批槽位
             if self
                 .top
                 .compare_exchange(
@@ -151,6 +139,19 @@ impl<T: Copy> Deque<T> {
                 )
                 .is_ok()
             {
+                let mut temp = Vec::with_capacity(num_to_steal as usize);
+                for i in 0..num_to_steal {
+                    unsafe {
+                        let slot = self
+                            .buffer
+                            .get_unchecked((t.wrapping_add(i) & self.mask) as usize)
+                            .get();
+                        let item = ptr::read(slot);
+                        ptr::write(slot as *mut Option<T>, None); // 清理槽位
+                        temp.push(item);
+                    }
+                }
+
                 let first_item = temp[0].expect("Deque was not empty");
                 let mut overflow = Vec::with_capacity((num_to_steal - 1) as usize);
                 for item_opt in temp.into_iter().skip(1) {
@@ -158,14 +159,16 @@ impl<T: Copy> Deque<T> {
                         overflow.push(item);
                     }
                 }
-                return Steal::Success(BatchStealResult {
+                Steal::Success(BatchStealResult {
                     item: first_item,
                     overflow,
-                });
+                })
+            } else {
+                Steal::Retry
             }
-            return Steal::Retry;
+        } else {
+            Steal::Empty
         }
-        Steal::Empty
     }
 
     pub fn is_empty(&self) -> bool {
