@@ -34,11 +34,6 @@ pub enum RegisterFd<'a, H: RawHandleMeta> {
     Owned(OwnedRawHandle<H>),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DriverControlCommand {
-    UnregisterFiles(Vec<IoFd>),
-}
-
 pub type SharedSlotTable<Spec> = Arc<slot::SlotTable<Spec>>;
 pub type SharedDriverSlotTable<D> = SharedSlotTable<<D as Driver>::SlotSpec>;
 pub type RemoteCancelSender = mpsc::Sender<CancelRequest>;
