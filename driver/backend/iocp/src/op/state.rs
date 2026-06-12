@@ -4,7 +4,8 @@ use crate::error::{IocpError, IocpResult};
 use crate::rio::SocketInflightToken;
 use crate::win32::{IoCompletionPort, Overlapped};
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use veloq_driver_core::driver::registry::OpRegistry as CoreOpRegistry;
 use veloq_driver_core::driver::{CompletionToken, OpToken};
@@ -17,7 +18,7 @@ pub(crate) type BlockingSuccessCleanup = fn(usize);
 pub(crate) struct BlockingCompletion {
     port: Arc<IoCompletionPort>,
     completion_token: CompletionToken,
-    result: Mutex<Option<IocpResult<usize>>>,
+    result: AtomicPtr<IocpResult<usize>>,
     cleanup_success: Option<BlockingSuccessCleanup>,
 }
 
@@ -30,7 +31,7 @@ impl BlockingCompletion {
         Arc::new(Self {
             port,
             completion_token,
-            result: Mutex::new(None),
+            result: AtomicPtr::new(std::ptr::null_mut()),
             cleanup_success,
         })
     }
@@ -39,7 +40,13 @@ impl BlockingCompletion {
         let result = result.map_err(|e| {
             IocpError::Win32.io_report("iocp.driver.inner.blocking_completion.store", e)
         });
-        *self.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+        let raw = Box::into_raw(Box::new(result));
+        let old = self.result.swap(raw, Ordering::Release);
+        if !old.is_null() {
+            unsafe {
+                let _ = Box::from_raw(old);
+            }
+        }
     }
 
     pub(crate) fn complete(&self, result: io::Result<usize>) {
@@ -54,18 +61,25 @@ impl BlockingCompletion {
     }
 
     pub(crate) fn take_result(&self) -> Option<IocpResult<usize>> {
-        self.result.lock().unwrap_or_else(|e| e.into_inner()).take()
+        let ptr = self.result.swap(std::ptr::null_mut(), Ordering::Acquire);
+        if ptr.is_null() {
+            None
+        } else {
+            unsafe { Some(*Box::from_raw(ptr)) }
+        }
     }
 }
 
 impl Drop for BlockingCompletion {
     fn drop(&mut self) {
-        let Some(cleanup_success) = self.cleanup_success else {
-            return;
-        };
-        let result = self.result.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(Ok(value)) = result {
-            cleanup_success(value);
+        let ptr = *self.result.get_mut();
+        if !ptr.is_null() {
+            let result = unsafe { *Box::from_raw(ptr) };
+            if let Some(cleanup_success) = self.cleanup_success {
+                if let Ok(value) = result {
+                    cleanup_success(value);
+                }
+            }
         }
     }
 }
