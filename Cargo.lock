@@ -1453,6 +1453,7 @@ dependencies = [
  "veloq-buf",
  "veloq-driver-core",
  "veloq-pod",
+ "veloq-storage",
  "veloq-wheel",
  "windows-sys",
 ]
