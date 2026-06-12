@@ -63,25 +63,30 @@ impl<T: Copy> Deque<T> {
 
         if b.wrapping_sub(t) >= 0 {
             let slot = unsafe { self.buffer.get_unchecked((b & self.mask) as usize).get() };
-            let item = unsafe { ptr::read(slot) };
 
             if t == b {
                 if self
                     .top
                     .compare_exchange(t, t.wrapping_add(1), Ordering::SeqCst, Ordering::Relaxed)
-                    .is_err()
+                    .is_ok()
                 {
+                    let item = unsafe { ptr::read(slot) };
+                    unsafe {
+                        ptr::write(slot as *mut Option<T>, None);
+                    }
                     self.bottom.store(b.wrapping_add(1), Ordering::Relaxed);
-                    return None;
+                    item
+                } else {
+                    self.bottom.store(b.wrapping_add(1), Ordering::Relaxed);
+                    None
                 }
-                self.bottom.store(b.wrapping_add(1), Ordering::Relaxed);
+            } else {
+                let item = unsafe { ptr::read(slot) };
+                unsafe {
+                    ptr::write(slot as *mut Option<T>, None);
+                }
+                item
             }
-
-            // 成功弹出，清理槽位
-            unsafe {
-                ptr::write(slot as *mut Option<T>, None);
-            }
-            item
         } else {
             self.bottom.store(b.wrapping_add(1), Ordering::Relaxed);
             None
