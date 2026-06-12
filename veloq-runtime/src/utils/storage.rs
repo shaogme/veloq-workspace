@@ -246,13 +246,13 @@ impl Storage for LocalStorage {
     fn strategy_type() -> StrategyType {
         StrategyType::Local
     }
-    type Usize = NonAtomicUsize;
-    type OptionPtr<T> = NonAtomicOptionPtr<T>;
-    type NonNullPtr<T> = NonAtomicNonNullPtr<T>;
+    type Usize = Usize;
+    type OptionPtr<T> = OptionPtr<T>;
+    type NonNullPtr<T> = NonNullPtr<T>;
     type Lock<T> = LocalLock<T>;
     type WakerQueue = LocalWakerQueue;
-    type OptionBox<T: ?Sized + Send> = NonAtomicOptionBox<T>;
-    type OptionArc<T: ?Sized + Send + Sync> = NonAtomicOptionArc<T>;
+    type OptionBox<T: ?Sized + Send> = OptionBox<T>;
+    type OptionArc<T: ?Sized + Send + Sync> = OptionArc<T>;
 }
 
 pub struct LocalLock<T>(RefCell<T>);
@@ -287,10 +287,10 @@ impl StateWakerQueue for LocalWakerQueue {
     }
 }
 
-pub struct NonAtomicUsize(Cell<usize>);
+pub struct Usize(Cell<usize>);
 
 impl_state_int!(
-    NonAtomicUsize, self, _order, val, curr, new, success, failure,
+    Usize, self, _order, val, curr, new, success, failure,
     new(v) { Self(Cell::new(v)) },
     load() { self.0.get() },
     store(v) { self.0.set(v) },
@@ -600,7 +600,7 @@ impl_ptr_state_wrapper!(
 );
 
 impl_ptr_state_wrapper!(
-    NonAtomicOptionPtr, StateOptionPtr, Option<NonNull<T>>, Cell<*mut T>, self, _order,
+    OptionPtr, StateOptionPtr, Option<NonNull<T>>, Cell<*mut T>, self, _order,
     new(p) { Self(Cell::new(opt_to_raw(p))) },
     load() { opt_from_raw(self.0.get()) },
     store(p) { self.0.set(opt_to_raw(p)) },
@@ -622,7 +622,7 @@ impl_ptr_state_wrapper!(
 );
 
 impl_ptr_state_wrapper!(
-    NonAtomicNonNullPtr, StateNonNullPtr, NonNull<T>, Cell<NonNull<T>>, self, _order,
+    NonNullPtr, StateNonNullPtr, NonNull<T>, Cell<NonNull<T>>, self, _order,
     new(p) { Self(Cell::new(p)) },
     load() { self.0.get() },
     store(p) { self.0.set(p) },
@@ -700,11 +700,11 @@ macro_rules! impl_cell_opt_methods {
     };
 }
 
-// --- NonAtomicOptionBox ---
+// --- OptionBox ---
 
-pub struct NonAtomicOptionBox<T: ?Sized>(Cell<Option<Box<T>>>);
+pub struct OptionBox<T: ?Sized>(Cell<Option<Box<T>>>);
 
-impl<T: ?Sized + Send> StateOptionBox<T> for NonAtomicOptionBox<T> {
+impl<T: ?Sized + Send> StateOptionBox<T> for OptionBox<T> {
     impl_cell_opt_methods!(Box<T>);
     fn swap(&self, new: Option<Box<T>>, _order: Ordering) -> Option<Box<T>> {
         self.0.replace(new)
@@ -743,11 +743,11 @@ impl<T: ?Sized + Send + Sync> StateOptionArc<T> for AtomicOptionArc<T> {
     }
 }
 
-// --- NonAtomicOptionArc ---
+// --- OptionArc ---
 
-pub struct NonAtomicOptionArc<T: ?Sized>(Cell<Option<Arc<T>>>);
+pub struct OptionArc<T: ?Sized>(Cell<Option<Arc<T>>>);
 
-impl<T: ?Sized + Send + Sync> StateOptionArc<T> for NonAtomicOptionArc<T> {
+impl<T: ?Sized + Send + Sync> StateOptionArc<T> for OptionArc<T> {
     impl_cell_opt_methods!(Arc<T>);
     fn load_clone(&self, _order: Ordering) -> Option<Arc<T>> {
         let opt = self.0.take();

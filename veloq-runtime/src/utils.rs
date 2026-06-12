@@ -7,6 +7,6 @@ pub mod storage;
 pub use fast_rand::FastRand;
 pub use ownership::{ArcOwnership, Ownership, RcOwnership};
 pub use storage::{
-    AtomicNonNullPtr, AtomicOptionArc, AtomicOptionBox, AtomicOptionPtr, NonAtomicOptionPtr,
-    StateOptionPtr, StaticTransfer,
+    AtomicNonNullPtr, AtomicOptionArc, AtomicOptionBox, AtomicOptionPtr, OptionPtr, StateOptionPtr,
+    StaticTransfer,
 };
