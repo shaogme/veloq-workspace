@@ -1526,6 +1526,7 @@ dependencies = [
  "veloq-atomic-waker",
  "veloq-deque",
  "veloq-intrusive-linklist",
+ "veloq-storage",
  "veloq-tls",
 ]
 
@@ -1534,6 +1535,13 @@ name = "veloq-shim"
 version = "0.1.0"
 dependencies = [
  "loom",
+]
+
+[[package]]
+name = "veloq-storage"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
 ]
 
 [[package]]

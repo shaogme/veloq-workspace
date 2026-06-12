@@ -1,5 +1,5 @@
 [package]
-name = "veloq-runtime"
+name = "veloq-storage"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,22 +12,7 @@ categories.workspace = true
 readme.workspace = true
 
 [dependencies]
-crossbeam-queue.workspace = true
-libc.workspace = true
 parking_lot.workspace = true
-numaperf-topo = "0.1"
-
-veloq-atomic-waker.workspace = true
-veloq-intrusive-linklist.workspace = true
-veloq-tls.workspace = true
-veloq-deque.workspace = true
-veloq-storage.workspace = true
-
-diagweave.workspace = true
 
 [lints]
 workspace = true
-
-[dev-dependencies]
-trybuild = "1.0"
-
