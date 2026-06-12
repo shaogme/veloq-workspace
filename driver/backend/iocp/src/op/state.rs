@@ -74,10 +74,10 @@ impl Drop for BlockingCompletion {
         let ptr = self.result.load(Ordering::Acquire);
         if let Some(p) = ptr {
             let result = unsafe { *Box::from_raw(p.as_ptr()) };
-            if let Some(cleanup_success) = self.cleanup_success {
-                if let Ok(value) = result {
-                    cleanup_success(value);
-                }
+            if let Some(cleanup_success) = self.cleanup_success
+                && let Ok(value) = result
+            {
+                cleanup_success(value);
             }
         }
     }
