@@ -48,11 +48,12 @@ pub(crate) struct Receivers {
     pub(crate) remote_receivers: Vec<Receiver<SendTaskRef>>,
     pub(crate) pinned_receivers: Vec<Receiver<SendTaskRef>>,
     pub(crate) local_receivers: Vec<Receiver<LocalTaskRef>>,
+    pub(crate) deques: Vec<crossbeam_deque::Worker<SendTaskRef>>,
 }
 
 pub(crate) fn init_runtime_components(
     worker_count: NonZeroUsize,
-    queue_capacity: NonZeroUsize,
+    _queue_capacity: NonZeroUsize,
 ) -> (WorkerRegistry, TopologyContext, Receivers) {
     let worker_count_val = worker_count.get();
     let mut unparkers = Vec::with_capacity(worker_count_val);
@@ -60,6 +61,7 @@ pub(crate) fn init_runtime_components(
     let mut remote_receivers = Vec::with_capacity(worker_count_val);
     let mut pinned_receivers = Vec::with_capacity(worker_count_val);
     let mut local_receivers = Vec::with_capacity(worker_count_val);
+    let mut deques = Vec::with_capacity(worker_count_val);
     let mut workers = Vec::with_capacity(worker_count_val);
     let mut next_idle = Vec::with_capacity(worker_count_val);
 
@@ -76,7 +78,12 @@ pub(crate) fn init_runtime_components(
         remote_receivers.push(rrx);
         pinned_receivers.push(prx);
         local_receivers.push(lrx);
-        workers.push(Arc::new(WorkerQueue::new(rtx, ptx, ltx, queue_capacity)));
+
+        let worker_deque = crossbeam_deque::Worker::new_lifo();
+        let stealer = worker_deque.stealer();
+        deques.push(worker_deque);
+
+        workers.push(Arc::new(WorkerQueue::new(rtx, ptx, ltx, stealer)));
         next_idle.push(AtomicUsize::new(usize::MAX));
     }
 
@@ -132,6 +139,7 @@ pub(crate) fn init_runtime_components(
             remote_receivers,
             pinned_receivers,
             local_receivers,
+            deques,
         },
     )
 }
@@ -255,7 +263,7 @@ impl RuntimeSharedBase {
         if let Some(header) = worker.lifo.swap(None, Ordering::AcqRel) {
             return Some(unsafe { SendTaskRef::from_header(header.as_ptr()) });
         }
-        worker.deque.pop()
+        self.tls.with(|ctx| ctx.worker.pop())
     }
 
     fn fn_pop_pinned(&self, worker_id: usize, rx: &Receiver<SendTaskRef>) -> Option<SendTaskRef> {
@@ -283,8 +291,10 @@ impl RuntimeSharedBase {
     }
 
     fn steal_send(&self, thief_id: usize, rand: &FastRand) -> Option<SendTaskRef> {
-        self.scheduler
-            .steal_send(thief_id, &self.registry, &self.topo, rand)
+        self.tls.with(|ctx| {
+            self.scheduler
+                .steal_send(thief_id, &self.registry, &self.topo, rand, &ctx.worker)
+        })
     }
 
     fn poll_local_task(&self, worker_id: usize, task: LocalTaskRef) {
@@ -367,7 +377,7 @@ impl<T> RuntimeShared<T> {
         let worker = &self.base.registry.workers[worker_id];
         let local_has_work = worker.local_count.load(Ordering::Acquire) > 0;
         worker.lifo.load(Ordering::Acquire).is_some()
-            || !worker.deque.is_empty()
+            || !worker.stealer.is_empty()
             || local_has_work
             || worker.pinned_count.load(Ordering::Acquire) > 0
     }
@@ -412,15 +422,9 @@ impl<T> RuntimeShared<T> {
                 return;
             }
 
-            if worker.deque.push(task).is_ok() {
-                self.wake_worker(worker_id);
-                return;
-            }
-
-            // Fallback to remote_tx if deque is full
-            if worker.remote_tx.send(task).is_err() {
-                self.base.scheduler.injector.push(task);
-            }
+            self.base.tls.with(|ctx| {
+                ctx.worker.push(task);
+            });
             self.wake_worker(worker_id);
             return;
         }

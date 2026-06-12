@@ -1,5 +1,5 @@
 [package]
-name = "veloq-deque"
+name = "veloq-storage"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,13 +12,7 @@ categories.workspace = true
 readme.workspace = true
 
 [dependencies]
-veloq-shim = { workspace = true, features = ["alloc"] }
-
-[dev-dependencies]
-loom.workspace = true
-
-[features]
-loom = ["veloq-shim/loom"]
+parking_lot.workspace = true
 
 [lints]
 workspace = true

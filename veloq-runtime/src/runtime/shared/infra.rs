@@ -1,5 +1,4 @@
 use parking_lot::Mutex;
-use std::num::NonZeroUsize;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -11,9 +10,10 @@ use crate::runtime::primitives::{EventCount, Parker, ParkerInner, Unparker};
 use crate::runtime::shared::RuntimeShared;
 use crate::scope::GenericScopeCompletion;
 use crate::task::{LocalTaskRef, ScopeStorage, SendTaskRef, TaskHandleRef, TaskHeader};
+use crate::utils::FastRand;
 use crate::utils::ownership::Ownership;
 use crate::utils::storage::{AtomicOptionPtr, StateOptionPtr};
-use crate::utils::{BatchStealResult, Deque, FastRand, Steal};
+use crossbeam_deque::Steal;
 
 pub(crate) struct WorkerQueue {
     pub(crate) remote_tx: Sender<SendTaskRef>,
@@ -23,8 +23,8 @@ pub(crate) struct WorkerQueue {
     pub(crate) local_count: AtomicUsize,
     /// LIFO slot for high-priority task (cache locality)
     pub(crate) lifo: AtomicOptionPtr<TaskHeader>,
-    /// Chase-Lev Deque for work-stealing
-    pub(crate) deque: Deque<SendTaskRef>,
+    /// Stealer for work-stealing
+    pub(crate) stealer: crossbeam_deque::Stealer<SendTaskRef>,
 }
 
 impl WorkerQueue {
@@ -32,7 +32,7 @@ impl WorkerQueue {
         remote_tx: Sender<SendTaskRef>,
         pinned_tx: Sender<SendTaskRef>,
         local_tx: Sender<LocalTaskRef>,
-        queue_capacity: NonZeroUsize,
+        stealer: crossbeam_deque::Stealer<SendTaskRef>,
     ) -> Self {
         Self {
             remote_tx,
@@ -41,7 +41,7 @@ impl WorkerQueue {
             pinned_count: AtomicUsize::new(0),
             local_count: AtomicUsize::new(0),
             lifo: AtomicOptionPtr::new(None),
-            deque: Deque::new(queue_capacity),
+            stealer,
         }
     }
 }
@@ -243,8 +243,8 @@ impl TaskScheduler {
         registry: &WorkerRegistry,
         topo: &TopologyContext,
         rand: &FastRand,
+        thief_worker: &crossbeam_deque::Worker<SendTaskRef>,
     ) -> Option<SendTaskRef> {
-        let thief_worker = &registry.workers[thief_id];
         let num_workers = registry.workers.len();
         if num_workers <= 1 {
             return self.pop_global();
@@ -271,13 +271,10 @@ impl TaskScheduler {
                         continue;
                     }
                     match registry.workers[victim]
-                        .deque
-                        .steal_batch(&thief_worker.deque)
+                        .stealer
+                        .steal_batch_and_pop(thief_worker)
                     {
-                        Steal::Success(BatchStealResult { item, overflow }) => {
-                            for task in overflow {
-                                self.injector.push(task);
-                            }
+                        Steal::Success(item) => {
                             return Some(item);
                         }
                         Steal::Retry => {
@@ -308,13 +305,10 @@ impl TaskScheduler {
                 let other_group = &topo.groups[other_group_idx];
                 for &victim in &other_group.worker_ids {
                     match registry.workers[victim]
-                        .deque
-                        .steal_batch(&thief_worker.deque)
+                        .stealer
+                        .steal_batch_and_pop(thief_worker)
                     {
-                        Steal::Success(BatchStealResult { item, overflow }) => {
-                            for task in overflow {
-                                self.injector.push(task);
-                            }
+                        Steal::Success(item) => {
                             return Some(item);
                         }
                         Steal::Retry => {

@@ -4,11 +4,14 @@ use crate::error::{IocpError, IocpResult};
 use crate::rio::SocketInflightToken;
 use crate::win32::{IoCompletionPort, Overlapped};
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::ptr::NonNull;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use veloq_driver_core::driver::registry::OpRegistry as CoreOpRegistry;
 use veloq_driver_core::driver::{CompletionToken, OpToken};
 use veloq_driver_core::slot::{Slot as CoreSlot, SlotSpec as CoreSlotSpec};
+use veloq_storage::{AtomicOptionPtr, StateOptionPtr};
 
 use crate::op::{IocpOp, IocpUserPayload};
 
@@ -17,7 +20,7 @@ pub(crate) type BlockingSuccessCleanup = fn(usize);
 pub(crate) struct BlockingCompletion {
     port: Arc<IoCompletionPort>,
     completion_token: CompletionToken,
-    result: Mutex<Option<IocpResult<usize>>>,
+    result: AtomicOptionPtr<IocpResult<usize>>,
     cleanup_success: Option<BlockingSuccessCleanup>,
 }
 
@@ -30,7 +33,7 @@ impl BlockingCompletion {
         Arc::new(Self {
             port,
             completion_token,
-            result: Mutex::new(None),
+            result: AtomicOptionPtr::new(None),
             cleanup_success,
         })
     }
@@ -39,7 +42,14 @@ impl BlockingCompletion {
         let result = result.map_err(|e| {
             IocpError::Win32.io_report("iocp.driver.inner.blocking_completion.store", e)
         });
-        *self.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+        let raw = Box::into_raw(Box::new(result));
+        let non_null = NonNull::new(raw);
+        let old = self.result.swap(non_null, Ordering::Release);
+        if let Some(old_ptr) = old {
+            unsafe {
+                let _ = Box::from_raw(old_ptr.as_ptr());
+            }
+        }
     }
 
     pub(crate) fn complete(&self, result: io::Result<usize>) {
@@ -54,18 +64,21 @@ impl BlockingCompletion {
     }
 
     pub(crate) fn take_result(&self) -> Option<IocpResult<usize>> {
-        self.result.lock().unwrap_or_else(|e| e.into_inner()).take()
+        let ptr = self.result.swap(None, Ordering::Acquire);
+        ptr.map(|p| unsafe { *Box::from_raw(p.as_ptr()) })
     }
 }
 
 impl Drop for BlockingCompletion {
     fn drop(&mut self) {
-        let Some(cleanup_success) = self.cleanup_success else {
-            return;
-        };
-        let result = self.result.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(Ok(value)) = result {
-            cleanup_success(value);
+        let ptr = self.result.load(Ordering::Acquire);
+        if let Some(p) = ptr {
+            let result = unsafe { *Box::from_raw(p.as_ptr()) };
+            if let Some(cleanup_success) = self.cleanup_success
+                && let Ok(value) = result
+            {
+                cleanup_success(value);
+            }
         }
     }
 }

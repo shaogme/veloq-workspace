@@ -97,8 +97,6 @@ jobs:
         run: cargo test --release -p veloq-sync --tests --features loom
       - name: Run Veloq Atomic Waker Loom tests
         run: cargo test --release -p veloq-atomic-waker --tests --features loom
-      - name: Run Veloq Atomic Waker Loom tests
-        run: cargo test --release -p veloq-atomic-waker --tests --features loom
       - name: Run Veloq Driver Core Loom tests
         run: cargo test --release -p veloq-driver-core --tests --features loom
 

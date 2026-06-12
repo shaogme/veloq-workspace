@@ -1,13 +1,9 @@
-pub mod blocking_ops;
-
 use crossbeam_queue::SegQueue;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
-
-use crate::blocking_ops::SysBlockingOps;
 
 #[derive(Debug, Clone)]
 pub struct BlockingPoolConfig {
@@ -36,18 +32,12 @@ pub enum ThreadPoolError {
 pub enum BlockingTask {
     /// A generic closure to run in the blocking pool.
     Fn(Box<dyn FnOnce() + Send>),
-    // Future expansion for system-specific ops (e.g. legacy IOCP ops)
-    SysOp(SysBlockingOps),
 }
 
 impl BlockingTask {
     pub fn run(self) {
         match self {
             BlockingTask::Fn(f) => f(),
-            #[cfg(target_os = "windows")]
-            BlockingTask::SysOp(op) => op.run(),
-            #[cfg(target_os = "linux")]
-            BlockingTask::SysOp(_) => {}
         }
     }
 }

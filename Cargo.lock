@@ -1415,14 +1415,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "veloq-deque"
-version = "0.1.0"
-dependencies = [
- "loom",
- "veloq-shim",
-]
-
-[[package]]
 name = "veloq-driver-core"
 version = "0.1.0"
 dependencies = [
@@ -1453,6 +1445,7 @@ dependencies = [
  "veloq-buf",
  "veloq-driver-core",
  "veloq-pod",
+ "veloq-storage",
  "veloq-wheel",
  "windows-sys",
 ]
@@ -1517,6 +1510,7 @@ version = "0.1.0"
 name = "veloq-runtime"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-deque",
  "crossbeam-queue",
  "diagweave",
  "libc",
@@ -1524,8 +1518,8 @@ dependencies = [
  "parking_lot",
  "trybuild",
  "veloq-atomic-waker",
- "veloq-deque",
  "veloq-intrusive-linklist",
+ "veloq-storage",
  "veloq-tls",
 ]
 
@@ -1534,6 +1528,13 @@ name = "veloq-shim"
 version = "0.1.0"
 dependencies = [
  "loom",
+]
+
+[[package]]
+name = "veloq-storage"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
 ]
 
 [[package]]

@@ -17,7 +17,7 @@ members = [
     "utils/veloq-blocking",
     "utils/veloq-pod", 
     "utils/veloq-tls",
-    "utils/veloq-deque",
+    "utils/veloq-storage",
     "test-utils/xtest-runner"
 ]
 default-members = [
@@ -36,7 +36,7 @@ default-members = [
     "utils/veloq-blocking",
     "utils/veloq-pod",
     "utils/veloq-tls",
-    "utils/veloq-deque",
+    "utils/veloq-storage",
     "test-utils/xtest-runner"
 ]
 resolver = "3"
@@ -75,13 +75,15 @@ veloq-wheel = { path = "utils/veloq-wheel", version = "0.1.0" }
 veloq-blocking = { path = "utils/veloq-blocking", version = "0.1.0" }
 veloq-pod = { path = "utils/veloq-pod", version = "0.1.0" }
 veloq-tls = { path = "utils/veloq-tls", version = "0.1.0" }
-veloq-deque = { path = "utils/veloq-deque", version = "0.1.0" }
+veloq-storage = { path = "utils/veloq-storage", version = "0.1.0" }
 
 # External Crates
 crossbeam-utils = { version = "0.8", default-features = false }
+
+crossbeam-deque = "0.8"
+crossbeam-queue = "0.3"
 futures-core = "0.3"
 futures-util = "0.3"
-crossbeam-queue = "0.3"
 libc = "0.2.183"
 windows-sys = { version = "0.61", features = [
     "Win32_System_IO",

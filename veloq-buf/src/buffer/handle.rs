@@ -6,6 +6,9 @@ use std::ptr::NonNull;
 
 use bilge::prelude::*;
 
+mod range;
+pub use range::{BufIoRangeBound, BufIoRangeError, BufIoRangeErrorKind};
+
 use super::common::{PoolKind, RegionInfo};
 use super::error::{BufError, BufResult};
 use crate::heap::ChunkId;
@@ -181,6 +184,65 @@ impl FixedBuf {
     /// The returned view borrows `self` and does not change ownership.
     pub fn view(&self, range: Range<usize>) -> FixedBufView<'_> {
         FixedBufView::new(self, range)
+    }
+
+    #[inline]
+    pub fn checked_read_range(
+        &mut self,
+        buf_offset: usize,
+    ) -> Result<(*mut u8, u32), BufIoRangeError> {
+        let len = self.checked_buf_io_len(buf_offset, BufIoRangeBound::Capacity)?;
+        // SAFETY: buf_offset is verified to be within 0..=capacity above.
+        let ptr = unsafe { self.as_mut_ptr().add(buf_offset) };
+        Ok((ptr, len))
+    }
+
+    #[inline]
+    pub fn checked_write_range(
+        &self,
+        buf_offset: usize,
+    ) -> Result<(*const u8, u32), BufIoRangeError> {
+        let len = self.checked_buf_io_len(buf_offset, BufIoRangeBound::Length)?;
+        // SAFETY: buf_offset is verified to be within 0..=len above, and len <= capacity.
+        let ptr = unsafe { self.as_ptr().add(buf_offset) };
+        Ok((ptr, len))
+    }
+
+    #[inline]
+    fn checked_buf_io_len(
+        &self,
+        buf_offset: usize,
+        bound_kind: BufIoRangeBound,
+    ) -> Result<u32, BufIoRangeError> {
+        let bound = match bound_kind {
+            BufIoRangeBound::Capacity => self.capacity(),
+            BufIoRangeBound::Length => self.len(),
+        };
+
+        if buf_offset > bound {
+            return Err(BufIoRangeError::new(
+                BufIoRangeErrorKind::OffsetOutOfBounds,
+                buf_offset,
+                self.len(),
+                self.capacity(),
+                bound,
+                bound_kind,
+                0,
+            ));
+        }
+
+        let submission_length = bound - buf_offset;
+        u32::try_from(submission_length).map_err(|_| {
+            BufIoRangeError::new(
+                BufIoRangeErrorKind::LengthExceedsU32,
+                buf_offset,
+                self.len(),
+                self.capacity(),
+                bound,
+                bound_kind,
+                submission_length,
+            )
+        })
     }
 
     /// Allocate a buffer from the system heap (not from a pool).
