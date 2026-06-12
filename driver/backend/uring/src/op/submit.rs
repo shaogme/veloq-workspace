@@ -11,9 +11,9 @@ use crate::op::{Timeout, Wakeup};
 use diagweave::prelude::*;
 use io_uring::{opcode, squeue, types};
 use tracing::warn;
+use veloq_buf::BufIoRangeError;
 use veloq_driver_core::DriverCoreError;
 use veloq_driver_core::driver::{CompletionCleanup, CompletionCleanupGuard, SubmitTokenContext};
-use veloq_driver_core::op::BufIoRangeError;
 
 #[inline]
 fn invalid_buf_io_range(scope: &'static str, err: BufIoRangeError) -> Report<UringError> {
