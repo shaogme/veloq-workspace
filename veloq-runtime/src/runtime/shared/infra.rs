@@ -270,13 +270,12 @@ impl TaskScheduler {
                     if victim == thief_id {
                         continue;
                     }
-                    match registry.workers[victim]
-                        .deque
-                        .steal_batch(&thief_worker.deque)
-                    {
+                    match registry.workers[victim].deque.steal_batch() {
                         Steal::Success(BatchStealResult { item, overflow }) => {
                             for task in overflow {
-                                self.injector.push(task);
+                                if thief_worker.deque.push(task).is_err() {
+                                    self.injector.push(task);
+                                }
                             }
                             return Some(item);
                         }
@@ -307,13 +306,12 @@ impl TaskScheduler {
                 }
                 let other_group = &topo.groups[other_group_idx];
                 for &victim in &other_group.worker_ids {
-                    match registry.workers[victim]
-                        .deque
-                        .steal_batch(&thief_worker.deque)
-                    {
+                    match registry.workers[victim].deque.steal_batch() {
                         Steal::Success(BatchStealResult { item, overflow }) => {
                             for task in overflow {
-                                self.injector.push(task);
+                                if thief_worker.deque.push(task).is_err() {
+                                    self.injector.push(task);
+                                }
                             }
                             return Some(item);
                         }

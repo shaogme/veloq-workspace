@@ -37,7 +37,7 @@ impl<T: Copy> Deque<T> {
         let b = self.bottom.load(Ordering::Relaxed);
         let t = self.top.load(Ordering::Acquire);
 
-        if b - t > self.mask {
+        if b.wrapping_sub(t) > self.mask {
             return Err(item);
         }
 
@@ -49,20 +49,20 @@ impl<T: Copy> Deque<T> {
             ptr::write(slot, Some(item));
         }
 
-        self.bottom.store(b + 1, Ordering::Release);
+        self.bottom.store(b.wrapping_add(1), Ordering::Release);
         Ok(())
     }
 
     /// 仅由 Owner 调用：弹出任务 (LIFO)
     pub fn pop(&self) -> Option<T> {
-        let b = self.bottom.load(Ordering::Relaxed) - 1;
+        let b = self.bottom.load(Ordering::Relaxed).wrapping_sub(1);
         self.bottom.store(b, Ordering::Relaxed);
 
         fence(Ordering::SeqCst);
 
         let t = self.top.load(Ordering::Relaxed);
 
-        if t <= b {
+        if b.wrapping_sub(t) >= 0 {
             let item = unsafe {
                 let slot = self.buffer.get_unchecked((b & self.mask) as usize).get();
                 ptr::read(slot)
@@ -71,17 +71,17 @@ impl<T: Copy> Deque<T> {
             if t == b {
                 if self
                     .top
-                    .compare_exchange(t, t + 1, Ordering::SeqCst, Ordering::Relaxed)
+                    .compare_exchange(t, t.wrapping_add(1), Ordering::SeqCst, Ordering::Relaxed)
                     .is_err()
                 {
-                    self.bottom.store(b + 1, Ordering::Relaxed);
+                    self.bottom.store(b.wrapping_add(1), Ordering::Relaxed);
                     return None;
                 }
-                self.bottom.store(b + 1, Ordering::Relaxed);
+                self.bottom.store(b.wrapping_add(1), Ordering::Relaxed);
             }
             item
         } else {
-            self.bottom.store(b + 1, Ordering::Relaxed);
+            self.bottom.store(b.wrapping_add(1), Ordering::Relaxed);
             None
         }
     }
@@ -94,7 +94,7 @@ impl<T: Copy> Deque<T> {
 
         let b = self.bottom.load(Ordering::Acquire);
 
-        if t < b {
+        if b.wrapping_sub(t) > 0 {
             let item = unsafe {
                 let slot = self.buffer.get_unchecked((t & self.mask) as usize).get();
                 ptr::read(slot)
@@ -102,7 +102,7 @@ impl<T: Copy> Deque<T> {
 
             if self
                 .top
-                .compare_exchange(t, t + 1, Ordering::SeqCst, Ordering::Relaxed)
+                .compare_exchange(t, t.wrapping_add(1), Ordering::SeqCst, Ordering::Relaxed)
                 .is_ok()
             {
                 match item {
@@ -118,36 +118,43 @@ impl<T: Copy> Deque<T> {
     }
 
     /// 由 Stealers 调用：批量窃取任务
-    pub fn steal_batch(&self, dest: &Deque<T>) -> Steal<BatchStealResult<T>> {
+    pub fn steal_batch(&self) -> Steal<BatchStealResult<T>> {
         let t = self.top.load(Ordering::Acquire);
 
         fence(Ordering::SeqCst);
 
         let b = self.bottom.load(Ordering::Acquire);
 
-        if t < b {
-            let n = b - t;
+        let n = b.wrapping_sub(t);
+        if n > 0 {
             let num_to_steal = (n + 1) / 2;
+
+            // 先拷贝到本地临时变量
+            let mut temp = Vec::with_capacity(num_to_steal as usize);
+            for i in 0..num_to_steal {
+                let slot = unsafe {
+                    self.buffer
+                        .get_unchecked((t.wrapping_add(i) & self.mask) as usize)
+                        .get()
+                };
+                let item = unsafe { ptr::read(slot) };
+                temp.push(item);
+            }
 
             if self
                 .top
-                .compare_exchange(t, t + num_to_steal, Ordering::SeqCst, Ordering::Relaxed)
+                .compare_exchange(
+                    t,
+                    t.wrapping_add(num_to_steal),
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                )
                 .is_ok()
             {
-                let first_slot =
-                    unsafe { self.buffer.get_unchecked((t & self.mask) as usize).get() };
-                let first_item = unsafe { ptr::read(first_slot) }.expect("Deque was not empty");
-
-                let mut overflow = Vec::new();
-                for i in 1..num_to_steal {
-                    let slot = unsafe {
-                        self.buffer
-                            .get_unchecked(((t + i) & self.mask) as usize)
-                            .get()
-                    };
-                    if let Some(item) = (unsafe { ptr::read(slot) })
-                        && dest.push(item).is_err()
-                    {
+                let first_item = temp[0].expect("Deque was not empty");
+                let mut overflow = Vec::with_capacity((num_to_steal - 1) as usize);
+                for item_opt in temp.into_iter().skip(1) {
+                    if let Some(item) = item_opt {
                         overflow.push(item);
                     }
                 }
@@ -164,7 +171,7 @@ impl<T: Copy> Deque<T> {
     pub fn is_empty(&self) -> bool {
         let b = self.bottom.load(Ordering::Relaxed);
         let t = self.top.load(Ordering::Relaxed);
-        t >= b
+        b.wrapping_sub(t) <= 0
     }
 }
 

@@ -51,11 +51,13 @@ fn test_multi_stealers() {
             let dest = Deque::new(NonZeroUsize::new(4).unwrap());
             let mut local_results = Vec::new();
             loop {
-                match q1.steal_batch(&dest) {
+                match q1.steal_batch() {
                     Steal::Success(res) => {
                         local_results.push(res.item);
                         for item in res.overflow {
-                            local_results.push(item);
+                            if dest.push(item).is_err() {
+                                local_results.push(item);
+                            }
                         }
                         break;
                     }
@@ -75,11 +77,13 @@ fn test_multi_stealers() {
             let dest = Deque::new(NonZeroUsize::new(4).unwrap());
             let mut local_results = Vec::new();
             loop {
-                match q2.steal_batch(&dest) {
+                match q2.steal_batch() {
                     Steal::Success(res) => {
                         local_results.push(res.item);
                         for item in res.overflow {
-                            local_results.push(item);
+                            if dest.push(item).is_err() {
+                                local_results.push(item);
+                            }
                         }
                         break;
                     }
@@ -123,10 +127,14 @@ fn test_wrap_around() {
         q.push(11).unwrap();
 
         let dest = Deque::new(NonZeroUsize::new(4).unwrap());
-        match q.steal_batch(&dest) {
+        match q.steal_batch() {
             Steal::Success(res) => {
                 let mut items = vec![res.item];
-                items.extend(res.overflow);
+                for item in res.overflow {
+                    if dest.push(item).is_err() {
+                        items.push(item);
+                    }
+                }
                 while let Some(item) = dest.pop() {
                     items.push(item);
                 }
@@ -153,7 +161,7 @@ fn test_steal_overflow() {
         dest.push(100).unwrap();
         dest.push(101).unwrap();
 
-        match q.steal_batch(&dest) {
+        match q.steal_batch() {
             Steal::Success(res) => {
                 assert_eq!(res.item, 1);
                 assert_eq!(res.overflow, vec![2, 3]);
@@ -181,10 +189,14 @@ fn test_steal_integrity() {
         }
 
         let dest = Deque::new(NonZeroUsize::new(4).unwrap());
-        match q.steal_batch(&dest) {
+        match q.steal_batch() {
             Steal::Success(res) => {
                 let mut collected = vec![res.item];
-                collected.extend(res.overflow);
+                for item in res.overflow {
+                    if dest.push(item).is_err() {
+                        collected.push(item);
+                    }
+                }
                 while let Some(item) = dest.pop() {
                     collected.push(item);
                 }
