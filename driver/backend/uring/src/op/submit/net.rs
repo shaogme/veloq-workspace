@@ -4,7 +4,6 @@ use crate::op::payload::KernelRef;
 use crate::op::{Accept, Connect, OpSend, Recv, SendTo, UdpConnect, UdpRecv, UdpRecvFrom, UdpSend};
 use io_uring::{opcode, squeue};
 use veloq_driver_core::driver::SubmitTokenContext;
-use veloq_driver_core::op::{checked_read_buf_range, checked_write_buf_range};
 
 use super::{invalid_buf_io_range, resolve_socket_fd};
 
@@ -14,7 +13,9 @@ pub(crate) unsafe fn make_sqe_recv(
     driver: &mut UringDriver,
     _token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
-    let (ptr, len) = checked_read_buf_range(&mut val.buf, val.buf_offset)
+    let (ptr, len) = val
+        .buf
+        .checked_read_range(val.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_recv", err))?;
     let fixed_fd = resolve_socket_fd(&driver.file_slots, val.fd, "uring.op.submit.make_sqe_recv")?;
     Ok(opcode::Recv::new(fixed_fd, ptr, len).build())
@@ -26,7 +27,9 @@ pub(crate) unsafe fn make_sqe_send(
     driver: &mut UringDriver,
     _token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
-    let (ptr, len) = checked_write_buf_range(&val.buf, val.buf_offset)
+    let (ptr, len) = val
+        .buf
+        .checked_write_range(val.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_send", err))?;
     let fixed_fd = resolve_socket_fd(&driver.file_slots, val.fd, "uring.op.submit.make_sqe_send")?;
     Ok(opcode::Send::new(fixed_fd, ptr, len).build())
@@ -38,7 +41,9 @@ pub(crate) unsafe fn make_sqe_udp_recv(
     driver: &mut UringDriver,
     _token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
-    let (ptr, len) = checked_read_buf_range(&mut val.buf, val.buf_offset)
+    let (ptr, len) = val
+        .buf
+        .checked_read_range(val.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_udp_recv", err))?;
     let fixed_fd = resolve_socket_fd(
         &driver.file_slots,
@@ -54,7 +59,9 @@ pub(crate) unsafe fn make_sqe_udp_send(
     driver: &mut UringDriver,
     _token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
-    let (ptr, len) = checked_write_buf_range(&val.buf, val.buf_offset)
+    let (ptr, len) = val
+        .buf
+        .checked_write_range(val.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_udp_send", err))?;
     let fixed_fd = resolve_socket_fd(
         &driver.file_slots,
@@ -143,7 +150,9 @@ pub(crate) unsafe fn make_sqe_send_to(
     driver: &mut UringDriver,
     _token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
-    let (ptr, len) = checked_write_buf_range(&user.buf, user.buf_offset)
+    let (ptr, len) = user
+        .buf
+        .checked_write_range(user.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_send_to", err))?;
     kernel.iovec[0].iov_base = ptr as *mut _;
     kernel.iovec[0].iov_len = len as usize;
@@ -174,7 +183,8 @@ pub(crate) unsafe fn make_sqe_udp_recv_from(
     let fd = user.fd;
     let recv_buf = &mut user.buf;
 
-    let (ptr, len) = checked_read_buf_range(recv_buf, user.buf_offset)
+    let (ptr, len) = recv_buf
+        .checked_read_range(user.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_udp_recv_from", err))?;
     kernel.iovec[0].iov_base = ptr as *mut _;
     kernel.iovec[0].iov_len = len as usize;

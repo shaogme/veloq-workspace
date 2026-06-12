@@ -5,8 +5,7 @@ pub(crate) use blocking::{
     submit_fsync, submit_fsync_raw, submit_open, submit_sync_range, submit_sync_range_raw,
 };
 
-use veloq_buf::FixedBuf;
-use veloq_driver_core::op::{BufIoRangeError, checked_read_buf_range, checked_write_buf_range};
+use veloq_buf::{BufIoRangeError, FixedBuf};
 
 use diagweave::prelude::*;
 
@@ -39,7 +38,8 @@ fn checked_file_read_range(
     buf_offset: usize,
     scope: &'static str,
 ) -> IocpResult<(*mut u8, u32)> {
-    checked_read_buf_range(buf, buf_offset).map_err(|err| invalid_buf_io_range(scope, err))
+    buf.checked_read_range(buf_offset)
+        .map_err(|err| invalid_buf_io_range(scope, err))
 }
 
 fn checked_file_write_range(
@@ -47,7 +47,7 @@ fn checked_file_write_range(
     buf_offset: usize,
     scope: &'static str,
 ) -> IocpResult<(*mut u8, u32)> {
-    checked_write_buf_range(buf, buf_offset)
+    buf.checked_write_range(buf_offset)
         .map(|(ptr, len)| (ptr as *mut u8, len))
         .map_err(|err| invalid_buf_io_range(scope, err))
 }

@@ -10,7 +10,6 @@ use io_uring::{opcode, squeue, types};
 use veloq_buf::PoolKind;
 use veloq_buf::heap::ChunkId;
 use veloq_driver_core::driver::SubmitTokenContext;
-use veloq_driver_core::op::{checked_read_buf_range, checked_write_buf_range};
 
 use super::{invalid_buf_io_range, resolve_any_fd, resolve_file_fd};
 
@@ -21,7 +20,9 @@ pub(crate) unsafe fn make_sqe_read_fixed(
     _token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
     let region_info = rw_op.buf.resolve_region_info();
-    let (ptr, len) = checked_read_buf_range(&mut rw_op.buf, rw_op.buf_offset)
+    let (ptr, len) = rw_op
+        .buf
+        .checked_read_range(rw_op.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_read_fixed", err))?;
     let offset = rw_op.offset;
     let fixed_fd = resolve_file_fd(
@@ -56,7 +57,9 @@ pub(crate) unsafe fn make_sqe_read_raw(
     _token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
     let region_info = rw_op.buf.resolve_region_info();
-    let (ptr, len) = checked_read_buf_range(&mut rw_op.buf, rw_op.buf_offset)
+    let (ptr, len) = rw_op
+        .buf
+        .checked_read_range(rw_op.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_read_raw", err))?;
     let fd = rw_op.fd.as_fd();
 
@@ -88,7 +91,9 @@ pub(crate) unsafe fn make_sqe_write_fixed(
     _token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
     let region_info = rw_op.buf.resolve_region_info();
-    let (ptr, len) = checked_write_buf_range(&rw_op.buf, rw_op.buf_offset)
+    let (ptr, len) = rw_op
+        .buf
+        .checked_write_range(rw_op.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_write_fixed", err))?;
     let offset = rw_op.offset;
     let fixed_fd = resolve_file_fd(
@@ -125,7 +130,9 @@ pub(crate) unsafe fn make_sqe_write_raw(
     _token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
     let region_info = rw_op.buf.resolve_region_info();
-    let (ptr, len) = checked_write_buf_range(&rw_op.buf, rw_op.buf_offset)
+    let (ptr, len) = rw_op
+        .buf
+        .checked_write_range(rw_op.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_write_raw", err))?;
     let fd = rw_op.fd.as_fd();
 
