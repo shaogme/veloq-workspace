@@ -35,8 +35,43 @@ pub(crate) type SendTo = CoreSendTo;
 pub(crate) type UdpRecvFrom = CoreUdpRecvFrom;
 pub(crate) type Wakeup = CoreWakeup;
 
+pub enum UringUserPayload {
+    ReadFixed(ReadFixed),
+    ReadRaw(ReadRaw),
+    WriteFixed(WriteFixed),
+    WriteRaw(WriteRaw),
+    Recv(Recv),
+    OpSend(OpSend),
+    UdpRecv(UdpRecv),
+    UdpSend(UdpSend),
+    Connect(Connect),
+    UdpConnect(UdpConnect),
+    Close(Close),
+    Fsync(Fsync),
+    FsyncRaw(FsyncRaw),
+    SyncFileRange(SyncFileRange),
+    SyncFileRangeRaw(SyncFileRangeRaw),
+    Fallocate(Fallocate),
+    FallocateRaw(FallocateRaw),
+    Accept(Accept),
+    SendTo(SendTo),
+    UdpRecvFrom(UdpRecvFrom),
+    Open(Open),
+    Wakeup(Wakeup),
+    Timeout(Timeout),
+}
+
+// SAFETY: all payload variants are moved between driver-owned slots and completion queues.
+unsafe impl Send for UringUserPayload {}
+
 pub(crate) struct KernelRef<T> {
-    pub(crate) _marker: std::marker::PhantomData<T>,
+    pub(crate) marker: std::marker::PhantomData<T>,
+}
+
+pub(crate) fn kernel_ref<T>(_user: &T) -> KernelRef<T> {
+    KernelRef {
+        marker: std::marker::PhantomData,
+    }
 }
 
 pub(crate) struct AcceptPayload {}
@@ -62,6 +97,73 @@ pub(crate) struct WakeupPayload {
 
 pub(crate) struct TimeoutPayload {
     pub(crate) ts: [i64; 2],
+}
+
+fn zeroed_sockaddr_storage() -> libc::sockaddr_storage {
+    // C socket storage is intentionally zero-initialized before make_sqe fills it.
+    unsafe { std::mem::zeroed() }
+}
+
+fn zeroed_msghdr() -> libc::msghdr {
+    // msghdr pointer fields are populated immediately before submission.
+    unsafe { std::mem::zeroed() }
+}
+
+impl AcceptPayload {
+    #[inline]
+    pub(crate) const fn new() -> Self {
+        Self {}
+    }
+}
+
+impl SendToPayload {
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self {
+            msg_name: zeroed_sockaddr_storage(),
+            msg_namelen: 0,
+            iovec: [libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            }],
+            msghdr: zeroed_msghdr(),
+        }
+    }
+}
+
+impl UdpRecvFromPayload {
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self {
+            msg_name: zeroed_sockaddr_storage(),
+            iovec: [libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            }],
+            msghdr: zeroed_msghdr(),
+        }
+    }
+}
+
+impl OpenPayload {
+    #[inline]
+    pub(crate) const fn new() -> Self {
+        Self {}
+    }
+}
+
+impl WakeupPayload {
+    #[inline]
+    pub(crate) const fn new() -> Self {
+        Self { buf: [0; 8] }
+    }
+}
+
+impl TimeoutPayload {
+    #[inline]
+    pub(crate) const fn new() -> Self {
+        Self { ts: [0; 2] }
+    }
 }
 
 pub(crate) enum UringOpPayload {

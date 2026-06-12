@@ -1,5 +1,4 @@
-use diagweave::{report::Report, set};
-use veloq_driver_core::{DriverErrorKind, DriverResult, ResultAsDriverExt};
+use diagweave::prelude::*;
 
 set! {
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -14,6 +13,8 @@ set! {
         RqCreation,
         #[display("RIO datapath operation error")]
         Datapath,
+        #[display("RIO invalid input")]
+        InvalidInput,
         #[display("RIO resource limit reached")]
         ResourceExhaustion,
         #[display("RIO not supported or initialized")]
@@ -24,23 +25,3 @@ set! {
 }
 
 pub type RioResult<T> = Result<T, Report<RioError>>;
-
-pub(crate) trait RioResultExt<T> {
-    fn to_driver_result(
-        self,
-        kind: DriverErrorKind,
-        scope: &'static str,
-        detail: impl ToString,
-    ) -> DriverResult<T>;
-}
-
-impl<T> RioResultExt<T> for RioResult<T> {
-    fn to_driver_result(
-        self,
-        kind: DriverErrorKind,
-        scope: &'static str,
-        detail: impl ToString,
-    ) -> DriverResult<T> {
-        ResultAsDriverExt::to_driver_result(self, kind, scope, detail)
-    }
-}

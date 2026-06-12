@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use crate::error::{Result as VeloqResult, from_driver_report, from_io_error};
+use crate::error::Result;
+use crate::fs::error::FsError;
+use crate::runtime::context::RuntimeContext;
+use diagweave::prelude::*;
 use veloq_driver_native::driver::{Driver, RegisterFd};
 use veloq_driver_native::op::Open;
 
@@ -93,25 +96,29 @@ impl OpenOptions {
         self
     }
 
-    pub async fn open_local(&self, path: impl AsRef<Path>) -> VeloqResult<super::file::LocalFile> {
-        let op = self.build_op(path.as_ref()).map_err(from_io_error)?;
-        use crate::runtime::context::submit;
+    pub async fn open_local<'a, 'ctx>(
+        &self,
+        ctx: RuntimeContext<'a, 'ctx>,
+        path: impl AsRef<Path>,
+    ) -> Result<super::file::LocalFile<'a, 'ctx>> {
+        let op = self.build_op(&ctx, path.as_ref())?;
         use veloq_driver_native::op::{LocalSubmitter, Op};
 
-        let submitter = LocalSubmitter;
-        let (res, _) = submit(&submitter, Op::new(op)).await.into_inner();
-        let owned = res.map_err(from_driver_report)?;
+        let submitter = LocalSubmitter::new();
+        let (res, _) = ctx.submit(&submitter, Op::new(op)).await.into_inner();
+        let owned = res.trans()?;
         let fd = owned.into_raw();
-        let ctx = crate::runtime::context::try_current()
-            .ok_or_else(|| from_io_error(std::io::Error::other("runtime context not set")))?;
-        let driver = ctx.driver();
-        let fixed = driver
-            .borrow_mut()
-            .register_files(vec![RegisterFd::Borrowed(fd.borrow())])
-            .map_err(from_driver_report)?
-            .into_iter()
-            .next()
-            .ok_or_else(|| from_io_error(std::io::Error::other("register_files returned empty")))?;
+        let fixed = ctx.driver(|mut driver| {
+            let res = driver
+                .register_files(vec![RegisterFd::Borrowed(fd.borrow())])
+                .trans()?
+                .into_iter()
+                .next();
+            match res {
+                Some(fixed) => Ok(fixed),
+                None => FsError::RegisterFailed.trans(),
+            }
+        })?;
         use std::cell::Cell;
 
         Ok(super::file::LocalFile {
@@ -119,29 +126,52 @@ impl OpenOptions {
             fd: fixed,
             submitter,
             pos: Cell::new(0),
+            ctx,
         })
     }
 
-    pub async fn open(&self, path: impl AsRef<Path>) -> VeloqResult<super::file::File> {
-        let op = self.build_op(path.as_ref()).map_err(from_io_error)?;
-        use crate::runtime::context::submit;
+    pub async fn open<'a, 'ctx>(
+        &self,
+        ctx: RuntimeContext<'a, 'ctx>,
+        path: impl AsRef<Path>,
+    ) -> Result<super::file::File<'a, 'ctx>> {
+        let op = self.build_op(&ctx, path.as_ref())?;
         use veloq_driver_native::op::{DetachedSubmitter, Op};
 
         let submitter = DetachedSubmitter::new();
-        let (res, _) = submit(&submitter, Op::new(op)).await.into_inner();
-        let owned = res.map_err(from_driver_report)?;
-        let fd = owned.into_raw();
+        let owner = ctx.scope.worker_id();
+        let (res, _) = ctx.submit_to(owner, Op::new(op)).await?;
+        let owned = res.trans()?;
+        let raw = owned.into_raw();
+        // SAFETY: ownership is transferred into the owner driver's registered file table.
+        let owned = unsafe { veloq_driver_native::OwnedRawHandle::from_raw_owned(raw) };
+        let fd = ctx.driver(|mut driver| {
+            driver
+                .register_files(vec![RegisterFd::Owned(owned)])
+                .trans()?
+                .into_iter()
+                .next()
+                .ok_or(FsError::RegisterFailed)
+                .trans()
+        })?;
         use std::sync::atomic::AtomicU64;
 
         Ok(super::file::File {
-            raw: fd,
+            raw,
+            fd,
+            owner_worker_id: owner,
             submitter,
             pos: AtomicU64::new(0),
+            ctx,
         })
     }
 
     #[cfg(unix)]
-    fn build_op(&self, path: &Path) -> std::io::Result<Open> {
+    fn build_op(
+        &self,
+        ctx: &crate::runtime::context::RuntimeContext<'_, '_>,
+        path: &Path,
+    ) -> Result<Open> {
         use std::num::NonZeroUsize;
         use std::os::unix::ffi::OsStrExt;
 
@@ -149,13 +179,10 @@ impl OpenOptions {
         let len = path_bytes.len() + 1;
         let len_nz = NonZeroUsize::new(len).unwrap();
 
-        let mut buf = crate::runtime::context::try_alloc(len_nz)?;
+        let mut buf = ctx.try_alloc(len_nz).trans()?;
         let slice = buf.as_slice_mut();
         if slice.len() < len {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::OutOfMemory,
-                "path too long for buffer",
-            ));
+            return FsError::PathTooLong.trans();
         }
         slice[..len - 1].copy_from_slice(path_bytes);
         slice[len - 1] = 0;
@@ -201,7 +228,11 @@ impl OpenOptions {
     }
 
     #[cfg(windows)]
-    fn build_op(&self, path: &Path) -> std::io::Result<Open> {
+    fn build_op(
+        &self,
+        ctx: &crate::runtime::context::RuntimeContext<'_, '_>,
+        path: &Path,
+    ) -> Result<Open> {
         use std::num::NonZeroUsize;
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Foundation::*;
@@ -216,13 +247,10 @@ impl OpenOptions {
         path_w.push(0);
         let len_bytes = NonZeroUsize::new(path_w.len() * 2).unwrap();
 
-        let mut buf = crate::runtime::context::try_alloc(len_bytes)?;
+        let mut buf = ctx.try_alloc(len_bytes).trans()?;
         let slice = buf.as_slice_mut();
         if slice.len() < len_bytes.get() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::OutOfMemory,
-                "path too long for buffer",
-            ));
+            return FsError::PathTooLong.trans();
         }
 
         unsafe {

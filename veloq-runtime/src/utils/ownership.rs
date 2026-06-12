@@ -2,10 +2,10 @@ use std::ops::Deref;
 use std::rc::{Rc, Weak as RcWeak};
 use std::sync::{Arc, Weak as ArcWeak};
 
-use crate::utils::storage::StrategyId;
+use crate::utils::storage::StrategyType;
 
 pub trait Ownership {
-    fn strategy_id() -> StrategyId;
+    fn strategy_type() -> StrategyType;
     type Shared<T: ?Sized>: Clone + Deref<Target = T>;
     type Weak<T: ?Sized>: Clone;
 
@@ -27,9 +27,8 @@ pub trait Ownership {
 pub struct ArcOwnership;
 
 impl Ownership for ArcOwnership {
-    fn strategy_id() -> StrategyId {
-        static ID: u8 = 0;
-        StrategyId::from_static(&ID)
+    fn strategy_type() -> StrategyType {
+        StrategyType::Atomic
     }
     type Shared<T: ?Sized> = Arc<T>;
     type Weak<T: ?Sized> = ArcWeak<T>;
@@ -74,9 +73,8 @@ impl Ownership for ArcOwnership {
 pub struct RcOwnership;
 
 impl Ownership for RcOwnership {
-    fn strategy_id() -> StrategyId {
-        static ID: u8 = 0;
-        StrategyId::from_static(&ID)
+    fn strategy_type() -> StrategyType {
+        StrategyType::Local
     }
     type Shared<T: ?Sized> = Rc<T>;
     type Weak<T: ?Sized> = RcWeak<T>;

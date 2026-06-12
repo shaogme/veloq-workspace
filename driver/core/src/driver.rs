@@ -1,31 +1,154 @@
 use crate::slot;
-use crate::slot::is_runnable_state;
+use crate::slot::SlotSpec as CoreSlotSpec;
 use crate::{BorrowedRawHandle, IoFd, OwnedRawHandle, RawHandleMeta, SlotSidecar};
-use crate::{DriverErrorReport, DriverResult};
+use crate::{DriverError, DriverReport, DriverResult};
 
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::task::Poll;
 use std::task::Waker;
 use std::time::Duration;
 
-pub mod completion;
+mod completion;
 pub mod registry;
 
 pub use completion::*;
 
-pub trait PlatformOp {}
+pub trait PlatformOp {
+    type CleanupContext<'a>
+    where
+        Self: 'a;
+
+    #[inline]
+    fn completion_cleanup(&mut self, _context: Self::CleanupContext<'_>) -> CompletionCleanupGuard {
+        CompletionCleanupGuard::default()
+    }
+
+    #[inline]
+    fn orphan_cleanup(&mut self, context: Self::CleanupContext<'_>) -> CompletionCleanupGuard {
+        self.completion_cleanup(context)
+    }
+}
 
 pub enum RegisterFd<'a, H: RawHandleMeta> {
     Borrowed(BorrowedRawHandle<'a, H>),
     Owned(OwnedRawHandle<H>),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DriverControlCommand {
-    UnregisterFiles(Vec<IoFd>),
+pub type SharedSlotTable<Spec> = Arc<slot::SlotTable<Spec>>;
+pub type SharedDriverSlotTable<D> = SharedSlotTable<<D as Driver>::SlotSpec>;
+pub type RemoteCancelSender = mpsc::Sender<CancelRequest>;
+
+#[must_use]
+pub enum DriverSubmitResult<E> {
+    Submitted(Poll<()>),
+    Failed {
+        report: DriverReport<E>,
+        status: SubmitStatus,
+    },
 }
 
-pub type SharedSlotTable<Op, UP, S, C> = Arc<slot::SlotTable<Op, UP, S, C>>;
+impl<E> DriverSubmitResult<E> {
+    #[inline]
+    pub fn submitted(poll: Poll<()>) -> Self {
+        Self::Submitted(poll)
+    }
+
+    #[inline]
+    pub fn failed(report: DriverReport<E>, status: SubmitStatus) -> Self {
+        Self::Failed { report, status }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmittedOpSlot {
+    token: OpToken,
+}
+
+impl SubmittedOpSlot {
+    #[inline]
+    pub fn token(self) -> OpToken {
+        self.token
+    }
+
+    #[inline]
+    pub fn completion_token(self) -> CompletionToken {
+        CompletionToken::user(self.token)
+    }
+}
+
+pub struct ReservedOpSlot<'a, D: Driver + ?Sized> {
+    driver: &'a mut D,
+    token: OpToken,
+    release_on_drop: bool,
+}
+
+impl<'a, D: Driver + ?Sized> ReservedOpSlot<'a, D> {
+    #[inline]
+    fn new(driver: &'a mut D, token: OpToken) -> Self {
+        Self {
+            driver,
+            token,
+            release_on_drop: true,
+        }
+    }
+
+    #[inline]
+    pub fn token(&self) -> OpToken {
+        self.token
+    }
+
+    #[inline]
+    pub fn completion_token(&self) -> CompletionToken {
+        CompletionToken::user(self.token)
+    }
+
+    #[inline]
+    pub fn completion_table(&self) -> SharedCompletionTable<D::SlotSpec> {
+        self.driver.completion_table()
+    }
+
+    #[inline]
+    pub fn remote_cancel_sender(&self) -> RemoteCancelSender {
+        self.driver.remote_cancel_sender()
+    }
+
+    #[inline]
+    pub fn create_waker(&self) -> Arc<dyn RemoteWaker<D::Error>> {
+        self.driver.create_waker()
+    }
+
+    #[inline]
+    pub fn set_payload(&mut self, payload: D::UP) {
+        self.driver.slot_set_payload_raw(self.token, payload);
+    }
+
+    #[inline]
+    pub fn submit(&mut self, op_in: &mut Option<D::Op>) -> DriverSubmitResult<D::Error> {
+        self.driver.submit_op_raw(self.token, op_in)
+    }
+
+    #[inline]
+    pub fn persist(mut self) -> SubmittedOpSlot {
+        self.release_on_drop = false;
+        SubmittedOpSlot { token: self.token }
+    }
+
+    #[inline]
+    pub fn recover_payload(mut self) -> Option<D::UP> {
+        let payload = self.driver.slot_take_payload_raw(self.token);
+        self.driver.release_op_slot_raw(self.token);
+        self.release_on_drop = false;
+        payload
+    }
+}
+
+impl<D: Driver + ?Sized> Drop for ReservedOpSlot<'_, D> {
+    fn drop(&mut self) {
+        if self.release_on_drop {
+            self.driver.release_op_slot_raw(self.token);
+        }
+    }
+}
 
 pub trait Driver {
     type Op: PlatformOp;
@@ -33,76 +156,268 @@ pub trait Driver {
     type Raw: RawHandleMeta;
     type Sidecar: SlotSidecar;
     type Completion: CompletionValue;
+    type Error: DriverError;
+    type SlotSpec: CoreSlotSpec<
+            Op = Self::Op,
+            UserPayload = Self::UP,
+            Sidecar = Self::Sidecar,
+            Error = Self::Error,
+            Completion = Self::Completion,
+        >;
 
-    fn reserve_op(&mut self) -> DriverResult<(usize, u32)>;
+    #[doc(hidden)]
+    fn reserve_op_raw(&mut self) -> DriverResult<OpToken, Self::Error>;
 
-    fn slot_table(&self) -> SharedSlotTable<Self::Op, Self::UP, Self::Sidecar, Self::Completion>;
+    fn reserve_op(&mut self) -> DriverResult<ReservedOpSlot<'_, Self>, Self::Error>
+    where
+        Self: Sized,
+    {
+        let token = self.reserve_op_raw()?;
+        Ok(ReservedOpSlot::new(self, token))
+    }
 
-    fn detached_cancel_table(&self) -> Arc<slot::DetachedCancelTable>;
+    fn slot_table(&self) -> SharedDriverSlotTable<Self>;
 
-    fn slot_set_payload(&mut self, user_data: usize, payload: Self::UP);
+    fn remote_cancel_sender(&self) -> RemoteCancelSender;
 
-    fn slot_take_payload(&mut self, user_data: usize) -> Option<Self::UP>;
+    #[doc(hidden)]
+    fn try_recv_remote_cancel_request(&mut self) -> Option<CancelRequest>;
 
-    fn submit(
+    #[doc(hidden)]
+    fn slot_set_payload_raw(&mut self, token: OpToken, payload: Self::UP);
+
+    #[doc(hidden)]
+    fn slot_take_payload_raw(&mut self, token: OpToken) -> Option<Self::UP>;
+
+    #[doc(hidden)]
+    fn release_op_slot_raw(&mut self, token: OpToken);
+
+    #[doc(hidden)]
+    fn submit_op_raw(
         &mut self,
-        user_data: usize,
+        token: OpToken,
         op_in: &mut Option<Self::Op>,
-        binder: SubmitBinder,
-    ) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>>;
+    ) -> DriverSubmitResult<Self::Error>;
 
-    fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome>;
+    fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome, Self::Error>;
 
-    fn completion_queue(&self) -> SharedCompletionQueue;
+    fn completion_table(&self) -> SharedCompletionTable<Self::SlotSpec>;
 
-    fn completion_table(&self) -> SharedCompletionTable<Self::UP, Self::Completion>;
-
-    fn try_pop_completion(&mut self) -> Option<CompletionEvent> {
-        self.completion_queue().pop()
-    }
-
-    fn register_completion_waker(&mut self, token: u64, waker: &Waker) {
-        self.completion_table().register_waker(token, waker);
-    }
-
-    fn cancel_op(&mut self, user_data: usize);
-
-    fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> DriverResult<()>;
-
-    fn register_files<'a>(
+    fn register_completion_waker(
         &mut self,
-        files: Vec<RegisterFd<'a, Self::Raw>>,
-    ) -> DriverResult<Vec<IoFd>>;
+        token: OpToken,
+        waker: &Waker,
+    ) -> CompletionMutationOutcome {
+        self.completion_table().register_waker(token, waker)
+    }
 
-    fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<()>;
+    fn cancel_op(
+        &mut self,
+        request: CancelRequest,
+    ) -> DriverResult<CancelSubmitOutcome, Self::Error>;
 
-    fn create_waker(&self) -> Arc<dyn RemoteWaker>;
+    fn register_chunk(
+        &mut self,
+        id: veloq_buf::heap::ChunkId,
+        ptr: *const u8,
+        len: usize,
+    ) -> DriverResult<(), Self::Error>;
 
-    fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>);
+    fn register_files<'f>(
+        &mut self,
+        files: Vec<RegisterFd<'f, Self::Raw>>,
+    ) -> DriverResult<Vec<IoFd>, Self::Error>;
+
+    fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<(), Self::Error>;
+
+    fn create_waker(&self) -> Arc<dyn RemoteWaker<Self::Error>>;
 }
 
-#[inline]
-pub fn drain_cancel_requests<D: Driver>(driver: &mut D) {
-    let shared = driver.slot_table();
-    let cancel_table = driver.detached_cancel_table();
-    let word_count = cancel_table.cancel_word_count();
-    for word_idx in 0..word_count {
-        let mut bits = cancel_table.take_cancel_word(word_idx);
-        while bits != 0 {
-            let bit_idx = bits.trailing_zeros() as usize;
-            bits &= bits - 1;
+pub trait ContextDriverProvider<D: Driver + ?Sized> {
+    fn with_driver_mut<R>(&self, f: impl FnOnce(&mut D) -> R) -> R;
+    fn with_driver_ref<R>(&self, f: impl FnOnce(&D) -> R) -> R;
+}
 
-            let user_data = word_idx * 64 + bit_idx;
-            let Some((generation, state)) = shared.slot_snapshot(user_data) else {
-                continue;
-            };
-            if cancel_table.cancel_generation(user_data) == generation as u64
-                && is_runnable_state(state)
-            {
-                driver.cancel_op(user_data);
+pub struct RuntimeContextDriver<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> {
+    provider: &'a P,
+    _phantom: std::marker::PhantomData<fn() -> D>,
+}
+
+impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> RuntimeContextDriver<'a, D, P> {
+    pub fn new(provider: &'a P) -> Self {
+        Self {
+            provider,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
+    for RuntimeContextDriver<'a, D, P>
+{
+    type Op = D::Op;
+    type UP = D::UP;
+    type Raw = D::Raw;
+    type Sidecar = D::Sidecar;
+    type Completion = D::Completion;
+    type Error = D::Error;
+    type SlotSpec = D::SlotSpec;
+
+    #[inline]
+    fn reserve_op_raw(&mut self) -> DriverResult<OpToken, Self::Error> {
+        self.provider.with_driver_mut(|d| d.reserve_op_raw())
+    }
+
+    #[inline]
+    fn slot_table(&self) -> SharedDriverSlotTable<Self> {
+        self.provider.with_driver_ref(|d| d.slot_table())
+    }
+
+    #[inline]
+    fn remote_cancel_sender(&self) -> RemoteCancelSender {
+        self.provider.with_driver_ref(|d| d.remote_cancel_sender())
+    }
+
+    #[inline]
+    fn try_recv_remote_cancel_request(&mut self) -> Option<CancelRequest> {
+        self.provider
+            .with_driver_mut(|d| d.try_recv_remote_cancel_request())
+    }
+
+    #[inline]
+    fn slot_set_payload_raw(&mut self, token: OpToken, payload: Self::UP) {
+        self.provider
+            .with_driver_mut(|d| d.slot_set_payload_raw(token, payload))
+    }
+
+    #[inline]
+    fn slot_take_payload_raw(&mut self, token: OpToken) -> Option<Self::UP> {
+        self.provider
+            .with_driver_mut(|d| d.slot_take_payload_raw(token))
+    }
+
+    #[inline]
+    fn release_op_slot_raw(&mut self, token: OpToken) {
+        self.provider
+            .with_driver_mut(|d| d.release_op_slot_raw(token))
+    }
+
+    #[inline]
+    fn submit_op_raw(
+        &mut self,
+        token: OpToken,
+        op_in: &mut Option<Self::Op>,
+    ) -> DriverSubmitResult<Self::Error> {
+        self.provider
+            .with_driver_mut(|d| d.submit_op_raw(token, op_in))
+    }
+
+    #[inline]
+    fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome, Self::Error> {
+        self.provider.with_driver_mut(|d| d.drive(mode))
+    }
+
+    #[inline]
+    fn completion_table(&self) -> SharedCompletionTable<Self::SlotSpec> {
+        self.provider.with_driver_ref(|d| d.completion_table())
+    }
+
+    #[inline]
+    fn cancel_op(
+        &mut self,
+        request: CancelRequest,
+    ) -> DriverResult<CancelSubmitOutcome, Self::Error> {
+        self.provider.with_driver_mut(|d| d.cancel_op(request))
+    }
+
+    #[inline]
+    fn register_chunk(
+        &mut self,
+        id: veloq_buf::heap::ChunkId,
+        ptr: *const u8,
+        len: usize,
+    ) -> DriverResult<(), Self::Error> {
+        self.provider
+            .with_driver_mut(|d| d.register_chunk(id, ptr, len))
+    }
+
+    #[inline]
+    fn register_files<'f>(
+        &mut self,
+        files: Vec<RegisterFd<'f, Self::Raw>>,
+    ) -> DriverResult<Vec<IoFd>, Self::Error> {
+        self.provider.with_driver_mut(|d| d.register_files(files))
+    }
+
+    #[inline]
+    fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<(), Self::Error> {
+        self.provider.with_driver_mut(|d| d.unregister_files(files))
+    }
+
+    #[inline]
+    fn create_waker(&self) -> Arc<dyn RemoteWaker<Self::Error>> {
+        self.provider.with_driver_ref(|d| d.create_waker())
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CancelDrainOutcome {
+    pub requests: u64,
+    pub submitted: u64,
+    pub queued: u64,
+    pub completed_locally: u64,
+    pub target_missing: u64,
+    pub target_stale: u64,
+    pub target_corrupt: u64,
+    pub diagnostic_only: u64,
+    pub no_backend_handle: u64,
+}
+
+impl CancelDrainOutcome {
+    #[inline]
+    fn record(&mut self, outcome: CancelSubmitOutcome) {
+        self.requests = self.requests.saturating_add(1);
+        match outcome {
+            CancelSubmitOutcome::Submitted => {
+                self.submitted = self.submitted.saturating_add(1);
+            }
+            CancelSubmitOutcome::Queued => {
+                self.queued = self.queued.saturating_add(1);
+            }
+            CancelSubmitOutcome::CompletedLocally => {
+                self.completed_locally = self.completed_locally.saturating_add(1);
+            }
+            CancelSubmitOutcome::TargetGone { reason } => match reason {
+                CancelTargetGoneReason::Missing => {
+                    self.target_missing = self.target_missing.saturating_add(1);
+                }
+                CancelTargetGoneReason::Stale => {
+                    self.target_stale = self.target_stale.saturating_add(1);
+                }
+                CancelTargetGoneReason::Corrupt => {
+                    self.target_corrupt = self.target_corrupt.saturating_add(1);
+                }
+            },
+            CancelSubmitOutcome::DiagnosticOnly { anomaly: _ } => {
+                self.diagnostic_only = self.diagnostic_only.saturating_add(1);
+            }
+            CancelSubmitOutcome::NoBackendHandle => {
+                self.no_backend_handle = self.no_backend_handle.saturating_add(1);
             }
         }
     }
+}
+
+#[inline]
+pub fn drain_cancel_requests<D: Driver>(
+    driver: &mut D,
+) -> DriverResult<CancelDrainOutcome, D::Error> {
+    let mut outcome = CancelDrainOutcome::default();
+    while let Some(request) = driver.try_recv_remote_cancel_request() {
+        let submit_outcome = driver.cancel_op(request)?;
+        outcome.record(submit_outcome);
+    }
+    Ok(outcome)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,18 +432,11 @@ pub struct DriveOutcome {
     pub pending_progress: bool,
 }
 
-pub trait RemoteWaker: Send + Sync {
-    fn wake(&self) -> DriverResult<()>;
-}
-
-#[must_use]
-pub struct Outcome<T>(T);
-
-impl<T> Outcome<T> {
-    #[inline]
-    pub fn into_inner(self) -> T {
-        self.0
-    }
+pub trait RemoteWaker<E>: Send + Sync
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    fn wake(&self) -> DriverResult<(), E>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,36 +448,20 @@ pub enum SubmitStatus {
     Void,
 }
 
-#[derive(Default)]
-pub struct SubmitBinder;
-
-impl SubmitBinder {
-    #[inline]
-    pub fn new() -> Self {
-        Self
-    }
-
-    #[inline]
-    pub fn ok(
-        self,
-        poll: Poll<()>,
-    ) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>> {
-        Outcome(Ok(poll))
-    }
-
-    #[inline]
-    pub fn err(
-        self,
-        err: DriverErrorReport,
-        status: SubmitStatus,
-    ) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>> {
-        Outcome(Err((err, status)))
-    }
-}
-
 #[cfg(feature = "test-hooks")]
 pub mod test_hooks {
     pub trait DriverTestHooks {
         fn debug_chunk_register_attempts(&self) -> u64;
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+impl<'a, D: Driver + ?Sized + test_hooks::DriverTestHooks, P: ContextDriverProvider<D> + ?Sized>
+    test_hooks::DriverTestHooks for RuntimeContextDriver<'a, D, P>
+{
+    #[inline]
+    fn debug_chunk_register_attempts(&self) -> u64 {
+        self.provider
+            .with_driver_ref(|d| d.debug_chunk_register_attempts())
     }
 }

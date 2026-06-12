@@ -1,5 +1,6 @@
+use super::{SlotCompletion, SlotError, SlotPayload, SlotSidecarData, SlotSpec};
 use crate::DriverResult;
-use crate::SlotSidecar;
+use crate::driver::{CompletionAnomaly, CompletionCleanupGuard, UserCompletionEvent};
 use bilge::prelude::*;
 use std::marker::PhantomData;
 use veloq_atomic_waker::AtomicWaker;
@@ -88,21 +89,19 @@ impl AtomicPackedCoreState {
     }
 }
 
-pub struct SlotStorage<Op, UP, S: SlotSidecar, R = usize> {
-    pub op: Option<Op>,
-    pub result: Option<DriverResult<R>>,
-    pub payload: Option<UP>,
-    pub sidecar: S,
+pub struct SlotStorage<Spec: SlotSpec> {
+    pub result: Option<DriverResult<SlotCompletion<Spec>, SlotError<Spec>>>,
+    pub payload: Option<SlotPayload<Spec>>,
+    pub sidecar: SlotSidecarData<Spec>,
 }
 
-impl<Op, UP, S: SlotSidecar, R> SlotStorage<Op, UP, S, R> {
+impl<Spec: SlotSpec> SlotStorage<Spec> {
     #[inline]
     pub fn new() -> Self {
         Self {
-            op: None,
             result: None,
             payload: None,
-            sidecar: S::default(),
+            sidecar: SlotSidecarData::<Spec>::default(),
         }
     }
 
@@ -114,52 +113,87 @@ impl<Op, UP, S: SlotSidecar, R> SlotStorage<Op, UP, S, R> {
     #[inline]
     pub fn with_mut<F, X>(&mut self, f: F) -> X
     where
-        F: FnOnce(&mut Option<Op>, &mut Option<DriverResult<R>>, &mut Option<UP>, &mut S) -> X,
+        F: FnOnce(
+            &mut Option<DriverResult<SlotCompletion<Spec>, SlotError<Spec>>>,
+            &mut Option<SlotPayload<Spec>>,
+            &mut SlotSidecarData<Spec>,
+        ) -> X,
     {
-        f(
-            &mut self.op,
-            &mut self.result,
-            &mut self.payload,
-            &mut self.sidecar,
-        )
+        f(&mut self.result, &mut self.payload, &mut self.sidecar)
     }
 }
 
-impl<Op, UP, S: SlotSidecar, R> Default for SlotStorage<Op, UP, S, R> {
+impl<Spec: SlotSpec> Default for SlotStorage<Spec> {
     #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
-type SlotMarker<Op, S, UP> = PhantomData<fn() -> (Op, S, UP)>;
+type SlotMarker<Spec> = PhantomData<fn() -> Spec>;
 
-pub struct SlotData<Op, UP, S: SlotSidecar, R = usize> {
+pub struct SlotData<Spec: SlotSpec> {
     pub(crate) core_state: AtomicPackedCoreState,
     pub next_free: AtomicUsize,
     pub(crate) completion_res: AtomicI32,
     pub(crate) completion_flags: AtomicU32,
-    pub(crate) completion_data: Mutex<CompletionData<UP, R>>,
+    pub(crate) completion_data: Mutex<CompletionData<Spec>>,
     pub(crate) completion_waker: AtomicWaker,
-    _marker: SlotMarker<Op, S, UP>,
+    marker: SlotMarker<Spec>,
 }
 
-#[derive(Debug)]
-pub(crate) struct CompletionData<UP, R = usize> {
-    pub payload: Option<UP>,
-    pub detail: Option<DriverResult<R>>,
+pub(crate) enum CompletionData<Spec: SlotSpec> {
+    Empty,
+    User {
+        event: UserCompletionEvent,
+        payload: SlotPayload<Spec>,
+        detail: Option<DriverResult<SlotCompletion<Spec>, SlotError<Spec>>>,
+        cleanup: CompletionCleanupGuard,
+    },
+    Lost {
+        anomaly: CompletionAnomaly,
+        cleanup: CompletionCleanupGuard,
+    },
 }
 
-impl<UP, R> Default for CompletionData<UP, R> {
+impl<Spec: SlotSpec> Default for CompletionData<Spec> {
+    #[inline]
     fn default() -> Self {
-        Self {
-            payload: None,
-            detail: None,
+        Self::Empty
+    }
+}
+
+impl<Spec: SlotSpec> std::fmt::Debug for CompletionData<Spec>
+where
+    SlotPayload<Spec>: std::fmt::Debug,
+    SlotCompletion<Spec>: std::fmt::Debug,
+    SlotError<Spec>: std::fmt::Debug,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("Empty"),
+            Self::User {
+                event,
+                payload,
+                detail,
+                cleanup,
+            } => f
+                .debug_struct("User")
+                .field("event", event)
+                .field("payload", payload)
+                .field("detail", detail)
+                .field("cleanup", cleanup)
+                .finish(),
+            Self::Lost { anomaly, cleanup } => f
+                .debug_struct("Lost")
+                .field("anomaly", anomaly)
+                .field("cleanup", cleanup)
+                .finish(),
         }
     }
 }
 
-impl<Op, UP, S: SlotSidecar, R> SlotData<Op, UP, S, R> {
+impl<Spec: SlotSpec> SlotData<Spec> {
     pub(crate) const NULL_INDEX: usize = usize::MAX;
 
     pub fn new() -> Self {
@@ -172,9 +206,9 @@ impl<Op, UP, S: SlotSidecar, R> SlotData<Op, UP, S, R> {
             next_free: AtomicUsize::new(Self::NULL_INDEX),
             completion_res: AtomicI32::new(0),
             completion_flags: AtomicU32::new(0),
-            completion_data: Mutex::new(CompletionData::<UP, R>::default()),
+            completion_data: Mutex::new(CompletionData::<Spec>::default()),
             completion_waker: AtomicWaker::new(),
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 
@@ -238,17 +272,16 @@ impl<Op, UP, S: SlotSidecar, R> SlotData<Op, UP, S, R> {
     }
 
     #[inline]
-    pub(crate) fn completion_with_data<F, X>(&self, f: F) -> X
+    pub(crate) fn completion_with_record_data<F, X>(&self, f: F) -> X
     where
-        F: FnOnce(&mut Option<UP>, &mut Option<DriverResult<R>>) -> X,
+        F: FnOnce(&mut CompletionData<Spec>) -> X,
     {
         let mut data = self.completion_data.lock();
-        let CompletionData { payload, detail } = &mut *data;
-        f(payload, detail)
+        f(&mut *data)
     }
 }
 
-impl<Op, UP, S: SlotSidecar, R> Default for SlotData<Op, UP, S, R> {
+impl<Spec: SlotSpec> Default for SlotData<Spec> {
     fn default() -> Self {
         Self::new()
     }

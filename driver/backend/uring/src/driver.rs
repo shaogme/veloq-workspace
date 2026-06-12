@@ -1,10 +1,9 @@
-use diagweave::report::Report;
+use diagweave::prelude::*;
 use io_uring::IoUring;
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::Poll;
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::time::Instant;
 
 use tracing::{debug, trace};
@@ -12,16 +11,15 @@ use tracing::{debug, trace};
 use crate::config::{
     BufferRegistrationMode, IoFd, IoMode, OwnedRawHandle, RawHandle, UringConfig, UringRawHandle,
 };
-use crate::error::{UringError, UringResult, UringResultExt, from_io_error};
+use crate::diagnostics::UringCompletionDiagnostics;
+use crate::error::{UringError, UringResult};
 use crate::op::{UringOp, UringUserPayload};
-use veloq_driver_core::driver::registry::{OpEntry, OpHandle, OpRegistry};
+use veloq_driver_core::DriverResult as CoreDriverResult;
+use veloq_driver_core::driver::registry::{OpEntry, OpHandle};
 use veloq_driver_core::driver::{
-    DriveMode, DriveOutcome, Driver, Outcome, RegisterFd, RemoteWaker, SharedCompletionQueue,
-    SharedCompletionTable, SubmitBinder, SubmitStatus,
-};
-use veloq_driver_core::slot::DetachedCancelTable;
-use veloq_driver_core::{
-    DriverErrorKind, DriverErrorReport, DriverResult, driver_error, driver_os_error,
+    CancelCompletionId, CancelMode, CancelRequest, CancelSubmitOutcome, DriveMode, DriveOutcome,
+    Driver, DriverCompletionDiagnostics, DriverSubmitResult, OpToken, RegisterFd,
+    RemoteCancelSender, RemoteWaker, SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
 };
 
 mod completion;
@@ -30,104 +28,132 @@ mod registration;
 mod submission;
 
 pub use lifecycle::UringOpState;
-pub(crate) use registration::{MAX_CHUNKS, RegisteredFileEntry, UringRegistrationStats};
+pub(crate) use registration::{
+    FileSlot, MAX_CHUNKS, RegisteredFileEntry, UringRegistrationStats, resolve_registered_fixed_fd,
+};
 
-use crate::op::slot::UringOpRegistryExt;
+use crate::op::{UringOpRegistry, UringSlotSpec};
 
+type DriverResult<T> = CoreDriverResult<T, UringError>;
 pub(crate) struct EventFd {
     pub(crate) fd: OwnedRawHandle,
 }
 
+pub(crate) struct WakerFdState {
+    fd: Mutex<Arc<EventFd>>,
+}
+
+impl WakerFdState {
+    #[inline]
+    pub(crate) fn new(fd: Arc<EventFd>) -> Self {
+        Self { fd: Mutex::new(fd) }
+    }
+
+    #[inline]
+    fn lock_fd(&self) -> MutexGuard<'_, Arc<EventFd>> {
+        self.fd
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[inline]
+    pub(crate) fn current(&self) -> Arc<EventFd> {
+        self.lock_fd().clone()
+    }
+
+    #[inline]
+    pub(crate) fn replace(&self, fd: Arc<EventFd>) -> Arc<EventFd> {
+        std::mem::replace(&mut *self.lock_fd(), fd)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PendingCancel {
+    pub(crate) target: OpToken,
+    pub(crate) mode: CancelMode,
+}
+
+impl PendingCancel {
+    #[inline]
+    pub(crate) const fn new(request: CancelRequest) -> Self {
+        Self {
+            target: request.target,
+            mode: request.mode,
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn user_parts(self) -> (usize, u32) {
+        self.target.parts()
+    }
+}
+
 pub(crate) struct UringWaker {
-    pub(crate) fd: Arc<EventFd>,
+    pub(crate) state: Arc<WakerFdState>,
     pub(crate) is_waked: Arc<AtomicBool>,
 }
 
-impl RemoteWaker for UringWaker {
+impl RemoteWaker<UringError> for UringWaker {
     fn wake(&self) -> DriverResult<()> {
         if self.is_waked.load(Ordering::Relaxed) {
             return Ok(());
         }
         if !self.is_waked.swap(true, Ordering::AcqRel) {
             let buf = 1u64.to_ne_bytes();
-            let ret = unsafe { libc::write(self.fd.fd.raw().as_fd(), buf.as_ptr() as *const _, 8) };
+            let fd = self.state.current();
+            let ret = unsafe { libc::write(fd.fd.raw().as_fd(), buf.as_ptr() as *const _, 8) };
             if ret < 0 {
                 let err = io::Error::last_os_error();
                 if err.raw_os_error() == Some(libc::EAGAIN) {
                     return Ok(());
                 }
-                return Err(driver_os_error(
-                    DriverErrorKind::System,
-                    "uring.driver.waker.wake",
-                    err.raw_os_error().unwrap_or(libc::EIO),
-                    err.to_string(),
-                ));
+                return Err(UringError::Internal
+                    .to_report()
+                    .push_ctx("scope", "uring.driver.waker.wake")
+                    .set_error_code(err.raw_os_error().unwrap_or(libc::EIO))
+                    .attach_note(err.to_string()));
             }
         }
         Ok(())
     }
 }
 
-#[inline]
-pub(crate) fn invalid_state(scope: &'static str, msg: impl Into<String>) -> Report<UringError> {
-    Report::new(UringError::InvalidState).attach_note(format!("{scope}: {}", msg.into()))
-}
-
-#[inline]
-pub(crate) fn invalid_input(scope: &'static str, msg: impl Into<String>) -> Report<UringError> {
-    Report::new(UringError::InvalidInput).attach_note(format!("{scope}: {}", msg.into()))
-}
-
-#[inline]
-pub(crate) fn unsupported(scope: &'static str, msg: impl Into<String>) -> Report<UringError> {
-    Report::new(UringError::Unsupported).attach_note(format!("{scope}: {}", msg.into()))
-}
-
-#[inline]
-pub(crate) fn map_uring_error(
-    report: Report<UringError>,
-    kind: DriverErrorKind,
-    scope: &'static str,
-    detail: impl ToString,
-) -> DriverErrorReport {
-    let detail_text = detail.to_string();
-    report
-        .set_accumulate_src_chain(true)
-        .map_err(|_| kind)
-        .with_ctx("scope", scope)
-        .attach_note(detail_text)
-}
-
-pub struct UringDriver {
+pub struct UringDriver<'a> {
     pub(crate) ring: IoUring,
-    pub(crate) ops: OpRegistry<UringOp, UringUserPayload, UringOpState, ()>,
-    pub(crate) backlog: VecDeque<usize>,
-    pub(crate) pending_cancellations: VecDeque<usize>,
-    pub(crate) completion_events: SharedCompletionQueue,
-    pub(crate) completion_table: SharedCompletionTable<UringUserPayload>,
-    pub(crate) detached_cancel_table: Arc<DetachedCancelTable>,
+    pub(crate) ops: UringOpRegistry,
+    pub(crate) backlog: VecDeque<OpToken>,
+    pub(crate) pending_cancellations: VecDeque<PendingCancel>,
+    pub(crate) pending_cancel_cqes: HashMap<CancelCompletionId, PendingCancel>,
+    pub(crate) next_cancel_id: u16,
+    pub(crate) completion_diagnostics: DriverCompletionDiagnostics<UringCompletionDiagnostics>,
+    pub(crate) completion_table: SharedCompletionTable<UringSlotSpec>,
+    pub(crate) remote_cancel_sender: RemoteCancelSender,
+    pub(crate) remote_cancel_receiver: mpsc::Receiver<CancelRequest>,
 
-    pub(crate) waker_fd: Arc<EventFd>,
+    pub(crate) waker_state: Arc<WakerFdState>,
     pub(crate) waker_registered_fd: Option<IoFd>,
-    pub(crate) waker_token: Option<usize>,
+    pub(crate) waker_armed: bool,
+    pub(crate) waker_buf: Box<[u8; 8]>,
     pub(crate) registered_chunks: veloq_bitset::BitSet,
     pub(crate) is_waked: Arc<AtomicBool>,
 
-    pub(crate) wheel: veloq_wheel::Wheel<usize>,
-    pub(crate) timer_buffer: Vec<usize>,
+    pub(crate) wheel: veloq_wheel::Wheel<OpToken>,
+    pub(crate) timer_buffer: Vec<OpToken>,
     pub(crate) last_timer_poll: Instant,
-    pub(crate) registrar: Box<dyn veloq_buf::BufferRegistrar>,
+    pub(crate) registrar: Box<dyn veloq_buf::BufferRegistrar + 'a>,
     pub(crate) registration_stats: UringRegistrationStats,
     pub(crate) registration_mode: BufferRegistrationMode,
-    pub(crate) chunk_register_failures_recent: HashMap<u16, Instant>,
-    pub(crate) registered_files: Vec<Option<RegisteredFileEntry>>,
-    pub(crate) file_generations: Vec<u64>,
+    pub(crate) chunk_register_failures_recent: HashMap<veloq_buf::heap::ChunkId, Instant>,
+    pub(crate) file_slots: Vec<FileSlot>,
     pub(crate) free_file_slots: Vec<u32>,
     pub(crate) file_table_initialized: bool,
 }
 
-impl UringDriver {
-    fn new_internal(config: impl AsRef<UringConfig>) -> UringResult<Self> {
+impl<'a> UringDriver<'a> {
+    fn new_internal(
+        config: impl AsRef<UringConfig>,
+        registrar: Box<dyn veloq_buf::BufferRegistrar + 'a>,
+    ) -> UringResult<Self> {
         let config = config.as_ref();
         let mut builder = IoUring::builder();
 
@@ -150,54 +176,45 @@ impl UringDriver {
                     Err(e)
                 }
             })
-            .map_err(|e| from_io_error(UringError::DriverInit, "driver.new.build_ring", e))?;
+            .map_err(|e| UringError::DriverInit.io_report("driver.new.build_ring", e))?;
 
-        let ops = OpRegistry::new(entries as usize);
-        let completion_table: SharedCompletionTable<UringUserPayload> = ops.shared.clone();
+        let ops = UringOpRegistry::new(entries as usize);
+        let completion_table: SharedCompletionTable<UringSlotSpec> = ops.shared.clone();
+        let completion_diagnostics = ops.shared.completion_diagnostics();
 
-        let waker_fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-        if waker_fd < 0 {
-            return Err(from_io_error(
-                UringError::DriverInit,
-                "driver.new.eventfd",
-                io::Error::last_os_error(),
-            ));
-        }
+        let waker_fd = Self::create_event_fd("driver.new.eventfd")?;
 
         debug!("Initalized UringDriver with {} entries", entries);
 
         let is_waked = Arc::new(AtomicBool::new(false));
+        let (remote_cancel_sender, remote_cancel_receiver) = mpsc::channel();
 
         let mut driver = Self {
             ring,
             ops,
             backlog: VecDeque::new(),
             pending_cancellations: VecDeque::new(),
-            completion_events: std::sync::Arc::new(crossbeam_queue::SegQueue::new()),
+            pending_cancel_cqes: HashMap::new(),
+            next_cancel_id: 1,
+            completion_diagnostics,
             completion_table,
-            detached_cancel_table: Arc::new(DetachedCancelTable::new(entries as usize)),
-            waker_fd: Arc::new(EventFd {
-                // SAFETY: `eventfd` returns a freshly created fd owned by this driver.
-                fd: unsafe {
-                    OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_file(
-                        waker_fd,
-                    )))
-                },
-            }),
+            remote_cancel_sender,
+            remote_cancel_receiver,
+            waker_state: Arc::new(WakerFdState::new(waker_fd)),
             waker_registered_fd: None,
-            waker_token: None,
+            waker_armed: false,
+            waker_buf: Box::new([0; 8]),
             registered_chunks: veloq_bitset::BitSet::new(MAX_CHUNKS),
             is_waked,
 
             wheel: veloq_wheel::Wheel::new(veloq_wheel::WheelConfig::default()),
             timer_buffer: Vec::new(),
             last_timer_poll: Instant::now(),
-            registrar: Box::new(veloq_buf::NoopRegistrar),
+            registrar,
             registration_stats: UringRegistrationStats::default(),
             registration_mode: config.registration_mode,
             chunk_register_failures_recent: HashMap::new(),
-            registered_files: Vec::new(),
-            file_generations: Vec::new(),
+            file_slots: Vec::new(),
             free_file_slots: Vec::new(),
             file_table_initialized: false,
         };
@@ -220,121 +237,128 @@ impl UringDriver {
         Ok(driver)
     }
 
-    pub fn new(config: impl AsRef<UringConfig>) -> UringResult<Self> {
-        Self::new_internal(config).map_err(|e| e.attach_note("create uring driver"))
+    pub fn new(
+        config: impl AsRef<UringConfig>,
+        registrar: Box<dyn veloq_buf::BufferRegistrar + 'a>,
+    ) -> UringResult<Self> {
+        Self::new_internal(config, registrar).attach_note("create uring driver")
     }
 
     fn has_active_ops_internal(&mut self) -> bool {
         self.ops.has_active_ops()
     }
+
+    pub(crate) fn create_event_fd(scope: &'static str) -> UringResult<Arc<EventFd>> {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        if fd < 0 {
+            return Err(UringError::DriverInit.io_report(scope, io::Error::last_os_error()));
+        }
+        Ok(Arc::new(EventFd {
+            // SAFETY: `eventfd` returns a freshly created fd owned by this driver.
+            fd: unsafe {
+                OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_file(fd)))
+            },
+        }))
+    }
+
+    pub(crate) fn rebuild_waker_fd(&mut self) -> UringResult<()> {
+        let new_fd = Self::create_event_fd("driver.rebuild_waker_fd.eventfd")?;
+        if let Some(fixed_fd) = self.waker_registered_fd {
+            let raw = RawHandle::new(UringRawHandle::for_file(new_fd.fd.raw().as_fd()));
+            self.replace_registered_fixed_fd(fixed_fd, raw)?;
+        }
+        let _old_fd = self.waker_state.replace(new_fd);
+        Ok(())
+    }
 }
 
-impl Drop for UringDriver {
+impl<'a> Drop for UringDriver<'a> {
     fn drop(&mut self) {}
 }
 
-impl Driver for UringDriver {
+impl<'a> Driver for UringDriver<'a> {
     type Op = UringOp;
     type UP = UringUserPayload;
     type Raw = UringRawHandle;
     type Sidecar = ();
     type Completion = usize;
+    type Error = UringError;
+    type SlotSpec = UringSlotSpec;
 
-    fn reserve_op(&mut self) -> DriverResult<(usize, u32)> {
+    fn reserve_op_raw(&mut self) -> DriverResult<OpToken> {
         match self.ops.insert(OpEntry::new(UringOpState::new())) {
             Ok(OpHandle {
                 index: id,
                 generation,
             }) => {
                 trace!(id, generation, "Reserved op slot");
-                self.ops.slot_reserve(id);
-                Ok((id, generation))
+                OpToken::from_registry_parts(id, generation).map_err(|err| {
+                    UringError::InvalidState
+                        .to_report()
+                        .push_ctx("scope", "uring.driver.reserve_op")
+                        .with_ctx("slot_index", id)
+                        .with_ctx("generation", generation)
+                        .with_ctx("op_token_error", format!("{err:?}"))
+                        .attach_note("reserved op slot cannot be encoded as completion token")
+                })
             }
-            Err(_) => Err(driver_error(
-                DriverErrorKind::InvalidState,
-                "uring.driver.reserve_op",
-                "OpRegistry full",
-            )),
+            Err(_) => {
+                Err(UringError::InvalidState.report("uring.driver.reserve_op", "OpRegistry full"))
+            }
         }
     }
 
-    fn slot_table(
-        &self,
-    ) -> std::sync::Arc<
-        veloq_driver_core::slot::SlotTable<Self::Op, Self::UP, Self::Sidecar, Self::Completion>,
-    > {
+    fn slot_table(&self) -> SharedDriverSlotTable<Self> {
         self.ops.shared.clone()
     }
 
-    fn detached_cancel_table(&self) -> std::sync::Arc<DetachedCancelTable> {
-        self.detached_cancel_table.clone()
+    fn remote_cancel_sender(&self) -> RemoteCancelSender {
+        self.remote_cancel_sender.clone()
     }
 
-    fn slot_set_payload(&mut self, user_data: usize, payload: UringUserPayload) {
-        let _ =
-            self.ops
-                .with_slot_storage_mut(user_data, |_op, _result, payload_cell, _sidecar| {
-                    *payload_cell = Some(payload);
-                });
+    fn try_recv_remote_cancel_request(&mut self) -> Option<CancelRequest> {
+        self.remote_cancel_receiver.try_recv().ok()
     }
 
-    fn slot_take_payload(&mut self, user_data: usize) -> Option<UringUserPayload> {
+    fn slot_set_payload_raw(&mut self, token: OpToken, payload: UringUserPayload) {
+        let _ = self
+            .ops
+            .with_slot_storage_mut(token, |_result, payload_cell, _sidecar| {
+                *payload_cell = Some(payload);
+            });
+    }
+
+    fn slot_take_payload_raw(&mut self, token: OpToken) -> Option<UringUserPayload> {
         self.ops
-            .with_slot_storage_mut(user_data, |_op, _result, payload_cell, _sidecar| {
-                payload_cell.take()
-            })
+            .with_slot_storage_mut(token, |_result, payload_cell, _sidecar| payload_cell.take())
             .flatten()
     }
 
-    fn submit(
+    fn release_op_slot_raw(&mut self, token: OpToken) {
+        let _ = self.ops.remove(token);
+    }
+
+    fn submit_op_raw(
         &mut self,
-        user_data: usize,
+        token: OpToken,
         op_in: &mut Option<Self::Op>,
-        binder: SubmitBinder,
-    ) -> Outcome<Result<Poll<()>, (DriverErrorReport, SubmitStatus)>> {
+    ) -> DriverSubmitResult<Self::Error> {
         let Some(op) = op_in.take() else {
-            return binder.err(
-                map_uring_error(
-                    invalid_state("driver.submit", "submit called with empty Option"),
-                    DriverErrorKind::InvalidState,
-                    "uring.driver.submit",
-                    "submit called with empty Option",
-                ),
+            return DriverSubmitResult::failed(
+                UringError::InvalidState
+                    .report("driver.submit", "submit called with empty Option")
+                    .push_ctx("scope", "uring.driver.submit")
+                    .attach_note("submit called with empty Option"),
                 SubmitStatus::Void,
             );
         };
         let op: UringOp = op;
         let strategy = op.vtable.strategy;
-        if strategy == crate::op::SubmissionStrategy::BackgroundOnly {
-            *op_in = Some(op);
-            return binder.err(
-                driver_error(
-                    DriverErrorKind::Unsupported,
-                    "uring.driver.submit",
-                    "background op cannot be submitted normally",
-                ),
-                SubmitStatus::Void,
-            );
-        }
 
         match strategy {
-            crate::op::SubmissionStrategy::BackgroundOnly => binder.err(
-                map_uring_error(
-                    invalid_state(
-                        "driver.submit",
-                        "background strategy reached normal submit path",
-                    ),
-                    DriverErrorKind::InvalidState,
-                    "uring.driver.submit",
-                    "background strategy reached normal submit path",
-                ),
-                SubmitStatus::Void,
-            ),
-            crate::op::SubmissionStrategy::SubmitSqe => {
-                self.submit_sqe_internal(user_data, op, op_in, binder)
-            }
+            crate::op::SubmissionStrategy::SubmitSqe => self.submit_sqe_internal(token, op, op_in),
             crate::op::SubmissionStrategy::SoftwareTimer => {
-                self.submit_timer_internal(user_data, op, op_in, binder)
+                self.submit_timer_internal(token, op, op_in)
             }
         }
     }
@@ -342,13 +366,9 @@ impl Driver for UringDriver {
     fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome> {
         match mode {
             DriveMode::Poll => {
-                self.poll_nonblocking_internal().map_err(|e| {
-                    driver_error(
-                        DriverErrorKind::Completion,
-                        "uring.driver.drive.poll",
-                        format!("{e:#}"),
-                    )
-                })?;
+                self.poll_nonblocking_internal()
+                    .push_ctx("scope", "uring.driver.drive.poll")
+                    .attach_note("poll completions")?;
             }
             DriveMode::Wait => {
                 let pending_progress =
@@ -359,11 +379,9 @@ impl Driver for UringDriver {
                         pending_progress,
                     });
                 }
-                self.wait_internal().to_driver_result(
-                    DriverErrorKind::Completion,
-                    "uring.driver.drive.wait",
-                    "wait for completions",
-                )?;
+                self.wait_internal()
+                    .push_ctx("scope", "uring.driver.drive.wait")
+                    .attach_note("wait for completions")?;
             }
         }
 
@@ -375,62 +393,54 @@ impl Driver for UringDriver {
         })
     }
 
-    fn completion_queue(&self) -> SharedCompletionQueue {
-        self.completion_events.clone()
-    }
-
-    fn completion_table(&self) -> SharedCompletionTable<UringUserPayload> {
+    fn completion_table(&self) -> SharedCompletionTable<Self::SlotSpec> {
         self.completion_table.clone()
     }
 
-    fn cancel_op(&mut self, user_data: usize) {
-        self.cancel_op_internal(user_data);
+    fn cancel_op(&mut self, request: CancelRequest) -> DriverResult<CancelSubmitOutcome> {
+        Ok(self.cancel_op_internal(request))
     }
 
-    fn register_chunk(&mut self, id: u16, ptr: *const u8, len: usize) -> DriverResult<()> {
-        self.register_chunk_internal(id, ptr, len).to_driver_result(
-            DriverErrorKind::Registration,
-            "uring.driver.register_chunk",
-            "register chunk",
-        )
-    }
-
-    fn register_files<'a>(
+    fn register_chunk(
         &mut self,
-        files: Vec<RegisterFd<'a, UringRawHandle>>,
+        id: veloq_buf::heap::ChunkId,
+        ptr: *const u8,
+        len: usize,
+    ) -> DriverResult<()> {
+        self.register_chunk_internal(id, ptr, len)
+            .push_ctx("scope", "uring.driver.register_chunk")
+            .with_ctx("driver_error_kind", UringError::Registration.to_string())
+            .attach_note("register chunk")
+    }
+
+    fn register_files<'f>(
+        &mut self,
+        files: Vec<RegisterFd<'f, UringRawHandle>>,
     ) -> DriverResult<Vec<IoFd>> {
-        self.register_files_internal(files).to_driver_result(
-            DriverErrorKind::Registration,
-            "uring.driver.register_files",
-            "register files",
-        )
+        self.register_files_internal(files)
+            .push_ctx("scope", "uring.driver.register_files")
+            .attach_note("register files")
     }
 
     fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<()> {
         for fd in files {
-            self.unregister_fixed_fd(fd).to_driver_result(
-                DriverErrorKind::Registration,
-                "uring.driver.unregister_files",
-                "unregister fixed fd",
-            )?;
+            self.unregister_fixed_fd(fd)
+                .push_ctx("scope", "uring.driver.unregister_files")
+                .attach_note("unregister fixed fd")?;
         }
         Ok(())
     }
 
-    fn create_waker(&self) -> Arc<dyn RemoteWaker> {
+    fn create_waker(&self) -> Arc<dyn RemoteWaker<UringError>> {
         Arc::new(UringWaker {
-            fd: self.waker_fd.clone(),
+            state: self.waker_state.clone(),
             is_waked: self.is_waked.clone(),
         })
-    }
-
-    fn set_registrar(&mut self, registrar: Box<dyn veloq_buf::BufferRegistrar>) {
-        self.registrar = registrar;
     }
 }
 
 #[cfg(feature = "test-hooks")]
-impl veloq_driver_core::driver::test_hooks::DriverTestHooks for UringDriver {
+impl veloq_driver_core::driver::test_hooks::DriverTestHooks for UringDriver<'_> {
     fn debug_chunk_register_attempts(&self) -> u64 {
         self.registration_stats.chunk_register_attempts
     }

@@ -4,8 +4,9 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use veloq::fs::{BufferingMode, File, OpenOptions};
-use veloq::io::buffer::{BufPool, FixedBuf};
-use veloq::runtime::{Runtime, context};
+use veloq::io::buffer::FixedBuf;
+use veloq::runtime::Runtime;
+use veloq::runtime::context::RuntimeContext;
 use veloq::sync::mpsc;
 use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
 
@@ -166,7 +167,12 @@ fn get_file_path(t_idx: usize) -> PathBuf {
 
 /// Prepare files Phase: Create and fallocate files
 /// This runs effectively in parallel per thread, but outside the measurement loop.
-async fn prepare_files_for_thread(file_size: u64, t_idx: usize, buffering_mode: BufferingMode) {
+async fn prepare_files_for_thread<'a, 'ctx>(
+    ctx: RuntimeContext<'a, 'ctx>,
+    file_size: u64,
+    t_idx: usize,
+    buffering_mode: BufferingMode,
+) {
     let path = get_file_path(t_idx);
     if path.exists() {
         let _ = std::fs::remove_file(&path);
@@ -177,7 +183,7 @@ async fn prepare_files_for_thread(file_size: u64, t_idx: usize, buffering_mode: 
         .create(true)
         .truncate(true)
         .buffering(buffering_mode)
-        .open(&path)
+        .open(ctx, &path)
         .await
         .expect("Failed to create file during preparation");
 
@@ -199,7 +205,7 @@ fn cleanup_files(threads: usize) {
     }
 }
 
-async fn apply_sync(file: &File, mode: SyncMode, bytes: u64) {
+async fn apply_sync<'a, 'ctx>(file: &File<'a, 'ctx>, mode: SyncMode, bytes: u64) {
     match mode {
         SyncMode::None => {}
         SyncMode::SyncRange => {
@@ -219,17 +225,15 @@ async fn apply_sync(file: &File, mode: SyncMode, bytes: u64) {
     }
 }
 
-async fn run_iteration_measured(
-    ctx: &veloq::runtime::RuntimeScopeContext,
+async fn run_iteration_measured<'a, 'ctx>(
+    ctx: RuntimeContext<'a, 'ctx>,
     qdepth: usize,
-    file: &File,
+    file: &File<'a, 'ctx>,
     ops: &[WriteOp],
     block_size: NonZeroUsize,
     sync_mode: SyncMode,
     available_buffers: &mut Vec<FixedBuf>,
 ) -> IterationResult {
-    let pool = context::current_pool().expect("Worker should have bound pool");
-
     // We need ownership of buffers to submit them.
     // We will collect them back as tasks finish.
 
@@ -255,7 +259,7 @@ async fn run_iteration_measured(
             while in_flight < qdepth && current_op_idx < total_ops {
                 let buf = if let Some(b) = available_buffers.pop() {
                     b
-                } else if let Some(b) = pool.alloc(block_size) {
+                } else if let Ok(b) = ctx.try_alloc(block_size) {
                     // Fallback if initial set wasn't enough (shouldn't happen if properly sized)
                     b
                 } else {
@@ -309,8 +313,8 @@ async fn run_iteration_measured(
     }
 }
 
-async fn run_worker(
-    ctx: &veloq::runtime::RuntimeScopeContext,
+async fn run_worker<'a, 'ctx>(
+    ctx: RuntimeContext<'a, 'ctx>,
     qdepth: usize,
     min_duration: Duration,
     min_iters: usize,
@@ -318,14 +322,12 @@ async fn run_worker(
     sync_mode: SyncMode,
     config: ThreadConfig,
 ) -> std::io::Result<Vec<IterationResult>> {
-    let pool = context::current_pool().expect("No pool");
-
     // 1. Open File (Persistent handle for benchmarking)
     let file = OpenOptions::new()
         .write(true)
         .create(false) // already created
         .buffering(buffering_mode)
-        .open(&config.file_path)
+        .open(ctx, &config.file_path)
         .await
         .expect("Failed to open file in worker");
 
@@ -334,7 +336,7 @@ async fn run_worker(
     // This mimics static buffer pools in standard benchmarks.
     let mut reuse_buffers = Vec::with_capacity(qdepth);
     for _ in 0..qdepth {
-        if let Some(buf) = pool.alloc(config.block_size) {
+        if let Ok(buf) = ctx.try_alloc(config.block_size) {
             reuse_buffers.push(buf);
         } else {
             panic!("Failed to allocate initial buffers for queue depth coverage");
@@ -454,9 +456,18 @@ fn main() {
             let mut prepare_handles = Vec::with_capacity(args.threads);
             for t_idx in 0..args.threads {
                 let prepare_buffering = buffering_mode;
-                prepare_handles.push(s.spawn_boxed_to(t_idx, async move || {
-                    prepare_files_for_thread(FILE_SIZE_PER_THREAD, t_idx, prepare_buffering).await;
-                }));
+                prepare_handles.push(
+                    s.spawn_boxed_to(t_idx, async move || {
+                        prepare_files_for_thread(
+                            ctx,
+                            FILE_SIZE_PER_THREAD,
+                            t_idx,
+                            prepare_buffering,
+                        )
+                        .await;
+                    })
+                    .expect("prepare task dispatch failed"),
+                );
             }
             for handle in prepare_handles {
                 handle.await.expect("Preparation task failed");
@@ -474,18 +485,21 @@ fn main() {
                 let worker_sync = sync_mode;
                 let t_idx = config.thread_index;
 
-                worker_handles.push(s.spawn_boxed_to(t_idx, async move || {
-                    run_worker(
-                        ctx,
-                        qdepth,
-                        duration_limit,
-                        min_iters,
-                        worker_buffering,
-                        worker_sync,
-                        config,
-                    )
-                    .await
-                }));
+                worker_handles.push(
+                    s.spawn_boxed_to(t_idx, async move || {
+                        run_worker(
+                            ctx,
+                            qdepth,
+                            duration_limit,
+                            min_iters,
+                            worker_buffering,
+                            worker_sync,
+                            config,
+                        )
+                        .await
+                    })
+                    .expect("worker task dispatch failed"),
+                );
             }
 
             // 3. Aggregate

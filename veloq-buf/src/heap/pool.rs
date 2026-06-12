@@ -3,13 +3,14 @@
 use super::buddy::BuddyAllocator;
 use super::cache::{LocalCacheEntry, TLS_CACHE};
 use super::units::{
-    ChunkInfo, GlobalAllocatorConfig, SLOT_SIZE, SUPERBLOCK_ORDER, SUPERBLOCK_SIZE, SlotIndex,
-    SuperblockState,
+    ChunkId, ChunkInfo, GlobalAllocatorConfig, PageAlignedBytes, SUPERBLOCK_ORDER, ShardIndex,
+    SlotCount, SlotIndex, SuperblockIndex, SuperblockState,
 };
+use crate::buffer::{BufError, BufResult};
 use crossbeam_utils::CachePadded;
+use diagweave::prelude::*;
 use parking_lot::{Mutex, RwLock};
 use std::hash::{Hash, Hasher};
-use std::io;
 use std::num::NonZeroUsize;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -27,18 +28,19 @@ unsafe impl Send for MemoryChunk {}
 unsafe impl Sync for MemoryChunk {}
 
 impl MemoryChunk {
-    pub fn new(size: NonZeroUsize) -> std::io::Result<Self> {
+    pub fn new(size: NonZeroUsize) -> BufResult<Self> {
         let ptr = unsafe {
             // Try Huge Pages first
             match crate::os::alloc_huge_pages(size) {
                 Ok(p) => NonNull::new(p),
                 Err(_) => {
                     // Fallback to standard pages if Huge Pages failed
-                    crate::os::alloc_pages(size).map(NonNull::new)?
+                    let p = crate::os::alloc_pages(size).trans()?;
+                    NonNull::new(p)
                 }
             }
         }
-        .ok_or_else(|| std::io::Error::other("Allocation failed"))?;
+        .ok_or_else(|| BufError::AllocFailed("Allocation returned null pointer".to_string()))?;
         Ok(Self { ptr, size })
     }
 
@@ -83,7 +85,7 @@ impl Drop for MemoryChunk {
 
 /// A Managed Chunk of memory with its own Allocator(s).
 pub struct Chunk {
-    pub id: u16,
+    pub id: ChunkId,
 
     /// The sharded buddy allocators
     ///
@@ -109,17 +111,15 @@ pub struct Chunk {
     pub(crate) memory: Arc<MemoryChunk>,
 
     /// Number of slots per shard
-    pub(crate) slots_per_shard: usize,
+    pub(crate) slots_per_shard: SlotCount,
 }
 
 impl Chunk {
-    pub fn new(id: u16, size: usize) -> io::Result<Self> {
+    pub fn new(id: ChunkId, size: PageAlignedBytes) -> BufResult<Self> {
         // 1. Allocate the massive slab
-        let chunk = Arc::new(MemoryChunk::new(unsafe {
-            NonZeroUsize::new_unchecked(size)
-        })?);
+        let chunk = Arc::new(MemoryChunk::new(size.as_non_zero())?);
 
-        let total_slots = size / SLOT_SIZE;
+        let total_slots = size.slot_count();
 
         // 2. Determine Shard Layout
         // Dynamic sharding based on CPU cores, scaled for contention.
@@ -133,7 +133,7 @@ impl Chunk {
         let mut shard_count = parallelism.next_power_of_two().max(16);
 
         // Constraint: Each shard must accomodate at least one Superblock (64 slots)
-        let max_shards = total_slots / SUPERBLOCK_SIZE;
+        let max_shards = total_slots.superblock_count();
         if max_shards > 0 && shard_count > max_shards {
             shard_count = 1 << (usize::BITS - 1 - max_shards.leading_zeros());
         } else if max_shards == 0 {
@@ -142,14 +142,11 @@ impl Chunk {
             shard_count = 1;
         }
 
-        let slots_per_shard = total_slots / shard_count; // Integer division
-        let bytes_per_shard = slots_per_shard * SLOT_SIZE;
+        let slots_per_shard = total_slots.per_shard(shard_count); // Integer division
+        let bytes_per_shard = slots_per_shard.bytes();
 
-        if slots_per_shard == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "Chunk memory size too small for sharding",
-            ));
+        if slots_per_shard.get() == 0 {
+            return BufError::ChunkTooSmall.trans();
         }
 
         // 3. Initialize Buddy Allocators (Sharded)
@@ -166,7 +163,7 @@ impl Chunk {
         }
 
         // 4. Initialize Superblock States
-        let num_superblocks = total_slots / SUPERBLOCK_SIZE;
+        let num_superblocks = total_slots.superblock_count();
         let states: Vec<CachePadded<SuperblockState>> = (0..num_superblocks)
             .map(|_| CachePadded::new(SuperblockState::new()))
             .collect();
@@ -182,7 +179,7 @@ impl Chunk {
     }
 
     /// Resolve SlotIndex to Raw Pointer within this Chunk
-    pub fn resolve_ptr(&self, index: SlotIndex) -> NonNull<u8> {
+    pub(crate) fn resolve_ptr(&self, index: SlotIndex) -> NonNull<u8> {
         let offset = index.offset();
         assert!(
             offset < self.memory.len(),
@@ -194,10 +191,10 @@ impl Chunk {
 
     // Internal alloc/dealloc methods specific to this Chunk
     pub(crate) fn alloc_slots(
-        &self,
+        self: &Arc<Self>,
         order: usize,
         seed: Option<usize>,
-    ) -> Option<(SlotIndex, NonNull<u8>)> {
+    ) -> Option<ChunkAlloc> {
         // Fast Path: Order 0 (4KB) uses Thread Local Superblock Cache
         if order == 0 {
             // 1. No Active Superblock in global. Just find one via global.
@@ -205,21 +202,27 @@ impl Chunk {
 
             // 2. No Active Superblock. Alloc New.
             if let Some((base_idx, _)) = self.alloc_global(SUPERBLOCK_ORDER, seed) {
-                let sb_idx = base_idx.0 / SUPERBLOCK_SIZE;
+                let sb_idx = base_idx.superblock_index();
 
                 // Initialize State
                 // CRITICAL: We must hold the state in "Active" mode before anyone else can touch it.
                 // Since we just alloced it, no one else has pointers to slots inside it.
-                self.superblocks[sb_idx].init();
+                self.superblocks[sb_idx.get()].init();
 
                 // Alloc one
-                let offset = self.superblocks[sb_idx]
+                let offset = self.superblocks[sb_idx.get()]
                     .alloc_one()
                     .expect("Fresh superblock must have space");
 
-                let global_idx = SlotIndex(sb_idx * SUPERBLOCK_SIZE + offset as usize);
+                let global_idx = SlotIndex::from_superblock_offset(sb_idx, offset);
                 let ptr = self.resolve_ptr(global_idx);
-                return Some((global_idx, ptr));
+                return Some(ChunkAlloc::Small(SmallAlloc {
+                    chunk: self.clone(),
+                    chunk_id: self.id,
+                    sb_idx,
+                    slot_idx: global_idx,
+                    ptr,
+                }));
             }
 
             // Fallback
@@ -227,7 +230,13 @@ impl Chunk {
         }
 
         // Large Allocations: Direct Global
-        self.alloc_global(order, seed)
+        self.alloc_global(order, seed).map(|(slot_idx, ptr)| {
+            ChunkAlloc::Large(LargeAlloc {
+                chunk_id: self.id,
+                slot_idx,
+                ptr,
+            })
+        })
     }
 
     /// Internal helper for direct global operations
@@ -249,7 +258,7 @@ impl Chunk {
         // Start shard based on hash
         // Optimization: shard_count is always power of 2 (enforced in new)
         let mask = shard_count - 1;
-        let start_shard = hash & mask;
+        let start_shard = ShardIndex::new(hash & mask);
 
         // Randomized Stealing Stride
         // We use the upper bits of the hash to generate a stride.
@@ -261,18 +270,18 @@ impl Chunk {
         // Scan ALL shards using the permuted order.
         for i in 0..shard_count {
             // idx = (start + i * stride) % count
-            let idx = (start_shard.wrapping_add(i.wrapping_mul(stride))) & mask;
+            let idx =
+                ShardIndex::new((start_shard.get().wrapping_add(i.wrapping_mul(stride))) & mask);
 
-            if let Some(mut buddy) = self.shards[idx].try_lock()
+            if let Some(mut buddy) = self.shards[idx.get()].try_lock()
                 && let Some(local_idx) = buddy.alloc(order)
             {
                 let ptr = buddy.ptr_of(local_idx);
 
-                // Convert local slot index to global slot index
-                // Global = ShardBase + Local
-                let global_idx_val = (idx * self.slots_per_shard) + local_idx.0;
-
-                return Some((SlotIndex(global_idx_val), ptr));
+                return Some((
+                    SlotIndex::from_shard_local(idx, self.slots_per_shard, local_idx),
+                    ptr,
+                ));
             }
         }
 
@@ -280,16 +289,18 @@ impl Chunk {
         // If we are here, either all shards are contented, or all are full.
         // Iterate through all shards again, blocking on each.
         for i in 0..shard_count {
-            let idx = (start_shard.wrapping_add(i.wrapping_mul(stride))) & mask;
+            let idx =
+                ShardIndex::new((start_shard.get().wrapping_add(i.wrapping_mul(stride))) & mask);
 
             // Block until lock acquired
-            let mut buddy = self.shards[idx].lock();
+            let mut buddy = self.shards[idx.get()].lock();
             if let Some(local_idx) = buddy.alloc(order) {
                 let ptr = buddy.ptr_of(local_idx);
 
-                let global_idx_val = (idx * self.slots_per_shard) + local_idx.0;
-
-                return Some((SlotIndex(global_idx_val), ptr));
+                return Some((
+                    SlotIndex::from_shard_local(idx, self.slots_per_shard, local_idx),
+                    ptr,
+                ));
             }
         }
 
@@ -300,16 +311,16 @@ impl Chunk {
     pub(crate) unsafe fn dealloc_slots(&self, index: SlotIndex, order: usize) {
         // Fast Path: Order 0 uses Superblock State
         if order == 0 {
-            let sb_idx = index.0 / SUPERBLOCK_SIZE;
-            let offset = (index.0 % SUPERBLOCK_SIZE) as u16;
+            let sb_idx = index.superblock_index();
+            let offset = index.superblock_offset();
 
-            if sb_idx >= self.superblocks.len() {
+            if sb_idx.get() >= self.superblocks.len() {
                 return;
             }
 
             // Free slot in bitmap
             // If returns true, Block is Empty AND Inactive -> Return to Buddy
-            if self.superblocks[sb_idx].free_one(offset) {
+            if self.superblocks[sb_idx.get()].free_one(offset) {
                 self.dealloc_superblock(sb_idx);
             }
             return;
@@ -320,9 +331,8 @@ impl Chunk {
         }
     }
 
-    pub(crate) fn dealloc_superblock(&self, sb_idx: usize) {
-        let global_idx = SlotIndex(sb_idx * SUPERBLOCK_SIZE);
-        unsafe { self.dealloc_global(global_idx, SUPERBLOCK_ORDER) };
+    pub(crate) fn dealloc_superblock(&self, sb_idx: SuperblockIndex) {
+        unsafe { self.dealloc_global(sb_idx.base_slot(), SUPERBLOCK_ORDER) };
     }
 
     unsafe fn dealloc_global(&self, index: SlotIndex, order: usize) {
@@ -330,15 +340,17 @@ impl Chunk {
         let (shard_idx, local_idx) = self.shard_for_index(index);
 
         // Boundary check
-        if shard_idx >= self.shards.len() {
+        if shard_idx.get() >= self.shards.len() {
             panic!(
                 "Chunk {}: Invalid slot index {} (shard {})",
-                self.id, index.0, shard_idx
+                self.id,
+                index.get(),
+                shard_idx.get()
             );
         }
 
         // 2. Deallocate in strict shard
-        let mut buddy = self.shards[shard_idx].lock();
+        let mut buddy = self.shards[shard_idx.get()].lock();
         unsafe {
             buddy
                 .dealloc(local_idx, order)
@@ -347,11 +359,28 @@ impl Chunk {
     }
 
     /// Helper: Map Global SlotIndex to Shard and Local Index
-    fn shard_for_index(&self, index: SlotIndex) -> (usize, SlotIndex) {
-        let shard_idx = index.0 / self.slots_per_shard;
-        let local_idx = index.0 % self.slots_per_shard;
-        (shard_idx, SlotIndex(local_idx))
+    fn shard_for_index(&self, index: SlotIndex) -> (ShardIndex, SlotIndex) {
+        index.shard_local(self.slots_per_shard)
     }
+}
+
+pub(crate) struct SmallAlloc {
+    pub(crate) chunk: Arc<Chunk>,
+    pub(crate) chunk_id: ChunkId,
+    pub(crate) sb_idx: SuperblockIndex,
+    pub(crate) slot_idx: SlotIndex,
+    pub(crate) ptr: NonNull<u8>,
+}
+
+pub(crate) struct LargeAlloc {
+    pub(crate) chunk_id: ChunkId,
+    pub(crate) slot_idx: SlotIndex,
+    pub(crate) ptr: NonNull<u8>,
+}
+
+pub(crate) enum ChunkAlloc {
+    Small(SmallAlloc),
+    Large(LargeAlloc),
 }
 
 pub type ChunkListener = Box<dyn Fn(ChunkInfo) + Send + Sync>;
@@ -369,18 +398,18 @@ pub struct GlobalSlotPool {
 
 impl GlobalSlotPool {
     /// Create a new GlobalSlotPool
-    pub fn new(config: GlobalAllocatorConfig) -> io::Result<Self> {
+    pub fn new(config: GlobalAllocatorConfig) -> BufResult<Self> {
         let total_size = config.total_memory;
 
         if total_size < super::units::MIN_THREAD_MEMORY.get() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Total memory too small",
-            ));
+            return BufError::ChunkTooSmall.trans();
         }
 
+        let total_size = PageAlignedBytes::from_usize(total_size)
+            .ok_or(BufError::PageUnaligned { size: total_size })?;
+
         // Initial Chunk (ID=0)
-        let chunk0 = Chunk::new(0, total_size)?;
+        let chunk0 = Chunk::new(ChunkId::ZERO, total_size)?;
 
         Ok(Self {
             chunks: CachePadded::new(RwLock::new(vec![Arc::new(chunk0)])),
@@ -402,11 +431,11 @@ impl GlobalSlotPool {
     /// - `u16`: Chunk ID
     /// - `SlotIndex`: The within-chunk index.
     /// - `NonNull<u8>`: The raw pointer to the memory.
-    pub fn alloc_slots(
+    pub(crate) fn alloc_slots(
         &self,
         order: usize,
         seed: Option<usize>,
-    ) -> Option<(u16, SlotIndex, NonNull<u8>)> {
+    ) -> Option<(ChunkId, SlotIndex, NonNull<u8>)> {
         // --- Phase 0: Lockless TLS Fast Path (Order 0) ---
         if order == 0 {
             let pool_id = self as *const _ as usize;
@@ -420,32 +449,16 @@ impl GlobalSlotPool {
             let chunks = self.chunks.read();
             let mut found = None;
             for chunk in chunks.iter() {
-                if let Some((idx, ptr)) = chunk.alloc_slots(order, seed) {
-                    found = Some((chunk.id, idx, ptr, chunk.clone()));
+                if let Some(alloc) = chunk.alloc_slots(order, seed) {
+                    found = Some(alloc);
                     break;
                 }
             }
             found
         };
 
-        if let Some((chunk_id, idx, ptr, chunk_ref)) = res {
-            // If order 0, cache the chunk/superblock for future lockless access
-            if order == 0 {
-                let pool_id = self as *const _ as usize;
-                let sb_idx = idx.0 / SUPERBLOCK_SIZE;
-                TLS_CACHE.with(|cache| {
-                    cache.insert(
-                        pool_id,
-                        LocalCacheEntry {
-                            chunk: chunk_ref,
-                            sb_idx,
-                            chunk_id,
-                        },
-                    );
-                });
-            }
-
-            return Some((chunk_id, idx, ptr));
+        if let Some(alloc) = res {
+            return Some(self.finish_alloc(alloc));
         }
 
         // 2. Dynamic Expansion (Write Lock)
@@ -454,29 +467,24 @@ impl GlobalSlotPool {
 
             // Double-check: Someone might have expanded while we waited for the lock
             for chunk in chunks.iter() {
-                if let Some((idx, ptr)) = chunk.alloc_slots(order, seed) {
-                    return Some((chunk.id, idx, ptr));
+                if let Some(alloc) = chunk.alloc_slots(order, seed) {
+                    return Some(self.finish_alloc(alloc));
                 }
             }
 
             // 3. Expand Pool
             let next_id = chunks.len();
-            if next_id > u16::MAX as usize {
-                // ID overflow
-                return None;
-            }
-            let next_id_u16 = next_id as u16;
+            let next_id = ChunkId::from_index(next_id)?;
 
             // Strategy: fixed expansion size (e.g. 64 MB) to prevent fragmentation from small chunks
             // optimize: maybe exponential growth or configurable?
             const EXPANSION_SIZE: usize = 64 * 1024 * 1024;
 
-            tracing::info!(
-                "GlobalSlotPool: Expanding pool with Chunk ID {}",
-                next_id_u16
-            );
+            tracing::info!("GlobalSlotPool: Expanding pool with Chunk ID {}", next_id);
 
-            let new_chunk = match Chunk::new(next_id_u16, EXPANSION_SIZE) {
+            let expansion_size = PageAlignedBytes::from_usize(EXPANSION_SIZE)
+                .expect("EXPANSION_SIZE must be page aligned");
+            let new_chunk = match Chunk::new(next_id, expansion_size) {
                 Ok(c) => Arc::new(c),
                 Err(e) => {
                     tracing::error!("Failed to allocate new chunk: {}", e);
@@ -501,21 +509,44 @@ impl GlobalSlotPool {
                 listener(info);
             }
 
-            if let Some((idx, ptr)) = res {
-                return Some((next_id_u16, idx, ptr));
+            if let Some(alloc) = res {
+                return Some(self.finish_alloc(alloc));
             }
         }
 
         None
     }
 
+    fn finish_alloc(&self, alloc: ChunkAlloc) -> (ChunkId, SlotIndex, NonNull<u8>) {
+        match alloc {
+            ChunkAlloc::Small(alloc) => {
+                let chunk_id = alloc.chunk_id;
+                let slot_idx = alloc.slot_idx;
+                let ptr = alloc.ptr;
+                let pool_id = self as *const _ as usize;
+                TLS_CACHE.with(|cache| {
+                    cache.insert(
+                        pool_id,
+                        LocalCacheEntry {
+                            chunk: alloc.chunk,
+                            sb_idx: alloc.sb_idx,
+                            chunk_id,
+                        },
+                    );
+                });
+                (chunk_id, slot_idx, ptr)
+            }
+            ChunkAlloc::Large(alloc) => (alloc.chunk_id, alloc.slot_idx, alloc.ptr),
+        }
+    }
+
     /// Deallocates a block of slots.
     ///
     /// # Safety
     /// - `chunk_id`, `index`, and `order` must match a previous allocation.
-    pub unsafe fn dealloc_slots(&self, chunk_id: u16, index: SlotIndex, order: usize) {
+    pub(crate) unsafe fn dealloc_slots(&self, chunk_id: ChunkId, index: SlotIndex, order: usize) {
         let chunks = self.chunks.read();
-        if let Some(chunk) = chunks.get(chunk_id as usize) {
+        if let Some(chunk) = chunks.get(chunk_id.0 as usize) {
             // Verify ID just in case
             debug_assert_eq!(chunk.id, chunk_id);
             unsafe {
@@ -528,19 +559,32 @@ impl GlobalSlotPool {
     }
 
     /// Get Memory Info for a Chunk
-    pub fn chunk_info(&self, chunk_id: u16) -> Option<ChunkInfo> {
+    pub fn chunk_info(&self, chunk_id: ChunkId) -> Option<ChunkInfo> {
         let chunks = self.chunks.read();
-        chunks.get(chunk_id as usize).map(|c| ChunkInfo {
+        chunks.get(chunk_id.0 as usize).map(|c| ChunkInfo {
             id: c.id,
             ptr: c.memory.ptr,
             len: c.memory.size,
         })
     }
 
+    /// Get memory info for all currently allocated chunks.
+    pub fn chunk_infos(&self) -> Vec<ChunkInfo> {
+        let chunks = self.chunks.read();
+        chunks
+            .iter()
+            .map(|c| ChunkInfo {
+                id: c.id,
+                ptr: c.memory.ptr,
+                len: c.memory.size,
+            })
+            .collect()
+    }
+
     /// Get Global Memory Info (Legacy/Compat for single chunk)
     /// Returns info for Chunk 0.
     pub fn global_info(&self) -> ChunkInfo {
-        self.chunk_info(0).expect("Chunk 0 must exist")
+        self.chunk_info(ChunkId::ZERO).expect("Chunk 0 must exist")
     }
 }
 

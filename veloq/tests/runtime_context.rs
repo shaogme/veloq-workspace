@@ -1,5 +1,5 @@
 use std::num::NonZeroUsize;
-use veloq::runtime::{Runtime, context};
+use veloq::runtime::Runtime;
 use veloq_buf::{BufPool, UniformSlot, heap::ThreadMemoryMultiplier, nz};
 
 #[test]
@@ -9,8 +9,8 @@ fn runtime_binds_buf_pool_to_current_thread() {
         .build()
         .expect("failed to build runtime");
 
-    runtime.block_on(async |_| {
-        let pool = context::current_pool().expect("buffer pool should be bound");
+    runtime.block_on(async |ctx| {
+        let pool = ctx.buf_pool();
         assert!(pool.alloc(nz!(64)).is_some());
     });
 }

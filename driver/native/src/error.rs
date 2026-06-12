@@ -1,7 +1,4 @@
-pub use veloq_driver_core::{
-    DriverErrorKind, DriverErrorReport, DriverResult, ResultAsDriverExt, driver_error,
-    driver_error_kind_fallback_errno, driver_error_report_to_event_res, driver_os_error,
-};
+pub use veloq_driver_core::{DriverReport, DriverResult};
 
 #[cfg(unix)]
 pub use veloq_driver_uring::{UringError as Error, UringResult as PlatformResult};

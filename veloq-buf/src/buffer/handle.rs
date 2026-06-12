@@ -6,11 +6,17 @@ use std::ptr::NonNull;
 
 use bilge::prelude::*;
 
-use super::common::{AllocError, PoolKind, RegionInfo};
+mod range;
+pub use range::{BufIoRangeBound, BufIoRangeError, BufIoRangeErrorKind};
+
+use super::common::{PoolKind, RegionInfo};
+use super::error::{BufError, BufResult};
+use crate::heap::ChunkId;
+use diagweave::prelude::*;
 
 #[bitsize(64)]
 #[derive(FromBits, DebugBits, Clone, Copy, PartialEq, Eq)]
-pub struct PackedContext {
+pub(crate) struct PackedContext {
     pub slot_idx: u32,
     pub order: u8,
     pub chunk_id: u16,
@@ -24,8 +30,21 @@ pub(crate) struct HeapControlBlock {
 }
 
 impl PackedContext {
-    pub fn raw_payload(&self) -> u64 {
+    pub(crate) fn raw_payload(&self) -> u64 {
         u64::from(*self) & 0x00FFFFFFFFFFFFFF
+    }
+
+    pub(crate) fn from_slot_parts(
+        slot_idx: u32,
+        order: u8,
+        chunk_id: ChunkId,
+        pool_kind: PoolKind,
+    ) -> Self {
+        Self::new(slot_idx, order, chunk_id.0, pool_kind)
+    }
+
+    pub(crate) fn slot_chunk_id(&self) -> ChunkId {
+        ChunkId::from_raw(self.chunk_id())
     }
 }
 
@@ -167,19 +186,77 @@ impl FixedBuf {
         FixedBufView::new(self, range)
     }
 
+    #[inline]
+    pub fn checked_read_range(
+        &mut self,
+        buf_offset: usize,
+    ) -> Result<(*mut u8, u32), BufIoRangeError> {
+        let len = self.checked_buf_io_len(buf_offset, BufIoRangeBound::Capacity)?;
+        // SAFETY: buf_offset is verified to be within 0..=capacity above.
+        let ptr = unsafe { self.as_mut_ptr().add(buf_offset) };
+        Ok((ptr, len))
+    }
+
+    #[inline]
+    pub fn checked_write_range(
+        &self,
+        buf_offset: usize,
+    ) -> Result<(*const u8, u32), BufIoRangeError> {
+        let len = self.checked_buf_io_len(buf_offset, BufIoRangeBound::Length)?;
+        // SAFETY: buf_offset is verified to be within 0..=len above, and len <= capacity.
+        let ptr = unsafe { self.as_ptr().add(buf_offset) };
+        Ok((ptr, len))
+    }
+
+    #[inline]
+    fn checked_buf_io_len(
+        &self,
+        buf_offset: usize,
+        bound_kind: BufIoRangeBound,
+    ) -> Result<u32, BufIoRangeError> {
+        let bound = match bound_kind {
+            BufIoRangeBound::Capacity => self.capacity(),
+            BufIoRangeBound::Length => self.len(),
+        };
+
+        if buf_offset > bound {
+            return Err(BufIoRangeError::new(
+                BufIoRangeErrorKind::OffsetOutOfBounds,
+                buf_offset,
+                self.len(),
+                self.capacity(),
+                bound,
+                bound_kind,
+                0,
+            ));
+        }
+
+        let submission_length = bound - buf_offset;
+        u32::try_from(submission_length).map_err(|_| {
+            BufIoRangeError::new(
+                BufIoRangeErrorKind::LengthExceedsU32,
+                buf_offset,
+                self.len(),
+                self.capacity(),
+                bound,
+                bound_kind,
+                submission_length,
+            )
+        })
+    }
+
     /// Allocate a buffer from the system heap (not from a pool).
     ///
     /// This is used as a fallback when the pool is full.
     /// Note: Heap-allocated buffers may not be registered with the I/O driver
     /// and thus may incur overhead for direct I/O operations.
-    pub fn alloc_heap(len: NonZeroUsize) -> Result<Self, AllocError> {
+    pub fn alloc_heap(len: NonZeroUsize) -> BufResult<Self> {
         // Allocate space for the metadata block plus the payload.
         // We use os::alloc_pages to ensure page alignment for both.
-        let total_size = len.get().checked_add(4096).ok_or(AllocError::Oom)?;
+        let total_size = len.get().checked_add(4096).ok_or(BufError::Oom)?;
         let total_size_nz = unsafe { NonZeroUsize::new_unchecked(total_size) };
 
-        let base_ptr =
-            unsafe { crate::os::alloc_pages(total_size_nz) }.map_err(|_| AllocError::Oom)?;
+        let base_ptr = unsafe { crate::os::alloc_pages(total_size_nz) }.trans()?;
 
         // Initialize the control block in the first page
         let control = unsafe { &mut *(base_ptr as *mut HeapControlBlock) };
@@ -290,7 +367,7 @@ pub(crate) fn heap_resolve_region_info(buf: &FixedBuf) -> RegionInfo {
 
     RegionInfo {
         pool_kind: PoolKind::Heap,
-        id: 0,
+        id: ChunkId::ZERO,
         offset: ptr.saturating_sub(base),
         cookie: buf.context_raw(),
     }

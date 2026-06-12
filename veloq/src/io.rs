@@ -1,5 +1,4 @@
-use std::future::Future;
-use std::io;
+use std::{error::Error, future::Future};
 
 use veloq_buf::FixedBuf;
 
@@ -12,9 +11,14 @@ pub mod buffer {
 /// Suitable for underlying asynchronous read operations that require passing
 /// `FixedBuf` ownership.
 pub trait AsyncBufRead {
-    fn read(&self, buf: FixedBuf) -> impl Future<Output = io::Result<(usize, FixedBuf)>>;
+    type Error: Error;
 
-    fn read_exact(&self, buf: FixedBuf) -> impl Future<Output = io::Result<(usize, FixedBuf)>>;
+    fn read(&self, buf: FixedBuf) -> impl Future<Output = Result<(usize, FixedBuf), Self::Error>>;
+
+    fn read_exact(
+        &self,
+        buf: FixedBuf,
+    ) -> impl Future<Output = Result<(usize, FixedBuf), Self::Error>>;
 }
 
 /// Async buffered writing trait.
@@ -22,11 +26,16 @@ pub trait AsyncBufRead {
 /// Suitable for underlying asynchronous write operations that require passing
 /// `FixedBuf` ownership.
 pub trait AsyncBufWrite {
-    fn write(&self, buf: FixedBuf) -> impl Future<Output = io::Result<(usize, FixedBuf)>>;
+    type Error: Error;
 
-    fn write_all(&self, buf: FixedBuf) -> impl Future<Output = io::Result<(usize, FixedBuf)>>;
+    fn write(&self, buf: FixedBuf) -> impl Future<Output = Result<(usize, FixedBuf), Self::Error>>;
 
-    fn flush(&self) -> impl Future<Output = io::Result<()>>;
+    fn write_all(
+        &self,
+        buf: FixedBuf,
+    ) -> impl Future<Output = Result<(usize, FixedBuf), Self::Error>>;
 
-    fn shutdown(&self) -> impl Future<Output = io::Result<()>>;
+    fn flush(&self) -> impl Future<Output = Result<(), Self::Error>>;
+
+    fn shutdown(&self) -> impl Future<Output = Result<(), Self::Error>>;
 }

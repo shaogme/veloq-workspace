@@ -1,7 +1,7 @@
 use crate::config::UringRawHandle;
-use crate::error::{UringError, UringResult, from_io_error};
+use crate::error::{UringError, UringResult};
 use crate::{OwnedRawHandle, RawHandle, SockAddrStorage};
-use diagweave::report::Report;
+use diagweave::prelude::*;
 use libc::{c_int, sockaddr, sockaddr_in, sockaddr_in6, socklen_t};
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -15,11 +15,7 @@ impl Socket {
     fn new_v4(ty: c_int) -> UringResult<Self> {
         let fd = unsafe { libc::socket(libc::AF_INET, ty, 0) };
         if fd < 0 {
-            return Err(from_io_error(
-                UringError::Socket,
-                "socket.new_v4",
-                io::Error::last_os_error(),
-            ));
+            return Err(UringError::Socket.io_report("socket.new_v4", io::Error::last_os_error()));
         }
         Ok(Self {
             // SAFETY: newly created socket fd is uniquely owned.
@@ -32,11 +28,7 @@ impl Socket {
     fn new_v6(ty: c_int) -> UringResult<Self> {
         let fd = unsafe { libc::socket(libc::AF_INET6, ty, 0) };
         if fd < 0 {
-            return Err(from_io_error(
-                UringError::Socket,
-                "socket.new_v6",
-                io::Error::last_os_error(),
-            ));
+            return Err(UringError::Socket.io_report("socket.new_v6", io::Error::last_os_error()));
         }
         Ok(Self {
             // SAFETY: newly created socket fd is uniquely owned.
@@ -57,11 +49,9 @@ impl Socket {
             )
         };
         if ret < 0 {
-            return Err(from_io_error(
-                UringError::Socket,
-                "socket.setsockopt",
-                io::Error::last_os_error(),
-            ));
+            return Err(
+                UringError::Socket.io_report("socket.setsockopt", io::Error::last_os_error())
+            );
         }
         Ok(())
     }
@@ -92,11 +82,7 @@ impl Socket {
             )
         };
         if ret < 0 {
-            return Err(from_io_error(
-                UringError::Socket,
-                "socket.bind",
-                io::Error::last_os_error(),
-            ));
+            return Err(UringError::Socket.io_report("socket.bind", io::Error::last_os_error()));
         }
         Ok(())
     }
@@ -111,11 +97,7 @@ impl Socket {
             )
         };
         if ret < 0 {
-            return Err(from_io_error(
-                UringError::Socket,
-                "socket.connect",
-                io::Error::last_os_error(),
-            ));
+            return Err(UringError::Socket.io_report("socket.connect", io::Error::last_os_error()));
         }
         Ok(())
     }
@@ -123,11 +105,7 @@ impl Socket {
     pub fn listen(&self, backlog: i32) -> UringResult<()> {
         let ret = unsafe { libc::listen(self.fd.raw().as_fd(), backlog as c_int) };
         if ret < 0 {
-            return Err(from_io_error(
-                UringError::Socket,
-                "socket.listen",
-                io::Error::last_os_error(),
-            ));
+            return Err(UringError::Socket.io_report("socket.listen", io::Error::last_os_error()));
         }
         Ok(())
     }
@@ -157,16 +135,13 @@ impl Socket {
             )
         };
         if ret < 0 {
-            return Err(from_io_error(
-                UringError::Socket,
-                "socket.local_addr.getsockname",
-                io::Error::last_os_error(),
-            ));
+            return Err(UringError::Socket
+                .io_report("socket.local_addr.getsockname", io::Error::last_os_error()));
         }
         to_socket_addr(unsafe {
             std::slice::from_raw_parts(&storage as *const _ as *const u8, len as usize)
         })
-        .map_err(|e| e.attach_note("socket.local_addr.decode"))
+        .attach_note("socket.local_addr.decode")
     }
 
     pub fn set_nodelay(&self, nodelay: bool) -> UringResult<()> {
@@ -276,7 +251,7 @@ impl SocketAddrCodec for SockAddrStorage {
     type Error = UringError;
 
     fn to_socket_addr(buf: &[u8]) -> UringResult<SocketAddr> {
-        to_socket_addr(buf).map_err(|e| e.attach_note("socket_addr.decode"))
+        to_socket_addr(buf).attach_note("socket_addr.decode")
     }
 
     fn socket_addr_to_storage(addr: SocketAddr) -> (Self, Self::Len) {

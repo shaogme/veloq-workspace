@@ -1,18 +1,27 @@
-use std::future::poll_fn;
+use core::cell::UnsafeCell;
+use std::future::{Future, poll_fn};
+use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::ops::AsyncFnOnce;
-use std::sync::{Arc, mpsc::Receiver};
-use std::task::Poll;
+use std::pin::Pin;
+use std::ptr::NonNull;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, mpsc::Receiver};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use super::shared::RuntimeShared;
-use crate::scope::{AsyncScope, GenericAsyncScope, LocalAsyncScope};
-use crate::task::{LocalTaskRef, RuntimeContextExt, SendTaskRef};
+use crate::error::{Result, RuntimeError};
+use crate::scope::{AsyncScope, LocalAsyncScope};
+use crate::task::{
+    GenericTaskHeader, LocalTaskRef, RawTask, RuntimeContextExt, ScopeRef, SendTaskRef,
+    TaskHandleRef, TaskHeader, TaskVTable,
+};
 use crate::utils::FastRand;
-use crate::utils::ownership::{ArcOwnership, RcOwnership};
-use crate::utils::storage::{AtomicStorage, LocalStorage};
+use crate::utils::storage::AtomicStorage;
 
-use veloq_tls::Tls;
+use diagweave::DiagnosticResult;
+use veloq_atomic_waker::AtomicWaker;
 
 /// Worker 空闲时的等待策略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,69 +76,97 @@ impl IdleDecision {
     pub fn is_continue(self) -> bool {
         matches!(self, Self::Continue)
     }
+
+    #[inline]
+    pub(crate) fn into_wait_strategy(self) -> Option<IdleWaitStrategy> {
+        match self {
+            Self::Continue => None,
+            Self::Wait(strategy) => Some(strategy),
+        }
+    }
 }
 
 pub struct RuntimeContext {
     pub(crate) worker_id: usize,
-    pub(crate) local_rx: Receiver<LocalTaskRef>,
     pub(crate) remote_rx: Receiver<SendTaskRef>,
     pub(crate) pinned_rx: Receiver<SendTaskRef>,
+    pub(crate) local_rx: Receiver<LocalTaskRef>,
     pub(crate) rand: FastRand,
+    pub(crate) worker: crossbeam_deque::Worker<SendTaskRef>,
 }
+
+unsafe impl Send for RuntimeContext {}
+unsafe impl Sync for RuntimeContext {}
 
 /// A context handle provided to the `block_on` async closure, allowing creation of scopes.
-#[derive(Clone)]
-pub struct RuntimeScopeContext {
-    pub(crate) shared: Arc<RuntimeShared>,
+pub struct RuntimeScopeContext<'rt, T> {
+    shared: &'rt RuntimeShared<T>,
 }
 
-impl RuntimeScopeContext {
+unsafe impl<'rt, T> Send for RuntimeScopeContext<'rt, T> {}
+unsafe impl<'rt, T> Sync for RuntimeScopeContext<'rt, T> {}
+
+impl<'rt, T> Copy for RuntimeScopeContext<'rt, T> {}
+
+impl<'rt, T> Clone for RuntimeScopeContext<'rt, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'rt, T> RuntimeScopeContext<'rt, T> {
+    pub(crate) fn new(shared: &'rt RuntimeShared<T>) -> Self {
+        Self { shared }
+    }
+
     /// Returns the total worker count in the runtime.
     pub fn worker_count(&self) -> NonZeroUsize {
-        self.shared.worker_count()
+        self.shared().worker_count()
     }
 
     /// Wakes up the specified worker.
     pub fn wake_worker(&self, worker_id: usize) {
-        self.shared.wake_worker(worker_id);
+        self.shared().wake_worker(worker_id);
     }
 
     /// Checks if the runtime is shutting down.
     pub fn is_shutdown(&self) -> bool {
-        self.shared
-            .shutdown
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.shared().base.shutdown.load(Ordering::Acquire)
     }
 
     /// Returns the shared runtime state.
-    pub fn shared(&self) -> &RuntimeShared {
-        self.shared.as_ref()
+    pub fn shared(&self) -> &'rt RuntimeShared<T> {
+        self.shared
     }
 
-    pub fn route_to<F, Fut>(
+    pub fn route_to<'scope_ref, F, Fut>(
         &self,
         worker_id: usize,
         job: F,
-    ) -> std::io::Result<crate::runtime::route::RoutedFuture<'_, Fut>>
+    ) -> Result<RoutedFuture<Fut>>
     where
-        F: FnOnce() -> Fut + Send,
-        Fut: std::future::Future + Send,
+        F: FnOnce() -> Fut + Send + 'scope_ref,
+        Fut: Future + Send + 'scope_ref,
     {
-        let slot = crate::runtime::route::RouteCell::new();
+        self.shared().validate_worker_id(worker_id)?;
+
+        let slot = RouteCell::new();
         let slot_for_job = slot.clone();
 
-        struct RouteJobTask<F, Fut> {
-            header: crate::task::TaskHeader,
-            job: core::cell::UnsafeCell<Option<F>>,
-            slot: std::sync::Arc<crate::runtime::route::RouteCell<Fut>>,
+        #[repr(C)]
+        struct RouteJobTask<'scope_ref, F, Fut> {
+            header: TaskHeader,
+            job: UnsafeCell<Option<F>>,
+            slot: Arc<RouteCell<Fut>>,
+            marker: PhantomData<&'scope_ref ()>,
         }
 
-        impl<F, Fut> crate::task::RawTask for RouteJobTask<F, Fut>
+        impl<'scope_ref, F, Fut> RawTask for RouteJobTask<'scope_ref, F, Fut>
         where
-            F: FnOnce() -> Fut + Send,
-            Fut: std::future::Future + Send,
+            F: FnOnce() -> Fut + Send + 'scope_ref,
+            Fut: Future + Send + 'scope_ref,
         {
-            type Storage = crate::utils::storage::AtomicStorage;
+            type Storage = AtomicStorage;
 
             fn poll_raw(&self, _worker_id: usize) -> bool {
                 let job = unsafe { &mut *self.job.get() }
@@ -140,166 +177,190 @@ impl RuntimeScopeContext {
                 // Mark as completed before self-destruct
                 self.header.mark_completed_and_notify();
                 unsafe {
-                    let ptr = self as *const Self as *mut Self;
-                    let _ = Box::from_raw(ptr);
+                    let header_ptr = NonNull::from(&self.header);
+                    GenericTaskHeader::drop_task(header_ptr);
                 }
                 true
             }
 
-            fn header(&self) -> &crate::task::GenericTaskHeader<Self::Storage> {
+            fn header(&self) -> &GenericTaskHeader<Self::Storage> {
                 &self.header
             }
         }
 
-        impl<F, Fut> RouteJobTask<F, Fut>
+        impl<'scope_ref, F, Fut> RouteJobTask<'scope_ref, F, Fut>
         where
-            F: FnOnce() -> Fut + Send,
-            Fut: std::future::Future + Send,
+            F: FnOnce() -> Fut + Send + 'scope_ref,
+            Fut: Future + Send + 'scope_ref,
         {
-            const VTABLE: &'static crate::task::TaskVTable<crate::utils::storage::AtomicStorage> =
-                &crate::task::TaskVTable {
-                    wake: |_| {},
-                    wake_by_ref: |_| {},
-                    poll: |data, worker_id| unsafe {
-                        let node = &*(data.as_ptr() as *const Self);
-                        crate::task::RawTask::poll_raw(node, worker_id)
-                    },
-                };
+            const VTABLE: &'static TaskVTable<AtomicStorage> = &TaskVTable {
+                wake: |_| {},
+                wake_by_ref: |_| {},
+                poll: |header, worker_id| unsafe {
+                    let raw_ptr = header as *const GenericTaskHeader<AtomicStorage> as *const ();
+                    let node = &*(raw_ptr as *const Self);
+                    RawTask::poll_raw(node, worker_id)
+                },
+                drop: |data| unsafe {
+                    let ptr = data.as_ptr() as *mut Self;
+                    let _ = Box::from_raw(ptr);
+                },
+            };
         }
 
         let task = Box::new(RouteJobTask {
-            header: crate::task::TaskHeader::new(RouteJobTask::<F, Fut>::VTABLE),
-            job: core::cell::UnsafeCell::new(Some(job)),
+            header: TaskHeader::new(
+                RouteJobTask::<'scope_ref, F, Fut>::VTABLE,
+                &self.shared().base,
+                worker_id,
+                ScopeRef::<AtomicStorage>::dummy(),
+            ),
+            job: UnsafeCell::new(Some(job)),
             slot: slot_for_job,
+            marker: PhantomData,
         });
 
         task.header.set_pinned();
-        unsafe {
-            task.header
-                .set_runtime_info(Arc::as_ptr(&self.shared), worker_id);
-        }
 
         let ptr = Box::into_raw(task);
-        let task_ref = unsafe { crate::task::SendTaskRef::from_concrete(ptr) };
+        let task_ref = unsafe { SendTaskRef::from_concrete(ptr) };
+        let header_ptr = task_ref.header() as *const GenericTaskHeader<AtomicStorage>;
+        let task_ctx = unsafe { SendTaskRef::from_header(header_ptr) };
 
-        if !self.shared.enqueue_pinned(worker_id, task_ref) {
+        if !self.shared().enqueue_pinned(worker_id, task_ctx) {
             unsafe {
                 let _ = Box::from_raw(ptr);
             }
-            return Err(std::io::Error::other("failed to dispatch job to worker"));
+            let current_worker = self.worker_id();
+            let is_shutdown = self.is_shutdown();
+            return RuntimeError::DispatchFailed {
+                target_worker: worker_id,
+                current_worker,
+            }
+            .with_ctx("is_shutdown", is_shutdown);
         }
 
-        Ok(crate::runtime::route::RoutedFuture::new(slot))
+        Ok(RoutedFuture::new(slot))
     }
 
-    pub async fn execute_on_owner<F, Fut, R>(
+    pub async fn execute_on_owner<'scope_ref, F, Fut, R>(
         &self,
-        task: &impl crate::task::TaskHandleRef,
+        task: &impl TaskHandleRef,
         f: F,
-    ) -> std::io::Result<R>
+    ) -> Result<R>
     where
-        F: FnOnce() -> Fut + Send,
-        Fut: std::future::Future<Output = R> + Send,
+        F: FnOnce() -> Fut + Send + 'scope_ref,
+        Fut: Future<Output = R> + Send + 'scope_ref,
         R: Send,
     {
-        use std::sync::atomic::Ordering;
-        let worker_id =
-            crate::utils::storage::StateInt::load(&task.header().worker_id, Ordering::Acquire);
+        let worker_id = task.header().worker_id();
         Ok(self.route_to(worker_id, f)?.await)
     }
 
     /// Creates a new thread-safe (Send) asynchronous scope.
-    pub async fn scope<T, F>(&self, f: F) -> T
+    pub async fn scope<'scope, R, F>(&self, f: F) -> R
     where
-        F: for<'b, 's, 'm> AsyncFnOnce(
-            &'b GenericAsyncScope<'s, AtomicStorage, ArcOwnership, &'m ()>,
-        ) -> T,
+        F: for<'scope_ref> AsyncFnOnce(&'scope_ref AsyncScope<'rt, 'scope, T>) -> R,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
-        let s = AsyncScope::__private_new(
-            RuntimeScopeContext {
-                shared: self.shared.clone(),
-            },
-            parent,
-        );
+        let s = AsyncScope::new(*self, parent);
         let res = f(&s).await;
         s.wait_all().await;
         res
     }
 
     /// Creates a new thread-local asynchronous scope.
-    pub async fn scope_local<T, F>(&self, f: F) -> T
+    pub async fn scope_local<'scope, R, F>(&self, f: F) -> R
     where
-        F: for<'b, 's, 'm> AsyncFnOnce(
-            &'b GenericAsyncScope<'s, LocalStorage, RcOwnership, *const &'m ()>,
-        ) -> T,
+        F: for<'scope_ref> AsyncFnOnce(&'scope_ref LocalAsyncScope<'rt, 'scope, T>) -> R,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
-        let s = LocalAsyncScope::__private_new(
-            RuntimeScopeContext {
-                shared: self.shared.clone(),
-            },
-            parent,
-        );
+        let s = LocalAsyncScope::new(*self, parent);
         let res = f(&s).await;
         s.wait_all().await;
         res
     }
-}
-
-pub type IdleHook = fn() -> IdleDecision;
-pub type WorkerTickHook = fn();
-
-pub static CONTEXT: Tls<RuntimeContext> = Tls::new();
-
-/// Worker initialization context passed to the injected worker init step.
-#[derive(Clone)]
-pub struct WorkerInitContext {
-    pub shared: Arc<RuntimeShared>,
-    worker_id: usize,
-    worker_count: NonZeroUsize,
-}
-
-impl WorkerInitContext {
-    pub(crate) fn new(
-        shared: Arc<RuntimeShared>,
-        worker_id: usize,
-        worker_count: NonZeroUsize,
-    ) -> Self {
-        Self {
-            shared,
-            worker_id,
-            worker_count,
-        }
-    }
 
     /// Returns the current worker id.
-    #[inline]
     pub fn worker_id(&self) -> usize {
-        self.worker_id
-    }
-
-    /// Returns the total worker count in the runtime.
-    #[inline]
-    pub fn worker_count(&self) -> NonZeroUsize {
-        self.worker_count
-    }
-
-    /// Returns the runtime scope context.
-    #[inline]
-    pub fn runtime_context(&self) -> RuntimeScopeContext {
-        RuntimeScopeContext {
-            shared: self.shared.clone(),
-        }
+        self.shared()
+            .base
+            .tls
+            .try_with(|ctx| ctx.worker_id)
+            .unwrap_or(usize::MAX)
     }
 }
 
-#[inline(always)]
-pub fn current_worker_id() -> usize {
-    CONTEXT
-        .get()
-        .map(|ptr| unsafe { ptr.as_ref().worker_id })
-        .unwrap_or(usize::MAX)
+pub type IdleHook<T> = fn(&RuntimeShared<T>) -> IdleDecision;
+pub type WorkerTickHook = fn();
+
+pub struct RouteCell<T> {
+    value: Mutex<Option<T>>,
+    waker: AtomicWaker,
+}
+
+impl<T> RouteCell<T> {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            value: Mutex::new(None),
+            waker: AtomicWaker::new(),
+        })
+    }
+
+    pub(crate) fn set(&self, value: T) {
+        let mut slot = self.value.lock().expect("worker route slot poisoned");
+        debug_assert!(slot.is_none(), "worker route slot already populated");
+        *slot = Some(value);
+        self.waker.wake();
+    }
+
+    pub(crate) fn take(&self) -> Option<T> {
+        self.value
+            .lock()
+            .expect("worker route slot poisoned")
+            .take()
+    }
+
+    pub(crate) fn register(&self, waker: &Waker) {
+        self.waker.register(waker);
+    }
+}
+
+pub struct RoutedFuture<F> {
+    slot: Arc<RouteCell<F>>,
+    inner: Option<F>,
+}
+
+impl<F> RoutedFuture<F> {
+    pub(crate) fn new(slot: Arc<RouteCell<F>>) -> Self {
+        Self { slot, inner: None }
+    }
+}
+
+impl<F> Future for RoutedFuture<F>
+where
+    F: Future,
+{
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+
+        if this.inner.is_none() {
+            if let Some(op) = this.slot.take() {
+                this.inner = Some(op);
+            } else {
+                this.slot.register(cx.waker());
+                if let Some(op) = this.slot.take() {
+                    this.inner = Some(op);
+                } else {
+                    return Poll::Pending;
+                }
+            }
+        }
+        let inner = this.inner.as_mut().expect("route future missing inner op");
+        unsafe { Pin::new_unchecked(inner) }.poll(cx)
+    }
 }
 
 #[cfg(test)]
@@ -315,11 +376,9 @@ mod tests {
     #[test]
     fn idle_decision_wait_wraps_strategy() {
         let decision = IdleDecision::wait(IdleWaitStrategy::timeout(Duration::from_millis(5)));
-        match decision {
-            IdleDecision::Wait(IdleWaitStrategy::Timeout(duration)) => {
-                assert_eq!(duration, Duration::from_millis(5));
-            }
-            _ => panic!("unexpected idle decision"),
-        }
+        assert_eq!(
+            decision.into_wait_strategy(),
+            Some(IdleWaitStrategy::Timeout(Duration::from_millis(5)))
+        );
     }
 }

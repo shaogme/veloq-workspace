@@ -1,56 +1,45 @@
-use std::io;
 use std::net::SocketAddr;
 use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::error::{Result as VeloqResult, from_driver_report, from_io_error};
-use crate::runtime::context::submit_control_task;
+use crate::error::Result;
+use crate::net::error::NetError;
+use crate::runtime::context::{RuntimeContext, submit_control_task};
 use veloq_driver_native::driver::{Driver, RegisterFd};
 use veloq_driver_native::op::IoFd;
 use veloq_driver_native::{OwnedRawHandle, RawHandle};
-use veloq_runtime::runtime::shared::RuntimeShared;
+
+use diagweave::prelude::*;
 
 // ============================================================================
 // SocketToken + InnerSocket (RAII Wrapper)
 // ============================================================================
 
-pub struct SocketToken<'a> {
+pub struct SocketToken<'a, 'ctx> {
     fd: IoFd,
     owner_worker_id: usize,
-    shared: &'a RuntimeShared,
+    ctx: RuntimeContext<'a, 'ctx>,
 }
 
-impl<'a> SocketToken<'a> {
-    pub(crate) fn new(
-        handle: RawHandle,
-        owner_worker_id: usize,
-        shared: &'a RuntimeShared,
-    ) -> VeloqResult<Self> {
+impl<'a, 'ctx> SocketToken<'a, 'ctx> {
+    pub(crate) fn new(ctx: RuntimeContext<'a, 'ctx>, handle: RawHandle) -> Result<Self> {
         if !handle.borrow().is_socket() {
-            return Err(from_io_error(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "socket registration requires socket handle",
-            )));
+            return NetError::InvalidSocketHandle.trans();
         }
 
         // SAFETY: caller transfers ownership via RawHandle created from OwnedRawHandle::into_raw.
         let owned = unsafe { OwnedRawHandle::from_raw_owned(handle) };
-        let ctx = crate::runtime::context::try_current()
-            .ok_or_else(|| from_io_error(io::Error::other("runtime context not set")))?;
-        let driver = ctx.driver();
-        let fd = driver
-            .borrow_mut()
-            .register_files(vec![RegisterFd::Owned(owned)])
-            .map_err(from_driver_report)
-            .and_then(|mut fds| {
-                fds.pop()
-                    .ok_or_else(|| from_io_error(io::Error::other("register_files returned empty")))
-            })?;
+        let fd = ctx.driver(|mut driver| {
+            driver
+                .register_files(vec![RegisterFd::Owned(owned)])
+                .trans()
+                .and_then(|mut fds| fds.pop().ok_or(NetError::RegistrationEmpty).trans())
+        })?;
         Ok(Self {
             fd,
-            owner_worker_id,
-            shared,
+            owner_worker_id: ctx.scope.worker_id(),
+            ctx,
         })
     }
 
@@ -60,15 +49,16 @@ impl<'a> SocketToken<'a> {
     }
 }
 
-impl<'a> Drop for SocketToken<'a> {
+impl<'a, 'ctx> Drop for SocketToken<'a, 'ctx> {
     fn drop(&mut self) {
-        let current_worker_id = veloq_runtime::runtime::current_worker_id();
+        let current_worker_id = self.ctx.scope.worker_id();
         if current_worker_id == self.owner_worker_id {
-            if let Some(ctx) = crate::runtime::context::try_current() {
-                let _ = ctx.driver().borrow_mut().unregister_files(vec![self.fd]);
-            }
+            self.ctx.scope.shared().extra_tls.with(|extra| {
+                let mut driver = extra.driver.borrow_mut();
+                let _ = driver.unregister_files(vec![self.fd]);
+            });
         } else {
-            submit_control_task(self.shared, self.owner_worker_id, self.fd);
+            submit_control_task(self.ctx.scope.shared(), self.owner_worker_id, self.fd);
         }
     }
 }
@@ -77,40 +67,48 @@ impl<'a> Drop for SocketToken<'a> {
 // SocketTokenPtr Trait
 // ============================================================================
 
-pub trait SocketTokenPtr<'a>: Deref<Target = SocketToken<'a>> + Clone {
-    fn new_ptr(token: SocketToken<'a>) -> Self;
+pub trait SocketTokenPtr<'a, 'ctx>: Deref<Target = SocketToken<'a, 'ctx>> + Clone
+where
+    'ctx: 'a,
+{
+    fn new_ptr(token: SocketToken<'a, 'ctx>) -> Self;
 }
 
-impl<'a> SocketTokenPtr<'a> for Rc<SocketToken<'a>> {
-    fn new_ptr(token: SocketToken<'a>) -> Self {
+impl<'a, 'ctx> SocketTokenPtr<'a, 'ctx> for Rc<SocketToken<'a, 'ctx>> {
+    fn new_ptr(token: SocketToken<'a, 'ctx>) -> Self {
         Rc::new(token)
     }
 }
 
-impl<'a> SocketTokenPtr<'a> for Arc<SocketToken<'a>> {
-    fn new_ptr(token: SocketToken<'a>) -> Self {
+impl<'a, 'ctx> SocketTokenPtr<'a, 'ctx> for Arc<SocketToken<'a, 'ctx>> {
+    fn new_ptr(token: SocketToken<'a, 'ctx>) -> Self {
         Arc::new(token)
     }
 }
 
 #[derive(Clone)]
-pub struct InnerSocket<'a, P: SocketTokenPtr<'a>> {
+pub struct InnerSocket<'a, 'ctx, P: SocketTokenPtr<'a, 'ctx>>
+where
+    'ctx: 'a,
+{
     token: P,
     local_addr: Option<SocketAddr>,
-    _marker: std::marker::PhantomData<&'a ()>,
+    marker: std::marker::PhantomData<(&'a (), &'ctx ())>,
 }
 
-impl<'a, P: SocketTokenPtr<'a>> InnerSocket<'a, P> {
+impl<'a, 'ctx, P: SocketTokenPtr<'a, 'ctx>> InnerSocket<'a, 'ctx, P>
+where
+    'ctx: 'a,
+{
     pub fn new(
+        ctx: RuntimeContext<'a, 'ctx>,
         handle: RawHandle,
         local_addr: Option<SocketAddr>,
-        owner_worker_id: usize,
-        shared: &'a RuntimeShared,
-    ) -> VeloqResult<Self> {
+    ) -> Result<Self> {
         Ok(Self {
-            token: P::new_ptr(SocketToken::new(handle, owner_worker_id, shared)?),
+            token: P::new_ptr(SocketToken::new(ctx, handle)?),
             local_addr,
-            _marker: std::marker::PhantomData,
+            marker: std::marker::PhantomData,
         })
     }
 
@@ -123,11 +121,9 @@ impl<'a, P: SocketTokenPtr<'a>> InnerSocket<'a, P> {
         self.token.owner_worker_id
     }
 
-    pub fn local_addr(&self) -> VeloqResult<SocketAddr> {
-        self.local_addr.ok_or_else(|| {
-            from_io_error(io::Error::other(
-                "local addr is unavailable for this socket",
-            ))
-        })
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        self.local_addr
+            .ok_or(NetError::LocalAddrUnavailable)
+            .trans()
     }
 }

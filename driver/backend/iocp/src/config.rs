@@ -1,4 +1,4 @@
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use veloq_buf::nz;
 use veloq_driver_core::{
     BorrowedRawHandle as CoreBorrowedRawHandle, IoFd as CoreIoFd,
@@ -24,6 +24,14 @@ impl BufferRegistrationMode {
     #[inline]
     pub const fn is_strict(self) -> bool {
         matches!(self, Self::Strict)
+    }
+
+    #[inline]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Compatible => "compatible",
+        }
     }
 }
 
@@ -160,6 +168,27 @@ pub type OwnedRawHandle = CoreOwnedRawHandle<IocpHandle>;
 pub type BorrowedRawHandle<'a> = CoreBorrowedRawHandle<'a, IocpHandle>;
 pub type SocketKey = IocpHandle;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IocpAssociation {
+    pub(crate) port_raw: NonZeroUsize,
+    pub(crate) completion_key: usize,
+}
+
+impl IocpAssociation {
+    #[inline]
+    pub(crate) const fn new(port_raw: NonZeroUsize, completion_key: usize) -> Self {
+        Self {
+            port_raw,
+            completion_key,
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn port_raw(self) -> usize {
+        self.port_raw.get()
+    }
+}
+
 /// Registered descriptor entry used by driver-side fixed-file table.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RegisteredHandle {
@@ -183,6 +212,24 @@ impl RegisteredHandle {
         match self {
             Self::Owned(h) => h.borrow(),
             Self::Weak(h) => h.borrow(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RegisteredSlot {
+    pub(crate) handle: Option<RegisteredHandle>,
+    pub(crate) generation: u64,
+    pub(crate) association: Option<IocpAssociation>,
+}
+
+impl RegisteredSlot {
+    #[inline]
+    pub(crate) fn occupied(handle: RegisteredHandle, generation: u64) -> Self {
+        Self {
+            handle: Some(handle),
+            generation,
+            association: None,
         }
     }
 }

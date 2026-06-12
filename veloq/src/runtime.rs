@@ -3,19 +3,21 @@ pub mod context;
 use std::cell::RefCell;
 use std::num::NonZeroUsize;
 use std::ops::AsyncFnOnce;
-use std::rc::Rc;
 use std::sync::{Arc, mpsc};
+use std::thread;
 
+use diagweave::Transform;
 use veloq_blocking::init_blocking_pool;
 use veloq_buf::PoolTopology;
-use veloq_driver_native::driver::{Driver, PlatformDriver};
-use veloq_runtime::runtime::{self as async_runtime, WorkerInitContext};
+use veloq_driver_native::driver::PlatformDriver;
+use veloq_runtime::runtime::{self as async_runtime};
 use veloq_runtime::utils::storage::StaticTransfer;
 
-use crate::config::Config;
-use crate::runtime::context::{DriverRegistrar, RegistrarMessage};
-
-pub use veloq_runtime::runtime::RuntimeScopeContext;
+use crate::config::{BlockingPoolConfig, Config};
+use crate::runtime::context::{
+    BorrowedRegistrar, DriverRegistrar, RegistrarMessage, RuntimeContext, WorkerRegistrarState,
+    WorkerState, poll_current_driver,
+};
 
 pub struct RuntimeBuilder<T: PoolTopology> {
     topology: T,
@@ -30,7 +32,7 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
         }
     }
 
-    pub fn worker_count(mut self, worker_count: std::num::NonZeroUsize) -> Self {
+    pub fn worker_count(mut self, worker_count: NonZeroUsize) -> Self {
         self.config = self.config.worker_threads(worker_count.get());
         self
     }
@@ -45,7 +47,7 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
         self
     }
 
-    pub fn blocking_pool(mut self, blocking_pool: crate::config::BlockingPoolConfig) -> Self {
+    pub fn blocking_pool(mut self, blocking_pool: BlockingPoolConfig) -> Self {
         self.config = self.config.blocking_pool(blocking_pool);
         self
     }
@@ -58,16 +60,16 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
         self
     }
 
-    pub fn build(self) -> std::io::Result<Runtime<T>> {
+    pub fn build(self) -> crate::error::Result<Runtime<T>> {
         let worker_count = self.config.get_worker_threads_opt().unwrap_or_else(|| {
-            std::thread::available_parallelism()
+            thread::available_parallelism()
                 .unwrap_or_else(|_| NonZeroUsize::new(1).expect("1 is non-zero"))
         });
 
         // Initialize blocking pool using config
         init_blocking_pool(self.config.get_blocking_pool_config().clone());
 
-        let state = self.topology.init(worker_count.get())?;
+        let state = self.topology.init(worker_count.get()).trans()?;
 
         Ok(Runtime {
             worker_count,
@@ -79,7 +81,7 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
 }
 
 pub struct Runtime<T: PoolTopology> {
-    worker_count: std::num::NonZeroUsize,
+    worker_count: NonZeroUsize,
     topology: T,
     state: T::State,
     config: Config,
@@ -102,29 +104,21 @@ impl<T: PoolTopology> Runtime<T> {
         RuntimeBuilder::new(topology)
     }
 
-    pub fn worker_count(&self) -> std::num::NonZeroUsize {
+    pub fn worker_count(&self) -> NonZeroUsize {
         self.worker_count
     }
 
     pub fn block_on<R, F>(self, f: F) -> R
     where
-        F: AsyncFnOnce(&RuntimeScopeContext) -> R,
+        F: for<'s1, 's2> AsyncFnOnce(RuntimeContext<'s1, 's2>) -> R,
     {
         let Runtime {
             worker_count,
             topology,
             state,
             config,
+            ..
         } = self;
-
-        struct ClearCurrentContext;
-        impl Drop for ClearCurrentContext {
-            fn drop(&mut self) {
-                context::clear_current_runtime_context();
-            }
-        }
-
-        let _clear = ClearCurrentContext;
 
         // 预先为每个 Worker 创建消息通道
         let mut senders = Vec::with_capacity(worker_count.get());
@@ -150,36 +144,48 @@ impl<T: PoolTopology> Runtime<T> {
         let runtime = async_runtime::RuntimeBuilder::new()
             .with_worker_count(worker_count.get())
             .with_queue_capacity(config.get_queue_capacity().get())
-            .with_idle_hook(crate::runtime::context::poll_current_driver)
-            .with_worker_init(async move |worker_ctx: WorkerInitContext| {
+            .with_idle_hook(poll_current_driver)
+            .with_worker_factory(move |worker_id, shared| {
                 let topology = topology.clone();
                 let state = state.clone();
                 let config = config.clone();
-                let receiver = receivers.take(worker_ctx.worker_id());
-
-                let driver = Rc::new(RefCell::new(
-                    PlatformDriver::new(&config).expect("failed to create driver"),
-                ));
-
-                // 初始化 TLS 中的注册中心状态
-                context::init_worker_registrar_state(receiver);
+                let receiver = receivers.take(worker_id);
 
                 let registration_mode = config.registration_mode();
-                let registrar = DriverRegistrar::new(Rc::downgrade(&driver), registration_mode);
+                let registrar = DriverRegistrar::new(shared, registration_mode);
 
-                {
-                    let mut driver_ref = driver.borrow_mut();
-                    driver_ref.set_registrar(Box::new(registrar.clone()));
+                let registrar_state = RefCell::new(WorkerRegistrarState {
+                    receiver,
+                    chunks: Vec::new(),
+                });
+
+                let driver = PlatformDriver::new(config.clone(), Box::new(registrar.clone()))
+                    .expect("failed to create driver");
+                let driver_cell = RefCell::new(driver);
+
+                let buf_pool = {
+                    let borrowed_registrar = BorrowedRegistrar {
+                        driver: &driver_cell,
+                        state: &registrar_state,
+                        registration_mode,
+                    };
+                    topology
+                        .build(&state, worker_id, &borrowed_registrar)
+                        .expect("failed to build worker buffer pool")
+                };
+
+                WorkerState {
+                    driver: driver_cell,
+                    buf_pool,
+                    registrar,
+                    registrar_state,
                 }
-
-                let buf_pool =
-                    topology.build(&state, worker_ctx.worker_id(), Box::new(registrar.clone()));
-                context::set_current_runtime_context(context::RuntimeContext::new(
-                    driver, buf_pool, config, registrar,
-                ));
             })
             .build();
 
-        runtime.block_on(f)
+        runtime.block_on(async move |scope| {
+            let ctx = RuntimeContext { scope };
+            f(ctx).await
+        })
     }
 }

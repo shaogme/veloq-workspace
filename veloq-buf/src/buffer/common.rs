@@ -1,10 +1,11 @@
 //! Common traits and types for buffer management.
 
-use std::alloc::LayoutError;
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::ptr::NonNull;
 
 use bilge::prelude::*;
+
+use crate::heap::{ChunkId, PageAlignedBytes};
 
 #[bitsize(1)]
 #[derive(FromBits, Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +57,7 @@ impl<const S: u16> std::fmt::Debug for NotU16<S> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegionInfo {
     pub pool_kind: PoolKind,
-    pub id: u16,
+    pub id: ChunkId,
     pub offset: usize,
     /// A unique cookie used to distinguish different allocations for the same pointer (e.g. heap reuse).
     pub cookie: u64,
@@ -91,14 +92,28 @@ impl AllocResult {
 
 #[derive(Debug, Clone, Copy)]
 pub struct BufferRegion {
+    pub(crate) id: ChunkId,
     pub(crate) ptr: NonNull<u8>,
-    pub(crate) len: NonZeroUsize,
+    pub(crate) len: PageAlignedBytes,
 }
 
 impl BufferRegion {
-    pub fn new(ptr: NonNull<u8>, len: NonZeroUsize) -> Self {
-        Self { ptr, len }
+    pub fn new(id: ChunkId, ptr: NonNull<u8>, len: PageAlignedBytes) -> Self {
+        Self { id, ptr, len }
     }
+
+    pub fn from_chunk_info(info: crate::heap::ChunkInfo) -> Option<Self> {
+        PageAlignedBytes::new(info.len).map(|len| Self {
+            id: info.id,
+            ptr: info.ptr,
+            len,
+        })
+    }
+
+    pub fn id(&self) -> ChunkId {
+        self.id
+    }
+
     pub fn ptr(&self) -> NonNull<u8> {
         self.ptr
     }
@@ -128,22 +143,22 @@ pub trait BufferRegistrar {
     /// Register memory regions with the kernel.
     /// Returns a list of handles (tokens) corresponding to the regions.
     /// For RIO this is RIO_BUFFERID, for uring it might be ignored or index.
-    fn register(&self, regions: &[BufferRegion]) -> std::io::Result<Vec<usize>>;
+    fn register(&self, regions: &[BufferRegion]) -> super::error::BufResult<Vec<ChunkId>>;
 
     /// Resolve chunk info for a given chunk_id.
     /// Used for lazy registration.
-    fn resolve_chunk_info(&self, chunk_id: u16) -> Option<crate::heap::ChunkInfo>;
+    fn resolve_chunk_info(&self, chunk_id: ChunkId) -> Option<crate::heap::ChunkInfo>;
 }
 
 /// A no-op registrar that does nothing.
 pub struct NoopRegistrar;
 
 impl BufferRegistrar for NoopRegistrar {
-    fn register(&self, _regions: &[BufferRegion]) -> std::io::Result<Vec<usize>> {
+    fn register(&self, _regions: &[BufferRegion]) -> super::error::BufResult<Vec<ChunkId>> {
         Ok(Vec::new())
     }
 
-    fn resolve_chunk_info(&self, _chunk_id: u16) -> Option<crate::heap::ChunkInfo> {
+    fn resolve_chunk_info(&self, _chunk_id: ChunkId) -> Option<crate::heap::ChunkInfo> {
         None
     }
 }
@@ -169,34 +184,4 @@ pub trait BackingPool: std::fmt::Debug {
 pub trait BufPool: std::fmt::Debug {
     /// Allocate a buffer ready for I/O.
     fn alloc(&self, len: NonZeroUsize) -> Option<super::handle::FixedBuf>;
-}
-
-#[derive(Debug)]
-pub enum AllocError {
-    Layout(LayoutError),
-    Oom,
-}
-
-impl std::fmt::Display for AllocError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AllocError::Layout(e) => write!(f, "Layout error: {}", e),
-            AllocError::Oom => write!(f, "Out of memory"),
-        }
-    }
-}
-
-impl std::error::Error for AllocError {}
-
-impl From<AllocError> for std::io::Error {
-    fn from(err: AllocError) -> Self {
-        match err {
-            AllocError::Layout(_) => {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "Layout error")
-            }
-            AllocError::Oom => {
-                std::io::Error::new(std::io::ErrorKind::OutOfMemory, "Out of memory")
-            }
-        }
-    }
 }

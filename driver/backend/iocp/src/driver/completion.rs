@@ -1,671 +1,545 @@
-use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
-use tracing::debug;
-use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+use std::time::Instant;
 
-use veloq_driver_core::driver::registry::OpRegistry;
+use diagweave::prelude::*;
+use tracing::warn;
 use veloq_driver_core::driver::{
-    SharedCompletionQueue, SharedCompletionTable, drain_cancel_requests,
+    CancelMode, CompletionAnomaly, CompletionBackend, CompletionBackendHooks,
+    CompletionCleanupGuard, CompletionControl, CompletionEnvelope, CompletionFlowExt,
+    CompletionFlowOutcome, CompletionHookOutcome, CompletionIngress, CompletionSource,
+    SyntheticCompletionSource, UserCompletionEvent,
 };
-use veloq_driver_core::slot::{InFlightWaiting, SlotRegistryExt, SlotView};
-use veloq_driver_core::{DriverErrorKind, DriverResult, driver_error};
+use veloq_driver_core::slot::{InFlightOrphaned, InFlightWaiting, SlotRegistryExt, SlotView};
 
-use crate::common::{
-    IocpErrorContext, WAKEUP_USER_DATA, completion_record, io_result_to_event_res, iocp_msg,
-    push_completion_shared,
-};
-use crate::config::SocketKey;
-use crate::driver::{CloseMode, CompletionSidecar, IocpDriver, IocpOpState, RIO_EVENT_KEY};
-use crate::error::{IocpError, IocpResult, from_io_error};
-use crate::op::slot::Slot;
-use crate::op::{IocpOp, IocpUserPayload, OverlappedEntry, submit};
+use crate::driver::polling::CompletionProgress;
+use crate::driver::{IocpDriver, IocpDriverCompletionDiagnostics};
+use crate::error::{IocpError, IocpResult, iocp_report_to_event_res};
+use crate::op::{IocpOp, IocpSlotSpec, Slot};
+use crate::rio::{RioState, SocketInflightToken};
+use std::num::NonZeroU8;
 
-pub(crate) struct EmitContext<'a> {
-    pub(crate) completion_events: &'a SharedCompletionQueue,
-    pub(crate) completion_table: &'a SharedCompletionTable<IocpUserPayload>,
+pub(crate) const COMP_BACKEND_IOCP: CompletionBackend =
+    CompletionBackend::Backend(match NonZeroU8::new(1) {
+        Some(val) => val,
+        None => unreachable!(),
+    });
+
+pub(crate) const COMP_BACKEND_RIO: CompletionBackend =
+    CompletionBackend::Backend(match NonZeroU8::new(3) {
+        Some(val) => val,
+        None => unreachable!(),
+    });
+
+pub(crate) enum IocpSyntheticCompletion {
+    None,
+    Cancel { mode: CancelMode },
 }
 
-pub(crate) struct CancelContext<'a> {
-    pub(crate) registered_files: &'a [Option<crate::config::RegisteredHandle>],
-    pub(crate) completion_events: &'a SharedCompletionQueue,
-    pub(crate) completion_table: &'a SharedCompletionTable<IocpUserPayload>,
-}
-
-impl IocpDriver {
-    pub(crate) fn shutdown_ops(&mut self) -> usize {
-        if self.shutting_down {
-            return 0;
-        }
-        self.shutting_down = true;
-        self.rio_state.begin_shutdown();
-
-        let mut in_flight = Vec::new();
-        for user_data in 0..self.ops.local.len() {
-            if matches!(
-                self.ops.slot_view(user_data),
-                Some(SlotView::InFlightWaiting(_)) | Some(SlotView::InFlightOrphaned(_))
-            ) {
-                in_flight.push(user_data);
-            }
-        }
-        let count = in_flight.len();
-        for user_data in in_flight {
-            self.cancel_op_internal(user_data);
-        }
-        count
-    }
-
-    pub(crate) fn drain_pending_iocp(
-        &mut self,
-        pending_count: usize,
-        timeout: Duration,
-    ) -> DriverResult<()> {
-        if pending_count == 0 {
-            return Ok(());
-        }
-        let mut drained = 0usize;
-        let deadline = Instant::now() + timeout;
-
-        while drained < pending_count {
-            if Instant::now() >= deadline {
-                return Err(driver_error(
-                    DriverErrorKind::Timeout,
-                    "iocp/driver",
-                    "drain timed out",
-                ));
-            }
-            drained += self.poll_completion()?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn poll_completion(&mut self) -> DriverResult<usize> {
-        let status = self.port.get_status(10).map_err(|e| {
-            driver_error(
-                DriverErrorKind::Completion,
-                "iocp/driver",
-                format!("failed to poll IOCP status: {e:#}"),
-            )
-        })?;
-
-        match status {
-            crate::win32::CompletionStatus::Completed {
-                bytes,
-                key,
-                overlapped,
-                success,
-                error_code,
-            } => {
-                if key == RIO_EVENT_KEY {
-                    return self
-                        .rio_state
-                        .process_completions(
-                            &mut self.ops,
-                            &self.extensions,
-                            &*self.registrar,
-                            &self.completion_events,
-                            &self.completion_table,
-                        )
-                        .inspect(|_| {
-                            self.drain_deferred_socket_cleanup();
-                        })
-                        .map_err(|e| {
-                            Self::with_report_detail(
-                                DriverErrorKind::Completion,
-                                "iocp/driver",
-                                "failed to process rio completions",
-                                format!("{e:#}"),
-                            )
-                        });
-                }
-
-                if !overlapped.is_null() {
-                    // SAFETY: overlapped pointer is guaranteed to be valid during IOCP completion.
-                    let id = unsafe { crate::win32::OverlappedId::from_ptr(overlapped) };
-                    self.process_completion(id.as_usize(), success, error_code, bytes);
-                    return Ok(1);
-                }
-            }
-            crate::win32::CompletionStatus::Timeout => {}
-        }
-        Ok(0)
-    }
-
-    pub(crate) fn close_impl(&mut self, mode: CloseMode) -> DriverResult<()> {
-        if self.closed {
-            return Ok(());
-        }
-        let pending = self.shutdown_ops();
-        if let CloseMode::Strict { timeout } = mode {
-            self.drain_pending_iocp(pending, timeout).map_err(|e| {
-                Self::with_report_detail(
-                    DriverErrorKind::Timeout,
-                    "iocp/driver",
-                    "drain pending iocp timed out",
-                    format!("{e:#}"),
-                )
-            })?;
-            self.rio_state.drain_outstanding(timeout).map_err(|e| {
-                Self::with_report_detail(
-                    DriverErrorKind::Completion,
-                    "iocp/driver",
-                    "failed to drain RIO outstanding requests",
-                    format!("{e:#}"),
-                )
-            })?;
-        }
-        self.rio_state.kernel.close();
-        self.closed = true;
-        Ok(())
-    }
-
-    /// Retrieves completion events from the I/O completion port.
-    pub(crate) fn get_completion(&mut self, timeout_ms: u32) -> IocpResult<()> {
-        drain_cancel_requests(self);
-        let wait_ms = self.calculate_wait_ms(timeout_ms);
-
-        let status = self.port.get_status(wait_ms);
-        let now = Instant::now();
-        let elapsed = now.saturating_duration_since(self.last_timer_poll);
-        self.wheel.advance(elapsed, &mut self.timer_buffer);
-        self.process_timers();
-        self.last_timer_poll = now;
-
-        let status = status.map_err(|e| {
-            diagweave::report::Report::new(IocpError::CompletionWait).attach_note(format!("{e:#}"))
-        })?;
-
-        match status {
-            crate::win32::CompletionStatus::Completed {
-                bytes,
-                key,
-                overlapped,
-                success,
-                error_code,
-            } => {
-                if key == RIO_EVENT_KEY {
-                    self.rio_state
-                        .process_completions(
-                            &mut self.ops,
-                            &self.extensions,
-                            &*self.registrar,
-                            &self.completion_events,
-                            &self.completion_table,
-                        )
-                        .inspect(|_| {
-                            self.drain_deferred_socket_cleanup();
-                        })
-                        .map_err(|e| {
-                            diagweave::report::Report::new(IocpError::CompletionWait)
-                                .attach_note(format!("{e:#}"))
-                        })?;
-                    return Ok(());
-                }
-
-                let user_data = self.resolve_user_data(overlapped, success, key, error_code)?;
-
-                if user_data == WAKEUP_USER_DATA {
-                    self.is_notified.store(false, Ordering::Release);
-                    return Ok(());
-                }
-                self.process_completion(user_data, success, error_code, bytes);
-            }
-            crate::win32::CompletionStatus::Timeout => {}
-        }
-        Ok(())
-    }
-
-    pub(crate) fn calculate_wait_ms(&self, timeout_ms: u32) -> u32 {
-        if let Some(delay) = self.wheel.next_timeout() {
-            let millis = delay.as_millis().min(u32::MAX as u128) as u32;
-            std::cmp::min(timeout_ms, millis)
-        } else {
-            timeout_ms
-        }
-    }
-
-    pub(crate) fn resolve_user_data(
-        &self,
-        overlapped: *mut crate::win32::Overlapped,
-        success: bool,
-        completion_key: usize,
-        error_code: Option<u32>,
-    ) -> IocpResult<usize> {
-        if !overlapped.is_null() {
-            // SAFETY: overlapped is non-null and corresponds to a valid OverlappedEntry.
-            let id = unsafe { crate::win32::OverlappedId::from_ptr(overlapped) };
-            let idx = id.as_usize();
-            if idx >= self.ops.local.len() {
-                debug!(idx, "Completed index out of bounds");
-                return Ok(usize::MAX - 2);
-            }
-            Ok(idx)
-        } else {
-            if !success {
-                let err = error_code.unwrap_or(0);
-                if err == WAIT_TIMEOUT {
-                    return Ok(WAKEUP_USER_DATA);
-                }
-                if completion_key == 0 {
-                    return Err(iocp_msg(
-                        IocpErrorContext::CompletionWait,
-                        format!(
-                            "GetQueuedCompletionStatus failed: err={}, key={}, overlapped=null",
-                            err, completion_key
-                        ),
-                    ));
-                }
-            }
-            Ok(completion_key)
-        }
-    }
-
-    pub(crate) fn process_timers(&mut self) {
-        let timer_buffer = std::mem::take(&mut self.timer_buffer);
-        let mut pending_events: Vec<CompletionSidecar> = Vec::new();
-        let now = Instant::now();
-
-        let mut expired = Vec::new();
-        for &user_data in &timer_buffer {
-            let in_flight = matches!(
-                self.ops.slot_view(user_data),
-                Some(SlotView::InFlightWaiting(_)) | Some(SlotView::InFlightOrphaned(_))
-            );
-            if let Some(op) = self.ops.local.get_mut(user_data) {
-                if in_flight {
-                    if let Some(deadline) = op.entry.platform_data.timer_deadline
-                        && now < deadline
-                    {
-                        let remain = deadline.saturating_duration_since(now);
-                        op.entry.platform_data.timer_id =
-                            Some(self.wheel.insert(user_data, remain));
-                        continue;
-                    }
-                    expired.push(user_data);
-                } else {
-                    op.entry.platform_data.timer_id = None;
-                    op.entry.platform_data.timer_deadline = None;
-                }
-            }
-        }
-        for user_data in expired {
-            Self::finish_timer_op(&mut self.ops, user_data, &mut pending_events);
-        }
-
-        for completion in pending_events {
-            push_completion_shared(
-                &self.completion_events,
-                &self.completion_table,
-                completion_record(completion),
-            );
-        }
-        self.timer_buffer = timer_buffer;
-        self.timer_buffer.clear();
-    }
-
-    pub(crate) fn finish_timer_op(
-        ops: &mut OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
-        user_data: usize,
-        pending_events: &mut Vec<CompletionSidecar>,
-    ) {
-        let mut guard = match ops.slot_view(user_data) {
-            Some(SlotView::InFlightWaiting(slot)) => slot.complete(),
-            _ => return,
-        };
-
-        let generation = guard.entry.generation(Ordering::Acquire);
-        let _ = guard.take_op();
-        let (payload_erased, detail) = guard.take_completion_data();
-        pending_events.push(CompletionSidecar {
-            user_data,
-            generation,
-            res: 0,
-            flags: 0,
-            payload: payload_erased,
-            detail,
-        });
-        ops.remove(user_data);
-    }
-
-    pub(crate) fn process_completion(
-        &mut self,
-        user_data: usize,
-        success: bool,
-        error_code: Option<u32>,
-        bytes_transferred: u32,
-    ) {
-        if !self.ops.contains(user_data) {
-            return;
-        }
-
-        let io_result = self.calculate_io_result(user_data, success, error_code, bytes_transferred);
-        match self.ops.slot_view(user_data) {
-            Some(SlotView::InFlightWaiting(_)) => {
-                let slot_generation;
-                {
-                    let slot = &self.ops.shared.slots[user_data];
-                    let op = &mut self.ops.local[user_data];
-                    slot_generation = slot.generation(Ordering::Acquire);
-
-                    if op.entry.platform_data.generation != slot_generation {
-                        debug!(user_data, "Ignoring stale completion");
-                        return;
-                    }
-                }
-
-                self.release_socket_inflight_for_op(user_data);
-                let ctx = EmitContext {
-                    completion_events: &self.completion_events,
-                    completion_table: &self.completion_table,
-                };
-                Self::emit_event_inner(ctx, &mut self.ops, user_data, slot_generation, io_result);
-            }
-            Some(SlotView::InFlightOrphaned(_)) => {
-                let slot_generation =
-                    self.ops.shared.slots[user_data].generation(Ordering::Acquire);
-                self.release_socket_inflight_for_op(user_data);
-                let Some(SlotView::InFlightOrphaned(slot)) = self.ops.slot_view(user_data) else {
-                    return;
-                };
-                let mut completed = slot.complete();
-                let _ = completed.take_op();
-                let (payload, detail) = completed.take_completion_data();
-                push_completion_shared(
-                    &self.completion_events,
-                    &self.completion_table,
-                    completion_record(CompletionSidecar {
-                        user_data,
-                        generation: slot_generation,
-                        res: io_result_to_event_res(&io_result),
-                        flags: 0,
-                        payload,
-                        detail,
-                    }),
-                );
-                self.ops.recycle(user_data, slot_generation.wrapping_add(1));
-            }
-            _ => {
-                debug!(user_data, "Ignoring completion for non in-flight slot");
-            }
+impl IocpSyntheticCompletion {
+    #[inline]
+    fn cancel_mode(&self) -> CancelMode {
+        match self {
+            Self::Cancel { mode } => *mode,
+            Self::None => CancelMode::UserVisible,
         }
     }
 
     #[inline]
-    pub(crate) fn with_inflight_slot<R>(
-        ops: &mut OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
-        index: usize,
-        f: impl FnOnce(Slot<'_, InFlightWaiting>) -> R,
-    ) -> Option<R> {
-        match ops.slot_view(index)? {
-            SlotView::InFlightWaiting(slot) => Some(f(slot)),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn calculate_io_result(
-        &mut self,
-        user_data: usize,
-        success: bool,
-        error_code: Option<u32>,
-        bytes_transferred: u32,
-    ) -> IocpResult<usize> {
-        let mut io_result = if !success {
-            Err(from_io_error(
-                IocpError::CompletionWait,
-                "iocp.driver.calculate_io_result",
-                std::io::Error::from_raw_os_error(error_code.unwrap_or(0) as i32),
-            ))
-        } else {
-            Ok(bytes_transferred as usize)
-        };
-
-        let processed = Self::with_inflight_slot(&mut self.ops, user_data, |mut guard| {
-            // SAFETY: InFlight state grants sidecar mutable access.
-            let blocking_res = unsafe { guard.sidecar_unchecked(|s| s.blocking_result.take()) };
-
-            let _ = guard.with_op_mut(|iocp_op: &mut IocpOp| {
-                if let Some(res) = blocking_res {
-                    io_result = res.map_err(|e| {
-                        from_io_error(IocpError::Win32, "iocp.driver.blocking_completion", e)
-                    });
-                } else if matches!(
-                    &iocp_op.payload,
-                    crate::op::IocpOpPayload::Open(_)
-                        | crate::op::IocpOpPayload::Close(_)
-                        | crate::op::IocpOpPayload::Fsync(_)
-                        | crate::op::IocpOpPayload::FsyncRaw(_)
-                        | crate::op::IocpOpPayload::SyncRange(_)
-                        | crate::op::IocpOpPayload::SyncRangeRaw(_)
-                        | crate::op::IocpOpPayload::Fallocate(_)
-                        | crate::op::IocpOpPayload::FallocateRaw(_)
-                ) {
-                    io_result = Err(diagweave::report::Report::new(IocpError::CompletionWait)
-                        .attach_note("missing blocking result for offloaded file completion"));
-                } else if let Ok(val) = io_result {
-                    io_result = iocp_op.on_complete(val, &self.extensions).map_err(|e| {
-                        diagweave::report::Report::new(IocpError::CompletionWait)
-                            .attach_note(format!("{e:#}"))
-                    });
-                }
-            });
-        });
-
-        if processed.is_none() {
-            debug!(
-                user_data,
-                "Skipping IO result calculation for non in-flight slot"
-            );
-            return io_result;
-        }
-
-        if io_result.is_err() {
-            let _ = self
-                .ops
-                .with_slot_storage_mut(user_data, |_op, result, _payload, _sidecar| {
-                    *result = Some(Err(driver_error(
-                        DriverErrorKind::Completion,
-                        "iocp/driver",
-                        "completion without os error",
-                    )));
-                });
-        }
-        io_result
-    }
-
-    pub(crate) fn emit_event_inner(
-        ctx: EmitContext<'_>,
-        ops: &mut OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
-        user_data: usize,
-        slot_generation: u32,
-        io_result: IocpResult<usize>,
-    ) {
-        let mut should_free = false;
-        let mut sidecar_to_push = None;
-        let handled = Self::with_inflight_slot(ops, user_data, |guard| {
-            let completion_res = io_result_to_event_res(&io_result);
-            let mut guard = guard.complete();
-
-            if guard.platform_mut().is_background {
-                let _ = guard.take_op();
-                let _ = guard.take_completion_data();
-                let _data = std::mem::take(guard.platform_mut());
-                should_free = true;
-            } else {
-                if let Some(op) = guard.op.as_mut() {
-                    op.unbind_user_payload();
-                }
-                let (payload, detail) = guard.take_completion_data();
-                sidecar_to_push = Some(CompletionSidecar {
-                    user_data,
-                    generation: slot_generation,
-                    res: completion_res,
-                    flags: 0,
-                    payload,
-                    detail,
-                });
-                if !guard.platform_mut().rio_needs_drain || guard.platform_mut().rio_drained {
-                    let _ = guard.take_op();
-                    let _data = std::mem::take(guard.platform_mut());
-                    should_free = true;
-                }
-            }
-        });
-
-        if handled.is_none() {
-            debug!(user_data, "Received completion for non-active slot");
-        } else if should_free {
-            ops.remove(user_data);
-        }
-
-        if let Some(sidecar) = sidecar_to_push {
-            push_completion_shared(
-                ctx.completion_events,
-                ctx.completion_table,
-                completion_record(sidecar),
-            );
-        }
-    }
-
-    pub(crate) fn cancel_op_internal(&mut self, user_data: usize) {
-        if !self.ops.contains(user_data) {
-            return;
-        }
-
-        let emit_ctx = EmitContext {
-            completion_events: &self.completion_events,
-            completion_table: &self.completion_table,
-        };
-
-        let timer_id = self
-            .ops
-            .get_mut(user_data)
-            .and_then(|op| op.platform_data.timer_id);
-        if let Some(tid) = timer_id {
-            self.wheel.cancel(tid);
-            Self::emit_aborted_inner(emit_ctx, user_data, &mut self.ops);
-            return;
-        }
-
-        let state = self.ops.slot_view(user_data);
-        match state {
-            Some(SlotView::InFlightOrphaned(_)) => {
-                if self.shutting_down {
-                    Self::emit_aborted_inner(emit_ctx, user_data, &mut self.ops);
-                }
-            }
-            Some(SlotView::InFlightWaiting(_)) => {
-                let ctx = CancelContext {
-                    registered_files: &self.registered_files,
-                    completion_events: &self.completion_events,
-                    completion_table: &self.completion_table,
-                };
-                if let Some(key) = Self::perform_cancel(ctx, user_data, &mut self.ops) {
-                    self.rio_state.release_socket_inflight(key);
-                    self.drain_deferred_socket_cleanup();
-                }
-            }
-            _ => {
-                Self::emit_aborted_inner(emit_ctx, user_data, &mut self.ops);
-            }
-        }
-    }
-
-    pub(crate) fn perform_cancel(
-        ctx: CancelContext<'_>,
-        user_data: usize,
-        ops: &mut OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
-    ) -> Option<SocketKey> {
-        let mut should_emit_aborted = false;
-        let mut aborted_socket_key = None;
-        let handled = match ops.slot_view(user_data) {
-            Some(SlotView::InFlightWaiting(mut guard)) => {
-                let raw_handle = guard
-                    .with_op_mut(|iocp_op| iocp_op.header.resolved_handle)
-                    .flatten()
-                    .or_else(|| {
-                        let fd = guard.with_op_mut(|iocp_op| iocp_op.get_fd()).flatten()?;
-                        submit::resolve_fd_handle(&fd, ctx.registered_files).ok()
-                    });
-
-                if let Some(raw_handle) = raw_handle {
-                    let handle = raw_handle.as_handle();
-                    let is_rio = guard
-                        .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
-                        .unwrap_or(false);
-
-                    if is_rio {
-                        let _ = guard.with_op_mut(|iocp_op| {
-                            iocp_op.header.in_flight = false;
-                        });
-                        should_emit_aborted = true;
-                        aborted_socket_key =
-                            raw_handle.is_socket().then_some(raw_handle.actor_key());
-                    } else {
-                        // SAFETY: `guard.storage` exposes the overlapped entry for this cancelled slot.
-                        let overlapped_ptr =
-                            guard.storage.with_mut(|_op, _result, _payload, sidecar| {
-                                &mut sidecar.inner as *mut crate::win32::Overlapped
-                            });
-                        // SAFETY: handle and overlapped_ptr are valid for this operation.
-                        let _ = unsafe {
-                            crate::win32::IoCompletionPort::cancel_request(handle, overlapped_ptr)
-                        };
-                    }
-                }
-                Some(())
-            }
-            _ => None,
-        };
-
-        if handled.is_none() {
-            debug!(user_data, "Skipping cancel for non in-flight slot");
-        } else if should_emit_aborted {
-            let emit_ctx = EmitContext {
-                completion_events: ctx.completion_events,
-                completion_table: ctx.completion_table,
-            };
-            Self::emit_aborted_inner(emit_ctx, user_data, ops);
-            return aborted_socket_key;
-        }
+    fn take_submission_failure(&mut self) -> Option<Report<IocpError>> {
         None
     }
+}
 
-    pub(crate) fn emit_aborted_inner(
-        ctx: EmitContext<'_>,
-        user_data: usize,
-        ops: &mut OpRegistry<IocpOp, IocpUserPayload, IocpOpState, OverlappedEntry>,
-    ) {
-        let generation = ops.shared.slots[user_data].generation(Ordering::Acquire);
-        let inflight = Self::with_inflight_slot(ops, user_data, |guard| {
-            let mut guard = guard.complete();
-            let _ = guard.take_op();
-            let data = guard.take_completion_data();
-            let _ = guard.reset();
-            data
-        });
+#[derive(Default)]
+struct IocpPostCompletionEffects {
+    drain_socket_cleanup: bool,
+}
 
-        let (payload, detail) = if let Some(data) = inflight {
-            data
-        } else {
-            ops.with_slot_storage_mut(user_data, |_op, result, payload, _sidecar| {
-                (payload.take(), result.take())
-            })
-            .unwrap_or((None, None))
-        };
+enum IocpBackendEffect {
+    None,
+    SocketInflight(SocketInflightToken),
+}
 
-        push_completion_shared(
-            ctx.completion_events,
-            ctx.completion_table,
-            completion_record(CompletionSidecar {
-                user_data,
-                generation,
-                res: -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
-                flags: 0,
-                payload,
-                detail,
-            }),
+impl Default for IocpBackendEffect {
+    #[inline]
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+struct IocpCompletionHooks<'a> {
+    ext: &'a crate::ext::Extensions,
+    diagnostics: &'a IocpDriverCompletionDiagnostics,
+    rio: &'a mut RioState,
+    completion: &'a crate::driver::polling::CompletionPump,
+    synthetic: IocpSyntheticCompletion,
+    post: IocpPostCompletionEffects,
+}
+
+impl<'a> IocpCompletionHooks<'a> {
+    fn new(
+        ext: &'a crate::ext::Extensions,
+        diagnostics: &'a IocpDriverCompletionDiagnostics,
+        rio: &'a mut RioState,
+        completion: &'a crate::driver::polling::CompletionPump,
+        synthetic: IocpSyntheticCompletion,
+    ) -> Self {
+        Self {
+            ext,
+            diagnostics,
+            rio,
+            completion,
+            synthetic,
+            post: IocpPostCompletionEffects::default(),
+        }
+    }
+
+    fn into_post_effects(self) -> IocpPostCompletionEffects {
+        self.post
+    }
+}
+
+impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
+    type BackendIngress = ();
+    type BackendEffect = IocpBackendEffect;
+
+    fn handle_control(
+        &mut self,
+        control: CompletionControl,
+    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
+        match control {
+            CompletionControl::Waker { raw, .. } => {
+                if raw.res >= 0 {
+                    self.diagnostics.backend().inc_waker_ok();
+                    self.completion.clear_notification();
+                } else {
+                    self.diagnostics.backend().inc_waker_error();
+                    warn!(res = raw.res, "IOCP waker completion reported an error");
+                    self.completion.clear_notification();
+                }
+                CompletionHookOutcome::ControlHandled {
+                    effect: IocpBackendEffect::None,
+                }
+            }
+            CompletionControl::Cancel { raw, .. } => {
+                let anomaly = CompletionAnomaly::control_completion_untracked(raw.token)
+                    .with_raw_completion(raw);
+                CompletionHookOutcome::Anomaly {
+                    anomaly,
+                    effect: IocpBackendEffect::None,
+                }
+            }
+        }
+    }
+
+    fn complete_waiting(
+        &mut self,
+        event: UserCompletionEvent,
+        mut slot: Slot<'_, InFlightWaiting>,
+        source: CompletionSource<'_, Self::BackendIngress>,
+    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
+        match source {
+            CompletionSource::Synthetic(SyntheticCompletionSource::Timer) => {
+                complete_timer_waiting_slot(slot, event)
+            }
+            CompletionSource::Synthetic(SyntheticCompletionSource::Cancel) => {
+                complete_cancel_waiting_slot(slot, event, self.synthetic.cancel_mode())
+            }
+            CompletionSource::Synthetic(SyntheticCompletionSource::SubmissionFailure) => {
+                complete_submission_failure_slot(
+                    slot,
+                    event,
+                    self.synthetic.take_submission_failure(),
+                )
+            }
+            CompletionSource::Kernel | CompletionSource::User | CompletionSource::Backend(_) => {
+                let io_result = calculate_io_result_from_slot(self.ext, &mut slot, event.res());
+                let socket_inflight = take_socket_inflight_from_slot(&mut slot);
+                complete_iocp_waiting_slot(slot, event, io_result, socket_inflight)
+            }
+        }
+    }
+
+    fn complete_orphaned(
+        &mut self,
+        event: UserCompletionEvent,
+        slot: Slot<'_, InFlightOrphaned>,
+        _source: CompletionSource<'_, Self::BackendIngress>,
+    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
+        let (cleanup, socket_inflight) = complete_iocp_orphaned_slot(slot, event.res());
+        CompletionHookOutcome::Cleanup {
+            cleanup,
+            effect: socket_inflight
+                .map(IocpBackendEffect::SocketInflight)
+                .unwrap_or_default(),
+        }
+    }
+
+    fn finish_backend_effect(&mut self, effect: Self::BackendEffect) {
+        match effect {
+            IocpBackendEffect::None => {}
+            IocpBackendEffect::SocketInflight(token) => {
+                self.rio.release_socket_inflight_token(token);
+                self.post.drain_socket_cleanup = true;
+            }
+        }
+    }
+}
+
+impl<'a> IocpDriver<'a> {
+    pub(super) fn process_timers(&mut self) {
+        let timer_buffer = self.timer.take_buffer();
+        let now = Instant::now();
+
+        let mut expired = Vec::new();
+        for &token in &timer_buffer {
+            match self.ops.checked_slot_view(token) {
+                veloq_driver_core::slot::CheckedSlotView::Valid(SlotView::InFlightWaiting(
+                    mut slot,
+                )) => {
+                    if let Some(deadline) = slot.platform().timer_deadline
+                        && now < deadline
+                    {
+                        let remain = deadline.saturating_duration_since(now);
+                        let timer_id = self.timer.insert(token, remain);
+                        slot.platform_mut().timer_id = Some(timer_id);
+                        continue;
+                    }
+                    expired.push(token);
+                }
+                veloq_driver_core::slot::CheckedSlotView::Valid(SlotView::InFlightOrphaned(
+                    mut slot,
+                )) => {
+                    if let Some(deadline) = slot.platform().timer_deadline
+                        && now < deadline
+                    {
+                        let remain = deadline.saturating_duration_since(now);
+                        let timer_id = self.timer.insert(token, remain);
+                        slot.platform_mut().timer_id = Some(timer_id);
+                        continue;
+                    }
+                    expired.push(token);
+                }
+                _ => expired.push(token),
+            }
+        }
+
+        for token in expired {
+            let event = UserCompletionEvent::from_parts(COMP_BACKEND_IOCP, token, 0, 0);
+            let _ = self.accept_synthetic_completion(
+                event,
+                SyntheticCompletionSource::Timer,
+                IocpSyntheticCompletion::None,
+            );
+        }
+        self.timer.restore_cleared_buffer(timer_buffer);
+    }
+
+    pub(super) fn process_completion_envelope(
+        &mut self,
+        envelope: CompletionEnvelope,
+    ) -> IocpResult<CompletionProgress> {
+        let outcome = self.accept_completion_ingress(
+            CompletionIngress::Kernel(envelope),
+            IocpSyntheticCompletion::None,
+        )?;
+        Ok(CompletionProgress::from_flow(outcome, 1, 0))
+    }
+
+    pub(crate) fn accept_synthetic_completion(
+        &mut self,
+        event: UserCompletionEvent,
+        source: SyntheticCompletionSource,
+        synthetic: IocpSyntheticCompletion,
+    ) -> IocpResult<CompletionFlowOutcome> {
+        self.accept_completion_ingress(CompletionIngress::Synthetic { event, source }, synthetic)
+    }
+
+    pub(crate) fn accept_completion_anomaly(
+        &mut self,
+        anomaly: CompletionAnomaly,
+    ) -> IocpResult<CompletionFlowOutcome> {
+        self.accept_completion_ingress(
+            CompletionIngress::Anomaly(anomaly),
+            IocpSyntheticCompletion::None,
+        )
+    }
+
+    pub(crate) fn accept_raw_completion(
+        &mut self,
+        raw_token: u64,
+        res: i32,
+        flags: u32,
+    ) -> IocpResult<CompletionFlowOutcome> {
+        self.accept_completion_ingress(
+            CompletionIngress::Kernel(CompletionEnvelope::from_raw_parts(
+                COMP_BACKEND_IOCP,
+                raw_token,
+                res,
+                flags,
+            )),
+            IocpSyntheticCompletion::None,
+        )
+    }
+
+    fn accept_completion_ingress(
+        &mut self,
+        ingress: CompletionIngress<()>,
+        synthetic: IocpSyntheticCompletion,
+    ) -> IocpResult<CompletionFlowOutcome> {
+        let mut hooks = IocpCompletionHooks::new(
+            &self.extensions,
+            &self.completion_diagnostics,
+            self.rio.state_mut(),
+            &self.completion,
+            synthetic,
         );
+        let outcome = self.ops.accept_completion(
+            self.completion.table(),
+            &self.completion_diagnostics,
+            &mut hooks,
+            ingress,
+        );
+        let post = hooks.into_post_effects();
+        if post.drain_socket_cleanup {
+            self.drain_deferred_socket_cleanup();
+        }
+        Ok(outcome)
+    }
+}
 
-        ops.remove(user_data);
+impl CompletionProgress {
+    #[inline]
+    pub(super) fn from_flow(flow: CompletionFlowOutcome, iocp: usize, rio: usize) -> Self {
+        Self {
+            iocp,
+            rio,
+            user_completed: flow.user_completed,
+            user_lost: flow.user_lost,
+            orphan_cleaned: flow.orphan_cleaned,
+            internal: flow.internal,
+            anomaly: flow.anomaly,
+        }
+    }
+}
+
+fn calculate_io_result_from_slot(
+    ext: &crate::ext::Extensions,
+    guard: &mut Slot<'_, InFlightWaiting>,
+    event_res: i32,
+) -> IocpResult<usize> {
+    let user_data = guard.snapshot().index;
+    let mut io_result = if event_res < 0 {
+        Err(IocpError::CompletionWait.io_report(
+            "iocp.driver.calculate_io_result_from_slot",
+            std::io::Error::from_raw_os_error(-event_res),
+        ))
+    } else {
+        Ok(event_res as usize)
+    };
+
+    let _ = guard.with_op_mut(|iocp_op: &mut IocpOp| {
+        let blocking_res = iocp_op
+            .header
+            .blocking_completion
+            .take()
+            .and_then(|completion| completion.take_result());
+        if let Some(res) = blocking_res {
+            io_result = res
+                .with_ctx("outer_scope", "iocp.driver.blocking_completion")
+                .attach_note("blocking completion returned stored error");
+        } else if matches!(
+            &iocp_op.payload,
+            crate::op::IocpOpPayload::Open(_)
+                | crate::op::IocpOpPayload::Close(_)
+                | crate::op::IocpOpPayload::Fsync(_)
+                | crate::op::IocpOpPayload::FsyncRaw(_)
+                | crate::op::IocpOpPayload::SyncRange(_)
+                | crate::op::IocpOpPayload::SyncRangeRaw(_)
+                | crate::op::IocpOpPayload::Fallocate(_)
+                | crate::op::IocpOpPayload::FallocateRaw(_)
+        ) {
+            io_result = Err(IocpError::CompletionWait
+                .to_report()
+                .push_ctx("scope", "iocp/driver")
+                .with_ctx("user_data", user_data)
+                .attach_note("missing blocking result for offloaded file completion"));
+        } else if let Ok(val) = io_result {
+            io_result = iocp_op
+                .on_complete(val, ext)
+                .attach_note("IOCP completion hook failed");
+        }
+    });
+
+    io_result
+}
+
+fn complete_iocp_waiting_slot(
+    guard: Slot<'_, InFlightWaiting>,
+    event: UserCompletionEvent,
+    io_result: IocpResult<usize>,
+    socket_inflight: Option<SocketInflightToken>,
+) -> CompletionHookOutcome<IocpSlotSpec, IocpBackendEffect> {
+    let mut io_detail = Some(io_result);
+    let snapshot = guard.snapshot();
+    let effect = socket_inflight
+        .map(IocpBackendEffect::SocketInflight)
+        .unwrap_or_default();
+    let mut guard = guard.complete();
+
+    if guard.platform_mut().is_background {
+        let _ = guard.take_op();
+        let _ = guard.take_completion_data();
+        let _data = std::mem::take(guard.platform_mut());
+        return CompletionHookOutcome::Cleanup {
+            cleanup: CompletionCleanupGuard::default(),
+            effect,
+        };
+    }
+
+    let completion_res = io_detail
+        .as_ref()
+        .map(io_result_to_event_res)
+        .unwrap_or(event.res());
+    let cleanup = if let Some(io_result) = io_detail.as_ref() {
+        guard
+            .with_op_mut(|op| {
+                let cleanup = op.completion_cleanup(io_result);
+                op.unbind_user_payload();
+                cleanup
+            })
+            .unwrap_or_default()
+    } else {
+        let _ = guard.with_op_mut(|op| op.unbind_user_payload());
+        CompletionCleanupGuard::default()
+    };
+    let (payload, detail) = guard.take_completion_data();
+    let event =
+        UserCompletionEvent::from_parts(COMP_BACKEND_IOCP, event.token(), completion_res, 0);
+    if let Some(payload) = payload {
+        let _ = guard.take_op();
+        let _data = std::mem::take(guard.platform_mut());
+        CompletionHookOutcome::User {
+            event,
+            payload,
+            detail: detail.or_else(|| io_detail.take()),
+            cleanup,
+            effect,
+        }
+    } else {
+        drop(detail);
+        let _ = guard.take_op();
+        let _data = std::mem::take(guard.platform_mut());
+        CompletionHookOutcome::Lost {
+            event,
+            loss_reason: CompletionAnomaly::corrupt_slot_snapshot(
+                event.completion_token(),
+                snapshot,
+            )
+            .with_raw_completion(event.raw()),
+            snapshot,
+            cleanup,
+            effect,
+        }
+    }
+}
+
+fn complete_timer_waiting_slot(
+    slot: Slot<'_, InFlightWaiting>,
+    event: UserCompletionEvent,
+) -> CompletionHookOutcome<IocpSlotSpec, IocpBackendEffect> {
+    let io_result: IocpResult<usize> = Ok(0);
+    complete_iocp_waiting_slot(slot, event, io_result, None)
+}
+
+fn complete_submission_failure_slot(
+    slot: Slot<'_, InFlightWaiting>,
+    event: UserCompletionEvent,
+    report: Option<Report<IocpError>>,
+) -> CompletionHookOutcome<IocpSlotSpec, IocpBackendEffect> {
+    let io_result = report.unwrap_or_else(|| {
+        IocpError::Submission
+            .to_report()
+            .push_ctx("scope", "iocp.driver.submission_failure")
+            .set_error_code((-event.res()).max(1))
+            .attach_note("IOCP submission failed")
+    });
+    complete_iocp_waiting_slot(slot, event, Err(io_result), None)
+}
+
+fn complete_cancel_waiting_slot(
+    slot: Slot<'_, InFlightWaiting>,
+    event: UserCompletionEvent,
+    mode: CancelMode,
+) -> CompletionHookOutcome<IocpSlotSpec, IocpBackendEffect> {
+    let abort_result: IocpResult<usize> = Err(IocpError::CompletionWait
+        .to_report()
+        .push_ctx("scope", "iocp.driver.cancel")
+        .set_error_code((-event.res()).max(1))
+        .attach_note("operation aborted locally"));
+    if mode == CancelMode::UserVisible {
+        complete_iocp_waiting_slot(slot, event, abort_result, None)
+    } else {
+        let mut completed = slot.complete();
+        let cleanup = completed
+            .with_op_mut(|op| op.orphan_cleanup(&abort_result))
+            .unwrap_or_default();
+        let _ = completed.take_op();
+        let (payload, detail) = completed.take_completion_data();
+        drop(payload);
+        drop(detail);
+        CompletionHookOutcome::Cleanup {
+            cleanup,
+            effect: IocpBackendEffect::None,
+        }
+    }
+}
+
+fn complete_iocp_orphaned_slot(
+    slot: Slot<'_, InFlightOrphaned>,
+    event_res: i32,
+) -> (CompletionCleanupGuard, Option<SocketInflightToken>) {
+    let mut completed = slot.complete();
+    let io_result = if event_res >= 0 {
+        Ok(event_res as usize)
+    } else {
+        Err(IocpError::CompletionWait.io_report(
+            "iocp.driver.process_completion.orphaned",
+            std::io::Error::from_raw_os_error(-event_res),
+        ))
+    };
+    let (cleanup, socket_inflight) = completed
+        .with_op_mut(|op| {
+            let cleanup = op.orphan_cleanup(&io_result);
+            let socket_inflight = take_socket_inflight_from_op(op);
+            (cleanup, socket_inflight)
+        })
+        .unwrap_or_default();
+    let _ = completed.take_op();
+    let _ = completed.take_completion_data();
+    (cleanup, socket_inflight)
+}
+
+#[inline]
+fn take_socket_inflight_from_slot(
+    slot: &mut Slot<'_, InFlightWaiting>,
+) -> Option<SocketInflightToken> {
+    slot.with_op_mut(take_socket_inflight_from_op)
+        .ok()
+        .flatten()
+}
+
+#[inline]
+fn take_socket_inflight_from_op(op: &mut IocpOp) -> Option<SocketInflightToken> {
+    if op.header.in_flight {
+        op.header.in_flight = false;
+    }
+    op.header.socket_inflight.take()
+}
+
+#[inline]
+fn io_result_to_event_res(res: &IocpResult<usize>) -> i32 {
+    match res {
+        Ok(v) => (*v).min(i32::MAX as usize) as i32,
+        Err(e) => iocp_report_to_event_res(e),
     }
 }

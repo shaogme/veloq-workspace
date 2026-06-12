@@ -1,13 +1,13 @@
-use veloq_runtime::runtime::Runtime;
+use veloq_runtime::runtime::{Runtime, RuntimeScopeContext};
 use veloq_runtime::task::yield_now;
 use veloq_runtime::{task, task_local};
 
 // --- 测试用例 ---
 
-async fn work(id: String, steps: u32) -> String {
+async fn work(ctx: RuntimeScopeContext<'_, ()>, id: String, steps: u32) -> String {
     for i in 1..=steps {
         yield_now().await;
-        let worker_id = veloq_runtime::runtime::current_worker_id();
+        let worker_id = ctx.worker_id();
         println!(
             "  [Worker {}] [任务 {}] 进度 {}/{}",
             worker_id, id, i, steps
@@ -15,14 +15,13 @@ async fn work(id: String, steps: u32) -> String {
     }
     format!("Result from {}", id)
 }
-
 fn main() {
     let rt = Runtime::default();
     rt.block_on(async |ctx| {
         println!("--- 安全异步作用域执行开始 ---");
 
-        task_local!(static_node, work("栈任务-Static".to_string(), 2));
-        task!(send_node, work("栈Send任务".to_string(), 2));
+        task_local!(static_node, work(ctx, "栈任务-Static".to_string(), 2));
+        task!(send_node, work(ctx, "栈Send任务".to_string(), 2));
 
         ctx.scope(async |my_scope| {
             let res_send = my_scope.spawn(&send_node).await.unwrap();
@@ -30,7 +29,8 @@ fn main() {
 
             let mut handles = Vec::new();
             for i in 1..=3 {
-                let h = my_scope.spawn_boxed(work(format!("堆任务-{}", i), i + 1));
+                let h = my_scope
+                    .spawn_boxed(async move { work(ctx, format!("堆任务-{}", i), i + 1).await });
                 handles.push(h);
             }
 
@@ -66,7 +66,7 @@ fn main() {
                 let h1 = explicit_cancel_scope.spawn_boxed(async {
                     for i in 1..=10 {
                         yield_now().await;
-                        let worker_id = veloq_runtime::runtime::current_worker_id();
+                        let worker_id = explicit_cancel_scope.worker_id();
                         println!("    [Worker {}] [手动取消任务] 进度 {}", worker_id, i);
                     }
                 });
@@ -91,14 +91,14 @@ fn main() {
             ctx.scope(async |async_notify_scope| {
                 let token = async_notify_scope.cancel_token().child();
                 let token_clone = token.clone();
-                let h = async_notify_scope.spawn_boxed(async move {
-                    let worker_id = veloq_runtime::runtime::current_worker_id();
+                let h = async_notify_scope.spawn_boxed(async {
+                    let worker_id = async_notify_scope.worker_id();
                     println!(
                         "    [Worker {}] [异步监听任务] 正在等待取消信号...",
                         worker_id
                     );
                     token_clone.cancelled().await;
-                    let worker_id = veloq_runtime::runtime::current_worker_id();
+                    let worker_id = async_notify_scope.worker_id();
                     println!(
                         "    [Worker {}] [异步监听任务] 收到取消信号！正在清理资源...",
                         worker_id
@@ -122,16 +122,16 @@ fn main() {
                 let h = lazy_token_scope.spawn_boxed(async {
                     yield_now().await;
                     yield_now().await;
-                    let worker_id = veloq_runtime::runtime::current_worker_id();
+                    let worker_id = lazy_token_scope.worker_id();
                     println!("    [Worker {}] [延迟令牌任务] 任务运行中...", worker_id);
                 });
 
                 let task_token = h.cancel_token();
                 let token_clone = task_token.clone();
 
-                lazy_token_scope.spawn_boxed(async move {
+                lazy_token_scope.spawn_boxed(async {
                     token_clone.cancelled().await;
-                    let worker_id = veloq_runtime::runtime::current_worker_id();
+                    let worker_id = lazy_token_scope.worker_id();
                     println!("    [Worker {}] [监听器] 检测到任务令牌被取消", worker_id);
                 });
 
@@ -147,11 +147,13 @@ fn main() {
             println!("\n  [测试] 测试定向分发：显式发送任务到 Worker 1...");
             ctx.scope(async |target_scope| {
                 let mut handles = Vec::new();
+                let worker_id = target_scope.worker_id();
                 for i in 1..=3 {
-                    let h = target_scope.spawn_boxed_to(1, async move || {
-                        let worker_id = veloq_runtime::runtime::current_worker_id();
-                        println!("    [Worker {}] [定向任务-{}] 正在执行...", worker_id, i);
-                    });
+                    let h = target_scope
+                        .spawn_boxed_to(1, async move || {
+                            println!("    [Worker {}] [定向任务-{}] 正在执行...", worker_id, i);
+                        })
+                        .expect("定向任务分发失败");
                     handles.push(h);
                 }
                 for h in handles {
@@ -165,21 +167,19 @@ fn main() {
             ctx.scope(async |parent_scope| {
                 let token = parent_scope.cancel_token().clone();
 
-                parent_scope.spawn_boxed(async move {
-                    println!("    [父作用域] 启动子作用域...");
-                    ctx.scope(async |child_scope| {
-                        child_scope.spawn_boxed(async {
-                            for i in 1..=100 {
-                                yield_now().await;
-                                if i % 10 == 0 {
-                                    println!("      [子作用域任务] 运行中... {}", i);
-                                }
+                println!("    [父作用域] 启动子作用域...");
+                ctx.scope(async |child_scope| {
+                    child_scope.spawn_boxed(async {
+                        for i in 1..=100 {
+                            yield_now().await;
+                            if i % 10 == 0 {
+                                println!("      [子作用域任务] 运行中... {}", i);
                             }
-                        });
-                    })
-                    .await;
-                    println!("    [父作用域] 子作用域已退出");
-                });
+                        }
+                    });
+                })
+                .await;
+                println!("    [父作用域] 子作用域已退出");
 
                 yield_now().await;
                 yield_now().await;

@@ -1,7 +1,7 @@
 //! Thread-local cache for the heap allocator.
 
 use super::pool::Chunk;
-use super::units::{SUPERBLOCK_SIZE, SlotIndex, SuperblockState};
+use super::units::{ChunkId, SlotIndex, SuperblockIndex, SuperblockState};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ptr;
@@ -10,14 +10,14 @@ use std::sync::Arc;
 
 pub(crate) struct LocalCacheEntry {
     pub(crate) chunk: Arc<Chunk>,
-    pub(crate) sb_idx: usize,
-    pub(crate) chunk_id: u16,
+    pub(crate) sb_idx: SuperblockIndex,
+    pub(crate) chunk_id: ChunkId,
 }
 
 impl Drop for LocalCacheEntry {
     fn drop(&mut self) {
         // Retire active superblock on thread exit
-        let should_free = self.chunk.superblocks[self.sb_idx].set_inactive();
+        let should_free = self.chunk.superblocks[self.sb_idx.get()].set_inactive();
         if should_free {
             self.chunk.dealloc_superblock(self.sb_idx);
         }
@@ -36,8 +36,8 @@ pub(crate) struct HotSegment {
     // These pointers/values are updated whenever `owner` is set.
     pub(crate) sb_state: Cell<*const SuperblockState>,
     pub(crate) chunk_base: Cell<*const u8>,
-    pub(crate) sb_idx: Cell<usize>,
-    pub(crate) chunk_id: Cell<u16>,
+    pub(crate) sb_idx: Cell<SuperblockIndex>,
+    pub(crate) chunk_id: Cell<ChunkId>,
 
     // Ownership preservation.
     // Setting this to None will automatically trigger Superblock retirement via `LocalCacheEntry::drop`.
@@ -50,8 +50,8 @@ impl HotSegment {
             pool_id: Cell::new(0),
             sb_state: Cell::new(ptr::null()),
             chunk_base: Cell::new(ptr::null()),
-            sb_idx: Cell::new(0),
-            chunk_id: Cell::new(0),
+            sb_idx: Cell::new(SuperblockIndex::new(0)),
+            chunk_id: Cell::new(ChunkId::ZERO),
             owner: Cell::new(None),
         }
     }
@@ -59,7 +59,7 @@ impl HotSegment {
     /// Update the hot segment with a new entry.
     pub(crate) fn set(&self, pool_id: PoolId, entry: LocalCacheEntry) {
         // Mirror metadata to primitive cells for fast access
-        let sb_ref = &*entry.chunk.superblocks[entry.sb_idx];
+        let sb_ref = &*entry.chunk.superblocks[entry.sb_idx.get()];
         self.sb_state.set(sb_ref as *const SuperblockState);
         self.chunk_base.set(entry.chunk.memory.as_ptr());
         self.sb_idx.set(entry.sb_idx);
@@ -91,7 +91,7 @@ pub(crate) struct LocalCache {
 }
 
 impl LocalCache {
-    pub(crate) fn try_alloc(&self, pool_id: PoolId) -> Option<(u16, SlotIndex, NonNull<u8>)> {
+    pub(crate) fn try_alloc(&self, pool_id: PoolId) -> Option<(ChunkId, SlotIndex, NonNull<u8>)> {
         let sb_ptr = self.hot.sb_state.get();
 
         // One-check fast path: identity match and non-null state
@@ -102,7 +102,7 @@ impl LocalCache {
             if let Some(offset) = sb.alloc_one() {
                 let sb_idx = self.hot.sb_idx.get();
                 let chunk_id = self.hot.chunk_id.get();
-                let global_idx = SlotIndex(sb_idx * SUPERBLOCK_SIZE + offset as usize);
+                let global_idx = SlotIndex::from_superblock_offset(sb_idx, offset);
 
                 let ptr = unsafe {
                     NonNull::new_unchecked(
@@ -120,7 +120,7 @@ impl LocalCache {
     }
 
     #[inline(never)]
-    fn try_alloc_slow(&self, pool_id: PoolId) -> Option<(u16, SlotIndex, NonNull<u8>)> {
+    fn try_alloc_slow(&self, pool_id: PoolId) -> Option<(ChunkId, SlotIndex, NonNull<u8>)> {
         let mut others = self.others.borrow_mut();
         if let Some(entry) = others.remove(&pool_id) {
             // 1. Move current hot entry to others

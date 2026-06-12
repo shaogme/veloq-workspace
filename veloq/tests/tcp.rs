@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use veloq::io::{AsyncBufRead, AsyncBufWrite};
 use veloq::net::{TcpListener, TcpStream};
-use veloq::runtime::{Runtime, context};
+use veloq::runtime::Runtime;
 use veloq::sync::mpsc;
 use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
 
@@ -55,7 +55,7 @@ fn tcp_read_exact_write_all() {
         ctx.scope(async |s| {
             s.spawn_boxed(async move {
                 let (stream, _) = listener.accept().await.expect("Accept failed");
-                let mut read_buf = context::alloc(nz!(DATA.len()));
+                let mut read_buf = ctx.alloc(nz!(DATA.len()));
                 read_buf.set_len(DATA.len());
 
                 let (_, buf) = stream
@@ -74,7 +74,7 @@ fn tcp_read_exact_write_all() {
                 let client = TcpStream::connect(ctx, listen_addr)
                     .await
                     .expect("Failed to connect");
-                let mut write_buf = context::alloc(nz!(DATA.len()));
+                let mut write_buf = ctx.alloc(nz!(DATA.len()));
                 write_buf.as_slice_mut()[..DATA.len()].copy_from_slice(DATA);
                 write_buf.set_len(DATA.len());
 
@@ -83,7 +83,7 @@ fn tcp_read_exact_write_all() {
                     .await
                     .expect("Client write_all failed");
 
-                let mut read_buf = context::alloc(nz!(DATA.len()));
+                let mut read_buf = ctx.alloc(nz!(DATA.len()));
                 read_buf.set_len(DATA.len());
                 let (_, buf) = client
                     .read_exact(read_buf)
@@ -170,7 +170,7 @@ fn tcp_recv_zero_bytes() {
                 let stream = TcpStream::connect(ctx, listen_addr)
                     .await
                     .expect("Failed to connect");
-                let buf = context::alloc(nz!(1024));
+                let buf = ctx.alloc(nz!(1024));
                 let result = stream.recv(buf).await;
                 match result {
                     Ok((bytes, _buf)) => {
@@ -302,7 +302,7 @@ fn multithread_tcp_echo() {
 
                 let (stream, _) = listener.accept().await.expect("Accept failed");
                 let expect = b"Hello from worker 1!";
-                let mut recv_buf = context::alloc(nz!(1024));
+                let mut recv_buf = ctx.alloc(nz!(1024));
                 let mut received = Vec::with_capacity(expect.len());
                 while received.len() < expect.len() {
                     let (n, buf) = stream.recv(recv_buf).await.expect("Recv failed");
@@ -316,7 +316,7 @@ fn multithread_tcp_echo() {
                 let mut sent = 0usize;
                 while sent < expect.len() {
                     let remain = &expect[sent..];
-                    let mut echo_buf = context::alloc(nz!(1024));
+                    let mut echo_buf = ctx.alloc(nz!(1024));
                     let chunk = remain.len().min(echo_buf.capacity());
                     echo_buf.spare_capacity_mut()[..chunk].copy_from_slice(&remain[..chunk]);
                     echo_buf.set_len(chunk);
@@ -336,14 +336,14 @@ fn multithread_tcp_echo() {
                     .await
                     .expect("Failed to connect");
                 let data = b"Hello from worker 1!";
-                let mut send_buf = context::alloc(nz!(1024));
+                let mut send_buf = ctx.alloc(nz!(1024));
                 send_buf.spare_capacity_mut()[..data.len()].copy_from_slice(data);
                 send_buf.set_len(data.len());
 
                 let (sent, _) = stream.send(send_buf).await.expect("Send failed");
                 assert_eq!(sent, data.len());
 
-                let mut recv_buf = context::alloc(nz!(1024));
+                let mut recv_buf = ctx.alloc(nz!(1024));
                 let mut echoed = Vec::with_capacity(data.len());
                 while echoed.len() < data.len() {
                     let (n, buf) = stream.recv(recv_buf).await.expect("Recv failed");
@@ -419,7 +419,7 @@ fn tcp_cancel_recv() {
                 let stream = TcpStream::connect(ctx, listen_addr)
                     .await
                     .expect("Failed to connect");
-                let buf = context::alloc(nz!(1024));
+                let buf = ctx.alloc(nz!(1024));
                 veloq_runtime::select! {
                     _ = stream.recv(buf) => {
                         panic!("Recv should have been cancelled, but it completed (unexpectedly)");

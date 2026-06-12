@@ -9,7 +9,7 @@ pub struct LinkedList<A: Adapter> {
     pub(crate) tail: Option<NonNull<Link>>,
     pub(crate) adapter: A,
     pub(crate) len: usize,
-    _marker: PhantomData<Box<A::Value>>,
+    marker: PhantomData<Box<A::Value>>,
 }
 
 // 确保 Send/Sync 语义正确，取决于 Value 是否 Send/Sync
@@ -24,7 +24,7 @@ impl<A: Adapter> LinkedList<A> {
             tail: None,
             adapter,
             len: 0,
-            _marker: PhantomData,
+            marker: PhantomData,
         }
     }
 

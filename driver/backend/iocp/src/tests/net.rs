@@ -11,7 +11,7 @@ use std::net::TcpListener;
 use std::os::windows::io::IntoRawSocket;
 use std::time::Duration;
 use veloq_buf::BufPool;
-use veloq_buf::{PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
+use veloq_buf::{NoopRegistrar, PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
 use veloq_driver_core::driver::{DriveMode, Driver, RegisterFd};
 use veloq_driver_core::op::{Accept, Connect, Recv};
 
@@ -27,8 +27,8 @@ fn register_owned_socket(driver: &mut IocpDriver, socket: Socket) -> IoFd {
 
 #[test]
 fn test_iocp_accept() {
-    let mut driver: IocpDriver =
-        IocpDriver::new(IocpConfig::default()).expect("Driver creation failed");
+    let mut driver: IocpDriver = IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar))
+        .expect("Driver creation failed");
 
     // Listener (Bind to random port)
     let std_listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -53,7 +53,7 @@ fn test_iocp_accept() {
         remote_addr: None,
     };
 
-    let (user_data, generation) = submit_test_op(&mut driver, accept_op);
+    let token = submit_test_op(&mut driver, accept_op);
 
     // Connect Client in background
     std::thread::spawn(move || {
@@ -61,13 +61,8 @@ fn test_iocp_accept() {
         std::net::TcpStream::connect(addr).expect("Client connect failed");
     });
 
-    let record = wait_completion_record(
-        &mut driver,
-        user_data,
-        generation,
-        std::time::Duration::from_secs(5),
-    )
-    .expect("Accept failed");
+    let record = wait_completion_record(&mut driver, token, std::time::Duration::from_secs(5))
+        .expect("Accept failed");
     let completion = complete_from_record::<Accept<SockAddrStorage>>(record);
     let (accepted, op) = completion.into_parts();
     let _accepted = accepted.expect("Accept failed");
@@ -78,7 +73,8 @@ fn test_iocp_accept() {
 
 #[test]
 fn test_iocp_connect() {
-    let mut driver: IocpDriver = IocpDriver::new(IocpConfig::default()).unwrap();
+    let mut driver: IocpDriver =
+        IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar)).unwrap();
 
     // Listener
     let std_listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -97,14 +93,9 @@ fn test_iocp_connect() {
         addr_len: addr_len as u32,
     };
 
-    let (user_data, generation) = submit_test_op(&mut driver, connect_op);
+    let token = submit_test_op(&mut driver, connect_op);
 
-    let res = wait_completion(
-        &mut driver,
-        user_data,
-        generation,
-        std::time::Duration::from_secs(5),
-    );
+    let res = wait_completion(&mut driver, token, std::time::Duration::from_secs(5));
     assert!(res.is_ok(), "Connect failed: {:?}", res.err());
 
     driver.unregister_files(vec![client_fd]).unwrap();
@@ -112,7 +103,7 @@ fn test_iocp_connect() {
 
 #[test]
 fn test_iocp_recv_with_buffer_pool() {
-    let mut driver = IocpDriver::new(IocpConfig::default()).unwrap();
+    let mut driver = IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar)).unwrap();
 
     // Setup GlobalAlloc
     let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(10).unwrap());
@@ -121,7 +112,9 @@ fn test_iocp_recv_with_buffer_pool() {
     let global_pool = topology.create_pool(1).expect("Create pool failed");
 
     // Build pool with noop registrar; chunk registration is explicitly controlled below.
-    let reg_pool = topology.build(&global_pool, 0, Box::new(veloq_buf::NoopRegistrar));
+    let reg_pool = topology
+        .build(&global_pool, 0, &veloq_buf::NoopRegistrar)
+        .expect("build buffer pool failed");
 
     // Setup server listener
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -136,7 +129,7 @@ fn test_iocp_recv_with_buffer_pool() {
         addr: addr_storage,
         addr_len: addr_len as u32,
     };
-    let (connect_user_data, connect_generation) = submit_test_op(&mut driver, connect_op);
+    let connect_token = submit_test_op(&mut driver, connect_op);
 
     let server_thread = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -160,8 +153,7 @@ fn test_iocp_recv_with_buffer_pool() {
     // Poll connect completion before issuing recv.
     let connect_res = wait_completion(
         &mut driver,
-        connect_user_data,
-        connect_generation,
+        connect_token,
         std::time::Duration::from_secs(5),
     );
     assert!(
@@ -177,15 +169,10 @@ fn test_iocp_recv_with_buffer_pool() {
         buf_offset: 0,
     };
 
-    let (user_data, generation) = submit_test_op(&mut driver, recv_op);
+    let token = submit_test_op(&mut driver, recv_op);
 
-    let record = wait_completion_record(
-        &mut driver,
-        user_data,
-        generation,
-        std::time::Duration::from_secs(5),
-    )
-    .expect("recv completion missing");
+    let record = wait_completion_record(&mut driver, token, std::time::Duration::from_secs(5))
+        .expect("recv completion missing");
     let completion = complete_from_record::<Recv>(record);
     let (result, mut op) = completion.into_parts();
     let bytes_read = result.expect("Recv failed");
@@ -198,15 +185,85 @@ fn test_iocp_recv_with_buffer_pool() {
 }
 
 #[test]
-fn test_rio_cancel_poll_returns_aborted_without_hang() {
+fn test_unregister_owned_socket_waits_for_inflight_recv() {
     use std::sync::mpsc;
 
-    let mut driver = IocpDriver::new(IocpConfig::default()).unwrap();
+    let mut driver = IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar)).unwrap();
 
     let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(10).unwrap());
     let topology = UniformSlot::new(multiplier);
     let global_pool = topology.create_pool(1).expect("Create pool failed");
-    let reg_pool = topology.build(&global_pool, 0, Box::new(veloq_buf::NoopRegistrar));
+    let reg_pool = topology
+        .build(&global_pool, 0, &veloq_buf::NoopRegistrar)
+        .expect("build buffer pool failed");
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx_send, rx_send) = mpsc::channel::<()>();
+
+    let server_thread = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = rx_send.recv();
+        stream.write_all(b"recv-after-unregister").unwrap();
+    });
+
+    let client = Socket::new_tcp_v4().expect("client socket create failed");
+    let client_fd = register_owned_socket(&mut driver, client);
+    let (addr_storage, addr_len) = socket_addr_to_storage(addr);
+    let connect_op = Connect {
+        fd: client_fd,
+        addr: addr_storage,
+        addr_len: addr_len as u32,
+    };
+    let connect_token = submit_test_op(&mut driver, connect_op);
+    wait_completion(&mut driver, connect_token, Duration::from_secs(5)).expect("Connect failed");
+
+    let buf = reg_pool
+        .alloc(std::num::NonZeroUsize::new(8192).unwrap())
+        .expect("Failed to alloc buffer");
+    let region = buf.resolve_region_info();
+    let chunk = global_pool
+        .chunk_info(region.id)
+        .expect("Chunk info for buffer not found");
+    driver
+        .register_chunk(region.id, chunk.ptr.as_ptr(), chunk.len.get())
+        .expect("register chunk failed");
+
+    let recv_op = Recv {
+        fd: client_fd,
+        buf,
+        buf_offset: 0,
+    };
+    let token = submit_test_op(&mut driver, recv_op);
+
+    driver
+        .unregister_files(vec![client_fd])
+        .expect("unregister while recv in flight should defer cleanup");
+
+    let _ = tx_send.send(());
+    let record = wait_completion_record(&mut driver, token, Duration::from_secs(5))
+        .expect("recv completion missing");
+    let completion = complete_from_record::<Recv>(record);
+    let (result, mut op) = completion.into_parts();
+    let bytes_read = result.expect("Recv failed after unregister");
+    op.buf.set_len(bytes_read);
+    assert_eq!(&op.buf.as_slice()[..bytes_read], b"recv-after-unregister");
+
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn test_rio_cancel_poll_returns_aborted_without_hang() {
+    use std::sync::mpsc;
+
+    let mut driver = IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar)).unwrap();
+
+    let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(10).unwrap());
+    let topology = UniformSlot::new(multiplier);
+    let global_pool = topology.create_pool(1).expect("Create pool failed");
+    let reg_pool = topology
+        .build(&global_pool, 0, &veloq_buf::NoopRegistrar)
+        .expect("build buffer pool failed");
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -226,14 +283,9 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
         addr: addr_storage,
         addr_len: addr_len as u32,
     };
-    let (connect_user_data, connect_generation) = submit_test_op(&mut driver, connect_op);
+    let connect_token = submit_test_op(&mut driver, connect_op);
 
-    let connect_res = wait_completion(
-        &mut driver,
-        connect_user_data,
-        connect_generation,
-        Duration::from_secs(5),
-    );
+    let connect_res = wait_completion(&mut driver, connect_token, Duration::from_secs(5));
     assert!(
         connect_res.is_ok(),
         "Connect failed: {:?}",
@@ -256,18 +308,20 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
         buf,
         buf_offset: 0,
     };
-    let (user_data, generation) = submit_test_op(&mut driver, recv_op);
+    let token = submit_test_op(&mut driver, recv_op);
 
-    driver.cancel_op(user_data);
+    let _ = driver.cancel_op(veloq_driver_core::driver::CancelRequest::user_visible(
+        token,
+    ));
+    let _ = tx_send.send(());
 
-    let res = wait_completion(&mut driver, user_data, generation, Duration::from_secs(1));
+    let res = wait_completion(&mut driver, token, Duration::from_secs(5));
     let err = res.expect_err("cancelled op should return aborted");
     assert_eq!(
         completion_os_error_code(&err),
         Some(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32)
     );
 
-    let _ = tx_send.send(());
     server_thread.join().unwrap();
     driver.unregister_files(vec![client_fd]).unwrap();
 }
@@ -276,12 +330,14 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
 fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
     use std::sync::mpsc;
 
-    let mut driver = IocpDriver::new(IocpConfig::default()).unwrap();
+    let mut driver = IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar)).unwrap();
 
     let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(10).unwrap());
     let topology = UniformSlot::new(multiplier);
     let global_pool = topology.create_pool(1).expect("Create pool failed");
-    let reg_pool = topology.build(&global_pool, 0, Box::new(veloq_buf::NoopRegistrar));
+    let reg_pool = topology
+        .build(&global_pool, 0, &veloq_buf::NoopRegistrar)
+        .expect("build buffer pool failed");
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -301,14 +357,9 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
         addr: addr_storage,
         addr_len: addr_len as u32,
     };
-    let (connect_user_data, connect_generation) = submit_test_op(&mut driver, connect_op);
+    let connect_token = submit_test_op(&mut driver, connect_op);
 
-    let connect_res = wait_completion(
-        &mut driver,
-        connect_user_data,
-        connect_generation,
-        Duration::from_secs(5),
-    );
+    let connect_res = wait_completion(&mut driver, connect_token, Duration::from_secs(5));
     assert!(
         connect_res.is_ok(),
         "Connect failed: {:?}",
@@ -331,34 +382,37 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
         buf,
         buf_offset: 0,
     };
-    let (user_data, generation) = submit_test_op(&mut driver, recv_op);
+    let token = submit_test_op(&mut driver, recv_op);
 
-    driver.cancel_op(user_data);
+    let _ = driver.cancel_op(veloq_driver_core::driver::CancelRequest::user_visible(
+        token,
+    ));
 
-    let res = wait_completion(&mut driver, user_data, generation, Duration::from_secs(1));
+    assert!(
+        !remote_free_contains(&driver, token.index()),
+        "取消后真实 RIO completion 到来前不应回收槽位"
+    );
+
+    let _ = tx_send.send(());
+
+    let res = wait_completion(&mut driver, token, Duration::from_secs(5));
     let err = res.expect_err("cancelled op should return aborted");
     assert_eq!(
         completion_os_error_code(&err),
         Some(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32)
     );
 
-    assert!(
-        remote_free_contains(&driver, user_data),
-        "取消完成后应立即回收槽位"
-    );
-
-    let _ = tx_send.send(());
     let drain_start = std::time::Instant::now();
     while drain_start.elapsed() < Duration::from_secs(2) {
         let _ = driver.drive(DriveMode::Poll);
-        if remote_free_contains(&driver, user_data) {
+        if remote_free_contains(&driver, token.index()) {
             break;
         }
         std::thread::sleep(Duration::from_millis(5));
     }
 
     assert!(
-        remote_free_contains(&driver, user_data),
+        remote_free_contains(&driver, token.index()),
         "晚到 RIO completion 到来后槽位仍应保持可复用"
     );
 

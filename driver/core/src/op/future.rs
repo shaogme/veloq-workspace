@@ -1,5 +1,4 @@
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::error::Error;
 use std::sync::Arc;
 use std::{
     future::Future,
@@ -9,12 +8,14 @@ use std::{
 use tracing::trace;
 
 use crate::driver::{
-    CompletionRecord, Driver, PlatformOp, PollRecordResult, RemoteWaker, SharedCompletionTable,
-    SubmitBinder, SubmitStatus, encode_completion_token, event_res_to_result,
+    CancelRequest, CompletionAnomaly, CompletionAnomalyReason, CompletionRecord, CompletionToken,
+    CompletionValue, Driver, DriverSubmitResult, OpToken, PlatformOp, PollRecordResult,
+    RemoteCancelSender, RemoteWaker, SharedCompletionTable, SubmitStatus,
 };
 use crate::op::{IntoPlatformOp, Op};
-use crate::slot::DetachedCancelTable;
-use crate::{DriverErrorKind, DriverErrorReport, DriverResult, driver_error};
+use crate::{DriverCoreError, DriverError, DriverReport, DriverResult};
+
+use diagweave::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LostReason {
@@ -23,6 +24,8 @@ pub enum LostReason {
     GenerationMismatch,
     /// 内部错误：操作负载丢失 (Completion sidecar missing)。
     PayloadMissing,
+    /// 内部错误：擦除后的 payload 与操作类型不匹配。
+    PayloadTypeMismatch,
     /// 其它未知原因造成的资源丢失。
     Other,
 }
@@ -32,6 +35,7 @@ impl std::fmt::Display for LostReason {
         match self {
             Self::GenerationMismatch => write!(f, "generation mismatch (slot recycled)"),
             Self::PayloadMissing => write!(f, "payload missing"),
+            Self::PayloadTypeMismatch => write!(f, "payload type mismatch"),
             Self::Other => write!(f, "unknown resource loss"),
         }
     }
@@ -39,13 +43,13 @@ impl std::fmt::Display for LostReason {
 
 /// 描述 IO 操作丢失及其原因的结构化错误。
 #[derive(Debug)]
-pub struct OpError {
+pub struct OpError<E> {
     pub reason: LostReason,
-    pub source: DriverErrorReport,
+    pub source: DriverReport<E>,
 }
 
-impl OpError {
-    pub fn new(reason: LostReason, source: DriverErrorReport) -> Self {
+impl<E> OpError<E> {
+    pub fn new(reason: LostReason, source: DriverReport<E>) -> Self {
         Self { reason, source }
     }
 
@@ -55,7 +59,10 @@ impl OpError {
     }
 }
 
-impl std::fmt::Display for OpError {
+impl<E> std::fmt::Display for OpError<E>
+where
+    E: Error + Send + Sync + 'static,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.reason, self.source)
     }
@@ -63,14 +70,17 @@ impl std::fmt::Display for OpError {
 
 /// The result of an IO operation.
 #[derive(Debug)]
-pub enum OpResult<T, R = usize> {
+pub enum OpResult<T, E, R = usize> {
     /// Operation completed (successfully or with IO error).
-    Completed(DriverResult<R>, T),
+    Completed(DriverResult<R, E>, T),
     /// Operation failed because the resource ownership was lost.
-    ResourceLost(OpError),
+    ResourceLost(OpError<E>),
 }
 
-impl<T, R> OpResult<T, R> {
+impl<T, E, R> OpResult<T, E, R>
+where
+    E: Error + Send + Sync + 'static,
+{
     /// Unwraps the result, assuming the operation completed (panics if Lost).
     pub fn unwrap(self) -> (R, T) {
         match self {
@@ -81,7 +91,7 @@ impl<T, R> OpResult<T, R> {
     }
 
     /// Returns the result and the resource implementation (if available).
-    pub fn into_inner(self) -> (DriverResult<R>, Option<T>) {
+    pub fn into_inner(self) -> (DriverResult<R, E>, Option<T>) {
         match self {
             OpResult::Completed(res, data) => (res, Some(data)),
             OpResult::ResourceLost(err) => (Err(err.source), None),
@@ -91,128 +101,233 @@ impl<T, R> OpResult<T, R> {
 
 /// The completion projection for a submitted operation.
 #[derive(Debug)]
-pub struct OpCompletion<T, R = usize> {
-    pub result: DriverResult<R>,
+pub struct OpCompletion<T, E, R = usize> {
+    pub result: DriverResult<R, E>,
     pub output: T,
 }
 
-impl<T, R> OpCompletion<T, R> {
+impl<T, E, R> OpCompletion<T, E, R> {
     #[inline]
-    pub fn new(result: DriverResult<R>, output: T) -> Self {
+    pub fn new(result: DriverResult<R, E>, output: T) -> Self {
         Self { result, output }
     }
 
     #[inline]
-    pub fn into_parts(self) -> (DriverResult<R>, T) {
+    pub fn into_parts(self) -> (DriverResult<R, E>, T) {
         (self.result, self.output)
     }
 }
 
 #[inline]
-pub(crate) fn payload_missing_error() -> OpError {
+pub(crate) fn payload_missing_error<E>() -> OpError<E>
+where
+    E: DriverError,
+{
     OpError::new(
         LostReason::PayloadMissing,
-        driver_error(
-            DriverErrorKind::Internal,
-            "driver-core/op",
-            "operation payload lost: completion sidecar missing",
+        E::from_core_report(
+            DriverCoreError::Internal
+                .to_report()
+                .push_ctx("scope", "driver-core/op")
+                .attach_note("operation payload lost: completion sidecar missing"),
         ),
     )
 }
 
 #[inline]
-pub(crate) fn generation_mismatch_error() -> OpError {
-    OpError::new(
-        LostReason::GenerationMismatch,
-        driver_error(
-            DriverErrorKind::Internal,
-            "driver-core/op",
-            "operation lost: slot recycled (generation mismatch)",
-        ),
-    )
-}
-
-#[inline]
-pub(crate) fn completion_record_to_result<T, O, UP, C>(
-    record: CompletionRecord<UP, C>,
-) -> Poll<OpResult<T::Output, T::Completion>>
+pub(crate) fn payload_projection_error<E>(source: DriverReport<E>) -> OpError<E>
 where
-    UP: Send,
+    E: DriverError,
+{
+    OpError::new(LostReason::PayloadTypeMismatch, source)
+}
+
+#[inline]
+pub(crate) fn completion_anomaly_error<E>(anomaly: CompletionAnomaly) -> OpError<E>
+where
+    E: DriverError,
+{
+    let reason = match anomaly.reason {
+        CompletionAnomalyReason::StaleGeneration => LostReason::GenerationMismatch,
+        CompletionAnomalyReason::PayloadMissing => LostReason::PayloadMissing,
+        CompletionAnomalyReason::UnknownSlot
+        | CompletionAnomalyReason::UnknownControlToken
+        | CompletionAnomalyReason::ControlCompletionUntracked
+        | CompletionAnomalyReason::NonActiveSlot
+        | CompletionAnomalyReason::SlotCorruption
+        | CompletionAnomalyReason::OpMissing
+        | CompletionAnomalyReason::BackendInvariantBroken
+        | CompletionAnomalyReason::CompletionKeyMismatch
+        | CompletionAnomalyReason::FinalizeFailed
+        | CompletionAnomalyReason::CancelAckTargetStillActive
+        | CompletionAnomalyReason::BackendContextUnknown
+        | CompletionAnomalyReason::BackendSpecific(_) => LostReason::Other,
+    };
+
+    let mut report = DriverCoreError::Internal
+        .to_report()
+        .push_ctx("scope", "driver-core/op")
+        .with_ctx("completion_token", anomaly.token.raw())
+        .with_ctx("completion_anomaly", format!("{:?}", anomaly.reason))
+        .attach_note("operation completion became unavailable");
+
+    if let Some(index) = anomaly.index {
+        report = report.with_ctx("slot_index", index);
+    }
+    if let Some(expected_generation) = anomaly.expected_generation {
+        report = report.with_ctx("expected_generation", expected_generation);
+    }
+    if let Some(actual_generation) = anomaly.actual_generation {
+        report = report.with_ctx("actual_generation", actual_generation);
+    }
+    if let Some(state) = anomaly.state {
+        report = report.with_ctx("slot_state", format!("{state:?}"));
+    }
+    if let Some(backend) = anomaly.backend {
+        report = report.with_ctx("completion_backend", format!("{backend:?}"));
+    }
+    if let Some(backend_context) = anomaly.backend_context {
+        report = report.with_ctx("completion_backend_context", backend_context);
+    }
+    if let Some(raw_result) = anomaly.raw_result {
+        report = report.with_ctx("raw_result", raw_result);
+    }
+    if let Some(flags) = anomaly.flags {
+        report = report.with_ctx("completion_flags", flags);
+    }
+    if let Some(snapshot) = anomaly.slot_snapshot {
+        report = report
+            .with_ctx("snapshot_has_op", snapshot.has_op)
+            .with_ctx("snapshot_has_payload", snapshot.has_payload);
+    }
+
+    OpError::new(reason, E::from_core_report(report))
+}
+
+#[inline]
+pub(crate) fn completion_record_to_result<T, O, Spec>(
+    record: CompletionRecord<Spec>,
+) -> Poll<OpResult<T::Output, Spec::Error, T::Completion>>
+where
+    Spec: crate::slot::SlotSpec,
     O: PlatformOp,
-    T: IntoPlatformOp<O, DriverCompletion = C, ErasedPayload = UP>,
-    C: crate::driver::CompletionValue,
+    T: IntoPlatformOp<
+            O,
+            DriverCompletion = Spec::Completion,
+            ErasedPayload = Spec::UserPayload,
+            Error = Spec::Error,
+        >,
+    Spec::Error: DriverError,
+    Spec::Completion: crate::driver::CompletionValue,
 {
     let CompletionRecord {
         event,
         payload: payload_erased,
         detail,
+        mut cleanup,
     } = record;
-    let Some(payload_erased) = payload_erased else {
-        return Poll::Ready(OpResult::ResourceLost(payload_missing_error()));
+    let payload = match T::try_payload_from_erased(payload_erased) {
+        Ok(payload) => payload,
+        Err(report) => {
+            let _ = cleanup.run();
+            return Poll::Ready(OpResult::ResourceLost(payload_projection_error(report)));
+        }
     };
-    let payload = T::payload_from_erased(payload_erased);
-    let res = detail.unwrap_or_else(|| event_res_to_result::<C>(event.res));
+    cleanup.disarm();
+    let res =
+        detail.unwrap_or_else(|| Spec::Completion::from_event_res::<Spec::Error>(event.res()));
     let completion = T::complete(payload, res);
     Poll::Ready(OpResult::Completed(completion.result, completion.output))
 }
 
 #[inline]
-pub(crate) fn poll_completion_table_once<T, O, UP, C>(
-    table: &dyn crate::driver::CompletionAccess<UP, C>,
-    token: u64,
-) -> Poll<OpResult<T::Output, T::Completion>>
+pub(crate) fn poll_completion_table_once<T, O, Spec>(
+    table: &dyn crate::driver::CompletionAccess<Spec>,
+    token: OpToken,
+) -> Poll<OpResult<T::Output, Spec::Error, T::Completion>>
 where
-    UP: Send,
+    Spec: crate::slot::SlotSpec,
     O: PlatformOp,
-    T: IntoPlatformOp<O, DriverCompletion = C, ErasedPayload = UP>,
-    C: crate::driver::CompletionValue,
+    T: IntoPlatformOp<
+            O,
+            DriverCompletion = Spec::Completion,
+            ErasedPayload = Spec::UserPayload,
+            Error = Spec::Error,
+        >,
+    Spec::Error: DriverError,
+    Spec::Completion: crate::driver::CompletionValue,
 {
     match table.try_take_record(token) {
-        PollRecordResult::Ready(record) => completion_record_to_result::<T, O, UP, C>(record),
-        PollRecordResult::Stale => Poll::Ready(OpResult::<T::Output, T::Completion>::ResourceLost(
-            generation_mismatch_error(),
-        )),
+        PollRecordResult::Ready(record) => completion_record_to_result::<T, O, Spec>(record),
+        PollRecordResult::Unavailable(anomaly) => {
+            Poll::Ready(
+                OpResult::<T::Output, Spec::Error, T::Completion>::ResourceLost(
+                    completion_anomaly_error(anomaly),
+                ),
+            )
+        }
         PollRecordResult::Pending => Poll::Pending,
     }
 }
 
-type DetachedOpMarker<T, UP, C, O> = (T, UP, C, fn() -> O);
+type DetachedOpMarker<T, Spec> = (T, Spec);
 
 /// A Future representing a detached operation.
-pub struct DetachedOp<T, O, C>
+pub struct DetachedOp<T, Spec>
 where
-    O: PlatformOp,
-    C: crate::driver::CompletionValue,
-    T: IntoPlatformOp<O, DriverCompletion = C>,
+    Spec: crate::slot::SlotSpec,
+    Spec::Error: DriverError,
+    Spec::Completion: crate::driver::CompletionValue,
+    T: IntoPlatformOp<
+            Spec::Op,
+            DriverCompletion = Spec::Completion,
+            Error = Spec::Error,
+            ErasedPayload = Spec::UserPayload,
+        >,
 {
-    pub(crate) completion_table: Option<SharedCompletionTable<T::ErasedPayload, C>>,
-    pub(crate) cancel_signal: Option<Arc<DetachedCancelTable>>,
-    pub(crate) cancel_waker: Option<Arc<dyn RemoteWaker>>,
-    pub(crate) token: u64,
-    pub(crate) immediate_failure: Option<(DriverErrorReport, T::UserPayload)>,
-    pub(crate) _phantom: std::marker::PhantomData<DetachedOpMarker<T, T::ErasedPayload, C, O>>,
+    pub(crate) completion_table: Option<SharedCompletionTable<Spec>>,
+    pub(crate) cancel_sender: Option<RemoteCancelSender>,
+    pub(crate) cancel_waker: Option<Arc<dyn RemoteWaker<Spec::Error>>>,
+    pub(crate) token: Option<OpToken>,
+    pub(crate) immediate_failure: Option<(DriverReport<Spec::Error>, T::UserPayload)>,
+    pub(crate) immediate_resource_lost: Option<OpError<Spec::Error>>,
+    pub(crate) _phantom: std::marker::PhantomData<DetachedOpMarker<T, Spec>>,
 }
 
-unsafe impl<
-    T: IntoPlatformOp<O, DriverCompletion = C> + std::marker::Send,
-    O: PlatformOp,
-    C: crate::driver::CompletionValue,
-> std::marker::Send for DetachedOp<T, O, C>
+unsafe impl<T, Spec> std::marker::Send for DetachedOp<T, Spec>
+where
+    Spec: crate::slot::SlotSpec,
+    Spec::Error: DriverError,
+    Spec::Completion: crate::driver::CompletionValue,
+    T: IntoPlatformOp<
+            Spec::Op,
+            DriverCompletion = Spec::Completion,
+            Error = Spec::Error,
+            ErasedPayload = Spec::UserPayload,
+        > + std::marker::Send,
 {
 }
 
-impl<T, O, C> Drop for DetachedOp<T, O, C>
+impl<T, Spec> Drop for DetachedOp<T, Spec>
 where
-    O: PlatformOp,
-    C: crate::driver::CompletionValue,
-    T: IntoPlatformOp<O, DriverCompletion = C>,
+    Spec: crate::slot::SlotSpec,
+    Spec::Error: DriverError,
+    Spec::Completion: crate::driver::CompletionValue,
+    T: IntoPlatformOp<
+            Spec::Op,
+            DriverCompletion = Spec::Completion,
+            Error = Spec::Error,
+            ErasedPayload = Spec::UserPayload,
+        >,
 {
     fn drop(&mut self) {
-        if let Some(table) = self.completion_table.as_ref() {
-            table.mark_orphaned(self.token);
-        }
-        if let Some(cancel_signal) = self.cancel_signal.as_ref() {
-            cancel_signal.request_cancel(self.token);
+        if let Some(token) = self.token {
+            if let Some(table) = self.completion_table.as_ref() {
+                table.mark_orphaned(token);
+            }
+            if let Some(cancel_sender) = self.cancel_sender.as_ref() {
+                let _ = cancel_sender.send(CancelRequest::abandon(token));
+            }
         }
         if let Some(cancel_waker) = self.cancel_waker.as_ref()
             && let Err(e) = cancel_waker.wake()
@@ -222,13 +337,19 @@ where
     }
 }
 
-impl<T, O, C> Future for DetachedOp<T, O, C>
+impl<T, Spec> Future for DetachedOp<T, Spec>
 where
-    O: PlatformOp,
-    C: crate::driver::CompletionValue,
-    T: IntoPlatformOp<O, DriverCompletion = C>,
+    Spec: crate::slot::SlotSpec,
+    Spec::Error: DriverError,
+    Spec::Completion: crate::driver::CompletionValue,
+    T: IntoPlatformOp<
+            Spec::Op,
+            DriverCompletion = Spec::Completion,
+            Error = Spec::Error,
+            ErasedPayload = Spec::UserPayload,
+        >,
 {
-    type Output = OpResult<T::Output, T::Completion>;
+    type Output = OpResult<T::Output, Spec::Error, T::Completion>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
@@ -237,19 +358,25 @@ where
             let completion = T::complete(payload, Err(e));
             return Poll::Ready(OpResult::Completed(completion.result, completion.output));
         }
+        if let Some(err) = this.immediate_resource_lost.take() {
+            return Poll::Ready(OpResult::ResourceLost(err));
+        }
 
         let table = this
             .completion_table
             .as_ref()
             .expect("DetachedOp missing completion_table but no immediate_failure");
+        let token = this
+            .token
+            .expect("DetachedOp missing completion token but no immediate_failure");
         if let Poll::Ready(result) =
-            poll_completion_table_once::<T, O, T::ErasedPayload, C>(&**table, this.token)
+            poll_completion_table_once::<T, Spec::Op, Spec>(&**table, token)
         {
             return Poll::Ready(result);
         }
 
-        table.register_waker(this.token, cx.waker());
-        poll_completion_table_once::<T, O, T::ErasedPayload, C>(&**table, this.token)
+        table.register_waker(token, cx.waker());
+        poll_completion_table_once::<T, Spec::Op, Spec>(&**table, token)
     }
 }
 
@@ -261,40 +388,55 @@ pub enum LocalState {
 }
 
 /// A Future wrapper for asynchronous IO operations executed locally.
-pub struct LocalOp<T, D>
+pub struct LocalOp<'a, T, P>
 where
-    D: Driver,
-    T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>,
+    P: crate::op::DriverProvider,
+    T: IntoPlatformOp<
+            P::Op,
+            DriverCompletion = P::Completion,
+            ErasedPayload = P::UP,
+            Error = P::Error,
+        >,
 {
     pub(crate) state: LocalState,
     pub(crate) data: Option<T>,
-    pub(crate) driver: Rc<RefCell<D>>,
-    pub(crate) user_data: usize,
-    pub(crate) token: u64,
+    pub(crate) provider: P,
+    pub(crate) token: Option<OpToken>,
+    pub(crate) marker: std::marker::PhantomData<&'a ()>,
 }
 
-impl<T, D> LocalOp<T, D>
+impl<'a, T, P> LocalOp<'a, T, P>
 where
-    D: Driver,
-    T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>,
+    P: crate::op::DriverProvider,
+    T: IntoPlatformOp<
+            P::Op,
+            DriverCompletion = P::Completion,
+            ErasedPayload = P::UP,
+            Error = P::Error,
+        >,
 {
-    pub fn new(data: T, driver: Rc<RefCell<D>>) -> Self {
+    pub fn new(data: T, provider: P) -> Self {
         Self {
             state: LocalState::Defined,
             data: Some(data),
-            driver,
-            user_data: 0,
-            token: 0,
+            provider,
+            token: None,
+            marker: std::marker::PhantomData,
         }
     }
 }
 
-impl<T, D> Future for LocalOp<T, D>
+impl<'a, T, P> Future for LocalOp<'a, T, P>
 where
-    D: Driver,
-    T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>,
+    P: crate::op::DriverProvider,
+    T: IntoPlatformOp<
+            P::Op,
+            DriverCompletion = P::Completion,
+            ErasedPayload = P::UP,
+            Error = P::Error,
+        >,
 {
-    type Output = OpResult<T::Output, T::Completion>;
+    type Output = OpResult<T::Output, P::Error, T::Completion>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let op = unsafe { self.get_unchecked_mut() };
@@ -304,128 +446,150 @@ where
                 op = %std::any::type_name::<T>(),
                 "LocalOp::poll: submit begin"
             );
-            let mut driver = op.driver.borrow_mut();
 
-            // Submit to driver
             let data = op.data.take().expect("Op started without data");
             let (driver_op, payload) = data.into_kernel_and_payload();
 
-            let (user_data, generation) = match driver.reserve_op() {
-                Ok(v) => v,
-                Err(e) => {
+            let submit_res = op.provider.with_driver(|mut driver| {
+                let mut slot = match driver.reserve_op() {
+                    Ok(v) => v,
+                    Err(e) => return Err((e, driver_op, payload)),
+                };
+                let token = slot.token();
+                slot.set_payload(T::payload_into_erased(payload));
+
+                let mut driver_op_opt = Some(driver_op);
+                let result = slot.submit(&mut driver_op_opt);
+
+                let mut fallback_payload = None;
+                match &result {
+                    DriverSubmitResult::Submitted(_)
+                    | DriverSubmitResult::Failed {
+                        status: SubmitStatus::InFlight,
+                        ..
+                    } => {
+                        let _ = slot.persist();
+                    }
+                    DriverSubmitResult::Failed {
+                        status: SubmitStatus::Void,
+                        ..
+                    } => {
+                        if let Some(val) = driver_op_opt.take() {
+                            drop(val);
+                        }
+                        fallback_payload = slot.recover_payload();
+                    }
+                }
+                Ok((token, result, fallback_payload))
+            });
+
+            match submit_res {
+                Err((e, driver_op, payload)) => {
                     drop(driver_op);
                     let completion = T::complete(payload, Err(e));
                     return Poll::Ready(OpResult::Completed(completion.result, completion.output));
                 }
-            };
-            op.user_data = user_data;
-            op.token = encode_completion_token(user_data, generation);
-            driver.slot_set_payload(user_data, T::payload_into_erased(payload));
-
-            let mut driver_op_opt = Some(driver_op);
-            let result = driver
-                .submit(user_data, &mut driver_op_opt, SubmitBinder::new())
-                .into_inner();
-
-            match result {
-                Ok(_) => {
-                    op.state = LocalState::Submitted;
-                    trace!(
-                        op = %std::any::type_name::<T>(),
-                        user_data = op.user_data,
-                        token = op.token,
-                        "LocalOp::poll: submitted"
-                    );
-                }
-                Err((e, status)) => {
-                    if status == SubmitStatus::Void {
-                        if let Some(val) = driver_op_opt.take() {
-                            drop(val);
+                Ok((token, result, fallback_payload)) => {
+                    op.token = Some(token);
+                    match result {
+                        DriverSubmitResult::Submitted(_) => {
+                            op.state = LocalState::Submitted;
+                            trace!(
+                                op = %std::any::type_name::<T>(),
+                                token = CompletionToken::user(token).raw(),
+                                "LocalOp::poll: submitted"
+                            );
                         }
-                        let payload_erased = driver.slot_take_payload(user_data).unwrap_or_else(|| {
-                            panic!(
-                                "Payload missing while recovering submit failure: user_data={}, status={:?}, error={}",
-                                user_data, status, e
-                            )
-                        });
-                        let payload = T::payload_from_erased(payload_erased);
-                        trace!(
-                            op = %std::any::type_name::<T>(),
-                            user_data = user_data,
-                            status = ?status,
-                            error = %e,
-                            "LocalOp::poll: submit failed synchronously"
-                        );
-                        let completion = T::complete(payload, Err(e));
-                        return Poll::Ready(OpResult::Completed(
-                            completion.result,
-                            completion.output,
-                        ));
-                    } else {
-                        op.state = LocalState::Submitted;
-                        trace!(
-                            op = %std::any::type_name::<T>(),
-                            user_data = op.user_data,
-                            token = op.token,
-                            status = ?status,
-                            "LocalOp::poll: submitted in flight"
-                        );
+                        DriverSubmitResult::Failed { report, status } => match status {
+                            SubmitStatus::Void => {
+                                let Some(payload_erased) = fallback_payload else {
+                                    return Poll::Ready(OpResult::ResourceLost(
+                                        payload_missing_error(),
+                                    ));
+                                };
+                                let payload = match T::try_payload_from_erased(payload_erased) {
+                                    Ok(payload) => payload,
+                                    Err(report) => {
+                                        return Poll::Ready(OpResult::ResourceLost(
+                                            payload_projection_error(report),
+                                        ));
+                                    }
+                                };
+                                trace!(
+                                    op = %std::any::type_name::<T>(),
+                                    status = ?status,
+                                    error = %report,
+                                    "LocalOp::poll: submit failed synchronously"
+                                );
+                                let completion = T::complete(payload, Err(report));
+                                return Poll::Ready(OpResult::Completed(
+                                    completion.result,
+                                    completion.output,
+                                ));
+                            }
+                            SubmitStatus::InFlight => {
+                                op.state = LocalState::Submitted;
+                                trace!(
+                                    op = %std::any::type_name::<T>(),
+                                    token = CompletionToken::user(token).raw(),
+                                    status = ?status,
+                                    "LocalOp::poll: submitted in flight"
+                                );
+                            }
+                        },
                     }
                 }
             }
-
-            op.state = LocalState::Submitted;
         }
 
         if let LocalState::Submitted = op.state {
-            let mut driver = op.driver.borrow_mut();
-            match poll_completion_table_once::<T, D::Op, D::UP, D::Completion>(
-                &*driver.completion_table(),
-                op.token,
-            ) {
-                Poll::Ready(result) => {
-                    op.state = LocalState::Completed;
-                    trace!(
-                        op = %std::any::type_name::<T>(),
-                        user_data = op.user_data,
-                        token = op.token,
-                        "LocalOp::poll: completion ready"
-                    );
-                    Poll::Ready(result)
-                }
-                Poll::Pending => {
-                    driver.register_completion_waker(op.token, cx.waker());
-                    trace!(
-                        op = %std::any::type_name::<T>(),
-                        user_data = op.user_data,
-                        token = op.token,
-                        "LocalOp::poll: completion pending"
-                    );
-                    match poll_completion_table_once::<T, D::Op, D::UP, D::Completion>(
-                        &*driver.completion_table(),
-                        op.token,
-                    ) {
-                        Poll::Ready(result) => {
-                            op.state = LocalState::Completed;
-                            trace!(
-                                op = %std::any::type_name::<T>(),
-                                user_data = op.user_data,
-                                token = op.token,
-                                "LocalOp::poll: completion ready after register"
-                            );
-                            Poll::Ready(result)
-                        }
-                        Poll::Pending => {
-                            trace!(
-                                op = %std::any::type_name::<T>(),
-                                user_data = op.user_data,
-                                token = op.token,
-                                "LocalOp::poll: still pending"
-                            );
-                            Poll::Pending
+            let token = op
+                .token
+                .expect("LocalOp submitted state missing completion token");
+            let res = op.provider.with_driver(|mut driver| {
+                let mut is_ready = false;
+                let mut ready_val = None;
+
+                match poll_completion_table_once::<T, P::Op, P::SlotSpec>(
+                    &*driver.completion_table(),
+                    token,
+                ) {
+                    Poll::Ready(result) => {
+                        is_ready = true;
+                        ready_val = Some(result);
+                    }
+                    Poll::Pending => {
+                        driver.register_completion_waker(token, cx.waker());
+                        match poll_completion_table_once::<T, P::Op, P::SlotSpec>(
+                            &*driver.completion_table(),
+                            token,
+                        ) {
+                            Poll::Ready(result) => {
+                                is_ready = true;
+                                ready_val = Some(result);
+                            }
+                            Poll::Pending => {}
                         }
                     }
                 }
+                (is_ready, ready_val)
+            });
+
+            if res.0 {
+                op.state = LocalState::Completed;
+                trace!(
+                    op = %std::any::type_name::<T>(),
+                    token = CompletionToken::user(token).raw(),
+                    "LocalOp::poll: completion ready"
+                );
+                Poll::Ready(res.1.unwrap())
+            } else {
+                trace!(
+                    op = %std::any::type_name::<T>(),
+                    token = CompletionToken::user(token).raw(),
+                    "LocalOp::poll: completion pending"
+                );
+                Poll::Pending
             }
         } else {
             panic!("Polled after completion");
@@ -433,52 +597,91 @@ where
     }
 }
 
-impl<T, D> Drop for LocalOp<T, D>
+impl<'a, T, P> Drop for LocalOp<'a, T, P>
 where
-    D: Driver,
-    T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>,
+    P: crate::op::DriverProvider,
+    T: IntoPlatformOp<
+            P::Op,
+            DriverCompletion = P::Completion,
+            ErasedPayload = P::UP,
+            Error = P::Error,
+        >,
 {
     fn drop(&mut self) {
-        if let LocalState::Submitted = self.state {
-            self.driver.borrow_mut().cancel_op(self.user_data);
+        if let LocalState::Submitted = self.state
+            && let Some(token) = self.token
+        {
+            self.provider.with_driver(|mut driver| {
+                driver.completion_table().mark_orphaned(token);
+                let _ = driver.cancel_op(CancelRequest::abandon(token));
+            });
         }
     }
 }
 
-pub trait OpSubmitter<D: Driver>: Clone + std::marker::Send + Sync {
+pub trait OpSubmitter<'a, P: crate::op::DriverProvider>: Clone + std::marker::Send + Sync {
     type Future<
-        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>
+        T: IntoPlatformOp<P::Op, DriverCompletion = P::Completion, ErasedPayload = P::UP, Error = P::Error>
             + std::marker::Send,
-    >: Future<Output = OpResult<T::Output, <T as IntoPlatformOp<D::Op>>::Completion>>;
+    >: Future<Output = OpResult<T::Output, P::Error, <T as IntoPlatformOp<P::Op>>::Completion>>;
 
-    fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<D>>) -> Self::Future<T>
+    fn submit<T>(&self, op: Op<T>, provider: P) -> Self::Future<T>
     where
-        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>
-            + std::marker::Send;
+        T: IntoPlatformOp<
+                P::Op,
+                DriverCompletion = P::Completion,
+                ErasedPayload = P::UP,
+                Error = P::Error,
+            > + std::marker::Send;
 
     fn from_current_context() -> Self;
 }
 
-#[derive(Clone, Copy)]
-pub struct LocalSubmitter;
+pub struct LocalSubmitter<P>(std::marker::PhantomData<fn() -> P>);
 
-impl<D: Driver> OpSubmitter<D> for LocalSubmitter {
+impl<P> Clone for LocalSubmitter<P> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<P> Copy for LocalSubmitter<P> {}
+
+impl<P> LocalSubmitter<P> {
+    pub fn new() -> Self {
+        Self(std::marker::PhantomData)
+    }
+}
+impl<P> Default for LocalSubmitter<P> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'a, P: crate::op::DriverProvider> OpSubmitter<'a, P> for LocalSubmitter<P> {
     type Future<
-        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>
-            + std::marker::Send,
-    > = LocalOp<T, D>;
+        T: IntoPlatformOp<
+                P::Op,
+                DriverCompletion = P::Completion,
+                ErasedPayload = P::UP,
+                Error = P::Error,
+            > + std::marker::Send,
+    > = LocalOp<'a, T, P>;
 
-    fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<D>>) -> LocalOp<T, D>
+    fn submit<T>(&self, op: Op<T>, provider: P) -> LocalOp<'a, T, P>
     where
-        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>
-            + std::marker::Send,
+        T: IntoPlatformOp<
+                P::Op,
+                DriverCompletion = P::Completion,
+                ErasedPayload = P::UP,
+                Error = P::Error,
+            > + std::marker::Send,
     {
         trace!("Submitting local op");
-        op.submit_local(driver)
+        op.submit_local(provider)
     }
 
     fn from_current_context() -> Self {
-        Self
+        Self::new()
     }
 }
 
@@ -497,18 +700,26 @@ impl Default for DetachedSubmitter {
     }
 }
 
-impl<D: Driver> OpSubmitter<D> for DetachedSubmitter {
+impl<'a, P: crate::op::DriverProvider> OpSubmitter<'a, P> for DetachedSubmitter {
     type Future<
-        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>
-            + std::marker::Send,
-    > = DetachedOp<T, D::Op, D::Completion>;
+        T: IntoPlatformOp<
+                P::Op,
+                DriverCompletion = P::Completion,
+                ErasedPayload = P::UP,
+                Error = P::Error,
+            > + std::marker::Send,
+    > = DetachedOp<T, <P::Driver<'a> as Driver>::SlotSpec>;
 
-    fn submit<T>(&self, op: Op<T>, driver: Rc<RefCell<D>>) -> Self::Future<T>
+    fn submit<T>(&self, op: Op<T>, provider: P) -> Self::Future<T>
     where
-        T: IntoPlatformOp<D::Op, DriverCompletion = D::Completion, ErasedPayload = D::UP>
-            + std::marker::Send,
+        T: IntoPlatformOp<
+                P::Op,
+                DriverCompletion = P::Completion,
+                ErasedPayload = P::UP,
+                Error = P::Error,
+            > + std::marker::Send,
     {
-        op.submit_detached(&mut *driver.borrow_mut())
+        provider.with_driver(|mut driver| op.submit_detached(&mut driver))
     }
 
     fn from_current_context() -> Self {

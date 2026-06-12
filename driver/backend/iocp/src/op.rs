@@ -5,34 +5,45 @@
 //! - `OpVTable`: The virtual table for dynamic dispatch without enums
 //! - `IntoPlatformOp` implementations split into `(KernelOp, UserPayload)`
 
-pub(crate) mod overlapped;
-pub(crate) mod slot;
-pub(crate) mod submit;
+mod file;
+mod net;
+mod payload;
+mod spec;
+mod state;
+mod submit;
 
-pub use overlapped::OverlappedEntry;
-pub(crate) use submit::SubmissionResult;
+pub use payload::IocpUserPayload;
+pub(crate) use payload::{
+    ACCEPT_EX_ADDR_SECTION_LEN, ACCEPT_EX_OUTPUT_BUFFER_LEN, AcceptPayload, IocpOpPayload,
+    KernelRef, OpenPayload, PayloadRef, SendToPayload, UdpRecvFromPayload, kernel_ref,
+};
+use spec::{IocpOpErasure, IocpOpSpec};
+pub(crate) use state::{
+    BlockingCompletion, BlockingSuccessCleanup, IocpOpRegistry, IocpSlotSpec, Slot,
+};
+pub use state::{IocpOpState, OverlappedEntry};
+pub(crate) use submit::{SubmissionResult, resolve_fd_handle};
 
-use std::ptr::NonNull;
+use std::sync::Arc;
 
-use crate::config::{IoFd, IocpHandle, OwnedRawHandle, RawHandle, RegisteredHandle};
-use crate::error::{IocpError, IocpResult};
+use crate::config::{IoFd, IocpHandle, OwnedRawHandle, RegisteredSlot};
+use crate::error::{IocpDriverResult as DriverResult, IocpError, IocpResult};
 use crate::ext::Extensions;
 use crate::net::addr::SockAddrStorage;
 use crate::rio::RioState;
 
-use veloq_driver_core::DriverResult;
-use veloq_driver_core::driver::PlatformOp;
+use veloq_driver_core::driver::{CompletionToken, OpToken, PlatformOp};
 use veloq_driver_core::op::{
     Accept as AcceptBase, Close as CloseBase, Connect as ConnectBase, Fallocate as FallocateBase,
     FallocateRaw as FallocateRawBase, Fsync as FsyncBase, FsyncRaw as FsyncRawBase, IntoPlatformOp,
-    OpCompletion, OpKind, Open, ReadFixed as ReadFixedBase, ReadRaw as ReadRawBase,
+    OpCompletion, OpKind, Open as OpenBase, ReadFixed as ReadFixedBase, ReadRaw as ReadRawBase,
     Recv as RecvBase, Send as OpSendBase, SendTo as SendToBase, SyncFileRange as SyncFileRangeBase,
-    SyncFileRangeRaw as SyncFileRangeRawBase, Timeout, UdpConnect as UdpConnectBase,
+    SyncFileRangeRaw as SyncFileRangeRawBase, Timeout as TimeoutBase, UdpConnect as UdpConnectBase,
     UdpRecv as UdpRecvBase, UdpRecvFrom as UdpRecvFromBase, UdpSend as UdpSendBase,
     Wakeup as WakeupBase, WriteFixed as WriteFixedBase, WriteRaw as WriteRawBase,
 };
 
-use windows_sys::Win32::Networking::WinSock::{SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE};
+use veloq_driver_core::driver::CompletionCleanupGuard;
 
 // ============================================================================
 // Type Aliases for Core Ops
@@ -58,6 +69,8 @@ pub(crate) type SyncFileRangeRaw = SyncFileRangeRawBase<IocpHandle>;
 pub(crate) type Fallocate = FallocateBase;
 pub(crate) type FallocateRaw = FallocateRawBase<IocpHandle>;
 pub(crate) type UdpRecvFrom = UdpRecvFromBase;
+pub(crate) type Open = OpenBase;
+pub(crate) type Timeout = TimeoutBase;
 pub(crate) type Wakeup = WakeupBase;
 
 // ============================================================================
@@ -66,283 +79,184 @@ pub(crate) type Wakeup = WakeupBase;
 
 /// Context for submitting IOCP operations.
 pub(crate) struct SubmitContext<'a> {
-    pub(crate) port: &'a crate::win32::IoCompletionPort,
+    pub(crate) port: Arc<crate::win32::IoCompletionPort>,
     pub(crate) overlapped: *mut crate::win32::Overlapped,
+    pub(crate) op_token: OpToken,
+    pub(crate) completion_token: CompletionToken,
     pub(crate) ext: &'a Extensions,
-    pub(crate) registered_files: &'a [Option<RegisteredHandle>],
+    pub(crate) registered_slots: &'a mut [RegisteredSlot],
     pub(crate) registrar: &'a dyn veloq_buf::BufferRegistrar,
 
     // RIO Support
     pub(crate) rio: &'a mut RioState,
-    pub(crate) slots_per_page: usize,
-    pub(crate) slab_resolver: &'a dyn Fn(usize) -> Option<(*const u8, usize)>,
 }
 
 // ============================================================================
-// Macro Definition
+// Type-Erased VTable
 // ============================================================================
 
-macro_rules! define_iocp_ops {
-    (
-        $(
-            $OpType:ident {
-                variant: $Variant:ident,
-                $(payload: $Payload:ty,)?
-                kind: $kind:expr,
-                submit: $submit:path,
-                $(on_complete: $complete:path,)?
-                $(completion: $completion:ty,)?
-                $(map_completion: $map_completion:expr,)?
-                get_fd: $get_fd:path,
-                $(construct: $construct:expr,)?
-                $(destruct: $destruct:expr,)?
+pub(crate) struct OpVTable {
+    pub(crate) submit: fn(&mut IocpKernelOp, &mut SubmitContext) -> IocpResult<SubmissionResult>,
+    pub(crate) on_complete:
+        unsafe fn(&mut IocpKernelOp, result: usize, ext: &Extensions) -> IocpResult<usize>,
+    pub(crate) completion_cleanup:
+        unsafe fn(&mut IocpKernelOp, result: &IocpResult<usize>) -> CompletionCleanupGuard,
+    pub(crate) orphan_cleanup:
+        unsafe fn(&mut IocpKernelOp, result: &IocpResult<usize>) -> CompletionCleanupGuard,
+    pub(crate) get_fd: unsafe fn(&IocpKernelOp) -> Option<IoFd>,
+    pub(crate) bind_user_payload: fn(&mut IocpKernelOp, &mut IocpUserPayload) -> IocpResult<()>,
+    pub(crate) unbind_user_payload: fn(&mut IocpKernelOp),
+}
+
+pub struct IocpKernelOp {
+    pub(crate) vtable: &'static OpVTable,
+    pub(crate) header: OverlappedEntry,
+    pub(crate) payload: IocpOpPayload,
+}
+
+impl PlatformOp for IocpKernelOp {
+    type CleanupContext<'a> = &'a IocpResult<usize>;
+
+    #[inline]
+    fn completion_cleanup(&mut self, result: Self::CleanupContext<'_>) -> CompletionCleanupGuard {
+        unsafe { (self.vtable.completion_cleanup)(self, result) }
+    }
+
+    #[inline]
+    fn orphan_cleanup(&mut self, result: Self::CleanupContext<'_>) -> CompletionCleanupGuard {
+        unsafe { (self.vtable.orphan_cleanup)(self, result) }
+    }
+}
+
+impl IocpKernelOp {
+    pub(crate) fn bind_user_payload(&mut self, erased: &mut IocpUserPayload) -> IocpResult<()> {
+        (self.vtable.bind_user_payload)(self, erased)
+    }
+
+    pub(crate) fn unbind_user_payload(&mut self) {
+        (self.vtable.unbind_user_payload)(self);
+    }
+
+    pub(crate) fn get_fd(&self) -> Option<IoFd> {
+        unsafe { (self.vtable.get_fd)(self) }
+    }
+
+    pub(crate) fn submit(&mut self, ctx: &mut SubmitContext) -> IocpResult<SubmissionResult> {
+        (self.vtable.submit)(self, ctx)
+    }
+
+    pub(crate) fn on_complete(&mut self, result: usize, ext: &Extensions) -> IocpResult<usize> {
+        unsafe { (self.vtable.on_complete)(self, result, ext) }
+    }
+
+    pub(crate) fn completion_cleanup(
+        &mut self,
+        result: &IocpResult<usize>,
+    ) -> CompletionCleanupGuard {
+        PlatformOp::completion_cleanup(self, result)
+    }
+
+    pub(crate) fn orphan_cleanup(&mut self, result: &IocpResult<usize>) -> CompletionCleanupGuard {
+        PlatformOp::orphan_cleanup(self, result)
+    }
+}
+
+macro_rules! impl_iocp_op_erasure {
+    ($OpType:ty, $user_variant:ident, $kernel_variant:ident, $completion:ty) => {
+        impl IocpOpErasure for $OpType {
+            fn erase_kernel_payload(payload: Self::KernelPayload) -> IocpOpPayload {
+                IocpOpPayload::$kernel_variant(payload)
             }
-        ),+ $(,)?
-    ) => {
-        pub enum IocpUserPayload {
-            $(
-                $OpType($OpType),
-            )+
+
+            fn kernel_payload_ref(payload: &IocpOpPayload) -> Option<&Self::KernelPayload> {
+                match payload {
+                    IocpOpPayload::$kernel_variant(payload) => Some(payload),
+                    _ => None,
+                }
+            }
+
+            fn kernel_payload_mut(payload: &mut IocpOpPayload) -> Option<&mut Self::KernelPayload> {
+                match payload {
+                    IocpOpPayload::$kernel_variant(payload) => Some(payload),
+                    _ => None,
+                }
+            }
+
+            fn erase_user_payload(payload: Self) -> IocpUserPayload {
+                IocpUserPayload::$user_variant(payload)
+            }
+
+            fn try_user_payload(payload: IocpUserPayload) -> DriverResult<Self> {
+                match payload {
+                    IocpUserPayload::$user_variant(payload) => Ok(payload),
+                    _ => Err(veloq_driver_core::op::payload_projection_mismatch_report::<
+                        IocpError,
+                    >(stringify!($OpType), "IocpUserPayload")),
+                }
+            }
+
+            fn user_payload_mut(payload: &mut IocpUserPayload) -> Option<&mut Self> {
+                match payload {
+                    IocpUserPayload::$user_variant(payload) => Some(payload),
+                    _ => None,
+                }
+            }
+
+            fn vtable() -> &'static OpVTable {
+                static TABLE: OpVTable = OpVTable {
+                    submit: spec::submit_shim::<$OpType>,
+                    on_complete: spec::on_complete_shim::<$OpType>,
+                    completion_cleanup: spec::completion_cleanup_shim::<$OpType>,
+                    orphan_cleanup: spec::orphan_cleanup_shim::<$OpType>,
+                    get_fd: spec::get_fd_shim::<$OpType>,
+                    bind_user_payload: spec::bind_user_payload_shim::<$OpType>,
+                    unbind_user_payload: spec::unbind_user_payload_shim::<$OpType>,
+                };
+                &TABLE
+            }
         }
 
-        unsafe impl Send for IocpUserPayload {}
+        impl IntoPlatformOp<IocpOp> for $OpType {
+            type UserPayload = $OpType;
+            type ErasedPayload = IocpUserPayload;
+            type Output = $OpType;
+            type Completion = $completion;
+            type DriverCompletion = usize;
+            type Error = IocpError;
 
-        /// Type-safe payload enum for IOCP operations.
-        pub(crate) enum IocpOpPayload {
-            $(
-                $Variant( define_iocp_ops!(@payload_type $OpType $(, $Payload)?) ),
-            )+
-        }
+            const PAYLOAD_KIND: OpKind = <$OpType as IocpOpSpec>::PAYLOAD_KIND;
 
-        /// Virtual table for dynamic dispatch of IOCP operations.
-        pub(crate) struct OpVTable {
-            pub(crate) submit: fn(op: &mut IocpKernelOp, ctx: &mut SubmitContext) -> IocpResult<SubmissionResult>,
-            pub(crate) on_complete: Option<unsafe fn(op: &mut IocpKernelOp, result: usize, ext: &Extensions) -> IocpResult<usize>>,
-            pub(crate) get_fd: unsafe fn(op: &IocpKernelOp) -> Option<IoFd>,
-        }
-
-        /// A type-erased IOCP kernel operation.
-        pub struct IocpKernelOp {
-            /// Virtual Table for dynamic dispatch
-            pub(crate) vtable: NonNull<OpVTable>,
-            /// Public header accessible directly by Driver
-            pub(crate) header: OverlappedEntry,
-            /// Type-safe payload enum
-            pub(crate) payload: IocpOpPayload,
-        }
-
-        impl PlatformOp for IocpKernelOp {}
-
-        impl IocpKernelOp {
-            pub(crate) fn bind_user_payload(&mut self, erased: &mut IocpUserPayload) -> IocpResult<()> {
-                match (&mut self.payload, erased) {
-                    $(
-                        (IocpOpPayload::$Variant(payload), IocpUserPayload::$OpType(user)) => {
-                            payload.user.bind(NonNull::from(user));
-                            Ok(())
-                        },
-                    )+
-                    _ => Err(diagweave::report::Report::new(IocpError::InvalidState).attach_note(
-                        "variant mismatch while binding IOCP user payload",
-                    )),
-                }
+            fn into_kernel_and_payload(self) -> (IocpKernelOp, Self::UserPayload) {
+                let kernel_payload = <$OpType as IocpOpSpec>::new_kernel_payload(&self);
+                let op = IocpKernelOp {
+                    vtable: <$OpType as IocpOpErasure>::vtable(),
+                    header: OverlappedEntry::new(
+                        OpToken::from_registry_parts(0, 0).expect("zero token should be encodable"),
+                    ),
+                    payload: <$OpType as IocpOpErasure>::erase_kernel_payload(kernel_payload),
+                };
+                (op, self)
             }
 
-            pub(crate) fn unbind_user_payload(&mut self) {
-                match &mut self.payload {
-                    $(
-                        IocpOpPayload::$Variant(payload) => payload.user.clear(),
-                    )+
-                }
+            fn payload_into_erased(payload: Self::UserPayload) -> IocpUserPayload {
+                <$OpType as IocpOpErasure>::erase_user_payload(payload)
             }
 
-            pub(crate) fn get_fd(&self) -> Option<IoFd> {
-                unsafe { (self.vtable.as_ref().get_fd)(self) }
+            fn try_payload_from_erased(
+                payload: IocpUserPayload,
+            ) -> DriverResult<Self::UserPayload> {
+                <$OpType as IocpOpErasure>::try_user_payload(payload)
             }
-            pub(crate) fn submit(&mut self, ctx: &mut SubmitContext) -> IocpResult<SubmissionResult> {
-                // SAFETY: vtable is initialized from a static TABLE and always non-null.
-                let table = unsafe { self.vtable.as_ref() };
-                (table.submit)(self, ctx)
-            }
-            pub(crate) fn on_complete(&mut self, result: usize, ext: &Extensions) -> IocpResult<usize> {
-                if let Some(on_complete) = unsafe { self.vtable.as_ref().on_complete } {
-                    unsafe { (on_complete)(self, result, ext) }
-                } else {
-                    Ok(result)
-                }
+
+            fn complete(
+                payload: Self::UserPayload,
+                res: DriverResult<usize>,
+            ) -> OpCompletion<Self::Output, IocpError, Self::Completion> {
+                let completion = <$OpType as IocpOpSpec>::map_completion(&payload, res);
+                OpCompletion::new(completion, payload)
             }
         }
-
-        $(
-            impl IntoPlatformOp<IocpOp> for $OpType {
-                type UserPayload = $OpType;
-                type ErasedPayload = IocpUserPayload;
-                type Output = $OpType;
-                type Completion = define_iocp_ops!(@completion_type $($completion)?);
-                type DriverCompletion = usize;
-                const PAYLOAD_KIND: OpKind = $kind;
-
-                fn into_kernel_and_payload(self) -> (IocpKernelOp, Self::UserPayload) {
-                    static TABLE: OpVTable = OpVTable {
-                        submit: |op, ctx| {
-                            if let IocpOpPayload::$Variant(ref mut p) = op.payload {
-                                $submit(&mut op.header, p, ctx)
-                            } else {
-                                Err(diagweave::report::Report::new(IocpError::InvalidState).attach_note(format!(
-                                    "variant mismatch in IocpKernelOp dispatch for {}",
-                                    stringify!($OpType)
-                                )))
-                            }
-                        },
-                        on_complete: define_iocp_ops!(@optional_complete_shim $OpType, $Variant, $($complete)?),
-                        get_fd: |op| unsafe {
-                            if let IocpOpPayload::$Variant(ref p) = op.payload {
-                                $get_fd(p)
-                            } else {
-                                None
-                            }
-                        },
-                    };
-
-                    let payload = define_iocp_ops!(@construct &self, $($construct)?, $OpType $(, $Payload)?);
-
-                    let op = IocpKernelOp {
-                        // SAFETY: TABLE is a static and its address is guaranteed to be non-null.
-                        vtable: unsafe { NonNull::new_unchecked(&TABLE as *const _ as *mut _) },
-                        header: OverlappedEntry::new(0),
-                        payload: IocpOpPayload::$Variant(payload),
-                    };
-                    (op, self)
-                }
-
-                fn payload_into_erased(payload: Self::UserPayload) -> IocpUserPayload {
-                    IocpUserPayload::$OpType(payload)
-                }
-
-                fn payload_from_erased(erased: IocpUserPayload) -> Self::UserPayload {
-                    match erased {
-                        IocpUserPayload::$OpType(p) => p,
-                        #[allow(unreachable_patterns)]
-                        _ => panic!("wrong payload type for {}", stringify!($OpType)),
-                    }
-                }
-
-                fn complete(
-                    payload: Self::UserPayload,
-                    res: DriverResult<usize>,
-                ) -> OpCompletion<Self::Output, Self::Completion> {
-                    let completion = define_iocp_ops!(@map_completion &payload, res, $($map_completion)?);
-                    let output = define_iocp_ops!(@destruct payload, $($destruct)?);
-                    OpCompletion::new(completion, output)
-                }
-            }
-        )+
     };
-
-    (@payload_type $OpType:ty) => { KernelRef<$OpType> };
-    (@payload_type $OpType:ty, $Payload:ty) => { $Payload };
-
-    (@optional_complete_shim $OpType:ident, $Variant:ident,) => { None };
-    (@optional_complete_shim $OpType:ident, $Variant:ident, $fn:path) => {
-        Some(|op, result, ext| unsafe {
-            if let IocpOpPayload::$Variant(ref mut p) = op.payload {
-                $fn(&mut op.header, p, result, ext)
-            } else {
-                Err(diagweave::report::Report::new(IocpError::InvalidState).attach_note(format!(
-                    "variant mismatch in IocpKernelOp on_complete for {}",
-                    stringify!($OpType)
-                )))
-            }
-        })
-    };
-
-    // Default construct: keep only a pointer to user payload
-    (@construct $user:expr, , $OpType:ty) => { KernelRef { user: PayloadRef::unbound() } };
-    // Custom construct
-    (@construct $user:expr, $construct:expr, $OpType:ty, $Payload:ty) => { ($construct)($user) };
-
-    // Default destruct: return user payload
-    (@destruct $user_payload:expr, ) => { $user_payload };
-    // Custom destruct
-    (@destruct $user_payload:expr, $destruct:expr) => { ($destruct)($user_payload) };
-
-    (@completion_type ) => { usize };
-    (@completion_type $ty:ty) => { $ty };
-
-    (@map_completion $this:expr, $res:expr, ) => { $res };
-    (@map_completion $this:expr, $res:expr, $expr:expr) => { ($expr)($this, $res) };
-}
-
-// ============================================================================
-// Payload Structures for Complex Ops
-// ============================================================================
-
-/// Reference to a kernel operation.
-pub(crate) struct PayloadRef<T> {
-    user: Option<NonNull<T>>,
-}
-
-impl<T> PayloadRef<T> {
-    #[inline]
-    pub(crate) const fn unbound() -> Self {
-        Self { user: None }
-    }
-
-    #[inline]
-    pub(crate) fn bind(&mut self, user: NonNull<T>) {
-        self.user = Some(user);
-    }
-
-    #[inline]
-    pub(crate) fn clear(&mut self) {
-        self.user = None;
-    }
-
-    #[inline]
-    pub(crate) unsafe fn as_ref(&self) -> &T {
-        let user = self.user.expect("IOCP user payload used before binding");
-        // SAFETY: the payload is bound to the live slot payload before submission.
-        unsafe { user.as_ref() }
-    }
-
-    #[inline]
-    pub(crate) unsafe fn as_mut(&mut self) -> &mut T {
-        let mut user = self.user.expect("IOCP user payload used before binding");
-        // SAFETY: the payload is bound to the live slot payload before submission.
-        unsafe { user.as_mut() }
-    }
-}
-
-pub(crate) struct KernelRef<T> {
-    pub(crate) user: PayloadRef<T>,
-}
-
-/// Payload for the socket accept operation.
-pub(crate) const ACCEPT_EX_ADDR_SECTION_LEN: usize = std::mem::size_of::<SOCKADDR_STORAGE>() + 16;
-pub(crate) const ACCEPT_EX_OUTPUT_BUFFER_LEN: usize = ACCEPT_EX_ADDR_SECTION_LEN * 2;
-
-pub(crate) struct AcceptPayload {
-    pub(crate) user: PayloadRef<Accept>,
-    pub(crate) accept_buffer: [u8; ACCEPT_EX_OUTPUT_BUFFER_LEN],
-    pub(crate) accept_socket: Option<OwnedRawHandle>,
-}
-
-/// Payload for the socket send-to operation.
-pub(crate) struct SendToPayload {
-    pub(crate) user: PayloadRef<SendTo>,
-    pub(crate) addr: SockAddrStorage,
-    pub(crate) addr_len: i32,
-}
-
-/// Payload for the socket recv-from operation.
-pub(crate) struct UdpRecvFromPayload {
-    pub(crate) user: PayloadRef<UdpRecvFrom>,
-    pub(crate) addr: SockAddrStorage,
-}
-
-/// Payload for the file open operation.
-pub(crate) struct OpenPayload {
-    pub(crate) user: PayloadRef<Open>,
 }
 
 /// Alias for the platform-specific IOCP kernel operation.
@@ -352,191 +266,72 @@ pub type IocpOp = IocpKernelOp;
 // Op Definitions
 // ============================================================================
 
-define_iocp_ops! {
-    ReadFixed {
-        variant: Read,
-        kind: OpKind::ReadFixed,
-        submit: submit::submit_read_fixed,
-        get_fd: submit::get_fd_read_fixed,
-    },
-    ReadRaw {
-        variant: ReadRaw,
-        kind: OpKind::ReadFixed,
-        submit: submit::submit_read_raw,
-        get_fd: submit::get_fd_read_raw,
-    },
-    WriteFixed {
-        variant: Write,
-        kind: OpKind::WriteFixed,
-        submit: submit::submit_write_fixed,
-        get_fd: submit::get_fd_write_fixed,
-    },
-    WriteRaw {
-        variant: WriteRaw,
-        kind: OpKind::WriteFixed,
-        submit: submit::submit_write_raw,
-        get_fd: submit::get_fd_write_raw,
-    },
-    Recv {
-        variant: Recv,
-        kind: OpKind::Recv,
-        submit: submit::submit_recv,
-        get_fd: submit::get_fd_recv,
-    },
-    OpSend {
-        variant: Send,
-        kind: OpKind::Send,
-        submit: submit::submit_send,
-        get_fd: submit::get_fd_send,
-    },
-    UdpRecv {
-        variant: UdpRecv,
-        kind: OpKind::UdpRecv,
-        submit: submit::submit_udp_recv,
-        get_fd: submit::get_fd_udp_recv,
-    },
-    UdpSend {
-        variant: UdpSend,
-        kind: OpKind::UdpSend,
-        submit: submit::submit_udp_send,
-        get_fd: submit::get_fd_udp_send,
-    },
-    Close {
-        variant: Close,
-        kind: OpKind::Close,
-        submit: submit::submit_close,
-        get_fd: submit::get_fd_close,
-    },
-    Fsync {
-        variant: Fsync,
-        kind: OpKind::Fsync,
-        submit: submit::submit_fsync,
-        get_fd: submit::get_fd_fsync,
-    },
-    FsyncRaw {
-        variant: FsyncRaw,
-        kind: OpKind::Fsync,
-        submit: submit::submit_fsync_raw,
-        get_fd: submit::get_fd_fsync_raw,
-    },
-    SyncFileRange {
-        variant: SyncRange,
-        kind: OpKind::SyncFileRange,
-        submit: submit::submit_sync_range,
-        get_fd: submit::get_fd_sync_range,
-    },
-    SyncFileRangeRaw {
-        variant: SyncRangeRaw,
-        kind: OpKind::SyncFileRange,
-        submit: submit::submit_sync_range_raw,
-        get_fd: submit::get_fd_sync_range_raw,
-    },
-    Fallocate {
-        variant: Fallocate,
-        kind: OpKind::Fallocate,
-        submit: submit::submit_fallocate,
-        get_fd: submit::get_fd_fallocate,
-    },
-    FallocateRaw {
-        variant: FallocateRaw,
-        kind: OpKind::Fallocate,
-        submit: submit::submit_fallocate_raw,
-        get_fd: submit::get_fd_fallocate_raw,
-    },
-    Timeout {
-        variant: Timeout,
-        kind: OpKind::Timeout,
-        submit: submit::submit_timeout,
-        get_fd: submit::get_fd_timeout,
-    },
-    Connect {
-        variant: Connect,
-        kind: OpKind::Connect,
-        submit: submit::submit_connect,
-        on_complete: submit::on_complete_connect,
-        get_fd: submit::get_fd_connect,
-    },
-    UdpConnect {
-        variant: UdpConnect,
-        kind: OpKind::UdpConnect,
-        submit: submit::submit_udp_connect,
-        on_complete: submit::on_complete_udp_connect,
-        get_fd: submit::get_fd_udp_connect,
-    },
-    Accept {
-        variant: Accept,
-        payload: AcceptPayload,
-        kind: OpKind::Accept,
-        submit: submit::submit_accept,
-        on_complete: submit::on_complete_accept,
-        completion: OwnedRawHandle,
-        map_completion: |_op: &Accept, res: DriverResult<usize>| {
-            res.map(|raw| unsafe {
-                OwnedRawHandle::from_raw_owned(RawHandle::new(IocpHandle::for_socket(raw as _)))
-            })
-        },
-        get_fd: submit::get_fd_accept,
-        construct: |_user: &Accept| {
-            AcceptPayload {
-                user: PayloadRef::unbound(),
-                accept_buffer: [0; ACCEPT_EX_OUTPUT_BUFFER_LEN],
-                accept_socket: None,
-            }
-        },
-    },
-    SendTo {
-        variant: SendTo,
-        payload: SendToPayload,
-        kind: OpKind::SendTo,
-        submit: submit::submit_send_to,
-        get_fd: submit::get_fd_send_to,
-        construct: |user: &SendTo| {
-            let (addr, _raw_addr_len) = crate::net::addr::socket_addr_to_storage(user.addr);
-            let addr_len = match user.addr {
-                std::net::SocketAddr::V4(_) => std::mem::size_of::<SOCKADDR_IN>() as i32,
-                std::net::SocketAddr::V6(_) => std::mem::size_of::<SOCKADDR_IN6>() as i32,
-            };
-            SendToPayload {
-                user: PayloadRef::unbound(),
-                addr,
-                addr_len,
-            }
-        },
-    },
-    UdpRecvFrom {
-        variant: UdpRecvFrom,
-        payload: UdpRecvFromPayload,
-        kind: OpKind::UdpRecvFrom,
-        submit: submit::submit_udp_recv_from,
-        on_complete: submit::on_complete_udp_recv_from,
-        get_fd: submit::get_fd_udp_recv_from,
-        construct: |_user: &UdpRecvFrom| {
-            UdpRecvFromPayload {
-                user: PayloadRef::unbound(),
-                addr: SockAddrStorage::default(),
-            }
-        },
-    },
-    Open {
-        variant: Open,
-        payload: OpenPayload,
-        kind: OpKind::Open,
-        submit: submit::submit_open,
-        completion: OwnedRawHandle,
-        map_completion: |_op: &Open, res: DriverResult<usize>| {
-            res.map(|raw| unsafe {
-                OwnedRawHandle::from_raw_owned(RawHandle::new(IocpHandle::for_file(raw as _)))
-            })
-        },
-        get_fd: submit::get_fd_open,
-        construct: |_user: &Open| OpenPayload {
-            user: PayloadRef::unbound(),
-        },
-    },
-    Wakeup {
-        variant: Wakeup,
-        kind: OpKind::Wakeup,
-        submit: submit::submit_wakeup,
-        get_fd: submit::get_fd_wakeup,
-    },
+impl IocpOpSpec for Timeout {
+    type KernelPayload = KernelRef<Self>;
+    type Completion = usize;
+
+    const PAYLOAD_KIND: OpKind = OpKind::Timeout;
+
+    fn new_kernel_payload(user: &Self) -> Self::KernelPayload {
+        kernel_ref(user)
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<SubmissionResult> {
+        submit::submit_timeout(header, payload, ctx)
+    }
+
+    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+        res
+    }
 }
+
+impl IocpOpSpec for Wakeup {
+    type KernelPayload = KernelRef<Self>;
+    type Completion = usize;
+
+    const PAYLOAD_KIND: OpKind = OpKind::Wakeup;
+
+    fn new_kernel_payload(user: &Self) -> Self::KernelPayload {
+        kernel_ref(user)
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<SubmissionResult> {
+        submit::submit_wakeup(header, payload, ctx)
+    }
+
+    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+        res
+    }
+}
+
+impl_iocp_op_erasure!(ReadFixed, ReadFixed, Read, usize);
+impl_iocp_op_erasure!(ReadRaw, ReadRaw, ReadRaw, usize);
+impl_iocp_op_erasure!(WriteFixed, WriteFixed, Write, usize);
+impl_iocp_op_erasure!(WriteRaw, WriteRaw, WriteRaw, usize);
+impl_iocp_op_erasure!(Recv, Recv, Recv, usize);
+impl_iocp_op_erasure!(OpSend, OpSend, Send, usize);
+impl_iocp_op_erasure!(UdpRecv, UdpRecv, UdpRecv, usize);
+impl_iocp_op_erasure!(UdpSend, UdpSend, UdpSend, usize);
+impl_iocp_op_erasure!(Close, Close, Close, usize);
+impl_iocp_op_erasure!(Fsync, Fsync, Fsync, usize);
+impl_iocp_op_erasure!(FsyncRaw, FsyncRaw, FsyncRaw, usize);
+impl_iocp_op_erasure!(SyncFileRange, SyncFileRange, SyncRange, usize);
+impl_iocp_op_erasure!(SyncFileRangeRaw, SyncFileRangeRaw, SyncRangeRaw, usize);
+impl_iocp_op_erasure!(Fallocate, Fallocate, Fallocate, usize);
+impl_iocp_op_erasure!(FallocateRaw, FallocateRaw, FallocateRaw, usize);
+impl_iocp_op_erasure!(Timeout, Timeout, Timeout, usize);
+impl_iocp_op_erasure!(Connect, Connect, Connect, usize);
+impl_iocp_op_erasure!(UdpConnect, UdpConnect, UdpConnect, usize);
+impl_iocp_op_erasure!(Accept, Accept, Accept, OwnedRawHandle);
+impl_iocp_op_erasure!(SendTo, SendTo, SendTo, usize);
+impl_iocp_op_erasure!(UdpRecvFrom, UdpRecvFrom, UdpRecvFrom, usize);
+impl_iocp_op_erasure!(Open, Open, Open, OwnedRawHandle);
+impl_iocp_op_erasure!(Wakeup, Wakeup, Wakeup, usize);

@@ -9,6 +9,7 @@ use super::any::AnyBufPool;
 use super::common::{
     AllocResult, BackingPool, BufPool, BufferRegion, BufferRegistrar, PoolKind, RegionInfo,
 };
+use super::error::{BufError, BufResult};
 use super::handle::{FixedBuf, PackedContext};
 
 /// 定义 Runtime 所有工作线程的缓冲池拓扑结构
@@ -27,7 +28,7 @@ pub trait PoolTopology: Clone + Send + Sync {
 
     /// Initialize the global/shared state.
     /// Called once by the Runtime Builder.
-    fn init(&self, worker_count: usize) -> std::io::Result<Self::State>;
+    fn init(&self, worker_count: usize) -> BufResult<Self::State>;
 
     /// Build the `AnyBufPool` for a specific worker.
     /// Called within each worker thread.
@@ -39,8 +40,8 @@ pub trait PoolTopology: Clone + Send + Sync {
         &self,
         state: &Self::State,
         worker_idx: usize,
-        registrar: Box<dyn BufferRegistrar>,
-    ) -> AnyBufPool;
+        registrar: &dyn BufferRegistrar,
+    ) -> BufResult<AnyBufPool>;
 
     /// Connect a listener to the shared state to receive notifications about new memory chunks.
     /// Used for dynamic expansion.
@@ -65,10 +66,7 @@ impl UniformSlot {
     }
 
     // Backward compatibility shim for tests if needed
-    pub fn create_pool(
-        &self,
-        worker_count: usize,
-    ) -> std::io::Result<Arc<crate::heap::GlobalSlotPool>> {
+    pub fn create_pool(&self, worker_count: usize) -> BufResult<Arc<crate::heap::GlobalSlotPool>> {
         self.init(worker_count)
     }
 }
@@ -76,7 +74,7 @@ impl UniformSlot {
 impl PoolTopology for UniformSlot {
     type State = Arc<crate::heap::GlobalSlotPool>;
 
-    fn init(&self, worker_count: usize) -> std::io::Result<Self::State> {
+    fn init(&self, worker_count: usize) -> BufResult<Self::State> {
         let total_size =
             self.multiplier.0.get() * crate::heap::MIN_THREAD_MEMORY.get() * 2 * worker_count;
         let config = crate::heap::GlobalAllocatorConfig {
@@ -93,20 +91,24 @@ impl PoolTopology for UniformSlot {
         &self,
         pool: &Self::State,
         worker_idx: usize,
-        registrar: Box<dyn BufferRegistrar>,
-    ) -> AnyBufPool {
+        registrar: &dyn BufferRegistrar,
+    ) -> BufResult<AnyBufPool> {
         // 在 Slot 架构中，所有线程共享一个大的连续区域
-        // Phase 1: For now, we only register the initial chunk (Chunk 0).
-        let global_info = pool.chunk_info(0).expect("Chunk 0 missing");
-        let region = BufferRegion::new(global_info.ptr, global_info.len);
+        let regions = pool
+            .chunk_infos()
+            .into_iter()
+            .map(|info| {
+                BufferRegion::from_chunk_info(info).ok_or(BufError::PageUnaligned {
+                    size: info.len.get(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         // 注册内存区域
-        let _ids = registrar
-            .register(&[region])
-            .expect("Failed to register global buffer region (check 'ulimit -l' / RLIMIT_MEMLOCK)");
+        let _ids = registrar.register(&regions)?;
 
         let slot_pool = SlotBasedPool::with_seed(pool.clone(), worker_idx);
-        AnyBufPool::new(slot_pool)
+        Ok(AnyBufPool::new(slot_pool))
     }
 
     fn connect_listener(
@@ -217,8 +219,8 @@ impl BackingPool for SlotBasedPool {
 
         if let Some((chunk_id, slot_idx, ptr)) = self.pool.alloc_slots(order, self.seed) {
             let capacity = crate::heap::buddy::BuddyAllocator::capacity_of(order);
-            let context_data = PackedContext::new(
-                slot_idx.0 as u32,
+            let context_data = PackedContext::from_slot_parts(
+                slot_idx.get() as u32,
                 order as u8,
                 chunk_id,
                 PoolKind::SlotBased,
@@ -303,7 +305,7 @@ pub(crate) unsafe fn slot_based_dealloc(pool_data: NonNull<()>, context: u64) {
     let raw_ptr = pool_data.as_ptr() as *const crate::heap::GlobalSlotPool;
 
     let ctx = PackedContext::from(context);
-    let chunk_id = ctx.chunk_id();
+    let chunk_id = ctx.slot_chunk_id();
     let order = ctx.order() as usize;
     let slot_idx = crate::heap::SlotIndex(ctx.slot_idx() as usize);
 
@@ -344,7 +346,7 @@ pub(crate) unsafe fn slot_based_resolve_region_info(
 
     // 2. Unpack ChunkID
     let ctx = PackedContext::from(buf.context_raw());
-    let chunk_id = ctx.chunk_id();
+    let chunk_id = ctx.slot_chunk_id();
 
     // 3. Get base address from ChunkInfo
     let chunk_info = pool

@@ -1,4 +1,5 @@
 use super::sleep::{LocalSleep, Sleep, sleep_until, sleep_until_local};
+use crate::runtime::context::RuntimeContext;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,27 +13,31 @@ pub enum MissedTickBehavior {
 // Sync/Send Interval
 // ============================================================================
 
-pub fn interval(period: Duration) -> Interval {
-    interval_at(Instant::now(), period)
+pub fn interval<'a, 'ctx>(ctx: RuntimeContext<'a, 'ctx>, period: Duration) -> Interval<'a, 'ctx> {
+    interval_at(ctx, Instant::now(), period)
 }
 
-pub fn interval_at(start: Instant, period: Duration) -> Interval {
+pub fn interval_at<'a, 'ctx>(
+    ctx: RuntimeContext<'a, 'ctx>,
+    start: Instant,
+    period: Duration,
+) -> Interval<'a, 'ctx> {
     Interval {
         period,
         next_tick: start,
         behavior: MissedTickBehavior::Burst,
-        delay: sleep_until(start),
+        delay: sleep_until(ctx, start),
     }
 }
 
-pub struct Interval {
+pub struct Interval<'a, 'ctx> {
     period: Duration,
     next_tick: Instant,
     behavior: MissedTickBehavior,
-    delay: Sleep,
+    delay: Sleep<'a, 'ctx>,
 }
 
-impl Interval {
+impl<'a, 'ctx> Interval<'a, 'ctx> {
     pub fn set_missed_tick_behavior(&mut self, behavior: MissedTickBehavior) {
         self.behavior = behavior;
     }
@@ -79,27 +84,34 @@ impl Interval {
 // Local Interval
 // ============================================================================
 
-pub fn interval_local(period: Duration) -> LocalInterval {
-    interval_at_local(Instant::now(), period)
+pub fn interval_local<'a, 'ctx>(
+    ctx: RuntimeContext<'a, 'ctx>,
+    period: Duration,
+) -> LocalInterval<'a, 'ctx> {
+    interval_at_local(ctx, Instant::now(), period)
 }
 
-pub fn interval_at_local(start: Instant, period: Duration) -> LocalInterval {
+pub fn interval_at_local<'a, 'ctx>(
+    ctx: RuntimeContext<'a, 'ctx>,
+    start: Instant,
+    period: Duration,
+) -> LocalInterval<'a, 'ctx> {
     LocalInterval {
         period,
         next_tick: start,
         behavior: MissedTickBehavior::Burst,
-        delay: sleep_until_local(start),
+        delay: sleep_until_local(ctx, start),
     }
 }
 
-pub struct LocalInterval {
+pub struct LocalInterval<'a, 'ctx> {
     period: Duration,
     next_tick: Instant,
     behavior: MissedTickBehavior,
-    delay: LocalSleep,
+    delay: LocalSleep<'a, 'ctx>,
 }
 
-impl LocalInterval {
+impl<'a, 'ctx> LocalInterval<'a, 'ctx> {
     pub fn set_missed_tick_behavior(&mut self, behavior: MissedTickBehavior) {
         self.behavior = behavior;
     }

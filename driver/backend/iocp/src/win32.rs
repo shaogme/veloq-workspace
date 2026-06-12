@@ -1,8 +1,9 @@
+use std::io::Error as IoError;
 use std::ptr;
 
-use crate::error::{IocpError, IocpResult, from_io_error};
-use diagweave::report::Report;
-use veloq_pod::{Pod, Zeroable, bytes_of, bytes_of_mut, zeroed};
+use crate::error::{IocpError, IocpResult};
+use veloq_driver_core::driver::CompletionToken;
+use veloq_pod::{Pod, Zeroable, zeroed};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
 };
@@ -14,6 +15,14 @@ use windows_sys::Win32::System::IO::{
     CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
     PostQueuedCompletionStatus,
 };
+
+fn last_os_error() -> IoError {
+    IoError::last_os_error()
+}
+
+fn from_raw_os_error(err: i32) -> IoError {
+    IoError::from_raw_os_error(err)
+}
 
 // ============================================================================
 // Overlapped
@@ -47,18 +56,18 @@ impl Overlapped {
 
     /// Sets the offset of the overlapped operation.
     pub fn set_offset(&mut self, offset: u64) {
-        let bytes = bytes_of_mut(self);
-        let low = (offset as u32).to_ne_bytes();
-        let high = ((offset >> 32) as u32).to_ne_bytes();
-        bytes[0..4].copy_from_slice(&low);
-        bytes[4..8].copy_from_slice(&high);
+        // SAFETY: File offset uses the documented Offset/OffsetHigh view of the OVERLAPPED union.
+        let parts = unsafe { &mut self.0.Anonymous.Anonymous };
+        parts.Offset = offset as u32;
+        parts.OffsetHigh = (offset >> 32) as u32;
     }
 
     /// Returns the offset of the overlapped operation.
     pub fn offset(&self) -> u64 {
-        let bytes = bytes_of(self);
-        let low = u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64;
-        let high = u32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as u64;
+        // SAFETY: File offset uses the documented Offset/OffsetHigh view of the OVERLAPPED union.
+        let parts = unsafe { self.0.Anonymous.Anonymous };
+        let low = u64::from(parts.Offset);
+        let high = u64::from(parts.OffsetHigh);
         low | (high << 32)
     }
 }
@@ -66,6 +75,40 @@ impl Overlapped {
 impl Default for Overlapped {
     fn default() -> Self {
         Self::zeroed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::{offset_of, size_of};
+    use windows_sys::Win32::System::IO::{OVERLAPPED, OVERLAPPED_0_0};
+
+    #[test]
+    fn overlapped_offset_fields_follow_win32_layout() {
+        assert_eq!(offset_of!(OVERLAPPED, Anonymous), size_of::<usize>() * 2);
+        assert_eq!(offset_of!(OVERLAPPED_0_0, Offset), 0);
+        assert_eq!(offset_of!(OVERLAPPED_0_0, OffsetHigh), size_of::<u32>());
+    }
+
+    #[test]
+    fn set_offset_writes_offset_union_without_touching_internal_status() {
+        let mut overlapped = Overlapped::zeroed();
+        let internal = usize::MAX;
+        let internal_high = usize::MAX - 1;
+        overlapped.0.Internal = internal;
+        overlapped.0.InternalHigh = internal_high;
+
+        overlapped.set_offset(0x99aa_bbcc_ddee_ff00);
+
+        assert_eq!(overlapped.0.Internal, internal);
+        assert_eq!(overlapped.0.InternalHigh, internal_high);
+        assert_eq!(overlapped.offset(), 0x99aa_bbcc_ddee_ff00);
+
+        // SAFETY: The test verifies the same documented file-offset union view used by set_offset.
+        let parts = unsafe { overlapped.0.Anonymous.Anonymous };
+        assert_eq!(parts.Offset, 0xddee_ff00);
+        assert_eq!(parts.OffsetHigh, 0x99aa_bbcc);
     }
 }
 
@@ -113,11 +156,6 @@ unsafe impl Sync for OwnedHandle {}
 #[derive(Debug)]
 pub struct SafeSocket(pub SOCKET);
 
-#[inline]
-fn win32_last_error(context: IocpError, scope: &'static str) -> Report<IocpError> {
-    from_io_error(context, scope, std::io::Error::last_os_error())
-}
-
 impl SafeSocket {
     /// Returns the raw SOCKET.
     pub fn as_raw(&self) -> SOCKET {
@@ -139,7 +177,7 @@ impl SafeSocket {
         // SAFETY: The caller ensures that `addr` and `len` are valid.
         let ret = unsafe { bind(self.0, addr, len) };
         if ret != 0 {
-            return Err(win32_last_error(IocpError::Socket, "bind"));
+            return Err(IocpError::Socket.io_report("bind", last_os_error()));
         }
         Ok(())
     }
@@ -149,7 +187,7 @@ impl SafeSocket {
         // SAFETY: The socket is valid and owned by us.
         let ret = unsafe { listen(self.0, backlog) };
         if ret != 0 {
-            return Err(win32_last_error(IocpError::Socket, "listen"));
+            return Err(IocpError::Socket.io_report("listen", last_os_error()));
         }
         Ok(())
     }
@@ -164,7 +202,7 @@ impl SafeSocket {
         // SAFETY: The caller ensures that `addr` and `len` are valid.
         let ret = unsafe { connect(self.0, addr, len) };
         if ret != 0 {
-            return Err(win32_last_error(IocpError::Socket, "connect"));
+            return Err(IocpError::Socket.io_report("connect", last_os_error()));
         }
         Ok(())
     }
@@ -178,7 +216,7 @@ impl SafeSocket {
         // SAFETY: The caller ensures that `addr` and `len` are valid.
         let ret = unsafe { getsockname(self.0, addr, len) };
         if ret != 0 {
-            return Err(win32_last_error(IocpError::Socket, "getsockname"));
+            return Err(IocpError::Socket.io_report("getsockname", last_os_error()));
         }
         Ok(())
     }
@@ -192,7 +230,7 @@ impl SafeSocket {
         // SAFETY: The caller ensures that `addr` and `len` are valid.
         let ret = unsafe { getpeername(self.0, addr, len) };
         if ret != 0 {
-            return Err(win32_last_error(IocpError::Socket, "getpeername"));
+            return Err(IocpError::Socket.io_report("getpeername", last_os_error()));
         }
         Ok(())
     }
@@ -210,7 +248,7 @@ impl SafeSocket {
             )
         };
         if ret != 0 {
-            return Err(win32_last_error(IocpError::Socket, "setsockopt"));
+            return Err(IocpError::Socket.io_report("setsockopt", last_os_error()));
         }
         Ok(())
     }
@@ -220,7 +258,7 @@ impl SafeSocket {
         // SAFETY: Setting socket option with no payload is safe for valid options.
         let ret = unsafe { setsockopt(self.0, level, optname, std::ptr::null(), 0) };
         if ret != 0 {
-            return Err(win32_last_error(IocpError::Socket, "setsockopt_empty"));
+            return Err(IocpError::Socket.io_report("setsockopt_empty", last_os_error()));
         }
         Ok(())
     }
@@ -249,6 +287,12 @@ unsafe impl Sync for SafeSocket {}
 /// A safe wrapper for an I/O Completion Port.
 pub struct IoCompletionPort(OwnedHandle);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelRequestResult {
+    Submitted,
+    NotFound,
+}
+
 impl IoCompletionPort {
     /// Creates a new, unconnected I/O Completion Port.
     pub fn new(threads: u32) -> IocpResult<Self> {
@@ -256,10 +300,7 @@ impl IoCompletionPort {
         let handle =
             unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, ptr::null_mut(), 0, threads) };
         if handle.is_null() {
-            return Err(win32_last_error(
-                IocpError::Win32,
-                "CreateIoCompletionPort.new",
-            ));
+            return Err(IocpError::Win32.io_report("CreateIoCompletionPort.new", last_os_error()));
         }
         Ok(Self(OwnedHandle(handle)))
     }
@@ -270,19 +311,24 @@ impl IoCompletionPort {
     ///
     /// The caller must ensure that `handle` is valid and not already associated.
     pub unsafe fn associate(&self, handle: HANDLE, completion_key: usize) -> IocpResult<()> {
+        let port = self.0.as_raw();
+        let handle_raw = handle as usize;
+        let port_raw = port as usize;
+
         // SAFETY: The caller ensures that `handle` is valid and not already associated.
-        let res = unsafe { CreateIoCompletionPort(handle, self.0.as_raw(), completion_key, 0) };
+        let res = unsafe { CreateIoCompletionPort(handle, port, completion_key, 0) };
         if res.is_null() {
             // SAFETY: GetLastError is safe to call after a failed Win32 API call.
             let err = unsafe { GetLastError() };
-            if err == windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER {
-                return Ok(());
-            }
-            return Err(from_io_error(
-                IocpError::Win32,
-                "CreateIoCompletionPort.associate",
-                std::io::Error::from_raw_os_error(err as i32),
-            ));
+            return Err(IocpError::Win32
+                .io_report(
+                    "CreateIoCompletionPort.associate",
+                    from_raw_os_error(err as i32),
+                )
+                .with_ctx("handle_raw", handle_raw)
+                .with_ctx("port_raw", port_raw)
+                .with_ctx("completion_key", completion_key)
+                .with_ctx("os_error_code", err));
         }
         Ok(())
     }
@@ -303,18 +349,15 @@ impl IoCompletionPort {
             PostQueuedCompletionStatus(self.0.as_raw(), bytes, key, overlapped as *mut OVERLAPPED)
         };
         if res == 0 {
-            return Err(win32_last_error(
-                IocpError::Win32,
-                "PostQueuedCompletionStatus",
-            ));
+            return Err(IocpError::Win32.io_report("PostQueuedCompletionStatus", last_os_error()));
         }
         Ok(())
     }
 
-    /// Notifies the completion port with a user-defined completion key.
-    pub fn notify(&self, user_data: usize) -> IocpResult<()> {
+    /// Notifies the completion port with a typed completion token.
+    pub fn notify(&self, token: CompletionToken) -> IocpResult<()> {
         // SAFETY: Posting with a null overlapped is always safe.
-        unsafe { self.post(0, user_data, ptr::null_mut()) }
+        unsafe { self.post(0, token.raw() as usize, ptr::null_mut()) }
     }
 
     /// Cancels a pending I/O request.
@@ -322,22 +365,21 @@ impl IoCompletionPort {
     /// # Safety
     ///
     /// The caller must ensure that `handle` and `overlapped` are valid.
-    pub unsafe fn cancel_request(handle: HANDLE, overlapped: *mut Overlapped) -> IocpResult<()> {
+    pub unsafe fn cancel_request(
+        handle: HANDLE,
+        overlapped: *mut Overlapped,
+    ) -> IocpResult<CancelRequestResult> {
         // SAFETY: The caller ensures `handle` and `overlapped` are valid.
         let res = unsafe { CancelIoEx(handle, overlapped as *mut OVERLAPPED) };
         if res == 0 {
             // SAFETY: GetLastError is safe to call after a failed Win32 API call.
             let err = unsafe { GetLastError() };
             if err == windows_sys::Win32::Foundation::ERROR_NOT_FOUND {
-                return Ok(());
+                return Ok(CancelRequestResult::NotFound);
             }
-            return Err(from_io_error(
-                IocpError::Win32,
-                "CancelIoEx",
-                std::io::Error::from_raw_os_error(err as i32),
-            ));
+            return Err(IocpError::Win32.io_report("CancelIoEx", from_raw_os_error(err as i32)));
         }
-        Ok(())
+        Ok(CancelRequestResult::Submitted)
     }
 
     /// Retrieves a completion status from the port.
@@ -364,11 +406,8 @@ impl IoCompletionPort {
                 if err == WAIT_TIMEOUT {
                     return Ok(CompletionStatus::Timeout);
                 }
-                return Err(from_io_error(
-                    IocpError::Win32,
-                    "GetQueuedCompletionStatus",
-                    std::io::Error::from_raw_os_error(err as i32),
-                ));
+                return Err(IocpError::Win32
+                    .io_report("GetQueuedCompletionStatus", from_raw_os_error(err as i32)));
             } else {
                 return Ok(CompletionStatus::Completed {
                     bytes,
@@ -405,32 +444,4 @@ pub enum CompletionStatus {
         error_code: Option<u32>,
     },
     Timeout,
-}
-
-// ============================================================================
-// OverlappedId
-// ============================================================================
-
-/// A handle to an overlapped operation, represented as a slot index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OverlappedId(pub usize);
-
-impl OverlappedId {
-    /// Recovers the OverlappedId from a raw pointer to an Overlapped structure.
-    ///
-    /// # Safety
-    ///
-    /// The pointer must be a valid pointer to an Overlapped structure that is
-    /// embedded at the start of an OverlappedEntry.
-    pub unsafe fn from_ptr(ptr: *const Overlapped) -> Self {
-        use crate::op::OverlappedEntry;
-        // SAFETY: The `inner` field is at the start of `OverlappedEntry` due to `#[repr(C)]`.
-        let user_data = unsafe { (*(ptr as *const OverlappedEntry)).user_data };
-        Self(user_data)
-    }
-
-    /// Returns the raw index.
-    pub fn as_usize(&self) -> usize {
-        self.0
-    }
 }

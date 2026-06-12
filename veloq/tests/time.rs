@@ -19,9 +19,9 @@ fn build_runtime(worker_threads: usize) -> Runtime<UniformSlot> {
 fn test_sleep_basic() {
     let runtime = build_runtime(1);
 
-    runtime.block_on(async |_| {
+    runtime.block_on(async |ctx| {
         let start = Instant::now();
-        sleep(Duration::from_millis(100)).await;
+        sleep(ctx, Duration::from_millis(100)).await;
         let elapsed = start.elapsed();
         assert!(elapsed >= Duration::from_millis(100));
     });
@@ -33,9 +33,9 @@ fn test_sleep_local_basic() {
 
     runtime.block_on(async |ctx| {
         ctx.scope_local(async |s| {
-            let handle = s.spawn_boxed_local(async {
+            let handle = s.spawn_boxed_local(async move {
                 let start = Instant::now();
-                sleep_local(Duration::from_millis(100)).await;
+                sleep_local(ctx, Duration::from_millis(100)).await;
                 start.elapsed()
             });
 
@@ -50,9 +50,9 @@ fn test_sleep_local_basic() {
 fn test_sleep_until() {
     let runtime = build_runtime(1);
 
-    runtime.block_on(async |_| {
+    runtime.block_on(async |ctx| {
         let deadline = Instant::now() + Duration::from_millis(200);
-        sleep_until(deadline).await;
+        sleep_until(ctx, deadline).await;
         assert!(Instant::now() >= deadline);
     });
 }
@@ -61,9 +61,9 @@ fn test_sleep_until() {
 fn test_sleep_zero_duration() {
     let runtime = build_runtime(1);
 
-    runtime.block_on(async |_| {
+    runtime.block_on(async |ctx| {
         let start = Instant::now();
-        sleep(Duration::ZERO).await;
+        sleep(ctx, Duration::ZERO).await;
         let elapsed = start.elapsed();
         assert!(elapsed < Duration::from_millis(10));
     });
@@ -73,8 +73,8 @@ fn test_sleep_zero_duration() {
 fn test_sleep_reset() {
     let runtime = build_runtime(1);
 
-    runtime.block_on(async |_| {
-        let mut s = sleep(Duration::from_secs(10));
+    runtime.block_on(async |ctx| {
+        let mut s = sleep(ctx, Duration::from_secs(10));
         let start = Instant::now();
 
         s.reset(Instant::now() + Duration::from_millis(50));
@@ -90,8 +90,8 @@ fn test_sleep_reset() {
 fn test_timeout_success() {
     let runtime = build_runtime(1);
 
-    runtime.block_on(async |_| {
-        let result = timeout(Duration::from_secs(1), async { "success" }).await;
+    runtime.block_on(async |ctx| {
+        let result = timeout(ctx, Duration::from_secs(1), async { "success" }).await;
         assert_eq!(result.expect("timeout should not elapse"), "success");
     });
 }
@@ -100,9 +100,9 @@ fn test_timeout_success() {
 fn test_timeout_elapsed() {
     let runtime = build_runtime(1);
 
-    runtime.block_on(async |_| {
-        let result = timeout(Duration::from_millis(50), async {
-            sleep(Duration::from_secs(1)).await;
+    runtime.block_on(async |ctx| {
+        let result = timeout(ctx, Duration::from_millis(50), async {
+            sleep(ctx, Duration::from_secs(1)).await;
             "never"
         })
         .await;
@@ -115,10 +115,10 @@ fn test_timeout_elapsed() {
 fn test_timeout_at() {
     let runtime = build_runtime(1);
 
-    runtime.block_on(async |_| {
+    runtime.block_on(async |ctx| {
         let deadline = Instant::now() + Duration::from_millis(50);
-        let result = timeout_at(deadline, async {
-            sleep(Duration::from_secs(1)).await;
+        let result = timeout_at(ctx, deadline, async {
+            sleep(ctx, Duration::from_secs(1)).await;
         })
         .await;
 
@@ -130,9 +130,9 @@ fn test_timeout_at() {
 fn test_interval_basic_burst() {
     let runtime = build_runtime(1);
 
-    runtime.block_on(async |_| {
+    runtime.block_on(async |ctx| {
         let start = Instant::now();
-        let mut interval = interval(Duration::from_millis(20));
+        let mut interval = interval(ctx, Duration::from_millis(20));
 
         interval.tick().await;
         interval.tick().await;
@@ -147,12 +147,12 @@ fn test_interval_basic_burst() {
 fn test_interval_missed_burst() {
     let runtime = build_runtime(1);
 
-    runtime.block_on(async |_| {
-        let mut interval = interval(Duration::from_millis(10));
+    runtime.block_on(async |ctx| {
+        let mut interval = interval(ctx, Duration::from_millis(10));
         interval.set_missed_tick_behavior(MissedTickBehavior::Burst);
 
         interval.tick().await;
-        sleep(Duration::from_millis(55)).await;
+        sleep(ctx, Duration::from_millis(55)).await;
 
         let t1 = Instant::now();
         interval.tick().await;
@@ -171,12 +171,12 @@ fn test_interval_missed_burst() {
 fn test_interval_missed_delay() {
     let runtime = build_runtime(1);
 
-    runtime.block_on(async |_| {
-        let mut interval = interval(Duration::from_millis(20));
+    runtime.block_on(async |ctx| {
+        let mut interval = interval(ctx, Duration::from_millis(20));
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         interval.tick().await;
-        sleep(Duration::from_millis(50)).await;
+        sleep(ctx, Duration::from_millis(50)).await;
 
         let start = Instant::now();
         interval.tick().await;
@@ -191,12 +191,12 @@ fn test_interval_missed_delay() {
 fn test_interval_missed_skip() {
     let runtime = build_runtime(1);
 
-    runtime.block_on(async |_| {
-        let mut interval = interval(Duration::from_millis(20));
+    runtime.block_on(async |ctx| {
+        let mut interval = interval(ctx, Duration::from_millis(20));
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         interval.tick().await;
-        sleep(Duration::from_millis(70)).await;
+        sleep(ctx, Duration::from_millis(70)).await;
 
         let start = Instant::now();
         interval.tick().await;
@@ -216,7 +216,7 @@ fn test_concurrent_sleeps() {
             for i in 0..10 {
                 handles.push(s.spawn_boxed(async move {
                     let duration = Duration::from_millis((i + 1) * 10);
-                    sleep(duration).await;
+                    sleep(ctx, duration).await;
                     duration
                 }));
             }
@@ -236,8 +236,8 @@ fn test_mixed_local_and_sync_sleeps() {
 
     runtime.block_on(async |ctx| {
         ctx.scope(async |s| {
-            let h_sync = s.spawn_boxed(async {
-                sleep(Duration::from_millis(50)).await;
+            let h_sync = s.spawn_boxed(async move {
+                sleep(ctx, Duration::from_millis(50)).await;
                 "sync"
             });
             assert_eq!(h_sync.await.expect("sync task failed"), "sync");
@@ -245,8 +245,8 @@ fn test_mixed_local_and_sync_sleeps() {
         .await;
 
         ctx.scope_local(async |s| {
-            let h_local = s.spawn_boxed_local(async {
-                sleep_local(Duration::from_millis(50)).await;
+            let h_local = s.spawn_boxed_local(async move {
+                sleep_local(ctx, Duration::from_millis(50)).await;
                 "local"
             });
             assert_eq!(h_local.await.expect("local task failed"), "local");
@@ -259,16 +259,16 @@ fn test_mixed_local_and_sync_sleeps() {
 fn test_select_timeout() {
     let runtime = build_runtime(1);
 
-    runtime.block_on(async |_| {
+    runtime.block_on(async |ctx| {
         let res = select! {
-            _ = sleep(Duration::from_millis(100)) => "timeout",
+            _ = sleep(ctx, Duration::from_millis(100)) => "timeout",
             _ = async { 42 } => "value",
         };
         assert_eq!(res, "value");
 
         let res = select! {
-            _ = sleep(Duration::from_millis(10)) => "timeout",
-            _ = sleep(Duration::from_millis(1000)) => "value",
+            _ = sleep(ctx, Duration::from_millis(10)) => "timeout",
+            _ = sleep(ctx, Duration::from_millis(1000)) => "value",
         };
         assert_eq!(res, "timeout");
     });

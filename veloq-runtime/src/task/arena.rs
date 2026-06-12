@@ -1,4 +1,4 @@
-use crate::utils::storage::{StateInt, StateLock, StateOptionPtr, Storage};
+use crate::utils::storage::{StateInt, StateLock, StateOptionPtr, Storage, ThreadSafeStorage};
 use std::alloc::{Layout, alloc, dealloc};
 use std::ptr::{self, NonNull};
 use std::sync::atomic::Ordering;
@@ -30,20 +30,20 @@ pub(crate) struct GenericChunk<S: Storage> {
     used: S::Usize,
     // 活跃对象计数器：当计数归零时，Chunk 可被回收
     active_count: S::Usize,
-    // 该块拥有的析构函数链表
-    drop_head: S::Lock<LinkedList<DropAdapter<S>>>,
+    // 该块拥有的析构函数链表，采用双向链表结构，并在锁保护下操作
+    drop_list: S::Lock<LinkedList<DropAdapter<S>>>,
 }
 
 pub(crate) struct GenericDropNode<S: Storage> {
     link: Link,
     data_ptr: *mut u8, // 重排字段以优化对齐
-    drop_fn: unsafe fn(*mut u8),
+    drop_fn: S::Usize,
     // 所属的 Chunk，用于回收
     chunk: *const GenericChunk<S>,
 }
 
-intrusive_adapter!(pub(crate) DropAdapter<S> = GenericDropNode<S> { link: Link } where S: Storage);
 intrusive_adapter!(pub(crate) ChunkAdapter<S> = GenericChunk<S> { link: Link } where S: Storage);
+intrusive_adapter!(pub(crate) DropAdapter<S> = GenericDropNode<S> { link: Link } where S: Storage);
 
 impl<S: Storage> GenericArena<S> {
     pub fn new() -> Self {
@@ -95,14 +95,15 @@ impl<S: Storage> GenericArena<S> {
                     node_ptr,
                     GenericDropNode {
                         link: Link::new(),
-                        drop_fn,
+                        drop_fn: S::Usize::new(drop_fn as usize),
                         data_ptr,
                         chunk: chunk_ptr,
                     },
                 );
 
-                let mut drop_head = (*chunk_ptr).drop_head.lock();
-                drop_head.push_front(std::pin::Pin::new_unchecked(&mut *node_ptr));
+                // 在锁保护下插入链表
+                let mut drop_list = (*chunk_ptr).drop_list.lock();
+                drop_list.push_front(std::pin::Pin::new_unchecked(&mut *node_ptr));
             }
             data_ptr
         } else {
@@ -120,21 +121,26 @@ impl<S: Storage> GenericArena<S> {
         let node_ptr = unsafe { (data_ptr as *mut u8).sub(offset) as *mut GenericDropNode<S> };
 
         // 2. 执行析构
-        let drop_fn = unsafe { (*node_ptr).drop_fn };
+        let drop_fn_val = unsafe { (*node_ptr).drop_fn.fetch_and(0, Ordering::AcqRel) };
         let chunk_ptr = unsafe { (*node_ptr).chunk as *mut GenericChunk<S> };
 
-        unsafe {
-            let mut drop_head = (*chunk_ptr).drop_head.lock();
-            if (*node_ptr).link.is_linked() {
-                let mut cursor = drop_head.cursor_mut_from_ptr(NonNull::new_unchecked(node_ptr));
-                cursor.remove();
+        if drop_fn_val != 0 {
+            unsafe {
+                let drop_fn = *(&drop_fn_val as *const usize as *const unsafe fn(*mut u8));
+                (drop_fn)(data_ptr as *mut u8);
             }
-            // 将 drop_fn 置为 no-op 避免重复调用
-            ptr::write_volatile(&mut (*node_ptr).drop_fn, |_| {});
-            (drop_fn)(data_ptr as *mut u8);
         }
 
-        // 3. 减少计数并检查回收
+        // 3. 从双向链表安全移除节点
+        unsafe {
+            let mut drop_list = (*chunk_ptr).drop_list.lock();
+            let mut cursor = drop_list.cursor_mut_from_ptr(NonNull::new_unchecked(node_ptr));
+            if cursor.get_raw().is_some() {
+                cursor.remove();
+            }
+        }
+
+        // 4. 减少计数并检查回收
         if unsafe {
             (*chunk_ptr)
                 .active_count
@@ -206,7 +212,7 @@ impl<S: Storage> GenericArena<S> {
             layout: new_chunk_layout,
             used: S::Usize::new(0),
             active_count: S::Usize::new(1), // 初始计数为 1，代表被 Arena 的 active_chunk 引用
-            drop_head: S::Lock::new(LinkedList::new(DropAdapter::<S>::new())),
+            drop_list: S::Lock::new(LinkedList::new(DropAdapter::<S>::new())),
         });
 
         let chunk_ptr: *mut GenericChunk<S> = Box::into_raw(new_chunk);
@@ -292,11 +298,15 @@ impl<S: Storage> GenericChunk<S> {
         let size = layout.size();
         let mask = align - 1;
 
+        let base_addr = self.ptr.as_ptr() as usize;
         let mut current_used = self.used.load(Ordering::Acquire);
         loop {
-            let current_ptr = unsafe { self.ptr.as_ptr().add(current_used) } as usize;
+            let current_ptr = match base_addr.checked_add(current_used) {
+                Some(addr) => addr,
+                None => return ptr::null_mut(),
+            };
             let aligned_ptr = (current_ptr + mask) & !mask;
-            let offset = aligned_ptr - self.ptr.as_ptr() as usize;
+            let offset = aligned_ptr - base_addr;
             let new_used = offset + size;
 
             if new_used <= self.layout.size() {
@@ -323,11 +333,19 @@ impl<S: Storage> Drop for GenericArena<S> {
             unsafe {
                 let chunk_ptr = chunk_pin.get_unchecked_mut() as *mut GenericChunk<S>;
                 let chunk = Box::from_raw(chunk_ptr);
-                let mut drop_head = chunk.drop_head.lock();
-                while let Some(node_pin) = drop_head.pop_front() {
+
+                // 遍历双向链表并析构所有存活节点
+                let mut drop_list = chunk.drop_list.lock();
+                while let Some(node_pin) = drop_list.pop_front() {
                     let node = node_pin.get_unchecked_mut();
-                    (node.drop_fn)(node.data_ptr);
+                    let drop_fn_val = node.drop_fn.fetch_and(0, Ordering::AcqRel);
+                    if drop_fn_val != 0 {
+                        let drop_fn = *(&drop_fn_val as *const usize as *const unsafe fn(*mut u8));
+                        (drop_fn)(node.data_ptr);
+                    }
                 }
+                drop(drop_list);
+
                 dealloc(chunk.ptr.as_ptr(), chunk.layout);
             }
         }
@@ -347,28 +365,28 @@ impl<S: Storage> Arena for GenericArena<S> {
 }
 
 // 安全性：GenericArena 的 Send/Sync 性质取决于 Storage 的实现
-unsafe impl<S: Storage> Send for GenericArena<S>
+unsafe impl<S: ThreadSafeStorage> Send for GenericArena<S>
 where
     S::OptionPtr<GenericChunk<S>>: Send,
-    S::Lock<Vec<*mut GenericChunk<S>>>: Send,
+    S::Lock<LinkedList<ChunkAdapter<S>>>: Send,
 {
 }
-unsafe impl<S: Storage> Sync for GenericArena<S>
+unsafe impl<S: ThreadSafeStorage> Sync for GenericArena<S>
 where
     S::OptionPtr<GenericChunk<S>>: Sync,
-    S::Lock<Vec<*mut GenericChunk<S>>>: Sync,
+    S::Lock<LinkedList<ChunkAdapter<S>>>: Sync,
 {
 }
 
-unsafe impl<S: Storage> Send for GenericChunk<S>
+unsafe impl<S: ThreadSafeStorage> Send for GenericChunk<S>
 where
     S::Usize: Send,
-    S::OptionPtr<GenericDropNode<S>>: Send,
+    S::Lock<LinkedList<DropAdapter<S>>>: Send,
 {
 }
-unsafe impl<S: Storage> Sync for GenericChunk<S>
+unsafe impl<S: ThreadSafeStorage> Sync for GenericChunk<S>
 where
     S::Usize: Sync,
-    S::OptionPtr<GenericDropNode<S>>: Sync,
+    S::Lock<LinkedList<DropAdapter<S>>>: Sync,
 {
 }

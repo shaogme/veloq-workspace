@@ -5,11 +5,11 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
+use veloq::runtime::context::RuntimeContext;
 
 use veloq::fs::{BufferingMode, File};
-use veloq::runtime::{Runtime, context};
-use veloq_buf::{BufPool, UniformSlot, heap::ThreadMemoryMultiplier, nz};
-use veloq_runtime::runtime::current_worker_id;
+use veloq::runtime::Runtime;
+use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BenchSyncMode {
@@ -95,7 +95,7 @@ fn bench_file_path(base_dir: &Path, name: impl AsRef<str>) -> PathBuf {
     base_dir.join(name.as_ref())
 }
 
-async fn apply_sync(file: &File, len: u64, mode: BenchSyncMode) {
+async fn apply_sync<'a, 'ctx>(file: &File<'a, 'ctx>, len: u64, mode: BenchSyncMode) {
     match mode {
         BenchSyncMode::None => {}
         BenchSyncMode::SyncRange => {
@@ -115,19 +115,28 @@ async fn apply_sync(file: &File, len: u64, mode: BenchSyncMode) {
     }
 }
 
-async fn open_file(path: &Path, buffering_mode: BufferingMode) -> File {
+async fn open_file<'a, 'ctx>(
+    ctx: RuntimeContext<'a, 'ctx>,
+    path: &Path,
+    buffering_mode: BufferingMode,
+) -> File<'a, 'ctx> {
     File::options()
         .write(true)
         .create(true)
         .truncate(true)
         .buffering(buffering_mode)
-        .open(path)
+        .open(ctx, path)
         .await
         .expect("Failed to create")
 }
 
-async fn open_and_fallocate(path: &Path, buffering_mode: BufferingMode, len: u64) -> File {
-    let file = open_file(path, buffering_mode).await;
+async fn open_and_fallocate<'a, 'ctx>(
+    ctx: RuntimeContext<'a, 'ctx>,
+    path: &Path,
+    buffering_mode: BufferingMode,
+    len: u64,
+) -> File<'a, 'ctx> {
+    let file = open_file(ctx, path, buffering_mode).await;
     file.fallocate(0, len).await.expect("Fallocate failed");
     file
 }
@@ -139,8 +148,8 @@ fn create_runtime(worker_threads: usize) -> Runtime<UniformSlot> {
         .expect("failed to build runtime")
 }
 
-async fn run_1gb_iteration(
-    ctx: &veloq_runtime::runtime::RuntimeScopeContext,
+async fn run_1gb_iteration<'a, 'ctx>(
+    ctx: RuntimeContext<'a, 'ctx>,
     phase: BenchPhase,
     buffering_mode: BufferingMode,
     sync_mode: BenchSyncMode,
@@ -154,9 +163,8 @@ async fn run_1gb_iteration(
 
     let total_start = matches!(phase, BenchPhase::Total).then(Instant::now);
 
-    let file = open_and_fallocate(&file_path, buffering_mode, TOTAL_SIZE).await;
+    let file = open_and_fallocate(ctx, &file_path, buffering_mode, TOTAL_SIZE).await;
     let file = Rc::new(file);
-    let pool = context::current_pool().expect("Worker should have bound pool");
 
     let write_start = matches!(phase, BenchPhase::Write).then(Instant::now);
 
@@ -168,7 +176,7 @@ async fn run_1gb_iteration(
 
         while offset < TOTAL_SIZE {
             if tasks.len() < concurrency_limit
-                && let Some(buf) = pool.alloc(CHUNK_SIZE)
+                && let Some(buf) = ctx.try_alloc_from_pool(CHUNK_SIZE)
             {
                 let remaining = TOTAL_SIZE - offset;
                 let write_len = std::cmp::min(remaining, CHUNK_SIZE.get() as u64) as usize;
@@ -213,14 +221,14 @@ async fn run_1gb_iteration(
     }
 }
 
-async fn run_worker_iteration(
-    files: Vec<File>,
+async fn run_worker_iteration<'a, 'ctx>(
+    ctx: RuntimeContext<'a, 'ctx>,
+    files: Vec<File<'a, 'ctx>>,
     file_size: u64,
     chunk_size: NonZeroUsize,
     sync_mode: BenchSyncMode,
 ) -> u64 {
-    let pool = context::current_pool().expect("Worker should have bound pool");
-    let worker_id = current_worker_id();
+    let worker_id = ctx.scope.worker_id();
     let concurrency_limit = 8;
     let mut offsets = vec![0u64; files.len()];
     let mut current_local_idx = 0usize;
@@ -247,7 +255,7 @@ async fn run_worker_iteration(
             let Some(idx) = found else {
                 break;
             };
-            let Some(buf) = pool.alloc(chunk_size) else {
+            let Some(buf) = ctx.try_alloc_from_pool(chunk_size) else {
                 break;
             };
 
@@ -404,32 +412,41 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                                 })
                                 .collect();
 
-                            prepare_handles.push(s.spawn_boxed_to(worker_id, async move || {
-                                let mut files = Vec::with_capacity(FILES_PER_WORKER);
-                                for path in &prepare_path_names {
-                                    if path.exists() {
+                            prepare_handles.push(
+                                s.spawn_boxed_to(worker_id, async move || {
+                                    let mut files = Vec::with_capacity(FILES_PER_WORKER);
+                                    for path in &prepare_path_names {
+                                        if path.exists() {
+                                            let _ = std::fs::remove_file(path);
+                                        }
+
+                                        let file = open_and_fallocate(
+                                            ctx,
+                                            path,
+                                            buffering_mode,
+                                            FILE_SIZE,
+                                        )
+                                        .await;
+                                        files.push(file);
+                                    }
+
+                                    let bytes = run_worker_iteration(
+                                        ctx,
+                                        files,
+                                        FILE_SIZE,
+                                        nz!(4 * 1024 * 1024),
+                                        sync_mode,
+                                    )
+                                    .await;
+
+                                    for path in prepare_path_names {
                                         let _ = std::fs::remove_file(path);
                                     }
 
-                                    let file =
-                                        open_and_fallocate(path, buffering_mode, FILE_SIZE).await;
-                                    files.push(file);
-                                }
-
-                                let bytes = run_worker_iteration(
-                                    files,
-                                    FILE_SIZE,
-                                    nz!(4 * 1024 * 1024),
-                                    sync_mode,
-                                )
-                                .await;
-
-                                for path in prepare_path_names {
-                                    let _ = std::fs::remove_file(path);
-                                }
-
-                                Ok::<u64, std::io::Error>(bytes)
-                            }));
+                                    Ok::<u64, std::io::Error>(bytes)
+                                })
+                                .expect("worker prepare task dispatch failed"),
+                            );
                         }
 
                         let mut total_bytes = 0u64;
