@@ -79,6 +79,7 @@ impl<T, WF> Runtime<T, WF> {
         let mut remote_receivers = receivers.remote_receivers;
         let mut pinned_receivers = receivers.pinned_receivers;
         let mut local_receivers = receivers.local_receivers;
+        let mut deques = receivers.deques;
 
         thread::scope(|scope| {
             struct ShutdownGuard<'a, T>(&'a RuntimeShared<T>);
@@ -93,6 +94,7 @@ impl<T, WF> Runtime<T, WF> {
                 let rrx = remote_receivers.pop().expect("remote receivers exhausted");
                 let prx = pinned_receivers.pop().expect("pinned receivers exhausted");
                 let lrx = local_receivers.pop().expect("local receivers exhausted");
+                let deque = deques.pop().expect("deques exhausted");
                 let worker_factory_ref = &worker_factory;
 
                 let context = RuntimeContext {
@@ -101,6 +103,7 @@ impl<T, WF> Runtime<T, WF> {
                     pinned_rx: prx,
                     local_rx: lrx,
                     rand: FastRand::new(worker_id as u64),
+                    worker: deque,
                 };
 
                 scope.spawn(move || {
@@ -129,6 +132,7 @@ impl<T, WF> Runtime<T, WF> {
             let lrx0 = local_receivers
                 .pop()
                 .expect("main worker local receiver exhausted");
+            let deque0 = deques.pop().expect("main worker deque exhausted");
 
             let context = RuntimeContext {
                 worker_id: 0,
@@ -136,6 +140,7 @@ impl<T, WF> Runtime<T, WF> {
                 pinned_rx: prx0,
                 local_rx: lrx0,
                 rand: FastRand::new(0),
+                worker: deque0,
             };
             shared_ref
                 .base

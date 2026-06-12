@@ -1415,14 +1415,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "veloq-deque"
-version = "0.1.0"
-dependencies = [
- "loom",
- "veloq-shim",
-]
-
-[[package]]
 name = "veloq-driver-core"
 version = "0.1.0"
 dependencies = [
@@ -1518,6 +1510,7 @@ version = "0.1.0"
 name = "veloq-runtime"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-deque",
  "crossbeam-queue",
  "diagweave",
  "libc",
@@ -1525,7 +1518,6 @@ dependencies = [
  "parking_lot",
  "trybuild",
  "veloq-atomic-waker",
- "veloq-deque",
  "veloq-intrusive-linklist",
  "veloq-storage",
  "veloq-tls",

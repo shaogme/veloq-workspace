@@ -92,6 +92,7 @@ pub struct RuntimeContext {
     pub(crate) pinned_rx: Receiver<SendTaskRef>,
     pub(crate) local_rx: Receiver<LocalTaskRef>,
     pub(crate) rand: FastRand,
+    pub(crate) worker: crossbeam_deque::Worker<SendTaskRef>,
 }
 
 unsafe impl Send for RuntimeContext {}
