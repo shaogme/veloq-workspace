@@ -96,7 +96,7 @@ pub(crate) struct WakeupPayload {
 }
 
 pub(crate) struct TimeoutPayload {
-    pub(crate) ts: [i64; 2],
+    pub(crate) ts: io_uring::types::Timespec,
 }
 
 fn zeroed_sockaddr_storage() -> libc::sockaddr_storage {
@@ -161,8 +161,10 @@ impl WakeupPayload {
 
 impl TimeoutPayload {
     #[inline]
-    pub(crate) const fn new() -> Self {
-        Self { ts: [0; 2] }
+    pub(crate) fn new() -> Self {
+        Self {
+            ts: io_uring::types::Timespec::new(),
+        }
     }
 }
 

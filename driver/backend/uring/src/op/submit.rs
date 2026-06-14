@@ -85,9 +85,10 @@ pub(crate) unsafe fn make_sqe_timeout(
     _driver: &mut UringDriver,
     _token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
-    kernel.ts[0] = user.duration.as_secs() as i64;
-    kernel.ts[1] = user.duration.subsec_nanos() as i64;
-    let ts_ptr = kernel.ts.as_ptr() as *const types::Timespec;
+    kernel.ts = types::Timespec::new()
+        .sec(user.duration.as_secs())
+        .nsec(user.duration.subsec_nanos());
+    let ts_ptr = &kernel.ts as *const types::Timespec;
 
     Ok(opcode::Timeout::new(ts_ptr).build())
 }
