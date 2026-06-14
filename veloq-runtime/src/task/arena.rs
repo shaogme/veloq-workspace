@@ -254,20 +254,21 @@ impl<S: Storage> GenericArena<S> {
                 let used = a_ref.used.load(Ordering::Acquire);
                 if a_ref.layout.size().saturating_sub(used) >= layout.size() + layout.align() {
                     // 另一个线程已经提供了一个合适的 chunk。
-                    // 我们可以放弃当前的 new_chunk（减少其 active 引用）。
-                    unsafe {
-                        if (*chunk_ptr)
-                            .active_count
-                            .fetch_sub(1usize, Ordering::AcqRel)
-                            == 1
-                        {
-                            self.reclaim_chunk(chunk_ptr);
-                        }
-                    }
                     // 尝试从当前的 active 分配（需要锁定/引用）
                     if a_ref.active_count.fetch_add(1usize, Ordering::AcqRel) > 0 {
                         let p = a_ref.try_alloc(layout);
                         if !p.is_null() {
+                            // 只有当成功从另一个 chunk 分配时，我们才丢弃当前的 new_chunk。
+                            // 此时我们一次性扣除它的两个引用计数（active_chunk 占位 + 对象分配占位）。
+                            unsafe {
+                                if (*chunk_ptr)
+                                    .active_count
+                                    .fetch_sub(2usize, Ordering::AcqRel)
+                                    == 2
+                                {
+                                    self.reclaim_chunk(chunk_ptr);
+                                }
+                            }
                             return (p, a.as_ptr());
                         }
                         // 分配失败，减少计数
@@ -278,28 +279,25 @@ impl<S: Storage> GenericArena<S> {
                     // 如果分配失败，继续尝试将 new_chunk 设为 active
                 }
             }
-            match self.active_chunk.compare_exchange_weak(
+            if let Ok(old_active) = self.active_chunk.compare_exchange_weak(
                 active,
                 NonNull::new(chunk_ptr),
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(old_active) => {
-                    if let Some(old) = old_active {
-                        unsafe {
-                            if old
-                                .as_ref()
-                                .active_count
-                                .fetch_sub(1usize, Ordering::AcqRel)
-                                == 1
-                            {
-                                self.reclaim_chunk(old.as_ptr());
-                            }
+                if let Some(old) = old_active {
+                    unsafe {
+                        if old
+                            .as_ref()
+                            .active_count
+                            .fetch_sub(1usize, Ordering::AcqRel)
+                            == 1
+                        {
+                            self.reclaim_chunk(old.as_ptr());
                         }
                     }
-                    break;
                 }
-                Err(_) => {}
+                break;
             }
         }
 
