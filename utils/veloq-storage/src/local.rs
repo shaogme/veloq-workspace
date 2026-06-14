@@ -108,12 +108,14 @@ impl_state_int!(
 struct LocalEpochState {
     guard_count: usize,
     pending_defers: Vec<Box<dyn FnOnce()>>,
+    is_draining: bool,
 }
 
 thread_local! {
     static LOCAL_EPOCH: RefCell<LocalEpochState> = RefCell::new(LocalEpochState {
         guard_count: 0,
         pending_defers: Vec::new(),
+        is_draining: false,
     });
 }
 
@@ -125,11 +127,11 @@ impl StateGuard for LocalGuard {
         F: FnOnce() + Send + 'static,
     {
         LOCAL_EPOCH.with(|state| {
-            let mut state = state.borrow_mut();
-            if state.guard_count == 0 {
-                f();
-            } else {
-                state.pending_defers.push(Box::new(f));
+            let mut s = state.borrow_mut();
+            s.pending_defers.push(Box::new(f));
+            if s.guard_count == 0 {
+                drop(s);
+                LocalGuard::safe_drain();
             }
         });
     }
@@ -138,12 +140,64 @@ impl StateGuard for LocalGuard {
 impl Drop for LocalGuard {
     fn drop(&mut self) {
         LOCAL_EPOCH.with(|state| {
-            let mut state = state.borrow_mut();
-            state.guard_count -= 1;
-            if state.guard_count == 0 {
-                let defers = std::mem::take(&mut state.pending_defers);
-                for defer in defers {
+            let mut s = state.borrow_mut();
+            s.guard_count -= 1;
+            if s.guard_count == 0 {
+                drop(s);
+                LocalGuard::safe_drain();
+            }
+        });
+    }
+}
+
+struct DrainGuard;
+
+impl Drop for DrainGuard {
+    fn drop(&mut self) {
+        LOCAL_EPOCH.with(|state| {
+            state.borrow_mut().is_draining = false;
+        });
+    }
+}
+
+impl LocalGuard {
+    fn safe_drain() {
+        LOCAL_EPOCH.with(|state| {
+            {
+                let s = state.borrow();
+                if s.is_draining || s.guard_count > 0 || s.pending_defers.is_empty() {
+                    return;
+                }
+            }
+
+            let mut s = state.borrow_mut();
+            s.is_draining = true;
+            let _guard = DrainGuard;
+
+            let mut defers = std::mem::take(&mut s.pending_defers);
+            drop(s);
+
+            loop {
+                for defer in defers.drain(..) {
                     defer();
+                }
+
+                let has_more = {
+                    let defers_ref = &mut defers;
+                    LOCAL_EPOCH.with(|state| {
+                        let mut s = state.borrow_mut();
+                        if s.pending_defers.is_empty() {
+                            s.pending_defers = std::mem::take(defers_ref);
+                            false
+                        } else {
+                            std::mem::swap(&mut s.pending_defers, defers_ref);
+                            true
+                        }
+                    })
+                };
+
+                if !has_more {
+                    break;
                 }
             }
         });

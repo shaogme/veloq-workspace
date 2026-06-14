@@ -339,3 +339,93 @@ fn test_static_transfer() {
     assert_eq!(transfer.take(1), 2);
     assert_eq!(transfer.take(2), 3);
 }
+
+#[test]
+fn test_local_guard_defer_basic() {
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag_clone = flag.clone();
+
+    unsafe {
+        let guard = LocalStorage::pin();
+        guard.defer(move || {
+            flag_clone.store(true, Ordering::SeqCst);
+        });
+        assert!(!flag.load(Ordering::SeqCst));
+        drop(guard);
+    }
+    assert!(flag.load(Ordering::SeqCst));
+}
+
+#[test]
+fn test_local_guard_defer_reentrant() {
+    let step = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let step_clone = step.clone();
+
+    unsafe {
+        let guard = LocalStorage::pin();
+        guard.defer(move || {
+            step_clone.store(1, Ordering::SeqCst);
+            let inner_guard = LocalStorage::pin();
+            let step_inner = step_clone.clone();
+            inner_guard.defer(move || {
+                step_inner.store(2, Ordering::SeqCst);
+            });
+            drop(inner_guard);
+        });
+        drop(guard);
+    }
+    assert_eq!(step.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn test_local_guard_defer_recursive_drain() {
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count_clone = count.clone();
+
+    fn recursive_defer(c: Arc<std::sync::atomic::AtomicUsize>, depth: usize) {
+        if depth == 0 {
+            return;
+        }
+        unsafe {
+            let guard = LocalStorage::pin();
+            guard.defer(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+                recursive_defer(c, depth - 1);
+            });
+        }
+    }
+
+    recursive_defer(count_clone, 10);
+    assert_eq!(count.load(Ordering::SeqCst), 10);
+}
+
+#[test]
+fn test_local_guard_defer_panic_safety() {
+    let flag1 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag2 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let flag1_clone = flag1.clone();
+    let flag2_clone = flag2.clone();
+
+    // 1. 触发一个会 panic 的 defer
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || unsafe {
+        let guard = LocalStorage::pin();
+        guard.defer(move || {
+            flag1_clone.store(true, Ordering::SeqCst);
+            panic!("intentional panic");
+        });
+        drop(guard);
+    }));
+    assert!(result.is_err());
+    assert!(flag1.load(Ordering::SeqCst));
+
+    // 2. 验证后续的 defer 是否依然能正常执行
+    unsafe {
+        let guard = LocalStorage::pin();
+        guard.defer(move || {
+            flag2_clone.store(true, Ordering::SeqCst);
+        });
+        drop(guard);
+    }
+    assert!(flag2.load(Ordering::SeqCst));
+}
