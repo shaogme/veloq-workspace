@@ -82,6 +82,7 @@ crossbeam-utils = { version = "0.8", default-features = false }
 
 crossbeam-deque = "0.8"
 crossbeam-queue = "0.3"
+crossbeam-epoch = "0.9"
 futures-core = "0.3"
 futures-util = "0.3"
 libc = "0.2.183"

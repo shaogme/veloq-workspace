@@ -1,4 +1,6 @@
-use crate::utils::storage::{StateInt, StateLock, StateOptionPtr, Storage, ThreadSafeStorage};
+use crate::utils::storage::{
+    StateGuard, StateInt, StateLock, StateOptionPtr, Storage, ThreadSafeStorage,
+};
 use std::alloc::{Layout, alloc, dealloc};
 use std::ptr::{self, NonNull};
 use std::sync::atomic::Ordering;
@@ -120,6 +122,8 @@ impl<S: Storage> GenericArena<S> {
         let offset = node_layout.extend(layout).unwrap().1;
         let node_ptr = unsafe { (data_ptr as *mut u8).sub(offset) as *mut GenericDropNode<S> };
 
+        let _guard = S::pin();
+
         // 2. 执行析构
         let drop_fn_val = unsafe { (*node_ptr).drop_fn.fetch_and(0, Ordering::AcqRel) };
         let chunk_ptr = unsafe { (*node_ptr).chunk as *mut GenericChunk<S> };
@@ -157,13 +161,21 @@ impl<S: Storage> GenericArena<S> {
             let mut cursor = chunks.cursor_mut_from_ptr(NonNull::new_unchecked(chunk_ptr));
             if cursor.get_raw().is_some() {
                 cursor.remove();
-                let chunk = Box::from_raw(chunk_ptr);
-                dealloc(chunk.ptr.as_ptr(), chunk.layout);
+
+                // 将 dealloc 和释放 GenericChunk 的操作放入 epoch 延迟中
+                let guard = S::pin();
+                let chunk_addr = chunk_ptr as usize;
+                guard.defer(move || {
+                    let chunk_ptr = chunk_addr as *mut GenericChunk<S>;
+                    let chunk = Box::from_raw(chunk_ptr);
+                    dealloc(chunk.ptr.as_ptr(), chunk.layout);
+                });
             }
         }
     }
 
     fn try_alloc_fast(&self, layout: Layout) -> Option<(*mut u8, *mut GenericChunk<S>)> {
+        let _guard = S::pin();
         if let Some(chunk_ptr) = self.active_chunk.load(Ordering::Acquire) {
             let chunk = unsafe { chunk_ptr.as_ref() };
             // 增加计数以确保在分配期间块不被回收
@@ -184,16 +196,19 @@ impl<S: Storage> GenericArena<S> {
     #[inline(never)]
     fn alloc_slow(&self, layout: Layout) -> (*mut u8, *mut GenericChunk<S>) {
         // Double-check
-        if let Some(current_active) = self.active_chunk.load(Ordering::Acquire) {
-            let a_ref = unsafe { current_active.as_ref() };
-            if a_ref.active_count.fetch_add(1usize, Ordering::AcqRel) > 0 {
-                let p = a_ref.try_alloc(layout);
-                if !p.is_null() {
-                    return (p, current_active.as_ptr());
-                }
-                // 分配失败，减少计数
-                if a_ref.active_count.fetch_sub(1usize, Ordering::AcqRel) == 1 {
-                    self.reclaim_chunk(current_active.as_ptr());
+        {
+            let _guard = S::pin();
+            if let Some(current_active) = self.active_chunk.load(Ordering::Acquire) {
+                let a_ref = unsafe { current_active.as_ref() };
+                if a_ref.active_count.fetch_add(1usize, Ordering::AcqRel) > 0 {
+                    let p = a_ref.try_alloc(layout);
+                    if !p.is_null() {
+                        return (p, current_active.as_ptr());
+                    }
+                    // 分配失败，减少计数
+                    if a_ref.active_count.fetch_sub(1usize, Ordering::AcqRel) == 1 {
+                        self.reclaim_chunk(current_active.as_ptr());
+                    }
                 }
             }
         }
@@ -231,9 +246,9 @@ impl<S: Storage> GenericArena<S> {
             }
         }
 
-        // 更新活跃块指针
-        let mut active = self.active_chunk.load(Ordering::Acquire);
         loop {
+            let _guard = S::pin();
+            let active = self.active_chunk.load(Ordering::Acquire);
             if let Some(a) = active {
                 let a_ref = unsafe { a.as_ref() };
                 let used = a_ref.used.load(Ordering::Acquire);
@@ -284,7 +299,7 @@ impl<S: Storage> GenericArena<S> {
                     }
                     break;
                 }
-                Err(actual) => active = actual,
+                Err(_) => {}
             }
         }
 

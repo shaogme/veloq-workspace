@@ -1,4 +1,3 @@
-
 macro_rules! impl_state_int {
     ($ty:ty, $self:ident, $order:ident, $val:ident, $curr:ident, $new:ident, $success:ident, $failure:ident,
      new($new_val:ident) $new_expr:block,
