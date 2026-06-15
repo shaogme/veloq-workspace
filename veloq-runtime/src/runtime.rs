@@ -167,8 +167,8 @@ impl<T, WF> Runtime<T, WF> {
 }
 
 pub struct RuntimeBuilder<T, WF> {
-    worker_count: Option<usize>,
-    queue_capacity: usize,
+    worker_count: Option<NonZeroUsize>,
+    queue_capacity: NonZeroUsize,
     worker_factory: Option<WF>,
     idle_hook: Option<IdleHook<T>>,
     worker_tick_hook: Option<WorkerTickHook>,
@@ -178,7 +178,7 @@ impl RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
     pub fn new() -> Self {
         RuntimeBuilder {
             worker_count: None,
-            queue_capacity: 1024,
+            queue_capacity: NonZeroUsize::new(1024).unwrap(),
             worker_factory: Some(|_, _| ()),
             idle_hook: None,
             worker_tick_hook: None,
@@ -193,22 +193,13 @@ impl Default for RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
 }
 
 impl<T, WF> RuntimeBuilder<T, WF> {
-    pub fn worker_count(mut self, count: NonZeroUsize) -> Self {
-        self.worker_count = Some(count.get());
+
+    pub fn with_worker_count(mut self, count: Option<NonZeroUsize>) -> Self {
+        self.worker_count = count;
         self
     }
 
-    pub fn with_worker_count(mut self, count: usize) -> Self {
-        self.worker_count = Some(count);
-        self
-    }
-
-    pub fn queue_capacity(mut self, capacity: NonZeroUsize) -> Self {
-        self.queue_capacity = capacity.get();
-        self
-    }
-
-    pub fn with_queue_capacity(mut self, capacity: usize) -> Self {
+    pub fn with_queue_capacity(mut self, capacity: NonZeroUsize) -> Self {
         self.queue_capacity = capacity;
         self
     }
@@ -239,14 +230,12 @@ impl<T, WF> RuntimeBuilder<T, WF> {
     }
 
     pub fn build(self) -> Runtime<T, WF> {
-        let count = self
+        let worker_count = self
             .worker_count
-            .unwrap_or_else(|| thread::available_parallelism().map_or(1, |n| n.get()));
-        let worker_count =
-            NonZeroUsize::new(count).expect("requested worker count must be non-zero");
+            .unwrap_or_else(|| thread::available_parallelism().unwrap_or(NonZeroUsize::new(1).unwrap()));
         let (registry, topo, receivers) = init_runtime_components(
             worker_count,
-            NonZeroUsize::new(self.queue_capacity).expect("queue capacity must be non-zero"),
+            self.queue_capacity,
         );
         let shared = RuntimeShared::new(
             registry,

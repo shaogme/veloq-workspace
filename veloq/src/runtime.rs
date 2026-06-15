@@ -149,8 +149,8 @@ impl<T: PoolTopology> Runtime<T> {
         );
 
         let runtime = async_runtime::RuntimeBuilder::new()
-            .with_worker_count(worker_count.get())
-            .with_queue_capacity(config.get_queue_capacity().get())
+            .with_worker_count(Some(worker_count))
+            .with_queue_capacity(config.get_queue_capacity())
             .with_idle_hook(poll_current_driver)
             .with_worker_factory(move |worker_id, shared| {
                 let topology = topology.clone();
