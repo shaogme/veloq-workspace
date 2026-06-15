@@ -2,9 +2,9 @@ use crate::{
     error::Result,
     runtime::{RuntimeScopeContext, RuntimeShared, primitives::GenericCancellationToken},
     task::{
-        AnyScopeRef, Arena, ErasedCancellationToken, GenericArena, LocalBoxedTaskNode, LocalTask,
-        LocalTaskRef, RawScope, RawTask, ScopeRef, ScopeStorage, SendBoxedTaskNode, SendTask,
-        SendTaskRef, TaskError, TaskHandleRef, TaskJoinGate,
+        AnyScopeRef, Arena, ErasedCancellationToken, GenericArena, GenericTaskNode, LocalTask,
+        LocalTaskRef, RawScope, RawTask, ScopeRef, ScopeStorage, SendTask, SendTaskRef, Task,
+        TaskBounds, TaskError, TaskHandleRef, TaskJoinGate, TaskStorage,
     },
     utils::ownership::{ArcOwnership, Ownership, RcOwnership},
 };
@@ -145,20 +145,15 @@ impl<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra>
     where
         TTask: LocalTask<T> + Sized + 'scope,
     {
-        let mut guard: ScopeTaskGuard<S, O> = ScopeTaskGuard::new(&self.completion);
-
-        let worker_id = self.context.worker_id();
-        let task_ref = unsafe { LocalTaskRef::from_concrete(task as *const TTask) };
         unsafe {
-            let scope_ref = self.scope_completion_ref().cast::<LocalStorage>();
-            task_ref
-                .header()
-                .initialize(&self.context.shared().base, worker_id, scope_ref);
+            self.spawn_task_impl(
+                self.context.worker_id(),
+                task,
+                |runtime, worker_id, task_ref| {
+                    runtime.enqueue_local(worker_id, task_ref);
+                },
+            )
         }
-        guard.handoff_to(task_ref.header());
-        self.context.shared().enqueue_local(worker_id, task_ref);
-
-        JoinHandle::new_direct(self, task_ref, task, None)
     }
 
     pub fn spawn_boxed_local<'scope_ref, T, F>(
@@ -168,39 +163,15 @@ impl<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra>
     where
         F: Future<Output = T> + 'scope_ref,
     {
-        let mut guard: ScopeTaskGuard<S, O> = ScopeTaskGuard::new(&self.completion);
-
-        let worker_id = self.context.worker_id();
-        let scope_ref = self.scope_completion_ref().cast::<LocalStorage>();
-        let node = LocalBoxedTaskNode::new(future);
         unsafe {
-            node.header
-                .initialize(&self.context.shared().base, worker_id, scope_ref);
+            self.spawn_boxed_impl(
+                self.context.worker_id(),
+                future,
+                |runtime, worker_id, task_ref| {
+                    runtime.enqueue_local(worker_id, task_ref);
+                },
+            )
         }
-        let layout = Layout::new::<LocalBoxedTaskNode<T, F>>();
-        let node_ptr = unsafe {
-            self.arena.alloc::<LocalBoxedTaskNode<T, F>>(
-                layout,
-                Some(|ptr| drop_in_place(ptr as *mut LocalBoxedTaskNode<T, F>)),
-            ) as *mut LocalBoxedTaskNode<T, F>
-        };
-        unsafe { write(node_ptr, node) };
-
-        let node_ref = unsafe { &*node_ptr };
-        guard.handoff_to(node_ref.header());
-
-        let task_ref = unsafe { LocalTaskRef::from_concrete(node_ptr) };
-        self.context.shared().enqueue_local(worker_id, task_ref);
-
-        JoinHandle::new_direct(
-            self,
-            task_ref,
-            node_ref,
-            Some(|arena, gate| unsafe {
-                let layout = Layout::new::<LocalBoxedTaskNode<T, F>>();
-                arena.drop_object_raw(gate as *const dyn TaskJoinGate<T> as *mut u8, layout);
-            }),
-        )
     }
 
     pub fn cancel_token(&self) -> &GenericCancellationToken<S, O> {
@@ -232,6 +203,75 @@ impl<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra>
     pub fn shared(&self) -> &RuntimeShared<TExtra> {
         self.context.shared()
     }
+
+    unsafe fn spawn_task_impl<'scope_ref, T, H, TTask>(
+        &'scope_ref self,
+        worker_id: usize,
+        task: &'scope TTask,
+        enqueue_fn: impl FnOnce(&RuntimeShared<TExtra>, usize, H),
+    ) -> JoinHandle<'scope_ref, T, H, Self, TExtra>
+    where
+        H: TaskHandleRef,
+        TTask: Task<T, Storage = H::Storage> + Sized + 'scope,
+    {
+        let mut guard = ScopeTaskGuard::<S, O>::new(&self.completion);
+        let task_ref = unsafe { H::from_concrete(task as *const TTask) };
+        unsafe {
+            let scope_ref = self.scope_completion_ref().cast::<H::Storage>();
+            task_ref
+                .header()
+                .initialize(&self.context.shared().base, worker_id, scope_ref);
+        }
+        guard.handoff_to(task_ref.header());
+        enqueue_fn(self.context.shared(), worker_id, task_ref);
+
+        JoinHandle::new_direct(self, task_ref, task, None)
+    }
+
+    unsafe fn spawn_boxed_impl<'scope_ref, T, H, F>(
+        &'scope_ref self,
+        worker_id: usize,
+        future: F,
+        enqueue_fn: impl FnOnce(&RuntimeShared<TExtra>, usize, H),
+    ) -> JoinHandle<'scope_ref, T, H, Self, TExtra>
+    where
+        H: TaskHandleRef,
+        H::Storage: TaskStorage + TaskBounds<T, F>,
+        F: Future<Output = T> + 'scope_ref,
+    {
+        let mut guard = ScopeTaskGuard::<S, O>::new(&self.completion);
+
+        let scope_ref = self.scope_completion_ref().cast::<H::Storage>();
+        let node = GenericTaskNode::<H::Storage, T, F>::new(future);
+        unsafe {
+            node.header
+                .initialize(&self.context.shared().base, worker_id, scope_ref);
+        }
+        let layout = Layout::new::<GenericTaskNode<H::Storage, T, F>>();
+        let node_ptr = unsafe {
+            self.arena.alloc::<GenericTaskNode<H::Storage, T, F>>(
+                layout,
+                Some(|ptr| drop_in_place(ptr as *mut GenericTaskNode<H::Storage, T, F>)),
+            ) as *mut GenericTaskNode<H::Storage, T, F>
+        };
+        unsafe { write(node_ptr, node) };
+
+        let node_ref = unsafe { &*node_ptr };
+        guard.handoff_to(node_ref.header());
+
+        let task_ref = unsafe { H::from_concrete(node_ptr) };
+        enqueue_fn(self.context.shared(), worker_id, task_ref);
+
+        JoinHandle::new_direct(
+            self,
+            task_ref,
+            node_ref,
+            Some(|arena, gate| unsafe {
+                let layout = Layout::new::<GenericTaskNode<H::Storage, T, F>>();
+                arena.drop_object_raw(gate as *const dyn TaskJoinGate<T> as *mut u8, layout);
+            }),
+        )
+    }
 }
 
 impl<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra> Drop
@@ -259,21 +299,11 @@ impl<'rt, 'scope, TExtra> GenericAsyncScope<'rt, 'scope, AtomicStorage, ArcOwner
             "worker_id {} is out of bounds",
             worker_id
         );
-        let mut guard: ScopeTaskGuard<AtomicStorage, ArcOwnership> =
-            ScopeTaskGuard::new(&self.completion);
-
-        let task_ref = unsafe { SendTaskRef::from_concrete(task as *const S_) };
         unsafe {
-            task_ref.header().initialize(
-                &self.context.shared().base,
-                worker_id,
-                self.scope_completion_ref(),
-            );
+            self.spawn_task_impl(worker_id, task, |runtime, worker_id, task_ref| {
+                runtime.enqueue_send(worker_id, task_ref);
+            })
         }
-        guard.handoff_to(task_ref.header());
-        self.context.shared().enqueue_send(worker_id, task_ref);
-
-        JoinHandle::new_direct(self, task_ref, task, None)
     }
 
     pub fn spawn_to<'scope_ref, T: Send, S_>(
@@ -356,38 +386,11 @@ impl<'rt, 'scope, TExtra> GenericAsyncScope<'rt, 'scope, AtomicStorage, ArcOwner
             "worker_id {} is out of bounds",
             worker_id
         );
-        let scope_ref = self.scope_completion_ref();
-        let mut guard: ScopeTaskGuard<AtomicStorage, ArcOwnership> =
-            ScopeTaskGuard::new(&self.completion);
-        let node = SendBoxedTaskNode::new(future);
         unsafe {
-            node.header
-                .initialize(&self.context.shared().base, worker_id, scope_ref);
+            self.spawn_boxed_impl(worker_id, future, |runtime, worker_id, task_ref| {
+                runtime.enqueue_send(worker_id, task_ref);
+            })
         }
-        let layout = Layout::new::<SendBoxedTaskNode<T, F>>();
-        let node_ptr = unsafe {
-            self.arena.alloc::<SendBoxedTaskNode<T, F>>(
-                layout,
-                Some(|ptr| drop_in_place(ptr as *mut SendBoxedTaskNode<T, F>)),
-            ) as *mut SendBoxedTaskNode<T, F>
-        };
-        unsafe { write(node_ptr, node) };
-
-        let node_ref = unsafe { &*node_ptr };
-        guard.handoff_to(node_ref.header());
-
-        let task_ref = unsafe { SendTaskRef::from_concrete(node_ptr) };
-        self.context.shared().enqueue_send(worker_id, task_ref);
-
-        JoinHandle::new_direct(
-            self,
-            task_ref,
-            node_ref,
-            Some(|arena, gate| unsafe {
-                let layout = Layout::new::<SendBoxedTaskNode<T, F>>();
-                arena.drop_object_raw(gate as *const dyn TaskJoinGate<T> as *mut u8, layout);
-            }),
-        )
     }
 
     pub fn spawn_boxed_to<'scope_ref, T: Send, F>(
