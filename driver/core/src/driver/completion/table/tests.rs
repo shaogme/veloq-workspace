@@ -51,8 +51,11 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
     fn handle_control(
         &mut self,
         _control: CompletionControl,
-    ) -> CompletionHookOutcome<DummySlotSpec, Self::BackendEffect> {
-        CompletionHookOutcome::Ignore { effect: () }
+    ) -> crate::driver::HookResult<
+        DummySlotSpec,
+        CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>,
+    > {
+        Ok(CompletionHookOutcome::Ignore { effect: () })
     }
 
     fn complete_waiting(
@@ -60,7 +63,10 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
         event: UserCompletionEvent,
         slot: slot::Slot<'_, slot::InFlightWaiting, DummySlotSpec>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<DummySlotSpec, Self::BackendEffect> {
+    ) -> crate::driver::HookResult<
+        DummySlotSpec,
+        CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>,
+    > {
         if let Some(loss_reason) = self.loss_reason.take() {
             let snapshot = slot.snapshot();
             let mut completed = slot.complete();
@@ -68,25 +74,25 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
             let (payload, detail) = completed.take_completion_data();
             let _ = payload;
             drop(detail);
-            return CompletionHookOutcome::Lost {
+            return Ok(CompletionHookOutcome::Lost {
                 event,
                 loss_reason,
                 snapshot,
                 cleanup: self.cleanup.take().unwrap_or_default(),
                 effect: (),
-            };
+            });
         }
 
         let mut completed = slot.complete();
         let _ = completed.take_op();
         let (payload, detail) = completed.take_completion_data();
-        CompletionHookOutcome::User {
+        Ok(CompletionHookOutcome::User {
             event,
             payload: payload.expect("test slot payload should exist"),
             detail,
             cleanup: self.cleanup.take().unwrap_or_default(),
             effect: (),
-        }
+        })
     }
 
     fn complete_orphaned(
@@ -94,16 +100,19 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
         _event: UserCompletionEvent,
         slot: slot::Slot<'_, slot::InFlightOrphaned, DummySlotSpec>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<DummySlotSpec, Self::BackendEffect> {
+    ) -> crate::driver::HookResult<
+        DummySlotSpec,
+        CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>,
+    > {
         let mut completed = slot.complete();
         let _ = completed.take_op();
         let (payload, detail) = completed.take_completion_data();
         let _ = payload;
         drop(detail);
-        CompletionHookOutcome::Cleanup {
+        Ok(CompletionHookOutcome::Cleanup {
             cleanup: self.cleanup.take().unwrap_or_default(),
             effect: (),
-        }
+        })
     }
 
     fn complete_corrupt(
@@ -111,26 +120,29 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
         event: UserCompletionEvent,
         anomaly: CompletionAnomaly,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<DummySlotSpec, Self::BackendEffect> {
+    ) -> crate::driver::HookResult<
+        DummySlotSpec,
+        CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>,
+    > {
         let Some(snapshot) = anomaly.slot_snapshot else {
-            return CompletionHookOutcome::Anomaly {
+            return Ok(CompletionHookOutcome::Anomaly {
                 anomaly,
                 effect: (),
-            };
+            });
         };
-        CompletionHookOutcome::Lost {
+        Ok(CompletionHookOutcome::Lost {
             event,
             loss_reason: self.loss_reason.take().unwrap_or(anomaly),
             snapshot,
             cleanup: self.cleanup.take().unwrap_or_default(),
             effect: (),
-        }
+        })
     }
 
     fn finish_backend_effect(
         &mut self,
         _effect: Self::BackendEffect,
-    ) -> crate::DriverResult<(), ()> {
+    ) -> crate::driver::HookResult<DummySlotSpec, ()> {
         Ok(())
     }
 }

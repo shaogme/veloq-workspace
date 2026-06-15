@@ -12,6 +12,8 @@ use super::{
     unknown_completion_anomaly,
 };
 
+pub type HookResult<Spec, T> = DriverResult<T, slot::SlotError<Spec>>;
+
 #[derive(Debug, Clone, Copy)]
 pub struct CompletionWritePermit {
     _private: (),
@@ -115,47 +117,46 @@ where
     fn handle_control(
         &mut self,
         control: CompletionControl,
-    ) -> CompletionHookOutcome<Spec, Self::BackendEffect>;
+    ) -> HookResult<Spec, CompletionHookOutcome<Spec, Self::BackendEffect>>;
 
     fn complete_waiting(
         &mut self,
         event: UserCompletionEvent,
         slot: slot::Slot<'_, slot::InFlightWaiting, Spec>,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<Spec, Self::BackendEffect>;
+    ) -> HookResult<Spec, CompletionHookOutcome<Spec, Self::BackendEffect>>;
 
     fn complete_orphaned(
         &mut self,
         event: UserCompletionEvent,
         slot: slot::Slot<'_, slot::InFlightOrphaned, Spec>,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<Spec, Self::BackendEffect>;
+    ) -> HookResult<Spec, CompletionHookOutcome<Spec, Self::BackendEffect>>;
 
     fn complete_corrupt(
         &mut self,
         _event: UserCompletionEvent,
         anomaly: CompletionAnomaly,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<Spec, Self::BackendEffect> {
-        CompletionHookOutcome::Anomaly {
+    ) -> HookResult<Spec, CompletionHookOutcome<Spec, Self::BackendEffect>> {
+        Ok(CompletionHookOutcome::Anomaly {
             anomaly,
             effect: Self::BackendEffect::default(),
-        }
+        })
     }
 
     fn complete_backend_ingress(
         &mut self,
         _ingress: &Self::BackendIngress,
-    ) -> CompletionBackendIngressAction<Spec, Self::BackendEffect> {
-        CompletionBackendIngressAction::Finish(CompletionHookOutcome::Ignore {
-            effect: Self::BackendEffect::default(),
-        })
+    ) -> HookResult<Spec, CompletionBackendIngressAction<Spec, Self::BackendEffect>> {
+        Ok(CompletionBackendIngressAction::Finish(
+            CompletionHookOutcome::Ignore {
+                effect: Self::BackendEffect::default(),
+            },
+        ))
     }
 
-    fn finish_backend_effect(
-        &mut self,
-        effect: Self::BackendEffect,
-    ) -> DriverResult<(), slot::SlotError<Spec>>;
+    fn finish_backend_effect(&mut self, effect: Self::BackendEffect) -> HookResult<Spec, ()>;
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -307,11 +308,11 @@ where
                     CompletionSource::Kernel,
                 ),
                 CompletionDispatch::Waker { id, raw } => {
-                    let outcome = hooks.handle_control(CompletionControl::Waker { id, raw });
+                    let outcome = hooks.handle_control(CompletionControl::Waker { id, raw })?;
                     finish_hook_outcome(self, table, diagnostics, hooks, outcome, None)
                 }
                 CompletionDispatch::Cancel { id, raw } => {
-                    let outcome = hooks.handle_control(CompletionControl::Cancel { id, raw });
+                    let outcome = hooks.handle_control(CompletionControl::Cancel { id, raw })?;
                     finish_hook_outcome(self, table, diagnostics, hooks, outcome, None)
                 }
                 CompletionDispatch::Unknown { envelope } => {
@@ -330,18 +331,20 @@ where
                 event,
                 CompletionSource::Synthetic(source),
             ),
-            CompletionIngress::Backend(backend) => match hooks.complete_backend_ingress(&backend) {
-                CompletionBackendIngressAction::RouteUser(event) => self.accept_user_event(
-                    table,
-                    diagnostics,
-                    hooks,
-                    event,
-                    CompletionSource::Backend(&backend),
-                ),
-                CompletionBackendIngressAction::Finish(outcome) => {
-                    finish_hook_outcome(self, table, diagnostics, hooks, outcome, None)
+            CompletionIngress::Backend(backend) => {
+                match hooks.complete_backend_ingress(&backend)? {
+                    CompletionBackendIngressAction::RouteUser(event) => self.accept_user_event(
+                        table,
+                        diagnostics,
+                        hooks,
+                        event,
+                        CompletionSource::Backend(&backend),
+                    ),
+                    CompletionBackendIngressAction::Finish(outcome) => {
+                        finish_hook_outcome(self, table, diagnostics, hooks, outcome, None)
+                    }
                 }
-            },
+            }
             CompletionIngress::Anomaly(anomaly) => Ok(finish_anomaly(self, diagnostics, anomaly)),
         }
     }
@@ -385,7 +388,7 @@ where
         let token = event.token();
         match route_user_completion(event, self.checked_slot_view(token)) {
             RoutedSlotCompletion::Waiting(slot) => {
-                let outcome = hooks.complete_waiting(event, slot, source);
+                let outcome = hooks.complete_waiting(event, slot, source)?;
                 finish_hook_outcome(
                     self,
                     table,
@@ -396,7 +399,7 @@ where
                 )
             }
             RoutedSlotCompletion::Orphaned(slot) => {
-                let outcome = hooks.complete_orphaned(event, slot, source);
+                let outcome = hooks.complete_orphaned(event, slot, source)?;
                 finish_hook_outcome(
                     self,
                     table,
@@ -407,7 +410,7 @@ where
                 )
             }
             RoutedSlotCompletion::Corrupt(anomaly) => {
-                let outcome = hooks.complete_corrupt(event, anomaly, source);
+                let outcome = hooks.complete_corrupt(event, anomaly, source)?;
                 finish_hook_outcome(
                     self,
                     table,
@@ -420,7 +423,7 @@ where
             RoutedSlotCompletion::Missing(anomaly)
             | RoutedSlotCompletion::Empty(anomaly)
             | RoutedSlotCompletion::Stale(anomaly) => {
-                let outcome = hooks.complete_corrupt(event, anomaly, source);
+                let outcome = hooks.complete_corrupt(event, anomaly, source)?;
                 finish_hook_outcome(self, table, diagnostics, hooks, outcome, None)
             }
         }

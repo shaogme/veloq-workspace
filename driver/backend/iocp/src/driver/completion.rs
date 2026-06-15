@@ -104,8 +104,9 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
     fn handle_control(
         &mut self,
         control: CompletionControl,
-    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
-        match control {
+    ) -> crate::error::IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>>
+    {
+        Ok(match control {
             CompletionControl::Waker { raw, .. } => {
                 if raw.res >= 0 {
                     self.diagnostics.backend().inc_waker_ok();
@@ -127,7 +128,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
                     effect: IocpBackendEffect::None,
                 }
             }
-        }
+        })
     }
 
     fn complete_waiting(
@@ -135,8 +136,9 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
         event: UserCompletionEvent,
         mut slot: Slot<'_, InFlightWaiting>,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
-        match source {
+    ) -> crate::error::IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>>
+    {
+        Ok(match source {
             CompletionSource::Synthetic(SyntheticCompletionSource::Timer) => {
                 complete_timer_waiting_slot(slot, event)
             }
@@ -155,7 +157,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
                 let socket_inflight = take_socket_inflight_from_slot(&mut slot);
                 complete_iocp_waiting_slot(slot, event, io_result, socket_inflight)
             }
-        }
+        })
     }
 
     fn complete_orphaned(
@@ -163,14 +165,15 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
         event: UserCompletionEvent,
         slot: Slot<'_, InFlightOrphaned>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
+    ) -> crate::error::IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>>
+    {
         let (cleanup, socket_inflight) = complete_iocp_orphaned_slot(slot, event.res());
-        CompletionHookOutcome::Cleanup {
+        Ok(CompletionHookOutcome::Cleanup {
             cleanup,
             effect: socket_inflight
                 .map(IocpBackendEffect::SocketInflight)
                 .unwrap_or_default(),
-        }
+        })
     }
 
     fn finish_backend_effect(&mut self, effect: Self::BackendEffect) -> IocpResult<()> {

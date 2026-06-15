@@ -219,13 +219,14 @@ impl CompletionBackendHooks<crate::op::UringSlotSpec> for UringCompletionHooks<'
     fn handle_control(
         &mut self,
         control: CompletionControl,
-    ) -> CompletionHookOutcome<crate::op::UringSlotSpec, Self::BackendEffect> {
-        match control {
+    ) -> UringDriverResult<CompletionHookOutcome<crate::op::UringSlotSpec, Self::BackendEffect>>
+    {
+        Ok(match control {
             CompletionControl::Waker { raw, .. } => CompletionHookOutcome::ControlHandled {
                 effect: self.handle_waker_control(raw),
             },
             CompletionControl::Cancel { id, raw } => self.handle_cancel_control(id, raw),
-        }
+        })
     }
 
     fn complete_waiting(
@@ -233,8 +234,9 @@ impl CompletionBackendHooks<crate::op::UringSlotSpec> for UringCompletionHooks<'
         event: UserCompletionEvent,
         slot: Slot<'_, InFlightWaiting>,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<crate::op::UringSlotSpec, Self::BackendEffect> {
-        match source {
+    ) -> UringDriverResult<CompletionHookOutcome<crate::op::UringSlotSpec, Self::BackendEffect>>
+    {
+        Ok(match source {
             CompletionSource::Synthetic(SyntheticCompletionSource::Timer) => {
                 complete_timer_waiting_slot(slot, event)
             }
@@ -251,7 +253,7 @@ impl CompletionBackendHooks<crate::op::UringSlotSpec> for UringCompletionHooks<'
             CompletionSource::Kernel | CompletionSource::User | CompletionSource::Backend(_) => {
                 complete_kernel_waiting_slot(slot, event.token(), event.raw())
             }
-        }
+        })
     }
 
     fn complete_orphaned(
@@ -259,7 +261,8 @@ impl CompletionBackendHooks<crate::op::UringSlotSpec> for UringCompletionHooks<'
         event: UserCompletionEvent,
         slot: Slot<'_, InFlightOrphaned>,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<crate::op::UringSlotSpec, Self::BackendEffect> {
+    ) -> UringDriverResult<CompletionHookOutcome<crate::op::UringSlotSpec, Self::BackendEffect>>
+    {
         let res = match source {
             CompletionSource::Synthetic(SyntheticCompletionSource::Timer) => 0,
             CompletionSource::Synthetic(SyntheticCompletionSource::Cancel) => event.res(),
@@ -269,10 +272,10 @@ impl CompletionBackendHooks<crate::op::UringSlotSpec> for UringCompletionHooks<'
             | CompletionSource::Backend(_) => event.raw().res,
         };
         let cleanup = cleanup_orphaned_slot(slot, res);
-        CompletionHookOutcome::Cleanup {
+        Ok(CompletionHookOutcome::Cleanup {
             cleanup,
             effect: UringBackendEffect::None,
-        }
+        })
     }
 
     fn finish_backend_effect(&mut self, effect: Self::BackendEffect) -> UringResult<()> {

@@ -21,7 +21,7 @@ pub use event::{
 pub use flow::{
     CompletionBackendHooks, CompletionBackendIngressAction, CompletionControl, CompletionFlowExt,
     CompletionFlowOutcome, CompletionHookOutcome, CompletionIngress, CompletionSource,
-    CompletionWritePermit, SyntheticCompletionSource,
+    CompletionWritePermit, HookResult, SyntheticCompletionSource,
 };
 pub use packet::{
     CompletionInput, CompletionLoss, CompletionPacket, CompletionRecord, UserCompletion,

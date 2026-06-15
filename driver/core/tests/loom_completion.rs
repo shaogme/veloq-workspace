@@ -32,8 +32,11 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
     fn handle_control(
         &mut self,
         _control: CompletionControl,
-    ) -> CompletionHookOutcome<DummySlotSpec, Self::BackendEffect> {
-        CompletionHookOutcome::Ignore { effect: () }
+    ) -> veloq_driver_core::driver::HookResult<
+        DummySlotSpec,
+        CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>,
+    > {
+        Ok(CompletionHookOutcome::Ignore { effect: () })
     }
 
     fn complete_waiting(
@@ -45,17 +48,20 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
             DummySlotSpec,
         >,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<DummySlotSpec, Self::BackendEffect> {
+    ) -> veloq_driver_core::driver::HookResult<
+        DummySlotSpec,
+        CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>,
+    > {
         let mut completed = slot.complete();
         let _ = completed.take_op();
         let (payload, detail) = completed.take_completion_data();
-        CompletionHookOutcome::User {
+        Ok(CompletionHookOutcome::User {
             event,
             payload: payload.expect("loom test payload should exist"),
             detail,
             cleanup: CompletionCleanupGuard::default(),
             effect: (),
-        }
+        })
     }
 
     fn complete_orphaned(
@@ -67,22 +73,25 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
             DummySlotSpec,
         >,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<DummySlotSpec, Self::BackendEffect> {
+    ) -> veloq_driver_core::driver::HookResult<
+        DummySlotSpec,
+        CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>,
+    > {
         let mut completed = slot.complete();
         let _ = completed.take_op();
         let (payload, detail) = completed.take_completion_data();
         let _ = payload;
         drop(detail);
-        CompletionHookOutcome::Cleanup {
+        Ok(CompletionHookOutcome::Cleanup {
             cleanup: CompletionCleanupGuard::default(),
             effect: (),
-        }
+        })
     }
 
     fn finish_backend_effect(
         &mut self,
         _effect: Self::BackendEffect,
-    ) -> veloq_driver_core::DriverResult<(), ()> {
+    ) -> veloq_driver_core::driver::HookResult<DummySlotSpec, ()> {
         Ok(())
     }
 }

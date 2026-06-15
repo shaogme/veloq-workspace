@@ -128,10 +128,11 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
     fn handle_control(
         &mut self,
         _control: CompletionControl,
-    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
-        CompletionHookOutcome::Ignore {
+    ) -> crate::error::IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>>
+    {
+        Ok(CompletionHookOutcome::Ignore {
             effect: RioBackendEffect::default(),
-        }
+        })
     }
 
     fn complete_waiting(
@@ -139,9 +140,10 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
         event: UserCompletionEvent,
         slot: crate::op::Slot<'_, InFlightWaiting>,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
+    ) -> crate::error::IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>>
+    {
         let CompletionSource::Backend(ingress) = source else {
-            return CompletionHookOutcome::Anomaly {
+            return Ok(CompletionHookOutcome::Anomaly {
                 anomaly: CompletionAnomaly::backend_invariant_broken(
                     event.completion_token(),
                     event.token().index(),
@@ -150,9 +152,15 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
                 )
                 .with_raw_completion(event.raw()),
                 effect: RioBackendEffect::default(),
-            };
+            });
         };
-        complete_rio_waiting_slot(self.registry, self.ext, slot, event, ingress)
+        Ok(complete_rio_waiting_slot(
+            self.registry,
+            self.ext,
+            slot,
+            event,
+            ingress,
+        ))
     }
 
     fn complete_orphaned(
@@ -160,13 +168,14 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
         event: UserCompletionEvent,
         slot: crate::op::Slot<'_, InFlightOrphaned>,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
+    ) -> crate::error::IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>>
+    {
         let CompletionSource::Backend(ingress) = source else {
-            return CompletionHookOutcome::Ignore {
+            return Ok(CompletionHookOutcome::Ignore {
                 effect: RioBackendEffect::default(),
-            };
+            });
         };
-        complete_rio_orphaned_slot(slot, event, ingress)
+        Ok(complete_rio_orphaned_slot(slot, event, ingress))
     }
 
     fn complete_corrupt(
@@ -174,25 +183,30 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
         _event: UserCompletionEvent,
         anomaly: CompletionAnomaly,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
+    ) -> crate::error::IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>>
+    {
         let effect = match source {
             CompletionSource::Backend(ingress) => RioBackendEffect::from_init(&ingress.init),
             CompletionSource::Kernel | CompletionSource::User | CompletionSource::Synthetic(_) => {
                 RioBackendEffect::default()
             }
         };
-        CompletionHookOutcome::Anomaly { anomaly, effect }
+        Ok(CompletionHookOutcome::Anomaly { anomaly, effect })
     }
 
     fn complete_backend_ingress(
         &mut self,
         ingress: &Self::BackendIngress,
-    ) -> CompletionBackendIngressAction<IocpSlotSpec, Self::BackendEffect> {
-        CompletionBackendIngressAction::RouteUser(UserCompletionEvent::from_parts(
-            crate::driver::completion::COMP_BACKEND_RIO,
-            ingress.init.token,
-            ingress.result.raw_res(),
-            0,
+    ) -> crate::error::IocpDriverResult<
+        CompletionBackendIngressAction<IocpSlotSpec, Self::BackendEffect>,
+    > {
+        Ok(CompletionBackendIngressAction::RouteUser(
+            UserCompletionEvent::from_parts(
+                crate::driver::completion::COMP_BACKEND_RIO,
+                ingress.init.token,
+                ingress.result.raw_res(),
+                0,
+            ),
         ))
     }
 

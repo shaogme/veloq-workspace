@@ -66,8 +66,9 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
     fn handle_control(
         &mut self,
         _control: CompletionControl,
-    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
-        CompletionHookOutcome::Ignore { effect: () }
+    ) -> crate::error::IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>>
+    {
+        Ok(CompletionHookOutcome::Ignore { effect: () })
     }
 
     fn complete_waiting(
@@ -75,7 +76,8 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
         event: UserCompletionEvent,
         slot: Slot<'_, InFlightWaiting>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
+    ) -> crate::error::IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>>
+    {
         let event_res = event.res();
         let snapshot = slot.snapshot();
         let mut guard = slot.complete();
@@ -92,9 +94,17 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
             .unwrap_or_default();
         let _ = guard.take_op();
         let (payload, detail) = guard.take_completion_data();
-        let Some(payload) = payload else {
+        Ok(if let Some(payload) = payload {
+            CompletionHookOutcome::User {
+                event,
+                payload,
+                detail,
+                cleanup,
+                effect: (),
+            }
+        } else {
             drop(detail);
-            return CompletionHookOutcome::Lost {
+            CompletionHookOutcome::Lost {
                 event,
                 loss_reason: CompletionAnomaly::corrupt_slot_snapshot(
                     event.completion_token(),
@@ -104,15 +114,8 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
                 snapshot,
                 cleanup,
                 effect: (),
-            };
-        };
-        CompletionHookOutcome::User {
-            event,
-            payload,
-            detail,
-            cleanup,
-            effect: (),
-        }
+            }
+        })
     }
 
     fn complete_orphaned(
@@ -120,17 +123,18 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
         _event: UserCompletionEvent,
         slot: Slot<'_, InFlightOrphaned>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
+    ) -> crate::error::IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>>
+    {
         let mut guard = slot.complete();
         let cleanup = guard
             .with_op_mut(|op| op.orphan_cleanup(&Err(IocpError::Submission.to_report())))
             .unwrap_or_default();
         let _ = guard.take_op();
         let _ = guard.take_completion_data();
-        CompletionHookOutcome::Cleanup {
+        Ok(CompletionHookOutcome::Cleanup {
             cleanup,
             effect: (),
-        }
+        })
     }
 
     fn finish_backend_effect(&mut self, _effect: Self::BackendEffect) -> IocpResult<()> {
