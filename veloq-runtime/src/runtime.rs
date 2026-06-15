@@ -21,9 +21,8 @@ pub mod context;
 pub mod primitives;
 pub mod shared;
 
-pub use context::{
-    IdleDecision, IdleHook, IdleWaitStrategy, RuntimeContext, RuntimeScopeContext, WorkerTickHook,
-};
+pub use context::{IdleDecision, IdleWaitStrategy, RuntimeScopeContext};
+pub(crate) use context::{IdleHook, RuntimeContext, WorkerTickHook};
 pub use primitives::GenericCancellationToken;
 pub use shared::{EnqueuePinnedOutcome, RuntimeShared, RuntimeSharedBase};
 
@@ -124,8 +123,9 @@ impl<T, WF> Runtime<T, WF> {
                         shared_ref
                             .extra_tls
                             .set_owned(worker_factory_ref(worker_id, shared_ref))
-                            .map_err(|source| {
-                                RuntimeError::TlsSetOwnedFailed { worker_id, source }
+                            .map_err(|source| RuntimeError::TlsSetOwnedFailed {
+                                worker_id,
+                                source,
                             })?;
                         Ok(())
                     })();
@@ -214,14 +214,13 @@ impl<T, WF> Runtime<T, WF> {
                 }
             };
 
-            if block_res.is_ok() {
-                if let Some(err) = thread_errors
+            if block_res.is_ok()
+                && let Some(err) = thread_errors
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .take()
-                {
-                    return Err(err);
-                }
+            {
+                return Err(err);
             }
 
             block_res

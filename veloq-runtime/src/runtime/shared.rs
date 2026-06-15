@@ -206,7 +206,7 @@ impl RuntimeSharedBase {
     }
 
     #[inline]
-    pub fn validate_worker_id(&self, worker_id: usize) -> Result<()> {
+    pub(crate) fn validate_worker_id(&self, worker_id: usize) -> Result<()> {
         let worker_count = self.worker_count().get();
         if worker_id < worker_count {
             return Ok(());
@@ -229,7 +229,7 @@ impl RuntimeSharedBase {
     }
 
     /// 将本地任务入队当前线程的本地队列。
-    pub fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef) {
+    pub(crate) fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef) {
         if task.header().is_completed() {
             return;
         }
@@ -275,7 +275,7 @@ impl RuntimeSharedBase {
     }
 
     #[inline]
-    pub fn wake_worker(&self, worker_id: usize) {
+    pub(crate) fn wake_worker(&self, worker_id: usize) {
         self.registry.unpark(worker_id);
     }
 
@@ -334,14 +334,14 @@ impl RuntimeSharedBase {
         }
     }
 
-    pub fn shutdown(&self) {
+    pub(crate) fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
         for i in 0..self.registry.unparkers.len() {
             self.registry.unpark(i);
         }
     }
 
-    pub fn enqueue_send(&self, worker_id: usize, task: SendTaskRef) {
+    pub(crate) fn enqueue_send(&self, worker_id: usize, task: SendTaskRef) {
         self.assert_worker_id(worker_id);
         if task.header().is_completed() {
             return;
@@ -373,7 +373,7 @@ impl<T> RuntimeShared<T> {
         self.base.unparkers()
     }
 
-    pub fn choose_worker(&self) -> usize {
+    pub(crate) fn choose_worker(&self) -> usize {
         let current = self
             .base
             .tls
@@ -394,7 +394,7 @@ impl<T> RuntimeShared<T> {
         self.base.validate_worker_id(worker_id)
     }
 
-    pub fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef) {
+    pub(crate) fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef) {
         self.base.enqueue_local(worker_id, task);
     }
 
@@ -412,11 +412,11 @@ impl<T> RuntimeShared<T> {
     }
 
     #[inline]
-    pub fn wake_worker(&self, worker_id: usize) {
+    pub(crate) fn wake_worker(&self, worker_id: usize) {
         self.base.wake_worker(worker_id)
     }
 
-    pub fn enqueue_send(&self, worker_id: usize, task: SendTaskRef) {
+    pub(crate) fn enqueue_send(&self, worker_id: usize, task: SendTaskRef) {
         self.base.assert_worker_id(worker_id);
         if task.header().is_completed() {
             return;
@@ -457,11 +457,11 @@ impl<T> RuntimeShared<T> {
         self.base.enqueue_send(worker_id, task);
     }
 
-    pub fn shutdown(&self) {
+    pub(crate) fn shutdown(&self) {
         self.base.shutdown();
     }
 
-    pub fn drive_worker<'a, S: ScopeStorage, O: Ownership + 'a>(
+    pub(crate) fn drive_worker<'a, S: ScopeStorage, O: Ownership + 'a>(
         &self,
         completion: Option<&O::Shared<GenericScopeCompletion<S, O>>>,
     ) {

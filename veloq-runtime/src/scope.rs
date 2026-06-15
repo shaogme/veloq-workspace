@@ -121,7 +121,10 @@ impl<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra> ScopeProvider
 impl<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra>
     GenericAsyncScope<'rt, 'scope, S, O, TExtra>
 {
-    pub fn new(context: RuntimeScopeContext<'rt, TExtra>, parent: Option<AnyScopeRef>) -> Self {
+    pub(crate) fn new(
+        context: RuntimeScopeContext<'rt, TExtra>,
+        parent: Option<AnyScopeRef>,
+    ) -> Self {
         let completion = GenericScopeCompletion::<S, O>::new(parent.clone());
 
         if let Some(ref parent) = parent {
@@ -192,7 +195,7 @@ impl<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra>
     }
 
     #[inline]
-    pub fn scope_completion_ref(&self) -> ScopeRef<S> {
+    pub(crate) fn scope_completion_ref(&self) -> ScopeRef<S> {
         unsafe {
             let non_null = RawScope::clone_raw(&*self.completion);
             ScopeRef::new(non_null)

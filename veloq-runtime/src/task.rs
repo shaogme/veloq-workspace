@@ -4,10 +4,9 @@ mod nodes;
 mod scope;
 
 pub use arena::{Arena, GenericArena};
+pub(crate) use header::GenericWakerNode;
 pub use header::{
-    GenericTaskHeader, GenericWakerNode, INTRUSIVE_WAKER_VTABLE, LOCAL_INTRUSIVE_WAKER_VTABLE,
-    PollStatus, STATE_CANCELLED, STATE_COMPLETED, STATE_POLLING, STATE_QUEUED, STATE_READY,
-    STATE_WOKEN, TaskVTable,
+    GenericTaskHeader, INTRUSIVE_WAKER_VTABLE, LOCAL_INTRUSIVE_WAKER_VTABLE, PollStatus, TaskVTable,
 };
 pub(crate) use nodes::{GenericTaskNode, TaskBounds, TaskStorage};
 pub use nodes::{LocalBoxedTaskNode, LocalTaskNode, SendBoxedTaskNode, SendTaskNode};

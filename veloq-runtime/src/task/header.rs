@@ -22,15 +22,15 @@ use veloq_storage::{
     ThreadSafeStorage,
 };
 
-pub const STATE_COMPLETED: usize = 1 << 0;
-pub const STATE_QUEUED: usize = 1 << 1;
-pub const STATE_READY: usize = 1 << 2;
-pub const STATE_CANCELLED: usize = 1 << 3;
-pub const STATE_POLLING: usize = 1 << 4;
-pub const STATE_WOKEN: usize = 1 << 5;
-pub const STATE_PINNED: usize = 1 << 6;
-pub const STATE_SCOPE_OBLIGATED: usize = 1 << 7;
-pub const STATE_SCOPE_ACKED: usize = 1 << 8;
+pub(crate) const STATE_COMPLETED: usize = 1 << 0;
+pub(crate) const STATE_QUEUED: usize = 1 << 1;
+pub(crate) const STATE_READY: usize = 1 << 2;
+pub(crate) const STATE_CANCELLED: usize = 1 << 3;
+pub(crate) const STATE_POLLING: usize = 1 << 4;
+pub(crate) const STATE_WOKEN: usize = 1 << 5;
+pub(crate) const STATE_PINNED: usize = 1 << 6;
+pub(crate) const STATE_SCOPE_OBLIGATED: usize = 1 << 7;
+pub(crate) const STATE_SCOPE_ACKED: usize = 1 << 8;
 const WAKE_TOKEN_ALIVE: u32 = 1 << 0;
 const WAKE_TOKEN_ACTIVE_SHIFT: u32 = 1;
 const WAKE_TOKEN_ACTIVE_UNIT: u32 = 1 << WAKE_TOKEN_ACTIVE_SHIFT;
@@ -43,7 +43,7 @@ pub enum PollStatus {
     Complete,
 }
 
-pub struct TaskWakeToken<S: Storage> {
+pub(crate) struct TaskWakeToken<S: Storage> {
     state: AtomicU32,
     header: AtomicOptionPtr<GenericTaskHeader<S>>,
     marker: PhantomData<fn() -> S>,
@@ -54,7 +54,7 @@ struct TaskWakeGuard<'a, S: Storage> {
 }
 
 impl<S: Storage> TaskWakeToken<S> {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: AtomicU32::new(WAKE_TOKEN_ALIVE),
             header: AtomicOptionPtr::new(None),
@@ -63,7 +63,7 @@ impl<S: Storage> TaskWakeToken<S> {
     }
 
     #[inline]
-    pub fn bind_header(&self, header: NonNull<GenericTaskHeader<S>>) {
+    pub(crate) fn bind_header(&self, header: NonNull<GenericTaskHeader<S>>) {
         let header_ptr = Some(header);
         let current = self.header.load(Ordering::Acquire);
         debug_assert!(current.is_none() || current == header_ptr);
@@ -160,13 +160,13 @@ pub struct TaskVTable<S: Storage> {
     pub drop: unsafe fn(data: NonNull<GenericTaskHeader<S>>),
 }
 
-pub struct GenericWakerNode<S: Storage> {
+pub(crate) struct GenericWakerNode<S: Storage> {
     pub(crate) waker: Waker,
     pub(crate) link: Link,
     pub(crate) marker: PhantomData<S>,
 }
 
-intrusive_adapter!(pub WakerAdapter<S> = GenericWakerNode<S> { link: Link } where S: Storage);
+intrusive_adapter!(pub(crate) WakerAdapter<S> = GenericWakerNode<S> { link: Link } where S: Storage);
 
 pub struct GenericTaskHeader<S: Storage> {
     state: S::Usize,
@@ -196,7 +196,7 @@ impl<S: Storage> GenericTaskHeader<S> {
         this
     }
 
-    pub fn new_placeholder(vtable: &'static TaskVTable<S>) -> Self {
+    pub(crate) fn new_placeholder(vtable: &'static TaskVTable<S>) -> Self {
         Self {
             state: S::Usize::new(0),
             ref_count: S::Usize::new(1),
@@ -212,7 +212,7 @@ impl<S: Storage> GenericTaskHeader<S> {
     /// # Safety
     ///
     /// 必须保证该方法在任务被 enqueue 并发布给其他线程前被调用，且在生命周期内仅调用一次。
-    pub unsafe fn initialize(
+    pub(crate) unsafe fn initialize(
         &self,
         runtime: &RuntimeSharedBase,
         worker_id: usize,
@@ -226,12 +226,12 @@ impl<S: Storage> GenericTaskHeader<S> {
     }
 
     #[inline]
-    pub fn is_completed(&self) -> bool {
+    pub(crate) fn is_completed(&self) -> bool {
         self.state.load(Ordering::Acquire) & STATE_COMPLETED != 0
     }
 
     #[inline]
-    pub fn is_pinned(&self) -> bool {
+    pub(crate) fn is_pinned(&self) -> bool {
         self.state.load(Ordering::Acquire) & STATE_PINNED != 0
     }
 
@@ -241,7 +241,7 @@ impl<S: Storage> GenericTaskHeader<S> {
     }
 
     #[inline]
-    pub fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         if self.state.load(Ordering::Acquire) & STATE_CANCELLED != 0 {
             return true;
         }
@@ -249,12 +249,12 @@ impl<S: Storage> GenericTaskHeader<S> {
     }
 
     #[inline]
-    pub fn cancel(&self) {
+    pub(crate) fn cancel(&self) {
         self.state.fetch_or(STATE_CANCELLED, Ordering::Release);
     }
 
     #[inline]
-    pub fn try_mark_queued(&self) -> bool {
+    pub(crate) fn try_mark_queued(&self) -> bool {
         loop {
             let state = self.state.load(Ordering::Acquire);
             if state & STATE_QUEUED != 0 || state & STATE_COMPLETED != 0 {
@@ -277,7 +277,7 @@ impl<S: Storage> GenericTaskHeader<S> {
     }
 
     #[inline]
-    pub fn clear_queued(&self) -> bool {
+    pub(crate) fn clear_queued(&self) -> bool {
         let old_state = self.state.fetch_and(!STATE_QUEUED, Ordering::Release);
         if old_state & STATE_QUEUED != 0 && self.ref_count.fetch_sub(1, Ordering::AcqRel) == 1 {
             return true;
@@ -287,7 +287,7 @@ impl<S: Storage> GenericTaskHeader<S> {
 
     /// 尝试进入 Poll 状态。
     #[inline]
-    pub fn try_enter_poll(&self) -> PollStatus {
+    pub(crate) fn try_enter_poll(&self) -> PollStatus {
         let mut state = self.state.load(Ordering::Acquire);
         loop {
             if state & STATE_COMPLETED != 0 {
@@ -324,7 +324,7 @@ impl<S: Storage> GenericTaskHeader<S> {
 
     /// 退出 Poll 状态并检查是否需要重新进入。
     #[inline]
-    pub fn exit_poll_to_pending(&self) -> bool {
+    pub(crate) fn exit_poll_to_pending(&self) -> bool {
         let mut state = self.state.load(Ordering::Acquire);
         loop {
             let mut new_state = state & !STATE_POLLING;
@@ -348,7 +348,7 @@ impl<S: Storage> GenericTaskHeader<S> {
 
     /// 显式退出 Poll 状态，不检查唤醒标记。
     #[inline]
-    pub fn exit_poll(&self) {
+    pub(crate) fn exit_poll(&self) {
         self.state.fetch_and(!STATE_POLLING, Ordering::Release);
     }
 
@@ -356,7 +356,7 @@ impl<S: Storage> GenericTaskHeader<S> {
     ///
     /// The caller must ensure that the `node` remains valid and pinned at its current memory location
     /// until it is either woken or explicitly removed from the task's waker list.
-    pub unsafe fn register_completion(&self, node: Pin<&mut GenericWakerNode<S>>) {
+    pub(crate) unsafe fn register_completion(&self, node: Pin<&mut GenericWakerNode<S>>) {
         if self.is_completed() {
             node.waker.wake_by_ref();
             return;
@@ -395,11 +395,11 @@ impl<S: Storage> GenericTaskHeader<S> {
     }
 
     #[inline]
-    pub fn worker_id(&self) -> usize {
+    pub(crate) fn worker_id(&self) -> usize {
         self.worker_id.load(Ordering::Acquire)
     }
 
-    pub fn claim_scope_obligation(&self) {
+    pub(crate) fn claim_scope_obligation(&self) {
         let old = self.state.fetch_or(STATE_SCOPE_OBLIGATED, Ordering::AcqRel);
         debug_assert!(
             old & STATE_SCOPE_OBLIGATED == 0,
@@ -413,11 +413,11 @@ impl<S: Storage> GenericTaskHeader<S> {
     }
 
     #[inline]
-    pub fn is_scope_acknowledged(&self) -> bool {
+    pub(crate) fn is_scope_acknowledged(&self) -> bool {
         self.state.load(Ordering::Acquire) & STATE_SCOPE_ACKED != 0
     }
 
-    pub fn acknowledge_completion(&self) {
+    pub(crate) fn acknowledge_completion(&self) {
         let old = self.state.fetch_or(STATE_SCOPE_ACKED, Ordering::AcqRel);
         if old & STATE_SCOPE_ACKED != 0 {
             debug_assert!(false, "duplicate acknowledge_completion");
@@ -434,7 +434,7 @@ impl<S: Storage> GenericTaskHeader<S> {
         self.state.load(Ordering::Acquire) & STATE_READY != 0
     }
 
-    pub fn create_waker(&self, vtable: &'static RawWakerVTable) -> Waker {
+    pub(crate) fn create_waker(&self, vtable: &'static RawWakerVTable) -> Waker {
         self.wake_token.bind_header(NonNull::from(self));
         let data = Arc::into_raw(Arc::clone(&self.wake_token)) as *const ();
         unsafe { Waker::from_raw(RawWaker::new(data, vtable)) }
@@ -445,7 +445,7 @@ impl<S: Storage> GenericTaskHeader<S> {
     /// instance, and `vtable` must match the vtable used for its creation.
     /// When the underlying task has already been deactivated and physically dropped, this
     /// returns `None`.
-    pub unsafe fn from_waker<'a>(
+    pub(crate) unsafe fn from_waker<'a>(
         waker: &'a Waker,
         vtable: &'static RawWakerVTable,
     ) -> Option<&'a Self> {
@@ -458,17 +458,17 @@ impl<S: Storage> GenericTaskHeader<S> {
     }
 
     #[inline]
-    pub fn decrement_ref_count(&self) -> bool {
+    pub(crate) fn decrement_ref_count(&self) -> bool {
         self.ref_count.fetch_sub(1, Ordering::AcqRel) == 1
     }
 
     #[inline]
-    pub fn scope_completion_ref(&self) -> ScopeRef<S> {
+    pub(crate) fn scope_completion_ref(&self) -> ScopeRef<S> {
         unsafe { (*self.scope.get()).clone() }
     }
 
     #[inline]
-    pub fn runtime(&self) -> &RuntimeSharedBase {
+    pub(crate) fn runtime(&self) -> &RuntimeSharedBase {
         unsafe {
             (*self.runtime.get())
                 .expect("runtime not initialized")
@@ -477,7 +477,7 @@ impl<S: Storage> GenericTaskHeader<S> {
     }
 
     #[inline]
-    pub fn notify_runtime_active(&self) {
+    pub(crate) fn notify_runtime_active(&self) {
         let runtime = self.runtime();
         runtime.idle.event_count.notify();
         runtime.wake_worker(self.worker_id());
@@ -486,7 +486,7 @@ impl<S: Storage> GenericTaskHeader<S> {
     /// 唤醒任务（消耗所有权）。
     ///
     /// # Safety
-    /// `self_ptr` 必须是指向 `self` 的有效非空指针。
+    /// `self_ptr` 必须是指向 `self` 的有效 non-null 指针。
     #[inline]
     pub unsafe fn wake(self_ptr: NonNull<Self>) {
         let vtable = unsafe { self_ptr.as_ref().vtable };
@@ -495,7 +495,7 @@ impl<S: Storage> GenericTaskHeader<S> {
 
     /// 通过引用唤醒任务。
     #[inline]
-    pub fn wake_by_ref(&self) {
+    pub(crate) fn wake_by_ref(&self) {
         unsafe { (self.vtable.wake_by_ref)(self) };
     }
 
@@ -504,14 +504,14 @@ impl<S: Storage> GenericTaskHeader<S> {
     /// # Safety
     /// 调用者必须确保 `self` 处于可被 poll 的正确状态下。
     #[inline]
-    pub unsafe fn poll(&self, worker_id: usize) -> bool {
+    pub(crate) unsafe fn poll(&self, worker_id: usize) -> bool {
         unsafe { (self.vtable.poll)(self, worker_id) }
     }
 
     /// 释放任务。
     ///
     /// # Safety
-    /// `self_ptr` 必须是指向 `self` 且未被释放的有效非空指针。
+    /// `self_ptr` 必须是指向 `self` 且未被释放的有效 non-null 指针。
     #[inline]
     pub unsafe fn drop_task(self_ptr: NonNull<Self>) {
         let vtable = unsafe { self_ptr.as_ref().vtable };
@@ -521,8 +521,8 @@ impl<S: Storage> GenericTaskHeader<S> {
     /// 入队当前任务。
     ///
     /// # Safety
-    /// `self_ptr` 必须是指向 `self` 的有效非空指针。
-    pub unsafe fn enqueue_self(&self, self_ptr: NonNull<Self>)
+    /// `self_ptr` 必须是指向 `self` 的有效 non-null 指针。
+    pub(crate) unsafe fn enqueue_self(&self, self_ptr: NonNull<Self>)
     where
         S: TaskStorage,
     {
@@ -544,7 +544,7 @@ impl<S: Storage> GenericTaskHeader<S> {
     ///
     /// # Safety
     /// `node` 指向的节点必须是由 `register_completion` 注册的相同节点。
-    pub unsafe fn remove_waker(&self, node: NonNull<GenericWakerNode<S>>) {
+    pub(crate) unsafe fn remove_waker(&self, node: NonNull<GenericWakerNode<S>>) {
         if self.is_completed() {
             return;
         }

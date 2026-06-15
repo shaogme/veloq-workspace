@@ -69,7 +69,7 @@ pub type ScopeCompletion = GenericScopeCompletion<AtomicStorage, ArcOwnership>;
 pub type LocalScopeCompletion = GenericScopeCompletion<LocalStorage, RcOwnership>;
 
 impl<S: ScopeStorage, O: Ownership> GenericScopeCompletion<S, O> {
-    pub fn new(parent: Option<AnyScopeRef>) -> O::Shared<Self> {
+    pub(crate) fn new(parent: Option<AnyScopeRef>) -> O::Shared<Self> {
         let parent = S::Parent::from_any(parent);
         let cross_parent = if S::strategy_type() != StrategyType::Atomic
             || O::strategy_type() != StrategyType::Atomic
@@ -102,12 +102,12 @@ impl<S: ScopeStorage, O: Ownership> GenericScopeCompletion<S, O> {
         }
     }
 
-    pub fn cancel(&self) {
+    pub(crate) fn cancel(&self) {
         self.cancel_token.cancel();
         self.drain_wakers();
     }
 
-    pub fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         if self.cancel_token.is_cancelled() {
             return true;
         }
@@ -117,7 +117,7 @@ impl<S: ScopeStorage, O: Ownership> GenericScopeCompletion<S, O> {
         false
     }
 
-    pub fn cancel_token(&self) -> &GenericCancellationToken<S, O> {
+    pub(crate) fn cancel_token(&self) -> &GenericCancellationToken<S, O> {
         &self.cancel_token
     }
 
@@ -181,17 +181,17 @@ impl<S: ScopeStorage, O: Ownership> GenericScopeCompletion<S, O> {
         }
     }
 
-    pub fn is_done(&self) -> bool {
+    pub(crate) fn is_done(&self) -> bool {
         self.remaining.load(Ordering::Acquire) == 0
     }
 
-    pub fn report_panic(&self, payload: Box<dyn Any + Send + 'static>) {
+    pub(crate) fn report_panic(&self, payload: Box<dyn Any + Send + 'static>) {
         let _ = self
             .panic_info
             .compare_exchange_none(payload, Ordering::AcqRel, Ordering::Acquire);
     }
 
-    pub fn take_panic(&self) -> Option<Box<dyn Any + Send + 'static>> {
+    pub(crate) fn take_panic(&self) -> Option<Box<dyn Any + Send + 'static>> {
         self.panic_info.take(Ordering::AcqRel)
     }
 

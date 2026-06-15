@@ -90,7 +90,7 @@ impl IdleDecision {
     }
 }
 
-pub struct RuntimeContext {
+pub(crate) struct RuntimeContext {
     pub(crate) worker_id: usize,
     pub(crate) rand: FastRand,
     pub(crate) worker: Worker<SendTaskRef>,
@@ -131,7 +131,7 @@ impl<'rt, T> RuntimeScopeContext<'rt, T> {
     }
 
     /// Checks if the runtime is shutting down.
-    pub fn is_shutdown(&self) -> bool {
+    pub(crate) fn is_shutdown(&self) -> bool {
         self.shared().base.shutdown.load(Ordering::Acquire)
     }
 
@@ -297,10 +297,10 @@ impl<'rt, T> RuntimeScopeContext<'rt, T> {
     }
 }
 
-pub type IdleHook<T> = fn(&RuntimeShared<T>) -> IdleDecision;
-pub type WorkerTickHook = fn();
+pub(crate) type IdleHook<T> = fn(&RuntimeShared<T>) -> IdleDecision;
+pub(crate) type WorkerTickHook = fn();
 
-pub struct RouteCell<T> {
+pub(crate) struct RouteCell<T> {
     value: Mutex<Option<T>>,
     waker: AtomicWaker,
 }
