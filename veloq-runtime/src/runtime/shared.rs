@@ -336,8 +336,12 @@ impl RuntimeSharedBase {
             let worker = &self.registry.workers[worker_id];
             if worker.remote_tx.send(task).is_err() {
                 self.scheduler.injector.push(task);
+                let group_idx = self.topo.worker_to_group[worker_id];
+                self.idle
+                    .wake_idle_in_group(group_idx, &self.topo, &self.registry);
+            } else {
+                self.wake_worker(worker_id);
             }
-            self.wake_worker(worker_id);
         }
     }
 }

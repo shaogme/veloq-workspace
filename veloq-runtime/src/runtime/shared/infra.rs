@@ -131,6 +131,50 @@ impl IdleStack {
             }
         }
     }
+
+    /// 仅当栈顶为 `worker_id` 时弹出（`leave_idle` 快路径）。
+    pub(crate) fn try_pop_self(&self, worker_id: usize, next_ptrs: &[AtomicUsize]) -> bool {
+        let mut head = self.head.load(Ordering::Acquire);
+        loop {
+            if head == Self::EMPTY {
+                return false;
+            }
+            let top_id = (head & 0xFFFFFFFF) as usize;
+            if top_id != worker_id {
+                return false;
+            }
+            let next_id = next_ptrs[worker_id].load(Ordering::Acquire);
+            let new_head = if next_id == usize::MAX {
+                Self::EMPTY
+            } else {
+                let next_gen = (head >> 32) + 1;
+                (next_gen << 32) | (next_id as u64)
+            };
+            match self.head.compare_exchange_weak(
+                head,
+                new_head,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(h) => head = h,
+            }
+        }
+    }
+
+    /// 弹出仍标记为 idle 的 worker；跳过栈中已失效（stale）的条目。
+    pub(crate) fn pop_idle(
+        &self,
+        idle_mask: &AtomicBitset,
+        next_ptrs: &[AtomicUsize],
+    ) -> Option<usize> {
+        while let Some(worker_id) = self.pop(next_ptrs) {
+            if idle_mask.is_set(worker_id) {
+                return Some(worker_id);
+            }
+        }
+        None
+    }
 }
 
 pub(crate) struct AtomicBitset {
@@ -149,16 +193,24 @@ impl AtomicBitset {
         }
     }
 
-    pub(crate) fn set(&self, index: usize) {
+    pub(crate) fn try_set(&self, index: usize) -> bool {
         let word = index / 64;
         let bit = index % 64;
-        self.bits[word].fetch_or(1 << bit, Ordering::Release);
+        let mask = 1 << bit;
+        let prev = self.bits[word].fetch_or(mask, Ordering::AcqRel);
+        prev & mask == 0
     }
 
     pub(crate) fn clear(&self, index: usize) {
         let word = index / 64;
         let bit = index % 64;
         self.bits[word].fetch_and(!(1 << bit), Ordering::Release);
+    }
+
+    pub(crate) fn is_set(&self, index: usize) -> bool {
+        let word = index / 64;
+        let bit = index % 64;
+        self.bits[word].load(Ordering::Acquire) & (1 << bit) != 0
     }
 }
 
@@ -348,6 +400,29 @@ pub(crate) struct IdleController {
     pub(crate) event_count: EventCount,
 }
 
+impl IdleController {
+    /// 唤醒指定 NUMA 组内一个 idle worker；成功返回 true。
+    pub(crate) fn wake_idle_in_group(
+        &self,
+        group_idx: usize,
+        topo: &TopologyContext,
+        registry: &WorkerRegistry,
+    ) -> bool {
+        let group = &topo.groups[group_idx];
+        if let Some(worker_id) = group.idle_stack.pop_idle(&self.idle_mask, &topo.next_idle) {
+            registry.unpark(worker_id);
+            return true;
+        }
+        for &worker_id in &group.worker_ids {
+            if self.idle_mask.is_set(worker_id) {
+                registry.unpark(worker_id);
+                return true;
+            }
+        }
+        false
+    }
+}
+
 pub(crate) struct RuntimeProgressCoordinator<'a, T> {
     shared: &'a RuntimeShared<T>,
     worker_id: usize,
@@ -377,8 +452,9 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
         let group = &base.topo.groups[group_idx];
         let seq = base.idle.event_count.load();
 
-        base.idle.idle_mask.set(self.worker_id);
-        group.idle_stack.push(self.worker_id, &base.topo.next_idle);
+        if base.idle.idle_mask.try_set(self.worker_id) {
+            group.idle_stack.push(self.worker_id, &base.topo.next_idle);
+        }
 
         if self.should_retry(seq, completion) {
             self.leave_idle(group_idx);
@@ -430,9 +506,9 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
 
     fn leave_idle(&self, group_idx: usize) {
         let base = &self.shared.base;
-        let _ = base.topo.groups[group_idx]
-            .idle_stack
-            .pop(&base.topo.next_idle);
         base.idle.idle_mask.clear(self.worker_id);
+        base.topo.groups[group_idx]
+            .idle_stack
+            .try_pop_self(self.worker_id, &base.topo.next_idle);
     }
 }
