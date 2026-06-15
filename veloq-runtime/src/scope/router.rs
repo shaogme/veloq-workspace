@@ -153,6 +153,14 @@ impl<'scope_ref, T> RoutedSpawnState<'scope_ref, T> {
         self.cancel_requested.load(Ordering::Acquire)
     }
 
+    pub(crate) fn has_failed_outcome(&self) -> bool {
+        if let Some(raw) = self.outcome.load(Ordering::Acquire) {
+            unsafe { matches!(raw.as_ref(), RoutedSpawnOutcomeInner::Failed(_)) }
+        } else {
+            false
+        }
+    }
+
     fn set_outcome(&self, inner: RoutedSpawnOutcomeInner<'scope_ref, T>) {
         let boxed = Box::new(inner);
         let raw = NonNull::new(Box::into_raw(boxed)).unwrap();

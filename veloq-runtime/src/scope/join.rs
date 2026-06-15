@@ -3,7 +3,7 @@ use super::{
     router::{RoutedSpawnState, RoutedTaskAccess},
 };
 use crate::{
-    runtime::GenericCancellationToken,
+    runtime::{GenericCancellationToken, primitives::CancelledFuture},
     task::{
         Arena, GenericTaskHeader, GenericWakerNode, LocalTaskRef, SendTaskRef, TaskError,
         TaskHandleRef, TaskJoinGate,
@@ -39,6 +39,12 @@ pub(crate) enum JoinSource<'scope_ref, T, R: TaskHandleRef> {
     },
 }
 
+/// Join handle for a spawned child task.
+///
+/// As a `Future`, `await` waits until the task has **finished executing**, not merely
+/// until cancellation has been requested. If the task ends due to cancellation, the
+/// result is `Err(TaskError::Cancelled)`. For immediate notification when cancellation
+/// is requested, use [`JoinHandle::cancelled`].
 pub struct JoinHandle<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra> {
     pub(crate) source: JoinSource<'scope_ref, T, R>,
     pub(crate) scope: &'scope_ref S,
@@ -65,6 +71,12 @@ pub type LocalAsyncJoinHandle<'rt, 'scope_ref, T, TExtra> =
 impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
     JoinHandle<'scope_ref, T, R, S, TExtra>
 {
+    /// Requests cancellation of the task.
+    ///
+    /// This only signals cancellation; the task may continue running until it is
+    /// polled and observes the cancel state. Use `await` to wait until the task has
+    /// actually stopped, or [`JoinHandle::cancelled`] to be notified as soon as
+    /// cancellation has been requested.
     pub fn cancel(&self) {
         let mut cancel_slot = self.cancel_token.lock();
         if let Some(token) = cancel_slot.take() {
@@ -81,6 +93,42 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
                     resolved.task.header().cancel();
                 } else {
                     state.cancel_ready_task_if_any();
+                }
+            }
+        }
+    }
+
+    /// Completes when cancellation has been requested, without waiting for the
+    /// underlying task to finish executing.
+    ///
+    /// Use `await` if you need to wait until the task has actually stopped.
+    pub fn cancelled(&self) -> CancelledFuture<S::Storage, S::Ownership> {
+        self.cancel_token().cancelled()
+    }
+
+    /// Returns whether cancellation has been requested (the task may still be running).
+    pub fn is_cancel_requested(&self) -> bool {
+        match &self.source {
+            JoinSource::Direct { task, .. } => task.header().is_cancelled(),
+            JoinSource::Routed { state, resolved } => {
+                state.is_cancel_requested()
+                    || self.scope.completion().is_cancelled()
+                    || resolved
+                        .as_ref()
+                        .is_some_and(|r| r.task.header().is_cancelled())
+            }
+        }
+    }
+
+    /// Returns whether the task has fully completed (equivalent to `await` returning `Ready`).
+    pub fn is_finished(&self) -> bool {
+        match &self.source {
+            JoinSource::Direct { task, .. } => task.header().is_completed(),
+            JoinSource::Routed { state, resolved } => {
+                if let Some(res) = resolved {
+                    res.task.header().is_completed()
+                } else {
+                    state.has_failed_outcome()
                 }
             }
         }
@@ -207,7 +255,6 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TEx
             .drive_worker::<S::Storage, S::Ownership>(Some(this.scope.completion()));
 
         let arena = this.scope.arena();
-        let completion = this.scope.completion();
         let waker_node = &mut this.waker_node;
         let reclaim = this.reclaim;
 
@@ -224,10 +271,6 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TEx
                     return Poll::Ready(res);
                 }
 
-                if completion.is_cancelled() || header.is_cancelled() {
-                    return Poll::Ready(Err(TaskError::Cancelled));
-                }
-
                 Self::register_waker_on::<R::Storage>(waker_node, arena, header, cx);
                 Poll::Pending
             }
@@ -241,10 +284,6 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TEx
                             let output = access.take_result();
                             access.reclaim(arena);
                             return Poll::Ready(output);
-                        }
-
-                        if completion.is_cancelled() || header.is_cancelled() {
-                            return Poll::Ready(Err(TaskError::Cancelled));
                         }
 
                         Self::register_waker_on::<R::Storage>(waker_node, arena, header, cx);

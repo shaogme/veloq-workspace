@@ -76,6 +76,7 @@ fn main() {
                 yield_now().await;
                 println!("    >> 正在手动取消任务...");
                 h1.cancel();
+                // cancel() only requests cancellation; await waits until the task has stopped.
 
                 match h1.await {
                     Err(veloq_runtime::task::TaskError::Cancelled) => {
