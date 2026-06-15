@@ -7,7 +7,7 @@ use windows_sys::Win32::Networking::WinSock::{
 };
 
 use crate::{
-    config::{BorrowedRawHandle, RawHandle},
+    config::BorrowedRawHandle,
     error::{IocpError, IocpResult},
     ext::Extensions,
     net::addr::{self, SockAddrIn, SockAddrIn6, SockAddrStorage},
@@ -40,21 +40,20 @@ pub(crate) fn submit_connect(
     .push_ctx("scope", "submit_connect")
     .with_ctx("fd_fixed_index", connect_op.fd.fixed_index())
     .with_ctx("fd_generation", connect_op.fd.generation())
-    .with_ctx("handle_raw", raw.as_handle() as usize)
+    .with_ctx("handle_raw", raw.raw().as_handle() as usize)
     .with_ctx("user_data", header.token.index())
     .with_ctx("generation", header.token.generation())?;
-    let raw_handle = RawHandle::new(raw);
-    let handle = raw_handle.borrow();
+    let handle = raw.borrow();
     ensure_socket_bound(handle, connect_op)?;
     let connect_ex = ctx.ext.connect_ex;
     let overlapped = ctx.overlapped;
     let inflight = ctx
         .rio
-        .try_acquire_socket_inflight_guard(raw.actor_key())
+        .try_acquire_socket_inflight_guard(raw.raw().actor_key())
         .push_ctx("scope", "submit_connect.acquire_socket_inflight")
         .with_ctx("fd_fixed_index", connect_op.fd.fixed_index())
         .with_ctx("fd_generation", connect_op.fd.generation())
-        .with_ctx("handle_raw", raw.as_handle() as usize)
+        .with_ctx("handle_raw", raw.raw().as_handle() as usize)
         .with_ctx("user_data", header.token.index())
         .with_ctx("generation", header.token.generation())
         .attach_note("failed to acquire socket inflight slot before ConnectEx")
@@ -147,7 +146,7 @@ pub(crate) unsafe fn on_complete_connect(
         .resolved_handle
         .ok_or(IocpError::InvalidState)
         .attach_note("resolved handle missing for connect completion")?;
-    with_borrowed_socket(raw_handle.as_socket(), |socket| {
+    with_borrowed_socket(raw_handle.raw().as_socket(), |socket| {
         socket.setsockopt_empty(SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT)
     })?;
     Ok(result)
@@ -162,7 +161,7 @@ pub(crate) fn submit_udp_connect(
     let (connect_op, _overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) }?;
     let raw = resolve_fd_handle(&connect_op.fd, &*ctx.registered_slots)?;
     header.resolved_handle = Some(raw);
-    with_borrowed_socket(raw.as_socket(), |socket| {
+    with_borrowed_socket(raw.raw().as_socket(), |socket| {
         // SAFETY: address pointer/length are validated by caller and come from op payload.
         unsafe {
             socket.connect(

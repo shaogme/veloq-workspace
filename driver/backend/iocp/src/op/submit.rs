@@ -12,7 +12,7 @@ use windows_sys::Win32::{
 };
 
 use crate::{
-    config::{BorrowedRawHandle, IoFd, IocpAssociation, IocpHandle, RegisteredSlot},
+    config::{BorrowedRawHandle, IoFd, IocpAssociation, IocpHandle, RawHandle, RegisteredSlot},
     error::{IocpError, IocpResult},
     ext::{LpfnAcceptEx, LpfnConnectEx},
     op::{
@@ -193,7 +193,7 @@ pub(crate) unsafe fn iocp_submit_accept_ex(args: AcceptExArgs) -> IocpResult<Sub
 pub(crate) fn resolve_fd_handle(
     fd: &IoFd,
     registered_slots: &[RegisteredSlot],
-) -> IocpResult<IocpHandle> {
+) -> IocpResult<RawHandle> {
     let idx = fd.fixed_index();
     let Some(slot) = registered_slots.get(idx as usize) else {
         return IocpError::ResolveFd
@@ -211,7 +211,7 @@ pub(crate) fn resolve_fd_handle(
     }
 
     if let Some(handle) = slot.handle.as_ref() {
-        Ok(handle.as_raw().raw())
+        Ok(handle.as_raw())
     } else {
         IocpError::ResolveFd
             .with_ctx("fd_fixed_index", idx)
@@ -223,7 +223,7 @@ pub(crate) fn resolve_fd_handle(
 pub(crate) fn resolve_registered_raw_file(
     raw: IocpHandle,
     registered_slots: &[RegisteredSlot],
-) -> IocpResult<(IoFd, IocpHandle)> {
+) -> IocpResult<(IoFd, RawHandle)> {
     if !raw.is_file() {
         return IocpError::InvalidInput
             .with_ctx("handle_raw", raw.as_handle() as usize)
@@ -245,7 +245,7 @@ pub(crate) fn resolve_registered_raw_file(
                 .attach_note("registered file index exceeds IoFd range")
         })?;
         let fd = IoFd::fixed_with_generation(fixed_index, slot.generation);
-        return Ok((fd, entry.as_raw().raw()));
+        return Ok((fd, entry.as_raw()));
     }
 
     IocpError::InvalidInput
@@ -273,7 +273,7 @@ pub(crate) unsafe fn unpack_kernel_ref<T>(
 /// Associates a handle with an IOCP.
 pub(crate) fn ensure_iocp_association(
     fd: &IoFd,
-    handle: IocpHandle,
+    handle: RawHandle,
     port: &IoCompletionPort,
     registered_slots: &mut [RegisteredSlot],
 ) -> IocpResult<()> {
@@ -300,7 +300,7 @@ pub(crate) fn ensure_iocp_association(
             .attach_note("invalid registered file descriptor");
     }
 
-    ensure_handle_iocp_association(handle, port, &mut slot.association)
+    ensure_handle_iocp_association(handle.raw(), port, &mut slot.association)
 }
 
 fn ensure_handle_iocp_association(

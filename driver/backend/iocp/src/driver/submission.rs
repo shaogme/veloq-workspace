@@ -21,7 +21,7 @@ use veloq_driver_core::{
 };
 
 use crate::{
-    config::IoFd,
+    config::{IoFd, RawHandle},
     driver::{
         IocpDriver, IocpDriverCompletionDiagnostics, IocpDriverResult, IocpOpRegistry,
         registration::close_registered_owned_fd,
@@ -364,7 +364,7 @@ impl<'a> IocpDriver<'a> {
                         .report("iocp/driver", "submission guard slot missing during Close")
                 })?;
                 slot.with_op_mut(|op| {
-                    op.header.resolved_handle = Some(raw_handle);
+                    op.header.resolved_handle = Some(RawHandle::new(raw_handle));
                     op.header.blocking_completion = Some(completion);
                 })
                 .map_err(|err| slot_access_report("iocp.driver.call_op_submit.close_op", err))?;

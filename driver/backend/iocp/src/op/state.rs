@@ -1,5 +1,6 @@
 use crate::{
     IocpHandle,
+    config::RawHandle,
     diagnostics::IocpCompletionDiagnostics,
     error::{IocpError, IocpResult},
     op::{IocpOp, IocpUserPayload},
@@ -17,7 +18,7 @@ use veloq_driver_core::{
 };
 use veloq_storage::{AtomicOptionPtr, StateOptionPtr};
 
-pub(crate) type BlockingSuccessCleanup = fn(usize);
+pub(crate) type BlockingSuccessCleanup = fn(IocpHandle);
 
 pub(crate) struct BlockingCompletion {
     port: Arc<IoCompletionPort>,
@@ -76,7 +77,7 @@ impl Drop for BlockingCompletion {
             if let Some(cleanup_success) = self.cleanup_success
                 && let Ok(value) = result
             {
-                cleanup_success(value);
+                cleanup_success(IocpHandle::for_file(value as _));
             }
         }
     }
@@ -94,7 +95,7 @@ pub struct OverlappedEntry {
     /// Result of an offloaded blocking operation.
     pub(crate) blocking_completion: Option<Arc<BlockingCompletion>>,
     /// Resolved handle captured during submission to avoid re-resolving Fixed fd on hot paths.
-    pub(crate) resolved_handle: Option<IocpHandle>,
+    pub(crate) resolved_handle: Option<RawHandle>,
     /// Socket inflight ownership acquired before a kernel-pending socket submit.
     pub(crate) socket_inflight: Option<SocketInflightToken>,
 }

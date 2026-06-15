@@ -245,7 +245,7 @@ impl<'a> IocpDriver<'a> {
                         });
 
                     if let Some(raw_handle) = raw_handle {
-                        let handle = raw_handle.as_handle();
+                        let handle = raw_handle.raw().as_handle();
                         let overlapped_ptr =
                             guard.with_sidecar_mut(|sidecar| &mut sidecar.inner as *mut Overlapped);
                         match unsafe { IoCompletionPort::cancel_request(handle, overlapped_ptr) }? {
@@ -279,7 +279,7 @@ impl<'a> IocpDriver<'a> {
                         });
 
                     if let Some(raw_handle) = raw_handle {
-                        let handle = raw_handle.as_handle();
+                        let handle = raw_handle.raw().as_handle();
                         let overlapped_ptr =
                             guard.with_sidecar_mut(|sidecar| &mut sidecar.inner as *mut Overlapped);
                         match unsafe { IoCompletionPort::cancel_request(handle, overlapped_ptr) }? {

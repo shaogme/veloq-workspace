@@ -11,7 +11,6 @@ use std::mem::ManuallyDrop;
 use windows_sys::Win32::Networking::WinSock::SOCKET;
 
 use crate::{
-    config::RawHandle,
     error::IocpResult,
     ext::Extensions,
     net::addr::{self, SockAddrStorage},
@@ -64,8 +63,7 @@ pub(crate) fn submit_recv(
     let fd = val.fd;
     let raw = resolve_fd_handle(&fd, &*ctx.registered_slots)?;
     header.resolved_handle = Some(raw);
-    let raw_handle = RawHandle::new(raw);
-    let handle = raw_handle.borrow();
+    let handle = raw.borrow();
     let token = ctx.op_token;
     let (user_data, generation) = token.parts();
     mark_header_in_flight(
@@ -104,8 +102,7 @@ pub(crate) fn submit_udp_recv(
     let fd = val.fd;
     let raw = resolve_fd_handle(&fd, &*ctx.registered_slots)?;
     header.resolved_handle = Some(raw);
-    let raw_handle = RawHandle::new(raw);
-    let handle = raw_handle.borrow();
+    let handle = raw.borrow();
     let token = ctx.op_token;
     let (user_data, generation) = token.parts();
     mark_header_in_flight(
@@ -143,8 +140,7 @@ pub(crate) fn submit_send(
 
     let raw = resolve_fd_handle(&val.fd, &*ctx.registered_slots)?;
     header.resolved_handle = Some(raw);
-    let raw_handle = RawHandle::new(raw);
-    let handle = raw_handle.borrow();
+    let handle = raw.borrow();
     let token = ctx.op_token;
     let (user_data, generation) = token.parts();
     mark_header_in_flight(
@@ -182,8 +178,7 @@ pub(crate) fn submit_udp_send(
 
     let raw = resolve_fd_handle(&val.fd, &*ctx.registered_slots)?;
     header.resolved_handle = Some(raw);
-    let raw_handle = RawHandle::new(raw);
-    let handle = raw_handle.borrow();
+    let handle = raw.borrow();
     let token = ctx.op_token;
     let (user_data, generation) = token.parts();
     mark_header_in_flight(
@@ -219,8 +214,7 @@ pub(crate) fn submit_send_to(
     let user = unsafe { payload.user.as_ref()? };
     let raw = resolve_fd_handle(&user.fd, &*ctx.registered_slots)?;
     header.resolved_handle = Some(raw);
-    let raw_handle = RawHandle::new(raw);
-    let handle = raw_handle.borrow();
+    let handle = raw.borrow();
 
     let args = RioSendToArgs {
         fd: user.fd,
@@ -263,8 +257,7 @@ pub(crate) fn submit_udp_recv_from(
     let fd = val.fd;
     let raw = resolve_fd_handle(&fd, &*ctx.registered_slots)?;
     header.resolved_handle = Some(raw);
-    let raw_handle = RawHandle::new(raw);
-    let handle = raw_handle.borrow();
+    let handle = raw.borrow();
     let args = RioUdpRecvFromArgs {
         fd,
         handle,

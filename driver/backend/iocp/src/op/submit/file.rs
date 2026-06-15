@@ -10,7 +10,6 @@ use veloq_buf::{BufIoRangeError, FixedBuf};
 use diagweave::prelude::*;
 
 use crate::{
-    config::RawHandle,
     error::{IocpError, IocpResult},
     op::{
         KernelRef, OverlappedEntry, ReadFixed, ReadRaw, SubmitContext, WriteFixed, WriteRaw,
@@ -74,7 +73,7 @@ macro_rules! submit_io_op {
                 .push_ctx("scope", stringify!($fn_name))
                 .with_ctx("fd_fixed_index", val.fd.fixed_index())
                 .with_ctx("fd_generation", val.fd.generation())
-                .with_ctx("handle_raw", raw.as_handle() as usize)
+                .with_ctx("handle_raw", raw.raw().as_handle() as usize)
                 .with_ctx("user_data", header.token.index())
                 .with_ctx("generation", header.token.generation())
                 .with_ctx("offset", val.offset)
@@ -83,14 +82,13 @@ macro_rules! submit_io_op {
 
             // Depending on ReadFile/WriteFile sig: (handle, buf, len, bytes, overlapped)
             let (ptr, len) = $range_fn(&mut val.buf, val.buf_offset, stringify!($fn_name))?;
-            let raw_handle = RawHandle::new(raw);
-            let handle = raw_handle.borrow();
+            let handle = raw.borrow();
             // SAFETY: Calling Win32 ReadFile/WriteFile via wrapper with valid parameters.
             let submit_res = unsafe { $wrapper_fn(handle, ptr as _, len, ctx.overlapped) }
                 .push_ctx("scope", stringify!($fn_name))
                 .with_ctx("fd_fixed_index", val.fd.fixed_index())
                 .with_ctx("fd_generation", val.fd.generation())
-                .with_ctx("handle_raw", raw.as_handle() as usize)
+                .with_ctx("handle_raw", raw.raw().as_handle() as usize)
                 .with_ctx("user_data", header.token.index())
                 .with_ctx("generation", header.token.generation())
                 .with_ctx("offset", val.offset)
@@ -121,7 +119,7 @@ macro_rules! submit_raw_io_op {
                 .push_ctx("scope", stringify!($fn_name))
                 .with_ctx("fd_fixed_index", fd.fixed_index())
                 .with_ctx("fd_generation", fd.generation())
-                .with_ctx("handle_raw", raw.as_handle() as usize)
+                .with_ctx("handle_raw", raw.raw().as_handle() as usize)
                 .with_ctx("user_data", header.token.index())
                 .with_ctx("generation", header.token.generation())
                 .with_ctx("offset", val.offset)
@@ -129,11 +127,10 @@ macro_rules! submit_raw_io_op {
                 .with_ctx("buffer_capacity", val.buf.capacity())?;
 
             let (ptr, len) = $range_fn(&mut val.buf, val.buf_offset, stringify!($fn_name))?;
-            let raw_handle = RawHandle::new(raw);
-            let handle = raw_handle.borrow();
+            let handle = raw.borrow();
             let submit_res = unsafe { $wrapper_fn(handle, ptr as _, len, ctx.overlapped) }
                 .push_ctx("scope", stringify!($fn_name))
-                .with_ctx("handle_raw", raw.as_handle() as usize)
+                .with_ctx("handle_raw", raw.raw().as_handle() as usize)
                 .with_ctx("user_data", header.token.index())
                 .with_ctx("generation", header.token.generation())
                 .with_ctx("offset", val.offset)

@@ -5,7 +5,7 @@ use windows_sys::Win32::Networking::WinSock::{
 
 use crate::{
     Socket,
-    config::{BorrowedRawHandle, IocpHandle, RawHandle},
+    config::{BorrowedRawHandle, IocpHandle},
     error::{IocpError, IocpResult},
     ext::Extensions,
     net::addr::{self, SockAddrStorage},
@@ -48,8 +48,7 @@ pub(crate) fn submit_accept(
     let user = unsafe { payload.user.as_mut()? };
     let raw = resolve_fd_handle(&user.fd, &*ctx.registered_slots)?;
     header.resolved_handle = Some(raw);
-    let raw_handle = RawHandle::new(raw);
-    let handle = raw_handle.borrow();
+    let handle = raw.borrow();
     if payload.accept_socket.is_none() {
         let family = socket_family_from_handle(handle)?;
         let accept_socket = if family == AF_INET {
@@ -73,7 +72,7 @@ pub(crate) fn submit_accept(
 
     ensure_iocp_association(&user.fd, raw, ctx.port.as_ref(), &mut *ctx.registered_slots)
         .push_ctx("scope", "submit_accept")
-        .with_ctx("listen_handle_raw", raw.as_handle() as usize)
+        .with_ctx("listen_handle_raw", raw.raw().as_handle() as usize)
         .with_ctx("user_data", header.token.index())
         .with_ctx("generation", header.token.generation())?;
 
@@ -83,11 +82,11 @@ pub(crate) fn submit_accept(
     let overlapped = ctx.overlapped;
     let inflight = ctx
         .rio
-        .try_acquire_socket_inflight_guard(raw.actor_key())
+        .try_acquire_socket_inflight_guard(raw.raw().actor_key())
         .push_ctx("scope", "submit_accept.acquire_socket_inflight")
         .with_ctx("fd_fixed_index", user.fd.fixed_index())
         .with_ctx("fd_generation", user.fd.generation())
-        .with_ctx("listen_handle_raw", raw.as_handle() as usize)
+        .with_ctx("listen_handle_raw", raw.raw().as_handle() as usize)
         .with_ctx("accept_socket_raw", accept_socket_raw)
         .with_ctx("user_data", header.token.index())
         .with_ctx("generation", header.token.generation())
@@ -138,7 +137,7 @@ pub(crate) unsafe fn on_complete_accept(
         .resolved_handle
         .ok_or(IocpError::InvalidState)
         .attach_note("resolved listen handle missing for accept completion")?;
-    let listen_socket = listen_handle.as_socket();
+    let listen_socket = listen_handle.raw().as_socket();
     let accept_socket_raw = accept_socket.raw().as_socket();
 
     if let Err(e) = with_borrowed_socket(accept_socket_raw, |socket| {
