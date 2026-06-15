@@ -95,6 +95,27 @@ CROSS_SKIP_AUTO_UPDATE=1 cross test --target x86_64-pc-windows-gnu
 
 所有命令必须零错误、零告警（按 `-D warnings` 生效）。
 
+## 代码质量要求
+
+- **质量与测试**: 注重代码质量、可测试性和测试覆盖。
+- **编码规范**:
+    - **禁止长路径**: 禁止在代码中使用全限定命名空间（尤其是以 `crate::` 开头的路径）超过 15 个字符。必须通过 `use` 语句导入后再调用。
+    - **合并相同前缀的use语句**: 当有多个`use`语句具有相同前缀时，应合并为一条`use`语句，例如：
+    ```rust
+    //Bad
+    use crate::nix::build;
+    use crate::nix::store;
+    use crate::nix::path;
+    use crate::nix::refpath;
+    //Good
+    use crate::nix::{
+        build,
+        store,
+        path,
+        refpath,
+    };
+    ```
+
 ## CI 命令风格 (CI Command Style)
 
 - 禁止在 CI 中使用批处理循环/脚本进行重试或编排。
