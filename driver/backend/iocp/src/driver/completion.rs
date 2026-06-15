@@ -332,9 +332,7 @@ fn calculate_io_result_from_slot(
             .take()
             .and_then(|completion| completion.take_result());
         if let Some(res) = blocking_res {
-            io_result = res
-                .with_ctx("outer_scope", "iocp.driver.blocking_completion")
-                .attach_note("blocking completion returned stored error");
+            io_result = res;
         } else if matches!(
             &iocp_op.payload,
             IocpOpPayload::Open(_)

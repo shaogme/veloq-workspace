@@ -48,12 +48,11 @@ fn sanitize_field(s: &str) -> String {
 
 pub(crate) fn iocp_msg(ctx: IocpErrorContext, detail: impl Into<String>) -> Report<IocpError> {
     let detail = detail.into();
-    let report = IocpError::from(ctx)
+    IocpError::from(ctx)
         .to_report()
         .push_ctx("scope", "iocp/common")
         .with_ctx("detail", sanitize_field(&detail))
-        .attach_note(detail);
-    report
+        .attach_note(detail)
 }
 
 // ============================================================================

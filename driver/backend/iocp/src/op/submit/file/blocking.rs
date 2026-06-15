@@ -45,13 +45,17 @@ fn make_blocking_completion(
 
 fn blocking_job<F>(completion: Arc<BlockingCompletion>, f: F) -> BlockingTask
 where
-    F: FnOnce() -> io::Result<usize> + Send + 'static,
+    F: FnOnce() -> IocpResult<usize> + Send + 'static,
 {
     BlockingTask::Fn(Box::new(move || completion.complete(f())))
 }
 
 fn last_os_error() -> io::Error {
     io::Error::from_raw_os_error(unsafe { GetLastError() } as i32)
+}
+
+fn win32_err(scope: &'static str) -> Report<IocpError> {
+    IocpError::Win32.io_report(scope, last_os_error())
 }
 
 fn is_valid_file_handle(handle: HANDLE) -> bool {
@@ -77,7 +81,7 @@ pub(crate) fn completion_cleanup_close_file(result: &IocpResult<usize>) -> Compl
     }))
 }
 
-fn duplicate_file_handle(handle: HANDLE) -> io::Result<OwnedHandle> {
+fn duplicate_file_handle(handle: HANDLE, scope: &'static str) -> IocpResult<OwnedHandle> {
     let process = unsafe { GetCurrentProcess() };
     let mut duplicated = ptr::null_mut();
     let ret = unsafe {
@@ -92,7 +96,7 @@ fn duplicate_file_handle(handle: HANDLE) -> io::Result<OwnedHandle> {
         )
     };
     if ret == 0 {
-        Err(last_os_error())
+        Err(IocpError::Submission.io_report(scope, last_os_error()))
     } else {
         Ok(OwnedHandle(duplicated))
     }
@@ -115,7 +119,7 @@ fn owned_wide_path(bytes: &[u8]) -> IocpResult<Vec<u16>> {
     Ok(path)
 }
 
-fn open_file(path: Vec<u16>, flags: i32, mode: u32) -> io::Result<usize> {
+fn open_file(path: Vec<u16>, flags: i32, mode: u32) -> IocpResult<usize> {
     let real_disposition = mode & 0xFF;
     const FAKE_NO_BUFFERING: u32 = 1 << 8;
     const FAKE_WRITE_THROUGH: u32 = 1 << 9;
@@ -141,27 +145,28 @@ fn open_file(path: Vec<u16>, flags: i32, mode: u32) -> io::Result<usize> {
     };
 
     if handle == INVALID_HANDLE_VALUE {
-        Err(last_os_error())
+        Err(win32_err("CreateFileW"))
     } else {
         Ok(handle as usize)
     }
 }
 
-fn flush_file_buffers(handle: HANDLE) -> io::Result<usize> {
+fn flush_file_buffers(handle: HANDLE) -> IocpResult<usize> {
     let ret = unsafe { FlushFileBuffers(handle) };
     if ret == 0 {
-        Err(last_os_error())
+        Err(win32_err("FlushFileBuffers"))
     } else {
         Ok(0)
     }
 }
 
-fn fallocate_file(handle: HANDLE, mode: i32, offset: u64, len: u64) -> io::Result<usize> {
-    let req_size = offset
-        .checked_add(len)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "fallocate range overflows"))?;
-    let allocation_size = i64::try_from(req_size)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "fallocate range exceeds i64"))?;
+fn fallocate_file(handle: HANDLE, mode: i32, offset: u64, len: u64) -> IocpResult<usize> {
+    let Some(req_size) = offset.checked_add(len) else {
+        return IocpError::InvalidInput.attach_note("fallocate range overflows");
+    };
+    let Ok(allocation_size) = i64::try_from(req_size) else {
+        return IocpError::InvalidInput.attach_note("fallocate range exceeds i64");
+    };
 
     let mut alloc_info = FILE_ALLOCATION_INFO {
         AllocationSize: allocation_size,
@@ -175,7 +180,7 @@ fn fallocate_file(handle: HANDLE, mode: i32, offset: u64, len: u64) -> io::Resul
         )
     };
     if ret == 0 {
-        return Err(last_os_error());
+        return Err(win32_err("SetFileInformationByHandle.allocation"));
     }
 
     if mode == 0 {
@@ -191,7 +196,7 @@ fn fallocate_file(handle: HANDLE, mode: i32, offset: u64, len: u64) -> io::Resul
             )
         };
         if ret == 0 {
-            return Err(last_os_error());
+            return Err(win32_err("SetFileInformationByHandle.eof"));
         }
     }
 
@@ -241,8 +246,7 @@ pub(crate) fn submit_fsync(
     let raw = resolve_fd_handle(&user.fd, &*ctx.registered_slots)?;
     header.resolved_handle = Some(raw);
 
-    let handle = duplicate_file_handle(raw.as_handle())
-        .map_err(|e| IocpError::Submission.io_report("DuplicateHandle.fsync", e))?;
+    let handle = duplicate_file_handle(raw.as_handle(), "DuplicateHandle.fsync")?;
     let completion = make_blocking_completion(header, ctx, None);
     let task = blocking_job(completion, move || flush_file_buffers(handle.as_raw()));
     Ok(SubmissionResult::Offload(task))
@@ -258,8 +262,7 @@ pub(crate) fn submit_fsync_raw(
     let raw_handle = RawHandle::new(user.fd);
     let handle = raw_handle.borrow();
 
-    let handle = duplicate_file_handle(handle.raw().as_handle())
-        .map_err(|e| IocpError::Submission.io_report("DuplicateHandle.fsync_raw", e))?;
+    let handle = duplicate_file_handle(handle.raw().as_handle(), "DuplicateHandle.fsync_raw")?;
     let completion = make_blocking_completion(header, ctx, None);
     let task = blocking_job(completion, move || flush_file_buffers(handle.as_raw()));
     Ok(SubmissionResult::Offload(task))
@@ -278,8 +281,7 @@ pub(crate) fn submit_sync_range(
     let raw = resolve_fd_handle(&user.fd, &*ctx.registered_slots)?;
     header.resolved_handle = Some(raw);
 
-    let handle = duplicate_file_handle(raw.as_handle())
-        .map_err(|e| IocpError::Submission.io_report("DuplicateHandle.sync_range", e))?;
+    let handle = duplicate_file_handle(raw.as_handle(), "DuplicateHandle.sync_range")?;
     let completion = make_blocking_completion(header, ctx, None);
     let task = blocking_job(completion, move || flush_file_buffers(handle.as_raw()));
     Ok(SubmissionResult::Offload(task))
@@ -295,8 +297,7 @@ pub(crate) fn submit_sync_range_raw(
     let raw_handle = RawHandle::new(user.fd);
     let handle = raw_handle.borrow();
 
-    let handle = duplicate_file_handle(handle.raw().as_handle())
-        .map_err(|e| IocpError::Submission.io_report("DuplicateHandle.sync_range_raw", e))?;
+    let handle = duplicate_file_handle(handle.raw().as_handle(), "DuplicateHandle.sync_range_raw")?;
     let completion = make_blocking_completion(header, ctx, None);
     let task = blocking_job(completion, move || flush_file_buffers(handle.as_raw()));
     Ok(SubmissionResult::Offload(task))
@@ -318,8 +319,7 @@ pub(crate) fn submit_fallocate(
     let mode = user.mode;
     let offset = user.offset;
     let len = user.len;
-    let handle = duplicate_file_handle(raw.as_handle())
-        .map_err(|e| IocpError::Submission.io_report("DuplicateHandle.fallocate", e))?;
+    let handle = duplicate_file_handle(raw.as_handle(), "DuplicateHandle.fallocate")?;
     let completion = make_blocking_completion(header, ctx, None);
     let task = blocking_job(completion, move || {
         fallocate_file(handle.as_raw(), mode, offset, len)
@@ -340,8 +340,7 @@ pub(crate) fn submit_fallocate_raw(
     let mode = user.mode;
     let offset = user.offset;
     let len = user.len;
-    let handle = duplicate_file_handle(handle.raw().as_handle())
-        .map_err(|e| IocpError::Submission.io_report("DuplicateHandle.fallocate_raw", e))?;
+    let handle = duplicate_file_handle(handle.raw().as_handle(), "DuplicateHandle.fallocate_raw")?;
     let completion = make_blocking_completion(header, ctx, None);
     let task = blocking_job(completion, move || {
         fallocate_file(handle.as_raw(), mode, offset, len)

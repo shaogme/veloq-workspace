@@ -7,7 +7,6 @@ use crate::{
     win32::{IoCompletionPort, Overlapped},
 };
 use std::{
-    io,
     ptr::NonNull,
     sync::{Arc, atomic::Ordering},
     time::Instant,
@@ -41,10 +40,7 @@ impl BlockingCompletion {
         })
     }
 
-    pub(crate) fn store_result(&self, result: io::Result<usize>) {
-        let result = result.map_err(|e| {
-            IocpError::Win32.io_report("iocp.driver.inner.blocking_completion.store", e)
-        });
+    pub(crate) fn store_result(&self, result: IocpResult<usize>) {
         let raw = Box::into_raw(Box::new(result));
         let non_null = NonNull::new(raw);
         let old = self.result.swap(non_null, Ordering::Release);
@@ -55,7 +51,7 @@ impl BlockingCompletion {
         }
     }
 
-    pub(crate) fn complete(&self, result: io::Result<usize>) {
+    pub(crate) fn complete(&self, result: IocpResult<usize>) {
         self.store_result(result);
         if let Err(report) = self.port.notify(self.completion_token) {
             tracing::error!(

@@ -228,12 +228,12 @@ impl HandleRegistry {
     }
 }
 
-fn close_iocp_handle(handle: IocpHandle) -> io::Result<usize> {
+fn close_iocp_handle(handle: IocpHandle) -> IocpResult<usize> {
     match handle {
         IocpHandle::File { handle } => {
             let ret = unsafe { CloseHandle(handle) };
             if ret == 0 {
-                Err(io::Error::last_os_error())
+                Err(IocpError::Win32.io_report("CloseHandle", io::Error::last_os_error()))
             } else {
                 Ok(0)
             }
@@ -242,7 +242,10 @@ fn close_iocp_handle(handle: IocpHandle) -> io::Result<usize> {
             let socket = handle as SOCKET;
             let ret = unsafe { closesocket(socket) };
             if ret == SOCKET_ERROR || socket == INVALID_SOCKET {
-                Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
+                Err(IocpError::Win32.io_report(
+                    "closesocket",
+                    io::Error::from_raw_os_error(unsafe { WSAGetLastError() }),
+                ))
             } else {
                 Ok(0)
             }
@@ -250,13 +253,11 @@ fn close_iocp_handle(handle: IocpHandle) -> io::Result<usize> {
     }
 }
 
-fn close_owned_entry_now(entry: RegisteredHandle) -> io::Result<usize> {
+fn close_owned_entry_now(entry: RegisteredHandle) -> IocpResult<usize> {
     match entry {
         RegisteredHandle::Owned(handle) => close_iocp_handle(handle.into_raw().raw()),
-        RegisteredHandle::Weak(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Close is only valid for owned registered file descriptors",
-        )),
+        RegisteredHandle::Weak(_) => IocpError::InvalidInput
+            .attach_note("Close is only valid for owned registered file descriptors"),
     }
 }
 
@@ -264,7 +265,7 @@ pub(super) fn close_registered_owned_fd(
     handles: &mut HandleRegistry,
     rio: &mut RioState,
     fd: IoFd,
-) -> IocpResult<(IocpHandle, io::Result<usize>)> {
+) -> IocpResult<(IocpHandle, IocpResult<usize>)> {
     let (idx, entry) = handles.take_owned_for_close(fd)?;
     let raw = entry.as_raw().raw();
     handles.release_slot(idx);
