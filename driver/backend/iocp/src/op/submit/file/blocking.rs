@@ -1,27 +1,36 @@
 use veloq_blocking::BlockingTask;
 
 use diagweave::prelude::*;
-use std::io;
-use std::ptr;
-use std::sync::Arc;
-use windows_sys::Win32::Foundation::{
-    CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+use std::{io, ptr, sync::Arc};
+use windows_sys::Win32::{
+    Foundation::{
+        CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, GetLastError, HANDLE,
+        INVALID_HANDLE_VALUE,
+    },
+    Storage::FileSystem::{
+        CreateFileW, FILE_ALLOCATION_INFO, FILE_ATTRIBUTE_NORMAL, FILE_END_OF_FILE_INFO,
+        FILE_FLAG_NO_BUFFERING, FILE_FLAG_OVERLAPPED, FILE_FLAG_WRITE_THROUGH, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FileAllocationInfo, FileEndOfFileInfo, FlushFileBuffers,
+        SetFileInformationByHandle,
+    },
+    System::Threading::GetCurrentProcess,
 };
-use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ALLOCATION_INFO, FILE_ATTRIBUTE_NORMAL, FILE_END_OF_FILE_INFO,
-    FILE_FLAG_OVERLAPPED, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileAllocationInfo,
-    FileEndOfFileInfo, FlushFileBuffers, SetFileInformationByHandle,
-};
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-use crate::error::{IocpError, IocpResult};
-use crate::op::submit::{SubmissionResult, resolve_fd_handle};
-use crate::op::{
-    BlockingCompletion, BlockingSuccessCleanup, Close, Fallocate, FallocateRaw, Fsync, FsyncRaw,
-    KernelRef, OpenPayload, OverlappedEntry, SubmitContext, SyncFileRange, SyncFileRangeRaw,
+use crate::{
+    config::{IocpHandle, RawHandle},
+    error::{IocpError, IocpResult},
+    op::{
+        BlockingCompletion, BlockingSuccessCleanup, Close, Fallocate, FallocateRaw, Fsync,
+        FsyncRaw, KernelRef, OpenPayload, OverlappedEntry, SubmitContext, SyncFileRange,
+        SyncFileRangeRaw,
+        submit::{SubmissionResult, resolve_fd_handle},
+    },
+    win32::OwnedHandle,
 };
-use veloq_driver_core::RawHandleMeta;
-use veloq_driver_core::driver::{CompletionCleanup, CompletionCleanupGuard};
+use veloq_driver_core::{
+    RawHandleMeta,
+    driver::{CompletionCleanup, CompletionCleanupGuard},
+};
 
 fn make_blocking_completion(
     header: &mut OverlappedEntry,
@@ -63,12 +72,12 @@ pub(crate) fn completion_cleanup_close_file(result: &IocpResult<usize>) -> Compl
         return CompletionCleanupGuard::default();
     };
     CompletionCleanupGuard::new(CompletionCleanup::new(move || {
-        crate::config::IocpHandle::for_file(raw as _).close();
+        IocpHandle::for_file(raw as _).close();
         Ok(())
     }))
 }
 
-fn duplicate_file_handle(handle: HANDLE) -> io::Result<crate::win32::OwnedHandle> {
+fn duplicate_file_handle(handle: HANDLE) -> io::Result<OwnedHandle> {
     let process = unsafe { GetCurrentProcess() };
     let mut duplicated = ptr::null_mut();
     let ret = unsafe {
@@ -85,7 +94,7 @@ fn duplicate_file_handle(handle: HANDLE) -> io::Result<crate::win32::OwnedHandle
     if ret == 0 {
         Err(last_os_error())
     } else {
-        Ok(crate::win32::OwnedHandle(duplicated))
+        Ok(OwnedHandle(duplicated))
     }
 }
 
@@ -113,11 +122,9 @@ fn open_file(path: Vec<u16>, flags: i32, mode: u32) -> io::Result<usize> {
 
     let mut flags_and_attributes = FILE_FLAG_OVERLAPPED | FILE_ATTRIBUTE_NORMAL;
     if (mode & FAKE_NO_BUFFERING) != 0 {
-        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
         flags_and_attributes |= FILE_FLAG_NO_BUFFERING;
     }
     if (mode & FAKE_WRITE_THROUGH) != 0 {
-        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_WRITE_THROUGH;
         flags_and_attributes |= FILE_FLAG_WRITE_THROUGH;
     }
 
@@ -248,7 +255,7 @@ pub(crate) fn submit_fsync_raw(
 ) -> IocpResult<SubmissionResult> {
     let user = unsafe { payload.user.as_ref()? };
     header.resolved_handle = Some(user.fd);
-    let raw_handle = crate::config::RawHandle::new(user.fd);
+    let raw_handle = RawHandle::new(user.fd);
     let handle = raw_handle.borrow();
 
     let handle = duplicate_file_handle(handle.raw().as_handle())
@@ -285,7 +292,7 @@ pub(crate) fn submit_sync_range_raw(
 ) -> IocpResult<SubmissionResult> {
     let user = unsafe { payload.user.as_ref()? };
     header.resolved_handle = Some(user.fd);
-    let raw_handle = crate::config::RawHandle::new(user.fd);
+    let raw_handle = RawHandle::new(user.fd);
     let handle = raw_handle.borrow();
 
     let handle = duplicate_file_handle(handle.raw().as_handle())
@@ -327,7 +334,7 @@ pub(crate) fn submit_fallocate_raw(
 ) -> IocpResult<SubmissionResult> {
     let user = unsafe { payload.user.as_ref()? };
     header.resolved_handle = Some(user.fd);
-    let raw_handle = crate::config::RawHandle::new(user.fd);
+    let raw_handle = RawHandle::new(user.fd);
     let handle = raw_handle.borrow();
 
     let mode = user.mode;

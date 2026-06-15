@@ -1,9 +1,18 @@
 use super::RioRegistry;
-use crate::net::addr::SockAddrStorage;
-use crate::rio::RioEnv;
-use crate::rio::core::{RioBufferId, RioProvider};
-use crate::rio::error::{RioError, RioResult};
+use crate::{
+    net::addr::SockAddrStorage,
+    rio::{
+        RioEnv,
+        core::{RioBufferId, RioProvider},
+        error::{RioError, RioResult},
+    },
+};
 use diagweave::prelude::*;
+use std::{
+    ffi::c_void,
+    mem::{size_of, size_of_val},
+    ptr::{addr_of, copy_nonoverlapping, write_bytes},
+};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, RIO_BUF, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
 };
@@ -17,7 +26,7 @@ pub(crate) struct RioAddrReservation {
 impl RioRegistry {
     pub(crate) fn prepare_send_addr(
         &mut self,
-        addr_ptr: *const std::ffi::c_void,
+        addr_ptr: *const c_void,
         addr_len: i32,
         env: RioEnv<'_>,
     ) -> RioResult<RioAddrReservation> {
@@ -28,8 +37,8 @@ impl RioRegistry {
         // SAFETY: `dst` points at an owned scratch slot, and `addr_ptr` was
         // validated as non-null with at least `copy_len` readable bytes.
         unsafe {
-            std::ptr::write_bytes(dst, 0, std::mem::size_of::<SockAddrStorage>());
-            std::ptr::copy_nonoverlapping(addr_ptr.cast::<u8>(), dst, copy_len);
+            write_bytes(dst, 0, size_of::<SockAddrStorage>());
+            copy_nonoverlapping(addr_ptr.cast::<u8>(), dst, copy_len);
         }
         Ok(RioAddrReservation {
             rio_buf: RIO_BUF {
@@ -45,7 +54,7 @@ impl RioRegistry {
         let dst = (&mut self.addr_slots[reservation.slot] as *mut SockAddrStorage).cast::<u8>();
         // SAFETY: `dst` points at an owned scratch slot.
         unsafe {
-            std::ptr::write_bytes(dst, 0, std::mem::size_of::<SockAddrStorage>());
+            write_bytes(dst, 0, size_of::<SockAddrStorage>());
         }
         Ok(reservation)
     }
@@ -66,7 +75,7 @@ impl RioRegistry {
         };
         // SAFETY: `src` is a live scratch slot and `dst` points at the op payload.
         unsafe {
-            std::ptr::copy_nonoverlapping(src as *const SockAddrStorage, dst, 1);
+            copy_nonoverlapping(src as *const SockAddrStorage, dst, 1);
         }
         Ok(())
     }
@@ -97,7 +106,7 @@ impl RioRegistry {
             rio_buf: RIO_BUF {
                 BufferId: buffer_id.0,
                 Offset: offset,
-                Length: std::mem::size_of::<SOCKADDR_INET>() as u32,
+                Length: size_of::<SOCKADDR_INET>() as u32,
             },
         })
     }
@@ -110,7 +119,7 @@ impl RioRegistry {
             return Ok(self.addr_buffer_id);
         }
 
-        let len = std::mem::size_of_val(&*self.addr_slots);
+        let len = size_of_val(&*self.addr_slots);
         let len_u32 = u32::try_from(len).map_err(|_| {
             RioError::ResourceExhaustion
                 .to_report()
@@ -126,10 +135,7 @@ impl RioRegistry {
         Ok(id)
     }
 
-    pub(crate) fn validate_send_addr(
-        addr_ptr: *const std::ffi::c_void,
-        addr_len: i32,
-    ) -> RioResult<u32> {
+    pub(crate) fn validate_send_addr(addr_ptr: *const c_void, addr_len: i32) -> RioResult<u32> {
         if addr_ptr.is_null() {
             return RioError::InvalidInput.attach_note("RIO send_to received null address");
         }
@@ -138,20 +144,19 @@ impl RioRegistry {
                 .with_ctx("address_len", addr_len)
                 .attach_note("RIO send_to invalid negative address length");
         }
-        if (addr_len as usize) < std::mem::size_of::<SOCKADDR>() {
+        if (addr_len as usize) < size_of::<SOCKADDR>() {
             return RioError::InvalidInput
                 .with_ctx("address_len", addr_len)
-                .with_ctx("min_address_len", std::mem::size_of::<SOCKADDR>())
+                .with_ctx("min_address_len", size_of::<SOCKADDR>())
                 .attach_note("RIO send_to address too short for SOCKADDR");
         }
         // SAFETY: addr_ptr is non-null and at least SOCKADDR-sized; read_unaligned avoids
         // imposing alignment requirements on future raw-pointer callers.
-        let family = unsafe {
-            std::ptr::addr_of!((*(addr_ptr as *const SOCKADDR)).sa_family).read_unaligned()
-        };
+        let family =
+            unsafe { addr_of!((*(addr_ptr as *const SOCKADDR)).sa_family).read_unaligned() };
         let min_len = match family {
-            AF_INET => std::mem::size_of::<SOCKADDR_IN>(),
-            AF_INET6 => std::mem::size_of::<SOCKADDR_IN6>(),
+            AF_INET => size_of::<SOCKADDR_IN>(),
+            AF_INET6 => size_of::<SOCKADDR_IN6>(),
             _ => {
                 return RioError::InvalidInput
                     .with_ctx("address_family", family)
@@ -165,12 +170,12 @@ impl RioRegistry {
                 .attach_note("RIO send_to invalid address length");
         }
 
-        Ok(std::mem::size_of::<SOCKADDR_INET>() as u32)
+        Ok(size_of::<SOCKADDR_INET>() as u32)
     }
 
     pub(crate) fn addr_slot_offset(slot: usize) -> RioResult<u32> {
         let offset = slot
-            .checked_mul(std::mem::size_of::<SockAddrStorage>())
+            .checked_mul(size_of::<SockAddrStorage>())
             .ok_or(RioError::ResourceExhaustion)
             .attach_note("RIO address slot offset overflow")?;
         u32::try_from(offset).map_err(|_| {
@@ -194,6 +199,7 @@ impl RioRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::zeroed;
 
     #[test]
     fn rio_send_addr_validation_rejects_short_sockaddr_before_family_read() {
@@ -207,7 +213,7 @@ mod tests {
     #[test]
     fn rio_send_addr_validation_rejects_invalid_lengths_and_families() {
         // SAFETY: SOCKADDR is a plain WinSock address header and all-zero bytes are valid here.
-        let mut sockaddr: SOCKADDR = unsafe { std::mem::zeroed() };
+        let mut sockaddr: SOCKADDR = unsafe { zeroed() };
         let err = RioRegistry::validate_send_addr((&sockaddr as *const SOCKADDR).cast(), -1)
             .expect_err("negative sockaddr length should fail");
         assert_eq!(*err.inner(), RioError::InvalidInput);
@@ -215,7 +221,7 @@ mod tests {
         sockaddr.sa_family = AF_INET6;
         let err = RioRegistry::validate_send_addr(
             (&sockaddr as *const SOCKADDR).cast(),
-            std::mem::size_of::<SOCKADDR>() as i32,
+            size_of::<SOCKADDR>() as i32,
         )
         .expect_err("IPv6 sockaddr shorter than SOCKADDR_IN6 should fail");
         assert_eq!(*err.inner(), RioError::InvalidInput);
@@ -223,7 +229,7 @@ mod tests {
         sockaddr.sa_family = 0x7fff;
         let err = RioRegistry::validate_send_addr(
             (&sockaddr as *const SOCKADDR).cast(),
-            std::mem::size_of::<SOCKADDR>() as i32,
+            size_of::<SOCKADDR>() as i32,
         )
         .expect_err("unsupported sockaddr family should fail");
         assert_eq!(*err.inner(), RioError::InvalidInput);
@@ -232,23 +238,23 @@ mod tests {
     #[test]
     fn rio_send_addr_validation_accepts_ipv4_and_ipv6_lengths() {
         // SAFETY: SOCKADDR_IN is POD; the test fills the family field explicitly.
-        let mut ipv4: SOCKADDR_IN = unsafe { std::mem::zeroed() };
+        let mut ipv4: SOCKADDR_IN = unsafe { zeroed() };
         ipv4.sin_family = AF_INET;
         let rio_len = RioRegistry::validate_send_addr(
             (&ipv4 as *const SOCKADDR_IN).cast(),
-            std::mem::size_of::<SOCKADDR_IN>() as i32,
+            size_of::<SOCKADDR_IN>() as i32,
         )
         .expect("valid IPv4 sockaddr should pass");
-        assert_eq!(rio_len, std::mem::size_of::<SOCKADDR_INET>() as u32);
+        assert_eq!(rio_len, size_of::<SOCKADDR_INET>() as u32);
 
         // SAFETY: SOCKADDR_IN6 is POD; the test fills the family field explicitly.
-        let mut ipv6: SOCKADDR_IN6 = unsafe { std::mem::zeroed() };
+        let mut ipv6: SOCKADDR_IN6 = unsafe { zeroed() };
         ipv6.sin6_family = AF_INET6;
         let rio_len = RioRegistry::validate_send_addr(
             (&ipv6 as *const SOCKADDR_IN6).cast(),
-            std::mem::size_of::<SOCKADDR_IN6>() as i32,
+            size_of::<SOCKADDR_IN6>() as i32,
         )
         .expect("valid IPv6 sockaddr should pass");
-        assert_eq!(rio_len, std::mem::size_of::<SOCKADDR_INET>() as u32);
+        assert_eq!(rio_len, size_of::<SOCKADDR_INET>() as u32);
     }
 }

@@ -1,19 +1,22 @@
-use crate::IocpHandle;
-use crate::diagnostics::IocpCompletionDiagnostics;
-use crate::error::{IocpError, IocpResult};
-use crate::rio::SocketInflightToken;
-use crate::win32::{IoCompletionPort, Overlapped};
-use std::io;
-use std::ptr::NonNull;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::Instant;
-use veloq_driver_core::driver::registry::OpRegistry as CoreOpRegistry;
-use veloq_driver_core::driver::{CompletionToken, OpToken};
-use veloq_driver_core::slot::{Slot as CoreSlot, SlotSpec as CoreSlotSpec};
+use crate::{
+    IocpHandle,
+    diagnostics::IocpCompletionDiagnostics,
+    error::{IocpError, IocpResult},
+    op::{IocpOp, IocpUserPayload},
+    rio::SocketInflightToken,
+    win32::{IoCompletionPort, Overlapped},
+};
+use std::{
+    io,
+    ptr::NonNull,
+    sync::{Arc, atomic::Ordering},
+    time::Instant,
+};
+use veloq_driver_core::{
+    driver::{CompletionToken, OpToken, registry::OpRegistry as CoreOpRegistry},
+    slot::{Slot as CoreSlot, SlotSpec as CoreSlotSpec},
+};
 use veloq_storage::{AtomicOptionPtr, StateOptionPtr};
-
-use crate::op::{IocpOp, IocpUserPayload};
 
 pub(crate) type BlockingSuccessCleanup = fn(usize);
 

@@ -1,19 +1,21 @@
-//! Runtime datapath: hot path buffer/pool state and UDP submissions.
-
 pub(crate) mod control_flow;
 
-use crate::IoFd;
-use crate::config::{BorrowedRawHandle, SocketKey};
-use crate::op::SubmissionResult;
-use crate::rio::core::{RioAddressPolicy, RioOpKind, RioSubmissionKind, RioSubmitPlan};
-use crate::rio::error::{RioError, RioResult};
-use crate::rio::{
-    RioState, SocketInflightGuard, SocketInflightToken, SocketLifecycleState, SocketRuntimeState,
+use crate::{
+    IoFd,
+    config::{BorrowedRawHandle, SocketKey},
+    op::SubmissionResult,
+    rio::{
+        RioState, SocketInflightGuard, SocketInflightToken, SocketLifecycleState,
+        SocketRuntimeState,
+        core::{RioAddressPolicy, RioOpKind, RioSubmissionKind, RioSubmitPlan},
+        error::{RioError, RioResult},
+    },
 };
 use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
-use veloq_driver_core::driver::OpToken;
-use veloq_driver_core::op::UdpRecvFrom;
+use std::ffi::c_void;
+use veloq_buf::{BufferRegistrar, FixedBuf};
+use veloq_driver_core::{driver::OpToken, op::UdpRecvFrom};
 
 pub(crate) use control_flow::RioSocketActor;
 
@@ -28,8 +30,8 @@ pub(crate) struct RioTarget<'a> {
 pub(crate) struct RioSendToArgs<'a> {
     pub(crate) fd: IoFd,
     pub(crate) handle: BorrowedRawHandle<'a>,
-    pub(crate) buf: &'a veloq_buf::FixedBuf,
-    pub(crate) addr_ptr: *const std::ffi::c_void,
+    pub(crate) buf: &'a FixedBuf,
+    pub(crate) addr_ptr: *const c_void,
     pub(crate) addr_len: i32,
     pub(crate) token: OpToken,
     pub(crate) buf_offset: usize,
@@ -39,7 +41,7 @@ pub(crate) struct RioUdpRecvFromArgs<'a> {
     pub(crate) fd: IoFd,
     pub(crate) handle: BorrowedRawHandle<'a>,
     pub(crate) recv_from_op: &'a mut UdpRecvFrom,
-    pub(crate) addr_ptr: *mut std::ffi::c_void,
+    pub(crate) addr_ptr: *mut c_void,
     pub(crate) token: OpToken,
 }
 
@@ -147,7 +149,7 @@ impl RioState {
     pub(crate) fn try_submit_send_to(
         &mut self,
         args: RioSendToArgs<'_>,
-        registrar: &dyn veloq_buf::BufferRegistrar,
+        registrar: &dyn BufferRegistrar,
     ) -> RioResult<SubmissionResult> {
         self.try_submit_send_to_internal(args, registrar)
     }
@@ -155,7 +157,7 @@ impl RioState {
     fn try_submit_send_to_internal(
         &mut self,
         args: RioSendToArgs<'_>,
-        registrar: &dyn veloq_buf::BufferRegistrar,
+        registrar: &dyn BufferRegistrar,
     ) -> RioResult<SubmissionResult> {
         let RioSendToArgs {
             fd,
@@ -201,7 +203,7 @@ impl RioState {
     pub(crate) fn try_submit_recv_from(
         &mut self,
         args: RioUdpRecvFromArgs<'_>,
-        registrar: &dyn veloq_buf::BufferRegistrar,
+        registrar: &dyn BufferRegistrar,
     ) -> RioResult<SubmissionResult> {
         self.try_submit_recv_from_internal(args, registrar)
     }
@@ -209,7 +211,7 @@ impl RioState {
     fn try_submit_recv_from_internal(
         &mut self,
         args: RioUdpRecvFromArgs<'_>,
-        registrar: &dyn veloq_buf::BufferRegistrar,
+        registrar: &dyn BufferRegistrar,
     ) -> RioResult<SubmissionResult> {
         let RioUdpRecvFromArgs {
             fd,
@@ -298,7 +300,7 @@ mod tests {
     use crate::BufferRegistrationMode;
     use crate::config::IocpHandle;
     use crate::rio::core::{RioKernel, RioRegistry, RioRq};
-    use crate::rio::runtime::RioSocketActor;
+    use std::ptr::null_mut;
 
     fn test_state() -> RioState {
         use rustc_hash::FxHashMap;
@@ -318,7 +320,7 @@ mod tests {
     }
 
     fn test_socket_key() -> SocketKey {
-        IocpHandle::for_socket(std::ptr::null_mut())
+        IocpHandle::for_socket(null_mut())
     }
 
     #[test]

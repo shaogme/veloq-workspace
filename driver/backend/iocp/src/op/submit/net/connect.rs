@@ -6,15 +6,19 @@ use windows_sys::Win32::Networking::WinSock::{
     SOCKADDR_STORAGE, SOL_SOCKET,
 };
 
-use crate::config::BorrowedRawHandle;
-use crate::error::{IocpError, IocpResult};
-use crate::ext::Extensions;
-use crate::net::addr::{self, SockAddrStorage};
-use crate::op::submit::{
-    ConnectExArgs, SubmissionResult, ensure_iocp_association, iocp_submit_connect_ex,
-    resolve_fd_handle, unpack_kernel_ref,
+use crate::{
+    config::{BorrowedRawHandle, RawHandle},
+    error::{IocpError, IocpResult},
+    ext::Extensions,
+    net::addr::{self, SockAddrIn, SockAddrIn6, SockAddrStorage},
+    op::{
+        Connect, KernelRef, OverlappedEntry, SubmitContext, UdpConnect,
+        submit::{
+            ConnectExArgs, SubmissionResult, ensure_iocp_association, iocp_submit_connect_ex,
+            resolve_fd_handle, unpack_kernel_ref,
+        },
+    },
 };
-use crate::op::{Connect, KernelRef, OverlappedEntry, SubmitContext, UdpConnect};
 
 use super::{mark_socket_header_in_flight, with_borrowed_socket};
 
@@ -39,7 +43,7 @@ pub(crate) fn submit_connect(
     .with_ctx("handle_raw", raw.as_handle() as usize)
     .with_ctx("user_data", header.token.index())
     .with_ctx("generation", header.token.generation())?;
-    let raw_handle = crate::config::RawHandle::new(raw);
+    let raw_handle = RawHandle::new(raw);
     let handle = raw_handle.borrow();
     ensure_socket_bound(handle, connect_op)?;
     let connect_ex = ctx.ext.connect_ex;
@@ -107,18 +111,18 @@ fn ensure_socket_bound(handle: BorrowedRawHandle<'_>, connect_op: &Connect) -> I
     let family = connect_op.addr.family();
     let (storage, len) = if family == AF_INET {
         let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
-        let s = addr::SockAddrIn::new(&addr);
+        let s = SockAddrIn::new(&addr);
         let mut storage = SockAddrStorage::default();
-        let sin_ref = from_bytes_mut::<addr::SockAddrIn>(
+        let sin_ref = from_bytes_mut::<SockAddrIn>(
             &mut bytes_of_mut(&mut storage)[..std::mem::size_of::<SOCKADDR_IN>()],
         );
         *sin_ref = s;
         (storage, std::mem::size_of::<SOCKADDR_IN>() as i32)
     } else {
         let addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
-        let s = addr::SockAddrIn6::new(&addr);
+        let s = SockAddrIn6::new(&addr);
         let mut storage = SockAddrStorage::default();
-        let sin6_ref = from_bytes_mut::<addr::SockAddrIn6>(
+        let sin6_ref = from_bytes_mut::<SockAddrIn6>(
             &mut bytes_of_mut(&mut storage)[..std::mem::size_of::<SOCKADDR_IN6>()],
         );
         *sin6_ref = s;

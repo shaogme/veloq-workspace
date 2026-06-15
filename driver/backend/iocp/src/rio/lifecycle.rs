@@ -1,37 +1,51 @@
 //! Shutdown and deferred cleanup orchestration for `RioState`.
 
-use crate::config::SocketKey;
-use crate::driver::IocpDriverCompletionDiagnostics;
-use crate::rio::ActorKey;
-use crate::rio::RioState;
-use crate::rio::core::{
-    RioCompletionKind, RioKernel, RioOpRequestInit, RioRegistry, RioRequestContextDecode,
+use crate::{
+    BufferRegistrationMode,
+    config::SocketKey,
+    driver::IocpDriverCompletionDiagnostics,
+    op::IocpUserPayload,
+    rio::{
+        ActorKey, RioState, SocketRuntimeState,
+        core::{
+            RioCompletionKind, RioKernel, RioOpRequestInit, RioRegistry, RioRequestContextDecode,
+        },
+        error::{RioError, RioResult},
+        runtime::{
+            RioSocketActor,
+            control_flow::{
+                rio_malformed_context_anomaly, rio_missing_context_anomaly,
+                rio_stale_context_anomaly,
+            },
+            release_socket_inflight_token_from,
+        },
+    },
 };
-use crate::rio::error::{RioError, RioResult};
-use crate::rio::runtime::RioSocketActor;
-use crate::rio::runtime::control_flow::{
-    rio_malformed_context_anomaly, rio_missing_context_anomaly, rio_stale_context_anomaly,
-};
-use crate::rio::runtime::release_socket_inflight_token_from;
 use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use slotmap::SlotMap;
-use std::sync::OnceLock;
+use std::{
+    mem::zeroed,
+    sync::OnceLock,
+    thread::{sleep, yield_now},
+    time::{Duration, Instant},
+};
+use veloq_buf::NoopRegistrar;
 use windows_sys::Win32::Networking::WinSock::{RIO_CORRUPT_CQ, RIORESULT};
 
-const RIO_REAPER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const RIO_REAPER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct DeferredRioCleanup {
     kernel: RioKernel,
     registry: RioRegistry,
-    registration_mode: crate::BufferRegistrationMode,
+    registration_mode: BufferRegistrationMode,
     submissions_closed: bool,
     actors: SlotMap<ActorKey, RioSocketActor>,
     actor_by_handle: FxHashMap<SocketKey, ActorKey>,
-    socket_runtime: FxHashMap<SocketKey, crate::rio::SocketRuntimeState>,
+    socket_runtime: FxHashMap<SocketKey, SocketRuntimeState>,
     outstanding_count: usize,
     next_request_id: u64,
-    deferred_payloads: Vec<crate::op::IocpUserPayload>,
+    deferred_payloads: Vec<IocpUserPayload>,
     diagnostics: IocpDriverCompletionDiagnostics,
 }
 
@@ -150,7 +164,7 @@ impl RioState {
         Ok(())
     }
 
-    pub(crate) fn drain_outstanding(&mut self, timeout: std::time::Duration) -> RioResult<()> {
+    pub(crate) fn drain_outstanding(&mut self, timeout: Duration) -> RioResult<()> {
         struct Backoff {
             yields: u32,
         }
@@ -165,14 +179,14 @@ impl RioState {
             fn snooze(&mut self) {
                 if self.yields < 10 {
                     self.yields += 1;
-                    std::thread::yield_now();
+                    yield_now();
                 } else {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    sleep(Duration::from_millis(1));
                 }
             }
         }
 
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let mut backoff = Backoff::new();
         while self.outstanding_count > 0 {
             if start.elapsed() >= timeout {
@@ -184,7 +198,7 @@ impl RioState {
 
             const MAX_RESULTS: usize = 128;
             // SAFETY: RIORESULT is a POD struct and safe to zero-initialize.
-            let mut results: [RIORESULT; MAX_RESULTS] = unsafe { std::mem::zeroed() };
+            let mut results: [RIORESULT; MAX_RESULTS] = unsafe { zeroed() };
             let count = self.kernel.dequeue(&mut results);
 
             if count == RIO_CORRUPT_CQ {
@@ -214,10 +228,7 @@ impl RioState {
                 "finalizing RIO state before outstanding requests drained"
             );
         }
-        if let Some(env) = self
-            .kernel
-            .env(&veloq_buf::NoopRegistrar, self.registration_mode)
-        {
+        if let Some(env) = self.kernel.env(&NoopRegistrar, self.registration_mode) {
             self.registry.cleanup_deregister(env);
         }
         self.kernel.close();
@@ -244,7 +255,7 @@ impl RioState {
         })
     }
 
-    pub(crate) fn defer_payloads(&mut self, payloads: Vec<crate::op::IocpUserPayload>) {
+    pub(crate) fn defer_payloads(&mut self, payloads: Vec<IocpUserPayload>) {
         self.deferred_payloads.extend(payloads);
     }
 }

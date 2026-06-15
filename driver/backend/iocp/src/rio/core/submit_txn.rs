@@ -1,19 +1,28 @@
-use super::registry::{RioAddrReservation, RioPreparedBuffer};
-use super::request::{
-    RioAddressPolicy, RioOpRequestInit, RioPreparedRequest, RioRequestDiagnostics, RioSubmitPlan,
+use super::{
+    registry::{RioAddrReservation, RioPreparedBuffer},
+    request::{
+        RioAddressPolicy, RioOpRequestInit, RioPreparedRequest, RioRequestDiagnostics,
+        RioSubmitPlan,
+    },
+    submit_ops::{RioDispatch, RioKernel, RioRq},
 };
-use super::submit_ops::{RioDispatch, RioKernel, RioRq};
-use crate::config::SocketKey;
-use crate::op::SubmissionResult;
-use crate::rio::error::{RioError, RioResult};
-use crate::rio::{RioEnv, RioState, SocketInflightToken, SocketLifecycleState};
+use crate::{
+    config::SocketKey,
+    op::SubmissionResult,
+    rio::{
+        RioEnv, RioState, SocketInflightToken, SocketLifecycleState,
+        error::{RioError, RioResult},
+    },
+};
 use diagweave::prelude::*;
+use std::mem::size_of;
+use veloq_buf::BufferRegistrar;
 use windows_sys::Win32::Networking::WinSock::SOCKADDR_INET;
 
 struct RioSubmitTxn<'a> {
     state: &'a mut RioState,
     plan: RioSubmitPlan<'a>,
-    registrar: &'a dyn veloq_buf::BufferRegistrar,
+    registrar: &'a dyn BufferRegistrar,
     rq: Option<RioRq>,
     socket_inflight: Option<SocketInflightToken>,
     data_buf: Option<RioPreparedBuffer>,
@@ -28,7 +37,7 @@ impl<'a> RioSubmitTxn<'a> {
     fn new(
         state: &'a mut RioState,
         plan: RioSubmitPlan<'a>,
-        registrar: &'a dyn veloq_buf::BufferRegistrar,
+        registrar: &'a dyn BufferRegistrar,
     ) -> Self {
         let outstanding_snapshot = state.outstanding_count;
         Self {
@@ -510,7 +519,7 @@ impl RioState {
     pub(crate) fn submit_rio(
         &mut self,
         plan: RioSubmitPlan<'_>,
-        registrar: &dyn veloq_buf::BufferRegistrar,
+        registrar: &dyn BufferRegistrar,
         submit: impl FnOnce(&RioKernel, &RioPreparedRequest) -> RioResult<()>,
     ) -> RioResult<SubmissionResult> {
         RioSubmitTxn::new(self, plan, registrar)
@@ -541,7 +550,7 @@ impl RioState {
                         .attach_note("RIO recv_from received null address buffer");
                 }
                 let mut addr = self.registry.prepare_recv_addr(env)?;
-                addr.rio_buf.Length = std::mem::size_of::<SOCKADDR_INET>() as u32;
+                addr.rio_buf.Length = size_of::<SOCKADDR_INET>() as u32;
                 Ok(Some(addr))
             }
         }
@@ -559,13 +568,15 @@ impl RioState {
 
 #[cfg(test)]
 mod tests {
-    use super::super::registry::{RioRegistry, RioSubmissionKind, test_helpers};
+    use super::super::{RioRegistry, RioSubmissionKind, registry::test_helpers};
     use super::*;
     use crate::BufferRegistrationMode;
-    use crate::config::{IoFd, IocpHandle, RawHandle};
+    use crate::config::{BorrowedRawHandle, IoFd, IocpHandle, RawHandle};
     use crate::net::addr::SockAddrStorage;
+    use crate::rio::core::RioOpKind;
     use std::cell::Cell;
     use std::sync::atomic::Ordering;
+    use veloq_buf::{FixedBuf, NoopRegistrar};
     use veloq_driver_core::driver::OpToken;
 
     fn test_state_with_dispatch(addr_capacity: usize) -> RioState {
@@ -587,15 +598,15 @@ mod tests {
     }
 
     fn test_plan<'a>(
-        handle: crate::config::BorrowedRawHandle<'a>,
-        buffer: &'a veloq_buf::FixedBuf,
+        handle: BorrowedRawHandle<'a>,
+        buffer: &'a FixedBuf,
         address: RioAddressPolicy,
     ) -> RioSubmitPlan<'a> {
         RioSubmitPlan {
             fd: IoFd::fixed_with_generation(7, 9),
             handle,
             token: OpToken::from_registry_parts(11, 17).expect("test token should be encodable"),
-            op_kind: super::super::RioOpKind::RecvFrom,
+            op_kind: RioOpKind::RecvFrom,
             buffer_kind: RioSubmissionKind::Recv,
             buffer,
             buffer_offset: 0,
@@ -628,7 +639,7 @@ mod tests {
             },
         );
 
-        let err = match state.submit_rio(plan, &veloq_buf::NoopRegistrar, |_kernel, _request| {
+        let err = match state.submit_rio(plan, &NoopRegistrar, |_kernel, _request| {
             panic!("closing socket should fail before kernel submit")
         }) {
             Ok(_) => panic!("closing socket should reject submission transaction"),
@@ -672,7 +683,7 @@ mod tests {
             },
         );
 
-        let err = match state.submit_rio(plan, &veloq_buf::NoopRegistrar, |_kernel, request| {
+        let err = match state.submit_rio(plan, &NoopRegistrar, |_kernel, request| {
             request_context.set(request.as_request_context() as usize as u64);
             Err(RioError::Datapath
                 .to_report()

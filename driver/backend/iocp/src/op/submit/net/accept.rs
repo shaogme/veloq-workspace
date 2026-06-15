@@ -3,17 +3,24 @@ use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, SO_UPDATE_ACCEPT_CONTEXT, SOCKADDR, SOCKADDR_STORAGE, SOCKET, SOL_SOCKET,
 };
 
-use crate::config::BorrowedRawHandle;
-use crate::error::{IocpError, IocpResult};
-use crate::ext::Extensions;
-use crate::net::addr::{self, SockAddrStorage};
-use crate::op::submit::{
-    AcceptExArgs, SubmissionResult, ensure_iocp_association, iocp_submit_accept_ex,
-    resolve_fd_handle,
+use crate::{
+    Socket,
+    config::{BorrowedRawHandle, IocpHandle, RawHandle},
+    error::{IocpError, IocpResult},
+    ext::Extensions,
+    net::addr::{self, SockAddrStorage},
+    op::{
+        ACCEPT_EX_ADDR_SECTION_LEN, AcceptPayload, OverlappedEntry, SubmitContext,
+        submit::{
+            AcceptExArgs, SubmissionResult, ensure_iocp_association, iocp_submit_accept_ex,
+            resolve_fd_handle,
+        },
+    },
 };
-use crate::op::{ACCEPT_EX_ADDR_SECTION_LEN, AcceptPayload, OverlappedEntry, SubmitContext};
-use veloq_driver_core::RawHandleMeta;
-use veloq_driver_core::driver::{CompletionCleanup, CompletionCleanupGuard};
+use veloq_driver_core::{
+    RawHandleMeta,
+    driver::{CompletionCleanup, CompletionCleanupGuard},
+};
 
 use super::{mark_socket_header_in_flight, with_borrowed_socket};
 
@@ -41,14 +48,14 @@ pub(crate) fn submit_accept(
     let user = unsafe { payload.user.as_mut()? };
     let raw = resolve_fd_handle(&user.fd, &*ctx.registered_slots)?;
     header.resolved_handle = Some(raw);
-    let raw_handle = crate::config::RawHandle::new(raw);
+    let raw_handle = RawHandle::new(raw);
     let handle = raw_handle.borrow();
     if payload.accept_socket.is_none() {
         let family = socket_family_from_handle(handle)?;
         let accept_socket = if family == AF_INET {
-            crate::Socket::new_tcp_v4()
+            Socket::new_tcp_v4()
         } else {
-            crate::Socket::new_tcp_v6()
+            Socket::new_tcp_v6()
         }
         .map(|s| s.into_owned_raw())
         .push_ctx("scope", "submit_accept.create_accept_socket")
@@ -187,7 +194,7 @@ pub(crate) fn completion_cleanup_close_socket(
         return CompletionCleanupGuard::default();
     };
     CompletionCleanupGuard::new(CompletionCleanup::new(move || {
-        crate::config::IocpHandle::for_socket(raw as _).close();
+        IocpHandle::for_socket(raw as _).close();
         Ok(())
     }))
 }

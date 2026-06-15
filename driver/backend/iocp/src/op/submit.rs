@@ -2,21 +2,26 @@ mod file;
 mod net;
 
 use diagweave::prelude::*;
-use std::io;
-use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, GetLastError};
-use windows_sys::Win32::Networking::WinSock::SOCKET;
-use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
-use windows_sys::Win32::System::IO::OVERLAPPED;
-
-use crate::config::{BorrowedRawHandle, IoFd, IocpAssociation, IocpHandle, RegisteredSlot};
-use crate::error::{IocpError, IocpResult};
-use crate::ext::{LpfnAcceptEx, LpfnConnectEx};
-use crate::op::{
-    AcceptPayload, Close, Connect, Fallocate, Fsync, KernelRef, OpSend, OverlappedEntry, Recv,
-    SendToPayload, SubmitContext, SyncFileRange, Timeout, UdpConnect, UdpRecv, UdpRecvFromPayload,
-    UdpSend, Wakeup,
+use std::{ffi::c_void, io, time::Duration};
+use veloq_blocking::BlockingTask;
+use windows_sys::Win32::{
+    Foundation::{ERROR_IO_PENDING, GetLastError},
+    Networking::WinSock::{SOCKADDR, SOCKET},
+    Storage::FileSystem::{ReadFile, WriteFile},
+    System::IO::OVERLAPPED,
 };
-use crate::win32::{IoCompletionPort, Overlapped};
+
+use crate::{
+    config::{BorrowedRawHandle, IoFd, IocpAssociation, IocpHandle, RegisteredSlot},
+    error::{IocpError, IocpResult},
+    ext::{LpfnAcceptEx, LpfnConnectEx},
+    op::{
+        AcceptPayload, Close, Connect, Fallocate, Fsync, KernelRef, OpSend, OverlappedEntry,
+        ReadFixed, Recv, SendToPayload, SubmitContext, SyncFileRange, Timeout, UdpConnect, UdpRecv,
+        UdpRecvFromPayload, UdpSend, Wakeup, WriteFixed,
+    },
+    win32::{IoCompletionPort, Overlapped},
+};
 
 pub(crate) use file::{
     completion_cleanup_close_file, submit_close, submit_fallocate, submit_fallocate_raw,
@@ -33,16 +38,16 @@ pub(crate) use net::{
 pub(crate) enum SubmissionResult {
     Pending,
     PostToQueue,
-    Offload(veloq_blocking::BlockingTask),
-    Timer(std::time::Duration),
+    Offload(BlockingTask),
+    Timer(Duration),
 }
 
 pub(crate) struct ConnectExArgs {
     pub(crate) connect_ex: LpfnConnectEx,
     pub(crate) s: SOCKET,
-    pub(crate) name: *const windows_sys::Win32::Networking::WinSock::SOCKADDR,
+    pub(crate) name: *const SOCKADDR,
     pub(crate) namelen: i32,
-    pub(crate) lp_send_buffer: *const std::ffi::c_void,
+    pub(crate) lp_send_buffer: *const c_void,
     pub(crate) dw_send_data_length: u32,
     pub(crate) lp_dw_bytes_sent: *mut u32,
     pub(crate) lp_overlapped: *mut Overlapped,
@@ -52,7 +57,7 @@ pub(crate) struct AcceptExArgs {
     pub(crate) accept_ex: LpfnAcceptEx,
     pub(crate) s_listen_socket: SOCKET,
     pub(crate) s_accept_socket: SOCKET,
-    pub(crate) lp_output_buffer: *mut std::ffi::c_void,
+    pub(crate) lp_output_buffer: *mut c_void,
     pub(crate) dw_receive_data_length: u32,
     pub(crate) dw_local_address_length: u32,
     pub(crate) dw_remote_address_length: u32,
@@ -347,28 +352,20 @@ pub(crate) fn mark_header_in_flight(
 
 macro_rules! impl_get_fd {
     ($fn_name:ident, $payload:ty, direct_fd) => {
-        pub(crate) unsafe fn $fn_name(payload: &$payload) -> Option<crate::config::IoFd> {
+        pub(crate) unsafe fn $fn_name(payload: &$payload) -> Option<IoFd> {
             // SAFETY: the caller guarantees the payload pointer is valid.
             unsafe { payload.user.as_ref().ok().map(|user| user.fd) }
         }
     };
     ($fn_name:ident, $payload:ty, no_fd) => {
-        pub(crate) unsafe fn $fn_name(_payload: &$payload) -> Option<crate::config::IoFd> {
+        pub(crate) unsafe fn $fn_name(_payload: &$payload) -> Option<IoFd> {
             None
         }
     };
 }
 
-impl_get_fd!(
-    get_fd_read_fixed,
-    KernelRef<crate::op::ReadFixed>,
-    direct_fd
-);
-impl_get_fd!(
-    get_fd_write_fixed,
-    KernelRef<crate::op::WriteFixed>,
-    direct_fd
-);
+impl_get_fd!(get_fd_read_fixed, KernelRef<ReadFixed>, direct_fd);
+impl_get_fd!(get_fd_write_fixed, KernelRef<WriteFixed>, direct_fd);
 impl_get_fd!(get_fd_recv, KernelRef<Recv>, direct_fd);
 impl_get_fd!(get_fd_send, KernelRef<OpSend>, direct_fd);
 impl_get_fd!(get_fd_udp_recv, KernelRef<UdpRecv>, direct_fd);
@@ -392,7 +389,7 @@ impl_get_fd!(get_fd_fallocate, KernelRef<Fallocate>, direct_fd);
 ///
 /// The caller must ensure that header, payload, and ctx are valid.
 pub(crate) fn submit_wakeup(
-    _header: &mut crate::op::OverlappedEntry,
+    _header: &mut OverlappedEntry,
     _payload: &mut KernelRef<Wakeup>,
     _ctx: &mut SubmitContext,
 ) -> IocpResult<SubmissionResult> {
@@ -403,7 +400,7 @@ pub(crate) fn submit_wakeup(
 ///
 /// The caller must ensure that header, payload, and ctx are valid.
 pub(crate) fn submit_timeout(
-    _header: &mut crate::op::OverlappedEntry,
+    _header: &mut OverlappedEntry,
     payload: &mut KernelRef<Timeout>,
     _ctx: &mut SubmitContext,
 ) -> IocpResult<SubmissionResult> {

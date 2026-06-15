@@ -1,28 +1,39 @@
 //! Actor coordination and completion routing for the RIO runtime.
 
-use crate::IoFd;
-use crate::config::{BorrowedRawHandle, SocketKey};
-use crate::driver::IocpDriverCompletionDiagnostics;
-use crate::error::{IocpError, IocpResult};
-use crate::op::{IocpOpRegistry, IocpSlotSpec};
-use crate::rio::core::{
-    RioBufferLeaseToken, RioCompletionKind, RioOpRequestInit, RioRegistry, RioRequestContextDecode,
-    RioRq, rio_result_to_event_res,
+use crate::{
+    IoFd,
+    config::{BorrowedRawHandle, SocketKey},
+    driver::IocpDriverCompletionDiagnostics,
+    error::{IocpDriverResult, IocpError, IocpResult},
+    op::{IocpOpPayload, IocpOpRegistry, IocpSlotSpec, Slot},
+    rio::{
+        RioEnv, RioState, SocketInflightToken, SocketLifecycleState, SocketRuntimeState,
+        core::{
+            RioBufferLeaseToken, RioCompletionKind, RioOpRequestInit, RioRegistry,
+            RioRequestContextDecode, RioRq, rio_result_to_event_res,
+        },
+        error::{RioError, RioResult},
+        runtime::release_socket_inflight_token_from,
+    },
 };
-use crate::rio::error::{RioError, RioResult};
-use crate::rio::runtime::release_socket_inflight_token_from;
-use crate::rio::{RioEnv, RioState, SocketInflightToken, SocketLifecycleState, SocketRuntimeState};
 use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
+use std::mem::{take, zeroed};
 use tracing::debug;
-use veloq_driver_core::driver::{
-    CompletionAnomaly, CompletionBackendHooks, CompletionBackendIngressAction, CompletionControl,
-    CompletionFlowExt, CompletionHookOutcome, CompletionIngress, CompletionSource, CompletionToken,
-    RawCompletion, SharedCompletionTable, UserCompletionEvent,
+use veloq_buf::BufferRegistrar;
+use veloq_driver_core::{
+    driver::{
+        CompletionAnomaly, CompletionAnomalyReason, CompletionBackendHooks,
+        CompletionBackendIngressAction, CompletionControl, CompletionFlowExt,
+        CompletionHookOutcome, CompletionIngress, CompletionSource, CompletionToken, RawCompletion,
+        SharedCompletionTable, UserCompletionEvent,
+    },
+    slot::{InFlightOrphaned, InFlightWaiting, SlotState},
 };
-use veloq_driver_core::slot::{InFlightOrphaned, InFlightWaiting};
-use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
-use windows_sys::Win32::Networking::WinSock::{RIO_CORRUPT_CQ, RIORESULT};
+use windows_sys::Win32::{
+    Foundation::ERROR_OPERATION_ABORTED,
+    Networking::WinSock::{RIO_CORRUPT_CQ, RIORESULT},
+};
 
 pub(crate) struct RioSocketActor {
     pub(crate) rq: RioRq,
@@ -128,8 +139,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
     fn handle_control(
         &mut self,
         _control: CompletionControl,
-    ) -> crate::error::IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>>
-    {
+    ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         Ok(CompletionHookOutcome::Ignore {
             effect: RioBackendEffect::default(),
         })
@@ -138,17 +148,16 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
     fn complete_waiting(
         &mut self,
         event: UserCompletionEvent,
-        slot: crate::op::Slot<'_, InFlightWaiting>,
+        slot: Slot<'_, InFlightWaiting>,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> crate::error::IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>>
-    {
+    ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         let CompletionSource::Backend(ingress) = source else {
             return Ok(CompletionHookOutcome::Anomaly {
                 anomaly: CompletionAnomaly::backend_invariant_broken(
                     event.completion_token(),
                     event.token().index(),
                     event.token().generation(),
-                    veloq_driver_core::slot::SlotState::InFlightWaiting,
+                    SlotState::InFlightWaiting,
                 )
                 .with_raw_completion(event.raw()),
                 effect: RioBackendEffect::default(),
@@ -166,10 +175,9 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
     fn complete_orphaned(
         &mut self,
         event: UserCompletionEvent,
-        slot: crate::op::Slot<'_, InFlightOrphaned>,
+        slot: Slot<'_, InFlightOrphaned>,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> crate::error::IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>>
-    {
+    ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         let CompletionSource::Backend(ingress) = source else {
             return Ok(CompletionHookOutcome::Ignore {
                 effect: RioBackendEffect::default(),
@@ -183,8 +191,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
         _event: UserCompletionEvent,
         anomaly: CompletionAnomaly,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> crate::error::IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>>
-    {
+    ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         let effect = match source {
             CompletionSource::Backend(ingress) => RioBackendEffect::from_init(&ingress.init),
             CompletionSource::Kernel | CompletionSource::User | CompletionSource::Synthetic(_) => {
@@ -197,9 +204,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
     fn complete_backend_ingress(
         &mut self,
         ingress: &Self::BackendIngress,
-    ) -> crate::error::IocpDriverResult<
-        CompletionBackendIngressAction<IocpSlotSpec, Self::BackendEffect>,
-    > {
+    ) -> IocpDriverResult<CompletionBackendIngressAction<IocpSlotSpec, Self::BackendEffect>> {
         Ok(CompletionBackendIngressAction::RouteUser(
             UserCompletionEvent::from_parts(
                 crate::driver::completion::COMP_BACKEND_RIO,
@@ -241,7 +246,7 @@ fn iocp_completion_error_to_rio(error: Report<IocpError>) -> Report<RioError> {
 fn complete_rio_waiting_slot(
     registry: &mut RioRegistry,
     ext: &crate::ext::Extensions,
-    mut slot: crate::op::Slot<'_, InFlightWaiting>,
+    mut slot: Slot<'_, InFlightWaiting>,
     event: UserCompletionEvent,
     ingress: &RioIngress,
 ) -> CompletionHookOutcome<IocpSlotSpec, RioBackendEffect> {
@@ -326,7 +331,7 @@ fn complete_rio_waiting_slot(
 
     let _ = slot.with_op_mut(|iocp_op| {
         if let Some(addr_slot) = init.addr_slot
-            && let crate::op::IocpOpPayload::UdpRecvFrom(payload) = &mut iocp_op.payload
+            && let IocpOpPayload::UdpRecvFrom(payload) = &mut iocp_op.payload
             && !cancelled
             && completion.is_ok()
             && let Err(e) = registry
@@ -390,7 +395,7 @@ fn complete_rio_waiting_slot(
 }
 
 fn complete_rio_orphaned_slot(
-    mut slot: crate::op::Slot<'_, InFlightOrphaned>,
+    mut slot: Slot<'_, InFlightOrphaned>,
     _event: UserCompletionEvent,
     ingress: &RioIngress,
 ) -> CompletionHookOutcome<IocpSlotSpec, RioBackendEffect> {
@@ -425,7 +430,7 @@ fn complete_rio_orphaned_slot(
         .unwrap_or_default();
     let _ = guard.take_op();
     let _ = guard.take_completion_data();
-    let _ = std::mem::take(guard.platform_mut());
+    let _ = take(guard.platform_mut());
     CompletionHookOutcome::Cleanup { cleanup, effect }
 }
 
@@ -445,9 +450,7 @@ pub(crate) fn rio_malformed_context_anomaly(raw_context: u64) -> CompletionAnoma
         raw_result: None,
         flags: None,
         slot_snapshot: None,
-        reason: veloq_driver_core::driver::CompletionAnomalyReason::BackendSpecific(
-            RIO_ANOMALY_MALFORMED,
-        ),
+        reason: CompletionAnomalyReason::BackendSpecific(RIO_ANOMALY_MALFORMED),
     }
 }
 
@@ -595,12 +598,12 @@ impl RioState {
         &mut self,
         ops: &mut IocpOpRegistry,
         ext: &crate::ext::Extensions,
-        registrar: &dyn veloq_buf::BufferRegistrar,
+        registrar: &dyn BufferRegistrar,
         completion_table: &SharedCompletionTable<IocpSlotSpec>,
         diagnostics: &mut IocpDriverCompletionDiagnostics,
     ) -> RioResult<usize> {
         const MAX_RIO_RESULTS: usize = 128;
-        let mut results: [RIORESULT; MAX_RIO_RESULTS] = unsafe { std::mem::zeroed() };
+        let mut results: [RIORESULT; MAX_RIO_RESULTS] = unsafe { zeroed() };
         let Some(env) = self.kernel.env(registrar, self.registration_mode) else {
             return Ok(0);
         };

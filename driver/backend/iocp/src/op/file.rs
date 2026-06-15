@@ -1,15 +1,14 @@
-use crate::config::{IoFd, IocpHandle, OwnedRawHandle, RawHandle};
-use crate::error::{IocpDriverResult as DriverResult, IocpResult};
-use crate::op::spec::IocpOpSpec;
-use crate::op::submit;
-use crate::op::{
-    Close, Fallocate, FallocateRaw, Fsync, FsyncRaw, KernelRef, Open, OpenPayload, OverlappedEntry,
-    ReadFixed, ReadRaw, SubmitContext, SyncFileRange, SyncFileRangeRaw, WriteFixed, WriteRaw,
-    kernel_ref,
+use crate::{
+    config::{IoFd, IocpHandle, OwnedRawHandle, RawHandle},
+    error::{IocpDriverResult as DriverResult, IocpResult},
+    op::{
+        Close, Fallocate, FallocateRaw, Fsync, FsyncRaw, KernelRef, Open, OpenPayload,
+        OverlappedEntry, PayloadRef, ReadFixed, ReadRaw, SubmitContext, SyncFileRange,
+        SyncFileRangeRaw, WriteFixed, WriteRaw, kernel_ref, spec::IocpOpSpec, submit,
+    },
 };
 
-use veloq_driver_core::driver::CompletionCleanupGuard;
-use veloq_driver_core::op::OpKind;
+use veloq_driver_core::{driver::CompletionCleanupGuard, op::OpKind};
 
 impl IocpOpSpec for ReadFixed {
     type KernelPayload = KernelRef<Self>;
@@ -296,7 +295,7 @@ impl IocpOpSpec for Open {
 
     fn new_kernel_payload(_user: &Self) -> Self::KernelPayload {
         OpenPayload {
-            user: crate::op::PayloadRef::unbound(),
+            user: PayloadRef::unbound(),
         }
     }
 

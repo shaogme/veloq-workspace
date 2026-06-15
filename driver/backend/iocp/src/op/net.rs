@@ -1,17 +1,16 @@
-use crate::config::{IoFd, IocpHandle, OwnedRawHandle, RawHandle};
-use crate::error::{IocpDriverResult as DriverResult, IocpResult};
-use crate::ext::Extensions;
-use crate::net::addr::SockAddrStorage;
-use crate::op::spec::IocpOpSpec;
-use crate::op::submit;
-use crate::op::{
-    ACCEPT_EX_OUTPUT_BUFFER_LEN, Accept, AcceptPayload, Connect, KernelRef, OpSend,
-    OverlappedEntry, Recv, SendTo, SendToPayload, SubmitContext, UdpConnect, UdpRecv, UdpRecvFrom,
-    UdpRecvFromPayload, UdpSend, kernel_ref,
+use crate::{
+    config::{IoFd, IocpHandle, OwnedRawHandle, RawHandle},
+    error::{IocpDriverResult as DriverResult, IocpResult},
+    ext::Extensions,
+    net::addr::{SockAddrStorage, socket_addr_to_storage},
+    op::{
+        ACCEPT_EX_OUTPUT_BUFFER_LEN, Accept, AcceptPayload, Connect, KernelRef, OpSend,
+        OverlappedEntry, PayloadRef, Recv, SendTo, SendToPayload, SubmitContext, UdpConnect,
+        UdpRecv, UdpRecvFrom, UdpRecvFromPayload, UdpSend, kernel_ref, spec::IocpOpSpec, submit,
+    },
 };
 
-use veloq_driver_core::driver::CompletionCleanupGuard;
-use veloq_driver_core::op::OpKind;
+use veloq_driver_core::{driver::CompletionCleanupGuard, op::OpKind};
 use windows_sys::Win32::Networking::WinSock::{SOCKADDR_IN, SOCKADDR_IN6};
 
 impl IocpOpSpec for Recv {
@@ -202,7 +201,7 @@ impl IocpOpSpec for Accept {
 
     fn new_kernel_payload(_user: &Self) -> Self::KernelPayload {
         AcceptPayload {
-            user: crate::op::PayloadRef::unbound(),
+            user: PayloadRef::unbound(),
             accept_buffer: [0; ACCEPT_EX_OUTPUT_BUFFER_LEN],
             accept_socket: None,
         }
@@ -250,13 +249,13 @@ impl IocpOpSpec for SendTo {
     const PAYLOAD_KIND: OpKind = OpKind::SendTo;
 
     fn new_kernel_payload(user: &Self) -> Self::KernelPayload {
-        let (addr, _raw_addr_len) = crate::net::addr::socket_addr_to_storage(user.addr);
+        let (addr, _raw_addr_len) = socket_addr_to_storage(user.addr);
         let addr_len = match user.addr {
             std::net::SocketAddr::V4(_) => std::mem::size_of::<SOCKADDR_IN>() as i32,
             std::net::SocketAddr::V6(_) => std::mem::size_of::<SOCKADDR_IN6>() as i32,
         };
         SendToPayload {
-            user: crate::op::PayloadRef::unbound(),
+            user: PayloadRef::unbound(),
             addr,
             addr_len,
         }
@@ -287,7 +286,7 @@ impl IocpOpSpec for UdpRecvFrom {
 
     fn new_kernel_payload(_user: &Self) -> Self::KernelPayload {
         UdpRecvFromPayload {
-            user: crate::op::PayloadRef::unbound(),
+            user: PayloadRef::unbound(),
             addr: SockAddrStorage::default(),
         }
     }
