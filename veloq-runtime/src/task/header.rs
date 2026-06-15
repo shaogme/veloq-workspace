@@ -176,7 +176,6 @@ pub struct GenericTaskHeader<S: Storage> {
     scope: UnsafeCell<ScopeRef<S>>,
     runtime: UnsafeCell<Option<NonNull<RuntimeSharedBase>>>,
     worker_id: S::Usize,
-    injector_next: S::OptionPtr<GenericTaskHeader<S>>,
     vtable: &'static TaskVTable<S>,
 }
 
@@ -206,7 +205,6 @@ impl<S: Storage> GenericTaskHeader<S> {
             scope: UnsafeCell::new(ScopeRef::dummy()),
             runtime: UnsafeCell::new(None),
             worker_id: S::Usize::new(0),
-            injector_next: S::OptionPtr::new(None),
             vtable,
         }
     }
@@ -483,16 +481,6 @@ impl<S: Storage> GenericTaskHeader<S> {
         let runtime = self.runtime();
         runtime.idle.event_count.notify();
         runtime.wake_worker(self.worker_id());
-    }
-
-    #[inline]
-    pub(crate) fn next(&self) -> Option<NonNull<GenericTaskHeader<S>>> {
-        self.injector_next.load(Ordering::Acquire)
-    }
-
-    #[inline]
-    pub(crate) fn set_next(&self, next: Option<NonNull<GenericTaskHeader<S>>>) {
-        self.injector_next.store(next, Ordering::Release);
     }
 
     /// 唤醒任务（消耗所有权）。

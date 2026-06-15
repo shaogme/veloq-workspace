@@ -1,7 +1,5 @@
-use crossbeam_deque::{Steal, Stealer, Worker};
-use parking_lot::Mutex;
+use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use std::{
-    ptr::NonNull,
     sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -19,7 +17,7 @@ use crate::{
         shared::RuntimeShared,
     },
     scope::GenericScopeCompletion,
-    task::{LocalTaskRef, ScopeStorage, SendTaskRef, TaskHandleRef, TaskHeader},
+    task::{LocalTaskRef, ScopeStorage, SendTaskRef, TaskHeader},
     utils::{FastRand, ownership::Ownership},
 };
 
@@ -258,31 +256,27 @@ impl TopologyContext {
 }
 
 pub(crate) struct GlobalInjector {
-    head: Mutex<Option<NonNull<TaskHeader>>>,
+    queue: Injector<SendTaskRef>,
 }
 
 impl GlobalInjector {
     pub(crate) fn new() -> Self {
         Self {
-            head: Mutex::new(None),
+            queue: Injector::new(),
         }
     }
 
     pub(crate) fn push(&self, task: SendTaskRef) {
-        let task_ptr = NonNull::from(task.header());
-        let mut head = self.head.lock();
-        task.header().set_next(*head);
-        *head = Some(task_ptr);
+        self.queue.push(task);
     }
 
     pub(crate) fn pop(&self) -> Option<SendTaskRef> {
-        let mut head = self.head.lock();
-        let head_ptr = (*head)?;
-        let next_ptr = unsafe { head_ptr.as_ref().next() };
-        *head = next_ptr;
-        unsafe {
-            head_ptr.as_ref().set_next(None);
-            Some(SendTaskRef::from_header(head_ptr.as_ptr()))
+        loop {
+            match self.queue.steal() {
+                Steal::Success(task) => return Some(task),
+                Steal::Retry => continue,
+                Steal::Empty => return None,
+            }
         }
     }
 }
