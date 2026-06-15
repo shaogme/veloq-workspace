@@ -1,11 +1,19 @@
-use std::num::NonZeroUsize;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-use std::path::{Path, PathBuf};
-use veloq::fs::{File, LocalFile};
-use veloq::io::{AsyncBufRead, AsyncBufWrite};
-use veloq::runtime::Runtime;
+use std::{
+    env,
+    fs::remove_file,
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+    process,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
+use veloq::{
+    fs::{File, LocalFile},
+    io::{AsyncBufRead, AsyncBufWrite},
+    runtime::Runtime,
+};
 use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
 
 static TEMP_FILE_ID: AtomicUsize = AtomicUsize::new(0);
@@ -16,7 +24,7 @@ impl CleanupGuard {
     fn new(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref().to_path_buf();
         if path.exists() {
-            let _ = std::fs::remove_file(&path);
+            let _ = remove_file(&path);
         }
         Self(path)
     }
@@ -25,7 +33,7 @@ impl CleanupGuard {
 impl Drop for CleanupGuard {
     fn drop(&mut self) {
         if self.0.exists() {
-            let _ = std::fs::remove_file(&self.0);
+            let _ = remove_file(&self.0);
         }
     }
 }
@@ -39,7 +47,7 @@ fn create_runtime() -> Runtime<UniformSlot> {
 
 fn temp_file_path(label: &str) -> PathBuf {
     let id = TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("veloq-{label}-{}-{id}.tmp", std::process::id()))
+    env::temp_dir().join(format!("veloq-{label}-{}-{id}.tmp", process::id()))
 }
 
 #[test]

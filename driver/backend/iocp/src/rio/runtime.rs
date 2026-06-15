@@ -265,10 +265,10 @@ impl SocketInflightGuard<'_> {
 
 impl Drop for SocketInflightGuard<'_> {
     fn drop(&mut self) {
-        if let Some(token) = self.token.take() {
-            if let Err(e) = self.state.release_socket_inflight_token(token) {
-                tracing::error!(error = ?e, "failed to release socket inflight token in guard drop");
-            }
+        if let Some(token) = self.token.take()
+            && let Err(e) = self.state.release_socket_inflight_token(token)
+        {
+            tracing::error!(error = ?e, "failed to release socket inflight token in guard drop");
         }
     }
 }

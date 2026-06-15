@@ -1,27 +1,31 @@
 use core::cell::UnsafeCell;
-use std::future::{Future, poll_fn};
-use std::marker::PhantomData;
-use std::num::NonZeroUsize;
-use std::ops::AsyncFnOnce;
-use std::pin::Pin;
-use std::ptr::NonNull;
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, mpsc::Receiver};
-use std::task::{Context, Poll, Waker};
-use std::time::Duration;
+use std::{
+    future::{Future, poll_fn},
+    marker::PhantomData,
+    num::NonZeroUsize,
+    ops::AsyncFnOnce,
+    pin::Pin,
+    ptr::NonNull,
+    sync::{Arc, Mutex, atomic::Ordering, mpsc::Receiver},
+    task::{Context, Poll, Waker},
+    time::Duration,
+};
 
 use super::shared::RuntimeShared;
-use crate::error::{Result, RuntimeError};
-use crate::scope::{AsyncScope, LocalAsyncScope};
-use crate::task::{
-    GenericTaskHeader, LocalTaskRef, RawTask, RuntimeContextExt, ScopeRef, SendTaskRef,
-    TaskHandleRef, TaskHeader, TaskVTable,
+use crate::{
+    error::{Result, RuntimeError},
+    scope::{AsyncScope, LocalAsyncScope},
+    task::{
+        GenericTaskHeader, LocalTaskRef, RawTask, RuntimeContextExt, ScopeRef, SendTaskRef,
+        TaskHandleRef, TaskHeader, TaskVTable,
+    },
+    utils::FastRand,
 };
-use crate::utils::FastRand;
-use crate::utils::storage::AtomicStorage;
 
+use crossbeam_deque::Worker;
 use diagweave::DiagnosticResult;
 use veloq_atomic_waker::AtomicWaker;
+use veloq_storage::AtomicStorage;
 
 /// Worker 空闲时的等待策略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,7 +96,7 @@ pub struct RuntimeContext {
     pub(crate) pinned_rx: Receiver<SendTaskRef>,
     pub(crate) local_rx: Receiver<LocalTaskRef>,
     pub(crate) rand: FastRand,
-    pub(crate) worker: crossbeam_deque::Worker<SendTaskRef>,
+    pub(crate) worker: Worker<SendTaskRef>,
 }
 
 unsafe impl Send for RuntimeContext {}

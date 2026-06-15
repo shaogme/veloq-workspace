@@ -16,11 +16,11 @@ use veloq_driver_native::{
 use veloq_runtime::{
     runtime::{IdleDecision, IdleWaitStrategy, RuntimeScopeContext, RuntimeShared},
     scope::{AsyncScope, LocalAsyncScope},
+    storage::AtomicStorage,
     task::{
         GenericTaskHeader, RawTask, ScopeRef, SendTaskRef, TaskHandleRef, TaskHeader, TaskVTable,
         yield_now,
     },
-    utils::storage::AtomicStorage,
 };
 
 use crate::{config::BufferRegistrationMode, error::Result as VeloqResult};

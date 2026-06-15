@@ -1,10 +1,11 @@
-use crate::utils::storage::{
-    StateGuard, StateInt, StateLock, StateOptionPtr, Storage, ThreadSafeStorage,
+use std::{
+    alloc::{Layout, alloc, dealloc, handle_alloc_error},
+    pin::Pin,
+    ptr::{self, NonNull},
+    sync::atomic::Ordering,
 };
-use std::alloc::{Layout, alloc, dealloc};
-use std::ptr::{self, NonNull};
-use std::sync::atomic::Ordering;
 use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
+use veloq_storage::{StateGuard, StateInt, StateLock, StateOptionPtr, Storage, ThreadSafeStorage};
 
 /// 一个高性能的、块分配器接口。
 pub trait Arena {
@@ -105,7 +106,7 @@ impl<S: Storage> GenericArena<S> {
 
                 // 在锁保护下插入链表
                 let mut drop_list = (*chunk_ptr).drop_list.lock();
-                drop_list.push_front(std::pin::Pin::new_unchecked(&mut *node_ptr));
+                drop_list.push_front(Pin::new_unchecked(&mut *node_ptr));
             }
             data_ptr
         } else {
@@ -218,7 +219,7 @@ impl<S: Storage> GenericArena<S> {
         let new_chunk_layout = Layout::from_size_align(chunk_size, 64).unwrap();
         let ptr = unsafe { alloc(new_chunk_layout) };
         if ptr.is_null() {
-            std::alloc::handle_alloc_error(new_chunk_layout);
+            handle_alloc_error(new_chunk_layout);
         }
 
         let new_chunk = Box::new(GenericChunk {
@@ -242,7 +243,7 @@ impl<S: Storage> GenericArena<S> {
         {
             let mut chunks = self.chunks.lock();
             unsafe {
-                chunks.push_back(std::pin::Pin::new_unchecked(&mut *chunk_ptr));
+                chunks.push_back(Pin::new_unchecked(&mut *chunk_ptr));
             }
         }
 

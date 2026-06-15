@@ -1,34 +1,45 @@
-use std::mem::ManuallyDrop;
-use std::pin::Pin;
-use std::ptr::NonNull;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::task::{RawWaker, RawWakerVTable, Waker};
-use std::time::Duration;
+use std::{
+    future::Future,
+    mem::ManuallyDrop,
+    pin::Pin,
+    ptr::NonNull,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, AtomicUsize, Ordering},
+    },
+    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+    time::Duration,
+};
 use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
+use veloq_storage::{StateInt, StateLock, StateWakerQueue, Storage};
 
-use crate::task::{AnySendScopeRef, OpaqueToken};
-use crate::utils::ownership::Ownership;
-use crate::utils::storage::{StateInt, StateLock, StateWakerQueue, Storage};
+use crate::{
+    task::{AnySendScopeRef, OpaqueToken},
+    utils::ownership::Ownership,
+};
 
 // --- 系统级同步原语 (WaitOnAddress / Futex) ---
 
 pub(crate) mod sys {
-    use std::sync::atomic::AtomicU32;
-    use std::time::Duration;
+    use std::{ffi::c_void, sync::atomic::AtomicU32, time::Duration};
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    use std::thread;
 
     #[cfg(windows)]
     mod win {
+        use super::c_void;
+
         #[link(name = "Synchronization")]
         unsafe extern "system" {
             pub fn WaitOnAddress(
-                address: *const std::ffi::c_void,
-                compare_address: *const std::ffi::c_void,
+                address: *const c_void,
+                compare_address: *const c_void,
                 address_size: usize,
                 milliseconds: u32,
             ) -> i32;
-            pub fn WakeByAddressSingle(address: *const std::ffi::c_void);
-            pub fn WakeByAddressAll(address: *const std::ffi::c_void);
+            pub fn WakeByAddressSingle(address: *const c_void);
+            pub fn WakeByAddressAll(address: *const c_void);
         }
     }
 
@@ -84,13 +95,14 @@ pub(crate) mod sys {
 
     #[cfg(target_os = "linux")]
     pub unsafe fn wait(addr: &AtomicU32, expected: u32) {
+        use std::ptr::null;
         unsafe {
             libc::syscall(
                 libc::SYS_futex,
                 addr as *const _ as *mut i32,
                 libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
                 expected as i32,
-                std::ptr::null::<libc::timespec>(),
+                null::<libc::timespec>(),
             );
         }
     }
@@ -139,11 +151,11 @@ pub(crate) mod sys {
 
     #[cfg(not(any(windows, target_os = "linux")))]
     pub unsafe fn wait(_addr: &AtomicU32, _expected: u32) {
-        std::thread::yield_now();
+        thread::yield_now();
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     pub unsafe fn wait_timeout(_addr: &AtomicU32, _expected: u32, timeout: Duration) -> bool {
-        std::thread::sleep(timeout);
+        thread::sleep(timeout);
         false
     }
     #[cfg(not(any(windows, target_os = "linux")))]
@@ -559,23 +571,20 @@ pub struct CancelledFuture<S: Storage, O: Ownership> {
     token: GenericCancellationToken<S, O>,
 }
 
-impl<S: Storage, O: Ownership> std::future::Future for CancelledFuture<S, O> {
+impl<S: Storage, O: Ownership> Future for CancelledFuture<S, O> {
     type Output = ();
 
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         if self.token.is_cancelled() {
-            return std::task::Poll::Ready(());
+            return Poll::Ready(());
         }
 
         self.token.register_waker(cx.waker());
 
         if self.token.is_cancelled() {
-            std::task::Poll::Ready(())
+            Poll::Ready(())
         } else {
-            std::task::Poll::Pending
+            Poll::Pending
         }
     }
 }

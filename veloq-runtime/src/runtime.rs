@@ -1,13 +1,17 @@
-use std::future::Future;
-use std::num::NonZeroUsize;
-use std::ops::AsyncFnOnce;
-use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::thread;
+use std::{
+    future::Future,
+    marker::PhantomData,
+    num::NonZeroUsize,
+    ops::AsyncFnOnce,
+    pin::pin,
+    ptr,
+    sync::Arc,
+    task::{Context, Poll},
+    thread,
+};
 
-use crate::utils::FastRand;
-use crate::utils::ownership::ArcOwnership;
-use crate::utils::storage::AtomicStorage;
+use crate::utils::{FastRand, ownership::ArcOwnership};
+use veloq_storage::AtomicStorage;
 
 pub mod context;
 pub mod primitives;
@@ -26,7 +30,7 @@ pub struct Runtime<T, WF> {
     pub(crate) shared: RuntimeShared<T>,
     pub(crate) receivers: Option<Receivers>,
     pub(crate) worker_factory: Option<WF>,
-    marker: std::marker::PhantomData<T>,
+    marker: PhantomData<T>,
 }
 
 pub type DefaultWorkerFactory = fn(usize, &RuntimeShared<()>) -> ();
@@ -67,7 +71,7 @@ impl<T, WF> Runtime<T, WF> {
             }
         }
 
-        let shared_ref: &'run RuntimeShared<T> = unsafe { &*std::ptr::from_ref(&self.shared) };
+        let shared_ref: &'run RuntimeShared<T> = unsafe { &*ptr::from_ref(&self.shared) };
         let ctx = RuntimeScopeContext::new(shared_ref);
 
         let worker_count = shared_ref.worker_count();
@@ -160,7 +164,7 @@ impl<T, WF> Runtime<T, WF> {
 
             shared_ref.drive_worker::<AtomicStorage, ArcOwnership>(None);
 
-            let mut fut = std::pin::pin!(f(ctx));
+            let mut fut = pin!(f(ctx));
             loop {
                 match fut.as_mut().poll(&mut cx) {
                     Poll::Ready(res) => {
@@ -276,7 +280,7 @@ impl<T, WF> RuntimeBuilder<T, WF> {
             shared,
             receivers: Some(receivers),
             worker_factory: self.worker_factory,
-            marker: std::marker::PhantomData,
+            marker: PhantomData,
         }
     }
 }

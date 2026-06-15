@@ -1,19 +1,27 @@
+use crossbeam_deque::{Steal, Stealer, Worker};
 use parking_lot::Mutex;
-use std::ptr::NonNull;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::Sender;
-use std::time::Duration;
+use std::{
+    ptr::NonNull,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        mpsc::Sender,
+    },
+    thread,
+    time::Duration,
+};
+use veloq_storage::{AtomicOptionPtr, StateOptionPtr};
 
-use crate::runtime::context::{IdleDecision, IdleWaitStrategy};
-use crate::runtime::primitives::{EventCount, Parker, ParkerInner, Unparker};
-use crate::runtime::shared::RuntimeShared;
-use crate::scope::GenericScopeCompletion;
-use crate::task::{LocalTaskRef, ScopeStorage, SendTaskRef, TaskHandleRef, TaskHeader};
-use crate::utils::FastRand;
-use crate::utils::ownership::Ownership;
-use crate::utils::storage::{AtomicOptionPtr, StateOptionPtr};
-use crossbeam_deque::Steal;
+use crate::{
+    runtime::{
+        context::{IdleDecision, IdleWaitStrategy},
+        primitives::{EventCount, Parker, ParkerInner, Unparker},
+        shared::RuntimeShared,
+    },
+    scope::GenericScopeCompletion,
+    task::{LocalTaskRef, ScopeStorage, SendTaskRef, TaskHandleRef, TaskHeader},
+    utils::{FastRand, ownership::Ownership},
+};
 
 pub(crate) struct WorkerQueue {
     pub(crate) remote_tx: Sender<SendTaskRef>,
@@ -24,7 +32,7 @@ pub(crate) struct WorkerQueue {
     /// LIFO slot for high-priority task (cache locality)
     pub(crate) lifo: AtomicOptionPtr<TaskHeader>,
     /// Stealer for work-stealing
-    pub(crate) stealer: crossbeam_deque::Stealer<SendTaskRef>,
+    pub(crate) stealer: Stealer<SendTaskRef>,
 }
 
 impl WorkerQueue {
@@ -32,7 +40,7 @@ impl WorkerQueue {
         remote_tx: Sender<SendTaskRef>,
         pinned_tx: Sender<SendTaskRef>,
         local_tx: Sender<LocalTaskRef>,
-        stealer: crossbeam_deque::Stealer<SendTaskRef>,
+        stealer: Stealer<SendTaskRef>,
     ) -> Self {
         Self {
             remote_tx,
@@ -243,7 +251,7 @@ impl TaskScheduler {
         registry: &WorkerRegistry,
         topo: &TopologyContext,
         rand: &FastRand,
-        thief_worker: &crossbeam_deque::Worker<SendTaskRef>,
+        thief_worker: &Worker<SendTaskRef>,
     ) -> Option<SendTaskRef> {
         let num_workers = registry.workers.len();
         if num_workers <= 1 {
@@ -360,7 +368,7 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
             .map(|h| h(self.shared))
             .unwrap_or(IdleDecision::wait(IdleWaitStrategy::Block));
         let Some(wait_strategy) = idle_decision.into_wait_strategy() else {
-            std::thread::yield_now();
+            thread::yield_now();
             return;
         };
 
@@ -395,7 +403,7 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
         let base = &self.shared.base;
         base.idle.event_count.load() != seq
             || self.shared.has_work(self.worker_id)
-            || base.shutdown.load(std::sync::atomic::Ordering::Acquire)
+            || base.shutdown.load(Ordering::Acquire)
             || completion.map(|c| c.is_done()).unwrap_or(false)
     }
 

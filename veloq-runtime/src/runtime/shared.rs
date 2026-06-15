@@ -1,23 +1,33 @@
-use std::num::NonZeroUsize;
-use std::ptr::NonNull;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::{
+    hint::spin_loop,
+    num::NonZeroUsize,
+    ptr::NonNull,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+        mpsc::{self, Receiver},
+    },
+};
+
+use crossbeam_deque::Worker;
+use diagweave::prelude::*;
+use numaperf_topo::Topology;
+use veloq_storage::StateOptionPtr;
+use veloq_tls::Tls;
 
 use super::context::{IdleHook, RuntimeContext, WorkerTickHook};
-use crate::error::{Result, RuntimeError};
-use crate::runtime::primitives::{self, Unparker};
-use crate::scope::{GenericScopeCompletion, ScopeCompletionRegistration};
-use crate::task::{LocalTaskRef, ScopeStorage, SendTaskRef, TaskHandleRef};
-use crate::utils::FastRand;
-use crate::utils::ownership::Ownership;
-use crate::utils::storage::StateOptionPtr;
-use diagweave::DiagnosticResult;
+use crate::{
+    error::{Result, RuntimeError},
+    runtime::primitives::{EventCount, ParkerInner, Unparker, create_unpark_waker},
+    scope::{GenericScopeCompletion, ScopeCompletionRegistration},
+    task::{LocalTaskRef, ScopeStorage, SendTaskRef, TaskHandleRef},
+    utils::{FastRand, ownership::Ownership},
+};
 
 pub(crate) mod infra;
 
 use infra::{
-    GlobalInjector, IdleController, IdleStack, NUMAGroup, RuntimeProgressCoordinator,
+    AtomicBitset, GlobalInjector, IdleController, IdleStack, NUMAGroup, RuntimeProgressCoordinator,
     TaskScheduler, TopologyContext, WorkerQueue, WorkerRegistry,
 };
 
@@ -29,14 +39,14 @@ pub struct RuntimeSharedBase {
     pub(crate) shutdown: AtomicBool,
     pub(crate) worker_tick_hook: Option<WorkerTickHook>,
     /// Worker 线程核心上下文（不含用户 extra 状态）。
-    pub(crate) tls: veloq_tls::Tls<RuntimeContext>,
+    pub(crate) tls: Tls<RuntimeContext>,
 }
 
 pub struct RuntimeShared<T> {
     pub base: RuntimeSharedBase,
     pub(crate) idle_hook: Option<IdleHook<T>>,
     /// Worker 线程用户自定义 extra 状态。
-    pub extra_tls: veloq_tls::Tls<T>,
+    pub extra_tls: Tls<T>,
 }
 
 unsafe impl<T> Send for RuntimeShared<T> {}
@@ -48,7 +58,7 @@ pub(crate) struct Receivers {
     pub(crate) remote_receivers: Vec<Receiver<SendTaskRef>>,
     pub(crate) pinned_receivers: Vec<Receiver<SendTaskRef>>,
     pub(crate) local_receivers: Vec<Receiver<LocalTaskRef>>,
-    pub(crate) deques: Vec<crossbeam_deque::Worker<SendTaskRef>>,
+    pub(crate) deques: Vec<Worker<SendTaskRef>>,
 }
 
 pub(crate) fn init_runtime_components(
@@ -66,7 +76,7 @@ pub(crate) fn init_runtime_components(
     let mut next_idle = Vec::with_capacity(worker_count_val);
 
     for _ in 0..worker_count_val {
-        let inner = Arc::new(primitives::ParkerInner {
+        let inner = Arc::new(ParkerInner {
             state: AtomicU32::new(0),
         });
         unparkers.push(Unparker::from_inner(inner.clone()));
@@ -79,7 +89,7 @@ pub(crate) fn init_runtime_components(
         pinned_receivers.push(prx);
         local_receivers.push(lrx);
 
-        let worker_deque = crossbeam_deque::Worker::new_lifo();
+        let worker_deque = Worker::new_lifo();
         let stealer = worker_deque.stealer();
         deques.push(worker_deque);
 
@@ -88,7 +98,7 @@ pub(crate) fn init_runtime_components(
     }
 
     // NUMA detection
-    let topo_info = numaperf_topo::Topology::discover().ok();
+    let topo_info = Topology::discover().ok();
     let mut groups = Vec::new();
     let mut worker_to_group = vec![0; worker_count_val];
 
@@ -165,19 +175,15 @@ impl<T> RuntimeShared<T> {
                     next_worker: AtomicUsize::new(0),
                 },
                 idle: IdleController {
-                    idle_mask: infra::AtomicBitset::new(worker_count.get()),
-                    event_count: primitives::EventCount::new(),
+                    idle_mask: AtomicBitset::new(worker_count.get()),
+                    event_count: EventCount::new(),
                 },
                 shutdown: AtomicBool::new(false),
                 worker_tick_hook,
-                tls: veloq_tls::Tls::new(|| {
-                    panic!("RuntimeContext accessed outside of a worker thread")
-                }),
+                tls: Tls::new(|| panic!("RuntimeContext accessed outside of a worker thread")),
             },
             idle_hook,
-            extra_tls: veloq_tls::Tls::new(|| {
-                panic!("extra TLS accessed outside of a worker thread")
-            }),
+            extra_tls: Tls::new(|| panic!("extra TLS accessed outside of a worker thread")),
         }
     }
 }
@@ -445,8 +451,7 @@ impl<T> RuntimeShared<T> {
 
             let worker_tick_hook = self.base.worker_tick_hook;
 
-            let waker =
-                primitives::create_unpark_waker(self.base.registry.unparkers[worker_id].clone());
+            let waker = create_unpark_waker(self.base.registry.unparkers[worker_id].clone());
             let mut completion_registration =
                 completion.map(|c| ScopeCompletionRegistration::new(&**c, &waker));
 
@@ -521,7 +526,7 @@ impl<T> RuntimeShared<T> {
                         progressed = true;
                         break;
                     }
-                    std::hint::spin_loop();
+                    spin_loop();
                 }
 
                 if progressed {

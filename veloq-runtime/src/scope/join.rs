@@ -1,20 +1,27 @@
-use crate::runtime::GenericCancellationToken;
-use crate::task::{GenericTaskHeader, GenericWakerNode, SendTaskRef, TaskError, TaskHandleRef};
-use crate::utils::storage::{AtomicStorage, StateLock};
-use std::alloc::Layout;
-use std::future::Future;
-use std::marker::PhantomData;
-use std::pin::Pin;
-use std::ptr::{NonNull, drop_in_place, write};
-use std::sync::Arc;
-use std::task::{Context, Poll};
+use super::{
+    AsyncScope, CancelTokenSlot, LocalAsyncScope, ScopeProvider,
+    router::{RoutedSpawnState, RoutedTaskAccess},
+};
+use crate::{
+    runtime::GenericCancellationToken,
+    task::{
+        Arena, GenericTaskHeader, GenericWakerNode, LocalTaskRef, SendTaskRef, TaskError,
+        TaskHandleRef, TaskJoinGate,
+    },
+};
+use std::{
+    alloc::Layout,
+    future::Future,
+    marker::PhantomData,
+    pin::Pin,
+    ptr::{NonNull, drop_in_place, write},
+    sync::Arc,
+    task::{Context, Poll},
+};
 use veloq_intrusive_linklist::Link;
+use veloq_storage::{AtomicStorage, StateLock, Storage};
 
-use super::router::{RoutedSpawnState, RoutedTaskAccess};
-use super::{CancelTokenSlot, ScopeProvider};
-
-pub(crate) type ReclaimFn<'scope_ref, T, A> =
-    unsafe fn(&A, &'scope_ref dyn crate::task::TaskJoinGate<T>);
+pub(crate) type ReclaimFn<'scope_ref, T, A> = unsafe fn(&A, &'scope_ref dyn TaskJoinGate<T>);
 
 pub(crate) struct ResolvedRoutedTask<'scope_ref, T, R: TaskHandleRef> {
     pub(crate) task: R,
@@ -24,7 +31,7 @@ pub(crate) struct ResolvedRoutedTask<'scope_ref, T, R: TaskHandleRef> {
 pub(crate) enum JoinSource<'scope_ref, T, R: TaskHandleRef> {
     Direct {
         task: R,
-        gate: &'scope_ref dyn crate::task::TaskJoinGate<T>,
+        gate: &'scope_ref dyn TaskJoinGate<T>,
     },
     Routed {
         state: Arc<RoutedSpawnState<'scope_ref, T>>,
@@ -42,39 +49,18 @@ pub struct JoinHandle<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>,
 }
 
 unsafe impl<'rt, 'scope, 'scope_ref, T, TExtra> Send
-    for JoinHandle<
-        'scope_ref,
-        T,
-        SendTaskRef,
-        crate::scope::AsyncScope<'rt, 'scope, TExtra>,
-        TExtra,
-    >
+    for JoinHandle<'scope_ref, T, SendTaskRef, AsyncScope<'rt, 'scope, TExtra>, TExtra>
 where
     T: Send,
 {
 }
 
-pub type LocalJoinHandle<'rt, 'scope_ref, T, TExtra> = JoinHandle<
-    'scope_ref,
-    T,
-    crate::task::LocalTaskRef,
-    crate::scope::AsyncScope<'rt, 'scope_ref, TExtra>,
-    TExtra,
->;
-pub type SendJoinHandle<'rt, 'scope_ref, T, TExtra> = JoinHandle<
-    'scope_ref,
-    T,
-    SendTaskRef,
-    crate::scope::AsyncScope<'rt, 'scope_ref, TExtra>,
-    TExtra,
->;
-pub type LocalAsyncJoinHandle<'rt, 'scope_ref, T, TExtra> = JoinHandle<
-    'scope_ref,
-    T,
-    crate::task::LocalTaskRef,
-    crate::scope::LocalAsyncScope<'rt, 'scope_ref, TExtra>,
-    TExtra,
->;
+pub type LocalJoinHandle<'rt, 'scope_ref, T, TExtra> =
+    JoinHandle<'scope_ref, T, LocalTaskRef, AsyncScope<'rt, 'scope_ref, TExtra>, TExtra>;
+pub type SendJoinHandle<'rt, 'scope_ref, T, TExtra> =
+    JoinHandle<'scope_ref, T, SendTaskRef, AsyncScope<'rt, 'scope_ref, TExtra>, TExtra>;
+pub type LocalAsyncJoinHandle<'rt, 'scope_ref, T, TExtra> =
+    JoinHandle<'scope_ref, T, LocalTaskRef, LocalAsyncScope<'rt, 'scope_ref, TExtra>, TExtra>;
 
 impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
     JoinHandle<'scope_ref, T, R, S, TExtra>
@@ -138,7 +124,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
     pub(crate) fn new_direct(
         scope: &'scope_ref S,
         task: R,
-        gate: &'scope_ref dyn crate::task::TaskJoinGate<T>,
+        gate: &'scope_ref dyn TaskJoinGate<T>,
         reclaim: Option<ReclaimFn<'scope_ref, T, S::Arena>>,
     ) -> Self {
         Self {
@@ -168,10 +154,10 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
         }
     }
 
-    fn register_waker_on<St: crate::utils::storage::Storage>(
+    fn register_waker_on<St: Storage>(
         waker_node: &mut Option<Pin<&'scope_ref mut GenericWakerNode<St>>>,
-        arena: &dyn crate::task::Arena,
-        header: &crate::task::GenericTaskHeader<St>,
+        arena: &dyn Arena,
+        header: &GenericTaskHeader<St>,
         cx: &mut Context<'_>,
     ) {
         if let Some(node) = waker_node {

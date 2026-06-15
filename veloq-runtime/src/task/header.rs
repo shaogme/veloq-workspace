@@ -1,18 +1,26 @@
-use crate::runtime::RuntimeSharedBase;
-use crate::runtime::primitives::sys;
-use crate::task::{ScopeRef, SendTaskRef, TaskHandleRef};
-use crate::utils::storage::{
-    AtomicOptionPtr, StateInt, StateLock, StateOptionPtr, Storage, ThreadSafeStorage,
+use crate::{
+    runtime::{RuntimeSharedBase, primitives::sys},
+    task::{ScopeRef, SendTaskRef, TaskHandleRef, nodes::TaskStorage},
 };
-use std::cell::UnsafeCell;
-use std::hint::spin_loop;
-use std::mem::ManuallyDrop;
-use std::ptr::NonNull;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::task::{RawWaker, RawWakerVTable, Waker};
-use std::thread::yield_now;
+use std::{
+    cell::UnsafeCell,
+    hint::spin_loop,
+    marker::PhantomData,
+    mem::ManuallyDrop,
+    pin::Pin,
+    ptr::{self, NonNull},
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    task::{RawWaker, RawWakerVTable, Waker},
+    thread::yield_now,
+};
 use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
+use veloq_storage::{
+    AtomicOptionPtr, AtomicStorage, LocalStorage, StateInt, StateLock, StateOptionPtr, Storage,
+    ThreadSafeStorage,
+};
 
 pub const STATE_COMPLETED: usize = 1 << 0;
 pub const STATE_QUEUED: usize = 1 << 1;
@@ -36,7 +44,7 @@ pub enum PollStatus {
 pub struct TaskWakeToken<S: Storage> {
     state: AtomicU32,
     header: AtomicOptionPtr<GenericTaskHeader<S>>,
-    marker: std::marker::PhantomData<fn() -> S>,
+    marker: PhantomData<fn() -> S>,
 }
 
 struct TaskWakeGuard<'a, S: Storage> {
@@ -48,7 +56,7 @@ impl<S: Storage> TaskWakeToken<S> {
         Self {
             state: AtomicU32::new(WAKE_TOKEN_ALIVE),
             header: AtomicOptionPtr::new(None),
-            marker: std::marker::PhantomData,
+            marker: PhantomData,
         }
     }
 
@@ -153,7 +161,7 @@ pub struct TaskVTable<S: Storage> {
 pub struct GenericWakerNode<S: Storage> {
     pub(crate) waker: Waker,
     pub(crate) link: Link,
-    pub(crate) marker: std::marker::PhantomData<S>,
+    pub(crate) marker: PhantomData<S>,
 }
 
 intrusive_adapter!(pub WakerAdapter<S> = GenericWakerNode<S> { link: Link } where S: Storage);
@@ -348,7 +356,7 @@ impl<S: Storage> GenericTaskHeader<S> {
     ///
     /// The caller must ensure that the `node` remains valid and pinned at its current memory location
     /// until it is either woken or explicitly removed from the task's waker list.
-    pub unsafe fn register_completion(&self, node: std::pin::Pin<&mut GenericWakerNode<S>>) {
+    pub unsafe fn register_completion(&self, node: Pin<&mut GenericWakerNode<S>>) {
         if self.is_completed() {
             node.waker.wake_by_ref();
             return;
@@ -414,7 +422,7 @@ impl<S: Storage> GenericTaskHeader<S> {
         waker: &'a Waker,
         vtable: &'static RawWakerVTable,
     ) -> Option<&'a Self> {
-        if std::ptr::eq(waker.vtable(), vtable) {
+        if ptr::eq(waker.vtable(), vtable) {
             let token = unsafe { &*(waker.data() as *const TaskWakeToken<S>) };
             token.header()
         } else {
@@ -499,7 +507,7 @@ impl<S: Storage> GenericTaskHeader<S> {
     /// `self_ptr` 必须是指向 `self` 的有效非空指针。
     pub unsafe fn enqueue_self(&self, self_ptr: NonNull<Self>)
     where
-        S: crate::task::nodes::TaskStorage,
+        S: TaskStorage,
     {
         let runtime = self.runtime();
         if !S::IS_LOCAL && self.is_pinned() {
@@ -531,54 +539,40 @@ impl<S: Storage> GenericTaskHeader<S> {
 pub static INTRUSIVE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     |data| {
         unsafe {
-            Arc::increment_strong_count(
-                data as *const TaskWakeToken<crate::utils::storage::AtomicStorage>,
-            );
+            Arc::increment_strong_count(data as *const TaskWakeToken<AtomicStorage>);
         }
         RawWaker::new(data, &INTRUSIVE_WAKER_VTABLE)
     },
     |data| unsafe {
-        let token =
-            Arc::from_raw(data as *const TaskWakeToken<crate::utils::storage::AtomicStorage>);
+        let token = Arc::from_raw(data as *const TaskWakeToken<AtomicStorage>);
         token.wake_impl();
     },
     |data| unsafe {
-        let token = ManuallyDrop::new(Arc::from_raw(
-            data as *const TaskWakeToken<crate::utils::storage::AtomicStorage>,
-        ));
+        let token = ManuallyDrop::new(Arc::from_raw(data as *const TaskWakeToken<AtomicStorage>));
         token.wake_impl();
     },
     |data| unsafe {
-        drop(Arc::from_raw(
-            data as *const TaskWakeToken<crate::utils::storage::AtomicStorage>,
-        ));
+        drop(Arc::from_raw(data as *const TaskWakeToken<AtomicStorage>));
     },
 );
 
 pub static LOCAL_INTRUSIVE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     |data| {
         unsafe {
-            Arc::increment_strong_count(
-                data as *const TaskWakeToken<crate::utils::storage::LocalStorage>,
-            );
+            Arc::increment_strong_count(data as *const TaskWakeToken<LocalStorage>);
         }
         RawWaker::new(data, &LOCAL_INTRUSIVE_WAKER_VTABLE)
     },
     |data| unsafe {
-        let token =
-            Arc::from_raw(data as *const TaskWakeToken<crate::utils::storage::LocalStorage>);
+        let token = Arc::from_raw(data as *const TaskWakeToken<LocalStorage>);
         token.wake_impl();
     },
     |data| unsafe {
-        let token = ManuallyDrop::new(Arc::from_raw(
-            data as *const TaskWakeToken<crate::utils::storage::LocalStorage>,
-        ));
+        let token = ManuallyDrop::new(Arc::from_raw(data as *const TaskWakeToken<LocalStorage>));
         token.wake_impl();
     },
     |data| unsafe {
-        drop(Arc::from_raw(
-            data as *const TaskWakeToken<crate::utils::storage::LocalStorage>,
-        ));
+        drop(Arc::from_raw(data as *const TaskWakeToken<LocalStorage>));
     },
 );
 

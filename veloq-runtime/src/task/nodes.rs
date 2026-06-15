@@ -1,14 +1,20 @@
-use crate::task::{
-    GenericTaskHeader, INTRUSIVE_WAKER_VTABLE, LOCAL_INTRUSIVE_WAKER_VTABLE, LocalTaskRef, RawTask,
-    SendTaskRef, Task, TaskError, TaskHandleRef, TaskResultSetter, TaskVTable, poll_task_internal,
+use crate::{
+    runtime::RuntimeSharedBase,
+    task::{
+        GenericTaskHeader, INTRUSIVE_WAKER_VTABLE, LOCAL_INTRUSIVE_WAKER_VTABLE, LocalTaskRef,
+        RawTask, SendTaskRef, Task, TaskError, TaskHandleRef, TaskResultSetter, TaskVTable,
+        poll_task_internal,
+    },
 };
-use crate::utils::storage::{AtomicStorage, LocalStorage, StateInt, Storage, ThreadSafeStorage};
-use std::cell::UnsafeCell;
-use std::future::Future;
-use std::pin::Pin;
-use std::ptr::NonNull;
-use std::sync::atomic::Ordering;
-use std::task::{Context, Poll, RawWakerVTable};
+use std::{
+    cell::UnsafeCell,
+    future::Future,
+    pin::Pin,
+    ptr::NonNull,
+    sync::atomic::Ordering,
+    task::{Context, Poll, RawWakerVTable},
+};
+use veloq_storage::{AtomicStorage, LocalStorage, StateInt, Storage, ThreadSafeStorage};
 
 const STATUS_RUNNING: usize = 0;
 const STATUS_DONE: usize = 1;
@@ -19,7 +25,7 @@ pub trait TaskStorage: Storage + Sized {
     const IS_LOCAL: bool;
     const WAKER_VTABLE: &'static RawWakerVTable;
     fn enqueue(
-        runtime: &crate::runtime::RuntimeSharedBase,
+        runtime: &RuntimeSharedBase,
         worker_id: usize,
         data: NonNull<GenericTaskHeader<Self>>,
     );
@@ -29,7 +35,7 @@ impl TaskStorage for LocalStorage {
     const IS_LOCAL: bool = true;
     const WAKER_VTABLE: &'static RawWakerVTable = &LOCAL_INTRUSIVE_WAKER_VTABLE;
     fn enqueue(
-        runtime: &crate::runtime::RuntimeSharedBase,
+        runtime: &RuntimeSharedBase,
         worker_id: usize,
         data: NonNull<GenericTaskHeader<Self>>,
     ) {
@@ -41,7 +47,7 @@ impl TaskStorage for AtomicStorage {
     const IS_LOCAL: bool = false;
     const WAKER_VTABLE: &'static RawWakerVTable = &INTRUSIVE_WAKER_VTABLE;
     fn enqueue(
-        runtime: &crate::runtime::RuntimeSharedBase,
+        runtime: &RuntimeSharedBase,
         worker_id: usize,
         data: NonNull<GenericTaskHeader<Self>>,
     ) {

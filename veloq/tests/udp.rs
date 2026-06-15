@@ -1,12 +1,24 @@
-use std::num::NonZeroUsize;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    collections::HashSet,
+    net::SocketAddr,
+    num::NonZeroUsize,
+    str,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
-use veloq::io::{AsyncBufRead, AsyncBufWrite};
-use veloq::net::UdpSocket;
-use veloq::runtime::{Runtime, context::RuntimeContext};
-use veloq::sync::mpsc;
-use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
+use veloq::{
+    io::{AsyncBufRead, AsyncBufWrite},
+    net::UdpSocket,
+    runtime::{Runtime, context::RuntimeContext},
+    sync::mpsc,
+    time,
+};
+use veloq_buf::{FixedBuf, UniformSlot, heap::ThreadMemoryMultiplier, nz};
+use veloq_runtime::{select, task::yield_now};
 
 fn create_runtime() -> Runtime<UniformSlot> {
     create_runtime_with_workers(1)
@@ -27,7 +39,7 @@ fn bind_udp_socket<'a, 'ctx>(
 }
 
 async fn allow_udp_recv_to_arm(ctx: RuntimeContext<'_, '_>) {
-    veloq::time::sleep(ctx, std::time::Duration::from_millis(5)).await;
+    time::sleep(ctx, Duration::from_millis(5)).await;
 }
 
 #[test]
@@ -162,7 +174,7 @@ fn udp_multiple_messages() {
                         .recv_from(ctx.alloc(nz!(1024)))
                         .await
                         .expect("recv_from failed");
-                    let msg = std::str::from_utf8(datagram.buf.as_slice())
+                    let msg = str::from_utf8(datagram.buf.as_slice())
                         .expect("udp payload must be utf-8")
                         .to_string();
                     msg_tx.send(msg).expect("message channel closed");
@@ -243,9 +255,7 @@ fn udp_heap_buffer() {
         ctx.scope(async |s| {
             s.spawn_boxed(async move {
                 let datagram = socket1
-                    .recv_from(
-                        veloq_buf::FixedBuf::alloc_heap(nz!(1024)).expect("Heap allocation failed"),
-                    )
+                    .recv_from(FixedBuf::alloc_heap(nz!(1024)).expect("Heap allocation failed"))
                     .await
                     .expect("recv_from failed");
                 assert_eq!(
@@ -255,8 +265,7 @@ fn udp_heap_buffer() {
             });
 
             s.spawn_boxed(async move {
-                let mut buf =
-                    veloq_buf::FixedBuf::alloc_heap(nz!(1024)).expect("Heap allocation failed");
+                let mut buf = FixedBuf::alloc_heap(nz!(1024)).expect("Heap allocation failed");
                 let data = b"UDP from heap!";
                 buf.as_slice_mut()[..data.len()].copy_from_slice(data);
                 buf.set_len(data.len());
@@ -286,14 +295,12 @@ fn udp_ipv6() {
 
 #[test]
 fn udp_cancel_recv_from() {
-    use veloq_runtime::task::yield_now;
-
     let runtime = create_runtime();
     runtime.block_on(async |ctx| {
         let socket = UdpSocket::bind(ctx, "127.0.0.1:0").expect("Failed to bind UDP socket");
         let buf = ctx.alloc(nz!(1024));
 
-        veloq_runtime::select! {
+        select! {
             _ = socket.recv_from(buf) => {
                 panic!("RecvStream should have been cancelled, but it completed (unexpectedly)");
             },
@@ -404,7 +411,7 @@ fn multithread_udp_no_echo() {
 fn multithread_udp_echo() {
     let runtime = create_runtime_with_workers(2);
     runtime.block_on(async |ctx| {
-        let (addr_tx, mut addr_rx) = mpsc::unbounded::<std::net::SocketAddr>();
+        let (addr_tx, mut addr_rx) = mpsc::unbounded::<SocketAddr>();
         let (done_tx, mut done_rx) = mpsc::unbounded::<()>();
 
         ctx.scope(async |s| {
@@ -469,8 +476,6 @@ fn multithread_udp_echo() {
 
 #[test]
 fn multithread_udp_cross_worker_drop_is_routed() {
-    use veloq_runtime::task::yield_now;
-
     let runtime = create_runtime_with_workers(2);
     runtime.block_on(async |ctx| {
         let (clone_tx, mut clone_rx) = mpsc::unbounded::<UdpSocket<'_, '_>>();
@@ -541,7 +546,7 @@ fn multithread_concurrent_udp_clients() {
         let mut addr_channels = Vec::with_capacity(NUM_CLIENTS);
 
         for _ in 0..NUM_CLIENTS {
-            addr_channels.push(mpsc::unbounded::<std::net::SocketAddr>());
+            addr_channels.push(mpsc::unbounded::<SocketAddr>());
         }
 
         let server_senders = addr_channels
@@ -550,7 +555,7 @@ fn multithread_concurrent_udp_clients() {
             .collect::<Vec<_>>();
         let server = bind_udp_socket(ctx, "127.0.0.1:0");
         let server_addr = server.local_addr().expect("Failed to get server address");
-        let (peer_tx, mut peer_rx) = mpsc::unbounded::<std::net::SocketAddr>();
+        let (peer_tx, mut peer_rx) = mpsc::unbounded::<SocketAddr>();
 
         for tx in server_senders {
             tx.send(server_addr).unwrap();
@@ -597,7 +602,7 @@ fn multithread_concurrent_udp_clients() {
         })
         .await;
 
-        let mut peers = std::collections::HashSet::with_capacity(NUM_CLIENTS);
+        let mut peers = HashSet::with_capacity(NUM_CLIENTS);
         for _ in 0..NUM_CLIENTS {
             peers.insert(peer_rx.recv().await.expect("peer channel closed"));
         }

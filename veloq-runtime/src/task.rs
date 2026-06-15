@@ -15,12 +15,17 @@ pub use scope::{
     ScopeParent, ScopeRef, ScopeStorage,
 };
 
-use crate::utils::storage::{AtomicStorage, LocalStorage, StateLock, Storage};
-use std::any::Any;
-use std::future::Future;
-use std::pin::Pin;
-use std::ptr::NonNull;
-use std::task::{Context, Poll};
+use std::{
+    any::Any,
+    fmt::{Debug, Formatter, Result as FmtResult},
+    future::Future,
+    marker::PhantomData,
+    panic::{AssertUnwindSafe, catch_unwind},
+    pin::Pin,
+    ptr::NonNull,
+    task::{Context, Poll},
+};
+use veloq_storage::{AtomicStorage, LocalStorage, StateLock, Storage};
 
 pub type TaskHeader = GenericTaskHeader<AtomicStorage>;
 pub type LocalTaskHeader = GenericTaskHeader<LocalStorage>;
@@ -34,8 +39,8 @@ pub enum TaskError {
     Cancelled,
 }
 
-impl std::fmt::Debug for TaskError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for TaskError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
             Self::Panic => write!(f, "Task panicked"),
             Self::Cancelled => write!(f, "Task cancelled"),
@@ -161,7 +166,7 @@ where
 {
     header: &'a GenericTaskHeader<S>,
     result_setter: &'a R,
-    marker: std::marker::PhantomData<T>,
+    marker: PhantomData<T>,
 }
 
 impl<'a, T, R, S: Storage> TaskFinalizer<'a, T, R, S>
@@ -173,7 +178,7 @@ where
         Self {
             header,
             result_setter,
-            marker: std::marker::PhantomData,
+            marker: PhantomData,
         }
     }
 
@@ -246,7 +251,7 @@ where
             return true;
         }
 
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| poll_fn(cx)));
+        let res = catch_unwind(AssertUnwindSafe(|| poll_fn(cx)));
         match res {
             Ok(Poll::Ready(val)) => {
                 finalizer.complete(Ok(val), is_local);

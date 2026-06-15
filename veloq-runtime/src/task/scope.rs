@@ -1,13 +1,16 @@
-use crate::runtime::primitives::GenericCancellationToken;
-use crate::scope::GenericScopeCompletion;
-use crate::utils::ownership::Ownership;
-use crate::utils::storage::{
-    AtomicStorage, LocalStorage, Storage, StrategyType, ThreadSafeStorage,
+use crate::{
+    runtime::primitives::GenericCancellationToken, scope::GenericScopeCompletion,
+    utils::ownership::Ownership,
 };
-use std::any::Any;
-use std::marker::PhantomData;
-use std::ptr::NonNull;
-use std::task::Waker;
+use std::{
+    any::Any,
+    fmt::{Debug, Formatter, Result as FmtResult},
+    marker::PhantomData,
+    mem::ManuallyDrop,
+    ptr::NonNull,
+    task::Waker,
+};
+use veloq_storage::{AtomicStorage, LocalStorage, Storage, StrategyType, ThreadSafeStorage};
 
 /// 不透明的作用域句柄。
 ///
@@ -121,8 +124,8 @@ pub struct ScopeRef<S: Storage> {
     _marker: PhantomData<S>,
 }
 
-impl<S: Storage> std::fmt::Debug for ScopeRef<S> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<S: Storage> Debug for ScopeRef<S> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("ScopeRef")
             .field("inner", &self.inner)
             .finish()
@@ -165,7 +168,7 @@ impl<S: Storage> ScopeRef<S> {
     /// 在 crate 内将 ScopeRef 从一种 Storage 模式转换为另一种 Storage 模式。
     #[inline]
     pub(crate) fn cast<T: Storage>(self) -> ScopeRef<T> {
-        let this = std::mem::ManuallyDrop::new(self);
+        let this = ManuallyDrop::new(self);
         ScopeRef {
             inner: this.inner,
             _marker: PhantomData,
@@ -225,7 +228,7 @@ impl<S: Storage> ScopeRef<S> {
     /// 将具体类型的 `ScopeRef` 转换成不透明类型的 `AnyScopeRef`。
     #[inline]
     pub fn into_any(self) -> AnyScopeRef {
-        let this = std::mem::ManuallyDrop::new(self);
+        let this = ManuallyDrop::new(self);
         match S::strategy_type() {
             StrategyType::Local => AnyScopeRef::Local(ScopeRef {
                 inner: this.inner,

@@ -1,16 +1,15 @@
-use crate::runtime::primitives::GenericCancellationToken;
-use crate::task::{AnyScopeRef, ScopeParent, ScopeStorage};
-use crate::utils::ownership::{ArcOwnership, Ownership, RcOwnership};
-use crate::utils::storage::{
+use crate::{
+    runtime::primitives::GenericCancellationToken,
+    task::{AnyScopeRef, ErasedCancellationToken, RawScope, ScopeParent, ScopeStorage},
+    utils::ownership::{ArcOwnership, Ownership, RcOwnership},
+};
+use std::{
+    any::Any, marker::PhantomData, pin::Pin, ptr::NonNull, sync::atomic::Ordering, task::Waker,
+};
+use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
+use veloq_storage::{
     AtomicStorage, LocalStorage, StateInt, StateLock, StateOptionBox, StrategyType,
 };
-use std::any::Any;
-use std::marker::PhantomData;
-use std::pin::Pin;
-use std::ptr::NonNull;
-use std::sync::atomic::Ordering;
-use std::task::Waker;
-use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 
 pub(crate) struct ScopeWakerNode<S: ScopeStorage> {
     pub(crate) waker: Waker,
@@ -204,9 +203,7 @@ impl<S: ScopeStorage, O: Ownership> Drop for GenericScopeCompletion<S, O> {
     }
 }
 
-impl<S: ScopeStorage, O: Ownership + 'static> crate::task::RawScope
-    for GenericScopeCompletion<S, O>
-{
+impl<S: ScopeStorage, O: Ownership + 'static> RawScope for GenericScopeCompletion<S, O> {
     #[inline]
     fn task_done(&self) {
         self.task_done();
@@ -218,7 +215,7 @@ impl<S: ScopeStorage, O: Ownership + 'static> crate::task::RawScope
     }
 
     #[inline]
-    fn report_panic(&self, payload: Box<dyn std::any::Any + Send + 'static>) {
+    fn report_panic(&self, payload: Box<dyn Any + Send + 'static>) {
         self.report_panic(payload);
     }
 
@@ -228,7 +225,7 @@ impl<S: ScopeStorage, O: Ownership + 'static> crate::task::RawScope
     }
 
     #[inline]
-    fn try_link_child(&self, child_token: &crate::task::ErasedCancellationToken) -> bool {
+    fn try_link_child(&self, child_token: &ErasedCancellationToken) -> bool {
         if child_token.s_type != S::strategy_type() || child_token.o_type != O::strategy_type() {
             return false;
         }
@@ -250,10 +247,10 @@ impl<S: ScopeStorage, O: Ownership + 'static> crate::task::RawScope
     }
 
     #[inline]
-    unsafe fn clone_raw(&self) -> NonNull<dyn crate::task::RawScope> {
+    unsafe fn clone_raw(&self) -> NonNull<dyn RawScope> {
         let ptr = self as *const Self;
         unsafe { O::increment_strong_count(ptr) };
-        let dyn_ptr: *const dyn crate::task::RawScope = ptr;
+        let dyn_ptr: *const dyn RawScope = ptr;
         unsafe { NonNull::new_unchecked(dyn_ptr as *mut _) }
     }
 

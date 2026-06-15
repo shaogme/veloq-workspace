@@ -1,13 +1,20 @@
-use std::net::SocketAddr;
-use std::num::NonZeroUsize;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    net::SocketAddr,
+    num::NonZeroUsize,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
-use veloq::io::{AsyncBufRead, AsyncBufWrite};
-use veloq::net::{TcpListener, TcpStream};
-use veloq::runtime::Runtime;
-use veloq::sync::mpsc;
-use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
+use veloq::{
+    io::{AsyncBufRead, AsyncBufWrite},
+    net::{TcpListener, TcpStream},
+    runtime::Runtime,
+    sync::mpsc,
+};
+use veloq_buf::{FixedBuf, UniformSlot, heap::ThreadMemoryMultiplier, nz};
+use veloq_runtime::{select, task::yield_now};
 
 fn create_runtime() -> Runtime<UniformSlot> {
     create_runtime_with_workers(1)
@@ -194,8 +201,7 @@ fn tcp_heap_buffer() {
         ctx.scope(async |s| {
             s.spawn_boxed(async move {
                 let (stream, _) = listener.accept().await.expect("Accept failed");
-                let buf =
-                    veloq_buf::FixedBuf::alloc_heap(nz!(4096)).expect("Heap allocation failed");
+                let buf = FixedBuf::alloc_heap(nz!(4096)).expect("Heap allocation failed");
                 let (n, buf) = stream.recv(buf).await.expect("Server recv failed");
                 assert_eq!(&buf.as_slice()[..n], b"Hello from heap!");
             });
@@ -204,8 +210,7 @@ fn tcp_heap_buffer() {
                 let stream = TcpStream::connect(ctx, listen_addr)
                     .await
                     .expect("Failed to connect");
-                let mut buf =
-                    veloq_buf::FixedBuf::alloc_heap(nz!(4096)).expect("Heap allocation failed");
+                let mut buf = FixedBuf::alloc_heap(nz!(4096)).expect("Heap allocation failed");
                 let data = b"Hello from heap!";
                 buf.as_slice_mut()[..data.len()].copy_from_slice(data);
                 buf.set_len(data.len());
@@ -412,7 +417,7 @@ fn tcp_cancel_recv() {
         ctx.scope(async |s| {
             s.spawn_boxed(async move {
                 let (_stream, _) = listener.accept().await.expect("Accept failed");
-                veloq_runtime::task::yield_now().await;
+                yield_now().await;
             });
 
             s.spawn_boxed(async move {
@@ -420,11 +425,11 @@ fn tcp_cancel_recv() {
                     .await
                     .expect("Failed to connect");
                 let buf = ctx.alloc(nz!(1024));
-                veloq_runtime::select! {
+                select! {
                     _ = stream.recv(buf) => {
                         panic!("Recv should have been cancelled, but it completed (unexpectedly)");
                     },
-                    _ = veloq_runtime::task::yield_now() => {
+                    _ = yield_now() => {
                         println!("TCP recv cancelled successfully");
                     }
                 };

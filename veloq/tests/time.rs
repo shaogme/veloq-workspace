@@ -1,9 +1,11 @@
-use std::num::NonZeroUsize;
-use std::time::{Duration, Instant};
+use std::{
+    num::NonZeroUsize,
+    time::{Duration, Instant},
+};
 
-use veloq::runtime::Runtime;
-use veloq::time::{
-    MissedTickBehavior, interval, sleep, sleep_local, sleep_until, timeout, timeout_at,
+use veloq::{
+    runtime::Runtime,
+    time::{MissedTickBehavior, interval, sleep, sleep_local, sleep_until, timeout, timeout_at},
 };
 use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
 use veloq_runtime::select;

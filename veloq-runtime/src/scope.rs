@@ -1,17 +1,22 @@
-use crate::error::Result;
-use crate::runtime::primitives::GenericCancellationToken;
-use crate::runtime::{RuntimeScopeContext, RuntimeShared};
-use crate::task::{
-    AnyScopeRef, Arena, ErasedCancellationToken, GenericArena, LocalBoxedTaskNode, LocalTask,
-    LocalTaskRef, RawScope, ScopeRef, ScopeStorage, SendBoxedTaskNode, SendTask, SendTaskRef,
-    TaskError, TaskHandleRef, TaskJoinGate,
+use crate::{
+    error::Result,
+    runtime::{RuntimeScopeContext, RuntimeShared, primitives::GenericCancellationToken},
+    task::{
+        AnyScopeRef, Arena, ErasedCancellationToken, GenericArena, LocalBoxedTaskNode, LocalTask,
+        LocalTaskRef, RawScope, ScopeRef, ScopeStorage, SendBoxedTaskNode, SendTask, SendTaskRef,
+        TaskError, TaskHandleRef, TaskJoinGate,
+    },
+    utils::ownership::{ArcOwnership, Ownership, RcOwnership},
 };
-use crate::utils::ownership::{ArcOwnership, Ownership, RcOwnership};
-use crate::utils::storage::{AtomicStorage, LocalStorage, StateLock, Storage};
-use std::alloc::Layout;
-use std::future::Future;
-use std::ops::AsyncFnOnce;
-use std::ptr::{NonNull, drop_in_place, write};
+use std::{
+    alloc::Layout,
+    future::Future,
+    marker::PhantomData,
+    ops::AsyncFnOnce,
+    panic::resume_unwind,
+    ptr::{NonNull, drop_in_place, write},
+};
+use veloq_storage::{AtomicStorage, LocalStorage, StateLock, Storage};
 
 mod completion;
 mod join;
@@ -83,7 +88,7 @@ pub struct GenericAsyncScope<'rt, 'scope, S: ScopeStorage, O: Ownership + 'stati
     context: RuntimeScopeContext<'rt, TExtra>,
     arena: GenericArena<S>,
     completion: O::Shared<GenericScopeCompletion<S, O>>,
-    _phantom: std::marker::PhantomData<fn(&'scope ()) -> &'scope ()>,
+    _phantom: PhantomData<fn(&'scope ()) -> &'scope ()>,
 }
 
 pub type AsyncScope<'rt, 'scope, TExtra> =
@@ -127,7 +132,7 @@ impl<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra>
             context,
             arena: GenericArena::new(),
             completion,
-            _phantom: std::marker::PhantomData,
+            _phantom: PhantomData,
         }
     }
 
@@ -206,7 +211,7 @@ impl<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra>
             .shared()
             .drive_worker::<S, O>(Some(&self.completion));
         if let Some(panic_info) = self.completion.take_panic() {
-            std::panic::resume_unwind(panic_info);
+            resume_unwind(panic_info);
         }
     }
 

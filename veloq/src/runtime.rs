@@ -14,7 +14,7 @@ use veloq_buf::PoolTopology;
 use veloq_driver_native::driver::PlatformDriver;
 use veloq_runtime::{
     runtime::{self as async_runtime},
-    utils::storage::StaticTransfer,
+    utils::StaticTransfer,
 };
 
 use crate::{

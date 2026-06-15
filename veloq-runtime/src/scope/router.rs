@@ -1,23 +1,28 @@
-use crate::error::Result as RuntimeResult;
-use crate::runtime::{RuntimeScopeContext, RuntimeShared};
-use crate::task::{
-    Arena, GenericArena, GenericTaskHeader, RawScope, RawTask, ScopeRef, ScopeStorage,
-    SendBoxedTaskNode, SendTask, SendTaskRef, Task, TaskError, TaskHandleRef,
+use crate::{
+    error::Result as RuntimeResult,
+    runtime::{RuntimeScopeContext, RuntimeShared},
+    scope::{
+        SendPtr,
+        completion::{GenericScopeCompletion, ScopeCompletion},
+    },
+    task::{
+        Arena, GenericArena, GenericTaskHeader, RawScope, RawTask, ScopeRef, ScopeStorage,
+        SendBoxedTaskNode, SendTask, SendTaskRef, Task, TaskError, TaskHandleRef,
+    },
+    utils::ownership::Ownership,
 };
-use crate::utils::ownership::Ownership;
-use crate::utils::storage::{AtomicOptionPtr, AtomicStorage, StateOptionPtr};
-use std::alloc::Layout;
-use std::future::Future;
-use std::marker::PhantomData;
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::ptr::{NonNull, drop_in_place, write};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::Waker;
+use std::{
+    alloc::Layout,
+    future::{Future, ready},
+    marker::PhantomData,
+    panic::{AssertUnwindSafe, catch_unwind},
+    ptr::{NonNull, drop_in_place, write},
+    sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
+    task::Waker,
+};
 use veloq_atomic_waker::AtomicWaker;
-
-use crate::scope::SendPtr;
-use crate::scope::completion::{GenericScopeCompletion, ScopeCompletion};
+use veloq_storage::{AtomicOptionPtr, AtomicStorage, StateOptionPtr};
 
 pub(crate) trait RoutedTaskAccess<T>: Send {
     fn take_result(&self) -> Result<T, TaskError>;
@@ -251,7 +256,7 @@ where
             state_ref.fail(TaskError::Panic);
             completion_ref.task_done();
         }
-        std::future::ready(())
+        ready(())
     }) {
         Ok(_) => Ok(()),
         Err(err) => {
