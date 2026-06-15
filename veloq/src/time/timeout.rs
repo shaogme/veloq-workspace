@@ -1,10 +1,12 @@
 use super::error::Elapsed;
 use super::sleep::{LocalSleep, Sleep, sleep_until, sleep_until_local};
 use crate::runtime::context::RuntimeContext;
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+    time::{Duration, Instant},
+};
 
 // ============================================================================
 // Sync/Send Timeout

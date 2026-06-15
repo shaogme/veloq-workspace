@@ -1,8 +1,14 @@
-use crate::cursor::{Cursor, CursorMut};
-use crate::{Adapter, Link};
-use core::marker::PhantomData;
-use core::pin::Pin;
-use core::ptr::NonNull;
+use crate::{
+    Adapter, Link,
+    cursor::{Cursor, CursorMut},
+};
+use core::{
+    fmt,
+    marker::PhantomData,
+    ops::{Deref, DerefMut},
+    pin::Pin,
+    ptr::NonNull,
+};
 
 pub struct LinkedList<A: Adapter> {
     pub(crate) head: Option<NonNull<Link>>,
@@ -201,7 +207,7 @@ impl<'a, A: Adapter> Drop for RemoveOnDrop<'a, A> {
     }
 }
 
-impl<'a, A: Adapter> core::ops::Deref for RemoveOnDrop<'a, A> {
+impl<'a, A: Adapter> Deref for RemoveOnDrop<'a, A> {
     type Target = LinkedList<A>;
 
     fn deref(&self) -> &Self::Target {
@@ -209,7 +215,7 @@ impl<'a, A: Adapter> core::ops::Deref for RemoveOnDrop<'a, A> {
     }
 }
 
-impl<'a, A: Adapter> core::ops::DerefMut for RemoveOnDrop<'a, A> {
+impl<'a, A: Adapter> DerefMut for RemoveOnDrop<'a, A> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.list
     }
@@ -235,8 +241,8 @@ impl<A: Adapter> Drop for LinkedList<A> {
     }
 }
 
-impl<A: Adapter> core::fmt::Debug for LinkedList<A> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl<A: Adapter> fmt::Debug for LinkedList<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LinkedList")
             .field("len", &self.len)
             .finish()

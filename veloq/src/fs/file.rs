@@ -1,24 +1,29 @@
 use super::open_options::OpenOptions;
-use crate::fs::error::FsError;
-use crate::runtime::context::{RuntimeContext, submit_control_task};
-
-use diagweave::prelude::*;
-use veloq_buf::FixedBuf;
-use veloq_driver_native::driver::Driver;
-use veloq_driver_native::op::{
-    DetachedSubmitter, Fallocate, FileSyncFileRangeRaw, Fsync, IoFd, LocalSubmitter, Op, ReadFixed,
-    WriteFixed,
+use crate::{
+    error::{Error, Result},
+    fs::error::FsError,
+    io::{AsyncBufRead, AsyncBufWrite},
+    runtime::context::{RuntimeContext, submit_control_task},
 };
-use veloq_driver_native::{RawHandle, RawHandleKind};
-
-use std::cell::Cell;
-use std::future::{Future, IntoFuture};
-use std::path::Path;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::{Context, Poll};
-
-use crate::error::{Error, Result};
+use diagweave::prelude::*;
+use std::{
+    cell::Cell,
+    future::{Future, IntoFuture},
+    path::Path,
+    pin::Pin,
+    sync::atomic::{AtomicU64, Ordering},
+    task::{Context, Poll},
+};
+use veloq_buf::FixedBuf;
+use veloq_driver_native::{
+    RawHandle, RawHandleKind, Socket,
+    driver::Driver,
+    op::{
+        DetachedSubmitter, Fallocate, FileSyncFileRangeRaw, Fsync, IoFd, LocalSubmitter, Op,
+        OpSubmitter, ReadFixed, WriteFixed,
+    },
+};
+use windows_sys::Win32::Foundation::CloseHandle;
 
 #[cfg(not(unix))]
 macro_rules! ignore {
@@ -39,10 +44,10 @@ fn close_raw_handle(raw: RawHandle) {
     #[cfg(windows)]
     match raw.borrow().kind() {
         RawHandleKind::File => unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(raw.raw().as_handle());
+            CloseHandle(raw.raw().as_handle());
         },
         RawHandleKind::Socket => {
-            let _ = unsafe { veloq_driver_native::Socket::from_raw(raw.raw()) };
+            let _ = unsafe { Socket::from_raw(raw.raw()) };
         }
     }
 }
@@ -212,7 +217,7 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> crate::io::AsyncBufRead for LocalFile<'a, 'ctx> {
+impl<'a, 'ctx> AsyncBufRead for LocalFile<'a, 'ctx> {
     type Error = Report<Error>;
 
     async fn read(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -239,7 +244,7 @@ impl<'a, 'ctx> crate::io::AsyncBufRead for LocalFile<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> crate::io::AsyncBufWrite for LocalFile<'a, 'ctx> {
+impl<'a, 'ctx> AsyncBufWrite for LocalFile<'a, 'ctx> {
     type Error = Report<Error>;
 
     async fn write(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -475,10 +480,9 @@ impl<'f, 'a, 'ctx> IntoFuture for SyncRangeBuilder<'f, 'a, 'ctx> {
 }
 
 pub struct SyncRangeFuture<'a, 'ctx> {
-    inner: <DetachedSubmitter as veloq_driver_native::op::OpSubmitter<
-        'ctx,
-        RuntimeContext<'a, 'ctx>,
-    >>::Future<FileSyncFileRangeRaw>,
+    inner: <DetachedSubmitter as OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>>>::Future<
+        FileSyncFileRangeRaw,
+    >,
 }
 
 impl<'a, 'ctx> Future for SyncRangeFuture<'a, 'ctx> {
@@ -496,7 +500,7 @@ impl<'a, 'ctx> Future for SyncRangeFuture<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> crate::io::AsyncBufRead for File<'a, 'ctx> {
+impl<'a, 'ctx> AsyncBufRead for File<'a, 'ctx> {
     type Error = Report<Error>;
 
     async fn read(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -523,7 +527,7 @@ impl<'a, 'ctx> crate::io::AsyncBufRead for File<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> crate::io::AsyncBufWrite for File<'a, 'ctx> {
+impl<'a, 'ctx> AsyncBufWrite for File<'a, 'ctx> {
     type Error = Report<Error>;
 
     async fn write(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {

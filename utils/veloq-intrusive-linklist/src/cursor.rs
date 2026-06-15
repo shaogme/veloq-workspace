@@ -1,7 +1,5 @@
-use crate::list::LinkedList;
-use crate::{Adapter, Link};
-use core::pin::Pin;
-use core::ptr::NonNull;
+use crate::{Adapter, Link, list::LinkedList};
+use core::{pin::Pin, ptr::NonNull};
 
 pub struct Cursor<'a, A: Adapter> {
     list: &'a LinkedList<A>,

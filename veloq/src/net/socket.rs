@@ -1,15 +1,17 @@
 use std::net::{SocketAddr, ToSocketAddrs};
 
-use crate::error::Result;
-use crate::net::error::NetError;
-use crate::runtime::context::RuntimeContext;
+use crate::{
+    error::Result,
+    net::{
+        common::InnerSocket,
+        error::NetError,
+        tcp::{GenericTcpListener, TcpListener, TcpStream},
+        udp::{GenericUdpSocket, UdpSocket},
+    },
+    runtime::context::RuntimeContext,
+};
 use diagweave::prelude::*;
-use veloq_driver_native::Socket;
-use veloq_driver_native::op::DetachedSubmitter;
-
-use crate::net::common::InnerSocket;
-use crate::net::tcp::{GenericTcpListener, TcpListener, TcpStream};
-use crate::net::udp::{GenericUdpSocket, UdpSocket};
+use veloq_driver_native::{Socket, op::DetachedSubmitter};
 
 // ============================================================================
 // TcpSocket

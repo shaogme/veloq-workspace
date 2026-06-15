@@ -1,9 +1,12 @@
 #![cfg(feature = "loom")]
-use veloq_driver_core::driver::registry::OpRegistry;
-use veloq_driver_core::driver::*;
-use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotSpec, SlotView};
-use veloq_shim::sync::Mutex;
-use veloq_shim::{Arc, thread};
+use veloq_driver_core::{
+    driver::{registry::OpRegistry, *},
+    slot::{
+        CheckedSlotView, InFlightOrphaned, InFlightWaiting, Slot, SlotRegistryExt, SlotSpec,
+        SlotView,
+    },
+};
+use veloq_shim::{Arc, sync::Mutex, thread};
 
 struct DummyPlatformOp;
 
@@ -32,26 +35,16 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
     fn handle_control(
         &mut self,
         _control: CompletionControl,
-    ) -> veloq_driver_core::driver::HookResult<
-        DummySlotSpec,
-        CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>,
-    > {
+    ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>> {
         Ok(CompletionHookOutcome::Ignore { effect: () })
     }
 
     fn complete_waiting(
         &mut self,
         event: UserCompletionEvent,
-        slot: veloq_driver_core::slot::Slot<
-            '_,
-            veloq_driver_core::slot::InFlightWaiting,
-            DummySlotSpec,
-        >,
+        slot: Slot<'_, InFlightWaiting, DummySlotSpec>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> veloq_driver_core::driver::HookResult<
-        DummySlotSpec,
-        CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>,
-    > {
+    ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>> {
         let mut completed = slot.complete();
         let _ = completed.take_op();
         let (payload, detail) = completed.take_completion_data();
@@ -67,16 +60,9 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
     fn complete_orphaned(
         &mut self,
         _event: UserCompletionEvent,
-        slot: veloq_driver_core::slot::Slot<
-            '_,
-            veloq_driver_core::slot::InFlightOrphaned,
-            DummySlotSpec,
-        >,
+        slot: Slot<'_, InFlightOrphaned, DummySlotSpec>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> veloq_driver_core::driver::HookResult<
-        DummySlotSpec,
-        CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>,
-    > {
+    ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>> {
         let mut completed = slot.complete();
         let _ = completed.take_op();
         let (payload, detail) = completed.take_completion_data();
@@ -91,7 +77,7 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
     fn finish_backend_effect(
         &mut self,
         _effect: Self::BackendEffect,
-    ) -> veloq_driver_core::driver::HookResult<DummySlotSpec, ()> {
+    ) -> HookResult<DummySlotSpec, ()> {
         Ok(())
     }
 }

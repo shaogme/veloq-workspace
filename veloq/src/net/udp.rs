@@ -1,18 +1,27 @@
-use std::net::{SocketAddr, ToSocketAddrs};
-use std::rc::Rc;
-use std::sync::Arc;
+use std::{
+    net::{SocketAddr, ToSocketAddrs},
+    rc::Rc,
+    sync::Arc,
+};
 
-use crate::error::{Error, Result};
-use crate::net::common::{InnerSocket, SocketToken, SocketTokenPtr};
-use crate::net::error::NetError;
-use crate::runtime::context::RuntimeContext;
-use diagweave::prelude::*;
-use diagweave::report::Report;
+use crate::{
+    error::{Error, Result},
+    io::{AsyncBufRead, AsyncBufWrite},
+    net::{
+        common::{InnerSocket, SocketToken, SocketTokenPtr},
+        error::NetError,
+    },
+    runtime::context::RuntimeContext,
+};
+use diagweave::{prelude::*, report::Report};
 use veloq_buf::FixedBuf;
-use veloq_driver_native::Socket;
-use veloq_driver_native::op::{
-    DetachedSubmitter, LocalSubmitter, Op, OpSubmitter, SendTo, UdpConnect, UdpRecv as OpUdpRecv,
-    UdpRecvFrom, UdpRecvPacket, UdpRecvPacketBuf, UdpSend as OpUdpSend,
+use veloq_driver_native::{
+    Socket,
+    op::{
+        DetachedSubmitter, LocalSubmitter, Op, OpSubmitter, SendTo, UdpConnect,
+        UdpRecv as OpUdpRecv, UdpRecvFrom, UdpRecvPacket, UdpRecvPacketBuf, UdpSend as OpUdpSend,
+    },
+    socket_addr_to_storage,
 };
 
 #[derive(Clone)]
@@ -102,7 +111,7 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
     }
 
     async fn connect_direct(&self, addr: SocketAddr) -> Result<()> {
-        let (raw_addr, raw_addr_len) = veloq_driver_native::socket_addr_to_storage(addr);
+        let (raw_addr, raw_addr_len) = socket_addr_to_storage(addr);
         #[allow(clippy::unnecessary_cast)]
         let op = UdpConnect {
             fd: self.inner.fd(),
@@ -242,7 +251,7 @@ impl<'a, 'ctx> UdpSocket<'a, 'ctx> {
 
     pub async fn connect(&self, addr: SocketAddr) -> Result<()> {
         let owner = self.inner.owner_worker_id();
-        let (raw_addr, raw_addr_len) = veloq_driver_native::socket_addr_to_storage(addr);
+        let (raw_addr, raw_addr_len) = socket_addr_to_storage(addr);
         #[allow(clippy::unnecessary_cast)]
         let op = UdpConnect {
             fd: self.inner.fd(),
@@ -284,7 +293,7 @@ impl<'a, 'ctx> UdpSocket<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> crate::io::AsyncBufRead for LocalUdpSocket<'a, 'ctx> {
+impl<'a, 'ctx> AsyncBufRead for LocalUdpSocket<'a, 'ctx> {
     type Error = Report<Error>;
 
     async fn read(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -306,7 +315,7 @@ impl<'a, 'ctx> crate::io::AsyncBufRead for LocalUdpSocket<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> crate::io::AsyncBufRead for UdpSocket<'a, 'ctx> {
+impl<'a, 'ctx> AsyncBufRead for UdpSocket<'a, 'ctx> {
     type Error = Report<Error>;
 
     async fn read(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -328,7 +337,7 @@ impl<'a, 'ctx> crate::io::AsyncBufRead for UdpSocket<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> crate::io::AsyncBufWrite for LocalUdpSocket<'a, 'ctx> {
+impl<'a, 'ctx> AsyncBufWrite for LocalUdpSocket<'a, 'ctx> {
     type Error = Report<Error>;
 
     async fn write(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -358,7 +367,7 @@ impl<'a, 'ctx> crate::io::AsyncBufWrite for LocalUdpSocket<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> crate::io::AsyncBufWrite for UdpSocket<'a, 'ctx> {
+impl<'a, 'ctx> AsyncBufWrite for UdpSocket<'a, 'ctx> {
     type Error = Report<Error>;
 
     async fn write(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {

@@ -9,11 +9,14 @@
     html_logo_url = "https://raw.githubusercontent.com/smol-rs/smol/master/assets/images/logo_fullsize_transparent.png"
 )]
 
-use core::fmt;
-use core::task::Waker;
-use veloq_shim::atomic::AtomicUsize;
-use veloq_shim::atomic::Ordering::{AcqRel, Acquire, Release};
-use veloq_shim::cell::UnsafeCell;
+use core::{fmt, task::Waker};
+use veloq_shim::{
+    atomic::{
+        AtomicUsize,
+        Ordering::{AcqRel, Acquire, Release},
+    },
+    cell::UnsafeCell,
+};
 
 /// A synchronization primitive for task wakeup.
 ///

@@ -1,15 +1,19 @@
-use std::cell::{Cell, RefCell};
-use std::ptr::NonNull;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::task::Waker;
+use std::{
+    cell::{Cell, RefCell, RefMut},
+    marker::PhantomData,
+    mem::{swap, take},
+    ptr::{NonNull, null_mut},
+    rc::Rc,
+    sync::{Arc, atomic::Ordering},
+    task::Waker,
+};
 
 use crate::{
     LocalOnlyStorage, StateGuard, StateLock, StateOptionArc, StateOptionBox, StateWakerQueue,
     Storage, StrategyType, sealed,
 };
 
-pub struct LocalStorage(std::marker::PhantomData<std::rc::Rc<()>>);
+pub struct LocalStorage(PhantomData<Rc<()>>);
 impl sealed::Sealed for LocalStorage {}
 impl LocalOnlyStorage for LocalStorage {}
 
@@ -37,7 +41,7 @@ impl Storage for LocalStorage {
 pub struct LocalLock<T>(RefCell<T>);
 impl<T> StateLock<T> for LocalLock<T> {
     type Guard<'a>
-        = std::cell::RefMut<'a, T>
+        = RefMut<'a, T>
     where
         T: 'a;
     fn new(val: T) -> Self {
@@ -62,7 +66,7 @@ impl StateWakerQueue for LocalWakerQueue {
     }
 
     fn take_all(&self) -> Vec<Waker> {
-        std::mem::take(&mut *self.0.borrow_mut())
+        take(&mut *self.0.borrow_mut())
     }
 }
 
@@ -174,7 +178,7 @@ impl LocalGuard {
             s.is_draining = true;
             let _guard = DrainGuard;
 
-            let mut defers = std::mem::take(&mut s.pending_defers);
+            let mut defers = take(&mut s.pending_defers);
             drop(s);
 
             loop {
@@ -187,10 +191,10 @@ impl LocalGuard {
                     LOCAL_EPOCH.with(|state| {
                         let mut s = state.borrow_mut();
                         if s.pending_defers.is_empty() {
-                            s.pending_defers = std::mem::take(defers_ref);
+                            s.pending_defers = take(defers_ref);
                             false
                         } else {
-                            std::mem::swap(&mut s.pending_defers, defers_ref);
+                            swap(&mut s.pending_defers, defers_ref);
                             true
                         }
                     })
@@ -208,7 +212,7 @@ impl LocalGuard {
 
 // OptionPtr helpers
 fn opt_to_raw<T>(ptr: Option<NonNull<T>>) -> *mut T {
-    ptr.map(|p| p.as_ptr()).unwrap_or(std::ptr::null_mut())
+    ptr.map(|p| p.as_ptr()).unwrap_or(null_mut())
 }
 fn opt_from_raw<T>(ptr: *mut T) -> Option<NonNull<T>> {
     NonNull::new(ptr)

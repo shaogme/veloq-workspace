@@ -1,7 +1,15 @@
-use std::ptr::NonNull;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use std::task::Waker;
+use std::{
+    marker::PhantomData,
+    ptr::{NonNull, null_mut},
+    sync::{
+        Arc,
+        atomic::{AtomicPtr, AtomicUsize, Ordering},
+    },
+    task::Waker,
+};
+
+use crossbeam_epoch::{Guard, pin};
+use parking_lot::{Mutex, MutexGuard};
 
 use crate::{
     StateGuard, StateLock, StateOptionArc, StateOptionBox, StateWakerQueue, Storage, StrategyType,
@@ -26,18 +34,18 @@ impl Storage for AtomicStorage {
     type Guard = AtomicGuard;
 
     fn pin() -> Self::Guard {
-        AtomicGuard(crossbeam_epoch::pin())
+        AtomicGuard(pin())
     }
 }
 
-pub struct AtomicLock<T>(parking_lot::Mutex<T>);
+pub struct AtomicLock<T>(Mutex<T>);
 impl<T> StateLock<T> for AtomicLock<T> {
     type Guard<'a>
-        = parking_lot::MutexGuard<'a, T>
+        = MutexGuard<'a, T>
     where
         T: 'a;
     fn new(val: T) -> Self {
-        Self(parking_lot::Mutex::new(val))
+        Self(Mutex::new(val))
     }
     fn lock(&self) -> Self::Guard<'_> {
         self.0.lock()
@@ -46,10 +54,10 @@ impl<T> StateLock<T> for AtomicLock<T> {
 unsafe impl<T> Send for AtomicLock<T> {}
 unsafe impl<T> Sync for AtomicLock<T> {}
 
-pub struct AtomicWakerQueue(parking_lot::Mutex<Vec<Waker>>);
+pub struct AtomicWakerQueue(Mutex<Vec<Waker>>);
 impl StateWakerQueue for AtomicWakerQueue {
     fn new() -> Self {
-        Self(parking_lot::Mutex::new(Vec::new()))
+        Self(Mutex::new(Vec::new()))
     }
 
     fn register(&self, waker: &Waker) {
@@ -79,7 +87,7 @@ impl_state_int!(
     compare_exchange_weak(c, n, s, f) { self.compare_exchange_weak(c, n, s, f) }
 );
 
-pub struct AtomicGuard(crossbeam_epoch::Guard);
+pub struct AtomicGuard(Guard);
 
 impl StateGuard for AtomicGuard {
     unsafe fn defer<F>(&self, f: F)
@@ -147,7 +155,7 @@ pub trait PointerStrategy<T> {
     fn physical_null() -> *mut ();
 }
 
-pub struct BoxStrategy<T: ?Sized>(std::marker::PhantomData<T>);
+pub struct BoxStrategy<T: ?Sized>(PhantomData<T>);
 impl<T: ?Sized> PointerStrategy<Box<T>> for BoxStrategy<T> {
     type Raw = PhysicalHandle;
 
@@ -176,11 +184,11 @@ impl<T: ?Sized> PointerStrategy<Box<T>> for BoxStrategy<T> {
     }
 
     fn physical_null() -> *mut () {
-        std::ptr::null_mut()
+        null_mut()
     }
 }
 
-pub struct ArcStrategy<T: ?Sized>(std::marker::PhantomData<T>);
+pub struct ArcStrategy<T: ?Sized>(PhantomData<T>);
 impl<T: ?Sized> PointerStrategy<Arc<T>> for ArcStrategy<T> {
     type Raw = PhysicalHandle;
 
@@ -209,13 +217,13 @@ impl<T: ?Sized> PointerStrategy<Arc<T>> for ArcStrategy<T> {
     }
 
     fn physical_null() -> *mut () {
-        std::ptr::null_mut()
+        null_mut()
     }
 }
 
 pub struct GenericAtomicOption<T, S: PointerStrategy<T>> {
     inner: AtomicPtr<()>,
-    marker: std::marker::PhantomData<fn(T) -> S::Raw>,
+    marker: PhantomData<fn(T) -> S::Raw>,
 }
 
 unsafe impl<T, S: PointerStrategy<T>> Send for GenericAtomicOption<T, S> where T: Send {}
@@ -292,7 +300,7 @@ impl<T, S: PointerStrategy<T>> Drop for GenericAtomicOption<T, S> {
 
 // OptionPtr helpers
 fn opt_to_raw<T>(ptr: Option<NonNull<T>>) -> *mut T {
-    ptr.map(|p| p.as_ptr()).unwrap_or(std::ptr::null_mut())
+    ptr.map(|p| p.as_ptr()).unwrap_or(null_mut())
 }
 fn opt_from_raw<T>(ptr: *mut T) -> Option<NonNull<T>> {
     NonNull::new(ptr)

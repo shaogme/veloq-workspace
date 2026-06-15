@@ -1,5 +1,9 @@
-use std::fmt;
-use std::mem::{align_of, size_of};
+use std::{
+    error::Error,
+    fmt,
+    mem::{self, align_of, size_of},
+    slice::{from_raw_parts, from_raw_parts_mut},
+};
 
 /// An error that can occur when casting between types and byte slices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,7 +23,7 @@ impl fmt::Display for PodError {
     }
 }
 
-impl std::error::Error for PodError {}
+impl Error for PodError {}
 
 /// Trait for types that can be safely initialized with all zeros.
 ///
@@ -68,14 +72,14 @@ unsafe impl Pod for isize {}
 pub fn bytes_of<T: Pod>(val: &T) -> &[u8] {
     let ptr = val as *const T as *const u8;
     // SAFETY: T is Pod, so it's safe to treat its memory as a byte slice.
-    unsafe { std::slice::from_raw_parts(ptr, size_of::<T>()) }
+    unsafe { from_raw_parts(ptr, size_of::<T>()) }
 }
 
 /// Casts a mutable reference to a `Pod` type into a mutable byte slice.
 pub fn bytes_of_mut<T: Pod>(val: &mut T) -> &mut [u8] {
     let ptr = val as *mut T as *mut u8;
     // SAFETY: T is Pod, so it's safe to treat its memory as a byte slice.
-    unsafe { std::slice::from_raw_parts_mut(ptr, size_of::<T>()) }
+    unsafe { from_raw_parts_mut(ptr, size_of::<T>()) }
 }
 
 /// Attempts to cast a byte slice into a reference to a `Pod` type.
@@ -119,7 +123,7 @@ pub fn from_bytes_mut<T: Pod>(bytes: &mut [u8]) -> &mut T {
 /// Returns a zero-initialized instance of a `Zeroable` type.
 pub fn zeroed<T: Zeroable>() -> T {
     // SAFETY: T is Zeroable, so it's safe to initialize it with zeros.
-    unsafe { std::mem::zeroed() }
+    unsafe { mem::zeroed() }
 }
 
 /// Casts a reference to a `Pod` type to a reference of another `Pod` type.

@@ -1,11 +1,14 @@
 use crate::runtime::context::RuntimeContext;
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
-
-use veloq_driver_native::driver::{Driver, PlatformDriver};
-use veloq_driver_native::op::{DetachedOp, LocalOp, Op, Timeout as OpTimeout};
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+    time::{Duration, Instant},
+};
+use veloq_driver_native::{
+    driver::{Driver, PlatformDriver},
+    op::{DetachedOp, LocalOp, Op, Timeout as OpTimeout},
+};
 
 type SleepDetachedOp<'ctx> = DetachedOp<OpTimeout, <PlatformDriver<'ctx> as Driver>::SlotSpec>;
 

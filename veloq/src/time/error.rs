@@ -1,5 +1,8 @@
-use std::fmt;
-use std::io;
+use std::{
+    error::Error,
+    fmt,
+    io::{self, ErrorKind::TimedOut},
+};
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Elapsed(());
@@ -16,10 +19,10 @@ impl fmt::Display for Elapsed {
     }
 }
 
-impl std::error::Error for Elapsed {}
+impl Error for Elapsed {}
 
 impl From<Elapsed> for io::Error {
     fn from(_: Elapsed) -> io::Error {
-        io::Error::new(io::ErrorKind::TimedOut, "deadline has elapsed")
+        io::Error::new(TimedOut, "deadline has elapsed")
     }
 }

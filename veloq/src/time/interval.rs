@@ -1,6 +1,10 @@
 use super::sleep::{LocalSleep, Sleep, sleep_until, sleep_until_local};
 use crate::runtime::context::RuntimeContext;
-use std::time::{Duration, Instant};
+use std::{
+    future::poll_fn,
+    pin::Pin,
+    time::{Duration, Instant},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MissedTickBehavior {
@@ -48,7 +52,7 @@ impl<'a, 'ctx> Interval<'a, 'ctx> {
 
     pub async fn tick(&mut self) -> Instant {
         // Wait for current delay to complete
-        std::future::poll_fn(|cx| std::pin::Pin::new(&mut self.delay).poll(cx)).await;
+        poll_fn(|cx| Pin::new(&mut self.delay).poll(cx)).await;
 
         let now = Instant::now();
         let ticked = self.next_tick;
@@ -122,7 +126,7 @@ impl<'a, 'ctx> LocalInterval<'a, 'ctx> {
 
     pub async fn tick(&mut self) -> Instant {
         // Wait for current delay to complete
-        std::future::poll_fn(|cx| std::pin::Pin::new(&mut self.delay).poll(cx)).await;
+        poll_fn(|cx| Pin::new(&mut self.delay).poll(cx)).await;
 
         let now = Instant::now();
         let ticked = self.next_tick;

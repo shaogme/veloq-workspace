@@ -1,14 +1,15 @@
-use std::net::SocketAddr;
-use std::ops::Deref;
-use std::rc::Rc;
-use std::sync::Arc;
+use std::{marker::PhantomData, net::SocketAddr, ops::Deref, rc::Rc, sync::Arc};
 
-use crate::error::Result;
-use crate::net::error::NetError;
-use crate::runtime::context::{RuntimeContext, submit_control_task};
-use veloq_driver_native::driver::{Driver, RegisterFd};
-use veloq_driver_native::op::IoFd;
-use veloq_driver_native::{OwnedRawHandle, RawHandle};
+use crate::{
+    error::Result,
+    net::error::NetError,
+    runtime::context::{RuntimeContext, submit_control_task},
+};
+use veloq_driver_native::{
+    OwnedRawHandle, RawHandle,
+    driver::{Driver, RegisterFd},
+    op::IoFd,
+};
 
 use diagweave::prelude::*;
 
@@ -93,7 +94,7 @@ where
 {
     token: P,
     local_addr: Option<SocketAddr>,
-    marker: std::marker::PhantomData<(&'a (), &'ctx ())>,
+    marker: PhantomData<(&'a (), &'ctx ())>,
 }
 
 impl<'a, 'ctx, P: SocketTokenPtr<'a, 'ctx>> InnerSocket<'a, 'ctx, P>
@@ -108,7 +109,7 @@ where
         Ok(Self {
             token: P::new_ptr(SocketToken::new(ctx, handle)?),
             local_addr,
-            marker: std::marker::PhantomData,
+            marker: PhantomData,
         })
     }
 

@@ -1,18 +1,22 @@
-use std::ptr::NonNull;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::task::Waker;
+use std::{
+    panic::{AssertUnwindSafe, catch_unwind},
+    ptr::{NonNull, null},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    task::{RawWaker, RawWakerVTable, Waker},
+};
 use veloq_storage::*;
 
-unsafe fn dummy_clone(ptr: *const ()) -> std::task::RawWaker {
-    std::task::RawWaker::new(ptr, &DUMMY_VTABLE)
+unsafe fn dummy_clone(ptr: *const ()) -> RawWaker {
+    RawWaker::new(ptr, &DUMMY_VTABLE)
 }
 
-static DUMMY_VTABLE: std::task::RawWakerVTable =
-    std::task::RawWakerVTable::new(dummy_clone, |_| {}, |_| {}, |_| {});
+static DUMMY_VTABLE: RawWakerVTable = RawWakerVTable::new(dummy_clone, |_| {}, |_| {}, |_| {});
 
 fn create_dummy_waker() -> Waker {
-    let raw_waker = std::task::RawWaker::new(std::ptr::null(), &DUMMY_VTABLE);
+    let raw_waker = RawWaker::new(null(), &DUMMY_VTABLE);
     unsafe { Waker::from_raw(raw_waker) }
 }
 
@@ -342,7 +346,7 @@ fn test_static_transfer() {
 
 #[test]
 fn test_local_guard_defer_basic() {
-    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::new(AtomicBool::new(false));
     let flag_clone = flag.clone();
 
     unsafe {
@@ -358,7 +362,7 @@ fn test_local_guard_defer_basic() {
 
 #[test]
 fn test_local_guard_defer_reentrant() {
-    let step = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let step = Arc::new(AtomicUsize::new(0));
     let step_clone = step.clone();
 
     unsafe {
@@ -379,10 +383,10 @@ fn test_local_guard_defer_reentrant() {
 
 #[test]
 fn test_local_guard_defer_recursive_drain() {
-    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = Arc::new(AtomicUsize::new(0));
     let count_clone = count.clone();
 
-    fn recursive_defer(c: Arc<std::sync::atomic::AtomicUsize>, depth: usize) {
+    fn recursive_defer(c: Arc<AtomicUsize>, depth: usize) {
         if depth == 0 {
             return;
         }
@@ -401,14 +405,14 @@ fn test_local_guard_defer_recursive_drain() {
 
 #[test]
 fn test_local_guard_defer_panic_safety() {
-    let flag1 = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let flag2 = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag1 = Arc::new(AtomicBool::new(false));
+    let flag2 = Arc::new(AtomicBool::new(false));
 
     let flag1_clone = flag1.clone();
     let flag2_clone = flag2.clone();
 
     // 1. 触发一个会 panic 的 defer
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || unsafe {
+    let result = catch_unwind(AssertUnwindSafe(move || unsafe {
         let guard = LocalStorage::pin();
         guard.defer(move || {
             flag1_clone.store(true, Ordering::SeqCst);

@@ -1,9 +1,8 @@
 use std::num::NonZeroUsize;
 
-use veloq::config::BufferRegistrationMode;
-use veloq::runtime::Runtime;
 #[cfg(feature = "test-hooks")]
 use veloq::runtime::context::RuntimeContext;
+use veloq::{config::BufferRegistrationMode, runtime::Runtime};
 use veloq_buf::{
     BufPool, PoolKind, RegionInfo, UniformSlot, heap::ChunkId, heap::ThreadMemoryMultiplier, nz,
 };

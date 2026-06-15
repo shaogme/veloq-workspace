@@ -1,10 +1,14 @@
 use crossbeam_queue::SegQueue;
 use parking_lot::{Condvar, Mutex};
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::thread;
-use std::time::Duration;
+use std::{
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread,
+    time::Duration,
+};
 
 #[derive(Debug, Clone)]
 pub struct BlockingPoolConfig {

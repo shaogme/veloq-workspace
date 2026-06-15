@@ -15,10 +15,12 @@ pub use local::{
 };
 pub use transfer::StaticTransfer;
 
-use std::ptr::NonNull;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::task::Waker;
+use std::{
+    ops::DerefMut,
+    ptr::NonNull,
+    sync::{Arc, atomic::Ordering},
+    task::Waker,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StrategyType {
@@ -130,7 +132,7 @@ pub trait StateNonNullPtr<T> {
 }
 
 pub trait StateLock<T> {
-    type Guard<'a>: std::ops::DerefMut<Target = T>
+    type Guard<'a>: DerefMut<Target = T>
     where
         Self: 'a,
         T: 'a;

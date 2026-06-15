@@ -1,33 +1,42 @@
-use std::cell::RefCell;
-use std::num::NonZeroUsize;
-use std::sync::mpsc;
+use std::{cell::RefCell, io, num::NonZeroUsize, ops::AsyncFnOnce, ptr::NonNull, sync::mpsc};
 
-use veloq_buf::heap::ChunkId;
-use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
-use veloq_driver_native::driver::{
-    ContextDriverProvider, DriveMode, Driver, PlatformDriver, RuntimeContextDriver,
-};
-use veloq_driver_native::op::{DetachedSubmitter, IntoPlatformOp, Op};
-use veloq_runtime::task::{ScopeRef, TaskHandleRef};
-use veloq_runtime::utils::storage::AtomicStorage;
-
-use crate::config::BufferRegistrationMode;
-use crate::error::Result as VeloqResult;
 use diagweave::prelude::*;
-use veloq_runtime::runtime::{IdleDecision, IdleWaitStrategy, RuntimeScopeContext, RuntimeShared};
+use veloq_buf::{
+    AnyBufPool, BufPool, BufResult, BufferRegion, BufferRegistrar, FixedBuf,
+    heap::{ChunkId, ChunkInfo},
+};
+use veloq_driver_native::{
+    driver::{
+        ContextDriverProvider, DriveMode, Driver, PlatformDriver, PlatformOp, PlatformUP,
+        RuntimeContextDriver,
+    },
+    error::{DriverReport, Error as DriverError},
+    op::{DetachedSubmitter, DriverProvider, IntoPlatformOp, IoFd, Op, OpSubmitter},
+};
+use veloq_runtime::{
+    runtime::{IdleDecision, IdleWaitStrategy, RuntimeScopeContext, RuntimeShared},
+    scope::{AsyncScope, LocalAsyncScope},
+    task::{
+        GenericTaskHeader, RawTask, ScopeRef, SendTaskRef, TaskHandleRef, TaskHeader, TaskVTable,
+        yield_now,
+    },
+    utils::storage::AtomicStorage,
+};
+
+use crate::{config::BufferRegistrationMode, error::Result as VeloqResult};
 
 /// 驱动注册中心的消息类型
 #[derive(Debug, Clone)]
 pub enum RegistrarMessage {
     /// 发现了新的内存块，需要通知驱动注册
-    NewChunk(veloq_buf::heap::ChunkInfo),
+    NewChunk(ChunkInfo),
 }
 
 pub struct WorkerRegistrarState {
     /// 接收来自分发器的广播消息
     pub receiver: mpsc::Receiver<RegistrarMessage>,
     /// 本地已知的内存块快照
-    pub chunks: Vec<veloq_buf::heap::ChunkInfo>,
+    pub chunks: Vec<ChunkInfo>,
 }
 
 pub struct WorkerState<'a, 'ctx> {
@@ -72,15 +81,12 @@ impl<'a, 'ctx> DriverRegistrar<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> veloq_buf::BufferRegistrar for DriverRegistrar<'a, 'ctx> {
-    fn register(&self, regions: &[veloq_buf::BufferRegion]) -> veloq_buf::BufResult<Vec<ChunkId>> {
+impl<'a, 'ctx> BufferRegistrar for DriverRegistrar<'a, 'ctx> {
+    fn register(&self, regions: &[BufferRegion]) -> BufResult<Vec<ChunkId>> {
         self.extra(|extra| register_internal(&extra.driver, &extra.registrar_state, regions))
     }
 
-    fn resolve_chunk_info(
-        &self,
-        chunk_id: veloq_buf::heap::ChunkId,
-    ) -> Option<veloq_buf::heap::ChunkInfo> {
+    fn resolve_chunk_info(&self, chunk_id: ChunkId) -> Option<ChunkInfo> {
         self.extra(|extra| {
             resolve_chunk_info_internal(
                 &extra.driver,
@@ -98,15 +104,12 @@ pub(crate) struct BorrowedRegistrar<'a, 'ctx> {
     pub registration_mode: BufferRegistrationMode,
 }
 
-impl<'a, 'ctx> veloq_buf::BufferRegistrar for BorrowedRegistrar<'a, 'ctx> {
-    fn register(&self, regions: &[veloq_buf::BufferRegion]) -> veloq_buf::BufResult<Vec<ChunkId>> {
+impl<'a, 'ctx> BufferRegistrar for BorrowedRegistrar<'a, 'ctx> {
+    fn register(&self, regions: &[BufferRegion]) -> BufResult<Vec<ChunkId>> {
         register_internal(self.driver, self.state, regions)
     }
 
-    fn resolve_chunk_info(
-        &self,
-        chunk_id: veloq_buf::heap::ChunkId,
-    ) -> Option<veloq_buf::heap::ChunkInfo> {
+    fn resolve_chunk_info(&self, chunk_id: ChunkId) -> Option<ChunkInfo> {
         resolve_chunk_info_internal(self.driver, self.state, self.registration_mode, chunk_id)
     }
 }
@@ -114,8 +117,8 @@ impl<'a, 'ctx> veloq_buf::BufferRegistrar for BorrowedRegistrar<'a, 'ctx> {
 fn register_internal(
     driver: &RefCell<PlatformDriver<'_>>,
     state: &RefCell<WorkerRegistrarState>,
-    regions: &[veloq_buf::BufferRegion],
-) -> veloq_buf::BufResult<Vec<ChunkId>> {
+    regions: &[BufferRegion],
+) -> BufResult<Vec<ChunkId>> {
     let mut indices = Vec::with_capacity(regions.len());
     let mut new_chunks = Vec::with_capacity(regions.len());
 
@@ -125,13 +128,13 @@ fn register_internal(
             let chunk_id = region.id();
             driver
                 .register_chunk(chunk_id, region.as_ptr(), region.len())
-                .map_err(|err| std::io::Error::other(format!("{err:#}")))
+                .map_err(|err| io::Error::other(format!("{err:#}")))
                 .trans()?;
 
-            new_chunks.push(veloq_buf::heap::ChunkInfo {
+            new_chunks.push(ChunkInfo {
                 id: chunk_id,
-                ptr: unsafe { std::ptr::NonNull::new_unchecked(region.as_ptr() as *mut u8) },
-                len: unsafe { std::num::NonZeroUsize::new_unchecked(region.len()) },
+                ptr: unsafe { NonNull::new_unchecked(region.as_ptr() as *mut u8) },
+                len: unsafe { NonZeroUsize::new_unchecked(region.len()) },
             });
             indices.push(chunk_id);
         }
@@ -147,8 +150,8 @@ fn resolve_chunk_info_internal(
     driver: &RefCell<PlatformDriver<'_>>,
     state: &RefCell<WorkerRegistrarState>,
     registration_mode: BufferRegistrationMode,
-    chunk_id: veloq_buf::heap::ChunkId,
-) -> Option<veloq_buf::heap::ChunkInfo> {
+    chunk_id: ChunkId,
+) -> Option<ChunkInfo> {
     // 首先在本地快照中查找
     let found = {
         let state = state.borrow();
@@ -217,9 +220,9 @@ impl<'a, 'ctx> ContextDriverProvider<PlatformDriver<'ctx>> for RuntimeContext<'a
     }
 }
 
-impl<'a, 'ctx> veloq_driver_native::op::DriverProvider for RuntimeContext<'a, 'ctx> {
-    type Op = veloq_driver_native::driver::PlatformOp;
-    type UP = veloq_driver_native::driver::PlatformUP;
+impl<'a, 'ctx> DriverProvider for RuntimeContext<'a, 'ctx> {
+    type Op = PlatformOp;
+    type UP = PlatformUP;
     type Completion = usize;
     type Error = <PlatformDriver<'ctx> as Driver>::Error;
     type SlotSpec = <PlatformDriver<'ctx> as Driver>::SlotSpec;
@@ -246,18 +249,18 @@ impl<'a, 'ctx> RuntimeContext<'a, 'ctx> {
 
     pub async fn scope<R, F>(&self, f: F) -> R
     where
-        F: for<'scope_ref, 's0, 's1, 's2, 's3> std::ops::AsyncFnOnce(
-                &'scope_ref veloq_runtime::scope::AsyncScope<'s0, 's1, WorkerState<'s2, 's3>>,
-            ) -> R,
+        F: for<'scope_ref, 's0, 's1, 's2, 's3> AsyncFnOnce(
+            &'scope_ref AsyncScope<'s0, 's1, WorkerState<'s2, 's3>>,
+        ) -> R,
     {
         self.scope.scope(f).await
     }
 
     pub async fn scope_local<R, F>(&self, f: F) -> R
     where
-        F: for<'scope_ref, 's0, 's1, 's2, 's3> std::ops::AsyncFnOnce(
-                &'scope_ref veloq_runtime::scope::LocalAsyncScope<'s0, 's1, WorkerState<'s2, 's3>>,
-            ) -> R,
+        F: for<'scope_ref, 's0, 's1, 's2, 's3> AsyncFnOnce(
+            &'scope_ref LocalAsyncScope<'s0, 's1, WorkerState<'s2, 's3>>,
+        ) -> R,
     {
         self.scope.scope_local(f).await
     }
@@ -288,7 +291,7 @@ impl<'a, 'ctx> RuntimeContext<'a, 'ctx> {
         self.buf_pool().alloc(size)
     }
 
-    pub fn try_alloc(&self, size: NonZeroUsize) -> veloq_buf::BufResult<FixedBuf> {
+    pub fn try_alloc(&self, size: NonZeroUsize) -> BufResult<FixedBuf> {
         self.try_alloc_from_pool(size)
             .map_or_else(|| FixedBuf::alloc_heap(size), Ok)
     }
@@ -318,7 +321,7 @@ impl<'a, 'ctx> RuntimeContext<'a, 'ctx> {
 
     pub fn submit<'d, S, T>(&self, submitter: &'d S, op: Op<T>) -> S::Future<T>
     where
-        S: veloq_driver_native::op::OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy + 'd,
+        S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy + 'd,
         T: IntoPlatformOp<
                 <PlatformDriver<'ctx> as Driver>::Op,
                 DriverCompletion = <PlatformDriver<'ctx> as Driver>::Completion,
@@ -332,7 +335,7 @@ impl<'a, 'ctx> RuntimeContext<'a, 'ctx> {
 
     pub async fn yield_now(&self) {
         self.sync_registrar();
-        veloq_runtime::task::yield_now().await;
+        yield_now().await;
     }
 
     pub async fn submit_to<'d, T>(
@@ -342,7 +345,7 @@ impl<'a, 'ctx> RuntimeContext<'a, 'ctx> {
     ) -> VeloqResult<(
         Result<
             <T as IntoPlatformOp<<PlatformDriver<'ctx> as Driver>::Op>>::Completion,
-            veloq_driver_native::error::DriverReport<veloq_driver_native::error::Error>,
+            DriverReport<DriverError>,
         >,
         T::Output,
     )>
@@ -399,21 +402,21 @@ pub fn poll_current_driver<'a, 'ctx>(
 }
 
 pub(crate) fn submit_control_task<'a, 'ctx>(
-    shared: &'a veloq_runtime::runtime::shared::RuntimeShared<WorkerState<'a, 'ctx>>,
+    shared: &'a RuntimeShared<WorkerState<'a, 'ctx>>,
     worker_id: usize,
-    fd: veloq_driver_native::op::IoFd,
+    fd: IoFd,
 ) {
     struct UnregisterFileTask<'a, 'ctx> {
-        header: veloq_runtime::task::TaskHeader,
-        fd: veloq_driver_native::op::IoFd,
-        shared_ptr: *const veloq_runtime::runtime::shared::RuntimeShared<WorkerState<'a, 'ctx>>,
+        header: TaskHeader,
+        fd: IoFd,
+        shared_ptr: *const RuntimeShared<WorkerState<'a, 'ctx>>,
     }
 
     unsafe impl<'a, 'ctx> Send for UnregisterFileTask<'a, 'ctx> {}
     unsafe impl<'a, 'ctx> Sync for UnregisterFileTask<'a, 'ctx> {}
 
-    impl<'a, 'ctx> veloq_runtime::task::RawTask for UnregisterFileTask<'a, 'ctx> {
-        type Storage = veloq_runtime::utils::storage::AtomicStorage;
+    impl<'a, 'ctx> RawTask for UnregisterFileTask<'a, 'ctx> {
+        type Storage = AtomicStorage;
 
         fn poll_raw(&self, _worker_id: usize) -> bool {
             let shared = unsafe { &*self.shared_ptr };
@@ -423,29 +426,24 @@ pub(crate) fn submit_control_task<'a, 'ctx>(
             });
             self.header.mark_completed_and_notify();
             unsafe {
-                let header_ptr = std::ptr::NonNull::from(&self.header);
-                veloq_runtime::task::GenericTaskHeader::drop_task(header_ptr);
+                let header_ptr = NonNull::from(&self.header);
+                GenericTaskHeader::drop_task(header_ptr);
             }
             true
         }
 
-        fn header(&self) -> &veloq_runtime::task::GenericTaskHeader<Self::Storage> {
+        fn header(&self) -> &GenericTaskHeader<Self::Storage> {
             &self.header
         }
     }
 
     impl<'a, 'ctx> UnregisterFileTask<'a, 'ctx> {
-        const VTABLE: &'static veloq_runtime::task::TaskVTable<
-            veloq_runtime::utils::storage::AtomicStorage,
-        > = &veloq_runtime::task::TaskVTable {
+        const VTABLE: &'static TaskVTable<AtomicStorage> = &TaskVTable {
             wake: |_| {},
             wake_by_ref: |_| {},
             poll: |header, worker_id| unsafe {
-                let node = &*(header
-                    as *const veloq_runtime::task::GenericTaskHeader<
-                        veloq_runtime::utils::storage::AtomicStorage,
-                    > as *const Self);
-                veloq_runtime::task::RawTask::poll_raw(node, worker_id)
+                let node = &*(header as *const GenericTaskHeader<AtomicStorage> as *const Self);
+                RawTask::poll_raw(node, worker_id)
             },
             drop: |data| unsafe {
                 let ptr = data.as_ptr() as *mut Self;
@@ -455,7 +453,7 @@ pub(crate) fn submit_control_task<'a, 'ctx>(
     }
 
     let task = Box::new(UnregisterFileTask {
-        header: veloq_runtime::task::TaskHeader::new(
+        header: TaskHeader::new(
             UnregisterFileTask::<'a, 'ctx>::VTABLE,
             &shared.base,
             worker_id,
@@ -468,7 +466,7 @@ pub(crate) fn submit_control_task<'a, 'ctx>(
     task.header.set_pinned();
 
     let ptr = Box::into_raw(task);
-    let task_ref = unsafe { veloq_runtime::task::SendTaskRef::from_concrete(ptr) };
+    let task_ref = unsafe { SendTaskRef::from_concrete(ptr) };
     if !shared.enqueue_pinned(worker_id, task_ref) {
         unsafe {
             let _ = Box::from_raw(ptr);

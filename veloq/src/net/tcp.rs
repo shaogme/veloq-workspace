@@ -1,17 +1,27 @@
-use std::net::{SocketAddr, ToSocketAddrs};
-use std::rc::Rc;
-use std::sync::Arc;
+use std::{
+    mem::size_of,
+    net::{SocketAddr, ToSocketAddrs},
+    rc::Rc,
+    sync::Arc,
+};
 
-use crate::error::{Error, Result};
-use crate::net::common::{InnerSocket, SocketToken, SocketTokenPtr};
-use crate::net::error::NetError;
-use crate::runtime::context::RuntimeContext;
-use diagweave::prelude::*;
-use diagweave::report::Report;
+use crate::{
+    error::{Error, Result},
+    io::{AsyncBufRead, AsyncBufWrite},
+    net::{
+        common::{InnerSocket, SocketToken, SocketTokenPtr},
+        error::NetError,
+    },
+    runtime::context::RuntimeContext,
+};
+use diagweave::{prelude::*, report::Report};
 use veloq_buf::FixedBuf;
-use veloq_driver_native::Socket;
-use veloq_driver_native::op::{
-    Accept, Connect, DetachedSubmitter, LocalSubmitter, Op, OpSubmitter, Recv, Send as OpSend,
+use veloq_driver_native::{
+    SockAddrStorage, Socket,
+    op::{
+        Accept, Connect, DetachedSubmitter, LocalSubmitter, Op, OpSubmitter, Recv, Send as OpSend,
+    },
+    socket_addr_to_storage,
 };
 
 #[derive(Clone)]
@@ -83,8 +93,8 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
     async fn accept_direct(&self) -> Result<(GenericTcpStream<'a, 'ctx, S, P>, SocketAddr)> {
         let op = Accept {
             fd: self.inner.fd(),
-            addr: veloq_driver_native::SockAddrStorage::default(),
-            addr_len: std::mem::size_of::<veloq_driver_native::SockAddrStorage>() as u32,
+            addr: SockAddrStorage::default(),
+            addr_len: size_of::<SockAddrStorage>() as u32,
             remote_addr: None,
         };
 
@@ -121,7 +131,7 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
         ctx: RuntimeContext<'a, 'ctx>,
         addr: SocketAddr,
     ) -> Result<Self> {
-        let (raw_addr, raw_addr_len) = veloq_driver_native::socket_addr_to_storage(addr);
+        let (raw_addr, raw_addr_len) = socket_addr_to_storage(addr);
         #[allow(clippy::unnecessary_cast)]
         let op = Connect {
             fd: inner.fd(),
@@ -208,8 +218,8 @@ impl<'a, 'ctx> TcpListener<'a, 'ctx> {
         let owner = self.inner.owner_worker_id();
         let op = Accept {
             fd: self.inner.fd(),
-            addr: veloq_driver_native::SockAddrStorage::default(),
-            addr_len: std::mem::size_of::<veloq_driver_native::SockAddrStorage>() as u32,
+            addr: SockAddrStorage::default(),
+            addr_len: size_of::<SockAddrStorage>() as u32,
             remote_addr: None,
         };
 
@@ -295,7 +305,7 @@ impl<'a, 'ctx> TcpStream<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> crate::io::AsyncBufRead for LocalTcpStream<'a, 'ctx> {
+impl<'a, 'ctx> AsyncBufRead for LocalTcpStream<'a, 'ctx> {
     type Error = Report<Error>;
 
     async fn read(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -317,7 +327,7 @@ impl<'a, 'ctx> crate::io::AsyncBufRead for LocalTcpStream<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> crate::io::AsyncBufRead for TcpStream<'a, 'ctx> {
+impl<'a, 'ctx> AsyncBufRead for TcpStream<'a, 'ctx> {
     type Error = Report<Error>;
 
     async fn read(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -339,7 +349,7 @@ impl<'a, 'ctx> crate::io::AsyncBufRead for TcpStream<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> crate::io::AsyncBufWrite for LocalTcpStream<'a, 'ctx> {
+impl<'a, 'ctx> AsyncBufWrite for LocalTcpStream<'a, 'ctx> {
     type Error = Report<Error>;
 
     async fn write(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -369,7 +379,7 @@ impl<'a, 'ctx> crate::io::AsyncBufWrite for LocalTcpStream<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> crate::io::AsyncBufWrite for TcpStream<'a, 'ctx> {
+impl<'a, 'ctx> AsyncBufWrite for TcpStream<'a, 'ctx> {
     type Error = Report<Error>;
 
     async fn write(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {

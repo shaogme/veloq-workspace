@@ -1,22 +1,29 @@
 pub mod context;
 
-use std::cell::RefCell;
-use std::num::NonZeroUsize;
-use std::ops::AsyncFnOnce;
-use std::sync::{Arc, mpsc};
-use std::thread;
+use std::{
+    cell::RefCell,
+    num::NonZeroUsize,
+    ops::AsyncFnOnce,
+    sync::{Arc, mpsc},
+    thread,
+};
 
 use diagweave::Transform;
 use veloq_blocking::init_blocking_pool;
 use veloq_buf::PoolTopology;
 use veloq_driver_native::driver::PlatformDriver;
-use veloq_runtime::runtime::{self as async_runtime};
-use veloq_runtime::utils::storage::StaticTransfer;
+use veloq_runtime::{
+    runtime::{self as async_runtime},
+    utils::storage::StaticTransfer,
+};
 
-use crate::config::{BlockingPoolConfig, Config};
-use crate::runtime::context::{
-    BorrowedRegistrar, DriverRegistrar, RegistrarMessage, RuntimeContext, WorkerRegistrarState,
-    WorkerState, poll_current_driver,
+use crate::{
+    config::{BlockingPoolConfig, Config},
+    error::Result as VeloqResult,
+    runtime::context::{
+        BorrowedRegistrar, DriverRegistrar, RegistrarMessage, RuntimeContext, WorkerRegistrarState,
+        WorkerState, poll_current_driver,
+    },
 };
 
 pub struct RuntimeBuilder<T: PoolTopology> {
@@ -60,7 +67,7 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
         self
     }
 
-    pub fn build(self) -> crate::error::Result<Runtime<T>> {
+    pub fn build(self) -> VeloqResult<Runtime<T>> {
         let worker_count = self.config.get_worker_threads_opt().unwrap_or_else(|| {
             thread::available_parallelism()
                 .unwrap_or_else(|_| NonZeroUsize::new(1).expect("1 is non-zero"))
