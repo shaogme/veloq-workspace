@@ -1,16 +1,15 @@
-use std::num::NonZeroU8;
-use std::time::Instant;
+use std::{io, num::NonZeroU8, time::Instant};
 
 use diagweave::prelude::*;
 use tracing::warn;
-use veloq_driver_core::driver::{
-    CancelMode, CompletionAnomaly, CompletionBackend, CompletionBackendHooks,
-    CompletionCleanupGuard, CompletionControl, CompletionEnvelope, CompletionFlowExt,
-    CompletionFlowOutcome, CompletionHookOutcome, CompletionIngress, CompletionSource,
-    SyntheticCompletionSource, UserCompletionEvent,
-};
-use veloq_driver_core::slot::{
-    CheckedSlotView, InFlightOrphaned, InFlightWaiting, SlotRegistryExt, SlotView,
+use veloq_driver_core::{
+    driver::{
+        CancelMode, CompletionAnomaly, CompletionBackend, CompletionBackendHooks,
+        CompletionCleanupGuard, CompletionControl, CompletionEnvelope, CompletionFlowExt,
+        CompletionFlowOutcome, CompletionHookOutcome, CompletionIngress, CompletionSource,
+        SyntheticCompletionSource, UserCompletionEvent,
+    },
+    slot::{CheckedSlotView, InFlightOrphaned, InFlightWaiting, SlotRegistryExt, SlotView},
 };
 
 use crate::{
@@ -317,7 +316,7 @@ fn calculate_io_result_from_slot(
     let mut io_result = if event_res < 0 {
         Err(IocpError::CompletionWait.io_report(
             "iocp.driver.calculate_io_result_from_slot",
-            std::io::Error::from_raw_os_error(-event_res),
+            io::Error::from_raw_os_error(-event_res),
         ))
     } else {
         Ok(event_res as usize)
@@ -490,7 +489,7 @@ fn complete_iocp_orphaned_slot(
     } else {
         Err(IocpError::CompletionWait.io_report(
             "iocp.driver.process_completion.orphaned",
-            std::io::Error::from_raw_os_error(-event_res),
+            io::Error::from_raw_os_error(-event_res),
         ))
     };
     let (cleanup, socket_inflight) = completed

@@ -1,19 +1,18 @@
-use std::io::Error as IoError;
-use std::ptr;
+use std::{io::Error as IoError, ptr};
 
 use crate::error::{IocpError, IocpResult};
 use veloq_driver_core::driver::CompletionToken;
 use veloq_pod::{Pod, Zeroable, zeroed};
-use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
-};
-use windows_sys::Win32::Networking::WinSock::{
-    INVALID_SOCKET, SOCKADDR, SOCKET, bind, closesocket, connect, getpeername, getsockname, listen,
-    setsockopt,
-};
-use windows_sys::Win32::System::IO::{
-    CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
-    PostQueuedCompletionStatus,
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT},
+    Networking::WinSock::{
+        INVALID_SOCKET, SOCKADDR, SOCKET, bind, closesocket, connect, getpeername, getsockname,
+        listen, setsockopt,
+    },
+    System::IO::{
+        CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatus, OVERLAPPED,
+        PostQueuedCompletionStatus,
+    },
 };
 
 fn last_os_error() -> IoError {

@@ -5,11 +5,18 @@ mod polling;
 mod registration;
 mod submission;
 
-use std::sync::{Arc, mpsc};
-use std::time::Duration;
+use std::{
+    sync::{Arc, mpsc},
+    time::Duration,
+};
 
 use diagweave::prelude::*;
 use tracing::trace;
+
+use lifecycle::{IocpRioRuntime, WinsockGuard};
+use polling::{CompletionPump, TimerEngine};
+use registration::HandleRegistry;
+use submission::SubmitContextInternal;
 
 #[cfg(test)]
 use crate::RegisteredHandle;
@@ -56,23 +63,23 @@ pub use crate::op::IocpOpState;
 
 /// The IOCP driver implementation that manages I/O completion ports and operations.
 pub struct IocpDriver<'a> {
-    completion: polling::CompletionPump,
+    completion: CompletionPump,
     ops: IocpOpRegistry,
     extensions: Extensions,
-    timer: polling::TimerEngine,
-    handles: registration::HandleRegistry,
+    timer: TimerEngine,
+    handles: HandleRegistry,
     remote_cancel_sender: RemoteCancelSender,
     remote_cancel_receiver: mpsc::Receiver<CancelRequest>,
     completion_diagnostics: IocpDriverCompletionDiagnostics,
 
     // RIO Support (required)
-    rio: lifecycle::IocpRioRuntime<'a>,
+    rio: IocpRioRuntime<'a>,
     shutting_down: bool,
     closed: bool,
 
     // Rust drops fields in declaration order; keep this last so WSACleanup runs
     // after socket/RIO-backed state has been torn down.
-    _winsock: lifecycle::WinsockGuard,
+    _winsock: WinsockGuard,
 }
 
 /// Closing mode for the driver or operations.
@@ -225,7 +232,7 @@ impl<'a> Driver for IocpDriver<'a> {
         let completion = &self.completion;
         let timer = &mut self.timer;
         let diagnostics = &mut self.completion_diagnostics;
-        let ctx = submission::SubmitContextInternal::new(
+        let ctx = SubmitContextInternal::new(
             completion.port_arc(),
             timer.wheel_mut(),
             completion.table(),

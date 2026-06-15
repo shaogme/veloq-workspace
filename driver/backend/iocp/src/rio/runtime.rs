@@ -297,9 +297,11 @@ pub(crate) fn release_socket_inflight_token_from(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::BufferRegistrationMode;
-    use crate::config::IocpHandle;
-    use crate::rio::core::{RioKernel, RioRegistry, RioRq};
+    use crate::{
+        BufferRegistrationMode,
+        config::IocpHandle,
+        rio::core::{RioKernel, RioRegistry, RioRq},
+    };
     use std::ptr::null_mut;
 
     fn test_state() -> RioState {

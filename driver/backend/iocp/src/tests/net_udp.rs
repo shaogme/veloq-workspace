@@ -1,18 +1,22 @@
-use crate::config::{IoFd, IocpConfig};
-use crate::driver::IocpDriver;
-use crate::net::socket::Socket;
-use crate::tests::{
-    complete_from_record, completion_os_error_code, submit_test_op, wait_completion,
-    wait_completion_record,
+use crate::{
+    config::{IoFd, IocpConfig},
+    driver::IocpDriver,
+    net::socket::Socket,
+    tests::{
+        complete_from_record, completion_os_error_code, submit_test_op, wait_completion,
+        wait_completion_record,
+    },
 };
-use std::time::Duration;
-use veloq_buf::{BufPool, FixedBuf, NoopRegistrar};
+use std::{net::UdpSocket, num::NonZeroUsize, sync::Arc, time::Duration};
 use veloq_buf::{
-    PoolTopology, UniformSlot,
+    BufPool, FixedBuf, NoopRegistrar, PoolTopology, UniformSlot,
     heap::{GlobalSlotPool, ThreadMemoryMultiplier},
 };
-use veloq_driver_core::driver::{Driver, RegisterFd};
-use veloq_driver_core::op::{SendTo, UdpRecvFrom};
+use veloq_driver_core::{
+    driver::{CancelRequest, Driver, RegisterFd},
+    op::{SendTo, UdpRecvFrom},
+};
+use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 
 fn register_owned_socket(driver: &mut IocpDriver, socket: Socket) -> IoFd {
     let handle = socket.into_owned_raw();
@@ -26,7 +30,7 @@ fn register_owned_socket(driver: &mut IocpDriver, socket: Socket) -> IoFd {
 
 fn register_buf_chunk(
     driver: &mut IocpDriver,
-    global_pool: &std::sync::Arc<GlobalSlotPool>,
+    global_pool: &Arc<GlobalSlotPool>,
     buf: &FixedBuf,
     label: &'static str,
 ) {
@@ -60,7 +64,7 @@ fn test_rio_udp_send_to_recv_from_address_path() {
     let server_fd = register_owned_socket(&mut driver, server);
     let client_fd = register_owned_socket(&mut driver, client);
 
-    let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(10).unwrap());
+    let multiplier = ThreadMemoryMultiplier(NonZeroUsize::new(10).unwrap());
     let topology = UniformSlot::new(multiplier);
     let global_pool = topology.create_pool(1).expect("Create pool failed");
     let reg_pool = topology
@@ -68,14 +72,14 @@ fn test_rio_udp_send_to_recv_from_address_path() {
         .expect("build buffer pool failed");
 
     let mut send_buf = reg_pool
-        .alloc(std::num::NonZeroUsize::new(8192).unwrap())
+        .alloc(NonZeroUsize::new(8192).unwrap())
         .expect("send alloc failed");
     let test_data = b"rio-udp-sendto-regression";
     send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
     send_buf.set_len(test_data.len());
 
     let recv_buf = reg_pool
-        .alloc(std::num::NonZeroUsize::new(8192).unwrap())
+        .alloc(NonZeroUsize::new(8192).unwrap())
         .expect("recv alloc failed");
     register_buf_chunk(&mut driver, &global_pool, &send_buf, "send");
     register_buf_chunk(&mut driver, &global_pool, &recv_buf, "recv");
@@ -137,7 +141,7 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
     let server_fd = register_owned_socket(&mut driver, server);
     let client_fd = register_owned_socket(&mut driver, client);
 
-    let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(10).unwrap());
+    let multiplier = ThreadMemoryMultiplier(NonZeroUsize::new(10).unwrap());
     let topology = UniformSlot::new(multiplier);
     let global_pool = topology.create_pool(1).expect("Create pool failed");
     let reg_pool = topology
@@ -145,14 +149,14 @@ fn test_rio_udp_send_to_recv_from_address_path_ipv6() {
         .expect("build buffer pool failed");
 
     let mut send_buf = reg_pool
-        .alloc(std::num::NonZeroUsize::new(8192).unwrap())
+        .alloc(NonZeroUsize::new(8192).unwrap())
         .expect("send alloc failed");
     let test_data = b"rio-udp-sendto-regression-ipv6";
     send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
     send_buf.set_len(test_data.len());
 
     let recv_buf = reg_pool
-        .alloc(std::num::NonZeroUsize::new(8192).unwrap())
+        .alloc(NonZeroUsize::new(8192).unwrap())
         .expect("recv alloc failed");
     register_buf_chunk(&mut driver, &global_pool, &send_buf, "send");
     register_buf_chunk(&mut driver, &global_pool, &recv_buf, "recv");
@@ -200,7 +204,7 @@ fn test_rio_udp_recv_from_cancel_reports_aborted() {
         .expect("server bind failed");
     let server_addr = server.local_addr().expect("server local_addr failed");
     let server_fd = register_owned_socket(&mut driver, server);
-    let multiplier = ThreadMemoryMultiplier(std::num::NonZeroUsize::new(10).unwrap());
+    let multiplier = ThreadMemoryMultiplier(NonZeroUsize::new(10).unwrap());
     let topology = UniformSlot::new(multiplier);
     let global_pool = topology.create_pool(1).expect("Create pool failed");
     let reg_pool = topology
@@ -208,7 +212,7 @@ fn test_rio_udp_recv_from_cancel_reports_aborted() {
         .expect("build buffer pool failed");
 
     let recv_buf = reg_pool
-        .alloc(std::num::NonZeroUsize::new(8192).unwrap())
+        .alloc(NonZeroUsize::new(8192).unwrap())
         .expect("recv alloc failed");
     register_buf_chunk(&mut driver, &global_pool, &recv_buf, "recv");
 
@@ -220,18 +224,16 @@ fn test_rio_udp_recv_from_cancel_reports_aborted() {
     };
     let token = submit_test_op(&mut driver, recv_op);
 
-    let _ = driver.cancel_op(veloq_driver_core::driver::CancelRequest::user_visible(
-        token,
-    ));
-    let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("client bind failed");
+    let _ = driver.cancel_op(CancelRequest::user_visible(token));
+    let client = UdpSocket::bind("127.0.0.1:0").expect("client bind failed");
     client
         .send_to(b"cancel-drain", server_addr)
         .expect("client send_to failed");
-    let err = wait_completion(&mut driver, token, std::time::Duration::from_secs(5))
+    let err = wait_completion(&mut driver, token, Duration::from_secs(5))
         .expect_err("cancelled udp_recv_from should fail");
     assert_eq!(
         completion_os_error_code(&err),
-        Some(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32)
+        Some(ERROR_OPERATION_ABORTED as i32)
     );
 
     driver.unregister_files(vec![server_fd]).unwrap();

@@ -1,6 +1,11 @@
-use std::fmt;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    error::Error,
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use diagweave::prelude::*;
 use tracing::error;
@@ -28,7 +33,7 @@ impl fmt::Display for IocpErrorContext {
     }
 }
 
-impl std::error::Error for IocpErrorContext {}
+impl Error for IocpErrorContext {}
 
 impl From<IocpErrorContext> for IocpError {
     fn from(value: IocpErrorContext) -> Self {

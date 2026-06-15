@@ -1,12 +1,14 @@
-use std::collections::VecDeque;
-use std::io;
+use std::{collections::VecDeque, io, mem};
 
 use diagweave::prelude::*;
+use veloq_buf::heap::ChunkId;
 use veloq_driver_core::driver::RegisterFd;
-use windows_sys::Win32::Foundation::CloseHandle;
-use windows_sys::Win32::Networking::WinSock::{
-    INVALID_SOCKET, SO_TYPE, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSAENOTSOCK, WSAGetLastError,
-    closesocket, getsockopt,
+use windows_sys::Win32::{
+    Foundation::CloseHandle,
+    Networking::WinSock::{
+        INVALID_SOCKET, SO_TYPE, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSAENOTSOCK, WSAGetLastError,
+        closesocket, getsockopt,
+    },
 };
 
 use crate::{
@@ -292,7 +294,7 @@ impl<'a> IocpDriver<'a> {
     pub(crate) fn detect_socket_from_file_handle(handle: RawHandle) -> IocpResult<bool> {
         let socket = handle.raw().as_socket();
         let mut ty = 0i32;
-        let mut len = std::mem::size_of::<i32>() as i32;
+        let mut len = mem::size_of::<i32>() as i32;
         // SAFETY: buffer pointers are valid for getsockopt call.
         let ret = unsafe {
             getsockopt(
@@ -313,7 +315,7 @@ impl<'a> IocpDriver<'a> {
         } else {
             Err(IocpError::ResolveFd.io_report(
                 "iocp/driver.detect_socket_from_file_handle",
-                std::io::Error::from_raw_os_error(err),
+                io::Error::from_raw_os_error(err),
             ))
         }
     }
@@ -380,7 +382,7 @@ impl<'a> IocpDriver<'a> {
     /// Registers a chunk of memory for RIO operations.
     pub(crate) fn register_chunk(
         &mut self,
-        id: veloq_buf::heap::ChunkId,
+        id: ChunkId,
         ptr: *const u8,
         len: usize,
     ) -> IocpDriverResult<()> {

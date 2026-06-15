@@ -30,10 +30,12 @@ use crate::{
 use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use std::{
+    collections::HashSet,
+    mem::replace,
     ptr,
     time::{Duration, Instant},
 };
-use veloq_buf::FixedBuf;
+use veloq_buf::{FixedBuf, heap::ChunkId};
 use windows_sys::Win32::Networking::WinSock::RIO_BUF;
 
 use super::{
@@ -76,7 +78,7 @@ pub(crate) struct RioRegistry {
     pub(crate) pending_deregistrations: Vec<RioBufferId>,
     pub(crate) rq_depth: u32,
     pub(crate) registration_stats: RioRegistrationStats,
-    pub(crate) chunk_register_failures_recent: FxHashMap<veloq_buf::heap::ChunkId, Instant>,
+    pub(crate) chunk_register_failures_recent: FxHashMap<ChunkId, Instant>,
     pub(crate) heap_register_failures_recent: FxHashMap<RioHeapBufferKey, Instant>,
     pub(crate) next_registration_generation: u64,
     request_contexts: Vec<RioRequestContextSlot>,
@@ -350,7 +352,6 @@ impl RioRegistry {
     }
 
     pub(crate) fn cleanup_deregister(&mut self, env: RioEnv<'_>) {
-        use std::collections::HashSet;
         let mut deregistered = HashSet::new();
 
         for id in self
@@ -376,7 +377,7 @@ impl RioRegistry {
                 env.dispatch.deregister_buffer(id);
             }
         }
-        let addr_buffer_id = std::mem::replace(&mut self.addr_buffer_id, RioBufferId::INVALID);
+        let addr_buffer_id = replace(&mut self.addr_buffer_id, RioBufferId::INVALID);
         if !addr_buffer_id.is_invalid() && deregistered.insert(addr_buffer_id.0 as usize) {
             env.dispatch.deregister_buffer(addr_buffer_id);
         }
@@ -397,13 +398,19 @@ impl RioRegistry {
 
 #[cfg(test)]
 pub(crate) mod test_helpers {
-    use super::super::submit_ops::{RioCq, RioDispatch};
-    use super::*;
+    use super::{
+        super::submit_ops::{RioCq, RioDispatch},
+        *,
+    };
     use crate::BufferRegistrationMode;
-    use std::ffi::c_void;
-    use std::num::NonZeroUsize;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    use std::{
+        ffi::c_void,
+        num::NonZeroUsize,
+        sync::{
+            Mutex, MutexGuard,
+            atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
+        },
+    };
     use veloq_buf::NoopRegistrar;
     use windows_sys::Win32::Networking::WinSock::{
         RIO_BUFFERID, RIO_CQ, RIO_NOTIFICATION_COMPLETION, RIO_RQ, RIORESULT,
@@ -427,7 +434,7 @@ pub(crate) mod test_helpers {
         DEREGISTERED_IDS.lock().expect("deregister mutex").clear();
     }
 
-    pub(crate) fn lock_dispatch_state() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn lock_dispatch_state() -> MutexGuard<'static, ()> {
         DISPATCH_TEST_LOCK.lock().expect("dispatch test mutex")
     }
 
@@ -562,8 +569,7 @@ pub(crate) mod test_helpers {
 
 #[cfg(test)]
 mod tests {
-    use super::test_helpers::fixed_buf;
-    use super::*;
+    use super::{test_helpers::fixed_buf, *};
 
     #[test]
     fn rio_submission_len_allows_exact_boundaries() {

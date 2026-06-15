@@ -1,18 +1,23 @@
-use std::sync::Arc;
-use std::task::Poll;
-use std::time::{Duration, Instant};
-
-use diagweave::prelude::*;
-use veloq_blocking::BlockingTask;
-use veloq_driver_core::driver::{
-    CompletionAnomaly, CompletionBackendHooks, CompletionControl, CompletionFlowExt,
-    CompletionHookOutcome, CompletionIngress, CompletionSource, CompletionToken,
-    DriverSubmitResult, OpToken, SharedCompletionTable, SubmitStatus, SyntheticCompletionSource,
-    UserCompletionEvent,
+use std::{
+    sync::Arc,
+    task::Poll,
+    time::{Duration, Instant},
 };
-use veloq_driver_core::slot::{
-    CheckedSlotView, InFlightOrphaned, InFlightWaiting, Reserved, SlotAccessError, SlotRegistryExt,
-    SlotView,
+
+use super::completion::COMP_BACKEND_IOCP;
+use diagweave::prelude::*;
+use veloq_blocking::{BlockingTask, get_blocking_pool};
+use veloq_driver_core::{
+    driver::{
+        CompletionAnomaly, CompletionBackendHooks, CompletionControl, CompletionFlowExt,
+        CompletionHookOutcome, CompletionIngress, CompletionSource, CompletionToken,
+        DriverSubmitResult, OpToken, SharedCompletionTable, SubmitStatus,
+        SyntheticCompletionSource, UserCompletionEvent,
+    },
+    slot::{
+        CheckedSlotView, InFlightOrphaned, InFlightWaiting, Reserved, SlotAccessError,
+        SlotRegistryExt, SlotView,
+    },
 };
 
 use crate::{
@@ -56,7 +61,7 @@ struct BlockingBridge;
 
 impl BlockingBridge {
     fn submit(task: BlockingTask) -> bool {
-        veloq_blocking::get_blocking_pool().execute(task).is_ok()
+        get_blocking_pool().execute(task).is_ok()
     }
 }
 
@@ -71,8 +76,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
     fn handle_control(
         &mut self,
         _control: CompletionControl,
-    ) -> crate::error::IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>>
-    {
+    ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         Ok(CompletionHookOutcome::Ignore { effect: () })
     }
 
@@ -81,8 +85,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
         event: UserCompletionEvent,
         slot: Slot<'_, InFlightWaiting>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> crate::error::IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>>
-    {
+    ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         let event_res = event.res();
         let snapshot = slot.snapshot();
         let mut guard = slot.complete();
@@ -128,8 +131,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
         _event: UserCompletionEvent,
         slot: Slot<'_, InFlightOrphaned>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> crate::error::IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>>
-    {
+    ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         let mut guard = slot.complete();
         let cleanup = guard
             .with_op_mut(|op| op.orphan_cleanup(&Err(IocpError::Submission.to_report())))
@@ -216,12 +218,7 @@ impl<'a> IocpDriver<'a> {
         if !BlockingBridge::submit(task) {
             let report = IocpError::Submission.report("iocp/driver", "thread pool overloaded");
             let event_res = iocp_fallback_event_res(IocpError::Submission);
-            let event = UserCompletionEvent::from_parts(
-                super::completion::COMP_BACKEND_IOCP,
-                token,
-                event_res,
-                0,
-            );
+            let event = UserCompletionEvent::from_parts(COMP_BACKEND_IOCP, token, event_res, 0);
             let mut hooks = SubmissionFailureHooks {
                 report: Some(report),
             };

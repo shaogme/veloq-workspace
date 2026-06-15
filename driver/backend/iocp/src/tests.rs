@@ -5,15 +5,23 @@ pub(crate) mod net_udp;
 
 use core::convert::TryFrom;
 use diagweave::prelude::*;
-use veloq_driver_core::driver::{
-    CompletionRecord, CompletionValue, DriveMode, Driver, DriverSubmitResult, OpToken,
-    PollRecordResult,
+use std::{
+    io, thread,
+    time::{Duration, Instant},
 };
-use veloq_driver_core::op::{IntoPlatformOp, OpCompletion};
+use veloq_driver_core::{
+    driver::{
+        CompletionRecord, CompletionValue, DriveMode, Driver, DriverSubmitResult, OpToken,
+        PollRecordResult,
+    },
+    op::{IntoPlatformOp, OpCompletion},
+};
 
-use crate::driver::IocpDriver;
-use crate::error::{IocpError, IocpResult, iocp_report_to_event_res};
-use crate::op::{IocpOp, IocpSlotSpec, IocpUserPayload};
+use crate::{
+    driver::IocpDriver,
+    error::{IocpError, IocpResult, iocp_report_to_event_res},
+    op::{IocpOp, IocpSlotSpec, IocpUserPayload},
+};
 
 pub(crate) fn remote_free_contains(driver: &IocpDriver, needle: usize) -> bool {
     driver.debug_remote_free_contains(needle)
@@ -71,9 +79,9 @@ where
 pub(crate) fn wait_completion_record(
     driver: &mut IocpDriver,
     token: OpToken,
-    timeout: std::time::Duration,
+    timeout: Duration,
 ) -> IocpResult<CompletionRecord<IocpSlotSpec>> {
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     loop {
         if start.elapsed() > timeout {
             return IocpError::CompletionWait
@@ -94,19 +102,19 @@ pub(crate) fn wait_completion_record(
             }
             PollRecordResult::Pending => {}
         }
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(5));
     }
 }
 
 pub(crate) fn wait_completion(
     driver: &mut IocpDriver,
     token: OpToken,
-    timeout: std::time::Duration,
+    timeout: Duration,
 ) -> IocpResult<usize> {
     let record = wait_completion_record(driver, token, timeout)?;
     usize::from_event_res::<IocpError>(record.event.res()).map_err(|e| {
         let code = iocp_report_to_event_res(&e);
-        let io_error = std::io::Error::from_raw_os_error(-code);
+        let io_error = io::Error::from_raw_os_error(-code);
         IocpError::CompletionWait.io_report("iocp.tests.wait_completion", io_error)
     })
 }

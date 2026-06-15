@@ -568,14 +568,22 @@ impl RioState {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{RioRegistry, RioSubmissionKind, registry::test_helpers};
-    use super::*;
-    use crate::BufferRegistrationMode;
-    use crate::config::{BorrowedRawHandle, IoFd, IocpHandle, RawHandle};
-    use crate::net::addr::SockAddrStorage;
-    use crate::rio::core::RioOpKind;
-    use std::cell::Cell;
-    use std::sync::atomic::Ordering;
+    use super::{
+        super::{
+            RioRegistry, RioSubmissionKind,
+            registry::test_helpers::{self, NEXT_REGISTER_ID},
+        },
+        *,
+    };
+    use crate::{
+        BufferRegistrationMode,
+        config::{BorrowedRawHandle, IoFd, IocpHandle, RawHandle},
+        net::addr::SockAddrStorage,
+        rio::core::RioOpKind,
+    };
+    use rustc_hash::FxHashMap;
+    use slotmap::SlotMap;
+    use std::{cell::Cell, sync::atomic::Ordering};
     use veloq_buf::{FixedBuf, NoopRegistrar};
     use veloq_driver_core::driver::OpToken;
 
@@ -587,9 +595,9 @@ mod tests {
             registry: RioRegistry::new(32, addr_capacity),
             registration_mode: BufferRegistrationMode::Strict,
             submissions_closed: false,
-            actors: slotmap::SlotMap::with_key(),
-            actor_by_handle: rustc_hash::FxHashMap::default(),
-            socket_runtime: rustc_hash::FxHashMap::default(),
+            actors: SlotMap::with_key(),
+            actor_by_handle: FxHashMap::default(),
+            socket_runtime: FxHashMap::default(),
             outstanding_count: 0,
             next_request_id: 0,
             deferred_payloads: Vec::new(),
@@ -660,7 +668,7 @@ mod tests {
                 .all(|in_use| !*in_use)
         );
         assert!(state.registry.heap_rio_bufs.is_empty());
-        assert_eq!(test_helpers::NEXT_REGISTER_ID.load(Ordering::SeqCst), 100);
+        assert_eq!(NEXT_REGISTER_ID.load(Ordering::SeqCst), 100);
     }
 
     #[test]

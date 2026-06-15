@@ -1,10 +1,16 @@
-use std::time::{Duration, Instant};
+use std::{
+    sync::mpsc,
+    time::{Duration, Instant},
+};
 
 use diagweave::prelude::*;
 use tracing::debug;
 use veloq_buf::BufferRegistrar;
-use veloq_driver_core::driver::{CancelRequest, SharedCompletionTable};
-use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotView};
+use veloq_driver_core::{
+    driver::{CancelRequest, SharedCompletionTable},
+    slot::{CheckedSlotView, SlotRegistryExt, SlotView},
+};
+use windows_sys::Win32::Networking::WinSock::{WSACleanup, WSADATA, WSAGetLastError, WSAStartup};
 
 use crate::{
     config::{BorrowedRawHandle, BufferRegistrationMode, IocpConfig, IocpHandle, RawHandle},
@@ -15,11 +21,11 @@ use crate::{
     win32::IoCompletionPort,
 };
 
-use super::polling::{CompletionPump, TimerEngine};
-use super::registration::HandleRegistry;
 use super::{
     CloseMode, IocpDriver, IocpDriverCompletionDiagnostics, IocpDriverResult, IocpOpRegistry,
     PreInit,
+    polling::{CompletionPump, TimerEngine},
+    registration::HandleRegistry,
 };
 
 #[derive(Clone, Copy, Default)]
@@ -121,7 +127,7 @@ impl<'a> IocpDriver<'a> {
             completion_diagnostics.clone(),
         )
         .attach_note("failed to initialize RIO runtime")?;
-        let (remote_cancel_sender, remote_cancel_receiver) = std::sync::mpsc::channel();
+        let (remote_cancel_sender, remote_cancel_receiver) = mpsc::channel();
         Ok(Self {
             completion: CompletionPump::new(port_val, completion_table),
             ops,
@@ -139,8 +145,6 @@ impl<'a> IocpDriver<'a> {
     }
 
     fn start_winsock() -> IocpResult<WinsockGuard> {
-        use windows_sys::Win32::Networking::WinSock::{WSADATA, WSAStartup};
-
         // SAFETY: WSAStartup is required before Windows socket APIs are used.
         let ret = unsafe {
             let mut data: WSADATA = std::mem::zeroed();
@@ -309,8 +313,6 @@ impl Drop for IocpDriver<'_> {
 
 impl Drop for WinsockGuard {
     fn drop(&mut self) {
-        use windows_sys::Win32::Networking::WinSock::{WSACleanup, WSAGetLastError};
-
         // SAFETY: This guard is only constructed after a successful WSAStartup.
         let ret = unsafe { WSACleanup() };
         if ret != 0 {

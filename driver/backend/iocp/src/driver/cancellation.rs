@@ -1,10 +1,12 @@
 use tracing::{debug, warn};
-use veloq_driver_core::driver::{
-    CancelMode, CancelRequest, CancelSubmitOutcome, CancelTargetGoneReason, CompletionAnomaly,
-    CompletionToken, OpToken, SyntheticCompletionSource, UserCompletionEvent,
-    cancel_target_anomaly,
+use veloq_driver_core::{
+    driver::{
+        CancelMode, CancelRequest, CancelSubmitOutcome, CancelTargetGoneReason, CompletionAnomaly,
+        CompletionToken, OpToken, RawCompletion, SyntheticCompletionSource, UserCompletionEvent,
+        cancel_target_anomaly,
+    },
+    slot::{CheckedSlotView, SlotRegistryExt, SlotView},
 };
-use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotView};
 use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED};
 
 use crate::{
@@ -202,7 +204,7 @@ impl<'a> IocpDriver<'a> {
         self.completion_diagnostics
             .backend()
             .inc_cancel_ack_not_found_active();
-        let raw = veloq_driver_core::driver::RawCompletion::new(
+        let raw = RawCompletion::new(
             COMP_BACKEND_IOCP,
             CompletionToken::user(token),
             -(ERROR_NOT_FOUND as i32),
