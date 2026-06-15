@@ -1,19 +1,20 @@
+use crate::{
+    config::{RawHandle, UringRawHandle},
+    driver::{UringDriver, lifecycle::UringSubmissionState},
+    error::{UringError, UringResult},
+    op::{Reserved, Slot, SlotView, SubmissionStrategy, UringOp, UringOpRegistryExt},
+};
 use diagweave::prelude::*;
+use io_uring::opcode;
 use std::task::Poll;
 use tracing::{debug, trace};
-
-use crate::config::{RawHandle, UringRawHandle};
-use crate::driver::UringDriver;
-use crate::driver::lifecycle::UringSubmissionState;
-use crate::error::{UringError, UringResult};
-use crate::op::{Slot, SlotView, UringOpRegistryExt};
-use crate::op::{SubmissionStrategy, UringOp};
-
-use io_uring::opcode;
-use veloq_driver_core::driver::{
-    CompletionToken, DriverSubmitResult, OpToken, SubmitStatus, SubmitTokenContext,
+use veloq_buf::heap::ChunkId;
+use veloq_driver_core::{
+    driver::{
+        CompletionToken, DriverSubmitResult, OpToken, RegisterFd, SubmitStatus, SubmitTokenContext,
+    },
+    slot::{CheckedSlotView, InFlightWaiting, SlotAccessError},
 };
-use veloq_driver_core::slot::SlotAccessError;
 
 fn slot_access_report(scope: &'static str, err: SlotAccessError) -> Report<UringError> {
     UringError::InvalidState
@@ -33,7 +34,7 @@ impl<'a> UringDriver<'a> {
     pub(crate) unsafe fn submit_from_slot_raw(
         driver: *mut UringDriver,
         token: OpToken,
-        slot: Slot<'_, crate::op::Reserved>,
+        slot: Slot<'_, Reserved>,
     ) -> UringResult<bool> {
         let driver = unsafe { &mut *driver };
         let user_data = token.index();
@@ -56,7 +57,7 @@ impl<'a> UringDriver<'a> {
 
         match strategy {
             SubmissionStrategy::SubmitSqe => {
-                let mut chunks = [veloq_buf::heap::ChunkId::ZERO; 4];
+                let mut chunks = [ChunkId::ZERO; 4];
                 let (count, sqe) = {
                     let driver_ptr = driver as *mut UringDriver;
                     let slot = sub_guard.slot.as_mut().ok_or_else(|| {
@@ -193,7 +194,7 @@ impl<'a> UringDriver<'a> {
     pub(crate) fn submit_from_slot_token(&mut self, token: OpToken) -> UringResult<bool> {
         let driver_ptr = self as *mut UringDriver;
         let slot = match self.ops.checked_slot_view(token) {
-            veloq_driver_core::slot::CheckedSlotView::Valid(SlotView::Reserved(slot)) => slot,
+            CheckedSlotView::Valid(SlotView::Reserved(slot)) => slot,
             _ => {
                 return Err(UringError::InvalidState
                     .report("driver.submit_from_slot_index", "op missing in slot"));
@@ -205,7 +206,7 @@ impl<'a> UringDriver<'a> {
     pub(crate) unsafe fn submit_queued_from_slot_raw(
         driver: *mut UringDriver,
         token: OpToken,
-        mut slot: Slot<'_, veloq_driver_core::slot::InFlightWaiting>,
+        mut slot: Slot<'_, InFlightWaiting>,
     ) -> UringResult<bool> {
         let driver = unsafe { &mut *driver };
         let user_data = token.index();
@@ -227,7 +228,7 @@ impl<'a> UringDriver<'a> {
                 .attach_note("queued uring backlog entry is not an SQE operation"));
         }
 
-        let mut chunks = [veloq_buf::heap::ChunkId::ZERO; 4];
+        let mut chunks = [ChunkId::ZERO; 4];
         let (count, sqe) = {
             let driver_ptr = driver as *mut UringDriver;
             slot.with_op_and_payload_mut(|op, payload| {
@@ -324,9 +325,8 @@ impl<'a> UringDriver<'a> {
                 let event_fd = self.waker_state.current();
                 let fd = event_fd.fd.raw().as_fd();
                 let raw = RawHandle::new(UringRawHandle::for_file(fd));
-                let mut fds = self.register_files_internal(vec![
-                    veloq_driver_core::driver::RegisterFd::Borrowed(raw.borrow()),
-                ])?;
+                let mut fds =
+                    self.register_files_internal(vec![RegisterFd::Borrowed(raw.borrow())])?;
                 let fixed_fd = fds.pop().ok_or_else(|| {
                     UringError::InvalidState
                         .report("driver.submit_waker", "register_files returned empty")
@@ -410,7 +410,7 @@ impl<'a> UringDriver<'a> {
         let user_data = token.index();
         let driver_ptr = self as *mut UringDriver;
         let slot = match self.ops.checked_slot_view(token) {
-            veloq_driver_core::slot::CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
+            CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
                 if slot.has_op() {
                     let mut slot = slot;
                     match slot.op_mut() {
@@ -479,7 +479,7 @@ impl<'a> UringDriver<'a> {
         let user_data = token.index();
         let driver_ptr = self as *mut UringDriver;
         let slot = match self.ops.checked_slot_view(token) {
-            veloq_driver_core::slot::CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
+            CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
                 if slot.has_op() {
                     let mut slot = slot;
                     match slot.op_mut() {

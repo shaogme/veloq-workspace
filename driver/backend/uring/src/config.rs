@@ -1,9 +1,9 @@
-use std::num::NonZeroU32;
-pub use veloq_driver_core::RawHandleKind;
+use std::{mem, num::NonZeroU32};
 use veloq_driver_core::{
     BorrowedRawHandle as CoreBorrowedRawHandle, OwnedRawHandle as CoreOwnedRawHandle,
     RawHandle as CoreRawHandle, RawHandleMeta,
 };
+pub use veloq_driver_core::{IoFd, RawHandleKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UringRawHandle {
@@ -62,11 +62,9 @@ pub struct SockAddrStorage(pub libc::sockaddr_storage);
 
 impl Default for SockAddrStorage {
     fn default() -> Self {
-        Self(unsafe { std::mem::zeroed() })
+        Self(unsafe { mem::zeroed() })
     }
 }
-
-pub type IoFd = veloq_driver_core::IoFd;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BufferRegistrationMode {

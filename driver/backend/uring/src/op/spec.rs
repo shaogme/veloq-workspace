@@ -1,20 +1,24 @@
 mod file;
 mod net;
 
-use crate::OwnedRawHandle;
-use crate::driver::UringDriver;
-use crate::error::{UringDriverResult as DriverResult, UringError};
-use crate::op::{
-    Accept, Close, Connect, Fallocate, FallocateRaw, Fsync, FsyncRaw, OpSend, OpVTable, Open,
-    ReadFixed, ReadRaw, Recv, SendTo, SubmissionStrategy, SyncFileRange, SyncFileRangeRaw, Timeout,
-    UdpConnect, UdpRecv, UdpRecvFrom, UdpSend, UringKernelOp, UringOpPayload, UringUserPayload,
-    Wakeup, WriteFixed, WriteRaw, payload, submit,
+use crate::{
+    OwnedRawHandle,
+    driver::UringDriver,
+    error::{UringDriverResult, UringDriverResult as DriverResult, UringError},
+    op::{
+        Accept, Close, Connect, Fallocate, FallocateRaw, Fsync, FsyncRaw, OpSend, OpVTable, Open,
+        ReadFixed, ReadRaw, Recv, SendTo, SubmissionStrategy, SyncFileRange, SyncFileRangeRaw,
+        Timeout, UdpConnect, UdpRecv, UdpRecvFrom, UdpSend, UringKernelOp, UringOp, UringOpPayload,
+        UringUserPayload, Wakeup, WriteFixed, WriteRaw, payload, submit,
+    },
 };
 use io_uring::squeue;
 use std::time::Duration;
 use veloq_buf::heap::ChunkId;
-use veloq_driver_core::driver::{CompletionCleanupGuard, SubmitTokenContext};
-use veloq_driver_core::op::OpKind;
+use veloq_driver_core::{
+    driver::{CompletionCleanupGuard, SubmitTokenContext},
+    op::{IntoPlatformOp, OpCompletion, OpKind, payload_projection_mismatch_report},
+};
 
 pub(crate) trait UringOpSpec: Sized + Send + 'static {
     type KernelPayload;
@@ -180,116 +184,104 @@ where
 
 macro_rules! impl_uring_op_erasure {
     ($OpType:ty, $user_variant:ident, $kernel_variant:ident, $completion:ty) => {
-        impl crate::op::spec::UringOpErasure for $OpType {
-            fn erase_kernel_payload(payload: Self::KernelPayload) -> crate::op::UringOpPayload {
-                crate::op::UringOpPayload::$kernel_variant(payload)
+        impl UringOpErasure for $OpType {
+            fn erase_kernel_payload(payload: Self::KernelPayload) -> UringOpPayload {
+                UringOpPayload::$kernel_variant(payload)
             }
 
-            fn kernel_payload_ref(
-                payload: &crate::op::UringOpPayload,
-            ) -> Option<&Self::KernelPayload> {
+            fn kernel_payload_ref(payload: &UringOpPayload) -> Option<&Self::KernelPayload> {
                 match payload {
-                    crate::op::UringOpPayload::$kernel_variant(payload) => Some(payload),
+                    UringOpPayload::$kernel_variant(payload) => Some(payload),
                     _ => None,
                 }
             }
 
             fn kernel_payload_mut(
-                payload: &mut crate::op::UringOpPayload,
+                payload: &mut UringOpPayload,
             ) -> Option<&mut Self::KernelPayload> {
                 match payload {
-                    crate::op::UringOpPayload::$kernel_variant(payload) => Some(payload),
+                    UringOpPayload::$kernel_variant(payload) => Some(payload),
                     _ => None,
                 }
             }
 
-            fn erase_user_payload(payload: Self) -> crate::op::UringUserPayload {
-                crate::op::UringUserPayload::$user_variant(payload)
+            fn erase_user_payload(payload: Self) -> UringUserPayload {
+                UringUserPayload::$user_variant(payload)
             }
 
-            fn try_user_payload(
-                payload: crate::op::UringUserPayload,
-            ) -> crate::error::UringDriverResult<Self> {
+            fn try_user_payload(payload: UringUserPayload) -> UringDriverResult<Self> {
                 match payload {
-                    crate::op::UringUserPayload::$user_variant(payload) => Ok(payload),
-                    _ => Err(veloq_driver_core::op::payload_projection_mismatch_report::<
-                        crate::error::UringError,
-                    >(stringify!($OpType), "UringUserPayload")),
+                    UringUserPayload::$user_variant(payload) => Ok(payload),
+                    _ => Err(payload_projection_mismatch_report::<UringError>(
+                        stringify!($OpType),
+                        "UringUserPayload",
+                    )),
                 }
             }
 
-            fn user_payload_ref(payload: &crate::op::UringUserPayload) -> Option<&Self> {
+            fn user_payload_ref(payload: &UringUserPayload) -> Option<&Self> {
                 match payload {
-                    crate::op::UringUserPayload::$user_variant(payload) => Some(payload),
+                    UringUserPayload::$user_variant(payload) => Some(payload),
                     _ => None,
                 }
             }
 
-            fn user_payload_mut(payload: &mut crate::op::UringUserPayload) -> Option<&mut Self> {
+            fn user_payload_mut(payload: &mut UringUserPayload) -> Option<&mut Self> {
                 match payload {
-                    crate::op::UringUserPayload::$user_variant(payload) => Some(payload),
+                    UringUserPayload::$user_variant(payload) => Some(payload),
                     _ => None,
                 }
             }
 
-            fn vtable() -> &'static crate::op::OpVTable {
-                static TABLE: crate::op::OpVTable = crate::op::OpVTable {
-                    make_sqe: crate::op::spec::make_sqe_shim::<$OpType>,
-                    on_complete: crate::op::spec::on_complete_shim::<$OpType>,
-                    completion_cleanup: crate::op::spec::completion_cleanup_shim::<$OpType>,
-                    orphan_cleanup: crate::op::spec::orphan_cleanup_shim::<$OpType>,
-                    strategy: <$OpType as crate::op::spec::UringOpSpec>::STRATEGY,
-                    get_timeout: crate::op::spec::get_timeout_shim::<$OpType>,
-                    resolve_chunks: crate::op::spec::resolve_chunks_shim::<$OpType>,
+            fn vtable() -> &'static OpVTable {
+                static TABLE: OpVTable = OpVTable {
+                    make_sqe: make_sqe_shim::<$OpType>,
+                    on_complete: on_complete_shim::<$OpType>,
+                    completion_cleanup: completion_cleanup_shim::<$OpType>,
+                    orphan_cleanup: orphan_cleanup_shim::<$OpType>,
+                    strategy: <$OpType as UringOpSpec>::STRATEGY,
+                    get_timeout: get_timeout_shim::<$OpType>,
+                    resolve_chunks: resolve_chunks_shim::<$OpType>,
                 };
                 &TABLE
             }
         }
 
-        impl veloq_driver_core::op::IntoPlatformOp<crate::op::UringOp> for $OpType {
+        impl IntoPlatformOp<UringOp> for $OpType {
             type UserPayload = $OpType;
-            type ErasedPayload = crate::op::UringUserPayload;
+            type ErasedPayload = UringUserPayload;
             type Output = $OpType;
             type Completion = $completion;
             type DriverCompletion = usize;
-            type Error = crate::error::UringError;
+            type Error = UringError;
 
-            const PAYLOAD_KIND: veloq_driver_core::op::OpKind =
-                <$OpType as crate::op::spec::UringOpSpec>::PAYLOAD_KIND;
+            const PAYLOAD_KIND: OpKind = <$OpType as UringOpSpec>::PAYLOAD_KIND;
 
-            fn into_kernel_and_payload(self) -> (crate::op::UringKernelOp, Self::UserPayload) {
-                let kernel_payload =
-                    <$OpType as crate::op::spec::UringOpSpec>::new_kernel_payload(&self);
-                let op = crate::op::UringKernelOp {
-                    vtable: <$OpType as crate::op::spec::UringOpErasure>::vtable(),
-                    payload: <$OpType as crate::op::spec::UringOpErasure>::erase_kernel_payload(
-                        kernel_payload,
-                    ),
+            fn into_kernel_and_payload(self) -> (UringKernelOp, Self::UserPayload) {
+                let kernel_payload = <$OpType as UringOpSpec>::new_kernel_payload(&self);
+                let op = UringKernelOp {
+                    vtable: <$OpType as UringOpErasure>::vtable(),
+                    payload: <$OpType as UringOpErasure>::erase_kernel_payload(kernel_payload),
                 };
                 (op, self)
             }
 
-            fn payload_into_erased(payload: Self::UserPayload) -> crate::op::UringUserPayload {
-                <$OpType as crate::op::spec::UringOpErasure>::erase_user_payload(payload)
+            fn payload_into_erased(payload: Self::UserPayload) -> UringUserPayload {
+                <$OpType as UringOpErasure>::erase_user_payload(payload)
             }
 
             fn try_payload_from_erased(
-                payload: crate::op::UringUserPayload,
-            ) -> crate::error::UringDriverResult<Self::UserPayload> {
-                <$OpType as crate::op::spec::UringOpErasure>::try_user_payload(payload)
+                payload: UringUserPayload,
+            ) -> UringDriverResult<Self::UserPayload> {
+                <$OpType as UringOpErasure>::try_user_payload(payload)
             }
 
             fn complete(
                 payload: Self::UserPayload,
-                res: crate::error::UringDriverResult<usize>,
-            ) -> veloq_driver_core::op::OpCompletion<
-                Self::Output,
-                crate::error::UringError,
-                Self::Completion,
-            > {
-                let completion =
-                    <$OpType as crate::op::spec::UringOpSpec>::map_completion(&payload, res);
-                veloq_driver_core::op::OpCompletion::new(completion, payload)
+                res: UringDriverResult<usize>,
+            ) -> OpCompletion<Self::Output, UringError, Self::Completion> {
+                let completion = <$OpType as UringOpSpec>::map_completion(&payload, res);
+                OpCompletion::new(completion, payload)
             }
         }
     };

@@ -1,14 +1,15 @@
-use crate::driver::UringDriver;
-use crate::error::{UringDriverResult as DriverResult, UringError};
-use crate::op::payload::KernelRef;
-use crate::op::{
-    Close, Fallocate, FallocateRaw, Fsync, FsyncRaw, Open, ReadFixed, ReadRaw, SyncFileRange,
-    SyncFileRangeRaw, WriteFixed, WriteRaw,
+use crate::{
+    driver::{RegisteredFileEntry, UringDriver},
+    error::{UringDriverResult as DriverResult, UringError},
+    op::{
+        Close, Fallocate, FallocateRaw, Fsync, FsyncRaw, Open, ReadFixed, ReadRaw, SyncFileRange,
+        SyncFileRangeRaw, WriteFixed, WriteRaw,
+        payload::{KernelRef, OpenPayload},
+    },
 };
 use diagweave::prelude::*;
 use io_uring::{opcode, squeue, types};
-use veloq_buf::PoolKind;
-use veloq_buf::heap::ChunkId;
+use veloq_buf::{PoolKind, heap::ChunkId};
 use veloq_driver_core::driver::SubmitTokenContext;
 
 use super::{invalid_buf_io_range, resolve_any_fd, resolve_file_fd};
@@ -164,7 +165,7 @@ pub(crate) unsafe fn make_sqe_close(
     _token: SubmitTokenContext,
 ) -> DriverResult<squeue::Entry> {
     let idx = close_op.fd.fixed_index() as usize;
-    if let Some(crate::driver::RegisteredFileEntry::BorrowedFd { .. }) =
+    if let Some(RegisteredFileEntry::BorrowedFd { .. }) =
         driver.file_slots.get(idx).and_then(|s| s.entry.as_ref())
     {
         return Err(UringError::InvalidInput
@@ -311,7 +312,7 @@ pub(crate) unsafe fn make_sqe_fallocate_raw(
 }
 
 pub(crate) unsafe fn make_sqe_open(
-    _kernel: &mut crate::op::payload::OpenPayload,
+    _kernel: &mut OpenPayload,
     user: &mut Open,
     _driver: &mut UringDriver,
     _token: SubmitTokenContext,

@@ -4,16 +4,24 @@ mod net;
 pub(super) use file::*;
 pub(super) use net::*;
 
-use crate::config::{IoFd, RawHandleKind};
-use crate::driver::{FileSlot, UringDriver, resolve_registered_fixed_fd};
-use crate::error::{UringDriverResult as DriverResult, UringError};
-use crate::op::{Timeout, Wakeup};
+use crate::{
+    config::{IoFd, RawHandleKind},
+    driver::{FileSlot, UringDriver, resolve_registered_fixed_fd},
+    error::{UringDriverResult as DriverResult, UringError},
+    op::{
+        Timeout, Wakeup,
+        payload::{TimeoutPayload, WakeupPayload},
+    },
+};
 use diagweave::prelude::*;
 use io_uring::{opcode, squeue, types};
+use std::io;
 use tracing::warn;
 use veloq_buf::BufIoRangeError;
-use veloq_driver_core::DriverCoreError;
-use veloq_driver_core::driver::{CompletionCleanup, CompletionCleanupGuard, SubmitTokenContext};
+use veloq_driver_core::{
+    DriverCoreError,
+    driver::{CompletionCleanup, CompletionCleanupGuard, SubmitTokenContext},
+};
 
 #[inline]
 fn invalid_buf_io_range(scope: &'static str, err: BufIoRangeError) -> Report<UringError> {
@@ -63,7 +71,7 @@ pub(crate) fn completion_cleanup_close_raw_fd(result: i32) -> CompletionCleanupG
         // SAFETY: successful open/accept CQEs transfer a fresh raw fd that no user future owns yet.
         let close_res = unsafe { libc::close(result) };
         if close_res != 0 {
-            let error = std::io::Error::last_os_error();
+            let error = io::Error::last_os_error();
             warn!(
                 fd = result,
                 errno = error.raw_os_error(),
@@ -80,7 +88,7 @@ pub(crate) fn completion_cleanup_close_raw_fd(result: i32) -> CompletionCleanupG
 }
 
 pub(crate) unsafe fn make_sqe_timeout(
-    kernel: &mut crate::op::payload::TimeoutPayload,
+    kernel: &mut TimeoutPayload,
     user: &mut Timeout,
     _driver: &mut UringDriver,
     _token: SubmitTokenContext,
@@ -94,7 +102,7 @@ pub(crate) unsafe fn make_sqe_timeout(
 }
 
 pub(crate) unsafe fn make_sqe_wakeup(
-    kernel: &mut crate::op::payload::WakeupPayload,
+    kernel: &mut WakeupPayload,
     user: &mut Wakeup,
     driver: &mut UringDriver,
     _token: SubmitTokenContext,

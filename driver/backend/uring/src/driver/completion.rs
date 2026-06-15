@@ -1,27 +1,35 @@
-use std::collections::HashMap;
-use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    num::NonZeroU8,
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
+};
 
 use diagweave::prelude::*;
 use tracing::{debug, error, trace, warn};
 
-use crate::diagnostics::UringCompletionDiagnostics;
-use crate::driver::{PendingCancel, UringDriver};
-use crate::error::{UringDriverResult, UringError, UringResult, uring_report_to_event_res};
-use crate::op::{Slot, UringUserPayload};
-use veloq_driver_core::IoFd;
-use veloq_driver_core::driver::{
-    CancelCompletionId, CancelMode, CompletionAnomaly, CompletionBackend, CompletionBackendHooks,
-    CompletionCleanupGuard, CompletionControl, CompletionEnvelope, CompletionFlowExt,
-    CompletionFlowOutcome, CompletionHookOutcome, CompletionIngress, CompletionSource,
-    DriverCompletionDiagnostics, OpToken, PlatformOp, RawCompletion, SyntheticCompletionSource,
-    UserCompletionEvent, drain_cancel_requests,
+use crate::{
+    diagnostics::UringCompletionDiagnostics,
+    driver::{PendingCancel, UringDriver},
+    error::{UringDriverResult, UringError, UringResult, uring_report_to_event_res},
+    op::{Slot, UringSlotSpec, UringUserPayload},
 };
-use veloq_driver_core::slot::{InFlightOrphaned, InFlightWaiting, SlotRegistryExt};
+use veloq_driver_core::{
+    IoFd,
+    driver::{
+        CancelCompletionId, CancelMode, CompletionAnomaly, CompletionBackend,
+        CompletionBackendHooks, CompletionCleanupGuard, CompletionControl, CompletionEnvelope,
+        CompletionFlowExt, CompletionFlowOutcome, CompletionHookOutcome, CompletionIngress,
+        CompletionSource, CompletionToken, DriverCompletionDiagnostics, OpToken, PlatformOp,
+        RawCompletion, SyntheticCompletionSource, UserCompletionEvent, drain_cancel_requests,
+    },
+    slot::{
+        CheckedSlotView, Completed, InFlightOrphaned, InFlightWaiting, SlotRegistryExt,
+        SlotSnapshot, SlotView,
+    },
+};
 
 pub(crate) type CompletionProgress = CompletionFlowOutcome;
-
-use std::num::NonZeroU8;
 pub(crate) const COMP_BACKEND_URING: CompletionBackend =
     CompletionBackend::Backend(match NonZeroU8::new(2) {
         Some(val) => val,
@@ -88,7 +96,7 @@ struct UringCompletionHooks<'a> {
     pending_cancel_cqes: &'a mut HashMap<CancelCompletionId, PendingCancel>,
     waker_buf_len: usize,
     waker_armed: &'a mut bool,
-    is_waked: &'a std::sync::atomic::AtomicBool,
+    is_waked: &'a AtomicBool,
     synthetic: UringSyntheticCompletion,
     post: UringPostCompletionEffects,
 }
@@ -99,7 +107,7 @@ impl<'a> UringCompletionHooks<'a> {
         pending_cancel_cqes: &'a mut HashMap<CancelCompletionId, PendingCancel>,
         waker_buf_len: usize,
         waker_armed: &'a mut bool,
-        is_waked: &'a std::sync::atomic::AtomicBool,
+        is_waked: &'a AtomicBool,
         synthetic: UringSyntheticCompletion,
     ) -> Self {
         Self {
@@ -149,7 +157,7 @@ impl<'a> UringCompletionHooks<'a> {
         &mut self,
         cancel_id: CancelCompletionId,
         raw: RawCompletion,
-    ) -> CompletionHookOutcome<crate::op::UringSlotSpec, UringBackendEffect> {
+    ) -> CompletionHookOutcome<UringSlotSpec, UringBackendEffect> {
         let request = self.pending_cancel_cqes.remove(&cancel_id);
         let Some(request) = request else {
             let anomaly =
@@ -212,15 +220,14 @@ impl<'a> UringCompletionHooks<'a> {
     }
 }
 
-impl CompletionBackendHooks<crate::op::UringSlotSpec> for UringCompletionHooks<'_> {
+impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
     type BackendIngress = ();
     type BackendEffect = UringBackendEffect;
 
     fn handle_control(
         &mut self,
         control: CompletionControl,
-    ) -> UringDriverResult<CompletionHookOutcome<crate::op::UringSlotSpec, Self::BackendEffect>>
-    {
+    ) -> UringDriverResult<CompletionHookOutcome<UringSlotSpec, Self::BackendEffect>> {
         Ok(match control {
             CompletionControl::Waker { raw, .. } => CompletionHookOutcome::ControlHandled {
                 effect: self.handle_waker_control(raw),
@@ -234,8 +241,7 @@ impl CompletionBackendHooks<crate::op::UringSlotSpec> for UringCompletionHooks<'
         event: UserCompletionEvent,
         slot: Slot<'_, InFlightWaiting>,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> UringDriverResult<CompletionHookOutcome<crate::op::UringSlotSpec, Self::BackendEffect>>
-    {
+    ) -> UringDriverResult<CompletionHookOutcome<UringSlotSpec, Self::BackendEffect>> {
         Ok(match source {
             CompletionSource::Synthetic(SyntheticCompletionSource::Timer) => {
                 complete_timer_waiting_slot(slot, event)
@@ -261,8 +267,7 @@ impl CompletionBackendHooks<crate::op::UringSlotSpec> for UringCompletionHooks<'
         event: UserCompletionEvent,
         slot: Slot<'_, InFlightOrphaned>,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> UringDriverResult<CompletionHookOutcome<crate::op::UringSlotSpec, Self::BackendEffect>>
-    {
+    ) -> UringDriverResult<CompletionHookOutcome<UringSlotSpec, Self::BackendEffect>> {
         let res = match source {
             CompletionSource::Synthetic(SyntheticCompletionSource::Timer) => 0,
             CompletionSource::Synthetic(SyntheticCompletionSource::Cancel) => event.res(),
@@ -498,15 +503,11 @@ impl<'a> UringDriver<'a> {
         raw: RawCompletion,
     ) -> UringResult<()> {
         let active_target = match self.ops.checked_slot_view(request.target) {
-            veloq_driver_core::slot::CheckedSlotView::Valid(
-                veloq_driver_core::slot::SlotView::InFlightWaiting(slot),
-            ) => Some((
+            CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) => Some((
                 slot.snapshot(),
                 "async cancel returned ENOENT while target is still waiting",
             )),
-            veloq_driver_core::slot::CheckedSlotView::Valid(
-                veloq_driver_core::slot::SlotView::InFlightOrphaned(slot),
-            ) => Some((
+            CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot)) => Some((
                 slot.snapshot(),
                 "async cancel returned ENOENT while target is still orphaned",
             )),
@@ -522,7 +523,7 @@ impl<'a> UringDriver<'a> {
             .inc_cancel_ack_enoent_active();
         let target_raw = RawCompletion::new(
             COMP_BACKEND_URING,
-            veloq_driver_core::driver::CompletionToken::user(request.target),
+            CompletionToken::user(request.target),
             raw.res,
             raw.flags,
         );
@@ -552,7 +553,7 @@ fn complete_kernel_waiting_slot(
     mut slot: Slot<'_, InFlightWaiting>,
     token: OpToken,
     raw: RawCompletion,
-) -> CompletionHookOutcome<crate::op::UringSlotSpec, UringBackendEffect> {
+) -> CompletionHookOutcome<UringSlotSpec, UringBackendEffect> {
     let (final_res, cleanup) = match slot.with_op_and_payload_mut(|op, payload| {
         let final_res = unsafe { (op.vtable.on_complete)(op, payload, raw.res) };
         let cleanup = op.completion_cleanup(raw.res);
@@ -599,7 +600,7 @@ fn complete_kernel_waiting_slot(
 fn complete_timer_waiting_slot(
     mut slot: Slot<'_, InFlightWaiting>,
     event: UserCompletionEvent,
-) -> CompletionHookOutcome<crate::op::UringSlotSpec, UringBackendEffect> {
+) -> CompletionHookOutcome<UringSlotSpec, UringBackendEffect> {
     slot.platform_mut().timer_id = None;
     let snapshot = slot.snapshot();
     let mut completed = slot.complete();
@@ -633,7 +634,7 @@ fn complete_cancel_waiting_slot(
     slot: Slot<'_, InFlightWaiting>,
     event: UserCompletionEvent,
     mode: CancelMode,
-) -> CompletionHookOutcome<crate::op::UringSlotSpec, UringBackendEffect> {
+) -> CompletionHookOutcome<UringSlotSpec, UringBackendEffect> {
     complete_local_cancel_slot(slot, event, mode, false)
 }
 
@@ -641,7 +642,7 @@ fn complete_submission_failure_slot(
     slot: Slot<'_, InFlightWaiting>,
     event: UserCompletionEvent,
     report: Option<Report<UringError>>,
-) -> CompletionHookOutcome<crate::op::UringSlotSpec, UringBackendEffect> {
+) -> CompletionHookOutcome<UringSlotSpec, UringBackendEffect> {
     let event_res = event.res();
     let snapshot = slot.snapshot();
     let mut completed = slot.complete();
@@ -679,7 +680,7 @@ fn complete_local_cancel_slot(
     event: UserCompletionEvent,
     mode: CancelMode,
     orphaned: bool,
-) -> CompletionHookOutcome<crate::op::UringSlotSpec, UringBackendEffect> {
+) -> CompletionHookOutcome<UringSlotSpec, UringBackendEffect> {
     let snapshot = slot.snapshot();
     let mut completed = slot.complete();
     let cleanup = completed
@@ -730,7 +731,7 @@ fn complete_local_cancel_slot(
 fn lost_waiting_slot_completion(
     slot: impl LostWaitingSlot,
     raw: RawCompletion,
-) -> CompletionHookOutcome<crate::op::UringSlotSpec, UringBackendEffect> {
+) -> CompletionHookOutcome<UringSlotSpec, UringBackendEffect> {
     let (snapshot, cleanup) = slot.finish_lost(raw.res);
     let Some(token) = lost_completion_event_token(snapshot, raw) else {
         let anomaly =
@@ -753,10 +754,10 @@ fn lost_waiting_slot_completion(
 }
 
 fn lost_completed_slot_completion(
-    mut slot: Slot<'_, veloq_driver_core::slot::Completed>,
+    mut slot: Slot<'_, Completed>,
     raw: RawCompletion,
     cleanup: CompletionCleanupGuard,
-) -> CompletionHookOutcome<crate::op::UringSlotSpec, UringBackendEffect> {
+) -> CompletionHookOutcome<UringSlotSpec, UringBackendEffect> {
     let snapshot = slot.snapshot();
     let Some(token) = lost_completion_event_token(snapshot, raw) else {
         let anomaly =
@@ -783,31 +784,16 @@ fn lost_completed_slot_completion(
 }
 
 #[inline]
-fn lost_completion_event_token(
-    snapshot: veloq_driver_core::slot::SlotSnapshot,
-    raw: RawCompletion,
-) -> Option<OpToken> {
+fn lost_completion_event_token(snapshot: SlotSnapshot, raw: RawCompletion) -> Option<OpToken> {
     snapshot.try_token().ok().or_else(|| raw.token.op_token())
 }
 
 trait LostWaitingSlot {
-    fn finish_lost(
-        self,
-        res: i32,
-    ) -> (
-        veloq_driver_core::slot::SlotSnapshot,
-        CompletionCleanupGuard,
-    );
+    fn finish_lost(self, res: i32) -> (SlotSnapshot, CompletionCleanupGuard);
 }
 
 impl<'a> LostWaitingSlot for Slot<'a, InFlightWaiting> {
-    fn finish_lost(
-        mut self,
-        res: i32,
-    ) -> (
-        veloq_driver_core::slot::SlotSnapshot,
-        CompletionCleanupGuard,
-    ) {
+    fn finish_lost(mut self, res: i32) -> (SlotSnapshot, CompletionCleanupGuard) {
         let snapshot = self.snapshot();
         let cleanup = self
             .with_op_mut(|op| op.completion_cleanup(res))
@@ -844,8 +830,7 @@ pub(crate) fn driver_result_to_event_res(res: &UringDriverResult<usize>) -> i32 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
-    use veloq_driver_core::driver::CompletionToken;
+    use veloq_driver_core::driver::CompletionAnomalyReason;
 
     fn test_hooks<'a>(
         diagnostics: &'a DriverCompletionDiagnostics<UringCompletionDiagnostics>,
@@ -909,7 +894,7 @@ mod tests {
             outcome,
             CompletionHookOutcome::Anomaly {
                 anomaly: CompletionAnomaly {
-                    reason: veloq_driver_core::driver::CompletionAnomalyReason::ControlCompletionUntracked,
+                    reason: CompletionAnomalyReason::ControlCompletionUntracked,
                     ..
                 },
                 ..

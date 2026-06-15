@@ -1,6 +1,11 @@
-use crate::driver::completion::UringSyntheticCompletion;
-use crate::driver::{PendingCancel, UringDriver};
-use crate::error::{UringError, uring_report_to_event_res};
+use crate::{
+    driver::{
+        PendingCancel, UringDriver,
+        completion::{COMP_BACKEND_URING, UringSyntheticCompletion},
+    },
+    error::{UringError, uring_report_to_event_res},
+    op::{CheckedSlotView, Slot, SlotState, SlotView, UringOpRegistryExt},
+};
 use diagweave::prelude::*;
 use io_uring::opcode;
 use tracing::{debug, trace};
@@ -9,8 +14,7 @@ use veloq_driver_core::driver::{
     CompletionToken, OpToken, SyntheticCompletionSource, UserCompletionEvent,
     cancel_target_anomaly,
 };
-
-use crate::op::{CheckedSlotView, Slot, SlotState, SlotView, UringOpRegistryExt};
+use veloq_wheel::TaskId;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum UringSubmissionState {
@@ -23,7 +27,7 @@ pub(crate) enum UringSubmissionState {
 
 #[derive(Clone, Default)]
 pub struct UringOpState {
-    pub(crate) timer_id: Option<veloq_wheel::TaskId>,
+    pub(crate) timer_id: Option<TaskId>,
     pub(crate) submission_state: UringSubmissionState,
 }
 
@@ -87,12 +91,7 @@ impl<'a> UringDriver<'a> {
         self.completion_diagnostics
             .backend()
             .inc_cancel_local_completed();
-        let event = UserCompletionEvent::from_parts(
-            crate::driver::completion::COMP_BACKEND_URING,
-            token,
-            -libc::ECANCELED,
-            0,
-        );
+        let event = UserCompletionEvent::from_parts(COMP_BACKEND_URING, token, -libc::ECANCELED, 0);
         let _ = self.accept_synthetic_completion(
             event,
             SyntheticCompletionSource::Cancel,
@@ -170,13 +169,8 @@ impl<'a> UringDriver<'a> {
             | CheckedSlotView::Empty(_)
             | CheckedSlotView::Stale(_)
             | CheckedSlotView::Corrupt(_)) => {
-                let (reason, anomaly) = cancel_target_anomaly(
-                    crate::driver::completion::COMP_BACKEND_URING,
-                    token,
-                    -libc::ECANCELED,
-                    0,
-                    view,
-                );
+                let (reason, anomaly) =
+                    cancel_target_anomaly(COMP_BACKEND_URING, token, -libc::ECANCELED, 0, view);
                 self.record_cancel_target_gone(reason);
                 let _ = self.accept_completion_anomaly(anomaly);
                 debug!(
@@ -205,7 +199,7 @@ impl<'a> UringDriver<'a> {
                     | CheckedSlotView::Corrupt(_) => {
                         self.pending_cancellations.pop_front();
                         let (reason, anomaly) = cancel_target_anomaly(
-                            crate::driver::completion::COMP_BACKEND_URING,
+                            COMP_BACKEND_URING,
                             request.target,
                             -libc::ECANCELED,
                             0,
@@ -328,12 +322,7 @@ impl<'a> UringDriver<'a> {
 
     fn complete_queued_submission_error(&mut self, token: OpToken, report: Report<UringError>) {
         let event_res = uring_report_to_event_res(&report);
-        let event = UserCompletionEvent::from_parts(
-            crate::driver::completion::COMP_BACKEND_URING,
-            token,
-            event_res,
-            0,
-        );
+        let event = UserCompletionEvent::from_parts(COMP_BACKEND_URING, token, event_res, 0);
         let _ = self.accept_synthetic_completion(
             event,
             SyntheticCompletionSource::SubmissionFailure,

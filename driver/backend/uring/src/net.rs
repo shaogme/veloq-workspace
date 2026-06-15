@@ -1,10 +1,16 @@
-use crate::config::UringRawHandle;
-use crate::error::{UringError, UringResult};
-use crate::{OwnedRawHandle, RawHandle, SockAddrStorage};
+use crate::{
+    OwnedRawHandle, RawHandle, SockAddrStorage,
+    config::UringRawHandle,
+    error::{UringError, UringResult},
+};
 use diagweave::prelude::*;
 use libc::{c_int, sockaddr, sockaddr_in, sockaddr_in6, socklen_t};
-use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::{
+    io,
+    mem::{MaybeUninit, size_of, zeroed},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    ptr, slice,
+};
 use veloq_driver_core::{PlatformSocket, SocketAddrCodec};
 
 pub struct Socket {
@@ -45,7 +51,7 @@ impl Socket {
                 level,
                 optname,
                 &optval as *const _ as *const libc::c_void,
-                std::mem::size_of::<T>() as socklen_t,
+                size_of::<T>() as socklen_t,
             )
         };
         if ret < 0 {
@@ -125,8 +131,8 @@ impl Socket {
     }
 
     pub fn local_addr(&self) -> UringResult<SocketAddr> {
-        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as socklen_t;
+        let mut storage: libc::sockaddr_storage = unsafe { zeroed() };
+        let mut len = size_of::<libc::sockaddr_storage>() as socklen_t;
         let ret = unsafe {
             libc::getsockname(
                 self.fd.raw().as_fd(),
@@ -139,7 +145,7 @@ impl Socket {
                 .io_report("socket.local_addr.getsockname", io::Error::last_os_error()));
         }
         to_socket_addr(unsafe {
-            std::slice::from_raw_parts(&storage as *const _ as *const u8, len as usize)
+            slice::from_raw_parts(&storage as *const _ as *const u8, len as usize)
         })
         .attach_note("socket.local_addr.decode")
     }
@@ -260,32 +266,32 @@ impl SocketAddrCodec for SockAddrStorage {
 }
 
 pub fn to_socket_addr(buf: &[u8]) -> UringResult<SocketAddr> {
-    if buf.len() < std::mem::size_of::<libc::sa_family_t>() {
+    if buf.len() < size_of::<libc::sa_family_t>() {
         return Err(Report::new(UringError::InvalidInput).attach_note("Invalid address length"));
     }
-    let mut family_raw = std::mem::MaybeUninit::<libc::sa_family_t>::uninit();
+    let mut family_raw = MaybeUninit::<libc::sa_family_t>::uninit();
     // Copy into properly aligned stack storage before reading, avoiding UB on unaligned input.
     unsafe {
-        std::ptr::copy_nonoverlapping(
+        ptr::copy_nonoverlapping(
             buf.as_ptr(),
             family_raw.as_mut_ptr() as *mut u8,
-            std::mem::size_of::<libc::sa_family_t>(),
+            size_of::<libc::sa_family_t>(),
         );
     }
     let family = unsafe { family_raw.assume_init() } as i32;
     match family {
         libc::AF_INET => {
-            if buf.len() < std::mem::size_of::<sockaddr_in>() {
+            if buf.len() < size_of::<sockaddr_in>() {
                 return Err(
                     Report::new(UringError::InvalidInput).attach_note("Invalid address length")
                 );
             }
-            let mut sin_raw = std::mem::MaybeUninit::<sockaddr_in>::zeroed();
+            let mut sin_raw = MaybeUninit::<sockaddr_in>::zeroed();
             unsafe {
-                std::ptr::copy_nonoverlapping(
+                ptr::copy_nonoverlapping(
                     buf.as_ptr(),
                     sin_raw.as_mut_ptr() as *mut u8,
-                    std::mem::size_of::<sockaddr_in>(),
+                    size_of::<sockaddr_in>(),
                 );
             }
             let sin = unsafe { sin_raw.assume_init() };
@@ -294,17 +300,17 @@ pub fn to_socket_addr(buf: &[u8]) -> UringResult<SocketAddr> {
             Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
         }
         libc::AF_INET6 => {
-            if buf.len() < std::mem::size_of::<sockaddr_in6>() {
+            if buf.len() < size_of::<sockaddr_in6>() {
                 return Err(
                     Report::new(UringError::InvalidInput).attach_note("Invalid address length")
                 );
             }
-            let mut sin6_raw = std::mem::MaybeUninit::<sockaddr_in6>::zeroed();
+            let mut sin6_raw = MaybeUninit::<sockaddr_in6>::zeroed();
             unsafe {
-                std::ptr::copy_nonoverlapping(
+                ptr::copy_nonoverlapping(
                     buf.as_ptr(),
                     sin6_raw.as_mut_ptr() as *mut u8,
-                    std::mem::size_of::<sockaddr_in6>(),
+                    size_of::<sockaddr_in6>(),
                 );
             }
             let sin6 = unsafe { sin6_raw.assume_init() };
@@ -330,7 +336,7 @@ pub fn socket_addr_to_storage(addr: SocketAddr) -> (SockAddrStorage, socklen_t) 
                 (*sin_ptr).sin_family = libc::AF_INET as _;
                 (*sin_ptr).sin_port = a.port().to_be();
                 (*sin_ptr).sin_addr.s_addr = u32::from_ne_bytes(a.ip().octets());
-                std::mem::size_of::<sockaddr_in>() as socklen_t
+                size_of::<sockaddr_in>() as socklen_t
             }
         }
         SocketAddr::V6(a) => {
@@ -341,7 +347,7 @@ pub fn socket_addr_to_storage(addr: SocketAddr) -> (SockAddrStorage, socklen_t) 
                 (*sin6_ptr).sin6_addr.s6_addr = a.ip().octets();
                 (*sin6_ptr).sin6_flowinfo = a.flowinfo();
                 (*sin6_ptr).sin6_scope_id = a.scope_id();
-                std::mem::size_of::<sockaddr_in6>() as socklen_t
+                size_of::<sockaddr_in6>() as socklen_t
             }
         }
     };

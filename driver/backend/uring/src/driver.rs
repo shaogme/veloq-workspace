@@ -1,25 +1,38 @@
 use diagweave::prelude::*;
 use io_uring::IoUring;
-use std::collections::{HashMap, VecDeque};
-use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, mpsc};
-use std::time::Instant;
-
-use tracing::{debug, trace};
-
-use crate::config::{
-    BufferRegistrationMode, IoFd, IoMode, OwnedRawHandle, RawHandle, UringConfig, UringRawHandle,
+use std::{
+    collections::{HashMap, VecDeque},
+    io, mem, ptr,
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    time::Instant,
 };
-use crate::diagnostics::UringCompletionDiagnostics;
-use crate::error::{UringError, UringResult};
-use crate::op::{UringOp, UringUserPayload};
-use veloq_driver_core::DriverResult as CoreDriverResult;
-use veloq_driver_core::driver::registry::{OpEntry, OpHandle};
-use veloq_driver_core::driver::{
-    CancelCompletionId, CancelMode, CancelRequest, CancelSubmitOutcome, DriveMode, DriveOutcome,
-    Driver, DriverCompletionDiagnostics, DriverSubmitResult, OpToken, RegisterFd,
-    RemoteCancelSender, RemoteWaker, SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
+use tracing::{debug, trace};
+use veloq_bitset::BitSet;
+use veloq_buf::{BufferRegistrar, heap::ChunkId};
+use veloq_wheel::{Wheel, WheelConfig};
+
+use crate::{
+    config::{
+        BufferRegistrationMode, IoFd, IoMode, OwnedRawHandle, RawHandle, UringConfig,
+        UringRawHandle,
+    },
+    diagnostics::UringCompletionDiagnostics,
+    error::{UringError, UringResult},
+    op::{SubmissionStrategy, UringOp, UringOpRegistry, UringSlotSpec, UringUserPayload},
+};
+use veloq_driver_core::{
+    DriverResult as CoreDriverResult,
+    driver::{
+        CancelCompletionId, CancelMode, CancelRequest, CancelSubmitOutcome, DriveMode,
+        DriveOutcome, Driver, DriverCompletionDiagnostics, DriverSubmitResult, OpToken, RegisterFd,
+        RemoteCancelSender, RemoteWaker, SharedCompletionTable, SharedDriverSlotTable,
+        SubmitStatus,
+        registry::{OpEntry, OpHandle},
+    },
 };
 
 mod completion;
@@ -31,8 +44,6 @@ pub use lifecycle::UringOpState;
 pub(crate) use registration::{
     FileSlot, MAX_CHUNKS, RegisteredFileEntry, UringRegistrationStats, resolve_registered_fixed_fd,
 };
-
-use crate::op::{UringOpRegistry, UringSlotSpec};
 
 type DriverResult<T> = CoreDriverResult<T, UringError>;
 pub(crate) struct EventFd {
@@ -63,7 +74,7 @@ impl WakerFdState {
 
     #[inline]
     pub(crate) fn replace(&self, fd: Arc<EventFd>) -> Arc<EventFd> {
-        std::mem::replace(&mut *self.lock_fd(), fd)
+        mem::replace(&mut *self.lock_fd(), fd)
     }
 }
 
@@ -134,16 +145,16 @@ pub struct UringDriver<'a> {
     pub(crate) waker_registered_fd: Option<IoFd>,
     pub(crate) waker_armed: bool,
     pub(crate) waker_buf: Box<[u8; 8]>,
-    pub(crate) registered_chunks: veloq_bitset::BitSet,
+    pub(crate) registered_chunks: BitSet,
     pub(crate) is_waked: Arc<AtomicBool>,
 
-    pub(crate) wheel: veloq_wheel::Wheel<OpToken>,
+    pub(crate) wheel: Wheel<OpToken>,
     pub(crate) timer_buffer: Vec<OpToken>,
     pub(crate) last_timer_poll: Instant,
-    pub(crate) registrar: Box<dyn veloq_buf::BufferRegistrar + 'a>,
+    pub(crate) registrar: Box<dyn BufferRegistrar + 'a>,
     pub(crate) registration_stats: UringRegistrationStats,
     pub(crate) registration_mode: BufferRegistrationMode,
-    pub(crate) chunk_register_failures_recent: HashMap<veloq_buf::heap::ChunkId, Instant>,
+    pub(crate) chunk_register_failures_recent: HashMap<ChunkId, Instant>,
     pub(crate) file_slots: Vec<FileSlot>,
     pub(crate) free_file_slots: Vec<u32>,
     pub(crate) file_table_initialized: bool,
@@ -204,10 +215,10 @@ impl<'a> UringDriver<'a> {
             waker_registered_fd: None,
             waker_armed: false,
             waker_buf: Box::new([0; 8]),
-            registered_chunks: veloq_bitset::BitSet::new(MAX_CHUNKS),
+            registered_chunks: BitSet::new(MAX_CHUNKS),
             is_waked,
 
-            wheel: veloq_wheel::Wheel::new(veloq_wheel::WheelConfig::default()),
+            wheel: Wheel::new(WheelConfig::default()),
             timer_buffer: Vec::new(),
             last_timer_poll: Instant::now(),
             registrar,
@@ -224,7 +235,7 @@ impl<'a> UringDriver<'a> {
         // Sparse registration
         let iovecs = vec![
             libc::iovec {
-                iov_base: std::ptr::null_mut(),
+                iov_base: ptr::null_mut(),
                 iov_len: 0
             };
             MAX_CHUNKS
@@ -239,7 +250,7 @@ impl<'a> UringDriver<'a> {
 
     pub fn new(
         config: impl AsRef<UringConfig>,
-        registrar: Box<dyn veloq_buf::BufferRegistrar + 'a>,
+        registrar: Box<dyn BufferRegistrar + 'a>,
     ) -> UringResult<Self> {
         Self::new_internal(config, registrar).attach_note("create uring driver")
     }
@@ -356,10 +367,8 @@ impl<'a> Driver for UringDriver<'a> {
         let strategy = op.vtable.strategy;
 
         match strategy {
-            crate::op::SubmissionStrategy::SubmitSqe => self.submit_sqe_internal(token, op, op_in),
-            crate::op::SubmissionStrategy::SoftwareTimer => {
-                self.submit_timer_internal(token, op, op_in)
-            }
+            SubmissionStrategy::SubmitSqe => self.submit_sqe_internal(token, op, op_in),
+            SubmissionStrategy::SoftwareTimer => self.submit_timer_internal(token, op, op_in),
         }
     }
 
@@ -401,12 +410,7 @@ impl<'a> Driver for UringDriver<'a> {
         Ok(self.cancel_op_internal(request))
     }
 
-    fn register_chunk(
-        &mut self,
-        id: veloq_buf::heap::ChunkId,
-        ptr: *const u8,
-        len: usize,
-    ) -> DriverResult<()> {
+    fn register_chunk(&mut self, id: ChunkId, ptr: *const u8, len: usize) -> DriverResult<()> {
         self.register_chunk_internal(id, ptr, len)
             .push_ctx("scope", "uring.driver.register_chunk")
             .with_ctx("driver_error_kind", UringError::Registration.to_string())
@@ -440,7 +444,10 @@ impl<'a> Driver for UringDriver<'a> {
 }
 
 #[cfg(feature = "test-hooks")]
-impl veloq_driver_core::driver::test_hooks::DriverTestHooks for UringDriver<'_> {
+use veloq_driver_core::driver::test_hooks::DriverTestHooks;
+
+#[cfg(feature = "test-hooks")]
+impl DriverTestHooks for UringDriver<'_> {
     fn debug_chunk_register_attempts(&self) -> u64 {
         self.registration_stats.chunk_register_attempts
     }
