@@ -1,7 +1,6 @@
 use std::{io, num::NonZeroU8, time::Instant};
 
 use diagweave::prelude::*;
-use tracing::warn;
 use veloq_driver_core::{
     driver::{
         CancelMode, CompletionAnomaly, CompletionBackend, CompletionBackendHooks,
@@ -116,8 +115,12 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
                     self.completion.clear_notification();
                 } else {
                     self.diagnostics.backend().inc_waker_error();
-                    warn!(res = raw.res, "IOCP waker completion reported an error");
                     self.completion.clear_notification();
+                    return Err(IocpError::Internal
+                        .to_report()
+                        .push_ctx("scope", "iocp.driver.completion.waker")
+                        .set_error_code(-raw.res)
+                        .attach_note("IOCP waker completion reported an error"));
                 }
                 CompletionHookOutcome::ControlHandled {
                     effect: IocpBackendEffect::None,

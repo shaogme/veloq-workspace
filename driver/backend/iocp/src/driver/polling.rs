@@ -5,7 +5,6 @@ use std::{
 };
 
 use diagweave::prelude::*;
-use tracing::{debug, error};
 use veloq_driver_core::{
     driver::{
         CompletionAnomaly, CompletionEnvelope, CompletionIdentity, OpToken, RawCompletion,
@@ -207,9 +206,8 @@ impl<'a> IocpDriver<'a> {
                 Ok(0)
             }
             IocpCompletionStatusKind::OverlappedUser { queue_key } => {
-                let envelope = self.resolve_overlapped_user_envelope(
-                    bytes, queue_key, overlapped, success, res, flags,
-                )?;
+                let envelope =
+                    self.resolve_overlapped_user_envelope(queue_key, overlapped, res, flags)?;
                 self.process_completion_envelope(envelope)
             }
             IocpCompletionStatusKind::ControlKey | IocpCompletionStatusKind::PostedToken => {
@@ -247,21 +245,22 @@ impl<'a> IocpDriver<'a> {
 
     fn resolve_overlapped_user_envelope(
         &mut self,
-        bytes: u32,
         completion_key: usize,
         overlapped: *mut Overlapped,
-        success: bool,
         res: i32,
         flags: u32,
     ) -> IocpResult<CompletionEnvelope> {
         let entry = unsafe { &*(overlapped as *const OverlappedEntry) };
         let idx = entry.token.index();
         if idx >= self.ops.capacity() {
-            error!(
-                idx,
-                slots = self.ops.capacity(),
-                "completed index out of bounds"
-            );
+            return Err(IocpError::InvalidState.report(
+                "resolve_overlapped_user_envelope",
+                format!(
+                    "completed index out of bounds: index {}, capacity {}",
+                    idx,
+                    self.ops.capacity()
+                ),
+            ));
         }
 
         let envelope = CompletionEnvelope::from_sidecar_user_token(
@@ -293,21 +292,8 @@ impl<'a> IocpDriver<'a> {
                 mismatch_raw,
                 self.ops.checked_slot_view(entry.token),
             );
-            let reason = anomaly.reason;
             let _ = self.accept_completion_anomaly(anomaly)?;
-            debug!(
-                expected_key,
-                completion_key,
-                sidecar_token = raw.token.raw(),
-                reason = ?reason,
-                "IOCP completion key does not match overlapped sidecar token"
-            );
         }
-
-        debug!(
-            completion_key,
-            success, bytes, "resolved overlapped IOCP completion"
-        );
         Ok(envelope)
     }
 }

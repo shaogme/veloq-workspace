@@ -1,4 +1,3 @@
-use tracing::{debug, warn};
 use veloq_driver_core::{
     driver::{
         CancelMode, CancelRequest, CancelSubmitOutcome, CancelTargetGoneReason, CompletionAnomaly,
@@ -15,7 +14,7 @@ use crate::{
         IocpDriver, IocpOpRegistry,
         completion::{COMP_BACKEND_IOCP, IocpSyntheticCompletion},
     },
-    error::IocpResult,
+    error::{IocpError, IocpResult},
     op,
     win32::{CancelRequestResult, IoCompletionPort, Overlapped},
 };
@@ -38,7 +37,6 @@ impl<'a> IocpDriver<'a> {
         request: CancelRequest,
     ) -> IocpResult<CancelSubmitOutcome> {
         let token = request.target;
-        let (user_data, generation) = token.parts();
 
         let timer_id = match self.ops.checked_slot_view(token) {
             CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
@@ -69,27 +67,17 @@ impl<'a> IocpDriver<'a> {
                 self.record_cancel_status(token, status)
             }
             CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
-                let prepared = if slot.has_op() {
-                    let start_result = slot.start_submission_with(None);
-                    match start_result {
-                        Ok(guard) => {
-                            let _ = guard.persist();
-                            true
-                        }
-                        Err(err) => {
-                            debug!(
-                                user_data,
-                                generation,
-                                snapshot = ?err.snapshot,
-                                "reserved IOCP cancel could not prepare synthetic completion"
-                            );
-                            false
-                        }
-                    }
-                } else {
-                    false
-                };
-                if prepared {
+                if slot.has_op() {
+                    let guard = slot.start_submission_with(None).map_err(|err| {
+                        IocpError::InvalidState.report(
+                            "cancel_op_internal",
+                            format!(
+                                "Reserved slot has_op but start_submission_with failed: {:?}",
+                                err
+                            ),
+                        )
+                    })?;
+                    let _ = guard.persist();
                     self.complete_local_cancel(token, request.mode);
                 } else {
                     let _ = self.ops.remove(token);
@@ -123,13 +111,6 @@ impl<'a> IocpDriver<'a> {
                 }
                 self.record_cancel_target_gone(reason);
                 let _ = self.accept_completion_anomaly(anomaly)?;
-                debug!(
-                    user_data,
-                    generation,
-                    token = CompletionToken::user(token).raw(),
-                    reason = ?reason,
-                    "IOCP cancel request found non-active slot"
-                );
                 Ok(CancelSubmitOutcome::TargetGone { reason })
             }
         }
@@ -164,11 +145,9 @@ impl<'a> IocpDriver<'a> {
                     .backend()
                     .inc_cancel_ack_not_found();
                 if let Some(anomaly) = self.record_cancel_not_found_if_target_active(token)? {
-                    debug!("CancelIoEx returned ERROR_NOT_FOUND while target is still active");
                     return Ok(CancelSubmitOutcome::DiagnosticOnly { anomaly });
                 }
                 self.record_cancel_target_gone(CancelTargetGoneReason::Missing);
-                debug!("CancelIoEx target was already complete or absent");
                 Ok(CancelSubmitOutcome::target_missing())
             }
             Ok(CancelPerformStatus::NoHandle) => {
@@ -181,7 +160,6 @@ impl<'a> IocpDriver<'a> {
             }
             Err(report) => {
                 self.completion_diagnostics.backend().inc_cancel_error();
-                warn!(report = ?report, "CancelIoEx failed");
                 Err(report)
             }
         }
@@ -219,12 +197,6 @@ impl<'a> IocpDriver<'a> {
         .with_slot_snapshot(snapshot)
         .with_raw_completion(raw);
         let _ = self.accept_completion_anomaly(anomaly)?;
-        debug!(
-            user_data = snapshot.index,
-            generation = snapshot.generation,
-            state = ?snapshot.state,
-            "CancelIoEx returned ERROR_NOT_FOUND while target is still active"
-        );
         Ok(Some(anomaly))
     }
 
@@ -250,7 +222,6 @@ impl<'a> IocpDriver<'a> {
         token: OpToken,
         ops: &mut IocpOpRegistry,
     ) -> IocpResult<CancelPerformStatus> {
-        let user_data = token.index();
         let status = match ops.checked_slot_view(token) {
             CheckedSlotView::Valid(SlotView::InFlightWaiting(mut guard)) => {
                 let is_rio = guard
@@ -323,9 +294,6 @@ impl<'a> IocpDriver<'a> {
             _ => CancelPerformStatus::NonActive,
         };
 
-        if matches!(status, CancelPerformStatus::NonActive) {
-            debug!(user_data, "Skipping cancel for non in-flight slot");
-        }
         Ok(status)
     }
 }
