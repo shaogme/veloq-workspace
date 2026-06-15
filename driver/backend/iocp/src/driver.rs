@@ -11,7 +11,6 @@ use std::{
 };
 
 use diagweave::prelude::*;
-use tracing::trace;
 
 use lifecycle::{IocpRioRuntime, WinsockGuard};
 use polling::{CompletionPump, TimerEngine};
@@ -150,7 +149,6 @@ impl<'a> Driver for IocpDriver<'a> {
                 return Err(IocpError::Registration.report("iocp/driver", "OpRegistry is full"));
             }
         };
-        trace!(user_data, generation, "Reserved op slot");
         OpToken::from_registry_parts(user_data, generation).map_err(|err| {
             IocpError::Registration
                 .to_report()

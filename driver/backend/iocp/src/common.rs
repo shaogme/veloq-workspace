@@ -8,7 +8,6 @@ use std::{
 };
 
 use diagweave::prelude::*;
-use tracing::error;
 
 use crate::{
     error::{IocpDriverResult, IocpError},
@@ -54,11 +53,6 @@ pub(crate) fn iocp_msg(ctx: IocpErrorContext, detail: impl Into<String>) -> Repo
         .push_ctx("scope", "iocp/common")
         .with_ctx("detail", sanitize_field(&detail))
         .attach_note(detail);
-    error!(
-        context = %ctx,
-        report = %report,
-        "IOCP error report"
-    );
     report
 }
 
