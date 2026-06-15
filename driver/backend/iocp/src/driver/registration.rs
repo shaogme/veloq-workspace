@@ -9,12 +9,15 @@ use windows_sys::Win32::Networking::WinSock::{
     closesocket, getsockopt,
 };
 
-use crate::config::{
-    IoFd, IocpHandle, RawHandle, RawHandleKind, RegisteredHandle, RegisteredSlot, SocketKey,
+use crate::{
+    OwnedRawHandle,
+    config::{
+        IoFd, IocpHandle, RawHandle, RawHandleKind, RegisteredHandle, RegisteredSlot, SocketKey,
+    },
+    driver::{IocpDriver, IocpDriverResult},
+    error::{IocpError, IocpResult},
+    rio::RioState,
 };
-use crate::driver::{IocpDriver, IocpDriverResult};
-use crate::error::{IocpError, IocpResult};
-use crate::rio::RioState;
 
 pub(super) struct DeferredSocketCleanup {
     handle: SocketKey,
@@ -393,11 +396,11 @@ impl<'a> IocpDriver<'a> {
     /// Registers a set of file/socket handles for use with the driver.
     pub(crate) fn register_files<'h>(
         &mut self,
-        files: Vec<RegisterFd<'h, crate::config::IocpHandle>>,
+        files: Vec<RegisterFd<'h, IocpHandle>>,
     ) -> IocpDriverResult<Vec<IoFd>> {
         enum InputHandle {
             Borrowed(RawHandle),
-            Owned(crate::OwnedRawHandle),
+            Owned(OwnedRawHandle),
         }
 
         impl InputHandle {
@@ -419,7 +422,7 @@ impl<'a> IocpDriver<'a> {
                         // SAFETY: ownership comes from RegisterFd::Owned and is transferred
                         // into the registered slot for deterministic lifecycle management.
                         RegisteredHandle::Owned(unsafe {
-                            crate::OwnedRawHandle::from_raw_owned(canonical)
+                            OwnedRawHandle::from_raw_owned(canonical)
                         })
                     }
                 }
@@ -441,9 +444,7 @@ impl<'a> IocpDriver<'a> {
                         .push_ctx("scope", "iocp/driver")
                         .attach_note("detect socket from file handle failed")?
                     {
-                        RawHandle::new(crate::config::IocpHandle::for_socket(
-                            handle.raw().as_handle(),
-                        ))
+                        RawHandle::new(IocpHandle::for_socket(handle.raw().as_handle()))
                     } else {
                         handle
                     }
@@ -452,7 +453,7 @@ impl<'a> IocpDriver<'a> {
             let kind = canonical.kind();
             if kind == RawHandleKind::Socket {
                 let mut raw = canonical.raw();
-                if let crate::config::IocpHandle::Socket { generation: g, .. } = &mut raw
+                if let IocpHandle::Socket { generation: g, .. } = &mut raw
                     && *g == 0
                 {
                     *g = self.handles.next_socket_generation();

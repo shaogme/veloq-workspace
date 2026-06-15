@@ -1,3 +1,4 @@
+use std::num::NonZeroU8;
 use std::time::Instant;
 
 use diagweave::prelude::*;
@@ -8,13 +9,17 @@ use veloq_driver_core::driver::{
     CompletionFlowOutcome, CompletionHookOutcome, CompletionIngress, CompletionSource,
     SyntheticCompletionSource, UserCompletionEvent,
 };
-use veloq_driver_core::slot::{InFlightOrphaned, InFlightWaiting, SlotRegistryExt, SlotView};
+use veloq_driver_core::slot::{
+    CheckedSlotView, InFlightOrphaned, InFlightWaiting, SlotRegistryExt, SlotView,
+};
 
-use crate::driver::{IocpDriver, IocpDriverCompletionDiagnostics};
-use crate::error::{IocpError, IocpResult, iocp_report_to_event_res};
-use crate::op::{IocpOp, IocpSlotSpec, Slot};
-use crate::rio::{RioState, SocketInflightToken};
-use std::num::NonZeroU8;
+use crate::{
+    driver::{IocpDriver, IocpDriverCompletionDiagnostics, polling::CompletionPump},
+    error::{IocpDriverResult, IocpError, IocpResult, iocp_report_to_event_res},
+    ext::Extensions,
+    op::{IocpOp, IocpOpPayload, IocpSlotSpec, Slot},
+    rio::{RioState, SocketInflightToken},
+};
 
 pub(crate) const COMP_BACKEND_IOCP: CompletionBackend =
     CompletionBackend::Backend(match NonZeroU8::new(1) {
@@ -66,20 +71,20 @@ impl Default for IocpBackendEffect {
 }
 
 struct IocpCompletionHooks<'a> {
-    ext: &'a crate::ext::Extensions,
+    ext: &'a Extensions,
     diagnostics: &'a IocpDriverCompletionDiagnostics,
     rio: &'a mut RioState,
-    completion: &'a crate::driver::polling::CompletionPump,
+    completion: &'a CompletionPump,
     synthetic: IocpSyntheticCompletion,
     post: IocpPostCompletionEffects,
 }
 
 impl<'a> IocpCompletionHooks<'a> {
     fn new(
-        ext: &'a crate::ext::Extensions,
+        ext: &'a Extensions,
         diagnostics: &'a IocpDriverCompletionDiagnostics,
         rio: &'a mut RioState,
-        completion: &'a crate::driver::polling::CompletionPump,
+        completion: &'a CompletionPump,
         synthetic: IocpSyntheticCompletion,
     ) -> Self {
         Self {
@@ -104,8 +109,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
     fn handle_control(
         &mut self,
         control: CompletionControl,
-    ) -> crate::error::IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>>
-    {
+    ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         Ok(match control {
             CompletionControl::Waker { raw, .. } => {
                 if raw.res >= 0 {
@@ -136,8 +140,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
         event: UserCompletionEvent,
         mut slot: Slot<'_, InFlightWaiting>,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> crate::error::IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>>
-    {
+    ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         Ok(match source {
             CompletionSource::Synthetic(SyntheticCompletionSource::Timer) => {
                 complete_timer_waiting_slot(slot, event)
@@ -165,8 +168,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
         event: UserCompletionEvent,
         slot: Slot<'_, InFlightOrphaned>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> crate::error::IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>>
-    {
+    ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         let (cleanup, socket_inflight) = complete_iocp_orphaned_slot(slot, event.res());
         Ok(CompletionHookOutcome::Cleanup {
             cleanup,
@@ -196,9 +198,7 @@ impl<'a> IocpDriver<'a> {
         let mut expired = Vec::new();
         for &token in &timer_buffer {
             match self.ops.checked_slot_view(token) {
-                veloq_driver_core::slot::CheckedSlotView::Valid(SlotView::InFlightWaiting(
-                    mut slot,
-                )) => {
+                CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
                     if let Some(deadline) = slot.platform().timer_deadline
                         && now < deadline
                     {
@@ -209,9 +209,7 @@ impl<'a> IocpDriver<'a> {
                     }
                     expired.push(token);
                 }
-                veloq_driver_core::slot::CheckedSlotView::Valid(SlotView::InFlightOrphaned(
-                    mut slot,
-                )) => {
+                CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot)) => {
                     if let Some(deadline) = slot.platform().timer_deadline
                         && now < deadline
                     {
@@ -311,7 +309,7 @@ impl<'a> IocpDriver<'a> {
 }
 
 fn calculate_io_result_from_slot(
-    ext: &crate::ext::Extensions,
+    ext: &Extensions,
     guard: &mut Slot<'_, InFlightWaiting>,
     event_res: i32,
 ) -> IocpResult<usize> {
@@ -337,14 +335,14 @@ fn calculate_io_result_from_slot(
                 .attach_note("blocking completion returned stored error");
         } else if matches!(
             &iocp_op.payload,
-            crate::op::IocpOpPayload::Open(_)
-                | crate::op::IocpOpPayload::Close(_)
-                | crate::op::IocpOpPayload::Fsync(_)
-                | crate::op::IocpOpPayload::FsyncRaw(_)
-                | crate::op::IocpOpPayload::SyncRange(_)
-                | crate::op::IocpOpPayload::SyncRangeRaw(_)
-                | crate::op::IocpOpPayload::Fallocate(_)
-                | crate::op::IocpOpPayload::FallocateRaw(_)
+            IocpOpPayload::Open(_)
+                | IocpOpPayload::Close(_)
+                | IocpOpPayload::Fsync(_)
+                | IocpOpPayload::FsyncRaw(_)
+                | IocpOpPayload::SyncRange(_)
+                | IocpOpPayload::SyncRangeRaw(_)
+                | IocpOpPayload::Fallocate(_)
+                | IocpOpPayload::FallocateRaw(_)
         ) {
             io_result = Err(IocpError::CompletionWait
                 .to_report()

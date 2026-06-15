@@ -6,11 +6,14 @@ use veloq_buf::BufferRegistrar;
 use veloq_driver_core::driver::{CancelRequest, SharedCompletionTable};
 use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotView};
 
-use crate::config::{BorrowedRawHandle, BufferRegistrationMode, IocpConfig, IocpHandle};
-use crate::error::{IocpError, IocpResult};
-use crate::ext::Extensions;
-use crate::op::IocpSlotSpec;
-use crate::rio::RioState;
+use crate::{
+    config::{BorrowedRawHandle, BufferRegistrationMode, IocpConfig, IocpHandle, RawHandle},
+    error::{IocpError, IocpResult},
+    ext::Extensions,
+    op::IocpSlotSpec,
+    rio::RioState,
+    win32::IoCompletionPort,
+};
 
 use super::polling::{CompletionPump, TimerEngine};
 use super::registration::HandleRegistry;
@@ -79,7 +82,7 @@ impl<'a> IocpRioRuntime<'a> {
 impl<'a> IocpDriver<'a> {
     /// Creates a pre-initialization completion port handle.
     pub(crate) fn create_pre_init() -> IocpResult<PreInit> {
-        crate::win32::IoCompletionPort::new(0).attach_note("failed to create pre-init IOCP")
+        IoCompletionPort::new(0).attach_note("failed to create pre-init IOCP")
     }
 
     /// Creates a new IOCP driver instance.
@@ -103,14 +106,14 @@ impl<'a> IocpDriver<'a> {
 
         let port_handle = port_val.as_raw();
         debug!(port = ?port_handle, "Initializing IocpDriver");
-        let extensions = crate::ext::Extensions::new()
+        let extensions = Extensions::new()
             .with_ctx("port_raw", port_handle as usize)
             .attach_note("failed to load IOCP extensions")?;
         let ops = IocpOpRegistry::new(entries as usize);
         let completion_table: SharedCompletionTable<IocpSlotSpec> = ops.shared.clone();
         let completion_diagnostics = ops.shared.completion_diagnostics();
         let rio = IocpRioRuntime::new(
-            crate::config::RawHandle::new(IocpHandle::for_file(port_handle)).borrow(),
+            RawHandle::new(IocpHandle::for_file(port_handle)).borrow(),
             entries,
             &extensions,
             registration_mode,

@@ -5,8 +5,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use diagweave::prelude::*;
 use tracing::error;
 
-use crate::error::IocpError;
-use crate::win32::IoCompletionPort;
+use crate::{
+    error::{IocpDriverResult, IocpError},
+    win32::IoCompletionPort,
+};
 use veloq_driver_core::driver::{CompletionToken, RemoteWaker};
 
 // ============================================================================
@@ -66,7 +68,7 @@ pub(crate) struct IocpWaker {
 }
 
 impl RemoteWaker<IocpError> for IocpWaker {
-    fn wake(&self) -> crate::error::IocpDriverResult<()> {
+    fn wake(&self) -> IocpDriverResult<()> {
         if self.is_notified.load(Ordering::Relaxed) {
             return Ok(());
         }

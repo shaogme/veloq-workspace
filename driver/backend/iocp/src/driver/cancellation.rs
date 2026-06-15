@@ -5,15 +5,21 @@ use veloq_driver_core::driver::{
     cancel_target_anomaly,
 };
 use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotView};
+use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED};
 
-use crate::driver::completion::IocpSyntheticCompletion;
-use crate::driver::{IocpDriver, IocpOpRegistry};
-use crate::error::IocpResult;
-use crate::op;
-use crate::win32::CancelRequestResult;
+use crate::{
+    config::RegisteredSlot,
+    driver::{
+        IocpDriver, IocpOpRegistry,
+        completion::{COMP_BACKEND_IOCP, IocpSyntheticCompletion},
+    },
+    error::IocpResult,
+    op,
+    win32::{CancelRequestResult, IoCompletionPort, Overlapped},
+};
 
 struct CancelContext<'a> {
-    registered_slots: &'a [crate::config::RegisteredSlot],
+    registered_slots: &'a [RegisteredSlot],
 }
 
 enum CancelPerformStatus {
@@ -103,9 +109,9 @@ impl<'a> IocpDriver<'a> {
                     | CheckedSlotView::Valid(_) => None,
                 };
                 let (reason, anomaly) = cancel_target_anomaly(
-                    crate::driver::completion::COMP_BACKEND_IOCP,
+                    COMP_BACKEND_IOCP,
                     token,
-                    -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
+                    -(ERROR_OPERATION_ABORTED as i32),
                     0,
                     view,
                 );
@@ -129,9 +135,9 @@ impl<'a> IocpDriver<'a> {
 
     fn complete_local_cancel(&mut self, token: OpToken, mode: CancelMode) {
         let event = UserCompletionEvent::from_parts(
-            crate::driver::completion::COMP_BACKEND_IOCP,
+            COMP_BACKEND_IOCP,
             token,
-            -(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32),
+            -(ERROR_OPERATION_ABORTED as i32),
             0,
         );
         let _ = self.accept_synthetic_completion(
@@ -197,9 +203,9 @@ impl<'a> IocpDriver<'a> {
             .backend()
             .inc_cancel_ack_not_found_active();
         let raw = veloq_driver_core::driver::RawCompletion::new(
-            crate::driver::completion::COMP_BACKEND_IOCP,
+            COMP_BACKEND_IOCP,
             CompletionToken::user(token),
-            -(windows_sys::Win32::Foundation::ERROR_NOT_FOUND as i32),
+            -(ERROR_NOT_FOUND as i32),
             0,
         );
         let anomaly = CompletionAnomaly::cancel_ack_target_still_active(
@@ -267,12 +273,9 @@ impl<'a> IocpDriver<'a> {
 
                     if let Some(raw_handle) = raw_handle {
                         let handle = raw_handle.as_handle();
-                        let overlapped_ptr = guard.with_sidecar_mut(|sidecar| {
-                            &mut sidecar.inner as *mut crate::win32::Overlapped
-                        });
-                        match unsafe {
-                            crate::win32::IoCompletionPort::cancel_request(handle, overlapped_ptr)
-                        }? {
+                        let overlapped_ptr =
+                            guard.with_sidecar_mut(|sidecar| &mut sidecar.inner as *mut Overlapped);
+                        match unsafe { IoCompletionPort::cancel_request(handle, overlapped_ptr) }? {
                             CancelRequestResult::Submitted => CancelPerformStatus::Submitted,
                             CancelRequestResult::NotFound => CancelPerformStatus::NotFound,
                         }
@@ -304,12 +307,9 @@ impl<'a> IocpDriver<'a> {
 
                     if let Some(raw_handle) = raw_handle {
                         let handle = raw_handle.as_handle();
-                        let overlapped_ptr = guard.with_sidecar_mut(|sidecar| {
-                            &mut sidecar.inner as *mut crate::win32::Overlapped
-                        });
-                        match unsafe {
-                            crate::win32::IoCompletionPort::cancel_request(handle, overlapped_ptr)
-                        }? {
+                        let overlapped_ptr =
+                            guard.with_sidecar_mut(|sidecar| &mut sidecar.inner as *mut Overlapped);
+                        match unsafe { IoCompletionPort::cancel_request(handle, overlapped_ptr) }? {
                             CancelRequestResult::Submitted => CancelPerformStatus::Submitted,
                             CancelRequestResult::NotFound => CancelPerformStatus::NotFound,
                         }

@@ -15,17 +15,22 @@ use veloq_driver_core::slot::{
     SlotView,
 };
 
-use crate::config::IoFd;
-use crate::driver::{
-    IocpDriver, IocpDriverCompletionDiagnostics, IocpDriverResult, IocpOpRegistry,
-};
-use crate::error::{IocpError, IocpResult, iocp_fallback_event_res};
-use crate::op::{
-    BlockingCompletion, IocpOp, IocpOpPayload, IocpSlotSpec, Slot, SubmissionResult, SubmitContext,
+use crate::{
+    config::IoFd,
+    driver::{
+        IocpDriver, IocpDriverCompletionDiagnostics, IocpDriverResult, IocpOpRegistry,
+        registration::close_registered_owned_fd,
+    },
+    error::{IocpError, IocpResult, iocp_fallback_event_res},
+    op::{
+        BlockingCompletion, IocpOp, IocpOpPayload, IocpSlotSpec, Slot, SubmissionResult,
+        SubmitContext,
+    },
+    win32::{IoCompletionPort, Overlapped},
 };
 
 pub(crate) struct SubmitContextInternal<'a> {
-    port: Arc<crate::win32::IoCompletionPort>,
+    port: Arc<IoCompletionPort>,
     wheel: &'a mut veloq_wheel::Wheel<OpToken>,
     completion_table: &'a SharedCompletionTable<IocpSlotSpec>,
     diagnostics: &'a mut IocpDriverCompletionDiagnostics,
@@ -33,7 +38,7 @@ pub(crate) struct SubmitContextInternal<'a> {
 
 impl<'a> SubmitContextInternal<'a> {
     pub(crate) fn new(
-        port: Arc<crate::win32::IoCompletionPort>,
+        port: Arc<IoCompletionPort>,
         wheel: &'a mut veloq_wheel::Wheel<OpToken>,
         completion_table: &'a SharedCompletionTable<IocpSlotSpec>,
         diagnostics: &'a mut IocpDriverCompletionDiagnostics,
@@ -331,8 +336,7 @@ impl<'a> IocpDriver<'a> {
             .push_ctx("scope", "iocp/driver")
             .attach_note("failed to prepare op slot")?;
 
-        let overlapped =
-            guard.with_sidecar_mut(|sidecar| &mut sidecar.inner as *mut crate::win32::Overlapped);
+        let overlapped = guard.with_sidecar_mut(|sidecar| &mut sidecar.inner as *mut Overlapped);
 
         let mut sub_guard = guard
             .start_submission_with(Some(|slot| {
@@ -347,11 +351,8 @@ impl<'a> IocpDriver<'a> {
         };
 
         let result = if let Some(fd) = close_fd {
-            let close_result = super::registration::close_registered_owned_fd(
-                &mut self.handles,
-                self.rio.state_mut(),
-                fd,
-            );
+            let close_result =
+                close_registered_owned_fd(&mut self.handles, self.rio.state_mut(), fd);
 
             close_result.and_then(|(raw_handle, io_result)| {
                 let completion = BlockingCompletion::new(

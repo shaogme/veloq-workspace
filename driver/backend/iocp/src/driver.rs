@@ -5,34 +5,45 @@ mod polling;
 mod registration;
 mod submission;
 
-pub(crate) const RIO_EVENT_TOKEN: veloq_driver_core::driver::CompletionToken =
-    match veloq_driver_core::driver::CompletionToken::encode_control(3, 0) {
-        Ok(t) => t,
-        Err(_) => panic!("Failed to encode RIO_EVENT_TOKEN"),
-    };
-
-pub(crate) const RIO_EVENT_KEY: usize = RIO_EVENT_TOKEN.raw() as usize;
-pub(crate) type PreInit = crate::win32::IoCompletionPort;
-
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
+use diagweave::prelude::*;
 use tracing::trace;
 
-use crate::diagnostics::IocpCompletionDiagnostics;
-use veloq_driver_core::DriverResult as CoreDriverResult;
-use veloq_driver_core::driver::registry::OpEntry;
-use veloq_driver_core::driver::{
-    CancelRequest, CancelSubmitOutcome, DriveMode, DriveOutcome, Driver,
-    DriverCompletionDiagnostics, DriverSubmitResult, OpToken, RegisterFd, RemoteCancelSender,
-    RemoteWaker, SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
+#[cfg(test)]
+use crate::RegisteredHandle;
+use crate::{
+    config::{IoFd, IocpHandle},
+    diagnostics::IocpCompletionDiagnostics,
+    error::IocpError,
+    ext::Extensions,
+    op::{IocpOp, IocpOpPayload, IocpOpRegistry, IocpSlotSpec, IocpUserPayload, OverlappedEntry},
+    win32::IoCompletionPort,
 };
 
-use diagweave::prelude::*;
+use veloq_buf::heap::ChunkId;
+use veloq_driver_core::{
+    DriverResult as CoreDriverResult,
+    driver::{
+        CancelRequest, CancelSubmitOutcome, CompletionToken, DriveMode, DriveOutcome, Driver,
+        DriverCompletionDiagnostics, DriverSubmitResult, OpToken, RegisterFd, RemoteCancelSender,
+        RemoteWaker, SharedCompletionTable, SharedDriverSlotTable, SubmitStatus, registry::OpEntry,
+    },
+};
 
-use crate::config::{IoFd, IocpHandle};
-use crate::error::IocpError;
-use crate::op::{IocpOp, IocpOpPayload, IocpOpRegistry, IocpSlotSpec, IocpUserPayload};
+use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
+
+#[cfg(feature = "test-hooks")]
+use veloq_driver_core::driver::test_hooks::DriverTestHooks;
+
+pub(crate) const RIO_EVENT_TOKEN: CompletionToken = match CompletionToken::encode_control(3, 0) {
+    Ok(t) => t,
+    Err(_) => panic!("Failed to encode RIO_EVENT_TOKEN"),
+};
+
+pub(crate) const RIO_EVENT_KEY: usize = RIO_EVENT_TOKEN.raw() as usize;
+pub(crate) type PreInit = IoCompletionPort;
 
 pub(crate) type IocpDriverResult<T> = CoreDriverResult<T, IocpError>;
 pub(crate) type IocpDriverCompletionDiagnostics =
@@ -47,7 +58,7 @@ pub use crate::op::IocpOpState;
 pub struct IocpDriver<'a> {
     completion: polling::CompletionPump,
     ops: IocpOpRegistry,
-    extensions: crate::ext::Extensions,
+    extensions: Extensions,
     timer: polling::TimerEngine,
     handles: registration::HandleRegistry,
     remote_cancel_sender: RemoteCancelSender,
@@ -96,10 +107,7 @@ impl<'a> IocpDriver<'a> {
     }
 
     #[cfg(test)]
-    pub(crate) fn debug_registered_file(
-        &self,
-        idx: usize,
-    ) -> Option<&crate::config::RegisteredHandle> {
+    pub(crate) fn debug_registered_file(&self, idx: usize) -> Option<&RegisteredHandle> {
         self.handles.registered_file(idx)
     }
 
@@ -120,10 +128,10 @@ impl<'a> IocpDriver<'a> {
 }
 
 impl<'a> Driver for IocpDriver<'a> {
-    type Op = crate::op::IocpOp;
+    type Op = IocpOp;
     type UP = IocpUserPayload;
     type Raw = IocpHandle;
-    type Sidecar = crate::op::OverlappedEntry;
+    type Sidecar = OverlappedEntry;
     type Completion = usize;
     type Error = IocpError;
     type SlotSpec = IocpSlotSpec;
@@ -187,7 +195,7 @@ impl<'a> Driver for IocpDriver<'a> {
                 IocpError::Internal
                     .to_report()
                     .push_ctx("scope", "iocp/driver")
-                    .set_error_code(windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED as i32)
+                    .set_error_code(ERROR_OPERATION_ABORTED as i32)
                     .attach_note("driver is shutting down"),
                 SubmitStatus::Void,
             );
@@ -265,12 +273,7 @@ impl<'a> Driver for IocpDriver<'a> {
         self.cancel_op_internal(request)
     }
 
-    fn register_chunk(
-        &mut self,
-        id: veloq_buf::heap::ChunkId,
-        ptr: *const u8,
-        len: usize,
-    ) -> IocpDriverResult<()> {
+    fn register_chunk(&mut self, id: ChunkId, ptr: *const u8, len: usize) -> IocpDriverResult<()> {
         IocpDriver::register_chunk(self, id, ptr, len)
             .push_ctx("scope", "iocp/driver")
             .attach_note("register chunk failed")
@@ -293,7 +296,7 @@ impl<'a> Driver for IocpDriver<'a> {
 }
 
 #[cfg(feature = "test-hooks")]
-impl veloq_driver_core::driver::test_hooks::DriverTestHooks for IocpDriver<'_> {
+impl DriverTestHooks for IocpDriver<'_> {
     fn debug_chunk_register_attempts(&self) -> u64 {
         self.rio
             .state()

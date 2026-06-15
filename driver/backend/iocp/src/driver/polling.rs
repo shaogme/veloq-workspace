@@ -11,23 +11,23 @@ use veloq_driver_core::driver::{
 use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotView};
 use veloq_wheel::{TaskId, Wheel, WheelConfig};
 
-use crate::common::{IocpErrorContext, IocpWaker, iocp_msg};
-use crate::error::{IocpError, IocpResult};
-use crate::op::IocpSlotSpec;
+use crate::{
+    common::{IocpErrorContext, IocpWaker, iocp_msg},
+    error::{IocpError, IocpResult},
+    op::{IocpSlotSpec, OverlappedEntry},
+    win32::{IoCompletionPort, Overlapped},
+};
 
 use super::{IocpDriver, IocpDriverResult, RIO_EVENT_KEY, RIO_EVENT_TOKEN};
 
 pub(super) struct CompletionPump {
-    port: Arc<crate::win32::IoCompletionPort>,
+    port: Arc<IoCompletionPort>,
     is_notified: Arc<AtomicBool>,
     table: SharedCompletionTable<IocpSlotSpec>,
 }
 
 impl CompletionPump {
-    pub(super) fn new(
-        port: crate::win32::IoCompletionPort,
-        table: SharedCompletionTable<IocpSlotSpec>,
-    ) -> Self {
+    pub(super) fn new(port: IoCompletionPort, table: SharedCompletionTable<IocpSlotSpec>) -> Self {
         Self {
             port: Arc::new(port),
             is_notified: Arc::new(AtomicBool::new(false)),
@@ -35,11 +35,11 @@ impl CompletionPump {
         }
     }
 
-    pub(super) fn port(&self) -> &crate::win32::IoCompletionPort {
+    pub(super) fn port(&self) -> &IoCompletionPort {
         self.port.as_ref()
     }
 
-    pub(super) fn port_arc(&self) -> Arc<crate::win32::IoCompletionPort> {
+    pub(super) fn port_arc(&self) -> Arc<IoCompletionPort> {
         self.port.clone()
     }
 
@@ -174,7 +174,7 @@ impl<'a> IocpDriver<'a> {
         &mut self,
         bytes: u32,
         key: usize,
-        overlapped: *mut crate::win32::Overlapped,
+        overlapped: *mut Overlapped,
         success: bool,
         error_code: Option<u32>,
     ) -> IocpDriverResult<usize> {
@@ -243,12 +243,12 @@ impl<'a> IocpDriver<'a> {
         &mut self,
         bytes: u32,
         completion_key: usize,
-        overlapped: *mut crate::win32::Overlapped,
+        overlapped: *mut Overlapped,
         success: bool,
         res: i32,
         flags: u32,
     ) -> IocpResult<CompletionEnvelope> {
-        let entry = unsafe { &*(overlapped as *const crate::op::OverlappedEntry) };
+        let entry = unsafe { &*(overlapped as *const OverlappedEntry) };
         let idx = entry.token.index();
         if idx >= self.ops.capacity() {
             error!(
@@ -319,7 +319,7 @@ enum IocpCompletionStatusKind {
 #[inline]
 fn classify_completion_status(
     key: usize,
-    overlapped: *mut crate::win32::Overlapped,
+    overlapped: *mut Overlapped,
     success: bool,
 ) -> IocpCompletionStatusKind {
     if key == RIO_EVENT_KEY {
