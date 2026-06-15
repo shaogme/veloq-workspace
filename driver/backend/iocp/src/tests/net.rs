@@ -25,7 +25,7 @@ use veloq_buf::BufPool;
 use veloq_buf::{NoopRegistrar, PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
 use veloq_driver_core::{
     driver::{CancelRequest, DriveMode, Driver, RegisterFd},
-    op::{Accept, Connect, Recv},
+    op::types::{Accept, Connect, Recv},
 };
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 

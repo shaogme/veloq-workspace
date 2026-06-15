@@ -1,6 +1,11 @@
-use crate::DriverResult;
-use crate::driver::registry::OpRegistry;
-use crate::slot::{self, SlotRegistryExt};
+use crate::{
+    DriverResult,
+    driver::registry::OpRegistry,
+    slot::{
+        InFlightOrphaned, InFlightWaiting, Slot, SlotCompletion, SlotCompletionDiagnostics,
+        SlotError, SlotPayload, SlotRegistryExt, SlotSnapshot, SlotSpec,
+    },
+};
 
 use super::{
     CompletionAnomaly, CompletionAnomalyReason, CompletionBackend, CompletionCleanupGuard,
@@ -12,7 +17,7 @@ use super::{
     unknown_completion_anomaly,
 };
 
-pub type HookResult<Spec, T> = DriverResult<T, slot::SlotError<Spec>>;
+pub type HookResult<Spec, T> = DriverResult<T, SlotError<Spec>>;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CompletionWritePermit {
@@ -67,19 +72,19 @@ pub enum CompletionControl {
 
 pub enum CompletionHookOutcome<Spec, Effect>
 where
-    Spec: slot::SlotSpec,
+    Spec: SlotSpec,
 {
     User {
         event: UserCompletionEvent,
-        payload: slot::SlotPayload<Spec>,
-        detail: Option<DriverResult<slot::SlotCompletion<Spec>, slot::SlotError<Spec>>>,
+        payload: SlotPayload<Spec>,
+        detail: Option<DriverResult<SlotCompletion<Spec>, SlotError<Spec>>>,
         cleanup: CompletionCleanupGuard,
         effect: Effect,
     },
     Lost {
         event: UserCompletionEvent,
         loss_reason: CompletionAnomaly,
-        snapshot: slot::SlotSnapshot,
+        snapshot: SlotSnapshot,
         cleanup: CompletionCleanupGuard,
         effect: Effect,
     },
@@ -101,7 +106,7 @@ where
 
 pub enum CompletionBackendIngressAction<Spec, Effect>
 where
-    Spec: slot::SlotSpec,
+    Spec: SlotSpec,
 {
     RouteUser(UserCompletionEvent),
     Finish(CompletionHookOutcome<Spec, Effect>),
@@ -109,7 +114,7 @@ where
 
 pub trait CompletionBackendHooks<Spec>
 where
-    Spec: slot::SlotSpec,
+    Spec: SlotSpec,
 {
     type BackendIngress;
     type BackendEffect: Default;
@@ -122,14 +127,14 @@ where
     fn complete_waiting(
         &mut self,
         event: UserCompletionEvent,
-        slot: slot::Slot<'_, slot::InFlightWaiting, Spec>,
+        slot: Slot<'_, InFlightWaiting, Spec>,
         source: CompletionSource<'_, Self::BackendIngress>,
     ) -> HookResult<Spec, CompletionHookOutcome<Spec, Self::BackendEffect>>;
 
     fn complete_orphaned(
         &mut self,
         event: UserCompletionEvent,
-        slot: slot::Slot<'_, slot::InFlightOrphaned, Spec>,
+        slot: Slot<'_, InFlightOrphaned, Spec>,
         source: CompletionSource<'_, Self::BackendIngress>,
     ) -> HookResult<Spec, CompletionHookOutcome<Spec, Self::BackendEffect>>;
 
@@ -267,34 +272,34 @@ enum FinalizeAction {
 
 pub trait CompletionFlowExt<Spec>
 where
-    Spec: slot::SlotSpec,
+    Spec: SlotSpec,
 {
     fn accept_completion<Hooks>(
         &mut self,
         table: &SharedCompletionTable<Spec>,
-        diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
+        diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
         hooks: &mut Hooks,
         ingress: CompletionIngress<Hooks::BackendIngress>,
-    ) -> DriverResult<CompletionFlowOutcome, slot::SlotError<Spec>>
+    ) -> DriverResult<CompletionFlowOutcome, SlotError<Spec>>
     where
         Hooks: CompletionBackendHooks<Spec>;
 }
 
 impl<Spec> CompletionFlowExt<Spec> for OpRegistry<Spec>
 where
-    Spec: slot::SlotSpec,
-    slot::SlotPayload<Spec>: Send,
-    slot::SlotError<Spec>: Send,
-    slot::SlotCompletion<Spec>: Send,
-    slot::SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
+    Spec: SlotSpec,
+    SlotPayload<Spec>: Send,
+    SlotError<Spec>: Send,
+    SlotCompletion<Spec>: Send,
+    SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
 {
     fn accept_completion<Hooks>(
         &mut self,
         table: &SharedCompletionTable<Spec>,
-        diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
+        diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
         hooks: &mut Hooks,
         ingress: CompletionIngress<Hooks::BackendIngress>,
-    ) -> DriverResult<CompletionFlowOutcome, slot::SlotError<Spec>>
+    ) -> DriverResult<CompletionFlowOutcome, SlotError<Spec>>
     where
         Hooks: CompletionBackendHooks<Spec>,
     {
@@ -352,36 +357,36 @@ where
 
 trait CompletionFlowOpRegistryExt<Spec>
 where
-    Spec: slot::SlotSpec,
+    Spec: SlotSpec,
 {
     fn accept_user_event<Hooks>(
         &mut self,
         table: &SharedCompletionTable<Spec>,
-        diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
+        diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
         hooks: &mut Hooks,
         event: UserCompletionEvent,
         source: CompletionSource<'_, Hooks::BackendIngress>,
-    ) -> DriverResult<CompletionFlowOutcome, slot::SlotError<Spec>>
+    ) -> DriverResult<CompletionFlowOutcome, SlotError<Spec>>
     where
         Hooks: CompletionBackendHooks<Spec>;
 }
 
 impl<Spec> CompletionFlowOpRegistryExt<Spec> for OpRegistry<Spec>
 where
-    Spec: slot::SlotSpec,
-    slot::SlotPayload<Spec>: Send,
-    slot::SlotError<Spec>: Send,
-    slot::SlotCompletion<Spec>: Send,
-    slot::SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
+    Spec: SlotSpec,
+    SlotPayload<Spec>: Send,
+    SlotError<Spec>: Send,
+    SlotCompletion<Spec>: Send,
+    SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
 {
     fn accept_user_event<Hooks>(
         &mut self,
         table: &SharedCompletionTable<Spec>,
-        diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
+        diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
         hooks: &mut Hooks,
         event: UserCompletionEvent,
         source: CompletionSource<'_, Hooks::BackendIngress>,
-    ) -> DriverResult<CompletionFlowOutcome, slot::SlotError<Spec>>
+    ) -> DriverResult<CompletionFlowOutcome, SlotError<Spec>>
     where
         Hooks: CompletionBackendHooks<Spec>,
     {
@@ -433,17 +438,17 @@ where
 fn finish_hook_outcome<Spec, Hooks>(
     registry: &mut OpRegistry<Spec>,
     table: &SharedCompletionTable<Spec>,
-    diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
+    diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
     hooks: &mut Hooks,
     outcome: CompletionHookOutcome<Spec, Hooks::BackendEffect>,
     finalize: Option<FinalizeAction>,
-) -> DriverResult<CompletionFlowOutcome, slot::SlotError<Spec>>
+) -> DriverResult<CompletionFlowOutcome, SlotError<Spec>>
 where
-    Spec: slot::SlotSpec,
-    slot::SlotPayload<Spec>: Send,
-    slot::SlotError<Spec>: Send,
-    slot::SlotCompletion<Spec>: Send,
-    slot::SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
+    Spec: SlotSpec,
+    SlotPayload<Spec>: Send,
+    SlotError<Spec>: Send,
+    SlotCompletion<Spec>: Send,
+    SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
     Hooks: CompletionBackendHooks<Spec>,
 {
     match outcome {
@@ -511,15 +516,15 @@ where
 
 fn record_user_completion<Spec>(
     table: &SharedCompletionTable<Spec>,
-    diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
+    diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
     packet: CompletionPacket<Spec>,
 ) -> RecordCompletionOutcome
 where
-    Spec: slot::SlotSpec,
-    slot::SlotPayload<Spec>: Send,
-    slot::SlotError<Spec>: Send,
-    slot::SlotCompletion<Spec>: Send,
-    slot::SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
+    Spec: SlotSpec,
+    SlotPayload<Spec>: Send,
+    SlotError<Spec>: Send,
+    SlotCompletion<Spec>: Send,
+    SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
 {
     match table.record_completion(CompletionWritePermit::new(), packet) {
         RecordCompletionResult::Recorded(outcome) => outcome,
@@ -532,17 +537,17 @@ where
 
 fn record_lost_completion<Spec>(
     table: &SharedCompletionTable<Spec>,
-    diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
+    diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
     event: UserCompletionEvent,
     anomaly: CompletionAnomaly,
     cleanup: CompletionCleanupGuard,
 ) -> RecordCompletionOutcome
 where
-    Spec: slot::SlotSpec,
-    slot::SlotPayload<Spec>: Send,
-    slot::SlotError<Spec>: Send,
-    slot::SlotCompletion<Spec>: Send,
-    slot::SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
+    Spec: SlotSpec,
+    SlotPayload<Spec>: Send,
+    SlotError<Spec>: Send,
+    SlotCompletion<Spec>: Send,
+    SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
 {
     record_user_completion::<Spec>(
         table,
@@ -553,12 +558,12 @@ where
 
 fn finish_waiting_if_needed<Spec>(
     registry: &mut OpRegistry<Spec>,
-    diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
+    diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
     finalize: Option<FinalizeAction>,
     fallback_event: UserCompletionEvent,
 ) where
-    Spec: slot::SlotSpec,
-    slot::SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
+    Spec: SlotSpec,
+    SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
 {
     let event = match finalize {
         Some(FinalizeAction::Waiting(event)) => event,
@@ -579,11 +584,11 @@ fn finish_waiting_if_needed<Spec>(
 
 fn finish_orphaned<Spec>(
     registry: &mut OpRegistry<Spec>,
-    diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
+    diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
     event: UserCompletionEvent,
 ) where
-    Spec: slot::SlotSpec,
-    slot::SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
+    Spec: SlotSpec,
+    SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
 {
     let raw = event.raw();
     let _ = finalize_orphaned_checked(
@@ -598,12 +603,12 @@ fn finish_orphaned<Spec>(
 
 fn finish_corrupt<Spec>(
     registry: &mut OpRegistry<Spec>,
-    diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
-    snapshot: slot::SlotSnapshot,
+    diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
+    snapshot: SlotSnapshot,
     raw: RawCompletion,
 ) where
-    Spec: slot::SlotSpec,
-    slot::SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
+    Spec: SlotSpec,
+    SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
 {
     let _ = finalize_corrupt_checked(
         registry,
@@ -617,12 +622,12 @@ fn finish_corrupt<Spec>(
 
 fn finish_anomaly<Spec>(
     registry: &mut OpRegistry<Spec>,
-    diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
+    diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
     anomaly: CompletionAnomaly,
 ) -> CompletionFlowOutcome
 where
-    Spec: slot::SlotSpec,
-    slot::SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
+    Spec: SlotSpec,
+    SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
 {
     diagnostics.record_anomaly(&anomaly);
     if should_finalize_corrupt_anomaly(&anomaly)

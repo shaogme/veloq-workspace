@@ -1,17 +1,16 @@
-use crate::DriverResult;
-use crate::slot;
+use crate::{DriverResult, slot::SlotSpec};
 
 use super::{
     CompletionAnomaly, CompletionCleanupGuard, CompletionEvent, DriverCompletionDiagnostics,
     OpToken, UserCompletionEvent,
 };
 
-pub struct CompletionPacket<Spec: slot::SlotSpec> {
+pub struct CompletionPacket<Spec: SlotSpec> {
     pub event: UserCompletionEvent,
     pub input: CompletionInput<Spec>,
 }
 
-pub struct UserCompletion<Spec: slot::SlotSpec> {
+pub struct UserCompletion<Spec: SlotSpec> {
     pub payload: Spec::UserPayload,
     pub detail: Option<DriverResult<Spec::Completion, Spec::Error>>,
     pub cleanup: CompletionCleanupGuard,
@@ -22,12 +21,12 @@ pub struct CompletionLoss {
     pub cleanup: CompletionCleanupGuard,
 }
 
-pub enum CompletionInput<Spec: slot::SlotSpec> {
+pub enum CompletionInput<Spec: SlotSpec> {
     User(UserCompletion<Spec>),
     Lost(CompletionLoss),
 }
 
-impl<Spec: slot::SlotSpec> CompletionInput<Spec> {
+impl<Spec: SlotSpec> CompletionInput<Spec> {
     #[inline]
     pub fn cleanup_mut(&mut self) -> &mut CompletionCleanupGuard {
         match self {
@@ -45,7 +44,7 @@ impl<Spec: slot::SlotSpec> CompletionInput<Spec> {
     }
 }
 
-impl<Spec: slot::SlotSpec> CompletionPacket<Spec> {
+impl<Spec: SlotSpec> CompletionPacket<Spec> {
     #[inline]
     pub fn user_event(
         event: UserCompletionEvent,
@@ -105,14 +104,14 @@ impl<Spec: slot::SlotSpec> CompletionPacket<Spec> {
     }
 }
 
-pub struct CompletionRecord<Spec: slot::SlotSpec> {
+pub struct CompletionRecord<Spec: SlotSpec> {
     pub event: UserCompletionEvent,
     pub payload: Spec::UserPayload,
     pub detail: Option<DriverResult<Spec::Completion, Spec::Error>>,
     pub cleanup: CompletionCleanupGuard,
 }
 
-impl<Spec: slot::SlotSpec> CompletionRecord<Spec> {
+impl<Spec: SlotSpec> CompletionRecord<Spec> {
     #[inline]
     pub fn disarm_cleanup(&mut self) -> bool {
         self.cleanup.disarm()
@@ -120,7 +119,7 @@ impl<Spec: slot::SlotSpec> CompletionRecord<Spec> {
 }
 
 #[inline]
-pub(super) fn run_rejected_cleanup<Spec: slot::SlotSpec>(
+pub(super) fn run_rejected_cleanup<Spec: SlotSpec>(
     diagnostics: &DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
     mut packet: CompletionPacket<Spec>,
 ) {

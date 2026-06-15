@@ -1,13 +1,12 @@
 use crate::slot;
-use std::sync::Arc;
-use std::task::Waker;
+use std::{sync::Arc, task::Waker};
 use veloq_shim::atomic::Ordering;
 
-use super::types::CompletionMutationOutcome;
 use super::{
     CompletionAnomaly, CompletionCleanupGuard, CompletionInput, CompletionPacket, CompletionRecord,
-    CompletionToken, CompletionWritePermit, OpToken, RecordCompletionOutcome,
-    RecordCompletionResult, UserCompletionEvent,
+    CompletionToken, CompletionWritePermit, DriverCompletionDiagnostics,
+    DriverCompletionDiagnosticsBackend, OpToken, RecordCompletionOutcome, RecordCompletionResult,
+    UserCompletionEvent, run_completion_cleanup, types::CompletionMutationOutcome,
 };
 
 pub type SharedCompletionTable<Spec> = Arc<dyn CompletionAccess<Spec>>;
@@ -61,11 +60,11 @@ pub const CELL_STATE_BUSY: u8 = 4;
 
 #[inline]
 fn recorded_completion<Spec: slot::SlotSpec>(
-    diagnostics: &super::DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
+    diagnostics: &DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
     outcome: RecordCompletionOutcome,
 ) -> RecordCompletionResult<Spec>
 where
-    Spec::CompletionDiagnostics: super::DriverCompletionDiagnosticsBackend,
+    Spec::CompletionDiagnostics: DriverCompletionDiagnosticsBackend,
 {
     diagnostics.record_completion_outcome(&outcome);
     RecordCompletionResult::Recorded(outcome)
@@ -73,12 +72,12 @@ where
 
 #[inline]
 fn rejected_completion<Spec: slot::SlotSpec>(
-    diagnostics: &super::DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
+    diagnostics: &DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
     outcome: RecordCompletionOutcome,
     packet: CompletionPacket<Spec>,
 ) -> RecordCompletionResult<Spec>
 where
-    Spec::CompletionDiagnostics: super::DriverCompletionDiagnosticsBackend,
+    Spec::CompletionDiagnostics: DriverCompletionDiagnosticsBackend,
 {
     diagnostics.record_completion_outcome(&outcome);
     RecordCompletionResult::Rejected {
@@ -151,11 +150,11 @@ fn mutation_non_active(
 
 #[inline]
 fn recorded_mutation<B>(
-    diagnostics: &super::DriverCompletionDiagnostics<B>,
+    diagnostics: &DriverCompletionDiagnostics<B>,
     outcome: CompletionMutationOutcome,
 ) -> CompletionMutationOutcome
 where
-    B: super::DriverCompletionDiagnosticsBackend,
+    B: DriverCompletionDiagnosticsBackend,
 {
     if let Some(anomaly) = outcome.anomaly() {
         diagnostics.record_anomaly(anomaly);
@@ -165,10 +164,10 @@ where
 
 #[inline]
 fn run_discarded_record_cleanup<Spec: slot::SlotSpec>(
-    diagnostics: &super::DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
+    diagnostics: &DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
     record_data: slot::CompletionData<Spec>,
 ) where
-    Spec::CompletionDiagnostics: super::DriverCompletionDiagnosticsBackend,
+    Spec::CompletionDiagnostics: DriverCompletionDiagnosticsBackend,
 {
     match record_data {
         slot::CompletionData::User {
@@ -179,13 +178,13 @@ fn run_discarded_record_cleanup<Spec: slot::SlotSpec>(
         } => {
             drop(payload);
             drop(detail);
-            let _ = super::run_completion_cleanup(diagnostics, &mut cleanup);
+            let _ = run_completion_cleanup(diagnostics, &mut cleanup);
         }
         slot::CompletionData::Lost {
             anomaly: _,
             mut cleanup,
         } => {
-            let _ = super::run_completion_cleanup(diagnostics, &mut cleanup);
+            let _ = run_completion_cleanup(diagnostics, &mut cleanup);
         }
         slot::CompletionData::Empty => {}
     }
@@ -406,7 +405,7 @@ where
             }),
             slot::CompletionData::Lost { anomaly, cleanup } => {
                 let mut cleanup = cleanup;
-                let _ = super::run_completion_cleanup(&self.diagnostics, &mut cleanup);
+                let _ = run_completion_cleanup(&self.diagnostics, &mut cleanup);
                 PollRecordResult::Unavailable(anomaly)
             }
             slot::CompletionData::Empty => {

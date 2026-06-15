@@ -4,9 +4,11 @@ pub use anomaly::{
     CompletionAnomaly, CompletionAnomalyReason, CompletionBackend, CompletionMutationOutcome,
 };
 
-use crate::slot;
-use crate::{DriverCoreError, DriverResult};
-use std::sync::Arc;
+use crate::{DriverCoreError, DriverResult, slot};
+use std::{
+    fmt::{Debug, Formatter, Result},
+    sync::Arc,
+};
 use veloq_shim::atomic::{AtomicU64, Ordering};
 
 use super::CompletionPacket;
@@ -32,8 +34,8 @@ impl CompletionCleanup {
     }
 }
 
-impl std::fmt::Debug for CompletionCleanup {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for CompletionCleanup {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         f.debug_struct("CompletionCleanup").finish_non_exhaustive()
     }
 }

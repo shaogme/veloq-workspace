@@ -1,19 +1,23 @@
-use std::error::Error;
-use std::sync::Arc;
 use std::{
+    error::Error,
     future::Future,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 use tracing::trace;
 
-use crate::driver::{
-    CancelRequest, CompletionAnomaly, CompletionAnomalyReason, CompletionRecord, CompletionToken,
-    CompletionValue, Driver, DriverSubmitResult, OpToken, PlatformOp, PollRecordResult,
-    RemoteCancelSender, RemoteWaker, SharedCompletionTable, SubmitStatus,
+use crate::{
+    DriverCoreError, DriverError, DriverReport, DriverResult,
+    driver::{
+        CancelRequest, CompletionAccess, CompletionAnomaly, CompletionAnomalyReason,
+        CompletionRecord, CompletionToken, CompletionValue, Driver, DriverSubmitResult, OpToken,
+        PlatformOp, PollRecordResult, RemoteCancelSender, RemoteWaker, SharedCompletionTable,
+        SubmitStatus,
+    },
+    op::{DriverProvider, IntoPlatformOp, Op},
+    slot::SlotSpec,
 };
-use crate::op::{IntoPlatformOp, Op};
-use crate::{DriverCoreError, DriverError, DriverReport, DriverResult};
 
 use diagweave::prelude::*;
 
@@ -209,7 +213,7 @@ pub(crate) fn completion_record_to_result<T, O, Spec>(
     record: CompletionRecord<Spec>,
 ) -> Poll<OpResult<T::Output, Spec::Error, T::Completion>>
 where
-    Spec: crate::slot::SlotSpec,
+    Spec: SlotSpec,
     O: PlatformOp,
     T: IntoPlatformOp<
             O,
@@ -218,7 +222,7 @@ where
             Error = Spec::Error,
         >,
     Spec::Error: DriverError,
-    Spec::Completion: crate::driver::CompletionValue,
+    Spec::Completion: CompletionValue,
 {
     let CompletionRecord {
         event,
@@ -242,11 +246,11 @@ where
 
 #[inline]
 pub(crate) fn poll_completion_table_once<T, O, Spec>(
-    table: &dyn crate::driver::CompletionAccess<Spec>,
+    table: &dyn CompletionAccess<Spec>,
     token: OpToken,
 ) -> Poll<OpResult<T::Output, Spec::Error, T::Completion>>
 where
-    Spec: crate::slot::SlotSpec,
+    Spec: SlotSpec,
     O: PlatformOp,
     T: IntoPlatformOp<
             O,
@@ -255,7 +259,7 @@ where
             Error = Spec::Error,
         >,
     Spec::Error: DriverError,
-    Spec::Completion: crate::driver::CompletionValue,
+    Spec::Completion: CompletionValue,
 {
     match table.try_take_record(token) {
         PollRecordResult::Ready(record) => completion_record_to_result::<T, O, Spec>(record),
@@ -275,9 +279,9 @@ type DetachedOpMarker<T, Spec> = (T, Spec);
 /// A Future representing a detached operation.
 pub struct DetachedOp<T, Spec>
 where
-    Spec: crate::slot::SlotSpec,
+    Spec: SlotSpec,
     Spec::Error: DriverError,
-    Spec::Completion: crate::driver::CompletionValue,
+    Spec::Completion: CompletionValue,
     T: IntoPlatformOp<
             Spec::Op,
             DriverCompletion = Spec::Completion,
@@ -296,9 +300,9 @@ where
 
 unsafe impl<T, Spec> std::marker::Send for DetachedOp<T, Spec>
 where
-    Spec: crate::slot::SlotSpec,
+    Spec: SlotSpec,
     Spec::Error: DriverError,
-    Spec::Completion: crate::driver::CompletionValue,
+    Spec::Completion: CompletionValue,
     T: IntoPlatformOp<
             Spec::Op,
             DriverCompletion = Spec::Completion,
@@ -310,9 +314,9 @@ where
 
 impl<T, Spec> Drop for DetachedOp<T, Spec>
 where
-    Spec: crate::slot::SlotSpec,
+    Spec: SlotSpec,
     Spec::Error: DriverError,
-    Spec::Completion: crate::driver::CompletionValue,
+    Spec::Completion: CompletionValue,
     T: IntoPlatformOp<
             Spec::Op,
             DriverCompletion = Spec::Completion,
@@ -339,9 +343,9 @@ where
 
 impl<T, Spec> Future for DetachedOp<T, Spec>
 where
-    Spec: crate::slot::SlotSpec,
+    Spec: SlotSpec,
     Spec::Error: DriverError,
-    Spec::Completion: crate::driver::CompletionValue,
+    Spec::Completion: CompletionValue,
     T: IntoPlatformOp<
             Spec::Op,
             DriverCompletion = Spec::Completion,
@@ -390,7 +394,7 @@ pub enum LocalState {
 /// A Future wrapper for asynchronous IO operations executed locally.
 pub struct LocalOp<'a, T, P>
 where
-    P: crate::op::DriverProvider,
+    P: DriverProvider,
     T: IntoPlatformOp<
             P::Op,
             DriverCompletion = P::Completion,
@@ -407,7 +411,7 @@ where
 
 impl<'a, T, P> LocalOp<'a, T, P>
 where
-    P: crate::op::DriverProvider,
+    P: DriverProvider,
     T: IntoPlatformOp<
             P::Op,
             DriverCompletion = P::Completion,
@@ -428,7 +432,7 @@ where
 
 impl<'a, T, P> Future for LocalOp<'a, T, P>
 where
-    P: crate::op::DriverProvider,
+    P: DriverProvider,
     T: IntoPlatformOp<
             P::Op,
             DriverCompletion = P::Completion,
@@ -599,7 +603,7 @@ where
 
 impl<'a, T, P> Drop for LocalOp<'a, T, P>
 where
-    P: crate::op::DriverProvider,
+    P: DriverProvider,
     T: IntoPlatformOp<
             P::Op,
             DriverCompletion = P::Completion,
@@ -619,7 +623,7 @@ where
     }
 }
 
-pub trait OpSubmitter<'a, P: crate::op::DriverProvider>: Clone + std::marker::Send + Sync {
+pub trait OpSubmitter<'a, P: DriverProvider>: Clone + std::marker::Send + Sync {
     type Future<
         T: IntoPlatformOp<P::Op, DriverCompletion = P::Completion, ErasedPayload = P::UP, Error = P::Error>
             + std::marker::Send,
@@ -657,7 +661,7 @@ impl<P> Default for LocalSubmitter<P> {
     }
 }
 
-impl<'a, P: crate::op::DriverProvider> OpSubmitter<'a, P> for LocalSubmitter<P> {
+impl<'a, P: DriverProvider> OpSubmitter<'a, P> for LocalSubmitter<P> {
     type Future<
         T: IntoPlatformOp<
                 P::Op,
@@ -700,7 +704,7 @@ impl Default for DetachedSubmitter {
     }
 }
 
-impl<'a, P: crate::op::DriverProvider> OpSubmitter<'a, P> for DetachedSubmitter {
+impl<'a, P: DriverProvider> OpSubmitter<'a, P> for DetachedSubmitter {
     type Future<
         T: IntoPlatformOp<
                 P::Op,

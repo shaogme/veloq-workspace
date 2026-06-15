@@ -3,38 +3,39 @@ use std::future::Future;
 use crate::SockAddrStorage;
 
 pub type IoFd = veloq_driver_core::IoFd;
-pub type ReadRaw<H> = veloq_driver_core::op::ReadRaw<H>;
-pub type WriteRaw<H> = veloq_driver_core::op::WriteRaw<H>;
-pub type FsyncRaw<H> = veloq_driver_core::op::FsyncRaw<H>;
-pub type SyncFileRangeRaw<H> = veloq_driver_core::op::SyncFileRangeRaw<H>;
-pub type FallocateRaw<H> = veloq_driver_core::op::FallocateRaw<H>;
+pub type ReadRaw<H> = veloq_driver_core::op::types::ReadRaw<H>;
+pub type WriteRaw<H> = veloq_driver_core::op::types::WriteRaw<H>;
+pub type FsyncRaw<H> = veloq_driver_core::op::types::FsyncRaw<H>;
+pub type SyncFileRangeRaw<H> = veloq_driver_core::op::types::SyncFileRangeRaw<H>;
+pub type FallocateRaw<H> = veloq_driver_core::op::types::FallocateRaw<H>;
 
 #[cfg(unix)]
 type FileRawHandle = veloq_driver_uring::UringRawHandle;
 #[cfg(windows)]
 type FileRawHandle = veloq_driver_iocp::IocpHandle;
 
-pub type FileSyncFileRangeRaw = veloq_driver_core::op::SyncFileRangeRaw<FileRawHandle>;
-pub type ReadFixed = veloq_driver_core::op::ReadFixed;
-pub type WriteFixed = veloq_driver_core::op::WriteFixed;
-pub type Recv = veloq_driver_core::op::Recv;
-pub type Send = veloq_driver_core::op::Send;
-pub type UdpRecv = veloq_driver_core::op::UdpRecv;
-pub type UdpSend = veloq_driver_core::op::UdpSend;
-pub type UdpConnect = veloq_driver_core::op::UdpConnect<SockAddrStorage>;
-pub type Connect = veloq_driver_core::op::Connect<SockAddrStorage>;
-pub type Close = veloq_driver_core::op::Close;
-pub type Fsync = veloq_driver_core::op::Fsync;
-pub type Wakeup = veloq_driver_core::op::Wakeup;
-pub type Accept = veloq_driver_core::op::Accept<SockAddrStorage>;
-pub type SendTo = veloq_driver_core::op::SendTo;
-pub type SyncFileRange = veloq_driver_core::op::SyncFileRange;
-pub type Fallocate = veloq_driver_core::op::Fallocate;
-pub type UdpRecvFrom = veloq_driver_core::op::UdpRecvFrom;
+pub type FileSyncFileRangeRaw = veloq_driver_core::op::types::SyncFileRangeRaw<FileRawHandle>;
+pub type ReadFixed = veloq_driver_core::op::types::ReadFixed;
+pub type WriteFixed = veloq_driver_core::op::types::WriteFixed;
+pub type Recv = veloq_driver_core::op::types::Recv;
+pub type Send = veloq_driver_core::op::types::Send;
+pub type UdpRecv = veloq_driver_core::op::types::UdpRecv;
+pub type UdpSend = veloq_driver_core::op::types::UdpSend;
+pub type UdpConnect = veloq_driver_core::op::types::UdpConnect<SockAddrStorage>;
+pub type Connect = veloq_driver_core::op::types::Connect<SockAddrStorage>;
+pub type Close = veloq_driver_core::op::types::Close;
+pub type Fsync = veloq_driver_core::op::types::Fsync;
+pub type Wakeup = veloq_driver_core::op::types::Wakeup;
+pub type Accept = veloq_driver_core::op::types::Accept<SockAddrStorage>;
+pub type SendTo = veloq_driver_core::op::types::SendTo;
+pub type SyncFileRange = veloq_driver_core::op::types::SyncFileRange;
+pub type Fallocate = veloq_driver_core::op::types::Fallocate;
+pub type UdpRecvFrom = veloq_driver_core::op::types::UdpRecvFrom;
 
 pub use veloq_driver_core::op::{
     DetachedOp, DetachedSubmitter, DriverProvider, IntoPlatformOp, LocalSubmitter, Op, OpKind,
-    OpLifecycle, OpResult, Open, Timeout, UdpRecvPacket, UdpRecvPacketBuf,
+    OpLifecycle, OpResult,
+    types::{Open, Timeout, UdpRecvPacket, UdpRecvPacketBuf},
 };
 
 pub type LocalOp<'a, T, P> = veloq_driver_core::op::LocalOp<'a, T, P>;

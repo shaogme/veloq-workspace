@@ -17,7 +17,7 @@ use std::{
 use veloq_buf::NoopRegistrar;
 use veloq_driver_core::{
     driver::{Driver, DriverSubmitResult, RegisterFd, SubmitStatus},
-    op::{Close, Fsync, IntoPlatformOp},
+    op::{IntoPlatformOp, types::*},
 };
 use windows_sys::Win32::Networking::WinSock::{WSACleanup, WSADATA, WSAStartup};
 

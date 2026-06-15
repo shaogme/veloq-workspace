@@ -1,6 +1,7 @@
-use crate::driver::DriverCompletionDiagnostics;
-use crate::slot::core::SlotData;
-use crate::slot::{SlotCompletion, SlotCompletionDiagnostics, SlotError, SlotSpec};
+use crate::{
+    driver::DriverCompletionDiagnostics,
+    slot::{SlotCompletion, SlotCompletionDiagnostics, SlotError, SlotSpec, core::SlotData},
+};
 use crossbeam_utils::CachePadded;
 use veloq_shim::atomic::{AtomicUsize, Ordering};
 

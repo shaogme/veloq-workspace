@@ -37,15 +37,17 @@ use crate::{
 use veloq_driver_core::{
     driver::{CompletionCleanupGuard, CompletionToken, OpToken, PlatformOp},
     op::{
-        Accept as AcceptBase, Close as CloseBase, Connect as ConnectBase,
-        Fallocate as FallocateBase, FallocateRaw as FallocateRawBase, Fsync as FsyncBase,
-        FsyncRaw as FsyncRawBase, IntoPlatformOp, OpCompletion, OpKind, Open as OpenBase,
-        ReadFixed as ReadFixedBase, ReadRaw as ReadRawBase, Recv as RecvBase, Send as OpSendBase,
-        SendTo as SendToBase, SyncFileRange as SyncFileRangeBase,
-        SyncFileRangeRaw as SyncFileRangeRawBase, Timeout as TimeoutBase,
-        UdpConnect as UdpConnectBase, UdpRecv as UdpRecvBase, UdpRecvFrom as UdpRecvFromBase,
-        UdpSend as UdpSendBase, Wakeup as WakeupBase, WriteFixed as WriteFixedBase,
-        WriteRaw as WriteRawBase,
+        IntoPlatformOp, OpCompletion,
+        types::{
+            Accept as AcceptBase, Close as CloseBase, Connect as ConnectBase,
+            Fallocate as FallocateBase, FallocateRaw as FallocateRawBase, Fsync as FsyncBase,
+            FsyncRaw as FsyncRawBase, OpKind, Open as OpenBase, ReadFixed as ReadFixedBase,
+            ReadRaw as ReadRawBase, Recv as RecvBase, Send as OpSendBase, SendTo as SendToBase,
+            SyncFileRange as SyncFileRangeBase, SyncFileRangeRaw as SyncFileRangeRawBase,
+            Timeout as TimeoutBase, UdpConnect as UdpConnectBase, UdpRecv as UdpRecvBase,
+            UdpRecvFrom as UdpRecvFromBase, UdpSend as UdpSendBase, Wakeup as WakeupBase,
+            WriteFixed as WriteFixedBase, WriteRaw as WriteRawBase,
+        },
     },
 };
 

@@ -1,11 +1,18 @@
 use super::{SlotCompletion, SlotError, SlotPayload, SlotSidecarData, SlotSpec};
-use crate::DriverResult;
-use crate::driver::{CompletionAnomaly, CompletionCleanupGuard, UserCompletionEvent};
+use crate::{
+    DriverResult,
+    driver::{CompletionAnomaly, CompletionCleanupGuard, UserCompletionEvent},
+};
 use bilge::prelude::*;
-use std::marker::PhantomData;
+use std::{
+    fmt::{self, Debug},
+    marker::PhantomData,
+};
 use veloq_atomic_waker::AtomicWaker;
-use veloq_shim::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use veloq_shim::sync::Mutex;
+use veloq_shim::{
+    atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    sync::Mutex,
+};
 
 #[bitsize(8)]
 #[derive(FromBits, Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,13 +170,13 @@ impl<Spec: SlotSpec> Default for CompletionData<Spec> {
     }
 }
 
-impl<Spec: SlotSpec> std::fmt::Debug for CompletionData<Spec>
+impl<Spec: SlotSpec> fmt::Debug for CompletionData<Spec>
 where
-    SlotPayload<Spec>: std::fmt::Debug,
-    SlotCompletion<Spec>: std::fmt::Debug,
-    SlotError<Spec>: std::fmt::Debug,
+    SlotPayload<Spec>: fmt::Debug,
+    SlotCompletion<Spec>: fmt::Debug,
+    SlotError<Spec>: fmt::Debug,
 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => f.write_str("Empty"),
             Self::User {

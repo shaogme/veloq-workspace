@@ -14,7 +14,7 @@ use veloq_buf::{
 };
 use veloq_driver_core::{
     driver::{CancelRequest, Driver, RegisterFd},
-    op::{SendTo, UdpRecvFrom},
+    op::types::{SendTo, UdpRecvFrom},
 };
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 

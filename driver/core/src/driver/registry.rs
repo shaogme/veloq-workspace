@@ -1,10 +1,12 @@
-use crate::DriverResult;
-use crate::driver::OpToken;
-use crate::slot::{
-    SlotCompletion, SlotEntry, SlotError, SlotOp, SlotPayload, SlotPlatformData, SlotSidecarData,
-    SlotSpec, SlotState, SlotStorage, SlotTable,
+use crate::{
+    DriverResult,
+    driver::OpToken,
+    slot::{
+        SlotCompletion, SlotEntry, SlotError, SlotOp, SlotPayload, SlotPlatformData,
+        SlotSidecarData, SlotSnapshot, SlotSpec, SlotState, SlotStorage, SlotTable,
+    },
 };
-use std::sync::Arc;
+use std::{mem, sync::Arc};
 use veloq_shim::atomic::Ordering;
 
 pub type RegistryOp<T> = SlotOp<T>;
@@ -121,7 +123,7 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
 
             let new_gen = slot.generation(Ordering::Relaxed).wrapping_add(1);
             slot.reset(new_gen);
-            slot.set_state(crate::slot::SlotState::Reserved, Ordering::Release);
+            slot.set_state(SlotState::Reserved, Ordering::Release);
 
             self.local[idx].op = None;
             self.local[idx].entry.platform_data = data;
@@ -255,7 +257,7 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
     fn remove_at_index(&mut self, user_data: usize) -> OpEntry<RegistryPlatformData<Spec>> {
         let local = &mut self.local[user_data];
         let _ = local.op.take();
-        let data = std::mem::take(&mut local.entry.platform_data);
+        let data = mem::take(&mut local.entry.platform_data);
         local.storage.reset();
         self.shared.slots[user_data].free();
         self.shared.push_free(user_data);
@@ -288,7 +290,7 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
     fn recycle_at_index(&mut self, user_data: usize, generation: u32) {
         let local = &mut self.local[user_data];
         let _ = local.op.take();
-        let _ = std::mem::take(&mut local.entry.platform_data);
+        let _ = mem::take(&mut local.entry.platform_data);
         local.storage.reset();
 
         if self.shared.slots[user_data].state(Ordering::Acquire) == SlotState::InFlightReady {
@@ -332,7 +334,7 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
     #[inline]
     pub fn finalize_corrupt_slot(
         &mut self,
-        snapshot: crate::slot::SlotSnapshot,
+        snapshot: SlotSnapshot,
     ) -> Option<OpEntry<RegistryPlatformData<Spec>>> {
         self.remove(OpToken::from_registry_parts(snapshot.index, snapshot.generation).ok()?)
     }
@@ -340,7 +342,7 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
     pub fn get_page_slice(&self, page_idx: usize) -> Option<(*const u8, usize)> {
         if page_idx == 0 {
             let ptr = self.local.as_ptr() as *const u8;
-            let len = std::mem::size_of_val(&*self.local);
+            let len = mem::size_of_val(&*self.local);
             Some((ptr, len))
         } else {
             None

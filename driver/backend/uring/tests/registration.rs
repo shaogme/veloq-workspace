@@ -6,7 +6,10 @@ use veloq_driver_core::driver::{
     CompletionRecord, CompletionValue, DriveMode, Driver, DriverSubmitResult, PollRecordResult,
     RegisterFd, SubmitStatus,
 };
-use veloq_driver_core::op::{Close, Fsync, IntoPlatformOp};
+use veloq_driver_core::op::{
+    IntoPlatformOp,
+    types::{Close, Fsync},
+};
 use veloq_driver_uring::{
     IoFd, OwnedRawHandle, RawHandle, UringConfig, UringDriver, UringError, UringOp, UringRawHandle,
     UringResult, UringUserPayload,

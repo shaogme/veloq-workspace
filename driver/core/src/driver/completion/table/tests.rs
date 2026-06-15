@@ -1,14 +1,19 @@
 use super::*;
-use crate::DriverCoreError;
-use crate::driver::OpToken;
-use crate::driver::PlatformOp;
-use crate::driver::registry::OpRegistry;
-use crate::driver::{
-    CompletionAnomalyReason, CompletionBackend, CompletionBackendHooks, CompletionCleanup,
-    CompletionControl, CompletionEnvelope, CompletionFlowExt, CompletionFlowOutcome,
-    CompletionHookOutcome, CompletionIngress, CompletionSource,
+use std::task::Waker;
+
+use crate::{
+    DriverCoreError,
+    driver::{
+        CompletionAnomalyReason, CompletionBackend, CompletionBackendHooks, CompletionCleanup,
+        CompletionControl, CompletionEnvelope, CompletionFlowExt, CompletionFlowOutcome,
+        CompletionHookOutcome, CompletionIngress, CompletionSource, HookResult, OpToken,
+        PlatformOp, registry::OpRegistry,
+    },
+    slot::{
+        self, CheckedSlotView, InFlightOrphaned, InFlightWaiting, SlotRegistryExt, SlotState,
+        SlotView,
+    },
 };
-use crate::slot::{CheckedSlotView, SlotRegistryExt, SlotView};
 use diagweave::prelude::*;
 use veloq_shim::atomic::Ordering;
 
@@ -51,22 +56,16 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
     fn handle_control(
         &mut self,
         _control: CompletionControl,
-    ) -> crate::driver::HookResult<
-        DummySlotSpec,
-        CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>,
-    > {
+    ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>> {
         Ok(CompletionHookOutcome::Ignore { effect: () })
     }
 
     fn complete_waiting(
         &mut self,
         event: UserCompletionEvent,
-        slot: slot::Slot<'_, slot::InFlightWaiting, DummySlotSpec>,
+        slot: slot::Slot<'_, InFlightWaiting, DummySlotSpec>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> crate::driver::HookResult<
-        DummySlotSpec,
-        CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>,
-    > {
+    ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>> {
         if let Some(loss_reason) = self.loss_reason.take() {
             let snapshot = slot.snapshot();
             let mut completed = slot.complete();
@@ -98,12 +97,9 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
     fn complete_orphaned(
         &mut self,
         _event: UserCompletionEvent,
-        slot: slot::Slot<'_, slot::InFlightOrphaned, DummySlotSpec>,
+        slot: slot::Slot<'_, InFlightOrphaned, DummySlotSpec>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> crate::driver::HookResult<
-        DummySlotSpec,
-        CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>,
-    > {
+    ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>> {
         let mut completed = slot.complete();
         let _ = completed.take_op();
         let (payload, detail) = completed.take_completion_data();
@@ -120,10 +116,7 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
         event: UserCompletionEvent,
         anomaly: CompletionAnomaly,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> crate::driver::HookResult<
-        DummySlotSpec,
-        CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>,
-    > {
+    ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>> {
         let Some(snapshot) = anomaly.slot_snapshot else {
             return Ok(CompletionHookOutcome::Anomaly {
                 anomaly,
@@ -142,7 +135,7 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
     fn finish_backend_effect(
         &mut self,
         _effect: Self::BackendEffect,
-    ) -> crate::driver::HookResult<DummySlotSpec, ()> {
+    ) -> HookResult<DummySlotSpec, ()> {
         Ok(())
     }
 }
@@ -278,7 +271,7 @@ fn mark_waiting_does_not_activate_idle_future_generation() {
 fn mark_waiting_does_not_revive_orphaned_slot() {
     let table = slot::SlotTable::<DummySlotSpec>::new(1);
     table.slots[0].reset(1);
-    table.slots[0].set_state(slot::SlotState::InFlightOrphaned, Ordering::Release);
+    table.slots[0].set_state(SlotState::InFlightOrphaned, Ordering::Release);
     let token = test_token(0, 1);
 
     let outcome = table.mark_waiting(token);
@@ -291,7 +284,7 @@ fn mark_waiting_does_not_revive_orphaned_slot() {
 fn mark_orphaned_reports_stale_generation() {
     let table = slot::SlotTable::<DummySlotSpec>::new(1);
     table.slots[0].reset(2);
-    table.slots[0].set_state(slot::SlotState::InFlightWaiting, Ordering::Release);
+    table.slots[0].set_state(SlotState::InFlightWaiting, Ordering::Release);
     let token = test_token(0, 1);
 
     let outcome = table.mark_orphaned(token);
@@ -307,7 +300,7 @@ fn mark_orphaned_reports_stale_generation() {
 #[test]
 fn register_waker_reports_missing_slot() {
     let table = slot::SlotTable::<DummySlotSpec>::new(1);
-    let waker = std::task::Waker::noop();
+    let waker = Waker::noop();
     let token = test_token(3, 1);
 
     let outcome = table.register_waker(token, waker);
@@ -320,7 +313,7 @@ fn lost_completion_is_observable_as_unavailable() {
     let (mut registry, token) = reserved_registry();
     let table = registry.shared.clone();
     let completion_token = CompletionToken::user(token);
-    let anomaly = CompletionAnomaly::corrupt(completion_token, 0, 1, slot::SlotState::Reserved);
+    let anomaly = CompletionAnomaly::corrupt(completion_token, 0, 1, SlotState::Reserved);
 
     let outcome = accept_lost(
         &mut registry,
@@ -345,13 +338,13 @@ fn lost_completion_reports_stale_generation() {
     let (mut registry, token) = active_registry();
     let _ = registry.remove(token);
     let fresh = registry.alloc(()).expect("fresh slot").handle;
-    registry.shared.slots[0].set_state(slot::SlotState::InFlightWaiting, Ordering::Release);
+    registry.shared.slots[0].set_state(SlotState::InFlightWaiting, Ordering::Release);
     let anomaly = CompletionAnomaly::stale(
         CompletionToken::user(token),
         0,
         1,
         fresh.generation,
-        slot::SlotState::InFlightWaiting,
+        SlotState::InFlightWaiting,
     );
 
     let outcome = accept_lost(
@@ -370,7 +363,7 @@ fn lost_completion_reports_empty_slot() {
     let mut registry = OpRegistry::<DummySlotSpec>::new(1);
     let token = test_token(0, 0);
     let anomaly =
-        CompletionAnomaly::non_active(CompletionToken::user(token), 0, 0, slot::SlotState::Idle);
+        CompletionAnomaly::non_active(CompletionToken::user(token), 0, 0, SlotState::Idle);
 
     let outcome = accept_lost(
         &mut registry,

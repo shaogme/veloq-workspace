@@ -1,12 +1,16 @@
-use crate::slot;
-use crate::slot::SlotSpec as CoreSlotSpec;
-use crate::{BorrowedRawHandle, IoFd, OwnedRawHandle, RawHandleMeta, SlotSidecar};
-use crate::{DriverError, DriverReport, DriverResult};
-
-use std::sync::{Arc, mpsc};
-use std::task::Poll;
-use std::task::Waker;
-use std::time::Duration;
+use crate::{
+    BorrowedRawHandle, DriverError, DriverReport, DriverResult, IoFd, OwnedRawHandle,
+    RawHandleMeta, SlotSidecar,
+    slot::{self, SlotSpec as CoreSlotSpec},
+};
+use std::{
+    error::Error,
+    marker::PhantomData,
+    sync::{Arc, mpsc},
+    task::{Poll, Waker},
+    time::Duration,
+};
+use veloq_buf::heap::ChunkId;
 
 mod completion;
 pub mod registry;
@@ -218,7 +222,7 @@ pub trait Driver {
 
     fn register_chunk(
         &mut self,
-        id: veloq_buf::heap::ChunkId,
+        id: ChunkId,
         ptr: *const u8,
         len: usize,
     ) -> DriverResult<(), Self::Error>;
@@ -240,14 +244,14 @@ pub trait ContextDriverProvider<D: Driver + ?Sized> {
 
 pub struct RuntimeContextDriver<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> {
     provider: &'a P,
-    _phantom: std::marker::PhantomData<fn() -> D>,
+    _phantom: PhantomData<fn() -> D>,
 }
 
 impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> RuntimeContextDriver<'a, D, P> {
     pub fn new(provider: &'a P) -> Self {
         Self {
             provider,
-            _phantom: std::marker::PhantomData,
+            _phantom: PhantomData,
         }
     }
 }
@@ -333,7 +337,7 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
     #[inline]
     fn register_chunk(
         &mut self,
-        id: veloq_buf::heap::ChunkId,
+        id: ChunkId,
         ptr: *const u8,
         len: usize,
     ) -> DriverResult<(), Self::Error> {
@@ -434,7 +438,7 @@ pub struct DriveOutcome {
 
 pub trait RemoteWaker<E>: Send + Sync
 where
-    E: std::error::Error + Send + Sync + 'static,
+    E: Error + Send + Sync + 'static,
 {
     fn wake(&self) -> DriverResult<(), E>;
 }
@@ -456,8 +460,11 @@ pub mod test_hooks {
 }
 
 #[cfg(feature = "test-hooks")]
-impl<'a, D: Driver + ?Sized + test_hooks::DriverTestHooks, P: ContextDriverProvider<D> + ?Sized>
-    test_hooks::DriverTestHooks for RuntimeContextDriver<'a, D, P>
+use test_hooks::DriverTestHooks;
+
+#[cfg(feature = "test-hooks")]
+impl<'a, D: Driver + ?Sized + DriverTestHooks, P: ContextDriverProvider<D> + ?Sized> DriverTestHooks
+    for RuntimeContextDriver<'a, D, P>
 {
     #[inline]
     fn debug_chunk_register_attempts(&self) -> u64 {

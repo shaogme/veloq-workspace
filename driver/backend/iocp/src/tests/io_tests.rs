@@ -18,7 +18,10 @@ use std::{
 use veloq_buf::{FixedBuf, NoopRegistrar};
 use veloq_driver_core::{
     driver::{Driver, DriverSubmitResult, RegisterFd, SubmitStatus},
-    op::{IntoPlatformOp, ReadFixed, ReadRaw, Timeout, WriteFixed, WriteRaw},
+    op::{
+        IntoPlatformOp,
+        types::{ReadFixed, ReadRaw, Timeout, WriteFixed, WriteRaw},
+    },
 };
 use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
 
