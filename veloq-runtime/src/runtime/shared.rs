@@ -5,11 +5,11 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
-        mpsc::{self, Receiver},
     },
 };
 
 use crossbeam_deque::Worker;
+use crossbeam_queue::ArrayQueue;
 use diagweave::prelude::*;
 use numaperf_topo::Topology;
 use veloq_storage::StateOptionPtr;
@@ -70,22 +70,16 @@ unsafe impl Send for RuntimeSharedBase {}
 unsafe impl Sync for RuntimeSharedBase {}
 
 pub(crate) struct Receivers {
-    pub(crate) remote_receivers: Vec<Receiver<SendTaskRef>>,
-    pub(crate) pinned_receivers: Vec<Receiver<SendTaskRef>>,
-    pub(crate) local_receivers: Vec<Receiver<LocalTaskRef>>,
     pub(crate) deques: Vec<Worker<SendTaskRef>>,
 }
 
 pub(crate) fn init_runtime_components(
     worker_count: NonZeroUsize,
-    _queue_capacity: NonZeroUsize,
+    queue_capacity: NonZeroUsize,
 ) -> (WorkerRegistry, TopologyContext, Receivers) {
     let worker_count_val = worker_count.get();
     let mut unparkers = Vec::with_capacity(worker_count_val);
     let mut parker_inners = Vec::with_capacity(worker_count_val);
-    let mut remote_receivers = Vec::with_capacity(worker_count_val);
-    let mut pinned_receivers = Vec::with_capacity(worker_count_val);
-    let mut local_receivers = Vec::with_capacity(worker_count_val);
     let mut deques = Vec::with_capacity(worker_count_val);
     let mut workers = Vec::with_capacity(worker_count_val);
     let mut next_idle = Vec::with_capacity(worker_count_val);
@@ -97,18 +91,20 @@ pub(crate) fn init_runtime_components(
         unparkers.push(Unparker::from_inner(inner.clone()));
         parker_inners.push(inner);
 
-        let (rtx, rrx) = mpsc::channel();
-        let (ptx, prx) = mpsc::channel();
-        let (ltx, lrx) = mpsc::channel();
-        remote_receivers.push(rrx);
-        pinned_receivers.push(prx);
-        local_receivers.push(lrx);
+        let remote_queue = ArrayQueue::new(queue_capacity.get());
+        let pinned_queue = ArrayQueue::new(queue_capacity.get());
+        let local_queue = ArrayQueue::new(queue_capacity.get());
 
         let worker_deque = Worker::new_lifo();
         let stealer = worker_deque.stealer();
         deques.push(worker_deque);
 
-        workers.push(Arc::new(WorkerQueue::new(rtx, ptx, ltx, stealer)));
+        workers.push(Arc::new(WorkerQueue::new(
+            remote_queue,
+            pinned_queue,
+            local_queue,
+            stealer,
+        )));
         next_idle.push(AtomicUsize::new(usize::MAX));
     }
 
@@ -160,12 +156,7 @@ pub(crate) fn init_runtime_components(
             worker_to_group,
             next_idle,
         },
-        Receivers {
-            remote_receivers,
-            pinned_receivers,
-            local_receivers,
-            deques,
-        },
+        Receivers { deques },
     )
 }
 
@@ -245,13 +236,13 @@ impl RuntimeSharedBase {
         if task.header().try_mark_queued() {
             let worker = &self.registry.workers[worker_id];
             worker.local_count.fetch_add(1, Ordering::Release);
-            if worker.local_tx.send(task).is_ok() {
-                task.header().notify_runtime_active();
-            } else {
+            if let Err(task) = worker.local_queue.push(task) {
                 worker.local_count.fetch_sub(1, Ordering::Release);
                 if task.header().clear_queued() {
                     task.header().acknowledge_completion();
                 }
+            } else {
+                task.header().notify_runtime_active();
             }
         }
     }
@@ -269,10 +260,10 @@ impl RuntimeSharedBase {
             self.idle.event_count.notify();
             let worker = &self.registry.workers[worker_id];
             worker.pinned_count.fetch_add(1, Ordering::Release);
-            if worker.pinned_tx.send(task).is_err() {
+            if let Err(task) = worker.pinned_queue.push(task) {
                 worker.pinned_count.fetch_sub(1, Ordering::Release);
-                if header.clear_queued() {
-                    header.acknowledge_completion();
+                if task.header().clear_queued() {
+                    task.header().acknowledge_completion();
                 }
                 return EnqueuePinnedOutcome::AbortedAcknowledged;
             }
@@ -296,8 +287,8 @@ impl RuntimeSharedBase {
         self.tls.with(|ctx| ctx.worker.pop())
     }
 
-    fn fn_pop_pinned(&self, worker_id: usize, rx: &Receiver<SendTaskRef>) -> Option<SendTaskRef> {
-        let res = rx.try_recv().ok();
+    fn fn_pop_pinned(&self, worker_id: usize) -> Option<SendTaskRef> {
+        let res = self.registry.workers[worker_id].pinned_queue.pop();
         if res.is_some() {
             self.registry.workers[worker_id]
                 .pinned_count
@@ -306,8 +297,8 @@ impl RuntimeSharedBase {
         res
     }
 
-    fn fn_pop_local(&self, worker_id: usize, rx: &Receiver<LocalTaskRef>) -> Option<LocalTaskRef> {
-        let res = rx.try_recv().ok();
+    fn fn_pop_local(&self, worker_id: usize) -> Option<LocalTaskRef> {
+        let res = self.registry.workers[worker_id].local_queue.pop();
         if res.is_some() {
             self.registry.workers[worker_id]
                 .local_count
@@ -358,7 +349,7 @@ impl RuntimeSharedBase {
         if task.header().try_mark_queued() {
             self.idle.event_count.notify();
             let worker = &self.registry.workers[worker_id];
-            if worker.remote_tx.send(task).is_err() {
+            if let Err(task) = worker.remote_queue.push(task) {
                 self.scheduler.injector.push(task);
                 let group_idx = self.topo.worker_to_group[worker_id];
                 self.idle
@@ -517,15 +508,12 @@ impl<T> RuntimeShared<T> {
                     progressed = true;
                 }
 
-                if !progressed
-                    && let Some(task) = self.base.fn_pop_pinned(worker_id, &ctx.pinned_rx)
-                {
+                if !progressed && let Some(task) = self.base.fn_pop_pinned(worker_id) {
                     self.base.poll_send_task(worker_id, task);
                     progressed = true;
                 }
 
-                if !progressed && let Some(task) = self.base.fn_pop_local(worker_id, &ctx.local_rx)
-                {
+                if !progressed && let Some(task) = self.base.fn_pop_local(worker_id) {
                     self.base.poll_local_task(worker_id, task);
                     progressed = true;
                 }
@@ -538,7 +526,9 @@ impl<T> RuntimeShared<T> {
                     progressed = true;
                 }
 
-                if !progressed && let Ok(task) = ctx.remote_rx.try_recv() {
+                if !progressed
+                    && let Some(task) = self.base.registry.workers[worker_id].remote_queue.pop()
+                {
                     self.base.poll_send_task(worker_id, task);
                     progressed = true;
                 }

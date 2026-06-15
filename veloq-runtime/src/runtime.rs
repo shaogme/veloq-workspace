@@ -80,9 +80,6 @@ impl<T, WF> Runtime<T, WF> {
             .take()
             .expect("worker_factory already taken");
         let receivers = self.receivers.take().expect("receivers already taken");
-        let mut remote_receivers = receivers.remote_receivers;
-        let mut pinned_receivers = receivers.pinned_receivers;
-        let mut local_receivers = receivers.local_receivers;
         let mut deques = receivers.deques;
 
         thread::scope(|scope| {
@@ -95,17 +92,11 @@ impl<T, WF> Runtime<T, WF> {
             let _guard = ShutdownGuard(shared_ref);
 
             for worker_id in (1..worker_count.get()).rev() {
-                let rrx = remote_receivers.pop().expect("remote receivers exhausted");
-                let prx = pinned_receivers.pop().expect("pinned receivers exhausted");
-                let lrx = local_receivers.pop().expect("local receivers exhausted");
                 let deque = deques.pop().expect("deques exhausted");
                 let worker_factory_ref = &worker_factory;
 
                 let context = RuntimeContext {
                     worker_id,
-                    remote_rx: rrx,
-                    pinned_rx: prx,
-                    local_rx: lrx,
                     rand: FastRand::new(worker_id as u64),
                     worker: deque,
                 };
@@ -127,22 +118,10 @@ impl<T, WF> Runtime<T, WF> {
                 });
             }
 
-            let rrx0 = remote_receivers
-                .pop()
-                .expect("main worker remote receiver exhausted");
-            let prx0 = pinned_receivers
-                .pop()
-                .expect("main worker pinned receiver exhausted");
-            let lrx0 = local_receivers
-                .pop()
-                .expect("main worker local receiver exhausted");
             let deque0 = deques.pop().expect("main worker deque exhausted");
 
             let context = RuntimeContext {
                 worker_id: 0,
-                remote_rx: rrx0,
-                pinned_rx: prx0,
-                local_rx: lrx0,
                 rand: FastRand::new(0),
                 worker: deque0,
             };

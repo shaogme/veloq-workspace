@@ -1,9 +1,9 @@
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
+use crossbeam_queue::ArrayQueue;
 use std::{
     sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        mpsc::Sender,
     },
     thread,
     time::Duration,
@@ -22,9 +22,9 @@ use crate::{
 };
 
 pub(crate) struct WorkerQueue {
-    pub(crate) remote_tx: Sender<SendTaskRef>,
-    pub(crate) pinned_tx: Sender<SendTaskRef>,
-    pub(crate) local_tx: Sender<LocalTaskRef>,
+    pub(crate) remote_queue: ArrayQueue<SendTaskRef>,
+    pub(crate) pinned_queue: ArrayQueue<SendTaskRef>,
+    pub(crate) local_queue: ArrayQueue<LocalTaskRef>,
     pub(crate) pinned_count: AtomicUsize,
     pub(crate) local_count: AtomicUsize,
     /// LIFO slot for high-priority task (cache locality)
@@ -35,15 +35,15 @@ pub(crate) struct WorkerQueue {
 
 impl WorkerQueue {
     pub(crate) fn new(
-        remote_tx: Sender<SendTaskRef>,
-        pinned_tx: Sender<SendTaskRef>,
-        local_tx: Sender<LocalTaskRef>,
+        remote_queue: ArrayQueue<SendTaskRef>,
+        pinned_queue: ArrayQueue<SendTaskRef>,
+        local_queue: ArrayQueue<LocalTaskRef>,
         stealer: Stealer<SendTaskRef>,
     ) -> Self {
         Self {
-            remote_tx,
-            pinned_tx,
-            local_tx,
+            remote_queue,
+            pinned_queue,
+            local_queue,
             pinned_count: AtomicUsize::new(0),
             local_count: AtomicUsize::new(0),
             lifo: AtomicOptionPtr::new(None),

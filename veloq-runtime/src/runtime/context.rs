@@ -6,7 +6,7 @@ use std::{
     ops::AsyncFnOnce,
     pin::Pin,
     ptr::NonNull,
-    sync::{Arc, Mutex, atomic::Ordering, mpsc::Receiver},
+    sync::{Arc, Mutex, atomic::Ordering},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -16,8 +16,8 @@ use crate::{
     error::{Result, RuntimeError},
     scope::{AsyncScope, LocalAsyncScope},
     task::{
-        GenericTaskHeader, LocalTaskRef, RawTask, RuntimeContextExt, ScopeRef, SendTaskRef,
-        TaskHandleRef, TaskHeader, TaskVTable,
+        GenericTaskHeader, RawTask, RuntimeContextExt, ScopeRef, SendTaskRef, TaskHandleRef,
+        TaskHeader, TaskVTable,
     },
     utils::FastRand,
 };
@@ -92,9 +92,6 @@ impl IdleDecision {
 
 pub struct RuntimeContext {
     pub(crate) worker_id: usize,
-    pub(crate) remote_rx: Receiver<SendTaskRef>,
-    pub(crate) pinned_rx: Receiver<SendTaskRef>,
-    pub(crate) local_rx: Receiver<LocalTaskRef>,
     pub(crate) rand: FastRand,
     pub(crate) worker: Worker<SendTaskRef>,
 }
