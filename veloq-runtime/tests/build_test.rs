@@ -92,6 +92,13 @@ fn test_nested_scope_build_5() {
     });
 }
 
+// This test fails to compile due to limitations in Rust's current lifetime inference mechanism.
+// Error Cause: `ctx.scope` expects an async closure that accepts a `GenericAsyncScope` reference with any lifetime (Higher-Rank Trait Bound, HRTB).
+// However, when the nested async closure (`async |child_scope|`) is defined inside the async block spawned by `parent_scope.spawn_boxed`,
+// the compiler fails to generalize the closure's parameter lifetime over all possible inputs (i.e. to implement `AsyncFnOnce` generically).
+// Instead, it infers a single concrete lifetime, causing the compilation error:
+// "implementation of `AsyncFnOnce` is not general enough".
+// Workaround: Refer to `test_nested_scope_build_5` where a named `async fn` is used to explicitly express the lifetime bounds.
 // #[test]
 // fn test_nested_scope_build_6() {
 //     let rt = Runtime::<(), _>::new();
