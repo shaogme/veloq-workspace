@@ -151,7 +151,30 @@ impl RioState {
     }
 
     pub(crate) fn drain_outstanding(&mut self, timeout: std::time::Duration) -> RioResult<()> {
+
+        struct Backoff {
+            yields: u32,
+        }
+
+        impl Backoff {
+        #[inline]
+        fn new() -> Self {
+            Self { yields: 0 }
+        }
+
+        #[inline]
+        fn snooze(&mut self) {
+            if self.yields < 10 {
+                self.yields += 1;
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+        }
+
         let start = std::time::Instant::now();
+        let mut backoff = Backoff::new();
         while self.outstanding_count > 0 {
             if start.elapsed() >= timeout {
                 return RioError::Internal
@@ -171,10 +194,11 @@ impl RioState {
             }
 
             if count == 0 {
-                std::thread::yield_now();
+                backoff.snooze();
                 continue;
             }
 
+            backoff = Backoff::new();
             self.drain_batch(&results, count as usize)?;
         }
 

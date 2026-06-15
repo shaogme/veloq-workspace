@@ -710,41 +710,4 @@ impl RioState {
         }
         Ok(hooks.completed_count)
     }
-
-    pub(crate) fn drain_outstanding_with_ops(
-        &mut self,
-        timeout: std::time::Duration,
-        ops: &mut IocpOpRegistry,
-        ext: &crate::ext::Extensions,
-        registrar: &dyn veloq_buf::BufferRegistrar,
-        completion_table: &SharedCompletionTable<IocpSlotSpec>,
-        diagnostics: &mut IocpDriverCompletionDiagnostics,
-    ) -> RioResult<()> {
-        let deadline = std::time::Instant::now()
-            .checked_add(timeout)
-            .ok_or_else(|| {
-                RioError::Internal
-                    .to_report()
-                    .with_ctx("timeout_ms", timeout.as_millis() as u64)
-                    .attach_note("strict close RIO drain timeout is too large")
-            })?;
-
-        while self.outstanding_count > 0 {
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                return RioError::Internal
-                    .with_ctx("outstanding_count", self.outstanding_count)
-                    .with_ctx("timeout_ms", timeout.as_millis() as u64)
-                    .attach_note("strict close timed out while draining RIO outstanding requests");
-            }
-
-            let processed =
-                self.process_completions(ops, ext, registrar, completion_table, diagnostics)?;
-            if processed == 0 {
-                std::thread::yield_now();
-            }
-        }
-
-        Ok(())
-    }
 }

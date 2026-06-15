@@ -304,6 +304,7 @@ mod tests {
     use crate::rio::runtime::RioSocketActor;
 
     fn test_state() -> RioState {
+        use rustc_hash::FxHashMap;
         RioState {
             kernel: RioKernel::noop(),
             registry: RioRegistry::new(32, 1),

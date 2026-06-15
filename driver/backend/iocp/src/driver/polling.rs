@@ -17,24 +17,6 @@ use crate::op::IocpSlotSpec;
 
 use super::{IocpDriver, IocpDriverResult, RIO_EVENT_KEY, RIO_EVENT_TOKEN};
 
-#[derive(Default)]
-pub(super) struct CompletionProgress {
-    pub(super) iocp: usize,
-    pub(super) rio: usize,
-    pub(super) user_completed: usize,
-    pub(super) user_lost: usize,
-    pub(super) orphan_cleaned: usize,
-    pub(super) internal: usize,
-    pub(super) anomaly: usize,
-}
-
-impl CompletionProgress {
-    #[inline]
-    pub(super) fn semantic_count(&self) -> usize {
-        self.user_completed + self.user_lost + self.orphan_cleaned + self.internal + self.anomaly
-    }
-}
-
 pub(super) struct CompletionPump {
     port: Arc<crate::win32::IoCompletionPort>,
     is_notified: Arc<AtomicBool>,
@@ -129,10 +111,7 @@ impl TimerEngine {
 }
 
 impl<'a> IocpDriver<'a> {
-    pub(super) fn poll_completion(
-        &mut self,
-        timeout: Duration,
-    ) -> IocpDriverResult<CompletionProgress> {
+    pub(super) fn poll_completion(&mut self, timeout: Duration) -> IocpDriverResult<usize> {
         let status = self
             .completion
             .port()
@@ -148,7 +127,7 @@ impl<'a> IocpDriver<'a> {
                 success,
                 error_code,
             } => self.handle_completion_status(bytes, key, overlapped, success, error_code),
-            crate::win32::CompletionStatus::Timeout => Ok(CompletionProgress::default()),
+            crate::win32::CompletionStatus::Timeout => Ok(0),
         }
     }
 
@@ -198,12 +177,12 @@ impl<'a> IocpDriver<'a> {
         overlapped: *mut crate::win32::Overlapped,
         success: bool,
         error_code: Option<u32>,
-    ) -> IocpDriverResult<CompletionProgress> {
+    ) -> IocpDriverResult<usize> {
         let res = iocp_status_res(success, error_code, bytes);
         let flags = iocp_status_flags(success, error_code);
         match classify_completion_status(key, overlapped, success) {
             IocpCompletionStatusKind::RioWake => {
-                let processed = {
+                {
                     let (rio_state, registrar) = self.rio.state_and_registrar_mut();
                     rio_state.process_completions(
                         &mut self.ops,
@@ -219,22 +198,17 @@ impl<'a> IocpDriver<'a> {
                 .push_ctx("scope", "iocp/driver")
                 .attach_note("failed to process rio completions")
                 .trans()?;
-                Ok(CompletionProgress {
-                    iocp: 0,
-                    rio: processed,
-                    internal: 1,
-                    ..CompletionProgress::default()
-                })
+                Ok(0)
             }
             IocpCompletionStatusKind::OverlappedUser { queue_key } => {
                 let envelope = self.resolve_overlapped_user_envelope(
                     bytes, queue_key, overlapped, success, res, flags,
                 )?;
-                Ok(self.process_completion_envelope(envelope)?)
+                self.process_completion_envelope(envelope)
             }
             IocpCompletionStatusKind::ControlKey | IocpCompletionStatusKind::PostedToken => {
-                let flow = self.accept_raw_completion(key as u64, res, flags)?;
-                Ok(CompletionProgress::from_flow(flow, 1, 0))
+                self.accept_raw_completion(key as u64, res, flags)?;
+                Ok(1)
             }
             IocpCompletionStatusKind::NullFailure => {
                 let _ = iocp_msg(
@@ -250,8 +224,8 @@ impl<'a> IocpDriver<'a> {
                     .with_backend_context(key as u64)
                     .with_raw_result(res)
                     .with_flags(flags);
-                let flow = self.accept_completion_anomaly(anomaly)?;
-                Ok(CompletionProgress::from_flow(flow, 1, 0))
+                self.accept_completion_anomaly(anomaly)?;
+                Ok(1)
             }
             IocpCompletionStatusKind::Unknown => {
                 let anomaly = CompletionAnomaly::backend_context_unknown(RIO_EVENT_TOKEN)
@@ -259,8 +233,8 @@ impl<'a> IocpDriver<'a> {
                     .with_backend_context(key as u64)
                     .with_raw_result(res)
                     .with_flags(flags);
-                let flow = self.accept_completion_anomaly(anomaly)?;
-                Ok(CompletionProgress::from_flow(flow, 1, 0))
+                self.accept_completion_anomaly(anomaly)?;
+                Ok(1)
             }
         }
     }

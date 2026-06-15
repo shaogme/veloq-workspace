@@ -10,7 +10,6 @@ use veloq_driver_core::driver::{
 };
 use veloq_driver_core::slot::{InFlightOrphaned, InFlightWaiting, SlotRegistryExt, SlotView};
 
-use crate::driver::polling::CompletionProgress;
 use crate::driver::{IocpDriver, IocpDriverCompletionDiagnostics};
 use crate::error::{IocpError, IocpResult, iocp_report_to_event_res};
 use crate::op::{IocpOp, IocpSlotSpec, Slot};
@@ -237,12 +236,12 @@ impl<'a> IocpDriver<'a> {
     pub(super) fn process_completion_envelope(
         &mut self,
         envelope: CompletionEnvelope,
-    ) -> IocpResult<CompletionProgress> {
-        let outcome = self.accept_completion_ingress(
+    ) -> IocpResult<usize> {
+        self.accept_completion_ingress(
             CompletionIngress::Kernel(envelope),
             IocpSyntheticCompletion::None,
         )?;
-        Ok(CompletionProgress::from_flow(outcome, 1, 0))
+        Ok(1)
     }
 
     pub(crate) fn accept_synthetic_completion(
@@ -304,21 +303,6 @@ impl<'a> IocpDriver<'a> {
             self.drain_deferred_socket_cleanup();
         }
         Ok(outcome)
-    }
-}
-
-impl CompletionProgress {
-    #[inline]
-    pub(super) fn from_flow(flow: CompletionFlowOutcome, iocp: usize, rio: usize) -> Self {
-        Self {
-            iocp,
-            rio,
-            user_completed: flow.user_completed,
-            user_lost: flow.user_lost,
-            orphan_cleaned: flow.orphan_cleaned,
-            internal: flow.internal,
-            anomaly: flow.anomaly,
-        }
     }
 }
 

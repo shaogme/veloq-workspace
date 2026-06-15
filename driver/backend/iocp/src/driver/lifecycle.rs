@@ -206,15 +206,12 @@ impl<'a> IocpDriver<'a> {
         pending
     }
 
-    pub(super) fn drain_pending_iocp(
+    pub(super) fn drain_pending_all(
         &mut self,
-        pending_count: usize,
+        pending_iocp_count: usize,
         timeout: Duration,
     ) -> IocpDriverResult<()> {
-        if pending_count == 0 {
-            return Ok(());
-        }
-        let mut drained = 0usize;
+        let mut drained_iocp = 0usize;
         let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
             IocpError::CompletionWait
                 .to_report()
@@ -222,15 +219,15 @@ impl<'a> IocpDriver<'a> {
                 .attach_note("strict close timeout is too large")
         })?;
 
-        while drained < pending_count {
+        while drained_iocp < pending_iocp_count || self.rio.state().outstanding_count > 0 {
             let now = Instant::now();
             if now >= deadline {
-                return Err(IocpError::CompletionWait.report("iocp/driver", "drain timed out"));
+                return Err(
+                    IocpError::CompletionWait.report("iocp/driver", "strict close drain timed out")
+                );
             }
-            let progress = self.poll_completion(deadline.saturating_duration_since(now))?;
-            let _ = progress.semantic_count();
-            drained += progress.iocp;
-            let _rio_progress = progress.rio;
+            let count = self.poll_completion(deadline.saturating_duration_since(now))?;
+            drained_iocp += count;
         }
         Ok(())
     }
@@ -284,25 +281,9 @@ impl<'a> IocpDriver<'a> {
         }
         let pending = self.shutdown_ops();
         if let CloseMode::Strict { timeout } = mode {
-            self.drain_pending_iocp(pending.iocp_pending, timeout)
+            self.drain_pending_all(pending.iocp_pending, timeout)
                 .push_ctx("scope", "iocp/driver")
-                .attach_note("drain pending iocp timed out")?;
-            {
-                let completion_table = self.completion.table();
-                let (rio_state, registrar) = self.rio.state_and_registrar_mut();
-                rio_state
-                    .drain_outstanding_with_ops(
-                        timeout,
-                        &mut self.ops,
-                        &self.extensions,
-                        registrar,
-                        completion_table,
-                        &mut self.completion_diagnostics,
-                    )
-                    .push_ctx("scope", "iocp/driver")
-                    .attach_note("failed to drain RIO outstanding requests")
-                    .trans()?;
-            }
+                .attach_note("strict close drain pending requests timed out")?;
             self.drain_deferred_socket_cleanup();
             self.rio.state_mut().forget_runtime_after_drain();
             self.rio.state_mut().kernel.close();
