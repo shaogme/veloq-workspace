@@ -119,8 +119,11 @@ impl RioState {
     }
 
     #[inline]
-    pub(crate) fn release_socket_inflight_token(&mut self, token: SocketInflightToken) {
-        let _ = release_socket_inflight_token_from(&mut self.socket_runtime, token);
+    pub(crate) fn release_socket_inflight_token(
+        &mut self,
+        token: SocketInflightToken,
+    ) -> RioResult<()> {
+        release_socket_inflight_token_from(&mut self.socket_runtime, token)
     }
 
     #[inline]
@@ -261,7 +264,9 @@ impl SocketInflightGuard<'_> {
 impl Drop for SocketInflightGuard<'_> {
     fn drop(&mut self) {
         if let Some(token) = self.token.take() {
-            self.state.release_socket_inflight_token(token);
+            if let Err(e) = self.state.release_socket_inflight_token(token) {
+                tracing::error!(error = ?e, "failed to release socket inflight token in guard drop");
+            }
         }
     }
 }
@@ -269,30 +274,22 @@ impl Drop for SocketInflightGuard<'_> {
 pub(crate) fn release_socket_inflight_token_from(
     socket_runtime: &mut FxHashMap<SocketKey, SocketRuntimeState>,
     token: SocketInflightToken,
-) -> bool {
+) -> RioResult<()> {
     let socket_key = token.socket_key();
-    let state = socket_runtime.get_mut(&socket_key);
-    debug_assert!(
-        state.is_some(),
-        "socket inflight release without registered runtime state"
-    );
-    let Some(state) = state else {
-        tracing::error!(
-            socket_raw = socket_key.as_handle() as usize,
-            "socket inflight release without registered runtime state"
-        );
-        return false;
-    };
-    debug_assert!(state.inflight > 0, "socket inflight counter underflow");
+    let state = socket_runtime.get_mut(&socket_key).ok_or_else(|| {
+        RioError::InvalidInput
+            .to_report()
+            .with_ctx("socket_raw", socket_key.as_handle() as usize)
+            .attach_note("socket inflight release without registered runtime state")
+    })?;
+
     if state.inflight == 0 {
-        tracing::error!(
-            socket_raw = socket_key.as_handle() as usize,
-            "socket inflight counter underflow"
-        );
-        return false;
+        return RioError::Internal
+            .with_ctx("socket_raw", socket_key.as_handle() as usize)
+            .attach_note("socket inflight counter underflow");
     }
     state.inflight -= 1;
-    true
+    Ok(())
 }
 
 #[cfg(test)]
@@ -335,7 +332,7 @@ mod tests {
             .expect("registered open socket should acquire inflight token");
         assert_eq!(state.socket_runtime.get(&key).unwrap().inflight, 1);
 
-        state.release_socket_inflight_token(token);
+        state.release_socket_inflight_token(token).unwrap();
         assert_eq!(state.socket_runtime.get(&key).unwrap().inflight, 0);
     }
 
@@ -387,7 +384,7 @@ mod tests {
         assert_eq!(state.actors.len(), 1);
         assert!(state.try_acquire_socket_inflight_token(key).is_err());
 
-        state.release_socket_inflight_token(token);
+        state.release_socket_inflight_token(token).unwrap();
         assert_eq!(state.socket_runtime.get(&key).unwrap().inflight, 0);
     }
 

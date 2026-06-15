@@ -315,13 +315,13 @@ impl<'a> IocpDriver<'a> {
         }
     }
 
-    pub(super) fn release_socket_inflight_for_op(&mut self, user_data: usize) {
+    pub(super) fn release_socket_inflight_for_op(&mut self, user_data: usize) -> IocpResult<()> {
         let Some(token) = self
             .ops
             .active_tokens()
             .find(|token| token.index() == user_data)
         else {
-            return;
+            return Ok(());
         };
         let socket_inflight =
             self.ops
@@ -344,9 +344,13 @@ impl<'a> IocpDriver<'a> {
                 });
 
         if let Some(token) = socket_inflight {
-            self.rio.state_mut().release_socket_inflight_token(token);
+            self.rio
+                .state_mut()
+                .release_socket_inflight_token(token)
+                .trans()?;
             self.drain_deferred_socket_cleanup();
         }
+        Ok(())
     }
 
     pub(super) fn drain_deferred_socket_cleanup(&mut self) {

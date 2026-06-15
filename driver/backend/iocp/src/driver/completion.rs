@@ -177,7 +177,9 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
         match effect {
             IocpBackendEffect::None => {}
             IocpBackendEffect::SocketInflight(token) => {
-                self.rio.release_socket_inflight_token(token);
+                if let Err(err) = self.rio.release_socket_inflight_token(token) {
+                    tracing::error!(%err, ?token, "failed to release socket inflight token");
+                }
                 self.post.drain_socket_cleanup = true;
             }
         }

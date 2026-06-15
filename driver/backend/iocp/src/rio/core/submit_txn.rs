@@ -180,13 +180,27 @@ impl<'a> RioSubmitTxn<'a> {
     }
 
     fn encode_context(mut self) -> RioResult<Self> {
-        let rq = self.rq.expect("RIO submit transaction missing actor RQ");
-        let socket_inflight = self
-            .socket_inflight
-            .expect("RIO submit transaction missing socket inflight token");
-        let data_buf = self
-            .data_buf
-            .expect("RIO submit transaction missing prepared data buffer");
+        let rq = self.rq.ok_or_else(|| {
+            self.attach_stage_error(
+                RioError::Internal.to_report(),
+                "rio.core.submit_txn.encode_context",
+                "RIO submit transaction missing actor RQ",
+            )
+        })?;
+        let socket_inflight = self.socket_inflight.ok_or_else(|| {
+            self.attach_stage_error(
+                RioError::Internal.to_report(),
+                "rio.core.submit_txn.encode_context",
+                "RIO submit transaction missing socket inflight token",
+            )
+        })?;
+        let data_buf = self.data_buf.ok_or_else(|| {
+            self.attach_stage_error(
+                RioError::Internal.to_report(),
+                "rio.core.submit_txn.encode_context",
+                "RIO submit transaction missing prepared data buffer",
+            )
+        })?;
         let addr = self.addr;
         let diagnostics = RioRequestDiagnostics::new(rq, &data_buf.rio_buf, addr.as_ref());
         let request_id = self.state.next_request_id();
@@ -223,19 +237,20 @@ impl<'a> RioSubmitTxn<'a> {
     ) -> RioResult<Self> {
         self.acquire_buffer_ref()?;
         let error_context = self.plan.submit_error_context();
-        let submit_result = {
-            let request = self
-                .request
-                .as_ref()
-                .expect("RIO submit transaction missing encoded request");
-            submit(&self.state.kernel, request)
-                .map_err(|error| request.attach_submit_error(error, error_context))
+        let request = if let Some(ref request) = self.request {
+            request
+        } else {
+            return Err(self.attach_stage_error(
+                RioError::Internal.to_report(),
+                "rio.core.submit_txn.submit_kernel",
+                "RIO submit transaction missing encoded request",
+            ));
         };
 
-        match submit_result {
+        match submit(&self.state.kernel, request) {
             Ok(()) => Ok(self),
             Err(error) => Err(self.attach_stage_error(
-                error,
+                request.attach_submit_error(error, error_context),
                 "rio.core.submit_txn.submit_kernel",
                 "failed to submit RIO request to kernel",
             )),
@@ -243,12 +258,23 @@ impl<'a> RioSubmitTxn<'a> {
     }
 
     fn commit(mut self) -> RioResult<SubmissionResult> {
-        let request = self
-            .request
-            .as_mut()
-            .expect("RIO submit transaction missing committed request");
+        let request = if let Some(ref mut request) = self.request {
+            request
+        } else {
+            return Err(self.attach_stage_error(
+                RioError::Internal.to_report(),
+                "rio.core.submit_txn.commit",
+                "RIO submit transaction missing committed request",
+            ));
+        };
         let submitted_context = request.mark_submitted();
-        debug_assert!(!submitted_context.as_request_context().is_null());
+        if submitted_context.as_request_context().is_null() {
+            return Err(self.attach_stage_error(
+                RioError::Internal.to_report(),
+                "rio.core.submit_txn.commit",
+                "RIO submitted request context is null",
+            ));
+        }
         self.state.outstanding_count += 1;
         self.submitted = true;
         Ok(SubmissionResult::Pending)
@@ -258,10 +284,15 @@ impl<'a> RioSubmitTxn<'a> {
         if self.buffer_ref_acquired {
             return Ok(());
         }
-        let request = self
-            .request
-            .as_ref()
-            .expect("RIO submit transaction missing request before buffer ref acquire");
+        let request = if let Some(ref request) = self.request {
+            request
+        } else {
+            return Err(self.attach_stage_error(
+                RioError::Internal.to_report(),
+                "rio.core.submit_txn.acquire_buffer_ref",
+                "RIO submit transaction missing request before buffer ref acquire",
+            ));
+        };
         match self
             .state
             .registry
@@ -282,15 +313,18 @@ impl<'a> RioSubmitTxn<'a> {
         }
     }
 
-    fn rollback_buffer_ref(&mut self) {
+    fn rollback_buffer_ref(&mut self) -> RioResult<()> {
         if !self.buffer_ref_acquired {
-            return;
+            return Ok(());
         }
 
-        let Some(data_buf) = self.data_buf else {
-            tracing::error!("unsubmitted RIO buffer ref missing prepared buffer");
-            return;
-        };
+        let data_buf = self.data_buf.ok_or_else(|| {
+            self.attach_stage_error(
+                RioError::Internal.to_report(),
+                "rio.core.submit_txn.rollback_buffer_ref",
+                "unsubmitted RIO buffer ref missing prepared buffer",
+            )
+        })?;
 
         let release = if let Some(dispatch) = self.state.kernel.dispatch {
             let env = self.env(&dispatch);
@@ -306,30 +340,29 @@ impl<'a> RioSubmitTxn<'a> {
         match release {
             Ok(()) => {
                 self.buffer_ref_acquired = false;
+                Ok(())
             }
-            Err(error) => {
-                tracing::error!(
-                    report = ?error,
-                    rio_op_kind = self.plan.op_kind.as_str(),
-                    rio_request_id = self
-                        .request
-                        .as_ref()
-                        .map_or(0, |request| request.request_id),
-                    "failed to roll back unsubmitted RIO buffer lease"
-                );
-            }
+            Err(error) => Err(self.attach_stage_error(
+                error,
+                "rio.core.submit_txn.rollback_buffer_ref",
+                "failed to roll back unsubmitted RIO buffer lease",
+            )),
         }
     }
 
-    fn rollback_context(&mut self) {
+    fn rollback_context(&mut self) -> RioResult<()> {
         let Some(request) = self.request.as_mut() else {
-            return;
+            return Ok(());
         };
         let init = request.take_init(&mut self.state.registry);
-        debug_assert!(
-            init.is_some(),
-            "unsubmitted RIO request missing prepared request context"
-        );
+        if init.is_none() {
+            return Err(self.attach_stage_error(
+                RioError::Internal.to_report(),
+                "rio.core.submit_txn.rollback_context",
+                "unsubmitted RIO request missing prepared request context during rollback",
+            ));
+        }
+        Ok(())
     }
 
     fn rollback_address(&mut self) {
@@ -338,10 +371,11 @@ impl<'a> RioSubmitTxn<'a> {
             .free_addr_slot(self.addr.take().map(|addr| addr.slot));
     }
 
-    fn rollback_socket(&mut self) {
+    fn rollback_socket(&mut self) -> RioResult<()> {
         if let Some(socket_inflight) = self.socket_inflight.take() {
-            self.state.release_socket_inflight_token(socket_inflight);
+            self.state.release_socket_inflight_token(socket_inflight)?;
         }
+        Ok(())
     }
 
     #[inline]
@@ -435,10 +469,40 @@ impl Drop for RioSubmitTxn<'_> {
         if self.submitted {
             return;
         }
-        self.rollback_buffer_ref();
-        self.rollback_context();
+        if let Err(error) = self.rollback_buffer_ref() {
+            tracing::error!(
+                report = ?error,
+                rio_op_kind = self.plan.op_kind.as_str(),
+                rio_request_id = self
+                    .request
+                    .as_ref()
+                    .map(|request| request.request_id),
+                "failed to roll back unsubmitted RIO buffer reference"
+            );
+        }
+        if let Err(error) = self.rollback_context() {
+            tracing::error!(
+                report = ?error,
+                rio_op_kind = self.plan.op_kind.as_str(),
+                rio_request_id = self
+                    .request
+                    .as_ref()
+                    .map(|request| request.request_id),
+                "failed to roll back unsubmitted RIO request context"
+            );
+        }
         self.rollback_address();
-        self.rollback_socket();
+        if let Err(error) = self.rollback_socket() {
+            tracing::error!(
+                report = ?error,
+                rio_op_kind = self.plan.op_kind.as_str(),
+                rio_request_id = self
+                    .request
+                    .as_ref()
+                    .map(|request| request.request_id),
+                "failed to roll back unsubmitted RIO socket inflight token"
+            );
+        }
     }
 }
 

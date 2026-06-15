@@ -110,7 +110,7 @@ impl<'a> IocpDriver<'a> {
                     view,
                 );
                 if let Some(index) = corrupt_index {
-                    self.release_socket_inflight_for_op(index);
+                    self.release_socket_inflight_for_op(index)?;
                     self.drain_deferred_socket_cleanup();
                 }
                 self.record_cancel_target_gone(reason);

@@ -423,6 +423,7 @@ where
         }
     }
 }
+
 fn finish_hook_outcome<Spec, Hooks>(
     registry: &mut OpRegistry<Spec>,
     table: &SharedCompletionTable<Spec>,
