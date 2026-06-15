@@ -31,6 +31,21 @@ use infra::{
     TaskScheduler, TopologyContext, WorkerQueue, WorkerRegistry,
 };
 
+/// `enqueue_pinned` 的结果：区分 scope 是否已由 `acknowledge_completion` 结算。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnqueuePinnedOutcome {
+    /// 成功入队到目标 worker 的 pinned channel。
+    Enqueued,
+    /// 任务已在队列中，无需额外 scope 操作。
+    AlreadyQueued,
+    /// 入队 abort，scope 义务已由 `acknowledge_completion` 结算。
+    AbortedAcknowledged,
+    /// 任务已完成且 scope 已结算。
+    AlreadySettled,
+    /// 无法通过 header ack 结算，caller 的 `ScopeTaskGuard` 须 `settle`。
+    NeedsCallerSettle,
+}
+
 pub struct RuntimeSharedBase {
     pub(crate) registry: WorkerRegistry,
     pub(crate) topo: TopologyContext,
@@ -234,29 +249,38 @@ impl RuntimeSharedBase {
                 task.header().notify_runtime_active();
             } else {
                 worker.local_count.fetch_sub(1, Ordering::Release);
+                if task.header().clear_queued() {
+                    task.header().acknowledge_completion();
+                }
             }
         }
     }
 
-    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef) -> bool {
+    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef) -> EnqueuePinnedOutcome {
         self.assert_worker_id(worker_id);
-        if task.header().is_completed() {
-            return false;
+        let header = task.header();
+        if header.is_completed() {
+            if header.is_scope_acknowledged() {
+                return EnqueuePinnedOutcome::AlreadySettled;
+            }
+            return EnqueuePinnedOutcome::NeedsCallerSettle;
         }
-        if task.header().try_mark_queued() {
+        if header.try_mark_queued() {
             self.idle.event_count.notify();
             let worker = &self.registry.workers[worker_id];
             worker.pinned_count.fetch_add(1, Ordering::Release);
             if worker.pinned_tx.send(task).is_err() {
                 worker.pinned_count.fetch_sub(1, Ordering::Release);
-                if task.header().clear_queued() {
-                    task.header().acknowledge_completion();
+                if header.clear_queued() {
+                    header.acknowledge_completion();
                 }
-                return false;
+                return EnqueuePinnedOutcome::AbortedAcknowledged;
             }
             self.wake_worker(worker_id);
+            EnqueuePinnedOutcome::Enqueued
+        } else {
+            EnqueuePinnedOutcome::AlreadyQueued
         }
-        true
     }
 
     #[inline]
@@ -392,7 +416,7 @@ impl<T> RuntimeShared<T> {
             || worker.pinned_count.load(Ordering::Acquire) > 0
     }
 
-    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef) -> bool {
+    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef) -> EnqueuePinnedOutcome {
         self.base.enqueue_pinned(worker_id, task)
     }
 

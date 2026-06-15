@@ -21,7 +21,7 @@ pub use context::{
     IdleDecision, IdleHook, IdleWaitStrategy, RuntimeContext, RuntimeScopeContext, WorkerTickHook,
 };
 pub use primitives::GenericCancellationToken;
-pub use shared::{RuntimeShared, RuntimeSharedBase};
+pub use shared::{EnqueuePinnedOutcome, RuntimeShared, RuntimeSharedBase};
 
 use primitives::{Signal, create_waker};
 use shared::{Receivers, init_runtime_components};

@@ -1,5 +1,5 @@
 use crate::{
-    runtime::{RuntimeSharedBase, primitives::sys},
+    runtime::{EnqueuePinnedOutcome, RuntimeSharedBase, primitives::sys},
     task::{ScopeRef, SendTaskRef, TaskHandleRef, nodes::TaskStorage},
 };
 use std::{
@@ -29,6 +29,8 @@ pub const STATE_CANCELLED: usize = 1 << 3;
 pub const STATE_POLLING: usize = 1 << 4;
 pub const STATE_WOKEN: usize = 1 << 5;
 pub const STATE_PINNED: usize = 1 << 6;
+pub const STATE_SCOPE_OBLIGATED: usize = 1 << 7;
+pub const STATE_SCOPE_ACKED: usize = 1 << 8;
 const WAKE_TOKEN_ALIVE: u32 = 1 << 0;
 const WAKE_TOKEN_ACTIVE_SHIFT: u32 = 1;
 const WAKE_TOKEN_ACTIVE_UNIT: u32 = 1 << WAKE_TOKEN_ACTIVE_SHIFT;
@@ -399,7 +401,34 @@ impl<S: Storage> GenericTaskHeader<S> {
         self.worker_id.load(Ordering::Acquire)
     }
 
+    pub fn claim_scope_obligation(&self) {
+        let old = self.state.fetch_or(STATE_SCOPE_OBLIGATED, Ordering::AcqRel);
+        debug_assert!(
+            old & STATE_SCOPE_OBLIGATED == 0,
+            "duplicate scope obligation claim"
+        );
+    }
+
+    #[inline]
+    pub fn has_scope_obligation(&self) -> bool {
+        self.state.load(Ordering::Acquire) & STATE_SCOPE_OBLIGATED != 0
+    }
+
+    #[inline]
+    pub fn is_scope_acknowledged(&self) -> bool {
+        self.state.load(Ordering::Acquire) & STATE_SCOPE_ACKED != 0
+    }
+
     pub fn acknowledge_completion(&self) {
+        let old = self.state.fetch_or(STATE_SCOPE_ACKED, Ordering::AcqRel);
+        if old & STATE_SCOPE_ACKED != 0 {
+            debug_assert!(false, "duplicate acknowledge_completion");
+            return;
+        }
+        debug_assert!(
+            old & STATE_SCOPE_OBLIGATED != 0,
+            "acknowledge_completion without scope obligation"
+        );
         self.scope_completion_ref().task_done();
     }
 
@@ -512,7 +541,12 @@ impl<S: Storage> GenericTaskHeader<S> {
         let runtime = self.runtime();
         if !S::IS_LOCAL && self.is_pinned() {
             let task = unsafe { SendTaskRef::from_header(self_ptr.as_ptr() as *const _) };
-            runtime.enqueue_pinned(self.worker_id(), task);
+            match runtime.enqueue_pinned(self.worker_id(), task) {
+                EnqueuePinnedOutcome::Enqueued | EnqueuePinnedOutcome::AlreadyQueued => {}
+                EnqueuePinnedOutcome::AbortedAcknowledged
+                | EnqueuePinnedOutcome::AlreadySettled => {}
+                EnqueuePinnedOutcome::NeedsCallerSettle => self.acknowledge_completion(),
+            }
             return;
         }
         S::enqueue(runtime, self.worker_id(), self_ptr);

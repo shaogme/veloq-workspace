@@ -3,8 +3,8 @@ use crate::{
     runtime::{RuntimeScopeContext, RuntimeShared, primitives::GenericCancellationToken},
     task::{
         AnyScopeRef, Arena, ErasedCancellationToken, GenericArena, LocalBoxedTaskNode, LocalTask,
-        LocalTaskRef, RawScope, ScopeRef, ScopeStorage, SendBoxedTaskNode, SendTask, SendTaskRef,
-        TaskError, TaskHandleRef, TaskJoinGate,
+        LocalTaskRef, RawScope, RawTask, ScopeRef, ScopeStorage, SendBoxedTaskNode, SendTask,
+        SendTaskRef, TaskError, TaskHandleRef, TaskJoinGate,
     },
     utils::ownership::{ArcOwnership, Ownership, RcOwnership},
 };
@@ -19,6 +19,7 @@ use std::{
 use veloq_storage::{AtomicStorage, LocalStorage, StateLock, Storage};
 
 mod completion;
+mod guard;
 mod join;
 mod router;
 
@@ -26,9 +27,10 @@ pub(crate) use completion::ScopeCompletionRegistration;
 pub use completion::{GenericScopeCompletion, LocalScopeCompletion, ScopeCompletion};
 pub use join::{JoinHandle, LocalAsyncJoinHandle, LocalJoinHandle, SendJoinHandle};
 
+use guard::ScopeTaskGuard;
 use router::{
-    RoutedJobCell, RoutedSpawnReady, RoutedSpawnState, dispatch_routed, install_routed_pinned_task,
-    make_spawn_to_access,
+    RoutedJobCell, RoutedSpawnReady, RoutedSpawnState, dispatch_routed,
+    handle_enqueue_pinned_outcome, install_routed_pinned_task, make_spawn_to_access,
 };
 
 pub(crate) struct SendPtr<T>(NonNull<T>);
@@ -143,7 +145,7 @@ impl<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra>
     where
         TTask: LocalTask<T> + Sized + 'scope,
     {
-        self.completion.add_task();
+        let mut guard: ScopeTaskGuard<S, O> = ScopeTaskGuard::new(&self.completion);
 
         let worker_id = self.context.worker_id();
         let task_ref = unsafe { LocalTaskRef::from_concrete(task as *const TTask) };
@@ -153,6 +155,7 @@ impl<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra>
                 .header()
                 .initialize(&self.context.shared().base, worker_id, scope_ref);
         }
+        guard.handoff_to(task_ref.header());
         self.context.shared().enqueue_local(worker_id, task_ref);
 
         JoinHandle::new_direct(self, task_ref, task, None)
@@ -165,6 +168,8 @@ impl<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra>
     where
         F: Future<Output = T> + 'scope_ref,
     {
+        let mut guard: ScopeTaskGuard<S, O> = ScopeTaskGuard::new(&self.completion);
+
         let worker_id = self.context.worker_id();
         let scope_ref = self.scope_completion_ref().cast::<LocalStorage>();
         let node = LocalBoxedTaskNode::new(future);
@@ -182,7 +187,7 @@ impl<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra>
         unsafe { write(node_ptr, node) };
 
         let node_ref = unsafe { &*node_ptr };
-        self.completion.add_task();
+        guard.handoff_to(node_ref.header());
 
         let task_ref = unsafe { LocalTaskRef::from_concrete(node_ptr) };
         self.context.shared().enqueue_local(worker_id, task_ref);
@@ -254,7 +259,8 @@ impl<'rt, 'scope, TExtra> GenericAsyncScope<'rt, 'scope, AtomicStorage, ArcOwner
             "worker_id {} is out of bounds",
             worker_id
         );
-        self.completion.add_task();
+        let mut guard: ScopeTaskGuard<AtomicStorage, ArcOwnership> =
+            ScopeTaskGuard::new(&self.completion);
 
         let task_ref = unsafe { SendTaskRef::from_concrete(task as *const S_) };
         unsafe {
@@ -264,6 +270,7 @@ impl<'rt, 'scope, TExtra> GenericAsyncScope<'rt, 'scope, AtomicStorage, ArcOwner
                 self.scope_completion_ref(),
             );
         }
+        guard.handoff_to(task_ref.header());
         self.context.shared().enqueue_send(worker_id, task_ref);
 
         JoinHandle::new_direct(self, task_ref, task, None)
@@ -280,23 +287,23 @@ impl<'rt, 'scope, TExtra> GenericAsyncScope<'rt, 'scope, AtomicStorage, ArcOwner
         self.context.shared().validate_worker_id(worker_id)?;
 
         let state = RoutedSpawnState::new();
-        self.completion.add_task();
+        let guard: ScopeTaskGuard<AtomicStorage, ArcOwnership> =
+            ScopeTaskGuard::new(&self.completion);
 
         let runtime = self.context.shared();
         let runtime_base_ptr = SendPtr::new(NonNull::from(&runtime.base));
-        let completion = self.completion.clone();
         let state_for_job = state.clone();
         let scope_ref = self.scope_completion_ref();
 
         dispatch_routed::<AtomicStorage, ArcOwnership, T, _, TExtra>(
             &self.context,
-            &self.completion,
+            guard,
             state.clone(),
             worker_id,
-            move || {
+            move |guard| {
                 if state_for_job.is_cancel_requested() {
                     state_for_job.fail(TaskError::Cancelled);
-                    completion.task_done();
+                    guard.settle();
                     return;
                 }
 
@@ -307,9 +314,12 @@ impl<'rt, 'scope, TExtra> GenericAsyncScope<'rt, 'scope, AtomicStorage, ArcOwner
                 task.header().set_pinned();
 
                 let task_ref = unsafe { SendTaskRef::from_concrete(task) };
-                if !unsafe { &*runtime_base_ptr.as_ptr() }.enqueue_pinned(worker_id, task_ref) {
+                guard.handoff_to(task.header());
+
+                let outcome =
+                    unsafe { &*runtime_base_ptr.as_ptr() }.enqueue_pinned(worker_id, task_ref);
+                if !handle_enqueue_pinned_outcome(guard, task_ref.header(), outcome) {
                     state_for_job.fail(TaskError::Panic);
-                    completion.task_done();
                     return;
                 }
 
@@ -347,6 +357,8 @@ impl<'rt, 'scope, TExtra> GenericAsyncScope<'rt, 'scope, AtomicStorage, ArcOwner
             worker_id
         );
         let scope_ref = self.scope_completion_ref();
+        let mut guard: ScopeTaskGuard<AtomicStorage, ArcOwnership> =
+            ScopeTaskGuard::new(&self.completion);
         let node = SendBoxedTaskNode::new(future);
         unsafe {
             node.header
@@ -362,7 +374,7 @@ impl<'rt, 'scope, TExtra> GenericAsyncScope<'rt, 'scope, AtomicStorage, ArcOwner
         unsafe { write(node_ptr, node) };
 
         let node_ref = unsafe { &*node_ptr };
-        self.completion.add_task();
+        guard.handoff_to(node_ref.header());
 
         let task_ref = unsafe { SendTaskRef::from_concrete(node_ptr) };
         self.context.shared().enqueue_send(worker_id, task_ref);
@@ -389,11 +401,11 @@ impl<'rt, 'scope, TExtra> GenericAsyncScope<'rt, 'scope, AtomicStorage, ArcOwner
         self.context.shared().validate_worker_id(worker_id)?;
 
         let state = RoutedSpawnState::new();
-        self.completion.add_task();
+        let guard: ScopeTaskGuard<AtomicStorage, ArcOwnership> =
+            ScopeTaskGuard::new(&self.completion);
 
         let runtime = self.context.shared();
         let runtime_ptr = SendPtr::new(NonNull::from(runtime));
-        let completion = self.completion.clone();
         let state_for_job = state.clone();
         let job_layout = Layout::new::<RoutedJobCell<F>>();
         let job_ptr = unsafe {
@@ -410,17 +422,17 @@ impl<'rt, 'scope, TExtra> GenericAsyncScope<'rt, 'scope, AtomicStorage, ArcOwner
         let arena_ptr = SendPtr::new(NonNull::from(&self.arena));
         if let Err(err) = dispatch_routed::<AtomicStorage, ArcOwnership, T, _, TExtra>(
             &self.context,
-            &self.completion,
+            guard,
             state.clone(),
             worker_id,
-            move || {
+            move |guard| {
                 let arena = unsafe { arena_ptr.as_ref() };
                 if state_for_job.is_cancel_requested() {
                     unsafe {
                         arena.drop_object_raw(job_ptr_for_job.as_ptr() as *mut u8, job_layout)
                     };
                     state_for_job.fail(TaskError::Cancelled);
-                    completion.task_done();
+                    guard.settle();
                     return;
                 }
 
@@ -431,14 +443,14 @@ impl<'rt, 'scope, TExtra> GenericAsyncScope<'rt, 'scope, AtomicStorage, ArcOwner
 
                 if state_for_job.is_cancel_requested() {
                     state_for_job.fail(TaskError::Cancelled);
-                    completion.task_done();
+                    guard.settle();
                     return;
                 }
 
                 install_routed_pinned_task(
                     unsafe { &*runtime_ptr.as_ptr() },
                     arena,
-                    completion,
+                    guard,
                     worker_id,
                     state_for_job,
                     future,

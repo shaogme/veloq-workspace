@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use super::shared::RuntimeShared;
+use super::shared::{EnqueuePinnedOutcome, RuntimeShared};
 use crate::{
     error::{Result, RuntimeError},
     scope::{AsyncScope, LocalAsyncScope},
@@ -231,17 +231,22 @@ impl<'rt, T> RuntimeScopeContext<'rt, T> {
         let header_ptr = task_ref.header() as *const GenericTaskHeader<AtomicStorage>;
         let task_ctx = unsafe { SendTaskRef::from_header(header_ptr) };
 
-        if !self.shared().enqueue_pinned(worker_id, task_ctx) {
-            unsafe {
-                let _ = Box::from_raw(ptr);
+        match self.shared().enqueue_pinned(worker_id, task_ctx) {
+            EnqueuePinnedOutcome::Enqueued | EnqueuePinnedOutcome::AlreadyQueued => {}
+            EnqueuePinnedOutcome::AbortedAcknowledged
+            | EnqueuePinnedOutcome::AlreadySettled
+            | EnqueuePinnedOutcome::NeedsCallerSettle => {
+                unsafe {
+                    let _ = Box::from_raw(ptr);
+                }
+                let current_worker = self.worker_id();
+                let is_shutdown = self.is_shutdown();
+                return RuntimeError::DispatchFailed {
+                    target_worker: worker_id,
+                    current_worker,
+                }
+                .with_ctx("is_shutdown", is_shutdown);
             }
-            let current_worker = self.worker_id();
-            let is_shutdown = self.is_shutdown();
-            return RuntimeError::DispatchFailed {
-                target_worker: worker_id,
-                current_worker,
-            }
-            .with_ctx("is_shutdown", is_shutdown);
         }
 
         Ok(RoutedFuture::new(slot))

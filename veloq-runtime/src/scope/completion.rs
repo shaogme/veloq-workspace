@@ -121,14 +121,26 @@ impl<S: ScopeStorage, O: Ownership> GenericScopeCompletion<S, O> {
         &self.cancel_token
     }
 
-    pub fn add_task(&self) {
+    pub(crate) fn register_task(&self) {
         self.remaining.fetch_add(1, Ordering::AcqRel);
     }
 
-    pub fn task_done(&self) {
-        let remaining = self.remaining.fetch_sub(1, Ordering::AcqRel) - 1;
-        if remaining == 0 {
-            self.drain_wakers();
+    pub(crate) fn settle_task(&self) {
+        loop {
+            let prev = self.remaining.load(Ordering::Acquire);
+            if prev == 0 {
+                return;
+            }
+            if self
+                .remaining
+                .compare_exchange(prev, prev - 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                if prev == 1 {
+                    self.drain_wakers();
+                }
+                return;
+            }
         }
     }
 
@@ -206,7 +218,7 @@ impl<S: ScopeStorage, O: Ownership> Drop for GenericScopeCompletion<S, O> {
 impl<S: ScopeStorage, O: Ownership + 'static> RawScope for GenericScopeCompletion<S, O> {
     #[inline]
     fn task_done(&self) {
-        self.task_done();
+        self.settle_task();
     }
 
     #[inline]
@@ -258,5 +270,22 @@ impl<S: ScopeStorage, O: Ownership + 'static> RawScope for GenericScopeCompletio
     unsafe fn drop_raw(&self) {
         let ptr = self as *const Self;
         unsafe { O::decrement_strong_count(ptr) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::ownership::ArcOwnership;
+    use veloq_storage::AtomicStorage;
+
+    #[test]
+    fn duplicate_settle_task_does_not_underflow() {
+        let completion = GenericScopeCompletion::<AtomicStorage, ArcOwnership>::new(None);
+        completion.register_task();
+        completion.settle_task();
+        assert!(completion.is_done());
+        completion.settle_task();
+        assert!(completion.is_done());
     }
 }

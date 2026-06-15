@@ -14,7 +14,9 @@ use veloq_driver_native::{
     op::{DetachedSubmitter, DriverProvider, IntoPlatformOp, IoFd, Op, OpSubmitter},
 };
 use veloq_runtime::{
-    runtime::{IdleDecision, IdleWaitStrategy, RuntimeScopeContext, RuntimeShared},
+    runtime::{
+        EnqueuePinnedOutcome, IdleDecision, IdleWaitStrategy, RuntimeScopeContext, RuntimeShared,
+    },
     scope::{AsyncScope, LocalAsyncScope},
     storage::AtomicStorage,
     task::{
@@ -467,9 +469,12 @@ pub(crate) fn submit_control_task<'a, 'ctx>(
 
     let ptr = Box::into_raw(task);
     let task_ref = unsafe { SendTaskRef::from_concrete(ptr) };
-    if !shared.enqueue_pinned(worker_id, task_ref) {
-        unsafe {
+    match shared.enqueue_pinned(worker_id, task_ref) {
+        EnqueuePinnedOutcome::Enqueued | EnqueuePinnedOutcome::AlreadyQueued => {}
+        EnqueuePinnedOutcome::AbortedAcknowledged
+        | EnqueuePinnedOutcome::AlreadySettled
+        | EnqueuePinnedOutcome::NeedsCallerSettle => unsafe {
             let _ = Box::from_raw(ptr);
-        }
+        },
     }
 }

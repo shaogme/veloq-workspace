@@ -1,15 +1,12 @@
 use crate::{
     error::Result as RuntimeResult,
-    runtime::{RuntimeScopeContext, RuntimeShared},
-    scope::{
-        SendPtr,
-        completion::{GenericScopeCompletion, ScopeCompletion},
-    },
+    runtime::{EnqueuePinnedOutcome, RuntimeScopeContext, RuntimeShared},
+    scope::{GenericScopeCompletion, guard::ScopeTaskGuard},
     task::{
         Arena, GenericArena, GenericTaskHeader, RawScope, RawTask, ScopeRef, ScopeStorage,
         SendBoxedTaskNode, SendTask, SendTaskRef, Task, TaskError, TaskHandleRef,
     },
-    utils::ownership::Ownership,
+    utils::ownership::{ArcOwnership, Ownership},
 };
 use std::{
     alloc::Layout,
@@ -17,12 +14,14 @@ use std::{
     marker::PhantomData,
     panic::{AssertUnwindSafe, catch_unwind},
     ptr::{NonNull, drop_in_place, write},
-    sync::Arc,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::Waker,
 };
 use veloq_atomic_waker::AtomicWaker;
-use veloq_storage::{AtomicOptionPtr, AtomicStorage, StateOptionPtr};
+use veloq_storage::{AtomicOptionPtr, AtomicStorage, StateOptionPtr, Storage};
 
 pub(crate) trait RoutedTaskAccess<T>: Send {
     fn take_result(&self) -> Result<T, TaskError>;
@@ -231,46 +230,53 @@ unsafe impl<'scope_ref, T> Sync for RoutedSpawnState<'scope_ref, T> where T: Sen
 
 pub(crate) fn dispatch_routed<'rt, 'scope_ref, S: ScopeStorage, O: Ownership, T, F, TExtra>(
     context: &RuntimeScopeContext<'rt, TExtra>,
-    completion: &O::Shared<GenericScopeCompletion<S, O>>,
+    mut guard: ScopeTaskGuard<S, O>,
     state: Arc<RoutedSpawnState<'scope_ref, T>>,
     worker_id: usize,
     job: F,
 ) -> RuntimeResult<()>
 where
     O::Shared<GenericScopeCompletion<S, O>>: Send,
-    F: FnOnce() + Send + 'scope_ref,
-    T: 'scope_ref,
+    F: FnOnce(&mut ScopeTaskGuard<S, O>) + Send + 'scope_ref,
+    T: Send + 'scope_ref,
 {
-    let completion_raw_ptr = O::as_ptr(completion) as *const ();
-    let completion_send_ptr = SendPtr::new(NonNull::new(completion_raw_ptr as *mut ()).unwrap());
-
-    let state_raw_ptr = Arc::as_ptr(&state) as *const ();
-    let state_send_ptr = SendPtr::new(NonNull::new(state_raw_ptr as *mut ()).unwrap());
-
-    let job_boxed: Box<dyn FnOnce() + Send + 'scope_ref> = Box::new(job);
+    let completion = guard.completion().clone();
+    let state_for_route = state.clone();
 
     match context.route_to(worker_id, move || {
-        let state_ref: &RoutedSpawnState<'scope_ref, T> =
-            unsafe { &*(state_send_ptr.as_ptr() as *const RoutedSpawnState<'scope_ref, T>) };
-        let completion_ref: &GenericScopeCompletion<S, O> =
-            unsafe { &*(completion_send_ptr.as_ptr() as *const GenericScopeCompletion<S, O>) };
-        let result = catch_unwind(AssertUnwindSafe(move || {
-            job_boxed();
-        }));
+        let result = catch_unwind(AssertUnwindSafe(|| job(&mut guard)));
 
         if let Err(panic_err) = result {
-            completion_ref.report_panic(panic_err);
-            completion_ref.cancel();
-            state_ref.fail(TaskError::Panic);
-            completion_ref.task_done();
+            completion.report_panic(panic_err);
+            completion.cancel();
+            state_for_route.fail(TaskError::Panic);
+            if guard.is_armed() {
+                guard.settle();
+            } else {
+                completion.settle_task();
+            }
         }
         ready(())
     }) {
         Ok(_) => Ok(()),
         Err(err) => {
-            completion.task_done();
             state.fail(TaskError::Panic);
             Err(err)
+        }
+    }
+}
+
+pub(crate) fn handle_enqueue_pinned_outcome<H: Storage, S: ScopeStorage, O: Ownership>(
+    guard: &mut ScopeTaskGuard<S, O>,
+    header: &GenericTaskHeader<H>,
+    outcome: EnqueuePinnedOutcome,
+) -> bool {
+    match outcome {
+        EnqueuePinnedOutcome::Enqueued | EnqueuePinnedOutcome::AlreadyQueued => true,
+        EnqueuePinnedOutcome::AbortedAcknowledged | EnqueuePinnedOutcome::AlreadySettled => false,
+        EnqueuePinnedOutcome::NeedsCallerSettle => {
+            guard.settle_enqueue_failure(header);
+            false
         }
     }
 }
@@ -278,7 +284,7 @@ where
 pub(crate) fn install_routed_pinned_task<'scope_ref, 'rt, T, Fut, TExtra>(
     runtime: &'rt RuntimeShared<TExtra>,
     arena: &GenericArena<AtomicStorage>,
-    completion: Arc<ScopeCompletion>,
+    guard: &mut ScopeTaskGuard<AtomicStorage, ArcOwnership>,
     worker_id: usize,
     state: Arc<RoutedSpawnState<'scope_ref, T>>,
     future: Fut,
@@ -287,7 +293,7 @@ pub(crate) fn install_routed_pinned_task<'scope_ref, 'rt, T, Fut, TExtra>(
     Fut: Future<Output = T> + 'scope_ref,
 {
     let scope_ref = unsafe {
-        let non_null = RawScope::clone_raw(&*completion);
+        let non_null = RawScope::clone_raw(guard.completion_ref());
         ScopeRef::new(non_null)
     };
     let node = SendBoxedTaskNode::new(future);
@@ -312,10 +318,12 @@ pub(crate) fn install_routed_pinned_task<'scope_ref, 'rt, T, Fut, TExtra>(
     let task_ctx = unsafe { SendTaskRef::from_header(header_ptr) };
     let header = task_ref.header();
 
-    if !runtime.enqueue_pinned(worker_id, task_ctx) {
+    guard.handoff_to(header);
+
+    let outcome = runtime.enqueue_pinned(worker_id, task_ctx);
+    if !handle_enqueue_pinned_outcome(guard, header, outcome) {
         unsafe { arena.drop_object_raw(node_ptr as *mut u8, layout) };
         state.fail(TaskError::Panic);
-        completion.task_done();
         return;
     }
 
