@@ -13,7 +13,8 @@ fn test_nested_scope_local_build() {
             });
         })
         .await;
-    });
+    })
+    .unwrap();
 }
 
 #[test]
@@ -29,7 +30,8 @@ fn test_nested_scope_build_1() {
             });
         })
         .await;
-    });
+    })
+    .unwrap();
 }
 
 #[test]
@@ -45,7 +47,8 @@ fn test_nested_scope_build_2() {
             });
         })
         .await;
-    });
+    })
+    .unwrap();
 }
 
 #[test]
@@ -59,7 +62,8 @@ fn test_nested_scope_build_3() {
             .await;
         })
         .await;
-    });
+    })
+    .unwrap();
 }
 
 #[test]
@@ -73,7 +77,8 @@ fn test_nested_scope_build_4() {
             .await;
         })
         .await;
-    });
+    })
+    .unwrap();
 }
 
 #[test]
@@ -89,7 +94,8 @@ fn test_nested_scope_build_5() {
             });
         })
         .await;
-    });
+    })
+    .unwrap();
 }
 
 // This test fails to compile due to limitations in Rust's current lifetime inference mechanism.
@@ -112,5 +118,5 @@ fn test_nested_scope_build_5() {
 //             });
 //         })
 //         .await;
-//     });
+//     }).unwrap();
 // }

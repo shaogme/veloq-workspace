@@ -37,7 +37,8 @@ fn test_select_basic() {
             _ = PendingFuture => 2,
         };
         assert_eq!(res, 1);
-    });
+    })
+    .unwrap();
 }
 
 #[test]
@@ -50,7 +51,8 @@ fn test_select_biased() {
             val2 = ready(20) => val2,
         };
         assert_eq!(res, 10);
-    });
+    })
+    .unwrap();
 }
 
 #[test]
@@ -63,7 +65,8 @@ fn test_select_biased_reverse() {
             val2 = ready(10) => val2,
         };
         assert_eq!(res, 20);
-    });
+    })
+    .unwrap();
 }
 
 #[test]
@@ -76,7 +79,8 @@ fn test_select_expression() {
             _ = PendingFuture => 0,
         };
         assert_eq!(res, 10);
-    });
+    })
+    .unwrap();
 }
 
 #[test]
@@ -89,7 +93,8 @@ fn test_select_three_branches() {
             val = ready(3) => val,
         };
         assert_eq!(res, 3);
-    });
+    })
+    .unwrap();
 }
 
 #[test]
@@ -116,5 +121,6 @@ fn test_select_cancellation() {
             }
         })
         .await;
-    });
+    })
+    .unwrap();
 }

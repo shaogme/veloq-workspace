@@ -23,7 +23,8 @@ fn test_join_handle_waits_for_task_completion_on_cancel() {
             assert!(matches!(res, Err(TaskError::Cancelled)));
         })
         .await;
-    });
+    })
+    .unwrap();
 }
 
 #[test]
@@ -47,7 +48,8 @@ fn test_join_handle_cancelled_before_await() {
             assert!(matches!(res, Err(TaskError::Cancelled)));
         })
         .await;
-    });
+    })
+    .unwrap();
 }
 
 #[test]
@@ -72,5 +74,6 @@ fn test_join_handle_scope_cancel_waits_for_completion() {
             assert!(matches!(res, Err(TaskError::Cancelled)));
         })
         .await;
-    });
+    })
+    .unwrap();
 }

@@ -17,7 +17,8 @@ fn test_panic_propagation() {
             })
             .await;
             println!("如果不传播，这里会被打印");
-        });
+        })
+        .unwrap();
     }));
 
     match result {

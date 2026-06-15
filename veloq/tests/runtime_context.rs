@@ -8,8 +8,10 @@ fn runtime_binds_buf_pool_to_current_thread() {
         .build()
         .expect("failed to build runtime");
 
-    runtime.block_on(async |ctx| {
-        let pool = ctx.buf_pool();
-        assert!(pool.alloc(nz!(64)).is_some());
-    });
+    runtime
+        .block_on(async |ctx| {
+            let pool = ctx.buf_pool();
+            assert!(pool.alloc(nz!(64)).is_some());
+        })
+        .unwrap();
 }

@@ -13,7 +13,8 @@ fn test_scope_local_basic() {
             assert_eq!(h2.await.unwrap(), 4);
         })
         .await;
-    });
+    })
+    .unwrap();
 }
 
 #[test]
@@ -31,7 +32,8 @@ fn test_scope_local_nested() {
             assert_eq!(h1.await.unwrap(), 10);
         })
         .await;
-    });
+    })
+    .unwrap();
 }
 
 #[test]
@@ -72,5 +74,6 @@ fn test_scope_local_nested_in_async_scope_cancellation() {
             ));
         })
         .await;
-    });
+    })
+    .unwrap();
 }

@@ -115,7 +115,7 @@ impl<T: PoolTopology> Runtime<T> {
         self.worker_count
     }
 
-    pub fn block_on<R, F>(self, f: F) -> R
+    pub fn block_on<R, F>(self, f: F) -> VeloqResult<R>
     where
         F: for<'s1, 's2> AsyncFnOnce(RuntimeContext<'s1, 's2>) -> R,
     {
@@ -190,9 +190,11 @@ impl<T: PoolTopology> Runtime<T> {
             })
             .build();
 
-        runtime.block_on(async move |scope| {
-            let ctx = RuntimeContext { scope };
-            f(ctx).await
-        })
+        runtime
+            .block_on(async move |scope| {
+                let ctx = RuntimeContext { scope };
+                f(ctx).await
+            })
+            .trans()
     }
 }

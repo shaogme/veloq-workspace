@@ -5,12 +5,16 @@ use std::{
     ops::AsyncFnOnce,
     pin::pin,
     ptr,
-    sync::Arc,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
     thread,
 };
 
-use crate::utils::{FastRand, ownership::ArcOwnership};
+use crate::{
+    error::{Result, RuntimeError},
+    utils::{FastRand, ownership::ArcOwnership},
+};
+use diagweave::prelude::*;
 use veloq_storage::AtomicStorage;
 
 pub mod context;
@@ -58,7 +62,7 @@ impl<T, WF> Runtime<T, WF> {
         self.shared.worker_count()
     }
 
-    pub fn block_on<'run, R, F>(mut self, f: F) -> R
+    pub fn block_on<'run, R, F>(mut self, f: F) -> Result<R>
     where
         T: 'run,
         WF: Fn(usize, &'run RuntimeShared<T>) -> T + Send + Sync,
@@ -78,11 +82,16 @@ impl<T, WF> Runtime<T, WF> {
         let worker_factory = self
             .worker_factory
             .take()
-            .expect("worker_factory already taken");
-        let receivers = self.receivers.take().expect("receivers already taken");
+            .ok_or(RuntimeError::WorkerFactoryAlreadyTaken)?;
+        let receivers = self
+            .receivers
+            .take()
+            .ok_or(RuntimeError::ReceiversAlreadyTaken)?;
         let mut deques = receivers.deques;
 
-        thread::scope(|scope| {
+        let thread_errors = Mutex::new(None);
+
+        let res = thread::scope(|scope| {
             struct ShutdownGuard<'a, T>(&'a RuntimeShared<T>);
             impl<'a, T> Drop for ShutdownGuard<'a, T> {
                 fn drop(&mut self) {
@@ -92,8 +101,14 @@ impl<T, WF> Runtime<T, WF> {
             let _guard = ShutdownGuard(shared_ref);
 
             for worker_id in (1..worker_count.get()).rev() {
-                let deque = deques.pop().expect("deques exhausted");
+                let deque = match deques.pop() {
+                    Some(d) => d,
+                    None => {
+                        return RuntimeError::DequesExhausted { worker_id }.trans();
+                    }
+                };
                 let worker_factory_ref = &worker_factory;
+                let thread_errors_ref = &thread_errors;
 
                 let context = RuntimeContext {
                     worker_id,
@@ -102,15 +117,27 @@ impl<T, WF> Runtime<T, WF> {
                 };
 
                 scope.spawn(move || {
-                    shared_ref
-                        .base
-                        .tls
-                        .set_owned(context)
-                        .expect("failed to set runtime context");
-                    shared_ref
-                        .extra_tls
-                        .set_owned(worker_factory_ref(worker_id, shared_ref))
-                        .expect("failed to set extra TLS");
+                    let init_res = (|| {
+                        shared_ref.base.tls.set_owned(context).map_err(|source| {
+                            RuntimeError::TlsSetOwnedFailed { worker_id, source }
+                        })?;
+                        shared_ref
+                            .extra_tls
+                            .set_owned(worker_factory_ref(worker_id, shared_ref))
+                            .map_err(|source| {
+                                RuntimeError::TlsSetOwnedFailed { worker_id, source }
+                            })?;
+                        Ok(())
+                    })();
+
+                    if let Err(err) = init_res {
+                        let mut guard = thread_errors_ref.lock().unwrap_or_else(|e| e.into_inner());
+                        if guard.is_none() {
+                            *guard = Some(err);
+                        }
+                        return;
+                    }
+
                     let _tls_cleanup = TlsCleanupGuard(&shared_ref.base.tls);
                     let _extra_cleanup = TlsCleanupGuard(&shared_ref.extra_tls);
 
@@ -118,24 +145,40 @@ impl<T, WF> Runtime<T, WF> {
                 });
             }
 
-            let deque0 = deques.pop().expect("main worker deque exhausted");
+            let deque0 = deques.pop().ok_or(RuntimeError::MainWorkerDequeExhausted)?;
 
             let context = RuntimeContext {
                 worker_id: 0,
                 rand: FastRand::new(0),
                 worker: deque0,
             };
-            shared_ref
-                .base
-                .tls
-                .set_owned(context)
-                .expect("failed to set runtime context");
+            shared_ref.base.tls.set_owned(context).map_err(|source| {
+                RuntimeError::TlsSetOwnedFailed {
+                    worker_id: 0,
+                    source,
+                }
+                .to_report()
+            })?;
             shared_ref
                 .extra_tls
                 .set_owned(worker_factory(0, shared_ref))
-                .expect("failed to set extra TLS");
+                .map_err(|source| {
+                    RuntimeError::TlsSetOwnedFailed {
+                        worker_id: 0,
+                        source,
+                    }
+                    .to_report()
+                })?;
             let _tls_cleanup = TlsCleanupGuard(&shared_ref.base.tls);
             let _extra_cleanup = TlsCleanupGuard(&shared_ref.extra_tls);
+
+            if let Some(err) = thread_errors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                return Err(err);
+            }
 
             let signal = Arc::new(Signal::new(true));
             let waker = create_waker(signal.clone());
@@ -144,10 +187,18 @@ impl<T, WF> Runtime<T, WF> {
             shared_ref.drive_worker::<AtomicStorage, ArcOwnership>(None);
 
             let mut fut = pin!(f(ctx));
-            loop {
+            let block_res = loop {
+                if let Some(err) = thread_errors
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                {
+                    break Err(err);
+                }
+
                 match fut.as_mut().poll(&mut cx) {
                     Poll::Ready(res) => {
-                        break res;
+                        break Ok(res);
                     }
                     Poll::Pending => match shared_ref
                         .idle_hook
@@ -161,8 +212,22 @@ impl<T, WF> Runtime<T, WF> {
                         IdleDecision::Wait(IdleWaitStrategy::Block) => signal.wait(),
                     },
                 }
+            };
+
+            if block_res.is_ok() {
+                if let Some(err) = thread_errors
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+                {
+                    return Err(err);
+                }
             }
-        })
+
+            block_res
+        })?;
+
+        Ok(res)
     }
 }
 
@@ -193,7 +258,6 @@ impl Default for RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
 }
 
 impl<T, WF> RuntimeBuilder<T, WF> {
-
     pub fn with_worker_count(mut self, count: Option<NonZeroUsize>) -> Self {
         self.worker_count = count;
         self
@@ -230,13 +294,11 @@ impl<T, WF> RuntimeBuilder<T, WF> {
     }
 
     pub fn build(self) -> Runtime<T, WF> {
-        let worker_count = self
-            .worker_count
-            .unwrap_or_else(|| thread::available_parallelism().unwrap_or(NonZeroUsize::new(1).unwrap()));
-        let (registry, topo, receivers) = init_runtime_components(
-            worker_count,
-            self.queue_capacity,
-        );
+        let worker_count = self.worker_count.unwrap_or_else(|| {
+            thread::available_parallelism().unwrap_or(NonZeroUsize::new(1).unwrap())
+        });
+        let (registry, topo, receivers) =
+            init_runtime_components(worker_count, self.queue_capacity);
         let shared = RuntimeShared::new(
             registry,
             topo,

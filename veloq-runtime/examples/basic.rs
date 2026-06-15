@@ -192,6 +192,7 @@ fn main() {
         })
         .await;
         println!("--- scope 结束 ---");
-    });
+    })
+    .unwrap();
     println!("--- 所有任务安全完成 ---");
 }

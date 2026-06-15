@@ -11,7 +11,8 @@ fn test_local_task_execution() {
             assert_eq!(handle.await.unwrap(), 2);
         })
         .await;
-    });
+    })
+    .unwrap();
 }
 
 #[test]
@@ -27,5 +28,6 @@ fn test_local_task_with_yield() {
             assert_eq!(handle.await.unwrap(), 42);
         })
         .await;
-    });
+    })
+    .unwrap();
 }

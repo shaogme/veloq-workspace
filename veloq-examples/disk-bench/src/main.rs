@@ -449,116 +449,120 @@ fn main() {
         .expect("Failed to build Runtime");
 
     // Execute
-    runtime.block_on(async |ctx| {
-        ctx.scope(async |s| {
-            // 1. Preparation Phase (Create & Fallocate)
-            println!("Initializing disk files (creating & fallocating)... This may take a while.");
-            let mut prepare_handles = Vec::with_capacity(args.threads);
-            for t_idx in 0..args.threads {
-                let prepare_buffering = buffering_mode;
-                prepare_handles.push(
-                    s.spawn_boxed_to(t_idx, async move || {
-                        prepare_files_for_thread(
-                            ctx,
-                            FILE_SIZE_PER_THREAD,
-                            t_idx,
-                            prepare_buffering,
-                        )
-                        .await;
-                    })
-                    .expect("prepare task dispatch failed"),
+    runtime
+        .block_on(async |ctx| {
+            ctx.scope(async |s| {
+                // 1. Preparation Phase (Create & Fallocate)
+                println!(
+                    "Initializing disk files (creating & fallocating)... This may take a while."
                 );
-            }
-            for handle in prepare_handles {
-                handle.await.expect("Preparation task failed");
-            }
-            println!("Files prepared. Starting Benchmark Measurement...");
+                let mut prepare_handles = Vec::with_capacity(args.threads);
+                for t_idx in 0..args.threads {
+                    let prepare_buffering = buffering_mode;
+                    prepare_handles.push(
+                        s.spawn_boxed_to(t_idx, async move || {
+                            prepare_files_for_thread(
+                                ctx,
+                                FILE_SIZE_PER_THREAD,
+                                t_idx,
+                                prepare_buffering,
+                            )
+                            .await;
+                        })
+                        .expect("prepare task dispatch failed"),
+                    );
+                }
+                for handle in prepare_handles {
+                    handle.await.expect("Preparation task failed");
+                }
+                println!("Files prepared. Starting Benchmark Measurement...");
 
-            // 2. Measurement Phase
-            let duration_limit = Duration::from_secs(args.duration);
-            let min_iters = args.iterations;
-            let mut worker_handles = Vec::with_capacity(args.threads);
+                // 2. Measurement Phase
+                let duration_limit = Duration::from_secs(args.duration);
+                let min_iters = args.iterations;
+                let mut worker_handles = Vec::with_capacity(args.threads);
 
-            for config in configs {
-                let qdepth = args.qdepth;
-                let worker_buffering = buffering_mode;
-                let worker_sync = sync_mode;
-                let t_idx = config.thread_index;
+                for config in configs {
+                    let qdepth = args.qdepth;
+                    let worker_buffering = buffering_mode;
+                    let worker_sync = sync_mode;
+                    let t_idx = config.thread_index;
 
-                worker_handles.push(
-                    s.spawn_boxed_to(t_idx, async move || {
-                        run_worker(
-                            ctx,
-                            qdepth,
-                            duration_limit,
-                            min_iters,
-                            worker_buffering,
-                            worker_sync,
-                            config,
-                        )
+                    worker_handles.push(
+                        s.spawn_boxed_to(t_idx, async move || {
+                            run_worker(
+                                ctx,
+                                qdepth,
+                                duration_limit,
+                                min_iters,
+                                worker_buffering,
+                                worker_sync,
+                                config,
+                            )
+                            .await
+                        })
+                        .expect("worker task dispatch failed"),
+                    );
+                }
+
+                // 3. Aggregate
+                let mut all_throughputs = Vec::new();
+                let mut total_bytes_all = 0;
+                let bench_start = Instant::now(); // Approx wall time for throughput calc if we want system-wide
+
+                for handle in worker_handles {
+                    let worker_results = handle
                         .await
-                    })
-                    .expect("worker task dispatch failed"),
-                );
-            }
+                        .expect("Worker task failed")
+                        .expect("Worker execution failed");
 
-            // 3. Aggregate
-            let mut all_throughputs = Vec::new();
-            let mut total_bytes_all = 0;
-            let bench_start = Instant::now(); // Approx wall time for throughput calc if we want system-wide
+                    // Calculate thread average
+                    let mut thread_bytes = 0;
 
-            for handle in worker_handles {
-                let worker_results = handle
-                    .await
-                    .expect("Worker task failed")
-                    .expect("Worker execution failed");
+                    for r in worker_results {
+                        thread_bytes += r.bytes;
 
-                // Calculate thread average
-                let mut thread_bytes = 0;
-
-                for r in worker_results {
-                    thread_bytes += r.bytes;
-
-                    let secs = r.duration.as_secs_f64();
-                    if secs > 0.0 {
-                        let mb = r.bytes as f64 / 1024.0 / 1024.0;
-                        all_throughputs.push(mb / secs);
+                        let secs = r.duration.as_secs_f64();
+                        if secs > 0.0 {
+                            let mb = r.bytes as f64 / 1024.0 / 1024.0;
+                            all_throughputs.push(mb / secs);
+                        }
                     }
+                    total_bytes_all += thread_bytes;
                 }
-                total_bytes_all += thread_bytes;
-            }
 
-            let elapsed = bench_start.elapsed();
-            let total_mb = total_bytes_all as f64 / 1024.0 / 1024.0;
-            let system_throughput = if elapsed.as_secs_f64() > 0.0 {
-                total_mb / elapsed.as_secs_f64()
-            } else {
-                0.0
-            };
+                let elapsed = bench_start.elapsed();
+                let total_mb = total_bytes_all as f64 / 1024.0 / 1024.0;
+                let system_throughput = if elapsed.as_secs_f64() > 0.0 {
+                    total_mb / elapsed.as_secs_f64()
+                } else {
+                    0.0
+                };
 
-            println!("--------------------------------------------------");
-            println!("Benchmark Completed.");
-            println!("Total Data Measured: {:.2} MB", total_mb);
-            println!("Wall Time (Approx):  {:.2} s", elapsed.as_secs_f64());
-            println!("System Throughput:   {:.2} MB/s", system_throughput);
-            println!("--------------------------------------------------");
+                println!("--------------------------------------------------");
+                println!("Benchmark Completed.");
+                println!("Total Data Measured: {:.2} MB", total_mb);
+                println!("Wall Time (Approx):  {:.2} s", elapsed.as_secs_f64());
+                println!("System Throughput:   {:.2} MB/s", system_throughput);
+                println!("--------------------------------------------------");
 
-            if !all_throughputs.is_empty() {
-                let avg_raw: f64 =
-                    all_throughputs.iter().sum::<f64>() / all_throughputs.len() as f64;
-                println!("Average Iteration Throughput: {:.2} MB/s", avg_raw);
+                if !all_throughputs.is_empty() {
+                    let avg_raw: f64 =
+                        all_throughputs.iter().sum::<f64>() / all_throughputs.len() as f64;
+                    println!("Average Iteration Throughput: {:.2} MB/s", avg_raw);
 
-                let filtered = filter_outliers(all_throughputs);
-                if !filtered.is_empty() {
-                    let avg_filt: f64 = filtered.iter().sum::<f64>() / filtered.len() as f64;
-                    println!("Filtered Avg Throughput (IQR): {:.2} MB/s", avg_filt);
+                    let filtered = filter_outliers(all_throughputs);
+                    if !filtered.is_empty() {
+                        let avg_filt: f64 = filtered.iter().sum::<f64>() / filtered.len() as f64;
+                        println!("Filtered Avg Throughput (IQR): {:.2} MB/s", avg_filt);
+                    }
+                } else {
+                    println!("No data collected.");
                 }
-            } else {
-                println!("No data collected.");
-            }
+            })
+            .await;
         })
-        .await;
-    });
+        .unwrap();
 
     // 4. Cleanup Phase
     println!("Cleaning up files...");

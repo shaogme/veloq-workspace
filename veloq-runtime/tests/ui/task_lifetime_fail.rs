@@ -26,5 +26,5 @@ fn main() {
             let _ = s.spawn(&t);
         })
         .await;
-    });
+    }).unwrap();
 }
