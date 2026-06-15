@@ -10,9 +10,12 @@ use veloq_buf::{
 #[cfg(feature = "test-hooks")]
 use veloq_driver_native::driver::test_hooks::DriverTestHooks;
 
-fn build_runtime(worker_threads: usize, mode: BufferRegistrationMode) -> Runtime<UniformSlot> {
+fn build_runtime(
+    worker_threads: NonZeroUsize,
+    mode: BufferRegistrationMode,
+) -> Runtime<UniformSlot> {
     Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(1))))
-        .worker_count(NonZeroUsize::new(worker_threads).expect("worker_threads must be > 0"))
+        .worker_count(Some(worker_threads))
         .with_config(|c| c.iocp_registration_mode(mode).uring_registration_mode(mode))
         .build()
         .expect("failed to build runtime")
@@ -31,7 +34,7 @@ fn current_chunk_register_attempts(ctx: RuntimeContext<'_, '_>) -> u64 {
 }
 
 fn run_auto_expansion_single_worker(mode: BufferRegistrationMode) {
-    let runtime = build_runtime(1, mode);
+    let runtime = build_runtime(nz!(1), mode);
     runtime.block_on(async |ctx| {
         let pool = ctx.buf_pool();
         let alloc_size = nz!(1024 * 1024);
@@ -75,7 +78,7 @@ fn run_expansion_immediate_registration_check(
     mode: BufferRegistrationMode,
     _should_immediate: bool,
 ) {
-    let runtime = build_runtime(1, mode);
+    let runtime = build_runtime(nz!(1), mode);
     runtime.block_on(async |ctx| {
         let pool = ctx.buf_pool();
         let alloc_size = nz!(1024 * 1024);
@@ -125,7 +128,7 @@ fn run_expansion_immediate_registration_check(
 }
 
 fn run_auto_expansion_multithread(mode: BufferRegistrationMode) {
-    let runtime = build_runtime(2, mode);
+    let runtime = build_runtime(nz!(2), mode);
     runtime.block_on(async |ctx| {
         let pool = ctx.buf_pool();
         let alloc_size = nz!(1024 * 1024);

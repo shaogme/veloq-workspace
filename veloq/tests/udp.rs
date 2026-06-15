@@ -21,12 +21,12 @@ use veloq_buf::{FixedBuf, UniformSlot, heap::ThreadMemoryMultiplier, nz};
 use veloq_runtime::{select, task::yield_now};
 
 fn create_runtime() -> Runtime<UniformSlot> {
-    create_runtime_with_workers(1)
+    create_runtime_with_workers(nz!(1))
 }
 
-fn create_runtime_with_workers(worker_threads: usize) -> Runtime<UniformSlot> {
+fn create_runtime_with_workers(worker_threads: NonZeroUsize) -> Runtime<UniformSlot> {
     Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(4))))
-        .worker_count(NonZeroUsize::new(worker_threads).expect("worker_threads must be > 0"))
+        .worker_count(Some(worker_threads))
         .build()
         .expect("failed to build runtime")
 }
@@ -355,7 +355,7 @@ fn udp_read_exact_write_all() {
 
 #[test]
 fn multithread_udp_no_echo() {
-    let runtime = create_runtime_with_workers(3);
+    let runtime = create_runtime_with_workers(nz!(3));
     runtime.block_on(async |ctx| {
         const NUM_WORKERS: usize = 3;
         let completed = Arc::new(AtomicUsize::new(0));
@@ -409,7 +409,7 @@ fn multithread_udp_no_echo() {
 
 #[test]
 fn multithread_udp_echo() {
-    let runtime = create_runtime_with_workers(2);
+    let runtime = create_runtime_with_workers(nz!(2));
     runtime.block_on(async |ctx| {
         let (addr_tx, mut addr_rx) = mpsc::unbounded::<SocketAddr>();
         let (done_tx, mut done_rx) = mpsc::unbounded::<()>();
@@ -476,7 +476,7 @@ fn multithread_udp_echo() {
 
 #[test]
 fn multithread_udp_cross_worker_drop_is_routed() {
-    let runtime = create_runtime_with_workers(2);
+    let runtime = create_runtime_with_workers(nz!(2));
     runtime.block_on(async |ctx| {
         let (clone_tx, mut clone_rx) = mpsc::unbounded::<UdpSocket<'_, '_>>();
         let (ready_tx, mut ready_rx) = mpsc::unbounded::<()>();
@@ -539,7 +539,7 @@ fn multithread_udp_cross_worker_drop_is_routed() {
 
 #[test]
 fn multithread_concurrent_udp_clients() {
-    let runtime = create_runtime_with_workers(4);
+    let runtime = create_runtime_with_workers(nz!(4));
     runtime.block_on(async |ctx| {
         const NUM_CLIENTS: usize = 3;
         let completed = Arc::new(AtomicUsize::new(0));

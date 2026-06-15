@@ -433,7 +433,7 @@ fn main() {
     }
 
     // Initialize Runtime
-    let worker_count = NonZeroUsize::new(args.threads).expect("threads must be non-zero");
+    let worker_count = NonZeroUsize::new(args.threads);
     let buffer_multiplier_bytes = args
         .qdepth
         .saturating_mul(block_size_bytes.get())

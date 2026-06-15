@@ -141,9 +141,9 @@ async fn open_and_fallocate<'a, 'ctx>(
     file
 }
 
-fn create_runtime(worker_threads: usize) -> Runtime<UniformSlot> {
+fn create_runtime(worker_threads: NonZeroUsize) -> Runtime<UniformSlot> {
     Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(128))))
-        .worker_count(NonZeroUsize::new(worker_threads).expect("worker_threads must be > 0"))
+        .worker_count(Some(worker_threads))
         .build()
         .expect("failed to build runtime")
 }
@@ -319,7 +319,7 @@ fn benchmark_1gb_write(c: &mut Criterion) {
                 b.iter_custom(|iters| {
                     let mut total_elapsed = Duration::ZERO;
                     for _ in 0..iters {
-                        let runtime = create_runtime(1);
+                        let runtime = create_runtime(nz!(1));
                         let elapsed = runtime.block_on(async |ctx| {
                             run_1gb_iteration(ctx, BenchPhase::Total, buffering_mode, sync_mode)
                                 .await
@@ -335,7 +335,7 @@ fn benchmark_1gb_write(c: &mut Criterion) {
                 b.iter_custom(|iters| {
                     let mut total_elapsed = Duration::ZERO;
                     for _ in 0..iters {
-                        let runtime = create_runtime(1);
+                        let runtime = create_runtime(nz!(1));
                         let elapsed = runtime.block_on(async |ctx| {
                             run_1gb_iteration(ctx, BenchPhase::Write, buffering_mode, sync_mode)
                                 .await
@@ -351,7 +351,7 @@ fn benchmark_1gb_write(c: &mut Criterion) {
                 b.iter_custom(|iters| {
                     let mut total_elapsed = Duration::ZERO;
                     for _ in 0..iters {
-                        let runtime = create_runtime(1);
+                        let runtime = create_runtime(nz!(1));
                         let elapsed = runtime.block_on(async |ctx| {
                             run_1gb_iteration(ctx, BenchPhase::Flush, buffering_mode, sync_mode)
                                 .await
@@ -375,15 +375,15 @@ fn benchmark_32_files_write(c: &mut Criterion) {
 
     // 1GB Total Size
     const FILE_COUNT: usize = 32;
-    const WORKER_COUNT: usize = 4;
+    const WORKER_COUNT: NonZeroUsize = nz!(4);
     const TOTAL_SIZE: u64 = 1024 * 1024 * 1024;
     const FILE_SIZE: u64 = TOTAL_SIZE / FILE_COUNT as u64;
-    const FILES_PER_WORKER: usize = FILE_COUNT / WORKER_COUNT;
+    const FILES_PER_WORKER: usize = FILE_COUNT / WORKER_COUNT.get();
     let buffering_mode = bench_buffering_mode();
     let sync_mode = bench_sync_mode();
 
     // Ensure accurate division
-    assert_eq!(FILES_PER_WORKER * WORKER_COUNT, FILE_COUNT);
+    assert_eq!(FILES_PER_WORKER * WORKER_COUNT.get(), FILE_COUNT);
 
     group.throughput(Throughput::Bytes(TOTAL_SIZE));
     group.sample_size(10);
@@ -401,8 +401,8 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                     let pid = std::process::id();
 
                     ctx.scope(async |s| {
-                        let mut prepare_handles = Vec::with_capacity(WORKER_COUNT);
-                        for worker_id in 0..WORKER_COUNT {
+                        let mut prepare_handles = Vec::with_capacity(WORKER_COUNT.get());
+                        for worker_id in 0..WORKER_COUNT.get() {
                             let prepare_path_names: Vec<PathBuf> = (0..FILES_PER_WORKER)
                                 .map(|f_idx| {
                                     bench_file_path(

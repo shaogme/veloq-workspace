@@ -17,12 +17,12 @@ use veloq_buf::{FixedBuf, UniformSlot, heap::ThreadMemoryMultiplier, nz};
 use veloq_runtime::{select, task::yield_now};
 
 fn create_runtime() -> Runtime<UniformSlot> {
-    create_runtime_with_workers(1)
+    create_runtime_with_workers(nz!(1))
 }
 
-fn create_runtime_with_workers(worker_threads: usize) -> Runtime<UniformSlot> {
+fn create_runtime_with_workers(worker_threads: NonZeroUsize) -> Runtime<UniformSlot> {
     Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(4))))
-        .worker_count(NonZeroUsize::new(worker_threads).expect("worker_threads must be > 0"))
+        .worker_count(Some(worker_threads))
         .build()
         .expect("failed to build runtime")
 }
@@ -254,7 +254,7 @@ fn tcp_multiple_connections() {
 
 #[test]
 fn multithread_tcp_connections() {
-    let runtime = create_runtime_with_workers(3);
+    let runtime = create_runtime_with_workers(nz!(3));
     runtime.block_on(async |ctx| {
         const NUM_WORKERS: usize = 3;
         let connection_count = Arc::new(AtomicUsize::new(0));
@@ -293,7 +293,7 @@ fn multithread_tcp_connections() {
 
 #[test]
 fn multithread_tcp_echo() {
-    let runtime = create_runtime_with_workers(2);
+    let runtime = create_runtime_with_workers(nz!(2));
     runtime.block_on(async |ctx| {
         let (addr_tx, mut addr_rx) = mpsc::unbounded::<SocketAddr>();
         let (done_tx, mut done_rx) = mpsc::unbounded::<()>();
@@ -368,7 +368,7 @@ fn multithread_tcp_echo() {
 
 #[test]
 fn multithread_concurrent_tcp_clients() {
-    let runtime = create_runtime_with_workers(4);
+    let runtime = create_runtime_with_workers(nz!(4));
     runtime.block_on(async |ctx| {
         const NUM_CLIENTS: usize = 3;
         let connection_count = Arc::new(AtomicUsize::new(0));

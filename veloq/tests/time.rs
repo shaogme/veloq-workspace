@@ -10,16 +10,16 @@ use veloq::{
 use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
 use veloq_runtime::select;
 
-fn build_runtime(worker_threads: usize) -> Runtime<UniformSlot> {
+fn build_runtime(worker_threads: NonZeroUsize) -> Runtime<UniformSlot> {
     Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(4))))
-        .worker_count(NonZeroUsize::new(worker_threads).expect("worker_threads must be > 0"))
+        .worker_count(Some(worker_threads))
         .build()
         .expect("failed to build runtime")
 }
 
 #[test]
 fn test_sleep_basic() {
-    let runtime = build_runtime(1);
+    let runtime = build_runtime(nz!(1));
 
     runtime.block_on(async |ctx| {
         let start = Instant::now();
@@ -31,7 +31,7 @@ fn test_sleep_basic() {
 
 #[test]
 fn test_sleep_local_basic() {
-    let runtime = build_runtime(1);
+    let runtime = build_runtime(nz!(1));
 
     runtime.block_on(async |ctx| {
         ctx.scope_local(async |s| {
@@ -50,7 +50,7 @@ fn test_sleep_local_basic() {
 
 #[test]
 fn test_sleep_until() {
-    let runtime = build_runtime(1);
+    let runtime = build_runtime(nz!(1));
 
     runtime.block_on(async |ctx| {
         let deadline = Instant::now() + Duration::from_millis(200);
@@ -61,7 +61,7 @@ fn test_sleep_until() {
 
 #[test]
 fn test_sleep_zero_duration() {
-    let runtime = build_runtime(1);
+    let runtime = build_runtime(nz!(1));
 
     runtime.block_on(async |ctx| {
         let start = Instant::now();
@@ -73,7 +73,7 @@ fn test_sleep_zero_duration() {
 
 #[test]
 fn test_sleep_reset() {
-    let runtime = build_runtime(1);
+    let runtime = build_runtime(nz!(1));
 
     runtime.block_on(async |ctx| {
         let mut s = sleep(ctx, Duration::from_secs(10));
@@ -90,7 +90,7 @@ fn test_sleep_reset() {
 
 #[test]
 fn test_timeout_success() {
-    let runtime = build_runtime(1);
+    let runtime = build_runtime(nz!(1));
 
     runtime.block_on(async |ctx| {
         let result = timeout(ctx, Duration::from_secs(1), async { "success" }).await;
@@ -100,7 +100,7 @@ fn test_timeout_success() {
 
 #[test]
 fn test_timeout_elapsed() {
-    let runtime = build_runtime(1);
+    let runtime = build_runtime(nz!(1));
 
     runtime.block_on(async |ctx| {
         let result = timeout(ctx, Duration::from_millis(50), async {
@@ -115,7 +115,7 @@ fn test_timeout_elapsed() {
 
 #[test]
 fn test_timeout_at() {
-    let runtime = build_runtime(1);
+    let runtime = build_runtime(nz!(1));
 
     runtime.block_on(async |ctx| {
         let deadline = Instant::now() + Duration::from_millis(50);
@@ -130,7 +130,7 @@ fn test_timeout_at() {
 
 #[test]
 fn test_interval_basic_burst() {
-    let runtime = build_runtime(1);
+    let runtime = build_runtime(nz!(1));
 
     runtime.block_on(async |ctx| {
         let start = Instant::now();
@@ -147,7 +147,7 @@ fn test_interval_basic_burst() {
 
 #[test]
 fn test_interval_missed_burst() {
-    let runtime = build_runtime(1);
+    let runtime = build_runtime(nz!(1));
 
     runtime.block_on(async |ctx| {
         let mut interval = interval(ctx, Duration::from_millis(10));
@@ -171,7 +171,7 @@ fn test_interval_missed_burst() {
 
 #[test]
 fn test_interval_missed_delay() {
-    let runtime = build_runtime(1);
+    let runtime = build_runtime(nz!(1));
 
     runtime.block_on(async |ctx| {
         let mut interval = interval(ctx, Duration::from_millis(20));
@@ -191,7 +191,7 @@ fn test_interval_missed_delay() {
 
 #[test]
 fn test_interval_missed_skip() {
-    let runtime = build_runtime(1);
+    let runtime = build_runtime(nz!(1));
 
     runtime.block_on(async |ctx| {
         let mut interval = interval(ctx, Duration::from_millis(20));
@@ -210,7 +210,7 @@ fn test_interval_missed_skip() {
 
 #[test]
 fn test_concurrent_sleeps() {
-    let runtime = build_runtime(4);
+    let runtime = build_runtime(nz!(4));
 
     runtime.block_on(async |ctx| {
         ctx.scope(async |s| {
@@ -234,7 +234,7 @@ fn test_concurrent_sleeps() {
 
 #[test]
 fn test_mixed_local_and_sync_sleeps() {
-    let runtime = build_runtime(2);
+    let runtime = build_runtime(nz!(2));
 
     runtime.block_on(async |ctx| {
         ctx.scope(async |s| {
@@ -259,7 +259,7 @@ fn test_mixed_local_and_sync_sleeps() {
 
 #[test]
 fn test_select_timeout() {
-    let runtime = build_runtime(1);
+    let runtime = build_runtime(nz!(1));
 
     runtime.block_on(async |ctx| {
         let res = select! {

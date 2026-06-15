@@ -39,8 +39,8 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
         }
     }
 
-    pub fn worker_count(mut self, worker_count: NonZeroUsize) -> Self {
-        self.config = self.config.worker_threads(worker_count.get());
+    pub fn worker_count(mut self, worker_count: Option<NonZeroUsize>) -> Self {
+        self.config = self.config.worker_threads(worker_count);
         self
     }
 
