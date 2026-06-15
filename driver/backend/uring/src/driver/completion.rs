@@ -275,15 +275,16 @@ impl CompletionBackendHooks<crate::op::UringSlotSpec> for UringCompletionHooks<'
         }
     }
 
-    fn finish_backend_effect(&mut self, effect: Self::BackendEffect) {
+    fn finish_backend_effect(&mut self, effect: Self::BackendEffect) -> UringResult<()> {
         match effect {
-            UringBackendEffect::None => {}
+            UringBackendEffect::None => Ok(()),
             UringBackendEffect::Waker { should_rebuild } => {
                 *self.waker_armed = false;
                 self.is_waked.store(false, Ordering::Release);
                 self.post.rebuild_waker |= should_rebuild;
                 self.post.resubmit_waker = true;
                 self.post.flush_backlog = true;
+                Ok(())
             }
             UringBackendEffect::CancelEnoent {
                 cancel_id,
@@ -291,9 +292,11 @@ impl CompletionBackendHooks<crate::op::UringSlotSpec> for UringCompletionHooks<'
                 raw,
             } => {
                 self.post.cancel_enoent.push((cancel_id, request, raw));
+                Ok(())
             }
             UringBackendEffect::CloseCompleted { fd } => {
                 self.post.close_unregister.push(fd);
+                Ok(())
             }
         }
     }
@@ -449,7 +452,7 @@ impl<'a> UringDriver<'a> {
             &self.completion_diagnostics,
             &mut hooks,
             ingress,
-        );
+        )?;
         let post = hooks.into_post_effects();
         self.apply_post_completion_effects(post)?;
         Ok(outcome)

@@ -127,7 +127,12 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
         }
     }
 
-    fn finish_backend_effect(&mut self, _effect: Self::BackendEffect) {}
+    fn finish_backend_effect(
+        &mut self,
+        _effect: Self::BackendEffect,
+    ) -> crate::DriverResult<(), ()> {
+        Ok(())
+    }
 }
 
 fn active_registry() -> (OpRegistry<DummySlotSpec>, OpToken) {
@@ -166,7 +171,9 @@ fn accept_with_hooks(
 ) -> CompletionFlowOutcome {
     let diagnostics = registry.shared.completion_diagnostics();
     let table: SharedCompletionTable<DummySlotSpec> = registry.shared.clone();
-    registry.accept_completion(&table, &diagnostics, hooks, CompletionIngress::User(event))
+    registry
+        .accept_completion(&table, &diagnostics, hooks, CompletionIngress::User(event))
+        .expect("test completion should succeed")
 }
 
 fn accept_user(registry: &mut OpRegistry<DummySlotSpec>, token: OpToken, res: i32) {
@@ -225,17 +232,19 @@ fn raw_unknown_control_is_recorded_as_anomaly() {
     let mut hooks = TestHooks::default();
     let raw_unknown_control = (99u64 << 48) | (7u64 << 32) | u64::from(u32::MAX);
 
-    let outcome = registry.accept_completion(
-        &table,
-        &diagnostics,
-        &mut hooks,
-        CompletionIngress::Kernel(CompletionEnvelope::from_raw_parts(
-            CompletionBackend::Core,
-            raw_unknown_control,
-            -5,
-            0,
-        )),
-    );
+    let outcome = registry
+        .accept_completion(
+            &table,
+            &diagnostics,
+            &mut hooks,
+            CompletionIngress::Kernel(CompletionEnvelope::from_raw_parts(
+                CompletionBackend::Core,
+                raw_unknown_control,
+                -5,
+                0,
+            )),
+        )
+        .expect("test completion should succeed");
 
     assert_eq!(outcome.anomaly, 1);
     assert_eq!(diagnostics.snapshot().unknown_completion, 1);

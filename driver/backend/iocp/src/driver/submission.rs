@@ -133,7 +133,9 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
         }
     }
 
-    fn finish_backend_effect(&mut self, _effect: Self::BackendEffect) {}
+    fn finish_backend_effect(&mut self, _effect: Self::BackendEffect) -> IocpResult<()> {
+        Ok(())
+    }
 }
 
 fn close_fd_from_op(op: &mut IocpOp) -> IocpResult<Option<IoFd>> {
@@ -222,7 +224,7 @@ impl<'a> IocpDriver<'a> {
                     event,
                     source: SyntheticCompletionSource::SubmissionFailure,
                 },
-            );
+            )?;
             return Err(IocpError::Submission.report("iocp/driver", "thread pool overloaded"));
         }
         Ok(Poll::Pending)

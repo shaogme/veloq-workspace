@@ -173,14 +173,13 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
         }
     }
 
-    fn finish_backend_effect(&mut self, effect: Self::BackendEffect) {
+    fn finish_backend_effect(&mut self, effect: Self::BackendEffect) -> IocpResult<()> {
         match effect {
-            IocpBackendEffect::None => {}
+            IocpBackendEffect::None => Ok(()),
             IocpBackendEffect::SocketInflight(token) => {
-                if let Err(err) = self.rio.release_socket_inflight_token(token) {
-                    tracing::error!(%err, ?token, "failed to release socket inflight token");
-                }
+                self.rio.release_socket_inflight_token(token).trans()?;
                 self.post.drain_socket_cleanup = true;
+                Ok(())
             }
         }
     }
@@ -299,7 +298,7 @@ impl<'a> IocpDriver<'a> {
             &self.completion_diagnostics,
             &mut hooks,
             ingress,
-        );
+        )?;
         let post = hooks.into_post_effects();
         if post.drain_socket_cleanup {
             self.drain_deferred_socket_cleanup();

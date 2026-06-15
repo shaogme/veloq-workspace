@@ -3,7 +3,7 @@
 use crate::IoFd;
 use crate::config::{BorrowedRawHandle, SocketKey};
 use crate::driver::IocpDriverCompletionDiagnostics;
-use crate::error::IocpError;
+use crate::error::{IocpError, IocpResult};
 use crate::op::{IocpOpRegistry, IocpSlotSpec};
 use crate::rio::core::{
     RioBufferLeaseToken, RioCompletionKind, RioOpRequestInit, RioRegistry, RioRequestContextDecode,
@@ -99,7 +99,6 @@ struct RioCompletionHooks<'a> {
     registry: &'a mut RioRegistry,
     env: RioEnv<'a>,
     ext: &'a crate::ext::Extensions,
-    first_error: Option<Report<RioError>>,
     completed_count: usize,
 }
 
@@ -117,13 +116,8 @@ impl<'a> RioCompletionHooks<'a> {
             registry,
             env,
             ext,
-            first_error: None,
             completed_count: 0,
         }
-    }
-
-    fn take_error(&mut self) -> Option<Report<RioError>> {
-        self.first_error.take()
     }
 }
 
@@ -202,23 +196,31 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
         ))
     }
 
-    fn finish_backend_effect(&mut self, effect: Self::BackendEffect) {
+    fn finish_backend_effect(&mut self, effect: Self::BackendEffect) -> IocpResult<()> {
         let Some(release) = effect.release else {
-            return;
+            return Ok(());
         };
         self.registry.free_addr_slot(release.addr_slot);
-        if let Err(error) = self
-            .registry
+        self.registry
             .release_buffer_lease(release.buffer_lease, self.env)
-            && self.first_error.is_none()
-        {
-            self.first_error = Some(error);
-        }
+            .trans()?;
         let _ = release_socket_inflight_token_from(self.socket_runtime, release.socket_inflight);
         if *self.outstanding_count > 0 {
             *self.outstanding_count -= 1;
         }
         self.completed_count += 1;
+        Ok(())
+    }
+}
+
+fn iocp_completion_error_to_rio(error: Report<IocpError>) -> Report<RioError> {
+    match *error.inner() {
+        IocpError::Rio(kind) => error.map_err(|_| kind),
+        kind => RioError::Internal
+            .to_report()
+            .push_ctx("scope", "rio.runtime.control_flow.process_completions")
+            .with_ctx("iocp_error", format!("{kind:?}"))
+            .attach_note("unexpected IOCP completion error during RIO processing"),
     }
 }
 
@@ -616,12 +618,14 @@ impl RioState {
                         init,
                         context: _completed_context,
                     }) => {
-                        let _ = ops.accept_completion(
+                        if let Err(error) = ops.accept_completion(
                             completion_table,
                             diagnostics,
                             &mut hooks,
                             CompletionIngress::Backend(RioIngress { init, result }),
-                        );
+                        ) {
+                            return Err(iocp_completion_error_to_rio(error));
+                        }
                     }
                     RioRequestContextDecode::Malformed { raw } => {
                         let anomaly =
@@ -692,9 +696,6 @@ impl RioState {
                             "ignoring stale RIO request context"
                         );
                     }
-                }
-                if let Some(error) = hooks.take_error() {
-                    return Err(error);
                 }
             }
 

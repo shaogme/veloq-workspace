@@ -152,7 +152,10 @@ where
         })
     }
 
-    fn finish_backend_effect(&mut self, effect: Self::BackendEffect);
+    fn finish_backend_effect(
+        &mut self,
+        effect: Self::BackendEffect,
+    ) -> DriverResult<(), slot::SlotError<Spec>>;
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -271,7 +274,7 @@ where
         diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
         hooks: &mut Hooks,
         ingress: CompletionIngress<Hooks::BackendIngress>,
-    ) -> CompletionFlowOutcome
+    ) -> DriverResult<CompletionFlowOutcome, slot::SlotError<Spec>>
     where
         Hooks: CompletionBackendHooks<Spec>;
 }
@@ -290,7 +293,7 @@ where
         diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
         hooks: &mut Hooks,
         ingress: CompletionIngress<Hooks::BackendIngress>,
-    ) -> CompletionFlowOutcome
+    ) -> DriverResult<CompletionFlowOutcome, slot::SlotError<Spec>>
     where
         Hooks: CompletionBackendHooks<Spec>,
     {
@@ -314,7 +317,7 @@ where
                 CompletionDispatch::Unknown { envelope } => {
                     let anomaly = unknown_completion_anomaly(envelope);
                     diagnostics.record_anomaly(&anomaly);
-                    CompletionFlowOutcome::anomaly()
+                    Ok(CompletionFlowOutcome::anomaly())
                 }
             },
             CompletionIngress::User(event) => {
@@ -339,7 +342,7 @@ where
                     finish_hook_outcome(self, table, diagnostics, hooks, outcome, None)
                 }
             },
-            CompletionIngress::Anomaly(anomaly) => finish_anomaly(self, diagnostics, anomaly),
+            CompletionIngress::Anomaly(anomaly) => Ok(finish_anomaly(self, diagnostics, anomaly)),
         }
     }
 }
@@ -355,7 +358,7 @@ where
         hooks: &mut Hooks,
         event: UserCompletionEvent,
         source: CompletionSource<'_, Hooks::BackendIngress>,
-    ) -> CompletionFlowOutcome
+    ) -> DriverResult<CompletionFlowOutcome, slot::SlotError<Spec>>
     where
         Hooks: CompletionBackendHooks<Spec>;
 }
@@ -375,7 +378,7 @@ where
         hooks: &mut Hooks,
         event: UserCompletionEvent,
         source: CompletionSource<'_, Hooks::BackendIngress>,
-    ) -> CompletionFlowOutcome
+    ) -> DriverResult<CompletionFlowOutcome, slot::SlotError<Spec>>
     where
         Hooks: CompletionBackendHooks<Spec>,
     {
@@ -431,7 +434,7 @@ fn finish_hook_outcome<Spec, Hooks>(
     hooks: &mut Hooks,
     outcome: CompletionHookOutcome<Spec, Hooks::BackendEffect>,
     finalize: Option<FinalizeAction>,
-) -> CompletionFlowOutcome
+) -> DriverResult<CompletionFlowOutcome, slot::SlotError<Spec>>
 where
     Spec: slot::SlotSpec,
     slot::SlotPayload<Spec>: Send,
@@ -454,8 +457,8 @@ where
                 CompletionPacket::<Spec>::user_with_cleanup(event, payload, detail, cleanup),
             );
             finish_waiting_if_needed(registry, diagnostics, finalize, event);
-            hooks.finish_backend_effect(effect);
-            completion_progress_from_record(record)
+            hooks.finish_backend_effect(effect)?;
+            Ok(completion_progress_from_record(record))
         }
         CompletionHookOutcome::Lost {
             event,
@@ -467,8 +470,8 @@ where
             let record =
                 record_lost_completion::<Spec>(table, diagnostics, event, loss_reason, cleanup);
             finish_corrupt(registry, diagnostics, snapshot, event.raw());
-            hooks.finish_backend_effect(effect);
-            completion_progress_from_record(record)
+            hooks.finish_backend_effect(effect)?;
+            Ok(completion_progress_from_record(record))
         }
         CompletionHookOutcome::Cleanup {
             mut cleanup,
@@ -484,21 +487,21 @@ where
                 }
                 Some(FinalizeAction::CorruptFromEvent) | None => {}
             }
-            hooks.finish_backend_effect(effect);
-            CompletionFlowOutcome::orphan_cleaned()
+            hooks.finish_backend_effect(effect)?;
+            Ok(CompletionFlowOutcome::orphan_cleaned())
         }
         CompletionHookOutcome::Anomaly { anomaly, effect } => {
             let progress = finish_anomaly(registry, diagnostics, anomaly);
-            hooks.finish_backend_effect(effect);
-            progress
+            hooks.finish_backend_effect(effect)?;
+            Ok(progress)
         }
         CompletionHookOutcome::ControlHandled { effect } => {
-            hooks.finish_backend_effect(effect);
-            CompletionFlowOutcome::internal()
+            hooks.finish_backend_effect(effect)?;
+            Ok(CompletionFlowOutcome::internal())
         }
         CompletionHookOutcome::Ignore { effect } => {
-            hooks.finish_backend_effect(effect);
-            CompletionFlowOutcome::ignored()
+            hooks.finish_backend_effect(effect)?;
+            Ok(CompletionFlowOutcome::ignored())
         }
     }
 }

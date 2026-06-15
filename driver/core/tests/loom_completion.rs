@@ -79,7 +79,12 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
         }
     }
 
-    fn finish_backend_effect(&mut self, _effect: Self::BackendEffect) {}
+    fn finish_backend_effect(
+        &mut self,
+        _effect: Self::BackendEffect,
+    ) -> veloq_driver_core::DriverResult<(), ()> {
+        Ok(())
+    }
 }
 
 fn active_registry() -> (

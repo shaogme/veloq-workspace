@@ -629,7 +629,12 @@ mod tests {
             }
         }
 
-        fn finish_backend_effect(&mut self, _effect: Self::BackendEffect) {}
+        fn finish_backend_effect(
+            &mut self,
+            _effect: Self::BackendEffect,
+        ) -> DriverResult<(), SlotError<DummySlotSpec>> {
+            Ok(())
+        }
     }
 
     #[test]
