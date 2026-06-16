@@ -6,7 +6,7 @@ async fn test_unbounded_basic() {
     let local = task::LocalSet::new();
     local
         .run_until(async move {
-            let (tx, rx) = spsc::new_unbounded();
+            let (tx, rx) = spsc::unbounded();
 
             task::spawn_local(async move {
                 for i in 0..10 {
@@ -29,7 +29,7 @@ async fn test_bounded_basic() {
     let local = task::LocalSet::new();
     local
         .run_until(async move {
-            let (tx, rx) = spsc::new_bounded(5);
+            let (tx, rx) = spsc::bounded(5);
 
             task::spawn_local(async move {
                 for i in 0..10 {
@@ -51,7 +51,7 @@ async fn test_sender_drop_closes_channel() {
     let local = task::LocalSet::new();
     local
         .run_until(async move {
-            let (tx, rx) = spsc::new_unbounded::<()>();
+            let (tx, rx) = spsc::unbounded::<()>();
             task::spawn_local(async move {
                 drop(tx);
             });
@@ -66,7 +66,7 @@ async fn test_receiver_drop_errors_sender() {
     let local = task::LocalSet::new();
     local
         .run_until(async move {
-            let (tx, rx) = spsc::new_bounded::<i32>(1);
+            let (tx, rx) = spsc::bounded::<i32>(1);
 
             tx.send(1).await.unwrap();
 
@@ -89,7 +89,7 @@ async fn test_bounded_backpressure() {
     let local = task::LocalSet::new();
     local
         .run_until(async move {
-            let (tx, rx) = spsc::new_bounded(1);
+            let (tx, rx) = spsc::bounded(1);
 
             task::spawn_local(async move {
                 tx.send(1).await.unwrap();
@@ -117,7 +117,7 @@ async fn test_stream_conversion() {
     let local = task::LocalSet::new();
     local
         .run_until(async move {
-            let (tx, rx) = spsc::new_unbounded();
+            let (tx, rx) = spsc::unbounded();
 
             task::spawn_local(async move {
                 tx.send(100).await.unwrap();
@@ -143,7 +143,7 @@ async fn test_zst() {
     let local = task::LocalSet::new();
     local
         .run_until(async move {
-            let (tx, rx) = spsc::new_unbounded::<()>();
+            let (tx, rx) = spsc::unbounded::<()>();
 
             task::spawn_local(async move {
                 for _ in 0..100 {
@@ -161,7 +161,7 @@ async fn test_zst() {
 
 #[tokio::test]
 async fn test_try_recv() {
-    let (tx, rx) = spsc::new_unbounded();
+    let (tx, rx) = spsc::unbounded();
 
     assert_eq!(rx.try_recv(), Err(spsc::TryRecvError::Empty));
 

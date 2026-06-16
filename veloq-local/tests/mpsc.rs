@@ -6,7 +6,7 @@ async fn test_unbounded_basic() {
     let local = task::LocalSet::new();
     local
         .run_until(async {
-            let (tx, rx) = mpsc::new_unbounded();
+            let (tx, rx) = mpsc::unbounded();
 
             task::spawn_local(async move {
                 for i in 0..10 {
@@ -31,7 +31,7 @@ async fn test_bounded_basic() {
     let local = task::LocalSet::new();
     local
         .run_until(async {
-            let (tx, rx) = mpsc::new_bounded(5);
+            let (tx, rx) = mpsc::bounded(5);
 
             task::spawn_local(async move {
                 for i in 0..10 {
@@ -52,7 +52,7 @@ async fn test_multiple_senders() {
     let local = task::LocalSet::new();
     local
         .run_until(async {
-            let (tx, rx) = mpsc::new_unbounded();
+            let (tx, rx) = mpsc::unbounded();
 
             for i in 0..5 {
                 let tx = tx.clone();
@@ -76,7 +76,7 @@ async fn test_sender_drop_closes_channel() {
     let local = task::LocalSet::new();
     local
         .run_until(async {
-            let (tx, rx) = mpsc::new_unbounded::<()>();
+            let (tx, rx) = mpsc::unbounded::<()>();
             task::spawn_local(async move {
                 drop(tx);
             });
@@ -91,7 +91,7 @@ async fn test_receiver_drop_errors_sender() {
     let local = task::LocalSet::new();
     local
         .run_until(async {
-            let (tx, rx) = mpsc::new_bounded::<i32>(1);
+            let (tx, rx) = mpsc::bounded::<i32>(1);
 
             // Fill the channel first to make sure next send might block or wait
             tx.send(1).await.unwrap();
@@ -115,7 +115,7 @@ async fn test_bounded_backpressure() {
     let local = task::LocalSet::new();
     local
         .run_until(async {
-            let (tx, rx) = mpsc::new_bounded(1);
+            let (tx, rx) = mpsc::bounded(1);
 
             // This task will fill the channel and then block on the next send
             let tx_clone = tx.clone();
@@ -147,7 +147,7 @@ async fn test_stream_conversion() {
     let local = task::LocalSet::new();
     local
         .run_until(async {
-            let (tx, rx) = mpsc::new_unbounded();
+            let (tx, rx) = mpsc::unbounded();
 
             task::spawn_local(async move {
                 tx.send(100).await.unwrap();
@@ -172,7 +172,7 @@ async fn test_stream_conversion() {
 
 #[tokio::test]
 async fn test_try_recv() {
-    let (tx, rx) = mpsc::new_unbounded();
+    let (tx, rx) = mpsc::unbounded();
 
     assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Empty));
 

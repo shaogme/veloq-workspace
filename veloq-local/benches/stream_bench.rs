@@ -12,7 +12,7 @@ fn bench_stream_creation(c: &mut Criterion) {
 
     c.bench_function("stream_creation_and_poll", |b| {
         b.to_async(&rt).iter(|| async {
-            let (tx, rx) = mpsc::new_unbounded();
+            let (tx, rx) = mpsc::unbounded();
             tx.send(1).await.unwrap();
 
             let stream = rx.stream();

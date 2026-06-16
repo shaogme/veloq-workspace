@@ -294,12 +294,12 @@ impl<T> LocalChannel<T> {
 }
 
 /// 创建一个新的无界通道
-pub fn new_unbounded<T>() -> (LocalSender<T>, LocalReceiver<T>) {
+pub fn unbounded<T>() -> (LocalSender<T>, LocalReceiver<T>) {
     LocalChannel::new(ChannelCapacity::Unbounded)
 }
 
 /// 创建一个新的有界通道
-pub fn new_bounded<T>(size: usize) -> (LocalSender<T>, LocalReceiver<T>) {
+pub fn bounded<T>(size: usize) -> (LocalSender<T>, LocalReceiver<T>) {
     LocalChannel::new(ChannelCapacity::Bounded(size))
 }
 

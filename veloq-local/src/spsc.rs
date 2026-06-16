@@ -406,12 +406,12 @@ impl<'a, T> Stream for ChannelStream<'a, T> {
 }
 
 /// Creates a new unbounded SPSC channel.
-pub fn new_unbounded<T>() -> (Sender<T>, Receiver<T>) {
+pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
     new(ChannelCapacity::Unbounded)
 }
 
 /// Creates a new bounded SPSC channel.
-pub fn new_bounded<T>(size: usize) -> (Sender<T>, Receiver<T>) {
+pub fn bounded<T>(size: usize) -> (Sender<T>, Receiver<T>) {
     new(ChannelCapacity::Bounded(size))
 }
 
