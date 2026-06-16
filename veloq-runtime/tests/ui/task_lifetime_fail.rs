@@ -1,10 +1,10 @@
 use veloq_runtime::runtime::Runtime;
-use veloq_runtime::{task, task_local};
+use veloq_runtime::{task, task_local, scope};
 
 fn main() {
     let rt = Runtime::<(), _>::new();
     rt.block_on(async |ctx| {
-        ctx.scope(async |s| {
+        scope!(ctx, async |s| {
             task_local!(t, async {
                 veloq_runtime::task::yield_now().await;
                 veloq_runtime::task::yield_now().await;
@@ -16,7 +16,7 @@ fn main() {
         })
         .await
         .unwrap();
-        ctx.scope(async |s| {
+        scope!(ctx, async |s| {
             task!(t, async {
                 veloq_runtime::task::yield_now().await;
                 veloq_runtime::task::yield_now().await;

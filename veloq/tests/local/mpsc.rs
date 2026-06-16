@@ -1,5 +1,5 @@
 use veloq::local::mpsc;
-use veloq::runtime::Runtime;
+use veloq::runtime::{Runtime, scope_local};
 use veloq_buf::heap::ThreadMemoryMultiplier;
 use veloq_buf::{UniformSlot, nz};
 use veloq_runtime::task::yield_now;
@@ -19,7 +19,7 @@ fn test_unbounded_basic() {
             let state = mpsc::unbounded();
             let (tx, rx) = state.split();
 
-            ctx.scope(async |s| {
+            scope_local!(ctx.scope, async |s| {
                 s.spawn_boxed_local(async move {
                     for i in 0..10 {
                         tx.send(i).await.unwrap();
@@ -49,7 +49,7 @@ fn test_bounded_basic() {
             let state = mpsc::bounded(5);
             let (tx, rx) = state.split();
 
-            ctx.scope(async |s| {
+            scope_local!(ctx.scope, async |s| {
                 s.spawn_boxed_local(async move {
                     for i in 0..10 {
                         tx.send(i).await.unwrap();
@@ -75,7 +75,7 @@ fn test_multiple_senders() {
             let state = mpsc::unbounded();
             let (tx, rx) = state.split();
 
-            ctx.scope(async |s| {
+            scope_local!(ctx.scope, async |s| {
                 for i in 0..5 {
                     let tx = tx.clone();
                     s.spawn_boxed_local(async move {
@@ -103,7 +103,7 @@ fn test_sender_drop_closes_channel() {
         .block_on(async |ctx| {
             let state = mpsc::unbounded::<()>();
             let (tx, rx) = state.split();
-            ctx.scope(async |s| {
+            scope_local!(ctx.scope, async |s| {
                 s.spawn_boxed_local(async move {
                     drop(tx);
                 });
@@ -127,7 +127,7 @@ fn test_receiver_drop_errors_sender() {
             // Fill the channel first to make sure next send might block or wait
             tx.send(1).await.unwrap();
 
-            ctx.scope(async |s| {
+            scope_local!(ctx.scope, async |s| {
                 s.spawn_boxed_local(async move {
                     drop(rx);
                 });
@@ -153,7 +153,7 @@ fn test_bounded_backpressure() {
             let state = mpsc::bounded(1);
             let (tx, rx) = state.split();
 
-            ctx.scope(async |s| {
+            scope_local!(ctx.scope, async |s| {
                 // This task will fill the channel and then block on the next send
                 let tx_clone = tx.clone();
                 s.spawn_boxed_local(async move {
@@ -190,7 +190,7 @@ fn test_stream_conversion() {
             let state = mpsc::unbounded();
             let (tx, rx) = state.split();
 
-            ctx.scope(async |s| {
+            scope_local!(ctx.scope, async |s| {
                 s.spawn_boxed_local(async move {
                     tx.send(100).await.unwrap();
                     tx.send(200).await.unwrap();
@@ -246,7 +246,7 @@ fn test_owned_mpsc() {
         .block_on(async |ctx| {
             let (tx, rx) = mpsc::owned_bounded(5);
 
-            ctx.scope(async |s| {
+            scope_local!(ctx.scope, async |s| {
                 s.spawn_boxed_local(async move {
                     for i in 0..10 {
                         tx.send(i).await.unwrap();

@@ -87,12 +87,15 @@ pub(crate) fn new_cancel_slot<S: Storage, O: Ownership>()
 pub(crate) type CancelTokenSlot<S, O> =
     <S as Storage>::Lock<Option<GenericCancellationToken<S, O>>>;
 
+pub struct AsyncScopeGuard;
+
 /// 通用的作用域实现，支持通过 Storage 策略切换线程安全或本地分配。
 pub struct GenericAsyncScope<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra> {
     context: RuntimeScopeContext<'rt, TExtra>,
     arena: GenericArena<S>,
     completion: O::Shared<GenericScopeCompletion<S, O>>,
-    _phantom: PhantomData<fn(&'scope ()) -> &'scope ()>,
+    _guard: &'scope AsyncScopeGuard,
+    _marker: PhantomData<fn(&'scope ())>,
 }
 
 pub type AsyncScope<'rt, 'scope, TExtra> =
@@ -123,9 +126,10 @@ impl<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra> ScopeProvider
 impl<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra>
     GenericAsyncScope<'rt, 'scope, S, O, TExtra>
 {
-    pub(crate) fn new(
+    pub fn new(
         context: RuntimeScopeContext<'rt, TExtra>,
         parent: Option<AnyScopeRef>,
+        guard: &'scope AsyncScopeGuard,
     ) -> Self {
         let completion = GenericScopeCompletion::<S, O>::new(parent.clone());
 
@@ -139,7 +143,8 @@ impl<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra>
             context,
             arena: GenericArena::new(),
             completion,
-            _phantom: PhantomData,
+            _guard: guard,
+            _marker: PhantomData::default(),
         }
     }
 
@@ -164,7 +169,7 @@ impl<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra>
         future: F,
     ) -> JoinHandle<'scope_ref, T, LocalTaskRef, Self, TExtra>
     where
-        F: Future<Output = T> + 'scope_ref,
+        F: Future<Output = T> + 'scope,
     {
         unsafe {
             self.spawn_boxed_impl(
@@ -242,7 +247,7 @@ impl<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra>
     where
         H: TaskHandleRef,
         H::Storage: TaskStorage + TaskBounds<T, F>,
-        F: Future<Output = T> + 'scope_ref,
+        F: Future<Output = T> + 'scope,
     {
         let mut guard = ScopeTaskGuard::<S, O>::new(&self.completion);
 
@@ -404,7 +409,7 @@ impl<'rt, 'scope, TExtra> GenericAsyncScope<'rt, 'scope, AtomicStorage, ArcOwner
         future: F,
     ) -> JoinHandle<'scope_ref, T, SendTaskRef, Self, TExtra>
     where
-        F: Future<Output = T> + Send + 'scope_ref,
+        F: Future<Output = T> + Send + 'scope,
     {
         debug_assert!(
             worker_id < self.context.shared().worker_count().get(),
@@ -425,7 +430,7 @@ impl<'rt, 'scope, TExtra> GenericAsyncScope<'rt, 'scope, AtomicStorage, ArcOwner
         job: F,
     ) -> JoinHandle<'scope_ref, T, SendTaskRef, Self, TExtra>
     where
-        F: AsyncFnOnce() -> T + Send + 'scope_ref,
+        F: AsyncFnOnce() -> T + Send + 'scope,
     {
         let state = RoutedSpawnState::new();
         if let Err(err) = self.context.shared().validate_worker_id(worker_id) {
@@ -521,7 +526,7 @@ impl<'rt, 'scope, TExtra> GenericAsyncScope<'rt, 'scope, AtomicStorage, ArcOwner
         future: F,
     ) -> JoinHandle<'scope_ref, T, SendTaskRef, Self, TExtra>
     where
-        F: Future<Output = T> + Send + 'scope_ref,
+        F: Future<Output = T> + Send + 'scope,
     {
         self.spawn_boxed_send_impl(self.context.shared().choose_worker(), future)
     }
@@ -544,7 +549,7 @@ impl<'rt, 'scope, TExtra> GenericAsyncScope<'rt, 'scope, LocalStorage, RcOwnersh
         future: F,
     ) -> JoinHandle<'scope_ref, T, LocalTaskRef, Self, TExtra>
     where
-        F: Future<Output = T> + 'scope_ref,
+        F: Future<Output = T> + 'scope,
     {
         self.spawn_boxed_local(future)
     }

@@ -17,6 +17,8 @@ use veloq_runtime::{
     utils::StaticTransfer,
 };
 
+pub use veloq_runtime::{scope, scope_local};
+
 use crate::{
     config::{BlockingPoolConfig, Config},
     error::Result as VeloqResult,
@@ -159,14 +161,14 @@ impl<T: PoolTopology> Runtime<T> {
                 let receiver = receivers.take(worker_id);
 
                 let registration_mode = config.registration_mode();
-                let registrar = DriverRegistrar::new(shared, registration_mode);
+                let registrar = DriverRegistrar::new(shared);
 
                 let registrar_state = RefCell::new(WorkerRegistrarState {
                     receiver,
                     chunks: Vec::new(),
                 });
 
-                let driver = PlatformDriver::new(config.clone(), Box::new(registrar.clone()))
+                let driver = PlatformDriver::new(config.clone(), Box::new(registrar))
                     .expect("failed to create driver");
                 let driver_cell = RefCell::new(driver);
 
@@ -184,8 +186,8 @@ impl<T: PoolTopology> Runtime<T> {
                 WorkerState {
                     driver: driver_cell,
                     buf_pool,
-                    registrar,
                     registrar_state,
+                    registration_mode,
                 }
             })
             .build();

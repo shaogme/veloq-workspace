@@ -155,7 +155,8 @@ fn run_auto_expansion_multithread(mode: BufferRegistrationMode) {
             let expanded_id =
                 expanded_chunk_id.expect("worker0 did not trigger pool auto expansion");
 
-            ctx.scope(async |s| {
+            use veloq::runtime::scope;
+            scope!(ctx.scope, async |s| {
                 let mut handles = Vec::new();
                 for _ in 0..4 {
                     handles.push(s.spawn_boxed(async move {

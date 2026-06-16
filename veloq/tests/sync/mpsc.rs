@@ -1,10 +1,9 @@
-use std::time::Duration;
-use veloq_sync::mpsc;
-use veloq::runtime::Runtime;
+use veloq::runtime::{Runtime, scope};
 use veloq_buf::UniformSlot;
 use veloq_buf::heap::ThreadMemoryMultiplier;
 use veloq_buf::nz;
 use veloq_runtime::task::yield_now;
+use veloq_sync::mpsc;
 
 fn create_runtime() -> Runtime<UniformSlot> {
     Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(4))))
@@ -17,7 +16,7 @@ fn create_runtime() -> Runtime<UniformSlot> {
 fn test_sync_unbounded_simple() {
     let runtime = create_runtime();
     runtime
-        .block_on(async |ctx| {
+        .block_on(async |_ctx| {
             let state = mpsc::unbounded();
             let (tx, mut rx) = state.split();
 
@@ -38,7 +37,7 @@ fn test_sync_unbounded_multi_thread() {
             let state = mpsc::unbounded();
             let (tx, mut rx) = state.split();
 
-            ctx.scope(async |s| {
+            scope!(ctx.scope, async |s| {
                 for i in 0..10 {
                     let tx = tx.clone();
                     s.spawn_boxed(async move {
@@ -72,7 +71,7 @@ fn test_sync_unbounded_stream() {
             let state = mpsc::unbounded();
             let (tx, rx) = state.split();
 
-            ctx.scope(async |s| {
+            scope!(ctx.scope, async |s| {
                 s.spawn_boxed(async move {
                     for i in 0..5 {
                         tx.send(i).unwrap();
@@ -107,7 +106,7 @@ fn test_sync_bounded_capacity() {
 
             tx.send(1).await.unwrap();
 
-            ctx.scope(async |s| {
+            scope!(ctx.scope, async |s| {
                 let tx_clone = tx.clone();
                 s.spawn_boxed(async move {
                     tx_clone.send(2).await.unwrap();
@@ -133,7 +132,7 @@ fn test_sync_bounded_drop_receiver() {
             let (tx, rx) = state.split();
             tx.send(1).await.unwrap();
 
-            ctx.scope(async |s| {
+            scope!(ctx.scope, async |s| {
                 s.spawn_boxed(async move {
                     let result = tx.send(2).await;
                     assert!(result.is_err());
@@ -155,7 +154,7 @@ fn test_sync_owned_mpsc() {
         .block_on(async |ctx| {
             let (tx, rx) = mpsc::owned_bounded(5);
 
-            ctx.scope(async |s| {
+            scope!(ctx.scope, async |s| {
                 s.spawn_boxed(async move {
                     for i in 0..10 {
                         tx.send(i).await.unwrap();

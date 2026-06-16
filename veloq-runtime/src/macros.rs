@@ -1,3 +1,5 @@
+pub mod helpers;
+
 /// A macro to wait on multiple futures simultaneously, returning the output of the first one that completes.
 ///
 /// The first argument must be a [`RuntimeScopeContext`](crate::runtime::RuntimeScopeContext).
@@ -183,6 +185,46 @@ macro_rules! select {
     (@tuple_field $tuple:ident, ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~) => { &mut $tuple.13 };
     (@tuple_field $tuple:ident, ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~) => { &mut $tuple.14 };
     (@tuple_field $tuple:ident, ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~) => { &mut $tuple.15 };
+}
 
+#[macro_export]
+macro_rules! scope {
+    ($ctx:expr, $closure:expr) => {
+        async {
+            use std::future::poll_fn;
+            use std::task::Poll;
+            use $crate::macros::helpers::{_constrain, _constrain_result};
+            use $crate::scope::{AsyncScope, AsyncScopeGuard};
+            use $crate::task::RuntimeContextExt;
 
+            let parent = poll_fn(|cx| Poll::Ready(RuntimeContextExt::scope_completion(cx))).await;
+            let guard = AsyncScopeGuard;
+            let scope = AsyncScope::new($ctx, parent, &guard);
+            let s_ref = &scope;
+            let res = _constrain($closure)(s_ref).await;
+            scope.wait_all().await?;
+            _constrain_result(Ok(res))
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! scope_local {
+    ($ctx:expr, $closure:expr) => {
+        async {
+            use std::future::poll_fn;
+            use std::task::Poll;
+            use $crate::macros::helpers::{_constrain_local, _constrain_result};
+            use $crate::scope::{AsyncScopeGuard, LocalAsyncScope};
+            use $crate::task::RuntimeContextExt;
+
+            let parent = poll_fn(|cx| Poll::Ready(RuntimeContextExt::scope_completion(cx))).await;
+            let guard = AsyncScopeGuard;
+            let scope = LocalAsyncScope::new($ctx, parent, &guard);
+            let s_ref = &scope;
+            let res = _constrain_local($closure)(s_ref).await;
+            scope.wait_all().await?;
+            _constrain_result(Ok(res))
+        }
+    };
 }

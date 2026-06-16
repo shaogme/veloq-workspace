@@ -1,4 +1,4 @@
-use std::{cell::RefCell, io, num::NonZeroUsize, ops::AsyncFnOnce, ptr::NonNull, sync::mpsc};
+use std::{cell::RefCell, io, num::NonZeroUsize, ptr::NonNull, sync::mpsc};
 
 use diagweave::prelude::*;
 use veloq_buf::{
@@ -18,7 +18,6 @@ use veloq_runtime::{
     runtime::{
         EnqueuePinnedOutcome, IdleDecision, IdleWaitStrategy, RuntimeScopeContext, RuntimeShared,
     },
-    scope::{AsyncScope, LocalAsyncScope},
     storage::AtomicStorage,
     task::{
         GenericTaskHeader, RawTask, ScopeRef, SendTaskRef, TaskHandleRef, TaskHeader, TaskVTable,
@@ -42,31 +41,24 @@ pub struct WorkerRegistrarState {
     pub chunks: Vec<ChunkInfo>,
 }
 
-pub struct WorkerState<'a, 'ctx> {
+pub struct WorkerState<'ctx> {
     pub driver: RefCell<PlatformDriver<'ctx>>,
     pub buf_pool: AnyBufPool,
-    pub registrar: DriverRegistrar<'a, 'ctx>,
     pub registrar_state: RefCell<WorkerRegistrarState>,
+    pub registration_mode: BufferRegistrationMode,
 }
 
 #[derive(Clone)]
 pub struct DriverRegistrar<'a, 'ctx> {
-    shared: &'a RuntimeShared<WorkerState<'a, 'ctx>>,
-    registration_mode: BufferRegistrationMode,
+    shared: &'a RuntimeShared<WorkerState<'ctx>>,
 }
 
 impl<'a, 'ctx> DriverRegistrar<'a, 'ctx> {
-    pub(crate) fn new(
-        shared: &'a RuntimeShared<WorkerState<'a, 'ctx>>,
-        registration_mode: BufferRegistrationMode,
-    ) -> Self {
-        Self {
-            shared,
-            registration_mode,
-        }
+    pub(crate) fn new(shared: &'a RuntimeShared<WorkerState<'ctx>>) -> Self {
+        Self { shared }
     }
 
-    fn extra<R>(&self, f: impl FnOnce(&WorkerState<'a, 'ctx>) -> R) -> R {
+    fn extra<R>(&self, f: impl FnOnce(&WorkerState<'ctx>) -> R) -> R {
         self.shared
             .extra_tls
             .try_with(|extra| f(extra))
@@ -78,7 +70,7 @@ impl<'a, 'ctx> DriverRegistrar<'a, 'ctx> {
             sync_to_driver_internal(
                 &extra.driver,
                 &extra.registrar_state,
-                self.registration_mode,
+                extra.registration_mode,
             );
         })
     }
@@ -94,7 +86,7 @@ impl<'a, 'ctx> BufferRegistrar for DriverRegistrar<'a, 'ctx> {
             resolve_chunk_info_internal(
                 &extra.driver,
                 &extra.registrar_state,
-                self.registration_mode,
+                extra.registration_mode,
                 chunk_id,
             )
         })
@@ -208,7 +200,7 @@ pub struct RuntimeContext<'a, 'ctx>
 where
     'ctx: 'a,
 {
-    pub scope: RuntimeScopeContext<'a, WorkerState<'a, 'ctx>>,
+    pub scope: RuntimeScopeContext<'a, WorkerState<'ctx>>,
 }
 
 impl<'a, 'ctx> ContextDriverProvider<PlatformDriver<'ctx>> for RuntimeContext<'a, 'ctx> {
@@ -242,30 +234,12 @@ impl<'a, 'ctx> DriverProvider for RuntimeContext<'a, 'ctx> {
 
 impl<'a, 'ctx> RuntimeContext<'a, 'ctx> {
     #[inline]
-    fn extra<R>(&self, f: impl FnOnce(&WorkerState<'a, 'ctx>) -> R) -> R {
+    fn extra<R>(&self, f: impl FnOnce(&WorkerState<'ctx>) -> R) -> R {
         self.scope
             .shared()
             .extra_tls
             .try_with(|extra| f(extra))
             .expect("RuntimeContext accessed outside of a worker thread")
-    }
-
-    pub async fn scope<R, F>(&self, f: F) -> RuntimeResult<R>
-    where
-        F: for<'scope_ref, 's0, 's1, 's2, 's3> AsyncFnOnce(
-            &'scope_ref AsyncScope<'s0, 's1, WorkerState<'s2, 's3>>,
-        ) -> R,
-    {
-        self.scope.scope(f).await
-    }
-
-    pub async fn scope_local<R, F>(&self, f: F) -> RuntimeResult<R>
-    where
-        F: for<'scope_ref, 's0, 's1, 's2, 's3> AsyncFnOnce(
-            &'scope_ref LocalAsyncScope<'s0, 's1, WorkerState<'s2, 's3>>,
-        ) -> R,
-    {
-        self.scope.scope_local(f).await
     }
 
     #[inline]
@@ -275,7 +249,7 @@ impl<'a, 'ctx> RuntimeContext<'a, 'ctx> {
 
     #[inline]
     pub fn registrar(&self) -> DriverRegistrar<'a, 'ctx> {
-        self.extra(|extra| extra.registrar.clone())
+        DriverRegistrar::new(self.scope.shared())
     }
     #[inline]
     pub fn select_poll_start(&self, branches: u32) -> u32 {
@@ -388,12 +362,14 @@ impl<'a, 'ctx> RuntimeContext<'a, 'ctx> {
     }
 }
 
-pub fn poll_current_driver<'a, 'ctx>(
-    shared: &RuntimeShared<WorkerState<'a, 'ctx>>,
-) -> IdleDecision {
+pub fn poll_current_driver<'ctx>(shared: &RuntimeShared<WorkerState<'ctx>>) -> IdleDecision {
     shared.extra_tls.with(|extra| {
         // sync registrar
-        extra.registrar.sync_to_driver();
+        sync_to_driver_internal(
+            &extra.driver,
+            &extra.registrar_state,
+            extra.registration_mode,
+        );
 
         let mut driver = extra.driver.borrow_mut();
 
@@ -409,20 +385,20 @@ pub fn poll_current_driver<'a, 'ctx>(
 }
 
 pub(crate) fn submit_control_task<'a, 'ctx>(
-    shared: &'a RuntimeShared<WorkerState<'a, 'ctx>>,
+    shared: &'a RuntimeShared<WorkerState<'ctx>>,
     worker_id: usize,
     fd: IoFd,
 ) {
-    struct UnregisterFileTask<'a, 'ctx> {
+    struct UnregisterFileTask<'ctx> {
         header: TaskHeader,
         fd: IoFd,
-        shared_ptr: *const RuntimeShared<WorkerState<'a, 'ctx>>,
+        shared_ptr: *const RuntimeShared<WorkerState<'ctx>>,
     }
 
-    unsafe impl<'a, 'ctx> Send for UnregisterFileTask<'a, 'ctx> {}
-    unsafe impl<'a, 'ctx> Sync for UnregisterFileTask<'a, 'ctx> {}
+    unsafe impl<'ctx> Send for UnregisterFileTask<'ctx> {}
+    unsafe impl<'ctx> Sync for UnregisterFileTask<'ctx> {}
 
-    impl<'a, 'ctx> RawTask for UnregisterFileTask<'a, 'ctx> {
+    impl<'ctx> RawTask for UnregisterFileTask<'ctx> {
         type Storage = AtomicStorage;
 
         fn poll_raw(&self, _worker_id: usize) -> RuntimeResult<bool> {
@@ -444,7 +420,7 @@ pub(crate) fn submit_control_task<'a, 'ctx>(
         }
     }
 
-    impl<'a, 'ctx> UnregisterFileTask<'a, 'ctx> {
+    impl<'ctx> UnregisterFileTask<'ctx> {
         const VTABLE: &'static TaskVTable<AtomicStorage> = &TaskVTable {
             wake: |_| {},
             wake_by_ref: |_| {},
@@ -461,7 +437,7 @@ pub(crate) fn submit_control_task<'a, 'ctx>(
 
     let task = Box::new(UnregisterFileTask {
         header: TaskHeader::new(
-            UnregisterFileTask::<'a, 'ctx>::VTABLE,
+            UnregisterFileTask::<'ctx>::VTABLE,
             &shared.base,
             worker_id,
             ScopeRef::<AtomicStorage>::dummy(),

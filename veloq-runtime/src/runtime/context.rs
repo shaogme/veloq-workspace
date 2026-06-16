@@ -1,9 +1,8 @@
 use core::cell::UnsafeCell;
 use std::{
-    future::{Future, poll_fn},
+    future::Future,
     marker::PhantomData,
     num::NonZeroUsize,
-    ops::AsyncFnOnce,
     pin::Pin,
     ptr::NonNull,
     sync::{Arc, Mutex, atomic::Ordering},
@@ -14,10 +13,8 @@ use std::{
 use super::shared::{EnqueuePinnedOutcome, RuntimeShared};
 use crate::{
     error::{Result, RuntimeError},
-    scope::{AsyncScope, LocalAsyncScope},
     task::{
-        GenericTaskHeader, RawTask, RuntimeContextExt, ScopeRef, SendTaskRef, TaskHandleRef,
-        TaskHeader, TaskVTable,
+        GenericTaskHeader, RawTask, ScopeRef, SendTaskRef, TaskHandleRef, TaskHeader, TaskVTable,
     },
     utils::FastRand,
 };
@@ -283,30 +280,6 @@ impl<'rt, T> RuntimeScopeContext<'rt, T> {
     {
         let worker_id = task.header().worker_id();
         self.route_to(worker_id, f)?.await
-    }
-
-    /// Creates a new thread-safe (Send) asynchronous scope.
-    pub async fn scope<'scope, R, F>(&self, f: F) -> Result<R>
-    where
-        F: for<'scope_ref> AsyncFnOnce(&'scope_ref AsyncScope<'rt, 'scope, T>) -> R,
-    {
-        let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
-        let s = AsyncScope::new(*self, parent);
-        let res = f(&s).await;
-        s.wait_all().await?;
-        Ok(res)
-    }
-
-    /// Creates a new thread-local asynchronous scope.
-    pub async fn scope_local<'scope, R, F>(&self, f: F) -> Result<R>
-    where
-        F: for<'scope_ref> AsyncFnOnce(&'scope_ref LocalAsyncScope<'rt, 'scope, T>) -> R,
-    {
-        let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
-        let s = LocalAsyncScope::new(*self, parent);
-        let res = f(&s).await;
-        s.wait_all().await?;
-        Ok(res)
     }
 
     /// Returns the current worker id.

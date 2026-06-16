@@ -1,8 +1,8 @@
-use veloq_sync::oneshot;
-use veloq::runtime::Runtime;
+use veloq::runtime::{Runtime, scope};
 use veloq_buf::UniformSlot;
 use veloq_buf::heap::ThreadMemoryMultiplier;
 use veloq_buf::nz;
+use veloq_sync::oneshot;
 
 fn create_runtime() -> Runtime<UniformSlot> {
     Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(4))))
@@ -19,7 +19,7 @@ fn test_sync_oneshot_send_recv() {
             let state = oneshot::channel();
             let (tx, rx) = state.split();
 
-            ctx.scope(async |s| {
+            scope!(ctx.scope, async |s| {
                 s.spawn_boxed(async move {
                     tx.send(42).unwrap();
                 });
@@ -40,7 +40,7 @@ fn test_sync_oneshot_drop_sender() {
             let state = oneshot::channel::<i32>();
             let (tx, rx) = state.split();
 
-            ctx.scope(async |s| {
+            scope!(ctx.scope, async |s| {
                 s.spawn_boxed(async move {
                     drop(tx);
                 });
@@ -80,7 +80,7 @@ fn test_sync_oneshot_drop_receiver_notify() {
             let state = oneshot::channel::<i32>();
             let (tx, rx) = state.split();
 
-            ctx.scope(async |s| {
+            scope!(ctx.scope, async |s| {
                 s.spawn_boxed(async move {
                     drop(rx);
                 });
@@ -102,7 +102,7 @@ fn test_sync_oneshot_poll_closed() {
             let state = oneshot::channel::<()>();
             let (mut tx, rx) = state.split();
 
-            ctx.scope(async |s| {
+            scope!(ctx.scope, async |s| {
                 s.spawn_boxed(async move {
                     drop(rx);
                 });
@@ -123,7 +123,7 @@ fn test_sync_owned_oneshot() {
         .block_on(async |ctx| {
             let (tx, rx) = oneshot::owned_channel();
 
-            ctx.scope(async |s| {
+            scope!(ctx.scope, async |s| {
                 s.spawn_boxed(async move {
                     tx.send(42).unwrap();
                 });

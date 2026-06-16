@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use veloq::runtime::context::RuntimeContext;
 
 use veloq::fs::{BufferingMode, File};
-use veloq::runtime::Runtime;
+use veloq::runtime::{Runtime, scope, scope_local};
 use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,7 +170,7 @@ async fn run_1gb_iteration<'a, 'ctx>(
 
     let concurrency_limit = 32;
 
-    ctx.scope_local(async |s| {
+    scope_local!(ctx.scope, async |s| {
         let mut tasks = VecDeque::new();
         let mut offset: u64 = 0;
 
@@ -408,7 +408,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                         let base_dir = bench_base_dir();
                         let pid = std::process::id();
 
-                        ctx.scope(async |s| {
+                        scope!(ctx.scope, async |s| {
                             let mut prepare_handles = Vec::with_capacity(WORKER_COUNT.get());
                             for worker_id in 0..WORKER_COUNT.get() {
                                 let prepare_path_names: Vec<PathBuf> = (0..FILES_PER_WORKER)

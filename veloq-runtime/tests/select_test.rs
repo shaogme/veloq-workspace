@@ -3,7 +3,7 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use veloq_runtime::{runtime::Runtime, scope::JoinOutcome, select, task::TaskError};
+use veloq_runtime::{runtime::Runtime, scope, scope::JoinOutcome, select, task::TaskError};
 
 struct ReadyFuture<T>(Option<T>);
 impl<T: Unpin + Copy> Future for ReadyFuture<T> {
@@ -138,7 +138,7 @@ fn test_select_three_branches() {
 fn test_select_cancellation() {
     let rt = Runtime::<(), _>::new();
     rt.block_on(async |ctx| {
-        ctx.scope(async |s| {
+        scope!(ctx, async |s| {
             let handle = s.spawn_boxed(async move {
                 select! {
                     ctx;

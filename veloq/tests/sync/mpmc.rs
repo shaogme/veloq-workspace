@@ -1,10 +1,10 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use veloq_sync::mpmc;
-use veloq::runtime::Runtime;
+use veloq::runtime::{Runtime, scope};
 use veloq_buf::UniformSlot;
 use veloq_buf::heap::ThreadMemoryMultiplier;
 use veloq_buf::nz;
 use veloq_runtime::task::yield_now;
+use veloq_sync::mpmc;
 
 fn create_runtime() -> Runtime<UniformSlot> {
     Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(4))))
@@ -17,7 +17,7 @@ fn create_runtime() -> Runtime<UniformSlot> {
 fn test_sync_mpmc_unbounded_simple() {
     let runtime = create_runtime();
     runtime
-        .block_on(async |ctx| {
+        .block_on(async |_ctx| {
             let state = mpmc::unbounded();
             let (tx, rx) = state.split();
 
@@ -41,7 +41,7 @@ fn test_sync_mpmc_unbounded_concurrent() {
             let (tx, rx) = state.split();
             let count = 100;
 
-            ctx.scope(async |s| {
+            scope!(ctx.scope, async |s| {
                 for _ in 0..5 {
                     let tx = tx.clone();
                     s.spawn_boxed(async move {
@@ -80,7 +80,7 @@ fn test_sync_mpmc_bounded_capacity() {
 
             tx.send(1).await.unwrap();
 
-            ctx.scope(async |s| {
+            scope!(ctx.scope, async |s| {
                 let tx_clone = tx.clone();
                 s.spawn_boxed(async move {
                     tx_clone.send(2).await.unwrap();
@@ -109,7 +109,7 @@ fn test_sync_mpmc_bounded_multi_consumer() {
                 tx.send(i).await.unwrap();
             }
 
-            ctx.scope(async |s| {
+            scope!(ctx.scope, async |s| {
                 let c1 = rx.clone();
                 let c2 = rx.clone();
 

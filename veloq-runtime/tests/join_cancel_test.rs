@@ -1,5 +1,6 @@
 use veloq_runtime::{
     runtime::Runtime,
+    scope,
     scope::JoinOutcome,
     task::{TaskError, yield_now},
 };
@@ -8,7 +9,7 @@ use veloq_runtime::{
 fn test_join_handle_waits_for_task_completion_on_cancel() {
     let rt = Runtime::<(), _>::new();
     rt.block_on(async |ctx| {
-        ctx.scope(async |scope| {
+        scope!(ctx, async |scope| {
             let handle = scope.spawn_boxed(async {
                 for _ in 0..8 {
                     yield_now().await;
@@ -35,7 +36,7 @@ fn test_join_handle_waits_for_task_completion_on_cancel() {
 fn test_join_handle_cancelled_before_await() {
     let rt = Runtime::<(), _>::new();
     rt.block_on(async |ctx| {
-        ctx.scope(async |scope| {
+        scope!(ctx, async |scope| {
             let handle = scope.spawn_boxed(async {
                 loop {
                     yield_now().await;
@@ -61,7 +62,7 @@ fn test_join_handle_cancelled_before_await() {
 fn test_join_handle_scope_cancel_waits_for_completion() {
     let rt = Runtime::<(), _>::new();
     rt.block_on(async |ctx| {
-        ctx.scope(async |scope| {
+        scope!(ctx, async |scope| {
             let token = scope.cancel_token().clone();
             let handle = scope.spawn_boxed(async {
                 loop {

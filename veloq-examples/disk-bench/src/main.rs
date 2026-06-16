@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use veloq::fs::{BufferingMode, File, OpenOptions};
 use veloq::io::buffer::FixedBuf;
-use veloq::runtime::Runtime;
 use veloq::runtime::context::RuntimeContext;
+use veloq::runtime::{Runtime, scope};
 use veloq::sync::mpsc;
 use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
 
@@ -253,7 +253,7 @@ async fn run_iteration_measured<'a, 'ctx>(
     let state = mpsc::unbounded();
     let (tx, mut rx) = state.split();
 
-    ctx.scope(async |s| {
+    scope!(ctx.scope, async |s| {
         let mut in_flight = 0usize;
         loop {
             // 1. Submit tasks up to qdepth if we have buffers and ops
@@ -453,7 +453,7 @@ fn main() {
     // Execute
     runtime
         .block_on(async |ctx| {
-            ctx.scope(async |s| {
+            scope!(ctx.scope, async |s| {
                 // 1. Preparation Phase (Create & Fallocate)
                 println!(
                     "Initializing disk files (creating & fallocating)... This may take a while."
