@@ -111,12 +111,10 @@ pub struct OpCompletion<T, E, R = usize> {
 }
 
 impl<T, E, R> OpCompletion<T, E, R> {
-    #[inline]
     pub fn new(result: DriverResult<R, E>, output: T) -> Self {
         Self { result, output }
     }
 
-    #[inline]
     pub fn into_parts(self) -> (DriverResult<R, E>, T) {
         (self.result, self.output)
     }

@@ -25,7 +25,6 @@ pub struct CompletionWritePermit {
 }
 
 impl CompletionWritePermit {
-    #[inline]
     const fn new() -> Self {
         Self { _private: () }
     }
@@ -179,12 +178,10 @@ pub struct CompletionFlowOutcome {
 }
 
 impl CompletionFlowOutcome {
-    #[inline]
     pub const fn semantic_count(&self) -> usize {
         self.user_completed + self.user_lost + self.orphan_cleaned + self.internal + self.anomaly
     }
 
-    #[inline]
     pub fn merge(&mut self, other: Self) {
         self.user_completed += other.user_completed;
         self.user_lost += other.user_lost;
@@ -194,7 +191,6 @@ impl CompletionFlowOutcome {
         self.ignored += other.ignored;
     }
 
-    #[inline]
     const fn user_completed() -> Self {
         Self {
             user_completed: 1,
@@ -206,7 +202,6 @@ impl CompletionFlowOutcome {
         }
     }
 
-    #[inline]
     const fn user_lost() -> Self {
         Self {
             user_completed: 0,
@@ -218,7 +213,6 @@ impl CompletionFlowOutcome {
         }
     }
 
-    #[inline]
     const fn orphan_cleaned() -> Self {
         Self {
             user_completed: 0,
@@ -230,7 +224,6 @@ impl CompletionFlowOutcome {
         }
     }
 
-    #[inline]
     const fn internal() -> Self {
         Self {
             user_completed: 0,
@@ -242,7 +235,6 @@ impl CompletionFlowOutcome {
         }
     }
 
-    #[inline]
     const fn anomaly() -> Self {
         Self {
             user_completed: 0,
@@ -254,7 +246,6 @@ impl CompletionFlowOutcome {
         }
     }
 
-    #[inline]
     const fn ignored() -> Self {
         Self {
             user_completed: 0,

@@ -36,7 +36,6 @@ pub struct LocalSlot<Spec: SlotSpec> {
 }
 
 impl<Spec: SlotSpec> LocalSlot<Spec> {
-    #[inline]
     fn new() -> Self {
         Self {
             op: None,
@@ -200,7 +199,6 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         self.slot_bundle_by_index_mut(token.index())
     }
 
-    #[inline]
     pub fn with_slot_storage_mut<F, X>(&mut self, token: OpToken, f: F) -> Option<X>
     where
         F: FnOnce(
@@ -235,7 +233,6 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         core.generation() == generation && core.state() != SlotState::Idle
     }
 
-    #[inline]
     pub fn active_tokens(&self) -> impl Iterator<Item = OpToken> + '_ {
         self.shared
             .slots
@@ -249,7 +246,6 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
             })
     }
 
-    #[inline]
     pub fn capacity(&self) -> usize {
         self.local.len()
     }
@@ -279,7 +275,6 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         Some(self.remove_at_index(user_data))
     }
 
-    #[inline]
     pub fn finalize_checked(
         &mut self,
         token: OpToken,
@@ -315,7 +310,6 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         true
     }
 
-    #[inline]
     pub fn finalize_waiting_completion(
         &mut self,
         token: OpToken,
@@ -323,7 +317,6 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         self.remove(token)
     }
 
-    #[inline]
     pub fn finalize_orphaned_completion(
         &mut self,
         token: OpToken,
@@ -331,7 +324,6 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         self.remove(token)
     }
 
-    #[inline]
     pub fn finalize_corrupt_slot(
         &mut self,
         snapshot: SlotSnapshot,
@@ -349,12 +341,10 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         }
     }
 
-    #[inline]
     pub fn has_active_ops(&self) -> bool {
         self.active_count > 0
     }
 
-    #[inline]
     pub fn active_count(&self) -> usize {
         self.active_count
     }

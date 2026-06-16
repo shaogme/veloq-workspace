@@ -16,7 +16,6 @@ pub enum RoutedSlotCompletion<'a, Spec: slot::SlotSpec> {
 }
 
 impl<'a, Spec: slot::SlotSpec> RoutedSlotCompletion<'a, Spec> {
-    #[inline]
     pub fn kind(&self) -> Option<CompletionAnomalyKind> {
         match self {
             Self::Waiting(_) | Self::Orphaned(_) => None,

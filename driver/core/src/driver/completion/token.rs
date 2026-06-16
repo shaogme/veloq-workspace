@@ -11,7 +11,6 @@ pub enum CompletionControlKind {
 }
 
 impl CompletionControlKind {
-    #[inline]
     pub(super) fn from_raw(raw: u16) -> Option<Self> {
         match raw {
             1 => Some(Self::Waker),
@@ -41,7 +40,6 @@ pub struct SubmitTokenContext {
 }
 
 impl SubmitTokenContext {
-    #[inline]
     pub fn user(op_token: OpToken) -> Self {
         Self {
             op_token,
@@ -49,7 +47,6 @@ impl SubmitTokenContext {
         }
     }
 
-    #[inline]
     pub const fn new(op_token: OpToken, completion_token: CompletionToken) -> Self {
         Self {
             op_token,
@@ -70,7 +67,6 @@ pub enum OpTokenError {
 }
 
 impl OpToken {
-    #[inline]
     pub const fn try_new(index: usize, generation: u32) -> Result<Self, OpTokenError> {
         if index as u64 >= INDEX_LIMIT {
             return Err(OpTokenError::ReservedControlIndex { index });
@@ -78,22 +74,18 @@ impl OpToken {
         Ok(Self { index, generation })
     }
 
-    #[inline]
     pub const fn from_registry_parts(index: usize, generation: u32) -> Result<Self, OpTokenError> {
         Self::try_new(index, generation)
     }
 
-    #[inline]
     pub const fn index(self) -> usize {
         self.index
     }
 
-    #[inline]
     pub const fn generation(self) -> u32 {
         self.generation
     }
 
-    #[inline]
     pub const fn parts(self) -> (usize, u32) {
         (self.index, self.generation)
     }
@@ -103,12 +95,10 @@ impl OpToken {
 pub struct CancelCompletionId(u16);
 
 impl CancelCompletionId {
-    #[inline]
     pub const fn new(raw: u16) -> Self {
         Self(raw)
     }
 
-    #[inline]
     pub const fn raw(self) -> u16 {
         self.0
     }
@@ -139,23 +129,19 @@ impl std::fmt::Display for CompletionTokenError {
 impl std::error::Error for CompletionTokenError {}
 
 impl CompletionToken {
-    #[inline]
     pub const fn user(token: OpToken) -> Self {
         let (index, generation) = token.parts();
         Self(((generation as u64 & 0x7fff) << 48) | (index as u64 & 0x0000_ffff_ffff_ffff))
     }
 
-    #[inline]
     pub(super) const fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
 
-    #[inline]
     pub const fn raw(self) -> u64 {
         self.0
     }
 
-    #[inline]
     pub const fn encode_control(kind: u16, id: u16) -> Result<Self, CompletionTokenError> {
         if kind > 0x7fff {
             return Err(CompletionTokenError::ControlKindOverflow { kind });
@@ -172,7 +158,6 @@ impl CompletionToken {
         ))
     }
 
-    #[inline]
     const fn internal(kind: CompletionControlKind, id: u16) -> Self {
         Self(
             CONTROL_TOKEN_FLAG
@@ -181,17 +166,14 @@ impl CompletionToken {
         )
     }
 
-    #[inline]
     pub const fn waker(id: u16) -> Self {
         Self::internal(CompletionControlKind::Waker, id)
     }
 
-    #[inline]
     pub const fn cancel(id: CancelCompletionId) -> Self {
         Self::internal(CompletionControlKind::Cancel, id.raw())
     }
 
-    #[inline]
     pub fn classify(self) -> CompletionTokenClass {
         if (self.0 & CONTROL_TOKEN_FLAG) == 0 {
             let raw_index = self.0 & 0x0000_ffff_ffff_ffff;
@@ -212,7 +194,6 @@ impl CompletionToken {
         }
     }
 
-    #[inline]
     pub fn op_token(self) -> Option<OpToken> {
         match self.classify() {
             CompletionTokenClass::User(token) => Some(token),
@@ -224,7 +205,6 @@ impl CompletionToken {
 }
 
 impl From<CompletionToken> for u64 {
-    #[inline]
     fn from(value: CompletionToken) -> Self {
         value.raw()
     }

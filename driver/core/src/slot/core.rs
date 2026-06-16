@@ -36,13 +36,11 @@ pub struct PackedCoreState {
 }
 
 impl PackedCoreState {
-    #[inline]
     pub fn with_state(mut self, state: SlotState) -> Self {
         self.set_state(state);
         self
     }
 
-    #[inline]
     pub fn with_generation(mut self, generation: u32) -> Self {
         self.set_generation(generation);
         self
@@ -52,22 +50,18 @@ impl PackedCoreState {
 pub struct AtomicPackedCoreState(AtomicU64);
 
 impl AtomicPackedCoreState {
-    #[inline]
     pub fn new(state: PackedCoreState) -> Self {
         Self(AtomicU64::new(u64::from(state)))
     }
 
-    #[inline]
     pub fn load(&self, order: Ordering) -> PackedCoreState {
         PackedCoreState::from(self.0.load(order))
     }
 
-    #[inline]
     pub fn store(&self, state: PackedCoreState, order: Ordering) {
         self.0.store(u64::from(state), order);
     }
 
-    #[inline]
     pub fn compare_exchange(
         &self,
         current: PackedCoreState,
@@ -81,7 +75,6 @@ impl AtomicPackedCoreState {
             .map_err(PackedCoreState::from)
     }
 
-    #[inline]
     pub fn compare_exchange_weak(
         &self,
         current: PackedCoreState,
@@ -103,7 +96,6 @@ pub struct SlotStorage<Spec: SlotSpec> {
 }
 
 impl<Spec: SlotSpec> SlotStorage<Spec> {
-    #[inline]
     pub fn new() -> Self {
         Self {
             result: None,
@@ -112,12 +104,10 @@ impl<Spec: SlotSpec> SlotStorage<Spec> {
         }
     }
 
-    #[inline]
     pub fn reset(&mut self) {
         *self = Self::new();
     }
 
-    #[inline]
     pub fn with_mut<F, X>(&mut self, f: F) -> X
     where
         F: FnOnce(
@@ -131,7 +121,6 @@ impl<Spec: SlotSpec> SlotStorage<Spec> {
 }
 
 impl<Spec: SlotSpec> Default for SlotStorage<Spec> {
-    #[inline]
     fn default() -> Self {
         Self::new()
     }
@@ -165,7 +154,6 @@ pub(crate) enum CompletionData<Spec: SlotSpec> {
 }
 
 impl<Spec: SlotSpec> Default for CompletionData<Spec> {
-    #[inline]
     fn default() -> Self {
         Self::Empty
     }
@@ -225,22 +213,18 @@ impl<Spec: SlotSpec> SlotData<Spec> {
         }
     }
 
-    #[inline]
     pub(crate) fn state(&self, ordering: Ordering) -> SlotState {
         self.core_state.load(ordering).state()
     }
 
-    #[inline]
     pub fn generation(&self, ordering: Ordering) -> u32 {
         self.core_state.load(ordering).generation()
     }
 
-    #[inline]
     pub(crate) fn load_core_state(&self, ordering: Ordering) -> PackedCoreState {
         self.core_state.load(ordering)
     }
 
-    #[inline]
     pub(crate) fn set_state(&self, state: SlotState, ordering: Ordering) {
         let mut current = self.core_state.load(Ordering::Acquire);
         loop {
@@ -284,7 +268,6 @@ impl<Spec: SlotSpec> SlotData<Spec> {
         }
     }
 
-    #[inline]
     pub(crate) fn completion_with_record_data<F, X>(&self, f: F) -> X
     where
         F: FnOnce(&mut CompletionData<Spec>) -> X,

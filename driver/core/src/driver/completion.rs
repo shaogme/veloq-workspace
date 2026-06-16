@@ -51,7 +51,6 @@ pub trait CompletionValue: Send {
 }
 
 impl CompletionValue for usize {
-    #[inline]
     fn from_event_res<E>(res: i32) -> DriverResult<Self, E>
     where
         E: DriverError,

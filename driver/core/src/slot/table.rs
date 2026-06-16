@@ -39,7 +39,6 @@ impl<Spec: SlotSpec> SlotTable<Spec> {
         }
     }
 
-    #[inline]
     pub fn completion_diagnostics(
         &self,
     ) -> DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>> {
@@ -69,17 +68,14 @@ impl<Spec: SlotSpec> SlotTable<Spec> {
     }
 
     /// 检查是否存在已完成但尚未被消费的完成项。
-    #[inline]
     pub fn has_ready_completion(&self) -> bool {
         self.ready_completion_count.load(Ordering::Acquire) > 0
     }
 
-    #[inline]
     pub(crate) fn note_ready_completion(&self) {
         self.ready_completion_count.fetch_add(1, Ordering::Release);
     }
 
-    #[inline]
     pub(crate) fn clear_ready_completion(&self) {
         let mut current = self.ready_completion_count.load(Ordering::Acquire);
         loop {

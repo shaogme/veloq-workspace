@@ -16,17 +16,14 @@ pub struct CancelRequest {
 }
 
 impl CancelRequest {
-    #[inline]
     pub const fn new(target: OpToken, mode: CancelMode) -> Self {
         Self { target, mode }
     }
 
-    #[inline]
     pub const fn user_visible(target: OpToken) -> Self {
         Self::new(target, CancelMode::UserVisible)
     }
 
-    #[inline]
     pub const fn abandon(target: OpToken) -> Self {
         Self::new(target, CancelMode::Abandon)
     }
@@ -50,21 +47,18 @@ pub enum CancelTargetGoneReason {
 }
 
 impl CancelSubmitOutcome {
-    #[inline]
     pub const fn target_missing() -> Self {
         Self::TargetGone {
             reason: CancelTargetGoneReason::Missing,
         }
     }
 
-    #[inline]
     pub const fn target_stale() -> Self {
         Self::TargetGone {
             reason: CancelTargetGoneReason::Stale,
         }
     }
 
-    #[inline]
     pub const fn target_corrupt() -> Self {
         Self::TargetGone {
             reason: CancelTargetGoneReason::Corrupt,

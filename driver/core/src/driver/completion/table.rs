@@ -198,7 +198,6 @@ where
     slot::SlotError<Spec>: Send,
     slot::SlotCompletion<Spec>: Send,
 {
-    #[inline]
     fn record_completion(
         &self,
         _permit: CompletionWritePermit,
@@ -332,7 +331,6 @@ where
         recorded_completion(&self.diagnostics, success_outcome)
     }
 
-    #[inline]
     fn try_take_record(&self, token: OpToken) -> PollRecordResult<Spec> {
         let attach = AnomalyAttach::from_op_token(token);
         let (idx, generation) = token.parts();
@@ -437,7 +435,6 @@ where
         }
     }
 
-    #[inline]
     fn register_waker(&self, token: OpToken, waker: &Waker) -> CompletionMutationOutcome {
         let (idx, generation) = token.parts();
         if idx >= self.slots.len() {
@@ -484,7 +481,6 @@ where
         recorded_mutation(&self.diagnostics, token, outcome)
     }
 
-    #[inline]
     fn mark_waiting(&self, token: OpToken) -> CompletionMutationOutcome {
         let (idx, generation) = token.parts();
         if idx >= self.slots.len() {
@@ -537,7 +533,6 @@ where
         }
     }
 
-    #[inline]
     fn discard_ready_record(&self, token: OpToken) -> CompletionMutationOutcome {
         let (idx, generation) = token.parts();
         if idx >= self.slots.len() {
@@ -593,7 +588,6 @@ where
         }
     }
 
-    #[inline]
     fn mark_orphaned(&self, token: OpToken) -> CompletionMutationOutcome {
         let (idx, generation) = token.parts();
         if idx >= self.slots.len() {
@@ -656,7 +650,6 @@ where
         }
     }
 
-    #[inline]
     #[cfg(any(test, feature = "loom"))]
     fn debug_get_state(&self, idx: usize) -> u8 {
         let current = self.slots[idx].load_core_state(Ordering::Acquire);

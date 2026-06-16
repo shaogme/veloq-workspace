@@ -39,7 +39,6 @@ pub struct IoFd {
 
 impl IoFd {
     /// Creates an IO descriptor from a registered descriptor index.
-    #[inline]
     pub const fn fixed(index: u32) -> Self {
         Self {
             fixed_index: index,
@@ -48,7 +47,6 @@ impl IoFd {
     }
 
     /// Creates an IO descriptor from a registered descriptor index and generation.
-    #[inline]
     pub const fn fixed_with_generation(index: u32, generation: u64) -> Self {
         Self {
             fixed_index: index,
@@ -57,13 +55,11 @@ impl IoFd {
     }
 
     /// Returns the registered descriptor index.
-    #[inline]
     pub const fn fixed_index(self) -> u32 {
         self.fixed_index
     }
 
     /// Returns the descriptor generation.
-    #[inline]
     pub const fn generation(self) -> u64 {
         self.generation
     }
@@ -122,24 +118,20 @@ pub struct OwnedRawHandle<H: RawHandleMeta> {
 }
 
 impl<H: Handle> RawHandle<H> {
-    #[inline]
     pub const fn raw(self) -> H {
         self.raw
     }
 }
 
 impl<H: RawHandleMeta> RawHandle<H> {
-    #[inline]
     pub const fn new(raw: H) -> Self {
         Self { raw }
     }
 
-    #[inline]
     pub fn kind(self) -> RawHandleKind {
         self.raw.kind()
     }
 
-    #[inline]
     pub const fn borrow(&self) -> BorrowedRawHandle<'_, H> {
         BorrowedRawHandle {
             raw: *self,
@@ -147,41 +139,34 @@ impl<H: RawHandleMeta> RawHandle<H> {
         }
     }
 
-    #[inline]
     pub fn is_socket(self) -> bool {
         matches!(self.kind(), RawHandleKind::Socket)
     }
 
-    #[inline]
     pub fn is_file(self) -> bool {
         matches!(self.kind(), RawHandleKind::File)
     }
 }
 
 impl<'a, H: RawHandleMeta> BorrowedRawHandle<'a, H> {
-    #[inline]
     pub const fn raw(self) -> H {
         self.raw.raw()
     }
 
-    #[inline]
     pub fn kind(self) -> RawHandleKind {
         self.raw.kind()
     }
 
-    #[inline]
     pub fn is_socket(self) -> bool {
         self.raw.is_socket()
     }
 
-    #[inline]
     pub fn is_file(self) -> bool {
         self.raw.is_file()
     }
 }
 
 impl<H: RawHandleMeta> OwnedRawHandle<H> {
-    #[inline]
     pub const fn raw(&self) -> H {
         self.raw.raw()
     }
@@ -189,33 +174,27 @@ impl<H: RawHandleMeta> OwnedRawHandle<H> {
     /// # Safety
     ///
     /// 调用方必须保证 `raw` 拥有唯一所有权。
-    #[inline]
     pub const unsafe fn from_raw_owned(raw: RawHandle<H>) -> Self {
         Self { raw }
     }
 
-    #[inline]
     pub fn into_raw(self) -> RawHandle<H> {
         let this = core::mem::ManuallyDrop::new(self);
         this.raw
     }
 
-    #[inline]
     pub fn kind(&self) -> RawHandleKind {
         self.raw.kind()
     }
 
-    #[inline]
     pub const fn borrow(&self) -> BorrowedRawHandle<'_, H> {
         self.raw.borrow()
     }
 
-    #[inline]
     pub fn is_socket(&self) -> bool {
         self.raw.is_socket()
     }
 
-    #[inline]
     pub fn is_file(&self) -> bool {
         self.raw.is_file()
     }

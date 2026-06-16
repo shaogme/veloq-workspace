@@ -127,12 +127,10 @@ pub enum CompletionMutationOutcome {
 }
 
 impl CompletionMutationOutcome {
-    #[inline]
     pub const fn is_applied(self) -> bool {
         matches!(self, Self::Applied)
     }
 
-    #[inline]
     pub fn anomaly_outcome(&self) -> Option<AnomalyOutcome> {
         match self {
             Self::Applied => None,
@@ -140,7 +138,6 @@ impl CompletionMutationOutcome {
         }
     }
 
-    #[inline]
     pub fn kind(&self) -> Option<CompletionAnomalyKind> {
         self.anomaly_outcome().map(AnomalyOutcome::kind)
     }
@@ -201,7 +198,6 @@ pub enum CompletionAnomaly {
 }
 
 impl AnomalyOutcome {
-    #[inline]
     pub fn kind(self) -> CompletionAnomalyKind {
         match self {
             Self::Missing(kind)
@@ -211,19 +207,16 @@ impl AnomalyOutcome {
         }
     }
 
-    #[inline]
     pub fn materialize(self, attach: AnomalyAttach) -> CompletionAnomaly {
         self.kind().materialize(attach)
     }
 }
 
 impl AnomalyAttach {
-    #[inline]
     pub const fn token_only(token: CompletionToken) -> Self {
         Self { token, raw: None }
     }
 
-    #[inline]
     pub fn from_op_token(token: crate::driver::OpToken) -> Self {
         Self {
             token: CompletionToken::user(token),
@@ -231,7 +224,6 @@ impl AnomalyAttach {
         }
     }
 
-    #[inline]
     pub fn from_raw_completion(raw: super::super::RawCompletion) -> Self {
         Self {
             token: raw.token,

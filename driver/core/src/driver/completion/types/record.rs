@@ -11,7 +11,6 @@ pub struct CompletionCleanup {
 }
 
 impl CompletionCleanup {
-    #[inline]
     pub fn new(
         action: impl FnOnce() -> DriverResult<(), DriverCoreError> + Send + 'static,
     ) -> Self {
@@ -20,7 +19,6 @@ impl CompletionCleanup {
         }
     }
 
-    #[inline]
     pub fn run(self) -> DriverResult<(), DriverCoreError> {
         (self.action)()
     }
@@ -38,29 +36,24 @@ pub struct CompletionCleanupGuard {
 }
 
 impl CompletionCleanupGuard {
-    #[inline]
     pub fn new(cleanup: CompletionCleanup) -> Self {
         Self {
             cleanup: Some(cleanup),
         }
     }
 
-    #[inline]
     pub fn none() -> Self {
         Self::default()
     }
 
-    #[inline]
     pub fn is_armed(&self) -> bool {
         self.cleanup.is_some()
     }
 
-    #[inline]
     pub fn disarm(&mut self) -> bool {
         self.cleanup.take().is_some()
     }
 
-    #[inline]
     pub fn run(&mut self) -> DriverResult<bool, DriverCoreError> {
         let Some(cleanup) = self.cleanup.take() else {
             return Ok(false);
@@ -86,7 +79,6 @@ pub enum RecordCompletionOutcome {
 }
 
 impl RecordCompletionOutcome {
-    #[inline]
     pub fn anomaly_outcome(&self) -> Option<AnomalyOutcome> {
         match self {
             Self::RecordedUser | Self::RecordedLost | Self::OrphanedDropped => None,
@@ -104,7 +96,6 @@ pub enum RecordCompletionResult<Spec: slot::SlotSpec> {
 }
 
 impl<Spec: slot::SlotSpec> RecordCompletionResult<Spec> {
-    #[inline]
     pub fn outcome(&self) -> &RecordCompletionOutcome {
         match self {
             Self::Recorded(outcome) => outcome,
@@ -112,7 +103,6 @@ impl<Spec: slot::SlotSpec> RecordCompletionResult<Spec> {
         }
     }
 
-    #[inline]
     pub fn into_outcome(self) -> RecordCompletionOutcome {
         match self {
             Self::Recorded(outcome) => outcome,

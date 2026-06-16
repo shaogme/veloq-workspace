@@ -28,7 +28,6 @@ pub enum CompletionInput<Spec: SlotSpec> {
 }
 
 impl<Spec: SlotSpec> CompletionInput<Spec> {
-    #[inline]
     pub fn cleanup_mut(&mut self) -> &mut CompletionCleanupGuard {
         match self {
             Self::User(completion) => &mut completion.cleanup,
@@ -36,7 +35,6 @@ impl<Spec: SlotSpec> CompletionInput<Spec> {
         }
     }
 
-    #[inline]
     pub fn lost_kind(&self) -> Option<(CompletionAnomalyKind, AnomalyAttach)> {
         match self {
             Self::User(_) => None,
@@ -46,7 +44,6 @@ impl<Spec: SlotSpec> CompletionInput<Spec> {
 }
 
 impl<Spec: SlotSpec> CompletionPacket<Spec> {
-    #[inline]
     pub fn user_event(
         event: UserCompletionEvent,
         payload: Spec::UserPayload,
@@ -63,7 +60,6 @@ impl<Spec: SlotSpec> CompletionPacket<Spec> {
         }
     }
 
-    #[inline]
     pub fn user(
         event: UserCompletionEvent,
         payload: Spec::UserPayload,
@@ -72,7 +68,6 @@ impl<Spec: SlotSpec> CompletionPacket<Spec> {
         Self::user_event(event, payload, detail, CompletionCleanupGuard::default())
     }
 
-    #[inline]
     pub fn user_with_cleanup(
         event: UserCompletionEvent,
         payload: Spec::UserPayload,
@@ -82,7 +77,6 @@ impl<Spec: SlotSpec> CompletionPacket<Spec> {
         Self::user_event(event, payload, detail, cleanup)
     }
 
-    #[inline]
     pub fn lost(
         event: UserCompletionEvent,
         kind: CompletionAnomalyKind,
@@ -99,12 +93,10 @@ impl<Spec: SlotSpec> CompletionPacket<Spec> {
         }
     }
 
-    #[inline]
     pub const fn token(&self) -> OpToken {
         self.event.token()
     }
 
-    #[inline]
     pub const fn completion_event(&self) -> CompletionEvent {
         self.event.event()
     }
@@ -118,7 +110,6 @@ pub struct CompletionRecord<Spec: SlotSpec> {
 }
 
 impl<Spec: SlotSpec> CompletionRecord<Spec> {
-    #[inline]
     pub fn disarm_cleanup(&mut self) -> bool {
         self.cleanup.disarm()
     }
