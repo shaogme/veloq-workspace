@@ -19,7 +19,7 @@ use std::{
 ///
 /// 由于基于 `Rc` 和 `RefCell`，只能在单线程（Local）使用。
 #[derive(Debug)]
-pub struct LocalSender<T> {
+pub struct Sender<T> {
     channel: LocalChannel<T>,
 }
 
@@ -27,7 +27,7 @@ pub struct LocalSender<T> {
 ///
 /// 提供 `recv` 方法用于接收消息，也可以通过 `stream()` 转换为 `Stream`。
 #[derive(Debug)]
-pub struct LocalReceiver<T> {
+pub struct Receiver<T> {
     channel: LocalChannel<T>,
 }
 
@@ -267,7 +267,7 @@ impl<T> Drop for LocalChannel<T> {
 
 impl<T> LocalChannel<T> {
     #[allow(clippy::new_ret_no_self)]
-    fn new(capacity: ChannelCapacity) -> (LocalSender<T>, LocalReceiver<T>) {
+    fn new(capacity: ChannelCapacity) -> (Sender<T>, Receiver<T>) {
         let channel_buffer = match capacity {
             ChannelCapacity::Unbounded => VecDeque::new(),
             ChannelCapacity::Bounded(x) => VecDeque::with_capacity(x),
@@ -285,25 +285,25 @@ impl<T> LocalChannel<T> {
         };
 
         (
-            LocalSender {
+            Sender {
                 channel: channel.clone(),
             },
-            LocalReceiver { channel },
+            Receiver { channel },
         )
     }
 }
 
 /// 创建一个新的无界通道
-pub fn unbounded<T>() -> (LocalSender<T>, LocalReceiver<T>) {
+pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
     LocalChannel::new(ChannelCapacity::Unbounded)
 }
 
 /// 创建一个新的有界通道
-pub fn bounded<T>(size: usize) -> (LocalSender<T>, LocalReceiver<T>) {
+pub fn bounded<T>(size: usize) -> (Sender<T>, Receiver<T>) {
     LocalChannel::new(ChannelCapacity::Bounded(size))
 }
 
-impl<T> Clone for LocalSender<T> {
+impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
         self.channel.state.borrow_mut().tx_count += 1;
         Self {
@@ -312,7 +312,7 @@ impl<T> Clone for LocalSender<T> {
     }
 }
 
-impl<T> LocalSender<T> {
+impl<T> Sender<T> {
     /// 尝试发送数据，如果通道已满或接收端关闭则返回错误
     pub fn try_send(&self, item: T) -> Result<(), SendError<T>> {
         if let Some(w) = self.channel.state.borrow_mut().push(item)? {
@@ -364,7 +364,7 @@ fn wake_up_all(waiters: &mut LinkedList<WaiterAdapter>) {
     }
 }
 
-impl<T> Drop for LocalSender<T> {
+impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         let mut state = self.channel.state.borrow_mut();
         state.tx_count -= 1;
@@ -376,7 +376,7 @@ impl<T> Drop for LocalSender<T> {
     }
 }
 
-impl<T> Drop for LocalReceiver<T> {
+impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         let mut state = self.channel.state.borrow_mut();
         // Receiver 只有一个，所以可以直接关闭
@@ -459,7 +459,7 @@ impl<T> Drop for ChannelStream<'_, T> {
     }
 }
 
-impl<T> LocalReceiver<T> {
+impl<T> Receiver<T> {
     /// 尝试非阻塞接收
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
         let result = self.channel.state.borrow_mut().recv_one();
