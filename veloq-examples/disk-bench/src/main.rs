@@ -250,7 +250,8 @@ async fn run_iteration_measured<'a, 'ctx>(
     let total_ops = ops.len();
     let mut current_op_idx = 0;
     let mut written_bytes = 0u64;
-    let (tx, mut rx) = mpsc::unbounded();
+    let state = mpsc::unbounded();
+    let (tx, mut rx) = state.split();
 
     ctx.scope(async |s| {
         let mut in_flight = 0usize;
