@@ -15,7 +15,8 @@ fn real_waker() -> Waker {
 }
 
 fn bench_poll_pending(c: &mut Criterion) {
-    let (_tx, rx) = mpsc::unbounded::<i32>();
+    let state = mpsc::unbounded::<i32>();
+    let (_tx, rx) = state.split();
     let recv_fut = rx.recv();
     let mut pinned = Box::pin(recv_fut);
     let waker = real_waker();
@@ -30,7 +31,8 @@ fn bench_poll_pending(c: &mut Criterion) {
 
 fn bench_stream_poll_pending(c: &mut Criterion) {
     use futures_core::Stream;
-    let (_tx, rx) = mpsc::unbounded::<i32>();
+    let state = mpsc::unbounded::<i32>();
+    let (_tx, rx) = state.split();
     let stream = rx.stream();
     let mut pinned = Box::pin(stream);
     let waker = real_waker();

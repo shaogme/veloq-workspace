@@ -11,7 +11,8 @@ fn bench_oneshot_send_recv(c: &mut Criterion) {
 
     group.bench_function("send_recv", |b| {
         b.to_async(&rt).iter(|| async {
-            let (tx, rx) = oneshot::channel();
+            let state = oneshot::channel();
+            let (tx, rx) = state.split();
             tx.send(1).unwrap();
             rx.await.unwrap();
         });
