@@ -193,8 +193,8 @@ impl<T: PoolTopology> Runtime<T> {
             .build();
 
         runtime
-            .block_on(async move |scope| {
-                let ctx = Ctx { scope };
+            .block_on(async move |runtime_ctx| {
+                let ctx = Ctx { runtime_ctx };
                 f(ctx).await
             })
             .trans()

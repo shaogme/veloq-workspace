@@ -144,7 +144,7 @@ impl OpenOptions {
         let op = self.build_op(&ctx, path.as_ref())?;
 
         let submitter = DetachedSubmitter::new();
-        let owner = ctx.scope.worker_id();
+        let owner = ctx.runtime_ctx.worker_id();
         let (res, _) = ctx.submit_to(owner, Op::new(op)).await?;
         let owned = res.trans()?;
         let raw = owned.into_raw();

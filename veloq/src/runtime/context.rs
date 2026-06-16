@@ -201,20 +201,20 @@ pub struct Ctx<'a, 'ctx>
 where
     'ctx: 'a,
 {
-    pub scope: RuntimeCtx<'a, WorkerState<'ctx>>,
+    pub runtime_ctx: RuntimeCtx<'a, WorkerState<'ctx>>,
 }
 
 impl<'a, 'ctx> AsRuntimeCtx<'a, WorkerState<'ctx>> for Ctx<'a, 'ctx> {
     #[inline]
     fn as_runtime_ctx(self) -> RuntimeCtx<'a, WorkerState<'ctx>> {
-        self.scope
+        self.runtime_ctx
     }
 }
 
 impl<'a, 'ctx> AsRuntimeCtx<'a, WorkerState<'ctx>> for &Ctx<'a, 'ctx> {
     #[inline]
     fn as_runtime_ctx(self) -> RuntimeCtx<'a, WorkerState<'ctx>> {
-        self.scope
+        self.runtime_ctx
     }
 }
 
@@ -250,7 +250,7 @@ impl<'a, 'ctx> DriverProvider for Ctx<'a, 'ctx> {
 impl<'a, 'ctx> Ctx<'a, 'ctx> {
     #[inline]
     fn extra<R>(&self, f: impl FnOnce(&WorkerState<'ctx>) -> R) -> R {
-        self.scope
+        self.runtime_ctx
             .shared()
             .extra_tls
             .try_with(|extra| f(extra))
@@ -264,11 +264,11 @@ impl<'a, 'ctx> Ctx<'a, 'ctx> {
 
     #[inline]
     pub fn registrar(&self) -> DriverRegistrar<'a, 'ctx> {
-        DriverRegistrar::new(self.scope.shared())
+        DriverRegistrar::new(self.runtime_ctx.shared())
     }
     #[inline]
     pub fn select_poll_start(&self, branches: u32) -> u32 {
-        self.scope.select_poll_start(branches)
+        self.runtime_ctx.select_poll_start(branches)
     }
 
     pub fn driver<'d, R>(
@@ -354,7 +354,7 @@ impl<'a, 'ctx> Ctx<'a, 'ctx> {
             > + Send
             + 'd + 'ctx,
     {
-        if self.scope.worker_id() == worker_id {
+        if self.runtime_ctx.worker_id() == worker_id {
             let (res, op_back) = self
                 .submit(&DetachedSubmitter::new(), op)
                 .await
@@ -362,11 +362,13 @@ impl<'a, 'ctx> Ctx<'a, 'ctx> {
             let op = op_back.expect("Op lost in local submit");
             Ok((res, op))
         } else {
-            let scope_clone = self.scope;
+            let runtime_ctx_clone = self.runtime_ctx;
             let routed = self
-                .scope
+                .runtime_ctx
                 .route_to(worker_id, move || {
-                    let ctx = Ctx { scope: scope_clone };
+                    let ctx = Ctx {
+                        runtime_ctx: runtime_ctx_clone,
+                    };
                     ctx.driver(|mut driver| op.submit_detached(&mut driver))
                 })
                 .trans()?;

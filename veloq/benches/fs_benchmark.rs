@@ -229,7 +229,7 @@ async fn run_worker_iteration<'a, 'ctx>(
     chunk_size: NonZeroUsize,
     sync_mode: BenchSyncMode,
 ) -> u64 {
-    let worker_id = ctx.scope.worker_id();
+    let worker_id = ctx.runtime_ctx.worker_id();
     let concurrency_limit = 8;
     let mut offsets = vec![0u64; files.len()];
     let mut current_local_idx = 0usize;
