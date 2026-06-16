@@ -381,7 +381,7 @@ impl<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> Future for SendFuture<'a, 'b, T, 
                 return Poll::Ready(Err(SendError(this.msg.take().unwrap())));
             }
 
-            if !this.queued {
+            if !this.queued || !this.node.link.is_linked() {
                 let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
                 if state
                     .flavor
@@ -453,13 +453,15 @@ impl<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> Future for RecvFuture<'a, 'b, T, 
 
             this.node.waker.register(cx.waker());
 
-            if !this.queued {
+            if !this.queued || !this.node.link.is_linked() {
                 let mut lock = state.recv_waiters.lock();
-                unsafe {
-                    let node_pin = Pin::new_unchecked(&mut this.node);
-                    lock.push_back(node_pin);
+                if !this.node.link.is_linked() {
+                    unsafe {
+                        let node_pin = Pin::new_unchecked(&mut this.node);
+                        lock.push_back(node_pin);
+                    }
+                    state.recv_waiter_count.fetch_add(1, Ordering::Relaxed);
                 }
-                state.recv_waiter_count.fetch_add(1, Ordering::Relaxed);
                 this.queued = true;
             } else {
                 return Poll::Pending;
@@ -536,13 +538,15 @@ impl<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> Stream for ReceiverStream<'a, 'b,
 
             this.node.waker.register(cx.waker());
 
-            if !this.queued {
+            if !this.queued || !this.node.link.is_linked() {
                 let mut lock = state.recv_waiters.lock();
-                unsafe {
-                    let node_pin = Pin::new_unchecked(&mut this.node);
-                    lock.push_back(node_pin);
+                if !this.node.link.is_linked() {
+                    unsafe {
+                        let node_pin = Pin::new_unchecked(&mut this.node);
+                        lock.push_back(node_pin);
+                    }
+                    state.recv_waiter_count.fetch_add(1, Ordering::Relaxed);
                 }
-                state.recv_waiter_count.fetch_add(1, Ordering::Relaxed);
                 this.queued = true;
             } else {
                 return Poll::Pending;
@@ -682,13 +686,15 @@ impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Stream for OwnedReceiverStream<'a, T,
 
             this.node.waker.register(cx.waker());
 
-            if !this.queued {
+            if !this.queued || !this.node.link.is_linked() {
                 let mut lock = this.state.recv_waiters.lock();
-                unsafe {
-                    let node_pin = Pin::new_unchecked(&mut this.node);
-                    lock.push_back(node_pin);
+                if !this.node.link.is_linked() {
+                    unsafe {
+                        let node_pin = Pin::new_unchecked(&mut this.node);
+                        lock.push_back(node_pin);
+                    }
+                    this.state.recv_waiter_count.fetch_add(1, Ordering::Relaxed);
                 }
-                this.state.recv_waiter_count.fetch_add(1, Ordering::Relaxed);
                 this.queued = true;
             } else {
                 return Poll::Pending;
