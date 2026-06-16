@@ -23,7 +23,7 @@ use tracing::debug;
 use veloq_buf::BufferRegistrar;
 use veloq_driver_core::{
     driver::{
-        CompletionAnomaly, CompletionAnomalyReason, CompletionBackendHooks,
+        CompletionAnomaly, CompletionBackendHooks,
         CompletionBackendIngressAction, CompletionControl, CompletionFlowExt,
         CompletionHookOutcome, CompletionIngress, CompletionSource, CompletionToken, RawCompletion,
         SharedCompletionTable, UserCompletionEvent,
@@ -291,7 +291,6 @@ fn complete_rio_waiting_slot(
         return CompletionHookOutcome::Lost {
             event,
             loss_reason: anomaly,
-            snapshot,
             cleanup,
             effect,
         };
@@ -377,7 +376,6 @@ fn complete_rio_waiting_slot(
                 snapshot,
             )
             .with_raw_completion(event.raw()),
-            snapshot,
             cleanup,
             effect,
         }
@@ -429,19 +427,12 @@ pub(crate) const RIO_ANOMALY_MISSING: u16 = 2;
 pub(crate) const RIO_ANOMALY_STALE: u16 = 3;
 
 pub(crate) fn rio_malformed_context_anomaly(raw_context: u64) -> CompletionAnomaly {
-    CompletionAnomaly {
-        token: RIO_EVENT_TOKEN,
-        index: None,
-        expected_generation: None,
-        actual_generation: None,
-        state: None,
-        backend: Some(COMP_BACKEND_RIO),
-        backend_context: Some(raw_context),
-        raw_result: None,
-        flags: None,
-        slot_snapshot: None,
-        reason: CompletionAnomalyReason::BackendSpecific(RIO_ANOMALY_MALFORMED),
-    }
+    CompletionAnomaly::backend_specific(
+        RIO_ANOMALY_MALFORMED,
+        RIO_EVENT_TOKEN,
+        COMP_BACKEND_RIO,
+        raw_context,
+    )
 }
 
 pub(crate) fn rio_missing_context_anomaly(
@@ -449,19 +440,14 @@ pub(crate) fn rio_missing_context_anomaly(
     index: usize,
     generation: u32,
 ) -> CompletionAnomaly {
-    CompletionAnomaly {
-        token: RIO_EVENT_TOKEN,
-        index: Some(index),
-        expected_generation: Some(generation),
-        actual_generation: None,
-        state: None,
-        backend: Some(COMP_BACKEND_RIO),
-        backend_context: Some(raw_context),
-        raw_result: None,
-        flags: None,
-        slot_snapshot: None,
-        reason: CompletionAnomalyReason::BackendSpecific(RIO_ANOMALY_MISSING),
-    }
+    CompletionAnomaly::backend_specific_missing(
+        RIO_ANOMALY_MISSING,
+        RIO_EVENT_TOKEN,
+        COMP_BACKEND_RIO,
+        raw_context,
+        index,
+        generation,
+    )
 }
 
 pub(crate) fn rio_stale_context_anomaly(
@@ -470,19 +456,15 @@ pub(crate) fn rio_stale_context_anomaly(
     expected_generation: u32,
     actual_generation: u32,
 ) -> CompletionAnomaly {
-    CompletionAnomaly {
-        token: RIO_EVENT_TOKEN,
-        index: Some(index),
-        expected_generation: Some(expected_generation),
-        actual_generation: Some(actual_generation),
-        state: None,
-        backend: Some(COMP_BACKEND_RIO),
-        backend_context: Some(raw_context),
-        raw_result: None,
-        flags: None,
-        slot_snapshot: None,
-        reason: CompletionAnomalyReason::BackendSpecific(RIO_ANOMALY_STALE),
-    }
+    CompletionAnomaly::backend_specific_stale(
+        RIO_ANOMALY_STALE,
+        RIO_EVENT_TOKEN,
+        COMP_BACKEND_RIO,
+        raw_context,
+        index,
+        expected_generation,
+        actual_generation,
+    )
 }
 
 fn anomaly_with_rio_raw(anomaly: CompletionAnomaly, res: RioResultData) -> CompletionAnomaly {

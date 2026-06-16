@@ -259,8 +259,13 @@ pub(super) fn dispatch_envelope(envelope: CompletionEnvelope) -> CompletionDispa
 
 impl CompletionAnomaly {
     #[inline]
-    pub fn with_raw_completion(self, raw: RawCompletion) -> Self {
-        self.with_backend(raw.backend).with_event(raw.event())
+    pub fn with_raw_completion(self, raw: super::RawCompletion) -> Self {
+        use super::CompletionRaw;
+        self.with_token(raw.token).with_raw(CompletionRaw {
+            backend: raw.backend,
+            res: raw.res,
+            flags: raw.flags,
+        })
     }
 }
 

@@ -194,7 +194,6 @@ impl<'a> IocpDriver<'a> {
             snapshot.generation,
             snapshot.state,
         )
-        .with_slot_snapshot(snapshot)
         .with_raw_completion(raw);
         let _ = self.accept_completion_anomaly(anomaly)?;
         Ok(Some(anomaly))

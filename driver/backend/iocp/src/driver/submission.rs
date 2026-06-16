@@ -119,7 +119,6 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
                     snapshot,
                 )
                 .with_raw_completion(event.raw()),
-                snapshot,
                 cleanup,
                 effect: (),
             }

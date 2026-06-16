@@ -102,7 +102,7 @@ pub fn cancel_target_anomaly<'a, Spec: slot::SlotSpec>(
         }
         Err(anomaly) => anomaly,
     };
-    let reason = match anomaly.reason {
+    let reason = match anomaly.reason() {
         CompletionAnomalyReason::StaleGeneration => CancelTargetGoneReason::Stale,
         CompletionAnomalyReason::OpMissing
         | CompletionAnomalyReason::PayloadMissing

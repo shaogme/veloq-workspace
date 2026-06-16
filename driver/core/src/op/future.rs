@@ -151,7 +151,7 @@ pub(crate) fn completion_anomaly_error<E>(anomaly: CompletionAnomaly) -> OpError
 where
     E: DriverError,
 {
-    let reason = match anomaly.reason {
+    let reason = match anomaly.reason() {
         CompletionAnomalyReason::StaleGeneration => LostReason::GenerationMismatch,
         CompletionAnomalyReason::PayloadMissing => LostReason::PayloadMissing,
         CompletionAnomalyReason::UnknownSlot
@@ -171,35 +171,35 @@ where
     let mut report = DriverCoreError::Internal
         .to_report()
         .push_ctx("scope", "driver-core/op")
-        .with_ctx("completion_token", anomaly.token.raw())
-        .with_ctx("completion_anomaly", format!("{:?}", anomaly.reason))
+        .with_ctx("completion_token", anomaly.token().raw())
+        .with_ctx("completion_anomaly", format!("{:?}", anomaly.reason()))
         .attach_note("operation completion became unavailable");
 
-    if let Some(index) = anomaly.index {
+    if let Some(index) = anomaly.index() {
         report = report.with_ctx("slot_index", index);
     }
-    if let Some(expected_generation) = anomaly.expected_generation {
+    if let Some(expected_generation) = anomaly.expected_generation() {
         report = report.with_ctx("expected_generation", expected_generation);
     }
-    if let Some(actual_generation) = anomaly.actual_generation {
+    if let Some(actual_generation) = anomaly.actual_generation() {
         report = report.with_ctx("actual_generation", actual_generation);
     }
-    if let Some(state) = anomaly.state {
+    if let Some(state) = anomaly.state() {
         report = report.with_ctx("slot_state", format!("{state:?}"));
     }
-    if let Some(backend) = anomaly.backend {
+    if let Some(backend) = anomaly.backend() {
         report = report.with_ctx("completion_backend", format!("{backend:?}"));
     }
-    if let Some(backend_context) = anomaly.backend_context {
+    if let Some(backend_context) = anomaly.backend_context() {
         report = report.with_ctx("completion_backend_context", backend_context);
     }
-    if let Some(raw_result) = anomaly.raw_result {
+    if let Some(raw_result) = anomaly.raw_result() {
         report = report.with_ctx("raw_result", raw_result);
     }
-    if let Some(flags) = anomaly.flags {
+    if let Some(flags) = anomaly.flags() {
         report = report.with_ctx("completion_flags", flags);
     }
-    if let Some(snapshot) = anomaly.slot_snapshot {
+    if let Some(snapshot) = anomaly.slot_snapshot() {
         report = report
             .with_ctx("snapshot_has_op", snapshot.has_op)
             .with_ctx("snapshot_has_payload", snapshot.has_payload);

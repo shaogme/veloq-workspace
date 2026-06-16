@@ -533,7 +533,6 @@ impl<'a> UringDriver<'a> {
             snapshot.generation,
             snapshot.state,
         )
-        .with_slot_snapshot(snapshot)
         .with_raw_completion(target_raw);
         let _ = self.accept_completion_anomaly(anomaly)?;
         debug!(
@@ -615,7 +614,6 @@ fn complete_timer_waiting_slot(
                 snapshot,
             )
             .with_raw_completion(event.raw()),
-            snapshot,
             cleanup: CompletionCleanupGuard::default(),
             effect: UringBackendEffect::None,
         };
@@ -660,7 +658,6 @@ fn complete_submission_failure_slot(
                 snapshot,
             )
             .with_raw_completion(event.raw()),
-            snapshot,
             cleanup,
             effect: UringBackendEffect::None,
         };
@@ -712,7 +709,6 @@ fn complete_local_cancel_slot(
                     snapshot,
                 )
                 .with_raw_completion(event.raw()),
-                snapshot,
                 cleanup,
                 effect: UringBackendEffect::None,
             }
@@ -747,7 +743,6 @@ fn lost_waiting_slot_completion(
         event,
         loss_reason: CompletionAnomaly::corrupt_slot_snapshot(raw.token, snapshot)
             .with_raw_completion(raw),
-        snapshot,
         cleanup,
         effect: UringBackendEffect::None,
     }
@@ -777,7 +772,6 @@ fn lost_completed_slot_completion(
         event,
         loss_reason: CompletionAnomaly::corrupt_slot_snapshot(raw.token, snapshot)
             .with_raw_completion(raw),
-        snapshot,
         cleanup,
         effect: UringBackendEffect::None,
     }
@@ -893,12 +887,9 @@ mod tests {
         assert!(matches!(
             outcome,
             CompletionHookOutcome::Anomaly {
-                anomaly: CompletionAnomaly {
-                    reason: CompletionAnomalyReason::ControlCompletionUntracked,
-                    ..
-                },
+                anomaly,
                 ..
-            }
+            } if anomaly.reason() == CompletionAnomalyReason::ControlCompletionUntracked
         ));
     }
 }

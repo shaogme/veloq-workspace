@@ -96,8 +96,8 @@ pub(crate) fn wait_completion_record(
             PollRecordResult::Ready(record) => return Ok(record),
             PollRecordResult::Unavailable(anomaly) => {
                 return IocpError::CompletionWait
-                    .with_ctx("completion_token", anomaly.token.raw())
-                    .with_ctx("completion_anomaly", format!("{:?}", anomaly.reason))
+                    .with_ctx("completion_token", anomaly.token().raw())
+                    .with_ctx("completion_anomaly", format!("{:?}", anomaly.reason()))
                     .attach_note("completion record unavailable");
             }
             PollRecordResult::Pending => {}

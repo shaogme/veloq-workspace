@@ -2,6 +2,7 @@ mod anomaly;
 
 pub use anomaly::{
     CompletionAnomaly, CompletionAnomalyReason, CompletionBackend, CompletionMutationOutcome,
+    CompletionRaw,
 };
 
 use crate::{DriverCoreError, DriverResult, slot};
@@ -280,7 +281,7 @@ where
             return;
         }
 
-        match anomaly.reason {
+        match anomaly.reason() {
             CompletionAnomalyReason::UnknownSlot
             | CompletionAnomalyReason::UnknownControlToken
             | CompletionAnomalyReason::NonActiveSlot => self.inc_unknown_completion(),

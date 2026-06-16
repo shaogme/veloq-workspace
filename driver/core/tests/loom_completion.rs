@@ -219,7 +219,7 @@ fn test_stale_after_generation_advance_loom() {
 
         match table.try_take_record(token_g1) {
             PollRecordResult::Unavailable(anomaly)
-                if anomaly.reason == CompletionAnomalyReason::StaleGeneration => {}
+                if anomaly.reason() == CompletionAnomalyReason::StaleGeneration => {}
             PollRecordResult::Ready(_) => panic!("old generation must not become ready"),
             PollRecordResult::Pending => panic!("old generation must be stale"),
             PollRecordResult::Unavailable(anomaly) => {

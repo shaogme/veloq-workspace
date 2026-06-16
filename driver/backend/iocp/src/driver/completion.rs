@@ -422,7 +422,6 @@ fn complete_iocp_waiting_slot(
                 snapshot,
             )
             .with_raw_completion(event.raw()),
-            snapshot,
             cleanup,
             effect,
         }

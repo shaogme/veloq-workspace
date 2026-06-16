@@ -75,8 +75,7 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
             drop(detail);
             return Ok(CompletionHookOutcome::Lost {
                 event,
-                loss_reason,
-                snapshot,
+                loss_reason: loss_reason.with_slot_snapshot(snapshot),
                 cleanup: self.cleanup.take().unwrap_or_default(),
                 effect: (),
             });
@@ -117,16 +116,20 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
         anomaly: CompletionAnomaly,
         _source: CompletionSource<'_, Self::BackendIngress>,
     ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>> {
-        let Some(snapshot) = anomaly.slot_snapshot else {
+        let Some(snapshot) = anomaly.slot_snapshot() else {
             return Ok(CompletionHookOutcome::Anomaly {
                 anomaly,
                 effect: (),
             });
         };
+        let loss_reason = self
+            .loss_reason
+            .take()
+            .unwrap_or(anomaly)
+            .with_slot_snapshot(snapshot);
         Ok(CompletionHookOutcome::Lost {
             event,
-            loss_reason: self.loss_reason.take().unwrap_or(anomaly),
-            snapshot,
+            loss_reason,
             cleanup: self.cleanup.take().unwrap_or_default(),
             effect: (),
         })
@@ -220,9 +223,9 @@ fn try_take_record_reports_future_generation_unavailable() {
 
     match table.try_take_record(token) {
         PollRecordResult::Unavailable(anomaly) => {
-            assert_eq!(anomaly.reason, CompletionAnomalyReason::NonActiveSlot);
-            assert_eq!(anomaly.index, Some(0));
-            assert_eq!(anomaly.expected_generation, Some(1));
+            assert_eq!(anomaly.reason(), CompletionAnomalyReason::NonActiveSlot);
+            assert_eq!(anomaly.index(), Some(0));
+            assert_eq!(anomaly.expected_generation(), Some(1));
         }
         PollRecordResult::Pending => panic!("future generation token must not stay pending"),
         PollRecordResult::Ready(_) => panic!("future generation token must not become ready"),
@@ -326,7 +329,7 @@ fn lost_completion_is_observable_as_unavailable() {
     assert_eq!(outcome.user_lost, 1);
     assert!(matches!(
         table.try_take_record(token),
-        PollRecordResult::Unavailable(observed) if observed.reason == anomaly.reason
+        PollRecordResult::Unavailable(observed) if observed.reason() == anomaly.reason()
     ));
     let snapshot = table.completion_diagnostics().snapshot();
     assert_eq!(snapshot.user_lost, 1);
@@ -393,7 +396,7 @@ fn lost_completion_preserves_payload_missing_reason() {
     assert_eq!(outcome.user_lost, 1);
     assert!(matches!(
         table.try_take_record(token),
-        PollRecordResult::Unavailable(observed) if observed.reason == anomaly.reason
+        PollRecordResult::Unavailable(observed) if observed.reason() == anomaly.reason()
     ));
     let snapshot = table.completion_diagnostics().snapshot();
     assert_eq!(snapshot.user_lost, 1);
@@ -417,7 +420,7 @@ fn lost_completion_preserves_op_missing_reason() {
     assert_eq!(outcome.user_lost, 1);
     assert!(matches!(
         table.try_take_record(token),
-        PollRecordResult::Unavailable(observed) if observed.reason == anomaly.reason
+        PollRecordResult::Unavailable(observed) if observed.reason() == anomaly.reason()
     ));
     let snapshot = table.completion_diagnostics().snapshot();
     assert_eq!(snapshot.user_lost, 1);
@@ -459,7 +462,7 @@ fn ready_mark_orphaned_cleanup_leaves_diagnostic_stale_result() {
     assert!(matches!(
         table.try_take_record(token),
         PollRecordResult::Unavailable(anomaly)
-            if anomaly.reason == CompletionAnomalyReason::StaleGeneration
+            if anomaly.reason() == CompletionAnomalyReason::StaleGeneration
     ));
     let snapshot = table.completion_diagnostics().snapshot();
     assert_eq!(snapshot.stale_completion, 1);

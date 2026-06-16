@@ -84,7 +84,6 @@ where
     Lost {
         event: UserCompletionEvent,
         loss_reason: CompletionAnomaly,
-        snapshot: SlotSnapshot,
         cleanup: CompletionCleanupGuard,
         effect: Effect,
     },
@@ -471,13 +470,14 @@ where
         CompletionHookOutcome::Lost {
             event,
             loss_reason,
-            snapshot,
             cleanup,
             effect,
         } => {
             let record =
                 record_lost_completion::<Spec>(table, diagnostics, event, loss_reason, cleanup);
-            finish_corrupt(registry, diagnostics, snapshot, event.raw());
+            if let Some(snapshot) = loss_reason.slot_snapshot() {
+                finish_corrupt(registry, diagnostics, snapshot, event.raw());
+            }
             hooks.finish_backend_effect(effect)?;
             Ok(completion_progress_from_record(record))
         }
@@ -631,13 +631,13 @@ where
 {
     diagnostics.record_anomaly(&anomaly);
     if should_finalize_corrupt_anomaly(&anomaly)
-        && let Some(snapshot) = anomaly.slot_snapshot
+        && let Some(snapshot) = anomaly.slot_snapshot()
     {
         let raw = RawCompletion::new(
-            anomaly.backend.unwrap_or(CompletionBackend::Core),
-            anomaly.token,
-            anomaly.raw_result.unwrap_or(0),
-            anomaly.flags.unwrap_or(0),
+            anomaly.backend().unwrap_or(CompletionBackend::Core),
+            anomaly.token(),
+            anomaly.raw_result().unwrap_or(0),
+            anomaly.flags().unwrap_or(0),
         );
         finish_corrupt(registry, diagnostics, snapshot, raw);
     }
@@ -647,7 +647,7 @@ where
 #[inline]
 fn should_finalize_corrupt_anomaly(anomaly: &CompletionAnomaly) -> bool {
     matches!(
-        anomaly.reason,
+        anomaly.reason(),
         CompletionAnomalyReason::OpMissing
             | CompletionAnomalyReason::PayloadMissing
             | CompletionAnomalyReason::SlotCorruption

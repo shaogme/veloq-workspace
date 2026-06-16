@@ -148,7 +148,7 @@ impl DriverCompletionDiagnosticsBackend for IocpCompletionDiagnostics {
 
     #[inline]
     fn record_backend_anomaly(&self, anomaly: &CompletionAnomaly) -> bool {
-        match anomaly.reason {
+        match anomaly.reason() {
             CompletionAnomalyReason::BackendSpecific(code) => match code {
                 RIO_ANOMALY_MALFORMED => {
                     Self::inc(&self.rio_malformed_context);

@@ -168,7 +168,7 @@ pub(super) fn route_user_completion<'a, Spec: slot::SlotSpec>(
                 .with_raw_completion(raw),
             )
         }
-        Err(anomaly) => match anomaly.reason {
+        Err(anomaly) => match anomaly.reason() {
             CompletionAnomalyReason::UnknownSlot => RoutedSlotCompletion::Missing(anomaly),
             CompletionAnomalyReason::NonActiveSlot => RoutedSlotCompletion::Empty(anomaly),
             CompletionAnomalyReason::StaleGeneration => RoutedSlotCompletion::Stale(anomaly),
