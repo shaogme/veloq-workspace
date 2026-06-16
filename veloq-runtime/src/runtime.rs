@@ -1,6 +1,5 @@
 use std::{
     future::Future,
-    marker::PhantomData,
     num::NonZeroUsize,
     ops::AsyncFnOnce,
     pin::pin,
@@ -33,7 +32,6 @@ pub struct Runtime<T, WF> {
     pub(crate) shared: RuntimeShared<T>,
     pub(crate) receivers: Option<Receivers>,
     pub(crate) worker_factory: Option<WF>,
-    marker: PhantomData<T>,
 }
 
 pub type DefaultWorkerFactory = fn(usize, &RuntimeShared<()>) -> ();
@@ -314,7 +312,6 @@ impl<T, WF> RuntimeBuilder<T, WF> {
             shared,
             receivers: Some(receivers),
             worker_factory: self.worker_factory,
-            marker: PhantomData,
         }
     }
 }

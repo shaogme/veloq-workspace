@@ -1,6 +1,6 @@
 use std::cell::Cell;
 
-/// 一个简单的 Xorshift64 随机数生成器。
+/// 一个使用 WyRand 算法实现的快速伪随机数生成器。
 pub struct FastRand {
     state: Cell<u64>,
 }
@@ -8,17 +8,16 @@ pub struct FastRand {
 impl FastRand {
     pub fn new(seed: u64) -> Self {
         Self {
-            state: Cell::new(seed.wrapping_add(0x9E3779B97F4A7C15)), // 避免种子为 0
+            state: Cell::new(seed),
         }
     }
 
     pub fn next_u64(&self) -> u64 {
-        let mut x = self.state.get();
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.state.set(x);
-        x
+        let mut state = self.state.get();
+        state = state.wrapping_add(0xa076_1d64_78bd_642f);
+        self.state.set(state);
+        let hash = (state as u128).wrapping_mul((state ^ 0xe703_7ed1_a0b4_28db) as u128);
+        ((hash >> 64) as u64) ^ (hash as u64)
     }
 
     /// 返回 [0, max) 范围内的随机数。
