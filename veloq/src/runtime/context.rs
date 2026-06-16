@@ -277,6 +277,10 @@ impl<'a, 'ctx> RuntimeContext<'a, 'ctx> {
     pub fn registrar(&self) -> DriverRegistrar<'a, 'ctx> {
         self.extra(|extra| extra.registrar.clone())
     }
+    #[inline]
+    pub fn select_poll_start(&self, branches: u32) -> u32 {
+        self.scope.select_poll_start(branches)
+    }
 
     pub fn driver<'d, R>(
         &'d self,

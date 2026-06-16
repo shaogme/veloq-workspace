@@ -140,6 +140,15 @@ impl<'rt, T> RuntimeScopeContext<'rt, T> {
         self.shared
     }
 
+    /// 为 `select!` 公平模式返回 `[0, branches)` 范围内的随机起始分支索引。
+    #[doc(hidden)]
+    pub fn select_poll_start(&self, branches: u32) -> u32 {
+        self.shared()
+            .base
+            .tls
+            .with(|ctx| ctx.rand.next_u32(branches))
+    }
+
     pub fn route_to<'scope_ref, F, Fut>(
         &self,
         worker_id: usize,

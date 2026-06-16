@@ -321,6 +321,8 @@ fn udp_cancel_recv_from() {
         let buf = ctx.alloc(nz!(1024));
 
         select! {
+            ctx;
+            biased;
             _ = socket.recv_from(buf) => {
                 panic!("RecvStream should have been cancelled, but it completed (unexpectedly)");
             },

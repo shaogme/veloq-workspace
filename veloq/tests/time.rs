@@ -296,12 +296,14 @@ fn test_select_timeout() {
     runtime
         .block_on(async |ctx| {
             let res = select! {
+                ctx;
                 _ = sleep(ctx, Duration::from_millis(100)) => "timeout",
                 _ = async { 42 } => "value",
             };
             assert_eq!(res, "value");
 
             let res = select! {
+                ctx;
                 _ = sleep(ctx, Duration::from_millis(10)) => "timeout",
                 _ = sleep(ctx, Duration::from_millis(1000)) => "value",
             };

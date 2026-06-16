@@ -138,7 +138,9 @@ pub struct SlotData<Spec: SlotSpec> {
     marker: SlotMarker<Spec>,
 }
 
+#[derive(Default)]
 pub(crate) enum CompletionData<Spec: SlotSpec> {
+    #[default]
     Empty,
     User {
         event: UserCompletionEvent,
@@ -151,12 +153,6 @@ pub(crate) enum CompletionData<Spec: SlotSpec> {
         attach: AnomalyAttach,
         cleanup: CompletionCleanupGuard,
     },
-}
-
-impl<Spec: SlotSpec> Default for CompletionData<Spec> {
-    fn default() -> Self {
-        Self::Empty
-    }
 }
 
 impl<Spec: SlotSpec> fmt::Debug for CompletionData<Spec>

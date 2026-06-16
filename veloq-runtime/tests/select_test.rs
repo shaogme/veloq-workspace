@@ -32,8 +32,9 @@ impl Future for PendingFuture {
 #[test]
 fn test_select_basic() {
     let rt = Runtime::<(), _>::new();
-    rt.block_on(async |_| {
+    rt.block_on(async |ctx| {
         let res = select! {
+            ctx;
             val = ready(1) => val,
             _ = PendingFuture => 2,
         };
@@ -44,10 +45,11 @@ fn test_select_basic() {
 
 #[test]
 fn test_select_biased() {
-    // Both are ready immediately. First one should win.
     let rt = Runtime::<(), _>::new();
-    rt.block_on(async |_| {
+    rt.block_on(async |ctx| {
         let res = select! {
+            ctx;
+            biased;
             val = ready(10) => val,
             val2 = ready(20) => val2,
         };
@@ -58,10 +60,11 @@ fn test_select_biased() {
 
 #[test]
 fn test_select_biased_reverse() {
-    // Both are ready immediately. First one declared (which is ready(20)) should win.
     let rt = Runtime::<(), _>::new();
-    rt.block_on(async |_| {
+    rt.block_on(async |ctx| {
         let res = select! {
+            ctx;
+            biased;
             val = ready(20) => val,
             val2 = ready(10) => val2,
         };
@@ -71,11 +74,43 @@ fn test_select_biased_reverse() {
 }
 
 #[test]
-fn test_select_expression() {
-    // Test using complex expressions in select
+fn test_select_fair_distribution() {
     let rt = Runtime::<(), _>::new();
-    rt.block_on(async |_| {
+    rt.block_on(async |ctx| {
+        let mut saw_first = false;
+        let mut saw_second = false;
+
+        for _ in 0..64 {
+            let res = select! {
+                ctx;
+                _ = ready(10) => 0,
+                _ = ready(20) => 1,
+            };
+            match res {
+                0 => saw_first = true,
+                1 => saw_second = true,
+                _ => unreachable!(),
+            }
+        }
+
+        assert!(
+            saw_first,
+            "fair select should sometimes choose the first branch"
+        );
+        assert!(
+            saw_second,
+            "fair select should sometimes choose the second branch"
+        );
+    })
+    .unwrap();
+}
+
+#[test]
+fn test_select_expression() {
+    let rt = Runtime::<(), _>::new();
+    rt.block_on(async |ctx| {
         let res = select! {
+            ctx;
             v = async { 5 + 5 } => v,
             _ = PendingFuture => 0,
         };
@@ -87,8 +122,9 @@ fn test_select_expression() {
 #[test]
 fn test_select_three_branches() {
     let rt = Runtime::<(), _>::new();
-    rt.block_on(async |_| {
+    rt.block_on(async |ctx| {
         let res = select! {
+            ctx;
             _ = PendingFuture => 1,
             _ = PendingFuture => 2,
             val = ready(3) => val,
@@ -103,16 +139,15 @@ fn test_select_cancellation() {
     let rt = Runtime::<(), _>::new();
     rt.block_on(async |ctx| {
         ctx.scope(async |s| {
-            let handle = s.spawn_boxed(async {
+            let handle = s.spawn_boxed(async move {
                 select! {
+                    ctx;
                     _ = PendingFuture => (),
                 }
             });
 
-            // Cancel the task
             handle.cancel();
 
-            // Join the task and expect Cancelled error
             let res = handle.await;
             match res {
                 JoinOutcome::TaskErr(TaskError::Cancelled) => {}

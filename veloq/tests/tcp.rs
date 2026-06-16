@@ -459,6 +459,8 @@ fn tcp_cancel_recv() {
                     .expect("Failed to connect");
                 let buf = ctx.alloc(nz!(1024));
                 select! {
+                    ctx;
+                    biased;
                     _ = stream.recv(buf) => {
                         panic!("Recv should have been cancelled, but it completed (unexpectedly)");
                     },

@@ -95,9 +95,7 @@ impl<S: Storage> GenericArena<S> {
             res = Some(self.alloc_slow(total_layout));
         }
 
-        let Some((ptr, chunk_ptr)) = res else {
-            return None;
-        };
+        let (ptr, chunk_ptr) = res?;
 
         // 4. 增加活跃对象计数 (已经在 try_alloc_fast/alloc_slow 中处理)
 
