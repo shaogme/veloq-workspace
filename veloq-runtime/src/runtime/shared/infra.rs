@@ -214,7 +214,7 @@ impl AtomicBitset {
 }
 
 pub(crate) struct WorkerRegistry {
-    pub(crate) workers: Box<[Arc<WorkerQueue>]>,
+    pub(crate) workers: Box<[WorkerQueue]>,
     pub(crate) unparkers: Box<[Unparker]>,
     pub(crate) parker_inners: Box<[Arc<ParkerInner>]>,
 }

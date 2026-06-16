@@ -100,12 +100,12 @@ pub(crate) fn init_runtime_components(
         let stealer = worker_deque.stealer();
         deques.push(worker_deque);
 
-        workers.push(Arc::new(WorkerQueue::new(
+        workers.push(WorkerQueue::new(
             remote_queue,
             pinned_queue,
             local_queue,
             stealer,
-        )));
+        ));
         next_idle.push(AtomicUsize::new(usize::MAX));
     }
 
