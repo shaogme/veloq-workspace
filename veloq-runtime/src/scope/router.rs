@@ -63,13 +63,13 @@ impl<F> RoutedJobCell<F> {
     }
 
     pub(crate) fn take(&mut self) -> RuntimeResult<F> {
-        self.job.take().ok_or(
+        self.job.take().ok_or_else(|| {
             RuntimeError::InvariantViolation {
                 site: "RoutedJobCell::take",
                 detail: "job has already been taken",
             }
-            .to_report(),
-        )
+            .to_report()
+        })
     }
 }
 
