@@ -1,7 +1,9 @@
 use std::cell::{Cell, UnsafeCell};
 use std::fmt;
 use std::future::Future;
+use std::mem::ManuallyDrop;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 pub use crate::common::TryRecvError;
@@ -172,5 +174,92 @@ impl<'a, T> fmt::Debug for Sender<'a, T> {
 impl<'a, T> fmt::Debug for Receiver<'a, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Receiver").finish()
+    }
+}
+
+/// Owned oneshot channel sender.
+pub struct OwnedSender<T> {
+    state: ManuallyDrop<Rc<State<T>>>,
+}
+
+/// Owned oneshot channel receiver.
+pub struct OwnedReceiver<T> {
+    state: Rc<State<T>>,
+}
+
+/// Creates a new owned oneshot channel.
+pub fn owned_channel<T>() -> (OwnedSender<T>, OwnedReceiver<T>) {
+    let state = Rc::new(State::new());
+    (
+        OwnedSender {
+            state: ManuallyDrop::new(state.clone()),
+        },
+        OwnedReceiver { state },
+    )
+}
+
+impl<T> OwnedSender<T> {
+    /// Sends a value on the channel.
+    pub fn send(self, t: T) -> Result<(), T> {
+        let this = ManuallyDrop::new(self);
+        let state = unsafe { std::ptr::read(&*this.state) };
+        let sender = Sender { state: &state };
+        sender.send(t)
+    }
+
+    /// Checks if the receiver has been dropped.
+    pub fn is_closed(&self) -> bool {
+        let sender = ManuallyDrop::new(Sender { state: &self.state });
+        sender.is_closed()
+    }
+}
+
+impl<T> Drop for OwnedSender<T> {
+    fn drop(&mut self) {
+        drop(Sender { state: &self.state });
+        unsafe {
+            ManuallyDrop::drop(&mut self.state);
+        }
+    }
+}
+
+impl<T> fmt::Debug for OwnedSender<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OwnedSender").finish()
+    }
+}
+
+impl<T> OwnedReceiver<T> {
+    /// Attempts to receive a value without blocking.
+    pub fn try_recv(&self) -> Result<T, TryRecvError> {
+        let receiver = ManuallyDrop::new(Receiver { state: &self.state });
+        receiver.try_recv()
+    }
+
+    /// Closes the receiver.
+    pub fn close(&mut self) {
+        let mut receiver = ManuallyDrop::new(Receiver { state: &self.state });
+        receiver.close();
+    }
+}
+
+impl<T> Future for OwnedReceiver<T> {
+    type Output = Result<T, RecvError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut receiver = ManuallyDrop::new(Receiver { state: &self.state });
+        Pin::new(&mut *receiver).poll(cx)
+    }
+}
+
+impl<T> Drop for OwnedReceiver<T> {
+    fn drop(&mut self) {
+        drop(Receiver { state: &self.state });
+    }
+}
+
+impl<T> fmt::Debug for OwnedReceiver<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OwnedReceiver").finish()
     }
 }

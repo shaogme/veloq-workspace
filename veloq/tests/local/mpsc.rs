@@ -238,3 +238,28 @@ fn test_try_recv() {
         })
         .unwrap();
 }
+
+#[test]
+fn test_owned_mpsc() {
+    let runtime = create_runtime();
+    runtime
+        .block_on(async |ctx| {
+            let (tx, rx) = mpsc::owned_bounded(5);
+
+            ctx.scope(async |s| {
+                s.spawn_boxed_local(async move {
+                    for i in 0..10 {
+                        tx.send(i).await.unwrap();
+                    }
+                });
+
+                for i in 0..10 {
+                    let val = rx.recv().await.expect("Should receive value");
+                    assert_eq!(val, i);
+                }
+            })
+            .await
+            .unwrap();
+        })
+        .unwrap();
+}

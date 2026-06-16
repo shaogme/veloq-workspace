@@ -9,8 +9,10 @@ use std::{
     cell::RefCell,
     collections::VecDeque,
     marker::PhantomPinned,
+    mem::ManuallyDrop,
     pin::Pin,
     ptr::NonNull,
+    rc::Rc,
     task::{Context, Poll, Waker},
 };
 
@@ -484,5 +486,176 @@ impl<'a, T> Receiver<'a, T> {
                 ret
             })),
         }
+    }
+}
+
+/// Owned MPSC channel sender.
+pub struct OwnedSender<T> {
+    state: Rc<State<T>>,
+}
+
+/// Owned MPSC channel receiver.
+pub struct OwnedReceiver<T> {
+    state: Rc<State<T>>,
+}
+
+/// Creates a new owned MPSC channel.
+pub fn owned_channel<T>(capacity: ChannelCapacity) -> (OwnedSender<T>, OwnedReceiver<T>) {
+    let state = Rc::new(State::new(capacity));
+    (
+        OwnedSender {
+            state: state.clone(),
+        },
+        OwnedReceiver { state },
+    )
+}
+
+/// Creates a new bounded owned MPSC channel.
+pub fn owned_bounded<T>(size: usize) -> (OwnedSender<T>, OwnedReceiver<T>) {
+    owned_channel(ChannelCapacity::Bounded(size))
+}
+
+/// Creates a new unbounded owned MPSC channel.
+pub fn owned_unbounded<T>() -> (OwnedSender<T>, OwnedReceiver<T>) {
+    owned_channel(ChannelCapacity::Unbounded)
+}
+
+impl<T> Clone for OwnedSender<T> {
+    fn clone(&self) -> Self {
+        let sender = ManuallyDrop::new(Sender { state: &self.state });
+        let _cloned = ManuallyDrop::new(sender.clone());
+        OwnedSender {
+            state: self.state.clone(),
+        }
+    }
+}
+
+impl<T> OwnedSender<T> {
+    /// Attempts to send a message without blocking.
+    pub fn try_send(&self, item: T) -> Result<(), SendError<T>> {
+        let sender = ManuallyDrop::new(Sender { state: &self.state });
+        sender.try_send(item)
+    }
+
+    /// Asynchronously sends a message.
+    pub async fn send(&self, item: T) -> Result<(), SendError<T>> {
+        let sender = ManuallyDrop::new(Sender { state: &self.state });
+        sender.send(item).await
+    }
+
+    /// Checks if the channel is full.
+    pub fn is_full(&self) -> bool {
+        let sender = ManuallyDrop::new(Sender { state: &self.state });
+        sender.is_full()
+    }
+
+    /// Returns the number of messages in the channel.
+    pub fn len(&self) -> usize {
+        let sender = ManuallyDrop::new(Sender { state: &self.state });
+        sender.len()
+    }
+
+    /// Checks if the channel is empty.
+    pub fn is_empty(&self) -> bool {
+        let sender = ManuallyDrop::new(Sender { state: &self.state });
+        sender.is_empty()
+    }
+}
+
+impl<T> Drop for OwnedSender<T> {
+    fn drop(&mut self) {
+        drop(Sender { state: &self.state });
+    }
+}
+
+impl<T> OwnedReceiver<T> {
+    /// Attempts to receive a message without blocking.
+    pub fn try_recv(&self) -> Result<T, TryRecvError> {
+        let receiver = ManuallyDrop::new(Receiver { state: &self.state });
+        receiver.try_recv()
+    }
+
+    /// Asynchronously receives a message.
+    pub async fn recv(&self) -> Option<T> {
+        let receiver = ManuallyDrop::new(Receiver { state: &self.state });
+        receiver.recv().await
+    }
+
+    /// Converts the receiver into a stream.
+    pub fn stream(&self) -> OwnedChannelStream<T> {
+        OwnedChannelStream::new(self.state.clone())
+    }
+}
+
+impl<T> Drop for OwnedReceiver<T> {
+    fn drop(&mut self) {
+        drop(Receiver { state: &self.state });
+    }
+}
+
+/// A stream of messages from an owned MPSC channel.
+pub struct OwnedChannelStream<T> {
+    state: Rc<State<T>>,
+    node: WaiterNode,
+}
+
+impl<T> OwnedChannelStream<T> {
+    fn new(state: Rc<State<T>>) -> Self {
+        OwnedChannelStream {
+            state,
+            node: WaiterNode {
+                waker: RefCell::new(None),
+                link: Link::new(),
+                _p: PhantomPinned,
+            },
+        }
+    }
+}
+
+impl<T> Stream for OwnedChannelStream<T> {
+    type Item = T;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let result = self.state.state.borrow_mut().recv_one();
+        let this = unsafe { self.get_unchecked_mut() };
+        let node = unsafe { Pin::new_unchecked(&mut this.node) };
+
+        match result {
+            PollResult::Pending => {
+                let mut waker = node.waker.borrow_mut();
+                update_waker(&mut waker, cx.waker());
+                drop(waker);
+
+                if !node.link.is_linked() {
+                    register_into_waiting_queue::<T, ReceiverAction>(
+                        node,
+                        &mut this.state.state.borrow_mut(),
+                    );
+                }
+
+                Poll::Pending
+            }
+            PollResult::Ready(result) => {
+                remove_from_the_waiting_queue::<T, ReceiverAction>(
+                    node,
+                    &mut this.state.state.borrow_mut(),
+                );
+
+                Poll::Ready(result.map(|(ret, mw)| {
+                    if let Some(waker) = mw {
+                        waker.wake();
+                    }
+                    ret
+                }))
+            }
+        }
+    }
+}
+
+impl<T> Drop for OwnedChannelStream<T> {
+    fn drop(&mut self) {
+        let mut state = self.state.state.borrow_mut();
+        let node = unsafe { Pin::new_unchecked(&mut self.node) };
+        remove_from_the_waiting_queue::<T, ReceiverAction>(node, &mut state);
     }
 }

@@ -4,8 +4,10 @@ use std::{
     alloc::{Layout, alloc, dealloc, handle_alloc_error},
     cell::UnsafeCell,
     mem,
+    mem::ManuallyDrop,
     pin::Pin,
     ptr::{self, NonNull},
+    rc::Rc,
     task::{Context, Poll, Waker},
 };
 
@@ -425,6 +427,133 @@ pub struct ChannelStream<'a, 'b, T> {
 }
 
 impl<'a, 'b, T> Stream for ChannelStream<'a, 'b, T> {
+    type Item = T;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let (item, waker) = unsafe {
+            let inner = &mut *self.receiver.inner.inner.get();
+
+            if let Some(item) = inner.pop() {
+                (Some(item), inner.producer_waker.take())
+            } else if inner.is_closed {
+                return Poll::Ready(None);
+            } else {
+                update_waker(&mut inner.consumer_waker, cx.waker());
+                return Poll::Pending;
+            }
+        };
+
+        if let Some(w) = waker {
+            w.wake();
+        }
+        Poll::Ready(item)
+    }
+}
+
+/// Owned SPSC channel sender.
+pub struct OwnedSender<T> {
+    inner: Rc<State<T>>,
+}
+
+/// Owned SPSC channel receiver.
+pub struct OwnedReceiver<T> {
+    inner: Rc<State<T>>,
+}
+
+/// Creates a new owned SPSC channel.
+pub fn owned_channel<T>(capacity: ChannelCapacity) -> (OwnedSender<T>, OwnedReceiver<T>) {
+    let state = Rc::new(State::new(capacity));
+    (
+        OwnedSender {
+            inner: state.clone(),
+        },
+        OwnedReceiver { inner: state },
+    )
+}
+
+/// Creates a new bounded owned SPSC channel.
+pub fn owned_bounded<T>(size: usize) -> (OwnedSender<T>, OwnedReceiver<T>) {
+    owned_channel(ChannelCapacity::Bounded(size))
+}
+
+/// Creates a new unbounded owned SPSC channel.
+pub fn owned_unbounded<T>() -> (OwnedSender<T>, OwnedReceiver<T>) {
+    owned_channel(ChannelCapacity::Unbounded)
+}
+
+impl<T> OwnedSender<T> {
+    /// Attempts to send a message without blocking.
+    pub fn try_send(&self, item: T) -> Result<(), SendError<T>> {
+        let sender = ManuallyDrop::new(Sender { inner: &self.inner });
+        sender.try_send(item)
+    }
+
+    /// Asynchronously sends a message.
+    pub async fn send(&self, item: T) -> Result<(), SendError<T>> {
+        let sender = ManuallyDrop::new(Sender { inner: &self.inner });
+        sender.send(item).await
+    }
+
+    /// Checks if the channel is full.
+    pub fn is_full(&self) -> bool {
+        let sender = ManuallyDrop::new(Sender { inner: &self.inner });
+        sender.is_full()
+    }
+
+    /// Returns the number of messages in the channel.
+    pub fn len(&self) -> usize {
+        let sender = ManuallyDrop::new(Sender { inner: &self.inner });
+        sender.len()
+    }
+
+    /// Checks if the channel is empty.
+    pub fn is_empty(&self) -> bool {
+        let sender = ManuallyDrop::new(Sender { inner: &self.inner });
+        sender.is_empty()
+    }
+}
+
+impl<T> Drop for OwnedSender<T> {
+    fn drop(&mut self) {
+        drop(Sender { inner: &self.inner });
+    }
+}
+
+impl<T> OwnedReceiver<T> {
+    /// Attempts to receive a message without blocking.
+    pub fn try_recv(&self) -> Result<T, TryRecvError> {
+        let receiver = ManuallyDrop::new(Receiver { inner: &self.inner });
+        receiver.try_recv()
+    }
+
+    /// Asynchronously receives a message.
+    pub async fn recv(&self) -> Option<T> {
+        let receiver = ManuallyDrop::new(Receiver { inner: &self.inner });
+        receiver.recv().await
+    }
+
+    /// Converts the receiver into a stream.
+    pub fn stream(&self) -> OwnedChannelStream<T> {
+        OwnedChannelStream {
+            receiver: OwnedReceiver {
+                inner: self.inner.clone(),
+            },
+        }
+    }
+}
+
+impl<T> Drop for OwnedReceiver<T> {
+    fn drop(&mut self) {
+        drop(Receiver { inner: &self.inner });
+    }
+}
+
+/// A stream of messages from an owned SPSC channel.
+pub struct OwnedChannelStream<T> {
+    receiver: OwnedReceiver<T>,
+}
+
+impl<T> Stream for OwnedChannelStream<T> {
     type Item = T;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {

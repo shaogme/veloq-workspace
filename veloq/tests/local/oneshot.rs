@@ -117,3 +117,23 @@ fn test_send_before_recv() {
         })
         .unwrap();
 }
+
+#[test]
+fn test_owned_oneshot() {
+    let runtime = create_runtime();
+    runtime
+        .block_on(async |ctx| {
+            let (tx, rx) = oneshot::owned_channel();
+
+            ctx.scope(async |s| {
+                s.spawn_boxed_local(async move {
+                    tx.send(42).unwrap();
+                });
+
+                assert_eq!(rx.await.unwrap(), 42);
+            })
+            .await
+            .unwrap();
+        })
+        .unwrap();
+}
