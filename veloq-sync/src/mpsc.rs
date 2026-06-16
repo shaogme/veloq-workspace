@@ -3,14 +3,33 @@ use crate::{
     shim::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        queue::SegQueue,
+        queue::{ArrayQueue, SegQueue},
     },
 };
 use futures_core::stream::Stream;
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+};
 use veloq_atomic_waker::AtomicWaker;
+
+#[doc(hidden)]
+pub trait Queue<T> {
+    fn pop(&self) -> Option<T>;
+}
+
+impl<T> Queue<T> for SegQueue<T> {
+    fn pop(&self) -> Option<T> {
+        self.pop()
+    }
+}
+
+impl<T> Queue<T> for ArrayQueue<T> {
+    fn pop(&self) -> Option<T> {
+        self.pop()
+    }
+}
 
 /// A multi-producer, single-consumer channel for sending values across threads
 /// to a local executor task.
@@ -22,41 +41,51 @@ pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
         queue: SegQueue::new(),
         state: ChannelState::new(),
         strategy: UnboundedStrategy,
+        _marker: std::marker::PhantomData,
     });
 
     (
         GenericSender {
             shared: shared.clone(),
+            _marker: std::marker::PhantomData,
         },
-        GenericReceiver { shared },
+        GenericReceiver {
+            shared,
+            _marker: std::marker::PhantomData,
+        },
     )
 }
 
 /// A bounded multi-producer, single-consumer channel.
 ///
-/// This implementation uses `crossbeam_queue::SegQueue` and explicitly tracks capacity.
+/// This implementation uses `crossbeam_queue::ArrayQueue` and explicitly tracks capacity.
 /// Senders wait asynchronously if the channel is full.
 pub fn bounded<T>(capacity: usize) -> (BoundedSender<T>, BoundedReceiver<T>) {
     assert!(capacity > 0, "capacity must be > 0");
     let shared = Arc::new(Shared {
-        queue: SegQueue::new(),
+        queue: ArrayQueue::new(capacity),
         state: ChannelState::new(),
         strategy: BoundedStrategy::new(capacity),
+        _marker: std::marker::PhantomData,
     });
 
     (
         GenericSender {
             shared: shared.clone(),
+            _marker: std::marker::PhantomData,
         },
-        GenericReceiver { shared },
+        GenericReceiver {
+            shared,
+            _marker: std::marker::PhantomData,
+        },
     )
 }
 
 // Type Aliases to maintain API compatibility
-pub type Sender<T> = GenericSender<T, UnboundedStrategy>;
-pub type Receiver<T> = GenericReceiver<T, UnboundedStrategy>;
-pub type BoundedSender<T> = GenericSender<T, BoundedStrategy>;
-pub type BoundedReceiver<T> = GenericReceiver<T, BoundedStrategy>;
+pub type Sender<T> = GenericSender<T, UnboundedStrategy, SegQueue<T>>;
+pub type Receiver<T> = GenericReceiver<T, UnboundedStrategy, SegQueue<T>>;
+pub type BoundedSender<T> = GenericSender<T, BoundedStrategy, ArrayQueue<T>>;
+pub type BoundedReceiver<T> = GenericReceiver<T, BoundedStrategy, ArrayQueue<T>>;
 
 // --- Core State Logic ---
 
@@ -158,34 +187,38 @@ impl ChannelStrategy for BoundedStrategy {
 
 // --- Shared Structure ---
 
-struct Shared<T, S> {
-    queue: SegQueue<T>,
+struct Shared<T, S, Q> {
+    queue: Q,
     state: ChannelState,
     strategy: S,
+    _marker: std::marker::PhantomData<fn() -> T>,
 }
 
 // --- Generic Structures ---
 
-pub struct GenericSender<T, S: ChannelStrategy> {
-    shared: Arc<Shared<T, S>>,
+pub struct GenericSender<T, S: ChannelStrategy, Q> {
+    shared: Arc<Shared<T, S, Q>>,
+    _marker: std::marker::PhantomData<fn() -> T>,
 }
 
-pub struct GenericReceiver<T, S: ChannelStrategy> {
-    shared: Arc<Shared<T, S>>,
+pub struct GenericReceiver<T, S: ChannelStrategy, Q> {
+    shared: Arc<Shared<T, S, Q>>,
+    _marker: std::marker::PhantomData<fn() -> T>,
 }
 
 // --- Implementations ---
 
-impl<T, S: ChannelStrategy> Clone for GenericSender<T, S> {
+impl<T, S: ChannelStrategy, Q> Clone for GenericSender<T, S, Q> {
     fn clone(&self) -> Self {
         self.shared.state.inc_sender();
         Self {
             shared: self.shared.clone(),
+            _marker: std::marker::PhantomData,
         }
     }
 }
 
-impl<T, S: ChannelStrategy> Drop for GenericSender<T, S> {
+impl<T, S: ChannelStrategy, Q> Drop for GenericSender<T, S, Q> {
     fn drop(&mut self) {
         if self.shared.state.dec_sender() {
             self.shared.state.wake_rx();
@@ -193,7 +226,7 @@ impl<T, S: ChannelStrategy> Drop for GenericSender<T, S> {
     }
 }
 
-impl<T, S: ChannelStrategy> Drop for GenericReceiver<T, S> {
+impl<T, S: ChannelStrategy, Q> Drop for GenericReceiver<T, S, Q> {
     fn drop(&mut self) {
         self.shared.state.set_rx_inactive();
         self.shared.strategy.on_rx_drop();
@@ -201,7 +234,7 @@ impl<T, S: ChannelStrategy> Drop for GenericReceiver<T, S> {
 }
 
 // Unbounded Specifics
-impl<T> GenericSender<T, UnboundedStrategy> {
+impl<T> GenericSender<T, UnboundedStrategy, SegQueue<T>> {
     /// Sends a value to the channel.
     ///
     /// Returns an error if the receiver has been dropped.
@@ -217,7 +250,7 @@ impl<T> GenericSender<T, UnboundedStrategy> {
 }
 
 // Bounded Specifics
-impl<T> GenericSender<T, BoundedStrategy> {
+impl<T> GenericSender<T, BoundedStrategy, ArrayQueue<T>> {
     /// Sends a value to the channel.
     ///
     /// Waits if the channel is full. Returns an error if the receiver is dropped.
@@ -232,7 +265,7 @@ impl<T> GenericSender<T, BoundedStrategy> {
 }
 
 struct BoundedSendFuture<'a, T> {
-    sender: &'a GenericSender<T, BoundedStrategy>,
+    sender: &'a GenericSender<T, BoundedStrategy, ArrayQueue<T>>,
     val: Option<T>,
     waker_state: Option<Arc<WakerState>>,
 }
@@ -271,7 +304,7 @@ impl<'a, T> Future for BoundedSendFuture<'a, T> {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    shared.queue.push(this.val.take().unwrap());
+                    let _ = shared.queue.push(this.val.take().unwrap());
                     shared.state.wake_rx();
                     return Poll::Ready(Ok(()));
                 }
@@ -306,7 +339,7 @@ impl<'a, T> Future for BoundedSendFuture<'a, T> {
 }
 
 // Receiver Methods (Unified)
-impl<T, S: ChannelStrategy> GenericReceiver<T, S> {
+impl<T, S: ChannelStrategy, Q: Queue<T>> GenericReceiver<T, S, Q> {
     /// Async receive method.
     ///
     /// Returns `None` if the channel is closed (all senders dropped).
@@ -333,11 +366,11 @@ impl<T, S: ChannelStrategy> GenericReceiver<T, S> {
     }
 }
 
-struct RecvFuture<'a, T, S: ChannelStrategy> {
-    receiver: &'a mut GenericReceiver<T, S>,
+struct RecvFuture<'a, T, S: ChannelStrategy, Q: Queue<T>> {
+    receiver: &'a mut GenericReceiver<T, S, Q>,
 }
 
-impl<'a, T, S: ChannelStrategy> Future for RecvFuture<'a, T, S> {
+impl<'a, T, S: ChannelStrategy, Q: Queue<T>> Future for RecvFuture<'a, T, S, Q> {
     type Output = Option<T>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -345,7 +378,7 @@ impl<'a, T, S: ChannelStrategy> Future for RecvFuture<'a, T, S> {
     }
 }
 
-impl<T, S: ChannelStrategy> Stream for GenericReceiver<T, S> {
+impl<T, S: ChannelStrategy, Q: Queue<T>> Stream for GenericReceiver<T, S, Q> {
     type Item = T;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
