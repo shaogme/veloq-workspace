@@ -171,6 +171,16 @@ pub struct Signal {
 }
 
 impl Signal {
+    pub fn is_notified(&self) -> bool {
+        self.state.load(Ordering::Acquire) == 1
+    }
+
+    pub fn try_reset(&self) -> bool {
+        self.state
+            .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
     pub fn new(ready: bool) -> Self {
         Self {
             state: AtomicU32::new(if ready { 1 } else { 0 }),

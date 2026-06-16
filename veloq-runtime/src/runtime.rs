@@ -203,17 +203,47 @@ impl<T, WF> Runtime<T, WF> {
                     Poll::Ready(res) => {
                         break Ok(res);
                     }
-                    Poll::Pending => match shared_ref
-                        .idle_hook
-                        .map(|h| h(shared_ref))
-                        .unwrap_or(IdleDecision::wait(IdleWaitStrategy::Block))
-                    {
-                        IdleDecision::Continue => thread::yield_now(),
-                        IdleDecision::Wait(IdleWaitStrategy::Timeout(d)) => {
-                            let _ = signal.wait_timeout(d);
+                    Poll::Pending => {
+                        while !signal.is_notified() {
+                            let mut progressed = false;
+                            if let Some(task) = shared_ref.base.fn_pop_send(0) {
+                                shared_ref.base.poll_send_task(0, task)?;
+                                progressed = true;
+                            } else if let Some(task) = shared_ref.base.fn_pop_pinned(0) {
+                                shared_ref.base.poll_send_task(0, task)?;
+                                progressed = true;
+                            } else if let Some(task) = shared_ref.base.fn_pop_local(0) {
+                                shared_ref.base.poll_local_task(0, task)?;
+                                progressed = true;
+                            } else if let Some(task) = shared_ref.base.pop_global() {
+                                shared_ref.base.poll_send_task(0, task)?;
+                                progressed = true;
+                            } else if let Some(task) =
+                                shared_ref.base.registry.workers[0].remote_queue.pop()
+                            {
+                                shared_ref.base.poll_send_task(0, task)?;
+                                progressed = true;
+                            }
+
+                            if !progressed {
+                                break;
+                            }
                         }
-                        IdleDecision::Wait(IdleWaitStrategy::Block) => signal.wait(),
-                    },
+
+                        if !signal.try_reset() {
+                            match shared_ref
+                                .idle_hook
+                                .map(|h| h(shared_ref))
+                                .unwrap_or(IdleDecision::wait(IdleWaitStrategy::Block))
+                            {
+                                IdleDecision::Continue => thread::yield_now(),
+                                IdleDecision::Wait(IdleWaitStrategy::Timeout(d)) => {
+                                    let _ = signal.wait_timeout(d);
+                                }
+                                IdleDecision::Wait(IdleWaitStrategy::Block) => signal.wait(),
+                            }
+                        }
+                    }
                 }
             };
 

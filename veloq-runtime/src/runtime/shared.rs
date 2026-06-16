@@ -286,7 +286,7 @@ impl RuntimeSharedBase {
         self.registry.unpark(worker_id);
     }
 
-    fn fn_pop_send(&self, worker_id: usize) -> Option<SendTaskRef> {
+    pub(crate) fn fn_pop_send(&self, worker_id: usize) -> Option<SendTaskRef> {
         let worker = &self.registry.workers[worker_id];
         if let Some(header) = worker.lifo.swap(None, Ordering::AcqRel) {
             return Some(unsafe { SendTaskRef::from_header(header.as_ptr()) });
@@ -294,7 +294,7 @@ impl RuntimeSharedBase {
         self.tls.with(|ctx| ctx.worker.pop())
     }
 
-    fn fn_pop_pinned(&self, worker_id: usize) -> Option<SendTaskRef> {
+    pub(crate) fn fn_pop_pinned(&self, worker_id: usize) -> Option<SendTaskRef> {
         let res = self.registry.workers[worker_id].pinned_queue.pop();
         if res.is_some() {
             self.registry.workers[worker_id]
@@ -304,7 +304,7 @@ impl RuntimeSharedBase {
         res
     }
 
-    fn fn_pop_local(&self, worker_id: usize) -> Option<LocalTaskRef> {
+    pub(crate) fn fn_pop_local(&self, worker_id: usize) -> Option<LocalTaskRef> {
         let res = self.registry.workers[worker_id].local_queue.pop();
         if res.is_some() {
             self.registry.workers[worker_id]
@@ -314,7 +314,7 @@ impl RuntimeSharedBase {
         res
     }
 
-    fn pop_global(&self) -> Option<SendTaskRef> {
+    pub(crate) fn pop_global(&self) -> Option<SendTaskRef> {
         self.scheduler.pop_global()
     }
 
@@ -325,7 +325,7 @@ impl RuntimeSharedBase {
         })
     }
 
-    fn poll_local_task(&self, worker_id: usize, task: LocalTaskRef) -> Result<()> {
+    pub(crate) fn poll_local_task(&self, worker_id: usize, task: LocalTaskRef) -> Result<()> {
         if task.header().clear_queued() {
             task.header().acknowledge_completion();
             Ok(())
