@@ -4,10 +4,11 @@ use std::task::Waker;
 use crate::{
     DriverCoreError,
     driver::{
+        AnomalyAttach, AnomalyOutcome, CompletionAnomaly, CompletionAnomalyKind,
         CompletionAnomalyReason, CompletionBackend, CompletionBackendHooks, CompletionCleanup,
         CompletionControl, CompletionEnvelope, CompletionFlowExt, CompletionFlowOutcome,
         CompletionHookOutcome, CompletionIngress, CompletionSource, HookResult, OpToken,
-        PlatformOp, registry::OpRegistry,
+        PlatformOp, SlotIssueReason, registry::OpRegistry,
     },
     slot::{
         self, CheckedSlotView, InFlightOrphaned, InFlightWaiting, SlotRegistryExt, SlotState,
@@ -45,7 +46,7 @@ fn test_event(token: OpToken, res: i32) -> UserCompletionEvent {
 
 #[derive(Default)]
 struct TestHooks {
-    loss_reason: Option<CompletionAnomaly>,
+    loss_kind: Option<CompletionAnomalyKind>,
     cleanup: Option<CompletionCleanupGuard>,
 }
 
@@ -66,8 +67,7 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
         slot: slot::Slot<'_, InFlightWaiting, DummySlotSpec>,
         _source: CompletionSource<'_, Self::BackendIngress>,
     ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>> {
-        if let Some(loss_reason) = self.loss_reason.take() {
-            let snapshot = slot.snapshot();
+        if let Some(loss_kind) = self.loss_kind.take() {
             let mut completed = slot.complete();
             let _ = completed.take_op();
             let (payload, detail) = completed.take_completion_data();
@@ -75,7 +75,7 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
             drop(detail);
             return Ok(CompletionHookOutcome::Lost {
                 event,
-                loss_reason: loss_reason.with_slot_snapshot(snapshot),
+                loss_kind,
                 cleanup: self.cleanup.take().unwrap_or_default(),
                 effect: (),
             });
@@ -113,24 +113,20 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
     fn complete_corrupt(
         &mut self,
         event: UserCompletionEvent,
-        anomaly: CompletionAnomaly,
+        kind: CompletionAnomalyKind,
         _source: CompletionSource<'_, Self::BackendIngress>,
     ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>> {
-        let Some(snapshot) = anomaly.slot_snapshot() else {
-            return Ok(CompletionHookOutcome::Anomaly {
-                anomaly,
+        if let Some(loss_kind) = self.loss_kind.take() {
+            return Ok(CompletionHookOutcome::Lost {
+                event,
+                loss_kind,
+                cleanup: self.cleanup.take().unwrap_or_default(),
                 effect: (),
             });
-        };
-        let loss_reason = self
-            .loss_reason
-            .take()
-            .unwrap_or(anomaly)
-            .with_slot_snapshot(snapshot);
-        Ok(CompletionHookOutcome::Lost {
-            event,
-            loss_reason,
-            cleanup: self.cleanup.take().unwrap_or_default(),
+        }
+        Ok(CompletionHookOutcome::Anomaly {
+            kind,
+            attach: AnomalyAttach::from_raw_completion(event.raw()),
             effect: (),
         })
     }
@@ -193,14 +189,24 @@ fn accept_lost(
     registry: &mut OpRegistry<DummySlotSpec>,
     token: OpToken,
     res: i32,
-    anomaly: CompletionAnomaly,
+    kind: CompletionAnomalyKind,
     cleanup: CompletionCleanupGuard,
 ) -> CompletionFlowOutcome {
     let mut hooks = TestHooks {
-        loss_reason: Some(anomaly),
+        loss_kind: Some(kind),
         cleanup: Some(cleanup),
     };
     accept_with_hooks(registry, test_event(token, res), &mut hooks)
+}
+
+fn expected_lost_anomaly(
+    kind: CompletionAnomalyKind,
+    token: OpToken,
+    res: i32,
+) -> CompletionAnomaly {
+    kind.materialize(AnomalyAttach::from_raw_completion(
+        test_event(token, res).raw(),
+    ))
 }
 
 #[test]
@@ -222,13 +228,22 @@ fn try_take_record_reports_future_generation_unavailable() {
     let token = test_token(0, 1);
 
     match table.try_take_record(token) {
-        PollRecordResult::Unavailable(anomaly) => {
-            assert_eq!(anomaly.reason(), CompletionAnomalyReason::NonActiveSlot);
-            assert_eq!(anomaly.index(), Some(0));
-            assert_eq!(anomaly.expected_generation(), Some(1));
+        PollRecordResult::UnavailableKind(kind) => {
+            assert_eq!(kind.reason(), CompletionAnomalyReason::NonActiveSlot);
+            assert!(matches!(
+                kind,
+                CompletionAnomalyKind::NonActive {
+                    index: 0,
+                    generation: 1,
+                    ..
+                }
+            ));
         }
         PollRecordResult::Pending => panic!("future generation token must not stay pending"),
         PollRecordResult::Ready(_) => panic!("future generation token must not become ready"),
+        PollRecordResult::Unavailable(anomaly) => {
+            panic!("future generation token should report kind, got {anomaly:?}")
+        }
     }
 }
 
@@ -266,7 +281,10 @@ fn mark_waiting_does_not_activate_idle_future_generation() {
 
     let outcome = table.mark_waiting(token);
 
-    assert!(matches!(outcome, CompletionMutationOutcome::NonActive(_)));
+    assert!(matches!(
+        outcome,
+        CompletionMutationOutcome::Rejected(AnomalyOutcome::NonActive(_))
+    ));
     assert_eq!(table.debug_get_state(0), CELL_STATE_IDLE);
 }
 
@@ -279,7 +297,10 @@ fn mark_waiting_does_not_revive_orphaned_slot() {
 
     let outcome = table.mark_waiting(token);
 
-    assert!(matches!(outcome, CompletionMutationOutcome::NonActive(_)));
+    assert!(matches!(
+        outcome,
+        CompletionMutationOutcome::Rejected(AnomalyOutcome::NonActive(_))
+    ));
     assert_eq!(table.debug_get_state(0), CELL_STATE_ORPHANED);
 }
 
@@ -292,7 +313,10 @@ fn mark_orphaned_reports_stale_generation() {
 
     let outcome = table.mark_orphaned(token);
 
-    assert!(matches!(outcome, CompletionMutationOutcome::Stale(_)));
+    assert!(matches!(
+        outcome,
+        CompletionMutationOutcome::Rejected(AnomalyOutcome::Stale(_))
+    ));
     assert_eq!(table.debug_get_state(0), CELL_STATE_WAITING);
     assert_eq!(
         table.completion_diagnostics().snapshot().stale_completion,
@@ -308,28 +332,37 @@ fn register_waker_reports_missing_slot() {
 
     let outcome = table.register_waker(token, waker);
 
-    assert!(matches!(outcome, CompletionMutationOutcome::Missing(_)));
+    assert!(matches!(
+        outcome,
+        CompletionMutationOutcome::Rejected(AnomalyOutcome::Missing(_))
+    ));
 }
 
 #[test]
 fn lost_completion_is_observable_as_unavailable() {
     let (mut registry, token) = reserved_registry();
     let table = registry.shared.clone();
-    let completion_token = CompletionToken::user(token);
-    let anomaly = CompletionAnomaly::corrupt(completion_token, 0, 1, SlotState::Reserved);
+    let res = -5;
+    let kind = CompletionAnomalyKind::slot_issue(
+        SlotIssueReason::SlotCorruption,
+        0,
+        1,
+        SlotState::Reserved,
+    );
+    let expected = expected_lost_anomaly(kind, token, res);
 
     let outcome = accept_lost(
         &mut registry,
         token,
-        -5,
-        anomaly,
+        res,
+        kind,
         CompletionCleanupGuard::default(),
     );
 
     assert_eq!(outcome.user_lost, 1);
     assert!(matches!(
         table.try_take_record(token),
-        PollRecordResult::Unavailable(observed) if observed.reason() == anomaly.reason()
+        PollRecordResult::Unavailable(observed) if observed == expected
     ));
     let snapshot = table.completion_diagnostics().snapshot();
     assert_eq!(snapshot.user_lost, 1);
@@ -342,19 +375,13 @@ fn lost_completion_reports_stale_generation() {
     let _ = registry.remove(token);
     let fresh = registry.alloc(()).expect("fresh slot").handle;
     registry.shared.slots[0].set_state(SlotState::InFlightWaiting, Ordering::Release);
-    let anomaly = CompletionAnomaly::stale(
-        CompletionToken::user(token),
-        0,
-        1,
-        fresh.generation,
-        SlotState::InFlightWaiting,
-    );
+    let kind = CompletionAnomalyKind::stale(0, 1, fresh.generation, SlotState::InFlightWaiting);
 
     let outcome = accept_lost(
         &mut registry,
         token,
         -1,
-        anomaly,
+        kind,
         CompletionCleanupGuard::default(),
     );
 
@@ -365,14 +392,13 @@ fn lost_completion_reports_stale_generation() {
 fn lost_completion_reports_empty_slot() {
     let mut registry = OpRegistry::<DummySlotSpec>::new(1);
     let token = test_token(0, 0);
-    let anomaly =
-        CompletionAnomaly::non_active(CompletionToken::user(token), 0, 0, SlotState::Idle);
+    let kind = CompletionAnomalyKind::non_active(0, 0, SlotState::Idle);
 
     let outcome = accept_lost(
         &mut registry,
         token,
         -1,
-        anomaly,
+        kind,
         CompletionCleanupGuard::default(),
     );
 
@@ -383,20 +409,28 @@ fn lost_completion_reports_empty_slot() {
 fn lost_completion_preserves_payload_missing_reason() {
     let (mut registry, token) = reserved_registry();
     let table = registry.shared.clone();
-    let anomaly = CompletionAnomaly::payload_missing(CompletionToken::user(token), 0, 1);
+    let res = -1;
+    let kind = CompletionAnomalyKind::corrupt_snapshot(slot::SlotSnapshot {
+        index: 0,
+        generation: 1,
+        state: SlotState::Idle,
+        has_op: true,
+        has_payload: false,
+    });
+    let expected = expected_lost_anomaly(kind, token, res);
 
     let outcome = accept_lost(
         &mut registry,
         token,
-        -1,
-        anomaly,
+        res,
+        kind,
         CompletionCleanupGuard::default(),
     );
 
     assert_eq!(outcome.user_lost, 1);
     assert!(matches!(
         table.try_take_record(token),
-        PollRecordResult::Unavailable(observed) if observed.reason() == anomaly.reason()
+        PollRecordResult::Unavailable(observed) if observed == expected
     ));
     let snapshot = table.completion_diagnostics().snapshot();
     assert_eq!(snapshot.user_lost, 1);
@@ -407,20 +441,28 @@ fn lost_completion_preserves_payload_missing_reason() {
 fn lost_completion_preserves_op_missing_reason() {
     let (mut registry, token) = reserved_registry();
     let table = registry.shared.clone();
-    let anomaly = CompletionAnomaly::op_missing(CompletionToken::user(token), 0, 1);
+    let res = -1;
+    let kind = CompletionAnomalyKind::corrupt_snapshot(slot::SlotSnapshot {
+        index: 0,
+        generation: 1,
+        state: SlotState::Idle,
+        has_op: false,
+        has_payload: false,
+    });
+    let expected = expected_lost_anomaly(kind, token, res);
 
     let outcome = accept_lost(
         &mut registry,
         token,
-        -1,
-        anomaly,
+        res,
+        kind,
         CompletionCleanupGuard::default(),
     );
 
     assert_eq!(outcome.user_lost, 1);
     assert!(matches!(
         table.try_take_record(token),
-        PollRecordResult::Unavailable(observed) if observed.reason() == anomaly.reason()
+        PollRecordResult::Unavailable(observed) if observed == expected
     ));
     let snapshot = table.completion_diagnostics().snapshot();
     assert_eq!(snapshot.user_lost, 1);
@@ -444,6 +486,9 @@ fn duplicate_completion_does_not_clear_ready_data() {
         PollRecordResult::Unavailable(anomaly) => {
             panic!("first completion should remain available: {anomaly:?}")
         }
+        PollRecordResult::UnavailableKind(kind) => {
+            panic!("first completion should remain available: {kind:?}")
+        }
     };
     assert_eq!(record.event.res(), 11);
 }
@@ -461,8 +506,8 @@ fn ready_mark_orphaned_cleanup_leaves_diagnostic_stale_result() {
 
     assert!(matches!(
         table.try_take_record(token),
-        PollRecordResult::Unavailable(anomaly)
-            if anomaly.reason() == CompletionAnomalyReason::StaleGeneration
+        PollRecordResult::UnavailableKind(kind)
+            if kind.reason() == CompletionAnomalyReason::StaleGeneration
     ));
     let snapshot = table.completion_diagnostics().snapshot();
     assert_eq!(snapshot.stale_completion, 1);

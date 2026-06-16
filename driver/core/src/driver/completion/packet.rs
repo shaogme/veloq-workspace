@@ -1,8 +1,8 @@
 use crate::{DriverResult, slot::SlotSpec};
 
 use super::{
-    CompletionAnomaly, CompletionCleanupGuard, CompletionEvent, DriverCompletionDiagnostics,
-    OpToken, UserCompletionEvent,
+    AnomalyAttach, CompletionAnomaly, CompletionAnomalyKind, CompletionCleanupGuard,
+    CompletionEvent, DriverCompletionDiagnostics, OpToken, UserCompletionEvent,
 };
 
 pub struct CompletionPacket<Spec: SlotSpec> {
@@ -84,9 +84,11 @@ impl<Spec: SlotSpec> CompletionPacket<Spec> {
     #[inline]
     pub fn lost(
         event: UserCompletionEvent,
-        anomaly: CompletionAnomaly,
+        kind: CompletionAnomalyKind,
         cleanup: CompletionCleanupGuard,
     ) -> Self {
+        let attach = AnomalyAttach::from_raw_completion(event.raw());
+        let anomaly = kind.materialize(attach);
         Self {
             event,
             input: CompletionInput::Lost(CompletionLoss { anomaly, cleanup }),

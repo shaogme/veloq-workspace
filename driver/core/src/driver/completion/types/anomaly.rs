@@ -21,30 +21,26 @@ pub enum CompletionAnomalyReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompletionMutationOutcome {
-    Applied,
-    Missing(CompletionAnomaly),
-    Stale(CompletionAnomaly),
-    NonActive(CompletionAnomaly),
-    UnknownControl(CompletionAnomaly),
+pub enum ControlAnomalyReason {
+    UnknownControlToken,
+    ControlCompletionUntracked,
+    BackendContextUnknown,
 }
 
-impl CompletionMutationOutcome {
-    #[inline]
-    pub const fn is_applied(self) -> bool {
-        matches!(self, Self::Applied)
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotIssueReason {
+    BackendInvariantBroken,
+    CompletionKeyMismatch,
+    FinalizeFailed,
+    CancelAckTargetStillActive,
+    SlotCorruption,
+}
 
-    #[inline]
-    pub const fn anomaly(&self) -> Option<&CompletionAnomaly> {
-        match self {
-            Self::Applied => None,
-            Self::Missing(anomaly)
-            | Self::Stale(anomaly)
-            | Self::NonActive(anomaly)
-            | Self::UnknownControl(anomaly) => Some(anomaly),
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendSlotRef {
+    pub index: usize,
+    pub expected_generation: u32,
+    pub actual_generation: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +54,89 @@ pub struct CompletionRaw {
     pub backend: CompletionBackend,
     pub res: i32,
     pub flags: u32,
+}
+
+/// Lightweight anomaly classification for hot propagation paths (~24–32 B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionAnomalyKind {
+    UnknownSlot {
+        index: usize,
+        generation: u32,
+    },
+    Stale {
+        index: usize,
+        expected: u32,
+        actual: u32,
+        state: slot::SlotState,
+    },
+    NonActive {
+        index: usize,
+        generation: u32,
+        state: slot::SlotState,
+    },
+    Corrupt {
+        snapshot: slot::SlotSnapshot,
+    },
+    SlotIssue {
+        reason: SlotIssueReason,
+        index: usize,
+        generation: u32,
+        state: slot::SlotState,
+        snapshot: Option<slot::SlotSnapshot>,
+    },
+    Control {
+        reason: ControlAnomalyReason,
+    },
+    BackendContext {
+        backend: CompletionBackend,
+        backend_context: u64,
+    },
+    BackendSpecific {
+        code: u16,
+        backend: CompletionBackend,
+        backend_context: u64,
+        slot: Option<BackendSlotRef>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnomalyAttach {
+    pub token: CompletionToken,
+    pub raw: Option<CompletionRaw>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnomalyOutcome {
+    Missing(CompletionAnomalyKind),
+    Stale(CompletionAnomalyKind),
+    NonActive(CompletionAnomalyKind),
+    Corrupt(CompletionAnomalyKind),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionMutationOutcome {
+    Applied,
+    Rejected(AnomalyOutcome),
+}
+
+impl CompletionMutationOutcome {
+    #[inline]
+    pub const fn is_applied(self) -> bool {
+        matches!(self, Self::Applied)
+    }
+
+    #[inline]
+    pub fn anomaly_outcome(&self) -> Option<AnomalyOutcome> {
+        match self {
+            Self::Applied => None,
+            Self::Rejected(outcome) => Some(*outcome),
+        }
+    }
+
+    #[inline]
+    pub fn kind(&self) -> Option<CompletionAnomalyKind> {
+        self.anomaly_outcome().map(AnomalyOutcome::kind)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +191,448 @@ pub enum CompletionAnomaly {
         actual_generation: Option<u32>,
         raw: Option<CompletionRaw>,
     },
+}
+
+impl AnomalyOutcome {
+    #[inline]
+    pub fn kind(self) -> CompletionAnomalyKind {
+        match self {
+            Self::Missing(kind)
+            | Self::Stale(kind)
+            | Self::NonActive(kind)
+            | Self::Corrupt(kind) => kind,
+        }
+    }
+
+    #[inline]
+    pub fn materialize(self, attach: AnomalyAttach) -> CompletionAnomaly {
+        self.kind().materialize(attach)
+    }
+}
+
+impl AnomalyAttach {
+    #[inline]
+    pub const fn token_only(token: CompletionToken) -> Self {
+        Self { token, raw: None }
+    }
+
+    #[inline]
+    pub fn from_op_token(token: crate::driver::OpToken) -> Self {
+        Self {
+            token: CompletionToken::user(token),
+            raw: None,
+        }
+    }
+
+    #[inline]
+    pub fn from_raw_completion(raw: super::super::RawCompletion) -> Self {
+        Self {
+            token: raw.token,
+            raw: Some(CompletionRaw {
+                backend: raw.backend,
+                res: raw.res,
+                flags: raw.flags,
+            }),
+        }
+    }
+}
+
+#[inline]
+fn corrupt_reason_from_snapshot(snapshot: slot::SlotSnapshot) -> CompletionAnomalyReason {
+    if !snapshot.has_op {
+        CompletionAnomalyReason::OpMissing
+    } else if !snapshot.has_payload {
+        CompletionAnomalyReason::PayloadMissing
+    } else {
+        CompletionAnomalyReason::SlotCorruption
+    }
+}
+
+impl CompletionAnomalyKind {
+    #[inline]
+    pub const fn unknown_slot(index: usize, generation: u32) -> Self {
+        Self::UnknownSlot { index, generation }
+    }
+
+    #[inline]
+    pub const fn stale(index: usize, expected: u32, actual: u32, state: slot::SlotState) -> Self {
+        Self::Stale {
+            index,
+            expected,
+            actual,
+            state,
+        }
+    }
+
+    #[inline]
+    pub const fn non_active(index: usize, generation: u32, state: slot::SlotState) -> Self {
+        Self::NonActive {
+            index,
+            generation,
+            state,
+        }
+    }
+
+    #[inline]
+    pub const fn corrupt_snapshot(snapshot: slot::SlotSnapshot) -> Self {
+        Self::Corrupt { snapshot }
+    }
+
+    #[inline]
+    pub fn corrupt_from_view(snapshot: slot::SlotSnapshot) -> Self {
+        Self::Corrupt { snapshot }
+    }
+
+    #[inline]
+    pub const fn slot_issue(
+        reason: SlotIssueReason,
+        index: usize,
+        generation: u32,
+        state: slot::SlotState,
+    ) -> Self {
+        Self::SlotIssue {
+            reason,
+            index,
+            generation,
+            state,
+            snapshot: None,
+        }
+    }
+
+    #[inline]
+    pub const fn slot_issue_with_snapshot(
+        reason: SlotIssueReason,
+        snapshot: slot::SlotSnapshot,
+    ) -> Self {
+        Self::SlotIssue {
+            reason,
+            index: snapshot.index,
+            generation: snapshot.generation,
+            state: snapshot.state,
+            snapshot: Some(snapshot),
+        }
+    }
+
+    #[inline]
+    pub const fn backend_invariant_broken(
+        index: usize,
+        generation: u32,
+        state: slot::SlotState,
+    ) -> Self {
+        Self::slot_issue(
+            SlotIssueReason::BackendInvariantBroken,
+            index,
+            generation,
+            state,
+        )
+    }
+
+    #[inline]
+    pub const fn backend_invariant_broken_snapshot(snapshot: slot::SlotSnapshot) -> Self {
+        Self::slot_issue_with_snapshot(SlotIssueReason::BackendInvariantBroken, snapshot)
+    }
+
+    #[inline]
+    pub const fn completion_key_mismatch(
+        index: usize,
+        generation: u32,
+        state: slot::SlotState,
+    ) -> Self {
+        Self::slot_issue(
+            SlotIssueReason::CompletionKeyMismatch,
+            index,
+            generation,
+            state,
+        )
+    }
+
+    #[inline]
+    pub const fn finalize_failed(index: usize, generation: u32, state: slot::SlotState) -> Self {
+        Self::slot_issue(SlotIssueReason::FinalizeFailed, index, generation, state)
+    }
+
+    #[inline]
+    pub const fn finalize_failed_snapshot(snapshot: slot::SlotSnapshot) -> Self {
+        Self::slot_issue_with_snapshot(SlotIssueReason::FinalizeFailed, snapshot)
+    }
+
+    #[inline]
+    pub const fn cancel_ack_target_still_active(
+        index: usize,
+        generation: u32,
+        state: slot::SlotState,
+    ) -> Self {
+        Self::slot_issue(
+            SlotIssueReason::CancelAckTargetStillActive,
+            index,
+            generation,
+            state,
+        )
+    }
+
+    #[inline]
+    pub const fn unknown_control() -> Self {
+        Self::Control {
+            reason: ControlAnomalyReason::UnknownControlToken,
+        }
+    }
+
+    #[inline]
+    pub const fn control_completion_untracked() -> Self {
+        Self::Control {
+            reason: ControlAnomalyReason::ControlCompletionUntracked,
+        }
+    }
+
+    #[inline]
+    pub const fn backend_context_unknown() -> Self {
+        Self::Control {
+            reason: ControlAnomalyReason::BackendContextUnknown,
+        }
+    }
+
+    #[inline]
+    pub const fn backend_context(backend: CompletionBackend, backend_context: u64) -> Self {
+        Self::BackendContext {
+            backend,
+            backend_context,
+        }
+    }
+
+    #[inline]
+    pub const fn backend_specific(
+        code: u16,
+        backend: CompletionBackend,
+        backend_context: u64,
+    ) -> Self {
+        Self::BackendSpecific {
+            code,
+            backend,
+            backend_context,
+            slot: None,
+        }
+    }
+
+    #[inline]
+    pub const fn backend_specific_missing(
+        code: u16,
+        backend: CompletionBackend,
+        backend_context: u64,
+        index: usize,
+        expected_generation: u32,
+    ) -> Self {
+        Self::BackendSpecific {
+            code,
+            backend,
+            backend_context,
+            slot: Some(BackendSlotRef {
+                index,
+                expected_generation,
+                actual_generation: None,
+            }),
+        }
+    }
+
+    #[inline]
+    pub const fn backend_specific_stale(
+        code: u16,
+        backend: CompletionBackend,
+        backend_context: u64,
+        index: usize,
+        expected_generation: u32,
+        actual_generation: u32,
+    ) -> Self {
+        Self::BackendSpecific {
+            code,
+            backend,
+            backend_context,
+            slot: Some(BackendSlotRef {
+                index,
+                expected_generation,
+                actual_generation: Some(actual_generation),
+            }),
+        }
+    }
+
+    #[inline]
+    pub fn reason(self) -> CompletionAnomalyReason {
+        match self {
+            Self::UnknownSlot { .. } => CompletionAnomalyReason::UnknownSlot,
+            Self::Stale { .. } => CompletionAnomalyReason::StaleGeneration,
+            Self::NonActive { .. } => CompletionAnomalyReason::NonActiveSlot,
+            Self::Corrupt { snapshot } => corrupt_reason_from_snapshot(snapshot),
+            Self::SlotIssue { reason, .. } => match reason {
+                SlotIssueReason::BackendInvariantBroken => {
+                    CompletionAnomalyReason::BackendInvariantBroken
+                }
+                SlotIssueReason::CompletionKeyMismatch => {
+                    CompletionAnomalyReason::CompletionKeyMismatch
+                }
+                SlotIssueReason::FinalizeFailed => CompletionAnomalyReason::FinalizeFailed,
+                SlotIssueReason::CancelAckTargetStillActive => {
+                    CompletionAnomalyReason::CancelAckTargetStillActive
+                }
+                SlotIssueReason::SlotCorruption => CompletionAnomalyReason::SlotCorruption,
+            },
+            Self::Control { reason } => match reason {
+                ControlAnomalyReason::UnknownControlToken => {
+                    CompletionAnomalyReason::UnknownControlToken
+                }
+                ControlAnomalyReason::ControlCompletionUntracked => {
+                    CompletionAnomalyReason::ControlCompletionUntracked
+                }
+                ControlAnomalyReason::BackendContextUnknown => {
+                    CompletionAnomalyReason::BackendContextUnknown
+                }
+            },
+            Self::BackendContext { .. } => CompletionAnomalyReason::BackendContextUnknown,
+            Self::BackendSpecific { code, .. } => CompletionAnomalyReason::BackendSpecific(code),
+        }
+    }
+
+    #[inline]
+    pub fn index(self) -> Option<usize> {
+        match self {
+            Self::UnknownSlot { index, .. }
+            | Self::Stale { index, .. }
+            | Self::NonActive { index, .. }
+            | Self::SlotIssue { index, .. } => Some(index),
+            Self::Corrupt { snapshot } => Some(snapshot.index),
+            Self::BackendSpecific {
+                slot: Some(slot), ..
+            } => Some(slot.index),
+            Self::Control { .. } | Self::BackendContext { .. } => None,
+            Self::BackendSpecific { slot: None, .. } => None,
+        }
+    }
+
+    #[inline]
+    pub fn slot_snapshot(self) -> Option<slot::SlotSnapshot> {
+        match self {
+            Self::Corrupt { snapshot } => Some(snapshot),
+            Self::SlotIssue {
+                snapshot: Some(snapshot),
+                ..
+            } => Some(snapshot),
+            Self::SlotIssue { .. } => None,
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn materialize(self, attach: AnomalyAttach) -> CompletionAnomaly {
+        let token = attach.token;
+        let raw = attach.raw;
+        let anomaly = match self {
+            Self::UnknownSlot { index, generation } => {
+                CompletionAnomaly::unknown_slot(token, index, generation)
+            }
+            Self::Stale {
+                index,
+                expected,
+                actual,
+                state,
+            } => CompletionAnomaly::stale(token, index, expected, actual, state),
+            Self::NonActive {
+                index,
+                generation,
+                state,
+            } => CompletionAnomaly::non_active(token, index, generation, state),
+            Self::Corrupt { snapshot } => CompletionAnomaly::corrupt_slot_snapshot(token, snapshot),
+            Self::SlotIssue {
+                reason,
+                index,
+                generation,
+                state,
+                snapshot,
+            } => {
+                let mut anomaly = match reason {
+                    SlotIssueReason::BackendInvariantBroken => {
+                        CompletionAnomaly::backend_invariant_broken(token, index, generation, state)
+                    }
+                    SlotIssueReason::CompletionKeyMismatch => {
+                        CompletionAnomaly::completion_key_mismatch(token, index, generation, state)
+                    }
+                    SlotIssueReason::FinalizeFailed => {
+                        CompletionAnomaly::finalize_failed(token, index, generation, state)
+                    }
+                    SlotIssueReason::CancelAckTargetStillActive => {
+                        CompletionAnomaly::cancel_ack_target_still_active(
+                            token, index, generation, state,
+                        )
+                    }
+                    SlotIssueReason::SlotCorruption => {
+                        CompletionAnomaly::corrupt(token, index, generation, state)
+                    }
+                };
+                if let Some(snapshot) = snapshot {
+                    anomaly = anomaly.with_slot_snapshot(snapshot);
+                }
+                anomaly
+            }
+            Self::Control { reason } => match reason {
+                ControlAnomalyReason::UnknownControlToken => {
+                    CompletionAnomaly::unknown_control(token)
+                }
+                ControlAnomalyReason::ControlCompletionUntracked => {
+                    CompletionAnomaly::control_completion_untracked(token)
+                }
+                ControlAnomalyReason::BackendContextUnknown => {
+                    CompletionAnomaly::backend_context_unknown(token)
+                }
+            },
+            Self::BackendContext {
+                backend,
+                backend_context,
+            } => {
+                let raw = raw.unwrap_or(CompletionRaw {
+                    backend,
+                    res: 0,
+                    flags: 0,
+                });
+                CompletionAnomaly::from_backend_context(token, backend, backend_context, raw)
+            }
+            Self::BackendSpecific {
+                code,
+                backend,
+                backend_context,
+                slot,
+            } => match slot {
+                None => CompletionAnomaly::backend_specific(code, token, backend, backend_context),
+                Some(BackendSlotRef {
+                    index,
+                    expected_generation,
+                    actual_generation: None,
+                }) => CompletionAnomaly::backend_specific_missing(
+                    code,
+                    token,
+                    backend,
+                    backend_context,
+                    index,
+                    expected_generation,
+                ),
+                Some(BackendSlotRef {
+                    index,
+                    expected_generation,
+                    actual_generation: Some(actual_generation),
+                }) => CompletionAnomaly::backend_specific_stale(
+                    code,
+                    token,
+                    backend,
+                    backend_context,
+                    index,
+                    expected_generation,
+                    actual_generation,
+                ),
+            },
+        };
+        match raw {
+            Some(raw) if !matches!(anomaly, CompletionAnomaly::BackendContext { .. }) => {
+                anomaly.with_raw(raw)
+            }
+            _ => anomaly,
+        }
+    }
 }
 
 impl CompletionAnomaly {
@@ -787,5 +1308,16 @@ mod tests {
     #[test]
     fn completion_anomaly_is_compact_enough_to_copy() {
         assert!(size_of::<CompletionAnomaly>() <= 72);
+    }
+
+    #[test]
+    fn completion_anomaly_kind_is_lightweight() {
+        assert!(size_of::<CompletionAnomalyKind>() <= 40);
+    }
+
+    #[test]
+    fn anomaly_outcome_is_compact() {
+        assert!(size_of::<AnomalyOutcome>() <= 48);
+        assert!(size_of::<CompletionMutationOutcome>() <= 48);
     }
 }

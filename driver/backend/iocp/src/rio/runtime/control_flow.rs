@@ -23,9 +23,9 @@ use tracing::debug;
 use veloq_buf::BufferRegistrar;
 use veloq_driver_core::{
     driver::{
-        CompletionAnomaly, CompletionBackendHooks,
+        AnomalyAttach, CompletionAnomalyKind, CompletionBackendHooks,
         CompletionBackendIngressAction, CompletionControl, CompletionFlowExt,
-        CompletionHookOutcome, CompletionIngress, CompletionSource, CompletionToken, RawCompletion,
+        CompletionHookOutcome, CompletionIngress, CompletionSource, RawCompletion,
         SharedCompletionTable, UserCompletionEvent,
     },
     slot::{InFlightOrphaned, InFlightWaiting, SlotState},
@@ -153,13 +153,12 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
     ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         let CompletionSource::Backend(ingress) = source else {
             return Ok(CompletionHookOutcome::Anomaly {
-                anomaly: CompletionAnomaly::backend_invariant_broken(
-                    event.completion_token(),
+                kind: CompletionAnomalyKind::backend_invariant_broken(
                     event.token().index(),
                     event.token().generation(),
                     SlotState::InFlightWaiting,
-                )
-                .with_raw_completion(event.raw()),
+                ),
+                attach: AnomalyAttach::from_raw_completion(event.raw()),
                 effect: RioBackendEffect::default(),
             });
         };
@@ -188,8 +187,8 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
 
     fn complete_corrupt(
         &mut self,
-        _event: UserCompletionEvent,
-        anomaly: CompletionAnomaly,
+        event: UserCompletionEvent,
+        kind: CompletionAnomalyKind,
         source: CompletionSource<'_, Self::BackendIngress>,
     ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         let effect = match source {
@@ -198,7 +197,11 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
                 RioBackendEffect::default()
             }
         };
-        Ok(CompletionHookOutcome::Anomaly { anomaly, effect })
+        Ok(CompletionHookOutcome::Anomaly {
+            kind,
+            attach: AnomalyAttach::from_raw_completion(event.raw()),
+            effect,
+        })
     }
 
     fn complete_backend_ingress(
@@ -254,21 +257,12 @@ fn complete_rio_waiting_slot(
     let result = ingress.result;
     let token = init.token;
     let (user_data, generation) = token.parts();
-    let completion_token = CompletionToken::user(token);
     let socket_key = init.socket_inflight.socket_key();
-    let raw = RawCompletion::new(COMP_BACKEND_RIO, completion_token, result.raw_res(), 0);
     let effect = RioBackendEffect::from_init(init);
 
     if slot.platform().generation != generation {
         let snapshot = slot.snapshot();
-        let anomaly = CompletionAnomaly::corrupt(
-            completion_token,
-            snapshot.index,
-            snapshot.generation,
-            snapshot.state,
-        )
-        .with_slot_snapshot(snapshot)
-        .with_raw_completion(raw);
+        let loss_kind = CompletionAnomalyKind::corrupt_snapshot(snapshot);
         let report = IocpError::Internal
             .to_report()
             .push_ctx("scope", "rio.runtime.control_flow.handle_op_completion")
@@ -290,7 +284,7 @@ fn complete_rio_waiting_slot(
         };
         return CompletionHookOutcome::Lost {
             event,
-            loss_reason: anomaly,
+            loss_kind,
             cleanup,
             effect,
         };
@@ -371,11 +365,7 @@ fn complete_rio_waiting_slot(
         drop(detail);
         CompletionHookOutcome::Lost {
             event,
-            loss_reason: CompletionAnomaly::corrupt_slot_snapshot(
-                event.completion_token(),
-                snapshot,
-            )
-            .with_raw_completion(event.raw()),
+            loss_kind: CompletionAnomalyKind::corrupt_snapshot(snapshot),
             cleanup,
             effect,
         }
@@ -426,23 +416,17 @@ pub(crate) const RIO_ANOMALY_MALFORMED: u16 = 1;
 pub(crate) const RIO_ANOMALY_MISSING: u16 = 2;
 pub(crate) const RIO_ANOMALY_STALE: u16 = 3;
 
-pub(crate) fn rio_malformed_context_anomaly(raw_context: u64) -> CompletionAnomaly {
-    CompletionAnomaly::backend_specific(
-        RIO_ANOMALY_MALFORMED,
-        RIO_EVENT_TOKEN,
-        COMP_BACKEND_RIO,
-        raw_context,
-    )
+pub(crate) fn rio_malformed_context_kind(raw_context: u64) -> CompletionAnomalyKind {
+    CompletionAnomalyKind::backend_specific(RIO_ANOMALY_MALFORMED, COMP_BACKEND_RIO, raw_context)
 }
 
-pub(crate) fn rio_missing_context_anomaly(
+pub(crate) fn rio_missing_context_kind(
     raw_context: u64,
     index: usize,
     generation: u32,
-) -> CompletionAnomaly {
-    CompletionAnomaly::backend_specific_missing(
+) -> CompletionAnomalyKind {
+    CompletionAnomalyKind::backend_specific_missing(
         RIO_ANOMALY_MISSING,
-        RIO_EVENT_TOKEN,
         COMP_BACKEND_RIO,
         raw_context,
         index,
@@ -450,15 +434,14 @@ pub(crate) fn rio_missing_context_anomaly(
     )
 }
 
-pub(crate) fn rio_stale_context_anomaly(
+pub(crate) fn rio_stale_context_kind(
     raw_context: u64,
     index: usize,
     expected_generation: u32,
     actual_generation: u32,
-) -> CompletionAnomaly {
-    CompletionAnomaly::backend_specific_stale(
+) -> CompletionAnomalyKind {
+    CompletionAnomalyKind::backend_specific_stale(
         RIO_ANOMALY_STALE,
-        RIO_EVENT_TOKEN,
         COMP_BACKEND_RIO,
         raw_context,
         index,
@@ -467,8 +450,8 @@ pub(crate) fn rio_stale_context_anomaly(
     )
 }
 
-fn anomaly_with_rio_raw(anomaly: CompletionAnomaly, res: RioResultData) -> CompletionAnomaly {
-    anomaly.with_raw_completion(RawCompletion::new(
+fn rio_result_attach(res: RioResultData) -> AnomalyAttach {
+    AnomalyAttach::from_raw_completion(RawCompletion::new(
         COMP_BACKEND_RIO,
         RIO_EVENT_TOKEN,
         res.raw_res(),
@@ -613,13 +596,14 @@ impl RioState {
                         }
                     }
                     RioRequestContextDecode::Malformed { raw } => {
-                        let anomaly =
-                            anomaly_with_rio_raw(rio_malformed_context_anomaly(raw), result);
                         let _ = ops.accept_completion(
                             completion_table,
                             diagnostics,
                             &mut hooks,
-                            CompletionIngress::Anomaly(anomaly),
+                            CompletionIngress::Anomaly {
+                                kind: rio_malformed_context_kind(raw),
+                                attach: rio_result_attach(result),
+                            },
                         );
                         debug!(
                             request_context = raw,
@@ -629,19 +613,18 @@ impl RioState {
                         );
                     }
                     RioRequestContextDecode::Missing { id } => {
-                        let anomaly = anomaly_with_rio_raw(
-                            rio_missing_context_anomaly(
-                                result.request_context,
-                                id.index(),
-                                id.generation(),
-                            ),
-                            result,
-                        );
                         let _ = ops.accept_completion(
                             completion_table,
                             diagnostics,
                             &mut hooks,
-                            CompletionIngress::Anomaly(anomaly),
+                            CompletionIngress::Anomaly {
+                                kind: rio_missing_context_kind(
+                                    result.request_context,
+                                    id.index(),
+                                    id.generation(),
+                                ),
+                                attach: rio_result_attach(result),
+                            },
                         );
                         debug!(
                             request_context = result.request_context,
@@ -656,20 +639,19 @@ impl RioState {
                         id,
                         actual_generation,
                     } => {
-                        let anomaly = anomaly_with_rio_raw(
-                            rio_stale_context_anomaly(
-                                result.request_context,
-                                id.index(),
-                                id.generation(),
-                                actual_generation,
-                            ),
-                            result,
-                        );
                         let _ = ops.accept_completion(
                             completion_table,
                             diagnostics,
                             &mut hooks,
-                            CompletionIngress::Anomaly(anomaly),
+                            CompletionIngress::Anomaly {
+                                kind: rio_stale_context_kind(
+                                    result.request_context,
+                                    id.index(),
+                                    id.generation(),
+                                    actual_generation,
+                                ),
+                                attach: rio_result_attach(result),
+                            },
                         );
                         debug!(
                             request_context = result.request_context,

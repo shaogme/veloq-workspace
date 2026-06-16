@@ -172,14 +172,16 @@ impl DriverCompletionDiagnosticsBackend for IocpCompletionDiagnostics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rio::runtime::control_flow::rio_malformed_context_anomaly;
+    use crate::rio::runtime::control_flow::rio_malformed_context_kind;
+    use veloq_driver_core::driver::AnomalyAttach;
 
     #[test]
     fn rio_backend_anomaly_keeps_core_counting_enabled() {
         let diagnostics = IocpCompletionDiagnostics::default();
-        let anomaly = rio_malformed_context_anomaly(0xa700_0001);
+        let kind = rio_malformed_context_kind(0xa700_0001);
+        let attach = AnomalyAttach::token_only(crate::driver::RIO_EVENT_TOKEN);
 
-        assert!(!diagnostics.record_backend_anomaly(&anomaly));
+        assert!(!diagnostics.record_backend_anomaly(&kind.materialize(attach)));
         assert_eq!(diagnostics.snapshot().rio.malformed_context, 1);
     }
 }

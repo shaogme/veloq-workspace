@@ -3,10 +3,10 @@ use std::{io, num::NonZeroU8, time::Instant};
 use diagweave::prelude::*;
 use veloq_driver_core::{
     driver::{
-        CancelMode, CompletionAnomaly, CompletionBackend, CompletionBackendHooks,
-        CompletionCleanupGuard, CompletionControl, CompletionEnvelope, CompletionFlowExt,
-        CompletionFlowOutcome, CompletionHookOutcome, CompletionIngress, CompletionSource,
-        SyntheticCompletionSource, UserCompletionEvent,
+        AnomalyAttach, CancelMode, CompletionAnomalyKind, CompletionBackend,
+        CompletionBackendHooks, CompletionCleanupGuard, CompletionControl, CompletionEnvelope,
+        CompletionFlowExt, CompletionFlowOutcome, CompletionHookOutcome, CompletionIngress,
+        CompletionSource, SyntheticCompletionSource, UserCompletionEvent,
     },
     slot::{CheckedSlotView, InFlightOrphaned, InFlightWaiting, SlotRegistryExt, SlotView},
 };
@@ -126,14 +126,11 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
                     effect: IocpBackendEffect::None,
                 }
             }
-            CompletionControl::Cancel { raw, .. } => {
-                let anomaly = CompletionAnomaly::control_completion_untracked(raw.token)
-                    .with_raw_completion(raw);
-                CompletionHookOutcome::Anomaly {
-                    anomaly,
-                    effect: IocpBackendEffect::None,
-                }
-            }
+            CompletionControl::Cancel { raw, .. } => CompletionHookOutcome::Anomaly {
+                kind: CompletionAnomalyKind::control_completion_untracked(),
+                attach: AnomalyAttach::from_raw_completion(raw),
+                effect: IocpBackendEffect::None,
+            },
         })
     }
 
@@ -259,10 +256,11 @@ impl<'a> IocpDriver<'a> {
 
     pub(crate) fn accept_completion_anomaly(
         &mut self,
-        anomaly: CompletionAnomaly,
+        kind: CompletionAnomalyKind,
+        attach: AnomalyAttach,
     ) -> IocpResult<CompletionFlowOutcome> {
         self.accept_completion_ingress(
-            CompletionIngress::Anomaly(anomaly),
+            CompletionIngress::Anomaly { kind, attach },
             IocpSyntheticCompletion::None,
         )
     }
@@ -417,11 +415,7 @@ fn complete_iocp_waiting_slot(
         let _data = std::mem::take(guard.platform_mut());
         CompletionHookOutcome::Lost {
             event,
-            loss_reason: CompletionAnomaly::corrupt_slot_snapshot(
-                event.completion_token(),
-                snapshot,
-            )
-            .with_raw_completion(event.raw()),
+            loss_kind: CompletionAnomalyKind::corrupt_snapshot(snapshot),
             cleanup,
             effect,
         }

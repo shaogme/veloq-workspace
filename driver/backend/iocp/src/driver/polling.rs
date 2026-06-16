@@ -7,8 +7,8 @@ use std::{
 use diagweave::prelude::*;
 use veloq_driver_core::{
     driver::{
-        CompletionAnomaly, CompletionEnvelope, CompletionIdentity, OpToken, RawCompletion,
-        RemoteWaker, SharedCompletionTable, drain_cancel_requests,
+        AnomalyAttach, CompletionAnomalyKind, CompletionEnvelope, CompletionIdentity, OpToken,
+        RawCompletion, RemoteWaker, SharedCompletionTable, drain_cancel_requests,
     },
     slot::{CheckedSlotView, SlotRegistryExt, SlotView},
 };
@@ -223,21 +223,29 @@ impl<'a> IocpDriver<'a> {
                 .with_ctx("completion_key", key)
                 .with_ctx("overlapped_is_null", true);
 
-                let anomaly = CompletionAnomaly::backend_context_unknown(RIO_EVENT_TOKEN)
-                    .with_backend(COMP_BACKEND_IOCP)
-                    .with_backend_context(key as u64)
-                    .with_raw_result(res)
-                    .with_flags(flags);
-                self.accept_completion_anomaly(anomaly)?;
+                let attach = AnomalyAttach::from_raw_completion(RawCompletion::new(
+                    COMP_BACKEND_IOCP,
+                    RIO_EVENT_TOKEN,
+                    res,
+                    flags,
+                ));
+                self.accept_completion_anomaly(
+                    CompletionAnomalyKind::backend_context(COMP_BACKEND_IOCP, key as u64),
+                    attach,
+                )?;
                 Ok(1)
             }
             IocpCompletionStatusKind::Unknown => {
-                let anomaly = CompletionAnomaly::backend_context_unknown(RIO_EVENT_TOKEN)
-                    .with_backend(COMP_BACKEND_IOCP)
-                    .with_backend_context(key as u64)
-                    .with_raw_result(res)
-                    .with_flags(flags);
-                self.accept_completion_anomaly(anomaly)?;
+                let attach = AnomalyAttach::from_raw_completion(RawCompletion::new(
+                    COMP_BACKEND_IOCP,
+                    RIO_EVENT_TOKEN,
+                    res,
+                    flags,
+                ));
+                self.accept_completion_anomaly(
+                    CompletionAnomalyKind::backend_context(COMP_BACKEND_IOCP, key as u64),
+                    attach,
+                )?;
                 Ok(1)
             }
         }
@@ -286,13 +294,10 @@ impl<'a> IocpDriver<'a> {
                 raw.res,
                 raw.flags,
             );
-            let anomaly = completion_key_mismatch_anomaly(
-                entry.token,
-                raw,
-                mismatch_raw,
-                self.ops.checked_slot_view(entry.token),
-            );
-            let _ = self.accept_completion_anomaly(anomaly)?;
+            let kind =
+                completion_key_mismatch_kind(entry.token, self.ops.checked_slot_view(entry.token));
+            let attach = AnomalyAttach::from_raw_completion(mismatch_raw);
+            let _ = self.accept_completion_anomaly(kind, attach)?;
         }
         Ok(envelope)
     }
@@ -356,12 +361,10 @@ fn iocp_status_flags(success: bool, error_code: Option<u32>) -> u32 {
     (u32::from(success)) | (error_code.unwrap_or(0).min(u32::MAX >> 1) << 1)
 }
 
-fn completion_key_mismatch_anomaly(
+fn completion_key_mismatch_kind(
     token: OpToken,
-    raw: RawCompletion,
-    mismatch_raw: RawCompletion,
     view: CheckedSlotView<'_, IocpSlotSpec>,
-) -> CompletionAnomaly {
+) -> CompletionAnomalyKind {
     match view {
         CheckedSlotView::Valid(slot) => {
             let snapshot = match slot {
@@ -369,41 +372,26 @@ fn completion_key_mismatch_anomaly(
                 SlotView::InFlightWaiting(slot) => slot.snapshot(),
                 SlotView::InFlightOrphaned(slot) => slot.snapshot(),
             };
-            CompletionAnomaly::completion_key_mismatch(
-                raw.token,
+            CompletionAnomalyKind::completion_key_mismatch(
                 snapshot.index,
                 snapshot.generation,
                 snapshot.state,
             )
-            .with_slot_snapshot(snapshot)
-            .with_raw_completion(mismatch_raw)
         }
         CheckedSlotView::Missing {
             index,
             expected_generation,
-        } => CompletionAnomaly::unknown_slot(mismatch_raw.token, index, expected_generation)
-            .with_raw_completion(mismatch_raw),
-        CheckedSlotView::Empty(snapshot) => CompletionAnomaly::non_active(
-            mismatch_raw.token,
-            snapshot.index,
-            token.generation(),
-            snapshot.state,
-        )
-        .with_slot_snapshot(snapshot)
-        .with_raw_completion(mismatch_raw),
-        CheckedSlotView::Stale(snapshot) => CompletionAnomaly::stale(
-            mismatch_raw.token,
+        } => CompletionAnomalyKind::unknown_slot(index, expected_generation),
+        CheckedSlotView::Empty(snapshot) => {
+            CompletionAnomalyKind::non_active(snapshot.index, token.generation(), snapshot.state)
+        }
+        CheckedSlotView::Stale(snapshot) => CompletionAnomalyKind::stale(
             snapshot.index,
             token.generation(),
             snapshot.generation,
             snapshot.state,
-        )
-        .with_slot_snapshot(snapshot)
-        .with_raw_completion(mismatch_raw),
-        CheckedSlotView::Corrupt(snapshot) => {
-            CompletionAnomaly::corrupt_slot_snapshot(mismatch_raw.token, snapshot)
-                .with_raw_completion(mismatch_raw)
-        }
+        ),
+        CheckedSlotView::Corrupt(snapshot) => CompletionAnomalyKind::corrupt_snapshot(snapshot),
     }
 }
 

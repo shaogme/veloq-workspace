@@ -695,6 +695,9 @@ mod tests {
             PollRecordResult::Unavailable(anomaly) => {
                 panic!("completion should be available: {anomaly:?}")
             }
+            PollRecordResult::UnavailableKind(kind) => {
+                panic!("completion should be available: {kind:?}")
+            }
         };
         assert_eq!(record.event.completion_token(), completion_token);
         assert_eq!(record.payload, ());

@@ -12,7 +12,7 @@ mod token;
 mod types;
 
 pub use cancel::{
-    CancelMode, CancelRequest, CancelSubmitOutcome, CancelTargetGoneReason, cancel_target_anomaly,
+    CancelMode, CancelRequest, CancelSubmitOutcome, CancelTargetGoneReason, cancel_target_kind,
 };
 pub use event::{
     CompletionDispatch, CompletionEnvelope, CompletionEvent, CompletionIdentity,
@@ -36,10 +36,11 @@ pub use token::{
     OpTokenError, SubmitTokenContext,
 };
 pub use types::{
-    CompletionAnomaly, CompletionAnomalyReason, CompletionBackend, CompletionCleanup,
-    CompletionCleanupGuard, CompletionMutationOutcome, CompletionRaw, DriverCompletionDiagnostics,
+    AnomalyAttach, AnomalyOutcome, BackendSlotRef, CompletionAnomaly, CompletionAnomalyKind,
+    CompletionAnomalyReason, CompletionBackend, CompletionCleanup, CompletionCleanupGuard,
+    CompletionMutationOutcome, CompletionRaw, ControlAnomalyReason, DriverCompletionDiagnostics,
     DriverCompletionDiagnosticsBackend, DriverCompletionDiagnosticsSnapshot,
-    RecordCompletionOutcome, RecordCompletionResult,
+    RecordCompletionOutcome, RecordCompletionResult, SlotIssueReason,
 };
 
 pub trait CompletionValue: Send {
@@ -69,7 +70,7 @@ impl CompletionValue for usize {
     }
 }
 
-use event::{dispatch_envelope, unknown_completion_anomaly};
+use event::{dispatch_envelope, unknown_completion_kind};
 use packet::{run_completion_cleanup, run_rejected_cleanup};
 use routing::{
     finalize_corrupt_checked, finalize_orphaned_checked, finalize_waiting_checked,

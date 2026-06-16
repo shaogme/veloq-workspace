@@ -10,7 +10,7 @@ use tracing::trace;
 use crate::{
     DriverCoreError, DriverError, DriverReport, DriverResult,
     driver::{
-        CancelRequest, CompletionAccess, CompletionAnomaly, CompletionAnomalyReason,
+        AnomalyAttach, CancelRequest, CompletionAccess, CompletionAnomaly, CompletionAnomalyReason,
         CompletionRecord, CompletionToken, CompletionValue, Driver, DriverSubmitResult, OpToken,
         PlatformOp, PollRecordResult, RemoteCancelSender, RemoteWaker, SharedCompletionTable,
         SubmitStatus,
@@ -267,6 +267,14 @@ where
             Poll::Ready(
                 OpResult::<T::Output, Spec::Error, T::Completion>::ResourceLost(
                     completion_anomaly_error(anomaly),
+                ),
+            )
+        }
+        PollRecordResult::UnavailableKind(kind) => {
+            let attach = AnomalyAttach::from_op_token(token);
+            Poll::Ready(
+                OpResult::<T::Output, Spec::Error, T::Completion>::ResourceLost(
+                    completion_anomaly_error(kind.materialize(attach)),
                 ),
             )
         }

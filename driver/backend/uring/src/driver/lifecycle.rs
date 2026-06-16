@@ -10,9 +10,9 @@ use diagweave::prelude::*;
 use io_uring::opcode;
 use tracing::{debug, trace};
 use veloq_driver_core::driver::{
-    CancelCompletionId, CancelMode, CancelRequest, CancelSubmitOutcome, CancelTargetGoneReason,
-    CompletionToken, OpToken, SyntheticCompletionSource, UserCompletionEvent,
-    cancel_target_anomaly,
+    AnomalyAttach, CancelCompletionId, CancelMode, CancelRequest, CancelSubmitOutcome,
+    CancelTargetGoneReason, CompletionToken, OpToken, SyntheticCompletionSource,
+    UserCompletionEvent, cancel_target_kind,
 };
 use veloq_wheel::TaskId;
 
@@ -169,10 +169,10 @@ impl<'a> UringDriver<'a> {
             | CheckedSlotView::Empty(_)
             | CheckedSlotView::Stale(_)
             | CheckedSlotView::Corrupt(_)) => {
-                let (reason, anomaly) =
-                    cancel_target_anomaly(COMP_BACKEND_URING, token, -libc::ECANCELED, 0, view);
+                let (reason, kind) = cancel_target_kind(token, view);
                 self.record_cancel_target_gone(reason);
-                let _ = self.accept_completion_anomaly(anomaly);
+                let attach = AnomalyAttach::from_op_token(token);
+                let _ = self.accept_completion_anomaly_kind(kind, attach);
                 debug!(
                     user_data,
                     generation,
@@ -198,15 +198,13 @@ impl<'a> UringDriver<'a> {
                     | CheckedSlotView::Stale(_)
                     | CheckedSlotView::Corrupt(_) => {
                         self.pending_cancellations.pop_front();
-                        let (reason, anomaly) = cancel_target_anomaly(
-                            COMP_BACKEND_URING,
+                        let (reason, kind) = cancel_target_kind(
                             request.target,
-                            -libc::ECANCELED,
-                            0,
                             self.ops.checked_slot_view(request.target),
                         );
                         self.record_cancel_target_gone(reason);
-                        let _ = self.accept_completion_anomaly(anomaly);
+                        let attach = AnomalyAttach::from_op_token(request.target);
+                        let _ = self.accept_completion_anomaly_kind(kind, attach);
                         continue;
                     }
                 }

@@ -148,7 +148,9 @@ fn test_completion_table_loom() {
                         CompletionToken::user(token)
                     )
                 }
-                PollRecordResult::Pending | PollRecordResult::Unavailable(_) => {
+                PollRecordResult::Pending
+                | PollRecordResult::Unavailable(_)
+                | PollRecordResult::UnavailableKind(_) => {
                     table_cloned.mark_orphaned(token);
                 }
             }
@@ -202,6 +204,9 @@ fn test_fast_completion_then_waiting_take_loom() {
             PollRecordResult::Unavailable(anomaly) => {
                 panic!("unexpected unavailable completion: {anomaly:?}")
             }
+            PollRecordResult::UnavailableKind(kind) => {
+                panic!("unexpected unavailable completion kind: {kind:?}")
+            }
         }
 
         assert_eq!(table.debug_get_state(0), CELL_STATE_IDLE);
@@ -218,12 +223,12 @@ fn test_stale_after_generation_advance_loom() {
         let _ = table.try_take_record(token_g1);
 
         match table.try_take_record(token_g1) {
-            PollRecordResult::Unavailable(anomaly)
-                if anomaly.reason() == CompletionAnomalyReason::StaleGeneration => {}
+            PollRecordResult::UnavailableKind(kind)
+                if kind.reason() == CompletionAnomalyReason::StaleGeneration => {}
             PollRecordResult::Ready(_) => panic!("old generation must not become ready"),
             PollRecordResult::Pending => panic!("old generation must be stale"),
             PollRecordResult::Unavailable(anomaly) => {
-                panic!("old generation should be stale, got {anomaly:?}")
+                panic!("old generation should be stale kind, got materialized {anomaly:?}")
             }
         }
     });

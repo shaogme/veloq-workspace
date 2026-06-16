@@ -1,8 +1,8 @@
 use veloq_driver_core::{
     driver::{
-        CancelMode, CancelRequest, CancelSubmitOutcome, CancelTargetGoneReason, CompletionAnomaly,
-        CompletionToken, OpToken, RawCompletion, SyntheticCompletionSource, UserCompletionEvent,
-        cancel_target_anomaly,
+        AnomalyAttach, CancelMode, CancelRequest, CancelSubmitOutcome, CancelTargetGoneReason,
+        CompletionAnomalyKind, CompletionToken, OpToken, RawCompletion, SyntheticCompletionSource,
+        UserCompletionEvent, cancel_target_kind,
     },
     slot::{CheckedSlotView, SlotRegistryExt, SlotView},
 };
@@ -98,19 +98,19 @@ impl<'a> IocpDriver<'a> {
                     | CheckedSlotView::Stale(_)
                     | CheckedSlotView::Valid(_) => None,
                 };
-                let (reason, anomaly) = cancel_target_anomaly(
-                    COMP_BACKEND_IOCP,
-                    token,
-                    -(ERROR_OPERATION_ABORTED as i32),
-                    0,
-                    view,
-                );
+                let (reason, kind) = cancel_target_kind(token, view);
                 if let Some(index) = corrupt_index {
                     self.release_socket_inflight_for_op(index)?;
                     self.drain_deferred_socket_cleanup();
                 }
                 self.record_cancel_target_gone(reason);
-                let _ = self.accept_completion_anomaly(anomaly)?;
+                let attach = AnomalyAttach::from_raw_completion(RawCompletion::new(
+                    COMP_BACKEND_IOCP,
+                    CompletionToken::user(token),
+                    -(ERROR_OPERATION_ABORTED as i32),
+                    0,
+                ));
+                let _ = self.accept_completion_anomaly(kind, attach)?;
                 Ok(CancelSubmitOutcome::TargetGone { reason })
             }
         }
@@ -144,8 +144,8 @@ impl<'a> IocpDriver<'a> {
                 self.completion_diagnostics
                     .backend()
                     .inc_cancel_ack_not_found();
-                if let Some(anomaly) = self.record_cancel_not_found_if_target_active(token)? {
-                    return Ok(CancelSubmitOutcome::DiagnosticOnly { anomaly });
+                if let Some(kind) = self.record_cancel_not_found_if_target_active(token)? {
+                    return Ok(CancelSubmitOutcome::DiagnosticOnly { kind });
                 }
                 self.record_cancel_target_gone(CancelTargetGoneReason::Missing);
                 Ok(CancelSubmitOutcome::target_missing())
@@ -168,7 +168,7 @@ impl<'a> IocpDriver<'a> {
     fn record_cancel_not_found_if_target_active(
         &mut self,
         token: OpToken,
-    ) -> IocpResult<Option<CompletionAnomaly>> {
+    ) -> IocpResult<Option<CompletionAnomalyKind>> {
         let active_target = match self.ops.checked_slot_view(token) {
             CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) => Some(slot.snapshot()),
             CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot)) => Some(slot.snapshot()),
@@ -188,15 +188,14 @@ impl<'a> IocpDriver<'a> {
             -(ERROR_NOT_FOUND as i32),
             0,
         );
-        let anomaly = CompletionAnomaly::cancel_ack_target_still_active(
-            raw.token,
+        let kind = CompletionAnomalyKind::cancel_ack_target_still_active(
             snapshot.index,
             snapshot.generation,
             snapshot.state,
-        )
-        .with_raw_completion(raw);
-        let _ = self.accept_completion_anomaly(anomaly)?;
-        Ok(Some(anomaly))
+        );
+        let attach = AnomalyAttach::from_raw_completion(raw);
+        let _ = self.accept_completion_anomaly(kind, attach)?;
+        Ok(Some(kind))
     }
 
     fn record_cancel_target_gone(&self, reason: CancelTargetGoneReason) {

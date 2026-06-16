@@ -8,13 +8,13 @@ use crate::{
 };
 
 use super::{
-    CompletionAnomaly, CompletionAnomalyReason, CompletionBackend, CompletionCleanupGuard,
-    CompletionDispatch, CompletionEnvelope, CompletionPacket, DriverCompletionDiagnostics,
-    DriverCompletionDiagnosticsBackend, RawCompletion, RecordCompletionOutcome,
-    RecordCompletionResult, RoutedSlotCompletion, SharedCompletionTable, UserCompletionEvent,
-    dispatch_envelope, finalize_corrupt_checked, finalize_orphaned_checked,
+    AnomalyAttach, CompletionAnomalyKind, CompletionAnomalyReason, CompletionBackend,
+    CompletionCleanupGuard, CompletionDispatch, CompletionEnvelope, CompletionPacket,
+    DriverCompletionDiagnostics, DriverCompletionDiagnosticsBackend, RawCompletion,
+    RecordCompletionOutcome, RecordCompletionResult, RoutedSlotCompletion, SharedCompletionTable,
+    UserCompletionEvent, dispatch_envelope, finalize_corrupt_checked, finalize_orphaned_checked,
     finalize_waiting_checked, route_user_completion, run_completion_cleanup, run_rejected_cleanup,
-    unknown_completion_anomaly,
+    unknown_completion_kind,
 };
 
 pub type HookResult<Spec, T> = DriverResult<T, SlotError<Spec>>;
@@ -47,7 +47,10 @@ pub enum CompletionIngress<BackendIngress = ()> {
         source: SyntheticCompletionSource,
     },
     Backend(BackendIngress),
-    Anomaly(CompletionAnomaly),
+    Anomaly {
+        kind: CompletionAnomalyKind,
+        attach: AnomalyAttach,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -83,7 +86,7 @@ where
     },
     Lost {
         event: UserCompletionEvent,
-        loss_reason: CompletionAnomaly,
+        loss_kind: CompletionAnomalyKind,
         cleanup: CompletionCleanupGuard,
         effect: Effect,
     },
@@ -92,7 +95,8 @@ where
         effect: Effect,
     },
     Anomaly {
-        anomaly: CompletionAnomaly,
+        kind: CompletionAnomalyKind,
+        attach: AnomalyAttach,
         effect: Effect,
     },
     ControlHandled {
@@ -140,11 +144,12 @@ where
     fn complete_corrupt(
         &mut self,
         _event: UserCompletionEvent,
-        anomaly: CompletionAnomaly,
+        kind: CompletionAnomalyKind,
         _source: CompletionSource<'_, Self::BackendIngress>,
     ) -> HookResult<Spec, CompletionHookOutcome<Spec, Self::BackendEffect>> {
         Ok(CompletionHookOutcome::Anomaly {
-            anomaly,
+            kind,
+            attach: AnomalyAttach::from_raw_completion(_event.raw()),
             effect: Self::BackendEffect::default(),
         })
     }
@@ -320,8 +325,9 @@ where
                     finish_hook_outcome(self, table, diagnostics, hooks, outcome, None)
                 }
                 CompletionDispatch::Unknown { envelope } => {
-                    let anomaly = unknown_completion_anomaly(envelope);
-                    diagnostics.record_anomaly(&anomaly);
+                    let kind = unknown_completion_kind(envelope);
+                    let attach = AnomalyAttach::from_raw_completion(envelope.raw);
+                    diagnostics.record_anomaly_kind(kind, attach);
                     Ok(CompletionFlowOutcome::anomaly())
                 }
             },
@@ -349,7 +355,9 @@ where
                     }
                 }
             }
-            CompletionIngress::Anomaly(anomaly) => Ok(finish_anomaly(self, diagnostics, anomaly)),
+            CompletionIngress::Anomaly { kind, attach } => {
+                Ok(finish_anomaly(self, diagnostics, kind, attach))
+            }
         }
     }
 }
@@ -413,8 +421,8 @@ where
                     Some(FinalizeAction::Orphaned(event)),
                 )
             }
-            RoutedSlotCompletion::Corrupt(anomaly) => {
-                let outcome = hooks.complete_corrupt(event, anomaly, source)?;
+            RoutedSlotCompletion::Corrupt(kind) => {
+                let outcome = hooks.complete_corrupt(event, kind, source)?;
                 finish_hook_outcome(
                     self,
                     table,
@@ -424,10 +432,10 @@ where
                     Some(FinalizeAction::CorruptFromEvent),
                 )
             }
-            RoutedSlotCompletion::Missing(anomaly)
-            | RoutedSlotCompletion::Empty(anomaly)
-            | RoutedSlotCompletion::Stale(anomaly) => {
-                let outcome = hooks.complete_corrupt(event, anomaly, source)?;
+            RoutedSlotCompletion::Missing(kind)
+            | RoutedSlotCompletion::Empty(kind)
+            | RoutedSlotCompletion::Stale(kind) => {
+                let outcome = hooks.complete_corrupt(event, kind, source)?;
                 finish_hook_outcome(self, table, diagnostics, hooks, outcome, None)
             }
         }
@@ -469,13 +477,13 @@ where
         }
         CompletionHookOutcome::Lost {
             event,
-            loss_reason,
+            loss_kind,
             cleanup,
             effect,
         } => {
             let record =
-                record_lost_completion::<Spec>(table, diagnostics, event, loss_reason, cleanup);
-            if let Some(snapshot) = loss_reason.slot_snapshot() {
+                record_lost_completion::<Spec>(table, diagnostics, event, loss_kind, cleanup);
+            if let Some(snapshot) = loss_kind.slot_snapshot() {
                 finish_corrupt(registry, diagnostics, snapshot, event.raw());
             }
             hooks.finish_backend_effect(effect)?;
@@ -498,8 +506,12 @@ where
             hooks.finish_backend_effect(effect)?;
             Ok(CompletionFlowOutcome::orphan_cleaned())
         }
-        CompletionHookOutcome::Anomaly { anomaly, effect } => {
-            let progress = finish_anomaly(registry, diagnostics, anomaly);
+        CompletionHookOutcome::Anomaly {
+            kind,
+            attach,
+            effect,
+        } => {
+            let progress = finish_anomaly(registry, diagnostics, kind, attach);
             hooks.finish_backend_effect(effect)?;
             Ok(progress)
         }
@@ -539,7 +551,7 @@ fn record_lost_completion<Spec>(
     table: &SharedCompletionTable<Spec>,
     diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
     event: UserCompletionEvent,
-    anomaly: CompletionAnomaly,
+    kind: CompletionAnomalyKind,
     cleanup: CompletionCleanupGuard,
 ) -> RecordCompletionOutcome
 where
@@ -552,7 +564,7 @@ where
     record_user_completion::<Spec>(
         table,
         diagnostics,
-        CompletionPacket::<Spec>::lost(event, anomaly, cleanup),
+        CompletionPacket::<Spec>::lost(event, kind, cleanup),
     )
 }
 
@@ -623,31 +635,30 @@ fn finish_corrupt<Spec>(
 fn finish_anomaly<Spec>(
     registry: &mut OpRegistry<Spec>,
     diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
-    anomaly: CompletionAnomaly,
+    kind: CompletionAnomalyKind,
+    attach: AnomalyAttach,
 ) -> CompletionFlowOutcome
 where
     Spec: SlotSpec,
     SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
 {
-    diagnostics.record_anomaly(&anomaly);
-    if should_finalize_corrupt_anomaly(&anomaly)
-        && let Some(snapshot) = anomaly.slot_snapshot()
+    diagnostics.record_anomaly_kind(kind, attach);
+    if should_finalize_corrupt_kind(kind)
+        && let Some(snapshot) = kind.slot_snapshot()
     {
-        let raw = RawCompletion::new(
-            anomaly.backend().unwrap_or(CompletionBackend::Core),
-            anomaly.token(),
-            anomaly.raw_result().unwrap_or(0),
-            anomaly.flags().unwrap_or(0),
-        );
+        let raw = attach
+            .raw
+            .map(|raw| RawCompletion::new(raw.backend, attach.token, raw.res, raw.flags))
+            .unwrap_or_else(|| RawCompletion::new(CompletionBackend::Core, attach.token, 0, 0));
         finish_corrupt(registry, diagnostics, snapshot, raw);
     }
     CompletionFlowOutcome::anomaly()
 }
 
 #[inline]
-fn should_finalize_corrupt_anomaly(anomaly: &CompletionAnomaly) -> bool {
+fn should_finalize_corrupt_kind(kind: CompletionAnomalyKind) -> bool {
     matches!(
-        anomaly.reason(),
+        kind.reason(),
         CompletionAnomalyReason::OpMissing
             | CompletionAnomalyReason::PayloadMissing
             | CompletionAnomalyReason::SlotCorruption
@@ -661,9 +672,6 @@ fn completion_progress_from_record(outcome: RecordCompletionOutcome) -> Completi
         RecordCompletionOutcome::RecordedUser => CompletionFlowOutcome::user_completed(),
         RecordCompletionOutcome::RecordedLost => CompletionFlowOutcome::user_lost(),
         RecordCompletionOutcome::OrphanedDropped => CompletionFlowOutcome::orphan_cleaned(),
-        RecordCompletionOutcome::Missing(_)
-        | RecordCompletionOutcome::Stale(_)
-        | RecordCompletionOutcome::NonActive(_)
-        | RecordCompletionOutcome::Corrupt(_) => CompletionFlowOutcome::anomaly(),
+        RecordCompletionOutcome::Rejected(_) => CompletionFlowOutcome::anomaly(),
     }
 }

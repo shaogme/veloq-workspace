@@ -3,7 +3,7 @@
 use crate::{
     BufferRegistrationMode,
     config::SocketKey,
-    driver::IocpDriverCompletionDiagnostics,
+    driver::{IocpDriverCompletionDiagnostics, RIO_EVENT_TOKEN, completion::COMP_BACKEND_RIO},
     op::IocpUserPayload,
     rio::{
         ActorKey, RioState, SocketRuntimeState,
@@ -14,8 +14,7 @@ use crate::{
         runtime::{
             RioSocketActor,
             control_flow::{
-                rio_malformed_context_anomaly, rio_missing_context_anomaly,
-                rio_stale_context_anomaly,
+                rio_malformed_context_kind, rio_missing_context_kind, rio_stale_context_kind,
             },
             release_socket_inflight_token_from,
         },
@@ -31,6 +30,7 @@ use std::{
     time::{Duration, Instant},
 };
 use veloq_buf::NoopRegistrar;
+use veloq_driver_core::driver::AnomalyAttach;
 use windows_sys::Win32::Networking::WinSock::{RIO_CORRUPT_CQ, RIORESULT};
 
 const RIO_REAPER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -124,31 +124,28 @@ impl RioState {
                     release_socket_inflight_token_from(&mut self.socket_runtime, socket_inflight);
             }
             RioRequestContextDecode::Malformed { raw } => {
-                let anomaly = rio_malformed_context_anomaly(raw)
-                    .with_raw_result(rio_drain_raw_res(res))
-                    .with_flags(0);
-                self.diagnostics.record_anomaly(&anomaly);
+                self.diagnostics
+                    .record_anomaly_kind(rio_malformed_context_kind(raw), rio_drain_attach(res));
             }
             RioRequestContextDecode::Missing { id } => {
-                let anomaly =
-                    rio_missing_context_anomaly(res.RequestContext, id.index(), id.generation())
-                        .with_raw_result(rio_drain_raw_res(res))
-                        .with_flags(0);
-                self.diagnostics.record_anomaly(&anomaly);
+                self.diagnostics.record_anomaly_kind(
+                    rio_missing_context_kind(res.RequestContext, id.index(), id.generation()),
+                    rio_drain_attach(res),
+                );
             }
             RioRequestContextDecode::Stale {
                 id,
                 actual_generation,
             } => {
-                let anomaly = rio_stale_context_anomaly(
-                    res.RequestContext,
-                    id.index(),
-                    id.generation(),
-                    actual_generation,
-                )
-                .with_raw_result(rio_drain_raw_res(res))
-                .with_flags(0);
-                self.diagnostics.record_anomaly(&anomaly);
+                self.diagnostics.record_anomaly_kind(
+                    rio_stale_context_kind(
+                        res.RequestContext,
+                        id.index(),
+                        id.generation(),
+                        actual_generation,
+                    ),
+                    rio_drain_attach(res),
+                );
             }
         }
         if self.outstanding_count > 0 {
@@ -258,6 +255,16 @@ impl RioState {
     pub(crate) fn defer_payloads(&mut self, payloads: Vec<IocpUserPayload>) {
         self.deferred_payloads.extend(payloads);
     }
+}
+
+#[inline]
+fn rio_drain_attach(res: &RIORESULT) -> AnomalyAttach {
+    AnomalyAttach::from_raw_completion(veloq_driver_core::driver::RawCompletion::new(
+        COMP_BACKEND_RIO,
+        RIO_EVENT_TOKEN,
+        rio_drain_raw_res(res),
+        0,
+    ))
 }
 
 #[inline]

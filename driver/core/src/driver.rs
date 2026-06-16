@@ -402,7 +402,7 @@ impl CancelDrainOutcome {
                     self.target_corrupt = self.target_corrupt.saturating_add(1);
                 }
             },
-            CancelSubmitOutcome::DiagnosticOnly { anomaly: _ } => {
+            CancelSubmitOutcome::DiagnosticOnly { kind: _ } => {
                 self.diagnostic_only = self.diagnostic_only.saturating_add(1);
             }
             CancelSubmitOutcome::NoBackendHandle => {

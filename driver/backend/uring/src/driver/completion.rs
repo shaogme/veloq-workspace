@@ -17,7 +17,7 @@ use crate::{
 use veloq_driver_core::{
     IoFd,
     driver::{
-        CancelCompletionId, CancelMode, CompletionAnomaly, CompletionBackend,
+        AnomalyAttach, CancelCompletionId, CancelMode, CompletionAnomalyKind, CompletionBackend,
         CompletionBackendHooks, CompletionCleanupGuard, CompletionControl, CompletionEnvelope,
         CompletionFlowExt, CompletionFlowOutcome, CompletionHookOutcome, CompletionIngress,
         CompletionSource, CompletionToken, DriverCompletionDiagnostics, OpToken, PlatformOp,
@@ -160,8 +160,6 @@ impl<'a> UringCompletionHooks<'a> {
     ) -> CompletionHookOutcome<UringSlotSpec, UringBackendEffect> {
         let request = self.pending_cancel_cqes.remove(&cancel_id);
         let Some(request) = request else {
-            let anomaly =
-                CompletionAnomaly::control_completion_untracked(raw.token).with_raw_completion(raw);
             debug!(
                 cancel_id = cancel_id.raw(),
                 result = raw.res,
@@ -170,7 +168,8 @@ impl<'a> UringCompletionHooks<'a> {
                 "async cancel completion had no pending request"
             );
             return CompletionHookOutcome::Anomaly {
-                anomaly,
+                kind: CompletionAnomalyKind::control_completion_untracked(),
+                attach: AnomalyAttach::from_raw_completion(raw),
                 effect: UringBackendEffect::None,
             };
         };
@@ -432,12 +431,13 @@ impl<'a> UringDriver<'a> {
         self.accept_completion_ingress(CompletionIngress::Synthetic { event, source }, synthetic)
     }
 
-    pub(crate) fn accept_completion_anomaly(
+    pub(crate) fn accept_completion_anomaly_kind(
         &mut self,
-        anomaly: CompletionAnomaly,
+        kind: CompletionAnomalyKind,
+        attach: AnomalyAttach,
     ) -> UringResult<CompletionFlowOutcome> {
         self.accept_completion_ingress(
-            CompletionIngress::Anomaly(anomaly),
+            CompletionIngress::Anomaly { kind, attach },
             UringSyntheticCompletion::None,
         )
     }
@@ -527,14 +527,13 @@ impl<'a> UringDriver<'a> {
             raw.res,
             raw.flags,
         );
-        let anomaly = CompletionAnomaly::cancel_ack_target_still_active(
-            target_raw.token,
+        let kind = CompletionAnomalyKind::cancel_ack_target_still_active(
             snapshot.index,
             snapshot.generation,
             snapshot.state,
-        )
-        .with_raw_completion(target_raw);
-        let _ = self.accept_completion_anomaly(anomaly)?;
+        );
+        let attach = AnomalyAttach::from_raw_completion(target_raw);
+        let _ = self.accept_completion_anomaly_kind(kind, attach)?;
         debug!(
             cancel_id = cancel_id.raw(),
             request = ?request,
@@ -609,11 +608,7 @@ fn complete_timer_waiting_slot(
         drop(detail);
         return CompletionHookOutcome::Lost {
             event,
-            loss_reason: CompletionAnomaly::corrupt_slot_snapshot(
-                event.completion_token(),
-                snapshot,
-            )
-            .with_raw_completion(event.raw()),
+            loss_kind: CompletionAnomalyKind::corrupt_snapshot(snapshot),
             cleanup: CompletionCleanupGuard::default(),
             effect: UringBackendEffect::None,
         };
@@ -653,11 +648,7 @@ fn complete_submission_failure_slot(
         drop(detail);
         return CompletionHookOutcome::Lost {
             event,
-            loss_reason: CompletionAnomaly::corrupt_slot_snapshot(
-                event.completion_token(),
-                snapshot,
-            )
-            .with_raw_completion(event.raw()),
+            loss_kind: CompletionAnomalyKind::corrupt_snapshot(snapshot),
             cleanup,
             effect: UringBackendEffect::None,
         };
@@ -704,11 +695,7 @@ fn complete_local_cancel_slot(
             drop(detail);
             CompletionHookOutcome::Lost {
                 event,
-                loss_reason: CompletionAnomaly::corrupt_slot_snapshot(
-                    event.completion_token(),
-                    snapshot,
-                )
-                .with_raw_completion(event.raw()),
+                loss_kind: CompletionAnomalyKind::corrupt_snapshot(snapshot),
                 cleanup,
                 effect: UringBackendEffect::None,
             }
@@ -730,19 +717,17 @@ fn lost_waiting_slot_completion(
 ) -> CompletionHookOutcome<UringSlotSpec, UringBackendEffect> {
     let (snapshot, cleanup) = slot.finish_lost(raw.res);
     let Some(token) = lost_completion_event_token(snapshot, raw) else {
-        let anomaly =
-            CompletionAnomaly::corrupt_slot_snapshot(raw.token, snapshot).with_raw_completion(raw);
         drop(cleanup);
         return CompletionHookOutcome::Anomaly {
-            anomaly,
+            kind: CompletionAnomalyKind::corrupt_snapshot(snapshot),
+            attach: AnomalyAttach::from_raw_completion(raw),
             effect: UringBackendEffect::None,
         };
     };
     let event = UserCompletionEvent::from_parts(COMP_BACKEND_URING, token, raw.res, raw.flags);
     CompletionHookOutcome::Lost {
         event,
-        loss_reason: CompletionAnomaly::corrupt_slot_snapshot(raw.token, snapshot)
-            .with_raw_completion(raw),
+        loss_kind: CompletionAnomalyKind::corrupt_snapshot(snapshot),
         cleanup,
         effect: UringBackendEffect::None,
     }
@@ -755,11 +740,10 @@ fn lost_completed_slot_completion(
 ) -> CompletionHookOutcome<UringSlotSpec, UringBackendEffect> {
     let snapshot = slot.snapshot();
     let Some(token) = lost_completion_event_token(snapshot, raw) else {
-        let anomaly =
-            CompletionAnomaly::corrupt_slot_snapshot(raw.token, snapshot).with_raw_completion(raw);
         drop(cleanup);
         return CompletionHookOutcome::Anomaly {
-            anomaly,
+            kind: CompletionAnomalyKind::corrupt_snapshot(snapshot),
+            attach: AnomalyAttach::from_raw_completion(raw),
             effect: UringBackendEffect::None,
         };
     };
@@ -770,8 +754,7 @@ fn lost_completed_slot_completion(
     drop(detail);
     CompletionHookOutcome::Lost {
         event,
-        loss_reason: CompletionAnomaly::corrupt_slot_snapshot(raw.token, snapshot)
-            .with_raw_completion(raw),
+        loss_kind: CompletionAnomalyKind::corrupt_snapshot(snapshot),
         cleanup,
         effect: UringBackendEffect::None,
     }
@@ -887,9 +870,9 @@ mod tests {
         assert!(matches!(
             outcome,
             CompletionHookOutcome::Anomaly {
-                anomaly,
+                kind,
                 ..
-            } if anomaly.reason() == CompletionAnomalyReason::ControlCompletionUntracked
+            } if kind.reason() == CompletionAnomalyReason::ControlCompletionUntracked
         ));
     }
 }

@@ -9,7 +9,7 @@ use diagweave::prelude::*;
 use veloq_blocking::{BlockingTask, get_blocking_pool};
 use veloq_driver_core::{
     driver::{
-        CompletionAnomaly, CompletionBackendHooks, CompletionControl, CompletionFlowExt,
+        CompletionAnomalyKind, CompletionBackendHooks, CompletionControl, CompletionFlowExt,
         CompletionHookOutcome, CompletionIngress, CompletionSource, CompletionToken,
         DriverSubmitResult, OpToken, SharedCompletionTable, SubmitStatus,
         SyntheticCompletionSource, UserCompletionEvent,
@@ -114,11 +114,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
             drop(detail);
             CompletionHookOutcome::Lost {
                 event,
-                loss_reason: CompletionAnomaly::corrupt_slot_snapshot(
-                    event.completion_token(),
-                    snapshot,
-                )
-                .with_raw_completion(event.raw()),
+                loss_kind: CompletionAnomalyKind::corrupt_snapshot(snapshot),
                 cleanup,
                 effect: (),
             }

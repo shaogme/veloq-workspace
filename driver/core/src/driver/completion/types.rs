@@ -1,8 +1,9 @@
 mod anomaly;
 
 pub use anomaly::{
-    CompletionAnomaly, CompletionAnomalyReason, CompletionBackend, CompletionMutationOutcome,
-    CompletionRaw,
+    AnomalyAttach, AnomalyOutcome, BackendSlotRef, CompletionAnomaly, CompletionAnomalyKind,
+    CompletionAnomalyReason, CompletionBackend, CompletionMutationOutcome, CompletionRaw,
+    ControlAnomalyReason, SlotIssueReason,
 };
 
 use crate::{DriverCoreError, DriverResult, slot};
@@ -92,10 +93,17 @@ pub enum RecordCompletionOutcome {
     RecordedUser,
     RecordedLost,
     OrphanedDropped,
-    Missing(CompletionAnomaly),
-    Stale(CompletionAnomaly),
-    NonActive(CompletionAnomaly),
-    Corrupt(CompletionAnomaly),
+    Rejected(AnomalyOutcome),
+}
+
+impl RecordCompletionOutcome {
+    #[inline]
+    pub fn anomaly_outcome(&self) -> Option<AnomalyOutcome> {
+        match self {
+            Self::RecordedUser | Self::RecordedLost | Self::OrphanedDropped => None,
+            Self::Rejected(outcome) => Some(*outcome),
+        }
+    }
 }
 
 pub enum RecordCompletionResult<Spec: slot::SlotSpec> {
@@ -301,6 +309,17 @@ where
     }
 
     #[inline]
+    pub fn record_anomaly_kind(&self, kind: CompletionAnomalyKind, attach: AnomalyAttach) {
+        let anomaly = kind.materialize(attach);
+        self.record_anomaly(&anomaly);
+    }
+
+    #[inline]
+    pub fn record_anomaly_outcome(&self, outcome: AnomalyOutcome, attach: AnomalyAttach) {
+        self.record_anomaly_kind(outcome.kind(), attach);
+    }
+
+    #[inline]
     pub fn record_completion_outcome(&self, outcome: &RecordCompletionOutcome) {
         if !matches!(
             outcome,
@@ -312,10 +331,7 @@ where
             RecordCompletionOutcome::RecordedUser => self.inc_user_completed(),
             RecordCompletionOutcome::RecordedLost => self.inc_user_lost(),
             RecordCompletionOutcome::OrphanedDropped => self.inc_user_orphan_completed(),
-            RecordCompletionOutcome::Missing(anomaly)
-            | RecordCompletionOutcome::Stale(anomaly)
-            | RecordCompletionOutcome::NonActive(anomaly)
-            | RecordCompletionOutcome::Corrupt(anomaly) => self.record_anomaly(anomaly),
+            RecordCompletionOutcome::Rejected(_) => {}
         }
     }
 }
