@@ -124,3 +124,112 @@ CROSS_SKIP_AUTO_UPDATE=1 cross test --target x86_64-pc-windows-gnu
 - 不要为跨平台编译引入包装/存根入口文件；平台后端 crate 保持其目标平台原生形态。
 
 如任一检查未通过，必须先修复再提交。
+
+## Git 提交信息 (Commit Message) 规范与指南
+
+本指南旨在规范项目中 Git 提交信息（Commit Message）的格式和内容要求，以便于生成清晰的变更历史、简化代码审查过程以及维护高质量的系统演进记录。
+
+---
+
+### 1. 提交信息结构
+
+每次提交信息应当包含一个简短的**标题（Header）**，以及（对于复杂或重大的变更）详细的**正文（Body）**。
+
+#### 1.1 标题格式 (Header Format)
+
+标题必须控制在单行内，推荐格式如下：
+```text
+<type>(<scope>): <subject>
+```
+
+- **`<type>`（类型）**：描述本次变更的性质，必须使用小写。常用类型包括：
+  - `feat`: 新增功能（Feature）。
+  - `fix`: 修复 Bug。
+  - `refactor`: 代码重构（既不修复 Bug 也不添加新功能，如修改能见度、代码结构优化等）。
+  - `perf`: 性能提升（Performance）。
+  - `style`: 格式化、缺失分号等不影响代码运行的变更。
+  - `test`: 新增或修改测试代码。
+  - `chore`: 构建过程或辅助工具、库的变动。
+- **`<scope>`（范围）**：可选，描述本次变更影响的子系统或模块，必须使用小写。例如：
+  - `sync`: 异步同步原语（如通道、队列）。
+  - `runtime`: 运行时底层设计（如调度器、工作线程）。
+  - `scope`: 结构化并发作用域（Scope）。
+  - `completion`: 完成队列与异常传播（Completion Anomaly）。
+  - `driver` / `driver-core`: 驱动层与底层 I/O 后端（如 IOCP、io_uring）。
+- **`<subject>`（主题说明）**：简短描述本次变更的核心内容。
+  - 使用祈使句/现在时（例如，使用 `unify` 而不是 `unified`，使用 `slim` 而不是 `slimmed`）。
+  - 结尾不加句号。
+
+*示例：*
+- `refactor(sync): unify queue abstractions and simplify mpsc bounded strategy`
+- `perf(scope): avoid unnecessary heap allocation in RoutedJobCell::take`
+- `feat(runtime): redesign select! macro to support fair and biased polling`
+
+---
+
+### 2. 正文格式 (Body Format)
+
+对于重构（`refactor`）、性能优化（`perf`）、新特性（`feat`）等复杂改动，**必须**在标题下方空一行后写入详细的正文，清晰说明改动的背景、设计决策、API 变动以及兼容性影响。
+
+正文应当按以下结构或内容进行组织：
+
+#### 2.1 背景与动机 (Motivation & Context)
+简要描述为什么要进行此改动。例如，某个结构体在热路径上占用内存过大（如 `CompletionAnomaly`），导致频繁拷贝造成栈空间浪费或性能瓶颈。
+
+#### 2.2 核心设计与修改内容 (Core Design & Key Changes)
+清晰列出修改的要点，例如：
+- 引入了哪些新的轻量级类型（如 `CompletionAnomalyKind`）来替代胖结构体。
+- 变更了哪些核心逻辑或边界策略。
+- 调整了哪些方法或类型的可见性（例如将内部结构调整为 `pub(crate)`）。
+
+#### 2.3 接口变动与破坏性改动 (API Changes & Breaking Changes)
+如果变更会导致 API 不兼容，必须明确指出：
+- 哪些 API 方法被移除或重命名。
+- 参数或返回值类型的改变。
+- 依赖项的更新。
+
+#### 2.4 测试与后端更新 (Test & Backend Updates)
+描述配套修改了哪些后端实现（如 `iocp`、`uring` 等）或单元测试、Loom 并发测试，以确保整体编译和测试的通过。
+
+---
+
+### 3. 良好实践与典型示例
+
+#### 典型示例 1：核心重构与类型轻量化
+```text
+refactor(driver): slim completion anomaly propagation with CompletionAnomalyKind
+
+Introduce a lightweight propagation layer for completion anomalies so hot
+paths (mutation, table, routing, poll) carry ~24–40 B kinds instead of full
+~72 B CompletionAnomaly values. Full anomalies are materialized only at
+explicit boundaries where token/raw context is available.
+
+Core type changes (driver/core):
+- Add CompletionAnomalyKind, AnomalyAttach, AnomalyOutcome, ControlAnomalyReason,
+  SlotIssueReason, and BackendSlotRef.
+...
+```
+
+#### 典型示例 2：可见性收紧
+```text
+refactor(runtime): restrict visibility of internal types and methods to crate-local
+
+Restrict the visibility of internal runtime and task subsystem methods and
+structures to `pub(crate)` to improve encapsulation and modularity within the
+`veloq-runtime` crate.
+
+- **scope/completion.rs**: Change GenericScopeCompletion methods to pub(crate).
+- **task/header.rs**: Restrict internal state constants to pub(crate).
+...
+```
+
+#### 典型示例 3：错误传播改造（API 破坏性改动）
+```text
+refact: change `Runtime::block_on` to return `Result` and propagate errors
+
+Refactors `veloq-runtime`'s `Runtime::block_on` to return a `Result<R>` instead
+of returning the result directly (panicking on internal initialization failures).
+This allows propagating thread-local storage (TLS) setup failures, worker factory
+taking errors, and deque exhaustion errors gracefully back to the caller.
+...
+```
