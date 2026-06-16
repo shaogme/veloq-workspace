@@ -16,13 +16,14 @@ use std::{
 };
 use veloq_buf::FixedBuf;
 use veloq_driver_native::{
-    RawHandle, RawHandleKind, Socket,
+    RawHandle, RawHandleKind,
     driver::Driver,
     op::{
         DetachedSubmitter, Fallocate, FileSyncFileRangeRaw, Fsync, IoFd, LocalSubmitter, Op,
         OpSubmitter, ReadFixed, WriteFixed,
     },
 };
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::CloseHandle;
 
 #[cfg(not(unix))]
@@ -47,6 +48,7 @@ fn close_raw_handle(raw: RawHandle) {
             CloseHandle(raw.raw().as_handle());
         },
         RawHandleKind::Socket => {
+            use veloq_driver_native::Socket;
             let _ = unsafe { Socket::from_raw(raw.raw()) };
         }
     }

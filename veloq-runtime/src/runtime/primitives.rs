@@ -21,14 +21,14 @@ use crate::{
 // --- 系统级同步原语 (WaitOnAddress / Futex) ---
 
 pub(crate) mod sys {
-    use std::{ffi::c_void, sync::atomic::AtomicU32, time::Duration};
+    use std::{sync::atomic::AtomicU32, time::Duration};
 
     #[cfg(not(any(windows, target_os = "linux")))]
     use std::thread;
 
     #[cfg(windows)]
     mod win {
-        use super::c_void;
+        use std::ffi::c_void;
 
         #[link(name = "Synchronization")]
         unsafe extern "system" {
