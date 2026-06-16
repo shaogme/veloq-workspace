@@ -520,6 +520,79 @@ impl CompletionAnomalyKind {
     }
 
     #[inline]
+    pub fn expected_generation(self) -> Option<u32> {
+        match self {
+            Self::UnknownSlot { generation, .. } => Some(generation),
+            Self::Stale { expected, .. } => Some(expected),
+            Self::NonActive { generation, .. } => Some(generation),
+            Self::Corrupt { snapshot } => Some(snapshot.generation),
+            Self::SlotIssue { generation, .. } => Some(generation),
+            Self::BackendSpecific {
+                slot: Some(slot), ..
+            } => Some(slot.expected_generation),
+            Self::Control { .. } | Self::BackendContext { .. } => None,
+            Self::BackendSpecific { slot: None, .. } => None,
+        }
+    }
+
+    #[inline]
+    pub fn actual_generation(self) -> Option<u32> {
+        match self {
+            Self::Stale { actual, .. } => Some(actual),
+            Self::NonActive { generation, .. } => Some(generation),
+            Self::Corrupt { snapshot } => Some(snapshot.generation),
+            Self::SlotIssue { generation, .. } => Some(generation),
+            Self::BackendSpecific {
+                slot: Some(slot), ..
+            } => slot.actual_generation,
+            Self::UnknownSlot { .. } | Self::Control { .. } | Self::BackendContext { .. } => None,
+            Self::BackendSpecific { slot: None, .. } => None,
+        }
+    }
+
+    #[inline]
+    pub fn state(self) -> Option<slot::SlotState> {
+        match self {
+            Self::Stale { state, .. }
+            | Self::NonActive { state, .. }
+            | Self::SlotIssue { state, .. } => Some(state),
+            Self::Corrupt { snapshot } => Some(snapshot.state),
+            Self::UnknownSlot { .. }
+            | Self::Control { .. }
+            | Self::BackendContext { .. }
+            | Self::BackendSpecific { .. } => None,
+        }
+    }
+
+    #[inline]
+    pub fn backend(self) -> Option<CompletionBackend> {
+        match self {
+            Self::BackendContext { backend, .. } | Self::BackendSpecific { backend, .. } => {
+                Some(backend)
+            }
+            Self::UnknownSlot { .. }
+            | Self::Stale { .. }
+            | Self::NonActive { .. }
+            | Self::Corrupt { .. }
+            | Self::SlotIssue { .. }
+            | Self::Control { .. } => None,
+        }
+    }
+
+    #[inline]
+    pub fn backend_context_value(self) -> Option<u64> {
+        match self {
+            Self::BackendContext {
+                backend_context, ..
+            }
+            | Self::BackendSpecific {
+                backend_context, ..
+            } => Some(backend_context),
+            _ => None,
+        }
+    }
+
+    #[inline]
     pub fn materialize(self, attach: AnomalyAttach) -> CompletionAnomaly {
         let token = attach.token;
         let raw = attach.raw;
@@ -1319,5 +1392,10 @@ mod tests {
     fn anomaly_outcome_is_compact() {
         assert!(size_of::<AnomalyOutcome>() <= 48);
         assert!(size_of::<CompletionMutationOutcome>() <= 48);
+    }
+
+    #[test]
+    fn unavailable_completion_attach_is_compact() {
+        assert!(size_of::<(CompletionAnomalyKind, AnomalyAttach)>() <= 56);
     }
 }

@@ -3,7 +3,7 @@ use std::{sync::Arc, task::Waker};
 use veloq_shim::atomic::Ordering;
 
 use super::{
-    AnomalyAttach, AnomalyOutcome, CompletionAnomaly, CompletionAnomalyKind, CompletionBackend,
+    AnomalyAttach, AnomalyOutcome, CompletionAnomalyKind, CompletionBackend,
     CompletionCleanupGuard, CompletionInput, CompletionPacket, CompletionRaw, CompletionRecord,
     CompletionWritePermit, DriverCompletionDiagnostics, DriverCompletionDiagnosticsBackend,
     OpToken, RecordCompletionOutcome, RecordCompletionResult, UserCompletionEvent,
@@ -16,10 +16,11 @@ pub type SharedCompletionTable<Spec> = Arc<dyn CompletionAccess<Spec>>;
 pub enum PollRecordResult<Spec: slot::SlotSpec> {
     /// Operation completed successfully or with an error.
     Ready(CompletionRecord<Spec>),
-    /// Operation completion became unavailable with a materialized anomaly.
-    Unavailable(CompletionAnomaly),
     /// Operation completion became unavailable; materialize at the poll boundary.
-    UnavailableKind(CompletionAnomalyKind),
+    Unavailable {
+        kind: CompletionAnomalyKind,
+        attach: AnomalyAttach,
+    },
     /// Operation is still in flight.
     Pending,
 }
@@ -180,7 +181,8 @@ fn run_discarded_record_cleanup<Spec: slot::SlotSpec>(
             let _ = run_completion_cleanup(diagnostics, &mut cleanup);
         }
         slot::CompletionData::Lost {
-            anomaly: _,
+            kind: _,
+            attach: _,
             mut cleanup,
         } => {
             let _ = run_completion_cleanup(diagnostics, &mut cleanup);
@@ -296,8 +298,8 @@ where
             }
         };
 
-        if let Some(anomaly) = packet.input.anomaly() {
-            self.diagnostics.record_anomaly(anomaly);
+        if let Some((kind, attach)) = packet.input.lost_kind() {
+            self.diagnostics.record_anomaly_kind(kind, attach);
         }
         let input = packet.input;
         cell.completion_with_record_data(|record| {
@@ -309,7 +311,8 @@ where
                     cleanup: completion.cleanup,
                 },
                 CompletionInput::Lost(loss) => slot::CompletionData::Lost {
-                    anomaly: loss.anomaly,
+                    kind: loss.kind,
+                    attach: loss.attach,
                     cleanup: loss.cleanup,
                 },
             };
@@ -336,7 +339,7 @@ where
         if idx >= self.slots.len() {
             let kind = CompletionAnomalyKind::unknown_slot(idx, generation);
             self.diagnostics.record_anomaly_kind(kind, attach);
-            return PollRecordResult::UnavailableKind(kind);
+            return PollRecordResult::Unavailable { kind, attach };
         }
         let cell = &self.slots[idx];
 
@@ -347,13 +350,13 @@ where
         if cell_gen > generation {
             let kind = CompletionAnomalyKind::stale(idx, generation, cell_gen, state);
             self.diagnostics.record_anomaly_kind(kind, attach);
-            return PollRecordResult::UnavailableKind(kind);
+            return PollRecordResult::Unavailable { kind, attach };
         }
 
         if cell_gen < generation {
             let kind = CompletionAnomalyKind::non_active(idx, generation, state);
             self.diagnostics.record_anomaly_kind(kind, attach);
-            return PollRecordResult::UnavailableKind(kind);
+            return PollRecordResult::Unavailable { kind, attach };
         }
 
         if state != slot::SlotState::InFlightReady {
@@ -367,7 +370,7 @@ where
                 | slot::SlotState::ReservedValue => {
                     let kind = CompletionAnomalyKind::non_active(idx, generation, state);
                     self.diagnostics.record_anomaly_kind(kind, attach);
-                    PollRecordResult::UnavailableKind(kind)
+                    PollRecordResult::Unavailable { kind, attach }
                 }
                 slot::SlotState::InFlightReady => unreachable!(),
             };
@@ -403,10 +406,13 @@ where
                 detail,
                 cleanup,
             }),
-            slot::CompletionData::Lost { anomaly, cleanup } => {
-                let mut cleanup = cleanup;
+            slot::CompletionData::Lost {
+                kind,
+                attach,
+                mut cleanup,
+            } => {
                 let _ = run_completion_cleanup(&self.diagnostics, &mut cleanup);
-                PollRecordResult::Unavailable(anomaly)
+                PollRecordResult::Unavailable { kind, attach }
             }
             slot::CompletionData::Empty => {
                 let kind = CompletionAnomalyKind::corrupt_snapshot(slot::SlotSnapshot {
@@ -424,10 +430,9 @@ where
                         flags: cell.completion_flags.load(Ordering::Acquire),
                     }),
                 };
-                let anomaly = kind.materialize(attach);
-                self.diagnostics.record_anomaly(&anomaly);
+                self.diagnostics.record_anomaly_kind(kind, attach);
                 self.diagnostics.inc_user_lost();
-                PollRecordResult::Unavailable(anomaly)
+                PollRecordResult::Unavailable { kind, attach }
             }
         }
     }

@@ -1,8 +1,8 @@
 use crate::{DriverResult, slot::SlotSpec};
 
 use super::{
-    AnomalyAttach, CompletionAnomaly, CompletionAnomalyKind, CompletionCleanupGuard,
-    CompletionEvent, DriverCompletionDiagnostics, OpToken, UserCompletionEvent,
+    AnomalyAttach, CompletionAnomalyKind, CompletionCleanupGuard, CompletionEvent,
+    DriverCompletionDiagnostics, OpToken, UserCompletionEvent,
 };
 
 pub struct CompletionPacket<Spec: SlotSpec> {
@@ -17,7 +17,8 @@ pub struct UserCompletion<Spec: SlotSpec> {
 }
 
 pub struct CompletionLoss {
-    pub anomaly: CompletionAnomaly,
+    pub kind: CompletionAnomalyKind,
+    pub attach: AnomalyAttach,
     pub cleanup: CompletionCleanupGuard,
 }
 
@@ -36,10 +37,10 @@ impl<Spec: SlotSpec> CompletionInput<Spec> {
     }
 
     #[inline]
-    pub fn anomaly(&self) -> Option<&CompletionAnomaly> {
+    pub fn lost_kind(&self) -> Option<(CompletionAnomalyKind, AnomalyAttach)> {
         match self {
             Self::User(_) => None,
-            Self::Lost(loss) => Some(&loss.anomaly),
+            Self::Lost(loss) => Some((loss.kind, loss.attach)),
         }
     }
 }
@@ -88,10 +89,13 @@ impl<Spec: SlotSpec> CompletionPacket<Spec> {
         cleanup: CompletionCleanupGuard,
     ) -> Self {
         let attach = AnomalyAttach::from_raw_completion(event.raw());
-        let anomaly = kind.materialize(attach);
         Self {
             event,
-            input: CompletionInput::Lost(CompletionLoss { anomaly, cleanup }),
+            input: CompletionInput::Lost(CompletionLoss {
+                kind,
+                attach,
+                cleanup,
+            }),
         }
     }
 

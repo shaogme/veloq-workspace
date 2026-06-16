@@ -10,10 +10,10 @@ use tracing::trace;
 use crate::{
     DriverCoreError, DriverError, DriverReport, DriverResult,
     driver::{
-        AnomalyAttach, CancelRequest, CompletionAccess, CompletionAnomaly, CompletionAnomalyReason,
-        CompletionRecord, CompletionToken, CompletionValue, Driver, DriverSubmitResult, OpToken,
-        PlatformOp, PollRecordResult, RemoteCancelSender, RemoteWaker, SharedCompletionTable,
-        SubmitStatus,
+        AnomalyAttach, CancelRequest, CompletionAccess, CompletionAnomalyKind,
+        CompletionAnomalyReason, CompletionRecord, CompletionToken, CompletionValue, Driver,
+        DriverSubmitResult, OpToken, PlatformOp, PollRecordResult, RemoteCancelSender, RemoteWaker,
+        SharedCompletionTable, SubmitStatus,
     },
     op::{DriverProvider, IntoPlatformOp, Op},
     slot::SlotSpec,
@@ -147,11 +147,8 @@ where
 }
 
 #[inline]
-pub(crate) fn completion_anomaly_error<E>(anomaly: CompletionAnomaly) -> OpError<E>
-where
-    E: DriverError,
-{
-    let reason = match anomaly.reason() {
+fn lost_reason_from_anomaly(reason: CompletionAnomalyReason) -> LostReason {
+    match reason {
         CompletionAnomalyReason::StaleGeneration => LostReason::GenerationMismatch,
         CompletionAnomalyReason::PayloadMissing => LostReason::PayloadMissing,
         CompletionAnomalyReason::UnknownSlot
@@ -166,40 +163,50 @@ where
         | CompletionAnomalyReason::CancelAckTargetStillActive
         | CompletionAnomalyReason::BackendContextUnknown
         | CompletionAnomalyReason::BackendSpecific(_) => LostReason::Other,
-    };
+    }
+}
+
+#[inline]
+pub(crate) fn completion_anomaly_error_from_kind<E>(
+    kind: CompletionAnomalyKind,
+    attach: AnomalyAttach,
+) -> OpError<E>
+where
+    E: DriverError,
+{
+    let reason = lost_reason_from_anomaly(kind.reason());
 
     let mut report = DriverCoreError::Internal
         .to_report()
         .push_ctx("scope", "driver-core/op")
-        .with_ctx("completion_token", anomaly.token().raw())
-        .with_ctx("completion_anomaly", format!("{:?}", anomaly.reason()))
+        .with_ctx("completion_token", attach.token.raw())
+        .with_ctx("completion_anomaly", format!("{:?}", kind.reason()))
         .attach_note("operation completion became unavailable");
 
-    if let Some(index) = anomaly.index() {
+    if let Some(index) = kind.index() {
         report = report.with_ctx("slot_index", index);
     }
-    if let Some(expected_generation) = anomaly.expected_generation() {
+    if let Some(expected_generation) = kind.expected_generation() {
         report = report.with_ctx("expected_generation", expected_generation);
     }
-    if let Some(actual_generation) = anomaly.actual_generation() {
+    if let Some(actual_generation) = kind.actual_generation() {
         report = report.with_ctx("actual_generation", actual_generation);
     }
-    if let Some(state) = anomaly.state() {
+    if let Some(state) = kind.state() {
         report = report.with_ctx("slot_state", format!("{state:?}"));
     }
-    if let Some(backend) = anomaly.backend() {
+    if let Some(backend) = kind.backend().or_else(|| attach.raw.map(|raw| raw.backend)) {
         report = report.with_ctx("completion_backend", format!("{backend:?}"));
     }
-    if let Some(backend_context) = anomaly.backend_context() {
+    if let Some(backend_context) = kind.backend_context_value() {
         report = report.with_ctx("completion_backend_context", backend_context);
     }
-    if let Some(raw_result) = anomaly.raw_result() {
-        report = report.with_ctx("raw_result", raw_result);
+    if let Some(raw) = attach.raw {
+        report = report
+            .with_ctx("raw_result", raw.res)
+            .with_ctx("completion_flags", raw.flags);
     }
-    if let Some(flags) = anomaly.flags() {
-        report = report.with_ctx("completion_flags", flags);
-    }
-    if let Some(snapshot) = anomaly.slot_snapshot() {
+    if let Some(snapshot) = kind.slot_snapshot() {
         report = report
             .with_ctx("snapshot_has_op", snapshot.has_op)
             .with_ctx("snapshot_has_payload", snapshot.has_payload);
@@ -263,18 +270,10 @@ where
 {
     match table.try_take_record(token) {
         PollRecordResult::Ready(record) => completion_record_to_result::<T, O, Spec>(record),
-        PollRecordResult::Unavailable(anomaly) => {
+        PollRecordResult::Unavailable { kind, attach } => {
             Poll::Ready(
                 OpResult::<T::Output, Spec::Error, T::Completion>::ResourceLost(
-                    completion_anomaly_error(anomaly),
-                ),
-            )
-        }
-        PollRecordResult::UnavailableKind(kind) => {
-            let attach = AnomalyAttach::from_op_token(token);
-            Poll::Ready(
-                OpResult::<T::Output, Spec::Error, T::Completion>::ResourceLost(
-                    completion_anomaly_error(kind.materialize(attach)),
+                    completion_anomaly_error_from_kind(kind, attach),
                 ),
             )
         }

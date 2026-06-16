@@ -94,10 +94,10 @@ pub(crate) fn wait_completion_record(
         let completion_table = driver.completion_table();
         match completion_table.try_take_record(token) {
             PollRecordResult::Ready(record) => return Ok(record),
-            PollRecordResult::Unavailable(anomaly) => {
+            PollRecordResult::Unavailable { kind, attach } => {
                 return IocpError::CompletionWait
-                    .with_ctx("completion_token", anomaly.token().raw())
-                    .with_ctx("completion_anomaly", format!("{:?}", anomaly.reason()))
+                    .with_ctx("completion_token", attach.token.raw())
+                    .with_ctx("completion_anomaly", format!("{:?}", kind.reason()))
                     .attach_note("completion record unavailable");
             }
             PollRecordResult::Pending => {}

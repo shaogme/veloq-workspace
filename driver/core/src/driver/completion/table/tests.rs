@@ -209,6 +209,13 @@ fn expected_lost_anomaly(
     ))
 }
 
+fn unavailable_materialized(result: PollRecordResult<DummySlotSpec>) -> Option<CompletionAnomaly> {
+    match result {
+        PollRecordResult::Unavailable { kind, attach } => Some(kind.materialize(attach)),
+        _ => None,
+    }
+}
+
 #[test]
 fn record_completion_rejects_idle_future_generation() {
     let mut registry = OpRegistry::<DummySlotSpec>::new(1);
@@ -228,7 +235,7 @@ fn try_take_record_reports_future_generation_unavailable() {
     let token = test_token(0, 1);
 
     match table.try_take_record(token) {
-        PollRecordResult::UnavailableKind(kind) => {
+        PollRecordResult::Unavailable { kind, .. } => {
             assert_eq!(kind.reason(), CompletionAnomalyReason::NonActiveSlot);
             assert!(matches!(
                 kind,
@@ -241,9 +248,6 @@ fn try_take_record_reports_future_generation_unavailable() {
         }
         PollRecordResult::Pending => panic!("future generation token must not stay pending"),
         PollRecordResult::Ready(_) => panic!("future generation token must not become ready"),
-        PollRecordResult::Unavailable(anomaly) => {
-            panic!("future generation token should report kind, got {anomaly:?}")
-        }
     }
 }
 
@@ -360,10 +364,10 @@ fn lost_completion_is_observable_as_unavailable() {
     );
 
     assert_eq!(outcome.user_lost, 1);
-    assert!(matches!(
-        table.try_take_record(token),
-        PollRecordResult::Unavailable(observed) if observed == expected
-    ));
+    assert_eq!(
+        unavailable_materialized(table.try_take_record(token)),
+        Some(expected)
+    );
     let snapshot = table.completion_diagnostics().snapshot();
     assert_eq!(snapshot.user_lost, 1);
     assert_eq!(snapshot.user_completed, 0);
@@ -428,10 +432,10 @@ fn lost_completion_preserves_payload_missing_reason() {
     );
 
     assert_eq!(outcome.user_lost, 1);
-    assert!(matches!(
-        table.try_take_record(token),
-        PollRecordResult::Unavailable(observed) if observed == expected
-    ));
+    assert_eq!(
+        unavailable_materialized(table.try_take_record(token)),
+        Some(expected)
+    );
     let snapshot = table.completion_diagnostics().snapshot();
     assert_eq!(snapshot.user_lost, 1);
     assert_eq!(snapshot.payload_missing, 1);
@@ -460,10 +464,10 @@ fn lost_completion_preserves_op_missing_reason() {
     );
 
     assert_eq!(outcome.user_lost, 1);
-    assert!(matches!(
-        table.try_take_record(token),
-        PollRecordResult::Unavailable(observed) if observed == expected
-    ));
+    assert_eq!(
+        unavailable_materialized(table.try_take_record(token)),
+        Some(expected)
+    );
     let snapshot = table.completion_diagnostics().snapshot();
     assert_eq!(snapshot.user_lost, 1);
     assert_eq!(snapshot.slot_corruption, 1);
@@ -483,10 +487,7 @@ fn duplicate_completion_does_not_clear_ready_data() {
     let record = match table.try_take_record(token) {
         PollRecordResult::Ready(record) => record,
         PollRecordResult::Pending => panic!("first completion should be ready"),
-        PollRecordResult::Unavailable(anomaly) => {
-            panic!("first completion should remain available: {anomaly:?}")
-        }
-        PollRecordResult::UnavailableKind(kind) => {
+        PollRecordResult::Unavailable { kind, .. } => {
             panic!("first completion should remain available: {kind:?}")
         }
     };
@@ -506,8 +507,10 @@ fn ready_mark_orphaned_cleanup_leaves_diagnostic_stale_result() {
 
     assert!(matches!(
         table.try_take_record(token),
-        PollRecordResult::UnavailableKind(kind)
-            if kind.reason() == CompletionAnomalyReason::StaleGeneration
+        PollRecordResult::Unavailable {
+            kind,
+            ..
+        } if kind.reason() == CompletionAnomalyReason::StaleGeneration
     ));
     let snapshot = table.completion_diagnostics().snapshot();
     assert_eq!(snapshot.stale_completion, 1);

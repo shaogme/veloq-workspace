@@ -692,10 +692,7 @@ mod tests {
         let record = match registry.shared.try_take_record(token) {
             PollRecordResult::Ready(record) => record,
             PollRecordResult::Pending => panic!("completion should be ready"),
-            PollRecordResult::Unavailable(anomaly) => {
-                panic!("completion should be available: {anomaly:?}")
-            }
-            PollRecordResult::UnavailableKind(kind) => {
+            PollRecordResult::Unavailable { kind, .. } => {
                 panic!("completion should be available: {kind:?}")
             }
         };

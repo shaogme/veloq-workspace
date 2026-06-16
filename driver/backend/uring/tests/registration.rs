@@ -223,8 +223,8 @@ fn wait_completion(
                     .unwrap_or_else(|| usize::from_event_res::<UringError>(event.res()))
                     .expect("completion reported error");
             }
-            PollRecordResult::Unavailable(anomaly) => {
-                panic!("completion record unavailable: {anomaly:?}");
+            PollRecordResult::Unavailable { kind, .. } => {
+                panic!("completion record unavailable: {kind:?}");
             }
             PollRecordResult::Pending => {}
         }
