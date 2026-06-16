@@ -4,7 +4,7 @@ use crate::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         lock::SpinLock,
-        queue::{ArrayQueue, SegQueue},
+        queue::{ArrayQueue, Queue, SegQueue},
     },
     waker::{WaiterAdapter, WaiterNode},
 };
@@ -19,44 +19,6 @@ use veloq_intrusive_linklist::LinkedList;
 
 mod flavor {
     use super::*;
-
-    pub trait RawQueue<T>: Send + Sync {
-        fn new(cap: usize) -> Self;
-        fn push(&self, val: T) -> Result<(), T>;
-        fn pop(&self) -> Option<T>;
-        fn is_full(&self) -> bool;
-    }
-
-    impl<T: Send> RawQueue<T> for SegQueue<T> {
-        fn new(_cap: usize) -> Self {
-            SegQueue::new()
-        }
-        fn push(&self, val: T) -> Result<(), T> {
-            self.push(val);
-            Ok(())
-        }
-        fn pop(&self) -> Option<T> {
-            self.pop()
-        }
-        fn is_full(&self) -> bool {
-            false
-        }
-    }
-
-    impl<T: Send> RawQueue<T> for ArrayQueue<T> {
-        fn new(cap: usize) -> Self {
-            ArrayQueue::new(cap)
-        }
-        fn push(&self, val: T) -> Result<(), T> {
-            self.push(val)
-        }
-        fn pop(&self) -> Option<T> {
-            self.pop()
-        }
-        fn is_full(&self) -> bool {
-            self.is_full()
-        }
-    }
 
     pub trait ChannelFlavor: Send + Sync {
         fn new() -> Self;
@@ -188,11 +150,11 @@ pub fn bounded<T: Send>(capacity: usize) -> (BoundedSender<T>, BoundedReceiver<T
 
 // --- Generic Structs ---
 
-pub struct GenericSender<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> {
+pub struct GenericSender<T, F: ChannelFlavor, Q: Queue<T>> {
     shared: Arc<Shared<T, F, Q>>,
 }
 
-impl<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Clone for GenericSender<T, F, Q> {
+impl<T, F: ChannelFlavor, Q: Queue<T>> Clone for GenericSender<T, F, Q> {
     fn clone(&self) -> Self {
         self.shared.sender_count.fetch_add(1, Ordering::Relaxed);
         Self {
@@ -201,7 +163,7 @@ impl<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Clone for GenericSender<T, F, 
     }
 }
 
-impl<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Drop for GenericSender<T, F, Q> {
+impl<T, F: ChannelFlavor, Q: Queue<T>> Drop for GenericSender<T, F, Q> {
     fn drop(&mut self) {
         if self.shared.sender_count.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.shared.close();
@@ -209,11 +171,11 @@ impl<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Drop for GenericSender<T, F, Q
     }
 }
 
-pub struct GenericReceiver<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> {
+pub struct GenericReceiver<T, F: ChannelFlavor, Q: Queue<T>> {
     shared: Arc<Shared<T, F, Q>>,
 }
 
-impl<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Clone for GenericReceiver<T, F, Q> {
+impl<T, F: ChannelFlavor, Q: Queue<T>> Clone for GenericReceiver<T, F, Q> {
     fn clone(&self) -> Self {
         self.shared.receiver_count.fetch_add(1, Ordering::Relaxed);
         Self {
@@ -222,7 +184,7 @@ impl<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Clone for GenericReceiver<T, F
     }
 }
 
-impl<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Drop for GenericReceiver<T, F, Q> {
+impl<T, F: ChannelFlavor, Q: Queue<T>> Drop for GenericReceiver<T, F, Q> {
     fn drop(&mut self) {
         self.shared.receiver_count.fetch_sub(1, Ordering::Relaxed);
         // 只有当 receiver_count 降为 0 时，才意味着 CLOSED。
@@ -237,7 +199,7 @@ impl<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Drop for GenericReceiver<T, F,
 
 // --- Shared ---
 
-struct Shared<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> {
+struct Shared<T, F: ChannelFlavor, Q: Queue<T>> {
     queue: Q,
 
     // 接收等待队列 (通用)
@@ -252,10 +214,10 @@ struct Shared<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> {
     marker: std::marker::PhantomData<T>,
 }
 
-unsafe impl<T: Send, F: ChannelFlavor, Q: flavor::RawQueue<T>> Send for Shared<T, F, Q> {}
-unsafe impl<T: Send, F: ChannelFlavor, Q: flavor::RawQueue<T>> Sync for Shared<T, F, Q> {}
+unsafe impl<T: Send, F: ChannelFlavor, Q: Queue<T>> Send for Shared<T, F, Q> {}
+unsafe impl<T: Send, F: ChannelFlavor, Q: Queue<T>> Sync for Shared<T, F, Q> {}
 
-impl<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Shared<T, F, Q> {
+impl<T, F: ChannelFlavor, Q: Queue<T>> Shared<T, F, Q> {
     fn new(capacity: usize) -> Self {
         Self {
             queue: Q::new(capacity),
@@ -300,7 +262,7 @@ impl<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Shared<T, F, Q> {
 
 // --- Implementation ---
 
-impl<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> GenericSender<T, F, Q> {
+impl<T, F: ChannelFlavor, Q: Queue<T>> GenericSender<T, F, Q> {
     fn new(capacity: usize) -> (Self, GenericReceiver<T, F, Q>) {
         let shared = Arc::new(Shared::new(capacity));
         (
@@ -348,7 +310,7 @@ impl<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> GenericSender<T, F, Q> {
     }
 }
 
-impl<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> GenericReceiver<T, F, Q> {
+impl<T, F: ChannelFlavor, Q: Queue<T>> GenericReceiver<T, F, Q> {
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
         if let Some(msg) = self.shared.queue.pop() {
             self.shared.flavor.release(); // For bounded, this wakes sender
@@ -391,14 +353,14 @@ impl<T, F: ChannelFlavor, Q: flavor::RawQueue<T>> GenericReceiver<T, F, Q> {
 
 // --- Futures ---
 
-struct SendFuture<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> {
+struct SendFuture<'a, T, F: ChannelFlavor, Q: Queue<T>> {
     sender: &'a GenericSender<T, F, Q>,
     msg: Option<T>,
     node: WaiterNode,
     queued: bool,
 }
 
-impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Future for SendFuture<'a, T, F, Q> {
+impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Future for SendFuture<'a, T, F, Q> {
     type Output = Result<(), SendError<T>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -457,7 +419,7 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Future for SendFuture<'a, 
     }
 }
 
-impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Drop for SendFuture<'a, T, F, Q> {
+impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Drop for SendFuture<'a, T, F, Q> {
     fn drop(&mut self) {
         if self.queued {
             let node_pin = unsafe { Pin::new_unchecked(&mut self.node) };
@@ -466,13 +428,13 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Drop for SendFuture<'a, T,
     }
 }
 
-struct RecvFuture<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> {
+struct RecvFuture<'a, T, F: ChannelFlavor, Q: Queue<T>> {
     receiver: &'a GenericReceiver<T, F, Q>,
     node: WaiterNode,
     queued: bool,
 }
 
-impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Future for RecvFuture<'a, T, F, Q> {
+impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Future for RecvFuture<'a, T, F, Q> {
     type Output = Result<T, TryRecvError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -531,7 +493,7 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Future for RecvFuture<'a, 
     }
 }
 
-impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Drop for RecvFuture<'a, T, F, Q> {
+impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Drop for RecvFuture<'a, T, F, Q> {
     fn drop(&mut self) {
         if self.queued {
             let node_pin = unsafe { Pin::new_unchecked(&mut self.node) };
@@ -540,7 +502,7 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Drop for RecvFuture<'a, T,
     }
 }
 
-fn remove_recv_waiter<T, F: ChannelFlavor, Q: flavor::RawQueue<T>>(
+fn remove_recv_waiter<T, F: ChannelFlavor, Q: Queue<T>>(
     shared: &Shared<T, F, Q>,
     node: Pin<&mut WaiterNode>,
 ) {
@@ -555,13 +517,13 @@ fn remove_recv_waiter<T, F: ChannelFlavor, Q: flavor::RawQueue<T>>(
     }
 }
 
-pub struct ReceiverStream<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> {
+pub struct ReceiverStream<'a, T, F: ChannelFlavor, Q: Queue<T>> {
     shared: &'a Shared<T, F, Q>,
     node: WaiterNode,
     queued: bool,
 }
 
-impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Stream for ReceiverStream<'a, T, F, Q> {
+impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Stream for ReceiverStream<'a, T, F, Q> {
     type Item = T;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -616,7 +578,7 @@ impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Stream for ReceiverStream<
     }
 }
 
-impl<'a, T, F: ChannelFlavor, Q: flavor::RawQueue<T>> Drop for ReceiverStream<'a, T, F, Q> {
+impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Drop for ReceiverStream<'a, T, F, Q> {
     fn drop(&mut self) {
         if self.queued {
             let node_pin = unsafe { Pin::new_unchecked(&mut self.node) };

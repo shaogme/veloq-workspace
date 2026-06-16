@@ -3,7 +3,7 @@ use crate::{
     shim::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        queue::{ArrayQueue, SegQueue},
+        queue::{ArrayQueue, Queue, SegQueue},
     },
 };
 use futures_core::stream::Stream;
@@ -13,23 +13,6 @@ use std::{
     task::{Context, Poll},
 };
 use veloq_atomic_waker::AtomicWaker;
-
-#[doc(hidden)]
-pub trait Queue<T> {
-    fn pop(&self) -> Option<T>;
-}
-
-impl<T> Queue<T> for SegQueue<T> {
-    fn pop(&self) -> Option<T> {
-        self.pop()
-    }
-}
-
-impl<T> Queue<T> for ArrayQueue<T> {
-    fn pop(&self) -> Option<T> {
-        self.pop()
-    }
-}
 
 /// A multi-producer, single-consumer channel for sending values across threads
 /// to a local executor task.
@@ -130,7 +113,7 @@ impl ChannelState {
 
 // --- Strategies ---
 
-pub trait ChannelStrategy: Send + Sync + 'static {
+pub trait ChannelStrategy: Send + Sync {
     fn on_rx_drop(&self);
     fn on_msg_recv(&self);
 }
@@ -143,8 +126,6 @@ impl ChannelStrategy for UnboundedStrategy {
 }
 
 pub struct BoundedStrategy {
-    capacity: usize,
-    size: AtomicUsize,
     send_waiters: SegQueue<Arc<WakerState>>,
 }
 
@@ -154,10 +135,8 @@ struct WakerState {
 }
 
 impl BoundedStrategy {
-    fn new(capacity: usize) -> Self {
+    fn new(_capacity: usize) -> Self {
         Self {
-            capacity,
-            size: AtomicUsize::new(0),
             send_waiters: SegQueue::new(),
         }
     }
@@ -180,7 +159,6 @@ impl ChannelStrategy for BoundedStrategy {
     }
 
     fn on_msg_recv(&self) {
-        self.size.fetch_sub(1, Ordering::Release);
         self.wake_one_sender();
     }
 }
@@ -292,23 +270,14 @@ impl<'a, T> Future for BoundedSendFuture<'a, T> {
         }
 
         // Try acquire capacity
-        let mut size = strategy.size.load(Ordering::Relaxed);
-        loop {
-            if size >= strategy.capacity {
-                break;
+        let val = this.val.take().unwrap();
+        match shared.queue.push(val) {
+            Ok(_) => {
+                shared.state.wake_rx();
+                return Poll::Ready(Ok(()));
             }
-            match strategy.size.compare_exchange_weak(
-                size,
-                size + 1,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    let _ = shared.queue.push(this.val.take().unwrap());
-                    shared.state.wake_rx();
-                    return Poll::Ready(Ok(()));
-                }
-                Err(s) => size = s,
+            Err(returned_val) => {
+                this.val = Some(returned_val);
             }
         }
 
@@ -330,7 +299,7 @@ impl<'a, T> Future for BoundedSendFuture<'a, T> {
         if !shared.state.is_rx_active() {
             return Poll::Ready(Err(SendError(this.val.take().unwrap())));
         }
-        if strategy.size.load(Ordering::Acquire) < strategy.capacity {
+        if !shared.queue.is_full() {
             ws.waker.wake();
         }
 
