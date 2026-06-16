@@ -1,5 +1,5 @@
 use crate::{
-    error::Result as RuntimeResult,
+    error::{Result as RuntimeResult, RuntimeError},
     runtime::{EnqueuePinnedOutcome, RuntimeScopeContext, RuntimeShared},
     scope::{GenericScopeCompletion, guard::ScopeTaskGuard},
     task::{
@@ -8,6 +8,7 @@ use crate::{
     },
     utils::ownership::{ArcOwnership, Ownership},
 };
+use diagweave::prelude::*;
 use std::{
     alloc::Layout,
     future::{Future, ready},
@@ -23,8 +24,21 @@ use std::{
 use veloq_atomic_waker::AtomicWaker;
 use veloq_storage::{AtomicOptionPtr, AtomicStorage, StateOptionPtr, Storage};
 
+pub(crate) enum RoutedTakeResult<T> {
+    Ok(T),
+    TaskErr(TaskError),
+    RuntimeErr(Report<RuntimeError>),
+}
+
+pub(crate) enum RoutedTakeReadyOutcome<'scope_ref, T> {
+    Pending,
+    Ready(RoutedSpawnReady<'scope_ref, T>),
+    TaskErr(TaskError),
+    RuntimeErr(Report<RuntimeError>),
+}
+
 pub(crate) trait RoutedTaskAccess<T>: Send {
-    fn take_result(&self) -> Result<T, TaskError>;
+    fn take_result(&self) -> RoutedTakeResult<T>;
     fn reclaim(self: Box<Self>, arena: &dyn Arena);
 }
 
@@ -35,7 +49,8 @@ pub(crate) struct RoutedSpawnReady<'scope_ref, T> {
 
 pub(crate) enum RoutedSpawnOutcomeInner<'scope_ref, T> {
     Ready(RoutedSpawnReady<'scope_ref, T>),
-    Failed(TaskError),
+    FailedTask(TaskError),
+    FailedRuntime(Report<RuntimeError>),
 }
 
 pub(crate) struct RoutedJobCell<F> {
@@ -47,8 +62,14 @@ impl<F> RoutedJobCell<F> {
         Self { job: Some(job) }
     }
 
-    pub(crate) fn take(&mut self) -> F {
-        self.job.take().expect("routed job already taken")
+    pub(crate) fn take(&mut self) -> RuntimeResult<F> {
+        self.job.take().ok_or(
+            RuntimeError::InvariantViolation {
+                site: "RoutedJobCell::take",
+                detail: "job has already been taken",
+            }
+            .to_report(),
+        )
     }
 }
 
@@ -61,8 +82,17 @@ impl<'scope_ref, T, S_> RoutedTaskAccess<T> for SpawnToAccess<'scope_ref, T, S_>
 where
     S_: SendTask<T> + Sized + 'scope_ref,
 {
-    fn take_result(&self) -> Result<T, TaskError> {
-        self.task.take_result().expect("task result already taken")
+    fn take_result(&self) -> RoutedTakeResult<T> {
+        match self.task.take_result() {
+            Some(Ok(value)) => RoutedTakeResult::Ok(value),
+            Some(Err(err)) => RoutedTakeResult::TaskErr(err),
+            None => RoutedTakeResult::RuntimeErr(
+                RuntimeError::TaskResultUnavailable {
+                    stage: "RoutedTaskAccess::take_result(SpawnToAccess)",
+                }
+                .to_report(),
+            ),
+        }
     }
 
     fn reclaim(self: Box<Self>, _arena: &dyn Arena) {}
@@ -96,8 +126,17 @@ where
     T: Send + 'scope_ref,
     Fut: Future<Output = T> + 'scope_ref,
 {
-    fn take_result(&self) -> Result<T, TaskError> {
-        self.node.take_result().expect("task result already taken")
+    fn take_result(&self) -> RoutedTakeResult<T> {
+        match self.node.take_result() {
+            Some(Ok(value)) => RoutedTakeResult::Ok(value),
+            Some(Err(err)) => RoutedTakeResult::TaskErr(err),
+            None => RoutedTakeResult::RuntimeErr(
+                RuntimeError::TaskResultUnavailable {
+                    stage: "RoutedTaskAccess::take_result(BoxedTaskAccess)",
+                }
+                .to_report(),
+            ),
+        }
     }
 
     fn reclaim(self: Box<Self>, arena: &dyn Arena) {
@@ -134,6 +173,14 @@ pub(crate) struct RoutedSpawnState<'scope_ref, T> {
     waker: AtomicWaker,
 }
 
+pub(crate) fn new_failed_routed_state<'scope_ref, T>(
+    err: Report<RuntimeError>,
+) -> Arc<RoutedSpawnState<'scope_ref, T>> {
+    let state = RoutedSpawnState::new();
+    state.fail_runtime(err);
+    state
+}
+
 impl<'scope_ref, T> RoutedSpawnState<'scope_ref, T> {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -154,7 +201,13 @@ impl<'scope_ref, T> RoutedSpawnState<'scope_ref, T> {
 
     pub(crate) fn has_failed_outcome(&self) -> bool {
         if let Some(raw) = self.outcome.load(Ordering::Acquire) {
-            unsafe { matches!(raw.as_ref(), RoutedSpawnOutcomeInner::Failed(_)) }
+            unsafe {
+                matches!(
+                    raw.as_ref(),
+                    RoutedSpawnOutcomeInner::FailedTask(_)
+                        | RoutedSpawnOutcomeInner::FailedRuntime(_)
+                )
+            }
         } else {
             false
         }
@@ -162,7 +215,9 @@ impl<'scope_ref, T> RoutedSpawnState<'scope_ref, T> {
 
     fn set_outcome(&self, inner: RoutedSpawnOutcomeInner<'scope_ref, T>) {
         let boxed = Box::new(inner);
-        let raw = NonNull::new(Box::into_raw(boxed)).unwrap();
+        let Some(raw) = NonNull::new(Box::into_raw(boxed)) else {
+            return;
+        };
         match self
             .outcome
             .compare_exchange(None, Some(raw), Ordering::AcqRel, Ordering::Acquire)
@@ -183,21 +238,26 @@ impl<'scope_ref, T> RoutedSpawnState<'scope_ref, T> {
         self.set_outcome(RoutedSpawnOutcomeInner::Ready(ready));
     }
 
-    pub(crate) fn fail(&self, err: TaskError) {
-        self.set_outcome(RoutedSpawnOutcomeInner::Failed(err));
+    pub(crate) fn fail_task(&self, err: TaskError) {
+        self.set_outcome(RoutedSpawnOutcomeInner::FailedTask(err));
     }
 
-    pub(crate) fn try_take_ready(
-        &self,
-    ) -> Result<Option<RoutedSpawnReady<'scope_ref, T>>, TaskError> {
+    pub(crate) fn fail_runtime(&self, err: Report<RuntimeError>) {
+        self.set_outcome(RoutedSpawnOutcomeInner::FailedRuntime(err));
+    }
+
+    pub(crate) fn try_take_ready(&self) -> RoutedTakeReadyOutcome<'scope_ref, T> {
         if let Some(raw) = self.outcome.swap(None, Ordering::AcqRel) {
             let inner = unsafe { Box::from_raw(raw.as_ptr()) };
             match *inner {
-                RoutedSpawnOutcomeInner::Ready(ready) => Ok(Some(ready)),
-                RoutedSpawnOutcomeInner::Failed(err) => Err(err),
+                RoutedSpawnOutcomeInner::Ready(ready) => RoutedTakeReadyOutcome::Ready(ready),
+                RoutedSpawnOutcomeInner::FailedTask(err) => RoutedTakeReadyOutcome::TaskErr(err),
+                RoutedSpawnOutcomeInner::FailedRuntime(err) => {
+                    RoutedTakeReadyOutcome::RuntimeErr(err)
+                }
             }
         } else {
-            Ok(None)
+            RoutedTakeReadyOutcome::Pending
         }
     }
 
@@ -234,8 +294,7 @@ pub(crate) fn dispatch_routed<'rt, 'scope_ref, S: ScopeStorage, O: Ownership, T,
     state: Arc<RoutedSpawnState<'scope_ref, T>>,
     worker_id: usize,
     job: F,
-) -> RuntimeResult<()>
-where
+) where
     O::Shared<GenericScopeCompletion<S, O>>: Send,
     F: FnOnce(&mut ScopeTaskGuard<S, O>) + Send + 'scope_ref,
     T: Send + 'scope_ref,
@@ -243,13 +302,13 @@ where
     let completion = guard.completion().clone();
     let state_for_route = state.clone();
 
-    match context.route_to(worker_id, move || {
+    if let Err(err) = context.route_to(worker_id, move || {
         let result = catch_unwind(AssertUnwindSafe(|| job(&mut guard)));
 
         if let Err(panic_err) = result {
             completion.report_panic(panic_err);
             completion.cancel();
-            state_for_route.fail(TaskError::Panic);
+            state_for_route.fail_task(TaskError::Panic);
             if guard.is_armed() {
                 guard.settle();
             } else {
@@ -258,11 +317,7 @@ where
         }
         ready(())
     }) {
-        Ok(_) => Ok(()),
-        Err(err) => {
-            state.fail(TaskError::Panic);
-            Err(err)
-        }
+        state.fail_runtime(err);
     }
 }
 
@@ -306,8 +361,14 @@ pub(crate) fn install_routed_pinned_task<'scope_ref, 'rt, T, Fut, TExtra>(
         arena.alloc::<SendBoxedTaskNode<T, Fut>>(
             layout,
             Some(|ptr| drop_in_place(ptr as *mut SendBoxedTaskNode<T, Fut>)),
-        ) as *mut SendBoxedTaskNode<T, Fut>
+        )
     };
+    let Some(node_ptr) = node_ptr else {
+        state.fail_task(TaskError::Panic);
+        guard.settle();
+        return;
+    };
+    let node_ptr = node_ptr.as_ptr() as *mut SendBoxedTaskNode<T, Fut>;
     unsafe { write(node_ptr, node) };
 
     let node_ref = unsafe { &*node_ptr };
@@ -323,7 +384,7 @@ pub(crate) fn install_routed_pinned_task<'scope_ref, 'rt, T, Fut, TExtra>(
     let outcome = runtime.enqueue_pinned(worker_id, task_ctx);
     if !handle_enqueue_pinned_outcome(guard, header, outcome) {
         unsafe { arena.drop_object_raw(node_ptr as *mut u8, layout) };
-        state.fail(TaskError::Panic);
+        state.fail_task(TaskError::Panic);
         return;
     }
 

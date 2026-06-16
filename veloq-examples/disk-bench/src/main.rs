@@ -301,7 +301,8 @@ async fn run_iteration_measured<'a, 'ctx>(
             in_flight -= 1;
         }
     })
-    .await;
+    .await
+    .unwrap();
 
     apply_sync(file, sync_mode, written_bytes).await;
 
@@ -459,18 +460,15 @@ fn main() {
                 let mut prepare_handles = Vec::with_capacity(args.threads);
                 for t_idx in 0..args.threads {
                     let prepare_buffering = buffering_mode;
-                    prepare_handles.push(
-                        s.spawn_boxed_to(t_idx, async move || {
-                            prepare_files_for_thread(
-                                ctx,
-                                FILE_SIZE_PER_THREAD,
-                                t_idx,
-                                prepare_buffering,
-                            )
-                            .await;
-                        })
-                        .expect("prepare task dispatch failed"),
-                    );
+                    prepare_handles.push(s.spawn_boxed_to(t_idx, async move || {
+                        prepare_files_for_thread(
+                            ctx,
+                            FILE_SIZE_PER_THREAD,
+                            t_idx,
+                            prepare_buffering,
+                        )
+                        .await;
+                    }));
                 }
                 for handle in prepare_handles {
                     handle.await.expect("Preparation task failed");
@@ -488,21 +486,18 @@ fn main() {
                     let worker_sync = sync_mode;
                     let t_idx = config.thread_index;
 
-                    worker_handles.push(
-                        s.spawn_boxed_to(t_idx, async move || {
-                            run_worker(
-                                ctx,
-                                qdepth,
-                                duration_limit,
-                                min_iters,
-                                worker_buffering,
-                                worker_sync,
-                                config,
-                            )
-                            .await
-                        })
-                        .expect("worker task dispatch failed"),
-                    );
+                    worker_handles.push(s.spawn_boxed_to(t_idx, async move || {
+                        run_worker(
+                            ctx,
+                            qdepth,
+                            duration_limit,
+                            min_iters,
+                            worker_buffering,
+                            worker_sync,
+                            config,
+                        )
+                        .await
+                    }));
                 }
 
                 // 3. Aggregate
@@ -560,7 +555,8 @@ fn main() {
                     println!("No data collected.");
                 }
             })
-            .await;
+            .await
+            .unwrap();
         })
         .unwrap();
 

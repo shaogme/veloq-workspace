@@ -1,14 +1,16 @@
 use super::{
     AsyncScope, CancelTokenSlot, LocalAsyncScope, ScopeProvider,
-    router::{RoutedSpawnState, RoutedTaskAccess},
+    router::{RoutedSpawnState, RoutedTakeReadyOutcome, RoutedTakeResult, RoutedTaskAccess},
 };
 use crate::{
+    error::{Result as RuntimeResult, RuntimeError},
     runtime::{GenericCancellationToken, primitives::CancelledFuture},
     task::{
         Arena, GenericTaskHeader, GenericWakerNode, LocalTaskRef, SendTaskRef, TaskError,
         TaskHandleRef, TaskJoinGate,
     },
 };
+use diagweave::{Report, prelude::*};
 use std::{
     alloc::Layout,
     future::Future,
@@ -22,6 +24,34 @@ use veloq_intrusive_linklist::Link;
 use veloq_storage::{AtomicStorage, StateLock, Storage};
 
 pub(crate) type ReclaimFn<'scope_ref, T, A> = unsafe fn(&A, &'scope_ref dyn TaskJoinGate<T>);
+
+/// Outcome of awaiting a [`JoinHandle`].
+#[derive(Debug)]
+pub enum JoinOutcome<T> {
+    /// The task completed successfully.
+    Ok(T),
+    /// The task failed due to cancellation or panic during execution.
+    TaskErr(TaskError),
+    /// The runtime encountered a protocol or infrastructure error while joining.
+    RuntimeErr(Report<RuntimeError>),
+}
+
+impl<T> JoinOutcome<T> {
+    pub fn unwrap(self) -> T {
+        match self {
+            Self::Ok(value) => value,
+            Self::TaskErr(err) => panic!("task error: {err:?}"),
+            Self::RuntimeErr(err) => panic!("runtime error: {err}"),
+        }
+    }
+    pub fn expect(self, msg: &str) -> T {
+        match self {
+            Self::Ok(value) => value,
+            Self::TaskErr(err) => panic!("{msg}: task error: {err:?}"),
+            Self::RuntimeErr(err) => panic!("{msg}: runtime error: {err}"),
+        }
+    }
+}
 
 pub(crate) struct ResolvedRoutedTask<'scope_ref, T, R: TaskHandleRef> {
     pub(crate) task: R,
@@ -43,15 +73,15 @@ pub(crate) enum JoinSource<'scope_ref, T, R: TaskHandleRef> {
 ///
 /// As a `Future`, `await` waits until the task has **finished executing**, not merely
 /// until cancellation has been requested. If the task ends due to cancellation, the
-/// result is `Err(TaskError::Cancelled)`. For immediate notification when cancellation
-/// is requested, use [`JoinHandle::cancelled`].
+/// result is [`JoinOutcome::TaskErr`] with [`TaskError::Cancelled`]. For immediate
+/// notification when cancellation is requested, use [`JoinHandle::cancelled`].
 pub struct JoinHandle<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra> {
     pub(crate) source: JoinSource<'scope_ref, T, R>,
     pub(crate) scope: &'scope_ref S,
     pub(crate) cancel_token: CancelTokenSlot<S::Storage, S::Ownership>,
     pub(crate) waker_node: Option<Pin<&'scope_ref mut GenericWakerNode<R::Storage>>>,
     pub(crate) reclaim: Option<ReclaimFn<'scope_ref, T, S::Arena>>,
-    pub(crate) marker: std::marker::PhantomData<TExtra>,
+    pub(crate) marker: PhantomData<TExtra>,
 }
 
 unsafe impl<'rt, 'scope, 'scope_ref, T, TExtra> Send
@@ -207,7 +237,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
         arena: &dyn Arena,
         header: &GenericTaskHeader<St>,
         cx: &mut Context<'_>,
-    ) {
+    ) -> RuntimeResult<()> {
         if let Some(node) = waker_node {
             let mut node = node.as_mut();
             if !node.waker.will_wake(cx.waker()) {
@@ -216,17 +246,23 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
                     header.register_completion(node.as_mut());
                 }
             }
+            return Ok(());
         } else {
             let node_ptr = unsafe {
                 arena.alloc_raw(
                     Layout::new::<GenericWakerNode<St>>(),
                     Some(|ptr| drop_in_place(ptr as *mut GenericWakerNode<St>)),
-                ) as *mut GenericWakerNode<St>
+                )
             };
-            let node_ptr = NonNull::new(node_ptr).expect("arena allocation failed");
+            let Some(node_ptr) = node_ptr else {
+                return Err(RuntimeError::ArenaAllocationNull {
+                    op: "JoinHandle::register_waker_on",
+                }
+                .to_report());
+            };
             unsafe {
                 write(
-                    node_ptr.as_ptr(),
+                    node_ptr.as_ptr() as *mut GenericWakerNode<St>,
                     GenericWakerNode {
                         waker: cx.waker().clone(),
                         link: Link::new(),
@@ -234,25 +270,40 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
                     },
                 );
             }
-            let node_ref = unsafe { Pin::new_unchecked(&mut *node_ptr.as_ptr()) };
+            let node_ref = unsafe {
+                Pin::new_unchecked(&mut *(node_ptr.as_ptr() as *mut GenericWakerNode<St>))
+            };
             *waker_node = Some(node_ref);
             unsafe {
-                header.register_completion(waker_node.as_mut().unwrap().as_mut());
+                if let Some(node) = waker_node.as_mut() {
+                    header.register_completion(node.as_mut());
+                } else {
+                    return Err(RuntimeError::InvariantViolation {
+                        site: "JoinHandle::register_waker_on",
+                        detail: "waker node missing after initialization",
+                    }
+                    .to_report());
+                }
             }
         }
+        Ok(())
     }
 }
 
 impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TExtra: 'scope_ref>
     Future for JoinHandle<'scope_ref, T, R, S, TExtra>
 {
-    type Output = Result<T, TaskError>;
+    type Output = JoinOutcome<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        this.scope
+        if let Err(err) = this
+            .scope
             .runtime()
-            .drive_worker::<S::Storage, S::Ownership>(Some(this.scope.completion()));
+            .drive_worker::<S::Storage, S::Ownership>(Some(this.scope.completion()))
+        {
+            return Poll::Ready(JoinOutcome::RuntimeErr(err));
+        }
 
         let arena = this.scope.arena();
         let waker_node = &mut this.waker_node;
@@ -262,50 +313,75 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TEx
             JoinSource::Direct { task, gate, .. } => {
                 let header = task.header();
                 if header.is_completed() {
-                    let res = gate
-                        .take_result_erased()
-                        .expect("task result already taken");
+                    let Some(res) = gate.take_result_erased() else {
+                        return Poll::Ready(JoinOutcome::RuntimeErr(
+                            RuntimeError::TaskResultUnavailable {
+                                stage: "JoinHandle::poll(Direct)",
+                            }
+                            .to_report(),
+                        ));
+                    };
                     if let Some(reclaim) = reclaim {
                         unsafe { (reclaim)(arena, *gate) };
                     }
-                    return Poll::Ready(res);
+                    return Poll::Ready(match res {
+                        Ok(value) => JoinOutcome::Ok(value),
+                        Err(err) => JoinOutcome::TaskErr(err),
+                    });
                 }
 
-                Self::register_waker_on::<R::Storage>(waker_node, arena, header, cx);
+                if let Err(err) =
+                    Self::register_waker_on::<R::Storage>(waker_node, arena, header, cx)
+                {
+                    return Poll::Ready(JoinOutcome::RuntimeErr(err));
+                }
                 Poll::Pending
             }
-            JoinSource::Routed { state, resolved } => {
-                loop {
-                    if let Some(res) = resolved {
-                        let header = res.task.header();
-                        if header.is_completed() {
-                            let access =
-                                res.access.take().expect("routed task access already taken");
-                            let output = access.take_result();
-                            access.reclaim(arena);
-                            return Poll::Ready(output);
-                        }
+            JoinSource::Routed { state, resolved } => loop {
+                if let Some(res) = resolved {
+                    let header = res.task.header();
+                    if header.is_completed() {
+                        let Some(access) = res.access.take() else {
+                            return Poll::Ready(JoinOutcome::RuntimeErr(
+                                RuntimeError::InvariantViolation {
+                                    site: "JoinHandle::poll(Routed)",
+                                    detail: "routed task access already taken",
+                                }
+                                .to_report(),
+                            ));
+                        };
+                        let outcome = access.take_result();
+                        access.reclaim(arena);
+                        return Poll::Ready(match outcome {
+                            RoutedTakeResult::Ok(value) => JoinOutcome::Ok(value),
+                            RoutedTakeResult::TaskErr(err) => JoinOutcome::TaskErr(err),
+                            RoutedTakeResult::RuntimeErr(err) => JoinOutcome::RuntimeErr(err),
+                        });
+                    }
 
-                        Self::register_waker_on::<R::Storage>(waker_node, arena, header, cx);
-                        return Poll::Pending;
-                    } else {
-                        match state.try_take_ready() {
-                            Ok(Some(ready)) => {
-                                let converted_task = unsafe {
-                                    R::from_header(ready.task.header()
-                                        as *const GenericTaskHeader<AtomicStorage>
-                                        as *const GenericTaskHeader<R::Storage>)
-                                };
-                                *resolved = Some(ResolvedRoutedTask {
-                                    task: converted_task,
-                                    access: Some(ready.access),
-                                });
-                                // Continue to poll the newly resolved task
-                            }
-                            Ok(None) => {
-                                state.register(cx.waker());
-                                // Double check to avoid race condition
-                                if let Some(ready) = state.try_take_ready()? {
+                    if let Err(err) =
+                        Self::register_waker_on::<R::Storage>(waker_node, arena, header, cx)
+                    {
+                        return Poll::Ready(JoinOutcome::RuntimeErr(err));
+                    }
+                    return Poll::Pending;
+                } else {
+                    match state.try_take_ready() {
+                        RoutedTakeReadyOutcome::Ready(ready) => {
+                            let converted_task = unsafe {
+                                R::from_header(ready.task.header()
+                                    as *const GenericTaskHeader<AtomicStorage>
+                                    as *const GenericTaskHeader<R::Storage>)
+                            };
+                            *resolved = Some(ResolvedRoutedTask {
+                                task: converted_task,
+                                access: Some(ready.access),
+                            });
+                        }
+                        RoutedTakeReadyOutcome::Pending => {
+                            state.register(cx.waker());
+                            match state.try_take_ready() {
+                                RoutedTakeReadyOutcome::Ready(ready) => {
                                     let converted_task = unsafe {
                                         R::from_header(ready.task.header()
                                             as *const GenericTaskHeader<AtomicStorage>
@@ -317,13 +393,24 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TEx
                                     });
                                     continue;
                                 }
-                                return Poll::Pending;
+                                RoutedTakeReadyOutcome::Pending => return Poll::Pending,
+                                RoutedTakeReadyOutcome::TaskErr(err) => {
+                                    return Poll::Ready(JoinOutcome::TaskErr(err));
+                                }
+                                RoutedTakeReadyOutcome::RuntimeErr(err) => {
+                                    return Poll::Ready(JoinOutcome::RuntimeErr(err));
+                                }
                             }
-                            Err(err) => return Poll::Ready(Err(err)),
+                        }
+                        RoutedTakeReadyOutcome::TaskErr(err) => {
+                            return Poll::Ready(JoinOutcome::TaskErr(err));
+                        }
+                        RoutedTakeReadyOutcome::RuntimeErr(err) => {
+                            return Poll::Ready(JoinOutcome::RuntimeErr(err));
                         }
                     }
                 }
-            }
+            },
         }
     }
 }

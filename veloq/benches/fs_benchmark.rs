@@ -209,7 +209,8 @@ async fn run_1gb_iteration<'a, 'ctx>(
             let _ = n;
         }
     })
-    .await;
+    .await
+    .unwrap();
 
     let flush_start = matches!(phase, BenchPhase::Flush).then(Instant::now);
     apply_sync(&file, TOTAL_SIZE, sync_mode).await;
@@ -419,8 +420,9 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                                     })
                                     .collect();
 
-                                prepare_handles.push(
-                                    s.spawn_boxed_to(worker_id, async move || {
+                                prepare_handles.push(s.spawn_boxed_to(
+                                    worker_id,
+                                    async move || {
                                         let mut files = Vec::with_capacity(FILES_PER_WORKER);
                                         for path in &prepare_path_names {
                                             if path.exists() {
@@ -451,9 +453,8 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                                         }
 
                                         Ok::<u64, std::io::Error>(bytes)
-                                    })
-                                    .expect("worker prepare task dispatch failed"),
-                                );
+                                    },
+                                ));
                             }
 
                             let mut total_bytes = 0u64;
@@ -467,7 +468,8 @@ fn benchmark_32_files_write(c: &mut Criterion) {
 
                             assert_eq!(total_bytes, TOTAL_SIZE);
                         })
-                        .await;
+                        .await
+                        .unwrap();
 
                         start.elapsed()
                     })

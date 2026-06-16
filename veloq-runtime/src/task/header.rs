@@ -1,7 +1,9 @@
 use crate::{
+    error::{Result, RuntimeError},
     runtime::{EnqueuePinnedOutcome, RuntimeSharedBase, primitives::sys},
     task::{ScopeRef, SendTaskRef, TaskHandleRef, nodes::TaskStorage},
 };
+use diagweave::prelude::*;
 use std::{
     cell::UnsafeCell,
     hint::spin_loop,
@@ -156,7 +158,7 @@ impl<'a, S: Storage> Drop for TaskWakeGuard<'a, S> {
 pub struct TaskVTable<S: Storage> {
     pub wake: unsafe fn(data: NonNull<GenericTaskHeader<S>>),
     pub wake_by_ref: unsafe fn(data: &GenericTaskHeader<S>),
-    pub poll: unsafe fn(data: &GenericTaskHeader<S>, worker_id: usize) -> bool,
+    pub poll: unsafe fn(data: &GenericTaskHeader<S>, worker_id: usize) -> Result<bool>,
     pub drop: unsafe fn(data: NonNull<GenericTaskHeader<S>>),
 }
 
@@ -468,19 +470,19 @@ impl<S: Storage> GenericTaskHeader<S> {
     }
 
     #[inline]
-    pub(crate) fn runtime(&self) -> &RuntimeSharedBase {
-        unsafe {
-            (*self.runtime.get())
-                .expect("runtime not initialized")
-                .as_ref()
-        }
+    pub(crate) fn runtime(&self) -> Result<&RuntimeSharedBase> {
+        unsafe { *self.runtime.get() }
+            .map(|ptr| unsafe { ptr.as_ref() })
+            .ok_or(RuntimeError::MissingRuntimeBinding)
+            .trans()
     }
 
     #[inline]
-    pub(crate) fn notify_runtime_active(&self) {
-        let runtime = self.runtime();
+    pub(crate) fn notify_runtime_active(&self) -> Result<()> {
+        let runtime = self.runtime()?;
         runtime.idle.event_count.notify();
         runtime.wake_worker(self.worker_id());
+        Ok(())
     }
 
     /// 唤醒任务（消耗所有权）。
@@ -504,7 +506,7 @@ impl<S: Storage> GenericTaskHeader<S> {
     /// # Safety
     /// 调用者必须确保 `self` 处于可被 poll 的正确状态下。
     #[inline]
-    pub(crate) unsafe fn poll(&self, worker_id: usize) -> bool {
+    pub(crate) unsafe fn poll(&self, worker_id: usize) -> Result<bool> {
         unsafe { (self.vtable.poll)(self, worker_id) }
     }
 
@@ -522,11 +524,11 @@ impl<S: Storage> GenericTaskHeader<S> {
     ///
     /// # Safety
     /// `self_ptr` 必须是指向 `self` 的有效 non-null 指针。
-    pub(crate) unsafe fn enqueue_self(&self, self_ptr: NonNull<Self>)
+    pub(crate) unsafe fn enqueue_self(&self, self_ptr: NonNull<Self>) -> Result<()>
     where
         S: TaskStorage,
     {
-        let runtime = self.runtime();
+        let runtime = self.runtime()?;
         if !S::IS_LOCAL && self.is_pinned() {
             let task = unsafe { SendTaskRef::from_header(self_ptr.as_ptr() as *const _) };
             match runtime.enqueue_pinned(self.worker_id(), task) {
@@ -535,9 +537,10 @@ impl<S: Storage> GenericTaskHeader<S> {
                 | EnqueuePinnedOutcome::AlreadySettled => {}
                 EnqueuePinnedOutcome::NeedsCallerSettle => self.acknowledge_completion(),
             }
-            return;
+            return Ok(());
         }
-        S::enqueue(runtime, self.worker_id(), self_ptr);
+        S::enqueue(runtime, self.worker_id(), self_ptr)?;
+        Ok(())
     }
 
     /// 尝试将一个 waker 节点从任务的 waker 列表中移除。

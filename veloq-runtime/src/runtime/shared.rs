@@ -1,6 +1,7 @@
 use std::{
     hint::spin_loop,
     num::NonZeroUsize,
+    process::abort,
     ptr::NonNull,
     sync::{
         Arc,
@@ -186,10 +187,14 @@ impl<T> RuntimeShared<T> {
                 },
                 shutdown: AtomicBool::new(false),
                 worker_tick_hook,
-                tls: Tls::new(|| panic!("RuntimeContext accessed outside of a worker thread")),
+                tls: Tls::new(|| RuntimeContext {
+                    worker_id: usize::MAX,
+                    rand: FastRand::new(u64::MAX),
+                    worker: Worker::new_lifo(),
+                }),
             },
             idle_hook,
-            extra_tls: Tls::new(|| panic!("extra TLS accessed outside of a worker thread")),
+            extra_tls: Tls::new(|| abort()),
         }
     }
 }
@@ -201,8 +206,12 @@ impl RuntimeSharedBase {
 
     #[inline]
     pub fn worker_count(&self) -> NonZeroUsize {
-        NonZeroUsize::new(self.registry.workers.len())
-            .expect("runtime must have at least one worker")
+        if let Some(count) = NonZeroUsize::new(self.registry.workers.len()) {
+            count
+        } else {
+            // runtime 初始化路径保证至少 1 个 worker，回退仅用于防御式容错。
+            unsafe { NonZeroUsize::new_unchecked(1) }
+        }
     }
 
     #[inline]
@@ -219,19 +228,10 @@ impl RuntimeSharedBase {
         .with_category("runtime.dispatch")
     }
 
-    #[inline]
-    fn assert_worker_id(&self, worker_id: usize) {
-        let worker_count = self.registry.workers.len();
-        assert!(
-            worker_id < worker_count,
-            "worker_id {worker_id} is out of bounds (worker_count: {worker_count})"
-        );
-    }
-
     /// 将本地任务入队当前线程的本地队列。
-    pub(crate) fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef) {
+    pub(crate) fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef) -> Result<()> {
         if task.header().is_completed() {
-            return;
+            return Ok(());
         }
         if task.header().try_mark_queued() {
             let worker = &self.registry.workers[worker_id];
@@ -241,14 +241,21 @@ impl RuntimeSharedBase {
                 if task.header().clear_queued() {
                     task.header().acknowledge_completion();
                 }
-            } else {
-                task.header().notify_runtime_active();
+            } else if let Err(err) = task.header().notify_runtime_active() {
+                worker.local_count.fetch_sub(1, Ordering::Release);
+                if task.header().clear_queued() {
+                    task.header().acknowledge_completion();
+                }
+                return Err(err);
             }
         }
+        Ok(())
     }
 
     pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef) -> EnqueuePinnedOutcome {
-        self.assert_worker_id(worker_id);
+        if self.validate_worker_id(worker_id).is_err() {
+            return EnqueuePinnedOutcome::AbortedAcknowledged;
+        }
         let header = task.header();
         if header.is_completed() {
             if header.is_scope_acknowledged() {
@@ -318,19 +325,21 @@ impl RuntimeSharedBase {
         })
     }
 
-    fn poll_local_task(&self, worker_id: usize, task: LocalTaskRef) {
+    fn poll_local_task(&self, worker_id: usize, task: LocalTaskRef) -> Result<()> {
         if task.header().clear_queued() {
             task.header().acknowledge_completion();
+            Ok(())
         } else {
-            let _ = task.poll_task(worker_id);
+            task.poll_task(worker_id).map(|_| ())
         }
     }
 
-    pub(crate) fn poll_send_task(&self, worker_id: usize, task: SendTaskRef) {
+    pub(crate) fn poll_send_task(&self, worker_id: usize, task: SendTaskRef) -> Result<()> {
         if task.header().clear_queued() {
             task.header().acknowledge_completion();
+            Ok(())
         } else {
-            let _ = task.poll_task(worker_id);
+            task.poll_task(worker_id).map(|_| ())
         }
     }
 
@@ -342,7 +351,9 @@ impl RuntimeSharedBase {
     }
 
     pub(crate) fn enqueue_send(&self, worker_id: usize, task: SendTaskRef) {
-        self.assert_worker_id(worker_id);
+        if self.validate_worker_id(worker_id).is_err() {
+            return;
+        }
         if task.header().is_completed() {
             return;
         }
@@ -394,8 +405,8 @@ impl<T> RuntimeShared<T> {
         self.base.validate_worker_id(worker_id)
     }
 
-    pub(crate) fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef) {
-        self.base.enqueue_local(worker_id, task);
+    pub(crate) fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef) -> Result<()> {
+        self.base.enqueue_local(worker_id, task)
     }
 
     pub(crate) fn has_work(&self, worker_id: usize) -> bool {
@@ -417,7 +428,9 @@ impl<T> RuntimeShared<T> {
     }
 
     pub(crate) fn enqueue_send(&self, worker_id: usize, task: SendTaskRef) {
-        self.base.assert_worker_id(worker_id);
+        if self.base.validate_worker_id(worker_id).is_err() {
+            return;
+        }
         if task.header().is_completed() {
             return;
         }
@@ -464,8 +477,8 @@ impl<T> RuntimeShared<T> {
     pub(crate) fn drive_worker<'a, S: ScopeStorage, O: Ownership + 'a>(
         &self,
         completion: Option<&O::Shared<GenericScopeCompletion<S, O>>>,
-    ) {
-        self.base.tls.with(move |ctx| {
+    ) -> Result<()> {
+        self.base.tls.with(move |ctx| -> Result<()> {
             let worker_id = ctx.worker_id;
 
             let worker_tick_hook = self.base.worker_tick_hook;
@@ -486,11 +499,11 @@ impl<T> RuntimeShared<T> {
                 }
 
                 if completion.map(|c| c.is_done()).unwrap_or(false) {
-                    return;
+                    return Ok(());
                 }
 
                 if completion.is_none() && worker_id == 0 {
-                    return;
+                    return Ok(());
                 }
 
                 tick = tick.wrapping_add(1);
@@ -498,23 +511,23 @@ impl<T> RuntimeShared<T> {
                 if processed_tasks >= 64 {
                     processed_tasks = 0;
                     if let Some(task) = self.base.pop_global() {
-                        self.base.poll_send_task(worker_id, task);
+                        self.base.poll_send_task(worker_id, task)?;
                         progressed = true;
                     }
                 }
 
                 if !progressed && let Some(task) = self.base.fn_pop_send(worker_id) {
-                    self.base.poll_send_task(worker_id, task);
+                    self.base.poll_send_task(worker_id, task)?;
                     progressed = true;
                 }
 
                 if !progressed && let Some(task) = self.base.fn_pop_pinned(worker_id) {
-                    self.base.poll_send_task(worker_id, task);
+                    self.base.poll_send_task(worker_id, task)?;
                     progressed = true;
                 }
 
                 if !progressed && let Some(task) = self.base.fn_pop_local(worker_id) {
-                    self.base.poll_local_task(worker_id, task);
+                    self.base.poll_local_task(worker_id, task)?;
                     progressed = true;
                 }
 
@@ -522,14 +535,14 @@ impl<T> RuntimeShared<T> {
                     && tick.is_multiple_of(INJECTOR_CHECK_INTERVAL)
                     && let Some(task) = self.base.pop_global()
                 {
-                    self.base.poll_send_task(worker_id, task);
+                    self.base.poll_send_task(worker_id, task)?;
                     progressed = true;
                 }
 
                 if !progressed
                     && let Some(task) = self.base.registry.workers[worker_id].remote_queue.pop()
                 {
-                    self.base.poll_send_task(worker_id, task);
+                    self.base.poll_send_task(worker_id, task)?;
                     progressed = true;
                 }
 
@@ -540,7 +553,7 @@ impl<T> RuntimeShared<T> {
 
                 for _ in 0..4 {
                     if let Some(task) = self.base.steal_send(worker_id, &ctx.rand) {
-                        self.base.poll_send_task(worker_id, task);
+                        self.base.poll_send_task(worker_id, task)?;
                         progressed = true;
                         break;
                     }
@@ -555,8 +568,9 @@ impl<T> RuntimeShared<T> {
                 if let Some(registration) = completion_registration.as_mut() {
                     registration.register(&waker);
                 }
-                RuntimeProgressCoordinator::new(self, worker_id).run(completion.map(|c| &**c));
+                RuntimeProgressCoordinator::new(self, worker_id).run(completion.map(|c| &**c))?;
             }
+            Ok(())
         })
     }
 }

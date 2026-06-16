@@ -47,7 +47,8 @@ fn test_sleep_local_basic() {
                 let elapsed = handle.await.expect("local sleep task failed");
                 assert!(elapsed >= Duration::from_millis(100));
             })
-            .await;
+            .await
+            .unwrap();
         })
         .unwrap();
 }
@@ -253,7 +254,8 @@ fn test_concurrent_sleeps() {
                     let _ = dur;
                 }
             })
-            .await;
+            .await
+            .unwrap();
         })
         .unwrap();
 }
@@ -271,7 +273,8 @@ fn test_mixed_local_and_sync_sleeps() {
                 });
                 assert_eq!(h_sync.await.expect("sync task failed"), "sync");
             })
-            .await;
+            .await
+            .unwrap();
 
             ctx.scope_local(async |s| {
                 let h_local = s.spawn_boxed_local(async move {
@@ -280,7 +283,8 @@ fn test_mixed_local_and_sync_sleeps() {
                 });
                 assert_eq!(h_local.await.expect("local task failed"), "local");
             })
-            .await;
+            .await
+            .unwrap();
         })
         .unwrap();
 }

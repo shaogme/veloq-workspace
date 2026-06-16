@@ -48,7 +48,8 @@ fn tcp_connect_smoke() {
                     drop(stream);
                 });
             })
-            .await;
+            .await
+            .unwrap();
         })
         .unwrap();
 }
@@ -102,7 +103,8 @@ fn tcp_read_exact_write_all() {
                     assert_eq!(buf.as_slice(), DATA);
                 });
             })
-            .await;
+            .await
+            .unwrap();
         })
         .unwrap();
 }
@@ -165,7 +167,8 @@ fn tcp_ipv6() {
                     drop(stream);
                 });
             })
-            .await;
+            .await
+            .unwrap();
         })
         .unwrap();
 }
@@ -198,7 +201,8 @@ fn tcp_recv_zero_bytes() {
                     }
                 });
             })
-            .await;
+            .await
+            .unwrap();
         })
         .unwrap();
 }
@@ -231,7 +235,8 @@ fn tcp_heap_buffer() {
                     stream.send(buf).await.expect("Client send failed");
                 });
             })
-            .await;
+            .await
+            .unwrap();
         })
         .unwrap();
 }
@@ -263,7 +268,8 @@ fn tcp_multiple_connections() {
                     }
                 });
             })
-            .await;
+            .await
+            .unwrap();
         })
         .unwrap();
 }
@@ -303,7 +309,8 @@ fn multithread_tcp_connections() {
                     });
                 }
             })
-            .await;
+            .await
+            .unwrap();
 
             assert_eq!(connection_count.load(Ordering::SeqCst), NUM_WORKERS);
         })
@@ -382,7 +389,8 @@ fn multithread_tcp_echo() {
                     done_tx.send(()).unwrap();
                 });
             })
-            .await;
+            .await
+            .unwrap();
         })
         .unwrap();
 }
@@ -423,7 +431,8 @@ fn multithread_concurrent_tcp_clients() {
                 }
                 server_h.await.expect("server task failed");
             })
-            .await;
+            .await
+            .unwrap();
 
             assert_eq!(connection_count.load(Ordering::SeqCst), NUM_CLIENTS);
         })
@@ -459,7 +468,8 @@ fn tcp_cancel_recv() {
                 };
             });
             })
-            .await;
+            .await
+            .unwrap();
         })
         .unwrap();
 }

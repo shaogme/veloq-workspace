@@ -44,21 +44,21 @@ error[E0716]: temporary value dropped while borrowed
    = note: this error originates in the macro `task_local` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0716]: temporary value dropped while borrowed
-  --> tests/ui/task_lifetime_fail.rs:19:13
+  --> tests/ui/task_lifetime_fail.rs:20:13
    |
-18 |           ctx.scope(async |s| {
+19 |           ctx.scope(async |s| {
    |                            - lifetime `'1` appears in the type of `s`
-19 | /             task!(t, async {
-20 | |                 veloq_runtime::task::yield_now().await;
+20 | /             task!(t, async {
 21 | |                 veloq_runtime::task::yield_now().await;
 22 | |                 veloq_runtime::task::yield_now().await;
 23 | |                 veloq_runtime::task::yield_now().await;
-24 | |                 42
-25 | |             });
+24 | |                 veloq_runtime::task::yield_now().await;
+25 | |                 42
+26 | |             });
    | |______________^ creates a temporary value which is freed while still in use
-26 |               let _ = s.spawn(&t);
+27 |               let _ = s.spawn(&t);
    |                       ----------- argument requires that borrow lasts for `'1`
-27 |           })
+28 |           })
    |           - temporary value is freed at the end of this statement
    |
 note: requirement that the value outlives `'1` introduced here
@@ -69,21 +69,21 @@ note: requirement that the value outlives `'1` introduced here
    = note: this error originates in the macro `task` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0716]: temporary value dropped while borrowed
-  --> tests/ui/task_lifetime_fail.rs:19:13
+  --> tests/ui/task_lifetime_fail.rs:20:13
    |
-18 |           ctx.scope(async |s| {
+19 |           ctx.scope(async |s| {
    |                            - lifetime `'1` appears in the type of `s`
-19 | /             task!(t, async {
-20 | |                 veloq_runtime::task::yield_now().await;
+20 | /             task!(t, async {
 21 | |                 veloq_runtime::task::yield_now().await;
 22 | |                 veloq_runtime::task::yield_now().await;
 23 | |                 veloq_runtime::task::yield_now().await;
-24 | |                 42
-25 | |             });
+24 | |                 veloq_runtime::task::yield_now().await;
+25 | |                 42
+26 | |             });
    | |______________^ creates a temporary value which is freed while still in use
-26 |               let _ = s.spawn(&t);
+27 |               let _ = s.spawn(&t);
    |                       ----------- argument requires that borrow lasts for `'1`
-27 |           })
+28 |           })
    |           - temporary value is freed at the end of this statement
    |
    = note: this error originates in the macro `task` (in Nightly builds, run with -Z macro-backtrace for more info)

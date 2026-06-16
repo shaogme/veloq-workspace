@@ -94,7 +94,8 @@ fn udp_send_receive() {
                     assert_eq!(sent, data.len());
                 });
             })
-            .await;
+            .await
+            .unwrap();
         })
         .unwrap();
 }
@@ -152,10 +153,12 @@ fn udp_echo() {
                                 .expect("Client send_to failed");
                         });
                     })
-                    .await;
+                    .await
+                    .unwrap();
                 });
             })
-            .await;
+            .await
+            .unwrap();
         })
         .unwrap();
 }
@@ -199,7 +202,8 @@ fn udp_multiple_messages() {
                     }
                 });
             })
-            .await;
+            .await
+            .unwrap();
 
             let mut received = Vec::with_capacity(NUM_MESSAGES);
             for _ in 0..NUM_MESSAGES {
@@ -249,7 +253,8 @@ fn udp_large_data() {
                     assert_eq!(bytes, DATA_SIZE);
                 });
             })
-            .await;
+            .await
+            .unwrap();
         })
         .unwrap();
 }
@@ -285,7 +290,8 @@ fn udp_heap_buffer() {
                     socket2.send_to(buf, addr1).await.expect("send_to failed");
                 });
             })
-            .await;
+            .await
+            .unwrap();
         })
         .unwrap();
 }
@@ -364,7 +370,8 @@ fn udp_read_exact_write_all() {
                         .expect("Client write_all failed");
                 });
             })
-            .await;
+            .await
+            .unwrap();
         })
         .unwrap();
 }
@@ -419,7 +426,8 @@ fn multithread_udp_no_echo() {
                     });
                 }
             })
-            .await;
+            .await
+            .unwrap();
 
             assert_eq!(completed.load(Ordering::SeqCst), NUM_WORKERS);
         })
@@ -485,12 +493,14 @@ fn multithread_udp_echo() {
                                 .expect("Client send_to failed");
                         });
                     })
-                    .await;
+                    .await
+                    .unwrap();
 
                     done_tx.send(()).unwrap();
                 });
             })
-            .await;
+            .await
+            .unwrap();
         })
         .unwrap();
 }
@@ -545,7 +555,8 @@ fn multithread_udp_cross_worker_drop_is_routed() {
                                 .expect("probe send_to failed");
                         });
                     })
-                    .await;
+                    .await
+                    .unwrap();
                 });
 
                 s.spawn_boxed(async move {
@@ -555,7 +566,8 @@ fn multithread_udp_cross_worker_drop_is_routed() {
                     done_tx.send(()).unwrap();
                 });
             })
-            .await;
+            .await
+            .unwrap();
         })
         .unwrap();
 }
@@ -624,7 +636,8 @@ fn multithread_concurrent_udp_clients() {
                     handle.await.expect("client task failed");
                 }
             })
-            .await;
+            .await
+            .unwrap();
 
             let mut peers = HashSet::with_capacity(NUM_CLIENTS);
             for _ in 0..NUM_CLIENTS {

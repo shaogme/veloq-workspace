@@ -1,5 +1,4 @@
-use veloq_runtime::runtime::Runtime;
-use veloq_runtime::task::yield_now;
+use veloq_runtime::{runtime::Runtime, task::yield_now};
 
 #[test]
 fn test_panic_propagation() {
@@ -15,7 +14,8 @@ fn test_panic_propagation() {
                 });
                 println!("主任务等待 scope 结束...");
             })
-            .await;
+            .await
+            .unwrap();
             println!("如果不传播，这里会被打印");
         })
         .unwrap();

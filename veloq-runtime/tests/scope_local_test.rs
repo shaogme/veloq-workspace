@@ -1,5 +1,9 @@
-use veloq_runtime::runtime::Runtime;
-use veloq_runtime::task_local;
+use veloq_runtime::{
+    runtime::Runtime,
+    scope::JoinOutcome,
+    task::{TaskError, yield_now},
+    task_local,
+};
 
 #[test]
 fn test_scope_local_basic() {
@@ -12,7 +16,8 @@ fn test_scope_local_basic() {
             assert_eq!(h1.await.unwrap(), 2);
             assert_eq!(h2.await.unwrap(), 4);
         })
-        .await;
+        .await
+        .unwrap();
     })
     .unwrap();
 }
@@ -28,10 +33,12 @@ fn test_scope_local_nested() {
                     h2.await.unwrap()
                 })
                 .await
+                .unwrap()
             });
             assert_eq!(h1.await.unwrap(), 10);
         })
-        .await;
+        .await
+        .unwrap();
     })
     .unwrap();
 }
@@ -52,28 +59,24 @@ fn test_scope_local_nested_in_async_scope_cancellation() {
 
                     // Child handle should be cancelled
                     let res = child_handle.await;
-                    assert!(matches!(
-                        res,
-                        Err(veloq_runtime::task::TaskError::Cancelled)
-                    ));
+                    assert!(matches!(res, JoinOutcome::TaskErr(TaskError::Cancelled)));
                 })
-                .await;
+                .await
+                .unwrap();
             });
 
             // Let the tasks start and suspend
-            veloq_runtime::task::yield_now().await;
-            veloq_runtime::task::yield_now().await;
+            yield_now().await;
+            yield_now().await;
 
             // Trigger parent cancellation
             parent_token.cancel();
 
             let res = handle.await;
-            assert!(matches!(
-                res,
-                Err(veloq_runtime::task::TaskError::Cancelled)
-            ));
+            assert!(matches!(res, JoinOutcome::TaskErr(TaskError::Cancelled)));
         })
-        .await;
+        .await
+        .unwrap();
     })
     .unwrap();
 }

@@ -141,7 +141,12 @@ impl<T, WF> Runtime<T, WF> {
                     let _tls_cleanup = TlsCleanupGuard(&shared_ref.base.tls);
                     let _extra_cleanup = TlsCleanupGuard(&shared_ref.extra_tls);
 
-                    shared_ref.drive_worker::<AtomicStorage, ArcOwnership>(None);
+                    if let Err(err) = shared_ref.drive_worker::<AtomicStorage, ArcOwnership>(None) {
+                        let mut guard = thread_errors_ref.lock().unwrap_or_else(|e| e.into_inner());
+                        if guard.is_none() {
+                            *guard = Some(err);
+                        }
+                    }
                 });
             }
 
@@ -184,7 +189,7 @@ impl<T, WF> Runtime<T, WF> {
             let waker = create_waker(signal.clone());
             let mut cx = Context::from_waker(&waker);
 
-            shared_ref.drive_worker::<AtomicStorage, ArcOwnership>(None);
+            shared_ref.drive_worker::<AtomicStorage, ArcOwnership>(None)?;
 
             let mut fut = pin!(f(ctx));
             let block_res = loop {

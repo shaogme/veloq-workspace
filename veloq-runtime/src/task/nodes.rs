@@ -1,4 +1,5 @@
 use crate::{
+    error::Result as RuntimeResult,
     runtime::RuntimeSharedBase,
     task::{
         GenericTaskHeader, INTRUSIVE_WAKER_VTABLE, LOCAL_INTRUSIVE_WAKER_VTABLE, LocalTaskRef,
@@ -28,7 +29,7 @@ pub trait TaskStorage: Storage + Sized {
         runtime: &RuntimeSharedBase,
         worker_id: usize,
         data: NonNull<GenericTaskHeader<Self>>,
-    );
+    ) -> RuntimeResult<()>;
 }
 
 impl TaskStorage for LocalStorage {
@@ -38,8 +39,8 @@ impl TaskStorage for LocalStorage {
         runtime: &RuntimeSharedBase,
         worker_id: usize,
         data: NonNull<GenericTaskHeader<Self>>,
-    ) {
-        unsafe { runtime.enqueue_local(worker_id, LocalTaskRef::from_header(data.as_ptr())) };
+    ) -> RuntimeResult<()> {
+        unsafe { runtime.enqueue_local(worker_id, LocalTaskRef::from_header(data.as_ptr())) }
     }
 }
 
@@ -50,8 +51,11 @@ impl TaskStorage for AtomicStorage {
         runtime: &RuntimeSharedBase,
         worker_id: usize,
         data: NonNull<GenericTaskHeader<Self>>,
-    ) {
-        unsafe { runtime.enqueue_send(worker_id, SendTaskRef::from_header(data.as_ptr())) };
+    ) -> RuntimeResult<()> {
+        unsafe {
+            runtime.enqueue_send(worker_id, SendTaskRef::from_header(data.as_ptr()));
+        }
+        Ok(())
     }
 }
 
@@ -94,10 +98,14 @@ where
     /// 优化 VTable 的定义，确保其作为静态引用在编译期完全内联。
     const VTABLE: &'static TaskVTable<S> = &TaskVTable {
         wake: |data| unsafe {
-            data.as_ref().enqueue_self(data);
+            if data.as_ref().enqueue_self(data).is_err() {
+                data.as_ref().cancel();
+            }
         },
         wake_by_ref: |header| unsafe {
-            header.enqueue_self(NonNull::from(header));
+            if header.enqueue_self(NonNull::from(header)).is_err() {
+                header.cancel();
+            }
         },
         poll: |header, worker_id| unsafe {
             let raw_ptr = header as *const GenericTaskHeader<S> as *const Self;
@@ -138,10 +146,10 @@ where
 {
     type Storage = S;
 
-    fn poll_raw(&self, _worker_id: usize) -> bool {
+    fn poll_raw(&self, _worker_id: usize) -> RuntimeResult<bool> {
         let waker = self.header.create_waker(S::WAKER_VTABLE);
         let mut cx = Context::from_waker(&waker);
-        self.poll_task(&mut cx)
+        Ok(self.poll_task(&mut cx))
     }
 
     fn header(&self) -> &GenericTaskHeader<Self::Storage> {

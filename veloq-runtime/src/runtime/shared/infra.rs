@@ -11,6 +11,7 @@ use std::{
 use veloq_storage::{AtomicOptionPtr, StateOptionPtr};
 
 use crate::{
+    error::Result,
     runtime::{
         context::{IdleDecision, IdleWaitStrategy},
         primitives::{EventCount, Parker, ParkerInner, Unparker},
@@ -430,7 +431,7 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
     pub(crate) fn run<S: ScopeStorage, O: Ownership>(
         &self,
         completion: Option<&GenericScopeCompletion<S, O>>,
-    ) {
+    ) -> Result<()> {
         let idle_decision = self
             .shared
             .idle_hook
@@ -438,7 +439,7 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
             .unwrap_or(IdleDecision::wait(IdleWaitStrategy::Block));
         let Some(wait_strategy) = idle_decision.into_wait_strategy() else {
             thread::yield_now();
-            return;
+            return Ok(());
         };
 
         let base = &self.shared.base;
@@ -452,17 +453,18 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
 
         if self.should_retry(seq, completion) {
             self.leave_idle(group_idx);
-            return;
+            return Ok(());
         }
 
         if let Some(task) = base.scheduler.pop_global() {
             self.leave_idle(group_idx);
-            base.poll_send_task(self.worker_id, task);
-            return;
+            base.poll_send_task(self.worker_id, task)?;
+            return Ok(());
         }
 
         self.park(wait_strategy, completion);
         self.leave_idle(group_idx);
+        Ok(())
     }
 
     fn should_retry<S: ScopeStorage, O: Ownership>(

@@ -23,7 +23,7 @@ use crate::{
 };
 
 use crossbeam_deque::Worker;
-use diagweave::DiagnosticResult;
+use diagweave::prelude::*;
 use veloq_atomic_waker::AtomicWaker;
 use veloq_storage::AtomicStorage;
 
@@ -169,19 +169,32 @@ impl<'rt, T> RuntimeScopeContext<'rt, T> {
         {
             type Storage = AtomicStorage;
 
-            fn poll_raw(&self, _worker_id: usize) -> bool {
-                let job = unsafe { &mut *self.job.get() }
-                    .take()
-                    .expect("job already taken");
+            fn poll_raw(&self, _worker_id: usize) -> Result<bool> {
+                let Some(job) = (unsafe { &mut *self.job.get() }).take() else {
+                    self.slot.fail(
+                        RuntimeError::InvariantViolation {
+                            site: "RuntimeScopeContext::route_to::RouteJobTask::poll_raw",
+                            detail: "job already taken",
+                        }
+                        .to_report()
+                        .with_category("runtime.route"),
+                    )?;
+                    self.header.mark_completed_and_notify();
+                    unsafe {
+                        let header_ptr = NonNull::from(&self.header);
+                        GenericTaskHeader::drop_task(header_ptr);
+                    }
+                    return Ok(true);
+                };
                 let fut = job();
-                self.slot.set(fut);
+                self.slot.set(fut)?;
                 // Mark as completed before self-destruct
                 self.header.mark_completed_and_notify();
                 unsafe {
                     let header_ptr = NonNull::from(&self.header);
                     GenericTaskHeader::drop_task(header_ptr);
                 }
-                true
+                Ok(true)
             }
 
             fn header(&self) -> &GenericTaskHeader<Self::Storage> {
@@ -260,31 +273,31 @@ impl<'rt, T> RuntimeScopeContext<'rt, T> {
         R: Send,
     {
         let worker_id = task.header().worker_id();
-        Ok(self.route_to(worker_id, f)?.await)
+        self.route_to(worker_id, f)?.await
     }
 
     /// Creates a new thread-safe (Send) asynchronous scope.
-    pub async fn scope<'scope, R, F>(&self, f: F) -> R
+    pub async fn scope<'scope, R, F>(&self, f: F) -> Result<R>
     where
         F: for<'scope_ref> AsyncFnOnce(&'scope_ref AsyncScope<'rt, 'scope, T>) -> R,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
         let s = AsyncScope::new(*self, parent);
         let res = f(&s).await;
-        s.wait_all().await;
-        res
+        s.wait_all().await?;
+        Ok(res)
     }
 
     /// Creates a new thread-local asynchronous scope.
-    pub async fn scope_local<'scope, R, F>(&self, f: F) -> R
+    pub async fn scope_local<'scope, R, F>(&self, f: F) -> Result<R>
     where
         F: for<'scope_ref> AsyncFnOnce(&'scope_ref LocalAsyncScope<'rt, 'scope, T>) -> R,
     {
         let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
         let s = LocalAsyncScope::new(*self, parent);
         let res = f(&s).await;
-        s.wait_all().await;
-        res
+        s.wait_all().await?;
+        Ok(res)
     }
 
     /// Returns the current worker id.
@@ -301,7 +314,7 @@ pub(crate) type IdleHook<T> = fn(&RuntimeShared<T>) -> IdleDecision;
 pub(crate) type WorkerTickHook = fn();
 
 pub(crate) struct RouteCell<T> {
-    value: Mutex<Option<T>>,
+    value: Mutex<Option<Result<T>>>,
     waker: AtomicWaker,
 }
 
@@ -313,18 +326,34 @@ impl<T> RouteCell<T> {
         })
     }
 
-    pub(crate) fn set(&self, value: T) {
-        let mut slot = self.value.lock().expect("worker route slot poisoned");
+    pub(crate) fn set(&self, value: T) -> Result<()> {
+        let mut slot = self.value.lock().map_err(|_| RuntimeError::PoisonedLock {
+            component: "runtime.route_slot",
+        })?;
         debug_assert!(slot.is_none(), "worker route slot already populated");
-        *slot = Some(value);
+        *slot = Some(Ok(value));
         self.waker.wake();
+        Ok(())
     }
 
-    pub(crate) fn take(&self) -> Option<T> {
-        self.value
+    pub(crate) fn fail(&self, err: Report<RuntimeError>) -> Result<()> {
+        let mut slot = self.value.lock().map_err(|_| RuntimeError::PoisonedLock {
+            component: "runtime.route_slot",
+        })?;
+        debug_assert!(slot.is_none(), "worker route slot already populated");
+        *slot = Some(Err(err));
+        self.waker.wake();
+        Ok(())
+    }
+
+    pub(crate) fn take(&self) -> Result<Option<Result<T>>> {
+        Ok(self
+            .value
             .lock()
-            .expect("worker route slot poisoned")
-            .take()
+            .map_err(|_| RuntimeError::PoisonedLock {
+                component: "runtime.route_slot",
+            })?
+            .take())
     }
 
     pub(crate) fn register(&self, waker: &Waker) {
@@ -347,25 +376,43 @@ impl<F> Future for RoutedFuture<F>
 where
     F: Future,
 {
-    type Output = F::Output;
+    type Output = Result<F::Output>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
         if this.inner.is_none() {
-            if let Some(op) = this.slot.take() {
-                this.inner = Some(op);
+            if let Some(op) = this.slot.take()? {
+                match op {
+                    Ok(op) => this.inner = Some(op),
+                    Err(err) => return Poll::Ready(Err(err)),
+                }
             } else {
                 this.slot.register(cx.waker());
-                if let Some(op) = this.slot.take() {
-                    this.inner = Some(op);
+                if let Some(op) = this.slot.take()? {
+                    match op {
+                        Ok(op) => this.inner = Some(op),
+                        Err(err) => return Poll::Ready(Err(err)),
+                    }
                 } else {
                     return Poll::Pending;
                 }
             }
         }
-        let inner = this.inner.as_mut().expect("route future missing inner op");
-        unsafe { Pin::new_unchecked(inner) }.poll(cx)
+        let Some(inner) = this.inner.as_mut() else {
+            let err = RuntimeError::InvariantViolation {
+                site: "RoutedFuture::poll",
+                detail: "route future missing inner op",
+            }
+            .to_report()
+            .with_category("runtime.route");
+            return Poll::Ready(Err(err));
+        };
+
+        match unsafe { Pin::new_unchecked(inner) }.poll(cx) {
+            Poll::Ready(output) => Poll::Ready(Ok(output)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 

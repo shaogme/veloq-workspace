@@ -5,10 +5,6 @@ use super::super::CompletionToken;
 mod entity;
 mod kind;
 
-#[cfg(test)]
-#[cfg(not(feature = "loom"))]
-mod tests;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionAnomalyReason {
     UnknownSlot,

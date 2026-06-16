@@ -1,6 +1,10 @@
-use veloq_runtime::runtime::{Runtime, RuntimeScopeContext};
-use veloq_runtime::task::yield_now;
-use veloq_runtime::{task, task_local};
+use veloq_runtime::{
+    runtime::{Runtime, RuntimeScopeContext},
+    scope::JoinOutcome,
+    task,
+    task::{TaskError, yield_now},
+    task_local,
+};
 
 // --- 测试用例 ---
 
@@ -58,7 +62,8 @@ fn main() {
                 let biz_res: Result<String, &str> = biz_handle.await.unwrap();
                 println!("  >> 业务任务结果: {:?}", biz_res);
             })
-            .await;
+            .await
+            .unwrap();
 
             // --- 测试显式取消 (Explicit Cancellation) ---
             println!("\n  [测试] 测试显式取消：手动取消特定任务...");
@@ -79,13 +84,14 @@ fn main() {
                 // cancel() only requests cancellation; await waits until the task has stopped.
 
                 match h1.await {
-                    Err(veloq_runtime::task::TaskError::Cancelled) => {
+                    JoinOutcome::TaskErr(TaskError::Cancelled) => {
                         println!("    >> 确认：任务已被手动取消")
                     }
                     other => println!("    >> 错误：意外的返回结果 {:?}", other),
                 }
             })
-            .await;
+            .await
+            .unwrap();
 
             // --- 测试异步取消通知 (Async Cancellation Notification) ---
             println!("\n  [测试] 测试异步取消通知：任务主动监听取消信号...");
@@ -115,7 +121,8 @@ fn main() {
                 let res = h.await.unwrap();
                 println!("    >> 任务清理结果: {}", res);
             })
-            .await;
+            .await
+            .unwrap();
 
             // --- 测试延迟生成的任务令牌 (Lazy Task Token) ---
             println!("\n  [测试] 测试 JoinHandle 延迟生成的取消令牌...");
@@ -142,7 +149,8 @@ fn main() {
 
                 let _ = h.await;
             })
-            .await;
+            .await
+            .unwrap();
 
             // --- 测试定向分发 (Targeted Distribution) ---
             println!("\n  [测试] 测试定向分发：显式发送任务到 Worker 1...");
@@ -150,18 +158,17 @@ fn main() {
                 let mut handles = Vec::new();
                 let worker_id = target_scope.worker_id();
                 for i in 1..=3 {
-                    let h = target_scope
-                        .spawn_boxed_to(1, async move || {
-                            println!("    [Worker {}] [定向任务-{}] 正在执行...", worker_id, i);
-                        })
-                        .expect("定向任务分发失败");
+                    let h = target_scope.spawn_boxed_to(1, async move || {
+                        println!("    [Worker {}] [定向任务-{}] 正在执行...", worker_id, i);
+                    });
                     handles.push(h);
                 }
                 for h in handles {
                     let _ = h.await;
                 }
             })
-            .await;
+            .await
+            .unwrap();
 
             // --- 测试嵌套取消传播 (Nested Cancellation Propagation) ---
             println!("\n  [测试] 测试嵌套取消传播：取消父作用域应自动取消子作用域...");
@@ -179,7 +186,8 @@ fn main() {
                         }
                     });
                 })
-                .await;
+                .await
+                .unwrap();
                 println!("    [父作用域] 子作用域已退出");
 
                 yield_now().await;
@@ -187,10 +195,12 @@ fn main() {
                 println!("    >> 正在取消父作用域...");
                 token.cancel();
             })
-            .await;
+            .await
+            .unwrap();
             println!("  >> 父作用域已退出");
         })
-        .await;
+        .await
+        .unwrap();
         println!("--- scope 结束 ---");
     })
     .unwrap();

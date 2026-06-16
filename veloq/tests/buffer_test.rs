@@ -177,7 +177,8 @@ fn run_auto_expansion_multithread(mode: BufferRegistrationMode) {
                     );
                 }
             })
-            .await;
+            .await
+            .unwrap();
         })
         .unwrap();
 }

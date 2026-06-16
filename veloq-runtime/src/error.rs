@@ -1,4 +1,5 @@
-use diagweave::set;
+use diagweave::{Report, set};
+use std::result::Result as StdResult;
 
 set! {
     pub RuntimeError = {
@@ -31,7 +32,36 @@ set! {
             worker_id: usize,
             source: veloq_tls::TlsError,
         },
+
+        #[display("runtime invariant violation at {site}: {detail}")]
+        InvariantViolation {
+            site: &'static str,
+            detail: &'static str,
+        },
+
+        #[display("mutex poisoned: {component}")]
+        PoisonedLock {
+            component: &'static str,
+        },
+
+        #[display("runtime binding is missing")]
+        MissingRuntimeBinding,
+
+        #[display("arena layout overflow during {op}")]
+        ArenaLayoutOverflow {
+            op: &'static str,
+        },
+
+        #[display("arena allocation returned null during {op}")]
+        ArenaAllocationNull {
+            op: &'static str,
+        },
+
+        #[display("task result unavailable at {stage}")]
+        TaskResultUnavailable {
+            stage: &'static str,
+        },
     }
 }
 
-pub type Result<T> = std::result::Result<T, diagweave::report::Report<RuntimeError>>;
+pub type Result<T> = StdResult<T, Report<RuntimeError>>;

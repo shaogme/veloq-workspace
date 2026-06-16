@@ -1,5 +1,8 @@
-use veloq_runtime::runtime::Runtime;
-use veloq_runtime::task::{TaskError, yield_now};
+use veloq_runtime::{
+    runtime::Runtime,
+    scope::JoinOutcome,
+    task::{TaskError, yield_now},
+};
 
 #[test]
 fn test_join_handle_waits_for_task_completion_on_cancel() {
@@ -20,9 +23,10 @@ fn test_join_handle_waits_for_task_completion_on_cancel() {
             assert!(!handle.is_finished());
 
             let res = handle.await;
-            assert!(matches!(res, Err(TaskError::Cancelled)));
+            assert!(matches!(res, JoinOutcome::TaskErr(TaskError::Cancelled)));
         })
-        .await;
+        .await
+        .unwrap();
     })
     .unwrap();
 }
@@ -45,9 +49,10 @@ fn test_join_handle_cancelled_before_await() {
             assert!(!handle.is_finished());
 
             let res = handle.await;
-            assert!(matches!(res, Err(TaskError::Cancelled)));
+            assert!(matches!(res, JoinOutcome::TaskErr(TaskError::Cancelled)));
         })
-        .await;
+        .await
+        .unwrap();
     })
     .unwrap();
 }
@@ -71,9 +76,10 @@ fn test_join_handle_scope_cancel_waits_for_completion() {
             assert!(!handle.is_finished());
 
             let res = handle.await;
-            assert!(matches!(res, Err(TaskError::Cancelled)));
+            assert!(matches!(res, JoinOutcome::TaskErr(TaskError::Cancelled)));
         })
-        .await;
+        .await
+        .unwrap();
     })
     .unwrap();
 }

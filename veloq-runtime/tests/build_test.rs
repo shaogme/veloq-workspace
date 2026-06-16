@@ -1,4 +1,4 @@
-use veloq_runtime::runtime::Runtime;
+use veloq_runtime::{runtime::Runtime, scope::AsyncScope};
 
 #[test]
 fn test_nested_scope_local_build() {
@@ -9,10 +9,12 @@ fn test_nested_scope_local_build() {
                 ctx.scope_local(async |child_scope| {
                     child_scope.spawn_boxed_local(async {});
                 })
-                .await;
+                .await
+                .unwrap();
             });
         })
-        .await;
+        .await
+        .unwrap();
     })
     .unwrap();
 }
@@ -26,10 +28,12 @@ fn test_nested_scope_build_1() {
                 ctx.scope(async |child_scope| {
                     child_scope.spawn_boxed(async {});
                 })
-                .await;
+                .await
+                .unwrap();
             });
         })
-        .await;
+        .await
+        .unwrap();
     })
     .unwrap();
 }
@@ -43,10 +47,12 @@ fn test_nested_scope_build_2() {
                 ctx.scope_local(async |child_scope| {
                     child_scope.spawn_boxed(async {});
                 })
-                .await;
+                .await
+                .unwrap();
             });
         })
-        .await;
+        .await
+        .unwrap();
     })
     .unwrap();
 }
@@ -59,9 +65,11 @@ fn test_nested_scope_build_3() {
             ctx.scope_local(async |child_scope| {
                 child_scope.spawn_boxed(async {});
             })
-            .await;
+            .await
+            .unwrap();
         })
-        .await;
+        .await
+        .unwrap();
     })
     .unwrap();
 }
@@ -74,9 +82,11 @@ fn test_nested_scope_build_4() {
             ctx.scope(async |child_scope| {
                 child_scope.spawn_boxed(async {});
             })
-            .await;
+            .await
+            .unwrap();
         })
-        .await;
+        .await
+        .unwrap();
     })
     .unwrap();
 }
@@ -86,14 +96,15 @@ fn test_nested_scope_build_5() {
     let rt = Runtime::<(), _>::new();
     rt.block_on(async |ctx| {
         ctx.scope(async |parent_scope| {
-            async fn run_child_scope(child_scope: &veloq_runtime::scope::AsyncScope<'_, '_, ()>) {
+            async fn run_child_scope(child_scope: &AsyncScope<'_, '_, ()>) {
                 child_scope.spawn_boxed(async {});
             }
             parent_scope.spawn_boxed(async {
-                ctx.scope(run_child_scope).await;
+                ctx.scope(run_child_scope).await.unwrap();
             });
         })
-        .await;
+        .await
+        .unwrap();
     })
     .unwrap();
 }

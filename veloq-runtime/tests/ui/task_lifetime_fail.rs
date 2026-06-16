@@ -14,7 +14,8 @@ fn main() {
             });
             let _ = s.spawn_local(&t);
         })
-        .await;
+        .await
+        .unwrap();
         ctx.scope(async |s| {
             task!(t, async {
                 veloq_runtime::task::yield_now().await;
@@ -25,6 +26,7 @@ fn main() {
             });
             let _ = s.spawn(&t);
         })
-        .await;
+        .await
+        .unwrap();
     }).unwrap();
 }

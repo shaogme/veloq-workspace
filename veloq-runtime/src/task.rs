@@ -15,6 +15,7 @@ pub use scope::{
     ScopeParent, ScopeRef, ScopeStorage,
 };
 
+use crate::error::Result as RuntimeResult;
 use std::{
     any::Any,
     fmt::{Debug, Formatter, Result as FmtResult},
@@ -91,7 +92,7 @@ pub trait TaskHandleRef: Copy {
     unsafe fn from_header(header: *const GenericTaskHeader<Self::Storage>) -> Self;
 
     /// Polls the task through the handle.
-    fn poll_task(&self, worker_id: usize) -> bool;
+    fn poll_task(&self, worker_id: usize) -> RuntimeResult<bool>;
 
     /// # Safety
     /// The `ptr` must be a valid pointer to a task node implementing `RawTask` with the correct storage.
@@ -102,7 +103,7 @@ pub trait TaskHandleRef: Copy {
 
 pub trait RawTask {
     type Storage: Storage;
-    fn poll_raw(&self, worker_id: usize) -> bool;
+    fn poll_raw(&self, worker_id: usize) -> RuntimeResult<bool>;
     fn header(&self) -> &GenericTaskHeader<Self::Storage>;
 }
 
@@ -304,7 +305,7 @@ impl TaskHandleRef for LocalTaskRef {
     }
 
     #[inline]
-    fn poll_task(&self, worker_id: usize) -> bool {
+    fn poll_task(&self, worker_id: usize) -> RuntimeResult<bool> {
         let header = unsafe { self.header.as_ref() };
         unsafe { header.poll(worker_id) }
     }
@@ -347,7 +348,7 @@ impl TaskHandleRef for SendTaskRef {
     }
 
     #[inline]
-    fn poll_task(&self, worker_id: usize) -> bool {
+    fn poll_task(&self, worker_id: usize) -> RuntimeResult<bool> {
         let header = unsafe { self.header.as_ref() };
         unsafe { header.poll(worker_id) }
     }
@@ -405,7 +406,7 @@ impl Future for YieldNow {
 macro_rules! task_local {
     ($name:ident, $future_expr:expr) => {
         let mut __fut = $future_expr;
-        let mut __fut = unsafe { std::pin::Pin::new_unchecked(&mut __fut) };
+        let mut __fut = unsafe { core::pin::Pin::new_unchecked(&mut __fut) };
         let $name = $crate::task::LocalTaskNode::new(__fut);
     };
 }
@@ -413,7 +414,7 @@ macro_rules! task_local {
 macro_rules! task {
     ($name:ident, $future_expr:expr) => {
         let mut __fut = $future_expr;
-        let mut __fut = unsafe { std::pin::Pin::new_unchecked(&mut __fut) };
+        let mut __fut = unsafe { core::pin::Pin::new_unchecked(&mut __fut) };
         let $name = $crate::task::SendTaskNode::new(__fut);
     };
 }

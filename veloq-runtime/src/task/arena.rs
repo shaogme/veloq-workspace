@@ -11,7 +11,11 @@ use veloq_storage::{StateGuard, StateInt, StateLock, StateOptionPtr, Storage, Th
 pub trait Arena {
     /// # Safety
     /// The layout must be valid. If `drop_fn` is provided, it must be safe to call on the returned pointer.
-    unsafe fn alloc_raw(&self, layout: Layout, drop_fn: Option<unsafe fn(*mut u8)>) -> *mut u8;
+    unsafe fn alloc_raw(
+        &self,
+        layout: Layout,
+        drop_fn: Option<unsafe fn(*mut u8)>,
+    ) -> Option<NonNull<u8>>;
     /// # Safety
     /// `data_ptr` must be a pointer previously returned by `alloc_raw`.
     unsafe fn drop_object_raw(&self, data_ptr: *mut u8, layout: Layout);
@@ -67,11 +71,18 @@ impl<S: Storage> GenericArena<S> {
     /// 分配内存并记录其析构函数。
     /// # Safety
     /// The caller must ensure that `drop_fn` is valid.
-    pub unsafe fn alloc<T>(&self, layout: Layout, drop_fn: Option<unsafe fn(*mut u8)>) -> *mut u8 {
+    pub unsafe fn alloc<T>(
+        &self,
+        layout: Layout,
+        drop_fn: Option<unsafe fn(*mut u8)>,
+    ) -> Option<NonNull<u8>> {
         // 1. 如果有析构函数，需要额外分配 DropNode 空间
         let (total_layout, offset) = if drop_fn.is_some() {
             let node_layout = Layout::new::<GenericDropNode<S>>();
-            node_layout.extend(layout).expect("Layout overflow")
+            match node_layout.extend(layout) {
+                Ok(v) => v,
+                Err(_) => return None,
+            }
         } else {
             (layout, 0)
         };
@@ -84,7 +95,9 @@ impl<S: Storage> GenericArena<S> {
             res = Some(self.alloc_slow(total_layout));
         }
 
-        let (ptr, chunk_ptr) = res.unwrap();
+        let Some((ptr, chunk_ptr)) = res else {
+            return None;
+        };
 
         // 4. 增加活跃对象计数 (已经在 try_alloc_fast/alloc_slow 中处理)
 
@@ -108,9 +121,9 @@ impl<S: Storage> GenericArena<S> {
                 let mut drop_list = (*chunk_ptr).drop_list.lock();
                 drop_list.push_front(Pin::new_unchecked(&mut *node_ptr));
             }
-            data_ptr
+            NonNull::new(data_ptr)
         } else {
-            ptr
+            NonNull::new(ptr)
         }
     }
 
@@ -120,7 +133,9 @@ impl<S: Storage> GenericArena<S> {
     pub unsafe fn drop_object<T>(&self, data_ptr: *mut T, layout: Layout) {
         // 1. 计算 DropNode 的位置
         let node_layout = Layout::new::<GenericDropNode<S>>();
-        let offset = node_layout.extend(layout).unwrap().1;
+        let Ok((_, offset)) = node_layout.extend(layout) else {
+            return;
+        };
         let node_ptr = unsafe { (data_ptr as *mut u8).sub(offset) as *mut GenericDropNode<S> };
 
         let _guard = S::pin();
@@ -216,7 +231,10 @@ impl<S: Storage> GenericArena<S> {
 
         // 分配新块
         let chunk_size = 8192.max(layout.size() + layout.align());
-        let new_chunk_layout = Layout::from_size_align(chunk_size, 64).unwrap();
+        let new_chunk_layout = match Layout::from_size_align(chunk_size, 64) {
+            Ok(layout) => layout,
+            Err(_) => handle_alloc_error(layout),
+        };
         let ptr = unsafe { alloc(new_chunk_layout) };
         if ptr.is_null() {
             handle_alloc_error(new_chunk_layout);
@@ -224,7 +242,7 @@ impl<S: Storage> GenericArena<S> {
 
         let new_chunk = Box::new(GenericChunk {
             link: Link::new(),
-            ptr: NonNull::new(ptr).unwrap(),
+            ptr: NonNull::new(ptr).unwrap_or_else(|| handle_alloc_error(new_chunk_layout)),
             layout: new_chunk_layout,
             used: S::Usize::new(0),
             active_count: S::Usize::new(1), // 初始计数为 1，代表被 Arena 的 active_chunk 引用
@@ -368,7 +386,11 @@ impl<S: Storage> Drop for GenericArena<S> {
 
 impl<S: Storage> Arena for GenericArena<S> {
     #[inline]
-    unsafe fn alloc_raw(&self, layout: Layout, drop_fn: Option<unsafe fn(*mut u8)>) -> *mut u8 {
+    unsafe fn alloc_raw(
+        &self,
+        layout: Layout,
+        drop_fn: Option<unsafe fn(*mut u8)>,
+    ) -> Option<NonNull<u8>> {
         unsafe { self.alloc::<()>(layout, drop_fn) }
     }
 

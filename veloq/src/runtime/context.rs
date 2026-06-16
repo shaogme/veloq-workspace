@@ -14,6 +14,7 @@ use veloq_driver_native::{
     op::{DetachedSubmitter, DriverProvider, IntoPlatformOp, IoFd, Op, OpSubmitter},
 };
 use veloq_runtime::{
+    error::Result as RuntimeResult,
     runtime::{
         EnqueuePinnedOutcome, IdleDecision, IdleWaitStrategy, RuntimeScopeContext, RuntimeShared,
     },
@@ -249,7 +250,7 @@ impl<'a, 'ctx> RuntimeContext<'a, 'ctx> {
             .expect("RuntimeContext accessed outside of a worker thread")
     }
 
-    pub async fn scope<R, F>(&self, f: F) -> R
+    pub async fn scope<R, F>(&self, f: F) -> RuntimeResult<R>
     where
         F: for<'scope_ref, 's0, 's1, 's2, 's3> AsyncFnOnce(
             &'scope_ref AsyncScope<'s0, 's1, WorkerState<'s2, 's3>>,
@@ -258,7 +259,7 @@ impl<'a, 'ctx> RuntimeContext<'a, 'ctx> {
         self.scope.scope(f).await
     }
 
-    pub async fn scope_local<R, F>(&self, f: F) -> R
+    pub async fn scope_local<R, F>(&self, f: F) -> RuntimeResult<R>
     where
         F: for<'scope_ref, 's0, 's1, 's2, 's3> AsyncFnOnce(
             &'scope_ref LocalAsyncScope<'s0, 's1, WorkerState<'s2, 's3>>,
@@ -376,7 +377,7 @@ impl<'a, 'ctx> RuntimeContext<'a, 'ctx> {
                     ctx.driver(|mut driver| op.submit_detached(&mut driver))
                 })
                 .trans()?;
-            let (res, op_back) = routed.await.into_inner();
+            let (res, op_back) = routed.await.trans()?.into_inner();
             let op = op_back.expect("Op lost in remote submit");
             Ok((res, op))
         }
@@ -420,7 +421,7 @@ pub(crate) fn submit_control_task<'a, 'ctx>(
     impl<'a, 'ctx> RawTask for UnregisterFileTask<'a, 'ctx> {
         type Storage = AtomicStorage;
 
-        fn poll_raw(&self, _worker_id: usize) -> bool {
+        fn poll_raw(&self, _worker_id: usize) -> RuntimeResult<bool> {
             let shared = unsafe { &*self.shared_ptr };
             let _ = shared.extra_tls.try_with(|extra| {
                 let mut driver = extra.driver.borrow_mut();
@@ -431,7 +432,7 @@ pub(crate) fn submit_control_task<'a, 'ctx>(
                 let header_ptr = NonNull::from(&self.header);
                 GenericTaskHeader::drop_task(header_ptr);
             }
-            true
+            Ok(true)
         }
 
         fn header(&self) -> &GenericTaskHeader<Self::Storage> {

@@ -155,7 +155,8 @@ fn test_multithread_file_ops() {
                     });
                 }
             })
-            .await;
+            .await
+            .unwrap();
         })
         .unwrap();
 
