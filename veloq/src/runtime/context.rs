@@ -16,7 +16,8 @@ use veloq_driver_native::{
 use veloq_runtime::{
     error::Result as RuntimeResult,
     runtime::{
-        EnqueuePinnedOutcome, IdleDecision, IdleWaitStrategy, RuntimeScopeContext, RuntimeShared,
+        AsRuntimeCtx, EnqueuePinnedOutcome, IdleDecision, IdleWaitStrategy, RuntimeCtx,
+        RuntimeShared,
     },
     storage::AtomicStorage,
     task::{
@@ -62,7 +63,7 @@ impl<'a, 'ctx> DriverRegistrar<'a, 'ctx> {
         self.shared
             .extra_tls
             .try_with(|extra| f(extra))
-            .expect("RuntimeContext accessed outside of a worker thread")
+            .expect("Ctx accessed outside of a worker thread")
     }
 
     pub fn sync_to_driver(&self) {
@@ -196,14 +197,28 @@ fn sync_to_driver_internal(
 }
 
 #[derive(Clone, Copy)]
-pub struct RuntimeContext<'a, 'ctx>
+pub struct Ctx<'a, 'ctx>
 where
     'ctx: 'a,
 {
-    pub scope: RuntimeScopeContext<'a, WorkerState<'ctx>>,
+    pub scope: RuntimeCtx<'a, WorkerState<'ctx>>,
 }
 
-impl<'a, 'ctx> ContextDriverProvider<PlatformDriver<'ctx>> for RuntimeContext<'a, 'ctx> {
+impl<'a, 'ctx> AsRuntimeCtx<'a, WorkerState<'ctx>> for Ctx<'a, 'ctx> {
+    #[inline]
+    fn as_runtime_ctx(self) -> RuntimeCtx<'a, WorkerState<'ctx>> {
+        self.scope
+    }
+}
+
+impl<'a, 'ctx> AsRuntimeCtx<'a, WorkerState<'ctx>> for &Ctx<'a, 'ctx> {
+    #[inline]
+    fn as_runtime_ctx(self) -> RuntimeCtx<'a, WorkerState<'ctx>> {
+        self.scope
+    }
+}
+
+impl<'a, 'ctx> ContextDriverProvider<PlatformDriver<'ctx>> for Ctx<'a, 'ctx> {
     #[inline]
     fn with_driver_mut<R>(&self, f: impl FnOnce(&mut PlatformDriver<'ctx>) -> R) -> R {
         self.extra(|extra| f(&mut extra.driver.borrow_mut()))
@@ -215,14 +230,14 @@ impl<'a, 'ctx> ContextDriverProvider<PlatformDriver<'ctx>> for RuntimeContext<'a
     }
 }
 
-impl<'a, 'ctx> DriverProvider for RuntimeContext<'a, 'ctx> {
+impl<'a, 'ctx> DriverProvider for Ctx<'a, 'ctx> {
     type Op = PlatformOp;
     type UP = PlatformUP;
     type Completion = usize;
     type Error = <PlatformDriver<'ctx> as Driver>::Error;
     type SlotSpec = <PlatformDriver<'ctx> as Driver>::SlotSpec;
     type Driver<'d>
-        = RuntimeContextDriver<'d, PlatformDriver<'ctx>, RuntimeContext<'a, 'ctx>>
+        = RuntimeContextDriver<'d, PlatformDriver<'ctx>, Ctx<'a, 'ctx>>
     where
         Self: 'd;
 
@@ -232,14 +247,14 @@ impl<'a, 'ctx> DriverProvider for RuntimeContext<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> RuntimeContext<'a, 'ctx> {
+impl<'a, 'ctx> Ctx<'a, 'ctx> {
     #[inline]
     fn extra<R>(&self, f: impl FnOnce(&WorkerState<'ctx>) -> R) -> R {
         self.scope
             .shared()
             .extra_tls
             .try_with(|extra| f(extra))
-            .expect("RuntimeContext accessed outside of a worker thread")
+            .expect("Ctx accessed outside of a worker thread")
     }
 
     #[inline]
@@ -258,7 +273,7 @@ impl<'a, 'ctx> RuntimeContext<'a, 'ctx> {
 
     pub fn driver<'d, R>(
         &'d self,
-        f: impl FnOnce(RuntimeContextDriver<'d, PlatformDriver<'ctx>, RuntimeContext<'a, 'ctx>>) -> R,
+        f: impl FnOnce(RuntimeContextDriver<'d, PlatformDriver<'ctx>, Ctx<'a, 'ctx>>) -> R,
     ) -> R {
         f(RuntimeContextDriver::new(self))
     }
@@ -302,7 +317,7 @@ impl<'a, 'ctx> RuntimeContext<'a, 'ctx> {
 
     pub fn submit<'d, S, T>(&self, submitter: &'d S, op: Op<T>) -> S::Future<T>
     where
-        S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy + 'd,
+        S: OpSubmitter<'ctx, Ctx<'a, 'ctx>> + Copy + 'd,
         T: IntoPlatformOp<
                 <PlatformDriver<'ctx> as Driver>::Op,
                 DriverCompletion = <PlatformDriver<'ctx> as Driver>::Completion,
@@ -351,7 +366,7 @@ impl<'a, 'ctx> RuntimeContext<'a, 'ctx> {
             let routed = self
                 .scope
                 .route_to(worker_id, move || {
-                    let ctx = RuntimeContext { scope: scope_clone };
+                    let ctx = Ctx { scope: scope_clone };
                     ctx.driver(|mut driver| op.submit_detached(&mut driver))
                 })
                 .trans()?;

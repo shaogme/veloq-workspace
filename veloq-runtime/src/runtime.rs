@@ -20,8 +20,8 @@ pub mod context;
 pub mod primitives;
 pub mod shared;
 
-pub use context::{IdleDecision, IdleWaitStrategy, RuntimeScopeContext};
-pub(crate) use context::{IdleHook, RuntimeContext, WorkerTickHook};
+pub use context::{AsRuntimeCtx, IdleDecision, IdleWaitStrategy, RuntimeCtx};
+pub(crate) use context::{IdleHook, RuntimeTlsInner, WorkerTickHook};
 pub use primitives::GenericCancellationToken;
 pub use shared::{EnqueuePinnedOutcome, RuntimeShared, RuntimeSharedBase};
 
@@ -63,7 +63,7 @@ impl<T, WF> Runtime<T, WF> {
     where
         T: 'run,
         WF: Fn(usize, &'run RuntimeShared<T>) -> T + Send + Sync,
-        F: AsyncFnOnce(RuntimeScopeContext<'run, T>) -> R,
+        F: AsyncFnOnce(RuntimeCtx<'run, T>) -> R,
     {
         struct TlsCleanupGuard<'a, T>(&'a veloq_tls::Tls<T>);
         impl<'a, T> Drop for TlsCleanupGuard<'a, T> {
@@ -73,7 +73,7 @@ impl<T, WF> Runtime<T, WF> {
         }
 
         let shared_ref: &'run RuntimeShared<T> = unsafe { &*ptr::from_ref(&self.shared) };
-        let ctx = RuntimeScopeContext::new(shared_ref);
+        let ctx = RuntimeCtx::new(shared_ref);
 
         let worker_count = shared_ref.worker_count();
         let worker_factory = self
@@ -107,7 +107,7 @@ impl<T, WF> Runtime<T, WF> {
                 let worker_factory_ref = &worker_factory;
                 let thread_errors_ref = &thread_errors;
 
-                let context = RuntimeContext {
+                let context = RuntimeTlsInner {
                     worker_id,
                     rand: FastRand::new(worker_id as u64),
                     worker: deque,
@@ -150,7 +150,7 @@ impl<T, WF> Runtime<T, WF> {
 
             let deque0 = deques.pop().ok_or(RuntimeError::MainWorkerDequeExhausted)?;
 
-            let context = RuntimeContext {
+            let context = RuntimeTlsInner {
                 worker_id: 0,
                 rand: FastRand::new(0),
                 worker: deque0,

@@ -16,7 +16,7 @@ use numaperf_topo::Topology;
 use veloq_storage::StateOptionPtr;
 use veloq_tls::Tls;
 
-use super::context::{IdleHook, RuntimeContext, WorkerTickHook};
+use super::context::{IdleHook, RuntimeTlsInner, WorkerTickHook};
 use crate::{
     error::{Result, RuntimeError},
     runtime::primitives::{EventCount, ParkerInner, Unparker, create_unpark_waker},
@@ -55,7 +55,7 @@ pub struct RuntimeSharedBase {
     pub(crate) shutdown: AtomicBool,
     pub(crate) worker_tick_hook: Option<WorkerTickHook>,
     /// Worker 线程核心上下文（不含用户 extra 状态）。
-    pub(crate) tls: Tls<RuntimeContext>,
+    pub(crate) tls: Tls<RuntimeTlsInner>,
 }
 
 pub struct RuntimeShared<T> {
@@ -187,7 +187,7 @@ impl<T> RuntimeShared<T> {
                 },
                 shutdown: AtomicBool::new(false),
                 worker_tick_hook,
-                tls: Tls::new(|| RuntimeContext {
+                tls: Tls::new(|| RuntimeTlsInner {
                     worker_id: usize::MAX,
                     rand: FastRand::new(u64::MAX),
                     worker: Worker::new_lifo(),

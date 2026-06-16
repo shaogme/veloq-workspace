@@ -1,6 +1,6 @@
 use super::error::Elapsed;
 use super::sleep::{LocalSleep, Sleep, sleep_until, sleep_until_local};
-use crate::runtime::context::RuntimeContext;
+use crate::runtime::context::Ctx;
 use std::{
     future::Future,
     pin::Pin,
@@ -13,7 +13,7 @@ use std::{
 // ============================================================================
 
 pub fn timeout<'a, 'ctx, T>(
-    ctx: RuntimeContext<'a, 'ctx>,
+    ctx: Ctx<'a, 'ctx>,
     duration: Duration,
     future: T,
 ) -> Timeout<'a, 'ctx, T>
@@ -24,7 +24,7 @@ where
 }
 
 pub fn timeout_at<'a, 'ctx, T>(
-    ctx: RuntimeContext<'a, 'ctx>,
+    ctx: Ctx<'a, 'ctx>,
     deadline: Instant,
     future: T,
 ) -> Timeout<'a, 'ctx, T>
@@ -75,7 +75,7 @@ where
 // ============================================================================
 
 pub fn timeout_local<'a, 'ctx, T>(
-    ctx: RuntimeContext<'a, 'ctx>,
+    ctx: Ctx<'a, 'ctx>,
     duration: Duration,
     future: T,
 ) -> LocalTimeout<'a, 'ctx, T>
@@ -86,7 +86,7 @@ where
 }
 
 pub fn timeout_at_local<'a, 'ctx, T>(
-    ctx: RuntimeContext<'a, 'ctx>,
+    ctx: Ctx<'a, 'ctx>,
     deadline: Instant,
     future: T,
 ) -> LocalTimeout<'a, 'ctx, T>

@@ -1,6 +1,6 @@
 use crate::{
     error::{Result as RuntimeResult, RuntimeError},
-    runtime::{EnqueuePinnedOutcome, RuntimeScopeContext, RuntimeShared},
+    runtime::{EnqueuePinnedOutcome, RuntimeCtx, RuntimeShared},
     scope::{GenericScopeCompletion, guard::ScopeTaskGuard},
     task::{
         Arena, GenericArena, GenericTaskHeader, RawScope, RawTask, ScopeRef, ScopeStorage,
@@ -289,7 +289,7 @@ unsafe impl<'scope_ref, T> Send for RoutedSpawnState<'scope_ref, T> where T: Sen
 unsafe impl<'scope_ref, T> Sync for RoutedSpawnState<'scope_ref, T> where T: Send {}
 
 pub(crate) fn dispatch_routed<'rt, 'scope_ref, S: ScopeStorage, O: Ownership, T, F, TExtra>(
-    context: &RuntimeScopeContext<'rt, TExtra>,
+    context: &RuntimeCtx<'rt, TExtra>,
     mut guard: ScopeTaskGuard<S, O>,
     state: Arc<RoutedSpawnState<'scope_ref, T>>,
     worker_id: usize,

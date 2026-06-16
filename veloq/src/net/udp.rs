@@ -11,7 +11,7 @@ use crate::{
         common::{InnerSocket, SocketToken, SocketTokenPtr},
         error::NetError,
     },
-    runtime::context::RuntimeContext,
+    runtime::context::Ctx,
 };
 use diagweave::{prelude::*, report::Report};
 use veloq_buf::FixedBuf;
@@ -28,16 +28,16 @@ use veloq_driver_native::{
 pub struct GenericUdpSocket<'a, 'ctx, S, P: SocketTokenPtr<'a, 'ctx>> {
     pub(crate) inner: InnerSocket<'a, 'ctx, P>,
     pub(crate) submitter: S,
-    pub(crate) ctx: RuntimeContext<'a, 'ctx>,
+    pub(crate) ctx: Ctx<'a, 'ctx>,
 }
 
 pub type LocalUdpSocket<'a, 'ctx> =
-    GenericUdpSocket<'a, 'ctx, LocalSubmitter<RuntimeContext<'a, 'ctx>>, Rc<SocketToken<'a, 'ctx>>>;
+    GenericUdpSocket<'a, 'ctx, LocalSubmitter<Ctx<'a, 'ctx>>, Rc<SocketToken<'a, 'ctx>>>;
 pub type UdpSocket<'a, 'ctx> =
     GenericUdpSocket<'a, 'ctx, DetachedSubmitter, Arc<SocketToken<'a, 'ctx>>>;
 
 fn bind_inner<'a, 'ctx, A: ToSocketAddrs, P: SocketTokenPtr<'a, 'ctx>>(
-    ctx: RuntimeContext<'a, 'ctx>,
+    ctx: Ctx<'a, 'ctx>,
     addr: A,
 ) -> Result<InnerSocket<'a, 'ctx, P>> {
     let addr = addr
@@ -58,7 +58,7 @@ fn bind_inner<'a, 'ctx, A: ToSocketAddrs, P: SocketTokenPtr<'a, 'ctx>>(
     InnerSocket::new(ctx, socket.into_owned_raw().into_raw(), Some(local_addr))
 }
 
-impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketTokenPtr<'a, 'ctx>>
+impl<'a, 'ctx, S: OpSubmitter<'ctx, Ctx<'a, 'ctx>> + Copy, P: SocketTokenPtr<'a, 'ctx>>
     GenericUdpSocket<'a, 'ctx, S, P>
 {
     pub fn local_addr(&self) -> Result<SocketAddr> {
@@ -172,7 +172,7 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
 }
 
 impl<'a, 'ctx> LocalUdpSocket<'a, 'ctx> {
-    pub fn bind<A: ToSocketAddrs>(ctx: RuntimeContext<'a, 'ctx>, addr: A) -> Result<Self> {
+    pub fn bind<A: ToSocketAddrs>(ctx: Ctx<'a, 'ctx>, addr: A) -> Result<Self> {
         Ok(Self {
             inner: bind_inner(ctx, addr)?,
             submitter: LocalSubmitter::new(),
@@ -210,7 +210,7 @@ impl<'a, 'ctx> LocalUdpSocket<'a, 'ctx> {
 }
 
 impl<'a, 'ctx> UdpSocket<'a, 'ctx> {
-    pub fn bind<A: ToSocketAddrs>(ctx: RuntimeContext<'a, 'ctx>, addr: A) -> Result<Self> {
+    pub fn bind<A: ToSocketAddrs>(ctx: Ctx<'a, 'ctx>, addr: A) -> Result<Self> {
         Ok(Self {
             inner: bind_inner(ctx, addr)?,
             submitter: DetachedSubmitter::new(),

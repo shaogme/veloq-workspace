@@ -1,5 +1,5 @@
 use super::sleep::{LocalSleep, Sleep, sleep_until, sleep_until_local};
-use crate::runtime::context::RuntimeContext;
+use crate::runtime::context::Ctx;
 use std::{
     future::poll_fn,
     pin::Pin,
@@ -17,12 +17,12 @@ pub enum MissedTickBehavior {
 // Sync/Send Interval
 // ============================================================================
 
-pub fn interval<'a, 'ctx>(ctx: RuntimeContext<'a, 'ctx>, period: Duration) -> Interval<'a, 'ctx> {
+pub fn interval<'a, 'ctx>(ctx: Ctx<'a, 'ctx>, period: Duration) -> Interval<'a, 'ctx> {
     interval_at(ctx, Instant::now(), period)
 }
 
 pub fn interval_at<'a, 'ctx>(
-    ctx: RuntimeContext<'a, 'ctx>,
+    ctx: Ctx<'a, 'ctx>,
     start: Instant,
     period: Duration,
 ) -> Interval<'a, 'ctx> {
@@ -88,15 +88,12 @@ impl<'a, 'ctx> Interval<'a, 'ctx> {
 // Local Interval
 // ============================================================================
 
-pub fn interval_local<'a, 'ctx>(
-    ctx: RuntimeContext<'a, 'ctx>,
-    period: Duration,
-) -> LocalInterval<'a, 'ctx> {
+pub fn interval_local<'a, 'ctx>(ctx: Ctx<'a, 'ctx>, period: Duration) -> LocalInterval<'a, 'ctx> {
     interval_at_local(ctx, Instant::now(), period)
 }
 
 pub fn interval_at_local<'a, 'ctx>(
-    ctx: RuntimeContext<'a, 'ctx>,
+    ctx: Ctx<'a, 'ctx>,
     start: Instant,
     period: Duration,
 ) -> LocalInterval<'a, 'ctx> {

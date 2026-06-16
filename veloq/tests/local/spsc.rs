@@ -19,7 +19,7 @@ fn test_unbounded_basic() {
             let state = spsc::unbounded();
             let (tx, rx) = state.split();
 
-            scope_local!(ctx.scope, async |s| {
+            scope_local!(ctx, async |s| {
                 s.spawn_boxed_local(async move {
                     for i in 0..10 {
                         tx.send(i).await.unwrap();
@@ -47,7 +47,7 @@ fn test_bounded_basic() {
             let state = spsc::bounded(5);
             let (tx, rx) = state.split();
 
-            scope_local!(ctx.scope, async |s| {
+            scope_local!(ctx, async |s| {
                 s.spawn_boxed_local(async move {
                     for i in 0..10 {
                         tx.send(i).await.unwrap();
@@ -73,7 +73,7 @@ fn test_sender_drop_closes_channel() {
         .block_on(async |ctx| {
             let state = spsc::unbounded::<()>();
             let (tx, rx) = state.split();
-            scope_local!(ctx.scope, async |s| {
+            scope_local!(ctx, async |s| {
                 s.spawn_boxed_local(async move {
                     drop(tx);
                 });
@@ -96,7 +96,7 @@ fn test_receiver_drop_errors_sender() {
 
             tx.send(1).await.unwrap();
 
-            scope_local!(ctx.scope, async |s| {
+            scope_local!(ctx, async |s| {
                 s.spawn_boxed_local(async move {
                     drop(rx);
                 });
@@ -122,7 +122,7 @@ fn test_bounded_backpressure() {
             let state = spsc::bounded(1);
             let (tx, rx) = state.split();
 
-            scope_local!(ctx.scope, async |s| {
+            scope_local!(ctx, async |s| {
                 s.spawn_boxed_local(async move {
                     tx.send(1).await.unwrap();
                     tx.send(2).await.unwrap();
@@ -155,7 +155,7 @@ fn test_stream_conversion() {
             let state = spsc::unbounded();
             let (tx, rx) = state.split();
 
-            scope_local!(ctx.scope, async |s| {
+            scope_local!(ctx, async |s| {
                 s.spawn_boxed_local(async move {
                     tx.send(100).await.unwrap();
                     tx.send(200).await.unwrap();
@@ -186,7 +186,7 @@ fn test_zst() {
             let state = spsc::unbounded::<()>();
             let (tx, rx) = state.split();
 
-            scope_local!(ctx.scope, async |s| {
+            scope_local!(ctx, async |s| {
                 s.spawn_boxed_local(async move {
                     for _ in 0..100 {
                         tx.send(()).await.unwrap();
@@ -235,7 +235,7 @@ fn test_owned_spsc() {
         .block_on(async |ctx| {
             let (tx, rx) = spsc::owned_bounded(5);
 
-            scope_local!(ctx.scope, async |s| {
+            scope_local!(ctx, async |s| {
                 s.spawn_boxed_local(async move {
                     for i in 0..10 {
                         tx.send(i).await.unwrap();

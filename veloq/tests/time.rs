@@ -38,7 +38,7 @@ fn test_sleep_local_basic() {
 
     runtime
         .block_on(async |ctx| {
-            scope_local!(ctx.scope, async |s| {
+            scope_local!(ctx, async |s| {
                 let handle = s.spawn_boxed_local(async move {
                     let start = Instant::now();
                     sleep_local(ctx, Duration::from_millis(100)).await;
@@ -240,7 +240,7 @@ fn test_concurrent_sleeps() {
 
     runtime
         .block_on(async |ctx| {
-            scope!(ctx.scope, async |s| {
+            scope!(ctx, async |s| {
                 let mut handles = Vec::new();
                 for i in 0..10 {
                     handles.push(s.spawn_boxed(async move {
@@ -267,7 +267,7 @@ fn test_mixed_local_and_sync_sleeps() {
 
     runtime
         .block_on(async |ctx| {
-            scope!(ctx.scope, async |s| {
+            scope!(ctx, async |s| {
                 let h_sync = s.spawn_boxed(async move {
                     sleep(ctx, Duration::from_millis(50)).await;
                     "sync"
@@ -277,7 +277,7 @@ fn test_mixed_local_and_sync_sleeps() {
             .await
             .unwrap();
 
-            scope_local!(ctx.scope, async |s| {
+            scope_local!(ctx, async |s| {
                 let h_local = s.spawn_boxed_local(async move {
                     sleep_local(ctx, Duration::from_millis(50)).await;
                     "local"

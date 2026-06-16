@@ -1,6 +1,6 @@
 use crate::{
     error::{Result, RuntimeError},
-    runtime::{RuntimeScopeContext, RuntimeShared, primitives::GenericCancellationToken},
+    runtime::{RuntimeCtx, RuntimeShared, primitives::GenericCancellationToken},
     task::{
         AnyScopeRef, Arena, ErasedCancellationToken, GenericArena, GenericTaskNode, LocalTask,
         LocalTaskRef, RawScope, RawTask, ScopeRef, ScopeStorage, SendTask, SendTaskRef, Task,
@@ -91,7 +91,7 @@ pub struct AsyncScopeGuard;
 
 /// 通用的作用域实现，支持通过 Storage 策略切换线程安全或本地分配。
 pub struct GenericAsyncScope<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra> {
-    context: RuntimeScopeContext<'rt, TExtra>,
+    context: RuntimeCtx<'rt, TExtra>,
     arena: GenericArena<S>,
     completion: O::Shared<GenericScopeCompletion<S, O>>,
     _guard: &'scope AsyncScopeGuard,
@@ -127,7 +127,7 @@ impl<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra>
     GenericAsyncScope<'rt, 'scope, S, O, TExtra>
 {
     pub fn new(
-        context: RuntimeScopeContext<'rt, TExtra>,
+        context: RuntimeCtx<'rt, TExtra>,
         parent: Option<AnyScopeRef>,
         guard: &'scope AsyncScopeGuard,
     ) -> Self {

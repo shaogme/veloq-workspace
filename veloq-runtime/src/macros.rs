@@ -2,7 +2,7 @@ pub mod helpers;
 
 /// A macro to wait on multiple futures simultaneously, returning the output of the first one that completes.
 ///
-/// The first argument must be a [`RuntimeScopeContext`](crate::runtime::RuntimeScopeContext).
+/// The first argument must be a [`RuntimeCtx`](crate::runtime::RuntimeCtx).
 ///
 /// By default, branches are polled in a **fair** order: each `select!` invocation picks a random
 /// starting branch via the worker TLS [`FastRand`](crate::utils::FastRand), then polls in ring order.
@@ -199,7 +199,11 @@ macro_rules! scope {
 
             let parent = poll_fn(|cx| Poll::Ready(RuntimeContextExt::scope_completion(cx))).await;
             let guard = AsyncScopeGuard;
-            let scope = AsyncScope::new($ctx, parent, &guard);
+            let scope = AsyncScope::new(
+                $crate::runtime::AsRuntimeCtx::as_runtime_ctx($ctx),
+                parent,
+                &guard,
+            );
             let s_ref = &scope;
             let res = _constrain($closure)(s_ref).await;
             scope.wait_all().await?;
@@ -220,7 +224,11 @@ macro_rules! scope_local {
 
             let parent = poll_fn(|cx| Poll::Ready(RuntimeContextExt::scope_completion(cx))).await;
             let guard = AsyncScopeGuard;
-            let scope = LocalAsyncScope::new($ctx, parent, &guard);
+            let scope = LocalAsyncScope::new(
+                $crate::runtime::AsRuntimeCtx::as_runtime_ctx($ctx),
+                parent,
+                &guard,
+            );
             let s_ref = &scope;
             let res = _constrain_local($closure)(s_ref).await;
             scope.wait_all().await?;

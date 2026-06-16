@@ -37,7 +37,7 @@ fn test_sync_unbounded_multi_thread() {
             let state = mpsc::unbounded();
             let (tx, mut rx) = state.split();
 
-            scope!(ctx.scope, async |s| {
+            scope!(ctx, async |s| {
                 for i in 0..10 {
                     let tx = tx.clone();
                     s.spawn_boxed(async move {
@@ -71,7 +71,7 @@ fn test_sync_unbounded_stream() {
             let state = mpsc::unbounded();
             let (tx, rx) = state.split();
 
-            scope!(ctx.scope, async |s| {
+            scope!(ctx, async |s| {
                 s.spawn_boxed(async move {
                     for i in 0..5 {
                         tx.send(i).unwrap();
@@ -106,7 +106,7 @@ fn test_sync_bounded_capacity() {
 
             tx.send(1).await.unwrap();
 
-            scope!(ctx.scope, async |s| {
+            scope!(ctx, async |s| {
                 let tx_clone = tx.clone();
                 s.spawn_boxed(async move {
                     tx_clone.send(2).await.unwrap();
@@ -132,7 +132,7 @@ fn test_sync_bounded_drop_receiver() {
             let (tx, rx) = state.split();
             tx.send(1).await.unwrap();
 
-            scope!(ctx.scope, async |s| {
+            scope!(ctx, async |s| {
                 s.spawn_boxed(async move {
                     let result = tx.send(2).await;
                     assert!(result.is_err());
@@ -154,7 +154,7 @@ fn test_sync_owned_mpsc() {
         .block_on(async |ctx| {
             let (tx, rx) = mpsc::owned_bounded(5);
 
-            scope!(ctx.scope, async |s| {
+            scope!(ctx, async |s| {
                 s.spawn_boxed(async move {
                     for i in 0..10 {
                         tx.send(i).await.unwrap();

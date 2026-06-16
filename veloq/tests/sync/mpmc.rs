@@ -41,7 +41,7 @@ fn test_sync_mpmc_unbounded_concurrent() {
             let (tx, rx) = state.split();
             let count = 100;
 
-            scope!(ctx.scope, async |s| {
+            scope!(ctx, async |s| {
                 for _ in 0..5 {
                     let tx = tx.clone();
                     s.spawn_boxed(async move {
@@ -80,7 +80,7 @@ fn test_sync_mpmc_bounded_capacity() {
 
             tx.send(1).await.unwrap();
 
-            scope!(ctx.scope, async |s| {
+            scope!(ctx, async |s| {
                 let tx_clone = tx.clone();
                 s.spawn_boxed(async move {
                     tx_clone.send(2).await.unwrap();
@@ -109,7 +109,7 @@ fn test_sync_mpmc_bounded_multi_consumer() {
                 tx.send(i).await.unwrap();
             }
 
-            scope!(ctx.scope, async |s| {
+            scope!(ctx, async |s| {
                 let c1 = rx.clone();
                 let c2 = rx.clone();
 

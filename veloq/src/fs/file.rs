@@ -3,7 +3,7 @@ use crate::{
     error::{Error, Result},
     fs::error::FsError,
     io::{AsyncBufRead, AsyncBufWrite},
-    runtime::context::{RuntimeContext, submit_control_task},
+    runtime::context::{Ctx, submit_control_task},
 };
 use diagweave::prelude::*;
 use std::{
@@ -59,9 +59,9 @@ fn close_raw_handle(raw: RawHandle) {
 pub struct LocalFile<'a, 'ctx> {
     pub(crate) raw: RawHandle,
     pub(crate) fd: IoFd,
-    pub(crate) submitter: LocalSubmitter<RuntimeContext<'a, 'ctx>>,
+    pub(crate) submitter: LocalSubmitter<Ctx<'a, 'ctx>>,
     pub(crate) pos: Cell<u64>,
-    pub(crate) ctx: RuntimeContext<'a, 'ctx>,
+    pub(crate) ctx: Ctx<'a, 'ctx>,
 }
 
 pub struct File<'a, 'ctx> {
@@ -70,7 +70,7 @@ pub struct File<'a, 'ctx> {
     pub(crate) owner_worker_id: usize,
     pub(crate) submitter: DetachedSubmitter,
     pub(crate) pos: AtomicU64,
-    pub(crate) ctx: RuntimeContext<'a, 'ctx>,
+    pub(crate) ctx: Ctx<'a, 'ctx>,
 }
 
 impl<'a, 'ctx> Drop for LocalFile<'a, 'ctx> {
@@ -482,9 +482,7 @@ impl<'f, 'a, 'ctx> IntoFuture for SyncRangeBuilder<'f, 'a, 'ctx> {
 }
 
 pub struct SyncRangeFuture<'a, 'ctx> {
-    inner: <DetachedSubmitter as OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>>>::Future<
-        FileSyncFileRangeRaw,
-    >,
+    inner: <DetachedSubmitter as OpSubmitter<'ctx, Ctx<'a, 'ctx>>>::Future<FileSyncFileRangeRaw>,
 }
 
 impl<'a, 'ctx> Future for SyncRangeFuture<'a, 'ctx> {
@@ -565,17 +563,11 @@ impl<'a, 'ctx> AsyncBufWrite for File<'a, 'ctx> {
 }
 
 impl<'a, 'ctx> LocalFile<'a, 'ctx> {
-    pub async fn open(
-        ctx: RuntimeContext<'a, 'ctx>,
-        path: impl AsRef<Path>,
-    ) -> Result<LocalFile<'a, 'ctx>> {
+    pub async fn open(ctx: Ctx<'a, 'ctx>, path: impl AsRef<Path>) -> Result<LocalFile<'a, 'ctx>> {
         OpenOptions::new().read(true).open_local(ctx, path).await
     }
 
-    pub async fn create(
-        ctx: RuntimeContext<'a, 'ctx>,
-        path: impl AsRef<Path>,
-    ) -> Result<LocalFile<'a, 'ctx>> {
+    pub async fn create(ctx: Ctx<'a, 'ctx>, path: impl AsRef<Path>) -> Result<LocalFile<'a, 'ctx>> {
         OpenOptions::new()
             .write(true)
             .create(true)
@@ -586,17 +578,11 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
 }
 
 impl<'a, 'ctx> File<'a, 'ctx> {
-    pub async fn open(
-        ctx: RuntimeContext<'a, 'ctx>,
-        path: impl AsRef<Path>,
-    ) -> Result<File<'a, 'ctx>> {
+    pub async fn open(ctx: Ctx<'a, 'ctx>, path: impl AsRef<Path>) -> Result<File<'a, 'ctx>> {
         OpenOptions::new().read(true).open(ctx, path).await
     }
 
-    pub async fn create(
-        ctx: RuntimeContext<'a, 'ctx>,
-        path: impl AsRef<Path>,
-    ) -> Result<File<'a, 'ctx>> {
+    pub async fn create(ctx: Ctx<'a, 'ctx>, path: impl AsRef<Path>) -> Result<File<'a, 'ctx>> {
         OpenOptions::new()
             .write(true)
             .create(true)

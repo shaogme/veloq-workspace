@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use veloq::fs::{BufferingMode, File, OpenOptions};
 use veloq::io::buffer::FixedBuf;
-use veloq::runtime::context::RuntimeContext;
+use veloq::runtime::context::Ctx;
 use veloq::runtime::{Runtime, scope};
 use veloq::sync::mpsc;
 use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
@@ -168,7 +168,7 @@ fn get_file_path(t_idx: usize) -> PathBuf {
 /// Prepare files Phase: Create and fallocate files
 /// This runs effectively in parallel per thread, but outside the measurement loop.
 async fn prepare_files_for_thread<'a, 'ctx>(
-    ctx: RuntimeContext<'a, 'ctx>,
+    ctx: Ctx<'a, 'ctx>,
     file_size: u64,
     t_idx: usize,
     buffering_mode: BufferingMode,
@@ -226,7 +226,7 @@ async fn apply_sync<'a, 'ctx>(file: &File<'a, 'ctx>, mode: SyncMode, bytes: u64)
 }
 
 async fn run_iteration_measured<'a, 'ctx>(
-    ctx: RuntimeContext<'a, 'ctx>,
+    ctx: Ctx<'a, 'ctx>,
     qdepth: usize,
     file: &File<'a, 'ctx>,
     ops: &[WriteOp],
@@ -253,7 +253,7 @@ async fn run_iteration_measured<'a, 'ctx>(
     let state = mpsc::unbounded();
     let (tx, mut rx) = state.split();
 
-    scope!(ctx.scope, async |s| {
+    scope!(ctx, async |s| {
         let mut in_flight = 0usize;
         loop {
             // 1. Submit tasks up to qdepth if we have buffers and ops
@@ -316,7 +316,7 @@ async fn run_iteration_measured<'a, 'ctx>(
 }
 
 async fn run_worker<'a, 'ctx>(
-    ctx: RuntimeContext<'a, 'ctx>,
+    ctx: Ctx<'a, 'ctx>,
     qdepth: usize,
     min_duration: Duration,
     min_iters: usize,
@@ -453,7 +453,7 @@ fn main() {
     // Execute
     runtime
         .block_on(async |ctx| {
-            scope!(ctx.scope, async |s| {
+            scope!(ctx, async |s| {
                 // 1. Preparation Phase (Create & Fallocate)
                 println!(
                     "Initializing disk files (creating & fallocating)... This may take a while."

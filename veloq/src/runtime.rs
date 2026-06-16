@@ -23,7 +23,7 @@ use crate::{
     config::{BlockingPoolConfig, Config},
     error::Result as VeloqResult,
     runtime::context::{
-        BorrowedRegistrar, DriverRegistrar, RegistrarMessage, RuntimeContext, WorkerRegistrarState,
+        BorrowedRegistrar, Ctx, DriverRegistrar, RegistrarMessage, WorkerRegistrarState,
         WorkerState, poll_current_driver,
     },
 };
@@ -119,7 +119,7 @@ impl<T: PoolTopology> Runtime<T> {
 
     pub fn block_on<R, F>(self, f: F) -> VeloqResult<R>
     where
-        F: for<'s1, 's2> AsyncFnOnce(RuntimeContext<'s1, 's2>) -> R,
+        F: for<'s1, 's2> AsyncFnOnce(Ctx<'s1, 's2>) -> R,
     {
         let Runtime {
             worker_count,
@@ -194,7 +194,7 @@ impl<T: PoolTopology> Runtime<T> {
 
         runtime
             .block_on(async move |scope| {
-                let ctx = RuntimeContext { scope };
+                let ctx = Ctx { scope };
                 f(ctx).await
             })
             .trans()

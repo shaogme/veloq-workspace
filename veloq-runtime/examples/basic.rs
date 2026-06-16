@@ -1,5 +1,5 @@
 use veloq_runtime::{
-    runtime::{Runtime, RuntimeScopeContext},
+    runtime::{Runtime, RuntimeCtx},
     scope,
     scope::JoinOutcome,
     task,
@@ -9,7 +9,7 @@ use veloq_runtime::{
 
 // --- 测试用例 ---
 
-async fn work(ctx: RuntimeScopeContext<'_, ()>, id: String, steps: u32) -> String {
+async fn work(ctx: RuntimeCtx<'_, ()>, id: String, steps: u32) -> String {
     for i in 1..=steps {
         yield_now().await;
         let worker_id = ctx.worker_id();

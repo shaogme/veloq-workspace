@@ -1,7 +1,7 @@
 use std::num::NonZeroUsize;
 
 #[cfg(feature = "test-hooks")]
-use veloq::runtime::context::RuntimeContext;
+use veloq::runtime::context::Ctx;
 use veloq::{config::BufferRegistrationMode, runtime::Runtime};
 use veloq_buf::{
     BufPool, PoolKind, RegionInfo, UniformSlot, heap::ChunkId, heap::ThreadMemoryMultiplier, nz,
@@ -26,7 +26,7 @@ fn assert_slot_based(info: RegionInfo, message: &str) {
 }
 
 #[cfg(feature = "test-hooks")]
-fn current_chunk_register_attempts(ctx: RuntimeContext<'_, '_>) -> u64 {
+fn current_chunk_register_attempts(ctx: Ctx<'_, '_>) -> u64 {
     ctx.driver(|driver| {
         let hooks = &driver as &dyn DriverTestHooks;
         hooks.debug_chunk_register_attempts()
@@ -156,7 +156,7 @@ fn run_auto_expansion_multithread(mode: BufferRegistrationMode) {
                 expanded_chunk_id.expect("worker0 did not trigger pool auto expansion");
 
             use veloq::runtime::scope;
-            scope!(ctx.scope, async |s| {
+            scope!(ctx, async |s| {
                 let mut handles = Vec::new();
                 for _ in 0..4 {
                     handles.push(s.spawn_boxed(async move {

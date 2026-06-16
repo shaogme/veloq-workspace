@@ -5,7 +5,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
-use veloq::runtime::context::RuntimeContext;
+use veloq::runtime::context::Ctx;
 
 use veloq::fs::{BufferingMode, File};
 use veloq::runtime::{Runtime, scope, scope_local};
@@ -116,7 +116,7 @@ async fn apply_sync<'a, 'ctx>(file: &File<'a, 'ctx>, len: u64, mode: BenchSyncMo
 }
 
 async fn open_file<'a, 'ctx>(
-    ctx: RuntimeContext<'a, 'ctx>,
+    ctx: Ctx<'a, 'ctx>,
     path: &Path,
     buffering_mode: BufferingMode,
 ) -> File<'a, 'ctx> {
@@ -131,7 +131,7 @@ async fn open_file<'a, 'ctx>(
 }
 
 async fn open_and_fallocate<'a, 'ctx>(
-    ctx: RuntimeContext<'a, 'ctx>,
+    ctx: Ctx<'a, 'ctx>,
     path: &Path,
     buffering_mode: BufferingMode,
     len: u64,
@@ -149,7 +149,7 @@ fn create_runtime(worker_threads: NonZeroUsize) -> Runtime<UniformSlot> {
 }
 
 async fn run_1gb_iteration<'a, 'ctx>(
-    ctx: RuntimeContext<'a, 'ctx>,
+    ctx: Ctx<'a, 'ctx>,
     phase: BenchPhase,
     buffering_mode: BufferingMode,
     sync_mode: BenchSyncMode,
@@ -170,7 +170,7 @@ async fn run_1gb_iteration<'a, 'ctx>(
 
     let concurrency_limit = 32;
 
-    scope_local!(ctx.scope, async |s| {
+    scope_local!(ctx, async |s| {
         let mut tasks = VecDeque::new();
         let mut offset: u64 = 0;
 
@@ -223,7 +223,7 @@ async fn run_1gb_iteration<'a, 'ctx>(
 }
 
 async fn run_worker_iteration<'a, 'ctx>(
-    ctx: RuntimeContext<'a, 'ctx>,
+    ctx: Ctx<'a, 'ctx>,
     files: Vec<File<'a, 'ctx>>,
     file_size: u64,
     chunk_size: NonZeroUsize,
@@ -408,7 +408,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                         let base_dir = bench_base_dir();
                         let pid = std::process::id();
 
-                        scope!(ctx.scope, async |s| {
+                        scope!(ctx, async |s| {
                             let mut prepare_handles = Vec::with_capacity(WORKER_COUNT.get());
                             for worker_id in 0..WORKER_COUNT.get() {
                                 let prepare_path_names: Vec<PathBuf> = (0..FILES_PER_WORKER)

@@ -3,7 +3,7 @@ use std::{marker::PhantomData, net::SocketAddr, ops::Deref, rc::Rc, sync::Arc};
 use crate::{
     error::Result,
     net::error::NetError,
-    runtime::context::{RuntimeContext, submit_control_task},
+    runtime::context::{Ctx, submit_control_task},
 };
 use veloq_driver_native::{
     OwnedRawHandle, RawHandle,
@@ -20,11 +20,11 @@ use diagweave::prelude::*;
 pub struct SocketToken<'a, 'ctx> {
     fd: IoFd,
     owner_worker_id: usize,
-    ctx: RuntimeContext<'a, 'ctx>,
+    ctx: Ctx<'a, 'ctx>,
 }
 
 impl<'a, 'ctx> SocketToken<'a, 'ctx> {
-    pub(crate) fn new(ctx: RuntimeContext<'a, 'ctx>, handle: RawHandle) -> Result<Self> {
+    pub(crate) fn new(ctx: Ctx<'a, 'ctx>, handle: RawHandle) -> Result<Self> {
         if !handle.borrow().is_socket() {
             return NetError::InvalidSocketHandle.trans();
         }
@@ -102,7 +102,7 @@ where
     'ctx: 'a,
 {
     pub fn new(
-        ctx: RuntimeContext<'a, 'ctx>,
+        ctx: Ctx<'a, 'ctx>,
         handle: RawHandle,
         local_addr: Option<SocketAddr>,
     ) -> Result<Self> {

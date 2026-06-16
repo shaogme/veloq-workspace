@@ -12,7 +12,7 @@ use crate::{
         common::{InnerSocket, SocketToken, SocketTokenPtr},
         error::NetError,
     },
-    runtime::context::RuntimeContext,
+    runtime::context::Ctx,
 };
 use diagweave::{prelude::*, report::Report};
 use veloq_buf::FixedBuf;
@@ -28,24 +28,20 @@ use veloq_driver_native::{
 pub struct GenericTcpListener<'a, 'ctx, S, P: SocketTokenPtr<'a, 'ctx>> {
     pub(crate) inner: InnerSocket<'a, 'ctx, P>,
     pub(crate) submitter: S,
-    pub(crate) ctx: RuntimeContext<'a, 'ctx>,
+    pub(crate) ctx: Ctx<'a, 'ctx>,
 }
 
 #[derive(Clone)]
 pub struct GenericTcpStream<'a, 'ctx, S, P: SocketTokenPtr<'a, 'ctx>> {
     pub(crate) inner: InnerSocket<'a, 'ctx, P>,
     pub(crate) submitter: S,
-    pub(crate) ctx: RuntimeContext<'a, 'ctx>,
+    pub(crate) ctx: Ctx<'a, 'ctx>,
 }
 
-pub type LocalTcpListener<'a, 'ctx> = GenericTcpListener<
-    'a,
-    'ctx,
-    LocalSubmitter<RuntimeContext<'a, 'ctx>>,
-    Rc<SocketToken<'a, 'ctx>>,
->;
+pub type LocalTcpListener<'a, 'ctx> =
+    GenericTcpListener<'a, 'ctx, LocalSubmitter<Ctx<'a, 'ctx>>, Rc<SocketToken<'a, 'ctx>>>;
 pub type LocalTcpStream<'a, 'ctx> =
-    GenericTcpStream<'a, 'ctx, LocalSubmitter<RuntimeContext<'a, 'ctx>>, Rc<SocketToken<'a, 'ctx>>>;
+    GenericTcpStream<'a, 'ctx, LocalSubmitter<Ctx<'a, 'ctx>>, Rc<SocketToken<'a, 'ctx>>>;
 
 pub type TcpListener<'a, 'ctx> =
     GenericTcpListener<'a, 'ctx, DetachedSubmitter, Arc<SocketToken<'a, 'ctx>>>;
@@ -53,7 +49,7 @@ pub type TcpStream<'a, 'ctx> =
     GenericTcpStream<'a, 'ctx, DetachedSubmitter, Arc<SocketToken<'a, 'ctx>>>;
 
 fn bind_listener_inner<'a, 'ctx, A: ToSocketAddrs, P: SocketTokenPtr<'a, 'ctx>>(
-    ctx: RuntimeContext<'a, 'ctx>,
+    ctx: Ctx<'a, 'ctx>,
     addr: A,
 ) -> Result<InnerSocket<'a, 'ctx, P>> {
     let addr = addr
@@ -76,7 +72,7 @@ fn bind_listener_inner<'a, 'ctx, A: ToSocketAddrs, P: SocketTokenPtr<'a, 'ctx>>(
 }
 
 fn new_stream_inner<'a, 'ctx, P: SocketTokenPtr<'a, 'ctx>>(
-    ctx: RuntimeContext<'a, 'ctx>,
+    ctx: Ctx<'a, 'ctx>,
     addr: &SocketAddr,
 ) -> Result<InnerSocket<'a, 'ctx, P>> {
     let socket = if addr.is_ipv4() {
@@ -87,7 +83,7 @@ fn new_stream_inner<'a, 'ctx, P: SocketTokenPtr<'a, 'ctx>>(
     InnerSocket::new(ctx, socket.into_owned_raw().into_raw(), None)
 }
 
-impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketTokenPtr<'a, 'ctx>>
+impl<'a, 'ctx, S: OpSubmitter<'ctx, Ctx<'a, 'ctx>> + Copy, P: SocketTokenPtr<'a, 'ctx>>
     GenericTcpListener<'a, 'ctx, S, P>
 {
     async fn accept_direct(&self) -> Result<(GenericTcpStream<'a, 'ctx, S, P>, SocketAddr)> {
@@ -122,13 +118,13 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
     }
 }
 
-impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketTokenPtr<'a, 'ctx>>
+impl<'a, 'ctx, S: OpSubmitter<'ctx, Ctx<'a, 'ctx>> + Copy, P: SocketTokenPtr<'a, 'ctx>>
     GenericTcpStream<'a, 'ctx, S, P>
 {
     async fn connect_from_inner_direct(
         inner: InnerSocket<'a, 'ctx, P>,
         submitter: S,
-        ctx: RuntimeContext<'a, 'ctx>,
+        ctx: Ctx<'a, 'ctx>,
         addr: SocketAddr,
     ) -> Result<Self> {
         let (raw_addr, raw_addr_len) = socket_addr_to_storage(addr);
@@ -192,7 +188,7 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, RuntimeContext<'a, 'ctx>> + Copy, P: SocketT
 }
 
 impl<'a, 'ctx> LocalTcpListener<'a, 'ctx> {
-    pub fn bind<A: ToSocketAddrs>(ctx: RuntimeContext<'a, 'ctx>, addr: A) -> Result<Self> {
+    pub fn bind<A: ToSocketAddrs>(ctx: Ctx<'a, 'ctx>, addr: A) -> Result<Self> {
         Ok(Self {
             inner: bind_listener_inner(ctx, addr)?,
             submitter: LocalSubmitter::new(),
@@ -206,7 +202,7 @@ impl<'a, 'ctx> LocalTcpListener<'a, 'ctx> {
 }
 
 impl<'a, 'ctx> TcpListener<'a, 'ctx> {
-    pub fn bind<A: ToSocketAddrs>(ctx: RuntimeContext<'a, 'ctx>, addr: A) -> Result<Self> {
+    pub fn bind<A: ToSocketAddrs>(ctx: Ctx<'a, 'ctx>, addr: A) -> Result<Self> {
         Ok(Self {
             inner: bind_listener_inner(ctx, addr)?,
             submitter: DetachedSubmitter::new(),
@@ -238,7 +234,7 @@ impl<'a, 'ctx> TcpListener<'a, 'ctx> {
 }
 
 impl<'a, 'ctx> LocalTcpStream<'a, 'ctx> {
-    pub async fn connect(ctx: RuntimeContext<'a, 'ctx>, addr: SocketAddr) -> Result<Self> {
+    pub async fn connect(ctx: Ctx<'a, 'ctx>, addr: SocketAddr) -> Result<Self> {
         let inner = new_stream_inner(ctx, &addr)?;
         Self::connect_from_inner_direct(inner, LocalSubmitter::new(), ctx, addr).await
     }
@@ -261,13 +257,13 @@ impl<'a, 'ctx> LocalTcpStream<'a, 'ctx> {
 }
 
 impl<'a, 'ctx> TcpStream<'a, 'ctx> {
-    pub async fn connect(ctx: RuntimeContext<'a, 'ctx>, addr: SocketAddr) -> Result<Self> {
+    pub async fn connect(ctx: Ctx<'a, 'ctx>, addr: SocketAddr) -> Result<Self> {
         let inner = new_stream_inner(ctx, &addr)?;
         Self::connect_from_inner_direct(inner, DetachedSubmitter::new(), ctx, addr).await
     }
 
     pub(crate) async fn connect_from_inner(
-        ctx: RuntimeContext<'a, 'ctx>,
+        ctx: Ctx<'a, 'ctx>,
         inner: InnerSocket<'a, 'ctx, Arc<SocketToken<'a, 'ctx>>>,
         addr: SocketAddr,
     ) -> Result<Self> {

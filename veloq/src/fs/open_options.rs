@@ -1,5 +1,5 @@
 use super::file::{File, LocalFile};
-use crate::{error::Result, fs::error::FsError, runtime::context::RuntimeContext};
+use crate::{error::Result, fs::error::FsError, runtime::context::Ctx};
 use diagweave::prelude::*;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -106,7 +106,7 @@ impl OpenOptions {
 
     pub async fn open_local<'a, 'ctx>(
         &self,
-        ctx: RuntimeContext<'a, 'ctx>,
+        ctx: Ctx<'a, 'ctx>,
         path: impl AsRef<Path>,
     ) -> Result<LocalFile<'a, 'ctx>> {
         let op = self.build_op(&ctx, path.as_ref())?;
@@ -138,7 +138,7 @@ impl OpenOptions {
 
     pub async fn open<'a, 'ctx>(
         &self,
-        ctx: RuntimeContext<'a, 'ctx>,
+        ctx: Ctx<'a, 'ctx>,
         path: impl AsRef<Path>,
     ) -> Result<File<'a, 'ctx>> {
         let op = self.build_op(&ctx, path.as_ref())?;
@@ -171,7 +171,7 @@ impl OpenOptions {
     }
 
     #[cfg(unix)]
-    fn build_op(&self, ctx: &RuntimeContext<'_, '_>, path: &Path) -> Result<Open> {
+    fn build_op(&self, ctx: &Ctx<'_, '_>, path: &Path) -> Result<Open> {
         let path_bytes = path.as_os_str().as_bytes();
         let len = path_bytes.len() + 1;
         let len_nz = NonZeroUsize::new(len).unwrap();
@@ -225,7 +225,7 @@ impl OpenOptions {
     }
 
     #[cfg(windows)]
-    fn build_op(&self, ctx: &RuntimeContext<'_, '_>, path: &Path) -> Result<Open> {
+    fn build_op(&self, ctx: &Ctx<'_, '_>, path: &Path) -> Result<Open> {
         const FAKE_NO_BUFFERING: u32 = 1 << 8;
         const FAKE_WRITE_THROUGH: u32 = 1 << 9;
 

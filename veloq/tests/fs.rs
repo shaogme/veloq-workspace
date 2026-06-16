@@ -120,7 +120,7 @@ fn test_multithread_file_ops() {
     runtime
         .block_on(async |ctx| {
             use veloq::runtime::scope;
-            scope!(ctx.scope, async |s| {
+            scope!(ctx, async |s| {
                 for i in 0..NUM_TASKS {
                     let counter = completion_count_for_runtime.clone();
                     s.spawn_boxed(async move {

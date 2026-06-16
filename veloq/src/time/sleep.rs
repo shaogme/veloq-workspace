@@ -1,4 +1,4 @@
-use crate::runtime::context::RuntimeContext;
+use crate::runtime::context::Ctx;
 use std::{
     future::Future,
     pin::Pin,
@@ -19,14 +19,14 @@ type SleepDetachedOp<'ctx> = DetachedOp<OpTimeout, <PlatformDriver<'ctx> as Driv
 /// Waits until `duration` has elapsed.
 ///
 /// This future is `Send` and `Sync`.
-pub fn sleep<'a, 'ctx>(ctx: RuntimeContext<'a, 'ctx>, duration: Duration) -> Sleep<'a, 'ctx> {
+pub fn sleep<'a, 'ctx>(ctx: Ctx<'a, 'ctx>, duration: Duration) -> Sleep<'a, 'ctx> {
     sleep_until(ctx, Instant::now() + duration)
 }
 
 /// Waits until `deadline` is reached.
 ///
 /// This future is `Send` and `Sync`.
-pub fn sleep_until<'a, 'ctx>(ctx: RuntimeContext<'a, 'ctx>, deadline: Instant) -> Sleep<'a, 'ctx> {
+pub fn sleep_until<'a, 'ctx>(ctx: Ctx<'a, 'ctx>, deadline: Instant) -> Sleep<'a, 'ctx> {
     Sleep {
         ctx,
         deadline,
@@ -35,7 +35,7 @@ pub fn sleep_until<'a, 'ctx>(ctx: RuntimeContext<'a, 'ctx>, deadline: Instant) -
 }
 
 pub struct Sleep<'a, 'ctx> {
-    ctx: RuntimeContext<'a, 'ctx>,
+    ctx: Ctx<'a, 'ctx>,
     deadline: Instant,
     inner: Option<SleepDetachedOp<'ctx>>,
 }
@@ -96,20 +96,14 @@ impl<'a, 'ctx> Future for Sleep<'a, 'ctx> {
 /// Waits until `duration` has elapsed (Local version).
 ///
 /// This future is `!Send`.
-pub fn sleep_local<'a, 'ctx>(
-    ctx: RuntimeContext<'a, 'ctx>,
-    duration: Duration,
-) -> LocalSleep<'a, 'ctx> {
+pub fn sleep_local<'a, 'ctx>(ctx: Ctx<'a, 'ctx>, duration: Duration) -> LocalSleep<'a, 'ctx> {
     sleep_until_local(ctx, Instant::now() + duration)
 }
 
 /// Waits until `deadline` is reached (Local version).
 ///
 /// This future is `!Send`.
-pub fn sleep_until_local<'a, 'ctx>(
-    ctx: RuntimeContext<'a, 'ctx>,
-    deadline: Instant,
-) -> LocalSleep<'a, 'ctx> {
+pub fn sleep_until_local<'a, 'ctx>(ctx: Ctx<'a, 'ctx>, deadline: Instant) -> LocalSleep<'a, 'ctx> {
     LocalSleep {
         ctx,
         deadline,
@@ -118,9 +112,9 @@ pub fn sleep_until_local<'a, 'ctx>(
 }
 
 pub struct LocalSleep<'a, 'ctx> {
-    ctx: RuntimeContext<'a, 'ctx>,
+    ctx: Ctx<'a, 'ctx>,
     deadline: Instant,
-    inner: Option<LocalOp<'ctx, OpTimeout, RuntimeContext<'a, 'ctx>>>,
+    inner: Option<LocalOp<'ctx, OpTimeout, Ctx<'a, 'ctx>>>,
 }
 
 impl<'a, 'ctx> LocalSleep<'a, 'ctx> {

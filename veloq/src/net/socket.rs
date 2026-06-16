@@ -8,7 +8,7 @@ use crate::{
         tcp::{GenericTcpListener, TcpListener, TcpStream},
         udp::{GenericUdpSocket, UdpSocket},
     },
-    runtime::context::RuntimeContext,
+    runtime::context::Ctx,
 };
 use diagweave::prelude::*;
 use veloq_driver_native::{Socket, op::DetachedSubmitter};
@@ -87,7 +87,7 @@ impl TcpSocket {
     /// Consumes the `TcpSocket` and returns a `TcpListener`.
     pub fn listen<'a, 'ctx>(
         self,
-        ctx: RuntimeContext<'a, 'ctx>,
+        ctx: Ctx<'a, 'ctx>,
         backlog: u32,
     ) -> Result<TcpListener<'a, 'ctx>> {
         let local_addr = self.inner.local_addr().trans()?;
@@ -108,7 +108,7 @@ impl TcpSocket {
     /// Consumes the `TcpSocket` and returns a `TcpStream` future.
     pub async fn connect<'a, 'ctx>(
         self,
-        ctx: RuntimeContext<'a, 'ctx>,
+        ctx: Ctx<'a, 'ctx>,
         addr: SocketAddr,
     ) -> Result<TcpStream<'a, 'ctx>> {
         let inner = InnerSocket::new(ctx, self.inner.into_owned_raw().into_raw(), None)?;
@@ -170,7 +170,7 @@ impl UdpSocketBuilder {
     /// Consumes the builder and returns a `UdpSocket`.
     pub fn bind<'a, 'ctx, A: ToSocketAddrs>(
         self,
-        ctx: RuntimeContext<'a, 'ctx>,
+        ctx: Ctx<'a, 'ctx>,
         addr: A,
     ) -> Result<UdpSocket<'a, 'ctx>> {
         let addr = addr

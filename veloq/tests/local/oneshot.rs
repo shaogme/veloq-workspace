@@ -19,7 +19,7 @@ fn test_send_recv() {
             let state = oneshot::channel();
             let (tx, rx) = state.split();
 
-            scope_local!(ctx.scope, async |s| {
+            scope_local!(ctx, async |s| {
                 s.spawn_boxed_local(async move {
                     tx.send(42).unwrap();
                 });
@@ -90,7 +90,7 @@ fn test_drop_tx_notify() {
             let state = oneshot::channel::<i32>();
             let (tx, rx) = state.split();
 
-            scope_local!(ctx.scope, async |s| {
+            scope_local!(ctx, async |s| {
                 let handle = s.spawn_boxed_local(rx);
 
                 // Drop tx without sending
@@ -125,7 +125,7 @@ fn test_owned_oneshot() {
         .block_on(async |ctx| {
             let (tx, rx) = oneshot::owned_channel();
 
-            scope_local!(ctx.scope, async |s| {
+            scope_local!(ctx, async |s| {
                 s.spawn_boxed_local(async move {
                     tx.send(42).unwrap();
                 });
