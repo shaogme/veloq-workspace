@@ -120,21 +120,19 @@ impl<'a> UringDriver<'a> {
                             .submission_missing_chunk_info
                             .saturating_add(1);
                         if driver.registration_mode.is_strict() {
-                            return Err(UringError::InvalidState
-                                .to_report()
+                            return UringError::InvalidState
                                 .push_ctx("scope", "driver.submit_from_slot_raw.missing_chunk_info")
                                 .with_ctx("chunk_id", chunk_id.raw())
                                 .with_ctx("user_data", user_data)
                                 .attach_note(
                                     "strict mode missing chunk info for lazy registration",
-                                ));
+                                );
                         }
-                        return Err(UringError::InvalidInput
-                            .to_report()
+                        return UringError::InvalidInput
                             .push_ctx("scope", "driver.submit_from_slot_raw.missing_chunk_info")
                             .with_ctx("chunk_id", chunk_id.raw())
                             .with_ctx("user_data", user_data)
-                            .attach_note("missing chunk info for lazy registration"));
+                            .attach_note("missing chunk info for lazy registration");
                     }
                 }
 
@@ -220,12 +218,11 @@ impl<'a> UringDriver<'a> {
             .vtable
             .strategy;
         if strategy != SubmissionStrategy::SubmitSqe {
-            return Err(UringError::InvalidState
-                .to_report()
+            return UringError::InvalidState
                 .push_ctx("scope", "driver.submit_queued_from_slot_raw.strategy")
                 .with_ctx("user_data", user_data)
                 .with_ctx("strategy", format!("{strategy:?}"))
-                .attach_note("queued uring backlog entry is not an SQE operation"));
+                .attach_note("queued uring backlog entry is not an SQE operation");
         }
 
         let mut chunks = [ChunkId::ZERO; 4];
@@ -281,25 +278,23 @@ impl<'a> UringDriver<'a> {
                     .submission_missing_chunk_info
                     .saturating_add(1);
                 if driver.registration_mode.is_strict() {
-                    return Err(UringError::InvalidState
-                        .to_report()
+                    return UringError::InvalidState
                         .push_ctx(
                             "scope",
                             "driver.submit_queued_from_slot_raw.missing_chunk_info",
                         )
                         .with_ctx("chunk_id", chunk_id.raw())
                         .with_ctx("user_data", user_data)
-                        .attach_note("strict mode missing chunk info for lazy registration"));
+                        .attach_note("strict mode missing chunk info for lazy registration");
                 }
-                return Err(UringError::InvalidInput
-                    .to_report()
+                return UringError::InvalidInput
                     .push_ctx(
                         "scope",
                         "driver.submit_queued_from_slot_raw.missing_chunk_info",
                     )
                     .with_ctx("chunk_id", chunk_id.raw())
                     .with_ctx("user_data", user_data)
-                    .attach_note("missing chunk info for lazy registration"));
+                    .attach_note("missing chunk info for lazy registration");
             }
         }
 

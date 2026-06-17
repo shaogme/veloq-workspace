@@ -55,45 +55,40 @@ pub(crate) fn resolve_registered_fixed_fd(
     let idx = fd.fixed_index();
     let index = idx as usize;
     let Some(slot) = file_slots.get(index) else {
-        return Err(UringError::ResolveFd
-            .to_report()
+        return UringError::ResolveFd
             .push_ctx("scope", scope)
             .with_ctx("fd_fixed_index", idx)
             .with_ctx("fd_generation", fd.generation())
-            .attach_note("registered file descriptor index out of bounds"));
+            .attach_note("registered file descriptor index out of bounds");
     };
 
     if slot.generation != fd.generation() {
-        let mut report = UringError::ResolveFd
-            .to_report()
+        return UringError::ResolveFd
             .push_ctx("scope", scope)
             .with_ctx("fd_fixed_index", idx)
             .with_ctx("fd_generation", fd.generation())
-            .attach_note("stale registered file descriptor generation");
-        report = report.with_ctx("current_generation", slot.generation);
-        return Err(report);
+            .attach_note("stale registered file descriptor generation")
+            .with_ctx("current_generation", slot.generation);
     }
 
     let Some(entry) = slot.entry.as_ref() else {
-        return Err(UringError::ResolveFd
-            .to_report()
+        return UringError::ResolveFd
             .push_ctx("scope", scope)
             .with_ctx("fd_fixed_index", idx)
             .with_ctx("fd_generation", fd.generation())
-            .attach_note("invalid registered file descriptor"));
+            .attach_note("invalid registered file descriptor");
     };
 
     if let Some(expected_kind) = expected_kind {
         let current_kind = entry.kind();
         if current_kind != expected_kind {
-            return Err(UringError::ResolveFd
-                .to_report()
+            return UringError::ResolveFd
                 .push_ctx("scope", scope)
                 .with_ctx("fd_fixed_index", idx)
                 .with_ctx("fd_generation", fd.generation())
                 .with_ctx("expected_kind", format!("{expected_kind:?}"))
                 .with_ctx("current_kind", format!("{current_kind:?}"))
-                .attach_note("registered file descriptor kind mismatch"));
+                .attach_note("registered file descriptor kind mismatch");
         }
     }
 
@@ -132,21 +127,19 @@ impl<'a> UringDriver<'a> {
                 .registration_stats
                 .chunk_register_skipped_recent_failure
                 .saturating_add(1);
-            return Err(UringError::Registration
-                .to_report()
+            return UringError::Registration
                 .push_ctx("scope", "driver.register_chunk_internal")
                 .with_ctx("chunk_id", id.raw())
-                .attach_note("recent chunk registration failure cooldown"));
+                .attach_note("recent chunk registration failure cooldown");
         }
 
         let index = id.as_usize();
         if index >= MAX_CHUNKS {
-            return Err(UringError::InvalidInput
-                .to_report()
+            return UringError::InvalidInput
                 .push_ctx("scope", "driver.register_chunk_internal")
                 .with_ctx("chunk_id", index)
                 .with_ctx("max_chunks", MAX_CHUNKS)
-                .attach_note("chunk id exceeds maximum registered chunk count"));
+                .attach_note("chunk id exceeds maximum registered chunk count");
         }
 
         let iovecs = [libc::iovec {
@@ -277,38 +270,34 @@ impl<'a> UringDriver<'a> {
         raw: RawHandle,
     ) -> UringResult<()> {
         if !self.file_table_initialized {
-            return Err(UringError::InvalidState
-                .to_report()
+            return UringError::InvalidState
                 .push_ctx("scope", "driver.replace_registered_fixed_fd")
                 .with_ctx("fd_fixed_index", fixed_fd.fixed_index())
-                .attach_note("registered file table is not initialized"));
+                .attach_note("registered file table is not initialized");
         }
 
         let idx = fixed_fd.fixed_index();
         let index = idx as usize;
         let Some(slot) = self.file_slots.get_mut(index) else {
-            return Err(UringError::InvalidState
-                .to_report()
+            return UringError::InvalidState
                 .push_ctx("scope", "driver.replace_registered_fixed_fd")
                 .with_ctx("fd_fixed_index", idx)
                 .with_ctx("fd_generation", fixed_fd.generation())
-                .attach_note("registered file index out of bounds"));
+                .attach_note("registered file index out of bounds");
         };
         if slot.generation != fixed_fd.generation() {
-            return Err(UringError::InvalidState
-                .to_report()
+            return UringError::InvalidState
                 .push_ctx("scope", "driver.replace_registered_fixed_fd")
                 .with_ctx("fd_fixed_index", idx)
                 .with_ctx("fd_generation", fixed_fd.generation())
-                .attach_note("registered file generation mismatch while replacing fd"));
+                .attach_note("registered file generation mismatch while replacing fd");
         }
         if slot.entry.is_none() {
-            return Err(UringError::InvalidState
-                .to_report()
+            return UringError::InvalidState
                 .push_ctx("scope", "driver.replace_registered_fixed_fd")
                 .with_ctx("fd_fixed_index", idx)
                 .with_ctx("fd_generation", fixed_fd.generation())
-                .attach_note("registered file slot is empty while replacing fd"));
+                .attach_note("registered file slot is empty while replacing fd");
         }
 
         let fd = raw.raw().as_fd();
@@ -359,12 +348,11 @@ impl<'a> UringDriver<'a> {
         let requested = files.len();
         let available = self.free_file_slots.len();
         if requested > available {
-            return Err(UringError::InvalidState
-                .to_report()
+            return UringError::InvalidState
                 .push_ctx("scope", "driver.register_files_internal")
                 .with_ctx("requested_files", requested)
                 .with_ctx("free_file_slots", available)
-                .attach_note("io_uring registered file table exhausted"));
+                .attach_note("io_uring registered file table exhausted");
         }
 
         let mut fixed_fds = Vec::with_capacity(files.len());
