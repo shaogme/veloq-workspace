@@ -3,7 +3,7 @@ use crate::{
         PendingCancel, UringDriver,
         completion::{COMP_BACKEND_URING, UringSyntheticCompletion},
     },
-    error::{UringError, uring_report_to_event_res},
+    error::{UringError, UringResult, uring_report_to_event_res},
     op::{CheckedSlotView, Slot, SlotState, SlotView, UringOpRegistryExt},
 };
 use diagweave::prelude::*;
@@ -87,7 +87,7 @@ impl<'a> UringDriver<'a> {
         }
     }
 
-    fn complete_local_cancel(&mut self, token: OpToken, mode: CancelMode) {
+    fn complete_local_cancel(&mut self, token: OpToken, mode: CancelMode) -> UringResult<()> {
         self.completion_diagnostics
             .backend()
             .inc_cancel_local_completed();
@@ -96,10 +96,14 @@ impl<'a> UringDriver<'a> {
             event,
             SyntheticCompletionSource::Cancel,
             UringSyntheticCompletion::Cancel { mode },
-        );
+        )?;
+        Ok(())
     }
 
-    pub(crate) fn cancel_op_internal(&mut self, request: CancelRequest) -> CancelSubmitOutcome {
+    pub(crate) fn cancel_op_internal(
+        &mut self,
+        request: CancelRequest,
+    ) -> UringResult<CancelSubmitOutcome> {
         let request = PendingCancel::new(request);
         let (user_data, generation) = request.user_parts();
         let token = request.target;
@@ -126,44 +130,44 @@ impl<'a> UringDriver<'a> {
                     false
                 };
                 if prepared {
-                    self.complete_local_cancel(token, request.mode);
+                    self.complete_local_cancel(token, request.mode)?;
                 } else {
                     let _ = self.ops.remove(token);
                 }
-                CancelSubmitOutcome::CompletedLocally
+                Ok(CancelSubmitOutcome::CompletedLocally)
             }
             CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
                 if slot.platform().submission_state == UringSubmissionState::Queued {
                     self.remove_backlog_token(token);
-                    self.complete_local_cancel(token, request.mode);
-                    return CancelSubmitOutcome::CompletedLocally;
+                    self.complete_local_cancel(token, request.mode)?;
+                    return Ok(CancelSubmitOutcome::CompletedLocally);
                 }
 
                 if let Some(tid) = slot.platform_mut().timer_id.take() {
                     self.wheel.cancel(tid);
-                    self.complete_local_cancel(token, request.mode);
-                    return CancelSubmitOutcome::CompletedLocally;
+                    self.complete_local_cancel(token, request.mode)?;
+                    return Ok(CancelSubmitOutcome::CompletedLocally);
                 }
 
                 if request.mode == CancelMode::Abandon {
                     let _ = slot.cancel();
                 }
-                self.submit_cancel_request(request)
+                Ok(self.submit_cancel_request(request))
             }
             CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot)) => {
                 if slot.platform().submission_state == UringSubmissionState::Queued {
                     self.remove_backlog_token(token);
-                    self.complete_local_cancel(token, CancelMode::Abandon);
-                    return CancelSubmitOutcome::CompletedLocally;
+                    self.complete_local_cancel(token, CancelMode::Abandon)?;
+                    return Ok(CancelSubmitOutcome::CompletedLocally);
                 }
 
                 if let Some(tid) = slot.platform_mut().timer_id.take() {
                     self.wheel.cancel(tid);
-                    self.complete_local_cancel(token, CancelMode::Abandon);
-                    return CancelSubmitOutcome::CompletedLocally;
+                    self.complete_local_cancel(token, CancelMode::Abandon)?;
+                    return Ok(CancelSubmitOutcome::CompletedLocally);
                 }
 
-                self.submit_cancel_request(request)
+                Ok(self.submit_cancel_request(request))
             }
             view @ (CheckedSlotView::Missing { .. }
             | CheckedSlotView::Empty(_)
@@ -180,7 +184,7 @@ impl<'a> UringDriver<'a> {
                     reason = ?reason,
                     "cancel request did not match an active uring slot"
                 );
-                CancelSubmitOutcome::TargetGone { reason }
+                Ok(CancelSubmitOutcome::TargetGone { reason })
             }
         }
     }
@@ -221,7 +225,7 @@ impl<'a> UringDriver<'a> {
         }
     }
 
-    pub(crate) fn flush_backlog(&mut self) {
+    pub(crate) fn flush_backlog(&mut self) -> UringResult<()> {
         enum BacklogAction {
             SubmitReserved,
             SubmitQueued,
@@ -261,11 +265,11 @@ impl<'a> UringDriver<'a> {
             match action {
                 BacklogAction::CancelQueued => {
                     self.pop_backlog();
-                    self.complete_local_cancel(token, CancelMode::Abandon);
+                    self.complete_local_cancel(token, CancelMode::Abandon)?;
                 }
                 BacklogAction::CancelKernel => {
                     self.pop_backlog();
-                    let _ = self.cancel_op_internal(CancelRequest::abandon(token));
+                    self.cancel_op_internal(CancelRequest::abandon(token))?;
                 }
                 BacklogAction::Drop => {
                     self.pop_backlog();
@@ -300,6 +304,7 @@ impl<'a> UringDriver<'a> {
                 }
             }
         }
+        Ok(())
     }
 
     pub(crate) fn push_backlog(&mut self, token: OpToken) {

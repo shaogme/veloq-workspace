@@ -2,7 +2,7 @@ use std::ptr::NonNull;
 
 use crate::{
     config::IoFd,
-    error::{IocpDriverResult as DriverResult, IocpError, IocpResult},
+    error::{IocpError, IocpResult},
     ext::Extensions,
     op::{
         IocpKernelOp, IocpOpPayload, IocpUserPayload, OpVTable, OverlappedEntry, SubmissionResult,
@@ -58,7 +58,7 @@ pub(crate) trait IocpOpSpec: Sized + Send + 'static {
         None
     }
 
-    fn map_completion(payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion>;
+    fn map_completion(payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion>;
 }
 
 pub(crate) trait IocpOpErasure: IocpOpSpec {
@@ -67,7 +67,7 @@ pub(crate) trait IocpOpErasure: IocpOpSpec {
     fn kernel_payload_mut(payload: &mut IocpOpPayload) -> Option<&mut Self::KernelPayload>;
 
     fn erase_user_payload(payload: Self) -> IocpUserPayload;
-    fn try_user_payload(payload: IocpUserPayload) -> DriverResult<Self>;
+    fn try_user_payload(payload: IocpUserPayload) -> IocpResult<Self>;
     fn user_payload_mut(payload: &mut IocpUserPayload) -> Option<&mut Self>;
 
     fn vtable() -> &'static OpVTable;

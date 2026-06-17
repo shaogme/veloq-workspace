@@ -24,15 +24,11 @@ use crate::{
     error::{UringError, UringResult},
     op::{SubmissionStrategy, UringOp, UringOpRegistry, UringSlotSpec, UringUserPayload},
 };
-use veloq_driver_core::{
-    DriverResult as CoreDriverResult,
-    driver::{
-        CancelCompletionId, CancelMode, CancelRequest, CancelSubmitOutcome, DriveMode,
-        DriveOutcome, Driver, DriverCompletionDiagnostics, DriverSubmitResult, OpToken, RegisterFd,
-        RemoteCancelSender, RemoteWaker, SharedCompletionTable, SharedDriverSlotTable,
-        SubmitStatus,
-        registry::{OpEntry, OpHandle},
-    },
+use veloq_driver_core::driver::{
+    CancelCompletionId, CancelMode, CancelRequest, CancelSubmitOutcome, DriveMode, DriveOutcome,
+    Driver, DriverCompletionDiagnostics, DriverSubmitResult, OpToken, RegisterFd,
+    RemoteCancelSender, RemoteWaker, SharedCompletionTable, SharedDriverSlotTable, SubmitStatus,
+    registry::{OpEntry, OpHandle},
 };
 
 mod completion;
@@ -45,7 +41,6 @@ pub(crate) use registration::{
     FileSlot, MAX_CHUNKS, RegisteredFileEntry, UringRegistrationStats, resolve_registered_fixed_fd,
 };
 
-type DriverResult<T> = CoreDriverResult<T, UringError>;
 pub(crate) struct EventFd {
     pub(crate) fd: OwnedRawHandle,
 }
@@ -105,7 +100,7 @@ pub(crate) struct UringWaker {
 }
 
 impl RemoteWaker<UringError> for UringWaker {
-    fn wake(&self) -> DriverResult<()> {
+    fn wake(&self) -> UringResult<()> {
         if self.is_waked.load(Ordering::Relaxed) {
             return Ok(());
         }
@@ -296,7 +291,7 @@ impl<'a> Driver for UringDriver<'a> {
     type Error = UringError;
     type SlotSpec = UringSlotSpec;
 
-    fn reserve_op_raw(&mut self) -> DriverResult<OpToken> {
+    fn reserve_op_raw(&mut self) -> UringResult<OpToken> {
         match self.ops.insert(OpEntry::new(UringOpState::new())) {
             Ok(OpHandle {
                 index: id,
@@ -372,7 +367,7 @@ impl<'a> Driver for UringDriver<'a> {
         }
     }
 
-    fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome> {
+    fn drive(&mut self, mode: DriveMode) -> UringResult<DriveOutcome> {
         match mode {
             DriveMode::Poll => {
                 self.poll_nonblocking_internal()
@@ -406,11 +401,11 @@ impl<'a> Driver for UringDriver<'a> {
         self.completion_table.clone()
     }
 
-    fn cancel_op(&mut self, request: CancelRequest) -> DriverResult<CancelSubmitOutcome> {
-        Ok(self.cancel_op_internal(request))
+    fn cancel_op(&mut self, request: CancelRequest) -> UringResult<CancelSubmitOutcome> {
+        self.cancel_op_internal(request)
     }
 
-    fn register_chunk(&mut self, id: ChunkId, ptr: *const u8, len: usize) -> DriverResult<()> {
+    fn register_chunk(&mut self, id: ChunkId, ptr: *const u8, len: usize) -> UringResult<()> {
         self.register_chunk_internal(id, ptr, len)
             .push_ctx("scope", "uring.driver.register_chunk")
             .with_ctx("driver_error_kind", UringError::Registration.to_string())
@@ -420,13 +415,13 @@ impl<'a> Driver for UringDriver<'a> {
     fn register_files<'f>(
         &mut self,
         files: Vec<RegisterFd<'f, UringRawHandle>>,
-    ) -> DriverResult<Vec<IoFd>> {
+    ) -> UringResult<Vec<IoFd>> {
         self.register_files_internal(files)
             .push_ctx("scope", "uring.driver.register_files")
             .attach_note("register files")
     }
 
-    fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<()> {
+    fn unregister_files(&mut self, files: Vec<IoFd>) -> UringResult<()> {
         for fd in files {
             self.unregister_fixed_fd(fd)
                 .push_ctx("scope", "uring.driver.unregister_files")

@@ -3,7 +3,7 @@
 use crate::{
     diagnostics::UringCompletionDiagnostics,
     driver::{UringDriver, UringOpState},
-    error::{UringDriverResult as DriverResult, UringError},
+    error::{UringError, UringResult},
 };
 use io_uring::squeue;
 use std::time::Duration;
@@ -37,12 +37,12 @@ pub(crate) type MakeSqeFn = unsafe fn(
     payload: &mut UringUserPayload,
     driver: &mut UringDriver,
     token: SubmitTokenContext,
-) -> DriverResult<squeue::Entry>;
+) -> UringResult<squeue::Entry>;
 pub(crate) type OnCompleteFn = unsafe fn(
     op: &mut UringKernelOp,
     payload: &mut UringUserPayload,
     result: i32,
-) -> DriverResult<usize>;
+) -> UringResult<usize>;
 pub(crate) type CompletionCleanupFn =
     unsafe fn(op: &mut UringKernelOp, result: i32) -> CompletionCleanupGuard;
 pub(crate) type OrphanCleanupFn =

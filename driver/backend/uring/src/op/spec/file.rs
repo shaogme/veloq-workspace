@@ -2,7 +2,7 @@ use crate::{
     OwnedRawHandle, RawHandle,
     config::UringRawHandle,
     driver::UringDriver,
-    error::UringDriverResult as DriverResult,
+    error::UringResult,
     op::{
         Close, Fallocate, FallocateRaw, Fsync, FsyncRaw, Open, ReadFixed, ReadRaw,
         SubmissionStrategy, SyncFileRange, SyncFileRangeRaw, WriteFixed, WriteRaw, payload, submit,
@@ -32,7 +32,7 @@ impl UringOpSpec for ReadFixed {
         payload: &mut Self,
         driver: &mut UringDriver,
         token: SubmitTokenContext,
-    ) -> DriverResult<squeue::Entry> {
+    ) -> UringResult<squeue::Entry> {
         unsafe { submit::make_sqe_read_fixed(kernel, payload, driver, token) }
     }
 
@@ -44,7 +44,7 @@ impl UringOpSpec for ReadFixed {
         submit::resolve_chunks_read_fixed(kernel, payload, chunks)
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
         res
     }
 }
@@ -64,7 +64,7 @@ impl UringOpSpec for ReadRaw {
         payload: &mut Self,
         driver: &mut UringDriver,
         token: SubmitTokenContext,
-    ) -> DriverResult<squeue::Entry> {
+    ) -> UringResult<squeue::Entry> {
         unsafe { submit::make_sqe_read_raw(kernel, payload, driver, token) }
     }
 
@@ -76,7 +76,7 @@ impl UringOpSpec for ReadRaw {
         submit::resolve_chunks_read_raw(kernel, payload, chunks)
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
         res
     }
 }
@@ -96,7 +96,7 @@ impl UringOpSpec for WriteFixed {
         payload: &mut Self,
         driver: &mut UringDriver,
         token: SubmitTokenContext,
-    ) -> DriverResult<squeue::Entry> {
+    ) -> UringResult<squeue::Entry> {
         unsafe { submit::make_sqe_write_fixed(kernel, payload, driver, token) }
     }
 
@@ -108,7 +108,7 @@ impl UringOpSpec for WriteFixed {
         submit::resolve_chunks_write_fixed(kernel, payload, chunks)
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
         res
     }
 }
@@ -128,7 +128,7 @@ impl UringOpSpec for WriteRaw {
         payload: &mut Self,
         driver: &mut UringDriver,
         token: SubmitTokenContext,
-    ) -> DriverResult<squeue::Entry> {
+    ) -> UringResult<squeue::Entry> {
         unsafe { submit::make_sqe_write_raw(kernel, payload, driver, token) }
     }
 
@@ -140,7 +140,7 @@ impl UringOpSpec for WriteRaw {
         submit::resolve_chunks_write_raw(kernel, payload, chunks)
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
         res
     }
 }
@@ -161,11 +161,11 @@ impl UringOpSpec for Close {
         payload: &mut Self,
         driver: &mut UringDriver,
         token: SubmitTokenContext,
-    ) -> DriverResult<squeue::Entry> {
+    ) -> UringResult<squeue::Entry> {
         unsafe { submit::make_sqe_close(kernel, payload, driver, token) }
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
         res
     }
 }
@@ -185,11 +185,11 @@ impl UringOpSpec for Fsync {
         payload: &mut Self,
         driver: &mut UringDriver,
         token: SubmitTokenContext,
-    ) -> DriverResult<squeue::Entry> {
+    ) -> UringResult<squeue::Entry> {
         unsafe { submit::make_sqe_fsync(kernel, payload, driver, token) }
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
         res
     }
 }
@@ -209,11 +209,11 @@ impl UringOpSpec for FsyncRaw {
         payload: &mut Self,
         driver: &mut UringDriver,
         token: SubmitTokenContext,
-    ) -> DriverResult<squeue::Entry> {
+    ) -> UringResult<squeue::Entry> {
         unsafe { submit::make_sqe_fsync_raw(kernel, payload, driver, token) }
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
         res
     }
 }
@@ -233,11 +233,11 @@ impl UringOpSpec for SyncFileRange {
         payload: &mut Self,
         driver: &mut UringDriver,
         token: SubmitTokenContext,
-    ) -> DriverResult<squeue::Entry> {
+    ) -> UringResult<squeue::Entry> {
         unsafe { submit::make_sqe_sync_range(kernel, payload, driver, token) }
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
         res
     }
 }
@@ -257,11 +257,11 @@ impl UringOpSpec for SyncFileRangeRaw {
         payload: &mut Self,
         driver: &mut UringDriver,
         token: SubmitTokenContext,
-    ) -> DriverResult<squeue::Entry> {
+    ) -> UringResult<squeue::Entry> {
         unsafe { submit::make_sqe_sync_range_raw(kernel, payload, driver, token) }
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
         res
     }
 }
@@ -281,11 +281,11 @@ impl UringOpSpec for Fallocate {
         payload: &mut Self,
         driver: &mut UringDriver,
         token: SubmitTokenContext,
-    ) -> DriverResult<squeue::Entry> {
+    ) -> UringResult<squeue::Entry> {
         unsafe { submit::make_sqe_fallocate(kernel, payload, driver, token) }
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
         res
     }
 }
@@ -305,11 +305,11 @@ impl UringOpSpec for FallocateRaw {
         payload: &mut Self,
         driver: &mut UringDriver,
         token: SubmitTokenContext,
-    ) -> DriverResult<squeue::Entry> {
+    ) -> UringResult<squeue::Entry> {
         unsafe { submit::make_sqe_fallocate_raw(kernel, payload, driver, token) }
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
         res
     }
 }
@@ -329,7 +329,7 @@ impl UringOpSpec for Open {
         payload: &mut Self,
         driver: &mut UringDriver,
         token: SubmitTokenContext,
-    ) -> DriverResult<squeue::Entry> {
+    ) -> UringResult<squeue::Entry> {
         unsafe { submit::make_sqe_open(kernel, payload, driver, token) }
     }
 
@@ -340,7 +340,7 @@ impl UringOpSpec for Open {
         submit::completion_cleanup_close_raw_fd(result)
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
         res.map(|raw| unsafe {
             OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_file(raw as i32)))
         })

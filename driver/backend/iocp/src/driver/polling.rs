@@ -21,9 +21,7 @@ use crate::{
     win32::{CompletionStatus, IoCompletionPort, Overlapped},
 };
 
-use super::{
-    IocpDriver, IocpDriverResult, RIO_EVENT_KEY, RIO_EVENT_TOKEN, completion::COMP_BACKEND_IOCP,
-};
+use super::{IocpDriver, RIO_EVENT_KEY, RIO_EVENT_TOKEN, completion::COMP_BACKEND_IOCP};
 
 pub(super) struct CompletionPump {
     port: Arc<IoCompletionPort>,
@@ -116,7 +114,7 @@ impl TimerEngine {
 }
 
 impl<'a> IocpDriver<'a> {
-    pub(super) fn poll_completion(&mut self, timeout: Duration) -> IocpDriverResult<usize> {
+    pub(super) fn poll_completion(&mut self, timeout: Duration) -> IocpResult<usize> {
         let status = self
             .completion
             .port()
@@ -144,7 +142,7 @@ impl<'a> IocpDriver<'a> {
         let status = self.completion.port().get_status(wait_ms);
         let now = Instant::now();
         self.timer.advance_to(now);
-        self.process_timers();
+        self.process_timers()?;
 
         let status = status
             .attach_note("failed to get IOCP completion status")
@@ -182,7 +180,7 @@ impl<'a> IocpDriver<'a> {
         overlapped: *mut Overlapped,
         success: bool,
         error_code: Option<u32>,
-    ) -> IocpDriverResult<usize> {
+    ) -> IocpResult<usize> {
         let res = iocp_status_res(success, error_code, bytes);
         let flags = iocp_status_flags(success, error_code);
         match classify_completion_status(key, overlapped, success) {
@@ -201,8 +199,7 @@ impl<'a> IocpDriver<'a> {
                     self.drain_deferred_socket_cleanup();
                 })
                 .push_ctx("scope", "iocp/driver")
-                .attach_note("failed to process rio completions")
-                .trans()?;
+                .attach_note("failed to process rio completions")?;
                 Ok(0)
             }
             IocpCompletionStatusKind::OverlappedUser { queue_key } => {

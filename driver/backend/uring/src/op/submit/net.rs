@@ -1,6 +1,6 @@
 use crate::{
     driver::UringDriver,
-    error::{UringDriverResult as DriverResult, UringError},
+    error::{UringError, UringResult},
     net::{socket_addr_to_storage, to_socket_addr},
     op::{
         Accept, Connect, OpSend, Recv, SendTo, UdpConnect, UdpRecv, UdpRecvFrom, UdpSend,
@@ -18,7 +18,7 @@ pub(crate) unsafe fn make_sqe_recv(
     val: &mut Recv,
     driver: &mut UringDriver,
     _token: SubmitTokenContext,
-) -> DriverResult<squeue::Entry> {
+) -> UringResult<squeue::Entry> {
     let (ptr, len) = val
         .buf
         .checked_read_range(val.buf_offset)
@@ -32,7 +32,7 @@ pub(crate) unsafe fn make_sqe_send(
     val: &mut OpSend,
     driver: &mut UringDriver,
     _token: SubmitTokenContext,
-) -> DriverResult<squeue::Entry> {
+) -> UringResult<squeue::Entry> {
     let (ptr, len) = val
         .buf
         .checked_write_range(val.buf_offset)
@@ -46,7 +46,7 @@ pub(crate) unsafe fn make_sqe_udp_recv(
     val: &mut UdpRecv,
     driver: &mut UringDriver,
     _token: SubmitTokenContext,
-) -> DriverResult<squeue::Entry> {
+) -> UringResult<squeue::Entry> {
     let (ptr, len) = val
         .buf
         .checked_read_range(val.buf_offset)
@@ -64,7 +64,7 @@ pub(crate) unsafe fn make_sqe_udp_send(
     val: &mut UdpSend,
     driver: &mut UringDriver,
     _token: SubmitTokenContext,
-) -> DriverResult<squeue::Entry> {
+) -> UringResult<squeue::Entry> {
     let (ptr, len) = val
         .buf
         .checked_write_range(val.buf_offset)
@@ -82,7 +82,7 @@ pub(crate) unsafe fn make_sqe_connect(
     val: &mut Connect,
     driver: &mut UringDriver,
     _token: SubmitTokenContext,
-) -> DriverResult<squeue::Entry> {
+) -> UringResult<squeue::Entry> {
     let fixed_fd = resolve_socket_fd(
         &driver.file_slots,
         val.fd,
@@ -96,7 +96,7 @@ pub(crate) unsafe fn make_sqe_udp_connect(
     val: &mut UdpConnect,
     driver: &mut UringDriver,
     _token: SubmitTokenContext,
-) -> DriverResult<squeue::Entry> {
+) -> UringResult<squeue::Entry> {
     let fixed_fd = resolve_socket_fd(
         &driver.file_slots,
         val.fd,
@@ -110,7 +110,7 @@ pub(crate) unsafe fn make_sqe_accept(
     val: &mut Accept,
     driver: &mut UringDriver,
     _token: SubmitTokenContext,
-) -> DriverResult<squeue::Entry> {
+) -> UringResult<squeue::Entry> {
     let fixed_fd = resolve_socket_fd(
         &driver.file_slots,
         val.fd,
@@ -128,7 +128,7 @@ pub(crate) unsafe fn on_complete_accept(
     _kernel: &mut AcceptPayload,
     accept_op: &mut Accept,
     result: i32,
-) -> DriverResult<usize> {
+) -> UringResult<usize> {
     if result < 0 {
         return Err(UringError::CompletionWait
             .report(
@@ -155,7 +155,7 @@ pub(crate) unsafe fn make_sqe_send_to(
     user: &mut SendTo,
     driver: &mut UringDriver,
     _token: SubmitTokenContext,
-) -> DriverResult<squeue::Entry> {
+) -> UringResult<squeue::Entry> {
     let (ptr, len) = user
         .buf
         .checked_write_range(user.buf_offset)
@@ -185,7 +185,7 @@ pub(crate) unsafe fn make_sqe_udp_recv_from(
     user: &mut UdpRecvFrom,
     driver: &mut UringDriver,
     _token: SubmitTokenContext,
-) -> DriverResult<squeue::Entry> {
+) -> UringResult<squeue::Entry> {
     let fd = user.fd;
     let recv_buf = &mut user.buf;
 
@@ -212,7 +212,7 @@ pub(crate) unsafe fn on_complete_udp_recv_from(
     kernel: &mut UdpRecvFromPayload,
     user: &mut UdpRecvFrom,
     result: i32,
-) -> DriverResult<usize> {
+) -> UringResult<usize> {
     if result < 0 {
         return Err(UringError::CompletionWait
             .report(

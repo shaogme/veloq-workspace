@@ -4,7 +4,7 @@ mod net;
 use crate::{
     OwnedRawHandle,
     driver::UringDriver,
-    error::{UringDriverResult, UringDriverResult as DriverResult, UringError},
+    error::{UringError, UringResult},
     op::{
         Accept, Close, Connect, Fallocate, FallocateRaw, Fsync, FsyncRaw, OpSend, OpVTable, Open,
         ReadFixed, ReadRaw, Recv, SendTo, SubmissionStrategy, SyncFileRange, SyncFileRangeRaw,
@@ -34,13 +34,13 @@ pub(crate) trait UringOpSpec: Sized + Send + 'static {
         payload: &mut Self,
         driver: &mut UringDriver,
         token: SubmitTokenContext,
-    ) -> DriverResult<squeue::Entry>;
+    ) -> UringResult<squeue::Entry>;
 
     unsafe fn on_complete(
         _kernel: &mut Self::KernelPayload,
         _payload: &mut Self,
         result: i32,
-    ) -> DriverResult<usize> {
+    ) -> UringResult<usize> {
         if result >= 0 {
             Ok(result as usize)
         } else {
@@ -76,7 +76,7 @@ pub(crate) trait UringOpSpec: Sized + Send + 'static {
         0
     }
 
-    fn map_completion(payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion>;
+    fn map_completion(payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion>;
 }
 
 pub(crate) trait UringOpErasure: UringOpSpec {
@@ -85,7 +85,7 @@ pub(crate) trait UringOpErasure: UringOpSpec {
     fn kernel_payload_mut(payload: &mut UringOpPayload) -> Option<&mut Self::KernelPayload>;
 
     fn erase_user_payload(payload: Self) -> UringUserPayload;
-    fn try_user_payload(payload: UringUserPayload) -> DriverResult<Self>;
+    fn try_user_payload(payload: UringUserPayload) -> UringResult<Self>;
     fn user_payload_ref(payload: &UringUserPayload) -> Option<&Self>;
     fn user_payload_mut(payload: &mut UringUserPayload) -> Option<&mut Self>;
 
@@ -97,7 +97,7 @@ pub(crate) unsafe fn make_sqe_shim<S>(
     payload: &mut UringUserPayload,
     driver: &mut UringDriver,
     token: SubmitTokenContext,
-) -> DriverResult<squeue::Entry>
+) -> UringResult<squeue::Entry>
 where
     S: UringOpErasure,
 {
@@ -114,7 +114,7 @@ pub(crate) unsafe fn on_complete_shim<S>(
     op: &mut UringKernelOp,
     payload: &mut UringUserPayload,
     result: i32,
-) -> DriverResult<usize>
+) -> UringResult<usize>
 where
     S: UringOpErasure,
 {
@@ -209,7 +209,7 @@ macro_rules! impl_uring_op_erasure {
                 UringUserPayload::$user_variant(payload)
             }
 
-            fn try_user_payload(payload: UringUserPayload) -> UringDriverResult<Self> {
+            fn try_user_payload(payload: UringUserPayload) -> UringResult<Self> {
                 match payload {
                     UringUserPayload::$user_variant(payload) => Ok(payload),
                     _ => Err(payload_projection_mismatch_report::<UringError>(
@@ -272,13 +272,13 @@ macro_rules! impl_uring_op_erasure {
 
             fn try_payload_from_erased(
                 payload: UringUserPayload,
-            ) -> UringDriverResult<Self::UserPayload> {
+            ) -> UringResult<Self::UserPayload> {
                 <$OpType as UringOpErasure>::try_user_payload(payload)
             }
 
             fn complete(
                 payload: Self::UserPayload,
-                res: UringDriverResult<usize>,
+                res: UringResult<usize>,
             ) -> OpCompletion<Self::Output, UringError, Self::Completion> {
                 let completion = <$OpType as UringOpSpec>::map_completion(&payload, res);
                 OpCompletion::new(completion, payload)
@@ -302,11 +302,11 @@ impl UringOpSpec for Wakeup {
         payload: &mut Self,
         driver: &mut UringDriver,
         token: SubmitTokenContext,
-    ) -> DriverResult<squeue::Entry> {
+    ) -> UringResult<squeue::Entry> {
         unsafe { submit::make_sqe_wakeup(kernel, payload, driver, token) }
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
         res
     }
 }
@@ -327,7 +327,7 @@ impl UringOpSpec for Timeout {
         payload: &mut Self,
         driver: &mut UringDriver,
         token: SubmitTokenContext,
-    ) -> DriverResult<squeue::Entry> {
+    ) -> UringResult<squeue::Entry> {
         unsafe { submit::make_sqe_timeout(kernel, payload, driver, token) }
     }
 
@@ -335,7 +335,7 @@ impl UringOpSpec for Timeout {
         Some(payload.duration)
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
         res
     }
 }

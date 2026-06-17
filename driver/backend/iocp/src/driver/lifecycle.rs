@@ -22,8 +22,7 @@ use crate::{
 };
 
 use super::{
-    CloseMode, IocpDriver, IocpDriverCompletionDiagnostics, IocpDriverResult, IocpOpRegistry,
-    PreInit,
+    CloseMode, IocpDriver, IocpDriverCompletionDiagnostics, IocpOpRegistry, PreInit,
     polling::{CompletionPump, TimerEngine},
     registration::HandleRegistry,
 };
@@ -159,9 +158,9 @@ impl<'a> IocpDriver<'a> {
         Ok(WinsockGuard)
     }
 
-    pub(super) fn shutdown_ops(&mut self) -> ShutdownPending {
+    pub(super) fn shutdown_ops(&mut self) -> IocpResult<ShutdownPending> {
         if self.shutting_down {
-            return ShutdownPending::default();
+            return Ok(ShutdownPending::default());
         }
         self.shutting_down = true;
         self.rio.state_mut().stop_accepting_new_submissions();
@@ -208,16 +207,16 @@ impl<'a> IocpDriver<'a> {
             in_flight.push(token);
         }
         for token in in_flight {
-            let _ = self.cancel_op_internal(CancelRequest::abandon(token));
+            self.cancel_op_internal(CancelRequest::abandon(token))?;
         }
-        pending
+        Ok(pending)
     }
 
     pub(super) fn drain_pending_all(
         &mut self,
         pending_iocp_count: usize,
         timeout: Duration,
-    ) -> IocpDriverResult<()> {
+    ) -> IocpResult<()> {
         let mut drained_iocp = 0usize;
         let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
             IocpError::CompletionWait
@@ -282,11 +281,11 @@ impl<'a> IocpDriver<'a> {
         self.rio.state_mut().defer_payloads(payloads);
     }
 
-    pub(super) fn close_impl(&mut self, mode: CloseMode) -> IocpDriverResult<()> {
+    pub(super) fn close_impl(&mut self, mode: CloseMode) -> IocpResult<()> {
         if self.closed {
             return Ok(());
         }
-        let pending = self.shutdown_ops();
+        let pending = self.shutdown_ops()?;
         if let CloseMode::Strict { timeout } = mode {
             self.drain_pending_all(pending.iocp_pending, timeout)
                 .push_ctx("scope", "iocp/driver")

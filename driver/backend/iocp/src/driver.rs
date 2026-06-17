@@ -20,6 +20,7 @@ use submission::SubmitContextInternal;
 #[cfg(test)]
 use crate::RegisteredHandle;
 use crate::{
+    IocpResult,
     config::{IoFd, IocpHandle},
     diagnostics::IocpCompletionDiagnostics,
     error::IocpError,
@@ -29,13 +30,10 @@ use crate::{
 };
 
 use veloq_buf::heap::ChunkId;
-use veloq_driver_core::{
-    DriverResult as CoreDriverResult,
-    driver::{
-        CancelRequest, CancelSubmitOutcome, CompletionToken, DriveMode, DriveOutcome, Driver,
-        DriverCompletionDiagnostics, DriverSubmitResult, OpToken, RegisterFd, RemoteCancelSender,
-        RemoteWaker, SharedCompletionTable, SharedDriverSlotTable, SubmitStatus, registry::OpEntry,
-    },
+use veloq_driver_core::driver::{
+    CancelRequest, CancelSubmitOutcome, CompletionToken, DriveMode, DriveOutcome, Driver,
+    DriverCompletionDiagnostics, DriverSubmitResult, OpToken, RegisterFd, RemoteCancelSender,
+    RemoteWaker, SharedCompletionTable, SharedDriverSlotTable, SubmitStatus, registry::OpEntry,
 };
 
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
@@ -51,7 +49,6 @@ pub(crate) const RIO_EVENT_TOKEN: CompletionToken = match CompletionToken::encod
 pub(crate) const RIO_EVENT_KEY: usize = RIO_EVENT_TOKEN.raw() as usize;
 pub(crate) type PreInit = IoCompletionPort;
 
-pub(crate) type IocpDriverResult<T> = CoreDriverResult<T, IocpError>;
 pub(crate) type IocpDriverCompletionDiagnostics =
     DriverCompletionDiagnostics<IocpCompletionDiagnostics>;
 pub use crate::op::IocpOpState;
@@ -142,7 +139,7 @@ impl<'a> Driver for IocpDriver<'a> {
     type Error = IocpError;
     type SlotSpec = IocpSlotSpec;
 
-    fn reserve_op_raw(&mut self) -> IocpDriverResult<OpToken> {
+    fn reserve_op_raw(&mut self) -> IocpResult<OpToken> {
         let (user_data, generation) = match self.ops.insert(OpEntry::new(IocpOpState::default())) {
             Ok(handle) => (handle.index, handle.generation),
             Err(_) => {
@@ -240,7 +237,7 @@ impl<'a> Driver for IocpDriver<'a> {
         Self::on_submit_res(&mut self.ops, ctx, result, token, op_in)
     }
 
-    fn drive(&mut self, mode: DriveMode) -> IocpDriverResult<DriveOutcome> {
+    fn drive(&mut self, mode: DriveMode) -> IocpResult<DriveOutcome> {
         match mode {
             DriveMode::Poll => {
                 self.get_completion(0)
@@ -274,11 +271,11 @@ impl<'a> Driver for IocpDriver<'a> {
         self.completion.completion_table()
     }
 
-    fn cancel_op(&mut self, request: CancelRequest) -> IocpDriverResult<CancelSubmitOutcome> {
+    fn cancel_op(&mut self, request: CancelRequest) -> IocpResult<CancelSubmitOutcome> {
         self.cancel_op_internal(request)
     }
 
-    fn register_chunk(&mut self, id: ChunkId, ptr: *const u8, len: usize) -> IocpDriverResult<()> {
+    fn register_chunk(&mut self, id: ChunkId, ptr: *const u8, len: usize) -> IocpResult<()> {
         IocpDriver::register_chunk(self, id, ptr, len)
             .push_ctx("scope", "iocp/driver")
             .attach_note("register chunk failed")
@@ -287,11 +284,11 @@ impl<'a> Driver for IocpDriver<'a> {
     fn register_files<'f>(
         &mut self,
         files: Vec<RegisterFd<'f, IocpHandle>>,
-    ) -> IocpDriverResult<Vec<IoFd>> {
+    ) -> IocpResult<Vec<IoFd>> {
         IocpDriver::register_files(self, files)
     }
 
-    fn unregister_files(&mut self, files: Vec<IoFd>) -> IocpDriverResult<()> {
+    fn unregister_files(&mut self, files: Vec<IoFd>) -> IocpResult<()> {
         IocpDriver::unregister_files(self, files)
     }
 

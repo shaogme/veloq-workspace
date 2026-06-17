@@ -1,7 +1,7 @@
 use core::convert::TryFrom;
 
 use diagweave::prelude::*;
-use veloq_driver_core::{DriverCoreError, DriverError, DriverResult};
+use veloq_driver_core::{DriverCoreError, DriverError};
 
 set! {
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -30,7 +30,6 @@ set! {
 }
 
 pub type UringResult<T> = Result<T, Report<UringError>>;
-pub type UringDriverResult<T> = DriverResult<T, UringError>;
 
 impl UringError {
     #[inline]

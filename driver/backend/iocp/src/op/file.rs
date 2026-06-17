@@ -1,6 +1,6 @@
 use crate::{
     config::{IoFd, IocpHandle, OwnedRawHandle, RawHandle},
-    error::{IocpDriverResult as DriverResult, IocpResult},
+    error::IocpResult,
     op::{
         Close, Fallocate, FallocateRaw, Fsync, FsyncRaw, KernelRef, Open, OpenPayload,
         OverlappedEntry, PayloadRef, ReadFixed, ReadRaw, SubmitContext, SyncFileRange,
@@ -32,7 +32,7 @@ impl IocpOpSpec for ReadFixed {
         unsafe { submit::get_fd_read_fixed(payload) }
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion> {
         res
     }
 }
@@ -55,7 +55,7 @@ impl IocpOpSpec for ReadRaw {
         submit::submit_read_raw(header, payload, ctx)
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion> {
         res
     }
 }
@@ -82,7 +82,7 @@ impl IocpOpSpec for WriteFixed {
         unsafe { submit::get_fd_write_fixed(payload) }
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion> {
         res
     }
 }
@@ -105,7 +105,7 @@ impl IocpOpSpec for WriteRaw {
         submit::submit_write_raw(header, payload, ctx)
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion> {
         res
     }
 }
@@ -132,7 +132,7 @@ impl IocpOpSpec for Close {
         unsafe { submit::get_fd_close(payload) }
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion> {
         res
     }
 }
@@ -159,7 +159,7 @@ impl IocpOpSpec for Fsync {
         unsafe { submit::get_fd_fsync(payload) }
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion> {
         res
     }
 }
@@ -182,7 +182,7 @@ impl IocpOpSpec for FsyncRaw {
         submit::submit_fsync_raw(header, payload, ctx)
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion> {
         res
     }
 }
@@ -209,7 +209,7 @@ impl IocpOpSpec for SyncFileRange {
         unsafe { submit::get_fd_sync_range(payload) }
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion> {
         res
     }
 }
@@ -232,7 +232,7 @@ impl IocpOpSpec for SyncFileRangeRaw {
         submit::submit_sync_range_raw(header, payload, ctx)
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion> {
         res
     }
 }
@@ -259,7 +259,7 @@ impl IocpOpSpec for Fallocate {
         unsafe { submit::get_fd_fallocate(payload) }
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion> {
         res
     }
 }
@@ -282,7 +282,7 @@ impl IocpOpSpec for FallocateRaw {
         submit::submit_fallocate_raw(header, payload, ctx)
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion> {
         res
     }
 }
@@ -314,7 +314,7 @@ impl IocpOpSpec for Open {
         submit::completion_cleanup_close_file(result)
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion> {
         res.map(|raw| unsafe {
             OwnedRawHandle::from_raw_owned(RawHandle::new(IocpHandle::for_file(raw as _)))
         })

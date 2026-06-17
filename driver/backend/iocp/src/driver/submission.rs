@@ -23,7 +23,7 @@ use veloq_driver_core::{
 use crate::{
     config::{IoFd, RawHandle},
     driver::{
-        IocpDriver, IocpDriverCompletionDiagnostics, IocpDriverResult, IocpOpRegistry,
+        IocpDriver, IocpDriverCompletionDiagnostics, IocpOpRegistry,
         registration::close_registered_owned_fd,
     },
     error::{IocpError, IocpResult, iocp_fallback_event_res},
@@ -76,7 +76,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
     fn handle_control(
         &mut self,
         _control: CompletionControl,
-    ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
+    ) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         Ok(CompletionHookOutcome::Ignore { effect: () })
     }
 
@@ -85,7 +85,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
         event: UserCompletionEvent,
         slot: Slot<'_, InFlightWaiting>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
+    ) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         let event_res = event.res();
         let snapshot = slot.snapshot();
         let mut guard = slot.complete();
@@ -126,7 +126,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
         _event: UserCompletionEvent,
         slot: Slot<'_, InFlightOrphaned>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
+    ) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         let mut guard = slot.complete();
         let cleanup = guard
             .with_op_mut(|op| op.orphan_cleanup(&Err(IocpError::Submission.to_report())))
@@ -209,7 +209,7 @@ impl<'a> IocpDriver<'a> {
         ctx: SubmitContextInternal<'_>,
         token: OpToken,
         task: BlockingTask,
-    ) -> IocpDriverResult<Poll<()>> {
+    ) -> IocpResult<Poll<()>> {
         if !BlockingBridge::submit(task) {
             let report = IocpError::Submission.report("iocp/driver", "thread pool overloaded");
             let event_res = iocp_fallback_event_res(IocpError::Submission);
@@ -234,7 +234,7 @@ impl<'a> IocpDriver<'a> {
     pub(crate) fn on_submit_res(
         ops: &mut IocpOpRegistry,
         ctx: SubmitContextInternal<'_>,
-        result: IocpDriverResult<SubmissionResult>,
+        result: IocpResult<SubmissionResult>,
         token: OpToken,
         op_in: &mut Option<IocpOp>,
     ) -> DriverSubmitResult<IocpError> {
@@ -323,7 +323,7 @@ impl<'a> IocpDriver<'a> {
         &mut self,
         token: OpToken,
         op: IocpOp,
-    ) -> IocpDriverResult<IocpDriverResult<SubmissionResult>> {
+    ) -> IocpResult<IocpResult<SubmissionResult>> {
         let mut guard = Self::prep_op_slot(&mut self.ops, token, op)
             .push_ctx("scope", "iocp/driver")
             .attach_note("failed to prepare op slot")?;

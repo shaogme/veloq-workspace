@@ -10,7 +10,7 @@ use std::{
 use diagweave::prelude::*;
 
 use crate::{
-    error::{IocpDriverResult, IocpError},
+    error::{IocpError, IocpResult},
     win32::IoCompletionPort,
 };
 use veloq_driver_core::driver::{CompletionToken, RemoteWaker};
@@ -66,7 +66,7 @@ pub(crate) struct IocpWaker {
 }
 
 impl RemoteWaker<IocpError> for IocpWaker {
-    fn wake(&self) -> IocpDriverResult<()> {
+    fn wake(&self) -> IocpResult<()> {
         if self.is_notified.load(Ordering::Relaxed) {
             return Ok(());
         }

@@ -1,6 +1,6 @@
 use crate::{
     config::{IoFd, IocpHandle, OwnedRawHandle, RawHandle},
-    error::{IocpDriverResult as DriverResult, IocpResult},
+    error::IocpResult,
     ext::Extensions,
     net::addr::{SockAddrStorage, socket_addr_to_storage},
     op::{
@@ -35,7 +35,7 @@ impl IocpOpSpec for Recv {
         unsafe { submit::get_fd_recv(payload) }
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion> {
         res
     }
 }
@@ -62,7 +62,7 @@ impl IocpOpSpec for OpSend {
         unsafe { submit::get_fd_send(payload) }
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion> {
         res
     }
 }
@@ -89,7 +89,7 @@ impl IocpOpSpec for UdpRecv {
         unsafe { submit::get_fd_udp_recv(payload) }
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion> {
         res
     }
 }
@@ -116,7 +116,7 @@ impl IocpOpSpec for UdpSend {
         unsafe { submit::get_fd_udp_send(payload) }
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion> {
         res
     }
 }
@@ -152,7 +152,7 @@ impl IocpOpSpec for Connect {
         unsafe { submit::get_fd_connect(payload) }
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion> {
         res
     }
 }
@@ -188,7 +188,7 @@ impl IocpOpSpec for UdpConnect {
         unsafe { submit::get_fd_udp_connect(payload) }
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion> {
         res
     }
 }
@@ -235,7 +235,7 @@ impl IocpOpSpec for Accept {
         unsafe { submit::get_fd_accept(payload) }
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion> {
         res.map(|raw| unsafe {
             OwnedRawHandle::from_raw_owned(RawHandle::new(IocpHandle::for_socket(raw as _)))
         })
@@ -273,7 +273,7 @@ impl IocpOpSpec for SendTo {
         unsafe { submit::get_fd_send_to(payload) }
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion> {
         res
     }
 }
@@ -312,7 +312,7 @@ impl IocpOpSpec for UdpRecvFrom {
         unsafe { submit::get_fd_udp_recv_from(payload) }
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion> {
         res
     }
 }

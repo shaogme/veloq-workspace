@@ -11,7 +11,7 @@ use tracing::{debug, error, trace, warn};
 use crate::{
     diagnostics::UringCompletionDiagnostics,
     driver::{PendingCancel, UringDriver},
-    error::{UringDriverResult, UringError, UringResult, uring_report_to_event_res},
+    error::{UringError, UringResult, uring_report_to_event_res},
     op::{Slot, UringSlotSpec, UringUserPayload},
 };
 use veloq_driver_core::{
@@ -226,7 +226,7 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
     fn handle_control(
         &mut self,
         control: CompletionControl,
-    ) -> UringDriverResult<CompletionHookOutcome<UringSlotSpec, Self::BackendEffect>> {
+    ) -> UringResult<CompletionHookOutcome<UringSlotSpec, Self::BackendEffect>> {
         Ok(match control {
             CompletionControl::Waker { raw, .. } => CompletionHookOutcome::ControlHandled {
                 effect: self.handle_waker_control(raw),
@@ -240,7 +240,7 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
         event: UserCompletionEvent,
         slot: Slot<'_, InFlightWaiting>,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> UringDriverResult<CompletionHookOutcome<UringSlotSpec, Self::BackendEffect>> {
+    ) -> UringResult<CompletionHookOutcome<UringSlotSpec, Self::BackendEffect>> {
         Ok(match source {
             CompletionSource::Synthetic(SyntheticCompletionSource::Timer) => {
                 complete_timer_waiting_slot(slot, event)
@@ -266,7 +266,7 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
         event: UserCompletionEvent,
         slot: Slot<'_, InFlightOrphaned>,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> UringDriverResult<CompletionHookOutcome<UringSlotSpec, Self::BackendEffect>> {
+    ) -> UringResult<CompletionHookOutcome<UringSlotSpec, Self::BackendEffect>> {
         let res = match source {
             CompletionSource::Synthetic(SyntheticCompletionSource::Timer) => 0,
             CompletionSource::Synthetic(SyntheticCompletionSource::Cancel) => event.res(),
@@ -313,7 +313,7 @@ impl<'a> UringDriver<'a> {
     pub(crate) fn wait_internal(&mut self) -> UringResult<()> {
         let _ = drain_cancel_requests(self)?;
         self.flush_cancellations();
-        self.flush_backlog();
+        self.flush_backlog()?;
 
         if !self.has_active_ops_internal() {
             return Ok(());
@@ -345,17 +345,17 @@ impl<'a> UringDriver<'a> {
 
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(self.last_timer_poll);
-        self.advance_timers(elapsed);
+        self.advance_timers(elapsed)?;
         self.last_timer_poll = now;
 
         let progress = self.process_completions_internal()?;
         let _ = progress.semantic_count();
         self.flush_cancellations();
-        self.flush_backlog();
+        self.flush_backlog()?;
         Ok(())
     }
 
-    pub(crate) fn advance_timers(&mut self, elapsed: Duration) {
+    pub(crate) fn advance_timers(&mut self, elapsed: Duration) -> UringResult<()> {
         self.wheel.advance(elapsed, &mut self.timer_buffer);
 
         let timer_buffer = std::mem::take(&mut self.timer_buffer);
@@ -365,25 +365,26 @@ impl<'a> UringDriver<'a> {
                 event,
                 SyntheticCompletionSource::Timer,
                 UringSyntheticCompletion::None,
-            );
+            )?;
         }
+        Ok(())
     }
 
     pub(crate) fn poll_nonblocking_internal(&mut self) -> UringResult<()> {
         let _ = drain_cancel_requests(self)?;
         self.flush_cancellations();
-        self.flush_backlog();
+        self.flush_backlog()?;
         self.submit_to_kernel()?;
         let progress = self.process_completions_internal()?;
         let _ = progress.semantic_count();
 
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(self.last_timer_poll);
-        self.advance_timers(elapsed);
+        self.advance_timers(elapsed)?;
         self.last_timer_poll = now;
 
         self.flush_cancellations();
-        self.flush_backlog();
+        self.flush_backlog()?;
         Ok(())
     }
 
@@ -491,7 +492,7 @@ impl<'a> UringDriver<'a> {
             return Err(e);
         }
         if post.flush_backlog {
-            self.flush_backlog();
+            self.flush_backlog()?;
         }
         Ok(())
     }
@@ -797,7 +798,7 @@ fn cleanup_orphaned_slot(slot: Slot<'_, InFlightOrphaned>, cqe_res: i32) -> Comp
 }
 
 #[inline]
-pub(crate) fn driver_result_to_event_res(res: &UringDriverResult<usize>) -> i32 {
+pub(crate) fn driver_result_to_event_res(res: &UringResult<usize>) -> i32 {
     match res {
         Ok(v) => (*v).min(i32::MAX as usize) as i32,
         Err(e) => uring_report_to_event_res(e),

@@ -2,7 +2,7 @@ use core::convert::TryFrom;
 use std::fmt::Display;
 
 use diagweave::prelude::*;
-use veloq_driver_core::{DriverCoreError, DriverError, DriverResult};
+use veloq_driver_core::{DriverCoreError, DriverError};
 
 use crate::rio::RioError;
 
@@ -37,7 +37,6 @@ set! {
 }
 
 pub type IocpResult<T> = Result<T, Report<IocpError>>;
-pub type IocpDriverResult<T> = DriverResult<T, IocpError>;
 
 impl IocpError {
     #[inline]

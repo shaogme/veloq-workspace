@@ -49,7 +49,7 @@ impl<'a> IocpDriver<'a> {
         };
         if let Some(tid) = timer_id {
             self.timer.cancel(tid);
-            self.complete_local_cancel(token, request.mode);
+            self.complete_local_cancel(token, request.mode)?;
             self.completion_diagnostics
                 .backend()
                 .inc_cancel_local_completed();
@@ -78,7 +78,7 @@ impl<'a> IocpDriver<'a> {
                         )
                     })?;
                     let _ = guard.persist();
-                    self.complete_local_cancel(token, request.mode);
+                    self.complete_local_cancel(token, request.mode)?;
                 } else {
                     let _ = self.ops.remove(token);
                 }
@@ -116,7 +116,7 @@ impl<'a> IocpDriver<'a> {
         }
     }
 
-    fn complete_local_cancel(&mut self, token: OpToken, mode: CancelMode) {
+    fn complete_local_cancel(&mut self, token: OpToken, mode: CancelMode) -> IocpResult<()> {
         let event = UserCompletionEvent::from_parts(
             COMP_BACKEND_IOCP,
             token,
@@ -127,7 +127,8 @@ impl<'a> IocpDriver<'a> {
             event,
             SyntheticCompletionSource::Cancel,
             IocpSyntheticCompletion::Cancel { mode },
-        );
+        )?;
+        Ok(())
     }
 
     fn record_cancel_status(

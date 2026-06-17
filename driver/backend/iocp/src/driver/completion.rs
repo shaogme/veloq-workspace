@@ -13,7 +13,7 @@ use veloq_driver_core::{
 
 use crate::{
     driver::{IocpDriver, IocpDriverCompletionDiagnostics, polling::CompletionPump},
-    error::{IocpDriverResult, IocpError, IocpResult, iocp_report_to_event_res},
+    error::{IocpError, IocpResult, iocp_report_to_event_res},
     ext::Extensions,
     op::{IocpOp, IocpOpPayload, IocpSlotSpec, Slot},
     rio::{RioState, SocketInflightToken},
@@ -107,7 +107,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
     fn handle_control(
         &mut self,
         control: CompletionControl,
-    ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
+    ) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         Ok(match control {
             CompletionControl::Waker { raw, .. } => {
                 if raw.res >= 0 {
@@ -139,7 +139,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
         event: UserCompletionEvent,
         mut slot: Slot<'_, InFlightWaiting>,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
+    ) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         Ok(match source {
             CompletionSource::Synthetic(SyntheticCompletionSource::Timer) => {
                 complete_timer_waiting_slot(slot, event)
@@ -167,7 +167,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
         event: UserCompletionEvent,
         slot: Slot<'_, InFlightOrphaned>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
+    ) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         let (cleanup, socket_inflight) = complete_iocp_orphaned_slot(slot, event.res());
         Ok(CompletionHookOutcome::Cleanup {
             cleanup,
@@ -190,7 +190,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
 }
 
 impl<'a> IocpDriver<'a> {
-    pub(super) fn process_timers(&mut self) {
+    pub(super) fn process_timers(&mut self) -> IocpResult<()> {
         let timer_buffer = self.timer.take_buffer();
         let now = Instant::now();
 
@@ -229,9 +229,10 @@ impl<'a> IocpDriver<'a> {
                 event,
                 SyntheticCompletionSource::Timer,
                 IocpSyntheticCompletion::None,
-            );
+            )?;
         }
         self.timer.restore_cleared_buffer(timer_buffer);
+        Ok(())
     }
 
     pub(super) fn process_completion_envelope(

@@ -1,6 +1,6 @@
 use crate::{
     driver::{RegisteredFileEntry, UringDriver},
-    error::{UringDriverResult as DriverResult, UringError},
+    error::{UringError, UringResult},
     op::{
         Close, Fallocate, FallocateRaw, Fsync, FsyncRaw, Open, ReadFixed, ReadRaw, SyncFileRange,
         SyncFileRangeRaw, WriteFixed, WriteRaw,
@@ -19,7 +19,7 @@ pub(crate) unsafe fn make_sqe_read_fixed(
     rw_op: &mut ReadFixed,
     driver: &mut UringDriver,
     _token: SubmitTokenContext,
-) -> DriverResult<squeue::Entry> {
+) -> UringResult<squeue::Entry> {
     let region_info = rw_op.buf.resolve_region_info();
     let (ptr, len) = rw_op
         .buf
@@ -56,7 +56,7 @@ pub(crate) unsafe fn make_sqe_read_raw(
     rw_op: &mut ReadRaw,
     driver: &mut UringDriver,
     _token: SubmitTokenContext,
-) -> DriverResult<squeue::Entry> {
+) -> UringResult<squeue::Entry> {
     let region_info = rw_op.buf.resolve_region_info();
     let (ptr, len) = rw_op
         .buf
@@ -90,7 +90,7 @@ pub(crate) unsafe fn make_sqe_write_fixed(
     rw_op: &mut WriteFixed,
     driver: &mut UringDriver,
     _token: SubmitTokenContext,
-) -> DriverResult<squeue::Entry> {
+) -> UringResult<squeue::Entry> {
     let region_info = rw_op.buf.resolve_region_info();
     let (ptr, len) = rw_op
         .buf
@@ -129,7 +129,7 @@ pub(crate) unsafe fn make_sqe_write_raw(
     rw_op: &mut WriteRaw,
     driver: &mut UringDriver,
     _token: SubmitTokenContext,
-) -> DriverResult<squeue::Entry> {
+) -> UringResult<squeue::Entry> {
     let region_info = rw_op.buf.resolve_region_info();
     let (ptr, len) = rw_op
         .buf
@@ -163,7 +163,7 @@ pub(crate) unsafe fn make_sqe_close(
     close_op: &mut Close,
     driver: &mut UringDriver,
     _token: SubmitTokenContext,
-) -> DriverResult<squeue::Entry> {
+) -> UringResult<squeue::Entry> {
     let idx = close_op.fd.fixed_index() as usize;
     if let Some(RegisteredFileEntry::BorrowedFd { .. }) =
         driver.file_slots.get(idx).and_then(|s| s.entry.as_ref())
@@ -190,7 +190,7 @@ pub(crate) unsafe fn make_sqe_fsync(
     fsync_op: &mut Fsync,
     driver: &mut UringDriver,
     _token: SubmitTokenContext,
-) -> DriverResult<squeue::Entry> {
+) -> UringResult<squeue::Entry> {
     let flags = if fsync_op.datasync {
         io_uring::types::FsyncFlags::DATASYNC
     } else {
@@ -210,7 +210,7 @@ pub(crate) unsafe fn make_sqe_fsync_raw(
     fsync_op: &mut FsyncRaw,
     _driver: &mut UringDriver,
     _token: SubmitTokenContext,
-) -> DriverResult<squeue::Entry> {
+) -> UringResult<squeue::Entry> {
     let flags = if fsync_op.datasync {
         io_uring::types::FsyncFlags::DATASYNC
     } else {
@@ -226,7 +226,7 @@ pub(crate) unsafe fn make_sqe_sync_range(
     sync_op: &mut SyncFileRange,
     driver: &mut UringDriver,
     _token: SubmitTokenContext,
-) -> DriverResult<squeue::Entry> {
+) -> UringResult<squeue::Entry> {
     let nbytes = if sync_op.nbytes > u32::MAX as u64 {
         if sync_op.nbytes == u64::MAX {
             0
@@ -258,7 +258,7 @@ pub(crate) unsafe fn make_sqe_sync_range_raw(
     sync_op: &mut SyncFileRangeRaw,
     _driver: &mut UringDriver,
     _token: SubmitTokenContext,
-) -> DriverResult<squeue::Entry> {
+) -> UringResult<squeue::Entry> {
     let nbytes = if sync_op.nbytes > u32::MAX as u64 {
         if sync_op.nbytes == u64::MAX {
             0
@@ -286,7 +286,7 @@ pub(crate) unsafe fn make_sqe_fallocate(
     fallocate_op: &mut Fallocate,
     driver: &mut UringDriver,
     _token: SubmitTokenContext,
-) -> DriverResult<squeue::Entry> {
+) -> UringResult<squeue::Entry> {
     let fixed_fd = resolve_file_fd(
         &driver.file_slots,
         fallocate_op.fd,
@@ -303,7 +303,7 @@ pub(crate) unsafe fn make_sqe_fallocate_raw(
     fallocate_op: &mut FallocateRaw,
     _driver: &mut UringDriver,
     _token: SubmitTokenContext,
-) -> DriverResult<squeue::Entry> {
+) -> UringResult<squeue::Entry> {
     let fd = fallocate_op.fd.as_fd();
     Ok(opcode::Fallocate::new(types::Fd(fd), fallocate_op.len)
         .offset(fallocate_op.offset)
@@ -316,7 +316,7 @@ pub(crate) unsafe fn make_sqe_open(
     user: &mut Open,
     _driver: &mut UringDriver,
     _token: SubmitTokenContext,
-) -> DriverResult<squeue::Entry> {
+) -> UringResult<squeue::Entry> {
     let path_ptr = user.path.as_slice().as_ptr() as *const _;
     Ok(opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path_ptr)
         .flags(user.flags)

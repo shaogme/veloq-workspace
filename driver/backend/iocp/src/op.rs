@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use crate::{
     config::{IoFd, IocpHandle, OwnedRawHandle, RegisteredSlot},
-    error::{IocpDriverResult as DriverResult, IocpError, IocpResult},
+    error::{IocpError, IocpResult},
     ext::Extensions,
     net::addr::SockAddrStorage,
     rio::RioState,
@@ -192,7 +192,7 @@ macro_rules! impl_iocp_op_erasure {
                 IocpUserPayload::$user_variant(payload)
             }
 
-            fn try_user_payload(payload: IocpUserPayload) -> DriverResult<Self> {
+            fn try_user_payload(payload: IocpUserPayload) -> IocpResult<Self> {
                 match payload {
                     IocpUserPayload::$user_variant(payload) => Ok(payload),
                     _ => Err(veloq_driver_core::op::payload_projection_mismatch_report::<
@@ -248,15 +248,13 @@ macro_rules! impl_iocp_op_erasure {
                 <$OpType as IocpOpErasure>::erase_user_payload(payload)
             }
 
-            fn try_payload_from_erased(
-                payload: IocpUserPayload,
-            ) -> DriverResult<Self::UserPayload> {
+            fn try_payload_from_erased(payload: IocpUserPayload) -> IocpResult<Self::UserPayload> {
                 <$OpType as IocpOpErasure>::try_user_payload(payload)
             }
 
             fn complete(
                 payload: Self::UserPayload,
-                res: DriverResult<usize>,
+                res: IocpResult<usize>,
             ) -> OpCompletion<Self::Output, IocpError, Self::Completion> {
                 let completion = <$OpType as IocpOpSpec>::map_completion(&payload, res);
                 OpCompletion::new(completion, payload)
@@ -290,7 +288,7 @@ impl IocpOpSpec for Timeout {
         submit::submit_timeout(header, payload, ctx)
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion> {
         res
     }
 }
@@ -313,7 +311,7 @@ impl IocpOpSpec for Wakeup {
         submit::submit_wakeup(header, payload, ctx)
     }
 
-    fn map_completion(_payload: &Self, res: DriverResult<usize>) -> DriverResult<Self::Completion> {
+    fn map_completion(_payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion> {
         res
     }
 }

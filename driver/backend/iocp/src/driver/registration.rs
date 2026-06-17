@@ -16,7 +16,7 @@ use crate::{
     config::{
         IoFd, IocpHandle, RawHandle, RawHandleKind, RegisteredHandle, RegisteredSlot, SocketKey,
     },
-    driver::{IocpDriver, IocpDriverResult},
+    driver::IocpDriver,
     error::{IocpError, IocpResult},
     rio::RioState,
 };
@@ -386,7 +386,7 @@ impl<'a> IocpDriver<'a> {
         id: ChunkId,
         ptr: *const u8,
         len: usize,
-    ) -> IocpDriverResult<()> {
+    ) -> IocpResult<()> {
         self.rio
             .state_mut()
             .register_chunk(id, ptr, len)
@@ -400,7 +400,7 @@ impl<'a> IocpDriver<'a> {
     pub(crate) fn register_files<'h>(
         &mut self,
         files: Vec<RegisterFd<'h, IocpHandle>>,
-    ) -> IocpDriverResult<Vec<IoFd>> {
+    ) -> IocpResult<Vec<IoFd>> {
         enum InputHandle {
             Borrowed(RawHandle),
             Owned(OwnedRawHandle),
@@ -499,7 +499,7 @@ impl<'a> IocpDriver<'a> {
     }
 
     /// Unregisters a set of previously registered files.
-    pub(crate) fn unregister_files(&mut self, files: Vec<IoFd>) -> IocpDriverResult<()> {
+    pub(crate) fn unregister_files(&mut self, files: Vec<IoFd>) -> IocpResult<()> {
         for fd in files {
             if let Some((idx, entry)) = self.handles.take_for_unregister(fd) {
                 if entry.as_raw().kind() == RawHandleKind::Socket {

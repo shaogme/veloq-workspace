@@ -373,7 +373,7 @@ impl<'a> UringDriver<'a> {
                 }
             }
         }
-        self.flush_backlog();
+        self.flush_backlog()?;
         Ok(())
     }
 

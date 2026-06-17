@@ -4,7 +4,7 @@ use crate::{
     IoFd,
     config::{BorrowedRawHandle, SocketKey},
     driver::{IocpDriverCompletionDiagnostics, RIO_EVENT_TOKEN, completion::COMP_BACKEND_RIO},
-    error::{IocpDriverResult, IocpError, IocpResult},
+    error::{IocpError, IocpResult},
     op::{IocpOpPayload, IocpOpRegistry, IocpSlotSpec, Slot},
     rio::{
         RioEnv, RioState, SocketInflightToken, SocketLifecycleState, SocketRuntimeState,
@@ -19,7 +19,6 @@ use crate::{
 use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use std::mem::{take, zeroed};
-use tracing::debug;
 use veloq_buf::BufferRegistrar;
 use veloq_driver_core::{
     driver::{
@@ -139,7 +138,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
     fn handle_control(
         &mut self,
         _control: CompletionControl,
-    ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
+    ) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         Ok(CompletionHookOutcome::Ignore {
             effect: RioBackendEffect::default(),
         })
@@ -150,7 +149,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
         event: UserCompletionEvent,
         slot: Slot<'_, InFlightWaiting>,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
+    ) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         let CompletionSource::Backend(ingress) = source else {
             return Ok(CompletionHookOutcome::Anomaly {
                 kind: CompletionAnomalyKind::backend_invariant_broken(
@@ -176,7 +175,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
         event: UserCompletionEvent,
         slot: Slot<'_, InFlightOrphaned>,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
+    ) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         let CompletionSource::Backend(ingress) = source else {
             return Ok(CompletionHookOutcome::Ignore {
                 effect: RioBackendEffect::default(),
@@ -190,7 +189,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
         event: UserCompletionEvent,
         kind: CompletionAnomalyKind,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
+    ) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         let effect = match source {
             CompletionSource::Backend(ingress) => RioBackendEffect::from_init(&ingress.init),
             CompletionSource::Kernel | CompletionSource::User | CompletionSource::Synthetic(_) => {
@@ -207,7 +206,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
     fn complete_backend_ingress(
         &mut self,
         ingress: &Self::BackendIngress,
-    ) -> IocpDriverResult<CompletionBackendIngressAction<IocpSlotSpec, Self::BackendEffect>> {
+    ) -> IocpResult<CompletionBackendIngressAction<IocpSlotSpec, Self::BackendEffect>> {
         Ok(CompletionBackendIngressAction::RouteUser(
             UserCompletionEvent::from_parts(
                 COMP_BACKEND_RIO,
@@ -226,23 +225,13 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
         self.registry
             .release_buffer_lease(release.buffer_lease, self.env)
             .trans()?;
-        let _ = release_socket_inflight_token_from(self.socket_runtime, release.socket_inflight);
+        let _ = release_socket_inflight_token_from(self.socket_runtime, release.socket_inflight)
+            .trans()?;
         if *self.outstanding_count > 0 {
             *self.outstanding_count -= 1;
         }
         self.completed_count += 1;
         Ok(())
-    }
-}
-
-fn iocp_completion_error_to_rio(error: Report<IocpError>) -> Report<RioError> {
-    match *error.inner() {
-        IocpError::Rio(kind) => error.map_err(|_| kind),
-        kind => RioError::Internal
-            .to_report()
-            .push_ctx("scope", "rio.runtime.control_flow.process_completions")
-            .with_ctx("iocp_error", format!("{kind:?}"))
-            .attach_note("unexpected IOCP completion error during RIO processing"),
     }
 }
 
@@ -552,7 +541,7 @@ impl RioState {
         registrar: &dyn BufferRegistrar,
         completion_table: &SharedCompletionTable<IocpSlotSpec>,
         diagnostics: &mut IocpDriverCompletionDiagnostics,
-    ) -> RioResult<usize> {
+    ) -> IocpResult<usize> {
         const MAX_RIO_RESULTS: usize = 128;
         let mut results: [RIORESULT; MAX_RIO_RESULTS] = unsafe { zeroed() };
         let Some(env) = self.kernel.env(registrar, self.registration_mode) else {
@@ -570,7 +559,8 @@ impl RioState {
             let count = self.kernel.dequeue(&mut results);
             if count == RIO_CORRUPT_CQ {
                 return RioError::Internal
-                    .attach_note("RIO completion queue is corrupt (RIO_CORRUPT_CQ)");
+                    .attach_note("RIO completion queue is corrupt (RIO_CORRUPT_CQ)")
+                    .trans();
             }
             if count == 0 {
                 break;
@@ -586,14 +576,12 @@ impl RioState {
                         init,
                         context: _completed_context,
                     }) => {
-                        if let Err(error) = ops.accept_completion(
+                        let _ = ops.accept_completion(
                             completion_table,
                             diagnostics,
                             &mut hooks,
                             CompletionIngress::Backend(RioIngress { init, result }),
-                        ) {
-                            return Err(iocp_completion_error_to_rio(error));
-                        }
+                        )?;
                     }
                     RioRequestContextDecode::Malformed { raw } => {
                         let _ = ops.accept_completion(
@@ -604,13 +592,7 @@ impl RioState {
                                 kind: rio_malformed_context_kind(raw),
                                 attach: rio_result_attach(result),
                             },
-                        );
-                        debug!(
-                            request_context = raw,
-                            status = result.status,
-                            bytes = result.bytes,
-                            "ignoring malformed RIO request context"
-                        );
+                        )?;
                     }
                     RioRequestContextDecode::Missing { id } => {
                         let _ = ops.accept_completion(
@@ -625,15 +607,7 @@ impl RioState {
                                 ),
                                 attach: rio_result_attach(result),
                             },
-                        );
-                        debug!(
-                            request_context = result.request_context,
-                            context_index = id.index(),
-                            context_generation = id.generation(),
-                            status = result.status,
-                            bytes = result.bytes,
-                            "ignoring missing RIO request context"
-                        );
+                        )?;
                     }
                     RioRequestContextDecode::Stale {
                         id,
@@ -652,16 +626,7 @@ impl RioState {
                                 ),
                                 attach: rio_result_attach(result),
                             },
-                        );
-                        debug!(
-                            request_context = result.request_context,
-                            context_index = id.index(),
-                            expected_generation = id.generation(),
-                            actual_generation,
-                            status = result.status,
-                            bytes = result.bytes,
-                            "ignoring stale RIO request context"
-                        );
+                        )?;
                     }
                 }
             }
@@ -671,7 +636,7 @@ impl RioState {
             }
         }
 
-        self.kernel.rearm_notify()?;
+        self.kernel.rearm_notify().trans()?;
 
         if *hooks.outstanding_count == 0 {
             hooks.registry.flush_deregs(hooks.env);

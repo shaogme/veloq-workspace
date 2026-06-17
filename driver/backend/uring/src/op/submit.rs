@@ -7,7 +7,7 @@ pub(super) use net::*;
 use crate::{
     config::{IoFd, RawHandleKind},
     driver::{FileSlot, UringDriver, resolve_registered_fixed_fd},
-    error::{UringDriverResult as DriverResult, UringError},
+    error::{UringError, UringResult},
     op::{
         Timeout, Wakeup,
         payload::{TimeoutPayload, WakeupPayload},
@@ -40,7 +40,7 @@ fn resolve_file_fd(
     file_slots: &[FileSlot],
     fd: IoFd,
     scope: &'static str,
-) -> DriverResult<types::Fixed> {
+) -> UringResult<types::Fixed> {
     resolve_registered_fixed_fd(file_slots, fd, Some(RawHandleKind::File), scope).map(types::Fixed)
 }
 
@@ -49,7 +49,7 @@ fn resolve_socket_fd(
     file_slots: &[FileSlot],
     fd: IoFd,
     scope: &'static str,
-) -> DriverResult<types::Fixed> {
+) -> UringResult<types::Fixed> {
     resolve_registered_fixed_fd(file_slots, fd, Some(RawHandleKind::Socket), scope)
         .map(types::Fixed)
 }
@@ -59,7 +59,7 @@ fn resolve_any_fd(
     file_slots: &[FileSlot],
     fd: IoFd,
     scope: &'static str,
-) -> DriverResult<types::Fixed> {
+) -> UringResult<types::Fixed> {
     resolve_registered_fixed_fd(file_slots, fd, None, scope).map(types::Fixed)
 }
 
@@ -92,7 +92,7 @@ pub(crate) unsafe fn make_sqe_timeout(
     user: &mut Timeout,
     _driver: &mut UringDriver,
     _token: SubmitTokenContext,
-) -> DriverResult<squeue::Entry> {
+) -> UringResult<squeue::Entry> {
     kernel.ts = types::Timespec::new()
         .sec(user.duration.as_secs())
         .nsec(user.duration.subsec_nanos());
@@ -106,7 +106,7 @@ pub(crate) unsafe fn make_sqe_wakeup(
     user: &mut Wakeup,
     driver: &mut UringDriver,
     _token: SubmitTokenContext,
-) -> DriverResult<squeue::Entry> {
+) -> UringResult<squeue::Entry> {
     let fixed_fd = resolve_file_fd(
         &driver.file_slots,
         user.fd,
