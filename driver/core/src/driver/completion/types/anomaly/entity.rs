@@ -208,14 +208,6 @@ impl CompletionAnomaly {
         )
     }
 
-    pub fn backend_context_unknown(token: CompletionToken) -> Self {
-        Self::TokenOnly {
-            reason: CompletionAnomalyReason::BackendContextUnknown,
-            token,
-            raw: None,
-        }
-    }
-
     pub fn from_backend_context(
         token: CompletionToken,
         backend: CompletionBackend,

@@ -2,8 +2,7 @@ use crate::slot;
 
 use super::{
     AnomalyAttach, BackendSlotRef, CompletionAnomaly, CompletionAnomalyKind,
-    CompletionAnomalyReason, CompletionBackend, CompletionRaw, ControlAnomalyReason,
-    SlotIssueReason,
+    CompletionAnomalyReason, CompletionBackend, CompletionRaw, SlotIssueReason,
 };
 
 impl CompletionAnomalyKind {
@@ -62,12 +61,6 @@ impl CompletionAnomalyKind {
 
     pub const fn finalize_failed_snapshot(snapshot: slot::SlotSnapshot) -> Self {
         Self::slot_issue_with_snapshot(SlotIssueReason::FinalizeFailed, snapshot)
-    }
-
-    pub const fn backend_context_unknown() -> Self {
-        Self::Control {
-            reason: ControlAnomalyReason::BackendContextUnknown,
-        }
     }
 
     pub const fn backend_context(backend: CompletionBackend, backend_context: u64) -> Self {
@@ -137,11 +130,7 @@ impl CompletionAnomalyKind {
             Self::SlotIssue { reason, .. } => match reason {
                 SlotIssueReason::FinalizeFailed => CompletionAnomalyReason::FinalizeFailed,
             },
-            Self::Control { reason } => match reason {
-                ControlAnomalyReason::BackendContextUnknown => {
-                    CompletionAnomalyReason::BackendContextUnknown
-                }
-            },
+
             Self::BackendContext { .. } => CompletionAnomalyReason::BackendContextUnknown,
             Self::BackendSpecific { code, .. } => CompletionAnomalyReason::BackendSpecific(code),
         }
@@ -156,7 +145,7 @@ impl CompletionAnomalyKind {
             Self::BackendSpecific {
                 slot: Some(slot), ..
             } => Some(slot.index),
-            Self::Control { .. } | Self::BackendContext { .. } => None,
+            Self::BackendContext { .. } => None,
             Self::BackendSpecific { slot: None, .. } => None,
         }
     }
@@ -180,7 +169,7 @@ impl CompletionAnomalyKind {
             Self::BackendSpecific {
                 slot: Some(slot), ..
             } => Some(slot.expected_generation),
-            Self::Control { .. } | Self::BackendContext { .. } => None,
+            Self::BackendContext { .. } => None,
             Self::BackendSpecific { slot: None, .. } => None,
         }
     }
@@ -193,7 +182,7 @@ impl CompletionAnomalyKind {
             Self::BackendSpecific {
                 slot: Some(slot), ..
             } => slot.actual_generation,
-            Self::UnknownSlot { .. } | Self::Control { .. } | Self::BackendContext { .. } => None,
+            Self::UnknownSlot { .. } | Self::BackendContext { .. } => None,
             Self::BackendSpecific { slot: None, .. } => None,
         }
     }
@@ -204,7 +193,6 @@ impl CompletionAnomalyKind {
             | Self::NonActive { state, .. }
             | Self::SlotIssue { state, .. } => Some(state),
             Self::UnknownSlot { .. }
-            | Self::Control { .. }
             | Self::BackendContext { .. }
             | Self::BackendSpecific { .. } => None,
         }
@@ -218,8 +206,7 @@ impl CompletionAnomalyKind {
             Self::UnknownSlot { .. }
             | Self::Stale { .. }
             | Self::NonActive { .. }
-            | Self::SlotIssue { .. }
-            | Self::Control { .. } => None,
+            | Self::SlotIssue { .. } => None,
         }
     }
 
@@ -270,11 +257,7 @@ impl CompletionAnomalyKind {
                 }
                 anomaly
             }
-            Self::Control { reason } => match reason {
-                ControlAnomalyReason::BackendContextUnknown => {
-                    CompletionAnomaly::backend_context_unknown(token)
-                }
-            },
+
             Self::BackendContext {
                 backend,
                 backend_context,

@@ -38,7 +38,7 @@ pub use token::{
 pub use types::{
     AnomalyAttach, AnomalyOutcome, BackendSlotRef, CompletionAnomaly, CompletionAnomalyKind,
     CompletionAnomalyReason, CompletionBackend, CompletionCleanup, CompletionCleanupGuard,
-    CompletionMutationOutcome, CompletionRaw, ControlAnomalyReason, DriverCompletionDiagnostics,
+    CompletionMutationOutcome, CompletionRaw, DriverCompletionDiagnostics,
     DriverCompletionDiagnosticsBackend, DriverCompletionDiagnosticsSnapshot,
     RecordCompletionOutcome, RecordCompletionResult, SlotIssueReason,
 };
