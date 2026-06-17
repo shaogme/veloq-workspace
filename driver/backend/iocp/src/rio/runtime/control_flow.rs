@@ -281,14 +281,13 @@ fn complete_rio_waiting_slot(
 
     let cancelled = slot.platform().rio_cancel_requested;
     let mut completion = if cancelled {
-        Err(IocpError::CompletionWait
-            .to_report()
+        IocpError::CompletionWait
             .push_ctx("scope", "rio.runtime.control_flow.handle_op_completion")
             .with_ctx("socket_raw", socket_key.as_handle() as usize)
             .with_ctx("rio_op_kind", init.op_kind.as_str())
             .with_ctx("rio_request_id", init.request_id)
             .set_error_code(ERROR_OPERATION_ABORTED as i32)
-            .attach_note("RIO operation was cancelled before kernel completion"))
+            .attach_note("RIO operation was cancelled before kernel completion")
     } else if result.status == 0 {
         Ok(result.bytes as usize)
     } else {

@@ -343,11 +343,10 @@ fn calculate_io_result_from_slot(
                 | IocpOpPayload::Fallocate(_)
                 | IocpOpPayload::FallocateRaw(_)
         ) {
-            io_result = Err(IocpError::CompletionWait
-                .to_report()
+            io_result = IocpError::CompletionWait
                 .push_ctx("scope", "iocp/driver")
                 .with_ctx("user_data", user_data)
-                .attach_note("missing blocking result for offloaded file completion"));
+                .attach_note("missing blocking result for offloaded file completion");
         } else if let Ok(val) = io_result {
             io_result = iocp_op
                 .on_complete(val, ext)
@@ -451,11 +450,10 @@ fn complete_cancel_waiting_slot(
     event: UserCompletionEvent,
     mode: CancelMode,
 ) -> CompletionHookOutcome<IocpSlotSpec, IocpBackendEffect> {
-    let abort_result: IocpResult<usize> = Err(IocpError::CompletionWait
-        .to_report()
+    let abort_result: IocpResult<usize> = IocpError::CompletionWait
         .push_ctx("scope", "iocp.driver.cancel")
         .set_error_code((-event.res()).max(1))
-        .attach_note("operation aborted locally"));
+        .attach_note("operation aborted locally");
     if mode == CancelMode::UserVisible {
         complete_iocp_waiting_slot(slot, event, abort_result, None)
     } else {
