@@ -62,6 +62,14 @@ pub const CELL_STATE_READY: u8 = 2;
 pub const CELL_STATE_ORPHANED: u8 = 3;
 pub const CELL_STATE_BUSY: u8 = 4;
 
+#[inline(always)]
+fn spin_yield() {
+    #[cfg(feature = "loom")]
+    veloq_shim::thread::yield_now();
+    #[cfg(not(feature = "loom"))]
+    std::hint::spin_loop();
+}
+
 #[inline]
 fn recorded_completion<Spec: slot::SlotSpec>(
     diagnostics: &DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
@@ -293,7 +301,10 @@ where
                         packet,
                     );
                 }
-                slot::SlotState::Finalizing => continue,
+                slot::SlotState::Finalizing => {
+                    spin_yield();
+                    continue;
+                }
             }
         };
 
@@ -517,7 +528,10 @@ where
                         CompletionMutationOutcome::Applied,
                     );
                 }
-                slot::SlotState::Finalizing => continue,
+                slot::SlotState::Finalizing => {
+                    spin_yield();
+                    continue;
+                }
                 slot::SlotState::Idle
                 | slot::SlotState::Reserved
                 | slot::SlotState::InFlightOrphaned
@@ -569,7 +583,10 @@ where
                         );
                     }
                 }
-                slot::SlotState::Finalizing => continue,
+                slot::SlotState::Finalizing => {
+                    spin_yield();
+                    continue;
+                }
                 _ if cell_gen != generation => {
                     return recorded_mutation(
                         &self.diagnostics,
@@ -631,7 +648,10 @@ where
                 slot::SlotState::InFlightReady if cell_gen == generation => {
                     return self.discard_ready_record(token);
                 }
-                slot::SlotState::Finalizing => continue,
+                slot::SlotState::Finalizing => {
+                    spin_yield();
+                    continue;
+                }
                 _ if cell_gen != generation => {
                     return recorded_mutation(
                         &self.diagnostics,

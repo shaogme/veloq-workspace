@@ -218,8 +218,9 @@ fn test_stale_after_generation_advance_loom() {
         let _ = table.try_take_record(token_g1);
 
         match table.try_take_record(token_g1) {
-            PollRecordResult::Unavailable { kind, .. }
-                if kind.reason() == CompletionAnomalyReason::StaleGeneration => {}
+            PollRecordResult::Unavailable { kind, .. } => {
+                assert_eq!(kind.reason(), CompletionAnomalyReason::StaleGeneration);
+            }
             PollRecordResult::Ready(_) => panic!("old generation must not become ready"),
             PollRecordResult::Pending => panic!("old generation must be stale"),
         }
