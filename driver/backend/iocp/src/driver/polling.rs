@@ -214,27 +214,13 @@ impl<'a> IocpDriver<'a> {
                 self.accept_raw_completion(key as u64, res, flags)?;
                 Ok(1)
             }
-            IocpCompletionStatusKind::NullFailure => {
-                let _ = iocp_msg(
-                    IocpErrorContext::CompletionWait,
-                    "GetQueuedCompletionStatus failed with null overlapped",
-                )
-                .with_ctx("os_error_code", error_code.unwrap_or(0))
-                .with_ctx("completion_key", key)
-                .with_ctx("overlapped_is_null", true);
-
-                let attach = AnomalyAttach::from_raw_completion(RawCompletion::new(
-                    COMP_BACKEND_IOCP,
-                    RIO_EVENT_TOKEN,
-                    res,
-                    flags,
-                ));
-                self.accept_completion_anomaly(
-                    CompletionAnomalyKind::backend_context(COMP_BACKEND_IOCP, key as u64),
-                    attach,
-                )?;
-                Ok(1)
-            }
+            IocpCompletionStatusKind::NullFailure => Err(iocp_msg(
+                IocpErrorContext::CompletionWait,
+                "GetQueuedCompletionStatus failed with null overlapped",
+            )
+            .with_ctx("os_error_code", error_code.unwrap_or(0))
+            .with_ctx("completion_key", key)
+            .with_ctx("overlapped_is_null", true)),
             IocpCompletionStatusKind::Unknown => {
                 let attach = AnomalyAttach::from_raw_completion(RawCompletion::new(
                     COMP_BACKEND_IOCP,
