@@ -268,6 +268,12 @@ pub struct RuntimeBuilder<T, WF> {
     worker_tick_hook: Option<WorkerTickHook>,
 }
 
+impl Default for RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
     pub fn new() -> Self {
         RuntimeBuilder {
