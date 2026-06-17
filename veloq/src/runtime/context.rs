@@ -14,7 +14,7 @@ use veloq_driver_native::{
     op::{DetachedSubmitter, DriverProvider, IntoPlatformOp, IoFd, Op, OpSubmitter},
 };
 use veloq_runtime::{
-    error::Result as RuntimeResult,
+    error::{Result as RuntimeResult, RuntimeError},
     runtime::{
         EnqueuePinnedOutcome, IdleDecision, IdleWaitStrategy, IntoRuntimeCtx, RuntimeCtx,
         RuntimeShared,
@@ -335,22 +335,21 @@ impl<'rt, 'reg> Ctx<'rt, 'reg> {
         self.try_alloc(size).expect("failed to allocate buffer")
     }
 
-    /// 让当前线程的驱动在空闲时进入等待推进。
-    ///
-    /// 这个入口会优先利用驱动后端的阻塞等待能力，避免固定轮询兜底。
-    pub fn drive_wait(&self) -> IdleDecision {
+    pub fn drive_wait(&self) -> VeloqResult<IdleDecision> {
         self.sync_registrar();
         self.driver(|mut driver| {
             let outcome = driver
                 .drive(DriveMode::Wait)
-                .unwrap_or_else(|err| panic!("driver drive(Wait) failed: {err:#}"));
+                .push_ctx("scope", "Ctx::drive_wait")
+                .attach_note("driver drive(Wait) failed")
+                .trans()?;
             if !outcome.pending_progress {
-                return IdleDecision::wait(IdleWaitStrategy::block());
+                return Ok(IdleDecision::wait(IdleWaitStrategy::block()));
             }
-            match outcome.next_timeout_hint {
+            Ok(match outcome.next_timeout_hint {
                 Some(duration) => IdleDecision::wait(IdleWaitStrategy::timeout(duration)),
                 None => IdleDecision::wait(IdleWaitStrategy::block()),
-            }
+            })
         })
     }
 
@@ -418,26 +417,42 @@ impl<'rt, 'reg> Ctx<'rt, 'reg> {
     }
 }
 
-pub fn poll_current_driver<'reg>(shared: &RuntimeShared<WorkerState<'reg>>) -> IdleDecision {
-    shared.extra_tls.with(|extra| {
-        // sync registrar
-        sync_to_driver_internal(
-            &extra.driver,
-            &extra.registrar_state,
-            extra.registration_mode,
-        );
+pub fn poll_current_driver<'reg>(
+    shared: &RuntimeShared<WorkerState<'reg>>,
+) -> RuntimeResult<IdleDecision> {
+    shared
+        .extra_tls
+        .try_with(|extra| {
+            // sync registrar
+            sync_to_driver_internal(
+                &extra.driver,
+                &extra.registrar_state,
+                extra.registration_mode,
+            );
 
-        let mut driver = extra.driver.borrow_mut();
+            let mut driver = extra.driver.borrow_mut();
 
-        let outcome = driver
-            .drive(DriveMode::Poll)
-            .unwrap_or_else(|err| panic!("driver drive(Poll) failed: {err:#}"));
-        match outcome.next_timeout_hint {
-            Some(duration) => IdleDecision::wait(IdleWaitStrategy::timeout(duration)),
-            None if outcome.pending_progress => IdleDecision::continue_now(),
-            None => IdleDecision::wait(IdleWaitStrategy::block()),
-        }
-    })
+            let outcome = driver.drive(DriveMode::Poll).map_err(|err| {
+                RuntimeError::InvariantViolation {
+                    site: "poll_current_driver",
+                    detail: "driver drive(Poll) failed",
+                }
+                .to_report()
+                .with_diag_src_err(err)
+            })?;
+            Ok(match outcome.next_timeout_hint {
+                Some(duration) => IdleDecision::wait(IdleWaitStrategy::timeout(duration)),
+                None if outcome.pending_progress => IdleDecision::continue_now(),
+                None => IdleDecision::wait(IdleWaitStrategy::block()),
+            })
+        })
+        .ok_or_else(|| {
+            RuntimeError::TlsSetOwnedFailed {
+                worker_id: shared.worker_id(),
+                source: veloq_tls::TlsError::AllocationFailed,
+            }
+            .to_report()
+        })?
 }
 
 pub(crate) fn submit_control_task<'rt, 'reg>(

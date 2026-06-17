@@ -432,11 +432,10 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
         &self,
         completion: Option<&GenericScopeCompletion<S, O>>,
     ) -> Result<()> {
-        let idle_decision = self
-            .shared
-            .idle_hook
-            .map(|h| h(self.shared))
-            .unwrap_or(IdleDecision::wait(IdleWaitStrategy::Block));
+        let idle_decision = match self.shared.idle_hook {
+            Some(h) => h(self.shared)?,
+            None => IdleDecision::wait(IdleWaitStrategy::Block),
+        };
         let Some(wait_strategy) = idle_decision.into_wait_strategy() else {
             thread::yield_now();
             return Ok(());

@@ -209,7 +209,7 @@ fn wait_completion(
         if start.elapsed() > timeout {
             panic!("wait_completion timed out");
         }
-        let _ = driver.drive(DriveMode::Poll);
+        let _ = driver.drive(DriveMode::Poll).expect("drive failed");
         let table = driver.completion_table();
         match table.try_take_record(token) {
             PollRecordResult::Ready(record) => {

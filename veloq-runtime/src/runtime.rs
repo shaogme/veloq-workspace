@@ -228,11 +228,14 @@ impl<'rt, T, WF> Runtime<'rt, T, WF> {
                         }
 
                         if !signal.try_reset() {
-                            match shared_ref
-                                .idle_hook
-                                .map(|h| h(shared_ref))
-                                .unwrap_or(IdleDecision::wait(IdleWaitStrategy::Block))
-                            {
+                            let decision = match shared_ref.idle_hook {
+                                Some(h) => match h(shared_ref) {
+                                    Ok(dec) => dec,
+                                    Err(err) => break Err(err),
+                                },
+                                None => IdleDecision::wait(IdleWaitStrategy::Block),
+                            };
+                            match decision {
                                 IdleDecision::Continue => thread::yield_now(),
                                 IdleDecision::Wait(IdleWaitStrategy::Timeout(d)) => {
                                     let _ = signal.wait_timeout(d);

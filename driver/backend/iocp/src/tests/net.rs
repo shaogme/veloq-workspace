@@ -409,7 +409,7 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
 
     let drain_start = Instant::now();
     while drain_start.elapsed() < Duration::from_secs(2) {
-        let _ = driver.drive(DriveMode::Poll);
+        let _ = driver.drive(DriveMode::Poll).expect("drive failed");
         if remote_free_contains(&driver, token.index()) {
             break;
         }

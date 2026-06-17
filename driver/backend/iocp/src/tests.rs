@@ -90,7 +90,7 @@ pub(crate) fn wait_completion_record(
                 .with_ctx("timeout_ms", timeout.as_millis() as u64)
                 .attach_note("wait completion timed out");
         }
-        let _ = driver.drive(DriveMode::Poll);
+        let _ = driver.drive(DriveMode::Poll)?;
         let completion_table = driver.completion_table();
         match completion_table.try_take_record(token) {
             PollRecordResult::Ready(record) => return Ok(record),

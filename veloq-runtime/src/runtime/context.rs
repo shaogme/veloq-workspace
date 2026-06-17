@@ -305,7 +305,7 @@ impl<'rt, T> RuntimeCtx<'rt, T> {
     }
 }
 
-pub(crate) type IdleHook<T> = fn(&RuntimeShared<T>) -> IdleDecision;
+pub(crate) type IdleHook<T> = fn(&RuntimeShared<T>) -> Result<IdleDecision>;
 pub(crate) type WorkerTickHook = fn();
 
 pub(crate) struct RouteCell<T> {
