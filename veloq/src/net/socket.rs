@@ -85,11 +85,11 @@ impl TcpSocket {
     /// Listen for incoming connections.
     ///
     /// Consumes the `TcpSocket` and returns a `TcpListener`.
-    pub fn listen<'a, 'ctx>(
+    pub fn listen<'rt, 'reg>(
         self,
-        ctx: Ctx<'a, 'ctx>,
+        ctx: Ctx<'rt, 'reg>,
         backlog: u32,
-    ) -> Result<TcpListener<'a, 'ctx>> {
+    ) -> Result<TcpListener<'rt, 'reg>> {
         let local_addr = self.inner.local_addr().trans()?;
         self.inner.listen(backlog as i32).trans()?;
         Ok(GenericTcpListener {
@@ -106,11 +106,11 @@ impl TcpSocket {
     /// Connect to the given address.
     ///
     /// Consumes the `TcpSocket` and returns a `TcpStream` future.
-    pub async fn connect<'a, 'ctx>(
+    pub async fn connect<'rt, 'reg>(
         self,
-        ctx: Ctx<'a, 'ctx>,
+        ctx: Ctx<'rt, 'reg>,
         addr: SocketAddr,
-    ) -> Result<TcpStream<'a, 'ctx>> {
+    ) -> Result<TcpStream<'rt, 'reg>> {
         let inner = InnerSocket::new(ctx, self.inner.into_owned_raw().into_raw(), None)?;
         TcpStream::connect_from_inner(ctx, inner, addr).await
     }
@@ -168,11 +168,11 @@ impl UdpSocketBuilder {
     /// Bind the socket to the given address.
     ///
     /// Consumes the builder and returns a `UdpSocket`.
-    pub fn bind<'a, 'ctx, A: ToSocketAddrs>(
+    pub fn bind<'rt, 'reg, A: ToSocketAddrs>(
         self,
-        ctx: Ctx<'a, 'ctx>,
+        ctx: Ctx<'rt, 'reg>,
         addr: A,
-    ) -> Result<UdpSocket<'a, 'ctx>> {
+    ) -> Result<UdpSocket<'rt, 'reg>> {
         let addr = addr
             .to_socket_addrs()
             .map_err(NetError::ToSocketAddrs)?

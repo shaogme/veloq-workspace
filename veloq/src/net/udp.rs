@@ -25,21 +25,21 @@ use veloq_driver_native::{
 };
 
 #[derive(Clone)]
-pub struct GenericUdpSocket<'a, 'ctx, S, P: SocketTokenPtr<'a, 'ctx>> {
-    pub(crate) inner: InnerSocket<'a, 'ctx, P>,
+pub struct GenericUdpSocket<'rt, 'reg, S, P: SocketTokenPtr<'rt, 'reg>> {
+    pub(crate) inner: InnerSocket<'rt, 'reg, P>,
     pub(crate) submitter: S,
-    pub(crate) ctx: Ctx<'a, 'ctx>,
+    pub(crate) ctx: Ctx<'rt, 'reg>,
 }
 
-pub type LocalUdpSocket<'a, 'ctx> =
-    GenericUdpSocket<'a, 'ctx, LocalSubmitter<Ctx<'a, 'ctx>>, Rc<SocketToken<'a, 'ctx>>>;
-pub type UdpSocket<'a, 'ctx> =
-    GenericUdpSocket<'a, 'ctx, DetachedSubmitter, Arc<SocketToken<'a, 'ctx>>>;
+pub type LocalUdpSocket<'rt, 'reg> =
+    GenericUdpSocket<'rt, 'reg, LocalSubmitter<Ctx<'rt, 'reg>>, Rc<SocketToken<'rt, 'reg>>>;
+pub type UdpSocket<'rt, 'reg> =
+    GenericUdpSocket<'rt, 'reg, DetachedSubmitter, Arc<SocketToken<'rt, 'reg>>>;
 
-fn bind_inner<'a, 'ctx, A: ToSocketAddrs, P: SocketTokenPtr<'a, 'ctx>>(
-    ctx: Ctx<'a, 'ctx>,
+fn bind_inner<'rt, 'reg, A: ToSocketAddrs, P: SocketTokenPtr<'rt, 'reg>>(
+    ctx: Ctx<'rt, 'reg>,
     addr: A,
-) -> Result<InnerSocket<'a, 'ctx, P>> {
+) -> Result<InnerSocket<'rt, 'reg, P>> {
     let addr = addr
         .to_socket_addrs()
         .map_err(NetError::ToSocketAddrs)?
@@ -58,8 +58,8 @@ fn bind_inner<'a, 'ctx, A: ToSocketAddrs, P: SocketTokenPtr<'a, 'ctx>>(
     InnerSocket::new(ctx, socket.into_owned_raw().into_raw(), Some(local_addr))
 }
 
-impl<'a, 'ctx, S: OpSubmitter<'ctx, Ctx<'a, 'ctx>> + Copy, P: SocketTokenPtr<'a, 'ctx>>
-    GenericUdpSocket<'a, 'ctx, S, P>
+impl<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy, P: SocketTokenPtr<'rt, 'reg>>
+    GenericUdpSocket<'rt, 'reg, S, P>
 {
     pub fn local_addr(&self) -> Result<SocketAddr> {
         self.inner.local_addr()
@@ -171,8 +171,8 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, Ctx<'a, 'ctx>> + Copy, P: SocketTokenPtr<'a,
     }
 }
 
-impl<'a, 'ctx> LocalUdpSocket<'a, 'ctx> {
-    pub fn bind<A: ToSocketAddrs>(ctx: Ctx<'a, 'ctx>, addr: A) -> Result<Self> {
+impl<'rt, 'reg> LocalUdpSocket<'rt, 'reg> {
+    pub fn bind<A: ToSocketAddrs>(ctx: Ctx<'rt, 'reg>, addr: A) -> Result<Self> {
         Ok(Self {
             inner: bind_inner(ctx, addr)?,
             submitter: LocalSubmitter::new(),
@@ -209,8 +209,8 @@ impl<'a, 'ctx> LocalUdpSocket<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> UdpSocket<'a, 'ctx> {
-    pub fn bind<A: ToSocketAddrs>(ctx: Ctx<'a, 'ctx>, addr: A) -> Result<Self> {
+impl<'rt, 'reg> UdpSocket<'rt, 'reg> {
+    pub fn bind<A: ToSocketAddrs>(ctx: Ctx<'rt, 'reg>, addr: A) -> Result<Self> {
         Ok(Self {
             inner: bind_inner(ctx, addr)?,
             submitter: DetachedSubmitter::new(),
@@ -293,7 +293,7 @@ impl<'a, 'ctx> UdpSocket<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> AsyncBufRead for LocalUdpSocket<'a, 'ctx> {
+impl<'rt, 'reg> AsyncBufRead for LocalUdpSocket<'rt, 'reg> {
     type Error = Report<Error>;
 
     async fn read(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -315,7 +315,7 @@ impl<'a, 'ctx> AsyncBufRead for LocalUdpSocket<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> AsyncBufRead for UdpSocket<'a, 'ctx> {
+impl<'rt, 'reg> AsyncBufRead for UdpSocket<'rt, 'reg> {
     type Error = Report<Error>;
 
     async fn read(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -337,7 +337,7 @@ impl<'a, 'ctx> AsyncBufRead for UdpSocket<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> AsyncBufWrite for LocalUdpSocket<'a, 'ctx> {
+impl<'rt, 'reg> AsyncBufWrite for LocalUdpSocket<'rt, 'reg> {
     type Error = Report<Error>;
 
     async fn write(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -367,7 +367,7 @@ impl<'a, 'ctx> AsyncBufWrite for LocalUdpSocket<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> AsyncBufWrite for UdpSocket<'a, 'ctx> {
+impl<'rt, 'reg> AsyncBufWrite for UdpSocket<'rt, 'reg> {
     type Error = Report<Error>;
 
     async fn write(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {

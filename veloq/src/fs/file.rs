@@ -56,24 +56,24 @@ fn close_raw_handle(raw: RawHandle) {
 
 // fn unregister_fixed_fd is no longer needed globally
 
-pub struct LocalFile<'a, 'ctx> {
+pub struct LocalFile<'rt, 'reg> {
     pub(crate) raw: RawHandle,
     pub(crate) fd: IoFd,
-    pub(crate) submitter: LocalSubmitter<Ctx<'a, 'ctx>>,
+    pub(crate) submitter: LocalSubmitter<Ctx<'rt, 'reg>>,
     pub(crate) pos: Cell<u64>,
-    pub(crate) ctx: Ctx<'a, 'ctx>,
+    pub(crate) ctx: Ctx<'rt, 'reg>,
 }
 
-pub struct File<'a, 'ctx> {
+pub struct File<'rt, 'reg> {
     pub(crate) raw: RawHandle,
     pub(crate) fd: IoFd,
     pub(crate) owner_worker_id: usize,
     pub(crate) submitter: DetachedSubmitter,
     pub(crate) pos: AtomicU64,
-    pub(crate) ctx: Ctx<'a, 'ctx>,
+    pub(crate) ctx: Ctx<'rt, 'reg>,
 }
 
-impl<'a, 'ctx> Drop for LocalFile<'a, 'ctx> {
+impl<'rt, 'reg> Drop for LocalFile<'rt, 'reg> {
     fn drop(&mut self) {
         self.ctx.runtime_ctx.shared().extra_tls.with(|extra| {
             let mut driver = extra.driver.borrow_mut();
@@ -83,7 +83,7 @@ impl<'a, 'ctx> Drop for LocalFile<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> Drop for File<'a, 'ctx> {
+impl<'rt, 'reg> Drop for File<'rt, 'reg> {
     fn drop(&mut self) {
         let current_worker_id = self.ctx.runtime_ctx.worker_id();
         if current_worker_id == self.owner_worker_id {
@@ -97,7 +97,7 @@ impl<'a, 'ctx> Drop for File<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> LocalFile<'a, 'ctx> {
+impl<'rt, 'reg> LocalFile<'rt, 'reg> {
     pub fn options() -> OpenOptions {
         OpenOptions::new()
     }
@@ -219,7 +219,7 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> AsyncBufRead for LocalFile<'a, 'ctx> {
+impl<'rt, 'reg> AsyncBufRead for LocalFile<'rt, 'reg> {
     type Error = Report<Error>;
 
     async fn read(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -246,7 +246,7 @@ impl<'a, 'ctx> AsyncBufRead for LocalFile<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> AsyncBufWrite for LocalFile<'a, 'ctx> {
+impl<'rt, 'reg> AsyncBufWrite for LocalFile<'rt, 'reg> {
     type Error = Report<Error>;
 
     async fn write(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -281,7 +281,7 @@ impl<'a, 'ctx> AsyncBufWrite for LocalFile<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> File<'a, 'ctx> {
+impl<'rt, 'reg> File<'rt, 'reg> {
     pub fn options() -> OpenOptions {
         OpenOptions::new()
     }
@@ -397,20 +397,20 @@ impl<'a, 'ctx> File<'a, 'ctx> {
         res.map(|_| ()).trans()
     }
 
-    pub fn sync_range(&self, offset: u64, nbytes: u64) -> SyncRangeBuilder<'_, 'a, 'ctx> {
+    pub fn sync_range(&self, offset: u64, nbytes: u64) -> SyncRangeBuilder<'_, 'rt, 'reg> {
         SyncRangeBuilder::new(self, offset, nbytes)
     }
 }
 
-pub struct SyncRangeBuilder<'f, 'a, 'ctx> {
-    file: &'f File<'a, 'ctx>,
+pub struct SyncRangeBuilder<'f, 'rt, 'reg> {
+    file: &'f File<'rt, 'reg>,
     offset: u64,
     nbytes: u64,
     flags: u32,
 }
 
-impl<'f, 'a, 'ctx> SyncRangeBuilder<'f, 'a, 'ctx> {
-    fn new(file: &'f File<'a, 'ctx>, offset: u64, nbytes: u64) -> Self {
+impl<'f, 'rt, 'reg> SyncRangeBuilder<'f, 'rt, 'reg> {
+    fn new(file: &'f File<'rt, 'reg>, offset: u64, nbytes: u64) -> Self {
         #[cfg(unix)]
         let flags = libc::SYNC_FILE_RANGE_WAIT_BEFORE
             | libc::SYNC_FILE_RANGE_WRITE
@@ -463,9 +463,9 @@ impl<'f, 'a, 'ctx> SyncRangeBuilder<'f, 'a, 'ctx> {
     }
 }
 
-impl<'f, 'a, 'ctx> IntoFuture for SyncRangeBuilder<'f, 'a, 'ctx> {
+impl<'f, 'rt, 'reg> IntoFuture for SyncRangeBuilder<'f, 'rt, 'reg> {
     type Output = Result<usize>;
-    type IntoFuture = SyncRangeFuture<'a, 'ctx>;
+    type IntoFuture = SyncRangeFuture<'rt, 'reg>;
 
     fn into_future(self) -> Self::IntoFuture {
         let op = FileSyncFileRangeRaw {
@@ -481,11 +481,11 @@ impl<'f, 'a, 'ctx> IntoFuture for SyncRangeBuilder<'f, 'a, 'ctx> {
     }
 }
 
-pub struct SyncRangeFuture<'a, 'ctx> {
-    inner: <DetachedSubmitter as OpSubmitter<'ctx, Ctx<'a, 'ctx>>>::Future<FileSyncFileRangeRaw>,
+pub struct SyncRangeFuture<'rt, 'reg> {
+    inner: <DetachedSubmitter as OpSubmitter<'reg, Ctx<'rt, 'reg>>>::Future<FileSyncFileRangeRaw>,
 }
 
-impl<'a, 'ctx> Future for SyncRangeFuture<'a, 'ctx> {
+impl<'rt, 'reg> Future for SyncRangeFuture<'rt, 'reg> {
     type Output = Result<usize>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -500,7 +500,7 @@ impl<'a, 'ctx> Future for SyncRangeFuture<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> AsyncBufRead for File<'a, 'ctx> {
+impl<'rt, 'reg> AsyncBufRead for File<'rt, 'reg> {
     type Error = Report<Error>;
 
     async fn read(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -527,7 +527,7 @@ impl<'a, 'ctx> AsyncBufRead for File<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> AsyncBufWrite for File<'a, 'ctx> {
+impl<'rt, 'reg> AsyncBufWrite for File<'rt, 'reg> {
     type Error = Report<Error>;
 
     async fn write(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -562,12 +562,15 @@ impl<'a, 'ctx> AsyncBufWrite for File<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> LocalFile<'a, 'ctx> {
-    pub async fn open(ctx: Ctx<'a, 'ctx>, path: impl AsRef<Path>) -> Result<LocalFile<'a, 'ctx>> {
+impl<'rt, 'reg> LocalFile<'rt, 'reg> {
+    pub async fn open(ctx: Ctx<'rt, 'reg>, path: impl AsRef<Path>) -> Result<LocalFile<'rt, 'reg>> {
         OpenOptions::new().read(true).open_local(ctx, path).await
     }
 
-    pub async fn create(ctx: Ctx<'a, 'ctx>, path: impl AsRef<Path>) -> Result<LocalFile<'a, 'ctx>> {
+    pub async fn create(
+        ctx: Ctx<'rt, 'reg>,
+        path: impl AsRef<Path>,
+    ) -> Result<LocalFile<'rt, 'reg>> {
         OpenOptions::new()
             .write(true)
             .create(true)
@@ -577,12 +580,12 @@ impl<'a, 'ctx> LocalFile<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> File<'a, 'ctx> {
-    pub async fn open(ctx: Ctx<'a, 'ctx>, path: impl AsRef<Path>) -> Result<File<'a, 'ctx>> {
+impl<'rt, 'reg> File<'rt, 'reg> {
+    pub async fn open(ctx: Ctx<'rt, 'reg>, path: impl AsRef<Path>) -> Result<File<'rt, 'reg>> {
         OpenOptions::new().read(true).open(ctx, path).await
     }
 
-    pub async fn create(ctx: Ctx<'a, 'ctx>, path: impl AsRef<Path>) -> Result<File<'a, 'ctx>> {
+    pub async fn create(ctx: Ctx<'rt, 'reg>, path: impl AsRef<Path>) -> Result<File<'rt, 'reg>> {
         OpenOptions::new()
             .write(true)
             .create(true)

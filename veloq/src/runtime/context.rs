@@ -42,24 +42,24 @@ pub struct WorkerRegistrarState {
     pub chunks: Vec<ChunkInfo>,
 }
 
-pub struct WorkerState<'ctx> {
-    pub driver: RefCell<PlatformDriver<'ctx>>,
+pub struct WorkerState<'reg> {
+    pub driver: RefCell<PlatformDriver<'reg>>,
     pub buf_pool: AnyBufPool,
     pub registrar_state: RefCell<WorkerRegistrarState>,
     pub registration_mode: BufferRegistrationMode,
 }
 
 #[derive(Clone)]
-pub struct DriverRegistrar<'a, 'ctx> {
-    shared: &'a RuntimeShared<WorkerState<'ctx>>,
+pub struct DriverRegistrar<'rt, 'reg> {
+    shared: &'rt RuntimeShared<WorkerState<'reg>>,
 }
 
-impl<'a, 'ctx> DriverRegistrar<'a, 'ctx> {
-    pub(crate) fn new(shared: &'a RuntimeShared<WorkerState<'ctx>>) -> Self {
+impl<'rt, 'reg> DriverRegistrar<'rt, 'reg> {
+    pub(crate) fn new(shared: &'rt RuntimeShared<WorkerState<'reg>>) -> Self {
         Self { shared }
     }
 
-    fn extra<R>(&self, f: impl FnOnce(&WorkerState<'ctx>) -> R) -> R {
+    fn extra<R>(&self, f: impl FnOnce(&WorkerState<'reg>) -> R) -> R {
         self.shared
             .extra_tls
             .try_with(|extra| f(extra))
@@ -77,7 +77,7 @@ impl<'a, 'ctx> DriverRegistrar<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> BufferRegistrar for DriverRegistrar<'a, 'ctx> {
+impl<'rt, 'reg> BufferRegistrar for DriverRegistrar<'rt, 'reg> {
     fn register(&self, regions: &[BufferRegion]) -> BufResult<Vec<ChunkId>> {
         self.extra(|extra| register_internal(&extra.driver, &extra.registrar_state, regions))
     }
@@ -94,13 +94,13 @@ impl<'a, 'ctx> BufferRegistrar for DriverRegistrar<'a, 'ctx> {
     }
 }
 
-pub(crate) struct BorrowedRegistrar<'a, 'ctx> {
-    pub driver: &'a RefCell<PlatformDriver<'ctx>>,
-    pub state: &'a RefCell<WorkerRegistrarState>,
+pub(crate) struct BorrowedRegistrar<'rt, 'reg> {
+    pub driver: &'rt RefCell<PlatformDriver<'reg>>,
+    pub state: &'rt RefCell<WorkerRegistrarState>,
     pub registration_mode: BufferRegistrationMode,
 }
 
-impl<'a, 'ctx> BufferRegistrar for BorrowedRegistrar<'a, 'ctx> {
+impl<'rt, 'reg> BufferRegistrar for BorrowedRegistrar<'rt, 'reg> {
     fn register(&self, regions: &[BufferRegion]) -> BufResult<Vec<ChunkId>> {
         register_internal(self.driver, self.state, regions)
     }
@@ -197,47 +197,47 @@ fn sync_to_driver_internal(
 }
 
 #[derive(Clone, Copy)]
-pub struct Ctx<'a, 'ctx>
+pub struct Ctx<'rt, 'reg>
 where
-    'ctx: 'a,
+    'reg: 'rt,
 {
-    pub runtime_ctx: RuntimeCtx<'a, WorkerState<'ctx>>,
+    pub runtime_ctx: RuntimeCtx<'rt, WorkerState<'reg>>,
 }
 
-impl<'a, 'ctx> AsRuntimeCtx<'a, WorkerState<'ctx>> for Ctx<'a, 'ctx> {
+impl<'rt, 'reg> AsRuntimeCtx<'rt, WorkerState<'reg>> for Ctx<'rt, 'reg> {
     #[inline]
-    fn as_runtime_ctx(self) -> RuntimeCtx<'a, WorkerState<'ctx>> {
+    fn as_runtime_ctx(self) -> RuntimeCtx<'rt, WorkerState<'reg>> {
         self.runtime_ctx
     }
 }
 
-impl<'a, 'ctx> AsRuntimeCtx<'a, WorkerState<'ctx>> for &Ctx<'a, 'ctx> {
+impl<'rt, 'reg> AsRuntimeCtx<'rt, WorkerState<'reg>> for &Ctx<'rt, 'reg> {
     #[inline]
-    fn as_runtime_ctx(self) -> RuntimeCtx<'a, WorkerState<'ctx>> {
+    fn as_runtime_ctx(self) -> RuntimeCtx<'rt, WorkerState<'reg>> {
         self.runtime_ctx
     }
 }
 
-impl<'a, 'ctx> ContextDriverProvider<PlatformDriver<'ctx>> for Ctx<'a, 'ctx> {
+impl<'rt, 'reg> ContextDriverProvider<PlatformDriver<'reg>> for Ctx<'rt, 'reg> {
     #[inline]
-    fn with_driver_mut<R>(&self, f: impl FnOnce(&mut PlatformDriver<'ctx>) -> R) -> R {
+    fn with_driver_mut<R>(&self, f: impl FnOnce(&mut PlatformDriver<'reg>) -> R) -> R {
         self.extra(|extra| f(&mut extra.driver.borrow_mut()))
     }
 
     #[inline]
-    fn with_driver_ref<R>(&self, f: impl FnOnce(&PlatformDriver<'ctx>) -> R) -> R {
+    fn with_driver_ref<R>(&self, f: impl FnOnce(&PlatformDriver<'reg>) -> R) -> R {
         self.extra(|extra| f(&extra.driver.borrow()))
     }
 }
 
-impl<'a, 'ctx> DriverProvider for Ctx<'a, 'ctx> {
+impl<'rt, 'reg> DriverProvider for Ctx<'rt, 'reg> {
     type Op = PlatformOp;
     type UP = PlatformUP;
     type Completion = usize;
-    type Error = <PlatformDriver<'ctx> as Driver>::Error;
-    type SlotSpec = <PlatformDriver<'ctx> as Driver>::SlotSpec;
+    type Error = <PlatformDriver<'reg> as Driver>::Error;
+    type SlotSpec = <PlatformDriver<'reg> as Driver>::SlotSpec;
     type Driver<'d>
-        = RuntimeContextDriver<'d, PlatformDriver<'ctx>, Ctx<'a, 'ctx>>
+        = RuntimeContextDriver<'d, PlatformDriver<'reg>, Ctx<'rt, 'reg>>
     where
         Self: 'd;
 
@@ -247,9 +247,9 @@ impl<'a, 'ctx> DriverProvider for Ctx<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> Ctx<'a, 'ctx> {
+impl<'rt, 'reg> Ctx<'rt, 'reg> {
     #[inline]
-    fn extra<R>(&self, f: impl FnOnce(&WorkerState<'ctx>) -> R) -> R {
+    fn extra<R>(&self, f: impl FnOnce(&WorkerState<'reg>) -> R) -> R {
         self.runtime_ctx
             .shared()
             .extra_tls
@@ -263,7 +263,7 @@ impl<'a, 'ctx> Ctx<'a, 'ctx> {
     }
 
     #[inline]
-    pub fn registrar(&self) -> DriverRegistrar<'a, 'ctx> {
+    pub fn registrar(&self) -> DriverRegistrar<'rt, 'reg> {
         DriverRegistrar::new(self.runtime_ctx.shared())
     }
     #[inline]
@@ -273,7 +273,7 @@ impl<'a, 'ctx> Ctx<'a, 'ctx> {
 
     pub fn driver<'d, R>(
         &'d self,
-        f: impl FnOnce(RuntimeContextDriver<'d, PlatformDriver<'ctx>, Ctx<'a, 'ctx>>) -> R,
+        f: impl FnOnce(RuntimeContextDriver<'d, PlatformDriver<'reg>, Ctx<'rt, 'reg>>) -> R,
     ) -> R {
         f(RuntimeContextDriver::new(self))
     }
@@ -317,12 +317,12 @@ impl<'a, 'ctx> Ctx<'a, 'ctx> {
 
     pub fn submit<'d, S, T>(&self, submitter: &'d S, op: Op<T>) -> S::Future<T>
     where
-        S: OpSubmitter<'ctx, Ctx<'a, 'ctx>> + Copy + 'd,
+        S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy + 'd,
         T: IntoPlatformOp<
-                <PlatformDriver<'ctx> as Driver>::Op,
-                DriverCompletion = <PlatformDriver<'ctx> as Driver>::Completion,
-                ErasedPayload = <PlatformDriver<'ctx> as Driver>::UP,
-                Error = <PlatformDriver<'ctx> as Driver>::Error,
+                <PlatformDriver<'reg> as Driver>::Op,
+                DriverCompletion = <PlatformDriver<'reg> as Driver>::Completion,
+                ErasedPayload = <PlatformDriver<'reg> as Driver>::UP,
+                Error = <PlatformDriver<'reg> as Driver>::Error,
             > + Send,
     {
         self.sync_registrar();
@@ -340,19 +340,19 @@ impl<'a, 'ctx> Ctx<'a, 'ctx> {
         op: Op<T>,
     ) -> VeloqResult<(
         Result<
-            <T as IntoPlatformOp<<PlatformDriver<'ctx> as Driver>::Op>>::Completion,
+            <T as IntoPlatformOp<<PlatformDriver<'reg> as Driver>::Op>>::Completion,
             DriverReport<DriverError>,
         >,
         T::Output,
     )>
     where
         T: IntoPlatformOp<
-                <PlatformDriver<'ctx> as Driver>::Op,
-                DriverCompletion = <PlatformDriver<'ctx> as Driver>::Completion,
-                ErasedPayload = <PlatformDriver<'ctx> as Driver>::UP,
-                Error = <PlatformDriver<'ctx> as Driver>::Error,
+                <PlatformDriver<'reg> as Driver>::Op,
+                DriverCompletion = <PlatformDriver<'reg> as Driver>::Completion,
+                ErasedPayload = <PlatformDriver<'reg> as Driver>::UP,
+                Error = <PlatformDriver<'reg> as Driver>::Error,
             > + Send
-            + 'd + 'ctx,
+            + 'd + 'reg,
     {
         if self.runtime_ctx.worker_id() == worker_id {
             let (res, op_back) = self
@@ -379,7 +379,7 @@ impl<'a, 'ctx> Ctx<'a, 'ctx> {
     }
 }
 
-pub fn poll_current_driver<'ctx>(shared: &RuntimeShared<WorkerState<'ctx>>) -> IdleDecision {
+pub fn poll_current_driver<'reg>(shared: &RuntimeShared<WorkerState<'reg>>) -> IdleDecision {
     shared.extra_tls.with(|extra| {
         // sync registrar
         sync_to_driver_internal(
@@ -401,21 +401,21 @@ pub fn poll_current_driver<'ctx>(shared: &RuntimeShared<WorkerState<'ctx>>) -> I
     })
 }
 
-pub(crate) fn submit_control_task<'a, 'ctx>(
-    shared: &'a RuntimeShared<WorkerState<'ctx>>,
+pub(crate) fn submit_control_task<'rt, 'reg>(
+    shared: &'rt RuntimeShared<WorkerState<'reg>>,
     worker_id: usize,
     fd: IoFd,
 ) {
-    struct UnregisterFileTask<'ctx> {
+    struct UnregisterFileTask<'reg> {
         header: TaskHeader,
         fd: IoFd,
-        shared_ptr: *const RuntimeShared<WorkerState<'ctx>>,
+        shared_ptr: *const RuntimeShared<WorkerState<'reg>>,
     }
 
-    unsafe impl<'ctx> Send for UnregisterFileTask<'ctx> {}
-    unsafe impl<'ctx> Sync for UnregisterFileTask<'ctx> {}
+    unsafe impl<'reg> Send for UnregisterFileTask<'reg> {}
+    unsafe impl<'reg> Sync for UnregisterFileTask<'reg> {}
 
-    impl<'ctx> RawTask for UnregisterFileTask<'ctx> {
+    impl<'reg> RawTask for UnregisterFileTask<'reg> {
         type Storage = AtomicStorage;
 
         fn poll_raw(&self, _worker_id: usize) -> RuntimeResult<bool> {
@@ -437,7 +437,7 @@ pub(crate) fn submit_control_task<'a, 'ctx>(
         }
     }
 
-    impl<'ctx> UnregisterFileTask<'ctx> {
+    impl<'reg> UnregisterFileTask<'reg> {
         const VTABLE: &'static TaskVTable<AtomicStorage> = &TaskVTable {
             wake: |_| {},
             wake_by_ref: |_| {},
@@ -454,7 +454,7 @@ pub(crate) fn submit_control_task<'a, 'ctx>(
 
     let task = Box::new(UnregisterFileTask {
         header: TaskHeader::new(
-            UnregisterFileTask::<'ctx>::VTABLE,
+            UnregisterFileTask::<'reg>::VTABLE,
             &shared.base,
             worker_id,
             ScopeRef::<AtomicStorage>::dummy(),

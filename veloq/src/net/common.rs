@@ -17,14 +17,14 @@ use diagweave::prelude::*;
 // SocketToken + InnerSocket (RAII Wrapper)
 // ============================================================================
 
-pub struct SocketToken<'a, 'ctx> {
+pub struct SocketToken<'rt, 'reg> {
     fd: IoFd,
     owner_worker_id: usize,
-    ctx: Ctx<'a, 'ctx>,
+    ctx: Ctx<'rt, 'reg>,
 }
 
-impl<'a, 'ctx> SocketToken<'a, 'ctx> {
-    pub(crate) fn new(ctx: Ctx<'a, 'ctx>, handle: RawHandle) -> Result<Self> {
+impl<'rt, 'reg> SocketToken<'rt, 'reg> {
+    pub(crate) fn new(ctx: Ctx<'rt, 'reg>, handle: RawHandle) -> Result<Self> {
         if !handle.borrow().is_socket() {
             return NetError::InvalidSocketHandle.trans();
         }
@@ -50,7 +50,7 @@ impl<'a, 'ctx> SocketToken<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> Drop for SocketToken<'a, 'ctx> {
+impl<'rt, 'reg> Drop for SocketToken<'rt, 'reg> {
     fn drop(&mut self) {
         let current_worker_id = self.ctx.runtime_ctx.worker_id();
         if current_worker_id == self.owner_worker_id {
@@ -68,41 +68,41 @@ impl<'a, 'ctx> Drop for SocketToken<'a, 'ctx> {
 // SocketTokenPtr Trait
 // ============================================================================
 
-pub trait SocketTokenPtr<'a, 'ctx>: Deref<Target = SocketToken<'a, 'ctx>> + Clone
+pub trait SocketTokenPtr<'rt, 'reg>: Deref<Target = SocketToken<'rt, 'reg>> + Clone
 where
-    'ctx: 'a,
+    'reg: 'rt,
 {
-    fn new_ptr(token: SocketToken<'a, 'ctx>) -> Self;
+    fn new_ptr(token: SocketToken<'rt, 'reg>) -> Self;
 }
 
-impl<'a, 'ctx> SocketTokenPtr<'a, 'ctx> for Rc<SocketToken<'a, 'ctx>> {
-    fn new_ptr(token: SocketToken<'a, 'ctx>) -> Self {
+impl<'rt, 'reg> SocketTokenPtr<'rt, 'reg> for Rc<SocketToken<'rt, 'reg>> {
+    fn new_ptr(token: SocketToken<'rt, 'reg>) -> Self {
         Rc::new(token)
     }
 }
 
-impl<'a, 'ctx> SocketTokenPtr<'a, 'ctx> for Arc<SocketToken<'a, 'ctx>> {
-    fn new_ptr(token: SocketToken<'a, 'ctx>) -> Self {
+impl<'rt, 'reg> SocketTokenPtr<'rt, 'reg> for Arc<SocketToken<'rt, 'reg>> {
+    fn new_ptr(token: SocketToken<'rt, 'reg>) -> Self {
         Arc::new(token)
     }
 }
 
 #[derive(Clone)]
-pub struct InnerSocket<'a, 'ctx, P: SocketTokenPtr<'a, 'ctx>>
+pub struct InnerSocket<'rt, 'reg, P: SocketTokenPtr<'rt, 'reg>>
 where
-    'ctx: 'a,
+    'reg: 'rt,
 {
     token: P,
     local_addr: Option<SocketAddr>,
-    marker: PhantomData<(&'a (), &'ctx ())>,
+    marker: PhantomData<(&'rt (), &'reg ())>,
 }
 
-impl<'a, 'ctx, P: SocketTokenPtr<'a, 'ctx>> InnerSocket<'a, 'ctx, P>
+impl<'rt, 'reg, P: SocketTokenPtr<'rt, 'reg>> InnerSocket<'rt, 'reg, P>
 where
-    'ctx: 'a,
+    'reg: 'rt,
 {
     pub fn new(
-        ctx: Ctx<'a, 'ctx>,
+        ctx: Ctx<'rt, 'reg>,
         handle: RawHandle,
         local_addr: Option<SocketAddr>,
     ) -> Result<Self> {

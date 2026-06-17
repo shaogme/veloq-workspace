@@ -25,33 +25,33 @@ use veloq_driver_native::{
 };
 
 #[derive(Clone)]
-pub struct GenericTcpListener<'a, 'ctx, S, P: SocketTokenPtr<'a, 'ctx>> {
-    pub(crate) inner: InnerSocket<'a, 'ctx, P>,
+pub struct GenericTcpListener<'rt, 'reg, S, P: SocketTokenPtr<'rt, 'reg>> {
+    pub(crate) inner: InnerSocket<'rt, 'reg, P>,
     pub(crate) submitter: S,
-    pub(crate) ctx: Ctx<'a, 'ctx>,
+    pub(crate) ctx: Ctx<'rt, 'reg>,
 }
 
 #[derive(Clone)]
-pub struct GenericTcpStream<'a, 'ctx, S, P: SocketTokenPtr<'a, 'ctx>> {
-    pub(crate) inner: InnerSocket<'a, 'ctx, P>,
+pub struct GenericTcpStream<'rt, 'reg, S, P: SocketTokenPtr<'rt, 'reg>> {
+    pub(crate) inner: InnerSocket<'rt, 'reg, P>,
     pub(crate) submitter: S,
-    pub(crate) ctx: Ctx<'a, 'ctx>,
+    pub(crate) ctx: Ctx<'rt, 'reg>,
 }
 
-pub type LocalTcpListener<'a, 'ctx> =
-    GenericTcpListener<'a, 'ctx, LocalSubmitter<Ctx<'a, 'ctx>>, Rc<SocketToken<'a, 'ctx>>>;
-pub type LocalTcpStream<'a, 'ctx> =
-    GenericTcpStream<'a, 'ctx, LocalSubmitter<Ctx<'a, 'ctx>>, Rc<SocketToken<'a, 'ctx>>>;
+pub type LocalTcpListener<'rt, 'reg> =
+    GenericTcpListener<'rt, 'reg, LocalSubmitter<Ctx<'rt, 'reg>>, Rc<SocketToken<'rt, 'reg>>>;
+pub type LocalTcpStream<'rt, 'reg> =
+    GenericTcpStream<'rt, 'reg, LocalSubmitter<Ctx<'rt, 'reg>>, Rc<SocketToken<'rt, 'reg>>>;
 
-pub type TcpListener<'a, 'ctx> =
-    GenericTcpListener<'a, 'ctx, DetachedSubmitter, Arc<SocketToken<'a, 'ctx>>>;
-pub type TcpStream<'a, 'ctx> =
-    GenericTcpStream<'a, 'ctx, DetachedSubmitter, Arc<SocketToken<'a, 'ctx>>>;
+pub type TcpListener<'rt, 'reg> =
+    GenericTcpListener<'rt, 'reg, DetachedSubmitter, Arc<SocketToken<'rt, 'reg>>>;
+pub type TcpStream<'rt, 'reg> =
+    GenericTcpStream<'rt, 'reg, DetachedSubmitter, Arc<SocketToken<'rt, 'reg>>>;
 
-fn bind_listener_inner<'a, 'ctx, A: ToSocketAddrs, P: SocketTokenPtr<'a, 'ctx>>(
-    ctx: Ctx<'a, 'ctx>,
+fn bind_listener_inner<'rt, 'reg, A: ToSocketAddrs, P: SocketTokenPtr<'rt, 'reg>>(
+    ctx: Ctx<'rt, 'reg>,
     addr: A,
-) -> Result<InnerSocket<'a, 'ctx, P>> {
+) -> Result<InnerSocket<'rt, 'reg, P>> {
     let addr = addr
         .to_socket_addrs()
         .map_err(NetError::ToSocketAddrs)?
@@ -71,10 +71,10 @@ fn bind_listener_inner<'a, 'ctx, A: ToSocketAddrs, P: SocketTokenPtr<'a, 'ctx>>(
     InnerSocket::new(ctx, socket.into_owned_raw().into_raw(), Some(local_addr))
 }
 
-fn new_stream_inner<'a, 'ctx, P: SocketTokenPtr<'a, 'ctx>>(
-    ctx: Ctx<'a, 'ctx>,
+fn new_stream_inner<'rt, 'reg, P: SocketTokenPtr<'rt, 'reg>>(
+    ctx: Ctx<'rt, 'reg>,
     addr: &SocketAddr,
-) -> Result<InnerSocket<'a, 'ctx, P>> {
+) -> Result<InnerSocket<'rt, 'reg, P>> {
     let socket = if addr.is_ipv4() {
         Socket::new_tcp_v4().trans()?
     } else {
@@ -83,10 +83,10 @@ fn new_stream_inner<'a, 'ctx, P: SocketTokenPtr<'a, 'ctx>>(
     InnerSocket::new(ctx, socket.into_owned_raw().into_raw(), None)
 }
 
-impl<'a, 'ctx, S: OpSubmitter<'ctx, Ctx<'a, 'ctx>> + Copy, P: SocketTokenPtr<'a, 'ctx>>
-    GenericTcpListener<'a, 'ctx, S, P>
+impl<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy, P: SocketTokenPtr<'rt, 'reg>>
+    GenericTcpListener<'rt, 'reg, S, P>
 {
-    async fn accept_direct(&self) -> Result<(GenericTcpStream<'a, 'ctx, S, P>, SocketAddr)> {
+    async fn accept_direct(&self) -> Result<(GenericTcpStream<'rt, 'reg, S, P>, SocketAddr)> {
         let op = Accept {
             fd: self.inner.fd(),
             addr: SockAddrStorage::default(),
@@ -118,13 +118,13 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, Ctx<'a, 'ctx>> + Copy, P: SocketTokenPtr<'a,
     }
 }
 
-impl<'a, 'ctx, S: OpSubmitter<'ctx, Ctx<'a, 'ctx>> + Copy, P: SocketTokenPtr<'a, 'ctx>>
-    GenericTcpStream<'a, 'ctx, S, P>
+impl<'rt, 'reg, S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy, P: SocketTokenPtr<'rt, 'reg>>
+    GenericTcpStream<'rt, 'reg, S, P>
 {
     async fn connect_from_inner_direct(
-        inner: InnerSocket<'a, 'ctx, P>,
+        inner: InnerSocket<'rt, 'reg, P>,
         submitter: S,
-        ctx: Ctx<'a, 'ctx>,
+        ctx: Ctx<'rt, 'reg>,
         addr: SocketAddr,
     ) -> Result<Self> {
         let (raw_addr, raw_addr_len) = socket_addr_to_storage(addr);
@@ -187,8 +187,8 @@ impl<'a, 'ctx, S: OpSubmitter<'ctx, Ctx<'a, 'ctx>> + Copy, P: SocketTokenPtr<'a,
     }
 }
 
-impl<'a, 'ctx> LocalTcpListener<'a, 'ctx> {
-    pub fn bind<A: ToSocketAddrs>(ctx: Ctx<'a, 'ctx>, addr: A) -> Result<Self> {
+impl<'rt, 'reg> LocalTcpListener<'rt, 'reg> {
+    pub fn bind<A: ToSocketAddrs>(ctx: Ctx<'rt, 'reg>, addr: A) -> Result<Self> {
         Ok(Self {
             inner: bind_listener_inner(ctx, addr)?,
             submitter: LocalSubmitter::new(),
@@ -196,13 +196,13 @@ impl<'a, 'ctx> LocalTcpListener<'a, 'ctx> {
         })
     }
 
-    pub async fn accept(&self) -> Result<(LocalTcpStream<'a, 'ctx>, SocketAddr)> {
+    pub async fn accept(&self) -> Result<(LocalTcpStream<'rt, 'reg>, SocketAddr)> {
         self.accept_direct().await
     }
 }
 
-impl<'a, 'ctx> TcpListener<'a, 'ctx> {
-    pub fn bind<A: ToSocketAddrs>(ctx: Ctx<'a, 'ctx>, addr: A) -> Result<Self> {
+impl<'rt, 'reg> TcpListener<'rt, 'reg> {
+    pub fn bind<A: ToSocketAddrs>(ctx: Ctx<'rt, 'reg>, addr: A) -> Result<Self> {
         Ok(Self {
             inner: bind_listener_inner(ctx, addr)?,
             submitter: DetachedSubmitter::new(),
@@ -210,7 +210,7 @@ impl<'a, 'ctx> TcpListener<'a, 'ctx> {
         })
     }
 
-    pub async fn accept(&self) -> Result<(TcpStream<'a, 'ctx>, SocketAddr)> {
+    pub async fn accept(&self) -> Result<(TcpStream<'rt, 'reg>, SocketAddr)> {
         let owner = self.inner.owner_worker_id();
         let op = Accept {
             fd: self.inner.fd(),
@@ -233,8 +233,8 @@ impl<'a, 'ctx> TcpListener<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> LocalTcpStream<'a, 'ctx> {
-    pub async fn connect(ctx: Ctx<'a, 'ctx>, addr: SocketAddr) -> Result<Self> {
+impl<'rt, 'reg> LocalTcpStream<'rt, 'reg> {
+    pub async fn connect(ctx: Ctx<'rt, 'reg>, addr: SocketAddr) -> Result<Self> {
         let inner = new_stream_inner(ctx, &addr)?;
         Self::connect_from_inner_direct(inner, LocalSubmitter::new(), ctx, addr).await
     }
@@ -256,15 +256,15 @@ impl<'a, 'ctx> LocalTcpStream<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> TcpStream<'a, 'ctx> {
-    pub async fn connect(ctx: Ctx<'a, 'ctx>, addr: SocketAddr) -> Result<Self> {
+impl<'rt, 'reg> TcpStream<'rt, 'reg> {
+    pub async fn connect(ctx: Ctx<'rt, 'reg>, addr: SocketAddr) -> Result<Self> {
         let inner = new_stream_inner(ctx, &addr)?;
         Self::connect_from_inner_direct(inner, DetachedSubmitter::new(), ctx, addr).await
     }
 
     pub(crate) async fn connect_from_inner(
-        ctx: Ctx<'a, 'ctx>,
-        inner: InnerSocket<'a, 'ctx, Arc<SocketToken<'a, 'ctx>>>,
+        ctx: Ctx<'rt, 'reg>,
+        inner: InnerSocket<'rt, 'reg, Arc<SocketToken<'rt, 'reg>>>,
         addr: SocketAddr,
     ) -> Result<Self> {
         Self::connect_from_inner_direct(inner, DetachedSubmitter::new(), ctx, addr).await
@@ -301,7 +301,7 @@ impl<'a, 'ctx> TcpStream<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> AsyncBufRead for LocalTcpStream<'a, 'ctx> {
+impl<'rt, 'reg> AsyncBufRead for LocalTcpStream<'rt, 'reg> {
     type Error = Report<Error>;
 
     async fn read(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -323,7 +323,7 @@ impl<'a, 'ctx> AsyncBufRead for LocalTcpStream<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> AsyncBufRead for TcpStream<'a, 'ctx> {
+impl<'rt, 'reg> AsyncBufRead for TcpStream<'rt, 'reg> {
     type Error = Report<Error>;
 
     async fn read(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -345,7 +345,7 @@ impl<'a, 'ctx> AsyncBufRead for TcpStream<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> AsyncBufWrite for LocalTcpStream<'a, 'ctx> {
+impl<'rt, 'reg> AsyncBufWrite for LocalTcpStream<'rt, 'reg> {
     type Error = Report<Error>;
 
     async fn write(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {
@@ -375,7 +375,7 @@ impl<'a, 'ctx> AsyncBufWrite for LocalTcpStream<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> AsyncBufWrite for TcpStream<'a, 'ctx> {
+impl<'rt, 'reg> AsyncBufWrite for TcpStream<'rt, 'reg> {
     type Error = Report<Error>;
 
     async fn write(&self, buf: FixedBuf) -> Result<(usize, FixedBuf)> {

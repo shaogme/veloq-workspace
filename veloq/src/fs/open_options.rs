@@ -104,11 +104,11 @@ impl OpenOptions {
         self
     }
 
-    pub async fn open_local<'a, 'ctx>(
+    pub async fn open_local<'rt, 'reg>(
         &self,
-        ctx: Ctx<'a, 'ctx>,
+        ctx: Ctx<'rt, 'reg>,
         path: impl AsRef<Path>,
-    ) -> Result<LocalFile<'a, 'ctx>> {
+    ) -> Result<LocalFile<'rt, 'reg>> {
         let op = self.build_op(&ctx, path.as_ref())?;
 
         let submitter = LocalSubmitter::new();
@@ -136,11 +136,11 @@ impl OpenOptions {
         })
     }
 
-    pub async fn open<'a, 'ctx>(
+    pub async fn open<'rt, 'reg>(
         &self,
-        ctx: Ctx<'a, 'ctx>,
+        ctx: Ctx<'rt, 'reg>,
         path: impl AsRef<Path>,
-    ) -> Result<File<'a, 'ctx>> {
+    ) -> Result<File<'rt, 'reg>> {
         let op = self.build_op(&ctx, path.as_ref())?;
 
         let submitter = DetachedSubmitter::new();
