@@ -1,5 +1,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::rio::runtime::control_flow::{
+    RIO_ANOMALY_MALFORMED, RIO_ANOMALY_MISSING, RIO_ANOMALY_STALE,
+};
 use veloq_driver_core::driver::{
     CompletionAnomaly, CompletionAnomalyReason, DriverCompletionDiagnosticsBackend,
 };
@@ -145,17 +148,17 @@ impl DriverCompletionDiagnosticsBackend for IocpCompletionDiagnostics {
 
     #[inline]
     fn record_backend_anomaly(&self, anomaly: &CompletionAnomaly) -> bool {
-        match anomaly.reason {
+        match anomaly.reason() {
             CompletionAnomalyReason::BackendSpecific(code) => match code {
-                crate::rio::runtime::control_flow::RIO_ANOMALY_MALFORMED => {
+                RIO_ANOMALY_MALFORMED => {
                     Self::inc(&self.rio_malformed_context);
                     false
                 }
-                crate::rio::runtime::control_flow::RIO_ANOMALY_MISSING => {
+                RIO_ANOMALY_MISSING => {
                     Self::inc(&self.rio_missing_context);
                     false
                 }
-                crate::rio::runtime::control_flow::RIO_ANOMALY_STALE => {
+                RIO_ANOMALY_STALE => {
                     Self::inc(&self.rio_stale_context);
                     false
                 }
@@ -169,13 +172,16 @@ impl DriverCompletionDiagnosticsBackend for IocpCompletionDiagnostics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rio::runtime::control_flow::rio_malformed_context_kind;
+    use veloq_driver_core::driver::AnomalyAttach;
 
     #[test]
     fn rio_backend_anomaly_keeps_core_counting_enabled() {
         let diagnostics = IocpCompletionDiagnostics::default();
-        let anomaly = crate::rio::runtime::control_flow::rio_malformed_context_anomaly(0xa700_0001);
+        let kind = rio_malformed_context_kind(0xa700_0001);
+        let attach = AnomalyAttach::token_only(crate::driver::RIO_EVENT_TOKEN);
 
-        assert!(!diagnostics.record_backend_anomaly(&anomaly));
+        assert!(!diagnostics.record_backend_anomaly(&kind.materialize(attach)));
         assert_eq!(diagnostics.snapshot().rio.malformed_context, 1);
     }
 }

@@ -1,25 +1,51 @@
-use std::num::NonZeroUsize;
-use std::ptr::NonNull;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver};
+use std::{
+    hint::spin_loop,
+    num::NonZeroUsize,
+    process::abort,
+    ptr::NonNull,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+    },
+};
 
-use super::context::{IdleHook, RuntimeContext, WorkerTickHook};
-use crate::error::{Result, RuntimeError};
-use crate::runtime::primitives::{self, Unparker};
-use crate::scope::{GenericScopeCompletion, ScopeCompletionRegistration};
-use crate::task::{LocalTaskRef, ScopeStorage, SendTaskRef, TaskHandleRef};
-use crate::utils::FastRand;
-use crate::utils::ownership::Ownership;
-use crate::utils::storage::StateOptionPtr;
-use diagweave::DiagnosticResult;
+use crossbeam_deque::Worker;
+use crossbeam_queue::ArrayQueue;
+use diagweave::prelude::*;
+use numaperf_topo::Topology;
+use veloq_storage::StateOptionPtr;
+use veloq_tls::Tls;
+
+use super::context::{IdleHook, RuntimeTlsInner, WorkerTickHook};
+use crate::{
+    error::{Result, RuntimeError},
+    runtime::primitives::{EventCount, ParkerInner, Unparker, create_unpark_waker},
+    scope::{GenericScopeCompletion, ScopeCompletionRegistration},
+    task::{LocalTaskRef, ScopeStorage, SendTaskRef, TaskHandleRef},
+    utils::{FastRand, ownership::Ownership},
+};
 
 pub(crate) mod infra;
 
 use infra::{
-    GlobalInjector, IdleController, IdleStack, NUMAGroup, RuntimeProgressCoordinator,
+    AtomicBitset, GlobalInjector, IdleController, IdleStack, NUMAGroup, RuntimeProgressCoordinator,
     TaskScheduler, TopologyContext, WorkerQueue, WorkerRegistry,
 };
+
+/// `enqueue_pinned` 的结果：区分 scope 是否已由 `acknowledge_completion` 结算。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnqueuePinnedOutcome {
+    /// 成功入队到目标 worker 的 pinned channel。
+    Enqueued,
+    /// 任务已在队列中，无需额外 scope 操作。
+    AlreadyQueued,
+    /// 入队 abort，scope 义务已由 `acknowledge_completion` 结算。
+    AbortedAcknowledged,
+    /// 任务已完成且 scope 已结算。
+    AlreadySettled,
+    /// 无法通过 header ack 结算，caller 的 `ScopeTaskGuard` 须 `settle`。
+    NeedsCallerSettle,
+}
 
 pub struct RuntimeSharedBase {
     pub(crate) registry: WorkerRegistry,
@@ -29,66 +55,57 @@ pub struct RuntimeSharedBase {
     pub(crate) shutdown: AtomicBool,
     pub(crate) worker_tick_hook: Option<WorkerTickHook>,
     /// Worker 线程核心上下文（不含用户 extra 状态）。
-    pub(crate) tls: veloq_tls::Tls<RuntimeContext>,
+    pub(crate) tls: Tls<RuntimeTlsInner>,
 }
 
 pub struct RuntimeShared<T> {
     pub base: RuntimeSharedBase,
     pub(crate) idle_hook: Option<IdleHook<T>>,
     /// Worker 线程用户自定义 extra 状态。
-    pub extra_tls: veloq_tls::Tls<T>,
+    pub extra_tls: Tls<T>,
 }
 
-unsafe impl<T> Send for RuntimeShared<T> {}
-unsafe impl<T> Sync for RuntimeShared<T> {}
-unsafe impl Send for RuntimeSharedBase {}
-unsafe impl Sync for RuntimeSharedBase {}
-
 pub(crate) struct Receivers {
-    pub(crate) remote_receivers: Vec<Receiver<SendTaskRef>>,
-    pub(crate) pinned_receivers: Vec<Receiver<SendTaskRef>>,
-    pub(crate) local_receivers: Vec<Receiver<LocalTaskRef>>,
-    pub(crate) deques: Vec<crossbeam_deque::Worker<SendTaskRef>>,
+    pub(crate) deques: Vec<Worker<SendTaskRef>>,
 }
 
 pub(crate) fn init_runtime_components(
     worker_count: NonZeroUsize,
-    _queue_capacity: NonZeroUsize,
+    queue_capacity: NonZeroUsize,
 ) -> (WorkerRegistry, TopologyContext, Receivers) {
     let worker_count_val = worker_count.get();
     let mut unparkers = Vec::with_capacity(worker_count_val);
     let mut parker_inners = Vec::with_capacity(worker_count_val);
-    let mut remote_receivers = Vec::with_capacity(worker_count_val);
-    let mut pinned_receivers = Vec::with_capacity(worker_count_val);
-    let mut local_receivers = Vec::with_capacity(worker_count_val);
     let mut deques = Vec::with_capacity(worker_count_val);
     let mut workers = Vec::with_capacity(worker_count_val);
     let mut next_idle = Vec::with_capacity(worker_count_val);
 
     for _ in 0..worker_count_val {
-        let inner = Arc::new(primitives::ParkerInner {
+        let inner = Arc::new(ParkerInner {
             state: AtomicU32::new(0),
         });
         unparkers.push(Unparker::from_inner(inner.clone()));
         parker_inners.push(inner);
 
-        let (rtx, rrx) = mpsc::channel();
-        let (ptx, prx) = mpsc::channel();
-        let (ltx, lrx) = mpsc::channel();
-        remote_receivers.push(rrx);
-        pinned_receivers.push(prx);
-        local_receivers.push(lrx);
+        let remote_queue = ArrayQueue::new(queue_capacity.get());
+        let pinned_queue = ArrayQueue::new(queue_capacity.get());
+        let local_queue = ArrayQueue::new(queue_capacity.get());
 
-        let worker_deque = crossbeam_deque::Worker::new_lifo();
+        let worker_deque = Worker::new_lifo();
         let stealer = worker_deque.stealer();
         deques.push(worker_deque);
 
-        workers.push(Arc::new(WorkerQueue::new(rtx, ptx, ltx, stealer)));
+        workers.push(WorkerQueue::new(
+            remote_queue,
+            pinned_queue,
+            local_queue,
+            stealer,
+        ));
         next_idle.push(AtomicUsize::new(usize::MAX));
     }
 
     // NUMA detection
-    let topo_info = numaperf_topo::Topology::discover().ok();
+    let topo_info = Topology::discover().ok();
     let mut groups = Vec::new();
     let mut worker_to_group = vec![0; worker_count_val];
 
@@ -135,12 +152,7 @@ pub(crate) fn init_runtime_components(
             worker_to_group,
             next_idle,
         },
-        Receivers {
-            remote_receivers,
-            pinned_receivers,
-            local_receivers,
-            deques,
-        },
+        Receivers { deques },
     )
 }
 
@@ -165,19 +177,19 @@ impl<T> RuntimeShared<T> {
                     next_worker: AtomicUsize::new(0),
                 },
                 idle: IdleController {
-                    idle_mask: infra::AtomicBitset::new(worker_count.get()),
-                    event_count: primitives::EventCount::new(),
+                    idle_mask: AtomicBitset::new(worker_count.get()),
+                    event_count: EventCount::new(),
                 },
                 shutdown: AtomicBool::new(false),
                 worker_tick_hook,
-                tls: veloq_tls::Tls::new(|| {
-                    panic!("RuntimeContext accessed outside of a worker thread")
+                tls: Tls::new(|| RuntimeTlsInner {
+                    worker_id: usize::MAX,
+                    rand: FastRand::new(u64::MAX),
+                    worker: Worker::new_lifo(),
                 }),
             },
             idle_hook,
-            extra_tls: veloq_tls::Tls::new(|| {
-                panic!("extra TLS accessed outside of a worker thread")
-            }),
+            extra_tls: Tls::new(|| abort()),
         }
     }
 }
@@ -189,12 +201,16 @@ impl RuntimeSharedBase {
 
     #[inline]
     pub fn worker_count(&self) -> NonZeroUsize {
-        NonZeroUsize::new(self.registry.workers.len())
-            .expect("runtime must have at least one worker")
+        if let Some(count) = NonZeroUsize::new(self.registry.workers.len()) {
+            count
+        } else {
+            // runtime 初始化路径保证至少 1 个 worker，回退仅用于防御式容错。
+            unsafe { NonZeroUsize::new_unchecked(1) }
+        }
     }
 
     #[inline]
-    pub fn validate_worker_id(&self, worker_id: usize) -> Result<()> {
+    pub(crate) fn validate_worker_id(&self, worker_id: usize) -> Result<()> {
         let worker_count = self.worker_count().get();
         if worker_id < worker_count {
             return Ok(());
@@ -207,58 +223,65 @@ impl RuntimeSharedBase {
         .with_category("runtime.dispatch")
     }
 
-    #[inline]
-    fn assert_worker_id(&self, worker_id: usize) {
-        let worker_count = self.registry.workers.len();
-        assert!(
-            worker_id < worker_count,
-            "worker_id {worker_id} is out of bounds (worker_count: {worker_count})"
-        );
-    }
-
     /// 将本地任务入队当前线程的本地队列。
-    pub fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef) {
+    pub(crate) fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef) -> Result<()> {
         if task.header().is_completed() {
-            return;
+            return Ok(());
         }
         if task.header().try_mark_queued() {
             let worker = &self.registry.workers[worker_id];
             worker.local_count.fetch_add(1, Ordering::Release);
-            if worker.local_tx.send(task).is_ok() {
-                task.header().notify_runtime_active();
-            } else {
+            if let Err(task) = worker.local_queue.push(task) {
                 worker.local_count.fetch_sub(1, Ordering::Release);
+                if task.header().clear_queued() {
+                    task.header().acknowledge_completion();
+                }
+            } else if let Err(err) = task.header().notify_runtime_active() {
+                worker.local_count.fetch_sub(1, Ordering::Release);
+                if task.header().clear_queued() {
+                    task.header().acknowledge_completion();
+                }
+                return Err(err);
             }
         }
+        Ok(())
     }
 
-    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef) -> bool {
-        self.assert_worker_id(worker_id);
-        if task.header().is_completed() {
-            return false;
+    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef) -> EnqueuePinnedOutcome {
+        if self.validate_worker_id(worker_id).is_err() {
+            return EnqueuePinnedOutcome::AbortedAcknowledged;
         }
-        if task.header().try_mark_queued() {
+        let header = task.header();
+        if header.is_completed() {
+            if header.is_scope_acknowledged() {
+                return EnqueuePinnedOutcome::AlreadySettled;
+            }
+            return EnqueuePinnedOutcome::NeedsCallerSettle;
+        }
+        if header.try_mark_queued() {
             self.idle.event_count.notify();
             let worker = &self.registry.workers[worker_id];
             worker.pinned_count.fetch_add(1, Ordering::Release);
-            if worker.pinned_tx.send(task).is_err() {
+            if let Err(task) = worker.pinned_queue.push(task) {
                 worker.pinned_count.fetch_sub(1, Ordering::Release);
                 if task.header().clear_queued() {
                     task.header().acknowledge_completion();
                 }
-                return false;
+                return EnqueuePinnedOutcome::AbortedAcknowledged;
             }
             self.wake_worker(worker_id);
+            EnqueuePinnedOutcome::Enqueued
+        } else {
+            EnqueuePinnedOutcome::AlreadyQueued
         }
-        true
     }
 
     #[inline]
-    pub fn wake_worker(&self, worker_id: usize) {
+    pub(crate) fn wake_worker(&self, worker_id: usize) {
         self.registry.unpark(worker_id);
     }
 
-    fn fn_pop_send(&self, worker_id: usize) -> Option<SendTaskRef> {
+    pub(crate) fn fn_pop_send(&self, worker_id: usize) -> Option<SendTaskRef> {
         let worker = &self.registry.workers[worker_id];
         if let Some(header) = worker.lifo.swap(None, Ordering::AcqRel) {
             return Some(unsafe { SendTaskRef::from_header(header.as_ptr()) });
@@ -266,8 +289,8 @@ impl RuntimeSharedBase {
         self.tls.with(|ctx| ctx.worker.pop())
     }
 
-    fn fn_pop_pinned(&self, worker_id: usize, rx: &Receiver<SendTaskRef>) -> Option<SendTaskRef> {
-        let res = rx.try_recv().ok();
+    pub(crate) fn fn_pop_pinned(&self, worker_id: usize) -> Option<SendTaskRef> {
+        let res = self.registry.workers[worker_id].pinned_queue.pop();
         if res.is_some() {
             self.registry.workers[worker_id]
                 .pinned_count
@@ -276,8 +299,8 @@ impl RuntimeSharedBase {
         res
     }
 
-    fn fn_pop_local(&self, worker_id: usize, rx: &Receiver<LocalTaskRef>) -> Option<LocalTaskRef> {
-        let res = rx.try_recv().ok();
+    pub(crate) fn fn_pop_local(&self, worker_id: usize) -> Option<LocalTaskRef> {
+        let res = self.registry.workers[worker_id].local_queue.pop();
         if res.is_some() {
             self.registry.workers[worker_id]
                 .local_count
@@ -286,7 +309,7 @@ impl RuntimeSharedBase {
         res
     }
 
-    fn pop_global(&self) -> Option<SendTaskRef> {
+    pub(crate) fn pop_global(&self) -> Option<SendTaskRef> {
         self.scheduler.pop_global()
     }
 
@@ -297,41 +320,49 @@ impl RuntimeSharedBase {
         })
     }
 
-    fn poll_local_task(&self, worker_id: usize, task: LocalTaskRef) {
+    pub(crate) fn poll_local_task(&self, worker_id: usize, task: LocalTaskRef) -> Result<()> {
         if task.header().clear_queued() {
             task.header().acknowledge_completion();
+            Ok(())
         } else {
-            let _ = task.poll_task(worker_id);
+            task.poll_task(worker_id).map(|_| ())
         }
     }
 
-    pub(crate) fn poll_send_task(&self, worker_id: usize, task: SendTaskRef) {
+    pub(crate) fn poll_send_task(&self, worker_id: usize, task: SendTaskRef) -> Result<()> {
         if task.header().clear_queued() {
             task.header().acknowledge_completion();
+            Ok(())
         } else {
-            let _ = task.poll_task(worker_id);
+            task.poll_task(worker_id).map(|_| ())
         }
     }
 
-    pub fn shutdown(&self) {
+    pub(crate) fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
         for i in 0..self.registry.unparkers.len() {
             self.registry.unpark(i);
         }
     }
 
-    pub fn enqueue_send(&self, worker_id: usize, task: SendTaskRef) {
-        self.assert_worker_id(worker_id);
+    pub(crate) fn enqueue_send(&self, worker_id: usize, task: SendTaskRef) {
+        if self.validate_worker_id(worker_id).is_err() {
+            return;
+        }
         if task.header().is_completed() {
             return;
         }
         if task.header().try_mark_queued() {
             self.idle.event_count.notify();
             let worker = &self.registry.workers[worker_id];
-            if worker.remote_tx.send(task).is_err() {
+            if let Err(task) = worker.remote_queue.push(task) {
                 self.scheduler.injector.push(task);
+                let group_idx = self.topo.worker_to_group[worker_id];
+                self.idle
+                    .wake_idle_in_group(group_idx, &self.topo, &self.registry);
+            } else {
+                self.wake_worker(worker_id);
             }
-            self.wake_worker(worker_id);
         }
     }
 }
@@ -348,7 +379,7 @@ impl<T> RuntimeShared<T> {
         self.base.unparkers()
     }
 
-    pub fn choose_worker(&self) -> usize {
+    pub(crate) fn choose_worker(&self) -> usize {
         let current = self
             .base
             .tls
@@ -369,8 +400,8 @@ impl<T> RuntimeShared<T> {
         self.base.validate_worker_id(worker_id)
     }
 
-    pub fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef) {
-        self.base.enqueue_local(worker_id, task);
+    pub(crate) fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef) -> Result<()> {
+        self.base.enqueue_local(worker_id, task)
     }
 
     pub(crate) fn has_work(&self, worker_id: usize) -> bool {
@@ -382,17 +413,19 @@ impl<T> RuntimeShared<T> {
             || worker.pinned_count.load(Ordering::Acquire) > 0
     }
 
-    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef) -> bool {
+    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef) -> EnqueuePinnedOutcome {
         self.base.enqueue_pinned(worker_id, task)
     }
 
     #[inline]
-    pub fn wake_worker(&self, worker_id: usize) {
+    pub(crate) fn wake_worker(&self, worker_id: usize) {
         self.base.wake_worker(worker_id)
     }
 
-    pub fn enqueue_send(&self, worker_id: usize, task: SendTaskRef) {
-        self.base.assert_worker_id(worker_id);
+    pub(crate) fn enqueue_send(&self, worker_id: usize, task: SendTaskRef) {
+        if self.base.validate_worker_id(worker_id).is_err() {
+            return;
+        }
         if task.header().is_completed() {
             return;
         }
@@ -432,21 +465,20 @@ impl<T> RuntimeShared<T> {
         self.base.enqueue_send(worker_id, task);
     }
 
-    pub fn shutdown(&self) {
+    pub(crate) fn shutdown(&self) {
         self.base.shutdown();
     }
 
-    pub fn drive_worker<'a, S: ScopeStorage, O: Ownership + 'a>(
+    pub(crate) fn drive_worker<'a, S: ScopeStorage, O: Ownership + 'a>(
         &self,
         completion: Option<&O::Shared<GenericScopeCompletion<S, O>>>,
-    ) {
-        self.base.tls.with(move |ctx| {
+    ) -> Result<()> {
+        self.base.tls.with(move |ctx| -> Result<()> {
             let worker_id = ctx.worker_id;
 
             let worker_tick_hook = self.base.worker_tick_hook;
 
-            let waker =
-                primitives::create_unpark_waker(self.base.registry.unparkers[worker_id].clone());
+            let waker = create_unpark_waker(self.base.registry.unparkers[worker_id].clone());
             let mut completion_registration =
                 completion.map(|c| ScopeCompletionRegistration::new(&**c, &waker));
 
@@ -462,11 +494,11 @@ impl<T> RuntimeShared<T> {
                 }
 
                 if completion.map(|c| c.is_done()).unwrap_or(false) {
-                    return;
+                    return Ok(());
                 }
 
                 if completion.is_none() && worker_id == 0 {
-                    return;
+                    return Ok(());
                 }
 
                 tick = tick.wrapping_add(1);
@@ -474,26 +506,23 @@ impl<T> RuntimeShared<T> {
                 if processed_tasks >= 64 {
                     processed_tasks = 0;
                     if let Some(task) = self.base.pop_global() {
-                        self.base.poll_send_task(worker_id, task);
+                        self.base.poll_send_task(worker_id, task)?;
                         progressed = true;
                     }
                 }
 
                 if !progressed && let Some(task) = self.base.fn_pop_send(worker_id) {
-                    self.base.poll_send_task(worker_id, task);
+                    self.base.poll_send_task(worker_id, task)?;
                     progressed = true;
                 }
 
-                if !progressed
-                    && let Some(task) = self.base.fn_pop_pinned(worker_id, &ctx.pinned_rx)
-                {
-                    self.base.poll_send_task(worker_id, task);
+                if !progressed && let Some(task) = self.base.fn_pop_pinned(worker_id) {
+                    self.base.poll_send_task(worker_id, task)?;
                     progressed = true;
                 }
 
-                if !progressed && let Some(task) = self.base.fn_pop_local(worker_id, &ctx.local_rx)
-                {
-                    self.base.poll_local_task(worker_id, task);
+                if !progressed && let Some(task) = self.base.fn_pop_local(worker_id) {
+                    self.base.poll_local_task(worker_id, task)?;
                     progressed = true;
                 }
 
@@ -501,12 +530,14 @@ impl<T> RuntimeShared<T> {
                     && tick.is_multiple_of(INJECTOR_CHECK_INTERVAL)
                     && let Some(task) = self.base.pop_global()
                 {
-                    self.base.poll_send_task(worker_id, task);
+                    self.base.poll_send_task(worker_id, task)?;
                     progressed = true;
                 }
 
-                if !progressed && let Ok(task) = ctx.remote_rx.try_recv() {
-                    self.base.poll_send_task(worker_id, task);
+                if !progressed
+                    && let Some(task) = self.base.registry.workers[worker_id].remote_queue.pop()
+                {
+                    self.base.poll_send_task(worker_id, task)?;
                     progressed = true;
                 }
 
@@ -517,11 +548,11 @@ impl<T> RuntimeShared<T> {
 
                 for _ in 0..4 {
                     if let Some(task) = self.base.steal_send(worker_id, &ctx.rand) {
-                        self.base.poll_send_task(worker_id, task);
+                        self.base.poll_send_task(worker_id, task)?;
                         progressed = true;
                         break;
                     }
-                    std::hint::spin_loop();
+                    spin_loop();
                 }
 
                 if progressed {
@@ -532,8 +563,9 @@ impl<T> RuntimeShared<T> {
                 if let Some(registration) = completion_registration.as_mut() {
                     registration.register(&waker);
                 }
-                RuntimeProgressCoordinator::new(self, worker_id).run(completion.map(|c| &**c));
+                RuntimeProgressCoordinator::new(self, worker_id).run(completion.map(|c| &**c))?;
             }
+            Ok(())
         })
     }
 }

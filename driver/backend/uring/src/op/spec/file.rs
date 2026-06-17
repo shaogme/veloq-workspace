@@ -1,15 +1,19 @@
-use crate::config::UringRawHandle;
-use crate::driver::UringDriver;
-use crate::error::UringDriverResult as DriverResult;
-use crate::op::{
-    Close, Fallocate, FallocateRaw, Fsync, FsyncRaw, Open, ReadFixed, ReadRaw, SubmissionStrategy,
-    SyncFileRange, SyncFileRangeRaw, WriteFixed, WriteRaw, payload, submit,
+use crate::{
+    OwnedRawHandle, RawHandle,
+    config::UringRawHandle,
+    driver::UringDriver,
+    error::UringDriverResult as DriverResult,
+    op::{
+        Close, Fallocate, FallocateRaw, Fsync, FsyncRaw, Open, ReadFixed, ReadRaw,
+        SubmissionStrategy, SyncFileRange, SyncFileRangeRaw, WriteFixed, WriteRaw, payload, submit,
+    },
 };
-use crate::{OwnedRawHandle, RawHandle};
 use io_uring::squeue;
 use veloq_buf::heap::ChunkId;
-use veloq_driver_core::driver::{CompletionCleanupGuard, SubmitTokenContext};
-use veloq_driver_core::op::OpKind;
+use veloq_driver_core::{
+    driver::{CompletionCleanupGuard, SubmitTokenContext},
+    op::OpKind,
+};
 
 use super::UringOpSpec;
 

@@ -1,13 +1,16 @@
-use crate::runtime::context::RuntimeContext;
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use crate::runtime::context::Ctx;
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+    time::{Duration, Instant},
+};
+use veloq_driver_native::{
+    driver::{Driver, PlatformDriver},
+    op::{DetachedOp, LocalOp, Op, Timeout as OpTimeout},
+};
 
-use veloq_driver_native::driver::{Driver, PlatformDriver};
-use veloq_driver_native::op::{DetachedOp, LocalOp, Op, Timeout as OpTimeout};
-
-type SleepDetachedOp<'ctx> = DetachedOp<OpTimeout, <PlatformDriver<'ctx> as Driver>::SlotSpec>;
+type SleepDetachedOp<'reg> = DetachedOp<OpTimeout, <PlatformDriver<'reg> as Driver>::SlotSpec>;
 
 // ============================================================================
 // Sync/Send Sleep (uses DetachedOp)
@@ -16,14 +19,14 @@ type SleepDetachedOp<'ctx> = DetachedOp<OpTimeout, <PlatformDriver<'ctx> as Driv
 /// Waits until `duration` has elapsed.
 ///
 /// This future is `Send` and `Sync`.
-pub fn sleep<'a, 'ctx>(ctx: RuntimeContext<'a, 'ctx>, duration: Duration) -> Sleep<'a, 'ctx> {
+pub fn sleep<'rt, 'reg>(ctx: Ctx<'rt, 'reg>, duration: Duration) -> Sleep<'rt, 'reg> {
     sleep_until(ctx, Instant::now() + duration)
 }
 
 /// Waits until `deadline` is reached.
 ///
 /// This future is `Send` and `Sync`.
-pub fn sleep_until<'a, 'ctx>(ctx: RuntimeContext<'a, 'ctx>, deadline: Instant) -> Sleep<'a, 'ctx> {
+pub fn sleep_until<'rt, 'reg>(ctx: Ctx<'rt, 'reg>, deadline: Instant) -> Sleep<'rt, 'reg> {
     Sleep {
         ctx,
         deadline,
@@ -31,13 +34,13 @@ pub fn sleep_until<'a, 'ctx>(ctx: RuntimeContext<'a, 'ctx>, deadline: Instant) -
     }
 }
 
-pub struct Sleep<'a, 'ctx> {
-    ctx: RuntimeContext<'a, 'ctx>,
+pub struct Sleep<'rt, 'reg> {
+    ctx: Ctx<'rt, 'reg>,
     deadline: Instant,
-    inner: Option<SleepDetachedOp<'ctx>>,
+    inner: Option<SleepDetachedOp<'reg>>,
 }
 
-impl<'a, 'ctx> Sleep<'a, 'ctx> {
+impl<'rt, 'reg> Sleep<'rt, 'reg> {
     pub fn deadline(&self) -> Instant {
         self.deadline
     }
@@ -52,7 +55,7 @@ impl<'a, 'ctx> Sleep<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> Future for Sleep<'a, 'ctx> {
+impl<'rt, 'reg> Future for Sleep<'rt, 'reg> {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -93,20 +96,17 @@ impl<'a, 'ctx> Future for Sleep<'a, 'ctx> {
 /// Waits until `duration` has elapsed (Local version).
 ///
 /// This future is `!Send`.
-pub fn sleep_local<'a, 'ctx>(
-    ctx: RuntimeContext<'a, 'ctx>,
-    duration: Duration,
-) -> LocalSleep<'a, 'ctx> {
+pub fn sleep_local<'rt, 'reg>(ctx: Ctx<'rt, 'reg>, duration: Duration) -> LocalSleep<'rt, 'reg> {
     sleep_until_local(ctx, Instant::now() + duration)
 }
 
 /// Waits until `deadline` is reached (Local version).
 ///
 /// This future is `!Send`.
-pub fn sleep_until_local<'a, 'ctx>(
-    ctx: RuntimeContext<'a, 'ctx>,
+pub fn sleep_until_local<'rt, 'reg>(
+    ctx: Ctx<'rt, 'reg>,
     deadline: Instant,
-) -> LocalSleep<'a, 'ctx> {
+) -> LocalSleep<'rt, 'reg> {
     LocalSleep {
         ctx,
         deadline,
@@ -114,13 +114,13 @@ pub fn sleep_until_local<'a, 'ctx>(
     }
 }
 
-pub struct LocalSleep<'a, 'ctx> {
-    ctx: RuntimeContext<'a, 'ctx>,
+pub struct LocalSleep<'rt, 'reg> {
+    ctx: Ctx<'rt, 'reg>,
     deadline: Instant,
-    inner: Option<LocalOp<'ctx, OpTimeout, RuntimeContext<'a, 'ctx>>>,
+    inner: Option<LocalOp<'reg, OpTimeout, Ctx<'rt, 'reg>>>,
 }
 
-impl<'a, 'ctx> LocalSleep<'a, 'ctx> {
+impl<'rt, 'reg> LocalSleep<'rt, 'reg> {
     pub fn deadline(&self) -> Instant {
         self.deadline
     }
@@ -135,7 +135,7 @@ impl<'a, 'ctx> LocalSleep<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> Future for LocalSleep<'a, 'ctx> {
+impl<'rt, 'reg> Future for LocalSleep<'rt, 'reg> {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {

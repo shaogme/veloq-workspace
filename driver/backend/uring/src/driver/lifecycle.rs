@@ -1,16 +1,20 @@
-use crate::driver::completion::UringSyntheticCompletion;
-use crate::driver::{PendingCancel, UringDriver};
-use crate::error::{UringError, uring_report_to_event_res};
+use crate::{
+    driver::{
+        PendingCancel, UringDriver,
+        completion::{COMP_BACKEND_URING, UringSyntheticCompletion},
+    },
+    error::{UringError, uring_report_to_event_res},
+    op::{CheckedSlotView, Slot, SlotState, SlotView, UringOpRegistryExt},
+};
 use diagweave::prelude::*;
 use io_uring::opcode;
 use tracing::{debug, trace};
 use veloq_driver_core::driver::{
-    CancelCompletionId, CancelMode, CancelRequest, CancelSubmitOutcome, CancelTargetGoneReason,
-    CompletionToken, OpToken, SyntheticCompletionSource, UserCompletionEvent,
-    cancel_target_anomaly,
+    AnomalyAttach, CancelCompletionId, CancelMode, CancelRequest, CancelSubmitOutcome,
+    CancelTargetGoneReason, CompletionToken, OpToken, SyntheticCompletionSource,
+    UserCompletionEvent, cancel_target_kind,
 };
-
-use crate::op::{CheckedSlotView, Slot, SlotState, SlotView, UringOpRegistryExt};
+use veloq_wheel::TaskId;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum UringSubmissionState {
@@ -23,7 +27,7 @@ pub(crate) enum UringSubmissionState {
 
 #[derive(Clone, Default)]
 pub struct UringOpState {
-    pub(crate) timer_id: Option<veloq_wheel::TaskId>,
+    pub(crate) timer_id: Option<TaskId>,
     pub(crate) submission_state: UringSubmissionState,
 }
 
@@ -87,12 +91,7 @@ impl<'a> UringDriver<'a> {
         self.completion_diagnostics
             .backend()
             .inc_cancel_local_completed();
-        let event = UserCompletionEvent::from_parts(
-            crate::driver::completion::COMP_BACKEND_URING,
-            token,
-            -libc::ECANCELED,
-            0,
-        );
+        let event = UserCompletionEvent::from_parts(COMP_BACKEND_URING, token, -libc::ECANCELED, 0);
         let _ = self.accept_synthetic_completion(
             event,
             SyntheticCompletionSource::Cancel,
@@ -170,15 +169,10 @@ impl<'a> UringDriver<'a> {
             | CheckedSlotView::Empty(_)
             | CheckedSlotView::Stale(_)
             | CheckedSlotView::Corrupt(_)) => {
-                let (reason, anomaly) = cancel_target_anomaly(
-                    crate::driver::completion::COMP_BACKEND_URING,
-                    token,
-                    -libc::ECANCELED,
-                    0,
-                    view,
-                );
+                let (reason, kind) = cancel_target_kind(token, view);
                 self.record_cancel_target_gone(reason);
-                let _ = self.accept_completion_anomaly(anomaly);
+                let attach = AnomalyAttach::from_op_token(token);
+                let _ = self.accept_completion_anomaly_kind(kind, attach);
                 debug!(
                     user_data,
                     generation,
@@ -204,15 +198,13 @@ impl<'a> UringDriver<'a> {
                     | CheckedSlotView::Stale(_)
                     | CheckedSlotView::Corrupt(_) => {
                         self.pending_cancellations.pop_front();
-                        let (reason, anomaly) = cancel_target_anomaly(
-                            crate::driver::completion::COMP_BACKEND_URING,
+                        let (reason, kind) = cancel_target_kind(
                             request.target,
-                            -libc::ECANCELED,
-                            0,
                             self.ops.checked_slot_view(request.target),
                         );
                         self.record_cancel_target_gone(reason);
-                        let _ = self.accept_completion_anomaly(anomaly);
+                        let attach = AnomalyAttach::from_op_token(request.target);
+                        let _ = self.accept_completion_anomaly_kind(kind, attach);
                         continue;
                     }
                 }
@@ -328,12 +320,7 @@ impl<'a> UringDriver<'a> {
 
     fn complete_queued_submission_error(&mut self, token: OpToken, report: Report<UringError>) {
         let event_res = uring_report_to_event_res(&report);
-        let event = UserCompletionEvent::from_parts(
-            crate::driver::completion::COMP_BACKEND_URING,
-            token,
-            event_res,
-            0,
-        );
+        let event = UserCompletionEvent::from_parts(COMP_BACKEND_URING, token, event_res, 0);
         let _ = self.accept_synthetic_completion(
             event,
             SyntheticCompletionSource::SubmissionFailure,

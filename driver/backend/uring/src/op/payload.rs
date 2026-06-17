@@ -1,17 +1,16 @@
-use veloq_driver_core::op::{
+pub(crate) use veloq_driver_core::op::types::{
     Accept as CoreAccept, Close as CoreClose, Connect as CoreConnect, Fallocate as CoreFallocate,
-    FallocateRaw as CoreFallocateRaw, Fsync as CoreFsync, FsyncRaw as CoreFsyncRaw,
+    FallocateRaw as CoreFallocateRaw, Fsync as CoreFsync, FsyncRaw as CoreFsyncRaw, Open,
     ReadFixed as CoreReadFixed, ReadRaw as CoreReadRaw, Recv as CoreRecv, Send as CoreSend,
     SendTo as CoreSendTo, SyncFileRange as CoreSyncFileRange,
-    SyncFileRangeRaw as CoreSyncFileRangeRaw, UdpConnect as CoreUdpConnect, UdpRecv as CoreUdpRecv,
-    UdpRecvFrom as CoreUdpRecvFrom, UdpSend as CoreUdpSend, Wakeup as CoreWakeup,
-    WriteFixed as CoreWriteFixed, WriteRaw as CoreWriteRaw,
+    SyncFileRangeRaw as CoreSyncFileRangeRaw, Timeout, UdpConnect as CoreUdpConnect,
+    UdpRecv as CoreUdpRecv, UdpRecvFrom as CoreUdpRecvFrom, UdpSend as CoreUdpSend,
+    Wakeup as CoreWakeup, WriteFixed as CoreWriteFixed, WriteRaw as CoreWriteRaw,
 };
 
-pub(crate) use veloq_driver_core::op::{Open, Timeout};
-
-use crate::config::SockAddrStorage;
-use crate::config::UringRawHandle;
+use crate::config::{SockAddrStorage, UringRawHandle};
+use io_uring::types::Timespec;
+use std::{marker::PhantomData, mem, ptr};
 
 pub(crate) type ReadFixed = CoreReadFixed;
 pub(crate) type ReadRaw = CoreReadRaw<UringRawHandle>;
@@ -65,12 +64,12 @@ pub enum UringUserPayload {
 unsafe impl Send for UringUserPayload {}
 
 pub(crate) struct KernelRef<T> {
-    pub(crate) marker: std::marker::PhantomData<T>,
+    pub(crate) marker: PhantomData<T>,
 }
 
 pub(crate) fn kernel_ref<T>(_user: &T) -> KernelRef<T> {
     KernelRef {
-        marker: std::marker::PhantomData,
+        marker: PhantomData,
     }
 }
 
@@ -96,17 +95,17 @@ pub(crate) struct WakeupPayload {
 }
 
 pub(crate) struct TimeoutPayload {
-    pub(crate) ts: [i64; 2],
+    pub(crate) ts: Timespec,
 }
 
 fn zeroed_sockaddr_storage() -> libc::sockaddr_storage {
     // C socket storage is intentionally zero-initialized before make_sqe fills it.
-    unsafe { std::mem::zeroed() }
+    unsafe { mem::zeroed() }
 }
 
 fn zeroed_msghdr() -> libc::msghdr {
     // msghdr pointer fields are populated immediately before submission.
-    unsafe { std::mem::zeroed() }
+    unsafe { mem::zeroed() }
 }
 
 impl AcceptPayload {
@@ -123,7 +122,7 @@ impl SendToPayload {
             msg_name: zeroed_sockaddr_storage(),
             msg_namelen: 0,
             iovec: [libc::iovec {
-                iov_base: std::ptr::null_mut(),
+                iov_base: ptr::null_mut(),
                 iov_len: 0,
             }],
             msghdr: zeroed_msghdr(),
@@ -137,7 +136,7 @@ impl UdpRecvFromPayload {
         Self {
             msg_name: zeroed_sockaddr_storage(),
             iovec: [libc::iovec {
-                iov_base: std::ptr::null_mut(),
+                iov_base: ptr::null_mut(),
                 iov_len: 0,
             }],
             msghdr: zeroed_msghdr(),
@@ -161,8 +160,10 @@ impl WakeupPayload {
 
 impl TimeoutPayload {
     #[inline]
-    pub(crate) const fn new() -> Self {
-        Self { ts: [0; 2] }
+    pub(crate) fn new() -> Self {
+        Self {
+            ts: Timespec::new(),
+        }
     }
 }
 

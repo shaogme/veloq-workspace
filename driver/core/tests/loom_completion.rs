@@ -1,9 +1,12 @@
 #![cfg(feature = "loom")]
-use veloq_driver_core::driver::registry::OpRegistry;
-use veloq_driver_core::driver::*;
-use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotSpec, SlotView};
-use veloq_shim::sync::Mutex;
-use veloq_shim::{Arc, thread};
+use veloq_driver_core::{
+    driver::{registry::OpRegistry, *},
+    slot::{
+        CheckedSlotView, InFlightOrphaned, InFlightWaiting, Slot, SlotRegistryExt, SlotSpec,
+        SlotView,
+    },
+};
+use veloq_shim::{Arc, sync::Mutex, thread};
 
 struct DummyPlatformOp;
 
@@ -32,54 +35,51 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
     fn handle_control(
         &mut self,
         _control: CompletionControl,
-    ) -> CompletionHookOutcome<DummySlotSpec, Self::BackendEffect> {
-        CompletionHookOutcome::Ignore { effect: () }
+    ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>> {
+        Ok(CompletionHookOutcome::Ignore { effect: () })
     }
 
     fn complete_waiting(
         &mut self,
         event: UserCompletionEvent,
-        slot: veloq_driver_core::slot::Slot<
-            '_,
-            veloq_driver_core::slot::InFlightWaiting,
-            DummySlotSpec,
-        >,
+        slot: Slot<'_, InFlightWaiting, DummySlotSpec>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<DummySlotSpec, Self::BackendEffect> {
+    ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>> {
         let mut completed = slot.complete();
         let _ = completed.take_op();
         let (payload, detail) = completed.take_completion_data();
-        CompletionHookOutcome::User {
+        Ok(CompletionHookOutcome::User {
             event,
             payload: payload.expect("loom test payload should exist"),
             detail,
             cleanup: CompletionCleanupGuard::default(),
             effect: (),
-        }
+        })
     }
 
     fn complete_orphaned(
         &mut self,
         _event: UserCompletionEvent,
-        slot: veloq_driver_core::slot::Slot<
-            '_,
-            veloq_driver_core::slot::InFlightOrphaned,
-            DummySlotSpec,
-        >,
+        slot: Slot<'_, InFlightOrphaned, DummySlotSpec>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<DummySlotSpec, Self::BackendEffect> {
+    ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>> {
         let mut completed = slot.complete();
         let _ = completed.take_op();
         let (payload, detail) = completed.take_completion_data();
         let _ = payload;
         drop(detail);
-        CompletionHookOutcome::Cleanup {
+        Ok(CompletionHookOutcome::Cleanup {
             cleanup: CompletionCleanupGuard::default(),
             effect: (),
-        }
+        })
     }
 
-    fn finish_backend_effect(&mut self, _effect: Self::BackendEffect) {}
+    fn finish_backend_effect(
+        &mut self,
+        _effect: Self::BackendEffect,
+    ) -> HookResult<DummySlotSpec, ()> {
+        Ok(())
+    }
 }
 
 fn active_registry() -> (
@@ -148,7 +148,7 @@ fn test_completion_table_loom() {
                         CompletionToken::user(token)
                     )
                 }
-                PollRecordResult::Pending | PollRecordResult::Unavailable(_) => {
+                PollRecordResult::Pending | PollRecordResult::Unavailable { .. } => {
                     table_cloned.mark_orphaned(token);
                 }
             }
@@ -199,8 +199,8 @@ fn test_fast_completion_then_waiting_take_loom() {
                 assert_eq!(record.event.res(), 7);
             }
             PollRecordResult::Pending => panic!("expected ready after fast completion"),
-            PollRecordResult::Unavailable(anomaly) => {
-                panic!("unexpected unavailable completion: {anomaly:?}")
+            PollRecordResult::Unavailable { kind, .. } => {
+                panic!("unexpected unavailable completion: {kind:?}")
             }
         }
 
@@ -218,13 +218,11 @@ fn test_stale_after_generation_advance_loom() {
         let _ = table.try_take_record(token_g1);
 
         match table.try_take_record(token_g1) {
-            PollRecordResult::Unavailable(anomaly)
-                if anomaly.reason == CompletionAnomalyReason::StaleGeneration => {}
+            PollRecordResult::Unavailable { kind, .. } => {
+                assert_eq!(kind.reason(), CompletionAnomalyReason::StaleGeneration);
+            }
             PollRecordResult::Ready(_) => panic!("old generation must not become ready"),
             PollRecordResult::Pending => panic!("old generation must be stale"),
-            PollRecordResult::Unavailable(anomaly) => {
-                panic!("old generation should be stale, got {anomaly:?}")
-            }
         }
     });
 }

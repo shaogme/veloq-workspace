@@ -1,14 +1,21 @@
-use crate::task::{
-    GenericTaskHeader, INTRUSIVE_WAKER_VTABLE, LOCAL_INTRUSIVE_WAKER_VTABLE, LocalTaskRef, RawTask,
-    SendTaskRef, Task, TaskError, TaskHandleRef, TaskResultSetter, TaskVTable, poll_task_internal,
+use crate::{
+    error::Result as RuntimeResult,
+    runtime::RuntimeSharedBase,
+    task::{
+        GenericTaskHeader, INTRUSIVE_WAKER_VTABLE, LOCAL_INTRUSIVE_WAKER_VTABLE, LocalTaskRef,
+        RawTask, SendTaskRef, Task, TaskError, TaskHandleRef, TaskResultSetter, TaskVTable,
+        poll_task_internal,
+    },
 };
-use crate::utils::storage::{AtomicStorage, LocalStorage, StateInt, Storage, ThreadSafeStorage};
-use std::cell::UnsafeCell;
-use std::future::Future;
-use std::pin::Pin;
-use std::ptr::NonNull;
-use std::sync::atomic::Ordering;
-use std::task::{Context, Poll, RawWakerVTable};
+use std::{
+    cell::UnsafeCell,
+    future::Future,
+    pin::Pin,
+    ptr::NonNull,
+    sync::atomic::Ordering,
+    task::{Context, Poll, RawWakerVTable},
+};
+use veloq_storage::{AtomicStorage, LocalStorage, StateInt, Storage, ThreadSafeStorage};
 
 const STATUS_RUNNING: usize = 0;
 const STATUS_DONE: usize = 1;
@@ -19,21 +26,21 @@ pub trait TaskStorage: Storage + Sized {
     const IS_LOCAL: bool;
     const WAKER_VTABLE: &'static RawWakerVTable;
     fn enqueue(
-        runtime: &crate::runtime::RuntimeSharedBase,
+        runtime: &RuntimeSharedBase,
         worker_id: usize,
         data: NonNull<GenericTaskHeader<Self>>,
-    );
+    ) -> RuntimeResult<()>;
 }
 
 impl TaskStorage for LocalStorage {
     const IS_LOCAL: bool = true;
     const WAKER_VTABLE: &'static RawWakerVTable = &LOCAL_INTRUSIVE_WAKER_VTABLE;
     fn enqueue(
-        runtime: &crate::runtime::RuntimeSharedBase,
+        runtime: &RuntimeSharedBase,
         worker_id: usize,
         data: NonNull<GenericTaskHeader<Self>>,
-    ) {
-        unsafe { runtime.enqueue_local(worker_id, LocalTaskRef::from_header(data.as_ptr())) };
+    ) -> RuntimeResult<()> {
+        unsafe { runtime.enqueue_local(worker_id, LocalTaskRef::from_header(data.as_ptr())) }
     }
 }
 
@@ -41,11 +48,14 @@ impl TaskStorage for AtomicStorage {
     const IS_LOCAL: bool = false;
     const WAKER_VTABLE: &'static RawWakerVTable = &INTRUSIVE_WAKER_VTABLE;
     fn enqueue(
-        runtime: &crate::runtime::RuntimeSharedBase,
+        runtime: &RuntimeSharedBase,
         worker_id: usize,
         data: NonNull<GenericTaskHeader<Self>>,
-    ) {
-        unsafe { runtime.enqueue_send(worker_id, SendTaskRef::from_header(data.as_ptr())) };
+    ) -> RuntimeResult<()> {
+        unsafe {
+            runtime.enqueue_send(worker_id, SendTaskRef::from_header(data.as_ptr()));
+        }
+        Ok(())
     }
 }
 
@@ -88,10 +98,14 @@ where
     /// 优化 VTable 的定义，确保其作为静态引用在编译期完全内联。
     const VTABLE: &'static TaskVTable<S> = &TaskVTable {
         wake: |data| unsafe {
-            data.as_ref().enqueue_self(data);
+            if data.as_ref().enqueue_self(data).is_err() {
+                data.as_ref().cancel();
+            }
         },
         wake_by_ref: |header| unsafe {
-            header.enqueue_self(NonNull::from(header));
+            if header.enqueue_self(NonNull::from(header)).is_err() {
+                header.cancel();
+            }
         },
         poll: |header, worker_id| unsafe {
             let raw_ptr = header as *const GenericTaskHeader<S> as *const Self;
@@ -132,10 +146,10 @@ where
 {
     type Storage = S;
 
-    fn poll_raw(&self, _worker_id: usize) -> bool {
+    fn poll_raw(&self, _worker_id: usize) -> RuntimeResult<bool> {
         let waker = self.header.create_waker(S::WAKER_VTABLE);
         let mut cx = Context::from_waker(&waker);
-        self.poll_task(&mut cx)
+        Ok(self.poll_task(&mut cx))
     }
 
     fn header(&self) -> &GenericTaskHeader<Self::Storage> {

@@ -9,36 +9,86 @@ use std::{
     cell::RefCell,
     collections::VecDeque,
     marker::PhantomPinned,
+    mem::ManuallyDrop,
     pin::Pin,
     ptr::NonNull,
     rc::Rc,
     task::{Context, Poll, Waker},
 };
 
-/// 本地通道的发送端
-///
-/// 由于基于 `Rc` 和 `RefCell`，只能在单线程（Local）使用。
 #[derive(Debug)]
-pub struct LocalSender<T> {
-    channel: LocalChannel<T>,
+pub struct State<T> {
+    state: RefCell<StateInner<T>>,
+}
+
+impl<T> State<T> {
+    /// Creates a new MPSC channel state.
+    pub fn new(capacity: ChannelCapacity) -> Self {
+        let channel_buffer = match capacity {
+            ChannelCapacity::Unbounded => VecDeque::new(),
+            ChannelCapacity::Bounded(x) => VecDeque::with_capacity(x),
+        };
+
+        State {
+            state: RefCell::new(StateInner {
+                capacity,
+                channel: channel_buffer,
+                tx_count: 1,
+                is_closed: false,
+                send_waiters: LinkedList::new(WaiterAdapter::NEW),
+                recv_waiters: LinkedList::new(WaiterAdapter::NEW),
+            }),
+        }
+    }
+
+    /// Creates a new unbounded MPSC channel state.
+    pub fn unbounded() -> Self {
+        Self::new(ChannelCapacity::Unbounded)
+    }
+
+    /// Creates a new bounded MPSC channel state.
+    pub fn bounded(size: usize) -> Self {
+        Self::new(ChannelCapacity::Bounded(size))
+    }
+
+    /// Splits the state into a sender and a receiver.
+    pub fn split<'a>(&'a self) -> (Sender<'a, T>, Receiver<'a, T>) {
+        // Reset tx_count to 1 on split
+        self.state.borrow_mut().tx_count = 1;
+        (Sender { state: self }, Receiver { state: self })
+    }
+}
+
+/// Creates a new bounded MPSC channel state.
+pub fn bounded<T>(size: usize) -> State<T> {
+    State::bounded(size)
+}
+
+/// Creates a new unbounded MPSC channel state.
+pub fn unbounded<T>() -> State<T> {
+    State::unbounded()
+}
+
+/// 本地通道的发送端
+#[derive(Debug)]
+pub struct Sender<'a, T> {
+    state: &'a State<T>,
 }
 
 /// 本地通道的接收端
-///
-/// 提供 `recv` 方法用于接收消息，也可以通过 `stream()` 转换为 `Stream`。
 #[derive(Debug)]
-pub struct LocalReceiver<T> {
-    channel: LocalChannel<T>,
+pub struct Receiver<'a, T> {
+    state: &'a State<T>,
 }
 
 trait WaiterAction {
-    fn get_list<T>(state: &mut State<T>) -> &mut LinkedList<WaiterAdapter>;
+    fn get_list<T>(state: &mut StateInner<T>) -> &mut LinkedList<WaiterAdapter>;
 }
 
 struct SenderAction;
 
 impl WaiterAction for SenderAction {
-    fn get_list<T>(state: &mut State<T>) -> &mut LinkedList<WaiterAdapter> {
+    fn get_list<T>(state: &mut StateInner<T>) -> &mut LinkedList<WaiterAdapter> {
         &mut state.send_waiters
     }
 }
@@ -46,7 +96,7 @@ impl WaiterAction for SenderAction {
 struct ReceiverAction;
 
 impl WaiterAction for ReceiverAction {
-    fn get_list<T>(state: &mut State<T>) -> &mut LinkedList<WaiterAdapter> {
+    fn get_list<T>(state: &mut StateInner<T>) -> &mut LinkedList<WaiterAdapter> {
         &mut state.recv_waiters
     }
 }
@@ -57,7 +107,7 @@ where
     A: WaiterAction,
 {
     node: WaiterNode,
-    channel: &'a LocalChannel<T>,
+    state: &'a State<T>,
     poll_fn: F,
     _action: std::marker::PhantomData<A>,
 }
@@ -73,10 +123,10 @@ where
     F: FnMut() -> PollResult<R>,
     A: WaiterAction,
 {
-    fn new(poll_fn: F, channel: &'a LocalChannel<T>) -> Self {
+    fn new(poll_fn: F, state: &'a State<T>) -> Self {
         Waiter {
             poll_fn,
-            channel,
+            state,
             node: WaiterNode {
                 waker: RefCell::new(None),
                 link: Link::new(),
@@ -108,7 +158,7 @@ where
                 if !pinned_node.link.is_linked() {
                     register_into_waiting_queue::<T, A>(
                         pinned_node,
-                        &mut future_mut.channel.state.borrow_mut(),
+                        &mut future_mut.state.state.borrow_mut(),
                     );
                 }
                 Poll::Pending
@@ -116,7 +166,7 @@ where
             PollResult::Ready(result) => {
                 remove_from_the_waiting_queue::<T, A>(
                     pinned_node,
-                    &mut future_mut.channel.state.borrow_mut(),
+                    &mut future_mut.state.state.borrow_mut(),
                 );
                 Poll::Ready(result)
             }
@@ -126,7 +176,7 @@ where
 
 fn register_into_waiting_queue<T, A: WaiterAction>(
     node: Pin<&mut WaiterNode>,
-    state: &mut State<T>,
+    state: &mut StateInner<T>,
 ) {
     if node.link.is_linked() {
         return;
@@ -137,7 +187,7 @@ fn register_into_waiting_queue<T, A: WaiterAction>(
 
 fn remove_from_the_waiting_queue<T, A: WaiterAction>(
     node: Pin<&mut WaiterNode>,
-    state: &mut State<T>,
+    state: &mut StateInner<T>,
 ) {
     if !node.link.is_linked() {
         return;
@@ -157,7 +207,7 @@ where
         if self.node.link.is_linked() {
             let pinned_node = unsafe { Pin::new_unchecked(&mut self.node) };
 
-            let mut state = self.channel.state.borrow_mut();
+            let mut state = self.state.state.borrow_mut();
             remove_from_the_waiting_queue::<T, A>(pinned_node, &mut state);
         }
     }
@@ -177,7 +227,7 @@ impl WaiterAdapter {
 }
 
 #[derive(Debug)]
-struct State<T> {
+struct StateInner<T> {
     capacity: ChannelCapacity,
     channel: VecDeque<T>,
     tx_count: usize,
@@ -186,7 +236,7 @@ struct State<T> {
     send_waiters: LinkedList<WaiterAdapter>,
 }
 
-impl<T> State<T> {
+impl<T> StateInner<T> {
     fn push(&mut self, item: T) -> Result<Option<Waker>, SendError<T>> {
         if self.is_closed {
             Err(SendError::Closed(item))
@@ -239,25 +289,11 @@ impl<T> State<T> {
     }
 }
 
-#[derive(Debug)]
-struct LocalChannel<T> {
-    state: Rc<RefCell<State<T>>>,
-}
-
-impl<T> Clone for LocalChannel<T> {
-    fn clone(&self) -> Self {
-        Self {
-            state: self.state.clone(),
-        }
-    }
-}
-
-impl<T> Drop for LocalChannel<T> {
+impl<T> Drop for State<T> {
     fn drop(&mut self) {
         #[cfg(debug_assertions)]
         {
-            let should_check = Rc::strong_count(&self.state) == 1;
-            if should_check && let Ok(state) = self.state.try_borrow() {
+            if let Ok(state) = self.state.try_borrow() {
                 assert!(state.recv_waiters.is_empty(), "Receiver waiters mismatch");
                 assert!(state.send_waiters.is_empty(), "Sender waiters mismatch");
             }
@@ -265,57 +301,17 @@ impl<T> Drop for LocalChannel<T> {
     }
 }
 
-impl<T> LocalChannel<T> {
-    #[allow(clippy::new_ret_no_self)]
-    fn new(capacity: ChannelCapacity) -> (LocalSender<T>, LocalReceiver<T>) {
-        let channel_buffer = match capacity {
-            ChannelCapacity::Unbounded => VecDeque::new(),
-            ChannelCapacity::Bounded(x) => VecDeque::with_capacity(x),
-        };
-
-        let channel = LocalChannel {
-            state: Rc::new(RefCell::new(State {
-                capacity,
-                channel: channel_buffer,
-                tx_count: 1,
-                is_closed: false,
-                send_waiters: LinkedList::new(WaiterAdapter::NEW),
-                recv_waiters: LinkedList::new(WaiterAdapter::NEW),
-            })),
-        };
-
-        (
-            LocalSender {
-                channel: channel.clone(),
-            },
-            LocalReceiver { channel },
-        )
-    }
-}
-
-/// 创建一个新的无界通道
-pub fn new_unbounded<T>() -> (LocalSender<T>, LocalReceiver<T>) {
-    LocalChannel::new(ChannelCapacity::Unbounded)
-}
-
-/// 创建一个新的有界通道
-pub fn new_bounded<T>(size: usize) -> (LocalSender<T>, LocalReceiver<T>) {
-    LocalChannel::new(ChannelCapacity::Bounded(size))
-}
-
-impl<T> Clone for LocalSender<T> {
+impl<'a, T> Clone for Sender<'a, T> {
     fn clone(&self) -> Self {
-        self.channel.state.borrow_mut().tx_count += 1;
-        Self {
-            channel: self.channel.clone(),
-        }
+        self.state.state.borrow_mut().tx_count += 1;
+        Self { state: self.state }
     }
 }
 
-impl<T> LocalSender<T> {
+impl<'a, T> Sender<'a, T> {
     /// 尝试发送数据，如果通道已满或接收端关闭则返回错误
     pub fn try_send(&self, item: T) -> Result<(), SendError<T>> {
-        if let Some(w) = self.channel.state.borrow_mut().push(item)? {
+        if let Some(w) = self.state.state.borrow_mut().push(item)? {
             w.wake();
         }
         Ok(())
@@ -324,28 +320,28 @@ impl<T> LocalSender<T> {
     /// 异步发送数据，如果通道已满则等待
     pub async fn send(&self, item: T) -> Result<(), SendError<T>> {
         // 先等待空间，但不持有 borrow
-        Waiter::<T, SenderAction, _>::new(|| self.wait_for_room(), &self.channel).await;
+        Waiter::<T, SenderAction, _>::new(|| self.wait_for_room(), self.state).await;
         // 等待结束后尝试发送
         self.try_send(item)
     }
 
     /// 检查通道是否已满
     pub fn is_full(&self) -> bool {
-        self.channel.state.borrow().is_full()
+        self.state.state.borrow().is_full()
     }
 
     /// 获取当前通道中的消息数量
     pub fn len(&self) -> usize {
-        self.channel.state.borrow().channel.len()
+        self.state.state.borrow().channel.len()
     }
 
     /// 检查通道是否为空
     pub fn is_empty(&self) -> bool {
-        self.channel.state.borrow().channel.is_empty()
+        self.state.state.borrow().channel.is_empty()
     }
 
     fn wait_for_room(&self) -> PollResult<()> {
-        self.channel.state.borrow_mut().wait_for_room()
+        self.state.state.borrow_mut().wait_for_room()
     }
 }
 
@@ -364,9 +360,9 @@ fn wake_up_all(waiters: &mut LinkedList<WaiterAdapter>) {
     }
 }
 
-impl<T> Drop for LocalSender<T> {
+impl<'a, T> Drop for Sender<'a, T> {
     fn drop(&mut self) {
-        let mut state = self.channel.state.borrow_mut();
+        let mut state = self.state.state.borrow_mut();
         state.tx_count -= 1;
 
         if state.tx_count == 0 {
@@ -376,10 +372,9 @@ impl<T> Drop for LocalSender<T> {
     }
 }
 
-impl<T> Drop for LocalReceiver<T> {
+impl<'a, T> Drop for Receiver<'a, T> {
     fn drop(&mut self) {
-        let mut state = self.channel.state.borrow_mut();
-        // Receiver 只有一个，所以可以直接关闭
+        let mut state = self.state.state.borrow_mut();
         state.is_closed = true;
         wake_up_all(&mut state.recv_waiters);
         wake_up_all(&mut state.send_waiters);
@@ -387,14 +382,14 @@ impl<T> Drop for LocalReceiver<T> {
 }
 
 struct ChannelStream<'a, T> {
-    channel: &'a LocalChannel<T>,
+    state: &'a State<T>,
     node: WaiterNode,
 }
 
 impl<'a, T> ChannelStream<'a, T> {
-    fn new(channel: &'a LocalChannel<T>) -> Self {
+    fn new(state: &'a State<T>) -> Self {
         ChannelStream {
-            channel,
+            state,
             node: WaiterNode {
                 waker: RefCell::new(None),
                 link: Link::new(),
@@ -408,7 +403,7 @@ impl<T> Stream for ChannelStream<'_, T> {
     type Item = T;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let result = self.channel.state.borrow_mut().recv_one();
+        let result = self.state.state.borrow_mut().recv_one();
         let this = unsafe { self.get_unchecked_mut() };
         let node = unsafe { Pin::new_unchecked(&mut this.node) };
 
@@ -421,7 +416,7 @@ impl<T> Stream for ChannelStream<'_, T> {
                 if !node.link.is_linked() {
                     register_into_waiting_queue::<T, ReceiverAction>(
                         node,
-                        &mut this.channel.state.borrow_mut(),
+                        &mut this.state.state.borrow_mut(),
                     );
                 }
 
@@ -430,7 +425,7 @@ impl<T> Stream for ChannelStream<'_, T> {
             PollResult::Ready(result) => {
                 remove_from_the_waiting_queue::<T, ReceiverAction>(
                     node,
-                    &mut this.channel.state.borrow_mut(),
+                    &mut this.state.state.borrow_mut(),
                 );
 
                 Poll::Ready(result.map(|(ret, mw)| {
@@ -446,23 +441,16 @@ impl<T> Stream for ChannelStream<'_, T> {
 
 impl<T> Drop for ChannelStream<'_, T> {
     fn drop(&mut self) {
-        // 必须确保移除 waiting node，否则会导致悬挂指针（unsafe linked list）。
-        // 使用 borrow_mut() 而非 try_borrow_mut() 以确保在异常情况下也能清理。
-        // 如果 panic 发生，RefCell 已经 poison 也没关系，主要是防止后续 UB。
-        let mut state = self.channel.state.borrow_mut();
-        // Safety: ChannelStream contains PhantomPinned via WaiterNode, so it is !Unpin.
-        // Once pinned (which must happen before node is linked), it cannot be moved.
-        // Drop is called with &mut self, so we can access fields.
-        // If node is linked, it must be valid to pin it here as it hasn't moved since being linked.
+        let mut state = self.state.state.borrow_mut();
         let node = unsafe { Pin::new_unchecked(&mut self.node) };
         remove_from_the_waiting_queue::<T, ReceiverAction>(node, &mut state);
     }
 }
 
-impl<T> LocalReceiver<T> {
+impl<'a, T> Receiver<'a, T> {
     /// 尝试非阻塞接收
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        let result = self.channel.state.borrow_mut().recv_one();
+        let result = self.state.state.borrow_mut().recv_one();
         match result {
             PollResult::Pending => Err(TryRecvError::Empty),
             PollResult::Ready(opt) => match opt {
@@ -479,16 +467,16 @@ impl<T> LocalReceiver<T> {
 
     /// 接收下一条消息
     pub async fn recv(&self) -> Option<T> {
-        Waiter::<T, ReceiverAction, _>::new(|| self.recv_one(), &self.channel).await
+        Waiter::<T, ReceiverAction, _>::new(|| self.recv_one(), self.state).await
     }
 
     /// 转换为 Stream
     pub fn stream(&self) -> impl Stream<Item = T> + '_ {
-        ChannelStream::new(&self.channel)
+        ChannelStream::new(self.state)
     }
 
     fn recv_one(&self) -> PollResult<Option<T>> {
-        let result = self.channel.state.borrow_mut().recv_one();
+        let result = self.state.state.borrow_mut().recv_one();
         match result {
             PollResult::Pending => PollResult::Pending,
             PollResult::Ready(opt) => PollResult::Ready(opt.map(|(ret, mw)| {
@@ -498,5 +486,176 @@ impl<T> LocalReceiver<T> {
                 ret
             })),
         }
+    }
+}
+
+/// Owned MPSC channel sender.
+pub struct OwnedSender<T> {
+    state: Rc<State<T>>,
+}
+
+/// Owned MPSC channel receiver.
+pub struct OwnedReceiver<T> {
+    state: Rc<State<T>>,
+}
+
+/// Creates a new owned MPSC channel.
+pub fn owned_channel<T>(capacity: ChannelCapacity) -> (OwnedSender<T>, OwnedReceiver<T>) {
+    let state = Rc::new(State::new(capacity));
+    (
+        OwnedSender {
+            state: state.clone(),
+        },
+        OwnedReceiver { state },
+    )
+}
+
+/// Creates a new bounded owned MPSC channel.
+pub fn owned_bounded<T>(size: usize) -> (OwnedSender<T>, OwnedReceiver<T>) {
+    owned_channel(ChannelCapacity::Bounded(size))
+}
+
+/// Creates a new unbounded owned MPSC channel.
+pub fn owned_unbounded<T>() -> (OwnedSender<T>, OwnedReceiver<T>) {
+    owned_channel(ChannelCapacity::Unbounded)
+}
+
+impl<T> Clone for OwnedSender<T> {
+    fn clone(&self) -> Self {
+        let sender = ManuallyDrop::new(Sender { state: &self.state });
+        let _cloned = ManuallyDrop::new(sender.clone());
+        OwnedSender {
+            state: self.state.clone(),
+        }
+    }
+}
+
+impl<T> OwnedSender<T> {
+    /// Attempts to send a message without blocking.
+    pub fn try_send(&self, item: T) -> Result<(), SendError<T>> {
+        let sender = ManuallyDrop::new(Sender { state: &self.state });
+        sender.try_send(item)
+    }
+
+    /// Asynchronously sends a message.
+    pub async fn send(&self, item: T) -> Result<(), SendError<T>> {
+        let sender = ManuallyDrop::new(Sender { state: &self.state });
+        sender.send(item).await
+    }
+
+    /// Checks if the channel is full.
+    pub fn is_full(&self) -> bool {
+        let sender = ManuallyDrop::new(Sender { state: &self.state });
+        sender.is_full()
+    }
+
+    /// Returns the number of messages in the channel.
+    pub fn len(&self) -> usize {
+        let sender = ManuallyDrop::new(Sender { state: &self.state });
+        sender.len()
+    }
+
+    /// Checks if the channel is empty.
+    pub fn is_empty(&self) -> bool {
+        let sender = ManuallyDrop::new(Sender { state: &self.state });
+        sender.is_empty()
+    }
+}
+
+impl<T> Drop for OwnedSender<T> {
+    fn drop(&mut self) {
+        drop(Sender { state: &self.state });
+    }
+}
+
+impl<T> OwnedReceiver<T> {
+    /// Attempts to receive a message without blocking.
+    pub fn try_recv(&self) -> Result<T, TryRecvError> {
+        let receiver = ManuallyDrop::new(Receiver { state: &self.state });
+        receiver.try_recv()
+    }
+
+    /// Asynchronously receives a message.
+    pub async fn recv(&self) -> Option<T> {
+        let receiver = ManuallyDrop::new(Receiver { state: &self.state });
+        receiver.recv().await
+    }
+
+    /// Converts the receiver into a stream.
+    pub fn stream(&self) -> OwnedChannelStream<T> {
+        OwnedChannelStream::new(self.state.clone())
+    }
+}
+
+impl<T> Drop for OwnedReceiver<T> {
+    fn drop(&mut self) {
+        drop(Receiver { state: &self.state });
+    }
+}
+
+/// A stream of messages from an owned MPSC channel.
+pub struct OwnedChannelStream<T> {
+    state: Rc<State<T>>,
+    node: WaiterNode,
+}
+
+impl<T> OwnedChannelStream<T> {
+    fn new(state: Rc<State<T>>) -> Self {
+        OwnedChannelStream {
+            state,
+            node: WaiterNode {
+                waker: RefCell::new(None),
+                link: Link::new(),
+                _p: PhantomPinned,
+            },
+        }
+    }
+}
+
+impl<T> Stream for OwnedChannelStream<T> {
+    type Item = T;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let result = self.state.state.borrow_mut().recv_one();
+        let this = unsafe { self.get_unchecked_mut() };
+        let node = unsafe { Pin::new_unchecked(&mut this.node) };
+
+        match result {
+            PollResult::Pending => {
+                let mut waker = node.waker.borrow_mut();
+                update_waker(&mut waker, cx.waker());
+                drop(waker);
+
+                if !node.link.is_linked() {
+                    register_into_waiting_queue::<T, ReceiverAction>(
+                        node,
+                        &mut this.state.state.borrow_mut(),
+                    );
+                }
+
+                Poll::Pending
+            }
+            PollResult::Ready(result) => {
+                remove_from_the_waiting_queue::<T, ReceiverAction>(
+                    node,
+                    &mut this.state.state.borrow_mut(),
+                );
+
+                Poll::Ready(result.map(|(ret, mw)| {
+                    if let Some(waker) = mw {
+                        waker.wake();
+                    }
+                    ret
+                }))
+            }
+        }
+    }
+}
+
+impl<T> Drop for OwnedChannelStream<T> {
+    fn drop(&mut self) {
+        let mut state = self.state.state.borrow_mut();
+        let node = unsafe { Pin::new_unchecked(&mut self.node) };
+        remove_from_the_waiting_queue::<T, ReceiverAction>(node, &mut state);
     }
 }

@@ -1,14 +1,15 @@
-use std::net::SocketAddr;
-use std::ops::Deref;
-use std::rc::Rc;
-use std::sync::Arc;
+use std::{marker::PhantomData, net::SocketAddr, ops::Deref, rc::Rc, sync::Arc};
 
-use crate::error::Result;
-use crate::net::error::NetError;
-use crate::runtime::context::{RuntimeContext, submit_control_task};
-use veloq_driver_native::driver::{Driver, RegisterFd};
-use veloq_driver_native::op::IoFd;
-use veloq_driver_native::{OwnedRawHandle, RawHandle};
+use crate::{
+    error::Result,
+    net::error::NetError,
+    runtime::context::{Ctx, submit_control_task},
+};
+use veloq_driver_native::{
+    OwnedRawHandle, RawHandle,
+    driver::{Driver, RegisterFd},
+    op::IoFd,
+};
 
 use diagweave::prelude::*;
 
@@ -16,14 +17,14 @@ use diagweave::prelude::*;
 // SocketToken + InnerSocket (RAII Wrapper)
 // ============================================================================
 
-pub struct SocketToken<'a, 'ctx> {
+pub struct SocketToken<'rt, 'reg> {
     fd: IoFd,
     owner_worker_id: usize,
-    ctx: RuntimeContext<'a, 'ctx>,
+    ctx: Ctx<'rt, 'reg>,
 }
 
-impl<'a, 'ctx> SocketToken<'a, 'ctx> {
-    pub(crate) fn new(ctx: RuntimeContext<'a, 'ctx>, handle: RawHandle) -> Result<Self> {
+impl<'rt, 'reg> SocketToken<'rt, 'reg> {
+    pub(crate) fn new(ctx: Ctx<'rt, 'reg>, handle: RawHandle) -> Result<Self> {
         if !handle.borrow().is_socket() {
             return NetError::InvalidSocketHandle.trans();
         }
@@ -38,7 +39,7 @@ impl<'a, 'ctx> SocketToken<'a, 'ctx> {
         })?;
         Ok(Self {
             fd,
-            owner_worker_id: ctx.scope.worker_id(),
+            owner_worker_id: ctx.runtime_ctx.worker_id(),
             ctx,
         })
     }
@@ -49,16 +50,16 @@ impl<'a, 'ctx> SocketToken<'a, 'ctx> {
     }
 }
 
-impl<'a, 'ctx> Drop for SocketToken<'a, 'ctx> {
+impl<'rt, 'reg> Drop for SocketToken<'rt, 'reg> {
     fn drop(&mut self) {
-        let current_worker_id = self.ctx.scope.worker_id();
+        let current_worker_id = self.ctx.runtime_ctx.worker_id();
         if current_worker_id == self.owner_worker_id {
-            self.ctx.scope.shared().extra_tls.with(|extra| {
+            self.ctx.runtime_ctx.shared().extra_tls.with(|extra| {
                 let mut driver = extra.driver.borrow_mut();
                 let _ = driver.unregister_files(vec![self.fd]);
             });
         } else {
-            submit_control_task(self.ctx.scope.shared(), self.owner_worker_id, self.fd);
+            submit_control_task(self.ctx.runtime_ctx.shared(), self.owner_worker_id, self.fd);
         }
     }
 }
@@ -67,48 +68,48 @@ impl<'a, 'ctx> Drop for SocketToken<'a, 'ctx> {
 // SocketTokenPtr Trait
 // ============================================================================
 
-pub trait SocketTokenPtr<'a, 'ctx>: Deref<Target = SocketToken<'a, 'ctx>> + Clone
+pub trait SocketTokenPtr<'rt, 'reg>: Deref<Target = SocketToken<'rt, 'reg>> + Clone
 where
-    'ctx: 'a,
+    'reg: 'rt,
 {
-    fn new_ptr(token: SocketToken<'a, 'ctx>) -> Self;
+    fn new_ptr(token: SocketToken<'rt, 'reg>) -> Self;
 }
 
-impl<'a, 'ctx> SocketTokenPtr<'a, 'ctx> for Rc<SocketToken<'a, 'ctx>> {
-    fn new_ptr(token: SocketToken<'a, 'ctx>) -> Self {
+impl<'rt, 'reg> SocketTokenPtr<'rt, 'reg> for Rc<SocketToken<'rt, 'reg>> {
+    fn new_ptr(token: SocketToken<'rt, 'reg>) -> Self {
         Rc::new(token)
     }
 }
 
-impl<'a, 'ctx> SocketTokenPtr<'a, 'ctx> for Arc<SocketToken<'a, 'ctx>> {
-    fn new_ptr(token: SocketToken<'a, 'ctx>) -> Self {
+impl<'rt, 'reg> SocketTokenPtr<'rt, 'reg> for Arc<SocketToken<'rt, 'reg>> {
+    fn new_ptr(token: SocketToken<'rt, 'reg>) -> Self {
         Arc::new(token)
     }
 }
 
 #[derive(Clone)]
-pub struct InnerSocket<'a, 'ctx, P: SocketTokenPtr<'a, 'ctx>>
+pub struct InnerSocket<'rt, 'reg, P: SocketTokenPtr<'rt, 'reg>>
 where
-    'ctx: 'a,
+    'reg: 'rt,
 {
     token: P,
     local_addr: Option<SocketAddr>,
-    marker: std::marker::PhantomData<(&'a (), &'ctx ())>,
+    marker: PhantomData<(&'rt (), &'reg ())>,
 }
 
-impl<'a, 'ctx, P: SocketTokenPtr<'a, 'ctx>> InnerSocket<'a, 'ctx, P>
+impl<'rt, 'reg, P: SocketTokenPtr<'rt, 'reg>> InnerSocket<'rt, 'reg, P>
 where
-    'ctx: 'a,
+    'reg: 'rt,
 {
     pub fn new(
-        ctx: RuntimeContext<'a, 'ctx>,
+        ctx: Ctx<'rt, 'reg>,
         handle: RawHandle,
         local_addr: Option<SocketAddr>,
     ) -> Result<Self> {
         Ok(Self {
             token: P::new_ptr(SocketToken::new(ctx, handle)?),
             local_addr,
-            marker: std::marker::PhantomData,
+            marker: PhantomData,
         })
     }
 

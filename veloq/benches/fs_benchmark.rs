@@ -5,10 +5,10 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
-use veloq::runtime::context::RuntimeContext;
+use veloq::runtime::context::Ctx;
 
 use veloq::fs::{BufferingMode, File};
-use veloq::runtime::Runtime;
+use veloq::runtime::{Runtime, scope, scope_local};
 use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,7 +95,7 @@ fn bench_file_path(base_dir: &Path, name: impl AsRef<str>) -> PathBuf {
     base_dir.join(name.as_ref())
 }
 
-async fn apply_sync<'a, 'ctx>(file: &File<'a, 'ctx>, len: u64, mode: BenchSyncMode) {
+async fn apply_sync<'rt, 'reg>(file: &File<'rt, 'reg>, len: u64, mode: BenchSyncMode) {
     match mode {
         BenchSyncMode::None => {}
         BenchSyncMode::SyncRange => {
@@ -115,11 +115,11 @@ async fn apply_sync<'a, 'ctx>(file: &File<'a, 'ctx>, len: u64, mode: BenchSyncMo
     }
 }
 
-async fn open_file<'a, 'ctx>(
-    ctx: RuntimeContext<'a, 'ctx>,
+async fn open_file<'rt, 'reg>(
+    ctx: Ctx<'rt, 'reg>,
     path: &Path,
     buffering_mode: BufferingMode,
-) -> File<'a, 'ctx> {
+) -> File<'rt, 'reg> {
     File::options()
         .write(true)
         .create(true)
@@ -130,26 +130,26 @@ async fn open_file<'a, 'ctx>(
         .expect("Failed to create")
 }
 
-async fn open_and_fallocate<'a, 'ctx>(
-    ctx: RuntimeContext<'a, 'ctx>,
+async fn open_and_fallocate<'rt, 'reg>(
+    ctx: Ctx<'rt, 'reg>,
     path: &Path,
     buffering_mode: BufferingMode,
     len: u64,
-) -> File<'a, 'ctx> {
+) -> File<'rt, 'reg> {
     let file = open_file(ctx, path, buffering_mode).await;
     file.fallocate(0, len).await.expect("Fallocate failed");
     file
 }
 
-fn create_runtime(worker_threads: usize) -> Runtime<UniformSlot> {
+fn create_runtime(worker_threads: NonZeroUsize) -> Runtime<UniformSlot> {
     Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(128))))
-        .worker_count(NonZeroUsize::new(worker_threads).expect("worker_threads must be > 0"))
+        .worker_count(Some(worker_threads))
         .build()
         .expect("failed to build runtime")
 }
 
-async fn run_1gb_iteration<'a, 'ctx>(
-    ctx: RuntimeContext<'a, 'ctx>,
+async fn run_1gb_iteration<'rt, 'reg>(
+    ctx: Ctx<'rt, 'reg>,
     phase: BenchPhase,
     buffering_mode: BufferingMode,
     sync_mode: BenchSyncMode,
@@ -170,7 +170,7 @@ async fn run_1gb_iteration<'a, 'ctx>(
 
     let concurrency_limit = 32;
 
-    ctx.scope_local(async |s| {
+    scope_local!(ctx, async |s| {
         let mut tasks = VecDeque::new();
         let mut offset: u64 = 0;
 
@@ -209,7 +209,8 @@ async fn run_1gb_iteration<'a, 'ctx>(
             let _ = n;
         }
     })
-    .await;
+    .await
+    .unwrap();
 
     let flush_start = matches!(phase, BenchPhase::Flush).then(Instant::now);
     apply_sync(&file, TOTAL_SIZE, sync_mode).await;
@@ -221,14 +222,14 @@ async fn run_1gb_iteration<'a, 'ctx>(
     }
 }
 
-async fn run_worker_iteration<'a, 'ctx>(
-    ctx: RuntimeContext<'a, 'ctx>,
-    files: Vec<File<'a, 'ctx>>,
+async fn run_worker_iteration<'rt, 'reg>(
+    ctx: Ctx<'rt, 'reg>,
+    files: Vec<File<'rt, 'reg>>,
     file_size: u64,
     chunk_size: NonZeroUsize,
     sync_mode: BenchSyncMode,
 ) -> u64 {
-    let worker_id = ctx.scope.worker_id();
+    let worker_id = ctx.runtime_ctx.worker_id();
     let concurrency_limit = 8;
     let mut offsets = vec![0u64; files.len()];
     let mut current_local_idx = 0usize;
@@ -319,11 +320,13 @@ fn benchmark_1gb_write(c: &mut Criterion) {
                 b.iter_custom(|iters| {
                     let mut total_elapsed = Duration::ZERO;
                     for _ in 0..iters {
-                        let runtime = create_runtime(1);
-                        let elapsed = runtime.block_on(async |ctx| {
-                            run_1gb_iteration(ctx, BenchPhase::Total, buffering_mode, sync_mode)
-                                .await
-                        });
+                        let runtime = create_runtime(nz!(1));
+                        let elapsed = runtime
+                            .block_on(async |ctx| {
+                                run_1gb_iteration(ctx, BenchPhase::Total, buffering_mode, sync_mode)
+                                    .await
+                            })
+                            .unwrap();
                         total_elapsed += elapsed;
                     }
                     total_elapsed
@@ -335,11 +338,13 @@ fn benchmark_1gb_write(c: &mut Criterion) {
                 b.iter_custom(|iters| {
                     let mut total_elapsed = Duration::ZERO;
                     for _ in 0..iters {
-                        let runtime = create_runtime(1);
-                        let elapsed = runtime.block_on(async |ctx| {
-                            run_1gb_iteration(ctx, BenchPhase::Write, buffering_mode, sync_mode)
-                                .await
-                        });
+                        let runtime = create_runtime(nz!(1));
+                        let elapsed = runtime
+                            .block_on(async |ctx| {
+                                run_1gb_iteration(ctx, BenchPhase::Write, buffering_mode, sync_mode)
+                                    .await
+                            })
+                            .unwrap();
                         total_elapsed += elapsed;
                     }
                     total_elapsed
@@ -351,11 +356,13 @@ fn benchmark_1gb_write(c: &mut Criterion) {
                 b.iter_custom(|iters| {
                     let mut total_elapsed = Duration::ZERO;
                     for _ in 0..iters {
-                        let runtime = create_runtime(1);
-                        let elapsed = runtime.block_on(async |ctx| {
-                            run_1gb_iteration(ctx, BenchPhase::Flush, buffering_mode, sync_mode)
-                                .await
-                        });
+                        let runtime = create_runtime(nz!(1));
+                        let elapsed = runtime
+                            .block_on(async |ctx| {
+                                run_1gb_iteration(ctx, BenchPhase::Flush, buffering_mode, sync_mode)
+                                    .await
+                            })
+                            .unwrap();
                         total_elapsed += elapsed;
                     }
                     total_elapsed
@@ -375,15 +382,15 @@ fn benchmark_32_files_write(c: &mut Criterion) {
 
     // 1GB Total Size
     const FILE_COUNT: usize = 32;
-    const WORKER_COUNT: usize = 4;
+    const WORKER_COUNT: NonZeroUsize = nz!(4);
     const TOTAL_SIZE: u64 = 1024 * 1024 * 1024;
     const FILE_SIZE: u64 = TOTAL_SIZE / FILE_COUNT as u64;
-    const FILES_PER_WORKER: usize = FILE_COUNT / WORKER_COUNT;
+    const FILES_PER_WORKER: usize = FILE_COUNT / WORKER_COUNT.get();
     let buffering_mode = bench_buffering_mode();
     let sync_mode = bench_sync_mode();
 
     // Ensure accurate division
-    assert_eq!(FILES_PER_WORKER * WORKER_COUNT, FILE_COUNT);
+    assert_eq!(FILES_PER_WORKER * WORKER_COUNT.get(), FILE_COUNT);
 
     group.throughput(Throughput::Bytes(TOTAL_SIZE));
     group.sample_size(10);
@@ -395,75 +402,78 @@ fn benchmark_32_files_write(c: &mut Criterion) {
             let mut total_elapsed = Duration::ZERO;
             for _ in 0..iters {
                 let runtime = create_runtime(WORKER_COUNT);
-                let elapsed = runtime.block_on(async |ctx| {
-                    let start = Instant::now();
-                    let base_dir = bench_base_dir();
-                    let pid = std::process::id();
+                let elapsed = runtime
+                    .block_on(async |ctx| {
+                        let start = Instant::now();
+                        let base_dir = bench_base_dir();
+                        let pid = std::process::id();
 
-                    ctx.scope(async |s| {
-                        let mut prepare_handles = Vec::with_capacity(WORKER_COUNT);
-                        for worker_id in 0..WORKER_COUNT {
-                            let prepare_path_names: Vec<PathBuf> = (0..FILES_PER_WORKER)
-                                .map(|f_idx| {
-                                    bench_file_path(
-                                        &base_dir,
-                                        format!("bench_32_{pid}_{worker_id}_{f_idx}.tmp"),
-                                    )
-                                })
-                                .collect();
+                        scope!(ctx, async |s| {
+                            let mut prepare_handles = Vec::with_capacity(WORKER_COUNT.get());
+                            for worker_id in 0..WORKER_COUNT.get() {
+                                let prepare_path_names: Vec<PathBuf> = (0..FILES_PER_WORKER)
+                                    .map(|f_idx| {
+                                        bench_file_path(
+                                            &base_dir,
+                                            format!("bench_32_{pid}_{worker_id}_{f_idx}.tmp"),
+                                        )
+                                    })
+                                    .collect();
 
-                            prepare_handles.push(
-                                s.spawn_boxed_to(worker_id, async move || {
-                                    let mut files = Vec::with_capacity(FILES_PER_WORKER);
-                                    for path in &prepare_path_names {
-                                        if path.exists() {
+                                prepare_handles.push(s.spawn_boxed_to(
+                                    worker_id,
+                                    async move || {
+                                        let mut files = Vec::with_capacity(FILES_PER_WORKER);
+                                        for path in &prepare_path_names {
+                                            if path.exists() {
+                                                let _ = std::fs::remove_file(path);
+                                            }
+
+                                            let file = open_and_fallocate(
+                                                ctx,
+                                                path,
+                                                buffering_mode,
+                                                FILE_SIZE,
+                                            )
+                                            .await;
+                                            files.push(file);
+                                        }
+
+                                        let bytes = run_worker_iteration(
+                                            ctx,
+                                            files,
+                                            FILE_SIZE,
+                                            nz!(4 * 1024 * 1024),
+                                            sync_mode,
+                                        )
+                                        .await;
+
+                                        for path in prepare_path_names {
                                             let _ = std::fs::remove_file(path);
                                         }
 
-                                        let file = open_and_fallocate(
-                                            ctx,
-                                            path,
-                                            buffering_mode,
-                                            FILE_SIZE,
-                                        )
-                                        .await;
-                                        files.push(file);
-                                    }
+                                        Ok::<u64, std::io::Error>(bytes)
+                                    },
+                                ));
+                            }
 
-                                    let bytes = run_worker_iteration(
-                                        ctx,
-                                        files,
-                                        FILE_SIZE,
-                                        nz!(4 * 1024 * 1024),
-                                        sync_mode,
-                                    )
-                                    .await;
+                            let mut total_bytes = 0u64;
+                            for handle in prepare_handles {
+                                let bytes = handle
+                                    .await
+                                    .expect("worker task failed")
+                                    .expect("worker execution failed");
+                                total_bytes += bytes;
+                            }
 
-                                    for path in prepare_path_names {
-                                        let _ = std::fs::remove_file(path);
-                                    }
+                            assert_eq!(total_bytes, TOTAL_SIZE);
+                        })
+                        .await
+                        .unwrap();
 
-                                    Ok::<u64, std::io::Error>(bytes)
-                                })
-                                .expect("worker prepare task dispatch failed"),
-                            );
-                        }
-
-                        let mut total_bytes = 0u64;
-                        for handle in prepare_handles {
-                            let bytes = handle
-                                .await
-                                .expect("worker task failed")
-                                .expect("worker execution failed");
-                            total_bytes += bytes;
-                        }
-
-                        assert_eq!(total_bytes, TOTAL_SIZE);
+                        start.elapsed()
                     })
-                    .await;
-
-                    start.elapsed()
-                });
+                    .unwrap();
                 total_elapsed += elapsed;
             }
             total_elapsed

@@ -1,11 +1,12 @@
 use super::{HEAP_REGISTRATION_CACHE_LIMIT, REGISTER_FAILURE_RETRY_COOLDOWN, RioRegistry};
-use crate::rio::RioEnv;
-use crate::rio::core::{RioBufferId, RioProvider};
-use crate::rio::error::{RioError, RioResult};
+use crate::rio::{
+    RioEnv,
+    core::{RioBufferId, RioProvider},
+    error::{RioError, RioResult},
+};
 use diagweave::prelude::*;
 use std::time::Instant;
-use veloq_buf::heap::ChunkId;
-use veloq_buf::{FixedBuf, PoolKind};
+use veloq_buf::{FixedBuf, PoolKind, heap::ChunkId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct RioHeapBufferKey {
@@ -577,7 +578,7 @@ impl RioRegistry {
 mod tests {
     use super::super::test_helpers::*;
     use super::*;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::Ordering::SeqCst;
 
     #[test]
     fn rio_chunk_retired_registration_waits_for_last_lease() {
@@ -671,7 +672,7 @@ mod tests {
             registration: RioBufferRegistration::new(RioBufferId(55 as _)),
         });
         let byte = 0_u8;
-        REGISTER_FAILS.store(true, Ordering::SeqCst);
+        REGISTER_FAILS.store(true, SeqCst);
 
         registry
             .register_chunk(chunk_id, (&byte as *const u8, 1), env)

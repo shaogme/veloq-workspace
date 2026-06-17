@@ -1,19 +1,23 @@
-use std::error::Error;
-use std::sync::Arc;
 use std::{
+    error::Error,
     future::Future,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 use tracing::trace;
 
-use crate::driver::{
-    CancelRequest, CompletionAnomaly, CompletionAnomalyReason, CompletionRecord, CompletionToken,
-    CompletionValue, Driver, DriverSubmitResult, OpToken, PlatformOp, PollRecordResult,
-    RemoteCancelSender, RemoteWaker, SharedCompletionTable, SubmitStatus,
+use crate::{
+    DriverCoreError, DriverError, DriverReport, DriverResult,
+    driver::{
+        AnomalyAttach, CancelRequest, CompletionAccess, CompletionAnomalyKind,
+        CompletionAnomalyReason, CompletionRecord, CompletionToken, CompletionValue, Driver,
+        DriverSubmitResult, OpToken, PlatformOp, PollRecordResult, RemoteCancelSender, RemoteWaker,
+        SharedCompletionTable, SubmitStatus,
+    },
+    op::{DriverProvider, IntoPlatformOp, Op},
+    slot::SlotSpec,
 };
-use crate::op::{IntoPlatformOp, Op};
-use crate::{DriverCoreError, DriverError, DriverReport, DriverResult};
 
 use diagweave::prelude::*;
 
@@ -107,12 +111,10 @@ pub struct OpCompletion<T, E, R = usize> {
 }
 
 impl<T, E, R> OpCompletion<T, E, R> {
-    #[inline]
     pub fn new(result: DriverResult<R, E>, output: T) -> Self {
         Self { result, output }
     }
 
-    #[inline]
     pub fn into_parts(self) -> (DriverResult<R, E>, T) {
         (self.result, self.output)
     }
@@ -143,11 +145,8 @@ where
 }
 
 #[inline]
-pub(crate) fn completion_anomaly_error<E>(anomaly: CompletionAnomaly) -> OpError<E>
-where
-    E: DriverError,
-{
-    let reason = match anomaly.reason {
+fn lost_reason_from_anomaly(reason: CompletionAnomalyReason) -> LostReason {
+    match reason {
         CompletionAnomalyReason::StaleGeneration => LostReason::GenerationMismatch,
         CompletionAnomalyReason::PayloadMissing => LostReason::PayloadMissing,
         CompletionAnomalyReason::UnknownSlot
@@ -162,40 +161,50 @@ where
         | CompletionAnomalyReason::CancelAckTargetStillActive
         | CompletionAnomalyReason::BackendContextUnknown
         | CompletionAnomalyReason::BackendSpecific(_) => LostReason::Other,
-    };
+    }
+}
+
+#[inline]
+pub(crate) fn completion_anomaly_error_from_kind<E>(
+    kind: CompletionAnomalyKind,
+    attach: AnomalyAttach,
+) -> OpError<E>
+where
+    E: DriverError,
+{
+    let reason = lost_reason_from_anomaly(kind.reason());
 
     let mut report = DriverCoreError::Internal
         .to_report()
         .push_ctx("scope", "driver-core/op")
-        .with_ctx("completion_token", anomaly.token.raw())
-        .with_ctx("completion_anomaly", format!("{:?}", anomaly.reason))
+        .with_ctx("completion_token", attach.token.raw())
+        .with_ctx("completion_anomaly", format!("{:?}", kind.reason()))
         .attach_note("operation completion became unavailable");
 
-    if let Some(index) = anomaly.index {
+    if let Some(index) = kind.index() {
         report = report.with_ctx("slot_index", index);
     }
-    if let Some(expected_generation) = anomaly.expected_generation {
+    if let Some(expected_generation) = kind.expected_generation() {
         report = report.with_ctx("expected_generation", expected_generation);
     }
-    if let Some(actual_generation) = anomaly.actual_generation {
+    if let Some(actual_generation) = kind.actual_generation() {
         report = report.with_ctx("actual_generation", actual_generation);
     }
-    if let Some(state) = anomaly.state {
+    if let Some(state) = kind.state() {
         report = report.with_ctx("slot_state", format!("{state:?}"));
     }
-    if let Some(backend) = anomaly.backend {
+    if let Some(backend) = kind.backend().or_else(|| attach.raw.map(|raw| raw.backend)) {
         report = report.with_ctx("completion_backend", format!("{backend:?}"));
     }
-    if let Some(backend_context) = anomaly.backend_context {
+    if let Some(backend_context) = kind.backend_context_value() {
         report = report.with_ctx("completion_backend_context", backend_context);
     }
-    if let Some(raw_result) = anomaly.raw_result {
-        report = report.with_ctx("raw_result", raw_result);
+    if let Some(raw) = attach.raw {
+        report = report
+            .with_ctx("raw_result", raw.res)
+            .with_ctx("completion_flags", raw.flags);
     }
-    if let Some(flags) = anomaly.flags {
-        report = report.with_ctx("completion_flags", flags);
-    }
-    if let Some(snapshot) = anomaly.slot_snapshot {
+    if let Some(snapshot) = kind.slot_snapshot() {
         report = report
             .with_ctx("snapshot_has_op", snapshot.has_op)
             .with_ctx("snapshot_has_payload", snapshot.has_payload);
@@ -209,7 +218,7 @@ pub(crate) fn completion_record_to_result<T, O, Spec>(
     record: CompletionRecord<Spec>,
 ) -> Poll<OpResult<T::Output, Spec::Error, T::Completion>>
 where
-    Spec: crate::slot::SlotSpec,
+    Spec: SlotSpec,
     O: PlatformOp,
     T: IntoPlatformOp<
             O,
@@ -218,7 +227,7 @@ where
             Error = Spec::Error,
         >,
     Spec::Error: DriverError,
-    Spec::Completion: crate::driver::CompletionValue,
+    Spec::Completion: CompletionValue,
 {
     let CompletionRecord {
         event,
@@ -242,11 +251,11 @@ where
 
 #[inline]
 pub(crate) fn poll_completion_table_once<T, O, Spec>(
-    table: &dyn crate::driver::CompletionAccess<Spec>,
+    table: &dyn CompletionAccess<Spec>,
     token: OpToken,
 ) -> Poll<OpResult<T::Output, Spec::Error, T::Completion>>
 where
-    Spec: crate::slot::SlotSpec,
+    Spec: SlotSpec,
     O: PlatformOp,
     T: IntoPlatformOp<
             O,
@@ -255,14 +264,14 @@ where
             Error = Spec::Error,
         >,
     Spec::Error: DriverError,
-    Spec::Completion: crate::driver::CompletionValue,
+    Spec::Completion: CompletionValue,
 {
     match table.try_take_record(token) {
         PollRecordResult::Ready(record) => completion_record_to_result::<T, O, Spec>(record),
-        PollRecordResult::Unavailable(anomaly) => {
+        PollRecordResult::Unavailable { kind, attach } => {
             Poll::Ready(
                 OpResult::<T::Output, Spec::Error, T::Completion>::ResourceLost(
-                    completion_anomaly_error(anomaly),
+                    completion_anomaly_error_from_kind(kind, attach),
                 ),
             )
         }
@@ -275,9 +284,9 @@ type DetachedOpMarker<T, Spec> = (T, Spec);
 /// A Future representing a detached operation.
 pub struct DetachedOp<T, Spec>
 where
-    Spec: crate::slot::SlotSpec,
+    Spec: SlotSpec,
     Spec::Error: DriverError,
-    Spec::Completion: crate::driver::CompletionValue,
+    Spec::Completion: CompletionValue,
     T: IntoPlatformOp<
             Spec::Op,
             DriverCompletion = Spec::Completion,
@@ -296,9 +305,9 @@ where
 
 unsafe impl<T, Spec> std::marker::Send for DetachedOp<T, Spec>
 where
-    Spec: crate::slot::SlotSpec,
+    Spec: SlotSpec,
     Spec::Error: DriverError,
-    Spec::Completion: crate::driver::CompletionValue,
+    Spec::Completion: CompletionValue,
     T: IntoPlatformOp<
             Spec::Op,
             DriverCompletion = Spec::Completion,
@@ -310,9 +319,9 @@ where
 
 impl<T, Spec> Drop for DetachedOp<T, Spec>
 where
-    Spec: crate::slot::SlotSpec,
+    Spec: SlotSpec,
     Spec::Error: DriverError,
-    Spec::Completion: crate::driver::CompletionValue,
+    Spec::Completion: CompletionValue,
     T: IntoPlatformOp<
             Spec::Op,
             DriverCompletion = Spec::Completion,
@@ -339,9 +348,9 @@ where
 
 impl<T, Spec> Future for DetachedOp<T, Spec>
 where
-    Spec: crate::slot::SlotSpec,
+    Spec: SlotSpec,
     Spec::Error: DriverError,
-    Spec::Completion: crate::driver::CompletionValue,
+    Spec::Completion: CompletionValue,
     T: IntoPlatformOp<
             Spec::Op,
             DriverCompletion = Spec::Completion,
@@ -390,7 +399,7 @@ pub enum LocalState {
 /// A Future wrapper for asynchronous IO operations executed locally.
 pub struct LocalOp<'a, T, P>
 where
-    P: crate::op::DriverProvider,
+    P: DriverProvider,
     T: IntoPlatformOp<
             P::Op,
             DriverCompletion = P::Completion,
@@ -407,7 +416,7 @@ where
 
 impl<'a, T, P> LocalOp<'a, T, P>
 where
-    P: crate::op::DriverProvider,
+    P: DriverProvider,
     T: IntoPlatformOp<
             P::Op,
             DriverCompletion = P::Completion,
@@ -428,7 +437,7 @@ where
 
 impl<'a, T, P> Future for LocalOp<'a, T, P>
 where
-    P: crate::op::DriverProvider,
+    P: DriverProvider,
     T: IntoPlatformOp<
             P::Op,
             DriverCompletion = P::Completion,
@@ -599,7 +608,7 @@ where
 
 impl<'a, T, P> Drop for LocalOp<'a, T, P>
 where
-    P: crate::op::DriverProvider,
+    P: DriverProvider,
     T: IntoPlatformOp<
             P::Op,
             DriverCompletion = P::Completion,
@@ -619,7 +628,7 @@ where
     }
 }
 
-pub trait OpSubmitter<'a, P: crate::op::DriverProvider>: Clone + std::marker::Send + Sync {
+pub trait OpSubmitter<'a, P: DriverProvider>: Clone + std::marker::Send + Sync {
     type Future<
         T: IntoPlatformOp<P::Op, DriverCompletion = P::Completion, ErasedPayload = P::UP, Error = P::Error>
             + std::marker::Send,
@@ -657,7 +666,7 @@ impl<P> Default for LocalSubmitter<P> {
     }
 }
 
-impl<'a, P: crate::op::DriverProvider> OpSubmitter<'a, P> for LocalSubmitter<P> {
+impl<'a, P: DriverProvider> OpSubmitter<'a, P> for LocalSubmitter<P> {
     type Future<
         T: IntoPlatformOp<
                 P::Op,
@@ -700,7 +709,7 @@ impl Default for DetachedSubmitter {
     }
 }
 
-impl<'a, P: crate::op::DriverProvider> OpSubmitter<'a, P> for DetachedSubmitter {
+impl<'a, P: DriverProvider> OpSubmitter<'a, P> for DetachedSubmitter {
     type Future<
         T: IntoPlatformOp<
                 P::Op,

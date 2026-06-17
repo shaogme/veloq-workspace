@@ -4,6 +4,7 @@ use std::{
     alloc::{Layout, alloc, dealloc, handle_alloc_error},
     cell::UnsafeCell,
     mem,
+    mem::ManuallyDrop,
     pin::Pin,
     ptr::{self, NonNull},
     rc::Rc,
@@ -13,7 +14,7 @@ use std::{
 use crate::common::update_waker;
 pub use crate::common::{ChannelCapacity, SendError, TryRecvError};
 
-struct Inner<T> {
+struct StateInner<T> {
     buffer: NonNull<T>,
     capacity: usize,
     mask: usize,
@@ -25,7 +26,7 @@ struct Inner<T> {
     is_bounded: bool,
 }
 
-impl<T> Inner<T> {
+impl<T> StateInner<T> {
     fn new(capacity: ChannelCapacity) -> Self {
         let (cap, is_bounded) = match capacity {
             ChannelCapacity::Unbounded => (8, false), // Start small
@@ -48,7 +49,7 @@ impl<T> Inner<T> {
             NonNull::dangling()
         };
 
-        Inner {
+        StateInner {
             buffer: ptr,
             capacity: cap,
             mask: cap - 1,
@@ -158,7 +159,7 @@ impl<T> Inner<T> {
     }
 }
 
-impl<T> Drop for Inner<T> {
+impl<T> Drop for StateInner<T> {
     fn drop(&mut self) {
         // Drop remaining elements
         if mem::needs_drop::<T>() {
@@ -175,22 +176,66 @@ impl<T> Drop for Inner<T> {
     }
 }
 
+pub struct State<T> {
+    inner: UnsafeCell<StateInner<T>>,
+}
+
+impl<T> std::fmt::Debug for State<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("State").finish_non_exhaustive()
+    }
+}
+
+impl<T> State<T> {
+    /// Creates a new SPSC channel state.
+    pub fn new(capacity: ChannelCapacity) -> Self {
+        Self {
+            inner: UnsafeCell::new(StateInner::new(capacity)),
+        }
+    }
+
+    /// Creates a new bounded SPSC channel state.
+    pub fn bounded(size: usize) -> Self {
+        Self::new(ChannelCapacity::Bounded(size))
+    }
+
+    /// Creates a new unbounded SPSC channel state.
+    pub fn unbounded() -> Self {
+        Self::new(ChannelCapacity::Unbounded)
+    }
+
+    /// Splits the state into a sender and a receiver.
+    pub fn split<'a>(&'a self) -> (Sender<'a, T>, Receiver<'a, T>) {
+        (Sender { inner: self }, Receiver { inner: self })
+    }
+}
+
+/// Creates a new bounded SPSC channel state.
+pub fn bounded<T>(size: usize) -> State<T> {
+    State::bounded(size)
+}
+
+/// Creates a new unbounded SPSC channel state.
+pub fn unbounded<T>() -> State<T> {
+    State::unbounded()
+}
+
 /// SPSC Channel Sender
 #[derive(Debug)]
-pub struct Sender<T> {
-    inner: Rc<UnsafeCell<Inner<T>>>,
+pub struct Sender<'a, T> {
+    inner: &'a State<T>,
 }
 
 /// SPSC Channel Receiver
 #[derive(Debug)]
-pub struct Receiver<T> {
-    inner: Rc<UnsafeCell<Inner<T>>>,
+pub struct Receiver<'a, T> {
+    inner: &'a State<T>,
 }
 
-impl<T> Drop for Sender<T> {
+impl<'a, T> Drop for Sender<'a, T> {
     fn drop(&mut self) {
-        let waker = {
-            let inner = unsafe { &mut *self.inner.get() };
+        let waker = unsafe {
+            let inner = &mut *self.inner.inner.get();
             inner.is_closed = true;
             inner.consumer_waker.take()
         };
@@ -201,10 +246,10 @@ impl<T> Drop for Sender<T> {
     }
 }
 
-impl<T> Drop for Receiver<T> {
+impl<'a, T> Drop for Receiver<'a, T> {
     fn drop(&mut self) {
-        let waker = {
-            let inner = unsafe { &mut *self.inner.get() };
+        let waker = unsafe {
+            let inner = &mut *self.inner.inner.get();
             inner.is_closed = true;
             inner.producer_waker.take()
         };
@@ -215,11 +260,11 @@ impl<T> Drop for Receiver<T> {
     }
 }
 
-impl<T> Sender<T> {
+impl<'a, T> Sender<'a, T> {
     /// Attempts to send a message.
     pub fn try_send(&self, item: T) -> Result<(), SendError<T>> {
-        let waker = {
-            let inner = unsafe { &mut *self.inner.get() };
+        let waker = unsafe {
+            let inner = &mut *self.inner.inner.get();
 
             if inner.is_closed {
                 return Err(SendError::Closed(item));
@@ -250,36 +295,36 @@ impl<T> Sender<T> {
 
     /// Checks if the channel is full.
     pub fn is_full(&self) -> bool {
-        let inner = unsafe { &*self.inner.get() };
+        let inner = unsafe { &*self.inner.inner.get() };
         inner.is_full()
     }
 
     /// Returns the number of messages currently in the channel.
     pub fn len(&self) -> usize {
-        let inner = unsafe { &*self.inner.get() };
+        let inner = unsafe { &*self.inner.inner.get() };
         inner.len()
     }
 
     /// Checks if the channel is empty.
     pub fn is_empty(&self) -> bool {
-        let inner = unsafe { &*self.inner.get() };
+        let inner = unsafe { &*self.inner.inner.get() };
         inner.is_empty()
     }
 }
 
-struct SendFuture<'a, T> {
-    sender: &'a Sender<T>,
+pub struct SendFuture<'a, 'b, T> {
+    sender: &'b Sender<'a, T>,
     item: Option<T>,
 }
 
-impl<T> Unpin for SendFuture<'_, T> {}
+impl<T> Unpin for SendFuture<'_, '_, T> {}
 
-impl<'a, T> Future for SendFuture<'a, T> {
+impl<'a, 'b, T> Future for SendFuture<'a, 'b, T> {
     type Output = Result<(), SendError<T>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let waker_to_wake = {
-            let inner = unsafe { &mut *self.sender.inner.get() };
+        let waker_to_wake = unsafe {
+            let inner = &mut *self.sender.inner.inner.get();
 
             if inner.is_closed {
                 let item = self
@@ -312,11 +357,11 @@ impl<'a, T> Future for SendFuture<'a, T> {
     }
 }
 
-impl<T> Receiver<T> {
+impl<'a, T> Receiver<'a, T> {
     /// Attempts to receive a message.
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        let (item, waker) = {
-            let inner = unsafe { &mut *self.inner.get() };
+        let (item, waker) = unsafe {
+            let inner = &mut *self.inner.inner.get();
 
             if let Some(item) = inner.pop() {
                 (Some(item), inner.producer_waker.take())
@@ -349,16 +394,16 @@ impl<T> Receiver<T> {
     }
 }
 
-struct RecvFuture<'a, T> {
-    receiver: &'a Receiver<T>,
+pub struct RecvFuture<'a, 'b, T> {
+    receiver: &'b Receiver<'a, T>,
 }
 
-impl<T> Future for RecvFuture<'_, T> {
+impl<'a, 'b, T> Future for RecvFuture<'a, 'b, T> {
     type Output = Option<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let (item, waker) = {
-            let inner = unsafe { &mut *self.receiver.inner.get() };
+        let (item, waker) = unsafe {
+            let inner = &mut *self.receiver.inner.inner.get();
 
             if let Some(item) = inner.pop() {
                 (Some(item), inner.producer_waker.take())
@@ -377,16 +422,16 @@ impl<T> Future for RecvFuture<'_, T> {
     }
 }
 
-struct ChannelStream<'a, T> {
-    receiver: &'a Receiver<T>,
+pub struct ChannelStream<'a, 'b, T> {
+    receiver: &'b Receiver<'a, T>,
 }
 
-impl<'a, T> Stream for ChannelStream<'a, T> {
+impl<'a, 'b, T> Stream for ChannelStream<'a, 'b, T> {
     type Item = T;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let (item, waker) = {
-            let inner = unsafe { &mut *self.receiver.inner.get() };
+        let (item, waker) = unsafe {
+            let inner = &mut *self.receiver.inner.inner.get();
 
             if let Some(item) = inner.pop() {
                 (Some(item), inner.producer_waker.take())
@@ -405,24 +450,129 @@ impl<'a, T> Stream for ChannelStream<'a, T> {
     }
 }
 
-/// Creates a new unbounded SPSC channel.
-pub fn new_unbounded<T>() -> (Sender<T>, Receiver<T>) {
-    new(ChannelCapacity::Unbounded)
+/// Owned SPSC channel sender.
+pub struct OwnedSender<T> {
+    inner: Rc<State<T>>,
 }
 
-/// Creates a new bounded SPSC channel.
-pub fn new_bounded<T>(size: usize) -> (Sender<T>, Receiver<T>) {
-    new(ChannelCapacity::Bounded(size))
+/// Owned SPSC channel receiver.
+pub struct OwnedReceiver<T> {
+    inner: Rc<State<T>>,
 }
 
-fn new<T>(capacity: ChannelCapacity) -> (Sender<T>, Receiver<T>) {
-    let inner = Inner::new(capacity);
-    let state = Rc::new(UnsafeCell::new(inner));
-
+/// Creates a new owned SPSC channel.
+pub fn owned_channel<T>(capacity: ChannelCapacity) -> (OwnedSender<T>, OwnedReceiver<T>) {
+    let state = Rc::new(State::new(capacity));
     (
-        Sender {
+        OwnedSender {
             inner: state.clone(),
         },
-        Receiver { inner: state },
+        OwnedReceiver { inner: state },
     )
+}
+
+/// Creates a new bounded owned SPSC channel.
+pub fn owned_bounded<T>(size: usize) -> (OwnedSender<T>, OwnedReceiver<T>) {
+    owned_channel(ChannelCapacity::Bounded(size))
+}
+
+/// Creates a new unbounded owned SPSC channel.
+pub fn owned_unbounded<T>() -> (OwnedSender<T>, OwnedReceiver<T>) {
+    owned_channel(ChannelCapacity::Unbounded)
+}
+
+impl<T> OwnedSender<T> {
+    /// Attempts to send a message without blocking.
+    pub fn try_send(&self, item: T) -> Result<(), SendError<T>> {
+        let sender = ManuallyDrop::new(Sender { inner: &self.inner });
+        sender.try_send(item)
+    }
+
+    /// Asynchronously sends a message.
+    pub async fn send(&self, item: T) -> Result<(), SendError<T>> {
+        let sender = ManuallyDrop::new(Sender { inner: &self.inner });
+        sender.send(item).await
+    }
+
+    /// Checks if the channel is full.
+    pub fn is_full(&self) -> bool {
+        let sender = ManuallyDrop::new(Sender { inner: &self.inner });
+        sender.is_full()
+    }
+
+    /// Returns the number of messages in the channel.
+    pub fn len(&self) -> usize {
+        let sender = ManuallyDrop::new(Sender { inner: &self.inner });
+        sender.len()
+    }
+
+    /// Checks if the channel is empty.
+    pub fn is_empty(&self) -> bool {
+        let sender = ManuallyDrop::new(Sender { inner: &self.inner });
+        sender.is_empty()
+    }
+}
+
+impl<T> Drop for OwnedSender<T> {
+    fn drop(&mut self) {
+        drop(Sender { inner: &self.inner });
+    }
+}
+
+impl<T> OwnedReceiver<T> {
+    /// Attempts to receive a message without blocking.
+    pub fn try_recv(&self) -> Result<T, TryRecvError> {
+        let receiver = ManuallyDrop::new(Receiver { inner: &self.inner });
+        receiver.try_recv()
+    }
+
+    /// Asynchronously receives a message.
+    pub async fn recv(&self) -> Option<T> {
+        let receiver = ManuallyDrop::new(Receiver { inner: &self.inner });
+        receiver.recv().await
+    }
+
+    /// Converts the receiver into a stream.
+    pub fn stream(&self) -> OwnedChannelStream<T> {
+        OwnedChannelStream {
+            receiver: OwnedReceiver {
+                inner: self.inner.clone(),
+            },
+        }
+    }
+}
+
+impl<T> Drop for OwnedReceiver<T> {
+    fn drop(&mut self) {
+        drop(Receiver { inner: &self.inner });
+    }
+}
+
+/// A stream of messages from an owned SPSC channel.
+pub struct OwnedChannelStream<T> {
+    receiver: OwnedReceiver<T>,
+}
+
+impl<T> Stream for OwnedChannelStream<T> {
+    type Item = T;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let (item, waker) = unsafe {
+            let inner = &mut *self.receiver.inner.inner.get();
+
+            if let Some(item) = inner.pop() {
+                (Some(item), inner.producer_waker.take())
+            } else if inner.is_closed {
+                return Poll::Ready(None);
+            } else {
+                update_waker(&mut inner.consumer_waker, cx.waker());
+                return Poll::Pending;
+            }
+        };
+
+        if let Some(w) = waker {
+            w.wake();
+        }
+        Poll::Ready(item)
+    }
 }

@@ -1,16 +1,15 @@
-use crate::runtime::primitives::GenericCancellationToken;
-use crate::task::{AnyScopeRef, ScopeParent, ScopeStorage};
-use crate::utils::ownership::{ArcOwnership, Ownership, RcOwnership};
-use crate::utils::storage::{
+use crate::{
+    runtime::primitives::GenericCancellationToken,
+    task::{AnyScopeRef, ErasedCancellationToken, RawScope, ScopeParent, ScopeStorage},
+    utils::ownership::{ArcOwnership, Ownership, RcOwnership},
+};
+use std::{
+    any::Any, marker::PhantomData, pin::Pin, ptr::NonNull, sync::atomic::Ordering, task::Waker,
+};
+use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
+use veloq_storage::{
     AtomicStorage, LocalStorage, StateInt, StateLock, StateOptionBox, StrategyType,
 };
-use std::any::Any;
-use std::marker::PhantomData;
-use std::pin::Pin;
-use std::ptr::NonNull;
-use std::sync::atomic::Ordering;
-use std::task::Waker;
-use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 
 pub(crate) struct ScopeWakerNode<S: ScopeStorage> {
     pub(crate) waker: Waker,
@@ -70,7 +69,7 @@ pub type ScopeCompletion = GenericScopeCompletion<AtomicStorage, ArcOwnership>;
 pub type LocalScopeCompletion = GenericScopeCompletion<LocalStorage, RcOwnership>;
 
 impl<S: ScopeStorage, O: Ownership> GenericScopeCompletion<S, O> {
-    pub fn new(parent: Option<AnyScopeRef>) -> O::Shared<Self> {
+    pub(crate) fn new(parent: Option<AnyScopeRef>) -> O::Shared<Self> {
         let parent = S::Parent::from_any(parent);
         let cross_parent = if S::strategy_type() != StrategyType::Atomic
             || O::strategy_type() != StrategyType::Atomic
@@ -103,12 +102,12 @@ impl<S: ScopeStorage, O: Ownership> GenericScopeCompletion<S, O> {
         }
     }
 
-    pub fn cancel(&self) {
+    pub(crate) fn cancel(&self) {
         self.cancel_token.cancel();
         self.drain_wakers();
     }
 
-    pub fn is_cancelled(&self) -> bool {
+    pub(crate) fn is_cancelled(&self) -> bool {
         if self.cancel_token.is_cancelled() {
             return true;
         }
@@ -118,18 +117,30 @@ impl<S: ScopeStorage, O: Ownership> GenericScopeCompletion<S, O> {
         false
     }
 
-    pub fn cancel_token(&self) -> &GenericCancellationToken<S, O> {
+    pub(crate) fn cancel_token(&self) -> &GenericCancellationToken<S, O> {
         &self.cancel_token
     }
 
-    pub fn add_task(&self) {
+    pub(crate) fn register_task(&self) {
         self.remaining.fetch_add(1, Ordering::AcqRel);
     }
 
-    pub fn task_done(&self) {
-        let remaining = self.remaining.fetch_sub(1, Ordering::AcqRel) - 1;
-        if remaining == 0 {
-            self.drain_wakers();
+    pub(crate) fn settle_task(&self) {
+        loop {
+            let prev = self.remaining.load(Ordering::Acquire);
+            if prev == 0 {
+                return;
+            }
+            if self
+                .remaining
+                .compare_exchange(prev, prev - 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                if prev == 1 {
+                    self.drain_wakers();
+                }
+                return;
+            }
         }
     }
 
@@ -170,17 +181,17 @@ impl<S: ScopeStorage, O: Ownership> GenericScopeCompletion<S, O> {
         }
     }
 
-    pub fn is_done(&self) -> bool {
+    pub(crate) fn is_done(&self) -> bool {
         self.remaining.load(Ordering::Acquire) == 0
     }
 
-    pub fn report_panic(&self, payload: Box<dyn Any + Send + 'static>) {
+    pub(crate) fn report_panic(&self, payload: Box<dyn Any + Send + 'static>) {
         let _ = self
             .panic_info
             .compare_exchange_none(payload, Ordering::AcqRel, Ordering::Acquire);
     }
 
-    pub fn take_panic(&self) -> Option<Box<dyn Any + Send + 'static>> {
+    pub(crate) fn take_panic(&self) -> Option<Box<dyn Any + Send + 'static>> {
         self.panic_info.take(Ordering::AcqRel)
     }
 
@@ -204,12 +215,10 @@ impl<S: ScopeStorage, O: Ownership> Drop for GenericScopeCompletion<S, O> {
     }
 }
 
-impl<S: ScopeStorage, O: Ownership + 'static> crate::task::RawScope
-    for GenericScopeCompletion<S, O>
-{
+impl<S: ScopeStorage, O: Ownership + 'static> RawScope for GenericScopeCompletion<S, O> {
     #[inline]
     fn task_done(&self) {
-        self.task_done();
+        self.settle_task();
     }
 
     #[inline]
@@ -218,7 +227,7 @@ impl<S: ScopeStorage, O: Ownership + 'static> crate::task::RawScope
     }
 
     #[inline]
-    fn report_panic(&self, payload: Box<dyn std::any::Any + Send + 'static>) {
+    fn report_panic(&self, payload: Box<dyn Any + Send + 'static>) {
         self.report_panic(payload);
     }
 
@@ -228,7 +237,7 @@ impl<S: ScopeStorage, O: Ownership + 'static> crate::task::RawScope
     }
 
     #[inline]
-    fn try_link_child(&self, child_token: &crate::task::ErasedCancellationToken) -> bool {
+    fn try_link_child(&self, child_token: &ErasedCancellationToken) -> bool {
         if child_token.s_type != S::strategy_type() || child_token.o_type != O::strategy_type() {
             return false;
         }
@@ -250,10 +259,10 @@ impl<S: ScopeStorage, O: Ownership + 'static> crate::task::RawScope
     }
 
     #[inline]
-    unsafe fn clone_raw(&self) -> NonNull<dyn crate::task::RawScope> {
+    unsafe fn clone_raw(&self) -> NonNull<dyn RawScope> {
         let ptr = self as *const Self;
         unsafe { O::increment_strong_count(ptr) };
-        let dyn_ptr: *const dyn crate::task::RawScope = ptr;
+        let dyn_ptr: *const dyn RawScope = ptr;
         unsafe { NonNull::new_unchecked(dyn_ptr as *mut _) }
     }
 
@@ -261,5 +270,22 @@ impl<S: ScopeStorage, O: Ownership + 'static> crate::task::RawScope
     unsafe fn drop_raw(&self) {
         let ptr = self as *const Self;
         unsafe { O::decrement_strong_count(ptr) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::ownership::ArcOwnership;
+    use veloq_storage::AtomicStorage;
+
+    #[test]
+    fn duplicate_settle_task_does_not_underflow() {
+        let completion = GenericScopeCompletion::<AtomicStorage, ArcOwnership>::new(None);
+        completion.register_task();
+        completion.settle_task();
+        assert!(completion.is_done());
+        completion.settle_task();
+        assert!(completion.is_done());
     }
 }

@@ -1,8 +1,14 @@
-use crate::driver::UringDriver;
-use crate::error::{UringDriverResult as DriverResult, UringError};
-use crate::op::payload::KernelRef;
-use crate::op::{Accept, Connect, OpSend, Recv, SendTo, UdpConnect, UdpRecv, UdpRecvFrom, UdpSend};
+use crate::{
+    driver::UringDriver,
+    error::{UringDriverResult as DriverResult, UringError},
+    net::{socket_addr_to_storage, to_socket_addr},
+    op::{
+        Accept, Connect, OpSend, Recv, SendTo, UdpConnect, UdpRecv, UdpRecvFrom, UdpSend,
+        payload::{AcceptPayload, KernelRef, SendToPayload, UdpRecvFromPayload},
+    },
+};
 use io_uring::{opcode, squeue};
+use std::{mem::size_of, slice::from_raw_parts};
 use veloq_driver_core::driver::SubmitTokenContext;
 
 use super::{invalid_buf_io_range, resolve_socket_fd};
@@ -100,7 +106,7 @@ pub(crate) unsafe fn make_sqe_udp_connect(
 }
 
 pub(crate) unsafe fn make_sqe_accept(
-    _kernel: &mut crate::op::payload::AcceptPayload,
+    _kernel: &mut AcceptPayload,
     val: &mut Accept,
     driver: &mut UringDriver,
     _token: SubmitTokenContext,
@@ -119,7 +125,7 @@ pub(crate) unsafe fn make_sqe_accept(
 }
 
 pub(crate) unsafe fn on_complete_accept(
-    _kernel: &mut crate::op::payload::AcceptPayload,
+    _kernel: &mut AcceptPayload,
     accept_op: &mut Accept,
     result: i32,
 ) -> DriverResult<usize> {
@@ -133,19 +139,19 @@ pub(crate) unsafe fn on_complete_accept(
     }
 
     let addr_bytes = unsafe {
-        std::slice::from_raw_parts(
+        from_raw_parts(
             &accept_op.addr.0 as *const _ as *const u8,
             accept_op.addr_len as usize,
         )
     };
-    if let Ok(addr) = crate::net::to_socket_addr(addr_bytes) {
+    if let Ok(addr) = to_socket_addr(addr_bytes) {
         accept_op.remote_addr = Some(addr);
     }
     Ok(result as usize)
 }
 
 pub(crate) unsafe fn make_sqe_send_to(
-    kernel: &mut crate::op::payload::SendToPayload,
+    kernel: &mut SendToPayload,
     user: &mut SendTo,
     driver: &mut UringDriver,
     _token: SubmitTokenContext,
@@ -157,7 +163,7 @@ pub(crate) unsafe fn make_sqe_send_to(
     kernel.iovec[0].iov_base = ptr as *mut _;
     kernel.iovec[0].iov_len = len as usize;
 
-    let (msg_name, msg_namelen) = crate::net::socket_addr_to_storage(user.addr);
+    let (msg_name, msg_namelen) = socket_addr_to_storage(user.addr);
     kernel.msg_name = msg_name.0;
     kernel.msg_namelen = msg_namelen;
 
@@ -175,7 +181,7 @@ pub(crate) unsafe fn make_sqe_send_to(
 }
 
 pub(crate) unsafe fn make_sqe_udp_recv_from(
-    kernel: &mut crate::op::payload::UdpRecvFromPayload,
+    kernel: &mut UdpRecvFromPayload,
     user: &mut UdpRecvFrom,
     driver: &mut UringDriver,
     _token: SubmitTokenContext,
@@ -190,7 +196,7 @@ pub(crate) unsafe fn make_sqe_udp_recv_from(
     kernel.iovec[0].iov_len = len as usize;
 
     kernel.msghdr.msg_name = &mut kernel.msg_name as *mut _ as *mut libc::c_void;
-    kernel.msghdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as _;
+    kernel.msghdr.msg_namelen = size_of::<libc::sockaddr_storage>() as _;
     kernel.msghdr.msg_iov = kernel.iovec.as_mut_ptr();
     kernel.msghdr.msg_iovlen = 1;
 
@@ -203,7 +209,7 @@ pub(crate) unsafe fn make_sqe_udp_recv_from(
 }
 
 pub(crate) unsafe fn on_complete_udp_recv_from(
-    kernel: &mut crate::op::payload::UdpRecvFromPayload,
+    kernel: &mut UdpRecvFromPayload,
     user: &mut UdpRecvFrom,
     result: i32,
 ) -> DriverResult<usize> {
@@ -217,9 +223,8 @@ pub(crate) unsafe fn on_complete_udp_recv_from(
     }
 
     let len = kernel.msghdr.msg_namelen as usize;
-    let addr_bytes =
-        unsafe { std::slice::from_raw_parts(&kernel.msg_name as *const _ as *const u8, len) };
-    if let Ok(addr) = crate::net::to_socket_addr(addr_bytes) {
+    let addr_bytes = unsafe { from_raw_parts(&kernel.msg_name as *const _ as *const u8, len) };
+    if let Ok(addr) = to_socket_addr(addr_bytes) {
         user.addr = Some(addr);
     }
     Ok(result as usize)

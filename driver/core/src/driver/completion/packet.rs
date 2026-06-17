@@ -1,34 +1,33 @@
-use crate::DriverResult;
-use crate::slot;
+use crate::{DriverResult, slot::SlotSpec};
 
 use super::{
-    CompletionAnomaly, CompletionCleanupGuard, CompletionEvent, DriverCompletionDiagnostics,
-    OpToken, UserCompletionEvent,
+    AnomalyAttach, CompletionAnomalyKind, CompletionCleanupGuard, CompletionEvent,
+    DriverCompletionDiagnostics, OpToken, UserCompletionEvent,
 };
 
-pub struct CompletionPacket<Spec: slot::SlotSpec> {
+pub struct CompletionPacket<Spec: SlotSpec> {
     pub event: UserCompletionEvent,
     pub input: CompletionInput<Spec>,
 }
 
-pub struct UserCompletion<Spec: slot::SlotSpec> {
+pub struct UserCompletion<Spec: SlotSpec> {
     pub payload: Spec::UserPayload,
     pub detail: Option<DriverResult<Spec::Completion, Spec::Error>>,
     pub cleanup: CompletionCleanupGuard,
 }
 
 pub struct CompletionLoss {
-    pub anomaly: CompletionAnomaly,
+    pub kind: CompletionAnomalyKind,
+    pub attach: AnomalyAttach,
     pub cleanup: CompletionCleanupGuard,
 }
 
-pub enum CompletionInput<Spec: slot::SlotSpec> {
+pub enum CompletionInput<Spec: SlotSpec> {
     User(UserCompletion<Spec>),
     Lost(CompletionLoss),
 }
 
-impl<Spec: slot::SlotSpec> CompletionInput<Spec> {
-    #[inline]
+impl<Spec: SlotSpec> CompletionInput<Spec> {
     pub fn cleanup_mut(&mut self) -> &mut CompletionCleanupGuard {
         match self {
             Self::User(completion) => &mut completion.cleanup,
@@ -36,17 +35,15 @@ impl<Spec: slot::SlotSpec> CompletionInput<Spec> {
         }
     }
 
-    #[inline]
-    pub fn anomaly(&self) -> Option<&CompletionAnomaly> {
+    pub fn lost_kind(&self) -> Option<(CompletionAnomalyKind, AnomalyAttach)> {
         match self {
             Self::User(_) => None,
-            Self::Lost(loss) => Some(&loss.anomaly),
+            Self::Lost(loss) => Some((loss.kind, loss.attach)),
         }
     }
 }
 
-impl<Spec: slot::SlotSpec> CompletionPacket<Spec> {
-    #[inline]
+impl<Spec: SlotSpec> CompletionPacket<Spec> {
     pub fn user_event(
         event: UserCompletionEvent,
         payload: Spec::UserPayload,
@@ -63,7 +60,6 @@ impl<Spec: slot::SlotSpec> CompletionPacket<Spec> {
         }
     }
 
-    #[inline]
     pub fn user(
         event: UserCompletionEvent,
         payload: Spec::UserPayload,
@@ -72,7 +68,6 @@ impl<Spec: slot::SlotSpec> CompletionPacket<Spec> {
         Self::user_event(event, payload, detail, CompletionCleanupGuard::default())
     }
 
-    #[inline]
     pub fn user_with_cleanup(
         event: UserCompletionEvent,
         payload: Spec::UserPayload,
@@ -82,45 +77,46 @@ impl<Spec: slot::SlotSpec> CompletionPacket<Spec> {
         Self::user_event(event, payload, detail, cleanup)
     }
 
-    #[inline]
     pub fn lost(
         event: UserCompletionEvent,
-        anomaly: CompletionAnomaly,
+        kind: CompletionAnomalyKind,
         cleanup: CompletionCleanupGuard,
     ) -> Self {
+        let attach = AnomalyAttach::from_raw_completion(event.raw());
         Self {
             event,
-            input: CompletionInput::Lost(CompletionLoss { anomaly, cleanup }),
+            input: CompletionInput::Lost(CompletionLoss {
+                kind,
+                attach,
+                cleanup,
+            }),
         }
     }
 
-    #[inline]
     pub const fn token(&self) -> OpToken {
         self.event.token()
     }
 
-    #[inline]
     pub const fn completion_event(&self) -> CompletionEvent {
         self.event.event()
     }
 }
 
-pub struct CompletionRecord<Spec: slot::SlotSpec> {
+pub struct CompletionRecord<Spec: SlotSpec> {
     pub event: UserCompletionEvent,
     pub payload: Spec::UserPayload,
     pub detail: Option<DriverResult<Spec::Completion, Spec::Error>>,
     pub cleanup: CompletionCleanupGuard,
 }
 
-impl<Spec: slot::SlotSpec> CompletionRecord<Spec> {
-    #[inline]
+impl<Spec: SlotSpec> CompletionRecord<Spec> {
     pub fn disarm_cleanup(&mut self) -> bool {
         self.cleanup.disarm()
     }
 }
 
 #[inline]
-pub(super) fn run_rejected_cleanup<Spec: slot::SlotSpec>(
+pub(super) fn run_rejected_cleanup<Spec: SlotSpec>(
     diagnostics: &DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
     mut packet: CompletionPacket<Spec>,
 ) {

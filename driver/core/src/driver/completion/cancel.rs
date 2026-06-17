@@ -1,10 +1,7 @@
 use crate::slot::{self, CheckedSlotView, SlotView};
 
-use super::routing::slot_view_anomaly;
-use super::{
-    CompletionAnomaly, CompletionAnomalyReason, CompletionBackend, CompletionToken, OpToken,
-    RawCompletion,
-};
+use super::routing::slot_view_kind;
+use super::{CompletionAnomalyKind, CompletionAnomalyReason, OpToken};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelMode {
@@ -19,17 +16,14 @@ pub struct CancelRequest {
 }
 
 impl CancelRequest {
-    #[inline]
     pub const fn new(target: OpToken, mode: CancelMode) -> Self {
         Self { target, mode }
     }
 
-    #[inline]
     pub const fn user_visible(target: OpToken) -> Self {
         Self::new(target, CancelMode::UserVisible)
     }
 
-    #[inline]
     pub const fn abandon(target: OpToken) -> Self {
         Self::new(target, CancelMode::Abandon)
     }
@@ -41,7 +35,7 @@ pub enum CancelSubmitOutcome {
     Queued,
     CompletedLocally,
     TargetGone { reason: CancelTargetGoneReason },
-    DiagnosticOnly { anomaly: CompletionAnomaly },
+    DiagnosticOnly { kind: CompletionAnomalyKind },
     NoBackendHandle,
 }
 
@@ -53,21 +47,18 @@ pub enum CancelTargetGoneReason {
 }
 
 impl CancelSubmitOutcome {
-    #[inline]
     pub const fn target_missing() -> Self {
         Self::TargetGone {
             reason: CancelTargetGoneReason::Missing,
         }
     }
 
-    #[inline]
     pub const fn target_stale() -> Self {
         Self::TargetGone {
             reason: CancelTargetGoneReason::Stale,
         }
     }
 
-    #[inline]
     pub const fn target_corrupt() -> Self {
         Self::TargetGone {
             reason: CancelTargetGoneReason::Corrupt,
@@ -76,33 +67,22 @@ impl CancelSubmitOutcome {
 }
 
 #[inline]
-pub fn cancel_target_anomaly<'a, Spec: slot::SlotSpec>(
-    backend: CompletionBackend,
+pub fn cancel_target_kind<'a, Spec: slot::SlotSpec>(
     token: OpToken,
-    raw_res: i32,
-    flags: u32,
     view: CheckedSlotView<'a, Spec>,
-) -> (CancelTargetGoneReason, CompletionAnomaly) {
-    let raw = RawCompletion::new(backend, CompletionToken::user(token), raw_res, flags);
-    let anomaly = match slot_view_anomaly(backend, token, raw, view) {
+) -> (CancelTargetGoneReason, CompletionAnomalyKind) {
+    let kind = match slot_view_kind(token, view) {
         Ok(slot) => {
             let snapshot = match slot {
                 SlotView::Reserved(slot) => slot.snapshot(),
                 SlotView::InFlightWaiting(slot) => slot.snapshot(),
                 SlotView::InFlightOrphaned(slot) => slot.snapshot(),
             };
-            CompletionAnomaly::backend_invariant_broken(
-                raw.token,
-                snapshot.index,
-                snapshot.generation,
-                snapshot.state,
-            )
-            .with_slot_snapshot(snapshot)
-            .with_raw_completion(raw)
+            CompletionAnomalyKind::backend_invariant_broken_snapshot(snapshot)
         }
-        Err(anomaly) => anomaly,
+        Err(kind) => kind,
     };
-    let reason = match anomaly.reason {
+    let reason = match kind.reason() {
         CompletionAnomalyReason::StaleGeneration => CancelTargetGoneReason::Stale,
         CompletionAnomalyReason::OpMissing
         | CompletionAnomalyReason::PayloadMissing
@@ -118,5 +98,5 @@ pub fn cancel_target_anomaly<'a, Spec: slot::SlotSpec>(
         | CompletionAnomalyReason::BackendContextUnknown
         | CompletionAnomalyReason::BackendSpecific(_) => CancelTargetGoneReason::Missing,
     };
-    (reason, anomaly)
+    (reason, kind)
 }

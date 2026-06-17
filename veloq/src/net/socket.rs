@@ -1,15 +1,17 @@
 use std::net::{SocketAddr, ToSocketAddrs};
 
-use crate::error::Result;
-use crate::net::error::NetError;
-use crate::runtime::context::RuntimeContext;
+use crate::{
+    error::Result,
+    net::{
+        common::InnerSocket,
+        error::NetError,
+        tcp::{GenericTcpListener, TcpListener, TcpStream},
+        udp::{GenericUdpSocket, UdpSocket},
+    },
+    runtime::context::Ctx,
+};
 use diagweave::prelude::*;
-use veloq_driver_native::Socket;
-use veloq_driver_native::op::DetachedSubmitter;
-
-use crate::net::common::InnerSocket;
-use crate::net::tcp::{GenericTcpListener, TcpListener, TcpStream};
-use crate::net::udp::{GenericUdpSocket, UdpSocket};
+use veloq_driver_native::{Socket, op::DetachedSubmitter};
 
 // ============================================================================
 // TcpSocket
@@ -83,11 +85,11 @@ impl TcpSocket {
     /// Listen for incoming connections.
     ///
     /// Consumes the `TcpSocket` and returns a `TcpListener`.
-    pub fn listen<'a, 'ctx>(
+    pub fn listen<'rt, 'reg>(
         self,
-        ctx: RuntimeContext<'a, 'ctx>,
+        ctx: Ctx<'rt, 'reg>,
         backlog: u32,
-    ) -> Result<TcpListener<'a, 'ctx>> {
+    ) -> Result<TcpListener<'rt, 'reg>> {
         let local_addr = self.inner.local_addr().trans()?;
         self.inner.listen(backlog as i32).trans()?;
         Ok(GenericTcpListener {
@@ -104,11 +106,11 @@ impl TcpSocket {
     /// Connect to the given address.
     ///
     /// Consumes the `TcpSocket` and returns a `TcpStream` future.
-    pub async fn connect<'a, 'ctx>(
+    pub async fn connect<'rt, 'reg>(
         self,
-        ctx: RuntimeContext<'a, 'ctx>,
+        ctx: Ctx<'rt, 'reg>,
         addr: SocketAddr,
-    ) -> Result<TcpStream<'a, 'ctx>> {
+    ) -> Result<TcpStream<'rt, 'reg>> {
         let inner = InnerSocket::new(ctx, self.inner.into_owned_raw().into_raw(), None)?;
         TcpStream::connect_from_inner(ctx, inner, addr).await
     }
@@ -166,11 +168,11 @@ impl UdpSocketBuilder {
     /// Bind the socket to the given address.
     ///
     /// Consumes the builder and returns a `UdpSocket`.
-    pub fn bind<'a, 'ctx, A: ToSocketAddrs>(
+    pub fn bind<'rt, 'reg, A: ToSocketAddrs>(
         self,
-        ctx: RuntimeContext<'a, 'ctx>,
+        ctx: Ctx<'rt, 'reg>,
         addr: A,
-    ) -> Result<UdpSocket<'a, 'ctx>> {
+    ) -> Result<UdpSocket<'rt, 'reg>> {
         let addr = addr
             .to_socket_addrs()
             .map_err(NetError::ToSocketAddrs)?

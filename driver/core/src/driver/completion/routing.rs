@@ -2,28 +2,26 @@ use crate::driver::registry::OpRegistry;
 use crate::slot::{self, CheckedSlotView, SlotRegistryExt, SlotView};
 
 use super::{
-    CompletionAnomaly, CompletionAnomalyReason, CompletionBackend, CompletionToken,
-    DriverCompletionDiagnostics, OpToken, RawCompletion, UserCompletionEvent,
+    AnomalyAttach, CompletionAnomalyKind, CompletionAnomalyReason, CompletionBackend,
+    CompletionToken, DriverCompletionDiagnostics, OpToken, RawCompletion, UserCompletionEvent,
 };
 
 pub enum RoutedSlotCompletion<'a, Spec: slot::SlotSpec> {
     Waiting(slot::Slot<'a, slot::InFlightWaiting, Spec>),
     Orphaned(slot::Slot<'a, slot::InFlightOrphaned, Spec>),
-    Missing(CompletionAnomaly),
-    Empty(CompletionAnomaly),
-    Stale(CompletionAnomaly),
-    Corrupt(CompletionAnomaly),
+    Missing(CompletionAnomalyKind),
+    Empty(CompletionAnomalyKind),
+    Stale(CompletionAnomalyKind),
+    Corrupt(CompletionAnomalyKind),
 }
 
 impl<'a, Spec: slot::SlotSpec> RoutedSlotCompletion<'a, Spec> {
-    #[inline]
-    pub fn anomaly(&self) -> Option<&CompletionAnomaly> {
+    pub fn kind(&self) -> Option<CompletionAnomalyKind> {
         match self {
             Self::Waiting(_) | Self::Orphaned(_) => None,
-            Self::Missing(anomaly)
-            | Self::Empty(anomaly)
-            | Self::Stale(anomaly)
-            | Self::Corrupt(anomaly) => Some(anomaly),
+            Self::Missing(kind) | Self::Empty(kind) | Self::Stale(kind) | Self::Corrupt(kind) => {
+                Some(*kind)
+            }
         }
     }
 }
@@ -31,7 +29,7 @@ impl<'a, Spec: slot::SlotSpec> RoutedSlotCompletion<'a, Spec> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinalizeOutcome {
     Finalized,
-    Missing(CompletionAnomaly),
+    Missing(CompletionAnomalyKind),
 }
 
 #[inline]
@@ -91,16 +89,10 @@ where
             raw_res,
             flags,
         );
-        let anomaly = CompletionAnomaly::finalize_failed(
-            raw.token,
-            snapshot.index,
-            snapshot.generation,
-            snapshot.state,
-        )
-        .with_slot_snapshot(snapshot)
-        .with_raw_completion(raw);
-        diagnostics.record_anomaly(&anomaly);
-        return FinalizeOutcome::Missing(anomaly);
+        let kind = CompletionAnomalyKind::finalize_failed_snapshot(snapshot);
+        let attach = AnomalyAttach::from_raw_completion(raw);
+        diagnostics.record_anomaly_kind(kind, attach);
+        return FinalizeOutcome::Missing(kind);
     };
 
     if registry.finalize_corrupt_slot(snapshot).is_some() {
@@ -123,26 +115,20 @@ where
     Spec: slot::SlotSpec,
 {
     let raw = RawCompletion::new(backend, CompletionToken::user(token), raw_res, flags);
-    let anomaly = match slot_view_anomaly(backend, token, raw, registry.checked_slot_view(token)) {
+    let attach = AnomalyAttach::from_raw_completion(raw);
+    let kind = match slot_view_kind(token, registry.checked_slot_view(token)) {
         Ok(slot) => {
             let snapshot = match slot {
                 SlotView::Reserved(slot) => slot.snapshot(),
                 SlotView::InFlightWaiting(slot) => slot.snapshot(),
                 SlotView::InFlightOrphaned(slot) => slot.snapshot(),
             };
-            CompletionAnomaly::finalize_failed(
-                raw.token,
-                snapshot.index,
-                snapshot.generation,
-                snapshot.state,
-            )
-            .with_slot_snapshot(snapshot)
-            .with_raw_completion(raw)
+            CompletionAnomalyKind::finalize_failed_snapshot(snapshot)
         }
-        Err(anomaly) => anomaly,
+        Err(kind) => kind,
     };
-    diagnostics.record_anomaly(&anomaly);
-    FinalizeOutcome::Missing(anomaly)
+    diagnostics.record_anomaly_kind(kind, attach);
+    FinalizeOutcome::Missing(kind)
 }
 
 #[inline]
@@ -151,79 +137,52 @@ pub(super) fn route_user_completion<'a, Spec: slot::SlotSpec>(
     view: CheckedSlotView<'a, Spec>,
 ) -> RoutedSlotCompletion<'a, Spec> {
     let token = event.token();
-    let raw = event.raw();
-    match slot_view_anomaly(raw.backend, token, raw, view) {
+    match slot_view_kind(token, view) {
         Ok(SlotView::InFlightWaiting(slot)) => RoutedSlotCompletion::Waiting(slot),
         Ok(SlotView::InFlightOrphaned(slot)) => RoutedSlotCompletion::Orphaned(slot),
         Ok(SlotView::Reserved(slot)) => {
             let snapshot = slot.snapshot();
-            RoutedSlotCompletion::Corrupt(
-                CompletionAnomaly::backend_invariant_broken(
-                    raw.token,
-                    snapshot.index,
-                    snapshot.generation,
-                    snapshot.state,
-                )
-                .with_slot_snapshot(snapshot)
-                .with_raw_completion(raw),
-            )
+            RoutedSlotCompletion::Corrupt(CompletionAnomalyKind::backend_invariant_broken_snapshot(
+                snapshot,
+            ))
         }
-        Err(anomaly) => match anomaly.reason {
-            CompletionAnomalyReason::UnknownSlot => RoutedSlotCompletion::Missing(anomaly),
-            CompletionAnomalyReason::NonActiveSlot => RoutedSlotCompletion::Empty(anomaly),
-            CompletionAnomalyReason::StaleGeneration => RoutedSlotCompletion::Stale(anomaly),
-            _ => RoutedSlotCompletion::Corrupt(anomaly),
+        Err(kind) => match kind.reason() {
+            CompletionAnomalyReason::UnknownSlot => RoutedSlotCompletion::Missing(kind),
+            CompletionAnomalyReason::NonActiveSlot => RoutedSlotCompletion::Empty(kind),
+            CompletionAnomalyReason::StaleGeneration => RoutedSlotCompletion::Stale(kind),
+            _ => RoutedSlotCompletion::Corrupt(kind),
         },
     }
 }
 
 #[inline]
-pub(super) fn slot_view_anomaly<'a, Spec: slot::SlotSpec>(
-    backend: CompletionBackend,
+pub(super) fn slot_view_kind<'a, Spec: slot::SlotSpec>(
     token: OpToken,
-    raw: RawCompletion,
     view: CheckedSlotView<'a, Spec>,
-) -> Result<SlotView<'a, Spec>, CompletionAnomaly> {
-    let raw = RawCompletion::new(backend, raw.token, raw.res, raw.flags);
+) -> Result<SlotView<'a, Spec>, CompletionAnomalyKind> {
     let (index, expected_generation) = token.parts();
     match view {
         CheckedSlotView::Valid(slot) => Ok(slot),
-        CheckedSlotView::Missing { .. } => {
-            Err(
-                CompletionAnomaly::unknown_slot(raw.token, index, expected_generation)
-                    .with_raw_completion(raw),
-            )
-        }
-        CheckedSlotView::Empty(snapshot) => Err(CompletionAnomaly::non_active(
-            raw.token,
+        CheckedSlotView::Missing { .. } => Err(CompletionAnomalyKind::unknown_slot(
+            index,
+            expected_generation,
+        )),
+        CheckedSlotView::Empty(snapshot) => Err(CompletionAnomalyKind::non_active(
             snapshot.index,
             expected_generation,
             snapshot.state,
-        )
-        .with_slot_snapshot(snapshot)
-        .with_raw_completion(raw)),
-        CheckedSlotView::Stale(snapshot) => Err(CompletionAnomaly::stale(
-            raw.token,
+        )),
+        CheckedSlotView::Stale(snapshot) => Err(CompletionAnomalyKind::stale(
             snapshot.index,
             expected_generation,
             snapshot.generation,
             snapshot.state,
-        )
-        .with_slot_snapshot(snapshot)
-        .with_raw_completion(raw)),
-        CheckedSlotView::Corrupt(snapshot) => Err(corrupt_slot_anomaly(raw.token, snapshot)
-            .with_slot_snapshot(snapshot)
-            .with_raw_completion(raw)),
+        )),
+        CheckedSlotView::Corrupt(snapshot) => Err(corrupt_slot_kind(snapshot)),
     }
 }
 
 #[inline]
-fn corrupt_slot_anomaly(token: CompletionToken, snapshot: slot::SlotSnapshot) -> CompletionAnomaly {
-    if !snapshot.has_op {
-        CompletionAnomaly::op_missing(token, snapshot.index, snapshot.generation)
-    } else if !snapshot.has_payload {
-        CompletionAnomaly::payload_missing(token, snapshot.index, snapshot.generation)
-    } else {
-        CompletionAnomaly::corrupt(token, snapshot.index, snapshot.generation, snapshot.state)
-    }
+fn corrupt_slot_kind(snapshot: slot::SlotSnapshot) -> CompletionAnomalyKind {
+    CompletionAnomalyKind::corrupt_snapshot(snapshot)
 }

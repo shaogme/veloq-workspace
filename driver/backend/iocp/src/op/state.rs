@@ -1,21 +1,24 @@
-use crate::IocpHandle;
-use crate::diagnostics::IocpCompletionDiagnostics;
-use crate::error::{IocpError, IocpResult};
-use crate::rio::SocketInflightToken;
-use crate::win32::{IoCompletionPort, Overlapped};
-use std::io;
-use std::ptr::NonNull;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::Instant;
-use veloq_driver_core::driver::registry::OpRegistry as CoreOpRegistry;
-use veloq_driver_core::driver::{CompletionToken, OpToken};
-use veloq_driver_core::slot::{Slot as CoreSlot, SlotSpec as CoreSlotSpec};
+use crate::{
+    IocpHandle,
+    config::RawHandle,
+    diagnostics::IocpCompletionDiagnostics,
+    error::{IocpError, IocpResult},
+    op::{IocpOp, IocpUserPayload},
+    rio::SocketInflightToken,
+    win32::{IoCompletionPort, Overlapped},
+};
+use std::{
+    ptr::NonNull,
+    sync::{Arc, atomic::Ordering},
+    time::Instant,
+};
+use veloq_driver_core::{
+    driver::{CompletionToken, OpToken, registry::OpRegistry as CoreOpRegistry},
+    slot::{Slot as CoreSlot, SlotSpec as CoreSlotSpec},
+};
 use veloq_storage::{AtomicOptionPtr, StateOptionPtr};
 
-use crate::op::{IocpOp, IocpUserPayload};
-
-pub(crate) type BlockingSuccessCleanup = fn(usize);
+pub(crate) type BlockingSuccessCleanup = fn(IocpHandle);
 
 pub(crate) struct BlockingCompletion {
     port: Arc<IoCompletionPort>,
@@ -38,10 +41,7 @@ impl BlockingCompletion {
         })
     }
 
-    pub(crate) fn store_result(&self, result: io::Result<usize>) {
-        let result = result.map_err(|e| {
-            IocpError::Win32.io_report("iocp.driver.inner.blocking_completion.store", e)
-        });
+    pub(crate) fn store_result(&self, result: IocpResult<usize>) {
         let raw = Box::into_raw(Box::new(result));
         let non_null = NonNull::new(raw);
         let old = self.result.swap(non_null, Ordering::Release);
@@ -52,7 +52,7 @@ impl BlockingCompletion {
         }
     }
 
-    pub(crate) fn complete(&self, result: io::Result<usize>) {
+    pub(crate) fn complete(&self, result: IocpResult<usize>) {
         self.store_result(result);
         if let Err(report) = self.port.notify(self.completion_token) {
             tracing::error!(
@@ -77,7 +77,7 @@ impl Drop for BlockingCompletion {
             if let Some(cleanup_success) = self.cleanup_success
                 && let Ok(value) = result
             {
-                cleanup_success(value);
+                cleanup_success(IocpHandle::for_file(value as _));
             }
         }
     }
@@ -95,7 +95,7 @@ pub struct OverlappedEntry {
     /// Result of an offloaded blocking operation.
     pub(crate) blocking_completion: Option<Arc<BlockingCompletion>>,
     /// Resolved handle captured during submission to avoid re-resolving Fixed fd on hot paths.
-    pub(crate) resolved_handle: Option<IocpHandle>,
+    pub(crate) resolved_handle: Option<RawHandle>,
     /// Socket inflight ownership acquired before a kernel-pending socket submit.
     pub(crate) socket_inflight: Option<SocketInflightToken>,
 }

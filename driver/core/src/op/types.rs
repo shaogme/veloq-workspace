@@ -214,38 +214,32 @@ pub enum UdpRecvPacketBuf {
 }
 
 impl UdpRecvPacketBuf {
-    #[inline]
     pub fn from_fixed_buf(buf: FixedBuf) -> Self {
         Self::Owned(buf)
     }
 
-    #[inline]
     pub fn as_slice(&self) -> &[u8] {
         match self {
             Self::Owned(buf) => buf.as_slice(),
         }
     }
 
-    #[inline]
     pub fn len(&self) -> usize {
         match self {
             Self::Owned(buf) => buf.len(),
         }
     }
 
-    #[inline]
     pub fn capacity(&self) -> usize {
         match self {
             Self::Owned(buf) => buf.capacity(),
         }
     }
 
-    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    #[inline]
     pub fn into_fixed_buf(self) -> Option<FixedBuf> {
         match self {
             Self::Owned(buf) => Some(buf),

@@ -1,22 +1,31 @@
-use std::time::{Duration, Instant};
+use std::{
+    sync::mpsc,
+    time::{Duration, Instant},
+};
 
 use diagweave::prelude::*;
 use tracing::debug;
 use veloq_buf::BufferRegistrar;
-use veloq_driver_core::driver::{CancelRequest, SharedCompletionTable};
-use veloq_driver_core::slot::{CheckedSlotView, SlotRegistryExt, SlotView};
+use veloq_driver_core::{
+    driver::{CancelRequest, SharedCompletionTable},
+    slot::{CheckedSlotView, SlotRegistryExt, SlotView},
+};
+use windows_sys::Win32::Networking::WinSock::{WSACleanup, WSADATA, WSAGetLastError, WSAStartup};
 
-use crate::config::{BorrowedRawHandle, BufferRegistrationMode, IocpConfig, IocpHandle};
-use crate::error::{IocpError, IocpResult};
-use crate::ext::Extensions;
-use crate::op::IocpSlotSpec;
-use crate::rio::RioState;
+use crate::{
+    config::{BorrowedRawHandle, BufferRegistrationMode, IocpConfig, IocpHandle, RawHandle},
+    error::{IocpError, IocpResult},
+    ext::Extensions,
+    op::IocpSlotSpec,
+    rio::RioState,
+    win32::IoCompletionPort,
+};
 
-use super::polling::{CompletionPump, TimerEngine};
-use super::registration::HandleRegistry;
 use super::{
     CloseMode, IocpDriver, IocpDriverCompletionDiagnostics, IocpDriverResult, IocpOpRegistry,
     PreInit,
+    polling::{CompletionPump, TimerEngine},
+    registration::HandleRegistry,
 };
 
 #[derive(Clone, Copy, Default)]
@@ -34,7 +43,7 @@ enum ShutdownOpKind {
 
 pub(super) struct IocpRioRuntime<'a> {
     state: RioState,
-    registrar: Box<dyn BufferRegistrar + 'a>,
+    registrar: &'a (dyn BufferRegistrar + 'a),
 }
 
 /// Owns one successful Winsock startup for an IOCP driver.
@@ -50,7 +59,7 @@ impl<'a> IocpRioRuntime<'a> {
         entries: u32,
         ext: &Extensions,
         registration_mode: BufferRegistrationMode,
-        registrar: Box<dyn BufferRegistrar + 'a>,
+        registrar: &'a (dyn BufferRegistrar + 'a),
         diagnostics: IocpDriverCompletionDiagnostics,
     ) -> IocpResult<Self> {
         let state = RioState::new(port, entries, ext, registration_mode, diagnostics)
@@ -72,20 +81,20 @@ impl<'a> IocpRioRuntime<'a> {
     pub(super) fn state_and_registrar_mut(
         &mut self,
     ) -> (&mut RioState, &(dyn BufferRegistrar + 'a)) {
-        (&mut self.state, self.registrar.as_ref())
+        (&mut self.state, self.registrar)
     }
 }
 
 impl<'a> IocpDriver<'a> {
     /// Creates a pre-initialization completion port handle.
     pub(crate) fn create_pre_init() -> IocpResult<PreInit> {
-        crate::win32::IoCompletionPort::new(0).attach_note("failed to create pre-init IOCP")
+        IoCompletionPort::new(0).attach_note("failed to create pre-init IOCP")
     }
 
     /// Creates a new IOCP driver instance.
     pub fn new(
         config: impl AsRef<IocpConfig>,
-        registrar: Box<dyn BufferRegistrar + 'a>,
+        registrar: &'a (dyn BufferRegistrar + 'a),
     ) -> IocpResult<Self> {
         let cfg = config.as_ref();
         let pre = Self::create_pre_init()?;
@@ -97,20 +106,20 @@ impl<'a> IocpDriver<'a> {
         entries: u32,
         port_val: PreInit,
         registration_mode: BufferRegistrationMode,
-        registrar: Box<dyn BufferRegistrar + 'a>,
+        registrar: &'a (dyn BufferRegistrar + 'a),
     ) -> IocpResult<Self> {
         let winsock = Self::start_winsock()?;
 
         let port_handle = port_val.as_raw();
         debug!(port = ?port_handle, "Initializing IocpDriver");
-        let extensions = crate::ext::Extensions::new()
+        let extensions = Extensions::new()
             .with_ctx("port_raw", port_handle as usize)
             .attach_note("failed to load IOCP extensions")?;
         let ops = IocpOpRegistry::new(entries as usize);
         let completion_table: SharedCompletionTable<IocpSlotSpec> = ops.shared.clone();
         let completion_diagnostics = ops.shared.completion_diagnostics();
         let rio = IocpRioRuntime::new(
-            crate::config::RawHandle::new(IocpHandle::for_file(port_handle)).borrow(),
+            RawHandle::new(IocpHandle::for_file(port_handle)).borrow(),
             entries,
             &extensions,
             registration_mode,
@@ -118,7 +127,7 @@ impl<'a> IocpDriver<'a> {
             completion_diagnostics.clone(),
         )
         .attach_note("failed to initialize RIO runtime")?;
-        let (remote_cancel_sender, remote_cancel_receiver) = std::sync::mpsc::channel();
+        let (remote_cancel_sender, remote_cancel_receiver) = mpsc::channel();
         Ok(Self {
             completion: CompletionPump::new(port_val, completion_table),
             ops,
@@ -136,8 +145,6 @@ impl<'a> IocpDriver<'a> {
     }
 
     fn start_winsock() -> IocpResult<WinsockGuard> {
-        use windows_sys::Win32::Networking::WinSock::{WSADATA, WSAStartup};
-
         // SAFETY: WSAStartup is required before Windows socket APIs are used.
         let ret = unsafe {
             let mut data: WSADATA = std::mem::zeroed();
@@ -206,15 +213,12 @@ impl<'a> IocpDriver<'a> {
         pending
     }
 
-    pub(super) fn drain_pending_iocp(
+    pub(super) fn drain_pending_all(
         &mut self,
-        pending_count: usize,
+        pending_iocp_count: usize,
         timeout: Duration,
     ) -> IocpDriverResult<()> {
-        if pending_count == 0 {
-            return Ok(());
-        }
-        let mut drained = 0usize;
+        let mut drained_iocp = 0usize;
         let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
             IocpError::CompletionWait
                 .to_report()
@@ -222,15 +226,15 @@ impl<'a> IocpDriver<'a> {
                 .attach_note("strict close timeout is too large")
         })?;
 
-        while drained < pending_count {
+        while drained_iocp < pending_iocp_count || self.rio.state().outstanding_count > 0 {
             let now = Instant::now();
             if now >= deadline {
-                return Err(IocpError::CompletionWait.report("iocp/driver", "drain timed out"));
+                return Err(
+                    IocpError::CompletionWait.report("iocp/driver", "strict close drain timed out")
+                );
             }
-            let progress = self.poll_completion(deadline.saturating_duration_since(now))?;
-            let _ = progress.semantic_count();
-            drained += progress.iocp;
-            let _rio_progress = progress.rio;
+            let count = self.poll_completion(deadline.saturating_duration_since(now))?;
+            drained_iocp += count;
         }
         Ok(())
     }
@@ -284,25 +288,9 @@ impl<'a> IocpDriver<'a> {
         }
         let pending = self.shutdown_ops();
         if let CloseMode::Strict { timeout } = mode {
-            self.drain_pending_iocp(pending.iocp_pending, timeout)
+            self.drain_pending_all(pending.iocp_pending, timeout)
                 .push_ctx("scope", "iocp/driver")
-                .attach_note("drain pending iocp timed out")?;
-            {
-                let completion_table = self.completion.table();
-                let (rio_state, registrar) = self.rio.state_and_registrar_mut();
-                rio_state
-                    .drain_outstanding_with_ops(
-                        timeout,
-                        &mut self.ops,
-                        &self.extensions,
-                        registrar,
-                        completion_table,
-                        &mut self.completion_diagnostics,
-                    )
-                    .push_ctx("scope", "iocp/driver")
-                    .attach_note("failed to drain RIO outstanding requests")
-                    .trans()?;
-            }
+                .attach_note("strict close drain pending requests timed out")?;
             self.drain_deferred_socket_cleanup();
             self.rio.state_mut().forget_runtime_after_drain();
             self.rio.state_mut().kernel.close();
@@ -325,8 +313,6 @@ impl Drop for IocpDriver<'_> {
 
 impl Drop for WinsockGuard {
     fn drop(&mut self) {
-        use windows_sys::Win32::Networking::WinSock::{WSACleanup, WSAGetLastError};
-
         // SAFETY: This guard is only constructed after a successful WSAStartup.
         let ret = unsafe { WSACleanup() };
         if ret != 0 {

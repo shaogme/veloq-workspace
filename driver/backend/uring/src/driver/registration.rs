@@ -1,9 +1,14 @@
-use crate::driver::UringDriver;
-use crate::error::{UringError, UringResult};
+use crate::{
+    config::{IoFd, OwnedRawHandle, RawHandle, RawHandleKind, UringRawHandle},
+    driver::UringDriver,
+    error::{UringError, UringResult},
+};
 use diagweave::prelude::*;
-use std::time::{Duration, Instant};
-
-use crate::config::{IoFd, OwnedRawHandle, RawHandle, RawHandleKind, UringRawHandle};
+use std::{
+    mem::ManuallyDrop,
+    time::{Duration, Instant},
+};
+use veloq_buf::heap::ChunkId;
 use veloq_driver_core::driver::RegisterFd;
 
 pub(crate) const MAX_CHUNKS: usize = 1024;
@@ -115,7 +120,7 @@ impl<'a> UringDriver<'a> {
 
     pub(crate) fn register_chunk_internal(
         &mut self,
-        id: veloq_buf::heap::ChunkId,
+        id: ChunkId,
         ptr: *const u8,
         len: usize,
     ) -> UringResult<()> {
@@ -262,7 +267,7 @@ impl<'a> UringDriver<'a> {
         }
         self.free_file_slots.push(idx);
         Self::advance_file_generation(&mut self.file_slots[index].generation);
-        let _ = std::mem::ManuallyDrop::new(entry);
+        let _ = ManuallyDrop::new(entry);
         Ok(())
     }
 

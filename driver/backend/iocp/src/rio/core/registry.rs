@@ -18,21 +18,30 @@ pub(crate) use buffer::{
     RioHeapBufferKey,
 };
 
-use crate::IoFd;
-use crate::config::BorrowedRawHandle;
-use crate::net::addr::SockAddrStorage;
-use crate::rio::RioEnv;
-use crate::rio::error::{RioError, RioResult};
+use crate::{
+    IoFd,
+    config::BorrowedRawHandle,
+    net::addr::SockAddrStorage,
+    rio::{
+        RioEnv,
+        error::{RioError, RioResult},
+    },
+};
 use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
-use std::time::{Duration, Instant};
-use veloq_buf::FixedBuf;
+use std::{
+    collections::HashSet,
+    mem::replace,
+    ptr,
+    time::{Duration, Instant},
+};
+use veloq_buf::{FixedBuf, heap::ChunkId};
 use windows_sys::Win32::Networking::WinSock::RIO_BUF;
 
-use super::submit_ops::{RioBufferId, RioProvider, RioRq, RioRqConfig};
 use super::{
     RioCompletedRequestContext, RioCompletionKind, RioOpRequestInit, RioPreparedRequestContext,
     RioRequestContextDecode, RioRequestContextId,
+    submit_ops::{RioBufferId, RioProvider, RioRq, RioRqConfig},
 };
 
 pub(crate) const REGISTER_FAILURE_RETRY_COOLDOWN: Duration = Duration::from_millis(250);
@@ -69,7 +78,7 @@ pub(crate) struct RioRegistry {
     pub(crate) pending_deregistrations: Vec<RioBufferId>,
     pub(crate) rq_depth: u32,
     pub(crate) registration_stats: RioRegistrationStats,
-    pub(crate) chunk_register_failures_recent: FxHashMap<veloq_buf::heap::ChunkId, Instant>,
+    pub(crate) chunk_register_failures_recent: FxHashMap<ChunkId, Instant>,
     pub(crate) heap_register_failures_recent: FxHashMap<RioHeapBufferKey, Instant>,
     pub(crate) next_registration_generation: u64,
     request_contexts: Vec<RioRequestContextSlot>,
@@ -320,7 +329,7 @@ impl RioRegistry {
                 max_send_data_buffers: 1,
                 recv_cq: env.cq,
                 send_cq: env.cq,
-                context: std::ptr::null(),
+                context: ptr::null(),
             })
             .with_ctx("fd_fixed_index", fd.fixed_index())
             .with_ctx("fd_generation", fd.generation())
@@ -343,7 +352,6 @@ impl RioRegistry {
     }
 
     pub(crate) fn cleanup_deregister(&mut self, env: RioEnv<'_>) {
-        use std::collections::HashSet;
         let mut deregistered = HashSet::new();
 
         for id in self
@@ -369,7 +377,7 @@ impl RioRegistry {
                 env.dispatch.deregister_buffer(id);
             }
         }
-        let addr_buffer_id = std::mem::replace(&mut self.addr_buffer_id, RioBufferId::INVALID);
+        let addr_buffer_id = replace(&mut self.addr_buffer_id, RioBufferId::INVALID);
         if !addr_buffer_id.is_invalid() && deregistered.insert(addr_buffer_id.0 as usize) {
             env.dispatch.deregister_buffer(addr_buffer_id);
         }
@@ -390,12 +398,20 @@ impl RioRegistry {
 
 #[cfg(test)]
 pub(crate) mod test_helpers {
-    use super::super::submit_ops::{RioCq, RioDispatch};
-    use super::*;
+    use super::{
+        super::submit_ops::{RioCq, RioDispatch},
+        *,
+    };
     use crate::BufferRegistrationMode;
-    use std::num::NonZeroUsize;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::{
+        ffi::c_void,
+        num::NonZeroUsize,
+        sync::{
+            Mutex, MutexGuard,
+            atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
+        },
+    };
+    use veloq_buf::NoopRegistrar;
     use windows_sys::Win32::Networking::WinSock::{
         RIO_BUFFERID, RIO_CQ, RIO_NOTIFICATION_COMPLETION, RIO_RQ, RIORESULT,
     };
@@ -413,12 +429,12 @@ pub(crate) mod test_helpers {
     }
 
     pub(crate) fn reset_dispatch_state() {
-        NEXT_REGISTER_ID.store(100, Ordering::SeqCst);
-        REGISTER_FAILS.store(false, Ordering::SeqCst);
+        NEXT_REGISTER_ID.store(100, SeqCst);
+        REGISTER_FAILS.store(false, SeqCst);
         DEREGISTERED_IDS.lock().expect("deregister mutex").clear();
     }
 
-    pub(crate) fn lock_dispatch_state() -> std::sync::MutexGuard<'static, ()> {
+    pub(crate) fn lock_dispatch_state() -> MutexGuard<'static, ()> {
         DISPATCH_TEST_LOCK.lock().expect("dispatch test mutex")
     }
 
@@ -441,7 +457,7 @@ pub(crate) mod test_helpers {
         _max_send_data_buffers: u32,
         _recv_cq: RIO_CQ,
         _send_cq: RIO_CQ,
-        _context: *const std::ffi::c_void,
+        _context: *const c_void,
     ) -> RIO_RQ {
         1 as _
     }
@@ -450,10 +466,10 @@ pub(crate) mod test_helpers {
         _ptr: *const u8,
         _len: u32,
     ) -> RIO_BUFFERID {
-        if REGISTER_FAILS.swap(false, Ordering::SeqCst) {
+        if REGISTER_FAILS.swap(false, SeqCst) {
             return 0 as _;
         }
-        NEXT_REGISTER_ID.fetch_add(1, Ordering::SeqCst) as _
+        NEXT_REGISTER_ID.fetch_add(1, SeqCst) as _
     }
 
     pub(crate) unsafe extern "system" fn test_deregister_buffer(id: RIO_BUFFERID) {
@@ -482,7 +498,7 @@ pub(crate) mod test_helpers {
         _buf: *const RIO_BUF,
         _num_bufs: u32,
         _flags: u32,
-        _context: *const std::ffi::c_void,
+        _context: *const c_void,
     ) -> i32 {
         0
     }
@@ -492,7 +508,7 @@ pub(crate) mod test_helpers {
         _buf: *const RIO_BUF,
         _num_bufs: u32,
         _flags: u32,
-        _context: *const std::ffi::c_void,
+        _context: *const c_void,
     ) -> i32 {
         0
     }
@@ -506,7 +522,7 @@ pub(crate) mod test_helpers {
         _control_buf: *const RIO_BUF,
         _flags_buf: *const RIO_BUF,
         _flags: u32,
-        _context: *const std::ffi::c_void,
+        _context: *const c_void,
     ) -> i32 {
         0
     }
@@ -520,7 +536,7 @@ pub(crate) mod test_helpers {
         _control_buf: *const RIO_BUF,
         _flags_buf: *const RIO_BUF,
         _flags: u32,
-        _context: *const std::ffi::c_void,
+        _context: *const c_void,
     ) -> i32 {
         0
     }
@@ -543,7 +559,7 @@ pub(crate) mod test_helpers {
 
     pub(crate) fn test_env(dispatch: &RioDispatch) -> RioEnv<'_> {
         RioEnv {
-            registrar: &veloq_buf::NoopRegistrar,
+            registrar: &NoopRegistrar,
             dispatch,
             cq: RioCq::INVALID,
             registration_mode: BufferRegistrationMode::Strict,
@@ -553,8 +569,7 @@ pub(crate) mod test_helpers {
 
 #[cfg(test)]
 mod tests {
-    use super::test_helpers::fixed_buf;
-    use super::*;
+    use super::{test_helpers::fixed_buf, *};
 
     #[test]
     fn rio_submission_len_allows_exact_boundaries() {

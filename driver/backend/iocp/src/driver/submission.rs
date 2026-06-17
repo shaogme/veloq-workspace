@@ -1,31 +1,41 @@
-use std::sync::Arc;
-use std::task::Poll;
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    task::Poll,
+    time::{Duration, Instant},
+};
 
+use super::completion::COMP_BACKEND_IOCP;
 use diagweave::prelude::*;
-use veloq_blocking::BlockingTask;
-use veloq_driver_core::driver::{
-    CompletionAnomaly, CompletionBackendHooks, CompletionControl, CompletionFlowExt,
-    CompletionHookOutcome, CompletionIngress, CompletionSource, CompletionToken,
-    DriverSubmitResult, OpToken, SharedCompletionTable, SubmitStatus, SyntheticCompletionSource,
-    UserCompletionEvent,
-};
-use veloq_driver_core::slot::{
-    CheckedSlotView, InFlightOrphaned, InFlightWaiting, Reserved, SlotAccessError, SlotRegistryExt,
-    SlotView,
+use veloq_blocking::{BlockingTask, get_blocking_pool};
+use veloq_driver_core::{
+    driver::{
+        CompletionAnomalyKind, CompletionBackendHooks, CompletionControl, CompletionFlowExt,
+        CompletionHookOutcome, CompletionIngress, CompletionSource, CompletionToken,
+        DriverSubmitResult, OpToken, SharedCompletionTable, SubmitStatus,
+        SyntheticCompletionSource, UserCompletionEvent,
+    },
+    slot::{
+        CheckedSlotView, InFlightOrphaned, InFlightWaiting, Reserved, SlotAccessError,
+        SlotRegistryExt, SlotView,
+    },
 };
 
-use crate::config::IoFd;
-use crate::driver::{
-    IocpDriver, IocpDriverCompletionDiagnostics, IocpDriverResult, IocpOpRegistry,
-};
-use crate::error::{IocpError, IocpResult, iocp_fallback_event_res};
-use crate::op::{
-    BlockingCompletion, IocpOp, IocpOpPayload, IocpSlotSpec, Slot, SubmissionResult, SubmitContext,
+use crate::{
+    config::{IoFd, RawHandle},
+    driver::{
+        IocpDriver, IocpDriverCompletionDiagnostics, IocpDriverResult, IocpOpRegistry,
+        registration::close_registered_owned_fd,
+    },
+    error::{IocpError, IocpResult, iocp_fallback_event_res},
+    op::{
+        BlockingCompletion, IocpOp, IocpOpPayload, IocpSlotSpec, Slot, SubmissionResult,
+        SubmitContext,
+    },
+    win32::{IoCompletionPort, Overlapped},
 };
 
 pub(crate) struct SubmitContextInternal<'a> {
-    port: Arc<crate::win32::IoCompletionPort>,
+    port: Arc<IoCompletionPort>,
     wheel: &'a mut veloq_wheel::Wheel<OpToken>,
     completion_table: &'a SharedCompletionTable<IocpSlotSpec>,
     diagnostics: &'a mut IocpDriverCompletionDiagnostics,
@@ -33,7 +43,7 @@ pub(crate) struct SubmitContextInternal<'a> {
 
 impl<'a> SubmitContextInternal<'a> {
     pub(crate) fn new(
-        port: Arc<crate::win32::IoCompletionPort>,
+        port: Arc<IoCompletionPort>,
         wheel: &'a mut veloq_wheel::Wheel<OpToken>,
         completion_table: &'a SharedCompletionTable<IocpSlotSpec>,
         diagnostics: &'a mut IocpDriverCompletionDiagnostics,
@@ -51,7 +61,7 @@ struct BlockingBridge;
 
 impl BlockingBridge {
     fn submit(task: BlockingTask) -> bool {
-        veloq_blocking::get_blocking_pool().execute(task).is_ok()
+        get_blocking_pool().execute(task).is_ok()
     }
 }
 
@@ -66,8 +76,8 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
     fn handle_control(
         &mut self,
         _control: CompletionControl,
-    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
-        CompletionHookOutcome::Ignore { effect: () }
+    ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
+        Ok(CompletionHookOutcome::Ignore { effect: () })
     }
 
     fn complete_waiting(
@@ -75,7 +85,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
         event: UserCompletionEvent,
         slot: Slot<'_, InFlightWaiting>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
+    ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         let event_res = event.res();
         let snapshot = slot.snapshot();
         let mut guard = slot.complete();
@@ -92,27 +102,23 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
             .unwrap_or_default();
         let _ = guard.take_op();
         let (payload, detail) = guard.take_completion_data();
-        let Some(payload) = payload else {
-            drop(detail);
-            return CompletionHookOutcome::Lost {
+        Ok(if let Some(payload) = payload {
+            CompletionHookOutcome::User {
                 event,
-                loss_reason: CompletionAnomaly::corrupt_slot_snapshot(
-                    event.completion_token(),
-                    snapshot,
-                )
-                .with_raw_completion(event.raw()),
-                snapshot,
+                payload,
+                detail,
                 cleanup,
                 effect: (),
-            };
-        };
-        CompletionHookOutcome::User {
-            event,
-            payload,
-            detail,
-            cleanup,
-            effect: (),
-        }
+            }
+        } else {
+            drop(detail);
+            CompletionHookOutcome::Lost {
+                event,
+                loss_kind: CompletionAnomalyKind::corrupt_snapshot(snapshot),
+                cleanup,
+                effect: (),
+            }
+        })
     }
 
     fn complete_orphaned(
@@ -120,20 +126,22 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
         _event: UserCompletionEvent,
         slot: Slot<'_, InFlightOrphaned>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
+    ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         let mut guard = slot.complete();
         let cleanup = guard
             .with_op_mut(|op| op.orphan_cleanup(&Err(IocpError::Submission.to_report())))
             .unwrap_or_default();
         let _ = guard.take_op();
         let _ = guard.take_completion_data();
-        CompletionHookOutcome::Cleanup {
+        Ok(CompletionHookOutcome::Cleanup {
             cleanup,
             effect: (),
-        }
+        })
     }
 
-    fn finish_backend_effect(&mut self, _effect: Self::BackendEffect) {}
+    fn finish_backend_effect(&mut self, _effect: Self::BackendEffect) -> IocpResult<()> {
+        Ok(())
+    }
 }
 
 fn close_fd_from_op(op: &mut IocpOp) -> IocpResult<Option<IoFd>> {
@@ -205,12 +213,7 @@ impl<'a> IocpDriver<'a> {
         if !BlockingBridge::submit(task) {
             let report = IocpError::Submission.report("iocp/driver", "thread pool overloaded");
             let event_res = iocp_fallback_event_res(IocpError::Submission);
-            let event = UserCompletionEvent::from_parts(
-                super::completion::COMP_BACKEND_IOCP,
-                token,
-                event_res,
-                0,
-            );
+            let event = UserCompletionEvent::from_parts(COMP_BACKEND_IOCP, token, event_res, 0);
             let mut hooks = SubmissionFailureHooks {
                 report: Some(report),
             };
@@ -222,7 +225,7 @@ impl<'a> IocpDriver<'a> {
                     event,
                     source: SyntheticCompletionSource::SubmissionFailure,
                 },
-            );
+            )?;
             return Err(IocpError::Submission.report("iocp/driver", "thread pool overloaded"));
         }
         Ok(Poll::Pending)
@@ -325,8 +328,7 @@ impl<'a> IocpDriver<'a> {
             .push_ctx("scope", "iocp/driver")
             .attach_note("failed to prepare op slot")?;
 
-        let overlapped =
-            guard.with_sidecar_mut(|sidecar| &mut sidecar.inner as *mut crate::win32::Overlapped);
+        let overlapped = guard.with_sidecar_mut(|sidecar| &mut sidecar.inner as *mut Overlapped);
 
         let mut sub_guard = guard
             .start_submission_with(Some(|slot| {
@@ -341,11 +343,8 @@ impl<'a> IocpDriver<'a> {
         };
 
         let result = if let Some(fd) = close_fd {
-            let close_result = super::registration::close_registered_owned_fd(
-                &mut self.handles,
-                self.rio.state_mut(),
-                fd,
-            );
+            let close_result =
+                close_registered_owned_fd(&mut self.handles, self.rio.state_mut(), fd);
 
             close_result.and_then(|(raw_handle, io_result)| {
                 let completion = BlockingCompletion::new(
@@ -360,7 +359,7 @@ impl<'a> IocpDriver<'a> {
                         .report("iocp/driver", "submission guard slot missing during Close")
                 })?;
                 slot.with_op_mut(|op| {
-                    op.header.resolved_handle = Some(raw_handle);
+                    op.header.resolved_handle = Some(RawHandle::new(raw_handle));
                     op.header.blocking_completion = Some(completion);
                 })
                 .map_err(|err| slot_access_report("iocp.driver.call_op_submit.close_op", err))?;

@@ -66,13 +66,6 @@ impl MemoryChunk {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-
-    /// Obtain the raw parts
-    pub fn into_raw_parts(self) -> (NonNull<u8>, NonZeroUsize) {
-        let parts = (self.ptr, self.size);
-        std::mem::forget(self);
-        parts
-    }
 }
 
 impl Drop for MemoryChunk {

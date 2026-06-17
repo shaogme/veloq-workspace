@@ -1,11 +1,19 @@
-use std::path::Path;
-
-use crate::error::Result;
-use crate::fs::error::FsError;
-use crate::runtime::context::RuntimeContext;
+use super::file::{File, LocalFile};
+use crate::{error::Result, fs::error::FsError, runtime::context::Ctx};
 use diagweave::prelude::*;
-use veloq_driver_native::driver::{Driver, RegisterFd};
-use veloq_driver_native::op::Open;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+use std::{cell::Cell, num::NonZeroUsize, path::Path, sync::atomic::AtomicU64};
+
+use veloq_driver_native::{
+    OwnedRawHandle,
+    driver::{Driver, RegisterFd},
+    op::{DetachedSubmitter, LocalSubmitter, Op, Open},
+};
+#[cfg(windows)]
+use windows_sys::Win32::{Foundation::*, Storage::FileSystem::FILE_APPEND_DATA};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferingMode {
@@ -96,13 +104,12 @@ impl OpenOptions {
         self
     }
 
-    pub async fn open_local<'a, 'ctx>(
+    pub async fn open_local<'rt, 'reg>(
         &self,
-        ctx: RuntimeContext<'a, 'ctx>,
+        ctx: Ctx<'rt, 'reg>,
         path: impl AsRef<Path>,
-    ) -> Result<super::file::LocalFile<'a, 'ctx>> {
+    ) -> Result<LocalFile<'rt, 'reg>> {
         let op = self.build_op(&ctx, path.as_ref())?;
-        use veloq_driver_native::op::{LocalSubmitter, Op};
 
         let submitter = LocalSubmitter::new();
         let (res, _) = ctx.submit(&submitter, Op::new(op)).await.into_inner();
@@ -119,9 +126,8 @@ impl OpenOptions {
                 None => FsError::RegisterFailed.trans(),
             }
         })?;
-        use std::cell::Cell;
 
-        Ok(super::file::LocalFile {
+        Ok(LocalFile {
             raw: fd,
             fd: fixed,
             submitter,
@@ -130,21 +136,20 @@ impl OpenOptions {
         })
     }
 
-    pub async fn open<'a, 'ctx>(
+    pub async fn open<'rt, 'reg>(
         &self,
-        ctx: RuntimeContext<'a, 'ctx>,
+        ctx: Ctx<'rt, 'reg>,
         path: impl AsRef<Path>,
-    ) -> Result<super::file::File<'a, 'ctx>> {
+    ) -> Result<File<'rt, 'reg>> {
         let op = self.build_op(&ctx, path.as_ref())?;
-        use veloq_driver_native::op::{DetachedSubmitter, Op};
 
         let submitter = DetachedSubmitter::new();
-        let owner = ctx.scope.worker_id();
+        let owner = ctx.runtime_ctx.worker_id();
         let (res, _) = ctx.submit_to(owner, Op::new(op)).await?;
         let owned = res.trans()?;
         let raw = owned.into_raw();
         // SAFETY: ownership is transferred into the owner driver's registered file table.
-        let owned = unsafe { veloq_driver_native::OwnedRawHandle::from_raw_owned(raw) };
+        let owned = unsafe { OwnedRawHandle::from_raw_owned(raw) };
         let fd = ctx.driver(|mut driver| {
             driver
                 .register_files(vec![RegisterFd::Owned(owned)])
@@ -154,9 +159,8 @@ impl OpenOptions {
                 .ok_or(FsError::RegisterFailed)
                 .trans()
         })?;
-        use std::sync::atomic::AtomicU64;
 
-        Ok(super::file::File {
+        Ok(File {
             raw,
             fd,
             owner_worker_id: owner,
@@ -167,14 +171,7 @@ impl OpenOptions {
     }
 
     #[cfg(unix)]
-    fn build_op(
-        &self,
-        ctx: &crate::runtime::context::RuntimeContext<'_, '_>,
-        path: &Path,
-    ) -> Result<Open> {
-        use std::num::NonZeroUsize;
-        use std::os::unix::ffi::OsStrExt;
-
+    fn build_op(&self, ctx: &Ctx<'_, '_>, path: &Path) -> Result<Open> {
         let path_bytes = path.as_os_str().as_bytes();
         let len = path_bytes.len() + 1;
         let len_nz = NonZeroUsize::new(len).unwrap();
@@ -228,16 +225,7 @@ impl OpenOptions {
     }
 
     #[cfg(windows)]
-    fn build_op(
-        &self,
-        ctx: &crate::runtime::context::RuntimeContext<'_, '_>,
-        path: &Path,
-    ) -> Result<Open> {
-        use std::num::NonZeroUsize;
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Foundation::*;
-        use windows_sys::Win32::Storage::FileSystem::FILE_APPEND_DATA;
-
+    fn build_op(&self, ctx: &Ctx<'_, '_>, path: &Path) -> Result<Open> {
         const FAKE_NO_BUFFERING: u32 = 1 << 8;
         const FAKE_WRITE_THROUGH: u32 = 1 << 9;
 

@@ -1,20 +1,25 @@
-use std::collections::VecDeque;
-use std::io;
+use std::{collections::VecDeque, io, mem};
 
 use diagweave::prelude::*;
+use veloq_buf::heap::ChunkId;
 use veloq_driver_core::driver::RegisterFd;
-use windows_sys::Win32::Foundation::CloseHandle;
-use windows_sys::Win32::Networking::WinSock::{
-    INVALID_SOCKET, SO_TYPE, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSAENOTSOCK, WSAGetLastError,
-    closesocket, getsockopt,
+use windows_sys::Win32::{
+    Foundation::CloseHandle,
+    Networking::WinSock::{
+        INVALID_SOCKET, SO_TYPE, SOCKET, SOCKET_ERROR, SOL_SOCKET, WSAENOTSOCK, WSAGetLastError,
+        closesocket, getsockopt,
+    },
 };
 
-use crate::config::{
-    IoFd, IocpHandle, RawHandle, RawHandleKind, RegisteredHandle, RegisteredSlot, SocketKey,
+use crate::{
+    OwnedRawHandle,
+    config::{
+        IoFd, IocpHandle, RawHandle, RawHandleKind, RegisteredHandle, RegisteredSlot, SocketKey,
+    },
+    driver::{IocpDriver, IocpDriverResult},
+    error::{IocpError, IocpResult},
+    rio::RioState,
 };
-use crate::driver::{IocpDriver, IocpDriverResult};
-use crate::error::{IocpError, IocpResult};
-use crate::rio::RioState;
 
 pub(super) struct DeferredSocketCleanup {
     handle: SocketKey,
@@ -223,12 +228,12 @@ impl HandleRegistry {
     }
 }
 
-fn close_iocp_handle(handle: IocpHandle) -> io::Result<usize> {
+fn close_iocp_handle(handle: IocpHandle) -> IocpResult<usize> {
     match handle {
         IocpHandle::File { handle } => {
             let ret = unsafe { CloseHandle(handle) };
             if ret == 0 {
-                Err(io::Error::last_os_error())
+                Err(IocpError::Win32.io_report("CloseHandle", io::Error::last_os_error()))
             } else {
                 Ok(0)
             }
@@ -237,7 +242,10 @@ fn close_iocp_handle(handle: IocpHandle) -> io::Result<usize> {
             let socket = handle as SOCKET;
             let ret = unsafe { closesocket(socket) };
             if ret == SOCKET_ERROR || socket == INVALID_SOCKET {
-                Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
+                Err(IocpError::Win32.io_report(
+                    "closesocket",
+                    io::Error::from_raw_os_error(unsafe { WSAGetLastError() }),
+                ))
             } else {
                 Ok(0)
             }
@@ -245,13 +253,11 @@ fn close_iocp_handle(handle: IocpHandle) -> io::Result<usize> {
     }
 }
 
-fn close_owned_entry_now(entry: RegisteredHandle) -> io::Result<usize> {
+fn close_owned_entry_now(entry: RegisteredHandle) -> IocpResult<usize> {
     match entry {
         RegisteredHandle::Owned(handle) => close_iocp_handle(handle.into_raw().raw()),
-        RegisteredHandle::Weak(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Close is only valid for owned registered file descriptors",
-        )),
+        RegisteredHandle::Weak(_) => IocpError::InvalidInput
+            .attach_note("Close is only valid for owned registered file descriptors"),
     }
 }
 
@@ -259,7 +265,7 @@ pub(super) fn close_registered_owned_fd(
     handles: &mut HandleRegistry,
     rio: &mut RioState,
     fd: IoFd,
-) -> IocpResult<(IocpHandle, io::Result<usize>)> {
+) -> IocpResult<(IocpHandle, IocpResult<usize>)> {
     let (idx, entry) = handles.take_owned_for_close(fd)?;
     let raw = entry.as_raw().raw();
     handles.release_slot(idx);
@@ -289,7 +295,7 @@ impl<'a> IocpDriver<'a> {
     pub(crate) fn detect_socket_from_file_handle(handle: RawHandle) -> IocpResult<bool> {
         let socket = handle.raw().as_socket();
         let mut ty = 0i32;
-        let mut len = std::mem::size_of::<i32>() as i32;
+        let mut len = mem::size_of::<i32>() as i32;
         // SAFETY: buffer pointers are valid for getsockopt call.
         let ret = unsafe {
             getsockopt(
@@ -310,18 +316,18 @@ impl<'a> IocpDriver<'a> {
         } else {
             Err(IocpError::ResolveFd.io_report(
                 "iocp/driver.detect_socket_from_file_handle",
-                std::io::Error::from_raw_os_error(err),
+                io::Error::from_raw_os_error(err),
             ))
         }
     }
 
-    pub(super) fn release_socket_inflight_for_op(&mut self, user_data: usize) {
+    pub(super) fn release_socket_inflight_for_op(&mut self, user_data: usize) -> IocpResult<()> {
         let Some(token) = self
             .ops
             .active_tokens()
             .find(|token| token.index() == user_data)
         else {
-            return;
+            return Ok(());
         };
         let socket_inflight =
             self.ops
@@ -344,9 +350,13 @@ impl<'a> IocpDriver<'a> {
                 });
 
         if let Some(token) = socket_inflight {
-            self.rio.state_mut().release_socket_inflight_token(token);
+            self.rio
+                .state_mut()
+                .release_socket_inflight_token(token)
+                .trans()?;
             self.drain_deferred_socket_cleanup();
         }
+        Ok(())
     }
 
     pub(super) fn drain_deferred_socket_cleanup(&mut self) {
@@ -373,7 +383,7 @@ impl<'a> IocpDriver<'a> {
     /// Registers a chunk of memory for RIO operations.
     pub(crate) fn register_chunk(
         &mut self,
-        id: veloq_buf::heap::ChunkId,
+        id: ChunkId,
         ptr: *const u8,
         len: usize,
     ) -> IocpDriverResult<()> {
@@ -389,11 +399,11 @@ impl<'a> IocpDriver<'a> {
     /// Registers a set of file/socket handles for use with the driver.
     pub(crate) fn register_files<'h>(
         &mut self,
-        files: Vec<RegisterFd<'h, crate::config::IocpHandle>>,
+        files: Vec<RegisterFd<'h, IocpHandle>>,
     ) -> IocpDriverResult<Vec<IoFd>> {
         enum InputHandle {
             Borrowed(RawHandle),
-            Owned(crate::OwnedRawHandle),
+            Owned(OwnedRawHandle),
         }
 
         impl InputHandle {
@@ -415,7 +425,7 @@ impl<'a> IocpDriver<'a> {
                         // SAFETY: ownership comes from RegisterFd::Owned and is transferred
                         // into the registered slot for deterministic lifecycle management.
                         RegisteredHandle::Owned(unsafe {
-                            crate::OwnedRawHandle::from_raw_owned(canonical)
+                            OwnedRawHandle::from_raw_owned(canonical)
                         })
                     }
                 }
@@ -437,9 +447,7 @@ impl<'a> IocpDriver<'a> {
                         .push_ctx("scope", "iocp/driver")
                         .attach_note("detect socket from file handle failed")?
                     {
-                        RawHandle::new(crate::config::IocpHandle::for_socket(
-                            handle.raw().as_handle(),
-                        ))
+                        RawHandle::new(IocpHandle::for_socket(handle.raw().as_handle()))
                     } else {
                         handle
                     }
@@ -448,7 +456,7 @@ impl<'a> IocpDriver<'a> {
             let kind = canonical.kind();
             if kind == RawHandleKind::Socket {
                 let mut raw = canonical.raw();
-                if let crate::config::IocpHandle::Socket { generation: g, .. } = &mut raw
+                if let IocpHandle::Socket { generation: g, .. } = &mut raw
                     && *g == 0
                 {
                     *g = self.handles.next_socket_generation();

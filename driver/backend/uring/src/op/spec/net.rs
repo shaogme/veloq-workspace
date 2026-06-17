@@ -1,14 +1,18 @@
-use crate::config::UringRawHandle;
-use crate::driver::UringDriver;
-use crate::error::UringDriverResult as DriverResult;
-use crate::op::{
-    Accept, Connect, OpSend, Recv, SendTo, UdpConnect, UdpRecv, UdpRecvFrom, UdpSend, payload,
-    submit,
+use crate::{
+    OwnedRawHandle, RawHandle,
+    config::UringRawHandle,
+    driver::UringDriver,
+    error::UringDriverResult as DriverResult,
+    op::{
+        Accept, Connect, OpSend, Recv, SendTo, UdpConnect, UdpRecv, UdpRecvFrom, UdpSend, payload,
+        submit,
+    },
 };
-use crate::{OwnedRawHandle, RawHandle};
 use io_uring::squeue;
-use veloq_driver_core::driver::{CompletionCleanupGuard, SubmitTokenContext};
-use veloq_driver_core::op::OpKind;
+use veloq_driver_core::{
+    driver::{CompletionCleanupGuard, SubmitTokenContext},
+    op::OpKind,
+};
 
 use super::UringOpSpec;
 

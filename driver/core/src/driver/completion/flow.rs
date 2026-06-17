@@ -1,16 +1,23 @@
-use crate::DriverResult;
-use crate::driver::registry::OpRegistry;
-use crate::slot::{self, SlotRegistryExt};
+use crate::{
+    DriverResult,
+    driver::registry::OpRegistry,
+    slot::{
+        InFlightOrphaned, InFlightWaiting, Slot, SlotCompletion, SlotCompletionDiagnostics,
+        SlotError, SlotPayload, SlotRegistryExt, SlotSnapshot, SlotSpec,
+    },
+};
 
 use super::{
-    CompletionAnomaly, CompletionAnomalyReason, CompletionBackend, CompletionCleanupGuard,
-    CompletionDispatch, CompletionEnvelope, CompletionPacket, DriverCompletionDiagnostics,
-    DriverCompletionDiagnosticsBackend, RawCompletion, RecordCompletionOutcome,
-    RecordCompletionResult, RoutedSlotCompletion, SharedCompletionTable, UserCompletionEvent,
-    dispatch_envelope, finalize_corrupt_checked, finalize_orphaned_checked,
+    AnomalyAttach, CompletionAnomalyKind, CompletionAnomalyReason, CompletionBackend,
+    CompletionCleanupGuard, CompletionDispatch, CompletionEnvelope, CompletionPacket,
+    DriverCompletionDiagnostics, DriverCompletionDiagnosticsBackend, RawCompletion,
+    RecordCompletionOutcome, RecordCompletionResult, RoutedSlotCompletion, SharedCompletionTable,
+    UserCompletionEvent, dispatch_envelope, finalize_corrupt_checked, finalize_orphaned_checked,
     finalize_waiting_checked, route_user_completion, run_completion_cleanup, run_rejected_cleanup,
-    unknown_completion_anomaly,
+    unknown_completion_kind,
 };
+
+pub type HookResult<Spec, T> = DriverResult<T, SlotError<Spec>>;
 
 #[derive(Debug, Clone, Copy)]
 pub struct CompletionWritePermit {
@@ -18,7 +25,6 @@ pub struct CompletionWritePermit {
 }
 
 impl CompletionWritePermit {
-    #[inline]
     const fn new() -> Self {
         Self { _private: () }
     }
@@ -40,7 +46,10 @@ pub enum CompletionIngress<BackendIngress = ()> {
         source: SyntheticCompletionSource,
     },
     Backend(BackendIngress),
-    Anomaly(CompletionAnomaly),
+    Anomaly {
+        kind: CompletionAnomalyKind,
+        attach: AnomalyAttach,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -65,19 +74,18 @@ pub enum CompletionControl {
 
 pub enum CompletionHookOutcome<Spec, Effect>
 where
-    Spec: slot::SlotSpec,
+    Spec: SlotSpec,
 {
     User {
         event: UserCompletionEvent,
-        payload: slot::SlotPayload<Spec>,
-        detail: Option<DriverResult<slot::SlotCompletion<Spec>, slot::SlotError<Spec>>>,
+        payload: SlotPayload<Spec>,
+        detail: Option<DriverResult<SlotCompletion<Spec>, SlotError<Spec>>>,
         cleanup: CompletionCleanupGuard,
         effect: Effect,
     },
     Lost {
         event: UserCompletionEvent,
-        loss_reason: CompletionAnomaly,
-        snapshot: slot::SlotSnapshot,
+        loss_kind: CompletionAnomalyKind,
         cleanup: CompletionCleanupGuard,
         effect: Effect,
     },
@@ -86,7 +94,8 @@ where
         effect: Effect,
     },
     Anomaly {
-        anomaly: CompletionAnomaly,
+        kind: CompletionAnomalyKind,
+        attach: AnomalyAttach,
         effect: Effect,
     },
     ControlHandled {
@@ -99,7 +108,7 @@ where
 
 pub enum CompletionBackendIngressAction<Spec, Effect>
 where
-    Spec: slot::SlotSpec,
+    Spec: SlotSpec,
 {
     RouteUser(UserCompletionEvent),
     Finish(CompletionHookOutcome<Spec, Effect>),
@@ -107,7 +116,7 @@ where
 
 pub trait CompletionBackendHooks<Spec>
 where
-    Spec: slot::SlotSpec,
+    Spec: SlotSpec,
 {
     type BackendIngress;
     type BackendEffect: Default;
@@ -115,44 +124,47 @@ where
     fn handle_control(
         &mut self,
         control: CompletionControl,
-    ) -> CompletionHookOutcome<Spec, Self::BackendEffect>;
+    ) -> HookResult<Spec, CompletionHookOutcome<Spec, Self::BackendEffect>>;
 
     fn complete_waiting(
         &mut self,
         event: UserCompletionEvent,
-        slot: slot::Slot<'_, slot::InFlightWaiting, Spec>,
+        slot: Slot<'_, InFlightWaiting, Spec>,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<Spec, Self::BackendEffect>;
+    ) -> HookResult<Spec, CompletionHookOutcome<Spec, Self::BackendEffect>>;
 
     fn complete_orphaned(
         &mut self,
         event: UserCompletionEvent,
-        slot: slot::Slot<'_, slot::InFlightOrphaned, Spec>,
+        slot: Slot<'_, InFlightOrphaned, Spec>,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<Spec, Self::BackendEffect>;
+    ) -> HookResult<Spec, CompletionHookOutcome<Spec, Self::BackendEffect>>;
 
     fn complete_corrupt(
         &mut self,
         _event: UserCompletionEvent,
-        anomaly: CompletionAnomaly,
+        kind: CompletionAnomalyKind,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<Spec, Self::BackendEffect> {
-        CompletionHookOutcome::Anomaly {
-            anomaly,
+    ) -> HookResult<Spec, CompletionHookOutcome<Spec, Self::BackendEffect>> {
+        Ok(CompletionHookOutcome::Anomaly {
+            kind,
+            attach: AnomalyAttach::from_raw_completion(_event.raw()),
             effect: Self::BackendEffect::default(),
-        }
+        })
     }
 
     fn complete_backend_ingress(
         &mut self,
         _ingress: &Self::BackendIngress,
-    ) -> CompletionBackendIngressAction<Spec, Self::BackendEffect> {
-        CompletionBackendIngressAction::Finish(CompletionHookOutcome::Ignore {
-            effect: Self::BackendEffect::default(),
-        })
+    ) -> HookResult<Spec, CompletionBackendIngressAction<Spec, Self::BackendEffect>> {
+        Ok(CompletionBackendIngressAction::Finish(
+            CompletionHookOutcome::Ignore {
+                effect: Self::BackendEffect::default(),
+            },
+        ))
     }
 
-    fn finish_backend_effect(&mut self, effect: Self::BackendEffect);
+    fn finish_backend_effect(&mut self, effect: Self::BackendEffect) -> HookResult<Spec, ()>;
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -166,12 +178,10 @@ pub struct CompletionFlowOutcome {
 }
 
 impl CompletionFlowOutcome {
-    #[inline]
     pub const fn semantic_count(&self) -> usize {
         self.user_completed + self.user_lost + self.orphan_cleaned + self.internal + self.anomaly
     }
 
-    #[inline]
     pub fn merge(&mut self, other: Self) {
         self.user_completed += other.user_completed;
         self.user_lost += other.user_lost;
@@ -181,7 +191,6 @@ impl CompletionFlowOutcome {
         self.ignored += other.ignored;
     }
 
-    #[inline]
     const fn user_completed() -> Self {
         Self {
             user_completed: 1,
@@ -193,7 +202,6 @@ impl CompletionFlowOutcome {
         }
     }
 
-    #[inline]
     const fn user_lost() -> Self {
         Self {
             user_completed: 0,
@@ -205,7 +213,6 @@ impl CompletionFlowOutcome {
         }
     }
 
-    #[inline]
     const fn orphan_cleaned() -> Self {
         Self {
             user_completed: 0,
@@ -217,7 +224,6 @@ impl CompletionFlowOutcome {
         }
     }
 
-    #[inline]
     const fn internal() -> Self {
         Self {
             user_completed: 0,
@@ -229,7 +235,6 @@ impl CompletionFlowOutcome {
         }
     }
 
-    #[inline]
     const fn anomaly() -> Self {
         Self {
             user_completed: 0,
@@ -241,7 +246,6 @@ impl CompletionFlowOutcome {
         }
     }
 
-    #[inline]
     const fn ignored() -> Self {
         Self {
             user_completed: 0,
@@ -263,34 +267,34 @@ enum FinalizeAction {
 
 pub trait CompletionFlowExt<Spec>
 where
-    Spec: slot::SlotSpec,
+    Spec: SlotSpec,
 {
     fn accept_completion<Hooks>(
         &mut self,
         table: &SharedCompletionTable<Spec>,
-        diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
+        diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
         hooks: &mut Hooks,
         ingress: CompletionIngress<Hooks::BackendIngress>,
-    ) -> CompletionFlowOutcome
+    ) -> DriverResult<CompletionFlowOutcome, SlotError<Spec>>
     where
         Hooks: CompletionBackendHooks<Spec>;
 }
 
 impl<Spec> CompletionFlowExt<Spec> for OpRegistry<Spec>
 where
-    Spec: slot::SlotSpec,
-    slot::SlotPayload<Spec>: Send,
-    slot::SlotError<Spec>: Send,
-    slot::SlotCompletion<Spec>: Send,
-    slot::SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
+    Spec: SlotSpec,
+    SlotPayload<Spec>: Send,
+    SlotError<Spec>: Send,
+    SlotCompletion<Spec>: Send,
+    SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
 {
     fn accept_completion<Hooks>(
         &mut self,
         table: &SharedCompletionTable<Spec>,
-        diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
+        diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
         hooks: &mut Hooks,
         ingress: CompletionIngress<Hooks::BackendIngress>,
-    ) -> CompletionFlowOutcome
+    ) -> DriverResult<CompletionFlowOutcome, SlotError<Spec>>
     where
         Hooks: CompletionBackendHooks<Spec>,
     {
@@ -304,17 +308,18 @@ where
                     CompletionSource::Kernel,
                 ),
                 CompletionDispatch::Waker { id, raw } => {
-                    let outcome = hooks.handle_control(CompletionControl::Waker { id, raw });
+                    let outcome = hooks.handle_control(CompletionControl::Waker { id, raw })?;
                     finish_hook_outcome(self, table, diagnostics, hooks, outcome, None)
                 }
                 CompletionDispatch::Cancel { id, raw } => {
-                    let outcome = hooks.handle_control(CompletionControl::Cancel { id, raw });
+                    let outcome = hooks.handle_control(CompletionControl::Cancel { id, raw })?;
                     finish_hook_outcome(self, table, diagnostics, hooks, outcome, None)
                 }
                 CompletionDispatch::Unknown { envelope } => {
-                    let anomaly = unknown_completion_anomaly(envelope);
-                    diagnostics.record_anomaly(&anomaly);
-                    CompletionFlowOutcome::anomaly()
+                    let kind = unknown_completion_kind(envelope);
+                    let attach = AnomalyAttach::from_raw_completion(envelope.raw);
+                    diagnostics.record_anomaly_kind(kind, attach);
+                    Ok(CompletionFlowOutcome::anomaly())
                 }
             },
             CompletionIngress::User(event) => {
@@ -327,62 +332,66 @@ where
                 event,
                 CompletionSource::Synthetic(source),
             ),
-            CompletionIngress::Backend(backend) => match hooks.complete_backend_ingress(&backend) {
-                CompletionBackendIngressAction::RouteUser(event) => self.accept_user_event(
-                    table,
-                    diagnostics,
-                    hooks,
-                    event,
-                    CompletionSource::Backend(&backend),
-                ),
-                CompletionBackendIngressAction::Finish(outcome) => {
-                    finish_hook_outcome(self, table, diagnostics, hooks, outcome, None)
+            CompletionIngress::Backend(backend) => {
+                match hooks.complete_backend_ingress(&backend)? {
+                    CompletionBackendIngressAction::RouteUser(event) => self.accept_user_event(
+                        table,
+                        diagnostics,
+                        hooks,
+                        event,
+                        CompletionSource::Backend(&backend),
+                    ),
+                    CompletionBackendIngressAction::Finish(outcome) => {
+                        finish_hook_outcome(self, table, diagnostics, hooks, outcome, None)
+                    }
                 }
-            },
-            CompletionIngress::Anomaly(anomaly) => finish_anomaly(self, diagnostics, anomaly),
+            }
+            CompletionIngress::Anomaly { kind, attach } => {
+                Ok(finish_anomaly(self, diagnostics, kind, attach))
+            }
         }
     }
 }
 
 trait CompletionFlowOpRegistryExt<Spec>
 where
-    Spec: slot::SlotSpec,
+    Spec: SlotSpec,
 {
     fn accept_user_event<Hooks>(
         &mut self,
         table: &SharedCompletionTable<Spec>,
-        diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
+        diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
         hooks: &mut Hooks,
         event: UserCompletionEvent,
         source: CompletionSource<'_, Hooks::BackendIngress>,
-    ) -> CompletionFlowOutcome
+    ) -> DriverResult<CompletionFlowOutcome, SlotError<Spec>>
     where
         Hooks: CompletionBackendHooks<Spec>;
 }
 
 impl<Spec> CompletionFlowOpRegistryExt<Spec> for OpRegistry<Spec>
 where
-    Spec: slot::SlotSpec,
-    slot::SlotPayload<Spec>: Send,
-    slot::SlotError<Spec>: Send,
-    slot::SlotCompletion<Spec>: Send,
-    slot::SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
+    Spec: SlotSpec,
+    SlotPayload<Spec>: Send,
+    SlotError<Spec>: Send,
+    SlotCompletion<Spec>: Send,
+    SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
 {
     fn accept_user_event<Hooks>(
         &mut self,
         table: &SharedCompletionTable<Spec>,
-        diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
+        diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
         hooks: &mut Hooks,
         event: UserCompletionEvent,
         source: CompletionSource<'_, Hooks::BackendIngress>,
-    ) -> CompletionFlowOutcome
+    ) -> DriverResult<CompletionFlowOutcome, SlotError<Spec>>
     where
         Hooks: CompletionBackendHooks<Spec>,
     {
         let token = event.token();
         match route_user_completion(event, self.checked_slot_view(token)) {
             RoutedSlotCompletion::Waiting(slot) => {
-                let outcome = hooks.complete_waiting(event, slot, source);
+                let outcome = hooks.complete_waiting(event, slot, source)?;
                 finish_hook_outcome(
                     self,
                     table,
@@ -393,7 +402,7 @@ where
                 )
             }
             RoutedSlotCompletion::Orphaned(slot) => {
-                let outcome = hooks.complete_orphaned(event, slot, source);
+                let outcome = hooks.complete_orphaned(event, slot, source)?;
                 finish_hook_outcome(
                     self,
                     table,
@@ -403,8 +412,8 @@ where
                     Some(FinalizeAction::Orphaned(event)),
                 )
             }
-            RoutedSlotCompletion::Corrupt(anomaly) => {
-                let outcome = hooks.complete_corrupt(event, anomaly, source);
+            RoutedSlotCompletion::Corrupt(kind) => {
+                let outcome = hooks.complete_corrupt(event, kind, source)?;
                 finish_hook_outcome(
                     self,
                     table,
@@ -414,29 +423,30 @@ where
                     Some(FinalizeAction::CorruptFromEvent),
                 )
             }
-            RoutedSlotCompletion::Missing(anomaly)
-            | RoutedSlotCompletion::Empty(anomaly)
-            | RoutedSlotCompletion::Stale(anomaly) => {
-                let outcome = hooks.complete_corrupt(event, anomaly, source);
+            RoutedSlotCompletion::Missing(kind)
+            | RoutedSlotCompletion::Empty(kind)
+            | RoutedSlotCompletion::Stale(kind) => {
+                let outcome = hooks.complete_corrupt(event, kind, source)?;
                 finish_hook_outcome(self, table, diagnostics, hooks, outcome, None)
             }
         }
     }
 }
+
 fn finish_hook_outcome<Spec, Hooks>(
     registry: &mut OpRegistry<Spec>,
     table: &SharedCompletionTable<Spec>,
-    diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
+    diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
     hooks: &mut Hooks,
     outcome: CompletionHookOutcome<Spec, Hooks::BackendEffect>,
     finalize: Option<FinalizeAction>,
-) -> CompletionFlowOutcome
+) -> DriverResult<CompletionFlowOutcome, SlotError<Spec>>
 where
-    Spec: slot::SlotSpec,
-    slot::SlotPayload<Spec>: Send,
-    slot::SlotError<Spec>: Send,
-    slot::SlotCompletion<Spec>: Send,
-    slot::SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
+    Spec: SlotSpec,
+    SlotPayload<Spec>: Send,
+    SlotError<Spec>: Send,
+    SlotCompletion<Spec>: Send,
+    SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
     Hooks: CompletionBackendHooks<Spec>,
 {
     match outcome {
@@ -453,21 +463,22 @@ where
                 CompletionPacket::<Spec>::user_with_cleanup(event, payload, detail, cleanup),
             );
             finish_waiting_if_needed(registry, diagnostics, finalize, event);
-            hooks.finish_backend_effect(effect);
-            completion_progress_from_record(record)
+            hooks.finish_backend_effect(effect)?;
+            Ok(completion_progress_from_record(record))
         }
         CompletionHookOutcome::Lost {
             event,
-            loss_reason,
-            snapshot,
+            loss_kind,
             cleanup,
             effect,
         } => {
             let record =
-                record_lost_completion::<Spec>(table, diagnostics, event, loss_reason, cleanup);
-            finish_corrupt(registry, diagnostics, snapshot, event.raw());
-            hooks.finish_backend_effect(effect);
-            completion_progress_from_record(record)
+                record_lost_completion::<Spec>(table, diagnostics, event, loss_kind, cleanup);
+            if let Some(snapshot) = loss_kind.slot_snapshot() {
+                finish_corrupt(registry, diagnostics, snapshot, event.raw());
+            }
+            hooks.finish_backend_effect(effect)?;
+            Ok(completion_progress_from_record(record))
         }
         CompletionHookOutcome::Cleanup {
             mut cleanup,
@@ -483,36 +494,40 @@ where
                 }
                 Some(FinalizeAction::CorruptFromEvent) | None => {}
             }
-            hooks.finish_backend_effect(effect);
-            CompletionFlowOutcome::orphan_cleaned()
+            hooks.finish_backend_effect(effect)?;
+            Ok(CompletionFlowOutcome::orphan_cleaned())
         }
-        CompletionHookOutcome::Anomaly { anomaly, effect } => {
-            let progress = finish_anomaly(registry, diagnostics, anomaly);
-            hooks.finish_backend_effect(effect);
-            progress
+        CompletionHookOutcome::Anomaly {
+            kind,
+            attach,
+            effect,
+        } => {
+            let progress = finish_anomaly(registry, diagnostics, kind, attach);
+            hooks.finish_backend_effect(effect)?;
+            Ok(progress)
         }
         CompletionHookOutcome::ControlHandled { effect } => {
-            hooks.finish_backend_effect(effect);
-            CompletionFlowOutcome::internal()
+            hooks.finish_backend_effect(effect)?;
+            Ok(CompletionFlowOutcome::internal())
         }
         CompletionHookOutcome::Ignore { effect } => {
-            hooks.finish_backend_effect(effect);
-            CompletionFlowOutcome::ignored()
+            hooks.finish_backend_effect(effect)?;
+            Ok(CompletionFlowOutcome::ignored())
         }
     }
 }
 
 fn record_user_completion<Spec>(
     table: &SharedCompletionTable<Spec>,
-    diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
+    diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
     packet: CompletionPacket<Spec>,
 ) -> RecordCompletionOutcome
 where
-    Spec: slot::SlotSpec,
-    slot::SlotPayload<Spec>: Send,
-    slot::SlotError<Spec>: Send,
-    slot::SlotCompletion<Spec>: Send,
-    slot::SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
+    Spec: SlotSpec,
+    SlotPayload<Spec>: Send,
+    SlotError<Spec>: Send,
+    SlotCompletion<Spec>: Send,
+    SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
 {
     match table.record_completion(CompletionWritePermit::new(), packet) {
         RecordCompletionResult::Recorded(outcome) => outcome,
@@ -525,33 +540,33 @@ where
 
 fn record_lost_completion<Spec>(
     table: &SharedCompletionTable<Spec>,
-    diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
+    diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
     event: UserCompletionEvent,
-    anomaly: CompletionAnomaly,
+    kind: CompletionAnomalyKind,
     cleanup: CompletionCleanupGuard,
 ) -> RecordCompletionOutcome
 where
-    Spec: slot::SlotSpec,
-    slot::SlotPayload<Spec>: Send,
-    slot::SlotError<Spec>: Send,
-    slot::SlotCompletion<Spec>: Send,
-    slot::SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
+    Spec: SlotSpec,
+    SlotPayload<Spec>: Send,
+    SlotError<Spec>: Send,
+    SlotCompletion<Spec>: Send,
+    SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
 {
     record_user_completion::<Spec>(
         table,
         diagnostics,
-        CompletionPacket::<Spec>::lost(event, anomaly, cleanup),
+        CompletionPacket::<Spec>::lost(event, kind, cleanup),
     )
 }
 
 fn finish_waiting_if_needed<Spec>(
     registry: &mut OpRegistry<Spec>,
-    diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
+    diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
     finalize: Option<FinalizeAction>,
     fallback_event: UserCompletionEvent,
 ) where
-    Spec: slot::SlotSpec,
-    slot::SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
+    Spec: SlotSpec,
+    SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
 {
     let event = match finalize {
         Some(FinalizeAction::Waiting(event)) => event,
@@ -572,11 +587,11 @@ fn finish_waiting_if_needed<Spec>(
 
 fn finish_orphaned<Spec>(
     registry: &mut OpRegistry<Spec>,
-    diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
+    diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
     event: UserCompletionEvent,
 ) where
-    Spec: slot::SlotSpec,
-    slot::SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
+    Spec: SlotSpec,
+    SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
 {
     let raw = event.raw();
     let _ = finalize_orphaned_checked(
@@ -591,12 +606,12 @@ fn finish_orphaned<Spec>(
 
 fn finish_corrupt<Spec>(
     registry: &mut OpRegistry<Spec>,
-    diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
-    snapshot: slot::SlotSnapshot,
+    diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
+    snapshot: SlotSnapshot,
     raw: RawCompletion,
 ) where
-    Spec: slot::SlotSpec,
-    slot::SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
+    Spec: SlotSpec,
+    SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
 {
     let _ = finalize_corrupt_checked(
         registry,
@@ -610,32 +625,31 @@ fn finish_corrupt<Spec>(
 
 fn finish_anomaly<Spec>(
     registry: &mut OpRegistry<Spec>,
-    diagnostics: &DriverCompletionDiagnostics<slot::SlotCompletionDiagnostics<Spec>>,
-    anomaly: CompletionAnomaly,
+    diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
+    kind: CompletionAnomalyKind,
+    attach: AnomalyAttach,
 ) -> CompletionFlowOutcome
 where
-    Spec: slot::SlotSpec,
-    slot::SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
+    Spec: SlotSpec,
+    SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
 {
-    diagnostics.record_anomaly(&anomaly);
-    if should_finalize_corrupt_anomaly(&anomaly)
-        && let Some(snapshot) = anomaly.slot_snapshot
+    diagnostics.record_anomaly_kind(kind, attach);
+    if should_finalize_corrupt_kind(kind)
+        && let Some(snapshot) = kind.slot_snapshot()
     {
-        let raw = RawCompletion::new(
-            anomaly.backend.unwrap_or(CompletionBackend::Core),
-            anomaly.token,
-            anomaly.raw_result.unwrap_or(0),
-            anomaly.flags.unwrap_or(0),
-        );
+        let raw = attach
+            .raw
+            .map(|raw| RawCompletion::new(raw.backend, attach.token, raw.res, raw.flags))
+            .unwrap_or_else(|| RawCompletion::new(CompletionBackend::Core, attach.token, 0, 0));
         finish_corrupt(registry, diagnostics, snapshot, raw);
     }
     CompletionFlowOutcome::anomaly()
 }
 
 #[inline]
-fn should_finalize_corrupt_anomaly(anomaly: &CompletionAnomaly) -> bool {
+fn should_finalize_corrupt_kind(kind: CompletionAnomalyKind) -> bool {
     matches!(
-        anomaly.reason,
+        kind.reason(),
         CompletionAnomalyReason::OpMissing
             | CompletionAnomalyReason::PayloadMissing
             | CompletionAnomalyReason::SlotCorruption
@@ -649,9 +663,6 @@ fn completion_progress_from_record(outcome: RecordCompletionOutcome) -> Completi
         RecordCompletionOutcome::RecordedUser => CompletionFlowOutcome::user_completed(),
         RecordCompletionOutcome::RecordedLost => CompletionFlowOutcome::user_lost(),
         RecordCompletionOutcome::OrphanedDropped => CompletionFlowOutcome::orphan_cleaned(),
-        RecordCompletionOutcome::Missing(_)
-        | RecordCompletionOutcome::Stale(_)
-        | RecordCompletionOutcome::NonActive(_)
-        | RecordCompletionOutcome::Corrupt(_) => CompletionFlowOutcome::anomaly(),
+        RecordCompletionOutcome::Rejected(_) => CompletionFlowOutcome::anomaly(),
     }
 }

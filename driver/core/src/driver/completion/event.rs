@@ -1,6 +1,6 @@
 use super::{
-    CancelCompletionId, CompletionAnomaly, CompletionBackend, CompletionControlKind,
-    CompletionToken, CompletionTokenClass, OpToken,
+    CancelCompletionId, CompletionAnomaly, CompletionAnomalyKind, CompletionBackend,
+    CompletionControlKind, CompletionToken, CompletionTokenClass, OpToken,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12,7 +12,6 @@ pub struct RawCompletion {
 }
 
 impl RawCompletion {
-    #[inline]
     pub const fn new(
         backend: CompletionBackend,
         token: CompletionToken,
@@ -27,7 +26,6 @@ impl RawCompletion {
         }
     }
 
-    #[inline]
     pub const fn event(self) -> CompletionEvent {
         CompletionEvent {
             token: self.token,
@@ -51,7 +49,6 @@ pub struct UserCompletionEventMismatch {
 }
 
 impl UserCompletionEvent {
-    #[inline]
     pub fn try_new(
         token: OpToken,
         raw: RawCompletion,
@@ -67,7 +64,6 @@ impl UserCompletionEvent {
         Ok(Self { token, raw })
     }
 
-    #[inline]
     pub fn from_parts(backend: CompletionBackend, token: OpToken, res: i32, flags: u32) -> Self {
         Self {
             token,
@@ -75,38 +71,31 @@ impl UserCompletionEvent {
         }
     }
 
-    #[inline]
     pub(super) fn from_classified(token: OpToken, raw: RawCompletion) -> Self {
         debug_assert_eq!(raw.token, CompletionToken::user(token));
         Self { token, raw }
     }
 
-    #[inline]
     pub const fn token(self) -> OpToken {
         self.token
     }
 
-    #[inline]
     pub const fn raw(self) -> RawCompletion {
         self.raw
     }
 
-    #[inline]
     pub const fn completion_token(self) -> CompletionToken {
         self.raw.token
     }
 
-    #[inline]
     pub const fn res(self) -> i32 {
         self.raw.res
     }
 
-    #[inline]
     pub const fn flags(self) -> u32 {
         self.raw.flags
     }
 
-    #[inline]
     pub const fn event(self) -> CompletionEvent {
         self.raw.event()
     }
@@ -160,7 +149,6 @@ pub struct CompletionEnvelope {
 }
 
 impl CompletionEnvelope {
-    #[inline]
     pub fn from_raw_parts(
         backend: CompletionBackend,
         raw_token: u64,
@@ -175,7 +163,6 @@ impl CompletionEnvelope {
         ))
     }
 
-    #[inline]
     pub fn from_raw(raw: RawCompletion) -> Self {
         let (identity, source) = match raw.token.classify() {
             CompletionTokenClass::User(token) => (
@@ -208,7 +195,6 @@ impl CompletionEnvelope {
         }
     }
 
-    #[inline]
     pub fn from_sidecar_user_token(
         backend: CompletionBackend,
         token: OpToken,
@@ -236,7 +222,6 @@ pub struct CompletionEvent {
 }
 
 impl CompletionEvent {
-    #[inline]
     pub const fn raw_token(self) -> u64 {
         self.token.raw()
     }
@@ -258,27 +243,26 @@ pub(super) fn dispatch_envelope(envelope: CompletionEnvelope) -> CompletionDispa
 }
 
 impl CompletionAnomaly {
-    #[inline]
-    pub fn with_raw_completion(self, raw: RawCompletion) -> Self {
-        self.with_backend(raw.backend).with_event(raw.event())
+    pub fn with_raw_completion(self, raw: super::RawCompletion) -> Self {
+        use super::CompletionRaw;
+        self.with_token(raw.token).with_raw(CompletionRaw {
+            backend: raw.backend,
+            res: raw.res,
+            flags: raw.flags,
+        })
     }
 }
 
 #[inline]
-pub(super) fn unknown_completion_anomaly(envelope: CompletionEnvelope) -> CompletionAnomaly {
+pub(super) fn unknown_completion_kind(envelope: CompletionEnvelope) -> CompletionAnomalyKind {
     match envelope.identity {
         CompletionIdentity::BackendContext {
             backend,
             raw_context,
-        } => CompletionAnomaly::backend_context_unknown(envelope.raw.token)
-            .with_raw_completion(envelope.raw)
-            .with_backend(backend)
-            .with_backend_context(raw_context),
+        } => CompletionAnomalyKind::backend_context(backend, raw_context),
         CompletionIdentity::UnknownControl { .. }
         | CompletionIdentity::User(_)
         | CompletionIdentity::Waker(_)
-        | CompletionIdentity::Cancel(_) => {
-            CompletionAnomaly::unknown_control(envelope.raw.token).with_raw_completion(envelope.raw)
-        }
+        | CompletionIdentity::Cancel(_) => CompletionAnomalyKind::unknown_control(),
     }
 }

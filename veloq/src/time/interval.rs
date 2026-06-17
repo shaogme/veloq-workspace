@@ -1,6 +1,10 @@
 use super::sleep::{LocalSleep, Sleep, sleep_until, sleep_until_local};
-use crate::runtime::context::RuntimeContext;
-use std::time::{Duration, Instant};
+use crate::runtime::context::Ctx;
+use std::{
+    future::poll_fn,
+    pin::Pin,
+    time::{Duration, Instant},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MissedTickBehavior {
@@ -13,15 +17,15 @@ pub enum MissedTickBehavior {
 // Sync/Send Interval
 // ============================================================================
 
-pub fn interval<'a, 'ctx>(ctx: RuntimeContext<'a, 'ctx>, period: Duration) -> Interval<'a, 'ctx> {
+pub fn interval<'rt, 'reg>(ctx: Ctx<'rt, 'reg>, period: Duration) -> Interval<'rt, 'reg> {
     interval_at(ctx, Instant::now(), period)
 }
 
-pub fn interval_at<'a, 'ctx>(
-    ctx: RuntimeContext<'a, 'ctx>,
+pub fn interval_at<'rt, 'reg>(
+    ctx: Ctx<'rt, 'reg>,
     start: Instant,
     period: Duration,
-) -> Interval<'a, 'ctx> {
+) -> Interval<'rt, 'reg> {
     Interval {
         period,
         next_tick: start,
@@ -30,14 +34,14 @@ pub fn interval_at<'a, 'ctx>(
     }
 }
 
-pub struct Interval<'a, 'ctx> {
+pub struct Interval<'rt, 'reg> {
     period: Duration,
     next_tick: Instant,
     behavior: MissedTickBehavior,
-    delay: Sleep<'a, 'ctx>,
+    delay: Sleep<'rt, 'reg>,
 }
 
-impl<'a, 'ctx> Interval<'a, 'ctx> {
+impl<'rt, 'reg> Interval<'rt, 'reg> {
     pub fn set_missed_tick_behavior(&mut self, behavior: MissedTickBehavior) {
         self.behavior = behavior;
     }
@@ -48,7 +52,7 @@ impl<'a, 'ctx> Interval<'a, 'ctx> {
 
     pub async fn tick(&mut self) -> Instant {
         // Wait for current delay to complete
-        std::future::poll_fn(|cx| std::pin::Pin::new(&mut self.delay).poll(cx)).await;
+        poll_fn(|cx| Pin::new(&mut self.delay).poll(cx)).await;
 
         let now = Instant::now();
         let ticked = self.next_tick;
@@ -84,18 +88,18 @@ impl<'a, 'ctx> Interval<'a, 'ctx> {
 // Local Interval
 // ============================================================================
 
-pub fn interval_local<'a, 'ctx>(
-    ctx: RuntimeContext<'a, 'ctx>,
+pub fn interval_local<'rt, 'reg>(
+    ctx: Ctx<'rt, 'reg>,
     period: Duration,
-) -> LocalInterval<'a, 'ctx> {
+) -> LocalInterval<'rt, 'reg> {
     interval_at_local(ctx, Instant::now(), period)
 }
 
-pub fn interval_at_local<'a, 'ctx>(
-    ctx: RuntimeContext<'a, 'ctx>,
+pub fn interval_at_local<'rt, 'reg>(
+    ctx: Ctx<'rt, 'reg>,
     start: Instant,
     period: Duration,
-) -> LocalInterval<'a, 'ctx> {
+) -> LocalInterval<'rt, 'reg> {
     LocalInterval {
         period,
         next_tick: start,
@@ -104,14 +108,14 @@ pub fn interval_at_local<'a, 'ctx>(
     }
 }
 
-pub struct LocalInterval<'a, 'ctx> {
+pub struct LocalInterval<'rt, 'reg> {
     period: Duration,
     next_tick: Instant,
     behavior: MissedTickBehavior,
-    delay: LocalSleep<'a, 'ctx>,
+    delay: LocalSleep<'rt, 'reg>,
 }
 
-impl<'a, 'ctx> LocalInterval<'a, 'ctx> {
+impl<'rt, 'reg> LocalInterval<'rt, 'reg> {
     pub fn set_missed_tick_behavior(&mut self, behavior: MissedTickBehavior) {
         self.behavior = behavior;
     }
@@ -122,7 +126,7 @@ impl<'a, 'ctx> LocalInterval<'a, 'ctx> {
 
     pub async fn tick(&mut self) -> Instant {
         // Wait for current delay to complete
-        std::future::poll_fn(|cx| std::pin::Pin::new(&mut self.delay).poll(cx)).await;
+        poll_fn(|cx| Pin::new(&mut self.delay).poll(cx)).await;
 
         let now = Instant::now();
         let ticked = self.next_tick;

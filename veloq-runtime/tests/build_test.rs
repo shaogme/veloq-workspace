@@ -1,109 +1,137 @@
-use veloq_runtime::runtime::Runtime;
+#[allow(unused_imports)]
+use veloq_runtime::{LifetimeGuard, runtime::Runtime, scope, scope::AsyncScope, scope_local};
 
 #[test]
 fn test_nested_scope_local_build() {
-    let rt = Runtime::<(), _>::new();
+    let guard = LifetimeGuard;
+    let rt = Runtime::<(), _>::new(&guard);
     rt.block_on(async |ctx| {
-        ctx.scope_local(async |parent_scope| {
-            parent_scope.spawn_boxed_local(async {
-                ctx.scope_local(async |child_scope| {
+        scope_local!(ctx, async |parent_scope| {
+            parent_scope.spawn_boxed_local(async move {
+                scope_local!(ctx, async move |child_scope| {
                     child_scope.spawn_boxed_local(async {});
                 })
-                .await;
+                .await
+                .unwrap();
             });
         })
-        .await;
-    });
+        .await
+        .unwrap();
+    })
+    .unwrap();
 }
 
 #[test]
 fn test_nested_scope_build_1() {
-    let rt = Runtime::<(), _>::new();
+    let guard = LifetimeGuard;
+    let rt = Runtime::<(), _>::new(&guard);
     rt.block_on(async |ctx| {
-        ctx.scope_local(async |parent_scope| {
-            parent_scope.spawn_boxed(async {
-                ctx.scope(async |child_scope| {
+        scope_local!(ctx, async |parent_scope| {
+            parent_scope.spawn_boxed(async move {
+                scope!(ctx, async move |child_scope| {
                     child_scope.spawn_boxed(async {});
                 })
-                .await;
+                .await
+                .unwrap();
             });
         })
-        .await;
-    });
+        .await
+        .unwrap();
+    })
+    .unwrap();
 }
 
 #[test]
 fn test_nested_scope_build_2() {
-    let rt = Runtime::<(), _>::new();
+    let guard = LifetimeGuard;
+    let rt = Runtime::<(), _>::new(&guard);
     rt.block_on(async |ctx| {
-        ctx.scope(async |parent_scope| {
-            parent_scope.spawn_boxed_local(async {
-                ctx.scope_local(async |child_scope| {
+        scope!(ctx, async move |parent_scope| {
+            parent_scope.spawn_boxed_local(async move {
+                scope_local!(ctx, async |child_scope| {
                     child_scope.spawn_boxed(async {});
                 })
-                .await;
+                .await
+                .unwrap();
             });
         })
-        .await;
-    });
+        .await
+        .unwrap();
+    })
+    .unwrap();
 }
 
 #[test]
 fn test_nested_scope_build_3() {
-    let rt = Runtime::<(), _>::new();
+    let guard = LifetimeGuard;
+    let rt = Runtime::<(), _>::new(&guard);
     rt.block_on(async |ctx| {
-        ctx.scope(async |_parent_scope| {
-            ctx.scope_local(async |child_scope| {
+        scope!(ctx, async |_parent_scope| {
+            scope_local!(ctx, async |child_scope| {
                 child_scope.spawn_boxed(async {});
             })
-            .await;
+            .await
+            .unwrap();
         })
-        .await;
-    });
+        .await
+        .unwrap();
+    })
+    .unwrap();
 }
 
 #[test]
 fn test_nested_scope_build_4() {
-    let rt = Runtime::<(), _>::new();
+    let guard = LifetimeGuard;
+    let rt = Runtime::<(), _>::new(&guard);
     rt.block_on(async |ctx| {
-        ctx.scope(async |_parent_scope| {
-            ctx.scope(async |child_scope| {
+        scope!(ctx, async |_parent_scope| {
+            scope!(ctx, async |child_scope| {
                 child_scope.spawn_boxed(async {});
             })
-            .await;
+            .await
+            .unwrap();
         })
-        .await;
-    });
+        .await
+        .unwrap();
+    })
+    .unwrap();
 }
 
 #[test]
 fn test_nested_scope_build_5() {
-    let rt = Runtime::<(), _>::new();
+    let guard = LifetimeGuard;
+    let rt = Runtime::<(), _>::new(&guard);
     rt.block_on(async |ctx| {
-        ctx.scope(async |parent_scope| {
-            async fn run_child_scope(child_scope: &veloq_runtime::scope::AsyncScope<'_, '_, ()>) {
+        scope!(ctx, async move |parent_scope| {
+            async fn run_child_scope(child_scope: &AsyncScope<'_, '_, ()>) {
                 child_scope.spawn_boxed(async {});
             }
-            parent_scope.spawn_boxed(async {
-                ctx.scope(run_child_scope).await;
+            parent_scope.spawn_boxed(async move {
+                scope!(ctx, run_child_scope).await.unwrap();
             });
         })
-        .await;
-    });
+        .await
+        .unwrap();
+    })
+    .unwrap();
 }
 
-// #[test]
-// fn test_nested_scope_build_6() {
-//     let rt = Runtime::<(), _>::new();
-//     rt.block_on(async |ctx| {
-//         ctx.scope(async |parent_scope| {
-//             parent_scope.spawn_boxed(async {
-//                 ctx.scope(async |child_scope| {
-//                     child_scope.spawn_boxed(async {});
-//                 })
-//                 .await;
-//             });
-//         })
-//         .await;
-//     });
-// }
+#[test]
+fn test_nested_scope_build_6() {
+    let guard = LifetimeGuard;
+    let rt = Runtime::<(), _>::new(&guard);
+    rt.block_on(async |ctx| {
+        scope!(ctx, async move |parent_scope| {
+            parent_scope.spawn_boxed(async move {
+                scope!(ctx, async move |child_scope| {
+                    child_scope.spawn_boxed(async {});
+                })
+                .await
+                .unwrap();
+            });
+        })
+        .await
+        .unwrap();
+    })
+    .unwrap();
+}

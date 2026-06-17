@@ -12,9 +12,10 @@ pub(crate) use request::{
 };
 pub(crate) use submit_ops::{RioBufferId, RioCq, RioDispatch, RioKernel, RioProvider, RioRq};
 
-use crate::error::{IocpError, iocp_report_to_event_res};
-use crate::rio::RioState;
-use crate::rio::error::RioError;
+use crate::{
+    error::{IocpError, iocp_report_to_event_res},
+    rio::{RioState, error::RioError},
+};
 use diagweave::prelude::*;
 
 #[inline]

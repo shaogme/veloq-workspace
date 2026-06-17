@@ -1,21 +1,26 @@
+use std::marker::{PhantomData, Send};
+
 use tracing::trace;
 
-use crate::driver::{Driver, DriverSubmitResult, PlatformOp, SubmitStatus};
-use crate::{DriverCoreError, DriverError, DriverReport, DriverResult};
+use crate::{
+    DriverCoreError, DriverError, DriverReport, DriverResult, RawHandleMeta,
+    driver::{CompletionValue, Driver, DriverSubmitResult, PlatformOp, SubmitStatus},
+    slot::SlotSpec,
+};
 use diagweave::prelude::*;
 
 pub trait DriverProvider: Clone + Unpin {
     type Op: PlatformOp;
-    type UP: std::marker::Send;
-    type Completion: crate::driver::CompletionValue;
+    type UP: Send;
+    type Completion: CompletionValue;
     type Error: DriverError;
-    type SlotSpec: crate::slot::SlotSpec<
+    type SlotSpec: SlotSpec<
             Op = Self::Op,
             UserPayload = Self::UP,
             Completion = Self::Completion,
             Error = Self::Error,
         >;
-    type Driver<'a>: crate::driver::Driver<
+    type Driver<'a>: Driver<
             Op = Self::Op,
             UP = Self::UP,
             Completion = Self::Completion,
@@ -29,16 +34,16 @@ pub trait DriverProvider: Clone + Unpin {
 }
 
 mod future;
-mod types;
+pub mod types;
 
 pub use future::*;
-pub use types::*;
+pub use types::OpKind;
 
 /// Trait for managing the lifecycle of an operation.
 pub trait OpLifecycle: Sized {
     type PreAlloc;
     type Output;
-    type Raw: crate::RawHandleMeta;
+    type Raw: RawHandleMeta;
     type CompletionValue;
     type Error: DriverError;
 
@@ -58,14 +63,14 @@ pub trait OpLifecycle: Sized {
 }
 
 /// Trait to convert a user-facing operation to a platform-specific driver operation.
-pub trait IntoPlatformOp<O: PlatformOp>: Sized + std::marker::Send {
-    type UserPayload: std::marker::Send;
-    type ErasedPayload: std::marker::Send;
+pub trait IntoPlatformOp<O: PlatformOp>: Sized + Send {
+    type UserPayload: Send;
+    type ErasedPayload: Send;
     type Output;
     type Completion;
-    type DriverCompletion: crate::driver::CompletionValue;
+    type DriverCompletion: CompletionValue;
     type Error: DriverError;
-    const PAYLOAD_KIND: OpKind;
+    const PAYLOAD_KIND: types::OpKind;
 
     fn into_kernel_and_payload(self) -> (O, Self::UserPayload);
 
@@ -116,7 +121,7 @@ impl<T> Op<T> {
                 DriverCompletion = D::Completion,
                 ErasedPayload = D::UP,
                 Error = D::Error,
-            > + std::marker::Send,
+            > + Send,
         D: Driver,
     {
         let data = self.data;
@@ -142,7 +147,7 @@ impl<T> Op<T> {
                             token: Some(token),
                             immediate_failure: None,
                             immediate_resource_lost: None,
-                            _phantom: std::marker::PhantomData,
+                            _phantom: PhantomData,
                         }
                     }
                     DriverSubmitResult::Failed { report, status } => {
@@ -165,7 +170,7 @@ impl<T> Op<T> {
                                         immediate_resource_lost: Some(
                                             future::payload_missing_error(),
                                         ),
-                                        _phantom: std::marker::PhantomData,
+                                        _phantom: PhantomData,
                                     };
                                 };
 
@@ -184,7 +189,7 @@ impl<T> Op<T> {
                                             immediate_resource_lost: Some(
                                                 future::payload_projection_error(report),
                                             ),
-                                            _phantom: std::marker::PhantomData,
+                                            _phantom: PhantomData,
                                         };
                                     }
                                 };
@@ -198,7 +203,7 @@ impl<T> Op<T> {
                                     token: None,
                                     immediate_failure: Some((report, payload)),
                                     immediate_resource_lost: None,
-                                    _phantom: std::marker::PhantomData,
+                                    _phantom: PhantomData,
                                 }
                             }
                             SubmitStatus::InFlight => {
@@ -211,7 +216,7 @@ impl<T> Op<T> {
                                     token: Some(token),
                                     immediate_failure: None,
                                     immediate_resource_lost: None,
-                                    _phantom: std::marker::PhantomData,
+                                    _phantom: PhantomData,
                                 }
                             }
                         }
@@ -228,7 +233,7 @@ impl<T> Op<T> {
                     token: None,
                     immediate_failure: Some((e, payload)),
                     immediate_resource_lost: None,
-                    _phantom: std::marker::PhantomData,
+                    _phantom: PhantomData,
                 }
             }
         }

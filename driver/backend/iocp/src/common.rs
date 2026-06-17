@@ -1,12 +1,18 @@
-use std::fmt;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    error::Error,
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use diagweave::prelude::*;
-use tracing::error;
 
-use crate::error::IocpError;
-use crate::win32::IoCompletionPort;
+use crate::{
+    error::{IocpDriverResult, IocpError},
+    win32::IoCompletionPort,
+};
 use veloq_driver_core::driver::{CompletionToken, RemoteWaker};
 
 // ============================================================================
@@ -26,7 +32,7 @@ impl fmt::Display for IocpErrorContext {
     }
 }
 
-impl std::error::Error for IocpErrorContext {}
+impl Error for IocpErrorContext {}
 
 impl From<IocpErrorContext> for IocpError {
     fn from(value: IocpErrorContext) -> Self {
@@ -42,17 +48,11 @@ fn sanitize_field(s: &str) -> String {
 
 pub(crate) fn iocp_msg(ctx: IocpErrorContext, detail: impl Into<String>) -> Report<IocpError> {
     let detail = detail.into();
-    let report = IocpError::from(ctx)
+    IocpError::from(ctx)
         .to_report()
         .push_ctx("scope", "iocp/common")
         .with_ctx("detail", sanitize_field(&detail))
-        .attach_note(detail);
-    error!(
-        context = %ctx,
-        report = %report,
-        "IOCP error report"
-    );
-    report
+        .attach_note(detail)
 }
 
 // ============================================================================
@@ -66,7 +66,7 @@ pub(crate) struct IocpWaker {
 }
 
 impl RemoteWaker<IocpError> for IocpWaker {
-    fn wake(&self) -> crate::error::IocpDriverResult<()> {
+    fn wake(&self) -> IocpDriverResult<()> {
         if self.is_notified.load(Ordering::Relaxed) {
             return Ok(());
         }

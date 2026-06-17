@@ -1,10 +1,13 @@
-use super::registry::{
-    RioAddrReservation, RioBufferLeaseToken, RioPreparedBuffer, RioRegistry, RioSubmissionKind,
+use super::{
+    registry::{
+        RioAddrReservation, RioBufferLeaseToken, RioPreparedBuffer, RioRegistry, RioSubmissionKind,
+    },
+    submit_ops::RioRq,
 };
-use super::submit_ops::RioRq;
-use crate::config::{BorrowedRawHandle, IoFd, SocketKey};
-use crate::rio::SocketInflightToken;
-use crate::rio::error::RioError;
+use crate::{
+    config::{BorrowedRawHandle, IoFd, SocketKey},
+    rio::{SocketInflightToken, error::RioError},
+};
 use diagweave::prelude::*;
 use std::ffi::c_void;
 use veloq_driver_core::driver::OpToken;
@@ -320,8 +323,10 @@ mod tests {
     use super::*;
     use crate::config::IocpHandle;
 
+    use std::ptr;
+
     fn test_req_init(addr_slot: Option<usize>) -> RioOpRequestInit {
-        let socket_key = IocpHandle::for_socket(std::ptr::null_mut());
+        let socket_key = IocpHandle::for_socket(ptr::null_mut());
         RioOpRequestInit {
             token: OpToken::from_registry_parts(11, 17).expect("test token should be encodable"),
             socket_inflight: SocketInflightToken::new(socket_key),

@@ -1,6 +1,7 @@
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::fmt;
 use std::future::Future;
+use std::mem::ManuallyDrop;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
@@ -20,52 +21,65 @@ impl fmt::Display for RecvError {
 
 impl std::error::Error for RecvError {}
 
-struct State<T> {
-    value: Option<T>,
-    waker: Option<Waker>,
-    is_tx_closed: bool,
-    is_rx_closed: bool,
+pub struct State<T> {
+    value: UnsafeCell<Option<T>>,
+    waker: UnsafeCell<Option<Waker>>,
+    is_tx_closed: Cell<bool>,
+    is_rx_closed: Cell<bool>,
 }
 
 /// Oneshot 通道发送端
-pub struct Sender<T> {
-    state: Rc<UnsafeCell<State<T>>>,
+pub struct Sender<'a, T> {
+    state: &'a State<T>,
 }
 
 /// Oneshot 通道接收端
-pub struct Receiver<T> {
-    state: Rc<UnsafeCell<State<T>>>,
+pub struct Receiver<'a, T> {
+    state: &'a State<T>,
 }
 
-/// 创建一个新的 oneshot 通道
-pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
-    let state = Rc::new(UnsafeCell::new(State {
-        value: None,
-        waker: None,
-        is_tx_closed: false,
-        is_rx_closed: false,
-    }));
-    (
-        Sender {
-            state: state.clone(),
-        },
-        Receiver { state },
-    )
+impl<T> Default for State<T> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-impl<T> Sender<T> {
+impl<T> State<T> {
+    /// 创建一个新的 oneshot 通道状态
+    pub const fn new() -> Self {
+        State {
+            value: UnsafeCell::new(None),
+            waker: UnsafeCell::new(None),
+            is_tx_closed: Cell::new(false),
+            is_rx_closed: Cell::new(false),
+        }
+    }
+
+    /// 分离为发送端和接收端
+    pub fn split(&self) -> (Sender<'_, T>, Receiver<'_, T>) {
+        (Sender { state: self }, Receiver { state: self })
+    }
+}
+
+/// 创建一个新的 oneshot 通道状态
+pub const fn channel<T>() -> State<T> {
+    State::new()
+}
+
+impl<'a, T> Sender<'a, T> {
     /// 发送消息
     ///
     /// 成功时返回 `Ok(())`，如果接收端已关闭则返回 `Err(t)`。
     pub fn send(self, t: T) -> Result<(), T> {
         let waker;
         {
-            let state = unsafe { &mut *self.state.get() };
-            if state.is_rx_closed {
+            if self.state.is_rx_closed.get() {
                 return Err(t);
             }
-            state.value = Some(t);
-            waker = state.waker.take();
+            let value = unsafe { &mut *self.state.value.get() };
+            *value = Some(t);
+            let waker_slot = unsafe { &mut *self.state.waker.get() };
+            waker = waker_slot.take();
         }
 
         if let Some(waker) = waker {
@@ -76,20 +90,20 @@ impl<T> Sender<T> {
 
     /// 检查接收端是否已关闭
     pub fn is_closed(&self) -> bool {
-        let state = unsafe { &*self.state.get() };
-        state.is_rx_closed
+        self.state.is_rx_closed.get()
     }
 }
 
-impl<T> Drop for Sender<T> {
+impl<'a, T> Drop for Sender<'a, T> {
     fn drop(&mut self) {
         let waker;
         {
-            let state = unsafe { &mut *self.state.get() };
-            state.is_tx_closed = true;
+            self.state.is_tx_closed.set(true);
+            let value = unsafe { &*self.state.value.get() };
             // 如果发送端 drop 了且没发送值，唤醒接收端以让其感知错误
-            if state.value.is_none() {
-                waker = state.waker.take();
+            if value.is_none() {
+                let waker_slot = unsafe { &mut *self.state.waker.get() };
+                waker = waker_slot.take();
             } else {
                 waker = None;
             }
@@ -101,35 +115,38 @@ impl<T> Drop for Sender<T> {
     }
 }
 
-impl<T> Future for Receiver<T> {
+impl<'a, T> Future for Receiver<'a, T> {
     type Output = Result<T, RecvError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let state = unsafe { &mut *self.state.get() };
+        let state = self.state;
+        let value = unsafe { &mut *state.value.get() };
 
-        if let Some(val) = state.value.take() {
+        if let Some(val) = value.take() {
             return Poll::Ready(Ok(val));
         }
 
-        if state.is_tx_closed {
+        if state.is_tx_closed.get() {
             return Poll::Ready(Err(RecvError));
         }
 
-        update_waker(&mut state.waker, cx.waker());
+        let waker_slot = unsafe { &mut *state.waker.get() };
+        update_waker(waker_slot, cx.waker());
         Poll::Pending
     }
 }
 
-impl<T> Receiver<T> {
+impl<'a, T> Receiver<'a, T> {
     /// 尝试非阻塞接收
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        let state = unsafe { &mut *self.state.get() };
+        let state = self.state;
+        let value = unsafe { &mut *state.value.get() };
 
-        if let Some(val) = state.value.take() {
+        if let Some(val) = value.take() {
             return Ok(val);
         }
 
-        if state.is_tx_closed {
+        if state.is_tx_closed.get() {
             return Err(TryRecvError::Closed);
         }
 
@@ -138,26 +155,111 @@ impl<T> Receiver<T> {
 
     /// 关闭接收端
     pub fn close(&mut self) {
-        let state = unsafe { &mut *self.state.get() };
-        state.is_rx_closed = true;
+        self.state.is_rx_closed.set(true);
     }
 }
 
-impl<T> Drop for Receiver<T> {
+impl<'a, T> Drop for Receiver<'a, T> {
     fn drop(&mut self) {
-        let state = unsafe { &mut *self.state.get() };
-        state.is_rx_closed = true;
+        self.state.is_rx_closed.set(true);
     }
 }
 
-impl<T> fmt::Debug for Sender<T> {
+impl<'a, T> fmt::Debug for Sender<'a, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Sender").finish()
     }
 }
 
-impl<T> fmt::Debug for Receiver<T> {
+impl<'a, T> fmt::Debug for Receiver<'a, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Receiver").finish()
+    }
+}
+
+/// Owned oneshot channel sender.
+pub struct OwnedSender<T> {
+    state: ManuallyDrop<Rc<State<T>>>,
+}
+
+/// Owned oneshot channel receiver.
+pub struct OwnedReceiver<T> {
+    state: Rc<State<T>>,
+}
+
+/// Creates a new owned oneshot channel.
+pub fn owned_channel<T>() -> (OwnedSender<T>, OwnedReceiver<T>) {
+    let state = Rc::new(State::new());
+    (
+        OwnedSender {
+            state: ManuallyDrop::new(state.clone()),
+        },
+        OwnedReceiver { state },
+    )
+}
+
+impl<T> OwnedSender<T> {
+    /// Sends a value on the channel.
+    pub fn send(self, t: T) -> Result<(), T> {
+        let this = ManuallyDrop::new(self);
+        let state = unsafe { std::ptr::read(&*this.state) };
+        let sender = Sender { state: &state };
+        sender.send(t)
+    }
+
+    /// Checks if the receiver has been dropped.
+    pub fn is_closed(&self) -> bool {
+        let sender = ManuallyDrop::new(Sender { state: &self.state });
+        sender.is_closed()
+    }
+}
+
+impl<T> Drop for OwnedSender<T> {
+    fn drop(&mut self) {
+        drop(Sender { state: &self.state });
+        unsafe {
+            ManuallyDrop::drop(&mut self.state);
+        }
+    }
+}
+
+impl<T> fmt::Debug for OwnedSender<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OwnedSender").finish()
+    }
+}
+
+impl<T> OwnedReceiver<T> {
+    /// Attempts to receive a value without blocking.
+    pub fn try_recv(&self) -> Result<T, TryRecvError> {
+        let receiver = ManuallyDrop::new(Receiver { state: &self.state });
+        receiver.try_recv()
+    }
+
+    /// Closes the receiver.
+    pub fn close(&mut self) {
+        let mut receiver = ManuallyDrop::new(Receiver { state: &self.state });
+        receiver.close();
+    }
+}
+
+impl<T> Future for OwnedReceiver<T> {
+    type Output = Result<T, RecvError>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut receiver = ManuallyDrop::new(Receiver { state: &self.state });
+        Pin::new(&mut *receiver).poll(cx)
+    }
+}
+
+impl<T> Drop for OwnedReceiver<T> {
+    fn drop(&mut self) {
+        drop(Receiver { state: &self.state });
+    }
+}
+
+impl<T> fmt::Debug for OwnedReceiver<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OwnedReceiver").finish()
     }
 }

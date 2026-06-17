@@ -4,23 +4,29 @@ mod nodes;
 mod scope;
 
 pub use arena::{Arena, GenericArena};
+pub(crate) use header::GenericWakerNode;
 pub use header::{
-    GenericTaskHeader, GenericWakerNode, INTRUSIVE_WAKER_VTABLE, LOCAL_INTRUSIVE_WAKER_VTABLE,
-    PollStatus, STATE_CANCELLED, STATE_COMPLETED, STATE_POLLING, STATE_QUEUED, STATE_READY,
-    STATE_WOKEN, TaskVTable,
+    GenericTaskHeader, INTRUSIVE_WAKER_VTABLE, LOCAL_INTRUSIVE_WAKER_VTABLE, PollStatus, TaskVTable,
 };
+pub(crate) use nodes::{GenericTaskNode, TaskBounds, TaskStorage};
 pub use nodes::{LocalBoxedTaskNode, LocalTaskNode, SendBoxedTaskNode, SendTaskNode};
 pub use scope::{
     AnyScopeRef, AnySendScopeRef, ErasedCancellationToken, OpaqueScope, OpaqueToken, RawScope,
     ScopeParent, ScopeRef, ScopeStorage,
 };
 
-use crate::utils::storage::{AtomicStorage, LocalStorage, StateLock, Storage};
-use std::any::Any;
-use std::future::Future;
-use std::pin::Pin;
-use std::ptr::NonNull;
-use std::task::{Context, Poll};
+use crate::error::Result as RuntimeResult;
+use std::{
+    any::Any,
+    fmt::{Debug, Formatter, Result as FmtResult},
+    future::Future,
+    marker::PhantomData,
+    panic::{AssertUnwindSafe, catch_unwind},
+    pin::Pin,
+    ptr::NonNull,
+    task::{Context, Poll},
+};
+use veloq_storage::{AtomicStorage, LocalStorage, StateLock, Storage};
 
 pub type TaskHeader = GenericTaskHeader<AtomicStorage>;
 pub type LocalTaskHeader = GenericTaskHeader<LocalStorage>;
@@ -34,8 +40,8 @@ pub enum TaskError {
     Cancelled,
 }
 
-impl std::fmt::Debug for TaskError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for TaskError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
             Self::Panic => write!(f, "Task panicked"),
             Self::Cancelled => write!(f, "Task cancelled"),
@@ -86,7 +92,7 @@ pub trait TaskHandleRef: Copy {
     unsafe fn from_header(header: *const GenericTaskHeader<Self::Storage>) -> Self;
 
     /// Polls the task through the handle.
-    fn poll_task(&self, worker_id: usize) -> bool;
+    fn poll_task(&self, worker_id: usize) -> RuntimeResult<bool>;
 
     /// # Safety
     /// The `ptr` must be a valid pointer to a task node implementing `RawTask` with the correct storage.
@@ -97,7 +103,7 @@ pub trait TaskHandleRef: Copy {
 
 pub trait RawTask {
     type Storage: Storage;
-    fn poll_raw(&self, worker_id: usize) -> bool;
+    fn poll_raw(&self, worker_id: usize) -> RuntimeResult<bool>;
     fn header(&self) -> &GenericTaskHeader<Self::Storage>;
 }
 
@@ -161,7 +167,7 @@ where
 {
     header: &'a GenericTaskHeader<S>,
     result_setter: &'a R,
-    marker: std::marker::PhantomData<T>,
+    marker: PhantomData<T>,
 }
 
 impl<'a, T, R, S: Storage> TaskFinalizer<'a, T, R, S>
@@ -173,7 +179,7 @@ where
         Self {
             header,
             result_setter,
-            marker: std::marker::PhantomData,
+            marker: PhantomData,
         }
     }
 
@@ -246,7 +252,7 @@ where
             return true;
         }
 
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| poll_fn(cx)));
+        let res = catch_unwind(AssertUnwindSafe(|| poll_fn(cx)));
         match res {
             Ok(Poll::Ready(val)) => {
                 finalizer.complete(Ok(val), is_local);
@@ -299,7 +305,7 @@ impl TaskHandleRef for LocalTaskRef {
     }
 
     #[inline]
-    fn poll_task(&self, worker_id: usize) -> bool {
+    fn poll_task(&self, worker_id: usize) -> RuntimeResult<bool> {
         let header = unsafe { self.header.as_ref() };
         unsafe { header.poll(worker_id) }
     }
@@ -342,7 +348,7 @@ impl TaskHandleRef for SendTaskRef {
     }
 
     #[inline]
-    fn poll_task(&self, worker_id: usize) -> bool {
+    fn poll_task(&self, worker_id: usize) -> RuntimeResult<bool> {
         let header = unsafe { self.header.as_ref() };
         unsafe { header.poll(worker_id) }
     }
@@ -400,7 +406,7 @@ impl Future for YieldNow {
 macro_rules! task_local {
     ($name:ident, $future_expr:expr) => {
         let mut __fut = $future_expr;
-        let mut __fut = unsafe { std::pin::Pin::new_unchecked(&mut __fut) };
+        let mut __fut = unsafe { core::pin::Pin::new_unchecked(&mut __fut) };
         let $name = $crate::task::LocalTaskNode::new(__fut);
     };
 }
@@ -408,7 +414,7 @@ macro_rules! task_local {
 macro_rules! task {
     ($name:ident, $future_expr:expr) => {
         let mut __fut = $future_expr;
-        let mut __fut = unsafe { std::pin::Pin::new_unchecked(&mut __fut) };
+        let mut __fut = unsafe { core::pin::Pin::new_unchecked(&mut __fut) };
         let $name = $crate::task::SendTaskNode::new(__fut);
     };
 }

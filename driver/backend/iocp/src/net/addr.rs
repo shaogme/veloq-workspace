@@ -1,6 +1,8 @@
 use crate::error::{IocpError, IocpResult};
-use std::mem::offset_of;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::{
+    mem::{offset_of, size_of},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+};
 use veloq_driver_core::SocketAddrCodec;
 use veloq_pod::{Pod, Zeroable, bytes_of, bytes_of_mut, from_bytes, from_bytes_mut, zeroed};
 use windows_sys::Win32::Networking::WinSock::{
@@ -14,14 +16,14 @@ const SOCKADDR_IN6_ADDR_BYTES_OFFSET: usize = offset_of!(SOCKADDR_IN6, sin6_addr
 const SOCKADDR_IN6_SCOPE_ID_OFFSET: usize = offset_of!(SOCKADDR_IN6, Anonymous);
 
 fn read_u32_ne(bytes: &[u8], offset: usize) -> u32 {
-    const SIZE: usize = std::mem::size_of::<u32>();
+    const SIZE: usize = size_of::<u32>();
     let mut raw = [0u8; SIZE];
     raw.copy_from_slice(&bytes[offset..offset + SIZE]);
     u32::from_ne_bytes(raw)
 }
 
 fn write_u32_ne(bytes: &mut [u8], offset: usize, value: u32) {
-    const SIZE: usize = std::mem::size_of::<u32>();
+    const SIZE: usize = size_of::<u32>();
     let raw = value.to_ne_bytes();
     bytes[offset..offset + SIZE].copy_from_slice(&raw);
 }
@@ -143,18 +145,17 @@ pub fn to_socket_addr(buf: &[u8]) -> IocpResult<SocketAddr> {
 
     match family {
         AF_INET => {
-            if buf.len() < std::mem::size_of::<SOCKADDR_IN>() {
+            if buf.len() < size_of::<SOCKADDR_IN>() {
                 return IocpError::InvalidInput.attach_note("invalid IPv4 sockaddr length");
             }
-            let sin_wrapped: &SockAddrIn = from_bytes(&buf[..std::mem::size_of::<SOCKADDR_IN>()]);
+            let sin_wrapped: &SockAddrIn = from_bytes(&buf[..size_of::<SOCKADDR_IN>()]);
             Ok(SocketAddr::V4(sin_wrapped.to_std()))
         }
         AF_INET6 => {
-            if buf.len() < std::mem::size_of::<SOCKADDR_IN6>() {
+            if buf.len() < size_of::<SOCKADDR_IN6>() {
                 return IocpError::InvalidInput.attach_note("invalid IPv6 sockaddr length");
             }
-            let sin6_wrapped: &SockAddrIn6 =
-                from_bytes(&buf[..std::mem::size_of::<SOCKADDR_IN6>()]);
+            let sin6_wrapped: &SockAddrIn6 = from_bytes(&buf[..size_of::<SOCKADDR_IN6>()]);
             Ok(SocketAddr::V6(sin6_wrapped.to_std()))
         }
         _ => IocpError::InvalidInput.attach_note("unsupported address family"),
@@ -168,18 +169,18 @@ pub fn socket_addr_to_storage(addr: SocketAddr) -> (SockAddrStorage, i32) {
         SocketAddr::V4(a) => {
             let sin = SockAddrIn::new(&a);
             let sin_ref = from_bytes_mut::<SockAddrIn>(
-                &mut bytes_of_mut(&mut storage)[..std::mem::size_of::<SOCKADDR_IN>()],
+                &mut bytes_of_mut(&mut storage)[..size_of::<SOCKADDR_IN>()],
             );
             *sin_ref = sin;
-            std::mem::size_of::<SOCKADDR_IN>() as i32
+            size_of::<SOCKADDR_IN>() as i32
         }
         SocketAddr::V6(a) => {
             let sin6 = SockAddrIn6::new(&a);
             let sin6_ref = from_bytes_mut::<SockAddrIn6>(
-                &mut bytes_of_mut(&mut storage)[..std::mem::size_of::<SOCKADDR_IN6>()],
+                &mut bytes_of_mut(&mut storage)[..size_of::<SOCKADDR_IN6>()],
             );
             *sin6_ref = sin6;
-            std::mem::size_of::<SOCKADDR_IN6>() as i32
+            size_of::<SOCKADDR_IN6>() as i32
         }
     };
     (storage, len)

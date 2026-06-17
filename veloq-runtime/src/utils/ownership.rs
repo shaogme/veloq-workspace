@@ -1,8 +1,10 @@
-use std::ops::Deref;
-use std::rc::{Rc, Weak as RcWeak};
-use std::sync::{Arc, Weak as ArcWeak};
+use std::{
+    ops::Deref,
+    rc::{Rc, Weak as RcWeak},
+    sync::{Arc, Weak as ArcWeak},
+};
 
-use crate::utils::storage::StrategyType;
+use veloq_storage::StrategyType;
 
 pub trait Ownership {
     fn strategy_type() -> StrategyType;

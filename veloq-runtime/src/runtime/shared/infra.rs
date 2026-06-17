@@ -1,43 +1,50 @@
-use parking_lot::Mutex;
-use std::ptr::NonNull;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::Sender;
-use std::time::Duration;
+use crossbeam_deque::{Injector, Steal, Stealer, Worker};
+use crossbeam_queue::ArrayQueue;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
+    thread,
+    time::Duration,
+};
+use veloq_storage::{AtomicOptionPtr, StateOptionPtr};
 
-use crate::runtime::context::{IdleDecision, IdleWaitStrategy};
-use crate::runtime::primitives::{EventCount, Parker, ParkerInner, Unparker};
-use crate::runtime::shared::RuntimeShared;
-use crate::scope::GenericScopeCompletion;
-use crate::task::{LocalTaskRef, ScopeStorage, SendTaskRef, TaskHandleRef, TaskHeader};
-use crate::utils::FastRand;
-use crate::utils::ownership::Ownership;
-use crate::utils::storage::{AtomicOptionPtr, StateOptionPtr};
-use crossbeam_deque::Steal;
+use crate::{
+    error::Result,
+    runtime::{
+        context::{IdleDecision, IdleWaitStrategy},
+        primitives::{EventCount, Parker, ParkerInner, Unparker},
+        shared::RuntimeShared,
+    },
+    scope::GenericScopeCompletion,
+    task::{LocalTaskRef, ScopeStorage, SendTaskRef, TaskHeader},
+    utils::{FastRand, ownership::Ownership},
+};
 
 pub(crate) struct WorkerQueue {
-    pub(crate) remote_tx: Sender<SendTaskRef>,
-    pub(crate) pinned_tx: Sender<SendTaskRef>,
-    pub(crate) local_tx: Sender<LocalTaskRef>,
+    pub(crate) remote_queue: ArrayQueue<SendTaskRef>,
+    pub(crate) pinned_queue: ArrayQueue<SendTaskRef>,
+    pub(crate) local_queue: ArrayQueue<LocalTaskRef>,
     pub(crate) pinned_count: AtomicUsize,
     pub(crate) local_count: AtomicUsize,
     /// LIFO slot for high-priority task (cache locality)
     pub(crate) lifo: AtomicOptionPtr<TaskHeader>,
     /// Stealer for work-stealing
-    pub(crate) stealer: crossbeam_deque::Stealer<SendTaskRef>,
+    pub(crate) stealer: Stealer<SendTaskRef>,
 }
 
 impl WorkerQueue {
     pub(crate) fn new(
-        remote_tx: Sender<SendTaskRef>,
-        pinned_tx: Sender<SendTaskRef>,
-        local_tx: Sender<LocalTaskRef>,
-        stealer: crossbeam_deque::Stealer<SendTaskRef>,
+        remote_queue: ArrayQueue<SendTaskRef>,
+        pinned_queue: ArrayQueue<SendTaskRef>,
+        local_queue: ArrayQueue<LocalTaskRef>,
+        stealer: Stealer<SendTaskRef>,
     ) -> Self {
         Self {
-            remote_tx,
-            pinned_tx,
-            local_tx,
+            remote_queue,
+            pinned_queue,
+            local_queue,
             pinned_count: AtomicUsize::new(0),
             local_count: AtomicUsize::new(0),
             lifo: AtomicOptionPtr::new(None),
@@ -123,6 +130,50 @@ impl IdleStack {
             }
         }
     }
+
+    /// 仅当栈顶为 `worker_id` 时弹出（`leave_idle` 快路径）。
+    pub(crate) fn try_pop_self(&self, worker_id: usize, next_ptrs: &[AtomicUsize]) -> bool {
+        let mut head = self.head.load(Ordering::Acquire);
+        loop {
+            if head == Self::EMPTY {
+                return false;
+            }
+            let top_id = (head & 0xFFFFFFFF) as usize;
+            if top_id != worker_id {
+                return false;
+            }
+            let next_id = next_ptrs[worker_id].load(Ordering::Acquire);
+            let new_head = if next_id == usize::MAX {
+                Self::EMPTY
+            } else {
+                let next_gen = (head >> 32) + 1;
+                (next_gen << 32) | (next_id as u64)
+            };
+            match self.head.compare_exchange_weak(
+                head,
+                new_head,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(h) => head = h,
+            }
+        }
+    }
+
+    /// 弹出仍标记为 idle 的 worker；跳过栈中已失效（stale）的条目。
+    pub(crate) fn pop_idle(
+        &self,
+        idle_mask: &AtomicBitset,
+        next_ptrs: &[AtomicUsize],
+    ) -> Option<usize> {
+        while let Some(worker_id) = self.pop(next_ptrs) {
+            if idle_mask.is_set(worker_id) {
+                return Some(worker_id);
+            }
+        }
+        None
+    }
 }
 
 pub(crate) struct AtomicBitset {
@@ -141,10 +192,12 @@ impl AtomicBitset {
         }
     }
 
-    pub(crate) fn set(&self, index: usize) {
+    pub(crate) fn try_set(&self, index: usize) -> bool {
         let word = index / 64;
         let bit = index % 64;
-        self.bits[word].fetch_or(1 << bit, Ordering::Release);
+        let mask = 1 << bit;
+        let prev = self.bits[word].fetch_or(mask, Ordering::AcqRel);
+        prev & mask == 0
     }
 
     pub(crate) fn clear(&self, index: usize) {
@@ -152,10 +205,16 @@ impl AtomicBitset {
         let bit = index % 64;
         self.bits[word].fetch_and(!(1 << bit), Ordering::Release);
     }
+
+    pub(crate) fn is_set(&self, index: usize) -> bool {
+        let word = index / 64;
+        let bit = index % 64;
+        self.bits[word].load(Ordering::Acquire) & (1 << bit) != 0
+    }
 }
 
 pub(crate) struct WorkerRegistry {
-    pub(crate) workers: Box<[Arc<WorkerQueue>]>,
+    pub(crate) workers: Box<[WorkerQueue]>,
     pub(crate) unparkers: Box<[Unparker]>,
     pub(crate) parker_inners: Box<[Arc<ParkerInner>]>,
 }
@@ -198,31 +257,27 @@ impl TopologyContext {
 }
 
 pub(crate) struct GlobalInjector {
-    head: Mutex<Option<NonNull<TaskHeader>>>,
+    queue: Injector<SendTaskRef>,
 }
 
 impl GlobalInjector {
     pub(crate) fn new() -> Self {
         Self {
-            head: Mutex::new(None),
+            queue: Injector::new(),
         }
     }
 
     pub(crate) fn push(&self, task: SendTaskRef) {
-        let task_ptr = NonNull::from(task.header());
-        let mut head = self.head.lock();
-        task.header().set_next(*head);
-        *head = Some(task_ptr);
+        self.queue.push(task);
     }
 
     pub(crate) fn pop(&self) -> Option<SendTaskRef> {
-        let mut head = self.head.lock();
-        let head_ptr = (*head)?;
-        let next_ptr = unsafe { head_ptr.as_ref().next() };
-        *head = next_ptr;
-        unsafe {
-            head_ptr.as_ref().set_next(None);
-            Some(SendTaskRef::from_header(head_ptr.as_ptr()))
+        loop {
+            match self.queue.steal() {
+                Steal::Success(task) => return Some(task),
+                Steal::Retry => continue,
+                Steal::Empty => return None,
+            }
         }
     }
 }
@@ -243,7 +298,7 @@ impl TaskScheduler {
         registry: &WorkerRegistry,
         topo: &TopologyContext,
         rand: &FastRand,
-        thief_worker: &crossbeam_deque::Worker<SendTaskRef>,
+        thief_worker: &Worker<SendTaskRef>,
     ) -> Option<SendTaskRef> {
         let num_workers = registry.workers.len();
         if num_workers <= 1 {
@@ -340,6 +395,29 @@ pub(crate) struct IdleController {
     pub(crate) event_count: EventCount,
 }
 
+impl IdleController {
+    /// 唤醒指定 NUMA 组内一个 idle worker；成功返回 true。
+    pub(crate) fn wake_idle_in_group(
+        &self,
+        group_idx: usize,
+        topo: &TopologyContext,
+        registry: &WorkerRegistry,
+    ) -> bool {
+        let group = &topo.groups[group_idx];
+        if let Some(worker_id) = group.idle_stack.pop_idle(&self.idle_mask, &topo.next_idle) {
+            registry.unpark(worker_id);
+            return true;
+        }
+        for &worker_id in &group.worker_ids {
+            if self.idle_mask.is_set(worker_id) {
+                registry.unpark(worker_id);
+                return true;
+            }
+        }
+        false
+    }
+}
+
 pub(crate) struct RuntimeProgressCoordinator<'a, T> {
     shared: &'a RuntimeShared<T>,
     worker_id: usize,
@@ -353,15 +431,15 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
     pub(crate) fn run<S: ScopeStorage, O: Ownership>(
         &self,
         completion: Option<&GenericScopeCompletion<S, O>>,
-    ) {
+    ) -> Result<()> {
         let idle_decision = self
             .shared
             .idle_hook
             .map(|h| h(self.shared))
             .unwrap_or(IdleDecision::wait(IdleWaitStrategy::Block));
         let Some(wait_strategy) = idle_decision.into_wait_strategy() else {
-            std::thread::yield_now();
-            return;
+            thread::yield_now();
+            return Ok(());
         };
 
         let base = &self.shared.base;
@@ -369,22 +447,24 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
         let group = &base.topo.groups[group_idx];
         let seq = base.idle.event_count.load();
 
-        base.idle.idle_mask.set(self.worker_id);
-        group.idle_stack.push(self.worker_id, &base.topo.next_idle);
+        if base.idle.idle_mask.try_set(self.worker_id) {
+            group.idle_stack.push(self.worker_id, &base.topo.next_idle);
+        }
 
         if self.should_retry(seq, completion) {
             self.leave_idle(group_idx);
-            return;
+            return Ok(());
         }
 
         if let Some(task) = base.scheduler.pop_global() {
             self.leave_idle(group_idx);
-            base.poll_send_task(self.worker_id, task);
-            return;
+            base.poll_send_task(self.worker_id, task)?;
+            return Ok(());
         }
 
         self.park(wait_strategy, completion);
         self.leave_idle(group_idx);
+        Ok(())
     }
 
     fn should_retry<S: ScopeStorage, O: Ownership>(
@@ -395,7 +475,7 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
         let base = &self.shared.base;
         base.idle.event_count.load() != seq
             || self.shared.has_work(self.worker_id)
-            || base.shutdown.load(std::sync::atomic::Ordering::Acquire)
+            || base.shutdown.load(Ordering::Acquire)
             || completion.map(|c| c.is_done()).unwrap_or(false)
     }
 
@@ -422,9 +502,9 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
 
     fn leave_idle(&self, group_idx: usize) {
         let base = &self.shared.base;
-        let _ = base.topo.groups[group_idx]
-            .idle_stack
-            .pop(&base.topo.next_idle);
         base.idle.idle_mask.clear(self.worker_id);
+        base.topo.groups[group_idx]
+            .idle_stack
+            .try_pop_self(self.worker_id, &base.topo.next_idle);
     }
 }

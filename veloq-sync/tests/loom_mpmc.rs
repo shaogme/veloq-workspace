@@ -8,7 +8,7 @@ use veloq_sync::mpmc;
 #[test]
 fn loom_mpmc_unbounded_send_recv_async() {
     loom::model(|| {
-        let (tx, rx) = mpmc::unbounded();
+        let (tx, rx) = mpmc::owned_unbounded();
 
         let tx = Arc::new(tx);
         let rx = Arc::new(rx);

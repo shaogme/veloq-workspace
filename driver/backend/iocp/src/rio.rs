@@ -13,19 +13,19 @@ mod error;
 mod lifecycle;
 pub(crate) mod runtime;
 
-use crate::BufferRegistrationMode;
-use crate::config::SocketKey;
+use crate::{BufferRegistrationMode, config::SocketKey, driver::IocpDriverCompletionDiagnostics};
 use rustc_hash::FxHashMap;
 use slotmap::{SlotMap, new_key_type};
 
-use self::core::{RioCq, RioDispatch, RioKernel, RioRegistry};
-use self::runtime::RioSocketActor;
-use crate::driver::IocpDriverCompletionDiagnostics;
+use self::{
+    core::{RioCq, RioDispatch, RioKernel, RioRegistry},
+    runtime::RioSocketActor,
+};
 
-pub(crate) use self::error::RioError;
-pub(crate) use self::runtime::RioSendToArgs;
-pub(crate) use self::runtime::RioTarget;
-pub(crate) use self::runtime::RioUdpRecvFromArgs;
+pub(crate) use self::{
+    error::RioError,
+    runtime::{RioSendToArgs, RioTarget, RioUdpRecvFromArgs},
+};
 
 new_key_type! {
     pub(crate) struct ActorKey;

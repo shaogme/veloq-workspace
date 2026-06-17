@@ -1,13 +1,14 @@
-pub mod blocking_ops;
-
 use crossbeam_queue::SegQueue;
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::thread;
-use std::time::Duration;
-
-use crate::blocking_ops::SysBlockingOps;
+use parking_lot::{Condvar, Mutex};
+use std::{
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread,
+    time::Duration,
+};
 
 #[derive(Debug, Clone)]
 pub struct BlockingPoolConfig {
@@ -36,18 +37,12 @@ pub enum ThreadPoolError {
 pub enum BlockingTask {
     /// A generic closure to run in the blocking pool.
     Fn(Box<dyn FnOnce() + Send>),
-    // Future expansion for system-specific ops (e.g. legacy IOCP ops)
-    SysOp(SysBlockingOps),
 }
 
 impl BlockingTask {
     pub fn run(self) {
         match self {
             BlockingTask::Fn(f) => f(),
-            #[cfg(target_os = "windows")]
-            BlockingTask::SysOp(op) => op.run(),
-            #[cfg(target_os = "linux")]
-            BlockingTask::SysOp(_) => {}
         }
     }
 }
@@ -136,7 +131,7 @@ impl ThreadPool {
             state.queue.push(task);
 
             // Notify one worker
-            let _guard = state.sleeper_lock.lock().unwrap();
+            let _guard = state.sleeper_lock.lock();
             state.cond.notify_one();
             return Ok(());
         }
@@ -167,7 +162,7 @@ impl ThreadPool {
 
             // Need to notify? Maybe a worker became idle just now
             if state.idle_workers.load(Ordering::SeqCst) > 0 {
-                let _guard = state.sleeper_lock.lock().unwrap();
+                let _guard = state.sleeper_lock.lock();
                 state.cond.notify_one();
             }
             Ok(())
@@ -192,7 +187,7 @@ impl ThreadPool {
 
                 // 2. Queue empty: Prepare to sleep
                 state.idle_workers.fetch_add(1, Ordering::SeqCst);
-                let guard = state.sleeper_lock.lock().unwrap();
+                let mut guard = state.sleeper_lock.lock();
 
                 // 3. Double check queue under lock to avoid race conditions
                 if let Some(task) = state.queue.pop() {
@@ -203,7 +198,7 @@ impl ThreadPool {
                 }
 
                 // 4. Wait for signal
-                let (guard, result) = state.cond.wait_timeout(guard, keep_alive).unwrap();
+                let result = state.cond.wait_for(&mut guard, keep_alive);
                 drop(guard);
                 state.idle_workers.fetch_sub(1, Ordering::SeqCst);
 

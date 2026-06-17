@@ -1,11 +1,18 @@
 use super::{SlotCompletion, SlotError, SlotPayload, SlotSidecarData, SlotSpec};
-use crate::DriverResult;
-use crate::driver::{CompletionAnomaly, CompletionCleanupGuard, UserCompletionEvent};
+use crate::{
+    DriverResult,
+    driver::{AnomalyAttach, CompletionAnomalyKind, CompletionCleanupGuard, UserCompletionEvent},
+};
 use bilge::prelude::*;
-use std::marker::PhantomData;
+use std::{
+    fmt::{self, Debug},
+    marker::PhantomData,
+};
 use veloq_atomic_waker::AtomicWaker;
-use veloq_shim::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use veloq_shim::sync::Mutex;
+use veloq_shim::{
+    atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    sync::Mutex,
+};
 
 #[bitsize(8)]
 #[derive(FromBits, Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,13 +36,11 @@ pub struct PackedCoreState {
 }
 
 impl PackedCoreState {
-    #[inline]
     pub fn with_state(mut self, state: SlotState) -> Self {
         self.set_state(state);
         self
     }
 
-    #[inline]
     pub fn with_generation(mut self, generation: u32) -> Self {
         self.set_generation(generation);
         self
@@ -45,22 +50,18 @@ impl PackedCoreState {
 pub struct AtomicPackedCoreState(AtomicU64);
 
 impl AtomicPackedCoreState {
-    #[inline]
     pub fn new(state: PackedCoreState) -> Self {
         Self(AtomicU64::new(u64::from(state)))
     }
 
-    #[inline]
     pub fn load(&self, order: Ordering) -> PackedCoreState {
         PackedCoreState::from(self.0.load(order))
     }
 
-    #[inline]
     pub fn store(&self, state: PackedCoreState, order: Ordering) {
         self.0.store(u64::from(state), order);
     }
 
-    #[inline]
     pub fn compare_exchange(
         &self,
         current: PackedCoreState,
@@ -74,7 +75,6 @@ impl AtomicPackedCoreState {
             .map_err(PackedCoreState::from)
     }
 
-    #[inline]
     pub fn compare_exchange_weak(
         &self,
         current: PackedCoreState,
@@ -96,7 +96,6 @@ pub struct SlotStorage<Spec: SlotSpec> {
 }
 
 impl<Spec: SlotSpec> SlotStorage<Spec> {
-    #[inline]
     pub fn new() -> Self {
         Self {
             result: None,
@@ -105,12 +104,10 @@ impl<Spec: SlotSpec> SlotStorage<Spec> {
         }
     }
 
-    #[inline]
     pub fn reset(&mut self) {
         *self = Self::new();
     }
 
-    #[inline]
     pub fn with_mut<F, X>(&mut self, f: F) -> X
     where
         F: FnOnce(
@@ -124,7 +121,6 @@ impl<Spec: SlotSpec> SlotStorage<Spec> {
 }
 
 impl<Spec: SlotSpec> Default for SlotStorage<Spec> {
-    #[inline]
     fn default() -> Self {
         Self::new()
     }
@@ -142,7 +138,9 @@ pub struct SlotData<Spec: SlotSpec> {
     marker: SlotMarker<Spec>,
 }
 
+#[derive(Default)]
 pub(crate) enum CompletionData<Spec: SlotSpec> {
+    #[default]
     Empty,
     User {
         event: UserCompletionEvent,
@@ -151,25 +149,19 @@ pub(crate) enum CompletionData<Spec: SlotSpec> {
         cleanup: CompletionCleanupGuard,
     },
     Lost {
-        anomaly: CompletionAnomaly,
+        kind: CompletionAnomalyKind,
+        attach: AnomalyAttach,
         cleanup: CompletionCleanupGuard,
     },
 }
 
-impl<Spec: SlotSpec> Default for CompletionData<Spec> {
-    #[inline]
-    fn default() -> Self {
-        Self::Empty
-    }
-}
-
-impl<Spec: SlotSpec> std::fmt::Debug for CompletionData<Spec>
+impl<Spec: SlotSpec> fmt::Debug for CompletionData<Spec>
 where
-    SlotPayload<Spec>: std::fmt::Debug,
-    SlotCompletion<Spec>: std::fmt::Debug,
-    SlotError<Spec>: std::fmt::Debug,
+    SlotPayload<Spec>: fmt::Debug,
+    SlotCompletion<Spec>: fmt::Debug,
+    SlotError<Spec>: fmt::Debug,
 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Empty => f.write_str("Empty"),
             Self::User {
@@ -184,9 +176,14 @@ where
                 .field("detail", detail)
                 .field("cleanup", cleanup)
                 .finish(),
-            Self::Lost { anomaly, cleanup } => f
+            Self::Lost {
+                kind,
+                attach,
+                cleanup,
+            } => f
                 .debug_struct("Lost")
-                .field("anomaly", anomaly)
+                .field("kind", kind)
+                .field("attach", attach)
                 .field("cleanup", cleanup)
                 .finish(),
         }
@@ -212,22 +209,18 @@ impl<Spec: SlotSpec> SlotData<Spec> {
         }
     }
 
-    #[inline]
     pub(crate) fn state(&self, ordering: Ordering) -> SlotState {
         self.core_state.load(ordering).state()
     }
 
-    #[inline]
     pub fn generation(&self, ordering: Ordering) -> u32 {
         self.core_state.load(ordering).generation()
     }
 
-    #[inline]
     pub(crate) fn load_core_state(&self, ordering: Ordering) -> PackedCoreState {
         self.core_state.load(ordering)
     }
 
-    #[inline]
     pub(crate) fn set_state(&self, state: SlotState, ordering: Ordering) {
         let mut current = self.core_state.load(Ordering::Acquire);
         loop {
@@ -271,7 +264,6 @@ impl<Spec: SlotSpec> SlotData<Spec> {
         }
     }
 
-    #[inline]
     pub(crate) fn completion_with_record_data<F, X>(&self, f: F) -> X
     where
         F: FnOnce(&mut CompletionData<Spec>) -> X,

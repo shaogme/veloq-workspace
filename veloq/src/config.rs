@@ -73,8 +73,8 @@ impl Config {
         self
     }
 
-    pub fn worker_threads(mut self, worker_threads: usize) -> Self {
-        self.worker_threads = Some(NonZeroUsize::new(worker_threads).unwrap_or(nz!(1)));
+    pub fn worker_threads(mut self, worker_threads: Option<NonZeroUsize>) -> Self {
+        self.worker_threads = worker_threads;
         self
     }
 

@@ -12,7 +12,7 @@ mod token;
 mod types;
 
 pub use cancel::{
-    CancelMode, CancelRequest, CancelSubmitOutcome, CancelTargetGoneReason, cancel_target_anomaly,
+    CancelMode, CancelRequest, CancelSubmitOutcome, CancelTargetGoneReason, cancel_target_kind,
 };
 pub use event::{
     CompletionDispatch, CompletionEnvelope, CompletionEvent, CompletionIdentity,
@@ -21,7 +21,7 @@ pub use event::{
 pub use flow::{
     CompletionBackendHooks, CompletionBackendIngressAction, CompletionControl, CompletionFlowExt,
     CompletionFlowOutcome, CompletionHookOutcome, CompletionIngress, CompletionSource,
-    CompletionWritePermit, SyntheticCompletionSource,
+    CompletionWritePermit, HookResult, SyntheticCompletionSource,
 };
 pub use packet::{
     CompletionInput, CompletionLoss, CompletionPacket, CompletionRecord, UserCompletion,
@@ -36,10 +36,11 @@ pub use token::{
     OpTokenError, SubmitTokenContext,
 };
 pub use types::{
-    CompletionAnomaly, CompletionAnomalyReason, CompletionBackend, CompletionCleanup,
-    CompletionCleanupGuard, CompletionMutationOutcome, DriverCompletionDiagnostics,
+    AnomalyAttach, AnomalyOutcome, BackendSlotRef, CompletionAnomaly, CompletionAnomalyKind,
+    CompletionAnomalyReason, CompletionBackend, CompletionCleanup, CompletionCleanupGuard,
+    CompletionMutationOutcome, CompletionRaw, ControlAnomalyReason, DriverCompletionDiagnostics,
     DriverCompletionDiagnosticsBackend, DriverCompletionDiagnosticsSnapshot,
-    RecordCompletionOutcome, RecordCompletionResult,
+    RecordCompletionOutcome, RecordCompletionResult, SlotIssueReason,
 };
 
 pub trait CompletionValue: Send {
@@ -50,7 +51,6 @@ pub trait CompletionValue: Send {
 }
 
 impl CompletionValue for usize {
-    #[inline]
     fn from_event_res<E>(res: i32) -> DriverResult<Self, E>
     where
         E: DriverError,
@@ -69,7 +69,7 @@ impl CompletionValue for usize {
     }
 }
 
-use event::{dispatch_envelope, unknown_completion_anomaly};
+use event::{dispatch_envelope, unknown_completion_kind};
 use packet::{run_completion_cleanup, run_rejected_cleanup};
 use routing::{
     finalize_corrupt_checked, finalize_orphaned_checked, finalize_waiting_checked,

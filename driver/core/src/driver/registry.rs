@@ -1,10 +1,12 @@
-use crate::DriverResult;
-use crate::driver::OpToken;
-use crate::slot::{
-    SlotCompletion, SlotEntry, SlotError, SlotOp, SlotPayload, SlotPlatformData, SlotSidecarData,
-    SlotSpec, SlotState, SlotStorage, SlotTable,
+use crate::{
+    DriverResult,
+    driver::OpToken,
+    slot::{
+        SlotCompletion, SlotEntry, SlotError, SlotOp, SlotPayload, SlotPlatformData,
+        SlotSidecarData, SlotSnapshot, SlotSpec, SlotState, SlotStorage, SlotTable,
+    },
 };
-use std::sync::Arc;
+use std::{mem, sync::Arc};
 use veloq_shim::atomic::Ordering;
 
 pub type RegistryOp<T> = SlotOp<T>;
@@ -34,7 +36,6 @@ pub struct LocalSlot<Spec: SlotSpec> {
 }
 
 impl<Spec: SlotSpec> LocalSlot<Spec> {
-    #[inline]
     fn new() -> Self {
         Self {
             op: None,
@@ -121,7 +122,7 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
 
             let new_gen = slot.generation(Ordering::Relaxed).wrapping_add(1);
             slot.reset(new_gen);
-            slot.set_state(crate::slot::SlotState::Reserved, Ordering::Release);
+            slot.set_state(SlotState::Reserved, Ordering::Release);
 
             self.local[idx].op = None;
             self.local[idx].entry.platform_data = data;
@@ -198,7 +199,6 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         self.slot_bundle_by_index_mut(token.index())
     }
 
-    #[inline]
     pub fn with_slot_storage_mut<F, X>(&mut self, token: OpToken, f: F) -> Option<X>
     where
         F: FnOnce(
@@ -233,7 +233,6 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         core.generation() == generation && core.state() != SlotState::Idle
     }
 
-    #[inline]
     pub fn active_tokens(&self) -> impl Iterator<Item = OpToken> + '_ {
         self.shared
             .slots
@@ -247,7 +246,6 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
             })
     }
 
-    #[inline]
     pub fn capacity(&self) -> usize {
         self.local.len()
     }
@@ -255,7 +253,7 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
     fn remove_at_index(&mut self, user_data: usize) -> OpEntry<RegistryPlatformData<Spec>> {
         let local = &mut self.local[user_data];
         let _ = local.op.take();
-        let data = std::mem::take(&mut local.entry.platform_data);
+        let data = mem::take(&mut local.entry.platform_data);
         local.storage.reset();
         self.shared.slots[user_data].free();
         self.shared.push_free(user_data);
@@ -277,7 +275,6 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         Some(self.remove_at_index(user_data))
     }
 
-    #[inline]
     pub fn finalize_checked(
         &mut self,
         token: OpToken,
@@ -288,7 +285,7 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
     fn recycle_at_index(&mut self, user_data: usize, generation: u32) {
         let local = &mut self.local[user_data];
         let _ = local.op.take();
-        let _ = std::mem::take(&mut local.entry.platform_data);
+        let _ = mem::take(&mut local.entry.platform_data);
         local.storage.reset();
 
         if self.shared.slots[user_data].state(Ordering::Acquire) == SlotState::InFlightReady {
@@ -313,7 +310,6 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         true
     }
 
-    #[inline]
     pub fn finalize_waiting_completion(
         &mut self,
         token: OpToken,
@@ -321,7 +317,6 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         self.remove(token)
     }
 
-    #[inline]
     pub fn finalize_orphaned_completion(
         &mut self,
         token: OpToken,
@@ -329,10 +324,9 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         self.remove(token)
     }
 
-    #[inline]
     pub fn finalize_corrupt_slot(
         &mut self,
-        snapshot: crate::slot::SlotSnapshot,
+        snapshot: SlotSnapshot,
     ) -> Option<OpEntry<RegistryPlatformData<Spec>>> {
         self.remove(OpToken::from_registry_parts(snapshot.index, snapshot.generation).ok()?)
     }
@@ -340,25 +334,24 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
     pub fn get_page_slice(&self, page_idx: usize) -> Option<(*const u8, usize)> {
         if page_idx == 0 {
             let ptr = self.local.as_ptr() as *const u8;
-            let len = std::mem::size_of_val(&*self.local);
+            let len = mem::size_of_val(&*self.local);
             Some((ptr, len))
         } else {
             None
         }
     }
 
-    #[inline]
     pub fn has_active_ops(&self) -> bool {
         self.active_count > 0
     }
 
-    #[inline]
     pub fn active_count(&self) -> usize {
         self.active_count
     }
 }
 
 #[cfg(test)]
+#[cfg(not(feature = "loom"))]
 mod tests {
     use super::*;
     use crate::driver::PlatformOp;

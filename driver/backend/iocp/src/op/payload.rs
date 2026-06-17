@@ -2,14 +2,15 @@ use std::ptr::NonNull;
 
 use windows_sys::Win32::Networking::WinSock::SOCKADDR_STORAGE;
 
-use crate::config::OwnedRawHandle;
-use crate::error::{IocpError, IocpResult};
-use crate::net::addr::SockAddrStorage;
-use crate::op::spec::PayloadBinding;
-use crate::op::{
-    Accept, Close, Connect, Fallocate, FallocateRaw, Fsync, FsyncRaw, OpSend, Open, ReadFixed,
-    ReadRaw, Recv, SendTo, SyncFileRange, SyncFileRangeRaw, Timeout, UdpConnect, UdpRecv,
-    UdpRecvFrom, UdpSend, Wakeup, WriteFixed, WriteRaw,
+use crate::{
+    config::OwnedRawHandle,
+    error::{IocpError, IocpResult},
+    net::addr::SockAddrStorage,
+    op::{
+        Accept, Close, Connect, Fallocate, FallocateRaw, Fsync, FsyncRaw, OpSend, Open, ReadFixed,
+        ReadRaw, Recv, SendTo, SyncFileRange, SyncFileRangeRaw, Timeout, UdpConnect, UdpRecv,
+        UdpRecvFrom, UdpSend, Wakeup, WriteFixed, WriteRaw, spec::PayloadBinding,
+    },
 };
 
 use diagweave::prelude::*;

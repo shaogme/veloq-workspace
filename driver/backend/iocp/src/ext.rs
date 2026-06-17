@@ -1,12 +1,21 @@
-use crate::error::{IocpError, IocpResult};
-use crate::rio::RioError;
-use windows_sys::Win32::Networking::WinSock::{
-    AF_INET, INVALID_SOCKET, IPPROTO_TCP, RIO_EXTENSION_FUNCTION_TABLE,
-    SIO_GET_EXTENSION_FUNCTION_POINTER, SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER, SOCK_STREAM,
-    SOCKADDR, SOCKET, WSA_FLAG_OVERLAPPED, WSAID_ACCEPTEX, WSAID_CONNECTEX,
-    WSAID_GETACCEPTEXSOCKADDRS, WSAID_MULTIPLE_RIO, WSAIoctl, WSASocketW,
+use crate::{
+    error::{IocpError, IocpResult},
+    rio::RioError,
+    win32::SafeSocket,
 };
-use windows_sys::Win32::System::IO::OVERLAPPED;
+
+use windows_sys::{
+    Win32::{
+        Networking::WinSock::{
+            AF_INET, INVALID_SOCKET, IPPROTO_TCP, RIO_EXTENSION_FUNCTION_TABLE,
+            SIO_GET_EXTENSION_FUNCTION_POINTER, SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER,
+            SOCK_STREAM, SOCKADDR, SOCKET, WSA_FLAG_OVERLAPPED, WSAID_ACCEPTEX, WSAID_CONNECTEX,
+            WSAID_GETACCEPTEXSOCKADDRS, WSAID_MULTIPLE_RIO, WSAIoctl, WSASocketW,
+        },
+        System::IO::OVERLAPPED,
+    },
+    core::GUID,
+};
 
 // Function pointer types for WinSock extensions
 pub(crate) type LpfnAcceptEx = unsafe extern "system" fn(
@@ -75,7 +84,7 @@ impl Extensions {
                     IocpError::DriverInit.io_report("WSASocketW", std::io::Error::last_os_error())
                 );
             }
-            crate::win32::SafeSocket(s)
+            SafeSocket(s)
         };
 
         let traditional = Self::load_traditional(socket.as_raw());
@@ -134,7 +143,7 @@ impl Extensions {
         }
     }
 
-    fn get_extension<T>(socket: SOCKET, guid: windows_sys::core::GUID) -> IocpResult<T> {
+    fn get_extension<T>(socket: SOCKET, guid: GUID) -> IocpResult<T> {
         let mut guid = guid;
         let mut val = std::mem::MaybeUninit::<T>::uninit();
         let mut bytes_returned = 0;

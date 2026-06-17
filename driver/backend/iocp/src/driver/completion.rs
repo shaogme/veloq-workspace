@@ -1,21 +1,23 @@
-use std::time::Instant;
+use std::{io, num::NonZeroU8, time::Instant};
 
 use diagweave::prelude::*;
-use tracing::warn;
-use veloq_driver_core::driver::{
-    CancelMode, CompletionAnomaly, CompletionBackend, CompletionBackendHooks,
-    CompletionCleanupGuard, CompletionControl, CompletionEnvelope, CompletionFlowExt,
-    CompletionFlowOutcome, CompletionHookOutcome, CompletionIngress, CompletionSource,
-    SyntheticCompletionSource, UserCompletionEvent,
+use veloq_driver_core::{
+    driver::{
+        AnomalyAttach, CancelMode, CompletionAnomalyKind, CompletionBackend,
+        CompletionBackendHooks, CompletionCleanupGuard, CompletionControl, CompletionEnvelope,
+        CompletionFlowExt, CompletionFlowOutcome, CompletionHookOutcome, CompletionIngress,
+        CompletionSource, SyntheticCompletionSource, UserCompletionEvent,
+    },
+    slot::{CheckedSlotView, InFlightOrphaned, InFlightWaiting, SlotRegistryExt, SlotView},
 };
-use veloq_driver_core::slot::{InFlightOrphaned, InFlightWaiting, SlotRegistryExt, SlotView};
 
-use crate::driver::polling::CompletionProgress;
-use crate::driver::{IocpDriver, IocpDriverCompletionDiagnostics};
-use crate::error::{IocpError, IocpResult, iocp_report_to_event_res};
-use crate::op::{IocpOp, IocpSlotSpec, Slot};
-use crate::rio::{RioState, SocketInflightToken};
-use std::num::NonZeroU8;
+use crate::{
+    driver::{IocpDriver, IocpDriverCompletionDiagnostics, polling::CompletionPump},
+    error::{IocpDriverResult, IocpError, IocpResult, iocp_report_to_event_res},
+    ext::Extensions,
+    op::{IocpOp, IocpOpPayload, IocpSlotSpec, Slot},
+    rio::{RioState, SocketInflightToken},
+};
 
 pub(crate) const COMP_BACKEND_IOCP: CompletionBackend =
     CompletionBackend::Backend(match NonZeroU8::new(1) {
@@ -67,20 +69,20 @@ impl Default for IocpBackendEffect {
 }
 
 struct IocpCompletionHooks<'a> {
-    ext: &'a crate::ext::Extensions,
+    ext: &'a Extensions,
     diagnostics: &'a IocpDriverCompletionDiagnostics,
     rio: &'a mut RioState,
-    completion: &'a crate::driver::polling::CompletionPump,
+    completion: &'a CompletionPump,
     synthetic: IocpSyntheticCompletion,
     post: IocpPostCompletionEffects,
 }
 
 impl<'a> IocpCompletionHooks<'a> {
     fn new(
-        ext: &'a crate::ext::Extensions,
+        ext: &'a Extensions,
         diagnostics: &'a IocpDriverCompletionDiagnostics,
         rio: &'a mut RioState,
-        completion: &'a crate::driver::polling::CompletionPump,
+        completion: &'a CompletionPump,
         synthetic: IocpSyntheticCompletion,
     ) -> Self {
         Self {
@@ -105,30 +107,31 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
     fn handle_control(
         &mut self,
         control: CompletionControl,
-    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
-        match control {
+    ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
+        Ok(match control {
             CompletionControl::Waker { raw, .. } => {
                 if raw.res >= 0 {
                     self.diagnostics.backend().inc_waker_ok();
                     self.completion.clear_notification();
                 } else {
                     self.diagnostics.backend().inc_waker_error();
-                    warn!(res = raw.res, "IOCP waker completion reported an error");
                     self.completion.clear_notification();
+                    return Err(IocpError::Internal
+                        .to_report()
+                        .push_ctx("scope", "iocp.driver.completion.waker")
+                        .set_error_code(-raw.res)
+                        .attach_note("IOCP waker completion reported an error"));
                 }
                 CompletionHookOutcome::ControlHandled {
                     effect: IocpBackendEffect::None,
                 }
             }
-            CompletionControl::Cancel { raw, .. } => {
-                let anomaly = CompletionAnomaly::control_completion_untracked(raw.token)
-                    .with_raw_completion(raw);
-                CompletionHookOutcome::Anomaly {
-                    anomaly,
-                    effect: IocpBackendEffect::None,
-                }
-            }
-        }
+            CompletionControl::Cancel { raw, .. } => CompletionHookOutcome::Anomaly {
+                kind: CompletionAnomalyKind::control_completion_untracked(),
+                attach: AnomalyAttach::from_raw_completion(raw),
+                effect: IocpBackendEffect::None,
+            },
+        })
     }
 
     fn complete_waiting(
@@ -136,8 +139,8 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
         event: UserCompletionEvent,
         mut slot: Slot<'_, InFlightWaiting>,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
-        match source {
+    ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
+        Ok(match source {
             CompletionSource::Synthetic(SyntheticCompletionSource::Timer) => {
                 complete_timer_waiting_slot(slot, event)
             }
@@ -156,7 +159,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
                 let socket_inflight = take_socket_inflight_from_slot(&mut slot);
                 complete_iocp_waiting_slot(slot, event, io_result, socket_inflight)
             }
-        }
+        })
     }
 
     fn complete_orphaned(
@@ -164,22 +167,23 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
         event: UserCompletionEvent,
         slot: Slot<'_, InFlightOrphaned>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
+    ) -> IocpDriverResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         let (cleanup, socket_inflight) = complete_iocp_orphaned_slot(slot, event.res());
-        CompletionHookOutcome::Cleanup {
+        Ok(CompletionHookOutcome::Cleanup {
             cleanup,
             effect: socket_inflight
                 .map(IocpBackendEffect::SocketInflight)
                 .unwrap_or_default(),
-        }
+        })
     }
 
-    fn finish_backend_effect(&mut self, effect: Self::BackendEffect) {
+    fn finish_backend_effect(&mut self, effect: Self::BackendEffect) -> IocpResult<()> {
         match effect {
-            IocpBackendEffect::None => {}
+            IocpBackendEffect::None => Ok(()),
             IocpBackendEffect::SocketInflight(token) => {
-                self.rio.release_socket_inflight_token(token);
+                self.rio.release_socket_inflight_token(token).trans()?;
                 self.post.drain_socket_cleanup = true;
+                Ok(())
             }
         }
     }
@@ -193,9 +197,7 @@ impl<'a> IocpDriver<'a> {
         let mut expired = Vec::new();
         for &token in &timer_buffer {
             match self.ops.checked_slot_view(token) {
-                veloq_driver_core::slot::CheckedSlotView::Valid(SlotView::InFlightWaiting(
-                    mut slot,
-                )) => {
+                CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
                     if let Some(deadline) = slot.platform().timer_deadline
                         && now < deadline
                     {
@@ -206,9 +208,7 @@ impl<'a> IocpDriver<'a> {
                     }
                     expired.push(token);
                 }
-                veloq_driver_core::slot::CheckedSlotView::Valid(SlotView::InFlightOrphaned(
-                    mut slot,
-                )) => {
+                CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot)) => {
                     if let Some(deadline) = slot.platform().timer_deadline
                         && now < deadline
                     {
@@ -237,12 +237,12 @@ impl<'a> IocpDriver<'a> {
     pub(super) fn process_completion_envelope(
         &mut self,
         envelope: CompletionEnvelope,
-    ) -> IocpResult<CompletionProgress> {
-        let outcome = self.accept_completion_ingress(
+    ) -> IocpResult<usize> {
+        self.accept_completion_ingress(
             CompletionIngress::Kernel(envelope),
             IocpSyntheticCompletion::None,
         )?;
-        Ok(CompletionProgress::from_flow(outcome, 1, 0))
+        Ok(1)
     }
 
     pub(crate) fn accept_synthetic_completion(
@@ -256,10 +256,11 @@ impl<'a> IocpDriver<'a> {
 
     pub(crate) fn accept_completion_anomaly(
         &mut self,
-        anomaly: CompletionAnomaly,
+        kind: CompletionAnomalyKind,
+        attach: AnomalyAttach,
     ) -> IocpResult<CompletionFlowOutcome> {
         self.accept_completion_ingress(
-            CompletionIngress::Anomaly(anomaly),
+            CompletionIngress::Anomaly { kind, attach },
             IocpSyntheticCompletion::None,
         )
     }
@@ -298,7 +299,7 @@ impl<'a> IocpDriver<'a> {
             &self.completion_diagnostics,
             &mut hooks,
             ingress,
-        );
+        )?;
         let post = hooks.into_post_effects();
         if post.drain_socket_cleanup {
             self.drain_deferred_socket_cleanup();
@@ -307,23 +308,8 @@ impl<'a> IocpDriver<'a> {
     }
 }
 
-impl CompletionProgress {
-    #[inline]
-    pub(super) fn from_flow(flow: CompletionFlowOutcome, iocp: usize, rio: usize) -> Self {
-        Self {
-            iocp,
-            rio,
-            user_completed: flow.user_completed,
-            user_lost: flow.user_lost,
-            orphan_cleaned: flow.orphan_cleaned,
-            internal: flow.internal,
-            anomaly: flow.anomaly,
-        }
-    }
-}
-
 fn calculate_io_result_from_slot(
-    ext: &crate::ext::Extensions,
+    ext: &Extensions,
     guard: &mut Slot<'_, InFlightWaiting>,
     event_res: i32,
 ) -> IocpResult<usize> {
@@ -331,7 +317,7 @@ fn calculate_io_result_from_slot(
     let mut io_result = if event_res < 0 {
         Err(IocpError::CompletionWait.io_report(
             "iocp.driver.calculate_io_result_from_slot",
-            std::io::Error::from_raw_os_error(-event_res),
+            io::Error::from_raw_os_error(-event_res),
         ))
     } else {
         Ok(event_res as usize)
@@ -344,19 +330,17 @@ fn calculate_io_result_from_slot(
             .take()
             .and_then(|completion| completion.take_result());
         if let Some(res) = blocking_res {
-            io_result = res
-                .with_ctx("outer_scope", "iocp.driver.blocking_completion")
-                .attach_note("blocking completion returned stored error");
+            io_result = res;
         } else if matches!(
             &iocp_op.payload,
-            crate::op::IocpOpPayload::Open(_)
-                | crate::op::IocpOpPayload::Close(_)
-                | crate::op::IocpOpPayload::Fsync(_)
-                | crate::op::IocpOpPayload::FsyncRaw(_)
-                | crate::op::IocpOpPayload::SyncRange(_)
-                | crate::op::IocpOpPayload::SyncRangeRaw(_)
-                | crate::op::IocpOpPayload::Fallocate(_)
-                | crate::op::IocpOpPayload::FallocateRaw(_)
+            IocpOpPayload::Open(_)
+                | IocpOpPayload::Close(_)
+                | IocpOpPayload::Fsync(_)
+                | IocpOpPayload::FsyncRaw(_)
+                | IocpOpPayload::SyncRange(_)
+                | IocpOpPayload::SyncRangeRaw(_)
+                | IocpOpPayload::Fallocate(_)
+                | IocpOpPayload::FallocateRaw(_)
         ) {
             io_result = Err(IocpError::CompletionWait
                 .to_report()
@@ -431,12 +415,7 @@ fn complete_iocp_waiting_slot(
         let _data = std::mem::take(guard.platform_mut());
         CompletionHookOutcome::Lost {
             event,
-            loss_reason: CompletionAnomaly::corrupt_slot_snapshot(
-                event.completion_token(),
-                snapshot,
-            )
-            .with_raw_completion(event.raw()),
-            snapshot,
+            loss_kind: CompletionAnomalyKind::corrupt_snapshot(snapshot),
             cleanup,
             effect,
         }
@@ -504,7 +483,7 @@ fn complete_iocp_orphaned_slot(
     } else {
         Err(IocpError::CompletionWait.io_report(
             "iocp.driver.process_completion.orphaned",
-            std::io::Error::from_raw_os_error(-event_res),
+            io::Error::from_raw_os_error(-event_res),
         ))
     };
     let (cleanup, socket_inflight) = completed

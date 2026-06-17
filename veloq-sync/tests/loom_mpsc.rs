@@ -27,7 +27,7 @@ fn noop_waker() -> Waker {
 #[test]
 fn loom_mpsc_unbounded_recv_async() {
     loom::model(|| {
-        let (tx, mut rx) = mpsc::unbounded();
+        let (tx, mut rx) = mpsc::owned_unbounded();
         let tx = Arc::new(tx);
 
         // Thread 1: Sends data
@@ -66,7 +66,7 @@ fn loom_mpsc_unbounded_recv_async() {
 #[test]
 fn loom_mpsc_bounded_async_send() {
     loom::model(|| {
-        let (tx, mut rx) = mpsc::bounded::<usize>(1);
+        let (tx, mut rx) = mpsc::owned_bounded::<usize>(1);
         let tx = Arc::new(tx);
 
         // Thread 1: Fills the channel and then tries to send more

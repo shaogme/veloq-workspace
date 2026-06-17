@@ -1,7 +1,9 @@
 use super::addr::{socket_addr_to_storage, to_socket_addr};
-use crate::config::{IocpHandle, OwnedRawHandle, RawHandle};
-use crate::error::{IocpError, IocpResult};
-use crate::win32::SafeSocket;
+use crate::{
+    config::{IocpHandle, OwnedRawHandle, RawHandle},
+    error::{IocpError, IocpResult},
+    win32::SafeSocket,
+};
 use diagweave::report::ResultReportExt;
 use std::net::SocketAddr;
 use veloq_driver_core::PlatformSocket;

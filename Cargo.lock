@@ -1393,6 +1393,7 @@ name = "veloq-blocking"
 version = "0.1.0"
 dependencies = [
  "crossbeam-queue",
+ "parking_lot",
  "windows-sys",
 ]
 
@@ -1534,6 +1535,7 @@ dependencies = [
 name = "veloq-storage"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-epoch",
  "parking_lot",
 ]
 

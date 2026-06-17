@@ -11,16 +11,19 @@
 mod dispatch;
 pub(crate) use dispatch::*;
 
-use crate::BufferRegistrationMode;
-use crate::config::BorrowedRawHandle;
-use crate::driver::IocpDriverCompletionDiagnostics;
-use crate::ext::Extensions;
-use crate::op::SubmissionResult;
-use crate::rio::core::{
-    RioAddressPolicy, RioOpKind, RioRegistry, RioSubmissionKind, RioSubmitPlan,
+use crate::{
+    BufferRegistrationMode,
+    config::BorrowedRawHandle,
+    driver::IocpDriverCompletionDiagnostics,
+    ext::Extensions,
+    op::SubmissionResult,
+    rio::{
+        RioState, RioTarget,
+        core::{RioAddressPolicy, RioOpKind, RioRegistry, RioSubmissionKind, RioSubmitPlan},
+        error::{RioError, RioResult},
+    },
 };
-use crate::rio::error::{RioError, RioResult};
-use crate::rio::{RioState, RioTarget};
+use veloq_buf::{BufferRegistrar, FixedBuf, NoopRegistrar, heap::ChunkId};
 
 impl RioState {
     pub(crate) fn new(
@@ -53,14 +56,11 @@ impl RioState {
 
     pub(crate) fn register_chunk(
         &mut self,
-        id: veloq_buf::heap::ChunkId,
+        id: ChunkId,
         ptr: *const u8,
         len: usize,
     ) -> RioResult<()> {
-        let Some(env) = self
-            .kernel
-            .env(&veloq_buf::NoopRegistrar, self.registration_mode)
-        else {
+        let Some(env) = self.kernel.env(&NoopRegistrar, self.registration_mode) else {
             return Ok(());
         };
         self.registry.register_chunk(id, (ptr, len), env)
@@ -69,8 +69,8 @@ impl RioState {
     pub(crate) fn try_submit_recv(
         &mut self,
         target: RioTarget<'_>,
-        buf: &mut veloq_buf::FixedBuf,
-        registrar: &dyn veloq_buf::BufferRegistrar,
+        buf: &mut FixedBuf,
+        registrar: &dyn BufferRegistrar,
     ) -> RioResult<SubmissionResult> {
         self.try_submit_recv_internal(target, buf, registrar)
     }
@@ -78,8 +78,8 @@ impl RioState {
     fn try_submit_recv_internal(
         &mut self,
         target: RioTarget<'_>,
-        buf: &mut veloq_buf::FixedBuf,
-        registrar: &dyn veloq_buf::BufferRegistrar,
+        buf: &mut FixedBuf,
+        registrar: &dyn BufferRegistrar,
     ) -> RioResult<SubmissionResult> {
         let RioTarget {
             fd,
@@ -118,8 +118,8 @@ impl RioState {
     pub(crate) fn try_submit_send(
         &mut self,
         target: RioTarget<'_>,
-        buf: &veloq_buf::FixedBuf,
-        registrar: &dyn veloq_buf::BufferRegistrar,
+        buf: &FixedBuf,
+        registrar: &dyn BufferRegistrar,
     ) -> RioResult<SubmissionResult> {
         let RioTarget {
             fd,

@@ -1,7 +1,26 @@
-use std::ptr::NonNull;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::task::Waker;
+#[macro_use]
+mod macros;
+
+mod atomic;
+mod local;
+mod transfer;
+
+pub use atomic::{
+    ArcStrategy, AtomicLock, AtomicNonNullPtr, AtomicOptionArc, AtomicOptionBox, AtomicOptionPtr,
+    AtomicStorage, AtomicWakerQueue, BoxStrategy, GenericAtomicOption, PhysicalHandle,
+    PointerStrategy,
+};
+pub use local::{
+    LocalLock, LocalStorage, LocalWakerQueue, NonNullPtr, OptionArc, OptionBox, OptionPtr, Usize,
+};
+pub use transfer::StaticTransfer;
+
+use std::{
+    ops::DerefMut,
+    ptr::NonNull,
+    sync::{Arc, atomic::Ordering},
+    task::Waker,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StrategyType {
@@ -9,8 +28,17 @@ pub enum StrategyType {
     Atomic,
 }
 
-pub mod sealed {
+mod sealed {
     pub trait Sealed {}
+}
+
+pub trait StateGuard {
+    /// 延迟释放内存，以防发生 UAF 漏洞。
+    /// # Safety
+    /// 传入的闭包执行的代码必须是安全的回收操作。
+    unsafe fn defer<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static;
 }
 
 pub trait Storage: 'static {
@@ -22,6 +50,9 @@ pub trait Storage: 'static {
     type WakerQueue: StateWakerQueue;
     type OptionBox<T: ?Sized + Send>: StateOptionBox<T>;
     type OptionArc<T: ?Sized + Send + Sync>: StateOptionArc<T>;
+    type Guard: StateGuard;
+
+    fn pin() -> Self::Guard;
 }
 
 /// 标记所有底层 primitive 都可跨线程共享的存储策略。
@@ -101,7 +132,7 @@ pub trait StateNonNullPtr<T> {
 }
 
 pub trait StateLock<T> {
-    type Guard<'a>: std::ops::DerefMut<Target = T>
+    type Guard<'a>: DerefMut<Target = T>
     where
         Self: 'a,
         T: 'a;
@@ -140,100 +171,3 @@ pub trait StateOptionArc<T: ?Sized + Send + Sync> {
         failure: Ordering,
     ) -> Result<(), Arc<T>>;
 }
-
-macro_rules! impl_state_int {
-    ($ty:ty, $self:ident, $order:ident, $val:ident, $curr:ident, $new:ident, $success:ident, $failure:ident,
-     new($new_val:ident) $new_expr:block,
-     load() $load_expr:block,
-     store($store_val:ident) $store_expr:block,
-     fetch_add($add_val:ident) $add_expr:block,
-     fetch_sub($sub_val:ident) $sub_expr:block,
-     fetch_and($and_val:ident) $and_expr:block,
-     fetch_or($or_val:ident) $or_expr:block,
-     compare_exchange($ce_curr:ident, $ce_new:ident, $ce_s:ident, $ce_f:ident) $ce_expr:block,
-     compare_exchange_weak($cew_curr:ident, $cew_new:ident, $cew_s:ident, $cew_f:ident) $cew_expr:block
-    ) => {
-        impl $crate::StateInt for $ty {
-            fn new($new_val: usize) -> Self { $new_expr }
-            fn load(&$self, $order: ::std::sync::atomic::Ordering) -> usize { $load_expr }
-            fn store(&$self, $store_val: usize, $order: ::std::sync::atomic::Ordering) { $store_expr }
-            fn fetch_add(&$self, $add_val: usize, $order: ::std::sync::atomic::Ordering) -> usize { $add_expr }
-            fn fetch_sub(&$self, $sub_val: usize, $order: ::std::sync::atomic::Ordering) -> usize { $sub_expr }
-            fn fetch_and(&$self, $and_val: usize, $order: ::std::sync::atomic::Ordering) -> usize { $and_expr }
-            fn fetch_or(&$self, $or_val: usize, $order: ::std::sync::atomic::Ordering) -> usize { $or_expr }
-            fn compare_exchange(&$self, $ce_curr: usize, $ce_new: usize, $ce_s: ::std::sync::atomic::Ordering, $ce_f: ::std::sync::atomic::Ordering) -> Result<usize, usize> { $ce_expr }
-            fn compare_exchange_weak(&$self, $cew_curr: usize, $cew_new: usize, $cew_s: ::std::sync::atomic::Ordering, $cew_f: ::std::sync::atomic::Ordering) -> Result<usize, usize> { $cew_expr }
-        }
-    };
-}
-
-macro_rules! impl_ptr_state_wrapper {
-    ($name:ident, $trait:ident, $val:ty, $inner_ty:ty, $self:ident, $order:ident,
-     new($new_ptr:ident) $new_expr:block,
-     load() $load_expr:block,
-     store($store_ptr:ident) $store_expr:block,
-     swap($swap_ptr:ident) $swap_expr:block,
-     compare_exchange($ce_curr:ident, $ce_new:ident, $ce_s:ident, $ce_f:ident) $ce_expr:block,
-     compare_exchange_weak($cew_curr:ident, $cew_new:ident, $cew_s:ident, $cew_f:ident) $cew_expr:block,
-     $(unsafe_impl $unsafe_impl:item)*
-    ) => {
-        pub struct $name<T>($inner_ty);
-        $( $unsafe_impl )*
-        impl<T> $crate::$trait<T> for $name<T> {
-            fn new(ptr: $val) -> Self { let $new_ptr = ptr; $new_expr }
-            fn load(&$self, $order: ::std::sync::atomic::Ordering) -> $val { $load_expr }
-            fn store(&$self, ptr: $val, $order: ::std::sync::atomic::Ordering) { let $store_ptr = ptr; $store_expr }
-            fn swap(&$self, ptr: $val, $order: ::std::sync::atomic::Ordering) -> $val { let $swap_ptr = ptr; $swap_expr }
-            fn compare_exchange(&$self, $ce_curr: $val, $ce_new: $val, $ce_s: ::std::sync::atomic::Ordering, $ce_f: ::std::sync::atomic::Ordering) -> Result<$val, $val> { $ce_expr }
-            fn compare_exchange_weak(&$self, $cew_curr: $val, $cew_new: $val, $cew_s: ::std::sync::atomic::Ordering, $cew_f: ::std::sync::atomic::Ordering) -> Result<$val, $val> { $cew_expr }
-        }
-    };
-}
-
-macro_rules! impl_cell_opt_methods {
-    ($val:ty) => {
-        fn new(opt: Option<$val>) -> Self {
-            Self(::std::cell::Cell::new(opt))
-        }
-        fn take(&self, _order: ::std::sync::atomic::Ordering) -> Option<$val> {
-            self.0.take()
-        }
-        fn store(&self, val: Option<$val>, _order: ::std::sync::atomic::Ordering) {
-            self.0.set(val);
-        }
-        fn compare_exchange_none(
-            &self,
-            new: $val,
-            _success: ::std::sync::atomic::Ordering,
-            _failure: ::std::sync::atomic::Ordering,
-        ) -> Result<(), $val> {
-            let old = self.0.take();
-            if old.is_none() {
-                self.0.set(Some(new));
-                Ok(())
-            } else {
-                self.0.set(old);
-                Err(new)
-            }
-        }
-    };
-}
-
-// 声明私有子模块
-mod atomic;
-mod local;
-mod option_arc;
-mod option_box;
-mod pointer;
-mod transfer;
-
-// 重新导出公共 API
-pub use atomic::{AtomicLock, AtomicStorage, AtomicWakerQueue};
-pub use local::{LocalLock, LocalStorage, LocalWakerQueue, Usize};
-pub use option_arc::{AtomicOptionArc, OptionArc};
-pub use option_box::{AtomicOptionBox, OptionBox};
-pub use pointer::{
-    ArcStrategy, AtomicNonNullPtr, AtomicOptionPtr, BoxStrategy, GenericAtomicOption, NonNullPtr,
-    OptionPtr, PhysicalHandle, PointerStrategy,
-};
-pub use transfer::StaticTransfer;

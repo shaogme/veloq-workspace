@@ -1,14 +1,21 @@
-use crate::BufferRegistrationMode;
-use crate::config::BorrowedRawHandle;
-use crate::driver::RIO_EVENT_KEY;
-use crate::ext::Extensions;
-use crate::rio::error::{RioError, RioResult};
-use crate::rio::{RioEnv, RioState};
-use crate::win32::Overlapped;
+use crate::{
+    BufferRegistrationMode,
+    config::BorrowedRawHandle,
+    driver::RIO_EVENT_KEY,
+    ext::Extensions,
+    rio::{
+        RioEnv, RioState,
+        error::{RioError, RioResult},
+    },
+    win32::Overlapped,
+};
 use diagweave::prelude::*;
+use std::{ffi::c_void, ptr};
+use veloq_buf::BufferRegistrar;
 use windows_sys::Win32::Networking::WinSock::{
-    RIO_BUF, RIO_BUFFERID, RIO_CQ, RIO_IOCP_COMPLETION, RIO_NOTIFICATION_COMPLETION, RIO_RQ,
-    RIORESULT, SOCKET_ERROR,
+    RIO_BUF, RIO_BUFFERID, RIO_CQ, RIO_IOCP_COMPLETION, RIO_NOTIFICATION_COMPLETION,
+    RIO_NOTIFICATION_COMPLETION_0, RIO_NOTIFICATION_COMPLETION_0_1, RIO_RQ, RIORESULT,
+    SOCKET_ERROR,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -49,7 +56,7 @@ pub(crate) struct RioRqConfig {
     pub(crate) max_send_data_buffers: u32,
     pub(crate) recv_cq: RioCq,
     pub(crate) send_cq: RioCq,
-    pub(crate) context: *const std::ffi::c_void,
+    pub(crate) context: *const c_void,
 }
 
 pub(crate) struct RioExConfig<'a> {
@@ -61,7 +68,7 @@ pub(crate) struct RioExConfig<'a> {
     pub(crate) control_buf: *const RIO_BUF,
     pub(crate) flags_buf: *const RIO_BUF,
     pub(crate) flags: u32,
-    pub(crate) context: *const std::ffi::c_void,
+    pub(crate) context: *const c_void,
 }
 
 pub(crate) trait RioProvider: Send + Sync {
@@ -89,7 +96,7 @@ pub(crate) trait RioProvider: Send + Sync {
         buf: &RIO_BUF,
         num_bufs: u32,
         flags: u32,
-        context: *const std::ffi::c_void,
+        context: *const c_void,
     ) -> RioResult<()>;
 
     fn send(
@@ -98,7 +105,7 @@ pub(crate) trait RioProvider: Send + Sync {
         buf: &RIO_BUF,
         num_bufs: u32,
         flags: u32,
-        context: *const std::ffi::c_void,
+        context: *const c_void,
     ) -> RioResult<()>;
 
     fn send_ex(&self, config: RioExConfig<'_>) -> RioResult<()>;
@@ -118,7 +125,7 @@ pub(crate) struct RioDispatch {
         u32,
         RIO_CQ,
         RIO_CQ,
-        *const std::ffi::c_void,
+        *const c_void,
     ) -> RIO_RQ,
     pub(crate) register_buffer: unsafe extern "system" fn(*const u8, u32) -> RIO_BUFFERID,
     pub(crate) deregister_buffer: unsafe extern "system" fn(RIO_BUFFERID),
@@ -126,9 +133,9 @@ pub(crate) struct RioDispatch {
     pub(crate) notify: unsafe extern "system" fn(RIO_CQ) -> i32,
     pub(crate) close_cq: unsafe extern "system" fn(RIO_CQ),
     pub(crate) receive:
-        unsafe extern "system" fn(RIO_RQ, *const RIO_BUF, u32, u32, *const std::ffi::c_void) -> i32,
+        unsafe extern "system" fn(RIO_RQ, *const RIO_BUF, u32, u32, *const c_void) -> i32,
     pub(crate) send:
-        unsafe extern "system" fn(RIO_RQ, *const RIO_BUF, u32, u32, *const std::ffi::c_void) -> i32,
+        unsafe extern "system" fn(RIO_RQ, *const RIO_BUF, u32, u32, *const c_void) -> i32,
     pub(crate) send_ex: unsafe extern "system" fn(
         RIO_RQ,
         *const RIO_BUF,
@@ -138,7 +145,7 @@ pub(crate) struct RioDispatch {
         *const RIO_BUF,
         *const RIO_BUF,
         u32,
-        *const std::ffi::c_void,
+        *const c_void,
     ) -> i32,
     pub(crate) receive_ex: unsafe extern "system" fn(
         RIO_RQ,
@@ -149,7 +156,7 @@ pub(crate) struct RioDispatch {
         *const RIO_BUF,
         *const RIO_BUF,
         u32,
-        *const std::ffi::c_void,
+        *const c_void,
     ) -> i32,
 }
 
@@ -247,7 +254,7 @@ impl RioProvider for RioDispatch {
         buf: &RIO_BUF,
         num_bufs: u32,
         flags: u32,
-        context: *const std::ffi::c_void,
+        context: *const c_void,
     ) -> RioResult<()> {
         // SAFETY: Function pointer is verified at startup.
         let ret = unsafe { (self.receive)(rq.0, buf as *const _, num_bufs, flags, context) };
@@ -264,7 +271,7 @@ impl RioProvider for RioDispatch {
         buf: &RIO_BUF,
         num_bufs: u32,
         flags: u32,
-        context: *const std::ffi::c_void,
+        context: *const c_void,
     ) -> RioResult<()> {
         // SAFETY: Function pointer is verified at startup.
         let ret = unsafe { (self.send)(rq.0, buf as *const _, num_bufs, flags, context) };
@@ -388,10 +395,10 @@ impl RioKernel {
         let mut notify_ov = Box::new(Overlapped::zeroed());
         let notification = RIO_NOTIFICATION_COMPLETION {
             Type: RIO_IOCP_COMPLETION,
-            Anonymous: windows_sys::Win32::Networking::WinSock::RIO_NOTIFICATION_COMPLETION_0 {
-                Iocp: windows_sys::Win32::Networking::WinSock::RIO_NOTIFICATION_COMPLETION_0_1 {
+            Anonymous: RIO_NOTIFICATION_COMPLETION_0 {
+                Iocp: RIO_NOTIFICATION_COMPLETION_0_1 {
                     IocpHandle: port.raw().as_handle(),
-                    CompletionKey: RIO_EVENT_KEY as *mut std::ffi::c_void,
+                    CompletionKey: RIO_EVENT_KEY as *mut c_void,
                     Overlapped: notify_ov.as_mut_ptr().cast(),
                 },
             },
@@ -418,7 +425,7 @@ impl RioKernel {
     #[inline]
     pub(crate) fn env<'a>(
         &'a self,
-        registrar: &'a dyn veloq_buf::BufferRegistrar,
+        registrar: &'a dyn BufferRegistrar,
         registration_mode: BufferRegistrationMode,
     ) -> Option<RioEnv<'a>> {
         let dispatch = self.dispatch.as_ref()?;
@@ -444,7 +451,7 @@ impl RioKernel {
         &self,
         rq: RioRq,
         buf: &RIO_BUF,
-        ctx: *const std::ffi::c_void,
+        ctx: *const c_void,
     ) -> RioResult<()> {
         self.dispatch
             .as_ref()
@@ -457,7 +464,7 @@ impl RioKernel {
         &self,
         rq: RioRq,
         buf: &RIO_BUF,
-        ctx: *const std::ffi::c_void,
+        ctx: *const c_void,
     ) -> RioResult<()> {
         self.dispatch
             .as_ref()
@@ -471,7 +478,7 @@ impl RioKernel {
         rq: RioRq,
         data_buf: &RIO_BUF,
         addr_buf: &RIO_BUF,
-        ctx: *const std::ffi::c_void,
+        ctx: *const c_void,
     ) -> RioResult<()> {
         let dispatch = self
             .dispatch
@@ -482,10 +489,10 @@ impl RioKernel {
             rq,
             data_buf,
             data_buf_count: 1,
-            local_addr: std::ptr::null(),
+            local_addr: ptr::null(),
             remote_addr: addr_buf,
-            control_buf: std::ptr::null(),
-            flags_buf: std::ptr::null(),
+            control_buf: ptr::null(),
+            flags_buf: ptr::null(),
             flags: 0,
             context: ctx,
         })
@@ -496,7 +503,7 @@ impl RioKernel {
         rq: RioRq,
         data_buf: &RIO_BUF,
         addr_buf: &RIO_BUF,
-        ctx: *const std::ffi::c_void,
+        ctx: *const c_void,
     ) -> RioResult<()> {
         let dispatch = self
             .dispatch
@@ -507,10 +514,10 @@ impl RioKernel {
             rq,
             data_buf,
             data_buf_count: 1,
-            local_addr: std::ptr::null(),
+            local_addr: ptr::null(),
             remote_addr: addr_buf,
-            control_buf: std::ptr::null(),
-            flags_buf: std::ptr::null(),
+            control_buf: ptr::null(),
+            flags_buf: ptr::null(),
             flags: 0,
             context: ctx,
         })

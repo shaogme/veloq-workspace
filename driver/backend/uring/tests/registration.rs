@@ -6,14 +6,18 @@ use veloq_driver_core::driver::{
     CompletionRecord, CompletionValue, DriveMode, Driver, DriverSubmitResult, PollRecordResult,
     RegisterFd, SubmitStatus,
 };
-use veloq_driver_core::op::{Close, Fsync, IntoPlatformOp};
+use veloq_driver_core::op::{
+    IntoPlatformOp,
+    types::{Close, Fsync},
+};
 use veloq_driver_uring::{
     IoFd, OwnedRawHandle, RawHandle, UringConfig, UringDriver, UringError, UringOp, UringRawHandle,
     UringResult, UringUserPayload,
 };
 
 fn new_driver_or_skip() -> Option<UringDriver<'static>> {
-    match UringDriver::new(UringConfig::default(), Box::new(NoopRegistrar)) {
+    static REGISTRAR: NoopRegistrar = NoopRegistrar;
+    match UringDriver::new(UringConfig::default(), &REGISTRAR) {
         Ok(driver) => Some(driver),
         Err(report) => {
             eprintln!("skipping uring test: {report}");
@@ -27,7 +31,8 @@ fn new_driver_with_entries_or_skip(entries: u32) -> Option<UringDriver<'static>>
         entries: NonZeroU32::new(entries).unwrap(),
         ..UringConfig::default()
     };
-    match UringDriver::new(config, Box::new(NoopRegistrar)) {
+    static REGISTRAR: NoopRegistrar = NoopRegistrar;
+    match UringDriver::new(config, &REGISTRAR) {
         Ok(driver) => Some(driver),
         Err(report) => {
             eprintln!("skipping uring test with {entries} entries: {report}");
@@ -220,8 +225,8 @@ fn wait_completion(
                     .unwrap_or_else(|| usize::from_event_res::<UringError>(event.res()))
                     .expect("completion reported error");
             }
-            PollRecordResult::Unavailable(anomaly) => {
-                panic!("completion record unavailable: {anomaly:?}");
+            PollRecordResult::Unavailable { kind, .. } => {
+                panic!("completion record unavailable: {kind:?}");
             }
             PollRecordResult::Pending => {}
         }

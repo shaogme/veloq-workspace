@@ -1,19 +1,21 @@
-//! Runtime datapath: hot path buffer/pool state and UDP submissions.
-
 pub(crate) mod control_flow;
 
-use crate::IoFd;
-use crate::config::{BorrowedRawHandle, SocketKey};
-use crate::op::SubmissionResult;
-use crate::rio::core::{RioAddressPolicy, RioOpKind, RioSubmissionKind, RioSubmitPlan};
-use crate::rio::error::{RioError, RioResult};
-use crate::rio::{
-    RioState, SocketInflightGuard, SocketInflightToken, SocketLifecycleState, SocketRuntimeState,
+use crate::{
+    IoFd,
+    config::{BorrowedRawHandle, SocketKey},
+    op::SubmissionResult,
+    rio::{
+        RioState, SocketInflightGuard, SocketInflightToken, SocketLifecycleState,
+        SocketRuntimeState,
+        core::{RioAddressPolicy, RioOpKind, RioSubmissionKind, RioSubmitPlan},
+        error::{RioError, RioResult},
+    },
 };
 use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
-use veloq_driver_core::driver::OpToken;
-use veloq_driver_core::op::UdpRecvFrom;
+use std::ffi::c_void;
+use veloq_buf::{BufferRegistrar, FixedBuf};
+use veloq_driver_core::{driver::OpToken, op::types::UdpRecvFrom};
 
 pub(crate) use control_flow::RioSocketActor;
 
@@ -28,8 +30,8 @@ pub(crate) struct RioTarget<'a> {
 pub(crate) struct RioSendToArgs<'a> {
     pub(crate) fd: IoFd,
     pub(crate) handle: BorrowedRawHandle<'a>,
-    pub(crate) buf: &'a veloq_buf::FixedBuf,
-    pub(crate) addr_ptr: *const std::ffi::c_void,
+    pub(crate) buf: &'a FixedBuf,
+    pub(crate) addr_ptr: *const c_void,
     pub(crate) addr_len: i32,
     pub(crate) token: OpToken,
     pub(crate) buf_offset: usize,
@@ -39,7 +41,7 @@ pub(crate) struct RioUdpRecvFromArgs<'a> {
     pub(crate) fd: IoFd,
     pub(crate) handle: BorrowedRawHandle<'a>,
     pub(crate) recv_from_op: &'a mut UdpRecvFrom,
-    pub(crate) addr_ptr: *mut std::ffi::c_void,
+    pub(crate) addr_ptr: *mut c_void,
     pub(crate) token: OpToken,
 }
 
@@ -119,8 +121,11 @@ impl RioState {
     }
 
     #[inline]
-    pub(crate) fn release_socket_inflight_token(&mut self, token: SocketInflightToken) {
-        let _ = release_socket_inflight_token_from(&mut self.socket_runtime, token);
+    pub(crate) fn release_socket_inflight_token(
+        &mut self,
+        token: SocketInflightToken,
+    ) -> RioResult<()> {
+        release_socket_inflight_token_from(&mut self.socket_runtime, token)
     }
 
     #[inline]
@@ -144,7 +149,7 @@ impl RioState {
     pub(crate) fn try_submit_send_to(
         &mut self,
         args: RioSendToArgs<'_>,
-        registrar: &dyn veloq_buf::BufferRegistrar,
+        registrar: &dyn BufferRegistrar,
     ) -> RioResult<SubmissionResult> {
         self.try_submit_send_to_internal(args, registrar)
     }
@@ -152,7 +157,7 @@ impl RioState {
     fn try_submit_send_to_internal(
         &mut self,
         args: RioSendToArgs<'_>,
-        registrar: &dyn veloq_buf::BufferRegistrar,
+        registrar: &dyn BufferRegistrar,
     ) -> RioResult<SubmissionResult> {
         let RioSendToArgs {
             fd,
@@ -198,7 +203,7 @@ impl RioState {
     pub(crate) fn try_submit_recv_from(
         &mut self,
         args: RioUdpRecvFromArgs<'_>,
-        registrar: &dyn veloq_buf::BufferRegistrar,
+        registrar: &dyn BufferRegistrar,
     ) -> RioResult<SubmissionResult> {
         self.try_submit_recv_from_internal(args, registrar)
     }
@@ -206,7 +211,7 @@ impl RioState {
     fn try_submit_recv_from_internal(
         &mut self,
         args: RioUdpRecvFromArgs<'_>,
-        registrar: &dyn veloq_buf::BufferRegistrar,
+        registrar: &dyn BufferRegistrar,
     ) -> RioResult<SubmissionResult> {
         let RioUdpRecvFromArgs {
             fd,
@@ -260,8 +265,10 @@ impl SocketInflightGuard<'_> {
 
 impl Drop for SocketInflightGuard<'_> {
     fn drop(&mut self) {
-        if let Some(token) = self.token.take() {
-            self.state.release_socket_inflight_token(token);
+        if let Some(token) = self.token.take()
+            && let Err(e) = self.state.release_socket_inflight_token(token)
+        {
+            tracing::error!(error = ?e, "failed to release socket inflight token in guard drop");
         }
     }
 }
@@ -269,41 +276,36 @@ impl Drop for SocketInflightGuard<'_> {
 pub(crate) fn release_socket_inflight_token_from(
     socket_runtime: &mut FxHashMap<SocketKey, SocketRuntimeState>,
     token: SocketInflightToken,
-) -> bool {
+) -> RioResult<()> {
     let socket_key = token.socket_key();
-    let state = socket_runtime.get_mut(&socket_key);
-    debug_assert!(
-        state.is_some(),
-        "socket inflight release without registered runtime state"
-    );
-    let Some(state) = state else {
-        tracing::error!(
-            socket_raw = socket_key.as_handle() as usize,
-            "socket inflight release without registered runtime state"
-        );
-        return false;
-    };
-    debug_assert!(state.inflight > 0, "socket inflight counter underflow");
+    let state = socket_runtime.get_mut(&socket_key).ok_or_else(|| {
+        RioError::InvalidInput
+            .to_report()
+            .with_ctx("socket_raw", socket_key.as_handle() as usize)
+            .attach_note("socket inflight release without registered runtime state")
+    })?;
+
     if state.inflight == 0 {
-        tracing::error!(
-            socket_raw = socket_key.as_handle() as usize,
-            "socket inflight counter underflow"
-        );
-        return false;
+        return RioError::Internal
+            .with_ctx("socket_raw", socket_key.as_handle() as usize)
+            .attach_note("socket inflight counter underflow");
     }
     state.inflight -= 1;
-    true
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::BufferRegistrationMode;
-    use crate::config::IocpHandle;
-    use crate::rio::core::{RioKernel, RioRegistry, RioRq};
-    use crate::rio::runtime::RioSocketActor;
+    use crate::{
+        BufferRegistrationMode,
+        config::IocpHandle,
+        rio::core::{RioKernel, RioRegistry, RioRq},
+    };
+    use std::ptr::null_mut;
 
     fn test_state() -> RioState {
+        use rustc_hash::FxHashMap;
         RioState {
             kernel: RioKernel::noop(),
             registry: RioRegistry::new(32, 1),
@@ -320,7 +322,7 @@ mod tests {
     }
 
     fn test_socket_key() -> SocketKey {
-        IocpHandle::for_socket(std::ptr::null_mut())
+        IocpHandle::for_socket(null_mut())
     }
 
     #[test]
@@ -334,7 +336,7 @@ mod tests {
             .expect("registered open socket should acquire inflight token");
         assert_eq!(state.socket_runtime.get(&key).unwrap().inflight, 1);
 
-        state.release_socket_inflight_token(token);
+        state.release_socket_inflight_token(token).unwrap();
         assert_eq!(state.socket_runtime.get(&key).unwrap().inflight, 0);
     }
 
@@ -386,7 +388,7 @@ mod tests {
         assert_eq!(state.actors.len(), 1);
         assert!(state.try_acquire_socket_inflight_token(key).is_err());
 
-        state.release_socket_inflight_token(token);
+        state.release_socket_inflight_token(token).unwrap();
         assert_eq!(state.socket_runtime.get(&key).unwrap().inflight, 0);
     }
 

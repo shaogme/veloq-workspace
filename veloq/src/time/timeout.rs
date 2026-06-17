@@ -1,31 +1,33 @@
 use super::error::Elapsed;
 use super::sleep::{LocalSleep, Sleep, sleep_until, sleep_until_local};
-use crate::runtime::context::RuntimeContext;
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use crate::runtime::context::Ctx;
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+    time::{Duration, Instant},
+};
 
 // ============================================================================
 // Sync/Send Timeout
 // ============================================================================
 
-pub fn timeout<'a, 'ctx, T>(
-    ctx: RuntimeContext<'a, 'ctx>,
+pub fn timeout<'rt, 'reg, T>(
+    ctx: Ctx<'rt, 'reg>,
     duration: Duration,
     future: T,
-) -> Timeout<'a, 'ctx, T>
+) -> Timeout<'rt, 'reg, T>
 where
     T: Future,
 {
     timeout_at(ctx, Instant::now() + duration, future)
 }
 
-pub fn timeout_at<'a, 'ctx, T>(
-    ctx: RuntimeContext<'a, 'ctx>,
+pub fn timeout_at<'rt, 'reg, T>(
+    ctx: Ctx<'rt, 'reg>,
     deadline: Instant,
     future: T,
-) -> Timeout<'a, 'ctx, T>
+) -> Timeout<'rt, 'reg, T>
 where
     T: Future,
 {
@@ -35,14 +37,14 @@ where
     }
 }
 
-pub struct Timeout<'a, 'ctx, T> {
+pub struct Timeout<'rt, 'reg, T> {
     value: T,
-    delay: Sleep<'a, 'ctx>,
+    delay: Sleep<'rt, 'reg>,
 }
 
-impl<'a, 'ctx, T> Future for Timeout<'a, 'ctx, T>
+impl<'rt, 'reg, T> Future for Timeout<'rt, 'reg, T>
 where
-    'ctx: 'a,
+    'reg: 'rt,
     T: Future,
 {
     type Output = Result<T::Output, Elapsed>;
@@ -72,22 +74,22 @@ where
 // Local Timeout
 // ============================================================================
 
-pub fn timeout_local<'a, 'ctx, T>(
-    ctx: RuntimeContext<'a, 'ctx>,
+pub fn timeout_local<'rt, 'reg, T>(
+    ctx: Ctx<'rt, 'reg>,
     duration: Duration,
     future: T,
-) -> LocalTimeout<'a, 'ctx, T>
+) -> LocalTimeout<'rt, 'reg, T>
 where
     T: Future,
 {
     timeout_at_local(ctx, Instant::now() + duration, future)
 }
 
-pub fn timeout_at_local<'a, 'ctx, T>(
-    ctx: RuntimeContext<'a, 'ctx>,
+pub fn timeout_at_local<'rt, 'reg, T>(
+    ctx: Ctx<'rt, 'reg>,
     deadline: Instant,
     future: T,
-) -> LocalTimeout<'a, 'ctx, T>
+) -> LocalTimeout<'rt, 'reg, T>
 where
     T: Future,
 {
@@ -97,14 +99,14 @@ where
     }
 }
 
-pub struct LocalTimeout<'a, 'ctx, T> {
+pub struct LocalTimeout<'rt, 'reg, T> {
     value: T,
-    delay: LocalSleep<'a, 'ctx>,
+    delay: LocalSleep<'rt, 'reg>,
 }
 
-impl<'a, 'ctx, T> Future for LocalTimeout<'a, 'ctx, T>
+impl<'rt, 'reg, T> Future for LocalTimeout<'rt, 'reg, T>
 where
-    'ctx: 'a,
+    'reg: 'rt,
     T: Future,
 {
     type Output = Result<T::Output, Elapsed>;

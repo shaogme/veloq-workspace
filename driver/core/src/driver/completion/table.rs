@@ -1,13 +1,13 @@
 use crate::slot;
-use std::sync::Arc;
-use std::task::Waker;
+use std::{sync::Arc, task::Waker};
 use veloq_shim::atomic::Ordering;
 
-use super::types::CompletionMutationOutcome;
 use super::{
-    CompletionAnomaly, CompletionCleanupGuard, CompletionInput, CompletionPacket, CompletionRecord,
-    CompletionToken, CompletionWritePermit, OpToken, RecordCompletionOutcome,
-    RecordCompletionResult, UserCompletionEvent,
+    AnomalyAttach, AnomalyOutcome, CompletionAnomalyKind, CompletionBackend,
+    CompletionCleanupGuard, CompletionInput, CompletionPacket, CompletionRaw, CompletionRecord,
+    CompletionWritePermit, DriverCompletionDiagnostics, DriverCompletionDiagnosticsBackend,
+    OpToken, RecordCompletionOutcome, RecordCompletionResult, UserCompletionEvent,
+    run_completion_cleanup, types::CompletionMutationOutcome,
 };
 
 pub type SharedCompletionTable<Spec> = Arc<dyn CompletionAccess<Spec>>;
@@ -16,8 +16,11 @@ pub type SharedCompletionTable<Spec> = Arc<dyn CompletionAccess<Spec>>;
 pub enum PollRecordResult<Spec: slot::SlotSpec> {
     /// Operation completed successfully or with an error.
     Ready(CompletionRecord<Spec>),
-    /// Operation completion became unavailable and the waiter can finish as resource-lost.
-    Unavailable(CompletionAnomaly),
+    /// Operation completion became unavailable; materialize at the poll boundary.
+    Unavailable {
+        kind: CompletionAnomalyKind,
+        attach: AnomalyAttach,
+    },
     /// Operation is still in flight.
     Pending,
 }
@@ -33,10 +36,10 @@ pub trait CompletionAccess<Spec: slot::SlotSpec>: Send + Sync {
         &self,
         permit: CompletionWritePermit,
         event: UserCompletionEvent,
-        anomaly: CompletionAnomaly,
+        kind: CompletionAnomalyKind,
         cleanup: CompletionCleanupGuard,
     ) -> RecordCompletionResult<Spec> {
-        self.record_completion(permit, CompletionPacket::lost(event, anomaly, cleanup))
+        self.record_completion(permit, CompletionPacket::lost(event, kind, cleanup))
     }
 
     fn try_take_record(&self, token: OpToken) -> PollRecordResult<Spec>;
@@ -59,13 +62,21 @@ pub const CELL_STATE_READY: u8 = 2;
 pub const CELL_STATE_ORPHANED: u8 = 3;
 pub const CELL_STATE_BUSY: u8 = 4;
 
+#[inline(always)]
+fn spin_yield() {
+    #[cfg(feature = "loom")]
+    veloq_shim::thread::yield_now();
+    #[cfg(not(feature = "loom"))]
+    std::hint::spin_loop();
+}
+
 #[inline]
 fn recorded_completion<Spec: slot::SlotSpec>(
-    diagnostics: &super::DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
+    diagnostics: &DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
     outcome: RecordCompletionOutcome,
 ) -> RecordCompletionResult<Spec>
 where
-    Spec::CompletionDiagnostics: super::DriverCompletionDiagnosticsBackend,
+    Spec::CompletionDiagnostics: DriverCompletionDiagnosticsBackend,
 {
     diagnostics.record_completion_outcome(&outcome);
     RecordCompletionResult::Recorded(outcome)
@@ -73,13 +84,20 @@ where
 
 #[inline]
 fn rejected_completion<Spec: slot::SlotSpec>(
-    diagnostics: &super::DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
+    diagnostics: &DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
     outcome: RecordCompletionOutcome,
+    event: UserCompletionEvent,
     packet: CompletionPacket<Spec>,
 ) -> RecordCompletionResult<Spec>
 where
-    Spec::CompletionDiagnostics: super::DriverCompletionDiagnosticsBackend,
+    Spec::CompletionDiagnostics: DriverCompletionDiagnosticsBackend,
 {
+    if let RecordCompletionOutcome::Rejected(anomaly_outcome) = outcome {
+        diagnostics.record_anomaly_outcome(
+            anomaly_outcome,
+            AnomalyAttach::from_raw_completion(event.raw()),
+        );
+    }
     diagnostics.record_completion_outcome(&outcome);
     RecordCompletionResult::Rejected {
         outcome,
@@ -100,75 +118,64 @@ fn recorded_outcome<Spec: slot::SlotSpec>(
 #[inline]
 fn mutation_missing(token: OpToken) -> CompletionMutationOutcome {
     let (idx, generation) = token.parts();
-    CompletionMutationOutcome::Missing(CompletionAnomaly::unknown_slot(
-        CompletionToken::user(token),
-        idx,
-        generation,
+    CompletionMutationOutcome::Rejected(AnomalyOutcome::Missing(
+        CompletionAnomalyKind::unknown_slot(idx, generation),
     ))
 }
 
 #[inline]
 fn mutation_generation_mismatch(
-    token: OpToken,
     idx: usize,
     expected_generation: u32,
     actual_generation: u32,
     state: slot::SlotState,
 ) -> CompletionMutationOutcome {
-    let completion_token = CompletionToken::user(token);
     if actual_generation > expected_generation {
-        CompletionMutationOutcome::Stale(CompletionAnomaly::stale(
-            completion_token,
+        CompletionMutationOutcome::Rejected(AnomalyOutcome::Stale(CompletionAnomalyKind::stale(
             idx,
             expected_generation,
             actual_generation,
             state,
-        ))
+        )))
     } else {
-        CompletionMutationOutcome::NonActive(CompletionAnomaly::non_active(
-            completion_token,
-            idx,
-            expected_generation,
-            state,
+        CompletionMutationOutcome::Rejected(AnomalyOutcome::NonActive(
+            CompletionAnomalyKind::non_active(idx, expected_generation, state),
         ))
     }
 }
 
 #[inline]
 fn mutation_non_active(
-    token: OpToken,
     idx: usize,
     generation: u32,
     state: slot::SlotState,
 ) -> CompletionMutationOutcome {
-    CompletionMutationOutcome::NonActive(CompletionAnomaly::non_active(
-        CompletionToken::user(token),
-        idx,
-        generation,
-        state,
+    CompletionMutationOutcome::Rejected(AnomalyOutcome::NonActive(
+        CompletionAnomalyKind::non_active(idx, generation, state),
     ))
 }
 
 #[inline]
 fn recorded_mutation<B>(
-    diagnostics: &super::DriverCompletionDiagnostics<B>,
+    diagnostics: &DriverCompletionDiagnostics<B>,
+    token: OpToken,
     outcome: CompletionMutationOutcome,
 ) -> CompletionMutationOutcome
 where
-    B: super::DriverCompletionDiagnosticsBackend,
+    B: DriverCompletionDiagnosticsBackend,
 {
-    if let Some(anomaly) = outcome.anomaly() {
-        diagnostics.record_anomaly(anomaly);
+    if let Some(anomaly_outcome) = outcome.anomaly_outcome() {
+        diagnostics.record_anomaly_outcome(anomaly_outcome, AnomalyAttach::from_op_token(token));
     }
     outcome
 }
 
 #[inline]
 fn run_discarded_record_cleanup<Spec: slot::SlotSpec>(
-    diagnostics: &super::DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
+    diagnostics: &DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
     record_data: slot::CompletionData<Spec>,
 ) where
-    Spec::CompletionDiagnostics: super::DriverCompletionDiagnosticsBackend,
+    Spec::CompletionDiagnostics: DriverCompletionDiagnosticsBackend,
 {
     match record_data {
         slot::CompletionData::User {
@@ -179,13 +186,14 @@ fn run_discarded_record_cleanup<Spec: slot::SlotSpec>(
         } => {
             drop(payload);
             drop(detail);
-            let _ = super::run_completion_cleanup(diagnostics, &mut cleanup);
+            let _ = run_completion_cleanup(diagnostics, &mut cleanup);
         }
         slot::CompletionData::Lost {
-            anomaly: _,
+            kind: _,
+            attach: _,
             mut cleanup,
         } => {
-            let _ = super::run_completion_cleanup(diagnostics, &mut cleanup);
+            let _ = run_completion_cleanup(diagnostics, &mut cleanup);
         }
         slot::CompletionData::Empty => {}
     }
@@ -198,7 +206,6 @@ where
     slot::SlotError<Spec>: Send,
     slot::SlotCompletion<Spec>: Send,
 {
-    #[inline]
     fn record_completion(
         &self,
         _permit: CompletionWritePermit,
@@ -206,15 +213,15 @@ where
     ) -> RecordCompletionResult<Spec> {
         let op_token = packet.token();
         let event = packet.event;
-        let token = event.completion_token();
         let (idx, generation) = op_token.parts();
         let success_outcome = recorded_outcome(&packet.input);
         if idx >= self.slots.len() {
             return rejected_completion(
                 &self.diagnostics,
-                RecordCompletionOutcome::Missing(CompletionAnomaly::unknown_slot(
-                    token, idx, generation,
+                RecordCompletionOutcome::Rejected(AnomalyOutcome::Missing(
+                    CompletionAnomalyKind::unknown_slot(idx, generation),
                 )),
+                event,
                 packet,
             );
         }
@@ -228,23 +235,24 @@ where
             if generation < cell_gen {
                 return rejected_completion(
                     &self.diagnostics,
-                    RecordCompletionOutcome::Stale(CompletionAnomaly::stale(
-                        token, idx, generation, cell_gen, state,
+                    RecordCompletionOutcome::Rejected(AnomalyOutcome::Stale(
+                        CompletionAnomalyKind::stale(idx, generation, cell_gen, state),
                     )),
+                    event,
                     packet,
                 );
             }
             if generation > cell_gen {
                 let outcome = if state == slot::SlotState::Idle {
-                    RecordCompletionOutcome::NonActive(CompletionAnomaly::non_active(
-                        token, idx, generation, state,
+                    RecordCompletionOutcome::Rejected(AnomalyOutcome::NonActive(
+                        CompletionAnomalyKind::non_active(idx, generation, state),
                     ))
                 } else {
-                    RecordCompletionOutcome::Stale(CompletionAnomaly::stale(
-                        token, idx, generation, cell_gen, state,
+                    RecordCompletionOutcome::Rejected(AnomalyOutcome::Stale(
+                        CompletionAnomalyKind::stale(idx, generation, cell_gen, state),
                     ))
                 };
-                return rejected_completion(&self.diagnostics, outcome, packet);
+                return rejected_completion(&self.diagnostics, outcome, event, packet);
             }
 
             match state {
@@ -278,9 +286,10 @@ where
                 | slot::SlotState::ReservedValue => {
                     return rejected_completion(
                         &self.diagnostics,
-                        RecordCompletionOutcome::NonActive(CompletionAnomaly::non_active(
-                            token, idx, generation, state,
+                        RecordCompletionOutcome::Rejected(AnomalyOutcome::NonActive(
+                            CompletionAnomalyKind::non_active(idx, generation, state),
                         )),
+                        event,
                         packet,
                     );
                 }
@@ -288,15 +297,19 @@ where
                     return rejected_completion(
                         &self.diagnostics,
                         RecordCompletionOutcome::OrphanedDropped,
+                        event,
                         packet,
                     );
                 }
-                slot::SlotState::Finalizing => continue,
+                slot::SlotState::Finalizing => {
+                    spin_yield();
+                    continue;
+                }
             }
         };
 
-        if let Some(anomaly) = packet.input.anomaly() {
-            self.diagnostics.record_anomaly(anomaly);
+        if let Some((kind, attach)) = packet.input.lost_kind() {
+            self.diagnostics.record_anomaly_kind(kind, attach);
         }
         let input = packet.input;
         cell.completion_with_record_data(|record| {
@@ -308,7 +321,8 @@ where
                     cleanup: completion.cleanup,
                 },
                 CompletionInput::Lost(loss) => slot::CompletionData::Lost {
-                    anomaly: loss.anomaly,
+                    kind: loss.kind,
+                    attach: loss.attach,
                     cleanup: loss.cleanup,
                 },
             };
@@ -328,14 +342,13 @@ where
         recorded_completion(&self.diagnostics, success_outcome)
     }
 
-    #[inline]
     fn try_take_record(&self, token: OpToken) -> PollRecordResult<Spec> {
-        let completion_token = CompletionToken::user(token);
+        let attach = AnomalyAttach::from_op_token(token);
         let (idx, generation) = token.parts();
         if idx >= self.slots.len() {
-            let anomaly = CompletionAnomaly::unknown_slot(completion_token, idx, generation);
-            self.diagnostics.record_anomaly(&anomaly);
-            return PollRecordResult::Unavailable(anomaly);
+            let kind = CompletionAnomalyKind::unknown_slot(idx, generation);
+            self.diagnostics.record_anomaly_kind(kind, attach);
+            return PollRecordResult::Unavailable { kind, attach };
         }
         let cell = &self.slots[idx];
 
@@ -344,16 +357,15 @@ where
         let cell_gen = current.generation();
 
         if cell_gen > generation {
-            let anomaly =
-                CompletionAnomaly::stale(completion_token, idx, generation, cell_gen, state);
-            self.diagnostics.record_anomaly(&anomaly);
-            return PollRecordResult::Unavailable(anomaly);
+            let kind = CompletionAnomalyKind::stale(idx, generation, cell_gen, state);
+            self.diagnostics.record_anomaly_kind(kind, attach);
+            return PollRecordResult::Unavailable { kind, attach };
         }
 
         if cell_gen < generation {
-            let anomaly = CompletionAnomaly::non_active(completion_token, idx, generation, state);
-            self.diagnostics.record_anomaly(&anomaly);
-            return PollRecordResult::Unavailable(anomaly);
+            let kind = CompletionAnomalyKind::non_active(idx, generation, state);
+            self.diagnostics.record_anomaly_kind(kind, attach);
+            return PollRecordResult::Unavailable { kind, attach };
         }
 
         if state != slot::SlotState::InFlightReady {
@@ -365,10 +377,9 @@ where
                 | slot::SlotState::Reserved
                 | slot::SlotState::InFlightOrphaned
                 | slot::SlotState::ReservedValue => {
-                    let anomaly =
-                        CompletionAnomaly::non_active(completion_token, idx, generation, state);
-                    self.diagnostics.record_anomaly(&anomaly);
-                    PollRecordResult::Unavailable(anomaly)
+                    let kind = CompletionAnomalyKind::non_active(idx, generation, state);
+                    self.diagnostics.record_anomaly_kind(kind, attach);
+                    PollRecordResult::Unavailable { kind, attach }
                 }
                 slot::SlotState::InFlightReady => unreachable!(),
             };
@@ -404,27 +415,41 @@ where
                 detail,
                 cleanup,
             }),
-            slot::CompletionData::Lost { anomaly, cleanup } => {
-                let mut cleanup = cleanup;
-                let _ = super::run_completion_cleanup(&self.diagnostics, &mut cleanup);
-                PollRecordResult::Unavailable(anomaly)
+            slot::CompletionData::Lost {
+                kind,
+                attach,
+                mut cleanup,
+            } => {
+                let _ = run_completion_cleanup(&self.diagnostics, &mut cleanup);
+                PollRecordResult::Unavailable { kind, attach }
             }
             slot::CompletionData::Empty => {
-                let anomaly = CompletionAnomaly::payload_missing(completion_token, idx, generation)
-                    .with_raw_result(cell.completion_res.load(Ordering::Acquire))
-                    .with_flags(cell.completion_flags.load(Ordering::Acquire));
-                self.diagnostics.record_anomaly(&anomaly);
+                let kind = CompletionAnomalyKind::corrupt_snapshot(slot::SlotSnapshot {
+                    index: idx,
+                    generation,
+                    state: slot::SlotState::Idle,
+                    has_op: true,
+                    has_payload: false,
+                });
+                let attach = AnomalyAttach {
+                    token: attach.token,
+                    raw: Some(CompletionRaw {
+                        backend: CompletionBackend::Core,
+                        res: cell.completion_res.load(Ordering::Acquire),
+                        flags: cell.completion_flags.load(Ordering::Acquire),
+                    }),
+                };
+                self.diagnostics.record_anomaly_kind(kind, attach);
                 self.diagnostics.inc_user_lost();
-                PollRecordResult::Unavailable(anomaly)
+                PollRecordResult::Unavailable { kind, attach }
             }
         }
     }
 
-    #[inline]
     fn register_waker(&self, token: OpToken, waker: &Waker) -> CompletionMutationOutcome {
         let (idx, generation) = token.parts();
         if idx >= self.slots.len() {
-            return recorded_mutation(&self.diagnostics, mutation_missing(token));
+            return recorded_mutation(&self.diagnostics, token, mutation_missing(token));
         }
         let cell = &self.slots[idx];
 
@@ -435,7 +460,8 @@ where
         if cell_gen != generation {
             return recorded_mutation(
                 &self.diagnostics,
-                mutation_generation_mismatch(token, idx, generation, cell_gen, state),
+                token,
+                mutation_generation_mismatch(idx, generation, cell_gen, state),
             );
         }
 
@@ -447,29 +473,29 @@ where
         if generation_after != generation {
             return recorded_mutation(
                 &self.diagnostics,
-                mutation_generation_mismatch(token, idx, generation, generation_after, state_after),
+                token,
+                mutation_generation_mismatch(idx, generation, generation_after, state_after),
             );
         }
         if current_after.state() == slot::SlotState::InFlightReady && generation_after == generation
         {
             waker.wake_by_ref();
-            return recorded_mutation(&self.diagnostics, CompletionMutationOutcome::Applied);
+            return recorded_mutation(&self.diagnostics, token, CompletionMutationOutcome::Applied);
         }
 
         let outcome = match state_after {
             slot::SlotState::InFlightWaiting
             | slot::SlotState::InFlightReady
             | slot::SlotState::Finalizing => CompletionMutationOutcome::Applied,
-            state => mutation_non_active(token, idx, generation, state),
+            state => mutation_non_active(idx, generation, state),
         };
-        recorded_mutation(&self.diagnostics, outcome)
+        recorded_mutation(&self.diagnostics, token, outcome)
     }
 
-    #[inline]
     fn mark_waiting(&self, token: OpToken) -> CompletionMutationOutcome {
         let (idx, generation) = token.parts();
         if idx >= self.slots.len() {
-            return recorded_mutation(&self.diagnostics, mutation_missing(token));
+            return recorded_mutation(&self.diagnostics, token, mutation_missing(token));
         }
         let cell = &self.slots[idx];
 
@@ -481,22 +507,31 @@ where
             if cell_generation != generation {
                 return recorded_mutation(
                     &self.diagnostics,
-                    mutation_generation_mismatch(token, idx, generation, cell_generation, state),
+                    token,
+                    mutation_generation_mismatch(idx, generation, cell_generation, state),
                 );
             }
 
             if state == slot::SlotState::InFlightReady {
-                return recorded_mutation(&self.diagnostics, CompletionMutationOutcome::Applied);
+                return recorded_mutation(
+                    &self.diagnostics,
+                    token,
+                    CompletionMutationOutcome::Applied,
+                );
             }
 
             match state {
                 slot::SlotState::InFlightWaiting => {
                     return recorded_mutation(
                         &self.diagnostics,
+                        token,
                         CompletionMutationOutcome::Applied,
                     );
                 }
-                slot::SlotState::Finalizing => continue,
+                slot::SlotState::Finalizing => {
+                    spin_yield();
+                    continue;
+                }
                 slot::SlotState::Idle
                 | slot::SlotState::Reserved
                 | slot::SlotState::InFlightOrphaned
@@ -504,18 +539,18 @@ where
                 | slot::SlotState::ReservedValue => {
                     return recorded_mutation(
                         &self.diagnostics,
-                        mutation_non_active(token, idx, generation, state),
+                        token,
+                        mutation_non_active(idx, generation, state),
                     );
                 }
             }
         }
     }
 
-    #[inline]
     fn discard_ready_record(&self, token: OpToken) -> CompletionMutationOutcome {
         let (idx, generation) = token.parts();
         if idx >= self.slots.len() {
-            return recorded_mutation(&self.diagnostics, mutation_missing(token));
+            return recorded_mutation(&self.diagnostics, token, mutation_missing(token));
         }
         let cell = &self.slots[idx];
 
@@ -543,32 +578,37 @@ where
                         run_discarded_record_cleanup::<Spec>(&self.diagnostics, record_data);
                         return recorded_mutation(
                             &self.diagnostics,
+                            token,
                             CompletionMutationOutcome::Applied,
                         );
                     }
                 }
-                slot::SlotState::Finalizing => continue,
+                slot::SlotState::Finalizing => {
+                    spin_yield();
+                    continue;
+                }
                 _ if cell_gen != generation => {
                     return recorded_mutation(
                         &self.diagnostics,
-                        mutation_generation_mismatch(token, idx, generation, cell_gen, state),
+                        token,
+                        mutation_generation_mismatch(idx, generation, cell_gen, state),
                     );
                 }
                 _ => {
                     return recorded_mutation(
                         &self.diagnostics,
-                        mutation_non_active(token, idx, generation, state),
+                        token,
+                        mutation_non_active(idx, generation, state),
                     );
                 }
             }
         }
     }
 
-    #[inline]
     fn mark_orphaned(&self, token: OpToken) -> CompletionMutationOutcome {
         let (idx, generation) = token.parts();
         if idx >= self.slots.len() {
-            return recorded_mutation(&self.diagnostics, mutation_missing(token));
+            return recorded_mutation(&self.diagnostics, token, mutation_missing(token));
         }
         let cell = &self.slots[idx];
 
@@ -582,7 +622,8 @@ where
                     if cell_gen != generation {
                         return recorded_mutation(
                             &self.diagnostics,
-                            mutation_generation_mismatch(token, idx, generation, cell_gen, state),
+                            token,
+                            mutation_generation_mismatch(idx, generation, cell_gen, state),
                         );
                     }
                     if cell
@@ -599,6 +640,7 @@ where
                     {
                         return recorded_mutation(
                             &self.diagnostics,
+                            token,
                             CompletionMutationOutcome::Applied,
                         );
                     }
@@ -606,24 +648,28 @@ where
                 slot::SlotState::InFlightReady if cell_gen == generation => {
                     return self.discard_ready_record(token);
                 }
-                slot::SlotState::Finalizing => continue,
+                slot::SlotState::Finalizing => {
+                    spin_yield();
+                    continue;
+                }
                 _ if cell_gen != generation => {
                     return recorded_mutation(
                         &self.diagnostics,
-                        mutation_generation_mismatch(token, idx, generation, cell_gen, state),
+                        token,
+                        mutation_generation_mismatch(idx, generation, cell_gen, state),
                     );
                 }
                 _ => {
                     return recorded_mutation(
                         &self.diagnostics,
-                        mutation_non_active(token, idx, generation, state),
+                        token,
+                        mutation_non_active(idx, generation, state),
                     );
                 }
             }
         }
     }
 
-    #[inline]
     #[cfg(any(test, feature = "loom"))]
     fn debug_get_state(&self, idx: usize) -> u8 {
         let current = self.slots[idx].load_core_state(Ordering::Acquire);

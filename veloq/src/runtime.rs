@@ -1,22 +1,32 @@
 pub mod context;
 
-use std::cell::RefCell;
-use std::num::NonZeroUsize;
-use std::ops::AsyncFnOnce;
-use std::sync::{Arc, mpsc};
-use std::thread;
+use std::{
+    cell::RefCell,
+    num::NonZeroUsize,
+    ops::AsyncFnOnce,
+    sync::{Arc, mpsc},
+    thread,
+};
 
 use diagweave::Transform;
 use veloq_blocking::init_blocking_pool;
 use veloq_buf::PoolTopology;
 use veloq_driver_native::driver::PlatformDriver;
-use veloq_runtime::runtime::{self as async_runtime};
-use veloq_runtime::utils::storage::StaticTransfer;
+use veloq_runtime::{
+    LifetimeGuard,
+    runtime::{self as async_runtime},
+    utils::StaticTransfer,
+};
 
-use crate::config::{BlockingPoolConfig, Config};
-use crate::runtime::context::{
-    BorrowedRegistrar, DriverRegistrar, RegistrarMessage, RuntimeContext, WorkerRegistrarState,
-    WorkerState, poll_current_driver,
+pub use veloq_runtime::{scope, scope_local};
+
+use crate::{
+    config::{BlockingPoolConfig, Config},
+    error::Result as VeloqResult,
+    runtime::context::{
+        BorrowedRegistrar, Ctx, RegistrarMessage, SharedRegistrar, WorkerRegistrarState,
+        WorkerState, poll_current_driver,
+    },
 };
 
 pub struct RuntimeBuilder<T: PoolTopology> {
@@ -32,8 +42,8 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
         }
     }
 
-    pub fn worker_count(mut self, worker_count: NonZeroUsize) -> Self {
-        self.config = self.config.worker_threads(worker_count.get());
+    pub fn worker_count(mut self, worker_count: Option<NonZeroUsize>) -> Self {
+        self.config = self.config.worker_threads(worker_count);
         self
     }
 
@@ -60,7 +70,7 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
         self
     }
 
-    pub fn build(self) -> crate::error::Result<Runtime<T>> {
+    pub fn build(self) -> VeloqResult<Runtime<T>> {
         let worker_count = self.config.get_worker_threads_opt().unwrap_or_else(|| {
             thread::available_parallelism()
                 .unwrap_or_else(|_| NonZeroUsize::new(1).expect("1 is non-zero"))
@@ -108,9 +118,9 @@ impl<T: PoolTopology> Runtime<T> {
         self.worker_count
     }
 
-    pub fn block_on<R, F>(self, f: F) -> R
+    pub fn block_on<R, F>(self, f: F) -> VeloqResult<R>
     where
-        F: for<'s1, 's2> AsyncFnOnce(RuntimeContext<'s1, 's2>) -> R,
+        F: for<'s1, 's2> AsyncFnOnce(Ctx<'s1, 's2>) -> R,
     {
         let Runtime {
             worker_count,
@@ -141,9 +151,11 @@ impl<T: PoolTopology> Runtime<T> {
             }),
         );
 
+        let guard = LifetimeGuard;
+
         let runtime = async_runtime::RuntimeBuilder::new()
-            .with_worker_count(worker_count.get())
-            .with_queue_capacity(config.get_queue_capacity().get())
+            .with_worker_count(Some(worker_count))
+            .with_queue_capacity(config.get_queue_capacity())
             .with_idle_hook(poll_current_driver)
             .with_worker_factory(move |worker_id, shared| {
                 let topology = topology.clone();
@@ -152,14 +164,13 @@ impl<T: PoolTopology> Runtime<T> {
                 let receiver = receivers.take(worker_id);
 
                 let registration_mode = config.registration_mode();
-                let registrar = DriverRegistrar::new(shared, registration_mode);
-
+                let registrar = unsafe { SharedRegistrar::from_shared(shared) };
                 let registrar_state = RefCell::new(WorkerRegistrarState {
                     receiver,
                     chunks: Vec::new(),
                 });
 
-                let driver = PlatformDriver::new(config.clone(), Box::new(registrar.clone()))
+                let driver = PlatformDriver::new(config.clone(), registrar)
                     .expect("failed to create driver");
                 let driver_cell = RefCell::new(driver);
 
@@ -177,15 +188,17 @@ impl<T: PoolTopology> Runtime<T> {
                 WorkerState {
                     driver: driver_cell,
                     buf_pool,
-                    registrar,
                     registrar_state,
+                    registration_mode,
                 }
             })
-            .build();
+            .build(&guard);
 
-        runtime.block_on(async move |scope| {
-            let ctx = RuntimeContext { scope };
-            f(ctx).await
-        })
+        runtime
+            .block_on(async move |runtime_ctx| {
+                let ctx = Ctx { runtime_ctx };
+                f(ctx).await
+            })
+            .trans()
     }
 }

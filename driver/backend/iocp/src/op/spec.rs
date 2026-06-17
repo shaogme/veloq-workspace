@@ -1,15 +1,16 @@
 use std::ptr::NonNull;
 
-use crate::config::IoFd;
-use crate::error::{IocpDriverResult as DriverResult, IocpError, IocpResult};
-use crate::ext::Extensions;
-use crate::op::{
-    IocpKernelOp, IocpOpPayload, IocpUserPayload, OpVTable, OverlappedEntry, SubmissionResult,
-    SubmitContext,
+use crate::{
+    config::IoFd,
+    error::{IocpDriverResult as DriverResult, IocpError, IocpResult},
+    ext::Extensions,
+    op::{
+        IocpKernelOp, IocpOpPayload, IocpUserPayload, OpVTable, OverlappedEntry, SubmissionResult,
+        SubmitContext,
+    },
 };
 use diagweave::prelude::*;
-use veloq_driver_core::driver::CompletionCleanupGuard;
-use veloq_driver_core::op::OpKind;
+use veloq_driver_core::{driver::CompletionCleanupGuard, op::OpKind};
 
 pub(crate) trait PayloadBinding<T> {
     fn bind(&mut self, user: NonNull<T>);

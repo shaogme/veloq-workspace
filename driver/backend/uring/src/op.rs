@@ -1,13 +1,20 @@
 //! io_uring Platform-Specific Operation Definitions
 
-use crate::diagnostics::UringCompletionDiagnostics;
-use crate::driver::{UringDriver, UringOpState};
-use crate::error::{UringDriverResult as DriverResult, UringError};
+use crate::{
+    diagnostics::UringCompletionDiagnostics,
+    driver::{UringDriver, UringOpState},
+    error::{UringDriverResult as DriverResult, UringError},
+};
 use io_uring::squeue;
 use std::time::Duration;
-use veloq_driver_core::driver::registry::OpRegistry as CoreOpRegistry;
-use veloq_driver_core::driver::{CompletionCleanupGuard, PlatformOp, SubmitTokenContext};
-use veloq_driver_core::slot::{Slot as CoreSlot, SlotSpec as CoreSlotSpec};
+use veloq_buf::heap::ChunkId;
+use veloq_driver_core::{
+    driver::{
+        CompletionCleanupGuard, PlatformOp, SubmitTokenContext,
+        registry::OpRegistry as CoreOpRegistry,
+    },
+    slot::{Slot as CoreSlot, SlotSpec as CoreSlotSpec},
+};
 
 mod payload;
 mod spec;
@@ -42,11 +49,8 @@ pub(crate) type OrphanCleanupFn =
     unsafe fn(op: &mut UringKernelOp, result: i32) -> CompletionCleanupGuard;
 pub(crate) type GetTimeoutFn =
     unsafe fn(op: &UringKernelOp, payload: &UringUserPayload) -> Option<Duration>;
-pub(crate) type ResolveChunksFn = unsafe fn(
-    op: &UringKernelOp,
-    payload: &UringUserPayload,
-    chunks: &mut [veloq_buf::heap::ChunkId],
-) -> usize;
+pub(crate) type ResolveChunksFn =
+    unsafe fn(op: &UringKernelOp, payload: &UringUserPayload, chunks: &mut [ChunkId]) -> usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SubmissionStrategy {

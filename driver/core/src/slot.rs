@@ -1,7 +1,9 @@
-use crate::DriverResult;
-use crate::SlotSidecar;
-use crate::driver::registry::OpRegistry;
-use crate::driver::{OpToken, PlatformOp};
+use crate::{
+    DriverResult, SlotSidecar,
+    driver::{
+        DriverCompletionDiagnosticsBackend, OpToken, OpTokenError, PlatformOp, registry::OpRegistry,
+    },
+};
 use std::marker::PhantomData;
 use veloq_shim::atomic::Ordering;
 
@@ -12,7 +14,7 @@ pub trait SlotSpec {
     type Sidecar: SlotSidecar;
     type Error;
     type Completion;
-    type CompletionDiagnostics: crate::driver::DriverCompletionDiagnosticsBackend;
+    type CompletionDiagnostics: DriverCompletionDiagnosticsBackend;
 }
 
 pub type SlotOp<Spec> = <Spec as SlotSpec>::Op;
@@ -64,7 +66,6 @@ pub struct Slot<'a, State: SlotMarker, Spec: SlotSpec> {
 }
 
 impl<'a, State: SlotMarker, Spec: SlotSpec> Slot<'a, State, Spec> {
-    #[inline]
     pub(crate) fn new_internal(
         entry: &'a SlotEntry<Spec>,
         op: &'a mut Option<SlotOp<Spec>>,
@@ -82,17 +83,14 @@ impl<'a, State: SlotMarker, Spec: SlotSpec> Slot<'a, State, Spec> {
         }
     }
 
-    #[inline]
     pub fn platform(&self) -> &SlotPlatformData<Spec> {
         self.platform
     }
 
-    #[inline]
     pub fn platform_mut(&mut self) -> &mut SlotPlatformData<Spec> {
         self.platform
     }
 
-    #[inline]
     pub fn snapshot(&self) -> SlotSnapshot {
         SlotSnapshot {
             index: self.index,
@@ -103,7 +101,6 @@ impl<'a, State: SlotMarker, Spec: SlotSpec> Slot<'a, State, Spec> {
         }
     }
 
-    #[inline]
     fn access_error(
         &self,
         action: SlotAccessAction,
@@ -116,7 +113,6 @@ impl<'a, State: SlotMarker, Spec: SlotSpec> Slot<'a, State, Spec> {
         }
     }
 
-    #[inline]
     pub fn with_sidecar_mut<F, X>(&mut self, f: F) -> X
     where
         F: FnOnce(&mut SlotSidecarData<Spec>) -> X,
@@ -125,7 +121,6 @@ impl<'a, State: SlotMarker, Spec: SlotSpec> Slot<'a, State, Spec> {
             .with_mut(|_result, _payload, sidecar| f(sidecar))
     }
 
-    #[inline]
     pub fn with_op_and_payload_mut<F, X>(&mut self, f: F) -> SlotAccessOutcome<X>
     where
         F: FnOnce(&mut SlotOp<Spec>, &mut SlotPayload<Spec>) -> X,
@@ -158,7 +153,6 @@ pub fn is_runnable_state(state: SlotState) -> bool {
 }
 
 impl<'a, Spec: SlotSpec> Slot<'a, Reserved, Spec> {
-    #[inline]
     pub(crate) fn try_bind(
         entry: &'a SlotEntry<Spec>,
         op: &'a mut Option<SlotOp<Spec>>,
@@ -173,7 +167,6 @@ impl<'a, Spec: SlotSpec> Slot<'a, Reserved, Spec> {
         }
     }
 
-    #[inline]
     pub fn has_op(&self) -> bool {
         self.op.is_some()
     }
@@ -225,7 +218,6 @@ impl<'a, Spec: SlotSpec> Slot<'a, Reserved, Spec> {
         })
     }
 
-    #[inline]
     pub fn with_op_mut<F, X>(&mut self, f: F) -> SlotAccessOutcome<X>
     where
         F: FnOnce(&mut SlotOp<Spec>) -> X,
@@ -233,7 +225,6 @@ impl<'a, Spec: SlotSpec> Slot<'a, Reserved, Spec> {
         self.op_mut().map(f)
     }
 
-    #[inline]
     pub fn op_mut(&mut self) -> SlotAccessOutcome<&mut SlotOp<Spec>> {
         if self.op.is_none() {
             return Err(
@@ -245,7 +236,6 @@ impl<'a, Spec: SlotSpec> Slot<'a, Reserved, Spec> {
 }
 
 impl<'a, Spec: SlotSpec> Slot<'a, InFlightWaiting, Spec> {
-    #[inline]
     pub(crate) fn try_bind(
         entry: &'a SlotEntry<Spec>,
         op: &'a mut Option<SlotOp<Spec>>,
@@ -270,7 +260,6 @@ impl<'a, Spec: SlotSpec> Slot<'a, InFlightWaiting, Spec> {
         Slot::new_internal(self.entry, self.op, self.storage, self.platform, self.index)
     }
 
-    #[inline]
     pub fn with_op_mut<F, X>(&mut self, f: F) -> SlotAccessOutcome<X>
     where
         F: FnOnce(&mut SlotOp<Spec>) -> X,
@@ -278,7 +267,6 @@ impl<'a, Spec: SlotSpec> Slot<'a, InFlightWaiting, Spec> {
         self.op_mut().map(f)
     }
 
-    #[inline]
     pub fn op_mut(&mut self) -> SlotAccessOutcome<&mut SlotOp<Spec>> {
         if self.op.is_none() {
             return Err(
@@ -312,14 +300,12 @@ impl<'a, Spec: SlotSpec> Slot<'a, Completed, Spec> {
         Slot::new_internal(self.entry, self.op, self.storage, self.platform, self.index)
     }
 
-    #[inline]
     pub fn take_op(&mut self) -> SlotAccessOutcome<SlotOp<Spec>> {
         self.op.take().ok_or_else(|| {
             self.access_error(SlotAccessAction::TakeOp, SlotAccessErrorReason::MissingOp)
         })
     }
 
-    #[inline]
     pub fn with_op_mut<F, X>(&mut self, f: F) -> SlotAccessOutcome<X>
     where
         F: FnOnce(&mut SlotOp<Spec>) -> X,
@@ -337,7 +323,6 @@ impl<'a, Spec: SlotSpec> Slot<'a, Completed, Spec> {
             .with_mut(|result, payload, _sidecar| (payload.take(), result.take()))
     }
 
-    #[inline]
     pub fn take_completion_data_checked(&mut self) -> SlotAccessOutcome<SlotCompletionData<Spec>> {
         if self.storage.payload.is_none() {
             return Err(self.access_error(
@@ -350,7 +335,6 @@ impl<'a, Spec: SlotSpec> Slot<'a, Completed, Spec> {
 }
 
 impl<'a, Spec: SlotSpec> Slot<'a, InFlightOrphaned, Spec> {
-    #[inline]
     pub(crate) fn try_bind(
         entry: &'a SlotEntry<Spec>,
         op: &'a mut Option<SlotOp<Spec>>,
@@ -369,7 +353,6 @@ impl<'a, Spec: SlotSpec> Slot<'a, InFlightOrphaned, Spec> {
         Slot::new_internal(self.entry, self.op, self.storage, self.platform, self.index)
     }
 
-    #[inline]
     pub fn with_op_mut<F, X>(&mut self, f: F) -> SlotAccessOutcome<X>
     where
         F: FnOnce(&mut SlotOp<Spec>) -> X,
@@ -431,8 +414,7 @@ pub struct SlotSnapshot {
 }
 
 impl SlotSnapshot {
-    #[inline]
-    pub const fn try_token(self) -> Result<OpToken, crate::driver::OpTokenError> {
+    pub const fn try_token(self) -> Result<OpToken, OpTokenError> {
         OpToken::from_registry_parts(self.index, self.generation)
     }
 }
@@ -479,7 +461,6 @@ pub trait SlotRegistryExt<Spec: SlotSpec> {
 }
 
 impl<Spec: SlotSpec> SlotRegistryExt<Spec> for OpRegistry<Spec> {
-    #[inline]
     fn checked_slot_view(&mut self, token: OpToken) -> CheckedSlotView<'_, Spec> {
         let (index, expected_generation) = token.parts();
         let Some((entry, op_entry, op, storage)) = self.slot_bundle_by_index_mut(index) else {
@@ -559,8 +540,10 @@ impl<Spec: SlotSpec> SlotRegistryExt<Spec> for OpRegistry<Spec> {
 mod tests {
     use super::*;
     use crate::driver::{
-        CompletionAccess, CompletionBackendHooks, CompletionControl, CompletionFlowExt,
-        CompletionHookOutcome, CompletionIngress, CompletionSource, CompletionToken, PlatformOp,
+        CompletionAccess, CompletionBackend, CompletionBackendHooks, CompletionCleanupGuard,
+        CompletionControl, CompletionFlowExt, CompletionHookOutcome, CompletionIngress,
+        CompletionSource, CompletionToken, HookResult, PlatformOp, PollRecordResult,
+        SharedCompletionTable, UserCompletionEvent,
     };
 
     struct DummyPlatformOp;
@@ -590,46 +573,54 @@ mod tests {
         fn handle_control(
             &mut self,
             _control: CompletionControl,
-        ) -> CompletionHookOutcome<DummySlotSpec, Self::BackendEffect> {
-            CompletionHookOutcome::Ignore { effect: () }
+        ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>>
+        {
+            Ok(CompletionHookOutcome::Ignore { effect: () })
         }
 
         fn complete_waiting(
             &mut self,
-            event: crate::driver::UserCompletionEvent,
+            event: UserCompletionEvent,
             slot: Slot<'_, InFlightWaiting, DummySlotSpec>,
             _source: CompletionSource<'_, Self::BackendIngress>,
-        ) -> CompletionHookOutcome<DummySlotSpec, Self::BackendEffect> {
+        ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>>
+        {
             let mut completed = slot.complete();
             let _ = completed.take_op();
             let (payload, detail) = completed.take_completion_data();
-            CompletionHookOutcome::User {
+            Ok(CompletionHookOutcome::User {
                 event,
                 payload: payload.expect("test slot payload should exist"),
                 detail,
-                cleanup: crate::driver::CompletionCleanupGuard::default(),
+                cleanup: CompletionCleanupGuard::default(),
                 effect: (),
-            }
+            })
         }
 
         fn complete_orphaned(
             &mut self,
-            _event: crate::driver::UserCompletionEvent,
+            _event: UserCompletionEvent,
             slot: Slot<'_, InFlightOrphaned, DummySlotSpec>,
             _source: CompletionSource<'_, Self::BackendIngress>,
-        ) -> CompletionHookOutcome<DummySlotSpec, Self::BackendEffect> {
+        ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>>
+        {
             let mut completed = slot.complete();
             let _ = completed.take_op();
             let (payload, detail) = completed.take_completion_data();
             let _ = payload;
             drop(detail);
-            CompletionHookOutcome::Cleanup {
-                cleanup: crate::driver::CompletionCleanupGuard::default(),
+            Ok(CompletionHookOutcome::Cleanup {
+                cleanup: CompletionCleanupGuard::default(),
                 effect: (),
-            }
+            })
         }
 
-        fn finish_backend_effect(&mut self, _effect: Self::BackendEffect) {}
+        fn finish_backend_effect(
+            &mut self,
+            _effect: Self::BackendEffect,
+        ) -> HookResult<DummySlotSpec, ()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -659,14 +650,14 @@ mod tests {
         }
 
         let diagnostics = registry.shared.completion_diagnostics();
-        let table: crate::driver::SharedCompletionTable<DummySlotSpec> = registry.shared.clone();
+        let table: SharedCompletionTable<DummySlotSpec> = registry.shared.clone();
         let mut hooks = TestHooks;
         let _ = registry.accept_completion(
             &table,
             &diagnostics,
             &mut hooks,
-            CompletionIngress::User(crate::driver::UserCompletionEvent::from_parts(
-                crate::driver::CompletionBackend::Core,
+            CompletionIngress::User(UserCompletionEvent::from_parts(
+                CompletionBackend::Core,
                 token,
                 0,
                 0,
@@ -678,10 +669,10 @@ mod tests {
             CheckedSlotView::Empty(_)
         ));
         let record = match registry.shared.try_take_record(token) {
-            crate::driver::PollRecordResult::Ready(record) => record,
-            crate::driver::PollRecordResult::Pending => panic!("completion should be ready"),
-            crate::driver::PollRecordResult::Unavailable(anomaly) => {
-                panic!("completion should be available: {anomaly:?}")
+            PollRecordResult::Ready(record) => record,
+            PollRecordResult::Pending => panic!("completion should be ready"),
+            PollRecordResult::Unavailable { kind, .. } => {
+                panic!("completion should be available: {kind:?}")
             }
         };
         assert_eq!(record.event.completion_token(), completion_token);
