@@ -3,7 +3,9 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use veloq_runtime::{runtime::Runtime, scope, scope::JoinOutcome, select, task::TaskError};
+use veloq_runtime::{
+    LifetimeGuard, runtime::Runtime, scope, scope::JoinOutcome, select, task::TaskError,
+};
 
 struct ReadyFuture<T>(Option<T>);
 impl<T: Unpin + Copy> Future for ReadyFuture<T> {
@@ -31,7 +33,8 @@ impl Future for PendingFuture {
 
 #[test]
 fn test_select_basic() {
-    let rt = Runtime::<(), _>::new();
+    let guard = LifetimeGuard;
+    let rt = Runtime::<(), _>::new(&guard);
     rt.block_on(async |ctx| {
         let res = select! {
             ctx;
@@ -45,7 +48,8 @@ fn test_select_basic() {
 
 #[test]
 fn test_select_biased() {
-    let rt = Runtime::<(), _>::new();
+    let guard = LifetimeGuard;
+    let rt = Runtime::<(), _>::new(&guard);
     rt.block_on(async |ctx| {
         let res = select! {
             ctx;
@@ -60,7 +64,8 @@ fn test_select_biased() {
 
 #[test]
 fn test_select_biased_reverse() {
-    let rt = Runtime::<(), _>::new();
+    let guard = LifetimeGuard;
+    let rt = Runtime::<(), _>::new(&guard);
     rt.block_on(async |ctx| {
         let res = select! {
             ctx;
@@ -75,7 +80,8 @@ fn test_select_biased_reverse() {
 
 #[test]
 fn test_select_fair_distribution() {
-    let rt = Runtime::<(), _>::new();
+    let guard = LifetimeGuard;
+    let rt = Runtime::<(), _>::new(&guard);
     rt.block_on(async |ctx| {
         let mut saw_first = false;
         let mut saw_second = false;
@@ -107,7 +113,8 @@ fn test_select_fair_distribution() {
 
 #[test]
 fn test_select_expression() {
-    let rt = Runtime::<(), _>::new();
+    let guard = LifetimeGuard;
+    let rt = Runtime::<(), _>::new(&guard);
     rt.block_on(async |ctx| {
         let res = select! {
             ctx;
@@ -121,7 +128,8 @@ fn test_select_expression() {
 
 #[test]
 fn test_select_three_branches() {
-    let rt = Runtime::<(), _>::new();
+    let guard = LifetimeGuard;
+    let rt = Runtime::<(), _>::new(&guard);
     rt.block_on(async |ctx| {
         let res = select! {
             ctx;
@@ -136,7 +144,8 @@ fn test_select_three_branches() {
 
 #[test]
 fn test_select_cancellation() {
-    let rt = Runtime::<(), _>::new();
+    let guard = LifetimeGuard;
+    let rt = Runtime::<(), _>::new(&guard);
     rt.block_on(async |ctx| {
         scope!(ctx, async |s| {
             let handle = s.spawn_boxed(async move {

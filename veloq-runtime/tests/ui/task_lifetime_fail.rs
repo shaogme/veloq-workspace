@@ -1,8 +1,10 @@
 use veloq_runtime::runtime::Runtime;
+use veloq_runtime::LifetimeGuard;
 use veloq_runtime::{task, task_local, scope};
 
 fn main() {
-    let rt = Runtime::<(), _>::new();
+    let guard = LifetimeGuard;
+    let rt = Runtime::<(), _>::new(&guard);
     rt.block_on(async |ctx| {
         scope!(ctx, async |s| {
             task_local!(t, async {

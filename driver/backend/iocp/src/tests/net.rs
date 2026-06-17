@@ -41,8 +41,9 @@ fn register_owned_socket(driver: &mut IocpDriver, socket: Socket) -> IoFd {
 
 #[test]
 fn test_iocp_accept() {
-    let mut driver: IocpDriver = IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar))
-        .expect("Driver creation failed");
+    let registrar = NoopRegistrar;
+    let mut driver =
+        IocpDriver::new(IocpConfig::default(), &registrar).expect("Driver creation failed");
 
     // Listener (Bind to random port)
     let std_listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -87,8 +88,8 @@ fn test_iocp_accept() {
 
 #[test]
 fn test_iocp_connect() {
-    let mut driver: IocpDriver =
-        IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar)).unwrap();
+    let registrar = NoopRegistrar;
+    let mut driver = IocpDriver::new(IocpConfig::default(), &registrar).unwrap();
 
     // Listener
     let std_listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -117,7 +118,8 @@ fn test_iocp_connect() {
 
 #[test]
 fn test_iocp_recv_with_buffer_pool() {
-    let mut driver = IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar)).unwrap();
+    let registrar = NoopRegistrar;
+    let mut driver = IocpDriver::new(IocpConfig::default(), &registrar).unwrap();
 
     // Setup GlobalAlloc
     let multiplier = ThreadMemoryMultiplier(NonZeroUsize::new(10).unwrap());
@@ -196,7 +198,8 @@ fn test_iocp_recv_with_buffer_pool() {
 
 #[test]
 fn test_unregister_owned_socket_waits_for_inflight_recv() {
-    let mut driver = IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar)).unwrap();
+    let registrar = NoopRegistrar;
+    let mut driver = IocpDriver::new(IocpConfig::default(), &registrar).unwrap();
 
     let multiplier = ThreadMemoryMultiplier(NonZeroUsize::new(10).unwrap());
     let topology = UniformSlot::new(multiplier);
@@ -262,7 +265,8 @@ fn test_unregister_owned_socket_waits_for_inflight_recv() {
 
 #[test]
 fn test_rio_cancel_poll_returns_aborted_without_hang() {
-    let mut driver = IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar)).unwrap();
+    let registrar = NoopRegistrar;
+    let mut driver = IocpDriver::new(IocpConfig::default(), &registrar).unwrap();
 
     let multiplier = ThreadMemoryMultiplier(NonZeroUsize::new(10).unwrap());
     let topology = UniformSlot::new(multiplier);
@@ -332,7 +336,8 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
 
 #[test]
 fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
-    let mut driver = IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar)).unwrap();
+    let registrar = NoopRegistrar;
+    let mut driver = IocpDriver::new(IocpConfig::default(), &registrar).unwrap();
 
     let multiplier = ThreadMemoryMultiplier(NonZeroUsize::new(10).unwrap());
     let topology = UniformSlot::new(multiplier);

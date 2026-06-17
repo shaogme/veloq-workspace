@@ -83,13 +83,15 @@ fn test_extensions_load() {
 
 #[test]
 fn test_driver_creation() {
-    let _driver = IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar));
+    let registrar = NoopRegistrar;
+    let _driver = IocpDriver::new(IocpConfig::default(), &registrar);
     assert!(_driver.is_ok(), "Driver should be created");
 }
 
 #[test]
 fn test_register_files() {
-    let mut driver = IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar)).unwrap();
+    let registrar = NoopRegistrar;
+    let mut driver = IocpDriver::new(IocpConfig::default(), &registrar).unwrap();
     let handle = File::open("Cargo.toml").unwrap();
     let raw = ConfigRawHandle::new(ConfigIocpHandle::for_file(handle.as_raw_handle() as _));
     let fds = driver
@@ -101,7 +103,8 @@ fn test_register_files() {
 
 #[test]
 fn test_register_borrowed_file_keeps_weak_ownership() {
-    let mut driver = IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar)).unwrap();
+    let registrar = NoopRegistrar;
+    let mut driver = IocpDriver::new(IocpConfig::default(), &registrar).unwrap();
     let handle = File::open("Cargo.toml").unwrap();
     let raw = ConfigRawHandle::new(ConfigIocpHandle::for_file(handle.as_raw_handle() as _));
     let fd = driver
@@ -124,7 +127,8 @@ fn test_register_borrowed_file_keeps_weak_ownership() {
 
 #[test]
 fn test_stale_registered_fd_generation_rejected_on_submit() {
-    let mut driver = IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar)).unwrap();
+    let registrar = NoopRegistrar;
+    let mut driver = IocpDriver::new(IocpConfig::default(), &registrar).unwrap();
     let first = File::open("Cargo.toml").unwrap();
     let first_raw = ConfigRawHandle::new(ConfigIocpHandle::for_file(first.as_raw_handle() as _));
     let stale_fd = driver
@@ -178,7 +182,8 @@ fn test_stale_registered_fd_generation_rejected_on_submit() {
 
 #[test]
 fn test_close_owned_registered_file_unregisters_and_rejects_stale_fd() {
-    let mut driver = IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar)).unwrap();
+    let registrar = NoopRegistrar;
+    let mut driver = IocpDriver::new(IocpConfig::default(), &registrar).unwrap();
     let handle = File::open("Cargo.toml").unwrap();
     let raw = RawHandle::new(IocpHandle::for_file(handle.into_raw_handle() as _));
     let owned = unsafe { OwnedRawHandle::from_raw_owned(raw) };
@@ -211,7 +216,8 @@ fn test_close_owned_registered_file_unregisters_and_rejects_stale_fd() {
 
 #[test]
 fn test_close_borrowed_registered_file_is_rejected_without_unregistering() {
-    let mut driver = IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar)).unwrap();
+    let registrar = NoopRegistrar;
+    let mut driver = IocpDriver::new(IocpConfig::default(), &registrar).unwrap();
     let handle = File::open("Cargo.toml").unwrap();
     let raw = RawHandle::new(IocpHandle::for_file(handle.as_raw_handle() as _));
     let fd = driver

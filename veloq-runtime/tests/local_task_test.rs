@@ -1,8 +1,9 @@
-use veloq_runtime::{runtime::Runtime, scope, task::yield_now, task_local};
+use veloq_runtime::{LifetimeGuard, runtime::Runtime, scope, task::yield_now, task_local};
 
 #[test]
 fn test_local_task_execution() {
-    let rt = Runtime::<(), _>::new();
+    let guard = LifetimeGuard;
+    let rt = Runtime::<(), _>::new(&guard);
     rt.block_on(async |ctx| {
         task_local!(t, async { 1 + 1 });
         scope!(ctx, async |s| {
@@ -17,7 +18,8 @@ fn test_local_task_execution() {
 
 #[test]
 fn test_local_task_with_yield() {
-    let rt = Runtime::<(), _>::new();
+    let guard = LifetimeGuard;
+    let rt = Runtime::<(), _>::new(&guard);
     rt.block_on(async |ctx| {
         task_local!(t, async {
             yield_now().await;

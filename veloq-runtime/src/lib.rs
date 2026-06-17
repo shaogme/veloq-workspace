@@ -6,3 +6,5 @@ pub mod task;
 pub mod utils;
 
 pub use veloq_storage as storage;
+
+pub struct LifetimeGuard;

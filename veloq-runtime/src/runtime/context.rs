@@ -113,20 +113,20 @@ impl<'rt, T> Clone for RuntimeCtx<'rt, T> {
 }
 
 /// A trait to extract the runtime scope context.
-pub trait AsRuntimeCtx<'rt, T> {
-    fn as_runtime_ctx(self) -> RuntimeCtx<'rt, T>;
+pub trait IntoRuntimeCtx<'rt, T> {
+    fn into_runtime_ctx(self) -> RuntimeCtx<'rt, T>;
 }
 
-impl<'rt, T> AsRuntimeCtx<'rt, T> for RuntimeCtx<'rt, T> {
+impl<'rt, T> IntoRuntimeCtx<'rt, T> for RuntimeCtx<'rt, T> {
     #[inline]
-    fn as_runtime_ctx(self) -> RuntimeCtx<'rt, T> {
+    fn into_runtime_ctx(self) -> RuntimeCtx<'rt, T> {
         self
     }
 }
 
-impl<'rt, T> AsRuntimeCtx<'rt, T> for &RuntimeCtx<'rt, T> {
+impl<'rt, T> IntoRuntimeCtx<'rt, T> for &RuntimeCtx<'rt, T> {
     #[inline]
-    fn as_runtime_ctx(self) -> RuntimeCtx<'rt, T> {
+    fn into_runtime_ctx(self) -> RuntimeCtx<'rt, T> {
         *self
     }
 }

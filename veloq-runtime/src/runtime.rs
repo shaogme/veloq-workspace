@@ -10,6 +10,7 @@ use std::{
 };
 
 use crate::{
+    LifetimeGuard,
     error::{Result, RuntimeError},
     utils::{FastRand, ownership::ArcOwnership},
 };
@@ -20,7 +21,7 @@ pub mod context;
 pub mod primitives;
 pub mod shared;
 
-pub use context::{AsRuntimeCtx, IdleDecision, IdleWaitStrategy, RuntimeCtx};
+pub use context::{IntoRuntimeCtx, IdleDecision, IdleWaitStrategy, RuntimeCtx};
 pub(crate) use context::{IdleHook, RuntimeTlsInner, WorkerTickHook};
 pub use primitives::GenericCancellationToken;
 pub use shared::{EnqueuePinnedOutcome, RuntimeShared, RuntimeSharedBase};
@@ -28,19 +29,21 @@ pub use shared::{EnqueuePinnedOutcome, RuntimeShared, RuntimeSharedBase};
 use primitives::{Signal, create_waker};
 use shared::{Receivers, init_runtime_components};
 
-pub struct Runtime<T, WF> {
-    pub(crate) shared: RuntimeShared<T>,
-    pub(crate) receivers: Option<Receivers>,
-    pub(crate) worker_factory: Option<WF>,
+pub struct Runtime<'rt, T, WF> {
+    shared: RuntimeShared<T>,
+    receivers: Option<Receivers>,
+    worker_factory: Option<WF>,
+    _guard: &'rt LifetimeGuard,
+    _marker: std::marker::PhantomData<fn(&'rt ()) -> &'rt ()>,
 }
 
 pub type DefaultWorkerFactory = fn(usize, &RuntimeShared<()>) -> ();
 
 pub type DefaultWorkerFactoryFor<T> = fn(usize, &RuntimeShared<T>) -> T;
 
-impl Runtime<(), DefaultWorkerFactoryFor<()>> {
-    pub fn new() -> Self {
-        RuntimeBuilder::new().build()
+impl<'rt> Runtime<'rt, (), DefaultWorkerFactoryFor<()>> {
+    pub fn new(_guard: &'rt LifetimeGuard) -> Self {
+        RuntimeBuilder::new().build(_guard)
     }
 
     pub fn builder() -> RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
@@ -48,22 +51,16 @@ impl Runtime<(), DefaultWorkerFactoryFor<()>> {
     }
 }
 
-impl Default for Runtime<(), DefaultWorkerFactoryFor<()>> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<T, WF> Runtime<T, WF> {
+impl<'rt, T, WF> Runtime<'rt, T, WF> {
     pub fn worker_count(&self) -> NonZeroUsize {
         self.shared.worker_count()
     }
 
-    pub fn block_on<'run, R, F>(mut self, f: F) -> Result<R>
+    pub fn block_on<R, F>(mut self, f: F) -> Result<R>
     where
-        T: 'run,
-        WF: Fn(usize, &'run RuntimeShared<T>) -> T + Send + Sync,
-        F: AsyncFnOnce(RuntimeCtx<'run, T>) -> R,
+        T: 'rt,
+        WF: Fn(usize, &'rt RuntimeShared<T>) -> T + Send + Sync,
+        F: AsyncFnOnce(RuntimeCtx<'rt, T>) -> R,
     {
         struct TlsCleanupGuard<'a, T>(&'a veloq_tls::Tls<T>);
         impl<'a, T> Drop for TlsCleanupGuard<'a, T> {
@@ -72,7 +69,7 @@ impl<T, WF> Runtime<T, WF> {
             }
         }
 
-        let shared_ref: &'run RuntimeShared<T> = unsafe { &*ptr::from_ref(&self.shared) };
+        let shared_ref: &'rt RuntimeShared<T> = unsafe { &*ptr::from_ref(&self.shared) };
         let ctx = RuntimeCtx::new(shared_ref);
 
         let worker_count = shared_ref.worker_count();
@@ -89,8 +86,8 @@ impl<T, WF> Runtime<T, WF> {
         let thread_errors = Mutex::new(None);
 
         let res = thread::scope(|scope| {
-            struct ShutdownGuard<'a, T>(&'a RuntimeShared<T>);
-            impl<'a, T> Drop for ShutdownGuard<'a, T> {
+            struct ShutdownGuard<'rt, T>(&'rt RuntimeShared<T>);
+            impl<'rt, T> Drop for ShutdownGuard<'rt, T> {
                 fn drop(&mut self) {
                     self.0.shutdown();
                 }
@@ -283,12 +280,6 @@ impl RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
     }
 }
 
-impl Default for RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl<T, WF> RuntimeBuilder<T, WF> {
     pub fn with_worker_count(mut self, count: Option<NonZeroUsize>) -> Self {
         self.worker_count = count;
@@ -325,7 +316,7 @@ impl<T, WF> RuntimeBuilder<T, WF> {
         }
     }
 
-    pub fn build(self) -> Runtime<T, WF> {
+    pub fn build<'rt>(self, guard: &'rt LifetimeGuard) -> Runtime<'rt, T, WF> {
         let worker_count = self.worker_count.unwrap_or_else(|| {
             thread::available_parallelism().unwrap_or(NonZeroUsize::new(1).unwrap())
         });
@@ -342,6 +333,8 @@ impl<T, WF> RuntimeBuilder<T, WF> {
             shared,
             receivers: Some(receivers),
             worker_factory: self.worker_factory,
+            _guard: guard,
+            _marker: std::marker::PhantomData,
         }
     }
 }

@@ -1,4 +1,5 @@
 use veloq_runtime::{
+    LifetimeGuard,
     runtime::{Runtime, RuntimeCtx},
     scope,
     scope::JoinOutcome,
@@ -21,7 +22,8 @@ async fn work(ctx: RuntimeCtx<'_, ()>, id: String, steps: u32) -> String {
     format!("Result from {}", id)
 }
 fn main() {
-    let rt = Runtime::default();
+    let guard = LifetimeGuard;
+    let rt = Runtime::new(&guard);
     rt.block_on(async |ctx| {
         println!("--- 安全异步作用域执行开始 ---");
 

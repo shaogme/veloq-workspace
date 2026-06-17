@@ -28,7 +28,8 @@ use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 fn new_driver() -> IocpDriver<'static> {
-    IocpDriver::new(IocpConfig::default(), Box::new(NoopRegistrar)).unwrap()
+    static REGISTRAR: NoopRegistrar = NoopRegistrar;
+    IocpDriver::new(IocpConfig::default(), &REGISTRAR).unwrap()
 }
 
 fn temp_file_path(label: &str) -> PathBuf {

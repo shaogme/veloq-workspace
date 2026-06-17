@@ -13,6 +13,7 @@ use veloq_blocking::init_blocking_pool;
 use veloq_buf::PoolTopology;
 use veloq_driver_native::driver::PlatformDriver;
 use veloq_runtime::{
+    LifetimeGuard,
     runtime::{self as async_runtime},
     utils::StaticTransfer,
 };
@@ -23,7 +24,7 @@ use crate::{
     config::{BlockingPoolConfig, Config},
     error::Result as VeloqResult,
     runtime::context::{
-        BorrowedRegistrar, Ctx, DriverRegistrar, RegistrarMessage, WorkerRegistrarState,
+        BorrowedRegistrar, Ctx, RegistrarMessage, SharedRegistrar, WorkerRegistrarState,
         WorkerState, poll_current_driver,
     },
 };
@@ -150,6 +151,8 @@ impl<T: PoolTopology> Runtime<T> {
             }),
         );
 
+        let guard = LifetimeGuard;
+
         let runtime = async_runtime::RuntimeBuilder::new()
             .with_worker_count(Some(worker_count))
             .with_queue_capacity(config.get_queue_capacity())
@@ -161,14 +164,13 @@ impl<T: PoolTopology> Runtime<T> {
                 let receiver = receivers.take(worker_id);
 
                 let registration_mode = config.registration_mode();
-                let registrar = DriverRegistrar::new(shared);
-
+                let registrar = unsafe { SharedRegistrar::from_shared(shared) };
                 let registrar_state = RefCell::new(WorkerRegistrarState {
                     receiver,
                     chunks: Vec::new(),
                 });
 
-                let driver = PlatformDriver::new(config.clone(), Box::new(registrar))
+                let driver = PlatformDriver::new(config.clone(), registrar)
                     .expect("failed to create driver");
                 let driver_cell = RefCell::new(driver);
 
@@ -190,7 +192,7 @@ impl<T: PoolTopology> Runtime<T> {
                     registration_mode,
                 }
             })
-            .build();
+            .build(&guard);
 
         runtime
             .block_on(async move |runtime_ctx| {

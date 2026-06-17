@@ -151,7 +151,7 @@ pub struct UringDriver<'a> {
     pub(crate) wheel: Wheel<OpToken>,
     pub(crate) timer_buffer: Vec<OpToken>,
     pub(crate) last_timer_poll: Instant,
-    pub(crate) registrar: Box<dyn BufferRegistrar + 'a>,
+    pub(crate) registrar: &'a (dyn BufferRegistrar + 'a),
     pub(crate) registration_stats: UringRegistrationStats,
     pub(crate) registration_mode: BufferRegistrationMode,
     pub(crate) chunk_register_failures_recent: HashMap<ChunkId, Instant>,
@@ -163,7 +163,7 @@ pub struct UringDriver<'a> {
 impl<'a> UringDriver<'a> {
     fn new_internal(
         config: impl AsRef<UringConfig>,
-        registrar: Box<dyn veloq_buf::BufferRegistrar + 'a>,
+        registrar: &'a (dyn BufferRegistrar + 'a),
     ) -> UringResult<Self> {
         let config = config.as_ref();
         let mut builder = IoUring::builder();
@@ -250,7 +250,7 @@ impl<'a> UringDriver<'a> {
 
     pub fn new(
         config: impl AsRef<UringConfig>,
-        registrar: Box<dyn BufferRegistrar + 'a>,
+        registrar: &'a (dyn BufferRegistrar + 'a),
     ) -> UringResult<Self> {
         Self::new_internal(config, registrar).attach_note("create uring driver")
     }

@@ -43,7 +43,7 @@ enum ShutdownOpKind {
 
 pub(super) struct IocpRioRuntime<'a> {
     state: RioState,
-    registrar: Box<dyn BufferRegistrar + 'a>,
+    registrar: &'a (dyn BufferRegistrar + 'a),
 }
 
 /// Owns one successful Winsock startup for an IOCP driver.
@@ -59,7 +59,7 @@ impl<'a> IocpRioRuntime<'a> {
         entries: u32,
         ext: &Extensions,
         registration_mode: BufferRegistrationMode,
-        registrar: Box<dyn BufferRegistrar + 'a>,
+        registrar: &'a (dyn BufferRegistrar + 'a),
         diagnostics: IocpDriverCompletionDiagnostics,
     ) -> IocpResult<Self> {
         let state = RioState::new(port, entries, ext, registration_mode, diagnostics)
@@ -81,7 +81,7 @@ impl<'a> IocpRioRuntime<'a> {
     pub(super) fn state_and_registrar_mut(
         &mut self,
     ) -> (&mut RioState, &(dyn BufferRegistrar + 'a)) {
-        (&mut self.state, self.registrar.as_ref())
+        (&mut self.state, self.registrar)
     }
 }
 
@@ -94,7 +94,7 @@ impl<'a> IocpDriver<'a> {
     /// Creates a new IOCP driver instance.
     pub fn new(
         config: impl AsRef<IocpConfig>,
-        registrar: Box<dyn BufferRegistrar + 'a>,
+        registrar: &'a (dyn BufferRegistrar + 'a),
     ) -> IocpResult<Self> {
         let cfg = config.as_ref();
         let pre = Self::create_pre_init()?;
@@ -106,7 +106,7 @@ impl<'a> IocpDriver<'a> {
         entries: u32,
         port_val: PreInit,
         registration_mode: BufferRegistrationMode,
-        registrar: Box<dyn BufferRegistrar + 'a>,
+        registrar: &'a (dyn BufferRegistrar + 'a),
     ) -> IocpResult<Self> {
         let winsock = Self::start_winsock()?;
 

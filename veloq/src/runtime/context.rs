@@ -16,7 +16,7 @@ use veloq_driver_native::{
 use veloq_runtime::{
     error::Result as RuntimeResult,
     runtime::{
-        AsRuntimeCtx, EnqueuePinnedOutcome, IdleDecision, IdleWaitStrategy, RuntimeCtx,
+        IntoRuntimeCtx, EnqueuePinnedOutcome, IdleDecision, IdleWaitStrategy, RuntimeCtx,
         RuntimeShared,
     },
     storage::AtomicStorage,
@@ -91,6 +91,45 @@ impl<'rt, 'reg> BufferRegistrar for DriverRegistrar<'rt, 'reg> {
                 chunk_id,
             )
         })
+    }
+}
+
+#[repr(transparent)]
+pub struct SharedRegistrar<'reg> {
+    _shared: RuntimeShared<WorkerState<'reg>>,
+}
+
+impl<'reg> SharedRegistrar<'reg> {
+    /// # Safety
+    /// The memory layout of `SharedRegistrar` is identical to `RuntimeShared<WorkerState<'reg>>`.
+    #[inline]
+    pub unsafe fn from_shared<'rt>(shared: &'rt RuntimeShared<WorkerState<'reg>>) -> &'rt Self {
+        unsafe { &*(shared as *const RuntimeShared<WorkerState<'reg>> as *const Self) }
+    }
+}
+
+impl<'reg> BufferRegistrar for SharedRegistrar<'reg> {
+    fn register(&self, regions: &[BufferRegion]) -> BufResult<Vec<ChunkId>> {
+        let shared = unsafe { &*(self as *const Self as *const RuntimeShared<WorkerState<'reg>>) };
+        shared
+            .extra_tls
+            .try_with(|extra| register_internal(&extra.driver, &extra.registrar_state, regions))
+            .expect("Ctx accessed outside of a worker thread")
+    }
+
+    fn resolve_chunk_info(&self, chunk_id: ChunkId) -> Option<ChunkInfo> {
+        let shared = unsafe { &*(self as *const Self as *const RuntimeShared<WorkerState<'reg>>) };
+        shared
+            .extra_tls
+            .try_with(|extra| {
+                resolve_chunk_info_internal(
+                    &extra.driver,
+                    &extra.registrar_state,
+                    extra.registration_mode,
+                    chunk_id,
+                )
+            })
+            .expect("Ctx accessed outside of a worker thread")
     }
 }
 
@@ -204,16 +243,16 @@ where
     pub runtime_ctx: RuntimeCtx<'rt, WorkerState<'reg>>,
 }
 
-impl<'rt, 'reg> AsRuntimeCtx<'rt, WorkerState<'reg>> for Ctx<'rt, 'reg> {
+impl<'rt, 'reg> IntoRuntimeCtx<'rt, WorkerState<'reg>> for Ctx<'rt, 'reg> {
     #[inline]
-    fn as_runtime_ctx(self) -> RuntimeCtx<'rt, WorkerState<'reg>> {
+    fn into_runtime_ctx(self) -> RuntimeCtx<'rt, WorkerState<'reg>> {
         self.runtime_ctx
     }
 }
 
-impl<'rt, 'reg> AsRuntimeCtx<'rt, WorkerState<'reg>> for &Ctx<'rt, 'reg> {
+impl<'rt, 'reg> IntoRuntimeCtx<'rt, WorkerState<'reg>> for &Ctx<'rt, 'reg> {
     #[inline]
-    fn as_runtime_ctx(self) -> RuntimeCtx<'rt, WorkerState<'reg>> {
+    fn into_runtime_ctx(self) -> RuntimeCtx<'rt, WorkerState<'reg>> {
         self.runtime_ctx
     }
 }

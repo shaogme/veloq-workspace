@@ -1,4 +1,5 @@
 use crate::{
+    LifetimeGuard,
     error::{Result, RuntimeError},
     runtime::{RuntimeCtx, RuntimeShared, primitives::GenericCancellationToken},
     task::{
@@ -87,14 +88,12 @@ pub(crate) fn new_cancel_slot<S: Storage, O: Ownership>()
 pub(crate) type CancelTokenSlot<S, O> =
     <S as Storage>::Lock<Option<GenericCancellationToken<S, O>>>;
 
-pub struct AsyncScopeGuard;
-
 /// 通用的作用域实现，支持通过 Storage 策略切换线程安全或本地分配。
 pub struct GenericAsyncScope<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra> {
     context: RuntimeCtx<'rt, TExtra>,
     arena: GenericArena<S>,
     completion: O::Shared<GenericScopeCompletion<S, O>>,
-    _guard: &'scope AsyncScopeGuard,
+    _guard: &'scope LifetimeGuard,
     _marker: PhantomData<fn(&'scope ())>,
 }
 
@@ -129,7 +128,7 @@ impl<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra>
     pub fn new(
         context: RuntimeCtx<'rt, TExtra>,
         parent: Option<AnyScopeRef>,
-        guard: &'scope AsyncScopeGuard,
+        guard: &'scope LifetimeGuard,
     ) -> Self {
         let completion = GenericScopeCompletion::<S, O>::new(parent.clone());
 
@@ -144,7 +143,7 @@ impl<'rt, 'scope, S: ScopeStorage, O: Ownership + 'static, TExtra>
             arena: GenericArena::new(),
             completion,
             _guard: guard,
-            _marker: PhantomData::default(),
+            _marker: PhantomData,
         }
     }
 
