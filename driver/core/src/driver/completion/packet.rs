@@ -16,30 +16,19 @@ pub struct UserCompletion<Spec: SlotSpec> {
     pub cleanup: CompletionCleanupGuard,
 }
 
-pub struct CompletionLoss {
-    pub kind: CompletionAnomalyKind,
-    pub attach: AnomalyAttach,
-    pub cleanup: CompletionCleanupGuard,
-}
-
 pub enum CompletionInput<Spec: SlotSpec> {
     User(UserCompletion<Spec>),
-    Lost(CompletionLoss),
 }
 
 impl<Spec: SlotSpec> CompletionInput<Spec> {
     pub fn cleanup_mut(&mut self) -> &mut CompletionCleanupGuard {
         match self {
             Self::User(completion) => &mut completion.cleanup,
-            Self::Lost(loss) => &mut loss.cleanup,
         }
     }
 
     pub fn lost_kind(&self) -> Option<(CompletionAnomalyKind, AnomalyAttach)> {
-        match self {
-            Self::User(_) => None,
-            Self::Lost(loss) => Some((loss.kind, loss.attach)),
-        }
+        None
     }
 }
 
@@ -75,22 +64,6 @@ impl<Spec: SlotSpec> CompletionPacket<Spec> {
         cleanup: CompletionCleanupGuard,
     ) -> Self {
         Self::user_event(event, payload, detail, cleanup)
-    }
-
-    pub fn lost(
-        event: UserCompletionEvent,
-        kind: CompletionAnomalyKind,
-        cleanup: CompletionCleanupGuard,
-    ) -> Self {
-        let attach = AnomalyAttach::from_raw_completion(event.raw());
-        Self {
-            event,
-            input: CompletionInput::Lost(CompletionLoss {
-                kind,
-                attach,
-                cleanup,
-            }),
-        }
     }
 
     pub const fn token(&self) -> OpToken {

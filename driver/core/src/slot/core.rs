@@ -1,7 +1,7 @@
 use super::{SlotCompletion, SlotError, SlotPayload, SlotSidecarData, SlotSpec};
 use crate::{
     DriverResult,
-    driver::{AnomalyAttach, CompletionAnomalyKind, CompletionCleanupGuard, UserCompletionEvent},
+    driver::{CompletionCleanupGuard, UserCompletionEvent},
 };
 use bilge::prelude::*;
 use std::{
@@ -148,11 +148,6 @@ pub(crate) enum CompletionData<Spec: SlotSpec> {
         detail: Option<DriverResult<SlotCompletion<Spec>, SlotError<Spec>>>,
         cleanup: CompletionCleanupGuard,
     },
-    Lost {
-        kind: CompletionAnomalyKind,
-        attach: AnomalyAttach,
-        cleanup: CompletionCleanupGuard,
-    },
 }
 
 impl<Spec: SlotSpec> fmt::Debug for CompletionData<Spec>
@@ -174,16 +169,6 @@ where
                 .field("event", event)
                 .field("payload", payload)
                 .field("detail", detail)
-                .field("cleanup", cleanup)
-                .finish(),
-            Self::Lost {
-                kind,
-                attach,
-                cleanup,
-            } => f
-                .debug_struct("Lost")
-                .field("kind", kind)
-                .field("attach", attach)
                 .field("cleanup", cleanup)
                 .finish(),
         }

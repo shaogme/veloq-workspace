@@ -23,9 +23,7 @@ pub use flow::{
     CompletionFlowOutcome, CompletionHookOutcome, CompletionIngress, CompletionSource,
     CompletionWritePermit, HookResult, SyntheticCompletionSource,
 };
-pub use packet::{
-    CompletionInput, CompletionLoss, CompletionPacket, CompletionRecord, UserCompletion,
-};
+pub use packet::{CompletionInput, CompletionPacket, CompletionRecord, UserCompletion};
 pub use routing::{FinalizeOutcome, RoutedSlotCompletion};
 pub use table::{
     CELL_STATE_BUSY, CELL_STATE_IDLE, CELL_STATE_ORPHANED, CELL_STATE_READY, CELL_STATE_WAITING,

@@ -83,12 +83,7 @@ where
         cleanup: CompletionCleanupGuard,
         effect: Effect,
     },
-    Lost {
-        event: UserCompletionEvent,
-        loss_kind: CompletionAnomalyKind,
-        cleanup: CompletionCleanupGuard,
-        effect: Effect,
-    },
+
     Cleanup {
         cleanup: CompletionCleanupGuard,
         effect: Effect,
@@ -170,7 +165,6 @@ where
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CompletionFlowOutcome {
     pub user_completed: usize,
-    pub user_lost: usize,
     pub orphan_cleaned: usize,
     pub internal: usize,
     pub anomaly: usize,
@@ -179,12 +173,11 @@ pub struct CompletionFlowOutcome {
 
 impl CompletionFlowOutcome {
     pub const fn semantic_count(&self) -> usize {
-        self.user_completed + self.user_lost + self.orphan_cleaned + self.internal + self.anomaly
+        self.user_completed + self.orphan_cleaned + self.internal + self.anomaly
     }
 
     pub fn merge(&mut self, other: Self) {
         self.user_completed += other.user_completed;
-        self.user_lost += other.user_lost;
         self.orphan_cleaned += other.orphan_cleaned;
         self.internal += other.internal;
         self.anomaly += other.anomaly;
@@ -194,18 +187,6 @@ impl CompletionFlowOutcome {
     const fn user_completed() -> Self {
         Self {
             user_completed: 1,
-            user_lost: 0,
-            orphan_cleaned: 0,
-            internal: 0,
-            anomaly: 0,
-            ignored: 0,
-        }
-    }
-
-    const fn user_lost() -> Self {
-        Self {
-            user_completed: 0,
-            user_lost: 1,
             orphan_cleaned: 0,
             internal: 0,
             anomaly: 0,
@@ -216,7 +197,6 @@ impl CompletionFlowOutcome {
     const fn orphan_cleaned() -> Self {
         Self {
             user_completed: 0,
-            user_lost: 0,
             orphan_cleaned: 1,
             internal: 0,
             anomaly: 0,
@@ -227,7 +207,6 @@ impl CompletionFlowOutcome {
     const fn internal() -> Self {
         Self {
             user_completed: 0,
-            user_lost: 0,
             orphan_cleaned: 0,
             internal: 1,
             anomaly: 0,
@@ -238,7 +217,6 @@ impl CompletionFlowOutcome {
     const fn anomaly() -> Self {
         Self {
             user_completed: 0,
-            user_lost: 0,
             orphan_cleaned: 0,
             internal: 0,
             anomaly: 1,
@@ -249,7 +227,6 @@ impl CompletionFlowOutcome {
     const fn ignored() -> Self {
         Self {
             user_completed: 0,
-            user_lost: 0,
             orphan_cleaned: 0,
             internal: 0,
             anomaly: 0,
@@ -461,18 +438,6 @@ where
             hooks.finish_backend_effect(effect)?;
             Ok(completion_progress_from_record(record))
         }
-        CompletionHookOutcome::Lost {
-            event,
-            loss_kind,
-            cleanup,
-            effect,
-        } => {
-            let record =
-                record_lost_completion::<Spec>(table, diagnostics, event, loss_kind, cleanup);
-            let _ = registry.finalize_waiting_completion(event.token());
-            hooks.finish_backend_effect(effect)?;
-            Ok(completion_progress_from_record(record))
-        }
         CompletionHookOutcome::Cleanup {
             mut cleanup,
             effect,
@@ -534,27 +499,6 @@ where
     }
 }
 
-fn record_lost_completion<Spec>(
-    table: &SharedCompletionTable<Spec>,
-    diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
-    event: UserCompletionEvent,
-    kind: CompletionAnomalyKind,
-    cleanup: CompletionCleanupGuard,
-) -> RecordCompletionOutcome
-where
-    Spec: SlotSpec,
-    SlotPayload<Spec>: Send,
-    SlotError<Spec>: Send,
-    SlotCompletion<Spec>: Send,
-    SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
-{
-    record_user_completion::<Spec>(
-        table,
-        diagnostics,
-        CompletionPacket::<Spec>::lost(event, kind, cleanup),
-    )
-}
-
 fn finish_waiting_if_needed<Spec>(
     registry: &mut OpRegistry<Spec>,
     finalize: Option<FinalizeAction>,
@@ -590,7 +534,6 @@ where
 fn completion_progress_from_record(outcome: RecordCompletionOutcome) -> CompletionFlowOutcome {
     match outcome {
         RecordCompletionOutcome::RecordedUser => CompletionFlowOutcome::user_completed(),
-        RecordCompletionOutcome::RecordedLost => CompletionFlowOutcome::user_lost(),
         RecordCompletionOutcome::OrphanedDropped => CompletionFlowOutcome::orphan_cleaned(),
         RecordCompletionOutcome::Rejected(_) => CompletionFlowOutcome::anomaly(),
     }

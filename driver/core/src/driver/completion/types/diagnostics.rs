@@ -11,7 +11,6 @@ use super::record::RecordCompletionOutcome;
 #[derive(Debug, Default)]
 struct DriverCompletionDiagnosticsInner<B = ()> {
     user_completed: AtomicU64,
-    user_lost: AtomicU64,
     user_orphan_completed: AtomicU64,
     unknown_completion: AtomicU64,
     stale_completion: AtomicU64,
@@ -53,7 +52,6 @@ impl<B> Clone for DriverCompletionDiagnostics<B> {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DriverCompletionDiagnosticsSnapshot<B = ()> {
     pub user_completed: u64,
-    pub user_lost: u64,
     pub user_orphan_completed: u64,
     pub unknown_completion: u64,
     pub stale_completion: u64,
@@ -78,10 +76,6 @@ impl<B> DriverCompletionDiagnostics<B> {
 
     pub fn inc_user_completed(&self) {
         Self::inc(&self.inner.user_completed);
-    }
-
-    pub fn inc_user_lost(&self) {
-        Self::inc(&self.inner.user_lost);
     }
 
     pub fn inc_user_orphan_completed(&self) {
@@ -116,7 +110,6 @@ where
     pub fn snapshot(&self) -> DriverCompletionDiagnosticsSnapshot<B::Snapshot> {
         DriverCompletionDiagnosticsSnapshot {
             user_completed: Self::load(&self.inner.user_completed),
-            user_lost: Self::load(&self.inner.user_lost),
             user_orphan_completed: Self::load(&self.inner.user_orphan_completed),
             unknown_completion: Self::load(&self.inner.unknown_completion),
             stale_completion: Self::load(&self.inner.stale_completion),
@@ -152,15 +145,11 @@ where
     }
 
     pub fn record_completion_outcome(&self, outcome: &RecordCompletionOutcome) {
-        if !matches!(
-            outcome,
-            RecordCompletionOutcome::RecordedUser | RecordCompletionOutcome::RecordedLost
-        ) {
+        if !matches!(outcome, RecordCompletionOutcome::RecordedUser) {
             self.inc_completion_rejected();
         }
         match outcome {
             RecordCompletionOutcome::RecordedUser => self.inc_user_completed(),
-            RecordCompletionOutcome::RecordedLost => self.inc_user_lost(),
             RecordCompletionOutcome::OrphanedDropped => self.inc_user_orphan_completed(),
             RecordCompletionOutcome::Rejected(_) => {}
         }

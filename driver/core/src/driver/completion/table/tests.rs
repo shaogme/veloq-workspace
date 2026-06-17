@@ -4,7 +4,7 @@ use crate::{
     DriverCoreError,
     driver::{
         AnomalyAttach, AnomalyOutcome, CompletionAnomalyKind, CompletionAnomalyReason,
-        CompletionBackend, CompletionBackendHooks, CompletionCleanup, CompletionControl,
+        CompletionBackend, CompletionBackendHooks, CompletionCleanupGuard, CompletionControl,
         CompletionFlowExt, CompletionFlowOutcome, CompletionHookOutcome, CompletionIngress,
         CompletionSource, HookResult, OpToken, PlatformOp, registry::OpRegistry,
     },
@@ -61,7 +61,6 @@ fn test_event(token: OpToken, res: i32) -> UserCompletionEvent {
 
 #[derive(Default)]
 struct TestHooks {
-    loss_kind: Option<CompletionAnomalyKind>,
     cleanup: Option<CompletionCleanupGuard>,
 }
 
@@ -82,20 +81,6 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
         slot: slot::Slot<'_, InFlightWaiting, DummySlotSpec>,
         _source: CompletionSource<'_, Self::BackendIngress>,
     ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>> {
-        if let Some(loss_kind) = self.loss_kind.take() {
-            let mut completed = slot.complete();
-            let _ = completed.take_op();
-            let (payload, detail) = completed.take_completion_data();
-            let _ = payload;
-            drop(detail);
-            return Ok(CompletionHookOutcome::Lost {
-                event,
-                loss_kind,
-                cleanup: self.cleanup.take().unwrap_or_default(),
-                effect: (),
-            });
-        }
-
         let mut completed = slot.complete();
         let _ = completed.take_op();
         let (payload, detail) = completed.take_completion_data();
@@ -131,14 +116,6 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
         kind: CompletionAnomalyKind,
         _source: CompletionSource<'_, Self::BackendIngress>,
     ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>> {
-        if let Some(loss_kind) = self.loss_kind.take() {
-            return Ok(CompletionHookOutcome::Lost {
-                event,
-                loss_kind,
-                cleanup: self.cleanup.take().unwrap_or_default(),
-                effect: (),
-            });
-        }
         Ok(CompletionHookOutcome::Anomaly {
             kind,
             attach: AnomalyAttach::from_raw_completion(event.raw()),
@@ -191,20 +168,6 @@ fn accept_with_hooks(
 fn accept_user(registry: &mut OpRegistry<DummySlotSpec>, token: OpToken, res: i32) {
     let mut hooks = TestHooks::default();
     let _ = accept_with_hooks(registry, test_event(token, res), &mut hooks);
-}
-
-fn accept_lost(
-    registry: &mut OpRegistry<DummySlotSpec>,
-    token: OpToken,
-    res: i32,
-    kind: CompletionAnomalyKind,
-    cleanup: CompletionCleanupGuard,
-) -> CompletionFlowOutcome {
-    let mut hooks = TestHooks {
-        loss_kind: Some(kind),
-        cleanup: Some(cleanup),
-    };
-    accept_with_hooks(registry, test_event(token, res), &mut hooks)
 }
 
 #[test]
@@ -307,42 +270,6 @@ fn register_waker_reports_missing_slot() {
 }
 
 #[test]
-fn lost_completion_reports_stale_generation() {
-    let (mut registry, token) = active_registry();
-    let _ = registry.remove(token);
-    let fresh = registry.alloc(()).expect("fresh slot").handle;
-    registry.shared.slots[0].set_state(SlotState::InFlightWaiting, Ordering::Release);
-    let kind = CompletionAnomalyKind::stale(0, 1, fresh.generation, SlotState::InFlightWaiting);
-
-    let outcome = accept_lost(
-        &mut registry,
-        token,
-        -1,
-        kind,
-        CompletionCleanupGuard::default(),
-    );
-
-    assert_eq!(outcome.anomaly, 1);
-}
-
-#[test]
-fn lost_completion_reports_empty_slot() {
-    let mut registry = OpRegistry::<DummySlotSpec>::new(1);
-    let token = test_token(0, 0);
-    let kind = CompletionAnomalyKind::non_active(0, 0, SlotState::Idle);
-
-    let outcome = accept_lost(
-        &mut registry,
-        token,
-        -1,
-        kind,
-        CompletionCleanupGuard::default(),
-    );
-
-    assert_eq!(outcome.anomaly, 1);
-}
-
-#[test]
 fn duplicate_completion_does_not_clear_ready_data() {
     let (mut registry, token) = active_registry();
     let table = registry.shared.clone();
@@ -383,29 +310,4 @@ fn ready_mark_orphaned_cleanup_leaves_diagnostic_stale_result() {
     ));
     let snapshot = table.completion_diagnostics().snapshot();
     assert_eq!(snapshot.stale_completion, 1);
-}
-
-#[test]
-fn ready_mark_orphaned_runs_cleanup_and_records_error() {
-    let (mut registry, token) = active_registry();
-    let table = registry.shared.clone();
-    let cleanup = CompletionCleanupGuard::new(CompletionCleanup::new(|| {
-        Err(DriverCoreError::Internal
-            .to_report()
-            .attach_note("test cleanup failure"))
-    }));
-
-    let mut hooks = TestHooks {
-        cleanup: Some(cleanup),
-        ..TestHooks::default()
-    };
-    let outcome = accept_with_hooks(&mut registry, test_event(token, 0), &mut hooks);
-    assert_eq!(outcome.user_completed, 1);
-    assert_eq!(
-        table.mark_orphaned(token),
-        CompletionMutationOutcome::Applied
-    );
-
-    let snapshot = table.completion_diagnostics().snapshot();
-    assert_eq!(snapshot.orphan_cleanup_error, 1);
 }

@@ -5,8 +5,8 @@ use std::{sync::Arc, task::Waker};
 use veloq_shim::atomic::Ordering;
 
 use super::{
-    AnomalyAttach, AnomalyOutcome, CompletionAnomalyKind, CompletionCleanupGuard, CompletionInput,
-    CompletionPacket, CompletionRecord, CompletionWritePermit, DriverCompletionDiagnostics,
+    AnomalyAttach, AnomalyOutcome, CompletionAnomalyKind, CompletionInput, CompletionPacket,
+    CompletionRecord, CompletionWritePermit, DriverCompletionDiagnostics,
     DriverCompletionDiagnosticsBackend, OpToken, RecordCompletionOutcome, RecordCompletionResult,
     UserCompletionEvent, run_completion_cleanup, types::CompletionMutationOutcome,
 };
@@ -32,16 +32,6 @@ pub trait CompletionAccess<Spec: slot::SlotSpec>: Send + Sync {
         permit: CompletionWritePermit,
         packet: CompletionPacket<Spec>,
     ) -> RecordCompletionResult<Spec>;
-
-    fn record_lost_completion(
-        &self,
-        permit: CompletionWritePermit,
-        event: UserCompletionEvent,
-        kind: CompletionAnomalyKind,
-        cleanup: CompletionCleanupGuard,
-    ) -> RecordCompletionResult<Spec> {
-        self.record_completion(permit, CompletionPacket::lost(event, kind, cleanup))
-    }
 
     fn try_take_record(
         &self,
@@ -115,7 +105,6 @@ fn recorded_outcome<Spec: slot::SlotSpec>(
 ) -> RecordCompletionOutcome {
     match input {
         CompletionInput::User(_) => RecordCompletionOutcome::RecordedUser,
-        CompletionInput::Lost(_) => RecordCompletionOutcome::RecordedLost,
     }
 }
 
@@ -192,13 +181,6 @@ fn run_discarded_record_cleanup<Spec: slot::SlotSpec>(
             drop(detail);
             let _ = run_completion_cleanup(diagnostics, &mut cleanup);
         }
-        slot::CompletionData::Lost {
-            kind: _,
-            attach: _,
-            mut cleanup,
-        } => {
-            let _ = run_completion_cleanup(diagnostics, &mut cleanup);
-        }
         slot::CompletionData::Empty => {}
     }
 }
@@ -260,19 +242,6 @@ where
             }
 
             match state {
-                slot::SlotState::Reserved if matches!(packet.input, CompletionInput::Lost(_)) => {
-                    match cell.core_state.compare_exchange(
-                        current,
-                        current
-                            .with_state(slot::SlotState::Finalizing)
-                            .with_generation(generation),
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    ) {
-                        Ok(_) => break current.with_state(slot::SlotState::Finalizing),
-                        Err(_) => continue,
-                    }
-                }
                 slot::SlotState::InFlightWaiting => match cell.core_state.compare_exchange(
                     current,
                     current
@@ -312,9 +281,6 @@ where
             }
         };
 
-        if let Some((kind, attach)) = packet.input.lost_kind() {
-            self.diagnostics.record_anomaly_kind(kind, attach);
-        }
         let input = packet.input;
         cell.completion_with_record_data(|record| {
             *record = match input {
@@ -323,11 +289,6 @@ where
                     payload: completion.payload,
                     detail: completion.detail,
                     cleanup: completion.cleanup,
-                },
-                CompletionInput::Lost(loss) => slot::CompletionData::Lost {
-                    kind: loss.kind,
-                    attach: loss.attach,
-                    cleanup: loss.cleanup,
                 },
             };
         });
@@ -422,14 +383,6 @@ where
                 detail,
                 cleanup,
             })),
-            slot::CompletionData::Lost {
-                kind,
-                attach,
-                mut cleanup,
-            } => {
-                let _ = run_completion_cleanup(&self.diagnostics, &mut cleanup);
-                Ok(PollRecordResult::Unavailable { kind, attach })
-            }
             slot::CompletionData::Empty => {
                 let report = crate::DriverCoreError::Internal
                     .to_report()

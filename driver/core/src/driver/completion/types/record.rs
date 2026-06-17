@@ -73,7 +73,6 @@ impl Drop for CompletionCleanupGuard {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordCompletionOutcome {
     RecordedUser,
-    RecordedLost,
     OrphanedDropped,
     Rejected(AnomalyOutcome),
 }
@@ -81,7 +80,7 @@ pub enum RecordCompletionOutcome {
 impl RecordCompletionOutcome {
     pub fn anomaly_outcome(&self) -> Option<AnomalyOutcome> {
         match self {
-            Self::RecordedUser | Self::RecordedLost | Self::OrphanedDropped => None,
+            Self::RecordedUser | Self::OrphanedDropped => None,
             Self::Rejected(outcome) => Some(*outcome),
         }
     }
