@@ -8,8 +8,6 @@ mod kind;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionAnomalyReason {
     UnknownSlot,
-    UnknownControlToken,
-    ControlCompletionUntracked,
     StaleGeneration,
     NonActiveSlot,
     SlotCorruption,
@@ -25,8 +23,6 @@ pub enum CompletionAnomalyReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlAnomalyReason {
-    UnknownControlToken,
-    ControlCompletionUntracked,
     BackendContextUnknown,
 }
 

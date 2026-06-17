@@ -90,8 +90,6 @@ pub fn cancel_target_kind<'a, Spec: slot::SlotSpec>(
         | CompletionAnomalyReason::BackendInvariantBroken => CancelTargetGoneReason::Corrupt,
         CompletionAnomalyReason::UnknownSlot
         | CompletionAnomalyReason::NonActiveSlot
-        | CompletionAnomalyReason::UnknownControlToken
-        | CompletionAnomalyReason::ControlCompletionUntracked
         | CompletionAnomalyReason::CompletionKeyMismatch
         | CompletionAnomalyReason::FinalizeFailed
         | CompletionAnomalyReason::CancelAckTargetStillActive

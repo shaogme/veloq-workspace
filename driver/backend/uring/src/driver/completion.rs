@@ -157,21 +157,16 @@ impl<'a> UringCompletionHooks<'a> {
         &mut self,
         cancel_id: CancelCompletionId,
         raw: RawCompletion,
-    ) -> CompletionHookOutcome<UringSlotSpec, UringBackendEffect> {
+    ) -> UringResult<CompletionHookOutcome<UringSlotSpec, UringBackendEffect>> {
         let request = self.pending_cancel_cqes.remove(&cancel_id);
         let Some(request) = request else {
-            debug!(
-                cancel_id = cancel_id.raw(),
-                result = raw.res,
-                flags = raw.flags,
-                token = raw.token.raw(),
-                "async cancel completion had no pending request"
-            );
-            return CompletionHookOutcome::Anomaly {
-                kind: CompletionAnomalyKind::control_completion_untracked(),
-                attach: AnomalyAttach::from_raw_completion(raw),
-                effect: UringBackendEffect::None,
-            };
+            return Err(UringError::InvalidState.report(
+                "uring.completion.handle_cancel_control",
+                format!(
+                    "async cancel completion had no pending request for cancel_id: {}",
+                    cancel_id.raw()
+                ),
+            ));
         };
 
         match raw.res {
@@ -183,9 +178,9 @@ impl<'a> UringCompletionHooks<'a> {
                     result = value,
                     "async cancel completed"
                 );
-                CompletionHookOutcome::ControlHandled {
+                Ok(CompletionHookOutcome::ControlHandled {
                     effect: UringBackendEffect::None,
-                }
+                })
             }
             value if value == -libc::ENOENT => {
                 self.diagnostics.backend().inc_cancel_ack_not_found();
@@ -194,13 +189,13 @@ impl<'a> UringCompletionHooks<'a> {
                     request = ?request,
                     "async cancel target was already complete or absent"
                 );
-                CompletionHookOutcome::ControlHandled {
+                Ok(CompletionHookOutcome::ControlHandled {
                     effect: UringBackendEffect::CancelEnoent {
                         cancel_id,
                         request,
                         raw,
                     },
-                }
+                })
             }
             value => {
                 self.diagnostics.backend().inc_cancel_ack_error();
@@ -211,9 +206,9 @@ impl<'a> UringCompletionHooks<'a> {
                     errno = -value,
                     "async cancel request failed"
                 );
-                CompletionHookOutcome::ControlHandled {
+                Ok(CompletionHookOutcome::ControlHandled {
                     effect: UringBackendEffect::None,
-                }
+                })
             }
         }
     }
@@ -227,12 +222,12 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
         &mut self,
         control: CompletionControl,
     ) -> UringResult<CompletionHookOutcome<UringSlotSpec, Self::BackendEffect>> {
-        Ok(match control {
-            CompletionControl::Waker { raw, .. } => CompletionHookOutcome::ControlHandled {
+        match control {
+            CompletionControl::Waker { raw, .. } => Ok(CompletionHookOutcome::ControlHandled {
                 effect: self.handle_waker_control(raw),
-            },
+            }),
             CompletionControl::Cancel { id, raw } => self.handle_cancel_control(id, raw),
-        })
+        }
     }
 
     fn complete_waiting(
@@ -868,12 +863,7 @@ mod tests {
 
         let outcome = hooks.handle_cancel_control(cancel_id, raw);
 
-        assert!(matches!(
-            outcome,
-            CompletionHookOutcome::Anomaly {
-                kind,
-                ..
-            } if kind.reason() == CompletionAnomalyReason::ControlCompletionUntracked
-        ));
+        assert!(outcome.is_err());
+        assert_eq!(*outcome.unwrap_err().inner(), UringError::InvalidState);
     }
 }

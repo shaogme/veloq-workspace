@@ -150,8 +150,6 @@ fn lost_reason_from_anomaly(reason: CompletionAnomalyReason) -> LostReason {
         CompletionAnomalyReason::StaleGeneration => LostReason::GenerationMismatch,
         CompletionAnomalyReason::PayloadMissing => LostReason::PayloadMissing,
         CompletionAnomalyReason::UnknownSlot
-        | CompletionAnomalyReason::UnknownControlToken
-        | CompletionAnomalyReason::ControlCompletionUntracked
         | CompletionAnomalyReason::NonActiveSlot
         | CompletionAnomalyReason::SlotCorruption
         | CompletionAnomalyReason::OpMissing

@@ -1,6 +1,6 @@
 use super::{
-    CancelCompletionId, CompletionAnomaly, CompletionAnomalyKind, CompletionBackend,
-    CompletionControlKind, CompletionToken, CompletionTokenClass, OpToken,
+    CancelCompletionId, CompletionAnomaly, CompletionBackend, CompletionControlKind,
+    CompletionToken, CompletionTokenClass, OpToken,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,14 +124,7 @@ pub enum CompletionIdentity {
     User(OpToken),
     Waker(u16),
     Cancel(CancelCompletionId),
-    UnknownControl {
-        kind: u16,
-        id: u16,
-    },
-    BackendContext {
-        backend: CompletionBackend,
-        raw_context: u64,
-    },
+    UnknownControl { kind: u16, id: u16 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,9 +229,7 @@ pub(super) fn dispatch_envelope(envelope: CompletionEnvelope) -> CompletionDispa
         },
         CompletionIdentity::Waker(id) => CompletionDispatch::Waker { id, raw },
         CompletionIdentity::Cancel(id) => CompletionDispatch::Cancel { id, raw },
-        CompletionIdentity::UnknownControl { .. } | CompletionIdentity::BackendContext { .. } => {
-            CompletionDispatch::Unknown { envelope }
-        }
+        CompletionIdentity::UnknownControl { .. } => CompletionDispatch::Unknown { envelope },
     }
 }
 
@@ -250,19 +241,5 @@ impl CompletionAnomaly {
             res: raw.res,
             flags: raw.flags,
         })
-    }
-}
-
-#[inline]
-pub(super) fn unknown_completion_kind(envelope: CompletionEnvelope) -> CompletionAnomalyKind {
-    match envelope.identity {
-        CompletionIdentity::BackendContext {
-            backend,
-            raw_context,
-        } => CompletionAnomalyKind::backend_context(backend, raw_context),
-        CompletionIdentity::UnknownControl { .. }
-        | CompletionIdentity::User(_)
-        | CompletionIdentity::Waker(_)
-        | CompletionIdentity::Cancel(_) => CompletionAnomalyKind::unknown_control(),
     }
 }

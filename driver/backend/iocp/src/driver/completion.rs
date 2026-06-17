@@ -126,11 +126,12 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
                     effect: IocpBackendEffect::None,
                 }
             }
-            CompletionControl::Cancel { raw, .. } => CompletionHookOutcome::Anomaly {
-                kind: CompletionAnomalyKind::control_completion_untracked(),
-                attach: AnomalyAttach::from_raw_completion(raw),
-                effect: IocpBackendEffect::None,
-            },
+            CompletionControl::Cancel { .. } => {
+                return Err(IocpError::InvalidState.report(
+                    "iocp.completion.handle_control",
+                    "async cancel completion had no pending request (programming error)",
+                ));
+            }
         })
     }
 

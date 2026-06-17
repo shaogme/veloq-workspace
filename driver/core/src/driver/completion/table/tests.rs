@@ -6,9 +6,9 @@ use crate::{
     driver::{
         AnomalyAttach, AnomalyOutcome, CompletionAnomaly, CompletionAnomalyKind,
         CompletionAnomalyReason, CompletionBackend, CompletionBackendHooks, CompletionCleanup,
-        CompletionControl, CompletionEnvelope, CompletionFlowExt, CompletionFlowOutcome,
-        CompletionHookOutcome, CompletionIngress, CompletionSource, HookResult, OpToken,
-        PlatformOp, SlotIssueReason, registry::OpRegistry,
+        CompletionControl, CompletionFlowExt, CompletionFlowOutcome, CompletionHookOutcome,
+        CompletionIngress, CompletionSource, HookResult, OpToken, PlatformOp, SlotIssueReason,
+        registry::OpRegistry,
     },
     slot::{
         self, CheckedSlotView, InFlightOrphaned, InFlightWaiting, SlotRegistryExt, SlotState,
@@ -24,6 +24,24 @@ impl PlatformOp for DummyPlatformOp {
     type CleanupContext<'a> = ();
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct DummyError;
+
+impl std::fmt::Display for DummyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "dummy error")
+    }
+}
+
+impl std::error::Error for DummyError {}
+
+impl crate::DriverError for DummyError {
+    #[inline]
+    fn from_core_report(report: Report<DriverCoreError>) -> Report<Self> {
+        report.map_err(|_| DummyError)
+    }
+}
+
 struct DummySlotSpec;
 
 impl slot::SlotSpec for DummySlotSpec {
@@ -31,7 +49,7 @@ impl slot::SlotSpec for DummySlotSpec {
     type UserPayload = ();
     type PlatformData = ();
     type Sidecar = ();
-    type Error = ();
+    type Error = DummyError;
     type Completion = usize;
     type CompletionDiagnostics = ();
 }
@@ -249,33 +267,6 @@ fn try_take_record_reports_future_generation_unavailable() {
         PollRecordResult::Pending => panic!("future generation token must not stay pending"),
         PollRecordResult::Ready(_) => panic!("future generation token must not become ready"),
     }
-}
-
-#[test]
-fn raw_unknown_control_is_recorded_as_anomaly() {
-    let mut registry = OpRegistry::<DummySlotSpec>::new(1);
-    let diagnostics = registry.shared.completion_diagnostics();
-    let table: SharedCompletionTable<DummySlotSpec> = registry.shared.clone();
-    let mut hooks = TestHooks::default();
-    let raw_unknown_control = (99u64 << 48) | (7u64 << 32) | u64::from(u32::MAX);
-
-    let outcome = registry
-        .accept_completion(
-            &table,
-            &diagnostics,
-            &mut hooks,
-            CompletionIngress::Kernel(CompletionEnvelope::from_raw_parts(
-                CompletionBackend::Core,
-                raw_unknown_control,
-                -5,
-                0,
-            )),
-        )
-        .expect("test completion should succeed");
-
-    assert_eq!(outcome.anomaly, 1);
-    assert_eq!(diagnostics.snapshot().unknown_completion, 1);
-    assert!(!registry.shared.has_ready_completion());
 }
 
 #[test]

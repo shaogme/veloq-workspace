@@ -225,8 +225,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
         self.registry
             .release_buffer_lease(release.buffer_lease, self.env)
             .trans()?;
-        let _ = release_socket_inflight_token_from(self.socket_runtime, release.socket_inflight)
-            .trans()?;
+        release_socket_inflight_token_from(self.socket_runtime, release.socket_inflight).trans()?;
         if *self.outstanding_count > 0 {
             *self.outstanding_count -= 1;
         }

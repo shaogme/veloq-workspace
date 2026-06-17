@@ -545,11 +545,31 @@ mod tests {
         CompletionSource, CompletionToken, HookResult, PlatformOp, PollRecordResult,
         SharedCompletionTable, UserCompletionEvent,
     };
+    use crate::{DriverCoreError, DriverError};
+    use diagweave::prelude::*;
 
     struct DummyPlatformOp;
 
     impl PlatformOp for DummyPlatformOp {
         type CleanupContext<'a> = ();
+    }
+
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    struct DummyError;
+
+    impl std::fmt::Display for DummyError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "dummy error")
+        }
+    }
+
+    impl std::error::Error for DummyError {}
+
+    impl DriverError for DummyError {
+        #[inline]
+        fn from_core_report(report: Report<DriverCoreError>) -> Report<Self> {
+            report.map_err(|_| DummyError)
+        }
     }
 
     struct DummySlotSpec;
@@ -559,7 +579,7 @@ mod tests {
         type UserPayload = ();
         type PlatformData = ();
         type Sidecar = ();
-        type Error = ();
+        type Error = DummyError;
         type Completion = usize;
         type CompletionDiagnostics = ();
     }

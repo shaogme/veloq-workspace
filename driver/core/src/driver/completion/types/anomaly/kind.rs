@@ -115,18 +115,6 @@ impl CompletionAnomalyKind {
         )
     }
 
-    pub const fn unknown_control() -> Self {
-        Self::Control {
-            reason: ControlAnomalyReason::UnknownControlToken,
-        }
-    }
-
-    pub const fn control_completion_untracked() -> Self {
-        Self::Control {
-            reason: ControlAnomalyReason::ControlCompletionUntracked,
-        }
-    }
-
     pub const fn backend_context_unknown() -> Self {
         Self::Control {
             reason: ControlAnomalyReason::BackendContextUnknown,
@@ -212,12 +200,6 @@ impl CompletionAnomalyKind {
                 SlotIssueReason::SlotCorruption => CompletionAnomalyReason::SlotCorruption,
             },
             Self::Control { reason } => match reason {
-                ControlAnomalyReason::UnknownControlToken => {
-                    CompletionAnomalyReason::UnknownControlToken
-                }
-                ControlAnomalyReason::ControlCompletionUntracked => {
-                    CompletionAnomalyReason::ControlCompletionUntracked
-                }
                 ControlAnomalyReason::BackendContextUnknown => {
                     CompletionAnomalyReason::BackendContextUnknown
                 }
@@ -373,12 +355,6 @@ impl CompletionAnomalyKind {
                 anomaly
             }
             Self::Control { reason } => match reason {
-                ControlAnomalyReason::UnknownControlToken => {
-                    CompletionAnomaly::unknown_control(token)
-                }
-                ControlAnomalyReason::ControlCompletionUntracked => {
-                    CompletionAnomaly::control_completion_untracked(token)
-                }
                 ControlAnomalyReason::BackendContextUnknown => {
                     CompletionAnomaly::backend_context_unknown(token)
                 }

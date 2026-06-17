@@ -147,11 +147,10 @@ where
         }
 
         match anomaly.reason() {
-            CompletionAnomalyReason::UnknownSlot
-            | CompletionAnomalyReason::UnknownControlToken
-            | CompletionAnomalyReason::NonActiveSlot => self.inc_unknown_completion(),
-            CompletionAnomalyReason::ControlCompletionUntracked
-            | CompletionAnomalyReason::BackendInvariantBroken
+            CompletionAnomalyReason::UnknownSlot | CompletionAnomalyReason::NonActiveSlot => {
+                self.inc_unknown_completion()
+            }
+            CompletionAnomalyReason::BackendInvariantBroken
             | CompletionAnomalyReason::CompletionKeyMismatch
             | CompletionAnomalyReason::FinalizeFailed
             | CompletionAnomalyReason::CancelAckTargetStillActive

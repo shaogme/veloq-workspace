@@ -164,22 +164,6 @@ impl CompletionAnomaly {
         }
     }
 
-    pub fn unknown_control(token: CompletionToken) -> Self {
-        Self::TokenOnly {
-            reason: CompletionAnomalyReason::UnknownControlToken,
-            token,
-            raw: None,
-        }
-    }
-
-    pub fn control_completion_untracked(token: CompletionToken) -> Self {
-        Self::TokenOnly {
-            reason: CompletionAnomalyReason::ControlCompletionUntracked,
-            token,
-            raw: None,
-        }
-    }
-
     pub fn unknown_slot(token: CompletionToken, index: usize, generation: u32) -> Self {
         Self::UnknownSlot {
             token,

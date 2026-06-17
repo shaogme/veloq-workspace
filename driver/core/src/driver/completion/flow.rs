@@ -1,11 +1,12 @@
 use crate::{
-    DriverResult,
+    DriverError, DriverResult,
     driver::registry::OpRegistry,
     slot::{
         InFlightOrphaned, InFlightWaiting, Slot, SlotCompletion, SlotCompletionDiagnostics,
         SlotError, SlotPayload, SlotRegistryExt, SlotSnapshot, SlotSpec,
     },
 };
+use diagweave::DiagnosticError;
 
 use super::{
     AnomalyAttach, CompletionAnomalyKind, CompletionAnomalyReason, CompletionBackend,
@@ -14,7 +15,6 @@ use super::{
     RecordCompletionOutcome, RecordCompletionResult, RoutedSlotCompletion, SharedCompletionTable,
     UserCompletionEvent, dispatch_envelope, finalize_corrupt_checked, finalize_orphaned_checked,
     finalize_waiting_checked, route_user_completion, run_completion_cleanup, run_rejected_cleanup,
-    unknown_completion_kind,
 };
 
 pub type HookResult<Spec, T> = DriverResult<T, SlotError<Spec>>;
@@ -284,7 +284,7 @@ impl<Spec> CompletionFlowExt<Spec> for OpRegistry<Spec>
 where
     Spec: SlotSpec,
     SlotPayload<Spec>: Send,
-    SlotError<Spec>: Send,
+    SlotError<Spec>: Send + DriverError,
     SlotCompletion<Spec>: Send,
     SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
 {
@@ -316,10 +316,16 @@ where
                     finish_hook_outcome(self, table, diagnostics, hooks, outcome, None)
                 }
                 CompletionDispatch::Unknown { envelope } => {
-                    let kind = unknown_completion_kind(envelope);
-                    let attach = AnomalyAttach::from_raw_completion(envelope.raw);
-                    diagnostics.record_anomaly_kind(kind, attach);
-                    Ok(CompletionFlowOutcome::anomaly())
+                    use crate::DriverCoreError;
+                    Err(SlotError::<Spec>::from_core_report(
+                        DriverCoreError::Internal
+                            .to_report()
+                            .push_ctx("scope", "driver-core/completion")
+                            .attach_note(format!(
+                                "unknown control or unclassified completion: {:?}",
+                                envelope.identity
+                            )),
+                    ))
                 }
             },
             CompletionIngress::User(event) => {
