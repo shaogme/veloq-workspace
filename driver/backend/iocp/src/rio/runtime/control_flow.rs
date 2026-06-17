@@ -167,7 +167,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
                     "Backend invariant broken: RIO complete_waiting received non-Backend source",
                 );
         };
-        complete_rio_waiting_slot(self.registry, self.ext, slot, event, ingress)
+        complete_rio_waiting_slot(self.registry, self.ext, slot, ingress)
     }
 
     fn complete_orphaned(
@@ -238,7 +238,6 @@ fn complete_rio_waiting_slot(
     registry: &mut RioRegistry,
     ext: &crate::ext::Extensions,
     mut slot: Slot<'_, InFlightWaiting>,
-    event: UserCompletionEvent,
     ingress: &RioIngress,
 ) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, RioBackendEffect>> {
     let init = &ingress.init;
@@ -248,8 +247,6 @@ fn complete_rio_waiting_slot(
     let socket_key = init.socket_inflight.socket_key();
     let effect = RioBackendEffect::from_init(init);
     if slot.platform().generation != generation {
-        let snapshot = slot.snapshot();
-        let loss_kind = CompletionAnomalyKind::GenerationMismatch { snapshot };
         let report = IocpError::Internal
             .to_report()
             .push_ctx("scope", "rio.runtime.control_flow.handle_op_completion")
@@ -259,22 +256,7 @@ fn complete_rio_waiting_slot(
             .with_ctx("rio_op_kind", init.op_kind.as_str())
             .with_ctx("rio_request_id", init.request_id)
             .attach_note("RIO slot platform generation mismatch");
-        let cleanup = {
-            let mut guard = slot.complete();
-            let completion = Err(report);
-            let cleanup = guard
-                .with_op_mut(|op| op.completion_cleanup(&completion))
-                .unwrap_or_default();
-            let _ = guard.take_op();
-            let _ = guard.take_completion_data();
-            cleanup
-        };
-        return Ok(CompletionHookOutcome::Lost {
-            event,
-            loss_kind,
-            cleanup,
-            effect,
-        });
+        return Err(report);
     }
 
     let cancelled = slot.platform().rio_cancel_requested;

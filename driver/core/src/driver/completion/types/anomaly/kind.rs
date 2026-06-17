@@ -131,7 +131,6 @@ impl CompletionAnomalyKind {
 
     pub fn reason(self) -> CompletionAnomalyReason {
         match self {
-            Self::GenerationMismatch { .. } => CompletionAnomalyReason::StaleGeneration,
             Self::UnknownSlot { .. } => CompletionAnomalyReason::UnknownSlot,
             Self::Stale { .. } => CompletionAnomalyReason::StaleGeneration,
             Self::NonActive { .. } => CompletionAnomalyReason::NonActiveSlot,
@@ -150,7 +149,6 @@ impl CompletionAnomalyKind {
 
     pub fn index(self) -> Option<usize> {
         match self {
-            Self::GenerationMismatch { snapshot } => Some(snapshot.index),
             Self::UnknownSlot { index, .. }
             | Self::Stale { index, .. }
             | Self::NonActive { index, .. }
@@ -165,7 +163,6 @@ impl CompletionAnomalyKind {
 
     pub fn slot_snapshot(self) -> Option<slot::SlotSnapshot> {
         match self {
-            Self::GenerationMismatch { snapshot } => Some(snapshot),
             Self::SlotIssue {
                 snapshot: Some(snapshot),
                 ..
@@ -176,7 +173,6 @@ impl CompletionAnomalyKind {
 
     pub fn expected_generation(self) -> Option<u32> {
         match self {
-            Self::GenerationMismatch { snapshot } => Some(snapshot.generation),
             Self::UnknownSlot { generation, .. } => Some(generation),
             Self::Stale { expected, .. } => Some(expected),
             Self::NonActive { generation, .. } => Some(generation),
@@ -191,7 +187,6 @@ impl CompletionAnomalyKind {
 
     pub fn actual_generation(self) -> Option<u32> {
         match self {
-            Self::GenerationMismatch { snapshot } => Some(snapshot.generation),
             Self::Stale { actual, .. } => Some(actual),
             Self::NonActive { generation, .. } => Some(generation),
             Self::SlotIssue { generation, .. } => Some(generation),
@@ -205,7 +200,6 @@ impl CompletionAnomalyKind {
 
     pub fn state(self) -> Option<slot::SlotState> {
         match self {
-            Self::GenerationMismatch { snapshot } => Some(snapshot.state),
             Self::Stale { state, .. }
             | Self::NonActive { state, .. }
             | Self::SlotIssue { state, .. } => Some(state),
@@ -218,7 +212,6 @@ impl CompletionAnomalyKind {
 
     pub fn backend(self) -> Option<CompletionBackend> {
         match self {
-            Self::GenerationMismatch { .. } => None,
             Self::BackendContext { backend, .. } | Self::BackendSpecific { backend, .. } => {
                 Some(backend)
             }
@@ -246,19 +239,6 @@ impl CompletionAnomalyKind {
         let token = attach.token;
         let raw = attach.raw;
         let anomaly = match self {
-            Self::GenerationMismatch { snapshot } => {
-                let (expected_generation, index) = match token.op_token() {
-                    Some(op_token) => (op_token.generation(), op_token.index()),
-                    None => (snapshot.generation, snapshot.index),
-                };
-                CompletionAnomaly::stale(
-                    token,
-                    index,
-                    expected_generation,
-                    snapshot.generation,
-                    snapshot.state,
-                )
-            }
             Self::UnknownSlot { index, generation } => {
                 CompletionAnomaly::unknown_slot(token, index, generation)
             }

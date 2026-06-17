@@ -48,9 +48,6 @@ pub struct CompletionRaw {
 /// Lightweight anomaly classification for hot propagation paths (~24–32 B).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionAnomalyKind {
-    GenerationMismatch {
-        snapshot: slot::SlotSnapshot,
-    },
     UnknownSlot {
         index: usize,
         generation: u32,
