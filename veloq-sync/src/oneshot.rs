@@ -43,7 +43,19 @@ impl<T> Default for State<T> {
 
 impl<T> State<T> {
     /// Creates a new oneshot channel state.
+    #[cfg(not(feature = "loom"))]
     pub const fn new() -> Self {
+        State {
+            state: AtomicUsize::new(StateVal::new().as_usize()),
+            value: UnsafeCell::new(None),
+            tx_task: AtomicWaker::new(),
+            rx_task: AtomicWaker::new(),
+        }
+    }
+
+    /// Creates a new oneshot channel state.
+    #[cfg(feature = "loom")]
+    pub fn new() -> Self {
         State {
             state: AtomicUsize::new(StateVal::new().as_usize()),
             value: UnsafeCell::new(None),
