@@ -40,7 +40,7 @@ pub use types::{
     CompletionAnomalyReason, CompletionBackend, CompletionCleanup, CompletionCleanupGuard,
     CompletionMutationOutcome, CompletionRaw, DriverCompletionDiagnostics,
     DriverCompletionDiagnosticsBackend, DriverCompletionDiagnosticsSnapshot,
-    RecordCompletionOutcome, RecordCompletionResult, SlotIssueReason,
+    RecordCompletionOutcome, RecordCompletionResult,
 };
 
 pub trait CompletionValue: Send {

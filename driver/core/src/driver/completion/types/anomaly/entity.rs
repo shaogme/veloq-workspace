@@ -193,21 +193,6 @@ impl CompletionAnomaly {
         )
     }
 
-    pub fn finalize_failed(
-        token: CompletionToken,
-        index: usize,
-        generation: u32,
-        state: slot::SlotState,
-    ) -> Self {
-        Self::slot_state(
-            CompletionAnomalyReason::FinalizeFailed,
-            token,
-            index,
-            generation,
-            state,
-        )
-    }
-
     pub fn from_backend_context(
         token: CompletionToken,
         backend: CompletionBackend,

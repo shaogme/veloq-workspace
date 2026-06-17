@@ -150,7 +150,6 @@ fn lost_reason_from_anomaly(reason: CompletionAnomalyReason) -> LostReason {
         CompletionAnomalyReason::StaleGeneration => LostReason::GenerationMismatch,
         CompletionAnomalyReason::UnknownSlot
         | CompletionAnomalyReason::NonActiveSlot
-        | CompletionAnomalyReason::FinalizeFailed
         | CompletionAnomalyReason::BackendContextUnknown
         | CompletionAnomalyReason::BackendSpecific(_) => LostReason::Other,
     }
@@ -195,11 +194,6 @@ where
         report = report
             .with_ctx("raw_result", raw.res)
             .with_ctx("completion_flags", raw.flags);
-    }
-    if let Some(snapshot) = kind.slot_snapshot() {
-        report = report
-            .with_ctx("snapshot_has_op", snapshot.has_op)
-            .with_ctx("snapshot_has_payload", snapshot.has_payload);
     }
 
     OpError::new(reason, E::from_core_report(report))
@@ -257,15 +251,21 @@ where
     Spec::Completion: CompletionValue,
 {
     match table.try_take_record(token) {
-        PollRecordResult::Ready(record) => completion_record_to_result::<T, O, Spec>(record),
-        PollRecordResult::Unavailable { kind, attach } => {
+        Ok(PollRecordResult::Ready(record)) => completion_record_to_result::<T, O, Spec>(record),
+        Ok(PollRecordResult::Unavailable { kind, attach }) => {
             Poll::Ready(
                 OpResult::<T::Output, Spec::Error, T::Completion>::ResourceLost(
                     completion_anomaly_error_from_kind(kind, attach),
                 ),
             )
         }
-        PollRecordResult::Pending => Poll::Pending,
+        Ok(PollRecordResult::Pending) => Poll::Pending,
+        Err(report) => Poll::Ready(
+            OpResult::<T::Output, Spec::Error, T::Completion>::ResourceLost(OpError::new(
+                LostReason::Other,
+                report,
+            )),
+        ),
     }
 }
 

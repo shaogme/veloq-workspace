@@ -141,7 +141,7 @@ fn test_completion_table_loom() {
         let table_cloned = table.clone();
         let consumer = thread::spawn(move || {
             table_cloned.mark_waiting(token);
-            match table_cloned.try_take_record(token) {
+            match table_cloned.try_take_record(token).unwrap() {
                 PollRecordResult::Ready(record) => {
                     assert_eq!(
                         record.event.completion_token(),
@@ -190,7 +190,7 @@ fn test_fast_completion_then_waiting_take_loom() {
         accept_completion(&registry, token, 7);
 
         table.mark_waiting(token);
-        match table.try_take_record(token) {
+        match table.try_take_record(token).unwrap() {
             PollRecordResult::Ready(record) => {
                 assert_eq!(
                     record.event.completion_token(),
@@ -215,9 +215,9 @@ fn test_stale_after_generation_advance_loom() {
 
         accept_completion(&registry, token_g1, 1);
         table.mark_waiting(token_g1);
-        let _ = table.try_take_record(token_g1);
+        let _ = table.try_take_record(token_g1).unwrap();
 
-        match table.try_take_record(token_g1) {
+        match table.try_take_record(token_g1).unwrap() {
             PollRecordResult::Unavailable { kind, .. } => {
                 assert_eq!(kind.reason(), CompletionAnomalyReason::StaleGeneration);
             }
@@ -236,7 +236,7 @@ fn test_ready_race_with_mark_orphaned_loom() {
 
         let t1 = table.clone();
         let consumer_take = thread::spawn(move || {
-            let _ = t1.try_take_record(token);
+            let _ = t1.try_take_record(token).unwrap();
         });
 
         let t2 = table.clone();
@@ -265,7 +265,7 @@ fn test_two_consumers_at_most_one_ready_loom() {
         let c1_ready = ready_count.clone();
         let c1 = thread::spawn(move || {
             c1_table.mark_waiting(token);
-            if let PollRecordResult::Ready(_) = c1_table.try_take_record(token) {
+            if let PollRecordResult::Ready(_) = c1_table.try_take_record(token).unwrap() {
                 c1_ready.fetch_add(1, Ordering::SeqCst);
             }
         });
@@ -274,7 +274,7 @@ fn test_two_consumers_at_most_one_ready_loom() {
         let c2_ready = ready_count.clone();
         let c2 = thread::spawn(move || {
             c2_table.mark_waiting(token);
-            if let PollRecordResult::Ready(_) = c2_table.try_take_record(token) {
+            if let PollRecordResult::Ready(_) = c2_table.try_take_record(token).unwrap() {
                 c2_ready.fetch_add(1, Ordering::SeqCst);
             }
         });

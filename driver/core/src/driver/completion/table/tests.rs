@@ -1,5 +1,4 @@
 use super::*;
-use std::task::Waker;
 
 use crate::{
     DriverCoreError,
@@ -14,7 +13,6 @@ use crate::{
         SlotView,
     },
 };
-use diagweave::prelude::*;
 use veloq_shim::atomic::Ordering;
 
 struct DummyPlatformOp;
@@ -227,7 +225,7 @@ fn try_take_record_reports_future_generation_unavailable() {
     let table = slot::SlotTable::<DummySlotSpec>::new(1);
     let token = test_token(0, 1);
 
-    match table.try_take_record(token) {
+    match table.try_take_record(token).unwrap() {
         PollRecordResult::Unavailable { kind, .. } => {
             assert_eq!(kind.reason(), CompletionAnomalyReason::NonActiveSlot);
             assert!(matches!(
@@ -355,7 +353,7 @@ fn duplicate_completion_does_not_clear_ready_data() {
 
     assert_eq!(first.user_completed, 1);
     assert_eq!(duplicate.anomaly, 1);
-    let record = match table.try_take_record(token) {
+    let record = match table.try_take_record(token).unwrap() {
         PollRecordResult::Ready(record) => record,
         PollRecordResult::Pending => panic!("first completion should be ready"),
         PollRecordResult::Unavailable { kind, .. } => {
@@ -377,7 +375,7 @@ fn ready_mark_orphaned_cleanup_leaves_diagnostic_stale_result() {
     );
 
     assert!(matches!(
-        table.try_take_record(token),
+        table.try_take_record(token).unwrap(),
         PollRecordResult::Unavailable {
             kind,
             ..

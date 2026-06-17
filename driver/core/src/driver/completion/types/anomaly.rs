@@ -10,14 +10,8 @@ pub enum CompletionAnomalyReason {
     UnknownSlot,
     StaleGeneration,
     NonActiveSlot,
-    FinalizeFailed,
     BackendContextUnknown,
     BackendSpecific(u16),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SlotIssueReason {
-    FinalizeFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,13 +51,6 @@ pub enum CompletionAnomalyKind {
         index: usize,
         generation: u32,
         state: slot::SlotState,
-    },
-    SlotIssue {
-        reason: SlotIssueReason,
-        index: usize,
-        generation: u32,
-        state: slot::SlotState,
-        snapshot: Option<slot::SlotSnapshot>,
     },
     BackendContext {
         backend: CompletionBackend,

@@ -457,7 +457,7 @@ where
                 diagnostics,
                 CompletionPacket::<Spec>::user_with_cleanup(event, payload, detail, cleanup),
             );
-            finish_waiting_if_needed(registry, diagnostics, finalize, event)?;
+            finish_waiting_if_needed(registry, finalize, event)?;
             hooks.finish_backend_effect(effect)?;
             Ok(completion_progress_from_record(record))
         }
@@ -480,10 +480,10 @@ where
             let _ = run_completion_cleanup(diagnostics, &mut cleanup);
             match finalize {
                 Some(FinalizeAction::Waiting(event)) => {
-                    finish_waiting_if_needed(registry, diagnostics, finalize, event)?;
+                    finish_waiting_if_needed(registry, finalize, event)?;
                 }
                 Some(FinalizeAction::Orphaned(event)) => {
-                    finish_orphaned(registry, diagnostics, event)?;
+                    finish_orphaned(registry, event)?;
                 }
                 None => {}
             }
@@ -557,7 +557,6 @@ where
 
 fn finish_waiting_if_needed<Spec>(
     registry: &mut OpRegistry<Spec>,
-    diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
     finalize: Option<FinalizeAction>,
     fallback_event: UserCompletionEvent,
 ) -> DriverResult<(), SlotError<Spec>>
@@ -570,21 +569,12 @@ where
         Some(FinalizeAction::Waiting(event)) => event,
         Some(FinalizeAction::Orphaned(_)) | None => fallback_event,
     };
-    let raw = event.raw();
-    let _ = finalize_waiting_checked(
-        registry,
-        diagnostics,
-        raw.backend,
-        event.token(),
-        raw.res,
-        raw.flags,
-    )?;
+    let _ = finalize_waiting_checked(registry, event.token())?;
     Ok(())
 }
 
 fn finish_orphaned<Spec>(
     registry: &mut OpRegistry<Spec>,
-    diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
     event: UserCompletionEvent,
 ) -> DriverResult<(), SlotError<Spec>>
 where
@@ -592,15 +582,7 @@ where
     SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
     SlotError<Spec>: DriverError,
 {
-    let raw = event.raw();
-    let _ = finalize_orphaned_checked(
-        registry,
-        diagnostics,
-        raw.backend,
-        event.token(),
-        raw.res,
-        raw.flags,
-    )?;
+    let _ = finalize_orphaned_checked(registry, event.token())?;
     Ok(())
 }
 

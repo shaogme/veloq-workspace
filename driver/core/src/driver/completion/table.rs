@@ -1,13 +1,14 @@
+use crate::DriverError;
 use crate::slot;
+use diagweave::prelude::*;
 use std::{sync::Arc, task::Waker};
 use veloq_shim::atomic::Ordering;
 
 use super::{
-    AnomalyAttach, AnomalyOutcome, CompletionAnomalyKind, CompletionBackend,
-    CompletionCleanupGuard, CompletionInput, CompletionPacket, CompletionRaw, CompletionRecord,
-    CompletionWritePermit, DriverCompletionDiagnostics, DriverCompletionDiagnosticsBackend,
-    OpToken, RecordCompletionOutcome, RecordCompletionResult, UserCompletionEvent,
-    run_completion_cleanup, types::CompletionMutationOutcome,
+    AnomalyAttach, AnomalyOutcome, CompletionAnomalyKind, CompletionCleanupGuard, CompletionInput,
+    CompletionPacket, CompletionRecord, CompletionWritePermit, DriverCompletionDiagnostics,
+    DriverCompletionDiagnosticsBackend, OpToken, RecordCompletionOutcome, RecordCompletionResult,
+    UserCompletionEvent, run_completion_cleanup, types::CompletionMutationOutcome,
 };
 
 pub type SharedCompletionTable<Spec> = Arc<dyn CompletionAccess<Spec>>;
@@ -42,7 +43,10 @@ pub trait CompletionAccess<Spec: slot::SlotSpec>: Send + Sync {
         self.record_completion(permit, CompletionPacket::lost(event, kind, cleanup))
     }
 
-    fn try_take_record(&self, token: OpToken) -> PollRecordResult<Spec>;
+    fn try_take_record(
+        &self,
+        token: OpToken,
+    ) -> Result<PollRecordResult<Spec>, Report<Spec::Error>>;
 
     fn register_waker(&self, token: OpToken, waker: &Waker) -> CompletionMutationOutcome;
 
@@ -342,13 +346,16 @@ where
         recorded_completion(&self.diagnostics, success_outcome)
     }
 
-    fn try_take_record(&self, token: OpToken) -> PollRecordResult<Spec> {
+    fn try_take_record(
+        &self,
+        token: OpToken,
+    ) -> Result<PollRecordResult<Spec>, Report<Spec::Error>> {
         let attach = AnomalyAttach::from_op_token(token);
         let (idx, generation) = token.parts();
         if idx >= self.slots.len() {
             let kind = CompletionAnomalyKind::unknown_slot(idx, generation);
             self.diagnostics.record_anomaly_kind(kind, attach);
-            return PollRecordResult::Unavailable { kind, attach };
+            return Ok(PollRecordResult::Unavailable { kind, attach });
         }
         let cell = &self.slots[idx];
 
@@ -359,19 +366,19 @@ where
         if cell_gen > generation {
             let kind = CompletionAnomalyKind::stale(idx, generation, cell_gen, state);
             self.diagnostics.record_anomaly_kind(kind, attach);
-            return PollRecordResult::Unavailable { kind, attach };
+            return Ok(PollRecordResult::Unavailable { kind, attach });
         }
 
         if cell_gen < generation {
             let kind = CompletionAnomalyKind::non_active(idx, generation, state);
             self.diagnostics.record_anomaly_kind(kind, attach);
-            return PollRecordResult::Unavailable { kind, attach };
+            return Ok(PollRecordResult::Unavailable { kind, attach });
         }
 
         if state != slot::SlotState::InFlightReady {
             return match state {
                 slot::SlotState::InFlightWaiting | slot::SlotState::Finalizing => {
-                    PollRecordResult::Pending
+                    Ok(PollRecordResult::Pending)
                 }
                 slot::SlotState::Idle
                 | slot::SlotState::Reserved
@@ -379,7 +386,7 @@ where
                 | slot::SlotState::ReservedValue => {
                     let kind = CompletionAnomalyKind::non_active(idx, generation, state);
                     self.diagnostics.record_anomaly_kind(kind, attach);
-                    PollRecordResult::Unavailable { kind, attach }
+                    Ok(PollRecordResult::Unavailable { kind, attach })
                 }
                 slot::SlotState::InFlightReady => unreachable!(),
             };
@@ -397,7 +404,7 @@ where
             )
             .is_err()
         {
-            return PollRecordResult::Pending;
+            return Ok(PollRecordResult::Pending);
         }
 
         self.clear_ready_completion();
@@ -409,39 +416,29 @@ where
                 payload,
                 detail,
                 cleanup,
-            } => PollRecordResult::Ready(CompletionRecord {
+            } => Ok(PollRecordResult::Ready(CompletionRecord {
                 event,
                 payload,
                 detail,
                 cleanup,
-            }),
+            })),
             slot::CompletionData::Lost {
                 kind,
                 attach,
                 mut cleanup,
             } => {
                 let _ = run_completion_cleanup(&self.diagnostics, &mut cleanup);
-                PollRecordResult::Unavailable { kind, attach }
+                Ok(PollRecordResult::Unavailable { kind, attach })
             }
             slot::CompletionData::Empty => {
-                let kind = CompletionAnomalyKind::finalize_failed_snapshot(slot::SlotSnapshot {
-                    index: idx,
-                    generation,
-                    state: slot::SlotState::Idle,
-                    has_op: true,
-                    has_payload: false,
-                });
-                let attach = AnomalyAttach {
-                    token: attach.token,
-                    raw: Some(CompletionRaw {
-                        backend: CompletionBackend::Core,
-                        res: cell.completion_res.load(Ordering::Acquire),
-                        flags: cell.completion_flags.load(Ordering::Acquire),
-                    }),
-                };
-                self.diagnostics.record_anomaly_kind(kind, attach);
-                self.diagnostics.inc_user_lost();
-                PollRecordResult::Unavailable { kind, attach }
+                let report = crate::DriverCoreError::Internal
+                    .to_report()
+                    .push_ctx("scope", "try_take_record")
+                    .attach_note(format!(
+                        "corrupt slot state: InFlightReady slot completion data is empty. index: {}, generation: {}",
+                        idx, generation
+                    ));
+                Err(Spec::Error::from_core_report(report))
             }
         }
     }

@@ -5,7 +5,6 @@ mod record;
 pub use anomaly::{
     AnomalyAttach, AnomalyOutcome, BackendSlotRef, CompletionAnomaly, CompletionAnomalyKind,
     CompletionAnomalyReason, CompletionBackend, CompletionMutationOutcome, CompletionRaw,
-    SlotIssueReason,
 };
 pub use diagnostics::{
     DriverCompletionDiagnostics, DriverCompletionDiagnosticsBackend,

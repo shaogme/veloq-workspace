@@ -136,8 +136,7 @@ where
             CompletionAnomalyReason::UnknownSlot | CompletionAnomalyReason::NonActiveSlot => {
                 self.inc_unknown_completion()
             }
-            CompletionAnomalyReason::FinalizeFailed
-            | CompletionAnomalyReason::BackendContextUnknown
+            CompletionAnomalyReason::BackendContextUnknown
             | CompletionAnomalyReason::BackendSpecific(_) => self.inc_internal_unknown(),
             CompletionAnomalyReason::StaleGeneration => self.inc_stale_completion(),
         }

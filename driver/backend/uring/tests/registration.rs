@@ -211,7 +211,7 @@ fn wait_completion(
         }
         let _ = driver.drive(DriveMode::Poll).expect("drive failed");
         let table = driver.completion_table();
-        match table.try_take_record(token) {
+        match table.try_take_record(token).unwrap() {
             PollRecordResult::Ready(record) => {
                 let CompletionRecord {
                     event,

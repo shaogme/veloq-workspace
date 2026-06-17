@@ -85,7 +85,6 @@ pub fn cancel_target_kind<'a, Spec: slot::SlotSpec>(
         CompletionAnomalyReason::StaleGeneration => CancelTargetGoneReason::Stale,
         CompletionAnomalyReason::UnknownSlot
         | CompletionAnomalyReason::NonActiveSlot
-        | CompletionAnomalyReason::FinalizeFailed
         | CompletionAnomalyReason::BackendContextUnknown
         | CompletionAnomalyReason::BackendSpecific(_) => CancelTargetGoneReason::Missing,
     };

@@ -727,7 +727,7 @@ mod tests {
             registry.checked_slot_view(token).unwrap(),
             CheckedSlotView::Empty(_)
         ));
-        let record = match registry.shared.try_take_record(token) {
+        let record = match registry.shared.try_take_record(token).unwrap() {
             PollRecordResult::Ready(record) => record,
             PollRecordResult::Pending => panic!("completion should be ready"),
             PollRecordResult::Unavailable { kind, .. } => {

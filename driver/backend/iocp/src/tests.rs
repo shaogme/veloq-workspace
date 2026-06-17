@@ -92,7 +92,7 @@ pub(crate) fn wait_completion_record(
         }
         let _ = driver.drive(DriveMode::Poll)?;
         let completion_table = driver.completion_table();
-        match completion_table.try_take_record(token) {
+        match completion_table.try_take_record(token)? {
             PollRecordResult::Ready(record) => return Ok(record),
             PollRecordResult::Unavailable { kind, attach } => {
                 return IocpError::CompletionWait

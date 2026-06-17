@@ -2,10 +2,7 @@ use crate::slot::{self, CheckedSlotView, SlotRegistryExt, SlotView};
 use crate::{DriverCoreError, DriverError, driver::registry::OpRegistry};
 use diagweave::prelude::*;
 
-use super::{
-    AnomalyAttach, CompletionAnomalyKind, CompletionAnomalyReason, CompletionBackend,
-    CompletionToken, DriverCompletionDiagnostics, OpToken, RawCompletion, UserCompletionEvent,
-};
+use super::{CompletionAnomalyKind, CompletionAnomalyReason, OpToken, UserCompletionEvent};
 
 pub enum RoutedSlotCompletion<'a, Spec: slot::SlotSpec> {
     Waiting(slot::Slot<'a, slot::InFlightWaiting, Spec>),
@@ -33,11 +30,7 @@ pub enum FinalizeOutcome {
 #[inline]
 pub(super) fn finalize_waiting_checked<Spec>(
     registry: &mut OpRegistry<Spec>,
-    diagnostics: &DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
-    backend: CompletionBackend,
     token: OpToken,
-    raw_res: i32,
-    flags: u32,
 ) -> Result<FinalizeOutcome, Report<Spec::Error>>
 where
     Spec: slot::SlotSpec,
@@ -45,18 +38,14 @@ where
     if registry.finalize_waiting_completion(token).is_some() {
         Ok(FinalizeOutcome::Finalized)
     } else {
-        record_finalize_failure(registry, diagnostics, backend, token, raw_res, flags)
+        record_finalize_failure(registry, token)
     }
 }
 
 #[inline]
 pub(super) fn finalize_orphaned_checked<Spec>(
     registry: &mut OpRegistry<Spec>,
-    diagnostics: &DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
-    backend: CompletionBackend,
     token: OpToken,
-    raw_res: i32,
-    flags: u32,
 ) -> Result<FinalizeOutcome, Report<Spec::Error>>
 where
     Spec: slot::SlotSpec,
@@ -64,37 +53,44 @@ where
     if registry.finalize_orphaned_completion(token).is_some() {
         Ok(FinalizeOutcome::Finalized)
     } else {
-        record_finalize_failure(registry, diagnostics, backend, token, raw_res, flags)
+        record_finalize_failure(registry, token)
     }
 }
 
 #[inline]
 fn record_finalize_failure<Spec>(
     registry: &mut OpRegistry<Spec>,
-    diagnostics: &DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
-    backend: CompletionBackend,
     token: OpToken,
-    raw_res: i32,
-    flags: u32,
 ) -> Result<FinalizeOutcome, Report<Spec::Error>>
 where
     Spec: slot::SlotSpec,
 {
-    let raw = RawCompletion::new(backend, CompletionToken::user(token), raw_res, flags);
-    let attach = AnomalyAttach::from_raw_completion(raw);
-    let kind = match slot_view_kind(token, registry.checked_slot_view(token)?) {
-        Ok(slot) => {
-            let snapshot = match slot {
-                SlotView::Reserved(slot) => slot.snapshot(),
-                SlotView::InFlightWaiting(slot) => slot.snapshot(),
-                SlotView::InFlightOrphaned(slot) => slot.snapshot(),
-            };
-            CompletionAnomalyKind::finalize_failed_snapshot(snapshot)
-        }
-        Err(kind) => kind,
+    let snapshot = match registry.checked_slot_view(token)? {
+        CheckedSlotView::Valid(slot) => match slot {
+            SlotView::Reserved(s) => s.snapshot(),
+            SlotView::InFlightWaiting(s) => s.snapshot(),
+            SlotView::InFlightOrphaned(s) => s.snapshot(),
+        },
+        CheckedSlotView::Missing {
+            index,
+            expected_generation,
+        } => slot::SlotSnapshot {
+            index,
+            generation: expected_generation,
+            state: slot::SlotState::Idle,
+            has_op: false,
+            has_payload: false,
+        },
+        CheckedSlotView::Empty(s) | CheckedSlotView::Stale(s) => s,
     };
-    diagnostics.record_anomaly_kind(kind, attach);
-    Ok(FinalizeOutcome::Missing(kind))
+    let report = DriverCoreError::Internal
+        .to_report()
+        .push_ctx("scope", "record_finalize_failure")
+        .attach_note(format!(
+            "corrupt slot state: unable to finalize slot: {:?}",
+            snapshot
+        ));
+    Err(Spec::Error::from_core_report(report))
 }
 
 #[inline]
