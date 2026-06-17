@@ -6,7 +6,7 @@ use super::{CompletionAnomaly, CompletionAnomalyReason, CompletionBackend, Compl
 impl CompletionAnomaly {
     pub fn reason(self) -> CompletionAnomalyReason {
         match self {
-            Self::TokenOnly { reason, .. } | Self::SlotState { reason, .. } => reason,
+            Self::SlotState { reason, .. } => reason,
             Self::UnknownSlot { .. } => CompletionAnomalyReason::UnknownSlot,
             Self::StaleGeneration { .. } => CompletionAnomalyReason::StaleGeneration,
             Self::BackendContext { .. } => CompletionAnomalyReason::BackendContextUnknown,
@@ -16,8 +16,7 @@ impl CompletionAnomaly {
 
     pub fn token(self) -> CompletionToken {
         match self {
-            Self::TokenOnly { token, .. }
-            | Self::UnknownSlot { token, .. }
+            Self::UnknownSlot { token, .. }
             | Self::StaleGeneration { token, .. }
             | Self::SlotState { token, .. }
             | Self::BackendContext { token, .. }
@@ -31,7 +30,7 @@ impl CompletionAnomaly {
             | Self::StaleGeneration { index, .. }
             | Self::SlotState { index, .. } => Some(index),
             Self::BackendSpecific { index, .. } => index,
-            Self::TokenOnly { .. } | Self::BackendContext { .. } => None,
+            Self::BackendContext { .. } => None,
         }
     }
 
@@ -50,7 +49,7 @@ impl CompletionAnomaly {
                 expected_generation,
                 ..
             } => expected_generation,
-            Self::TokenOnly { .. } | Self::BackendContext { .. } => None,
+            Self::BackendContext { .. } => None,
         }
     }
 
@@ -63,7 +62,7 @@ impl CompletionAnomaly {
             Self::BackendSpecific {
                 actual_generation, ..
             } => actual_generation,
-            Self::UnknownSlot { .. } | Self::TokenOnly { .. } | Self::BackendContext { .. } => None,
+            Self::UnknownSlot { .. } | Self::BackendContext { .. } => None,
         }
     }
 
@@ -71,7 +70,6 @@ impl CompletionAnomaly {
         match self {
             Self::StaleGeneration { state, .. } | Self::SlotState { state, .. } => Some(state),
             Self::UnknownSlot { .. }
-            | Self::TokenOnly { .. }
             | Self::BackendContext { .. }
             | Self::BackendSpecific { .. } => None,
         }
@@ -92,12 +90,10 @@ impl CompletionAnomaly {
             Self::BackendContext { backend, .. } | Self::BackendSpecific { backend, .. } => {
                 Some(backend)
             }
-            Self::TokenOnly { raw: Some(raw), .. }
-            | Self::UnknownSlot { raw: Some(raw), .. }
+            Self::UnknownSlot { raw: Some(raw), .. }
             | Self::StaleGeneration { raw: Some(raw), .. }
             | Self::SlotState { raw: Some(raw), .. } => Some(raw.backend),
-            Self::TokenOnly { raw: None, .. }
-            | Self::UnknownSlot { raw: None, .. }
+            Self::UnknownSlot { raw: None, .. }
             | Self::StaleGeneration { raw: None, .. }
             | Self::SlotState { raw: None, .. } => None,
         }
@@ -125,8 +121,7 @@ impl CompletionAnomaly {
 
     fn raw_attachment(self) -> Option<CompletionRaw> {
         match self {
-            Self::TokenOnly { raw, .. }
-            | Self::UnknownSlot { raw, .. }
+            Self::UnknownSlot { raw, .. }
             | Self::StaleGeneration { raw, .. }
             | Self::SlotState { raw, .. }
             | Self::BackendSpecific { raw, .. } => raw,
@@ -268,8 +263,7 @@ impl CompletionAnomaly {
 
     pub fn with_raw(mut self, raw: CompletionRaw) -> Self {
         match &mut self {
-            Self::TokenOnly { raw: slot, .. }
-            | Self::UnknownSlot { raw: slot, .. }
+            Self::UnknownSlot { raw: slot, .. }
             | Self::StaleGeneration { raw: slot, .. }
             | Self::SlotState { raw: slot, .. }
             | Self::BackendSpecific { raw: slot, .. } => *slot = Some(raw),
@@ -280,20 +274,6 @@ impl CompletionAnomaly {
 
     pub fn with_backend(self, backend: CompletionBackend) -> Self {
         match self {
-            Self::TokenOnly {
-                reason: CompletionAnomalyReason::BackendContextUnknown,
-                token,
-                raw,
-            } => Self::BackendContext {
-                token,
-                backend,
-                backend_context: 0,
-                raw: raw.unwrap_or(CompletionRaw {
-                    backend,
-                    res: 0,
-                    flags: 0,
-                }),
-            },
             Self::BackendSpecific {
                 code,
                 token,
@@ -363,25 +343,6 @@ impl CompletionAnomaly {
                 actual_generation,
                 raw,
             },
-            Self::TokenOnly {
-                reason: CompletionAnomalyReason::BackendContextUnknown,
-                token,
-                raw,
-            } => {
-                let backend = raw
-                    .map(|raw| raw.backend)
-                    .unwrap_or(CompletionBackend::Core);
-                Self::BackendContext {
-                    token,
-                    backend,
-                    backend_context: context,
-                    raw: raw.unwrap_or(CompletionRaw {
-                        backend,
-                        res: 0,
-                        flags: 0,
-                    }),
-                }
-            }
             other => other,
         }
     }
@@ -398,8 +359,7 @@ impl CompletionAnomaly {
 
     pub fn with_token(mut self, token: CompletionToken) -> Self {
         match &mut self {
-            Self::TokenOnly { token: slot, .. }
-            | Self::UnknownSlot { token: slot, .. }
+            Self::UnknownSlot { token: slot, .. }
             | Self::StaleGeneration { token: slot, .. }
             | Self::SlotState { token: slot, .. }
             | Self::BackendContext { token: slot, .. }

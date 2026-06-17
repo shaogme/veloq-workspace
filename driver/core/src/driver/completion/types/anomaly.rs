@@ -102,11 +102,6 @@ impl CompletionMutationOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionAnomaly {
-    TokenOnly {
-        reason: CompletionAnomalyReason,
-        token: CompletionToken,
-        raw: Option<CompletionRaw>,
-    },
     UnknownSlot {
         token: CompletionToken,
         index: usize,
