@@ -20,8 +20,8 @@ use veloq_driver_core::{
         AnomalyAttach, CancelCompletionId, CancelMode, CompletionAnomalyKind, CompletionBackend,
         CompletionBackendHooks, CompletionCleanupGuard, CompletionControl, CompletionEnvelope,
         CompletionFlowExt, CompletionFlowOutcome, CompletionHookOutcome, CompletionIngress,
-        CompletionSource, CompletionToken, DriverCompletionDiagnostics, OpToken, PlatformOp,
-        RawCompletion, SyntheticCompletionSource, UserCompletionEvent, drain_cancel_requests,
+        CompletionSource, CompletionToken, Driver, DriverCompletionDiagnostics, OpToken,
+        PlatformOp, RawCompletion, SyntheticCompletionSource, UserCompletionEvent,
     },
     slot::{CheckedSlotView, InFlightOrphaned, InFlightWaiting, SlotRegistryExt, SlotView},
 };
@@ -303,7 +303,7 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
 
 impl<'a> UringDriver<'a> {
     pub(crate) fn wait_internal(&mut self) -> UringResult<()> {
-        let _ = drain_cancel_requests(self)?;
+        let _ = self.drain_cancel_requests()?;
         self.flush_cancellations()?;
         self.flush_backlog()?;
 
@@ -363,7 +363,7 @@ impl<'a> UringDriver<'a> {
     }
 
     pub(crate) fn poll_nonblocking_internal(&mut self) -> UringResult<()> {
-        let _ = drain_cancel_requests(self)?;
+        let _ = self.drain_cancel_requests()?;
         self.flush_cancellations()?;
         self.flush_backlog()?;
         self.submit_to_kernel()?;

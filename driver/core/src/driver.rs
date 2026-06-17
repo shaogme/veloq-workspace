@@ -219,6 +219,15 @@ pub trait Driver {
     fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<(), Self::Error>;
 
     fn create_waker(&self) -> Arc<dyn RemoteWaker<Self::Error>>;
+
+    fn drain_cancel_requests(&mut self) -> DriverResult<CancelDrainOutcome, Self::Error> {
+        let mut outcome = CancelDrainOutcome::default();
+        while let Some(request) = self.try_recv_remote_cancel_request() {
+            let submit_outcome = self.cancel_op(request)?;
+            outcome.record(submit_outcome);
+        }
+        Ok(outcome)
+    }
 }
 
 pub trait ContextDriverProvider<D: Driver + ?Sized> {
@@ -331,6 +340,10 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
     fn create_waker(&self) -> Arc<dyn RemoteWaker<Self::Error>> {
         self.provider.with_driver_ref(|d| d.create_waker())
     }
+
+    fn drain_cancel_requests(&mut self) -> DriverResult<CancelDrainOutcome, Self::Error> {
+        self.provider.with_driver_mut(|d| d.drain_cancel_requests())
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -374,18 +387,6 @@ impl CancelDrainOutcome {
             }
         }
     }
-}
-
-#[inline]
-pub fn drain_cancel_requests<D: Driver>(
-    driver: &mut D,
-) -> DriverResult<CancelDrainOutcome, D::Error> {
-    let mut outcome = CancelDrainOutcome::default();
-    while let Some(request) = driver.try_recv_remote_cancel_request() {
-        let submit_outcome = driver.cancel_op(request)?;
-        outcome.record(submit_outcome);
-    }
-    Ok(outcome)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -6,8 +6,8 @@ use std::{
 
 use diagweave::prelude::*;
 use veloq_driver_core::driver::{
-    AnomalyAttach, CompletionAnomalyKind, CompletionEnvelope, CompletionIdentity, OpToken,
-    RawCompletion, RemoteWaker, SharedCompletionTable, drain_cancel_requests,
+    AnomalyAttach, CompletionAnomalyKind, CompletionEnvelope, CompletionIdentity, Driver, OpToken,
+    RawCompletion, RemoteWaker, SharedCompletionTable,
 };
 use veloq_wheel::{TaskId, Wheel, WheelConfig};
 
@@ -133,7 +133,7 @@ impl<'a> IocpDriver<'a> {
 
     /// Retrieves completion events from the I/O completion port.
     pub(crate) fn get_completion(&mut self, timeout_ms: u32) -> IocpResult<()> {
-        let _ = drain_cancel_requests(self)?;
+        let _ = self.drain_cancel_requests()?;
         let wait_ms = self.calculate_wait_ms(timeout_ms);
 
         let status = self.completion.port().get_status(wait_ms);

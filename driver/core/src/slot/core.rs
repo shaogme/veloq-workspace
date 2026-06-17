@@ -27,6 +27,16 @@ pub enum SlotState {
     ReservedValue,
 }
 
+impl SlotState {
+    #[inline]
+    pub fn is_runnable(self) -> bool {
+        matches!(
+            self,
+            Self::Reserved | Self::InFlightWaiting | Self::InFlightOrphaned
+        )
+    }
+}
+
 #[bitsize(64)]
 #[derive(FromBits, DebugBits, Clone, Copy, PartialEq, Eq)]
 pub struct PackedCoreState {

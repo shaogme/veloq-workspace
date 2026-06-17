@@ -120,152 +120,150 @@ impl<T, E, R> OpCompletion<T, E, R> {
     }
 }
 
-#[inline]
-pub(crate) fn payload_missing_error<E>() -> OpError<E>
-where
-    E: DriverError,
-{
-    OpError::new(
-        LostReason::PayloadMissing,
-        E::from_core_report(
-            DriverCoreError::Internal
-                .to_report()
-                .push_ctx("scope", "driver-core/op")
-                .attach_note("operation payload lost: completion sidecar missing"),
-        ),
-    )
-}
-
-#[inline]
-pub(crate) fn payload_projection_error<E>(source: DriverReport<E>) -> OpError<E>
-where
-    E: DriverError,
-{
-    OpError::new(LostReason::PayloadTypeMismatch, source)
-}
-
-#[inline]
-fn lost_reason_from_anomaly(reason: CompletionAnomalyReason) -> LostReason {
-    match reason {
-        CompletionAnomalyReason::StaleGeneration => LostReason::GenerationMismatch,
-        CompletionAnomalyReason::UnknownSlot
-        | CompletionAnomalyReason::NonActiveSlot
-        | CompletionAnomalyReason::BackendContextUnknown
-        | CompletionAnomalyReason::BackendSpecific(_) => LostReason::Other,
-    }
-}
-
-#[inline]
-pub(crate) fn completion_anomaly_error_from_kind<E>(
-    kind: CompletionAnomalyKind,
-    attach: AnomalyAttach,
-) -> OpError<E>
-where
-    E: DriverError,
-{
-    let reason = lost_reason_from_anomaly(kind.reason());
-
-    let mut report = DriverCoreError::Internal
-        .to_report()
-        .push_ctx("scope", "driver-core/op")
-        .with_ctx("completion_token", attach.token.raw())
-        .with_ctx("completion_anomaly", format!("{:?}", kind.reason()))
-        .attach_note("operation completion became unavailable");
-
-    if let Some(index) = kind.index() {
-        report = report.with_ctx("slot_index", index);
-    }
-    if let Some(expected_generation) = kind.expected_generation() {
-        report = report.with_ctx("expected_generation", expected_generation);
-    }
-    if let Some(actual_generation) = kind.actual_generation() {
-        report = report.with_ctx("actual_generation", actual_generation);
-    }
-    if let Some(state) = kind.state() {
-        report = report.with_ctx("slot_state", format!("{state:?}"));
-    }
-    if let Some(backend) = kind.backend().or_else(|| attach.raw.map(|raw| raw.backend)) {
-        report = report.with_ctx("completion_backend", format!("{backend:?}"));
-    }
-    if let Some(backend_context) = kind.backend_context_value() {
-        report = report.with_ctx("completion_backend_context", backend_context);
-    }
-    if let Some(raw) = attach.raw {
-        report = report
-            .with_ctx("raw_result", raw.res)
-            .with_ctx("completion_flags", raw.flags);
-    }
-
-    OpError::new(reason, E::from_core_report(report))
-}
-
-#[inline]
-pub(crate) fn completion_record_to_result<T, O, Spec>(
-    record: CompletionRecord<Spec>,
-) -> Poll<OpResult<T::Output, Spec::Error, T::Completion>>
-where
-    Spec: SlotSpec,
-    O: PlatformOp,
-    T: IntoPlatformOp<
-            O,
-            DriverCompletion = Spec::Completion,
-            ErasedPayload = Spec::UserPayload,
-            Error = Spec::Error,
-        >,
-    Spec::Completion: CompletionValue,
-{
-    let CompletionRecord {
-        event,
-        payload: payload_erased,
-        detail,
-        mut cleanup,
-    } = record;
-    let payload = match T::try_payload_from_erased(payload_erased) {
-        Ok(payload) => payload,
-        Err(report) => {
-            let _ = cleanup.run();
-            return Poll::Ready(OpResult::ResourceLost(payload_projection_error(report)));
+impl LostReason {
+    #[inline]
+    pub(crate) fn from_anomaly_reason(reason: CompletionAnomalyReason) -> Self {
+        match reason {
+            CompletionAnomalyReason::StaleGeneration => Self::GenerationMismatch,
+            CompletionAnomalyReason::UnknownSlot
+            | CompletionAnomalyReason::NonActiveSlot
+            | CompletionAnomalyReason::BackendContextUnknown
+            | CompletionAnomalyReason::BackendSpecific(_) => Self::Other,
         }
-    };
-    cleanup.disarm();
-    let res =
-        detail.unwrap_or_else(|| Spec::Completion::from_event_res::<Spec::Error>(event.res()));
-    let completion = T::complete(payload, res);
-    Poll::Ready(OpResult::Completed(completion.result, completion.output))
+    }
 }
 
-#[inline]
-pub(crate) fn poll_completion_table_once<T, O, Spec>(
-    table: &dyn CompletionAccess<Spec>,
-    token: OpToken,
-) -> Poll<OpResult<T::Output, Spec::Error, T::Completion>>
+impl<E> OpError<E>
 where
-    Spec: SlotSpec,
-    O: PlatformOp,
-    T: IntoPlatformOp<
-            O,
-            DriverCompletion = Spec::Completion,
-            ErasedPayload = Spec::UserPayload,
-            Error = Spec::Error,
-        >,
-    Spec::Completion: CompletionValue,
+    E: DriverError,
 {
-    match table.try_take_record(token) {
-        Ok(PollRecordResult::Ready(record)) => completion_record_to_result::<T, O, Spec>(record),
-        Ok(PollRecordResult::Unavailable { kind, attach }) => {
-            Poll::Ready(
-                OpResult::<T::Output, Spec::Error, T::Completion>::ResourceLost(
-                    completion_anomaly_error_from_kind(kind, attach),
-                ),
-            )
+    #[inline]
+    pub(crate) fn payload_missing() -> Self {
+        Self::new(
+            LostReason::PayloadMissing,
+            E::from_core_report(
+                DriverCoreError::Internal
+                    .to_report()
+                    .push_ctx("scope", "driver-core/op")
+                    .attach_note("operation payload lost: completion sidecar missing"),
+            ),
+        )
+    }
+
+    #[inline]
+    pub(crate) fn payload_projection(source: DriverReport<E>) -> Self {
+        Self::new(LostReason::PayloadTypeMismatch, source)
+    }
+
+    #[inline]
+    pub(crate) fn from_completion_anomaly(
+        kind: CompletionAnomalyKind,
+        attach: AnomalyAttach,
+    ) -> Self {
+        let reason = LostReason::from_anomaly_reason(kind.reason());
+
+        let mut report = DriverCoreError::Internal
+            .to_report()
+            .push_ctx("scope", "driver-core/op")
+            .with_ctx("completion_token", attach.token.raw())
+            .with_ctx("completion_anomaly", format!("{:?}", kind.reason()))
+            .attach_note("operation completion became unavailable");
+
+        if let Some(index) = kind.index() {
+            report = report.with_ctx("slot_index", index);
         }
-        Ok(PollRecordResult::Pending) => Poll::Pending,
-        Err(report) => Poll::Ready(
-            OpResult::<T::Output, Spec::Error, T::Completion>::ResourceLost(OpError::new(
-                LostReason::Other,
-                report,
+        if let Some(expected_generation) = kind.expected_generation() {
+            report = report.with_ctx("expected_generation", expected_generation);
+        }
+        if let Some(actual_generation) = kind.actual_generation() {
+            report = report.with_ctx("actual_generation", actual_generation);
+        }
+        if let Some(state) = kind.state() {
+            report = report.with_ctx("slot_state", format!("{state:?}"));
+        }
+        if let Some(backend) = kind.backend().or_else(|| attach.raw.map(|raw| raw.backend)) {
+            report = report.with_ctx("completion_backend", format!("{backend:?}"));
+        }
+        if let Some(backend_context) = kind.backend_context_value() {
+            report = report.with_ctx("completion_backend_context", backend_context);
+        }
+        if let Some(raw) = attach.raw {
+            report = report
+                .with_ctx("raw_result", raw.res)
+                .with_ctx("completion_flags", raw.flags);
+        }
+
+        Self::new(reason, E::from_core_report(report))
+    }
+}
+
+impl<T, E, R> OpResult<T, E, R>
+where
+    E: DriverError,
+{
+    #[inline]
+    pub(crate) fn from_completion_record<Op, O, Spec>(record: CompletionRecord<Spec>) -> Poll<Self>
+    where
+        Spec: SlotSpec<Error = E>,
+        O: PlatformOp,
+        Op: IntoPlatformOp<
+                O,
+                Output = T,
+                Completion = R,
+                DriverCompletion = Spec::Completion,
+                ErasedPayload = Spec::UserPayload,
+                Error = E,
+            >,
+        Spec::Completion: CompletionValue,
+    {
+        let CompletionRecord {
+            event,
+            payload: payload_erased,
+            detail,
+            mut cleanup,
+        } = record;
+        let payload = match Op::try_payload_from_erased(payload_erased) {
+            Ok(payload) => payload,
+            Err(report) => {
+                let _ = cleanup.run();
+                return Poll::Ready(Self::ResourceLost(OpError::payload_projection(report)));
+            }
+        };
+        cleanup.disarm();
+        let res =
+            detail.unwrap_or_else(|| Spec::Completion::from_event_res::<Spec::Error>(event.res()));
+        let completion = Op::complete(payload, res);
+        Poll::Ready(Self::Completed(completion.result, completion.output))
+    }
+
+    #[inline]
+    pub(crate) fn poll_table_once<Op, O, Spec>(
+        table: &dyn CompletionAccess<Spec>,
+        token: OpToken,
+    ) -> Poll<Self>
+    where
+        Spec: SlotSpec<Error = E>,
+        O: PlatformOp,
+        Op: IntoPlatformOp<
+                O,
+                Output = T,
+                Completion = R,
+                DriverCompletion = Spec::Completion,
+                ErasedPayload = Spec::UserPayload,
+                Error = E,
+            >,
+        Spec::Completion: CompletionValue,
+    {
+        match table.try_take_record(token) {
+            Ok(PollRecordResult::Ready(record)) => {
+                Self::from_completion_record::<Op, O, Spec>(record)
+            }
+            Ok(PollRecordResult::Unavailable { kind, attach }) => Poll::Ready(Self::ResourceLost(
+                OpError::from_completion_anomaly(kind, attach),
             )),
-        ),
+            Ok(PollRecordResult::Pending) => Poll::Pending,
+            Err(report) => Poll::Ready(Self::ResourceLost(OpError::new(LostReason::Other, report))),
+        }
     }
 }
 
@@ -365,13 +363,13 @@ where
             .token
             .expect("DetachedOp missing completion token but no immediate_failure");
         if let Poll::Ready(result) =
-            poll_completion_table_once::<T, Spec::Op, Spec>(&**table, token)
+            Self::Output::poll_table_once::<T, Spec::Op, Spec>(&**table, token)
         {
             return Poll::Ready(result);
         }
 
         table.register_waker(token, cx.waker());
-        poll_completion_table_once::<T, Spec::Op, Spec>(&**table, token)
+        Self::Output::poll_table_once::<T, Spec::Op, Spec>(&**table, token)
     }
 }
 
@@ -499,14 +497,14 @@ where
                             SubmitStatus::Void => {
                                 let Some(payload_erased) = fallback_payload else {
                                     return Poll::Ready(OpResult::ResourceLost(
-                                        payload_missing_error(),
+                                        OpError::payload_missing(),
                                     ));
                                 };
                                 let payload = match T::try_payload_from_erased(payload_erased) {
                                     Ok(payload) => payload,
                                     Err(report) => {
                                         return Poll::Ready(OpResult::ResourceLost(
-                                            payload_projection_error(report),
+                                            OpError::payload_projection(report),
                                         ));
                                     }
                                 };
@@ -545,7 +543,7 @@ where
                 let mut is_ready = false;
                 let mut ready_val = None;
 
-                match poll_completion_table_once::<T, P::Op, P::SlotSpec>(
+                match Self::Output::poll_table_once::<T, P::Op, P::SlotSpec>(
                     &*driver.completion_table(),
                     token,
                 ) {
@@ -555,7 +553,7 @@ where
                     }
                     Poll::Pending => {
                         driver.register_completion_waker(token, cx.waker());
-                        match poll_completion_table_once::<T, P::Op, P::SlotSpec>(
+                        match Self::Output::poll_table_once::<T, P::Op, P::SlotSpec>(
                             &*driver.completion_table(),
                             token,
                         ) {

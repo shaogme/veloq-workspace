@@ -167,9 +167,7 @@ impl<T> Op<T> {
                                         cancel_waker: None,
                                         token: None,
                                         immediate_failure: None,
-                                        immediate_resource_lost: Some(
-                                            future::payload_missing_error(),
-                                        ),
+                                        immediate_resource_lost: Some(OpError::payload_missing()),
                                         _phantom: PhantomData,
                                     };
                                 };
@@ -187,7 +185,7 @@ impl<T> Op<T> {
                                             token: None,
                                             immediate_failure: None,
                                             immediate_resource_lost: Some(
-                                                future::payload_projection_error(report),
+                                                OpError::payload_projection(report),
                                             ),
                                             _phantom: PhantomData,
                                         };
