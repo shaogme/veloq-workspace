@@ -108,7 +108,7 @@ impl<'a> UringDriver<'a> {
         let (user_data, generation) = request.user_parts();
         let token = request.target;
 
-        match self.ops.checked_slot_view(token) {
+        match self.ops.checked_slot_view(token)? {
             CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
                 let prepared = if slot.has_op() {
                     match slot.start_submission_with(None) {
@@ -171,8 +171,7 @@ impl<'a> UringDriver<'a> {
             }
             view @ (CheckedSlotView::Missing { .. }
             | CheckedSlotView::Empty(_)
-            | CheckedSlotView::Stale(_)
-            | CheckedSlotView::Corrupt(_)) => {
+            | CheckedSlotView::Stale(_)) => {
                 let (reason, kind) = cancel_target_kind(token, view);
                 self.record_cancel_target_gone(reason);
                 let attach = AnomalyAttach::from_op_token(token);
@@ -189,26 +188,23 @@ impl<'a> UringDriver<'a> {
         }
     }
 
-    pub(crate) fn flush_cancellations(&mut self) {
+    pub(crate) fn flush_cancellations(&mut self) -> UringResult<()> {
         let mut submitted_count = 0;
         let limit = self.pending_cancellations.len();
 
         while submitted_count < limit {
             if let Some(request) = self.pending_cancellations.front().copied() {
-                match self.ops.checked_slot_view(request.target) {
+                let view = self.ops.checked_slot_view(request.target)?;
+                match view {
                     CheckedSlotView::Valid(_) => {}
                     CheckedSlotView::Missing { .. }
                     | CheckedSlotView::Empty(_)
-                    | CheckedSlotView::Stale(_)
-                    | CheckedSlotView::Corrupt(_) => {
+                    | CheckedSlotView::Stale(_) => {
                         self.pending_cancellations.pop_front();
-                        let (reason, kind) = cancel_target_kind(
-                            request.target,
-                            self.ops.checked_slot_view(request.target),
-                        );
+                        let (reason, kind) = cancel_target_kind(request.target, view);
                         self.record_cancel_target_gone(reason);
                         let attach = AnomalyAttach::from_op_token(request.target);
-                        let _ = self.accept_completion_anomaly_kind(kind, attach);
+                        let _ = self.accept_completion_anomaly_kind(kind, attach)?;
                         continue;
                     }
                 }
@@ -223,6 +219,7 @@ impl<'a> UringDriver<'a> {
                 break;
             }
         }
+        Ok(())
     }
 
     pub(crate) fn flush_backlog(&mut self) -> UringResult<()> {
@@ -235,7 +232,7 @@ impl<'a> UringDriver<'a> {
         }
 
         while let Some(&token) = self.backlog.front() {
-            let action = match self.ops.checked_slot_view(token) {
+            let action = match self.ops.checked_slot_view(token)? {
                 CheckedSlotView::Valid(slot) => match slot {
                     SlotView::InFlightOrphaned(slot) => {
                         if slot.platform().submission_state == UringSubmissionState::Queued {
@@ -285,7 +282,7 @@ impl<'a> UringDriver<'a> {
                 },
                 BacklogAction::SubmitQueued => {
                     let driver_ptr = self as *mut UringDriver;
-                    let result = match self.ops.checked_slot_view(token) {
+                    let result = match self.ops.checked_slot_view(token)? {
                         CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) => unsafe {
                             Self::submit_queued_from_slot_raw(driver_ptr, token, slot)
                         },

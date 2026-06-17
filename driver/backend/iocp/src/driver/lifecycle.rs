@@ -168,7 +168,7 @@ impl<'a> IocpDriver<'a> {
         let mut in_flight = Vec::new();
         let mut pending = ShutdownPending::default();
         for token in self.ops.active_tokens().collect::<Vec<_>>() {
-            let kind = match self.ops.checked_slot_view(token) {
+            let kind = match self.ops.checked_slot_view(token)? {
                 CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
                     if slot.platform().timer_id.is_some() {
                         Some(ShutdownOpKind::Immediate)
@@ -242,10 +242,10 @@ impl<'a> IocpDriver<'a> {
         let mut rio_slots = Vec::new();
         for token in self.ops.active_tokens().collect::<Vec<_>>() {
             let is_rio = match self.ops.checked_slot_view(token) {
-                CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => slot
+                Ok(CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot))) => slot
                     .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
                     .unwrap_or(false),
-                CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot)) => slot
+                Ok(CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot))) => slot
                     .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
                     .unwrap_or(false),
                 _ => false,
@@ -258,11 +258,11 @@ impl<'a> IocpDriver<'a> {
         let mut payloads = Vec::new();
         for token in rio_slots {
             match self.ops.checked_slot_view(token) {
-                CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
+                Ok(CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot))) => {
                     slot.platform_mut().rio_cancel_requested = true;
                     let _ = slot.with_op_mut(|iocp_op| iocp_op.unbind_user_payload());
                 }
-                CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot)) => {
+                Ok(CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot))) => {
                     slot.platform_mut().rio_cancel_requested = true;
                     let _ = slot.with_op_mut(|iocp_op| iocp_op.unbind_user_payload());
                 }

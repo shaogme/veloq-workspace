@@ -96,7 +96,7 @@ fn active_registry() -> (
             *payload = Some(());
         })
         .expect("slot storage should exist");
-    let slot = match registry.checked_slot_view(token) {
+    let slot = match registry.checked_slot_view(token).unwrap() {
         CheckedSlotView::Valid(SlotView::Reserved(slot)) => slot
             .init_op_with(DummyPlatformOp, |_| {})
             .expect("reserved slot should accept op"),

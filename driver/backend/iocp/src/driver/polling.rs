@@ -278,7 +278,7 @@ impl<'a> IocpDriver<'a> {
                 raw.flags,
             );
             let kind =
-                completion_key_mismatch_kind(entry.token, self.ops.checked_slot_view(entry.token));
+                completion_key_mismatch_kind(entry.token, self.ops.checked_slot_view(entry.token)?);
             let attach = AnomalyAttach::from_raw_completion(mismatch_raw);
             let _ = self.accept_completion_anomaly(kind, attach)?;
         }
@@ -374,7 +374,6 @@ fn completion_key_mismatch_kind(
             snapshot.generation,
             snapshot.state,
         ),
-        CheckedSlotView::Corrupt(snapshot) => CompletionAnomalyKind::corrupt_snapshot(snapshot),
     }
 }
 

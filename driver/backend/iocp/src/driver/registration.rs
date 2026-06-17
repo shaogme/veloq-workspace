@@ -321,44 +321,6 @@ impl<'a> IocpDriver<'a> {
         }
     }
 
-    pub(super) fn release_socket_inflight_for_op(&mut self, user_data: usize) -> IocpResult<()> {
-        let Some(token) = self
-            .ops
-            .active_tokens()
-            .find(|token| token.index() == user_data)
-        else {
-            return Ok(());
-        };
-        let socket_inflight =
-            self.ops
-                .active_slot_bundle_mut(token)
-                .and_then(|(_, _, op_opt, _)| {
-                    let op = op_opt.as_mut()?;
-                    let was_in_flight = op.header.in_flight;
-                    if was_in_flight {
-                        op.header.in_flight = false;
-                    }
-                    let socket_inflight = op.header.socket_inflight.take();
-                    debug_assert!(
-                        socket_inflight.is_some()
-                            || !was_in_flight
-                            || op.header.resolved_handle.is_none_or(|h| !h.is_socket())
-                            || Self::is_rio_op(op),
-                        "kernel-pending socket op completed without socket inflight token"
-                    );
-                    socket_inflight
-                });
-
-        if let Some(token) = socket_inflight {
-            self.rio
-                .state_mut()
-                .release_socket_inflight_token(token)
-                .trans()?;
-            self.drain_deferred_socket_cleanup();
-        }
-        Ok(())
-    }
-
     pub(super) fn drain_deferred_socket_cleanup(&mut self) {
         let mut rounds = self.handles.deferred_cleanup_len();
         while rounds > 0 {

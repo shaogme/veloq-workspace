@@ -23,10 +23,7 @@ use veloq_driver_core::{
         CompletionSource, CompletionToken, DriverCompletionDiagnostics, OpToken, PlatformOp,
         RawCompletion, SyntheticCompletionSource, UserCompletionEvent, drain_cancel_requests,
     },
-    slot::{
-        CheckedSlotView, Completed, InFlightOrphaned, InFlightWaiting, SlotRegistryExt,
-        SlotSnapshot, SlotView,
-    },
+    slot::{CheckedSlotView, InFlightOrphaned, InFlightWaiting, SlotRegistryExt, SlotView},
 };
 
 pub(crate) type CompletionProgress = CompletionFlowOutcome;
@@ -236,7 +233,7 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
         slot: Slot<'_, InFlightWaiting>,
         source: CompletionSource<'_, Self::BackendIngress>,
     ) -> UringResult<CompletionHookOutcome<UringSlotSpec, Self::BackendEffect>> {
-        Ok(match source {
+        match source {
             CompletionSource::Synthetic(SyntheticCompletionSource::Timer) => {
                 complete_timer_waiting_slot(slot, event)
             }
@@ -253,7 +250,7 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
             CompletionSource::Kernel | CompletionSource::User | CompletionSource::Backend(_) => {
                 complete_kernel_waiting_slot(slot, event.token(), event.raw())
             }
-        })
+        }
     }
 
     fn complete_orphaned(
@@ -307,7 +304,7 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
 impl<'a> UringDriver<'a> {
     pub(crate) fn wait_internal(&mut self) -> UringResult<()> {
         let _ = drain_cancel_requests(self)?;
-        self.flush_cancellations();
+        self.flush_cancellations()?;
         self.flush_backlog()?;
 
         if !self.has_active_ops_internal() {
@@ -345,7 +342,7 @@ impl<'a> UringDriver<'a> {
 
         let progress = self.process_completions_internal()?;
         let _ = progress.semantic_count();
-        self.flush_cancellations();
+        self.flush_cancellations()?;
         self.flush_backlog()?;
         Ok(())
     }
@@ -367,7 +364,7 @@ impl<'a> UringDriver<'a> {
 
     pub(crate) fn poll_nonblocking_internal(&mut self) -> UringResult<()> {
         let _ = drain_cancel_requests(self)?;
-        self.flush_cancellations();
+        self.flush_cancellations()?;
         self.flush_backlog()?;
         self.submit_to_kernel()?;
         let progress = self.process_completions_internal()?;
@@ -378,7 +375,7 @@ impl<'a> UringDriver<'a> {
         self.advance_timers(elapsed)?;
         self.last_timer_poll = now;
 
-        self.flush_cancellations();
+        self.flush_cancellations()?;
         self.flush_backlog()?;
         Ok(())
     }
@@ -498,7 +495,7 @@ impl<'a> UringDriver<'a> {
         request: PendingCancel,
         raw: RawCompletion,
     ) -> UringResult<()> {
-        let active_target = match self.ops.checked_slot_view(request.target) {
+        let active_target = match self.ops.checked_slot_view(request.target)? {
             CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) => Some((
                 slot.snapshot(),
                 "async cancel returned ENOENT while target is still waiting",
@@ -547,14 +544,19 @@ fn complete_kernel_waiting_slot(
     mut slot: Slot<'_, InFlightWaiting>,
     token: OpToken,
     raw: RawCompletion,
-) -> CompletionHookOutcome<UringSlotSpec, UringBackendEffect> {
+) -> UringResult<CompletionHookOutcome<UringSlotSpec, UringBackendEffect>> {
     let (final_res, cleanup) = match slot.with_op_and_payload_mut(|op, payload| {
         let final_res = unsafe { (op.vtable.on_complete)(op, payload, raw.res) };
         let cleanup = op.completion_cleanup(raw.res);
         (final_res, cleanup)
     }) {
         Ok(result) => result,
-        Err(_) => return lost_waiting_slot_completion(slot, raw),
+        Err(err) => {
+            return Err(UringError::InvalidState.report(
+                "uring.complete_kernel_waiting_slot",
+                format!("slot corruption detected on completion: {:?}", err),
+            ));
+        }
     };
 
     let mut completed = slot.complete();
@@ -563,7 +565,10 @@ fn complete_kernel_waiting_slot(
     let (payload, mut detail) = completed.take_completion_data();
     let Some(payload) = payload else {
         drop(detail);
-        return lost_completed_slot_completion(completed, raw, cleanup);
+        return Err(UringError::InvalidState.report(
+            "uring.complete_kernel_waiting_slot",
+            "slot payload missing on completion",
+        ));
     };
 
     let effect = if final_res.is_ok() {
@@ -582,48 +587,45 @@ fn complete_kernel_waiting_slot(
     }
     let _ = completed.take_op();
 
-    CompletionHookOutcome::User {
+    Ok(CompletionHookOutcome::User {
         event: UserCompletionEvent::from_parts(COMP_BACKEND_URING, token, res_code, raw.flags),
         payload,
         detail,
         cleanup,
         effect,
-    }
+    })
 }
 
 fn complete_timer_waiting_slot(
     mut slot: Slot<'_, InFlightWaiting>,
     event: UserCompletionEvent,
-) -> CompletionHookOutcome<UringSlotSpec, UringBackendEffect> {
+) -> UringResult<CompletionHookOutcome<UringSlotSpec, UringBackendEffect>> {
     slot.platform_mut().timer_id = None;
-    let snapshot = slot.snapshot();
     let mut completed = slot.complete();
     let _ = completed.take_op();
     let (payload, detail) = completed.take_completion_data();
     let Some(payload) = payload else {
         drop(detail);
-        return CompletionHookOutcome::Lost {
-            event,
-            loss_kind: CompletionAnomalyKind::corrupt_snapshot(snapshot),
-            cleanup: CompletionCleanupGuard::default(),
-            effect: UringBackendEffect::None,
-        };
+        return Err(UringError::InvalidState.report(
+            "uring.complete_timer_waiting_slot",
+            "slot payload missing on timer completion",
+        ));
     };
 
-    CompletionHookOutcome::User {
+    Ok(CompletionHookOutcome::User {
         event,
         payload,
         detail,
         cleanup: CompletionCleanupGuard::default(),
         effect: UringBackendEffect::None,
-    }
+    })
 }
 
 fn complete_cancel_waiting_slot(
     slot: Slot<'_, InFlightWaiting>,
     event: UserCompletionEvent,
     mode: CancelMode,
-) -> CompletionHookOutcome<UringSlotSpec, UringBackendEffect> {
+) -> UringResult<CompletionHookOutcome<UringSlotSpec, UringBackendEffect>> {
     complete_local_cancel_slot(slot, event, mode, false)
 }
 
@@ -631,9 +633,8 @@ fn complete_submission_failure_slot(
     slot: Slot<'_, InFlightWaiting>,
     event: UserCompletionEvent,
     report: Option<Report<UringError>>,
-) -> CompletionHookOutcome<UringSlotSpec, UringBackendEffect> {
+) -> UringResult<CompletionHookOutcome<UringSlotSpec, UringBackendEffect>> {
     let event_res = event.res();
-    let snapshot = slot.snapshot();
     let mut completed = slot.complete();
     let cleanup = completed
         .with_op_mut(|op| op.completion_cleanup(event_res))
@@ -642,21 +643,19 @@ fn complete_submission_failure_slot(
     let (payload, detail) = completed.take_completion_data();
     let Some(payload) = payload else {
         drop(detail);
-        return CompletionHookOutcome::Lost {
-            event,
-            loss_kind: CompletionAnomalyKind::corrupt_snapshot(snapshot),
-            cleanup,
-            effect: UringBackendEffect::None,
-        };
+        return Err(UringError::InvalidState.report(
+            "uring.complete_submission_failure_slot",
+            "slot payload missing on submission failure",
+        ));
     };
 
-    CompletionHookOutcome::User {
+    Ok(CompletionHookOutcome::User {
         event,
         payload,
         detail: detail.or(report.map(Err)),
         cleanup,
         effect: UringBackendEffect::None,
-    }
+    })
 }
 
 fn complete_local_cancel_slot(
@@ -664,8 +663,7 @@ fn complete_local_cancel_slot(
     event: UserCompletionEvent,
     mode: CancelMode,
     orphaned: bool,
-) -> CompletionHookOutcome<UringSlotSpec, UringBackendEffect> {
-    let snapshot = slot.snapshot();
+) -> UringResult<CompletionHookOutcome<UringSlotSpec, UringBackendEffect>> {
     let mut completed = slot.complete();
     let cleanup = completed
         .with_op_mut(|op| {
@@ -680,103 +678,28 @@ fn complete_local_cancel_slot(
     let _ = completed.take_op();
 
     match (mode, payload) {
-        (CancelMode::UserVisible, Some(payload)) => CompletionHookOutcome::User {
+        (CancelMode::UserVisible, Some(payload)) => Ok(CompletionHookOutcome::User {
             event,
             payload,
             detail,
             cleanup,
             effect: UringBackendEffect::None,
-        },
+        }),
         (CancelMode::UserVisible, None) => {
             drop(detail);
-            CompletionHookOutcome::Lost {
-                event,
-                loss_kind: CompletionAnomalyKind::corrupt_snapshot(snapshot),
-                cleanup,
-                effect: UringBackendEffect::None,
-            }
+            Err(UringError::InvalidState.report(
+                "uring.complete_local_cancel_slot",
+                "slot payload missing on cancel",
+            ))
         }
         (CancelMode::Abandon, payload) => {
             drop(payload);
             drop(detail);
-            CompletionHookOutcome::Cleanup {
+            Ok(CompletionHookOutcome::Cleanup {
                 cleanup,
                 effect: UringBackendEffect::None,
-            }
+            })
         }
-    }
-}
-
-fn lost_waiting_slot_completion(
-    slot: impl LostWaitingSlot,
-    raw: RawCompletion,
-) -> CompletionHookOutcome<UringSlotSpec, UringBackendEffect> {
-    let (snapshot, cleanup) = slot.finish_lost(raw.res);
-    let Some(token) = lost_completion_event_token(snapshot, raw) else {
-        drop(cleanup);
-        return CompletionHookOutcome::Anomaly {
-            kind: CompletionAnomalyKind::corrupt_snapshot(snapshot),
-            attach: AnomalyAttach::from_raw_completion(raw),
-            effect: UringBackendEffect::None,
-        };
-    };
-    let event = UserCompletionEvent::from_parts(COMP_BACKEND_URING, token, raw.res, raw.flags);
-    CompletionHookOutcome::Lost {
-        event,
-        loss_kind: CompletionAnomalyKind::corrupt_snapshot(snapshot),
-        cleanup,
-        effect: UringBackendEffect::None,
-    }
-}
-
-fn lost_completed_slot_completion(
-    mut slot: Slot<'_, Completed>,
-    raw: RawCompletion,
-    cleanup: CompletionCleanupGuard,
-) -> CompletionHookOutcome<UringSlotSpec, UringBackendEffect> {
-    let snapshot = slot.snapshot();
-    let Some(token) = lost_completion_event_token(snapshot, raw) else {
-        drop(cleanup);
-        return CompletionHookOutcome::Anomaly {
-            kind: CompletionAnomalyKind::corrupt_snapshot(snapshot),
-            attach: AnomalyAttach::from_raw_completion(raw),
-            effect: UringBackendEffect::None,
-        };
-    };
-    let event = UserCompletionEvent::from_parts(COMP_BACKEND_URING, token, raw.res, raw.flags);
-    let (payload, detail) = slot.take_completion_data();
-    let _ = slot.take_op();
-    drop(payload);
-    drop(detail);
-    CompletionHookOutcome::Lost {
-        event,
-        loss_kind: CompletionAnomalyKind::corrupt_snapshot(snapshot),
-        cleanup,
-        effect: UringBackendEffect::None,
-    }
-}
-
-#[inline]
-fn lost_completion_event_token(snapshot: SlotSnapshot, raw: RawCompletion) -> Option<OpToken> {
-    snapshot.try_token().ok().or_else(|| raw.token.op_token())
-}
-
-trait LostWaitingSlot {
-    fn finish_lost(self, res: i32) -> (SlotSnapshot, CompletionCleanupGuard);
-}
-
-impl<'a> LostWaitingSlot for Slot<'a, InFlightWaiting> {
-    fn finish_lost(mut self, res: i32) -> (SlotSnapshot, CompletionCleanupGuard) {
-        let snapshot = self.snapshot();
-        let cleanup = self
-            .with_op_mut(|op| op.completion_cleanup(res))
-            .unwrap_or_default();
-        let mut completed = self.complete();
-        let (payload, detail) = completed.take_completion_data();
-        let _ = completed.take_op();
-        drop(payload);
-        drop(detail);
-        (snapshot, cleanup)
     }
 }
 

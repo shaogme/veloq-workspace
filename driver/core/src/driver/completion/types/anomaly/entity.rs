@@ -6,9 +6,7 @@ use super::{CompletionAnomaly, CompletionAnomalyReason, CompletionBackend, Compl
 impl CompletionAnomaly {
     pub fn reason(self) -> CompletionAnomalyReason {
         match self {
-            Self::TokenOnly { reason, .. }
-            | Self::SlotState { reason, .. }
-            | Self::SlotCorruption { reason, .. } => reason,
+            Self::TokenOnly { reason, .. } | Self::SlotState { reason, .. } => reason,
             Self::UnknownSlot { .. } => CompletionAnomalyReason::UnknownSlot,
             Self::StaleGeneration { .. } => CompletionAnomalyReason::StaleGeneration,
             Self::BackendContext { .. } => CompletionAnomalyReason::BackendContextUnknown,
@@ -22,7 +20,6 @@ impl CompletionAnomaly {
             | Self::UnknownSlot { token, .. }
             | Self::StaleGeneration { token, .. }
             | Self::SlotState { token, .. }
-            | Self::SlotCorruption { token, .. }
             | Self::BackendContext { token, .. }
             | Self::BackendSpecific { token, .. } => token,
         }
@@ -33,7 +30,6 @@ impl CompletionAnomaly {
             Self::UnknownSlot { index, .. }
             | Self::StaleGeneration { index, .. }
             | Self::SlotState { index, .. } => Some(index),
-            Self::SlotCorruption { snapshot, .. } => Some(snapshot.index),
             Self::BackendSpecific { index, .. } => index,
             Self::TokenOnly { .. } | Self::BackendContext { .. } => None,
         }
@@ -50,7 +46,6 @@ impl CompletionAnomaly {
                 ..
             } => Some(expected_generation),
             Self::SlotState { generation, .. } => Some(generation),
-            Self::SlotCorruption { snapshot, .. } => Some(snapshot.generation),
             Self::BackendSpecific {
                 expected_generation,
                 ..
@@ -65,7 +60,6 @@ impl CompletionAnomaly {
                 actual_generation, ..
             } => Some(actual_generation),
             Self::SlotState { generation, .. } => Some(generation),
-            Self::SlotCorruption { snapshot, .. } => Some(snapshot.generation),
             Self::BackendSpecific {
                 actual_generation, ..
             } => actual_generation,
@@ -76,7 +70,6 @@ impl CompletionAnomaly {
     pub fn state(self) -> Option<slot::SlotState> {
         match self {
             Self::StaleGeneration { state, .. } | Self::SlotState { state, .. } => Some(state),
-            Self::SlotCorruption { snapshot, .. } => Some(snapshot.state),
             Self::UnknownSlot { .. }
             | Self::TokenOnly { .. }
             | Self::BackendContext { .. }
@@ -86,12 +79,10 @@ impl CompletionAnomaly {
 
     pub fn slot_snapshot(self) -> Option<slot::SlotSnapshot> {
         match self {
-            Self::SlotCorruption { snapshot, .. } => Some(snapshot),
             Self::SlotState {
                 snapshot: Some(snapshot),
                 ..
             } => Some(snapshot),
-            Self::SlotState { .. } => None,
             _ => None,
         }
     }
@@ -104,13 +95,11 @@ impl CompletionAnomaly {
             Self::TokenOnly { raw: Some(raw), .. }
             | Self::UnknownSlot { raw: Some(raw), .. }
             | Self::StaleGeneration { raw: Some(raw), .. }
-            | Self::SlotState { raw: Some(raw), .. }
-            | Self::SlotCorruption { raw: Some(raw), .. } => Some(raw.backend),
+            | Self::SlotState { raw: Some(raw), .. } => Some(raw.backend),
             Self::TokenOnly { raw: None, .. }
             | Self::UnknownSlot { raw: None, .. }
             | Self::StaleGeneration { raw: None, .. }
-            | Self::SlotState { raw: None, .. }
-            | Self::SlotCorruption { raw: None, .. } => None,
+            | Self::SlotState { raw: None, .. } => None,
         }
     }
 
@@ -140,7 +129,6 @@ impl CompletionAnomaly {
             | Self::UnknownSlot { raw, .. }
             | Self::StaleGeneration { raw, .. }
             | Self::SlotState { raw, .. }
-            | Self::SlotCorruption { raw, .. }
             | Self::BackendSpecific { raw, .. } => raw,
             Self::BackendContext { raw, .. } => Some(raw),
         }
@@ -198,99 +186,6 @@ impl CompletionAnomaly {
     ) -> Self {
         Self::slot_state(
             CompletionAnomalyReason::NonActiveSlot,
-            token,
-            index,
-            generation,
-            state,
-        )
-    }
-
-    pub fn corrupt(
-        token: CompletionToken,
-        index: usize,
-        generation: u32,
-        state: slot::SlotState,
-    ) -> Self {
-        Self::slot_state(
-            CompletionAnomalyReason::SlotCorruption,
-            token,
-            index,
-            generation,
-            state,
-        )
-    }
-
-    pub fn op_missing(token: CompletionToken, index: usize, generation: u32) -> Self {
-        Self::slot_corruption_from_parts(
-            CompletionAnomalyReason::OpMissing,
-            token,
-            index,
-            generation,
-            slot::SlotState::Idle,
-            false,
-            false,
-        )
-    }
-
-    pub fn payload_missing(token: CompletionToken, index: usize, generation: u32) -> Self {
-        Self::slot_corruption_from_parts(
-            CompletionAnomalyReason::PayloadMissing,
-            token,
-            index,
-            generation,
-            slot::SlotState::Idle,
-            true,
-            false,
-        )
-    }
-
-    fn slot_corruption_from_parts(
-        reason: CompletionAnomalyReason,
-        token: CompletionToken,
-        index: usize,
-        generation: u32,
-        state: slot::SlotState,
-        has_op: bool,
-        has_payload: bool,
-    ) -> Self {
-        Self::SlotCorruption {
-            reason,
-            token,
-            snapshot: slot::SlotSnapshot {
-                index,
-                generation,
-                state,
-                has_op,
-                has_payload,
-            },
-            raw: None,
-        }
-    }
-
-    pub fn corrupt_slot_snapshot(token: CompletionToken, snapshot: slot::SlotSnapshot) -> Self {
-        let reason = if !snapshot.has_op {
-            CompletionAnomalyReason::OpMissing
-        } else if !snapshot.has_payload {
-            CompletionAnomalyReason::PayloadMissing
-        } else {
-            CompletionAnomalyReason::SlotCorruption
-        };
-        Self::SlotCorruption {
-            reason,
-            token,
-            snapshot,
-            raw: None,
-        }
-    }
-
-    pub fn backend_invariant_broken(
-        token: CompletionToken,
-        index: usize,
-        generation: u32,
-        state: slot::SlotState,
-    ) -> Self {
-        Self::slot_state(
-            CompletionAnomalyReason::BackendInvariantBroken,
             token,
             index,
             generation,
@@ -430,7 +325,6 @@ impl CompletionAnomaly {
             | Self::UnknownSlot { raw: slot, .. }
             | Self::StaleGeneration { raw: slot, .. }
             | Self::SlotState { raw: slot, .. }
-            | Self::SlotCorruption { raw: slot, .. }
             | Self::BackendSpecific { raw: slot, .. } => *slot = Some(raw),
             Self::BackendContext { raw: slot, .. } => *slot = raw,
         }
@@ -561,7 +455,6 @@ impl CompletionAnomaly {
             | Self::UnknownSlot { token: slot, .. }
             | Self::StaleGeneration { token: slot, .. }
             | Self::SlotState { token: slot, .. }
-            | Self::SlotCorruption { token: slot, .. }
             | Self::BackendContext { token: slot, .. }
             | Self::BackendSpecific { token: slot, .. } => *slot = token,
         }
@@ -597,14 +490,6 @@ impl CompletionAnomaly {
                 generation: snapshot.generation,
                 state: snapshot.state,
                 snapshot: Some(snapshot),
-                raw,
-            },
-            Self::SlotCorruption {
-                reason, token, raw, ..
-            } => Self::SlotCorruption {
-                reason,
-                token,
-                snapshot,
                 raw,
             },
             other => other,

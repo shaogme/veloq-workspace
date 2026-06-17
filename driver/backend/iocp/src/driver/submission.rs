@@ -9,10 +9,9 @@ use diagweave::prelude::*;
 use veloq_blocking::{BlockingTask, get_blocking_pool};
 use veloq_driver_core::{
     driver::{
-        CompletionAnomalyKind, CompletionBackendHooks, CompletionControl, CompletionFlowExt,
-        CompletionHookOutcome, CompletionIngress, CompletionSource, CompletionToken,
-        DriverSubmitResult, OpToken, SharedCompletionTable, SubmitStatus,
-        SyntheticCompletionSource, UserCompletionEvent,
+        CompletionBackendHooks, CompletionControl, CompletionFlowExt, CompletionHookOutcome,
+        CompletionIngress, CompletionSource, CompletionToken, DriverSubmitResult, OpToken,
+        SharedCompletionTable, SubmitStatus, SyntheticCompletionSource, UserCompletionEvent,
     },
     slot::{
         CheckedSlotView, InFlightOrphaned, InFlightWaiting, Reserved, SlotAccessError,
@@ -87,7 +86,6 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
         _source: CompletionSource<'_, Self::BackendIngress>,
     ) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         let event_res = event.res();
-        let snapshot = slot.snapshot();
         let mut guard = slot.complete();
         let cleanup = guard
             .with_op_mut(|op| {
@@ -102,23 +100,22 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
             .unwrap_or_default();
         let _ = guard.take_op();
         let (payload, detail) = guard.take_completion_data();
-        Ok(if let Some(payload) = payload {
-            CompletionHookOutcome::User {
+        if let Some(payload) = payload {
+            Ok(CompletionHookOutcome::User {
                 event,
                 payload,
                 detail,
                 cleanup,
                 effect: (),
-            }
+            })
         } else {
             drop(detail);
-            CompletionHookOutcome::Lost {
-                event,
-                loss_kind: CompletionAnomalyKind::corrupt_snapshot(snapshot),
-                cleanup,
-                effect: (),
-            }
-        })
+            IocpError::InvalidState
+                .push_ctx("scope", "iocp.driver.SubmissionFailureHooks")
+                .with_ctx("user_data", event.token().index())
+                .with_ctx("generation", event.token().generation())
+                .attach_note("payload missing in active slot during submission failure completion")
+        }
     }
 
     fn complete_orphaned(
@@ -177,7 +174,7 @@ impl<'a> IocpDriver<'a> {
     ) -> IocpResult<Slot<'_, Reserved>> {
         let user_data = token.index();
         let generation = token.generation();
-        let mut guard = match ops.checked_slot_view(token) {
+        let mut guard = match ops.checked_slot_view(token)? {
             CheckedSlotView::Valid(SlotView::Reserved(slot)) => slot,
             _ => {
                 return IocpError::InvalidState
@@ -255,7 +252,7 @@ impl<'a> IocpDriver<'a> {
                 Self::handle_timer_sub(ops, ctx, token, duration)
             }
             Err(e) => {
-                if let CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) =
+                if let Ok(CheckedSlotView::Valid(SlotView::InFlightWaiting(slot))) =
                     ops.checked_slot_view(token)
                 {
                     let mut guard = slot.complete();
@@ -277,7 +274,7 @@ impl<'a> IocpDriver<'a> {
     ) -> DriverSubmitResult<IocpError> {
         let completion_token = CompletionToken::user(token);
         if let Err(err) = ctx.port.notify(completion_token) {
-            if let CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) =
+            if let Ok(CheckedSlotView::Valid(SlotView::InFlightWaiting(slot))) =
                 ops.checked_slot_view(token)
             {
                 let mut guard = slot.complete();

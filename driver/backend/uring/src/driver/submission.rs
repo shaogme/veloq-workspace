@@ -191,7 +191,7 @@ impl<'a> UringDriver<'a> {
 
     pub(crate) fn submit_from_slot_token(&mut self, token: OpToken) -> UringResult<bool> {
         let driver_ptr = self as *mut UringDriver;
-        let slot = match self.ops.checked_slot_view(token) {
+        let slot = match self.ops.checked_slot_view(token)? {
             CheckedSlotView::Valid(SlotView::Reserved(slot)) => slot,
             _ => {
                 return Err(UringError::InvalidState
@@ -405,7 +405,7 @@ impl<'a> UringDriver<'a> {
         let user_data = token.index();
         let driver_ptr = self as *mut UringDriver;
         let slot = match self.ops.checked_slot_view(token) {
-            CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
+            Ok(CheckedSlotView::Valid(SlotView::Reserved(slot))) => {
                 if slot.has_op() {
                     let mut slot = slot;
                     match slot.op_mut() {
@@ -430,7 +430,7 @@ impl<'a> UringDriver<'a> {
                     }
                 }
             }
-            _ => {
+            Ok(_) => {
                 return DriverSubmitResult::failed(
                     UringError::InvalidState.report(
                         "uring.driver.submit_sqe_internal",
@@ -438,6 +438,9 @@ impl<'a> UringDriver<'a> {
                     ),
                     SubmitStatus::Void,
                 );
+            }
+            Err(report) => {
+                return DriverSubmitResult::failed(report, SubmitStatus::Void);
             }
         };
 
@@ -474,7 +477,7 @@ impl<'a> UringDriver<'a> {
         let user_data = token.index();
         let driver_ptr = self as *mut UringDriver;
         let slot = match self.ops.checked_slot_view(token) {
-            CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
+            Ok(CheckedSlotView::Valid(SlotView::Reserved(slot))) => {
                 if slot.has_op() {
                     let mut slot = slot;
                     match slot.op_mut() {
@@ -505,7 +508,7 @@ impl<'a> UringDriver<'a> {
                     }
                 }
             }
-            _ => {
+            Ok(_) => {
                 return DriverSubmitResult::failed(
                     UringError::InvalidState.report(
                         "uring.driver.submit_timer_internal",
@@ -513,6 +516,9 @@ impl<'a> UringDriver<'a> {
                     ),
                     SubmitStatus::Void,
                 );
+            }
+            Err(report) => {
+                return DriverSubmitResult::failed(report, SubmitStatus::Void);
             }
         };
 

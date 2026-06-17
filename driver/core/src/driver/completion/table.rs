@@ -424,7 +424,7 @@ where
                 PollRecordResult::Unavailable { kind, attach }
             }
             slot::CompletionData::Empty => {
-                let kind = CompletionAnomalyKind::corrupt_snapshot(slot::SlotSnapshot {
+                let kind = CompletionAnomalyKind::finalize_failed_snapshot(slot::SlotSnapshot {
                     index: idx,
                     generation,
                     state: slot::SlotState::Idle,

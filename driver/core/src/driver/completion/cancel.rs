@@ -78,16 +78,12 @@ pub fn cancel_target_kind<'a, Spec: slot::SlotSpec>(
                 SlotView::InFlightWaiting(slot) => slot.snapshot(),
                 SlotView::InFlightOrphaned(slot) => slot.snapshot(),
             };
-            CompletionAnomalyKind::backend_invariant_broken_snapshot(snapshot)
+            CompletionAnomalyKind::non_active(snapshot.index, token.generation(), snapshot.state)
         }
         Err(kind) => kind,
     };
     let reason = match kind.reason() {
         CompletionAnomalyReason::StaleGeneration => CancelTargetGoneReason::Stale,
-        CompletionAnomalyReason::OpMissing
-        | CompletionAnomalyReason::PayloadMissing
-        | CompletionAnomalyReason::SlotCorruption
-        | CompletionAnomalyReason::BackendInvariantBroken => CancelTargetGoneReason::Corrupt,
         CompletionAnomalyReason::UnknownSlot
         | CompletionAnomalyReason::NonActiveSlot
         | CompletionAnomalyReason::CompletionKeyMismatch

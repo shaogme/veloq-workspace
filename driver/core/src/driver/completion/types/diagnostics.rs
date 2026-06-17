@@ -15,8 +15,6 @@ struct DriverCompletionDiagnosticsInner<B = ()> {
     user_orphan_completed: AtomicU64,
     unknown_completion: AtomicU64,
     stale_completion: AtomicU64,
-    slot_corruption: AtomicU64,
-    payload_missing: AtomicU64,
     completion_rejected: AtomicU64,
     internal_unknown: AtomicU64,
     orphan_cleanup_error: AtomicU64,
@@ -59,8 +57,6 @@ pub struct DriverCompletionDiagnosticsSnapshot<B = ()> {
     pub user_orphan_completed: u64,
     pub unknown_completion: u64,
     pub stale_completion: u64,
-    pub slot_corruption: u64,
-    pub payload_missing: u64,
     pub completion_rejected: u64,
     pub internal_unknown: u64,
     pub orphan_cleanup_error: u64,
@@ -100,14 +96,6 @@ impl<B> DriverCompletionDiagnostics<B> {
         Self::inc(&self.inner.stale_completion);
     }
 
-    pub fn inc_slot_corruption(&self) {
-        Self::inc(&self.inner.slot_corruption);
-    }
-
-    pub fn inc_payload_missing(&self) {
-        Self::inc(&self.inner.payload_missing);
-    }
-
     pub fn inc_completion_rejected(&self) {
         Self::inc(&self.inner.completion_rejected);
     }
@@ -132,8 +120,6 @@ where
             user_orphan_completed: Self::load(&self.inner.user_orphan_completed),
             unknown_completion: Self::load(&self.inner.unknown_completion),
             stale_completion: Self::load(&self.inner.stale_completion),
-            slot_corruption: Self::load(&self.inner.slot_corruption),
-            payload_missing: Self::load(&self.inner.payload_missing),
             completion_rejected: Self::load(&self.inner.completion_rejected),
             internal_unknown: Self::load(&self.inner.internal_unknown),
             orphan_cleanup_error: Self::load(&self.inner.orphan_cleanup_error),
@@ -150,16 +136,11 @@ where
             CompletionAnomalyReason::UnknownSlot | CompletionAnomalyReason::NonActiveSlot => {
                 self.inc_unknown_completion()
             }
-            CompletionAnomalyReason::BackendInvariantBroken
-            | CompletionAnomalyReason::CompletionKeyMismatch
+            CompletionAnomalyReason::CompletionKeyMismatch
             | CompletionAnomalyReason::FinalizeFailed
             | CompletionAnomalyReason::CancelAckTargetStillActive
             | CompletionAnomalyReason::BackendContextUnknown
             | CompletionAnomalyReason::BackendSpecific(_) => self.inc_internal_unknown(),
-            CompletionAnomalyReason::OpMissing | CompletionAnomalyReason::SlotCorruption => {
-                self.inc_slot_corruption()
-            }
-            CompletionAnomalyReason::PayloadMissing => self.inc_payload_missing(),
             CompletionAnomalyReason::StaleGeneration => self.inc_stale_completion(),
         }
     }

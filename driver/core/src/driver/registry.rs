@@ -354,7 +354,8 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
 #[cfg(not(feature = "loom"))]
 mod tests {
     use super::*;
-    use crate::driver::PlatformOp;
+    use crate::{DriverCoreError, DriverError, driver::PlatformOp};
+    use diagweave::prelude::*;
 
     struct DummyPlatformOp;
 
@@ -364,12 +365,30 @@ mod tests {
 
     struct DummySlotSpec;
 
+    #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+    struct DummyError;
+
+    impl std::fmt::Display for DummyError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "dummy error")
+        }
+    }
+
+    impl std::error::Error for DummyError {}
+
+    impl DriverError for DummyError {
+        #[inline]
+        fn from_core_report(report: Report<DriverCoreError>) -> Report<Self> {
+            report.map_err(|_| DummyError)
+        }
+    }
+
     impl SlotSpec for DummySlotSpec {
         type Op = DummyPlatformOp;
         type UserPayload = ();
         type PlatformData = ();
         type Sidecar = ();
-        type Error = ();
+        type Error = DummyError;
         type Completion = usize;
         type CompletionDiagnostics = ();
     }

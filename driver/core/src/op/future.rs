@@ -148,12 +148,8 @@ where
 fn lost_reason_from_anomaly(reason: CompletionAnomalyReason) -> LostReason {
     match reason {
         CompletionAnomalyReason::StaleGeneration => LostReason::GenerationMismatch,
-        CompletionAnomalyReason::PayloadMissing => LostReason::PayloadMissing,
         CompletionAnomalyReason::UnknownSlot
         | CompletionAnomalyReason::NonActiveSlot
-        | CompletionAnomalyReason::SlotCorruption
-        | CompletionAnomalyReason::OpMissing
-        | CompletionAnomalyReason::BackendInvariantBroken
         | CompletionAnomalyReason::CompletionKeyMismatch
         | CompletionAnomalyReason::FinalizeFailed
         | CompletionAnomalyReason::CancelAckTargetStillActive
@@ -224,7 +220,6 @@ where
             ErasedPayload = Spec::UserPayload,
             Error = Spec::Error,
         >,
-    Spec::Error: DriverError,
     Spec::Completion: CompletionValue,
 {
     let CompletionRecord {
@@ -261,7 +256,6 @@ where
             ErasedPayload = Spec::UserPayload,
             Error = Spec::Error,
         >,
-    Spec::Error: DriverError,
     Spec::Completion: CompletionValue,
 {
     match table.try_take_record(token) {
@@ -283,7 +277,6 @@ type DetachedOpMarker<T, Spec> = (T, Spec);
 pub struct DetachedOp<T, Spec>
 where
     Spec: SlotSpec,
-    Spec::Error: DriverError,
     Spec::Completion: CompletionValue,
     T: IntoPlatformOp<
             Spec::Op,
@@ -304,7 +297,6 @@ where
 unsafe impl<T, Spec> std::marker::Send for DetachedOp<T, Spec>
 where
     Spec: SlotSpec,
-    Spec::Error: DriverError,
     Spec::Completion: CompletionValue,
     T: IntoPlatformOp<
             Spec::Op,
@@ -318,7 +310,6 @@ where
 impl<T, Spec> Drop for DetachedOp<T, Spec>
 where
     Spec: SlotSpec,
-    Spec::Error: DriverError,
     Spec::Completion: CompletionValue,
     T: IntoPlatformOp<
             Spec::Op,
@@ -347,7 +338,6 @@ where
 impl<T, Spec> Future for DetachedOp<T, Spec>
 where
     Spec: SlotSpec,
-    Spec::Error: DriverError,
     Spec::Completion: CompletionValue,
     T: IntoPlatformOp<
             Spec::Op,

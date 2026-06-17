@@ -3,7 +3,7 @@ use crate::slot;
 use super::{
     AnomalyAttach, BackendSlotRef, CompletionAnomaly, CompletionAnomalyKind,
     CompletionAnomalyReason, CompletionBackend, CompletionRaw, ControlAnomalyReason,
-    SlotIssueReason, corrupt_reason_from_snapshot,
+    SlotIssueReason,
 };
 
 impl CompletionAnomalyKind {
@@ -26,14 +26,6 @@ impl CompletionAnomalyKind {
             generation,
             state,
         }
-    }
-
-    pub const fn corrupt_snapshot(snapshot: slot::SlotSnapshot) -> Self {
-        Self::Corrupt { snapshot }
-    }
-
-    pub fn corrupt_from_view(snapshot: slot::SlotSnapshot) -> Self {
-        Self::Corrupt { snapshot }
     }
 
     pub const fn slot_issue(
@@ -62,23 +54,6 @@ impl CompletionAnomalyKind {
             state: snapshot.state,
             snapshot: Some(snapshot),
         }
-    }
-
-    pub const fn backend_invariant_broken(
-        index: usize,
-        generation: u32,
-        state: slot::SlotState,
-    ) -> Self {
-        Self::slot_issue(
-            SlotIssueReason::BackendInvariantBroken,
-            index,
-            generation,
-            state,
-        )
-    }
-
-    pub const fn backend_invariant_broken_snapshot(snapshot: slot::SlotSnapshot) -> Self {
-        Self::slot_issue_with_snapshot(SlotIssueReason::BackendInvariantBroken, snapshot)
     }
 
     pub const fn completion_key_mismatch(
@@ -182,14 +157,11 @@ impl CompletionAnomalyKind {
 
     pub fn reason(self) -> CompletionAnomalyReason {
         match self {
+            Self::GenerationMismatch { .. } => CompletionAnomalyReason::StaleGeneration,
             Self::UnknownSlot { .. } => CompletionAnomalyReason::UnknownSlot,
             Self::Stale { .. } => CompletionAnomalyReason::StaleGeneration,
             Self::NonActive { .. } => CompletionAnomalyReason::NonActiveSlot,
-            Self::Corrupt { snapshot } => corrupt_reason_from_snapshot(snapshot),
             Self::SlotIssue { reason, .. } => match reason {
-                SlotIssueReason::BackendInvariantBroken => {
-                    CompletionAnomalyReason::BackendInvariantBroken
-                }
                 SlotIssueReason::CompletionKeyMismatch => {
                     CompletionAnomalyReason::CompletionKeyMismatch
                 }
@@ -197,7 +169,6 @@ impl CompletionAnomalyKind {
                 SlotIssueReason::CancelAckTargetStillActive => {
                     CompletionAnomalyReason::CancelAckTargetStillActive
                 }
-                SlotIssueReason::SlotCorruption => CompletionAnomalyReason::SlotCorruption,
             },
             Self::Control { reason } => match reason {
                 ControlAnomalyReason::BackendContextUnknown => {
@@ -211,11 +182,11 @@ impl CompletionAnomalyKind {
 
     pub fn index(self) -> Option<usize> {
         match self {
+            Self::GenerationMismatch { snapshot } => Some(snapshot.index),
             Self::UnknownSlot { index, .. }
             | Self::Stale { index, .. }
             | Self::NonActive { index, .. }
             | Self::SlotIssue { index, .. } => Some(index),
-            Self::Corrupt { snapshot } => Some(snapshot.index),
             Self::BackendSpecific {
                 slot: Some(slot), ..
             } => Some(slot.index),
@@ -226,22 +197,21 @@ impl CompletionAnomalyKind {
 
     pub fn slot_snapshot(self) -> Option<slot::SlotSnapshot> {
         match self {
-            Self::Corrupt { snapshot } => Some(snapshot),
+            Self::GenerationMismatch { snapshot } => Some(snapshot),
             Self::SlotIssue {
                 snapshot: Some(snapshot),
                 ..
             } => Some(snapshot),
-            Self::SlotIssue { .. } => None,
             _ => None,
         }
     }
 
     pub fn expected_generation(self) -> Option<u32> {
         match self {
+            Self::GenerationMismatch { snapshot } => Some(snapshot.generation),
             Self::UnknownSlot { generation, .. } => Some(generation),
             Self::Stale { expected, .. } => Some(expected),
             Self::NonActive { generation, .. } => Some(generation),
-            Self::Corrupt { snapshot } => Some(snapshot.generation),
             Self::SlotIssue { generation, .. } => Some(generation),
             Self::BackendSpecific {
                 slot: Some(slot), ..
@@ -253,9 +223,9 @@ impl CompletionAnomalyKind {
 
     pub fn actual_generation(self) -> Option<u32> {
         match self {
+            Self::GenerationMismatch { snapshot } => Some(snapshot.generation),
             Self::Stale { actual, .. } => Some(actual),
             Self::NonActive { generation, .. } => Some(generation),
-            Self::Corrupt { snapshot } => Some(snapshot.generation),
             Self::SlotIssue { generation, .. } => Some(generation),
             Self::BackendSpecific {
                 slot: Some(slot), ..
@@ -267,10 +237,10 @@ impl CompletionAnomalyKind {
 
     pub fn state(self) -> Option<slot::SlotState> {
         match self {
+            Self::GenerationMismatch { snapshot } => Some(snapshot.state),
             Self::Stale { state, .. }
             | Self::NonActive { state, .. }
             | Self::SlotIssue { state, .. } => Some(state),
-            Self::Corrupt { snapshot } => Some(snapshot.state),
             Self::UnknownSlot { .. }
             | Self::Control { .. }
             | Self::BackendContext { .. }
@@ -280,13 +250,13 @@ impl CompletionAnomalyKind {
 
     pub fn backend(self) -> Option<CompletionBackend> {
         match self {
+            Self::GenerationMismatch { .. } => None,
             Self::BackendContext { backend, .. } | Self::BackendSpecific { backend, .. } => {
                 Some(backend)
             }
             Self::UnknownSlot { .. }
             | Self::Stale { .. }
             | Self::NonActive { .. }
-            | Self::Corrupt { .. }
             | Self::SlotIssue { .. }
             | Self::Control { .. } => None,
         }
@@ -308,6 +278,19 @@ impl CompletionAnomalyKind {
         let token = attach.token;
         let raw = attach.raw;
         let anomaly = match self {
+            Self::GenerationMismatch { snapshot } => {
+                let (expected_generation, index) = match token.op_token() {
+                    Some(op_token) => (op_token.generation(), op_token.index()),
+                    None => (snapshot.generation, snapshot.index),
+                };
+                CompletionAnomaly::stale(
+                    token,
+                    index,
+                    expected_generation,
+                    snapshot.generation,
+                    snapshot.state,
+                )
+            }
             Self::UnknownSlot { index, generation } => {
                 CompletionAnomaly::unknown_slot(token, index, generation)
             }
@@ -322,7 +305,6 @@ impl CompletionAnomalyKind {
                 generation,
                 state,
             } => CompletionAnomaly::non_active(token, index, generation, state),
-            Self::Corrupt { snapshot } => CompletionAnomaly::corrupt_slot_snapshot(token, snapshot),
             Self::SlotIssue {
                 reason,
                 index,
@@ -331,9 +313,6 @@ impl CompletionAnomalyKind {
                 snapshot,
             } => {
                 let mut anomaly = match reason {
-                    SlotIssueReason::BackendInvariantBroken => {
-                        CompletionAnomaly::backend_invariant_broken(token, index, generation, state)
-                    }
                     SlotIssueReason::CompletionKeyMismatch => {
                         CompletionAnomaly::completion_key_mismatch(token, index, generation, state)
                     }
@@ -344,9 +323,6 @@ impl CompletionAnomalyKind {
                         CompletionAnomaly::cancel_ack_target_still_active(
                             token, index, generation, state,
                         )
-                    }
-                    SlotIssueReason::SlotCorruption => {
-                        CompletionAnomaly::corrupt(token, index, generation, state)
                     }
                 };
                 if let Some(snapshot) = snapshot {

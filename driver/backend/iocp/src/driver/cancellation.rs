@@ -38,7 +38,7 @@ impl<'a> IocpDriver<'a> {
     ) -> IocpResult<CancelSubmitOutcome> {
         let token = request.target;
 
-        let timer_id = match self.ops.checked_slot_view(token) {
+        let timer_id = match self.ops.checked_slot_view(token)? {
             CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
                 slot.platform_mut().timer_id.take()
             }
@@ -56,7 +56,7 @@ impl<'a> IocpDriver<'a> {
             return Ok(CancelSubmitOutcome::CompletedLocally);
         }
 
-        let state = self.ops.checked_slot_view(token);
+        let state = self.ops.checked_slot_view(token)?;
         match state {
             CheckedSlotView::Valid(SlotView::InFlightWaiting(_))
             | CheckedSlotView::Valid(SlotView::InFlightOrphaned(_)) => {
@@ -89,20 +89,8 @@ impl<'a> IocpDriver<'a> {
             }
             view @ (CheckedSlotView::Missing { .. }
             | CheckedSlotView::Empty(_)
-            | CheckedSlotView::Stale(_)
-            | CheckedSlotView::Corrupt(_)) => {
-                let corrupt_index = match &view {
-                    CheckedSlotView::Corrupt(snapshot) => Some(snapshot.index),
-                    CheckedSlotView::Missing { .. }
-                    | CheckedSlotView::Empty(_)
-                    | CheckedSlotView::Stale(_)
-                    | CheckedSlotView::Valid(_) => None,
-                };
+            | CheckedSlotView::Stale(_)) => {
                 let (reason, kind) = cancel_target_kind(token, view);
-                if let Some(index) = corrupt_index {
-                    self.release_socket_inflight_for_op(index)?;
-                    self.drain_deferred_socket_cleanup();
-                }
                 self.record_cancel_target_gone(reason);
                 let attach = AnomalyAttach::from_raw_completion(RawCompletion::new(
                     COMP_BACKEND_IOCP,
@@ -170,7 +158,7 @@ impl<'a> IocpDriver<'a> {
         &mut self,
         token: OpToken,
     ) -> IocpResult<Option<CompletionAnomalyKind>> {
-        let active_target = match self.ops.checked_slot_view(token) {
+        let active_target = match self.ops.checked_slot_view(token)? {
             CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) => Some(slot.snapshot()),
             CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot)) => Some(slot.snapshot()),
             _ => None,
@@ -221,7 +209,7 @@ impl<'a> IocpDriver<'a> {
         token: OpToken,
         ops: &mut IocpOpRegistry,
     ) -> IocpResult<CancelPerformStatus> {
-        let status = match ops.checked_slot_view(token) {
+        let status = match ops.checked_slot_view(token)? {
             CheckedSlotView::Valid(SlotView::InFlightWaiting(mut guard)) => {
                 let is_rio = guard
                     .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))

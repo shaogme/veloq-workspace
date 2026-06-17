@@ -10,10 +10,6 @@ pub enum CompletionAnomalyReason {
     UnknownSlot,
     StaleGeneration,
     NonActiveSlot,
-    SlotCorruption,
-    OpMissing,
-    PayloadMissing,
-    BackendInvariantBroken,
     CompletionKeyMismatch,
     FinalizeFailed,
     CancelAckTargetStillActive,
@@ -28,11 +24,9 @@ pub enum ControlAnomalyReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotIssueReason {
-    BackendInvariantBroken,
     CompletionKeyMismatch,
     FinalizeFailed,
     CancelAckTargetStillActive,
-    SlotCorruption,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +52,9 @@ pub struct CompletionRaw {
 /// Lightweight anomaly classification for hot propagation paths (~24–32 B).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionAnomalyKind {
+    GenerationMismatch {
+        snapshot: slot::SlotSnapshot,
+    },
     UnknownSlot {
         index: usize,
         generation: u32,
@@ -72,9 +69,6 @@ pub enum CompletionAnomalyKind {
         index: usize,
         generation: u32,
         state: slot::SlotState,
-    },
-    Corrupt {
-        snapshot: slot::SlotSnapshot,
     },
     SlotIssue {
         reason: SlotIssueReason,
@@ -109,7 +103,6 @@ pub enum AnomalyOutcome {
     Missing(CompletionAnomalyKind),
     Stale(CompletionAnomalyKind),
     NonActive(CompletionAnomalyKind),
-    Corrupt(CompletionAnomalyKind),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,12 +158,6 @@ pub enum CompletionAnomaly {
         snapshot: Option<slot::SlotSnapshot>,
         raw: Option<CompletionRaw>,
     },
-    SlotCorruption {
-        reason: CompletionAnomalyReason,
-        token: CompletionToken,
-        snapshot: slot::SlotSnapshot,
-        raw: Option<CompletionRaw>,
-    },
     BackendContext {
         token: CompletionToken,
         backend: CompletionBackend,
@@ -192,10 +179,7 @@ pub enum CompletionAnomaly {
 impl AnomalyOutcome {
     pub fn kind(self) -> CompletionAnomalyKind {
         match self {
-            Self::Missing(kind)
-            | Self::Stale(kind)
-            | Self::NonActive(kind)
-            | Self::Corrupt(kind) => kind,
+            Self::Missing(kind) | Self::Stale(kind) | Self::NonActive(kind) => kind,
         }
     }
 
@@ -225,18 +209,5 @@ impl AnomalyAttach {
                 flags: raw.flags,
             }),
         }
-    }
-}
-
-#[inline]
-pub(super) fn corrupt_reason_from_snapshot(
-    snapshot: slot::SlotSnapshot,
-) -> CompletionAnomalyReason {
-    if !snapshot.has_op {
-        CompletionAnomalyReason::OpMissing
-    } else if !snapshot.has_payload {
-        CompletionAnomalyReason::PayloadMissing
-    } else {
-        CompletionAnomalyReason::SlotCorruption
     }
 }

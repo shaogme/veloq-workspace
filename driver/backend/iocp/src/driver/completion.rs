@@ -141,7 +141,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
         mut slot: Slot<'_, InFlightWaiting>,
         source: CompletionSource<'_, Self::BackendIngress>,
     ) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
-        Ok(match source {
+        match source {
             CompletionSource::Synthetic(SyntheticCompletionSource::Timer) => {
                 complete_timer_waiting_slot(slot, event)
             }
@@ -156,11 +156,11 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
                 )
             }
             CompletionSource::Kernel | CompletionSource::User | CompletionSource::Backend(_) => {
-                let io_result = calculate_io_result_from_slot(self.ext, &mut slot, event.res());
+                let io_result = calculate_io_result_from_slot(self.ext, &mut slot, event.res())?;
                 let socket_inflight = take_socket_inflight_from_slot(&mut slot);
                 complete_iocp_waiting_slot(slot, event, io_result, socket_inflight)
             }
-        })
+        }
     }
 
     fn complete_orphaned(
@@ -198,7 +198,7 @@ impl<'a> IocpDriver<'a> {
         let mut expired = Vec::new();
         for &token in &timer_buffer {
             match self.ops.checked_slot_view(token) {
-                CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
+                Ok(CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot))) => {
                     if let Some(deadline) = slot.platform().timer_deadline
                         && now < deadline
                     {
@@ -209,7 +209,7 @@ impl<'a> IocpDriver<'a> {
                     }
                     expired.push(token);
                 }
-                CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot)) => {
+                Ok(CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot))) => {
                     if let Some(deadline) = slot.platform().timer_deadline
                         && now < deadline
                     {
@@ -314,7 +314,7 @@ fn calculate_io_result_from_slot(
     ext: &Extensions,
     guard: &mut Slot<'_, InFlightWaiting>,
     event_res: i32,
-) -> IocpResult<usize> {
+) -> IocpResult<IocpResult<usize>> {
     let user_data = guard.snapshot().index;
     let mut io_result = if event_res < 0 {
         Err(IocpError::CompletionWait.io_report(
@@ -325,7 +325,7 @@ fn calculate_io_result_from_slot(
         Ok(event_res as usize)
     };
 
-    let _ = guard.with_op_mut(|iocp_op: &mut IocpOp| {
+    let op_res = guard.with_op_mut(|iocp_op: &mut IocpOp| {
         let blocking_res = iocp_op
             .header
             .blocking_completion
@@ -355,7 +355,14 @@ fn calculate_io_result_from_slot(
         }
     });
 
-    io_result
+    if let Err(err) = op_res {
+        return Err(IocpError::InvalidState.report(
+            "iocp.calculate_io_result_from_slot",
+            format!("slot op missing on completion: {:?}", err),
+        ));
+    }
+
+    Ok(io_result)
 }
 
 fn complete_iocp_waiting_slot(
@@ -363,9 +370,8 @@ fn complete_iocp_waiting_slot(
     event: UserCompletionEvent,
     io_result: IocpResult<usize>,
     socket_inflight: Option<SocketInflightToken>,
-) -> CompletionHookOutcome<IocpSlotSpec, IocpBackendEffect> {
+) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, IocpBackendEffect>> {
     let mut io_detail = Some(io_result);
-    let snapshot = guard.snapshot();
     let effect = socket_inflight
         .map(IocpBackendEffect::SocketInflight)
         .unwrap_or_default();
@@ -375,10 +381,10 @@ fn complete_iocp_waiting_slot(
         let _ = guard.take_op();
         let _ = guard.take_completion_data();
         let _data = std::mem::take(guard.platform_mut());
-        return CompletionHookOutcome::Cleanup {
+        return Ok(CompletionHookOutcome::Cleanup {
             cleanup: CompletionCleanupGuard::default(),
             effect,
-        };
+        });
     }
 
     let completion_res = io_detail
@@ -403,30 +409,28 @@ fn complete_iocp_waiting_slot(
     if let Some(payload) = payload {
         let _ = guard.take_op();
         let _data = std::mem::take(guard.platform_mut());
-        CompletionHookOutcome::User {
+        Ok(CompletionHookOutcome::User {
             event,
             payload,
             detail: detail.or_else(|| io_detail.take()),
             cleanup,
             effect,
-        }
+        })
     } else {
         drop(detail);
         let _ = guard.take_op();
         let _data = std::mem::take(guard.platform_mut());
-        CompletionHookOutcome::Lost {
-            event,
-            loss_kind: CompletionAnomalyKind::corrupt_snapshot(snapshot),
-            cleanup,
-            effect,
-        }
+        Err(IocpError::InvalidState.report(
+            "iocp.complete_iocp_waiting_slot",
+            "slot payload missing on completion",
+        ))
     }
 }
 
 fn complete_timer_waiting_slot(
     slot: Slot<'_, InFlightWaiting>,
     event: UserCompletionEvent,
-) -> CompletionHookOutcome<IocpSlotSpec, IocpBackendEffect> {
+) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, IocpBackendEffect>> {
     let io_result: IocpResult<usize> = Ok(0);
     complete_iocp_waiting_slot(slot, event, io_result, None)
 }
@@ -435,7 +439,7 @@ fn complete_submission_failure_slot(
     slot: Slot<'_, InFlightWaiting>,
     event: UserCompletionEvent,
     report: Option<Report<IocpError>>,
-) -> CompletionHookOutcome<IocpSlotSpec, IocpBackendEffect> {
+) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, IocpBackendEffect>> {
     let io_result = report.unwrap_or_else(|| {
         IocpError::Submission
             .to_report()
@@ -450,7 +454,7 @@ fn complete_cancel_waiting_slot(
     slot: Slot<'_, InFlightWaiting>,
     event: UserCompletionEvent,
     mode: CancelMode,
-) -> CompletionHookOutcome<IocpSlotSpec, IocpBackendEffect> {
+) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, IocpBackendEffect>> {
     let abort_result: IocpResult<usize> = IocpError::CompletionWait
         .push_ctx("scope", "iocp.driver.cancel")
         .set_error_code((-event.res()).max(1))
@@ -466,10 +470,10 @@ fn complete_cancel_waiting_slot(
         let (payload, detail) = completed.take_completion_data();
         drop(payload);
         drop(detail);
-        CompletionHookOutcome::Cleanup {
+        Ok(CompletionHookOutcome::Cleanup {
             cleanup,
             effect: IocpBackendEffect::None,
-        }
+        })
     }
 }
 

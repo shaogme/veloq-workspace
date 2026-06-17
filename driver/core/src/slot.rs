@@ -1,9 +1,10 @@
 use crate::{
-    DriverResult, SlotSidecar,
+    DriverCoreError, DriverError, DriverResult, SlotSidecar,
     driver::{
         DriverCompletionDiagnosticsBackend, OpToken, OpTokenError, PlatformOp, registry::OpRegistry,
     },
 };
+use diagweave::prelude::*;
 use std::marker::PhantomData;
 use veloq_shim::atomic::Ordering;
 
@@ -12,7 +13,7 @@ pub trait SlotSpec {
     type UserPayload: Send;
     type PlatformData: Default;
     type Sidecar: SlotSidecar;
-    type Error;
+    type Error: DriverError;
     type Completion;
     type CompletionDiagnostics: DriverCompletionDiagnosticsBackend;
 }
@@ -453,21 +454,26 @@ pub enum CheckedSlotView<'a, Spec: SlotSpec> {
     },
     Empty(SlotSnapshot),
     Stale(SlotSnapshot),
-    Corrupt(SlotSnapshot),
 }
 
 pub trait SlotRegistryExt<Spec: SlotSpec> {
-    fn checked_slot_view(&mut self, token: OpToken) -> CheckedSlotView<'_, Spec>;
+    fn checked_slot_view(
+        &mut self,
+        token: OpToken,
+    ) -> Result<CheckedSlotView<'_, Spec>, Report<Spec::Error>>;
 }
 
 impl<Spec: SlotSpec> SlotRegistryExt<Spec> for OpRegistry<Spec> {
-    fn checked_slot_view(&mut self, token: OpToken) -> CheckedSlotView<'_, Spec> {
+    fn checked_slot_view(
+        &mut self,
+        token: OpToken,
+    ) -> Result<CheckedSlotView<'_, Spec>, Report<Spec::Error>> {
         let (index, expected_generation) = token.parts();
         let Some((entry, op_entry, op, storage)) = self.slot_bundle_by_index_mut(index) else {
-            return CheckedSlotView::Missing {
+            return Ok(CheckedSlotView::Missing {
                 index,
                 expected_generation,
-            };
+            });
         };
         let generation = entry.generation(Ordering::Acquire);
         let state = entry.state(Ordering::Acquire);
@@ -480,19 +486,23 @@ impl<Spec: SlotSpec> SlotRegistryExt<Spec> for OpRegistry<Spec> {
         };
 
         if generation != expected_generation {
-            return CheckedSlotView::Stale(snapshot);
+            return Ok(CheckedSlotView::Stale(snapshot));
         }
 
         match state {
             SlotState::InFlightWaiting | SlotState::InFlightOrphaned => {
                 if !snapshot.has_op || !snapshot.has_payload {
-                    return CheckedSlotView::Corrupt(snapshot);
+                    let report = DriverCoreError::Internal
+                        .to_report()
+                        .push_ctx("scope", "checked_slot_view")
+                        .attach_note(format!("corrupt slot detected: {:?}", snapshot));
+                    return Err(Spec::Error::from_core_report(report));
                 }
             }
             SlotState::Idle
             | SlotState::InFlightReady
             | SlotState::Finalizing
-            | SlotState::ReservedValue => return CheckedSlotView::Empty(snapshot),
+            | SlotState::ReservedValue => return Ok(CheckedSlotView::Empty(snapshot)),
             SlotState::Reserved => {}
         }
 
@@ -504,9 +514,19 @@ impl<Spec: SlotSpec> SlotRegistryExt<Spec> for OpRegistry<Spec> {
                 &mut op_entry.platform_data,
                 index,
             )
-            .map_or(CheckedSlotView::Corrupt(snapshot), |slot| {
-                CheckedSlotView::Valid(SlotView::Reserved(slot))
-            }),
+            .map_or_else(
+                || {
+                    let report = DriverCoreError::Internal
+                        .to_report()
+                        .push_ctx("scope", "checked_slot_view")
+                        .attach_note(format!(
+                            "corrupt slot (try_bind Reserved failed): {:?}",
+                            snapshot
+                        ));
+                    Err(Spec::Error::from_core_report(report))
+                },
+                |slot| Ok(CheckedSlotView::Valid(SlotView::Reserved(slot))),
+            ),
             SlotState::InFlightWaiting => Slot::<InFlightWaiting, Spec>::try_bind(
                 entry,
                 op,
@@ -514,9 +534,19 @@ impl<Spec: SlotSpec> SlotRegistryExt<Spec> for OpRegistry<Spec> {
                 &mut op_entry.platform_data,
                 index,
             )
-            .map_or(CheckedSlotView::Corrupt(snapshot), |slot| {
-                CheckedSlotView::Valid(SlotView::InFlightWaiting(slot))
-            }),
+            .map_or_else(
+                || {
+                    let report = DriverCoreError::Internal
+                        .to_report()
+                        .push_ctx("scope", "checked_slot_view")
+                        .attach_note(format!(
+                            "corrupt slot (try_bind InFlightWaiting failed): {:?}",
+                            snapshot
+                        ));
+                    Err(Spec::Error::from_core_report(report))
+                },
+                |slot| Ok(CheckedSlotView::Valid(SlotView::InFlightWaiting(slot))),
+            ),
             SlotState::InFlightOrphaned => Slot::<InFlightOrphaned, Spec>::try_bind(
                 entry,
                 op,
@@ -524,13 +554,23 @@ impl<Spec: SlotSpec> SlotRegistryExt<Spec> for OpRegistry<Spec> {
                 &mut op_entry.platform_data,
                 index,
             )
-            .map_or(CheckedSlotView::Corrupt(snapshot), |slot| {
-                CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot))
-            }),
+            .map_or_else(
+                || {
+                    let report = DriverCoreError::Internal
+                        .to_report()
+                        .push_ctx("scope", "checked_slot_view")
+                        .attach_note(format!(
+                            "corrupt slot (try_bind InFlightOrphaned failed): {:?}",
+                            snapshot
+                        ));
+                    Err(Spec::Error::from_core_report(report))
+                },
+                |slot| Ok(CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot))),
+            ),
             SlotState::Idle
             | SlotState::InFlightReady
             | SlotState::Finalizing
-            | SlotState::ReservedValue => CheckedSlotView::Empty(snapshot),
+            | SlotState::ReservedValue => Ok(CheckedSlotView::Empty(snapshot)),
         }
     }
 }
@@ -546,7 +586,6 @@ mod tests {
         SharedCompletionTable, UserCompletionEvent,
     };
     use crate::{DriverCoreError, DriverError};
-    use diagweave::prelude::*;
 
     struct DummyPlatformOp;
 
@@ -657,7 +696,7 @@ mod tests {
                     *payload = Some(());
                 })
                 .expect("slot storage should exist");
-            let slot = match registry.checked_slot_view(token) {
+            let slot = match registry.checked_slot_view(token).unwrap() {
                 CheckedSlotView::Valid(SlotView::Reserved(slot)) => slot
                     .init_op_with(DummyPlatformOp, |_| {})
                     .expect("reserved slot should accept op"),
@@ -685,7 +724,7 @@ mod tests {
         );
 
         assert!(matches!(
-            registry.checked_slot_view(token),
+            registry.checked_slot_view(token).unwrap(),
             CheckedSlotView::Empty(_)
         ));
         let record = match registry.shared.try_take_record(token) {
@@ -714,7 +753,7 @@ mod tests {
         assert_ne!(fresh.generation, stale_token.generation());
 
         assert!(matches!(
-            registry.checked_slot_view(stale_token),
+            registry.checked_slot_view(stale_token).unwrap(),
             CheckedSlotView::Stale(snapshot)
                 if snapshot.index == stale_token.index()
                     && snapshot.generation == fresh.generation
@@ -731,7 +770,7 @@ mod tests {
         let _ = registry.remove(token);
 
         assert!(matches!(
-            registry.checked_slot_view(token),
+            registry.checked_slot_view(token).unwrap(),
             CheckedSlotView::Empty(snapshot)
                 if snapshot.index == token.index()
                     && snapshot.generation == token.generation()
@@ -746,7 +785,7 @@ mod tests {
         let token = OpToken::from_registry_parts(handle.index, handle.generation)
             .expect("test handle should be encodable");
 
-        let slot = match registry.checked_slot_view(token) {
+        let slot = match registry.checked_slot_view(token).unwrap() {
             CheckedSlotView::Valid(SlotView::Reserved(slot)) => slot
                 .init_op_with(DummyPlatformOp, |_| {})
                 .expect("reserved slot should accept op"),
@@ -757,15 +796,7 @@ mod tests {
             .expect("reserved slot should start submission")
             .persist();
 
-        assert!(matches!(
-            registry.checked_slot_view(token),
-            CheckedSlotView::Corrupt(snapshot)
-                if snapshot.index == token.index()
-                    && snapshot.generation == token.generation()
-                    && snapshot.state == SlotState::InFlightWaiting
-                    && snapshot.has_op
-                    && !snapshot.has_payload
-        ));
+        assert!(registry.checked_slot_view(token).is_err());
     }
 
     #[test]
