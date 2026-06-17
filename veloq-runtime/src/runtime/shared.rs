@@ -65,11 +65,6 @@ pub struct RuntimeShared<T> {
     pub extra_tls: Tls<T>,
 }
 
-unsafe impl<T> Send for RuntimeShared<T> {}
-unsafe impl<T> Sync for RuntimeShared<T> {}
-unsafe impl Send for RuntimeSharedBase {}
-unsafe impl Sync for RuntimeSharedBase {}
-
 pub(crate) struct Receivers {
     pub(crate) deques: Vec<Worker<SendTaskRef>>,
 }

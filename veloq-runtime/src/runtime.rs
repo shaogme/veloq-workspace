@@ -21,7 +21,7 @@ pub mod context;
 pub mod primitives;
 pub mod shared;
 
-pub use context::{IntoRuntimeCtx, IdleDecision, IdleWaitStrategy, RuntimeCtx};
+pub use context::{IdleDecision, IdleWaitStrategy, IntoRuntimeCtx, RuntimeCtx};
 pub(crate) use context::{IdleHook, RuntimeTlsInner, WorkerTickHook};
 pub use primitives::GenericCancellationToken;
 pub use shared::{EnqueuePinnedOutcome, RuntimeShared, RuntimeSharedBase};

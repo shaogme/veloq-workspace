@@ -93,16 +93,10 @@ pub(crate) struct RuntimeTlsInner {
     pub(crate) worker: Worker<SendTaskRef>,
 }
 
-unsafe impl Send for RuntimeTlsInner {}
-unsafe impl Sync for RuntimeTlsInner {}
-
 /// A context handle provided to the `block_on` async closure, allowing creation of scopes.
 pub struct RuntimeCtx<'rt, T> {
     shared: &'rt RuntimeShared<T>,
 }
-
-unsafe impl<'rt, T> Send for RuntimeCtx<'rt, T> {}
-unsafe impl<'rt, T> Sync for RuntimeCtx<'rt, T> {}
 
 impl<'rt, T> Copy for RuntimeCtx<'rt, T> {}
 

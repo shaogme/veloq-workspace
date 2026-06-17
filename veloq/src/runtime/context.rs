@@ -16,7 +16,7 @@ use veloq_driver_native::{
 use veloq_runtime::{
     error::Result as RuntimeResult,
     runtime::{
-        IntoRuntimeCtx, EnqueuePinnedOutcome, IdleDecision, IdleWaitStrategy, RuntimeCtx,
+        EnqueuePinnedOutcome, IdleDecision, IdleWaitStrategy, IntoRuntimeCtx, RuntimeCtx,
         RuntimeShared,
     },
     storage::AtomicStorage,
