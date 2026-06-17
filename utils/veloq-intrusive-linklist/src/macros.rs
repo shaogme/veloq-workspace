@@ -139,6 +139,102 @@ macro_rules! intrusive_adapter {
     };
 }
 
+#[macro_export]
+macro_rules! concurrent_intrusive_adapter {
+    // Generic version with lifetime
+    ($vis:vis $Adapter:ident < $lt:lifetime, $($gen:ident),+ > = $Node:ty { $link_field:ident : ConcurrentLink } $(where $($wh:tt)+)?) => {
+        $vis struct $Adapter< $lt, $($gen),+ >(core::marker::PhantomData<(& $lt (), $($gen),+)>);
+
+        impl< $lt, $($gen),+ > $Adapter< $lt, $($gen),+ > {
+            pub const fn new() -> Self {
+                Self(core::marker::PhantomData)
+            }
+        }
+
+        unsafe impl < $lt, $($gen),+ > $crate::ConcurrentAdapter for $Adapter < $lt, $($gen),+ > $(where $($wh)+)? {
+            type Value = $Node;
+
+            #[inline]
+            unsafe fn get_link(&self, value: core::ptr::NonNull<Self::Value>) -> core::ptr::NonNull<$crate::ConcurrentLink> {
+                let val_ptr = value.as_ptr();
+                unsafe {
+                    let link_ptr = core::ptr::addr_of_mut!((*val_ptr).$link_field);
+                    core::ptr::NonNull::new_unchecked(link_ptr)
+                }
+            }
+
+            #[inline]
+            unsafe fn get_value(&self, link: core::ptr::NonNull<$crate::ConcurrentLink>) -> core::ptr::NonNull<Self::Value> {
+                let link_ptr = link.as_ptr();
+                unsafe {
+                    let val_ptr = $crate::container_of!(link_ptr, $Node, $link_field) as *mut $Node;
+                    core::ptr::NonNull::new_unchecked(val_ptr)
+                }
+            }
+        }
+    };
+
+    // Generic version
+    ($vis:vis $Adapter:ident < $($gen:ident),+ > = $Node:ty { $link_field:ident : ConcurrentLink } $(where $($wh:tt)+)?) => {
+        $vis struct $Adapter< $($gen),+ >(core::marker::PhantomData<($($gen),+)>);
+
+        impl< $($gen),+ > $Adapter< $($gen),+ > {
+            pub const fn new() -> Self {
+                Self(core::marker::PhantomData)
+            }
+        }
+
+        unsafe impl < $($gen),+ > $crate::ConcurrentAdapter for $Adapter < $($gen),+ > $(where $($wh)+)? {
+            type Value = $Node;
+
+            #[inline]
+            unsafe fn get_link(&self, value: core::ptr::NonNull<Self::Value>) -> core::ptr::NonNull<$crate::ConcurrentLink> {
+                let val_ptr = value.as_ptr();
+                unsafe {
+                    let link_ptr = core::ptr::addr_of_mut!((*val_ptr).$link_field);
+                    core::ptr::NonNull::new_unchecked(link_ptr)
+                }
+            }
+
+            #[inline]
+            unsafe fn get_value(&self, link: core::ptr::NonNull<$crate::ConcurrentLink>) -> core::ptr::NonNull<Self::Value> {
+                let link_ptr = link.as_ptr();
+                unsafe {
+                    let val_ptr = $crate::container_of!(link_ptr, $Node, $link_field) as *mut $Node;
+                    core::ptr::NonNull::new_unchecked(val_ptr)
+                }
+            }
+        }
+    };
+
+    // Non-generic version
+    ($vis:vis $Adapter:ident = $Node:ty { $link_field:ident : ConcurrentLink }) => {
+        $vis struct $Adapter;
+
+        unsafe impl $crate::ConcurrentAdapter for $Adapter {
+            type Value = $Node;
+
+            #[inline]
+            unsafe fn get_link(&self, value: core::ptr::NonNull<Self::Value>) -> core::ptr::NonNull<$crate::ConcurrentLink> {
+                let val_ptr = value.as_ptr();
+                unsafe {
+                    let link_ptr = core::ptr::addr_of_mut!((*val_ptr).$link_field);
+                    core::ptr::NonNull::new_unchecked(link_ptr)
+                }
+            }
+
+            #[inline]
+            unsafe fn get_value(&self, link: core::ptr::NonNull<$crate::ConcurrentLink>) -> core::ptr::NonNull<Self::Value> {
+                let link_ptr = link.as_ptr();
+                unsafe {
+                    let val_ptr = $crate::container_of!(link_ptr, $Node, $link_field) as *mut $Node;
+                    core::ptr::NonNull::new_unchecked(val_ptr)
+                }
+            }
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     #[repr(C)]

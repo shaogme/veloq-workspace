@@ -7,12 +7,12 @@ use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::task::{Context, Poll};
-use veloq_intrusive_linklist::LinkedList;
+use veloq_intrusive_linklist::ConcurrentLinkedList;
 
 /// An asynchronous reader-writer lock.
 pub struct RwLock<T: ?Sized> {
     state: AtomicUsize,
-    waiters: SpinLock<LinkedList<WaiterAdapter>>,
+    waiters: SpinLock<ConcurrentLinkedList<WaiterAdapter>>,
     data: UnsafeCell<T>,
 }
 
@@ -33,7 +33,7 @@ impl<T> RwLock<T> {
     pub const fn new(data: T) -> Self {
         Self {
             state: AtomicUsize::new(0),
-            waiters: SpinLock::new(LinkedList::new(WaiterAdapter::NEW)),
+            waiters: SpinLock::new(ConcurrentLinkedList::new(WaiterAdapter::NEW)),
             data: UnsafeCell::new(data),
         }
     }
@@ -43,7 +43,7 @@ impl<T> RwLock<T> {
     pub fn new(data: T) -> Self {
         Self {
             state: AtomicUsize::new(0),
-            waiters: SpinLock::new(LinkedList::new(WaiterAdapter::NEW)),
+            waiters: SpinLock::new(ConcurrentLinkedList::new(WaiterAdapter::NEW)),
             data: UnsafeCell::new(data),
         }
     }

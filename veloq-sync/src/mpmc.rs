@@ -16,7 +16,7 @@ use std::{
     ptr::NonNull,
     task::{Context, Poll},
 };
-use veloq_intrusive_linklist::LinkedList;
+use veloq_intrusive_linklist::ConcurrentLinkedList;
 
 pub mod flavor {
     use super::*;
@@ -54,7 +54,7 @@ pub mod flavor {
     }
 
     pub struct Bounded {
-        waiters: SpinLock<LinkedList<WaiterAdapter>>,
+        waiters: SpinLock<ConcurrentLinkedList<WaiterAdapter>>,
         waiter_count: AtomicUsize,
     }
 
@@ -67,7 +67,7 @@ pub mod flavor {
     impl ChannelFlavor for Bounded {
         fn new() -> Self {
             Self {
-                waiters: SpinLock::new(LinkedList::new(WaiterAdapter::NEW)),
+                waiters: SpinLock::new(ConcurrentLinkedList::new(WaiterAdapter::NEW)),
                 waiter_count: AtomicUsize::new(0),
             }
         }
@@ -157,7 +157,7 @@ pub struct State<T, F: ChannelFlavor, Q: Queue<T>> {
     pub(crate) queue: Q,
 
     // 接收等待队列 (通用)
-    pub(crate) recv_waiters: SpinLock<LinkedList<WaiterAdapter>>,
+    pub(crate) recv_waiters: SpinLock<ConcurrentLinkedList<WaiterAdapter>>,
     pub(crate) recv_waiter_count: AtomicUsize,
 
     pub(crate) is_closed: AtomicBool,
@@ -175,7 +175,7 @@ impl<T, F: ChannelFlavor, Q: Queue<T>> State<T, F, Q> {
     pub fn new(capacity: usize) -> Self {
         Self {
             queue: Q::new(capacity),
-            recv_waiters: SpinLock::new(LinkedList::new(WaiterAdapter::NEW)),
+            recv_waiters: SpinLock::new(ConcurrentLinkedList::new(WaiterAdapter::NEW)),
             recv_waiter_count: AtomicUsize::new(0),
             is_closed: AtomicBool::new(false),
             sender_count: AtomicUsize::new(1),
