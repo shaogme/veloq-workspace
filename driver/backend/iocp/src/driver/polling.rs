@@ -5,12 +5,9 @@ use std::{
 };
 
 use diagweave::prelude::*;
-use veloq_driver_core::{
-    driver::{
-        AnomalyAttach, CompletionAnomalyKind, CompletionEnvelope, CompletionIdentity, OpToken,
-        RawCompletion, RemoteWaker, SharedCompletionTable, drain_cancel_requests,
-    },
-    slot::{CheckedSlotView, SlotRegistryExt, SlotView},
+use veloq_driver_core::driver::{
+    AnomalyAttach, CompletionAnomalyKind, CompletionEnvelope, CompletionIdentity, OpToken,
+    RawCompletion, RemoteWaker, SharedCompletionTable, drain_cancel_requests,
 };
 use veloq_wheel::{TaskId, Wheel, WheelConfig};
 
@@ -264,23 +261,23 @@ impl<'a> IocpDriver<'a> {
         let raw = envelope.raw;
         let expected_key = raw.token.raw() as usize;
         if completion_key != 0 && completion_key != expected_key {
-            let mismatch_raw = RawCompletion::new(
-                COMP_BACKEND_IOCP,
-                CompletionEnvelope::from_raw_parts(
-                    COMP_BACKEND_IOCP,
-                    completion_key as u64,
-                    raw.res,
-                    raw.flags,
+            return Err(IocpError::InvalidState
+                .report(
+                    "resolve_overlapped_user_envelope",
+                    "Completion Key Mismatch occurred during IOCP status polling",
                 )
-                .raw
-                .token,
-                raw.res,
-                raw.flags,
-            );
-            let kind =
-                completion_key_mismatch_kind(entry.token, self.ops.checked_slot_view(entry.token)?);
-            let attach = AnomalyAttach::from_raw_completion(mismatch_raw);
-            let _ = self.accept_completion_anomaly(kind, attach)?;
+                .with_ctx("slot_index", entry.token.index())
+                .with_ctx("expected_generation", entry.token.generation())
+                .with_ctx("expected_key", expected_key as u64)
+                .with_ctx("received_completion_key", completion_key as u64)
+                .with_ctx("overlapped_ptr", overlapped as usize)
+                .with_ctx("raw_res", res)
+                .with_ctx("raw_flags", flags)
+                .attach_note(
+                    "The Completion Key received from GetQueuedCompletionStatus does not match \
+                     the expected key mapped to the submitted token. This indicates a programming \
+                     bug or memory corruption during Socket/File registration to the completion port."
+                ));
         }
         Ok(envelope)
     }
@@ -342,39 +339,6 @@ fn iocp_status_res(success: bool, error_code: Option<u32>, bytes: u32) -> i32 {
 #[inline]
 fn iocp_status_flags(success: bool, error_code: Option<u32>) -> u32 {
     (u32::from(success)) | (error_code.unwrap_or(0).min(u32::MAX >> 1) << 1)
-}
-
-fn completion_key_mismatch_kind(
-    token: OpToken,
-    view: CheckedSlotView<'_, IocpSlotSpec>,
-) -> CompletionAnomalyKind {
-    match view {
-        CheckedSlotView::Valid(slot) => {
-            let snapshot = match slot {
-                SlotView::Reserved(slot) => slot.snapshot(),
-                SlotView::InFlightWaiting(slot) => slot.snapshot(),
-                SlotView::InFlightOrphaned(slot) => slot.snapshot(),
-            };
-            CompletionAnomalyKind::completion_key_mismatch(
-                snapshot.index,
-                snapshot.generation,
-                snapshot.state,
-            )
-        }
-        CheckedSlotView::Missing {
-            index,
-            expected_generation,
-        } => CompletionAnomalyKind::unknown_slot(index, expected_generation),
-        CheckedSlotView::Empty(snapshot) => {
-            CompletionAnomalyKind::non_active(snapshot.index, token.generation(), snapshot.state)
-        }
-        CheckedSlotView::Stale(snapshot) => CompletionAnomalyKind::stale(
-            snapshot.index,
-            token.generation(),
-            snapshot.generation,
-            snapshot.state,
-        ),
-    }
 }
 
 #[cfg(test)]

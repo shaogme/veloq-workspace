@@ -1,12 +1,12 @@
 use veloq_driver_core::{
     driver::{
         AnomalyAttach, CancelMode, CancelRequest, CancelSubmitOutcome, CancelTargetGoneReason,
-        CompletionAnomalyKind, CompletionToken, OpToken, RawCompletion, SyntheticCompletionSource,
-        UserCompletionEvent, cancel_target_kind,
+        CompletionToken, OpToken, RawCompletion, SyntheticCompletionSource, UserCompletionEvent,
+        cancel_target_kind,
     },
     slot::{CheckedSlotView, SlotRegistryExt, SlotView},
 };
-use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED};
+use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 
 use crate::{
     config::RegisteredSlot,
@@ -133,9 +133,7 @@ impl<'a> IocpDriver<'a> {
                 self.completion_diagnostics
                     .backend()
                     .inc_cancel_ack_not_found();
-                if let Some(kind) = self.record_cancel_not_found_if_target_active(token)? {
-                    return Ok(CancelSubmitOutcome::DiagnosticOnly { kind });
-                }
+                self.record_cancel_not_found_if_target_active(token)?;
                 self.record_cancel_target_gone(CancelTargetGoneReason::Missing);
                 Ok(CancelSubmitOutcome::target_missing())
             }
@@ -154,10 +152,7 @@ impl<'a> IocpDriver<'a> {
         }
     }
 
-    fn record_cancel_not_found_if_target_active(
-        &mut self,
-        token: OpToken,
-    ) -> IocpResult<Option<CompletionAnomalyKind>> {
+    fn record_cancel_not_found_if_target_active(&mut self, token: OpToken) -> IocpResult<()> {
         let active_target = match self.ops.checked_slot_view(token)? {
             CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) => Some(slot.snapshot()),
             CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot)) => Some(slot.snapshot()),
@@ -165,26 +160,28 @@ impl<'a> IocpDriver<'a> {
         };
 
         let Some(snapshot) = active_target else {
-            return Ok(None);
+            return Ok(());
         };
 
         self.completion_diagnostics
             .backend()
             .inc_cancel_ack_not_found_active();
-        let raw = RawCompletion::new(
-            COMP_BACKEND_IOCP,
-            CompletionToken::user(token),
-            -(ERROR_NOT_FOUND as i32),
-            0,
-        );
-        let kind = CompletionAnomalyKind::cancel_ack_target_still_active(
-            snapshot.index,
-            snapshot.generation,
-            snapshot.state,
-        );
-        let attach = AnomalyAttach::from_raw_completion(raw);
-        let _ = self.accept_completion_anomaly(kind, attach)?;
-        Ok(Some(kind))
+        Err(IocpError::InvalidState
+            .report(
+                "record_cancel_not_found_if_target_active",
+                "Cancel Request returned NotFound but target slot is still active",
+            )
+            .with_ctx("expected_index", token.index())
+            .with_ctx("expected_generation", token.generation())
+            .with_ctx("actual_index", snapshot.index)
+            .with_ctx("actual_generation", snapshot.generation)
+            .with_ctx("slot_state", format!("{:?}", snapshot.state))
+            .attach_note(
+                "The kernel confirmed that the cancellation request returned ERROR_NOT_FOUND \
+                 (indicating the operation was already completed or not found in the kernel queue), \
+                 but the corresponding user-space I/O slot is still marked as active (in-flight). \
+                 This violates internal state invariants."
+            ))
     }
 
     fn record_cancel_target_gone(&self, reason: CancelTargetGoneReason) {

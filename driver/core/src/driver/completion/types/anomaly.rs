@@ -10,9 +10,7 @@ pub enum CompletionAnomalyReason {
     UnknownSlot,
     StaleGeneration,
     NonActiveSlot,
-    CompletionKeyMismatch,
     FinalizeFailed,
-    CancelAckTargetStillActive,
     BackendContextUnknown,
     BackendSpecific(u16),
 }
@@ -24,9 +22,7 @@ pub enum ControlAnomalyReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotIssueReason {
-    CompletionKeyMismatch,
     FinalizeFailed,
-    CancelAckTargetStillActive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

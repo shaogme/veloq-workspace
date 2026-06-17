@@ -507,36 +507,32 @@ impl<'a> UringDriver<'a> {
             _ => None,
         };
 
-        let Some((snapshot, message)) = active_target else {
+        let Some((snapshot, _message)) = active_target else {
             return Ok(());
         };
 
         self.completion_diagnostics
             .backend()
             .inc_cancel_ack_enoent_active();
-        let target_raw = RawCompletion::new(
-            COMP_BACKEND_URING,
-            CompletionToken::user(request.target),
-            raw.res,
-            raw.flags,
-        );
-        let kind = CompletionAnomalyKind::cancel_ack_target_still_active(
-            snapshot.index,
-            snapshot.generation,
-            snapshot.state,
-        );
-        let attach = AnomalyAttach::from_raw_completion(target_raw);
-        let _ = self.accept_completion_anomaly_kind(kind, attach)?;
-        debug!(
-            cancel_id = cancel_id.raw(),
-            request = ?request,
-            user_data = snapshot.index,
-            generation = snapshot.generation,
-            state = ?snapshot.state,
-            note = message,
-            "async cancel returned ENOENT while target is still active"
-        );
-        Ok(())
+        Err(UringError::InvalidState
+            .report(
+                "record_cancel_enoent_if_target_active",
+                "io_uring cancel returned ENOENT but target slot is still active",
+            )
+            .with_ctx("cancel_id", cancel_id.raw())
+            .with_ctx("expected_index", request.target.index())
+            .with_ctx("expected_generation", request.target.generation())
+            .with_ctx("actual_index", snapshot.index)
+            .with_ctx("actual_generation", snapshot.generation)
+            .with_ctx("slot_state", format!("{:?}", snapshot.state))
+            .with_ctx("raw_cqe_res", raw.res)
+            .with_ctx("raw_cqe_flags", raw.flags)
+            .attach_note(
+                "The io_uring asynchronous cancel operation completed with -ENOENT (indicating \
+                 the operation was not found in kernel's pending queue), but the corresponding \
+                 user-space I/O slot remains active (InFlightWaiting or InFlightOrphaned). \
+                 This state mismatch indicates a potential memory leak or race condition.",
+            ))
     }
 }
 

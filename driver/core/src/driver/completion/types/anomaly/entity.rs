@@ -193,21 +193,6 @@ impl CompletionAnomaly {
         )
     }
 
-    pub fn completion_key_mismatch(
-        token: CompletionToken,
-        index: usize,
-        generation: u32,
-        state: slot::SlotState,
-    ) -> Self {
-        Self::slot_state(
-            CompletionAnomalyReason::CompletionKeyMismatch,
-            token,
-            index,
-            generation,
-            state,
-        )
-    }
-
     pub fn finalize_failed(
         token: CompletionToken,
         index: usize,
@@ -216,21 +201,6 @@ impl CompletionAnomaly {
     ) -> Self {
         Self::slot_state(
             CompletionAnomalyReason::FinalizeFailed,
-            token,
-            index,
-            generation,
-            state,
-        )
-    }
-
-    pub fn cancel_ack_target_still_active(
-        token: CompletionToken,
-        index: usize,
-        generation: u32,
-        state: slot::SlotState,
-    ) -> Self {
-        Self::slot_state(
-            CompletionAnomalyReason::CancelAckTargetStillActive,
             token,
             index,
             generation,

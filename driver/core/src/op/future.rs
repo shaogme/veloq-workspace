@@ -150,9 +150,7 @@ fn lost_reason_from_anomaly(reason: CompletionAnomalyReason) -> LostReason {
         CompletionAnomalyReason::StaleGeneration => LostReason::GenerationMismatch,
         CompletionAnomalyReason::UnknownSlot
         | CompletionAnomalyReason::NonActiveSlot
-        | CompletionAnomalyReason::CompletionKeyMismatch
         | CompletionAnomalyReason::FinalizeFailed
-        | CompletionAnomalyReason::CancelAckTargetStillActive
         | CompletionAnomalyReason::BackendContextUnknown
         | CompletionAnomalyReason::BackendSpecific(_) => LostReason::Other,
     }

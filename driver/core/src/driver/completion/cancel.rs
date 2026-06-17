@@ -35,7 +35,6 @@ pub enum CancelSubmitOutcome {
     Queued,
     CompletedLocally,
     TargetGone { reason: CancelTargetGoneReason },
-    DiagnosticOnly { kind: CompletionAnomalyKind },
     NoBackendHandle,
 }
 
@@ -86,9 +85,7 @@ pub fn cancel_target_kind<'a, Spec: slot::SlotSpec>(
         CompletionAnomalyReason::StaleGeneration => CancelTargetGoneReason::Stale,
         CompletionAnomalyReason::UnknownSlot
         | CompletionAnomalyReason::NonActiveSlot
-        | CompletionAnomalyReason::CompletionKeyMismatch
         | CompletionAnomalyReason::FinalizeFailed
-        | CompletionAnomalyReason::CancelAckTargetStillActive
         | CompletionAnomalyReason::BackendContextUnknown
         | CompletionAnomalyReason::BackendSpecific(_) => CancelTargetGoneReason::Missing,
     };

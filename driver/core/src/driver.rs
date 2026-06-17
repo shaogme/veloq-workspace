@@ -342,7 +342,6 @@ pub struct CancelDrainOutcome {
     pub target_missing: u64,
     pub target_stale: u64,
     pub target_corrupt: u64,
-    pub diagnostic_only: u64,
     pub no_backend_handle: u64,
 }
 
@@ -370,9 +369,6 @@ impl CancelDrainOutcome {
                     self.target_corrupt = self.target_corrupt.saturating_add(1);
                 }
             },
-            CancelSubmitOutcome::DiagnosticOnly { kind: _ } => {
-                self.diagnostic_only = self.diagnostic_only.saturating_add(1);
-            }
             CancelSubmitOutcome::NoBackendHandle => {
                 self.no_backend_handle = self.no_backend_handle.saturating_add(1);
             }

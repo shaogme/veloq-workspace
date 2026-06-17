@@ -136,9 +136,7 @@ where
             CompletionAnomalyReason::UnknownSlot | CompletionAnomalyReason::NonActiveSlot => {
                 self.inc_unknown_completion()
             }
-            CompletionAnomalyReason::CompletionKeyMismatch
-            | CompletionAnomalyReason::FinalizeFailed
-            | CompletionAnomalyReason::CancelAckTargetStillActive
+            CompletionAnomalyReason::FinalizeFailed
             | CompletionAnomalyReason::BackendContextUnknown
             | CompletionAnomalyReason::BackendSpecific(_) => self.inc_internal_unknown(),
             CompletionAnomalyReason::StaleGeneration => self.inc_stale_completion(),

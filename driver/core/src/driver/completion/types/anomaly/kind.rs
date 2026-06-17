@@ -56,38 +56,12 @@ impl CompletionAnomalyKind {
         }
     }
 
-    pub const fn completion_key_mismatch(
-        index: usize,
-        generation: u32,
-        state: slot::SlotState,
-    ) -> Self {
-        Self::slot_issue(
-            SlotIssueReason::CompletionKeyMismatch,
-            index,
-            generation,
-            state,
-        )
-    }
-
     pub const fn finalize_failed(index: usize, generation: u32, state: slot::SlotState) -> Self {
         Self::slot_issue(SlotIssueReason::FinalizeFailed, index, generation, state)
     }
 
     pub const fn finalize_failed_snapshot(snapshot: slot::SlotSnapshot) -> Self {
         Self::slot_issue_with_snapshot(SlotIssueReason::FinalizeFailed, snapshot)
-    }
-
-    pub const fn cancel_ack_target_still_active(
-        index: usize,
-        generation: u32,
-        state: slot::SlotState,
-    ) -> Self {
-        Self::slot_issue(
-            SlotIssueReason::CancelAckTargetStillActive,
-            index,
-            generation,
-            state,
-        )
     }
 
     pub const fn backend_context_unknown() -> Self {
@@ -162,13 +136,7 @@ impl CompletionAnomalyKind {
             Self::Stale { .. } => CompletionAnomalyReason::StaleGeneration,
             Self::NonActive { .. } => CompletionAnomalyReason::NonActiveSlot,
             Self::SlotIssue { reason, .. } => match reason {
-                SlotIssueReason::CompletionKeyMismatch => {
-                    CompletionAnomalyReason::CompletionKeyMismatch
-                }
                 SlotIssueReason::FinalizeFailed => CompletionAnomalyReason::FinalizeFailed,
-                SlotIssueReason::CancelAckTargetStillActive => {
-                    CompletionAnomalyReason::CancelAckTargetStillActive
-                }
             },
             Self::Control { reason } => match reason {
                 ControlAnomalyReason::BackendContextUnknown => {
@@ -313,16 +281,8 @@ impl CompletionAnomalyKind {
                 snapshot,
             } => {
                 let mut anomaly = match reason {
-                    SlotIssueReason::CompletionKeyMismatch => {
-                        CompletionAnomaly::completion_key_mismatch(token, index, generation, state)
-                    }
                     SlotIssueReason::FinalizeFailed => {
                         CompletionAnomaly::finalize_failed(token, index, generation, state)
-                    }
-                    SlotIssueReason::CancelAckTargetStillActive => {
-                        CompletionAnomaly::cancel_ack_target_still_active(
-                            token, index, generation, state,
-                        )
                     }
                 };
                 if let Some(snapshot) = snapshot {
