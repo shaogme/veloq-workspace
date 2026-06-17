@@ -16,7 +16,8 @@ use veloq_driver_uring::{
 };
 
 fn new_driver_or_skip() -> Option<UringDriver<'static>> {
-    match UringDriver::new(UringConfig::default(), Box::new(NoopRegistrar)) {
+    static REGISTRAR: NoopRegistrar = NoopRegistrar;
+    match UringDriver::new(UringConfig::default(), &REGISTRAR) {
         Ok(driver) => Some(driver),
         Err(report) => {
             eprintln!("skipping uring test: {report}");
@@ -30,7 +31,8 @@ fn new_driver_with_entries_or_skip(entries: u32) -> Option<UringDriver<'static>>
         entries: NonZeroU32::new(entries).unwrap(),
         ..UringConfig::default()
     };
-    match UringDriver::new(config, Box::new(NoopRegistrar)) {
+    static REGISTRAR: NoopRegistrar = NoopRegistrar;
+    match UringDriver::new(config, &REGISTRAR) {
         Ok(driver) => Some(driver),
         Err(report) => {
             eprintln!("skipping uring test with {entries} entries: {report}");
