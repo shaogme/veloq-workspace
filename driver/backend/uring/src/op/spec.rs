@@ -8,8 +8,8 @@ use crate::{
     op::{
         Accept, Close, Connect, Fallocate, FallocateRaw, Fsync, FsyncRaw, OpSend, OpVTable, Open,
         ReadFixed, ReadRaw, Recv, SendTo, SubmissionStrategy, SyncFileRange, SyncFileRangeRaw,
-        Timeout, UdpConnect, UdpRecv, UdpRecvFrom, UdpSend, UringKernelOp, UringOp, UringOpPayload,
-        UringUserPayload, Wakeup, WriteFixed, WriteRaw, payload, submit,
+        Timeout, UdpConnect, UdpRecv, UdpRecvFrom, UdpSend, UringKernelOp, UringOpPayload,
+        UringSlotSpec, UringUserPayload, Wakeup, WriteFixed, WriteRaw, payload, submit,
     },
 };
 use io_uring::squeue;
@@ -247,13 +247,10 @@ macro_rules! impl_uring_op_erasure {
             }
         }
 
-        impl IntoPlatformOp<UringOp> for $OpType {
+        impl IntoPlatformOp<UringSlotSpec> for $OpType {
             type UserPayload = $OpType;
-            type ErasedPayload = UringUserPayload;
             type Output = $OpType;
             type Completion = $completion;
-            type DriverCompletion = usize;
-            type Error = UringError;
 
             const PAYLOAD_KIND: OpKind = <$OpType as UringOpSpec>::PAYLOAD_KIND;
 

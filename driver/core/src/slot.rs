@@ -1,7 +1,8 @@
 use crate::{
     DriverCoreError, DriverError, DriverResult, SlotSidecar,
     driver::{
-        DriverCompletionDiagnosticsBackend, OpToken, OpTokenError, PlatformOp, registry::OpRegistry,
+        CompletionValue, DriverCompletionDiagnosticsBackend, OpToken, OpTokenError, PlatformOp,
+        registry::OpRegistry,
     },
 };
 use diagweave::prelude::*;
@@ -14,7 +15,7 @@ pub trait SlotSpec {
     type PlatformData: Default;
     type Sidecar: SlotSidecar;
     type Error: DriverError;
-    type Completion;
+    type Completion: CompletionValue;
     type CompletionDiagnostics: DriverCompletionDiagnosticsBackend;
 }
 

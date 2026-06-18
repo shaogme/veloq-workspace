@@ -1,7 +1,6 @@
 use crate::{
-    BorrowedRawHandle, DriverError, DriverReport, DriverResult, IoFd, OwnedRawHandle,
-    RawHandleMeta, SlotSidecar,
-    slot::{self, SlotSpec as CoreSlotSpec},
+    BorrowedRawHandle, DriverReport, DriverResult, IoFd, OwnedRawHandle, RawHandleMeta,
+    slot::{self, SlotError, SlotOp, SlotPayload, SlotSpec as CoreSlotSpec},
 };
 use std::{
     error::Error,
@@ -105,15 +104,18 @@ impl<'a, D: Driver + ?Sized> ReservedOpSlot<'a, D> {
         self.driver.remote_cancel_sender()
     }
 
-    pub fn create_waker(&self) -> Arc<dyn RemoteWaker<D::Error>> {
+    pub fn create_waker(&self) -> Arc<dyn RemoteWaker<SlotError<D::SlotSpec>>> {
         self.driver.create_waker()
     }
 
-    pub fn set_payload(&mut self, payload: D::UP) {
+    pub fn set_payload(&mut self, payload: SlotPayload<D::SlotSpec>) {
         self.driver.slot_set_payload_raw(self.token, payload);
     }
 
-    pub fn submit(&mut self, op_in: &mut Option<D::Op>) -> DriverSubmitResult<D::Error> {
+    pub fn submit(
+        &mut self,
+        op_in: &mut Option<SlotOp<D::SlotSpec>>,
+    ) -> DriverSubmitResult<SlotError<D::SlotSpec>> {
         self.driver.submit_op_raw(self.token, op_in)
     }
 
@@ -122,7 +124,7 @@ impl<'a, D: Driver + ?Sized> ReservedOpSlot<'a, D> {
         SubmittedOpSlot { token: self.token }
     }
 
-    pub fn recover_payload(mut self) -> Option<D::UP> {
+    pub fn recover_payload(mut self) -> Option<SlotPayload<D::SlotSpec>> {
         let payload = self.driver.slot_take_payload_raw(self.token);
         self.driver.release_op_slot_raw(self.token);
         self.release_on_drop = false;
@@ -139,24 +141,13 @@ impl<D: Driver + ?Sized> Drop for ReservedOpSlot<'_, D> {
 }
 
 pub trait Driver {
-    type Op: PlatformOp;
-    type UP: Send;
+    type SlotSpec: CoreSlotSpec;
     type Raw: RawHandleMeta;
-    type Sidecar: SlotSidecar;
-    type Completion: CompletionValue;
-    type Error: DriverError;
-    type SlotSpec: CoreSlotSpec<
-            Op = Self::Op,
-            UserPayload = Self::UP,
-            Sidecar = Self::Sidecar,
-            Error = Self::Error,
-            Completion = Self::Completion,
-        >;
 
     #[doc(hidden)]
-    fn reserve_op_raw(&mut self) -> DriverResult<OpToken, Self::Error>;
+    fn reserve_op_raw(&mut self) -> DriverResult<OpToken, SlotError<Self::SlotSpec>>;
 
-    fn reserve_op(&mut self) -> DriverResult<ReservedOpSlot<'_, Self>, Self::Error>
+    fn reserve_op(&mut self) -> DriverResult<ReservedOpSlot<'_, Self>, SlotError<Self::SlotSpec>>
     where
         Self: Sized,
     {
@@ -172,10 +163,10 @@ pub trait Driver {
     fn try_recv_remote_cancel_request(&mut self) -> Option<CancelRequest>;
 
     #[doc(hidden)]
-    fn slot_set_payload_raw(&mut self, token: OpToken, payload: Self::UP);
+    fn slot_set_payload_raw(&mut self, token: OpToken, payload: SlotPayload<Self::SlotSpec>);
 
     #[doc(hidden)]
-    fn slot_take_payload_raw(&mut self, token: OpToken) -> Option<Self::UP>;
+    fn slot_take_payload_raw(&mut self, token: OpToken) -> Option<SlotPayload<Self::SlotSpec>>;
 
     #[doc(hidden)]
     fn release_op_slot_raw(&mut self, token: OpToken);
@@ -184,10 +175,10 @@ pub trait Driver {
     fn submit_op_raw(
         &mut self,
         token: OpToken,
-        op_in: &mut Option<Self::Op>,
-    ) -> DriverSubmitResult<Self::Error>;
+        op_in: &mut Option<SlotOp<Self::SlotSpec>>,
+    ) -> DriverSubmitResult<SlotError<Self::SlotSpec>>;
 
-    fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome, Self::Error>;
+    fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome, SlotError<Self::SlotSpec>>;
 
     fn completion_table(&self) -> SharedCompletionTable<Self::SlotSpec>;
 
@@ -202,25 +193,28 @@ pub trait Driver {
     fn cancel_op(
         &mut self,
         request: CancelRequest,
-    ) -> DriverResult<CancelSubmitOutcome, Self::Error>;
+    ) -> DriverResult<CancelSubmitOutcome, SlotError<Self::SlotSpec>>;
 
     fn register_chunk(
         &mut self,
         id: ChunkId,
         ptr: *const u8,
         len: usize,
-    ) -> DriverResult<(), Self::Error>;
+    ) -> DriverResult<(), SlotError<Self::SlotSpec>>;
 
     fn register_files<'f>(
         &mut self,
         files: Vec<RegisterFd<'f, Self::Raw>>,
-    ) -> DriverResult<Vec<IoFd>, Self::Error>;
+    ) -> DriverResult<Vec<IoFd>, SlotError<Self::SlotSpec>>;
 
-    fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<(), Self::Error>;
+    fn unregister_files(&mut self, files: Vec<IoFd>)
+    -> DriverResult<(), SlotError<Self::SlotSpec>>;
 
-    fn create_waker(&self) -> Arc<dyn RemoteWaker<Self::Error>>;
+    fn create_waker(&self) -> Arc<dyn RemoteWaker<SlotError<Self::SlotSpec>>>;
 
-    fn drain_cancel_requests(&mut self) -> DriverResult<CancelDrainOutcome, Self::Error> {
+    fn drain_cancel_requests(
+        &mut self,
+    ) -> DriverResult<CancelDrainOutcome, SlotError<Self::SlotSpec>> {
         let mut outcome = CancelDrainOutcome::default();
         while let Some(request) = self.try_recv_remote_cancel_request() {
             let submit_outcome = self.cancel_op(request)?;
@@ -252,15 +246,10 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> RuntimeContex
 impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
     for RuntimeContextDriver<'a, D, P>
 {
-    type Op = D::Op;
-    type UP = D::UP;
-    type Raw = D::Raw;
-    type Sidecar = D::Sidecar;
-    type Completion = D::Completion;
-    type Error = D::Error;
     type SlotSpec = D::SlotSpec;
+    type Raw = D::Raw;
 
-    fn reserve_op_raw(&mut self) -> DriverResult<OpToken, Self::Error> {
+    fn reserve_op_raw(&mut self) -> DriverResult<OpToken, SlotError<Self::SlotSpec>> {
         self.provider.with_driver_mut(|d| d.reserve_op_raw())
     }
 
@@ -277,12 +266,12 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
             .with_driver_mut(|d| d.try_recv_remote_cancel_request())
     }
 
-    fn slot_set_payload_raw(&mut self, token: OpToken, payload: Self::UP) {
+    fn slot_set_payload_raw(&mut self, token: OpToken, payload: SlotPayload<Self::SlotSpec>) {
         self.provider
             .with_driver_mut(|d| d.slot_set_payload_raw(token, payload))
     }
 
-    fn slot_take_payload_raw(&mut self, token: OpToken) -> Option<Self::UP> {
+    fn slot_take_payload_raw(&mut self, token: OpToken) -> Option<SlotPayload<Self::SlotSpec>> {
         self.provider
             .with_driver_mut(|d| d.slot_take_payload_raw(token))
     }
@@ -295,13 +284,13 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
     fn submit_op_raw(
         &mut self,
         token: OpToken,
-        op_in: &mut Option<Self::Op>,
-    ) -> DriverSubmitResult<Self::Error> {
+        op_in: &mut Option<SlotOp<Self::SlotSpec>>,
+    ) -> DriverSubmitResult<SlotError<Self::SlotSpec>> {
         self.provider
             .with_driver_mut(|d| d.submit_op_raw(token, op_in))
     }
 
-    fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome, Self::Error> {
+    fn drive(&mut self, mode: DriveMode) -> DriverResult<DriveOutcome, SlotError<Self::SlotSpec>> {
         self.provider.with_driver_mut(|d| d.drive(mode))
     }
 
@@ -312,7 +301,7 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
     fn cancel_op(
         &mut self,
         request: CancelRequest,
-    ) -> DriverResult<CancelSubmitOutcome, Self::Error> {
+    ) -> DriverResult<CancelSubmitOutcome, SlotError<Self::SlotSpec>> {
         self.provider.with_driver_mut(|d| d.cancel_op(request))
     }
 
@@ -321,7 +310,7 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
         id: ChunkId,
         ptr: *const u8,
         len: usize,
-    ) -> DriverResult<(), Self::Error> {
+    ) -> DriverResult<(), SlotError<Self::SlotSpec>> {
         self.provider
             .with_driver_mut(|d| d.register_chunk(id, ptr, len))
     }
@@ -329,19 +318,24 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> Driver
     fn register_files<'f>(
         &mut self,
         files: Vec<RegisterFd<'f, Self::Raw>>,
-    ) -> DriverResult<Vec<IoFd>, Self::Error> {
+    ) -> DriverResult<Vec<IoFd>, SlotError<Self::SlotSpec>> {
         self.provider.with_driver_mut(|d| d.register_files(files))
     }
 
-    fn unregister_files(&mut self, files: Vec<IoFd>) -> DriverResult<(), Self::Error> {
+    fn unregister_files(
+        &mut self,
+        files: Vec<IoFd>,
+    ) -> DriverResult<(), SlotError<Self::SlotSpec>> {
         self.provider.with_driver_mut(|d| d.unregister_files(files))
     }
 
-    fn create_waker(&self) -> Arc<dyn RemoteWaker<Self::Error>> {
+    fn create_waker(&self) -> Arc<dyn RemoteWaker<SlotError<Self::SlotSpec>>> {
         self.provider.with_driver_ref(|d| d.create_waker())
     }
 
-    fn drain_cancel_requests(&mut self) -> DriverResult<CancelDrainOutcome, Self::Error> {
+    fn drain_cancel_requests(
+        &mut self,
+    ) -> DriverResult<CancelDrainOutcome, SlotError<Self::SlotSpec>> {
         self.provider.with_driver_mut(|d| d.drain_cancel_requests())
     }
 }

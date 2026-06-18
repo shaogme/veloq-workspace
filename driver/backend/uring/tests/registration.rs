@@ -12,7 +12,7 @@ use veloq_driver_core::op::{
 };
 use veloq_driver_uring::{
     IoFd, OwnedRawHandle, RawHandle, UringConfig, UringDriver, UringError, UringOp, UringRawHandle,
-    UringResult, UringUserPayload,
+    UringResult, UringSlotSpec, UringUserPayload,
 };
 
 fn new_driver_or_skip() -> Option<UringDriver<'static>> {
@@ -100,9 +100,7 @@ fn stale_registered_fd_generation_rejected_on_submit() {
     let (uring_kernel, payload) = op.into_kernel_and_payload();
     let mut uring_op: Option<UringOp> = Some(uring_kernel);
     let mut slot = driver.reserve_op().expect("reserve op failed");
-    slot.set_payload(<Fsync as IntoPlatformOp<UringOp>>::payload_into_erased(
-        payload,
-    ));
+    slot.set_payload(<Fsync as IntoPlatformOp<UringSlotSpec>>::payload_into_erased(payload));
 
     match slot.submit(&mut uring_op) {
         DriverSubmitResult::Failed {
@@ -239,12 +237,7 @@ fn submit_test_op<T>(
     data: T,
 ) -> veloq_driver_core::driver::OpToken
 where
-    T: IntoPlatformOp<
-            UringOp,
-            DriverCompletion = usize,
-            ErasedPayload = UringUserPayload,
-            Error = UringError,
-        >,
+    T: IntoPlatformOp<UringSlotSpec>,
 {
     let (uring_kernel, payload) = data.into_kernel_and_payload();
     let mut uring_op: Option<UringOp> = Some(uring_kernel);
@@ -296,9 +289,7 @@ fn close_owned_registered_file() {
     let (uring_kernel, payload) = op.into_kernel_and_payload();
     let mut uring_op: Option<UringOp> = Some(uring_kernel);
     let mut slot = driver.reserve_op().expect("reserve op failed");
-    slot.set_payload(<Fsync as IntoPlatformOp<UringOp>>::payload_into_erased(
-        payload,
-    ));
+    slot.set_payload(<Fsync as IntoPlatformOp<UringSlotSpec>>::payload_into_erased(payload));
 
     match slot.submit(&mut uring_op) {
         DriverSubmitResult::Failed {
@@ -341,9 +332,7 @@ fn close_borrowed_registered_file_is_rejected() {
     let (uring_kernel, payload) = op.into_kernel_and_payload();
     let mut uring_op: Option<UringOp> = Some(uring_kernel);
     let mut slot = driver.reserve_op().expect("reserve op failed");
-    slot.set_payload(<Close as IntoPlatformOp<UringOp>>::payload_into_erased(
-        payload,
-    ));
+    slot.set_payload(<Close as IntoPlatformOp<UringSlotSpec>>::payload_into_erased(payload));
 
     match slot.submit(&mut uring_op) {
         DriverSubmitResult::Failed {

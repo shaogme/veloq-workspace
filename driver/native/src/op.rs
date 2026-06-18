@@ -14,6 +14,7 @@ pub use veloq_driver_core::{
             UdpRecvPacket, UdpRecvPacketBuf, UdpSend, Wakeup, WriteFixed, WriteRaw,
         },
     },
+    slot::{SlotCompletion, SlotError, SlotOp, SlotPayload},
 };
 
 #[cfg(unix)]
@@ -27,46 +28,23 @@ pub type Connect = CoreConnect<SockAddrStorage>;
 pub type Accept = CoreAccept<SockAddrStorage>;
 
 pub trait OpSubmitter<'a, P: DriverProvider>: Clone + StdSend + Sync {
-    type Future<
-        T: IntoPlatformOp<
-                P::Op,
-                DriverCompletion = P::Completion,
-                ErasedPayload = P::UP,
-                Error = P::Error,
-            >
-            + StdSend,
-    >: Future<Output = OpResult<T::Output, P::Error, <T as IntoPlatformOp<P::Op>>::Completion>>;
+    type Future<T: IntoPlatformOp<P::SlotSpec> + StdSend>: Future<
+        Output = OpResult<T::Output, SlotError<P::SlotSpec>, T::Completion>,
+    >;
 
     fn submit<T>(&self, op: Op<T>, provider: P) -> Self::Future<T>
     where
-        T: IntoPlatformOp<
-                P::Op,
-                DriverCompletion = P::Completion,
-                ErasedPayload = P::UP,
-                Error = P::Error,
-            > + StdSend;
+        T: IntoPlatformOp<P::SlotSpec> + StdSend;
 
     fn from_current_context() -> Self;
 }
 
 impl<'a, P: DriverProvider> OpSubmitter<'a, P> for LocalSubmitter<P> {
-    type Future<
-        T: IntoPlatformOp<
-                P::Op,
-                DriverCompletion = P::Completion,
-                ErasedPayload = P::UP,
-                Error = P::Error,
-            > + StdSend,
-    > = LocalOp<'a, T, P>;
+    type Future<T: IntoPlatformOp<P::SlotSpec> + StdSend> = LocalOp<'a, T, P>;
 
     fn submit<T>(&self, op: Op<T>, provider: P) -> LocalOp<'a, T, P>
     where
-        T: IntoPlatformOp<
-                P::Op,
-                DriverCompletion = P::Completion,
-                ErasedPayload = P::UP,
-                Error = P::Error,
-            > + StdSend,
+        T: IntoPlatformOp<P::SlotSpec> + StdSend,
     {
         <LocalSubmitter<P> as CoreOpSubmitter<'a, P>>::submit(self, op, provider)
     }
@@ -77,23 +55,11 @@ impl<'a, P: DriverProvider> OpSubmitter<'a, P> for LocalSubmitter<P> {
 }
 
 impl<'a, P: DriverProvider> OpSubmitter<'a, P> for DetachedSubmitter {
-    type Future<
-        T: IntoPlatformOp<
-                P::Op,
-                DriverCompletion = P::Completion,
-                ErasedPayload = P::UP,
-                Error = P::Error,
-            > + StdSend,
-    > = DetachedOp<T, P::SlotSpec>;
+    type Future<T: IntoPlatformOp<P::SlotSpec> + StdSend> = DetachedOp<T, P::SlotSpec>;
 
     fn submit<T>(&self, op: Op<T>, provider: P) -> Self::Future<T>
     where
-        T: IntoPlatformOp<
-                P::Op,
-                DriverCompletion = P::Completion,
-                ErasedPayload = P::UP,
-                Error = P::Error,
-            > + StdSend,
+        T: IntoPlatformOp<P::SlotSpec> + StdSend,
     {
         <DetachedSubmitter as CoreOpSubmitter<'a, P>>::submit(self, op, provider)
     }

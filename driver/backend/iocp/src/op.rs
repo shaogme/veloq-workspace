@@ -222,13 +222,10 @@ macro_rules! impl_iocp_op_erasure {
             }
         }
 
-        impl IntoPlatformOp<IocpOp> for $OpType {
+        impl IntoPlatformOp<IocpSlotSpec> for $OpType {
             type UserPayload = $OpType;
-            type ErasedPayload = IocpUserPayload;
             type Output = $OpType;
             type Completion = $completion;
-            type DriverCompletion = usize;
-            type Error = IocpError;
 
             const PAYLOAD_KIND: OpKind = <$OpType as IocpOpSpec>::PAYLOAD_KIND;
 

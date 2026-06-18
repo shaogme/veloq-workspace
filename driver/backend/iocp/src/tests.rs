@@ -20,7 +20,7 @@ use veloq_driver_core::{
 use crate::{
     driver::IocpDriver,
     error::{IocpError, IocpResult, iocp_report_to_event_res},
-    op::{IocpOp, IocpSlotSpec, IocpUserPayload},
+    op::IocpSlotSpec,
 };
 
 pub(crate) fn remote_free_contains(driver: &IocpDriver, needle: usize) -> bool {
@@ -29,14 +29,9 @@ pub(crate) fn remote_free_contains(driver: &IocpDriver, needle: usize) -> bool {
 
 pub(crate) fn submit_test_op<T>(driver: &mut IocpDriver, data: T) -> OpToken
 where
-    T: IntoPlatformOp<
-            IocpOp,
-            DriverCompletion = usize,
-            ErasedPayload = IocpUserPayload,
-            Error = IocpError,
-        >,
+    T: IntoPlatformOp<IocpSlotSpec>,
 {
-    let (iocp_kernel, payload) = IntoPlatformOp::<IocpOp>::into_kernel_and_payload(data);
+    let (iocp_kernel, payload) = IntoPlatformOp::<IocpSlotSpec>::into_kernel_and_payload(data);
     let mut iocp_op = Some(iocp_kernel);
     let mut slot = driver.reserve_op().expect("reserve op failed");
     slot.set_payload(T::payload_into_erased(payload));
@@ -55,12 +50,7 @@ pub(crate) fn complete_from_record<T>(
     record: CompletionRecord<IocpSlotSpec>,
 ) -> OpCompletion<T::Output, IocpError, T::Completion>
 where
-    T: IntoPlatformOp<
-            IocpOp,
-            DriverCompletion = usize,
-            ErasedPayload = IocpUserPayload,
-            Error = IocpError,
-        >,
+    T: IntoPlatformOp<IocpSlotSpec>,
 {
     let CompletionRecord {
         event,

@@ -25,7 +25,7 @@ use crate::{
     diagnostics::IocpCompletionDiagnostics,
     error::IocpError,
     ext::Extensions,
-    op::{IocpOp, IocpOpPayload, IocpOpRegistry, IocpSlotSpec, IocpUserPayload, OverlappedEntry},
+    op::{IocpOp, IocpOpPayload, IocpOpRegistry, IocpSlotSpec, IocpUserPayload},
     win32::IoCompletionPort,
 };
 
@@ -131,13 +131,8 @@ impl<'a> IocpDriver<'a> {
 }
 
 impl<'a> Driver for IocpDriver<'a> {
-    type Op = IocpOp;
-    type UP = IocpUserPayload;
-    type Raw = IocpHandle;
-    type Sidecar = OverlappedEntry;
-    type Completion = usize;
-    type Error = IocpError;
     type SlotSpec = IocpSlotSpec;
+    type Raw = IocpHandle;
 
     fn reserve_op_raw(&mut self) -> IocpResult<OpToken> {
         let (user_data, generation) = match self.ops.insert(OpEntry::new(IocpOpState::default())) {
@@ -169,7 +164,7 @@ impl<'a> Driver for IocpDriver<'a> {
         self.remote_cancel_receiver.try_recv().ok()
     }
 
-    fn slot_set_payload_raw(&mut self, token: OpToken, payload: Self::UP) {
+    fn slot_set_payload_raw(&mut self, token: OpToken, payload: IocpUserPayload) {
         let _ = self
             .ops
             .with_slot_storage_mut(token, |_result, payload_cell, _sidecar| {
@@ -177,7 +172,7 @@ impl<'a> Driver for IocpDriver<'a> {
             });
     }
 
-    fn slot_take_payload_raw(&mut self, token: OpToken) -> Option<Self::UP> {
+    fn slot_take_payload_raw(&mut self, token: OpToken) -> Option<IocpUserPayload> {
         self.ops
             .with_slot_storage_mut(token, |_result, payload_cell, _sidecar| payload_cell.take())
             .flatten()
@@ -190,8 +185,8 @@ impl<'a> Driver for IocpDriver<'a> {
     fn submit_op_raw(
         &mut self,
         token: OpToken,
-        op_in: &mut Option<Self::Op>,
-    ) -> DriverSubmitResult<Self::Error> {
+        op_in: &mut Option<IocpOp>,
+    ) -> DriverSubmitResult<IocpError> {
         if self.shutting_down {
             return DriverSubmitResult::failed(
                 IocpError::Internal

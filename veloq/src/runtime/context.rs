@@ -6,10 +6,7 @@ use veloq_buf::{
     heap::{ChunkId, ChunkInfo},
 };
 use veloq_driver_native::{
-    driver::{
-        ContextDriverProvider, DriveMode, Driver, PlatformDriver, PlatformOp, PlatformUP,
-        RuntimeContextDriver,
-    },
+    driver::{ContextDriverProvider, DriveMode, Driver, PlatformDriver, RuntimeContextDriver},
     error::{DriverReport, Error as DriverError},
     op::{DetachedSubmitter, DriverProvider, IntoPlatformOp, IoFd, Op, OpSubmitter},
 };
@@ -270,10 +267,6 @@ impl<'rt, 'reg> ContextDriverProvider<PlatformDriver<'reg>> for Ctx<'rt, 'reg> {
 }
 
 impl<'rt, 'reg> DriverProvider for Ctx<'rt, 'reg> {
-    type Op = PlatformOp;
-    type UP = PlatformUP;
-    type Completion = usize;
-    type Error = <PlatformDriver<'reg> as Driver>::Error;
     type SlotSpec = <PlatformDriver<'reg> as Driver>::SlotSpec;
     type Driver<'d>
         = RuntimeContextDriver<'d, PlatformDriver<'reg>, Ctx<'rt, 'reg>>
@@ -356,12 +349,7 @@ impl<'rt, 'reg> Ctx<'rt, 'reg> {
     pub fn submit<'d, S, T>(&self, submitter: &'d S, op: Op<T>) -> S::Future<T>
     where
         S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy + 'd,
-        T: IntoPlatformOp<
-                <PlatformDriver<'reg> as Driver>::Op,
-                DriverCompletion = <PlatformDriver<'reg> as Driver>::Completion,
-                ErasedPayload = <PlatformDriver<'reg> as Driver>::UP,
-                Error = <PlatformDriver<'reg> as Driver>::Error,
-            > + Send,
+        T: IntoPlatformOp<<PlatformDriver<'reg> as Driver>::SlotSpec> + Send,
     {
         self.sync_registrar();
         submitter.submit(op, *self)
@@ -378,19 +366,13 @@ impl<'rt, 'reg> Ctx<'rt, 'reg> {
         op: Op<T>,
     ) -> VeloqResult<(
         Result<
-            <T as IntoPlatformOp<<PlatformDriver<'reg> as Driver>::Op>>::Completion,
+            <T as IntoPlatformOp<<PlatformDriver<'reg> as Driver>::SlotSpec>>::Completion,
             DriverReport<DriverError>,
         >,
         T::Output,
     )>
     where
-        T: IntoPlatformOp<
-                <PlatformDriver<'reg> as Driver>::Op,
-                DriverCompletion = <PlatformDriver<'reg> as Driver>::Completion,
-                ErasedPayload = <PlatformDriver<'reg> as Driver>::UP,
-                Error = <PlatformDriver<'reg> as Driver>::Error,
-            > + Send
-            + 'd + 'reg,
+        T: IntoPlatformOp<<PlatformDriver<'reg> as Driver>::SlotSpec> + Send + 'd + 'reg,
     {
         if self.runtime_ctx.worker_id() == worker_id {
             let (res, op_back) = self

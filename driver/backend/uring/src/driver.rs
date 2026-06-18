@@ -283,13 +283,8 @@ impl<'a> Drop for UringDriver<'a> {
 }
 
 impl<'a> Driver for UringDriver<'a> {
-    type Op = UringOp;
-    type UP = UringUserPayload;
-    type Raw = UringRawHandle;
-    type Sidecar = ();
-    type Completion = usize;
-    type Error = UringError;
     type SlotSpec = UringSlotSpec;
+    type Raw = UringRawHandle;
 
     fn reserve_op_raw(&mut self) -> UringResult<OpToken> {
         match self.ops.insert(OpEntry::new(UringOpState::new())) {
@@ -347,8 +342,8 @@ impl<'a> Driver for UringDriver<'a> {
     fn submit_op_raw(
         &mut self,
         token: OpToken,
-        op_in: &mut Option<Self::Op>,
-    ) -> DriverSubmitResult<Self::Error> {
+        op_in: &mut Option<UringOp>,
+    ) -> DriverSubmitResult<UringError> {
         let Some(op) = op_in.take() else {
             return DriverSubmitResult::failed(
                 UringError::InvalidState

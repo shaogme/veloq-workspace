@@ -20,8 +20,8 @@ use veloq_driver_core::{
         AnomalyAttach, CancelCompletionId, CancelMode, CompletionAnomalyKind, CompletionBackend,
         CompletionBackendHooks, CompletionCleanupGuard, CompletionControl, CompletionEnvelope,
         CompletionFlowExt, CompletionFlowOutcome, CompletionHookOutcome, CompletionIngress,
-        CompletionSource, CompletionToken, Driver, DriverCompletionDiagnostics, OpToken,
-        PlatformOp, RawCompletion, SyntheticCompletionSource, UserCompletionEvent,
+        CompletionSource, Driver, DriverCompletionDiagnostics, OpToken, PlatformOp, RawCompletion,
+        SyntheticCompletionSource, UserCompletionEvent,
     },
     slot::{CheckedSlotView, InFlightOrphaned, InFlightWaiting, SlotRegistryExt, SlotView},
 };
@@ -722,7 +722,7 @@ pub(crate) fn driver_result_to_event_res(res: &UringResult<usize>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use veloq_driver_core::driver::CompletionAnomalyReason;
+    use veloq_driver_core::driver::CompletionToken;
 
     fn test_hooks<'a>(
         diagnostics: &'a DriverCompletionDiagnostics<UringCompletionDiagnostics>,
@@ -782,7 +782,7 @@ mod tests {
 
         let outcome = hooks.handle_cancel_control(cancel_id, raw);
 
-        assert!(outcome.is_err());
-        assert_eq!(*outcome.unwrap_err().inner(), UringError::InvalidState);
+        let err = outcome.err().expect("outcome should be Err");
+        assert_eq!(*err.inner(), UringError::InvalidState);
     }
 }

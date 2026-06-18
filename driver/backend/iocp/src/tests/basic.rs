@@ -1,11 +1,12 @@
 use crate::{
-    IocpError, IocpHandle, IocpOp, IocpUserPayload, OwnedRawHandle, RawHandle, RegisteredHandle,
+    IocpHandle, OwnedRawHandle, RawHandle, RegisteredHandle,
     config::{
         IocpConfig, IocpHandle as ConfigIocpHandle, RawHandle as ConfigRawHandle,
         RegisteredHandle as ConfigRegisteredHandle,
     },
     driver::IocpDriver,
     ext::Extensions,
+    op::IocpSlotSpec,
     tests::{submit_test_op, wait_completion},
 };
 use std::{
@@ -44,12 +45,7 @@ fn init_winsock() -> TestWinsockGuard {
 
 fn submit_expect_void_failure<T>(driver: &mut IocpDriver<'_>, op: T, context: &str)
 where
-    T: IntoPlatformOp<
-            IocpOp,
-            DriverCompletion = usize,
-            ErasedPayload = IocpUserPayload,
-            Error = IocpError,
-        >,
+    T: IntoPlatformOp<IocpSlotSpec>,
 {
     let (iocp_kernel, payload) = op.into_kernel_and_payload();
     let mut iocp_op = Some(iocp_kernel);
@@ -157,9 +153,7 @@ fn test_stale_registered_fd_generation_rejected_on_submit() {
     let (iocp_kernel, payload) = op.into_kernel_and_payload();
     let mut iocp_op = Some(iocp_kernel);
     let mut slot = driver.reserve_op().expect("reserve op failed");
-    slot.set_payload(<Fsync as IntoPlatformOp<IocpOp>>::payload_into_erased(
-        payload,
-    ));
+    slot.set_payload(<Fsync as IntoPlatformOp<IocpSlotSpec>>::payload_into_erased(payload));
 
     match slot.submit(&mut iocp_op) {
         DriverSubmitResult::Failed {

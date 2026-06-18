@@ -12,11 +12,11 @@ use crate::{
     driver::{
         AnomalyAttach, CancelRequest, CompletionAccess, CompletionAnomalyKind,
         CompletionAnomalyReason, CompletionRecord, CompletionToken, CompletionValue, Driver,
-        DriverSubmitResult, OpToken, PlatformOp, PollRecordResult, RemoteCancelSender, RemoteWaker,
+        DriverSubmitResult, OpToken, PollRecordResult, RemoteCancelSender, RemoteWaker,
         SharedCompletionTable, SubmitStatus,
     },
     op::{DriverProvider, IntoPlatformOp, Op},
-    slot::SlotSpec,
+    slot::{SlotError, SlotSpec},
 };
 
 use diagweave::prelude::*;
@@ -202,19 +202,10 @@ where
     E: DriverError,
 {
     #[inline]
-    pub(crate) fn from_completion_record<Op, O, Spec>(record: CompletionRecord<Spec>) -> Poll<Self>
+    pub(crate) fn from_completion_record<Op, Spec>(record: CompletionRecord<Spec>) -> Poll<Self>
     where
         Spec: SlotSpec<Error = E>,
-        O: PlatformOp,
-        Op: IntoPlatformOp<
-                O,
-                Output = T,
-                Completion = R,
-                DriverCompletion = Spec::Completion,
-                ErasedPayload = Spec::UserPayload,
-                Error = E,
-            >,
-        Spec::Completion: CompletionValue,
+        Op: IntoPlatformOp<Spec, Output = T, Completion = R>,
     {
         let CompletionRecord {
             event,
@@ -237,27 +228,16 @@ where
     }
 
     #[inline]
-    pub(crate) fn poll_table_once<Op, O, Spec>(
+    pub(crate) fn poll_table_once<Op, Spec>(
         table: &dyn CompletionAccess<Spec>,
         token: OpToken,
     ) -> Poll<Self>
     where
         Spec: SlotSpec<Error = E>,
-        O: PlatformOp,
-        Op: IntoPlatformOp<
-                O,
-                Output = T,
-                Completion = R,
-                DriverCompletion = Spec::Completion,
-                ErasedPayload = Spec::UserPayload,
-                Error = E,
-            >,
-        Spec::Completion: CompletionValue,
+        Op: IntoPlatformOp<Spec, Output = T, Completion = R>,
     {
         match table.try_take_record(token) {
-            Ok(PollRecordResult::Ready(record)) => {
-                Self::from_completion_record::<Op, O, Spec>(record)
-            }
+            Ok(PollRecordResult::Ready(record)) => Self::from_completion_record::<Op, Spec>(record),
             Ok(PollRecordResult::Unavailable { kind, attach }) => Poll::Ready(Self::ResourceLost(
                 OpError::from_completion_anomaly(kind, attach),
             )),
@@ -273,13 +253,7 @@ type DetachedOpMarker<T, Spec> = (T, Spec);
 pub struct DetachedOp<T, Spec>
 where
     Spec: SlotSpec,
-    Spec::Completion: CompletionValue,
-    T: IntoPlatformOp<
-            Spec::Op,
-            DriverCompletion = Spec::Completion,
-            Error = Spec::Error,
-            ErasedPayload = Spec::UserPayload,
-        >,
+    T: IntoPlatformOp<Spec>,
 {
     pub(crate) completion_table: Option<SharedCompletionTable<Spec>>,
     pub(crate) cancel_sender: Option<RemoteCancelSender>,
@@ -293,26 +267,14 @@ where
 unsafe impl<T, Spec> std::marker::Send for DetachedOp<T, Spec>
 where
     Spec: SlotSpec,
-    Spec::Completion: CompletionValue,
-    T: IntoPlatformOp<
-            Spec::Op,
-            DriverCompletion = Spec::Completion,
-            Error = Spec::Error,
-            ErasedPayload = Spec::UserPayload,
-        > + std::marker::Send,
+    T: IntoPlatformOp<Spec> + std::marker::Send,
 {
 }
 
 impl<T, Spec> Drop for DetachedOp<T, Spec>
 where
     Spec: SlotSpec,
-    Spec::Completion: CompletionValue,
-    T: IntoPlatformOp<
-            Spec::Op,
-            DriverCompletion = Spec::Completion,
-            Error = Spec::Error,
-            ErasedPayload = Spec::UserPayload,
-        >,
+    T: IntoPlatformOp<Spec>,
 {
     fn drop(&mut self) {
         if let Some(token) = self.token {
@@ -334,13 +296,7 @@ where
 impl<T, Spec> Future for DetachedOp<T, Spec>
 where
     Spec: SlotSpec,
-    Spec::Completion: CompletionValue,
-    T: IntoPlatformOp<
-            Spec::Op,
-            DriverCompletion = Spec::Completion,
-            Error = Spec::Error,
-            ErasedPayload = Spec::UserPayload,
-        >,
+    T: IntoPlatformOp<Spec>,
 {
     type Output = OpResult<T::Output, Spec::Error, T::Completion>;
 
@@ -362,14 +318,12 @@ where
         let token = this
             .token
             .expect("DetachedOp missing completion token but no immediate_failure");
-        if let Poll::Ready(result) =
-            Self::Output::poll_table_once::<T, Spec::Op, Spec>(&**table, token)
-        {
+        if let Poll::Ready(result) = Self::Output::poll_table_once::<T, Spec>(&**table, token) {
             return Poll::Ready(result);
         }
 
         table.register_waker(token, cx.waker());
-        Self::Output::poll_table_once::<T, Spec::Op, Spec>(&**table, token)
+        Self::Output::poll_table_once::<T, Spec>(&**table, token)
     }
 }
 
@@ -384,12 +338,7 @@ pub enum LocalState {
 pub struct LocalOp<'a, T, P>
 where
     P: DriverProvider,
-    T: IntoPlatformOp<
-            P::Op,
-            DriverCompletion = P::Completion,
-            ErasedPayload = P::UP,
-            Error = P::Error,
-        >,
+    T: IntoPlatformOp<P::SlotSpec>,
 {
     pub(crate) state: LocalState,
     pub(crate) data: Option<T>,
@@ -401,12 +350,7 @@ where
 impl<'a, T, P> LocalOp<'a, T, P>
 where
     P: DriverProvider,
-    T: IntoPlatformOp<
-            P::Op,
-            DriverCompletion = P::Completion,
-            ErasedPayload = P::UP,
-            Error = P::Error,
-        >,
+    T: IntoPlatformOp<P::SlotSpec>,
 {
     pub fn new(data: T, provider: P) -> Self {
         Self {
@@ -422,14 +366,9 @@ where
 impl<'a, T, P> Future for LocalOp<'a, T, P>
 where
     P: DriverProvider,
-    T: IntoPlatformOp<
-            P::Op,
-            DriverCompletion = P::Completion,
-            ErasedPayload = P::UP,
-            Error = P::Error,
-        >,
+    T: IntoPlatformOp<P::SlotSpec>,
 {
-    type Output = OpResult<T::Output, P::Error, T::Completion>;
+    type Output = OpResult<T::Output, SlotError<P::SlotSpec>, T::Completion>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let op = unsafe { self.get_unchecked_mut() };
@@ -543,7 +482,7 @@ where
                 let mut is_ready = false;
                 let mut ready_val = None;
 
-                match Self::Output::poll_table_once::<T, P::Op, P::SlotSpec>(
+                match Self::Output::poll_table_once::<T, P::SlotSpec>(
                     &*driver.completion_table(),
                     token,
                 ) {
@@ -553,7 +492,7 @@ where
                     }
                     Poll::Pending => {
                         driver.register_completion_waker(token, cx.waker());
-                        match Self::Output::poll_table_once::<T, P::Op, P::SlotSpec>(
+                        match Self::Output::poll_table_once::<T, P::SlotSpec>(
                             &*driver.completion_table(),
                             token,
                         ) {
@@ -593,12 +532,7 @@ where
 impl<'a, T, P> Drop for LocalOp<'a, T, P>
 where
     P: DriverProvider,
-    T: IntoPlatformOp<
-            P::Op,
-            DriverCompletion = P::Completion,
-            ErasedPayload = P::UP,
-            Error = P::Error,
-        >,
+    T: IntoPlatformOp<P::SlotSpec>,
 {
     fn drop(&mut self) {
         if let LocalState::Submitted = self.state
@@ -613,19 +547,13 @@ where
 }
 
 pub trait OpSubmitter<'a, P: DriverProvider>: Clone + std::marker::Send + Sync {
-    type Future<
-        T: IntoPlatformOp<P::Op, DriverCompletion = P::Completion, ErasedPayload = P::UP, Error = P::Error>
-            + std::marker::Send,
-    >: Future<Output = OpResult<T::Output, P::Error, <T as IntoPlatformOp<P::Op>>::Completion>>;
+    type Future<T: IntoPlatformOp<P::SlotSpec> + std::marker::Send>: Future<
+        Output = OpResult<T::Output, SlotError<P::SlotSpec>, T::Completion>,
+    >;
 
     fn submit<T>(&self, op: Op<T>, provider: P) -> Self::Future<T>
     where
-        T: IntoPlatformOp<
-                P::Op,
-                DriverCompletion = P::Completion,
-                ErasedPayload = P::UP,
-                Error = P::Error,
-            > + std::marker::Send;
+        T: IntoPlatformOp<P::SlotSpec> + std::marker::Send;
 
     fn from_current_context() -> Self;
 }
@@ -651,23 +579,11 @@ impl<P> Default for LocalSubmitter<P> {
 }
 
 impl<'a, P: DriverProvider> OpSubmitter<'a, P> for LocalSubmitter<P> {
-    type Future<
-        T: IntoPlatformOp<
-                P::Op,
-                DriverCompletion = P::Completion,
-                ErasedPayload = P::UP,
-                Error = P::Error,
-            > + std::marker::Send,
-    > = LocalOp<'a, T, P>;
+    type Future<T: IntoPlatformOp<P::SlotSpec> + std::marker::Send> = LocalOp<'a, T, P>;
 
     fn submit<T>(&self, op: Op<T>, provider: P) -> LocalOp<'a, T, P>
     where
-        T: IntoPlatformOp<
-                P::Op,
-                DriverCompletion = P::Completion,
-                ErasedPayload = P::UP,
-                Error = P::Error,
-            > + std::marker::Send,
+        T: IntoPlatformOp<P::SlotSpec> + std::marker::Send,
     {
         trace!("Submitting local op");
         op.submit_local(provider)
@@ -694,23 +610,12 @@ impl Default for DetachedSubmitter {
 }
 
 impl<'a, P: DriverProvider> OpSubmitter<'a, P> for DetachedSubmitter {
-    type Future<
-        T: IntoPlatformOp<
-                P::Op,
-                DriverCompletion = P::Completion,
-                ErasedPayload = P::UP,
-                Error = P::Error,
-            > + std::marker::Send,
-    > = DetachedOp<T, <P::Driver<'a> as Driver>::SlotSpec>;
+    type Future<T: IntoPlatformOp<P::SlotSpec> + std::marker::Send> =
+        DetachedOp<T, <P::Driver<'a> as Driver>::SlotSpec>;
 
     fn submit<T>(&self, op: Op<T>, provider: P) -> Self::Future<T>
     where
-        T: IntoPlatformOp<
-                P::Op,
-                DriverCompletion = P::Completion,
-                ErasedPayload = P::UP,
-                Error = P::Error,
-            > + std::marker::Send,
+        T: IntoPlatformOp<P::SlotSpec> + std::marker::Send,
     {
         provider.with_driver(|mut driver| op.submit_detached(&mut driver))
     }

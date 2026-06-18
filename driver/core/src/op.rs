@@ -1,43 +1,28 @@
+mod future;
+pub mod types;
+
+pub use future::*;
+pub use types::OpKind;
+
 use std::marker::{PhantomData, Send};
 
 use tracing::trace;
 
 use crate::{
     DriverCoreError, DriverError, DriverReport, DriverResult, RawHandleMeta,
-    driver::{CompletionValue, Driver, DriverSubmitResult, PlatformOp, SubmitStatus},
-    slot::SlotSpec,
+    driver::{Driver, DriverSubmitResult, SubmitStatus},
+    slot::{SlotCompletion, SlotError, SlotOp, SlotPayload, SlotSpec},
 };
 use diagweave::prelude::*;
 
 pub trait DriverProvider: Clone + Unpin {
-    type Op: PlatformOp;
-    type UP: Send;
-    type Completion: CompletionValue;
-    type Error: DriverError;
-    type SlotSpec: SlotSpec<
-            Op = Self::Op,
-            UserPayload = Self::UP,
-            Completion = Self::Completion,
-            Error = Self::Error,
-        >;
-    type Driver<'a>: Driver<
-            Op = Self::Op,
-            UP = Self::UP,
-            Completion = Self::Completion,
-            Error = Self::Error,
-            SlotSpec = Self::SlotSpec,
-        >
+    type SlotSpec: SlotSpec;
+    type Driver<'a>: Driver<SlotSpec = Self::SlotSpec>
     where
         Self: 'a;
 
     fn with_driver<'a, R>(&'a self, f: impl FnOnce(Self::Driver<'a>) -> R) -> R;
 }
-
-mod future;
-pub mod types;
-
-pub use future::*;
-pub use types::OpKind;
 
 /// Trait for managing the lifecycle of an operation.
 pub trait OpLifecycle: Sized {
@@ -63,27 +48,24 @@ pub trait OpLifecycle: Sized {
 }
 
 /// Trait to convert a user-facing operation to a platform-specific driver operation.
-pub trait IntoPlatformOp<O: PlatformOp>: Sized + Send {
+pub trait IntoPlatformOp<Spec: SlotSpec>: Sized + Send {
     type UserPayload: Send;
-    type ErasedPayload: Send;
     type Output;
     type Completion;
-    type DriverCompletion: CompletionValue;
-    type Error: DriverError;
     const PAYLOAD_KIND: types::OpKind;
 
-    fn into_kernel_and_payload(self) -> (O, Self::UserPayload);
+    fn into_kernel_and_payload(self) -> (SlotOp<Spec>, Self::UserPayload);
 
-    fn payload_into_erased(payload: Self::UserPayload) -> Self::ErasedPayload;
+    fn payload_into_erased(payload: Self::UserPayload) -> SlotPayload<Spec>;
 
     fn try_payload_from_erased(
-        erased: Self::ErasedPayload,
-    ) -> DriverResult<Self::UserPayload, Self::Error>;
+        erased: SlotPayload<Spec>,
+    ) -> DriverResult<Self::UserPayload, SlotError<Spec>>;
 
     fn complete(
         payload: Self::UserPayload,
-        res: DriverResult<Self::DriverCompletion, <Self as IntoPlatformOp<O>>::Error>,
-    ) -> OpCompletion<Self::Output, Self::Error, Self::Completion>;
+        res: DriverResult<SlotCompletion<Spec>, SlotError<Spec>>,
+    ) -> OpCompletion<Self::Output, SlotError<Spec>, Self::Completion>;
 }
 
 #[inline]
@@ -116,12 +98,7 @@ impl<T> Op<T> {
 
     pub fn submit_detached<D>(self, driver: &mut D) -> DetachedOp<T, D::SlotSpec>
     where
-        T: IntoPlatformOp<
-                D::Op,
-                DriverCompletion = D::Completion,
-                ErasedPayload = D::UP,
-                Error = D::Error,
-            > + Send,
+        T: IntoPlatformOp<D::SlotSpec> + Send,
         D: Driver,
     {
         let data = self.data;
@@ -239,12 +216,7 @@ impl<T> Op<T> {
 
     pub fn submit_local<'a, P: DriverProvider>(self, provider: P) -> LocalOp<'a, T, P>
     where
-        T: IntoPlatformOp<
-                P::Op,
-                DriverCompletion = P::Completion,
-                ErasedPayload = P::UP,
-                Error = P::Error,
-            >,
+        T: IntoPlatformOp<P::SlotSpec>,
     {
         LocalOp::new(self.data, provider)
     }

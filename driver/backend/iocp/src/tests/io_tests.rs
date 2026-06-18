@@ -2,7 +2,7 @@ use crate::{
     config::{IoFd, IocpConfig, IocpHandle, RawHandle},
     driver::IocpDriver,
     error::IocpError,
-    op::IocpOp,
+    op::IocpSlotSpec,
     tests::{complete_from_record, submit_test_op, wait_completion, wait_completion_record},
 };
 use std::{
@@ -135,11 +135,11 @@ fn submit_raw_write_result(
         offset,
         buf_offset: 0,
     };
-    let (iocp_kernel, payload) = IntoPlatformOp::<IocpOp>::into_kernel_and_payload(op);
+    let (iocp_kernel, payload) = IntoPlatformOp::<IocpSlotSpec>::into_kernel_and_payload(op);
     let mut iocp_op = Some(iocp_kernel);
     let mut slot = driver.reserve_op().expect("reserve op failed");
     slot.set_payload(
-        <WriteRaw<IocpHandle> as IntoPlatformOp<IocpOp>>::payload_into_erased(payload),
+        <WriteRaw<IocpHandle> as IntoPlatformOp<IocpSlotSpec>>::payload_into_erased(payload),
     );
     slot.submit(&mut iocp_op)
 }
