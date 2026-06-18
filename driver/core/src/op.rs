@@ -9,7 +9,7 @@ use std::marker::{PhantomData, Send};
 use tracing::trace;
 
 use crate::{
-    DriverCoreError, DriverError, DriverReport, DriverResult, RawHandleMeta,
+    DriverCoreError, DriverError, DriverReport, DriverResult,
     driver::{Driver, DriverSubmitResult, SubmitStatus},
     slot::{SlotCompletion, SlotError, SlotOp, SlotPayload, SlotSpec},
 };
@@ -22,29 +22,6 @@ pub trait DriverProvider: Clone + Unpin {
         Self: 'a;
 
     fn with_driver<'a, R>(&'a self, f: impl FnOnce(Self::Driver<'a>) -> R) -> R;
-}
-
-/// Trait for managing the lifecycle of an operation.
-pub trait OpLifecycle: Sized {
-    type PreAlloc;
-    type Output;
-    type Raw: RawHandleMeta;
-    type CompletionValue;
-    type Error: DriverError;
-
-    fn pre_alloc(fd: Self::Raw) -> DriverResult<Self::PreAlloc, Self::Error>;
-
-    fn into_op(fd: Self::Raw, pre: Self::PreAlloc) -> Self;
-
-    fn into_output(
-        self,
-        res: DriverResult<Self::CompletionValue, Self::Error>,
-    ) -> DriverResult<Self::Output, Self::Error>;
-
-    fn prepare_op(fd: Self::Raw) -> DriverResult<Self, Self::Error> {
-        let pre = Self::pre_alloc(fd)?;
-        Ok(Self::into_op(fd, pre))
-    }
 }
 
 /// Trait to convert a user-facing operation to a platform-specific driver operation.

@@ -6,7 +6,7 @@ pub use veloq_driver_core::{
     IoFd,
     op::{
         DetachedOp, DetachedSubmitter, DriverProvider, IntoPlatformOp, LocalOp, LocalSubmitter, Op,
-        OpKind, OpLifecycle, OpResult, OpSubmitter as CoreOpSubmitter,
+        OpKind, OpResult, OpSubmitter as CoreOpSubmitter,
         types::{
             Accept as CoreAccept, Close, Connect as CoreConnect, Fallocate, FallocateRaw, Fsync,
             FsyncRaw, Open, ReadFixed, ReadRaw, Recv, Send, SendTo, SyncFileRange,
