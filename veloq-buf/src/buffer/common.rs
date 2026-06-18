@@ -1,10 +1,14 @@
 //! Common traits and types for buffer management.
 
-use std::num::{NonZeroU16, NonZeroUsize};
-use std::ptr::NonNull;
+use std::{
+    fmt::{Debug, Formatter, Result as FmtResult},
+    num::{NonZeroU16, NonZeroUsize},
+    ptr::NonNull,
+};
 
 use bilge::prelude::*;
 
+use super::{error::BufResult, handle::FixedBuf};
 use crate::heap::{ChunkId, PageAlignedBytes};
 
 #[bitsize(1)]
@@ -48,8 +52,8 @@ impl<const S: u16> NotU16<S> {
     }
 }
 
-impl<const S: u16> std::fmt::Debug for NotU16<S> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<const S: u16> Debug for NotU16<S> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(f, "{}", self.get())
     }
 }
@@ -74,10 +78,10 @@ pub enum AllocResult {
 }
 
 impl AllocResult {
-    pub fn into_buf(self, pool: &dyn BackingPool) -> Option<super::handle::FixedBuf> {
+    pub fn into_buf(self, pool: &dyn BackingPool) -> Option<FixedBuf> {
         match self {
             AllocResult::Allocated { ptr, cap, context } => unsafe {
-                Some(super::handle::FixedBuf::new(
+                Some(FixedBuf::new(
                     ptr,
                     cap,
                     pool.pool_data(),
@@ -143,7 +147,7 @@ pub trait BufferRegistrar {
     /// Register memory regions with the kernel.
     /// Returns a list of handles (tokens) corresponding to the regions.
     /// For RIO this is RIO_BUFFERID, for uring it might be ignored or index.
-    fn register(&self, regions: &[BufferRegion]) -> super::error::BufResult<Vec<ChunkId>>;
+    fn register(&self, regions: &[BufferRegion]) -> BufResult<Vec<ChunkId>>;
 
     /// Resolve chunk info for a given chunk_id.
     /// Used for lazy registration.
@@ -154,7 +158,7 @@ pub trait BufferRegistrar {
 pub struct NoopRegistrar;
 
 impl BufferRegistrar for NoopRegistrar {
-    fn register(&self, _regions: &[BufferRegion]) -> super::error::BufResult<Vec<ChunkId>> {
+    fn register(&self, _regions: &[BufferRegion]) -> BufResult<Vec<ChunkId>> {
         Ok(Vec::new())
     }
 
@@ -166,7 +170,7 @@ impl BufferRegistrar for NoopRegistrar {
 /// Memory pool implementation providing raw memory allocation.
 /// This trait manages memory layout, allocation algorithms, and deallocation.
 /// It does NOT handle driver registration.
-pub trait BackingPool: std::fmt::Debug {
+pub trait BackingPool: Debug {
     /// Allocate memory without registration context.
     /// Returns allocation result containing ptr, capacity, and header context.
     /// The `global_index` in the result should be ignored or None.
@@ -181,7 +185,7 @@ pub trait BackingPool: std::fmt::Debug {
 
 /// High-level Buffer Pool trait.
 /// Represents a pool that is ready for I/O operations (registered if necessary).
-pub trait BufPool: std::fmt::Debug {
+pub trait BufPool: Debug {
     /// Allocate a buffer ready for I/O.
-    fn alloc(&self, len: NonZeroUsize) -> Option<super::handle::FixedBuf>;
+    fn alloc(&self, len: NonZeroUsize) -> Option<FixedBuf>;
 }

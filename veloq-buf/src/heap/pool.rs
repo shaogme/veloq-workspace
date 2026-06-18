@@ -1,19 +1,29 @@
 //! Core memory pool management.
 
-use super::buddy::BuddyAllocator;
-use super::cache::{LocalCacheEntry, TLS_CACHE};
-use super::units::{
-    ChunkId, ChunkInfo, GlobalAllocatorConfig, PageAlignedBytes, SUPERBLOCK_ORDER, ShardIndex,
-    SlotCount, SlotIndex, SuperblockIndex, SuperblockState,
+use super::{
+    buddy::BuddyAllocator,
+    cache::{LocalCacheEntry, TLS_CACHE},
+    units::{
+        ChunkId, ChunkInfo, GlobalAllocatorConfig, MIN_THREAD_MEMORY, PageAlignedBytes,
+        SUPERBLOCK_ORDER, ShardIndex, SlotCount, SlotIndex, SuperblockIndex, SuperblockState,
+    },
 };
-use crate::buffer::{BufError, BufResult};
+use crate::{
+    buffer::{BufError, BufResult},
+    os::{alloc_huge_pages, alloc_pages, free_pages},
+};
 use crossbeam_utils::CachePadded;
 use diagweave::prelude::*;
 use parking_lot::{Mutex, RwLock};
-use std::hash::{Hash, Hasher};
-use std::num::NonZeroUsize;
-use std::ptr::NonNull;
-use std::sync::Arc;
+use std::{
+    collections::hash_map::DefaultHasher,
+    fmt::{Debug, Formatter, Result as FmtResult},
+    hash::{Hash, Hasher},
+    num::NonZeroUsize,
+    ptr::NonNull,
+    sync::Arc,
+    thread::{available_parallelism, current},
+};
 
 /// Underlying physical memory block (RAII Wrapper).
 /// Responsible for actual OS memory allocation and deallocation.
@@ -31,11 +41,11 @@ impl MemoryChunk {
     pub fn new(size: NonZeroUsize) -> BufResult<Self> {
         let ptr = unsafe {
             // Try Huge Pages first
-            match crate::os::alloc_huge_pages(size) {
+            match alloc_huge_pages(size) {
                 Ok(p) => NonNull::new(p),
                 Err(_) => {
                     // Fallback to standard pages if Huge Pages failed
-                    let p = crate::os::alloc_pages(size).trans()?;
+                    let p = alloc_pages(size).trans()?;
                     NonNull::new(p)
                 }
             }
@@ -71,7 +81,7 @@ impl MemoryChunk {
 impl Drop for MemoryChunk {
     fn drop(&mut self) {
         unsafe {
-            crate::os::free_pages(self.ptr, self.size);
+            free_pages(self.ptr, self.size);
         }
     }
 }
@@ -116,9 +126,7 @@ impl Chunk {
 
         // 2. Determine Shard Layout
         // Dynamic sharding based on CPU cores, scaled for contention.
-        let parallelism = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
+        let parallelism = available_parallelism().map(|n| n.get()).unwrap_or(1);
 
         // Start with parallelism next power of 2, minimum 16
         // Note: For dynamically added smaller chunks, we might want fewer shards?
@@ -242,8 +250,8 @@ impl Chunk {
             // (s * 0x27bb2ee687b0b0fd) is a simple way to spread bits if needed, but s is usually small
             s.wrapping_mul(0x27bb2ee687b0b0fd)
         } else {
-            let thread_id = std::thread::current().id();
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            let thread_id = current().id();
+            let mut hasher = DefaultHasher::new();
             thread_id.hash(&mut hasher);
             hasher.finish() as usize
         };
@@ -394,7 +402,7 @@ impl GlobalSlotPool {
     pub fn new(config: GlobalAllocatorConfig) -> BufResult<Self> {
         let total_size = config.total_memory;
 
-        if total_size < super::units::MIN_THREAD_MEMORY.get() {
+        if total_size < MIN_THREAD_MEMORY.get() {
             return BufError::ChunkTooSmall.trans();
         }
 
@@ -581,8 +589,8 @@ impl GlobalSlotPool {
     }
 }
 
-impl std::fmt::Debug for GlobalSlotPool {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for GlobalSlotPool {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         let chunks = self.chunks.read();
         f.debug_struct("GlobalSlotPool")
             .field("chunk_count", &chunks.len())

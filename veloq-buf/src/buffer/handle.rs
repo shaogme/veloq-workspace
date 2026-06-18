@@ -1,17 +1,28 @@
 //! Core Buffer handle and views.
 
-use std::num::NonZeroUsize;
-use std::ops::Range;
-use std::ptr::NonNull;
+use std::{
+    mem::{align_of, size_of},
+    num::NonZeroUsize,
+    ops::Range,
+    ptr::NonNull,
+    slice::{from_raw_parts, from_raw_parts_mut},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use bilge::prelude::*;
 
 mod range;
 pub use range::{BufIoRangeBound, BufIoRangeError, BufIoRangeErrorKind};
 
-use super::common::{PoolKind, RegionInfo};
-use super::error::{BufError, BufResult};
-use crate::heap::ChunkId;
+use super::{
+    common::{PoolKind, RegionInfo},
+    error::{BufError, BufResult},
+    slot_pool::{slot_based_dealloc, slot_based_resolve_region_info},
+};
+use crate::{
+    heap::ChunkId,
+    os::{alloc_pages, free_pages},
+};
 use diagweave::prelude::*;
 
 #[bitsize(64)]
@@ -60,8 +71,8 @@ pub struct FixedBuf {
     pub(crate) cap: u32,
 }
 
-const _: [(); 32] = [(); std::mem::size_of::<FixedBuf>()];
-const _: [(); 32] = [(); std::mem::align_of::<FixedBuf>()];
+const _: [(); 32] = [(); size_of::<FixedBuf>()];
+const _: [(); 32] = [(); align_of::<FixedBuf>()];
 
 // Safety: FixedBuf 拥有其底层内存的所有权。
 unsafe impl Send for FixedBuf {}
@@ -129,24 +140,22 @@ impl FixedBuf {
     /// The interpretation of the region index is pool-dependent.
     pub fn resolve_region_info(&self) -> RegionInfo {
         match self.pool_kind() {
-            PoolKind::SlotBased => unsafe {
-                super::slot_pool::slot_based_resolve_region_info(self.pool_data, self)
-            },
+            PoolKind::SlotBased => unsafe { slot_based_resolve_region_info(self.pool_data, self) },
             PoolKind::Heap => heap_resolve_region_info(self),
         }
     }
 
     pub fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len as usize) }
+        unsafe { from_raw_parts(self.ptr.as_ptr(), self.len as usize) }
     }
 
     pub fn as_slice_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len as usize) }
+        unsafe { from_raw_parts_mut(self.ptr.as_ptr(), self.len as usize) }
     }
 
     /// Access the full capacity as a mutable slice for writing data before set_len is called.
     pub fn spare_capacity_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.capacity_usize()) }
+        unsafe { from_raw_parts_mut(self.ptr.as_ptr(), self.capacity_usize()) }
     }
 
     pub fn as_ptr(&self) -> *const u8 {
@@ -256,7 +265,7 @@ impl FixedBuf {
         let total_size = len.get().checked_add(4096).ok_or(BufError::Oom)?;
         let total_size_nz = unsafe { NonZeroUsize::new_unchecked(total_size) };
 
-        let base_ptr = unsafe { crate::os::alloc_pages(total_size_nz) }.trans()?;
+        let base_ptr = unsafe { alloc_pages(total_size_nz) }.trans()?;
 
         // Initialize the control block in the first page
         let control = unsafe { &mut *(base_ptr as *mut HeapControlBlock) };
@@ -264,10 +273,8 @@ impl FixedBuf {
 
         let ptr = unsafe { NonNull::new_unchecked(base_ptr.add(4096)) };
 
-        static HEAP_BUF_COOKIE_GEN: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(1);
-        let cookie = HEAP_BUF_COOKIE_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            & 0x00FFFFFFFFFFFFFF;
+        static HEAP_BUF_COOKIE_GEN: AtomicU64 = AtomicU64::new(1);
+        let cookie = HEAP_BUF_COOKIE_GEN.fetch_add(1, Ordering::Relaxed) & 0x00FFFFFFFFFFFFFF;
 
         Ok(unsafe {
             Self::new(
@@ -330,7 +337,7 @@ impl<'a> FixedBufView<'a> {
     }
 
     pub fn as_slice(&self) -> &'a [u8] {
-        unsafe { std::slice::from_raw_parts(self.as_ptr(), self.len()) }
+        unsafe { from_raw_parts(self.as_ptr(), self.len()) }
     }
 }
 
@@ -339,7 +346,7 @@ impl Drop for FixedBuf {
         unsafe {
             match self.pool_kind() {
                 PoolKind::SlotBased => {
-                    super::slot_pool::slot_based_dealloc(self.pool_data, self.context_raw());
+                    slot_based_dealloc(self.pool_data, self.context_raw());
                 }
                 PoolKind::Heap => {
                     heap_dealloc(self.pool_data);
@@ -355,7 +362,7 @@ pub(crate) unsafe fn heap_dealloc(pool_data: NonNull<()>) {
     let control_ptr = base_ptr as *const HeapControlBlock;
     let total_size = unsafe { (*control_ptr).total_size };
     unsafe {
-        crate::os::free_pages(NonNull::new_unchecked(base_ptr), total_size);
+        free_pages(NonNull::new_unchecked(base_ptr), total_size);
     }
 }
 

@@ -1,9 +1,11 @@
 //! Core units and configuration for the heap allocator.
 
-use std::fmt;
-use std::num::NonZeroUsize;
-use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::{
+    fmt,
+    num::NonZeroUsize,
+    ptr::NonNull,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+};
 
 /// 2MB minimum memory per thread (Huge Page aligned)
 pub(crate) const MIN_THREAD_MEMORY: NonZeroUsize = crate::nz!(2 * 1024 * 1024);

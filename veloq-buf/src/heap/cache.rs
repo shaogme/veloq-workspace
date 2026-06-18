@@ -1,12 +1,15 @@
 //! Thread-local cache for the heap allocator.
 
-use super::pool::Chunk;
-use super::units::{ChunkId, SlotIndex, SuperblockIndex, SuperblockState};
-use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
-use std::ptr;
-use std::ptr::NonNull;
-use std::sync::Arc;
+use super::{
+    pool::Chunk,
+    units::{ChunkId, SlotIndex, SuperblockIndex, SuperblockState},
+};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    ptr::{self, NonNull},
+    sync::Arc,
+};
 
 pub(crate) struct LocalCacheEntry {
     pub(crate) chunk: Arc<Chunk>,

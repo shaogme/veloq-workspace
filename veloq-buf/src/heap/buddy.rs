@@ -1,10 +1,7 @@
 use crate::heap::units::{SLOT_SIZE, SlotIndex};
-use std::fmt;
-use std::mem::ManuallyDrop;
-use std::pin::Pin;
-use std::ptr::NonNull;
+use std::{array::from_fn, fmt, mem::ManuallyDrop, pin::Pin, ptr::NonNull};
 use veloq_bitset::BitSet;
-use veloq_intrusive_linklist::{Link, LinkedList};
+use veloq_intrusive_linklist::{Adapter, Link, LinkedList};
 
 /// Buddy System Constants
 pub const MIN_ORDER: usize = 0; // 4KB
@@ -22,7 +19,7 @@ struct FreeNode {
 
 struct FreeNodeAdapter;
 
-unsafe impl veloq_intrusive_linklist::Adapter for FreeNodeAdapter {
+unsafe impl Adapter for FreeNodeAdapter {
     type Value = FreeNode;
 
     unsafe fn get_link(&self, value: NonNull<Self::Value>) -> NonNull<Link> {
@@ -81,7 +78,7 @@ impl BuddyAllocator {
         assert!(len >= SLOT_SIZE, "Memory too small");
 
         let total_slots = len / SLOT_SIZE;
-        let free_lists = std::array::from_fn(|_| LinkedList::new(FreeNodeAdapter));
+        let free_lists = from_fn(|_| LinkedList::new(FreeNodeAdapter));
 
         let mut allocator = Self {
             base_ptr: ptr,

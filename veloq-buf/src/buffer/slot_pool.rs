@@ -1,16 +1,25 @@
 //! Slot-based buffer pool implementation.
 
-use std::cell::Cell;
-use std::num::NonZeroUsize;
-use std::ptr::NonNull;
-use std::sync::Arc;
-
-use super::any::AnyBufPool;
-use super::common::{
-    AllocResult, BackingPool, BufPool, BufferRegion, BufferRegistrar, PoolKind, RegionInfo,
+use std::{
+    cell::Cell,
+    fmt::{self, Debug, Formatter},
+    num::NonZeroUsize,
+    ptr::{NonNull, null},
+    sync::Arc,
 };
-use super::error::{BufError, BufResult};
-use super::handle::{FixedBuf, PackedContext};
+
+use super::{
+    any::AnyBufPool,
+    common::{
+        AllocResult, BackingPool, BufPool, BufferRegion, BufferRegistrar, PoolKind, RegionInfo,
+    },
+    error::{BufError, BufResult},
+    handle::{FixedBuf, PackedContext},
+};
+use crate::heap::{
+    ChunkInfo, GlobalAllocatorConfig, GlobalSlotPool, MIN_THREAD_MEMORY, SlotIndex,
+    ThreadMemoryMultiplier, buddy::BuddyAllocator,
+};
 
 /// 定义 Runtime 所有工作线程的缓冲池拓扑结构
 /// Defines the buffer pool topology for the runtime.
@@ -45,43 +54,38 @@ pub trait PoolTopology: Clone + Send + Sync {
 
     /// Connect a listener to the shared state to receive notifications about new memory chunks.
     /// Used for dynamic expansion.
-    fn connect_listener(
-        &self,
-        state: &Self::State,
-        listener: Box<dyn Fn(crate::heap::ChunkInfo) + Send + Sync>,
-    );
+    fn connect_listener(&self, state: &Self::State, listener: Box<dyn Fn(ChunkInfo) + Send + Sync>);
 }
 
 /// 标准 Slot 拓扑：使用 GlobalSlotPool
 #[derive(Clone)]
 pub struct UniformSlot {
     /// 内存倍数 (用于计算总内存大小)
-    pub multiplier: crate::heap::ThreadMemoryMultiplier,
+    pub multiplier: ThreadMemoryMultiplier,
 }
 
 impl UniformSlot {
     /// 创建新的 UniformSlot topology
-    pub fn new(multiplier: crate::heap::ThreadMemoryMultiplier) -> Self {
+    pub fn new(multiplier: ThreadMemoryMultiplier) -> Self {
         Self { multiplier }
     }
 
     // Backward compatibility shim for tests if needed
-    pub fn create_pool(&self, worker_count: usize) -> BufResult<Arc<crate::heap::GlobalSlotPool>> {
+    pub fn create_pool(&self, worker_count: usize) -> BufResult<Arc<GlobalSlotPool>> {
         self.init(worker_count)
     }
 }
 
 impl PoolTopology for UniformSlot {
-    type State = Arc<crate::heap::GlobalSlotPool>;
+    type State = Arc<GlobalSlotPool>;
 
     fn init(&self, worker_count: usize) -> BufResult<Self::State> {
-        let total_size =
-            self.multiplier.0.get() * crate::heap::MIN_THREAD_MEMORY.get() * 2 * worker_count;
-        let config = crate::heap::GlobalAllocatorConfig {
+        let total_size = self.multiplier.0.get() * MIN_THREAD_MEMORY.get() * 2 * worker_count;
+        let config = GlobalAllocatorConfig {
             total_memory: total_size,
         };
 
-        let pool = crate::heap::GlobalSlotPool::new(config)?;
+        let pool = GlobalSlotPool::new(config)?;
 
         // Return Arc instead of leaking
         Ok(Arc::new(pool))
@@ -126,7 +130,7 @@ impl PoolTopology for UniformSlot {
 #[derive(Clone)]
 pub struct SlotBasedPool {
     /// 全局 Slot Pool 的引用 (Arc)
-    pub(crate) pool: Arc<crate::heap::GlobalSlotPool>,
+    pub(crate) pool: Arc<GlobalSlotPool>,
     /// Optional seed for deterministic shard selection
     pub(crate) seed: Option<usize>,
 }
@@ -160,8 +164,8 @@ impl SlotBasedPool {
     }
 }
 
-impl std::fmt::Debug for SlotBasedPool {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for SlotBasedPool {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("SlotBasedPool").finish()
     }
 }
@@ -170,7 +174,7 @@ const ARC_CACHE_LIMIT: usize = 64;
 
 #[derive(Copy, Clone)]
 struct PoolCacheInner {
-    ptr: *const crate::heap::GlobalSlotPool,
+    ptr: *const GlobalSlotPool,
     balance: u32,
 }
 
@@ -180,7 +184,7 @@ impl ThreadLocalPoolCache {
     /// 构造一个新的空缓存。由于字段是简单的原始类型和指针，此构造函数是 const 的。
     const fn new() -> Self {
         Self(Cell::new(PoolCacheInner {
-            ptr: std::ptr::null(),
+            ptr: null(),
             balance: 0,
         }))
     }
@@ -218,7 +222,7 @@ impl BackingPool for SlotBasedPool {
         let order = Self::calculate_order(size);
 
         if let Some((chunk_id, slot_idx, ptr)) = self.pool.alloc_slots(order, self.seed) {
-            let capacity = crate::heap::buddy::BuddyAllocator::capacity_of(order);
+            let capacity = BuddyAllocator::capacity_of(order);
             let context_data = PackedContext::from_slot_parts(
                 slot_idx.get() as u32,
                 order as u8,
@@ -302,12 +306,12 @@ impl BufPool for SlotBasedPool {
 }
 
 pub(crate) unsafe fn slot_based_dealloc(pool_data: NonNull<()>, context: u64) {
-    let raw_ptr = pool_data.as_ptr() as *const crate::heap::GlobalSlotPool;
+    let raw_ptr = pool_data.as_ptr() as *const GlobalSlotPool;
 
     let ctx = PackedContext::from(context);
     let chunk_id = ctx.slot_chunk_id();
     let order = ctx.order() as usize;
-    let slot_idx = crate::heap::SlotIndex(ctx.slot_idx() as usize);
+    let slot_idx = SlotIndex(ctx.slot_idx() as usize);
 
     // Try recycle
     let recycled = with_pool_cache(|cache| {
@@ -342,7 +346,7 @@ pub(crate) unsafe fn slot_based_resolve_region_info(
     buf: &FixedBuf,
 ) -> RegionInfo {
     // 1. Cast back to GlobalSlotPool
-    let pool = unsafe { &*(pool_data.as_ptr() as *const crate::heap::GlobalSlotPool) };
+    let pool = unsafe { &*(pool_data.as_ptr() as *const GlobalSlotPool) };
 
     // 2. Unpack ChunkID
     let ctx = PackedContext::from(buf.context_raw());

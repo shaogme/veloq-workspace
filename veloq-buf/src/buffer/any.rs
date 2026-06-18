@@ -1,15 +1,21 @@
 //! Type-erased buffer pool.
 
-use super::common::BufPool;
-use super::handle::FixedBuf;
-use std::num::NonZeroUsize;
+use std::{
+    fmt::{Debug, Formatter, Result as FmtResult},
+    marker::PhantomData,
+    mem,
+    num::NonZeroUsize,
+    ptr::{self, drop_in_place},
+};
+
+use super::{common::BufPool, handle::FixedBuf};
 
 /// 手写 VTable，用于动态分发 BufPool 的方法而不使用 dyn
 pub struct BufPoolVTable {
     pub alloc: unsafe fn(*const u8, NonZeroUsize) -> Option<FixedBuf>,
     pub clone: unsafe fn(*const u8) -> AnyBufPool,
     pub drop: unsafe fn(*mut u8),
-    pub fmt: unsafe fn(*const u8, &mut std::fmt::Formatter<'_>) -> std::fmt::Result,
+    pub fmt: unsafe fn(*const u8, &mut Formatter<'_>) -> FmtResult,
 }
 
 /// A type-erased handle to any `BufPool`.
@@ -25,19 +31,19 @@ impl AnyBufPool {
     /// 从任意实现了 `BufPool + Clone` 的类型构造 `AnyBufPool`。
     pub fn new<P: BufPool + Clone>(pool: P) -> Self {
         // Size of the storage in bytes
-        const STORAGE_SIZE: usize = std::mem::size_of::<[usize; 3]>();
+        const STORAGE_SIZE: usize = mem::size_of::<[usize; 3]>();
 
         // Check if P fits in storage (SOO)
-        let is_inline = std::mem::size_of::<P>() <= STORAGE_SIZE
-            && std::mem::align_of::<P>() <= std::mem::align_of::<usize>();
+        let is_inline =
+            mem::size_of::<P>() <= STORAGE_SIZE && mem::align_of::<P>() <= mem::align_of::<usize>();
 
         unsafe fn alloc_shim<P: BufPool + Clone>(
             ptr: *const u8,
             size: NonZeroUsize,
         ) -> Option<FixedBuf> {
-            const STORAGE_SIZE: usize = std::mem::size_of::<[usize; 3]>();
-            if std::mem::size_of::<P>() <= STORAGE_SIZE
-                && std::mem::align_of::<P>() <= std::mem::align_of::<usize>()
+            const STORAGE_SIZE: usize = mem::size_of::<[usize; 3]>();
+            if mem::size_of::<P>() <= STORAGE_SIZE
+                && mem::align_of::<P>() <= mem::align_of::<usize>()
             {
                 let pool = unsafe { &*(ptr as *const P) };
                 pool.alloc(size)
@@ -48,9 +54,9 @@ impl AnyBufPool {
         }
 
         unsafe fn clone_shim<P: BufPool + Clone>(ptr: *const u8) -> AnyBufPool {
-            const STORAGE_SIZE: usize = std::mem::size_of::<[usize; 3]>();
-            if std::mem::size_of::<P>() <= STORAGE_SIZE
-                && std::mem::align_of::<P>() <= std::mem::align_of::<usize>()
+            const STORAGE_SIZE: usize = mem::size_of::<[usize; 3]>();
+            if mem::size_of::<P>() <= STORAGE_SIZE
+                && mem::align_of::<P>() <= mem::align_of::<usize>()
             {
                 let pool = unsafe { &*(ptr as *const P) };
                 AnyBufPool::new(pool.clone())
@@ -61,11 +67,11 @@ impl AnyBufPool {
         }
 
         unsafe fn drop_shim<P: BufPool + Clone>(ptr: *mut u8) {
-            const STORAGE_SIZE: usize = std::mem::size_of::<[usize; 3]>();
-            if std::mem::size_of::<P>() <= STORAGE_SIZE
-                && std::mem::align_of::<P>() <= std::mem::align_of::<usize>()
+            const STORAGE_SIZE: usize = mem::size_of::<[usize; 3]>();
+            if mem::size_of::<P>() <= STORAGE_SIZE
+                && mem::align_of::<P>() <= mem::align_of::<usize>()
             {
-                unsafe { std::ptr::drop_in_place(ptr as *mut P) };
+                unsafe { drop_in_place(ptr as *mut P) };
             } else {
                 unsafe {
                     let _ = Box::from_raw(*(ptr as *mut *mut P));
@@ -73,23 +79,20 @@ impl AnyBufPool {
             }
         }
 
-        unsafe fn fmt_shim<P: BufPool + Clone>(
-            ptr: *const u8,
-            f: &mut std::fmt::Formatter<'_>,
-        ) -> std::fmt::Result {
-            const STORAGE_SIZE: usize = std::mem::size_of::<[usize; 3]>();
-            if std::mem::size_of::<P>() <= STORAGE_SIZE
-                && std::mem::align_of::<P>() <= std::mem::align_of::<usize>()
+        unsafe fn fmt_shim<P: BufPool + Clone>(ptr: *const u8, f: &mut Formatter<'_>) -> FmtResult {
+            const STORAGE_SIZE: usize = mem::size_of::<[usize; 3]>();
+            if mem::size_of::<P>() <= STORAGE_SIZE
+                && mem::align_of::<P>() <= mem::align_of::<usize>()
             {
                 let pool = unsafe { &*(ptr as *const P) };
-                std::fmt::Debug::fmt(pool, f)
+                Debug::fmt(pool, f)
             } else {
                 let pool = unsafe { &**(ptr as *const *const P) };
-                std::fmt::Debug::fmt(pool, f)
+                Debug::fmt(pool, f)
             }
         }
 
-        struct VTableGen<P>(std::marker::PhantomData<P>);
+        struct VTableGen<P>(PhantomData<P>);
 
         impl<P: BufPool + Clone> VTableGen<P> {
             const VTABLE: BufPoolVTable = BufPoolVTable {
@@ -103,7 +106,7 @@ impl AnyBufPool {
         let mut storage = [0usize; 3];
         if is_inline {
             unsafe {
-                std::ptr::write(storage.as_mut_ptr() as *mut P, pool);
+                ptr::write(storage.as_mut_ptr() as *mut P, pool);
             }
         } else {
             storage[0] = Box::into_raw(Box::new(pool)) as usize;
@@ -134,8 +137,8 @@ impl Drop for AnyBufPool {
     }
 }
 
-impl std::fmt::Debug for AnyBufPool {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for AnyBufPool {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         unsafe { (self.vtable.fmt)(self.storage.as_ptr() as *const u8, f) }
     }
 }
