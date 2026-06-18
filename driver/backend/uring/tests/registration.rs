@@ -97,7 +97,8 @@ fn stale_registered_fd_generation_rejected_on_submit() {
         fd: stale_fd,
         datasync: false,
     };
-    let (uring_kernel, payload) = op.into_kernel_and_payload();
+    let (uring_kernel, payload) =
+        <Fsync as IntoPlatformOp<UringSlotSpec>>::into_kernel_and_payload(op);
     let mut uring_op: Option<UringOp> = Some(uring_kernel);
     let mut slot = driver.reserve_op().expect("reserve op failed");
     slot.set_payload(<Fsync as IntoPlatformOp<UringSlotSpec>>::payload_into_erased(payload));
@@ -239,7 +240,8 @@ fn submit_test_op<T>(
 where
     T: IntoPlatformOp<UringSlotSpec>,
 {
-    let (uring_kernel, payload) = data.into_kernel_and_payload();
+    let (uring_kernel, payload) =
+        <T as IntoPlatformOp<UringSlotSpec>>::into_kernel_and_payload(data);
     let mut uring_op: Option<UringOp> = Some(uring_kernel);
     let mut slot = driver.reserve_op().expect("reserve op failed");
     slot.set_payload(T::payload_into_erased(payload));
@@ -286,7 +288,8 @@ fn close_owned_registered_file() {
         fd: stale_fd,
         datasync: false,
     };
-    let (uring_kernel, payload) = op.into_kernel_and_payload();
+    let (uring_kernel, payload) =
+        <Fsync as IntoPlatformOp<UringSlotSpec>>::into_kernel_and_payload(op);
     let mut uring_op: Option<UringOp> = Some(uring_kernel);
     let mut slot = driver.reserve_op().expect("reserve op failed");
     slot.set_payload(<Fsync as IntoPlatformOp<UringSlotSpec>>::payload_into_erased(payload));
@@ -329,7 +332,8 @@ fn close_borrowed_registered_file_is_rejected() {
         .unwrap();
 
     let op = Close { fd };
-    let (uring_kernel, payload) = op.into_kernel_and_payload();
+    let (uring_kernel, payload) =
+        <Close as IntoPlatformOp<UringSlotSpec>>::into_kernel_and_payload(op);
     let mut uring_op: Option<UringOp> = Some(uring_kernel);
     let mut slot = driver.reserve_op().expect("reserve op failed");
     slot.set_payload(<Close as IntoPlatformOp<UringSlotSpec>>::payload_into_erased(payload));
