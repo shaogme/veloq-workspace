@@ -428,10 +428,10 @@ pub fn poll_current_driver<'reg>(
                 None => IdleDecision::wait(IdleWaitStrategy::block()),
             })
         })
-        .ok_or_else(|| {
+        .map_err(|err| {
             RuntimeError::TlsSetOwnedFailed {
                 worker_id: shared.worker_id(),
-                source: veloq_tls::TlsError::AllocationFailed,
+                source: err,
             }
             .to_report()
         })?

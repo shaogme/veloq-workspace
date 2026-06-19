@@ -30,7 +30,7 @@ set! {
         #[display("failed to set thread-local storage for worker {worker_id}: {source}")]
         TlsSetOwnedFailed {
             worker_id: usize,
-            source: veloq_tls::TlsError,
+            source: veloq_tls::TlsErrorKind,
         },
 
         #[display("runtime invariant violation at {site}: {detail}")]

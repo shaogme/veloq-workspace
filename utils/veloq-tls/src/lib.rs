@@ -6,7 +6,7 @@ mod tls;
 pub(crate) use shared::{RawKey, ResetGuard, is_sentinel, sentinel_ptr};
 
 // Public exports
-pub use error::TlsError;
+pub use error::{TlsError, TlsErrorKind};
 pub use tls::Tls;
 
 /// A macro for declaring thread-local variables using the platform-native `Tls`.

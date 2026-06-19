@@ -1,4 +1,4 @@
-use crate::{RawKey, ResetGuard, TlsError, is_sentinel, sentinel_ptr};
+use crate::{RawKey, ResetGuard, TlsError, TlsErrorKind, is_sentinel, sentinel_ptr};
 use once_cell::sync::OnceCell;
 use std::marker::PhantomData;
 
@@ -40,14 +40,14 @@ impl<T, F: Fn() -> T> Tls<T, F> {
     }
 
     #[inline]
-    fn get_key(&self) -> Result<RawKey, TlsError> {
+    fn get_key(&self) -> Result<RawKey, TlsErrorKind> {
         self.key
             .get_or_try_init(|| {
                 #[cfg(windows)]
                 {
                     let key = unsafe { FlsAlloc(Some(tls_destructor::<T>)) };
                     if key == FLS_OUT_OF_INDEXES {
-                        return Err(TlsError::AllocationFailed);
+                        return Err(TlsErrorKind::AllocationFailed);
                     }
                     Ok(key)
                 }
@@ -56,7 +56,7 @@ impl<T, F: Fn() -> T> Tls<T, F> {
                     let mut key = 0;
                     let res = unsafe { pthread_key_create(&mut key, Some(tls_destructor::<T>)) };
                     if res != 0 {
-                        return Err(TlsError::AllocationFailed);
+                        return Err(TlsErrorKind::AllocationFailed);
                     }
                     Ok(key)
                 }
@@ -145,10 +145,10 @@ impl<T, F: Fn() -> T> Tls<T, F> {
 
     /// Executes a closure with a reference to the value stored in TLS for the current thread without initializing it.
     ///
-    /// Returns `None` if no value has been set for this thread or if it is currently being initialized.
+    /// Returns `Err(TlsErrorKind::Uninitialized)` if no value has been set for this thread or if it is currently being initialized.
     #[inline(always)]
-    pub fn try_with<R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
-        let key = self.get_key().ok()?;
+    pub fn try_with<R>(&self, f: impl FnOnce(&T) -> R) -> Result<R, TlsErrorKind> {
+        let key = self.get_key()?;
         let raw_ptr = {
             #[cfg(windows)]
             unsafe {
@@ -161,22 +161,29 @@ impl<T, F: Fn() -> T> Tls<T, F> {
         };
 
         if raw_ptr.is_null() || is_sentinel(raw_ptr) {
-            None
+            Err(TlsErrorKind::Uninitialized)
         } else {
-            Some(unsafe { f(&*raw_ptr) })
+            Ok(unsafe { f(&*raw_ptr) })
         }
     }
 
     /// Sets an owned value into TLS for the current thread.
     ///
-    /// If there was a previously stored value, it will be dropped.
+    /// If there was a previously stored value, it is returned.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if recursive access or modification during replacement is detected.
+    /// Returns `Err(TlsError::RecursiveAccess)` if recursive access or modification during replacement is detected.
     #[inline(always)]
-    pub fn set_owned(&self, val: impl Into<Box<T>>) -> Result<(), TlsError> {
-        let key = self.get_key()?;
+    pub fn set_owned(&self, val: impl Into<Box<T>>) -> Result<Option<Box<T>>, TlsError<T>> {
+        let val = val.into();
+        let key = match self.get_key() {
+            Ok(k) => k,
+            Err(TlsErrorKind::AllocationFailed) => {
+                return Err(TlsError::AllocationFailed { val });
+            }
+            Err(_) => unreachable!(),
+        };
         let old_ptr = {
             #[cfg(windows)]
             unsafe {
@@ -188,64 +195,44 @@ impl<T, F: Fn() -> T> Tls<T, F> {
             }
         };
 
-        if !old_ptr.is_null() {
-            if is_sentinel(old_ptr) {
-                panic!("TLS recursive access during modification detected!");
-            }
-
-            // Set sentinel during deletion of the old value to avoid recursive deletion/access UB
-            let sentinel = sentinel_ptr::<T>();
-            #[cfg(windows)]
-            unsafe {
-                let res = FlsSetValue(key, sentinel as _);
-                if res == 0 {
-                    return Err(TlsError::SetFailed(
-                        std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-                    ));
-                }
-            }
-            #[cfg(unix)]
-            unsafe {
-                let res = pthread_setspecific(key, sentinel as _);
-                if res != 0 {
-                    return Err(TlsError::SetFailed(res as i32));
-                }
-            }
-
-            unsafe {
-                let _ = Box::from_raw(old_ptr);
-            }
+        if !old_ptr.is_null() && is_sentinel(old_ptr) {
+            return Err(TlsError::RecursiveAccess { val });
         }
 
         // Guard the newly set sentinel/null state during actual allocation and storage
         let guard = ResetGuard::new(key);
-        let owned_ptr = Box::into_raw(val.into());
+        let owned_ptr = Box::into_raw(val);
 
         #[cfg(windows)]
         {
             let res = unsafe { FlsSetValue(key, owned_ptr as _) };
             if res == 0 {
-                unsafe {
-                    let _ = Box::from_raw(owned_ptr);
-                }
-                return Err(TlsError::SetFailed(
-                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-                ));
+                let val = unsafe { Box::from_raw(owned_ptr) };
+                return Err(TlsError::SetFailed {
+                    code: std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                    val,
+                });
             }
         }
         #[cfg(unix)]
         {
             let res = unsafe { pthread_setspecific(key, owned_ptr as _) };
             if res != 0 {
-                unsafe {
-                    let _ = Box::from_raw(owned_ptr);
-                }
-                return Err(TlsError::SetFailed(res as i32));
+                let val = unsafe { Box::from_raw(owned_ptr) };
+                return Err(TlsError::SetFailed {
+                    code: res as i32,
+                    val,
+                });
             }
         }
 
         guard.cancel();
-        Ok(())
+
+        if old_ptr.is_null() {
+            Ok(None)
+        } else {
+            Ok(Some(unsafe { Box::from_raw(old_ptr) }))
+        }
     }
 
     /// Takes the owned value out of the TLS for the current thread, returning it.
@@ -363,13 +350,32 @@ mod tests {
         let local_tls: Tls<String> = Tls::new(|| "default".to_string());
         local_tls.with(|s| assert_eq!(s, "default"));
 
-        local_tls.set_owned("hello".to_string()).unwrap();
+        assert!(local_tls.set_owned("hello".to_string()).unwrap().is_none());
         local_tls.with(|s| assert_eq!(s, "hello"));
 
-        let taken = local_tls.take().unwrap();
-        assert_eq!(*taken, "hello");
+        let old = local_tls.set_owned("world".to_string()).unwrap().unwrap();
+        assert_eq!(*old, "hello");
+        local_tls.with(|s| assert_eq!(s, "world"));
 
-        assert!(local_tls.try_with(|s| s.clone()).is_none());
+        let taken = local_tls.take().unwrap();
+        assert_eq!(*taken, "world");
+
+        assert_eq!(
+            local_tls.try_with(|s| s.clone()),
+            Err(TlsErrorKind::Uninitialized)
+        );
+    }
+
+    #[test]
+    fn test_set_owned_recursive_error() {
+        static REC_TLS: Tls<i32> = Tls::new(|| {
+            let res = REC_TLS.set_owned(100);
+            let err = res.unwrap_err();
+            assert_eq!(err.kind(), TlsErrorKind::RecursiveAccess);
+            assert_eq!(*err.into_val(), 100);
+            42
+        });
+        REC_TLS.with(|_| {});
     }
 
     #[test]

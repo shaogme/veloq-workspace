@@ -113,14 +113,17 @@ impl<'rt, T, WF> Runtime<'rt, T, WF> {
                 scope.spawn(move || {
                     let init_res = (|| {
                         shared_ref.base.tls.set_owned(context).map_err(|source| {
-                            RuntimeError::TlsSetOwnedFailed { worker_id, source }
+                            RuntimeError::TlsSetOwnedFailed {
+                                worker_id,
+                                source: source.kind(),
+                            }
                         })?;
                         shared_ref
                             .extra_tls
                             .set_owned(worker_factory_ref(worker_id, shared_ref))
                             .map_err(|source| RuntimeError::TlsSetOwnedFailed {
                                 worker_id,
-                                source,
+                                source: source.kind(),
                             })?;
                         Ok(())
                     })();
@@ -155,7 +158,7 @@ impl<'rt, T, WF> Runtime<'rt, T, WF> {
             shared_ref.base.tls.set_owned(context).map_err(|source| {
                 RuntimeError::TlsSetOwnedFailed {
                     worker_id: 0,
-                    source,
+                    source: source.kind(),
                 }
                 .to_report()
             })?;
@@ -165,7 +168,7 @@ impl<'rt, T, WF> Runtime<'rt, T, WF> {
                 .map_err(|source| {
                     RuntimeError::TlsSetOwnedFailed {
                         worker_id: 0,
-                        source,
+                        source: source.kind(),
                     }
                     .to_report()
                 })?;
