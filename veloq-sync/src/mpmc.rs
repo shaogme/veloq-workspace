@@ -6,7 +6,7 @@ use crate::{
         lock::SpinLock,
         queue::{ArrayQueue, Queue, SegQueue},
     },
-    waker::{WaiterAdapter, WaiterNode},
+    waker::{ConcurrentWaiterAdapter, ConcurrentWaiterNode},
 };
 use futures_core::stream::Stream;
 use std::{
@@ -26,11 +26,11 @@ pub mod flavor {
         fn release(&self);
         fn register_send_wait(
             &self,
-            node: Pin<&mut WaiterNode>,
+            node: Pin<&mut ConcurrentWaiterNode>,
             cx: &Context<'_>,
             is_full: impl Fn() -> bool,
         ) -> bool;
-        fn remove_send_wait(&self, node: Pin<&mut WaiterNode>);
+        fn remove_send_wait(&self, node: Pin<&mut ConcurrentWaiterNode>);
         fn notify_all_senders(&self);
     }
 
@@ -43,18 +43,18 @@ pub mod flavor {
         fn release(&self) {}
         fn register_send_wait(
             &self,
-            _node: Pin<&mut WaiterNode>,
+            _node: Pin<&mut ConcurrentWaiterNode>,
             _cx: &Context<'_>,
             _is_full: impl Fn() -> bool,
         ) -> bool {
             false
         }
-        fn remove_send_wait(&self, _node: Pin<&mut WaiterNode>) {}
+        fn remove_send_wait(&self, _node: Pin<&mut ConcurrentWaiterNode>) {}
         fn notify_all_senders(&self) {}
     }
 
     pub struct Bounded {
-        waiters: SpinLock<ConcurrentLinkedList<WaiterAdapter>>,
+        waiters: SpinLock<ConcurrentLinkedList<ConcurrentWaiterAdapter>>,
         waiter_count: AtomicUsize,
     }
 
@@ -67,7 +67,7 @@ pub mod flavor {
     impl ChannelFlavor for Bounded {
         fn new() -> Self {
             Self {
-                waiters: SpinLock::new(ConcurrentLinkedList::new(WaiterAdapter::NEW)),
+                waiters: SpinLock::new(ConcurrentLinkedList::new(ConcurrentWaiterAdapter::NEW)),
                 waiter_count: AtomicUsize::new(0),
             }
         }
@@ -85,7 +85,7 @@ pub mod flavor {
 
         fn register_send_wait(
             &self,
-            node: Pin<&mut WaiterNode>,
+            node: Pin<&mut ConcurrentWaiterNode>,
             cx: &Context<'_>,
             is_full: impl Fn() -> bool,
         ) -> bool {
@@ -104,7 +104,7 @@ pub mod flavor {
             true
         }
 
-        fn remove_send_wait(&self, node: Pin<&mut WaiterNode>) {
+        fn remove_send_wait(&self, node: Pin<&mut ConcurrentWaiterNode>) {
             // Must acquire lock to check linkage safely to avoid race with notify
             let mut lock = self.waiters.lock();
             if node.link.is_linked() {
@@ -157,7 +157,7 @@ pub struct State<T, F: ChannelFlavor, Q: Queue<T>> {
     pub(crate) queue: Q,
 
     // 接收等待队列 (通用)
-    pub(crate) recv_waiters: SpinLock<ConcurrentLinkedList<WaiterAdapter>>,
+    pub(crate) recv_waiters: SpinLock<ConcurrentLinkedList<ConcurrentWaiterAdapter>>,
     pub(crate) recv_waiter_count: AtomicUsize,
 
     pub(crate) is_closed: AtomicBool,
@@ -175,7 +175,7 @@ impl<T, F: ChannelFlavor, Q: Queue<T>> State<T, F, Q> {
     pub fn new(capacity: usize) -> Self {
         Self {
             queue: Q::new(capacity),
-            recv_waiters: SpinLock::new(ConcurrentLinkedList::new(WaiterAdapter::NEW)),
+            recv_waiters: SpinLock::new(ConcurrentLinkedList::new(ConcurrentWaiterAdapter::NEW)),
             recv_waiter_count: AtomicUsize::new(0),
             is_closed: AtomicBool::new(false),
             sender_count: AtomicUsize::new(1),
@@ -289,7 +289,7 @@ impl<'a, T, F: ChannelFlavor, Q: Queue<T>> GenericSender<'a, T, F, Q> {
                 SendFuture {
                     sender: self,
                     msg: Some(m),
-                    node: WaiterNode::new(),
+                    node: ConcurrentWaiterNode::new(),
                     queued: false,
                 }
                 .await
@@ -326,7 +326,7 @@ impl<'a, T, F: ChannelFlavor, Q: Queue<T>> GenericReceiver<'a, T, F, Q> {
 
         RecvFuture {
             receiver: self,
-            node: WaiterNode::new(),
+            node: ConcurrentWaiterNode::new(),
             queued: false,
         }
         .await
@@ -335,7 +335,7 @@ impl<'a, T, F: ChannelFlavor, Q: Queue<T>> GenericReceiver<'a, T, F, Q> {
     pub fn stream(&self) -> ReceiverStream<'_, 'a, T, F, Q> {
         ReceiverStream {
             receiver: self,
-            node: WaiterNode::new(),
+            node: ConcurrentWaiterNode::new(),
             queued: false,
         }
     }
@@ -346,7 +346,7 @@ impl<'a, T, F: ChannelFlavor, Q: Queue<T>> GenericReceiver<'a, T, F, Q> {
 struct SendFuture<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> {
     sender: &'b GenericSender<'a, T, F, Q>,
     msg: Option<T>,
-    node: WaiterNode,
+    node: ConcurrentWaiterNode,
     queued: bool,
 }
 
@@ -411,7 +411,7 @@ impl<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> Drop for SendFuture<'a, 'b, T, F,
 
 struct RecvFuture<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> {
     receiver: &'b GenericReceiver<'a, T, F, Q>,
-    node: WaiterNode,
+    node: ConcurrentWaiterNode,
     queued: bool,
 }
 
@@ -481,7 +481,7 @@ impl<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> Drop for RecvFuture<'a, 'b, T, F,
 
 fn remove_recv_waiter<T, F: ChannelFlavor, Q: Queue<T>>(
     state: &State<T, F, Q>,
-    node: Pin<&mut WaiterNode>,
+    node: Pin<&mut ConcurrentWaiterNode>,
 ) {
     let mut lock = state.recv_waiters.lock();
     if node.link.is_linked() {
@@ -496,7 +496,7 @@ fn remove_recv_waiter<T, F: ChannelFlavor, Q: Queue<T>>(
 
 pub struct ReceiverStream<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> {
     receiver: &'b GenericReceiver<'a, T, F, Q>,
-    node: WaiterNode,
+    node: ConcurrentWaiterNode,
     queued: bool,
 }
 
@@ -637,7 +637,7 @@ impl<T, F: ChannelFlavor, Q: Queue<T>> GenericOwnedReceiver<T, F, Q> {
     pub fn stream(&self) -> OwnedReceiverStream<'_, T, F, Q> {
         OwnedReceiverStream {
             state: &self.state,
-            node: WaiterNode::new(),
+            node: ConcurrentWaiterNode::new(),
             queued: false,
         }
     }
@@ -645,7 +645,7 @@ impl<T, F: ChannelFlavor, Q: Queue<T>> GenericOwnedReceiver<T, F, Q> {
 
 pub struct OwnedReceiverStream<'a, T, F: ChannelFlavor, Q: Queue<T>> {
     state: &'a State<T, F, Q>,
-    node: WaiterNode,
+    node: ConcurrentWaiterNode,
     queued: bool,
 }
 

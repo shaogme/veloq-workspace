@@ -8,12 +8,12 @@ use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::task::{Context, Poll};
-use veloq_intrusive_linklist::ConcurrentLinkedList;
+use veloq_intrusive_linklist::LinkedList;
 
 /// An asynchronous mutual exclusion primitive.
 pub struct Mutex<T: ?Sized> {
     state: AtomicUsize,
-    waiters: SpinLock<ConcurrentLinkedList<WaiterAdapter>>,
+    waiters: SpinLock<LinkedList<WaiterAdapter>>,
     data: UnsafeCell<T>,
 }
 
@@ -26,7 +26,7 @@ impl<T> Mutex<T> {
     pub const fn new(data: T) -> Self {
         Self {
             state: AtomicUsize::new(0),
-            waiters: SpinLock::new(ConcurrentLinkedList::new(WaiterAdapter::NEW)),
+            waiters: SpinLock::new(LinkedList::new(WaiterAdapter::NEW)),
             data: UnsafeCell::new(data),
         }
     }
@@ -36,7 +36,7 @@ impl<T> Mutex<T> {
     pub fn new(data: T) -> Self {
         Self {
             state: AtomicUsize::new(0),
-            waiters: SpinLock::new(ConcurrentLinkedList::new(WaiterAdapter::NEW)),
+            waiters: SpinLock::new(LinkedList::new(WaiterAdapter::NEW)),
             data: UnsafeCell::new(data),
         }
     }
