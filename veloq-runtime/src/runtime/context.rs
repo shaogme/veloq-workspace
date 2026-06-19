@@ -301,7 +301,7 @@ impl<'rt, T> RuntimeCtx<'rt, T> {
             .base
             .tls
             .try_with(|ctx| ctx.worker_id)
-            .unwrap_or(usize::MAX)
+            .expect("Failed to get worker id: this should be invoked from a worker thread")
     }
 }
 

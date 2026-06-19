@@ -1,7 +1,6 @@
 use std::{
     hint::spin_loop,
     num::NonZeroUsize,
-    process::abort,
     ptr::NonNull,
     sync::{
         Arc,
@@ -182,14 +181,10 @@ impl<T> RuntimeShared<T> {
                 },
                 shutdown: AtomicBool::new(false),
                 worker_tick_hook,
-                tls: Tls::new(|| RuntimeTlsInner {
-                    worker_id: usize::MAX,
-                    rand: FastRand::new(u64::MAX),
-                    worker: Worker::new_lifo(),
-                }),
+                tls: Tls::new(),
             },
             idle_hook,
-            extra_tls: Tls::new(|| abort()),
+            extra_tls: Tls::new(),
         }
     }
 }

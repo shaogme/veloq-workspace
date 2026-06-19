@@ -21,20 +21,24 @@ use libc::{pthread_getspecific, pthread_key_create, pthread_key_delete, pthread_
 /// - When a `Tls` instance is dropped, destructor functions will **not** be triggered automatically for existing values in other threads, which may cause memory leaks.
 /// - If a `Tls` instance is dropped prematurely, subsequent accesses from other threads or cleanup upon thread exit may lead to undefined behavior (UB).
 /// - You must guarantee that the lifetime of the `Tls` instance is longer than all threads accessing it.
-pub struct Tls<T, F = fn() -> T> {
+pub struct Tls<T> {
     key: OnceCell<RawKey>,
-    init: F,
     marker: PhantomData<T>,
 }
 
-impl<T, F: Fn() -> T> Tls<T, F> {
-    /// Creates a new `Tls` instance with an initialization closure.
+impl<T> Default for Tls<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> Tls<T> {
+    /// Creates a new `Tls` instance.
     ///
     /// This should typically be stored in a `static` variable.
-    pub const fn new(init: F) -> Self {
+    pub const fn new() -> Self {
         Self {
             key: OnceCell::new(),
-            init,
             marker: PhantomData,
         }
     }
@@ -64,16 +68,20 @@ impl<T, F: Fn() -> T> Tls<T, F> {
             .copied()
     }
 
-    /// Executes a closure with a reference to the value stored in TLS for the current thread.
+    /// Helper to retrieve the TLS value pointer, optionally initializing it.
     ///
-    /// If no value has been set, the initialization closure is called.
+    /// # Errors
+    ///
+    /// - Returns `Err(TlsErrorKind::AllocationFailed)` if key allocation fails.
+    /// - Returns `Err(TlsErrorKind::RecursiveAccess)` if recursive initialization is detected.
+    /// - Returns `Err(TlsErrorKind::Uninitialized)` if no initializer is provided and the value is not set.
     ///
     /// # Panics
     ///
-    /// Panics if recursive initialization of the TLS variable is detected for the current thread.
+    /// Panics if setting sentinel or TLS value fails.
     #[inline(always)]
-    pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
-        let key = self.get_key().expect("TLS key allocation failed");
+    fn get_initialized_ptr(&self) -> Result<*const T, TlsErrorKind> {
+        let key = self.get_key()?;
         let raw_ptr = {
             #[cfg(windows)]
             unsafe {
@@ -87,83 +95,134 @@ impl<T, F: Fn() -> T> Tls<T, F> {
 
         if !raw_ptr.is_null() {
             if is_sentinel(raw_ptr) {
+                return Err(TlsErrorKind::RecursiveAccess);
+            }
+            return Ok(raw_ptr);
+        }
+        Err(TlsErrorKind::Uninitialized)
+    }
+
+    /// Helper to retrieve the TLS value pointer, optionally initializing it.
+    ///
+    /// # Errors
+    ///
+    /// - Returns `Err(TlsErrorKind::AllocationFailed)` if key allocation fails.
+    /// - Returns `Err(TlsErrorKind::RecursiveAccess)` if recursive initialization is detected.
+    /// - Returns `Err(TlsErrorKind::Uninitialized)` if no initializer is provided and the value is not set.
+    ///
+    /// # Panics
+    ///
+    /// Panics if setting sentinel or TLS value fails.
+    #[inline(always)]
+    fn get_or_try_init<I>(&self, init: I) -> Result<*const T, TlsErrorKind>
+    where
+        I: FnOnce() -> T,
+    {
+        match self.get_initialized_ptr() {
+            Ok(raw_ptr) => Ok(raw_ptr),
+            Err(TlsErrorKind::Uninitialized) => {
+                let key = self.get_key()?;
+                // Set sentinel to detect recursive initialization
+                let sentinel = sentinel_ptr::<T>();
+                #[cfg(windows)]
+                unsafe {
+                    let res = FlsSetValue(key, sentinel as _);
+                    if res == 0 {
+                        panic!(
+                            "Failed to set TLS sentinel: error code {}",
+                            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+                        );
+                    }
+                }
+                #[cfg(unix)]
+                unsafe {
+                    let res = pthread_setspecific(key, sentinel as _);
+                    if res != 0 {
+                        panic!("Failed to set TLS sentinel: error code {}", res);
+                    }
+                }
+
+                // Use ResetGuard to guarantee sentinel cleanup in case of closure panic or set failure
+                let guard = ResetGuard::new(key);
+
+                // Initialize using the closure
+                let val = init();
+                let owned_ptr = Box::into_raw(Box::new(val));
+
+                #[cfg(windows)]
+                unsafe {
+                    let res = FlsSetValue(key, owned_ptr as _);
+                    if res == 0 {
+                        let _ = Box::from_raw(owned_ptr);
+                        panic!(
+                            "Failed to set TLS value: error code {}",
+                            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+                        );
+                    }
+                }
+                #[cfg(unix)]
+                unsafe {
+                    let res = pthread_setspecific(key, owned_ptr as _);
+                    if res != 0 {
+                        let _ = Box::from_raw(owned_ptr);
+                        panic!("Failed to set TLS value: error code {}", res);
+                    }
+                }
+
+                guard.cancel();
+                Ok(owned_ptr)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Executes a closure with a reference to the value stored in TLS for the current thread.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the TLS value is uninitialized, or if recursive access/key allocation/set fails.
+    pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        match self.try_with(f) {
+            Ok(r) => r,
+            Err(TlsErrorKind::Uninitialized) => {
+                panic!("TLS value is uninitialized!");
+            }
+            Err(TlsErrorKind::RecursiveAccess) => {
                 panic!("TLS recursive initialization detected!");
             }
-            return f(unsafe { &*raw_ptr });
-        }
-
-        // Set sentinel to detect recursive initialization
-        let sentinel = sentinel_ptr::<T>();
-        #[cfg(windows)]
-        unsafe {
-            let res = FlsSetValue(key, sentinel as _);
-            if res == 0 {
-                panic!(
-                    "Failed to set TLS sentinel: error code {}",
-                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
-                );
+            Err(TlsErrorKind::AllocationFailed) => {
+                panic!("TLS key allocation failed");
+            }
+            Err(TlsErrorKind::SetFailed(code)) => {
+                panic!("TLS set value failed with error code: {}", code);
             }
         }
-        #[cfg(unix)]
-        unsafe {
-            let res = pthread_setspecific(key, sentinel as _);
-            if res != 0 {
-                panic!("Failed to set TLS sentinel: error code {}", res);
-            }
-        }
+    }
 
-        // Use ResetGuard to guarantee sentinel cleanup in case of closure panic or set failure
-        let guard = ResetGuard::new(key);
-
-        // Initialize using the closure
-        let val = (self.init)();
-        let owned_ptr = Box::into_raw(Box::new(val));
-
-        #[cfg(windows)]
-        unsafe {
-            let res = FlsSetValue(key, owned_ptr as _);
-            if res == 0 {
-                let _ = Box::from_raw(owned_ptr);
-                panic!(
-                    "Failed to set TLS value: error code {}",
-                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
-                );
-            }
-        }
-        #[cfg(unix)]
-        unsafe {
-            let res = pthread_setspecific(key, owned_ptr as _);
-            if res != 0 {
-                let _ = Box::from_raw(owned_ptr);
-                panic!("Failed to set TLS value: error code {}", res);
-            }
-        }
-
-        guard.cancel();
-        f(unsafe { &*owned_ptr })
+    /// Executes a closure with a reference to the value stored in TLS for the current thread,
+    /// initializing it with the provided closure if it has not been set yet.
+    ///
+    /// # Panics
+    ///
+    /// Panics if recursive initialization of the TLS variable is detected for the current thread,
+    /// or if TLS key allocation/set fails.
+    pub fn with_or_try_init<R>(
+        &self,
+        f: impl FnOnce(&T) -> R,
+        init: impl FnOnce() -> T,
+    ) -> Result<R, TlsErrorKind> {
+        self.get_or_try_init(init)
+            .map(|raw_ptr| f(unsafe { &*raw_ptr }))
     }
 
     /// Executes a closure with a reference to the value stored in TLS for the current thread without initializing it.
     ///
     /// Returns `Err(TlsErrorKind::Uninitialized)` if no value has been set for this thread or if it is currently being initialized.
-    #[inline(always)]
     pub fn try_with<R>(&self, f: impl FnOnce(&T) -> R) -> Result<R, TlsErrorKind> {
-        let key = self.get_key()?;
-        let raw_ptr = {
-            #[cfg(windows)]
-            unsafe {
-                FlsGetValue(key) as *const T
-            }
-            #[cfg(unix)]
-            unsafe {
-                pthread_getspecific(key) as *const T
-            }
-        };
-
-        if raw_ptr.is_null() || is_sentinel(raw_ptr) {
-            Err(TlsErrorKind::Uninitialized)
-        } else {
-            Ok(unsafe { f(&*raw_ptr) })
+        match self.get_initialized_ptr() {
+            Ok(raw_ptr) => Ok(unsafe { f(&*raw_ptr) }),
+            Err(TlsErrorKind::RecursiveAccess) => Err(TlsErrorKind::Uninitialized),
+            Err(e) => Err(e),
         }
     }
 
@@ -267,10 +326,10 @@ impl<T, F: Fn() -> T> Tls<T, F> {
     }
 }
 
-unsafe impl<T: Send, F: Send> Send for Tls<T, F> {}
-unsafe impl<T, F: Sync> Sync for Tls<T, F> {}
+unsafe impl<T> Send for Tls<T> {}
+unsafe impl<T> Sync for Tls<T> {}
 
-impl<T, F> Drop for Tls<T, F> {
+impl<T> Drop for Tls<T> {
     fn drop(&mut self) {
         if let Some(&key) = self.key.get() {
             #[cfg(windows)]
@@ -314,41 +373,64 @@ mod tests {
         pub static MACRO_TLS_STR: String = "hello_macro".to_string();
     }
 
-    static TEST_TLS: Tls<i32> = Tls::new(|| 42);
+    static TEST_TLS: Tls<i32> = Tls::new();
 
     #[test]
     fn test_basic_get_init() {
-        TEST_TLS.with(|v| {
-            assert_eq!(*v, 42);
-        });
+        TEST_TLS
+            .with_or_try_init(
+                |v| {
+                    assert_eq!(*v, 42);
+                },
+                || 42,
+            )
+            .unwrap();
     }
 
     #[test]
     fn test_thread_isolation() {
         thread::spawn(move || {
-            TEST_TLS.with(|v| {
-                assert_eq!(*v, 42);
-            });
+            TEST_TLS
+                .with_or_try_init(
+                    |v| {
+                        assert_eq!(*v, 42);
+                    },
+                    || 42,
+                )
+                .unwrap();
         })
         .join()
         .unwrap();
 
-        TEST_TLS.with(|v| {
-            assert_eq!(*v, 42);
-        });
+        TEST_TLS
+            .with_or_try_init(
+                |v| {
+                    assert_eq!(*v, 42);
+                },
+                || 42,
+            )
+            .unwrap();
     }
 
     #[test]
     #[should_panic(expected = "TLS recursive initialization detected!")]
     fn test_reentrancy_detection() {
-        static RECURSIVE_TLS: Tls<i32> = Tls::new(|| RECURSIVE_TLS.with(|x| *x));
-        RECURSIVE_TLS.with(|_| {});
+        static RECURSIVE_TLS: Tls<i32> = Tls::new();
+        RECURSIVE_TLS
+            .with_or_try_init(
+                |_| {},
+                || {
+                    RECURSIVE_TLS
+                        .with_or_try_init(|x| *x, || 42)
+                        .expect("TLS recursive initialization detected!")
+                },
+            )
+            .unwrap();
     }
 
     #[test]
     fn test_set_owned_and_try_with() {
-        let local_tls: Tls<String> = Tls::new(|| "default".to_string());
-        local_tls.with(|s| assert_eq!(s, "default"));
+        let local_tls: Tls<String> = Tls::new();
 
         assert!(local_tls.set_owned("hello".to_string()).unwrap().is_none());
         local_tls.with(|s| assert_eq!(s, "hello"));
@@ -368,23 +450,38 @@ mod tests {
 
     #[test]
     fn test_set_owned_recursive_error() {
-        static REC_TLS: Tls<i32> = Tls::new(|| {
-            let res = REC_TLS.set_owned(100);
-            let err = res.unwrap_err();
-            assert_eq!(err.kind(), TlsErrorKind::RecursiveAccess);
-            assert_eq!(*err.into_val(), 100);
-            42
-        });
-        REC_TLS.with(|_| {});
+        static REC_TLS: Tls<i32> = Tls::new();
+        REC_TLS
+            .with_or_try_init(
+                |_| {},
+                || {
+                    let res = REC_TLS.set_owned(100);
+                    let err = res.unwrap_err();
+                    assert_eq!(err.kind(), TlsErrorKind::RecursiveAccess);
+                    assert_eq!(*err.into_val(), 100);
+                    42
+                },
+            )
+            .unwrap();
     }
 
     #[test]
     fn test_veloq_tls_macro() {
-        MACRO_TLS_INT.with(|v| {
-            assert_eq!(*v, 100);
-        });
-        MACRO_TLS_STR.with(|v| {
-            assert_eq!(v, "hello_macro");
-        });
+        MACRO_TLS_INT
+            .with_or_try_init(
+                |v| {
+                    assert_eq!(*v, 100);
+                },
+                || 100,
+            )
+            .unwrap();
+        MACRO_TLS_STR
+            .with_or_try_init(
+                |v| {
+                    assert_eq!(v, "hello_macro");
+                },
+                || "hello_macro".to_string(),
+            )
+            .unwrap();
     }
 }

@@ -29,7 +29,7 @@ macro_rules! veloq_tls {
     ) => {
         $(
             $(#[$attr])*
-            $vis static $name: $crate::Tls<$t> = $crate::Tls::new(|| $init);
+            $vis static $name: $crate::Tls<$t> = $crate::Tls::new();
         )*
     };
 }
