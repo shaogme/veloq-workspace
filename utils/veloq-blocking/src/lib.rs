@@ -144,14 +144,21 @@ impl ThreadPool {
             let keep_alive = self.keep_alive;
             let core_threads = self.core_threads;
 
-            state.task_count.fetch_add(1, Ordering::SeqCst);
-            state.queue.push(task);
-
-            let _ = thread::Builder::new()
+            match thread::Builder::new()
                 .name("veloq-blocking-worker".into())
-                .spawn(move || Self::worker_loop(state_clone, keep_alive, core_threads));
-
-            return Ok(());
+                .spawn(move || Self::worker_loop(state_clone, keep_alive, core_threads))
+            {
+                Ok(_) => {
+                    state.task_count.fetch_add(1, Ordering::SeqCst);
+                    state.queue.push(task);
+                    let _guard = state.sleeper_lock.lock();
+                    state.cond.notify_one();
+                    return Ok(());
+                }
+                Err(_) => {
+                    state.active_workers.fetch_sub(1, Ordering::SeqCst);
+                }
+            }
         }
 
         // 3. Queue if capable (using atomic count for O(1) check)
