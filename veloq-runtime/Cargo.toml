@@ -22,6 +22,7 @@ veloq-intrusive-linklist.workspace = true
 veloq-tls.workspace = true
 crossbeam-deque.workspace = true
 veloq-storage.workspace = true
+veloq-thread.workspace = true
 
 diagweave.workspace = true
 

@@ -85,7 +85,7 @@ impl<'rt, T, WF> Runtime<'rt, T, WF> {
 
         let thread_errors = Mutex::new(None);
 
-        let res = thread::scope(|scope| {
+        let res: Result<R> = veloq_thread::scope(|scope| {
             struct ShutdownGuard<'rt, T>(&'rt RuntimeShared<T>);
             impl<'rt, T> Drop for ShutdownGuard<'rt, T> {
                 fn drop(&mut self) {
@@ -145,7 +145,7 @@ impl<'rt, T, WF> Runtime<'rt, T, WF> {
                             *guard = Some(err);
                         }
                     }
-                });
+                }).map_err(|e| RuntimeError::ThreadSpawnFailed { source: e })?;
             }
 
             let deque0 = deques.pop().ok_or(RuntimeError::MainWorkerDequeExhausted)?;
@@ -260,9 +260,9 @@ impl<'rt, T, WF> Runtime<'rt, T, WF> {
             }
 
             block_res
-        })?;
+        });
 
-        Ok(res)
+        res
     }
 }
 
