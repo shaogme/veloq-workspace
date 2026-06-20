@@ -97,10 +97,8 @@ impl<'a> Thread<'a> {
         Ok(())
     }
 
-    pub fn yield_now() {
-        unsafe {
-            let _ = SwitchToThread();
-        }
+    pub fn yield_now() -> bool {
+        unsafe { SwitchToThread() != 0 }
     }
 }
 
@@ -127,8 +125,8 @@ impl PlatformImpl for Platform {
         thread.abort()
     }
 
-    fn yield_now() {
-        Thread::yield_now();
+    fn yield_now() -> bool {
+        Thread::yield_now()
     }
 }
 

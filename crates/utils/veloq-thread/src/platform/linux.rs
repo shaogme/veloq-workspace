@@ -92,10 +92,8 @@ impl<'a> Thread<'a> {
         Ok(())
     }
 
-    pub fn yield_now() {
-        unsafe {
-            let _ = sched_yield();
-        }
+    pub fn yield_now() -> bool {
+        unsafe { sched_yield() == 0 }
     }
 }
 
@@ -122,8 +120,8 @@ impl PlatformImpl for Platform {
         thread.abort()
     }
 
-    fn yield_now() {
-        Thread::yield_now();
+    fn yield_now() -> bool {
+        Thread::yield_now()
     }
 }
 

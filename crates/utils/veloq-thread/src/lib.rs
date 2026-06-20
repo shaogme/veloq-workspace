@@ -23,6 +23,8 @@ where
 }
 
 /// 让出当前线程的 CPU 执行时间片。
-pub fn yield_now() {
-    Platform::yield_now();
+///
+/// 如果成功让出或切换到了另一个线程，返回 `true`；否则返回 `false`。
+pub fn yield_now() -> bool {
+    Platform::yield_now()
 }

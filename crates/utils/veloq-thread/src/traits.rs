@@ -35,7 +35,9 @@ pub trait PlatformImpl: Sized {
     fn abort<'a>(thread: &Self::Thread<'a>) -> Result<(), Self::Error>;
 
     /// 让出当前线程 of CPU 执行时间片。
-    fn yield_now();
+    ///
+    /// 如果成功让出或切换到了另一个线程，返回 `true`；否则返回 `false`。
+    fn yield_now() -> bool;
 
     /// 创建一个结构化并发作用域，并在其中执行闭包 `f`。
     fn scope<'env, F, R>(f: F) -> R
