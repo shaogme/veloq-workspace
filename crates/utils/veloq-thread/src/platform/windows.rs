@@ -59,7 +59,7 @@ impl<'a> Thread<'a> {
         unsafe {
             let handle = CreateThread(null(), 0, Some(thread_entry_win), param, 0, null_mut());
 
-            if handle == null_mut() {
+            if handle.is_null() {
                 let err = GetLastError();
                 let _ = Box::from_raw(param as *mut Box<dyn FnOnce() + 'a>);
                 return Err(ThreadError::CreationFailed(err));
