@@ -9,7 +9,7 @@ use std::{
 };
 
 use diagweave::Transform;
-use veloq_blocking::init_blocking_pool;
+
 use veloq_buf::PoolTopology;
 use veloq_driver_native::driver::PlatformDriver;
 use veloq_runtime::{
@@ -75,9 +75,6 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
             thread::available_parallelism()
                 .unwrap_or_else(|_| NonZeroUsize::new(1).expect("1 is non-zero"))
         });
-
-        // Initialize blocking pool using config
-        init_blocking_pool(self.config.get_blocking_pool_config().clone());
 
         let state = self.topology.init(worker_count.get()).trans()?;
 

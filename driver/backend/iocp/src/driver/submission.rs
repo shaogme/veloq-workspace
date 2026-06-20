@@ -6,7 +6,7 @@ use std::{
 
 use super::completion::COMP_BACKEND_IOCP;
 use diagweave::prelude::*;
-use veloq_blocking::{BlockingTask, get_blocking_pool};
+use veloq_blocking::{BlockingTask, ThreadPool};
 use veloq_driver_core::{
     driver::{
         CompletionBackendHooks, CompletionControl, CompletionFlowExt, CompletionHookOutcome,
@@ -53,14 +53,6 @@ impl<'a> SubmitContextInternal<'a> {
             completion_table,
             diagnostics,
         }
-    }
-}
-
-struct BlockingBridge;
-
-impl BlockingBridge {
-    fn submit(task: BlockingTask) -> bool {
-        get_blocking_pool().execute(task).is_ok()
     }
 }
 
@@ -206,8 +198,9 @@ impl<'a> IocpDriver<'a> {
         ctx: SubmitContextInternal<'_>,
         token: OpToken,
         task: BlockingTask,
+        blocking_pool: &ThreadPool,
     ) -> IocpResult<Poll<()>> {
-        if !BlockingBridge::submit(task) {
+        if blocking_pool.execute(task).is_err() {
             let report = IocpError::Submission.report("iocp/driver", "thread pool overloaded");
             let event_res = iocp_fallback_event_res(IocpError::Submission);
             let event = UserCompletionEvent::from_parts(COMP_BACKEND_IOCP, token, event_res, 0);
@@ -234,12 +227,13 @@ impl<'a> IocpDriver<'a> {
         result: IocpResult<SubmissionResult>,
         token: OpToken,
         op_in: &mut Option<IocpOp>,
+        blocking_pool: &ThreadPool,
     ) -> DriverSubmitResult<IocpError> {
         match result {
             Ok(SubmissionResult::Pending) => DriverSubmitResult::submitted(Poll::Pending),
             Ok(SubmissionResult::PostToQueue) => Self::handle_post_to_queue(ops, ctx, token, op_in),
             Ok(SubmissionResult::Offload(task)) => {
-                match Self::handle_offload(ops, ctx, token, task) {
+                match Self::handle_offload(ops, ctx, token, task, blocking_pool) {
                     Ok(poll) => DriverSubmitResult::submitted(poll),
                     Err(_) => DriverSubmitResult::failed(
                         IocpError::Submission

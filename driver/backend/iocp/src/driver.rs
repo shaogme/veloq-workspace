@@ -9,6 +9,7 @@ use std::{
     sync::{Arc, mpsc},
     time::Duration,
 };
+use veloq_blocking::ThreadPool;
 
 use diagweave::prelude::*;
 
@@ -72,6 +73,8 @@ pub struct IocpDriver<'a> {
     rio: IocpRioRuntime<'a>,
     shutting_down: bool,
     closed: bool,
+
+    blocking_pool: ThreadPool,
 
     // Rust drops fields in declaration order; keep this last so WSACleanup runs
     // after socket/RIO-backed state has been torn down.
@@ -229,7 +232,14 @@ impl<'a> Driver for IocpDriver<'a> {
             diagnostics,
         );
 
-        Self::on_submit_res(&mut self.ops, ctx, result, token, op_in)
+        Self::on_submit_res(
+            &mut self.ops,
+            ctx,
+            result,
+            token,
+            op_in,
+            &self.blocking_pool,
+        )
     }
 
     fn drive(&mut self, mode: DriveMode) -> IocpResult<DriveOutcome> {

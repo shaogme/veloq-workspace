@@ -13,7 +13,6 @@ pub struct Config {
     iocp: IocpConfig,
     worker_threads: Option<NonZeroUsize>,
     direct_io: bool,
-    blocking_pool: BlockingPoolConfig,
     queue_capacity: NonZeroUsize,
 }
 
@@ -46,7 +45,6 @@ impl Config {
             iocp: IocpConfig::default(),
             worker_threads: None,
             direct_io: false,
-            blocking_pool: BlockingPoolConfig::default(),
             queue_capacity: nz!(1024),
         }
     }
@@ -88,9 +86,18 @@ impl Config {
         self
     }
 
-    pub fn blocking_pool(mut self, blocking_pool: BlockingPoolConfig) -> Self {
-        self.blocking_pool = blocking_pool;
-        self
+    pub fn blocking_pool(self, blocking_pool: BlockingPoolConfig) -> Self {
+        #[cfg(windows)]
+        {
+            let mut this = self;
+            this.iocp.blocking_pool = blocking_pool;
+            this
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = blocking_pool;
+            self
+        }
     }
 
     #[cfg(windows)]
@@ -119,10 +126,6 @@ impl Config {
 
     pub(crate) fn get_worker_threads_opt(&self) -> Option<NonZeroUsize> {
         self.worker_threads
-    }
-
-    pub(crate) fn get_blocking_pool_config(&self) -> &BlockingPoolConfig {
-        &self.blocking_pool
     }
 
     pub(crate) fn get_queue_capacity(&self) -> NonZeroUsize {

@@ -1,4 +1,5 @@
 use std::num::{NonZeroU32, NonZeroUsize};
+use veloq_blocking::BlockingPoolConfig;
 use veloq_buf::nz;
 use veloq_driver_core::{
     BorrowedRawHandle as CoreBorrowedRawHandle, IoFd as CoreIoFd,
@@ -42,6 +43,8 @@ pub struct IocpConfig {
     pub entries: NonZeroU32,
     /// Mode for buffer registration.
     pub registration_mode: BufferRegistrationMode,
+    /// Configuration for the blocking thread pool.
+    pub blocking_pool: BlockingPoolConfig,
 }
 
 impl AsRef<IocpConfig> for IocpConfig {
@@ -55,6 +58,7 @@ impl Default for IocpConfig {
         Self {
             entries: nz!(1024),
             registration_mode: BufferRegistrationMode::Strict,
+            blocking_pool: BlockingPoolConfig::default(),
         }
     }
 }

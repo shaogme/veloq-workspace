@@ -3,7 +3,7 @@ use parking_lot::{Condvar, Mutex};
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
     thread,
@@ -45,26 +45,6 @@ impl BlockingTask {
             BlockingTask::Fn(f) => f(),
         }
     }
-}
-
-pub static BLOCKING_POOL: OnceLock<ThreadPool> = OnceLock::new();
-
-/// Initialize the blocking pool with the given config
-pub fn init_blocking_pool(config: BlockingPoolConfig) -> &'static ThreadPool {
-    BLOCKING_POOL.get_or_init(|| {
-        ThreadPool::new(
-            config.core_threads,
-            config.max_threads,
-            config.queue_capacity,
-            config.keep_alive,
-        )
-    })
-}
-
-/// Get the global blocking thread pool instance.
-/// Initializes it if it hasn't been initialized yet.
-pub fn get_blocking_pool() -> &'static ThreadPool {
-    BLOCKING_POOL.get().expect("Blocking pool not initialized")
 }
 
 struct PoolState {

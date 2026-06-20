@@ -2,6 +2,7 @@ use std::{
     sync::mpsc,
     time::{Duration, Instant},
 };
+use veloq_blocking::ThreadPool;
 
 use diagweave::prelude::*;
 use tracing::debug;
@@ -97,7 +98,19 @@ impl<'a> IocpDriver<'a> {
     ) -> IocpResult<Self> {
         let cfg = config.as_ref();
         let pre = Self::create_pre_init()?;
-        Self::new_from_pre_init(cfg.entries.get(), pre, cfg.registration_mode, registrar)
+        let blocking_pool = ThreadPool::new(
+            cfg.blocking_pool.core_threads,
+            cfg.blocking_pool.max_threads,
+            cfg.blocking_pool.queue_capacity,
+            cfg.blocking_pool.keep_alive,
+        );
+        Self::new_from_pre_init(
+            cfg.entries.get(),
+            pre,
+            cfg.registration_mode,
+            registrar,
+            blocking_pool,
+        )
     }
 
     /// Creates a new IOCP driver from a pre-initialized handle.
@@ -106,6 +119,7 @@ impl<'a> IocpDriver<'a> {
         port_val: PreInit,
         registration_mode: BufferRegistrationMode,
         registrar: &'a (dyn BufferRegistrar + 'a),
+        blocking_pool: ThreadPool,
     ) -> IocpResult<Self> {
         let winsock = Self::start_winsock()?;
 
@@ -139,6 +153,7 @@ impl<'a> IocpDriver<'a> {
             rio,
             shutting_down: false,
             closed: false,
+            blocking_pool,
             _winsock: winsock,
         })
     }
