@@ -28,7 +28,7 @@ pub use shared::{EnqueuePinnedOutcome, RuntimeShared, RuntimeSharedBase};
 use primitives::{Signal, create_waker};
 use shared::{Receivers, init_runtime_components};
 
-pub struct Runtime<'rt, 'env: 'rt, T, WF> {
+pub struct Runtime<'rt, 'env: 'rt, T, WF: 'rt> {
     shared: RuntimeShared<T>,
     receivers: Option<Receivers>,
     worker_factory: Option<WF>,
@@ -338,7 +338,7 @@ impl<T, WF> RuntimeBuilder<T, WF> {
     pub fn scope<'rt, 'env: 'rt, F, R>(self, f: F) -> Result<R>
     where
         T: 'rt,
-        WF: Fn(usize, &'rt RuntimeShared<T>) -> T + Send + Sync,
+        WF: Fn(usize, &'rt RuntimeShared<T>) -> T + Send + Sync + 'rt,
         F: AsyncFnOnce(RuntimeCtx<'rt, T>) -> R,
     {
         let worker_count = self.worker_count.unwrap_or_else(|| {
