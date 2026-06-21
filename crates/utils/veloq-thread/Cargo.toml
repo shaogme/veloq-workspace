@@ -20,7 +20,7 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
-libc = { workspace = true }
+libc.workspace = true
 
 [lints]
 workspace = true

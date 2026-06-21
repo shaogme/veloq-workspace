@@ -20,6 +20,8 @@ members = [
     "crates/utils/veloq-tls",
     "crates/utils/veloq-storage",
     "crates/utils/veloq-thread",
+    "crates/utils/veloq-hash",
+    "crates/utils/veloq-std",
     "crates/test-utils/xtest-runner"
 ]
 default-members = [
@@ -41,6 +43,8 @@ default-members = [
     "crates/utils/veloq-tls",
     "crates/utils/veloq-storage",
     "crates/utils/veloq-thread",
+    "crates/utils/veloq-hash",
+    "crates/utils/veloq-std",
     "crates/test-utils/xtest-runner"
 ]
 resolver = "3"
@@ -81,6 +85,8 @@ veloq-pod = { path = "crates/utils/veloq-pod", version = "0.1.0" }
 veloq-tls = { path = "crates/utils/veloq-tls", version = "0.1.0" }
 veloq-storage = { path = "crates/utils/veloq-storage", version = "0.1.0" }
 veloq-thread = { path = "crates/utils/veloq-thread", version = "0.1.0" }
+veloq-hash = { path = "crates/utils/veloq-hash", version = "0.1.0" }
+veloq-std = { path = "crates/utils/veloq-std", version = "0.1.0" }
 
 # External Crates
 crossbeam-utils = { version = "0.8", default-features = false }
@@ -110,6 +116,8 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 
 tokio = { version = "1", features = ["full"] }
 slotmap = "1.1.1"
+
+rustc-hash = "2.1.1"
 
 [workspace.lints.rust]
 warnings = "deny"

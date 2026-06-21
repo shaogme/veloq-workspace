@@ -108,8 +108,8 @@ impl<'scope, 'env, P: PlatformImpl> Scope<'scope, 'env, P> {
     /// 在当前作用域内生成一个新线程并执行闭包 `f`。
     pub fn spawn<F, R>(&'scope self, f: F) -> Result<ScopedJoinHandle<'scope, P, R>, P::Error>
     where
-        F: FnOnce() -> R + Send + 'scope,
-        R: Send + 'scope,
+        F: FnOnce() -> R + Send + 'env,
+        R: Send + 'env,
     {
         // 1. 在堆上分配一个共享槽位，用于接收子线程的返回值
         let result = Arc::new(SafeUnsafeCell::new(None));

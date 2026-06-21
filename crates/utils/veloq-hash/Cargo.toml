@@ -1,0 +1,27 @@
+[package]
+name = "veloq-hash"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "High-performance collision-resistant hashing backend for Windows and Linux."
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+rustc-hash.workspace = true
+
+[[bench]]
+name = "collision_and_perf_bench"
+harness = false
+
+
