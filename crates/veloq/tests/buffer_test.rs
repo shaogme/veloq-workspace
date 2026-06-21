@@ -1,5 +1,3 @@
-use std::num::NonZeroUsize;
-
 #[cfg(feature = "test-hooks")]
 use veloq::runtime::context::Ctx;
 use veloq::{config::BufferRegistrationMode, runtime::Runtime};
@@ -9,17 +7,6 @@ use veloq_buf::{
 
 #[cfg(feature = "test-hooks")]
 use veloq_driver_native::driver::test_hooks::DriverTestHooks;
-
-fn build_runtime(
-    worker_threads: NonZeroUsize,
-    mode: BufferRegistrationMode,
-) -> Runtime<UniformSlot> {
-    Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(1))))
-        .worker_count(Some(worker_threads))
-        .with_config(|c| c.iocp_registration_mode(mode).uring_registration_mode(mode))
-        .build()
-        .expect("failed to build runtime")
-}
 
 fn assert_slot_based(info: RegionInfo, message: &str) {
     assert_eq!(info.pool_kind, PoolKind::SlotBased, "{message}");
@@ -34,9 +21,10 @@ fn current_chunk_register_attempts(ctx: Ctx<'_, '_>) -> u64 {
 }
 
 fn run_auto_expansion_single_worker(mode: BufferRegistrationMode) {
-    let runtime = build_runtime(nz!(1), mode);
-    runtime
-        .block_on(async |ctx| {
+    Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(1))))
+        .worker_count(Some(nz!(1)))
+        .with_config(|c| c.iocp_registration_mode(mode).uring_registration_mode(mode))
+        .scope(async |ctx| {
             let pool = ctx.buf_pool();
             let alloc_size = nz!(1024 * 1024);
 
@@ -81,59 +69,62 @@ fn run_expansion_immediate_registration_check(
     mode: BufferRegistrationMode,
     _should_immediate: bool,
 ) {
-    let runtime = build_runtime(nz!(1), mode);
-    runtime.block_on(async |ctx| {
-        let pool = ctx.buf_pool();
-        let alloc_size = nz!(1024 * 1024);
+    Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(1))))
+        .worker_count(Some(nz!(1)))
+        .with_config(|c| c.iocp_registration_mode(mode).uring_registration_mode(mode))
+        .scope(async |ctx| {
+            let pool = ctx.buf_pool();
+            let alloc_size = nz!(1024 * 1024);
 
-        #[cfg(feature = "test-hooks")]
-        let before = current_chunk_register_attempts(ctx);
+            #[cfg(feature = "test-hooks")]
+            let before = current_chunk_register_attempts(ctx);
 
-        let mut bufs = Vec::new();
-        let mut expanded = false;
-        for i in 0..16 {
-            let buf = pool
-                .alloc(alloc_size)
-                .unwrap_or_else(|| panic!("allocation failed while triggering expansion, i={i}"));
-            let info = buf.resolve_region_info();
-            assert_slot_based(info, "expansion should not fallback to heap");
-            if info.id != ChunkId::ZERO {
-                expanded = true;
+            let mut bufs = Vec::new();
+            let mut expanded = false;
+            for i in 0..16 {
+                let buf = pool
+                    .alloc(alloc_size)
+                    .unwrap_or_else(|| panic!("allocation failed while triggering expansion, i={i}"));
+                let info = buf.resolve_region_info();
+                assert_slot_based(info, "expansion should not fallback to heap");
+                if info.id != ChunkId::ZERO {
+                    expanded = true;
+                }
+                bufs.push(buf);
+                if expanded {
+                    break;
+                }
             }
-            bufs.push(buf);
-            if expanded {
-                break;
-            }
-        }
-        assert!(expanded, "failed to trigger expansion");
+            assert!(expanded, "failed to trigger expansion");
 
-        // Cross at least one executor budget boundary so check_for_memory_updates runs again.
-        for _ in 0..128 {
-            ctx.yield_now().await;
-        }
-
-        #[cfg(feature = "test-hooks")]
-        {
-            let after = current_chunk_register_attempts(ctx);
-            if _should_immediate {
-                assert!(
-                    after > before,
-                    "compatible mode should eagerly register new chunk after expansion: before={before}, after={after}"
-                );
-            } else {
-                assert_eq!(
-                    after, before,
-                    "strict mode should not eagerly register after expansion without I/O submit: before={before}, after={after}"
-                );
+            // Cross at least one executor budget boundary so check_for_memory_updates runs again.
+            for _ in 0..128 {
+                ctx.yield_now().await;
             }
-        }
-    }).unwrap();
+
+            #[cfg(feature = "test-hooks")]
+            {
+                let after = current_chunk_register_attempts(ctx);
+                if _should_immediate {
+                    assert!(
+                        after > before,
+                        "compatible mode should eagerly register new chunk after expansion: before={before}, after={after}"
+                    );
+                } else {
+                    assert_eq!(
+                        after, before,
+                        "strict mode should not eagerly register after expansion without I/O submit: before={before}, after={after}"
+                    );
+                }
+            }
+        }).unwrap();
 }
 
 fn run_auto_expansion_multithread(mode: BufferRegistrationMode) {
-    let runtime = build_runtime(nz!(2), mode);
-    runtime
-        .block_on(async |ctx| {
+    Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(1))))
+        .worker_count(Some(nz!(2)))
+        .with_config(|c| c.iocp_registration_mode(mode).uring_registration_mode(mode))
+        .scope(async |ctx| {
             let pool = ctx.buf_pool();
             let alloc_size = nz!(1024 * 1024);
 

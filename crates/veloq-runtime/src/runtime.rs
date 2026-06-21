@@ -10,7 +10,6 @@ use std::{
 };
 
 use crate::{
-    LifetimeGuard,
     error::{Result, RuntimeError},
     utils::{FastRand, ownership::ArcOwnership},
 };
@@ -29,21 +28,23 @@ pub use shared::{EnqueuePinnedOutcome, RuntimeShared, RuntimeSharedBase};
 use primitives::{Signal, create_waker};
 use shared::{Receivers, init_runtime_components};
 
-pub struct Runtime<'rt, T, WF> {
+pub struct Runtime<'rt, 'env: 'rt, T, WF> {
     shared: RuntimeShared<T>,
     receivers: Option<Receivers>,
     worker_factory: Option<WF>,
-    _guard: &'rt LifetimeGuard,
-    _marker: std::marker::PhantomData<fn(&'rt ()) -> &'rt ()>,
+    _marker: std::marker::PhantomData<fn(&'rt ()) -> &'env ()>,
 }
 
 pub type DefaultWorkerFactory = fn(usize, &RuntimeShared<()>) -> ();
 
 pub type DefaultWorkerFactoryFor<T> = fn(usize, &RuntimeShared<T>) -> T;
 
-impl<'rt> Runtime<'rt, (), DefaultWorkerFactoryFor<()>> {
-    pub fn new(_guard: &'rt LifetimeGuard) -> Self {
-        RuntimeBuilder::new().build(_guard)
+impl<'rt, 'env: 'rt> Runtime<'rt, 'env, (), DefaultWorkerFactoryFor<()>> {
+    pub fn scope<F, R>(f: F) -> Result<R>
+    where
+        F: for<'rt_inner> AsyncFnOnce(RuntimeCtx<'rt_inner, ()>) -> R,
+    {
+        RuntimeBuilder::new().scope(f)
     }
 
     pub fn builder() -> RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
@@ -51,7 +52,7 @@ impl<'rt> Runtime<'rt, (), DefaultWorkerFactoryFor<()>> {
     }
 }
 
-impl<'rt, T, WF> Runtime<'rt, T, WF> {
+impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
     pub fn worker_count(&self) -> NonZeroUsize {
         self.shared.worker_count()
     }
@@ -334,7 +335,12 @@ impl<T, WF> RuntimeBuilder<T, WF> {
         }
     }
 
-    pub fn build<'rt>(self, guard: &'rt LifetimeGuard) -> Runtime<'rt, T, WF> {
+    pub fn scope<'rt, 'env: 'rt, F, R>(self, f: F) -> Result<R>
+    where
+        T: 'rt,
+        WF: Fn(usize, &'rt RuntimeShared<T>) -> T + Send + Sync,
+        F: AsyncFnOnce(RuntimeCtx<'rt, T>) -> R,
+    {
         let worker_count = self.worker_count.unwrap_or_else(|| {
             thread::available_parallelism().unwrap_or(NonZeroUsize::new(1).unwrap())
         });
@@ -347,12 +353,12 @@ impl<T, WF> RuntimeBuilder<T, WF> {
             self.idle_hook,
             self.worker_tick_hook,
         );
-        Runtime {
+        let rt = Runtime {
             shared,
             receivers: Some(receivers),
             worker_factory: self.worker_factory,
-            _guard: guard,
             _marker: std::marker::PhantomData,
-        }
+        };
+        rt.block_on(f)
     }
 }

@@ -1,5 +1,4 @@
 use veloq_runtime::{
-    LifetimeGuard,
     runtime::Runtime,
     scope,
     scope::JoinOutcome,
@@ -8,9 +7,7 @@ use veloq_runtime::{
 
 #[test]
 fn test_join_handle_waits_for_task_completion_on_cancel() {
-    let guard = LifetimeGuard;
-    let rt = Runtime::<(), _>::new(&guard);
-    rt.block_on(async |ctx| {
+    Runtime::<(), _>::scope(async |ctx| {
         scope!(ctx, async |scope| {
             let handle = scope.spawn_boxed(async {
                 for _ in 0..8 {
@@ -36,9 +33,7 @@ fn test_join_handle_waits_for_task_completion_on_cancel() {
 
 #[test]
 fn test_join_handle_cancelled_before_await() {
-    let guard = LifetimeGuard;
-    let rt = Runtime::<(), _>::new(&guard);
-    rt.block_on(async |ctx| {
+    Runtime::<(), _>::scope(async |ctx| {
         scope!(ctx, async |scope| {
             let handle = scope.spawn_boxed(async {
                 loop {
@@ -63,9 +58,7 @@ fn test_join_handle_cancelled_before_await() {
 
 #[test]
 fn test_join_handle_scope_cancel_waits_for_completion() {
-    let guard = LifetimeGuard;
-    let rt = Runtime::<(), _>::new(&guard);
-    rt.block_on(async |ctx| {
+    Runtime::<(), _>::scope(async |ctx| {
         scope!(ctx, async |scope| {
             let token = scope.cancel_token().clone();
             let handle = scope.spawn_boxed(async {

@@ -1,11 +1,9 @@
-use veloq_runtime::{LifetimeGuard, runtime::Runtime, scope, task::yield_now};
+use veloq_runtime::{runtime::Runtime, scope, task::yield_now};
 
 #[test]
 fn test_panic_propagation() {
-    let guard = LifetimeGuard;
-    let rt = Runtime::<(), _>::new(&guard);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        rt.block_on(async |ctx| {
+        Runtime::<(), _>::scope(async |ctx| {
             println!("开始测试 Panic 传播...");
             scope!(ctx, async |s| {
                 s.spawn_boxed(async {

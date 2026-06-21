@@ -3,9 +3,7 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use veloq_runtime::{
-    LifetimeGuard, runtime::Runtime, scope, scope::JoinOutcome, select, task::TaskError,
-};
+use veloq_runtime::{runtime::Runtime, scope, scope::JoinOutcome, select, task::TaskError};
 
 struct ReadyFuture<T>(Option<T>);
 impl<T: Unpin + Copy> Future for ReadyFuture<T> {
@@ -33,9 +31,7 @@ impl Future for PendingFuture {
 
 #[test]
 fn test_select_basic() {
-    let guard = LifetimeGuard;
-    let rt = Runtime::<(), _>::new(&guard);
-    rt.block_on(async |ctx| {
+    Runtime::<(), _>::scope(async |ctx| {
         let res = select! {
             ctx;
             val = ready(1) => val,
@@ -48,9 +44,7 @@ fn test_select_basic() {
 
 #[test]
 fn test_select_biased() {
-    let guard = LifetimeGuard;
-    let rt = Runtime::<(), _>::new(&guard);
-    rt.block_on(async |ctx| {
+    Runtime::<(), _>::scope(async |ctx| {
         let res = select! {
             ctx;
             biased;
@@ -64,9 +58,7 @@ fn test_select_biased() {
 
 #[test]
 fn test_select_biased_reverse() {
-    let guard = LifetimeGuard;
-    let rt = Runtime::<(), _>::new(&guard);
-    rt.block_on(async |ctx| {
+    Runtime::<(), _>::scope(async |ctx| {
         let res = select! {
             ctx;
             biased;
@@ -80,9 +72,7 @@ fn test_select_biased_reverse() {
 
 #[test]
 fn test_select_fair_distribution() {
-    let guard = LifetimeGuard;
-    let rt = Runtime::<(), _>::new(&guard);
-    rt.block_on(async |ctx| {
+    Runtime::<(), _>::scope(async |ctx| {
         let mut saw_first = false;
         let mut saw_second = false;
 
@@ -113,9 +103,7 @@ fn test_select_fair_distribution() {
 
 #[test]
 fn test_select_expression() {
-    let guard = LifetimeGuard;
-    let rt = Runtime::<(), _>::new(&guard);
-    rt.block_on(async |ctx| {
+    Runtime::<(), _>::scope(async |ctx| {
         let res = select! {
             ctx;
             v = async { 5 + 5 } => v,
@@ -128,9 +116,7 @@ fn test_select_expression() {
 
 #[test]
 fn test_select_three_branches() {
-    let guard = LifetimeGuard;
-    let rt = Runtime::<(), _>::new(&guard);
-    rt.block_on(async |ctx| {
+    Runtime::<(), _>::scope(async |ctx| {
         let res = select! {
             ctx;
             _ = PendingFuture => 1,
@@ -144,9 +130,7 @@ fn test_select_three_branches() {
 
 #[test]
 fn test_select_cancellation() {
-    let guard = LifetimeGuard;
-    let rt = Runtime::<(), _>::new(&guard);
-    rt.block_on(async |ctx| {
+    Runtime::<(), _>::scope(async |ctx| {
         scope!(ctx, async |s| {
             let handle = s.spawn_boxed(async move {
                 select! {

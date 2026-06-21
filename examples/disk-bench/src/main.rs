@@ -445,14 +445,10 @@ fn main() {
     let multiplier =
         NonZeroUsize::new(multiplier_units.max(1)).expect("multiplier must be non-zero");
 
-    let runtime = Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(multiplier)))
-        .worker_count(worker_count)
-        .build()
-        .expect("Failed to build Runtime");
-
     // Execute
-    runtime
-        .block_on(async |ctx| {
+    Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(multiplier)))
+        .worker_count(worker_count)
+        .scope(async |ctx| {
             scope!(ctx, async |s| {
                 // 1. Preparation Phase (Create & Fallocate)
                 println!(
@@ -559,7 +555,7 @@ fn main() {
             .await
             .unwrap();
         })
-        .unwrap();
+        .expect("Failed to run scope");
 
     // 4. Cleanup Phase
     println!("Cleaning up files...");

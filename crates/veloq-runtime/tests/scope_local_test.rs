@@ -1,5 +1,4 @@
 use veloq_runtime::{
-    LifetimeGuard,
     runtime::Runtime,
     scope,
     scope::JoinOutcome,
@@ -10,9 +9,7 @@ use veloq_runtime::{
 
 #[test]
 fn test_scope_local_basic() {
-    let guard = LifetimeGuard;
-    let rt = Runtime::<(), _>::new(&guard);
-    rt.block_on(async |ctx| {
+    Runtime::<(), _>::scope(async |ctx| {
         task_local!(t2, async { 2 + 2 });
         scope_local!(ctx, async |local_scope| {
             let h1 = local_scope.spawn_boxed_local(async { 1 + 1 });
@@ -28,9 +25,7 @@ fn test_scope_local_basic() {
 
 #[test]
 fn test_scope_local_nested() {
-    let guard = LifetimeGuard;
-    let rt = Runtime::<(), _>::new(&guard);
-    rt.block_on(async |ctx| {
+    Runtime::<(), _>::scope(async |ctx| {
         scope_local!(ctx, async move |outer| {
             let h1 = outer.spawn_boxed_local(async move {
                 scope_local!(ctx, async |inner| {
@@ -50,9 +45,7 @@ fn test_scope_local_nested() {
 
 #[test]
 fn test_scope_local_nested_in_async_scope_cancellation() {
-    let guard = LifetimeGuard;
-    let rt = Runtime::<(), _>::new(&guard);
-    rt.block_on(async |ctx| {
+    Runtime::<(), _>::scope(async |ctx| {
         scope!(ctx, async |parent_scope| {
             let parent_token = parent_scope.cancel_token().clone();
 

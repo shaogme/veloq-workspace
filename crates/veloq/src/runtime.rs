@@ -13,7 +13,6 @@ use diagweave::Transform;
 use veloq_buf::PoolTopology;
 use veloq_driver_native::driver::PlatformDriver;
 use veloq_runtime::{
-    LifetimeGuard,
     runtime::{self as async_runtime},
     utils::StaticTransfer,
 };
@@ -70,7 +69,10 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
         self
     }
 
-    pub fn build(self) -> VeloqResult<Runtime<T>> {
+    pub fn scope<F, R>(self, f: F) -> VeloqResult<R>
+    where
+        F: for<'s1, 's2> AsyncFnOnce(Ctx<'s1, 's2>) -> R,
+    {
         let worker_count = self.config.get_worker_threads_opt().unwrap_or_else(|| {
             thread::available_parallelism()
                 .unwrap_or_else(|_| NonZeroUsize::new(1).expect("1 is non-zero"))
@@ -78,12 +80,14 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
 
         let state = self.topology.init(worker_count.get()).trans()?;
 
-        Ok(Runtime {
+        let runtime = Runtime {
             worker_count,
             topology: self.topology,
             state,
             config: self.config,
-        })
+        };
+
+        runtime.block_on(f)
     }
 }
 
@@ -109,6 +113,13 @@ impl RegistrarDispatcher {
 impl<T: PoolTopology> Runtime<T> {
     pub fn builder(topology: T) -> RuntimeBuilder<T> {
         RuntimeBuilder::new(topology)
+    }
+
+    pub fn scope<F, R>(topology: T, f: F) -> VeloqResult<R>
+    where
+        F: for<'s1, 's2> AsyncFnOnce(Ctx<'s1, 's2>) -> R,
+    {
+        RuntimeBuilder::new(topology).scope(f)
     }
 
     pub fn worker_count(&self) -> NonZeroUsize {
@@ -148,9 +159,7 @@ impl<T: PoolTopology> Runtime<T> {
             }),
         );
 
-        let guard = LifetimeGuard;
-
-        let runtime = async_runtime::RuntimeBuilder::new()
+        async_runtime::RuntimeBuilder::new()
             .with_worker_count(Some(worker_count))
             .with_queue_capacity(config.get_queue_capacity())
             .with_idle_hook(poll_current_driver)
@@ -189,10 +198,7 @@ impl<T: PoolTopology> Runtime<T> {
                     registration_mode,
                 }
             })
-            .build(&guard);
-
-        runtime
-            .block_on(async move |runtime_ctx| {
+            .scope(async move |runtime_ctx| {
                 let ctx = Ctx { runtime_ctx };
                 f(ctx).await
             })
