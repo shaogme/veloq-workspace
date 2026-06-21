@@ -3,17 +3,17 @@ use crate::scope::{AsyncScope, LocalAsyncScope};
 use std::ops::AsyncFnOnce;
 
 #[doc(hidden)]
-pub fn _constrain<'g, R, F, TExtra>(f: F) -> F
+pub fn _constrain<'g, 'env, R, F, TExtra>(f: F) -> F
 where
-    F: for<'r> AsyncFnOnce(&'r AsyncScope<'r, 'g, TExtra>) -> R,
+    F: for<'r> AsyncFnOnce(&'r AsyncScope<'r, 'g, 'env, TExtra>) -> R,
 {
     f
 }
 
 #[doc(hidden)]
-pub fn _constrain_local<'g, R, F, TExtra>(f: F) -> F
+pub fn _constrain_local<'g, 'env, R, F, TExtra>(f: F) -> F
 where
-    F: for<'r> AsyncFnOnce(&'r LocalAsyncScope<'r, 'g, TExtra>) -> R,
+    F: for<'r> AsyncFnOnce(&'r LocalAsyncScope<'r, 'g, 'env, TExtra>) -> R,
 {
     f
 }

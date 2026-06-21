@@ -103,7 +103,7 @@ fn test_nested_scope_build_5() {
     let rt = Runtime::<(), _>::new(&guard);
     rt.block_on(async |ctx| {
         scope!(ctx, async move |parent_scope| {
-            async fn run_child_scope(child_scope: &AsyncScope<'_, '_, ()>) {
+            async fn run_child_scope(child_scope: &AsyncScope<'_, '_, '_, ()>) {
                 child_scope.spawn_boxed(async {});
             }
             parent_scope.spawn_boxed(async move {
@@ -121,7 +121,7 @@ fn test_nested_scope_build_6() {
     let guard = LifetimeGuard;
     let rt = Runtime::<(), _>::new(&guard);
     rt.block_on(async |ctx| {
-        scope!(ctx, async move |parent_scope| {
+        ctx.scope(async move |parent_scope| {
             parent_scope.spawn_boxed(async move {
                 scope!(ctx, async move |child_scope| {
                     child_scope.spawn_boxed(async {});

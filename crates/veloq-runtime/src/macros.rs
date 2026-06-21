@@ -193,17 +193,14 @@ macro_rules! scope {
         async {
             use std::future::poll_fn;
             use std::task::Poll;
-            use $crate::LifetimeGuard;
             use $crate::macros::helpers::{_constrain, _constrain_result};
             use $crate::scope::AsyncScope;
             use $crate::task::RuntimeContextExt;
 
             let parent = poll_fn(|cx| Poll::Ready(RuntimeContextExt::scope_completion(cx))).await;
-            let guard = LifetimeGuard;
             let scope = AsyncScope::new(
                 $crate::runtime::IntoRuntimeCtx::into_runtime_ctx($ctx),
                 parent,
-                &guard,
             );
             let s_ref = &scope;
             let res = _constrain($closure)(s_ref).await;
@@ -219,17 +216,14 @@ macro_rules! scope_local {
         async {
             use std::future::poll_fn;
             use std::task::Poll;
-            use $crate::LifetimeGuard;
             use $crate::macros::helpers::{_constrain_local, _constrain_result};
             use $crate::scope::LocalAsyncScope;
             use $crate::task::RuntimeContextExt;
 
             let parent = poll_fn(|cx| Poll::Ready(RuntimeContextExt::scope_completion(cx))).await;
-            let guard = LifetimeGuard;
             let scope = LocalAsyncScope::new(
                 $crate::runtime::IntoRuntimeCtx::into_runtime_ctx($ctx),
                 parent,
-                &guard,
             );
             let s_ref = &scope;
             let res = _constrain_local($closure)(s_ref).await;
