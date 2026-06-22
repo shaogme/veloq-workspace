@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use super::shared::{EnqueuePinnedOutcome, RuntimeShared, WorkerWaitHook};
+use super::shared::{EnqueuePinnedOutcome, RuntimeShared};
 use crate::{
     error::{Result, RuntimeError},
     scope::{AsyncScope, LocalAsyncScope},
@@ -34,6 +34,12 @@ pub enum IdleWaitStrategy {
     Block,
     /// 阻塞指定时长后重新检查。
     Timeout(Duration),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitBackend {
+    RuntimePark,
+    Driver,
 }
 
 impl IdleWaitStrategy {
@@ -62,7 +68,10 @@ pub enum IdleDecision {
     /// 继续推进，不进入阻塞等待。
     Continue,
     /// 进入等待阶段，具体方式由 `IdleWaitStrategy` 决定。
-    Wait(IdleWaitStrategy),
+    Wait {
+        backend: WaitBackend,
+        strategy: IdleWaitStrategy,
+    },
 }
 
 impl IdleDecision {
@@ -72,8 +81,8 @@ impl IdleDecision {
     }
 
     #[inline]
-    pub fn wait(strategy: IdleWaitStrategy) -> Self {
-        Self::Wait(strategy)
+    pub fn wait(backend: WaitBackend, strategy: IdleWaitStrategy) -> Self {
+        Self::Wait { backend, strategy }
     }
 
     #[inline]
@@ -82,10 +91,10 @@ impl IdleDecision {
     }
 
     #[inline]
-    pub(crate) fn into_wait_strategy(self) -> Option<IdleWaitStrategy> {
+    pub(crate) fn into_wait(self) -> Option<(WaitBackend, IdleWaitStrategy)> {
         match self {
             Self::Continue => None,
-            Self::Wait(strategy) => Some(strategy),
+            Self::Wait { backend, strategy } => Some((backend, strategy)),
         }
     }
 }
@@ -335,7 +344,7 @@ impl<'rt, T> RuntimeCtx<'rt, T> {
 }
 
 pub(crate) type IdleHook<T> = fn(&RuntimeShared<T>) -> Result<IdleDecision>;
-pub type RuntimeWorkerWaitHook<T> = WorkerWaitHook<T>;
+pub(crate) type DriverWaitHook<T> = fn(&RuntimeShared<T>, IdleWaitStrategy) -> Result<()>;
 pub(crate) type WorkerTickHook = fn();
 
 pub(crate) struct RouteCell<T> {
@@ -453,10 +462,16 @@ mod tests {
 
     #[test]
     fn idle_decision_wait_wraps_strategy() {
-        let decision = IdleDecision::wait(IdleWaitStrategy::timeout(Duration::from_millis(5)));
+        let decision = IdleDecision::wait(
+            WaitBackend::RuntimePark,
+            IdleWaitStrategy::timeout(Duration::from_millis(5)),
+        );
         assert_eq!(
-            decision.into_wait_strategy(),
-            Some(IdleWaitStrategy::Timeout(Duration::from_millis(5)))
+            decision.into_wait(),
+            Some((
+                WaitBackend::RuntimePark,
+                IdleWaitStrategy::Timeout(Duration::from_millis(5)),
+            ))
         );
     }
 }

@@ -6,77 +6,21 @@ use std::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     thread,
-    time::Duration,
 };
 use veloq_storage::{AtomicOptionPtr, StateOptionPtr};
 
 use crate::{
     error::Result,
     runtime::{
-        context::{IdleDecision, IdleWaitStrategy},
-        primitives::{EventCount, Parker, ParkerInner, Signal, Unparker},
+        context::{IdleDecision, IdleWaitStrategy, WaitBackend},
+        primitives::EventCount,
         shared::RuntimeShared,
+        wake::WakeCoordinator,
     },
     scope::GenericScopeCompletion,
     task::{LocalTaskRef, ScopeStorage, SendTaskRef, TaskHeader},
     utils::{FastRand, ownership::Ownership},
 };
-
-pub(crate) struct WorkerWakeSlot {
-    notified: Signal,
-    fallback: Unparker,
-}
-
-impl WorkerWakeSlot {
-    pub(crate) fn new(fallback: Unparker) -> Self {
-        Self {
-            notified: Signal::new(false),
-            fallback,
-        }
-    }
-
-    #[inline]
-    pub(crate) fn notify(&self) -> bool {
-        if self.notified.notify_once() {
-            self.fallback.unpark();
-            return true;
-        }
-        false
-    }
-
-    #[inline]
-    pub(crate) fn try_reset_notification(&self) -> bool {
-        self.notified.try_reset()
-    }
-}
-
-pub(crate) fn create_worker_waker(wake_slot: Arc<WorkerWakeSlot>) -> std::task::Waker {
-    use std::{
-        mem::ManuallyDrop,
-        task::{RawWaker, RawWakerVTable, Waker},
-    };
-
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(
-        |p| unsafe {
-            Arc::increment_strong_count(p as *const WorkerWakeSlot);
-            RawWaker::new(p, &VTABLE)
-        },
-        |p| unsafe {
-            let wake = Arc::from_raw(p as *const WorkerWakeSlot);
-            let _ = wake.notify();
-        },
-        |p| unsafe {
-            let wake = ManuallyDrop::new(Arc::from_raw(p as *const WorkerWakeSlot));
-            let _ = wake.notify();
-        },
-        |p| unsafe {
-            drop(Arc::from_raw(p as *const WorkerWakeSlot));
-        },
-    );
-
-    let raw = Arc::into_raw(wake_slot) as *const ();
-    unsafe { Waker::from_raw(RawWaker::new(raw, &VTABLE)) }
-}
 
 pub(crate) struct WorkerQueue {
     pub(crate) remote_queue: ArrayQueue<SendTaskRef>,
@@ -271,14 +215,13 @@ impl AtomicBitset {
 
 pub(crate) struct WorkerRegistry {
     pub(crate) workers: Box<[WorkerQueue]>,
-    pub(crate) parker_inners: Box<[Arc<ParkerInner>]>,
-    pub(crate) wake_slots: Box<[Arc<WorkerWakeSlot>]>,
+    pub(crate) wake_sources: Box<[Arc<WakeCoordinator>]>,
 }
 
 impl WorkerRegistry {
     #[inline]
-    pub(crate) fn wake_slot(&self, worker_id: usize) -> &WorkerWakeSlot {
-        self.wake_slots[worker_id].as_ref()
+    pub(crate) fn wake_source(&self, worker_id: usize) -> &WakeCoordinator {
+        self.wake_sources[worker_id].as_ref()
     }
 }
 
@@ -461,12 +404,12 @@ impl IdleController {
     ) -> bool {
         let group = &topo.groups[group_idx];
         if let Some(worker_id) = group.idle_stack.pop_idle(&self.idle_mask, &topo.next_idle) {
-            let _ = registry.wake_slot(worker_id).notify();
+            registry.wake_source(worker_id).notify();
             return true;
         }
         for &worker_id in &group.worker_ids {
             if self.idle_mask.is_set(worker_id) {
-                let _ = registry.wake_slot(worker_id).notify();
+                registry.wake_source(worker_id).notify();
                 return true;
             }
         }
@@ -490,9 +433,9 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
     ) -> Result<()> {
         let idle_decision = match self.shared.idle_hook {
             Some(h) => h(self.shared)?,
-            None => IdleDecision::wait(IdleWaitStrategy::Block),
+            None => IdleDecision::wait(WaitBackend::RuntimePark, IdleWaitStrategy::Block),
         };
-        let Some(wait_strategy) = idle_decision.into_wait_strategy() else {
+        let Some((backend, wait_strategy)) = idle_decision.into_wait() else {
             thread::yield_now();
             return Ok(());
         };
@@ -517,7 +460,7 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
             return Ok(());
         }
 
-        self.park(wait_strategy, completion)?;
+        self.park(backend, wait_strategy, completion)?;
         self.leave_idle(group_idx);
         Ok(())
     }
@@ -536,39 +479,23 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
 
     fn park<S: ScopeStorage, O: Ownership>(
         &self,
+        backend: WaitBackend,
         wait_strategy: IdleWaitStrategy,
         completion: Option<&GenericScopeCompletion<S, O>>,
     ) -> Result<()> {
         let base = &self.shared.base;
-        let wake_slot = base.registry.wake_slot(self.worker_id);
-
-        if wake_slot.try_reset_notification() {
-            return Ok(());
-        }
-
-        if matches!(wait_strategy, IdleWaitStrategy::Timeout(_))
-            && let Some(wait_hook) = self.shared.worker_wait_hook
-        {
-            wait_hook(self.shared, wait_strategy)?;
-            let _ = wake_slot.try_reset_notification();
-            return Ok(());
-        }
-
-        let parker = Parker::from_inner(base.registry.parker_inners[self.worker_id].clone());
-        match wait_strategy {
-            IdleWaitStrategy::Timeout(duration) => {
-                let _ = parker.park_timeout(duration);
-            }
-            IdleWaitStrategy::Block => {
-                if completion.is_some() {
-                    let _ = parker.park_timeout(Duration::from_millis(1));
-                } else {
-                    parker.park();
-                }
-            }
-        }
-        let _ = wake_slot.try_reset_notification();
-        Ok(())
+        let wake = base.registry.wake_sources[self.worker_id].clone();
+        let epoch = wake.current_epoch();
+        wake.wait_worker(
+            epoch,
+            backend,
+            wait_strategy,
+            completion.is_some(),
+            |strategy| match backend {
+                WaitBackend::RuntimePark => Ok(()),
+                WaitBackend::Driver => self.shared.drive_wait(strategy),
+            },
+        )
     }
 
     fn leave_idle(&self, group_idx: usize) {

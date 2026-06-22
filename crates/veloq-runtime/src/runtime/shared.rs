@@ -4,7 +4,7 @@ use std::{
     ptr::NonNull,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -15,12 +15,12 @@ use numaperf_topo::Topology;
 use veloq_storage::StateOptionPtr;
 use veloq_tls::Tls;
 
-use super::context::{IdleHook, RuntimeTlsInner, WorkerTickHook};
+use super::context::{DriverWaitHook, IdleHook, RuntimeTlsInner, WorkerTickHook};
 use crate::{
     error::{Result, RuntimeError},
     runtime::{
-        context::IdleWaitStrategy,
-        primitives::{EventCount, ParkerInner, Unparker},
+        primitives::EventCount,
+        wake::{WakeCoordinator, create_runtime_waker},
     },
     scope::{GenericScopeCompletion, ScopeCompletionRegistration},
     task::{LocalTaskRef, ScopeStorage, SendTaskRef, TaskHandleRef},
@@ -31,11 +31,8 @@ pub(crate) mod infra;
 
 use infra::{
     AtomicBitset, GlobalInjector, IdleController, IdleStack, NUMAGroup, RuntimeProgressCoordinator,
-    TaskScheduler, TopologyContext, WorkerQueue, WorkerRegistry, WorkerWakeSlot,
-    create_worker_waker,
+    TaskScheduler, TopologyContext, WorkerQueue, WorkerRegistry,
 };
-
-pub(crate) type WorkerWaitHook<T> = fn(&RuntimeShared<T>, IdleWaitStrategy) -> Result<()>;
 
 /// `enqueue_pinned` 的结果：区分 scope 是否已由 `acknowledge_completion` 结算。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +63,7 @@ pub struct RuntimeSharedBase {
 pub struct RuntimeShared<T> {
     pub base: RuntimeSharedBase,
     pub(crate) idle_hook: Option<IdleHook<T>>,
-    pub(crate) worker_wait_hook: Option<WorkerWaitHook<T>>,
+    pub(crate) driver_wait_hook: Option<DriverWaitHook<T>>,
     /// Worker 线程用户自定义 extra 状态。
     pub extra_tls: Tls<T>,
 }
@@ -80,19 +77,13 @@ pub(crate) fn init_runtime_components(
     queue_capacity: NonZeroUsize,
 ) -> (WorkerRegistry, TopologyContext, Receivers) {
     let worker_count_val = worker_count.get();
-    let mut parker_inners = Vec::with_capacity(worker_count_val);
-    let mut wake_slots = Vec::with_capacity(worker_count_val);
+    let mut wake_sources = Vec::with_capacity(worker_count_val);
     let mut deques = Vec::with_capacity(worker_count_val);
     let mut workers = Vec::with_capacity(worker_count_val);
     let mut next_idle = Vec::with_capacity(worker_count_val);
 
     for _ in 0..worker_count_val {
-        let inner = Arc::new(ParkerInner {
-            state: AtomicU32::new(0),
-        });
-        let unparker = Unparker::from_inner(inner.clone());
-        parker_inners.push(inner);
-        wake_slots.push(Arc::new(WorkerWakeSlot::new(unparker)));
+        wake_sources.push(Arc::new(WakeCoordinator::new()));
 
         let remote_queue = ArrayQueue::new(queue_capacity.get());
         let pinned_queue = ArrayQueue::new(queue_capacity.get());
@@ -151,8 +142,7 @@ pub(crate) fn init_runtime_components(
     (
         WorkerRegistry {
             workers: workers.into_boxed_slice(),
-            parker_inners: parker_inners.into_boxed_slice(),
-            wake_slots: wake_slots.into_boxed_slice(),
+            wake_sources: wake_sources.into_boxed_slice(),
         },
         TopologyContext {
             groups,
@@ -168,12 +158,24 @@ impl<T> RuntimeShared<T> {
         &self.base
     }
 
+    #[inline]
+    pub(crate) fn drive_wait(&self, strategy: crate::runtime::IdleWaitStrategy) -> Result<()> {
+        let hook = self.driver_wait_hook.ok_or_else(|| {
+            RuntimeError::InvariantViolation {
+                site: "RuntimeShared::drive_wait",
+                detail: "driver wait requires a driver wait hook",
+            }
+            .to_report()
+        })?;
+        hook(self, strategy)
+    }
+
     pub(crate) fn new(
         registry: WorkerRegistry,
         topo: TopologyContext,
         worker_count: NonZeroUsize,
         idle_hook: Option<IdleHook<T>>,
-        worker_wait_hook: Option<WorkerWaitHook<T>>,
+        driver_wait_hook: Option<DriverWaitHook<T>>,
         worker_tick_hook: Option<WorkerTickHook>,
     ) -> Self {
         Self {
@@ -193,7 +195,7 @@ impl<T> RuntimeShared<T> {
                 tls: Tls::new(),
             },
             idle_hook,
-            worker_wait_hook,
+            driver_wait_hook,
             extra_tls: Tls::new(),
         }
     }
@@ -279,12 +281,16 @@ impl RuntimeSharedBase {
 
     #[inline]
     pub(crate) fn wake_worker(&self, worker_id: usize) {
-        let _ = self.registry.wake_slot(worker_id).notify();
+        self.registry.wake_source(worker_id).notify();
     }
 
     #[inline]
-    pub fn try_reset_worker_notification(&self, worker_id: usize) -> bool {
-        self.registry.wake_slots[worker_id].try_reset_notification()
+    pub fn bind_external_wake(
+        &self,
+        worker_id: usize,
+        wake: Arc<dyn crate::runtime::ExternalWake>,
+    ) -> Result<()> {
+        self.registry.wake_sources[worker_id].bind_external_wake(wake)
     }
 
     pub(crate) fn fn_pop_send(&self, worker_id: usize) -> Option<SendTaskRef> {
@@ -346,8 +352,8 @@ impl RuntimeSharedBase {
 
     pub(crate) fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
-        for i in 0..self.registry.wake_slots.len() {
-            let _ = self.registry.wake_slot(i).notify();
+        for i in 0..self.registry.wake_sources.len() {
+            self.registry.wake_source(i).notify();
         }
     }
 
@@ -411,6 +417,7 @@ impl<T> RuntimeShared<T> {
         let local_has_work = worker.local_count.load(Ordering::Acquire) > 0;
         worker.lifo.load(Ordering::Acquire).is_some()
             || !worker.stealer.is_empty()
+            || !worker.remote_queue.is_empty()
             || local_has_work
             || worker.pinned_count.load(Ordering::Acquire) > 0
     }
@@ -480,7 +487,7 @@ impl<T> RuntimeShared<T> {
 
             let worker_tick_hook = self.base.worker_tick_hook;
 
-            let waker = create_worker_waker(self.base.registry.wake_slots[worker_id].clone());
+            let waker = create_runtime_waker(self.base.registry.wake_sources[worker_id].clone());
             let mut completion_registration =
                 completion.map(|c| ScopeCompletionRegistration::new(&**c, &waker));
 

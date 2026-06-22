@@ -4,8 +4,8 @@ use std::{
     ops::AsyncFnOnce,
     pin::pin,
     ptr,
-    sync::{Arc, Mutex},
-    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+    sync::Mutex,
+    task::{Context, Poll},
     thread,
 };
 
@@ -19,15 +19,16 @@ use veloq_storage::AtomicStorage;
 pub mod context;
 pub mod primitives;
 pub mod shared;
+pub mod wake;
 
-pub use context::RuntimeWorkerWaitHook;
-pub use context::{IdleDecision, IdleWaitStrategy, IntoRuntimeCtx, RuntimeCtx};
-pub(crate) use context::{IdleHook, RuntimeTlsInner, WorkerTickHook};
+pub(crate) use context::{DriverWaitHook, IdleHook, RuntimeTlsInner, WorkerTickHook};
+pub use context::{IdleDecision, IdleWaitStrategy, IntoRuntimeCtx, RuntimeCtx, WaitBackend};
 pub use primitives::GenericCancellationToken;
 pub use shared::{EnqueuePinnedOutcome, RuntimeShared, RuntimeSharedBase};
+pub use wake::ExternalWake;
 
-use primitives::Signal;
-use shared::{Receivers, infra::WorkerWakeSlot, init_runtime_components};
+use shared::{Receivers, init_runtime_components};
+use wake::create_runtime_waker;
 
 pub struct Runtime<'rt, 'env: 'rt, T, WF: 'rt> {
     shared: RuntimeShared<T>,
@@ -191,11 +192,8 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                 return Err(err);
             }
 
-            let signal = Arc::new(Signal::new(true));
-            let waker = create_block_on_waker(
-                signal.clone(),
-                shared_ref.base.registry.wake_slots[0].clone(),
-            );
+            let wake = shared_ref.base.registry.wake_sources[0].clone();
+            let waker = create_runtime_waker(wake.clone());
             let mut cx = Context::from_waker(&waker);
 
             shared_ref.drive_worker::<AtomicStorage, ArcOwnership>(None)?;
@@ -210,12 +208,18 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                     break Err(err);
                 }
 
+                let poll_epoch = wake.current_epoch();
                 match fut.as_mut().poll(&mut cx) {
                     Poll::Ready(res) => {
                         break Ok(res);
                     }
                     Poll::Pending => {
-                        while !signal.is_notified() {
+                        if wake.current_epoch() != poll_epoch {
+                            continue;
+                        }
+
+                        let epoch = wake.current_epoch();
+                        while wake.current_epoch() == epoch {
                             let mut progressed = false;
                             if let Some(task) = shared_ref.base.fn_pop_send(0) {
                                 shared_ref.base.poll_send_task(0, task)?;
@@ -241,20 +245,27 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                             }
                         }
 
-                        if !signal.try_reset() {
+                        if wake.current_epoch() == epoch {
                             let decision = match shared_ref.idle_hook {
                                 Some(h) => match h(shared_ref) {
                                     Ok(dec) => dec,
                                     Err(err) => break Err(err),
                                 },
-                                None => IdleDecision::wait(IdleWaitStrategy::Block),
+                                None => IdleDecision::wait(
+                                    WaitBackend::RuntimePark,
+                                    IdleWaitStrategy::Block,
+                                ),
                             };
                             match decision {
                                 IdleDecision::Continue => thread::yield_now(),
-                                IdleDecision::Wait(IdleWaitStrategy::Timeout(d)) => {
-                                    let _ = signal.wait_timeout(d);
+                                IdleDecision::Wait { backend, strategy } => {
+                                    wake.wait_block_on(epoch, backend, strategy, |strategy| {
+                                        match backend {
+                                            WaitBackend::RuntimePark => Ok(()),
+                                            WaitBackend::Driver => shared_ref.drive_wait(strategy),
+                                        }
+                                    })?;
                                 }
-                                IdleDecision::Wait(IdleWaitStrategy::Block) => signal.wait(),
                             }
                         }
                     }
@@ -277,52 +288,12 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
     }
 }
 
-struct BlockOnWake {
-    signal: Arc<Signal>,
-    worker_wake: Arc<WorkerWakeSlot>,
-}
-
-fn create_block_on_waker(signal: Arc<Signal>, worker_wake: Arc<WorkerWakeSlot>) -> Waker {
-    let wake = Arc::new(BlockOnWake {
-        signal,
-        worker_wake,
-    });
-    let raw = Arc::into_raw(wake) as *const ();
-    unsafe { Waker::from_raw(RawWaker::new(raw, &BLOCK_ON_VTABLE)) }
-}
-
-static BLOCK_ON_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    |p| unsafe {
-        Arc::increment_strong_count(p as *const BlockOnWake);
-        RawWaker::new(p, &BLOCK_ON_VTABLE)
-    },
-    |p| unsafe {
-        Arc::from_raw(p as *const BlockOnWake).wake();
-    },
-    |p| unsafe {
-        let wake = Arc::from_raw(p as *const BlockOnWake);
-        wake.signal.notify();
-        let _ = wake.worker_wake.notify();
-        let _ = Arc::into_raw(wake);
-    },
-    |p| unsafe {
-        drop(Arc::from_raw(p as *const BlockOnWake));
-    },
-);
-
-impl BlockOnWake {
-    fn wake(self: Arc<Self>) {
-        self.signal.notify();
-        let _ = self.worker_wake.notify();
-    }
-}
-
 pub struct RuntimeBuilder<T, WF> {
     worker_count: Option<NonZeroUsize>,
     queue_capacity: NonZeroUsize,
     worker_factory: Option<WF>,
     idle_hook: Option<IdleHook<T>>,
-    worker_wait_hook: Option<RuntimeWorkerWaitHook<T>>,
+    driver_wait_hook: Option<DriverWaitHook<T>>,
     worker_tick_hook: Option<WorkerTickHook>,
 }
 
@@ -339,7 +310,7 @@ impl RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
             queue_capacity: NonZeroUsize::new(1024).unwrap(),
             worker_factory: Some(|_, _| ()),
             idle_hook: None,
-            worker_wait_hook: None,
+            driver_wait_hook: None,
             worker_tick_hook: None,
         }
     }
@@ -362,13 +333,13 @@ impl<T, WF> RuntimeBuilder<T, WF> {
             worker_count: self.worker_count,
             queue_capacity: self.queue_capacity,
             worker_factory: self.worker_factory,
-            worker_wait_hook: None,
+            driver_wait_hook: None,
             worker_tick_hook: self.worker_tick_hook,
         }
     }
 
-    pub fn with_worker_wait_hook(mut self, hook: RuntimeWorkerWaitHook<T>) -> Self {
-        self.worker_wait_hook = Some(hook);
+    pub fn with_driver_wait_hook(mut self, hook: DriverWaitHook<T>) -> Self {
+        self.driver_wait_hook = Some(hook);
         self
     }
 
@@ -383,7 +354,7 @@ impl<T, WF> RuntimeBuilder<T, WF> {
             queue_capacity: self.queue_capacity,
             worker_factory: Some(factory),
             idle_hook: self.idle_hook,
-            worker_wait_hook: self.worker_wait_hook,
+            driver_wait_hook: self.driver_wait_hook,
             worker_tick_hook: self.worker_tick_hook,
         }
     }
@@ -404,7 +375,7 @@ impl<T, WF> RuntimeBuilder<T, WF> {
             topo,
             worker_count,
             self.idle_hook,
-            self.worker_wait_hook,
+            self.driver_wait_hook,
             self.worker_tick_hook,
         );
         let rt = Runtime {

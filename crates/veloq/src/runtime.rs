@@ -11,7 +11,7 @@ use std::{
 use diagweave::Transform;
 
 use veloq_buf::PoolTopology;
-use veloq_driver_native::driver::PlatformDriver;
+use veloq_driver_native::driver::{Driver, PlatformDriver};
 use veloq_runtime::{
     runtime::{self as async_runtime},
     utils::StaticTransfer,
@@ -23,8 +23,8 @@ use crate::{
     config::{BlockingPoolConfig, Config},
     error::Result as VeloqResult,
     runtime::context::{
-        BorrowedRegistrar, Ctx, RegistrarMessage, SharedRegistrar, WorkerRegistrarState,
-        WorkerState, poll_current_driver, wait_current_driver,
+        BorrowedRegistrar, Ctx, DriverWakeAdapter, RegistrarMessage, SharedRegistrar,
+        WorkerRegistrarState, WorkerState, drive_driver_wait, poll_current_driver,
     },
 };
 
@@ -163,7 +163,7 @@ impl<T: PoolTopology> Runtime<T> {
             .with_worker_count(Some(worker_count))
             .with_queue_capacity(config.get_queue_capacity())
             .with_idle_hook(poll_current_driver)
-            .with_worker_wait_hook(wait_current_driver)
+            .with_driver_wait_hook(drive_driver_wait)
             .with_worker_factory(move |worker_id, shared| {
                 let topology = topology.clone();
                 let state = state.clone();
@@ -179,6 +179,11 @@ impl<T: PoolTopology> Runtime<T> {
 
                 let driver = PlatformDriver::new(config.clone(), registrar)
                     .expect("failed to create driver");
+                let wake = driver.create_waker();
+                shared
+                    .base()
+                    .bind_external_wake(worker_id, Arc::new(DriverWakeAdapter::new(wake)))
+                    .expect("failed to bind driver wake adapter");
 
                 let driver_cell = RefCell::new(driver);
 

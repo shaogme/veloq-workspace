@@ -6,15 +6,17 @@ use veloq_buf::{
     heap::{ChunkId, ChunkInfo},
 };
 use veloq_driver_native::{
-    driver::{ContextDriverProvider, DriveMode, Driver, PlatformDriver, RuntimeContextDriver},
+    driver::{
+        ContextDriverProvider, DriveMode, Driver, PlatformDriver, RemoteWaker, RuntimeContextDriver,
+    },
     error::{DriverReport, Error as DriverError},
     op::{DetachedSubmitter, DriverProvider, IntoPlatformOp, IoFd, Op, OpSubmitter},
 };
 use veloq_runtime::{
     error::{Result as RuntimeResult, RuntimeError},
     runtime::{
-        EnqueuePinnedOutcome, IdleDecision, IdleWaitStrategy, IntoRuntimeCtx, RuntimeCtx,
-        RuntimeShared,
+        EnqueuePinnedOutcome, ExternalWake, IdleDecision, IdleWaitStrategy, IntoRuntimeCtx,
+        RuntimeCtx, RuntimeShared, WaitBackend,
     },
     storage::AtomicStorage,
     task::{
@@ -44,6 +46,37 @@ pub struct WorkerState<'reg> {
     pub buf_pool: AnyBufPool,
     pub registrar_state: RefCell<WorkerRegistrarState>,
     pub registration_mode: BufferRegistrationMode,
+}
+
+fn drive_current_driver<'reg>(
+    shared: &RuntimeShared<WorkerState<'reg>>,
+    mode: DriveMode,
+    site: &'static str,
+    detail: &'static str,
+) -> RuntimeResult<veloq_driver_native::driver::DriveOutcome> {
+    shared
+        .extra_tls
+        .try_with(|extra| {
+            sync_to_driver_internal(
+                &extra.driver,
+                &extra.registrar_state,
+                extra.registration_mode,
+            );
+
+            let mut driver = extra.driver.borrow_mut();
+            driver.drive(mode).map_err(|err| {
+                RuntimeError::InvariantViolation { site, detail }
+                    .to_report()
+                    .with_diag_src_err(err)
+            })
+        })
+        .map_err(|err| {
+            RuntimeError::TlsSetOwnedFailed {
+                worker_id: shared.worker_id(),
+                source: err,
+            }
+            .to_report()
+        })?
 }
 
 #[derive(Clone)]
@@ -328,24 +361,6 @@ impl<'rt, 'reg> Ctx<'rt, 'reg> {
         self.try_alloc(size).expect("failed to allocate buffer")
     }
 
-    pub fn drive_wait(&self) -> VeloqResult<IdleDecision> {
-        self.sync_registrar();
-        self.driver(|mut driver| {
-            let outcome = driver
-                .drive(DriveMode::Wait)
-                .push_ctx("scope", "Ctx::drive_wait")
-                .attach_note("driver drive(Wait) failed")
-                .trans()?;
-            if !outcome.pending_progress {
-                return Ok(IdleDecision::wait(IdleWaitStrategy::block()));
-            }
-            Ok(match outcome.next_timeout_hint {
-                Some(duration) => IdleDecision::wait(IdleWaitStrategy::timeout(duration)),
-                None => IdleDecision::wait(IdleWaitStrategy::block()),
-            })
-        })
-    }
-
     pub fn submit<'d, S, T>(&self, submitter: &'d S, op: Op<T>) -> S::Future<T>
     where
         S: OpSubmitter<'reg, Ctx<'rt, 'reg>> + Copy + 'd,
@@ -402,74 +417,48 @@ impl<'rt, 'reg> Ctx<'rt, 'reg> {
 pub fn poll_current_driver<'reg>(
     shared: &RuntimeShared<WorkerState<'reg>>,
 ) -> RuntimeResult<IdleDecision> {
-    shared
-        .extra_tls
-        .try_with(|extra| {
-            // sync registrar
-            sync_to_driver_internal(
-                &extra.driver,
-                &extra.registrar_state,
-                extra.registration_mode,
-            );
-
-            let mut driver = extra.driver.borrow_mut();
-
-            let outcome = driver.drive(DriveMode::Poll).map_err(|err| {
-                RuntimeError::InvariantViolation {
-                    site: "poll_current_driver",
-                    detail: "driver drive(Poll) failed",
-                }
-                .to_report()
-                .with_diag_src_err(err)
-            })?;
-            Ok(match outcome.next_timeout_hint {
-                Some(duration) => IdleDecision::wait(IdleWaitStrategy::timeout(duration)),
-                None if outcome.pending_progress => IdleDecision::continue_now(),
-                None => IdleDecision::wait(IdleWaitStrategy::block()),
-            })
-        })
-        .map_err(|err| {
-            RuntimeError::TlsSetOwnedFailed {
-                worker_id: shared.worker_id(),
-                source: err,
-            }
-            .to_report()
-        })?
+    let outcome = drive_current_driver(
+        shared,
+        DriveMode::Poll,
+        "poll_current_driver",
+        "driver drive(Poll) failed",
+    )?;
+    Ok(match outcome.next_timeout_hint {
+        Some(duration) => IdleDecision::wait(WaitBackend::Driver, IdleWaitStrategy::timeout(duration)),
+        None if outcome.pending_progress => IdleDecision::continue_now(),
+        None => IdleDecision::wait(WaitBackend::RuntimePark, IdleWaitStrategy::block()),
+    })
 }
 
-pub fn wait_current_driver<'reg>(
+pub fn drive_driver_wait<'reg>(
     shared: &RuntimeShared<WorkerState<'reg>>,
-    wait_strategy: IdleWaitStrategy,
+    _wait_strategy: IdleWaitStrategy,
 ) -> RuntimeResult<()> {
-    match wait_strategy {
-        IdleWaitStrategy::Timeout(_) => shared
-            .extra_tls
-            .try_with(|extra| {
-                sync_to_driver_internal(
-                    &extra.driver,
-                    &extra.registrar_state,
-                    extra.registration_mode,
-                );
+    let _ = drive_current_driver(
+        shared,
+        DriveMode::Wait,
+        "drive_driver_wait",
+        "driver drive(Wait) failed",
+    )?;
+    Ok(())
+}
 
-                let mut driver = extra.driver.borrow_mut();
-                let _ = driver.drive(DriveMode::Wait).map_err(|err| {
-                    RuntimeError::InvariantViolation {
-                        site: "wait_current_driver",
-                        detail: "driver drive(Wait) failed",
-                    }
-                    .to_report()
-                    .with_diag_src_err(err)
-                })?;
-                Ok(())
-            })
-            .map_err(|err| {
-                RuntimeError::TlsSetOwnedFailed {
-                    worker_id: shared.worker_id(),
-                    source: err,
-                }
-                .to_report()
-            })?,
-        IdleWaitStrategy::Block => Ok(()),
+pub struct DriverWakeAdapter<E> {
+    inner: std::sync::Arc<dyn RemoteWaker<E>>,
+}
+
+impl<E> DriverWakeAdapter<E> {
+    pub fn new(inner: std::sync::Arc<dyn RemoteWaker<E>>) -> Self {
+        Self { inner }
+    }
+}
+
+impl<E> ExternalWake for DriverWakeAdapter<E>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    fn wake(&self) {
+        let _ = self.inner.wake();
     }
 }
 
