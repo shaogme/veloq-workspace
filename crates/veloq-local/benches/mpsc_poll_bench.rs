@@ -1,25 +1,14 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::future::Future;
-use std::sync::Arc;
-use std::task::{Context, Wake, Waker};
+use std::task::{Context, Waker};
 use veloq_local::mpsc;
-
-struct MyWaker;
-
-impl Wake for MyWaker {
-    fn wake(self: Arc<Self>) {}
-}
-
-fn real_waker() -> Waker {
-    Waker::from(Arc::new(MyWaker))
-}
 
 fn bench_poll_pending(c: &mut Criterion) {
     let state = mpsc::unbounded::<i32>();
     let (_tx, rx) = state.split();
     let recv_fut = rx.recv();
     let mut pinned = Box::pin(recv_fut);
-    let waker = real_waker();
+    let waker = Waker::noop();
     let mut cx = Context::from_waker(&waker);
 
     c.bench_function("mpsc_poll_pending", |b| {
@@ -35,7 +24,7 @@ fn bench_stream_poll_pending(c: &mut Criterion) {
     let (_tx, rx) = state.split();
     let stream = rx.stream();
     let mut pinned = Box::pin(stream);
-    let waker = real_waker();
+    let waker = Waker::noop();
     let mut cx = Context::from_waker(&waker);
 
     c.bench_function("mpsc_stream_poll_pending", |b| {
