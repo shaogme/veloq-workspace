@@ -171,6 +171,15 @@ pub struct Signal {
 }
 
 impl Signal {
+    pub fn notify_once(&self) -> bool {
+        if self.state.swap(1, Ordering::AcqRel) == 0 {
+            unsafe { sys::wake_all(&self.state) };
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn is_notified(&self) -> bool {
         self.state.load(Ordering::Acquire) == 1
     }
@@ -188,9 +197,7 @@ impl Signal {
     }
 
     pub fn notify(&self) {
-        if self.state.swap(1, Ordering::AcqRel) == 0 {
-            unsafe { sys::wake_all(&self.state) };
-        }
+        let _ = self.notify_once();
     }
 
     pub fn wait(&self) {

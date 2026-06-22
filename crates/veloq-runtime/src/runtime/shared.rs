@@ -18,7 +18,10 @@ use veloq_tls::Tls;
 use super::context::{IdleHook, RuntimeTlsInner, WorkerTickHook};
 use crate::{
     error::{Result, RuntimeError},
-    runtime::primitives::{EventCount, ParkerInner, Unparker, create_unpark_waker},
+    runtime::{
+        context::IdleWaitStrategy,
+        primitives::{EventCount, ParkerInner, Unparker},
+    },
     scope::{GenericScopeCompletion, ScopeCompletionRegistration},
     task::{LocalTaskRef, ScopeStorage, SendTaskRef, TaskHandleRef},
     utils::{FastRand, ownership::Ownership},
@@ -28,8 +31,11 @@ pub(crate) mod infra;
 
 use infra::{
     AtomicBitset, GlobalInjector, IdleController, IdleStack, NUMAGroup, RuntimeProgressCoordinator,
-    TaskScheduler, TopologyContext, WorkerQueue, WorkerRegistry,
+    TaskScheduler, TopologyContext, WorkerQueue, WorkerRegistry, WorkerWakeSlot,
+    create_worker_waker,
 };
+
+pub(crate) type WorkerWaitHook<T> = fn(&RuntimeShared<T>, IdleWaitStrategy) -> Result<()>;
 
 /// `enqueue_pinned` 的结果：区分 scope 是否已由 `acknowledge_completion` 结算。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +66,7 @@ pub struct RuntimeSharedBase {
 pub struct RuntimeShared<T> {
     pub base: RuntimeSharedBase,
     pub(crate) idle_hook: Option<IdleHook<T>>,
+    pub(crate) worker_wait_hook: Option<WorkerWaitHook<T>>,
     /// Worker 线程用户自定义 extra 状态。
     pub extra_tls: Tls<T>,
 }
@@ -71,20 +78,27 @@ pub(crate) struct Receivers {
 pub(crate) fn init_runtime_components(
     worker_count: NonZeroUsize,
     queue_capacity: NonZeroUsize,
+    mut notifiers: Vec<Option<Arc<dyn Fn() + Send + Sync>>>,
 ) -> (WorkerRegistry, TopologyContext, Receivers) {
     let worker_count_val = worker_count.get();
-    let mut unparkers = Vec::with_capacity(worker_count_val);
     let mut parker_inners = Vec::with_capacity(worker_count_val);
+    let mut wake_slots = Vec::with_capacity(worker_count_val);
     let mut deques = Vec::with_capacity(worker_count_val);
     let mut workers = Vec::with_capacity(worker_count_val);
     let mut next_idle = Vec::with_capacity(worker_count_val);
 
-    for _ in 0..worker_count_val {
+    for worker_id in 0..worker_count_val {
         let inner = Arc::new(ParkerInner {
             state: AtomicU32::new(0),
         });
-        unparkers.push(Unparker::from_inner(inner.clone()));
+        let unparker = Unparker::from_inner(inner.clone());
         parker_inners.push(inner);
+        let notifier = if worker_id < notifiers.len() {
+            notifiers[worker_id].take()
+        } else {
+            None
+        };
+        wake_slots.push(Arc::new(WorkerWakeSlot::new(notifier, unparker)));
 
         let remote_queue = ArrayQueue::new(queue_capacity.get());
         let pinned_queue = ArrayQueue::new(queue_capacity.get());
@@ -143,8 +157,8 @@ pub(crate) fn init_runtime_components(
     (
         WorkerRegistry {
             workers: workers.into_boxed_slice(),
-            unparkers: unparkers.into_boxed_slice(),
             parker_inners: parker_inners.into_boxed_slice(),
+            wake_slots: wake_slots.into_boxed_slice(),
         },
         TopologyContext {
             groups,
@@ -165,6 +179,7 @@ impl<T> RuntimeShared<T> {
         topo: TopologyContext,
         worker_count: NonZeroUsize,
         idle_hook: Option<IdleHook<T>>,
+        worker_wait_hook: Option<WorkerWaitHook<T>>,
         worker_tick_hook: Option<WorkerTickHook>,
     ) -> Self {
         Self {
@@ -184,16 +199,13 @@ impl<T> RuntimeShared<T> {
                 tls: Tls::new(),
             },
             idle_hook,
+            worker_wait_hook,
             extra_tls: Tls::new(),
         }
     }
 }
 
 impl RuntimeSharedBase {
-    pub fn unparkers(&self) -> Box<[Unparker]> {
-        self.registry.unparkers.clone()
-    }
-
     #[inline]
     pub fn worker_count(&self) -> NonZeroUsize {
         if let Some(count) = NonZeroUsize::new(self.registry.workers.len()) {
@@ -273,7 +285,12 @@ impl RuntimeSharedBase {
 
     #[inline]
     pub(crate) fn wake_worker(&self, worker_id: usize) {
-        self.registry.unpark(worker_id);
+        let _ = self.registry.wake_slot(worker_id).notify();
+    }
+
+    #[inline]
+    pub fn try_reset_worker_notification(&self, worker_id: usize) -> bool {
+        self.registry.wake_slots[worker_id].try_reset_notification()
     }
 
     pub(crate) fn fn_pop_send(&self, worker_id: usize) -> Option<SendTaskRef> {
@@ -335,8 +352,8 @@ impl RuntimeSharedBase {
 
     pub(crate) fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
-        for i in 0..self.registry.unparkers.len() {
-            self.registry.unpark(i);
+        for i in 0..self.registry.wake_slots.len() {
+            let _ = self.registry.wake_slot(i).notify();
         }
     }
 
@@ -368,10 +385,6 @@ impl<T> RuntimeShared<T> {
             .tls
             .try_with(|ctx| ctx.worker_id)
             .unwrap_or(usize::MAX)
-    }
-
-    pub fn unparkers(&self) -> Box<[Unparker]> {
-        self.base.unparkers()
     }
 
     pub(crate) fn choose_worker(&self) -> usize {
@@ -473,7 +486,7 @@ impl<T> RuntimeShared<T> {
 
             let worker_tick_hook = self.base.worker_tick_hook;
 
-            let waker = create_unpark_waker(self.base.registry.unparkers[worker_id].clone());
+            let waker = create_worker_waker(self.base.registry.wake_slots[worker_id].clone());
             let mut completion_registration =
                 completion.map(|c| ScopeCompletionRegistration::new(&**c, &waker));
 

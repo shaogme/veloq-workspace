@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use super::shared::{EnqueuePinnedOutcome, RuntimeShared};
+use super::shared::{EnqueuePinnedOutcome, RuntimeShared, WorkerWaitHook};
 use crate::{
     error::{Result, RuntimeError},
     scope::{AsyncScope, LocalAsyncScope},
@@ -335,6 +335,7 @@ impl<'rt, T> RuntimeCtx<'rt, T> {
 }
 
 pub(crate) type IdleHook<T> = fn(&RuntimeShared<T>) -> Result<IdleDecision>;
+pub type RuntimeWorkerWaitHook<T> = WorkerWaitHook<T>;
 pub(crate) type WorkerTickHook = fn();
 
 pub(crate) struct RouteCell<T> {

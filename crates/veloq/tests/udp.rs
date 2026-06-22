@@ -500,8 +500,6 @@ fn multithread_udp_cross_worker_drop_is_routed() {
                 ready_tx.send(()).unwrap();
 
                 done_rx.recv().await.expect("cross-worker drop ack missing");
-                yield_now().await;
-                yield_now().await;
 
                 let probe_server = bind_udp_socket(ctx, "127.0.0.1:0");
                 let probe_client =

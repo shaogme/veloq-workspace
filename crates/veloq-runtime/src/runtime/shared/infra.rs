@@ -14,13 +14,72 @@ use crate::{
     error::Result,
     runtime::{
         context::{IdleDecision, IdleWaitStrategy},
-        primitives::{EventCount, Parker, ParkerInner, Unparker},
+        primitives::{EventCount, Parker, ParkerInner, Signal, Unparker},
         shared::RuntimeShared,
     },
     scope::GenericScopeCompletion,
     task::{LocalTaskRef, ScopeStorage, SendTaskRef, TaskHeader},
     utils::{FastRand, ownership::Ownership},
 };
+
+pub(crate) struct WorkerWakeSlot {
+    notified: Signal,
+    fallback: Unparker,
+    notifier: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl WorkerWakeSlot {
+    pub(crate) fn new(notifier: Option<Arc<dyn Fn() + Send + Sync>>, fallback: Unparker) -> Self {
+        Self {
+            notified: Signal::new(false),
+            fallback,
+            notifier: notifier.unwrap_or_else(|| Arc::new(|| {})),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn notify(&self) -> bool {
+        if self.notified.notify_once() {
+            self.fallback.unpark();
+            (self.notifier)();
+            return true;
+        }
+        false
+    }
+
+    #[inline]
+    pub(crate) fn try_reset_notification(&self) -> bool {
+        self.notified.try_reset()
+    }
+}
+
+pub(crate) fn create_worker_waker(wake_slot: Arc<WorkerWakeSlot>) -> std::task::Waker {
+    use std::{
+        mem::ManuallyDrop,
+        task::{RawWaker, RawWakerVTable, Waker},
+    };
+
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |p| unsafe {
+            Arc::increment_strong_count(p as *const WorkerWakeSlot);
+            RawWaker::new(p, &VTABLE)
+        },
+        |p| unsafe {
+            let wake = Arc::from_raw(p as *const WorkerWakeSlot);
+            let _ = wake.notify();
+        },
+        |p| unsafe {
+            let wake = ManuallyDrop::new(Arc::from_raw(p as *const WorkerWakeSlot));
+            let _ = wake.notify();
+        },
+        |p| unsafe {
+            drop(Arc::from_raw(p as *const WorkerWakeSlot));
+        },
+    );
+
+    let raw = Arc::into_raw(wake_slot) as *const ();
+    unsafe { Waker::from_raw(RawWaker::new(raw, &VTABLE)) }
+}
 
 pub(crate) struct WorkerQueue {
     pub(crate) remote_queue: ArrayQueue<SendTaskRef>,
@@ -215,14 +274,14 @@ impl AtomicBitset {
 
 pub(crate) struct WorkerRegistry {
     pub(crate) workers: Box<[WorkerQueue]>,
-    pub(crate) unparkers: Box<[Unparker]>,
     pub(crate) parker_inners: Box<[Arc<ParkerInner>]>,
+    pub(crate) wake_slots: Box<[Arc<WorkerWakeSlot>]>,
 }
 
 impl WorkerRegistry {
     #[inline]
-    pub(crate) fn unpark(&self, worker_id: usize) {
-        self.unparkers[worker_id].unpark();
+    pub(crate) fn wake_slot(&self, worker_id: usize) -> &WorkerWakeSlot {
+        self.wake_slots[worker_id].as_ref()
     }
 }
 
@@ -405,12 +464,12 @@ impl IdleController {
     ) -> bool {
         let group = &topo.groups[group_idx];
         if let Some(worker_id) = group.idle_stack.pop_idle(&self.idle_mask, &topo.next_idle) {
-            registry.unpark(worker_id);
+            let _ = registry.wake_slot(worker_id).notify();
             return true;
         }
         for &worker_id in &group.worker_ids {
             if self.idle_mask.is_set(worker_id) {
-                registry.unpark(worker_id);
+                let _ = registry.wake_slot(worker_id).notify();
                 return true;
             }
         }
@@ -461,7 +520,7 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
             return Ok(());
         }
 
-        self.park(wait_strategy, completion);
+        self.park(wait_strategy, completion)?;
         self.leave_idle(group_idx);
         Ok(())
     }
@@ -482,8 +541,20 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
         &self,
         wait_strategy: IdleWaitStrategy,
         completion: Option<&GenericScopeCompletion<S, O>>,
-    ) {
+    ) -> Result<()> {
         let base = &self.shared.base;
+        let wake_slot = base.registry.wake_slot(self.worker_id);
+
+        if wake_slot.try_reset_notification() {
+            return Ok(());
+        }
+
+        if let Some(wait_hook) = self.shared.worker_wait_hook {
+            wait_hook(self.shared, wait_strategy)?;
+            let _ = wake_slot.try_reset_notification();
+            return Ok(());
+        }
+
         let parker = Parker::from_inner(base.registry.parker_inners[self.worker_id].clone());
         match wait_strategy {
             IdleWaitStrategy::Timeout(duration) => {
@@ -497,6 +568,8 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
                 }
             }
         }
+        let _ = wake_slot.try_reset_notification();
+        Ok(())
     }
 
     fn leave_idle(&self, group_idx: usize) {

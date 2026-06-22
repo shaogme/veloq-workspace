@@ -5,7 +5,7 @@ use std::{
     pin::pin,
     ptr,
     sync::{Arc, Mutex},
-    task::{Context, Poll},
+    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
     thread,
 };
 
@@ -20,13 +20,14 @@ pub mod context;
 pub mod primitives;
 pub mod shared;
 
+pub use context::RuntimeWorkerWaitHook;
 pub use context::{IdleDecision, IdleWaitStrategy, IntoRuntimeCtx, RuntimeCtx};
 pub(crate) use context::{IdleHook, RuntimeTlsInner, WorkerTickHook};
 pub use primitives::GenericCancellationToken;
 pub use shared::{EnqueuePinnedOutcome, RuntimeShared, RuntimeSharedBase};
 
-use primitives::{Signal, create_waker};
-use shared::{Receivers, init_runtime_components};
+use primitives::Signal;
+use shared::{Receivers, infra::WorkerWakeSlot, init_runtime_components};
 
 pub struct Runtime<'rt, 'env: 'rt, T, WF: 'rt> {
     shared: RuntimeShared<T>,
@@ -191,7 +192,10 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
             }
 
             let signal = Arc::new(Signal::new(true));
-            let waker = create_waker(signal.clone());
+            let waker = create_block_on_waker(
+                signal.clone(),
+                shared_ref.base.registry.wake_slots[0].clone(),
+            );
             let mut cx = Context::from_waker(&waker);
 
             shared_ref.drive_worker::<AtomicStorage, ArcOwnership>(None)?;
@@ -273,12 +277,54 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
     }
 }
 
+struct BlockOnWake {
+    signal: Arc<Signal>,
+    worker_wake: Arc<WorkerWakeSlot>,
+}
+
+fn create_block_on_waker(signal: Arc<Signal>, worker_wake: Arc<WorkerWakeSlot>) -> Waker {
+    let wake = Arc::new(BlockOnWake {
+        signal,
+        worker_wake,
+    });
+    let raw = Arc::into_raw(wake) as *const ();
+    unsafe { Waker::from_raw(RawWaker::new(raw, &BLOCK_ON_VTABLE)) }
+}
+
+static BLOCK_ON_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    |p| unsafe {
+        Arc::increment_strong_count(p as *const BlockOnWake);
+        RawWaker::new(p, &BLOCK_ON_VTABLE)
+    },
+    |p| unsafe {
+        Arc::from_raw(p as *const BlockOnWake).wake();
+    },
+    |p| unsafe {
+        let wake = Arc::from_raw(p as *const BlockOnWake);
+        wake.signal.notify();
+        let _ = wake.worker_wake.notify();
+        let _ = Arc::into_raw(wake);
+    },
+    |p| unsafe {
+        drop(Arc::from_raw(p as *const BlockOnWake));
+    },
+);
+
+impl BlockOnWake {
+    fn wake(self: Arc<Self>) {
+        self.signal.notify();
+        let _ = self.worker_wake.notify();
+    }
+}
+
 pub struct RuntimeBuilder<T, WF> {
     worker_count: Option<NonZeroUsize>,
     queue_capacity: NonZeroUsize,
     worker_factory: Option<WF>,
     idle_hook: Option<IdleHook<T>>,
+    worker_wait_hook: Option<RuntimeWorkerWaitHook<T>>,
     worker_tick_hook: Option<WorkerTickHook>,
+    notifiers: Vec<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl Default for RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
@@ -294,7 +340,9 @@ impl RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
             queue_capacity: NonZeroUsize::new(1024).unwrap(),
             worker_factory: Some(|_, _| ()),
             idle_hook: None,
+            worker_wait_hook: None,
             worker_tick_hook: None,
+            notifiers: Vec::new(),
         }
     }
 }
@@ -310,14 +358,26 @@ impl<T, WF> RuntimeBuilder<T, WF> {
         self
     }
 
+    pub fn with_notifiers(mut self, notifiers: Vec<Option<Arc<dyn Fn() + Send + Sync>>>) -> Self {
+        self.notifiers = notifiers;
+        self
+    }
+
     pub fn with_idle_hook<NewT>(self, hook: IdleHook<NewT>) -> RuntimeBuilder<NewT, WF> {
         RuntimeBuilder {
             idle_hook: Some(hook),
             worker_count: self.worker_count,
             queue_capacity: self.queue_capacity,
             worker_factory: self.worker_factory,
+            worker_wait_hook: None,
             worker_tick_hook: self.worker_tick_hook,
+            notifiers: self.notifiers,
         }
+    }
+
+    pub fn with_worker_wait_hook(mut self, hook: RuntimeWorkerWaitHook<T>) -> Self {
+        self.worker_wait_hook = Some(hook);
+        self
     }
 
     pub fn with_worker_tick_hook(mut self, hook: WorkerTickHook) -> Self {
@@ -331,7 +391,9 @@ impl<T, WF> RuntimeBuilder<T, WF> {
             queue_capacity: self.queue_capacity,
             worker_factory: Some(factory),
             idle_hook: self.idle_hook,
+            worker_wait_hook: self.worker_wait_hook,
             worker_tick_hook: self.worker_tick_hook,
+            notifiers: self.notifiers,
         }
     }
 
@@ -345,12 +407,13 @@ impl<T, WF> RuntimeBuilder<T, WF> {
             thread::available_parallelism().unwrap_or(NonZeroUsize::new(1).unwrap())
         });
         let (registry, topo, receivers) =
-            init_runtime_components(worker_count, self.queue_capacity);
+            init_runtime_components(worker_count, self.queue_capacity, self.notifiers);
         let shared = RuntimeShared::new(
             registry,
             topo,
             worker_count,
             self.idle_hook,
+            self.worker_wait_hook,
             self.worker_tick_hook,
         );
         let rt = Runtime {
