@@ -25,15 +25,13 @@ use crate::{
 pub(crate) struct WorkerWakeSlot {
     notified: Signal,
     fallback: Unparker,
-    notifier: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl WorkerWakeSlot {
-    pub(crate) fn new(notifier: Option<Arc<dyn Fn() + Send + Sync>>, fallback: Unparker) -> Self {
+    pub(crate) fn new(fallback: Unparker) -> Self {
         Self {
             notified: Signal::new(false),
             fallback,
-            notifier: notifier.unwrap_or_else(|| Arc::new(|| {})),
         }
     }
 
@@ -41,7 +39,6 @@ impl WorkerWakeSlot {
     pub(crate) fn notify(&self) -> bool {
         if self.notified.notify_once() {
             self.fallback.unpark();
-            (self.notifier)();
             return true;
         }
         false
@@ -549,7 +546,9 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
             return Ok(());
         }
 
-        if let Some(wait_hook) = self.shared.worker_wait_hook {
+        if matches!(wait_strategy, IdleWaitStrategy::Timeout(_))
+            && let Some(wait_hook) = self.shared.worker_wait_hook
+        {
             wait_hook(self.shared, wait_strategy)?;
             let _ = wake_slot.try_reset_notification();
             return Ok(());

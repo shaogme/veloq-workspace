@@ -437,6 +437,42 @@ pub fn poll_current_driver<'reg>(
         })?
 }
 
+pub fn wait_current_driver<'reg>(
+    shared: &RuntimeShared<WorkerState<'reg>>,
+    wait_strategy: IdleWaitStrategy,
+) -> RuntimeResult<()> {
+    match wait_strategy {
+        IdleWaitStrategy::Timeout(_) => shared
+            .extra_tls
+            .try_with(|extra| {
+                sync_to_driver_internal(
+                    &extra.driver,
+                    &extra.registrar_state,
+                    extra.registration_mode,
+                );
+
+                let mut driver = extra.driver.borrow_mut();
+                let _ = driver.drive(DriveMode::Wait).map_err(|err| {
+                    RuntimeError::InvariantViolation {
+                        site: "wait_current_driver",
+                        detail: "driver drive(Wait) failed",
+                    }
+                    .to_report()
+                    .with_diag_src_err(err)
+                })?;
+                Ok(())
+            })
+            .map_err(|err| {
+                RuntimeError::TlsSetOwnedFailed {
+                    worker_id: shared.worker_id(),
+                    source: err,
+                }
+                .to_report()
+            })?,
+        IdleWaitStrategy::Block => Ok(()),
+    }
+}
+
 pub(crate) fn submit_control_task<'rt, 'reg>(
     shared: &'rt RuntimeShared<WorkerState<'reg>>,
     worker_id: usize,

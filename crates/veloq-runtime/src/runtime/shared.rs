@@ -78,7 +78,6 @@ pub(crate) struct Receivers {
 pub(crate) fn init_runtime_components(
     worker_count: NonZeroUsize,
     queue_capacity: NonZeroUsize,
-    mut notifiers: Vec<Option<Arc<dyn Fn() + Send + Sync>>>,
 ) -> (WorkerRegistry, TopologyContext, Receivers) {
     let worker_count_val = worker_count.get();
     let mut parker_inners = Vec::with_capacity(worker_count_val);
@@ -87,18 +86,13 @@ pub(crate) fn init_runtime_components(
     let mut workers = Vec::with_capacity(worker_count_val);
     let mut next_idle = Vec::with_capacity(worker_count_val);
 
-    for worker_id in 0..worker_count_val {
+    for _ in 0..worker_count_val {
         let inner = Arc::new(ParkerInner {
             state: AtomicU32::new(0),
         });
         let unparker = Unparker::from_inner(inner.clone());
         parker_inners.push(inner);
-        let notifier = if worker_id < notifiers.len() {
-            notifiers[worker_id].take()
-        } else {
-            None
-        };
-        wake_slots.push(Arc::new(WorkerWakeSlot::new(notifier, unparker)));
+        wake_slots.push(Arc::new(WorkerWakeSlot::new(unparker)));
 
         let remote_queue = ArrayQueue::new(queue_capacity.get());
         let pinned_queue = ArrayQueue::new(queue_capacity.get());

@@ -324,7 +324,6 @@ pub struct RuntimeBuilder<T, WF> {
     idle_hook: Option<IdleHook<T>>,
     worker_wait_hook: Option<RuntimeWorkerWaitHook<T>>,
     worker_tick_hook: Option<WorkerTickHook>,
-    notifiers: Vec<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl Default for RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
@@ -342,7 +341,6 @@ impl RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
             idle_hook: None,
             worker_wait_hook: None,
             worker_tick_hook: None,
-            notifiers: Vec::new(),
         }
     }
 }
@@ -358,11 +356,6 @@ impl<T, WF> RuntimeBuilder<T, WF> {
         self
     }
 
-    pub fn with_notifiers(mut self, notifiers: Vec<Option<Arc<dyn Fn() + Send + Sync>>>) -> Self {
-        self.notifiers = notifiers;
-        self
-    }
-
     pub fn with_idle_hook<NewT>(self, hook: IdleHook<NewT>) -> RuntimeBuilder<NewT, WF> {
         RuntimeBuilder {
             idle_hook: Some(hook),
@@ -371,7 +364,6 @@ impl<T, WF> RuntimeBuilder<T, WF> {
             worker_factory: self.worker_factory,
             worker_wait_hook: None,
             worker_tick_hook: self.worker_tick_hook,
-            notifiers: self.notifiers,
         }
     }
 
@@ -393,7 +385,6 @@ impl<T, WF> RuntimeBuilder<T, WF> {
             idle_hook: self.idle_hook,
             worker_wait_hook: self.worker_wait_hook,
             worker_tick_hook: self.worker_tick_hook,
-            notifiers: self.notifiers,
         }
     }
 
@@ -407,7 +398,7 @@ impl<T, WF> RuntimeBuilder<T, WF> {
             thread::available_parallelism().unwrap_or(NonZeroUsize::new(1).unwrap())
         });
         let (registry, topo, receivers) =
-            init_runtime_components(worker_count, self.queue_capacity, self.notifiers);
+            init_runtime_components(worker_count, self.queue_capacity);
         let shared = RuntimeShared::new(
             registry,
             topo,

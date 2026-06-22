@@ -4,14 +4,14 @@ use std::{
     cell::RefCell,
     num::NonZeroUsize,
     ops::AsyncFnOnce,
-    sync::{Arc, OnceLock, mpsc},
+    sync::{Arc, mpsc},
     thread,
 };
 
 use diagweave::Transform;
 
 use veloq_buf::PoolTopology;
-use veloq_driver_native::driver::{Driver, PlatformDriver};
+use veloq_driver_native::driver::PlatformDriver;
 use veloq_runtime::{
     runtime::{self as async_runtime},
     utils::StaticTransfer,
@@ -24,7 +24,7 @@ use crate::{
     error::Result as VeloqResult,
     runtime::context::{
         BorrowedRegistrar, Ctx, RegistrarMessage, SharedRegistrar, WorkerRegistrarState,
-        WorkerState, poll_current_driver,
+        WorkerState, poll_current_driver, wait_current_driver,
     },
 };
 
@@ -159,24 +159,11 @@ impl<T: PoolTopology> Runtime<T> {
             }),
         );
 
-        let mut placeholders = Vec::with_capacity(worker_count.get());
-        let mut notifiers = Vec::with_capacity(worker_count.get());
-        for _ in 0..worker_count.get() {
-            let placeholder = Arc::new(WorkerWakeNotifier::new());
-            placeholders.push(placeholder.clone());
-
-            let placeholder_clone = placeholder.clone();
-            let notifier: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-                placeholder_clone.call();
-            });
-            notifiers.push(Some(notifier));
-        }
-
         async_runtime::RuntimeBuilder::new()
             .with_worker_count(Some(worker_count))
             .with_queue_capacity(config.get_queue_capacity())
             .with_idle_hook(poll_current_driver)
-            .with_notifiers(notifiers)
+            .with_worker_wait_hook(wait_current_driver)
             .with_worker_factory(move |worker_id, shared| {
                 let topology = topology.clone();
                 let state = state.clone();
@@ -192,12 +179,6 @@ impl<T: PoolTopology> Runtime<T> {
 
                 let driver = PlatformDriver::new(config.clone(), registrar)
                     .expect("failed to create driver");
-
-                let placeholder = &placeholders[worker_id];
-                let wake = driver.create_waker();
-                placeholder.set_handler(Arc::new(move || {
-                    let _ = wake.wake();
-                }));
 
                 let driver_cell = RefCell::new(driver);
 
@@ -224,29 +205,5 @@ impl<T: PoolTopology> Runtime<T> {
                 f(ctx).await
             })
             .trans()
-    }
-}
-
-struct WorkerWakeNotifier {
-    handler: OnceLock<Arc<dyn Fn() + Send + Sync>>,
-}
-
-impl WorkerWakeNotifier {
-    fn new() -> Self {
-        Self {
-            handler: OnceLock::new(),
-        }
-    }
-
-    fn call(&self) {
-        if let Some(handler) = self.handler.get() {
-            handler();
-        }
-    }
-
-    fn set_handler(&self, handler: Arc<dyn Fn() + Send + Sync>) {
-        if self.handler.set(handler).is_err() {
-            panic!("WorkerWakeNotifier: handler has already been set");
-        }
     }
 }
