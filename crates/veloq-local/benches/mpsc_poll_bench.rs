@@ -9,7 +9,7 @@ fn bench_poll_pending(c: &mut Criterion) {
     let recv_fut = rx.recv();
     let mut pinned = Box::pin(recv_fut);
     let waker = Waker::noop();
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(waker);
 
     c.bench_function("mpsc_poll_pending", |b| {
         b.iter(|| {
@@ -25,7 +25,7 @@ fn bench_stream_poll_pending(c: &mut Criterion) {
     let stream = rx.stream();
     let mut pinned = Box::pin(stream);
     let waker = Waker::noop();
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(waker);
 
     c.bench_function("mpsc_stream_poll_pending", |b| {
         b.iter(|| {
