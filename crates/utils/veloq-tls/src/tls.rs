@@ -8,21 +8,15 @@ use core::{
 };
 
 #[cfg(windows)]
-use windows_sys::Win32::System::Threading::{
-    FLS_OUT_OF_INDEXES, FlsAlloc, FlsFree, FlsGetValue, FlsSetValue,
-};
-
-#[cfg(windows)]
-unsafe extern "system" {
-    fn GetLastError() -> u32;
-}
-
-#[cfg(windows)]
 use core::ffi::c_void;
-
 #[cfg(unix)]
 use libc::{
     c_void, pthread_getspecific, pthread_key_create, pthread_key_delete, pthread_setspecific,
+};
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::GetLastError,
+    System::Threading::{FLS_OUT_OF_INDEXES, FlsAlloc, FlsFree, FlsGetValue, FlsSetValue},
 };
 
 /// A high-performance thread-local storage wrapper using platform-native TLS.
@@ -66,55 +60,55 @@ impl<T> Tls<T> {
         }
 
         loop {
-            match self
-                .key
-                .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            {
-                Ok(_) => {
-                    let res = unsafe {
-                        #[cfg(windows)]
-                        {
-                            let key = FlsAlloc(Some(tls_destructor::<T>));
-                            if key == FLS_OUT_OF_INDEXES {
-                                Err(TlsErrorKind::AllocationFailed)
-                            } else {
-                                Ok(key)
+            if val == 0 {
+                match self
+                    .key
+                    .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                {
+                    Ok(_) => {
+                        let res = unsafe {
+                            #[cfg(windows)]
+                            {
+                                let key = FlsAlloc(Some(tls_destructor::<T>));
+                                if key == FLS_OUT_OF_INDEXES {
+                                    Err(TlsErrorKind::AllocationFailed)
+                                } else {
+                                    Ok(key)
+                                }
                             }
-                        }
-                        #[cfg(unix)]
-                        {
-                            let mut key = 0;
-                            let res = pthread_key_create(&mut key, Some(tls_destructor::<T>));
-                            if res != 0 {
-                                Err(TlsErrorKind::AllocationFailed)
-                            } else {
-                                Ok(key)
+                            #[cfg(unix)]
+                            {
+                                let mut key = 0;
+                                let res = pthread_key_create(&mut key, Some(tls_destructor::<T>));
+                                if res != 0 {
+                                    Err(TlsErrorKind::AllocationFailed)
+                                } else {
+                                    Ok(key)
+                                }
                             }
-                        }
-                    };
+                        };
 
-                    match res {
-                        Ok(k) => {
-                            let stored = (k as usize) + 2;
-                            self.key.store(stored, Ordering::Release);
-                            return Ok(k);
+                        match res {
+                            Ok(k) => {
+                                let stored = (k as usize) + 2;
+                                self.key.store(stored, Ordering::Release);
+                                return Ok(k);
+                            }
+                            Err(e) => {
+                                self.key.store(0, Ordering::Release);
+                                return Err(e);
+                            }
                         }
-                        Err(e) => {
-                            self.key.store(0, Ordering::Release);
-                            return Err(e);
-                        }
+                    }
+                    Err(current) => {
+                        val = current;
                     }
                 }
-                Err(current) => {
-                    if current > 1 {
-                        return Ok((current - 2) as RawKey);
-                    }
-                    spin_loop();
-                    val = self.key.load(Ordering::Acquire);
-                    if val > 1 {
-                        return Ok((val - 2) as RawKey);
-                    }
-                }
+            } else if val > 1 {
+                return Ok((val - 2) as RawKey);
+            } else {
+                spin_loop();
+                val = self.key.load(Ordering::Acquire);
             }
         }
     }
