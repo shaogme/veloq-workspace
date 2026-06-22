@@ -1,7 +1,6 @@
 use crate::{RawKey, ResetGuard, TlsError, TlsErrorKind, is_sentinel, sentinel_ptr};
 use alloc::boxed::Box;
 use core::{
-    ffi::c_void,
     hint::spin_loop,
     marker::PhantomData,
     ptr::null_mut,
@@ -18,8 +17,13 @@ unsafe extern "system" {
     fn GetLastError() -> u32;
 }
 
+#[cfg(windows)]
+use core::ffi::c_void;
+
 #[cfg(unix)]
-use libc::{pthread_getspecific, pthread_key_create, pthread_key_delete, pthread_setspecific};
+use libc::{
+    c_void, pthread_getspecific, pthread_key_create, pthread_key_delete, pthread_setspecific,
+};
 
 /// A high-performance thread-local storage wrapper using platform-native TLS.
 ///
@@ -439,7 +443,7 @@ impl<T> Drop for Tls<T> {
 }
 
 #[cfg(unix)]
-unsafe extern "C" fn tls_destructor<T>(ptr: *mut libc::c_void) {
+unsafe extern "C" fn tls_destructor<T>(ptr: *mut c_void) {
     if !ptr.is_null() && !is_sentinel(ptr) {
         unsafe {
             let _ = Box::from_raw(ptr as *mut T);
