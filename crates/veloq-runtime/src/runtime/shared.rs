@@ -281,7 +281,9 @@ impl RuntimeSharedBase {
 
     #[inline]
     pub(crate) fn wake_worker(&self, worker_id: usize) {
-        self.registry.wake_source(worker_id).notify();
+        self.registry
+            .wake_source(worker_id)
+            .notify_runtime_progress();
     }
 
     #[inline]
@@ -353,7 +355,7 @@ impl RuntimeSharedBase {
     pub(crate) fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
         for i in 0..self.registry.wake_sources.len() {
-            self.registry.wake_source(i).notify();
+            self.registry.wake_source(i).notify_runtime_progress();
         }
     }
 

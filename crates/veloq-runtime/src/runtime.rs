@@ -258,14 +258,16 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                             };
                             match decision {
                                 IdleDecision::Continue => thread::yield_now(),
-                                IdleDecision::Wait { backend, strategy } => {
-                                    wake.wait_block_on(epoch, backend, strategy, |strategy| {
-                                        match backend {
-                                            WaitBackend::RuntimePark => Ok(()),
-                                            WaitBackend::Driver => shared_ref.drive_wait(strategy),
-                                        }
-                                    })?;
-                                }
+                                IdleDecision::Wait { backend, strategy } => match backend {
+                                    WaitBackend::RuntimePark => {
+                                        wake.wait_block_on_runtime(epoch, strategy);
+                                    }
+                                    WaitBackend::Driver => {
+                                        wake.wait_block_on_driver(epoch, strategy, |strategy| {
+                                            shared_ref.drive_wait(strategy)
+                                        })?;
+                                    }
+                                },
                             }
                         }
                     }

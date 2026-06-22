@@ -404,12 +404,12 @@ impl IdleController {
     ) -> bool {
         let group = &topo.groups[group_idx];
         if let Some(worker_id) = group.idle_stack.pop_idle(&self.idle_mask, &topo.next_idle) {
-            registry.wake_source(worker_id).notify();
+            registry.wake_source(worker_id).notify_runtime_progress();
             return true;
         }
         for &worker_id in &group.worker_ids {
             if self.idle_mask.is_set(worker_id) {
-                registry.wake_source(worker_id).notify();
+                registry.wake_source(worker_id).notify_runtime_progress();
                 return true;
             }
         }
@@ -486,16 +486,15 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
         let base = &self.shared.base;
         let wake = base.registry.wake_sources[self.worker_id].clone();
         let epoch = wake.current_epoch();
-        wake.wait_worker(
-            epoch,
-            backend,
-            wait_strategy,
-            completion.is_some(),
-            |strategy| match backend {
-                WaitBackend::RuntimePark => Ok(()),
-                WaitBackend::Driver => self.shared.drive_wait(strategy),
-            },
-        )
+        match backend {
+            WaitBackend::RuntimePark => {
+                wake.wait_worker_runtime(epoch, wait_strategy, completion.is_some());
+                Ok(())
+            }
+            WaitBackend::Driver => wake.wait_worker_driver(epoch, wait_strategy, |strategy| {
+                self.shared.drive_wait(strategy)
+            }),
+        }
     }
 
     fn leave_idle(&self, group_idx: usize) {

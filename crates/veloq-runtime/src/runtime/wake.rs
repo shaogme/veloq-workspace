@@ -10,7 +10,7 @@ use std::{
 use crate::{
     error::{Result, RuntimeError},
     runtime::{
-        context::{IdleWaitStrategy, WaitBackend},
+        context::IdleWaitStrategy,
         primitives::{Parker, ParkerInner, Signal, Unparker},
     },
 };
@@ -20,15 +20,12 @@ pub trait ExternalWake: Send + Sync {
     fn wake(&self);
 }
 
-const WAIT_MODE_ACTIVE: u8 = 0;
-const WAIT_MODE_WORKER_RUNTIME: u8 = 1;
-const WAIT_MODE_WORKER_DRIVER: u8 = 2;
-const WAIT_MODE_BLOCK_ON_RUNTIME: u8 = 3;
-const WAIT_MODE_BLOCK_ON_DRIVER: u8 = 4;
+const DRIVER_WAIT_WORKER: u8 = 1 << 0;
+const DRIVER_WAIT_BLOCK_ON: u8 = 1 << 1;
 
 pub struct WakeCoordinator {
     epoch: AtomicU64,
-    wait_mode: AtomicU8,
+    driver_waits: AtomicU8,
     parker: Arc<ParkerInner>,
     block_on: Signal,
     external_wake: OnceLock<Arc<dyn ExternalWake>>,
@@ -38,7 +35,7 @@ impl WakeCoordinator {
     pub(crate) fn new() -> Self {
         Self {
             epoch: AtomicU64::new(0),
-            wait_mode: AtomicU8::new(WAIT_MODE_ACTIVE),
+            driver_waits: AtomicU8::new(0),
             parker: Arc::new(ParkerInner {
                 state: AtomicU32::new(0),
             }),
@@ -65,109 +62,93 @@ impl WakeCoordinator {
     }
 
     #[inline]
-    pub(crate) fn notify(&self) {
-        // Publish a new wake epoch before routing the underlying wake so waiters
-        // can detect notifications that happen during their own poll path.
+    pub(crate) fn notify_runtime_progress(&self) {
+        // Runtime progress is always published locally first so block_on/runtime
+        // waiters cannot miss a wake just because the current wait path happens
+        // to be a driver wait.
         let _ = self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.local_unpark();
 
-        match self.wait_mode.load(Ordering::Acquire) {
-            WAIT_MODE_WORKER_DRIVER | WAIT_MODE_BLOCK_ON_DRIVER => {
-                if let Some(wake) = self.external_wake.get() {
-                    wake.wake();
-                } else {
-                    self.local_unpark();
-                }
-            }
-            WAIT_MODE_BLOCK_ON_RUNTIME => {
-                self.block_on.notify();
-            }
-            WAIT_MODE_ACTIVE | WAIT_MODE_WORKER_RUNTIME | _ => {
-                self.local_unpark();
-            }
+        if self.driver_waits.load(Ordering::Acquire) != 0
+            && let Some(wake) = self.external_wake.get()
+        {
+            wake.wake();
         }
     }
 
-    pub(crate) fn wait_worker<F>(
+    pub(crate) fn wait_worker_runtime(
         &self,
         observed_epoch: u64,
-        backend: WaitBackend,
         strategy: IdleWaitStrategy,
         completion_wait: bool,
-        external_wait: F,
-    ) -> Result<()>
-    where
-        F: FnOnce(IdleWaitStrategy) -> Result<()>,
-    {
-        let mode = match backend {
-            WaitBackend::RuntimePark => WAIT_MODE_WORKER_RUNTIME,
-            WaitBackend::Driver => WAIT_MODE_WORKER_DRIVER,
-        };
-        let Some(_guard) = self.begin_wait(mode, observed_epoch) else {
-            return Ok(());
-        };
-
-        match backend {
-            WaitBackend::RuntimePark => {
-                self.wait_runtime(strategy, completion_wait);
-                Ok(())
-            }
-            WaitBackend::Driver => external_wait(strategy),
+    ) {
+        if self.epoch.load(Ordering::Acquire) != observed_epoch {
+            return;
         }
+        self.wait_runtime(strategy, completion_wait);
     }
 
-    pub(crate) fn wait_block_on<F>(
+    pub(crate) fn wait_worker_driver<F>(
         &self,
         observed_epoch: u64,
-        backend: WaitBackend,
         strategy: IdleWaitStrategy,
         external_wait: F,
     ) -> Result<()>
     where
         F: FnOnce(IdleWaitStrategy) -> Result<()>,
     {
-        let mode = match backend {
-            WaitBackend::RuntimePark => WAIT_MODE_BLOCK_ON_RUNTIME,
-            WaitBackend::Driver => WAIT_MODE_BLOCK_ON_DRIVER,
-        };
-        let Some(_guard) = self.begin_wait(mode, observed_epoch) else {
+        let Some(_guard) = self.begin_driver_wait(DRIVER_WAIT_WORKER, observed_epoch) else {
             return Ok(());
         };
-
-        match backend {
-            WaitBackend::RuntimePark => {
-                self.wait_block_signal(strategy);
-                Ok(())
-            }
-            WaitBackend::Driver => external_wait(strategy),
-        }
+        external_wait(strategy)
     }
 
-    fn begin_wait(&self, mode: u8, observed_epoch: u64) -> Option<WaitGuard<'_>> {
+    pub(crate) fn wait_block_on_runtime(&self, observed_epoch: u64, strategy: IdleWaitStrategy) {
+        if self.epoch.load(Ordering::Acquire) != observed_epoch {
+            return;
+        }
+        self.wait_block_signal(strategy);
+    }
+
+    pub(crate) fn wait_block_on_driver<F>(
+        &self,
+        observed_epoch: u64,
+        strategy: IdleWaitStrategy,
+        external_wait: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(IdleWaitStrategy) -> Result<()>,
+    {
+        let Some(_guard) = self.begin_driver_wait(DRIVER_WAIT_BLOCK_ON, observed_epoch) else {
+            return Ok(());
+        };
+        external_wait(strategy)
+    }
+
+    fn begin_driver_wait(&self, bit: u8, observed_epoch: u64) -> Option<DriverWaitGuard<'_>> {
         loop {
             if self.epoch.load(Ordering::Acquire) != observed_epoch {
                 return None;
             }
 
-            match self.wait_mode.compare_exchange(
-                WAIT_MODE_ACTIVE,
-                mode,
+            let waits = self.driver_waits.load(Ordering::Acquire);
+            match self.driver_waits.compare_exchange(
+                waits,
+                waits | bit,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
                 Ok(_) => break,
-                Err(WAIT_MODE_ACTIVE) => continue,
-                Err(_) => {
-                    return None;
-                }
+                Err(_) => continue,
             }
         }
 
         if self.epoch.load(Ordering::Acquire) != observed_epoch {
-            self.wait_mode.store(WAIT_MODE_ACTIVE, Ordering::Release);
+            self.driver_waits.fetch_and(!bit, Ordering::AcqRel);
             return None;
         }
 
-        Some(WaitGuard { wake: self, mode })
+        Some(DriverWaitGuard { wake: self, bit })
     }
 
     fn wait_runtime(&self, strategy: IdleWaitStrategy, completion_wait: bool) {
@@ -203,19 +184,16 @@ impl WakeCoordinator {
     }
 }
 
-struct WaitGuard<'a> {
+struct DriverWaitGuard<'a> {
     wake: &'a WakeCoordinator,
-    mode: u8,
+    bit: u8,
 }
 
-impl Drop for WaitGuard<'_> {
+impl Drop for DriverWaitGuard<'_> {
     fn drop(&mut self) {
-        let _ = self.wake.wait_mode.compare_exchange(
-            self.mode,
-            WAIT_MODE_ACTIVE,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        self.wake
+            .driver_waits
+            .fetch_and(!self.bit, Ordering::AcqRel);
     }
 }
 
@@ -230,11 +208,11 @@ static WAKE_VTABLE: RawWakerVTable = RawWakerVTable::new(
         RawWaker::new(p, &WAKE_VTABLE)
     },
     |p| unsafe {
-        Arc::from_raw(p as *const WakeCoordinator).notify();
+        Arc::from_raw(p as *const WakeCoordinator).notify_runtime_progress();
     },
     |p| unsafe {
         let wake = ManuallyDrop::new(Arc::from_raw(p as *const WakeCoordinator));
-        wake.notify();
+        wake.notify_runtime_progress();
     },
     |p| unsafe {
         drop(Arc::from_raw(p as *const WakeCoordinator));
@@ -244,27 +222,59 @@ static WAKE_VTABLE: RawWakerVTable = RawWakerVTable::new(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::context::IdleWaitStrategy;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct CountingWake {
+        hits: AtomicUsize,
+    }
+
+    impl CountingWake {
+        fn new() -> Self {
+            Self {
+                hits: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl ExternalWake for CountingWake {
+        fn wake(&self) {
+            self.hits.fetch_add(1, Ordering::AcqRel);
+        }
+    }
 
     #[test]
     fn wait_is_skipped_when_epoch_changes_before_arm() {
         let wake = WakeCoordinator::new();
         let epoch = wake.current_epoch();
-        wake.notify();
+        wake.notify_runtime_progress();
 
         let mut called = false;
-        let res = wake.wait_worker(
-            epoch,
-            WaitBackend::Driver,
-            IdleWaitStrategy::block(),
-            false,
-            |_| {
-                called = true;
-                Ok(())
-            },
-        );
+        let res = wake.wait_worker_driver(epoch, IdleWaitStrategy::block(), |_| {
+            called = true;
+            Ok(())
+        });
 
         assert!(res.is_ok());
         assert!(!called);
+    }
+
+    #[test]
+    fn runtime_progress_notifies_external_wake_while_driver_wait_is_armed() {
+        let wake = WakeCoordinator::new();
+        let external = Arc::new(CountingWake::new());
+        wake.bind_external_wake(external.clone()).unwrap();
+        let epoch = wake.current_epoch();
+
+        let res = wake.wait_worker_driver(epoch, IdleWaitStrategy::block(), |_| {
+            wake.notify_runtime_progress();
+            Ok(())
+        });
+
+        assert!(res.is_ok());
+        assert_eq!(external.hits.load(Ordering::Acquire), 1);
+        assert!(wake.current_epoch() > epoch);
     }
 }

@@ -424,7 +424,9 @@ pub fn poll_current_driver<'reg>(
         "driver drive(Poll) failed",
     )?;
     Ok(match outcome.next_timeout_hint {
-        Some(duration) => IdleDecision::wait(WaitBackend::Driver, IdleWaitStrategy::timeout(duration)),
+        Some(duration) => {
+            IdleDecision::wait(WaitBackend::Driver, IdleWaitStrategy::timeout(duration))
+        }
         None if outcome.pending_progress => IdleDecision::continue_now(),
         None => IdleDecision::wait(WaitBackend::RuntimePark, IdleWaitStrategy::block()),
     })
