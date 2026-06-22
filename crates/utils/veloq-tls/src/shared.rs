@@ -49,11 +49,11 @@ impl Drop for ResetGuard {
         if self.active {
             #[cfg(windows)]
             unsafe {
-                FlsSetValue(self.key, std::ptr::null_mut());
+                FlsSetValue(self.key, core::ptr::null_mut());
             }
             #[cfg(unix)]
             unsafe {
-                pthread_setspecific(self.key, std::ptr::null_mut());
+                pthread_setspecific(self.key, core::ptr::null_mut());
             }
         }
     }
