@@ -1,16 +1,16 @@
 use core::sync::atomic::{AtomicBool, Ordering};
-use veloq_thread::Thread;
+use veloq_thread::spawn;
 
 #[test]
 fn test_spawn_and_join() {
     static CALLED: AtomicBool = AtomicBool::new(false);
 
-    let thread = Thread::spawn(|| {
+    let thread = spawn(|| {
         CALLED.store(true, Ordering::SeqCst);
     })
-    .expect("Failed to spawn Thread");
+    .expect("Failed to spawn RawJoinHandle");
 
-    thread.join().expect("Failed to join Thread");
+    thread.join().expect("Failed to join RawJoinHandle");
 
     assert!(CALLED.load(Ordering::SeqCst));
 }
@@ -61,21 +61,53 @@ fn test_scope_nested() {
 fn test_yield_now() {
     veloq_thread::scope(|s| {
         s.spawn(|| {
-            veloq_thread::yield_now();
+            let _ = veloq_thread::yield_now();
         })
         .expect("Failed to spawn scoped thread");
     });
-    veloq_thread::yield_now();
+    let _ = veloq_thread::yield_now();
 }
 
 #[test]
 fn test_thread_abort() {
-    let thread = Thread::spawn(|| {
-        loop {
-            veloq_thread::yield_now();
-        }
-    })
-    .expect("Failed to spawn Thread");
+    let thread = spawn(|| while veloq_thread::yield_now().is_ok() {})
+        .expect("Failed to spawn RawJoinHandle");
 
-    thread.abort().expect("Failed to abort thread");
+    thread.abort().expect("Failed to abort RawJoinHandle");
+    let _ = thread.join();
+}
+
+#[test]
+fn test_spawn_with_return_value() {
+    let thread = spawn(|| 42).expect("Failed to spawn thread");
+    let val = thread.join().expect("Failed to join thread");
+    assert_eq!(val, 42);
+}
+
+#[test]
+fn test_thread_abort_error() {
+    let thread = spawn(|| while veloq_thread::yield_now().is_ok() {})
+        .expect("Failed to spawn RawJoinHandle");
+
+    thread.abort().expect("Failed to abort RawJoinHandle");
+    let res = thread.join();
+    assert!(res.is_err());
+    assert_eq!(
+        res.unwrap_err().kind(),
+        veloq_thread::ThreadErrorKind::Aborted
+    );
+}
+#[test]
+fn test_thread_panic_error() {
+    let thread = spawn(|| {
+        panic!("intentional panic");
+    })
+    .expect("Failed to spawn RawJoinHandle");
+
+    let res = thread.join();
+    assert!(res.is_err());
+    assert_eq!(
+        res.unwrap_err().kind(),
+        veloq_thread::ThreadErrorKind::Panicked
+    );
 }

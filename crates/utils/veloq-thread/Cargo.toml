@@ -12,6 +12,7 @@ categories.workspace = true
 readme.workspace = true
 
 [dependencies]
+veloq-tls.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { workspace = true, features = [
