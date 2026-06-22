@@ -189,10 +189,10 @@ impl<'scope, P: PlatformImpl, R: Send + 'scope> RawScopedJoinHandle<'scope, P, R
             #[cfg(feature = "std")]
             {
                 let panic_err = self.scope_data.pop_panic();
-                if let Some(mut err) = panic_err {
-                    if let Some(p) = err.take_panic() {
-                        resume_unwind(p);
-                    }
+                if let Some(mut err) = panic_err
+                    && let Some(p) = err.take_panic()
+                {
+                    resume_unwind(p);
                 }
             }
             panic!("handle finished but no result found");
