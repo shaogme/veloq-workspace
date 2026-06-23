@@ -96,8 +96,12 @@ impl TimerEngine {
 
     pub(super) fn advance_to(&mut self, now: Instant) {
         let elapsed = now.saturating_duration_since(self.last_poll);
-        self.wheel.advance(elapsed, &mut self.buffer);
-        self.last_poll = now;
+        let tick_ms = self.wheel.tick_duration().as_millis() as u64;
+        let ticks = elapsed.as_millis() as u64 / tick_ms;
+        if ticks > 0 {
+            self.wheel.advance(elapsed, &mut self.buffer);
+            self.last_poll += Duration::from_millis(ticks * tick_ms);
+        }
     }
 
     pub(super) fn take_buffer(&mut self) -> Vec<OpToken> {

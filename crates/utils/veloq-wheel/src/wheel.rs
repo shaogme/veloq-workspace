@@ -140,8 +140,7 @@ impl<T> Wheel<T> {
     /// 根据 L0 tick 持续时间将持续时间转换为 tick 数量。
     fn delay_to_ticks(&self, delay: Duration) -> u64 {
         let ms = delay.as_millis() as u64;
-        let ticks = ms / self.tick_duration_ms;
-        ticks.max(1)
+        ms / self.tick_duration_ms
     }
 
     /// Insert a task into the wheel with a specified delay.
@@ -150,7 +149,7 @@ impl<T> Wheel<T> {
     /// 将任务以指定的延迟插入时间轮。
     /// 返回一个 `TaskId`，可用于取消该任务。
     pub fn insert(&mut self, item: T, delay: Duration) -> TaskId {
-        let ticks = self.delay_to_ticks(delay);
+        let ticks = self.delay_to_ticks(delay).max(1);
         let deadline = self.global_tick.wrapping_add(ticks);
         let (level, slot_index) = self.determine_location(deadline);
 
@@ -266,6 +265,10 @@ impl<T> Wheel<T> {
                 }
             }
         }
+    }
+
+    pub fn tick_duration(&self) -> Duration {
+        Duration::from_millis(self.tick_duration_ms)
     }
 
     /// Calculate the duration until the next timed event triggers.

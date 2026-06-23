@@ -337,8 +337,12 @@ impl<'a> UringDriver<'a> {
 
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(self.last_timer_poll);
-        self.advance_timers(elapsed)?;
-        self.last_timer_poll = now;
+        let tick_ms = self.wheel.tick_duration().as_millis() as u64;
+        let ticks = elapsed.as_millis() as u64 / tick_ms;
+        if ticks > 0 {
+            self.advance_timers(elapsed)?;
+            self.last_timer_poll += Duration::from_millis(ticks * tick_ms);
+        }
 
         let progress = self.process_completions_internal()?;
         let _ = progress.semantic_count();
@@ -372,8 +376,12 @@ impl<'a> UringDriver<'a> {
 
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(self.last_timer_poll);
-        self.advance_timers(elapsed)?;
-        self.last_timer_poll = now;
+        let tick_ms = self.wheel.tick_duration().as_millis() as u64;
+        let ticks = elapsed.as_millis() as u64 / tick_ms;
+        if ticks > 0 {
+            self.advance_timers(elapsed)?;
+            self.last_timer_poll += Duration::from_millis(ticks * tick_ms);
+        }
 
         self.flush_cancellations()?;
         self.flush_backlog()?;
