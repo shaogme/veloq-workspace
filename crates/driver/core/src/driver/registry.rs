@@ -310,18 +310,36 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         true
     }
 
+    fn finalize_in_flight_completion(
+        &mut self,
+        token: OpToken,
+    ) -> Option<OpEntry<RegistryPlatformData<Spec>>> {
+        let (user_data, generation) = token.parts();
+        let slot = self.shared.slots.get(user_data)?;
+        let core = slot.load_core_state(Ordering::Acquire);
+
+        let is_valid = (core.state() != SlotState::Idle && core.generation() == generation)
+            || (core.state() == SlotState::Idle && core.generation() == generation.wrapping_add(1));
+
+        if !is_valid {
+            return None;
+        }
+
+        Some(self.remove_at_index(user_data))
+    }
+
     pub fn finalize_waiting_completion(
         &mut self,
         token: OpToken,
     ) -> Option<OpEntry<RegistryPlatformData<Spec>>> {
-        self.remove(token)
+        self.finalize_in_flight_completion(token)
     }
 
     pub fn finalize_orphaned_completion(
         &mut self,
         token: OpToken,
     ) -> Option<OpEntry<RegistryPlatformData<Spec>>> {
-        self.remove(token)
+        self.finalize_in_flight_completion(token)
     }
 
     pub fn finalize_corrupt_slot(
