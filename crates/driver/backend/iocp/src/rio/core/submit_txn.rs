@@ -602,6 +602,7 @@ mod tests {
             next_request_id: 0,
             deferred_payloads: Vec::new(),
             diagnostics: crate::driver::IocpDriverCompletionDiagnostics::default(),
+            cq_armed: true,
         }
     }
 

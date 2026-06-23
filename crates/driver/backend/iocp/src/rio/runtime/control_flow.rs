@@ -475,8 +475,9 @@ impl RioState {
         let key = self.actors.insert(actor);
         self.actor_by_handle.insert(socket_key, key);
         self.socket_runtime.entry(socket_key).or_default();
-        if is_first {
+        if is_first && !self.cq_armed {
             self.kernel.rearm_notify().trans()?;
+            self.cq_armed = true;
         }
         self.actors
             .get_mut(key)
@@ -529,6 +530,7 @@ impl RioState {
         let Some(env) = self.kernel.env(registrar, self.registration_mode) else {
             return Ok(0);
         };
+        self.cq_armed = false;
         let mut hooks = RioCompletionHooks::new(
             &mut self.outstanding_count,
             &mut self.socket_runtime,
@@ -620,6 +622,7 @@ impl RioState {
 
         if !self.actor_by_handle.is_empty() {
             self.kernel.rearm_notify().trans()?;
+            self.cq_armed = true;
         }
 
         if *hooks.outstanding_count == 0 {

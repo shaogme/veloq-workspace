@@ -51,6 +51,7 @@ impl RioState {
             next_request_id: 0,
             deferred_payloads: Vec::new(),
             diagnostics,
+            cq_armed: true,
         })
     }
 

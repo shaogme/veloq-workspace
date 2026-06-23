@@ -66,6 +66,7 @@ impl DeferredRioCleanup {
             next_request_id: self.next_request_id,
             deferred_payloads: self.deferred_payloads,
             diagnostics: self.diagnostics,
+            cq_armed: true,
         };
         state.stop_accepting_new_submissions();
         if let Err(e) = state.drain_outstanding(RIO_REAPER_DRAIN_TIMEOUT) {
