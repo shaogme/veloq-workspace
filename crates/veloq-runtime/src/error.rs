@@ -15,6 +15,12 @@ set! {
             current_worker: usize,
         },
 
+        #[display("failed to spawn worker thread: {source}")]
+        ThreadSpawnFailed {
+            #[source]
+            source: veloq_thread::ThreadError,
+        },
+
         #[display("worker_factory has already been taken")]
         WorkerFactoryAlreadyTaken,
 
