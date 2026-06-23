@@ -351,7 +351,14 @@ impl ThreadParker {
             return;
         }
 
-        self.state.store(2, Ordering::Release);
+        if self
+            .state
+            .compare_exchange(0, 2, Ordering::Release, Ordering::Acquire)
+            .is_err()
+        {
+            self.state.store(0, Ordering::Release);
+            return;
+        }
 
         while self.state.load(Ordering::Acquire) == 2 {
             unsafe {
