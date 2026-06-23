@@ -86,7 +86,7 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
 
         let thread_errors = Mutex::new(None);
 
-        let res: Result<R> = veloq_thread::scope(|scope| {
+        let res: Result<R> = thread::scope(|scope| {
             struct ShutdownGuard<'rt, T>(&'rt RuntimeShared<T>);
             impl<'rt, T> Drop for ShutdownGuard<'rt, T> {
                 fn drop(&mut self) {
@@ -111,48 +111,42 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                     worker: deque,
                 };
 
-                scope
-                    .spawn(move || {
-                        let init_res = (|| {
-                            shared_ref.base.tls.set_owned(context).map_err(|source| {
-                                RuntimeError::TlsSetOwnedFailed {
-                                    worker_id,
-                                    source: source.kind(),
-                                }
+                scope.spawn(move || {
+                    let init_res = (|| {
+                        shared_ref.base.tls.set_owned(context).map_err(|source| {
+                            RuntimeError::TlsSetOwnedFailed {
+                                worker_id,
+                                source: source.kind(),
+                            }
+                        })?;
+                        shared_ref
+                            .extra_tls
+                            .set_owned(worker_factory_ref(worker_id, shared_ref))
+                            .map_err(|source| RuntimeError::TlsSetOwnedFailed {
+                                worker_id,
+                                source: source.kind(),
                             })?;
-                            shared_ref
-                                .extra_tls
-                                .set_owned(worker_factory_ref(worker_id, shared_ref))
-                                .map_err(|source| RuntimeError::TlsSetOwnedFailed {
-                                    worker_id,
-                                    source: source.kind(),
-                                })?;
-                            Ok(())
-                        })();
+                        Ok(())
+                    })();
 
-                        if let Err(err) = init_res {
-                            let mut guard =
-                                thread_errors_ref.lock().unwrap_or_else(|e| e.into_inner());
-                            if guard.is_none() {
-                                *guard = Some(err);
-                            }
-                            return;
+                    if let Err(err) = init_res {
+                        let mut guard = thread_errors_ref.lock().unwrap_or_else(|e| e.into_inner());
+                        if guard.is_none() {
+                            *guard = Some(err);
                         }
+                        return;
+                    }
 
-                        let _tls_cleanup = TlsCleanupGuard(&shared_ref.base.tls);
-                        let _extra_cleanup = TlsCleanupGuard(&shared_ref.extra_tls);
+                    let _tls_cleanup = TlsCleanupGuard(&shared_ref.base.tls);
+                    let _extra_cleanup = TlsCleanupGuard(&shared_ref.extra_tls);
 
-                        if let Err(err) =
-                            shared_ref.drive_worker::<AtomicStorage, ArcOwnership>(None)
-                        {
-                            let mut guard =
-                                thread_errors_ref.lock().unwrap_or_else(|e| e.into_inner());
-                            if guard.is_none() {
-                                *guard = Some(err);
-                            }
+                    if let Err(err) = shared_ref.drive_worker::<AtomicStorage, ArcOwnership>(None) {
+                        let mut guard = thread_errors_ref.lock().unwrap_or_else(|e| e.into_inner());
+                        if guard.is_none() {
+                            *guard = Some(err);
                         }
-                    })
-                    .map_err(|e| RuntimeError::ThreadSpawnFailed { source: e })?;
+                    }
+                });
             }
 
             let deque0 = deques.pop().ok_or(RuntimeError::MainWorkerDequeExhausted)?;
