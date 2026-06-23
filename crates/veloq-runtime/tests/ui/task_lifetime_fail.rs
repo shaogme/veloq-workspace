@@ -1,0 +1,31 @@
+use veloq_runtime::runtime::Runtime;
+use veloq_runtime::{task, task_local, scope};
+
+fn main() {
+    Runtime::<(), _>::scope(async |ctx| {
+        scope!(ctx, async |s| {
+            task_local!(t, async {
+                veloq_runtime::task::yield_now().await;
+                veloq_runtime::task::yield_now().await;
+                veloq_runtime::task::yield_now().await;
+                veloq_runtime::task::yield_now().await;
+                42
+            });
+            let _ = s.spawn_local(&t);
+        })
+        .await
+        .unwrap();
+        scope!(ctx, async |s| {
+            task!(t, async {
+                veloq_runtime::task::yield_now().await;
+                veloq_runtime::task::yield_now().await;
+                veloq_runtime::task::yield_now().await;
+                veloq_runtime::task::yield_now().await;
+                42
+            });
+            let _ = s.spawn(&t);
+        })
+        .await
+        .unwrap();
+    }).unwrap();
+}

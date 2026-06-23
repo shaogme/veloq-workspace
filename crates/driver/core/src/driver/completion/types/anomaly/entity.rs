@@ -1,0 +1,405 @@
+use crate::slot;
+
+use super::super::super::{CompletionEvent, CompletionToken};
+use super::{CompletionAnomaly, CompletionAnomalyReason, CompletionBackend, CompletionRaw};
+
+impl CompletionAnomaly {
+    pub fn reason(self) -> CompletionAnomalyReason {
+        match self {
+            Self::SlotState { reason, .. } => reason,
+            Self::UnknownSlot { .. } => CompletionAnomalyReason::UnknownSlot,
+            Self::StaleGeneration { .. } => CompletionAnomalyReason::StaleGeneration,
+            Self::BackendContext { .. } => CompletionAnomalyReason::BackendContextUnknown,
+            Self::BackendSpecific { code, .. } => CompletionAnomalyReason::BackendSpecific(code),
+        }
+    }
+
+    pub fn token(self) -> CompletionToken {
+        match self {
+            Self::UnknownSlot { token, .. }
+            | Self::StaleGeneration { token, .. }
+            | Self::SlotState { token, .. }
+            | Self::BackendContext { token, .. }
+            | Self::BackendSpecific { token, .. } => token,
+        }
+    }
+
+    pub fn index(self) -> Option<usize> {
+        match self {
+            Self::UnknownSlot { index, .. }
+            | Self::StaleGeneration { index, .. }
+            | Self::SlotState { index, .. } => Some(index),
+            Self::BackendSpecific { index, .. } => index,
+            Self::BackendContext { .. } => None,
+        }
+    }
+
+    pub fn expected_generation(self) -> Option<u32> {
+        match self {
+            Self::UnknownSlot {
+                expected_generation,
+                ..
+            } => Some(expected_generation),
+            Self::StaleGeneration {
+                expected_generation,
+                ..
+            } => Some(expected_generation),
+            Self::SlotState { generation, .. } => Some(generation),
+            Self::BackendSpecific {
+                expected_generation,
+                ..
+            } => expected_generation,
+            Self::BackendContext { .. } => None,
+        }
+    }
+
+    pub fn actual_generation(self) -> Option<u32> {
+        match self {
+            Self::StaleGeneration {
+                actual_generation, ..
+            } => Some(actual_generation),
+            Self::SlotState { generation, .. } => Some(generation),
+            Self::BackendSpecific {
+                actual_generation, ..
+            } => actual_generation,
+            Self::UnknownSlot { .. } | Self::BackendContext { .. } => None,
+        }
+    }
+
+    pub fn state(self) -> Option<slot::SlotState> {
+        match self {
+            Self::StaleGeneration { state, .. } | Self::SlotState { state, .. } => Some(state),
+            Self::UnknownSlot { .. }
+            | Self::BackendContext { .. }
+            | Self::BackendSpecific { .. } => None,
+        }
+    }
+
+    pub fn slot_snapshot(self) -> Option<slot::SlotSnapshot> {
+        match self {
+            Self::SlotState {
+                snapshot: Some(snapshot),
+                ..
+            } => Some(snapshot),
+            _ => None,
+        }
+    }
+
+    pub fn backend(self) -> Option<CompletionBackend> {
+        match self {
+            Self::BackendContext { backend, .. } | Self::BackendSpecific { backend, .. } => {
+                Some(backend)
+            }
+            Self::UnknownSlot { raw: Some(raw), .. }
+            | Self::StaleGeneration { raw: Some(raw), .. }
+            | Self::SlotState { raw: Some(raw), .. } => Some(raw.backend),
+            Self::UnknownSlot { raw: None, .. }
+            | Self::StaleGeneration { raw: None, .. }
+            | Self::SlotState { raw: None, .. } => None,
+        }
+    }
+
+    pub fn backend_context(self) -> Option<u64> {
+        match self {
+            Self::BackendContext {
+                backend_context, ..
+            }
+            | Self::BackendSpecific {
+                backend_context, ..
+            } => Some(backend_context),
+            _ => None,
+        }
+    }
+
+    pub fn raw_result(self) -> Option<i32> {
+        self.raw_attachment().map(|raw| raw.res)
+    }
+
+    pub fn flags(self) -> Option<u32> {
+        self.raw_attachment().map(|raw| raw.flags)
+    }
+
+    fn raw_attachment(self) -> Option<CompletionRaw> {
+        match self {
+            Self::UnknownSlot { raw, .. }
+            | Self::StaleGeneration { raw, .. }
+            | Self::SlotState { raw, .. }
+            | Self::BackendSpecific { raw, .. } => raw,
+            Self::BackendContext { raw, .. } => Some(raw),
+        }
+    }
+
+    fn slot_state(
+        reason: CompletionAnomalyReason,
+        token: CompletionToken,
+        index: usize,
+        generation: u32,
+        state: slot::SlotState,
+    ) -> Self {
+        Self::SlotState {
+            reason,
+            token,
+            index,
+            generation,
+            state,
+            snapshot: None,
+            raw: None,
+        }
+    }
+
+    pub fn unknown_slot(token: CompletionToken, index: usize, generation: u32) -> Self {
+        Self::UnknownSlot {
+            token,
+            index,
+            expected_generation: generation,
+            raw: None,
+        }
+    }
+
+    pub fn stale(
+        token: CompletionToken,
+        index: usize,
+        expected_generation: u32,
+        actual_generation: u32,
+        state: slot::SlotState,
+    ) -> Self {
+        Self::StaleGeneration {
+            token,
+            index,
+            expected_generation,
+            actual_generation,
+            state,
+            raw: None,
+        }
+    }
+
+    pub fn non_active(
+        token: CompletionToken,
+        index: usize,
+        generation: u32,
+        state: slot::SlotState,
+    ) -> Self {
+        Self::slot_state(
+            CompletionAnomalyReason::NonActiveSlot,
+            token,
+            index,
+            generation,
+            state,
+        )
+    }
+
+    pub fn from_backend_context(
+        token: CompletionToken,
+        backend: CompletionBackend,
+        backend_context: u64,
+        raw: CompletionRaw,
+    ) -> Self {
+        Self::BackendContext {
+            token,
+            backend,
+            backend_context,
+            raw,
+        }
+    }
+
+    pub fn backend_specific(
+        code: u16,
+        token: CompletionToken,
+        backend: CompletionBackend,
+        backend_context: u64,
+    ) -> Self {
+        Self::BackendSpecific {
+            code,
+            token,
+            backend,
+            backend_context,
+            index: None,
+            expected_generation: None,
+            actual_generation: None,
+            raw: None,
+        }
+    }
+
+    pub fn backend_specific_missing(
+        code: u16,
+        token: CompletionToken,
+        backend: CompletionBackend,
+        backend_context: u64,
+        index: usize,
+        expected_generation: u32,
+    ) -> Self {
+        Self::BackendSpecific {
+            code,
+            token,
+            backend,
+            backend_context,
+            index: Some(index),
+            expected_generation: Some(expected_generation),
+            actual_generation: None,
+            raw: None,
+        }
+    }
+
+    pub fn backend_specific_stale(
+        code: u16,
+        token: CompletionToken,
+        backend: CompletionBackend,
+        backend_context: u64,
+        index: usize,
+        expected_generation: u32,
+        actual_generation: u32,
+    ) -> Self {
+        Self::BackendSpecific {
+            code,
+            token,
+            backend,
+            backend_context,
+            index: Some(index),
+            expected_generation: Some(expected_generation),
+            actual_generation: Some(actual_generation),
+            raw: None,
+        }
+    }
+
+    pub fn with_raw(mut self, raw: CompletionRaw) -> Self {
+        match &mut self {
+            Self::UnknownSlot { raw: slot, .. }
+            | Self::StaleGeneration { raw: slot, .. }
+            | Self::SlotState { raw: slot, .. }
+            | Self::BackendSpecific { raw: slot, .. } => *slot = Some(raw),
+            Self::BackendContext { raw: slot, .. } => *slot = raw,
+        }
+        self
+    }
+
+    pub fn with_backend(self, backend: CompletionBackend) -> Self {
+        match self {
+            Self::BackendSpecific {
+                code,
+                token,
+                backend: _,
+                backend_context,
+                index,
+                expected_generation,
+                actual_generation,
+                raw,
+            } => Self::BackendSpecific {
+                code,
+                token,
+                backend,
+                backend_context,
+                index,
+                expected_generation,
+                actual_generation,
+                raw,
+            },
+            other => {
+                if let Some(raw) = other.raw_attachment() {
+                    other.with_raw(CompletionRaw {
+                        backend,
+                        res: raw.res,
+                        flags: raw.flags,
+                    })
+                } else {
+                    other.with_raw(CompletionRaw {
+                        backend,
+                        res: 0,
+                        flags: 0,
+                    })
+                }
+            }
+        }
+    }
+
+    pub fn with_backend_context(self, context: u64) -> Self {
+        match self {
+            Self::BackendContext {
+                token,
+                backend,
+                raw,
+                ..
+            } => Self::BackendContext {
+                token,
+                backend,
+                backend_context: context,
+                raw,
+            },
+            Self::BackendSpecific {
+                code,
+                token,
+                backend,
+                index,
+                expected_generation,
+                actual_generation,
+                raw,
+                ..
+            } => Self::BackendSpecific {
+                code,
+                token,
+                backend,
+                backend_context: context,
+                index,
+                expected_generation,
+                actual_generation,
+                raw,
+            },
+            other => other,
+        }
+    }
+
+    pub fn with_event(mut self, event: CompletionEvent) -> Self {
+        let raw = CompletionRaw {
+            backend: self.backend().unwrap_or(CompletionBackend::Core),
+            res: event.res,
+            flags: event.flags,
+        };
+        self = self.with_token(event.token);
+        self.with_raw(raw)
+    }
+
+    pub fn with_token(mut self, token: CompletionToken) -> Self {
+        match &mut self {
+            Self::UnknownSlot { token: slot, .. }
+            | Self::StaleGeneration { token: slot, .. }
+            | Self::SlotState { token: slot, .. }
+            | Self::BackendContext { token: slot, .. }
+            | Self::BackendSpecific { token: slot, .. } => *slot = token,
+        }
+        self
+    }
+
+    pub fn with_raw_result(self, raw_result: i32) -> Self {
+        let backend = self.backend().unwrap_or(CompletionBackend::Core);
+        self.with_raw(CompletionRaw {
+            backend,
+            res: raw_result,
+            flags: self.flags().unwrap_or(0),
+        })
+    }
+
+    pub fn with_flags(self, flags: u32) -> Self {
+        let backend = self.backend().unwrap_or(CompletionBackend::Core);
+        self.with_raw(CompletionRaw {
+            backend,
+            res: self.raw_result().unwrap_or(0),
+            flags,
+        })
+    }
+
+    pub fn with_slot_snapshot(self, snapshot: slot::SlotSnapshot) -> Self {
+        match self {
+            Self::SlotState {
+                reason, token, raw, ..
+            } => Self::SlotState {
+                reason,
+                token,
+                index: snapshot.index,
+                generation: snapshot.generation,
+                state: snapshot.state,
+                snapshot: Some(snapshot),
+                raw,
+            },
+            other => other,
+        }
+    }
+}

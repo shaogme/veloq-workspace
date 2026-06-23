@@ -1,6 +1,6 @@
 services:
-  # Base configuration for the application
-  app-base: &app-base
+  # Develop mode: Mounts local directory for hot-reloading (Default)
+  dev:
     image: ghcr.io/shaogme/nixos-dockers/vscode-rust:latest
     environment:
       - ROOT_PASSWORD=root # Set your secure password here
@@ -10,10 +10,6 @@ services:
       - SYS_PTRACE
       - NET_ADMIN
     tty: true
-
-  # Develop mode: Mounts local directory for hot-reloading (Default)
-  dev:
-    <<: *app-base
     container_name: dev
     volumes:
       - .:/root/workspace
@@ -25,7 +21,20 @@ services:
 
   # Standalone mode: Uses code copied into the image (No host mounting)
   standalone:
-    <<: *app-base
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM ghcr.io/shaogme/nixos-dockers/vscode-rust:latest
+        COPY . /root/workspace
+    image: veloq-workspace-standalone:latest
+    environment:
+      - ROOT_PASSWORD=root # Set your secure password here
+    security_opt:
+      - seccomp:unconfined # Required for some low-level operations
+    cap_add:
+      - SYS_PTRACE
+      - NET_ADMIN
+    tty: true
     container_name: standalone
     volumes:
       - ${USERPROFILE}/.ssh/id_ed25519.pub:/tmp/id_ed25519.pub:ro

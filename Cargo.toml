@@ -1,43 +1,49 @@
 [workspace]
 members = [
-    "veloq",
-    "veloq-runtime",
-    "veloq-sync",
-    "veloq-buf", 
-    "veloq-examples/disk-bench",
-    "driver/core",
-    "driver/backend/uring",
-    "driver/backend/iocp",
-    "driver/native",
-    "utils/veloq-shim",
-    "utils/veloq-atomic-waker", 
-    "utils/veloq-intrusive-linklist", 
-    "utils/veloq-bitset",
-    "utils/veloq-wheel", 
-    "utils/veloq-blocking",
-    "utils/veloq-pod", 
-    "utils/veloq-tls",
-    "utils/veloq-storage",
-    "test-utils/xtest-runner"
+    "crates/veloq",
+    "crates/veloq-runtime",
+    "crates/veloq-sync",
+    "crates/veloq-buf",
+    "crates/veloq-local",
+    "examples/disk-bench",
+    "crates/driver/core",
+    "crates/driver/backend/uring",
+    "crates/driver/backend/iocp",
+    "crates/driver/native",
+    "crates/utils/veloq-shim",
+    "crates/utils/veloq-atomic-waker", 
+    "crates/utils/veloq-intrusive-linklist", 
+    "crates/utils/veloq-bitset",
+    "crates/utils/veloq-wheel", 
+    "crates/utils/veloq-blocking",
+    "crates/utils/veloq-pod", 
+    "crates/utils/veloq-tls",
+    "crates/utils/veloq-storage",
+    "crates/utils/veloq-hash",
+    "crates/utils/veloq-std",
+    "crates/test-utils/xtest-runner"
 ]
 default-members = [
-    "veloq",
-    "veloq-runtime",
-    "veloq-sync",
-    "veloq-buf",
-    "driver/core",
-    "driver/native",
-    "veloq-examples/disk-bench",
-    "utils/veloq-shim",
-    "utils/veloq-atomic-waker",
-    "utils/veloq-intrusive-linklist",
-    "utils/veloq-bitset",
-    "utils/veloq-wheel",
-    "utils/veloq-blocking",
-    "utils/veloq-pod",
-    "utils/veloq-tls",
-    "utils/veloq-storage",
-    "test-utils/xtest-runner"
+    "crates/veloq",
+    "crates/veloq-runtime",
+    "crates/veloq-sync",
+    "crates/veloq-buf",
+    "crates/veloq-local",
+    "crates/driver/core",
+    "crates/driver/native",
+    "examples/disk-bench",
+    "crates/utils/veloq-shim",
+    "crates/utils/veloq-atomic-waker",
+    "crates/utils/veloq-intrusive-linklist",
+    "crates/utils/veloq-bitset",
+    "crates/utils/veloq-wheel",
+    "crates/utils/veloq-blocking",
+    "crates/utils/veloq-pod",
+    "crates/utils/veloq-tls",
+    "crates/utils/veloq-storage",
+    "crates/utils/veloq-hash",
+    "crates/utils/veloq-std",
+    "crates/test-utils/xtest-runner"
 ]
 resolver = "3"
 
@@ -57,25 +63,27 @@ categories = ["asynchronous", "network-programming"]
 [workspace.dependencies]
 
 # Internal Crates
-veloq = { path = "veloq", version = "0.1.0", features = ["test-hooks"] }
-veloq-runtime = { path = "veloq-runtime", version = "0.1.0" }
-veloq-sync = { path = "veloq-sync", version = "0.1.0" }
-veloq-local = { path = "veloq-local", version = "0.1.0" }
-veloq-buf = { path = "veloq-buf", version = "0.1.0" }
-veloq-driver-core = { path = "driver/core", version = "0.1.0" }
-veloq-driver-uring = { path = "driver/backend/uring", version = "0.1.0" }
-veloq-driver-iocp = { path = "driver/backend/iocp", version = "0.1.0" }
-veloq-driver-native = { path = "driver/native", version = "0.1.0" }
+veloq = { path = "crates/veloq", version = "0.1.0", features = ["test-hooks"] }
+veloq-runtime = { path = "crates/veloq-runtime", version = "0.1.0" }
+veloq-sync = { path = "crates/veloq-sync", version = "0.1.0" }
+veloq-local = { path = "crates/veloq-local", version = "0.1.0" }
+veloq-buf = { path = "crates/veloq-buf", version = "0.1.0" }
+veloq-driver-core = { path = "crates/driver/core", version = "0.1.0" }
+veloq-driver-uring = { path = "crates/driver/backend/uring", version = "0.1.0" }
+veloq-driver-iocp = { path = "crates/driver/backend/iocp", version = "0.1.0" }
+veloq-driver-native = { path = "crates/driver/native", version = "0.1.0" }
 
-veloq-shim = { path = "utils/veloq-shim", version = "0.1.0" }
-veloq-atomic-waker = { path = "utils/veloq-atomic-waker", version = "0.1.0" }
-veloq-intrusive-linklist = { path = "utils/veloq-intrusive-linklist", version = "0.1.0" }
-veloq-bitset = { path = "utils/veloq-bitset", version = "0.1.0" }
-veloq-wheel = { path = "utils/veloq-wheel", version = "0.1.0" }
-veloq-blocking = { path = "utils/veloq-blocking", version = "0.1.0" }
-veloq-pod = { path = "utils/veloq-pod", version = "0.1.0" }
-veloq-tls = { path = "utils/veloq-tls", version = "0.1.0" }
-veloq-storage = { path = "utils/veloq-storage", version = "0.1.0" }
+veloq-shim = { path = "crates/utils/veloq-shim", version = "0.1.0" }
+veloq-atomic-waker = { path = "crates/utils/veloq-atomic-waker", version = "0.1.0" }
+veloq-intrusive-linklist = { path = "crates/utils/veloq-intrusive-linklist", version = "0.1.0" }
+veloq-bitset = { path = "crates/utils/veloq-bitset", version = "0.1.0" }
+veloq-wheel = { path = "crates/utils/veloq-wheel", version = "0.1.0" }
+veloq-blocking = { path = "crates/utils/veloq-blocking", version = "0.1.0" }
+veloq-pod = { path = "crates/utils/veloq-pod", version = "0.1.0" }
+veloq-tls = { path = "crates/utils/veloq-tls", version = "0.1.0" }
+veloq-storage = { path = "crates/utils/veloq-storage", version = "0.1.0" }
+veloq-hash = { path = "crates/utils/veloq-hash", version = "0.1.0" }
+veloq-std = { path = "crates/utils/veloq-std", version = "0.1.0" }
 
 # External Crates
 crossbeam-utils = { version = "0.8", default-features = false }
@@ -97,7 +105,7 @@ windows-sys = { version = "0.61", features = [
 tracing = "0.1.44"
 parking_lot = "0.12"
 bilge = "0.3.0"
-diagweave = "0.5.1"
+diagweave = "0.5.2"
 
 clap = { version = "4.6", features = ["derive"] }
 loom = "0.7.2"
@@ -105,6 +113,8 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 
 tokio = { version = "1", features = ["full"] }
 slotmap = "1.1.1"
+
+rustc-hash = "2.1.1"
 
 [workspace.lints.rust]
 warnings = "deny"
