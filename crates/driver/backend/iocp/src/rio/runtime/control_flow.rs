@@ -470,10 +470,14 @@ impl RioState {
             )
             .attach_note("RIOCreateRequestQueue failed")?;
 
+        let is_first = self.actor_by_handle.is_empty();
         let actor = RioSocketActor::new(rq);
         let key = self.actors.insert(actor);
         self.actor_by_handle.insert(socket_key, key);
         self.socket_runtime.entry(socket_key).or_default();
+        if is_first {
+            self.kernel.rearm_notify().trans()?;
+        }
         self.actors
             .get_mut(key)
             .ok_or(RioError::Internal)
@@ -614,7 +618,9 @@ impl RioState {
             }
         }
 
-        self.kernel.rearm_notify().trans()?;
+        if !self.actor_by_handle.is_empty() {
+            self.kernel.rearm_notify().trans()?;
+        }
 
         if *hooks.outstanding_count == 0 {
             hooks.registry.flush_deregs(hooks.env);
