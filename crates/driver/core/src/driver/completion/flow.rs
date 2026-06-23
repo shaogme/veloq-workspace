@@ -429,19 +429,20 @@ where
             cleanup,
             effect,
         } => {
+            hooks.finish_backend_effect(effect)?;
             let record = record_user_completion::<Spec>(
                 table,
                 diagnostics,
                 CompletionPacket::<Spec>::user_with_cleanup(event, payload, detail, cleanup),
             );
             finish_waiting_if_needed(registry, finalize, event)?;
-            hooks.finish_backend_effect(effect)?;
             Ok(completion_progress_from_record(record))
         }
         CompletionHookOutcome::Cleanup {
             mut cleanup,
             effect,
         } => {
+            hooks.finish_backend_effect(effect)?;
             let _ = run_completion_cleanup(diagnostics, &mut cleanup);
             match finalize {
                 Some(FinalizeAction::Waiting(event)) => {
@@ -452,7 +453,6 @@ where
                 }
                 None => {}
             }
-            hooks.finish_backend_effect(effect)?;
             Ok(CompletionFlowOutcome::orphan_cleaned())
         }
         CompletionHookOutcome::Anomaly {

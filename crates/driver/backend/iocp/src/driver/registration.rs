@@ -210,7 +210,7 @@ impl HandleRegistry {
         }
     }
 
-    fn deferred_cleanup_len(&self) -> usize {
+    pub(super) fn deferred_cleanup_len(&self) -> usize {
         self.deferred_socket_cleanup.len()
     }
 

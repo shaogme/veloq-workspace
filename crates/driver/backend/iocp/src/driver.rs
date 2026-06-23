@@ -243,6 +243,8 @@ impl<'a> Driver for IocpDriver<'a> {
     }
 
     fn drive(&mut self, mode: DriveMode) -> IocpResult<DriveOutcome> {
+        self.drain_deferred_socket_cleanup();
+
         match mode {
             DriveMode::Poll => {
                 self.get_completion(0)
@@ -250,8 +252,9 @@ impl<'a> Driver for IocpDriver<'a> {
                     .attach_note("drive(Poll) failed")?;
             }
             DriveMode::Wait => {
-                let pending_progress =
-                    self.has_active_ops_internal() || self.ops.shared.has_ready_completion();
+                let pending_progress = self.has_active_ops_internal()
+                    || self.ops.shared.has_ready_completion()
+                    || self.handles.deferred_cleanup_len() > 0;
                 if !pending_progress {
                     return Ok(DriveOutcome {
                         next_timeout_hint: self.timer.next_timeout(),
@@ -264,8 +267,11 @@ impl<'a> Driver for IocpDriver<'a> {
             }
         }
 
-        let pending_progress =
-            self.has_active_ops_internal() || self.ops.shared.has_ready_completion();
+        self.drain_deferred_socket_cleanup();
+
+        let pending_progress = self.has_active_ops_internal()
+            || self.ops.shared.has_ready_completion()
+            || self.handles.deferred_cleanup_len() > 0;
         Ok(DriveOutcome {
             next_timeout_hint: self.timer.next_timeout(),
             pending_progress,
