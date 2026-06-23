@@ -414,7 +414,7 @@ impl<T> RuntimeShared<T> {
         self.base.enqueue_local(worker_id, task)
     }
 
-    pub(crate) fn has_work(&self, worker_id: usize) -> bool {
+    pub fn has_work(&self, worker_id: usize) -> bool {
         let worker = &self.base.registry.workers[worker_id];
         let local_has_work = worker.local_count.load(Ordering::Acquire) > 0;
         worker.lifo.load(Ordering::Acquire).is_some()

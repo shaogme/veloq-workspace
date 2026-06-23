@@ -423,13 +423,31 @@ pub fn poll_current_driver<'reg>(
         "poll_current_driver",
         "driver drive(Poll) failed",
     )?;
-    Ok(match outcome.next_timeout_hint {
-        Some(duration) => {
-            IdleDecision::wait(WaitBackend::Driver, IdleWaitStrategy::timeout(duration))
-        }
-        None if outcome.pending_progress => IdleDecision::continue_now(),
-        None => IdleDecision::wait(WaitBackend::RuntimePark, IdleWaitStrategy::block()),
-    })
+    Ok(idle_decision_from_drive_outcome(
+        shared.has_work(shared.worker_id()),
+        outcome.next_timeout_hint,
+        outcome.pending_progress,
+    ))
+}
+
+fn idle_decision_from_drive_outcome(
+    has_runtime_work: bool,
+    next_timeout_hint: Option<std::time::Duration>,
+    pending_progress: bool,
+) -> IdleDecision {
+    if has_runtime_work {
+        return IdleDecision::continue_now();
+    }
+
+    if let Some(duration) = next_timeout_hint {
+        return IdleDecision::wait(WaitBackend::Driver, IdleWaitStrategy::timeout(duration));
+    }
+
+    if pending_progress {
+        return IdleDecision::wait(WaitBackend::Driver, IdleWaitStrategy::block());
+    }
+
+    IdleDecision::wait(WaitBackend::RuntimePark, IdleWaitStrategy::block())
 }
 
 pub fn drive_driver_wait<'reg>(
