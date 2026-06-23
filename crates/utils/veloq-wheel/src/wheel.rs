@@ -297,12 +297,18 @@ impl<T> Wheel<T> {
         // 检查 L1
         let l1_tick = self.global_tick / self.l1_tick_ratio;
         let l1_start = (l1_tick as usize) & self.levels[1].mask;
-        for i in 0..self.levels[1].slots.len() {
-            let idx = (l1_start + i) & self.levels[1].mask;
+        let l1_mask = self.levels[1].mask;
+        let l1_len = self.levels[1].slots.len();
+        for i in 0..l1_len {
+            let idx = (l1_start + i) & l1_mask;
             if self.levels[1].slots[idx].is_some() {
-                // Approximate time
-                // 近似时间
-                let slot_start_tick = (l1_tick + i as u64) * self.l1_tick_ratio;
+                // Find the target_l1_tick for this slot idx
+                let diff = (idx.wrapping_sub(l1_tick as usize)) & l1_mask;
+                let mut target_l1_tick = l1_tick + diff as u64;
+                if target_l1_tick * self.l1_tick_ratio <= self.global_tick {
+                    target_l1_tick += l1_len as u64;
+                }
+                let slot_start_tick = target_l1_tick * self.l1_tick_ratio;
                 let delay_ticks = slot_start_tick.saturating_sub(self.global_tick);
                 return Some(Duration::from_millis(delay_ticks * self.tick_duration_ms));
             }
