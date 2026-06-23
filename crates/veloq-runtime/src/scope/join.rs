@@ -280,7 +280,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
                 } else {
                     return Err(RuntimeError::InvariantViolation {
                         site: "JoinHandle::register_waker_on",
-                        detail: "waker node missing after initialization",
+                        detail: "waker node missing after initialization".into(),
                     }
                     .to_report());
                 }
@@ -345,7 +345,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TEx
                             return Poll::Ready(JoinOutcome::RuntimeErr(
                                 RuntimeError::InvariantViolation {
                                     site: "JoinHandle::poll(Routed)",
-                                    detail: "routed task access already taken",
+                                    detail: "routed task access already taken".into(),
                                 }
                                 .to_report(),
                             ));

@@ -417,7 +417,7 @@ pub fn poll_current_driver<'reg>(
             let outcome = driver.drive(DriveMode::Poll).map_err(|err| {
                 RuntimeError::InvariantViolation {
                     site: "poll_current_driver",
-                    detail: "driver drive(Poll) failed",
+                    detail: format!("driver drive(Poll) failed, details: {}", err).into(),
                 }
                 .to_report()
                 .with_diag_src_err(err)

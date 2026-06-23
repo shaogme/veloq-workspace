@@ -66,7 +66,7 @@ impl<F> RoutedJobCell<F> {
         self.job.take().ok_or_else(|| {
             RuntimeError::InvariantViolation {
                 site: "RoutedJobCell::take",
-                detail: "job has already been taken",
+                detail: "job has already been taken".into(),
             }
             .to_report()
         })

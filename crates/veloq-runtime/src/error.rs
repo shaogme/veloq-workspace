@@ -1,5 +1,5 @@
 use diagweave::{Report, set};
-use std::result::Result as StdResult;
+use std::{borrow::Cow, result::Result as StdResult};
 
 set! {
     pub RuntimeError = {
@@ -36,7 +36,7 @@ set! {
         #[display("runtime invariant violation at {site}: {detail}")]
         InvariantViolation {
             site: &'static str,
-            detail: &'static str,
+            detail: Cow<'static, str>,
         },
 
         #[display("mutex poisoned: {component}")]

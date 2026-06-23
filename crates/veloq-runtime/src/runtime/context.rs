@@ -222,7 +222,7 @@ impl<'rt, T> RuntimeCtx<'rt, T> {
                     self.slot.fail(
                         RuntimeError::InvariantViolation {
                             site: "RuntimeCtx::route_to::RouteJobTask::poll_raw",
-                            detail: "job already taken",
+                            detail: "job already taken".into(),
                         }
                         .to_report()
                         .with_category("runtime.route"),
@@ -426,7 +426,7 @@ where
         let Some(inner) = this.inner.as_mut() else {
             let err = RuntimeError::InvariantViolation {
                 site: "RoutedFuture::poll",
-                detail: "route future missing inner op",
+                detail: "route future missing inner op".into(),
             }
             .to_report()
             .with_category("runtime.route");
