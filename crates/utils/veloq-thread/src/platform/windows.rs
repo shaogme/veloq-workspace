@@ -1,10 +1,3 @@
-#[cfg(feature = "std")]
-use alloc::boxed::Box;
-#[cfg(feature = "std")]
-use core::any::Any;
-
-#[cfg(feature = "std")]
-use super::SendSyncPanicPayload;
 use super::{SafeUnsafeCell, Sentinel, ThreadResultReceiver, ThreadSharedState};
 use crate::{
     ThreadErrorKind,
@@ -27,6 +20,15 @@ use windows_sys::Win32::{
         WakeByAddressSingle,
     },
 };
+
+#[cfg(feature = "std")]
+use super::SendSyncPanicPayload;
+#[cfg(feature = "std")]
+use alloc::boxed::Box;
+#[cfg(feature = "std")]
+use core::any::Any;
+#[cfg(feature = "std")]
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 /// Windows 平台下的原始线程加入句柄
 pub struct RawJoinHandle<'a, T> {
@@ -113,7 +115,7 @@ where
     let state = unsafe { Arc::from_raw(param as *const ThreadSharedState<F, T>) };
 
     super::CURRENT_THREAD_STATUS.with_or_default(|cell| {
-        cell.set(Some(&state.status as *const core::sync::atomic::AtomicU8));
+        cell.set(Some(&state.status as *const AtomicU8));
     });
 
     struct ThreadStatusGuard;
@@ -134,7 +136,7 @@ where
     if let Some(f) = unsafe { (*state.closure.get()).take() } {
         #[cfg(feature = "std")]
         {
-            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            let res = catch_unwind(AssertUnwindSafe(f));
             match res {
                 Ok(r) => {
                     unsafe {

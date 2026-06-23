@@ -8,10 +8,19 @@ mod linux;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use linux::{Platform, RawJoinHandle, RawThreadError};
 
+use alloc::sync::Arc;
+use core::{
+    cell::{Cell, UnsafeCell},
+    sync::atomic::{AtomicU8, Ordering},
+};
+
 #[cfg(feature = "std")]
 use alloc::boxed::Box;
 #[cfg(feature = "std")]
-use core::any::Any;
+use core::{
+    any::Any,
+    fmt::{Debug, Formatter, Result as FmtResult},
+};
 
 #[cfg(feature = "std")]
 pub struct SendSyncPanicPayload(pub Box<dyn Any + Send + 'static>);
@@ -22,24 +31,18 @@ unsafe impl Send for SendSyncPanicPayload {}
 unsafe impl Sync for SendSyncPanicPayload {}
 
 #[cfg(feature = "std")]
-impl core::fmt::Debug for SendSyncPanicPayload {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl Debug for SendSyncPanicPayload {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.write_str("SendSyncPanicPayload")
     }
 }
-
-use alloc::sync::Arc;
-use core::{
-    cell::UnsafeCell,
-    sync::atomic::{AtomicU8, Ordering},
-};
 
 pub(crate) const STATE_INCOMPLETE: u8 = 0;
 pub(crate) const STATE_FINISHED: u8 = 1;
 pub(crate) const STATE_PANICKED: u8 = 2;
 pub(crate) const STATE_ABORTED: u8 = 3;
 
-pub(crate) static CURRENT_THREAD_STATUS: veloq_tls::Tls<core::cell::Cell<Option<*const AtomicU8>>> =
+pub(crate) static CURRENT_THREAD_STATUS: veloq_tls::Tls<Cell<Option<*const AtomicU8>>> =
     veloq_tls::Tls::new();
 
 /// 包装以在线程间安全共享的 UnsafeCell

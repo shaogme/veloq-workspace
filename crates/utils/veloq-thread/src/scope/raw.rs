@@ -1,17 +1,15 @@
-#[cfg(feature = "std")]
-use crate::traits::RawThreadErrorTrait;
 use crate::traits::{PlatformImpl, RawJoinHandleTrait, ThreadParkerTrait};
-
-#[cfg(feature = "std")]
-use alloc::boxed::Box;
-
-#[cfg(feature = "std")]
-use core::sync::atomic::AtomicPtr;
 use core::{
     marker::PhantomData,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
+#[cfg(feature = "std")]
+use crate::traits::RawThreadErrorTrait;
+#[cfg(feature = "std")]
+use alloc::boxed::Box;
+#[cfg(feature = "std")]
+use core::{ptr::null_mut, sync::atomic::AtomicPtr};
 #[cfg(feature = "std")]
 use std::{
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
@@ -31,7 +29,7 @@ pub(crate) struct RawScopeData<P: PlatformImpl> {
 impl<P: PlatformImpl> RawScopeData<P> {
     #[cfg(feature = "std")]
     fn pop_panic(&self) -> Option<P::Error> {
-        let ptr = self.panics.swap(core::ptr::null_mut(), Ordering::Acquire);
+        let ptr = self.panics.swap(null_mut(), Ordering::Acquire);
         if ptr.is_null() {
             None
         } else {
@@ -47,7 +45,7 @@ impl<P: PlatformImpl> Drop for RawScopeData<P> {
     fn drop(&mut self) {
         #[cfg(feature = "std")]
         {
-            let ptr = self.panics.swap(core::ptr::null_mut(), Ordering::Relaxed);
+            let ptr = self.panics.swap(null_mut(), Ordering::Relaxed);
             if !ptr.is_null() {
                 unsafe {
                     let _ = Box::from_raw(ptr);
@@ -122,7 +120,7 @@ impl<'scope, 'env, P: PlatformImpl> RawScope<'scope, 'env, P> {
                         if scope_data
                             .panics
                             .compare_exchange(
-                                core::ptr::null_mut(),
+                                null_mut(),
                                 payload,
                                 Ordering::Release,
                                 Ordering::Relaxed,
@@ -248,7 +246,7 @@ where
         parker: P::Parker::new(),
         cancelled: AtomicBool::new(false),
         #[cfg(feature = "std")]
-        panics: AtomicPtr::new(core::ptr::null_mut()),
+        panics: AtomicPtr::new(null_mut()),
         #[cfg(feature = "std")]
         has_panic: AtomicBool::new(false),
     };
