@@ -530,7 +530,7 @@ impl RioState {
         let Some(env) = self.kernel.env(registrar, self.registration_mode) else {
             return Ok(0);
         };
-        self.cq_armed = false;
+        let mut completions_found = false;
         let mut hooks = RioCompletionHooks::new(
             &mut self.outstanding_count,
             &mut self.socket_runtime,
@@ -549,6 +549,7 @@ impl RioState {
             if count == 0 {
                 break;
             }
+            completions_found = true;
 
             for res in results.iter().take(count as usize) {
                 let result = RioResultData::from_result(res);
@@ -620,7 +621,11 @@ impl RioState {
             }
         }
 
-        if !self.actor_by_handle.is_empty() {
+        if completions_found {
+            self.cq_armed = false;
+        }
+
+        if !self.actor_by_handle.is_empty() && !self.cq_armed {
             self.kernel.rearm_notify().trans()?;
             self.cq_armed = true;
         }
