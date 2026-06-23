@@ -1539,6 +1539,7 @@ dependencies = [
  "veloq-atomic-waker",
  "veloq-intrusive-linklist",
  "veloq-storage",
+ "veloq-thread",
  "veloq-tls",
 ]
 
@@ -1578,6 +1579,15 @@ dependencies = [
  "veloq-atomic-waker",
  "veloq-intrusive-linklist",
  "veloq-shim",
+]
+
+[[package]]
+name = "veloq-thread"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "veloq-tls",
+ "windows-sys",
 ]
 
 [[package]]
