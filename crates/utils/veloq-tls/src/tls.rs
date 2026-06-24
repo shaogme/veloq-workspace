@@ -1,13 +1,8 @@
 use crate::{
-    Platform, PlatformImpl, RawKey, ResetGuard, TlsError, TlsErrorKind, is_sentinel, sentinel_ptr,
+    AtomicKey, Key, PlatformKey, ResetGuard, TlsError, TlsErrorKind, is_sentinel, sentinel_ptr,
 };
 use alloc::boxed::Box;
-use core::{
-    hint::spin_loop,
-    marker::PhantomData,
-    ptr::null_mut,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use core::{marker::PhantomData, ptr::null_mut};
 
 /// A high-performance thread-local storage wrapper using platform-native TLS.
 ///
@@ -21,7 +16,7 @@ use core::{
 /// - If a `Tls` instance is dropped prematurely, subsequent accesses from other threads or cleanup upon thread exit may lead to undefined behavior (UB).
 /// - You must guarantee that the lifetime of the `Tls` instance is longer than all threads accessing it.
 pub struct Tls<T> {
-    key: AtomicUsize,
+    key: AtomicKey,
     marker: PhantomData<T>,
 }
 
@@ -37,50 +32,14 @@ impl<T> Tls<T> {
     /// This should typically be stored in a `static` variable.
     pub const fn new() -> Self {
         Self {
-            key: AtomicUsize::new(0),
+            key: AtomicKey::new(),
             marker: PhantomData,
         }
     }
 
     #[inline]
-    fn get_key(&self) -> Result<RawKey, TlsErrorKind> {
-        let mut val = self.key.load(Ordering::Acquire);
-        if val > 1 {
-            return Ok((val - 2) as RawKey);
-        }
-
-        loop {
-            if val == 0 {
-                match self
-                    .key
-                    .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
-                {
-                    Ok(_) => {
-                        let res = PlatformImpl::alloc_key::<T>();
-
-                        match res {
-                            Ok(k) => {
-                                let stored = (k as usize) + 2;
-                                self.key.store(stored, Ordering::Release);
-                                return Ok(k);
-                            }
-                            Err(e) => {
-                                self.key.store(0, Ordering::Release);
-                                return Err(e);
-                            }
-                        }
-                    }
-                    Err(current) => {
-                        val = current;
-                    }
-                }
-            } else if val > 1 {
-                return Ok((val - 2) as RawKey);
-            } else {
-                spin_loop();
-                val = self.key.load(Ordering::Acquire);
-            }
-        }
+    fn get_key(&self) -> Result<Key, TlsErrorKind> {
+        self.key.get::<T>()
     }
 
     /// Helper to retrieve the TLS value pointer, optionally initializing it.
@@ -97,7 +56,7 @@ impl<T> Tls<T> {
     #[inline(always)]
     fn get_initialized_ptr(&self) -> Result<*const T, TlsErrorKind> {
         let key = self.get_key()?;
-        let raw_ptr = unsafe { PlatformImpl::get_value::<T>(key) };
+        let raw_ptr = unsafe { key.get_value::<T>() };
 
         if !raw_ptr.is_null() {
             if is_sentinel(raw_ptr) {
@@ -131,7 +90,7 @@ impl<T> Tls<T> {
                 // Set sentinel to detect recursive initialization
                 let sentinel = sentinel_ptr::<T>();
                 unsafe {
-                    if let Err(res) = PlatformImpl::set_value(key, sentinel) {
+                    if let Err(res) = key.set_value(sentinel) {
                         panic!("Failed to set TLS sentinel: error code {}", res);
                     }
                 }
@@ -144,7 +103,7 @@ impl<T> Tls<T> {
                 let owned_ptr = Box::into_raw(Box::new(val));
 
                 unsafe {
-                    if let Err(res) = PlatformImpl::set_value(key, owned_ptr) {
+                    if let Err(res) = key.set_value(owned_ptr) {
                         let _ = Box::from_raw(owned_ptr);
                         panic!("Failed to set TLS value: error code {}", res);
                     }
@@ -275,7 +234,7 @@ impl<T> Tls<T> {
             }
             Err(_) => unreachable!(),
         };
-        let old_ptr = unsafe { PlatformImpl::get_value::<T>(key) };
+        let old_ptr = unsafe { key.get_value::<T>() };
 
         if !old_ptr.is_null() && is_sentinel(old_ptr) {
             return Err(TlsError::RecursiveAccess { val });
@@ -286,7 +245,7 @@ impl<T> Tls<T> {
         let owned_ptr = Box::into_raw(val);
 
         unsafe {
-            if let Err(code) = PlatformImpl::set_value(key, owned_ptr) {
+            if let Err(code) = key.set_value(owned_ptr) {
                 let val = Box::from_raw(owned_ptr);
                 return Err(TlsError::SetFailed { code, val });
             }
@@ -305,13 +264,13 @@ impl<T> Tls<T> {
     #[inline(always)]
     pub fn take(&self) -> Option<Box<T>> {
         let key = self.get_key().ok()?;
-        let old_ptr = unsafe { PlatformImpl::get_value::<T>(key) };
+        let old_ptr = unsafe { key.get_value::<T>() };
 
         if old_ptr.is_null() || is_sentinel(old_ptr) {
             None
         } else {
             unsafe {
-                let _ = PlatformImpl::set_value::<T>(key, null_mut());
+                let _ = key.set_value::<T>(null_mut());
             }
 
             Some(unsafe { Box::from_raw(old_ptr) })
@@ -324,11 +283,9 @@ unsafe impl<T> Sync for Tls<T> {}
 
 impl<T> Drop for Tls<T> {
     fn drop(&mut self) {
-        let val = self.key.load(Ordering::Acquire);
-        if val > 1 {
-            let key = (val - 2) as RawKey;
+        if let Some(key) = self.key.take() {
             unsafe {
-                PlatformImpl::free_key(key);
+                key.free();
             }
         }
     }
