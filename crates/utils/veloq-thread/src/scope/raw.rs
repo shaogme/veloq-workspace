@@ -1,7 +1,7 @@
-use crate::traits::{PlatformImpl, RawJoinHandleTrait, ThreadParkerTrait};
+use crate::traits::{PlatformImpl, RawJoinHandleTrait};
 use core::{
     marker::PhantomData,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
 #[cfg(feature = "std")]
@@ -17,8 +17,7 @@ use std::{
 };
 
 pub(crate) struct RawScopeData<P: PlatformImpl> {
-    pub(crate) num_running_threads: AtomicUsize,
-    pub(crate) parker: P::Parker,
+    pub(crate) num_running_threads: AtomicU32,
     pub(crate) cancelled: AtomicBool,
     #[cfg(feature = "std")]
     pub(crate) panics: AtomicPtr<P::Error>,
@@ -96,13 +95,12 @@ impl<'scope, 'env, P: PlatformImpl> RawScope<'scope, 'env, P> {
             }
             impl<P: PlatformImpl> Drop for ThreadFinishedGuard<'_, P> {
                 fn drop(&mut self) {
-                    if self
+                    let old = self
                         .data
                         .num_running_threads
-                        .fetch_sub(1, Ordering::Release)
-                        == 1
-                    {
-                        self.data.parker.unpark();
+                        .fetch_sub(1, Ordering::Release);
+                    if old == 1 {
+                        P::wake_by_address(&self.data.num_running_threads);
                     }
                 }
             }
@@ -146,7 +144,7 @@ impl<'scope, 'env, P: PlatformImpl> RawScope<'scope, 'env, P> {
             .fetch_add(1, Ordering::Relaxed);
 
         struct SpawnRollback<'a> {
-            count: &'a AtomicUsize,
+            count: &'a AtomicU32,
             active: bool,
         }
         impl Drop for SpawnRollback<'_> {
@@ -216,8 +214,12 @@ impl<P: PlatformImpl> Drop for RawScopeGuard<'_, P> {
             self.data.cancelled.store(true, Ordering::Release);
         }
 
-        while self.data.num_running_threads.load(Ordering::Acquire) != 0 {
-            self.data.parker.park();
+        let mut val;
+        while {
+            val = self.data.num_running_threads.load(Ordering::Acquire);
+            val != 0
+        } {
+            P::wait_on_address(&self.data.num_running_threads, val);
         }
 
         #[cfg(feature = "std")]
@@ -242,8 +244,7 @@ where
     F: for<'scope> FnOnce(&'scope RawScope<'scope, 'env, P>) -> R,
 {
     let scope_data = RawScopeData {
-        num_running_threads: AtomicUsize::new(0),
-        parker: P::Parker::new(),
+        num_running_threads: AtomicU32::new(0),
         cancelled: AtomicBool::new(false),
         #[cfg(feature = "std")]
         panics: AtomicPtr::new(null_mut()),

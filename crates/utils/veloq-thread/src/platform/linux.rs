@@ -1,7 +1,7 @@
 use super::{SafeUnsafeCell, Sentinel, ThreadResultReceiver, ThreadSharedState};
 use crate::{
     ThreadErrorKind,
-    traits::{PlatformImpl, RawJoinHandleTrait, RawThreadErrorTrait, ThreadParkerTrait},
+    traits::{PlatformImpl, RawJoinHandleTrait, RawThreadErrorTrait},
 };
 use alloc::sync::Arc;
 use core::{
@@ -12,7 +12,7 @@ use core::{
     marker::PhantomData,
     mem::zeroed,
     ptr::{null, null_mut},
-    sync::atomic::{AtomicI32, AtomicU8, Ordering},
+    sync::atomic::{AtomicU8, AtomicU32, Ordering},
 };
 use libc::{
     FUTEX_PRIVATE_FLAG, FUTEX_WAIT, FUTEX_WAKE, SYS_futex, pthread_create, pthread_detach,
@@ -280,7 +280,6 @@ pub struct Platform;
 
 impl PlatformImpl for Platform {
     type Error = RawThreadError;
-    type Parker = ThreadParker;
     type RawJoinHandle<'a, T: Send>
         = RawJoinHandle<'a, T>
     where
@@ -297,6 +296,31 @@ impl PlatformImpl for Platform {
     fn yield_now() -> Result<bool, crate::AbortedError> {
         RawJoinHandle::<()>::yield_now()
     }
+
+    fn wait_on_address(address: &AtomicU32, expected: u32) {
+        unsafe {
+            let _ = syscall(
+                SYS_futex,
+                address as *const AtomicU32 as *const c_void as *mut c_void,
+                FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
+                expected as i32,
+                null::<timespec>(),
+                null_mut::<c_void>(),
+                0,
+            );
+        }
+    }
+
+    fn wake_by_address(address: &AtomicU32) {
+        unsafe {
+            let _ = syscall(
+                SYS_futex,
+                address as *const AtomicU32 as *const c_void as *mut c_void,
+                FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
+                1,
+            );
+        }
+    }
 }
 
 impl<'a, T> Drop for RawJoinHandle<'a, T> {
@@ -304,81 +328,6 @@ impl<'a, T> Drop for RawJoinHandle<'a, T> {
         if let Some(thread_id) = self.thread_id.take() {
             unsafe {
                 let _ = pthread_detach(thread_id);
-            }
-        }
-    }
-}
-
-pub struct ThreadParker {
-    state: AtomicI32,
-}
-
-impl ThreadParkerTrait for ThreadParker {
-    fn new() -> Self {
-        Self::new()
-    }
-
-    fn park(&self) {
-        self.park();
-    }
-
-    fn unpark(&self) {
-        self.unpark();
-    }
-}
-
-impl ThreadParker {
-    pub const fn new() -> Self {
-        Self {
-            state: AtomicI32::new(0),
-        }
-    }
-
-    pub fn park(&self) {
-        if self
-            .state
-            .compare_exchange(1, 0, Ordering::Acquire, Ordering::Acquire)
-            .is_ok()
-        {
-            return;
-        }
-
-        if self
-            .state
-            .compare_exchange(0, 2, Ordering::Release, Ordering::Acquire)
-            .is_err()
-        {
-            self.state.store(0, Ordering::Release);
-            return;
-        }
-
-        while self.state.load(Ordering::Acquire) == 2 {
-            unsafe {
-                let _ = syscall(
-                    SYS_futex,
-                    self.state.as_ptr() as *mut c_void,
-                    FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
-                    2,
-                    null::<timespec>(),
-                    null_mut::<c_void>(),
-                    0,
-                );
-            }
-        }
-
-        self.state.swap(0, Ordering::Acquire);
-    }
-
-    pub fn unpark(&self) {
-        let old = self.state.swap(1, Ordering::AcqRel);
-        if old == 2 {
-            unsafe {
-                let _ = syscall(
-                    SYS_futex,
-                    self.state.as_ptr() as *mut c_void,
-                    FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
-                    1,
-                );
             }
         }
     }

@@ -3,6 +3,8 @@ use alloc::boxed::Box;
 #[cfg(feature = "std")]
 use core::any::Any;
 
+use core::sync::atomic::AtomicU32;
+
 use crate::{
     ThreadErrorKind,
     scope::raw::{RawScope, scope},
@@ -24,18 +26,6 @@ pub trait RawThreadErrorTrait: core::error::Error + Send + Sync + 'static {
     }
 }
 
-/// 线程 Parker 的抽象接口
-pub trait ThreadParkerTrait: Send + Sync {
-    /// 创建一个新的 Parker
-    fn new() -> Self;
-
-    /// 阻塞当前线程
-    fn park(&self);
-
-    /// 唤醒被阻塞 of 线程
-    fn unpark(&self);
-}
-
 /// 原始线程加入句柄的抽象接口
 pub trait RawJoinHandleTrait<T: Send>: Send + Sync {
     /// 错误类型
@@ -52,9 +42,6 @@ pub trait RawJoinHandleTrait<T: Send>: Send + Sync {
 pub trait PlatformImpl: Sized {
     /// 错误类型
     type Error: RawThreadErrorTrait;
-
-    /// Parker 类型
-    type Parker: ThreadParkerTrait;
 
     /// 原始加入句柄类型，带有生命周期约束
     type RawJoinHandle<'a, T: Send>: RawJoinHandleTrait<T, Error = Self::Error>
@@ -80,4 +67,10 @@ pub trait PlatformImpl: Sized {
     {
         scope::<'env, Self, F, R>(f)
     }
+
+    /// 在指定的 `AtomicU32` 地址上等待，直到其值不再等于 `expected`
+    fn wait_on_address(address: &AtomicU32, expected: u32);
+
+    /// 唤醒在指定的 `AtomicU32` 地址上等待的线程
+    fn wake_by_address(address: &AtomicU32);
 }
