@@ -1,14 +1,7 @@
-#[cfg(feature = "std")]
-use alloc::boxed::Box;
-#[cfg(feature = "std")]
-use core::any::Any;
-
-#[cfg(feature = "std")]
-use super::SendSyncPanicPayload;
 use super::{SafeUnsafeCell, Sentinel, ThreadResultReceiver, ThreadSharedState};
 use crate::{
     ThreadErrorKind,
-    traits::{PlatformImpl, RawJoinHandleTrait, RawThreadErrorTrait, ThreadParkerTrait},
+    traits::{PlatformImpl, RawJoinHandleTrait, RawThreadErrorTrait},
 };
 use alloc::sync::Arc;
 use core::{
@@ -18,7 +11,7 @@ use core::{
     fmt::{Display, Formatter, Result as FmtResult},
     marker::PhantomData,
     ptr::{null, null_mut},
-    sync::atomic::{AtomicU8, Ordering},
+    sync::atomic::{AtomicU8, AtomicU32, Ordering},
 };
 use windows_sys::Win32::{
     Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_OBJECT_0},
@@ -27,6 +20,15 @@ use windows_sys::Win32::{
         WakeByAddressSingle,
     },
 };
+
+#[cfg(feature = "std")]
+use super::SendSyncPanicPayload;
+#[cfg(feature = "std")]
+use alloc::boxed::Box;
+#[cfg(feature = "std")]
+use core::any::Any;
+#[cfg(feature = "std")]
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 /// Windows 平台下的原始线程加入句柄
 pub struct RawJoinHandle<'a, T> {
@@ -113,7 +115,7 @@ where
     let state = unsafe { Arc::from_raw(param as *const ThreadSharedState<F, T>) };
 
     super::CURRENT_THREAD_STATUS.with_or_default(|cell| {
-        cell.set(Some(&state.status as *const core::sync::atomic::AtomicU8));
+        cell.set(Some(&state.status as *const AtomicU8));
     });
 
     struct ThreadStatusGuard;
@@ -134,7 +136,7 @@ where
     if let Some(f) = unsafe { (*state.closure.get()).take() } {
         #[cfg(feature = "std")]
         {
-            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+            let res = catch_unwind(AssertUnwindSafe(f));
             match res {
                 Ok(r) => {
                     unsafe {
@@ -288,7 +290,6 @@ pub struct Platform;
 
 impl PlatformImpl for Platform {
     type Error = RawThreadError;
-    type Parker = ThreadParker;
     type RawJoinHandle<'a, T: Send>
         = RawJoinHandle<'a, T>
     where
@@ -305,6 +306,23 @@ impl PlatformImpl for Platform {
     fn yield_now() -> Result<bool, crate::AbortedError> {
         RawJoinHandle::<()>::yield_now()
     }
+
+    fn wait_on_address(address: &AtomicU32, expected: u32) {
+        unsafe {
+            let _ = WaitOnAddress(
+                address as *const AtomicU32 as *const c_void as *mut c_void,
+                &expected as *const u32 as *const c_void,
+                4,
+                INFINITE,
+            );
+        }
+    }
+
+    fn wake_by_address(address: &AtomicU32) {
+        unsafe {
+            WakeByAddressSingle(address as *const AtomicU32 as *const c_void);
+        }
+    }
 }
 
 impl<'a, T> Drop for RawJoinHandle<'a, T> {
@@ -312,74 +330,6 @@ impl<'a, T> Drop for RawJoinHandle<'a, T> {
         if let Some(handle) = self.handle.take() {
             unsafe {
                 let _ = CloseHandle(handle);
-            }
-        }
-    }
-}
-
-pub struct ThreadParker {
-    state: AtomicU8,
-}
-
-impl ThreadParkerTrait for ThreadParker {
-    fn new() -> Self {
-        Self::new()
-    }
-
-    fn park(&self) {
-        self.park();
-    }
-
-    fn unpark(&self) {
-        self.unpark();
-    }
-}
-
-impl ThreadParker {
-    pub const fn new() -> Self {
-        Self {
-            state: AtomicU8::new(0),
-        }
-    }
-
-    pub fn park(&self) {
-        if self
-            .state
-            .compare_exchange(1, 0, Ordering::Acquire, Ordering::Acquire)
-            .is_ok()
-        {
-            return;
-        }
-
-        if self
-            .state
-            .compare_exchange(0, 2, Ordering::Release, Ordering::Acquire)
-            .is_err()
-        {
-            self.state.store(0, Ordering::Release);
-            return;
-        }
-
-        while self.state.load(Ordering::Acquire) == 2 {
-            unsafe {
-                let expected = 2u8;
-                let _ = WaitOnAddress(
-                    self.state.as_ptr() as *mut c_void,
-                    &expected as *const u8 as *const c_void,
-                    1,
-                    INFINITE,
-                );
-            }
-        }
-
-        self.state.swap(0, Ordering::Acquire);
-    }
-
-    pub fn unpark(&self) {
-        let old = self.state.swap(1, Ordering::AcqRel);
-        if old == 2 {
-            unsafe {
-                WakeByAddressSingle(self.state.as_ptr() as *const c_void);
             }
         }
     }

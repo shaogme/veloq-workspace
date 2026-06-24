@@ -115,6 +115,8 @@ CROSS_SKIP_AUTO_UPDATE=1 cross test --target x86_64-pc-windows-gnu
         refpath,
     };
     ```
+    - **cfg属性分组与换行隔离**: 所有 `#[cfg(...)]` 内的条件相同的use语句必须放在一起，并且与其他不同条件或不带 `cfg` 的use语句显式使用空行分隔。
+    - **禁止在use嵌套导入内使用cfg**: 禁止在 `use {...}` 的 `{...}` 内部使用 `#[cfg(...)]`。
 
 ## CI 命令风格 (CI Command Style)
 

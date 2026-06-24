@@ -1,22 +1,12 @@
-use crate::{RawKey, ResetGuard, TlsError, TlsErrorKind, is_sentinel, sentinel_ptr};
+use crate::{
+    Platform, PlatformImpl, RawKey, ResetGuard, TlsError, TlsErrorKind, is_sentinel, sentinel_ptr,
+};
 use alloc::boxed::Box;
 use core::{
     hint::spin_loop,
     marker::PhantomData,
     ptr::null_mut,
     sync::atomic::{AtomicUsize, Ordering},
-};
-
-#[cfg(windows)]
-use core::ffi::c_void;
-#[cfg(unix)]
-use libc::{
-    c_void, pthread_getspecific, pthread_key_create, pthread_key_delete, pthread_setspecific,
-};
-#[cfg(windows)]
-use windows_sys::Win32::{
-    Foundation::GetLastError,
-    System::Threading::{FLS_OUT_OF_INDEXES, FlsAlloc, FlsFree, FlsGetValue, FlsSetValue},
 };
 
 /// A high-performance thread-local storage wrapper using platform-native TLS.
@@ -66,27 +56,7 @@ impl<T> Tls<T> {
                     .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
                 {
                     Ok(_) => {
-                        let res = unsafe {
-                            #[cfg(windows)]
-                            {
-                                let key = FlsAlloc(Some(tls_destructor::<T>));
-                                if key == FLS_OUT_OF_INDEXES {
-                                    Err(TlsErrorKind::AllocationFailed)
-                                } else {
-                                    Ok(key)
-                                }
-                            }
-                            #[cfg(unix)]
-                            {
-                                let mut key = 0;
-                                let res = pthread_key_create(&mut key, Some(tls_destructor::<T>));
-                                if res != 0 {
-                                    Err(TlsErrorKind::AllocationFailed)
-                                } else {
-                                    Ok(key)
-                                }
-                            }
-                        };
+                        let res = PlatformImpl::alloc_key::<T>();
 
                         match res {
                             Ok(k) => {
@@ -127,16 +97,7 @@ impl<T> Tls<T> {
     #[inline(always)]
     fn get_initialized_ptr(&self) -> Result<*const T, TlsErrorKind> {
         let key = self.get_key()?;
-        let raw_ptr = {
-            #[cfg(windows)]
-            unsafe {
-                FlsGetValue(key) as *const T
-            }
-            #[cfg(unix)]
-            unsafe {
-                pthread_getspecific(key) as *const T
-            }
-        };
+        let raw_ptr = unsafe { PlatformImpl::get_value::<T>(key) };
 
         if !raw_ptr.is_null() {
             if is_sentinel(raw_ptr) {
@@ -169,17 +130,8 @@ impl<T> Tls<T> {
                 let key = self.get_key()?;
                 // Set sentinel to detect recursive initialization
                 let sentinel = sentinel_ptr::<T>();
-                #[cfg(windows)]
                 unsafe {
-                    let res = FlsSetValue(key, sentinel as _);
-                    if res == 0 {
-                        panic!("Failed to set TLS sentinel: error code {}", GetLastError());
-                    }
-                }
-                #[cfg(unix)]
-                unsafe {
-                    let res = pthread_setspecific(key, sentinel as _);
-                    if res != 0 {
+                    if let Err(res) = PlatformImpl::set_value(key, sentinel) {
                         panic!("Failed to set TLS sentinel: error code {}", res);
                     }
                 }
@@ -191,18 +143,8 @@ impl<T> Tls<T> {
                 let val = init();
                 let owned_ptr = Box::into_raw(Box::new(val));
 
-                #[cfg(windows)]
                 unsafe {
-                    let res = FlsSetValue(key, owned_ptr as _);
-                    if res == 0 {
-                        let _ = Box::from_raw(owned_ptr);
-                        panic!("Failed to set TLS value: error code {}", GetLastError());
-                    }
-                }
-                #[cfg(unix)]
-                unsafe {
-                    let res = pthread_setspecific(key, owned_ptr as _);
-                    if res != 0 {
+                    if let Err(res) = PlatformImpl::set_value(key, owned_ptr) {
                         let _ = Box::from_raw(owned_ptr);
                         panic!("Failed to set TLS value: error code {}", res);
                     }
@@ -333,16 +275,7 @@ impl<T> Tls<T> {
             }
             Err(_) => unreachable!(),
         };
-        let old_ptr = {
-            #[cfg(windows)]
-            unsafe {
-                FlsGetValue(key) as *mut T
-            }
-            #[cfg(unix)]
-            unsafe {
-                pthread_getspecific(key) as *mut T
-            }
-        };
+        let old_ptr = unsafe { PlatformImpl::get_value::<T>(key) };
 
         if !old_ptr.is_null() && is_sentinel(old_ptr) {
             return Err(TlsError::RecursiveAccess { val });
@@ -352,26 +285,10 @@ impl<T> Tls<T> {
         let guard = ResetGuard::new(key);
         let owned_ptr = Box::into_raw(val);
 
-        #[cfg(windows)]
-        {
-            let res = unsafe { FlsSetValue(key, owned_ptr as _) };
-            if res == 0 {
-                let val = unsafe { Box::from_raw(owned_ptr) };
-                return Err(TlsError::SetFailed {
-                    code: unsafe { GetLastError() } as i32,
-                    val,
-                });
-            }
-        }
-        #[cfg(unix)]
-        {
-            let res = unsafe { pthread_setspecific(key, owned_ptr as _) };
-            if res != 0 {
-                let val = unsafe { Box::from_raw(owned_ptr) };
-                return Err(TlsError::SetFailed {
-                    code: res as i32,
-                    val,
-                });
+        unsafe {
+            if let Err(code) = PlatformImpl::set_value(key, owned_ptr) {
+                let val = Box::from_raw(owned_ptr);
+                return Err(TlsError::SetFailed { code, val });
             }
         }
 
@@ -388,27 +305,13 @@ impl<T> Tls<T> {
     #[inline(always)]
     pub fn take(&self) -> Option<Box<T>> {
         let key = self.get_key().ok()?;
-        let old_ptr = {
-            #[cfg(windows)]
-            unsafe {
-                FlsGetValue(key) as *mut T
-            }
-            #[cfg(unix)]
-            unsafe {
-                pthread_getspecific(key) as *mut T
-            }
-        };
+        let old_ptr = unsafe { PlatformImpl::get_value::<T>(key) };
 
         if old_ptr.is_null() || is_sentinel(old_ptr) {
             None
         } else {
-            #[cfg(windows)]
             unsafe {
-                FlsSetValue(key, null_mut());
-            }
-            #[cfg(unix)]
-            unsafe {
-                pthread_setspecific(key, null_mut());
+                let _ = PlatformImpl::set_value::<T>(key, null_mut());
             }
 
             Some(unsafe { Box::from_raw(old_ptr) })
@@ -424,32 +327,9 @@ impl<T> Drop for Tls<T> {
         let val = self.key.load(Ordering::Acquire);
         if val > 1 {
             let key = (val - 2) as RawKey;
-            #[cfg(windows)]
             unsafe {
-                FlsFree(key);
+                PlatformImpl::free_key(key);
             }
-            #[cfg(unix)]
-            unsafe {
-                pthread_key_delete(key);
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-unsafe extern "C" fn tls_destructor<T>(ptr: *mut c_void) {
-    if !ptr.is_null() && !is_sentinel(ptr) {
-        unsafe {
-            let _ = Box::from_raw(ptr as *mut T);
-        }
-    }
-}
-
-#[cfg(windows)]
-unsafe extern "system" fn tls_destructor<T>(ptr: *const c_void) {
-    if !ptr.is_null() && !is_sentinel(ptr) {
-        unsafe {
-            let _ = Box::from_raw(ptr as *mut T);
         }
     }
 }

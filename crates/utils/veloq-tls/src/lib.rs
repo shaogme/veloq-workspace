@@ -3,10 +3,12 @@
 extern crate alloc;
 
 mod error;
+mod platform;
 mod shared;
 mod tls;
 
 // Re-export internal items for submodules
+pub(crate) use platform::{Platform, PlatformImpl};
 pub(crate) use shared::{RawKey, ResetGuard, is_sentinel, sentinel_ptr};
 
 // Public exports

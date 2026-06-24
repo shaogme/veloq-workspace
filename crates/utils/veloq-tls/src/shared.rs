@@ -1,12 +1,6 @@
-#[cfg(unix)]
-use libc::pthread_setspecific;
-#[cfg(windows)]
-use windows_sys::Win32::System::Threading::FlsSetValue;
+use crate::{Platform, PlatformImpl};
 
-#[cfg(windows)]
-pub(crate) type RawKey = u32;
-#[cfg(unix)]
-pub(crate) type RawKey = libc::pthread_key_t;
+pub(crate) type RawKey = <PlatformImpl as Platform>::Key;
 
 /// Helper to check if a pointer is the reentrancy sentinel.
 ///
@@ -47,13 +41,8 @@ impl Drop for ResetGuard {
     #[inline(always)]
     fn drop(&mut self) {
         if self.active {
-            #[cfg(windows)]
             unsafe {
-                FlsSetValue(self.key, core::ptr::null_mut());
-            }
-            #[cfg(unix)]
-            unsafe {
-                pthread_setspecific(self.key, core::ptr::null_mut());
+                let _ = PlatformImpl::set_value::<()>(self.key, core::ptr::null_mut());
             }
         }
     }
