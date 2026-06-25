@@ -1,39 +1,39 @@
 use super::{SafeUnsafeCell, Sentinel, ThreadResultReceiver, ThreadSharedState};
 use crate::{
-    AbortedError, ThreadErrorKind,
-    traits::{PlatformImpl, RawJoinHandleTrait, RawThreadErrorTrait},
-};
-use alloc::sync::Arc;
-use core::{
     cell::UnsafeCell,
     error::Error,
-    ffi::c_void,
+    ffi::{c_int, c_void},
     fmt::{Display, Formatter, Result as FmtResult},
     marker::PhantomData,
+    mem::zeroed,
     ptr::{null, null_mut},
-    sync::atomic::{AtomicU8, AtomicU32, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU8, AtomicU32, Ordering},
+    },
+    thread::{
+        AbortedError, ThreadErrorKind,
+        traits::{PlatformImpl, RawJoinHandleTrait, RawThreadErrorTrait},
+    },
     time::Duration,
 };
-use windows_sys::Win32::{
-    Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_OBJECT_0},
-    System::Threading::{
-        CreateThread, INFINITE, Sleep, SwitchToThread, WaitForSingleObject, WaitOnAddress,
-        WakeByAddressAll, WakeByAddressSingle,
-    },
+use libc::{
+    FUTEX_PRIVATE_FLAG, FUTEX_WAIT, FUTEX_WAKE, SYS_futex, nanosleep, pthread_create,
+    pthread_detach, pthread_join, pthread_t, sched_yield, syscall, timespec,
 };
 
 #[cfg(feature = "std")]
 use super::SendSyncPanicPayload;
+
 #[cfg(feature = "std")]
-use alloc::boxed::Box;
-#[cfg(feature = "std")]
-use core::any::Any;
+use crate::{any::Any, boxed::Box};
+
 #[cfg(feature = "std")]
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-/// Windows 平台下的原始线程加入句柄
+/// Linux 平台下的原始线程加入句柄
 pub struct RawJoinHandle<'a, T> {
-    handle: Option<HANDLE>,
+    thread_id: Option<pthread_t>,
     result: Option<ThreadResultReceiver<'a, T>>,
     _marker: PhantomData<&'a ()>,
 }
@@ -43,9 +43,9 @@ unsafe impl<T: Send> Sync for RawJoinHandle<'_, T> {}
 
 #[derive(Debug)]
 pub enum RawThreadError {
-    CreationFailed(u32),
-    JoinFailed(u32),
-    AbortFailed(u32),
+    CreationFailed(c_int),
+    JoinFailed(c_int),
+    AbortFailed(c_int),
     AlreadyJoined,
     ResultAlreadyTaken,
     ResultMissing,
@@ -108,7 +108,7 @@ impl RawThreadErrorTrait for RawThreadError {
     }
 }
 
-unsafe extern "system" fn thread_entry_win<F, T>(param: *mut c_void) -> u32
+extern "C" fn thread_entry_posix<F, T>(param: *mut c_void) -> *mut c_void
 where
     F: FnOnce() -> T + Send,
     T: Send,
@@ -134,14 +134,14 @@ where
         panicked: true,
     };
 
-    if let Some(f) = unsafe { (*state.closure.get()).take() } {
+    if let Some(f) = unsafe { state.closure.with_mut(|x| x.take()) } {
         #[cfg(feature = "std")]
         {
             let res = catch_unwind(AssertUnwindSafe(f));
             match res {
                 Ok(r) => {
                     unsafe {
-                        *state.result.get() = Some(r);
+                        state.result.with_mut(|opt| *opt = Some(r));
                     }
                     sentinel.panicked = false;
                     let _ = state.status.compare_exchange(
@@ -152,7 +152,7 @@ where
                     );
                 }
                 Err(err) => unsafe {
-                    *state.panic_payload.get() = Some(err);
+                    state.panic_payload.with_mut(|opt| *opt = Some(err));
                 },
             }
         }
@@ -160,7 +160,7 @@ where
         {
             let r = f();
             unsafe {
-                *state.result.get() = Some(r);
+                state.result.with_mut(|opt| *opt = Some(r));
             }
             sentinel.panicked = false;
             let _ = state.status.compare_exchange(
@@ -172,7 +172,7 @@ where
         }
     }
 
-    0
+    null_mut()
 }
 
 fn spawn<'a, F, T>(f: F) -> Result<RawJoinHandle<'a, T>, RawThreadError>
@@ -193,25 +193,18 @@ where
     };
 
     let param = Arc::into_raw(state) as *mut c_void;
+    let mut thread_id: pthread_t = unsafe { zeroed() };
 
     unsafe {
-        let handle = CreateThread(
-            null(),
-            0,
-            Some(thread_entry_win::<F, T>),
-            param,
-            0,
-            null_mut(),
-        );
+        let res = pthread_create(&mut thread_id, null(), thread_entry_posix::<F, T>, param);
 
-        if handle.is_null() {
-            let err = GetLastError();
+        if res != 0 {
             let _ = Arc::from_raw(param as *const ThreadSharedState<F, T>);
-            return Err(RawThreadError::CreationFailed(err));
+            return Err(RawThreadError::CreationFailed(res));
         }
 
         Ok(RawJoinHandle {
-            handle: Some(handle),
+            thread_id: Some(thread_id),
             result: Some(receiver),
             _marker: PhantomData,
         })
@@ -220,11 +213,10 @@ where
 
 impl<'a, T> RawJoinHandle<'a, T> {
     pub fn join(mut self) -> Result<T, RawThreadError> {
-        let handle = self.handle.take().ok_or(RawThreadError::AlreadyJoined)?;
+        let thread_id = self.thread_id.take().ok_or(RawThreadError::AlreadyJoined)?;
         unsafe {
-            let res = WaitForSingleObject(handle, INFINITE);
-            let _ = CloseHandle(handle);
-            if res != WAIT_OBJECT_0 {
+            let res = pthread_join(thread_id, null_mut());
+            if res != 0 {
                 return Err(RawThreadError::JoinFailed(res));
             }
             let receiver = self
@@ -270,7 +262,7 @@ impl<'a, T> RawJoinHandle<'a, T> {
         if aborted {
             return Err(AbortedError);
         }
-        unsafe { Ok(SwitchToThread() != 0) }
+        unsafe { Ok(sched_yield() == 0) }
     }
 }
 
@@ -286,7 +278,7 @@ impl<'a, T: Send> RawJoinHandleTrait<T> for RawJoinHandle<'a, T> {
     }
 }
 
-/// Windows 平台下的平台实现结构体
+/// Linux 平台下的平台实现结构体
 pub struct Platform;
 
 impl PlatformImpl for Platform {
@@ -304,7 +296,7 @@ impl PlatformImpl for Platform {
         spawn(f)
     }
 
-    fn yield_now() -> Result<bool, crate::AbortedError> {
+    fn yield_now() -> Result<bool, AbortedError> {
         RawJoinHandle::<()>::yield_now()
     }
 
@@ -317,26 +309,27 @@ impl PlatformImpl for Platform {
         expected: u32,
         timeout: Option<Duration>,
     ) -> bool {
-        let ms = match timeout {
-            Some(dur) => {
-                if dur.as_millis() > INFINITE as u128 {
-                    INFINITE
-                } else {
-                    dur.as_millis() as u32
-                }
-            }
-            None => INFINITE,
+        let timespec_timeout = timeout.map(|dur| timespec {
+            tv_sec: dur.as_secs() as _,
+            tv_nsec: dur.subsec_nanos() as _,
+        });
+        let timeout_ptr = match timespec_timeout {
+            Some(ref ts) => ts as *const timespec,
+            None => null(),
         };
         unsafe {
-            let res = WaitOnAddress(
+            let res = syscall(
+                SYS_futex,
                 address as *const AtomicU32 as *const c_void as *mut c_void,
-                &expected as *const u32 as *const c_void,
-                4,
-                ms,
+                FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
+                expected as i32,
+                timeout_ptr,
+                null_mut::<c_void>(),
+                0,
             );
-            if res == 0 {
-                let err = GetLastError();
-                err == 1460 // ERROR_TIMEOUT
+            if res < 0 {
+                let err = *libc::__errno_location();
+                err == libc::ETIMEDOUT
             } else {
                 false
             }
@@ -345,13 +338,23 @@ impl PlatformImpl for Platform {
 
     fn wake_by_address(address: &AtomicU32) {
         unsafe {
-            WakeByAddressSingle(address as *const AtomicU32 as *const c_void);
+            let _ = syscall(
+                SYS_futex,
+                address as *const AtomicU32 as *const c_void as *mut c_void,
+                FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
+                1,
+            );
         }
     }
 
     fn wake_all_by_address(address: &AtomicU32) {
         unsafe {
-            WakeByAddressAll(address as *const AtomicU32 as *const c_void);
+            let _ = syscall(
+                SYS_futex,
+                address as *const AtomicU32 as *const c_void as *mut c_void,
+                FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
+                libc::INT_MAX,
+            );
         }
     }
 
@@ -371,14 +374,25 @@ impl PlatformImpl for Platform {
             return Err(AbortedError);
         }
 
-        let ms = if dur.as_millis() > u32::MAX as u128 {
-            u32::MAX
-        } else {
-            dur.as_millis() as u32
+        let mut req = timespec {
+            tv_sec: dur.as_secs() as _,
+            tv_nsec: dur.subsec_nanos() as _,
         };
 
         unsafe {
-            Sleep(ms);
+            loop {
+                let mut rem = zeroed();
+                let res = nanosleep(&req, &mut rem);
+                if res == 0 {
+                    break;
+                }
+
+                if aborted() {
+                    return Err(AbortedError);
+                }
+
+                req = rem;
+            }
         }
 
         if aborted() {
@@ -391,9 +405,9 @@ impl PlatformImpl for Platform {
 
 impl<'a, T> Drop for RawJoinHandle<'a, T> {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
+        if let Some(thread_id) = self.thread_id.take() {
             unsafe {
-                let _ = CloseHandle(handle);
+                let _ = pthread_detach(thread_id);
             }
         }
     }

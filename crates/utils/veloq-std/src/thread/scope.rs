@@ -1,6 +1,6 @@
 pub mod raw;
 
-use crate::{Platform, ThreadError};
+use crate::thread::{Platform, ThreadError};
 use raw::{RawScope, RawScopedJoinHandle, scope as raw_scope};
 
 /// 结构化并发的作用域封装结构体

@@ -1,10 +1,9 @@
-use crate::time::Instant;
-use core::{
+use crate::{
     sync::atomic::{AtomicU32, Ordering},
-    time::Duration,
+    thread::{Platform as ThreadPlatform, traits::PlatformImpl},
+    time::{Duration, Instant},
 };
 use lock_api::{GuardSend, RawMutex as RawMutexTrait, RawMutexFair, RawMutexTimed};
-use veloq_thread::{Platform as ThreadPlatform, traits::PlatformImpl};
 
 pub struct RawMutex {
     state: AtomicU32,

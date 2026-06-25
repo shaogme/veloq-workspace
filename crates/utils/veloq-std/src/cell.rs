@@ -1,3 +1,5 @@
+pub use core::cell::Cell;
+
 #[cfg(not(feature = "loom"))]
 #[repr(transparent)]
 pub struct UnsafeCell<T: ?Sized> {
@@ -41,14 +43,6 @@ impl<T: ?Sized> UnsafeCell<T> {
     {
         unsafe { f(&*self.cell.get()) }
     }
-
-    pub fn get(&self) -> *const T {
-        self.cell.get() as *const T
-    }
-
-    pub fn get_mut(&self) -> *mut T {
-        self.cell.get()
-    }
 }
 
 #[cfg(not(feature = "loom"))]
@@ -86,14 +80,6 @@ impl<T> UnsafeCell<T> {
 
 #[cfg(feature = "loom")]
 impl<T: ?Sized> UnsafeCell<T> {
-    pub fn get(&self) -> *const T {
-        self.inner.get().with(|ptr| ptr)
-    }
-
-    pub fn get_mut(&self) -> *mut T {
-        self.inner.get_mut().with(|ptr| ptr)
-    }
-
     /// # Safety
     ///
     /// The caller must ensure that there are no mutable references to the underlying data while the closure is executing.

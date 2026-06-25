@@ -1,13 +1,15 @@
 #[cfg(feature = "std")]
-use alloc::boxed::Box;
-#[cfg(feature = "std")]
-use core::any::Any;
+use crate::{alloc::boxed::Box, any::Any};
 
 use crate::{
-    AbortedError, ThreadErrorKind,
-    scope::raw::{RawScope, scope},
+    error::Error,
+    sync::atomic::AtomicU32,
+    thread::{
+        AbortedError, ThreadErrorKind,
+        scope::raw::{RawScope, scope},
+    },
+    time::Duration,
 };
-use core::{error::Error, sync::atomic::AtomicU32, time::Duration};
 
 /// 原始线程错误接口，供平台特有错误实现
 pub trait RawThreadErrorTrait: Error + Send + Sync + 'static {

@@ -1,12 +1,11 @@
-use crate::time::Instant;
-use core::{
+use crate::{
     sync::atomic::{AtomicU32, Ordering},
-    time::Duration,
+    thread::{Platform as ThreadPlatform, traits::PlatformImpl},
+    time::{Duration, Instant},
 };
 use lock_api::{
     GuardSend, RawRwLock as RawRwLockTrait, RawRwLockDowngrade, RawRwLockFair, RawRwLockTimed,
 };
-use veloq_thread::{Platform as ThreadPlatform, traits::PlatformImpl};
 
 const READER_MASK: u32 = 0x0000_FFFF;
 const WRITER_WAITING_MASK: u32 = 0x3FFF_0000;

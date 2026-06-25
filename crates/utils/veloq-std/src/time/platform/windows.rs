@@ -1,9 +1,7 @@
-use core::{
+use crate::{
     sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
+    time::{Duration, platform::Platform},
 };
-
-use crate::time::platform::Platform;
 
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
