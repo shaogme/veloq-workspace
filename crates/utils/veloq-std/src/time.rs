@@ -1,8 +1,7 @@
-use crate::time::platform::{Platform, PlatformImpl};
-
-use core::{
+use crate::{
     fmt,
     ops::{Add, AddAssign, Sub, SubAssign},
+    time::platform::{Platform, PlatformImpl},
 };
 
 pub use core::time::*;

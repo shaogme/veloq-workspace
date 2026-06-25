@@ -1538,8 +1538,8 @@ dependencies = [
  "trybuild",
  "veloq-atomic-waker",
  "veloq-intrusive-linklist",
+ "veloq-std",
  "veloq-storage",
- "veloq-thread",
  "veloq-tls",
 ]
 
@@ -1556,8 +1556,10 @@ version = "0.1.0"
 dependencies = [
  "hashbrown 0.17.1",
  "libc",
+ "lock_api",
+ "loom",
  "veloq-hash",
- "veloq-thread",
+ "veloq-tls",
  "windows-sys",
 ]
 
@@ -1582,15 +1584,6 @@ dependencies = [
  "veloq-atomic-waker",
  "veloq-intrusive-linklist",
  "veloq-shim",
-]
-
-[[package]]
-name = "veloq-thread"
-version = "0.1.0"
-dependencies = [
- "libc",
- "veloq-tls",
- "windows-sys",
 ]
 
 [[package]]

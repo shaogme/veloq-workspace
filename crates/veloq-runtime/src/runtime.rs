@@ -86,7 +86,7 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
 
         let thread_errors = Mutex::new(None);
 
-        let res: Result<R> = veloq_thread::scope(|scope| {
+        let res: Result<R> = veloq_std::thread::scope(|scope| {
             struct ShutdownGuard<'rt, T>(&'rt RuntimeShared<T>);
             impl<'rt, T> Drop for ShutdownGuard<'rt, T> {
                 fn drop(&mut self) {

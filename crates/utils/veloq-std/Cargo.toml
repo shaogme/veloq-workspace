@@ -14,11 +14,26 @@ categories.workspace = true
 
 [dependencies]
 hashbrown = { version = "0.17.1", default-features = false, features = ["alloc"] }
+lock_api = { version = "0.4.14", default-features = false }
 veloq-hash.workspace = true
-veloq-thread.workspace = true
+veloq-tls.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = { version = "0.2.183", default-features = false }
+[dependencies.loom]
+workspace = true
+features = ["futures"]
+optional = true
+
+[features]
+default = ["std"]
+std = []
+loom = ["dep:loom"]
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_System_Performance"] }
+windows-sys = { workspace = true, features = [
+    "Win32_System_Performance",
+    "Win32_System_Threading",
+    "Win32_Foundation",
+] }

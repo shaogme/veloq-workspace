@@ -8,16 +8,17 @@ mod linux;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use linux::{Platform, RawJoinHandle, RawThreadError};
 
-use alloc::sync::Arc;
-use core::{
+use crate::{
     cell::{Cell, UnsafeCell},
-    sync::atomic::{AtomicU8, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
 };
 
 #[cfg(feature = "std")]
-use alloc::boxed::Box;
-#[cfg(feature = "std")]
-use core::{
+use crate::{
+    alloc::boxed::Box,
     any::Any,
     fmt::{Debug, Formatter, Result as FmtResult},
 };
@@ -56,9 +57,11 @@ impl<T> SafeUnsafeCell<T> {
         Self(UnsafeCell::new(value))
     }
 
-    /// 获取内部数据的裸指针
-    pub(crate) unsafe fn get(&self) -> *mut T {
-        self.0.get()
+    pub unsafe fn with_mut<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut T) -> R,
+    {
+        unsafe { self.0.with_mut(f) }
     }
 }
 
@@ -88,7 +91,7 @@ where
     T: Send,
 {
     unsafe fn receive(&self) -> Option<T> {
-        unsafe { (&mut *self.result.get()).take() }
+        unsafe { self.result.with_mut(|x| x.take()) }
     }
 
     fn status(&self) -> u8 {
@@ -101,7 +104,7 @@ where
 
     #[cfg(feature = "std")]
     unsafe fn take_panic(&self) -> Option<Box<dyn Any + Send + 'static>> {
-        unsafe { (&mut *self.panic_payload.get()).take() }
+        unsafe { self.panic_payload.with_mut(|x| x.take()) }
     }
 }
 

@@ -1,15 +1,14 @@
-use crate::traits::{PlatformImpl, RawJoinHandleTrait};
-use core::{
+use crate::{
     marker::PhantomData,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    thread::traits::{PlatformImpl, RawJoinHandleTrait},
 };
 
 #[cfg(feature = "std")]
-use crate::traits::RawThreadErrorTrait;
-#[cfg(feature = "std")]
-use alloc::boxed::Box;
-#[cfg(feature = "std")]
-use core::{ptr::null_mut, sync::atomic::AtomicPtr};
+use crate::{
+    boxed::Box, ptr::null_mut, sync::atomic::AtomicPtr, thread::traits::RawThreadErrorTrait,
+};
+
 #[cfg(feature = "std")]
 use std::{
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},

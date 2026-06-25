@@ -18,7 +18,7 @@ set! {
         #[display("failed to spawn worker thread: {source}")]
         ThreadSpawnFailed {
             #[source]
-            source: veloq_thread::ThreadError,
+            source: veloq_std::thread::ThreadError,
         },
 
         #[display("worker_factory has already been taken")]

@@ -1,4 +1,4 @@
-use core::{fmt::Debug, hash::Hash, time::Duration};
+use crate::{fmt::Debug, hash::Hash, time::Duration};
 
 #[cfg(target_os = "linux")]
 mod linux;

@@ -1,33 +1,35 @@
 use super::{SafeUnsafeCell, Sentinel, ThreadResultReceiver, ThreadSharedState};
 use crate::{
-    AbortedError, ThreadErrorKind,
-    traits::{PlatformImpl, RawJoinHandleTrait, RawThreadErrorTrait},
-};
-use alloc::sync::Arc;
-use core::{
     cell::UnsafeCell,
     error::Error,
     ffi::c_void,
     fmt::{Display, Formatter, Result as FmtResult},
     marker::PhantomData,
     ptr::{null, null_mut},
-    sync::atomic::{AtomicU8, AtomicU32, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU8, AtomicU32, Ordering},
+    },
+    thread::{
+        AbortedError, ThreadErrorKind,
+        traits::{PlatformImpl, RawJoinHandleTrait, RawThreadErrorTrait},
+    },
     time::Duration,
 };
 use windows_sys::Win32::{
     Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_OBJECT_0},
     System::Threading::{
         CreateThread, INFINITE, Sleep, SwitchToThread, WaitForSingleObject, WaitOnAddress,
-        WakeByAddressSingle,
+        WakeByAddressAll, WakeByAddressSingle,
     },
 };
 
 #[cfg(feature = "std")]
 use super::SendSyncPanicPayload;
+
 #[cfg(feature = "std")]
-use alloc::boxed::Box;
-#[cfg(feature = "std")]
-use core::any::Any;
+use crate::{any::Any, boxed::Box};
+
 #[cfg(feature = "std")]
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -134,14 +136,14 @@ where
         panicked: true,
     };
 
-    if let Some(f) = unsafe { (*state.closure.get()).take() } {
+    if let Some(f) = unsafe { state.closure.with_mut(|x| x.take()) } {
         #[cfg(feature = "std")]
         {
             let res = catch_unwind(AssertUnwindSafe(f));
             match res {
                 Ok(r) => {
                     unsafe {
-                        *state.result.get() = Some(r);
+                        state.result.with_mut(|opt| *opt = Some(r));
                     }
                     sentinel.panicked = false;
                     let _ = state.status.compare_exchange(
@@ -152,7 +154,7 @@ where
                     );
                 }
                 Err(err) => unsafe {
-                    *state.panic_payload.get() = Some(err);
+                    state.panic_payload.with_mut(|opt| *opt = Some(err));
                 },
             }
         }
@@ -160,7 +162,7 @@ where
         {
             let r = f();
             unsafe {
-                *state.result.get() = Some(r);
+                state.result.with_mut(|opt| *opt = Some(r));
             }
             sentinel.panicked = false;
             let _ = state.status.compare_exchange(
@@ -304,24 +306,54 @@ impl PlatformImpl for Platform {
         spawn(f)
     }
 
-    fn yield_now() -> Result<bool, crate::AbortedError> {
+    fn yield_now() -> Result<bool, AbortedError> {
         RawJoinHandle::<()>::yield_now()
     }
 
     fn wait_on_address(address: &AtomicU32, expected: u32) {
+        Self::wait_on_address_timeout(address, expected, None);
+    }
+
+    fn wait_on_address_timeout(
+        address: &AtomicU32,
+        expected: u32,
+        timeout: Option<Duration>,
+    ) -> bool {
+        let ms = match timeout {
+            Some(dur) => {
+                if dur.as_millis() > INFINITE as u128 {
+                    INFINITE
+                } else {
+                    dur.as_millis() as u32
+                }
+            }
+            None => INFINITE,
+        };
         unsafe {
-            let _ = WaitOnAddress(
+            let res = WaitOnAddress(
                 address as *const AtomicU32 as *const c_void as *mut c_void,
                 &expected as *const u32 as *const c_void,
                 4,
-                INFINITE,
+                ms,
             );
+            if res == 0 {
+                let err = GetLastError();
+                err == 1460 // ERROR_TIMEOUT
+            } else {
+                false
+            }
         }
     }
 
     fn wake_by_address(address: &AtomicU32) {
         unsafe {
             WakeByAddressSingle(address as *const AtomicU32 as *const c_void);
+        }
+    }
+
+    fn wake_all_by_address(address: &AtomicU32) {
+        unsafe {
+            WakeByAddressAll(address as *const AtomicU32 as *const c_void);
         }
     }
 

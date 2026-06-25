@@ -1,10 +1,5 @@
 use super::{SafeUnsafeCell, Sentinel, ThreadResultReceiver, ThreadSharedState};
 use crate::{
-    AbortedError, ThreadErrorKind,
-    traits::{PlatformImpl, RawJoinHandleTrait, RawThreadErrorTrait},
-};
-use alloc::sync::Arc;
-use core::{
     cell::UnsafeCell,
     error::Error,
     ffi::{c_int, c_void},
@@ -12,7 +7,14 @@ use core::{
     marker::PhantomData,
     mem::zeroed,
     ptr::{null, null_mut},
-    sync::atomic::{AtomicU8, AtomicU32, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU8, AtomicU32, Ordering},
+    },
+    thread::{
+        AbortedError, ThreadErrorKind,
+        traits::{PlatformImpl, RawJoinHandleTrait, RawThreadErrorTrait},
+    },
     time::Duration,
 };
 use libc::{
@@ -22,10 +24,10 @@ use libc::{
 
 #[cfg(feature = "std")]
 use super::SendSyncPanicPayload;
+
 #[cfg(feature = "std")]
-use alloc::boxed::Box;
-#[cfg(feature = "std")]
-use core::any::Any;
+use crate::{any::Any, boxed::Box};
+
 #[cfg(feature = "std")]
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -132,14 +134,14 @@ where
         panicked: true,
     };
 
-    if let Some(f) = unsafe { (*state.closure.get()).take() } {
+    if let Some(f) = unsafe { state.closure.with_mut(|x| x.take()) } {
         #[cfg(feature = "std")]
         {
             let res = catch_unwind(AssertUnwindSafe(f));
             match res {
                 Ok(r) => {
                     unsafe {
-                        *state.result.get() = Some(r);
+                        state.result.with_mut(|opt| *opt = Some(r));
                     }
                     sentinel.panicked = false;
                     let _ = state.status.compare_exchange(
@@ -150,7 +152,7 @@ where
                     );
                 }
                 Err(err) => unsafe {
-                    *state.panic_payload.get() = Some(err);
+                    state.panic_payload.with_mut(|opt| *opt = Some(err));
                 },
             }
         }
@@ -158,7 +160,7 @@ where
         {
             let r = f();
             unsafe {
-                *state.result.get() = Some(r);
+                state.result.with_mut(|opt| *opt = Some(r));
             }
             sentinel.panicked = false;
             let _ = state.status.compare_exchange(
@@ -294,21 +296,43 @@ impl PlatformImpl for Platform {
         spawn(f)
     }
 
-    fn yield_now() -> Result<bool, crate::AbortedError> {
+    fn yield_now() -> Result<bool, AbortedError> {
         RawJoinHandle::<()>::yield_now()
     }
 
     fn wait_on_address(address: &AtomicU32, expected: u32) {
+        Self::wait_on_address_timeout(address, expected, None);
+    }
+
+    fn wait_on_address_timeout(
+        address: &AtomicU32,
+        expected: u32,
+        timeout: Option<Duration>,
+    ) -> bool {
+        let timespec_timeout = timeout.map(|dur| timespec {
+            tv_sec: dur.as_secs() as _,
+            tv_nsec: dur.subsec_nanos() as _,
+        });
+        let timeout_ptr = match timespec_timeout {
+            Some(ref ts) => ts as *const timespec,
+            None => null(),
+        };
         unsafe {
-            let _ = syscall(
+            let res = syscall(
                 SYS_futex,
                 address as *const AtomicU32 as *const c_void as *mut c_void,
                 FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
                 expected as i32,
-                null::<timespec>(),
+                timeout_ptr,
                 null_mut::<c_void>(),
                 0,
             );
+            if res < 0 {
+                let err = *libc::__errno_location();
+                err == libc::ETIMEDOUT
+            } else {
+                false
+            }
         }
     }
 
@@ -319,6 +343,17 @@ impl PlatformImpl for Platform {
                 address as *const AtomicU32 as *const c_void as *mut c_void,
                 FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
                 1,
+            );
+        }
+    }
+
+    fn wake_all_by_address(address: &AtomicU32) {
+        unsafe {
+            let _ = syscall(
+                SYS_futex,
+                address as *const AtomicU32 as *const c_void as *mut c_void,
+                FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
+                libc::INT_MAX,
             );
         }
     }

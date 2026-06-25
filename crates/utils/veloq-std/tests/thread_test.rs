@@ -1,5 +1,7 @@
-use core::sync::atomic::{AtomicBool, Ordering};
-use veloq_thread::spawn;
+use veloq_std::{
+    sync::atomic::{AtomicBool, Ordering},
+    thread::spawn,
+};
 
 #[test]
 fn test_spawn_and_join() {
@@ -18,7 +20,7 @@ fn test_spawn_and_join() {
 #[test]
 fn test_scope_borrow() {
     let mut val = 42;
-    veloq_thread::scope(|s| {
+    veloq_std::thread::scope(|s| {
         s.spawn(|| {
             val += 1;
         })
@@ -29,7 +31,7 @@ fn test_scope_borrow() {
 
 #[test]
 fn test_scope_join() {
-    let res = veloq_thread::scope(|s| {
+    let res = veloq_std::thread::scope(|s| {
         let handle = s.spawn(|| 24).expect("Failed to spawn scoped thread");
         handle.join().expect("Failed to join scoped thread")
     });
@@ -40,13 +42,13 @@ fn test_scope_join() {
 fn test_scope_nested() {
     let mut val1 = 10;
     let mut val2 = 20;
-    veloq_thread::scope(|s1| {
+    veloq_std::thread::scope(|s1| {
         s1.spawn(|| {
             val1 += 5;
         })
         .expect("Failed to spawn scoped thread 1");
 
-        veloq_thread::scope(|s2| {
+        veloq_std::thread::scope(|s2| {
             s2.spawn(|| {
                 val2 += 5;
             })
@@ -59,18 +61,18 @@ fn test_scope_nested() {
 
 #[test]
 fn test_yield_now() {
-    veloq_thread::scope(|s| {
+    veloq_std::thread::scope(|s| {
         s.spawn(|| {
-            let _ = veloq_thread::yield_now();
+            let _ = veloq_std::thread::yield_now();
         })
         .expect("Failed to spawn scoped thread");
     });
-    let _ = veloq_thread::yield_now();
+    let _ = veloq_std::thread::yield_now();
 }
 
 #[test]
 fn test_thread_abort() {
-    let thread = spawn(|| while veloq_thread::yield_now().is_ok() {})
+    let thread = spawn(|| while veloq_std::thread::yield_now().is_ok() {})
         .expect("Failed to spawn RawJoinHandle");
 
     thread.abort().expect("Failed to abort RawJoinHandle");
@@ -86,7 +88,7 @@ fn test_spawn_with_return_value() {
 
 #[test]
 fn test_thread_abort_error() {
-    let thread = spawn(|| while veloq_thread::yield_now().is_ok() {})
+    let thread = spawn(|| while veloq_std::thread::yield_now().is_ok() {})
         .expect("Failed to spawn RawJoinHandle");
 
     thread.abort().expect("Failed to abort RawJoinHandle");
@@ -94,9 +96,10 @@ fn test_thread_abort_error() {
     assert!(res.is_err());
     assert_eq!(
         res.unwrap_err().kind(),
-        veloq_thread::ThreadErrorKind::Aborted
+        veloq_std::thread::ThreadErrorKind::Aborted
     );
 }
+
 #[test]
 fn test_thread_panic_error() {
     let thread = spawn(|| {
@@ -108,6 +111,6 @@ fn test_thread_panic_error() {
     assert!(res.is_err());
     assert_eq!(
         res.unwrap_err().kind(),
-        veloq_thread::ThreadErrorKind::Panicked
+        veloq_std::thread::ThreadErrorKind::Panicked
     );
 }
