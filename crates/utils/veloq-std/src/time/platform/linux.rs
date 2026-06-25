@@ -2,7 +2,7 @@ use core::time::Duration;
 
 use crate::time::platform::Platform;
 
-use libc::{CLOCK_MONOTONIC, clock_gettime, timespec, time_t, c_long};
+use libc::{CLOCK_MONOTONIC, c_long, clock_gettime, time_t, timespec};
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Timespec {

@@ -1556,6 +1556,7 @@ version = "0.1.0"
 dependencies = [
  "hashbrown 0.17.1",
  "libc",
+ "lock_api",
  "veloq-hash",
  "veloq-thread",
  "windows-sys",

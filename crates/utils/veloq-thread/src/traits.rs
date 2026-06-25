@@ -70,8 +70,19 @@ pub trait PlatformImpl: Sized {
     /// 在指定的 `AtomicU32` 地址上等待，直到其值不再等于 `expected`
     fn wait_on_address(address: &AtomicU32, expected: u32);
 
+    /// 在指定的 `AtomicU32` 地址上等待，直到其值不再等于 `expected`，或者超时
+    /// 返回 `true` 表示超时，`false` 表示未超时（被唤醒或值已改变）
+    fn wait_on_address_timeout(
+        address: &AtomicU32,
+        expected: u32,
+        timeout: Option<Duration>,
+    ) -> bool;
+
     /// 唤醒在指定的 `AtomicU32` 地址上等待 of 线程
     fn wake_by_address(address: &AtomicU32);
+
+    /// 唤醒所有在指定的 `AtomicU32` 地址上等待的线程
+    fn wake_all_by_address(address: &AtomicU32);
 
     /// 使当前线程睡眠指定的时长。
     ///
