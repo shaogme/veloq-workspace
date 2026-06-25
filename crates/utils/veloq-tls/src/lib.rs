@@ -36,6 +36,17 @@ macro_rules! veloq_tls {
         $(
             $(#[$attr])*
             $vis static $name: $crate::Tls<$t> = $crate::Tls::new();
+
+            #[allow(non_camel_case_types)]
+            #[allow(dead_code)]
+            $vis struct $name {}
+
+            impl $name {
+                #[inline(always)]
+                $vis fn init() -> $t {
+                    $init
+                }
+            }
         )*
     };
 }

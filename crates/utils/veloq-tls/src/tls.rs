@@ -403,7 +403,7 @@ mod tests {
                 |v| {
                     assert_eq!(*v, 100);
                 },
-                || 100,
+                MACRO_TLS_INT::init,
             )
             .unwrap();
         MACRO_TLS_STR
@@ -411,7 +411,7 @@ mod tests {
                 |v| {
                     assert_eq!(v, "hello_macro");
                 },
-                || "hello_macro".to_string(),
+                MACRO_TLS_STR::init,
             )
             .unwrap();
     }
