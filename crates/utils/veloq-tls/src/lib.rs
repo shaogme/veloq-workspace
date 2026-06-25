@@ -8,8 +8,8 @@ mod shared;
 mod tls;
 
 // Re-export internal items for submodules
-pub(crate) use platform::{Platform, PlatformImpl};
-pub(crate) use shared::{RawKey, ResetGuard, is_sentinel, sentinel_ptr};
+pub(crate) use platform::{AtomicKey, Key, PlatformKey};
+pub(crate) use shared::{ResetGuard, is_sentinel, sentinel_ptr};
 
 // Public exports
 pub use error::{TlsError, TlsErrorKind};

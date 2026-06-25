@@ -11,7 +11,6 @@ use veloq_shim::{
 };
 
 pub type LinkedList<A> = generic::GenericLinkedList<A, Link>;
-#[allow(dead_code)]
 pub type RemoveOnDrop<'a, A> = generic::GenericRemoveOnDrop<'a, A, Link>;
 pub type Cursor<'a, A> = generic::GenericCursor<'a, A, Link>;
 pub type CursorMut<'a, A> = generic::GenericCursorMut<'a, A, Link>;

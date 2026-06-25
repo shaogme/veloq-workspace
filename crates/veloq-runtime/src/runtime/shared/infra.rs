@@ -1,12 +1,8 @@
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_queue::ArrayQueue;
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
-    },
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     thread,
-    time::Duration,
 };
 use veloq_storage::{AtomicOptionPtr, StateOptionPtr};
 
@@ -14,7 +10,7 @@ use crate::{
     error::Result,
     runtime::{
         context::{IdleDecision, IdleWaitStrategy},
-        primitives::{EventCount, Parker, ParkerInner, Unparker},
+        primitives::{EventCount, Unparker},
         shared::RuntimeShared,
     },
     scope::GenericScopeCompletion,
@@ -216,7 +212,6 @@ impl AtomicBitset {
 pub(crate) struct WorkerRegistry {
     pub(crate) workers: Box<[WorkerQueue]>,
     pub(crate) unparkers: Box<[Unparker]>,
-    pub(crate) parker_inners: Box<[Arc<ParkerInner>]>,
 }
 
 impl WorkerRegistry {
@@ -461,7 +456,7 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
             return Ok(());
         }
 
-        self.park(wait_strategy, completion);
+        self.park(wait_strategy, completion)?;
         self.leave_idle(group_idx);
         Ok(())
     }
@@ -481,22 +476,14 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
     fn park<S: ScopeStorage, O: Ownership>(
         &self,
         wait_strategy: IdleWaitStrategy,
-        completion: Option<&GenericScopeCompletion<S, O>>,
-    ) {
-        let base = &self.shared.base;
-        let parker = Parker::from_inner(base.registry.parker_inners[self.worker_id].clone());
-        match wait_strategy {
-            IdleWaitStrategy::Timeout(duration) => {
-                let _ = parker.park_timeout(duration);
-            }
-            IdleWaitStrategy::Block => {
-                if completion.is_some() {
-                    let _ = parker.park_timeout(Duration::from_millis(1));
-                } else {
-                    parker.park();
-                }
-            }
+        _completion: Option<&GenericScopeCompletion<S, O>>,
+    ) -> Result<()> {
+        if let Some(park_hook) = self.shared.park_hook {
+            park_hook(self.shared, wait_strategy)?;
+        } else {
+            thread::yield_now();
         }
+        Ok(())
     }
 
     fn leave_idle(&self, group_idx: usize) {

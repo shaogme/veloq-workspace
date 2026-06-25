@@ -23,7 +23,7 @@ pub mod shared;
 pub use context::{IdleDecision, IdleWaitStrategy, IntoRuntimeCtx, RuntimeCtx};
 pub(crate) use context::{IdleHook, RuntimeTlsInner, WorkerTickHook};
 pub use primitives::GenericCancellationToken;
-pub use shared::{EnqueuePinnedOutcome, RuntimeShared, RuntimeSharedBase};
+pub use shared::{EnqueuePinnedOutcome, ParkHook, RuntimeShared, RuntimeSharedBase};
 
 use primitives::{Signal, create_waker};
 use shared::{Receivers, init_runtime_components};
@@ -278,6 +278,7 @@ pub struct RuntimeBuilder<T, WF> {
     queue_capacity: NonZeroUsize,
     worker_factory: Option<WF>,
     idle_hook: Option<IdleHook<T>>,
+    park_hook: Option<ParkHook<T>>,
     worker_tick_hook: Option<WorkerTickHook>,
 }
 
@@ -294,6 +295,7 @@ impl RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
             queue_capacity: NonZeroUsize::new(1024).unwrap(),
             worker_factory: Some(|_, _| ()),
             idle_hook: None,
+            park_hook: None,
             worker_tick_hook: None,
         }
     }
@@ -313,11 +315,17 @@ impl<T, WF> RuntimeBuilder<T, WF> {
     pub fn with_idle_hook<NewT>(self, hook: IdleHook<NewT>) -> RuntimeBuilder<NewT, WF> {
         RuntimeBuilder {
             idle_hook: Some(hook),
+            park_hook: None,
             worker_count: self.worker_count,
             queue_capacity: self.queue_capacity,
             worker_factory: self.worker_factory,
             worker_tick_hook: self.worker_tick_hook,
         }
+    }
+
+    pub fn with_park_hook(mut self, hook: ParkHook<T>) -> Self {
+        self.park_hook = Some(hook);
+        self
     }
 
     pub fn with_worker_tick_hook(mut self, hook: WorkerTickHook) -> Self {
@@ -331,6 +339,7 @@ impl<T, WF> RuntimeBuilder<T, WF> {
             queue_capacity: self.queue_capacity,
             worker_factory: Some(factory),
             idle_hook: self.idle_hook,
+            park_hook: self.park_hook,
             worker_tick_hook: self.worker_tick_hook,
         }
     }
@@ -351,6 +360,7 @@ impl<T, WF> RuntimeBuilder<T, WF> {
             topo,
             worker_count,
             self.idle_hook,
+            self.park_hook,
             self.worker_tick_hook,
         );
         let rt = Runtime {

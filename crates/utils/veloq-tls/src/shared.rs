@@ -1,6 +1,4 @@
-use crate::{Platform, PlatformImpl};
-
-pub(crate) type RawKey = <PlatformImpl as Platform>::Key;
+use crate::{Key, PlatformKey};
 
 /// Helper to check if a pointer is the reentrancy sentinel.
 ///
@@ -21,13 +19,13 @@ pub(crate) fn sentinel_ptr<T>() -> *mut T {
 
 /// RAII helper to clean up the TLS sentinel value and reset it to null if initialization or modification fails/panics.
 pub(crate) struct ResetGuard {
-    pub(crate) key: RawKey,
+    pub(crate) key: Key,
     pub(crate) active: bool,
 }
 
 impl ResetGuard {
     #[inline(always)]
-    pub(crate) fn new(key: RawKey) -> Self {
+    pub(crate) fn new(key: Key) -> Self {
         Self { key, active: true }
     }
 
@@ -42,7 +40,7 @@ impl Drop for ResetGuard {
     fn drop(&mut self) {
         if self.active {
             unsafe {
-                let _ = PlatformImpl::set_value::<()>(self.key, core::ptr::null_mut());
+                let _ = self.key.set_value::<()>(core::ptr::null_mut());
             }
         }
     }
