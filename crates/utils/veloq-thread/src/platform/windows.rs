@@ -1,6 +1,6 @@
 use super::{SafeUnsafeCell, Sentinel, ThreadResultReceiver, ThreadSharedState};
 use crate::{
-    ThreadErrorKind,
+    AbortedError, ThreadErrorKind,
     traits::{PlatformImpl, RawJoinHandleTrait, RawThreadErrorTrait},
 };
 use alloc::sync::Arc;
@@ -12,11 +12,12 @@ use core::{
     marker::PhantomData,
     ptr::{null, null_mut},
     sync::atomic::{AtomicU8, AtomicU32, Ordering},
+    time::Duration,
 };
 use windows_sys::Win32::{
     Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_OBJECT_0},
     System::Threading::{
-        CreateThread, INFINITE, SwitchToThread, WaitForSingleObject, WaitOnAddress,
+        CreateThread, INFINITE, Sleep, SwitchToThread, WaitForSingleObject, WaitOnAddress,
         WakeByAddressSingle,
     },
 };
@@ -257,7 +258,7 @@ impl<'a, T> RawJoinHandle<'a, T> {
         Ok(())
     }
 
-    pub fn yield_now() -> Result<bool, crate::AbortedError> {
+    pub fn yield_now() -> Result<bool, AbortedError> {
         let aborted = super::CURRENT_THREAD_STATUS.with_or_default(|cell| {
             if let Some(status_ptr) = cell.get() {
                 let status = unsafe { &*status_ptr };
@@ -267,7 +268,7 @@ impl<'a, T> RawJoinHandle<'a, T> {
             }
         });
         if aborted {
-            return Err(crate::AbortedError);
+            return Err(AbortedError);
         }
         unsafe { Ok(SwitchToThread() != 0) }
     }
@@ -322,6 +323,39 @@ impl PlatformImpl for Platform {
         unsafe {
             WakeByAddressSingle(address as *const AtomicU32 as *const c_void);
         }
+    }
+
+    fn sleep(dur: Duration) -> Result<(), AbortedError> {
+        let aborted = || {
+            super::CURRENT_THREAD_STATUS.with_or_default(|cell| {
+                if let Some(status_ptr) = cell.get() {
+                    let status = unsafe { &*status_ptr };
+                    status.load(Ordering::Acquire) == super::STATE_ABORTED
+                } else {
+                    false
+                }
+            })
+        };
+
+        if aborted() {
+            return Err(AbortedError);
+        }
+
+        let ms = if dur.as_millis() > u32::MAX as u128 {
+            u32::MAX
+        } else {
+            dur.as_millis() as u32
+        };
+
+        unsafe {
+            Sleep(ms);
+        }
+
+        if aborted() {
+            return Err(AbortedError);
+        }
+
+        Ok(())
     }
 }
 

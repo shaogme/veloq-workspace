@@ -1,6 +1,6 @@
 use super::{SafeUnsafeCell, Sentinel, ThreadResultReceiver, ThreadSharedState};
 use crate::{
-    ThreadErrorKind,
+    AbortedError, ThreadErrorKind,
     traits::{PlatformImpl, RawJoinHandleTrait, RawThreadErrorTrait},
 };
 use alloc::sync::Arc;
@@ -13,10 +13,11 @@ use core::{
     mem::zeroed,
     ptr::{null, null_mut},
     sync::atomic::{AtomicU8, AtomicU32, Ordering},
+    time::Duration,
 };
 use libc::{
-    FUTEX_PRIVATE_FLAG, FUTEX_WAIT, FUTEX_WAKE, SYS_futex, pthread_create, pthread_detach,
-    pthread_join, pthread_t, sched_yield, syscall, timespec,
+    FUTEX_PRIVATE_FLAG, FUTEX_WAIT, FUTEX_WAKE, SYS_futex, nanosleep, pthread_create,
+    pthread_detach, pthread_join, pthread_t, sched_yield, syscall, timespec,
 };
 
 #[cfg(feature = "std")]
@@ -247,7 +248,7 @@ impl<'a, T> RawJoinHandle<'a, T> {
         Ok(())
     }
 
-    pub fn yield_now() -> Result<bool, crate::AbortedError> {
+    pub fn yield_now() -> Result<bool, AbortedError> {
         let aborted = super::CURRENT_THREAD_STATUS.with_or_default(|cell| {
             if let Some(status_ptr) = cell.get() {
                 let status = unsafe { &*status_ptr };
@@ -257,7 +258,7 @@ impl<'a, T> RawJoinHandle<'a, T> {
             }
         });
         if aborted {
-            return Err(crate::AbortedError);
+            return Err(AbortedError);
         }
         unsafe { Ok(sched_yield() == 0) }
     }
@@ -320,6 +321,50 @@ impl PlatformImpl for Platform {
                 1,
             );
         }
+    }
+
+    fn sleep(dur: Duration) -> Result<(), AbortedError> {
+        let aborted = || {
+            super::CURRENT_THREAD_STATUS.with_or_default(|cell| {
+                if let Some(status_ptr) = cell.get() {
+                    let status = unsafe { &*status_ptr };
+                    status.load(Ordering::Acquire) == super::STATE_ABORTED
+                } else {
+                    false
+                }
+            })
+        };
+
+        if aborted() {
+            return Err(AbortedError);
+        }
+
+        let mut req = timespec {
+            tv_sec: dur.as_secs() as _,
+            tv_nsec: dur.subsec_nanos() as _,
+        };
+
+        unsafe {
+            loop {
+                let mut rem = zeroed();
+                let res = nanosleep(&req, &mut rem);
+                if res == 0 {
+                    break;
+                }
+
+                if aborted() {
+                    return Err(AbortedError);
+                }
+
+                req = rem;
+            }
+        }
+
+        if aborted() {
+            return Err(AbortedError);
+        }
+
+        Ok(())
     }
 }
 

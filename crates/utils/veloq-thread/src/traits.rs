@@ -3,15 +3,14 @@ use alloc::boxed::Box;
 #[cfg(feature = "std")]
 use core::any::Any;
 
-use core::sync::atomic::AtomicU32;
-
 use crate::{
-    ThreadErrorKind,
+    AbortedError, ThreadErrorKind,
     scope::raw::{RawScope, scope},
 };
+use core::{error::Error, sync::atomic::AtomicU32, time::Duration};
 
 /// 原始线程错误接口，供平台特有错误实现
-pub trait RawThreadErrorTrait: core::error::Error + Send + Sync + 'static {
+pub trait RawThreadErrorTrait: Error + Send + Sync + 'static {
     /// 获取线程错误种类
     fn kind(&self) -> ThreadErrorKind;
 
@@ -57,8 +56,8 @@ pub trait PlatformImpl: Sized {
     /// 让出当前线程 of CPU 执行时间片。
     ///
     /// 如果成功让出或切换到了另一个线程，返回 `Ok(true)`；否则返回 `Ok(false)`。
-    /// 如果检测到当前线程已被中止，则返回 `Err(crate::AbortedError)`。
-    fn yield_now() -> Result<bool, crate::AbortedError>;
+    /// 如果检测到当前线程已被中止，则返回 `Err(AbortedError)`。
+    fn yield_now() -> Result<bool, AbortedError>;
 
     /// 创建一个结构化并发作用域，并在其中执行闭包 `f`。
     fn scope<'env, F, R>(f: F) -> R
@@ -71,6 +70,11 @@ pub trait PlatformImpl: Sized {
     /// 在指定的 `AtomicU32` 地址上等待，直到其值不再等于 `expected`
     fn wait_on_address(address: &AtomicU32, expected: u32);
 
-    /// 唤醒在指定的 `AtomicU32` 地址上等待的线程
+    /// 唤醒在指定的 `AtomicU32` 地址上等待 of 线程
     fn wake_by_address(address: &AtomicU32);
+
+    /// 使当前线程睡眠指定的时长。
+    ///
+    /// 如果检测到当前线程已被中止，则返回 `Err(AbortedError)`。
+    fn sleep(dur: Duration) -> Result<(), AbortedError>;
 }
