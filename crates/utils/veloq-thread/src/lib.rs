@@ -18,6 +18,7 @@ pub use scope::{
 use core::{
     error::Error,
     fmt::{self, Formatter, Result as FmtResult},
+    time::Duration,
 };
 
 /// 线程错误种类
@@ -120,4 +121,11 @@ where
 /// 如果检测到当前线程已被中止，则返回 `Err(AbortedError)`。
 pub fn yield_now() -> Result<bool, AbortedError> {
     Platform::yield_now()
+}
+
+/// 使当前线程睡眠指定的时长。
+///
+/// 如果检测到当前线程已被中止，则返回 `Err(AbortedError)`。
+pub fn sleep(dur: Duration) -> Result<(), AbortedError> {
+    Platform::sleep(dur)
 }
