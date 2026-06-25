@@ -4,7 +4,7 @@ use std::{
     pin::Pin,
     ptr::NonNull,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU32, AtomicUsize, Ordering},
     },
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
@@ -38,7 +38,6 @@ pub(crate) mod sys {
                 address_size: usize,
                 milliseconds: u32,
             ) -> i32;
-            pub fn WakeByAddressSingle(address: *const c_void);
             pub fn WakeByAddressAll(address: *const c_void);
         }
     }
@@ -76,13 +75,6 @@ pub(crate) mod sys {
                 4,
                 millis,
             ) != 0
-        }
-    }
-
-    #[cfg(windows)]
-    pub unsafe fn wake_one(addr: &AtomicU32) {
-        unsafe {
-            win::WakeByAddressSingle(addr as *const _ as *const _);
         }
     }
 
@@ -126,18 +118,6 @@ pub(crate) mod sys {
     }
 
     #[cfg(target_os = "linux")]
-    pub unsafe fn wake_one(addr: &AtomicU32) {
-        unsafe {
-            libc::syscall(
-                libc::SYS_futex,
-                addr as *const _ as *mut i32,
-                libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
-                1,
-            );
-        }
-    }
-
-    #[cfg(target_os = "linux")]
     pub unsafe fn wake_all(addr: &AtomicU32) {
         unsafe {
             libc::syscall(
@@ -158,8 +138,7 @@ pub(crate) mod sys {
         thread::sleep(timeout);
         false
     }
-    #[cfg(not(any(windows, target_os = "linux")))]
-    pub unsafe fn wake_one(_addr: &AtomicU32) {}
+
     #[cfg(not(any(windows, target_os = "linux")))]
     pub unsafe fn wake_all(_addr: &AtomicU32) {}
 }
@@ -253,147 +232,66 @@ pub fn create_unpark_waker(unparker: Unparker) -> Waker {
 
 static UNPARK_VTABLE: RawWakerVTable = RawWakerVTable::new(
     |p| unsafe {
-        Arc::increment_strong_count(p as *const ParkerInner);
+        Arc::increment_strong_count(p as *const UnparkerInner);
         RawWaker::new(p, &UNPARK_VTABLE)
     },
     |p| unsafe {
-        let inner = Arc::from_raw(p as *const ParkerInner);
-        Unparker::from_inner(inner).unpark();
+        let inner = Arc::from_raw(p as *const UnparkerInner);
+        inner.wake();
     },
     |p| unsafe {
-        let inner = ManuallyDrop::new(Arc::from_raw(p as *const ParkerInner));
-        Unparker::from_inner((*inner).clone()).unpark();
+        let inner = ManuallyDrop::new(Arc::from_raw(p as *const UnparkerInner));
+        inner.wake();
     },
     |p| unsafe {
-        drop(Arc::from_raw(p as *const ParkerInner));
+        drop(Arc::from_raw(p as *const UnparkerInner));
     },
 );
 
-// --- 高性能唤醒原语 (Parker/Unparker) ---
+// --- 高性能唤醒原语 (Unparker) ---
 
-pub struct Parker {
-    inner: Arc<ParkerInner>,
+pub trait RuntimeWaker: Send + Sync {
+    fn wake(&self);
+}
+
+pub(crate) struct UnparkerInner {
+    pub(crate) waker: OnceLock<Arc<dyn RuntimeWaker>>,
+}
+
+impl UnparkerInner {
+    fn wake(&self) {
+        if let Some(waker) = self.waker.get() {
+            waker.wake();
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct Unparker {
-    inner: Arc<ParkerInner>,
+    pub(crate) inner: Arc<UnparkerInner>,
 }
 
-pub(crate) struct ParkerInner {
-    pub(crate) state: AtomicU32,
-}
-
-const EMPTY: u32 = 0;
-const NOTIFIED: u32 = 1;
-const PARKED: u32 = 2;
-
-impl Default for Parker {
+impl Default for Unparker {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Parker {
+impl Unparker {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(ParkerInner {
-                state: AtomicU32::new(EMPTY),
+            inner: Arc::new(UnparkerInner {
+                waker: OnceLock::new(),
             }),
         }
     }
 
-    pub fn unparker(&self) -> Unparker {
-        Unparker {
-            inner: self.inner.clone(),
-        }
+    pub fn bind(&self, waker: Arc<dyn RuntimeWaker>) {
+        let _ = self.inner.waker.set(waker);
     }
 
-    pub(crate) fn from_inner(inner: Arc<ParkerInner>) -> Self {
-        Self { inner }
-    }
-
-    pub fn park(&self) {
-        loop {
-            // 1. Try to consume notification
-            if self
-                .inner
-                .state
-                .compare_exchange(NOTIFIED, EMPTY, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return;
-            }
-
-            // 2. Try to mark as parked
-            if self
-                .inner
-                .state
-                .compare_exchange(EMPTY, PARKED, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                // Wait until state changes from PARKED
-                unsafe { sys::wait(&self.inner.state, PARKED) };
-            } else {
-                // State must be NOTIFIED or PARKED (by another thread - though Parker is thread-exclusive)
-                // Continue to retry.
-            }
-        }
-    }
-
-    pub fn park_timeout(&self, duration: Duration) -> bool {
-        loop {
-            if self
-                .inner
-                .state
-                .compare_exchange(NOTIFIED, EMPTY, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return true;
-            }
-
-            if self
-                .inner
-                .state
-                .compare_exchange(EMPTY, PARKED, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                let _ = unsafe { sys::wait_timeout(&self.inner.state, PARKED, duration) };
-
-                if self
-                    .inner
-                    .state
-                    .compare_exchange(NOTIFIED, EMPTY, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    return true;
-                }
-
-                if self
-                    .inner
-                    .state
-                    .compare_exchange(PARKED, EMPTY, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-                {
-                    return false;
-                }
-            }
-        }
-    }
-}
-
-impl Unparker {
     pub fn unpark(&self) {
-        // Set state to NOTIFIED
-        let prev = self.inner.state.swap(NOTIFIED, Ordering::AcqRel);
-        if prev == PARKED {
-            // Wake the thread if it was parked
-            unsafe { sys::wake_one(&self.inner.state) };
-        }
-    }
-
-    pub(crate) fn from_inner(inner: Arc<ParkerInner>) -> Self {
-        Self { inner }
+        self.inner.wake();
     }
 }
 

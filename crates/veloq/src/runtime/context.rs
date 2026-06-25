@@ -512,3 +512,37 @@ pub(crate) fn submit_control_task<'rt, 'reg>(
         },
     }
 }
+
+pub fn park_current_driver<'reg>(
+    shared: &RuntimeShared<WorkerState<'reg>>,
+    _wait_strategy: IdleWaitStrategy,
+) -> RuntimeResult<()> {
+    let res = shared.extra_tls.try_with(|extra| {
+        // sync registrar
+        sync_to_driver_internal(
+            &extra.driver,
+            &extra.registrar_state,
+            extra.registration_mode,
+        );
+
+        let mut driver = extra.driver.borrow_mut();
+
+        // Block on the OS event driver
+        driver
+            .drive(DriveMode::Wait)
+            .map_err(|err| RuntimeError::InvariantViolation {
+                site: "park_current_driver",
+                detail: format!("driver drive(Wait) failed, details: {}", err).into(),
+            })
+    });
+
+    match res {
+        Ok(Ok(_outcome)) => Ok(()),
+        Ok(Err(err)) => Err(err.to_report()),
+        Err(err) => Err(RuntimeError::TlsSetOwnedFailed {
+            worker_id: shared.worker_id(),
+            source: err,
+        }
+        .to_report()),
+    }
+}

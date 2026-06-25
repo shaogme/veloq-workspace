@@ -2,6 +2,7 @@ pub mod context;
 
 use std::{
     cell::RefCell,
+    error::Error,
     num::NonZeroUsize,
     ops::AsyncFnOnce,
     sync::{Arc, mpsc},
@@ -11,9 +12,9 @@ use std::{
 use diagweave::Transform;
 
 use veloq_buf::PoolTopology;
-use veloq_driver_native::driver::PlatformDriver;
+use veloq_driver_native::driver::{Driver, PlatformDriver, RemoteWaker};
 use veloq_runtime::{
-    runtime::{self as async_runtime},
+    runtime::{self as async_runtime, primitives::RuntimeWaker},
     utils::StaticTransfer,
 };
 
@@ -24,7 +25,7 @@ use crate::{
     error::Result as VeloqResult,
     runtime::context::{
         BorrowedRegistrar, Ctx, RegistrarMessage, SharedRegistrar, WorkerRegistrarState,
-        WorkerState, poll_current_driver,
+        WorkerState, park_current_driver, poll_current_driver,
     },
 };
 
@@ -163,6 +164,7 @@ impl<T: PoolTopology> Runtime<T> {
             .with_worker_count(Some(worker_count))
             .with_queue_capacity(config.get_queue_capacity())
             .with_idle_hook(poll_current_driver)
+            .with_park_hook(park_current_driver)
             .with_worker_factory(move |worker_id, shared| {
                 let topology = topology.clone();
                 let state = state.clone();
@@ -178,6 +180,23 @@ impl<T: PoolTopology> Runtime<T> {
 
                 let driver = PlatformDriver::new(config.clone(), registrar)
                     .expect("failed to create driver");
+
+                let remote_waker = driver.create_waker();
+                struct DriverWakerWrapper<E> {
+                    waker: Arc<dyn RemoteWaker<E>>,
+                }
+                impl<E> RuntimeWaker for DriverWakerWrapper<E>
+                where
+                    E: Error + Send + Sync + 'static,
+                {
+                    fn wake(&self) {
+                        let _ = self.waker.wake();
+                    }
+                }
+                shared.base.unparkers()[worker_id].bind(Arc::new(DriverWakerWrapper {
+                    waker: remote_waker,
+                }));
+
                 let driver_cell = RefCell::new(driver);
 
                 let buf_pool = {

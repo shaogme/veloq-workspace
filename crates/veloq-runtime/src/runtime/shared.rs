@@ -2,10 +2,7 @@ use std::{
     hint::spin_loop,
     num::NonZeroUsize,
     ptr::NonNull,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
-    },
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use crossbeam_deque::Worker;
@@ -15,10 +12,10 @@ use numaperf_topo::Topology;
 use veloq_storage::StateOptionPtr;
 use veloq_tls::Tls;
 
-use super::context::{IdleHook, RuntimeTlsInner, WorkerTickHook};
+use super::context::{IdleHook, IdleWaitStrategy, RuntimeTlsInner, WorkerTickHook};
 use crate::{
     error::{Result, RuntimeError},
-    runtime::primitives::{EventCount, ParkerInner, Unparker, create_unpark_waker},
+    runtime::primitives::{EventCount, Unparker, create_unpark_waker},
     scope::{GenericScopeCompletion, ScopeCompletionRegistration},
     task::{LocalTaskRef, ScopeStorage, SendTaskRef, TaskHandleRef},
     utils::{FastRand, ownership::Ownership},
@@ -57,9 +54,12 @@ pub struct RuntimeSharedBase {
     pub(crate) tls: Tls<RuntimeTlsInner>,
 }
 
+pub type ParkHook<T> = fn(&RuntimeShared<T>, IdleWaitStrategy) -> Result<()>;
+
 pub struct RuntimeShared<T> {
     pub base: RuntimeSharedBase,
     pub(crate) idle_hook: Option<IdleHook<T>>,
+    pub(crate) park_hook: Option<ParkHook<T>>,
     /// Worker 线程用户自定义 extra 状态。
     pub extra_tls: Tls<T>,
 }
@@ -74,17 +74,12 @@ pub(crate) fn init_runtime_components(
 ) -> (WorkerRegistry, TopologyContext, Receivers) {
     let worker_count_val = worker_count.get();
     let mut unparkers = Vec::with_capacity(worker_count_val);
-    let mut parker_inners = Vec::with_capacity(worker_count_val);
     let mut deques = Vec::with_capacity(worker_count_val);
     let mut workers = Vec::with_capacity(worker_count_val);
     let mut next_idle = Vec::with_capacity(worker_count_val);
 
     for _ in 0..worker_count_val {
-        let inner = Arc::new(ParkerInner {
-            state: AtomicU32::new(0),
-        });
-        unparkers.push(Unparker::from_inner(inner.clone()));
-        parker_inners.push(inner);
+        unparkers.push(Unparker::new());
 
         let remote_queue = ArrayQueue::new(queue_capacity.get());
         let pinned_queue = ArrayQueue::new(queue_capacity.get());
@@ -144,7 +139,6 @@ pub(crate) fn init_runtime_components(
         WorkerRegistry {
             workers: workers.into_boxed_slice(),
             unparkers: unparkers.into_boxed_slice(),
-            parker_inners: parker_inners.into_boxed_slice(),
         },
         TopologyContext {
             groups,
@@ -165,6 +159,7 @@ impl<T> RuntimeShared<T> {
         topo: TopologyContext,
         worker_count: NonZeroUsize,
         idle_hook: Option<IdleHook<T>>,
+        park_hook: Option<ParkHook<T>>,
         worker_tick_hook: Option<WorkerTickHook>,
     ) -> Self {
         Self {
@@ -184,6 +179,7 @@ impl<T> RuntimeShared<T> {
                 tls: Tls::new(),
             },
             idle_hook,
+            park_hook,
             extra_tls: Tls::new(),
         }
     }
