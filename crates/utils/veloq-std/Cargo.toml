@@ -18,6 +18,15 @@ lock_api = { version = "0.4.14", default-features = false }
 veloq-hash.workspace = true
 veloq-thread.workspace = true
 
+[dependencies.loom]
+workspace = true
+features = ["futures"]
+optional = true
+
+[features]
+default = []
+loom = ["dep:loom"]
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { version = "0.2.183", default-features = false }
 
