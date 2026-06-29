@@ -137,10 +137,7 @@ impl<T> OnceLock<T> {
     #[inline]
     fn initialized_mut(&mut self) -> bool {
         let state = self.once.state();
-        match state {
-            OnceExclusiveState::Complete => true,
-            _ => false,
-        }
+        matches!(state, OnceExclusiveState::Complete)
     }
 
     #[cold]

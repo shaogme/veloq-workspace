@@ -63,6 +63,13 @@ impl<'a> Drop for CompletionGuard<'a> {
     }
 }
 
+impl Default for Once {
+    #[inline]
+    fn default() -> Once {
+        Once::new()
+    }
+}
+
 impl Once {
     #[inline]
     pub const fn new() -> Once {
