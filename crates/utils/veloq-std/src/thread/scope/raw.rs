@@ -1,6 +1,7 @@
 use crate::{
     marker::PhantomData,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    sys,
     thread::traits::{PlatformImpl, RawJoinHandleTrait},
 };
 
@@ -99,7 +100,7 @@ impl<'scope, 'env, P: PlatformImpl> RawScope<'scope, 'env, P> {
                         .num_running_threads
                         .fetch_sub(1, Ordering::Release);
                     if old == 1 {
-                        P::wake_by_address(&self.data.num_running_threads);
+                        sys::wake_by_address(&self.data.num_running_threads);
                     }
                 }
             }
@@ -218,7 +219,7 @@ impl<P: PlatformImpl> Drop for RawScopeGuard<'_, P> {
             val = self.data.num_running_threads.load(Ordering::Acquire);
             val != 0
         } {
-            P::wait_on_address(&self.data.num_running_threads, val);
+            sys::wait_on_address(&self.data.num_running_threads, val);
         }
 
         #[cfg(feature = "std")]

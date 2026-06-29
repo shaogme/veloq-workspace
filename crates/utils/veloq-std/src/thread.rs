@@ -100,7 +100,7 @@ impl<'a, T> JoinHandle<'a, T> {
     }
 }
 
-/// 产生一个新线程，并执行传入 of `f` 闭包。
+/// 产生一个新线程，并执行传入的 `f` 闭包。
 pub fn spawn<'a, F, T>(f: F) -> Result<JoinHandle<'a, T>, ThreadError>
 where
     F: FnOnce() -> T + Send + 'a,

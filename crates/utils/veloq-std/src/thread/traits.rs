@@ -3,7 +3,6 @@ use crate::{alloc::boxed::Box, any::Any};
 
 use crate::{
     error::Error,
-    sync::atomic::AtomicU32,
     thread::{
         AbortedError, ThreadErrorKind,
         scope::raw::{RawScope, scope},
@@ -55,7 +54,7 @@ pub trait PlatformImpl: Sized {
         F: FnOnce() -> T + Send + 'a,
         T: Send + 'a;
 
-    /// 让出当前线程 of CPU 执行时间片。
+    /// 让出当前线程的 CPU 执行时间片。
     ///
     /// 如果成功让出或切换到了另一个线程，返回 `Ok(true)`；否则返回 `Ok(false)`。
     /// 如果检测到当前线程已被中止，则返回 `Err(AbortedError)`。
@@ -68,23 +67,6 @@ pub trait PlatformImpl: Sized {
     {
         scope::<'env, Self, F, R>(f)
     }
-
-    /// 在指定的 `AtomicU32` 地址上等待，直到其值不再等于 `expected`
-    fn wait_on_address(address: &AtomicU32, expected: u32);
-
-    /// 在指定的 `AtomicU32` 地址上等待，直到其值不再等于 `expected`，或者超时
-    /// 返回 `true` 表示超时，`false` 表示未超时（被唤醒或值已改变）
-    fn wait_on_address_timeout(
-        address: &AtomicU32,
-        expected: u32,
-        timeout: Option<Duration>,
-    ) -> bool;
-
-    /// 唤醒在指定的 `AtomicU32` 地址上等待 of 线程
-    fn wake_by_address(address: &AtomicU32);
-
-    /// 唤醒所有在指定的 `AtomicU32` 地址上等待的线程
-    fn wake_all_by_address(address: &AtomicU32);
 
     /// 使当前线程睡眠指定的时长。
     ///

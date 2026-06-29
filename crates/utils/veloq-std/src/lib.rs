@@ -6,6 +6,7 @@ extern crate alloc;
 pub mod cell;
 pub mod collections;
 pub mod sync;
+pub mod sys;
 pub mod thread;
 pub mod time;
 
