@@ -84,7 +84,7 @@ impl Runner {
 
     pub fn run(&self) -> Result<(), Report<RunnerError>> {
         if !matches!(self.mode, RunMode::Native) {
-            // 在非原生环境下，我们直接运行一次 xtest-runner，由内部 of xtest-runner 负责循环
+            // 在非原生环境下，我们直接运行一次 xtest-runner，由内部的 xtest-runner 负责循环
             let command = self.round_command();
             let status = command_status(&command, &self.workspace_root)
                 .with_ctx("command", command.display());

@@ -1,6 +1,6 @@
 use crate::{
     sync::atomic::{AtomicU32, Ordering},
-    thread::{Platform as ThreadPlatform, traits::PlatformImpl},
+    sys,
     time::{Duration, Instant},
 };
 use lock_api::{GuardSend, RawMutex as RawMutexTrait, RawMutexFair, RawMutexTimed};
@@ -26,7 +26,7 @@ unsafe impl RawMutexTrait for RawMutex {
                 c = self.state.swap(2, Ordering::Acquire);
             }
             while c != 0 {
-                <ThreadPlatform as PlatformImpl>::wait_on_address_timeout(&self.state, 2, None);
+                sys::wait_on_address_timeout(&self.state, 2, None);
                 c = self.state.swap(2, Ordering::Acquire);
             }
         }
@@ -43,7 +43,7 @@ unsafe impl RawMutexTrait for RawMutex {
     unsafe fn unlock(&self) {
         if self.state.fetch_sub(1, Ordering::Release) != 1 {
             self.state.store(0, Ordering::Release);
-            <ThreadPlatform as PlatformImpl>::wake_by_address(&self.state);
+            sys::wake_by_address(&self.state);
         }
     }
 }
@@ -93,8 +93,7 @@ unsafe impl RawMutexTimed for RawMutex {
                 return false;
             }
             let dur = timeout.duration_since(now);
-            if <ThreadPlatform as PlatformImpl>::wait_on_address_timeout(&self.state, 2, Some(dur))
-            {
+            if sys::wait_on_address_timeout(&self.state, 2, Some(dur)) {
                 if self.state.load(Ordering::Relaxed) == 0 {
                     c = self.state.swap(2, Ordering::Acquire);
                     if c == 0 {

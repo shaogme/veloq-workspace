@@ -1,6 +1,6 @@
 use crate::{
     sync::atomic::{AtomicU32, Ordering},
-    thread::{Platform as ThreadPlatform, traits::PlatformImpl},
+    sys,
     time::{Duration, Instant},
 };
 use lock_api::{
@@ -43,7 +43,7 @@ unsafe impl RawRwLockTrait for RawRwLock {
                     return;
                 }
             }
-            <ThreadPlatform as PlatformImpl>::wait_on_address(&self.state, state);
+            sys::wait_on_address(&self.state, state);
             state = self.state.load(Ordering::Relaxed);
         }
     }
@@ -84,7 +84,7 @@ unsafe impl RawRwLockTrait for RawRwLock {
             ) {
                 Ok(_) => {
                     if (new_state & READER_MASK) == 0 && (new_state & WRITER_WAITING_MASK) != 0 {
-                        <ThreadPlatform as PlatformImpl>::wake_by_address(&self.state);
+                        sys::wake_by_address(&self.state);
                     }
                     return;
                 }
@@ -137,7 +137,7 @@ unsafe impl RawRwLockTrait for RawRwLock {
                     }
                 }
             }
-            <ThreadPlatform as PlatformImpl>::wait_on_address(&self.state, state);
+            sys::wait_on_address(&self.state, state);
             state = self.state.load(Ordering::Relaxed);
         }
     }
@@ -174,7 +174,7 @@ unsafe impl RawRwLockTrait for RawRwLock {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    <ThreadPlatform as PlatformImpl>::wake_all_by_address(&self.state);
+                    sys::wake_all_by_address(&self.state);
                     return;
                 }
                 Err(s) => state = s,
@@ -239,7 +239,7 @@ unsafe impl RawRwLockDowngrade for RawRwLock {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    <ThreadPlatform as PlatformImpl>::wake_all_by_address(&self.state);
+                    sys::wake_all_by_address(&self.state);
                     return;
                 }
                 Err(s) => state = s,
@@ -283,11 +283,7 @@ unsafe impl RawRwLockTimed for RawRwLock {
                 }
             }
             let dur = timeout.duration_since(now);
-            <ThreadPlatform as PlatformImpl>::wait_on_address_timeout(
-                &self.state,
-                state,
-                Some(dur),
-            );
+            sys::wait_on_address_timeout(&self.state, state, Some(dur));
             state = self.state.load(Ordering::Relaxed);
         }
     }
@@ -362,11 +358,7 @@ unsafe impl RawRwLockTimed for RawRwLock {
                 }
             }
             let dur = timeout.duration_since(now);
-            <ThreadPlatform as PlatformImpl>::wait_on_address_timeout(
-                &self.state,
-                state,
-                Some(dur),
-            );
+            sys::wait_on_address_timeout(&self.state, state, Some(dur));
             state = self.state.load(Ordering::Relaxed);
         }
     }
