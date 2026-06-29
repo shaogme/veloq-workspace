@@ -24,6 +24,103 @@ macro_rules! container_of {
     }};
 }
 
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __impl_intrusive_adapter {
+    // Generic version with lifetime
+    ($vis:vis $Adapter:ident < $lt:lifetime, $($gen:ident),+ >, $Node:ty, $link_field:ident, $Trait:ident, $Link:ident $(where $($wh:tt)+)?) => {
+        $vis struct $Adapter< $lt, $($gen),+ >(core::marker::PhantomData<(& $lt (), $($gen),+)>);
+
+        impl< $lt, $($gen),+ > $Adapter< $lt, $($gen),+ > {
+            pub const fn new() -> Self {
+                Self(core::marker::PhantomData)
+            }
+        }
+
+        unsafe impl < $lt, $($gen),+ > $crate::$Trait for $Adapter < $lt, $($gen),+ > $(where $($wh)+)? {
+            type Value = $Node;
+
+            #[inline]
+            unsafe fn get_link(&self, value: core::ptr::NonNull<Self::Value>) -> core::ptr::NonNull<$crate::$Link> {
+                let val_ptr = value.as_ptr();
+                unsafe {
+                    let link_ptr = core::ptr::addr_of_mut!((*val_ptr).$link_field);
+                    core::ptr::NonNull::new_unchecked(link_ptr)
+                }
+            }
+
+            #[inline]
+            unsafe fn get_value(&self, link: core::ptr::NonNull<$crate::$Link>) -> core::ptr::NonNull<Self::Value> {
+                let link_ptr = link.as_ptr();
+                unsafe {
+                    let val_ptr = $crate::container_of!(link_ptr, $Node, $link_field) as *mut $Node;
+                    core::ptr::NonNull::new_unchecked(val_ptr)
+                }
+            }
+        }
+    };
+
+    // Generic version
+    ($vis:vis $Adapter:ident < $($gen:ident),+ >, $Node:ty, $link_field:ident, $Trait:ident, $Link:ident $(where $($wh:tt)+)?) => {
+        $vis struct $Adapter< $($gen),+ >(core::marker::PhantomData<($($gen),+)>);
+
+        impl< $($gen),+ > $Adapter< $($gen),+ > {
+            pub const fn new() -> Self {
+                Self(core::marker::PhantomData)
+            }
+        }
+
+        unsafe impl < $($gen),+ > $crate::$Trait for $Adapter < $($gen),+ > $(where $($wh)+)? {
+            type Value = $Node;
+
+            #[inline]
+            unsafe fn get_link(&self, value: core::ptr::NonNull<Self::Value>) -> core::ptr::NonNull<$crate::$Link> {
+                let val_ptr = value.as_ptr();
+                unsafe {
+                    let link_ptr = core::ptr::addr_of_mut!((*val_ptr).$link_field);
+                    core::ptr::NonNull::new_unchecked(link_ptr)
+                }
+            }
+
+            #[inline]
+            unsafe fn get_value(&self, link: core::ptr::NonNull<$crate::$Link>) -> core::ptr::NonNull<Self::Value> {
+                let link_ptr = link.as_ptr();
+                unsafe {
+                    let val_ptr = $crate::container_of!(link_ptr, $Node, $link_field) as *mut $Node;
+                    core::ptr::NonNull::new_unchecked(val_ptr)
+                }
+            }
+        }
+    };
+
+    // Non-generic version
+    ($vis:vis $Adapter:ident, $Node:ty, $link_field:ident, $Trait:ident, $Link:ident) => {
+        $vis struct $Adapter;
+
+        unsafe impl $crate::$Trait for $Adapter {
+            type Value = $Node;
+
+            #[inline]
+            unsafe fn get_link(&self, value: core::ptr::NonNull<Self::Value>) -> core::ptr::NonNull<$crate::$Link> {
+                let val_ptr = value.as_ptr();
+                unsafe {
+                    let link_ptr = core::ptr::addr_of_mut!((*val_ptr).$link_field);
+                    core::ptr::NonNull::new_unchecked(link_ptr)
+                }
+            }
+
+            #[inline]
+            unsafe fn get_value(&self, link: core::ptr::NonNull<$crate::$Link>) -> core::ptr::NonNull<Self::Value> {
+                let link_ptr = link.as_ptr();
+                unsafe {
+                    let val_ptr = $crate::container_of!(link_ptr, $Node, $link_field) as *mut $Node;
+                    core::ptr::NonNull::new_unchecked(val_ptr)
+                }
+            }
+        }
+    };
+}
+
 /// 宏用于自动生成 `Adapter` 实现
 ///
 /// # Example
@@ -44,98 +141,17 @@ macro_rules! container_of {
 macro_rules! intrusive_adapter {
     // Generic version with lifetime
     ($vis:vis $Adapter:ident < $lt:lifetime, $($gen:ident),+ > = $Node:ty { $link_field:ident : Link } $(where $($wh:tt)+)?) => {
-        $vis struct $Adapter< $lt, $($gen),+ >(core::marker::PhantomData<(& $lt (), $($gen),+)>);
-
-        impl< $lt, $($gen),+ > $Adapter< $lt, $($gen),+ > {
-            pub const fn new() -> Self {
-                Self(core::marker::PhantomData)
-            }
-        }
-
-        unsafe impl < $lt, $($gen),+ > $crate::Adapter for $Adapter < $lt, $($gen),+ > $(where $($wh)+)? {
-            type Value = $Node;
-
-            #[inline]
-            unsafe fn get_link(&self, value: core::ptr::NonNull<Self::Value>) -> core::ptr::NonNull<$crate::Link> {
-                let val_ptr = value.as_ptr();
-                unsafe {
-                    let link_ptr = core::ptr::addr_of_mut!((*val_ptr).$link_field);
-                    core::ptr::NonNull::new_unchecked(link_ptr)
-                }
-            }
-
-            #[inline]
-            unsafe fn get_value(&self, link: core::ptr::NonNull<$crate::Link>) -> core::ptr::NonNull<Self::Value> {
-                let link_ptr = link.as_ptr();
-                unsafe {
-                    let val_ptr = $crate::container_of!(link_ptr, $Node, $link_field) as *mut $Node;
-                    core::ptr::NonNull::new_unchecked(val_ptr)
-                }
-            }
-        }
+        $crate::__impl_intrusive_adapter!($vis $Adapter < $lt, $($gen),+ >, $Node, $link_field, Adapter, Link $(where $($wh)+)?);
     };
 
     // Generic version
     ($vis:vis $Adapter:ident < $($gen:ident),+ > = $Node:ty { $link_field:ident : Link } $(where $($wh:tt)+)?) => {
-        $vis struct $Adapter< $($gen),+ >(core::marker::PhantomData<($($gen),+)>);
-
-        impl< $($gen),+ > $Adapter< $($gen),+ > {
-            pub const fn new() -> Self {
-                Self(core::marker::PhantomData)
-            }
-        }
-
-        unsafe impl < $($gen),+ > $crate::Adapter for $Adapter < $($gen),+ > $(where $($wh)+)? {
-            type Value = $Node;
-
-            #[inline]
-            unsafe fn get_link(&self, value: core::ptr::NonNull<Self::Value>) -> core::ptr::NonNull<$crate::Link> {
-                let val_ptr = value.as_ptr();
-                unsafe {
-                    let link_ptr = core::ptr::addr_of_mut!((*val_ptr).$link_field);
-                    core::ptr::NonNull::new_unchecked(link_ptr)
-                }
-            }
-
-            #[inline]
-            unsafe fn get_value(&self, link: core::ptr::NonNull<$crate::Link>) -> core::ptr::NonNull<Self::Value> {
-                let link_ptr = link.as_ptr();
-                unsafe {
-                    let val_ptr = $crate::container_of!(link_ptr, $Node, $link_field) as *mut $Node;
-                    core::ptr::NonNull::new_unchecked(val_ptr)
-                }
-            }
-        }
+        $crate::__impl_intrusive_adapter!($vis $Adapter < $($gen),+ >, $Node, $link_field, Adapter, Link $(where $($wh)+)?);
     };
 
     // Non-generic version
     ($vis:vis $Adapter:ident = $Node:ty { $link_field:ident : Link }) => {
-        $vis struct $Adapter;
-
-        unsafe impl $crate::Adapter for $Adapter {
-            type Value = $Node;
-
-            #[inline]
-            unsafe fn get_link(&self, value: core::ptr::NonNull<Self::Value>) -> core::ptr::NonNull<$crate::Link> {
-                let val_ptr = value.as_ptr();
-                // SAFETY: 调用者必须保证 value 指针有效且未被借用为 &mut（除非这里就在做转换）
-                // addr_of_mut! 不会在 stable 1.51 之前存在，但它是生成裸指针的安全方式
-                unsafe {
-                    let link_ptr = core::ptr::addr_of_mut!((*val_ptr).$link_field);
-                    core::ptr::NonNull::new_unchecked(link_ptr)
-                }
-            }
-
-            #[inline]
-            unsafe fn get_value(&self, link: core::ptr::NonNull<$crate::Link>) -> core::ptr::NonNull<Self::Value> {
-                let link_ptr = link.as_ptr();
-                // container_of 返回 *const T
-                unsafe {
-                    let val_ptr = $crate::container_of!(link_ptr, $Node, $link_field) as *mut $Node;
-                    core::ptr::NonNull::new_unchecked(val_ptr)
-                }
-            }
-        }
+        $crate::__impl_intrusive_adapter!($vis $Adapter, $Node, $link_field, Adapter, Link);
     };
 }
 
@@ -143,95 +159,17 @@ macro_rules! intrusive_adapter {
 macro_rules! concurrent_intrusive_adapter {
     // Generic version with lifetime
     ($vis:vis $Adapter:ident < $lt:lifetime, $($gen:ident),+ > = $Node:ty { $link_field:ident : ConcurrentLink } $(where $($wh:tt)+)?) => {
-        $vis struct $Adapter< $lt, $($gen),+ >(core::marker::PhantomData<(& $lt (), $($gen),+)>);
-
-        impl< $lt, $($gen),+ > $Adapter< $lt, $($gen),+ > {
-            pub const fn new() -> Self {
-                Self(core::marker::PhantomData)
-            }
-        }
-
-        unsafe impl < $lt, $($gen),+ > $crate::ConcurrentAdapter for $Adapter < $lt, $($gen),+ > $(where $($wh)+)? {
-            type Value = $Node;
-
-            #[inline]
-            unsafe fn get_link(&self, value: core::ptr::NonNull<Self::Value>) -> core::ptr::NonNull<$crate::ConcurrentLink> {
-                let val_ptr = value.as_ptr();
-                unsafe {
-                    let link_ptr = core::ptr::addr_of_mut!((*val_ptr).$link_field);
-                    core::ptr::NonNull::new_unchecked(link_ptr)
-                }
-            }
-
-            #[inline]
-            unsafe fn get_value(&self, link: core::ptr::NonNull<$crate::ConcurrentLink>) -> core::ptr::NonNull<Self::Value> {
-                let link_ptr = link.as_ptr();
-                unsafe {
-                    let val_ptr = $crate::container_of!(link_ptr, $Node, $link_field) as *mut $Node;
-                    core::ptr::NonNull::new_unchecked(val_ptr)
-                }
-            }
-        }
+        $crate::__impl_intrusive_adapter!($vis $Adapter < $lt, $($gen),+ >, $Node, $link_field, ConcurrentAdapter, ConcurrentLink $(where $($wh)+)?);
     };
 
     // Generic version
     ($vis:vis $Adapter:ident < $($gen:ident),+ > = $Node:ty { $link_field:ident : ConcurrentLink } $(where $($wh:tt)+)?) => {
-        $vis struct $Adapter< $($gen),+ >(core::marker::PhantomData<($($gen),+)>);
-
-        impl< $($gen),+ > $Adapter< $($gen),+ > {
-            pub const fn new() -> Self {
-                Self(core::marker::PhantomData)
-            }
-        }
-
-        unsafe impl < $($gen),+ > $crate::ConcurrentAdapter for $Adapter < $($gen),+ > $(where $($wh)+)? {
-            type Value = $Node;
-
-            #[inline]
-            unsafe fn get_link(&self, value: core::ptr::NonNull<Self::Value>) -> core::ptr::NonNull<$crate::ConcurrentLink> {
-                let val_ptr = value.as_ptr();
-                unsafe {
-                    let link_ptr = core::ptr::addr_of_mut!((*val_ptr).$link_field);
-                    core::ptr::NonNull::new_unchecked(link_ptr)
-                }
-            }
-
-            #[inline]
-            unsafe fn get_value(&self, link: core::ptr::NonNull<$crate::ConcurrentLink>) -> core::ptr::NonNull<Self::Value> {
-                let link_ptr = link.as_ptr();
-                unsafe {
-                    let val_ptr = $crate::container_of!(link_ptr, $Node, $link_field) as *mut $Node;
-                    core::ptr::NonNull::new_unchecked(val_ptr)
-                }
-            }
-        }
+        $crate::__impl_intrusive_adapter!($vis $Adapter < $($gen),+ >, $Node, $link_field, ConcurrentAdapter, ConcurrentLink $(where $($wh)+)?);
     };
 
     // Non-generic version
     ($vis:vis $Adapter:ident = $Node:ty { $link_field:ident : ConcurrentLink }) => {
-        $vis struct $Adapter;
-
-        unsafe impl $crate::ConcurrentAdapter for $Adapter {
-            type Value = $Node;
-
-            #[inline]
-            unsafe fn get_link(&self, value: core::ptr::NonNull<Self::Value>) -> core::ptr::NonNull<$crate::ConcurrentLink> {
-                let val_ptr = value.as_ptr();
-                unsafe {
-                    let link_ptr = core::ptr::addr_of_mut!((*val_ptr).$link_field);
-                    core::ptr::NonNull::new_unchecked(link_ptr)
-                }
-            }
-
-            #[inline]
-            unsafe fn get_value(&self, link: core::ptr::NonNull<$crate::ConcurrentLink>) -> core::ptr::NonNull<Self::Value> {
-                let link_ptr = link.as_ptr();
-                unsafe {
-                    let val_ptr = $crate::container_of!(link_ptr, $Node, $link_field) as *mut $Node;
-                    core::ptr::NonNull::new_unchecked(val_ptr)
-                }
-            }
-        }
+        $crate::__impl_intrusive_adapter!($vis $Adapter, $Node, $link_field, ConcurrentAdapter, ConcurrentLink);
     };
 }
 
