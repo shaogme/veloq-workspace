@@ -1,15 +1,22 @@
 #![cfg(feature = "loom")]
 
-use loom::sync::Arc;
-use loom::sync::atomic::{AtomicBool, Ordering};
-use loom::thread;
-use std::task::Wake;
+use loom::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+};
+use std::{
+    sync::Arc as StdArc,
+    task::{Wake, Waker},
+};
 use veloq_atomic_waker::AtomicWaker;
 
 struct TestWaker(Arc<AtomicBool>);
 
 impl Wake for TestWaker {
-    fn wake(self: std::sync::Arc<Self>) {
+    fn wake(self: StdArc<Self>) {
         self.0.store(true, Ordering::Relaxed);
     }
 }
@@ -22,15 +29,12 @@ fn concurrent_register() {
         let woken1 = Arc::new(AtomicBool::new(false));
         let woken2 = Arc::new(AtomicBool::new(false));
 
-        let w1 = std::sync::Arc::new(TestWaker(woken1.clone()));
-        let w2 = std::sync::Arc::new(TestWaker(woken2.clone()));
-        let waker1 = std::task::Waker::from(w1);
-        let waker2 = std::task::Waker::from(w2);
+        let w1 = StdArc::new(TestWaker(woken1.clone()));
+        let w2 = StdArc::new(TestWaker(woken2.clone()));
+        let waker1 = Waker::from(w1);
+        let waker2 = Waker::from(w2);
 
         let aw1 = atomic_waker.clone();
-        // We need to move wakers into threads but Waker is !Send in loom?
-        // No, Waker is Send.
-        // But we need to clone them.
         let waker1_clone = waker1.clone();
         let t1 = thread::spawn(move || {
             aw1.register(&waker1_clone);
