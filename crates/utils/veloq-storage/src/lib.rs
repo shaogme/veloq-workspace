@@ -32,15 +32,6 @@ mod sealed {
     pub trait Sealed {}
 }
 
-pub trait StateGuard {
-    /// 延迟释放内存，以防发生 UAF 漏洞。
-    /// # Safety
-    /// 传入的闭包执行的代码必须是安全的回收操作。
-    unsafe fn defer<F>(&self, f: F)
-    where
-        F: FnOnce() + Send + 'static;
-}
-
 pub trait Storage: 'static {
     fn strategy_type() -> StrategyType;
     type Usize: StateInt;
@@ -50,9 +41,6 @@ pub trait Storage: 'static {
     type WakerQueue: StateWakerQueue;
     type OptionBox<T: ?Sized + Send>: StateOptionBox<T>;
     type OptionArc<T: ?Sized + Send + Sync>: StateOptionArc<T>;
-    type Guard: StateGuard;
-
-    fn pin() -> Self::Guard;
 }
 
 /// 标记所有底层 primitive 都可跨线程共享的存储策略。

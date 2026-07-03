@@ -1,7 +1,7 @@
 use std::{
     cell::{Cell, RefCell, RefMut},
     marker::PhantomData,
-    mem::{swap, take},
+    mem::take,
     ptr::{NonNull, null_mut},
     rc::Rc,
     sync::{Arc, atomic::Ordering},
@@ -9,8 +9,8 @@ use std::{
 };
 
 use crate::{
-    LocalOnlyStorage, StateGuard, StateLock, StateOptionArc, StateOptionBox, StateWakerQueue,
-    Storage, StrategyType, sealed,
+    LocalOnlyStorage, StateLock, StateOptionArc, StateOptionBox, StateWakerQueue, Storage,
+    StrategyType, sealed,
 };
 
 pub struct LocalStorage(PhantomData<Rc<()>>);
@@ -28,14 +28,6 @@ impl Storage for LocalStorage {
     type WakerQueue = LocalWakerQueue;
     type OptionBox<T: ?Sized + Send> = OptionBox<T>;
     type OptionArc<T: ?Sized + Send + Sync> = OptionArc<T>;
-    type Guard = LocalGuard;
-
-    fn pin() -> Self::Guard {
-        LOCAL_EPOCH.with(|state| {
-            state.borrow_mut().guard_count += 1;
-        });
-        LocalGuard
-    }
 }
 
 pub struct LocalLock<T>(RefCell<T>);
@@ -108,105 +100,6 @@ impl_state_int!(
     },
     compare_exchange_weak(c, n, s, f) { self.compare_exchange(c, n, s, f) }
 );
-
-struct LocalEpochState {
-    guard_count: usize,
-    pending_defers: Vec<Box<dyn FnOnce()>>,
-    is_draining: bool,
-}
-
-thread_local! {
-    static LOCAL_EPOCH: RefCell<LocalEpochState> = RefCell::new(LocalEpochState {
-        guard_count: 0,
-        pending_defers: Vec::new(),
-        is_draining: false,
-    });
-}
-
-pub struct LocalGuard;
-
-impl StateGuard for LocalGuard {
-    unsafe fn defer<F>(&self, f: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        LOCAL_EPOCH.with(|state| {
-            let mut s = state.borrow_mut();
-            s.pending_defers.push(Box::new(f));
-            if s.guard_count == 0 {
-                drop(s);
-                LocalGuard::safe_drain();
-            }
-        });
-    }
-}
-
-impl Drop for LocalGuard {
-    fn drop(&mut self) {
-        LOCAL_EPOCH.with(|state| {
-            let mut s = state.borrow_mut();
-            s.guard_count -= 1;
-            if s.guard_count == 0 {
-                drop(s);
-                LocalGuard::safe_drain();
-            }
-        });
-    }
-}
-
-struct DrainGuard;
-
-impl Drop for DrainGuard {
-    fn drop(&mut self) {
-        LOCAL_EPOCH.with(|state| {
-            state.borrow_mut().is_draining = false;
-        });
-    }
-}
-
-impl LocalGuard {
-    fn safe_drain() {
-        LOCAL_EPOCH.with(|state| {
-            {
-                let s = state.borrow();
-                if s.is_draining || s.guard_count > 0 || s.pending_defers.is_empty() {
-                    return;
-                }
-            }
-
-            let mut s = state.borrow_mut();
-            s.is_draining = true;
-            let _guard = DrainGuard;
-
-            let mut defers = take(&mut s.pending_defers);
-            drop(s);
-
-            loop {
-                for defer in defers.drain(..) {
-                    defer();
-                }
-
-                let has_more = {
-                    let defers_ref = &mut defers;
-                    LOCAL_EPOCH.with(|state| {
-                        let mut s = state.borrow_mut();
-                        if s.pending_defers.is_empty() {
-                            s.pending_defers = take(defers_ref);
-                            false
-                        } else {
-                            swap(&mut s.pending_defers, defers_ref);
-                            true
-                        }
-                    })
-                };
-
-                if !has_more {
-                    break;
-                }
-            }
-        });
-    }
-}
 
 // ==================== Pointer Helpers & Local Pointer Wrappers ====================
 
