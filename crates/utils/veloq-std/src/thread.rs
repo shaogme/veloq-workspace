@@ -88,7 +88,7 @@ pub struct JoinHandle<'a, T> {
 unsafe impl<T: Send> Send for JoinHandle<'_, T> {}
 unsafe impl<T: Send> Sync for JoinHandle<'_, T> {}
 
-impl<'a, T> JoinHandle<'a, T> {
+impl<'a, T: Send> JoinHandle<'a, T> {
     /// 等待线程执行结束 (Join)
     pub fn join(self) -> Result<T, ThreadError> {
         self.inner.join().map_err(ThreadError::new)

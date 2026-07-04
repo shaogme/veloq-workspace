@@ -1,7 +1,12 @@
 use crate::{
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::Ordering,
     time::{Duration, platform::Platform},
 };
+
+#[cfg(not(feature = "loom"))]
+use crate::sync::atomic::AtomicU64;
+#[cfg(feature = "loom")]
+use core::sync::atomic::AtomicU64;
 
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 

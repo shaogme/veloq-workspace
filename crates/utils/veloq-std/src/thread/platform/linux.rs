@@ -1,5 +1,6 @@
 use super::{SafeUnsafeCell, Sentinel, ThreadResultReceiver, ThreadSharedState};
 use crate::{
+    boxed::Box,
     cell::UnsafeCell,
     error::Error,
     ffi::{c_int, c_void},
@@ -21,11 +22,14 @@ use libc::{
     nanosleep, pthread_create, pthread_detach, pthread_join, pthread_t, sched_yield, timespec,
 };
 
+#[cfg(feature = "loom")]
+use super::ThreadSharedStateTrait;
+
 #[cfg(feature = "std")]
 use super::SendSyncPanicPayload;
 
 #[cfg(feature = "std")]
-use crate::{any::Any, boxed::Box};
+use crate::any::Any;
 
 #[cfg(feature = "std")]
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -179,8 +183,21 @@ where
     F: FnOnce() -> T + Send + 'a,
     T: Send + 'a,
 {
+    #[cfg(feature = "loom")]
+    type BoxF<'a, T> = Box<dyn FnOnce() -> T + Send + 'a>;
+
+    #[cfg(not(feature = "loom"))]
     let state = Arc::new(ThreadSharedState {
         closure: UnsafeCell::new(Some(f)),
+        status: AtomicU8::new(super::STATE_INCOMPLETE),
+        result: SafeUnsafeCell::new(None),
+        #[cfg(feature = "std")]
+        panic_payload: SafeUnsafeCell::new(None),
+    });
+
+    #[cfg(feature = "loom")]
+    let state = Arc::new(ThreadSharedState {
+        closure: UnsafeCell::new(Some(Box::new(f) as BoxF<'a, T>)),
         status: AtomicU8::new(super::STATE_INCOMPLETE),
         result: SafeUnsafeCell::new(None),
         #[cfg(feature = "std")]
@@ -195,10 +212,18 @@ where
     let mut thread_id: pthread_t = unsafe { zeroed() };
 
     unsafe {
-        let res = pthread_create(&mut thread_id, null(), thread_entry_posix::<F, T>, param);
+        #[cfg(not(feature = "loom"))]
+        let entry = thread_entry_posix::<F, T>;
+        #[cfg(feature = "loom")]
+        let entry = thread_entry_posix::<BoxF<'a, T>, T>;
+
+        let res = pthread_create(&mut thread_id, null(), entry, param);
 
         if res != 0 {
+            #[cfg(not(feature = "loom"))]
             let _ = Arc::from_raw(param as *const ThreadSharedState<F, T>);
+            #[cfg(feature = "loom")]
+            let _ = Arc::from_raw(param as *const ThreadSharedState<BoxF<'a, T>, T>);
             return Err(RawThreadError::CreationFailed(res));
         }
 
@@ -210,7 +235,7 @@ where
     }
 }
 
-impl<'a, T> RawJoinHandle<'a, T> {
+impl<'a, T: Send> RawJoinHandle<'a, T> {
     pub fn join(mut self) -> Result<T, RawThreadError> {
         let thread_id = self.thread_id.take().ok_or(RawThreadError::AlreadyJoined)?;
         unsafe {

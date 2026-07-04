@@ -1,13 +1,83 @@
-use crate::sync::raw_rwlock::RawRwLock;
-use lock_api::RawRwLock as RawRwLockTrait;
+#[cfg(not(feature = "loom"))]
+mod std_impl {
+    use crate::sync::raw_rwlock::RawRwLock;
+    use lock_api::RawRwLock as RawRwLockTrait;
 
-pub type RwLock<T> = lock_api::RwLock<RawRwLock, T>;
-pub type RwLockReadGuard<'a, T> = lock_api::RwLockReadGuard<'a, RawRwLock, T>;
-pub type RwLockWriteGuard<'a, T> = lock_api::RwLockWriteGuard<'a, RawRwLock, T>;
+    pub type RwLock<T> = lock_api::RwLock<RawRwLock, T>;
+    pub type RwLockReadGuard<'a, T> = lock_api::RwLockReadGuard<'a, RawRwLock, T>;
+    pub type RwLockWriteGuard<'a, T> = lock_api::RwLockWriteGuard<'a, RawRwLock, T>;
 
-pub const fn const_rwlock<T>(val: T) -> RwLock<T> {
-    RwLock::const_new(<RawRwLock as RawRwLockTrait>::INIT, val)
+    pub const fn const_rwlock<T>(val: T) -> RwLock<T> {
+        RwLock::const_new(<RawRwLock as RawRwLockTrait>::INIT, val)
+    }
 }
+
+#[cfg(not(feature = "loom"))]
+pub use std_impl::*;
+
+#[cfg(feature = "loom")]
+mod loom_impl {
+    use crate::time::{Duration, Instant};
+
+    pub use loom::sync::{RwLock as LoomRwLock, RwLockReadGuard, RwLockWriteGuard};
+
+    #[derive(Debug)]
+    pub struct RwLock<T> {
+        inner: LoomRwLock<T>,
+    }
+
+    impl<T> RwLock<T> {
+        #[inline]
+        pub fn new(val: T) -> Self {
+            Self {
+                inner: LoomRwLock::new(val),
+            }
+        }
+
+        #[inline]
+        pub fn read(&self) -> RwLockReadGuard<'_, T> {
+            self.inner.read().unwrap()
+        }
+
+        #[inline]
+        pub fn write(&self) -> RwLockWriteGuard<'_, T> {
+            self.inner.write().unwrap()
+        }
+
+        #[inline]
+        pub fn try_read(&self) -> Option<RwLockReadGuard<'_, T>> {
+            self.inner.try_read().ok()
+        }
+
+        #[inline]
+        pub fn try_write(&self) -> Option<RwLockWriteGuard<'_, T>> {
+            self.inner.try_write().ok()
+        }
+
+        #[inline]
+        pub fn try_read_for(&self, _timeout: Duration) -> Option<RwLockReadGuard<'_, T>> {
+            self.try_read()
+        }
+
+        #[inline]
+        pub fn try_read_until(&self, _timeout: Instant) -> Option<RwLockReadGuard<'_, T>> {
+            self.try_read()
+        }
+
+        #[inline]
+        pub fn try_write_for(&self, _timeout: Duration) -> Option<RwLockWriteGuard<'_, T>> {
+            self.try_write()
+        }
+
+        #[inline]
+        pub fn try_write_until(&self, _timeout: Instant) -> Option<RwLockWriteGuard<'_, T>> {
+            self.try_write()
+        }
+    }
+}
+
+#[cfg(feature = "loom")]
+pub use loom_impl::*;
 
 #[cfg(test)]
 mod tests {

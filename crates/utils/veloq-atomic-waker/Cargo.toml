@@ -12,10 +12,10 @@ categories.workspace = true
 readme.workspace = true
 
 [dependencies]
-veloq-shim.workspace = true
+veloq-std.workspace = true
 
 [features]
-loom = ["veloq-shim/loom"]
+loom = ["veloq-std/loom"]
 
 [dev-dependencies]
 loom.workspace = true

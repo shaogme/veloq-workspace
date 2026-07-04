@@ -9,6 +9,7 @@ mod linux;
 pub use linux::{Platform, RawJoinHandle, RawThreadError};
 
 use crate::{
+    boxed::Box,
     cell::{Cell, UnsafeCell},
     sync::{
         Arc,
@@ -18,7 +19,6 @@ use crate::{
 
 #[cfg(feature = "std")]
 use crate::{
-    alloc::boxed::Box,
     any::Any,
     fmt::{Debug, Formatter, Result as FmtResult},
 };
@@ -53,7 +53,13 @@ unsafe impl<T: Send> Sync for SafeUnsafeCell<T> {}
 
 impl<T> SafeUnsafeCell<T> {
     /// 创建一个新的 SafeUnsafeCell
+    #[cfg(not(feature = "loom"))]
     pub(crate) const fn new(value: T) -> Self {
+        Self(UnsafeCell::new(value))
+    }
+
+    #[cfg(feature = "loom")]
+    pub(crate) fn new(value: T) -> Self {
         Self(UnsafeCell::new(value))
     }
 
@@ -109,17 +115,20 @@ where
 }
 
 pub(crate) struct ThreadResultReceiver<'a, T> {
+    #[cfg(not(feature = "loom"))]
     pub(crate) state: Arc<dyn ThreadSharedStateTrait<T> + 'a>,
+    #[cfg(feature = "loom")]
+    pub(crate) state: Arc<ThreadSharedState<Box<dyn FnOnce() -> T + Send + 'a>, T>>,
 }
 
 unsafe impl<T: Send> Send for ThreadResultReceiver<'_, T> {}
 unsafe impl<T: Send> Sync for ThreadResultReceiver<'_, T> {}
 
-impl<'a, T> ThreadResultReceiver<'a, T> {
+impl<'a, T: Send> ThreadResultReceiver<'a, T> {
     pub(crate) unsafe fn receive(self) -> Result<Option<T>, u8> {
-        let status = self.state.status();
+        let status = ThreadSharedStateTrait::status(&*self.state);
         if status == STATE_FINISHED {
-            unsafe { Ok(self.state.receive()) }
+            unsafe { Ok(ThreadSharedStateTrait::receive(&*self.state)) }
         } else {
             Err(status)
         }

@@ -1390,7 +1390,7 @@ name = "veloq-atomic-waker"
 version = "0.1.0"
 dependencies = [
  "loom",
- "veloq-shim",
+ "veloq-std",
 ]
 
 [[package]]

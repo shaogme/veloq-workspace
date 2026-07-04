@@ -72,7 +72,16 @@ impl Default for Once {
 
 impl Once {
     #[inline]
+    #[cfg(not(feature = "loom"))]
     pub const fn new() -> Once {
+        Once {
+            state_and_queued: AtomicU32::new(INCOMPLETE),
+        }
+    }
+
+    #[inline]
+    #[cfg(feature = "loom")]
+    pub fn new() -> Once {
         Once {
             state_and_queued: AtomicU32::new(INCOMPLETE),
         }
@@ -85,7 +94,12 @@ impl Once {
 
     #[inline]
     pub(crate) fn state(&mut self) -> OnceExclusiveState {
-        match *self.state_and_queued.get_mut() {
+        #[cfg(not(feature = "loom"))]
+        let val = *self.state_and_queued.get_mut();
+        #[cfg(feature = "loom")]
+        let val = self.state_and_queued.load(Acquire);
+
+        match val {
             INCOMPLETE => OnceExclusiveState::Incomplete,
             POISONED => OnceExclusiveState::Poisoned,
             COMPLETE => OnceExclusiveState::Complete,

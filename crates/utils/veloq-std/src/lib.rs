@@ -16,6 +16,10 @@ pub mod any {
     pub use core::any::*;
 }
 
+pub mod convert {
+    pub use core::convert::*;
+}
+
 pub mod hint {
     #[cfg(not(feature = "loom"))]
     pub use core::hint::spin_loop;
@@ -77,4 +81,8 @@ pub mod str {
 
 pub mod string {
     pub use alloc::string::*;
+}
+
+pub mod panic {
+    pub use core::panic::*;
 }
