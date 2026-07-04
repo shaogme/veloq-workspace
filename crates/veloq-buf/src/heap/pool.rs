@@ -196,7 +196,7 @@ impl Chunk {
 
     // Internal alloc/dealloc methods specific to this Chunk
     pub(crate) fn alloc_slots(
-        self: &Arc<Self>,
+        this: &Arc<Self>,
         order: usize,
         seed: Option<usize>,
     ) -> Option<ChunkAlloc> {
@@ -206,24 +206,24 @@ impl Chunk {
             // Note: with FastPath enabled in GlobalSlotPool, we rarely hit this for order 0.
 
             // 2. No Active Superblock. Alloc New.
-            if let Some((base_idx, _)) = self.alloc_global(SUPERBLOCK_ORDER, seed) {
+            if let Some((base_idx, _)) = this.alloc_global(SUPERBLOCK_ORDER, seed) {
                 let sb_idx = base_idx.superblock_index();
 
                 // Initialize State
                 // CRITICAL: We must hold the state in "Active" mode before anyone else can touch it.
                 // Since we just alloced it, no one else has pointers to slots inside it.
-                self.superblocks[sb_idx.get()].init();
+                this.superblocks[sb_idx.get()].init();
 
                 // Alloc one
-                let offset = self.superblocks[sb_idx.get()]
+                let offset = this.superblocks[sb_idx.get()]
                     .alloc_one()
                     .expect("Fresh superblock must have space");
 
                 let global_idx = SlotIndex::from_superblock_offset(sb_idx, offset);
-                let ptr = self.resolve_ptr(global_idx);
+                let ptr = this.resolve_ptr(global_idx);
                 return Some(ChunkAlloc::Small(SmallAlloc {
-                    chunk: self.clone(),
-                    chunk_id: self.id,
+                    chunk: this.clone(),
+                    chunk_id: this.id,
                     sb_idx,
                     slot_idx: global_idx,
                     ptr,
@@ -235,9 +235,9 @@ impl Chunk {
         }
 
         // Large Allocations: Direct Global
-        self.alloc_global(order, seed).map(|(slot_idx, ptr)| {
+        this.alloc_global(order, seed).map(|(slot_idx, ptr)| {
             ChunkAlloc::Large(LargeAlloc {
-                chunk_id: self.id,
+                chunk_id: this.id,
                 slot_idx,
                 ptr,
             })
@@ -454,7 +454,7 @@ impl GlobalSlotPool {
             let chunks = self.chunks.read();
             let mut found = None;
             for chunk in chunks.iter() {
-                if let Some(alloc) = chunk.alloc_slots(order, seed) {
+                if let Some(alloc) = Chunk::alloc_slots(chunk, order, seed) {
                     found = Some(alloc);
                     break;
                 }
@@ -472,7 +472,7 @@ impl GlobalSlotPool {
 
             // Double-check: Someone might have expanded while we waited for the lock
             for chunk in chunks.iter() {
-                if let Some(alloc) = chunk.alloc_slots(order, seed) {
+                if let Some(alloc) = Chunk::alloc_slots(chunk, order, seed) {
                     return Some(self.finish_alloc(alloc));
                 }
             }
@@ -498,7 +498,7 @@ impl GlobalSlotPool {
             };
 
             // Try alloc from new chunk
-            let res = new_chunk.alloc_slots(order, seed);
+            let res = Chunk::alloc_slots(&new_chunk, order, seed);
 
             // Commit new chunk
             chunks.push(new_chunk.clone());

@@ -3,14 +3,11 @@ use crate::{
     time::{Duration, platform::Platform},
 };
 
-#[cfg(not(feature = "loom"))]
-use crate::sync::atomic::AtomicU64;
-#[cfg(feature = "loom")]
-use core::sync::atomic::AtomicU64;
+use crate::sync::atomic::CoreAtomicU64;
 
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
-static FREQUENCY: AtomicU64 = AtomicU64::new(0);
+static FREQUENCY: CoreAtomicU64 = CoreAtomicU64::new(0);
 
 fn get_frequency() -> u64 {
     let cached = FREQUENCY.load(Ordering::Relaxed);

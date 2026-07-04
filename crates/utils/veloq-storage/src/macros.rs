@@ -16,7 +16,7 @@ macro_rules! impl_state_int {
             fn store(&$self, $store_val: usize, $order: ::veloq_std::sync::atomic::Ordering) { $store_expr }
             fn fetch_add(&$self, $add_val: usize, $order: ::veloq_std::sync::atomic::Ordering) -> usize { $add_expr }
             fn fetch_sub(&$self, $sub_val: usize, $order: ::veloq_std::sync::atomic::Ordering) -> usize { $sub_expr }
-            fn fetch_and(&$self, $and_val: usize, $order: ::veloq_std::sync::atomic::Ordering) -> usize { $add_expr }
+            fn fetch_and(&$self, $and_val: usize, $order: ::veloq_std::sync::atomic::Ordering) -> usize { $and_expr }
             fn fetch_or(&$self, $or_val: usize, $order: ::veloq_std::sync::atomic::Ordering) -> usize { $or_expr }
             fn compare_exchange(&$self, $ce_curr: usize, $ce_new: usize, $ce_s: ::veloq_std::sync::atomic::Ordering, $ce_f: ::veloq_std::sync::atomic::Ordering) -> Result<usize, usize> { $ce_expr }
             fn compare_exchange_weak(&$self, $cew_curr: usize, $cew_new: usize, $cew_s: ::veloq_std::sync::atomic::Ordering, $cew_f: ::veloq_std::sync::atomic::Ordering) -> Result<usize, usize> { $cew_expr }

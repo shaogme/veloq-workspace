@@ -370,10 +370,8 @@ impl PlatformImpl for Platform {
 
     fn available_parallelism() -> Result<NonZeroUsize, Self::Error> {
         let count = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) };
-        if count > 0 {
-            if let Some(n) = NonZeroUsize::new(count as usize) {
-                return Ok(n);
-            }
+        if let Some(n) = NonZeroUsize::new(count as usize) {
+            return Ok(n);
         }
         Ok(NonZeroUsize::new(1).unwrap())
     }

@@ -308,7 +308,20 @@ impl Default for SuperblockState {
 }
 
 impl SuperblockState {
+    #[cfg(not(feature = "loom"))]
     pub(crate) const fn new() -> Self {
+        Self {
+            // Initialize to 0 (All Used).
+            // This is "safe" because the superblock is Inactive.
+            // It effectively treats the uninitialized state as "Full and Inactive".
+            // The actual state is set to "All Free" in `init()` when acquired from Buddy.
+            free_mask: AtomicU64::new(0),
+            is_active: AtomicBool::new(false),
+        }
+    }
+
+    #[cfg(feature = "loom")]
+    pub(crate) fn new() -> Self {
         Self {
             // Initialize to 0 (All Used).
             // This is "safe" because the superblock is Inactive.

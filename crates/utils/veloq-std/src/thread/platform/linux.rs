@@ -377,10 +377,8 @@ impl PlatformImpl for Platform {
 
     fn available_parallelism() -> Result<NonZeroUsize, Self::Error> {
         let val = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
-        if val > 0 {
-            if let Some(n) = NonZeroUsize::new(val as usize) {
-                return Ok(n);
-            }
+        if let Some(n) = NonZeroUsize::new(val as usize) {
+            return Ok(n);
         }
         Ok(NonZeroUsize::new(1).unwrap())
     }
