@@ -1396,6 +1396,9 @@ dependencies = [
 [[package]]
 name = "veloq-bitset"
 version = "0.1.0"
+dependencies = [
+ "veloq-std",
+]
 
 [[package]]
 name = "veloq-blocking"

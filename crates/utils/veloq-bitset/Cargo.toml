@@ -12,6 +12,7 @@ categories.workspace = true
 readme.workspace = true
 
 [dependencies]
+veloq-std.workspace = true
 
 [lints]
 workspace = true

@@ -1,7 +1,5 @@
 #![no_std]
-use core::fmt;
-
-extern crate alloc;
+use veloq_std::{boxed::Box, error::Error, fmt, vec};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BitSetError {
@@ -18,11 +16,11 @@ impl fmt::Display for BitSetError {
     }
 }
 
-impl core::error::Error for BitSetError {}
+impl Error for BitSetError {}
 
 #[derive(Debug, Clone)]
 pub struct BitSet {
-    bits: alloc::vec::Vec<u64>,
+    bits: Box<[u8]>,
     size: usize,
 }
 
@@ -30,9 +28,9 @@ impl BitSet {
     /// Creates a new BitSet with enough capacity to hold `size` bits.
     /// All bits are initially 0 (false).
     pub fn new(capacity: usize) -> Self {
-        let num_u64 = capacity.div_ceil(64);
+        let num_u8 = capacity.div_ceil(8);
         Self {
-            bits: alloc::vec![0; num_u64],
+            bits: vec![0; num_u8].into_boxed_slice(),
             size: capacity,
         }
     }
@@ -47,9 +45,9 @@ impl BitSet {
                 size: self.size,
             });
         }
-        let word_idx = index / 64;
-        let bit_idx = index % 64;
-        self.bits[word_idx] |= 1 << bit_idx;
+        let byte_idx = index / 8;
+        let bit_idx = index % 8;
+        self.bits[byte_idx] |= 1 << bit_idx;
         Ok(())
     }
 
@@ -63,9 +61,9 @@ impl BitSet {
                 size: self.size,
             });
         }
-        let word_idx = index / 64;
-        let bit_idx = index % 64;
-        self.bits[word_idx] &= !(1 << bit_idx);
+        let byte_idx = index / 8;
+        let bit_idx = index % 8;
+        self.bits[byte_idx] &= !(1 << bit_idx);
         Ok(())
     }
 
@@ -79,9 +77,9 @@ impl BitSet {
                 size: self.size,
             });
         }
-        let word_idx = index / 64;
-        let bit_idx = index % 64;
-        Ok((self.bits[word_idx] & (1 << bit_idx)) != 0)
+        let byte_idx = index / 8;
+        let bit_idx = index % 8;
+        Ok((self.bits[byte_idx] & (1 << bit_idx)) != 0)
     }
 
     /// Returns the capacity (number of bits) of the BitSet.

@@ -1,10 +1,12 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![deny(warnings)]
 
-extern crate alloc;
+#[doc(hidden)]
+pub extern crate alloc;
 
 pub mod cell;
 pub mod collections;
+pub mod macros;
 pub mod sync;
 pub mod sys;
 pub mod thread;
