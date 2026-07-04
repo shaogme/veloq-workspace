@@ -1,10 +1,10 @@
 use veloq_std::{
-    alloc::rc::Rc,
     boxed::Box,
     cell::{Cell, RefCell, RefMut},
     marker::PhantomData,
     mem::take,
     ptr::{NonNull, null_mut},
+    rc::Rc,
     sync::{Arc, atomic::Ordering},
     task::Waker,
     vec::Vec,

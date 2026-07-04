@@ -92,7 +92,7 @@ impl fmt::Debug for Instant {
 
 #[cfg(test)]
 mod tests {
-    use alloc::format;
+    use alloc_crate::format;
 
     use super::*;
     use crate::thread;

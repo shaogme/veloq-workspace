@@ -2,7 +2,7 @@
 #![deny(warnings)]
 
 #[doc(hidden)]
-pub extern crate alloc;
+pub extern crate alloc as alloc_crate;
 
 pub mod cell;
 pub mod collections;
@@ -11,6 +11,14 @@ pub mod sync;
 pub mod sys;
 pub mod thread;
 pub mod time;
+
+pub mod alloc {
+    pub use alloc_crate::alloc::*;
+}
+
+pub mod array {
+    pub use core::array::*;
+}
 
 pub mod any {
     pub use core::any::*;
@@ -55,6 +63,14 @@ pub mod ops {
     pub use core::ops::*;
 }
 
+pub mod rc {
+    pub use alloc_crate::rc::*;
+}
+
+pub mod pin {
+    pub use core::pin::*;
+}
+
 pub mod hash {
     pub use core::hash::*;
 }
@@ -63,24 +79,28 @@ pub mod mem {
     pub use core::mem::*;
 }
 
+pub mod num {
+    pub use core::num::*;
+}
+
 pub mod boxed {
-    pub use alloc::boxed::*;
+    pub use alloc_crate::boxed::*;
 }
 
 pub mod vec {
-    pub use alloc::vec::*;
+    pub use alloc_crate::vec::*;
 }
 
 pub mod slice {
-    pub use alloc::slice::*;
+    pub use alloc_crate::slice::*;
 }
 
 pub mod str {
-    pub use alloc::str::*;
+    pub use alloc_crate::str::*;
 }
 
 pub mod string {
-    pub use alloc::string::*;
+    pub use alloc_crate::string::*;
 }
 
 pub mod panic {

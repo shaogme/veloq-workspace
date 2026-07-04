@@ -1,3 +1,5 @@
+use core::num::NonZeroUsize;
+
 use super::{SafeUnsafeCell, Sentinel, ThreadResultReceiver, ThreadSharedState};
 use crate::{
     boxed::Box,
@@ -12,14 +14,17 @@ use crate::{
         atomic::{AtomicU8, Ordering},
     },
     thread::{
-        AbortedError, ThreadErrorKind,
+        AbortedError, ThreadErrorKind, ThreadId,
         traits::{PlatformImpl, RawJoinHandleTrait, RawThreadErrorTrait},
     },
     time::Duration,
 };
 use windows_sys::Win32::{
     Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_OBJECT_0},
-    System::Threading::{CreateThread, INFINITE, Sleep, SwitchToThread, WaitForSingleObject},
+    System::Threading::{
+        ALL_PROCESSOR_GROUPS, CreateThread, GetActiveProcessorCount, GetCurrentThreadId, INFINITE,
+        Sleep, SwitchToThread, WaitForSingleObject,
+    },
 };
 
 #[cfg(feature = "loom")]
@@ -356,6 +361,21 @@ impl PlatformImpl for Platform {
         }
 
         Ok(())
+    }
+
+    fn current_id() -> ThreadId {
+        let id = unsafe { GetCurrentThreadId() };
+        ThreadId(id as u64)
+    }
+
+    fn available_parallelism() -> Result<NonZeroUsize, Self::Error> {
+        let count = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) };
+        if count > 0 {
+            if let Some(n) = NonZeroUsize::new(count as usize) {
+                return Ok(n);
+            }
+        }
+        Ok(NonZeroUsize::new(1).unwrap())
     }
 }
 

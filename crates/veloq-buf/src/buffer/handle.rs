@@ -1,6 +1,6 @@
 //! Core Buffer handle and views.
 
-use std::{
+use veloq_std::{
     mem::{align_of, size_of},
     num::NonZeroUsize,
     ops::Range,

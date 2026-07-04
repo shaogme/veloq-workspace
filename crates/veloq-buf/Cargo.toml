@@ -12,7 +12,8 @@ categories.workspace = true
 readme.workspace = true
 
 [dependencies]
-veloq-bitset.workspace = true
+veloq-std.workspace = true
+veloq-tls.workspace = true
 veloq-intrusive-linklist.workspace = true
 crossbeam-utils.workspace = true
 parking_lot.workspace = true

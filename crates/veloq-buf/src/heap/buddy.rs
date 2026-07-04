@@ -1,7 +1,8 @@
 use crate::heap::units::{SLOT_SIZE, SlotIndex};
-use std::{array::from_fn, fmt, mem::ManuallyDrop, pin::Pin, ptr::NonNull};
-use veloq_bitset::BitSet;
 use veloq_intrusive_linklist::{Adapter, Link, LinkedList};
+use veloq_std::{
+    array::from_fn, collections::BitSet, fmt, mem::ManuallyDrop, pin::Pin, ptr::NonNull,
+};
 
 /// Buddy System Constants
 pub const MIN_ORDER: usize = 0; // 4KB
@@ -335,7 +336,7 @@ impl Drop for BuddyAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::alloc::{Layout, alloc, dealloc};
+    use veloq_std::alloc::{Layout, alloc, dealloc};
 
     struct TestMemory {
         ptr: NonNull<u8>,

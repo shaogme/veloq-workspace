@@ -81,9 +81,9 @@ pub use loom_impl::*;
 
 #[cfg(test)]
 mod tests {
+    use crate::sync::Arc;
     use crate::sync::rwlock::RwLock;
     use crate::thread;
-    use alloc::sync::Arc;
     use core::time::Duration;
 
     #[test]
@@ -106,7 +106,7 @@ mod tests {
     fn test_rwlock_threads() {
         let lock = Arc::new(RwLock::new(0));
         let num_threads = 4;
-        let mut handles = alloc::vec::Vec::new();
+        let mut handles = crate::vec::Vec::new();
 
         for _ in 0..num_threads {
             let l = lock.clone();

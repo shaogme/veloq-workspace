@@ -1,14 +1,15 @@
 //! Core units and configuration for the heap allocator.
 
-use std::{
+use veloq_std::{
     fmt,
     num::NonZeroUsize,
+    nz,
     ptr::NonNull,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 /// 2MB minimum memory per thread (Huge Page aligned)
-pub(crate) const MIN_THREAD_MEMORY: NonZeroUsize = crate::nz!(2 * 1024 * 1024);
+pub(crate) const MIN_THREAD_MEMORY: NonZeroUsize = nz!(2 * 1024 * 1024);
 
 /// Multiplier for thread memory scaling.
 /// Each unit represents `MIN_THREAD_MEMORY` (2MB).

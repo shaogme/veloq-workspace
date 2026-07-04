@@ -59,9 +59,10 @@ pub use slot_pool::*;
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
-    use std::num::NonZeroUsize;
     use std::panic::{AssertUnwindSafe, catch_unwind};
+    use veloq_std::num::NonZeroUsize;
 
     #[test]
     fn heap_view_preserves_borrow_semantics() {

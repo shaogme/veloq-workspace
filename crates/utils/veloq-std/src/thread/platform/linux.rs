@@ -1,3 +1,5 @@
+use core::num::NonZeroUsize;
+
 use super::{SafeUnsafeCell, Sentinel, ThreadResultReceiver, ThreadSharedState};
 use crate::{
     boxed::Box,
@@ -13,7 +15,7 @@ use crate::{
         atomic::{AtomicU8, Ordering},
     },
     thread::{
-        AbortedError, ThreadErrorKind,
+        AbortedError, ThreadErrorKind, ThreadId,
         traits::{PlatformImpl, RawJoinHandleTrait, RawThreadErrorTrait},
     },
     time::Duration,
@@ -366,6 +368,21 @@ impl PlatformImpl for Platform {
         }
 
         Ok(())
+    }
+
+    fn current_id() -> ThreadId {
+        let id = unsafe { libc::pthread_self() };
+        ThreadId(id as u64)
+    }
+
+    fn available_parallelism() -> Result<NonZeroUsize, Self::Error> {
+        let val = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+        if val > 0 {
+            if let Some(n) = NonZeroUsize::new(val as usize) {
+                return Ok(n);
+            }
+        }
+        Ok(NonZeroUsize::new(1).unwrap())
     }
 }
 

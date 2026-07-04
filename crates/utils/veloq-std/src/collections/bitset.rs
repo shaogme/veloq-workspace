@@ -1,5 +1,4 @@
-#![no_std]
-use veloq_std::{boxed::Box, error::Error, fmt, vec};
+use crate::{boxed::Box, error::Error, fmt, vec};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BitSetError {

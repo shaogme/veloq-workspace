@@ -4,8 +4,11 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use veloq::runtime::{Runtime, context::Ctx, scope};
-use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
+use veloq::{
+    nz,
+    runtime::{Runtime, context::Ctx, scope},
+};
+use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier};
 use veloq_runtime::task::yield_now;
 use veloq_sync::mpmc;
 

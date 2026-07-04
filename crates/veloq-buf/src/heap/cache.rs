@@ -4,7 +4,7 @@ use super::{
     pool::Chunk,
     units::{ChunkId, SlotIndex, SuperblockIndex, SuperblockState},
 };
-use std::{
+use veloq_std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     ptr::{self, NonNull},
@@ -153,9 +153,20 @@ impl LocalCache {
     }
 }
 
-thread_local! {
-    pub(crate) static TLS_CACHE: LocalCache = LocalCache {
+pub(crate) struct TlsCacheWrapper;
+
+impl TlsCacheWrapper {
+    #[inline(always)]
+    pub(crate) fn with<R>(&self, f: impl FnOnce(&LocalCache) -> R) -> R {
+        TLS_CACHE_INNER.with_or_init(f, TLS_CACHE_INNER::init)
+    }
+}
+
+veloq_tls::veloq_tls! {
+    static TLS_CACHE_INNER: LocalCache = LocalCache {
         hot: HotSegment::new(),
-        others: RefCell::new(HashMap::new()),
+        others: RefCell::new(HashMap::default()),
     };
 }
+
+pub(crate) static TLS_CACHE: TlsCacheWrapper = TlsCacheWrapper;

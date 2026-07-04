@@ -15,14 +15,18 @@ use crate::{
 use crossbeam_utils::CachePadded;
 use diagweave::prelude::*;
 use parking_lot::{Mutex, RwLock};
-use std::{
+use veloq_std::{
+    boxed::Box,
     collections::hash_map::DefaultHasher,
     fmt::{Debug, Formatter, Result as FmtResult},
     hash::{Hash, Hasher},
     num::NonZeroUsize,
     ptr::NonNull,
+    string::ToString,
     sync::Arc,
     thread::{available_parallelism, current},
+    vec,
+    vec::Vec,
 };
 
 /// Underlying physical memory block (RAII Wrapper).

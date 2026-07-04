@@ -23,7 +23,7 @@ pub use rwlock::const_rwlock;
 pub use rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[cfg(not(feature = "loom"))]
-pub use alloc::sync::Arc;
+pub use alloc_crate::sync::Arc;
 
 #[cfg(feature = "loom")]
 pub use loom::sync::Arc;

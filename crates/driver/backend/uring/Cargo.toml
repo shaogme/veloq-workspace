@@ -20,7 +20,7 @@ test-hooks = ["veloq-driver-core/test-hooks"]
 veloq-driver-core.workspace = true
 veloq-buf.workspace = true
 veloq-wheel.workspace = true
-veloq-bitset.workspace = true
+veloq-std.workspace = true
 
 crossbeam-queue.workspace = true
 tracing.workspace = true

@@ -11,10 +11,11 @@ use std::{
 use veloq::{
     io::{AsyncBufRead, AsyncBufWrite},
     net::{TcpListener, TcpStream},
+    nz,
     runtime::{Runtime, context::Ctx, scope},
     sync::mpsc,
 };
-use veloq_buf::{FixedBuf, UniformSlot, heap::ThreadMemoryMultiplier, nz};
+use veloq_buf::{FixedBuf, UniformSlot, heap::ThreadMemoryMultiplier};
 use veloq_runtime::{select, task::yield_now};
 
 fn run_test<F, R>(f: F) -> R

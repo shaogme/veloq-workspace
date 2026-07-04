@@ -1,6 +1,6 @@
 use std::num::NonZeroUsize;
 
-use veloq_buf::nz;
+use veloq_std::nz;
 
 pub use veloq_blocking::BlockingPoolConfig;
 pub use veloq_driver_native::config::{BufferRegistrationMode, IocpConfig, UringConfig};

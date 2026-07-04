@@ -2,9 +2,10 @@ use std::ops::AsyncFnOnce;
 
 use veloq::{
     local::spsc,
+    nz,
     runtime::{Runtime, context::Ctx, scope_local},
 };
-use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
+use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier};
 use veloq_runtime::task::yield_now;
 
 fn run_test<F, R>(f: F) -> R

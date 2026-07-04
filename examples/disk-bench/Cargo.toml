@@ -15,7 +15,6 @@ readme.workspace = true
 clap.workspace = true
 rand = "0.10"
 veloq.workspace = true
-veloq-buf.workspace = true
 
 [lints]
 workspace = true

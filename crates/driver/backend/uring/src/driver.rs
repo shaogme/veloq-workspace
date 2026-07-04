@@ -11,8 +11,8 @@ use std::{
     time::Instant,
 };
 use tracing::{debug, trace};
-use veloq_bitset::BitSet;
 use veloq_buf::{BufferRegistrar, heap::ChunkId};
+use veloq_std::collections::BitSet;
 use veloq_wheel::{Wheel, WheelConfig};
 
 use crate::{

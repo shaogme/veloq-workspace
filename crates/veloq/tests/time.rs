@@ -5,10 +5,11 @@ use std::{
 };
 
 use veloq::{
+    nz,
     runtime::{Runtime, context::Ctx, scope, scope_local},
     time::{MissedTickBehavior, interval, sleep, sleep_local, sleep_until, timeout, timeout_at},
 };
-use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
+use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier};
 use veloq_runtime::select;
 
 fn run_test<F, R>(worker_threads: NonZeroUsize, f: F) -> R
