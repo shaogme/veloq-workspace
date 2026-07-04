@@ -1,15 +1,24 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
-use std::collections::VecDeque;
-use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
-use std::rc::Rc;
-use std::time::{Duration, Instant};
-use veloq::runtime::context::Ctx;
-
-use veloq::fs::{BufferingMode, File};
-use veloq::runtime::{Runtime, scope, scope_local};
-use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
+use std::{
+    cmp::min,
+    collections::VecDeque,
+    env,
+    fs::remove_file,
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+    process::id,
+    rc::Rc,
+    time::{Duration, Instant},
+};
+use veloq::{
+    buf::{UniformSlot, heap::ThreadMemoryMultiplier},
+    error,
+    fs::{BufferingMode, File},
+    nz,
+    runtime::{Runtime, context::Ctx, scope, scope_local},
+};
+use veloq_buf::FixedBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BenchSyncMode {
@@ -32,7 +41,7 @@ impl CleanupGuard {
     fn new(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         if path.exists() {
-            let _ = std::fs::remove_file(&path);
+            let _ = remove_file(&path);
         }
         Self(path)
     }
@@ -41,13 +50,13 @@ impl CleanupGuard {
 impl Drop for CleanupGuard {
     fn drop(&mut self) {
         if self.0.exists() {
-            let _ = std::fs::remove_file(&self.0);
+            let _ = remove_file(&self.0);
         }
     }
 }
 
 fn bench_buffering_mode() -> BufferingMode {
-    let raw = std::env::var("VELOQ_BENCH_BUFFERING").unwrap_or_else(|_| "directsync".to_string());
+    let raw = env::var("VELOQ_BENCH_BUFFERING").unwrap_or_else(|_| "directsync".to_string());
     match raw.to_ascii_lowercase().as_str() {
         "buffered" => BufferingMode::Buffered,
         "direct" => BufferingMode::Direct,
@@ -57,7 +66,7 @@ fn bench_buffering_mode() -> BufferingMode {
 }
 
 fn bench_sync_mode() -> BenchSyncMode {
-    let raw = std::env::var("VELOQ_BENCH_SYNC").unwrap_or_else(|_| "sync_range".to_string());
+    let raw = env::var("VELOQ_BENCH_SYNC").unwrap_or_else(|_| "sync_range".to_string());
     match raw.to_ascii_lowercase().as_str() {
         "none" => BenchSyncMode::None,
         "sync_range" => BenchSyncMode::SyncRange,
@@ -68,7 +77,7 @@ fn bench_sync_mode() -> BenchSyncMode {
 }
 
 fn bench_phase() -> BenchPhase {
-    let raw = std::env::var("VELOQ_BENCH_PHASE").unwrap_or_else(|_| "total".to_string());
+    let raw = env::var("VELOQ_BENCH_PHASE").unwrap_or_else(|_| "total".to_string());
     match raw.to_ascii_lowercase().as_str() {
         "total" => BenchPhase::Total,
         "write" => BenchPhase::Write,
@@ -78,15 +87,14 @@ fn bench_phase() -> BenchPhase {
 }
 
 fn bench_case_name() -> String {
-    let buffering =
-        std::env::var("VELOQ_BENCH_BUFFERING").unwrap_or_else(|_| "directsync".to_string());
-    let sync = std::env::var("VELOQ_BENCH_SYNC").unwrap_or_else(|_| "sync_range".to_string());
-    let phase = std::env::var("VELOQ_BENCH_PHASE").unwrap_or_else(|_| "total".to_string());
+    let buffering = env::var("VELOQ_BENCH_BUFFERING").unwrap_or_else(|_| "directsync".to_string());
+    let sync = env::var("VELOQ_BENCH_SYNC").unwrap_or_else(|_| "sync_range".to_string());
+    let phase = env::var("VELOQ_BENCH_PHASE").unwrap_or_else(|_| "total".to_string());
     format!("{buffering}_{sync}_{phase}")
 }
 
 fn bench_base_dir() -> PathBuf {
-    std::env::var("VELOQ_BENCH_DIR")
+    env::var("VELOQ_BENCH_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
 }
@@ -151,7 +159,7 @@ async fn run_1gb_iteration<'rt, 'reg>(
     const CHUNK_SIZE: NonZeroUsize = nz!(4 * 1024 * 1024);
 
     let base_dir = bench_base_dir();
-    let file_path = bench_file_path(&base_dir, format!("bench_1gb_{}.tmp", std::process::id()));
+    let file_path = bench_file_path(&base_dir, format!("bench_1gb_{}.tmp", id()));
     let _guard = CleanupGuard::new(&file_path);
 
     let total_start = matches!(phase, BenchPhase::Total).then(Instant::now);
@@ -172,7 +180,7 @@ async fn run_1gb_iteration<'rt, 'reg>(
                 && let Some(buf) = ctx.try_alloc_from_pool(CHUNK_SIZE)
             {
                 let remaining = TOTAL_SIZE - offset;
-                let write_len = std::cmp::min(remaining, CHUNK_SIZE.get() as u64) as usize;
+                let write_len = min(remaining, CHUNK_SIZE.get() as u64) as usize;
                 let file = file.clone();
                 let current_offset = offset;
 
@@ -227,9 +235,8 @@ async fn run_worker_iteration<'rt, 'reg>(
     let mut offsets = vec![0u64; files.len()];
     let mut current_local_idx = 0usize;
     let mut in_flight = 0usize;
-    let mut tasks: FuturesUnordered<
-        BoxFuture<'_, veloq::error::Result<(usize, veloq_buf::FixedBuf)>>,
-    > = FuturesUnordered::new();
+    let mut tasks: FuturesUnordered<BoxFuture<'_, error::Result<(usize, FixedBuf)>>> =
+        FuturesUnordered::new();
     let mut written_bytes = 0u64;
 
     loop {
@@ -254,7 +261,7 @@ async fn run_worker_iteration<'rt, 'reg>(
             };
 
             let remaining = file_size - offsets[idx];
-            let write_len = std::cmp::min(remaining, chunk_size.get() as u64) as usize;
+            let write_len = min(remaining, chunk_size.get() as u64) as usize;
             let file = &files[idx];
             let current_offset = offsets[idx];
 
@@ -417,7 +424,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                     .scope(async |ctx| {
                         let start = Instant::now();
                         let base_dir = bench_base_dir();
-                        let pid = std::process::id();
+                        let pid = id();
 
                         scope!(ctx, async |s| {
                             let mut prepare_handles = Vec::with_capacity(WORKER_COUNT.get());
@@ -437,7 +444,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                                         let mut files = Vec::with_capacity(FILES_PER_WORKER);
                                         for path in &prepare_path_names {
                                             if path.exists() {
-                                                let _ = std::fs::remove_file(path);
+                                                let _ = remove_file(path);
                                             }
 
                                             let file = open_and_fallocate(
@@ -460,7 +467,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                                         .await;
 
                                         for path in prepare_path_names {
-                                            let _ = std::fs::remove_file(path);
+                                            let _ = remove_file(path);
                                         }
 
                                         Ok::<u64, std::io::Error>(bytes)

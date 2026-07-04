@@ -1,13 +1,19 @@
-use std::io;
-use std::num::NonZeroUsize;
-use std::ptr;
-use std::ptr::NonNull;
-use windows_sys::Win32::System::Memory::{
-    MEM_COMMIT, MEM_LARGE_PAGES, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
-    VirtualFree,
+use veloq_std::{
+    num::NonZeroUsize,
+    ptr::{self, NonNull},
 };
 
-pub unsafe fn alloc_huge_pages(size: NonZeroUsize) -> io::Result<*mut u8> {
+use windows_sys::Win32::{
+    Foundation::GetLastError,
+    System::Memory::{
+        MEM_COMMIT, MEM_LARGE_PAGES, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        VirtualFree,
+    },
+};
+
+use crate::buffer::SystemError;
+
+pub unsafe fn alloc_huge_pages(size: NonZeroUsize) -> Result<*mut u8, SystemError> {
     // Windows requires the SeLockMemoryPrivilege for MEM_LARGE_PAGES to work.
     let ptr = unsafe {
         VirtualAlloc(
@@ -19,13 +25,14 @@ pub unsafe fn alloc_huge_pages(size: NonZeroUsize) -> io::Result<*mut u8> {
     };
 
     if ptr.is_null() {
-        Err(io::Error::last_os_error())
+        let err = unsafe { GetLastError() };
+        Err(SystemError::Os(err as i32))
     } else {
         Ok(ptr as *mut u8)
     }
 }
 
-pub unsafe fn alloc_pages(size: NonZeroUsize) -> io::Result<*mut u8> {
+pub unsafe fn alloc_pages(size: NonZeroUsize) -> Result<*mut u8, SystemError> {
     let ptr = unsafe {
         VirtualAlloc(
             ptr::null_mut(),
@@ -36,7 +43,8 @@ pub unsafe fn alloc_pages(size: NonZeroUsize) -> io::Result<*mut u8> {
     };
 
     if ptr.is_null() {
-        Err(io::Error::last_os_error())
+        let err = unsafe { GetLastError() };
+        Err(SystemError::Os(err as i32))
     } else {
         Ok(ptr as *mut u8)
     }

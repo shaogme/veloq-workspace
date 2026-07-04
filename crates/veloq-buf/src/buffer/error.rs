@@ -1,15 +1,24 @@
 use diagweave::set;
+use veloq_std::string::String;
 
 set! {
+    pub SystemError = {
+        #[display("OS error {0}")]
+        Os(i32),
+    }
+
     pub BufError = {
         #[display("Layout error: {0}")]
-        Layout(#[from] std::alloc::LayoutError),
+        Layout(#[from] veloq_std::alloc::LayoutError),
 
         #[display("Out of memory")]
         Oom,
 
-        #[display("IO error: {0}")]
-        Io(#[from] std::io::Error),
+        #[display("System error: {0}")]
+        System(#[from] SystemError),
+
+        #[display("Other error: {0}")]
+        Other(String),
 
         #[display("Allocation failed: {0}")]
         AllocFailed(String),

@@ -13,7 +13,6 @@ members = [
     "crates/utils/veloq-shim",
     "crates/utils/veloq-atomic-waker", 
     "crates/utils/veloq-intrusive-linklist", 
-    "crates/utils/veloq-bitset",
     "crates/utils/veloq-wheel", 
     "crates/utils/veloq-blocking",
     "crates/utils/veloq-pod", 
@@ -35,7 +34,6 @@ default-members = [
     "crates/utils/veloq-shim",
     "crates/utils/veloq-atomic-waker",
     "crates/utils/veloq-intrusive-linklist",
-    "crates/utils/veloq-bitset",
     "crates/utils/veloq-wheel",
     "crates/utils/veloq-blocking",
     "crates/utils/veloq-pod",
@@ -76,7 +74,6 @@ veloq-driver-native = { path = "crates/driver/native", version = "0.1.0" }
 veloq-shim = { path = "crates/utils/veloq-shim", version = "0.1.0" }
 veloq-atomic-waker = { path = "crates/utils/veloq-atomic-waker", version = "0.1.0" }
 veloq-intrusive-linklist = { path = "crates/utils/veloq-intrusive-linklist", version = "0.1.0" }
-veloq-bitset = { path = "crates/utils/veloq-bitset", version = "0.1.0" }
 veloq-wheel = { path = "crates/utils/veloq-wheel", version = "0.1.0" }
 veloq-blocking = { path = "crates/utils/veloq-blocking", version = "0.1.0" }
 veloq-pod = { path = "crates/utils/veloq-pod", version = "0.1.0" }
@@ -112,7 +109,7 @@ loom = "0.7.2"
 criterion = { version = "0.8", features = ["async_tokio"] }
 
 tokio = { version = "1", features = ["full"] }
-slotmap = "1.1.1"
+slotmap = { version = "1.1.1", default-features = false }
 
 rustc-hash = "2.1.1"
 

@@ -1,8 +1,9 @@
-use crate::{cell, fmt, marker, mem, sync};
-
-use core::{
+use crate::{
+    cell,
     convert::Infallible,
+    fmt, marker, mem,
     panic::{RefUnwindSafe, UnwindSafe},
+    sync,
 };
 
 use cell::UnsafeCell;
@@ -19,7 +20,19 @@ pub struct OnceLock<T> {
 impl<T> OnceLock<T> {
     #[inline]
     #[must_use]
+    #[cfg(not(feature = "loom"))]
     pub const fn new() -> OnceLock<T> {
+        OnceLock {
+            once: Once::new(),
+            value: UnsafeCell::new(MaybeUninit::uninit()),
+            _marker: PhantomData,
+        }
+    }
+
+    #[inline]
+    #[must_use]
+    #[cfg(feature = "loom")]
+    pub fn new() -> OnceLock<T> {
         OnceLock {
             once: Once::new(),
             value: UnsafeCell::new(MaybeUninit::uninit()),

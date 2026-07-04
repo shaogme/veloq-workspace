@@ -1,8 +1,8 @@
-use std::{cell::RefCell, io, num::NonZeroUsize, ptr::NonNull, sync::mpsc};
+use std::{cell::RefCell, num::NonZeroUsize, ptr::NonNull, sync::mpsc};
 
 use diagweave::prelude::*;
 use veloq_buf::{
-    AnyBufPool, BufPool, BufResult, BufferRegion, BufferRegistrar, FixedBuf,
+    AnyBufPool, BufError, BufPool, BufResult, BufferRegion, BufferRegistrar, FixedBuf,
     heap::{ChunkId, ChunkInfo},
 };
 use veloq_driver_native::{
@@ -160,8 +160,7 @@ fn register_internal(
             let chunk_id = region.id();
             driver
                 .register_chunk(chunk_id, region.as_ptr(), region.len())
-                .map_err(|err| io::Error::other(format!("{err:#}")))
-                .trans()?;
+                .map_err(|err| BufError::Other(format!("{err:#}")))?;
 
             new_chunks.push(ChunkInfo {
                 id: chunk_id,

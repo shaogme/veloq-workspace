@@ -1,18 +1,18 @@
-use std::{
+use veloq_std::{
+    boxed::Box,
     marker::PhantomData,
+    mem::take,
     ptr::{NonNull, null_mut},
     sync::{
-        Arc,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicPtr, AtomicUsize, Ordering},
     },
     task::Waker,
+    vec::Vec,
 };
 
-use crossbeam_epoch::{Guard, pin};
-use parking_lot::{Mutex, MutexGuard};
-
 use crate::{
-    StateGuard, StateLock, StateOptionArc, StateOptionBox, StateWakerQueue, Storage, StrategyType,
+    StateLock, StateOptionArc, StateOptionBox, StateWakerQueue, Storage, StrategyType,
     ThreadSafeStorage, sealed,
 };
 
@@ -31,11 +31,6 @@ impl Storage for AtomicStorage {
     type WakerQueue = AtomicWakerQueue;
     type OptionBox<T: ?Sized + Send> = AtomicOptionBox<T>;
     type OptionArc<T: ?Sized + Send + Sync> = AtomicOptionArc<T>;
-    type Guard = AtomicGuard;
-
-    fn pin() -> Self::Guard {
-        AtomicGuard(pin())
-    }
 }
 
 pub struct AtomicLock<T>(Mutex<T>);
@@ -68,7 +63,7 @@ impl StateWakerQueue for AtomicWakerQueue {
     }
 
     fn take_all(&self) -> Vec<Waker> {
-        std::mem::take(&mut *self.0.lock())
+        take(&mut *self.0.lock())
     }
 }
 unsafe impl Send for AtomicWakerQueue {}
@@ -86,17 +81,6 @@ impl_state_int!(
     compare_exchange(c, n, s, f) { self.compare_exchange(c, n, s, f) },
     compare_exchange_weak(c, n, s, f) { self.compare_exchange_weak(c, n, s, f) }
 );
-
-pub struct AtomicGuard(Guard);
-
-impl StateGuard for AtomicGuard {
-    unsafe fn defer<F>(&self, f: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        self.0.defer(f);
-    }
-}
 
 // ==================== Pointer Helpers & Strategies ====================
 
@@ -237,7 +221,7 @@ impl<T, S: PointerStrategy<T>> GenericAtomicOption<T, S> {
         };
         Self {
             inner: AtomicPtr::new(ptr),
-            marker: std::marker::PhantomData,
+            marker: PhantomData,
         }
     }
 

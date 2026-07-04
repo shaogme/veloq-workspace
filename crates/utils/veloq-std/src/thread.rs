@@ -14,6 +14,7 @@ pub use scope::{
 use crate::{
     error::Error,
     fmt::{self, Formatter, Result as FmtResult},
+    num::NonZeroUsize,
     time::Duration,
 };
 
@@ -88,7 +89,7 @@ pub struct JoinHandle<'a, T> {
 unsafe impl<T: Send> Send for JoinHandle<'_, T> {}
 unsafe impl<T: Send> Sync for JoinHandle<'_, T> {}
 
-impl<'a, T> JoinHandle<'a, T> {
+impl<'a, T: Send> JoinHandle<'a, T> {
     /// 等待线程执行结束 (Join)
     pub fn join(self) -> Result<T, ThreadError> {
         self.inner.join().map_err(ThreadError::new)
@@ -124,4 +125,40 @@ pub fn yield_now() -> Result<bool, AbortedError> {
 /// 如果检测到当前线程已被中止，则返回 `Err(AbortedError)`。
 pub fn sleep(dur: Duration) -> Result<(), AbortedError> {
     Platform::sleep(dur)
+}
+
+/// 线程的唯一标识符
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ThreadId(pub(crate) u64);
+
+impl ThreadId {
+    /// 将 ThreadId 转换为 u64
+    pub fn as_u64(&self) -> u64 {
+        self.0
+    }
+}
+
+/// 统一的线程表示结构体
+#[derive(Debug, Clone)]
+pub struct Thread {
+    id: ThreadId,
+}
+
+impl Thread {
+    /// 获取当前线程的唯一标识符
+    pub fn id(&self) -> ThreadId {
+        self.id
+    }
+}
+
+/// 获取当前线程
+pub fn current() -> Thread {
+    Thread {
+        id: Platform::current_id(),
+    }
+}
+
+/// 获取系统的可用并行度 (逻辑 CPU 核心数)
+pub fn available_parallelism() -> Result<NonZeroUsize, ThreadError> {
+    Platform::available_parallelism().map_err(ThreadError::new)
 }

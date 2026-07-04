@@ -1,12 +1,19 @@
-#[cfg(not(feature = "loom"))]
-mod atomic_impl {
+mod core_impl {
     pub use core::sync::atomic::{
         AtomicBool as CoreAtomicBool, AtomicI8 as CoreAtomicI8, AtomicI16 as CoreAtomicI16,
         AtomicI32 as CoreAtomicI32, AtomicI64 as CoreAtomicI64, AtomicIsize as CoreAtomicIsize,
         AtomicPtr as CoreAtomicPtr, AtomicU8 as CoreAtomicU8, AtomicU16 as CoreAtomicU16,
         AtomicU32 as CoreAtomicU32, AtomicU64 as CoreAtomicU64, AtomicUsize as CoreAtomicUsize,
-        Ordering, fence,
+        Ordering,
     };
+}
+
+pub use core_impl::*;
+
+#[cfg(not(feature = "loom"))]
+mod atomic_impl {
+    use super::core_impl::*;
+
     macro_rules! impl_atomic {
         ($name:ident, $inner:ty, $std_name:ident) => {
             #[derive(Debug, Default)]

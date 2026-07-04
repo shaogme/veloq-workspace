@@ -12,9 +12,10 @@ use std::{
 use veloq::{
     fs::{File, LocalFile},
     io::{AsyncBufRead, AsyncBufWrite},
+    nz,
     runtime::Runtime,
 };
-use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
+use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier};
 
 static TEMP_FILE_ID: AtomicUsize = AtomicUsize::new(0);
 

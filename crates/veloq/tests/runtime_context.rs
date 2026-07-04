@@ -1,5 +1,5 @@
-use veloq::runtime::Runtime;
-use veloq_buf::{BufPool, UniformSlot, heap::ThreadMemoryMultiplier, nz};
+use veloq::{nz, runtime::Runtime};
+use veloq_buf::{BufPool, UniformSlot, heap::ThreadMemoryMultiplier};
 
 #[test]
 fn runtime_binds_buf_pool_to_current_thread() {

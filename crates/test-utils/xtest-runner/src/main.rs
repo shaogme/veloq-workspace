@@ -172,7 +172,7 @@ fn main() -> ExitCode {
     match run_app(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(report) => {
-            eprintln!("{}", report.pretty());
+            eprintln!("{}", report.compact());
             ExitCode::FAILURE
         }
     }

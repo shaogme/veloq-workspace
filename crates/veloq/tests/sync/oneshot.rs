@@ -1,6 +1,9 @@
 use std::ops::AsyncFnOnce;
-use veloq::runtime::{Runtime, context::Ctx, scope};
-use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
+use veloq::{
+    nz,
+    runtime::{Runtime, context::Ctx, scope},
+};
+use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier};
 use veloq_sync::oneshot;
 
 fn run_test<F, R>(f: F) -> R

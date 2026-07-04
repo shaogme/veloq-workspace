@@ -1,6 +1,7 @@
 //! Type-erased buffer pool.
 
-use std::{
+use veloq_std::{
+    boxed::Box,
     fmt::{Debug, Formatter, Result as FmtResult},
     marker::PhantomData,
     mem,

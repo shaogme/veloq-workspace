@@ -1,9 +1,10 @@
 //! Common traits and types for buffer management.
 
-use std::{
+use veloq_std::{
     fmt::{Debug, Formatter, Result as FmtResult},
     num::{NonZeroU16, NonZeroUsize},
     ptr::NonNull,
+    vec::Vec,
 };
 
 use bilge::prelude::*;

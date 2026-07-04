@@ -1,11 +1,13 @@
 //! Slot-based buffer pool implementation.
 
-use std::{
+use veloq_std::{
+    boxed::Box,
     cell::Cell,
     fmt::{self, Debug, Formatter},
     num::NonZeroUsize,
     ptr::{NonNull, null},
     sync::Arc,
+    vec::Vec,
 };
 
 use super::{
@@ -204,17 +206,14 @@ impl Drop for ThreadLocalPoolCache {
     }
 }
 
-thread_local! {
+veloq_tls::veloq_tls! {
     /// 缓存当前线程使用的全局池引用计数。
-    ///
-    /// 注：在 Windows GNU 平台上，Clippy 会对常量初始化产生误报
-    #[cfg_attr(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"), allow(clippy::missing_const_for_thread_local))]
-    static POOL_CACHE: ThreadLocalPoolCache = const { ThreadLocalPoolCache::new() };
+    static POOL_CACHE: ThreadLocalPoolCache = ThreadLocalPoolCache::new();
 }
 
 #[inline]
 fn with_pool_cache<R>(f: impl FnOnce(&ThreadLocalPoolCache) -> R) -> R {
-    POOL_CACHE.with(f)
+    POOL_CACHE.with_or_init(f, POOL_CACHE::init)
 }
 
 impl BackingPool for SlotBasedPool {

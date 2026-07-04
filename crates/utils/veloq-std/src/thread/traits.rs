@@ -1,10 +1,12 @@
 #[cfg(feature = "std")]
-use crate::{alloc::boxed::Box, any::Any};
+use crate::{any::Any, boxed::Box};
+
+use core::num::NonZeroUsize;
 
 use crate::{
     error::Error,
     thread::{
-        AbortedError, ThreadErrorKind,
+        AbortedError, ThreadErrorKind, ThreadId,
         scope::raw::{RawScope, scope},
     },
     time::Duration,
@@ -72,4 +74,10 @@ pub trait PlatformImpl: Sized {
     ///
     /// 如果检测到当前线程已被中止，则返回 `Err(AbortedError)`。
     fn sleep(dur: Duration) -> Result<(), AbortedError>;
+
+    /// 获取当前线程的 ID
+    fn current_id() -> ThreadId;
+
+    /// 获取当前系统的可用并行度 (逻辑 CPU 核心数)
+    fn available_parallelism() -> Result<NonZeroUsize, Self::Error>;
 }

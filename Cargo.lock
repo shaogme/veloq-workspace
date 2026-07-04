@@ -366,7 +366,6 @@ dependencies = [
  "clap",
  "rand",
  "veloq",
- "veloq-buf",
 ]
 
 [[package]]
@@ -1380,6 +1379,7 @@ dependencies = [
  "veloq-driver-native",
  "veloq-local",
  "veloq-runtime",
+ "veloq-std",
  "veloq-sync",
  "veloq-tls",
  "windows-sys",
@@ -1390,12 +1390,8 @@ name = "veloq-atomic-waker"
 version = "0.1.0"
 dependencies = [
  "loom",
- "veloq-shim",
+ "veloq-std",
 ]
-
-[[package]]
-name = "veloq-bitset"
-version = "0.1.0"
 
 [[package]]
 name = "veloq-blocking"
@@ -1419,8 +1415,9 @@ dependencies = [
  "parking_lot",
  "tempfile",
  "tracing",
- "veloq-bitset",
  "veloq-intrusive-linklist",
+ "veloq-std",
+ "veloq-tls",
  "windows-sys",
 ]
 
@@ -1450,11 +1447,11 @@ dependencies = [
  "rustc-hash",
  "slotmap",
  "tracing",
- "veloq-bitset",
  "veloq-blocking",
  "veloq-buf",
  "veloq-driver-core",
  "veloq-pod",
+ "veloq-std",
  "veloq-storage",
  "veloq-wheel",
  "windows-sys",
@@ -1470,12 +1467,12 @@ dependencies = [
  "libc",
  "tracing",
  "veloq-atomic-waker",
- "veloq-bitset",
  "veloq-blocking",
  "veloq-buf",
  "veloq-driver-core",
  "veloq-driver-iocp",
  "veloq-driver-uring",
+ "veloq-std",
  "veloq-wheel",
  "windows-sys",
 ]
@@ -1489,9 +1486,9 @@ dependencies = [
  "io-uring",
  "libc",
  "tracing",
- "veloq-bitset",
  "veloq-buf",
  "veloq-driver-core",
+ "veloq-std",
  "veloq-wheel",
 ]
 
@@ -1567,8 +1564,7 @@ dependencies = [
 name = "veloq-storage"
 version = "0.1.0"
 dependencies = [
- "crossbeam-epoch",
- "parking_lot",
+ "veloq-std",
 ]
 
 [[package]]

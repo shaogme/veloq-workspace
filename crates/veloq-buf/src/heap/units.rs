@@ -1,14 +1,15 @@
 //! Core units and configuration for the heap allocator.
 
-use std::{
+use veloq_std::{
     fmt,
     num::NonZeroUsize,
+    nz,
     ptr::NonNull,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 /// 2MB minimum memory per thread (Huge Page aligned)
-pub(crate) const MIN_THREAD_MEMORY: NonZeroUsize = crate::nz!(2 * 1024 * 1024);
+pub(crate) const MIN_THREAD_MEMORY: NonZeroUsize = nz!(2 * 1024 * 1024);
 
 /// Multiplier for thread memory scaling.
 /// Each unit represents `MIN_THREAD_MEMORY` (2MB).
@@ -307,7 +308,20 @@ impl Default for SuperblockState {
 }
 
 impl SuperblockState {
+    #[cfg(not(feature = "loom"))]
     pub(crate) const fn new() -> Self {
+        Self {
+            // Initialize to 0 (All Used).
+            // This is "safe" because the superblock is Inactive.
+            // It effectively treats the uninitialized state as "Full and Inactive".
+            // The actual state is set to "All Free" in `init()` when acquired from Buddy.
+            free_mask: AtomicU64::new(0),
+            is_active: AtomicBool::new(false),
+        }
+    }
+
+    #[cfg(feature = "loom")]
+    pub(crate) fn new() -> Self {
         Self {
             // Initialize to 0 (All Used).
             // This is "safe" because the superblock is Inactive.

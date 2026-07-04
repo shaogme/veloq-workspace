@@ -1,14 +1,22 @@
 use clap::{Parser, ValueEnum};
 use rand::prelude::*;
-use std::num::NonZeroUsize;
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
-use veloq::fs::{BufferingMode, File, OpenOptions};
-use veloq::io::buffer::FixedBuf;
-use veloq::runtime::context::Ctx;
-use veloq::runtime::{Runtime, scope};
-use veloq::sync::mpsc;
-use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier, nz};
+use std::{
+    cmp::Ordering,
+    fmt::{self, Display, Formatter},
+    fs::remove_file,
+    io,
+    num::NonZeroUsize,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
+use veloq::{
+    buf::{UniformSlot, heap::ThreadMemoryMultiplier},
+    fs::{BufferingMode, File, OpenOptions},
+    io::buffer::FixedBuf,
+    nz,
+    runtime::{Runtime, context::Ctx, scope},
+    sync::mpsc,
+};
 
 #[derive(Clone, Copy, ValueEnum, Debug)]
 enum WriteMode {
@@ -78,8 +86,8 @@ impl BlockSize {
     }
 }
 
-impl std::fmt::Display for BlockSize {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for BlockSize {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "{}",
@@ -175,7 +183,7 @@ async fn prepare_files_for_thread<'rt, 'reg>(
 ) {
     let path = get_file_path(t_idx);
     if path.exists() {
-        let _ = std::fs::remove_file(&path);
+        let _ = remove_file(&path);
     }
 
     let file = OpenOptions::new()
@@ -200,7 +208,7 @@ fn cleanup_files(threads: usize) {
     for t_idx in 0..threads {
         let path = get_file_path(t_idx);
         if path.exists() {
-            let _ = std::fs::remove_file(&path);
+            let _ = remove_file(&path);
         }
     }
 }
@@ -323,7 +331,7 @@ async fn run_worker<'rt, 'reg>(
     buffering_mode: BufferingMode,
     sync_mode: SyncMode,
     config: ThreadConfig,
-) -> std::io::Result<Vec<IterationResult>> {
+) -> io::Result<Vec<IterationResult>> {
     // 1. Open File (Persistent handle for benchmarking)
     let file = OpenOptions::new()
         .write(true)
@@ -377,7 +385,7 @@ fn filter_outliers(mut data: Vec<f64>) -> Vec<f64> {
     if data.len() < 4 {
         return data;
     }
-    data.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    data.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
     let q1 = data[data.len() / 4];
     let q3 = data[data.len() * 3 / 4];
     let iqr = q3 - q1;

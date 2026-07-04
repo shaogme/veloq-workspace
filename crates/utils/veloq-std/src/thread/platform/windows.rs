@@ -1,5 +1,8 @@
+use core::num::NonZeroUsize;
+
 use super::{SafeUnsafeCell, Sentinel, ThreadResultReceiver, ThreadSharedState};
 use crate::{
+    boxed::Box,
     cell::UnsafeCell,
     error::Error,
     ffi::c_void,
@@ -11,21 +14,27 @@ use crate::{
         atomic::{AtomicU8, Ordering},
     },
     thread::{
-        AbortedError, ThreadErrorKind,
+        AbortedError, ThreadErrorKind, ThreadId,
         traits::{PlatformImpl, RawJoinHandleTrait, RawThreadErrorTrait},
     },
     time::Duration,
 };
 use windows_sys::Win32::{
     Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_OBJECT_0},
-    System::Threading::{CreateThread, INFINITE, Sleep, SwitchToThread, WaitForSingleObject},
+    System::Threading::{
+        ALL_PROCESSOR_GROUPS, CreateThread, GetActiveProcessorCount, GetCurrentThreadId, INFINITE,
+        Sleep, SwitchToThread, WaitForSingleObject,
+    },
 };
+
+#[cfg(feature = "loom")]
+use super::ThreadSharedStateTrait;
 
 #[cfg(feature = "std")]
 use super::SendSyncPanicPayload;
 
 #[cfg(feature = "std")]
-use crate::{any::Any, boxed::Box};
+use crate::any::Any;
 
 #[cfg(feature = "std")]
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -179,8 +188,21 @@ where
     F: FnOnce() -> T + Send + 'a,
     T: Send + 'a,
 {
+    #[cfg(feature = "loom")]
+    type BoxF<'a, T> = Box<dyn FnOnce() -> T + Send + 'a>;
+
+    #[cfg(not(feature = "loom"))]
     let state = Arc::new(ThreadSharedState {
         closure: UnsafeCell::new(Some(f)),
+        status: AtomicU8::new(super::STATE_INCOMPLETE),
+        result: SafeUnsafeCell::new(None),
+        #[cfg(feature = "std")]
+        panic_payload: SafeUnsafeCell::new(None),
+    });
+
+    #[cfg(feature = "loom")]
+    let state = Arc::new(ThreadSharedState {
+        closure: UnsafeCell::new(Some(Box::new(f) as BoxF<'a, T>)),
         status: AtomicU8::new(super::STATE_INCOMPLETE),
         result: SafeUnsafeCell::new(None),
         #[cfg(feature = "std")]
@@ -194,18 +216,19 @@ where
     let param = Arc::into_raw(state) as *mut c_void;
 
     unsafe {
-        let handle = CreateThread(
-            null(),
-            0,
-            Some(thread_entry_win::<F, T>),
-            param,
-            0,
-            null_mut(),
-        );
+        #[cfg(not(feature = "loom"))]
+        let entry = thread_entry_win::<F, T>;
+        #[cfg(feature = "loom")]
+        let entry = thread_entry_win::<BoxF<'a, T>, T>;
+
+        let handle = CreateThread(null(), 0, Some(entry), param, 0, null_mut());
 
         if handle.is_null() {
             let err = GetLastError();
+            #[cfg(not(feature = "loom"))]
             let _ = Arc::from_raw(param as *const ThreadSharedState<F, T>);
+            #[cfg(feature = "loom")]
+            let _ = Arc::from_raw(param as *const ThreadSharedState<BoxF<'a, T>, T>);
             return Err(RawThreadError::CreationFailed(err));
         }
 
@@ -217,7 +240,7 @@ where
     }
 }
 
-impl<'a, T> RawJoinHandle<'a, T> {
+impl<'a, T: Send> RawJoinHandle<'a, T> {
     pub fn join(mut self) -> Result<T, RawThreadError> {
         let handle = self.handle.take().ok_or(RawThreadError::AlreadyJoined)?;
         unsafe {
@@ -338,6 +361,19 @@ impl PlatformImpl for Platform {
         }
 
         Ok(())
+    }
+
+    fn current_id() -> ThreadId {
+        let id = unsafe { GetCurrentThreadId() };
+        ThreadId(id as u64)
+    }
+
+    fn available_parallelism() -> Result<NonZeroUsize, Self::Error> {
+        let count = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) };
+        if let Some(n) = NonZeroUsize::new(count as usize) {
+            return Ok(n);
+        }
+        Ok(NonZeroUsize::new(1).unwrap())
     }
 }
 
