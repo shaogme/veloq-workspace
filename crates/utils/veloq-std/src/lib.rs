@@ -27,6 +27,10 @@ pub mod ptr {
     pub use core::ptr::*;
 }
 
+pub mod task {
+    pub use core::task::*;
+}
+
 pub mod error {
     pub use core::error::*;
 }

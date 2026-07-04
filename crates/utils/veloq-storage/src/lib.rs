@@ -1,3 +1,5 @@
+#![no_std]
+
 #[macro_use]
 mod macros;
 
@@ -15,11 +17,13 @@ pub use local::{
 };
 pub use transfer::StaticTransfer;
 
-use std::{
+use veloq_std::{
+    boxed::Box,
     ops::DerefMut,
     ptr::NonNull,
     sync::{Arc, atomic::Ordering},
     task::Waker,
+    vec::Vec,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

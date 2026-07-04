@@ -1,14 +1,15 @@
-use std::{
+use veloq_std::{
+    boxed::Box,
     marker::PhantomData,
+    mem::take,
     ptr::{NonNull, null_mut},
     sync::{
-        Arc,
+        Arc, Mutex, MutexGuard,
         atomic::{AtomicPtr, AtomicUsize, Ordering},
     },
     task::Waker,
+    vec::Vec,
 };
-
-use parking_lot::{Mutex, MutexGuard};
 
 use crate::{
     StateLock, StateOptionArc, StateOptionBox, StateWakerQueue, Storage, StrategyType,
@@ -62,7 +63,7 @@ impl StateWakerQueue for AtomicWakerQueue {
     }
 
     fn take_all(&self) -> Vec<Waker> {
-        std::mem::take(&mut *self.0.lock())
+        take(&mut *self.0.lock())
     }
 }
 unsafe impl Send for AtomicWakerQueue {}
@@ -220,7 +221,7 @@ impl<T, S: PointerStrategy<T>> GenericAtomicOption<T, S> {
         };
         Self {
             inner: AtomicPtr::new(ptr),
-            marker: std::marker::PhantomData,
+            marker: PhantomData,
         }
     }
 

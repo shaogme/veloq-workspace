@@ -1570,7 +1570,7 @@ dependencies = [
 name = "veloq-storage"
 version = "0.1.0"
 dependencies = [
- "parking_lot",
+ "veloq-std",
 ]
 
 [[package]]

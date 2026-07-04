@@ -12,14 +12,14 @@ macro_rules! impl_state_int {
     ) => {
         impl $crate::StateInt for $ty {
             fn new($new_val: usize) -> Self { $new_expr }
-            fn load(&$self, $order: ::std::sync::atomic::Ordering) -> usize { $load_expr }
-            fn store(&$self, $store_val: usize, $order: ::std::sync::atomic::Ordering) { $store_expr }
-            fn fetch_add(&$self, $add_val: usize, $order: ::std::sync::atomic::Ordering) -> usize { $add_expr }
-            fn fetch_sub(&$self, $sub_val: usize, $order: ::std::sync::atomic::Ordering) -> usize { $sub_expr }
-            fn fetch_and(&$self, $and_val: usize, $order: ::std::sync::atomic::Ordering) -> usize { $and_expr }
-            fn fetch_or(&$self, $or_val: usize, $order: ::std::sync::atomic::Ordering) -> usize { $or_expr }
-            fn compare_exchange(&$self, $ce_curr: usize, $ce_new: usize, $ce_s: ::std::sync::atomic::Ordering, $ce_f: ::std::sync::atomic::Ordering) -> Result<usize, usize> { $ce_expr }
-            fn compare_exchange_weak(&$self, $cew_curr: usize, $cew_new: usize, $cew_s: ::std::sync::atomic::Ordering, $cew_f: ::std::sync::atomic::Ordering) -> Result<usize, usize> { $cew_expr }
+            fn load(&$self, $order: ::veloq_std::sync::atomic::Ordering) -> usize { $load_expr }
+            fn store(&$self, $store_val: usize, $order: ::veloq_std::sync::atomic::Ordering) { $store_expr }
+            fn fetch_add(&$self, $add_val: usize, $order: ::veloq_std::sync::atomic::Ordering) -> usize { $add_expr }
+            fn fetch_sub(&$self, $sub_val: usize, $order: ::veloq_std::sync::atomic::Ordering) -> usize { $sub_expr }
+            fn fetch_and(&$self, $and_val: usize, $order: ::veloq_std::sync::atomic::Ordering) -> usize { $add_expr }
+            fn fetch_or(&$self, $or_val: usize, $order: ::veloq_std::sync::atomic::Ordering) -> usize { $or_expr }
+            fn compare_exchange(&$self, $ce_curr: usize, $ce_new: usize, $ce_s: ::veloq_std::sync::atomic::Ordering, $ce_f: ::veloq_std::sync::atomic::Ordering) -> Result<usize, usize> { $ce_expr }
+            fn compare_exchange_weak(&$self, $cew_curr: usize, $cew_new: usize, $cew_s: ::veloq_std::sync::atomic::Ordering, $cew_f: ::veloq_std::sync::atomic::Ordering) -> Result<usize, usize> { $cew_expr }
         }
     };
 }
@@ -38,11 +38,11 @@ macro_rules! impl_ptr_state_wrapper {
         $( $unsafe_impl )*
         impl<T> $crate::$trait<T> for $name<T> {
             fn new(ptr: $val) -> Self { let $new_ptr = ptr; $new_expr }
-            fn load(&$self, $order: ::std::sync::atomic::Ordering) -> $val { $load_expr }
-            fn store(&$self, ptr: $val, $order: ::std::sync::atomic::Ordering) { let $store_ptr = ptr; $store_expr }
-            fn swap(&$self, ptr: $val, $order: ::std::sync::atomic::Ordering) -> $val { let $swap_ptr = ptr; $swap_expr }
-            fn compare_exchange(&$self, $ce_curr: $val, $ce_new: $val, $ce_s: ::std::sync::atomic::Ordering, $ce_f: ::std::sync::atomic::Ordering) -> Result<$val, $val> { $ce_expr }
-            fn compare_exchange_weak(&$self, $cew_curr: $val, $cew_new: $val, $cew_s: ::std::sync::atomic::Ordering, $cew_f: ::std::sync::atomic::Ordering) -> Result<$val, $val> { $cew_expr }
+            fn load(&$self, $order: ::veloq_std::sync::atomic::Ordering) -> $val { $load_expr }
+            fn store(&$self, ptr: $val, $order: ::veloq_std::sync::atomic::Ordering) { let $store_ptr = ptr; $store_expr }
+            fn swap(&$self, ptr: $val, $order: ::veloq_std::sync::atomic::Ordering) -> $val { let $swap_ptr = ptr; $swap_expr }
+            fn compare_exchange(&$self, $ce_curr: $val, $ce_new: $val, $ce_s: ::veloq_std::sync::atomic::Ordering, $ce_f: ::veloq_std::sync::atomic::Ordering) -> Result<$val, $val> { $ce_expr }
+            fn compare_exchange_weak(&$self, $cew_curr: $val, $cew_new: $val, $cew_s: ::veloq_std::sync::atomic::Ordering, $cew_f: ::veloq_std::sync::atomic::Ordering) -> Result<$val, $val> { $cew_expr }
         }
     };
 }
@@ -50,19 +50,19 @@ macro_rules! impl_ptr_state_wrapper {
 macro_rules! impl_cell_opt_methods {
     ($val:ty) => {
         fn new(opt: Option<$val>) -> Self {
-            Self(::std::cell::Cell::new(opt))
+            Self(::veloq_std::cell::Cell::new(opt))
         }
-        fn take(&self, _order: ::std::sync::atomic::Ordering) -> Option<$val> {
+        fn take(&self, _order: ::veloq_std::sync::atomic::Ordering) -> Option<$val> {
             self.0.take()
         }
-        fn store(&self, val: Option<$val>, _order: ::std::sync::atomic::Ordering) {
+        fn store(&self, val: Option<$val>, _order: ::veloq_std::sync::atomic::Ordering) {
             self.0.set(val);
         }
         fn compare_exchange_none(
             &self,
             new: $val,
-            _success: ::std::sync::atomic::Ordering,
-            _failure: ::std::sync::atomic::Ordering,
+            _success: ::veloq_std::sync::atomic::Ordering,
+            _failure: ::veloq_std::sync::atomic::Ordering,
         ) -> Result<(), $val> {
             let old = self.0.take();
             if old.is_none() {

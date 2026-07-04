@@ -1,4 +1,4 @@
-pub use core::cell::Cell;
+pub use core::cell::{Cell, RefCell, RefMut};
 
 #[cfg(not(feature = "loom"))]
 #[repr(transparent)]
