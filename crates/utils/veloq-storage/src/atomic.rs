@@ -29,8 +29,10 @@ impl Storage for AtomicStorage {
     type NonNullPtr<T> = AtomicNonNullPtr<T>;
     type Lock<T> = AtomicLock<T>;
     type WakerQueue = AtomicWakerQueue;
-    type OptionBox<T: ?Sized + Send> = AtomicOptionBox<T>;
-    type OptionArc<T: ?Sized + Send + Sync> = AtomicOptionArc<T>;
+    type OptionBox<T: Send> = AtomicOptionBox<T>;
+    type OptionFatBox<T: ?Sized + Send> = AtomicOptionFatBox<T>;
+    type OptionArc<T: Send + Sync> = AtomicOptionArc<T>;
+    type OptionFatArc<T: ?Sized + Send + Sync> = AtomicOptionFatArc<T>;
 }
 
 pub struct AtomicLock<T>(Mutex<T>);
@@ -84,29 +86,6 @@ impl_state_int!(
 
 // ==================== Pointer Helpers & Strategies ====================
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-#[repr(transparent)]
-pub struct PhysicalHandle(NonNull<u8>);
-
-impl PhysicalHandle {
-    /// 从原始指针创建句柄。
-    ///
-    /// # Safety
-    /// `ptr` 必须是非空的且满足对齐要求。
-    #[inline]
-    pub unsafe fn from_ptr(ptr: *mut ()) -> Self {
-        debug_assert!(!ptr.is_null());
-        // SAFETY: 调用者必须保证 ptr 非空且对齐。
-        unsafe { Self(NonNull::new_unchecked(ptr as *mut u8)) }
-    }
-
-    /// 获取内部原始指针。
-    #[inline]
-    pub fn as_ptr(self) -> *mut () {
-        self.0.as_ptr() as *mut ()
-    }
-}
-
 pub trait PointerStrategy<T> {
     /// 具体的中间类型，用于强类型化指针处理。
     type Raw: Copy;
@@ -120,11 +99,13 @@ pub trait PointerStrategy<T> {
     /// `raw` 必须是由 `to_raw` 生成的有效句柄。
     unsafe fn from_raw(raw: Self::Raw) -> T;
 
-    /// 获取对值的引用。
+    /// 克隆对值的引用。
     ///
     /// # Safety
     /// `raw` 指向的内容必须存活且有效。
-    unsafe fn as_ref<'a>(raw: Self::Raw) -> &'a T;
+    unsafe fn clone_ref(raw: Self::Raw) -> T
+    where
+        T: Clone;
 
     /// 将中间类型映射到物理存储指针（如 AtomicPtr 需要的 *mut ()）。
     fn to_physical(raw: Self::Raw) -> *mut ();
@@ -139,24 +120,26 @@ pub trait PointerStrategy<T> {
     fn physical_null() -> *mut ();
 }
 
-pub struct BoxStrategy<T: ?Sized>(PhantomData<T>);
-impl<T: ?Sized> PointerStrategy<Box<T>> for BoxStrategy<T> {
-    type Raw = PhysicalHandle;
+pub struct FatPointerStrategy<T>(PhantomData<T>);
+impl<T> PointerStrategy<T> for FatPointerStrategy<T> {
+    type Raw = NonNull<()>;
 
-    fn to_raw(val: Box<T>) -> Self::Raw {
-        // 对于 !Sized 类型，Box<T> 是胖指针，需要双重包装成瘦指针
-        unsafe { PhysicalHandle::from_ptr(Box::into_raw(Box::new(val)) as *mut ()) }
+    fn to_raw(val: T) -> Self::Raw {
+        unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(val)) as *mut ()) }
     }
 
-    unsafe fn from_raw(raw: Self::Raw) -> Box<T> {
+    unsafe fn from_raw(raw: Self::Raw) -> T {
         unsafe {
-            let double_boxed = Box::from_raw(raw.as_ptr() as *mut Box<T>);
+            let double_boxed = Box::from_raw(raw.as_ptr() as *mut T);
             *double_boxed
         }
     }
 
-    unsafe fn as_ref<'a>(raw: Self::Raw) -> &'a Box<T> {
-        unsafe { &*(raw.as_ptr() as *const Box<T>) }
+    unsafe fn clone_ref(raw: Self::Raw) -> T
+    where
+        T: Clone,
+    {
+        unsafe { (*(raw.as_ptr() as *const T)).clone() }
     }
 
     fn to_physical(raw: Self::Raw) -> *mut () {
@@ -164,40 +147,7 @@ impl<T: ?Sized> PointerStrategy<Box<T>> for BoxStrategy<T> {
     }
 
     unsafe fn from_physical(ptr: *mut ()) -> Self::Raw {
-        unsafe { PhysicalHandle::from_ptr(ptr) }
-    }
-
-    fn physical_null() -> *mut () {
-        null_mut()
-    }
-}
-
-pub struct ArcStrategy<T: ?Sized>(PhantomData<T>);
-impl<T: ?Sized> PointerStrategy<Arc<T>> for ArcStrategy<T> {
-    type Raw = PhysicalHandle;
-
-    fn to_raw(val: Arc<T>) -> Self::Raw {
-        // Arc<T> 对于 !Sized 也是胖指针，同样需要双重包装
-        unsafe { PhysicalHandle::from_ptr(Box::into_raw(Box::new(val)) as *mut ()) }
-    }
-
-    unsafe fn from_raw(raw: Self::Raw) -> Arc<T> {
-        unsafe {
-            let boxed_arc = Box::from_raw(raw.as_ptr() as *mut Arc<T>);
-            *boxed_arc
-        }
-    }
-
-    unsafe fn as_ref<'a>(raw: Self::Raw) -> &'a Arc<T> {
-        unsafe { &*(raw.as_ptr() as *const Arc<T>) }
-    }
-
-    fn to_physical(raw: Self::Raw) -> *mut () {
-        raw.as_ptr()
-    }
-
-    unsafe fn from_physical(ptr: *mut ()) -> Self::Raw {
-        unsafe { PhysicalHandle::from_ptr(ptr) }
+        unsafe { NonNull::new_unchecked(ptr) }
     }
 
     fn physical_null() -> *mut () {
@@ -254,7 +204,7 @@ impl<T, S: PointerStrategy<T>> GenericAtomicOption<T, S> {
         if ptr == S::physical_null() {
             None
         } else {
-            unsafe { Some(S::as_ref(S::from_physical(ptr)).clone()) }
+            unsafe { Some(S::clone_ref(S::from_physical(ptr))) }
         }
     }
 
@@ -333,14 +283,60 @@ impl_ptr_state_wrapper!(
 
 // ==================== Option Box & Arc ====================
 
+/// 一个专门用于原子存储 `Option<Box<T>>` 的容器（针对 Sized 类型）。
+/// 直接存储 Box 的原始指针，避免了双重包装。
+pub struct AtomicOptionBox<T>(AtomicPtr<T>);
+
+unsafe impl<T: Send> Send for AtomicOptionBox<T> {}
+unsafe impl<T: Send> Sync for AtomicOptionBox<T> {}
+
+impl<T: Send> StateOptionBox<T> for AtomicOptionBox<T> {
+    fn new(opt: Option<Box<T>>) -> Self {
+        Self(AtomicPtr::new(opt.map_or(null_mut(), Box::into_raw)))
+    }
+    fn take(&self, order: Ordering) -> Option<Box<T>> {
+        NonNull::new(self.0.swap(null_mut(), order)).map(|p| unsafe { Box::from_raw(p.as_ptr()) })
+    }
+    fn swap(&self, new: Option<Box<T>>, order: Ordering) -> Option<Box<T>> {
+        let new_ptr = new.map_or(null_mut(), Box::into_raw);
+        NonNull::new(self.0.swap(new_ptr, order)).map(|p| unsafe { Box::from_raw(p.as_ptr()) })
+    }
+    fn store(&self, val: Option<Box<T>>, order: Ordering) {
+        let new_ptr = val.map_or(null_mut(), Box::into_raw);
+        if let Some(p) = NonNull::new(self.0.swap(new_ptr, order)) {
+            unsafe { drop(Box::from_raw(p.as_ptr())) }
+        }
+    }
+    fn compare_exchange_none(
+        &self,
+        new: Box<T>,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<(), Box<T>> {
+        let new_ptr = Box::into_raw(new);
+        self.0
+            .compare_exchange(null_mut(), new_ptr, success, failure)
+            .map(|_| ())
+            .map_err(|_| unsafe { Box::from_raw(new_ptr) })
+    }
+}
+
+impl<T> Drop for AtomicOptionBox<T> {
+    fn drop(&mut self) {
+        if let Some(p) = NonNull::new(*self.0.get_mut()) {
+            unsafe { drop(Box::from_raw(p.as_ptr())) }
+        }
+    }
+}
+
 /// 一个原子存储 `Option<Box<T>>` 的容器。
 /// 针对 `!Sized` 类型（如 trait objects），它会自动处理双重包装以保持原子性。
-pub struct AtomicOptionBox<T: ?Sized>(GenericAtomicOption<Box<T>, BoxStrategy<T>>);
+pub struct AtomicOptionFatBox<T: ?Sized>(GenericAtomicOption<Box<T>, FatPointerStrategy<Box<T>>>);
 
-unsafe impl<T: ?Sized + Send> Send for AtomicOptionBox<T> {}
-unsafe impl<T: ?Sized + Send> Sync for AtomicOptionBox<T> {}
+unsafe impl<T: ?Sized + Send> Send for AtomicOptionFatBox<T> {}
+unsafe impl<T: ?Sized + Send> Sync for AtomicOptionFatBox<T> {}
 
-impl<T: ?Sized + Send> StateOptionBox<T> for AtomicOptionBox<T> {
+impl<T: ?Sized + Send> StateOptionBox<T> for AtomicOptionFatBox<T> {
     fn new(opt: Option<Box<T>>) -> Self {
         Self(GenericAtomicOption::new(opt))
     }
@@ -363,14 +359,64 @@ impl<T: ?Sized + Send> StateOptionBox<T> for AtomicOptionBox<T> {
     }
 }
 
-/// 一个专门用于原子存储 `Option<Arc<T>>` 的容器。
-/// 直接存储 Arc 的原始指针，避免了额外的 Box 包装。
-pub struct AtomicOptionArc<T: ?Sized>(GenericAtomicOption<Arc<T>, ArcStrategy<T>>);
+/// 一个专门用于原子存储 `Option<Arc<T>>` 的容器（针对 Sized 类型）。
+/// 直接存储 Arc 的原始指针，避免了双重包装。
+pub struct AtomicOptionArc<T>(AtomicPtr<T>);
 
-unsafe impl<T: ?Sized + Send + Sync> Send for AtomicOptionArc<T> {}
-unsafe impl<T: ?Sized + Send + Sync> Sync for AtomicOptionArc<T> {}
+unsafe impl<T: Send + Sync> Send for AtomicOptionArc<T> {}
+unsafe impl<T: Send + Sync> Sync for AtomicOptionArc<T> {}
 
-impl<T: ?Sized + Send + Sync> StateOptionArc<T> for AtomicOptionArc<T> {
+impl<T: Send + Sync> StateOptionArc<T> for AtomicOptionArc<T> {
+    fn new(opt: Option<Arc<T>>) -> Self {
+        Self(AtomicPtr::new(
+            opt.map_or(null_mut(), |a| Arc::into_raw(a) as *mut T),
+        ))
+    }
+    fn take(&self, order: Ordering) -> Option<Arc<T>> {
+        NonNull::new(self.0.swap(null_mut(), order)).map(|p| unsafe { Arc::from_raw(p.as_ptr()) })
+    }
+    fn store(&self, opt: Option<Arc<T>>, order: Ordering) {
+        let new_ptr = opt.map_or(null_mut(), |a| Arc::into_raw(a) as *mut T);
+        if let Some(p) = NonNull::new(self.0.swap(new_ptr, order)) {
+            unsafe { drop(Arc::from_raw(p.as_ptr())) }
+        }
+    }
+    fn load_clone(&self, order: Ordering) -> Option<Arc<T>> {
+        NonNull::new(self.0.load(order)).map(|p| unsafe {
+            Arc::increment_strong_count(p.as_ptr());
+            Arc::from_raw(p.as_ptr())
+        })
+    }
+    fn compare_exchange_none(
+        &self,
+        new: Arc<T>,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<(), Arc<T>> {
+        let new_ptr = Arc::into_raw(new) as *mut T;
+        self.0
+            .compare_exchange(null_mut(), new_ptr, success, failure)
+            .map(|_| ())
+            .map_err(|_| unsafe { Arc::from_raw(new_ptr) })
+    }
+}
+
+impl<T> Drop for AtomicOptionArc<T> {
+    fn drop(&mut self) {
+        if let Some(p) = NonNull::new(*self.0.get_mut()) {
+            unsafe { drop(Arc::from_raw(p.as_ptr())) }
+        }
+    }
+}
+
+/// 一个原子存储 `Option<Arc<T>>` 的容器。
+/// 针对 `!Sized` 类型（如 trait objects），它会自动处理双重包装以保持原子性。
+pub struct AtomicOptionFatArc<T: ?Sized>(GenericAtomicOption<Arc<T>, FatPointerStrategy<Arc<T>>>);
+
+unsafe impl<T: ?Sized + Send + Sync> Send for AtomicOptionFatArc<T> {}
+unsafe impl<T: ?Sized + Send + Sync> Sync for AtomicOptionFatArc<T> {}
+
+impl<T: ?Sized + Send + Sync> StateOptionArc<T> for AtomicOptionFatArc<T> {
     fn new(opt: Option<Arc<T>>) -> Self {
         Self(GenericAtomicOption::new(opt))
     }

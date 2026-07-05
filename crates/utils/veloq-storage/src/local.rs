@@ -28,8 +28,10 @@ impl Storage for LocalStorage {
     type NonNullPtr<T> = NonNullPtr<T>;
     type Lock<T> = LocalLock<T>;
     type WakerQueue = LocalWakerQueue;
-    type OptionBox<T: ?Sized + Send> = OptionBox<T>;
-    type OptionArc<T: ?Sized + Send + Sync> = OptionArc<T>;
+    type OptionBox<T: Send> = OptionBox<T>;
+    type OptionFatBox<T: ?Sized + Send> = OptionBox<T>;
+    type OptionArc<T: Send + Sync> = OptionArc<T>;
+    type OptionFatArc<T: ?Sized + Send + Sync> = OptionArc<T>;
 }
 
 pub struct LocalLock<T>(RefCell<T>);
