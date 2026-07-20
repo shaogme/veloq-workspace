@@ -6,54 +6,12 @@ use veloq_std::{
         AtomicPtr,
         Ordering::{AcqRel, Acquire, Relaxed, Release},
     },
-    task::{RawWaker, RawWakerVTable, Waker},
+    task::{RawWakerVTable, Waker},
 };
 
-const TAG_MASK: usize = 0b11;
-const REGISTERED: usize = 0b01;
-const WAKING: usize = 0b10;
-const REGISTERING: usize = 0b11;
-
-// A const NOOP_VTABLE as Waker::noop vtable cannot be accessed in const context.
-static NOOP_VTABLE: RawWakerVTable = RawWakerVTable::new(
-    |_| RawWaker::new(ptr::null(), &NOOP_VTABLE),
-    |_| (),
-    |_| (),
-    |_| (),
-);
-const NOOP_PTR: *mut RawWakerVTable = &NOOP_VTABLE as *const RawWakerVTable as *mut RawWakerVTable;
-
-trait TaggedPointerExt {
-    fn set(self, tag: usize) -> Self;
-    fn unset(self, tag: usize) -> Self;
-    fn tag(self) -> usize;
-}
-
-impl<T> TaggedPointerExt for *mut T {
-    #[inline(always)]
-    fn set(self, tag: usize) -> Self {
-        (((self as usize) & !TAG_MASK) | tag) as *mut T
-    }
-    #[inline(always)]
-    fn unset(self, tag: usize) -> Self {
-        ((self as usize) & !tag) as *mut T
-    }
-    #[inline(always)]
-    fn tag(self) -> usize {
-        (self as usize) & TAG_MASK
-    }
-}
-
-trait WakerExt {
-    fn vtable_ptr(&self) -> *mut RawWakerVTable;
-}
-
-impl WakerExt for Waker {
-    #[inline(always)]
-    fn vtable_ptr(&self) -> *mut RawWakerVTable {
-        self.vtable() as *const RawWakerVTable as *mut RawWakerVTable
-    }
-}
+use crate::common::{
+    NOOP_PTR, REGISTERED, REGISTERING, TAG_MASK, TaggedPointerExt, WAKING, WakerExt,
+};
 
 /// A specialized synchronization primitive for task wakeup, optimized for
 /// Single-Register (单注册者) and Multi-Wake (多唤醒者) scenarios.

@@ -1,21 +1,17 @@
 use veloq_std::{
-    cell::UnsafeCell,
     fmt,
+    mem::ManuallyDrop,
+    ptr,
     sync::atomic::{
-        AtomicUsize,
-        Ordering::{AcqRel, Acquire, Release},
+        AtomicPtr,
+        Ordering::{AcqRel, Acquire, Relaxed, Release},
     },
-    task::Waker,
+    task::{RawWakerVTable, Waker},
 };
 
-/// Idle state
-const WAITING: usize = 0;
-
-/// A new waker value is being registered with the `AtomicWaker` cell.
-const REGISTERING: usize = 0b01;
-
-/// The waker currently registered with the `AtomicWaker` cell is being woken.
-const WAKING: usize = 0b10;
+use crate::common::{
+    NOOP_PTR, REGISTERED, REGISTERING, TAG_MASK, TaggedPointerExt, WAKING, WakerExt,
+};
 
 /// A synchronization primitive for task wakeup.
 ///
@@ -100,131 +96,26 @@ const WAKING: usize = 0b10;
 /// }
 /// ```
 pub struct AtomicWaker {
-    state: AtomicUsize,
-    waker: UnsafeCell<Option<Waker>>,
+    vtable: AtomicPtr<RawWakerVTable>,
+    data: AtomicPtr<()>,
 }
-
-// `AtomicWaker` is a multi-consumer, single-producer transfer cell. The cell
-// stores a `Waker` value produced by calls to `register` and many threads can
-// race to take the waker (to wake it) by calling `wake`.
-//
-// If a new `Waker` instance is produced by calling `register` before an
-// existing one is consumed, then the existing one is overwritten.
-//
-// While `AtomicWaker` is single-producer, the implementation ensures memory
-// safety. In the event of concurrent calls to `register`, there will be a
-// single winner whose waker will get stored in the cell. The losers will not
-// have their tasks woken. As such, callers should ensure to add synchronization
-// to calls to `register`.
-//
-// The implementation uses a single `AtomicUsize` value to coordinate access to
-// the `Waker` cell. There are two bits that are operated on independently.
-// These are represented by `REGISTERING` and `WAKING`.
-//
-// The `REGISTERING` bit is set when a producer enters the critical section. The
-// `WAKING` bit is set when a consumer enters the critical section. Neither bit
-// being set is represented by `WAITING`.
-//
-// A thread obtains an exclusive lock on the waker cell by transitioning the
-// state from `WAITING` to `REGISTERING` or `WAKING`, depending on the operation
-// the thread wishes to perform. When this transition is made, it is guaranteed
-// that no other thread will access the waker cell.
-//
-// # Registering
-//
-// On a call to `register`, an attempt to transition the state from WAITING to
-// REGISTERING is made. On success, the caller obtains a lock on the waker cell.
-//
-// If the lock is obtained, then the thread sets the waker cell to the waker
-// provided as an argument. Then it attempts to transition the state back from
-// `REGISTERING` -> `WAITING`.
-//
-// If this transition is successful, then the registering process is complete
-// and the next call to `wake` will observe the waker.
-//
-// If the transition fails, then there was a concurrent call to `wake` that was
-// unable to access the waker cell (due to the registering thread holding the
-// lock). To handle this, the registering thread removes the waker it just set
-// from the cell and calls `wake` on it. This call to wake represents the
-// attempt to wake by the other thread (that set the `WAKING` bit). The state is
-// then transitioned from `REGISTERING | WAKING` back to `WAITING`.  This
-// transition must succeed because, at this point, the state cannot be
-// transitioned by another thread.
-//
-// # Waking
-//
-// On a call to `wake`, an attempt to transition the state from `WAITING` to
-// `WAKING` is made. On success, the caller obtains a lock on the waker cell.
-//
-// If the lock is obtained, then the thread takes ownership of the current value
-// in the waker cell, and calls `wake` on it. The state is then transitioned
-// back to `WAITING`. This transition must succeed as, at this point, the state
-// cannot be transitioned by another thread.
-//
-// If the thread is unable to obtain the lock, the `WAKING` bit is still.  This
-// is because it has either been set by the current thread but the previous
-// value included the `REGISTERING` bit **or** a concurrent thread is in the
-// `WAKING` critical section. Either way, no action must be taken.
-//
-// If the current thread is the only concurrent call to `wake` and another
-// thread is in the `register` critical section, when the other thread **exits**
-// the `register` critical section, it will observe the `WAKING` bit and handle
-// the wake itself.
-//
-// If another thread is in the `wake` critical section, then it will handle
-// waking the task.
-//
-// # A potential race (is safely handled).
-//
-// Imagine the following situation:
-//
-// * Thread A obtains the `wake` lock and wakes a task.
-//
-// * Before thread A releases the `wake` lock, the woken task is scheduled.
-//
-// * Thread B attempts to wake the task. In theory this should result in the
-//   task being woken, but it cannot because thread A still holds the wake lock.
-//
-// This case is handled by requiring users of `AtomicWaker` to call `register`
-// **before** attempting to observe the application state change that resulted
-// in the task being awoken. The wakers also change the application state before
-// calling wake.
-//
-// Because of this, the waker will do one of two things.
-//
-// 1) Observe the application state change that Thread B is woken for. In this
-//    case, it is OK for Thread B's wake to be lost.
-//
-// 2) Call register before attempting to observe the application state. Since
-//    Thread A still holds the `wake` lock, the call to `register` will result
-//    in the task waking itself and get scheduled again.
 
 impl AtomicWaker {
     /// Create an `AtomicWaker`.
     #[cfg(not(feature = "loom"))]
     pub const fn new() -> Self {
-        // Make sure that task is Sync
-        #[allow(dead_code)]
-        trait AssertSync: Sync {}
-        impl AssertSync for Waker {}
-
         AtomicWaker {
-            state: AtomicUsize::new(WAITING),
-            waker: UnsafeCell::new(None),
+            vtable: AtomicPtr::new(NOOP_PTR),
+            data: AtomicPtr::new(ptr::null_mut()),
         }
     }
 
     /// Create an `AtomicWaker`.
     #[cfg(feature = "loom")]
     pub fn new() -> Self {
-        // Make sure that task is Sync
-        #[allow(dead_code)]
-        trait AssertSync: Sync {}
-        impl AssertSync for Waker {}
-
         AtomicWaker {
-            state: AtomicUsize::new(WAITING),
-            waker: UnsafeCell::new(None),
+            vtable: AtomicPtr::new(NOOP_PTR),
+            data: AtomicPtr::new(ptr::null_mut()),
         }
     }
 
@@ -245,140 +136,129 @@ impl AtomicWaker {
     /// idea. Concurrent calls to `register` will attempt to register different
     /// tasks to be notified. One of the callers will win and have its task set,
     /// but there is no guarantee as to which caller will succeed.
-    ///
-    /// # Examples
-    ///
-    /// Here is how `register` is used when implementing a flag.
-    ///
-    /// ``` ignore
-    /// use futures::future::Future;
-    /// use futures::task::{Context, Poll, AtomicWaker};
-    /// use std::sync::atomic::AtomicBool;
-    /// use std::sync::atomic::Ordering::Relaxed;
-    /// use std::pin::Pin;
-    ///
-    /// struct Flag {
-    ///     waker: AtomicWaker,
-    ///     set: AtomicBool,
-    /// }
-    ///
-    /// impl Future for Flag {
-    ///     type Output = ();
-    ///
-    ///     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-    ///         // Register **before** checking `set` to avoid a race condition
-    ///         // that would result in lost notifications.
-    ///         self.waker.register(cx.waker());
-    ///
-    ///         if self.set.load(Relaxed) {
-    ///             Poll::Ready(())
-    ///         } else {
-    ///             Poll::Pending
-    ///         }
-    ///     }
-    /// }
-    /// ```
     pub fn register(&self, waker: &Waker) {
-        match self
-            .state
-            .compare_exchange(WAITING, REGISTERING, Acquire, Acquire)
-        {
-            Ok(_) => {
-                // Locked acquired, update the waker cell
+        let mut vtable = self.vtable.load(Acquire);
 
-                // Avoid cloning the waker if the old waker will awaken the same task.
-                //
-                // SAFETY: We acquired the lock (state transitioned from WAITING to REGISTERING),
-                // so we have exclusive access to the waker cell.
-                unsafe {
-                    self.waker.with_mut(|w| match w {
-                        Some(old_waker) if old_waker.will_wake(waker) => (),
-                        _ => *w = Some(waker.clone()),
-                    });
-                }
+        loop {
+            let tag = vtable.tag();
 
-                // Release the lock. If the state transitioned to include
-                // the `WAKING` bit, this means that at least one wake has
-                // been called concurrently.
-                //
-                // Start by assuming that the state is `REGISTERING` as this
-                // is what we just set it to. If this holds, we know that no
-                // other writes were performed in the meantime, so there is
-                // nothing to acquire, only release. In case of concurrent
-                // wakers, we need to acquire their releases, so success needs
-                // to do both.
-                let res = self
-                    .state
-                    .compare_exchange(REGISTERING, WAITING, AcqRel, Acquire);
+            if tag == WAKING {
+                waker.wake_by_ref();
+                return;
+            }
 
-                match res {
+            if tag == REGISTERING {
+                // For concurrent calls to `register`, standard AtomicWaker simply returns
+                // if it fails to acquire the registration lock. We match this behavior.
+                return;
+            }
+
+            if tag == 0 {
+                let registering_vtable = vtable.set(REGISTERING);
+                match self
+                    .vtable
+                    .compare_exchange(vtable, registering_vtable, AcqRel, Acquire)
+                {
                     Ok(_) => {
-                        // memory ordering: acquired self.state during CAS
-                        // - if previous wakes went through it syncs with
-                        //   their final release (`fetch_and`)
-                        // - if there was no previous wake the next wake
-                        //   will wake us, no sync needed.
+                        let owned_waker = ManuallyDrop::new(waker.clone());
+                        self.data.store(owned_waker.data() as *mut (), Release);
+                        let new_vtable = owned_waker.vtable_ptr().set(REGISTERED);
+                        match self.vtable.compare_exchange(
+                            registering_vtable,
+                            new_vtable,
+                            Release,
+                            Acquire,
+                        ) {
+                            Ok(_) => return,
+                            Err(actual) => {
+                                debug_assert_eq!(actual.tag(), WAKING);
+                                self.vtable.store(NOOP_PTR, Release);
+                                self.data.store(ptr::null_mut(), Release);
+                                let raw_waker = ManuallyDrop::into_inner(owned_waker);
+                                raw_waker.wake();
+                                return;
+                            }
+                        }
                     }
                     Err(actual) => {
-                        // This branch can only be reached if at least one
-                        // concurrent thread called `wake`. In this
-                        // case, `actual` **must** be `REGISTERING |
-                        // `WAKING`.
-                        debug_assert_eq!(actual, REGISTERING | WAKING);
-
-                        // Take the waker to wake once the atomic operation has
-                        // completed.
-                        //
-                        // SAFETY: We hold the lock (state is REGISTERING | WAKING), so we have exclusive access.
-                        let waker = unsafe {
-                            self.waker
-                                .with_mut(|w| w.take().expect("invariant broken: waker must exist"))
-                        };
-
-                        // We need to return to WAITING state (clear our lock and
-                        // concurrent WAKING flag). This needs to acquire all
-                        // WAKING fetch_or releases and it needs to release our
-                        // update to self.waker, so we need a `swap` operation.
-                        self.state.swap(WAITING, AcqRel);
-
-                        // memory ordering: we acquired the state for all
-                        // concurrent wakes, but future wakes might still
-                        // need to wake us in case we can't make progress
-                        // from the pending wakes.
-                        //
-                        // So we simply schedule to come back later (we could
-                        // also simply leave the registration in place above).
-                        waker.wake();
+                        vtable = actual;
+                        continue;
                     }
                 }
             }
-            Err(WAKING) => {
-                // Currently in the process of waking the task, i.e.,
-                // `wake` is currently being called on the old task handle.
-                //
-                // memory ordering: we acquired the state for all
-                // concurrent wakes, but future wakes might still
-                // need to wake us in case we can't make progress
-                // from the pending wakes.
-                //
-                // So we simply schedule to come back later (we
-                // could also spin here trying to acquire the lock
-                // to register).
-                waker.wake_by_ref();
+
+            if tag == REGISTERED {
+                // Fast-path: check if it is the same waker.
+                let clean_vtable = vtable.unset(TAG_MASK);
+                let current_data = self.data.load(Acquire) as *const ();
+                if waker.vtable_ptr() == clean_vtable
+                    && waker.data() == current_data
+                    && self.vtable.load(Relaxed) == vtable
+                {
+                    return;
+                }
+
+                let registering_vtable = vtable.set(REGISTERING);
+                match self
+                    .vtable
+                    .compare_exchange(vtable, registering_vtable, AcqRel, Acquire)
+                {
+                    Ok(_) => {
+                        let current_data = self.data.load(Acquire) as *const ();
+
+                        if waker.vtable_ptr() == clean_vtable && waker.data() == current_data {
+                            let target = clean_vtable.set(REGISTERED);
+                            match self.vtable.compare_exchange(
+                                registering_vtable,
+                                target,
+                                Release,
+                                Acquire,
+                            ) {
+                                Ok(_) => return,
+                                Err(actual) => {
+                                    debug_assert_eq!(actual.tag(), WAKING);
+                                    self.vtable.store(clean_vtable, Release);
+                                    waker.wake_by_ref();
+                                    return;
+                                }
+                            }
+                        }
+
+                        if clean_vtable != NOOP_PTR {
+                            let old_waker = unsafe { Waker::new(current_data, &*clean_vtable) };
+                            drop(old_waker);
+                        }
+
+                        let owned_waker = ManuallyDrop::new(waker.clone());
+                        self.data.store(owned_waker.data() as *mut (), Release);
+                        let new_vtable = owned_waker.vtable_ptr().set(REGISTERED);
+
+                        match self.vtable.compare_exchange(
+                            registering_vtable,
+                            new_vtable,
+                            Release,
+                            Acquire,
+                        ) {
+                            Ok(_) => return,
+                            Err(actual) => {
+                                debug_assert_eq!(actual.tag(), WAKING);
+                                self.vtable.store(clean_vtable, Release);
+                                self.data.store(ptr::null_mut(), Release);
+                                let raw_waker = ManuallyDrop::into_inner(owned_waker);
+                                raw_waker.wake();
+                                return;
+                            }
+                        }
+                    }
+                    Err(actual) => {
+                        vtable = actual;
+                        continue;
+                    }
+                }
             }
-            Err(state) => {
-                // In this case, a concurrent thread is holding the
-                // "registering" lock. This probably indicates a bug in the
-                // caller's code as racing to call `register` doesn't make much
-                // sense.
-                //
-                // memory ordering: don't care. a concurrent register() is going
-                // to succeed and provide proper memory ordering.
-                //
-                // We just want to maintain memory safety. It is ok to drop the
-                // call to `register`.
-                debug_assert!(state == REGISTERING || state == REGISTERING | WAKING);
-            }
+
+            core::hint::spin_loop();
+            vtable = self.vtable.load(Acquire);
         }
     }
 
@@ -393,41 +273,53 @@ impl AtomicWaker {
 
     /// Returns the last `Waker` passed to `register`, so that the user can wake it.
     ///
-    ///
-    /// Sometimes, just waking the AtomicWaker is not fine grained enough. This allows the user
-    /// to take the waker and then wake it separately, rather than performing both steps in one
-    /// atomic action.
-    ///
     /// If a waker has not been registered, this returns `None`.
     pub fn take(&self) -> Option<Waker> {
-        // AcqRel ordering is used in order to acquire the value of the `task`
-        // cell as well as to establish a `release` ordering with whatever
-        // memory the `AtomicWaker` is associated with.
-        match self.state.fetch_or(WAKING, AcqRel) {
-            WAITING => {
-                // The waking lock has been acquired.
-                //
-                // SAFETY: We acquired the lock (state was WAITING, now REGISTERING/WAKING implied by fetch_or),
-                // so we have exclusive access to the waker cell.
-                let waker = unsafe { self.waker.with_mut(|w| w.take()) };
-
-                // Release the lock
-                self.state.fetch_and(!WAKING, Release);
-
-                waker
+        let mut vtable = self.vtable.load(Relaxed);
+        loop {
+            let tag = vtable.tag();
+            if tag == REGISTERING {
+                let waking_vtable = vtable.set(WAKING);
+                match self
+                    .vtable
+                    .compare_exchange(vtable, waking_vtable, AcqRel, Acquire)
+                {
+                    Ok(_) => return None,
+                    Err(actual) => vtable = actual,
+                }
+            } else if tag == REGISTERED {
+                let waking_vtable = vtable.set(WAKING);
+                match self
+                    .vtable
+                    .compare_exchange(vtable, waking_vtable, AcqRel, Acquire)
+                {
+                    Ok(_) => {
+                        let clean = vtable.unset(TAG_MASK);
+                        let data = self.data.swap(ptr::null_mut(), AcqRel) as *const ();
+                        self.vtable.store(NOOP_PTR, Release);
+                        let waker = unsafe { Waker::new(data, &*clean) };
+                        return Some(waker);
+                    }
+                    Err(actual) => {
+                        vtable = actual;
+                    }
+                }
+            } else {
+                return None;
             }
-            state => {
-                // There is a concurrent thread currently updating the
-                // associated task.
-                //
-                // Nothing more to do as the `WAKING` bit has been set. It
-                // doesn't matter if there are concurrent registering threads or
-                // not.
-                //
-                debug_assert!(
-                    state == REGISTERING || state == REGISTERING | WAKING || state == WAKING
-                );
-                None
+        }
+    }
+}
+
+impl Drop for AtomicWaker {
+    fn drop(&mut self) {
+        let vtable = self.vtable.load(Relaxed);
+        if vtable.tag() == REGISTERED {
+            let clean = vtable.unset(TAG_MASK);
+            let data = self.data.load(Acquire) as *const ();
+            if clean != NOOP_PTR {
+                let waker = unsafe { Waker::new(data, &*clean) };
+                drop(waker);
             }
         }
     }
