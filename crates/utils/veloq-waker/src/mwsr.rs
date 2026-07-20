@@ -1,5 +1,4 @@
 use veloq_std::{
-    cell::UnsafeCell,
     fmt,
     mem::ManuallyDrop,
     ptr,
@@ -10,9 +9,10 @@ use veloq_std::{
     task::{RawWaker, RawWakerVTable, Waker},
 };
 
+const TAG_MASK: usize = 0b11;
 const REGISTERED: usize = 0b01;
 const WAKING: usize = 0b10;
-const REGISTERING: usize = 0b100;
+const REGISTERING: usize = 0b11;
 
 // A const NOOP_VTABLE as Waker::noop vtable cannot be accessed in const context.
 static NOOP_VTABLE: RawWakerVTable = RawWakerVTable::new(
@@ -26,21 +26,21 @@ const NOOP_PTR: *mut RawWakerVTable = &NOOP_VTABLE as *const RawWakerVTable as *
 trait TaggedPointerExt {
     fn set(self, tag: usize) -> Self;
     fn unset(self, tag: usize) -> Self;
-    fn has(self, tag: usize) -> bool;
+    fn tag(self) -> usize;
 }
 
 impl<T> TaggedPointerExt for *mut T {
     #[inline(always)]
     fn set(self, tag: usize) -> Self {
-        ((self as usize) | tag) as *mut T
+        (((self as usize) & !TAG_MASK) | tag) as *mut T
     }
     #[inline(always)]
     fn unset(self, tag: usize) -> Self {
         ((self as usize) & !tag) as *mut T
     }
     #[inline(always)]
-    fn has(self, tag: usize) -> bool {
-        (self as usize) & tag != 0
+    fn tag(self) -> usize {
+        (self as usize) & TAG_MASK
     }
 }
 
@@ -64,7 +64,7 @@ impl WakerExt for Waker {
 /// as `unsafe`.
 pub struct MwsrWaker {
     vtable: AtomicPtr<RawWakerVTable>,
-    data: UnsafeCell<*const ()>,
+    data: AtomicPtr<()>,
 }
 
 impl MwsrWaker {
@@ -73,7 +73,7 @@ impl MwsrWaker {
     pub const fn new() -> Self {
         MwsrWaker {
             vtable: AtomicPtr::new(NOOP_PTR),
-            data: UnsafeCell::new(ptr::null()),
+            data: AtomicPtr::new(ptr::null_mut()),
         }
     }
 
@@ -82,7 +82,7 @@ impl MwsrWaker {
     pub fn new() -> Self {
         MwsrWaker {
             vtable: AtomicPtr::new(NOOP_PTR),
-            data: UnsafeCell::new(ptr::null()),
+            data: AtomicPtr::new(ptr::null_mut()),
         }
     }
 
@@ -97,91 +97,108 @@ impl MwsrWaker {
         let mut vtable = self.vtable.load(Acquire);
 
         loop {
-            // 1. If currently waking or registering, wake/wait and return.
-            if vtable.has(WAKING) {
+            let tag = vtable.tag();
+
+            // 如果当前正在唤醒，为了避免丢失唤醒，必须立即唤醒新 waker 并返回
+            if tag == WAKING {
                 waker.wake_by_ref();
                 return;
             }
 
-            if vtable.has(REGISTERING) {
-                waker.wake_by_ref();
-                return;
+            if tag == REGISTERING {
+                core::hint::spin_loop();
+                vtable = self.vtable.load(Acquire);
+                continue;
             }
 
-            // 2. Acquire REGISTERING lock.
-            let clean_vtable = vtable.unset(REGISTERED | WAKING | REGISTERING);
-            let registering_vtable = clean_vtable.set(REGISTERING);
-            match self
-                .vtable
-                .compare_exchange(vtable, registering_vtable, AcqRel, Acquire)
-            {
-                Ok(_) => {
-                    // Lock acquired successfully! Now we are safe from concurrent reads/writes on self.data.
-                    let current_data = unsafe { self.data.with(|d| *d) };
+            if tag == 0 {
+                // 如果是 NOOP_PTR，可以直接安全地发布注册，因为此时 take() 不会产生作用
+                if vtable == NOOP_PTR {
+                    let owned_waker = ManuallyDrop::new(waker.clone());
+                    self.data.store(owned_waker.data() as *mut (), Release);
+                    let new_vtable = owned_waker.vtable_ptr().set(REGISTERED);
+                    self.vtable.store(new_vtable, Release);
+                    return;
+                }
+            }
 
-                    // 3. Cache Hit Check under lock
-                    if waker.vtable_ptr() == clean_vtable && waker.data() == current_data {
-                        let target = clean_vtable.set(REGISTERED);
+            if tag == REGISTERED {
+                // Fast-path: check if it is the same waker.
+                let clean_vtable = vtable.unset(TAG_MASK);
+                let current_data = self.data.load(Acquire) as *const ();
+                if waker.vtable_ptr() == clean_vtable
+                    && waker.data() == current_data
+                    && self.vtable.load(Relaxed) == vtable
+                {
+                    return;
+                }
+
+                // 尝试获取 REGISTERING 状态锁
+                let registering_vtable = vtable.set(REGISTERING);
+                match self
+                    .vtable
+                    .compare_exchange(vtable, registering_vtable, AcqRel, Acquire)
+                {
+                    Ok(_) => {
+                        let current_data = self.data.load(Acquire) as *const ();
+
+                        // 在锁保护下进行缓存命中的二次校验
+                        if waker.vtable_ptr() == clean_vtable && waker.data() == current_data {
+                            let target = clean_vtable.set(REGISTERED);
+                            match self.vtable.compare_exchange(
+                                registering_vtable,
+                                target,
+                                Release,
+                                Acquire,
+                            ) {
+                                Ok(_) => return,
+                                Err(actual) => {
+                                    debug_assert_eq!(actual.tag(), WAKING);
+                                    self.vtable.store(clean_vtable, Release);
+                                    waker.wake_by_ref();
+                                    return;
+                                }
+                            }
+                        }
+
+                        // Cache Miss 路径：销毁旧 Waker
+                        if clean_vtable != NOOP_PTR {
+                            let old_waker = unsafe { Waker::new(current_data, &*clean_vtable) };
+                            drop(old_waker);
+                        }
+
+                        // 拷贝并写入新 Waker
+                        let owned_waker = ManuallyDrop::new(waker.clone());
+                        self.data.store(owned_waker.data() as *mut (), Release);
+                        let new_vtable = owned_waker.vtable_ptr().set(REGISTERED);
+
+                        // 尝试释放锁并发布新注册
                         match self.vtable.compare_exchange(
                             registering_vtable,
-                            target,
+                            new_vtable,
                             Release,
                             Acquire,
                         ) {
                             Ok(_) => return,
                             Err(actual) => {
-                                debug_assert!(actual.has(WAKING));
+                                debug_assert_eq!(actual.tag(), WAKING);
                                 self.vtable.store(clean_vtable, Release);
-                                waker.wake_by_ref();
+                                self.data.store(ptr::null_mut(), Release);
+                                let raw_waker = ManuallyDrop::into_inner(owned_waker);
+                                raw_waker.wake();
                                 return;
                             }
                         }
                     }
-
-                    // 4. Cache Miss Path
-                    // Dropping the previous waker
-                    if vtable.has(REGISTERED) && clean_vtable != NOOP_PTR {
-                        let old_waker = unsafe { Waker::new(current_data, &*clean_vtable) };
-                        drop(old_waker);
+                    Err(actual) => {
+                        vtable = actual;
+                        continue;
                     }
-
-                    // Clone the new waker to take ownership of it.
-                    let owned_waker = ManuallyDrop::new(waker.clone());
-                    unsafe {
-                        self.data.with_mut(|d| *d = owned_waker.data());
-                    }
-                    let new_vtable = owned_waker.vtable_ptr().set(REGISTERED);
-
-                    // Try to release the REGISTERING lock and publish the registration.
-                    match self.vtable.compare_exchange(
-                        registering_vtable,
-                        new_vtable,
-                        Release,
-                        Acquire,
-                    ) {
-                        Ok(_) => return,
-                        Err(actual) => {
-                            debug_assert!(actual.has(WAKING));
-                            // Reset to clean_vtable, clearing WAKING and REGISTERING flags.
-                            self.vtable.store(clean_vtable, Release);
-                            let rollback_data = if vtable.has(REGISTERED) {
-                                ptr::null()
-                            } else {
-                                current_data
-                            };
-                            unsafe {
-                                self.data.with_mut(|d| *d = rollback_data);
-                            }
-                            let raw_waker = ManuallyDrop::into_inner(owned_waker);
-                            raw_waker.wake();
-                            return;
-                        }
-                    }
-                }
-                Err(actual) => {
-                    vtable = actual;
                 }
             }
+
+            core::hint::spin_loop();
+            vtable = self.vtable.load(Acquire);
         }
     }
 
@@ -200,34 +217,25 @@ impl MwsrWaker {
     pub fn take(&self) -> Option<Waker> {
         let mut vtable = self.vtable.load(Relaxed);
         loop {
-            if vtable.has(REGISTERING) {
-                if vtable.has(WAKING) {
-                    return None;
-                }
+            let tag = vtable.tag();
+            if tag == REGISTERING {
+                let waking_vtable = vtable.set(WAKING);
                 match self
                     .vtable
-                    .compare_exchange(vtable, vtable.set(WAKING), AcqRel, Acquire)
+                    .compare_exchange(vtable, waking_vtable, AcqRel, Acquire)
                 {
                     Ok(_) => return None,
                     Err(actual) => vtable = actual,
                 }
-            } else if vtable.has(REGISTERED) {
-                if vtable.has(WAKING) {
-                    return None;
-                }
+            } else if tag == REGISTERED {
+                let waking_vtable = vtable.set(WAKING);
                 match self
                     .vtable
-                    .compare_exchange(vtable, vtable.set(WAKING), AcqRel, Acquire)
+                    .compare_exchange(vtable, waking_vtable, AcqRel, Acquire)
                 {
                     Ok(_) => {
-                        let clean = vtable.unset(REGISTERED | WAKING);
-                        let data = unsafe {
-                            let d = self.data.with(|d| *d);
-                            self.data.with_mut(|d| *d = ptr::null());
-                            d
-                        };
-                        // Reset to NOOP_PTR to avoid stale references
-                        // and ensure subsequent registrations hit the cache miss path.
+                        let clean = vtable.unset(TAG_MASK);
+                        let data = self.data.swap(ptr::null_mut(), AcqRel) as *const ();
                         self.vtable.store(NOOP_PTR, Release);
                         let waker = unsafe { Waker::new(data, &*clean) };
                         return Some(waker);
@@ -237,26 +245,7 @@ impl MwsrWaker {
                     }
                 }
             } else {
-                if vtable.has(WAKING) {
-                    return None;
-                }
-                match self
-                    .vtable
-                    .compare_exchange(vtable, vtable.set(WAKING), AcqRel, Acquire)
-                {
-                    Ok(_) => {
-                        // Successfully flagged as WAKING. Since there's no registered waker,
-                        // we must release the WAKING lock before returning.
-                        let _ = self.vtable.compare_exchange(
-                            vtable.set(WAKING),
-                            vtable,
-                            Release,
-                            Relaxed,
-                        );
-                        return None;
-                    }
-                    Err(actual) => vtable = actual,
-                }
+                return None;
             }
         }
     }
@@ -265,9 +254,9 @@ impl MwsrWaker {
 impl Drop for MwsrWaker {
     fn drop(&mut self) {
         let vtable = self.vtable.load(Relaxed);
-        if vtable.has(REGISTERED) && !vtable.has(WAKING) && !vtable.has(REGISTERING) {
-            let clean = vtable.unset(REGISTERED | WAKING | REGISTERING);
-            let data = unsafe { self.data.with(|d| *d) };
+        if vtable.tag() == REGISTERED {
+            let clean = vtable.unset(TAG_MASK);
+            let data = self.data.load(Acquire) as *const ();
             if clean != NOOP_PTR {
                 let waker = unsafe { Waker::new(data, &*clean) };
                 drop(waker);
