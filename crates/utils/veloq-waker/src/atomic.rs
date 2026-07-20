@@ -98,6 +98,8 @@ use crate::common::{
 pub struct AtomicWaker {
     vtable: AtomicPtr<RawWakerVTable>,
     data: AtomicPtr<()>,
+    cached_vtable: AtomicPtr<RawWakerVTable>,
+    cached_data: AtomicPtr<()>,
 }
 
 impl AtomicWaker {
@@ -107,6 +109,8 @@ impl AtomicWaker {
         AtomicWaker {
             vtable: AtomicPtr::new(NOOP_PTR),
             data: AtomicPtr::new(ptr::null_mut()),
+            cached_vtable: AtomicPtr::new(ptr::null_mut()),
+            cached_data: AtomicPtr::new(ptr::null_mut()),
         }
     }
 
@@ -116,6 +120,8 @@ impl AtomicWaker {
         AtomicWaker {
             vtable: AtomicPtr::new(NOOP_PTR),
             data: AtomicPtr::new(ptr::null_mut()),
+            cached_vtable: AtomicPtr::new(ptr::null_mut()),
+            cached_data: AtomicPtr::new(ptr::null_mut()),
         }
     }
 
@@ -137,6 +143,20 @@ impl AtomicWaker {
     /// tasks to be notified. One of the callers will win and have its task set,
     /// but there is no guarantee as to which caller will succeed.
     pub fn register(&self, waker: &Waker) {
+        let waker_vtable = waker.vtable_ptr();
+        let waker_data = waker.data();
+
+        // Quick check of the local cache (Relaxed load)
+        let cached_vtable = self.cached_vtable.load(Relaxed);
+        let cached_data = self.cached_data.load(Relaxed);
+
+        if waker_vtable == cached_vtable && waker_data == cached_data {
+            let expected_vtable = waker_vtable.set(REGISTERED);
+            if self.vtable.load(Acquire) == expected_vtable {
+                return;
+            }
+        }
+
         let mut vtable = self.vtable.load(Acquire);
 
         loop {
@@ -153,50 +173,53 @@ impl AtomicWaker {
                 return;
             }
 
-            if tag == 0 {
-                let registering_vtable = vtable.set(REGISTERING);
-                match self
-                    .vtable
-                    .compare_exchange(vtable, registering_vtable, AcqRel, Acquire)
-                {
-                    Ok(_) => {
-                        let owned_waker = ManuallyDrop::new(waker.clone());
-                        self.data.store(owned_waker.data() as *mut (), Release);
-                        let new_vtable = owned_waker.vtable_ptr().set(REGISTERED);
-                        match self.vtable.compare_exchange(
-                            registering_vtable,
-                            new_vtable,
-                            Release,
-                            Acquire,
-                        ) {
-                            Ok(_) => return,
-                            Err(actual) => {
-                                debug_assert_eq!(actual.tag(), WAKING);
-                                self.vtable.store(NOOP_PTR, Release);
-                                self.data.store(ptr::null_mut(), Release);
-                                let raw_waker = ManuallyDrop::into_inner(owned_waker);
-                                raw_waker.wake();
-                                return;
+            if tag == 0
+                && vtable == NOOP_PTR {
+                    let registering_vtable = vtable.set(REGISTERING);
+                    match self
+                        .vtable
+                        .compare_exchange(vtable, registering_vtable, AcqRel, Acquire)
+                    {
+                        Ok(_) => {
+                            let owned_waker = ManuallyDrop::new(waker.clone());
+                            self.data.store(owned_waker.data() as *mut (), Release);
+                            let new_vtable = owned_waker.vtable_ptr().set(REGISTERED);
+                            match self.vtable.compare_exchange(
+                                registering_vtable,
+                                new_vtable,
+                                Release,
+                                Acquire,
+                            ) {
+                                Ok(_) => {
+                                    // Successfully registered, update local cache
+                                    self.cached_vtable.store(waker_vtable, Relaxed);
+                                    self.cached_data.store(waker_data as *mut (), Relaxed);
+                                    return;
+                                }
+                                Err(actual) => {
+                                    debug_assert_eq!(actual.tag(), WAKING);
+                                    self.vtable.store(NOOP_PTR, Release);
+                                    self.data.store(ptr::null_mut(), Release);
+
+                                    // Registration failed, clear local cache
+                                    self.cached_vtable.store(ptr::null_mut(), Relaxed);
+                                    self.cached_data.store(ptr::null_mut(), Relaxed);
+
+                                    let raw_waker = ManuallyDrop::into_inner(owned_waker);
+                                    raw_waker.wake();
+                                    return;
+                                }
                             }
                         }
-                    }
-                    Err(actual) => {
-                        vtable = actual;
-                        continue;
+                        Err(actual) => {
+                            vtable = actual;
+                            continue;
+                        }
                     }
                 }
-            }
 
             if tag == REGISTERED {
-                // Fast-path: check if it is the same waker.
                 let clean_vtable = vtable.unset(TAG_MASK);
-                let current_data = self.data.load(Acquire) as *const ();
-                if waker.vtable_ptr() == clean_vtable
-                    && waker.data() == current_data
-                    && self.vtable.load(Relaxed) == vtable
-                {
-                    return;
-                }
 
                 let registering_vtable = vtable.set(REGISTERING);
                 match self
@@ -206,44 +229,39 @@ impl AtomicWaker {
                     Ok(_) => {
                         let current_data = self.data.load(Acquire) as *const ();
 
-                        if waker.vtable_ptr() == clean_vtable && waker.data() == current_data {
-                            let target = clean_vtable.set(REGISTERED);
-                            match self.vtable.compare_exchange(
-                                registering_vtable,
-                                target,
-                                Release,
-                                Acquire,
-                            ) {
-                                Ok(_) => return,
-                                Err(actual) => {
-                                    debug_assert_eq!(actual.tag(), WAKING);
-                                    self.vtable.store(clean_vtable, Release);
-                                    waker.wake_by_ref();
-                                    return;
-                                }
-                            }
-                        }
-
+                        // Drop the old waker
                         if clean_vtable != NOOP_PTR {
                             let old_waker = unsafe { Waker::new(current_data, &*clean_vtable) };
                             drop(old_waker);
                         }
 
+                        // Copy and store the new waker
                         let owned_waker = ManuallyDrop::new(waker.clone());
                         self.data.store(owned_waker.data() as *mut (), Release);
                         let new_vtable = owned_waker.vtable_ptr().set(REGISTERED);
 
+                        // Try to release lock and publish new registration
                         match self.vtable.compare_exchange(
                             registering_vtable,
                             new_vtable,
                             Release,
                             Acquire,
                         ) {
-                            Ok(_) => return,
+                            Ok(_) => {
+                                // Successfully registered, update local cache
+                                self.cached_vtable.store(waker_vtable, Relaxed);
+                                self.cached_data.store(waker_data as *mut (), Relaxed);
+                                return;
+                            }
                             Err(actual) => {
                                 debug_assert_eq!(actual.tag(), WAKING);
-                                self.vtable.store(clean_vtable, Release);
+                                self.vtable.store(NOOP_PTR, Release);
                                 self.data.store(ptr::null_mut(), Release);
+
+                                // Registration failed (concurrent wakeup), clear local cache
+                                self.cached_vtable.store(ptr::null_mut(), Relaxed);
+                                self.cached_data.store(ptr::null_mut(), Relaxed);
+
                                 let raw_waker = ManuallyDrop::into_inner(owned_waker);
                                 raw_waker.wake();
                                 return;
@@ -295,7 +313,10 @@ impl AtomicWaker {
                 {
                     Ok(_) => {
                         let clean = vtable.unset(TAG_MASK);
-                        let data = self.data.swap(ptr::null_mut(), AcqRel) as *const ();
+                        // Since the current thread has exclusive access to self.data after a successful transition,
+                        // we can optimize the atomic swap to normal exclusive load and store.
+                        let data = self.data.load(Acquire);
+                        self.data.store(ptr::null_mut(), Release);
                         self.vtable.store(NOOP_PTR, Release);
                         let waker = unsafe { Waker::new(data, &*clean) };
                         return Some(waker);
