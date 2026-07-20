@@ -7,7 +7,7 @@ use crate::{
     },
 };
 use std::{mem, sync::Arc};
-use veloq_shim::atomic::Ordering;
+use veloq_std::sync::atomic::Ordering;
 
 pub type RegistryOp<T> = SlotOp<T>;
 pub type RegistryPayload<T> = SlotPayload<T>;

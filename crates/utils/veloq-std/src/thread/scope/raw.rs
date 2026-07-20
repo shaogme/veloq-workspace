@@ -7,13 +7,12 @@ use crate::{
 
 #[cfg(feature = "std")]
 use crate::{
-    boxed::Box, ptr::null_mut, sync::atomic::AtomicPtr, thread::traits::RawThreadErrorTrait,
-};
-
-#[cfg(feature = "std")]
-use std::{
+    boxed::Box,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    ptr::null_mut,
+    sync::atomic::AtomicPtr,
     thread::panicking,
+    thread::traits::RawThreadErrorTrait,
 };
 
 pub(crate) struct RawScopeData<P: PlatformImpl> {
@@ -21,8 +20,6 @@ pub(crate) struct RawScopeData<P: PlatformImpl> {
     pub(crate) cancelled: AtomicBool,
     #[cfg(feature = "std")]
     pub(crate) panics: AtomicPtr<P::Error>,
-    #[cfg(feature = "std")]
-    pub(crate) has_panic: AtomicBool,
 }
 
 impl<P: PlatformImpl> RawScopeData<P> {
@@ -112,8 +109,7 @@ impl<'scope, 'env, P: PlatformImpl> RawScope<'scope, 'env, P> {
                 match res {
                     Ok(r) => Some(r),
                     Err(err) => {
-                        scope_data.has_panic.store(true, Ordering::Release);
-                        let raw_err = P::Error::from_panic(err);
+                        let raw_err = P::Error::from_panic(Some(err));
                         let payload = Box::into_raw(Box::new(raw_err));
                         if scope_data
                             .panics
@@ -185,13 +181,11 @@ impl<'scope, P: PlatformImpl, R: Send + 'scope> RawScopedJoinHandle<'scope, P, R
             #[cfg(feature = "std")]
             {
                 let panic_err = self.scope_data.pop_panic();
-                if let Some(mut err) = panic_err
-                    && let Some(p) = err.take_panic()
-                {
-                    resume_unwind(p);
+                if let Some(err) = panic_err {
+                    return Err(err);
                 }
             }
-            panic!("handle finished but no result found");
+            Err(P::Error::from_panic(Default::default()))
         }
     }
 
@@ -230,8 +224,6 @@ impl<P: PlatformImpl> Drop for RawScopeGuard<'_, P> {
                     if let Some(p) = err.take_panic() {
                         resume_unwind(p);
                     }
-                } else if self.data.has_panic.load(Ordering::Acquire) {
-                    panic!("child thread panicked");
                 }
             }
         }
@@ -248,8 +240,6 @@ where
         cancelled: AtomicBool::new(false),
         #[cfg(feature = "std")]
         panics: AtomicPtr::new(null_mut()),
-        #[cfg(feature = "std")]
-        has_panic: AtomicBool::new(false),
     };
 
     let scope = RawScope {

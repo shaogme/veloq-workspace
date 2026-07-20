@@ -20,11 +20,23 @@ numaperf-topo = "0.1"
 veloq-waker.workspace = true
 veloq-intrusive-linklist.workspace = true
 veloq-tls.workspace = true
-veloq-std = { workspace = true, features = ["std"] }
+veloq-std.workspace = true
 crossbeam-deque.workspace = true
 veloq-storage.workspace = true
 
 diagweave.workspace = true
+
+[features]
+loom = [
+    "veloq-intrusive-linklist/loom",
+    "veloq-waker/loom",
+    "veloq-std/loom",
+]
+std = [
+    "veloq-intrusive-linklist/std",
+    "veloq-waker/std",
+    "veloq-std/std",
+]
 
 [lints]
 workspace = true

@@ -1,16 +1,16 @@
 use crate::{
     SendError, TryRecvError,
-    shim::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        queue::{ArrayQueue, Queue, SegQueue},
-    },
+    shim::queue::{ArrayQueue, Queue, SegQueue},
 };
 use futures_core::stream::Stream;
-use std::{
+use veloq_std::{
     future::Future,
     mem::ManuallyDrop,
     pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     task::{Context, Poll},
 };
 use veloq_waker::MwsrWaker;
@@ -20,7 +20,7 @@ pub struct State<T, S, Q> {
     pub(crate) queue: Q,
     pub(crate) state: ChannelState,
     pub(crate) strategy: S,
-    _marker: std::marker::PhantomData<fn() -> T>,
+    _marker: veloq_std::marker::PhantomData<fn() -> T>,
 }
 
 impl<T> State<T, UnboundedStrategy, SegQueue<T>> {
@@ -29,7 +29,7 @@ impl<T> State<T, UnboundedStrategy, SegQueue<T>> {
             queue: SegQueue::new(),
             state: ChannelState::new(),
             strategy: UnboundedStrategy,
-            _marker: std::marker::PhantomData,
+            _marker: veloq_std::marker::PhantomData,
         }
     }
 }
@@ -41,7 +41,7 @@ impl<T> State<T, BoundedStrategy, ArrayQueue<T>> {
             queue: ArrayQueue::new(capacity),
             state: ChannelState::new(),
             strategy: BoundedStrategy::new(capacity),
-            _marker: std::marker::PhantomData,
+            _marker: veloq_std::marker::PhantomData,
         }
     }
 }
@@ -53,11 +53,11 @@ impl<T, S: ChannelStrategy, Q> State<T, S, Q> {
         (
             GenericSender {
                 state: self,
-                _marker: std::marker::PhantomData,
+                _marker: veloq_std::marker::PhantomData,
             },
             GenericReceiver {
                 state: self,
-                _marker: std::marker::PhantomData,
+                _marker: veloq_std::marker::PhantomData,
             },
         )
     }
@@ -181,22 +181,22 @@ impl ChannelStrategy for BoundedStrategy {
 
 pub struct GenericSender<'a, T, S: ChannelStrategy, Q> {
     state: &'a State<T, S, Q>,
-    _marker: std::marker::PhantomData<fn() -> T>,
+    _marker: veloq_std::marker::PhantomData<fn() -> T>,
 }
 
 pub struct GenericReceiver<'a, T, S: ChannelStrategy, Q> {
     state: &'a State<T, S, Q>,
-    _marker: std::marker::PhantomData<fn() -> T>,
+    _marker: veloq_std::marker::PhantomData<fn() -> T>,
 }
 
 pub struct GenericOwnedSender<T, S: ChannelStrategy, Q> {
     state: Arc<State<T, S, Q>>,
-    _marker: std::marker::PhantomData<fn() -> T>,
+    _marker: veloq_std::marker::PhantomData<fn() -> T>,
 }
 
 pub struct GenericOwnedReceiver<T, S: ChannelStrategy, Q> {
     state: Arc<State<T, S, Q>>,
-    _marker: std::marker::PhantomData<fn() -> T>,
+    _marker: veloq_std::marker::PhantomData<fn() -> T>,
 }
 
 // --- Implementations ---
@@ -206,7 +206,7 @@ impl<'a, T, S: ChannelStrategy, Q> Clone for GenericSender<'a, T, S, Q> {
         self.state.state.inc_sender();
         Self {
             state: self.state,
-            _marker: std::marker::PhantomData,
+            _marker: veloq_std::marker::PhantomData,
         }
     }
 }
@@ -393,11 +393,11 @@ pub fn owned_unbounded<T>() -> (OwnedSender<T>, OwnedReceiver<T>) {
     (
         GenericOwnedSender {
             state: state.clone(),
-            _marker: std::marker::PhantomData,
+            _marker: veloq_std::marker::PhantomData,
         },
         GenericOwnedReceiver {
             state,
-            _marker: std::marker::PhantomData,
+            _marker: veloq_std::marker::PhantomData,
         },
     )
 }
@@ -407,11 +407,11 @@ pub fn owned_bounded<T>(capacity: usize) -> (BoundedOwnedSender<T>, BoundedOwned
     (
         GenericOwnedSender {
             state: state.clone(),
-            _marker: std::marker::PhantomData,
+            _marker: veloq_std::marker::PhantomData,
         },
         GenericOwnedReceiver {
             state,
-            _marker: std::marker::PhantomData,
+            _marker: veloq_std::marker::PhantomData,
         },
     )
 }
@@ -420,12 +420,12 @@ impl<T, S: ChannelStrategy, Q> Clone for GenericOwnedSender<T, S, Q> {
     fn clone(&self) -> Self {
         let sender = ManuallyDrop::new(GenericSender {
             state: &self.state,
-            _marker: std::marker::PhantomData,
+            _marker: veloq_std::marker::PhantomData,
         });
         let _cloned = ManuallyDrop::new(sender.clone());
         GenericOwnedSender {
             state: self.state.clone(),
-            _marker: std::marker::PhantomData,
+            _marker: veloq_std::marker::PhantomData,
         }
     }
 }
@@ -434,7 +434,7 @@ impl<T, S: ChannelStrategy, Q> Drop for GenericOwnedSender<T, S, Q> {
     fn drop(&mut self) {
         drop(GenericSender {
             state: &self.state,
-            _marker: std::marker::PhantomData,
+            _marker: veloq_std::marker::PhantomData,
         });
     }
 }
@@ -443,7 +443,7 @@ impl<T, S: ChannelStrategy, Q> Drop for GenericOwnedReceiver<T, S, Q> {
     fn drop(&mut self) {
         drop(GenericReceiver {
             state: &self.state,
-            _marker: std::marker::PhantomData,
+            _marker: veloq_std::marker::PhantomData,
         });
     }
 }
@@ -452,7 +452,7 @@ impl<T> GenericOwnedSender<T, UnboundedStrategy, SegQueue<T>> {
     pub fn send(&self, val: T) -> Result<(), SendError<T>> {
         let sender = ManuallyDrop::new(GenericSender {
             state: &self.state,
-            _marker: std::marker::PhantomData,
+            _marker: veloq_std::marker::PhantomData,
         });
         sender.send(val)
     }
@@ -462,7 +462,7 @@ impl<T> GenericOwnedSender<T, BoundedStrategy, ArrayQueue<T>> {
     pub async fn send(&self, val: T) -> Result<(), SendError<T>> {
         let sender = ManuallyDrop::new(GenericSender {
             state: &self.state,
-            _marker: std::marker::PhantomData,
+            _marker: veloq_std::marker::PhantomData,
         });
         sender.send(val).await
     }
@@ -472,7 +472,7 @@ impl<T, S: ChannelStrategy, Q: Queue<T>> GenericOwnedReceiver<T, S, Q> {
     pub async fn recv(&mut self) -> Option<T> {
         let mut receiver = ManuallyDrop::new(GenericReceiver {
             state: &self.state,
-            _marker: std::marker::PhantomData,
+            _marker: veloq_std::marker::PhantomData,
         });
         receiver.recv().await
     }
@@ -480,7 +480,7 @@ impl<T, S: ChannelStrategy, Q: Queue<T>> GenericOwnedReceiver<T, S, Q> {
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
         let mut receiver = ManuallyDrop::new(GenericReceiver {
             state: &self.state,
-            _marker: std::marker::PhantomData,
+            _marker: veloq_std::marker::PhantomData,
         });
         receiver.try_recv()
     }
@@ -493,7 +493,7 @@ impl<T, S: ChannelStrategy, Q: Queue<T>> Stream for GenericOwnedReceiver<T, S, Q
         let this = unsafe { self.get_unchecked_mut() };
         let mut receiver = ManuallyDrop::new(GenericReceiver {
             state: &this.state,
-            _marker: std::marker::PhantomData,
+            _marker: veloq_std::marker::PhantomData,
         });
         Pin::new(&mut *receiver).poll_next(cx)
     }

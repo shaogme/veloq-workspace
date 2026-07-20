@@ -1,6 +1,3 @@
-#[cfg(feature = "std")]
-use crate::{any::Any, boxed::Box};
-
 use core::num::NonZeroUsize;
 
 use crate::{
@@ -18,13 +15,11 @@ pub trait RawThreadErrorTrait: Error + Send + Sync + 'static {
     fn kind(&self) -> ThreadErrorKind;
 
     /// 从原始 panic payload 构造错误实例
-    #[cfg(feature = "std")]
-    fn from_panic(payload: Box<dyn Any + Send + 'static>) -> Self;
+    fn from_panic(payload: super::platform::ThreadPanicPayload) -> Self;
 
     /// 提取原始的 panic payload 并在原处留下 None
-    #[cfg(feature = "std")]
-    fn take_panic(&mut self) -> Option<Box<dyn Any + Send + 'static>> {
-        None
+    fn take_panic(&mut self) -> super::platform::ThreadPanicPayload {
+        Default::default()
     }
 }
 

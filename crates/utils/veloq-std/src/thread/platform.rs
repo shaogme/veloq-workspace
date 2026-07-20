@@ -18,13 +18,10 @@ use crate::{
 };
 
 #[cfg(feature = "std")]
-use crate::{
-    any::Any,
-    fmt::{Debug, Formatter, Result as FmtResult},
-};
+pub(crate) type ThreadPanicPayload = Option<Box<dyn crate::any::Any + Send + 'static>>;
 
 #[cfg(feature = "std")]
-pub struct SendSyncPanicPayload(pub Box<dyn Any + Send + 'static>);
+pub struct SendSyncPanicPayload(pub Box<dyn crate::any::Any + Send + 'static>);
 
 #[cfg(feature = "std")]
 unsafe impl Send for SendSyncPanicPayload {}
@@ -32,9 +29,41 @@ unsafe impl Send for SendSyncPanicPayload {}
 unsafe impl Sync for SendSyncPanicPayload {}
 
 #[cfg(feature = "std")]
-impl Debug for SendSyncPanicPayload {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+impl crate::fmt::Debug for SendSyncPanicPayload {
+    fn fmt(&self, f: &mut crate::fmt::Formatter<'_>) -> crate::fmt::Result {
         f.write_str("SendSyncPanicPayload")
+    }
+}
+
+#[cfg(not(feature = "std"))]
+pub(crate) type ThreadPanicPayload = ();
+
+#[cfg(not(feature = "std"))]
+pub type SendSyncPanicPayload = ();
+
+#[inline]
+pub(crate) fn from_panic_payload(payload: ThreadPanicPayload) -> Option<SendSyncPanicPayload> {
+    #[cfg(feature = "std")]
+    {
+        payload.map(SendSyncPanicPayload)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = payload;
+        Some(())
+    }
+}
+
+#[inline]
+pub(crate) fn take_panic_payload(opt: &mut Option<SendSyncPanicPayload>) -> ThreadPanicPayload {
+    #[cfg(feature = "std")]
+    {
+        opt.take().map(|p| p.0)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = opt.take();
+        ()
     }
 }
 
@@ -75,17 +104,14 @@ pub(crate) trait ThreadSharedStateTrait<T>: Send + Sync {
     unsafe fn receive(&self) -> Option<T>;
     fn status(&self) -> u8;
     fn set_aborted(&self);
-
-    #[cfg(feature = "std")]
-    unsafe fn take_panic(&self) -> Option<Box<dyn Any + Send + 'static>>;
+    unsafe fn take_panic(&self) -> ThreadPanicPayload;
 }
 
 pub(crate) struct ThreadSharedState<F, T> {
     pub(crate) closure: UnsafeCell<Option<F>>,
     pub(crate) status: AtomicU8,
     pub(crate) result: SafeUnsafeCell<Option<T>>,
-    #[cfg(feature = "std")]
-    pub(crate) panic_payload: SafeUnsafeCell<Option<Box<dyn Any + Send + 'static>>>,
+    pub(crate) panic_payload: SafeUnsafeCell<ThreadPanicPayload>,
 }
 
 unsafe impl<F: Send, T: Send> Send for ThreadSharedState<F, T> {}
@@ -108,9 +134,8 @@ where
         self.status.store(STATE_ABORTED, Ordering::Release);
     }
 
-    #[cfg(feature = "std")]
-    unsafe fn take_panic(&self) -> Option<Box<dyn Any + Send + 'static>> {
-        unsafe { self.panic_payload.with_mut(|x| x.take()) }
+    unsafe fn take_panic(&self) -> ThreadPanicPayload {
+        unsafe { self.panic_payload.with_mut(|x| core::mem::take(x)) }
     }
 }
 

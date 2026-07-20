@@ -2,7 +2,7 @@ use crate::DriverError;
 use crate::slot;
 use diagweave::prelude::*;
 use std::{sync::Arc, task::Waker};
-use veloq_shim::atomic::Ordering;
+use veloq_std::sync::atomic::Ordering;
 
 use super::{
     AnomalyAttach, AnomalyOutcome, CompletionAnomalyKind, CompletionInput, CompletionPacket,
@@ -59,7 +59,7 @@ pub const CELL_STATE_BUSY: u8 = 4;
 #[inline(always)]
 fn spin_yield() {
     #[cfg(feature = "loom")]
-    veloq_shim::thread::yield_now();
+    veloq_std::thread::yield_now();
     #[cfg(not(feature = "loom"))]
     std::hint::spin_loop();
 }

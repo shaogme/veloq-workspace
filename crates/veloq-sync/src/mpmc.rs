@@ -1,22 +1,21 @@
 use crate::{
     SendError, TryRecvError, TrySendError,
-    shim::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        lock::SpinLock,
-        queue::{ArrayQueue, Queue, SegQueue},
-    },
+    shim::queue::{ArrayQueue, Queue, SegQueue},
     waker::{ConcurrentWaiterAdapter, ConcurrentWaiterNode},
 };
 use futures_core::stream::Stream;
-use std::{
+use veloq_intrusive_linklist::ConcurrentLinkedList;
+use veloq_std::{
     future::Future,
     mem::ManuallyDrop,
     pin::Pin,
     ptr::NonNull,
+    sync::{
+        Arc, SpinLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     task::{Context, Poll},
 };
-use veloq_intrusive_linklist::ConcurrentLinkedList;
 
 pub mod flavor {
     use super::*;
@@ -76,10 +75,12 @@ pub mod flavor {
             // 优化：只有当有等待者时才尝试锁
             if self.waiter_count.load(Ordering::Relaxed) > 0 {
                 let mut lock = self.waiters.lock();
-                if let Some(node) = lock.pop_front() {
-                    self.waiter_count.fetch_sub(1, Ordering::Relaxed);
-                    node.as_ref().waker.wake();
-                }
+                lock.with_mut(|l| {
+                    if let Some(node) = l.pop_front() {
+                        self.waiter_count.fetch_sub(1, Ordering::Relaxed);
+                        node.as_ref().waker.wake();
+                    }
+                });
             }
         }
 
@@ -97,9 +98,10 @@ pub mod flavor {
             if !is_full() {
                 return false; // Retry acquire
             }
+            let is_linked = lock.with(|_| node.as_ref().link.is_linked());
             unsafe {
-                if !node.as_ref().link.is_linked() {
-                    lock.push_back(node);
+                if !is_linked {
+                    lock.with_mut(|l| l.push_back(node));
                     self.waiter_count.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -109,11 +111,14 @@ pub mod flavor {
         fn remove_send_wait(&self, node: Pin<&mut ConcurrentWaiterNode>) {
             // Must acquire lock to check linkage safely to avoid race with notify
             let mut lock = self.waiters.lock();
-            if node.link.is_linked() {
+            let is_linked = lock.with(|_| node.link.is_linked());
+            if is_linked {
                 unsafe {
                     let ptr = NonNull::from(&*node);
-                    let mut cursor = lock.cursor_mut_from_ptr(ptr);
-                    cursor.remove();
+                    lock.with_mut(|l| {
+                        let mut cursor = l.cursor_mut_from_ptr(ptr);
+                        cursor.remove();
+                    });
                     self.waiter_count.fetch_sub(1, Ordering::Relaxed);
                 }
             }
@@ -121,9 +126,11 @@ pub mod flavor {
 
         fn notify_all_senders(&self) {
             let mut lock = self.waiters.lock();
-            while let Some(node) = lock.pop_front() {
-                node.as_ref().waker.wake();
-            }
+            lock.with_mut(|l| {
+                while let Some(node) = l.pop_front() {
+                    node.as_ref().waker.wake();
+                }
+            });
             self.waiter_count.store(0, Ordering::Relaxed);
         }
     }
@@ -167,7 +174,7 @@ pub struct State<T, F: ChannelFlavor, Q: Queue<T>> {
     pub(crate) receiver_count: AtomicUsize,
 
     pub(crate) flavor: F,
-    _marker: std::marker::PhantomData<T>,
+    _marker: veloq_std::marker::PhantomData<T>,
 }
 
 unsafe impl<T: Send, F: ChannelFlavor, Q: Queue<T>> Send for State<T, F, Q> {}
@@ -183,7 +190,7 @@ impl<T, F: ChannelFlavor, Q: Queue<T>> State<T, F, Q> {
             sender_count: AtomicUsize::new(1),
             receiver_count: AtomicUsize::new(1),
             flavor: F::new(),
-            _marker: std::marker::PhantomData,
+            _marker: veloq_std::marker::PhantomData,
         }
     }
 
@@ -201,9 +208,11 @@ impl<T, F: ChannelFlavor, Q: Queue<T>> State<T, F, Q> {
         if !self.is_closed.swap(true, Ordering::SeqCst) {
             // Wake all receivers
             let mut lock = self.recv_waiters.lock();
-            while let Some(node) = lock.pop_front() {
-                node.as_ref().waker.wake();
-            }
+            lock.with_mut(|l| {
+                while let Some(node) = l.pop_front() {
+                    node.as_ref().waker.wake();
+                }
+            });
         }
     }
 
@@ -217,10 +226,12 @@ impl<T, F: ChannelFlavor, Q: Queue<T>> State<T, F, Q> {
     fn notify_recv_one(&self) {
         if self.recv_waiter_count.load(Ordering::Relaxed) > 0 {
             let mut lock = self.recv_waiters.lock();
-            if let Some(node) = lock.pop_front() {
-                self.recv_waiter_count.fetch_sub(1, Ordering::Relaxed);
-                node.as_ref().waker.wake();
-            }
+            lock.with_mut(|l| {
+                if let Some(node) = l.pop_front() {
+                    self.recv_waiter_count.fetch_sub(1, Ordering::Relaxed);
+                    node.as_ref().waker.wake();
+                }
+            });
         }
     }
 }
@@ -461,10 +472,10 @@ impl<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> Future for RecvFuture<'a, 'b, T, 
 
             if !this.queued || !this.node.link.is_linked() {
                 let mut lock = state.recv_waiters.lock();
-                if !this.node.link.is_linked() {
+                if !lock.with(|_| this.node.link.is_linked()) {
                     unsafe {
                         let node_pin = Pin::new_unchecked(&mut this.node);
-                        lock.push_back(node_pin);
+                        lock.with_mut(|l| l.push_back(node_pin));
                     }
                     state.recv_waiter_count.fetch_add(1, Ordering::Relaxed);
                 }
@@ -490,11 +501,14 @@ fn remove_recv_waiter<T, F: ChannelFlavor, Q: Queue<T>>(
     node: Pin<&mut ConcurrentWaiterNode>,
 ) {
     let mut lock = state.recv_waiters.lock();
-    if node.link.is_linked() {
+    let is_linked = lock.with(|_| node.link.is_linked());
+    if is_linked {
         unsafe {
             let ptr = NonNull::from(&*node);
-            let mut cursor = lock.cursor_mut_from_ptr(ptr);
-            cursor.remove();
+            lock.with_mut(|l| {
+                let mut cursor = l.cursor_mut_from_ptr(ptr);
+                cursor.remove();
+            });
             state.recv_waiter_count.fetch_sub(1, Ordering::Relaxed);
         }
     }
@@ -546,12 +560,14 @@ impl<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> Stream for ReceiverStream<'a, 'b,
                 this.node.waker.register(cx.waker());
             }
 
-            if !this.queued || !this.node.link.is_linked() {
+            let is_linked = this.node.link.is_linked();
+            if !this.queued || !is_linked {
                 let mut lock = state.recv_waiters.lock();
-                if !this.node.link.is_linked() {
+                let is_linked_under_lock = lock.with(|_| this.node.link.is_linked());
+                if !is_linked_under_lock {
                     unsafe {
                         let node_pin = Pin::new_unchecked(&mut this.node);
-                        lock.push_back(node_pin);
+                        lock.with_mut(|l| l.push_back(node_pin));
                     }
                     state.recv_waiter_count.fetch_add(1, Ordering::Relaxed);
                 }
@@ -696,12 +712,14 @@ impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Stream for OwnedReceiverStream<'a, T,
                 this.node.waker.register(cx.waker());
             }
 
-            if !this.queued || !this.node.link.is_linked() {
+            let is_linked = this.node.link.is_linked();
+            if !this.queued || !is_linked {
                 let mut lock = this.state.recv_waiters.lock();
-                if !this.node.link.is_linked() {
+                let is_linked_under_lock = lock.with(|_| this.node.link.is_linked());
+                if !is_linked_under_lock {
                     unsafe {
                         let node_pin = Pin::new_unchecked(&mut this.node);
-                        lock.push_back(node_pin);
+                        lock.with_mut(|l| l.push_back(node_pin));
                     }
                     this.state.recv_waiter_count.fetch_add(1, Ordering::Relaxed);
                 }

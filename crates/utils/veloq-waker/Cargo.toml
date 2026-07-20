@@ -16,6 +16,7 @@ veloq-std.workspace = true
 
 [features]
 loom = ["veloq-std/loom"]
+std = ["veloq-std/std"]
 
 [dev-dependencies]
 loom.workspace = true

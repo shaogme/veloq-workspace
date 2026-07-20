@@ -1,16 +1,18 @@
-use crate::shim::Arc;
-use crate::shim::atomic::AtomicUsize;
-use crate::shim::cell::UnsafeCell;
-
 use veloq_waker::MwsrWaker;
 
-use std::fmt;
-use std::future::Future;
-use std::mem::ManuallyDrop;
-use std::pin::Pin;
-use std::sync::atomic::Ordering;
-use std::task::Poll::{Pending, Ready};
-use std::task::{Context, Poll};
+use veloq_std::{
+    cell::UnsafeCell,
+    fmt,
+    future::Future,
+    mem::ManuallyDrop,
+    pin::Pin,
+    sync::atomic::Ordering,
+    sync::{Arc, atomic::AtomicUsize},
+    task::{
+        Context, Poll,
+        Poll::{Pending, Ready},
+    },
+};
 
 /// Creates a new one-shot channel state.
 pub fn channel<T>() -> State<T> {
@@ -141,7 +143,7 @@ pub struct Receiver<'a, T> {
 }
 
 pub mod error {
-    use std::fmt;
+    use veloq_std::fmt;
 
     /// Error returned by the `Future` implementation for `Receiver`.
     #[derive(Debug, Eq, PartialEq, Clone)]
@@ -162,7 +164,7 @@ pub mod error {
         }
     }
 
-    impl std::error::Error for RecvError {}
+    impl veloq_std::error::Error for RecvError {}
 
     impl fmt::Display for TryRecvError {
         fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -173,7 +175,7 @@ pub mod error {
         }
     }
 
-    impl std::error::Error for TryRecvError {}
+    impl veloq_std::error::Error for TryRecvError {}
 }
 
 use self::error::*;
@@ -202,7 +204,7 @@ impl<'a, T> Sender<'a, T> {
 
     /// Waits for the channel to be closed.
     pub async fn closed(&mut self) {
-        use std::future::poll_fn;
+        use veloq_std::future::poll_fn;
         poll_fn(|cx| self.poll_closed(cx)).await;
     }
 
@@ -414,7 +416,7 @@ impl<T> OwnedSender<T> {
     /// Sends a value.
     pub fn send(self, t: T) -> Result<(), T> {
         let this = ManuallyDrop::new(self);
-        let state = unsafe { std::ptr::read(&*this.state) };
+        let state = unsafe { veloq_std::ptr::read(&*this.state) };
         let sender = Sender { state: &state };
         sender.send(t)
     }

@@ -8,6 +8,7 @@ mod raw_rwlock;
 mod rwlock;
 
 pub mod atomic;
+mod spin_lock;
 
 #[cfg(not(feature = "loom"))]
 pub use mutex::const_mutex;
@@ -21,6 +22,7 @@ pub use raw_rwlock::RawRwLock;
 #[cfg(not(feature = "loom"))]
 pub use rwlock::const_rwlock;
 pub use rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+pub use spin_lock::{SpinLock, SpinLockGuard};
 
 #[cfg(not(feature = "loom"))]
 pub use alloc_crate::sync::Arc;

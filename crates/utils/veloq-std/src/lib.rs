@@ -55,6 +55,10 @@ pub mod fmt {
     pub use core::fmt::*;
 }
 
+pub mod future {
+    pub use core::future::*;
+}
+
 pub mod marker {
     pub use core::marker::*;
 }
@@ -103,6 +107,4 @@ pub mod string {
     pub use alloc_crate::string::*;
 }
 
-pub mod panic {
-    pub use core::panic::*;
-}
+pub mod panic;

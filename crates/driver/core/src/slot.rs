@@ -7,7 +7,7 @@ use crate::{
 };
 use diagweave::prelude::*;
 use std::marker::PhantomData;
-use veloq_shim::atomic::Ordering;
+use veloq_std::sync::atomic::Ordering;
 
 pub trait SlotSpec {
     type Op: PlatformOp;

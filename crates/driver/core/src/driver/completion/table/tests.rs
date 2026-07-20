@@ -13,7 +13,7 @@ use crate::{
         SlotView,
     },
 };
-use veloq_shim::atomic::Ordering;
+use veloq_std::sync::atomic::Ordering;
 
 struct DummyPlatformOp;
 

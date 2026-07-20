@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use veloq_shim::atomic::{AtomicU64, Ordering};
+use veloq_std::sync::atomic::{AtomicU64, Ordering};
 
 use super::anomaly::{
     AnomalyAttach, AnomalyOutcome, CompletionAnomaly, CompletionAnomalyKind,

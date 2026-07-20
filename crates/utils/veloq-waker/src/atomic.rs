@@ -116,50 +116,49 @@ impl AtomicWaker {
                 return;
             }
 
-            if tag == 0
-                && vtable == NOOP_PTR {
-                    let registering_vtable = vtable.set(REGISTERING);
-                    match self
-                        .vtable
-                        .compare_exchange(vtable, registering_vtable, AcqRel, Acquire)
-                    {
-                        Ok(_) => {
-                            let owned_waker = ManuallyDrop::new(waker.clone());
-                            self.data.store(owned_waker.data() as *mut (), Release);
-                            let new_vtable = owned_waker.vtable_ptr().set(REGISTERED);
-                            match self.vtable.compare_exchange(
-                                registering_vtable,
-                                new_vtable,
-                                Release,
-                                Acquire,
-                            ) {
-                                Ok(_) => {
-                                    // Successfully registered, update local cache
-                                    self.cached_vtable.store(waker_vtable, Relaxed);
-                                    self.cached_data.store(waker_data as *mut (), Relaxed);
-                                    return;
-                                }
-                                Err(actual) => {
-                                    debug_assert_eq!(actual.tag(), WAKING);
-                                    self.vtable.store(NOOP_PTR, Release);
-                                    self.data.store(ptr::null_mut(), Release);
+            if tag == 0 && vtable == NOOP_PTR {
+                let registering_vtable = vtable.set(REGISTERING);
+                match self
+                    .vtable
+                    .compare_exchange(vtable, registering_vtable, AcqRel, Acquire)
+                {
+                    Ok(_) => {
+                        let owned_waker = ManuallyDrop::new(waker.clone());
+                        self.data.store(owned_waker.data() as *mut (), Release);
+                        let new_vtable = owned_waker.vtable_ptr().set(REGISTERED);
+                        match self.vtable.compare_exchange(
+                            registering_vtable,
+                            new_vtable,
+                            Release,
+                            Acquire,
+                        ) {
+                            Ok(_) => {
+                                // Successfully registered, update local cache
+                                self.cached_vtable.store(waker_vtable, Relaxed);
+                                self.cached_data.store(waker_data as *mut (), Relaxed);
+                                return;
+                            }
+                            Err(actual) => {
+                                debug_assert_eq!(actual.tag(), WAKING);
+                                self.vtable.store(NOOP_PTR, Release);
+                                self.data.store(ptr::null_mut(), Release);
 
-                                    // Registration failed, clear local cache
-                                    self.cached_vtable.store(ptr::null_mut(), Relaxed);
-                                    self.cached_data.store(ptr::null_mut(), Relaxed);
+                                // Registration failed, clear local cache
+                                self.cached_vtable.store(ptr::null_mut(), Relaxed);
+                                self.cached_data.store(ptr::null_mut(), Relaxed);
 
-                                    let raw_waker = ManuallyDrop::into_inner(owned_waker);
-                                    raw_waker.wake();
-                                    return;
-                                }
+                                let raw_waker = ManuallyDrop::into_inner(owned_waker);
+                                raw_waker.wake();
+                                return;
                             }
                         }
-                        Err(actual) => {
-                            vtable = actual;
-                            continue;
-                        }
+                    }
+                    Err(actual) => {
+                        vtable = actual;
+                        continue;
                     }
                 }
+            }
 
             if tag == REGISTERED {
                 let clean_vtable = vtable.unset(TAG_MASK);
