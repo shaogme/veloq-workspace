@@ -7,7 +7,6 @@ mod raw_mutex;
 #[cfg(not(feature = "loom"))]
 mod raw_rwlock;
 mod rwlock;
-#[cfg(not(feature = "loom"))]
 pub(crate) mod sys;
 
 pub mod atomic;
