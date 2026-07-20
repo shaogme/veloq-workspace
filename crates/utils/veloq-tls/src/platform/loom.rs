@@ -33,7 +33,7 @@ impl Drop for ThreadValue {
 }
 
 loom::thread_local! {
-    static THREAD_VALUES: RefCell<Vec<(u32, ThreadValue)>> = RefCell::new(Vec::new());
+    static THREAD_VALUES: RefCell<Vec<Option<ThreadValue>>> = RefCell::new(Vec::new());
 }
 
 unsafe fn tls_destructor_shim<T>(ptr: *mut ()) {
@@ -53,8 +53,9 @@ impl PlatformKey for Key {
     unsafe fn free(self) {
         let _ = THREAD_VALUES.try_with(|cell| {
             let mut values = cell.borrow_mut();
-            if let Some(pos) = values.iter().position(|(k, _)| *k == self.0) {
-                values.remove(pos);
+            let idx = self.0 as usize;
+            if idx < values.len() {
+                values[idx] = None;
             }
         });
     }
@@ -64,8 +65,13 @@ impl PlatformKey for Key {
         THREAD_VALUES
             .try_with(|cell| {
                 let values = cell.borrow();
-                if let Some(pair) = values.iter().find(|(k, _)| *k == self.0) {
-                    pair.1.ptr.0 as *mut T
+                let idx = self.0 as usize;
+                if idx < values.len() {
+                    if let Some(ref val) = values[idx] {
+                        val.ptr.0 as *mut T
+                    } else {
+                        null_mut()
+                    }
                 } else {
                     null_mut()
                 }
@@ -77,20 +83,20 @@ impl PlatformKey for Key {
     unsafe fn set_value<T>(self, ptr: *mut T) -> Result<(), i32> {
         let res = THREAD_VALUES.try_with(|cell| {
             let mut values = cell.borrow_mut();
+            let idx = self.0 as usize;
             if ptr.is_null() {
-                if let Some(pos) = values.iter().position(|(k, _)| *k == self.0) {
-                    values.remove(pos);
+                if idx < values.len() {
+                    values[idx] = None;
                 }
             } else {
                 let val = ThreadValue {
                     ptr: SendPtr(ptr as *mut ()),
                     destructor: tls_destructor_shim::<T>,
                 };
-                if let Some(pair) = values.iter_mut().find(|(k, _)| *k == self.0) {
-                    pair.1 = val;
-                } else {
-                    values.push((self.0, val));
+                if idx >= values.len() {
+                    values.resize_with(idx + 1, || None);
                 }
+                values[idx] = Some(val);
             }
             Ok(())
         });
