@@ -121,7 +121,7 @@ impl MwsrWaker {
                 unreachable!("concurrent register detected on MwsrWaker");
                 #[cfg(not(debug_assertions))]
                 unsafe {
-                    std::hint::unreachable_unchecked()
+                    core::hint::unreachable_unchecked()
                 }
             }
         }

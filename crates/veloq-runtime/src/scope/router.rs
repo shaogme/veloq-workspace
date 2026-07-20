@@ -21,8 +21,8 @@ use std::{
     },
     task::Waker,
 };
-use veloq_waker::MwsrWaker;
 use veloq_storage::{AtomicOptionPtr, AtomicStorage, StateOptionPtr, Storage};
+use veloq_waker::MwsrWaker;
 
 pub(crate) enum RoutedTakeResult<T> {
     Ok(T),
