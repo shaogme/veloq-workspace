@@ -16,7 +16,7 @@ use crate::{
     },
     thread::{
         AbortedError, ThreadErrorKind, ThreadId,
-        traits::{PlatformImpl, RawJoinHandleTrait, RawThreadErrorTrait},
+        traits::{RawJoinHandleTrait, RawThreadErrorTrait, SystermImpl},
     },
     time::Duration,
 };
@@ -276,9 +276,9 @@ impl<'a, T: Send> RawJoinHandleTrait<T> for RawJoinHandle<'a, T> {
 }
 
 /// Windows 平台下的平台实现结构体
-pub struct Platform;
+pub struct Systerm;
 
-impl PlatformImpl for Platform {
+impl SystermImpl for Systerm {
     type Error = RawThreadError;
     type RawJoinHandle<'a, T: Send>
         = RawJoinHandle<'a, T>

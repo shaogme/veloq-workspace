@@ -1,6 +1,6 @@
 extern crate std;
 
-use crate::{PlatformKey, TlsErrorKind};
+use crate::{SystermKey, TlsErrorKind};
 use alloc::{boxed::Box, vec::Vec};
 use core::{
     cell::RefCell,
@@ -48,7 +48,7 @@ unsafe fn tls_destructor_shim<T>(ptr: *mut ()) {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Key(u32);
 
-impl PlatformKey for Key {
+impl SystermKey for Key {
     #[inline]
     unsafe fn free(self) {
         let _ = THREAD_VALUES.try_with(|cell| {

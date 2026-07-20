@@ -1,7 +1,7 @@
 use crate::{
     fmt,
     ops::{Add, AddAssign, Sub, SubAssign},
-    time::sys::{Platform, PlatformImpl},
+    time::sys::{Systerm, SystermImpl},
 };
 
 pub use core::time::*;
@@ -9,15 +9,15 @@ pub use core::time::*;
 mod sys;
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Instant(<PlatformImpl as Platform>::RawInstant);
+pub struct Instant(<SystermImpl as Systerm>::RawInstant);
 
 impl Instant {
     pub fn now() -> Self {
-        Self(PlatformImpl::now())
+        Self(SystermImpl::now())
     }
 
     pub fn duration_since(&self, earlier: Instant) -> Duration {
-        PlatformImpl::duration_since(self.0, earlier.0)
+        SystermImpl::duration_since(self.0, earlier.0)
     }
 
     pub fn checked_duration_since(&self, earlier: Instant) -> Option<Duration> {
@@ -38,11 +38,11 @@ impl Instant {
     }
 
     pub fn checked_add(&self, other: Duration) -> Option<Instant> {
-        PlatformImpl::checked_add(self.0, other).map(Instant)
+        SystermImpl::checked_add(self.0, other).map(Instant)
     }
 
     pub fn checked_sub(&self, other: Duration) -> Option<Instant> {
-        PlatformImpl::checked_sub(self.0, other).map(Instant)
+        SystermImpl::checked_sub(self.0, other).map(Instant)
     }
 }
 

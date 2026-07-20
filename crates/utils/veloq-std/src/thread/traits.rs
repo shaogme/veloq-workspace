@@ -37,7 +37,7 @@ pub trait RawJoinHandleTrait<T: Send>: Send + Sync {
 }
 
 /// 平台线程实现的统一抽象接口
-pub trait PlatformImpl: Sized {
+pub trait SystermImpl: Sized {
     /// 错误类型
     type Error: RawThreadErrorTrait;
 

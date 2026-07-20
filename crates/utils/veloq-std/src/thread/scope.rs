@@ -2,14 +2,14 @@ pub mod raw;
 
 use crate::{
     string::String,
-    thread::{Builder, Platform, ThreadError},
+    thread::{Builder, Systerm, ThreadError},
 };
 use raw::{RawScope, RawScopedJoinHandle, scope as raw_scope};
 
 /// 结构化并发的作用域封装结构体
 #[repr(transparent)]
 pub struct Scope<'scope, 'env> {
-    pub(crate) inner: RawScope<'scope, 'env, Platform>,
+    pub(crate) inner: RawScope<'scope, 'env, Systerm>,
 }
 
 impl<'scope, 'env> Scope<'scope, 'env> {
@@ -83,7 +83,7 @@ impl<'scope, 'env> ScopeBuilder<'scope, 'env> {
 
 /// 作用域内生成的线程加入句柄的封装结构体
 pub struct ScopedJoinHandle<'scope, R: Send + 'scope> {
-    pub(crate) inner: RawScopedJoinHandle<'scope, Platform, R>,
+    pub(crate) inner: RawScopedJoinHandle<'scope, Systerm, R>,
 }
 
 unsafe impl<'scope, R: Send + 'scope> Send for ScopedJoinHandle<'scope, R> {}
@@ -106,9 +106,9 @@ pub fn scope<'env, F, T>(f: F) -> T
 where
     F: for<'scope> FnOnce(&'scope Scope<'scope, 'env>) -> T,
 {
-    raw_scope::<Platform, _, _>(|raw_scope| {
+    raw_scope::<Systerm, _, _>(|raw_scope| {
         let wrapper = unsafe {
-            &*(raw_scope as *const RawScope<'_, 'env, Platform> as *const Scope<'_, 'env>)
+            &*(raw_scope as *const RawScope<'_, 'env, Systerm> as *const Scope<'_, 'env>)
         };
         f(wrapper)
     })

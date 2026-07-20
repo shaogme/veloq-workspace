@@ -1,4 +1,4 @@
-use crate::{PlatformKey, TlsErrorKind, is_sentinel};
+use crate::{SystermKey, TlsErrorKind, is_sentinel};
 use alloc::boxed::Box;
 use core::{
     ffi::c_void,
@@ -13,7 +13,7 @@ use windows_sys::Win32::{
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Key(u32);
 
-impl PlatformKey for Key {
+impl SystermKey for Key {
     #[inline]
     unsafe fn free(self) {
         unsafe {

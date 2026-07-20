@@ -5,7 +5,7 @@ use crate::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         sys,
     },
-    thread::traits::{PlatformImpl, RawJoinHandleTrait},
+    thread::traits::{RawJoinHandleTrait, SystermImpl},
 };
 
 #[cfg(feature = "std")]
@@ -18,14 +18,14 @@ use crate::{
     thread::traits::RawThreadErrorTrait,
 };
 
-pub(crate) struct RawScopeData<P: PlatformImpl> {
+pub(crate) struct RawScopeData<P: SystermImpl> {
     pub(crate) num_running_threads: AtomicU32,
     pub(crate) cancelled: AtomicBool,
     #[cfg(feature = "std")]
     pub(crate) panics: AtomicPtr<P::Error>,
 }
 
-impl<P: PlatformImpl> RawScopeData<P> {
+impl<P: SystermImpl> RawScopeData<P> {
     #[cfg(feature = "std")]
     fn pop_panic(&self) -> Option<P::Error> {
         let ptr = self.panics.swap(null_mut(), Ordering::Acquire);
@@ -40,7 +40,7 @@ impl<P: PlatformImpl> RawScopeData<P> {
     }
 }
 
-impl<P: PlatformImpl> Drop for RawScopeData<P> {
+impl<P: SystermImpl> Drop for RawScopeData<P> {
     fn drop(&mut self) {
         #[cfg(feature = "std")]
         {
@@ -55,14 +55,14 @@ impl<P: PlatformImpl> Drop for RawScopeData<P> {
 }
 
 /// 结构化并发的作用域，用于管理在其中生成的线程的生命周期。
-pub struct RawScope<'scope, 'env: 'scope, P: PlatformImpl> {
+pub struct RawScope<'scope, 'env: 'scope, P: SystermImpl> {
     data: &'scope RawScopeData<P>,
     _scope: PhantomData<&'scope mut &'scope ()>,
     _env: PhantomData<&'env mut &'env ()>,
 }
 
 /// 作用域内生成的线程的加入句柄，允许等待线程完成并获取其返回值。
-pub struct RawScopedJoinHandle<'scope, P: PlatformImpl, R: Send + 'scope> {
+pub struct RawScopedJoinHandle<'scope, P: SystermImpl, R: Send + 'scope> {
     handle: Option<P::RawJoinHandle<'scope, Option<R>>>,
     #[cfg(feature = "std")]
     scope_data: &'scope RawScopeData<P>,
@@ -70,13 +70,13 @@ pub struct RawScopedJoinHandle<'scope, P: PlatformImpl, R: Send + 'scope> {
     _scope_data: PhantomData<&'scope RawScopeData<P>>,
 }
 
-unsafe impl<'scope, P: PlatformImpl, R: Send + 'scope> Send for RawScopedJoinHandle<'scope, P, R> {}
-unsafe impl<'scope, P: PlatformImpl, R: Send + Sync + 'scope> Sync
+unsafe impl<'scope, P: SystermImpl, R: Send + 'scope> Send for RawScopedJoinHandle<'scope, P, R> {}
+unsafe impl<'scope, P: SystermImpl, R: Send + Sync + 'scope> Sync
     for RawScopedJoinHandle<'scope, P, R>
 {
 }
 
-impl<'scope, 'env, P: PlatformImpl> RawScope<'scope, 'env, P> {
+impl<'scope, 'env, P: SystermImpl> RawScope<'scope, 'env, P> {
     /// 检查当前作用域是否已被取消（例如主线程发生 panic）
     pub fn is_cancelled(&self) -> bool {
         self.data.cancelled.load(Ordering::Acquire)
@@ -104,10 +104,10 @@ impl<'scope, 'env, P: PlatformImpl> RawScope<'scope, 'env, P> {
     {
         let scope_data = self.data;
         let closure = move || {
-            struct ThreadFinishedGuard<'a, P: PlatformImpl> {
+            struct ThreadFinishedGuard<'a, P: SystermImpl> {
                 data: &'a RawScopeData<P>,
             }
-            impl<P: PlatformImpl> Drop for ThreadFinishedGuard<'_, P> {
+            impl<P: SystermImpl> Drop for ThreadFinishedGuard<'_, P> {
                 fn drop(&mut self) {
                     let old = self
                         .data
@@ -186,7 +186,7 @@ impl<'scope, 'env, P: PlatformImpl> RawScope<'scope, 'env, P> {
     }
 }
 
-impl<'scope, P: PlatformImpl, R: Send + 'scope> RawScopedJoinHandle<'scope, P, R> {
+impl<'scope, P: SystermImpl, R: Send + 'scope> RawScopedJoinHandle<'scope, P, R> {
     /// 等待子线程执行结束并返回其结果。
     pub fn join(mut self) -> Result<R, P::Error> {
         let handle = self.handle.take().expect("handle already joined");
@@ -215,11 +215,11 @@ impl<'scope, P: PlatformImpl, R: Send + 'scope> RawScopedJoinHandle<'scope, P, R
     }
 }
 
-struct RawScopeGuard<'scope, P: PlatformImpl> {
+struct RawScopeGuard<'scope, P: SystermImpl> {
     data: &'scope RawScopeData<P>,
     completed_successfully: bool,
 }
-impl<P: PlatformImpl> Drop for RawScopeGuard<'_, P> {
+impl<P: SystermImpl> Drop for RawScopeGuard<'_, P> {
     fn drop(&mut self) {
         if !self.completed_successfully {
             self.data.cancelled.store(true, Ordering::Release);
@@ -249,7 +249,7 @@ impl<P: PlatformImpl> Drop for RawScopeGuard<'_, P> {
 
 pub fn scope<'env, P, F, R>(f: F) -> R
 where
-    P: PlatformImpl,
+    P: SystermImpl,
     F: for<'scope> FnOnce(&'scope RawScope<'scope, 'env, P>) -> R,
 {
     let scope_data = RawScopeData {

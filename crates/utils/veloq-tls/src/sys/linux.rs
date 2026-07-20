@@ -1,4 +1,4 @@
-use crate::{PlatformKey, TlsErrorKind, is_sentinel};
+use crate::{SystermKey, TlsErrorKind, is_sentinel};
 use alloc::boxed::Box;
 use core::{
     hint::spin_loop,
@@ -12,7 +12,7 @@ use libc::{
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Key(pthread_key_t);
 
-impl PlatformKey for Key {
+impl SystermKey for Key {
     #[inline]
     unsafe fn free(self) {
         unsafe {

@@ -1,4 +1,4 @@
-use crate::time::{Duration, sys::Platform};
+use crate::time::{Duration, sys::Systerm};
 
 use libc::{CLOCK_MONOTONIC, c_long, clock_gettime, time_t, timespec};
 
@@ -8,9 +8,9 @@ pub struct Timespec {
     pub tv_nsec: c_long,
 }
 
-pub struct PlatformImpl;
+pub struct SystermImpl;
 
-impl Platform for PlatformImpl {
+impl Systerm for SystermImpl {
     type RawInstant = Timespec;
 
     fn now() -> Self::RawInstant {

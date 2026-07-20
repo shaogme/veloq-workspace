@@ -1,17 +1,17 @@
 #[cfg(all(target_os = "windows", not(feature = "loom")))]
 mod windows;
 #[cfg(all(target_os = "windows", not(feature = "loom")))]
-pub use windows::{Platform, RawJoinHandle, RawThreadError};
+pub use windows::{RawJoinHandle, RawThreadError, Systerm};
 
 #[cfg(all(any(target_os = "linux", target_os = "android"), not(feature = "loom")))]
 mod linux;
 #[cfg(all(any(target_os = "linux", target_os = "android"), not(feature = "loom")))]
-pub use linux::{Platform, RawJoinHandle, RawThreadError};
+pub use linux::{RawJoinHandle, RawThreadError, Systerm};
 
 #[cfg(feature = "loom")]
 mod loom;
 #[cfg(feature = "loom")]
-pub use loom::{Platform, RawJoinHandle, RawThreadError};
+pub use loom::{RawJoinHandle, RawThreadError, Systerm};
 
 use crate::{
     boxed::Box,

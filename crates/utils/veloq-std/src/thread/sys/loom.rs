@@ -7,7 +7,7 @@ use crate::{
     sync::{Arc, atomic::Ordering},
     thread::{
         AbortedError, ThreadErrorKind, ThreadId,
-        traits::{PlatformImpl, RawJoinHandleTrait, RawThreadErrorTrait},
+        traits::{RawJoinHandleTrait, RawThreadErrorTrait, SystermImpl},
     },
     time::Duration,
 };
@@ -120,9 +120,9 @@ impl<'a, T: Send> RawJoinHandleTrait<T> for RawJoinHandle<'a, T> {
     }
 }
 
-pub struct Platform;
+pub struct Systerm;
 
-impl PlatformImpl for Platform {
+impl SystermImpl for Systerm {
     type Error = RawThreadError;
     type RawJoinHandle<'a, T: Send>
         = RawJoinHandle<'a, T>

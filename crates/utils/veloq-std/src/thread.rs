@@ -3,7 +3,7 @@ use traits::*;
 
 mod parker;
 mod sys;
-pub use sys::{Platform, RawJoinHandle, RawThreadError};
+pub use sys::{RawJoinHandle, RawThreadError, Systerm};
 
 mod scope;
 pub use scope::{
@@ -115,7 +115,7 @@ where
     F: FnOnce() -> T + Send + 'a,
     T: Send + 'a,
 {
-    Platform::spawn(None, None, f)
+    Systerm::spawn(None, None, f)
         .map(|inner| JoinHandle { inner })
         .map_err(ThreadError::new)
 }
@@ -125,14 +125,14 @@ where
 /// 如果成功让出或切换到了另一个线程，返回 `Ok(true)`；否则返回 `Ok(false)`。
 /// 如果检测到当前线程已被中止，则返回 `Err(AbortedError)`。
 pub fn yield_now() -> Result<bool, AbortedError> {
-    Platform::yield_now()
+    Systerm::yield_now()
 }
 
 /// 使当前线程睡眠指定的时长。
 ///
 /// 如果检测到当前线程已被中止，则返回 `Err(AbortedError)`。
 pub fn sleep(dur: Duration) -> Result<(), AbortedError> {
-    Platform::sleep(dur)
+    Systerm::sleep(dur)
 }
 
 /// 线程的唯一标识符
@@ -221,7 +221,7 @@ pub fn park_timeout(dur: Duration) {
 
 /// 获取系统的可用并行度 (逻辑 CPU 核心数)
 pub fn available_parallelism() -> Result<NonZeroUsize, ThreadError> {
-    Platform::available_parallelism().map_err(ThreadError::new)
+    Systerm::available_parallelism().map_err(ThreadError::new)
 }
 
 /// 获取当前线程是否正在 panic。
@@ -268,7 +268,7 @@ impl Builder {
         F: FnOnce() -> T + Send + 'a,
         T: Send + 'a,
     {
-        Platform::spawn(self.name, self.stack_size, f)
+        Systerm::spawn(self.name, self.stack_size, f)
             .map(|inner| JoinHandle { inner })
             .map_err(ThreadError::new)
     }
