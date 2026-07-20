@@ -1,4 +1,6 @@
-use std::{
+#![no_std]
+
+use core::{
     error::Error,
     fmt,
     mem::{self, align_of, size_of},

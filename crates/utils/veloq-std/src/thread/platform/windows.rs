@@ -22,9 +22,8 @@ use crate::{
 use windows_sys::Win32::{
     Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_OBJECT_0},
     System::Threading::{
-        ALL_PROCESSOR_GROUPS, CreateThread, GetActiveProcessorCount, GetCurrentThread,
-        GetCurrentThreadId, INFINITE, SetThreadDescription, Sleep, SwitchToThread,
-        WaitForSingleObject,
+        ALL_PROCESSOR_GROUPS, CreateThread, GetActiveProcessorCount, GetCurrentThread, INFINITE,
+        SetThreadDescription, Sleep, SwitchToThread, WaitForSingleObject,
     },
 };
 
@@ -35,6 +34,7 @@ pub struct RawJoinHandle<'a, T> {
     handle: Option<HANDLE>,
     result: Option<ThreadResultReceiver<'a, T>>,
     _marker: PhantomData<&'a ()>,
+    pub(crate) thread: crate::thread::Thread,
 }
 
 unsafe impl<T: Send> Send for RawJoinHandle<'_, T> {}
@@ -105,6 +105,8 @@ where
 {
     let state = unsafe { Arc::from_raw(param as *const ThreadSharedState<F, T>) };
 
+    let _ = super::CURRENT_THREAD.set_owned(state.thread.clone());
+
     super::CURRENT_THREAD_STATUS.with_or_default(|cell| {
         cell.set(Some(&state.status as *const AtomicU8));
     });
@@ -116,7 +118,6 @@ where
             let current_thread = GetCurrentThread();
             let _ = SetThreadDescription(current_thread, name_u16.as_ptr());
         }
-        let _ = super::CURRENT_THREAD_NAME.set_owned(name.clone());
     }
 
     struct ThreadStatusGuard;
@@ -170,6 +171,8 @@ where
     #[cfg(feature = "loom")]
     type BoxF<'a, T> = crate::boxed::Box<dyn FnOnce() -> T + Send + 'a>;
 
+    let thread = crate::thread::Thread::new(name.clone());
+
     #[cfg(not(feature = "loom"))]
     let state = Arc::new(ThreadSharedState {
         closure: UnsafeCell::new(Some(f)),
@@ -177,6 +180,7 @@ where
         result: SafeUnsafeCell::new(None),
         panic_payload: SafeUnsafeCell::new(None),
         name,
+        thread: thread.clone(),
     });
 
     #[cfg(feature = "loom")]
@@ -186,6 +190,7 @@ where
         result: SafeUnsafeCell::new(None),
         panic_payload: SafeUnsafeCell::new(None),
         name,
+        thread: thread.clone(),
     });
 
     let receiver = ThreadResultReceiver {
@@ -222,6 +227,7 @@ where
             handle: Some(handle),
             result: Some(receiver),
             _marker: PhantomData,
+            thread,
         })
     }
 }
@@ -348,8 +354,7 @@ impl PlatformImpl for Platform {
     }
 
     fn current_id() -> ThreadId {
-        let id = unsafe { GetCurrentThreadId() };
-        ThreadId(id as u64)
+        crate::thread::current().id()
     }
 
     fn available_parallelism() -> Result<NonZeroUsize, Self::Error> {

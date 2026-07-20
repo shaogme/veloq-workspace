@@ -18,6 +18,7 @@ lock_api = { version = "0.4.14", default-features = false }
 veloq-hash.workspace = true
 veloq-tls.workspace = true
 crossbeam-utils.workspace = true
+crossbeam-queue.workspace = true
 
 [dependencies.loom]
 workspace = true

@@ -76,7 +76,7 @@ pub(crate) const STATE_ABORTED: u8 = 3;
 pub(crate) static CURRENT_THREAD_STATUS: veloq_tls::Tls<Cell<Option<*const AtomicU8>>> =
     veloq_tls::Tls::new();
 
-pub(crate) static CURRENT_THREAD_NAME: veloq_tls::Tls<String> = veloq_tls::Tls::new();
+pub(crate) static CURRENT_THREAD: veloq_tls::Tls<super::Thread> = veloq_tls::Tls::new();
 
 /// 包装以在线程间安全共享的 UnsafeCell
 pub(crate) struct SafeUnsafeCell<T>(UnsafeCell<T>);
@@ -116,6 +116,7 @@ pub(crate) struct ThreadSharedState<F, T> {
     pub(crate) result: SafeUnsafeCell<Option<T>>,
     pub(crate) panic_payload: SafeUnsafeCell<ThreadPanicPayload>,
     pub(crate) name: Option<String>,
+    pub(crate) thread: super::Thread,
 }
 
 unsafe impl<F: Send, T: Send> Send for ThreadSharedState<F, T> {}

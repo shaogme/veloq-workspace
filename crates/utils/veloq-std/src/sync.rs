@@ -8,6 +8,7 @@ mod raw_rwlock;
 mod rwlock;
 
 pub mod atomic;
+pub mod mpsc;
 mod spin_lock;
 
 #[cfg(not(feature = "loom"))]

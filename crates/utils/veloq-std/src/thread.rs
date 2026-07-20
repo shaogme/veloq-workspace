@@ -1,6 +1,7 @@
 pub mod traits;
 use traits::*;
 
+mod parker;
 mod platform;
 pub use platform::{Platform, RawJoinHandle, RawThreadError};
 
@@ -16,6 +17,7 @@ use crate::{
     fmt::{self, Formatter, Result as FmtResult},
     num::NonZeroUsize,
     string::String,
+    sync::Arc,
     time::Duration,
 };
 
@@ -91,6 +93,11 @@ unsafe impl<T: Send> Send for JoinHandle<'_, T> {}
 unsafe impl<T: Send> Sync for JoinHandle<'_, T> {}
 
 impl<'a, T: Send> JoinHandle<'a, T> {
+    /// 获取与该加入句柄关联的线程的引用。
+    pub fn thread(&self) -> &Thread {
+        &self.inner.thread
+    }
+
     /// 等待线程执行结束 (Join)
     pub fn join(self) -> Result<T, ThreadError> {
         self.inner.join().map_err(ThreadError::new)
@@ -139,32 +146,77 @@ impl ThreadId {
     }
 }
 
-/// 统一的线程表示结构体
-#[derive(Debug, Clone)]
-pub struct Thread {
-    id: ThreadId,
+use parker::Parker;
+
+struct Inner {
     name: Option<String>,
+    parker: Parker,
+}
+
+/// 统一的线程表示结构体
+#[derive(Clone)]
+pub struct Thread {
+    inner: Arc<Inner>,
+}
+
+impl fmt::Debug for Thread {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        f.debug_struct("Thread")
+            .field("id", &self.id())
+            .field("name", &self.name())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Thread {
+    pub(crate) fn new(name: Option<String>) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                name,
+                parker: Parker::new(),
+            }),
+        }
+    }
+
     /// 获取当前线程的唯一标识符
     pub fn id(&self) -> ThreadId {
-        self.id
+        ThreadId(Arc::as_ptr(&self.inner) as *const () as u64)
     }
 
     /// 获取线程的名称（如果有）
     pub fn name(&self) -> Option<&str> {
-        self.name.as_deref()
+        self.inner.name.as_deref()
+    }
+
+    /// 原子地使该线程的令牌可用。
+    pub fn unpark(&self) {
+        self.inner.parker.unpark();
+    }
+
+    /// 阻塞当前线程。
+    pub fn park(&self) {
+        self.inner.parker.park();
+    }
+
+    /// 阻塞当前线程，最多等待指定的时长。
+    pub fn park_timeout(&self, dur: Duration) {
+        self.inner.parker.park_timeout(dur);
     }
 }
 
 /// 获取当前线程
 pub fn current() -> Thread {
-    let name = platform::CURRENT_THREAD_NAME.try_with(|s| s.clone()).ok();
-    Thread {
-        id: Platform::current_id(),
-        name,
-    }
+    platform::CURRENT_THREAD.with_or_init(|t| t.clone(), || Thread::new(None))
+}
+
+/// 阻塞当前线程。
+pub fn park() {
+    current().park();
+}
+
+/// 阻塞当前线程，最多等待指定的时长。
+pub fn park_timeout(dur: Duration) {
+    current().park_timeout(dur);
 }
 
 /// 获取系统的可用并行度 (逻辑 CPU 核心数)

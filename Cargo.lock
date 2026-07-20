@@ -1538,6 +1538,7 @@ dependencies = [
 name = "veloq-std"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-queue",
  "crossbeam-utils",
  "hashbrown 0.17.1",
  "libc",
