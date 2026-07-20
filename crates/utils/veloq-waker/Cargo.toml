@@ -19,6 +19,11 @@ loom = ["veloq-std/loom"]
 
 [dev-dependencies]
 loom.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "waker_bench"
+harness = false
 
 [lints]
 workspace = true

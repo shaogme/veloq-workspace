@@ -3,7 +3,7 @@ use veloq_std::{
     fmt,
     sync::atomic::{
         AtomicUsize,
-        Ordering::{AcqRel, Acquire, Relaxed, Release},
+        Ordering::{AcqRel, Acquire, Release},
     },
     task::Waker,
 };
@@ -66,11 +66,6 @@ impl MwsrWaker {
     /// Calling this function concurrently from multiple threads/tasks is undefined behavior.
     /// However, it is fully safe to call `register` concurrently with `wake`.
     pub unsafe fn register(&self, waker: &Waker) {
-        if self.state.load(Relaxed) == WAKING {
-            waker.wake_by_ref();
-            return;
-        }
-
         match self
             .state
             .compare_exchange(WAITING, REGISTERING, Acquire, Acquire)
@@ -89,7 +84,7 @@ impl MwsrWaker {
                 // Release the lock.
                 let res = self
                     .state
-                    .compare_exchange(REGISTERING, WAITING, AcqRel, Acquire);
+                    .compare_exchange(REGISTERING, WAITING, Release, Acquire);
 
                 match res {
                     Ok(_) => {}
@@ -112,17 +107,13 @@ impl MwsrWaker {
                 }
             }
             Err(WAKING) => {
-                // A concurrent wake is in progress. Wake the new waker immediately to avoid losing the wake event.
                 waker.wake_by_ref();
             }
-            Err(_) => {
-                // Since there is no concurrent register, the state can never be REGISTERING or REGISTERING | WAKING.
-                #[cfg(debug_assertions)]
-                unreachable!("concurrent register detected on MwsrWaker");
-                #[cfg(not(debug_assertions))]
-                unsafe {
-                    core::hint::unreachable_unchecked()
-                }
+            Err(state) => {
+                // In this case, a concurrent thread is holding the "registering" lock.
+                // This indicates a bug in the caller's code as racing to call `register`
+                // is undefined behavior.
+                debug_assert!(state == REGISTERING || state == REGISTERING | WAKING);
             }
         }
     }
@@ -140,10 +131,6 @@ impl MwsrWaker {
     ///
     /// If a waker has not been registered, this returns `None`.
     pub fn take(&self) -> Option<Waker> {
-        if self.state.load(Relaxed) & WAKING != 0 {
-            return None;
-        }
-
         match self.state.fetch_or(WAKING, AcqRel) {
             WAITING => {
                 // The waking lock has been acquired.
