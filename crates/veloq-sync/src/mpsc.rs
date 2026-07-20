@@ -13,7 +13,7 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use veloq_atomic_waker::MwsrWaker;
+use veloq_waker::MwsrWaker;
 
 /// A multi-producer, single-consumer channel state.
 pub struct State<T, S, Q> {

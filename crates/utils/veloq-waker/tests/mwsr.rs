@@ -6,7 +6,7 @@ use std::{
     task::{Wake, Waker},
     thread,
 };
-use veloq_atomic_waker::MwsrWaker;
+use veloq_waker::MwsrWaker;
 
 struct TestWaker(Arc<AtomicBool>);
 

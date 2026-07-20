@@ -8,7 +8,7 @@ use std::{
     fmt::{self, Debug},
     marker::PhantomData,
 };
-use veloq_atomic_waker::AtomicWaker;
+use veloq_waker::AtomicWaker;
 use veloq_shim::{
     atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     sync::Mutex,

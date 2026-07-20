@@ -1,8 +1,8 @@
 use std::marker::PhantomPinned;
-use veloq_atomic_waker::MwsrWaker;
 use veloq_intrusive_linklist::{
     ConcurrentLink, Link, concurrent_intrusive_adapter, intrusive_adapter,
 };
+use veloq_waker::MwsrWaker;
 
 pub struct GenericWaiterNode<L> {
     pub(crate) waker: MwsrWaker,

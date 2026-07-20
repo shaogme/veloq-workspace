@@ -11,7 +11,7 @@ use std::{
     sync::Arc as StdArc,
     task::{Wake, Waker},
 };
-use veloq_atomic_waker::AtomicWaker;
+use veloq_waker::AtomicWaker;
 
 struct TestWaker(Arc<AtomicBool>);
 

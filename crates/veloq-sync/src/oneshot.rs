@@ -2,7 +2,7 @@ use crate::shim::Arc;
 use crate::shim::atomic::AtomicUsize;
 use crate::shim::cell::UnsafeCell;
 
-use veloq_atomic_waker::MwsrWaker;
+use veloq_waker::MwsrWaker;
 
 use std::fmt;
 use std::future::Future;

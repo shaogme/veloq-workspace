@@ -1,5 +1,5 @@
 [package]
-name = "veloq-atomic-waker"
+name = "veloq-waker"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -11,7 +11,7 @@ members = [
     "crates/driver/backend/iocp",
     "crates/driver/native",
     "crates/utils/veloq-shim",
-    "crates/utils/veloq-atomic-waker", 
+    "crates/utils/veloq-waker", 
     "crates/utils/veloq-intrusive-linklist", 
     "crates/utils/veloq-wheel", 
     "crates/utils/veloq-blocking",
@@ -32,7 +32,7 @@ default-members = [
     "crates/driver/native",
     "examples/disk-bench",
     "crates/utils/veloq-shim",
-    "crates/utils/veloq-atomic-waker",
+    "crates/utils/veloq-waker",
     "crates/utils/veloq-intrusive-linklist",
     "crates/utils/veloq-wheel",
     "crates/utils/veloq-blocking",
@@ -72,7 +72,7 @@ veloq-driver-iocp = { path = "crates/driver/backend/iocp", version = "0.1.0" }
 veloq-driver-native = { path = "crates/driver/native", version = "0.1.0" }
 
 veloq-shim = { path = "crates/utils/veloq-shim", version = "0.1.0" }
-veloq-atomic-waker = { path = "crates/utils/veloq-atomic-waker", version = "0.1.0" }
+veloq-waker = { path = "crates/utils/veloq-waker", version = "0.1.0" }
 veloq-intrusive-linklist = { path = "crates/utils/veloq-intrusive-linklist", version = "0.1.0" }
 veloq-wheel = { path = "crates/utils/veloq-wheel", version = "0.1.0" }
 veloq-blocking = { path = "crates/utils/veloq-blocking", version = "0.1.0" }

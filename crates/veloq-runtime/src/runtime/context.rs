@@ -24,7 +24,7 @@ use crate::{
 
 use crossbeam_deque::Worker;
 use diagweave::prelude::*;
-use veloq_atomic_waker::MwsrWaker;
+use veloq_waker::MwsrWaker;
 use veloq_storage::AtomicStorage;
 
 /// Worker 空闲时的等待策略。
