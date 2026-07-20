@@ -8,7 +8,10 @@ use veloq_driver_core::{
         SlotView,
     },
 };
-use veloq_std::{sync::{Arc, Mutex}, thread};
+use veloq_std::{
+    sync::{Arc, Mutex},
+    thread,
+};
 
 struct DummyPlatformOp;
 
