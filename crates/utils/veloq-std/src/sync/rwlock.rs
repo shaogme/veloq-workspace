@@ -1,6 +1,9 @@
 #[cfg(not(feature = "loom"))]
+pub(crate) mod raw;
+
+#[cfg(not(feature = "loom"))]
 mod std_impl {
-    use crate::sync::raw_rwlock::RawRwLock;
+    use super::raw::RawRwLock;
     use lock_api::RawRwLock as RawRwLockTrait;
 
     pub type RwLock<T> = lock_api::RwLock<RawRwLock, T>;

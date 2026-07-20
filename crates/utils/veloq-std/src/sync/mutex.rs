@@ -1,6 +1,9 @@
 #[cfg(not(feature = "loom"))]
+pub(crate) mod raw;
+
+#[cfg(not(feature = "loom"))]
 mod std_impl {
-    use crate::sync::raw_mutex::RawMutex;
+    use super::raw::RawMutex;
     use lock_api::RawMutex as RawMutexTrait;
 
     pub type Mutex<T> = lock_api::Mutex<RawMutex, T>;
