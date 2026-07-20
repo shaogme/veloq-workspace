@@ -13,7 +13,7 @@ readme.workspace = true
 
 [dependencies]
 veloq-intrusive-linklist.workspace = true
-veloq-atomic-waker.workspace = true
+veloq-waker.workspace = true
 veloq-shim.workspace = true
 
 crossbeam-utils.workspace = true
@@ -34,7 +34,7 @@ workspace = true
 
 [features]
 default = ["veloq-shim/alloc"]
-loom = ["dep:loom", "veloq-atomic-waker/loom", "veloq-intrusive-linklist/loom", "veloq-shim/loom", "veloq-shim/alloc"]
+loom = ["dep:loom", "veloq-waker/loom", "veloq-intrusive-linklist/loom", "veloq-shim/loom", "veloq-shim/alloc"]
 
 [[bench]]
 name = "mutex_bench"

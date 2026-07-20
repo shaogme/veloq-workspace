@@ -21,7 +21,7 @@ test-hooks = [
 ]
 
 [dependencies]
-veloq-atomic-waker.workspace = true
+veloq-waker.workspace = true
 veloq-buf.workspace = true
 veloq-driver-core.workspace = true
 veloq-wheel.workspace = true

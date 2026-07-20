@@ -8,11 +8,11 @@ use std::{
     fmt::{self, Debug},
     marker::PhantomData,
 };
-use veloq_atomic_waker::AtomicWaker;
 use veloq_shim::{
     atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     sync::Mutex,
 };
+use veloq_waker::AtomicWaker;
 
 #[bitsize(8)]
 #[derive(FromBits, Debug, Clone, Copy, PartialEq, Eq)]

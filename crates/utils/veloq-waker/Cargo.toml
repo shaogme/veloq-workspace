@@ -1,5 +1,5 @@
 [package]
-name = "veloq-atomic-waker"
+name = "veloq-waker"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -19,6 +19,11 @@ loom = ["veloq-std/loom"]
 
 [dev-dependencies]
 loom.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "waker_bench"
+harness = false
 
 [lints]
 workspace = true

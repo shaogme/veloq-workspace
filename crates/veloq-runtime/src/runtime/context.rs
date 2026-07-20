@@ -24,8 +24,8 @@ use crate::{
 
 use crossbeam_deque::Worker;
 use diagweave::prelude::*;
-use veloq_atomic_waker::AtomicWaker;
 use veloq_storage::AtomicStorage;
+use veloq_waker::MwsrWaker;
 
 /// Worker 空闲时的等待策略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,14 +339,14 @@ pub(crate) type WorkerTickHook = fn();
 
 pub(crate) struct RouteCell<T> {
     value: Mutex<Option<Result<T>>>,
-    waker: AtomicWaker,
+    waker: MwsrWaker,
 }
 
 impl<T> RouteCell<T> {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             value: Mutex::new(None),
-            waker: AtomicWaker::new(),
+            waker: MwsrWaker::new(),
         })
     }
 
@@ -381,7 +381,9 @@ impl<T> RouteCell<T> {
     }
 
     pub(crate) fn register(&self, waker: &Waker) {
-        self.waker.register(waker);
+        unsafe {
+            self.waker.register(waker);
+        }
     }
 }
 

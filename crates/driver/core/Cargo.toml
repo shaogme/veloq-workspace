@@ -15,10 +15,10 @@ categories.workspace = true
 [features]
 default = []
 test-hooks = []
-loom = ["veloq-shim/loom", "veloq-atomic-waker/loom", "veloq-buf/loom"]
+loom = ["veloq-shim/loom", "veloq-waker/loom", "veloq-buf/loom"]
 
 [dependencies]
-veloq-atomic-waker.workspace = true
+veloq-waker.workspace = true
 veloq-buf.workspace = true
 
 crossbeam-utils.workspace = true

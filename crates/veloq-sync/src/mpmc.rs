@@ -89,7 +89,9 @@ pub mod flavor {
             cx: &Context<'_>,
             is_full: impl Fn() -> bool,
         ) -> bool {
-            node.as_ref().waker.register(cx.waker());
+            unsafe {
+                node.as_ref().waker.register(cx.waker());
+            }
             let mut lock = self.waiters.lock();
             // Double check
             if !is_full() {
@@ -393,7 +395,9 @@ impl<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> Future for SendFuture<'a, 'b, T, 
                     continue;
                 }
             } else {
-                this.node.waker.register(cx.waker());
+                unsafe {
+                    this.node.waker.register(cx.waker());
+                }
                 return Poll::Pending;
             }
         }
@@ -451,7 +455,9 @@ impl<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> Future for RecvFuture<'a, 'b, T, 
                 return Poll::Ready(Err(TryRecvError::Disconnected));
             }
 
-            this.node.waker.register(cx.waker());
+            unsafe {
+                this.node.waker.register(cx.waker());
+            }
 
             if !this.queued || !this.node.link.is_linked() {
                 let mut lock = state.recv_waiters.lock();
@@ -536,7 +542,9 @@ impl<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> Stream for ReceiverStream<'a, 'b,
                 return Poll::Ready(None);
             }
 
-            this.node.waker.register(cx.waker());
+            unsafe {
+                this.node.waker.register(cx.waker());
+            }
 
             if !this.queued || !this.node.link.is_linked() {
                 let mut lock = state.recv_waiters.lock();
@@ -684,7 +692,9 @@ impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Stream for OwnedReceiverStream<'a, T,
                 return Poll::Ready(None);
             }
 
-            this.node.waker.register(cx.waker());
+            unsafe {
+                this.node.waker.register(cx.waker());
+            }
 
             if !this.queued || !this.node.link.is_linked() {
                 let mut lock = this.state.recv_waiters.lock();

@@ -13,7 +13,7 @@ use std::{
     pin::Pin,
     task::{Context, Poll},
 };
-use veloq_atomic_waker::AtomicWaker;
+use veloq_waker::MwsrWaker;
 
 /// A multi-producer, single-consumer channel state.
 pub struct State<T, S, Q> {
@@ -87,7 +87,7 @@ pub type BoundedOwnedReceiver<T> = GenericOwnedReceiver<T, BoundedStrategy, Arra
 // --- Core State Logic ---
 
 pub(crate) struct ChannelState {
-    rx_waker: AtomicWaker,
+    rx_waker: MwsrWaker,
     /// Number of active senders. Used to determine when to wake the receiver
     /// upon the last sender disconnecting.
     sender_count: AtomicUsize,
@@ -98,7 +98,7 @@ pub(crate) struct ChannelState {
 impl ChannelState {
     fn new() -> Self {
         Self {
-            rx_waker: AtomicWaker::new(),
+            rx_waker: MwsrWaker::new(),
             sender_count: AtomicUsize::new(1),
             receiver_active: AtomicBool::new(true),
         }
@@ -144,7 +144,7 @@ pub struct BoundedStrategy {
 }
 
 struct WakerState {
-    waker: AtomicWaker,
+    waker: MwsrWaker,
     waiting: AtomicBool,
 }
 
@@ -295,12 +295,14 @@ impl<'a, 'b, T> Future for BoundedSendFuture<'a, 'b, T> {
         // Register waiter
         if this.waker_state.is_none() {
             this.waker_state = Some(Arc::new(WakerState {
-                waker: AtomicWaker::new(),
+                waker: MwsrWaker::new(),
                 waiting: AtomicBool::new(false),
             }));
         }
         let ws = this.waker_state.as_ref().unwrap();
-        ws.waker.register(cx.waker());
+        unsafe {
+            ws.waker.register(cx.waker());
+        }
 
         if !ws.waiting.swap(true, Ordering::AcqRel) {
             strategy.send_waiters.push(ws.clone());
@@ -362,7 +364,9 @@ impl<'a, T, S: ChannelStrategy, Q: Queue<T>> Stream for GenericReceiver<'a, T, S
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = unsafe { self.get_unchecked_mut() };
-        this.state.state.rx_waker.register(cx.waker());
+        unsafe {
+            this.state.state.rx_waker.register(cx.waker());
+        }
 
         if let Some(val) = this.state.queue.pop() {
             this.state.strategy.on_msg_recv();

@@ -233,7 +233,9 @@ impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
                 }
 
                 // Register waker
-                this.node.waker.register(cx.waker());
+                unsafe {
+                    this.node.waker.register(cx.waker());
+                }
 
                 // Enqueue
                 unsafe {
@@ -258,12 +260,16 @@ impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
                     // Woken up
                     this.queued = false;
                     // Register waker to reset AtomicWaker state
-                    this.node.waker.register(cx.waker());
+                    unsafe {
+                        this.node.waker.register(cx.waker());
+                    }
                     continue;
                 }
 
                 // Register waker
-                this.node.waker.register(cx.waker());
+                unsafe {
+                    this.node.waker.register(cx.waker());
+                }
             }
 
             return Poll::Pending;

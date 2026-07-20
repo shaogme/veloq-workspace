@@ -1373,7 +1373,6 @@ dependencies = [
  "futures-util",
  "libc",
  "tracing",
- "veloq-atomic-waker",
  "veloq-blocking",
  "veloq-buf",
  "veloq-driver-native",
@@ -1382,15 +1381,8 @@ dependencies = [
  "veloq-std",
  "veloq-sync",
  "veloq-tls",
+ "veloq-waker",
  "windows-sys",
-]
-
-[[package]]
-name = "veloq-atomic-waker"
-version = "0.1.0"
-dependencies = [
- "loom",
- "veloq-std",
 ]
 
 [[package]]
@@ -1431,9 +1423,9 @@ dependencies = [
  "libc",
  "loom",
  "tracing",
- "veloq-atomic-waker",
  "veloq-buf",
  "veloq-shim",
+ "veloq-waker",
  "windows-sys",
 ]
 
@@ -1466,13 +1458,13 @@ dependencies = [
  "io-uring",
  "libc",
  "tracing",
- "veloq-atomic-waker",
  "veloq-blocking",
  "veloq-buf",
  "veloq-driver-core",
  "veloq-driver-iocp",
  "veloq-driver-uring",
  "veloq-std",
+ "veloq-waker",
  "veloq-wheel",
  "windows-sys",
 ]
@@ -1533,11 +1525,11 @@ dependencies = [
  "numaperf-topo",
  "parking_lot",
  "trybuild",
- "veloq-atomic-waker",
  "veloq-intrusive-linklist",
  "veloq-std",
  "veloq-storage",
  "veloq-tls",
+ "veloq-waker",
 ]
 
 [[package]]
@@ -1577,9 +1569,9 @@ dependencies = [
  "futures-core",
  "loom",
  "tokio",
- "veloq-atomic-waker",
  "veloq-intrusive-linklist",
  "veloq-shim",
+ "veloq-waker",
 ]
 
 [[package]]
@@ -1588,6 +1580,15 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "windows-sys",
+]
+
+[[package]]
+name = "veloq-waker"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "loom",
+ "veloq-std",
 ]
 
 [[package]]

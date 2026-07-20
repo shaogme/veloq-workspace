@@ -315,7 +315,7 @@ impl<'rt, 'reg> AsyncBufRead for LocalTcpStream<'rt, 'reg> {
             let (n, b) = self.recv_subset(buf, total).await?;
             buf = b;
             if n == 0 {
-                return Err(NetError::UnexpectedEof)?;
+                Err(NetError::UnexpectedEof)?;
             }
             total += n;
         }
@@ -337,7 +337,7 @@ impl<'rt, 'reg> AsyncBufRead for TcpStream<'rt, 'reg> {
             let (n, b) = self.recv_subset(buf, total).await?;
             buf = b;
             if n == 0 {
-                return Err(NetError::UnexpectedEof)?;
+                Err(NetError::UnexpectedEof)?;
             }
             total += n;
         }
@@ -359,7 +359,7 @@ impl<'rt, 'reg> AsyncBufWrite for LocalTcpStream<'rt, 'reg> {
             let (n, b) = self.send_subset(buf, total).await?;
             buf = b;
             if n == 0 {
-                return Err(NetError::WriteZero)?;
+                Err(NetError::WriteZero)?;
             }
             total += n;
         }
@@ -389,7 +389,7 @@ impl<'rt, 'reg> AsyncBufWrite for TcpStream<'rt, 'reg> {
             let (n, b) = self.send_subset(buf, total).await?;
             buf = b;
             if n == 0 {
-                return Err(NetError::WriteZero)?;
+                Err(NetError::WriteZero)?;
             }
             total += n;
         }

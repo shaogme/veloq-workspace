@@ -323,7 +323,9 @@ impl<'a, T: ?Sized> Future for RwLockReadFuture<'a, T> {
                 continue;
             }
 
-            this.node.waker.register(cx.waker());
+            unsafe {
+                this.node.waker.register(cx.waker());
+            }
 
             if !this.queued {
                 this.node.kind = KIND_READER;
@@ -464,7 +466,9 @@ impl<'a, T: ?Sized> Future for RwLockWriteFuture<'a, T> {
                 continue;
             }
 
-            this.node.waker.register(cx.waker());
+            unsafe {
+                this.node.waker.register(cx.waker());
+            }
 
             if !this.queued {
                 this.node.kind = KIND_WRITER;

@@ -61,7 +61,7 @@ pub struct GenericScopeCompletion<S: ScopeStorage, O: Ownership> {
     remaining: S::Usize,
     wakers: S::Lock<LinkedList<ScopeWakerAdapter<S>>>,
     cancel_token: GenericCancellationToken<S, O>,
-    panic_info: S::OptionBox<dyn Any + Send + 'static>,
+    panic_info: S::OptionFatBox<dyn Any + Send + 'static>,
     parent: S::Parent,
 }
 
@@ -83,7 +83,7 @@ impl<S: ScopeStorage, O: Ownership> GenericScopeCompletion<S, O> {
             remaining: S::Usize::new(0),
             wakers: S::Lock::new(LinkedList::new(ScopeWakerAdapter::<S>::new())),
             cancel_token: GenericCancellationToken::<S, O>::new_with_parent(cross_parent),
-            panic_info: S::OptionBox::new(None),
+            panic_info: S::OptionFatBox::new(None),
             parent,
         })
     }

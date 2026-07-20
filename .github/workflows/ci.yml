@@ -74,9 +74,13 @@ jobs:
         run: cargo xtest-windows
 
   loom-test:
-    name: Loom Test
+    name: Loom Test (${{ matrix.crate }})
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [veloq-sync, veloq-waker, veloq-driver-core]
     steps:
       - uses: actions/checkout@main
       - name: Install Rust
@@ -90,15 +94,12 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-loom-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-loom-${{ matrix.crate }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
+            ${{ runner.os }}-cargo-loom-${{ matrix.crate }}-
             ${{ runner.os }}-cargo-loom-
-      - name: Run Veloq Sync Loom tests
-        run: cargo test --release -p veloq-sync --tests --features loom
-      - name: Run Veloq Atomic Waker Loom tests
-        run: cargo test --release -p veloq-atomic-waker --tests --features loom
-      - name: Run Veloq Driver Core Loom tests
-        run: cargo test --release -p veloq-driver-core --tests --features loom
+      - name: Run Loom tests
+        run: cargo test --release -p ${{ matrix.crate }} --tests --features loom
 
   fmt:
     name: Rustfmt

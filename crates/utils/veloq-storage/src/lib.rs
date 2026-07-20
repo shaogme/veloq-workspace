@@ -8,9 +8,8 @@ mod local;
 mod transfer;
 
 pub use atomic::{
-    ArcStrategy, AtomicLock, AtomicNonNullPtr, AtomicOptionArc, AtomicOptionBox, AtomicOptionPtr,
-    AtomicStorage, AtomicWakerQueue, BoxStrategy, GenericAtomicOption, PhysicalHandle,
-    PointerStrategy,
+    AtomicLock, AtomicNonNullPtr, AtomicOptionArc, AtomicOptionBox, AtomicOptionPtr, AtomicStorage,
+    AtomicWakerQueue, GenericAtomicOption, PointerStrategy,
 };
 pub use local::{
     LocalLock, LocalStorage, LocalWakerQueue, NonNullPtr, OptionArc, OptionBox, OptionPtr, Usize,
@@ -43,8 +42,10 @@ pub trait Storage: 'static {
     type NonNullPtr<T>: StateNonNullPtr<T>;
     type Lock<T>: StateLock<T>;
     type WakerQueue: StateWakerQueue;
-    type OptionBox<T: ?Sized + Send>: StateOptionBox<T>;
-    type OptionArc<T: ?Sized + Send + Sync>: StateOptionArc<T>;
+    type OptionBox<T: Send>: StateOptionBox<T>;
+    type OptionFatBox<T: ?Sized + Send>: StateOptionBox<T>;
+    type OptionArc<T: Send + Sync>: StateOptionArc<T>;
+    type OptionFatArc<T: ?Sized + Send + Sync>: StateOptionArc<T>;
 }
 
 /// 标记所有底层 primitive 都可跨线程共享的存储策略。
