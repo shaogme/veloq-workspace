@@ -2,8 +2,8 @@ pub mod traits;
 use traits::*;
 
 mod parker;
-mod platform;
-pub use platform::{Platform, RawJoinHandle, RawThreadError};
+mod sys;
+pub use sys::{Platform, RawJoinHandle, RawThreadError};
 
 mod scope;
 pub use scope::{
@@ -206,7 +206,7 @@ impl Thread {
 
 /// 获取当前线程
 pub fn current() -> Thread {
-    platform::CURRENT_THREAD.with_or_init(|t| t.clone(), || Thread::new(None))
+    sys::CURRENT_THREAD.with_or_init(|t| t.clone(), || Thread::new(None))
 }
 
 /// 阻塞当前线程。

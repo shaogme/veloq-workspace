@@ -8,7 +8,6 @@ pub mod cell;
 pub mod collections;
 pub mod macros;
 pub mod sync;
-pub mod sys;
 pub mod thread;
 pub mod time;
 

@@ -1,8 +1,8 @@
 use crate::time::Duration;
 
 #[cfg(not(feature = "loom"))]
-use crate::{
-    sync::atomic::{AtomicU32, Ordering},
+use crate::sync::{
+    atomic::{AtomicU32, Ordering},
     sys::{wait_on_address, wait_on_address_timeout, wake_by_address},
 };
 

@@ -3,13 +3,13 @@
 extern crate alloc;
 
 mod error;
-mod platform;
 mod shared;
+mod sys;
 mod tls;
 
 // Re-export internal items for submodules
-pub(crate) use platform::{AtomicKey, Key, PlatformKey};
 pub(crate) use shared::{ResetGuard, is_sentinel, sentinel_ptr};
+pub(crate) use sys::{AtomicKey, Key, PlatformKey};
 
 // Public exports
 pub use error::{TlsError, TlsErrorKind};

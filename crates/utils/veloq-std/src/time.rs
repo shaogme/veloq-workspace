@@ -1,12 +1,12 @@
 use crate::{
     fmt,
     ops::{Add, AddAssign, Sub, SubAssign},
-    time::platform::{Platform, PlatformImpl},
+    time::sys::{Platform, PlatformImpl},
 };
 
 pub use core::time::*;
 
-mod platform;
+mod sys;
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Instant(<PlatformImpl as Platform>::RawInstant);

@@ -1,4 +1,4 @@
-use crate::time::{Duration, platform::Platform};
+use crate::time::{Duration, sys::Platform};
 
 use libc::{CLOCK_MONOTONIC, c_long, clock_gettime, time_t, timespec};
 

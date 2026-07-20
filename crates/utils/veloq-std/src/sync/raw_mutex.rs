@@ -1,6 +1,8 @@
 use crate::{
-    sync::atomic::{AtomicU32, Ordering},
-    sys,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        sys,
+    },
     time::{Duration, Instant},
 };
 use lock_api::{GuardSend, RawMutex as RawMutexTrait, RawMutexFair, RawMutexTimed};

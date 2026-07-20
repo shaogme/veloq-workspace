@@ -1,8 +1,10 @@
 use crate::{
     marker::PhantomData,
     string::String,
-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
-    sys,
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        sys,
+    },
     thread::traits::{PlatformImpl, RawJoinHandleTrait},
 };
 

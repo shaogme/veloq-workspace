@@ -278,3 +278,132 @@ fn test_once_lock_drop() {
     }
     assert_eq!(DROP_COUNTER.load(Ordering::SeqCst), 1);
 }
+
+#[cfg(not(feature = "loom"))]
+mod condvar_tests {
+    use std::vec::Vec;
+    use veloq_std::sync::{Arc, Condvar, Mutex};
+    use veloq_std::thread;
+    use veloq_std::time::Duration;
+
+    #[test]
+    fn test_condvar_basic() {
+        let pair = Arc::new((Mutex::new(false), Condvar::new()));
+        let pair2 = pair.clone();
+
+        thread::spawn(move || {
+            let (lock, cvar) = &*pair2;
+            let mut started = lock.lock();
+            *started = true;
+            cvar.notify_one();
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+
+        let (lock, cvar) = &*pair;
+        let mut started = lock.lock();
+        while !*started {
+            started = cvar.wait(started);
+        }
+        assert!(*started);
+    }
+
+    #[test]
+    fn test_condvar_timeout() {
+        let pair = Arc::new((Mutex::new(false), Condvar::new()));
+        let pair2 = pair.clone();
+
+        let handle = thread::spawn(move || {
+            let (lock, cvar) = &*pair2;
+            let mut started = lock.lock();
+            *started = true;
+            cvar.notify_one();
+        })
+        .unwrap();
+
+        let (lock, cvar) = &*pair;
+        let mut started = lock.lock();
+        while !*started {
+            let (g, res) = cvar.wait_timeout(started, Duration::from_millis(100));
+            started = g;
+            if res.timed_out() {
+                break;
+            }
+        }
+        assert!(*started);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_condvar_timeout_expired() {
+        let pair = Arc::new((Mutex::new(false), Condvar::new()));
+        let (lock, cvar) = &*pair;
+        let started = lock.lock();
+        let (_g, res) = cvar.wait_timeout(started, Duration::from_millis(10));
+        assert!(res.timed_out());
+    }
+
+    #[test]
+    fn test_condvar_notify_all() {
+        let pair = Arc::new((Mutex::new(0), Condvar::new()));
+        let mut handles = Vec::new();
+
+        for _ in 0..3 {
+            let pair_clone = pair.clone();
+            let handle = thread::spawn(move || {
+                let (lock, cvar) = &*pair_clone;
+                let mut count = lock.lock();
+                while *count == 0 {
+                    count = cvar.wait(count);
+                }
+                *count += 1;
+            })
+            .unwrap();
+            handles.push(handle);
+        }
+
+        thread::sleep(Duration::from_millis(20)).unwrap();
+
+        let (lock, cvar) = &*pair;
+        {
+            let mut count = lock.lock();
+            *count = 1;
+            cvar.notify_all();
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(*lock.lock(), 4);
+    }
+}
+
+#[cfg(feature = "loom")]
+mod loom_tests {
+    use loom::thread;
+    use veloq_std::sync::{Arc, Condvar, Mutex};
+
+    #[test]
+    fn test_loom_condvar() {
+        loom::model(|| {
+            let pair = Arc::new((Mutex::new(false), Condvar::new()));
+            let pair2 = pair.clone();
+
+            thread::spawn(move || {
+                let (lock, cvar) = &*pair2;
+                let mut started = lock.lock();
+                *started = true;
+                cvar.notify_one();
+            });
+
+            let (lock, cvar) = &*pair;
+            let mut started = lock.lock();
+            while !*started {
+                started = cvar.wait(started);
+            }
+            assert!(*started);
+        });
+    }
+}

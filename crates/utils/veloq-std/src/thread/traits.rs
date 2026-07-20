@@ -16,10 +16,10 @@ pub trait RawThreadErrorTrait: Error + Send + Sync + 'static {
     fn kind(&self) -> ThreadErrorKind;
 
     /// 从原始 panic payload 构造错误实例
-    fn from_panic(payload: super::platform::ThreadPanicPayload) -> Self;
+    fn from_panic(payload: super::sys::ThreadPanicPayload) -> Self;
 
     /// 提取原始的 panic payload 并在原处留下 None
-    fn take_panic(&mut self) -> super::platform::ThreadPanicPayload {
+    fn take_panic(&mut self) -> super::sys::ThreadPanicPayload {
         Default::default()
     }
 }

@@ -1,6 +1,6 @@
 use crate::{
     sync::atomic::Ordering,
-    time::{Duration, platform::Platform},
+    time::{Duration, sys::Platform},
 };
 
 use crate::sync::atomic::CoreAtomicU64;

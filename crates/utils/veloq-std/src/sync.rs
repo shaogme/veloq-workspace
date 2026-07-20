@@ -1,3 +1,4 @@
+mod condvar;
 mod mutex;
 mod once;
 mod once_lock;
@@ -6,11 +7,14 @@ mod raw_mutex;
 #[cfg(not(feature = "loom"))]
 mod raw_rwlock;
 mod rwlock;
+#[cfg(not(feature = "loom"))]
+pub(crate) mod sys;
 
 pub mod atomic;
 pub mod mpsc;
 mod spin_lock;
 
+pub use condvar::{Condvar, WaitTimeoutResult};
 #[cfg(not(feature = "loom"))]
 pub use mutex::const_mutex;
 pub use mutex::{Mutex, MutexGuard};
