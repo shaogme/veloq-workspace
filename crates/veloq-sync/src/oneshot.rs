@@ -2,7 +2,7 @@ use crate::shim::Arc;
 use crate::shim::atomic::AtomicUsize;
 use crate::shim::cell::UnsafeCell;
 
-use veloq_atomic_waker::AtomicWaker;
+use veloq_atomic_waker::MwsrWaker;
 
 use std::fmt;
 use std::future::Future;
@@ -26,10 +26,10 @@ pub struct State<T> {
     value: UnsafeCell<Option<T>>,
 
     /// The task to notify when the receiver drops without consuming the value.
-    tx_task: AtomicWaker,
+    tx_task: MwsrWaker,
 
     /// The task to notify when the value is sent.
-    rx_task: AtomicWaker,
+    rx_task: MwsrWaker,
 }
 
 #[derive(Clone, Copy)]
@@ -48,8 +48,8 @@ impl<T> State<T> {
         State {
             state: AtomicUsize::new(StateVal::new().as_usize()),
             value: UnsafeCell::new(None),
-            tx_task: AtomicWaker::new(),
-            rx_task: AtomicWaker::new(),
+            tx_task: MwsrWaker::new(),
+            rx_task: MwsrWaker::new(),
         }
     }
 
@@ -59,8 +59,8 @@ impl<T> State<T> {
         State {
             state: AtomicUsize::new(StateVal::new().as_usize()),
             value: UnsafeCell::new(None),
-            tx_task: AtomicWaker::new(),
-            rx_task: AtomicWaker::new(),
+            tx_task: MwsrWaker::new(),
+            rx_task: MwsrWaker::new(),
         }
     }
 
@@ -219,7 +219,9 @@ impl<'a, T> Sender<'a, T> {
             return Ready(());
         }
 
-        self.state.tx_task.register(cx.waker());
+        unsafe {
+            self.state.tx_task.register(cx.waker());
+        }
 
         // Double check after registration to avoid races
         if StateVal::load(&self.state.state, Ordering::Acquire).is_closed() {
@@ -352,7 +354,9 @@ impl<'a, T> Future for Receiver<'a, T> {
         }
 
         // Register waker
-        state.rx_task.register(cx.waker());
+        unsafe {
+            state.rx_task.register(cx.waker());
+        }
 
         // Double check state
         let state_val = StateVal::load(&state.state, Ordering::Acquire);

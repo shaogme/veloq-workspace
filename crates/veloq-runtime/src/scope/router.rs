@@ -21,7 +21,7 @@ use std::{
     },
     task::Waker,
 };
-use veloq_atomic_waker::AtomicWaker;
+use veloq_atomic_waker::MwsrWaker;
 use veloq_storage::{AtomicOptionPtr, AtomicStorage, StateOptionPtr, Storage};
 
 pub(crate) enum RoutedTakeResult<T> {
@@ -170,7 +170,7 @@ where
 pub(crate) struct RoutedSpawnState<'scope_ref, T> {
     outcome: AtomicOptionPtr<RoutedSpawnOutcomeInner<'scope_ref, T>>,
     cancel_requested: AtomicBool,
-    waker: AtomicWaker,
+    waker: MwsrWaker,
 }
 
 pub(crate) fn new_failed_routed_state<'scope_ref, T>(
@@ -186,7 +186,7 @@ impl<'scope_ref, T> RoutedSpawnState<'scope_ref, T> {
         Arc::new(Self {
             outcome: AtomicOptionPtr::new(None),
             cancel_requested: AtomicBool::new(false),
-            waker: AtomicWaker::new(),
+            waker: MwsrWaker::new(),
         })
     }
 
@@ -271,7 +271,9 @@ impl<'scope_ref, T> RoutedSpawnState<'scope_ref, T> {
     }
 
     pub(crate) fn register(&self, waker: &Waker) {
-        self.waker.register(waker);
+        unsafe {
+            self.waker.register(waker);
+        }
     }
 }
 
