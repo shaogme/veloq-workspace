@@ -13,11 +13,11 @@ pub use scope::{
 };
 
 use crate::{
+    alloc_crate::sync::Arc,
     error::Error,
     fmt::{self, Formatter, Result as FmtResult},
     num::NonZeroUsize,
     string::String,
-    sync::Arc,
     time::Duration,
 };
 

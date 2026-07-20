@@ -1,6 +1,7 @@
 use core::num::NonZeroUsize;
 
 use super::{SafeUnsafeCell, Sentinel, ThreadResultReceiver, ThreadSharedState};
+
 use crate::{
     cell::UnsafeCell,
     error::Error,
@@ -168,24 +169,10 @@ where
     F: FnOnce() -> T + Send + 'a,
     T: Send + 'a,
 {
-    #[cfg(feature = "loom")]
-    type BoxF<'a, T> = crate::boxed::Box<dyn FnOnce() -> T + Send + 'a>;
-
     let thread = crate::thread::Thread::new(name.clone());
 
-    #[cfg(not(feature = "loom"))]
     let state = Arc::new(ThreadSharedState {
         closure: UnsafeCell::new(Some(f)),
-        status: AtomicU8::new(super::STATE_INCOMPLETE),
-        result: SafeUnsafeCell::new(None),
-        panic_payload: SafeUnsafeCell::new(None),
-        name,
-        thread: thread.clone(),
-    });
-
-    #[cfg(feature = "loom")]
-    let state = Arc::new(ThreadSharedState {
-        closure: UnsafeCell::new(Some(crate::boxed::Box::new(f) as BoxF<'a, T>)),
         status: AtomicU8::new(super::STATE_INCOMPLETE),
         result: SafeUnsafeCell::new(None),
         panic_payload: SafeUnsafeCell::new(None),
@@ -200,10 +187,7 @@ where
     let param = Arc::into_raw(state) as *mut c_void;
 
     unsafe {
-        #[cfg(not(feature = "loom"))]
         let entry = thread_entry_win::<F, T>;
-        #[cfg(feature = "loom")]
-        let entry = thread_entry_win::<BoxF<'a, T>, T>;
 
         let handle = CreateThread(
             null(),
@@ -216,10 +200,7 @@ where
 
         if handle.is_null() {
             let err = GetLastError();
-            #[cfg(not(feature = "loom"))]
             let _ = Arc::from_raw(param as *const ThreadSharedState<F, T>);
-            #[cfg(feature = "loom")]
-            let _ = Arc::from_raw(param as *const ThreadSharedState<BoxF<'a, T>, T>);
             return Err(RawThreadError::CreationFailed(err));
         }
 

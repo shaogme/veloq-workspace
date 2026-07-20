@@ -91,6 +91,7 @@ impl fmt::Debug for Instant {
 }
 
 #[cfg(test)]
+#[cfg(not(feature = "loom"))]
 mod tests {
     use alloc_crate::format;
 

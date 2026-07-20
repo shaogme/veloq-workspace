@@ -1,5 +1,5 @@
 use veloq_std::{
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{CoreAtomicU32, Ordering},
     sync::{Once, OnceLock},
     thread,
     time::Duration,
@@ -264,7 +264,7 @@ fn test_once_lock_traits() {
 
 #[test]
 fn test_once_lock_drop() {
-    static DROP_COUNTER: AtomicU32 = AtomicU32::new(0);
+    static DROP_COUNTER: CoreAtomicU32 = CoreAtomicU32::new(0);
     struct Detector;
     impl Drop for Detector {
         fn drop(&mut self) {

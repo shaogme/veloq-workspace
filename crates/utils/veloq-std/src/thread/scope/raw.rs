@@ -235,10 +235,10 @@ impl<P: PlatformImpl> Drop for RawScopeGuard<'_, P> {
         {
             if !panicking() {
                 let panic_err = self.data.pop_panic();
-                if let Some(mut err) = panic_err {
-                    if let Some(p) = err.take_panic() {
-                        resume_unwind(p);
-                    }
+                if let Some(mut err) = panic_err
+                    && let Some(p) = err.take_panic()
+                {
+                    resume_unwind(p);
                 }
             }
         }

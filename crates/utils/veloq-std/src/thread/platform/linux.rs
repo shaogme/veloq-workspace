@@ -1,6 +1,7 @@
 use core::num::NonZeroUsize;
 
 use super::{SafeUnsafeCell, Sentinel, ThreadResultReceiver, ThreadSharedState};
+
 use crate::{
     cell::UnsafeCell,
     error::Error,
@@ -19,7 +20,6 @@ use crate::{
         traits::{PlatformImpl, RawJoinHandleTrait, RawThreadErrorTrait},
     },
     time::Duration,
-    vec::Vec,
 };
 use libc::{
     nanosleep, pthread_create, pthread_detach, pthread_join, pthread_t, sched_yield, timespec,
@@ -38,7 +38,7 @@ pub struct RawJoinHandle<'a, T> {
 unsafe impl<T: Send> Send for RawJoinHandle<'_, T> {}
 unsafe impl<T: Send> Sync for RawJoinHandle<'_, T> {}
 
-#[derive(Debug, Debug)]
+#[derive(Debug)]
 pub enum RawThreadError {
     CreationFailed(c_int),
     JoinFailed(c_int),
@@ -169,24 +169,10 @@ where
     F: FnOnce() -> T + Send + 'a,
     T: Send + 'a,
 {
-    #[cfg(feature = "loom")]
-    type BoxF<'a, T> = crate::boxed::Box<dyn FnOnce() -> T + Send + 'a>;
-
     let thread = crate::thread::Thread::new(name.clone());
 
-    #[cfg(not(feature = "loom"))]
     let state = Arc::new(ThreadSharedState {
         closure: UnsafeCell::new(Some(f)),
-        status: AtomicU8::new(super::STATE_INCOMPLETE),
-        result: SafeUnsafeCell::new(None),
-        panic_payload: SafeUnsafeCell::new(None),
-        name,
-        thread: thread.clone(),
-    });
-
-    #[cfg(feature = "loom")]
-    let state = Arc::new(ThreadSharedState {
-        closure: UnsafeCell::new(Some(crate::boxed::Box::new(f) as BoxF<'a, T>)),
         status: AtomicU8::new(super::STATE_INCOMPLETE),
         result: SafeUnsafeCell::new(None),
         panic_payload: SafeUnsafeCell::new(None),
@@ -202,34 +188,28 @@ where
     let mut thread_id: pthread_t = unsafe { zeroed() };
 
     unsafe {
-        #[cfg(not(feature = "loom"))]
         let entry = thread_entry_posix::<F, T>;
-        #[cfg(feature = "loom")]
-        let entry = thread_entry_posix::<BoxF<'a, T>, T>;
 
         let mut attr: libc::pthread_attr_t = zeroed();
         let mut attr_ptr = null();
-        if let Some(size) = stack_size {
-            if libc::pthread_attr_init(&mut attr) == 0 {
-                // Ensure stack size is at least 16KB to prevent failure
-                let target_size = core::cmp::max(size, 16384);
-                if libc::pthread_attr_setstacksize(&mut attr, target_size as _) == 0 {
-                    attr_ptr = &attr;
-                }
+        if let Some(size) = stack_size
+            && libc::pthread_attr_init(&mut attr) == 0
+        {
+            // Ensure stack size is at least 16KB to prevent failure
+            let target_size = core::cmp::max(size, 16384);
+            if libc::pthread_attr_setstacksize(&mut attr, target_size as _) == 0 {
+                attr_ptr = &attr;
             }
         }
 
         let res = pthread_create(&mut thread_id, attr_ptr, entry, param);
 
-        if attr_ptr != null() {
+        if !attr_ptr.is_null() {
             let _ = libc::pthread_attr_destroy(&mut attr);
         }
 
         if res != 0 {
-            #[cfg(not(feature = "loom"))]
             let _ = Arc::from_raw(param as *const ThreadSharedState<F, T>);
-            #[cfg(feature = "loom")]
-            let _ = Arc::from_raw(param as *const ThreadSharedState<BoxF<'a, T>, T>);
             return Err(RawThreadError::CreationFailed(res));
         }
 

@@ -14,3 +14,8 @@ readme.workspace = true
 [dependencies]
 libc.workspace = true
 windows-sys = { workspace = true, features = ["Win32_System_Threading"] }
+loom = { workspace = true, optional = true }
+
+[features]
+loom = ["dep:loom"]
+

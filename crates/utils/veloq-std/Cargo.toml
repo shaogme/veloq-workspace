@@ -28,7 +28,7 @@ optional = true
 [features]
 default = ["std"]
 std = []
-loom = ["dep:loom"]
+loom = ["dep:loom", "veloq-tls/loom"]
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc.workspace = true

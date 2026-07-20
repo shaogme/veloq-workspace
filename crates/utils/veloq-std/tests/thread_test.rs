@@ -1,11 +1,11 @@
 use veloq_std::{
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{CoreAtomicBool, Ordering},
     thread::spawn,
 };
 
 #[test]
 fn test_spawn_and_join() {
-    static CALLED: AtomicBool = AtomicBool::new(false);
+    static CALLED: CoreAtomicBool = CoreAtomicBool::new(false);
 
     let thread = spawn(|| {
         CALLED.store(true, Ordering::SeqCst);

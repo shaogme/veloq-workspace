@@ -59,7 +59,7 @@ pub const CELL_STATE_BUSY: u8 = 4;
 #[inline(always)]
 fn spin_yield() {
     #[cfg(feature = "loom")]
-    veloq_std::thread::yield_now();
+    let _ = veloq_std::thread::yield_now();
     #[cfg(not(feature = "loom"))]
     std::hint::spin_loop();
 }

@@ -15,14 +15,20 @@ pub(crate) trait PlatformKey: Copy + Send + Sync {
     unsafe fn set_value<T>(self, ptr: *mut T) -> Result<(), i32>;
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(feature = "loom")]
+mod loom;
+
+#[cfg(feature = "loom")]
+pub(crate) use loom::{AtomicKey, Key};
+
+#[cfg(all(not(feature = "loom"), target_os = "windows"))]
 mod windows;
 
-#[cfg(target_os = "windows")]
+#[cfg(all(not(feature = "loom"), target_os = "windows"))]
 pub(crate) use windows::{AtomicKey, Key};
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(feature = "loom"), not(target_os = "windows")))]
 mod linux;
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(feature = "loom"), not(target_os = "windows")))]
 pub(crate) use linux::{AtomicKey, Key};

@@ -1,12 +1,17 @@
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", not(feature = "loom")))]
 mod windows;
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", not(feature = "loom")))]
 pub use windows::{Platform, RawJoinHandle, RawThreadError};
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(any(target_os = "linux", target_os = "android"), not(feature = "loom")))]
 mod linux;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(any(target_os = "linux", target_os = "android"), not(feature = "loom")))]
 pub use linux::{Platform, RawJoinHandle, RawThreadError};
+
+#[cfg(feature = "loom")]
+mod loom;
+#[cfg(feature = "loom")]
+pub use loom::{Platform, RawJoinHandle, RawThreadError};
 
 use crate::{
     boxed::Box,
@@ -140,7 +145,7 @@ where
     }
 
     unsafe fn take_panic(&self) -> ThreadPanicPayload {
-        unsafe { self.panic_payload.with_mut(|x| core::mem::take(x)) }
+        unsafe { self.panic_payload.with_mut(core::mem::take) }
     }
 }
 

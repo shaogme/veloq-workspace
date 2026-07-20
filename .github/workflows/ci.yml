@@ -80,7 +80,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [veloq-sync, veloq-waker, veloq-driver-core]
+        crate: [veloq-sync, veloq-waker, veloq-std, veloq-driver-core]
     steps:
       - uses: actions/checkout@main
       - name: Install Rust

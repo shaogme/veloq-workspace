@@ -59,6 +59,7 @@ mod loom_impl {
 pub use loom_impl::*;
 
 #[cfg(test)]
+#[cfg(not(feature = "loom"))]
 mod tests {
     use crate::sync::Arc;
     use crate::sync::mutex::Mutex;

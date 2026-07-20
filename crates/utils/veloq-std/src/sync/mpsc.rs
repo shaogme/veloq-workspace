@@ -155,7 +155,11 @@ impl<T> Receiver<T> {
         if let Some(val) = self.inner.queue.pop() {
             Ok(val)
         } else if self.inner.senders.load(Ordering::Acquire) == 0 {
-            Err(TryRecvError::Disconnected)
+            if let Some(val) = self.inner.queue.pop() {
+                Ok(val)
+            } else {
+                Err(TryRecvError::Disconnected)
+            }
         } else {
             Err(TryRecvError::Empty)
         }
@@ -168,6 +172,9 @@ impl<T> Receiver<T> {
                 return Ok(val);
             }
             if self.inner.senders.load(Ordering::Acquire) == 0 {
+                if let Some(val) = self.inner.queue.pop() {
+                    return Ok(val);
+                }
                 return Err(RecvError);
             }
 
@@ -185,6 +192,9 @@ impl<T> Receiver<T> {
             if self.inner.senders.load(Ordering::Acquire) == 0 {
                 let mut blocked = self.inner.blocked_thread.lock();
                 *blocked = None;
+                if let Some(val) = self.inner.queue.pop() {
+                    return Ok(val);
+                }
                 return Err(RecvError);
             }
 
@@ -203,6 +213,9 @@ impl<T> Receiver<T> {
                 return Ok(val);
             }
             if self.inner.senders.load(Ordering::Acquire) == 0 {
+                if let Some(val) = self.inner.queue.pop() {
+                    return Ok(val);
+                }
                 return Err(RecvTimeoutError::Disconnected);
             }
             let now = Instant::now();
@@ -225,6 +238,9 @@ impl<T> Receiver<T> {
             if self.inner.senders.load(Ordering::Acquire) == 0 {
                 let mut blocked = self.inner.blocked_thread.lock();
                 *blocked = None;
+                if let Some(val) = self.inner.queue.pop() {
+                    return Ok(val);
+                }
                 return Err(RecvTimeoutError::Disconnected);
             }
 
