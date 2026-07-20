@@ -1,5 +1,6 @@
 use crate::{
     marker::PhantomData,
+    string::String,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
     sys,
     thread::traits::{PlatformImpl, RawJoinHandleTrait},
@@ -85,6 +86,20 @@ impl<'scope, 'env, P: PlatformImpl> RawScope<'scope, 'env, P> {
         F: FnOnce() -> R + Send + 'env,
         R: Send + 'env,
     {
+        self.spawn_with(None, None, f)
+    }
+
+    /// 在当前作用域内，使用特定属性生成一个新线程并执行闭包 `f`。
+    pub fn spawn_with<F, R>(
+        &'scope self,
+        name: Option<String>,
+        stack_size: Option<usize>,
+        f: F,
+    ) -> Result<RawScopedJoinHandle<'scope, P, R>, P::Error>
+    where
+        F: FnOnce() -> R + Send + 'env,
+        R: Send + 'env,
+    {
         let scope_data = self.data;
         let closure = move || {
             struct ThreadFinishedGuard<'a, P: PlatformImpl> {
@@ -155,7 +170,7 @@ impl<'scope, 'env, P: PlatformImpl> RawScope<'scope, 'env, P> {
             active: true,
         };
 
-        let handle = P::spawn(closure)?;
+        let handle = P::spawn(name, stack_size, closure)?;
 
         rollback.active = false;
 

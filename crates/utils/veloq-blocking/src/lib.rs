@@ -1,6 +1,9 @@
+#![no_std]
+
 use crossbeam_queue::SegQueue;
 use parking_lot::{Condvar, Mutex};
-use std::{
+use veloq_std::{
+    boxed::Box,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc,

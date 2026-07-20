@@ -9,6 +9,7 @@ use crate::{
     marker::PhantomData,
     mem::zeroed,
     ptr::{null, null_mut},
+    string::String,
     sync::{
         Arc,
         atomic::{AtomicU8, Ordering},
@@ -18,6 +19,7 @@ use crate::{
         traits::{PlatformImpl, RawJoinHandleTrait, RawThreadErrorTrait},
     },
     time::Duration,
+    vec::Vec,
 };
 use libc::{
     nanosleep, pthread_create, pthread_detach, pthread_join, pthread_t, sched_yield, timespec,
@@ -104,6 +106,19 @@ where
         cell.set(Some(&state.status as *const AtomicU8));
     });
 
+    if let Some(ref name) = state.name {
+        let mut name_bytes = name.as_bytes().to_vec();
+        if name_bytes.len() > 15 {
+            name_bytes.truncate(15);
+        }
+        name_bytes.push(0);
+        unsafe {
+            let current_thread = libc::pthread_self();
+            let _ = libc::pthread_setname_np(current_thread, name_bytes.as_ptr() as *const _);
+        }
+        let _ = super::CURRENT_THREAD_NAME.set_owned(name.clone());
+    }
+
     struct ThreadStatusGuard;
     impl Drop for ThreadStatusGuard {
         fn drop(&mut self) {
@@ -143,7 +158,11 @@ where
     null_mut()
 }
 
-fn spawn<'a, F, T>(f: F) -> Result<RawJoinHandle<'a, T>, RawThreadError>
+fn spawn<'a, F, T>(
+    name: Option<String>,
+    stack_size: Option<usize>,
+    f: F,
+) -> Result<RawJoinHandle<'a, T>, RawThreadError>
 where
     F: FnOnce() -> T + Send + 'a,
     T: Send + 'a,
@@ -157,6 +176,7 @@ where
         status: AtomicU8::new(super::STATE_INCOMPLETE),
         result: SafeUnsafeCell::new(None),
         panic_payload: SafeUnsafeCell::new(None),
+        name,
     });
 
     #[cfg(feature = "loom")]
@@ -165,6 +185,7 @@ where
         status: AtomicU8::new(super::STATE_INCOMPLETE),
         result: SafeUnsafeCell::new(None),
         panic_payload: SafeUnsafeCell::new(None),
+        name,
     });
 
     let receiver = ThreadResultReceiver {
@@ -180,7 +201,23 @@ where
         #[cfg(feature = "loom")]
         let entry = thread_entry_posix::<BoxF<'a, T>, T>;
 
-        let res = pthread_create(&mut thread_id, null(), entry, param);
+        let mut attr: libc::pthread_attr_t = zeroed();
+        let mut attr_ptr = null();
+        if let Some(size) = stack_size {
+            if libc::pthread_attr_init(&mut attr) == 0 {
+                // Ensure stack size is at least 16KB to prevent failure
+                let target_size = core::cmp::max(size, 16384);
+                if libc::pthread_attr_setstacksize(&mut attr, target_size as _) == 0 {
+                    attr_ptr = &attr;
+                }
+            }
+        }
+
+        let res = pthread_create(&mut thread_id, attr_ptr, entry, param);
+
+        if attr_ptr != null() {
+            let _ = libc::pthread_attr_destroy(&mut attr);
+        }
 
         if res != 0 {
             #[cfg(not(feature = "loom"))]
@@ -269,12 +306,16 @@ impl PlatformImpl for Platform {
     where
         T: 'a;
 
-    fn spawn<'a, F, T>(f: F) -> Result<Self::RawJoinHandle<'a, T>, Self::Error>
+    fn spawn<'a, F, T>(
+        name: Option<String>,
+        stack_size: Option<usize>,
+        f: F,
+    ) -> Result<Self::RawJoinHandle<'a, T>, Self::Error>
     where
         F: FnOnce() -> T + Send + 'a,
         T: Send + 'a,
     {
-        spawn(f)
+        spawn(name, stack_size, f)
     }
 
     fn yield_now() -> Result<bool, AbortedError> {

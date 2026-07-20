@@ -2,6 +2,7 @@ use core::num::NonZeroUsize;
 
 use crate::{
     error::Error,
+    string::String,
     thread::{
         AbortedError, ThreadErrorKind, ThreadId,
         scope::raw::{RawScope, scope},
@@ -45,8 +46,12 @@ pub trait PlatformImpl: Sized {
     where
         T: 'a;
 
-    /// 产生一个新线程，并执行传入的 `f` 闭包
-    fn spawn<'a, F, T>(f: F) -> Result<Self::RawJoinHandle<'a, T>, Self::Error>
+    /// 产生一个带有自定义配置（如线程名和栈大小）的新线程，并执行传入的 `f` 闭包
+    fn spawn<'a, F, T>(
+        name: Option<String>,
+        stack_size: Option<usize>,
+        f: F,
+    ) -> Result<Self::RawJoinHandle<'a, T>, Self::Error>
     where
         F: FnOnce() -> T + Send + 'a,
         T: Send + 'a;

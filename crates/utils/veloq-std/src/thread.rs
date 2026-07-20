@@ -6,7 +6,7 @@ pub use platform::{Platform, RawJoinHandle, RawThreadError};
 
 mod scope;
 pub use scope::{
-    Scope, ScopedJoinHandle,
+    Scope, ScopeBuilder, ScopedJoinHandle,
     raw::{RawScope, RawScopedJoinHandle},
     scope,
 };
@@ -15,6 +15,7 @@ use crate::{
     error::Error,
     fmt::{self, Formatter, Result as FmtResult},
     num::NonZeroUsize,
+    string::String,
     time::Duration,
 };
 
@@ -107,7 +108,7 @@ where
     F: FnOnce() -> T + Send + 'a,
     T: Send + 'a,
 {
-    Platform::spawn(f)
+    Platform::spawn(None, None, f)
         .map(|inner| JoinHandle { inner })
         .map_err(ThreadError::new)
 }
@@ -142,6 +143,7 @@ impl ThreadId {
 #[derive(Debug, Clone)]
 pub struct Thread {
     id: ThreadId,
+    name: Option<String>,
 }
 
 impl Thread {
@@ -149,12 +151,19 @@ impl Thread {
     pub fn id(&self) -> ThreadId {
         self.id
     }
+
+    /// 获取线程的名称（如果有）
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
 }
 
 /// 获取当前线程
 pub fn current() -> Thread {
+    let name = platform::CURRENT_THREAD_NAME.try_with(|s| s.clone()).ok();
     Thread {
         id: Platform::current_id(),
+        name,
     }
 }
 
@@ -169,5 +178,52 @@ pub fn panicking() -> bool {
         std::thread::panicking()
     } else {
         false
+    }
+}
+
+/// 线程工厂，可用于配置新线程的属性。
+#[must_use = "must eventually spawn the thread"]
+#[derive(Debug)]
+pub struct Builder {
+    pub(crate) name: Option<String>,
+    pub(crate) stack_size: Option<usize>,
+}
+
+impl Builder {
+    /// 产生一个默认配置的 Builder。
+    pub fn new() -> Self {
+        Self {
+            name: None,
+            stack_size: None,
+        }
+    }
+
+    /// 设置新线程的名称。
+    pub fn name(mut self, name: String) -> Self {
+        self.name = Some(name);
+        self
+    }
+
+    /// 设置新线程的栈大小（字节）。
+    pub fn stack_size(mut self, size: usize) -> Self {
+        self.stack_size = Some(size);
+        self
+    }
+
+    /// 使用配置启动新线程。
+    pub fn spawn<'a, F, T>(self, f: F) -> Result<JoinHandle<'a, T>, ThreadError>
+    where
+        F: FnOnce() -> T + Send + 'a,
+        T: Send + 'a,
+    {
+        Platform::spawn(self.name, self.stack_size, f)
+            .map(|inner| JoinHandle { inner })
+            .map_err(ThreadError::new)
+    }
+}
+
+impl Default for Builder {
+    fn default() -> Self {
+        Self::new()
     }
 }

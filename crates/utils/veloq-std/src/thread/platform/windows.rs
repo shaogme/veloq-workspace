@@ -8,6 +8,7 @@ use crate::{
     fmt::{Display, Formatter, Result as FmtResult},
     marker::PhantomData,
     ptr::{null, null_mut},
+    string::String,
     sync::{
         Arc,
         atomic::{AtomicU8, Ordering},
@@ -21,8 +22,9 @@ use crate::{
 use windows_sys::Win32::{
     Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_OBJECT_0},
     System::Threading::{
-        ALL_PROCESSOR_GROUPS, CreateThread, GetActiveProcessorCount, GetCurrentThreadId, INFINITE,
-        Sleep, SwitchToThread, WaitForSingleObject,
+        ALL_PROCESSOR_GROUPS, CreateThread, GetActiveProcessorCount, GetCurrentThread,
+        GetCurrentThreadId, INFINITE, SetThreadDescription, Sleep, SwitchToThread,
+        WaitForSingleObject,
     },
 };
 
@@ -107,6 +109,16 @@ where
         cell.set(Some(&state.status as *const AtomicU8));
     });
 
+    if let Some(ref name) = state.name {
+        let mut name_u16: crate::vec::Vec<u16> = name.encode_utf16().collect();
+        name_u16.push(0);
+        unsafe {
+            let current_thread = GetCurrentThread();
+            let _ = SetThreadDescription(current_thread, name_u16.as_ptr());
+        }
+        let _ = super::CURRENT_THREAD_NAME.set_owned(name.clone());
+    }
+
     struct ThreadStatusGuard;
     impl Drop for ThreadStatusGuard {
         fn drop(&mut self) {
@@ -146,7 +158,11 @@ where
     0
 }
 
-fn spawn<'a, F, T>(f: F) -> Result<RawJoinHandle<'a, T>, RawThreadError>
+fn spawn<'a, F, T>(
+    name: Option<String>,
+    stack_size: Option<usize>,
+    f: F,
+) -> Result<RawJoinHandle<'a, T>, RawThreadError>
 where
     F: FnOnce() -> T + Send + 'a,
     T: Send + 'a,
@@ -160,6 +176,7 @@ where
         status: AtomicU8::new(super::STATE_INCOMPLETE),
         result: SafeUnsafeCell::new(None),
         panic_payload: SafeUnsafeCell::new(None),
+        name,
     });
 
     #[cfg(feature = "loom")]
@@ -168,6 +185,7 @@ where
         status: AtomicU8::new(super::STATE_INCOMPLETE),
         result: SafeUnsafeCell::new(None),
         panic_payload: SafeUnsafeCell::new(None),
+        name,
     });
 
     let receiver = ThreadResultReceiver {
@@ -182,7 +200,14 @@ where
         #[cfg(feature = "loom")]
         let entry = thread_entry_win::<BoxF<'a, T>, T>;
 
-        let handle = CreateThread(null(), 0, Some(entry), param, 0, null_mut());
+        let handle = CreateThread(
+            null(),
+            stack_size.unwrap_or(0),
+            Some(entry),
+            param,
+            0,
+            null_mut(),
+        );
 
         if handle.is_null() {
             let err = GetLastError();
@@ -273,12 +298,16 @@ impl PlatformImpl for Platform {
     where
         T: 'a;
 
-    fn spawn<'a, F, T>(f: F) -> Result<Self::RawJoinHandle<'a, T>, Self::Error>
+    fn spawn<'a, F, T>(
+        name: Option<String>,
+        stack_size: Option<usize>,
+        f: F,
+    ) -> Result<Self::RawJoinHandle<'a, T>, Self::Error>
     where
         F: FnOnce() -> T + Send + 'a,
         T: Send + 'a,
     {
-        spawn(f)
+        spawn(name, stack_size, f)
     }
 
     fn yield_now() -> Result<bool, AbortedError> {
