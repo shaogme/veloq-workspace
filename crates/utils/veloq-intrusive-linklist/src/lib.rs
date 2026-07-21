@@ -1,13 +1,15 @@
+#![no_std]
+
 mod generic;
 mod macros;
 
 #[cfg(test)]
 mod tests;
 
-use std::ptr::NonNull;
-use veloq_shim::{
-    atomic::{AtomicBool, Ordering},
+use veloq_std::{
     cell::UnsafeCell,
+    ptr::NonNull,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 pub type LinkedList<A> = generic::GenericLinkedList<A, Link>;
@@ -80,7 +82,7 @@ impl Link {
 
 impl Drop for Link {
     fn drop(&mut self) {
-        if self.is_linked() && !std::thread::panicking() {
+        if self.is_linked() && !veloq_std::thread::panicking() {
             panic!("dropped a node that is still linked");
         }
     }
@@ -217,7 +219,7 @@ impl ConcurrentLink {
 
 impl Drop for ConcurrentLink {
     fn drop(&mut self) {
-        if self.is_linked() && !std::thread::panicking() {
+        if self.is_linked() && !veloq_std::thread::panicking() {
             panic!("dropped a node that is still linked");
         }
     }

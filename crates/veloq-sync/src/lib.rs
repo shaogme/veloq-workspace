@@ -6,7 +6,7 @@ pub mod rwlock;
 pub(crate) mod shim;
 pub(crate) mod waker;
 
-use std::fmt;
+use veloq_std::fmt;
 
 /// Error returned when sending to a closed channel.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -24,7 +24,7 @@ impl<T> fmt::Display for SendError<T> {
     }
 }
 
-impl<T> std::error::Error for SendError<T> {}
+impl<T> veloq_std::error::Error for SendError<T> {}
 
 /// Error returned when trying to send to a full or closed channel.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -53,7 +53,7 @@ impl<T> fmt::Display for TrySendError<T> {
     }
 }
 
-impl<T> std::error::Error for TrySendError<T> {}
+impl<T> veloq_std::error::Error for TrySendError<T> {}
 
 /// Error returned when trying to receive from an empty or closed channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,7 +73,7 @@ impl fmt::Display for TryRecvError {
     }
 }
 
-impl std::error::Error for TryRecvError {}
+impl veloq_std::error::Error for TryRecvError {}
 
 /// Error returned when receiving from a closed channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,4 +85,4 @@ impl fmt::Display for RecvError {
     }
 }
 
-impl std::error::Error for RecvError {}
+impl veloq_std::error::Error for RecvError {}

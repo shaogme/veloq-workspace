@@ -1,10 +1,8 @@
-#[cfg(feature = "std")]
-use crate::{any::Any, boxed::Box};
-
 use core::num::NonZeroUsize;
 
 use crate::{
     error::Error,
+    string::String,
     thread::{
         AbortedError, ThreadErrorKind, ThreadId,
         scope::raw::{RawScope, scope},
@@ -18,13 +16,11 @@ pub trait RawThreadErrorTrait: Error + Send + Sync + 'static {
     fn kind(&self) -> ThreadErrorKind;
 
     /// 从原始 panic payload 构造错误实例
-    #[cfg(feature = "std")]
-    fn from_panic(payload: Box<dyn Any + Send + 'static>) -> Self;
+    fn from_panic(payload: super::sys::ThreadPanicPayload) -> Self;
 
     /// 提取原始的 panic payload 并在原处留下 None
-    #[cfg(feature = "std")]
-    fn take_panic(&mut self) -> Option<Box<dyn Any + Send + 'static>> {
-        None
+    fn take_panic(&mut self) -> super::sys::ThreadPanicPayload {
+        Default::default()
     }
 }
 
@@ -41,7 +37,7 @@ pub trait RawJoinHandleTrait<T: Send>: Send + Sync {
 }
 
 /// 平台线程实现的统一抽象接口
-pub trait PlatformImpl: Sized {
+pub trait SystermImpl: Sized {
     /// 错误类型
     type Error: RawThreadErrorTrait;
 
@@ -50,8 +46,12 @@ pub trait PlatformImpl: Sized {
     where
         T: 'a;
 
-    /// 产生一个新线程，并执行传入的 `f` 闭包
-    fn spawn<'a, F, T>(f: F) -> Result<Self::RawJoinHandle<'a, T>, Self::Error>
+    /// 产生一个带有自定义配置（如线程名和栈大小）的新线程，并执行传入的 `f` 闭包
+    fn spawn<'a, F, T>(
+        name: Option<String>,
+        stack_size: Option<usize>,
+        f: F,
+    ) -> Result<Self::RawJoinHandle<'a, T>, Self::Error>
     where
         F: FnOnce() -> T + Send + 'a,
         T: Send + 'a;

@@ -1,31 +1,31 @@
 use crate::{
     marker::PhantomData,
-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
-    sys,
-    thread::traits::{PlatformImpl, RawJoinHandleTrait},
+    string::String,
+    sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        sys,
+    },
+    thread::traits::{RawJoinHandleTrait, SystermImpl},
 };
 
 #[cfg(feature = "std")]
 use crate::{
-    boxed::Box, ptr::null_mut, sync::atomic::AtomicPtr, thread::traits::RawThreadErrorTrait,
-};
-
-#[cfg(feature = "std")]
-use std::{
+    boxed::Box,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    ptr::null_mut,
+    sync::atomic::AtomicPtr,
     thread::panicking,
+    thread::traits::RawThreadErrorTrait,
 };
 
-pub(crate) struct RawScopeData<P: PlatformImpl> {
+pub(crate) struct RawScopeData<P: SystermImpl> {
     pub(crate) num_running_threads: AtomicU32,
     pub(crate) cancelled: AtomicBool,
     #[cfg(feature = "std")]
     pub(crate) panics: AtomicPtr<P::Error>,
-    #[cfg(feature = "std")]
-    pub(crate) has_panic: AtomicBool,
 }
 
-impl<P: PlatformImpl> RawScopeData<P> {
+impl<P: SystermImpl> RawScopeData<P> {
     #[cfg(feature = "std")]
     fn pop_panic(&self) -> Option<P::Error> {
         let ptr = self.panics.swap(null_mut(), Ordering::Acquire);
@@ -40,7 +40,7 @@ impl<P: PlatformImpl> RawScopeData<P> {
     }
 }
 
-impl<P: PlatformImpl> Drop for RawScopeData<P> {
+impl<P: SystermImpl> Drop for RawScopeData<P> {
     fn drop(&mut self) {
         #[cfg(feature = "std")]
         {
@@ -55,14 +55,14 @@ impl<P: PlatformImpl> Drop for RawScopeData<P> {
 }
 
 /// 结构化并发的作用域，用于管理在其中生成的线程的生命周期。
-pub struct RawScope<'scope, 'env: 'scope, P: PlatformImpl> {
+pub struct RawScope<'scope, 'env: 'scope, P: SystermImpl> {
     data: &'scope RawScopeData<P>,
     _scope: PhantomData<&'scope mut &'scope ()>,
     _env: PhantomData<&'env mut &'env ()>,
 }
 
 /// 作用域内生成的线程的加入句柄，允许等待线程完成并获取其返回值。
-pub struct RawScopedJoinHandle<'scope, P: PlatformImpl, R: Send + 'scope> {
+pub struct RawScopedJoinHandle<'scope, P: SystermImpl, R: Send + 'scope> {
     handle: Option<P::RawJoinHandle<'scope, Option<R>>>,
     #[cfg(feature = "std")]
     scope_data: &'scope RawScopeData<P>,
@@ -70,13 +70,13 @@ pub struct RawScopedJoinHandle<'scope, P: PlatformImpl, R: Send + 'scope> {
     _scope_data: PhantomData<&'scope RawScopeData<P>>,
 }
 
-unsafe impl<'scope, P: PlatformImpl, R: Send + 'scope> Send for RawScopedJoinHandle<'scope, P, R> {}
-unsafe impl<'scope, P: PlatformImpl, R: Send + Sync + 'scope> Sync
+unsafe impl<'scope, P: SystermImpl, R: Send + 'scope> Send for RawScopedJoinHandle<'scope, P, R> {}
+unsafe impl<'scope, P: SystermImpl, R: Send + Sync + 'scope> Sync
     for RawScopedJoinHandle<'scope, P, R>
 {
 }
 
-impl<'scope, 'env, P: PlatformImpl> RawScope<'scope, 'env, P> {
+impl<'scope, 'env, P: SystermImpl> RawScope<'scope, 'env, P> {
     /// 检查当前作用域是否已被取消（例如主线程发生 panic）
     pub fn is_cancelled(&self) -> bool {
         self.data.cancelled.load(Ordering::Acquire)
@@ -88,12 +88,26 @@ impl<'scope, 'env, P: PlatformImpl> RawScope<'scope, 'env, P> {
         F: FnOnce() -> R + Send + 'env,
         R: Send + 'env,
     {
+        self.spawn_with(None, None, f)
+    }
+
+    /// 在当前作用域内，使用特定属性生成一个新线程并执行闭包 `f`。
+    pub fn spawn_with<F, R>(
+        &'scope self,
+        name: Option<String>,
+        stack_size: Option<usize>,
+        f: F,
+    ) -> Result<RawScopedJoinHandle<'scope, P, R>, P::Error>
+    where
+        F: FnOnce() -> R + Send + 'env,
+        R: Send + 'env,
+    {
         let scope_data = self.data;
         let closure = move || {
-            struct ThreadFinishedGuard<'a, P: PlatformImpl> {
+            struct ThreadFinishedGuard<'a, P: SystermImpl> {
                 data: &'a RawScopeData<P>,
             }
-            impl<P: PlatformImpl> Drop for ThreadFinishedGuard<'_, P> {
+            impl<P: SystermImpl> Drop for ThreadFinishedGuard<'_, P> {
                 fn drop(&mut self) {
                     let old = self
                         .data
@@ -112,8 +126,7 @@ impl<'scope, 'env, P: PlatformImpl> RawScope<'scope, 'env, P> {
                 match res {
                     Ok(r) => Some(r),
                     Err(err) => {
-                        scope_data.has_panic.store(true, Ordering::Release);
-                        let raw_err = P::Error::from_panic(err);
+                        let raw_err = P::Error::from_panic(Some(err));
                         let payload = Box::into_raw(Box::new(raw_err));
                         if scope_data
                             .panics
@@ -159,7 +172,7 @@ impl<'scope, 'env, P: PlatformImpl> RawScope<'scope, 'env, P> {
             active: true,
         };
 
-        let handle = P::spawn(closure)?;
+        let handle = P::spawn(name, stack_size, closure)?;
 
         rollback.active = false;
 
@@ -173,7 +186,7 @@ impl<'scope, 'env, P: PlatformImpl> RawScope<'scope, 'env, P> {
     }
 }
 
-impl<'scope, P: PlatformImpl, R: Send + 'scope> RawScopedJoinHandle<'scope, P, R> {
+impl<'scope, P: SystermImpl, R: Send + 'scope> RawScopedJoinHandle<'scope, P, R> {
     /// 等待子线程执行结束并返回其结果。
     pub fn join(mut self) -> Result<R, P::Error> {
         let handle = self.handle.take().expect("handle already joined");
@@ -185,13 +198,11 @@ impl<'scope, P: PlatformImpl, R: Send + 'scope> RawScopedJoinHandle<'scope, P, R
             #[cfg(feature = "std")]
             {
                 let panic_err = self.scope_data.pop_panic();
-                if let Some(mut err) = panic_err
-                    && let Some(p) = err.take_panic()
-                {
-                    resume_unwind(p);
+                if let Some(err) = panic_err {
+                    return Err(err);
                 }
             }
-            panic!("handle finished but no result found");
+            Err(P::Error::from_panic(Default::default()))
         }
     }
 
@@ -204,11 +215,11 @@ impl<'scope, P: PlatformImpl, R: Send + 'scope> RawScopedJoinHandle<'scope, P, R
     }
 }
 
-struct RawScopeGuard<'scope, P: PlatformImpl> {
+struct RawScopeGuard<'scope, P: SystermImpl> {
     data: &'scope RawScopeData<P>,
     completed_successfully: bool,
 }
-impl<P: PlatformImpl> Drop for RawScopeGuard<'_, P> {
+impl<P: SystermImpl> Drop for RawScopeGuard<'_, P> {
     fn drop(&mut self) {
         if !self.completed_successfully {
             self.data.cancelled.store(true, Ordering::Release);
@@ -226,12 +237,10 @@ impl<P: PlatformImpl> Drop for RawScopeGuard<'_, P> {
         {
             if !panicking() {
                 let panic_err = self.data.pop_panic();
-                if let Some(mut err) = panic_err {
-                    if let Some(p) = err.take_panic() {
-                        resume_unwind(p);
-                    }
-                } else if self.data.has_panic.load(Ordering::Acquire) {
-                    panic!("child thread panicked");
+                if let Some(mut err) = panic_err
+                    && let Some(p) = err.take_panic()
+                {
+                    resume_unwind(p);
                 }
             }
         }
@@ -240,7 +249,7 @@ impl<P: PlatformImpl> Drop for RawScopeGuard<'_, P> {
 
 pub fn scope<'env, P, F, R>(f: F) -> R
 where
-    P: PlatformImpl,
+    P: SystermImpl,
     F: for<'scope> FnOnce(&'scope RawScope<'scope, 'env, P>) -> R,
 {
     let scope_data = RawScopeData {
@@ -248,8 +257,6 @@ where
         cancelled: AtomicBool::new(false),
         #[cfg(feature = "std")]
         panics: AtomicPtr::new(null_mut()),
-        #[cfg(feature = "std")]
-        has_panic: AtomicBool::new(false),
     };
 
     let scope = RawScope {

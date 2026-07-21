@@ -1,6 +1,6 @@
 use crate::{
     sync::atomic::Ordering,
-    time::{Duration, platform::Platform},
+    time::{Duration, sys::Systerm},
 };
 
 use crate::sync::atomic::CoreAtomicU64;
@@ -23,9 +23,9 @@ fn get_frequency() -> u64 {
     val
 }
 
-pub struct PlatformImpl;
+pub struct SystermImpl;
 
-impl Platform for PlatformImpl {
+impl Systerm for SystermImpl {
     type RawInstant = u64;
 
     fn now() -> Self::RawInstant {

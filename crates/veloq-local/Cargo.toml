@@ -15,6 +15,11 @@ categories.workspace = true
 [dependencies]
 futures-core.workspace = true
 veloq-intrusive-linklist.workspace = true
+veloq-std.workspace = true
+
+[features]
+loom = ["veloq-intrusive-linklist/loom"]
+std = ["veloq-intrusive-linklist/std", "veloq-std/std"]
 
 [dev-dependencies]
 tokio.workspace = true

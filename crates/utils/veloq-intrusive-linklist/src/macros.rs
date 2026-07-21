@@ -2,12 +2,12 @@
 macro_rules! offset_of {
     ($Container:path, $field:ident) => {{
         // 使用 MaybeUninit 创建未初始化的实例，模拟 container
-        let val = core::mem::MaybeUninit::<$Container>::uninit();
+        let val = veloq_std::mem::MaybeUninit::<$Container>::uninit();
         let base_ptr = val.as_ptr();
         // 获取字段指针
         // 注意：addr_of! 是 rust 1.51+ 特性，确保不产生引用
         #[allow(unused_unsafe)]
-        let field_ptr = unsafe { core::ptr::addr_of!((*base_ptr).$field) };
+        let field_ptr = unsafe { veloq_std::ptr::addr_of!((*base_ptr).$field) };
         (field_ptr as usize) - (base_ptr as usize)
     }};
 }
@@ -29,11 +29,11 @@ macro_rules! container_of {
 macro_rules! __impl_intrusive_adapter {
     // Generic version with lifetime
     ($vis:vis $Adapter:ident < $lt:lifetime, $($gen:ident),+ >, $Node:ty, $link_field:ident, $Trait:ident, $Link:ident $(where $($wh:tt)+)?) => {
-        $vis struct $Adapter< $lt, $($gen),+ >(core::marker::PhantomData<(& $lt (), $($gen),+)>);
+        $vis struct $Adapter< $lt, $($gen),+ >(veloq_std::marker::PhantomData<(& $lt (), $($gen),+)>);
 
         impl< $lt, $($gen),+ > $Adapter< $lt, $($gen),+ > {
             pub const fn new() -> Self {
-                Self(core::marker::PhantomData)
+                Self(veloq_std::marker::PhantomData)
             }
         }
 
@@ -41,20 +41,20 @@ macro_rules! __impl_intrusive_adapter {
             type Value = $Node;
 
             #[inline]
-            unsafe fn get_link(&self, value: core::ptr::NonNull<Self::Value>) -> core::ptr::NonNull<$crate::$Link> {
+            unsafe fn get_link(&self, value: veloq_std::ptr::NonNull<Self::Value>) -> veloq_std::ptr::NonNull<$crate::$Link> {
                 let val_ptr = value.as_ptr();
                 unsafe {
-                    let link_ptr = core::ptr::addr_of_mut!((*val_ptr).$link_field);
-                    core::ptr::NonNull::new_unchecked(link_ptr)
+                    let link_ptr = veloq_std::ptr::addr_of_mut!((*val_ptr).$link_field);
+                    veloq_std::ptr::NonNull::new_unchecked(link_ptr)
                 }
             }
 
             #[inline]
-            unsafe fn get_value(&self, link: core::ptr::NonNull<$crate::$Link>) -> core::ptr::NonNull<Self::Value> {
+            unsafe fn get_value(&self, link: veloq_std::ptr::NonNull<$crate::$Link>) -> veloq_std::ptr::NonNull<Self::Value> {
                 let link_ptr = link.as_ptr();
                 unsafe {
                     let val_ptr = $crate::container_of!(link_ptr, $Node, $link_field) as *mut $Node;
-                    core::ptr::NonNull::new_unchecked(val_ptr)
+                    veloq_std::ptr::NonNull::new_unchecked(val_ptr)
                 }
             }
         }
@@ -62,11 +62,11 @@ macro_rules! __impl_intrusive_adapter {
 
     // Generic version
     ($vis:vis $Adapter:ident < $($gen:ident),+ >, $Node:ty, $link_field:ident, $Trait:ident, $Link:ident $(where $($wh:tt)+)?) => {
-        $vis struct $Adapter< $($gen),+ >(core::marker::PhantomData<($($gen),+)>);
+        $vis struct $Adapter< $($gen),+ >(veloq_std::marker::PhantomData<($($gen),+)>);
 
         impl< $($gen),+ > $Adapter< $($gen),+ > {
             pub const fn new() -> Self {
-                Self(core::marker::PhantomData)
+                Self(veloq_std::marker::PhantomData)
             }
         }
 
@@ -74,20 +74,20 @@ macro_rules! __impl_intrusive_adapter {
             type Value = $Node;
 
             #[inline]
-            unsafe fn get_link(&self, value: core::ptr::NonNull<Self::Value>) -> core::ptr::NonNull<$crate::$Link> {
+            unsafe fn get_link(&self, value: veloq_std::ptr::NonNull<Self::Value>) -> veloq_std::ptr::NonNull<$crate::$Link> {
                 let val_ptr = value.as_ptr();
                 unsafe {
-                    let link_ptr = core::ptr::addr_of_mut!((*val_ptr).$link_field);
-                    core::ptr::NonNull::new_unchecked(link_ptr)
+                    let link_ptr = veloq_std::ptr::addr_of_mut!((*val_ptr).$link_field);
+                    veloq_std::ptr::NonNull::new_unchecked(link_ptr)
                 }
             }
 
             #[inline]
-            unsafe fn get_value(&self, link: core::ptr::NonNull<$crate::$Link>) -> core::ptr::NonNull<Self::Value> {
+            unsafe fn get_value(&self, link: veloq_std::ptr::NonNull<$crate::$Link>) -> veloq_std::ptr::NonNull<Self::Value> {
                 let link_ptr = link.as_ptr();
                 unsafe {
                     let val_ptr = $crate::container_of!(link_ptr, $Node, $link_field) as *mut $Node;
-                    core::ptr::NonNull::new_unchecked(val_ptr)
+                    veloq_std::ptr::NonNull::new_unchecked(val_ptr)
                 }
             }
         }
@@ -101,20 +101,20 @@ macro_rules! __impl_intrusive_adapter {
             type Value = $Node;
 
             #[inline]
-            unsafe fn get_link(&self, value: core::ptr::NonNull<Self::Value>) -> core::ptr::NonNull<$crate::$Link> {
+            unsafe fn get_link(&self, value: veloq_std::ptr::NonNull<Self::Value>) -> veloq_std::ptr::NonNull<$crate::$Link> {
                 let val_ptr = value.as_ptr();
                 unsafe {
-                    let link_ptr = core::ptr::addr_of_mut!((*val_ptr).$link_field);
-                    core::ptr::NonNull::new_unchecked(link_ptr)
+                    let link_ptr = veloq_std::ptr::addr_of_mut!((*val_ptr).$link_field);
+                    veloq_std::ptr::NonNull::new_unchecked(link_ptr)
                 }
             }
 
             #[inline]
-            unsafe fn get_value(&self, link: core::ptr::NonNull<$crate::$Link>) -> core::ptr::NonNull<Self::Value> {
+            unsafe fn get_value(&self, link: veloq_std::ptr::NonNull<$crate::$Link>) -> veloq_std::ptr::NonNull<Self::Value> {
                 let link_ptr = link.as_ptr();
                 unsafe {
                     let val_ptr = $crate::container_of!(link_ptr, $Node, $link_field) as *mut $Node;
-                    core::ptr::NonNull::new_unchecked(val_ptr)
+                    veloq_std::ptr::NonNull::new_unchecked(val_ptr)
                 }
             }
         }

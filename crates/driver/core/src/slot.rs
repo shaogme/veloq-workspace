@@ -7,7 +7,7 @@ use crate::{
 };
 use diagweave::prelude::*;
 use std::marker::PhantomData;
-use veloq_shim::atomic::Ordering;
+use veloq_std::sync::atomic::Ordering;
 
 pub trait SlotSpec {
     type Op: PlatformOp;
@@ -229,20 +229,6 @@ impl<'a, Spec: SlotSpec> Slot<'a, Reserved, Spec> {
 }
 
 impl<'a, Spec: SlotSpec> Slot<'a, InFlightWaiting, Spec> {
-    pub(crate) fn try_bind(
-        entry: &'a SlotEntry<Spec>,
-        op: &'a mut Option<SlotOp<Spec>>,
-        storage: &'a mut SlotStorage<Spec>,
-        platform: &'a mut SlotPlatformData<Spec>,
-        index: usize,
-    ) -> Option<Self> {
-        if entry.state(Ordering::Acquire) == SlotState::InFlightWaiting && op.is_some() {
-            Some(Self::new_internal(entry, op, storage, platform, index))
-        } else {
-            None
-        }
-    }
-
     pub fn complete(self) -> Slot<'a, Completed, Spec> {
         Slot::new_internal(self.entry, self.op, self.storage, self.platform, self.index)
     }
@@ -328,20 +314,6 @@ impl<'a, Spec: SlotSpec> Slot<'a, Completed, Spec> {
 }
 
 impl<'a, Spec: SlotSpec> Slot<'a, InFlightOrphaned, Spec> {
-    pub(crate) fn try_bind(
-        entry: &'a SlotEntry<Spec>,
-        op: &'a mut Option<SlotOp<Spec>>,
-        storage: &'a mut SlotStorage<Spec>,
-        platform: &'a mut SlotPlatformData<Spec>,
-        index: usize,
-    ) -> Option<Self> {
-        if entry.state(Ordering::Acquire) == SlotState::InFlightOrphaned && op.is_some() {
-            Some(Self::new_internal(entry, op, storage, platform, index))
-        } else {
-            None
-        }
-    }
-
     pub fn complete(self) -> Slot<'a, Completed, Spec> {
         Slot::new_internal(self.entry, self.op, self.storage, self.platform, self.index)
     }
@@ -519,46 +491,24 @@ impl<Spec: SlotSpec> SlotRegistryExt<Spec> for OpRegistry<Spec> {
                 },
                 |slot| Ok(CheckedSlotView::Valid(SlotView::Reserved(slot))),
             ),
-            SlotState::InFlightWaiting => Slot::<InFlightWaiting, Spec>::try_bind(
-                entry,
-                op,
-                storage,
-                &mut op_entry.platform_data,
-                index,
-            )
-            .map_or_else(
-                || {
-                    let report = DriverCoreError::Internal
-                        .to_report()
-                        .push_ctx("scope", "checked_slot_view")
-                        .attach_note(format!(
-                            "corrupt slot (try_bind InFlightWaiting failed): {:?}",
-                            snapshot
-                        ));
-                    Err(Spec::Error::from_core_report(report))
-                },
-                |slot| Ok(CheckedSlotView::Valid(SlotView::InFlightWaiting(slot))),
-            ),
-            SlotState::InFlightOrphaned => Slot::<InFlightOrphaned, Spec>::try_bind(
-                entry,
-                op,
-                storage,
-                &mut op_entry.platform_data,
-                index,
-            )
-            .map_or_else(
-                || {
-                    let report = DriverCoreError::Internal
-                        .to_report()
-                        .push_ctx("scope", "checked_slot_view")
-                        .attach_note(format!(
-                            "corrupt slot (try_bind InFlightOrphaned failed): {:?}",
-                            snapshot
-                        ));
-                    Err(Spec::Error::from_core_report(report))
-                },
-                |slot| Ok(CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot))),
-            ),
+            SlotState::InFlightWaiting => Ok(CheckedSlotView::Valid(SlotView::InFlightWaiting(
+                Slot::<InFlightWaiting, Spec>::new_internal(
+                    entry,
+                    op,
+                    storage,
+                    &mut op_entry.platform_data,
+                    index,
+                ),
+            ))),
+            SlotState::InFlightOrphaned => Ok(CheckedSlotView::Valid(SlotView::InFlightOrphaned(
+                Slot::<InFlightOrphaned, Spec>::new_internal(
+                    entry,
+                    op,
+                    storage,
+                    &mut op_entry.platform_data,
+                    index,
+                ),
+            ))),
             SlotState::Idle
             | SlotState::InFlightReady
             | SlotState::Finalizing

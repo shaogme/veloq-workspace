@@ -7,7 +7,7 @@ use crate::{
     },
 };
 use std::{mem, sync::Arc};
-use veloq_shim::atomic::Ordering;
+use veloq_std::sync::atomic::Ordering;
 
 pub type RegistryOp<T> = SlotOp<T>;
 pub type RegistryPayload<T> = SlotPayload<T>;
@@ -33,6 +33,8 @@ pub struct LocalSlot<Spec: SlotSpec> {
     pub(crate) op: Option<RegistryOp<Spec>>,
     pub entry: OpEntry<RegistryPlatformData<Spec>>,
     pub storage: SlotStorageOf<Spec>,
+    pub(crate) active: bool,
+    pub(crate) generation: u32,
 }
 
 impl<Spec: SlotSpec> LocalSlot<Spec> {
@@ -43,6 +45,8 @@ impl<Spec: SlotSpec> LocalSlot<Spec> {
                 platform_data: RegistryPlatformData::<Spec>::default(),
             },
             storage: SlotStorageOf::<Spec>::new(),
+            active: false,
+            generation: 0,
         }
     }
 }
@@ -124,6 +128,8 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
             slot.reset(new_gen);
             slot.set_state(SlotState::Reserved, Ordering::Release);
 
+            self.local[idx].active = true;
+            self.local[idx].generation = new_gen;
             self.local[idx].op = None;
             self.local[idx].entry.platform_data = data;
             self.local[idx].storage.reset();
@@ -252,6 +258,7 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
 
     fn remove_at_index(&mut self, user_data: usize) -> OpEntry<RegistryPlatformData<Spec>> {
         let local = &mut self.local[user_data];
+        local.active = false;
         let _ = local.op.take();
         let data = mem::take(&mut local.entry.platform_data);
         local.storage.reset();
@@ -266,9 +273,8 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
 
     pub fn remove(&mut self, token: OpToken) -> Option<OpEntry<RegistryPlatformData<Spec>>> {
         let (user_data, generation) = token.parts();
-        let slot = self.shared.slots.get(user_data)?;
-        let core = slot.load_core_state(Ordering::Acquire);
-        if core.state() == SlotState::Idle || core.generation() != generation {
+        let local = self.local.get(user_data)?;
+        if !local.active || local.generation != generation {
             return None;
         }
 
@@ -284,6 +290,7 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
 
     fn recycle_at_index(&mut self, user_data: usize, generation: u32) {
         let local = &mut self.local[user_data];
+        local.active = false;
         let _ = local.op.take();
         let _ = mem::take(&mut local.entry.platform_data);
         local.storage.reset();
@@ -298,11 +305,11 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
 
     pub fn recycle(&mut self, token: OpToken, next_generation: u32) -> bool {
         let (user_data, generation) = token.parts();
-        let Some(slot) = self.shared.slots.get(user_data) else {
-            return false;
+        let local = match self.local.get(user_data) {
+            Some(v) => v,
+            None => return false,
         };
-        let core = slot.load_core_state(Ordering::Acquire);
-        if core.state() == SlotState::Idle || core.generation() != generation {
+        if !local.active || local.generation != generation {
             return false;
         }
 
@@ -314,18 +321,7 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         &mut self,
         token: OpToken,
     ) -> Option<OpEntry<RegistryPlatformData<Spec>>> {
-        let (user_data, generation) = token.parts();
-        let slot = self.shared.slots.get(user_data)?;
-        let core = slot.load_core_state(Ordering::Acquire);
-
-        let is_valid = (core.state() != SlotState::Idle && core.generation() == generation)
-            || (core.state() == SlotState::Idle && core.generation() == generation.wrapping_add(1));
-
-        if !is_valid {
-            return None;
-        }
-
-        Some(self.remove_at_index(user_data))
+        self.remove(token)
     }
 
     pub fn finalize_waiting_completion(
@@ -431,5 +427,37 @@ mod tests {
         let tokens = registry.active_tokens().collect::<Vec<_>>();
 
         assert_eq!(tokens, vec![second_token]);
+    }
+
+    #[test]
+    fn idempotent_remove_prevents_double_free() {
+        let mut registry = OpRegistry::<DummySlotSpec>::new(3);
+        let alloc_res = registry.alloc(()).expect("alloc slot");
+        let token =
+            OpToken::from_registry_parts(alloc_res.handle.index, alloc_res.handle.generation)
+                .expect("token");
+
+        // 第一次 remove 成功，返回 platform_data
+        let first_remove = registry.remove(token);
+        assert!(first_remove.is_some());
+
+        // 第二次 remove 由于已非 active，应返回 None，且不会导致重复 push_free
+        let second_remove = registry.remove(token);
+        assert!(second_remove.is_none());
+    }
+
+    #[test]
+    fn finalize_waiting_completion_is_noop_after_remove() {
+        let mut registry = OpRegistry::<DummySlotSpec>::new(3);
+        let alloc_res = registry.alloc(()).expect("alloc slot");
+        let token =
+            OpToken::from_registry_parts(alloc_res.handle.index, alloc_res.handle.generation)
+                .expect("token");
+
+        // 先通过 remove 回收
+        assert!(registry.remove(token).is_some());
+
+        // 随后再调用 finalize_waiting_completion 应该幂等返回 None
+        assert!(registry.finalize_waiting_completion(token).is_none());
     }
 }

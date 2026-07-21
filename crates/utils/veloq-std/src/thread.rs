@@ -1,20 +1,23 @@
 pub mod traits;
 use traits::*;
 
-mod platform;
-pub use platform::{Platform, RawJoinHandle, RawThreadError};
+mod parker;
+mod sys;
+pub use sys::{RawJoinHandle, RawThreadError, Systerm};
 
 mod scope;
 pub use scope::{
-    Scope, ScopedJoinHandle,
+    Scope, ScopeBuilder, ScopedJoinHandle,
     raw::{RawScope, RawScopedJoinHandle},
     scope,
 };
 
 use crate::{
+    alloc_crate::sync::Arc,
     error::Error,
     fmt::{self, Formatter, Result as FmtResult},
     num::NonZeroUsize,
+    string::String,
     time::Duration,
 };
 
@@ -90,6 +93,11 @@ unsafe impl<T: Send> Send for JoinHandle<'_, T> {}
 unsafe impl<T: Send> Sync for JoinHandle<'_, T> {}
 
 impl<'a, T: Send> JoinHandle<'a, T> {
+    /// 获取与该加入句柄关联的线程的引用。
+    pub fn thread(&self) -> &Thread {
+        &self.inner.thread
+    }
+
     /// 等待线程执行结束 (Join)
     pub fn join(self) -> Result<T, ThreadError> {
         self.inner.join().map_err(ThreadError::new)
@@ -107,7 +115,7 @@ where
     F: FnOnce() -> T + Send + 'a,
     T: Send + 'a,
 {
-    Platform::spawn(f)
+    Systerm::spawn(None, None, f)
         .map(|inner| JoinHandle { inner })
         .map_err(ThreadError::new)
 }
@@ -117,14 +125,14 @@ where
 /// 如果成功让出或切换到了另一个线程，返回 `Ok(true)`；否则返回 `Ok(false)`。
 /// 如果检测到当前线程已被中止，则返回 `Err(AbortedError)`。
 pub fn yield_now() -> Result<bool, AbortedError> {
-    Platform::yield_now()
+    Systerm::yield_now()
 }
 
 /// 使当前线程睡眠指定的时长。
 ///
 /// 如果检测到当前线程已被中止，则返回 `Err(AbortedError)`。
 pub fn sleep(dur: Duration) -> Result<(), AbortedError> {
-    Platform::sleep(dur)
+    Systerm::sleep(dur)
 }
 
 /// 线程的唯一标识符
@@ -138,27 +146,136 @@ impl ThreadId {
     }
 }
 
+use parker::Parker;
+
+struct Inner {
+    name: Option<String>,
+    parker: Parker,
+}
+
 /// 统一的线程表示结构体
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Thread {
-    id: ThreadId,
+    inner: Arc<Inner>,
+}
+
+impl fmt::Debug for Thread {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        f.debug_struct("Thread")
+            .field("id", &self.id())
+            .field("name", &self.name())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Thread {
+    pub(crate) fn new(name: Option<String>) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                name,
+                parker: Parker::new(),
+            }),
+        }
+    }
+
     /// 获取当前线程的唯一标识符
     pub fn id(&self) -> ThreadId {
-        self.id
+        ThreadId(Arc::as_ptr(&self.inner) as *const () as u64)
+    }
+
+    /// 获取线程的名称（如果有）
+    pub fn name(&self) -> Option<&str> {
+        self.inner.name.as_deref()
+    }
+
+    /// 原子地使该线程的令牌可用。
+    pub fn unpark(&self) {
+        self.inner.parker.unpark();
+    }
+
+    /// 阻塞当前线程。
+    pub fn park(&self) {
+        self.inner.parker.park();
+    }
+
+    /// 阻塞当前线程，最多等待指定的时长。
+    pub fn park_timeout(&self, dur: Duration) {
+        self.inner.parker.park_timeout(dur);
     }
 }
 
 /// 获取当前线程
 pub fn current() -> Thread {
-    Thread {
-        id: Platform::current_id(),
-    }
+    sys::CURRENT_THREAD.with_or_init(|t| t.clone(), || Thread::new(None))
+}
+
+/// 阻塞当前线程。
+pub fn park() {
+    current().park();
+}
+
+/// 阻塞当前线程，最多等待指定的时长。
+pub fn park_timeout(dur: Duration) {
+    current().park_timeout(dur);
 }
 
 /// 获取系统的可用并行度 (逻辑 CPU 核心数)
 pub fn available_parallelism() -> Result<NonZeroUsize, ThreadError> {
-    Platform::available_parallelism().map_err(ThreadError::new)
+    Systerm::available_parallelism().map_err(ThreadError::new)
+}
+
+/// 获取当前线程是否正在 panic。
+pub fn panicking() -> bool {
+    if cfg!(feature = "std") {
+        std::thread::panicking()
+    } else {
+        false
+    }
+}
+
+/// 线程工厂，可用于配置新线程的属性。
+#[must_use = "must eventually spawn the thread"]
+#[derive(Debug)]
+pub struct Builder {
+    pub(crate) name: Option<String>,
+    pub(crate) stack_size: Option<usize>,
+}
+
+impl Builder {
+    /// 产生一个默认配置的 Builder。
+    pub fn new() -> Self {
+        Self {
+            name: None,
+            stack_size: None,
+        }
+    }
+
+    /// 设置新线程的名称。
+    pub fn name(mut self, name: String) -> Self {
+        self.name = Some(name);
+        self
+    }
+
+    /// 设置新线程的栈大小（字节）。
+    pub fn stack_size(mut self, size: usize) -> Self {
+        self.stack_size = Some(size);
+        self
+    }
+
+    /// 使用配置启动新线程。
+    pub fn spawn<'a, F, T>(self, f: F) -> Result<JoinHandle<'a, T>, ThreadError>
+    where
+        F: FnOnce() -> T + Send + 'a,
+        T: Send + 'a,
+    {
+        Systerm::spawn(self.name, self.stack_size, f)
+            .map(|inner| JoinHandle { inner })
+            .map_err(ThreadError::new)
+    }
+}
+
+impl Default for Builder {
+    fn default() -> Self {
+        Self::new()
+    }
 }

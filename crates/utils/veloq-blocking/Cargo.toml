@@ -13,6 +13,8 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+veloq-std.workspace = true
+
 crossbeam-queue.workspace = true
 parking_lot.workspace = true
 

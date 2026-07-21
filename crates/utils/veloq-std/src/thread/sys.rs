@@ -1,16 +1,22 @@
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", not(feature = "loom")))]
 mod windows;
-#[cfg(target_os = "windows")]
-pub use windows::{Platform, RawJoinHandle, RawThreadError};
+#[cfg(all(target_os = "windows", not(feature = "loom")))]
+pub use windows::{RawJoinHandle, RawThreadError, Systerm};
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(all(any(target_os = "linux", target_os = "android"), not(feature = "loom")))]
 mod linux;
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub use linux::{Platform, RawJoinHandle, RawThreadError};
+#[cfg(all(any(target_os = "linux", target_os = "android"), not(feature = "loom")))]
+pub use linux::{RawJoinHandle, RawThreadError, Systerm};
+
+#[cfg(feature = "loom")]
+mod loom;
+#[cfg(feature = "loom")]
+pub use loom::{RawJoinHandle, RawThreadError, Systerm};
 
 use crate::{
     boxed::Box,
     cell::{Cell, UnsafeCell},
+    string::String,
     sync::{
         Arc,
         atomic::{AtomicU8, Ordering},
@@ -18,13 +24,10 @@ use crate::{
 };
 
 #[cfg(feature = "std")]
-use crate::{
-    any::Any,
-    fmt::{Debug, Formatter, Result as FmtResult},
-};
+pub(crate) type ThreadPanicPayload = Option<Box<dyn crate::any::Any + Send + 'static>>;
 
 #[cfg(feature = "std")]
-pub struct SendSyncPanicPayload(pub Box<dyn Any + Send + 'static>);
+pub struct SendSyncPanicPayload(pub Box<dyn crate::any::Any + Send + 'static>);
 
 #[cfg(feature = "std")]
 unsafe impl Send for SendSyncPanicPayload {}
@@ -32,9 +35,41 @@ unsafe impl Send for SendSyncPanicPayload {}
 unsafe impl Sync for SendSyncPanicPayload {}
 
 #[cfg(feature = "std")]
-impl Debug for SendSyncPanicPayload {
-    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+impl crate::fmt::Debug for SendSyncPanicPayload {
+    fn fmt(&self, f: &mut crate::fmt::Formatter<'_>) -> crate::fmt::Result {
         f.write_str("SendSyncPanicPayload")
+    }
+}
+
+#[cfg(not(feature = "std"))]
+pub(crate) type ThreadPanicPayload = ();
+
+#[cfg(not(feature = "std"))]
+pub type SendSyncPanicPayload = ();
+
+#[inline]
+pub(crate) fn from_panic_payload(payload: ThreadPanicPayload) -> Option<SendSyncPanicPayload> {
+    #[cfg(feature = "std")]
+    {
+        payload.map(SendSyncPanicPayload)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = payload;
+        Some(())
+    }
+}
+
+#[inline]
+pub(crate) fn take_panic_payload(opt: &mut Option<SendSyncPanicPayload>) -> ThreadPanicPayload {
+    #[cfg(feature = "std")]
+    {
+        opt.take().map(|p| p.0)
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = opt.take();
+        ()
     }
 }
 
@@ -45,6 +80,8 @@ pub(crate) const STATE_ABORTED: u8 = 3;
 
 pub(crate) static CURRENT_THREAD_STATUS: veloq_tls::Tls<Cell<Option<*const AtomicU8>>> =
     veloq_tls::Tls::new();
+
+pub(crate) static CURRENT_THREAD: veloq_tls::Tls<super::Thread> = veloq_tls::Tls::new();
 
 /// 包装以在线程间安全共享的 UnsafeCell
 pub(crate) struct SafeUnsafeCell<T>(UnsafeCell<T>);
@@ -75,17 +112,16 @@ pub(crate) trait ThreadSharedStateTrait<T>: Send + Sync {
     unsafe fn receive(&self) -> Option<T>;
     fn status(&self) -> u8;
     fn set_aborted(&self);
-
-    #[cfg(feature = "std")]
-    unsafe fn take_panic(&self) -> Option<Box<dyn Any + Send + 'static>>;
+    unsafe fn take_panic(&self) -> ThreadPanicPayload;
 }
 
 pub(crate) struct ThreadSharedState<F, T> {
     pub(crate) closure: UnsafeCell<Option<F>>,
     pub(crate) status: AtomicU8,
     pub(crate) result: SafeUnsafeCell<Option<T>>,
-    #[cfg(feature = "std")]
-    pub(crate) panic_payload: SafeUnsafeCell<Option<Box<dyn Any + Send + 'static>>>,
+    pub(crate) panic_payload: SafeUnsafeCell<ThreadPanicPayload>,
+    pub(crate) name: Option<String>,
+    pub(crate) thread: super::Thread,
 }
 
 unsafe impl<F: Send, T: Send> Send for ThreadSharedState<F, T> {}
@@ -108,9 +144,8 @@ where
         self.status.store(STATE_ABORTED, Ordering::Release);
     }
 
-    #[cfg(feature = "std")]
-    unsafe fn take_panic(&self) -> Option<Box<dyn Any + Send + 'static>> {
-        unsafe { self.panic_payload.with_mut(|x| x.take()) }
+    unsafe fn take_panic(&self) -> ThreadPanicPayload {
+        unsafe { self.panic_payload.with_mut(core::mem::take) }
     }
 }
 

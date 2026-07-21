@@ -1,5 +1,5 @@
 use crate::{Link, LinkedList};
-use std::boxed::Box;
+use veloq_std::boxed::Box;
 
 struct TestNode {
     val: i32,

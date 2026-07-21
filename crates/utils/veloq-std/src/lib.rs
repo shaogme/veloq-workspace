@@ -8,7 +8,6 @@ pub mod cell;
 pub mod collections;
 pub mod macros;
 pub mod sync;
-pub mod sys;
 pub mod thread;
 pub mod time;
 
@@ -53,6 +52,10 @@ pub mod ffi {
 
 pub mod fmt {
     pub use core::fmt::*;
+}
+
+pub mod future {
+    pub use core::future::*;
 }
 
 pub mod marker {
@@ -103,6 +106,4 @@ pub mod string {
     pub use alloc_crate::string::*;
 }
 
-pub mod panic {
-    pub use core::panic::*;
-}
+pub mod panic;

@@ -8,7 +8,10 @@ use veloq_driver_core::{
         SlotView,
     },
 };
-use veloq_shim::{Arc, sync::Mutex, thread};
+use veloq_std::{
+    sync::{Arc, Mutex},
+    thread,
+};
 
 struct DummyPlatformOp;
 
@@ -135,17 +138,19 @@ fn accept_completion(registry: &Mutex<OpRegistry<DummySlotSpec>>, token: OpToken
     let diagnostics = registry.shared.completion_diagnostics();
     let table: SharedCompletionTable<DummySlotSpec> = registry.shared.clone();
     let mut hooks = TestHooks;
-    let _ = registry.accept_completion(
-        &table,
-        &diagnostics,
-        &mut hooks,
-        CompletionIngress::User(UserCompletionEvent::from_parts(
-            CompletionBackend::Core,
-            token,
-            res,
-            0,
-        )),
-    );
+    registry
+        .accept_completion(
+            &table,
+            &diagnostics,
+            &mut hooks,
+            CompletionIngress::User(UserCompletionEvent::from_parts(
+                CompletionBackend::Core,
+                token,
+                res,
+                0,
+            )),
+        )
+        .unwrap();
 }
 
 #[test]
@@ -156,7 +161,8 @@ fn test_completion_table_loom() {
         let registry_cloned = registry.clone();
         let producer = thread::spawn(move || {
             accept_completion(&registry_cloned, token, 0);
-        });
+        })
+        .unwrap();
 
         let table_cloned = table.clone();
         let consumer = thread::spawn(move || {
@@ -172,7 +178,8 @@ fn test_completion_table_loom() {
                     table_cloned.mark_orphaned(token);
                 }
             }
-        });
+        })
+        .unwrap();
 
         producer.join().unwrap();
         consumer.join().unwrap();
@@ -187,13 +194,15 @@ fn test_detached_drop_race_loom() {
         let registry_cloned = registry.clone();
         let producer = thread::spawn(move || {
             accept_completion(&registry_cloned, token, 42);
-        });
+        })
+        .unwrap();
 
         let table_cloned = table.clone();
         let consumer = thread::spawn(move || {
             table_cloned.mark_waiting(token);
             table_cloned.mark_orphaned(token);
-        });
+        })
+        .unwrap();
 
         producer.join().unwrap();
         consumer.join().unwrap();
@@ -257,12 +266,14 @@ fn test_ready_race_with_mark_orphaned_loom() {
         let t1 = table.clone();
         let consumer_take = thread::spawn(move || {
             let _ = t1.try_take_record(token).unwrap();
-        });
+        })
+        .unwrap();
 
         let t2 = table.clone();
         let consumer_drop = thread::spawn(move || {
             t2.mark_orphaned(token);
-        });
+        })
+        .unwrap();
 
         consumer_take.join().unwrap();
         consumer_drop.join().unwrap();
@@ -288,7 +299,8 @@ fn test_two_consumers_at_most_one_ready_loom() {
             if let PollRecordResult::Ready(_) = c1_table.try_take_record(token).unwrap() {
                 c1_ready.fetch_add(1, Ordering::SeqCst);
             }
-        });
+        })
+        .unwrap();
 
         let c2_table = table.clone();
         let c2_ready = ready_count.clone();
@@ -297,7 +309,8 @@ fn test_two_consumers_at_most_one_ready_loom() {
             if let PollRecordResult::Ready(_) = c2_table.try_take_record(token).unwrap() {
                 c2_ready.fetch_add(1, Ordering::SeqCst);
             }
-        });
+        })
+        .unwrap();
 
         c1.join().unwrap();
         c2.join().unwrap();

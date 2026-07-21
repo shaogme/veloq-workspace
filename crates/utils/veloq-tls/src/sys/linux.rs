@@ -1,40 +1,35 @@
-use crate::{PlatformKey, TlsErrorKind, is_sentinel};
+use crate::{SystermKey, TlsErrorKind, is_sentinel};
 use alloc::boxed::Box;
 use core::{
-    ffi::c_void,
     hint::spin_loop,
     sync::atomic::{AtomicU32, Ordering},
 };
-use windows_sys::Win32::{
-    Foundation::GetLastError,
-    System::Threading::{FLS_OUT_OF_INDEXES, FlsAlloc, FlsFree, FlsGetValue, FlsSetValue},
+use libc::{
+    c_void, pthread_getspecific, pthread_key_create, pthread_key_delete, pthread_key_t,
+    pthread_setspecific,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Key(u32);
+pub(crate) struct Key(pthread_key_t);
 
-impl PlatformKey for Key {
+impl SystermKey for Key {
     #[inline]
     unsafe fn free(self) {
         unsafe {
-            FlsFree(self.0);
+            pthread_key_delete(self.0);
         }
     }
 
     #[inline]
     unsafe fn get_value<T>(self) -> *mut T {
-        unsafe { FlsGetValue(self.0) as *mut T }
+        unsafe { pthread_getspecific(self.0) as *mut T }
     }
 
     #[inline]
     unsafe fn set_value<T>(self, ptr: *mut T) -> Result<(), i32> {
         unsafe {
-            let res = FlsSetValue(self.0, ptr as _);
-            if res == 0 {
-                Err(GetLastError() as i32)
-            } else {
-                Ok(())
-            }
+            let res = pthread_setspecific(self.0, ptr as _);
+            if res != 0 { Err(res as i32) } else { Ok(()) }
         }
     }
 }
@@ -43,8 +38,9 @@ impl Key {
     #[inline]
     fn alloc<T>() -> Result<Self, TlsErrorKind> {
         unsafe {
-            let key = FlsAlloc(Some(tls_destructor::<T>));
-            if key == FLS_OUT_OF_INDEXES {
+            let mut key = 0;
+            let res = pthread_key_create(&mut key, Some(tls_destructor::<T>));
+            if res != 0 {
                 Err(TlsErrorKind::AllocationFailed)
             } else {
                 Ok(Key(key))
@@ -104,7 +100,7 @@ impl AtomicKey {
     }
 }
 
-unsafe extern "system" fn tls_destructor<T>(ptr: *const c_void) {
+unsafe extern "C" fn tls_destructor<T>(ptr: *mut c_void) {
     if !ptr.is_null() && !is_sentinel(ptr) {
         unsafe {
             let _ = Box::from_raw(ptr as *mut T);

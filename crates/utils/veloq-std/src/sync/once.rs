@@ -1,4 +1,7 @@
-use crate::{cell, fmt, sync, sys};
+use crate::{
+    cell, fmt,
+    sync::{self, sys},
+};
 
 use core::panic::{RefUnwindSafe, UnwindSafe};
 

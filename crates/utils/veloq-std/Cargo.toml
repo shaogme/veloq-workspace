@@ -17,6 +17,8 @@ hashbrown = { version = "0.17.1", default-features = false, features = ["alloc"]
 lock_api = { version = "0.4.14", default-features = false }
 veloq-hash.workspace = true
 veloq-tls.workspace = true
+crossbeam-utils.workspace = true
+crossbeam-queue.workspace = true
 
 [dependencies.loom]
 workspace = true
@@ -26,7 +28,7 @@ optional = true
 [features]
 default = ["std"]
 std = []
-loom = ["dep:loom"]
+loom = ["dep:loom", "veloq-tls/loom"]
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc.workspace = true

@@ -1,49 +1,41 @@
 use core::num::NonZeroUsize;
 
 use super::{SafeUnsafeCell, Sentinel, ThreadResultReceiver, ThreadSharedState};
+
 use crate::{
-    boxed::Box,
     cell::UnsafeCell,
     error::Error,
     ffi::c_void,
     fmt::{Display, Formatter, Result as FmtResult},
     marker::PhantomData,
     ptr::{null, null_mut},
+    string::String,
     sync::{
         Arc,
         atomic::{AtomicU8, Ordering},
     },
     thread::{
         AbortedError, ThreadErrorKind, ThreadId,
-        traits::{PlatformImpl, RawJoinHandleTrait, RawThreadErrorTrait},
+        traits::{RawJoinHandleTrait, RawThreadErrorTrait, SystermImpl},
     },
     time::Duration,
 };
 use windows_sys::Win32::{
     Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_OBJECT_0},
     System::Threading::{
-        ALL_PROCESSOR_GROUPS, CreateThread, GetActiveProcessorCount, GetCurrentThreadId, INFINITE,
-        Sleep, SwitchToThread, WaitForSingleObject,
+        ALL_PROCESSOR_GROUPS, CreateThread, GetActiveProcessorCount, GetCurrentThread, INFINITE,
+        SetThreadDescription, Sleep, SwitchToThread, WaitForSingleObject,
     },
 };
 
-#[cfg(feature = "loom")]
-use super::ThreadSharedStateTrait;
-
-#[cfg(feature = "std")]
 use super::SendSyncPanicPayload;
-
-#[cfg(feature = "std")]
-use crate::any::Any;
-
-#[cfg(feature = "std")]
-use std::panic::{AssertUnwindSafe, catch_unwind};
 
 /// Windows 平台下的原始线程加入句柄
 pub struct RawJoinHandle<'a, T> {
     handle: Option<HANDLE>,
     result: Option<ThreadResultReceiver<'a, T>>,
     _marker: PhantomData<&'a ()>,
+    pub(crate) thread: crate::thread::Thread,
 }
 
 unsafe impl<T: Send> Send for RawJoinHandle<'_, T> {}
@@ -57,10 +49,7 @@ pub enum RawThreadError {
     AlreadyJoined,
     ResultAlreadyTaken,
     ResultMissing,
-    #[cfg(feature = "std")]
     Panicked(Option<SendSyncPanicPayload>),
-    #[cfg(not(feature = "std"))]
-    Panicked,
     Aborted,
 }
 
@@ -73,10 +62,7 @@ impl Display for RawThreadError {
             RawThreadError::AlreadyJoined => write!(f, "thread already joined"),
             RawThreadError::ResultAlreadyTaken => write!(f, "thread result already taken"),
             RawThreadError::ResultMissing => write!(f, "thread result missing"),
-            #[cfg(feature = "std")]
             RawThreadError::Panicked(_) => write!(f, "thread panicked during execution"),
-            #[cfg(not(feature = "std"))]
-            RawThreadError::Panicked => write!(f, "thread panicked during execution"),
             RawThreadError::Aborted => write!(f, "thread execution was aborted"),
         }
     }
@@ -93,25 +79,22 @@ impl RawThreadErrorTrait for RawThreadError {
             RawThreadError::AlreadyJoined => ThreadErrorKind::AlreadyJoined,
             RawThreadError::ResultAlreadyTaken => ThreadErrorKind::ResultAlreadyTaken,
             RawThreadError::ResultMissing => ThreadErrorKind::ResultMissing,
-            #[cfg(feature = "std")]
             RawThreadError::Panicked(_) => ThreadErrorKind::Panicked,
-            #[cfg(not(feature = "std"))]
-            RawThreadError::Panicked => ThreadErrorKind::Panicked,
             RawThreadError::Aborted => ThreadErrorKind::Aborted,
         }
     }
 
-    #[cfg(feature = "std")]
-    fn from_panic(payload: Box<dyn Any + Send + 'static>) -> Self {
-        RawThreadError::Panicked(Some(SendSyncPanicPayload(payload)))
+    #[inline]
+    fn from_panic(payload: super::ThreadPanicPayload) -> Self {
+        RawThreadError::Panicked(super::from_panic_payload(payload))
     }
 
-    #[cfg(feature = "std")]
-    fn take_panic(&mut self) -> Option<Box<dyn Any + Send + 'static>> {
+    #[inline]
+    fn take_panic(&mut self) -> super::ThreadPanicPayload {
         if let RawThreadError::Panicked(payload) = self {
-            payload.take().map(|p| p.0)
+            super::take_panic_payload(payload)
         } else {
-            None
+            Default::default()
         }
     }
 }
@@ -123,9 +106,20 @@ where
 {
     let state = unsafe { Arc::from_raw(param as *const ThreadSharedState<F, T>) };
 
+    let _ = super::CURRENT_THREAD.set_owned(state.thread.clone());
+
     super::CURRENT_THREAD_STATUS.with_or_default(|cell| {
         cell.set(Some(&state.status as *const AtomicU8));
     });
+
+    if let Some(ref name) = state.name {
+        let mut name_u16: crate::vec::Vec<u16> = name.encode_utf16().collect();
+        name_u16.push(0);
+        unsafe {
+            let current_thread = GetCurrentThread();
+            let _ = SetThreadDescription(current_thread, name_u16.as_ptr());
+        }
+    }
 
     struct ThreadStatusGuard;
     impl Drop for ThreadStatusGuard {
@@ -143,70 +137,47 @@ where
     };
 
     if let Some(f) = unsafe { state.closure.with_mut(|x| x.take()) } {
-        #[cfg(feature = "std")]
-        {
-            let res = catch_unwind(AssertUnwindSafe(f));
-            match res {
-                Ok(r) => {
-                    unsafe {
-                        state.result.with_mut(|opt| *opt = Some(r));
-                    }
-                    sentinel.panicked = false;
-                    let _ = state.status.compare_exchange(
-                        super::STATE_INCOMPLETE,
-                        super::STATE_FINISHED,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    );
+        let res = crate::panic::catch_unwind_safe(f);
+        match res {
+            Ok(r) => {
+                unsafe {
+                    state.result.with_mut(|opt| *opt = Some(r));
                 }
-                Err(err) => unsafe {
-                    state.panic_payload.with_mut(|opt| *opt = Some(err));
-                },
+                sentinel.panicked = false;
+                let _ = state.status.compare_exchange(
+                    super::STATE_INCOMPLETE,
+                    super::STATE_FINISHED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
             }
-        }
-        #[cfg(not(feature = "std"))]
-        {
-            let r = f();
-            unsafe {
-                state.result.with_mut(|opt| *opt = Some(r));
-            }
-            sentinel.panicked = false;
-            let _ = state.status.compare_exchange(
-                super::STATE_INCOMPLETE,
-                super::STATE_FINISHED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
+            Err(err) => unsafe {
+                state.panic_payload.with_mut(|opt| *opt = err);
+            },
         }
     }
 
     0
 }
 
-fn spawn<'a, F, T>(f: F) -> Result<RawJoinHandle<'a, T>, RawThreadError>
+fn spawn<'a, F, T>(
+    name: Option<String>,
+    stack_size: Option<usize>,
+    f: F,
+) -> Result<RawJoinHandle<'a, T>, RawThreadError>
 where
     F: FnOnce() -> T + Send + 'a,
     T: Send + 'a,
 {
-    #[cfg(feature = "loom")]
-    type BoxF<'a, T> = Box<dyn FnOnce() -> T + Send + 'a>;
+    let thread = crate::thread::Thread::new(name.clone());
 
-    #[cfg(not(feature = "loom"))]
     let state = Arc::new(ThreadSharedState {
         closure: UnsafeCell::new(Some(f)),
         status: AtomicU8::new(super::STATE_INCOMPLETE),
         result: SafeUnsafeCell::new(None),
-        #[cfg(feature = "std")]
         panic_payload: SafeUnsafeCell::new(None),
-    });
-
-    #[cfg(feature = "loom")]
-    let state = Arc::new(ThreadSharedState {
-        closure: UnsafeCell::new(Some(Box::new(f) as BoxF<'a, T>)),
-        status: AtomicU8::new(super::STATE_INCOMPLETE),
-        result: SafeUnsafeCell::new(None),
-        #[cfg(feature = "std")]
-        panic_payload: SafeUnsafeCell::new(None),
+        name,
+        thread: thread.clone(),
     });
 
     let receiver = ThreadResultReceiver {
@@ -216,19 +187,20 @@ where
     let param = Arc::into_raw(state) as *mut c_void;
 
     unsafe {
-        #[cfg(not(feature = "loom"))]
         let entry = thread_entry_win::<F, T>;
-        #[cfg(feature = "loom")]
-        let entry = thread_entry_win::<BoxF<'a, T>, T>;
 
-        let handle = CreateThread(null(), 0, Some(entry), param, 0, null_mut());
+        let handle = CreateThread(
+            null(),
+            stack_size.unwrap_or(0),
+            Some(entry),
+            param,
+            0,
+            null_mut(),
+        );
 
         if handle.is_null() {
             let err = GetLastError();
-            #[cfg(not(feature = "loom"))]
             let _ = Arc::from_raw(param as *const ThreadSharedState<F, T>);
-            #[cfg(feature = "loom")]
-            let _ = Arc::from_raw(param as *const ThreadSharedState<BoxF<'a, T>, T>);
             return Err(RawThreadError::CreationFailed(err));
         }
 
@@ -236,6 +208,7 @@ where
             handle: Some(handle),
             result: Some(receiver),
             _marker: PhantomData,
+            thread,
         })
     }
 }
@@ -253,19 +226,13 @@ impl<'a, T: Send> RawJoinHandle<'a, T> {
                 .result
                 .take()
                 .ok_or(RawThreadError::ResultAlreadyTaken)?;
-            #[cfg(feature = "std")]
             let state = receiver.state.clone();
             match receiver.receive() {
                 Ok(Some(val)) => Ok(val),
                 Ok(None) => Err(RawThreadError::ResultMissing),
                 Err(super::STATE_PANICKED) => {
-                    #[cfg(feature = "std")]
-                    {
-                        let payload = state.take_panic();
-                        Err(RawThreadError::Panicked(payload.map(SendSyncPanicPayload)))
-                    }
-                    #[cfg(not(feature = "std"))]
-                    Err(RawThreadError::Panicked)
+                    let payload = state.take_panic();
+                    Err(RawThreadError::from_panic(payload))
                 }
                 Err(super::STATE_ABORTED) => Err(RawThreadError::Aborted),
                 Err(_) => Err(RawThreadError::Aborted),
@@ -309,21 +276,25 @@ impl<'a, T: Send> RawJoinHandleTrait<T> for RawJoinHandle<'a, T> {
 }
 
 /// Windows 平台下的平台实现结构体
-pub struct Platform;
+pub struct Systerm;
 
-impl PlatformImpl for Platform {
+impl SystermImpl for Systerm {
     type Error = RawThreadError;
     type RawJoinHandle<'a, T: Send>
         = RawJoinHandle<'a, T>
     where
         T: 'a;
 
-    fn spawn<'a, F, T>(f: F) -> Result<Self::RawJoinHandle<'a, T>, Self::Error>
+    fn spawn<'a, F, T>(
+        name: Option<String>,
+        stack_size: Option<usize>,
+        f: F,
+    ) -> Result<Self::RawJoinHandle<'a, T>, Self::Error>
     where
         F: FnOnce() -> T + Send + 'a,
         T: Send + 'a,
     {
-        spawn(f)
+        spawn(name, stack_size, f)
     }
 
     fn yield_now() -> Result<bool, AbortedError> {
@@ -364,8 +335,7 @@ impl PlatformImpl for Platform {
     }
 
     fn current_id() -> ThreadId {
-        let id = unsafe { GetCurrentThreadId() };
-        ThreadId(id as u64)
+        crate::thread::current().id()
     }
 
     fn available_parallelism() -> Result<NonZeroUsize, Self::Error> {

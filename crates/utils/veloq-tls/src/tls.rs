@@ -1,5 +1,5 @@
 use crate::{
-    AtomicKey, Key, PlatformKey, ResetGuard, TlsError, TlsErrorKind, is_sentinel, sentinel_ptr,
+    AtomicKey, Key, ResetGuard, SystermKey, TlsError, TlsErrorKind, is_sentinel, sentinel_ptr,
 };
 use alloc::boxed::Box;
 use core::{marker::PhantomData, ptr::null_mut};

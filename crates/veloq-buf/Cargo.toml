@@ -23,6 +23,7 @@ diagweave.workspace = true
 
 [features]
 loom = ["veloq-intrusive-linklist/loom"]
+std = ["veloq-intrusive-linklist/std"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true

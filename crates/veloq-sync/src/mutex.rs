@@ -1,14 +1,18 @@
-use crate::shim::atomic::{AtomicUsize, Ordering};
-use crate::shim::cell::UnsafeCell;
-use crate::shim::lock::SpinLock;
 use crate::waker::{WaiterAdapter, WaiterNode};
-use std::future::Future;
-use std::marker::PhantomPinned;
-use std::ops::{Deref, DerefMut};
-use std::pin::Pin;
-use std::ptr::NonNull;
-use std::task::{Context, Poll};
 use veloq_intrusive_linklist::LinkedList;
+use veloq_std::{
+    cell::UnsafeCell,
+    future::Future,
+    marker::PhantomPinned,
+    ops::{Deref, DerefMut},
+    pin::Pin,
+    ptr::NonNull,
+    sync::{
+        SpinLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+    task::{Context, Poll},
+};
 
 /// An asynchronous mutual exclusion primitive.
 pub struct Mutex<T: ?Sized> {
@@ -66,7 +70,7 @@ impl<T: ?Sized> Mutex<T> {
     /// the mutable borrow statically guarantees no locks exist.
     pub fn get_mut(&mut self) -> &mut T {
         // SAFETY: We have exclusive access to the Mutex, so we have exclusive access to the data.
-        unsafe { &mut *self.data.get_mut() }
+        unsafe { &mut *self.data.with_mut(|ptr| ptr as *mut T) }
     }
 
     /// Attempts to acquire the lock immediately.
@@ -107,14 +111,14 @@ impl<T: ?Sized> Deref for MutexGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
         // SAFETY: We hold the lock.
-        unsafe { &*self.lock.data.get() }
+        unsafe { &*self.lock.data.with(|ptr| ptr as *const T) }
     }
 }
 
 impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         // SAFETY: We hold the lock.
-        unsafe { &mut *self.lock.data.get_mut() }
+        unsafe { &mut *self.lock.data.with_mut(|ptr| ptr as *mut T) }
     }
 }
 
@@ -135,9 +139,11 @@ impl<T: ?Sized> Drop for MutexGuard<'_, T> {
 
         // Notify one waiter
         let mut waiters = self.lock.waiters.lock();
-        if let Some(node) = waiters.pop_front() {
-            node.as_ref().waker.wake();
-        }
+        waiters.with_mut(|w| {
+            if let Some(node) = w.pop_front() {
+                node.as_ref().waker.wake();
+            }
+        });
     }
 }
 
@@ -173,16 +179,19 @@ impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
                         // We successfully acquired the lock.
                         // If we were queued, we must ensure we are removed.
                         let mut waiters = this.lock.waiters.lock();
-                        if this.node.link.is_linked() {
+                        let is_linked = waiters.with(|_| this.node.link.is_linked());
+                        if is_linked {
                             unsafe {
                                 let ptr = NonNull::from(&this.node);
-                                let mut cursor = waiters.cursor_mut_from_ptr(ptr);
-                                cursor.remove();
+                                waiters.with_mut(|w| {
+                                    let mut cursor = w.cursor_mut_from_ptr(ptr);
+                                    cursor.remove();
+                                });
                             }
                         }
                         // Optimization: if queue is empty, demote state to LOCKED.
                         // This avoids next unlock taking slow path.
-                        if waiters.is_empty() {
+                        if waiters.with(|w| w.is_empty()) {
                             this.lock.state.store(LOCKED, Ordering::Release);
                         }
 
@@ -203,7 +212,7 @@ impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
                     if this.lock.state.load(Ordering::Relaxed) == UNLOCKED {
                         break;
                     }
-                    std::hint::spin_loop();
+                    veloq_std::hint::spin_loop();
                 }
                 if this.lock.state.load(Ordering::Relaxed) == UNLOCKED {
                     continue;
@@ -240,7 +249,7 @@ impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
                 // Enqueue
                 unsafe {
                     let node_pin = Pin::new_unchecked(&mut this.node);
-                    waiters.push_back(node_pin);
+                    waiters.with_mut(|w| w.push_back(node_pin));
                 }
                 this.queued = true;
 
@@ -252,8 +261,8 @@ impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
             } else {
                 // If we are queued, check if we were woken
                 let is_linked = {
-                    let _waiters = this.lock.waiters.lock();
-                    this.node.link.is_linked()
+                    let waiters = this.lock.waiters.lock();
+                    waiters.with(|_| this.node.link.is_linked())
                 };
 
                 if !is_linked {
@@ -281,11 +290,14 @@ impl<'a, T: ?Sized> Drop for MutexLockFuture<'a, T> {
     fn drop(&mut self) {
         if self.queued {
             let mut waiters = self.lock.waiters.lock();
-            if self.node.link.is_linked() {
+            let is_linked = waiters.with(|_| self.node.link.is_linked());
+            if is_linked {
                 unsafe {
                     let ptr = NonNull::from(&self.node);
-                    let mut cursor = waiters.cursor_mut_from_ptr(ptr);
-                    cursor.remove();
+                    waiters.with_mut(|w| {
+                        let mut cursor = w.cursor_mut_from_ptr(ptr);
+                        cursor.remove();
+                    });
                 }
             }
         }
