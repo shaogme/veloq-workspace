@@ -1,5 +1,3 @@
-extern crate std;
-
 use crate::{SystermKey, TlsErrorKind};
 use alloc::{boxed::Box, vec::Vec};
 use core::{
@@ -32,9 +30,11 @@ impl Drop for ThreadValue {
     }
 }
 
-loom::thread_local! {
-    static THREAD_VALUES: RefCell<Vec<Option<ThreadValue>>> = RefCell::new(Vec::new());
-}
+static THREAD_VALUES: loom::thread::LocalKey<RefCell<Vec<Option<ThreadValue>>>> =
+    loom::thread::LocalKey {
+        init: (|| RefCell::new(Vec::new())) as fn() -> RefCell<Vec<Option<ThreadValue>>>,
+        _p: core::marker::PhantomData,
+    };
 
 unsafe fn tls_destructor_shim<T>(ptr: *mut ()) {
     // 过滤哨兵指针以防堆损坏
