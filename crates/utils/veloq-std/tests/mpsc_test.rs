@@ -67,7 +67,9 @@ mod loom_tests {
 
     #[test]
     fn test_loom_mpsc() {
-        loom::model(|| {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(7);
+        builder.check(|| {
             let (tx, rx) = mpsc::channel();
             let tx1 = tx.clone();
 

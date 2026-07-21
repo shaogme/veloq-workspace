@@ -1,3 +1,5 @@
+#![cfg(not(feature = "loom"))]
+
 use veloq_std::{
     sync::atomic::{CoreAtomicBool, Ordering},
     thread::spawn,

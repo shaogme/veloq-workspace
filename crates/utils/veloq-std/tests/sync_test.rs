@@ -1,3 +1,5 @@
+#![cfg(not(feature = "loom"))]
+
 use veloq_std::{
     sync::atomic::{CoreAtomicU32, Ordering},
     sync::{Once, OnceLock},
