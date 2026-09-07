@@ -260,12 +260,18 @@ impl Runner {
             eprintln!("[xtest-runner] 在 Windows 虚拟机中执行任务...");
         }
         let forward_args = std::env::args().skip(1).collect::<Vec<_>>();
-        let status = vm.run_in_vm(&forward_args)?;
+        let output = vm.run_in_vm(&forward_args, self.config.quiet)?;
 
-        if status.success() {
+        if output.status.success() {
+            if self.config.quiet {
+                print!("{}", String::from_utf8_lossy(&output.stdout));
+            }
             Ok(())
         } else {
-            std::process::exit(status.code().unwrap_or(1));
+            if self.config.quiet {
+                print_output(&output);
+            }
+            std::process::exit(output.status.code().unwrap_or(1));
         }
     }
 

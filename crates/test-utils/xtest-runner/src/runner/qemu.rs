@@ -4,7 +4,7 @@ use std::{
     io::{Error, ErrorKind},
     net::TcpListener,
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Child, Command, Output, Stdio},
     thread::sleep,
     time::{Duration, Instant},
 };
@@ -216,7 +216,7 @@ impl QemuInstance {
         Ok(())
     }
 
-    pub fn run_in_vm(&self, forward_args: &[String]) -> Result<ExitStatus, RunnerError> {
+    pub fn run_in_vm(&self, forward_args: &[String], quiet: bool) -> Result<Output, RunnerError> {
         let escaped_args = forward_args
             .iter()
             .map(|arg| {
@@ -230,28 +230,36 @@ impl QemuInstance {
             .join(" ");
 
         let vm_cmd = format!(
-            "powershell -Command \"Set-Location C:\\workspace; cargo run -p xtest-runner -- {escaped_args}\""
+            "powershell -Command \"Set-Location C:\\workspace; cargo run -q -p xtest-runner -- {escaped_args}\""
         );
 
-        let status = Command::new("sshpass")
-            .args([
-                "-p",
-                &self.config.password,
-                "ssh",
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                "UserKnownHostsFile=/dev/null",
-                "-o",
-                "LogLevel=ERROR",
-                "-p",
-                &self.host_port.to_string(),
-                &format!("{}@127.0.0.1", self.config.username),
-                &vm_cmd,
-            ])
-            .status()?;
+        let mut cmd = Command::new("sshpass");
+        cmd.args([
+            "-p",
+            &self.config.password,
+            "ssh",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "LogLevel=ERROR",
+            "-p",
+            &self.host_port.to_string(),
+            &format!("{}@127.0.0.1", self.config.username),
+            &vm_cmd,
+        ]);
 
-        Ok(status)
+        if quiet {
+            Ok(cmd.output()?)
+        } else {
+            let status = cmd.status()?;
+            Ok(Output {
+                status,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
     }
 }
 
