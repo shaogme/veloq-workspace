@@ -1,0 +1,122 @@
+{
+  "lockfile_version": "1",
+  "packages": {
+    "github:NixOS/nixpkgs/nixpkgs-unstable": {
+      "last_modified": "2026-09-07T01:55:52Z",
+      "resolved": "github:NixOS/nixpkgs/42f17a57f4f6e33b3de3dca0a2a5ea5233169d02?lastModified=1788746152&narHash=sha256-RaKngusl5I8pNi8RfrVvsHq3NZe7eFWzDlb01%2BhEVqY%3D"
+    },
+    "openssh@latest": {
+      "last_modified": "2026-08-27T07:16:00Z",
+      "resolved": "github:NixOS/nixpkgs/c27cdad491a991b11ed731760aa2ef8db0cb0410#openssh",
+      "source": "devbox-search",
+      "version": "10.5p1",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/v0ih1j77i9bvq7nn4r70s32fchgv1k6a-openssh-10.5p1",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/0llp0z6wz970lzhzm9csx4ahnjrjxw9p-openssh-10.5p1-man",
+              "default": true
+            },
+            {
+              "name": "dev",
+              "path": "/nix/store/20m6m81acz0gsmzwff984rbm2wmkdr8j-openssh-10.5p1-dev"
+            }
+          ],
+          "store_path": "/nix/store/v0ih1j77i9bvq7nn4r70s32fchgv1k6a-openssh-10.5p1"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/6dibrdp9lf2p8ap2bf02kywgljh51qca-openssh-10.5p1",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/5mqwhvyg5b54xx49186vxazf29ly5x6y-openssh-10.5p1-man",
+              "default": true
+            },
+            {
+              "name": "dev",
+              "path": "/nix/store/fn1q69a82rz57xmr2y1vx4mbdsbnk3z0-openssh-10.5p1-dev"
+            }
+          ],
+          "store_path": "/nix/store/6dibrdp9lf2p8ap2bf02kywgljh51qca-openssh-10.5p1"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/ggcm0s524bsly3qc7kww945qs7003psf-openssh-10.5p1",
+              "default": true
+            },
+            {
+              "name": "man",
+              "path": "/nix/store/s9a3xnwfliryd5qsk8kicsz3d6xpny60-openssh-10.5p1-man",
+              "default": true
+            },
+            {
+              "name": "dev",
+              "path": "/nix/store/wy59wl68ndias0dxqj5jx7y0rs040bmw-openssh-10.5p1-dev"
+            }
+          ],
+          "store_path": "/nix/store/ggcm0s524bsly3qc7kww945qs7003psf-openssh-10.5p1"
+        }
+      }
+    },
+    "sshpass@latest": {
+      "last_modified": "2026-08-27T07:16:00Z",
+      "resolved": "github:NixOS/nixpkgs/c27cdad491a991b11ed731760aa2ef8db0cb0410#sshpass",
+      "source": "devbox-search",
+      "version": "1.10",
+      "systems": {
+        "aarch64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/847sywnxn0528j4szin53xb9381aapqr-sshpass-1.10",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/847sywnxn0528j4szin53xb9381aapqr-sshpass-1.10"
+        },
+        "aarch64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/6bcaigvf7dz7x9kv3nnxj2cacfjj5h3c-sshpass-1.10",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/6bcaigvf7dz7x9kv3nnxj2cacfjj5h3c-sshpass-1.10"
+        },
+        "x86_64-darwin": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/30kr31149dx8mcnwnnav03i4fjaw0d09-sshpass-1.10",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/30kr31149dx8mcnwnnav03i4fjaw0d09-sshpass-1.10"
+        },
+        "x86_64-linux": {
+          "outputs": [
+            {
+              "name": "out",
+              "path": "/nix/store/xwpbf4n3ljnm9rspfhysvr2qvvkgpwdg-sshpass-1.10",
+              "default": true
+            }
+          ],
+          "store_path": "/nix/store/xwpbf4n3ljnm9rspfhysvr2qvvkgpwdg-sshpass-1.10"
+        }
+      }
+    }
+  }
+}

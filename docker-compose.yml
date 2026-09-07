@@ -1,31 +1,32 @@
-services:
-  # Base configuration for the application
-  app-base: &app-base
-    image: ghcr.io/shaogme/coding-images/rust-cross:latest
-    privileged: true
-    environment:
-      - ROOT_PASSWORD=root # Set your secure password here
-      - MISE_YES=1 # Non-interactive mode for mise
-      - HOST_UID=${HOST_UID:-1000:1000} # Adaptive UID/GID mapping to avoid file permission conflicts
-      - CONTAINER_HOME=${CONTAINER_HOME:-/home/dev} # Default to /home/dev, override with /root for root user
-      - CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-0} # Disabled by default for sccache caching compatibility
-      - CARGO_TARGET_DIR=/data/.cargo/target # Isolate Rust target directory to persistent data volume
-      - RUSTC_WRAPPER=${RUSTC_WRAPPER:-sccache} # Enable sccache compiler wrapper by default
-      - SCCACHE_DIR=/data/sccache # Directory for sccache compiler cache storage
-      - SCCACHE_DISABLE=${SCCACHE_DISABLE:-0} # Set to 1 to explicitly disable sccache (also supports ENABLE_SCCACHE=0)
-      - CROSS_CONTAINER_ENGINE=podman # Direct cross to use containerized Podman engine
-    security_opt:
-      - seccomp:unconfined # Required for inner container execution and trace
-      - label:disable # Disable SELinux labeling separation for containers
-    cap_add:
-      - SYS_ADMIN
-      - SYS_PTRACE
-      - NET_ADMIN
-    devices:
-      - /dev/fuse:/dev/fuse # Allow fuse-overlayfs inside container
-      - /dev/net/tun:/dev/net/tun # Allow TUN/TAP devices for Podman to create network interfaces
-    tty: true
+# Base configuration for the application
+x-app-base: &app-base
+  image: ghcr.io/shaogme/coding-images/qemu-rust-cross:latest
+  privileged: true
+  environment:
+    - ROOT_PASSWORD=root # Set your secure password here
+    - DEVBOX_AUTO_INIT=${DEVBOX_AUTO_INIT:-0} # Auto-initialize devbox.json if not present
+    - HOST_UID=${HOST_UID:-1000:1000} # Adaptive UID/GID mapping to avoid file permission conflicts
+    - CONTAINER_HOME=${CONTAINER_HOME:-/home/dev} # Default to /home/dev, override with /root for root user
+    - CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-0} # Disabled by default for sccache caching compatibility
+    - CARGO_TARGET_DIR=/data/.cargo/target # Isolate Rust target directory to persistent data volume
+    - RUSTC_WRAPPER=${RUSTC_WRAPPER:-sccache} # Enable sccache compiler wrapper by default
+    - SCCACHE_DIR=/data/sccache # Directory for sccache compiler cache storage
+    - SCCACHE_DISABLE=${SCCACHE_DISABLE:-0} # Set to 1 to explicitly disable sccache (also supports ENABLE_SCCACHE=0)
+    - CROSS_CONTAINER_ENGINE=podman # Direct cross to use containerized Podman engine
+  security_opt:
+    - seccomp:unconfined # Required for VM, inner container execution and trace
+    - label:disable # Disable SELinux labeling separation for containers
+  cap_add:
+    - SYS_ADMIN
+    - SYS_PTRACE
+    - NET_ADMIN
+  devices:
+    - /dev/kvm:/dev/kvm # Hardware acceleration for KVM virtualization
+    - /dev/net/tun:/dev/net/tun # Allow TUN/TAP devices for QEMU & Podman to create network interfaces
+    - /dev/fuse:/dev/fuse # Allow fuse-overlayfs inside container
+  tty: true
 
+services:
   # Develop mode: Mounts local directory for hot-reloading (Default)
   dev:
     <<: *app-base
@@ -34,6 +35,8 @@ services:
       # Mount host source code
       - .:/workspace
       - /workspace/.git
+      # Persist VM images, cloud-init seeds, and QEMU disks
+      - qemu-data:/data/qemu
       # Isolate Rust build artifacts inside a dedicated named Docker volume (high-performance Linux ext4)
       - rust-target:/data/.cargo/target
       # Persist Cargo dependencies, crate index, and git checkouts
@@ -43,17 +46,17 @@ services:
       - sccache-cache:/data/sccache
       # Persist Podman containers and cached cross-compilation toolchain images
       - podman-containers:/var/lib/containers
-      # Persist direnv data
-      - direnv-data:/data/direnv
+      # Persist devbox data
+      - devbox-data:/data/devbox
       # Persist unified AI credentials and tool configurations
       - coding-config:/data/coding-config
 
 volumes:
+  qemu-data:
   rust-target:
   cargo-registry:
   cargo-git:
   sccache-cache:
   podman-containers:
-  mise-cache:
-  direnv-data:
+  devbox-data:
   coding-config:

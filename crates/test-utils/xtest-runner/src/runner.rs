@@ -3,12 +3,14 @@ use diagweave::prelude::*;
 use std::path::{Path, PathBuf};
 
 mod cmd;
+mod qemu;
 
 pub use cmd::{CommandSpec, DockerComposeVariant};
 use cmd::{
-    command_output, command_status, command_works, docker_compose_variant, has_rust_target,
-    print_output, workspace_root,
+    command_output, command_status, command_works, docker_compose_variant, print_output,
+    workspace_root,
 };
+use qemu::{QemuInstance, WindowsVmConfig, ensure_devbox_path};
 
 #[derive(Clone, Copy, Debug)]
 pub enum RunMode {
@@ -33,10 +35,10 @@ impl Runner {
             workspace_root.to_string_lossy().to_string(),
         )?;
 
-        let windows_target = if cfg!(target_os = "windows") || config.target != Target::Windows {
+        let windows_target = if !cfg!(target_os = "windows") || config.target != Target::Windows {
             None
         } else {
-            // 在非 Windows 环境下（如 Linux），探测已安装的 Windows target
+            // 在 Windows 原生环境下，探测已安装的 Windows target
             let output = command_output(
                 &CommandSpec::new(
                     "rustup",
@@ -83,17 +85,18 @@ impl Runner {
     }
 
     pub fn run(&self) -> Result<(), Report<RunnerError>> {
-        if !matches!(self.mode, RunMode::Native) {
-            // 在非原生环境下，我们直接运行一次 xtest-runner，由内部的 xtest-runner 负责循环
+        if matches!(self.mode, RunMode::WindowsOnLinux) {
+            return self.run_windows_on_linux();
+        }
+
+        if matches!(self.mode, RunMode::LinuxOnWindows(_)) {
             let command = self.round_command();
             let status = command_status(&command, &self.workspace_root)
-                .with_ctx("command", command.display());
+                .with_ctx("command", command.display())?;
 
-            let status = status?;
             if status.success() {
                 return Ok(());
             } else {
-                // 代理子命令已经输出了详细报告（含 count 信息），外层直接对应 code 退出即可
                 std::process::exit(status.code().unwrap_or(1));
             }
         }
@@ -217,59 +220,53 @@ impl Runner {
 
     fn prepare_environment(&self) -> Result<(), Report<RunnerError>> {
         if matches!(self.mode, RunMode::WindowsOnLinux) {
-            if !command_works("cross", &["--version"], &self.workspace_root) {
-                self.run_setup(
-                    "安装 cross",
-                    CommandSpec::new("cargo", vec!["install".into(), "cross".into()]),
-                )?;
+            ensure_devbox_path(&self.workspace_root);
+
+            if !command_works("qemu-system-x86_64", &["--version"], &self.workspace_root) {
+                return Err(RunnerError::QemuNotFound.trans());
             }
 
-            if let Some(target) = &self.windows_target
-                && !has_rust_target(target, &self.workspace_root)
-                    .with_ctx("target", target.clone())?
+            if !command_works("ssh", &["-V"], &self.workspace_root)
+                || !command_works("sshpass", &["-V"], &self.workspace_root)
             {
-                self.run_setup(
-                    &format!("安装 {} 工具链", target),
-                    CommandSpec::new(
-                        "rustup",
-                        vec!["target".into(), "add".into(), target.clone()],
-                    ),
-                )?;
+                return Err(RunnerError::SshDependencyNotFound.trans());
             }
+
+            WindowsVmConfig::from_workspace(&self.workspace_root)?;
         }
 
         Ok(())
     }
 
-    fn run_setup(&self, step: &str, command: CommandSpec) -> Result<(), Report<RunnerError>> {
+    fn run_windows_on_linux(&self) -> Result<(), Report<RunnerError>> {
+        let vm_config = WindowsVmConfig::from_workspace(&self.workspace_root)?;
+
         if !self.config.quiet {
-            eprintln!("[xtest-runner] {step}: {}", command.display());
-            let status = command_status(&command, &self.workspace_root)
-                .with_ctx("step", step.to_string())?;
-            if status.success() {
-                return Ok(());
-            }
-
-            return RunnerError::SetupFailed {
-                step: step.to_string(),
-                code: status.code(),
-            }
-            .with_ctx("command", command.display());
+            eprintln!("[xtest-runner] 正在启动 QEMU Windows 虚拟机...");
         }
+        let vm = QemuInstance::start(vm_config)?;
 
-        let output =
-            command_output(&command, &self.workspace_root).with_ctx("step", step.to_string())?;
-        if output.status.success() {
-            return Ok(());
+        if !self.config.quiet {
+            eprintln!("[xtest-runner] 等待 Windows 虚拟机 SSH 就绪...");
         }
+        vm.wait_for_ssh()?;
 
-        eprintln!("{step} 失败（退出码: {:?}）", output.status.code());
-        print_output(&output);
-        RunnerError::SetupFailed {
-            step: step.to_string(),
-            code: output.status.code(),
+        if !self.config.quiet {
+            eprintln!("[xtest-runner] 正在同步工作区代码至 Windows 虚拟机...");
         }
-        .with_ctx("command", command.display())
+        vm.sync_workspace(&self.workspace_root)?;
+
+        if !self.config.quiet {
+            eprintln!("[xtest-runner] 在 Windows 虚拟机中执行任务...");
+        }
+        let forward_args = std::env::args().skip(1).collect::<Vec<_>>();
+        let status = vm.run_in_vm(&forward_args)?;
+
+        if status.success() {
+            Ok(())
+        } else {
+            std::process::exit(status.code().unwrap_or(1));
+        }
     }
 
     fn round_command(&self) -> CommandSpec {
@@ -300,20 +297,7 @@ impl Runner {
                 CommandSpec::new(program, args)
             }
             (RunMode::WindowsOnLinux, Target::Windows) => {
-                let target = self
-                    .windows_target
-                    .as_deref()
-                    .unwrap_or("x86_64-pc-windows-gnu");
-                let mut args = vec![
-                    "run".into(),
-                    "--target".into(),
-                    target.into(),
-                    "-p".into(),
-                    "xtest-runner".into(),
-                    "--".into(),
-                ];
-                args.extend(std::env::args().skip(1));
-                CommandSpec::new("cross", args).with_env("CROSS_SKIP_AUTO_UPDATE", "1")
+                unreachable!("WindowsOnLinux 由 QEMU 直接管理执行")
             }
             (_, Target::Linux) => {
                 linux_native_command(self.config.task, self.config.features.as_deref())

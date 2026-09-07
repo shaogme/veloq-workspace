@@ -1,6 +1,5 @@
 use clap::{Parser, ValueEnum};
-use diagweave::prelude::*;
-use diagweave::union;
+use diagweave::{prelude::*, union};
 use std::process::ExitCode;
 
 mod runner;
@@ -20,12 +19,20 @@ union! {
             #[display("无法解析 workspace 根目录")]
             WorkspaceRootResolutionFailed,
 
-            #[display("检查 rustup target 失败")]
-            FailedToCheckRustupTarget,
+            #[display("未检测到 qemu-system-x86_64，无法在 Linux 上执行 Windows 镜像")]
+            QemuNotFound,
 
-            #[display("{step} 失败（退出码: {code:?}）")]
-            SetupFailed {
-                step: String,
+            #[display("未检测到 ssh 或 sshpass，请通过 devbox 管理依赖")]
+            SshDependencyNotFound,
+
+            #[display("未找到 Windows 镜像: {0}")]
+            WindowsImageNotFound(String),
+
+            #[display("等待 Windows 虚拟机 SSH 就绪超时")]
+            VmSshTimeout,
+
+            #[display("同步代码到 Windows 虚拟机失败（退出码: {code:?}）")]
+            VmSyncFailed {
                 code: Option<i32>,
             },
 

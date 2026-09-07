@@ -24,11 +24,6 @@ impl CommandSpec {
         }
     }
 
-    pub fn with_env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.envs.push((key.into(), value.into()));
-        self
-    }
-
     pub fn display(&self) -> String {
         let env_part = self
             .envs
@@ -49,28 +44,6 @@ impl CommandSpec {
             format!("{env_part} {command_part}")
         }
     }
-}
-
-pub fn has_rust_target(target: &str, workspace_root: &Path) -> Result<bool, RunnerError> {
-    let output = command_output(
-        &CommandSpec::new(
-            "rustup",
-            vec!["target".into(), "list".into(), "--installed".into()],
-        ),
-        workspace_root,
-    )?;
-
-    if !output.status.success() {
-        eprintln!(
-            "检查 rustup target 失败（退出码: {:?}）",
-            output.status.code()
-        );
-        print_output(&output);
-        return Err(RunnerError::FailedToCheckRustupTarget);
-    }
-
-    let installed = String::from_utf8_lossy(&output.stdout);
-    Ok(installed.lines().any(|line| line.trim() == target))
 }
 
 pub fn command_works(program: &str, args: &[&str], workspace_root: &Path) -> bool {
@@ -108,8 +81,21 @@ pub fn print_output(output: &Output) {
 
 pub fn workspace_root() -> Result<PathBuf, RunnerError> {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut current = manifest_dir;
+    while let Some(parent) = current.parent() {
+        let cargo_toml = parent.join("Cargo.toml");
+        if cargo_toml.exists()
+            && let Ok(content) = std::fs::read_to_string(&cargo_toml)
+            && content.contains("[workspace]")
+        {
+            return Ok(parent.to_path_buf());
+        }
+        current = parent;
+    }
+
     manifest_dir
         .parent()
+        .and_then(Path::parent)
         .and_then(Path::parent)
         .map(Path::to_path_buf)
         .ok_or(RunnerError::WorkspaceRootResolutionFailed)
