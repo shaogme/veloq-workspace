@@ -209,7 +209,7 @@ impl Signal {
 /// 主线程既是 0 号 worker、又是唯一驱动外层 future 的地方，所以一次唤醒必须同时做两件
 /// 事：记下「外层 future 需要重新 poll」，以及把主线程从调度循环的 park 里叫回来 ——
 /// park 可能是 [`Unparker`] 的内置信号，也可能是 `park_hook` 里的驱动等待，两者都只认
-/// unpark（RUNTIME_REVIEW §2.1 / §2.2）。
+/// unpark。
 pub(crate) struct BlockOnSignal {
     ready: Signal,
     unparker: Unparker,
@@ -298,10 +298,9 @@ pub(crate) struct UnparkerInner {
 impl UnparkerInner {
     /// 两个目标都要通知。
     ///
-    /// `bind` 之前的唤醒只能落到内置信号上 —— 旧实现在未绑定时静默什么都不做，等于丢
-    /// 唤醒；而绑定了驱动 waker 的 worker 阻塞在驱动里、看不到信号，只能靠 waker 叫醒
-    /// （RUNTIME_REVIEW §1.13）。信号侧的额外成本只有一次 swap：状态停在「已通知」之后
-    /// 就不会再发系统调用。
+    /// `bind` 之前的唤醒只能落到内置信号上 —— 未绑定时若静默什么都不做，等于丢唤醒；
+    /// 而绑定了驱动 waker 的 worker 阻塞在驱动里、看不到信号，只能靠 waker 叫醒。
+    /// 信号侧的额外成本只有一次 swap：状态停在「已通知」之后就不会再发系统调用。
     fn wake(&self) {
         self.signal.notify();
         if let Some(waker) = self.waker.get() {
@@ -397,10 +396,9 @@ impl<S: Storage, O: Ownership> GenericCancellationTokenInner<S, O> {
 
     /// 取消本令牌及其整棵子树。
     ///
-    /// 用**显式工作栈**代替递归：递归深度等于令牌树深度（可栈溢出），而且旧实现是
-    /// 持父锁递归的 —— 唤醒范围覆盖整棵子树（RUNTIME_REVIEW §2.4）。这里每层只在锁内
-    /// 摘链并为子节点加一次强引用（否则出锁后子节点可能已被析构），唤醒与继续下探都在
-    /// 锁外进行。
+    /// 用**显式工作栈**代替递归：递归深度等于令牌树深度（避免栈溢出），且避免持父锁
+    /// 递归遍历子树。这里每层只在锁内摘链并为子节点加一次强引用（否则出锁后子节点可能
+    /// 已被析构），唤醒与继续下探都在锁外进行。
     fn cancel_internal(&self) {
         if self
             .cancelled
@@ -488,7 +486,7 @@ impl<S: Storage, O: Ownership> GenericCancellationToken<S, O> {
         }
 
         // 同一个令牌被 link 到两个父亲会直接覆盖 prev/next 并损坏链表，`push_back` 自身
-        // 只会 panic。这里显式拒绝重复挂载（RUNTIME_REVIEW §2.4）。
+        // 只会 panic。这里显式拒绝重复挂载。
         debug_assert!(
             !child.inner.link.is_linked(),
             "cancellation token is already linked to a parent"
@@ -696,7 +694,7 @@ impl EventCount {
     ///
     /// **必须在工作真正可见之后调用**（任务已 push 进队列）。反过来先 bump 再入队会打开
     /// 一个丢唤醒的窗口：worker 读到新序列号 → 检查队列（任务还没进去）→ `should_retry`
-    /// 认为无事发生 → 安心 park（RUNTIME_REVIEW §1.10）。
+    /// 认为无事发生 → 安心 park。
     pub fn notify(&self) {
         self.state.fetch_add(1, Ordering::Release);
     }
@@ -708,7 +706,7 @@ mod tests {
     use std::{thread::sleep, time::Duration};
 
     /// 已经发生过的 unpark 必须被记住：worker 检查完队列到真正睡下去之间存在窗口，
-    /// 落在窗口里的唤醒若被丢弃就是死锁（RUNTIME_REVIEW §1.13）。
+    /// 落在窗口里的唤醒若被丢弃就是死锁。
     #[test]
     fn unpark_before_park_does_not_block() {
         let unparker = Unparker::new();

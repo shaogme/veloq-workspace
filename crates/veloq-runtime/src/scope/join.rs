@@ -114,7 +114,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
         }
 
         // 取消必须伴随一次唤醒，否则一个正挂起的任务要等到下一次自然唤醒才会观察到
-        // 取消状态，而 `await` / `wait_all` 都在等它结束（RUNTIME_REVIEW §2.4）。
+        // 取消状态，而 `await` / `wait_all` 都在等它结束。
         match &self.source {
             JoinSource::Direct { task, .. } => {
                 task.header().cancel_and_wake();
@@ -259,7 +259,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
         };
 
         // 「刷新 waker + 入链」统一由 `register_completion` 完成：它自带 `is_linked()`
-        // 保护，重复注册不会破坏侵入式链表（RUNTIME_REVIEW §1.2）。
+        // 保护，重复注册不会破坏侵入式链表。
         let node = unsafe { Pin::new_unchecked(node) };
         unsafe { header.register_completion(node, cx.waker()) };
         Ok(())
@@ -284,9 +284,9 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TEx
 
     /// 只做「查完成状态 → 未完成则注册 waker → `Pending`」，**不驱动调度器**。
     ///
-    /// 旧实现每次 poll 的第一件事是跑一整个调度循环直到整个作用域结束，于是
-    /// `handle.await` 等的是本作用域的**所有**子任务，`select!` 的公平轮询完全失效，而在
-    /// 非 worker 线程上 poll 一个 handle 会因取不到 TLS 直接 panic（RUNTIME_REVIEW §2.1）。
+    /// 避免在 poll 中同步跑调度循环直到整个作用域结束；否则 `handle.await` 会等完本作用域的
+    /// **所有**子任务，导致 `select!` 的公平轮询完全失效，且在非 worker 线程上 poll 一个
+    /// handle 会因取不到 TLS 直接 panic。
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
         let arena = this.scope.arena();
@@ -299,7 +299,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TEx
                     Self::remove_waker_on(&mut this.waker_node, header);
                     let Some(res) = gate.take_result_erased() else {
                         // 任务在入队失败后被 `abandon_before_enqueue` 终结：没有结果，
-                        // 但状态是可判别的取消（RUNTIME_REVIEW §4.4）。
+                        // 但状态是可判别的取消。
                         if header.is_locally_cancelled() {
                             return Poll::Ready(JoinOutcome::TaskErr(TaskError::Cancelled));
                         }
@@ -418,7 +418,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra> Drop
 
             if let Some(task) = task {
                 // 无条件摘链：任务已完成也可能正处在「COMPLETED 已置位、链表尚未清空」
-                // 的窗口里，此时提前返回会留下悬垂节点（RUNTIME_REVIEW §1.5）。
+                // 的窗口里，此时提前返回会留下悬垂节点。
                 unsafe {
                     task.header().remove_waker(node_ptr);
                 }

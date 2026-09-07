@@ -85,7 +85,7 @@ impl SqeEnv<'_> {
 /// borrowed out of [`UringDriver::ops`] while it builds the record, so it cannot be handed the
 /// whole driver either — but unlike submission it does need to *mutate* something: a CQE that
 /// carries a buffer id has consumed a ring entry, and that entry has to be settled before the
-/// record leaves this function. See `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §5.
+/// record leaves this function.
 pub(crate) struct CqeEnv<'d> {
     provided: Option<&'d mut ProvidedBufGroup>,
 }

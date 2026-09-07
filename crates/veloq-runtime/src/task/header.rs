@@ -271,7 +271,7 @@ impl<S: Storage> GenericTaskHeader<S> {
     ///
     /// 取消在本运行时是协作式的：任务只有被 poll 到才会看到 `STATE_CANCELLED`。一个正
     /// 挂起的任务若不被唤醒，就要等到下一次自然唤醒（可能永远不来）才会结束，而
-    /// `wait_all` / 作用域析构都要等它结束（RUNTIME_REVIEW §2.4）。
+    /// `wait_all` / 作用域析构都要等它结束。
     #[inline]
     pub(crate) fn cancel_and_wake(&self) {
         let old = self.state.fetch_or(STATE_CANCELLED, Ordering::AcqRel);
@@ -415,7 +415,7 @@ impl<S: Storage> GenericTaskHeader<S> {
     ///
     /// 语义与 `GenericScopeCompletion::register` 对齐：节点已在链表中时只更新 waker，
     /// **绝不重复 `push_back`** —— 重复入链会覆盖节点的 prev/next，把链表变成自环或
-    /// 断链，随后 `notify_completion_wakers` 的遍历会死循环（RUNTIME_REVIEW §1.2）。
+    /// 断链，随后 `notify_completion_wakers` 的遍历会死循环。
     ///
     /// # Safety
     ///
@@ -465,8 +465,7 @@ impl<S: Storage> GenericTaskHeader<S> {
     /// 摘下并唤醒全部完成等待者。
     ///
     /// waker 一律在**释放锁之后**才被调用：`wake` 会执行任意用户/运行时代码，可能
-    /// 重入 `register_completion` / `remove_waker`，持锁唤醒有重入死锁风险
-    /// （RUNTIME_REVIEW §1.9）。
+    /// 重入 `register_completion` / `remove_waker`，持锁唤醒有重入死锁风险。
     fn notify_completion_wakers(&self) {
         let mut ready = Vec::new();
         {
@@ -552,7 +551,7 @@ impl<S: Storage> GenericTaskHeader<S> {
     /// 这条路径上任务永远不会被 poll，也没有任何队列引用会被归还，因此必须在这里
     /// 终结它：标记取消 + 完成、唤醒 join 等待者、归还任务自身的引用，并在引用计数
     /// 归零时结算 scope 义务。否则 scope 的 `remaining` 永不归零，`wait_all` 会永久
-    /// 挂起（RUNTIME_REVIEW §4.4）。
+    /// 挂起。
     ///
     /// 调用者必须先归还 `STATE_QUEUED` 持有的引用（`clear_queued`）；仍处于
     /// `QUEUED` 或已 `COMPLETED` 的任务由出队 / 完成路径负责结算，此处直接跳过。
@@ -716,8 +715,7 @@ impl<S: Storage> GenericTaskHeader<S> {
     ///
     /// 这里**不能**用 `is_completed()` 做提前返回：`mark_completed_and_notify` 先置位
     /// `COMPLETED`、之后才拿锁清链，窗口内提前返回会把一个仍然在链表里的节点留下，
-    /// 等 arena 释放后链表中就是悬垂指针（RUNTIME_REVIEW §1.5）。正确性由锁 +
-    /// `is_linked()` 保证。
+    /// 等 arena 释放后链表中就是悬垂指针。正确性由锁 + `is_linked()` 保证。
     ///
     /// # Safety
     /// `node` 指向的节点必须是由 `register_completion` 注册的相同节点。
@@ -830,7 +828,7 @@ mod tests {
     }
 
     /// 同一个节点用不同 waker 重复注册时只能在链表中出现一次，否则链表成环，
-    /// `mark_completed_and_notify` 的遍历会死循环（RUNTIME_REVIEW §1.2）。
+    /// `mark_completed_and_notify` 的遍历会死循环。
     #[test]
     fn register_completion_is_idempotent_for_linked_node() {
         let header = GenericTaskHeader::<AtomicStorage>::new_placeholder(&TEST_VTABLE);
@@ -866,8 +864,7 @@ mod tests {
         assert!(first.will_wake(&second));
     }
 
-    /// `remove_waker` 在任务已完成时也必须真正摘链，不能提前返回
-    /// （RUNTIME_REVIEW §1.5）。
+    /// `remove_waker` 在任务已完成时也必须真正摘链，不能提前返回。
     #[test]
     fn remove_waker_unlinks_even_after_completion() {
         let header = GenericTaskHeader::<AtomicStorage>::new_placeholder(&TEST_VTABLE);

@@ -54,8 +54,7 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
     /// `f` is higher-ranked over the context lifetime, so `R` cannot mention it: the
     /// `RuntimeCtx` (and anything derived from it) is confined to the call. Without that
     /// bound `'rt` is picked by the caller and `async |ctx| ctx` hands back a dangling
-    /// context, because the `RuntimeShared` it points at lives in this frame
-    /// (RUNTIME_REVIEW §1.15).
+    /// context, because the `RuntimeShared` it points at lives in this frame.
     pub fn block_on<R, F>(mut self, f: F) -> Result<R>
     where
         T: 'rt,
@@ -85,7 +84,7 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
 
         let thread_errors = Mutex::new(None);
         // 主线程的唤醒信号必须在 worker 线程启动**之前**建好：worker 初始化失败时要靠
-        // 它把主线程从 park 里叫回来，否则错误永远不会被报告（RUNTIME_REVIEW §1.11）。
+        // 它把主线程从 park 里叫回来，否则错误永远不会被报告。
         let signal = BlockOnSignal::new(shared_ref.base.unparker(0).clone());
 
         let res: Result<R> = veloq_std::thread::scope(|scope| {
@@ -200,13 +199,13 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
             }
 
             // 主线程就是 0 号 worker：外层 future 作为循环的「退出条件」交给统一调度循环
-            // 驱动，不再手写第二份 pop 链（RUNTIME_REVIEW §2.1 / §2.2）。
+            // 驱动，不再手写第二份 pop 链。
             let mut fut = pin!(f(ctx));
             let mut controller = BlockOnController::new(fut.as_mut(), signal.clone());
             let loop_res = run_worker_loop(shared_ref, &mut controller);
 
             // worker 线程的致命错误优先于循环自身的退出原因：循环正是被它触发的 shutdown
-            // 叫停的（RUNTIME_REVIEW §1.11）。
+            // 叫停的。
             if let Some(err) = thread_errors
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -309,7 +308,7 @@ impl<T, WF> RuntimeBuilder<T, WF> {
             thread::available_parallelism().unwrap_or(NonZeroUsize::new(1).unwrap())
         });
         // worker id 会被编码进 idle 栈 head 的低 32 位，必须在构造期就拒绝越界的规模，
-        // 而不是让 `IdleStack` 静默截断（RUNTIME_REVIEW §1.3）。
+        // 而不是让 `IdleStack` 静默截断。
         if worker_count.get() >= MAX_WORKER_COUNT {
             return RuntimeError::WorkerCountTooLarge {
                 worker_count: worker_count.get(),

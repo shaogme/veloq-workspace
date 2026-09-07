@@ -1,4 +1,4 @@
-//! 调度器统一（RUNTIME_REVIEW 阶段三：§2.1 / §2.2 / §2.3 / §1.10 / §1.13）的回归测试。
+//! 调度器统一改造的回归测试。
 //!
 //! 「等待」从嵌套调度循环改成了 waker 驱动，`block_on` 的主线程与 worker 线程共用同一份
 //! 循环，默认 park 也从 `yield_now` 死转换成了真正阻塞在信号上。前两项有直接的可观测行为
@@ -69,7 +69,7 @@ impl Future for ForeignWake<'_> {
     }
 }
 
-/// `handle.await` 只等这**一个**任务，不等它的兄弟任务（RUNTIME_REVIEW §2.1.1）。
+/// `handle.await` 只等这**一个**任务，不等它的兄弟任务。
 ///
 /// 旧实现里 `JoinHandle::poll` 的第一件事是跑一整个调度循环直到 `completion.is_done()`，
 /// 也就是整个作用域的子任务全部结束 —— 那样 `quick.await` 会一直卡到 `blocked` 也完成，
@@ -104,7 +104,7 @@ fn awaiting_one_handle_does_not_wait_for_its_siblings() {
         .unwrap();
 }
 
-/// 一个挂起的 `JoinHandle` 可以被 `select!` 放弃（RUNTIME_REVIEW §2.1.2）。
+/// 一个挂起的 `JoinHandle` 可以被 `select!` 放弃。
 ///
 /// `biased;` 让 `parked` 成为第一个被 poll 的分支：旧实现会在那里同步跑调度循环等整个作用
 /// 域结束，而 `parked` 的任务只在用例最后才被放行 —— 控制权永远回不到 `select!`，用例挂死。
@@ -158,7 +158,7 @@ fn nested_scope_chain<'a>(ctx: RuntimeCtx<'a, ()>, depth: u32) -> BoxedU32Future
     })
 }
 
-/// 作用域嵌套深度不再映射为栈帧深度（RUNTIME_REVIEW §2.1.3）。
+/// 作用域嵌套深度不再映射为栈帧深度。
 ///
 /// 旧实现每嵌套一层就多压一整套「`drive_worker` → poll 子任务 → 子任务 await 自己的作用域
 /// → 再一层 `drive_worker`」的栈帧。现在每层 await 都返回 `Pending`，下一层由 worker 顶层
@@ -178,7 +178,7 @@ fn deeply_nested_scopes_stay_flat() {
     assert_eq!(depth, DEPTH);
 }
 
-/// 运行时之外的线程唤醒一个挂起任务时，睡着的 worker 必须醒过来（RUNTIME_REVIEW §1.13）。
+/// 运行时之外的线程唤醒一个挂起任务时，睡着的 worker 必须醒过来。
 ///
 /// 外部线程刻意先睡一会儿，让所有 worker（含跑外层 future 的主线程）都真正 park 下去，
 /// 之后的 `wake()` 走 `enqueue_send` → `wake_worker` → `Unparker`。旧实现在没有 `park_hook`
@@ -219,7 +219,7 @@ fn a_parked_worker_wakes_on_a_foreign_thread_wake() {
     });
 }
 
-/// 跨 worker 的入队风暴不能丢唤醒（RUNTIME_REVIEW §1.10 + §1.13）。
+/// 跨 worker 的入队风暴不能丢唤醒。
 ///
 /// 每个任务都要经历「派发到别的 worker → 多次自我唤醒重新入队 → 完成后唤醒主线程」，
 /// 每一步都在 `EventCount` 序列号与 park 的竞态窗口上。序列号一旦回到「入队之前」递增，

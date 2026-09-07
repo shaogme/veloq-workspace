@@ -271,8 +271,7 @@ impl PlatformSocket for Socket {
 /// Returns the peer address of a connected socket, given only its raw handle.
 ///
 /// The facade's accept stream needs this on both platforms: the uring backend because multishot
-/// accept never reports the peer address, and IOCP so that the two paths have one shape. See
-/// `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §1.2.
+/// accept never reports the peer address, and IOCP so that the two paths have one shape.
 pub fn peer_addr_of_handle(handle: IocpHandle) -> IocpResult<SocketAddr> {
     peer_addr_of_socket(&SafeSocket(handle.as_socket()))
 }

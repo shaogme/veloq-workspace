@@ -355,9 +355,8 @@ fn test_two_consumers_at_most_one_ready_loom() {
     });
 }
 
-/// 消费方现在也抢 `finalizing`（见 `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §4.3），所以
-/// 「取一条」与「发布下一条」是一对真正的并发写入者。断言是：两条记录一条都不丢，且
-/// 终态完成之后 slot 必须回到可复用。
+/// 消费方现在也抢 `finalizing`，所以「取一条」与「发布下一条」是一对真正的并发写入者。
+/// 断言是：两条记录一条都不丢，且终态完成之后 slot 必须回到可复用。
 #[test]
 fn test_multishot_take_races_with_publish_loom() {
     loom::model(|| {

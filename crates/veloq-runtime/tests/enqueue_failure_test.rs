@@ -1,7 +1,7 @@
 //! 队列容量耗尽 / 入队失败降级路径的回归测试。
 //!
-//! 这些路径正是 RUNTIME_REVIEW §1.1（job cell 双重释放）与 §4.4（入队失败时 scope 义务
-//! 未结算 → `wait_all` 永久挂起）的触发条件，用 `with_queue_capacity(1)` 把它们逼出来。
+//! 验证入队失败时避免 job cell 双重释放，以及确保 scope 义务得到妥善结算（防止
+//! `wait_all` 永久挂起），用 `with_queue_capacity(1)` 把它们逼出来。
 
 use std::{convert::Infallible, num::NonZeroUsize};
 

@@ -59,8 +59,7 @@ pub(crate) unsafe fn make_sqe_recv_provided(
 ///
 /// `len` is deliberately left at the opcode's default of `0`, unlike
 /// [`make_sqe_recv_provided`]: multishot completions are sized by the kernel one at a time, so
-/// there is no single length this submission could name. See
-/// `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §9.4.
+/// there is no single length this submission could name.
 ///
 /// `RecvMulti::build` sets `IOSQE_BUFFER_SELECT` unconditionally — the kernel refuses a
 /// multishot recv without buffer selection, which is why this operation exists only once a ring

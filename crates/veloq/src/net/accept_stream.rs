@@ -10,8 +10,7 @@
 //!
 //! 两条路径的对端地址来源**不同**，这一点不要「统一」掉：`AcceptMulti` 的 SQE 没有 addr
 //! 字段（多条完成共享一个地址缓冲会互相覆盖），所以 `Native` 必须在拿到 fd 之后调
-//! `getpeername`；`Emulated` 走单发 `Accept`，地址由内核直接填好。见
-//! `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §1.2 / §7.3。
+//! `getpeername`；`Emulated` 走单发 `Accept`，地址由内核直接填好。
 //!
 //! 两条路径都通过 `S` 提交，所以 [`crate::net::LocalTcpListener`] 上的流走 `LocalOp`、
 //! [`crate::net::TcpListener`] 上的流走 `DetachedOp`——和这两种 listener 上其它每个操作

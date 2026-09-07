@@ -80,7 +80,7 @@ impl<F> RoutedJobCell<F> {
 /// （连同守卫）会被原地丢弃，同样完成释放。
 ///
 /// 这样就不再需要主线程按「结果状态」反推所有权 —— 结果状态并不携带「cell 归谁释放」
-/// 的信息，那正是双重释放的根因（RUNTIME_REVIEW §1.1）。
+/// 的信息，避免了由此引发的双重释放问题。
 pub(crate) struct RoutedJobCellOwner<F> {
     arena: SendPtr<GenericArena<AtomicStorage>>,
     cell: SendPtr<RoutedJobCell<F>>,

@@ -600,7 +600,7 @@ fn complete_kernel_waiting_slot(
     cqe_env: &mut CqeEnv<'_>,
 ) -> UringResult<CompletionHookOutcome<UringSlotSpec, UringBackendEffect>> {
     // `IORING_CQE_F_MORE`：内核声明这个操作还会继续投递完成。flags 的解读到此为止，
-    // core 只见 `CompletionContinuation`（见 `DRIVER_REVIEW.md` §4.2(a)）。
+    // core 只见 `CompletionContinuation`。
     let continuation = if io_uring::cqueue::more(raw.flags) {
         CompletionContinuation::More
     } else {

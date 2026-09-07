@@ -354,7 +354,7 @@ impl<'a> DriverRaw for UringDriver<'a> {
     ///
     /// 注册失败**不是**驱动初始化失败：`IORING_REGISTER_PBUF_RING` 要 5.19，而仓库声明的
     /// 最低内核是 5.6。失败就把能力留在 `false`，门面层据此拒绝那些需要它的操作，其余一切
-    /// 照旧（见 `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §8）。
+    /// 照旧。
     fn attach_buffer_pool_raw(&mut self, pool: AnyBufPool) -> UringResult<()> {
         if self
             .buffer_registry

@@ -191,8 +191,7 @@ fn arm_recv_multi(driver: &mut UringDriver<'static>, fd: IoFd) -> Option<OpToken
 /// 取消一条已经 orphan 掉的操作，并把它的终态完成收干净。
 ///
 /// 少了这一步就把 driver 丢掉，等于在内核仍持有环指针时反注册并 munmap——`UringDriver` 的
-/// 析构确实会 close ring fd 让内核取消一切在途操作，但那发生在 `unregister_buf_ring` 之后
-/// （见 `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §5.4）。
+/// 析构确实会 close ring fd 让内核取消一切在途操作，但那发生在 `unregister_buf_ring` 之后。
 ///
 /// 「收干净了」的判据是 token 变成 `Unavailable`：slot 归还的同时 generation 推进，这正是
 /// 终态完成落地的证据。

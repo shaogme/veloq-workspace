@@ -25,8 +25,7 @@ fn errno_of(err: &Report<DriverError>) -> Option<i32> {
 /// 环里没有 buffer 可挑。
 ///
 /// 对 multishot 而言这不只是一次失败：内核**顺带把整个操作终止了**（那条 CQE 不带
-/// `IORING_CQE_F_MORE`），所以流必须重新 arm 才能继续，见
-/// `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §5.3。
+/// `IORING_CQE_F_MORE`），所以流必须重新 arm 才能继续。
 #[cfg(target_os = "linux")]
 #[inline]
 pub fn is_buffer_ring_exhausted(err: &Report<DriverError>) -> bool {
@@ -37,8 +36,7 @@ pub fn is_buffer_ring_exhausted(err: &Report<DriverError>) -> bool {
 ///
 /// **必须靠试**：`IORING_OP_ACCEPT` 从 5.5 就在、`IORING_OP_RECV` 从 5.6 就在，而它们的
 /// multishot 变体分别要 5.19 与 6.0——`IORING_REGISTER_PROBE` 只回答「这个 opcode 存不
-/// 存在」，分不出这两者。于是能力集合先乐观地记上，第一次提交被 `-EINVAL` 打回来才降级
-/// （见 `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §8）。
+/// 存在」，分不出这两者。于是能力集合先乐观地记上，第一次提交被 `-EINVAL` 打回来才降级。
 ///
 /// 判据宽于必要：一个**真的**参数错误（比如 socket 根本没 listen）也会命中这里，于是能
 /// 力被白白关掉。但那条路是自愈的——退回单发之后同一个错误会照样报出来，用户看到的仍是

@@ -34,8 +34,7 @@ use worker_loop::{ScopeJoinController, ShutdownController};
 
 /// 每隔多少轮循环先看一次全局队列。
 ///
-/// 单一公平性机制：旧实现同时有 `tick % 61` 和 `processed_tasks >= 64` 两套重叠的计数器，
-/// 而且后者在检查后无条件归零（即使没取到任务），两者互相干扰（RUNTIME_REVIEW §2.3）。
+/// 单一公平性机制：避免同时使用多套重叠且互相干扰的计数器。
 const GLOBAL_QUEUE_INTERVAL: u32 = 61;
 
 /// 本地与全局队列都空时的偷取尝试次数。
@@ -234,7 +233,7 @@ impl RuntimeSharedBase {
     }
 
     /// 入队失败后放弃任务：先归还 `STATE_QUEUED` 持有的引用，再终结任务本体，
-    /// 确保 scope 义务一定被结算（RUNTIME_REVIEW §4.4）。
+    /// 确保 scope 义务一定被结算。
     fn abandon_queued_task<H: TaskHandleRef>(task: &H) {
         let header = task.header();
         if header.clear_queued() {
@@ -331,8 +330,7 @@ impl RuntimeSharedBase {
                 Self::abandon_queued_task(&task);
                 return EnqueuePinnedOutcome::AbortedAcknowledged;
             }
-            // 序列号只能在任务**已经可见之后**递增，见 `EventCount::notify`
-            // （RUNTIME_REVIEW §1.10）。
+            // 序列号只能在任务**已经可见之后**递增，见 `EventCount::notify`。
             self.idle.event_count.notify();
             self.wake_worker(worker_id);
             EnqueuePinnedOutcome::Enqueued
@@ -413,7 +411,7 @@ impl RuntimeSharedBase {
     pub(crate) fn enqueue_send(&self, worker_id: usize, task: SendTaskRef) {
         if self.validate_worker_id(worker_id).is_err() {
             // 任务不会进入任何队列，必须在此结算 scope 义务，否则 `remaining`
-            // 永不归零，`wait_all` 永久挂起（RUNTIME_REVIEW §4.4）。
+            // 永不归零，`wait_all` 永久挂起。
             task.header().abandon_before_enqueue();
             return;
         }
@@ -425,7 +423,7 @@ impl RuntimeSharedBase {
         }
         if task.header().try_mark_queued() {
             let worker = &self.registry.workers[worker_id];
-            // 两条分支都先让任务可见、再 bump 序列号（RUNTIME_REVIEW §1.10）。
+            // 两条分支都先让任务可见、再 bump 序列号。
             if let Err(task) = worker.remote_queue.push(task) {
                 self.scheduler.injector.push(task);
                 self.idle.event_count.notify();
@@ -442,7 +440,7 @@ impl RuntimeSharedBase {
     /// 从当前 worker 可见的所有来源里取出一个任务并 poll；无事可做时返回 `false`。
     ///
     /// 这是**唯一**的取任务链：worker 线程、`block_on` 主线程、作用域析构 join 全部共用
-    /// 它，主 worker 因此也参与 work stealing 与公平性间隔（RUNTIME_REVIEW §2.2）。
+    /// 它，主 worker 因此也参与 work stealing 与公平性间隔。
     ///
     /// 调用方必须已经处于本 worker 的 TLS 上下文中（`rand` 就是从那里借来的）。
     pub(crate) fn poll_next_task(
@@ -585,8 +583,7 @@ impl<T> RuntimeShared<T> {
                     ctx.worker.push(task);
                 });
             }
-            // 任务已进入 lifo 槽或本地 deque，此刻才可以 bump 序列号
-            // （RUNTIME_REVIEW §1.10）。
+            // 任务已进入 lifo 槽或本地 deque，此刻才可以 bump 序列号。
             self.base.idle.event_count.notify();
             self.wake_worker(worker_id);
             return;
@@ -602,8 +599,8 @@ impl<T> RuntimeShared<T> {
     /// 阻塞直到 `completion` 的全部子任务真正结束。
     ///
     /// 这是结构化并发的最后一道保证：作用域析构时不能带着仍在运行的子任务返回，否则子
-    /// 任务持有的 `'env` 借用会悬垂（RUNTIME_REVIEW §1.4）。因此这里**没有**提前退出的
-    /// 出口 —— 与 `std::thread::scope` 在 `Drop` 里阻塞 join 同理，宁可挂住也不能放行。
+    /// 任务持有的 `'env` 借用会悬垂。因此这里**没有**提前退出的出口 —— 与
+    /// `std::thread::scope` 在 `Drop` 里阻塞 join 同理，宁可挂住也不能放行。
     ///
     /// 正常情况下复用统一的调度循环（含 work stealing 与 idle/park 协调）；运行时正在关停
     /// 时循环会立刻返回，退化为「排空自己的队列 + 让出 CPU」，而关停路径上每个 worker 退出

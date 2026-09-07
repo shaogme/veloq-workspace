@@ -1,9 +1,7 @@
 //! 调度循环的**唯一**实现。
 //!
-//! 之前有两份：worker 线程走 `drive_worker`，`block_on` 的主线程手写了第二份 pop 链 ——
-//! 后者既不参与 work stealing、也没有公平性间隔与 idle 协调，于是 0 号 worker 在跑外层
-//! future 期间既不偷别人的活也不被 idle 统计覆盖，还得靠 `drive_worker` 里一个
-//! `completion.is_none() && worker_id == 0` 的魔法分支互相回避（RUNTIME_REVIEW §2.2）。
+//! 统一了 worker 线程与 `block_on` 主线程的调度驱动，主 worker 同样参与 work stealing、
+//! 公平性间隔与 idle 协调，无需特殊分支处理。
 //!
 //! 现在三种「为什么要跑循环」的差异全部收敛到 [`LoopController`]：
 //!
@@ -62,7 +60,7 @@ impl LoopController for ShutdownController {
 /// 跑到某个作用域的全部子任务真正结束。
 ///
 /// 只用于**同步**的 join（作用域析构）：异步等待走 `wait_all()` 的 waker 路径，不再嵌套
-/// 调度循环（RUNTIME_REVIEW §2.1）。
+/// 调度循环。
 pub(crate) struct ScopeJoinController<'a, S: ScopeStorage, O: Ownership> {
     completion: &'a GenericScopeCompletion<S, O>,
     registration: Option<ScopeCompletionRegistration<'a, S, O>>,
@@ -181,7 +179,7 @@ pub(crate) fn run_worker_loop<T, C: LoopController>(
 
         // 因 shutdown 退出：队列里的积压任务再也不会被 poll，必须在此放弃它们并结算
         // scope 义务，否则等待方（`wait_all` / 作用域析构 join）永远等不到 `remaining`
-        // 归零（RUNTIME_REVIEW §1.4 / §4.4）。
+        // 归零。
         base.abandon_worker_backlog(worker_id);
         Ok(())
     })

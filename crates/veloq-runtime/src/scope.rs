@@ -227,7 +227,7 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra>
     ///
     /// 真正的 `await`：未完成时把当前任务的 waker 挂到 completion 上并返回 `Pending`，由
     /// worker 顶层循环继续跑别的任务 —— 这本就是 thread-per-core 应有的行为。因此它可以被
-    /// `select!` / 超时打断，也不再让栈深度随作用域嵌套增长（RUNTIME_REVIEW §2.1）。
+    /// `select!` / 超时打断，也不再让栈深度随作用域嵌套增长。
     ///
     /// 子任务的 panic payload 在这里取走并重新抛出；被丢弃而没走到这里的作用域由 `Drop`
     /// 负责上交给父作用域。
@@ -356,15 +356,14 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra> Drop
     /// `spawn*` 接受 `&'env` 借用，子任务可能正在别的 worker 上持有这些借用运行；取消在本
     /// 运行时是协作式的，「已取消」与「已停止」之间有任意长的窗口。正常路径由
     /// `wait_all()` 兜底，但 `f` panic 和「整个 scope future 被丢弃」（`select!` 落败分支、
-    /// 超时、外层取消）这两条路径都绕过它 —— 那里若只发信号就返回，借用立刻悬垂
-    /// （RUNTIME_REVIEW §1.4）。这正是 `std::thread::scope` 必须在 `Drop` 里阻塞 join 的
-    /// 原因。
+    /// 超时、外层取消）这两条路径都绕过它 —— 那里若只发信号就返回，借用立刻悬垂。这正是
+    /// `std::thread::scope` 必须在 `Drop` 里阻塞 join 的原因。
     fn drop(&mut self) {
         self.cancel_and_join();
 
         // panic payload 的归属：正常路径由 `wait_all()` 取走并抛出。走到这里说明没人 join
         // （上面那两条路径），payload 交给上一层 scope，由它的 `wait_all()` 抛出；已经没有
-        // 上一层时，只要当前不是在 unwind 中就地抛出，绝不静默丢弃（RUNTIME_REVIEW §1.12）。
+        // 上一层时，只要当前不是在 unwind 中就地抛出，绝不静默丢弃。
         if let Some(payload) = self.completion.take_panic() {
             match self.completion.parent() {
                 Some(parent) => parent.report_panic(payload),

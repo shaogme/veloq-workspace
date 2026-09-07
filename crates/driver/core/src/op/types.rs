@@ -173,7 +173,7 @@ pub struct AcceptMulti<H: Handle> {
 /// `addrlen` fields at all, because several completions sharing one address buffer would
 /// overwrite each other. The accepted descriptor arrives as the operation's `Completion`
 /// (from the CQE's result), and the peer address has to be recovered with `getpeername`
-/// afterwards — see `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §1.2.
+/// afterwards.
 pub struct AcceptedSocket;
 
 /// Receive from a socket into a buffer the kernel picks out of the driver's provided-buffer
@@ -181,8 +181,7 @@ pub struct AcceptedSocket;
 ///
 /// Deliberately carries no buffer: with `IOSQE_BUFFER_SELECT` the buffer is bound to the
 /// connection only once data actually arrives, which is the entire point of provided buffers —
-/// ten thousand idle connections no longer pin ten thousand receive buffers. See
-/// `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §5.1.
+/// ten thousand idle connections no longer pin ten thousand receive buffers.
 pub struct RecvProvided<H: Handle> {
     pub fd: IoFd<H>,
 }
@@ -196,8 +195,7 @@ pub struct RecvProvided<H: Handle> {
 ///
 /// A provided-buffer ring is not optional here — it is the kernel's rule, not a design choice:
 /// the multishot variant of `IORING_OP_RECV` forces `IOSQE_BUFFER_SELECT`, because a single
-/// caller-supplied buffer could not possibly hold several completions' worth of data. See
-/// `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §6.
+/// caller-supplied buffer could not possibly hold several completions' worth of data.
 pub struct RecvMulti<H: Handle> {
     pub fd: IoFd<H>,
 }

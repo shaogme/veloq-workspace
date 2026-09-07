@@ -454,9 +454,8 @@ impl AnyScopeRef {
     /// 把一份未被认领的 panic payload 交给上一层 scope。
     ///
     /// 子 scope 在没有 `wait_all()` 的路径上被丢弃时（`select!` 落败分支、外层 panic），
-    /// payload 不能就地 `resume_unwind`（那会在任意 worker 线程上抛出，见
-    /// RUNTIME_REVIEW §1.12），也不能静默丢弃，于是沿 scope 树上交，由某一层的
-    /// `wait_all()` 抛出。
+    /// payload 不能就地 `resume_unwind`（那会在任意 worker 线程上抛出），也不能静默丢弃，
+    /// 于是沿 scope 树上交，由某一层的 `wait_all()` 抛出。
     #[inline]
     pub fn report_panic(&self, payload: Box<dyn Any + Send + 'static>) {
         match self {

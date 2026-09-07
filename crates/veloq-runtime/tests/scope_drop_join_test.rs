@@ -1,4 +1,4 @@
-//! 作用域析构必须 join，而不是只发一次取消信号（RUNTIME_REVIEW §1.4 / §1.12 / §2.4）。
+//! 作用域析构必须 join，而不是只发一次取消信号。
 //!
 //! 这些用例走的是「scope future 被丢弃」这条路径：`select!` 的落败分支。旧实现在这里只调
 //! 一次 `cancel()` 就返回，子任务仍在别的 worker 上持有 `'env` 借用运行；而取消是协作式
@@ -96,7 +96,7 @@ fn dropping_a_scope_joins_a_parked_child() {
 }
 
 /// 同一条路径下，子任务的 panic 不能丢失：作用域析构时把 payload 交给上一层作用域，由后者的
-/// `wait_all()` 抛出（RUNTIME_REVIEW §1.12）。
+/// `wait_all()` 抛出。
 #[test]
 fn panic_survives_a_dropped_scope() {
     let result = catch_unwind(AssertUnwindSafe(|| {

@@ -70,7 +70,7 @@ macro_rules! select {
             poll_fn(move |cx| {
                 // 取消走值而不是走 panic：返回 `Pending` 后由 `poll_task_internal` 统一按
                 // 取消结束任务（它在每次 poll 前后都检查取消状态）。`panic_any` 在
-                // `panic = "abort"` 下会直接终止进程（RUNTIME_REVIEW §1.6）。
+                // `panic = "abort"` 下会直接终止进程。
                 if cx.is_cancelled() {
                     return Poll::Pending;
                 }

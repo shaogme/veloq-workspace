@@ -105,8 +105,7 @@ pub(crate) struct RuntimeTlsInner {
 /// closure would then collapse into `T: 'static` — which rules out the intended use of the
 /// extra worker state (`veloq`'s `WorkerState<'rt>` borrows back into `RuntimeShared`).
 /// With the pointer, `for<'rt> AsyncFnOnce(RuntimeCtx<'rt, T>) -> R` is expressible for any
-/// `T`, and that bound is what keeps the context from escaping `block_on` inside `R`
-/// (RUNTIME_REVIEW §1.15).
+/// `T`, and that bound is what keeps the context from escaping `block_on` inside `R`.
 pub struct RuntimeCtx<'rt, T> {
     shared: NonNull<RuntimeShared<T>>,
     /// 与 `&'rt RuntimeShared<T>` 同为协变，但不引入 `T: 'rt` 的隐式约束。

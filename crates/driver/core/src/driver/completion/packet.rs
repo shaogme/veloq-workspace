@@ -8,7 +8,7 @@ use super::{
 /// 一条完成之后，该操作是否还会再投递完成。
 ///
 /// 后端把自己的表示（io_uring 的 `IORING_CQE_F_MORE`、IOCP 的「没有这回事」）翻译成
-/// 这个枚举交给 core——core 不解读后端 flags，见 `DRIVER_REVIEW.md` §4.2(a)。
+/// 这个枚举交给 core——core 不解读后端 flags。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompletionContinuation {
     /// 该操作到此终止：slot 可以归还，token 随这条完成被消费而失效。

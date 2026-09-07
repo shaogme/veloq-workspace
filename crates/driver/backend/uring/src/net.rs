@@ -273,8 +273,7 @@ impl SocketAddrCodec for SockAddrStorage {
 /// 取一个已连接 socket 的对端地址。
 ///
 /// multishot accept 不回填地址（`IORING_OP_ACCEPT` 的 multishot 变体没有 addr 字段），
-/// 所以门面层拿到新 fd 之后要用这条同步系统调用补齐——见
-/// `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §1.2。
+/// 所以门面层拿到新 fd 之后要用这条同步系统调用补齐。
 pub fn peer_addr_of_handle(handle: UringRawHandle) -> UringResult<SocketAddr> {
     peer_addr_of(handle.as_fd())
 }

@@ -18,8 +18,6 @@
 //!
 //! 收益就是 provided buffer 的收益：**buffer 只在数据到达时才与连接绑定**。一万个挂着
 //! `recv_multi()` 的空闲连接不占任何接收缓冲，而一万个挂着 `recv()` 的连接各压一个。
-//!
-//! 见 `MULTISHOT_PROVIDED_BUFFERS_DESIGN.md` §6 / §7。
 
 use veloq_std::{
     pin::Pin,

@@ -61,7 +61,7 @@ pub(crate) struct NUMAGroup {
 /// `next` 是 Treiber 栈的后继索引；`in_stack` 标记该 worker 的条目当前是否**物理挂在**
 /// 某个栈上。这个标记把「一个 worker 在栈中最多存在一个条目」变成不变式，因此
 /// `next[worker]` 不会在条目还留在栈里时被下一次 `push` 覆盖 —— 覆盖正是链表成环、
-/// `pop_idle` 死循环的根因（RUNTIME_REVIEW §1.3）。
+/// `pop_idle` 死循环的根因。
 pub(crate) struct IdleSlots {
     next: Box<[AtomicUsize]>,
     in_stack: AtomicBitset,
@@ -530,9 +530,9 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
     /// 真正让线程睡下去。
     ///
     /// 没有 `park_hook` 时**不能**退化成 `thread::yield_now()`：默认构建下 idle 决策就是
-    /// `Wait(Block)`，yield 意味着所有空闲 worker 100% 占用 CPU 死转（RUNTIME_REVIEW
-    /// §1.13）。每个 worker 的 [`Unparker`] 自带一个 futex / `WaitOnAddress` 信号，缺省时
-    /// 就阻塞在它上面 —— 而 `wake_worker` 一律走同一个 `Unparker`，唤醒路径无需分叉。
+    /// `Wait(Block)`，yield 意味着所有空闲 worker 100% 占用 CPU 死转。每个 worker 的
+    /// [`Unparker`] 自带一个 futex / `WaitOnAddress` 信号，缺省时就阻塞在它上面 ——
+    /// 而 `wake_worker` 一律走同一个 `Unparker`，唤醒路径无需分叉。
     fn park(&self, wait_strategy: IdleWaitStrategy) -> Result<()> {
         if let Some(park_hook) = self.shared.park_hook {
             park_hook(self.shared, wait_strategy)?;
@@ -551,7 +551,7 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
     ///
     /// 先清 `idle_mask`（这才是「是否可被唤醒」的权威标记），再尝试摘除栈顶的自身条目。
     /// 摘不掉时条目会作为陈旧条目留在栈里，由 `pop_idle` 惰性丢弃 —— `IdleSlots` 的
-    /// `in_stack` 位保证它不会被重复入栈（RUNTIME_REVIEW §1.3）。
+    /// `in_stack` 位保证它不会被重复入栈。
     fn leave_idle(&self, group_idx: usize) {
         let base = &self.shared.base;
         base.idle.idle_mask.clear(self.worker_id);
@@ -617,8 +617,7 @@ mod tests {
         assert_eq!(stack.pop(&slots), None);
     }
 
-    /// RUNTIME_REVIEW §1.3 的回归用例：陈旧条目 + 重复入栈曾把链表变成环，
-    /// 使 `pop_idle` 永远返回不了 `None`（死循环）。
+    /// 回归用例：验证陈旧条目 + 重复入栈不会把链表变成环，避免 `pop_idle` 陷入死循环。
     #[test]
     fn idle_stack_stale_entry_never_forms_cycle() {
         let (stack, slots, mask) = fixture(2);

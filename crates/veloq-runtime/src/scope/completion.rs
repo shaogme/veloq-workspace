@@ -76,10 +76,9 @@ impl<S: ScopeStorage, O: Ownership> Drop for ScopeCompletionRegistration<'_, S, 
 
 /// 等待一个作用域内全部子任务结束的 future。
 ///
-/// 「等待」必须由 waker 驱动。旧的 `wait_all` 是一个体内没有 `.await` 的 `async fn`：它
-/// 同步跑一整个调度循环直到 `remaining == 0`，于是 await 一个 handle 实际等的是整个作用
-/// 域、栈深度随作用域嵌套线性增长、外层 `select!` / 超时永远拿不到控制权，非 worker 线程
-/// 上还会直接 panic（RUNTIME_REVIEW §2.1）。驱动完成队列的职责只属于 worker 顶层循环。
+/// 「等待」必须由 waker 驱动。如果 `wait_all` 同步跑一整个调度循环直到 `remaining == 0`，
+/// await 一个 handle 实际等的是整个作用域、栈深度会随作用域嵌套线性增长、外层 `select!` /
+/// 超时永远拿不到控制权，非 worker 线程上还会直接 panic。驱动完成队列的职责只属于 worker 顶层循环。
 pub(crate) struct ScopeJoinFuture<'a, S: ScopeStorage, O: Ownership> {
     completion: &'a GenericScopeCompletion<S, O>,
     /// 侵入式节点，入链后地址必须稳定 —— 靠 `!Unpin` 保证。
@@ -279,8 +278,8 @@ impl<S: ScopeStorage, O: Ownership> GenericScopeCompletion<S, O> {
 ///
 /// completion 由 `Arc`/`Rc` 持有，最后一个引用可能落在任意 worker 线程上（task header
 /// 通过 `ScopeRef` 持有引用），在这里 `resume_unwind` 等于把 panic 抛到一个与该作用域
-/// 毫无关系的线程上，诊断信息完全失真（RUNTIME_REVIEW §1.12）。走到这里还残留 payload
-/// 说明作用域析构时也没能把它交出去（例如根作用域正在 unwind），只能丢弃。
+/// 毫无关系的线程上，诊断信息完全失真。走到这里还残留 payload 说明作用域析构时也没能把
+/// 它交出去（例如根作用域正在 unwind），只能丢弃。
 impl<S: ScopeStorage, O: Ownership> Drop for GenericScopeCompletion<S, O> {
     fn drop(&mut self) {
         let mut wakers = self.wakers.lock();
