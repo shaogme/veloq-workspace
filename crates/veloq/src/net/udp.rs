@@ -49,8 +49,10 @@ pub struct PreparedLocalUdpRecv<'rt> {
 }
 
 impl<'rt> PreparedLocalUdpRecv<'rt> {
-    pub fn arm(&mut self) -> bool {
-        self.op_fut.arm()
+    /// 确保底层接收操作已被真正 Arm。
+    pub async fn arm(&mut self) -> Result<()> {
+        self.op_fut.arm();
+        Ok(())
     }
 
     pub fn is_armed(&self) -> bool {
@@ -99,18 +101,31 @@ pub struct PreparedUdpRecv<'rt> {
 }
 
 impl<'rt> PreparedUdpRecv<'rt> {
-    pub fn arm(&mut self) -> bool {
+    /// 异步确保底层接收操作已被真正 Arm（提交到底层内核驱动）。
+    ///
+    /// - 若该套接字归属于当前 Worker，该方法同步提交并立即返回 `Ok(())`；
+    /// - 若该套接字归属于远程 Worker，该方法将异步等待远程 Worker 调度并成功执行
+    ///   `submit_detached`，确保底层网络栈（如 Windows RIO Request Queue）
+    ///   已成功挂载接收缓冲区后再返回。
+    pub async fn arm(&mut self) -> Result<()> {
         match &mut self.state {
-            PreparedUdpRecvState::Local(op) => op.arm(),
-            PreparedUdpRecvState::Remote(_) => true,
-            PreparedUdpRecvState::Done => false,
+            PreparedUdpRecvState::Local(op) => {
+                op.arm();
+                Ok(())
+            }
+            PreparedUdpRecvState::Remote(routed) => {
+                routed.wait_ready().await.trans()?;
+                Ok(())
+            }
+            PreparedUdpRecvState::Done => NetError::UdpRecvFromOpLost.trans(),
         }
     }
 
+    /// 查询该操作当前是否确实已被 Arm。
     pub fn is_armed(&self) -> bool {
         match &self.state {
             PreparedUdpRecvState::Local(op) => op.is_armed(),
-            PreparedUdpRecvState::Remote(_) => true,
+            PreparedUdpRecvState::Remote(routed) => routed.is_ready(),
             PreparedUdpRecvState::Done => false,
         }
     }

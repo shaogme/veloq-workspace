@@ -419,6 +419,13 @@ impl<T> RouteCell<T> {
         Ok(())
     }
 
+    pub(crate) fn is_populated(&self) -> bool {
+        self.value
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
+    }
+
     pub(crate) fn take(&self) -> Result<Option<Result<T>>> {
         Ok(self
             .value
@@ -445,6 +452,49 @@ impl<F> RoutedFuture<F> {
     pub(crate) fn new(slot: Arc<RouteCell<F>>) -> Self {
         Self { slot, inner: None }
     }
+
+    /// 查询内层 Future 是否已被远程 Worker 产出并已移入当前句柄（即阶段一已就绪）。
+    pub fn is_ready(&self) -> bool {
+        self.inner.is_some() || self.slot.is_populated()
+    }
+
+    /// 轮询直到目标 Worker 完成闭包执行并将内层 Future 放入当前槽位。
+    ///
+    /// 一旦返回 `Poll::Ready(Ok(()))`，说明远程闭包（如 `submit_detached`）
+    /// 已经在目标 Worker 的线程和驱动上完全执行并落地，底层内核资源已 Armed。
+    pub fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        if self.inner.is_some() {
+            return Poll::Ready(Ok(()));
+        }
+
+        if let Some(op) = self.slot.take()? {
+            match op {
+                Ok(op) => {
+                    self.inner = Some(op);
+                    Poll::Ready(Ok(()))
+                }
+                Err(err) => Poll::Ready(Err(err)),
+            }
+        } else {
+            self.slot.register(cx.waker());
+            if let Some(op) = self.slot.take()? {
+                match op {
+                    Ok(op) => {
+                        self.inner = Some(op);
+                        Poll::Ready(Ok(()))
+                    }
+                    Err(err) => Poll::Ready(Err(err)),
+                }
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    /// 异步等待目标 Worker 完成闭包执行并把内层 Future 传回。
+    pub async fn wait_ready(&mut self) -> Result<()> {
+        poll_fn(|cx| self.poll_ready(cx)).await
+    }
 }
 
 impl<F> Future for RoutedFuture<F>
@@ -456,38 +506,28 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
+        // 复用 poll_ready 确保 inner 已就绪
         if this.inner.is_none() {
-            if let Some(op) = this.slot.take()? {
-                match op {
-                    Ok(op) => this.inner = Some(op),
-                    Err(err) => return Poll::Ready(Err(err)),
-                }
-            } else {
-                this.slot.register(cx.waker());
-                if let Some(op) = this.slot.take()? {
-                    match op {
-                        Ok(op) => this.inner = Some(op),
-                        Err(err) => return Poll::Ready(Err(err)),
-                    }
-                } else {
-                    return Poll::Pending;
-                }
+            match this.poll_ready(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Pending => return Poll::Pending,
             }
         }
+
         let Some(inner) = this.inner.as_mut() else {
             let err = RuntimeError::InvariantViolation {
                 site: "RoutedFuture::poll",
-                detail: "route future missing inner op".into(),
+                detail: "route future missing inner op after poll_ready".into(),
             }
             .to_report()
             .with_category("runtime.route");
             return Poll::Ready(Err(err));
         };
 
-        match unsafe { Pin::new_unchecked(inner) }.poll(cx) {
-            Poll::Ready(output) => Poll::Ready(Ok(output)),
-            Poll::Pending => Poll::Pending,
-        }
+        // 阶段二：轮询内层 Future（例如 DetachedOp 的 I/O 完成事件）
+        let inner_pin = unsafe { Pin::new_unchecked(inner) };
+        inner_pin.poll(cx).map(Ok)
     }
 }
 

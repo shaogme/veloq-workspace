@@ -66,7 +66,7 @@ fn udp_send_receive() {
         scope!(ctx, async |s| {
             s.spawn_boxed(async move {
                 let mut recv_prep = socket1.prepare_recv_from(ctx.alloc_full(nz!(1024)));
-                recv_prep.arm();
+                recv_prep.arm().await.expect("arm failed");
                 tx.send(()).unwrap();
 
                 let datagram = recv_prep.await.expect("recv_from failed");
@@ -108,7 +108,7 @@ fn udp_echo() {
         scope!(ctx, async |s| {
             s.spawn_boxed(async move {
                 let mut server_prep = server.prepare_recv_from(ctx.alloc_full(nz!(1024)));
-                server_prep.arm();
+                server_prep.arm().await.expect("arm failed");
                 server_tx.send(()).unwrap();
 
                 let datagram = server_prep.await.expect("Server recv_from failed");
@@ -130,7 +130,7 @@ fn udp_echo() {
                     client_scope.spawn_boxed(async move {
                         let mut client_prep =
                             recv_client.prepare_recv_from(ctx.alloc_full(nz!(1024)));
-                        client_prep.arm();
+                        client_prep.arm().await.expect("arm failed");
                         client_tx.send(()).unwrap();
 
                         let datagram = client_prep.await.expect("Client recv_from failed");
@@ -178,7 +178,7 @@ fn udp_multiple_messages() {
 
                 s.spawn_boxed(async move {
                     let mut recv_prep = recv_socket.prepare_recv_from(ctx.alloc_full(nz!(1024)));
-                    recv_prep.arm();
+                    recv_prep.arm().await.expect("arm failed");
                     let _ = armed_tx.send(());
 
                     let datagram = recv_prep.await.expect("recv_from failed");
@@ -229,7 +229,7 @@ fn udp_large_data() {
         scope!(ctx, async |s| {
             s.spawn_boxed(async move {
                 let mut recv_prep = socket1.prepare_recv_from(ctx.alloc_full(nz!(2048)));
-                recv_prep.arm();
+                recv_prep.arm().await.expect("arm failed");
                 tx.send(()).unwrap();
 
                 let datagram = recv_prep.await.expect("recv_from failed");
@@ -268,7 +268,7 @@ fn udp_heap_buffer() {
                 let mut recv_prep = socket1.prepare_recv_from(
                     FixedBuf::alloc_heap_full(nz!(1024)).expect("Heap allocation failed"),
                 );
-                recv_prep.arm();
+                recv_prep.arm().await.expect("arm failed");
                 tx.send(()).unwrap();
 
                 let datagram = recv_prep.await.expect("recv_from failed");
@@ -392,7 +392,7 @@ fn multithread_udp_no_echo() {
 
                 s.spawn_boxed(async move {
                     let mut recv_prep = socket1.prepare_recv_from(ctx.alloc(nz!(1024), 1024));
-                    recv_prep.arm();
+                    recv_prep.arm().await.expect("arm failed");
                     ready_tx.send(()).unwrap();
 
                     let datagram = recv_prep.await.expect("recv_from failed");
@@ -438,7 +438,7 @@ fn multithread_udp_echo() {
                 let socket = bind_udp_socket(ctx, "127.0.0.1:0");
                 let server_addr = socket.local_addr().expect("Failed to get server address");
                 let mut server_prep = socket.prepare_recv_from(ctx.alloc(nz!(1024), 1024));
-                server_prep.arm();
+                server_prep.arm().await.expect("arm failed");
 
                 addr_tx.send(server_addr).unwrap();
                 let datagram = server_prep.await.expect("Server recv_from failed");
@@ -467,7 +467,7 @@ fn multithread_udp_echo() {
                     client_scope.spawn_boxed(async move {
                         let mut client_prep =
                             recv_client.prepare_recv_from(ctx.alloc(nz!(1024), 1024));
-                        client_prep.arm();
+                        client_prep.arm().await.expect("arm failed");
                         client_tx.send(()).unwrap();
 
                         let datagram = client_prep.await.expect("Client recv_from failed");
@@ -526,7 +526,7 @@ fn multithread_udp_cross_worker_drop_is_routed() {
                     probe_scope.spawn_boxed(async move {
                         let mut probe_prep =
                             probe_server_task.prepare_recv_from(ctx.alloc(nz!(1024), 1024));
-                        probe_prep.arm();
+                        probe_prep.arm().await.expect("arm failed");
                         probe_ready_tx.send(()).unwrap();
 
                         let datagram = probe_prep.await.expect("probe recv_from failed");
@@ -602,7 +602,8 @@ fn multithread_concurrent_udp_clients() {
 
                 s.spawn_boxed(async move {
                     let mut server_prep = recv_socket.prepare_recv_from(ctx.alloc(nz!(1024), 1024));
-                    server_prep.arm();
+                    // 使用真正的异步就绪等待，确保跨 Worker 提交已落地内核
+                    server_prep.arm().await.expect("server_prep arm failed");
                     let _ = ready_tx.send(());
 
                     let datagram = server_prep.await.expect("Server recv_from failed");
@@ -631,6 +632,7 @@ fn multithread_concurrent_udp_clients() {
                 });
             }
 
+            // 4. 汇总验证
             let mut unique_peers = HashSet::new();
             for _ in 0..NUM_CLIENTS {
                 let peer_addr = peer_rx.recv().await.expect("peer channel closed");
