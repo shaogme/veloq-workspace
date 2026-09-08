@@ -4,7 +4,7 @@ use veloq_std::{
     cmp,
     ffi::CString,
     hint,
-    io::{Error, ErrorKind, Read, Result, Seek, Write},
+    io::{Cursor, Error, ErrorKind, Read, Result, Seek, Stderr, Stdin, Stdout, Write},
     net::{TcpListener, TcpStream, UdpSocket},
 };
 
@@ -25,8 +25,11 @@ fn std_facade_exports_are_available() {
     fn assert_send_sync<T: Send + Sync>() {}
 
     assert_read::<&[u8]>();
-    assert_seek::<std::io::Cursor<Vec<u8>>>();
+    assert_seek::<Cursor<Vec<u8>>>();
     assert_write::<Vec<u8>>();
+    assert_read::<Stdin>();
+    assert_write::<Stdout>();
+    assert_write::<Stderr>();
     assert_send_sync::<TcpListener>();
     assert_send_sync::<TcpStream>();
     assert_send_sync::<UdpSocket>();

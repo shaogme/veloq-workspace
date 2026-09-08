@@ -3,13 +3,17 @@
 use core::ffi::c_void;
 
 use crate::alloc_crate as alloc;
+use crate::io::{Stderr, Stdin, Stdout};
 
 use alloc::{boxed::Box, rc::Rc, sync::Arc};
+use windows_sys::Win32::System::Console::{
+    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+};
 
 #[cfg(feature = "std")]
 use std::{
     fs::File,
-    io::{Stderr, Stdin, Stdout},
+    io::{Stderr as StdStderr, Stdin as StdStdin, Stdout as StdStdout},
     net::{TcpListener, TcpStream, UdpSocket},
     os::windows::io::{
         AsRawHandle as StdAsRawHandle, AsRawSocket as StdAsRawSocket,
@@ -283,16 +287,29 @@ impl IntoRawSocket for UdpSocket {
     }
 }
 
-#[cfg(feature = "std")]
 impl AsRawHandle for Stdin {
     #[inline]
     fn as_raw_handle(&self) -> RawHandle {
-        StdAsRawHandle::as_raw_handle(self)
+        unsafe { GetStdHandle(STD_INPUT_HANDLE) as RawHandle }
+    }
+}
+
+impl AsRawHandle for Stdout {
+    #[inline]
+    fn as_raw_handle(&self) -> RawHandle {
+        unsafe { GetStdHandle(STD_OUTPUT_HANDLE) as RawHandle }
+    }
+}
+
+impl AsRawHandle for Stderr {
+    #[inline]
+    fn as_raw_handle(&self) -> RawHandle {
+        unsafe { GetStdHandle(STD_ERROR_HANDLE) as RawHandle }
     }
 }
 
 #[cfg(feature = "std")]
-impl AsRawHandle for Stdout {
+impl AsRawHandle for StdStdin {
     #[inline]
     fn as_raw_handle(&self) -> RawHandle {
         StdAsRawHandle::as_raw_handle(self)
@@ -300,7 +317,15 @@ impl AsRawHandle for Stdout {
 }
 
 #[cfg(feature = "std")]
-impl AsRawHandle for Stderr {
+impl AsRawHandle for StdStdout {
+    #[inline]
+    fn as_raw_handle(&self) -> RawHandle {
+        StdAsRawHandle::as_raw_handle(self)
+    }
+}
+
+#[cfg(feature = "std")]
+impl AsRawHandle for StdStderr {
     #[inline]
     fn as_raw_handle(&self) -> RawHandle {
         StdAsRawHandle::as_raw_handle(self)

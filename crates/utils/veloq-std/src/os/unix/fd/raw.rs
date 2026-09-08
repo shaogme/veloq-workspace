@@ -3,13 +3,14 @@
 use core::ffi::c_int;
 
 use crate::alloc_crate as alloc;
+use crate::io::{Stderr, Stdin, Stdout};
 
 use alloc::{boxed::Box, rc::Rc, sync::Arc};
 
 #[cfg(feature = "std")]
 use std::{
     fs::File,
-    io::{Stderr, Stdin, Stdout},
+    io::{Stderr as StdStderr, Stdin as StdStdin, Stdout as StdStdout},
     net::{TcpListener, TcpStream, UdpSocket},
     os::fd::{AsRawFd as StdAsRawFd, FromRawFd as StdFromRawFd, IntoRawFd as StdIntoRawFd},
 };
@@ -192,7 +193,6 @@ impl IntoRawFd for UdpSocket {
     }
 }
 
-#[cfg(feature = "std")]
 impl AsRawFd for Stdin {
     #[inline]
     fn as_raw_fd(&self) -> RawFd {
@@ -200,7 +200,6 @@ impl AsRawFd for Stdin {
     }
 }
 
-#[cfg(feature = "std")]
 impl AsRawFd for Stdout {
     #[inline]
     fn as_raw_fd(&self) -> RawFd {
@@ -208,8 +207,31 @@ impl AsRawFd for Stdout {
     }
 }
 
-#[cfg(feature = "std")]
 impl AsRawFd for Stderr {
+    #[inline]
+    fn as_raw_fd(&self) -> RawFd {
+        libc::STDERR_FILENO
+    }
+}
+
+#[cfg(feature = "std")]
+impl AsRawFd for StdStdin {
+    #[inline]
+    fn as_raw_fd(&self) -> RawFd {
+        libc::STDIN_FILENO
+    }
+}
+
+#[cfg(feature = "std")]
+impl AsRawFd for StdStdout {
+    #[inline]
+    fn as_raw_fd(&self) -> RawFd {
+        libc::STDOUT_FILENO
+    }
+}
+
+#[cfg(feature = "std")]
+impl AsRawFd for StdStderr {
     #[inline]
     fn as_raw_fd(&self) -> RawFd {
         libc::STDERR_FILENO

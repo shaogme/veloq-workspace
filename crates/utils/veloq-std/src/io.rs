@@ -1,13 +1,20 @@
+pub mod cursor;
 pub mod error;
+pub mod impls;
 pub mod kind;
 pub mod os_error;
+pub mod stdio;
+pub mod traits;
 
+pub use cursor::Cursor;
 pub use error::{Error, Result, SimpleMessage};
 pub use kind::ErrorKind;
 pub use os_error::RawOsError;
-
-#[cfg(feature = "std")]
-pub use std::io::{Read, Seek, Write};
+pub use stdio::{Stderr, StderrLock, Stdin, StdinLock, Stdout, StdoutLock, stderr, stdin, stdout};
+pub use traits::{
+    Bytes, Chain, Empty, IoSlice, IoSliceMut, Read, Repeat, Seek, SeekFrom, Sink, Take, Write,
+    copy, empty, repeat, sink,
+};
 
 /// Creates a new I/O error from a known kind of error and a constant string literal.
 ///

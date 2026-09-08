@@ -1,7 +1,10 @@
 use core::fmt::{self, Display, Formatter};
 
 use veloq_std::const_io_error;
-use veloq_std::io::{Error, ErrorKind, RawOsError, Result, SimpleMessage};
+use veloq_std::io::{
+    Cursor, Error, ErrorKind, IoSlice, IoSliceMut, RawOsError, Read, Result, Seek, SeekFrom,
+    SimpleMessage, Stderr, Stdin, Stdout, Write, copy, empty, repeat, sink, stderr, stdin, stdout,
+};
 
 #[cfg(feature = "std")]
 use std::io::ErrorKind as StdErrorKind;
@@ -140,4 +143,207 @@ fn test_std_error_conversion() {
 
     let back_from_std: Error = std_os_err.into();
     assert_eq!(back_from_std.raw_os_error(), Some(22));
+}
+
+#[test]
+fn test_read_slice() {
+    let mut data: &[u8] = b"hello world";
+    let mut buf = [0u8; 5];
+    assert_eq!(data.read(&mut buf).unwrap(), 5);
+    assert_eq!(&buf, b"hello");
+    assert_eq!(data, b" world");
+
+    let mut rest = [0u8; 10];
+    assert_eq!(data.read(&mut rest).unwrap(), 6);
+    assert_eq!(&rest[..6], b" world");
+    assert_eq!(data.read(&mut rest).unwrap(), 0);
+}
+
+#[test]
+fn test_read_exact() {
+    let mut data: &[u8] = b"12345";
+    let mut buf = [0u8; 5];
+    data.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"12345");
+
+    let mut buf2 = [0u8; 1];
+    let err = data.read_exact(&mut buf2).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::UnexpectedEof);
+}
+
+#[test]
+fn test_read_to_end_and_to_string() {
+    use veloq_std::{string::String, vec::Vec};
+
+    let mut data: &[u8] = b"rust 2024 edition";
+    let mut vec = Vec::new();
+    let n = data.read_to_end(&mut vec).unwrap();
+    assert_eq!(n, 17);
+    assert_eq!(vec, b"rust 2024 edition");
+
+    let mut data2: &[u8] = b"hello async";
+    let mut s = String::new();
+    let n2 = data2.read_to_string(&mut s).unwrap();
+    assert_eq!(n2, 11);
+    assert_eq!(s, "hello async");
+}
+
+#[test]
+fn test_write_slice_and_vec() {
+    use veloq_std::vec::Vec;
+
+    let mut buf = [0u8; 8];
+    {
+        let mut slice = &mut buf[..];
+        let n = slice.write(b"abcd").unwrap();
+        assert_eq!(n, 4);
+        slice.write_all(b"efgh").unwrap();
+        assert_eq!(slice.write(b"i").unwrap(), 0);
+    }
+    assert_eq!(&buf, b"abcdefgh");
+
+    let mut v = Vec::new();
+    v.write_all(b"hello ").unwrap();
+    write!(v, "format {}", 42).unwrap();
+    assert_eq!(v, b"hello format 42");
+}
+
+#[test]
+fn test_cursor_read_write_seek() {
+    use veloq_std::vec::Vec;
+
+    let mut c = Cursor::new(Vec::new());
+    c.write_all(b"hello world").unwrap();
+    assert_eq!(c.position(), 11);
+
+    c.rewind().unwrap();
+    assert_eq!(c.position(), 0);
+
+    let mut buf = [0u8; 5];
+    c.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"hello");
+
+    let pos = c.seek(SeekFrom::Current(1)).unwrap();
+    assert_eq!(pos, 6);
+
+    let mut buf2 = [0u8; 5];
+    c.read_exact(&mut buf2).unwrap();
+    assert_eq!(&buf2, b"world");
+
+    assert_eq!(c.stream_len().unwrap(), 11);
+    assert_eq!(c.stream_position().unwrap(), 11);
+
+    c.seek(SeekFrom::End(-5)).unwrap();
+    let mut buf3 = [0u8; 5];
+    c.read_exact(&mut buf3).unwrap();
+    assert_eq!(&buf3, b"world");
+}
+
+#[test]
+fn test_copy_sink_empty_repeat() {
+    use veloq_std::vec::Vec;
+
+    let mut src: &[u8] = b"hello";
+    let mut dst = Vec::new();
+    let n = copy(&mut src, &mut dst).unwrap();
+    assert_eq!(n, 5);
+    assert_eq!(dst, b"hello");
+
+    let mut s = sink();
+    assert_eq!(s.write(b"drop me").unwrap(), 7);
+
+    let mut e = empty();
+    let mut b = [0u8; 4];
+    assert_eq!(e.read(&mut b).unwrap(), 0);
+    assert_eq!(e.seek(SeekFrom::Start(10)).unwrap(), 0);
+
+    let mut r = repeat(42);
+    let mut r_buf = [0u8; 4];
+    assert_eq!(r.read(&mut r_buf).unwrap(), 4);
+    assert_eq!(r_buf, [42, 42, 42, 42]);
+}
+
+#[test]
+fn test_read_adaptors() {
+    use veloq_std::vec::Vec;
+
+    let src: &[u8] = b"abcdef";
+    let mut taken = src.take(3);
+    let mut buf = Vec::new();
+    taken.read_to_end(&mut buf).unwrap();
+    assert_eq!(buf, b"abc");
+
+    let r1: &[u8] = b"abc";
+    let r2: &[u8] = b"def";
+    let mut chained = r1.chain(r2);
+    let mut chain_buf = Vec::new();
+    chained.read_to_end(&mut chain_buf).unwrap();
+    assert_eq!(chain_buf, b"abcdef");
+
+    let r3: &[u8] = b"xyz";
+    let bytes: Result<Vec<u8>> = r3.bytes().collect();
+    assert_eq!(bytes.unwrap(), b"xyz");
+}
+
+#[test]
+fn test_ioslice() {
+    let buf = b"hello world";
+    let mut slice = IoSlice::new(buf);
+    assert_eq!(&*slice, b"hello world");
+    slice.advance(6);
+    assert_eq!(&*slice, b"world");
+
+    let mut mut_buf = *b"hello world";
+    let mut mut_slice = IoSliceMut::new(&mut mut_buf);
+    assert_eq!(&*mut_slice, b"hello world");
+    mut_slice.advance(6);
+    assert_eq!(&*mut_slice, b"world");
+}
+
+#[test]
+fn test_stdio() {
+    fn assert_types<R: Read, W: Write>() {}
+    assert_types::<Stdin, Stdout>();
+    assert_types::<Stdin, Stderr>();
+
+    let mut out: Stdout = stdout();
+    out.write_all(b"").unwrap();
+    out.flush().unwrap();
+    let _out_lock = out.lock();
+
+    let mut err: Stderr = stderr();
+    err.write_all(b"").unwrap();
+    err.flush().unwrap();
+    let _err_lock = err.lock();
+
+    let in_handle: Stdin = stdin();
+    let _in_lock = in_handle.lock();
+}
+
+#[cfg(unix)]
+#[test]
+fn test_stdio_unix_raw_fd() {
+    use veloq_std::os::fd::AsRawFd;
+
+    let in_handle = stdin();
+    let out_handle = stdout();
+    let err_handle = stderr();
+
+    assert_eq!(in_handle.as_raw_fd(), libc::STDIN_FILENO);
+    assert_eq!(out_handle.as_raw_fd(), libc::STDOUT_FILENO);
+    assert_eq!(err_handle.as_raw_fd(), libc::STDERR_FILENO);
+}
+
+#[cfg(windows)]
+#[test]
+fn test_stdio_windows_raw_handle() {
+    use veloq_std::os::windows::io::AsRawHandle;
+
+    let in_handle = stdin();
+    let out_handle = stdout();
+    let err_handle = stderr();
+
+    let _ = in_handle.as_raw_handle();
+    let _ = out_handle.as_raw_handle();
+    let _ = err_handle.as_raw_handle();
 }
