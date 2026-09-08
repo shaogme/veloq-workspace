@@ -29,7 +29,7 @@ use windows_sys::Win32::{
 
 #[cfg(feature = "std")]
 use std::{
-    net::{TcpListener, TcpStream, UdpSocket},
+    net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream, UdpSocket as StdUdpSocket},
     os::windows::io::AsRawSocket as StdAsRawSocket,
 };
 
@@ -262,7 +262,7 @@ impl<T: AsSocket + ?Sized> AsSocket for Rc<T> {
 }
 
 #[cfg(feature = "std")]
-impl AsSocket for TcpStream {
+impl AsSocket for StdTcpStream {
     #[inline]
     fn as_socket(&self) -> BorrowedSocket<'_> {
         unsafe { BorrowedSocket::borrow_raw(StdAsRawSocket::as_raw_socket(self)) }
@@ -270,7 +270,7 @@ impl AsSocket for TcpStream {
 }
 
 #[cfg(feature = "std")]
-impl AsSocket for TcpListener {
+impl AsSocket for StdTcpListener {
     #[inline]
     fn as_socket(&self) -> BorrowedSocket<'_> {
         unsafe { BorrowedSocket::borrow_raw(StdAsRawSocket::as_raw_socket(self)) }
@@ -278,7 +278,7 @@ impl AsSocket for TcpListener {
 }
 
 #[cfg(feature = "std")]
-impl AsSocket for UdpSocket {
+impl AsSocket for StdUdpSocket {
     #[inline]
     fn as_socket(&self) -> BorrowedSocket<'_> {
         unsafe { BorrowedSocket::borrow_raw(StdAsRawSocket::as_raw_socket(self)) }

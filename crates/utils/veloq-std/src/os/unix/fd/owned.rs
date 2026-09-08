@@ -13,7 +13,7 @@ use alloc::{boxed::Box, rc::Rc, sync::Arc};
 #[cfg(feature = "std")]
 use std::{
     fs::File as StdFile,
-    net::{TcpListener, TcpStream, UdpSocket},
+    net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream, UdpSocket as StdUdpSocket},
     os::fd::AsRawFd as StdAsRawFd,
 };
 
@@ -209,7 +209,7 @@ impl AsFd for StdFile {
 }
 
 #[cfg(feature = "std")]
-impl AsFd for TcpStream {
+impl AsFd for StdTcpStream {
     #[inline]
     fn as_fd(&self) -> BorrowedFd<'_> {
         unsafe { BorrowedFd::borrow_raw(StdAsRawFd::as_raw_fd(self)) }
@@ -217,7 +217,7 @@ impl AsFd for TcpStream {
 }
 
 #[cfg(feature = "std")]
-impl AsFd for TcpListener {
+impl AsFd for StdTcpListener {
     #[inline]
     fn as_fd(&self) -> BorrowedFd<'_> {
         unsafe { BorrowedFd::borrow_raw(StdAsRawFd::as_raw_fd(self)) }
@@ -225,7 +225,7 @@ impl AsFd for TcpListener {
 }
 
 #[cfg(feature = "std")]
-impl AsFd for UdpSocket {
+impl AsFd for StdUdpSocket {
     #[inline]
     fn as_fd(&self) -> BorrowedFd<'_> {
         unsafe { BorrowedFd::borrow_raw(StdAsRawFd::as_raw_fd(self)) }

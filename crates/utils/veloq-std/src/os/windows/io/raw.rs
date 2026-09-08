@@ -16,7 +16,7 @@ use windows_sys::Win32::System::Console::{
 use std::{
     fs::File as StdFile,
     io::{Stderr as StdStderr, Stdin as StdStdin, Stdout as StdStdout},
-    net::{TcpListener, TcpStream, UdpSocket},
+    net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream, UdpSocket as StdUdpSocket},
     os::windows::io::{
         AsRawHandle as StdAsRawHandle, AsRawSocket as StdAsRawSocket,
         FromRawHandle as StdFromRawHandle, FromRawSocket as StdFromRawSocket,
@@ -218,7 +218,7 @@ impl IntoRawHandle for StdFile {
 }
 
 #[cfg(feature = "std")]
-impl AsRawSocket for TcpStream {
+impl AsRawSocket for StdTcpStream {
     #[inline]
     fn as_raw_socket(&self) -> RawSocket {
         StdAsRawSocket::as_raw_socket(self)
@@ -226,7 +226,7 @@ impl AsRawSocket for TcpStream {
 }
 
 #[cfg(feature = "std")]
-impl FromRawSocket for TcpStream {
+impl FromRawSocket for StdTcpStream {
     #[inline]
     unsafe fn from_raw_socket(sock: RawSocket) -> Self {
         unsafe { StdFromRawSocket::from_raw_socket(sock) }
@@ -234,7 +234,7 @@ impl FromRawSocket for TcpStream {
 }
 
 #[cfg(feature = "std")]
-impl IntoRawSocket for TcpStream {
+impl IntoRawSocket for StdTcpStream {
     #[inline]
     fn into_raw_socket(self) -> RawSocket {
         StdIntoRawSocket::into_raw_socket(self)
@@ -242,7 +242,7 @@ impl IntoRawSocket for TcpStream {
 }
 
 #[cfg(feature = "std")]
-impl AsRawSocket for TcpListener {
+impl AsRawSocket for StdTcpListener {
     #[inline]
     fn as_raw_socket(&self) -> RawSocket {
         StdAsRawSocket::as_raw_socket(self)
@@ -250,7 +250,7 @@ impl AsRawSocket for TcpListener {
 }
 
 #[cfg(feature = "std")]
-impl FromRawSocket for TcpListener {
+impl FromRawSocket for StdTcpListener {
     #[inline]
     unsafe fn from_raw_socket(sock: RawSocket) -> Self {
         unsafe { StdFromRawSocket::from_raw_socket(sock) }
@@ -258,7 +258,7 @@ impl FromRawSocket for TcpListener {
 }
 
 #[cfg(feature = "std")]
-impl IntoRawSocket for TcpListener {
+impl IntoRawSocket for StdTcpListener {
     #[inline]
     fn into_raw_socket(self) -> RawSocket {
         StdIntoRawSocket::into_raw_socket(self)
@@ -266,7 +266,7 @@ impl IntoRawSocket for TcpListener {
 }
 
 #[cfg(feature = "std")]
-impl AsRawSocket for UdpSocket {
+impl AsRawSocket for StdUdpSocket {
     #[inline]
     fn as_raw_socket(&self) -> RawSocket {
         StdAsRawSocket::as_raw_socket(self)
@@ -274,7 +274,7 @@ impl AsRawSocket for UdpSocket {
 }
 
 #[cfg(feature = "std")]
-impl FromRawSocket for UdpSocket {
+impl FromRawSocket for StdUdpSocket {
     #[inline]
     unsafe fn from_raw_socket(sock: RawSocket) -> Self {
         unsafe { StdFromRawSocket::from_raw_socket(sock) }
@@ -282,7 +282,7 @@ impl FromRawSocket for UdpSocket {
 }
 
 #[cfg(feature = "std")]
-impl IntoRawSocket for UdpSocket {
+impl IntoRawSocket for StdUdpSocket {
     #[inline]
     fn into_raw_socket(self) -> RawSocket {
         StdIntoRawSocket::into_raw_socket(self)

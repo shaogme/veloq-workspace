@@ -13,7 +13,7 @@ use alloc::{boxed::Box, rc::Rc, sync::Arc};
 use std::{
     fs::File as StdFile,
     io::{Stderr as StdStderr, Stdin as StdStdin, Stdout as StdStdout},
-    net::{TcpListener, TcpStream, UdpSocket},
+    net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream, UdpSocket as StdUdpSocket},
     os::fd::{AsRawFd as StdAsRawFd, FromRawFd as StdFromRawFd, IntoRawFd as StdIntoRawFd},
 };
 
@@ -124,7 +124,7 @@ impl IntoRawFd for StdFile {
 }
 
 #[cfg(feature = "std")]
-impl AsRawFd for TcpStream {
+impl AsRawFd for StdTcpStream {
     #[inline]
     fn as_raw_fd(&self) -> RawFd {
         StdAsRawFd::as_raw_fd(self)
@@ -132,7 +132,7 @@ impl AsRawFd for TcpStream {
 }
 
 #[cfg(feature = "std")]
-impl FromRawFd for TcpStream {
+impl FromRawFd for StdTcpStream {
     #[inline]
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
         unsafe { StdFromRawFd::from_raw_fd(fd) }
@@ -140,7 +140,7 @@ impl FromRawFd for TcpStream {
 }
 
 #[cfg(feature = "std")]
-impl IntoRawFd for TcpStream {
+impl IntoRawFd for StdTcpStream {
     #[inline]
     fn into_raw_fd(self) -> RawFd {
         StdIntoRawFd::into_raw_fd(self)
@@ -148,7 +148,7 @@ impl IntoRawFd for TcpStream {
 }
 
 #[cfg(feature = "std")]
-impl AsRawFd for TcpListener {
+impl AsRawFd for StdTcpListener {
     #[inline]
     fn as_raw_fd(&self) -> RawFd {
         StdAsRawFd::as_raw_fd(self)
@@ -156,7 +156,7 @@ impl AsRawFd for TcpListener {
 }
 
 #[cfg(feature = "std")]
-impl FromRawFd for TcpListener {
+impl FromRawFd for StdTcpListener {
     #[inline]
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
         unsafe { StdFromRawFd::from_raw_fd(fd) }
@@ -164,7 +164,7 @@ impl FromRawFd for TcpListener {
 }
 
 #[cfg(feature = "std")]
-impl IntoRawFd for TcpListener {
+impl IntoRawFd for StdTcpListener {
     #[inline]
     fn into_raw_fd(self) -> RawFd {
         StdIntoRawFd::into_raw_fd(self)
@@ -172,7 +172,7 @@ impl IntoRawFd for TcpListener {
 }
 
 #[cfg(feature = "std")]
-impl AsRawFd for UdpSocket {
+impl AsRawFd for StdUdpSocket {
     #[inline]
     fn as_raw_fd(&self) -> RawFd {
         StdAsRawFd::as_raw_fd(self)
@@ -180,7 +180,7 @@ impl AsRawFd for UdpSocket {
 }
 
 #[cfg(feature = "std")]
-impl FromRawFd for UdpSocket {
+impl FromRawFd for StdUdpSocket {
     #[inline]
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
         unsafe { StdFromRawFd::from_raw_fd(fd) }
@@ -188,7 +188,7 @@ impl FromRawFd for UdpSocket {
 }
 
 #[cfg(feature = "std")]
-impl IntoRawFd for UdpSocket {
+impl IntoRawFd for StdUdpSocket {
     #[inline]
     fn into_raw_fd(self) -> RawFd {
         StdIntoRawFd::into_raw_fd(self)

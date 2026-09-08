@@ -100,12 +100,7 @@ pub mod num {
     pub use core::num::*;
 }
 
-pub mod net {
-    pub use core::net::*;
-
-    #[cfg(feature = "std")]
-    pub use std::net::{TcpListener, TcpStream, UdpSocket};
-}
+pub mod net;
 
 pub mod boxed {
     pub use alloc_crate::boxed::*;
