@@ -33,7 +33,7 @@ cargo xtest-linux       # / xtest-windows    (nextest，连续跑 20 轮)
 `xtest-runner` 的平台路由（自动判定，无需手工干预）：
 
 - **Windows 主机 → Linux 目标**：通过 `docker compose run --rm standalone` 在容器内重新调用自身；不允许在 Windows 上原生跑 Linux 目标。
-- **Linux 主机 → Windows 目标**：通过 `cross`（自动带 `CROSS_SKIP_AUTO_UPDATE=1`，必要时自动 `cargo install cross` / `rustup target add x86_64-pc-windows-gnu`）。
+- **Linux 主机 → Windows 目标**：通过 QEMU Windows 虚拟机执行（使用 QEMU 而非 `cross`），由 `xtest-runner` 自动拉起 QEMU、等待 SSH 就绪、同步工作区并在虚拟机内部原生调用自身（依赖 `qemu-system-x86_64`、`ssh`/`sshpass` 及 `image/win2025-core-rust-gnu.qcow2` 镜像；存在 `/dev/kvm` 时自动开启 KVM 硬件加速）。
 - 原生目标：`cargo nextest run --workspace --exclude <对端后端 crate> --test-threads 1 --run-ignored all`，先 `--no-run` 预构建并预热 trybuild。
 
 常用参数：`--task {test,clippy,check}`、`--target {linux,windows}`、`-n/--count <次数>`（test 默认 20，用 `-n 1` 快速验证）、`--features`、`--quiet`。例：

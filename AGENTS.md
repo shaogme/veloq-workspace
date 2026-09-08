@@ -37,38 +37,18 @@ xcheck-windows
    - 不允许在 Windows 主机直接原生运行 Linux 目标的编译/检查/测试。
 
 2. **Linux 主机 -> Windows 目标**：
-   - Windows 相关命令一律通过 `cross` 执行。
+   - Windows 相关命令一律通过 **QEMU Windows 虚拟机** 执行（当前使用 QEMU 而非 `cross`）。
    - 不允许在 Linux 主机直接用 `cargo` 原生跑 Windows 目标。
-   - `cross` 执行必须带上：
-     ```bash
-     CROSS_SKIP_AUTO_UPDATE=1
-     ```
+   - 由 `xtest-runner` 统一管理 QEMU 虚拟机的生命周期、SSH 等待、工作区同步及在虚拟机内部的原生执行。
 
 ## 环境设置 (Environment Setup)
 
 在 Linux 上执行 Windows 目标任务前，需准备：
 
-1. 安装 `cross`：
-   ```bash
-   cargo install cross
-   ```
-
-2. 添加 Windows GNU 目标工具链：
-   ```bash
-   rustup target add x86_64-pc-windows-gnu
-   ```
-
-若遇到跨设备链接错误（`os error 18`），使用：
-
-```bash
-RUSTUP_HOME=$HOME/.rustup TMPDIR=$HOME/.rustup/tmp rustup target add x86_64-pc-windows-gnu
-```
-
-`cross` 示例：
-
-```bash
-CROSS_SKIP_AUTO_UPDATE=1 cross test --target x86_64-pc-windows-gnu
-```
+1. 安装 QEMU（`qemu-system-x86_64`）。
+2. 安装 `ssh` 与 `sshpass`（推荐通过 devbox 管理，`xtest-runner` 会自动探测并加载 `.devbox/nix/profile/default/bin`）。
+3. 准备 Windows 虚拟机镜像：默认路径 `image/win2025-core-rust-gnu.qcow2`（可通过 `image/win2025-core-rust-gnu.json` 配置路径与认证信息）。
+4. 硬件虚拟化（推荐）：若 `/dev/kvm` 存在，`xtest-runner` 会自动启用 KVM 硬件加速（`-enable-kvm -cpu host`）；否则自动回退至 TCG 软件仿真。
 
 ## 提交前检查 (Pre-commit Checks)
 
