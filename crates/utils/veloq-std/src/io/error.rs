@@ -9,7 +9,7 @@ use crate::io::{
 };
 
 #[cfg(feature = "std")]
-use std::io::Error as StdIoError;
+use std::io::{Error as StdIoError, ErrorKind as StdErrorKind};
 
 use alloc::boxed::Box;
 
@@ -263,9 +263,9 @@ impl From<Error> for StdIoError {
     fn from(err: Error) -> Self {
         match err.repr {
             Repr::Os(code) => Self::from_raw_os_error(code),
-            Repr::Simple(kind) => Self::from(std::io::ErrorKind::from(kind)),
-            Repr::SimpleMessage(msg) => Self::new(std::io::ErrorKind::from(msg.kind), msg.message),
-            Repr::Custom(c) => Self::new(std::io::ErrorKind::from(c.kind), c.error),
+            Repr::Simple(kind) => Self::from(StdErrorKind::from(kind)),
+            Repr::SimpleMessage(msg) => Self::new(StdErrorKind::from(msg.kind), msg.message),
+            Repr::Custom(c) => Self::new(StdErrorKind::from(c.kind), c.error),
         }
     }
 }

@@ -42,4 +42,5 @@ workspace = true
 
 [dev-dependencies]
 trybuild = "1.0"
+loom.workspace = true
 

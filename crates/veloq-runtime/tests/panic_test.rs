@@ -1,8 +1,9 @@
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use veloq_runtime::{runtime::Runtime, scope, task::yield_now};
 
 #[test]
 fn test_panic_propagation() {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let result = catch_unwind(AssertUnwindSafe(|| {
         Runtime::<(), _>::scope(async |ctx| {
             println!("开始测试 Panic 传播...");
             scope!(ctx, async |s| -> () {

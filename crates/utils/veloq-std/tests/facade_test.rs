@@ -45,9 +45,10 @@ fn std_facade_exports_are_available() {
 #[cfg(unix)]
 #[test]
 fn unix_fd_facade_exports_are_available() {
+    use std::fs::File as StdFile;
     use veloq_std::os::fd::{AsRawFd, RawFd};
 
-    let file = std::fs::File::open("Cargo.toml").expect("workspace manifest should exist");
+    let file = StdFile::open("Cargo.toml").expect("workspace manifest should exist");
     let fd: RawFd = file.as_raw_fd();
     assert!(fd >= 0);
 }
@@ -55,6 +56,7 @@ fn unix_fd_facade_exports_are_available() {
 #[cfg(windows)]
 #[test]
 fn windows_handle_facade_exports_are_available() {
+    use std::{fs::File as StdFile, net::TcpStream as StdTcpStream};
     use veloq_std::os::windows::io::{
         AsRawHandle, AsRawSocket, IntoRawHandle, IntoRawSocket, RawHandle, RawSocket,
     };
@@ -64,10 +66,10 @@ fn windows_handle_facade_exports_are_available() {
     fn assert_into_handle<T: IntoRawHandle>() {}
     fn assert_into_socket<T: IntoRawSocket>() {}
 
-    assert_handle::<std::fs::File>();
-    assert_into_handle::<std::fs::File>();
-    assert_socket::<std::net::TcpStream>();
-    assert_into_socket::<std::net::TcpStream>();
+    assert_handle::<StdFile>();
+    assert_into_handle::<StdFile>();
+    assert_socket::<StdTcpStream>();
+    assert_into_socket::<StdTcpStream>();
 
     let _: Option<RawHandle> = None;
     let _: Option<RawSocket> = None;

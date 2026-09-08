@@ -2,6 +2,7 @@ use veloq_std::{
     marker::PhantomData,
     net::SocketAddr,
     ops::Deref,
+    ptr::null_mut,
     rc::Rc,
     sync::{Arc, Mutex},
 };
@@ -35,7 +36,7 @@ impl Drop for StashedBox {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             unsafe { (self.drop_fn)(self.ptr) };
-            self.ptr = std::ptr::null_mut();
+            self.ptr = null_mut();
         }
     }
 }
@@ -94,7 +95,7 @@ impl<'rt> SocketToken<'rt> {
         let mut guard = self.accept_stash.lock();
         if let Some(mut stashed) = guard.take() {
             let ptr = stashed.ptr;
-            stashed.ptr = std::ptr::null_mut();
+            stashed.ptr = null_mut();
             let boxed = unsafe { Box::from_raw(ptr as *mut T) };
             Some(*boxed)
         } else {
@@ -124,7 +125,7 @@ impl<'rt> SocketToken<'rt> {
         let mut guard = self.recv_stash.lock();
         if let Some(mut stashed) = guard.take() {
             let ptr = stashed.ptr;
-            stashed.ptr = std::ptr::null_mut();
+            stashed.ptr = null_mut();
             let boxed = unsafe { Box::from_raw(ptr as *mut T) };
             Some(*boxed)
         } else {

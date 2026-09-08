@@ -1,4 +1,4 @@
-use std::{cell::RefCell, num::NonZeroUsize, ptr::NonNull, sync::mpsc};
+use std::{cell::RefCell, fmt::Display, num::NonZeroUsize, ptr::NonNull, sync::mpsc};
 
 use diagweave::prelude::*;
 use veloq_buf::{
@@ -587,7 +587,7 @@ fn driver_failure<E>(
     error: E,
 ) -> diagweave::Report<RuntimeError>
 where
-    E: std::fmt::Display,
+    E: Display,
 {
     RuntimeError::DriverFailed {
         source: RuntimeDriverError {

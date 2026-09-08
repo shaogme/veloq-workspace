@@ -1,5 +1,5 @@
-use std::fmt;
 use std::task::Waker;
+use std::{error::Error, fmt};
 
 /// Channel capacity configuration
 #[derive(Debug, Clone, Copy)]
@@ -35,7 +35,7 @@ impl<T> fmt::Display for SendError<T> {
     }
 }
 
-impl<T> std::error::Error for SendError<T> {}
+impl<T> Error for SendError<T> {}
 
 /// Error type for non-blocking receive operations
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -53,7 +53,7 @@ impl fmt::Display for TryRecvError {
     }
 }
 
-impl std::error::Error for TryRecvError {}
+impl Error for TryRecvError {}
 
 /// Updates the stored waker if it does not match the current context waker.
 pub fn update_waker(waker_slot: &mut Option<Waker>, new_waker: &Waker) {

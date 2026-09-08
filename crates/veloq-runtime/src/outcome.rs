@@ -1,4 +1,4 @@
-use std::{convert::Infallible, result::Result as StdResult};
+use std::{convert::Infallible, fmt::Debug, result::Result as StdResult};
 
 /// Describes how a scope body completed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -163,7 +163,7 @@ impl<T, E> Outcome<T, E> {
 
 impl<T, E> Outcome<T, E>
 where
-    E: std::fmt::Debug,
+    E: Debug,
 {
     /// Returns the contained [`Outcome::Ok`] value, consuming `self`.
     ///
@@ -198,7 +198,7 @@ where
 
 impl<T, E> Outcome<T, E>
 where
-    T: std::fmt::Debug,
+    T: Debug,
 {
     /// Returns the contained [`Outcome::Err`] value, consuming `self`.
     ///

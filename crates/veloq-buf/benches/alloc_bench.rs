@@ -1,7 +1,11 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use std::hint::black_box;
-use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::{
+    hint::black_box,
+    num::NonZeroUsize,
+    sync::{Arc, Barrier},
+    thread::spawn,
+    time::Instant,
+};
 use veloq_buf::heap::{GlobalAllocatorConfig, GlobalSlotPool};
 use veloq_buf::{BufPool, SlotBasedPool};
 
@@ -33,8 +37,8 @@ fn find_fastest_cores(count: usize) -> Vec<core_affinity::CoreId> {
 
     let mut results = Vec::new();
     for id in core_ids {
-        let start = std::time::Instant::now();
-        let handle = std::thread::spawn(move || {
+        let start = Instant::now();
+        let handle = spawn(move || {
             core_affinity::set_for_current(id);
             let mut sum = 0u64;
             // A simple computation to stress the core
@@ -69,7 +73,7 @@ fn bench_threaded(c: &mut Criterion) {
 
         b.iter_custom(|iters| {
             // Barrier for 4 worker threads + 1 controller thread
-            let barrier = Arc::new(std::sync::Barrier::new(5));
+            let barrier = Arc::new(Barrier::new(5));
             let mut handles = Vec::with_capacity(4);
             let iters_per_thread = iters.div_ceil(4);
 
@@ -83,7 +87,7 @@ fn bench_threaded(c: &mut Criterion) {
                     None
                 };
 
-                handles.push(std::thread::spawn(move || {
+                handles.push(spawn(move || {
                     if let Some(core) = core_id {
                         core_affinity::set_for_current(core);
                     }
@@ -107,7 +111,7 @@ fn bench_threaded(c: &mut Criterion) {
 
             // Phase 1: Wait for workers to be ready
             barrier.wait();
-            let start = std::time::Instant::now();
+            let start = Instant::now();
 
             // Phase 2: Wait for workers to finish
             barrier.wait();

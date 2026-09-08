@@ -16,7 +16,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll, Waker},
-    thread::{sleep, yield_now as thread_yield},
+    thread::{scope, sleep, yield_now as thread_yield},
     time::Duration,
 };
 
@@ -189,7 +189,7 @@ fn a_parked_worker_wakes_on_a_foreign_thread_wake() {
     let slot: Mutex<Option<Waker>> = Mutex::new(None);
     let fired = AtomicBool::new(false);
 
-    std::thread::scope(|threads| {
+    scope(|threads| {
         threads.spawn(|| {
             loop {
                 let waker = slot.lock().expect("waker slot").take();

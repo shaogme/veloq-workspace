@@ -3,6 +3,7 @@ pub mod context;
 use std::{
     cell::RefCell,
     error::Error,
+    mem::transmute,
     num::NonZeroUsize,
     ops::AsyncFnOnce,
     sync::{Arc, mpsc},
@@ -245,7 +246,7 @@ impl<T: PoolTopology> Runtime<T> {
                 // SAFETY: runtime_ctx 内部包含的 RuntimeShared 悬挂指针在 block_on 期间始终有效，
                 // transmute 仅调整句柄的生命周期标记以匹配 Ctx<'s> 结构体定义。
                 let runtime_ctx = unsafe {
-                    std::mem::transmute::<
+                    transmute::<
                         async_runtime::RuntimeCtx<'_, WorkerState<'_>>,
                         async_runtime::RuntimeCtx<'_, WorkerState<'_>>,
                     >(runtime_ctx)

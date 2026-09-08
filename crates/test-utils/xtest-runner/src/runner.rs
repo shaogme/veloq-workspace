@@ -1,6 +1,10 @@
 use crate::{Config, RunnerError, Target, Task};
 use diagweave::prelude::*;
-use std::path::{Path, PathBuf};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    process::exit,
+};
 
 mod cmd;
 mod qemu;
@@ -97,7 +101,7 @@ impl Runner {
             if status.success() {
                 return Ok(());
             } else {
-                std::process::exit(status.code().unwrap_or(1));
+                exit(status.code().unwrap_or(1));
             }
         }
 
@@ -137,11 +141,18 @@ impl Runner {
 
     fn nextest_prebuild_command(&self) -> CommandSpec {
         let mut command = match self.config.target {
-            Target::Linux => linux_native_command(Task::Test, self.config.features.as_deref()),
+            Target::Linux => linux_native_command(
+                Task::Test,
+                self.config.features.as_deref(),
+                self.config.package.as_deref(),
+                self.config.filter.as_deref(),
+            ),
             Target::Windows => windows_native_command(
                 Task::Test,
                 self.config.features.as_deref(),
                 self.windows_target.as_deref(),
+                self.config.package.as_deref(),
+                self.config.filter.as_deref(),
             ),
         };
         command.args.push("--no-run".into());
@@ -259,7 +270,7 @@ impl Runner {
         if !self.config.quiet {
             eprintln!("[xtest-runner] 在 Windows 虚拟机中执行任务...");
         }
-        let forward_args = std::env::args().skip(1).collect::<Vec<_>>();
+        let forward_args = env::args().skip(1).collect::<Vec<_>>();
         let output = vm.run_in_vm(&forward_args, self.config.quiet)?;
 
         if output.status.success() {
@@ -271,7 +282,7 @@ impl Runner {
             if self.config.quiet {
                 print_output(&output);
             }
-            std::process::exit(output.status.code().unwrap_or(1));
+            exit(output.status.code().unwrap_or(1));
         }
     }
 
@@ -299,25 +310,35 @@ impl Runner {
                     "xtest-runner".into(),
                     "--".into(),
                 ]);
-                args.extend(std::env::args().skip(1));
+                args.extend(env::args().skip(1));
                 CommandSpec::new(program, args)
             }
             (RunMode::WindowsOnLinux, Target::Windows) => {
                 unreachable!("WindowsOnLinux 由 QEMU 直接管理执行")
             }
-            (_, Target::Linux) => {
-                linux_native_command(self.config.task, self.config.features.as_deref())
-            }
+            (_, Target::Linux) => linux_native_command(
+                self.config.task,
+                self.config.features.as_deref(),
+                self.config.package.as_deref(),
+                self.config.filter.as_deref(),
+            ),
             (_, Target::Windows) => windows_native_command(
                 self.config.task,
                 self.config.features.as_deref(),
                 self.windows_target.as_deref(),
+                self.config.package.as_deref(),
+                self.config.filter.as_deref(),
             ),
         }
     }
 }
 
-fn linux_native_command(task: Task, features: Option<&str>) -> CommandSpec {
+fn linux_native_command(
+    task: Task,
+    features: Option<&str>,
+    package: Option<&str>,
+    filter: Option<&str>,
+) -> CommandSpec {
     let mut args = match task {
         Task::Test => vec!["nextest".into(), "run".into()],
         Task::Clippy => vec!["clippy".into()],
@@ -329,17 +350,28 @@ fn linux_native_command(task: Task, features: Option<&str>) -> CommandSpec {
         args.push(f.into());
     }
 
+    if let Some(package) = package {
+        args.push("--package".into());
+        args.push(package.into());
+    }
+
     match task {
         Task::Test => {
+            if package.is_none() {
+                args.push("--workspace".into());
+                args.push("--exclude".into());
+                args.push("veloq-driver-iocp".into());
+            }
             args.extend(vec![
-                "--workspace".into(),
-                "--exclude".into(),
-                "veloq-driver-iocp".into(),
                 "--test-threads".into(),
                 "1".into(),
                 "--run-ignored".into(),
                 "all".into(),
             ]);
+            if let Some(filter) = filter {
+                args.push("-E".into());
+                args.push(filter.into());
+            }
         }
         Task::Clippy => {
             args.extend(vec![
@@ -355,7 +387,13 @@ fn linux_native_command(task: Task, features: Option<&str>) -> CommandSpec {
     CommandSpec::new("cargo", args)
 }
 
-fn windows_native_command(task: Task, features: Option<&str>, target: Option<&str>) -> CommandSpec {
+fn windows_native_command(
+    task: Task,
+    features: Option<&str>,
+    target: Option<&str>,
+    package: Option<&str>,
+    filter: Option<&str>,
+) -> CommandSpec {
     let mut args = match task {
         Task::Test => vec!["nextest".into(), "run".into()],
         Task::Clippy => vec!["clippy".into()],
@@ -367,17 +405,28 @@ fn windows_native_command(task: Task, features: Option<&str>, target: Option<&st
         args.push(f.into());
     }
 
+    if let Some(package) = package {
+        args.push("--package".into());
+        args.push(package.into());
+    }
+
     match task {
         Task::Test => {
+            if package.is_none() {
+                args.push("--workspace".into());
+                args.push("--exclude".into());
+                args.push("veloq-driver-uring".into());
+            }
             args.extend(vec![
-                "--workspace".into(),
-                "--exclude".into(),
-                "veloq-driver-uring".into(),
                 "--test-threads".into(),
                 "1".into(),
                 "--run-ignored".into(),
                 "all".into(),
             ]);
+            if let Some(filter) = filter {
+                args.push("-E".into());
+                args.push(filter.into());
+            }
         }
         Task::Clippy => {
             args.extend(vec!["--all-targets".into()]);

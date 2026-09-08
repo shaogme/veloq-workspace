@@ -1,6 +1,7 @@
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_queue::ArrayQueue;
 use std::{
+    result::Result as StdResult,
     sync::Arc,
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     thread,
@@ -282,7 +283,7 @@ pub(crate) struct WorkerRegistry {
 
 impl WorkerRegistry {
     #[inline]
-    pub(crate) fn unpark(&self, worker_id: usize) -> std::result::Result<(), RuntimeWakeError> {
+    pub(crate) fn unpark(&self, worker_id: usize) -> StdResult<(), RuntimeWakeError> {
         self.unparkers[worker_id].unpark()
     }
 }

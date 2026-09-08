@@ -1,4 +1,6 @@
-use std::{num::NonZeroUsize, ops::AsyncFnOnce, pin::pin, ptr, sync::Mutex, thread};
+use std::{
+    marker::PhantomData, num::NonZeroUsize, ops::AsyncFnOnce, pin::pin, ptr, sync::Mutex, thread,
+};
 
 use crate::{
     error::{Result, RuntimeError},
@@ -24,7 +26,7 @@ pub struct Runtime<'rt, 'env: 'rt, T, WF: 'rt> {
     shared: RuntimeShared<T>,
     receivers: Option<Receivers>,
     worker_factory: Option<WF>,
-    _marker: std::marker::PhantomData<fn(&'rt ()) -> &'env ()>,
+    _marker: PhantomData<fn(&'rt ()) -> &'env ()>,
 }
 
 pub type DefaultWorkerFactory = fn(usize, &RuntimeShared<()>) -> ();
@@ -330,7 +332,7 @@ impl<T, WF> RuntimeBuilder<T, WF> {
             shared,
             receivers: Some(receivers),
             worker_factory: self.worker_factory,
-            _marker: std::marker::PhantomData,
+            _marker: PhantomData,
         };
         rt.block_on(f)
     }

@@ -1,6 +1,7 @@
 #![cfg(feature = "loom")]
 use loom::thread;
 use std::future::Future;
+use std::ptr;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use veloq_sync::oneshot;
 
@@ -16,7 +17,7 @@ fn noop_waker() -> Waker {
     static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
 
     fn noop_raw_waker() -> RawWaker {
-        RawWaker::new(std::ptr::null(), &VTABLE)
+        RawWaker::new(ptr::null(), &VTABLE)
     }
 
     unsafe { Waker::from_raw(noop_raw_waker()) }

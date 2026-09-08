@@ -5,6 +5,7 @@ use std::{
     collections::VecDeque,
     env,
     fs::remove_file,
+    io::Error as IoError,
     num::NonZeroUsize,
     path::{Path, PathBuf},
     process::id,
@@ -466,7 +467,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                                             let _ = remove_file(path);
                                         }
 
-                                        Ok::<u64, std::io::Error>(bytes)
+                                        Ok::<u64, IoError>(bytes)
                                     },
                                 ));
                             }

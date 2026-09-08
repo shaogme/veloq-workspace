@@ -1,10 +1,14 @@
-use std::cell::{Cell, UnsafeCell};
-use std::fmt;
-use std::future::Future;
-use std::mem::ManuallyDrop;
-use std::pin::Pin;
-use std::rc::Rc;
-use std::task::{Context, Poll, Waker};
+use std::{
+    cell::{Cell, UnsafeCell},
+    error::Error,
+    fmt,
+    future::Future,
+    mem::ManuallyDrop,
+    pin::Pin,
+    ptr,
+    rc::Rc,
+    task::{Context, Poll, Waker},
+};
 
 pub use crate::common::TryRecvError;
 use crate::common::update_waker;
@@ -19,7 +23,7 @@ impl fmt::Display for RecvError {
     }
 }
 
-impl std::error::Error for RecvError {}
+impl Error for RecvError {}
 
 pub struct State<T> {
     value: UnsafeCell<Option<T>>,
@@ -202,7 +206,7 @@ impl<T> OwnedSender<T> {
     /// Sends a value on the channel.
     pub fn send(self, t: T) -> Result<(), T> {
         let this = ManuallyDrop::new(self);
-        let state = unsafe { std::ptr::read(&*this.state) };
+        let state = unsafe { ptr::read(&*this.state) };
         let sender = Sender { state: &state };
         sender.send(t)
     }

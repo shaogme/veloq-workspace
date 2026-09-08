@@ -3,9 +3,9 @@ use crate::{error::Result, fs::error::FsError, runtime::context::Ctx};
 use diagweave::prelude::*;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
-#[cfg(windows)]
-use std::os::windows::ffi::OsStrExt;
 use std::{cell::Cell, num::NonZeroUsize, path::Path, sync::atomic::AtomicU64};
+#[cfg(windows)]
+use std::{os::windows::ffi::OsStrExt, ptr::copy_nonoverlapping};
 
 use veloq_driver_native::{
     OwnedRawHandle,
@@ -237,7 +237,7 @@ impl OpenOptions {
         }
 
         unsafe {
-            std::ptr::copy_nonoverlapping(
+            copy_nonoverlapping(
                 path_w.as_ptr() as *const u8,
                 slice.as_mut_ptr(),
                 len_bytes.get(),

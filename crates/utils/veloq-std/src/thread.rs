@@ -1,6 +1,9 @@
 pub mod traits;
 use traits::*;
 
+#[cfg(feature = "std")]
+use std::thread::panicking as panicking_std;
+
 mod parker;
 mod sys;
 pub use sys::{RawJoinHandle, RawThreadError, Systerm};
@@ -228,7 +231,7 @@ pub fn available_parallelism() -> Result<NonZeroUsize, ThreadError> {
 pub fn panicking() -> bool {
     #[cfg(feature = "std")]
     {
-        std::thread::panicking()
+        panicking_std()
     }
     #[cfg(not(feature = "std"))]
     {

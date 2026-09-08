@@ -1,5 +1,5 @@
 #![cfg(not(feature = "loom"))]
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use veloq_sync::rwlock::RwLock;
 
 #[tokio::test]
@@ -66,7 +66,7 @@ async fn test_rwlock_downgrade() {
     });
 
     // Ensure reader spawns and likely hits the lock
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // 3. Downgrade
     // This transitions from Write -> Read and should wake the reader.

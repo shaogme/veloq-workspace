@@ -3,6 +3,7 @@ use std::{
     net::SocketAddr,
     num::NonZeroUsize,
     ops::AsyncFnOnce,
+    pin::pin,
     str,
     sync::{
         Arc,
@@ -339,7 +340,7 @@ fn udp_read_exact_write_all() {
             s.spawn_boxed(async move {
                 let read_buf = ctx.alloc_full(nz!(16));
                 let read_fut = socket_server.read_exact(read_buf);
-                let mut read_fut = std::pin::pin!(read_fut);
+                let mut read_fut = pin!(read_fut);
                 select! {
                     ctx;
                     biased;

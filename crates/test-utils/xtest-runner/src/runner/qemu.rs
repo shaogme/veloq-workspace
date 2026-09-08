@@ -1,6 +1,6 @@
 use crate::RunnerError;
 use std::{
-    fs,
+    env, fs,
     io::{Error, ErrorKind},
     net::TcpListener,
     path::{Path, PathBuf},
@@ -266,15 +266,15 @@ impl QemuInstance {
 pub fn ensure_devbox_path(workspace_root: &Path) {
     let devbox_bin = workspace_root.join(".devbox/nix/profile/default/bin");
     if devbox_bin.exists()
-        && let Some(current_path) = std::env::var_os("PATH")
+        && let Some(current_path) = env::var_os("PATH")
     {
-        let mut paths = std::env::split_paths(&current_path).collect::<Vec<_>>();
+        let mut paths = env::split_paths(&current_path).collect::<Vec<_>>();
         if !paths.iter().any(|p| p == &devbox_bin) {
             paths.insert(0, devbox_bin);
-            if let Ok(new_path) = std::env::join_paths(paths) {
+            if let Ok(new_path) = env::join_paths(paths) {
                 // SAFETY: In single-threaded runner setup before spawning threads.
                 unsafe {
-                    std::env::set_var("PATH", new_path);
+                    env::set_var("PATH", new_path);
                 }
             }
         }

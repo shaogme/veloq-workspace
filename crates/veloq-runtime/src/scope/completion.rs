@@ -1,5 +1,7 @@
 use crate::{
-    runtime::primitives::{GenericCancellationToken, Unparker, create_unpark_waker},
+    runtime::primitives::{
+        CancelWaiterLinkResult, GenericCancellationToken, Unparker, create_unpark_waker,
+    },
     task::{
         AnyScopeRef, ErasedCancellationToken, RawScope, ScopeCancelWaiter, ScopeParent,
         ScopeStorage,
@@ -360,7 +362,11 @@ impl<S: ScopeStorage, O: Ownership + 'static> RawScope for GenericScopeCompletio
     }
 
     #[inline]
-    unsafe fn link_cancel_waiter(&self, waiter: NonNull<ScopeCancelWaiter>, waker: &Waker) -> bool {
+    unsafe fn link_cancel_waiter(
+        &self,
+        waiter: NonNull<ScopeCancelWaiter>,
+        waker: &Waker,
+    ) -> CancelWaiterLinkResult {
         unsafe { self.cancel_token().link_cancel_waiter(waiter, waker) }
     }
 

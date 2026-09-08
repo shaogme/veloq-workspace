@@ -1,5 +1,5 @@
 use diagweave::{Report, set};
-use std::{borrow::Cow, fmt, result::Result as StdResult};
+use std::{borrow::Cow, error::Error, fmt, result::Result as StdResult};
 
 /// 后端 remote waker 失败时跨 runtime 边界传递的稳定诊断。
 ///
@@ -23,7 +23,7 @@ impl fmt::Display for RuntimeWakeError {
     }
 }
 
-impl std::error::Error for RuntimeWakeError {}
+impl Error for RuntimeWakeError {}
 
 /// Driver 在 runtime 边界失败时使用的稳定诊断。
 ///
@@ -48,7 +48,7 @@ impl fmt::Display for RuntimeDriverError {
     }
 }
 
-impl std::error::Error for RuntimeDriverError {}
+impl Error for RuntimeDriverError {}
 
 set! {
     pub RuntimeError = {

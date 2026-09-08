@@ -1,6 +1,10 @@
 use crate::RunnerError;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::{
+    fs,
+    io::{Error, ErrorKind},
+    path::{Path, PathBuf},
+    process::{Command, ExitStatus, Output},
+};
 
 #[derive(Clone, Copy, Debug)]
 pub enum DockerComposeVariant {
@@ -85,7 +89,7 @@ pub fn workspace_root() -> Result<PathBuf, RunnerError> {
     while let Some(parent) = current.parent() {
         let cargo_toml = parent.join("Cargo.toml");
         if cargo_toml.exists()
-            && let Ok(content) = std::fs::read_to_string(&cargo_toml)
+            && let Ok(content) = fs::read_to_string(&cargo_toml)
             && content.contains("[workspace]")
         {
             return Ok(parent.to_path_buf());
@@ -104,10 +108,10 @@ pub fn workspace_root() -> Result<PathBuf, RunnerError> {
 pub fn command_status(
     command: &CommandSpec,
     workspace_root: &Path,
-) -> Result<std::process::ExitStatus, RunnerError> {
+) -> Result<ExitStatus, RunnerError> {
     if !workspace_root.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
+        return Err(Error::new(
+            ErrorKind::NotFound,
             format!("Workspace root does not exist: {:?}", workspace_root),
         )
         .into());
@@ -122,8 +126,8 @@ pub fn command_status(
 
 pub fn command_output(command: &CommandSpec, workspace_root: &Path) -> Result<Output, RunnerError> {
     if !workspace_root.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
+        return Err(Error::new(
+            ErrorKind::NotFound,
             format!("Workspace root does not exist: {:?}", workspace_root),
         )
         .into());

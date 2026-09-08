@@ -436,6 +436,17 @@ pub struct GenericCancellationToken<S: Storage, O: Ownership> {
     pub(crate) inner: O::Shared<GenericCancellationTokenInner<S, O>>,
 }
 
+/// 任务取消等待节点的注册结果。
+///
+/// `Linked` 表示节点已经由本令牌保护，调用方必须在节点摘除或被取消排空前
+/// 保持其地址有效。`RejectedByCancellation` 只表示本令牌的本地取消，且本次
+/// 调用不会把节点留在链表中；跨作用域父取消由注册后的任务状态复查处理。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelWaiterLinkResult {
+    Linked,
+    RejectedByCancellation,
+}
+
 pub type ChildList<S, O> = <S as Storage>::Lock<LinkedList<CancellationTokenAdapter<S, O>>>;
 pub type ParentSlot<S, O> =
     <S as Storage>::Lock<Option<<O as Ownership>::Weak<GenericCancellationTokenInner<S, O>>>>;
@@ -489,6 +500,9 @@ impl<S: Storage, O: Ownership> GenericCancellationTokenInner<S, O> {
             return;
         }
 
+        // `cancelled` 的发布先于取得 `task_waiters` 锁。注册者若已经持锁入链，
+        // 本次排空会在释放锁后看到它；注册者若之后才取得锁，则锁内检查必然拒绝。
+        // 因此成功发布取消后，不会再有路径把新节点写入本令牌的等待链表。
         self.wake_waiters();
 
         let mut pending = self.detach_children();
@@ -584,7 +598,11 @@ impl<S: Storage, O: Ownership> GenericCancellationToken<S, O> {
         }
     }
 
-    /// 把任务的等待节点挂到本令牌上；已取消时返回 `false` 且不入链。
+    /// 把任务的等待节点挂到本令牌上。
+    ///
+    /// 本地取消判断、waker 更新和首次入链在线性化锁内完成。取消标志发布后，
+    /// 只有已经持有这把锁的注册者能够先入链，并随后由同一次取消排空；之后取得
+    /// 锁的注册者会得到 [`CancelWaiterLinkResult::RejectedByCancellation`]。
     ///
     /// # Safety
     ///
@@ -593,31 +611,28 @@ impl<S: Storage, O: Ownership> GenericCancellationToken<S, O> {
         &self,
         waiter: NonNull<ScopeCancelWaiter>,
         waker: &Waker,
-    ) -> bool {
-        if self.is_cancelled() {
-            return false;
+    ) -> CancelWaiterLinkResult {
+        let mut waiters = self.inner.task_waiters.lock();
+        if self.inner.cancelled.load(Ordering::Acquire) != 0 {
+            return CancelWaiterLinkResult::RejectedByCancellation;
         }
 
-        {
-            let mut waiters = self.inner.task_waiters.lock();
-            unsafe {
-                let waiter_ref = waiter.as_ref();
-                waiter_ref.set_waker(waker);
-                if !waiter_ref.link.is_linked() {
-                    waiters.push_back(Pin::new_unchecked(&mut *waiter.as_ptr()));
-                }
+        unsafe {
+            let waiter_ref = waiter.as_ref();
+            waiter_ref.set_waker(waker);
+            if !waiter_ref.link.is_linked() {
+                waiters.push_back(Pin::new_unchecked(&mut *waiter.as_ptr()));
             }
         }
+        drop(waiters);
 
         if let Some(ref parent) = self.inner.cross_parent {
             // 跨策略嵌套（local scope 挂在 send scope 下）走不了令牌树，只能退回
-            // 父 scope 的 waker 队列。
+            // 父 scope 的 waker 队列。父取消不改变本地注册结果；任务头随后复查。
             parent.register_cancel_waker(waker);
         }
 
-        // 入链与取消之间的窗口：若此刻已被取消，队列可能已经被 drain 过，
-        // 由调用方按「已取消」处理。
-        !self.is_cancelled()
+        CancelWaiterLinkResult::Linked
     }
 
     /// # Safety
@@ -784,11 +799,17 @@ impl EventCount {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "loom"))]
+    use crate::scope::GenericScopeCompletion;
+    #[cfg(not(feature = "loom"))]
+    use crate::task::{RawScope, ScopeRef};
+    use crate::utils::ownership::ArcOwnership;
     use std::{
         sync::atomic::{AtomicUsize, Ordering},
-        thread::sleep,
+        thread::{scope, sleep},
         time::Duration,
     };
+    use veloq_storage::AtomicStorage;
 
     struct FailingWaker {
         calls: AtomicUsize,
@@ -823,7 +844,7 @@ mod tests {
         // 消耗掉可能存在的初始状态，确保真的会睡下去。
         assert!(!unparker.inner.signal.is_notified());
 
-        std::thread::scope(|threads| {
+        scope(|threads| {
             threads.spawn(|| {
                 sleep(Duration::from_millis(20));
                 unparker.unpark().expect("unpark failed");
@@ -885,5 +906,152 @@ mod tests {
         assert!(unparker.inner.failure.is_failed());
         assert!(unparker.inner.failure.first_error().is_some());
         assert!(unparker.inner.signal.is_notified());
+    }
+
+    fn new_cancel_waiter() -> ScopeCancelWaiter {
+        ScopeCancelWaiter::new()
+    }
+
+    #[cfg(not(feature = "loom"))]
+    #[test]
+    fn cancel_waiter_registration_rejects_after_local_cancel() {
+        let token = GenericCancellationToken::<AtomicStorage, ArcOwnership>::new();
+        token.cancel();
+        let waiter = new_cancel_waiter();
+        let waiter_ptr = NonNull::from(&waiter);
+
+        let result = unsafe { token.link_cancel_waiter(waiter_ptr, Waker::noop()) };
+
+        assert_eq!(result, CancelWaiterLinkResult::RejectedByCancellation);
+        assert!(!waiter.link.is_linked());
+        assert!(token.inner.task_waiters.lock().is_empty());
+
+        unsafe {
+            token.unlink_cancel_waiter(waiter_ptr);
+            token.unlink_cancel_waiter(waiter_ptr);
+        }
+    }
+
+    #[cfg(not(feature = "loom"))]
+    #[test]
+    fn cancel_drains_registered_waiter_and_repeated_unlink_is_safe() {
+        let token = GenericCancellationToken::<AtomicStorage, ArcOwnership>::new();
+        let waiter = new_cancel_waiter();
+        let waiter_ptr = NonNull::from(&waiter);
+
+        assert_eq!(
+            unsafe { token.link_cancel_waiter(waiter_ptr, Waker::noop()) },
+            CancelWaiterLinkResult::Linked
+        );
+        assert!(waiter.link.is_linked());
+        assert_eq!(token.inner.task_waiters.lock().len(), 1);
+
+        token.cancel();
+
+        assert!(!waiter.link.is_linked());
+        assert!(token.inner.task_waiters.lock().is_empty());
+        unsafe {
+            token.unlink_cancel_waiter(waiter_ptr);
+            token.unlink_cancel_waiter(waiter_ptr);
+        }
+    }
+
+    #[cfg(not(feature = "loom"))]
+    #[test]
+    fn registration_after_cancel_publication_is_rejected_under_lock() {
+        let token = GenericCancellationToken::<AtomicStorage, ArcOwnership>::new();
+        let waiter = new_cancel_waiter();
+        let waiter_ptr = NonNull::from(&waiter);
+
+        token.inner.cancelled.store(1, Ordering::Release);
+        assert_eq!(
+            unsafe { token.link_cancel_waiter(waiter_ptr, Waker::noop()) },
+            CancelWaiterLinkResult::RejectedByCancellation
+        );
+
+        assert!(!waiter.link.is_linked());
+        assert!(token.inner.task_waiters.lock().is_empty());
+    }
+
+    #[cfg(not(feature = "loom"))]
+    #[test]
+    fn repeated_waiter_registration_updates_without_duplicate_link() {
+        let token = GenericCancellationToken::<AtomicStorage, ArcOwnership>::new();
+        let waiter = new_cancel_waiter();
+        let waiter_ptr = NonNull::from(&waiter);
+
+        assert_eq!(
+            unsafe { token.link_cancel_waiter(waiter_ptr, Waker::noop()) },
+            CancelWaiterLinkResult::Linked
+        );
+        assert_eq!(
+            unsafe { token.link_cancel_waiter(waiter_ptr, Waker::noop()) },
+            CancelWaiterLinkResult::Linked
+        );
+        assert_eq!(token.inner.task_waiters.lock().len(), 1);
+
+        unsafe { token.unlink_cancel_waiter(waiter_ptr) };
+        assert!(!waiter.link.is_linked());
+    }
+
+    #[cfg(not(feature = "loom"))]
+    #[test]
+    fn parent_cancellation_does_not_reject_local_registration() {
+        let parent = GenericScopeCompletion::<AtomicStorage, ArcOwnership>::new(None);
+        let parent_scope = unsafe { ScopeRef::new(RawScope::clone_raw(parent.as_ref())) };
+        let token = GenericCancellationToken::<AtomicStorage, ArcOwnership>::new_with_parent(Some(
+            AnySendScopeRef::new(parent_scope),
+        ));
+        let waiter = new_cancel_waiter();
+        let waiter_ptr = NonNull::from(&waiter);
+
+        assert_eq!(
+            unsafe { token.link_cancel_waiter(waiter_ptr, Waker::noop()) },
+            CancelWaiterLinkResult::Linked
+        );
+        parent.cancel();
+        assert!(token.is_cancelled());
+        assert!(waiter.link.is_linked());
+
+        unsafe { token.unlink_cancel_waiter(waiter_ptr) };
+        assert!(!waiter.link.is_linked());
+        assert!(token.inner.task_waiters.lock().is_empty());
+    }
+
+    #[cfg(feature = "loom")]
+    #[test]
+    fn loom_cancel_and_register_leave_waiter_unlinked() {
+        struct SharedWaiter(ScopeCancelWaiter);
+
+        unsafe impl Send for SharedWaiter {}
+        unsafe impl Sync for SharedWaiter {}
+
+        loom::model(|| {
+            let token = loom::sync::Arc::new(
+                GenericCancellationToken::<AtomicStorage, ArcOwnership>::new(),
+            );
+            let waiter = loom::sync::Arc::new(SharedWaiter(new_cancel_waiter()));
+            let register_token = token.clone();
+            let register_waiter = waiter.clone();
+            let register = loom::thread::spawn(move || {
+                let waiter_ptr = NonNull::from(&register_waiter.0);
+                unsafe { register_token.link_cancel_waiter(waiter_ptr, Waker::noop()) }
+            });
+
+            let cancel_token = token.clone();
+            let cancel = loom::thread::spawn(move || {
+                cancel_token.cancel();
+            });
+
+            let result = register.join().expect("registration thread panicked");
+            cancel.join().expect("cancellation thread panicked");
+
+            assert!(matches!(
+                result,
+                CancelWaiterLinkResult::Linked | CancelWaiterLinkResult::RejectedByCancellation
+            ));
+            assert!(!waiter.0.link.is_linked());
+            assert!(token.inner.task_waiters.lock().is_empty());
+        });
     }
 }

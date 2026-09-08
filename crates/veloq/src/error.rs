@@ -1,4 +1,5 @@
 use diagweave::{report::Report, union};
+use std::result::Result as StdResult;
 
 union! {
     pub enum Error =
@@ -9,4 +10,4 @@ union! {
         veloq_runtime::error::RuntimeError as Runtime
 }
 
-pub type Result<T> = std::result::Result<T, Report<Error>>;
+pub type Result<T> = StdResult<T, Report<Error>>;

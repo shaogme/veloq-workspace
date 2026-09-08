@@ -2,6 +2,7 @@ use std::{
     env,
     fs::remove_file,
     num::NonZeroUsize,
+    ops::AsyncFnOnce,
     path::{Path, PathBuf},
     process,
     sync::{
@@ -9,11 +10,13 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
 };
+
 use veloq::{
     fs::{File, LocalFile},
     io::{AsyncBufRead, AsyncBufWrite},
     nz,
     runtime::Runtime,
+    runtime::context::Ctx,
 };
 use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier};
 
@@ -41,7 +44,7 @@ impl Drop for CleanupGuard {
 
 fn run_with_runtime<F, R>(f: F) -> R
 where
-    F: for<'s> std::ops::AsyncFnOnce(veloq::runtime::context::Ctx<'s>) -> R,
+    F: for<'s> AsyncFnOnce(Ctx<'s>) -> R,
 {
     Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(4))))
         .worker_count(Some(nz!(1)))

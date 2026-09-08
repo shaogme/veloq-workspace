@@ -2,6 +2,7 @@ use super::header::GenericTaskHeader;
 use crate::runtime::primitives::{EventCount, Unparker};
 use crossbeam_queue::SegQueue;
 use std::{
+    hint::spin_loop,
     marker::PhantomData,
     ops::Deref,
     ptr::NonNull,
@@ -155,7 +156,7 @@ impl<S: Storage> TaskWakeToken<S> {
                 Ok(_) => return Some(TaskWakeGuard { token: self }),
                 Err(actual) => {
                     state = actual;
-                    std::hint::spin_loop();
+                    spin_loop();
                 }
             }
         }
@@ -185,7 +186,7 @@ impl<S: Storage> TaskWakeToken<S> {
             }
 
             if spin_count < SPIN_LIMIT {
-                std::hint::spin_loop();
+                spin_loop();
                 spin_count += 1;
             } else if spin_count == SPIN_LIMIT {
                 yield_now();

@@ -1,4 +1,5 @@
 use diagweave::set;
+use std::io::Error as IoError;
 
 set! {
     pub TcpError = {
@@ -46,6 +47,6 @@ set! {
         WriteZero,
 
         #[display("failed to resolve address")]
-        ToSocketAddrs(std::io::Error),
+        ToSocketAddrs(IoError),
     }
 }

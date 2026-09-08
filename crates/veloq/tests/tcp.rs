@@ -1,11 +1,14 @@
 use std::{
-    net::SocketAddr,
+    future::poll_fn,
+    net::{SocketAddr, TcpStream as StdTcpStream},
     num::NonZeroUsize,
     ops::AsyncFnOnce,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    thread::spawn,
 };
 
 use futures_util::StreamExt;
@@ -542,9 +545,9 @@ fn a_local_listener_streams_connections_without_a_detached_op() {
         let listener = LocalTcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
         let listen_addr = listener.local_addr().expect("Failed to get local address");
 
-        let clients = std::thread::spawn(move || {
+        let clients = spawn(move || {
             for _ in 0..CONNECTIONS {
-                let stream = std::net::TcpStream::connect(listen_addr).expect("Failed to connect");
+                let stream = StdTcpStream::connect(listen_addr).expect("Failed to connect");
                 drop(stream);
             }
         });
@@ -775,9 +778,9 @@ fn recv_multi_falls_back_when_provided_buffers_unavailable() {
                 let mut chunks = stream
                     .recv_multi()
                     .expect("recv_multi must fallback and succeed");
-                let polled = std::future::poll_fn(|cx| {
+                let polled = poll_fn(|cx| {
                     use futures_core::Stream;
-                    unsafe { std::pin::Pin::new_unchecked(&mut chunks) }.poll_next(cx)
+                    unsafe { Pin::new_unchecked(&mut chunks) }.poll_next(cx)
                 })
                 .await;
                 let buf = polled

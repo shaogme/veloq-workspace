@@ -1,6 +1,9 @@
 #[cfg(feature = "std")]
 pub use std::panic::*;
 
+#[cfg(feature = "std")]
+use std::panic::{AssertUnwindSafe as StdAssertUnwindSafe, catch_unwind as std_catch_unwind};
+
 #[cfg(not(feature = "std"))]
 pub use core::panic::*;
 
@@ -16,7 +19,7 @@ where
 {
     #[cfg(feature = "std")]
     {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(Some)
+        std_catch_unwind(StdAssertUnwindSafe(f)).map_err(Some)
     }
 }
 

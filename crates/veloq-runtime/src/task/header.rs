@@ -1,6 +1,6 @@
 use crate::{
     error::{Result, RuntimeError},
-    runtime::{EnqueuePinnedOutcome, RuntimeSharedBase},
+    runtime::{EnqueuePinnedOutcome, RuntimeSharedBase, primitives::CancelWaiterLinkResult},
     task::{
         LocalWakeHeaderGuard, RawScope, ScopeCancelWaiter, ScopeRef, SendTaskRef, TaskHandleRef,
         TaskWakeToken, nodes::TaskStorage,
@@ -170,22 +170,26 @@ impl<S: Storage> GenericTaskHeader<S> {
     /// 把任务自己挂到所属 scope 的取消队列上，使 scope 取消能唤醒它。
     ///
     /// 在任务第一次返回 `Pending`（即它不再位于任何队列中）时调用一次即可：waker 由同一个
-    /// `TaskWakeToken` 派生，跨 poll 稳定。返回 `false` 表示 scope 已取消 —— 调用方应当
-    /// 立刻按取消处理，因为取消队列可能已经被 drain 过了。
+    /// `TaskWakeToken` 派生，跨 poll 稳定。armed 状态在注册协议前发布，表示任务可能需要
+    /// 清理节点，而不是证明节点已经入链。注册拒绝时仍执行幂等清理。
     pub(crate) fn arm_scope_cancel_waiter(&self, waker: &Waker) -> bool {
-        if self.state.load(Ordering::Acquire) & STATE_CANCEL_ARMED != 0 {
+        let old_state = self.state.fetch_or(STATE_CANCEL_ARMED, Ordering::AcqRel);
+        if old_state & STATE_CANCEL_ARMED != 0 {
             return true;
         }
 
         let waiter = NonNull::from(&self.cancel_waiter);
-        if !unsafe {
+        let result = unsafe {
             self.scope_completion_ref()
                 .link_cancel_waiter(waiter, waker)
-        } {
-            return false;
+        };
+        match result {
+            CancelWaiterLinkResult::Linked => true,
+            CancelWaiterLinkResult::RejectedByCancellation => {
+                self.disarm_scope_cancel_waiter();
+                false
+            }
         }
-        self.state.fetch_or(STATE_CANCEL_ARMED, Ordering::AcqRel);
-        true
     }
 
     /// 摘除取消等待节点。必须在 header 析构前完成：`Link` 在仍然入链时析构会 panic。
@@ -684,6 +688,8 @@ impl<S: Storage> Drop for GenericTaskHeader<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "loom"))]
+    use crate::{scope::GenericScopeCompletion, utils::ownership::ArcOwnership};
     use std::sync::atomic::AtomicU32;
     use veloq_intrusive_linklist::Link;
 
@@ -803,5 +809,47 @@ mod tests {
         // 幂等：重复调用不会再次结算。
         header.abandon_before_enqueue();
         assert!(!header.try_acknowledge_completion());
+    }
+
+    #[cfg(not(feature = "loom"))]
+    fn header_with_scope_cancelled() -> GenericTaskHeader<AtomicStorage> {
+        let completion = GenericScopeCompletion::<AtomicStorage, ArcOwnership>::new(None);
+        let scope_ptr = unsafe { RawScope::clone_raw(completion.as_ref()) };
+        let header = GenericTaskHeader::<AtomicStorage>::new_placeholder(&TEST_VTABLE);
+        unsafe {
+            *header.scope.get() = ScopeRef::new(scope_ptr);
+        }
+        completion.cancel();
+        header
+    }
+
+    #[cfg(not(feature = "loom"))]
+    #[test]
+    fn rejected_scope_waiter_registration_disarms_before_drop() {
+        let header = header_with_scope_cancelled();
+
+        assert!(!header.arm_scope_cancel_waiter(Waker::noop()));
+        assert_eq!(header.state.load(Ordering::Acquire) & STATE_CANCEL_ARMED, 0);
+        assert!(!header.cancel_waiter.link.is_linked());
+    }
+
+    #[cfg(not(feature = "loom"))]
+    #[test]
+    fn scope_waiter_disarm_is_idempotent_after_registration() {
+        let completion = GenericScopeCompletion::<AtomicStorage, ArcOwnership>::new(None);
+        let scope_ptr = unsafe { RawScope::clone_raw(completion.as_ref()) };
+        let header = GenericTaskHeader::<AtomicStorage>::new_placeholder(&TEST_VTABLE);
+        unsafe {
+            *header.scope.get() = ScopeRef::new(scope_ptr);
+        }
+
+        assert!(header.arm_scope_cancel_waiter(Waker::noop()));
+        assert!(header.cancel_waiter.link.is_linked());
+
+        header.disarm_scope_cancel_waiter();
+        header.disarm_scope_cancel_waiter();
+
+        assert_eq!(header.state.load(Ordering::Acquire) & STATE_CANCEL_ARMED, 0);
+        assert!(!header.cancel_waiter.link.is_linked());
     }
 }

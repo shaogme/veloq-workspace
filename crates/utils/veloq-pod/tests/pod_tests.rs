@@ -1,3 +1,4 @@
+use std::mem::size_of;
 use veloq_pod::*;
 
 #[test]
@@ -71,7 +72,7 @@ fn test_zeroable() {
     unsafe impl Zeroable for MyStruct {}
     unsafe impl Pod for MyStruct {}
 
-    assert_eq!(std::mem::size_of::<MyStruct>(), 8);
+    assert_eq!(size_of::<MyStruct>(), 8);
     let bytes = [0u8; 8];
     let s: &MyStruct = from_bytes(&bytes);
     assert_eq!(s.a, 0);

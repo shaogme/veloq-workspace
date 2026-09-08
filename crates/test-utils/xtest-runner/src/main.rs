@@ -1,5 +1,6 @@
 use clap::{Parser, ValueEnum};
 use diagweave::{prelude::*, union};
+use std::io::Error as IoError;
 use std::process::ExitCode;
 
 mod runner;
@@ -8,7 +9,7 @@ use runner::Runner;
 
 union! {
     pub(crate) enum RunnerError =
-        std::io::Error as Io |
+        IoError as Io |
         {
             #[display("{0}")]
             Cli(String),
@@ -120,6 +121,12 @@ struct Cli {
 
     #[arg(long, help = "启用 features")]
     features: Option<String>,
+
+    #[arg(long, help = "仅执行指定 package")]
+    package: Option<String>,
+
+    #[arg(long, help = "仅执行指定 nextest 过滤表达式")]
+    filter: Option<String>,
 }
 
 #[derive(Debug)]
@@ -129,6 +136,8 @@ pub(crate) struct Config {
     pub(crate) count: usize,
     pub(crate) quiet: bool,
     pub(crate) features: Option<String>,
+    pub(crate) package: Option<String>,
+    pub(crate) filter: Option<String>,
 }
 
 impl TryFrom<Cli> for Config {
@@ -158,6 +167,8 @@ impl TryFrom<Cli> for Config {
             count,
             quiet: cli.quiet,
             features: cli.features,
+            package: cli.package,
+            filter: cli.filter,
         })
     }
 }

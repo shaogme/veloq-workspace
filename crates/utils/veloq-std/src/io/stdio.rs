@@ -16,7 +16,7 @@ use crate::sync::{Mutex, MutexGuard};
 use crate::sync::const_mutex;
 
 #[cfg(feature = "loom")]
-use crate::sync::OnceLock;
+use std::sync::LazyLock;
 
 #[cfg(unix)]
 use unix as sys;
@@ -36,8 +36,8 @@ fn stdin_mutex() -> &'static Mutex<()> {
 
     #[cfg(feature = "loom")]
     {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        static LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+        &LOCK
     }
 }
 
@@ -50,8 +50,8 @@ fn stdout_mutex() -> &'static Mutex<()> {
 
     #[cfg(feature = "loom")]
     {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        static LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+        &LOCK
     }
 }
 
@@ -64,8 +64,8 @@ fn stderr_mutex() -> &'static Mutex<()> {
 
     #[cfg(feature = "loom")]
     {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        static LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+        &LOCK
     }
 }
 

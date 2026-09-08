@@ -323,7 +323,7 @@ impl<T: Send> StateOptionBox<T> for AtomicOptionBox<T> {
 
 impl<T> Drop for AtomicOptionBox<T> {
     fn drop(&mut self) {
-        if let Some(p) = NonNull::new(*self.0.get_mut()) {
+        if let Some(p) = NonNull::new(self.0.swap(null_mut(), Ordering::Relaxed)) {
             unsafe { drop(Box::from_raw(p.as_ptr())) }
         }
     }
@@ -403,7 +403,7 @@ impl<T: Send + Sync> StateOptionArc<T> for AtomicOptionArc<T> {
 
 impl<T> Drop for AtomicOptionArc<T> {
     fn drop(&mut self) {
-        if let Some(p) = NonNull::new(*self.0.get_mut()) {
+        if let Some(p) = NonNull::new(self.0.swap(null_mut(), Ordering::Relaxed)) {
             unsafe { drop(Arc::from_raw(p.as_ptr())) }
         }
     }

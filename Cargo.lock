@@ -1525,6 +1525,7 @@ dependencies = [
  "crossbeam-queue",
  "diagweave",
  "libc",
+ "loom",
  "numaperf-topo",
  "trybuild",
  "veloq-intrusive-linklist",

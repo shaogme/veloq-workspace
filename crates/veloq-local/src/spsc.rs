@@ -3,7 +3,7 @@ use futures_core::stream::Stream;
 use std::{
     alloc::{Layout, alloc, dealloc, handle_alloc_error},
     cell::UnsafeCell,
-    mem,
+    fmt, mem,
     mem::ManuallyDrop,
     pin::Pin,
     ptr::{self, NonNull},
@@ -180,8 +180,8 @@ pub struct State<T> {
     inner: UnsafeCell<StateInner<T>>,
 }
 
-impl<T> std::fmt::Debug for State<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<T> fmt::Debug for State<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("State").finish_non_exhaustive()
     }
 }

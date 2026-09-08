@@ -8,7 +8,7 @@ pub use crate::common::{ChannelCapacity, SendError, TryRecvError};
 use std::{
     cell::RefCell,
     collections::VecDeque,
-    marker::PhantomPinned,
+    marker::{PhantomData, PhantomPinned},
     mem::ManuallyDrop,
     pin::Pin,
     ptr::NonNull,
@@ -112,7 +112,7 @@ where
     node: WaiterNode,
     state: &'a State<T>,
     poll_fn: F,
-    _action: std::marker::PhantomData<A>,
+    _action: PhantomData<A>,
 }
 
 #[derive(Debug)]
@@ -135,7 +135,7 @@ where
                 link: Link::new(),
                 _p: PhantomPinned,
             },
-            _action: std::marker::PhantomData,
+            _action: PhantomData,
         }
     }
 }

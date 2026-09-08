@@ -16,6 +16,7 @@ use std::{
     ops::AsyncFnOnce,
     panic::resume_unwind,
     ptr::{NonNull, drop_in_place, write},
+    thread::panicking,
 };
 use veloq_storage::{AtomicStorage, LocalStorage, StateLock, Storage};
 
@@ -358,7 +359,7 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra> Drop
     /// 运行时是协作式的，「已取消」与「已停止」之间有任意长的窗口。正常路径由
     /// `wait_all()` 兜底，但 `f` panic 和「整个 scope future 被丢弃」（`select!` 落败分支、
     /// 超时、外层取消）这两条路径都绕过它 —— 那里若只发信号就返回，借用立刻悬垂。这正是
-    /// `std::thread::scope` 必须在 `Drop` 里阻塞 join 的原因。
+    /// `thread::scope` 必须在 `Drop` 里阻塞 join 的原因。
     fn drop(&mut self) {
         if self.cancel_and_join().is_err() {
             // Drop 不能返回错误；wake failure 已由共享 fatal 通道保存。
@@ -370,7 +371,7 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra> Drop
         if let Some(payload) = self.completion.take_panic() {
             match self.completion.parent() {
                 Some(parent) => parent.report_panic(payload),
-                None if !std::thread::panicking() => resume_unwind(payload),
+                None if !panicking() => resume_unwind(payload),
                 None => {}
             }
         }

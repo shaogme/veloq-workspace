@@ -6,7 +6,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll, Waker},
-    thread::yield_now as thread_yield,
+    thread::{scope, yield_now as thread_yield},
 };
 
 use veloq_runtime::{
@@ -82,7 +82,7 @@ fn local_task_foreign_wake_uses_owner_mailbox() {
     let foreign_context_has_scope = AtomicBool::new(true);
     let stale_waker = Mutex::new(None);
 
-    std::thread::scope(|threads| {
+    scope(|threads| {
         threads.spawn(|| {
             loop {
                 let waker = waker_slot.lock().expect("local waker slot").take();

@@ -1,6 +1,8 @@
 use std::{
+    future::poll_fn,
     mem::size_of,
     net::{SocketAddr, ToSocketAddrs},
+    pin::Pin,
     rc::Rc,
     sync::Arc,
 };
@@ -91,9 +93,9 @@ impl<'rt, S: OpSubmitter<'rt, Ctx<'rt>> + Copy, P: SocketTokenPtr<'rt>>
     async fn accept_direct(&self) -> Result<(GenericTcpStream<'rt, S, P>, SocketAddr)> {
         if self.inner.token().has_stashed_accept() {
             let mut stream = self.accept_multi();
-            let polled = std::future::poll_fn(|cx| {
+            let polled = poll_fn(|cx| {
                 use futures_core::Stream;
-                unsafe { std::pin::Pin::new_unchecked(&mut stream) }.poll_next(cx)
+                unsafe { Pin::new_unchecked(&mut stream) }.poll_next(cx)
             })
             .await;
             if let Some(res) = polled {
@@ -289,9 +291,9 @@ impl<'rt> TcpListener<'rt> {
     pub async fn accept(&self) -> Result<(TcpStream<'rt>, SocketAddr)> {
         if self.inner.token().has_stashed_accept() {
             let mut stream = self.accept_multi();
-            let polled = std::future::poll_fn(|cx| {
+            let polled = poll_fn(|cx| {
                 use futures_core::Stream;
-                unsafe { std::pin::Pin::new_unchecked(&mut stream) }.poll_next(cx)
+                unsafe { Pin::new_unchecked(&mut stream) }.poll_next(cx)
             })
             .await;
             if let Some(res) = polled {

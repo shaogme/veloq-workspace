@@ -1,5 +1,8 @@
 use core::ffi::CStr;
 
+#[cfg(feature = "loom")]
+use std::sync::LazyLock;
+
 use crate::{
     alloc_crate::{ffi::CString, vec::Vec},
     env::JoinPathsError,
@@ -15,7 +18,11 @@ use crate::{
     vec,
 };
 
+#[cfg(not(feature = "loom"))]
 static ENV_LOCK: RwLock<()> = RwLock::new(());
+
+#[cfg(feature = "loom")]
+static ENV_LOCK: LazyLock<RwLock<()>> = LazyLock::new(|| RwLock::new(()));
 
 #[cfg(not(any(target_os = "freebsd", target_vendor = "apple")))]
 unsafe fn environ() -> *mut *const *const libc::c_char {

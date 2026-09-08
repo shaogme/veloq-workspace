@@ -26,7 +26,7 @@ use veloq_std::os::windows::{
 };
 
 #[cfg(feature = "std")]
-use std::env;
+use std::{env, process::id};
 
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -43,7 +43,7 @@ impl TempFileGuard {
         let base = String::from("target");
 
         let mut path = PathBuf::from(base.as_str());
-        let filename = format!("veloq_test_{}_{}_{}.tmp", std::process::id(), name, count);
+        let filename = format!("veloq_test_{}_{}_{}.tmp", id(), name, count);
         path.push(filename.as_str());
 
         // Remove if exists

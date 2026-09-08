@@ -4,15 +4,16 @@ use loom::sync::Arc;
 use loom::thread;
 use std::future::Future;
 use std::pin::Pin;
+use std::ptr;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use veloq_sync::mutex::Mutex;
 
 fn dummy_waker() -> Waker {
-    unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    unsafe { Waker::from_raw(RawWaker::new(ptr::null(), &VTABLE)) }
 }
 
 static VTABLE: RawWakerVTable = RawWakerVTable::new(
-    |_| RawWaker::new(std::ptr::null(), &VTABLE),
+    |_| RawWaker::new(ptr::null(), &VTABLE),
     |_| {},
     |_| {},
     |_| {},

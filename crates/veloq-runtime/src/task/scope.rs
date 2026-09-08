@@ -1,5 +1,6 @@
 use crate::{
-    runtime::primitives::GenericCancellationToken, scope::GenericScopeCompletion,
+    runtime::primitives::{CancelWaiterLinkResult, GenericCancellationToken},
+    scope::GenericScopeCompletion,
     utils::ownership::Ownership,
 };
 use std::{
@@ -28,7 +29,7 @@ pub struct ScopeCancelWaiter {
 intrusive_adapter!(pub ScopeCancelWaiterAdapter = ScopeCancelWaiter { link: Link });
 
 impl ScopeCancelWaiter {
-    pub(crate) const fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             link: Link::new(),
             waker: UnsafeCell::new(None),
@@ -129,12 +130,16 @@ pub trait RawScope {
     fn try_link_child(&self, child_token: &ErasedCancellationToken) -> bool;
     fn parent(&self) -> Option<AnyScopeRef>;
     fn register_cancel_waker(&self, waker: &Waker);
-    /// 把任务自己的等待节点挂到本 scope 的取消队列上；已取消时返回 `false` 且不入链。
+    /// 把任务自己的等待节点挂到本 scope 的取消队列上。
     ///
     /// # Safety
     ///
     /// `waiter` 必须在被 `unlink_cancel_waiter` 摘除之前保持有效且地址稳定。
-    unsafe fn link_cancel_waiter(&self, waiter: NonNull<ScopeCancelWaiter>, waker: &Waker) -> bool;
+    unsafe fn link_cancel_waiter(
+        &self,
+        waiter: NonNull<ScopeCancelWaiter>,
+        waker: &Waker,
+    ) -> CancelWaiterLinkResult;
     /// # Safety
     ///
     /// `waiter` 必须是先前传给 `link_cancel_waiter` 的同一个节点。
@@ -172,8 +177,8 @@ impl<S: Storage> RawScope for DummyScope<S> {
         &self,
         _waiter: NonNull<ScopeCancelWaiter>,
         _waker: &Waker,
-    ) -> bool {
-        true
+    ) -> CancelWaiterLinkResult {
+        CancelWaiterLinkResult::Linked
     }
     unsafe fn unlink_cancel_waiter(&self, _waiter: NonNull<ScopeCancelWaiter>) {}
     unsafe fn clone_raw(&self) -> NonNull<dyn RawScope> {
@@ -285,7 +290,7 @@ impl<S: Storage> ScopeRef<S> {
         &self,
         waiter: NonNull<ScopeCancelWaiter>,
         waker: &Waker,
-    ) -> bool {
+    ) -> CancelWaiterLinkResult {
         unsafe { self.as_ref().link_cancel_waiter(waiter, waker) }
     }
 
