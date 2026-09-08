@@ -22,9 +22,9 @@ use crate::{
     error::{UringError, UringResult},
 };
 use diagweave::prelude::*;
-use std::collections::HashMap;
 use tracing::warn;
 use veloq_driver_core::RawHandleMeta;
+use veloq_std::{collections::HashMap, format, string::ToString, vec::Vec};
 
 const INITIAL_FILE_GENERATION: u64 = 1;
 
@@ -98,7 +98,7 @@ impl FileTable {
             slots: Vec::new(),
             fixed_capacity: fixed_capacity as usize,
             free_fixed: Vec::new(),
-            direct_owned: HashMap::new(),
+            direct_owned: HashMap::default(),
             exhaustion,
             initialized: false,
             fallback_reported: false,

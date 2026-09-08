@@ -1,3 +1,6 @@
+#![cfg_attr(not(test), no_std)]
+#![deny(warnings)]
+
 mod config;
 mod diagnostics;
 mod driver;

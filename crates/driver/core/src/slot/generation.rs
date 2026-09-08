@@ -1,5 +1,5 @@
 use diagweave::prelude::ContextValue;
-use std::fmt;
+use veloq_std::fmt;
 
 /// slot 的 ABA 计数器：把"这个 index 上的第几次占用"与 index 本身分开表达。
 ///

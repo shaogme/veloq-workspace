@@ -4,12 +4,10 @@ use crate::{
     driver::{CompletionCleanupGuard, CompletionContinuation, UserCompletionEvent},
 };
 use bilge::prelude::*;
-use std::{
-    fmt::{self, Debug},
-    marker::PhantomData,
-};
 use veloq_std::{
     collections::VecDeque,
+    fmt::{self, Debug},
+    marker::PhantomData,
     sync::{
         Mutex,
         atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering},

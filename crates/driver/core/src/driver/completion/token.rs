@@ -1,4 +1,5 @@
 use crate::slot::Generation;
+use veloq_std::{error::Error, fmt};
 
 /// `CompletionToken` 的 user 布局（bit 63 为 0）：
 ///
@@ -137,8 +138,8 @@ pub enum CompletionTokenError {
     ControlKindOverflow { kind: u16 },
 }
 
-impl std::fmt::Display for CompletionTokenError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for CompletionTokenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ReservedControlKind { kind } => {
                 write!(f, "Control kind {} is reserved by the driver", kind)
@@ -150,7 +151,7 @@ impl std::fmt::Display for CompletionTokenError {
     }
 }
 
-impl std::error::Error for CompletionTokenError {}
+impl Error for CompletionTokenError {}
 
 impl CompletionToken {
     pub const fn user(token: OpToken) -> Self {

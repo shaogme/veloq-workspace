@@ -1,9 +1,9 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::mpsc,
-};
 use veloq_driver_core::driver::{
     CancelCompletionId, CancelMode, CancelRequest, OpToken, RemoteCancelSender,
+};
+use veloq_std::{
+    collections::{HashMap, VecDeque},
+    sync::mpsc,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -40,7 +40,7 @@ impl UringCancelManager {
         let (sender, receiver) = mpsc::channel();
         Self {
             pending_cancellations: VecDeque::new(),
-            pending_cancel_cqes: HashMap::new(),
+            pending_cancel_cqes: HashMap::default(),
             next_cancel_id: 1,
             remote_cancel_sender: sender,
             remote_cancel_receiver: receiver,

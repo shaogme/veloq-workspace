@@ -1,11 +1,15 @@
-use std::{
+use futures_core::Stream;
+use tracing::trace;
+use veloq_std::{
+    any::type_name,
     error::Error,
+    fmt, format,
     future::Future,
+    marker::{PhantomData, Send, Sync},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
-use tracing::trace;
 
 use crate::{
     DriverCoreError, DriverError, DriverReport, DriverResult,
@@ -38,8 +42,8 @@ pub enum LostReason {
     Other,
 }
 
-impl std::fmt::Display for LostReason {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for LostReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::GenerationMismatch => write!(f, "generation mismatch (slot recycled)"),
             Self::PayloadMissing => write!(f, "payload missing"),
@@ -67,11 +71,11 @@ impl<E> OpError<E> {
     }
 }
 
-impl<E> std::fmt::Display for OpError<E>
+impl<E> fmt::Display for OpError<E>
 where
     E: Error + Send + Sync + 'static,
 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}: {}", self.reason, self.source)
     }
 }
@@ -294,7 +298,7 @@ where
     /// 提交阶段就已经定局的那一项（同步失败或资源丢失）。取走它之后就再没有别的来源，
     /// 流随即结束——所以它和 `token` 不会同时是 `Some`。
     pub(crate) immediate: Option<OpItem<T, Spec>>,
-    pub(crate) _phantom: std::marker::PhantomData<DetachedOpMarker<T, Spec>>,
+    pub(crate) _phantom: PhantomData<DetachedOpMarker<T, Spec>>,
 }
 
 impl<T, Spec> DetachedOp<T, Spec>
@@ -315,7 +319,7 @@ where
             cancel_waker: Some(cancel_waker),
             token: Some(token),
             immediate: None,
-            _phantom: std::marker::PhantomData,
+            _phantom: PhantomData,
         }
     }
 
@@ -327,7 +331,7 @@ where
             cancel_waker: None,
             token: None,
             immediate: Some(item),
-            _phantom: std::marker::PhantomData,
+            _phantom: PhantomData,
         }
     }
 
@@ -455,7 +459,7 @@ where
     pub(crate) provider: P,
     pub(crate) token: Option<OpToken>,
     pub(crate) immediate: Option<OpItem<T, P::SlotSpec>>,
-    pub(crate) marker: std::marker::PhantomData<&'a ()>,
+    pub(crate) marker: PhantomData<&'a ()>,
 }
 
 type LocalSubmitOutcome<P> = (
@@ -476,7 +480,7 @@ where
             provider,
             token: None,
             immediate: None,
-            marker: std::marker::PhantomData,
+            marker: PhantomData,
         }
     }
 
@@ -498,7 +502,7 @@ where
     /// 提交。返回 `Some` 表示这次提交同步就定局了（操作一条完成都不会产生）。
     fn submit(&mut self) -> Option<OpItem<T, P::SlotSpec>> {
         trace!(
-            op = %std::any::type_name::<T>(),
+            op = %type_name::<T>(),
             "LocalOp: submit begin"
         );
 
@@ -553,7 +557,7 @@ where
                 status: SubmitStatus::Void,
             } => {
                 trace!(
-                    op = %std::any::type_name::<T>(),
+                    op = %type_name::<T>(),
                     error = %report,
                     "LocalOp: submit failed synchronously"
                 );
@@ -566,7 +570,7 @@ where
             DriverSubmitResult::Submitted(_) | DriverSubmitResult::Failed { .. } => {
                 self.state = LocalState::Submitted;
                 trace!(
-                    op = %std::any::type_name::<T>(),
+                    op = %type_name::<T>(),
                     token = CompletionToken::user(token).raw(),
                     "LocalOp: submitted"
                 );
@@ -665,29 +669,27 @@ where
     }
 }
 
-pub trait OpSubmitter<'a, P: DriverProvider>: Clone + std::marker::Send + Sync {
+pub trait OpSubmitter<'a, P: DriverProvider>: Clone + Send + Sync {
     /// 单发提交的句柄：`await` 得到唯一的那条完成。
-    type Future<T: SingleShotOp<P::SlotSpec> + std::marker::Send>: Future<
-        Output = OpItem<T, P::SlotSpec>,
-    >;
+    type Future<T: SingleShotOp<P::SlotSpec> + Send>: Future<Output = OpItem<T, P::SlotSpec>>;
 
     /// 流式提交的句柄：一次提交、多条完成。单发操作在这里退化成只有一项的流。
     ///
     /// 与 `Future` 是**同一个具体类型**的两种看法，不是两条实现路径。
-    type Stream<T: IntoPlatformOp<P::SlotSpec> + std::marker::Send>: futures_core::Stream<Item = OpItem<T, P::SlotSpec>>;
+    type Stream<T: IntoPlatformOp<P::SlotSpec> + Send>: Stream<Item = OpItem<T, P::SlotSpec>>;
 
     fn submit<T>(&self, op: Op<T>, provider: P) -> Self::Future<T>
     where
-        T: SingleShotOp<P::SlotSpec> + std::marker::Send;
+        T: SingleShotOp<P::SlotSpec> + Send;
 
     fn submit_stream<T>(&self, op: Op<T>, provider: P) -> Self::Stream<T>
     where
-        T: IntoPlatformOp<P::SlotSpec> + std::marker::Send;
+        T: IntoPlatformOp<P::SlotSpec> + Send;
 
     fn from_current_context() -> Self;
 }
 
-pub struct LocalSubmitter<P>(std::marker::PhantomData<fn() -> P>);
+pub struct LocalSubmitter<P>(PhantomData<fn() -> P>);
 
 impl<P> Clone for LocalSubmitter<P> {
     fn clone(&self) -> Self {
@@ -698,7 +700,7 @@ impl<P> Copy for LocalSubmitter<P> {}
 
 impl<P> LocalSubmitter<P> {
     pub fn new() -> Self {
-        Self(std::marker::PhantomData)
+        Self(PhantomData)
     }
 }
 impl<P> Default for LocalSubmitter<P> {
@@ -708,12 +710,12 @@ impl<P> Default for LocalSubmitter<P> {
 }
 
 impl<'a, P: DriverProvider> OpSubmitter<'a, P> for LocalSubmitter<P> {
-    type Future<T: SingleShotOp<P::SlotSpec> + std::marker::Send> = LocalOp<'a, T, P>;
-    type Stream<T: IntoPlatformOp<P::SlotSpec> + std::marker::Send> = LocalOp<'a, T, P>;
+    type Future<T: SingleShotOp<P::SlotSpec> + Send> = LocalOp<'a, T, P>;
+    type Stream<T: IntoPlatformOp<P::SlotSpec> + Send> = LocalOp<'a, T, P>;
 
     fn submit<T>(&self, op: Op<T>, provider: P) -> LocalOp<'a, T, P>
     where
-        T: SingleShotOp<P::SlotSpec> + std::marker::Send,
+        T: SingleShotOp<P::SlotSpec> + Send,
     {
         trace!("Submitting local op");
         op.submit_local(provider)
@@ -721,7 +723,7 @@ impl<'a, P: DriverProvider> OpSubmitter<'a, P> for LocalSubmitter<P> {
 
     fn submit_stream<T>(&self, op: Op<T>, provider: P) -> LocalOp<'a, T, P>
     where
-        T: IntoPlatformOp<P::SlotSpec> + std::marker::Send,
+        T: IntoPlatformOp<P::SlotSpec> + Send,
     {
         trace!("Submitting local op stream");
         op.submit_local(provider)
@@ -748,21 +750,21 @@ impl Default for DetachedSubmitter {
 }
 
 impl<'a, P: DriverProvider> OpSubmitter<'a, P> for DetachedSubmitter {
-    type Future<T: SingleShotOp<P::SlotSpec> + std::marker::Send> =
+    type Future<T: SingleShotOp<P::SlotSpec> + Send> =
         DetachedOp<T, <P::Driver<'a> as DriverRaw>::SlotSpec>;
-    type Stream<T: IntoPlatformOp<P::SlotSpec> + std::marker::Send> =
+    type Stream<T: IntoPlatformOp<P::SlotSpec> + Send> =
         DetachedOp<T, <P::Driver<'a> as DriverRaw>::SlotSpec>;
 
     fn submit<T>(&self, op: Op<T>, provider: P) -> Self::Future<T>
     where
-        T: SingleShotOp<P::SlotSpec> + std::marker::Send,
+        T: SingleShotOp<P::SlotSpec> + Send,
     {
         provider.with_driver(|mut driver| op.submit_detached(&mut driver))
     }
 
     fn submit_stream<T>(&self, op: Op<T>, provider: P) -> Self::Stream<T>
     where
-        T: IntoPlatformOp<P::SlotSpec> + std::marker::Send,
+        T: IntoPlatformOp<P::SlotSpec> + Send,
     {
         provider.with_driver(|mut driver| op.submit_detached(&mut driver))
     }

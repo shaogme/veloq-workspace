@@ -1,8 +1,10 @@
-use std::{
+use veloq_blocking::ThreadPool;
+use veloq_std::{
+    mem,
     sync::mpsc,
     time::{Duration, Instant},
+    vec::Vec,
 };
-use veloq_blocking::ThreadPool;
 
 use diagweave::prelude::*;
 use tracing::debug;
@@ -161,7 +163,7 @@ impl<'a> IocpDriver<'a> {
     fn start_winsock() -> IocpResult<WinsockGuard> {
         // SAFETY: WSAStartup is required before Windows socket APIs are used.
         let ret = unsafe {
-            let mut data: WSADATA = std::mem::zeroed();
+            let mut data: WSADATA = mem::zeroed();
             WSAStartup(0x0202, &mut data)
         };
         if ret != 0 {

@@ -16,6 +16,7 @@ pub(crate) mod runtime;
 use crate::{BufferRegistrationMode, config::SocketKey, driver::IocpDriverCompletionDiagnostics};
 use rustc_hash::FxHashMap;
 use slotmap::{SlotMap, new_key_type};
+use veloq_std::vec::Vec;
 
 use self::{
     core::{RioCq, RioDispatch, RioKernel, RioRegistry},

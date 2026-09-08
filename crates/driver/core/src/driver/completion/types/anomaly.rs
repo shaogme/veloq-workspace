@@ -1,4 +1,5 @@
 use crate::slot::{self, Generation};
+use veloq_std::num::NonZeroU8;
 
 use super::super::CompletionToken;
 
@@ -24,7 +25,7 @@ pub struct BackendSlotRef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionBackend {
     Core,
-    Backend(std::num::NonZeroU8),
+    Backend(NonZeroU8),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

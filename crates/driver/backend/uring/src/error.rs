@@ -1,7 +1,6 @@
-use core::convert::TryFrom;
-
 use diagweave::prelude::*;
 use veloq_driver_core::{DriverCoreError, DriverError};
+use veloq_std::{convert::TryFrom, io, string::ToString};
 
 set! {
     #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -41,7 +40,11 @@ impl UringError {
     }
 
     #[inline]
-    pub(crate) fn io_report(self, scope: &'static str, error: std::io::Error) -> Report<Self> {
+    pub(crate) fn io_report<E>(self, scope: &'static str, error: E) -> Report<Self>
+    where
+        E: Into<io::Error>,
+    {
+        let error: io::Error = error.into();
         let os_code = error.raw_os_error();
         let detail = error.to_string();
         let report = self

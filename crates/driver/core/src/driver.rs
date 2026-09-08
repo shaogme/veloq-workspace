@@ -2,14 +2,15 @@ use crate::{
     BorrowedRawHandle, DriverReport, DriverResult, IoFd, OwnedRawHandle, RawHandleMeta,
     slot::{self, SlotError, SlotOp, SlotPayload, SlotSpec as CoreSlotSpec},
 };
-use std::{
+use veloq_buf::{AnyBufPool, heap::ChunkId};
+use veloq_std::{
     error::Error,
     marker::PhantomData,
     sync::{Arc, mpsc},
     task::{Poll, Waker},
     time::Duration,
+    vec::Vec,
 };
-use veloq_buf::{AnyBufPool, heap::ChunkId};
 
 mod completion;
 pub mod registry;

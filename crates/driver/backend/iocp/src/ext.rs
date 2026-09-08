@@ -4,6 +4,13 @@ use crate::{
     win32::SafeSocket,
 };
 
+use veloq_std::{
+    ffi::c_void,
+    fmt, io,
+    mem::{self, MaybeUninit},
+    ptr,
+};
+
 use windows_sys::{
     Win32::{
         Networking::WinSock::{
@@ -21,7 +28,7 @@ use windows_sys::{
 pub(crate) type LpfnAcceptEx = unsafe extern "system" fn(
     slistensocket: SOCKET,
     sacceptsocket: SOCKET,
-    lpoutputbuffer: *mut std::ffi::c_void,
+    lpoutputbuffer: *mut c_void,
     dwreceivedatalength: u32,
     dwlocaladdresslength: u32,
     dwremoteaddresslength: u32,
@@ -33,14 +40,14 @@ pub(crate) type LpfnConnectEx = unsafe extern "system" fn(
     s: SOCKET,
     name: *const SOCKADDR,
     namelen: i32,
-    lpsendbuffer: *const std::ffi::c_void,
+    lpsendbuffer: *const c_void,
     dwsenddatalength: u32,
     lpdwbytessent: *mut u32,
     lpoverlapped: *mut OVERLAPPED,
 ) -> i32;
 
 pub(crate) type LpfnGetAcceptExSockaddrs = unsafe extern "system" fn(
-    lpoutputbuffer: *const std::ffi::c_void,
+    lpoutputbuffer: *const c_void,
     dwreceivedatalength: u32,
     dwlocaladdresslength: u32,
     dwremoteaddresslength: u32,
@@ -58,8 +65,8 @@ pub(crate) struct Extensions {
     pub(crate) rio_table: RIO_EXTENSION_FUNCTION_TABLE,
 }
 
-impl std::fmt::Debug for Extensions {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for Extensions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Extensions")
             .field("rio_table", &true)
             .finish_non_exhaustive()
@@ -75,13 +82,13 @@ impl Extensions {
                 AF_INET as i32,
                 SOCK_STREAM,
                 IPPROTO_TCP,
-                std::ptr::null(),
+                ptr::null(),
                 0,
                 WSA_FLAG_OVERLAPPED,
             );
             if s == INVALID_SOCKET {
                 return Err(
-                    IocpError::DriverInit.io_report("WSASocketW", std::io::Error::last_os_error())
+                    IocpError::DriverInit.io_report("WSASocketW", io::Error::last_os_error())
                 );
             }
             SafeSocket(s)
@@ -117,20 +124,20 @@ impl Extensions {
         // called to fill it. Memory layout for the struct is guaranteed to be compatible.
         unsafe {
             let mut guid = WSAID_MULTIPLE_RIO;
-            let mut table: RIO_EXTENSION_FUNCTION_TABLE = std::mem::zeroed();
+            let mut table: RIO_EXTENSION_FUNCTION_TABLE = mem::zeroed();
             // RIO_EXTENSION_FUNCTION_TABLE must have cbSize initialized
-            table.cbSize = std::mem::size_of::<RIO_EXTENSION_FUNCTION_TABLE>() as u32;
+            table.cbSize = mem::size_of::<RIO_EXTENSION_FUNCTION_TABLE>() as u32;
 
             let mut bytes_returned = 0;
             let ret = WSAIoctl(
                 socket,
                 SIO_GET_MULTIPLE_EXTENSION_FUNCTION_POINTER,
                 &mut guid as *mut _ as *mut _,
-                std::mem::size_of_val(&guid) as u32,
+                mem::size_of_val(&guid) as u32,
                 &mut table as *mut _ as *mut _,
-                std::mem::size_of_val(&table) as u32,
+                mem::size_of_val(&table) as u32,
                 &mut bytes_returned,
-                std::ptr::null_mut(),
+                ptr::null_mut(),
                 None,
             );
 
@@ -138,14 +145,14 @@ impl Extensions {
                 Ok(table)
             } else {
                 Err(IocpError::Rio(RioError::LibraryLoad)
-                    .io_report("WSAIoctl.load_rio", std::io::Error::last_os_error()))
+                    .io_report("WSAIoctl.load_rio", io::Error::last_os_error()))
             }
         }
     }
 
     fn get_extension<T>(socket: SOCKET, guid: GUID) -> IocpResult<T> {
         let mut guid = guid;
-        let mut val = std::mem::MaybeUninit::<T>::uninit();
+        let mut val = MaybeUninit::<T>::uninit();
         let mut bytes_returned = 0;
 
         // SAFETY: `WSAIoctl` is called with correct pointers and sizes for the requested GUID extension pointer.
@@ -156,11 +163,11 @@ impl Extensions {
                 socket,
                 SIO_GET_EXTENSION_FUNCTION_POINTER,
                 &mut guid as *mut _ as *mut _,
-                std::mem::size_of_val(&guid) as u32,
+                mem::size_of_val(&guid) as u32,
                 val.as_mut_ptr() as *mut _,
-                std::mem::size_of::<T>() as u32,
+                mem::size_of::<T>() as u32,
                 &mut bytes_returned,
-                std::ptr::null_mut(),
+                ptr::null_mut(),
                 None,
             )
         };
@@ -170,7 +177,7 @@ impl Extensions {
             unsafe { Ok(val.assume_init()) }
         } else {
             Err(IocpError::DriverInit
-                .io_report("WSAIoctl.get_extension", std::io::Error::last_os_error()))
+                .io_report("WSAIoctl.get_extension", io::Error::last_os_error()))
         }
     }
 }

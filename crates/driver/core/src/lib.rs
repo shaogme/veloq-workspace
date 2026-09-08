@@ -1,7 +1,13 @@
-use core::{fmt, marker::PhantomData};
+#![cfg_attr(not(test), no_std)]
 
 use diagweave::prelude::*;
-use std::net::SocketAddr;
+use veloq_std::{
+    error::Error,
+    fmt,
+    marker::{PhantomData, Send, Sync},
+    mem,
+    net::SocketAddr,
+};
 
 pub mod driver;
 pub mod op;
@@ -168,7 +174,7 @@ set! {
 pub type DriverResult<T, E> = Result<T, Report<E>>;
 pub type DriverReport<E> = Report<E>;
 
-pub trait DriverError: std::error::Error + Send + Sync + 'static + Sized {
+pub trait DriverError: Error + Send + Sync + 'static + Sized {
     fn from_core_report(report: Report<DriverCoreError>) -> Report<Self>;
 }
 
@@ -265,7 +271,7 @@ impl<H: RawHandleMeta> OwnedRawHandle<H> {
     }
 
     pub fn into_raw(self) -> RawHandle<H> {
-        let this = core::mem::ManuallyDrop::new(self);
+        let this = mem::ManuallyDrop::new(self);
         this.raw
     }
 
@@ -299,7 +305,7 @@ impl<H: RawHandleMeta> Drop for OwnedRawHandle<H> {
 /// 平台套接字抽象，由各 driver 后端提供具体实现。
 pub trait PlatformSocket: Sized + Send {
     type Handle: RawHandleMeta;
-    type Error: std::error::Error + Send + Sync;
+    type Error: Error + Send + Sync;
 
     fn new_tcp_v4() -> Result<Self, Report<Self::Error>>;
     fn new_tcp_v6() -> Result<Self, Report<Self::Error>>;
@@ -331,7 +337,7 @@ pub trait PlatformSocket: Sized + Send {
 /// 平台地址存储编解码抽象。
 pub trait SocketAddrCodec: SockAddr {
     type Len: Copy + Send;
-    type Error: std::error::Error + Send + Sync;
+    type Error: Error + Send + Sync;
 
     fn to_socket_addr(buf: &[u8]) -> Result<SocketAddr, Report<Self::Error>>;
     fn socket_addr_to_storage(addr: SocketAddr) -> (Self, Self::Len);

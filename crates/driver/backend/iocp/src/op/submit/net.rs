@@ -7,7 +7,12 @@ pub(crate) use connect::{
 };
 
 use diagweave::prelude::*;
-use std::mem::ManuallyDrop;
+use veloq_std::{
+    ffi::c_void,
+    mem::{self, ManuallyDrop},
+    slice,
+    string::ToString,
+};
 use windows_sys::Win32::Networking::WinSock::SOCKET;
 
 use crate::{
@@ -216,7 +221,7 @@ pub(crate) fn submit_send_to(
         fd: user.fd,
         handle,
         buf: &user.buf,
-        addr_ptr: &payload.addr as *const _ as *const std::ffi::c_void,
+        addr_ptr: &payload.addr as *const _ as *const c_void,
         addr_len: payload.addr_len,
         token: ctx.op_token,
         buf_offset: user.buf_offset,
@@ -257,7 +262,7 @@ pub(crate) fn submit_udp_recv_from(
         fd,
         handle,
         recv_from_op: val,
-        addr_ptr: (&mut payload.addr as *mut SockAddrStorage).cast::<std::ffi::c_void>(),
+        addr_ptr: (&mut payload.addr as *mut SockAddrStorage).cast::<c_void>(),
         token: ctx.op_token,
     };
     mark_header_in_flight(
@@ -285,9 +290,9 @@ pub(crate) unsafe fn on_complete_udp_recv_from(
     // SAFETY: The caller guarantees that payload is valid.
     let val = unsafe { payload.user.as_mut()? };
     let addr_bytes = unsafe {
-        std::slice::from_raw_parts(
+        slice::from_raw_parts(
             (&payload.addr as *const SockAddrStorage).cast::<u8>(),
-            std::mem::size_of::<SockAddrStorage>(),
+            mem::size_of::<SockAddrStorage>(),
         )
     };
     val.addr = Some(

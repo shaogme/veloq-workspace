@@ -1,7 +1,9 @@
-use std::{
+use veloq_std::{
+    format, mem,
     sync::Arc,
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
+    vec::Vec,
 };
 
 use diagweave::prelude::*;
@@ -118,7 +120,7 @@ impl TimerEngine {
     }
 
     pub(super) fn take_buffer(&mut self) -> Vec<OpToken> {
-        std::mem::take(&mut self.buffer)
+        mem::take(&mut self.buffer)
     }
 
     pub(super) fn restore_cleared_buffer(&mut self, mut buffer: Vec<OpToken>) {
@@ -197,7 +199,7 @@ impl<'a> IocpDriver<'a> {
     pub(super) fn calculate_wait_ms(&self, timeout_ms: u32) -> u32 {
         if let Some(delay) = self.timer.next_timeout() {
             let millis = delay.as_millis().min(u32::MAX as u128) as u32;
-            std::cmp::min(timeout_ms, millis)
+            timeout_ms.min(millis)
         } else {
             timeout_ms
         }

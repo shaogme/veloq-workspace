@@ -1,7 +1,9 @@
 use crate::slot;
-use std::fmt::{Debug, Formatter, Result};
-
 use crate::{DriverCoreError, DriverResult};
+use veloq_std::{
+    boxed::Box,
+    fmt::{Debug, Formatter, Result},
+};
 
 use super::super::CompletionPacket;
 use super::anomaly::AnomalyOutcome;

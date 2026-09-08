@@ -17,6 +17,7 @@ use crate::{
     rio::{RioState, error::RioError},
 };
 use diagweave::prelude::*;
+use windows_sys::Win32::Networking::WinSock::WSAGetLastError;
 
 #[inline]
 pub(crate) fn rio_result_to_event_res(res: &crate::error::IocpResult<usize>) -> i32 {
@@ -40,7 +41,7 @@ impl RioState {
     #[inline]
     pub(crate) fn last_wsa_error_code() -> i32 {
         // SAFETY: WSAGetLastError is safe to call.
-        unsafe { windows_sys::Win32::Networking::WinSock::WSAGetLastError() }
+        unsafe { WSAGetLastError() }
     }
 
     pub(crate) fn last_wsa_report(context: RioError, scope: &'static str) -> Report<RioError> {

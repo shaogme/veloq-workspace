@@ -18,7 +18,6 @@ use crate::{
 };
 use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
-use std::mem::{take, zeroed};
 use veloq_buf::BufferRegistrar;
 use veloq_driver_core::{
     driver::{
@@ -28,6 +27,11 @@ use veloq_driver_core::{
         RawCompletion, SharedCompletionTable, UserCompletionEvent,
     },
     slot::{Generation, InFlightOrphaned, InFlightWaiting, SlotState, SlotStatus},
+};
+use veloq_std::{
+    format,
+    mem::{take, zeroed},
+    string::ToString,
 };
 use windows_sys::Win32::{
     Foundation::ERROR_OPERATION_ABORTED,

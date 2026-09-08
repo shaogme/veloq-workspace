@@ -7,14 +7,15 @@ use crate::{
     rio::SocketInflightToken,
     win32::{IoCompletionPort, Overlapped},
 };
-use std::{
-    ptr::NonNull,
-    sync::{Arc, atomic::Ordering},
-    time::Instant,
-};
 use veloq_driver_core::{
     driver::{CompletionToken, OpToken, registry::OpRegistry as CoreOpRegistry},
     slot::{Generation, Slot as CoreSlot, SlotSpec as CoreSlotSpec},
+};
+use veloq_std::{
+    boxed::Box,
+    ptr::NonNull,
+    sync::{Arc, atomic::Ordering},
+    time::Instant,
 };
 use veloq_storage::{AtomicOptionPtr, StateOptionPtr};
 

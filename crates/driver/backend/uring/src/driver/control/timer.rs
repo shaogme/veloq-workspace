@@ -1,5 +1,8 @@
-use std::time::{Duration, Instant};
 use veloq_driver_core::driver::OpToken;
+use veloq_std::{
+    time::{Duration, Instant},
+    vec::Vec,
+};
 use veloq_wheel::{Wheel, WheelConfig};
 
 pub(crate) struct UringTimerWheel {

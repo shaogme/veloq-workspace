@@ -12,7 +12,7 @@ pub(crate) use veloq_driver_core::op::types::{
 
 use crate::config::{SockAddrStorage, UringRawHandle};
 use io_uring::types::Timespec;
-use std::{
+use veloq_std::{
     marker::{PhantomData, PhantomPinned},
     mem, ptr,
 };

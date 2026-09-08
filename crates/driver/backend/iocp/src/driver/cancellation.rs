@@ -6,6 +6,7 @@ use veloq_driver_core::{
     },
     slot::{CheckedSlotView, SlotRegistryExt, SlotView},
 };
+use veloq_std::format;
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 
 use crate::{

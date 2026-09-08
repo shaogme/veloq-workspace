@@ -146,7 +146,10 @@ impl SystermImpl for Systerm {
             closure: crate::cell::UnsafeCell::new(Some(crate::boxed::Box::new(f) as BoxF<'a, T>)),
             status: loom::sync::atomic::AtomicU8::new(super::STATE_INCOMPLETE),
             result: SafeUnsafeCell::new(None),
+            #[cfg(feature = "std")]
             panic_payload: SafeUnsafeCell::new(None),
+            #[cfg(not(feature = "std"))]
+            panic_payload: SafeUnsafeCell::new(()),
             name,
             thread: thread.clone(),
         });
@@ -203,9 +206,12 @@ impl SystermImpl for Systerm {
                                 Ordering::Acquire,
                             );
                         }
+                        #[cfg(feature = "std")]
                         Err(err) => unsafe {
                             self.panic_payload.with_mut(|opt| *opt = err);
                         },
+                        #[cfg(not(feature = "std"))]
+                        Err(err) => match err {},
                     }
                 }
             }

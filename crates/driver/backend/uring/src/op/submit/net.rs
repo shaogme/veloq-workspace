@@ -11,8 +11,8 @@ use crate::{
     },
 };
 use io_uring::{opcode, squeue, types};
-use std::{mem::size_of, ptr, slice::from_raw_parts};
 use veloq_driver_core::driver::SubmitTokenContext;
+use veloq_std::{mem::size_of, ptr, slice::from_raw_parts};
 
 use super::{invalid_buf_io_range, resolve_socket_fd, resolve_socket_fd_direct, sqe_with_fd};
 

@@ -6,6 +6,9 @@ pub use error::{Error, Result, SimpleMessage};
 pub use kind::ErrorKind;
 pub use os_error::RawOsError;
 
+#[cfg(feature = "std")]
+pub use std::io::{Read, Seek, Write};
+
 /// Creates a new I/O error from a known kind of error and a constant string literal.
 ///
 /// This macro does not allocate heap memory and can be used in `const` contexts.

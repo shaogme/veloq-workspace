@@ -1,4 +1,4 @@
-use std::{future::Future, marker::Send as StdSend};
+use veloq_std::{future::Future, marker::Send as StdSend};
 
 use futures_core::Stream;
 

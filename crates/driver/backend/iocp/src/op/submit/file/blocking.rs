@@ -1,7 +1,7 @@
 use veloq_blocking::BlockingTask;
 
 use diagweave::prelude::*;
-use std::{io, ptr, sync::Arc};
+use veloq_std::{boxed::Box, io, mem::size_of, ptr, sync::Arc, vec::Vec};
 use windows_sys::Win32::{
     Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, GetLastError, INVALID_HANDLE_VALUE},
     Storage::FileSystem::{
@@ -170,7 +170,7 @@ fn fallocate_file(handle: IocpHandle, mode: i32, offset: u64, len: u64) -> IocpR
             handle.as_handle(),
             FileAllocationInfo,
             &mut alloc_info as *mut _ as *mut _,
-            std::mem::size_of::<FILE_ALLOCATION_INFO>() as u32,
+            size_of::<FILE_ALLOCATION_INFO>() as u32,
         )
     };
     if ret == 0 {
@@ -186,7 +186,7 @@ fn fallocate_file(handle: IocpHandle, mode: i32, offset: u64, len: u64) -> IocpR
                 handle.as_handle(),
                 FileEndOfFileInfo,
                 &mut eof_info as *mut _ as *mut _,
-                std::mem::size_of::<FILE_END_OF_FILE_INFO>() as u32,
+                size_of::<FILE_END_OF_FILE_INFO>() as u32,
             )
         };
         if ret == 0 {

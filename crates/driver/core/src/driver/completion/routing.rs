@@ -1,6 +1,7 @@
 use crate::slot::{self, CheckedSlotView, SlotRegistryExt, SlotView};
 use crate::{DriverCoreError, DriverError, driver::registry::OpRegistry};
 use diagweave::prelude::*;
+use veloq_std::format;
 
 use super::{CompletionAnomalyKind, OpToken, UserCompletionEvent};
 

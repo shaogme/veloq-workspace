@@ -10,8 +10,8 @@ use crate::{
     win32::Overlapped,
 };
 use diagweave::prelude::*;
-use std::{ffi::c_void, ptr};
 use veloq_buf::BufferRegistrar;
+use veloq_std::{boxed::Box, ffi::c_void, ptr};
 use windows_sys::Win32::Networking::WinSock::{
     RIO_BUF, RIO_BUFFERID, RIO_CQ, RIO_IOCP_COMPLETION, RIO_NOTIFICATION_COMPLETION,
     RIO_NOTIFICATION_COMPLETION_0, RIO_NOTIFICATION_COMPLETION_0_1, RIO_RQ, RIORESULT,

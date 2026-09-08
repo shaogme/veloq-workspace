@@ -24,13 +24,23 @@ pub mod any {
     pub use core::any::*;
 }
 
+pub mod cmp {
+    pub use core::cmp::*;
+}
+
 pub mod convert {
     pub use core::convert::*;
 }
 
 pub mod hint {
     #[cfg(not(feature = "loom"))]
-    pub use core::hint::spin_loop;
+    pub use core::hint::*;
+
+    #[cfg(feature = "loom")]
+    pub use core::hint::{
+        assert_unchecked, black_box, cold_path, select_unpredictable, unreachable_unchecked,
+    };
+
     #[cfg(feature = "loom")]
     pub use loom::hint::spin_loop;
 }
@@ -48,6 +58,7 @@ pub mod error {
 }
 
 pub mod ffi {
+    pub use alloc_crate::ffi::CString;
     pub use core::ffi::*;
 }
 
@@ -89,6 +100,9 @@ pub mod num {
 
 pub mod net {
     pub use core::net::*;
+
+    #[cfg(feature = "std")]
+    pub use std::net::{TcpListener, TcpStream, UdpSocket};
 }
 
 pub mod boxed {
@@ -110,5 +124,7 @@ pub mod str {
 pub mod string {
     pub use alloc_crate::string::*;
 }
+
+pub mod os;
 
 pub mod panic;

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use veloq_std::sync::atomic::{AtomicU64, Ordering};
 
 use veloq_driver_core::driver::{CompletionAnomaly, DriverCompletionDiagnosticsBackend};
 

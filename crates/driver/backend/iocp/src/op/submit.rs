@@ -2,8 +2,8 @@ mod file;
 mod net;
 
 use diagweave::prelude::*;
-use std::{ffi::c_void, io, time::Duration};
 use veloq_blocking::BlockingTask;
+use veloq_std::{ffi::c_void, io, num::NonZeroUsize, string::ToString, time::Duration};
 use windows_sys::Win32::{
     Foundation::{ERROR_IO_PENDING, GetLastError},
     Networking::WinSock::{SOCKADDR, SOCKET},
@@ -327,7 +327,7 @@ fn ensure_handle_iocp_association(
     association: &mut Option<IocpAssociation>,
 ) -> IocpResult<()> {
     let port_raw_value = port.as_raw() as usize;
-    let Some(port_raw) = std::num::NonZeroUsize::new(port_raw_value) else {
+    let Some(port_raw) = NonZeroUsize::new(port_raw_value) else {
         return IocpError::InvalidState
             .with_ctx("handle_raw", handle.as_handle() as usize)
             .with_ctx("port_raw", port_raw_value)

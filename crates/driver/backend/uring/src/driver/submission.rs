@@ -9,7 +9,6 @@ use crate::{
 };
 use diagweave::prelude::*;
 use io_uring::{opcode, types};
-use std::task::Poll;
 use tracing::{debug, trace};
 use veloq_buf::heap::ChunkId;
 use veloq_driver_core::{
@@ -18,6 +17,7 @@ use veloq_driver_core::{
     },
     slot::{CheckedSlotView, InFlightWaiting},
 };
+use veloq_std::{format, task::Poll, vec};
 
 /// Turns a reserved slot's op into an SQE (or a wheel entry) and hands it to the kernel.
 ///

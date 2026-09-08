@@ -12,6 +12,7 @@ use diagweave::prelude::*;
 use io_uring::{opcode, squeue, types};
 use veloq_buf::{PoolKind, heap::ChunkId};
 use veloq_driver_core::driver::SubmitTokenContext;
+use veloq_std::string::ToString;
 
 use super::{invalid_buf_io_range, resolve_any_fd, resolve_file_fd, sqe_with_fd};
 

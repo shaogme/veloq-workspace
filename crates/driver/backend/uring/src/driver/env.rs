@@ -17,11 +17,10 @@ use crate::{
 };
 use diagweave::prelude::*;
 use io_uring::{IoUring, cqueue, squeue};
-use std::time::Instant;
 use tracing::{debug, trace};
 use veloq_buf::{BufferRegistrar, FixedBuf, heap::ChunkId};
 use veloq_driver_core::driver::OpToken;
-use veloq_std::collections::BitSet;
+use veloq_std::{collections::BitSet, format, time::Instant};
 use veloq_wheel::Wheel;
 
 /// What a `IOSQE_BUFFER_SELECT` submission needs to know about the provided-buffer ring.

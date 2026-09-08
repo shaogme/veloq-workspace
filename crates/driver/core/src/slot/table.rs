@@ -3,7 +3,11 @@ use crate::{
     slot::{SlotCompletionDiagnostics, SlotSpec, core::SlotData},
 };
 use crossbeam_utils::CachePadded;
-use veloq_std::sync::atomic::{AtomicUsize, Ordering};
+use veloq_std::{
+    boxed::Box,
+    sync::atomic::{AtomicUsize, Ordering},
+    vec::Vec,
+};
 
 pub type SlotEntry<Spec> = CachePadded<SlotData<Spec>>;
 pub type SlotEntries<Spec> = Box<[SlotEntry<Spec>]>;

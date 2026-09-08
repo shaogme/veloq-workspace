@@ -1,4 +1,4 @@
-use std::{io, num::NonZeroU8, time::Instant};
+use veloq_std::{format, io, mem, num::NonZeroU8, time::Instant, vec::Vec};
 
 use diagweave::prelude::*;
 use veloq_driver_core::{
@@ -381,7 +381,7 @@ fn complete_iocp_waiting_slot(
     if guard.platform_mut().is_background {
         let _ = guard.take_op();
         let _ = guard.take_completion_data();
-        let _data = std::mem::take(guard.platform_mut());
+        let _data = mem::take(guard.platform_mut());
         return Ok(CompletionHookOutcome::Cleanup {
             cleanup: CompletionCleanupGuard::default(),
             continuation: CompletionContinuation::Final,
@@ -410,7 +410,7 @@ fn complete_iocp_waiting_slot(
         UserCompletionEvent::from_parts(COMP_BACKEND_IOCP, event.token(), completion_res, 0);
     if let Some(payload) = payload {
         let _ = guard.take_op();
-        let _data = std::mem::take(guard.platform_mut());
+        let _data = mem::take(guard.platform_mut());
         Ok(CompletionHookOutcome::User {
             event,
             payload,
@@ -423,7 +423,7 @@ fn complete_iocp_waiting_slot(
     } else {
         drop(detail);
         let _ = guard.take_op();
-        let _data = std::mem::take(guard.platform_mut());
+        let _data = mem::take(guard.platform_mut());
         Err(IocpError::InvalidState.report(
             "iocp.complete_iocp_waiting_slot",
             "slot payload missing on completion",

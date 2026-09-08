@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use veloq_std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::rio::runtime::control_flow::{
     RIO_ANOMALY_MALFORMED, RIO_ANOMALY_MISSING, RIO_ANOMALY_STALE,

@@ -5,7 +5,7 @@ use crate::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         sys,
     },
-    thread::traits::{RawJoinHandleTrait, SystermImpl},
+    thread::traits::{RawJoinHandleTrait, RawThreadErrorTrait, SystermImpl},
 };
 
 #[cfg(feature = "std")]
@@ -15,12 +15,12 @@ use crate::{
     ptr::null_mut,
     sync::atomic::AtomicPtr,
     thread::panicking,
-    thread::traits::RawThreadErrorTrait,
 };
 
 pub(crate) struct RawScopeData<P: SystermImpl> {
     pub(crate) num_running_threads: AtomicU32,
     pub(crate) cancelled: AtomicBool,
+    _platform: PhantomData<fn() -> P>,
     #[cfg(feature = "std")]
     pub(crate) panics: AtomicPtr<P::Error>,
 }
@@ -104,21 +104,20 @@ impl<'scope, 'env, P: SystermImpl> RawScope<'scope, 'env, P> {
     {
         let scope_data = self.data;
         let closure = move || {
-            struct ThreadFinishedGuard<'a, P: SystermImpl> {
-                data: &'a RawScopeData<P>,
+            struct ThreadFinishedGuard<'a> {
+                data: &'a AtomicU32,
             }
-            impl<P: SystermImpl> Drop for ThreadFinishedGuard<'_, P> {
+            impl Drop for ThreadFinishedGuard<'_> {
                 fn drop(&mut self) {
-                    let old = self
-                        .data
-                        .num_running_threads
-                        .fetch_sub(1, Ordering::Release);
+                    let old = self.data.fetch_sub(1, Ordering::Release);
                     if old == 1 {
-                        sys::wake_by_address(&self.data.num_running_threads);
+                        sys::wake_by_address(self.data);
                     }
                 }
             }
-            let _guard = ThreadFinishedGuard { data: scope_data };
+            let _guard = ThreadFinishedGuard {
+                data: &scope_data.num_running_threads,
+            };
 
             #[cfg(feature = "std")]
             {
@@ -202,7 +201,14 @@ impl<'scope, P: SystermImpl, R: Send + 'scope> RawScopedJoinHandle<'scope, P, R>
                     return Err(err);
                 }
             }
-            Err(P::Error::from_panic(Default::default()))
+            #[cfg(feature = "std")]
+            {
+                Err(P::Error::from_panic(Default::default()))
+            }
+            #[cfg(not(feature = "std"))]
+            {
+                Err(P::Error::from_panic(()))
+            }
         }
     }
 
@@ -255,6 +261,7 @@ where
     let scope_data = RawScopeData {
         num_running_threads: AtomicU32::new(0),
         cancelled: AtomicBool::new(false),
+        _platform: PhantomData,
         #[cfg(feature = "std")]
         panics: AtomicPtr::new(null_mut()),
     };

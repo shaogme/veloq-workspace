@@ -5,12 +5,18 @@ use crate::{
     win32::SafeSocket,
 };
 use diagweave::report::ResultReportExt;
-use std::net::SocketAddr;
 use veloq_driver_core::PlatformSocket;
+use veloq_std::{
+    io,
+    mem::{self, size_of_val},
+    net::SocketAddr,
+    ptr, slice,
+};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, INVALID_SOCKET, IP_TTL, IPPROTO_IP, IPPROTO_TCP, IPPROTO_UDP, SO_BROADCAST,
     SO_KEEPALIVE, SO_RCVBUF, SO_REUSEADDR, SO_SNDBUF, SOCK_DGRAM, SOCK_STREAM, SOCKADDR,
-    SOL_SOCKET, TCP_NODELAY, WSA_FLAG_OVERLAPPED, WSA_FLAG_REGISTERED_IO, WSASocketW,
+    SOCKADDR_STORAGE, SOL_SOCKET, TCP_NODELAY, WSA_FLAG_OVERLAPPED, WSA_FLAG_REGISTERED_IO,
+    WSASocketW,
 };
 
 /// A socket handle wrapper.
@@ -21,9 +27,9 @@ pub struct Socket {
 impl Socket {
     fn new_with_flags_inner(af: u16, ty: i32, protocol: i32, flags: u32) -> IocpResult<Self> {
         // SAFETY: Calling WSASocketW with valid arguments.
-        let s = unsafe { WSASocketW(af as i32, ty, protocol, std::ptr::null(), 0, flags) };
+        let s = unsafe { WSASocketW(af as i32, ty, protocol, ptr::null(), 0, flags) };
         if s == INVALID_SOCKET {
-            return Err(IocpError::Socket.io_report("WSASocketW", std::io::Error::last_os_error()));
+            return Err(IocpError::Socket.io_report("WSASocketW", io::Error::last_os_error()));
         }
         Ok(Self {
             inner: SafeSocket(s),
@@ -91,7 +97,7 @@ impl Socket {
     /// Consumes the Socket and returns an owned handle.
     pub fn into_owned_raw(self) -> OwnedRawHandle {
         let h = self.inner.0;
-        std::mem::forget(self);
+        mem::forget(self);
         let raw = RawHandle::new(IocpHandle::for_socket(h as _));
         // SAFETY: this socket originates from `self` and ownership is uniquely transferred.
         unsafe { OwnedRawHandle::from_raw_owned(raw) }
@@ -109,10 +115,8 @@ impl Socket {
     /// Returns the local address of the socket.
     pub fn local_addr(&self) -> IocpResult<SocketAddr> {
         // SAFETY: SOCKADDR_STORAGE is a POD struct and safe to zero-initialize.
-        let mut storage = unsafe {
-            std::mem::zeroed::<windows_sys::Win32::Networking::WinSock::SOCKADDR_STORAGE>()
-        };
-        let mut len = std::mem::size_of_val(&storage) as i32;
+        let mut storage = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
+        let mut len = size_of_val(&storage) as i32;
         // SAFETY: storage and len are valid pointers to local variables.
         unsafe {
             self.inner
@@ -121,8 +125,7 @@ impl Socket {
         }
 
         // SAFETY: storage is a valid SOCKADDR_STORAGE and len is its size.
-        let buf =
-            unsafe { std::slice::from_raw_parts(&storage as *const _ as *const u8, len as usize) };
+        let buf = unsafe { slice::from_raw_parts(&storage as *const _ as *const u8, len as usize) };
         to_socket_addr(buf).attach_note("decode local socket address failed")
     }
 
@@ -278,9 +281,8 @@ pub fn peer_addr_of_handle(handle: IocpHandle) -> IocpResult<SocketAddr> {
 
 fn peer_addr_of_socket(socket: &SafeSocket) -> IocpResult<SocketAddr> {
     // SAFETY: SOCKADDR_STORAGE is a POD struct and safe to zero-initialize.
-    let mut storage =
-        unsafe { std::mem::zeroed::<windows_sys::Win32::Networking::WinSock::SOCKADDR_STORAGE>() };
-    let mut len = std::mem::size_of_val(&storage) as i32;
+    let mut storage = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
+    let mut len = size_of_val(&storage) as i32;
     // SAFETY: storage and len are valid pointers to local variables.
     unsafe {
         socket
@@ -289,7 +291,6 @@ fn peer_addr_of_socket(socket: &SafeSocket) -> IocpResult<SocketAddr> {
     }
 
     // SAFETY: storage is a valid SOCKADDR_STORAGE and len is its size.
-    let buf =
-        unsafe { std::slice::from_raw_parts(&storage as *const _ as *const u8, len as usize) };
+    let buf = unsafe { slice::from_raw_parts(&storage as *const _ as *const u8, len as usize) };
     to_socket_addr(buf).attach_note("decode peer socket address failed")
 }

@@ -7,6 +7,7 @@ use crate::{
     },
 };
 use diagweave::DiagnosticError;
+use veloq_std::format;
 
 use super::{
     AnomalyAttach, CompletionAnomalyKind, CompletionCleanupGuard, CompletionContinuation,

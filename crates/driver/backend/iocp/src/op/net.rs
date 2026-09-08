@@ -11,6 +11,7 @@ use crate::{
 };
 
 use veloq_driver_core::{driver::CompletionCleanupGuard, op::OpKind};
+use veloq_std::{mem::size_of, net::SocketAddr};
 use windows_sys::Win32::Networking::WinSock::{SOCKADDR_IN, SOCKADDR_IN6};
 
 impl IocpOpSpec for Recv {
@@ -251,8 +252,8 @@ impl IocpOpSpec for SendTo {
     fn new_kernel_payload(user: &Self) -> Self::KernelPayload {
         let (addr, _raw_addr_len) = socket_addr_to_storage(user.addr);
         let addr_len = match user.addr {
-            std::net::SocketAddr::V4(_) => std::mem::size_of::<SOCKADDR_IN>() as i32,
-            std::net::SocketAddr::V6(_) => std::mem::size_of::<SOCKADDR_IN6>() as i32,
+            SocketAddr::V4(_) => size_of::<SOCKADDR_IN>() as i32,
+            SocketAddr::V6(_) => size_of::<SOCKADDR_IN6>() as i32,
         };
         SendToPayload {
             user: PayloadRef::unbound(),

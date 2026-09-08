@@ -1,6 +1,12 @@
 use diagweave::prelude::*;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use veloq_pod::{bytes_of_mut, from_bytes_mut};
+use veloq_std::{
+    mem::size_of,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6},
+    ptr::null,
+    slice,
+    string::ToString,
+};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, SO_UPDATE_CONNECT_CONTEXT, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6,
     SOCKADDR_STORAGE, SOL_SOCKET,
@@ -65,7 +71,7 @@ pub(crate) fn submit_connect(
             s: handle.raw().as_socket(),
             name: &connect_op.addr as *const _ as *const SOCKADDR,
             namelen: connect_op.addr_len as i32,
-            lp_send_buffer: std::ptr::null(),
+            lp_send_buffer: null(),
             dw_send_data_length: 0,
             lp_dw_bytes_sent: &mut bytes_sent,
             lp_overlapped: overlapped,
@@ -75,7 +81,7 @@ pub(crate) fn submit_connect(
 
 fn ensure_socket_bound(handle: BorrowedRawHandle<'_>, connect_op: &Connect) -> IocpResult<()> {
     let mut storage = SockAddrStorage::default();
-    let mut namelen = std::mem::size_of::<SOCKADDR_STORAGE>() as i32;
+    let mut namelen = size_of::<SOCKADDR_STORAGE>() as i32;
 
     if with_borrowed_socket(handle.raw().as_socket(), |socket| {
         // SAFETY: storage and namelen are valid for this call.
@@ -87,13 +93,13 @@ fn ensure_socket_bound(handle: BorrowedRawHandle<'_>, connect_op: &Connect) -> I
         let is_bound = if family == AF_INET {
             // SAFETY: storage and namelen are valid and initialized by getsockname.
             let buf = unsafe {
-                std::slice::from_raw_parts(&storage.0 as *const _ as *const u8, namelen as usize)
+                slice::from_raw_parts(&storage.0 as *const _ as *const u8, namelen as usize)
             };
             addr::to_socket_addr(buf).is_ok_and(|a| a.port() != 0)
         } else if family == AF_INET6 {
             // SAFETY: storage and namelen are valid and initialized by getsockname.
             let buf = unsafe {
-                std::slice::from_raw_parts(&storage.0 as *const _ as *const u8, namelen as usize)
+                slice::from_raw_parts(&storage.0 as *const _ as *const u8, namelen as usize)
             };
             addr::to_socket_addr(buf).is_ok_and(|a| a.port() != 0)
         } else {
@@ -111,19 +117,19 @@ fn ensure_socket_bound(handle: BorrowedRawHandle<'_>, connect_op: &Connect) -> I
         let s = SockAddrIn::new(&addr);
         let mut storage = SockAddrStorage::default();
         let sin_ref = from_bytes_mut::<SockAddrIn>(
-            &mut bytes_of_mut(&mut storage)[..std::mem::size_of::<SOCKADDR_IN>()],
+            &mut bytes_of_mut(&mut storage)[..size_of::<SOCKADDR_IN>()],
         );
         *sin_ref = s;
-        (storage, std::mem::size_of::<SOCKADDR_IN>() as i32)
+        (storage, size_of::<SOCKADDR_IN>() as i32)
     } else {
         let addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0);
         let s = SockAddrIn6::new(&addr);
         let mut storage = SockAddrStorage::default();
         let sin6_ref = from_bytes_mut::<SockAddrIn6>(
-            &mut bytes_of_mut(&mut storage)[..std::mem::size_of::<SOCKADDR_IN6>()],
+            &mut bytes_of_mut(&mut storage)[..size_of::<SOCKADDR_IN6>()],
         );
         *sin6_ref = s;
-        (storage, std::mem::size_of::<SOCKADDR_IN6>() as i32)
+        (storage, size_of::<SOCKADDR_IN6>() as i32)
     };
     with_borrowed_socket(handle.raw().as_socket(), |socket| {
         // SAFETY: storage is a valid SOCKADDR_STORAGE for this call.

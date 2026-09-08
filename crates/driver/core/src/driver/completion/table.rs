@@ -1,8 +1,18 @@
 use crate::DriverError;
 use crate::slot::{self, Generation};
 use diagweave::prelude::*;
-use std::{sync::Arc, task::Waker};
-use veloq_std::sync::atomic::Ordering;
+use veloq_std::{
+    boxed::Box,
+    hint::spin_loop,
+    sync::{Arc, atomic::Ordering},
+    task::Waker,
+};
+
+#[cfg(any(test, feature = "loom"))]
+use veloq_std::string::String;
+
+#[cfg(feature = "loom")]
+use veloq_std::thread::yield_now;
 
 use super::{
     AnomalyAttach, AnomalyOutcome, CompletionAnomalyKind, CompletionInput, CompletionPacket,
@@ -66,9 +76,9 @@ pub const CELL_STATE_BUSY: u8 = 4;
 #[inline(always)]
 fn spin_yield() {
     #[cfg(feature = "loom")]
-    let _ = veloq_std::thread::yield_now();
+    let _ = yield_now();
     #[cfg(not(feature = "loom"))]
-    std::hint::spin_loop();
+    spin_loop();
 }
 
 #[inline]
@@ -541,7 +551,7 @@ where
                 let report = crate::DriverCoreError::Internal
                     .to_report()
                     .push_ctx("scope", "try_take_record")
-                    .attach_note(format!(
+                    .attach_note(veloq_std::format!(
                         "corrupt slot state: mailbox marked ready but holds no record. index: {}, generation: {}",
                         idx, generation
                     ));
@@ -696,7 +706,7 @@ where
 
     #[cfg(any(test, feature = "loom"))]
     fn debug_status_string(&self, idx: usize) -> String {
-        format!(
+        veloq_std::format!(
             "{:?}",
             self.slots[idx].load_core_state(Ordering::Acquire).status()
         )

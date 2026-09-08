@@ -15,8 +15,8 @@ use crate::{
     },
 };
 use diagweave::prelude::*;
-use std::mem::size_of;
 use veloq_buf::BufferRegistrar;
+use veloq_std::{mem::size_of, string::ToString};
 use windows_sys::Win32::Networking::WinSock::SOCKADDR_INET;
 
 struct RioSubmitTxn<'a> {

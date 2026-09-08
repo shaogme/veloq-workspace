@@ -1,5 +1,6 @@
 use crate::{Handle, IoFd, RawHandleMeta, SockAddr};
 use veloq_buf::FixedBuf;
+use veloq_std::{net::SocketAddr, time::Duration};
 
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,7 +139,7 @@ pub struct FsyncRaw<H: RawHandleMeta> {
 
 /// Timeout operation (platform-specific timing).
 pub struct Timeout {
-    pub duration: std::time::Duration,
+    pub duration: Duration,
 }
 
 /// Wake up the event loop.
@@ -156,7 +157,7 @@ pub struct Accept<H: Handle, A: SockAddr> {
     /// Length of the address buffer.
     pub addr_len: u32,
     /// Parsed remote address (populated after completion).
-    pub remote_addr: Option<std::net::SocketAddr>,
+    pub remote_addr: Option<SocketAddr>,
 }
 
 /// Accept connections on a listening socket until the operation is cancelled.
@@ -215,7 +216,7 @@ pub struct SendTo<H: Handle> {
     pub buf: FixedBuf,
     pub buf_offset: usize,
     /// Target address.
-    pub addr: std::net::SocketAddr,
+    pub addr: SocketAddr,
 }
 
 /// Sync file range.
@@ -255,13 +256,13 @@ pub struct UdpRecvFrom<H: Handle> {
     pub fd: IoFd<H>,
     pub buf: FixedBuf,
     pub buf_offset: usize,
-    pub addr: Option<std::net::SocketAddr>,
+    pub addr: Option<SocketAddr>,
 }
 
 /// A received UDP datagram.
 pub struct UdpRecvPacket {
     pub buf: UdpRecvPacketBuf,
-    pub addr: std::net::SocketAddr,
+    pub addr: SocketAddr,
 }
 
 pub enum UdpRecvPacketBuf {

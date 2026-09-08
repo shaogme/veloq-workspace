@@ -10,6 +10,7 @@ use veloq_driver_core::{
     driver::{CompletionToken, OpToken, SubmitTokenContext},
     slot::{SlotAccessError, SubmissionGuard},
 };
+use veloq_std::format;
 use veloq_wheel::TaskId;
 
 pub(crate) fn slot_access_report(scope: &'static str, err: SlotAccessError) -> Report<UringError> {

@@ -1,9 +1,10 @@
-use std::{
+use veloq_std::{
     collections::HashMap,
-    mem,
+    format, mem,
     num::NonZeroU8,
     sync::atomic::{AtomicBool, Ordering},
     time::Instant,
+    vec::Vec,
 };
 
 use diagweave::prelude::*;
@@ -860,7 +861,7 @@ mod tests {
     #[test]
     fn waker_control_records_unexpected_byte_count_as_error() {
         let diagnostics = DriverCompletionDiagnostics::<UringCompletionDiagnostics>::default();
-        let mut pending_cancel_cqes = HashMap::new();
+        let mut pending_cancel_cqes = HashMap::default();
         let mut waker_armed = true;
         let is_waked = AtomicBool::new(true);
         let mut hooks = test_hooks(
@@ -885,7 +886,7 @@ mod tests {
     #[test]
     fn untracked_cancel_cqe_is_anomaly_not_user_completion() {
         let diagnostics = DriverCompletionDiagnostics::<UringCompletionDiagnostics>::default();
-        let mut pending_cancel_cqes = HashMap::new();
+        let mut pending_cancel_cqes = HashMap::default();
         let mut waker_armed = true;
         let is_waked = AtomicBool::new(true);
         let mut hooks = test_hooks(

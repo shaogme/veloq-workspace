@@ -13,9 +13,9 @@ use crate::{
 };
 use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
-use std::ffi::c_void;
 use veloq_buf::{BufferRegistrar, FixedBuf};
 use veloq_driver_core::driver::OpToken;
+use veloq_std::ffi::c_void;
 
 pub(crate) use control_flow::RioSocketActor;
 

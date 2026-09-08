@@ -1,4 +1,4 @@
-use std::ptr::NonNull;
+use veloq_std::{any::type_name, ptr::NonNull};
 
 use crate::{
     config::IoFd,
@@ -83,7 +83,7 @@ where
     let payload = S::kernel_payload_mut(&mut op.payload).ok_or_else(|| {
         IocpError::InvalidState
             .to_report()
-            .with_ctx("op_type", std::any::type_name::<S>())
+            .with_ctx("op_type", type_name::<S>())
             .attach_note("variant mismatch in IocpKernelOp dispatch")
     })?;
     S::submit(&mut op.header, payload, ctx)
@@ -100,7 +100,7 @@ where
     let payload = S::kernel_payload_mut(&mut op.payload).ok_or_else(|| {
         IocpError::InvalidState
             .to_report()
-            .with_ctx("op_type", std::any::type_name::<S>())
+            .with_ctx("op_type", type_name::<S>())
             .attach_note("variant mismatch in IocpKernelOp on_complete")
     })?;
     unsafe { S::on_complete(&mut op.header, payload, result, ext) }
@@ -150,13 +150,13 @@ where
     let payload = S::kernel_payload_mut(&mut op.payload).ok_or_else(|| {
         IocpError::InvalidState
             .to_report()
-            .with_ctx("op_type", std::any::type_name::<S>())
+            .with_ctx("op_type", type_name::<S>())
             .attach_note("variant mismatch while binding IOCP kernel payload")
     })?;
     let user = S::user_payload_mut(erased).ok_or_else(|| {
         IocpError::InvalidState
             .to_report()
-            .with_ctx("op_type", std::any::type_name::<S>())
+            .with_ctx("op_type", type_name::<S>())
             .attach_note("variant mismatch while binding IOCP user payload")
     })?;
     payload.bind(NonNull::from(user));

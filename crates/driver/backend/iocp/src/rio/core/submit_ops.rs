@@ -24,6 +24,7 @@ use crate::{
     },
 };
 use veloq_buf::{BufferRegistrar, FixedBuf, NoopRegistrar, heap::ChunkId};
+use veloq_std::vec::Vec;
 
 impl RioState {
     pub(crate) fn new(

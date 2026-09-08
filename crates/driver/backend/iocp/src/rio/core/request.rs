@@ -9,8 +9,8 @@ use crate::{
     rio::{SocketInflightToken, error::RioError},
 };
 use diagweave::prelude::*;
-use std::ffi::c_void;
 use veloq_driver_core::{driver::OpToken, slot::Generation};
+use veloq_std::{ffi::c_void, string::ToString};
 use windows_sys::Win32::Networking::WinSock::RIO_BUF;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

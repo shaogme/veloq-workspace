@@ -3,14 +3,16 @@ use crate::{
     error::{UringError, UringResult},
 };
 use diagweave::prelude::*;
-use std::{
+use veloq_driver_core::driver::RemoteWaker;
+use veloq_std::{
+    boxed::Box,
     io, mem,
+    string::ToString,
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
     },
 };
-use veloq_driver_core::driver::RemoteWaker;
 
 pub(crate) struct EventFd {
     pub(crate) fd: OwnedRawHandle,
@@ -28,9 +30,7 @@ impl WakerFdState {
 
     #[inline]
     fn lock_fd(&self) -> MutexGuard<'_, Arc<EventFd>> {
-        self.fd
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.fd.lock()
     }
 
     #[inline]

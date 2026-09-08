@@ -9,6 +9,8 @@ use veloq_buf::{BufIoRangeError, FixedBuf};
 
 use diagweave::prelude::*;
 
+use veloq_std::string::ToString;
+
 use crate::{
     error::{IocpError, IocpResult},
     op::{

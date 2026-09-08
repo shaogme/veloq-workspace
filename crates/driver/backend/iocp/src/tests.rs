@@ -107,7 +107,7 @@ pub(crate) fn wait_completion(
     usize::from_event_res::<IocpError>(record.event.res()).map_err(|e| {
         let code = iocp_report_to_event_res(&e);
         let io_error = io::Error::from_raw_os_error(-code);
-        IocpError::CompletionWait.io_report("iocp.tests.wait_completion", io_error)
+        IocpError::CompletionWait.io_report("iocp.tests.wait_completion", io_error.into())
     })
 }
 

@@ -1,4 +1,5 @@
 use diagweave::prelude::*;
+use veloq_std::{mem::size_of, ptr::null_mut, slice, string::ToString};
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, SO_UPDATE_ACCEPT_CONTEXT, SOCKADDR, SOCKADDR_STORAGE, SOCKET, SOL_SOCKET,
 };
@@ -26,7 +27,7 @@ use super::{mark_socket_header_in_flight, with_borrowed_socket};
 
 fn socket_family_from_handle(handle: BorrowedRawHandle<'_>) -> IocpResult<u16> {
     let mut storage = SockAddrStorage::default();
-    let mut namelen = std::mem::size_of::<SOCKADDR_STORAGE>() as i32;
+    let mut namelen = size_of::<SOCKADDR_STORAGE>() as i32;
     with_borrowed_socket(handle.raw().as_socket(), |socket| {
         // SAFETY: storage and namelen are valid output pointers.
         unsafe { socket.getsockname(&mut storage.0 as *mut _ as *mut SOCKADDR, &mut namelen) }
@@ -146,14 +147,14 @@ pub(crate) unsafe fn on_complete_accept(
             .push_ctx("scope", "on_complete_accept")
             .with_ctx("accept_socket_raw", accept_socket_raw)
             .with_ctx("listen_socket_raw", listen_socket)
-            .with_ctx("socket_opt_len", std::mem::size_of::<SOCKET>())
+            .with_ctx("socket_opt_len", size_of::<SOCKET>())
             .attach_note("setsockopt(SO_UPDATE_ACCEPT_CONTEXT) failed"));
     }
 
     let split = ACCEPT_EX_ADDR_SECTION_LEN;
 
-    let mut local_sockaddr: *mut SOCKADDR = std::ptr::null_mut();
-    let mut remote_sockaddr: *mut SOCKADDR = std::ptr::null_mut();
+    let mut local_sockaddr: *mut SOCKADDR = null_mut();
+    let mut remote_sockaddr: *mut SOCKADDR = null_mut();
     let mut local_len: i32 = 0;
     let mut remote_len: i32 = 0;
 
@@ -173,9 +174,8 @@ pub(crate) unsafe fn on_complete_accept(
 
     if !remote_sockaddr.is_null() && remote_len > 0 {
         // SAFETY: remote_sockaddr and remote_len are provided by AcceptEx.
-        let buf = unsafe {
-            std::slice::from_raw_parts(remote_sockaddr as *const u8, remote_len as usize)
-        };
+        let buf =
+            unsafe { slice::from_raw_parts(remote_sockaddr as *const u8, remote_len as usize) };
         if let Ok(addr) = addr::to_socket_addr(buf) {
             user.remote_addr = Some(addr);
         }

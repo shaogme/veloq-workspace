@@ -5,11 +5,13 @@ mod polling;
 mod registration;
 mod submission;
 
-use std::{
+use veloq_blocking::ThreadPool;
+use veloq_std::{
+    format,
     sync::{Arc, mpsc},
     time::Duration,
+    vec::Vec,
 };
-use veloq_blocking::ThreadPool;
 
 use diagweave::prelude::*;
 

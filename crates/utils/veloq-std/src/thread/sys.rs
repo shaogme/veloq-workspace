@@ -14,7 +14,6 @@ mod loom;
 pub use loom::{RawJoinHandle, RawThreadError, Systerm};
 
 use crate::{
-    boxed::Box,
     cell::{Cell, UnsafeCell},
     string::String,
     sync::{
@@ -22,6 +21,9 @@ use crate::{
         atomic::{AtomicU8, Ordering},
     },
 };
+
+#[cfg(any(feature = "std", feature = "loom"))]
+use crate::boxed::Box;
 
 #[cfg(feature = "std")]
 pub(crate) type ThreadPanicPayload = Option<Box<dyn crate::any::Any + Send + 'static>>;
@@ -55,8 +57,7 @@ pub(crate) fn from_panic_payload(payload: ThreadPanicPayload) -> Option<SendSync
     }
     #[cfg(not(feature = "std"))]
     {
-        let _ = payload;
-        Some(())
+        Some(payload)
     }
 }
 
@@ -68,8 +69,7 @@ pub(crate) fn take_panic_payload(opt: &mut Option<SendSyncPanicPayload>) -> Thre
     }
     #[cfg(not(feature = "std"))]
     {
-        let _ = opt.take();
-        ()
+        opt.take();
     }
 }
 

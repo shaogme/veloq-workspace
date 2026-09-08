@@ -5,8 +5,8 @@ use crate::rio::{
     error::{RioError, RioResult},
 };
 use diagweave::prelude::*;
-use std::time::Instant;
 use veloq_buf::{FixedBuf, PoolKind, heap::ChunkId};
+use veloq_std::{time::Instant, vec::Vec};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct RioHeapBufferKey {

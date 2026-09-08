@@ -8,7 +8,7 @@ use crate::{
     },
 };
 use diagweave::prelude::*;
-use std::{
+use veloq_std::{
     ffi::c_void,
     mem::{size_of, size_of_val},
     ptr::{addr_of, copy_nonoverlapping, write_bytes},

@@ -19,8 +19,8 @@ use crate::{
     op::{IntoPlatformOp, OpKind},
     slot::{self, Generation},
 };
-use std::sync::mpsc;
 use veloq_std::sync::atomic::{AtomicUsize, Ordering};
+use veloq_std::sync::mpsc;
 
 struct DummyPlatformOp;
 

@@ -1,7 +1,7 @@
-use std::num::NonZeroU32;
+use veloq_std::num::NonZeroU32;
 
 #[cfg(windows)]
-use std::num::{NonZeroU16, NonZeroUsize};
+use veloq_std::num::{NonZeroU16, NonZeroUsize};
 
 #[cfg(windows)]
 pub use veloq_driver_iocp::{BufferRegistrationMode, IocpConfig};

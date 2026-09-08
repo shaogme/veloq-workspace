@@ -22,7 +22,7 @@ pub(crate) use state::{BlockingCompletion, BlockingSuccessCleanup, IocpOpRegistr
 pub use state::{IocpOpState, IocpSlotSpec, OverlappedEntry};
 pub(crate) use submit::{SubmissionResult, locate_registered_slot, resolve_fd_handle};
 
-use std::sync::Arc;
+use veloq_std::sync::Arc;
 
 use diagweave::{prelude::*, report::Report};
 

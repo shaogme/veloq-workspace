@@ -5,14 +5,14 @@ use crate::{
 };
 use diagweave::prelude::*;
 use libc::{c_int, sockaddr, sockaddr_in, sockaddr_in6, socklen_t};
-use std::os::fd::RawFd;
-use std::{
+use veloq_driver_core::{PlatformSocket, SocketAddrCodec};
+use veloq_std::{
     io,
     mem::{MaybeUninit, size_of, zeroed},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    os::fd::RawFd,
     ptr, slice,
 };
-use veloq_driver_core::{PlatformSocket, SocketAddrCodec};
 
 pub struct Socket {
     fd: OwnedRawHandle,

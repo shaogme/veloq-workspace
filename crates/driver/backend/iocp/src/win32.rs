@@ -1,4 +1,4 @@
-use std::{io::Error as IoError, ptr};
+use veloq_std::{boxed::Box, io::Error as IoError, mem::size_of, ptr};
 
 use crate::error::{IocpError, IocpResult};
 use veloq_driver_core::driver::CompletionToken;
@@ -246,7 +246,7 @@ impl SafeSocket {
                 level,
                 optname,
                 optval as *const T as *const u8,
-                std::mem::size_of::<T>() as i32,
+                size_of::<T>() as i32,
             )
         };
         if ret != 0 {
@@ -258,7 +258,7 @@ impl SafeSocket {
     /// Sets a socket option with an empty payload.
     pub fn setsockopt_empty(&self, level: i32, optname: i32) -> IocpResult<()> {
         // SAFETY: Setting socket option with no payload is safe for valid options.
-        let ret = unsafe { setsockopt(self.0, level, optname, std::ptr::null(), 0) };
+        let ret = unsafe { setsockopt(self.0, level, optname, ptr::null(), 0) };
         if ret != 0 {
             return Err(IocpError::Socket.io_report("setsockopt_empty", last_os_error()));
         }

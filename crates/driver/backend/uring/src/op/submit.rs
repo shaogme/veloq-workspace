@@ -15,13 +15,13 @@ use crate::{
 };
 use diagweave::prelude::*;
 use io_uring::{opcode, squeue, types};
-use std::io;
 use tracing::warn;
 use veloq_buf::BufIoRangeError;
 use veloq_driver_core::{
     DriverCoreError,
     driver::{CompletionCleanup, CompletionCleanupGuard, SubmitTokenContext},
 };
+use veloq_std::{io, string::ToString};
 
 #[inline]
 fn invalid_buf_io_range(scope: &'static str, err: BufIoRangeError) -> Report<UringError> {

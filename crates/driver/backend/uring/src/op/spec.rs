@@ -15,7 +15,6 @@ use crate::{
 };
 use diagweave::prelude::*;
 use io_uring::squeue;
-use std::{convert::identity, time::Duration};
 use veloq_buf::heap::ChunkId;
 use veloq_driver_core::{
     driver::{CompletionCleanupGuard, SubmitTokenContext},
@@ -24,6 +23,7 @@ use veloq_driver_core::{
         payload_projection_mismatch_report,
     },
 };
+use veloq_std::{convert::identity, time::Duration};
 
 pub(crate) trait UringOpSpec: Sized + Send + 'static {
     type KernelPayload;

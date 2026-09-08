@@ -226,9 +226,12 @@ pub fn available_parallelism() -> Result<NonZeroUsize, ThreadError> {
 
 /// 获取当前线程是否正在 panic。
 pub fn panicking() -> bool {
-    if cfg!(feature = "std") {
+    #[cfg(feature = "std")]
+    {
         std::thread::panicking()
-    } else {
+    }
+    #[cfg(not(feature = "std"))]
+    {
         false
     }
 }

@@ -6,7 +6,6 @@ use crate::{
     error::{UringError, UringResult},
 };
 use io_uring::squeue;
-use std::time::Duration;
 use veloq_buf::heap::ChunkId;
 use veloq_driver_core::{
     driver::{
@@ -15,6 +14,7 @@ use veloq_driver_core::{
     },
     slot::{Slot as CoreSlot, SlotSpec as CoreSlotSpec},
 };
+use veloq_std::time::Duration;
 
 mod payload;
 mod spec;

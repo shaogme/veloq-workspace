@@ -151,9 +151,12 @@ where
                     Ordering::Acquire,
                 );
             }
+            #[cfg(feature = "std")]
             Err(err) => unsafe {
                 state.panic_payload.with_mut(|opt| *opt = err);
             },
+            #[cfg(not(feature = "std"))]
+            Err(err) => match err {},
         }
     }
 
@@ -175,7 +178,10 @@ where
         closure: UnsafeCell::new(Some(f)),
         status: AtomicU8::new(super::STATE_INCOMPLETE),
         result: SafeUnsafeCell::new(None),
+        #[cfg(feature = "std")]
         panic_payload: SafeUnsafeCell::new(None),
+        #[cfg(not(feature = "std"))]
+        panic_payload: SafeUnsafeCell::new(()),
         name,
         thread: thread.clone(),
     });
@@ -238,9 +244,15 @@ impl<'a, T: Send> RawJoinHandle<'a, T> {
             match receiver.receive() {
                 Ok(Some(val)) => Ok(val),
                 Ok(None) => Err(RawThreadError::ResultMissing),
+                #[cfg(feature = "std")]
                 Err(super::STATE_PANICKED) => {
                     let payload = state.take_panic();
                     Err(RawThreadError::from_panic(payload))
+                }
+                #[cfg(not(feature = "std"))]
+                Err(super::STATE_PANICKED) => {
+                    state.take_panic();
+                    Err(RawThreadError::from_panic(()))
                 }
                 Err(super::STATE_ABORTED) => Err(RawThreadError::Aborted),
                 Err(_) => Err(RawThreadError::Aborted),

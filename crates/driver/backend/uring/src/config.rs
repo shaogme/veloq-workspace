@@ -1,11 +1,11 @@
-use std::{
-    mem,
-    num::{NonZeroU16, NonZeroU32, NonZeroUsize},
-};
 pub use veloq_driver_core::RawHandleKind;
 use veloq_driver_core::{
     BorrowedRawHandle as CoreBorrowedRawHandle, IoFd as CoreIoFd,
     OwnedRawHandle as CoreOwnedRawHandle, RawHandle as CoreRawHandle, RawHandleMeta,
+};
+use veloq_std::{
+    mem,
+    num::{NonZeroU16, NonZeroU32, NonZeroUsize},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

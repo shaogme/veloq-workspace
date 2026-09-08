@@ -23,14 +23,16 @@ use crate::{
 use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use slotmap::SlotMap;
-use std::{
-    mem::zeroed,
-    sync::OnceLock,
-    thread::{sleep, yield_now},
-    time::{Duration, Instant},
-};
 use veloq_buf::NoopRegistrar;
 use veloq_driver_core::driver::AnomalyAttach;
+use veloq_std::{
+    mem::{self, zeroed},
+    string::ToString,
+    sync::{OnceLock, mpsc},
+    thread::{Builder, sleep, yield_now},
+    time::{Duration, Instant},
+    vec::Vec,
+};
 use windows_sys::Win32::Networking::WinSock::{RIO_CORRUPT_CQ, RIORESULT};
 
 const RIO_REAPER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -76,7 +78,7 @@ impl DeferredRioCleanup {
                     outstanding_count = state.outstanding_count,
                     "RioReaper: leaking deferred RIO state to keep in-flight buffers alive"
                 );
-                std::mem::forget(state);
+                mem::forget(state);
                 return;
             }
         }
@@ -84,11 +86,11 @@ impl DeferredRioCleanup {
     }
 }
 
-fn reaper_sender() -> Option<&'static std::sync::mpsc::Sender<DeferredRioCleanup>> {
-    static SENDER: OnceLock<Option<std::sync::mpsc::Sender<DeferredRioCleanup>>> = OnceLock::new();
+fn reaper_sender() -> Option<&'static mpsc::Sender<DeferredRioCleanup>> {
+    static SENDER: OnceLock<Option<mpsc::Sender<DeferredRioCleanup>>> = OnceLock::new();
     let opt = SENDER.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<DeferredRioCleanup>();
-        match std::thread::Builder::new()
+        let (tx, rx) = mpsc::channel::<DeferredRioCleanup>();
+        match Builder::new()
             .name("veloq-rio-reaper".to_string())
             .spawn(move || {
                 while let Ok(task) = rx.recv() {
@@ -177,9 +179,9 @@ impl RioState {
             fn snooze(&mut self) {
                 if self.yields < 10 {
                     self.yields += 1;
-                    yield_now();
+                    let _ = yield_now();
                 } else {
-                    sleep(Duration::from_millis(1));
+                    let _ = sleep(Duration::from_millis(1));
                 }
             }
         }
@@ -236,19 +238,19 @@ impl RioState {
         if self.kernel.cq.is_invalid() {
             return None;
         }
-        let kernel = std::mem::replace(&mut self.kernel, RioKernel::noop());
-        let registry = std::mem::replace(&mut self.registry, RioRegistry::new(32, 1));
+        let kernel = mem::replace(&mut self.kernel, RioKernel::noop());
+        let registry = mem::replace(&mut self.registry, RioRegistry::new(32, 1));
         Some(DeferredRioCleanup {
             kernel,
             registry,
             registration_mode: self.registration_mode,
             submissions_closed: self.submissions_closed,
-            actors: std::mem::take(&mut self.actors),
-            actor_by_handle: std::mem::take(&mut self.actor_by_handle),
-            socket_runtime: std::mem::take(&mut self.socket_runtime),
-            outstanding_count: std::mem::take(&mut self.outstanding_count),
+            actors: mem::take(&mut self.actors),
+            actor_by_handle: mem::take(&mut self.actor_by_handle),
+            socket_runtime: mem::take(&mut self.socket_runtime),
+            outstanding_count: mem::take(&mut self.outstanding_count),
             next_request_id: self.next_request_id,
-            deferred_payloads: std::mem::take(&mut self.deferred_payloads),
+            deferred_payloads: mem::take(&mut self.deferred_payloads),
             diagnostics: self.diagnostics.clone(),
         })
     }

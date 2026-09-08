@@ -14,11 +14,14 @@
 //! 收益不在「省掉分配」，而在「**buffer 只在数据到达时才与连接绑定**」：一万个空闲连接不
 //! 再各自压着一个 recv buffer。移交 + 补充完整保留了这一点。
 
-use std::{
+use core::sync::atomic::{AtomicU16, Ordering as CoreOrdering};
+
+use veloq_std::{
+    boxed::Box,
     io, mem,
     num::NonZeroUsize,
     ptr::{self, NonNull},
-    sync::atomic::{AtomicU16, Ordering},
+    vec::Vec,
 };
 
 use diagweave::prelude::*;
@@ -344,7 +347,8 @@ impl ProvidedBufGroup {
         // 该字段 2 字节对齐且在映射范围内。release 保证条目内容先于 tail 对内核可见。
         unsafe {
             let tail_ptr = BufRingEntry::tail(self.ring.ptr.as_ptr()).cast_mut();
-            AtomicU16::from_ptr(tail_ptr).store(self.tail, Ordering::Release);
+            // `veloq_std` 尚未暴露 `AtomicU16::from_ptr`；这里是内核共享映射的原子 FFI 边界。
+            AtomicU16::from_ptr(tail_ptr).store(self.tail, CoreOrdering::Release);
         }
 
         self.stats.available = self.stats.available.saturating_add(1);

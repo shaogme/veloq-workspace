@@ -1,4 +1,5 @@
-use std::{
+use veloq_std::{
+    format,
     sync::Arc,
     task::Poll,
     time::{Duration, Instant},

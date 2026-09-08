@@ -29,14 +29,18 @@ use crate::{
 };
 use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
-use std::{
+use veloq_buf::{FixedBuf, heap::ChunkId};
+use veloq_driver_core::slot::Generation;
+use veloq_std::{
+    boxed::Box,
     collections::HashSet,
     mem::replace,
     ptr,
+    string::ToString,
     time::{Duration, Instant},
+    vec,
+    vec::Vec,
 };
-use veloq_buf::{FixedBuf, heap::ChunkId};
-use veloq_driver_core::slot::Generation;
 use windows_sys::Win32::Networking::WinSock::RIO_BUF;
 
 use super::{
@@ -353,7 +357,7 @@ impl RioRegistry {
     }
 
     pub(crate) fn cleanup_deregister(&mut self, env: RioEnv<'_>) {
-        let mut deregistered = HashSet::new();
+        let mut deregistered = HashSet::default();
 
         for id in self
             .chunk_registry

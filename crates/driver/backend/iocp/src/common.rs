@@ -1,6 +1,7 @@
-use std::{
+use veloq_std::{
     error::Error,
     fmt,
+    string::String,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},

@@ -6,8 +6,12 @@ use crate::{
         SlotSidecarData, SlotSnapshot, SlotSpec, SlotState, SlotStorage, SlotTable,
     },
 };
-use std::{mem, sync::Arc};
-use veloq_std::sync::atomic::Ordering;
+use veloq_std::{
+    boxed::Box,
+    mem,
+    sync::{Arc, atomic::Ordering},
+    vec::Vec,
+};
 
 pub type RegistryOp<T> = SlotOp<T>;
 pub type RegistryPayload<T> = SlotPayload<T>;

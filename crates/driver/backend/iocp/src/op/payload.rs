@@ -1,4 +1,4 @@
-use std::ptr::NonNull;
+use veloq_std::{any::type_name, mem::size_of, ptr::NonNull};
 
 use windows_sys::Win32::Networking::WinSock::SOCKADDR_STORAGE;
 
@@ -106,7 +106,7 @@ impl<T> PayloadRef<T> {
         let user = self.user.ok_or_else(|| {
             IocpError::InvalidState
                 .to_report()
-                .with_ctx("payload_type", std::any::type_name::<T>())
+                .with_ctx("payload_type", type_name::<T>())
                 .attach_note("IOCP user payload used before binding")
         })?;
         // SAFETY: the payload is bound to the live slot payload before submission.
@@ -118,7 +118,7 @@ impl<T> PayloadRef<T> {
         let mut user = self.user.ok_or_else(|| {
             IocpError::InvalidState
                 .to_report()
-                .with_ctx("payload_type", std::any::type_name::<T>())
+                .with_ctx("payload_type", type_name::<T>())
                 .attach_note("IOCP user payload used before binding")
         })?;
         // SAFETY: the payload is bound to the live slot payload before submission.
@@ -131,7 +131,7 @@ pub(crate) struct KernelRef<T> {
 }
 
 /// Payload for the socket accept operation.
-pub(crate) const ACCEPT_EX_ADDR_SECTION_LEN: usize = std::mem::size_of::<SOCKADDR_STORAGE>() + 16;
+pub(crate) const ACCEPT_EX_ADDR_SECTION_LEN: usize = size_of::<SOCKADDR_STORAGE>() + 16;
 pub(crate) const ACCEPT_EX_OUTPUT_BUFFER_LEN: usize = ACCEPT_EX_ADDR_SECTION_LEN * 2;
 
 pub(crate) struct AcceptPayload {

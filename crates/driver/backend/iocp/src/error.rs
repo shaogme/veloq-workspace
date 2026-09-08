@@ -1,5 +1,5 @@
 use core::convert::TryFrom;
-use std::fmt::Display;
+use veloq_std::{fmt::Display, io::Error as IoError, string::ToString};
 
 use diagweave::prelude::*;
 use veloq_driver_core::{DriverCoreError, DriverError};
@@ -52,7 +52,7 @@ impl IocpError {
     }
 
     #[inline]
-    pub(crate) fn io_report(self, scope: &'static str, error: std::io::Error) -> Report<Self> {
+    pub(crate) fn io_report(self, scope: &'static str, error: IoError) -> Report<Self> {
         let os_code = error.raw_os_error();
         let report = self
             .to_report()

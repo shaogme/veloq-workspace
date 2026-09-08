@@ -1,10 +1,12 @@
-use std::num::{NonZeroU32, NonZeroUsize};
 use veloq_blocking::BlockingPoolConfig;
 use veloq_driver_core::{
     BorrowedRawHandle as CoreBorrowedRawHandle, IoFd as CoreIoFd,
     OwnedRawHandle as CoreOwnedRawHandle, RawHandle as CoreRawHandle, RawHandleMeta,
 };
-use veloq_std::nz;
+use veloq_std::{
+    num::{NonZeroU32, NonZeroUsize},
+    nz,
+};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Networking::WinSock::{INVALID_SOCKET, SOCKET, closesocket};
 

@@ -4,9 +4,8 @@ pub mod types;
 pub use future::*;
 pub use types::OpKind;
 
-use std::marker::Send;
-
 use tracing::trace;
+use veloq_std::marker::Send;
 
 use crate::{
     DriverCoreError, DriverError, DriverReport, DriverResult,
@@ -84,7 +83,7 @@ pub trait IntoPlatformOp<Spec: SlotSpec>: Sized + Send {
 
 /// 只产出一条完成的操作。
 ///
-/// 这是 [`LocalOp`] / [`DetachedOp`] 的 [`Future`](std::future::Future) 实现的边界：两者
+/// 这是 [`LocalOp`] / [`DetachedOp`] 的 [`Future`](veloq_std::future::Future) 实现的边界：两者
 /// 对**任何**操作都是完成流（[`futures_core::Stream`]），但只有单发操作能被 `await`——
 /// `await` 一个 multishot 操作等于「取第一条完成然后取消」，那是个陷阱而不是特性，所以让
 /// 它在编译期就不成立。
@@ -122,7 +121,7 @@ impl<T> Op<T> {
 
     /// 提交一个操作，得到一个不借用驱动的句柄。
     ///
-    /// 句柄既是单发操作的 [`Future`](std::future::Future)，也是任意操作的完成流
+    /// 句柄既是单发操作的 [`Future`](veloq_std::future::Future)，也是任意操作的完成流
     /// （[`futures_core::Stream`]）——「一条还是多条」由 slot 层的
     /// [`CompletionContinuation`](crate::driver::CompletionContinuation) 决定，提交路径
     /// 对两者完全相同。
