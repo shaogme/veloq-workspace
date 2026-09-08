@@ -2,18 +2,19 @@ mod arena;
 mod header;
 mod nodes;
 mod scope;
+mod wake;
 
 pub use arena::{Arena, GenericArena};
 pub(crate) use header::GenericWakerNode;
-pub use header::{
-    GenericTaskHeader, INTRUSIVE_WAKER_VTABLE, LOCAL_INTRUSIVE_WAKER_VTABLE, PollStatus, TaskVTable,
-};
+pub use header::{GenericTaskHeader, PollStatus, TaskVTable};
+pub(crate) use header::{INTRUSIVE_WAKER_VTABLE, LOCAL_INTRUSIVE_WAKER_VTABLE};
 pub(crate) use nodes::{GenericTaskNode, TaskBounds, TaskStorage};
 pub use nodes::{LocalBoxedTaskNode, LocalTaskNode, SendBoxedTaskNode, SendTaskNode};
 pub use scope::{
     AnyScopeRef, AnySendScopeRef, ErasedCancellationToken, OpaqueScope, OpaqueToken, RawScope,
     ScopeCancelWaiter, ScopeCancelWaiterAdapter, ScopeParent, ScopeRef, ScopeStorage,
 };
+pub(crate) use wake::{LocalWakeHeaderGuard, LocalWakeTarget, TaskWakeToken};
 
 use crate::error::Result as RuntimeResult;
 use std::{
@@ -61,7 +62,7 @@ impl RuntimeContextExt for Context<'_> {
                 return h.is_cancelled();
             }
             if let Some(h) =
-                LocalTaskHeader::from_waker(self.waker(), &LOCAL_INTRUSIVE_WAKER_VTABLE)
+                LocalTaskHeader::local_from_waker(self.waker(), &LOCAL_INTRUSIVE_WAKER_VTABLE)
             {
                 return h.is_cancelled();
             }
@@ -75,7 +76,7 @@ impl RuntimeContextExt for Context<'_> {
                 return Some(h.scope_completion_ref().into_any());
             }
             if let Some(h) =
-                LocalTaskHeader::from_waker(self.waker(), &LOCAL_INTRUSIVE_WAKER_VTABLE)
+                LocalTaskHeader::local_from_waker(self.waker(), &LOCAL_INTRUSIVE_WAKER_VTABLE)
             {
                 return Some(h.scope_completion_ref().into_any());
             }

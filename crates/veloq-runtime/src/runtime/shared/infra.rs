@@ -453,7 +453,7 @@ impl TaskScheduler {
 
 pub(crate) struct IdleController {
     pub(crate) idle_mask: AtomicBitset,
-    pub(crate) event_count: EventCount,
+    pub(crate) event_count: Arc<EventCount>,
 }
 
 impl IdleController {

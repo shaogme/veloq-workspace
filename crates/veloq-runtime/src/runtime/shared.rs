@@ -20,7 +20,7 @@ use crate::{
     error::{Result, RuntimeError},
     runtime::primitives::{EventCount, Unparker, WakeFailureState},
     scope::{GenericScopeCompletion, ScopeBlockingWaiter},
-    task::{LocalTaskRef, ScopeStorage, SendTaskRef, TaskHandleRef},
+    task::{LocalTaskRef, LocalWakeTarget, ScopeStorage, SendTaskRef, TaskHandleRef},
     utils::{FastRand, ownership::Ownership},
 };
 
@@ -64,6 +64,7 @@ pub struct RuntimeSharedBase {
     pub(crate) idle: IdleController,
     pub(crate) shutdown: Arc<AtomicBool>,
     pub(crate) wake_failure: Arc<WakeFailureState>,
+    pub(crate) local_wake_targets: Box<[Arc<LocalWakeTarget>]>,
     pub(crate) worker_tick_hook: Option<WorkerTickHook>,
     /// Worker 线程核心上下文（不含用户 extra 状态）。
     pub(crate) tls: Tls<RuntimeTlsInner>,
@@ -184,6 +185,16 @@ impl<T> RuntimeShared<T> {
     ) -> Self {
         let shutdown = registry.shutdown.clone();
         let wake_failure = registry.wake_failure.clone();
+        let event_count = Arc::new(EventCount::new());
+        let local_wake_targets = (0..worker_count.get())
+            .map(|worker_id| {
+                Arc::new(LocalWakeTarget::new(
+                    worker_id,
+                    registry.unparkers[worker_id].clone(),
+                    event_count.clone(),
+                ))
+            })
+            .collect();
         Self {
             base: RuntimeSharedBase {
                 registry,
@@ -194,10 +205,11 @@ impl<T> RuntimeShared<T> {
                 },
                 idle: IdleController {
                     idle_mask: AtomicBitset::new(worker_count.get()),
-                    event_count: EventCount::new(),
+                    event_count,
                 },
                 shutdown,
                 wake_failure,
+                local_wake_targets,
                 worker_tick_hook,
                 tls: Tls::new(),
             },
@@ -251,6 +263,26 @@ impl RuntimeSharedBase {
         .with_category("runtime.dispatch")
     }
 
+    #[inline]
+    pub(crate) fn local_wake_target(&self, worker_id: usize) -> &Arc<LocalWakeTarget> {
+        &self.local_wake_targets[worker_id]
+    }
+
+    /// 由 owner worker 消费 local wake mailbox；mailbox 中的 token 不能在 foreign thread
+    /// 解引用 local header。
+    pub(crate) fn drain_local_wake_mailbox(&self, worker_id: usize) {
+        debug_assert_eq!(self.local_wake_target(worker_id).worker_id(), worker_id);
+        if let Ok(current_worker) = self.tls.try_with(|ctx| ctx.worker_id) {
+            debug_assert_eq!(
+                current_worker, worker_id,
+                "local wake mailbox must be drained by its owner worker"
+            );
+        }
+        while let Some(token) = self.local_wake_target(worker_id).pop() {
+            token.dispatch_on_owner();
+        }
+    }
+
     /// 入队失败后放弃任务：先归还 `STATE_QUEUED` 持有的引用，再终结任务本体，
     /// 确保 scope 义务一定被结算。
     fn abandon_queued_task<H: TaskHandleRef>(task: &H) {
@@ -269,6 +301,7 @@ impl RuntimeSharedBase {
     /// 这里终结，等待它们的作用域会永久挂起。任务体本身不在这里析构 —— 它随所属 arena /
     /// 调用栈一起释放，与「入队失败」路径的约定一致。
     pub(crate) fn abandon_worker_backlog(&self, worker_id: usize) {
+        self.drain_local_wake_mailbox(worker_id);
         let worker = &self.registry.workers[worker_id];
 
         if let Some(header) = worker.lifo.swap(None, Ordering::AcqRel) {
@@ -289,6 +322,9 @@ impl RuntimeSharedBase {
             worker.remote_count.fetch_sub(1, Ordering::Release);
             Self::abandon_queued_task(&task);
         }
+        // shutdown 期间 foreign wake 仍可能在第一次 drain 后到达；再次 drain 后，
+        // `abandon_if_shutdown` 会把它们结算，而不是把任务留在已经退出的 worker 上。
+        self.drain_local_wake_mailbox(worker_id);
     }
 
     /// 运行时已关停时，入队等于把任务送进一个再也不会被 poll 的队列。
@@ -306,6 +342,11 @@ impl RuntimeSharedBase {
 
     /// 将本地任务入队当前线程的本地队列。
     pub(crate) fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef) -> Result<()> {
+        debug_assert_eq!(
+            self.tls.try_with(|ctx| ctx.worker_id).ok(),
+            Some(worker_id),
+            "local task enqueue must run on the owner worker"
+        );
         if task.header().is_completed() {
             return Ok(());
         }
@@ -479,6 +520,8 @@ impl RuntimeSharedBase {
         tick: u32,
         rand: &FastRand,
     ) -> Result<bool> {
+        self.drain_local_wake_mailbox(worker_id);
+
         if tick.is_multiple_of(GLOBAL_QUEUE_INTERVAL)
             && let Some(task) = self.pop_global()
         {
@@ -565,11 +608,13 @@ impl<T> RuntimeShared<T> {
 
     pub(crate) fn has_work(&self, worker_id: usize) -> bool {
         let worker = &self.base.registry.workers[worker_id];
+        let local_wake_has_work = !self.base.local_wake_target(worker_id).is_empty();
         let local_has_work = worker.local_count.load(Ordering::Acquire) > 0;
         worker.lifo.load(Ordering::Acquire).is_some()
             || worker.remote_count.load(Ordering::Acquire) > 0
             || !worker.stealer.is_empty()
             || local_has_work
+            || local_wake_has_work
             || worker.pinned_count.load(Ordering::Acquire) > 0
     }
 
