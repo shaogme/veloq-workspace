@@ -6,7 +6,6 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    thread,
 };
 
 use crossbeam_deque::Worker;
@@ -20,7 +19,7 @@ use super::context::{IdleHook, IdleWaitStrategy, RuntimeTlsInner, WorkerTickHook
 use crate::{
     error::{Result, RuntimeError},
     runtime::primitives::{EventCount, Unparker, WakeFailureState},
-    scope::GenericScopeCompletion,
+    scope::{GenericScopeCompletion, ScopeBlockingWaiter},
     task::{LocalTaskRef, ScopeStorage, SendTaskRef, TaskHandleRef},
     utils::{FastRand, ownership::Ownership},
 };
@@ -640,20 +639,28 @@ impl<T> RuntimeShared<T> {
     /// `std::thread::scope` 在 `Drop` 里阻塞 join 同理，宁可挂住也不能放行。
     ///
     /// 正常情况下复用统一的调度循环（含 work stealing 与 idle/park 协调）；运行时正在关停
-    /// 时循环会立刻返回，退化为「排空自己的队列 + 让出 CPU」，而关停路径上每个 worker 退出
-    /// 前都会放弃自己队列里的积压任务并结算义务，因此仍能收敛。
+    /// 时循环会立刻返回，退化为「排空自己的队列 + 阻塞等待任务或 completion 唤醒」，而
+    /// 关停路径上每个 worker 退出前都会放弃自己队列里的积压任务并结算义务，因此仍能收敛。
     pub(crate) fn join_scope<S: ScopeStorage, O: Ownership + 'static>(
         &self,
         completion: &O::Shared<GenericScopeCompletion<S, O>>,
     ) -> Result<()> {
         if self.base.tls.try_with(|ctx| ctx.worker_id).is_err() {
             // 非 worker 线程上无法驱动调度器，只能等别的 worker 把子任务跑完。
+            let mut waiter = ScopeBlockingWaiter::new(&**completion, Unparker::new());
             while !completion.is_done() {
-                thread::yield_now();
+                waiter.arm();
+                if completion.is_done() {
+                    break;
+                }
+                waiter.park();
             }
             return self.base.fatal_error().map_or(Ok(()), Err);
         }
 
+        let worker_id = self.base.tls.with(|ctx| ctx.worker_id);
+        let mut waiter =
+            ScopeBlockingWaiter::new(&**completion, self.base.unparker(worker_id).clone());
         let mut first_error = None;
         while !completion.is_done() {
             if !self.base.shutdown.load(Ordering::Acquire) {
@@ -665,7 +672,14 @@ impl<T> RuntimeShared<T> {
                     self.base.shutdown();
                 }
             } else if !self.drain_one_pending_task() {
-                thread::yield_now();
+                waiter.arm();
+                if completion.is_done() {
+                    break;
+                }
+                if self.drain_one_pending_task() {
+                    continue;
+                }
+                waiter.park();
             }
         }
 

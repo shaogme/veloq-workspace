@@ -25,7 +25,7 @@ mod join;
 mod router;
 
 pub use completion::{GenericScopeCompletion, LocalScopeCompletion, ScopeCompletion};
-pub(crate) use completion::{ScopeCompletionRegistration, ScopeJoinFuture};
+pub(crate) use completion::{ScopeBlockingWaiter, ScopeCompletionRegistration, ScopeJoinFuture};
 pub use join::{JoinHandle, JoinOutcome, LocalAsyncJoinHandle, LocalJoinHandle, SendJoinHandle};
 
 use guard::ScopeTaskGuard;

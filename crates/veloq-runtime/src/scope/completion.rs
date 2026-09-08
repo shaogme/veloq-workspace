@@ -1,5 +1,5 @@
 use crate::{
-    runtime::primitives::GenericCancellationToken,
+    runtime::primitives::{GenericCancellationToken, Unparker, create_unpark_waker},
     task::{
         AnyScopeRef, ErasedCancellationToken, RawScope, ScopeCancelWaiter, ScopeParent,
         ScopeStorage,
@@ -71,6 +71,35 @@ impl<S: ScopeStorage, O: Ownership> Drop for ScopeCompletionRegistration<'_, S, 
         unsafe {
             self.completion.remove_waiter(node);
         }
+    }
+}
+
+/// 将作用域完成通知接到一个可阻塞的 [`Unparker`] 上。
+pub(crate) struct ScopeBlockingWaiter<'a, S: ScopeStorage, O: Ownership> {
+    registration: ScopeCompletionRegistration<'a, S, O>,
+    unparker: Unparker,
+    waker: Waker,
+}
+
+impl<'a, S: ScopeStorage, O: Ownership> ScopeBlockingWaiter<'a, S, O> {
+    pub(crate) fn new(completion: &'a GenericScopeCompletion<S, O>, unparker: Unparker) -> Self {
+        let waker = create_unpark_waker(unparker.clone());
+        let registration = ScopeCompletionRegistration::new(completion, &waker);
+        Self {
+            registration,
+            unparker,
+            waker,
+        }
+    }
+
+    /// 在每次准备阻塞前重新注册完成通知。
+    pub(crate) fn arm(&mut self) {
+        self.registration.register(&self.waker);
+    }
+
+    /// 消费一次通知；没有通知时进入操作系统阻塞。
+    pub(crate) fn park(&self) {
+        self.unparker.park();
     }
 }
 
@@ -359,6 +388,8 @@ impl<S: ScopeStorage, O: Ownership + 'static> RawScope for GenericScopeCompletio
 mod tests {
     use super::*;
     use crate::utils::ownership::ArcOwnership;
+    use std::sync::{Arc, Barrier, mpsc::sync_channel};
+    use std::thread;
     use veloq_storage::AtomicStorage;
 
     #[test]
@@ -368,6 +399,104 @@ mod tests {
         completion.settle_task();
         assert!(completion.is_done());
         completion.settle_task();
+        assert!(completion.is_done());
+    }
+
+    #[test]
+    fn blocking_waiter_returns_when_completion_settles() {
+        let completion = GenericScopeCompletion::<AtomicStorage, ArcOwnership>::new(None);
+        completion.register_task();
+        let (armed_tx, armed_rx) = sync_channel(0);
+        let completion_for_thread = completion.clone();
+
+        let waiter_thread = thread::spawn(move || {
+            let mut waiter = ScopeBlockingWaiter::new(&completion_for_thread, Unparker::new());
+            waiter.arm();
+            armed_tx.send(()).expect("waiter did not arm");
+
+            while !completion_for_thread.is_done() {
+                waiter.arm();
+                if completion_for_thread.is_done() {
+                    break;
+                }
+                waiter.park();
+            }
+        });
+
+        armed_rx.recv().expect("waiter thread exited early");
+        completion.settle_task();
+        waiter_thread.join().expect("waiter thread panicked");
+    }
+
+    #[test]
+    fn completion_before_park_is_remembered() {
+        let completion = GenericScopeCompletion::<AtomicStorage, ArcOwnership>::new(None);
+        completion.register_task();
+        let mut waiter = ScopeBlockingWaiter::new(&completion, Unparker::new());
+
+        waiter.arm();
+        completion.settle_task();
+        waiter.park();
+        assert!(completion.is_done());
+    }
+
+    #[test]
+    fn cancel_wakes_waiter_without_passing_join() {
+        let completion = GenericScopeCompletion::<AtomicStorage, ArcOwnership>::new(None);
+        completion.register_task();
+        let mut waiter = ScopeBlockingWaiter::new(&completion, Unparker::new());
+
+        waiter.arm();
+        completion.cancel();
+        waiter.park();
+        assert!(!completion.is_done());
+
+        waiter.arm();
+        completion.settle_task();
+        waiter.park();
+        assert!(completion.is_done());
+    }
+
+    #[test]
+    fn all_blocking_waiters_wake_when_completion_settles() {
+        let completion = GenericScopeCompletion::<AtomicStorage, ArcOwnership>::new(None);
+        completion.register_task();
+        let barrier = Arc::new(Barrier::new(3));
+
+        thread::scope(|scope| {
+            for _ in 0..2 {
+                let completion_for_thread = completion.clone();
+                let barrier_for_thread = barrier.clone();
+                scope.spawn(move || {
+                    let mut waiter =
+                        ScopeBlockingWaiter::new(&completion_for_thread, Unparker::new());
+                    waiter.arm();
+                    barrier_for_thread.wait();
+
+                    while !completion_for_thread.is_done() {
+                        waiter.arm();
+                        if completion_for_thread.is_done() {
+                            break;
+                        }
+                        waiter.park();
+                    }
+                });
+            }
+
+            barrier.wait();
+            completion.settle_task();
+        });
+    }
+
+    #[test]
+    fn dropping_drained_registration_is_safe() {
+        let completion = GenericScopeCompletion::<AtomicStorage, ArcOwnership>::new(None);
+        completion.register_task();
+        let mut waiter = ScopeBlockingWaiter::new(&completion, Unparker::new());
+
+        waiter.arm();
+        completion.settle_task();
+        drop(waiter);
         assert!(completion.is_done());
     }
 }
