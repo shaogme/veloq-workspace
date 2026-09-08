@@ -302,7 +302,7 @@ mod tests {
         config::IocpHandle,
         rio::core::{RioKernel, RioRegistry, RioRq},
     };
-    use std::ptr::null_mut;
+    use veloq_std::ptr::null_mut;
 
     fn test_state() -> RioState {
         use rustc_hash::FxHashMap;

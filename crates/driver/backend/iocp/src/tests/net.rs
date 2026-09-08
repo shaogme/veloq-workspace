@@ -9,20 +9,18 @@ use crate::{
         wait_completion, wait_completion_record,
     },
 };
-use std::{
+use veloq_buf::{BufPool, NoopRegistrar, PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
+use veloq_driver_core::driver::{CancelRequest, DriveMode, Driver, RegisterFd};
+use veloq_std::{
     io::Write,
     mem,
     net::{TcpListener, TcpStream},
     num::NonZeroUsize,
-    os::windows::io::IntoRawSocket,
+    nz,
     sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
-use veloq_buf::BufPool;
-use veloq_buf::{NoopRegistrar, PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
-use veloq_driver_core::driver::{CancelRequest, DriveMode, Driver, RegisterFd};
-use veloq_std::nz;
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 
 fn register_owned_socket(driver: &mut IocpDriver, socket: Socket) -> IoFd {
@@ -67,8 +65,8 @@ fn test_iocp_accept() {
     let token = submit_test_op(&mut driver, accept_op);
 
     // Connect Client in background
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(50));
+    let _ = thread::spawn(move || {
+        let _ = thread::sleep(Duration::from_millis(50));
         TcpStream::connect(addr).expect("Client connect failed");
     });
 
@@ -146,7 +144,8 @@ fn test_iocp_recv_with_buffer_pool() {
     let server_thread = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         stream.write_all(b"Hello Buffer").unwrap();
-    });
+    })
+    .unwrap();
 
     // Alloc buffer
     let buf = reg_pool
@@ -212,7 +211,8 @@ fn test_unregister_owned_socket_waits_for_inflight_recv() {
         let (mut stream, _) = listener.accept().unwrap();
         let _ = rx_send.recv();
         stream.write_all(b"recv-after-unregister").unwrap();
-    });
+    })
+    .unwrap();
 
     let client = Socket::new_tcp_v4().expect("client socket create failed");
     let client_fd = register_owned_socket(&mut driver, client);
@@ -279,7 +279,8 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
         let (mut stream, _) = listener.accept().unwrap();
         let _ = rx_send.recv();
         stream.write_all(b"late").unwrap();
-    });
+    })
+    .unwrap();
 
     let client = Socket::new_tcp_v4().expect("client socket create failed");
     let client_fd = register_owned_socket(&mut driver, client);
@@ -350,7 +351,8 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
         let (mut stream, _) = listener.accept().unwrap();
         let _ = rx_send.recv();
         stream.write_all(b"late").unwrap();
-    });
+    })
+    .unwrap();
 
     let client = Socket::new_tcp_v4().expect("client socket create failed");
     let client_fd = register_owned_socket(&mut driver, client);
@@ -409,7 +411,7 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
         if remote_free_contains(&driver, token.index()) {
             break;
         }
-        thread::sleep(Duration::from_millis(5));
+        let _ = thread::sleep(Duration::from_millis(5));
     }
 
     assert!(

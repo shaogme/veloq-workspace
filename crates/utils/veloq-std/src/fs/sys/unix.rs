@@ -347,3 +347,10 @@ impl FilePermissions {
         }
     }
 }
+
+pub fn remove_file(path: &Path) -> Result<()> {
+    let c_path = CString::new(path.as_bytes())
+        .map_err(|_| Error::new(ErrorKind::InvalidInput, "path contains null byte"))?;
+    cvt(unsafe { libc::unlink(c_path.as_ptr()) })?;
+    Ok(())
+}

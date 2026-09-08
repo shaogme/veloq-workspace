@@ -83,7 +83,7 @@ impl Default for Overlapped {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::mem::{offset_of, size_of};
+    use veloq_std::mem::{offset_of, size_of};
     use windows_sys::Win32::System::IO::{OVERLAPPED, OVERLAPPED_0_0};
 
     #[test]

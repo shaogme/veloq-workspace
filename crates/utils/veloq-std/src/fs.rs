@@ -6,7 +6,7 @@ use core::{fmt, time::Duration};
 
 use crate::{
     alloc_crate::{string::String, vec::Vec},
-    io::{Error, IoSlice, IoSliceMut, Read, Result, Seek, SeekFrom, Write},
+    io::{Error, IoSlice, IoSliceMut, Read, Result, Seek, SeekFrom, Write, copy as io_copy},
     path::Path,
 };
 
@@ -939,5 +939,10 @@ pub fn write<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> Result<()>
 pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> Result<u64> {
     let mut reader = File::open(from)?;
     let mut writer = File::create(to)?;
-    crate::io::copy(&mut reader, &mut writer)
+    io_copy(&mut reader, &mut writer)
+}
+
+/// Removes a file from the filesystem.
+pub fn remove_file<P: AsRef<Path>>(path: P) -> Result<()> {
+    sys::remove_file(path.as_ref())
 }

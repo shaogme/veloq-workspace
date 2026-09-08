@@ -379,8 +379,8 @@ fn iocp_status_flags(success: bool, error_code: Option<u32>) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ptr;
     use veloq_driver_core::driver::CompletionToken;
+    use veloq_std::ptr;
 
     #[test]
     fn null_overlapped_key_zero_failure_is_not_posted_token() {

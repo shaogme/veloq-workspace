@@ -5,20 +5,19 @@ use crate::{
     op::{IocpSlotSpec, ReadFixed, ReadRaw, Timeout, WriteFixed, WriteRaw},
     tests::{complete_from_record, submit_test_op, wait_completion, wait_completion_record},
 };
-use std::{
-    env,
-    fs::{File, OpenOptions},
-    num::NonZeroUsize,
-    os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
-    path::PathBuf,
-    process,
-    sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, Instant},
-};
+use std::{env, process};
 use veloq_buf::{FixedBuf, NoopRegistrar};
 use veloq_driver_core::{
     driver::{Driver, DriverSubmitResult, RegisterFd, SubmitStatus},
     op::IntoPlatformOp,
+};
+use veloq_std::{
+    fs::{File, OpenOptions, remove_file},
+    num::NonZeroUsize,
+    os::windows::fs::OpenOptionsExt,
+    path::PathBuf,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
 };
 use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
 
@@ -31,7 +30,14 @@ fn new_driver() -> IocpDriver<'static> {
 
 fn temp_file_path(label: &str) -> PathBuf {
     let id = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
-    env::temp_dir().join(format!("veloq-iocp-{label}-{}-{id}.tmp", process::id()))
+    let mut path = PathBuf::from(
+        env::temp_dir()
+            .to_str()
+            .expect("temp dir must be valid utf-8"),
+    );
+    let filename = format!("veloq-iocp-{label}-{}-{id}.tmp", process::id());
+    path.push(filename.as_str());
+    path
 }
 
 fn open_overlapped_temp_file(label: &str) -> (PathBuf, File) {
@@ -49,8 +55,8 @@ fn open_overlapped_temp_file(label: &str) -> (PathBuf, File) {
 
 fn remove_temp_file(path: PathBuf, file: File) {
     drop(file);
-    std::fs::remove_file(&path).unwrap_or_else(|err| {
-        panic!("remove temp file {} failed: {err}", path.display());
+    remove_file(&path).unwrap_or_else(|err| {
+        panic!("remove temp file {path} failed: {err}");
     });
 }
 

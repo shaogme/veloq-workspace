@@ -3,18 +3,18 @@ pub(crate) mod io_tests;
 pub(crate) mod net;
 pub(crate) mod net_udp;
 
-use core::convert::TryFrom;
 use diagweave::prelude::*;
-use std::{
-    io, thread,
-    time::{Duration, Instant},
-};
 use veloq_driver_core::{
     driver::{
         CompletionRecord, CompletionValue, DriveMode, Driver, DriverSubmitResult, OpToken,
         PollRecordResult,
     },
     op::{IntoPlatformOp, OpCompletion},
+};
+use veloq_std::{
+    convert::TryFrom,
+    io, thread,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -94,7 +94,7 @@ pub(crate) fn wait_completion_record(
             }
             PollRecordResult::Pending => {}
         }
-        thread::sleep(Duration::from_millis(5));
+        let _ = thread::sleep(Duration::from_millis(5));
     }
 }
 

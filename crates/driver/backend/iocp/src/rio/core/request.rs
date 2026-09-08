@@ -321,8 +321,7 @@ mod tests {
     use super::super::registry::RioRegistry;
     use super::*;
     use crate::config::IocpHandle;
-
-    use std::ptr;
+    use veloq_std::ptr;
 
     fn test_req_init(addr_slot: Option<usize>) -> RioOpRequestInit {
         let socket_key = IocpHandle::for_socket(ptr::null_mut());

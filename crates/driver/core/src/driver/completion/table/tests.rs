@@ -14,7 +14,11 @@ use crate::{
         SlotState, SlotView,
     },
 };
-use veloq_std::sync::atomic::{AtomicUsize, Ordering};
+use veloq_std::{
+    error::Error,
+    fmt,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 struct DummyPlatformOp;
 
@@ -25,13 +29,13 @@ impl PlatformOp for DummyPlatformOp {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 struct DummyError;
 
-impl std::fmt::Display for DummyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for DummyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "dummy error")
     }
 }
 
-impl std::error::Error for DummyError {}
+impl Error for DummyError {}
 
 impl crate::DriverError for DummyError {
     #[inline]

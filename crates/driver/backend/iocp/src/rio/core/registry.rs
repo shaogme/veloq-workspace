@@ -408,7 +408,8 @@ pub(crate) mod test_helpers {
         *,
     };
     use crate::BufferRegistrationMode;
-    use std::{
+    use veloq_buf::NoopRegistrar;
+    use veloq_std::{
         ffi::c_void,
         num::NonZeroUsize,
         sync::{
@@ -416,7 +417,6 @@ pub(crate) mod test_helpers {
             atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
         },
     };
-    use veloq_buf::NoopRegistrar;
     use windows_sys::Win32::Networking::WinSock::{
         RIO_BUFFERID, RIO_CQ, RIO_NOTIFICATION_COMPLETION, RIO_RQ, RIORESULT,
     };
@@ -434,15 +434,15 @@ pub(crate) mod test_helpers {
     pub(crate) fn reset_dispatch_state() {
         NEXT_REGISTER_ID.store(100, SeqCst);
         REGISTER_FAILS.store(false, SeqCst);
-        DEREGISTERED_IDS.lock().expect("deregister mutex").clear();
+        DEREGISTERED_IDS.lock().clear();
     }
 
     pub(crate) fn lock_dispatch_state() -> MutexGuard<'static, ()> {
-        DISPATCH_TEST_LOCK.lock().expect("dispatch test mutex")
+        DISPATCH_TEST_LOCK.lock()
     }
 
     pub(crate) fn deregistered_ids() -> Vec<usize> {
-        DEREGISTERED_IDS.lock().expect("deregister mutex").clone()
+        DEREGISTERED_IDS.lock().clone()
     }
 
     pub(crate) unsafe extern "system" fn test_create_cq(
@@ -476,10 +476,7 @@ pub(crate) mod test_helpers {
     }
 
     pub(crate) unsafe extern "system" fn test_deregister_buffer(id: RIO_BUFFERID) {
-        DEREGISTERED_IDS
-            .lock()
-            .expect("deregister mutex")
-            .push(id as usize);
+        DEREGISTERED_IDS.lock().push(id as usize);
     }
 
     pub(crate) unsafe extern "system" fn test_dequeue(

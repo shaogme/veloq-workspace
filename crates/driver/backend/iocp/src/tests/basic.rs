@@ -9,17 +9,12 @@ use crate::{
     op::{AcceptMulti, Close, Fsync, IocpSlotSpec, RecvMulti, RecvProvided},
     tests::{submit_test_op, wait_completion},
 };
-use std::{
-    fs::File,
-    mem,
-    os::windows::io::{AsRawHandle, IntoRawHandle},
-    time::Duration,
-};
 use veloq_buf::NoopRegistrar;
 use veloq_driver_core::{
     driver::{Driver, DriverSubmitResult, RegisterFd, SubmitStatus},
     op::IntoPlatformOp,
 };
+use veloq_std::{fs::File, mem, time::Duration};
 use windows_sys::Win32::Networking::WinSock::{WSACleanup, WSADATA, WSAStartup};
 
 struct TestWinsockGuard;

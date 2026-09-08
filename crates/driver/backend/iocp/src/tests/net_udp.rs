@@ -8,13 +8,12 @@ use crate::{
         wait_completion_record,
     },
 };
-use std::{net::UdpSocket, num::NonZeroUsize, sync::Arc, time::Duration};
 use veloq_buf::{
     BufPool, FixedBuf, NoopRegistrar, PoolTopology, UniformSlot,
     heap::{GlobalSlotPool, ThreadMemoryMultiplier},
 };
 use veloq_driver_core::driver::{CancelRequest, Driver, RegisterFd};
-use veloq_std::nz;
+use veloq_std::{net::UdpSocket, num::NonZeroUsize, nz, sync::Arc, time::Duration};
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 
 fn register_owned_socket(driver: &mut IocpDriver, socket: Socket) -> IoFd {

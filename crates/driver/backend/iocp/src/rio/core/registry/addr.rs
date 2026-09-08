@@ -199,7 +199,7 @@ impl RioRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::mem::zeroed;
+    use veloq_std::mem::zeroed;
 
     #[test]
     fn rio_send_addr_validation_rejects_short_sockaddr_before_family_read() {

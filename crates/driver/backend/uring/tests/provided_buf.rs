@@ -3,9 +3,11 @@
 //! 每个用例都会在缺 `IORING_REGISTER_PBUF_RING` 的内核（< 5.19）上自行跳过——那是仓库声明
 //! 支持的区间的一部分，不是失败。
 
-use std::{
+use veloq_std::{
+    any, io, mem,
     num::{NonZeroU16, NonZeroU32, NonZeroUsize},
     os::fd::RawFd,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -80,12 +82,7 @@ impl SocketPair {
         let mut fds = [0i32; 2];
         // SAFETY: `fds` 是一个长度为 2 的数组，正是 `socketpair` 要写入的形状。
         let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
-        assert_eq!(
-            rc,
-            0,
-            "socketpair failed: {}",
-            std::io::Error::last_os_error()
-        );
+        assert_eq!(rc, 0, "socketpair failed: {}", io::Error::last_os_error());
         Self {
             rx: fds[0],
             tx: fds[1],
@@ -102,12 +99,7 @@ impl SocketPair {
     fn shutdown_tx(&self) {
         // SAFETY: `tx` 是本结构持有的 fd。
         let rc = unsafe { libc::shutdown(self.tx, libc::SHUT_WR) };
-        assert_eq!(
-            rc,
-            0,
-            "shutdown failed: {}",
-            std::io::Error::last_os_error()
-        );
+        assert_eq!(rc, 0, "shutdown failed: {}", io::Error::last_os_error());
     }
 
     fn register_rx(&self, driver: &mut UringDriver<'static>) -> IoFd {
@@ -148,7 +140,7 @@ where
         DriverSubmitResult::Failed { report, status } => {
             panic!(
                 "submit {} failed: status={status:?}, error={report}",
-                std::any::type_name::<T>()
+                any::type_name::<T>()
             )
         }
     }
@@ -170,7 +162,9 @@ fn arm_recv_multi(driver: &mut UringDriver<'static>, fd: IoFd) -> Option<OpToken
     for _ in 0..3 {
         driver.drive(DriveMode::Poll).expect("drive failed");
         match driver.completion_table().try_take_record(token).unwrap() {
-            PollRecordResult::Pending => std::thread::sleep(Duration::from_millis(1)),
+            PollRecordResult::Pending => {
+                let _ = thread::sleep(Duration::from_millis(1));
+            }
             PollRecordResult::Ready(record) => {
                 assert_eq!(
                     record.event.res(),
@@ -213,7 +207,7 @@ fn drain_cancelled(driver: &mut UringDriver<'static>, token: OpToken) {
             Instant::now() < deadline,
             "the cancelled operation never settled"
         );
-        std::thread::sleep(Duration::from_millis(1));
+        let _ = thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -237,7 +231,7 @@ fn take_completion(driver: &mut UringDriver<'static>, token: OpToken) -> (i32, O
                     UringUserPayload::ProvidedBuf(provided) => provided.buf,
                     other => panic!(
                         "a RecvProvided completion must carry a ProvidedBuf, got kind {:?}",
-                        std::mem::discriminant(&other)
+                        mem::discriminant(&other)
                     ),
                 };
                 return (event.res(), buf);
@@ -245,7 +239,9 @@ fn take_completion(driver: &mut UringDriver<'static>, token: OpToken) -> (i32, O
             PollRecordResult::Unavailable { kind, .. } => {
                 panic!("completion record unavailable: {kind:?}")
             }
-            PollRecordResult::Pending => std::thread::sleep(Duration::from_millis(2)),
+            PollRecordResult::Pending => {
+                let _ = thread::sleep(Duration::from_millis(2));
+            }
         }
     }
 }
@@ -398,7 +394,7 @@ fn a_discarded_completion_returns_its_buffer_to_the_ring() {
             Instant::now() < deadline,
             "the orphaned completion never arrived"
         );
-        std::thread::sleep(Duration::from_millis(2));
+        let _ = thread::sleep(Duration::from_millis(2));
     }
 
     // 环没被削短：后面的 recv 照常拿得到 buffer。
@@ -506,7 +502,7 @@ fn a_cancelled_recv_multi_returns_its_buffer_to_the_ring() {
                 Instant::now() < deadline,
                 "orphaned completion {expected_returns} never arrived"
             );
-            std::thread::sleep(Duration::from_millis(2));
+            let _ = thread::sleep(Duration::from_millis(2));
         }
     }
 

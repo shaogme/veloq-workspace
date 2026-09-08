@@ -19,8 +19,15 @@ use crate::{
     op::{IntoPlatformOp, OpKind},
     slot::{self, Generation},
 };
-use veloq_std::sync::atomic::{AtomicUsize, Ordering};
-use veloq_std::sync::mpsc;
+use veloq_std::{
+    error::Error,
+    fmt,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
+    task::Waker,
+};
 
 struct DummyPlatformOp;
 
@@ -31,13 +38,13 @@ impl PlatformOp for DummyPlatformOp {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 struct DummyError;
 
-impl std::fmt::Display for DummyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for DummyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "dummy error")
     }
 }
 
-impl std::error::Error for DummyError {}
+impl Error for DummyError {}
 
 impl DriverError for DummyError {
     #[inline]
@@ -159,11 +166,7 @@ impl CompletionAccess<DummySlotSpec> for MockTable {
         }))
     }
 
-    fn register_waker(
-        &self,
-        _token: OpToken,
-        _waker: &std::task::Waker,
-    ) -> CompletionMutationOutcome {
+    fn register_waker(&self, _token: OpToken, _waker: &Waker) -> CompletionMutationOutcome {
         CompletionMutationOutcome::Applied
     }
 
@@ -268,7 +271,7 @@ where
     where
         T: SingleShotOp<DummySlotSpec>,
     {
-        let waker = std::task::Waker::noop();
+        let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
         let op = self.op.as_mut().expect("op still alive");
         Pin::new(op).poll(&mut cx)
@@ -277,7 +280,7 @@ where
     fn poll_next_once(&mut self) -> Poll<Option<OpResult<(), DummyError, usize>>> {
         use futures_core::Stream;
 
-        let waker = std::task::Waker::noop();
+        let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
         let op = self.op.as_mut().expect("op still alive");
         Pin::new(op).poll_next(&mut cx)

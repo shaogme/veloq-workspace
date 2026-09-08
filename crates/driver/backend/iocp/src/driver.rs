@@ -122,8 +122,8 @@ impl<'a> IocpDriver<'a> {
 
     #[cfg(test)]
     pub(crate) fn debug_remote_free_contains(&self, needle: usize) -> bool {
-        use std::sync::atomic::Ordering;
         use veloq_driver_core::slot::SlotTable;
+        use veloq_std::sync::atomic::Ordering;
 
         let mut cur = self.ops.shared.remote_free_head.load(Ordering::Acquire);
         while cur != SlotTable::<IocpSlotSpec>::NULL_INDEX {

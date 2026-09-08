@@ -308,8 +308,10 @@ impl Drop for RioState {
 
 #[cfg(test)]
 mod tests {
+    use veloq_std::time::Duration;
+
     #[test]
     fn timeout_constant_is_positive() {
-        assert!(super::RIO_REAPER_DRAIN_TIMEOUT > std::time::Duration::from_secs(0));
+        assert!(super::RIO_REAPER_DRAIN_TIMEOUT > Duration::from_secs(0));
     }
 }

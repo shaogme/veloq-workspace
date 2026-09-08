@@ -1,5 +1,13 @@
-use std::num::NonZeroU32;
-use std::os::fd::AsRawFd;
+use veloq_std::{
+    array,
+    fs::File,
+    mem,
+    num::NonZeroU32,
+    thread,
+    time::{Duration, Instant},
+    vec,
+    vec::Vec,
+};
 
 use veloq_buf::NoopRegistrar;
 use veloq_driver_core::driver::{
@@ -51,7 +59,7 @@ fn new_driver_with_file_table_or_skip(
     }
 }
 
-fn raw_file(file: &std::fs::File) -> RawHandle {
+fn raw_file(file: &File) -> RawHandle {
     RawHandle::new(UringRawHandle::for_file(file.as_raw_fd()))
 }
 
@@ -59,14 +67,11 @@ fn invalid_file_handle() -> RawHandle {
     RawHandle::new(UringRawHandle::for_file(i32::MAX))
 }
 
-fn open_cargo_files<const N: usize>() -> [std::fs::File; N] {
-    std::array::from_fn(|_| std::fs::File::open("Cargo.toml").unwrap())
+fn open_cargo_files<const N: usize>() -> [File; N] {
+    array::from_fn(|_| File::open("Cargo.toml").unwrap())
 }
 
-fn register_borrowed_files(
-    driver: &mut UringDriver<'static>,
-    files: &[std::fs::File],
-) -> Vec<IoFd> {
+fn register_borrowed_files(driver: &mut UringDriver<'static>, files: &[File]) -> Vec<IoFd> {
     let raw_files = files.iter().map(raw_file).collect::<Vec<_>>();
     let registrations = raw_files
         .iter()
@@ -81,7 +86,7 @@ fn stale_registered_fd_generation_rejected_on_submit() {
         return;
     };
 
-    let first = std::fs::File::open("Cargo.toml").unwrap();
+    let first = File::open("Cargo.toml").unwrap();
     let first_raw = RawHandle::new(UringRawHandle::for_file(first.as_raw_fd()));
     let stale_fd = driver
         .register_files(vec![RegisterFd::Borrowed(first_raw.borrow())])
@@ -91,7 +96,7 @@ fn stale_registered_fd_generation_rejected_on_submit() {
         .unwrap();
     driver.unregister_files(vec![stale_fd]).unwrap();
 
-    let second = std::fs::File::open("Cargo.toml").unwrap();
+    let second = File::open("Cargo.toml").unwrap();
     let second_raw = RawHandle::new(UringRawHandle::for_file(second.as_raw_fd()));
     let fresh_fd = driver
         .register_files(vec![RegisterFd::Borrowed(second_raw.borrow())])
@@ -166,7 +171,7 @@ fn failed_batch_registration_rolls_back_successful_prefix() {
         return;
     };
 
-    let first = std::fs::File::open("Cargo.toml").unwrap();
+    let first = File::open("Cargo.toml").unwrap();
     let first_raw = raw_file(&first);
     let invalid = invalid_file_handle();
     assert!(
@@ -204,7 +209,7 @@ fn exhausted_batch_registration_does_not_partially_register() {
 
 fn register_borrowed_files_result(
     driver: &mut UringDriver<'static>,
-    files: &[std::fs::File],
+    files: &[File],
 ) -> UringResult<Vec<IoFd>> {
     let raw_files = files.iter().map(raw_file).collect::<Vec<_>>();
     let registrations = raw_files
@@ -217,9 +222,9 @@ fn register_borrowed_files_result(
 fn wait_completion(
     driver: &mut UringDriver<'static>,
     token: veloq_driver_core::driver::OpToken,
-    timeout: std::time::Duration,
+    timeout: Duration,
 ) -> usize {
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     loop {
         if start.elapsed() > timeout {
             panic!("wait_completion timed out");
@@ -247,7 +252,7 @@ fn wait_completion(
             }
             PollRecordResult::Pending => {}
         }
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        let _ = thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -277,7 +282,7 @@ fn close_owned_registered_file() {
         return;
     };
 
-    let file = std::fs::File::open("Cargo.toml").unwrap();
+    let file = File::open("Cargo.toml").unwrap();
     let raw_fd = file.as_raw_fd();
     let owned =
         unsafe { OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_file(raw_fd))) };
@@ -292,7 +297,7 @@ fn close_owned_registered_file() {
         .expect("a default file table registers descriptors");
 
     let token = submit_test_op(&mut driver, Close { fd });
-    let closed = wait_completion(&mut driver, token, std::time::Duration::from_secs(5));
+    let closed = wait_completion(&mut driver, token, Duration::from_secs(5));
     assert_eq!(closed, 0);
 
     let fsync_fd = driver
@@ -310,8 +315,8 @@ fn close_owned_registered_file() {
 }
 
 /// Registers one file past the kernel table and returns its direct descriptor.
-fn register_one_beyond(driver: &mut UringDriver<'static>) -> (std::fs::File, IoFd) {
-    let file = std::fs::File::open("Cargo.toml").unwrap();
+fn register_one_beyond(driver: &mut UringDriver<'static>) -> (File, IoFd) {
+    let file = File::open("Cargo.toml").unwrap();
     let raw = raw_file(&file);
     let fd = driver
         .register_files(vec![RegisterFd::Borrowed(raw.borrow())])
@@ -344,7 +349,7 @@ fn a_full_file_table_falls_back_to_unregistered_descriptors() {
             datasync: false,
         },
     );
-    let result = wait_completion(&mut driver, token, std::time::Duration::from_secs(5));
+    let result = wait_completion(&mut driver, token, Duration::from_secs(5));
     assert_eq!(result, 0, "fsync on a fallback descriptor must succeed");
 
     driver.unregister_files(vec![fd]).unwrap();
@@ -367,7 +372,7 @@ fn a_disabled_file_table_serves_every_descriptor_as_a_raw_fd() {
             datasync: false,
         },
     );
-    let result = wait_completion(&mut driver, token, std::time::Duration::from_secs(5));
+    let result = wait_completion(&mut driver, token, Duration::from_secs(5));
     assert_eq!(
         result, 0,
         "fsync without a registered file table must succeed"
@@ -418,9 +423,9 @@ fn close_owned_fallback_file() {
         return;
     };
 
-    let file = std::fs::File::open("Cargo.toml").unwrap();
+    let file = File::open("Cargo.toml").unwrap();
     let raw_fd = file.as_raw_fd();
-    std::mem::forget(file);
+    mem::forget(file);
     let owned =
         unsafe { OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_file(raw_fd))) };
     let fd = driver
@@ -432,14 +437,14 @@ fn close_owned_fallback_file() {
     assert!(fd.is_direct(), "expected a fallback descriptor");
 
     let token = submit_test_op(&mut driver, Close { fd });
-    let closed = wait_completion(&mut driver, token, std::time::Duration::from_secs(5));
+    let closed = wait_completion(&mut driver, token, Duration::from_secs(5));
     assert_eq!(closed, 0);
 
     // The kernel already closed this fd, so the driver must have *forgotten* the handle it
     // owned rather than dropped it. Linux hands out the lowest free fd, so reopening usually
     // lands on the very number just released — unregistering the dead descriptor must not
     // close that new file out from under us.
-    let reopened = std::fs::File::open("Cargo.toml").unwrap();
+    let reopened = File::open("Cargo.toml").unwrap();
     driver.unregister_files(vec![fd]).unwrap();
     if reopened.as_raw_fd() == raw_fd {
         reopened
@@ -454,7 +459,7 @@ fn close_borrowed_registered_file_is_rejected() {
         return;
     };
 
-    let file = std::fs::File::open("Cargo.toml").unwrap();
+    let file = File::open("Cargo.toml").unwrap();
     let raw = raw_file(&file);
     let fd = driver
         .register_files(vec![RegisterFd::Borrowed(raw.borrow())])

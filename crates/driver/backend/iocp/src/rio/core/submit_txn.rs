@@ -582,9 +582,9 @@ mod tests {
     };
     use rustc_hash::FxHashMap;
     use slotmap::SlotMap;
-    use std::{cell::Cell, sync::atomic::Ordering};
     use veloq_buf::{FixedBuf, NoopRegistrar};
     use veloq_driver_core::{driver::OpToken, slot::Generation};
+    use veloq_std::{cell::Cell, sync::atomic::Ordering};
 
     fn test_state_with_dispatch(addr_capacity: usize) -> RioState {
         let mut kernel = RioKernel::noop();

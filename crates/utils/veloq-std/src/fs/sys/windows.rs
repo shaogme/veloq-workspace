@@ -6,8 +6,8 @@ use windows_sys::Win32::{
         GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
     },
     Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, CREATE_ALWAYS, CREATE_NEW, CreateFileW, FILE_APPEND_DATA,
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY,
+        BY_HANDLE_FILE_INFORMATION, CREATE_ALWAYS, CREATE_NEW, CreateFileW, DeleteFileW,
+        FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_BEGIN, FILE_CURRENT, FILE_END, FlushFileBuffers,
         GetFileInformationByHandle, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
         OPEN_ALWAYS, OPEN_EXISTING, ReadFile, SetEndOfFile, SetFilePointerEx, SetFileTime,
@@ -20,8 +20,12 @@ use crate::{
     alloc_crate::vec::Vec,
     fs::{FileTimes, FileType, OpenOptions, TryLockError},
     io::{Error, ErrorKind, IoSlice, IoSliceMut, Result, SeekFrom},
-    os::windows::io::{
-        AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, IntoRawHandle, OwnedHandle, RawHandle,
+    os::{
+        cvt::cvt,
+        windows::io::{
+            AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, IntoRawHandle, OwnedHandle,
+            RawHandle,
+        },
     },
     path::Path,
 };
@@ -565,4 +569,17 @@ impl FilePermissions {
     pub fn set_readonly(&mut self, readonly: bool) {
         self.readonly = readonly;
     }
+}
+
+pub fn remove_file(path: &Path) -> Result<()> {
+    if path.as_str().contains('\0') {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "path contains null byte",
+        ));
+    }
+    let mut wide: Vec<u16> = path.as_str().encode_utf16().collect();
+    wide.push(0);
+    cvt(unsafe { DeleteFileW(wide.as_ptr()) })?;
+    Ok(())
 }

@@ -9,6 +9,8 @@ use veloq_driver_core::{
     },
 };
 use veloq_std::{
+    error::Error,
+    fmt,
     sync::{Arc, Mutex},
     thread,
 };
@@ -22,13 +24,13 @@ impl PlatformOp for DummyPlatformOp {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 struct DummyError;
 
-impl std::fmt::Display for DummyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for DummyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "dummy error")
     }
 }
 
-impl std::error::Error for DummyError {}
+impl Error for DummyError {}
 
 impl DriverError for DummyError {
     #[inline]
