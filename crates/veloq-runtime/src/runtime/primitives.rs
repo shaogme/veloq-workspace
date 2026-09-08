@@ -4,8 +4,8 @@ use std::{
     pin::Pin,
     ptr::NonNull,
     sync::{
-        Arc, OnceLock,
-        atomic::{AtomicU32, AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
     time::Duration,
@@ -14,6 +14,7 @@ use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 use veloq_storage::{StateInt, StateLock, StateWakerQueue, Storage};
 
 use crate::{
+    error::RuntimeWakeError,
     task::{AnySendScopeRef, OpaqueToken, ScopeCancelWaiter, ScopeCancelWaiterAdapter},
     utils::ownership::Ownership,
 };
@@ -204,6 +205,56 @@ impl Signal {
     }
 }
 
+/// 运行时共享的 remote wake 故障状态。
+///
+/// 唤醒入口可能来自 raw `Waker`，因此不能依赖返回值把错误交给调用者。所有入口都把
+/// 第一个错误写入这里，并设置 shutdown；仍能处理返回值的同步调用者会同时收到原始的
+/// `RuntimeWakeError`。
+pub(crate) struct WakeFailureState {
+    first_error: Mutex<Option<RuntimeWakeError>>,
+    failed: AtomicBool,
+    error_count: AtomicU64,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl WakeFailureState {
+    pub(crate) fn new(shutdown: Arc<AtomicBool>) -> Self {
+        Self {
+            first_error: Mutex::new(None),
+            failed: AtomicBool::new(false),
+            error_count: AtomicU64::new(0),
+            shutdown,
+        }
+    }
+
+    pub(crate) fn record(&self, error: RuntimeWakeError) {
+        self.error_count.fetch_add(1, Ordering::Relaxed);
+        let mut first_error = self.first_error.lock().unwrap_or_else(|e| e.into_inner());
+        if first_error.is_none() {
+            *first_error = Some(error);
+        }
+        drop(first_error);
+        self.failed.store(true, Ordering::Release);
+        self.shutdown.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn first_error(&self) -> Option<RuntimeWakeError> {
+        self.first_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn is_failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn error_count(&self) -> u64 {
+        self.error_count.load(Ordering::Relaxed)
+    }
+}
+
 /// `block_on` 那个外层 future 的唤醒目标。
 ///
 /// 主线程既是 0 号 worker、又是唯一驱动外层 future 的地方，所以一次唤醒必须同时做两件
@@ -226,7 +277,9 @@ impl BlockOnSignal {
 
     pub(crate) fn notify(&self) {
         self.ready.notify();
-        self.unparker.unpark();
+        if self.unparker.unpark().is_err() {
+            // raw task Waker 无法返回错误；Unparker 已保存共享 fatal 状态。
+        }
     }
 
     /// 取走「待 poll」标记；返回 `true` 表示本轮应当 poll 外层 future。
@@ -272,11 +325,11 @@ static UNPARK_VTABLE: RawWakerVTable = RawWakerVTable::new(
     },
     |p| unsafe {
         let inner = Arc::from_raw(p as *const UnparkerInner);
-        inner.wake();
+        inner.wake_from_raw();
     },
     |p| unsafe {
         let inner = ManuallyDrop::new(Arc::from_raw(p as *const UnparkerInner));
-        inner.wake();
+        inner.wake_from_raw();
     },
     |p| unsafe {
         drop(Arc::from_raw(p as *const UnparkerInner));
@@ -286,13 +339,14 @@ static UNPARK_VTABLE: RawWakerVTable = RawWakerVTable::new(
 // --- 高性能唤醒原语 (Unparker) ---
 
 pub trait RuntimeWaker: Send + Sync {
-    fn wake(&self);
+    fn wake(&self) -> Result<(), RuntimeWakeError>;
 }
 
 pub(crate) struct UnparkerInner {
     /// 没有 `park_hook` 时 worker 就阻塞在这个信号上。
     signal: Signal,
     waker: OnceLock<Arc<dyn RuntimeWaker>>,
+    failure: Arc<WakeFailureState>,
 }
 
 impl UnparkerInner {
@@ -301,10 +355,26 @@ impl UnparkerInner {
     /// `bind` 之前的唤醒只能落到内置信号上 —— 未绑定时若静默什么都不做，等于丢唤醒；
     /// 而绑定了驱动 waker 的 worker 阻塞在驱动里、看不到信号，只能靠 waker 叫醒。
     /// 信号侧的额外成本只有一次 swap：状态停在「已通知」之后就不会再发系统调用。
-    fn wake(&self) {
+    fn wake(&self) -> Result<(), RuntimeWakeError> {
         self.signal.notify();
-        if let Some(waker) = self.waker.get() {
-            waker.wake();
+        if self.failure.is_failed()
+            && let Some(error) = self.failure.first_error()
+        {
+            return Err(error);
+        }
+        if let Some(waker) = self.waker.get()
+            && let Err(error) = waker.wake()
+        {
+            self.failure.record(error.clone());
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// raw `Waker` ABI 没有返回错误的通道；错误已在这里写入共享 fatal 状态。
+    fn wake_from_raw(&self) {
+        if self.wake().is_err() {
+            // raw Waker ABI 无返回值；wake() 已保存共享 fatal 状态。
         }
     }
 }
@@ -322,20 +392,31 @@ impl Default for Unparker {
 
 impl Unparker {
     pub fn new() -> Self {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        Self::with_failure_state(Arc::new(WakeFailureState::new(shutdown)))
+    }
+
+    pub(crate) fn with_failure_state(failure: Arc<WakeFailureState>) -> Self {
         Self {
             inner: Arc::new(UnparkerInner {
                 signal: Signal::new(false),
                 waker: OnceLock::new(),
+                failure,
             }),
         }
     }
 
-    pub fn bind(&self, waker: Arc<dyn RuntimeWaker>) {
-        let _ = self.inner.waker.set(waker);
+    pub fn bind(&self, waker: Arc<dyn RuntimeWaker>) -> Result<(), RuntimeWakeError> {
+        self.inner.waker.set(waker).map_err(|_| RuntimeWakeError {
+            backend: "runtime",
+            worker_id: usize::MAX,
+            operation: "bind",
+            detail: "remote waker is already bound".into(),
+        })
     }
 
-    pub fn unpark(&self) {
-        self.inner.wake();
+    pub fn unpark(&self) -> Result<(), RuntimeWakeError> {
+        self.inner.wake()
     }
 
     /// 阻塞直到本 worker 被 unpark。运行时未安装 `park_hook` 时的默认 park 实现。
@@ -703,14 +784,34 @@ impl EventCount {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{thread::sleep, time::Duration};
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        thread::sleep,
+        time::Duration,
+    };
+
+    struct FailingWaker {
+        calls: AtomicUsize,
+    }
+
+    impl RuntimeWaker for FailingWaker {
+        fn wake(&self) -> Result<(), RuntimeWakeError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Err(RuntimeWakeError {
+                backend: "test",
+                worker_id: 7,
+                operation: "test.wake",
+                detail: "injected failure".into(),
+            })
+        }
+    }
 
     /// 已经发生过的 unpark 必须被记住：worker 检查完队列到真正睡下去之间存在窗口，
     /// 落在窗口里的唤醒若被丢弃就是死锁。
     #[test]
     fn unpark_before_park_does_not_block() {
         let unparker = Unparker::new();
-        unparker.unpark();
+        unparker.unpark().expect("unpark failed");
         unparker.park();
     }
 
@@ -725,7 +826,7 @@ mod tests {
         std::thread::scope(|threads| {
             threads.spawn(|| {
                 sleep(Duration::from_millis(20));
-                unparker.unpark();
+                unparker.unpark().expect("unpark failed");
             });
             unparker.park();
         });
@@ -748,5 +849,41 @@ mod tests {
 
         signal.notify();
         assert!(signal.take_ready());
+    }
+
+    #[test]
+    fn wake_failure_keeps_local_signal_and_first_error() {
+        let unparker = Unparker::new();
+        let waker = Arc::new(FailingWaker {
+            calls: AtomicUsize::new(0),
+        });
+        unparker.bind(waker.clone()).expect("bind failed");
+
+        let first = unparker.unpark().expect_err("wake should fail");
+        let second = unparker.unpark().expect_err("wake should fail");
+
+        assert_eq!(first.worker_id, 7);
+        assert_eq!(second, first);
+        assert!(unparker.inner.signal.is_notified());
+        assert_eq!(waker.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(unparker.inner.failure.error_count(), 1);
+        assert_eq!(unparker.inner.failure.first_error(), Some(first));
+    }
+
+    #[test]
+    fn raw_waker_records_wake_failure_without_return_channel() {
+        let unparker = Unparker::new();
+        unparker
+            .bind(Arc::new(FailingWaker {
+                calls: AtomicUsize::new(0),
+            }))
+            .expect("bind failed");
+        let waker = create_unpark_waker(unparker.clone());
+
+        waker.wake_by_ref();
+
+        assert!(unparker.inner.failure.is_failed());
+        assert!(unparker.inner.failure.first_error().is_some());
+        assert!(unparker.inner.signal.is_notified());
     }
 }

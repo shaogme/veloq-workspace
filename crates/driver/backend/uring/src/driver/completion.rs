@@ -136,10 +136,11 @@ impl<'a> UringCompletionHooks<'a> {
         CqeEnv::new(self.provided_buffers.as_deref_mut())
     }
 
-    fn handle_waker_control(&mut self, raw: RawCompletion) -> UringBackendEffect {
-        let mut should_rebuild = false;
+    fn handle_waker_control(&mut self, raw: RawCompletion) -> UringResult<UringBackendEffect> {
+        let should_rebuild = false;
         if raw.res == self.waker_buf_len as i32 {
             self.diagnostics.backend().inc_waker_ok();
+            self.diagnostics.backend().inc_wait_waker_return();
         } else if raw.res >= 0 {
             self.diagnostics.backend().inc_waker_error();
             warn!(
@@ -147,7 +148,15 @@ impl<'a> UringCompletionHooks<'a> {
                 expected = self.waker_buf_len,
                 "eventfd waker read returned unexpected byte count"
             );
-            should_rebuild = true;
+            return Err(UringError::CompletionWait
+                .report(
+                    "uring.completion.handle_waker_control",
+                    format!(
+                        "eventfd waker read returned {} bytes, expected {}",
+                        raw.res, self.waker_buf_len
+                    ),
+                )
+                .with_ctx("completion_result", raw.res));
         } else {
             self.diagnostics.backend().inc_waker_error();
             match -raw.res {
@@ -156,12 +165,17 @@ impl<'a> UringCompletionHooks<'a> {
                 }
                 errno => {
                     warn!(res = raw.res, errno, "eventfd waker read failed");
-                    should_rebuild = true;
+                    return Err(UringError::CompletionWait
+                        .report(
+                            "uring.completion.handle_waker_control",
+                            "eventfd waker read failed",
+                        )
+                        .set_error_code(errno));
                 }
             }
         }
 
-        UringBackendEffect::Waker { should_rebuild }
+        Ok(UringBackendEffect::Waker { should_rebuild })
     }
 
     fn handle_cancel_control(
@@ -235,7 +249,7 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
     ) -> UringResult<CompletionHookOutcome<UringSlotSpec, Self::BackendEffect>> {
         match control {
             CompletionControl::Waker { raw, .. } => Ok(CompletionHookOutcome::ControlHandled {
-                effect: self.handle_waker_control(raw),
+                effect: self.handle_waker_control(raw)?,
             }),
             CompletionControl::Cancel { id, raw } => self.handle_cancel_control(id, raw),
         }
@@ -361,6 +375,8 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
 }
 
 impl<'a> UringDriver<'a> {
+    const WAKE_FAILURE_PROBE_INTERVAL: Duration = Duration::from_secs(1);
+
     pub(crate) fn wait_internal(&mut self, external_timeout: Option<Duration>) -> UringResult<()> {
         let _ = self.drain_cancel_requests()?;
         self.flush_cancellations()?;
@@ -376,6 +392,11 @@ impl<'a> UringDriver<'a> {
             completion.sync();
             !completion.is_empty()
         };
+        if cq_ready {
+            self.completion_diagnostics
+                .backend()
+                .inc_wait_ready_preflight();
+        }
         self.advance_timer_clock()?;
         self.flush_cancellations()?;
         self.flush_backlog()?;
@@ -384,17 +405,22 @@ impl<'a> UringDriver<'a> {
             (Some(external), Some(internal)) => Some(external.min(internal)),
             (Some(external), None) => Some(external),
             (None, Some(internal)) => Some(internal),
-            (None, None) => None,
-        };
+            (None, None) => Some(Self::WAKE_FAILURE_PROBE_INTERVAL),
+        }
+        .map(|timeout| timeout.min(Self::WAKE_FAILURE_PROBE_INTERVAL));
 
         if self.ops.shared.has_ready_completion()
             || matches!(effective_timeout, Some(timeout) if timeout.is_zero())
         {
+            if matches!(effective_timeout, Some(timeout) if timeout.is_zero()) {
+                self.completion_diagnostics.backend().inc_wait_zero();
+            }
             return Ok(());
         }
 
         if !cq_ready && self.ring.completion().is_empty() {
             if let Some(duration) = effective_timeout {
+                self.completion_diagnostics.backend().inc_wait_block();
                 let ts = io_uring::types::Timespec::new()
                     .sec(duration.as_secs())
                     .nsec(duration.subsec_nanos());
@@ -402,13 +428,23 @@ impl<'a> UringDriver<'a> {
                 let args = io_uring::types::SubmitArgs::new().timespec(&ts);
                 match self.ring.submitter().submit_with_args(1, &args) {
                     Ok(_) => {}
-                    Err(ref e) if e.raw_os_error() == Some(libc::ETIME) => {}
+                    Err(ref e) if e.raw_os_error() == Some(libc::ETIME) => {
+                        self.completion_diagnostics.backend().inc_wait_timeout();
+                        if external_timeout.is_none()
+                            && duration == Self::WAKE_FAILURE_PROBE_INTERVAL
+                        {
+                            self.completion_diagnostics
+                                .backend()
+                                .inc_wait_probe_return();
+                        }
+                    }
                     Err(e) => {
                         return Err(UringError::CompletionWait
                             .io_report("driver.wait_internal.submit_with_args", e));
                     }
                 }
             } else {
+                self.completion_diagnostics.backend().inc_wait_block();
                 self.ring.submit_and_wait(1).map_err(|e| {
                     UringError::CompletionWait.io_report("driver.wait_internal.submit_and_wait", e)
                 })?;
@@ -430,11 +466,11 @@ impl<'a> UringDriver<'a> {
         let expired = self.timers.advance_timer_wheel(now).to_vec();
         for &token in &expired {
             let event = UserCompletionEvent::from_parts(COMP_BACKEND_URING, token, 0, 0);
-            let _ = self.accept_synthetic_completion(
+            self.accept_synthetic_completion(
                 event,
                 SyntheticCompletionSource::Timer,
                 UringSyntheticCompletion::None,
-            );
+            )?;
         }
         Ok(())
     }
@@ -455,11 +491,15 @@ impl<'a> UringDriver<'a> {
     }
 
     pub(crate) fn process_completions_internal(&mut self) -> UringResult<CompletionProgress> {
-        let _ = unsafe {
+        unsafe {
             self.ring
                 .submitter()
                 .enter::<()>(0, 0, 1 /* IORING_ENTER_GETEVENTS */, None)
-        };
+                .map_err(|e| {
+                    UringError::CompletionWait
+                        .io_report("driver.process_completions_internal.enter", e)
+                })?;
+        }
 
         // The CQEs are copied out of the ring first so that the borrow of `self.ring` ends
         // before the routing loop needs `&mut self`. The buffer lives on the driver to keep
@@ -576,6 +616,9 @@ impl<'a> UringDriver<'a> {
             self.completion_diagnostics.backend().inc_waker_rebuild();
             error!(report = ?e, "failed to resubmit waker");
             return Err(e);
+        }
+        if post.resubmit_waker {
+            self.completion_diagnostics.backend().inc_waker_rearm();
         }
         if post.flush_backlog {
             self.flush_backlog()?;
@@ -910,12 +953,7 @@ mod tests {
 
         let effect = hooks.handle_waker_control(raw);
 
-        assert!(matches!(
-            effect,
-            UringBackendEffect::Waker {
-                should_rebuild: true
-            }
-        ));
+        assert!(effect.is_err());
         assert_eq!(diagnostics.snapshot().backend.waker_error, 1);
     }
 

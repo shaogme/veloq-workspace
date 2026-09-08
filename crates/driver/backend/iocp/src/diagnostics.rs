@@ -25,6 +25,14 @@ pub struct IocpCompletionDiagnostics {
     waker_ok: AtomicU64,
     waker_error: AtomicU64,
     waker_rebuild: AtomicU64,
+    wait_enter: AtomicU64,
+    wait_block: AtomicU64,
+    wait_probe_return: AtomicU64,
+    wait_timeout: AtomicU64,
+    wait_waker_return: AtomicU64,
+    wait_ready_preflight: AtomicU64,
+    wait_zero: AtomicU64,
+    waker_rearm: AtomicU64,
     rio_malformed_context: AtomicU64,
     rio_missing_context: AtomicU64,
     rio_stale_context: AtomicU64,
@@ -45,6 +53,14 @@ pub struct IocpCompletionDiagnosticsSnapshot {
     pub waker_ok: u64,
     pub waker_error: u64,
     pub waker_rebuild: u64,
+    pub wait_enter: u64,
+    pub wait_block: u64,
+    pub wait_probe_return: u64,
+    pub wait_timeout: u64,
+    pub wait_waker_return: u64,
+    pub wait_ready_preflight: u64,
+    pub wait_zero: u64,
+    pub waker_rearm: u64,
     pub rio: RioCompletionDiagnosticsSnapshot,
 }
 
@@ -120,6 +136,46 @@ impl IocpCompletionDiagnostics {
     pub(crate) fn inc_waker_error(&self) {
         Self::inc(&self.waker_error);
     }
+
+    #[inline]
+    pub(crate) fn inc_wait_enter(&self) {
+        Self::inc(&self.wait_enter);
+    }
+
+    #[inline]
+    pub(crate) fn inc_wait_block(&self) {
+        Self::inc(&self.wait_block);
+    }
+
+    #[inline]
+    pub(crate) fn inc_wait_probe_return(&self) {
+        Self::inc(&self.wait_probe_return);
+    }
+
+    #[inline]
+    pub(crate) fn inc_wait_timeout(&self) {
+        Self::inc(&self.wait_timeout);
+    }
+
+    #[inline]
+    pub(crate) fn inc_wait_waker_return(&self) {
+        Self::inc(&self.wait_waker_return);
+    }
+
+    #[inline]
+    pub(crate) fn inc_wait_ready_preflight(&self) {
+        Self::inc(&self.wait_ready_preflight);
+    }
+
+    #[inline]
+    pub(crate) fn inc_wait_zero(&self) {
+        Self::inc(&self.wait_zero);
+    }
+
+    #[inline]
+    pub(crate) fn inc_waker_rearm(&self) {
+        Self::inc(&self.waker_rearm);
+    }
 }
 
 impl DriverCompletionDiagnosticsBackend for IocpCompletionDiagnostics {
@@ -141,6 +197,14 @@ impl DriverCompletionDiagnosticsBackend for IocpCompletionDiagnostics {
             waker_ok: Self::load(&self.waker_ok),
             waker_error: Self::load(&self.waker_error),
             waker_rebuild: Self::load(&self.waker_rebuild),
+            wait_enter: Self::load(&self.wait_enter),
+            wait_block: Self::load(&self.wait_block),
+            wait_probe_return: Self::load(&self.wait_probe_return),
+            wait_timeout: Self::load(&self.wait_timeout),
+            wait_waker_return: Self::load(&self.wait_waker_return),
+            wait_ready_preflight: Self::load(&self.wait_ready_preflight),
+            wait_zero: Self::load(&self.wait_zero),
+            waker_rearm: Self::load(&self.waker_rearm),
             rio: RioCompletionDiagnosticsSnapshot {
                 malformed_context: Self::load(&self.rio_malformed_context),
                 missing_context: Self::load(&self.rio_missing_context),

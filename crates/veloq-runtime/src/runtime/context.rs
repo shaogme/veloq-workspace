@@ -158,8 +158,8 @@ impl<'rt, T> RuntimeCtx<'rt, T> {
     }
 
     /// Wakes up the specified worker.
-    pub fn wake_worker(&self, worker_id: usize) {
-        self.shared().wake_worker(worker_id);
+    pub fn wake_worker(&self, worker_id: usize) -> Result<()> {
+        self.shared().wake_worker(worker_id)
     }
 
     /// Checks if the runtime is shutting down.

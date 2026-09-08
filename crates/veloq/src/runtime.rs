@@ -14,6 +14,7 @@ use diagweave::Transform;
 use veloq_buf::PoolTopology;
 use veloq_driver_native::driver::{Driver, PlatformDriver, RemoteWaker};
 use veloq_runtime::{
+    error::RuntimeWakeError,
     runtime::{self as async_runtime, primitives::RuntimeWaker},
     utils::StaticTransfer,
 };
@@ -184,18 +185,33 @@ impl<T: PoolTopology> Runtime<T> {
                 let remote_waker = driver.create_waker();
                 struct DriverWakerWrapper<E> {
                     waker: Arc<dyn RemoteWaker<E>>,
+                    worker_id: usize,
                 }
                 impl<E> RuntimeWaker for DriverWakerWrapper<E>
                 where
                     E: Error + Send + Sync + 'static,
                 {
-                    fn wake(&self) {
-                        let _ = self.waker.wake();
+                    fn wake(&self) -> Result<(), RuntimeWakeError> {
+                        self.waker.wake().map_err(|err| RuntimeWakeError {
+                            backend: if cfg!(target_os = "linux") {
+                                "io_uring"
+                            } else if cfg!(target_os = "windows") {
+                                "iocp"
+                            } else {
+                                "unknown"
+                            },
+                            worker_id: self.worker_id,
+                            operation: "remote_waker.wake",
+                            detail: format!("{err:#}"),
+                        })
                     }
                 }
-                shared.base.unparkers()[worker_id].bind(Arc::new(DriverWakerWrapper {
-                    waker: remote_waker,
-                }));
+                shared.base.unparkers()[worker_id]
+                    .bind(Arc::new(DriverWakerWrapper {
+                        waker: remote_waker,
+                        worker_id,
+                    }))
+                    .expect("worker remote waker is already bound");
 
                 let driver_cell = RefCell::new(driver);
 

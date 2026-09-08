@@ -1,5 +1,29 @@
 use diagweave::{Report, set};
-use std::{borrow::Cow, result::Result as StdResult};
+use std::{borrow::Cow, fmt, result::Result as StdResult};
+
+/// 后端 remote waker 失败时跨 runtime 边界传递的稳定诊断。
+///
+/// 该类型不携带 backend 泛型，因此 runtime 不需要依赖任何平台 driver。`detail` 保留
+/// 后端报告的文本快照，避免把只能在 driver 线程使用的报告对象跨线程或跨 crate 保存。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeWakeError {
+    pub backend: &'static str,
+    pub worker_id: usize,
+    pub operation: &'static str,
+    pub detail: String,
+}
+
+impl fmt::Display for RuntimeWakeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} worker {} failed during {}: {}",
+            self.backend, self.worker_id, self.operation, self.detail
+        )
+    }
+}
+
+impl std::error::Error for RuntimeWakeError {}
 
 set! {
     pub RuntimeError = {
@@ -49,6 +73,12 @@ set! {
         InvariantViolation {
             site: &'static str,
             detail: Cow<'static, str>,
+        },
+
+        #[display("runtime remote wake failed: {source}")]
+        WakeFailed {
+            #[source]
+            source: RuntimeWakeError,
         },
 
         #[display("mutex poisoned: {component}")]

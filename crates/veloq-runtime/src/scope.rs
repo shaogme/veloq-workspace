@@ -137,8 +137,8 @@ impl<'guard, 'rt, 'scope, 'env: 'scope, S: ScopeStorage, O: Ownership + 'static,
     for ScopeExitGuard<'guard, 'rt, 'scope, 'env, S, O, TExtra>
 {
     fn drop(&mut self) {
-        if self.armed {
-            self.scope.cancel_and_join();
+        if self.armed && self.scope.cancel_and_join().is_err() {
+            // Drop 不能返回错误；wake failure 已由共享 fatal 通道保存。
         }
     }
 }
@@ -252,11 +252,12 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra>
         self.context.shared()
     }
 
-    pub(crate) fn cancel_and_join(&self) {
+    pub(crate) fn cancel_and_join(&self) -> Result<()> {
         if !self.completion.is_done() {
             self.completion.cancel();
-            self.context.shared().join_scope::<S, O>(&self.completion);
+            return self.context.shared().join_scope::<S, O>(&self.completion);
         }
+        self.context.shared().base.fatal_error().map_or(Ok(()), Err)
     }
 
     unsafe fn spawn_task_impl<'scope_ref, T, H, TTask>(
@@ -359,7 +360,9 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra> Drop
     /// 超时、外层取消）这两条路径都绕过它 —— 那里若只发信号就返回，借用立刻悬垂。这正是
     /// `std::thread::scope` 必须在 `Drop` 里阻塞 join 的原因。
     fn drop(&mut self) {
-        self.cancel_and_join();
+        if self.cancel_and_join().is_err() {
+            // Drop 不能返回错误；wake failure 已由共享 fatal 通道保存。
+        }
 
         // panic payload 的归属：正常路径由 `wait_all()` 取走并抛出。走到这里说明没人 join
         // （上面那两条路径），payload 交给上一层 scope，由它的 `wait_all()` 抛出；已经没有

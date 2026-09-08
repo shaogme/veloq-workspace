@@ -257,6 +257,7 @@ impl<'a> DriverRaw for IocpDriver<'a> {
                     .attach_note("drive(Poll) failed")?;
             }
             DriveMode::Wait { timeout } => {
+                self.completion_diagnostics.backend().inc_wait_enter();
                 let wait_timeout = if self.ops.shared.has_ready_completion() {
                     Some(Duration::ZERO)
                 } else {

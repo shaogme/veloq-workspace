@@ -27,6 +27,7 @@ use super::{IocpDriver, RIO_EVENT_KEY, RIO_EVENT_TOKEN, completion::COMP_BACKEND
 
 /// Completions dequeued per `GetQueuedCompletionStatusEx` call, matching `MAX_RIO_RESULTS`.
 const MAX_IOCP_BATCH: usize = 128;
+const WAKE_FAILURE_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(super) struct CompletionPump {
     port: Arc<IoCompletionPort>,
@@ -269,20 +270,37 @@ impl<'a> IocpDriver<'a> {
     /// Retrieves completion events from the I/O completion port.
     pub(crate) fn get_completion(&mut self, timeout: Option<Duration>) -> IocpResult<()> {
         let _ = self.drain_cancel_requests()?;
+        self.timer.advance_to(Instant::now());
+        self.process_timers()?;
         let wait_ms = if self.ops.shared.has_ready_completion() {
+            self.completion_diagnostics
+                .backend()
+                .inc_wait_ready_preflight();
             0
         } else {
             self.calculate_wait_ms(timeout)
         };
+        if wait_ms == 0 {
+            self.completion_diagnostics.backend().inc_wait_zero();
+        } else {
+            self.completion_diagnostics.backend().inc_wait_block();
+        }
 
         let batched = self.completion.fill_batch(wait_ms);
-        let now = Instant::now();
-        self.timer.advance_to(now);
+        self.timer.advance_to(Instant::now());
         self.process_timers()?;
 
         let count = batched
             .attach_note("failed to get IOCP completion status")
             .trans()?;
+        if count == 0 {
+            self.completion_diagnostics.backend().inc_wait_timeout();
+            if timeout.is_none() && wait_ms == duration_to_wait_ms(WAKE_FAILURE_PROBE_INTERVAL) {
+                self.completion_diagnostics
+                    .backend()
+                    .inc_wait_probe_return();
+            }
+        }
         self.completion.mark_waker_notifications(count);
 
         // Every entry is routed even if one of them fails, so a single corrupt completion
@@ -296,6 +314,8 @@ impl<'a> IocpDriver<'a> {
             }
         }
 
+        self.timer.advance_to(Instant::now());
+        self.process_timers()?;
         first_error.map_or(Ok(()), Err)
     }
 
@@ -317,13 +337,15 @@ impl<'a> IocpDriver<'a> {
     pub(super) fn calculate_wait_ms(&self, timeout: Option<Duration>) -> u32 {
         let internal_timeout = self.timer.next_timeout().map(duration_to_wait_ms);
         let external_timeout = timeout.map(duration_to_wait_ms);
+        let probe_timeout = duration_to_wait_ms(WAKE_FAILURE_PROBE_INTERVAL);
 
-        match (external_timeout, internal_timeout) {
+        let timeout = match (external_timeout, internal_timeout) {
             (Some(external), Some(internal)) => external.min(internal),
             (Some(external), None) => external,
             (None, Some(internal)) => internal,
-            (None, None) => u32::MAX,
-        }
+            (None, None) => probe_timeout,
+        };
+        timeout.min(probe_timeout)
     }
 
     fn handle_completion_status(

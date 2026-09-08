@@ -124,6 +124,21 @@ impl UringWaker {
                 .set_error_code(err.raw_os_error().unwrap_or(libc::EIO))
                 .attach_note(err.to_string()));
         }
+        if ret != 8 {
+            self.notification_state
+                .compare_exchange(
+                    WAKER_NOTIFIED,
+                    WAKER_IDLE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .ok();
+            return Err(UringError::Internal
+                .to_report()
+                .push_ctx("scope", "uring.driver.waker.wake")
+                .with_ctx("bytes_written", ret)
+                .attach_note("eventfd write returned an unexpected byte count"));
+        }
         Ok(())
     }
 }

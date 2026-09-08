@@ -291,6 +291,7 @@ impl<'a> DriverRaw for UringDriver<'a> {
                     .attach_note("poll completions")?;
             }
             DriveMode::Wait { timeout } => {
+                self.completion_diagnostics.backend().inc_wait_enter();
                 self.wait_internal(timeout)
                     .push_ctx("scope", "uring.driver.drive.wait")
                     .attach_note("wait for completions")?;

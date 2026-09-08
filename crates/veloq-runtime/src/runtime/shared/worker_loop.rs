@@ -181,6 +181,6 @@ pub(crate) fn run_worker_loop<T, C: LoopController>(
         // scope 义务，否则等待方（`wait_all` / 作用域析构 join）永远等不到 `remaining`
         // 归零。
         base.abandon_worker_backlog(worker_id);
-        Ok(())
+        base.fatal_error().map_or(Ok(()), Err)
     })
 }

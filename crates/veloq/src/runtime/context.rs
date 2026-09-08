@@ -525,7 +525,9 @@ pub(crate) fn submit_control_task<'rt>(
     let task_ref = unsafe { SendTaskRef::from_concrete(ptr) };
     match shared.enqueue_pinned(worker_id, task_ref) {
         EnqueuePinnedOutcome::Enqueued | EnqueuePinnedOutcome::AlreadyQueued => {
-            shared.base.unparkers()[worker_id].unpark();
+            if shared.base.unparkers()[worker_id].unpark().is_err() {
+                // Unparker 已将 backend 错误写入 runtime fatal 通道。
+            }
         }
         EnqueuePinnedOutcome::AbortedAcknowledged
         | EnqueuePinnedOutcome::AlreadySettled
@@ -552,15 +554,19 @@ pub fn park_current_driver<'rt>(
         // Block on the OS event driver
         driver
             .drive(drive_mode_for_wait_strategy(wait_strategy))
-            .map_err(|err| RuntimeError::InvariantViolation {
-                site: "park_current_driver",
-                detail: format!("driver drive(Wait) failed, details: {}", err).into(),
+            .map_err(|err| {
+                RuntimeError::InvariantViolation {
+                    site: "park_current_driver",
+                    detail: "driver drive(Wait) failed".into(),
+                }
+                .to_report()
+                .with_diag_src_err(err)
             })
     });
 
     match res {
         Ok(Ok(_outcome)) => Ok(()),
-        Ok(Err(err)) => Err(err.to_report()),
+        Ok(Err(err)) => Err(err),
         Err(err) => Err(RuntimeError::TlsSetOwnedFailed {
             worker_id: shared.worker_id(),
             source: err,

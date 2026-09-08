@@ -2,7 +2,10 @@ use std::{
     hint::spin_loop,
     num::NonZeroUsize,
     ptr::NonNull,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     thread,
 };
 
@@ -16,7 +19,7 @@ use veloq_tls::Tls;
 use super::context::{IdleHook, IdleWaitStrategy, RuntimeTlsInner, WorkerTickHook};
 use crate::{
     error::{Result, RuntimeError},
-    runtime::primitives::{EventCount, Unparker},
+    runtime::primitives::{EventCount, Unparker, WakeFailureState},
     scope::GenericScopeCompletion,
     task::{LocalTaskRef, ScopeStorage, SendTaskRef, TaskHandleRef},
     utils::{FastRand, ownership::Ownership},
@@ -60,7 +63,8 @@ pub struct RuntimeSharedBase {
     pub(crate) topo: TopologyContext,
     pub(crate) scheduler: TaskScheduler,
     pub(crate) idle: IdleController,
-    pub(crate) shutdown: AtomicBool,
+    pub(crate) shutdown: Arc<AtomicBool>,
+    pub(crate) wake_failure: Arc<WakeFailureState>,
     pub(crate) worker_tick_hook: Option<WorkerTickHook>,
     /// Worker 线程核心上下文（不含用户 extra 状态）。
     pub(crate) tls: Tls<RuntimeTlsInner>,
@@ -88,12 +92,14 @@ pub(crate) fn init_runtime_components(
     queue_capacity: NonZeroUsize,
 ) -> (WorkerRegistry, TopologyContext, Receivers) {
     let worker_count_val = worker_count.get();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let wake_failure = Arc::new(WakeFailureState::new(shutdown.clone()));
     let mut unparkers = Vec::with_capacity(worker_count_val);
     let mut deques = Vec::with_capacity(worker_count_val);
     let mut workers = Vec::with_capacity(worker_count_val);
 
     for _ in 0..worker_count_val {
-        unparkers.push(Unparker::new());
+        unparkers.push(Unparker::with_failure_state(wake_failure.clone()));
 
         let remote_queue = ArrayQueue::new(queue_capacity.get());
         let pinned_queue = ArrayQueue::new(queue_capacity.get());
@@ -152,6 +158,8 @@ pub(crate) fn init_runtime_components(
         WorkerRegistry {
             workers: workers.into_boxed_slice(),
             unparkers: unparkers.into_boxed_slice(),
+            wake_failure,
+            shutdown,
         },
         TopologyContext {
             groups,
@@ -175,6 +183,8 @@ impl<T> RuntimeShared<T> {
         park_hook: Option<ParkHook<T>>,
         worker_tick_hook: Option<WorkerTickHook>,
     ) -> Self {
+        let shutdown = registry.shutdown.clone();
+        let wake_failure = registry.wake_failure.clone();
         Self {
             base: RuntimeSharedBase {
                 registry,
@@ -187,7 +197,8 @@ impl<T> RuntimeShared<T> {
                     idle_mask: AtomicBitset::new(worker_count.get()),
                     event_count: EventCount::new(),
                 },
-                shutdown: AtomicBool::new(false),
+                shutdown,
+                wake_failure,
                 worker_tick_hook,
                 tls: Tls::new(),
             },
@@ -206,6 +217,15 @@ impl RuntimeSharedBase {
     #[inline]
     pub(crate) fn unparker(&self, worker_id: usize) -> &Unparker {
         &self.registry.unparkers[worker_id]
+    }
+
+    pub(crate) fn fatal_error(&self) -> Option<Report<RuntimeError>> {
+        if !self.wake_failure.is_failed() {
+            return None;
+        }
+        self.wake_failure
+            .first_error()
+            .map(|source| RuntimeError::WakeFailed { source }.to_report())
     }
 
     #[inline]
@@ -333,7 +353,9 @@ impl RuntimeSharedBase {
             }
             // 序列号只能在任务**已经可见之后**递增，见 `EventCount::notify`。
             self.idle.event_count.notify();
-            self.wake_worker(worker_id);
+            if self.wake_worker(worker_id).is_err() {
+                // 任务已可见；唤醒失败由共享 fatal 通道终止 runtime。
+            }
             EnqueuePinnedOutcome::Enqueued
         } else {
             EnqueuePinnedOutcome::AlreadyQueued
@@ -341,8 +363,10 @@ impl RuntimeSharedBase {
     }
 
     #[inline]
-    pub(crate) fn wake_worker(&self, worker_id: usize) {
-        self.registry.unpark(worker_id);
+    pub(crate) fn wake_worker(&self, worker_id: usize) -> Result<()> {
+        self.registry
+            .unpark(worker_id)
+            .map_err(|source| RuntimeError::WakeFailed { source }.to_report())
     }
 
     pub(crate) fn fn_pop_send(&self, worker_id: usize) -> Option<SendTaskRef> {
@@ -405,7 +429,9 @@ impl RuntimeSharedBase {
     pub(crate) fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
         for i in 0..self.registry.unparkers.len() {
-            self.registry.unpark(i);
+            if self.registry.unpark(i).is_err() {
+                // Shutdown is already in progress; the waker records the backend failure.
+            }
         }
     }
 
@@ -434,7 +460,9 @@ impl RuntimeSharedBase {
             } else {
                 worker.remote_count.fetch_add(1, Ordering::Release);
                 self.idle.event_count.notify();
-                self.wake_worker(worker_id);
+                if self.wake_worker(worker_id).is_err() {
+                    // 任务已可见；唤醒失败由共享 fatal 通道终止 runtime。
+                }
             }
         }
     }
@@ -550,7 +578,7 @@ impl<T> RuntimeShared<T> {
     }
 
     #[inline]
-    pub(crate) fn wake_worker(&self, worker_id: usize) {
+    pub(crate) fn wake_worker(&self, worker_id: usize) -> Result<()> {
         self.base.wake_worker(worker_id)
     }
 
@@ -591,7 +619,9 @@ impl<T> RuntimeShared<T> {
             }
             // 任务已进入 lifo 槽或本地 deque，此刻才可以 bump 序列号。
             self.base.idle.event_count.notify();
-            self.wake_worker(worker_id);
+            if self.wake_worker(worker_id).is_err() {
+                // 任务已可见；唤醒失败由共享 fatal 通道终止 runtime。
+            }
             return;
         }
 
@@ -614,27 +644,33 @@ impl<T> RuntimeShared<T> {
     pub(crate) fn join_scope<S: ScopeStorage, O: Ownership + 'static>(
         &self,
         completion: &O::Shared<GenericScopeCompletion<S, O>>,
-    ) {
+    ) -> Result<()> {
         if self.base.tls.try_with(|ctx| ctx.worker_id).is_err() {
             // 非 worker 线程上无法驱动调度器，只能等别的 worker 把子任务跑完。
             while !completion.is_done() {
                 thread::yield_now();
             }
-            return;
+            return self.base.fatal_error().map_or(Ok(()), Err);
         }
 
+        let mut first_error = None;
         while !completion.is_done() {
             if !self.base.shutdown.load(Ordering::Acquire) {
-                // 驱动出错也只能重试：把错误上报出去就意味着带着未结束的子任务返回，
-                // 而这里没有任何调用者能安全处理那种状态。
                 let mut controller = ScopeJoinController::new(&**completion);
-                let _ = run_worker_loop(self, &mut controller);
-                continue;
-            }
-            if !self.drain_one_pending_task() {
+                if let Err(err) = run_worker_loop(self, &mut controller) {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                    self.base.shutdown();
+                }
+            } else if !self.drain_one_pending_task() {
                 thread::yield_now();
             }
         }
+
+        first_error
+            .or_else(|| self.base.fatal_error())
+            .map_or(Ok(()), Err)
     }
 
     /// 关停期间的退化驱动：只排空自己看得见的队列，不进入 idle 协调。

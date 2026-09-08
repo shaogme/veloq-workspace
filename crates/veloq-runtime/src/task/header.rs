@@ -638,7 +638,7 @@ impl<S: Storage> GenericTaskHeader<S> {
     pub(crate) fn notify_runtime_active(&self) -> Result<()> {
         let runtime = self.runtime()?;
         runtime.idle.event_count.notify();
-        runtime.wake_worker(self.worker_id());
+        runtime.wake_worker(self.worker_id())?;
         Ok(())
     }
 

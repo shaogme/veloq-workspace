@@ -112,7 +112,7 @@ impl<'a> IocpDriver<'a> {
             -(ERROR_OPERATION_ABORTED as i32),
             0,
         );
-        let _ = self.accept_synthetic_completion(
+        self.accept_synthetic_completion(
             event,
             SyntheticCompletionSource::Cancel,
             IocpSyntheticCompletion::Cancel { mode },

@@ -78,7 +78,7 @@ impl<'a> UringDriver<'a> {
             .backend()
             .inc_cancel_local_completed();
         let event = UserCompletionEvent::from_parts(COMP_BACKEND_URING, token, -libc::ECANCELED, 0);
-        let _ = self.accept_synthetic_completion(
+        self.accept_synthetic_completion(
             event,
             SyntheticCompletionSource::Cancel,
             UringSyntheticCompletion::Cancel { mode },
@@ -283,7 +283,7 @@ impl<'a> UringDriver<'a> {
                         Ok(false) => break,
                         Err(report) => {
                             self.pop_backlog();
-                            self.complete_queued_submission_error(token, report);
+                            self.complete_queued_submission_error(token, report)?;
                         }
                     }
                 }
@@ -308,16 +308,21 @@ impl<'a> UringDriver<'a> {
         true
     }
 
-    fn complete_queued_submission_error(&mut self, token: OpToken, report: Report<UringError>) {
+    fn complete_queued_submission_error(
+        &mut self,
+        token: OpToken,
+        report: Report<UringError>,
+    ) -> UringResult<()> {
         let event_res = uring_report_to_event_res(&report);
         let event = UserCompletionEvent::from_parts(COMP_BACKEND_URING, token, event_res, 0);
-        let _ = self.accept_synthetic_completion(
+        self.accept_synthetic_completion(
             event,
             SyntheticCompletionSource::SubmissionFailure,
             UringSyntheticCompletion::SubmissionFailure {
                 report: Some(report),
             },
-        );
+        )?;
+        Ok(())
     }
 
     fn record_cancel_target_gone(&self, reason: CancelTargetGoneReason) {

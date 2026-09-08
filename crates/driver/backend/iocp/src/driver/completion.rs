@@ -113,6 +113,8 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
                 self.completion.clear_notification()?;
                 if raw.res >= 0 {
                     self.diagnostics.backend().inc_waker_ok();
+                    self.diagnostics.backend().inc_wait_waker_return();
+                    self.diagnostics.backend().inc_waker_rearm();
                 } else {
                     self.diagnostics.backend().inc_waker_error();
                     return Err(IocpError::Internal
@@ -226,7 +228,7 @@ impl<'a> IocpDriver<'a> {
 
         for token in expired {
             let event = UserCompletionEvent::from_parts(COMP_BACKEND_IOCP, token, 0, 0);
-            let _ = self.accept_synthetic_completion(
+            self.accept_synthetic_completion(
                 event,
                 SyntheticCompletionSource::Timer,
                 IocpSyntheticCompletion::None,

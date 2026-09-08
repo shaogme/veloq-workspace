@@ -1,16 +1,17 @@
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_queue::ArrayQueue;
 use std::{
-    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    sync::Arc,
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     thread,
 };
 use veloq_storage::{AtomicOptionPtr, StateOptionPtr};
 
 use crate::{
-    error::Result,
+    error::{Result, RuntimeWakeError},
     runtime::{
         context::{IdleDecision, IdleWaitStrategy},
-        primitives::{EventCount, Unparker},
+        primitives::{EventCount, Unparker, WakeFailureState},
         shared::{RuntimeShared, worker_loop::LoopController},
     },
     task::{LocalTaskRef, SendTaskRef, TaskHeader},
@@ -275,12 +276,14 @@ impl AtomicBitset {
 pub(crate) struct WorkerRegistry {
     pub(crate) workers: Box<[WorkerQueue]>,
     pub(crate) unparkers: Box<[Unparker]>,
+    pub(crate) wake_failure: Arc<WakeFailureState>,
+    pub(crate) shutdown: Arc<AtomicBool>,
 }
 
 impl WorkerRegistry {
     #[inline]
-    pub(crate) fn unpark(&self, worker_id: usize) {
-        self.unparkers[worker_id].unpark();
+    pub(crate) fn unpark(&self, worker_id: usize) -> std::result::Result<(), RuntimeWakeError> {
+        self.unparkers[worker_id].unpark()
     }
 }
 
@@ -463,12 +466,16 @@ impl IdleController {
     ) -> bool {
         let group = &topo.groups[group_idx];
         if let Some(worker_id) = group.idle_stack.pop_idle(&self.idle_mask, &topo.idle_slots) {
-            registry.unpark(worker_id);
+            if registry.unpark(worker_id).is_err() {
+                // Unparker 已将故障写入共享 fatal 通道；这里没有可向上传播的结果。
+            }
             return true;
         }
         for &worker_id in &group.worker_ids {
             if self.idle_mask.is_set(worker_id) {
-                registry.unpark(worker_id);
+                if registry.unpark(worker_id).is_err() {
+                    // Unparker 已将故障写入共享 fatal 通道；这里没有可向上传播的结果。
+                }
                 return true;
             }
         }
