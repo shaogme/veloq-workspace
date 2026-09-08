@@ -4,45 +4,12 @@ use crate::{
     alloc_crate::ffi::CString,
     fs::{FileTimes, FileType, OpenOptions, TryLockError},
     io::{Error, ErrorKind, IoSlice, IoSliceMut, Result, SeekFrom},
-    os::unix::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
+    os::{
+        cvt::{cvt, cvt_r},
+        unix::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},
+    },
     path::Path,
 };
-
-#[inline]
-fn cvt(res: libc::c_int) -> Result<libc::c_int> {
-    if res < 0 {
-        Err(Error::last_os_error())
-    } else {
-        Ok(res)
-    }
-}
-
-#[inline]
-fn cvt_ssize(res: libc::ssize_t) -> Result<libc::ssize_t> {
-    if res < 0 {
-        Err(Error::last_os_error())
-    } else {
-        Ok(res)
-    }
-}
-
-#[inline]
-fn cvt_off(res: libc::off_t) -> Result<libc::off_t> {
-    if res < 0 {
-        Err(Error::last_os_error())
-    } else {
-        Ok(res)
-    }
-}
-
-fn cvt_r<T, F: FnMut() -> Result<T>>(mut f: F) -> Result<T> {
-    loop {
-        match f() {
-            Err(ref e) if e.is_interrupted() => {}
-            other => return other,
-        }
-    }
-}
 
 #[derive(Debug)]
 pub struct File(pub(crate) OwnedFd);
@@ -105,7 +72,7 @@ impl File {
     }
 
     pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
-        let ret = cvt_ssize(unsafe {
+        let ret = cvt(unsafe {
             libc::read(
                 self.0.as_raw_fd(),
                 buf.as_mut_ptr() as *mut libc::c_void,
@@ -127,9 +94,8 @@ impl File {
                 iov_len: bufs[i].len(),
             };
         }
-        let ret = cvt_ssize(unsafe {
-            libc::readv(self.0.as_raw_fd(), iovecs.as_ptr(), len as libc::c_int)
-        })?;
+        let ret =
+            cvt(unsafe { libc::readv(self.0.as_raw_fd(), iovecs.as_ptr(), len as libc::c_int) })?;
         Ok(ret as usize)
     }
 
@@ -139,7 +105,7 @@ impl File {
     }
 
     pub fn write(&self, buf: &[u8]) -> Result<usize> {
-        let ret = cvt_ssize(unsafe {
+        let ret = cvt(unsafe {
             libc::write(
                 self.0.as_raw_fd(),
                 buf.as_ptr() as *const libc::c_void,
@@ -161,9 +127,8 @@ impl File {
                 iov_len: bufs[i].len(),
             };
         }
-        let ret = cvt_ssize(unsafe {
-            libc::writev(self.0.as_raw_fd(), iovecs.as_ptr(), len as libc::c_int)
-        })?;
+        let ret =
+            cvt(unsafe { libc::writev(self.0.as_raw_fd(), iovecs.as_ptr(), len as libc::c_int) })?;
         Ok(ret as usize)
     }
 
@@ -183,8 +148,7 @@ impl File {
             SeekFrom::End(off) => (libc::SEEK_END, off),
             SeekFrom::Current(off) => (libc::SEEK_CUR, off),
         };
-        let ret =
-            cvt_off(unsafe { libc::lseek(self.0.as_raw_fd(), offset as libc::off_t, whence) })?;
+        let ret = cvt(unsafe { libc::lseek(self.0.as_raw_fd(), offset as libc::off_t, whence) })?;
         Ok(ret as u64)
     }
 
@@ -241,7 +205,7 @@ impl File {
         let offset: libc::off_t = offset
             .try_into()
             .map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
-        let ret = cvt_ssize(unsafe {
+        let ret = cvt(unsafe {
             libc::pread(
                 self.0.as_raw_fd(),
                 buf.as_mut_ptr() as *mut libc::c_void,
@@ -256,7 +220,7 @@ impl File {
         let offset: libc::off_t = offset
             .try_into()
             .map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
-        let ret = cvt_ssize(unsafe {
+        let ret = cvt(unsafe {
             libc::pwrite(
                 self.0.as_raw_fd(),
                 buf.as_ptr() as *const libc::c_void,

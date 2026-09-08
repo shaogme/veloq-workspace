@@ -1,12 +1,31 @@
 //! Owned and borrowed Windows sockets.
 
-use core::{fmt, marker::PhantomData, mem::forget};
+use core::{
+    fmt,
+    marker::PhantomData,
+    mem::{self, forget},
+};
 
 use super::raw::{AsRawSocket, FromRawSocket, IntoRawSocket, RawSocket};
-use crate::alloc_crate as alloc;
+use crate::{
+    alloc_crate as alloc,
+    io::{Error, Result},
+    os::{
+        cvt::{cvt, cvt_socket},
+        windows::net,
+    },
+};
 
 use alloc::{boxed::Box, rc::Rc, sync::Arc};
-use windows_sys::Win32::Networking::WinSock::closesocket;
+use windows_sys::Win32::{
+    Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation},
+    Networking::WinSock::{
+        INVALID_SOCKET, SOCKET, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
+        WSADuplicateSocketW, WSAEINVAL, WSAEPROTOTYPE, WSAGetLastError, WSAPROTOCOL_INFOW,
+        WSASocketW, closesocket,
+    },
+    System::Threading::GetCurrentProcessId,
+};
 
 #[cfg(feature = "std")]
 use std::{
@@ -51,6 +70,76 @@ impl BorrowedSocket<'_> {
             socket,
             _phantom: PhantomData,
         }
+    }
+
+    /// Creates a new `OwnedSocket` instance that shares the same underlying
+    /// object as the existing `BorrowedSocket` instance.
+    pub fn try_clone_to_owned(&self) -> Result<OwnedSocket> {
+        net::init();
+        let mut info = unsafe { mem::zeroed::<WSAPROTOCOL_INFOW>() };
+        let result = unsafe {
+            WSADuplicateSocketW(
+                self.socket as usize as SOCKET,
+                GetCurrentProcessId(),
+                &mut info,
+            )
+        };
+        cvt_socket(result)?;
+        let socket = unsafe {
+            WSASocketW(
+                info.iAddressFamily,
+                info.iSocketType,
+                info.iProtocol,
+                &info,
+                0,
+                WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT,
+            )
+        };
+
+        if socket != INVALID_SOCKET {
+            Ok(unsafe { OwnedSocket::from_raw_socket(socket as RawSocket) })
+        } else {
+            let error = unsafe { WSAGetLastError() };
+
+            if error != WSAEPROTOTYPE && error != WSAEINVAL {
+                return Err(Error::from_raw_os_error(error));
+            }
+
+            let socket = unsafe {
+                WSASocketW(
+                    info.iAddressFamily,
+                    info.iSocketType,
+                    info.iProtocol,
+                    &info,
+                    0,
+                    WSA_FLAG_OVERLAPPED,
+                )
+            };
+
+            if socket == INVALID_SOCKET {
+                return Err(net::last_error());
+            }
+
+            let owned = unsafe { OwnedSocket::from_raw_socket(socket as RawSocket) };
+            owned.set_no_inherit()?;
+            Ok(owned)
+        }
+    }
+}
+
+impl OwnedSocket {
+    /// Creates a new `OwnedSocket` instance that shares the same underlying
+    /// object as the existing `OwnedSocket` instance.
+    #[inline]
+    pub fn try_clone(&self) -> Result<Self> {
+        self.as_socket().try_clone_to_owned()
+    }
+
+    pub(crate) fn set_no_inherit(&self) -> Result<()> {
+        cvt(unsafe {
+            SetHandleInformation(self.socket as usize as HANDLE, HANDLE_FLAG_INHERIT, 0)
+        })?;
+        Ok(())
     }
 }
 

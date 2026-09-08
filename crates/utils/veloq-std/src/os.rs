@@ -4,6 +4,8 @@
 //! I/O handles, file descriptors, and extension traits that operate without depending
 //! on the standard library.
 
+pub mod cvt;
+
 #[cfg(unix)]
 pub mod unix;
 

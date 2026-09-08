@@ -2,8 +2,10 @@
 
 use core::ffi::c_int;
 
-use crate::alloc_crate as alloc;
-use crate::io::{Stderr, Stdin, Stdout};
+use crate::{
+    alloc_crate as alloc,
+    io::{Stderr, Stdin, Stdout},
+};
 
 use alloc::{boxed::Box, rc::Rc, sync::Arc};
 

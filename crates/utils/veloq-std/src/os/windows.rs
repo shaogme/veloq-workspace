@@ -2,4 +2,5 @@
 
 pub mod fs;
 pub mod io;
+pub(crate) mod net;
 pub mod raw;

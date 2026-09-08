@@ -8,8 +8,10 @@ use core::{
 };
 
 use super::raw::{AsRawHandle, FromRawHandle, IntoRawHandle, RawHandle};
-use crate::alloc_crate as alloc;
-use crate::io::{Error, Result};
+use crate::{
+    alloc_crate as alloc,
+    io::{Error, Result},
+};
 
 use alloc::{boxed::Box, rc::Rc, sync::Arc};
 use windows_sys::Win32::{

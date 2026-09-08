@@ -72,3 +72,16 @@ fn windows_handle_facade_exports_are_available() {
     let _: Option<RawHandle> = None;
     let _: Option<RawSocket> = None;
 }
+
+#[cfg(windows)]
+#[test]
+fn windows_socket_try_clone_test() {
+    use std::net::TcpListener as StdTcpListener;
+    use veloq_std::os::windows::io::{AsRawSocket, AsSocket, OwnedSocket};
+
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind listener");
+    let borrowed = listener.as_socket();
+    let cloned_owned: OwnedSocket = borrowed.try_clone_to_owned().expect("try_clone_to_owned");
+    let cloned_again = cloned_owned.try_clone().expect("OwnedSocket::try_clone");
+    assert_ne!(cloned_owned.as_raw_socket(), cloned_again.as_raw_socket());
+}

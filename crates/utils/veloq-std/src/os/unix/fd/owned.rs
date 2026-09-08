@@ -3,8 +3,10 @@
 use core::{fmt, marker::PhantomData, mem::forget};
 
 use super::raw::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
-use crate::alloc_crate as alloc;
-use crate::io::{Error, Result};
+use crate::{
+    alloc_crate as alloc,
+    io::{Error, Result},
+};
 
 use alloc::{boxed::Box, rc::Rc, sync::Arc};
 
