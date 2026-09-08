@@ -42,4 +42,5 @@ windows-sys = { workspace = true, features = [
     "Win32_Networking_WinSock",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
+    "Win32_System_IO",
 ] }

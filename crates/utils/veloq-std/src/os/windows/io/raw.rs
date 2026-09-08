@@ -12,7 +12,7 @@ use windows_sys::Win32::System::Console::{
 
 #[cfg(feature = "std")]
 use std::{
-    fs::File,
+    fs::File as StdFile,
     io::{Stderr as StdStderr, Stdin as StdStdin, Stdout as StdStdout},
     net::{TcpListener, TcpStream, UdpSocket},
     os::windows::io::{
@@ -192,7 +192,7 @@ impl<T: AsRawSocket + ?Sized> AsRawSocket for Rc<T> {
 }
 
 #[cfg(feature = "std")]
-impl AsRawHandle for File {
+impl AsRawHandle for StdFile {
     #[inline]
     fn as_raw_handle(&self) -> RawHandle {
         StdAsRawHandle::as_raw_handle(self)
@@ -200,7 +200,7 @@ impl AsRawHandle for File {
 }
 
 #[cfg(feature = "std")]
-impl FromRawHandle for File {
+impl FromRawHandle for StdFile {
     #[inline]
     unsafe fn from_raw_handle(handle: RawHandle) -> Self {
         unsafe { StdFromRawHandle::from_raw_handle(handle) }
@@ -208,7 +208,7 @@ impl FromRawHandle for File {
 }
 
 #[cfg(feature = "std")]
-impl IntoRawHandle for File {
+impl IntoRawHandle for StdFile {
     #[inline]
     fn into_raw_handle(self) -> RawHandle {
         StdIntoRawHandle::into_raw_handle(self)

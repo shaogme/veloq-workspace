@@ -20,7 +20,7 @@ use windows_sys::Win32::{
 };
 
 #[cfg(feature = "std")]
-use std::{fs::File, os::windows::io::AsRawHandle as StdAsRawHandle};
+use std::{fs::File as StdFile, os::windows::io::AsRawHandle as StdAsRawHandle};
 
 /// A borrowed Windows handle.
 #[derive(Copy, Clone)]
@@ -349,7 +349,7 @@ impl<T: AsHandle + ?Sized> AsHandle for Rc<T> {
 }
 
 #[cfg(feature = "std")]
-impl AsHandle for File {
+impl AsHandle for StdFile {
     #[inline]
     fn as_handle(&self) -> BorrowedHandle<'_> {
         unsafe { BorrowedHandle::borrow_raw(StdAsRawHandle::as_raw_handle(self)) }

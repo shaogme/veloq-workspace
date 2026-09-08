@@ -10,7 +10,7 @@ use alloc::{boxed::Box, rc::Rc, sync::Arc};
 
 #[cfg(feature = "std")]
 use std::{
-    fs::File,
+    fs::File as StdFile,
     net::{TcpListener, TcpStream, UdpSocket},
     os::fd::AsRawFd as StdAsRawFd,
 };
@@ -199,7 +199,7 @@ impl<T: AsFd + ?Sized> AsFd for Rc<T> {
 }
 
 #[cfg(feature = "std")]
-impl AsFd for File {
+impl AsFd for StdFile {
     #[inline]
     fn as_fd(&self) -> BorrowedFd<'_> {
         unsafe { BorrowedFd::borrow_raw(StdAsRawFd::as_raw_fd(self)) }

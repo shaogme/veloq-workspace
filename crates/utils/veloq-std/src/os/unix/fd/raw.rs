@@ -9,7 +9,7 @@ use alloc::{boxed::Box, rc::Rc, sync::Arc};
 
 #[cfg(feature = "std")]
 use std::{
-    fs::File,
+    fs::File as StdFile,
     io::{Stderr as StdStderr, Stdin as StdStdin, Stdout as StdStdout},
     net::{TcpListener, TcpStream, UdpSocket},
     os::fd::{AsRawFd as StdAsRawFd, FromRawFd as StdFromRawFd, IntoRawFd as StdIntoRawFd},
@@ -98,7 +98,7 @@ impl<T: AsRawFd + ?Sized> AsRawFd for Rc<T> {
 }
 
 #[cfg(feature = "std")]
-impl AsRawFd for File {
+impl AsRawFd for StdFile {
     #[inline]
     fn as_raw_fd(&self) -> RawFd {
         StdAsRawFd::as_raw_fd(self)
@@ -106,7 +106,7 @@ impl AsRawFd for File {
 }
 
 #[cfg(feature = "std")]
-impl FromRawFd for File {
+impl FromRawFd for StdFile {
     #[inline]
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
         unsafe { StdFromRawFd::from_raw_fd(fd) }
@@ -114,7 +114,7 @@ impl FromRawFd for File {
 }
 
 #[cfg(feature = "std")]
-impl IntoRawFd for File {
+impl IntoRawFd for StdFile {
     #[inline]
     fn into_raw_fd(self) -> RawFd {
         StdIntoRawFd::into_raw_fd(self)

@@ -4,7 +4,7 @@ use crate::io::{Error, Result};
 
 #[cfg(feature = "std")]
 use std::{
-    fs::{File, Metadata, OpenOptions as StdOpenOptions},
+    fs::{File as StdFile, Metadata as StdMetadata, OpenOptions as StdOpenOptions},
     os::windows::fs::{
         FileExt as StdFileExt, MetadataExt as StdMetadataExt, OpenOptionsExt as StdOpenOptionsExt,
     },
@@ -126,7 +126,7 @@ pub trait FileExt {
 }
 
 #[cfg(feature = "std")]
-impl FileExt for File {
+impl FileExt for StdFile {
     #[inline]
     fn seek_read(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
         StdFileExt::seek_read(self, buf, offset)
@@ -159,7 +159,7 @@ pub trait MetadataExt {
 }
 
 #[cfg(feature = "std")]
-impl MetadataExt for Metadata {
+impl MetadataExt for StdMetadata {
     #[inline]
     fn file_attributes(&self) -> u32 {
         StdMetadataExt::file_attributes(self)

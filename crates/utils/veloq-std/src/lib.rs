@@ -6,8 +6,10 @@ pub extern crate alloc as alloc_crate;
 
 pub mod cell;
 pub mod collections;
+pub mod fs;
 pub mod io;
 pub mod macros;
+pub mod path;
 pub mod sync;
 pub mod thread;
 pub mod time;
