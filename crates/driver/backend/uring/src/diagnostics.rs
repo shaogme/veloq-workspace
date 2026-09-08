@@ -24,6 +24,9 @@ pub struct UringCompletionDiagnostics {
     wait_waker_return: AtomicU64,
     wait_ready_preflight: AtomicU64,
     wait_zero: AtomicU64,
+    wait_external_timeout: AtomicU64,
+    wait_timer_return: AtomicU64,
+    wait_completion_return: AtomicU64,
     waker_rearm: AtomicU64,
 }
 
@@ -49,6 +52,9 @@ pub struct UringCompletionDiagnosticsSnapshot {
     pub wait_waker_return: u64,
     pub wait_ready_preflight: u64,
     pub wait_zero: u64,
+    pub wait_external_timeout: u64,
+    pub wait_timer_return: u64,
+    pub wait_completion_return: u64,
     pub waker_rearm: u64,
 }
 
@@ -164,6 +170,21 @@ impl UringCompletionDiagnostics {
     }
 
     #[inline]
+    pub(crate) fn inc_wait_external_timeout(&self) {
+        Self::inc(&self.wait_external_timeout);
+    }
+
+    #[inline]
+    pub(crate) fn inc_wait_timer_return(&self) {
+        Self::inc(&self.wait_timer_return);
+    }
+
+    #[inline]
+    pub(crate) fn inc_wait_completion_return(&self) {
+        Self::inc(&self.wait_completion_return);
+    }
+
+    #[inline]
     pub(crate) fn inc_waker_rearm(&self) {
         Self::inc(&self.waker_rearm);
     }
@@ -195,6 +216,9 @@ impl DriverCompletionDiagnosticsBackend for UringCompletionDiagnostics {
             wait_waker_return: Self::load(&self.wait_waker_return),
             wait_ready_preflight: Self::load(&self.wait_ready_preflight),
             wait_zero: Self::load(&self.wait_zero),
+            wait_external_timeout: Self::load(&self.wait_external_timeout),
+            wait_timer_return: Self::load(&self.wait_timer_return),
+            wait_completion_return: Self::load(&self.wait_completion_return),
             waker_rearm: Self::load(&self.waker_rearm),
         }
     }

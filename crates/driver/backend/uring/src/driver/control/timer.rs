@@ -27,7 +27,9 @@ impl UringTimerWheel {
 
     #[inline]
     pub(crate) fn next_timeout(&self) -> Option<Duration> {
-        self.wheel.next_timeout()
+        self.wheel.next_timeout().map(|timeout| {
+            timeout.saturating_sub(Instant::now().saturating_duration_since(self.last_poll))
+        })
     }
 
     #[inline]

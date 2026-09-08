@@ -25,6 +25,31 @@ impl fmt::Display for RuntimeWakeError {
 
 impl std::error::Error for RuntimeWakeError {}
 
+/// Driver 在 runtime 边界失败时使用的稳定诊断。
+///
+/// 该类型不携带具体 backend 的错误泛型；`detail` 保存底层 report 的文本快照，
+/// 使 worker loop、`block_on` 和 scope join 可以沿用同一错误类型观察失败。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeDriverError {
+    pub backend: &'static str,
+    pub worker_id: usize,
+    pub phase: &'static str,
+    pub operation: &'static str,
+    pub detail: String,
+}
+
+impl fmt::Display for RuntimeDriverError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} worker {} failed during {} {}: {}",
+            self.backend, self.worker_id, self.phase, self.operation, self.detail
+        )
+    }
+}
+
+impl std::error::Error for RuntimeDriverError {}
+
 set! {
     pub RuntimeError = {
         #[display("worker id {worker_id} is out of bounds (worker count: {worker_count})")]
@@ -79,6 +104,12 @@ set! {
         WakeFailed {
             #[source]
             source: RuntimeWakeError,
+        },
+
+        #[display("runtime driver failed: {source}")]
+        DriverFailed {
+            #[source]
+            source: RuntimeDriverError,
         },
 
         #[display("mutex poisoned: {component}")]

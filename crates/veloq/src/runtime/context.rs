@@ -14,7 +14,7 @@ use veloq_driver_native::{
     op::{DetachedSubmitter, DriverProvider, IntoPlatformOp, IoFd, Op, OpSubmitter, SingleShotOp},
 };
 use veloq_runtime::{
-    error::{Result as RuntimeResult, RuntimeError},
+    error::{Result as RuntimeResult, RuntimeDriverError, RuntimeError},
     runtime::{
         EnqueuePinnedOutcome, IdleDecision, IdleWaitStrategy, IntoRuntimeCtx, RuntimeCtx,
         RuntimeShared,
@@ -433,14 +433,9 @@ pub fn poll_current_driver<'rt>(
 
             let mut driver = extra.driver.borrow_mut();
 
-            let outcome = driver.drive(DriveMode::Poll).map_err(|err| {
-                RuntimeError::InvariantViolation {
-                    site: "poll_current_driver",
-                    detail: format!("driver drive(Poll) failed, details: {}", err).into(),
-                }
-                .to_report()
-                .with_diag_src_err(err)
-            })?;
+            let outcome = driver
+                .drive(DriveMode::Poll)
+                .map_err(|err| driver_failure(shared, "poll", "drive", err))?;
             Ok(idle_decision_from_outcome(outcome))
         })
         .map_err(|err| {
@@ -554,14 +549,7 @@ pub fn park_current_driver<'rt>(
         // Block on the OS event driver
         driver
             .drive(drive_mode_for_wait_strategy(wait_strategy))
-            .map_err(|err| {
-                RuntimeError::InvariantViolation {
-                    site: "park_current_driver",
-                    detail: "driver drive(Wait) failed".into(),
-                }
-                .to_report()
-                .with_diag_src_err(err)
-            })
+            .map_err(|err| driver_failure(shared, "wait", "drive", err))
     });
 
     match res {
@@ -590,6 +578,33 @@ fn drive_mode_for_wait_strategy(wait_strategy: IdleWaitStrategy) -> DriveMode {
     DriveMode::Wait {
         timeout: wait_strategy.into_timeout(),
     }
+}
+
+fn driver_failure<E>(
+    shared: &RuntimeShared<WorkerState<'_>>,
+    phase: &'static str,
+    operation: &'static str,
+    error: E,
+) -> diagweave::Report<RuntimeError>
+where
+    E: std::fmt::Display,
+{
+    RuntimeError::DriverFailed {
+        source: RuntimeDriverError {
+            backend: if cfg!(target_os = "linux") {
+                "io_uring"
+            } else if cfg!(target_os = "windows") {
+                "iocp"
+            } else {
+                "unknown"
+            },
+            worker_id: shared.worker_id(),
+            phase,
+            operation,
+            detail: format!("{error:#}"),
+        },
+    }
+    .to_report()
 }
 
 #[cfg(test)]

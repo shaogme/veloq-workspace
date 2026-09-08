@@ -29,6 +29,48 @@ use super::{IocpDriver, RIO_EVENT_KEY, RIO_EVENT_TOKEN, completion::COMP_BACKEND
 const MAX_IOCP_BATCH: usize = 128;
 const WAKE_FAILURE_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitBudgetSource {
+    External,
+    Timer,
+    Probe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WaitBudget {
+    duration: Duration,
+    source: WaitBudgetSource,
+}
+
+fn wait_budget(
+    external_timeout: Option<Duration>,
+    internal_timeout: Option<Duration>,
+    probe: Duration,
+) -> WaitBudget {
+    let mut budget = WaitBudget {
+        duration: probe,
+        source: WaitBudgetSource::Probe,
+    };
+
+    if let Some(internal) = internal_timeout
+        && internal <= budget.duration
+    {
+        budget = WaitBudget {
+            duration: internal,
+            source: WaitBudgetSource::Timer,
+        };
+    }
+    if let Some(external) = external_timeout
+        && external <= budget.duration
+    {
+        budget = WaitBudget {
+            duration: external,
+            source: WaitBudgetSource::External,
+        };
+    }
+    budget
+}
+
 pub(super) struct CompletionPump {
     port: Arc<IoCompletionPort>,
     notification_state: Arc<AtomicU8>,
@@ -107,7 +149,7 @@ impl CompletionPump {
         }
     }
 
-    pub(super) fn clear_notification(&self) -> IocpResult<()> {
+    pub(super) fn clear_notification(&self) -> IocpResult<bool> {
         loop {
             match self.notification_state.load(Ordering::Acquire) {
                 WAKER_PROCESSING => {
@@ -121,7 +163,7 @@ impl CompletionPump {
                         )
                         .is_ok()
                     {
-                        return Ok(());
+                        return Ok(false);
                     }
                 }
                 WAKER_REARM => {
@@ -148,7 +190,7 @@ impl CompletionPump {
                                 .push_ctx("scope", "iocp/driver.polling")
                                 .attach_note("failed to rearm remote waker"));
                         }
-                        return Ok(());
+                        return Ok(true);
                     }
                 }
                 WAKER_NOTIFIED => {
@@ -162,10 +204,10 @@ impl CompletionPump {
                         )
                         .is_ok()
                     {
-                        return Ok(());
+                        return Ok(false);
                     }
                 }
-                WAKER_IDLE => return Ok(()),
+                WAKER_IDLE => return Ok(false),
                 _ => unreachable!("invalid IOCP waker state"),
             }
         }
@@ -211,7 +253,9 @@ impl TimerEngine {
     }
 
     pub(super) fn next_timeout(&self) -> Option<Duration> {
-        self.wheel.next_timeout()
+        self.wheel.next_timeout().map(|timeout| {
+            timeout.saturating_sub(Instant::now().saturating_duration_since(self.last_poll))
+        })
     }
 
     pub(super) fn insert(&mut self, token: OpToken, duration: Duration) -> TaskId {
@@ -272,13 +316,19 @@ impl<'a> IocpDriver<'a> {
         let _ = self.drain_cancel_requests()?;
         self.timer.advance_to(Instant::now());
         self.process_timers()?;
-        let wait_ms = if self.ops.shared.has_ready_completion() {
+        let ready_completion = self.ops.shared.has_ready_completion();
+        let budget = wait_budget(
+            timeout,
+            self.timer.next_timeout(),
+            WAKE_FAILURE_PROBE_INTERVAL,
+        );
+        let wait_ms = if ready_completion {
             self.completion_diagnostics
                 .backend()
                 .inc_wait_ready_preflight();
             0
         } else {
-            self.calculate_wait_ms(timeout)
+            duration_to_wait_ms(budget.duration)
         };
         if wait_ms == 0 {
             self.completion_diagnostics.backend().inc_wait_zero();
@@ -287,18 +337,26 @@ impl<'a> IocpDriver<'a> {
         }
 
         let batched = self.completion.fill_batch(wait_ms);
-        self.timer.advance_to(Instant::now());
-        self.process_timers()?;
-
         let count = batched
             .attach_note("failed to get IOCP completion status")
             .trans()?;
-        if count == 0 {
+        let mut timed_out_source = None;
+        if count == 0 && wait_ms != 0 {
             self.completion_diagnostics.backend().inc_wait_timeout();
-            if timeout.is_none() && wait_ms == duration_to_wait_ms(WAKE_FAILURE_PROBE_INTERVAL) {
-                self.completion_diagnostics
+            timed_out_source = Some(budget.source);
+            match budget.source {
+                WaitBudgetSource::External => self
+                    .completion_diagnostics
                     .backend()
-                    .inc_wait_probe_return();
+                    .inc_wait_external_timeout(),
+                WaitBudgetSource::Timer => self
+                    .completion_diagnostics
+                    .backend()
+                    .inc_wait_timer_return(),
+                WaitBudgetSource::Probe => self
+                    .completion_diagnostics
+                    .backend()
+                    .inc_wait_probe_return(),
             }
         }
         self.completion.mark_waker_notifications(count);
@@ -306,16 +364,30 @@ impl<'a> IocpDriver<'a> {
         // Every entry is routed even if one of them fails, so a single corrupt completion
         // cannot drop the rest of the batch on the floor; the first error is reported.
         let mut first_error = None;
+        let mut handled = 0;
         for index in 0..count {
-            if let Err(report) = self.handle_batch_entry(index)
-                && first_error.is_none()
-            {
-                first_error = Some(report);
+            match self.handle_batch_entry(index) {
+                Ok(value) => handled += value,
+                Err(report) => {
+                    if first_error.is_none() {
+                        first_error = Some(report);
+                    }
+                }
             }
         }
 
         self.timer.advance_to(Instant::now());
-        self.process_timers()?;
+        let timer_count = self.process_timers()?;
+        if handled > 0 {
+            self.completion_diagnostics
+                .backend()
+                .inc_wait_completion_return();
+        }
+        if timer_count > 0 && timed_out_source != Some(WaitBudgetSource::Timer) {
+            self.completion_diagnostics
+                .backend()
+                .inc_wait_timer_return();
+        }
         first_error.map_or(Ok(()), Err)
     }
 
@@ -332,20 +404,6 @@ impl<'a> IocpDriver<'a> {
             return Ok(0);
         };
         self.handle_completion_status(bytes, key, overlapped, success, error_code)
-    }
-
-    pub(super) fn calculate_wait_ms(&self, timeout: Option<Duration>) -> u32 {
-        let internal_timeout = self.timer.next_timeout().map(duration_to_wait_ms);
-        let external_timeout = timeout.map(duration_to_wait_ms);
-        let probe_timeout = duration_to_wait_ms(WAKE_FAILURE_PROBE_INTERVAL);
-
-        let timeout = match (external_timeout, internal_timeout) {
-            (Some(external), Some(internal)) => external.min(internal),
-            (Some(external), None) => external,
-            (None, Some(internal)) => internal,
-            (None, None) => probe_timeout,
-        };
-        timeout.min(probe_timeout)
     }
 
     fn handle_completion_status(
@@ -574,5 +632,38 @@ mod tests {
         assert_eq!(duration_to_wait_ms(Duration::ZERO), 0);
         assert_eq!(duration_to_wait_ms(Duration::from_millis(1)), 1);
         assert_eq!(duration_to_wait_ms(Duration::from_micros(1_001)), 2);
+    }
+
+    #[test]
+    fn wait_budget_keeps_the_explicit_deadline_source() {
+        assert_eq!(
+            wait_budget(
+                Some(Duration::from_secs(2)),
+                Some(Duration::from_secs(3)),
+                Duration::from_secs(1),
+            ),
+            WaitBudget {
+                duration: Duration::from_secs(1),
+                source: WaitBudgetSource::Probe,
+            }
+        );
+        assert_eq!(
+            wait_budget(
+                Some(Duration::from_millis(3)),
+                Some(Duration::from_millis(7)),
+                Duration::from_secs(1),
+            ),
+            WaitBudget {
+                duration: Duration::from_millis(3),
+                source: WaitBudgetSource::External,
+            }
+        );
+        assert_eq!(
+            wait_budget(None, Some(Duration::from_millis(5)), Duration::from_secs(1),),
+            WaitBudget {
+                duration: Duration::from_millis(5),
+                source: WaitBudgetSource::Timer,
+            }
+        );
     }
 }

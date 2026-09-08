@@ -319,10 +319,11 @@ impl RuntimeSharedBase {
             if let Err(task) = worker.local_queue.push(task) {
                 worker.local_count.fetch_sub(1, Ordering::Release);
                 Self::abandon_queued_task(&task);
-            } else if let Err(err) = task.header().notify_runtime_active() {
-                worker.local_count.fetch_sub(1, Ordering::Release);
-                Self::abandon_queued_task(&task);
-                return Err(err);
+            } else {
+                // 唤醒失败会设置共享 shutdown。任务已经在队列中可见，必须保留队列引用和
+                // 计数，交给 worker 的 shutdown drain 结算；此处提前清理会让 drain 对计数
+                // 再次递减，并可能把仍在队列中的任务变成悬挂引用。
+                task.header().notify_runtime_active()?;
             }
         }
         Ok(())

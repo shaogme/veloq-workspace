@@ -110,11 +110,13 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
     ) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         Ok(match control {
             CompletionControl::Waker { raw, .. } => {
-                self.completion.clear_notification()?;
+                let rearmed = self.completion.clear_notification()?;
                 if raw.res >= 0 {
                     self.diagnostics.backend().inc_waker_ok();
                     self.diagnostics.backend().inc_wait_waker_return();
-                    self.diagnostics.backend().inc_waker_rearm();
+                    if rearmed {
+                        self.diagnostics.backend().inc_waker_rearm();
+                    }
                 } else {
                     self.diagnostics.backend().inc_waker_error();
                     return Err(IocpError::Internal
@@ -193,7 +195,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
 }
 
 impl<'a> IocpDriver<'a> {
-    pub(super) fn process_timers(&mut self) -> IocpResult<()> {
+    pub(super) fn process_timers(&mut self) -> IocpResult<usize> {
         let timer_buffer = self.timer.take_buffer();
         let now = Instant::now();
 
@@ -226,6 +228,7 @@ impl<'a> IocpDriver<'a> {
             }
         }
 
+        let expired_count = expired.len();
         for token in expired {
             let event = UserCompletionEvent::from_parts(COMP_BACKEND_IOCP, token, 0, 0);
             self.accept_synthetic_completion(
@@ -235,7 +238,7 @@ impl<'a> IocpDriver<'a> {
             )?;
         }
         self.timer.restore_cleared_buffer(timer_buffer);
-        Ok(())
+        Ok(expired_count)
     }
 
     pub(super) fn process_completion_envelope(

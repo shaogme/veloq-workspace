@@ -264,7 +264,8 @@ pub trait DriverRaw: sealed::Sealed {
     /// completion；没有可立即消费的状态后，应等待用户 I/O completion、后端 waker、
     /// 内部 timer 或取消/清理事件。没有 active 用户 operation 不是立即返回的理由，
     /// 因为后端 waker 本身就是等待源。`Wait` 的外部 timeout 是本次调用允许的最长等待
-    /// 时间，驱动内部 timer 更早时必须取两者的最小值；超时返回属于正常结果。
+    /// 时间，驱动内部 timer 或有限的故障探测周期更早时必须取三者的最小值；超时返回
+    /// 属于正常结果。
     ///
     /// 返回前必须重新计算 [`DriveOutcome`] 的三个字段：`ready_completion` 只能表示
     /// 完成表中已有可由 future 消费的记录，`in_flight` 只表示当前仍在途的用户操作，
@@ -655,8 +656,8 @@ pub enum DriveMode {
     Poll,
     /// 等待一个后端事件、内部 timer 或远端唤醒。
     ///
-    /// `Some` 是本次调用允许的最长等待时间；`None` 表示由后端内部 timer
-    /// 或事件源决定等待上限。
+    /// `Some` 是本次调用允许的最长等待时间；`None` 表示没有外部 deadline，后端仍可
+    /// 使用内部 timer 或有限的故障探测周期决定等待上限。
     Wait { timeout: Option<Duration> },
 }
 

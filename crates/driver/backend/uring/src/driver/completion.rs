@@ -39,6 +39,48 @@ pub(crate) const COMP_BACKEND_URING: CompletionBackend =
         None => unreachable!(),
     });
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitBudgetSource {
+    External,
+    Timer,
+    Probe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WaitBudget {
+    duration: Duration,
+    source: WaitBudgetSource,
+}
+
+fn wait_budget(
+    external_timeout: Option<Duration>,
+    internal_timeout: Option<Duration>,
+    probe: Duration,
+) -> WaitBudget {
+    let mut budget = WaitBudget {
+        duration: probe,
+        source: WaitBudgetSource::Probe,
+    };
+
+    if let Some(internal) = internal_timeout
+        && internal <= budget.duration
+    {
+        budget = WaitBudget {
+            duration: internal,
+            source: WaitBudgetSource::Timer,
+        };
+    }
+    if let Some(external) = external_timeout
+        && external <= budget.duration
+    {
+        budget = WaitBudget {
+            duration: external,
+            source: WaitBudgetSource::External,
+        };
+    }
+    budget
+}
+
 pub(crate) enum UringSyntheticCompletion {
     None,
     Cancel { mode: CancelMode },
@@ -392,78 +434,85 @@ impl<'a> UringDriver<'a> {
             completion.sync();
             !completion.is_empty()
         };
-        if cq_ready {
+        self.advance_timer_clock()?;
+        self.flush_cancellations()?;
+        self.flush_backlog()?;
+        let ready_completion = self.ops.shared.has_ready_completion();
+        if cq_ready || ready_completion {
             self.completion_diagnostics
                 .backend()
                 .inc_wait_ready_preflight();
         }
-        self.advance_timer_clock()?;
-        self.flush_cancellations()?;
-        self.flush_backlog()?;
 
-        let effective_timeout = match (external_timeout, self.timers.next_timeout()) {
-            (Some(external), Some(internal)) => Some(external.min(internal)),
-            (Some(external), None) => Some(external),
-            (None, Some(internal)) => Some(internal),
-            (None, None) => Some(Self::WAKE_FAILURE_PROBE_INTERVAL),
-        }
-        .map(|timeout| timeout.min(Self::WAKE_FAILURE_PROBE_INTERVAL));
-
-        if self.ops.shared.has_ready_completion()
-            || matches!(effective_timeout, Some(timeout) if timeout.is_zero())
-        {
-            if matches!(effective_timeout, Some(timeout) if timeout.is_zero()) {
-                self.completion_diagnostics.backend().inc_wait_zero();
-            }
-            return Ok(());
+        let budget = wait_budget(
+            external_timeout,
+            self.timers.next_timeout(),
+            Self::WAKE_FAILURE_PROBE_INTERVAL,
+        );
+        let zero_timeout = budget.duration.is_zero();
+        if zero_timeout {
+            self.completion_diagnostics.backend().inc_wait_zero();
         }
 
-        if !cq_ready && self.ring.completion().is_empty() {
-            if let Some(duration) = effective_timeout {
-                self.completion_diagnostics.backend().inc_wait_block();
-                let ts = io_uring::types::Timespec::new()
-                    .sec(duration.as_secs())
-                    .nsec(duration.subsec_nanos());
+        let did_block = !cq_ready && !ready_completion && !zero_timeout;
+        let mut timed_out_source = None;
+        if did_block {
+            self.completion_diagnostics.backend().inc_wait_block();
+            let duration = budget.duration;
+            let ts = io_uring::types::Timespec::new()
+                .sec(duration.as_secs())
+                .nsec(duration.subsec_nanos());
 
-                let args = io_uring::types::SubmitArgs::new().timespec(&ts);
-                match self.ring.submitter().submit_with_args(1, &args) {
-                    Ok(_) => {}
-                    Err(ref e) if e.raw_os_error() == Some(libc::ETIME) => {
-                        self.completion_diagnostics.backend().inc_wait_timeout();
-                        if external_timeout.is_none()
-                            && duration == Self::WAKE_FAILURE_PROBE_INTERVAL
-                        {
-                            self.completion_diagnostics
-                                .backend()
-                                .inc_wait_probe_return();
-                        }
-                    }
-                    Err(e) => {
-                        return Err(UringError::CompletionWait
-                            .io_report("driver.wait_internal.submit_with_args", e));
+            let args = io_uring::types::SubmitArgs::new().timespec(&ts);
+            match self.ring.submitter().submit_with_args(1, &args) {
+                Ok(_) => {}
+                Err(ref e) if e.raw_os_error() == Some(libc::ETIME) => {
+                    self.completion_diagnostics.backend().inc_wait_timeout();
+                    timed_out_source = Some(budget.source);
+                    match budget.source {
+                        WaitBudgetSource::External => self
+                            .completion_diagnostics
+                            .backend()
+                            .inc_wait_external_timeout(),
+                        WaitBudgetSource::Timer => self
+                            .completion_diagnostics
+                            .backend()
+                            .inc_wait_timer_return(),
+                        WaitBudgetSource::Probe => self
+                            .completion_diagnostics
+                            .backend()
+                            .inc_wait_probe_return(),
                     }
                 }
-            } else {
-                self.completion_diagnostics.backend().inc_wait_block();
-                self.ring.submit_and_wait(1).map_err(|e| {
-                    UringError::CompletionWait.io_report("driver.wait_internal.submit_and_wait", e)
-                })?;
+                Err(e) => {
+                    return Err(UringError::CompletionWait
+                        .io_report("driver.wait_internal.submit_with_args", e));
+                }
             }
         }
 
-        self.advance_timer_clock()?;
-
         let progress = self.process_completions_internal()?;
-        let _ = progress.semantic_count();
+        if progress.user_completed > 0 {
+            self.completion_diagnostics
+                .backend()
+                .inc_wait_completion_return();
+        }
+        let timer_count = self.advance_timer_clock()?;
+        if did_block && timer_count > 0 && timed_out_source != Some(WaitBudgetSource::Timer) {
+            self.completion_diagnostics
+                .backend()
+                .inc_wait_timer_return();
+        }
         self.flush_cancellations()?;
         self.flush_backlog()?;
         Ok(())
     }
 
     /// Advances the timer wheel by however many whole ticks elapsed since the last poll.
-    fn advance_timer_clock(&mut self) -> UringResult<()> {
+    fn advance_timer_clock(&mut self) -> UringResult<usize> {
         let now = Instant::now();
         let expired = self.timers.advance_timer_wheel(now).to_vec();
+        let expired_count = expired.len();
         for &token in &expired {
             let event = UserCompletionEvent::from_parts(COMP_BACKEND_URING, token, 0, 0);
             self.accept_synthetic_completion(
@@ -472,7 +521,7 @@ impl<'a> UringDriver<'a> {
                 UringSyntheticCompletion::None,
             )?;
         }
-        Ok(())
+        Ok(expired_count)
     }
 
     pub(crate) fn poll_nonblocking_internal(&mut self) -> UringResult<()> {
@@ -955,6 +1004,39 @@ mod tests {
 
         assert!(effect.is_err());
         assert_eq!(diagnostics.snapshot().backend.waker_error, 1);
+    }
+
+    #[test]
+    fn wait_budget_keeps_the_explicit_deadline_source() {
+        assert_eq!(
+            wait_budget(
+                Some(Duration::from_secs(2)),
+                Some(Duration::from_secs(3)),
+                Duration::from_secs(1),
+            ),
+            WaitBudget {
+                duration: Duration::from_secs(1),
+                source: WaitBudgetSource::Probe,
+            }
+        );
+        assert_eq!(
+            wait_budget(
+                Some(Duration::from_millis(3)),
+                Some(Duration::from_millis(7)),
+                Duration::from_secs(1),
+            ),
+            WaitBudget {
+                duration: Duration::from_millis(3),
+                source: WaitBudgetSource::External,
+            }
+        );
+        assert_eq!(
+            wait_budget(None, Some(Duration::from_millis(5)), Duration::from_secs(1),),
+            WaitBudget {
+                duration: Duration::from_millis(5),
+                source: WaitBudgetSource::Timer,
+            }
+        );
     }
 
     #[test]
