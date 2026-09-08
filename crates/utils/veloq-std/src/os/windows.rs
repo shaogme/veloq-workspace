@@ -1,9 +1,5 @@
-pub mod fs {
-    pub use std::os::windows::fs::OpenOptionsExt;
-}
+//! Windows-specific operating system primitives, handles, and conversion traits.
 
-pub mod io {
-    pub use std::os::windows::io::{
-        AsRawHandle, AsRawSocket, IntoRawHandle, IntoRawSocket, RawHandle, RawSocket,
-    };
-}
+pub mod fs;
+pub mod io;
+pub mod raw;

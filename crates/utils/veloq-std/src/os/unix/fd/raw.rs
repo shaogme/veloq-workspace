@@ -1,0 +1,217 @@
+//! Raw Unix file descriptors and conversion traits.
+
+use core::ffi::c_int;
+
+use crate::alloc_crate as alloc;
+
+use alloc::{boxed::Box, rc::Rc, sync::Arc};
+
+#[cfg(feature = "std")]
+use std::{
+    fs::File,
+    io::{Stderr, Stdin, Stdout},
+    net::{TcpListener, TcpStream, UdpSocket},
+    os::fd::{AsRawFd as StdAsRawFd, FromRawFd as StdFromRawFd, IntoRawFd as StdIntoRawFd},
+};
+
+/// Raw file descriptors.
+pub type RawFd = c_int;
+
+/// A trait to extract the raw file descriptor from an underlying object.
+pub trait AsRawFd {
+    /// Extracts the raw file descriptor.
+    fn as_raw_fd(&self) -> RawFd;
+}
+
+/// A trait to express the ability to construct an object from a raw file descriptor.
+pub trait FromRawFd {
+    /// Constructs a new instance of `Self` from the given raw file descriptor.
+    ///
+    /// # Safety
+    ///
+    /// The `fd` passed in must be an owned file descriptor; in particular, it must be open.
+    unsafe fn from_raw_fd(fd: RawFd) -> Self;
+}
+
+/// A trait to express the ability to consume an object and acquire ownership of its raw file descriptor.
+pub trait IntoRawFd {
+    /// Consumes this object, returning the raw underlying file descriptor.
+    #[must_use = "losing the raw file descriptor may leak resources"]
+    fn into_raw_fd(self) -> RawFd;
+}
+
+impl AsRawFd for RawFd {
+    #[inline]
+    fn as_raw_fd(&self) -> RawFd {
+        *self
+    }
+}
+
+impl IntoRawFd for RawFd {
+    #[inline]
+    fn into_raw_fd(self) -> RawFd {
+        self
+    }
+}
+
+impl FromRawFd for RawFd {
+    #[inline]
+    unsafe fn from_raw_fd(fd: RawFd) -> RawFd {
+        fd
+    }
+}
+
+impl<T: AsRawFd + ?Sized> AsRawFd for &T {
+    #[inline]
+    fn as_raw_fd(&self) -> RawFd {
+        T::as_raw_fd(self)
+    }
+}
+
+impl<T: AsRawFd + ?Sized> AsRawFd for &mut T {
+    #[inline]
+    fn as_raw_fd(&self) -> RawFd {
+        T::as_raw_fd(self)
+    }
+}
+
+impl<T: AsRawFd + ?Sized> AsRawFd for Box<T> {
+    #[inline]
+    fn as_raw_fd(&self) -> RawFd {
+        (**self).as_raw_fd()
+    }
+}
+
+impl<T: AsRawFd + ?Sized> AsRawFd for Arc<T> {
+    #[inline]
+    fn as_raw_fd(&self) -> RawFd {
+        (**self).as_raw_fd()
+    }
+}
+
+impl<T: AsRawFd + ?Sized> AsRawFd for Rc<T> {
+    #[inline]
+    fn as_raw_fd(&self) -> RawFd {
+        (**self).as_raw_fd()
+    }
+}
+
+#[cfg(feature = "std")]
+impl AsRawFd for File {
+    #[inline]
+    fn as_raw_fd(&self) -> RawFd {
+        StdAsRawFd::as_raw_fd(self)
+    }
+}
+
+#[cfg(feature = "std")]
+impl FromRawFd for File {
+    #[inline]
+    unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        unsafe { StdFromRawFd::from_raw_fd(fd) }
+    }
+}
+
+#[cfg(feature = "std")]
+impl IntoRawFd for File {
+    #[inline]
+    fn into_raw_fd(self) -> RawFd {
+        StdIntoRawFd::into_raw_fd(self)
+    }
+}
+
+#[cfg(feature = "std")]
+impl AsRawFd for TcpStream {
+    #[inline]
+    fn as_raw_fd(&self) -> RawFd {
+        StdAsRawFd::as_raw_fd(self)
+    }
+}
+
+#[cfg(feature = "std")]
+impl FromRawFd for TcpStream {
+    #[inline]
+    unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        unsafe { StdFromRawFd::from_raw_fd(fd) }
+    }
+}
+
+#[cfg(feature = "std")]
+impl IntoRawFd for TcpStream {
+    #[inline]
+    fn into_raw_fd(self) -> RawFd {
+        StdIntoRawFd::into_raw_fd(self)
+    }
+}
+
+#[cfg(feature = "std")]
+impl AsRawFd for TcpListener {
+    #[inline]
+    fn as_raw_fd(&self) -> RawFd {
+        StdAsRawFd::as_raw_fd(self)
+    }
+}
+
+#[cfg(feature = "std")]
+impl FromRawFd for TcpListener {
+    #[inline]
+    unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        unsafe { StdFromRawFd::from_raw_fd(fd) }
+    }
+}
+
+#[cfg(feature = "std")]
+impl IntoRawFd for TcpListener {
+    #[inline]
+    fn into_raw_fd(self) -> RawFd {
+        StdIntoRawFd::into_raw_fd(self)
+    }
+}
+
+#[cfg(feature = "std")]
+impl AsRawFd for UdpSocket {
+    #[inline]
+    fn as_raw_fd(&self) -> RawFd {
+        StdAsRawFd::as_raw_fd(self)
+    }
+}
+
+#[cfg(feature = "std")]
+impl FromRawFd for UdpSocket {
+    #[inline]
+    unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        unsafe { StdFromRawFd::from_raw_fd(fd) }
+    }
+}
+
+#[cfg(feature = "std")]
+impl IntoRawFd for UdpSocket {
+    #[inline]
+    fn into_raw_fd(self) -> RawFd {
+        StdIntoRawFd::into_raw_fd(self)
+    }
+}
+
+#[cfg(feature = "std")]
+impl AsRawFd for Stdin {
+    #[inline]
+    fn as_raw_fd(&self) -> RawFd {
+        libc::STDIN_FILENO
+    }
+}
+
+#[cfg(feature = "std")]
+impl AsRawFd for Stdout {
+    #[inline]
+    fn as_raw_fd(&self) -> RawFd {
+        libc::STDOUT_FILENO
+    }
+}
+
+#[cfg(feature = "std")]
+impl AsRawFd for Stderr {
+    #[inline]
+    fn as_raw_fd(&self) -> RawFd {
+        libc::STDERR_FILENO
+    }
+}

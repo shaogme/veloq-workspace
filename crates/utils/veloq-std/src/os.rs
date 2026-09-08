@@ -1,15 +1,14 @@
 //! Platform-specific operating-system handles and conversion traits.
 //!
-//! The modules in this facade intentionally mirror the stable standard-library
-//! paths used by the driver crates. They are only populated when the `std`
-//! feature is enabled; the empty module keeps the facade available to
-//! `no_std` consumers without exposing standard-library types.
+//! This module provides non-standard library implementations of platform-specific
+//! I/O handles, file descriptors, and extension traits that operate without depending
+//! on the standard library.
 
-#[cfg(all(feature = "std", unix))]
-mod unix;
+#[cfg(unix)]
+pub mod unix;
 
-#[cfg(all(feature = "std", unix))]
+#[cfg(unix)]
 pub use unix::fd;
 
-#[cfg(all(feature = "std", windows))]
+#[cfg(windows)]
 pub mod windows;

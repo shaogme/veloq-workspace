@@ -1,3 +1,6 @@
-pub mod fd {
-    pub use std::os::fd::{AsRawFd, RawFd};
-}
+//! Unix-specific operating system primitives and I/O safety types.
+
+pub mod fd;
+pub mod raw;
+
+pub use fd as io;
