@@ -16,7 +16,6 @@ categories.workspace = true
 veloq-std.workspace = true
 
 crossbeam-queue.workspace = true
-parking_lot.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys.workspace = true

@@ -16,7 +16,6 @@ veloq-std.workspace = true
 veloq-tls.workspace = true
 veloq-intrusive-linklist.workspace = true
 crossbeam-utils.workspace = true
-parking_lot.workspace = true
 tracing.workspace = true
 bilge.workspace = true
 diagweave.workspace = true

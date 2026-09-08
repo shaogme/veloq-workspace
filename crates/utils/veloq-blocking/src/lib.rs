@@ -1,12 +1,11 @@
 #![no_std]
 
 use crossbeam_queue::SegQueue;
-use parking_lot::{Condvar, Mutex};
 use veloq_std::{
     boxed::Box,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc,
+        Arc, Condvar, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     thread,
@@ -177,7 +176,7 @@ impl ThreadPool {
 
                 // 2. Queue empty: Prepare to sleep
                 state.idle_workers.fetch_add(1, Ordering::SeqCst);
-                let mut guard = state.sleeper_lock.lock();
+                let guard = state.sleeper_lock.lock();
 
                 // 3. Double check queue under lock to avoid race conditions
                 if let Some(task) = state.queue.pop() {
@@ -188,7 +187,7 @@ impl ThreadPool {
                 }
 
                 // 4. Wait for signal
-                let result = state.cond.wait_for(&mut guard, keep_alive);
+                let (guard, result) = state.cond.wait_timeout(guard, keep_alive);
                 drop(guard);
                 state.idle_workers.fetch_sub(1, Ordering::SeqCst);
 

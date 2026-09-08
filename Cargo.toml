@@ -87,7 +87,7 @@ crossbeam-queue = "0.3"
 crossbeam-epoch = "0.9"
 futures-core = "0.3"
 futures-util = "0.3"
-libc = "0.2.183"
+libc = { version = "0.2.183", default-features = false }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_IO",
@@ -98,9 +98,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
 ] }
 tracing = "0.1.44"
-parking_lot = "0.12"
 bilge = "0.3.0"
-diagweave = "0.5.4"
+diagweave = { version = "0.5.4", default-features = false }
 
 clap = { version = "4.6", features = ["derive"] }
 loom = "0.7.2"

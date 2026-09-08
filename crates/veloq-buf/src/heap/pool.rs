@@ -14,7 +14,6 @@ use crate::{
 };
 use crossbeam_utils::CachePadded;
 use diagweave::prelude::*;
-use parking_lot::{Mutex, RwLock};
 use veloq_std::{
     boxed::Box,
     collections::hash_map::DefaultHasher,
@@ -23,7 +22,7 @@ use veloq_std::{
     num::NonZeroUsize,
     ptr::NonNull,
     string::ToString,
-    sync::Arc,
+    sync::{Arc, Mutex, RwLock},
     thread::{available_parallelism, current},
     vec,
     vec::Vec,

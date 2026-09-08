@@ -345,7 +345,6 @@ checksum = "5828bf23922958cf06c510adcab09defb416b6b6ce1994f705aff7e4236cc01a"
 dependencies = [
  "diagweave-macros",
  "ref_str",
- "tracing",
 ]
 
 [[package]]
@@ -1391,7 +1390,6 @@ name = "veloq-blocking"
 version = "0.1.0"
 dependencies = [
  "crossbeam-queue",
- "parking_lot",
  "veloq-std",
  "windows-sys",
 ]
@@ -1406,7 +1404,6 @@ dependencies = [
  "crossbeam-utils",
  "diagweave",
  "libc",
- "parking_lot",
  "tempfile",
  "tracing",
  "veloq-intrusive-linklist",
@@ -1529,7 +1526,6 @@ dependencies = [
  "diagweave",
  "libc",
  "numaperf-topo",
- "parking_lot",
  "trybuild",
  "veloq-intrusive-linklist",
  "veloq-std",
