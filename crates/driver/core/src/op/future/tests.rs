@@ -22,6 +22,7 @@ use crate::{
 use veloq_std::{
     error::Error,
     fmt,
+    string::String,
     sync::{
         atomic::{AtomicUsize, Ordering},
         mpsc,

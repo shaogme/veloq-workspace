@@ -33,3 +33,43 @@ macro_rules! nz {
         unsafe { $crate::num::NonZero::new_unchecked($value) }
     }};
 }
+
+#[macro_export]
+macro_rules! print {
+    ($($arg:tt)*) => {
+        $crate::io::_print(core::format_args!($($arg)*))
+    };
+}
+
+#[macro_export]
+macro_rules! println {
+    () => {
+        $crate::print!("\n")
+    };
+    ($fmt:expr) => {
+        $crate::print!(core::concat!($fmt, "\n"))
+    };
+    ($fmt:expr, $($arg:tt)*) => {
+        $crate::print!(core::concat!($fmt, "\n"), $($arg)*)
+    };
+}
+
+#[macro_export]
+macro_rules! eprint {
+    ($($arg:tt)*) => {
+        $crate::io::_eprint(core::format_args!($($arg)*))
+    };
+}
+
+#[macro_export]
+macro_rules! eprintln {
+    () => {
+        $crate::eprint!("\n")
+    };
+    ($fmt:expr) => {
+        $crate::eprint!(core::concat!($fmt, "\n"))
+    };
+    ($fmt:expr, $($arg:tt)*) => {
+        $crate::eprint!(core::concat!($fmt, "\n"), $($arg)*)
+    };
+}

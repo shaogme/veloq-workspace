@@ -61,6 +61,7 @@ impl<'a> UringBufferRegistry<'a> {
         }
     }
 
+    #[cfg(feature = "test-hooks")]
     #[inline]
     pub(crate) fn stats(&self) -> &UringRegistrationStats {
         &self.stats

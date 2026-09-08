@@ -281,7 +281,6 @@ fn test_once_lock_drop() {
     assert_eq!(DROP_COUNTER.load(Ordering::SeqCst), 1);
 }
 
-#[cfg(not(feature = "loom"))]
 mod condvar_tests {
     use std::vec::Vec;
     use veloq_std::sync::{Arc, Condvar, Mutex};

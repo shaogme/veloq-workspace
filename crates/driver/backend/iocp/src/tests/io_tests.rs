@@ -5,19 +5,22 @@ use crate::{
     op::{IocpSlotSpec, ReadFixed, ReadRaw, Timeout, WriteFixed, WriteRaw},
     tests::{complete_from_record, submit_test_op, wait_completion, wait_completion_record},
 };
-use std::{env, process};
 use veloq_buf::{FixedBuf, NoopRegistrar};
 use veloq_driver_core::{
     driver::{Driver, DriverSubmitResult, RegisterFd, SubmitStatus},
     op::IntoPlatformOp,
 };
 use veloq_std::{
+    env, format,
     fs::{File, OpenOptions, remove_file},
     num::NonZeroUsize,
     os::windows::fs::OpenOptionsExt,
     path::PathBuf,
+    process,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
+    vec,
+    vec::Vec,
 };
 use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
 
@@ -30,12 +33,9 @@ fn new_driver() -> IocpDriver<'static> {
 
 fn temp_file_path(label: &str) -> PathBuf {
     let id = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
-    let mut path = PathBuf::from(
-        env::temp_dir()
-            .to_str()
-            .expect("temp dir must be valid utf-8"),
-    );
-    let filename = format!("veloq-iocp-{label}-{}-{id}.tmp", process::id());
+    let pid = process::id();
+    let mut path = env::temp_dir();
+    let filename = format!("veloq-iocp-{label}-{pid}-{id}.tmp");
     path.push(filename.as_str());
     path
 }

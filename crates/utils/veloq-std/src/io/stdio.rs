@@ -393,3 +393,15 @@ impl fmt::Debug for StderrLock<'_> {
         f.debug_struct("StderrLock").finish_non_exhaustive()
     }
 }
+
+#[doc(hidden)]
+pub fn _print(args: fmt::Arguments<'_>) {
+    let mut out = stdout().lock();
+    let _ = out.write_fmt(args);
+}
+
+#[doc(hidden)]
+pub fn _eprint(args: fmt::Arguments<'_>) {
+    let mut err = stderr().lock();
+    let _ = err.write_fmt(args);
+}

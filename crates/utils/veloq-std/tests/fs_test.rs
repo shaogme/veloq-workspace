@@ -1,6 +1,7 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use veloq_std::{
+    ffi::OsStr,
     fs::{File, FileTimes, OpenOptions, read, read_to_string, remove_file, write},
     io::{ErrorKind, IoSlice, IoSliceMut, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -65,18 +66,21 @@ impl Drop for TempFileGuard {
 #[test]
 fn test_path_operations() {
     let p = Path::new("foo/bar/baz.txt");
-    assert_eq!(p.file_name(), Some("baz.txt"));
-    assert_eq!(p.extension(), Some("txt"));
-    assert_eq!(p.parent().map(|x| x.as_str()), Some("foo/bar"));
+    assert_eq!(p.file_name(), Some(OsStr::new("baz.txt")));
+    assert_eq!(p.extension(), Some(OsStr::new("txt")));
+    assert_eq!(p.parent(), Some(Path::new("foo/bar")));
 
     let mut pb = PathBuf::from("foo");
     pb.push("bar");
     pb.push("baz.txt");
-    assert_eq!(pb.file_name(), Some("baz.txt"));
+    assert_eq!(pb.file_name(), Some(OsStr::new("baz.txt")));
     assert!(pb.pop());
-    assert_eq!(pb.file_name(), Some("bar"));
+    assert_eq!(pb.file_name(), Some(OsStr::new("bar")));
 
+    #[cfg(not(windows))]
     let root = Path::new("/a/b/c");
+    #[cfg(windows)]
+    let root = Path::new(r"C:\a\b\c");
     assert!(root.is_absolute());
     assert!(!p.is_absolute());
 }

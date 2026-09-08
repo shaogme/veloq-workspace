@@ -581,7 +581,7 @@ impl RioRegistry {
 mod tests {
     use super::super::test_helpers::*;
     use super::*;
-    use veloq_std::sync::atomic::Ordering::SeqCst;
+    use veloq_std::{sync::atomic::Ordering::SeqCst, vec};
 
     #[test]
     fn rio_chunk_retired_registration_waits_for_last_lease() {

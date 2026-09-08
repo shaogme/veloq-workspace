@@ -20,6 +20,7 @@ use veloq_std::{
     sync::mpsc,
     thread,
     time::{Duration, Instant},
+    vec,
 };
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 

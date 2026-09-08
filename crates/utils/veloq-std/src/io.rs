@@ -10,7 +10,10 @@ pub use cursor::Cursor;
 pub use error::{Error, Result, SimpleMessage};
 pub use kind::ErrorKind;
 pub use os_error::RawOsError;
-pub use stdio::{Stderr, StderrLock, Stdin, StdinLock, Stdout, StdoutLock, stderr, stdin, stdout};
+pub use stdio::{
+    _eprint, _print, Stderr, StderrLock, Stdin, StdinLock, Stdout, StdoutLock, stderr, stdin,
+    stdout,
+};
 pub use traits::{
     Bytes, Chain, Empty, IoSlice, IoSliceMut, Read, Repeat, Seek, SeekFrom, Sink, Take, Write,
     copy, empty, repeat, sink,

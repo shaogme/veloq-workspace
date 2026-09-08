@@ -6,10 +6,12 @@ pub extern crate alloc as alloc_crate;
 
 pub mod cell;
 pub mod collections;
+pub mod env;
 pub mod fs;
 pub mod io;
 pub mod macros;
 pub mod path;
+pub mod process;
 pub mod sync;
 pub mod thread;
 pub mod time;
@@ -59,10 +61,7 @@ pub mod error {
     pub use core::error::*;
 }
 
-pub mod ffi {
-    pub use alloc_crate::ffi::CString;
-    pub use core::ffi::*;
-}
+pub mod ffi;
 
 pub mod fmt {
     pub use core::fmt::*;

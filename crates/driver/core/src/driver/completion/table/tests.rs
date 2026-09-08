@@ -16,7 +16,7 @@ use crate::{
 };
 use veloq_std::{
     error::Error,
-    fmt,
+    fmt, format,
     sync::atomic::{AtomicUsize, Ordering},
 };
 

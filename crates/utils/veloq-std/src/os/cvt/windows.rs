@@ -31,7 +31,6 @@ pub fn cvt<I: IsZero>(i: I) -> Result<I> {
 }
 
 /// Win32 API helper: checks if the return value is zero (success) and returns error on non-zero.
-#[allow(dead_code)]
 #[inline]
 pub fn cvt_nz<I: IsZero>(i: I) -> Result<()> {
     if i.is_zero() {

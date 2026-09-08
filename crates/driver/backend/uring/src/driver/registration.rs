@@ -376,6 +376,7 @@ fn consecutive_run_end(slots: &[u32], start: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::consecutive_run_end;
+    use veloq_std::{vec, vec::Vec};
 
     /// Walks `slots` the way `install_claimed_files` does, collecting one run per syscall.
     fn runs(slots: &[u32]) -> Vec<&[u32]> {

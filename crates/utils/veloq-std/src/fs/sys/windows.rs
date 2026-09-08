@@ -22,9 +22,12 @@ use crate::{
     io::{Error, ErrorKind, IoSlice, IoSliceMut, Result, SeekFrom},
     os::{
         cvt::cvt,
-        windows::io::{
-            AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, IntoRawHandle, OwnedHandle,
-            RawHandle,
+        windows::{
+            ffi::OsStrExt,
+            io::{
+                AsHandle, AsRawHandle, BorrowedHandle, FromRawHandle, IntoRawHandle, OwnedHandle,
+                RawHandle,
+            },
         },
     },
     path::Path,
@@ -35,7 +38,7 @@ pub struct File(pub(crate) OwnedHandle);
 
 impl File {
     pub fn open_options(path: &Path, opts: &OpenOptions) -> Result<Self> {
-        let mut wide: Vec<u16> = path.as_str().encode_utf16().collect();
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
         wide.push(0);
 
         let access_mode = if let Some(mode) = opts.access_mode {
@@ -572,13 +575,13 @@ impl FilePermissions {
 }
 
 pub fn remove_file(path: &Path) -> Result<()> {
-    if path.as_str().contains('\0') {
+    if path.as_os_str().encode_wide().any(|c| c == 0) {
         return Err(Error::new(
             ErrorKind::InvalidInput,
             "path contains null byte",
         ));
     }
-    let mut wide: Vec<u16> = path.as_str().encode_utf16().collect();
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
     wide.push(0);
     cvt(unsafe { DeleteFileW(wide.as_ptr()) })?;
     Ok(())

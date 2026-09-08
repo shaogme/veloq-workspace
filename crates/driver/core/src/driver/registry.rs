@@ -362,7 +362,7 @@ mod tests {
     use super::*;
     use crate::{DriverCoreError, DriverError, driver::PlatformOp};
     use diagweave::prelude::*;
-    use veloq_std::{error::Error, fmt};
+    use veloq_std::{error::Error, fmt, vec};
 
     struct DummyPlatformOp;
 

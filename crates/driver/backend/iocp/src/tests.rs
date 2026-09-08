@@ -13,7 +13,7 @@ use veloq_driver_core::{
 };
 use veloq_std::{
     convert::TryFrom,
-    io, thread,
+    format, io, thread,
     time::{Duration, Instant},
 };
 

@@ -400,6 +400,7 @@ impl FileTable {
 mod tests {
     use super::{FileTable, RegisteredFileEntry, SqeFd};
     use crate::config::{FileTableExhaustion, IoFd, RawHandleKind, UringRawHandle};
+    use veloq_std::vec::Vec;
 
     fn borrowed(fd: i32) -> RegisteredFileEntry {
         RegisteredFileEntry::BorrowedFd {
