@@ -1,4 +1,7 @@
-use crate::slot::{self, Generation};
+use crate::{
+    driver::OpToken,
+    slot::{self, Generation},
+};
 use veloq_std::num::NonZeroU8;
 
 use super::super::CompletionToken;
@@ -161,7 +164,7 @@ impl AnomalyAttach {
         Self { token, raw: None }
     }
 
-    pub fn from_op_token(token: crate::driver::OpToken) -> Self {
+    pub fn from_op_token(token: OpToken) -> Self {
         Self {
             token: CompletionToken::user(token),
             raw: None,

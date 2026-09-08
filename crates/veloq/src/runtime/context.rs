@@ -7,7 +7,8 @@ use veloq_buf::{
 };
 use veloq_driver_native::{
     driver::{
-        ContextDriverProvider, DriveMode, Driver, DriverRaw, PlatformDriver, RuntimeContextDriver,
+        ContextDriverProvider, DriveMode, DriveOutcome, Driver, DriverRaw, PlatformDriver,
+        RuntimeContextDriver,
     },
     error::{DriverReport, Error as DriverError},
     op::{DetachedSubmitter, DriverProvider, IntoPlatformOp, IoFd, Op, OpSubmitter, SingleShotOp},
@@ -343,17 +344,11 @@ impl<'rt> Ctx<'rt> {
         self.sync_registrar();
         self.driver(|mut driver| {
             let outcome = driver
-                .drive(DriveMode::Wait)
+                .drive(DriveMode::Wait { timeout: None })
                 .push_ctx("scope", "Ctx::drive_wait")
                 .attach_note("driver drive(Wait) failed")
                 .trans()?;
-            if !outcome.pending_progress {
-                return Ok(IdleDecision::wait(IdleWaitStrategy::block()));
-            }
-            Ok(match outcome.next_timeout_hint {
-                Some(duration) => IdleDecision::wait(IdleWaitStrategy::timeout(duration)),
-                None => IdleDecision::wait(IdleWaitStrategy::block()),
-            })
+            Ok(idle_decision_from_outcome(outcome))
         })
     }
 
@@ -446,11 +441,7 @@ pub fn poll_current_driver<'rt>(
                 .to_report()
                 .with_diag_src_err(err)
             })?;
-            Ok(match outcome.next_timeout_hint {
-                Some(duration) => IdleDecision::wait(IdleWaitStrategy::timeout(duration)),
-                None if outcome.pending_progress => IdleDecision::continue_now(),
-                None => IdleDecision::wait(IdleWaitStrategy::block()),
-            })
+            Ok(idle_decision_from_outcome(outcome))
         })
         .map_err(|err| {
             RuntimeError::TlsSetOwnedFailed {
@@ -546,7 +537,7 @@ pub(crate) fn submit_control_task<'rt>(
 
 pub fn park_current_driver<'rt>(
     shared: &RuntimeShared<WorkerState<'rt>>,
-    _wait_strategy: IdleWaitStrategy,
+    wait_strategy: IdleWaitStrategy,
 ) -> RuntimeResult<()> {
     let res = shared.extra_tls.try_with(|extra| {
         // sync registrar
@@ -560,7 +551,7 @@ pub fn park_current_driver<'rt>(
 
         // Block on the OS event driver
         driver
-            .drive(DriveMode::Wait)
+            .drive(drive_mode_for_wait_strategy(wait_strategy))
             .map_err(|err| RuntimeError::InvariantViolation {
                 site: "park_current_driver",
                 detail: format!("driver drive(Wait) failed, details: {}", err).into(),
@@ -575,5 +566,79 @@ pub fn park_current_driver<'rt>(
             source: err,
         }
         .to_report()),
+    }
+}
+
+fn idle_decision_from_outcome(outcome: DriveOutcome) -> IdleDecision {
+    if outcome.ready_completion {
+        return IdleDecision::continue_now();
+    }
+
+    match outcome.next_timeout_hint {
+        Some(duration) => IdleDecision::wait(IdleWaitStrategy::timeout(duration)),
+        None => IdleDecision::wait(IdleWaitStrategy::block()),
+    }
+}
+
+fn drive_mode_for_wait_strategy(wait_strategy: IdleWaitStrategy) -> DriveMode {
+    DriveMode::Wait {
+        timeout: wait_strategy.into_timeout(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    fn outcome(
+        next_timeout_hint: Option<Duration>,
+        ready_completion: bool,
+        in_flight: bool,
+    ) -> DriveOutcome {
+        DriveOutcome {
+            next_timeout_hint,
+            ready_completion,
+            in_flight,
+        }
+    }
+
+    #[test]
+    fn ready_completion_wins_over_timer_and_in_flight_state() {
+        assert_eq!(
+            idle_decision_from_outcome(outcome(Some(Duration::from_secs(1)), true, true,)),
+            IdleDecision::Continue
+        );
+    }
+
+    #[test]
+    fn no_ready_completion_with_timer_waits_for_timeout() {
+        assert_eq!(
+            idle_decision_from_outcome(outcome(Some(Duration::from_millis(5)), false, false,)),
+            IdleDecision::Wait(IdleWaitStrategy::Timeout(Duration::from_millis(5)))
+        );
+    }
+
+    #[test]
+    fn active_io_without_ready_completion_waits_indefinitely() {
+        assert_eq!(
+            idle_decision_from_outcome(outcome(None, false, true)),
+            IdleDecision::Wait(IdleWaitStrategy::Block)
+        );
+    }
+
+    #[test]
+    fn wait_strategy_is_forwarded_as_external_timeout() {
+        assert_eq!(
+            drive_mode_for_wait_strategy(IdleWaitStrategy::Block),
+            DriveMode::Wait { timeout: None }
+        );
+        assert_eq!(
+            drive_mode_for_wait_strategy(IdleWaitStrategy::Timeout(Duration::from_millis(7))),
+            DriveMode::Wait {
+                timeout: Some(Duration::from_millis(7))
+            }
+        );
     }
 }

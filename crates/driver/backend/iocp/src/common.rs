@@ -4,7 +4,7 @@ use veloq_std::{
     string::String,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU8, Ordering},
     },
 };
 
@@ -60,23 +60,65 @@ pub(crate) fn iocp_msg(ctx: IocpErrorContext, detail: impl Into<String>) -> Repo
 // Waker
 // ============================================================================
 
+pub(crate) const WAKER_IDLE: u8 = 0;
+pub(crate) const WAKER_NOTIFIED: u8 = 1;
+pub(crate) const WAKER_PROCESSING: u8 = 2;
+pub(crate) const WAKER_REARM: u8 = 3;
+
 /// A waker that posts a completion status to the port to wake up the event loop.
 pub(crate) struct IocpWaker {
     pub(crate) port: Arc<IoCompletionPort>,
-    pub(crate) is_notified: Arc<AtomicBool>,
+    pub(crate) notification_state: Arc<AtomicU8>,
 }
 
 impl RemoteWaker<IocpError> for IocpWaker {
     fn wake(&self) -> IocpResult<()> {
-        if self.is_notified.load(Ordering::Relaxed) {
-            return Ok(());
+        loop {
+            match self.notification_state.load(Ordering::Acquire) {
+                WAKER_IDLE => {
+                    if self
+                        .notification_state
+                        .compare_exchange(
+                            WAKER_IDLE,
+                            WAKER_NOTIFIED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        if let Err(error) = self.port.notify(CompletionToken::waker(0)) {
+                            self.notification_state
+                                .compare_exchange(
+                                    WAKER_NOTIFIED,
+                                    WAKER_IDLE,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                )
+                                .ok();
+                            return Err(error
+                                .push_ctx("scope", "iocp/common")
+                                .attach_note("failed to notify remote waker"));
+                        }
+                        return Ok(());
+                    }
+                }
+                WAKER_NOTIFIED | WAKER_REARM => return Ok(()),
+                WAKER_PROCESSING => {
+                    if self
+                        .notification_state
+                        .compare_exchange(
+                            WAKER_PROCESSING,
+                            WAKER_REARM,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return Ok(());
+                    }
+                }
+                _ => unreachable!("invalid IOCP waker state"),
+            }
         }
-        if !self.is_notified.swap(true, Ordering::AcqRel) {
-            self.port
-                .notify(CompletionToken::waker(0))
-                .push_ctx("scope", "iocp/common")
-                .attach_note("failed to notify remote waker")?;
-        }
-        Ok(())
     }
 }

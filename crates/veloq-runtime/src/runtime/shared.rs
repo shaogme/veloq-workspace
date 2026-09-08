@@ -267,6 +267,7 @@ impl RuntimeSharedBase {
             Self::abandon_queued_task(&task);
         }
         while let Some(task) = worker.remote_queue.pop() {
+            worker.remote_count.fetch_sub(1, Ordering::Release);
             Self::abandon_queued_task(&task);
         }
     }
@@ -431,6 +432,7 @@ impl RuntimeSharedBase {
                 self.idle
                     .wake_idle_in_group(group_idx, &self.topo, &self.registry);
             } else {
+                worker.remote_count.fetch_add(1, Ordering::Release);
                 self.idle.event_count.notify();
                 self.wake_worker(worker_id);
             }
@@ -477,6 +479,9 @@ impl RuntimeSharedBase {
         }
 
         if let Some(task) = self.registry.workers[worker_id].remote_queue.pop() {
+            self.registry.workers[worker_id]
+                .remote_count
+                .fetch_sub(1, Ordering::Release);
             self.poll_send_task(worker_id, task)?;
             return Ok(true);
         }
@@ -534,6 +539,7 @@ impl<T> RuntimeShared<T> {
         let worker = &self.base.registry.workers[worker_id];
         let local_has_work = worker.local_count.load(Ordering::Acquire) > 0;
         worker.lifo.load(Ordering::Acquire).is_some()
+            || worker.remote_count.load(Ordering::Acquire) > 0
             || !worker.stealer.is_empty()
             || local_has_work
             || worker.pinned_count.load(Ordering::Acquire) > 0

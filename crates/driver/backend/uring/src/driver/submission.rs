@@ -145,6 +145,7 @@ impl<'a> UringDriver<'a> {
 
         if self.push_entry(sqe) {
             self.waker.set_armed(true);
+            self.waker.finish_rearm();
             Ok(())
         } else {
             Err(UringError::Submission.report("driver.submit_waker", "failed to enqueue waker SQE"))

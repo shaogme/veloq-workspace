@@ -2,8 +2,8 @@ use veloq_std::{
     collections::HashMap,
     format, mem,
     num::NonZeroU8,
-    sync::atomic::{AtomicBool, Ordering},
-    time::Instant,
+    sync::atomic::{AtomicU8, Ordering},
+    time::{Duration, Instant},
     vec::Vec,
 };
 
@@ -13,17 +13,21 @@ use tracing::{debug, error, trace, warn};
 use crate::{
     config::IoFd,
     diagnostics::UringCompletionDiagnostics,
+    driver::control::waker::{WAKER_PROCESSING, WAKER_REARM},
     driver::{CqeEnv, PendingCancel, ProvidedBufGroup, UringDriver},
     error::{UringError, UringResult, uring_report_to_event_res},
     op::{Slot, UringSlotSpec, UringUserPayload},
 };
+
+#[cfg(test)]
+use crate::driver::control::waker::WAKER_NOTIFIED;
 use veloq_driver_core::{
     driver::{
         AnomalyAttach, CancelCompletionId, CancelMode, CompletionAnomalyKind, CompletionBackend,
         CompletionBackendHooks, CompletionCleanupGuard, CompletionContinuation, CompletionControl,
         CompletionEnvelope, CompletionFlowExt, CompletionFlowOutcome, CompletionHookOutcome,
-        CompletionIngress, CompletionSource, Driver, DriverCompletionDiagnostics, OpToken,
-        PlatformOp, RawCompletion, SyntheticCompletionSource, UserCompletionEvent,
+        CompletionIngress, CompletionSource, CompletionToken, Driver, DriverCompletionDiagnostics,
+        OpToken, PlatformOp, RawCompletion, SyntheticCompletionSource, UserCompletionEvent,
     },
     slot::{CheckedSlotView, InFlightOrphaned, InFlightWaiting, SlotRegistryExt, SlotView},
 };
@@ -95,7 +99,7 @@ struct UringCompletionHooks<'a> {
     pending_cancel_cqes: &'a mut HashMap<CancelCompletionId, PendingCancel>,
     waker_buf_len: usize,
     waker_armed: &'a mut bool,
-    is_waked: &'a AtomicBool,
+    notification_state: &'a AtomicU8,
     provided_buffers: Option<&'a mut ProvidedBufGroup>,
     synthetic: UringSyntheticCompletion,
     post: UringPostCompletionEffects,
@@ -107,7 +111,7 @@ impl<'a> UringCompletionHooks<'a> {
         pending_cancel_cqes: &'a mut HashMap<CancelCompletionId, PendingCancel>,
         waker_buf_len: usize,
         waker_armed: &'a mut bool,
-        is_waked: &'a AtomicBool,
+        notification_state: &'a AtomicU8,
         provided_buffers: Option<&'a mut ProvidedBufGroup>,
         synthetic: UringSyntheticCompletion,
     ) -> Self {
@@ -116,7 +120,7 @@ impl<'a> UringCompletionHooks<'a> {
             pending_cancel_cqes,
             waker_buf_len,
             waker_armed,
-            is_waked,
+            notification_state,
             provided_buffers,
             synthetic,
             post: UringPostCompletionEffects::default(),
@@ -327,7 +331,14 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
             UringBackendEffect::None => Ok(()),
             UringBackendEffect::Waker { should_rebuild } => {
                 *self.waker_armed = false;
-                self.is_waked.store(false, Ordering::Release);
+                self.notification_state
+                    .compare_exchange(
+                        WAKER_PROCESSING,
+                        WAKER_REARM,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .ok();
                 self.post.rebuild_waker |= should_rebuild;
                 self.post.resubmit_waker = true;
                 self.post.flush_backlog = true;
@@ -350,19 +361,40 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
 }
 
 impl<'a> UringDriver<'a> {
-    pub(crate) fn wait_internal(&mut self) -> UringResult<()> {
+    pub(crate) fn wait_internal(&mut self, external_timeout: Option<Duration>) -> UringResult<()> {
         let _ = self.drain_cancel_requests()?;
         self.flush_cancellations()?;
         self.flush_backlog()?;
+        self.submit_waker()?;
+        self.submit_to_kernel()?;
 
-        if !self.has_active_ops_internal() {
+        // Waiting has a non-blocking preflight. It only decides whether the CQ already contains
+        // an event; all events are processed once below so a waker completion cannot cause this
+        // call to enter a second wait before the runtime gets control back.
+        let cq_ready = {
+            let mut completion = self.ring.completion();
+            completion.sync();
+            !completion.is_empty()
+        };
+        self.advance_timer_clock()?;
+        self.flush_cancellations()?;
+        self.flush_backlog()?;
+
+        let effective_timeout = match (external_timeout, self.timers.next_timeout()) {
+            (Some(external), Some(internal)) => Some(external.min(internal)),
+            (Some(external), None) => Some(external),
+            (None, Some(internal)) => Some(internal),
+            (None, None) => None,
+        };
+
+        if self.ops.shared.has_ready_completion()
+            || matches!(effective_timeout, Some(timeout) if timeout.is_zero())
+        {
             return Ok(());
         }
 
-        if self.ring.completion().is_empty() {
-            let next_timeout = self.timers.next_timeout();
-
-            if let Some(duration) = next_timeout {
+        if !cq_ready && self.ring.completion().is_empty() {
+            if let Some(duration) = effective_timeout {
                 let ts = io_uring::types::Timespec::new()
                     .sec(duration.as_secs())
                     .nsec(duration.subsec_nanos());
@@ -440,7 +472,11 @@ impl<'a> UringDriver<'a> {
 
             trace!("Processing completions, count={}", cqe_kicker.len());
             for cqe in cqe_kicker {
-                cqes.push((cqe.user_data(), cqe.result(), cqe.flags()));
+                let raw_token = cqe.user_data();
+                if raw_token == CompletionToken::waker(0).raw() {
+                    self.waker.begin_processing();
+                }
+                cqes.push((raw_token, cqe.result(), cqe.flags()));
             }
         }
 
@@ -502,7 +538,7 @@ impl<'a> UringDriver<'a> {
             self.cancellations.in_flight_mut(),
             waker_view.buf_len,
             waker_view.armed,
-            waker_view.is_waked,
+            waker_view.notification_state,
             self.buffer_registry.provided_buffers_mut(),
             synthetic,
         );
@@ -845,14 +881,14 @@ mod tests {
         diagnostics: &'a DriverCompletionDiagnostics<UringCompletionDiagnostics>,
         pending_cancel_cqes: &'a mut HashMap<CancelCompletionId, PendingCancel>,
         waker_armed: &'a mut bool,
-        is_waked: &'a AtomicBool,
+        notification_state: &'a AtomicU8,
     ) -> UringCompletionHooks<'a> {
         UringCompletionHooks::new(
             diagnostics,
             pending_cancel_cqes,
             8,
             waker_armed,
-            is_waked,
+            notification_state,
             None,
             UringSyntheticCompletion::None,
         )
@@ -863,12 +899,12 @@ mod tests {
         let diagnostics = DriverCompletionDiagnostics::<UringCompletionDiagnostics>::default();
         let mut pending_cancel_cqes = HashMap::default();
         let mut waker_armed = true;
-        let is_waked = AtomicBool::new(true);
+        let notification_state = AtomicU8::new(WAKER_NOTIFIED);
         let mut hooks = test_hooks(
             &diagnostics,
             &mut pending_cancel_cqes,
             &mut waker_armed,
-            &is_waked,
+            &notification_state,
         );
         let raw = RawCompletion::new(COMP_BACKEND_URING, CompletionToken::waker(0), 4, 0);
 
@@ -888,12 +924,12 @@ mod tests {
         let diagnostics = DriverCompletionDiagnostics::<UringCompletionDiagnostics>::default();
         let mut pending_cancel_cqes = HashMap::default();
         let mut waker_armed = true;
-        let is_waked = AtomicBool::new(true);
+        let notification_state = AtomicU8::new(WAKER_NOTIFIED);
         let mut hooks = test_hooks(
             &diagnostics,
             &mut pending_cancel_cqes,
             &mut waker_armed,
-            &is_waked,
+            &notification_state,
         );
         let cancel_id = CancelCompletionId::new(7);
         let raw = RawCompletion::new(COMP_BACKEND_URING, CompletionToken::cancel(cancel_id), 0, 0);

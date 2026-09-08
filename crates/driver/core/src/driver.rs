@@ -258,10 +258,17 @@ pub trait DriverRaw: sealed::Sealed {
     /// [`Self::try_recv_remote_cancel_request`] 取走。
     fn remote_cancel_sender_raw(&self) -> RemoteCancelSender;
 
-    /// 推进后端一次，并返回是否仍有需要处理的进展以及下次超时提示。
+    /// 推进后端一次，并返回当前可消费状态以及下次超时提示。
     ///
-    /// `Poll` 不得阻塞；`Wait` 可以等待内核或计时器。实现必须在返回前处理本 driver
-    /// 能观察到的完成和远端取消请求，但不得为了报告空闲而回收仍在途的 slot。
+    /// `Poll` 必须只做一次非阻塞推进。`Wait` 必须先复查取消、控制事件和 ready
+    /// completion；没有可立即消费的状态后，应等待用户 I/O completion、后端 waker、
+    /// 内部 timer 或取消/清理事件。没有 active 用户 operation 不是立即返回的理由，
+    /// 因为后端 waker 本身就是等待源。`Wait` 的外部 timeout 是本次调用允许的最长等待
+    /// 时间，驱动内部 timer 更早时必须取两者的最小值；超时返回属于正常结果。
+    ///
+    /// 返回前必须重新计算 [`DriveOutcome`] 的三个字段：`ready_completion` 只能表示
+    /// 完成表中已有可由 future 消费的记录，`in_flight` 只表示当前仍在途的用户操作，
+    /// 两者都不能由 deferred cleanup 或“将来可能完成”推导出来。
     fn drive_raw(
         &mut self,
         mode: DriveMode,
@@ -644,14 +651,25 @@ pub enum DriverCapability {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriveMode {
+    /// 执行一次非阻塞的后端推进。
     Poll,
-    Wait,
+    /// 等待一个后端事件、内部 timer 或远端唤醒。
+    ///
+    /// `Some` 是本次调用允许的最长等待时间；`None` 表示由后端内部 timer
+    /// 或事件源决定等待上限。
+    Wait { timeout: Option<Duration> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DriveOutcome {
+    /// 从本次调用返回时刻起，到驱动内部下一个 timer 到期的相对时长。
     pub next_timeout_hint: Option<Duration>,
-    pub pending_progress: bool,
+    /// 完成表中是否存在可以被 future 立即消费的 completion。
+    pub ready_completion: bool,
+    /// 当前是否仍有用户 I/O operation 处于 in-flight 状态。
+    ///
+    /// 该字段只用于观测和测试，不决定 idle 是否可以 Continue。
+    pub in_flight: bool,
 }
 
 pub trait RemoteWaker<E>: Send + Sync

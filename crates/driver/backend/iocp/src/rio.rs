@@ -13,7 +13,10 @@ mod error;
 mod lifecycle;
 pub(crate) mod runtime;
 
-use crate::{BufferRegistrationMode, config::SocketKey, driver::IocpDriverCompletionDiagnostics};
+use crate::{
+    BufferRegistrationMode, config::SocketKey, driver::IocpDriverCompletionDiagnostics,
+    op::IocpUserPayload,
+};
 use rustc_hash::FxHashMap;
 use slotmap::{SlotMap, new_key_type};
 use veloq_std::vec::Vec;
@@ -94,7 +97,7 @@ pub(crate) struct RioState {
     pub(crate) socket_runtime: FxHashMap<SocketKey, SocketRuntimeState>,
     pub(crate) outstanding_count: usize,
     pub(crate) next_request_id: u64,
-    pub(crate) deferred_payloads: Vec<crate::op::IocpUserPayload>,
+    pub(crate) deferred_payloads: Vec<IocpUserPayload>,
     pub(crate) diagnostics: IocpDriverCompletionDiagnostics,
     pub(crate) cq_armed: bool,
 }

@@ -9,6 +9,7 @@ use crate::{
     fmt::{Display, Formatter, Result as FmtResult},
     marker::PhantomData,
     mem::zeroed,
+    panic::catch_unwind_safe,
     ptr::{null, null_mut},
     string::String,
     sync::{
@@ -16,7 +17,7 @@ use crate::{
         atomic::{AtomicU8, Ordering},
     },
     thread::{
-        AbortedError, ThreadErrorKind, ThreadId,
+        AbortedError, Thread, ThreadErrorKind, ThreadId, current,
         traits::{RawJoinHandleTrait, RawThreadErrorTrait, SystermImpl},
     },
     time::Duration,
@@ -32,7 +33,7 @@ pub struct RawJoinHandle<'a, T> {
     thread_id: Option<pthread_t>,
     result: Option<ThreadResultReceiver<'a, T>>,
     _marker: PhantomData<&'a ()>,
-    pub(crate) thread: crate::thread::Thread,
+    pub(crate) thread: Thread,
 }
 
 unsafe impl<T: Send> Send for RawJoinHandle<'_, T> {}
@@ -137,7 +138,7 @@ where
     };
 
     if let Some(f) = unsafe { state.closure.with_mut(|x| x.take()) } {
-        let res = crate::panic::catch_unwind_safe(f);
+        let res = catch_unwind_safe(f);
         match res {
             Ok(r) => {
                 unsafe {
@@ -172,7 +173,7 @@ where
     F: FnOnce() -> T + Send + 'a,
     T: Send + 'a,
 {
-    let thread = crate::thread::Thread::new(name.clone());
+    let thread = Thread::new(name.clone());
 
     let state = Arc::new(ThreadSharedState {
         closure: UnsafeCell::new(Some(f)),
@@ -366,7 +367,7 @@ impl SystermImpl for Systerm {
     }
 
     fn current_id() -> ThreadId {
-        crate::thread::current().id()
+        current().id()
     }
 
     fn available_parallelism() -> Result<NonZeroUsize, Self::Error> {

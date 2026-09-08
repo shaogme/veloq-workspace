@@ -1,6 +1,8 @@
 use diagweave::set;
 use veloq_std::string::String;
 
+use crate::heap::ChunkId;
+
 set! {
     pub SystemError = {
         #[display("OS error {0}")]
@@ -30,7 +32,7 @@ set! {
         PageUnaligned { size: usize },
 
         #[display("Chunk {chunk_id} missing")]
-        ChunkMissing { chunk_id: crate::heap::ChunkId },
+        ChunkMissing { chunk_id: ChunkId },
 
         #[display("FixedBuf has invalid ChunkID")]
         InvalidChunkId,

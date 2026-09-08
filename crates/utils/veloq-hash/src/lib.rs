@@ -3,6 +3,8 @@
 
 use core::hash::{BuildHasher, Hasher};
 
+use crate::sys::get_system_time_seed;
+
 pub mod sys;
 
 /// 高性能无密码学安全但防碰撞攻击的哈希器
@@ -160,7 +162,7 @@ impl VeloqBuildHasher {
     #[inline]
     pub fn new() -> Self {
         Self {
-            seed: crate::sys::get_system_time_seed(),
+            seed: get_system_time_seed(),
         }
     }
 

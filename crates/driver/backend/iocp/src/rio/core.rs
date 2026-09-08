@@ -13,14 +13,14 @@ pub(crate) use request::{
 pub(crate) use submit_ops::{RioBufferId, RioCq, RioDispatch, RioKernel, RioProvider, RioRq};
 
 use crate::{
-    error::{IocpError, iocp_report_to_event_res},
+    error::{IocpError, IocpResult, iocp_report_to_event_res},
     rio::{RioState, error::RioError},
 };
 use diagweave::prelude::*;
 use windows_sys::Win32::Networking::WinSock::WSAGetLastError;
 
 #[inline]
-pub(crate) fn rio_result_to_event_res(res: &crate::error::IocpResult<usize>) -> i32 {
+pub(crate) fn rio_result_to_event_res(res: &IocpResult<usize>) -> i32 {
     match res {
         Ok(v) => (*v).min(i32::MAX as usize) as i32,
         Err(e) => iocp_report_to_event_res(e),

@@ -577,6 +577,7 @@ mod tests {
     use crate::{
         BufferRegistrationMode,
         config::{BorrowedRawHandle, IoFd, IocpHandle, RawHandle},
+        driver::IocpDriverCompletionDiagnostics,
         net::addr::SockAddrStorage,
         rio::core::RioOpKind,
     };
@@ -600,7 +601,7 @@ mod tests {
             outstanding_count: 0,
             next_request_id: 0,
             deferred_payloads: Vec::new(),
-            diagnostics: crate::driver::IocpDriverCompletionDiagnostics::default(),
+            diagnostics: IocpDriverCompletionDiagnostics::default(),
             cq_armed: true,
         }
     }

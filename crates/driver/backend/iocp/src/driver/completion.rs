@@ -110,12 +110,11 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
     ) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         Ok(match control {
             CompletionControl::Waker { raw, .. } => {
+                self.completion.clear_notification()?;
                 if raw.res >= 0 {
                     self.diagnostics.backend().inc_waker_ok();
-                    self.completion.clear_notification();
                 } else {
                     self.diagnostics.backend().inc_waker_error();
-                    self.completion.clear_notification();
                     return Err(IocpError::Internal
                         .to_report()
                         .push_ctx("scope", "iocp.driver.completion.waker")

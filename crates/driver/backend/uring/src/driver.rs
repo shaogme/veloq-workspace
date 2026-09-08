@@ -162,7 +162,7 @@ impl<'a> UringDriver<'a> {
         Self::new_internal(config, registrar).attach_note("create uring driver")
     }
 
-    fn has_active_ops_internal(&mut self) -> bool {
+    fn has_active_ops_internal(&self) -> bool {
         self.ops.has_active_ops()
     }
 
@@ -290,26 +290,17 @@ impl<'a> DriverRaw for UringDriver<'a> {
                     .push_ctx("scope", "uring.driver.drive.poll")
                     .attach_note("poll completions")?;
             }
-            DriveMode::Wait => {
-                let pending_progress =
-                    self.has_active_ops_internal() || self.ops.shared.has_ready_completion();
-                if !pending_progress {
-                    return Ok(DriveOutcome {
-                        next_timeout_hint: self.timers.next_timeout(),
-                        pending_progress,
-                    });
-                }
-                self.wait_internal()
+            DriveMode::Wait { timeout } => {
+                self.wait_internal(timeout)
                     .push_ctx("scope", "uring.driver.drive.wait")
                     .attach_note("wait for completions")?;
             }
         }
 
-        let pending_progress =
-            self.has_active_ops_internal() || self.ops.shared.has_ready_completion();
         Ok(DriveOutcome {
             next_timeout_hint: self.timers.next_timeout(),
-            pending_progress,
+            ready_completion: self.ops.shared.has_ready_completion(),
+            in_flight: self.has_active_ops_internal(),
         })
     }
 

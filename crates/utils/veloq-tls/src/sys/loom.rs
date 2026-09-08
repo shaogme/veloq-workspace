@@ -1,4 +1,4 @@
-use crate::{SystermKey, TlsErrorKind};
+use crate::{SystermKey, TlsErrorKind, is_sentinel};
 use alloc::{boxed::Box, vec::Vec};
 use core::{
     cell::RefCell,
@@ -38,7 +38,7 @@ static THREAD_VALUES: loom::thread::LocalKey<RefCell<Vec<Option<ThreadValue>>>> 
 
 unsafe fn tls_destructor_shim<T>(ptr: *mut ()) {
     // 过滤哨兵指针以防堆损坏
-    if !ptr.is_null() && !crate::is_sentinel(ptr) {
+    if !ptr.is_null() && !is_sentinel(ptr) {
         unsafe {
             let _ = Box::from_raw(ptr as *mut T);
         }

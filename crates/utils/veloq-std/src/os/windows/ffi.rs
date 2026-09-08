@@ -1,6 +1,9 @@
 //! Windows-specific extensions to primitives in the [`ffi`](crate::ffi) module.
 
-use crate::ffi::{OsStr, OsString, os_str::wtf8::Wtf8Buf};
+use crate::ffi::{
+    OsStr, OsString,
+    os_str::{Buf, wtf8::Wtf8Buf},
+};
 
 pub use crate::ffi::os_str::wtf8::EncodeWide;
 
@@ -15,7 +18,7 @@ impl OsStringExt for OsString {
     #[inline]
     fn from_wide(wide: &[u16]) -> OsString {
         OsString {
-            inner: crate::ffi::os_str::Buf {
+            inner: Buf {
                 inner: Wtf8Buf::from_wide(wide),
             },
         }

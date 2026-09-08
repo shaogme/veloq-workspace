@@ -10,7 +10,7 @@ use veloq_std::{
 use bilge::prelude::*;
 
 use super::{error::BufResult, handle::FixedBuf};
-use crate::heap::{ChunkId, PageAlignedBytes};
+use crate::heap::{ChunkId, ChunkInfo, PageAlignedBytes};
 
 #[bitsize(1)]
 #[derive(FromBits, Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,7 +108,7 @@ impl BufferRegion {
         Self { id, ptr, len }
     }
 
-    pub fn from_chunk_info(info: crate::heap::ChunkInfo) -> Option<Self> {
+    pub fn from_chunk_info(info: ChunkInfo) -> Option<Self> {
         PageAlignedBytes::new(info.len).map(|len| Self {
             id: info.id,
             ptr: info.ptr,
@@ -153,7 +153,7 @@ pub trait BufferRegistrar {
 
     /// Resolve chunk info for a given chunk_id.
     /// Used for lazy registration.
-    fn resolve_chunk_info(&self, chunk_id: ChunkId) -> Option<crate::heap::ChunkInfo>;
+    fn resolve_chunk_info(&self, chunk_id: ChunkId) -> Option<ChunkInfo>;
 }
 
 /// A no-op registrar that does nothing.
@@ -164,7 +164,7 @@ impl BufferRegistrar for NoopRegistrar {
         Ok(Vec::new())
     }
 
-    fn resolve_chunk_info(&self, _chunk_id: ChunkId) -> Option<crate::heap::ChunkInfo> {
+    fn resolve_chunk_info(&self, _chunk_id: ChunkId) -> Option<ChunkInfo> {
         None
     }
 }

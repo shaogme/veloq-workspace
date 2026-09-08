@@ -87,7 +87,7 @@ pub use loom_impl::*;
 mod tests {
     use crate::sync::Arc;
     use crate::sync::rwlock::RwLock;
-    use crate::thread;
+    use crate::{thread, time::Instant, vec::Vec};
     use core::time::Duration;
 
     #[test]
@@ -110,7 +110,7 @@ mod tests {
     fn test_rwlock_threads() {
         let lock = Arc::new(RwLock::new(0));
         let num_threads = 4;
-        let mut handles = crate::vec::Vec::new();
+        let mut handles = Vec::new();
 
         for _ in 0..num_threads {
             let l = lock.clone();
@@ -138,7 +138,7 @@ mod tests {
         let guard = lock.write();
 
         let handle = thread::spawn(move || {
-            let start = crate::time::Instant::now();
+            let start = Instant::now();
             let res = l.try_read_for(Duration::from_millis(10));
             assert!(res.is_none());
             assert!(start.elapsed() >= Duration::from_millis(10));

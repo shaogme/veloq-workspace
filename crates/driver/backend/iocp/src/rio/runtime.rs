@@ -11,6 +11,9 @@ use crate::{
         error::{RioError, RioResult},
     },
 };
+
+#[cfg(test)]
+use crate::driver::IocpDriverCompletionDiagnostics;
 use diagweave::prelude::*;
 use rustc_hash::FxHashMap;
 use veloq_buf::{BufferRegistrar, FixedBuf};
@@ -317,7 +320,7 @@ mod tests {
             outstanding_count: 0,
             next_request_id: 0,
             deferred_payloads: Vec::new(),
-            diagnostics: crate::driver::IocpDriverCompletionDiagnostics::default(),
+            diagnostics: IocpDriverCompletionDiagnostics::default(),
             cq_armed: true,
         }
     }

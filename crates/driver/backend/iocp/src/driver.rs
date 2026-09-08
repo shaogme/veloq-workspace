@@ -107,7 +107,7 @@ impl<'a> IocpDriver<'a> {
         )
     }
 
-    pub(crate) fn has_active_ops_internal(&mut self) -> bool {
+    pub(crate) fn has_active_ops_internal(&self) -> bool {
         self.ops.has_active_ops()
     }
 
@@ -252,21 +252,17 @@ impl<'a> DriverRaw for IocpDriver<'a> {
 
         match mode {
             DriveMode::Poll => {
-                self.get_completion(0)
+                self.get_completion(Some(Duration::ZERO))
                     .push_ctx("scope", "iocp/driver.drive.poll")
                     .attach_note("drive(Poll) failed")?;
             }
-            DriveMode::Wait => {
-                let pending_progress = self.has_active_ops_internal()
-                    || self.ops.shared.has_ready_completion()
-                    || self.handles.deferred_cleanup_len() > 0;
-                if !pending_progress {
-                    return Ok(DriveOutcome {
-                        next_timeout_hint: self.timer.next_timeout(),
-                        pending_progress,
-                    });
-                }
-                self.get_completion(u32::MAX)
+            DriveMode::Wait { timeout } => {
+                let wait_timeout = if self.ops.shared.has_ready_completion() {
+                    Some(Duration::ZERO)
+                } else {
+                    timeout
+                };
+                self.get_completion(wait_timeout)
                     .push_ctx("scope", "iocp/driver.drive.wait")
                     .attach_note("wait for completion failed")?;
             }
@@ -274,12 +270,10 @@ impl<'a> DriverRaw for IocpDriver<'a> {
 
         self.drain_deferred_socket_cleanup();
 
-        let pending_progress = self.has_active_ops_internal()
-            || self.ops.shared.has_ready_completion()
-            || self.handles.deferred_cleanup_len() > 0;
         Ok(DriveOutcome {
             next_timeout_hint: self.timer.next_timeout(),
-            pending_progress,
+            ready_completion: self.ops.shared.has_ready_completion(),
+            in_flight: self.has_active_ops_internal(),
         })
     }
 

@@ -1,12 +1,15 @@
 use super::{SafeUnsafeCell, ThreadResultReceiver, ThreadSharedState, ThreadSharedStateTrait};
 use crate::{
+    boxed::Box,
+    cell::UnsafeCell,
     error::Error,
     fmt::{Display, Formatter, Result as FmtResult},
     marker::PhantomData,
+    panic::catch_unwind_safe,
     string::String,
     sync::{Arc, atomic::Ordering},
     thread::{
-        AbortedError, ThreadErrorKind, ThreadId,
+        AbortedError, Thread, ThreadErrorKind, ThreadId, current,
         traits::{RawJoinHandleTrait, RawThreadErrorTrait, SystermImpl},
     },
     time::Duration,
@@ -18,7 +21,7 @@ pub struct RawJoinHandle<'a, T> {
     inner: Option<loom::thread::JoinHandle<()>>,
     result: Option<ThreadResultReceiver<'a, T>>,
     _marker: PhantomData<&'a ()>,
-    pub(crate) thread: crate::thread::Thread,
+    pub(crate) thread: Thread,
 }
 
 unsafe impl<T: Send> Send for RawJoinHandle<'_, T> {}
@@ -138,12 +141,12 @@ impl SystermImpl for Systerm {
         F: FnOnce() -> T + Send + 'a,
         T: Send + 'a,
     {
-        type BoxF<'a, T> = crate::boxed::Box<dyn FnOnce() -> T + Send + 'a>;
+        type BoxF<'a, T> = Box<dyn FnOnce() -> T + Send + 'a>;
 
-        let thread = crate::thread::Thread::new(name.clone());
+        let thread = Thread::new(name.clone());
 
         let state = Arc::new(ThreadSharedState {
-            closure: crate::cell::UnsafeCell::new(Some(crate::boxed::Box::new(f) as BoxF<'a, T>)),
+            closure: UnsafeCell::new(Some(Box::new(f) as BoxF<'a, T>)),
             status: loom::sync::atomic::AtomicU8::new(super::STATE_INCOMPLETE),
             result: SafeUnsafeCell::new(None),
             #[cfg(feature = "std")]
@@ -192,7 +195,7 @@ impl SystermImpl for Systerm {
                 };
 
                 if let Some(f) = unsafe { self.closure.with_mut(|x| x.take()) } {
-                    let res = crate::panic::catch_unwind_safe(f);
+                    let res = catch_unwind_safe(f);
                     match res {
                         Ok(r) => {
                             unsafe {
@@ -279,7 +282,7 @@ impl SystermImpl for Systerm {
     }
 
     fn current_id() -> ThreadId {
-        crate::thread::current().id()
+        current().id()
     }
 
     fn available_parallelism() -> Result<NonZeroUsize, Self::Error> {

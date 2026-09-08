@@ -1,7 +1,7 @@
 use super::*;
 
 use crate::{
-    DriverCoreError,
+    DriverCoreError, DriverError,
     driver::{
         AnomalyAttach, AnomalyOutcome, CompletionAnomalyKind, CompletionAnomalyReason,
         CompletionBackend, CompletionBackendHooks, CompletionCleanup, CompletionCleanupGuard,
@@ -37,7 +37,7 @@ impl fmt::Display for DummyError {
 
 impl Error for DummyError {}
 
-impl crate::DriverError for DummyError {
+impl DriverError for DummyError {
     #[inline]
     fn from_core_report(report: Report<DriverCoreError>) -> Report<Self> {
         report.map_err(|_| DummyError)

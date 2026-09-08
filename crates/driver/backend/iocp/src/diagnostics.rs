@@ -3,6 +3,9 @@ use veloq_std::sync::atomic::{AtomicU64, Ordering};
 use crate::rio::runtime::control_flow::{
     RIO_ANOMALY_MALFORMED, RIO_ANOMALY_MISSING, RIO_ANOMALY_STALE,
 };
+
+#[cfg(test)]
+use crate::driver::RIO_EVENT_TOKEN;
 use veloq_driver_core::driver::{
     CompletionAnomaly, CompletionAnomalyReason, DriverCompletionDiagnosticsBackend,
 };
@@ -179,7 +182,7 @@ mod tests {
     fn rio_backend_anomaly_keeps_core_counting_enabled() {
         let diagnostics = IocpCompletionDiagnostics::default();
         let kind = rio_malformed_context_kind(0xa700_0001);
-        let attach = AnomalyAttach::token_only(crate::driver::RIO_EVENT_TOKEN);
+        let attach = AnomalyAttach::token_only(RIO_EVENT_TOKEN);
 
         assert!(!diagnostics.record_backend_anomaly(&kind.materialize(attach)));
         assert_eq!(diagnostics.snapshot().rio.malformed_context, 1);

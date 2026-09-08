@@ -8,6 +8,7 @@ use crate::{
     ffi::c_void,
     fmt::{Display, Formatter, Result as FmtResult},
     marker::PhantomData,
+    panic::catch_unwind_safe,
     ptr::{null, null_mut},
     string::String,
     sync::{
@@ -15,10 +16,11 @@ use crate::{
         atomic::{AtomicU8, Ordering},
     },
     thread::{
-        AbortedError, ThreadErrorKind, ThreadId,
+        AbortedError, Thread, ThreadErrorKind, ThreadId, current,
         traits::{RawJoinHandleTrait, RawThreadErrorTrait, SystermImpl},
     },
     time::Duration,
+    vec::Vec,
 };
 use windows_sys::Win32::{
     Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_OBJECT_0},
@@ -35,7 +37,7 @@ pub struct RawJoinHandle<'a, T> {
     handle: Option<HANDLE>,
     result: Option<ThreadResultReceiver<'a, T>>,
     _marker: PhantomData<&'a ()>,
-    pub(crate) thread: crate::thread::Thread,
+    pub(crate) thread: Thread,
 }
 
 unsafe impl<T: Send> Send for RawJoinHandle<'_, T> {}
@@ -113,7 +115,7 @@ where
     });
 
     if let Some(ref name) = state.name {
-        let mut name_u16: crate::vec::Vec<u16> = name.encode_utf16().collect();
+        let mut name_u16: Vec<u16> = name.encode_utf16().collect();
         name_u16.push(0);
         unsafe {
             let current_thread = GetCurrentThread();
@@ -137,7 +139,7 @@ where
     };
 
     if let Some(f) = unsafe { state.closure.with_mut(|x| x.take()) } {
-        let res = crate::panic::catch_unwind_safe(f);
+        let res = catch_unwind_safe(f);
         match res {
             Ok(r) => {
                 unsafe {
@@ -172,7 +174,7 @@ where
     F: FnOnce() -> T + Send + 'a,
     T: Send + 'a,
 {
-    let thread = crate::thread::Thread::new(name.clone());
+    let thread = Thread::new(name.clone());
 
     let state = Arc::new(ThreadSharedState {
         closure: UnsafeCell::new(Some(f)),
@@ -347,7 +349,7 @@ impl SystermImpl for Systerm {
     }
 
     fn current_id() -> ThreadId {
-        crate::thread::current().id()
+        current().id()
     }
 
     fn available_parallelism() -> Result<NonZeroUsize, Self::Error> {

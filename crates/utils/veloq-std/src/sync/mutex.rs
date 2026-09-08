@@ -66,7 +66,7 @@ pub use loom_impl::*;
 mod tests {
     use crate::sync::Arc;
     use crate::sync::mutex::Mutex;
-    use crate::thread;
+    use crate::{thread, time::Instant, vec::Vec};
     use core::time::Duration;
 
     #[test]
@@ -84,7 +84,7 @@ mod tests {
     fn test_mutex_threads() {
         let mutex = Arc::new(Mutex::new(0));
         let num_threads = 4;
-        let mut handles = crate::vec::Vec::new();
+        let mut handles = Vec::new();
 
         for _ in 0..num_threads {
             let m = mutex.clone();
@@ -112,7 +112,7 @@ mod tests {
         let guard = mutex.lock();
 
         let handle = thread::spawn(move || {
-            let start = crate::time::Instant::now();
+            let start = Instant::now();
             let res = m.try_lock_for(Duration::from_millis(10));
             assert!(res.is_none()); // Should fail to acquire because guard is held
             assert!(start.elapsed() >= Duration::from_millis(10));

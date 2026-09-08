@@ -10,9 +10,15 @@ use veloq_std::{
     string::ToString,
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU8, Ordering},
     },
 };
+
+pub(crate) const WAKER_IDLE: u8 = 0;
+pub(crate) const WAKER_NOTIFIED: u8 = 1;
+pub(crate) const WAKER_PROCESSING: u8 = 2;
+pub(crate) const WAKER_REARM: u8 = 3;
+pub(crate) const WAKER_RENOTIFIED: u8 = 4;
 
 pub(crate) struct EventFd {
     pub(crate) fd: OwnedRawHandle,
@@ -46,29 +52,77 @@ impl WakerFdState {
 
 pub(crate) struct UringWaker {
     pub(crate) state: Arc<WakerFdState>,
-    pub(crate) is_waked: Arc<AtomicBool>,
+    pub(crate) notification_state: Arc<AtomicU8>,
 }
 
 impl RemoteWaker<UringError> for UringWaker {
     fn wake(&self) -> UringResult<()> {
-        if self.is_waked.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        if !self.is_waked.swap(true, Ordering::AcqRel) {
-            let buf = 1u64.to_ne_bytes();
-            let fd = self.state.current();
-            let ret = unsafe { libc::write(fd.fd.raw().as_fd(), buf.as_ptr() as *const _, 8) };
-            if ret < 0 {
-                let err = io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::EAGAIN) {
+        loop {
+            let state = self.notification_state.load(Ordering::Acquire);
+            match state {
+                WAKER_RENOTIFIED => return Ok(()),
+                WAKER_NOTIFIED => {
+                    if self
+                        .notification_state
+                        .compare_exchange(
+                            WAKER_NOTIFIED,
+                            WAKER_RENOTIFIED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    self.notify_event_fd()?;
                     return Ok(());
                 }
-                return Err(UringError::Internal
-                    .to_report()
-                    .push_ctx("scope", "uring.driver.waker.wake")
-                    .set_error_code(err.raw_os_error().unwrap_or(libc::EIO))
-                    .attach_note(err.to_string()));
+                WAKER_IDLE | WAKER_PROCESSING | WAKER_REARM => {
+                    if self
+                        .notification_state
+                        .compare_exchange(
+                            state,
+                            WAKER_NOTIFIED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+
+                    self.notify_event_fd()?;
+                    return Ok(());
+                }
+                _ => unreachable!("invalid io_uring waker state"),
             }
+        }
+    }
+}
+
+impl UringWaker {
+    fn notify_event_fd(&self) -> UringResult<()> {
+        let buf = 1u64.to_ne_bytes();
+        let fd = self.state.current();
+        let ret = unsafe { libc::write(fd.fd.raw().as_fd(), buf.as_ptr() as *const _, 8) };
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EAGAIN) {
+                return Ok(());
+            }
+            self.notification_state
+                .compare_exchange(
+                    WAKER_NOTIFIED,
+                    WAKER_IDLE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .ok();
+            return Err(UringError::Internal
+                .to_report()
+                .push_ctx("scope", "uring.driver.waker.wake")
+                .set_error_code(err.raw_os_error().unwrap_or(libc::EIO))
+                .attach_note(err.to_string()));
         }
         Ok(())
     }
@@ -77,7 +131,7 @@ impl RemoteWaker<UringError> for UringWaker {
 pub(crate) struct WakerHooksView<'a> {
     pub(crate) buf_len: usize,
     pub(crate) armed: &'a mut bool,
-    pub(crate) is_waked: &'a AtomicBool,
+    pub(crate) notification_state: &'a AtomicU8,
 }
 
 pub(crate) struct UringWakerManager {
@@ -85,7 +139,7 @@ pub(crate) struct UringWakerManager {
     registered_fd: Option<IoFd>,
     armed: bool,
     buf: Box<[u8; 8]>,
-    is_waked: Arc<AtomicBool>,
+    notification_state: Arc<AtomicU8>,
 }
 
 impl UringWakerManager {
@@ -96,7 +150,7 @@ impl UringWakerManager {
             registered_fd: None,
             armed: false,
             buf: Box::new([0; 8]),
-            is_waked: Arc::new(AtomicBool::new(false)),
+            notification_state: Arc::new(AtomicU8::new(WAKER_IDLE)),
         })
     }
 
@@ -117,7 +171,7 @@ impl UringWakerManager {
     pub(crate) fn create_waker(&self) -> Arc<dyn RemoteWaker<UringError>> {
         Arc::new(UringWaker {
             state: self.state.clone(),
-            is_waked: self.is_waked.clone(),
+            notification_state: self.notification_state.clone(),
         })
     }
 
@@ -136,8 +190,18 @@ impl UringWakerManager {
         WakerHooksView {
             buf_len: self.buf.len(),
             armed: &mut self.armed,
-            is_waked: &self.is_waked,
+            notification_state: &self.notification_state,
         }
+    }
+
+    pub(crate) fn begin_processing(&self) {
+        begin_processing(&self.notification_state);
+    }
+
+    pub(crate) fn finish_rearm(&self) {
+        self.notification_state
+            .compare_exchange(WAKER_REARM, WAKER_IDLE, Ordering::AcqRel, Ordering::Acquire)
+            .ok();
     }
 
     #[inline]
@@ -167,5 +231,28 @@ impl UringWakerManager {
 
     pub(crate) fn replace_state_fd(&mut self, new_fd: Arc<EventFd>) -> Arc<EventFd> {
         self.state.replace(new_fd)
+    }
+}
+
+fn begin_processing(state: &AtomicU8) {
+    loop {
+        let current = state.load(Ordering::Acquire);
+        match current {
+            WAKER_IDLE | WAKER_NOTIFIED | WAKER_RENOTIFIED => {
+                if state
+                    .compare_exchange(
+                        current,
+                        WAKER_PROCESSING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    return;
+                }
+            }
+            WAKER_PROCESSING | WAKER_REARM => return,
+            _ => unreachable!("invalid io_uring waker state"),
+        }
     }
 }

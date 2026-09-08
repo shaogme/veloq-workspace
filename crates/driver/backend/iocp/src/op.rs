@@ -32,6 +32,7 @@ use crate::{
     ext::Extensions,
     net::addr::SockAddrStorage,
     rio::RioState,
+    win32::{IoCompletionPort, Overlapped},
 };
 
 use veloq_driver_core::{
@@ -94,8 +95,8 @@ pub(crate) type RecvMulti = RecvMultiBase<IocpHandle>;
 
 /// Context for submitting IOCP operations.
 pub(crate) struct SubmitContext<'a> {
-    pub(crate) port: Arc<crate::win32::IoCompletionPort>,
-    pub(crate) overlapped: *mut crate::win32::Overlapped,
+    pub(crate) port: Arc<IoCompletionPort>,
+    pub(crate) overlapped: *mut Overlapped,
     pub(crate) op_token: OpToken,
     pub(crate) completion_token: CompletionToken,
     pub(crate) ext: &'a Extensions,

@@ -5,6 +5,7 @@ use crate::{
     config::{BorrowedRawHandle, SocketKey},
     driver::{IocpDriverCompletionDiagnostics, RIO_EVENT_TOKEN, completion::COMP_BACKEND_RIO},
     error::{IocpError, IocpResult},
+    ext::Extensions,
     op::{IocpOpPayload, IocpOpRegistry, IocpSlotSpec, Slot},
     rio::{
         RioEnv, RioState, SocketInflightToken, SocketLifecycleState, SocketRuntimeState,
@@ -112,7 +113,7 @@ struct RioCompletionHooks<'a> {
     socket_runtime: &'a mut FxHashMap<SocketKey, SocketRuntimeState>,
     registry: &'a mut RioRegistry,
     env: RioEnv<'a>,
-    ext: &'a crate::ext::Extensions,
+    ext: &'a Extensions,
     completed_count: usize,
 }
 
@@ -122,7 +123,7 @@ impl<'a> RioCompletionHooks<'a> {
         socket_runtime: &'a mut FxHashMap<SocketKey, SocketRuntimeState>,
         registry: &'a mut RioRegistry,
         env: RioEnv<'a>,
-        ext: &'a crate::ext::Extensions,
+        ext: &'a Extensions,
     ) -> Self {
         Self {
             outstanding_count,
@@ -243,7 +244,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
 
 fn complete_rio_waiting_slot(
     registry: &mut RioRegistry,
-    ext: &crate::ext::Extensions,
+    ext: &Extensions,
     mut slot: Slot<'_, InFlightWaiting>,
     ingress: &RioIngress,
 ) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, RioBackendEffect>> {
@@ -532,7 +533,7 @@ impl RioState {
     pub(crate) fn process_completions(
         &mut self,
         ops: &mut IocpOpRegistry,
-        ext: &crate::ext::Extensions,
+        ext: &Extensions,
         registrar: &dyn BufferRegistrar,
         completion_table: &SharedCompletionTable<IocpSlotSpec>,
         diagnostics: &mut IocpDriverCompletionDiagnostics,

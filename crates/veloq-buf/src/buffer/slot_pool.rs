@@ -120,7 +120,7 @@ impl PoolTopology for UniformSlot {
     fn connect_listener(
         &self,
         state: &Self::State,
-        listener: Box<dyn Fn(crate::heap::ChunkInfo) + Send + Sync>,
+        listener: Box<dyn Fn(ChunkInfo) + Send + Sync>,
     ) {
         state.set_listener(listener);
     }
@@ -139,12 +139,12 @@ pub struct SlotBasedPool {
 
 impl SlotBasedPool {
     /// 创建新的 SlotBasedPool
-    pub fn new(pool: Arc<crate::heap::GlobalSlotPool>) -> Self {
+    pub fn new(pool: Arc<GlobalSlotPool>) -> Self {
         Self { pool, seed: None }
     }
 
     /// 使用特定的 seed 创建 SlotBasedPool，确保 shard 选择是确定性的
-    pub fn with_seed(pool: Arc<crate::heap::GlobalSlotPool>, seed: usize) -> Self {
+    pub fn with_seed(pool: Arc<GlobalSlotPool>, seed: usize) -> Self {
         Self {
             pool,
             seed: Some(seed),

@@ -21,6 +21,7 @@ pub(crate) struct WorkerQueue {
     pub(crate) remote_queue: ArrayQueue<SendTaskRef>,
     pub(crate) pinned_queue: ArrayQueue<SendTaskRef>,
     pub(crate) local_queue: ArrayQueue<LocalTaskRef>,
+    pub(crate) remote_count: AtomicUsize,
     pub(crate) pinned_count: AtomicUsize,
     pub(crate) local_count: AtomicUsize,
     /// LIFO slot for high-priority task (cache locality)
@@ -40,6 +41,7 @@ impl WorkerQueue {
             remote_queue,
             pinned_queue,
             local_queue,
+            remote_count: AtomicUsize::new(0),
             pinned_count: AtomicUsize::new(0),
             local_count: AtomicUsize::new(0),
             lifo: AtomicOptionPtr::new(None),

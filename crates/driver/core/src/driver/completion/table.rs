@@ -1,5 +1,7 @@
-use crate::DriverError;
-use crate::slot::{self, Generation};
+use crate::{
+    DriverCoreError, DriverError,
+    slot::{self, Generation},
+};
 use diagweave::prelude::*;
 use veloq_std::{
     boxed::Box,
@@ -548,7 +550,7 @@ where
                 }))
             }
             None => {
-                let report = crate::DriverCoreError::Internal
+                let report = DriverCoreError::Internal
                     .to_report()
                     .push_ctx("scope", "try_take_record")
                     .attach_note(veloq_std::format!(

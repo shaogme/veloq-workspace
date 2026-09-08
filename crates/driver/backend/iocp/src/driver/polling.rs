@@ -1,20 +1,23 @@
 use veloq_std::{
     format, mem,
     sync::Arc,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicU8, Ordering},
     time::{Duration, Instant},
     vec::Vec,
 };
 
 use diagweave::prelude::*;
 use veloq_driver_core::driver::{
-    AnomalyAttach, CompletionAnomalyKind, CompletionEnvelope, CompletionIdentity, Driver, OpToken,
-    RawCompletion, RemoteWaker, SharedCompletionTable,
+    AnomalyAttach, CompletionAnomalyKind, CompletionEnvelope, CompletionIdentity, CompletionToken,
+    Driver, OpToken, RawCompletion, RemoteWaker, SharedCompletionTable,
 };
 use veloq_wheel::{TaskId, Wheel, WheelConfig};
 
 use crate::{
-    common::{IocpErrorContext, IocpWaker, iocp_msg},
+    common::{
+        IocpErrorContext, IocpWaker, WAKER_IDLE, WAKER_NOTIFIED, WAKER_PROCESSING, WAKER_REARM,
+        iocp_msg,
+    },
     error::{IocpError, IocpResult},
     op::{IocpSlotSpec, OverlappedEntry},
     win32::{CompletionBatch, CompletionStatus, IoCompletionPort, Overlapped},
@@ -27,7 +30,7 @@ const MAX_IOCP_BATCH: usize = 128;
 
 pub(super) struct CompletionPump {
     port: Arc<IoCompletionPort>,
-    is_notified: Arc<AtomicBool>,
+    notification_state: Arc<AtomicU8>,
     table: SharedCompletionTable<IocpSlotSpec>,
     batch: CompletionBatch,
 }
@@ -36,7 +39,7 @@ impl CompletionPump {
     pub(super) fn new(port: IoCompletionPort, table: SharedCompletionTable<IocpSlotSpec>) -> Self {
         Self {
             port: Arc::new(port),
-            is_notified: Arc::new(AtomicBool::new(false)),
+            notification_state: Arc::new(AtomicU8::new(WAKER_IDLE)),
             table,
             batch: CompletionBatch::with_capacity(MAX_IOCP_BATCH),
         }
@@ -66,15 +69,124 @@ impl CompletionPump {
         self.table.clone()
     }
 
-    pub(super) fn clear_notification(&self) {
-        self.is_notified.store(false, Ordering::Release);
+    pub(super) fn begin_notification(&self) {
+        loop {
+            match self.notification_state.load(Ordering::Acquire) {
+                WAKER_NOTIFIED => {
+                    if self
+                        .notification_state
+                        .compare_exchange(
+                            WAKER_NOTIFIED,
+                            WAKER_PROCESSING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+                WAKER_IDLE => {
+                    if self
+                        .notification_state
+                        .compare_exchange(
+                            WAKER_IDLE,
+                            WAKER_PROCESSING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+                WAKER_PROCESSING | WAKER_REARM => return,
+                _ => unreachable!("invalid IOCP waker state"),
+            }
+        }
+    }
+
+    pub(super) fn clear_notification(&self) -> IocpResult<()> {
+        loop {
+            match self.notification_state.load(Ordering::Acquire) {
+                WAKER_PROCESSING => {
+                    if self
+                        .notification_state
+                        .compare_exchange(
+                            WAKER_PROCESSING,
+                            WAKER_IDLE,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return Ok(());
+                    }
+                }
+                WAKER_REARM => {
+                    if self
+                        .notification_state
+                        .compare_exchange(
+                            WAKER_REARM,
+                            WAKER_NOTIFIED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        if let Err(error) = self.port.notify(CompletionToken::waker(0)) {
+                            self.notification_state
+                                .compare_exchange(
+                                    WAKER_NOTIFIED,
+                                    WAKER_IDLE,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                )
+                                .ok();
+                            return Err(error
+                                .push_ctx("scope", "iocp/driver.polling")
+                                .attach_note("failed to rearm remote waker"));
+                        }
+                        return Ok(());
+                    }
+                }
+                WAKER_NOTIFIED => {
+                    if self
+                        .notification_state
+                        .compare_exchange(
+                            WAKER_NOTIFIED,
+                            WAKER_IDLE,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return Ok(());
+                    }
+                }
+                WAKER_IDLE => return Ok(()),
+                _ => unreachable!("invalid IOCP waker state"),
+            }
+        }
     }
 
     pub(super) fn create_waker(&self) -> Arc<dyn RemoteWaker<IocpError>> {
         Arc::new(IocpWaker {
             port: self.port.clone(),
-            is_notified: self.is_notified.clone(),
+            notification_state: self.notification_state.clone(),
         })
+    }
+
+    fn mark_waker_notifications(&self, count: usize) {
+        let waker = CompletionToken::waker(0).raw() as usize;
+        for index in 0..count {
+            if let Some(status) = self.batch.status(index)
+                && status.overlapped.is_null()
+                && status.key == waker
+            {
+                self.begin_notification();
+            }
+        }
     }
 }
 
@@ -136,6 +248,7 @@ impl<'a> IocpDriver<'a> {
             .fill_batch(duration_to_wait_ms(timeout))
             .push_ctx("scope", "iocp/driver")
             .attach_note("failed to poll IOCP status")?;
+        self.completion.mark_waker_notifications(count);
 
         let mut drained = 0usize;
         let mut first_error = None;
@@ -154,9 +267,13 @@ impl<'a> IocpDriver<'a> {
     }
 
     /// Retrieves completion events from the I/O completion port.
-    pub(crate) fn get_completion(&mut self, timeout_ms: u32) -> IocpResult<()> {
+    pub(crate) fn get_completion(&mut self, timeout: Option<Duration>) -> IocpResult<()> {
         let _ = self.drain_cancel_requests()?;
-        let wait_ms = self.calculate_wait_ms(timeout_ms);
+        let wait_ms = if self.ops.shared.has_ready_completion() {
+            0
+        } else {
+            self.calculate_wait_ms(timeout)
+        };
 
         let batched = self.completion.fill_batch(wait_ms);
         let now = Instant::now();
@@ -166,6 +283,7 @@ impl<'a> IocpDriver<'a> {
         let count = batched
             .attach_note("failed to get IOCP completion status")
             .trans()?;
+        self.completion.mark_waker_notifications(count);
 
         // Every entry is routed even if one of them fails, so a single corrupt completion
         // cannot drop the rest of the batch on the floor; the first error is reported.
@@ -196,12 +314,15 @@ impl<'a> IocpDriver<'a> {
         self.handle_completion_status(bytes, key, overlapped, success, error_code)
     }
 
-    pub(super) fn calculate_wait_ms(&self, timeout_ms: u32) -> u32 {
-        if let Some(delay) = self.timer.next_timeout() {
-            let millis = delay.as_millis().min(u32::MAX as u128) as u32;
-            timeout_ms.min(millis)
-        } else {
-            timeout_ms
+    pub(super) fn calculate_wait_ms(&self, timeout: Option<Duration>) -> u32 {
+        let internal_timeout = self.timer.next_timeout().map(duration_to_wait_ms);
+        let external_timeout = timeout.map(duration_to_wait_ms);
+
+        match (external_timeout, internal_timeout) {
+            (Some(external), Some(internal)) => external.min(internal),
+            (Some(external), None) => external,
+            (None, Some(internal)) => internal,
+            (None, None) => u32::MAX,
         }
     }
 
@@ -358,7 +479,11 @@ fn duration_to_wait_ms(duration: Duration) -> u32 {
     if duration.is_zero() {
         0
     } else {
-        duration.as_millis().clamp(1, u32::MAX as u128) as u32
+        let millis = duration.as_millis();
+        let rounded = millis.saturating_add(u128::from(
+            !duration.subsec_nanos().is_multiple_of(1_000_000),
+        ));
+        rounded.clamp(1, u32::MAX as u128) as u32
     }
 }
 
@@ -420,5 +545,12 @@ mod tests {
             classify_completion_status(123, ptr::dangling_mut(), true),
             IocpCompletionStatusKind::OverlappedUser { queue_key: 123 }
         );
+    }
+
+    #[test]
+    fn external_timeout_rounds_up_to_avoid_early_expiry() {
+        assert_eq!(duration_to_wait_ms(Duration::ZERO), 0);
+        assert_eq!(duration_to_wait_ms(Duration::from_millis(1)), 1);
+        assert_eq!(duration_to_wait_ms(Duration::from_micros(1_001)), 2);
     }
 }

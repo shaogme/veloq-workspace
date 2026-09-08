@@ -1,6 +1,7 @@
 pub mod raw;
 
 use crate::{
+    fmt::{self, Formatter, Result as FmtResult},
     string::String,
     thread::{Builder, Systerm, ThreadError},
 };
@@ -46,8 +47,8 @@ pub struct ScopeBuilder<'scope, 'env> {
     builder: Builder,
 }
 
-impl<'scope, 'env> crate::fmt::Debug for ScopeBuilder<'scope, 'env> {
-    fn fmt(&self, f: &mut crate::fmt::Formatter<'_>) -> crate::fmt::Result {
+impl<'scope, 'env> fmt::Debug for ScopeBuilder<'scope, 'env> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("ScopeBuilder")
             .field("builder", &self.builder)
             .finish()

@@ -26,10 +26,16 @@ use crate::{
 use crate::boxed::Box;
 
 #[cfg(feature = "std")]
-pub(crate) type ThreadPanicPayload = Option<Box<dyn crate::any::Any + Send + 'static>>;
+use crate::{
+    any::Any,
+    fmt::{self, Formatter, Result as FmtResult},
+};
 
 #[cfg(feature = "std")]
-pub struct SendSyncPanicPayload(pub Box<dyn crate::any::Any + Send + 'static>);
+pub(crate) type ThreadPanicPayload = Option<Box<dyn Any + Send + 'static>>;
+
+#[cfg(feature = "std")]
+pub struct SendSyncPanicPayload(pub Box<dyn Any + Send + 'static>);
 
 #[cfg(feature = "std")]
 unsafe impl Send for SendSyncPanicPayload {}
@@ -37,8 +43,8 @@ unsafe impl Send for SendSyncPanicPayload {}
 unsafe impl Sync for SendSyncPanicPayload {}
 
 #[cfg(feature = "std")]
-impl crate::fmt::Debug for SendSyncPanicPayload {
-    fn fmt(&self, f: &mut crate::fmt::Formatter<'_>) -> crate::fmt::Result {
+impl fmt::Debug for SendSyncPanicPayload {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.write_str("SendSyncPanicPayload")
     }
 }
