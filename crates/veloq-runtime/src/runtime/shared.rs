@@ -1,10 +1,11 @@
 use std::{
     hint::spin_loop,
     num::NonZeroUsize,
+    panic::{AssertUnwindSafe, catch_unwind},
     ptr::NonNull,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+        atomic::{AtomicUsize, Ordering},
     },
 };
 
@@ -18,7 +19,9 @@ use veloq_tls::Tls;
 use super::context::{IdleHook, IdleWaitStrategy, RuntimeTlsInner, WorkerTickHook};
 use crate::{
     error::{Result, RuntimeError},
-    runtime::primitives::{EventCount, Unparker, WakeFailureState},
+    runtime::primitives::{
+        EventCount, ShutdownCoordinator, ShutdownPhase, Unparker, WakeFailureState,
+    },
     scope::{GenericScopeCompletion, ScopeBlockingWaiter},
     task::{
         GenericTaskHeader, LocalTaskRef, LocalWakeTarget, ScopeStorage, SendTaskRef, TaskHandleRef,
@@ -62,10 +65,7 @@ pub struct RuntimeSharedBase {
     pub(crate) topo: TopologyContext,
     pub(crate) scheduler: TaskScheduler,
     pub(crate) idle: IdleController,
-    pub(crate) shutdown: Arc<AtomicBool>,
-    /// Serializes shutdown with queue publication so no task can be published
-    /// after all workers have started draining their backlogs.
-    pub(crate) shutdown_gate: Mutex<()>,
+    pub(crate) shutdown: Arc<ShutdownCoordinator>,
     pub(crate) wake_failure: Arc<WakeFailureState>,
     pub(crate) local_wake_targets: Box<[Arc<LocalWakeTarget>]>,
     pub(crate) worker_tick_hook: Option<WorkerTickHook>,
@@ -95,8 +95,8 @@ pub(crate) fn init_runtime_components(
     queue_capacity: NonZeroUsize,
 ) -> (WorkerRegistry, TopologyContext, Receivers) {
     let worker_count_val = worker_count.get();
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let wake_failure = Arc::new(WakeFailureState::new(shutdown.clone()));
+    let shutdown = Arc::new(ShutdownCoordinator::new(worker_count_val));
+    let wake_failure = Arc::new(WakeFailureState::new(Arc::downgrade(&shutdown)));
     let mut unparkers = Vec::with_capacity(worker_count_val);
     let mut deques = Vec::with_capacity(worker_count_val);
     let mut workers = Vec::with_capacity(worker_count_val);
@@ -119,6 +119,7 @@ pub(crate) fn init_runtime_components(
             stealer,
         ));
     }
+    shutdown.install_shutdown_targets(unparkers.clone().into());
 
     // NUMA detection
     let topo_info = Topology::discover().ok();
@@ -211,7 +212,6 @@ impl<T> RuntimeShared<T> {
                     event_count,
                 },
                 shutdown,
-                shutdown_gate: Mutex::new(()),
                 wake_failure,
                 local_wake_targets,
                 worker_tick_hook,
@@ -235,6 +235,15 @@ impl RuntimeSharedBase {
     }
 
     pub(crate) fn fatal_error(&self) -> Option<Report<RuntimeError>> {
+        if self.shutdown.drain_failed() {
+            return Some(
+                RuntimeError::InvariantViolation {
+                    site: "global-injector-drain",
+                    detail: "task finalization panicked while draining the global injector".into(),
+                }
+                .to_report(),
+            );
+        }
         if !self.wake_failure.is_failed() {
             return None;
         }
@@ -287,6 +296,15 @@ impl RuntimeSharedBase {
         }
     }
 
+    /// Mark workers that were never started so shutdown barriers do not wait for nonexistent
+    /// participants. Their queues are empty because task publication starts only after all worker
+    /// setup has completed.
+    pub(crate) fn mark_workers_unavailable(&self, worker_ids: impl IntoIterator<Item = usize>) {
+        for worker_id in worker_ids {
+            self.shutdown.mark_worker_unavailable(worker_id);
+        }
+    }
+
     /// 入队失败后放弃任务：先归还 `STATE_QUEUED` 持有的引用，再终结任务本体，
     /// 确保 scope 义务一定被结算。
     ///
@@ -295,87 +313,138 @@ impl RuntimeSharedBase {
     /// 则使用 [`Self::abandon_queued_task_and_drop`] 接管这份释放责任。
     fn abandon_queued_task<H: TaskHandleRef>(task: &H) {
         let header = task.header();
-        if header.clear_queued() {
-            // clear_queued 已把最后一个队列引用交给统一终态状态机。
-        } else {
-            header.abandon_before_enqueue();
-        }
+        // 清除队列引用只解决 STATE_QUEUED 的所有权；若任务尚未发布结果，
+        // 仍必须进入 abandoned/finalized 状态机，才能结算 scope obligation。
+        header.clear_queued();
+        header.abandon_before_enqueue();
+    }
+
+    fn abandon_queued_task_from_wake<H: TaskHandleRef>(task: &H) {
+        let header = task.header();
+        header.clear_queued();
+        header.abandon_before_enqueue_from_wake();
     }
 
     /// 放弃一个已脱离队列、且当前 worker 已成为其对象所有者的任务。
-    fn abandon_queued_task_and_drop<H: TaskHandleRef>(task: &H) {
+    ///
+    /// 返回值表示任务完成通知或自定义 drop 回调发生了 panic。panic 被限制在单个任务内，
+    /// 这样 global injector 仍能继续处理其余任务；调用方负责把该诊断升级为 runtime fatal。
+    fn abandon_queued_task_and_drop<H: TaskHandleRef>(task: &H) -> bool {
         let header = task.header();
         Self::abandon_queued_task(task);
-        if header.drop_after_poll() && header.is_reclaimable() {
-            unsafe { GenericTaskHeader::drop_task(NonNull::from(header)) };
+        let mut failed = header.waker_panicked();
+        if header.drop_after_poll()
+            && header.is_reclaimable()
+            && catch_unwind(AssertUnwindSafe(|| unsafe {
+                GenericTaskHeader::drop_task(NonNull::from(header))
+            }))
+            .is_err()
+        {
+            failed = true;
         }
+        failed
     }
 
-    /// 放弃当前 worker 队列里的全部积压任务并结算它们的 scope 义务。
+    /// 放弃当前 worker 拥有的全部积压任务并结算它们的 scope 义务。
     ///
     /// 只在 worker 因 shutdown 退出调度循环时调用：这些任务已经不可能再被 poll，若不在
     /// 这里终结，等待它们的作用域会永久挂起。arena-backed 节点仍由 arena 回收；拥有独立
     /// 析构责任的自定义任务则由这里按 vtable 回收。
-    pub(crate) fn abandon_worker_backlog(&self, worker_id: usize) {
+    pub(crate) fn abandon_owned_backlog(&self, worker_id: usize) {
         self.drain_local_wake_mailbox(worker_id);
         let worker = &self.registry.workers[worker_id];
+        let mut failed = false;
 
         if let Some(header) = worker.lifo.swap(None, Ordering::AcqRel) {
-            Self::abandon_queued_task_and_drop(&unsafe {
+            failed |= Self::abandon_queued_task_and_drop(&unsafe {
                 SendTaskRef::from_header(header.as_ptr())
             });
         }
         while let Ok(Some(task)) = self.tls.try_with(|ctx| ctx.worker.pop()) {
-            Self::abandon_queued_task_and_drop(&task);
+            failed |= Self::abandon_queued_task_and_drop(&task);
         }
         while let Some(task) = worker.pinned_queue.pop() {
             worker.pinned_count.fetch_sub(1, Ordering::Release);
-            Self::abandon_queued_task_and_drop(&task);
+            failed |= Self::abandon_queued_task_and_drop(&task);
         }
         while let Some(task) = worker.local_queue.pop() {
             worker.local_count.fetch_sub(1, Ordering::Release);
-            Self::abandon_queued_task_and_drop(&task);
+            failed |= Self::abandon_queued_task_and_drop(&task);
         }
         while let Some(task) = worker.remote_queue.pop() {
             worker.remote_count.fetch_sub(1, Ordering::Release);
-            Self::abandon_queued_task_and_drop(&task);
+            failed |= Self::abandon_queued_task_and_drop(&task);
         }
         // shutdown 期间 foreign wake 仍可能在第一次 drain 后到达；再次 drain 后，
         // mailbox 中的 stale token 也不会把任务重新发布到已关闭的队列。
         self.drain_local_wake_mailbox(worker_id);
-        self.abandon_global_backlog();
+        if failed {
+            self.shutdown.record_drain_failure();
+        }
     }
 
-    /// 放弃 global injector 中尚未被任何 worker 取出的任务。
-    pub(crate) fn abandon_global_backlog(&self) {
-        self.scheduler.injector.drain(|task| {
-            Self::abandon_queued_task_and_drop(&task);
+    /// 由 worker 0 在两个 barrier 完成后，唯一排空 global injector。
+    pub(crate) fn drain_global_backlog_once(&self) {
+        if !self.shutdown.begin_global_drain(0) {
+            return;
+        }
+        let mut callback_failed = false;
+        let (_, panicked) = self.scheduler.injector.drain_once(|task| {
+            callback_failed |= Self::abandon_queued_task_and_drop(&task);
         });
+        if panicked || callback_failed {
+            self.shutdown.record_drain_failure();
+        }
+        debug_assert!(self.scheduler.injector.is_empty());
+        self.shutdown.finish_global_drain();
+    }
+
+    /// 统一的 worker shutdown 尾部，也用于 worker 初始化失败和主 worker
+    /// 尚未建立 TLS 的异常收尾。
+    pub(crate) fn complete_shutdown(&self, worker_id: usize) {
+        self.shutdown.request_shutdown();
+        self.shutdown.arrive_quiescent(worker_id);
+        self.shutdown.wait_for_quiescent();
+        self.abandon_owned_backlog(worker_id);
+        self.shutdown.arrive_local_drained(worker_id);
+        self.shutdown.wait_for_local_drained();
+
+        if worker_id == 0 {
+            if self.shutdown.phase() != ShutdownPhase::Drained {
+                self.drain_global_backlog_once();
+            }
+        } else {
+            self.shutdown.wait_for_drained();
+        }
     }
 
     /// 将本地任务入队当前线程的本地队列。
-    pub(crate) fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef) -> Result<()> {
+    fn enqueue_local_inner(
+        &self,
+        worker_id: usize,
+        task: LocalTaskRef,
+        from_wake: bool,
+    ) -> Result<()> {
         debug_assert_eq!(
             self.tls.try_with(|ctx| ctx.worker_id).ok(),
             Some(worker_id),
             "local task enqueue must run on the owner worker"
         );
+        let mut rejected = false;
+        let mut queue_rejected = None;
         let enqueued = {
-            let _shutdown_gate = self
-                .shutdown_gate
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _gate = self.shutdown.lock_publication();
             if task.header().is_result_ready() {
                 false
-            } else if self.shutdown.load(Ordering::Acquire) {
-                task.header().abandon_before_enqueue();
+            } else if !self.shutdown.is_running() {
+                rejected = true;
                 false
             } else if task.header().try_mark_queued() {
                 let worker = &self.registry.workers[worker_id];
                 worker.local_count.fetch_add(1, Ordering::Release);
                 if let Err(task) = worker.local_queue.push(task) {
                     worker.local_count.fetch_sub(1, Ordering::Release);
-                    Self::abandon_queued_task(&task);
+                    queue_rejected = Some(task);
                     false
                 } else {
                     true
@@ -384,6 +453,20 @@ impl RuntimeSharedBase {
                 false
             }
         };
+        if rejected {
+            if from_wake {
+                task.header().abandon_before_enqueue_from_wake();
+            } else {
+                task.header().abandon_before_enqueue();
+            }
+        }
+        if let Some(task) = queue_rejected {
+            if from_wake {
+                Self::abandon_queued_task_from_wake(&task);
+            } else {
+                Self::abandon_queued_task(&task);
+            }
+        }
         if enqueued {
             // 唤醒失败会设置共享 shutdown。任务已经在队列中可见，必须保留队列引用和
             // 计数，交给 worker 的 shutdown drain 结算；此处提前清理会让 drain 对计数
@@ -393,28 +476,48 @@ impl RuntimeSharedBase {
         Ok(())
     }
 
-    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef) -> EnqueuePinnedOutcome {
+    pub(crate) fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef) -> Result<()> {
+        self.enqueue_local_inner(worker_id, task, false)
+    }
+
+    pub(crate) fn enqueue_local_from_wake(
+        &self,
+        worker_id: usize,
+        task: LocalTaskRef,
+    ) -> Result<()> {
+        self.enqueue_local_inner(worker_id, task, true)
+    }
+
+    fn enqueue_pinned_inner(
+        &self,
+        worker_id: usize,
+        task: SendTaskRef,
+        from_wake: bool,
+    ) -> EnqueuePinnedOutcome {
         if self.validate_worker_id(worker_id).is_err() {
-            task.header().abandon_before_enqueue();
+            if from_wake {
+                task.header().abandon_before_enqueue_from_wake();
+            } else {
+                task.header().abandon_before_enqueue();
+            }
             return EnqueuePinnedOutcome::AbortedAcknowledged;
         }
+        let mut rejected = false;
+        let mut queue_rejected = None;
         let outcome = {
-            let _shutdown_gate = self
-                .shutdown_gate
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _gate = self.shutdown.lock_publication();
             let header = task.header();
             if header.is_result_ready() {
                 EnqueuePinnedOutcome::AlreadySettled
-            } else if self.shutdown.load(Ordering::Acquire) {
-                header.abandon_before_enqueue();
+            } else if !self.shutdown.is_running() {
+                rejected = true;
                 EnqueuePinnedOutcome::AbortedAcknowledged
             } else if header.try_mark_queued() {
                 let worker = &self.registry.workers[worker_id];
                 worker.pinned_count.fetch_add(1, Ordering::Release);
                 if let Err(task) = worker.pinned_queue.push(task) {
                     worker.pinned_count.fetch_sub(1, Ordering::Release);
-                    Self::abandon_queued_task(&task);
+                    queue_rejected = Some(task);
                     EnqueuePinnedOutcome::AbortedAcknowledged
                 } else {
                     EnqueuePinnedOutcome::Enqueued
@@ -423,6 +526,20 @@ impl RuntimeSharedBase {
                 EnqueuePinnedOutcome::AlreadyQueued
             }
         };
+        if rejected {
+            if from_wake {
+                task.header().abandon_before_enqueue_from_wake();
+            } else {
+                task.header().abandon_before_enqueue();
+            }
+        }
+        if let Some(task) = queue_rejected {
+            if from_wake {
+                Self::abandon_queued_task_from_wake(&task);
+            } else {
+                Self::abandon_queued_task(&task);
+            }
+        }
         if outcome == EnqueuePinnedOutcome::Enqueued {
             // 序列号只能在任务**已经可见之后**递增，见 `EventCount::notify`。
             self.idle.event_count.notify();
@@ -431,6 +548,18 @@ impl RuntimeSharedBase {
             }
         }
         outcome
+    }
+
+    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef) -> EnqueuePinnedOutcome {
+        self.enqueue_pinned_inner(worker_id, task, false)
+    }
+
+    pub(crate) fn enqueue_pinned_from_wake(
+        &self,
+        worker_id: usize,
+        task: SendTaskRef,
+    ) -> EnqueuePinnedOutcome {
+        self.enqueue_pinned_inner(worker_id, task, true)
     }
 
     #[inline]
@@ -517,34 +646,27 @@ impl RuntimeSharedBase {
     }
 
     pub(crate) fn shutdown(&self) {
-        let _shutdown_gate = self
-            .shutdown_gate
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.shutdown.store(true, Ordering::Release);
-        for i in 0..self.registry.unparkers.len() {
-            if self.registry.unpark(i).is_err() {
-                // Shutdown is already in progress; the waker records the backend failure.
-            }
-        }
+        self.shutdown.request_shutdown();
     }
 
-    pub(crate) fn enqueue_send(&self, worker_id: usize, task: SendTaskRef) {
+    fn enqueue_send_inner(&self, worker_id: usize, task: SendTaskRef, from_wake: bool) {
         if self.validate_worker_id(worker_id).is_err() {
             // 任务不会进入任何队列，必须在此结算 scope 义务，否则 `remaining`
             // 永不归零，`wait_all` 永久挂起。
-            task.header().abandon_before_enqueue();
+            if from_wake {
+                task.header().abandon_before_enqueue_from_wake();
+            } else {
+                task.header().abandon_before_enqueue();
+            }
             return;
         }
+        let mut rejected = false;
         let destination = {
-            let _shutdown_gate = self
-                .shutdown_gate
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let _gate = self.shutdown.lock_publication();
             if task.header().is_result_ready() {
                 None
-            } else if self.shutdown.load(Ordering::Acquire) {
-                task.header().abandon_before_enqueue();
+            } else if !self.shutdown.is_running() {
+                rejected = true;
                 None
             } else if task.header().try_mark_queued() {
                 let worker = &self.registry.workers[worker_id];
@@ -561,6 +683,14 @@ impl RuntimeSharedBase {
                 None
             }
         };
+        if rejected {
+            if from_wake {
+                task.header().abandon_before_enqueue_from_wake();
+            } else {
+                task.header().abandon_before_enqueue();
+            }
+            return;
+        }
         match destination {
             Some(true) => {
                 self.idle.event_count.notify();
@@ -578,6 +708,14 @@ impl RuntimeSharedBase {
         }
     }
 
+    pub(crate) fn enqueue_send(&self, worker_id: usize, task: SendTaskRef) {
+        self.enqueue_send_inner(worker_id, task, false);
+    }
+
+    pub(crate) fn enqueue_send_from_wake(&self, worker_id: usize, task: SendTaskRef) {
+        self.enqueue_send_inner(worker_id, task, true);
+    }
+
     /// 从当前 worker 可见的所有来源里取出一个任务并 poll；无事可做时返回 `false`。
     ///
     /// 这是**唯一**的取任务链：worker 线程、`block_on` 主线程、作用域析构 join 全部共用
@@ -590,6 +728,9 @@ impl RuntimeSharedBase {
         tick: u32,
         rand: &FastRand,
     ) -> Result<bool> {
+        if self.shutdown.is_shutdown() {
+            return Ok(false);
+        }
         self.drain_local_wake_mailbox(worker_id);
 
         if tick.is_multiple_of(GLOBAL_QUEUE_INTERVAL)
@@ -705,20 +846,21 @@ impl<T> RuntimeShared<T> {
             .unwrap_or(usize::MAX);
 
         if current == worker_id {
+            let mut rejected = false;
+            let mut handled = false;
             let enqueued = {
-                let _shutdown_gate = self
-                    .base
-                    .shutdown_gate
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if self.base.validate_worker_id(worker_id).is_err()
-                    || task.header().is_result_ready()
-                {
+                let _gate = self.base.shutdown.lock_publication();
+                if self.base.validate_worker_id(worker_id).is_err() {
                     false
-                } else if self.base.shutdown.load(Ordering::Acquire) {
-                    task.header().abandon_before_enqueue();
+                } else if task.header().is_result_ready() {
+                    handled = true;
+                    false
+                } else if !self.base.shutdown.is_running() {
+                    rejected = true;
+                    handled = true;
                     false
                 } else if task.header().try_mark_queued() {
+                    handled = true;
                     let worker = &self.base.registry.workers[worker_id];
                     let header_ptr = task.header() as *const _ as *mut _;
                     if worker
@@ -740,12 +882,18 @@ impl<T> RuntimeShared<T> {
                     false
                 }
             };
+            if rejected {
+                task.header().abandon_before_enqueue();
+            }
             if enqueued {
                 // 任务已进入 lifo 槽或本地 deque，此刻才可以 bump 序列号。
                 self.base.idle.event_count.notify();
                 if self.wake_worker(worker_id).is_err() {
                     // 任务已可见；唤醒失败由共享 fatal 通道终止 runtime。
                 }
+                return;
+            }
+            if handled {
                 return;
             }
         }
@@ -788,7 +936,7 @@ impl<T> RuntimeShared<T> {
             ScopeBlockingWaiter::new(&**completion, self.base.unparker(worker_id).clone());
         let mut first_error = None;
         while !completion.is_done() {
-            if !self.base.shutdown.load(Ordering::Acquire) {
+            if !self.base.shutdown.is_shutdown() {
                 let mut controller = ScopeJoinController::new(&**completion);
                 if let Err(err) = run_worker_loop(self, &mut controller) {
                     if first_error.is_none() {
@@ -796,15 +944,15 @@ impl<T> RuntimeShared<T> {
                     }
                     self.base.shutdown();
                 }
-            } else if !self.drain_one_pending_task() {
-                waiter.arm();
-                if completion.is_done() {
-                    break;
+            } else {
+                self.base.complete_shutdown(worker_id);
+                while !completion.is_done() {
+                    waiter.arm();
+                    if completion.is_done() {
+                        break;
+                    }
+                    waiter.park();
                 }
-                if self.drain_one_pending_task() {
-                    continue;
-                }
-                waiter.park();
             }
         }
 
@@ -813,16 +961,117 @@ impl<T> RuntimeShared<T> {
             .map_or(Ok(()), Err)
     }
 
-    /// 关停期间的退化驱动：只排空自己看得见的队列，不进入 idle 协调。
-    fn drain_one_pending_task(&self) -> bool {
-        let base = &self.base;
-        base.tls
-            .with(|ctx| base.poll_next_task(ctx.worker_id, 1, &ctx.rand))
-            .unwrap_or(false)
-    }
-
     /// worker 线程的调度循环入口：一直跑到运行时关停。
     pub(crate) fn run_worker(&self) -> Result<()> {
         run_worker_loop(self, &mut ShutdownController)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        scope::GenericScopeCompletion,
+        task::{GenericWakerNode, RawScope, ScopeRef, TaskVTable},
+        utils::ownership::ArcOwnership,
+    };
+    use std::{
+        marker::{PhantomData, PhantomPinned},
+        pin::Pin,
+        sync::atomic::AtomicUsize,
+        task::{RawWaker, Waker},
+    };
+    use veloq_intrusive_linklist::Link;
+    use veloq_storage::AtomicStorage;
+
+    static PANIC_WAKER_VTABLE: std::task::RawWakerVTable = std::task::RawWakerVTable::new(
+        |_| std::task::RawWaker::new(std::ptr::null(), &PANIC_WAKER_VTABLE),
+        |_| panic!("completion waker panic"),
+        |_| {},
+        |_| {},
+    );
+
+    static GLOBAL_DRAIN_DROPS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe fn noop_wake(_: NonNull<GenericTaskHeader<AtomicStorage>>) {}
+
+    unsafe fn noop_wake_by_ref(_: &GenericTaskHeader<AtomicStorage>) {}
+
+    unsafe fn noop_drop(_: NonNull<GenericTaskHeader<AtomicStorage>>) {
+        GLOBAL_DRAIN_DROPS.fetch_add(1, Ordering::AcqRel);
+    }
+
+    static DROP_AFTER_POLL_VTABLE: TaskVTable<AtomicStorage> = TaskVTable {
+        wake: noop_wake,
+        wake_by_ref: noop_wake_by_ref,
+        poll: |_, _| Ok(true),
+        drop: noop_drop,
+        drop_after_poll: true,
+    };
+
+    fn test_shared() -> RuntimeShared<()> {
+        let worker_count = NonZeroUsize::new(1).expect("one worker");
+        let queue_capacity = NonZeroUsize::new(1).expect("one queue slot");
+        let (registry, topo, _) = init_runtime_components(worker_count, queue_capacity);
+        RuntimeShared::new(registry, topo, worker_count, None, None, None)
+    }
+
+    #[test]
+    fn global_drain_settles_queue_reference_and_scope_once() {
+        GLOBAL_DRAIN_DROPS.store(0, Ordering::Release);
+        let shared = test_shared();
+        let completion = GenericScopeCompletion::<AtomicStorage, ArcOwnership>::new(None);
+        completion.register_task();
+
+        let scope_ptr = unsafe { RawScope::clone_raw(completion.as_ref()) };
+        let scope = unsafe { ScopeRef::<AtomicStorage>::new(scope_ptr) };
+        let header = GenericTaskHeader::new_placeholder(&DROP_AFTER_POLL_VTABLE);
+        unsafe { header.initialize(&shared.base, 0, scope) };
+        header.claim_scope_obligation();
+        assert!(header.try_mark_queued());
+
+        let task = unsafe { SendTaskRef::from_header(&header) };
+        shared.base.scheduler.injector.push(task);
+        shared.base.complete_shutdown(0);
+        shared.base.complete_shutdown(0);
+
+        assert!(header.is_result_ready());
+        assert!(header.is_reclaimable());
+        assert!(completion.is_done());
+        assert_eq!(GLOBAL_DRAIN_DROPS.load(Ordering::Acquire), 1);
+        assert!(shared.base.scheduler.injector.is_empty());
+    }
+
+    #[test]
+    fn global_drain_contains_waker_panic_and_finishes_task() {
+        let shared = test_shared();
+        let completion = GenericScopeCompletion::<AtomicStorage, ArcOwnership>::new(None);
+        completion.register_task();
+
+        let scope_ptr = unsafe { RawScope::clone_raw(completion.as_ref()) };
+        let scope = unsafe { ScopeRef::<AtomicStorage>::new(scope_ptr) };
+        let header = GenericTaskHeader::new_placeholder(&DROP_AFTER_POLL_VTABLE);
+        unsafe { header.initialize(&shared.base, 0, scope) };
+        header.claim_scope_obligation();
+        let panic_waker =
+            unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &PANIC_WAKER_VTABLE)) };
+        let mut node = GenericWakerNode {
+            waker: panic_waker.clone(),
+            link: Link::new(),
+            marker: PhantomData,
+            _pin: PhantomPinned,
+        };
+        let mut node = unsafe { Pin::new_unchecked(&mut node) };
+        unsafe { header.register_completion(node.as_mut(), &panic_waker) };
+        assert!(header.try_mark_queued());
+
+        let task = unsafe { SendTaskRef::from_header(&header) };
+        shared.base.scheduler.injector.push(task);
+        shared.base.complete_shutdown(0);
+
+        assert!(header.is_reclaimable());
+        assert!(completion.is_done());
+        assert!(header.waker_panicked());
+        assert!(shared.base.fatal_error().is_some());
     }
 }

@@ -40,7 +40,9 @@ impl TaskStorage for LocalStorage {
         worker_id: usize,
         data: NonNull<GenericTaskHeader<Self>>,
     ) -> RuntimeResult<()> {
-        unsafe { runtime.enqueue_local(worker_id, LocalTaskRef::from_header(data.as_ptr())) }
+        unsafe {
+            runtime.enqueue_local_from_wake(worker_id, LocalTaskRef::from_header(data.as_ptr()))
+        }
     }
 }
 
@@ -53,7 +55,7 @@ impl TaskStorage for AtomicStorage {
         data: NonNull<GenericTaskHeader<Self>>,
     ) -> RuntimeResult<()> {
         unsafe {
-            runtime.enqueue_send(worker_id, SendTaskRef::from_header(data.as_ptr()));
+            runtime.enqueue_send_from_wake(worker_id, SendTaskRef::from_header(data.as_ptr()));
         }
         Ok(())
     }

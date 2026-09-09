@@ -165,15 +165,20 @@ impl<S: Storage> TaskWakeToken<S> {
     /// send task 的原子 header 直接唤醒路径。
     #[inline]
     pub(crate) fn wake_impl(&self) {
-        let Some(_guard) = self.try_acquire() else {
-            return;
+        let header = {
+            let Some(_guard) = self.try_acquire() else {
+                return;
+            };
+
+            let Some(header) = self.header() else {
+                return;
+            };
+
+            header.wake_by_ref();
+            NonNull::from(header)
         };
 
-        let Some(header) = self.header() else {
-            return;
-        };
-
-        header.wake_by_ref();
+        unsafe { header.as_ref().finish_deferred_finalization() };
     }
 
     pub(crate) fn deactivate_and_wait(&self) {
@@ -246,21 +251,26 @@ impl TaskWakeToken<LocalStorage> {
             return;
         }
 
-        let Some(_guard) = self.try_acquire() else {
-            return;
-        };
-        let old_state = self.state.fetch_and(!WAKE_TOKEN_PENDING, Ordering::AcqRel);
-        if old_state & WAKE_TOKEN_PENDING == 0 {
-            // 只有一个 pending entry 合约；重复或 stale entry 不得重复派发。
-            return;
-        }
+        let header = {
+            let Some(_guard) = self.try_acquire() else {
+                return;
+            };
+            let old_state = self.state.fetch_and(!WAKE_TOKEN_PENDING, Ordering::AcqRel);
+            if old_state & WAKE_TOKEN_PENDING == 0 {
+                // 只有一个 pending entry 合约；重复或 stale entry 不得重复派发。
+                return;
+            }
 
-        let Some(header) = self.header.load(Ordering::Acquire) else {
-            return;
+            let Some(header) = self.header.load(Ordering::Acquire) else {
+                return;
+            };
+            // `ALIVE` 已由 try_acquire 证明，active guard 保证 header 在这次 owner dispatch
+            // 完成前不会被 Drop 清理。
+            unsafe { header.as_ref().wake_by_ref() };
+            header
         };
-        // `ALIVE` 已由 try_acquire 证明，active guard 保证 header 在这次 owner dispatch
-        // 完成前不会被 Drop 清理。
-        unsafe { header.as_ref().wake_by_ref() };
+
+        unsafe { header.as_ref().finish_deferred_finalization() };
     }
 
     /// 仅供 owner-side `RuntimeContextExt` 反查；foreign thread 一律返回 `None`。

@@ -11,6 +11,7 @@ use std::{
     cell::UnsafeCell,
     marker::{PhantomData, PhantomPinned},
     mem::ManuallyDrop,
+    panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
     ptr::{self, NonNull},
     sync::{Arc, atomic::Ordering},
@@ -34,6 +35,10 @@ pub(crate) const STATE_SCOPE_ACKED: usize = 1 << 8;
 pub(crate) const STATE_CANCEL_ARMED: usize = 1 << 9;
 pub(crate) const STATE_FINALIZED: usize = 1 << 10;
 pub(crate) const STATE_RECLAIMABLE: usize = 1 << 11;
+/// Wake callbacks defer finalization until their active token guard is released.
+pub(crate) const STATE_FINALIZATION_DEFERRED: usize = 1 << 12;
+/// A completion waker panicked; shutdown drain reports this after still finalizing the task.
+pub(crate) const STATE_WAKER_PANICKED: usize = 1 << 13;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PollStatus {
     Proceed,
@@ -407,7 +412,9 @@ impl<S: Storage> GenericTaskHeader<S> {
         }
 
         for waker in ready {
-            waker.wake();
+            if catch_unwind(AssertUnwindSafe(|| waker.wake())).is_err() {
+                self.state.fetch_or(STATE_WAKER_PANICKED, Ordering::Release);
+            }
         }
     }
 
@@ -432,6 +439,11 @@ impl<S: Storage> GenericTaskHeader<S> {
     #[inline]
     pub fn has_scope_obligation(&self) -> bool {
         self.state.load(Ordering::Acquire) & STATE_SCOPE_OBLIGATED != 0
+    }
+
+    #[inline]
+    pub(crate) fn waker_panicked(&self) -> bool {
+        self.state.load(Ordering::Acquire) & STATE_WAKER_PANICKED != 0
     }
 
     /// Advance `FINALIZED + ref_count == 0` exactly once.
@@ -496,6 +508,41 @@ impl<S: Storage> GenericTaskHeader<S> {
         }
         self.decrement_ref_count();
         self.finish_finalization();
+    }
+
+    /// Abandon a task from inside its own wake callback.
+    ///
+    /// The callback still owns an active wake-token guard, so finalization must be performed after
+    /// that guard is dropped. Otherwise `finish_finalization` waits for the callback that is
+    /// currently executing on the same thread.
+    pub(crate) fn abandon_before_enqueue_from_wake(&self) {
+        let old = self.state.fetch_or(
+            STATE_CANCELLED | STATE_READY | STATE_RESULT_READY,
+            Ordering::AcqRel,
+        );
+        if old & (STATE_RESULT_READY | STATE_QUEUED) != 0 {
+            return;
+        }
+
+        self.disarm_scope_cancel_waiter();
+        self.notify_completion_wakers();
+        if old & STATE_POLLING != 0 {
+            return;
+        }
+
+        self.decrement_ref_count();
+        self.state
+            .fetch_or(STATE_FINALIZATION_DEFERRED, Ordering::Release);
+    }
+
+    /// Finish an abandonment deferred by a wake callback.
+    pub(crate) fn finish_deferred_finalization(&self) {
+        let old = self
+            .state
+            .fetch_and(!STATE_FINALIZATION_DEFERRED, Ordering::AcqRel);
+        if old & STATE_FINALIZATION_DEFERRED != 0 {
+            self.finish_finalization();
+        }
     }
 
     /// 任务自身是否被显式取消（不考虑所属 scope 的取消状态）。
@@ -600,7 +647,7 @@ impl<S: Storage> GenericTaskHeader<S> {
         let runtime = self.runtime()?;
         if !S::IS_LOCAL && self.is_pinned() {
             let task = unsafe { SendTaskRef::from_header(self_ptr.as_ptr() as *const _) };
-            match runtime.enqueue_pinned(self.worker_id(), task) {
+            match runtime.enqueue_pinned_from_wake(self.worker_id(), task) {
                 EnqueuePinnedOutcome::Enqueued | EnqueuePinnedOutcome::AlreadyQueued => {}
                 EnqueuePinnedOutcome::AbortedAcknowledged
                 | EnqueuePinnedOutcome::AlreadySettled => {} // 终态任务的 wake 只会触发一次状态机检查，不能由调用者结算 scope。

@@ -12,7 +12,7 @@
 use std::{
     future::Future,
     pin::Pin,
-    sync::{Arc, atomic::Ordering},
+    sync::Arc,
     task::{Context, Poll, Waker},
 };
 
@@ -158,29 +158,45 @@ pub(crate) fn run_worker_loop<T, C: LoopController>(
         let waker = create_unpark_waker(base.unparker(worker_id).clone());
         let worker_tick_hook = base.worker_tick_hook;
         let mut tick = 0u32;
+        let mut loop_error = None;
 
-        while !base.shutdown.load(Ordering::Acquire) {
+        while !base.shutdown.is_shutdown() {
             if let Some(hook) = worker_tick_hook {
                 hook();
             }
 
-            if controller.poll_progress()? {
-                return Ok(());
+            match controller.poll_progress() {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(err) => {
+                    loop_error = Some(err);
+                    base.shutdown();
+                    break;
+                }
             }
 
             tick = tick.wrapping_add(1);
-            if base.poll_next_task(worker_id, tick, &ctx.rand)? {
-                continue;
+            match base.poll_next_task(worker_id, tick, &ctx.rand) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(err) => {
+                    loop_error = Some(err);
+                    base.shutdown();
+                    break;
+                }
             }
 
             controller.arm(&waker);
-            RuntimeProgressCoordinator::new(shared, worker_id).run(controller)?;
+            if let Err(err) = RuntimeProgressCoordinator::new(shared, worker_id).run(controller) {
+                loop_error = Some(err);
+                base.shutdown();
+                break;
+            }
         }
 
-        // 因 shutdown 退出：队列里的积压任务再也不会被 poll，必须在此放弃它们并结算
-        // scope 义务，否则等待方（`wait_all` / 作用域析构 join）永远等不到 `remaining`
-        // 归零。
-        base.abandon_worker_backlog(worker_id);
-        base.fatal_error().map_or(Ok(()), Err)
+        base.complete_shutdown(worker_id);
+        loop_error
+            .or_else(|| base.fatal_error())
+            .map_or(Ok(()), Err)
     })
 }

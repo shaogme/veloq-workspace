@@ -1,7 +1,6 @@
 use clap::{Parser, ValueEnum};
 use diagweave::{prelude::*, union};
-use std::io::Error as IoError;
-use std::process::ExitCode;
+use std::{io::Error as IoError, process::ExitCode};
 
 mod runner;
 
@@ -23,11 +22,27 @@ union! {
             #[display("未检测到 qemu-system-x86_64，无法在 Linux 上执行 Windows 镜像")]
             QemuNotFound,
 
-            #[display("未检测到 ssh 或 sshpass，请通过 devbox 管理依赖")]
+            #[display("未检测到 qemu-img，无法创建 qcow2 差分镜像")]
+            QemuImgNotFound,
+
+            #[display("未检测到 ssh 或 sshpass")]
             SshDependencyNotFound,
 
             #[display("未找到 Windows 镜像: {0}")]
             WindowsImageNotFound(String),
+
+            #[display("创建差分镜像失败（退出码: {code:?}）")]
+            CreateOverlayFailed {
+                code: Option<i32>,
+            },
+
+            #[display("在 Windows 虚拟机中执行 cargo fetch 失败（退出码: {code:?}）")]
+            CargoFetchFailed {
+                code: Option<i32>,
+            },
+
+            #[display("等待 Windows 虚拟机关机超时")]
+            VmShutdownTimeout,
 
             #[display("等待 Windows 虚拟机 SSH 就绪超时")]
             VmSshTimeout,

@@ -4,8 +4,8 @@ use std::{
     pin::Pin,
     ptr::NonNull,
     sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak,
+        atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
     time::Duration,
@@ -205,6 +205,259 @@ impl Signal {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub(crate) enum ShutdownPhase {
+    Running = 0,
+    StopRequested = 1,
+    AllWorkersQuiescent = 2,
+    DrainingGlobal = 3,
+    Drained = 4,
+}
+
+impl ShutdownPhase {
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            0 => Self::Running,
+            1 => Self::StopRequested,
+            2 => Self::AllWorkersQuiescent,
+            3 => Self::DrainingGlobal,
+            4 => Self::Drained,
+            _ => panic!("invalid shutdown phase: {raw}"),
+        }
+    }
+}
+
+/// Runtime-wide shutdown protocol.
+///
+/// The publication gate linearizes task publication with the transition out of
+/// [`ShutdownPhase::Running`]. Worker arrival slots make each barrier arrival
+/// idempotent, which is required because initialization failures and normal
+/// worker exits share the same cleanup path.
+pub(crate) struct ShutdownCoordinator {
+    phase: AtomicU8,
+    worker_count: usize,
+    quiescent_workers: AtomicUsize,
+    local_drained_workers: AtomicUsize,
+    quiescent_arrivals: Box<[AtomicBool]>,
+    local_drained_arrivals: Box<[AtomicBool]>,
+    publication_gate: Mutex<()>,
+    barrier_lock: Mutex<()>,
+    barrier: Condvar,
+    shutdown_targets: Mutex<Option<Box<[Unparker]>>>,
+    drain_failed: AtomicBool,
+}
+
+impl ShutdownCoordinator {
+    pub(crate) fn new(worker_count: usize) -> Self {
+        let quiescent_arrivals = (0..worker_count).map(|_| AtomicBool::new(false)).collect();
+        let local_drained_arrivals = (0..worker_count).map(|_| AtomicBool::new(false)).collect();
+        Self {
+            phase: AtomicU8::new(ShutdownPhase::Running as u8),
+            worker_count,
+            quiescent_workers: AtomicUsize::new(0),
+            local_drained_workers: AtomicUsize::new(0),
+            quiescent_arrivals,
+            local_drained_arrivals,
+            publication_gate: Mutex::new(()),
+            barrier_lock: Mutex::new(()),
+            barrier: Condvar::new(),
+            shutdown_targets: Mutex::new(None),
+            drain_failed: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn install_shutdown_targets(&self, targets: Box<[Unparker]>) {
+        let mut guard = self
+            .shutdown_targets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(guard.is_none(), "shutdown targets installed twice");
+        *guard = Some(targets);
+    }
+
+    pub(crate) fn lock_publication(&self) -> MutexGuard<'_, ()> {
+        self.publication_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        self.phase() == ShutdownPhase::Running
+    }
+
+    pub(crate) fn is_shutdown(&self) -> bool {
+        self.phase() >= ShutdownPhase::StopRequested
+    }
+
+    pub(crate) fn phase(&self) -> ShutdownPhase {
+        ShutdownPhase::from_raw(self.phase.load(Ordering::Acquire))
+    }
+
+    /// Request shutdown while holding the publication gate, then wake workers
+    /// only after releasing it. Wake callbacks can re-enter task publication.
+    pub(crate) fn request_shutdown(&self) {
+        {
+            let _gate = self.lock_publication();
+            if self.phase() == ShutdownPhase::Running {
+                self.phase
+                    .store(ShutdownPhase::StopRequested as u8, Ordering::Release);
+            }
+        }
+        self.notify_shutdown_targets();
+        self.notify_barrier();
+    }
+
+    fn notify_shutdown_targets(&self) {
+        let targets = self
+            .shutdown_targets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|targets| targets.to_vec());
+        if let Some(targets) = targets {
+            for target in targets {
+                target.shutdown_wake();
+            }
+        }
+    }
+
+    fn notify_barrier(&self) {
+        let _guard = self
+            .barrier_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.barrier.notify_all();
+    }
+
+    pub(crate) fn arrive_quiescent(&self, worker_id: usize) {
+        debug_assert!(worker_id < self.worker_count);
+        if self.quiescent_arrivals[worker_id].swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let arrived = self.quiescent_workers.fetch_add(1, Ordering::AcqRel) + 1;
+        if arrived == self.worker_count {
+            let _ = self.phase.compare_exchange(
+                ShutdownPhase::StopRequested as u8,
+                ShutdownPhase::AllWorkersQuiescent as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            self.notify_barrier();
+        }
+    }
+
+    /// Mark a worker that never started as having crossed both shutdown barriers.
+    ///
+    /// Thread creation and initialization happen before task publication, so an absent worker
+    /// has no owner-only queue that needs draining. Treating it as arrived keeps the coordinator
+    /// finite when the operating system refuses a thread or a worker setup fails before its loop
+    /// is entered. The arrival slots make this operation idempotent if an error path races with a
+    /// late cleanup callback.
+    pub(crate) fn mark_worker_unavailable(&self, worker_id: usize) {
+        debug_assert!(worker_id < self.worker_count);
+        debug_assert!(self.is_shutdown());
+        self.arrive_quiescent(worker_id);
+        self.arrive_local_drained(worker_id);
+    }
+
+    pub(crate) fn arrive_local_drained(&self, worker_id: usize) {
+        debug_assert!(worker_id < self.worker_count);
+        if self.local_drained_arrivals[worker_id].swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let arrived = self.local_drained_workers.fetch_add(1, Ordering::AcqRel) + 1;
+        if arrived == self.worker_count {
+            self.notify_barrier();
+        }
+    }
+
+    pub(crate) fn wait_for_quiescent(&self) {
+        let mut guard = self
+            .barrier_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while self.quiescent_workers.load(Ordering::Acquire) < self.worker_count {
+            guard = self
+                .barrier
+                .wait(guard)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    pub(crate) fn wait_for_local_drained(&self) {
+        let mut guard = self
+            .barrier_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while self.local_drained_workers.load(Ordering::Acquire) < self.worker_count {
+            guard = self
+                .barrier
+                .wait(guard)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    pub(crate) fn begin_global_drain(&self, worker_id: usize) -> bool {
+        debug_assert_eq!(worker_id, 0, "worker 0 owns the global drain");
+        let _gate = self.lock_publication();
+        assert_eq!(
+            self.quiescent_workers.load(Ordering::Acquire),
+            self.worker_count,
+            "global drain started before all workers became quiescent"
+        );
+        assert_eq!(
+            self.local_drained_workers.load(Ordering::Acquire),
+            self.worker_count,
+            "global drain started before all worker queues were drained"
+        );
+        let phase = self.phase();
+        if phase == ShutdownPhase::Drained || phase == ShutdownPhase::DrainingGlobal {
+            return false;
+        }
+        assert!(
+            phase >= ShutdownPhase::AllWorkersQuiescent,
+            "global drain started before worker barriers"
+        );
+        self.phase
+            .store(ShutdownPhase::DrainingGlobal as u8, Ordering::Release);
+        true
+    }
+
+    pub(crate) fn finish_global_drain(&self) {
+        let _gate = self.lock_publication();
+        assert_eq!(
+            self.phase(),
+            ShutdownPhase::DrainingGlobal,
+            "global drain completed in an invalid phase"
+        );
+        self.phase
+            .store(ShutdownPhase::Drained as u8, Ordering::Release);
+        self.notify_barrier();
+    }
+
+    pub(crate) fn wait_for_drained(&self) {
+        let mut guard = self
+            .barrier_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while self.phase() != ShutdownPhase::Drained {
+            guard = self
+                .barrier
+                .wait(guard)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    pub(crate) fn record_drain_failure(&self) {
+        self.drain_failed.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn drain_failed(&self) -> bool {
+        self.drain_failed.load(Ordering::Acquire)
+    }
+}
+
 /// 运行时共享的 remote wake 故障状态。
 ///
 /// 唤醒入口可能来自 raw `Waker`，因此不能依赖返回值把错误交给调用者。所有入口都把
@@ -214,16 +467,16 @@ pub(crate) struct WakeFailureState {
     first_error: Mutex<Option<RuntimeWakeError>>,
     failed: AtomicBool,
     error_count: AtomicU64,
-    shutdown: Arc<AtomicBool>,
+    coordinator: Weak<ShutdownCoordinator>,
 }
 
 impl WakeFailureState {
-    pub(crate) fn new(shutdown: Arc<AtomicBool>) -> Self {
+    pub(crate) fn new(coordinator: Weak<ShutdownCoordinator>) -> Self {
         Self {
             first_error: Mutex::new(None),
             failed: AtomicBool::new(false),
             error_count: AtomicU64::new(0),
-            shutdown,
+            coordinator,
         }
     }
 
@@ -235,7 +488,9 @@ impl WakeFailureState {
         }
         drop(first_error);
         self.failed.store(true, Ordering::Release);
-        self.shutdown.store(true, Ordering::Release);
+        if let Some(coordinator) = self.coordinator.upgrade() {
+            coordinator.request_shutdown();
+        }
     }
 
     pub(crate) fn first_error(&self) -> Option<RuntimeWakeError> {
@@ -377,6 +632,16 @@ impl UnparkerInner {
             // raw Waker ABI 无返回值；wake() 已保存共享 fatal 状态。
         }
     }
+
+    /// Shutdown notification must still reach a bound driver waker after a
+    /// wake failure has been recorded. Secondary shutdown wake failures are
+    /// intentionally not recursively recorded.
+    fn shutdown_wake(&self) {
+        self.signal.notify();
+        if let Some(waker) = self.waker.get() {
+            let _ = waker.wake();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -392,8 +657,7 @@ impl Default for Unparker {
 
 impl Unparker {
     pub fn new() -> Self {
-        let shutdown = Arc::new(AtomicBool::new(false));
-        Self::with_failure_state(Arc::new(WakeFailureState::new(shutdown)))
+        Self::with_failure_state(Arc::new(WakeFailureState::new(Weak::new())))
     }
 
     pub(crate) fn with_failure_state(failure: Arc<WakeFailureState>) -> Self {
@@ -417,6 +681,10 @@ impl Unparker {
 
     pub fn unpark(&self) -> Result<(), RuntimeWakeError> {
         self.inner.wake()
+    }
+
+    pub(crate) fn shutdown_wake(&self) {
+        self.inner.shutdown_wake();
     }
 
     /// 阻塞直到本 worker 被 unpark。运行时未安装 `park_hook` 时的默认 park 实现。
@@ -889,6 +1157,66 @@ mod tests {
         assert_eq!(waker.calls.load(Ordering::Relaxed), 1);
         assert_eq!(unparker.inner.failure.error_count(), 1);
         assert_eq!(unparker.inner.failure.first_error(), Some(first));
+    }
+
+    #[test]
+    fn shutdown_barriers_are_idempotent_and_ordered() {
+        let coordinator = ShutdownCoordinator::new(2);
+        coordinator.request_shutdown();
+        assert_eq!(coordinator.phase(), ShutdownPhase::StopRequested);
+
+        coordinator.arrive_quiescent(1);
+        coordinator.arrive_quiescent(1);
+        coordinator.arrive_quiescent(0);
+        coordinator.wait_for_quiescent();
+        assert_eq!(coordinator.phase(), ShutdownPhase::AllWorkersQuiescent);
+
+        coordinator.arrive_local_drained(0);
+        coordinator.arrive_local_drained(0);
+        coordinator.arrive_local_drained(1);
+        coordinator.wait_for_local_drained();
+
+        assert!(coordinator.begin_global_drain(0));
+        coordinator.finish_global_drain();
+        coordinator.wait_for_drained();
+        assert_eq!(coordinator.phase(), ShutdownPhase::Drained);
+    }
+
+    #[test]
+    fn unavailable_workers_close_both_barriers() {
+        let coordinator = ShutdownCoordinator::new(3);
+        coordinator.request_shutdown();
+        coordinator.mark_worker_unavailable(2);
+        coordinator.arrive_quiescent(0);
+        coordinator.arrive_quiescent(1);
+        coordinator.wait_for_quiescent();
+        assert_eq!(coordinator.phase(), ShutdownPhase::AllWorkersQuiescent);
+
+        coordinator.arrive_local_drained(0);
+        coordinator.arrive_local_drained(1);
+        coordinator.wait_for_local_drained();
+
+        assert!(coordinator.begin_global_drain(0));
+        assert!(!coordinator.begin_global_drain(0));
+        coordinator.finish_global_drain();
+        coordinator.wait_for_drained();
+    }
+
+    #[test]
+    fn shutdown_request_waits_for_publication_gate() {
+        let coordinator = Arc::new(ShutdownCoordinator::new(1));
+        let gate = coordinator.lock_publication();
+
+        scope(|threads| {
+            let coordinator_for_thread = coordinator.clone();
+            let handle = threads.spawn(move || coordinator_for_thread.request_shutdown());
+            std::thread::yield_now();
+            assert_eq!(coordinator.phase(), ShutdownPhase::Running);
+            drop(gate);
+            handle.join().expect("shutdown requester panicked");
+        });
+
+        assert_eq!(coordinator.phase(), ShutdownPhase::StopRequested);
     }
 
     #[test]

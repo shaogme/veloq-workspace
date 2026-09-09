@@ -12,6 +12,7 @@ use std::{
     any::Any,
     future::Future,
     marker::{PhantomData, PhantomPinned},
+    panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
     ptr::NonNull,
     sync::atomic::Ordering,
@@ -197,7 +198,7 @@ impl<S: ScopeStorage, O: Ownership> GenericScopeCompletion<S, O> {
         }
 
         for waker in ready {
-            waker.wake();
+            let _ = catch_unwind(AssertUnwindSafe(|| waker.wake()));
         }
     }
 

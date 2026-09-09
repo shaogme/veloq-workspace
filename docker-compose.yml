@@ -35,6 +35,8 @@ services:
       # Mount host source code
       - .:/workspace
       - /workspace/.git
+      - ./image/win2025-core-rust-gnu.qcow2:/workspace/image/win2025-core-rust-gnu.qcow2:ro
+      - ./image/win2025-core-rust-gnu.json:/workspace/image/win2025-core-rust-gnu.json:ro
       # Persist VM images, cloud-init seeds, and QEMU disks
       - qemu-data:/data/qemu
       # Isolate Rust build artifacts inside a dedicated named Docker volume (high-performance Linux ext4)

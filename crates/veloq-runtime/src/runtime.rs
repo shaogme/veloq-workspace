@@ -1,5 +1,12 @@
 use std::{
-    marker::PhantomData, num::NonZeroUsize, ops::AsyncFnOnce, pin::pin, ptr, sync::Mutex, thread,
+    marker::PhantomData,
+    num::NonZeroUsize,
+    ops::AsyncFnOnce,
+    panic::{AssertUnwindSafe, catch_unwind},
+    pin::pin,
+    ptr,
+    sync::Mutex,
+    thread,
 };
 
 use crate::{
@@ -70,6 +77,26 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
             }
         }
 
+        struct MainTlsCleanupGuard<'a, T> {
+            tls: &'a veloq_tls::Tls<RuntimeTlsInner>,
+            shared: &'a RuntimeShared<T>,
+            completed: bool,
+        }
+        impl<T> MainTlsCleanupGuard<'_, T> {
+            fn mark_completed(&mut self) {
+                self.completed = true;
+            }
+        }
+        impl<T> Drop for MainTlsCleanupGuard<'_, T> {
+            fn drop(&mut self) {
+                if !self.completed {
+                    self.shared.shutdown();
+                    self.shared.base.complete_shutdown(0);
+                }
+                let _ = self.tls.take();
+            }
+        }
+
         let shared_ref: &'rt RuntimeShared<T> = unsafe { &*ptr::from_ref(&self.shared) };
         let ctx = RuntimeCtx::new(shared_ref);
 
@@ -96,12 +123,21 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                     self.0.shutdown();
                 }
             }
-            let _guard = ShutdownGuard(shared_ref);
+            let shutdown_guard = ShutdownGuard(shared_ref);
+            let mut started_workers = vec![false; worker_count.get()];
+            // The calling thread is the worker-0 completion participant even before its TLS is
+            // installed; it can perform the final barrier and global drain on setup failures.
+            started_workers[0] = true;
 
             for worker_id in (1..worker_count.get()).rev() {
                 let deque = match deques.pop() {
                     Some(d) => d,
                     None => {
+                        shared_ref.shutdown();
+                        shared_ref.base.mark_workers_unavailable(
+                            (1..worker_count.get()).filter(|id| !started_workers[*id]),
+                        );
+                        shared_ref.base.complete_shutdown(0);
                         return RuntimeError::DequesExhausted { worker_id }.trans();
                     }
                 };
@@ -115,82 +151,126 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                     worker: deque,
                 };
 
-                scope
-                    .spawn(move || {
-                        let init_res = (|| {
-                            shared_ref.base.tls.set_owned(context).map_err(|source| {
-                                RuntimeError::TlsSetOwnedFailed {
-                                    worker_id,
-                                    source: source.kind(),
-                                }
-                            })?;
-                            shared_ref
-                                .extra_tls
-                                .set_owned(worker_factory_ref(worker_id, shared_ref))
-                                .map_err(|source| RuntimeError::TlsSetOwnedFailed {
-                                    worker_id,
-                                    source: source.kind(),
-                                })?;
-                            Ok(())
-                        })();
-
-                        // 该 worker 无法参与调度，必须叫停整个运行时并唤醒主线程：主线程
-                        // 可能正 park 着等一个再也不会到来的事件。还要放弃自己队列里的积压
-                        // 任务：它们再也不会被 poll，而某个作用域可能正在 join 它们（调度
-                        // 循环只在自己正常退出时才排空）。
-                        let report_fatal = |err| {
-                            let mut guard =
-                                thread_errors_ref.lock().unwrap_or_else(|e| e.into_inner());
-                            if guard.is_none() {
-                                *guard = Some(err);
+                if let Err(e) = scope.spawn(move || {
+                    let _tls_cleanup = TlsCleanupGuard(&shared_ref.base.tls);
+                    let _extra_cleanup = TlsCleanupGuard(&shared_ref.extra_tls);
+                    let init_res = catch_unwind(AssertUnwindSafe(|| {
+                        shared_ref.base.tls.set_owned(context).map_err(|source| {
+                            RuntimeError::TlsSetOwnedFailed {
+                                worker_id,
+                                source: source.kind(),
                             }
-                            drop(guard);
-                            shared_ref.shutdown();
-                            shared_ref.base.abandon_worker_backlog(worker_id);
-                            signal_ref.notify();
-                        };
-
-                        if let Err(err) = init_res {
-                            report_fatal(err);
-                            return;
+                        })?;
+                        shared_ref
+                            .extra_tls
+                            .set_owned(worker_factory_ref(worker_id, shared_ref))
+                            .map_err(|source| RuntimeError::TlsSetOwnedFailed {
+                                worker_id,
+                                source: source.kind(),
+                            })?;
+                        Ok(())
+                    }))
+                    .map_err(|_| {
+                        RuntimeError::InvariantViolation {
+                            site: "worker-initialization",
+                            detail: "worker factory panicked".into(),
                         }
-
-                        let _tls_cleanup = TlsCleanupGuard(&shared_ref.base.tls);
-                        let _extra_cleanup = TlsCleanupGuard(&shared_ref.extra_tls);
-
-                        if let Err(err) = shared_ref.run_worker() {
-                            report_fatal(err);
-                        }
+                        .to_report()
                     })
-                    .map_err(|e| RuntimeError::ThreadSpawnFailed { source: e })?;
+                    .and_then(|result| result);
+
+                    // 该 worker 无法参与调度，必须叫停整个运行时并唤醒主线程：主线程
+                    // 可能正 park 着等一个再也不会到来的事件。还要放弃自己队列里的积压
+                    // 任务：它们再也不会被 poll，而某个作用域可能正在 join 它们（调度
+                    // 循环只在自己正常退出时才排空）。
+                    let report_fatal = |err| {
+                        let mut guard = thread_errors_ref.lock().unwrap_or_else(|e| e.into_inner());
+                        if guard.is_none() {
+                            *guard = Some(err);
+                        }
+                        drop(guard);
+                        signal_ref.notify();
+                        shared_ref.shutdown();
+                        shared_ref.base.complete_shutdown(worker_id);
+                    };
+
+                    if let Err(err) = init_res {
+                        report_fatal(err);
+                        return;
+                    }
+
+                    match catch_unwind(AssertUnwindSafe(|| shared_ref.run_worker())) {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => report_fatal(err),
+                        Err(_) => report_fatal(
+                            RuntimeError::InvariantViolation {
+                                site: "worker-loop",
+                                detail: "worker loop panicked".into(),
+                            }
+                            .to_report(),
+                        ),
+                    }
+                }) {
+                    shared_ref.shutdown();
+                    shared_ref.base.mark_workers_unavailable(
+                        (1..worker_count.get()).filter(|id| !started_workers[*id]),
+                    );
+                    shared_ref.base.complete_shutdown(0);
+                    return RuntimeError::ThreadSpawnFailed { source: e }.trans();
+                }
+                started_workers[worker_id] = true;
             }
 
-            let deque0 = deques.pop().ok_or(RuntimeError::MainWorkerDequeExhausted)?;
+            let deque0 = match deques.pop() {
+                Some(deque) => deque,
+                None => {
+                    shared_ref.shutdown();
+                    shared_ref.base.mark_workers_unavailable(
+                        (1..worker_count.get()).filter(|id| !started_workers[*id]),
+                    );
+                    shared_ref.base.complete_shutdown(0);
+                    return RuntimeError::MainWorkerDequeExhausted.trans();
+                }
+            };
 
             let context = RuntimeTlsInner {
                 worker_id: 0,
                 rand: FastRand::new(0),
                 worker: deque0,
             };
-            shared_ref.base.tls.set_owned(context).map_err(|source| {
-                RuntimeError::TlsSetOwnedFailed {
+            let _tls_cleanup = TlsCleanupGuard(&shared_ref.base.tls);
+            let _extra_cleanup = TlsCleanupGuard(&shared_ref.extra_tls);
+            let mut main_cleanup = MainTlsCleanupGuard {
+                tls: &shared_ref.base.tls,
+                shared: shared_ref,
+                completed: false,
+            };
+
+            if let Err(source) = shared_ref.base.tls.set_owned(context) {
+                return RuntimeError::TlsSetOwnedFailed {
                     worker_id: 0,
                     source: source.kind(),
                 }
-                .to_report()
-            })?;
-            shared_ref
-                .extra_tls
-                .set_owned(worker_factory(0, shared_ref))
-                .map_err(|source| {
-                    RuntimeError::TlsSetOwnedFailed {
-                        worker_id: 0,
-                        source: source.kind(),
+                .trans();
+            }
+            let main_extra = match catch_unwind(AssertUnwindSafe(|| worker_factory(0, shared_ref)))
+            {
+                Ok(extra) => extra,
+                Err(_) => {
+                    return RuntimeError::InvariantViolation {
+                        site: "worker-initialization",
+                        detail: "worker factory panicked".into(),
                     }
-                    .to_report()
-                })?;
-            let _tls_cleanup = TlsCleanupGuard(&shared_ref.base.tls);
-            let _extra_cleanup = TlsCleanupGuard(&shared_ref.extra_tls);
+                    .trans();
+                }
+            };
+            if let Err(source) = shared_ref.extra_tls.set_owned(main_extra) {
+                return RuntimeError::TlsSetOwnedFailed {
+                    worker_id: 0,
+                    source: source.kind(),
+                }
+                .trans();
+            }
 
             if let Some(err) = thread_errors
                 .lock()
@@ -206,6 +286,12 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
             let mut controller = BlockOnController::new(fut.as_mut(), signal.clone());
             let loop_res = run_worker_loop(shared_ref, &mut controller);
 
+            // The main worker owns the final barrier and global drain whether
+            // the outer future completed normally or shutdown interrupted it.
+            shared_ref.shutdown();
+            shared_ref.base.complete_shutdown(0);
+            main_cleanup.mark_completed();
+
             // worker 线程的致命错误优先于循环自身的退出原因：循环正是被它触发的 shutdown
             // 叫停的。
             if let Some(err) = thread_errors
@@ -213,6 +299,9 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                 .unwrap_or_else(|e| e.into_inner())
                 .take()
             {
+                drop(controller);
+                drop(main_cleanup);
+                drop(shutdown_guard);
                 return Err(err);
             }
             loop_res?;

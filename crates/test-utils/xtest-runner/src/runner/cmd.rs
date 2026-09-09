@@ -139,3 +139,20 @@ pub fn command_output(command: &CommandSpec, workspace_root: &Path) -> Result<Ou
         .current_dir(workspace_root);
     Ok(process.output()?)
 }
+
+pub fn create_overlay_image(base_image: &Path, overlay_image: &Path) -> Result<(), RunnerError> {
+    let mut cmd = Command::new("qemu-img");
+    cmd.args(["create", "-f", "qcow2", "-b"]);
+    cmd.arg(base_image);
+    cmd.args(["-F", "qcow2"]);
+    cmd.arg(overlay_image);
+
+    let output = cmd.output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(RunnerError::CreateOverlayFailed {
+            code: output.status.code(),
+        })
+    }
+}

@@ -7,7 +7,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
     ptr::NonNull,
-    sync::{Arc, Mutex, atomic::Ordering},
+    sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -165,7 +165,7 @@ impl<'rt, T> RuntimeCtx<'rt, T> {
 
     /// Checks if the runtime is shutting down.
     pub(crate) fn is_shutdown(&self) -> bool {
-        self.shared().base.shutdown.load(Ordering::Acquire)
+        self.shared().base.shutdown.is_shutdown()
     }
 
     /// Returns the shared runtime state.

@@ -1,6 +1,7 @@
+use super::cmd::{create_overlay_image, print_output};
 use crate::RunnerError;
 use std::{
-    env, fs,
+    fs,
     io::{Error, ErrorKind},
     net::TcpListener,
     path::{Path, PathBuf},
@@ -11,7 +12,8 @@ use std::{
 
 #[derive(Debug, Clone)]
 pub struct WindowsVmConfig {
-    pub image_path: PathBuf,
+    pub base_image_path: PathBuf,
+    pub overlay_image_path: PathBuf,
     pub username: String,
     pub password: String,
     pub ssh_port: u16,
@@ -20,7 +22,8 @@ pub struct WindowsVmConfig {
 impl WindowsVmConfig {
     pub fn from_workspace(workspace_root: &Path) -> Result<Self, RunnerError> {
         let json_path = workspace_root.join("image/win2025-core-rust-gnu.json");
-        let mut image_path = workspace_root.join("image/win2025-core-rust-gnu.qcow2");
+        let mut base_image_path = workspace_root.join("image/win2025-core-rust-gnu.qcow2");
+        let mut overlay_image_path = None;
         let mut username = "Administrator".to_string();
         let mut password = "Admin1234!".to_string();
         let ssh_port = 22;
@@ -29,9 +32,17 @@ impl WindowsVmConfig {
             if let Some(path_str) = extract_json_string(&content, "path") {
                 let p = PathBuf::from(path_str);
                 if p.is_absolute() && p.exists() {
-                    image_path = p;
+                    base_image_path = p;
                 } else if workspace_root.join(&p).exists() {
-                    image_path = workspace_root.join(&p);
+                    base_image_path = workspace_root.join(&p);
+                }
+            }
+            if let Some(path_str) = extract_json_string(&content, "overlay_path") {
+                let p = PathBuf::from(path_str);
+                if p.is_absolute() {
+                    overlay_image_path = Some(p);
+                } else {
+                    overlay_image_path = Some(workspace_root.join(&p));
                 }
             }
             if let Some(u) = extract_json_string(&content, "username") {
@@ -42,18 +53,110 @@ impl WindowsVmConfig {
             }
         }
 
-        if !image_path.exists() {
+        if !base_image_path.exists() {
             return Err(RunnerError::WindowsImageNotFound(
-                image_path.display().to_string(),
+                base_image_path.display().to_string(),
             ));
         }
 
+        let overlay_image_path = overlay_image_path.unwrap_or_else(|| {
+            let file_stem = base_image_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("win2025-core-rust-gnu");
+            base_image_path.with_file_name(format!("{file_stem}-fetch.qcow2"))
+        });
+
         Ok(Self {
-            image_path,
+            base_image_path,
+            overlay_image_path,
             username,
             password,
             ssh_port,
         })
+    }
+
+    pub fn ensure_overlay_image(
+        &self,
+        workspace_root: &Path,
+        quiet: bool,
+    ) -> Result<(), RunnerError> {
+        if self.overlay_image_path.exists() {
+            return Ok(());
+        }
+
+        if !quiet {
+            eprintln!(
+                "[xtest-runner] 差分镜像不存在，准备创建差分镜像: {}",
+                self.overlay_image_path.display()
+            );
+            eprintln!(
+                "[xtest-runner] 基础镜像路径: {}",
+                self.base_image_path.display()
+            );
+        }
+
+        if let Some(parent) = self.overlay_image_path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::remove_file(&self.overlay_image_path);
+
+        if !quiet {
+            eprintln!("[xtest-runner] 正在执行 qemu-img create 创建差分镜像...");
+        }
+        create_overlay_image(&self.base_image_path, &self.overlay_image_path)?;
+
+        let build_res = (|| -> Result<(), RunnerError> {
+            if !quiet {
+                eprintln!("[xtest-runner] 正在启动 QEMU 虚拟机（写模式）以执行 cargo fetch...");
+            }
+            let vm = QemuInstance::start(self.clone(), false)?;
+
+            if !quiet {
+                eprintln!("[xtest-runner] 等待 Windows 虚拟机 SSH 就绪...");
+            }
+            vm.wait_for_ssh()?;
+
+            if !quiet {
+                eprintln!("[xtest-runner] 正在同步工作区代码至 Windows 虚拟机...");
+            }
+            vm.sync_workspace(workspace_root)?;
+
+            if !quiet {
+                eprintln!("[xtest-runner] 正在虚拟机内执行 cargo fetch --locked...");
+            }
+            let fetch_output = vm.run_powershell("cargo fetch --locked", quiet)?;
+            if !fetch_output.status.success() {
+                if quiet {
+                    print_output(&fetch_output);
+                }
+                return Err(RunnerError::CargoFetchFailed {
+                    code: fetch_output.status.code(),
+                });
+            }
+
+            if !quiet {
+                eprintln!("[xtest-runner] 正在关闭虚拟机以保存差分镜像...");
+            }
+            vm.shutdown_and_wait(Duration::from_secs(120))?;
+
+            Ok(())
+        })();
+
+        if let Err(err) = build_res {
+            eprintln!("[xtest-runner] 差分镜像制作失败，清理未完成的镜像文件...");
+            let _ = fs::remove_file(&self.overlay_image_path);
+            return Err(err);
+        }
+
+        if !quiet {
+            eprintln!(
+                "[xtest-runner] 差分镜像制作完成: {}",
+                self.overlay_image_path.display()
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -88,7 +191,7 @@ impl Drop for QemuInstance {
 }
 
 impl QemuInstance {
-    pub fn start(config: WindowsVmConfig) -> Result<Self, RunnerError> {
+    pub fn start(config: WindowsVmConfig, snapshot: bool) -> Result<Self, RunnerError> {
         let host_port = allocate_free_port().map_err(RunnerError::Io)?;
         let mut cmd = Command::new("qemu-system-x86_64");
 
@@ -105,7 +208,7 @@ impl QemuInstance {
             "-drive",
             &format!(
                 "file={},format=qcow2,if=virtio",
-                config.image_path.display()
+                config.overlay_image_path.display()
             ),
         ]);
         cmd.args([
@@ -113,7 +216,9 @@ impl QemuInstance {
             &format!("user,id=net0,hostfwd=tcp::{host_port}-:{}", config.ssh_port),
         ]);
         cmd.args(["-device", "virtio-net-pci,netdev=net0"]);
-        cmd.arg("-snapshot");
+        if snapshot {
+            cmd.arg("-snapshot");
+        }
         cmd.args(["-display", "none"]);
 
         cmd.stdout(Stdio::null());
@@ -216,21 +321,9 @@ impl QemuInstance {
         Ok(())
     }
 
-    pub fn run_in_vm(&self, forward_args: &[String], quiet: bool) -> Result<Output, RunnerError> {
-        let escaped_args = forward_args
-            .iter()
-            .map(|arg| {
-                if arg.contains(' ') {
-                    format!("\"{arg}\"")
-                } else {
-                    arg.clone()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-
+    pub fn run_powershell(&self, command: &str, quiet: bool) -> Result<Output, RunnerError> {
         let vm_cmd = format!(
-            "powershell -Command \"Set-Location C:\\workspace; cargo run -q -p xtest-runner -- {escaped_args}\""
+            "powershell -Command \"Set-Location C:\\workspace; {command}; exit $LASTEXITCODE\""
         );
 
         let mut cmd = Command::new("sshpass");
@@ -242,6 +335,8 @@ impl QemuInstance {
             "StrictHostKeyChecking=no",
             "-o",
             "UserKnownHostsFile=/dev/null",
+            "-o",
+            "ConnectTimeout=2",
             "-o",
             "LogLevel=ERROR",
             "-p",
@@ -261,22 +356,56 @@ impl QemuInstance {
             })
         }
     }
-}
 
-pub fn ensure_devbox_path(workspace_root: &Path) {
-    let devbox_bin = workspace_root.join(".devbox/nix/profile/default/bin");
-    if devbox_bin.exists()
-        && let Some(current_path) = env::var_os("PATH")
-    {
-        let mut paths = env::split_paths(&current_path).collect::<Vec<_>>();
-        if !paths.iter().any(|p| p == &devbox_bin) {
-            paths.insert(0, devbox_bin);
-            if let Ok(new_path) = env::join_paths(paths) {
-                // SAFETY: In single-threaded runner setup before spawning threads.
-                unsafe {
-                    env::set_var("PATH", new_path);
+    pub fn run_in_vm(&self, forward_args: &[String], quiet: bool) -> Result<Output, RunnerError> {
+        let escaped_args = forward_args
+            .iter()
+            .map(|arg| {
+                if arg.contains(' ') {
+                    format!("\"{arg}\"")
+                } else {
+                    arg.clone()
                 }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let inner_cmd = format!("cargo run -q -p xtest-runner -- {escaped_args}");
+        self.run_powershell(&inner_cmd, quiet)
+    }
+
+    pub fn shutdown_and_wait(mut self, timeout: Duration) -> Result<(), RunnerError> {
+        let mut cmd = Command::new("sshpass");
+        cmd.args([
+            "-p",
+            &self.config.password,
+            "ssh",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "ConnectTimeout=5",
+            "-o",
+            "LogLevel=ERROR",
+            "-p",
+            &self.host_port.to_string(),
+            &format!("{}@127.0.0.1", self.config.username),
+            "shutdown /s /t 0",
+        ]);
+        let _ = cmd.status();
+
+        let start = Instant::now();
+        let poll_interval = Duration::from_millis(500);
+        while start.elapsed() < timeout {
+            if let Ok(Some(_)) = self.child.try_wait() {
+                return Ok(());
             }
+            sleep(poll_interval);
         }
+
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        Err(RunnerError::VmShutdownTimeout)
     }
 }

@@ -1,6 +1,7 @@
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_queue::ArrayQueue;
 use std::{
+    panic::{AssertUnwindSafe, catch_unwind},
     result::Result as StdResult,
     sync::Arc,
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -12,7 +13,7 @@ use crate::{
     error::{Result, RuntimeWakeError},
     runtime::{
         context::{IdleDecision, IdleWaitStrategy},
-        primitives::{EventCount, Unparker, WakeFailureState},
+        primitives::{EventCount, ShutdownCoordinator, Unparker, WakeFailureState},
         shared::{RuntimeShared, worker_loop::LoopController},
     },
     task::{LocalTaskRef, SendTaskRef, TaskHeader},
@@ -278,7 +279,7 @@ pub(crate) struct WorkerRegistry {
     pub(crate) workers: Box<[WorkerQueue]>,
     pub(crate) unparkers: Box<[Unparker]>,
     pub(crate) wake_failure: Arc<WakeFailureState>,
-    pub(crate) shutdown: Arc<AtomicBool>,
+    pub(crate) shutdown: Arc<ShutdownCoordinator>,
 }
 
 impl WorkerRegistry {
@@ -320,12 +321,14 @@ impl TopologyContext {
 
 pub(crate) struct GlobalInjector {
     queue: Injector<SendTaskRef>,
+    drained: AtomicBool,
 }
 
 impl GlobalInjector {
     pub(crate) fn new() -> Self {
         Self {
             queue: Injector::new(),
+            drained: AtomicBool::new(false),
         }
     }
 
@@ -343,11 +346,29 @@ impl GlobalInjector {
         }
     }
 
-    /// Drain all task references still owned by the global injector.
-    pub(crate) fn drain(&self, mut f: impl FnMut(SendTaskRef)) {
-        while let Some(task) = self.pop() {
-            f(task);
+    /// Drain all task references still owned by the global injector exactly once.
+    ///
+    /// A panic from a task finalization callback is contained long enough to
+    /// process the rest of the injector. The caller records the diagnostic and
+    /// completes the shutdown phase after this method returns.
+    pub(crate) fn drain_once(&self, mut f: impl FnMut(SendTaskRef)) -> (usize, bool) {
+        if self.drained.swap(true, Ordering::AcqRel) {
+            return (0, false);
         }
+
+        let mut drained = 0;
+        let mut panicked = false;
+        while let Some(task) = self.pop() {
+            drained += 1;
+            if catch_unwind(AssertUnwindSafe(|| f(task))).is_err() {
+                panicked = true;
+            }
+        }
+        (drained, panicked)
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.queue.is_empty()
     }
 }
 
@@ -540,7 +561,7 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
         let base = &self.shared.base;
         base.idle.event_count.load() != seq
             || self.shared.has_work(self.worker_id)
-            || base.shutdown.load(Ordering::Acquire)
+            || base.shutdown.is_shutdown()
             || controller.is_ready()
     }
 

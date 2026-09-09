@@ -14,7 +14,7 @@ use cmd::{
     command_output, command_status, command_works, docker_compose_variant, print_output,
     workspace_root,
 };
-use qemu::{QemuInstance, WindowsVmConfig, ensure_devbox_path};
+use qemu::{QemuInstance, WindowsVmConfig};
 
 #[derive(Clone, Copy, Debug)]
 pub enum RunMode {
@@ -231,10 +231,12 @@ impl Runner {
 
     fn prepare_environment(&self) -> Result<(), Report<RunnerError>> {
         if matches!(self.mode, RunMode::WindowsOnLinux) {
-            ensure_devbox_path(&self.workspace_root);
-
             if !command_works("qemu-system-x86_64", &["--version"], &self.workspace_root) {
                 return Err(RunnerError::QemuNotFound.trans());
+            }
+
+            if !command_works("qemu-img", &["--version"], &self.workspace_root) {
+                return Err(RunnerError::QemuImgNotFound.trans());
             }
 
             if !command_works("ssh", &["-V"], &self.workspace_root)
@@ -251,11 +253,12 @@ impl Runner {
 
     fn run_windows_on_linux(&self) -> Result<(), Report<RunnerError>> {
         let vm_config = WindowsVmConfig::from_workspace(&self.workspace_root)?;
+        vm_config.ensure_overlay_image(&self.workspace_root, self.config.quiet)?;
 
         if !self.config.quiet {
-            eprintln!("[xtest-runner] 正在启动 QEMU Windows 虚拟机...");
+            eprintln!("[xtest-runner] 正在启动 QEMU Windows 虚拟机 (snapshot 模式)...");
         }
-        let vm = QemuInstance::start(vm_config)?;
+        let vm = QemuInstance::start(vm_config, true)?;
 
         if !self.config.quiet {
             eprintln!("[xtest-runner] 等待 Windows 虚拟机 SSH 就绪...");
