@@ -1,19 +1,15 @@
 use veloq_std::{
     boxed::Box,
     marker::PhantomData,
-    mem::take,
     ptr::{NonNull, null_mut},
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicPtr, AtomicUsize, Ordering},
     },
-    task::Waker,
-    vec::Vec,
 };
 
 use crate::{
-    StateLock, StateOptionArc, StateOptionBox, StateWakerQueue, Storage, StrategyType,
-    ThreadSafeStorage, sealed,
+    StateLock, StateOptionArc, StateOptionBox, Storage, StrategyType, ThreadSafeStorage, sealed,
 };
 
 pub struct AtomicStorage;
@@ -28,7 +24,6 @@ impl Storage for AtomicStorage {
     type OptionPtr<T> = AtomicOptionPtr<T>;
     type NonNullPtr<T> = AtomicNonNullPtr<T>;
     type Lock<T> = AtomicLock<T>;
-    type WakerQueue = AtomicWakerQueue;
     type OptionBox<T: Send> = AtomicOptionBox<T>;
     type OptionFatBox<T: ?Sized + Send> = AtomicOptionFatBox<T>;
     type OptionArc<T: Send + Sync> = AtomicOptionArc<T>;
@@ -50,26 +45,6 @@ impl<T> StateLock<T> for AtomicLock<T> {
 }
 unsafe impl<T> Send for AtomicLock<T> {}
 unsafe impl<T> Sync for AtomicLock<T> {}
-
-pub struct AtomicWakerQueue(Mutex<Vec<Waker>>);
-impl StateWakerQueue for AtomicWakerQueue {
-    fn new() -> Self {
-        Self(Mutex::new(Vec::new()))
-    }
-
-    fn register(&self, waker: &Waker) {
-        let mut wakers = self.0.lock();
-        if !wakers.iter().any(|registered| registered.will_wake(waker)) {
-            wakers.push(waker.clone());
-        }
-    }
-
-    fn take_all(&self) -> Vec<Waker> {
-        take(&mut *self.0.lock())
-    }
-}
-unsafe impl Send for AtomicWakerQueue {}
-unsafe impl Sync for AtomicWakerQueue {}
 
 impl_state_int!(
     AtomicUsize, self, order, val, curr, new, success, failure,

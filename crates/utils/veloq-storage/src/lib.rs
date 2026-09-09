@@ -9,11 +9,9 @@ mod transfer;
 
 pub use atomic::{
     AtomicLock, AtomicNonNullPtr, AtomicOptionArc, AtomicOptionBox, AtomicOptionPtr, AtomicStorage,
-    AtomicWakerQueue, GenericAtomicOption, PointerStrategy,
+    GenericAtomicOption, PointerStrategy,
 };
-pub use local::{
-    LocalLock, LocalStorage, LocalWakerQueue, NonNullPtr, OptionArc, OptionBox, OptionPtr, Usize,
-};
+pub use local::{LocalLock, LocalStorage, NonNullPtr, OptionArc, OptionBox, OptionPtr, Usize};
 pub use transfer::StaticTransfer;
 
 use veloq_std::{
@@ -21,8 +19,6 @@ use veloq_std::{
     ops::DerefMut,
     ptr::NonNull,
     sync::{Arc, atomic::Ordering},
-    task::Waker,
-    vec::Vec,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -41,7 +37,6 @@ pub trait Storage: 'static {
     type OptionPtr<T>: StateOptionPtr<T>;
     type NonNullPtr<T>: StateNonNullPtr<T>;
     type Lock<T>: StateLock<T>;
-    type WakerQueue: StateWakerQueue;
     type OptionBox<T: Send>: StateOptionBox<T>;
     type OptionFatBox<T: ?Sized + Send>: StateOptionBox<T>;
     type OptionArc<T: Send + Sync>: StateOptionArc<T>;
@@ -131,12 +126,6 @@ pub trait StateLock<T> {
         T: 'a;
     fn new(val: T) -> Self;
     fn lock(&self) -> Self::Guard<'_>;
-}
-
-pub trait StateWakerQueue: 'static {
-    fn new() -> Self;
-    fn register(&self, waker: &Waker);
-    fn take_all(&self) -> Vec<Waker>;
 }
 
 pub trait StateOptionBox<T: ?Sized + Send> {

@@ -1,20 +1,8 @@
 use std::{
-    ptr::{NonNull, null},
+    ptr::NonNull,
     sync::{Arc, atomic::Ordering},
-    task::{RawWaker, RawWakerVTable, Waker},
 };
 use veloq_storage::*;
-
-unsafe fn dummy_clone(ptr: *const ()) -> RawWaker {
-    RawWaker::new(ptr, &DUMMY_VTABLE)
-}
-
-static DUMMY_VTABLE: RawWakerVTable = RawWakerVTable::new(dummy_clone, |_| {}, |_| {}, |_| {});
-
-fn create_dummy_waker() -> Waker {
-    let raw_waker = RawWaker::new(null(), &DUMMY_VTABLE);
-    unsafe { Waker::from_raw(raw_waker) }
-}
 
 #[test]
 fn test_strategy_type() {
@@ -226,32 +214,6 @@ fn test_state_lock_local() {
         let guard = lock.lock();
         assert_eq!(*guard, 20);
     }
-}
-
-#[test]
-fn test_state_waker_queue_atomic() {
-    let queue = <AtomicStorage as Storage>::WakerQueue::new();
-    let waker = create_dummy_waker();
-
-    queue.register(&waker);
-    let wakers = queue.take_all();
-    assert_eq!(wakers.len(), 1);
-
-    let wakers_empty = queue.take_all();
-    assert_eq!(wakers_empty.len(), 0);
-}
-
-#[test]
-fn test_state_waker_queue_local() {
-    let queue = <LocalStorage as Storage>::WakerQueue::new();
-    let waker = create_dummy_waker();
-
-    queue.register(&waker);
-    let wakers = queue.take_all();
-    assert_eq!(wakers.len(), 1);
-
-    let wakers_empty = queue.take_all();
-    assert_eq!(wakers_empty.len(), 0);
 }
 
 #[test]

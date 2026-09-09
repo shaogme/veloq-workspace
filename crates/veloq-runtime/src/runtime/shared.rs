@@ -972,7 +972,7 @@ mod tests {
     use super::*;
     use crate::{
         scope::GenericScopeCompletion,
-        task::{GenericWakerNode, RawScope, ScopeRef, TaskVTable},
+        task::{GenericWakerNode, ScopeRef, TaskVTable},
         utils::ownership::ArcOwnership,
     };
     use std::{
@@ -1023,8 +1023,7 @@ mod tests {
         let completion = GenericScopeCompletion::<AtomicStorage, ArcOwnership>::new(None);
         completion.register_task();
 
-        let scope_ptr = unsafe { RawScope::clone_raw(completion.as_ref()) };
-        let scope = unsafe { ScopeRef::<AtomicStorage>::new(scope_ptr) };
+        let scope = ScopeRef::from_shared::<ArcOwnership>(&completion);
         let header = GenericTaskHeader::new_placeholder(&DROP_AFTER_POLL_VTABLE);
         unsafe { header.initialize(&shared.base, 0, scope) };
         header.claim_scope_obligation();
@@ -1048,8 +1047,7 @@ mod tests {
         let completion = GenericScopeCompletion::<AtomicStorage, ArcOwnership>::new(None);
         completion.register_task();
 
-        let scope_ptr = unsafe { RawScope::clone_raw(completion.as_ref()) };
-        let scope = unsafe { ScopeRef::<AtomicStorage>::new(scope_ptr) };
+        let scope = ScopeRef::from_shared::<ArcOwnership>(&completion);
         let header = GenericTaskHeader::new_placeholder(&DROP_AFTER_POLL_VTABLE);
         unsafe { header.initialize(&shared.base, 0, scope) };
         header.claim_scope_obligation();

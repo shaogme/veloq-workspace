@@ -103,7 +103,7 @@ veloq (面向用户的门面：fs / net / time / io / runtime)
 
 ### Send / Local 双形态 + Storage 策略泛型
 
-跨线程与线程内两套实现不是复制粘贴，而是对 `veloq-storage` 的 `Storage` trait 做泛型：`AtomicStorage`（原子，`ThreadSafeStorage`）与 `LocalStorage`（`Cell` 系，`LocalOnlyStorage`）提供同名的 `Usize / OptionPtr / Lock / WakerQueue / OptionBox / OptionArc` 关联类型。于是 `GenericTaskHeader<S>` 特化出 `TaskHeader` / `LocalTaskHeader`，`GenericScopeCompletion` 特化出 send/local 版本。写新的运行时内部结构时沿用这个模式，而不是新开一条并行实现。
+跨线程与线程内两套实现不是复制粘贴，而是对 `veloq-storage` 的 `Storage` trait 做泛型：`AtomicStorage`（原子，`ThreadSafeStorage`）与 `LocalStorage`（`Cell` 系，`LocalOnlyStorage`）提供同名的 `Usize / OptionPtr / Lock / OptionBox / OptionArc` 关联类型。于是 `GenericTaskHeader<S>` 特化出 `TaskHeader` / `LocalTaskHeader`，`GenericScopeCompletion` 特化出 send/local 版本。写新的运行时内部结构时沿用这个模式，而不是新开一条并行实现。
 
 对应地，通道也分两套：`veloq-sync`（跨线程，`no_std` + Loom 可验证）与 `veloq-local`（线程内 `Rc`/`RefCell`，零原子）。
 

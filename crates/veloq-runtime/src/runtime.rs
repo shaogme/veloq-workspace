@@ -15,13 +15,14 @@ use crate::{
 };
 use diagweave::prelude::*;
 
+pub mod cancellation;
 pub mod context;
 pub mod primitives;
 pub mod shared;
 
+pub use cancellation::GenericCancellationToken;
 pub use context::{IdleDecision, IdleWaitStrategy, IntoRuntimeCtx, RuntimeCtx, current_scope};
 pub(crate) use context::{IdleHook, RuntimeTlsInner, WorkerTickHook};
-pub use primitives::GenericCancellationToken;
 pub use shared::{EnqueuePinnedOutcome, ParkHook, RuntimeShared, RuntimeSharedBase};
 
 use primitives::BlockOnSignal;

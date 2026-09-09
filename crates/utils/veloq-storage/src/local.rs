@@ -2,17 +2,13 @@ use veloq_std::{
     boxed::Box,
     cell::{Cell, RefCell, RefMut},
     marker::PhantomData,
-    mem::take,
     ptr::{NonNull, null_mut},
     rc::Rc,
     sync::{Arc, atomic::Ordering},
-    task::Waker,
-    vec::Vec,
 };
 
 use crate::{
-    LocalOnlyStorage, StateLock, StateOptionArc, StateOptionBox, StateWakerQueue, Storage,
-    StrategyType, sealed,
+    LocalOnlyStorage, StateLock, StateOptionArc, StateOptionBox, Storage, StrategyType, sealed,
 };
 
 pub struct LocalStorage(PhantomData<Rc<()>>);
@@ -27,7 +23,6 @@ impl Storage for LocalStorage {
     type OptionPtr<T> = OptionPtr<T>;
     type NonNullPtr<T> = NonNullPtr<T>;
     type Lock<T> = LocalLock<T>;
-    type WakerQueue = LocalWakerQueue;
     type OptionBox<T: Send> = OptionBox<T>;
     type OptionFatBox<T: ?Sized + Send> = OptionBox<T>;
     type OptionArc<T: Send + Sync> = OptionArc<T>;
@@ -45,24 +40,6 @@ impl<T> StateLock<T> for LocalLock<T> {
     }
     fn lock(&self) -> Self::Guard<'_> {
         self.0.borrow_mut()
-    }
-}
-
-pub struct LocalWakerQueue(RefCell<Vec<Waker>>);
-impl StateWakerQueue for LocalWakerQueue {
-    fn new() -> Self {
-        Self(RefCell::new(Vec::new()))
-    }
-
-    fn register(&self, waker: &Waker) {
-        let mut wakers = self.0.borrow_mut();
-        if !wakers.iter().any(|registered| registered.will_wake(waker)) {
-            wakers.push(waker.clone());
-        }
-    }
-
-    fn take_all(&self) -> Vec<Waker> {
-        take(&mut *self.0.borrow_mut())
     }
 }
 

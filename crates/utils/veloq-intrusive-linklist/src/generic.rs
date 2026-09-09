@@ -89,7 +89,23 @@ impl<A: GenericAdapter<L>, L: LinkNode> GenericLinkedList<A, L> {
     pub unsafe fn push_back(&mut self, value: Pin<&mut A::Value>) {
         unsafe {
             let raw_val = value.get_unchecked_mut();
-            let link_ptr = self.adapter.get_link(NonNull::from(raw_val));
+            self.push_back_ptr(NonNull::from(raw_val));
+        }
+    }
+
+    /// 将一个由调用者保证有效且地址稳定的节点指针添加到尾部。
+    ///
+    /// 这个入口用于节点由外层锁和内部可变性保护、调用方只有共享引用的场景。
+    /// 相比从共享引用强行构造 `&mut`，它不会制造违反别名规则的临时可变引用。
+    ///
+    /// # Safety
+    ///
+    /// `value` 必须指向有效节点，且在链表持有期间保持地址稳定；调用者还必须保证
+    /// `self` 是该链表的唯一可变访问。
+    #[inline]
+    pub unsafe fn push_back_ptr(&mut self, value: NonNull<A::Value>) {
+        unsafe {
+            let link_ptr = self.adapter.get_link(value);
             let link = link_ptr.as_ref();
 
             if link.is_linked() {
@@ -146,6 +162,20 @@ impl<A: GenericAdapter<L>, L: LinkNode> GenericLinkedList<A, L> {
     /// 从头部移除节点
     #[inline]
     pub fn pop_front(&mut self) -> Option<Pin<&mut A::Value>> {
+        let val_ptr = unsafe { self.pop_front_ptr()? };
+        unsafe { Some(Pin::new_unchecked(&mut *val_ptr.as_ptr())) }
+    }
+
+    /// 从头部移除节点并返回原始指针。
+    ///
+    /// 这个入口用于外层锁保护的内部可变节点。它不会为被移除的值构造临时 `&mut`，
+    /// 因此调用方可以在只有共享节点引用时安全地完成摘链。
+    ///
+    /// # Safety
+    ///
+    /// 调用者必须保证链表和头部节点在操作期间有效，并独占访问链表。
+    #[inline]
+    pub unsafe fn pop_front_ptr(&mut self) -> Option<NonNull<A::Value>> {
         unsafe {
             let head = self.head?;
             let head_link = head.as_ref();
@@ -163,7 +193,7 @@ impl<A: GenericAdapter<L>, L: LinkNode> GenericLinkedList<A, L> {
             head_link.unsafe_unlink();
 
             let val_ptr = self.adapter.get_value(head);
-            Some(Pin::new_unchecked(&mut *val_ptr.as_ptr()))
+            Some(val_ptr)
         }
     }
 
@@ -359,6 +389,17 @@ impl<'a, A: GenericAdapter<L>, L: LinkNode> GenericCursorMut<'a, A, L> {
     /// 返回被移除的元素。
     #[inline]
     pub fn remove(&mut self) -> Option<Pin<&mut A::Value>> {
+        let val_ptr = unsafe { self.remove_ptr()? };
+        unsafe { Some(Pin::new_unchecked(&mut *val_ptr.as_ptr())) }
+    }
+
+    /// 移除当前指向的元素并返回原始指针。
+    ///
+    /// # Safety
+    ///
+    /// 调用者必须保证游标指向当前链表中的有效节点，并独占访问链表。
+    #[inline]
+    pub unsafe fn remove_ptr(&mut self) -> Option<NonNull<A::Value>> {
         let current_link_ptr = self.current?;
 
         unsafe {
@@ -384,7 +425,7 @@ impl<'a, A: GenericAdapter<L>, L: LinkNode> GenericCursorMut<'a, A, L> {
             current_link.unsafe_unlink();
 
             let val_ptr = self.list.adapter.get_value(current_link_ptr);
-            Some(Pin::new_unchecked(&mut *val_ptr.as_ptr()))
+            Some(val_ptr)
         }
     }
 

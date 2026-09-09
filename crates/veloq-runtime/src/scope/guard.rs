@@ -24,10 +24,6 @@ impl<S: ScopeStorage, O: Ownership> ScopeTaskGuard<S, O> {
         &self.completion
     }
 
-    pub(crate) fn completion_ref(&self) -> &GenericScopeCompletion<S, O> {
-        &self.completion
-    }
-
     pub(crate) fn is_armed(&self) -> bool {
         self.armed
     }

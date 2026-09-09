@@ -1,8 +1,11 @@
 use crate::{
     error::{Result, RuntimeError},
-    runtime::{EnqueuePinnedOutcome, RuntimeSharedBase, primitives::CancelWaiterLinkResult},
+    runtime::{
+        EnqueuePinnedOutcome, RuntimeSharedBase,
+        cancellation::{AncestorRegistration, CancelWaiterLinkResult},
+    },
     task::{
-        LocalWakeHeaderGuard, RawScope, ScopeCancelWaiter, ScopeRef, SendTaskRef, TaskHandleRef,
+        CancellationWaiter, LocalWakeHeaderGuard, RawScope, ScopeRef, SendTaskRef, TaskHandleRef,
         TaskWakeToken, nodes::TaskStorage,
     },
 };
@@ -16,6 +19,7 @@ use std::{
     ptr::{self, NonNull},
     sync::{Arc, atomic::Ordering},
     task::{RawWaker, RawWakerVTable, Waker},
+    vec::Vec,
 };
 use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 use veloq_storage::{
@@ -71,7 +75,9 @@ pub struct GenericTaskHeader<S: Storage> {
     cached_waker: UnsafeCell<Option<Waker>>,
     scope: UnsafeCell<ScopeRef<S>>,
     /// 本任务在所属 scope 取消队列中的等待节点；由 scope 的取消令牌锁保护。
-    cancel_waiter: ScopeCancelWaiter,
+    cancel_waiter: CancellationWaiter,
+    /// 跨 scope parent 的取消等待节点；每个节点地址在入链期间保持稳定。
+    cancel_ancestors: UnsafeCell<Vec<AncestorRegistration>>,
     runtime: UnsafeCell<Option<NonNull<RuntimeSharedBase>>>,
     worker_id: S::Usize,
     vtable: &'static TaskVTable<S>,
@@ -102,7 +108,8 @@ impl<S: Storage> GenericTaskHeader<S> {
             wake_token: Arc::new(TaskWakeToken::new()),
             cached_waker: UnsafeCell::new(None),
             scope: UnsafeCell::new(ScopeRef::dummy()),
-            cancel_waiter: ScopeCancelWaiter::new(),
+            cancel_waiter: CancellationWaiter::new(),
+            cancel_ancestors: UnsafeCell::new(Vec::new()),
             runtime: UnsafeCell::new(None),
             worker_id: S::Usize::new(0),
             vtable,
@@ -202,7 +209,21 @@ impl<S: Storage> GenericTaskHeader<S> {
                 .link_cancel_waiter(waiter, waker)
         };
         match result {
-            CancelWaiterLinkResult::Linked => true,
+            CancelWaiterLinkResult::Linked => {
+                let scope = self.scope_completion_ref();
+                let parent_chain = scope.cancel_parent_chain();
+                let ancestors = unsafe { &mut *self.cancel_ancestors.get() };
+                if ancestors.is_empty() {
+                    ancestors.extend(parent_chain.into_iter().map(AncestorRegistration::new));
+                }
+                for ancestor in ancestors.iter() {
+                    if ancestor.link(waker) == CancelWaiterLinkResult::RejectedByCancellation {
+                        self.disarm_scope_cancel_waiter();
+                        return false;
+                    }
+                }
+                true
+            }
             CancelWaiterLinkResult::RejectedByCancellation => {
                 self.disarm_scope_cancel_waiter();
                 false
@@ -216,7 +237,13 @@ impl<S: Storage> GenericTaskHeader<S> {
             return;
         }
         let waiter = NonNull::from(&self.cancel_waiter);
-        unsafe { self.scope_completion_ref().unlink_cancel_waiter(waiter) };
+        let scope = self.scope_completion_ref();
+        unsafe { scope.unlink_cancel_waiter(waiter) };
+        let ancestors = unsafe { &mut *self.cancel_ancestors.get() };
+        for ancestor in ancestors.iter().rev() {
+            ancestor.unlink();
+        }
+        ancestors.clear();
         self.state.fetch_and(!STATE_CANCEL_ARMED, Ordering::AcqRel);
     }
 
@@ -917,10 +944,10 @@ mod tests {
     #[cfg(not(feature = "loom"))]
     fn header_with_scope_cancelled() -> GenericTaskHeader<AtomicStorage> {
         let completion = GenericScopeCompletion::<AtomicStorage, ArcOwnership>::new(None);
-        let scope_ptr = unsafe { RawScope::clone_raw(completion.as_ref()) };
+        let scope_ptr = ScopeRef::from_shared::<ArcOwnership>(&completion);
         let header = GenericTaskHeader::<AtomicStorage>::new_placeholder(&TEST_VTABLE);
         unsafe {
-            *header.scope.get() = ScopeRef::new(scope_ptr);
+            *header.scope.get() = scope_ptr;
         }
         completion.cancel();
         header
@@ -940,10 +967,10 @@ mod tests {
     #[test]
     fn scope_waiter_disarm_is_idempotent_after_registration() {
         let completion = GenericScopeCompletion::<AtomicStorage, ArcOwnership>::new(None);
-        let scope_ptr = unsafe { RawScope::clone_raw(completion.as_ref()) };
+        let scope_ptr = ScopeRef::from_shared::<ArcOwnership>(&completion);
         let header = GenericTaskHeader::<AtomicStorage>::new_placeholder(&TEST_VTABLE);
         unsafe {
-            *header.scope.get() = ScopeRef::new(scope_ptr);
+            *header.scope.get() = scope_ptr;
         }
 
         assert!(header.arm_scope_cancel_waiter(Waker::noop()));

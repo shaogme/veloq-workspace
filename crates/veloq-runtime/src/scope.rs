@@ -1,10 +1,10 @@
 use crate::{
     error::{Result, RuntimeError},
-    runtime::{RuntimeCtx, RuntimeShared, primitives::GenericCancellationToken},
+    runtime::{RuntimeCtx, RuntimeShared, cancellation::GenericCancellationToken},
     task::{
         AnyScopeRef, Arena, ArenaAllocation, ErasedCancellationToken, GenericArena,
-        GenericTaskNode, LocalTask, LocalTaskRef, RawScope, RawTask, ScopeRef, ScopeStorage,
-        SendTask, SendTaskRef, Task, TaskBounds, TaskError, TaskHandleRef, TaskStorage,
+        GenericTaskNode, LocalTask, LocalTaskRef, RawTask, ScopeRef, ScopeStorage, SendTask,
+        SendTaskRef, Task, TaskBounds, TaskError, TaskHandleRef, TaskStorage,
     },
     utils::ownership::{ArcOwnership, Ownership, RcOwnership},
 };
@@ -234,10 +234,7 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra>
 
     #[inline]
     pub(crate) fn scope_completion_ref(&self) -> ScopeRef<S> {
-        unsafe {
-            let non_null = RawScope::clone_raw(&*self.completion);
-            ScopeRef::new(non_null)
-        }
+        ScopeRef::from_shared::<O>(&self.completion)
     }
 
     #[inline]

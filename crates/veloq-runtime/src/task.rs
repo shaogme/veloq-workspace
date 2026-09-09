@@ -13,8 +13,9 @@ pub(crate) use nodes::{GenericTaskNode, TaskBounds, TaskStorage};
 pub use nodes::{LocalBoxedTaskNode, LocalTaskNode, SendBoxedTaskNode, SendTaskNode};
 pub use scope::{
     AnyScopeRef, AnySendScopeRef, ErasedCancellationToken, OpaqueScope, OpaqueToken, RawScope,
-    ScopeCancelWaiter, ScopeCancelWaiterAdapter, ScopeParent, ScopeRef, ScopeStorage,
+    ScopeParent, ScopeRef, ScopeStorage,
 };
+pub(crate) use scope::{CancellationWaiter, CancellationWaiterAdapter};
 pub(crate) use wake::{LocalWakeHeaderGuard, LocalWakeTarget, TaskWakeToken};
 
 use crate::error::Result as RuntimeResult;

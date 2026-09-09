@@ -3,9 +3,8 @@ use crate::{
     runtime::{EnqueuePinnedOutcome, RuntimeCtx, RuntimeShared},
     scope::{GenericScopeCompletion, guard::ScopeTaskGuard},
     task::{
-        ArenaAllocation, GenericArena, GenericTaskHeader, ManagedAllocation, RawScope, RawTask,
-        ScopeRef, ScopeStorage, SendBoxedTaskNode, SendTask, SendTaskRef, Task, TaskError,
-        TaskHandleRef,
+        ArenaAllocation, GenericArena, GenericTaskHeader, ManagedAllocation, RawTask, ScopeRef,
+        ScopeStorage, SendBoxedTaskNode, SendTask, SendTaskRef, Task, TaskError, TaskHandleRef,
     },
     utils::ownership::{ArcOwnership, Ownership},
 };
@@ -502,10 +501,7 @@ pub(crate) fn install_routed_pinned_task<'scope_ref, 'rt, T, Fut, TExtra>(
     T: Send + 'scope_ref,
     Fut: Future<Output = T> + 'scope_ref,
 {
-    let scope_ref = unsafe {
-        let non_null = RawScope::clone_raw(guard.completion_ref());
-        ScopeRef::new(non_null)
-    };
+    let scope_ref = ScopeRef::from_shared::<ArcOwnership>(guard.completion());
     let layout = Layout::new::<SendBoxedTaskNode<T, Fut>>();
     let allocation = unsafe {
         arena.alloc_managed(layout, |ptr| {

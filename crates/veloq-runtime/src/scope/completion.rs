@@ -1,10 +1,11 @@
 use crate::{
-    runtime::primitives::{
-        CancelWaiterLinkResult, GenericCancellationToken, Unparker, create_unpark_waker,
+    runtime::{
+        cancellation::{CancelWaiterLinkResult, GenericCancellationToken},
+        primitives::{Unparker, create_unpark_waker},
     },
     task::{
-        AnyScopeRef, ErasedCancellationToken, RawScope, ScopeCancelWaiter, ScopeParent,
-        ScopeStorage,
+        AnyScopeRef, AnySendScopeRef, CancellationWaiter, ErasedCancellationToken, RawScope,
+        ScopeParent, ScopeStorage,
     },
     utils::ownership::{ArcOwnership, Ownership, RcOwnership},
 };
@@ -358,35 +359,34 @@ impl<S: ScopeStorage, O: Ownership + 'static> RawScope for GenericScopeCompletio
     }
 
     #[inline]
-    fn register_cancel_waker(&self, waker: &Waker) {
-        self.cancel_token().register_waker(waker);
+    fn cancel_parent_chain(&self) -> Vec<AnySendScopeRef> {
+        self.cancel_token().parent_chain()
     }
 
     #[inline]
     unsafe fn link_cancel_waiter(
         &self,
-        waiter: NonNull<ScopeCancelWaiter>,
+        waiter: NonNull<CancellationWaiter>,
         waker: &Waker,
     ) -> CancelWaiterLinkResult {
         unsafe { self.cancel_token().link_cancel_waiter(waiter, waker) }
     }
 
     #[inline]
-    unsafe fn unlink_cancel_waiter(&self, waiter: NonNull<ScopeCancelWaiter>) {
+    unsafe fn unlink_cancel_waiter(&self, waiter: NonNull<CancellationWaiter>) {
         unsafe { self.cancel_token().unlink_cancel_waiter(waiter) }
     }
 
     #[inline]
-    unsafe fn clone_raw(&self) -> NonNull<dyn RawScope> {
-        let ptr = self as *const Self;
+    unsafe fn clone_raw(&self, raw: NonNull<dyn RawScope>) -> NonNull<dyn RawScope> {
+        let ptr = raw.as_ptr() as *const Self;
         unsafe { O::increment_strong_count(ptr) };
-        let dyn_ptr: *const dyn RawScope = ptr;
-        unsafe { NonNull::new_unchecked(dyn_ptr as *mut _) }
+        raw
     }
 
     #[inline]
-    unsafe fn drop_raw(&self) {
-        let ptr = self as *const Self;
+    unsafe fn drop_raw(&self, raw: NonNull<dyn RawScope>) {
+        let ptr = raw.as_ptr() as *const Self;
         unsafe { O::decrement_strong_count(ptr) };
     }
 }

@@ -1,5 +1,5 @@
 use crate::{
-    runtime::primitives::{CancelWaiterLinkResult, GenericCancellationToken},
+    runtime::cancellation::{CancelWaiterLinkResult, GenericCancellationToken},
     scope::GenericScopeCompletion,
     utils::ownership::Ownership,
 };
@@ -21,14 +21,15 @@ use veloq_storage::{AtomicStorage, LocalStorage, Storage, StrategyType, ThreadSa
 /// `AtomicStorage` 的 scope 可以同时持有 local 与 send 两种任务（`spawn_local`），
 /// 类型化的链表装不下它们。`Link` 与 `Waker` 本身都与策略无关，节点字段一律在持有
 /// scope 取消令牌的锁时访问。
-pub struct ScopeCancelWaiter {
+#[doc(hidden)]
+pub struct CancellationWaiter {
     pub(crate) link: Link,
     pub(crate) waker: UnsafeCell<Option<Waker>>,
 }
 
-intrusive_adapter!(pub ScopeCancelWaiterAdapter = ScopeCancelWaiter { link: Link });
+intrusive_adapter!(pub(crate) CancellationWaiterAdapter = CancellationWaiter { link: Link });
 
-impl ScopeCancelWaiter {
+impl CancellationWaiter {
     pub(crate) fn new() -> Self {
         Self {
             link: Link::new(),
@@ -55,7 +56,7 @@ impl ScopeCancelWaiter {
     }
 }
 
-impl Default for ScopeCancelWaiter {
+impl Default for CancellationWaiter {
     fn default() -> Self {
         Self::new()
     }
@@ -129,7 +130,7 @@ pub trait RawScope {
     fn is_cancelled(&self) -> bool;
     fn try_link_child(&self, child_token: &ErasedCancellationToken) -> bool;
     fn parent(&self) -> Option<AnyScopeRef>;
-    fn register_cancel_waker(&self, waker: &Waker);
+    fn cancel_parent_chain(&self) -> Vec<AnySendScopeRef>;
     /// 把任务自己的等待节点挂到本 scope 的取消队列上。
     ///
     /// # Safety
@@ -137,21 +138,21 @@ pub trait RawScope {
     /// `waiter` 必须在被 `unlink_cancel_waiter` 摘除之前保持有效且地址稳定。
     unsafe fn link_cancel_waiter(
         &self,
-        waiter: NonNull<ScopeCancelWaiter>,
-        waker: &Waker,
+        waiter: NonNull<CancellationWaiter>,
+        waker: &std::task::Waker,
     ) -> CancelWaiterLinkResult;
     /// # Safety
     ///
     /// `waiter` 必须是先前传给 `link_cancel_waiter` 的同一个节点。
-    unsafe fn unlink_cancel_waiter(&self, waiter: NonNull<ScopeCancelWaiter>);
+    unsafe fn unlink_cancel_waiter(&self, waiter: NonNull<CancellationWaiter>);
     /// # Safety
     ///
     /// The caller must ensure the returned reference is dropped before the underlying scope is deallocated.
-    unsafe fn clone_raw(&self) -> NonNull<dyn RawScope>;
+    unsafe fn clone_raw(&self, raw: NonNull<dyn RawScope>) -> NonNull<dyn RawScope>;
     /// # Safety
     ///
     /// The caller must ensure the reference is not dropped twice.
-    unsafe fn drop_raw(&self);
+    unsafe fn drop_raw(&self, raw: NonNull<dyn RawScope>);
 }
 
 struct DummyScope<S: Storage>(PhantomData<S>);
@@ -171,21 +172,22 @@ impl<S: Storage> RawScope for DummyScope<S> {
     fn parent(&self) -> Option<AnyScopeRef> {
         None
     }
-    fn register_cancel_waker(&self, _waker: &Waker) {}
+    fn cancel_parent_chain(&self) -> Vec<AnySendScopeRef> {
+        Vec::new()
+    }
     /// 哑作用域永远不会被取消，因此「已挂载」是成立的（虽然什么都没挂）。
     unsafe fn link_cancel_waiter(
         &self,
-        _waiter: NonNull<ScopeCancelWaiter>,
-        _waker: &Waker,
+        _waiter: NonNull<CancellationWaiter>,
+        _waker: &std::task::Waker,
     ) -> CancelWaiterLinkResult {
         CancelWaiterLinkResult::Linked
     }
-    unsafe fn unlink_cancel_waiter(&self, _waiter: NonNull<ScopeCancelWaiter>) {}
-    unsafe fn clone_raw(&self) -> NonNull<dyn RawScope> {
-        let dyn_ptr: *const dyn RawScope = self;
-        unsafe { NonNull::new_unchecked(dyn_ptr as *mut _) }
+    unsafe fn unlink_cancel_waiter(&self, _waiter: NonNull<CancellationWaiter>) {}
+    unsafe fn clone_raw(&self, raw: NonNull<dyn RawScope>) -> NonNull<dyn RawScope> {
+        raw
     }
-    unsafe fn drop_raw(&self) {}
+    unsafe fn drop_raw(&self, _raw: NonNull<dyn RawScope>) {}
 }
 
 static DUMMY_LOCAL_SCOPE: DummyScope<LocalStorage> = DummyScope(PhantomData);
@@ -219,6 +221,18 @@ impl<S: Storage> ScopeRef<S> {
             inner,
             _marker: PhantomData,
         }
+    }
+
+    /// 从一个仍由调用者持有的作用域共享所有权中创建一份类型擦除引用。
+    pub(crate) fn from_shared<O>(shared: &O::Shared<GenericScopeCompletion<S, O>>) -> Self
+    where
+        S: ScopeStorage,
+        O: Ownership + 'static,
+    {
+        let ptr = O::as_ptr(shared);
+        unsafe { O::increment_strong_count(ptr) };
+        let dyn_ptr: *const dyn RawScope = ptr;
+        unsafe { Self::new(NonNull::new_unchecked(dyn_ptr as *mut _)) }
     }
 
     /// 获取内部的 `NonNull` 指针。
@@ -278,8 +292,8 @@ impl<S: Storage> ScopeRef<S> {
     }
 
     #[inline]
-    pub fn register_cancel_waker(&self, waker: &Waker) {
-        unsafe { self.as_ref().register_cancel_waker(waker) }
+    pub(crate) fn cancel_parent_chain(&self) -> Vec<AnySendScopeRef> {
+        unsafe { self.as_ref().cancel_parent_chain() }
     }
 
     /// # Safety
@@ -288,8 +302,8 @@ impl<S: Storage> ScopeRef<S> {
     #[inline]
     pub(crate) unsafe fn link_cancel_waiter(
         &self,
-        waiter: NonNull<ScopeCancelWaiter>,
-        waker: &Waker,
+        waiter: NonNull<CancellationWaiter>,
+        waker: &std::task::Waker,
     ) -> CancelWaiterLinkResult {
         unsafe { self.as_ref().link_cancel_waiter(waiter, waker) }
     }
@@ -298,7 +312,7 @@ impl<S: Storage> ScopeRef<S> {
     ///
     /// 见 [`RawScope::unlink_cancel_waiter`]。
     #[inline]
-    pub(crate) unsafe fn unlink_cancel_waiter(&self, waiter: NonNull<ScopeCancelWaiter>) {
+    pub(crate) unsafe fn unlink_cancel_waiter(&self, waiter: NonNull<CancellationWaiter>) {
         unsafe { self.as_ref().unlink_cancel_waiter(waiter) }
     }
 
@@ -337,7 +351,7 @@ impl<S: Storage> ScopeRef<S> {
 impl<S: Storage> Clone for ScopeRef<S> {
     #[inline]
     fn clone(&self) -> Self {
-        let non_null = unsafe { self.as_ref().clone_raw() };
+        let non_null = unsafe { self.as_ref().clone_raw(self.inner) };
         unsafe { Self::new(non_null) }
     }
 }
@@ -345,7 +359,7 @@ impl<S: Storage> Clone for ScopeRef<S> {
 impl<S: Storage> Drop for ScopeRef<S> {
     #[inline]
     fn drop(&mut self) {
-        unsafe { self.as_ref().drop_raw() }
+        unsafe { self.as_ref().drop_raw(self.inner) }
     }
 }
 
@@ -395,8 +409,22 @@ impl AnySendScopeRef {
     }
 
     #[inline]
-    pub fn register_cancel_waker(&self, waker: &Waker) {
-        unsafe { self.0.as_ref().register_cancel_waker(waker) }
+    pub(crate) fn parent_send(&self) -> Option<Self> {
+        self.0.parent().and_then(|parent| parent.as_send())
+    }
+
+    #[inline]
+    pub(crate) unsafe fn link_cancel_waiter(
+        &self,
+        waiter: NonNull<CancellationWaiter>,
+        waker: &std::task::Waker,
+    ) -> CancelWaiterLinkResult {
+        unsafe { self.0.link_cancel_waiter(waiter, waker) }
+    }
+
+    #[inline]
+    pub(crate) unsafe fn unlink_cancel_waiter(&self, waiter: NonNull<CancellationWaiter>) {
+        unsafe { self.0.unlink_cancel_waiter(waiter) }
     }
 
     #[inline]
@@ -445,14 +473,6 @@ impl AnyScopeRef {
         match self {
             Self::Local(s) => unsafe { s.as_ref().try_link_child(child_token) },
             Self::Send(s) => s.try_link_child(child_token),
-        }
-    }
-
-    #[inline]
-    pub fn register_cancel_waker(&self, waker: &Waker) {
-        match self {
-            Self::Local(s) => unsafe { s.as_ref().register_cancel_waker(waker) },
-            Self::Send(s) => s.register_cancel_waker(waker),
         }
     }
 

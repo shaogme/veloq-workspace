@@ -4,7 +4,7 @@ use super::{
 };
 use crate::{
     error::{Result as RuntimeResult, RuntimeError},
-    runtime::{GenericCancellationToken, primitives::CancelledFuture},
+    runtime::cancellation::{CancelledFuture, GenericCancellationToken},
     task::{
         Arena, GenericTaskHeader, GenericWakerNode, LocalTaskRef, SendTaskRef, TaskError,
         TaskHandleRef, TaskJoinGate, TaskLease,
