@@ -13,15 +13,13 @@ use std::{
     alloc::Layout,
     future::{Future, ready},
     marker::PhantomData,
+    mem,
     panic::{AssertUnwindSafe, catch_unwind},
     ptr::{NonNull, drop_in_place, write},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     task::Waker,
 };
-use veloq_storage::{AtomicOptionPtr, AtomicStorage, StateOptionPtr};
+use veloq_storage::{AtomicLock, AtomicStorage, StateLock};
 use veloq_waker::MwsrWaker;
 
 pub(crate) enum RoutedTakeResult<T> {
@@ -47,10 +45,26 @@ pub(crate) struct RoutedSpawnReady<'scope_ref, T> {
     pub(crate) access: Box<dyn RoutedTaskAccess<T> + 'scope_ref>,
 }
 
-pub(crate) enum RoutedSpawnOutcomeInner<'scope_ref, T> {
-    Ready(RoutedSpawnReady<'scope_ref, T>),
-    FailedTask(TaskError),
-    FailedRuntime(Report<RuntimeError>),
+enum RoutedOutcomeCell<'scope_ref, T> {
+    Pending {
+        cancel_requested: bool,
+    },
+    Ready {
+        ready: RoutedSpawnReady<'scope_ref, T>,
+        cancel_requested: bool,
+    },
+    FailedTask {
+        err: TaskError,
+        cancel_requested: bool,
+    },
+    FailedRuntime {
+        err: Report<RuntimeError>,
+        cancel_requested: bool,
+    },
+    Consumed {
+        cancel_requested: bool,
+        failed: bool,
+    },
 }
 
 pub(crate) struct RoutedJobCell<F> {
@@ -227,9 +241,7 @@ where
 }
 
 pub(crate) struct RoutedSpawnState<'scope_ref, T> {
-    outcome: AtomicOptionPtr<RoutedSpawnOutcomeInner<'scope_ref, T>>,
-    cancel_requested: AtomicBool,
-    failed: AtomicBool,
+    outcome: AtomicLock<RoutedOutcomeCell<'scope_ref, T>>,
     waker: MwsrWaker,
 }
 
@@ -244,96 +256,195 @@ pub(crate) fn new_failed_routed_state<'scope_ref, T>(
 impl<'scope_ref, T> RoutedSpawnState<'scope_ref, T> {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
-            outcome: AtomicOptionPtr::new(None),
-            cancel_requested: AtomicBool::new(false),
-            failed: AtomicBool::new(false),
+            outcome: AtomicLock::new(RoutedOutcomeCell::Pending {
+                cancel_requested: false,
+            }),
             waker: MwsrWaker::new(),
         })
     }
 
     pub(crate) fn request_cancel(&self) {
-        self.cancel_requested.store(true, Ordering::Release);
-        self.waker.wake();
+        let wake_join = {
+            let mut outcome = self.outcome.lock();
+            match &mut *outcome {
+                RoutedOutcomeCell::Pending { cancel_requested } => {
+                    *cancel_requested = true;
+                    true
+                }
+                RoutedOutcomeCell::Ready {
+                    ready,
+                    cancel_requested,
+                } => {
+                    *cancel_requested = true;
+                    // The lock protects the `ready` owner until cancellation has finished. A
+                    // concurrent take can therefore not reclaim the task while this header
+                    // access is in progress.
+                    ready.task.header().cancel_and_wake();
+                    true
+                }
+                RoutedOutcomeCell::FailedTask {
+                    cancel_requested, ..
+                }
+                | RoutedOutcomeCell::FailedRuntime {
+                    cancel_requested, ..
+                }
+                | RoutedOutcomeCell::Consumed {
+                    cancel_requested, ..
+                } => {
+                    *cancel_requested = true;
+                    false
+                }
+            }
+        };
+
+        if wake_join {
+            self.waker.wake();
+        }
     }
 
     pub(crate) fn is_cancel_requested(&self) -> bool {
-        self.cancel_requested.load(Ordering::Acquire)
+        let outcome = self.outcome.lock();
+        match &*outcome {
+            RoutedOutcomeCell::Pending { cancel_requested }
+            | RoutedOutcomeCell::Ready {
+                cancel_requested, ..
+            }
+            | RoutedOutcomeCell::FailedTask {
+                cancel_requested, ..
+            }
+            | RoutedOutcomeCell::FailedRuntime {
+                cancel_requested, ..
+            }
+            | RoutedOutcomeCell::Consumed {
+                cancel_requested, ..
+            } => *cancel_requested,
+        }
     }
 
     pub(crate) fn has_failed_outcome(&self) -> bool {
-        self.failed.load(Ordering::Acquire)
-    }
-
-    fn set_outcome(&self, inner: RoutedSpawnOutcomeInner<'scope_ref, T>) {
-        let boxed = Box::new(inner);
-        let Some(raw) = NonNull::new(Box::into_raw(boxed)) else {
-            return;
-        };
-        match self
-            .outcome
-            .compare_exchange(None, Some(raw), Ordering::AcqRel, Ordering::Acquire)
-        {
-            Ok(_) => {
-                self.waker.wake();
-            }
-            Err(_) => {
-                // If it's already set (e.g. Taken or Cancelled), drop the box to prevent leak.
-                unsafe {
-                    let _ = Box::from_raw(raw.as_ptr());
-                }
-            }
-        }
+        let outcome = self.outcome.lock();
+        matches!(
+            &*outcome,
+            RoutedOutcomeCell::FailedTask { .. }
+                | RoutedOutcomeCell::FailedRuntime { .. }
+                | RoutedOutcomeCell::Consumed { failed: true, .. }
+        )
     }
 
     pub(crate) fn set_ready(&self, ready: RoutedSpawnReady<'scope_ref, T>) {
-        self.set_outcome(RoutedSpawnOutcomeInner::Ready(ready));
+        let should_wake = {
+            let mut outcome = self.outcome.lock();
+            let RoutedOutcomeCell::Pending { cancel_requested } = &*outcome else {
+                debug_assert!(false, "routed outcome published more than once");
+                return;
+            };
+            let cancel_requested = *cancel_requested;
+            if cancel_requested {
+                // The task has already been enqueued. Do not wake it here: the worker queue will
+                // observe the cancellation, while `request_cancel` handles the ready case with a
+                // full cancel-and-wake operation.
+                ready.task.header().cancel();
+            }
+            *outcome = RoutedOutcomeCell::Ready {
+                ready,
+                cancel_requested,
+            };
+            true
+        };
+
+        if should_wake {
+            self.waker.wake();
+        }
     }
 
     pub(crate) fn fail_task(&self, err: TaskError) {
-        self.failed.store(true, Ordering::Release);
-        self.set_outcome(RoutedSpawnOutcomeInner::FailedTask(err));
+        let should_wake = {
+            let mut outcome = self.outcome.lock();
+            let RoutedOutcomeCell::Pending { cancel_requested } = &*outcome else {
+                debug_assert!(false, "routed task failure published more than once");
+                return;
+            };
+            *outcome = RoutedOutcomeCell::FailedTask {
+                err,
+                cancel_requested: *cancel_requested,
+            };
+            true
+        };
+
+        if should_wake {
+            self.waker.wake();
+        }
     }
 
     pub(crate) fn fail_runtime(&self, err: Report<RuntimeError>) {
-        self.failed.store(true, Ordering::Release);
-        self.set_outcome(RoutedSpawnOutcomeInner::FailedRuntime(err));
+        let should_wake = {
+            let mut outcome = self.outcome.lock();
+            let RoutedOutcomeCell::Pending { cancel_requested } = &*outcome else {
+                debug_assert!(false, "routed runtime failure published more than once");
+                return;
+            };
+            *outcome = RoutedOutcomeCell::FailedRuntime {
+                err,
+                cancel_requested: *cancel_requested,
+            };
+            true
+        };
+
+        if should_wake {
+            self.waker.wake();
+        }
     }
 
     pub(crate) fn try_take_ready(&self) -> RoutedTakeReadyOutcome<'scope_ref, T> {
-        if let Some(raw) = self.outcome.swap(None, Ordering::AcqRel) {
-            let inner = unsafe { Box::from_raw(raw.as_ptr()) };
-            match *inner {
-                RoutedSpawnOutcomeInner::Ready(ready) => RoutedTakeReadyOutcome::Ready(ready),
-                RoutedSpawnOutcomeInner::FailedTask(err) => RoutedTakeReadyOutcome::TaskErr(err),
-                RoutedSpawnOutcomeInner::FailedRuntime(err) => {
-                    RoutedTakeReadyOutcome::RuntimeErr(err)
-                }
+        let mut outcome = self.outcome.lock();
+        match mem::replace(
+            &mut *outcome,
+            RoutedOutcomeCell::Consumed {
+                cancel_requested: false,
+                failed: false,
+            },
+        ) {
+            RoutedOutcomeCell::Pending { cancel_requested } => {
+                *outcome = RoutedOutcomeCell::Pending { cancel_requested };
+                RoutedTakeReadyOutcome::Pending
             }
-        } else {
-            RoutedTakeReadyOutcome::Pending
-        }
-    }
-
-    pub(crate) fn cancel_ready_task_if_any(&self) {
-        let Some(raw) = self.outcome.swap(None, Ordering::AcqRel) else {
-            return;
-        };
-
-        let boxed = unsafe { Box::from_raw(raw.as_ptr()) };
-        if let RoutedSpawnOutcomeInner::Ready(ready) = &*boxed {
-            ready.task.header().cancel_and_wake();
-        }
-
-        let raw = NonNull::from(Box::leak(boxed));
-        if self
-            .outcome
-            .compare_exchange(None, Some(raw), Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            // A second terminal outcome is a protocol violation. The temporary
-            // owner must still release its old value without touching the newer
-            // value now owned by the state.
-            unsafe { drop(Box::from_raw(raw.as_ptr())) };
+            RoutedOutcomeCell::Ready {
+                ready,
+                cancel_requested,
+            } => {
+                *outcome = RoutedOutcomeCell::Consumed {
+                    cancel_requested,
+                    failed: false,
+                };
+                RoutedTakeReadyOutcome::Ready(ready)
+            }
+            RoutedOutcomeCell::FailedTask {
+                err,
+                cancel_requested,
+            } => {
+                *outcome = RoutedOutcomeCell::Consumed {
+                    cancel_requested,
+                    failed: true,
+                };
+                RoutedTakeReadyOutcome::TaskErr(err)
+            }
+            RoutedOutcomeCell::FailedRuntime {
+                err,
+                cancel_requested,
+            } => {
+                *outcome = RoutedOutcomeCell::Consumed {
+                    cancel_requested,
+                    failed: true,
+                };
+                RoutedTakeReadyOutcome::RuntimeErr(err)
+            }
+            RoutedOutcomeCell::Consumed { .. } => RoutedTakeReadyOutcome::RuntimeErr(
+                RuntimeError::InvariantViolation {
+                    site: "RoutedSpawnState::try_take_ready",
+                    detail: "routed outcome has already been consumed".into(),
+                }
+                .to_report(),
+            ),
         }
     }
 
@@ -343,19 +454,6 @@ impl<'scope_ref, T> RoutedSpawnState<'scope_ref, T> {
         }
     }
 }
-
-impl<'scope_ref, T> Drop for RoutedSpawnState<'scope_ref, T> {
-    fn drop(&mut self) {
-        if let Some(raw) = self.outcome.swap(None, Ordering::Acquire) {
-            unsafe {
-                let _ = Box::from_raw(raw.as_ptr());
-            }
-        }
-    }
-}
-
-unsafe impl<'scope_ref, T> Send for RoutedSpawnState<'scope_ref, T> where T: Send {}
-unsafe impl<'scope_ref, T> Sync for RoutedSpawnState<'scope_ref, T> where T: Send {}
 
 pub(crate) fn dispatch_routed<'rt, 'scope_ref, S: ScopeStorage, O: Ownership, T, F, TExtra>(
     context: &RuntimeCtx<'rt, TExtra>,
@@ -449,10 +547,6 @@ pub(crate) fn install_routed_pinned_task<'scope_ref, 'rt, T, Fut, TExtra>(
         return;
     }
 
-    if state.is_cancel_requested() {
-        header.cancel();
-    }
-
     let task_ready = unsafe {
         SendTaskRef::from_header(task_ref.header() as *const GenericTaskHeader<AtomicStorage>)
     };
@@ -467,7 +561,14 @@ pub(crate) fn install_routed_pinned_task<'scope_ref, 'rt, T, Fut, TExtra>(
 mod tests {
     use super::*;
     use crate::task::TaskVTable;
-    use std::ptr::NonNull;
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
+        ptr::NonNull,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     static TEST_VTABLE: TaskVTable<AtomicStorage> = TaskVTable {
         wake: |_| {},
@@ -477,9 +578,11 @@ mod tests {
         drop_after_poll: false,
     };
 
-    struct NoopAccess;
+    struct DropAccess {
+        drops: Arc<AtomicUsize>,
+    }
 
-    impl RoutedTaskAccess<()> for NoopAccess {
+    impl RoutedTaskAccess<()> for DropAccess {
         fn take_result(&self) -> RoutedTakeResult<()> {
             RoutedTakeResult::TaskErr(TaskError::Cancelled)
         }
@@ -487,27 +590,58 @@ mod tests {
         fn reclaim(self: Box<Self>, _arena: &dyn Arena) {}
     }
 
-    #[test]
-    fn cancel_ready_task_peeks_with_temporary_ownership() {
-        let header = GenericTaskHeader::<AtomicStorage>::new_placeholder(&TEST_VTABLE);
-        let task = unsafe { SendTaskRef::from_header(NonNull::from(&header).as_ptr()) };
-        let state = RoutedSpawnState::<()>::new();
-        state.set_ready(RoutedSpawnReady {
-            task,
-            access: Box::new(NoopAccess),
-        });
+    impl Drop for DropAccess {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
-        state.cancel_ready_task_if_any();
+    fn ready_for(task: SendTaskRef, drops: Arc<AtomicUsize>) -> RoutedSpawnReady<'static, ()> {
+        RoutedSpawnReady {
+            task,
+            access: Box::new(DropAccess { drops }),
+        }
+    }
+
+    #[test]
+    fn cancellation_before_ready_is_applied_during_publish() {
+        let header = GenericTaskHeader::<AtomicStorage>::new_placeholder(&TEST_VTABLE);
+        let state = RoutedSpawnState::<()>::new();
+        let drops = Arc::new(AtomicUsize::new(0));
+
+        state.request_cancel();
+        let task = unsafe { SendTaskRef::from_header(NonNull::from(&header).as_ptr()) };
+        state.set_ready(ready_for(task, drops.clone()));
+
+        assert!(header.is_locally_cancelled());
+        assert!(state.is_cancel_requested());
+        assert!(matches!(
+            state.try_take_ready(),
+            RoutedTakeReadyOutcome::Ready(_)
+        ));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cancellation_after_ready_cancels_under_the_state_lock() {
+        let header = GenericTaskHeader::<AtomicStorage>::new_placeholder(&TEST_VTABLE);
+        let state = RoutedSpawnState::<()>::new();
+        let drops = Arc::new(AtomicUsize::new(0));
+
+        let task = unsafe { SendTaskRef::from_header(NonNull::from(&header).as_ptr()) };
+        state.set_ready(ready_for(task, drops.clone()));
+        state.request_cancel();
 
         assert!(header.is_locally_cancelled());
         assert!(matches!(
             state.try_take_ready(),
             RoutedTakeReadyOutcome::Ready(_)
         ));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn failed_state_is_observable_without_raw_pointer_peek() {
+    fn failed_state_has_one_consumable_result() {
         let state = RoutedSpawnState::<()>::new();
         assert!(!state.has_failed_outcome());
         state.fail_task(TaskError::Panic);
@@ -516,5 +650,93 @@ mod tests {
             state.try_take_ready(),
             RoutedTakeReadyOutcome::TaskErr(TaskError::Panic)
         ));
+        assert!(state.has_failed_outcome());
+        assert!(matches!(
+            state.try_take_ready(),
+            RoutedTakeReadyOutcome::RuntimeErr(_)
+        ));
+    }
+
+    #[test]
+    fn duplicate_terminal_publication_is_rejected() {
+        let state = RoutedSpawnState::<()>::new();
+        state.fail_task(TaskError::Panic);
+
+        let duplicate = catch_unwind(AssertUnwindSafe(|| {
+            state.fail_task(TaskError::Cancelled);
+        }));
+
+        assert!(duplicate.is_err());
+    }
+
+    #[test]
+    fn repeated_ready_consumption_reports_an_invariant() {
+        let header = GenericTaskHeader::<AtomicStorage>::new_placeholder(&TEST_VTABLE);
+        let state = RoutedSpawnState::<()>::new();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let task = unsafe { SendTaskRef::from_header(NonNull::from(&header).as_ptr()) };
+        state.set_ready(ready_for(task, drops.clone()));
+
+        let first = state.try_take_ready();
+        drop(first);
+        assert!(matches!(
+            state.try_take_ready(),
+            RoutedTakeReadyOutcome::RuntimeErr(_)
+        ));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn dropping_state_releases_unconsumed_ready_once() {
+        let header = GenericTaskHeader::<AtomicStorage>::new_placeholder(&TEST_VTABLE);
+        let drops = Arc::new(AtomicUsize::new(0));
+        {
+            let state = RoutedSpawnState::<()>::new();
+            let task = unsafe { SendTaskRef::from_header(NonNull::from(&header).as_ptr()) };
+            state.set_ready(ready_for(task, drops.clone()));
+        }
+
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "loom")]
+    #[test]
+    fn loom_publish_cancel_take_has_one_ready_owner() {
+        let mut builder = loom::model::Builder::new();
+        builder.max_threads = 4;
+        builder.max_branches = 100;
+        builder.preemption_bound = Some(2);
+        builder.check(|| {
+            use loom::thread;
+
+            let header = Box::new(GenericTaskHeader::<AtomicStorage>::new_placeholder(
+                &TEST_VTABLE,
+            ));
+            let task_header = &*header;
+            let task = unsafe { SendTaskRef::from_header(NonNull::from(task_header).as_ptr()) };
+            let state = RoutedSpawnState::<()>::new();
+            let drops = Arc::new(AtomicUsize::new(0));
+
+            let publish_state = state.clone();
+            let publish_drops = drops.clone();
+            let publish = thread::spawn(move || {
+                publish_state.set_ready(ready_for(task, publish_drops));
+            });
+
+            let cancel_state = state.clone();
+            let cancel = thread::spawn(move || cancel_state.request_cancel());
+
+            let take_state = state.clone();
+            let take = thread::spawn(move || take_state.try_take_ready());
+
+            publish.join().unwrap();
+            cancel.join().unwrap();
+            let taken = take.join().unwrap();
+            drop(taken);
+
+            let final_take = state.try_take_ready();
+            drop(final_take);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        });
     }
 }

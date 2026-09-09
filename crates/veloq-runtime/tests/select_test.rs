@@ -136,7 +136,7 @@ fn test_select_three_branches() {
 fn test_select_multi_branch_cancellation() {
     Runtime::<(), _>::scope(async |ctx| {
         scope!(ctx, async |s| {
-            let handle = s.spawn_boxed(async move {
+            let mut handle = s.spawn_boxed(async move {
                 select! {
                     ctx;
                     _ = PendingFuture => 1,
@@ -162,7 +162,7 @@ fn test_select_multi_branch_cancellation() {
 fn test_select_cancellation() {
     Runtime::<(), _>::scope(async |ctx| {
         scope!(ctx, async |s| {
-            let handle = s.spawn_boxed(async move {
+            let mut handle = s.spawn_boxed(async move {
                 select! {
                     ctx;
                     _ = PendingFuture => (),

@@ -12,6 +12,7 @@ use crate::{
 };
 use diagweave::{Report, prelude::*};
 use std::{
+    cell::Cell,
     future::Future,
     marker::{PhantomData, PhantomPinned},
     pin::Pin,
@@ -74,6 +75,11 @@ pub(crate) enum JoinSource<'scope_ref, T, R: TaskHandleRef> {
 /// until cancellation has been requested. If the task ends due to cancellation, the
 /// result is [`JoinOutcome::TaskErr`] with [`TaskError::Cancelled`]. For immediate
 /// notification when cancellation is requested, use [`JoinHandle::cancelled`].
+///
+/// A join handle has a single owner. Its `poll`, `cancel`, `is_finished`,
+/// `is_cancel_requested`, and `Drop` operations must not run concurrently. In
+/// particular, this type is not a cross-thread cancellation handle: move the
+/// handle to the thread that owns it, or use a separate cancellation token.
 pub struct JoinHandle<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra> {
     pub(crate) source: JoinSource<'scope_ref, T, R>,
     pub(crate) scope: &'scope_ref S,
@@ -81,9 +87,14 @@ pub struct JoinHandle<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>,
     pub(crate) waker_node: Option<GenericWakerNode<R::Storage>>,
     pub(crate) reclaim: Option<ReclaimFn<'scope_ref, T, S::Arena>>,
     pub(crate) marker: PhantomData<TExtra>,
+    pub(crate) _not_sync: PhantomData<Cell<()>>,
     pub(crate) _pin: PhantomPinned,
 }
 
+// Safety: a send join handle is moved as one value between threads. Once moved, the
+// handle's `&mut self` poll/cancel contract gives exclusive access to its task reference,
+// waker node, reclaim callback, and cancellation slot; none of those fields are shared by
+// this implementation.
 unsafe impl<'rt, 'scope, 'env, 'scope_ref, T, TExtra> Send
     for JoinHandle<'scope_ref, T, SendTaskRef, AsyncScope<'rt, 'scope, 'env, TExtra>, TExtra>
 where
@@ -107,7 +118,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
     /// polled and observes the cancel state. Use `await` to wait until the task has
     /// actually stopped, or [`JoinHandle::cancelled`] to be notified as soon as
     /// cancellation has been requested.
-    pub fn cancel(&self) {
+    pub fn cancel(&mut self) {
         let mut cancel_slot = self.cancel_token.lock();
         if let Some(token) = cancel_slot.take() {
             token.cancel();
@@ -123,8 +134,6 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
                 state.request_cancel();
                 if let Some(resolved) = resolved {
                     resolved.task.header().cancel_and_wake();
-                } else {
-                    state.cancel_ready_task_if_any();
                 }
             }
         }
@@ -214,6 +223,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
             waker_node: None,
             reclaim,
             marker: PhantomData,
+            _not_sync: PhantomData,
             _pin: PhantomPinned,
         }
     }
@@ -232,6 +242,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
             waker_node: None,
             reclaim: None,
             marker: PhantomData,
+            _not_sync: PhantomData,
             _pin: PhantomPinned,
         }
     }

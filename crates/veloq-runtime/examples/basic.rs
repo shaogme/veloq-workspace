@@ -69,7 +69,7 @@ fn main() {
             println!("\n  [测试] 测试显式取消：手动取消特定任务...");
             scope!(ctx, async |explicit_cancel_scope| {
                 let worker_id = explicit_cancel_scope.worker_id();
-                let h1 = explicit_cancel_scope.spawn_boxed(async move {
+                let mut h1 = explicit_cancel_scope.spawn_boxed(async move {
                     for i in 1..=10 {
                         yield_now().await;
                         println!("    [Worker {}] [手动取消任务] 进度 {}", worker_id, i);
@@ -127,7 +127,7 @@ fn main() {
             println!("\n  [测试] 测试 JoinHandle 延迟生成的取消令牌...");
             scope!(ctx, async |lazy_token_scope| {
                 let worker_id = lazy_token_scope.worker_id();
-                let h = lazy_token_scope.spawn_boxed(async move {
+                let mut h = lazy_token_scope.spawn_boxed(async move {
                     yield_now().await;
                     yield_now().await;
                     println!("    [Worker {}] [延迟令牌任务] 任务运行中...", worker_id);

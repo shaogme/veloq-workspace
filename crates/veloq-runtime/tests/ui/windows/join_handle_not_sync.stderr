@@ -1,0 +1,67 @@
+error[E0277]: `Cell<()>` cannot be shared between threads safely
+ --> tests/ui/windows/join_handle_not_sync.rs:7:32
+  |
+7 |             let _: &dyn Sync = &handle;
+  |                                ^^^^^^^ `Cell<()>` cannot be shared between threads safely
+  |
+  = help: within `veloq_runtime::scope::JoinHandle<'_, usize, SendTaskRef, GenericAsyncScope<'_, '_, '_, AtomicStorage, ArcOwnership, _>, _>`, the trait `Sync` is not implemented for `Cell<()>`
+  = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock`
+note: required because it appears within the type `PhantomData<Cell<()>>`
+ --> $RUST/core/src/marker.rs
+note: required because it appears within the type `veloq_runtime::scope::JoinHandle<'_, usize, SendTaskRef, GenericAsyncScope<'_, '_, '_, AtomicStorage, ArcOwnership, _>, _>`
+ --> src/scope/join.rs
+  |
+  | pub struct JoinHandle<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra> {
+  |            ^^^^^^^^^^
+  = note: required for the cast from `&veloq_runtime::scope::JoinHandle<'_, usize, SendTaskRef, GenericAsyncScope<'_, '_, '_, AtomicStorage, ArcOwnership, _>, _>` to `&dyn Sync`
+
+error[E0277]: `dyn TaskJoinGate<usize>` cannot be shared between threads safely
+ --> tests/ui/windows/join_handle_not_sync.rs:7:32
+  |
+7 |             let _: &dyn Sync = &handle;
+  |                                ^^^^^^^ `dyn TaskJoinGate<usize>` cannot be shared between threads safely
+  |
+  = help: within `veloq_runtime::scope::JoinHandle<'_, usize, SendTaskRef, GenericAsyncScope<'_, '_, '_, AtomicStorage, ArcOwnership, _>, _>`, the trait `Sync` is not implemented for `dyn TaskJoinGate<usize>`
+  = note: required because it appears within the type `&dyn TaskJoinGate<usize>`
+note: required because it appears within the type `scope::join::JoinSource<'_, usize, SendTaskRef>`
+ --> src/scope/join.rs
+  |
+  | pub(crate) enum JoinSource<'scope_ref, T, R: TaskHandleRef> {
+  |                 ^^^^^^^^^^
+note: required because it appears within the type `veloq_runtime::scope::JoinHandle<'_, usize, SendTaskRef, GenericAsyncScope<'_, '_, '_, AtomicStorage, ArcOwnership, _>, _>`
+ --> src/scope/join.rs
+  |
+  | pub struct JoinHandle<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra> {
+  |            ^^^^^^^^^^
+  = note: required for the cast from `&veloq_runtime::scope::JoinHandle<'_, usize, SendTaskRef, GenericAsyncScope<'_, '_, '_, AtomicStorage, ArcOwnership, _>, _>` to `&dyn Sync`
+
+error[E0277]: `dyn scope::router::RoutedTaskAccess<usize>` cannot be shared between threads safely
+ --> tests/ui/windows/join_handle_not_sync.rs:7:32
+  |
+7 |             let _: &dyn Sync = &handle;
+  |                                ^^^^^^^ `dyn scope::router::RoutedTaskAccess<usize>` cannot be shared between threads safely
+  |
+  = help: the trait `Sync` is not implemented for `dyn scope::router::RoutedTaskAccess<usize>`
+  = note: required for `std::ptr::Unique<dyn scope::router::RoutedTaskAccess<usize>>` to implement `Sync`
+note: required because it appears within the type `Box<dyn scope::router::RoutedTaskAccess<usize>>`
+ --> $RUST/alloc/src/boxed.rs
+note: required because it appears within the type `Option<Box<dyn scope::router::RoutedTaskAccess<usize>>>`
+ --> $RUST/core/src/option.rs
+note: required because it appears within the type `scope::join::ResolvedRoutedTask<'_, usize, SendTaskRef>`
+ --> src/scope/join.rs
+  |
+  | pub(crate) struct ResolvedRoutedTask<'scope_ref, T, R: TaskHandleRef> {
+  |                   ^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `Option<scope::join::ResolvedRoutedTask<'_, usize, SendTaskRef>>`
+ --> $RUST/core/src/option.rs
+note: required because it appears within the type `scope::join::JoinSource<'_, usize, SendTaskRef>`
+ --> src/scope/join.rs
+  |
+  | pub(crate) enum JoinSource<'scope_ref, T, R: TaskHandleRef> {
+  |                 ^^^^^^^^^^
+note: required because it appears within the type `veloq_runtime::scope::JoinHandle<'_, usize, SendTaskRef, GenericAsyncScope<'_, '_, '_, AtomicStorage, ArcOwnership, _>, _>`
+ --> src/scope/join.rs
+  |
+  | pub struct JoinHandle<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra> {
+  |            ^^^^^^^^^^
+  = note: required for the cast from `&veloq_runtime::scope::JoinHandle<'_, usize, SendTaskRef, GenericAsyncScope<'_, '_, '_, AtomicStorage, ArcOwnership, _>, _>` to `&dyn Sync`

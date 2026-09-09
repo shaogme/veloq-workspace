@@ -156,7 +156,7 @@ fn cancelling_rejected_handles_is_safe() {
                 for i in 0..SPAWNS {
                     handles.push(scope.spawn_boxed_to(1, async move || i));
                 }
-                for handle in &handles {
+                for handle in &mut handles {
                     handle.cancel();
                 }
                 for handle in handles {
