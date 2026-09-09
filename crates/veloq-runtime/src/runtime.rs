@@ -26,9 +26,7 @@ pub(crate) use context::{IdleHook, RuntimeTlsInner, WorkerTickHook};
 pub use shared::{EnqueuePinnedOutcome, ParkHook, RuntimeShared, RuntimeSharedBase};
 
 use primitives::BlockOnSignal;
-use shared::{
-    BlockOnController, MAX_WORKER_COUNT, Receivers, init_runtime_components, run_worker_loop,
-};
+use shared::{BlockOnController, MAX_WORKER_COUNT, Receivers, run_worker_loop};
 
 pub struct Runtime<'rt, 'env: 'rt, T, WF: 'rt> {
     shared: RuntimeShared<T>,
@@ -320,6 +318,7 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
 pub struct RuntimeBuilder<T, WF> {
     worker_count: Option<NonZeroUsize>,
     queue_capacity: NonZeroUsize,
+    topology_override: Option<Box<[usize]>>,
     worker_factory: Option<WF>,
     idle_hook: Option<IdleHook<T>>,
     park_hook: Option<ParkHook<T>>,
@@ -337,6 +336,7 @@ impl RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
         RuntimeBuilder {
             worker_count: None,
             queue_capacity: NonZeroUsize::new(1024).unwrap(),
+            topology_override: None,
             worker_factory: Some(|_, _| ()),
             idle_hook: None,
             park_hook: None,
@@ -356,12 +356,22 @@ impl<T, WF> RuntimeBuilder<T, WF> {
         self
     }
 
+    /// Supplies a synthetic worker-to-group mapping for deterministic scheduler tests.
+    ///
+    /// This mapping describes locality hints only; it does not configure OS CPU affinity.
+    #[doc(hidden)]
+    pub fn with_test_topology(mut self, worker_to_group: Vec<usize>) -> Self {
+        self.topology_override = Some(worker_to_group.into_boxed_slice());
+        self
+    }
+
     pub fn with_idle_hook<NewT>(self, hook: IdleHook<NewT>) -> RuntimeBuilder<NewT, WF> {
         RuntimeBuilder {
             idle_hook: Some(hook),
             park_hook: None,
             worker_count: self.worker_count,
             queue_capacity: self.queue_capacity,
+            topology_override: self.topology_override,
             worker_factory: self.worker_factory,
             worker_tick_hook: self.worker_tick_hook,
         }
@@ -381,6 +391,7 @@ impl<T, WF> RuntimeBuilder<T, WF> {
         RuntimeBuilder {
             worker_count: self.worker_count,
             queue_capacity: self.queue_capacity,
+            topology_override: self.topology_override,
             worker_factory: Some(factory),
             idle_hook: self.idle_hook,
             park_hook: self.park_hook,
@@ -408,8 +419,23 @@ impl<T, WF> RuntimeBuilder<T, WF> {
             }
             .trans();
         }
-        let (registry, topo, receivers) =
-            init_runtime_components(worker_count, self.queue_capacity);
+        if let Some(worker_to_group) = self.topology_override.as_deref()
+            && (worker_to_group.len() != worker_count.get()
+                || worker_to_group
+                    .iter()
+                    .any(|&group_idx| group_idx >= worker_count.get()))
+        {
+            return RuntimeError::InvariantViolation {
+                site: "RuntimeBuilder::with_test_topology",
+                detail: "synthetic topology must map every worker to a valid group".into(),
+            }
+            .trans();
+        }
+        let (registry, topo, receivers) = shared::init_runtime_components_with_topology(
+            worker_count,
+            self.queue_capacity,
+            self.topology_override.as_deref(),
+        );
         let shared = RuntimeShared::new(
             registry,
             topo,

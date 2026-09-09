@@ -292,10 +292,35 @@ impl WorkerRegistry {
 pub(crate) struct TopologyContext {
     pub(crate) groups: Vec<NUMAGroup>,
     pub(crate) worker_to_group: Vec<usize>,
-    pub(crate) idle_slots: IdleSlots,
+    pub(crate) group_idle_slots: IdleSlots,
 }
 
 impl TopologyContext {
+    pub(crate) fn from_worker_to_group(worker_to_group: &[usize]) -> Self {
+        let worker_count = worker_to_group.len();
+        let group_count = worker_to_group
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, |group_idx| group_idx + 1);
+        let mut worker_ids = vec![Vec::new(); group_count];
+        for (worker_id, &group_idx) in worker_to_group.iter().enumerate() {
+            worker_ids[group_idx].push(worker_id);
+        }
+        let groups = worker_ids
+            .into_iter()
+            .map(|worker_ids| NUMAGroup {
+                worker_ids,
+                idle_stack: IdleStack::new(),
+            })
+            .collect();
+        Self {
+            groups,
+            worker_to_group: worker_to_group.to_vec(),
+            group_idle_slots: IdleSlots::new(worker_count),
+        }
+    }
+
     pub(crate) fn choose_worker_with_current(
         &self,
         next_worker: &AtomicUsize,
@@ -322,6 +347,7 @@ impl TopologyContext {
 pub(crate) struct GlobalInjector {
     queue: Injector<SendTaskRef>,
     drained: AtomicBool,
+    backlog: AtomicUsize,
 }
 
 impl GlobalInjector {
@@ -329,21 +355,31 @@ impl GlobalInjector {
         Self {
             queue: Injector::new(),
             drained: AtomicBool::new(false),
+            backlog: AtomicUsize::new(0),
         }
     }
 
-    pub(crate) fn push(&self, task: SendTaskRef) {
+    pub(crate) fn push_global(&self, task: SendTaskRef) {
+        self.backlog.fetch_add(1, Ordering::Release);
         self.queue.push(task);
     }
 
     pub(crate) fn pop(&self) -> Option<SendTaskRef> {
         loop {
             match self.queue.steal() {
-                Steal::Success(task) => return Some(task),
+                Steal::Success(task) => {
+                    let previous = self.backlog.fetch_sub(1, Ordering::AcqRel);
+                    debug_assert!(previous > 0, "global injector backlog underflow");
+                    return Some(task);
+                }
                 Steal::Retry => continue,
                 Steal::Empty => return None,
             }
         }
+    }
+
+    pub(crate) fn backlog(&self) -> usize {
+        self.backlog.load(Ordering::Acquire)
     }
 
     /// Drain all task references still owned by the global injector exactly once.
@@ -368,18 +404,45 @@ impl GlobalInjector {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.queue.is_empty()
+        self.backlog() == 0
     }
 }
 
 pub(crate) struct TaskScheduler {
-    pub(crate) injector: GlobalInjector,
+    injector: GlobalInjector,
     pub(crate) next_worker: AtomicUsize,
 }
 
 impl TaskScheduler {
+    pub(crate) fn new() -> Self {
+        Self {
+            injector: GlobalInjector::new(),
+            next_worker: AtomicUsize::new(0),
+        }
+    }
+
+    pub(super) fn push_global(&self, task: SendTaskRef) {
+        self.injector.push_global(task);
+    }
+
     pub(crate) fn pop_global(&self) -> Option<SendTaskRef> {
         self.injector.pop()
+    }
+
+    pub(crate) fn has_global_work(&self) -> bool {
+        self.injector.backlog() > 0
+    }
+
+    pub(crate) fn global_queue_backlog(&self) -> usize {
+        self.injector.backlog()
+    }
+
+    pub(crate) fn drain_global_once(&self, f: impl FnMut(SendTaskRef)) -> (usize, bool) {
+        self.injector.drain_once(f)
+    }
+
+    pub(crate) fn is_global_empty(&self) -> bool {
+        self.injector.is_empty()
     }
 
     pub(crate) fn steal_send(
@@ -483,32 +546,97 @@ impl TaskScheduler {
 pub(crate) struct IdleController {
     pub(crate) idle_mask: AtomicBitset,
     pub(crate) event_count: Arc<EventCount>,
+    global_idle_stack: IdleStack,
+    global_idle_slots: IdleSlots,
+    global_scan_cursor: AtomicUsize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WakeResult {
+    Woken,
+    NoIdleWorker,
 }
 
 impl IdleController {
-    /// 唤醒指定 NUMA 组内一个 idle worker；成功返回 true。
-    pub(crate) fn wake_idle_in_group(
+    pub(crate) fn new(worker_count: usize, event_count: Arc<EventCount>) -> Self {
+        Self {
+            idle_mask: AtomicBitset::new(worker_count),
+            event_count,
+            global_idle_stack: IdleStack::new(),
+            global_idle_slots: IdleSlots::new(worker_count),
+            global_scan_cursor: AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn enter_idle(&self, worker_id: usize, topo: &TopologyContext) {
+        if !self.idle_mask.try_set(worker_id) {
+            return;
+        }
+
+        let group_idx = topo.worker_to_group[worker_id];
+        topo.groups[group_idx]
+            .idle_stack
+            .push(worker_id, &topo.group_idle_slots);
+        self.global_idle_stack
+            .push(worker_id, &self.global_idle_slots);
+    }
+
+    pub(crate) fn leave_idle(&self, worker_id: usize, topo: &TopologyContext) {
+        self.idle_mask.clear(worker_id);
+        let group_idx = topo.worker_to_group[worker_id];
+        topo.groups[group_idx]
+            .idle_stack
+            .try_pop_self(worker_id, &topo.group_idle_slots);
+        self.global_idle_stack
+            .try_pop_self(worker_id, &self.global_idle_slots);
+    }
+
+    fn wake_worker(&self, worker_id: usize, registry: &WorkerRegistry) -> WakeResult {
+        if registry.unpark(worker_id).is_err() {
+            // Unparker 已将故障写入共享 fatal 通道；这里没有可向上传播的结果。
+        }
+        WakeResult::Woken
+    }
+
+    /// 优先唤醒目标 NUMA 组中的一个 worker；目标组没有候选时回退到全局 idle 索引。
+    pub(crate) fn wake_for_global_work(
         &self,
         group_idx: usize,
         topo: &TopologyContext,
         registry: &WorkerRegistry,
-    ) -> bool {
+    ) -> WakeResult {
         let group = &topo.groups[group_idx];
-        if let Some(worker_id) = group.idle_stack.pop_idle(&self.idle_mask, &topo.idle_slots) {
-            if registry.unpark(worker_id).is_err() {
-                // Unparker 已将故障写入共享 fatal 通道；这里没有可向上传播的结果。
-            }
-            return true;
+        if let Some(worker_id) = group
+            .idle_stack
+            .pop_idle(&self.idle_mask, &topo.group_idle_slots)
+        {
+            return self.wake_worker(worker_id, registry);
         }
         for &worker_id in &group.worker_ids {
             if self.idle_mask.is_set(worker_id) {
-                if registry.unpark(worker_id).is_err() {
-                    // Unparker 已将故障写入共享 fatal 通道；这里没有可向上传播的结果。
-                }
-                return true;
+                return self.wake_worker(worker_id, registry);
             }
         }
-        false
+
+        if let Some(worker_id) = self
+            .global_idle_stack
+            .pop_idle(&self.idle_mask, &self.global_idle_slots)
+        {
+            return self.wake_worker(worker_id, registry);
+        }
+
+        let worker_count = topo.worker_to_group.len();
+        if worker_count == 0 {
+            return WakeResult::NoIdleWorker;
+        }
+        let start = self.global_scan_cursor.fetch_add(1, Ordering::Relaxed) % worker_count;
+        for offset in 0..worker_count {
+            let worker_id = (start + offset) % worker_count;
+            if self.idle_mask.is_set(worker_id) {
+                return self.wake_worker(worker_id, registry);
+            }
+        }
+        WakeResult::NoIdleWorker
     }
 }
 
@@ -533,27 +661,22 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
         };
 
         let base = &self.shared.base;
-        let group_idx = base.topo.worker_to_group[self.worker_id];
-        let group = &base.topo.groups[group_idx];
         let seq = base.idle.event_count.load();
-
-        if base.idle.idle_mask.try_set(self.worker_id) {
-            group.idle_stack.push(self.worker_id, &base.topo.idle_slots);
-        }
+        base.idle.enter_idle(self.worker_id, &base.topo);
 
         if self.should_retry(seq, controller) {
-            self.leave_idle(group_idx);
+            self.leave_idle();
             return Ok(());
         }
 
         if let Some(task) = base.scheduler.pop_global() {
-            self.leave_idle(group_idx);
+            self.leave_idle();
             base.poll_send_task(self.worker_id, task)?;
             return Ok(());
         }
 
         self.park(wait_strategy)?;
-        self.leave_idle(group_idx);
+        self.leave_idle();
         Ok(())
     }
 
@@ -590,18 +713,62 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
     /// 先清 `idle_mask`（这才是「是否可被唤醒」的权威标记），再尝试摘除栈顶的自身条目。
     /// 摘不掉时条目会作为陈旧条目留在栈里，由 `pop_idle` 惰性丢弃 —— `IdleSlots` 的
     /// `in_stack` 位保证它不会被重复入栈。
-    fn leave_idle(&self, group_idx: usize) {
+    fn leave_idle(&self) {
         let base = &self.shared.base;
-        base.idle.idle_mask.clear(self.worker_id);
-        base.topo.groups[group_idx]
-            .idle_stack
-            .try_pop_self(self.worker_id, &base.topo.idle_slots);
+        base.idle.leave_idle(self.worker_id, &base.topo);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AtomicBitset, IdleSlots, IdleStack};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::{AtomicBitset, EventCount, IdleController, IdleSlots, IdleStack, WakeResult};
+    use crate::{error::RuntimeWakeError, runtime::primitives::RuntimeWaker};
+    use std::result::Result as StdResult;
+
+    struct RecordingWaker {
+        worker_id: usize,
+        calls: Arc<[AtomicUsize]>,
+    }
+
+    impl RuntimeWaker for RecordingWaker {
+        fn wake(&self) -> StdResult<(), RuntimeWakeError> {
+            self.calls[self.worker_id].fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    fn wake_fixture() -> (
+        IdleController,
+        super::TopologyContext,
+        super::WorkerRegistry,
+        Arc<[AtomicUsize]>,
+    ) {
+        let worker_count = 4;
+        let worker_count_nz = std::num::NonZeroUsize::new(worker_count).expect("workers");
+        let queue_capacity = std::num::NonZeroUsize::new(1).expect("queue capacity");
+        let (registry, _, _) =
+            crate::runtime::shared::init_runtime_components(worker_count_nz, queue_capacity);
+        let calls: Arc<[AtomicUsize]> = (0..worker_count)
+            .map(|_| AtomicUsize::new(0))
+            .collect::<Vec<_>>()
+            .into();
+        for (worker_id, unparker) in registry.unparkers.iter().enumerate() {
+            unparker
+                .bind(Arc::new(RecordingWaker {
+                    worker_id,
+                    calls: calls.clone(),
+                }))
+                .expect("recording waker must bind once");
+        }
+        let topo = super::TopologyContext::from_worker_to_group(&[0, 0, 1, 1]);
+        let idle = IdleController::new(worker_count, Arc::new(EventCount::new()));
+        (idle, topo, registry, calls)
+    }
 
     fn fixture(worker_count: usize) -> (IdleStack, IdleSlots, AtomicBitset) {
         (
@@ -705,5 +872,93 @@ mod tests {
 
         assert_eq!(stack.pop(&slots), Some(0));
         assert_eq!(stack.pop(&slots), None);
+    }
+
+    #[test]
+    fn idle_worker_has_independent_group_and_global_membership() {
+        let (idle, topo, _registry, _calls) = wake_fixture();
+        idle.enter_idle(0, &topo);
+
+        assert_eq!(
+            topo.groups[0]
+                .idle_stack
+                .pop_idle(&idle.idle_mask, &topo.group_idle_slots),
+            Some(0)
+        );
+        assert_eq!(
+            idle.global_idle_stack
+                .pop_idle(&idle.idle_mask, &idle.global_idle_slots),
+            Some(0)
+        );
+        assert!(idle.idle_mask.is_set(0));
+    }
+
+    #[test]
+    fn global_wake_prefers_target_group() {
+        let (idle, topo, registry, calls) = wake_fixture();
+        idle.enter_idle(0, &topo);
+        idle.enter_idle(2, &topo);
+
+        assert_eq!(
+            idle.wake_for_global_work(0, &topo, &registry),
+            WakeResult::Woken
+        );
+        assert_eq!(calls[0].load(Ordering::Relaxed), 1);
+        assert_eq!(calls[2].load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn global_wake_falls_back_to_other_group() {
+        let (idle, topo, registry, calls) = wake_fixture();
+        idle.enter_idle(2, &topo);
+
+        assert_eq!(
+            idle.wake_for_global_work(0, &topo, &registry),
+            WakeResult::Woken
+        );
+        assert_eq!(calls[2].load(Ordering::Relaxed), 1);
+        assert_eq!(
+            calls
+                .iter()
+                .map(|calls| calls.load(Ordering::Relaxed))
+                .sum::<usize>(),
+            1
+        );
+    }
+
+    #[test]
+    fn global_wake_cleans_stale_entries_and_terminates() {
+        let (idle, topo, registry, _calls) = wake_fixture();
+        idle.enter_idle(0, &topo);
+        idle.enter_idle(1, &topo);
+        idle.leave_idle(0, &topo);
+        idle.leave_idle(1, &topo);
+
+        assert_eq!(
+            idle.wake_for_global_work(0, &topo, &registry),
+            WakeResult::NoIdleWorker
+        );
+        assert_eq!(topo.groups[0].idle_stack.pop(&topo.group_idle_slots), None);
+        assert_eq!(idle.global_idle_stack.pop(&idle.global_idle_slots), None);
+    }
+
+    #[test]
+    fn repeated_idle_lifecycle_is_idempotent() {
+        let (idle, topo, registry, calls) = wake_fixture();
+        idle.enter_idle(0, &topo);
+        idle.enter_idle(0, &topo);
+        idle.leave_idle(0, &topo);
+        idle.leave_idle(0, &topo);
+        assert_eq!(
+            idle.wake_for_global_work(0, &topo, &registry),
+            WakeResult::NoIdleWorker
+        );
+
+        idle.enter_idle(0, &topo);
+        assert_eq!(
+            idle.wake_for_global_work(0, &topo, &registry),
+            WakeResult::Woken
+        );
+        assert_eq!(calls[0].load(Ordering::Relaxed), 1);
     }
 }

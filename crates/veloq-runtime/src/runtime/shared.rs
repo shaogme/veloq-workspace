@@ -3,10 +3,7 @@ use std::{
     num::NonZeroUsize,
     panic::{AssertUnwindSafe, catch_unwind},
     ptr::NonNull,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, MutexGuard, atomic::Ordering},
 };
 
 use crossbeam_deque::Worker;
@@ -33,8 +30,8 @@ pub(crate) mod infra;
 pub(crate) mod worker_loop;
 
 use infra::{
-    AtomicBitset, GlobalInjector, IdleController, IdleSlots, IdleStack, NUMAGroup, TaskScheduler,
-    TopologyContext, WorkerQueue, WorkerRegistry,
+    IdleController, IdleSlots, IdleStack, NUMAGroup, TaskScheduler, TopologyContext, WorkerQueue,
+    WorkerRegistry,
 };
 pub(crate) use worker_loop::{BlockOnController, run_worker_loop};
 use worker_loop::{ScopeJoinController, ShutdownController};
@@ -90,9 +87,18 @@ pub(crate) struct Receivers {
 /// 运行时支持的 worker 数量上界（不含）：worker id 需要能被编码进 idle 栈的低 32 位。
 pub(crate) const MAX_WORKER_COUNT: usize = IdleStack::MAX_WORKERS;
 
+#[cfg(test)]
 pub(crate) fn init_runtime_components(
     worker_count: NonZeroUsize,
     queue_capacity: NonZeroUsize,
+) -> (WorkerRegistry, TopologyContext, Receivers) {
+    init_runtime_components_with_topology(worker_count, queue_capacity, None)
+}
+
+pub(crate) fn init_runtime_components_with_topology(
+    worker_count: NonZeroUsize,
+    queue_capacity: NonZeroUsize,
+    topology_override: Option<&[usize]>,
 ) -> (WorkerRegistry, TopologyContext, Receivers) {
     let worker_count_val = worker_count.get();
     let shutdown = Arc::new(ShutdownCoordinator::new(worker_count_val));
@@ -121,42 +127,50 @@ pub(crate) fn init_runtime_components(
     }
     shutdown.install_shutdown_targets(unparkers.clone().into());
 
-    // NUMA detection
-    let topo_info = Topology::discover().ok();
-    let mut groups = Vec::new();
-    let mut worker_to_group = vec![0; worker_count_val];
+    let topology = if let Some(worker_to_group) = topology_override {
+        TopologyContext::from_worker_to_group(worker_to_group)
+    } else {
+        // NUMA detection
+        let topo_info = Topology::discover().ok();
+        let mut groups = Vec::new();
+        let mut worker_to_group = vec![0; worker_count_val];
 
-    match topo_info {
-        Some(t) if t.node_count() > 0 => {
-            let node_count = t.node_count();
-            let mut node_to_workers: Vec<Vec<usize>> = vec![Vec::new(); node_count];
+        match topo_info {
+            Some(t) if t.node_count() > 0 => {
+                let node_count = t.node_count();
+                let mut node_to_workers: Vec<Vec<usize>> = vec![Vec::new(); node_count];
 
-            for (i, group) in worker_to_group
-                .iter_mut()
-                .enumerate()
-                .take(worker_count_val)
-            {
-                let node_idx = i % node_count;
-                node_to_workers[node_idx].push(i);
-                *group = node_idx;
-            }
+                for i in 0..worker_count_val {
+                    let node_idx = i % node_count;
+                    node_to_workers[node_idx].push(i);
+                }
 
-            for worker_ids in node_to_workers.into_iter() {
-                if !worker_ids.is_empty() {
-                    groups.push(NUMAGroup {
-                        worker_ids,
-                        idle_stack: IdleStack::new(),
-                    });
+                for worker_ids in node_to_workers.into_iter() {
+                    if !worker_ids.is_empty() {
+                        let group_idx = groups.len();
+                        for &worker_id in &worker_ids {
+                            worker_to_group[worker_id] = group_idx;
+                        }
+                        groups.push(NUMAGroup {
+                            worker_ids,
+                            idle_stack: IdleStack::new(),
+                        });
+                    }
                 }
             }
+            _ => {
+                groups.push(NUMAGroup {
+                    worker_ids: (0..worker_count_val).collect(),
+                    idle_stack: IdleStack::new(),
+                });
+            }
         }
-        _ => {
-            groups.push(NUMAGroup {
-                worker_ids: (0..worker_count_val).collect(),
-                idle_stack: IdleStack::new(),
-            });
+        TopologyContext {
+            groups,
+            worker_to_group,
+            group_idle_slots: IdleSlots::new(worker_count_val),
         }
-    }
+    };
 
     (
         WorkerRegistry {
@@ -165,11 +179,7 @@ pub(crate) fn init_runtime_components(
             wake_failure,
             shutdown,
         },
-        TopologyContext {
-            groups,
-            worker_to_group,
-            idle_slots: IdleSlots::new(worker_count_val),
-        },
+        topology,
         Receivers { deques },
     )
 }
@@ -203,14 +213,8 @@ impl<T> RuntimeShared<T> {
             base: RuntimeSharedBase {
                 registry,
                 topo,
-                scheduler: TaskScheduler {
-                    injector: GlobalInjector::new(),
-                    next_worker: AtomicUsize::new(0),
-                },
-                idle: IdleController {
-                    idle_mask: AtomicBitset::new(worker_count.get()),
-                    event_count,
-                },
+                scheduler: TaskScheduler::new(),
+                idle: IdleController::new(worker_count.get(), event_count),
                 shutdown,
                 wake_failure,
                 local_wake_targets,
@@ -389,14 +393,19 @@ impl RuntimeSharedBase {
             return;
         }
         let mut callback_failed = false;
-        let (_, panicked) = self.scheduler.injector.drain_once(|task| {
+        let (_, panicked) = self.scheduler.drain_global_once(|task| {
             callback_failed |= Self::abandon_queued_task_and_drop(&task);
         });
         if panicked || callback_failed {
             self.shutdown.record_drain_failure();
         }
-        debug_assert!(self.scheduler.injector.is_empty());
+        debug_assert!(self.scheduler.is_global_empty());
         self.shutdown.finish_global_drain();
+    }
+
+    /// 返回 global injector 中当前尚未被 worker 消费的任务数量。
+    pub fn global_queue_backlog(&self) -> usize {
+        self.scheduler.global_queue_backlog()
     }
 
     /// 统一的 worker shutdown 尾部，也用于 worker 初始化失败和主 worker
@@ -649,6 +658,20 @@ impl RuntimeSharedBase {
         self.shutdown.request_shutdown();
     }
 
+    fn publish_global(
+        &self,
+        task: SendTaskRef,
+        target_group: usize,
+        publication_gate: MutexGuard<'_, ()>,
+    ) {
+        self.scheduler.push_global(task);
+        drop(publication_gate);
+        self.idle.event_count.notify();
+        let _ = self
+            .idle
+            .wake_for_global_work(target_group, &self.topo, &self.registry);
+    }
+
     fn enqueue_send_inner(&self, worker_id: usize, task: SendTaskRef, from_wake: bool) {
         if self.validate_worker_id(worker_id).is_err() {
             // 任务不会进入任何队列，必须在此结算 scope 义务，否则 `remaining`
@@ -662,7 +685,7 @@ impl RuntimeSharedBase {
         }
         let mut rejected = false;
         let destination = {
-            let _gate = self.shutdown.lock_publication();
+            let publication_gate = self.shutdown.lock_publication();
             if task.header().is_result_ready() {
                 None
             } else if !self.shutdown.is_running() {
@@ -674,10 +697,11 @@ impl RuntimeSharedBase {
                 worker.remote_count.fetch_add(1, Ordering::Release);
                 if let Err(task) = worker.remote_queue.push(task) {
                     worker.remote_count.fetch_sub(1, Ordering::Release);
-                    self.scheduler.injector.push(task);
-                    Some(false)
+                    let target_group = self.topo.worker_to_group[worker_id];
+                    self.publish_global(task, target_group, publication_gate);
+                    return;
                 } else {
-                    Some(true)
+                    Some(())
                 }
             } else {
                 None
@@ -691,20 +715,11 @@ impl RuntimeSharedBase {
             }
             return;
         }
-        match destination {
-            Some(true) => {
-                self.idle.event_count.notify();
-                if self.wake_worker(worker_id).is_err() {
-                    // 任务已可见；唤醒失败由共享 fatal 通道终止 runtime。
-                }
+        if let Some(()) = destination {
+            self.idle.event_count.notify();
+            if self.wake_worker(worker_id).is_err() {
+                // 任务已可见；唤醒失败由共享 fatal 通道终止 runtime。
             }
-            Some(false) => {
-                self.idle.event_count.notify();
-                let group_idx = self.topo.worker_to_group[worker_id];
-                self.idle
-                    .wake_idle_in_group(group_idx, &self.topo, &self.registry);
-            }
-            None => {}
         }
     }
 
@@ -827,6 +842,11 @@ impl<T> RuntimeShared<T> {
             || local_has_work
             || local_wake_has_work
             || worker.pinned_count.load(Ordering::Acquire) > 0
+            || self.base.scheduler.has_global_work()
+    }
+
+    pub fn global_queue_backlog(&self) -> usize {
+        self.base.global_queue_backlog()
     }
 
     pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef) -> EnqueuePinnedOutcome {
@@ -970,6 +990,7 @@ impl<T> RuntimeShared<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{error::RuntimeWakeError, runtime::primitives::RuntimeWaker};
     use crate::{
         scope::GenericScopeCompletion,
         task::{GenericWakerNode, ScopeRef, TaskVTable},
@@ -978,11 +999,27 @@ mod tests {
     use std::{
         marker::{PhantomData, PhantomPinned},
         pin::Pin,
-        sync::atomic::AtomicUsize,
+        result::Result as StdResult,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         task::{RawWaker, Waker},
     };
     use veloq_intrusive_linklist::Link;
     use veloq_storage::AtomicStorage;
+
+    struct RecordingWaker {
+        calls: Arc<[AtomicUsize]>,
+        worker_id: usize,
+    }
+
+    impl RuntimeWaker for RecordingWaker {
+        fn wake(&self) -> StdResult<(), RuntimeWakeError> {
+            self.calls[self.worker_id].fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
 
     static PANIC_WAKER_VTABLE: std::task::RawWakerVTable = std::task::RawWakerVTable::new(
         |_| std::task::RawWaker::new(std::ptr::null(), &PANIC_WAKER_VTABLE),
@@ -1030,7 +1067,8 @@ mod tests {
         assert!(header.try_mark_queued());
 
         let task = unsafe { SendTaskRef::from_header(&header) };
-        shared.base.scheduler.injector.push(task);
+        shared.base.scheduler.push_global(task);
+        assert_eq!(shared.base.global_queue_backlog(), 1);
         shared.base.complete_shutdown(0);
         shared.base.complete_shutdown(0);
 
@@ -1038,7 +1076,7 @@ mod tests {
         assert!(header.is_reclaimable());
         assert!(completion.is_done());
         assert_eq!(GLOBAL_DRAIN_DROPS.load(Ordering::Acquire), 1);
-        assert!(shared.base.scheduler.injector.is_empty());
+        assert_eq!(shared.base.global_queue_backlog(), 0);
     }
 
     #[test]
@@ -1064,12 +1102,76 @@ mod tests {
         assert!(header.try_mark_queued());
 
         let task = unsafe { SendTaskRef::from_header(&header) };
-        shared.base.scheduler.injector.push(task);
+        shared.base.scheduler.push_global(task);
+        assert_eq!(shared.base.global_queue_backlog(), 1);
         shared.base.complete_shutdown(0);
 
         assert!(header.is_reclaimable());
         assert!(completion.is_done());
         assert!(header.waker_panicked());
         assert!(shared.base.fatal_error().is_some());
+        assert_eq!(shared.base.global_queue_backlog(), 0);
+    }
+
+    #[test]
+    fn global_publication_wakes_idle_worker_from_other_group() {
+        let worker_count = NonZeroUsize::new(4).expect("workers");
+        let queue_capacity = NonZeroUsize::new(1).expect("queue capacity");
+        let (registry, _, _) = init_runtime_components(worker_count, queue_capacity);
+        let topo = infra::TopologyContext::from_worker_to_group(&[0, 0, 1, 1]);
+        let shared = RuntimeShared::<()>::new(registry, topo, worker_count, None, None, None);
+
+        let calls: Arc<[AtomicUsize]> = (0..worker_count.get())
+            .map(|_| AtomicUsize::new(0))
+            .collect::<Vec<_>>()
+            .into();
+        shared.base.registry.unparkers[2]
+            .bind(Arc::new(RecordingWaker {
+                calls: calls.clone(),
+                worker_id: 2,
+            }))
+            .expect("recording waker must bind once");
+        shared.base.idle.enter_idle(2, &shared.base.topo);
+
+        let header_in_queue = GenericTaskHeader::new_placeholder(&DROP_AFTER_POLL_VTABLE);
+        unsafe {
+            header_in_queue.initialize(&shared.base, 0, ScopeRef::dummy());
+        }
+        assert!(header_in_queue.try_mark_queued());
+        let queued_task = unsafe { SendTaskRef::from_header(&header_in_queue) };
+        let worker = &shared.base.registry.workers[0];
+        worker.remote_count.fetch_add(1, Ordering::Release);
+        assert!(worker.remote_queue.push(queued_task).is_ok());
+
+        let global_header = GenericTaskHeader::new_placeholder(&DROP_AFTER_POLL_VTABLE);
+        unsafe {
+            global_header.initialize(&shared.base, 0, ScopeRef::dummy());
+        }
+        let global_task = unsafe { SendTaskRef::from_header(&global_header) };
+
+        shared.base.enqueue_send(0, global_task);
+
+        assert_eq!(shared.base.global_queue_backlog(), 1);
+        assert_eq!(calls[2].load(Ordering::Relaxed), 1);
+        assert_eq!(
+            calls
+                .iter()
+                .map(|calls| calls.load(Ordering::Relaxed))
+                .sum::<usize>(),
+            1
+        );
+
+        let queued_task = worker.remote_queue.pop().expect("queued task");
+        worker.remote_count.fetch_sub(1, Ordering::Release);
+        shared
+            .base
+            .poll_send_task(0, queued_task)
+            .expect("remote task");
+        let global_task = shared.base.pop_global().expect("global task");
+        shared
+            .base
+            .poll_send_task(2, global_task)
+            .expect("global task");
+        assert_eq!(shared.base.global_queue_backlog(), 0);
     }
 }
