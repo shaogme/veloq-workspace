@@ -1,22 +1,274 @@
 pub(crate) mod raw;
 
-use self::raw::RawRwLock;
-use lock_api::RawRwLock as RawRwLockTrait;
+use core::{
+    fmt,
+    ops::{Deref, DerefMut},
+};
 
-pub type RwLock<T> = lock_api::RwLock<RawRwLock, T>;
-pub type RwLockReadGuard<'a, T> = lock_api::RwLockReadGuard<'a, RawRwLock, T>;
-pub type RwLockWriteGuard<'a, T> = lock_api::RwLockWriteGuard<'a, RawRwLock, T>;
+use crate::{
+    cell::UnsafeCell,
+    time::{Duration, Instant},
+};
 
+pub use self::raw::RawRwLock;
+
+pub struct RwLock<T: ?Sized> {
+    raw: RawRwLock,
+    data: UnsafeCell<T>,
+}
+
+unsafe impl<T: ?Sized + Send> Send for RwLock<T> {}
+unsafe impl<T: ?Sized + Send + Sync> Sync for RwLock<T> {}
+
+impl<T> RwLock<T> {
+    #[cfg(not(feature = "loom"))]
+    pub const fn new(val: T) -> Self {
+        Self {
+            raw: RawRwLock::new(),
+            data: UnsafeCell::new(val),
+        }
+    }
+
+    #[cfg(feature = "loom")]
+    pub fn new(val: T) -> Self {
+        Self {
+            raw: RawRwLock::new(),
+            data: UnsafeCell::new(val),
+        }
+    }
+
+    #[inline]
+    pub fn into_inner(self) -> T {
+        self.data.into_inner()
+    }
+}
+
+#[cfg(not(feature = "loom"))]
 pub const fn const_rwlock<T>(val: T) -> RwLock<T> {
-    RwLock::const_new(<RawRwLock as RawRwLockTrait>::INIT, val)
+    RwLock::new(val)
+}
+
+impl<T: ?Sized> RwLock<T> {
+    #[inline]
+    pub fn read(&self) -> RwLockReadGuard<'_, T> {
+        self.raw.lock_shared();
+        RwLockReadGuard { rwlock: self }
+    }
+
+    #[inline]
+    pub fn try_read(&self) -> Option<RwLockReadGuard<'_, T>> {
+        if self.raw.try_lock_shared() {
+            Some(RwLockReadGuard { rwlock: self })
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn try_read_for(&self, timeout: Duration) -> Option<RwLockReadGuard<'_, T>> {
+        if self.raw.try_lock_shared_for(timeout) {
+            Some(RwLockReadGuard { rwlock: self })
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn try_read_until(&self, timeout: Instant) -> Option<RwLockReadGuard<'_, T>> {
+        if self.raw.try_lock_shared_until(timeout) {
+            Some(RwLockReadGuard { rwlock: self })
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn write(&self) -> RwLockWriteGuard<'_, T> {
+        self.raw.lock_exclusive();
+        RwLockWriteGuard { rwlock: self }
+    }
+
+    #[inline]
+    pub fn try_write(&self) -> Option<RwLockWriteGuard<'_, T>> {
+        if self.raw.try_lock_exclusive() {
+            Some(RwLockWriteGuard { rwlock: self })
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn try_write_for(&self, timeout: Duration) -> Option<RwLockWriteGuard<'_, T>> {
+        if self.raw.try_lock_exclusive_for(timeout) {
+            Some(RwLockWriteGuard { rwlock: self })
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn try_write_until(&self, timeout: Instant) -> Option<RwLockWriteGuard<'_, T>> {
+        if self.raw.try_lock_exclusive_until(timeout) {
+            Some(RwLockWriteGuard { rwlock: self })
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn is_locked(&self) -> bool {
+        self.raw.is_locked()
+    }
+
+    #[inline]
+    pub fn is_locked_exclusive(&self) -> bool {
+        self.raw.is_locked_exclusive()
+    }
+
+    #[inline]
+    pub fn get_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.data.with_mut(|p| p as *mut T) }
+    }
+
+    #[inline]
+    pub fn raw(&self) -> &RawRwLock {
+        &self.raw
+    }
+}
+
+impl<T: Default> Default for RwLock<T> {
+    #[inline]
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
+impl<T> From<T> for RwLock<T> {
+    #[inline]
+    fn from(val: T) -> Self {
+        Self::new(val)
+    }
+}
+
+impl<T: ?Sized + fmt::Debug> fmt::Debug for RwLock<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut d = f.debug_struct("RwLock");
+        if let Some(guard) = self.try_read() {
+            d.field("data", &&*guard);
+        } else {
+            d.field("data", &"<locked>");
+        }
+        d.finish_non_exhaustive()
+    }
+}
+
+pub struct RwLockReadGuard<'a, T: ?Sized> {
+    rwlock: &'a RwLock<T>,
+}
+
+unsafe impl<T: ?Sized + Sync> Sync for RwLockReadGuard<'_, T> {}
+
+impl<'a, T: ?Sized> RwLockReadGuard<'a, T> {
+    #[inline]
+    pub fn rwlock(guard: &Self) -> &'a RwLock<T> {
+        guard.rwlock
+    }
+}
+
+impl<T: ?Sized> Deref for RwLockReadGuard<'_, T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.rwlock.data.with(|p| p as *const T) }
+    }
+}
+
+impl<T: ?Sized> Drop for RwLockReadGuard<'_, T> {
+    #[inline]
+    fn drop(&mut self) {
+        unsafe { self.rwlock.raw.unlock_shared() };
+    }
+}
+
+pub struct RwLockWriteGuard<'a, T: ?Sized> {
+    rwlock: &'a RwLock<T>,
+}
+
+unsafe impl<T: ?Sized + Sync> Sync for RwLockWriteGuard<'_, T> {}
+
+impl<'a, T: ?Sized> RwLockWriteGuard<'a, T> {
+    #[inline]
+    pub fn rwlock(guard: &Self) -> &'a RwLock<T> {
+        guard.rwlock
+    }
+
+    #[inline]
+    pub fn downgrade(guard: Self) -> RwLockReadGuard<'a, T> {
+        let rwlock = guard.rwlock;
+        core::mem::forget(guard);
+        unsafe { rwlock.raw.downgrade() };
+        RwLockReadGuard { rwlock }
+    }
+}
+
+impl<T: ?Sized> Deref for RwLockWriteGuard<'_, T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.rwlock.data.with(|p| p as *const T) }
+    }
+}
+
+impl<T: ?Sized> DerefMut for RwLockWriteGuard<'_, T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { &mut *self.rwlock.data.with_mut(|p| p as *mut T) }
+    }
+}
+
+impl<T: ?Sized> Drop for RwLockWriteGuard<'_, T> {
+    #[inline]
+    fn drop(&mut self) {
+        unsafe { self.rwlock.raw.unlock_exclusive() };
+    }
+}
+
+impl<T: ?Sized + fmt::Debug> fmt::Debug for RwLockReadGuard<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<T: ?Sized + fmt::Display> fmt::Display for RwLockReadGuard<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&**self, f)
+    }
+}
+
+impl<T: ?Sized + fmt::Debug> fmt::Debug for RwLockWriteGuard<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<T: ?Sized + fmt::Display> fmt::Display for RwLockWriteGuard<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&**self, f)
+    }
 }
 
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
-    use crate::sync::Arc;
-    use crate::sync::rwlock::RwLock;
-    use crate::{thread, time::Instant, vec::Vec};
     use core::time::Duration;
+
+    use crate::{
+        sync::{Arc, rwlock::RwLock},
+        thread,
+        time::Instant,
+        vec::Vec,
+    };
 
     #[test]
     fn test_rwlock_basic() {

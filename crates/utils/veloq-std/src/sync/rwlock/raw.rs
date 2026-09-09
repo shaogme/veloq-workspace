@@ -1,16 +1,17 @@
 use crate::{
-    sync::{
-        atomic::{AtomicU32, Ordering},
-        sys,
-    },
+    sync::atomic::{AtomicU32, Ordering},
     time::{Duration, Instant},
 };
-use core::ops::Deref;
+
+#[cfg(not(feature = "loom"))]
+use crate::sync::sys;
+#[cfg(not(feature = "loom"))]
 use lock_api::{
     GuardSend, RawRwLock as RawRwLockTrait, RawRwLockDowngrade, RawRwLockFair, RawRwLockTimed,
 };
+
 #[cfg(feature = "loom")]
-use std::sync::OnceLock;
+use crate::sync::sys::loom::WaitChannel;
 
 const READER_MASK: u32 = 0x0000_FFFF;
 const WRITER_WAITING_SHIFT: u32 = 16;
@@ -19,52 +20,28 @@ const WRITER_WAITING_ONE: u32 = 1 << WRITER_WAITING_SHIFT;
 const WRITER_WAITING_MAX: u32 = WRITER_WAITING_MASK >> WRITER_WAITING_SHIFT;
 const WRITER_BIT: u32 = 0x8000_0000;
 
-#[cfg(not(feature = "loom"))]
-struct StateCell(AtomicU32);
-
-#[cfg(feature = "loom")]
-struct StateCell(OnceLock<AtomicU32>);
-
-impl StateCell {
-    const fn new() -> Self {
-        #[cfg(not(feature = "loom"))]
-        {
-            Self(AtomicU32::new(0))
-        }
-        #[cfg(feature = "loom")]
-        {
-            Self(OnceLock::new())
-        }
-    }
-}
-
-impl Deref for StateCell {
-    type Target = AtomicU32;
-
-    fn deref(&self) -> &Self::Target {
-        #[cfg(not(feature = "loom"))]
-        {
-            &self.0
-        }
-        #[cfg(feature = "loom")]
-        {
-            self.0.get_or_init(|| AtomicU32::new(0))
-        }
-    }
-}
-
-/// The state word is also the platform wait address.
-///
-/// The low bits contain readers, the middle bits contain registered writers, and the
-/// high bit identifies the writer which owns the lock. A writer waiter is registered
-/// before it sleeps and is consumed by the CAS which acquires the lock. No operation
-/// relies on the value it observed before a failed CAS: every failure returns the new
-/// value to the loop and only that value may be used as a wait expectation.
 pub struct RawRwLock {
-    state: StateCell,
+    state: AtomicU32,
+    #[cfg(feature = "loom")]
+    channel: WaitChannel,
 }
 
 impl RawRwLock {
+    #[cfg(not(feature = "loom"))]
+    pub const fn new() -> Self {
+        Self {
+            state: AtomicU32::new(0),
+        }
+    }
+
+    #[cfg(feature = "loom")]
+    pub fn new() -> Self {
+        Self {
+            state: AtomicU32::new(0),
+            channel: WaitChannel::new(),
+        }
+    }
+
     #[inline]
     fn reader_count(state: u32) -> u32 {
         state & READER_MASK
@@ -191,7 +168,11 @@ impl RawRwLock {
         let downgraded = previous & WRITER_BIT != 0 && current & WRITER_BIT == 0;
 
         if released_writer || released_last_reader || removed_writer_waiter || downgraded {
+            #[cfg(not(feature = "loom"))]
             sys::wake_all_by_address(&self.state);
+
+            #[cfg(feature = "loom")]
+            self.channel.wake_all();
         }
     }
 
@@ -262,12 +243,12 @@ impl RawRwLock {
         }
     }
 
-    fn lock_shared_until(&self, timeout: Option<Instant>) -> bool {
+    pub fn lock_shared_until(&self, timeout: Option<Instant>) -> bool {
         let observed = self.state.load(Ordering::Relaxed);
         self.lock_shared_from_observed(observed, timeout)
     }
 
-    fn lock_shared_from_observed(&self, mut observed: u32, timeout: Option<Instant>) -> bool {
+    pub fn lock_shared_from_observed(&self, mut observed: u32, timeout: Option<Instant>) -> bool {
         loop {
             match self.try_acquire_shared(observed) {
                 Ok(_) => return true,
@@ -281,7 +262,12 @@ impl RawRwLock {
 
             let now = Instant::now();
             let Some(deadline) = timeout else {
+                #[cfg(not(feature = "loom"))]
                 sys::wait_on_address(&self.state, observed);
+
+                #[cfg(feature = "loom")]
+                self.channel.wait(&self.state, observed);
+
                 observed = self.state.load(Ordering::Relaxed);
                 continue;
             };
@@ -289,12 +275,18 @@ impl RawRwLock {
                 return false;
             }
             let remaining = deadline.duration_since(now);
+
+            #[cfg(not(feature = "loom"))]
             sys::wait_on_address_timeout(&self.state, observed, Some(remaining));
+
+            #[cfg(feature = "loom")]
+            self.channel.wait_timeout(&self.state, observed, remaining);
+
             observed = self.state.load(Ordering::Relaxed);
         }
     }
 
-    fn lock_exclusive_until(&self, timeout: Option<Instant>) -> bool {
+    pub fn lock_exclusive_until(&self, timeout: Option<Instant>) -> bool {
         let mut observed = self.state.load(Ordering::Relaxed);
         let mut registered = false;
         loop {
@@ -319,7 +311,12 @@ impl RawRwLock {
             }
 
             let Some(deadline) = timeout else {
+                #[cfg(not(feature = "loom"))]
                 sys::wait_on_address(&self.state, observed);
+
+                #[cfg(feature = "loom")]
+                self.channel.wait(&self.state, observed);
+
                 observed = self.state.load(Ordering::Relaxed);
                 continue;
             };
@@ -329,26 +326,24 @@ impl RawRwLock {
                 return false;
             }
             let remaining = deadline.duration_since(now);
+
+            #[cfg(not(feature = "loom"))]
             sys::wait_on_address_timeout(&self.state, observed, Some(remaining));
+
+            #[cfg(feature = "loom")]
+            self.channel.wait_timeout(&self.state, observed, remaining);
+
             observed = self.state.load(Ordering::Relaxed);
         }
     }
-}
-
-unsafe impl RawRwLockTrait for RawRwLock {
-    const INIT: Self = Self {
-        state: StateCell::new(),
-    };
-
-    type GuardMarker = GuardSend;
 
     #[inline]
-    fn lock_shared(&self) {
+    pub fn lock_shared(&self) {
         let _ = self.lock_shared_until(None);
     }
 
     #[inline]
-    fn try_lock_shared(&self) -> bool {
+    pub fn try_lock_shared(&self) -> bool {
         let mut observed = self.state.load(Ordering::Relaxed);
         loop {
             match self.try_acquire_shared(observed) {
@@ -363,18 +358,23 @@ unsafe impl RawRwLockTrait for RawRwLock {
         }
     }
 
+    /// Unlocks the shared reader lock.
+    ///
+    /// # Safety
+    ///
+    /// The caller must currently hold a shared reader lock.
     #[inline]
-    unsafe fn unlock_shared(&self) {
+    pub unsafe fn unlock_shared(&self) {
         self.release_shared();
     }
 
     #[inline]
-    fn lock_exclusive(&self) {
+    pub fn lock_exclusive(&self) {
         let _ = self.lock_exclusive_until(None);
     }
 
     #[inline]
-    fn try_lock_exclusive(&self) -> bool {
+    pub fn try_lock_exclusive(&self) -> bool {
         let mut observed = self.state.load(Ordering::Relaxed);
         loop {
             match self.try_acquire_exclusive(observed, false) {
@@ -389,76 +389,207 @@ unsafe impl RawRwLockTrait for RawRwLock {
         }
     }
 
+    /// Unlocks the exclusive writer lock.
+    ///
+    /// # Safety
+    ///
+    /// The caller must currently hold the exclusive writer lock.
     #[inline]
-    unsafe fn unlock_exclusive(&self) {
+    pub unsafe fn unlock_exclusive(&self) {
         self.release_exclusive();
     }
 
+    /// Downgrades the exclusive writer lock to a shared reader lock.
+    ///
+    /// # Safety
+    ///
+    /// The caller must currently hold the exclusive writer lock.
     #[inline]
-    fn is_locked(&self) -> bool {
+    pub unsafe fn downgrade(&self) {
+        self.downgrade_exclusive();
+    }
+
+    #[inline]
+    pub fn is_locked(&self) -> bool {
         let state = self.state.load(Ordering::Relaxed);
         state & (WRITER_BIT | READER_MASK) != 0
     }
 
     #[inline]
-    fn is_locked_exclusive(&self) -> bool {
+    pub fn is_locked_exclusive(&self) -> bool {
         self.state.load(Ordering::Relaxed) & WRITER_BIT != 0
     }
-}
 
-unsafe impl RawRwLockFair for RawRwLock {
     #[inline]
-    unsafe fn unlock_shared_fair(&self) {
+    pub fn try_lock_shared_for(&self, timeout: Duration) -> bool {
+        self.try_lock_shared_until(Instant::now() + timeout)
+    }
+
+    #[inline]
+    pub fn try_lock_shared_until(&self, timeout: Instant) -> bool {
+        self.lock_shared_until(Some(timeout))
+    }
+
+    #[inline]
+    pub fn try_lock_exclusive_for(&self, timeout: Duration) -> bool {
+        self.try_lock_exclusive_until(Instant::now() + timeout)
+    }
+
+    #[inline]
+    pub fn try_lock_exclusive_until(&self, timeout: Instant) -> bool {
+        self.lock_exclusive_until(Some(timeout))
+    }
+
+    /// Fairly unlocks the shared reader lock.
+    ///
+    /// # Safety
+    ///
+    /// The caller must currently hold a shared reader lock.
+    #[inline]
+    pub unsafe fn unlock_shared_fair(&self) {
         self.release_shared();
     }
 
+    /// Fairly unlocks the exclusive writer lock.
+    ///
+    /// # Safety
+    ///
+    /// The caller must currently hold the exclusive writer lock.
     #[inline]
-    unsafe fn unlock_exclusive_fair(&self) {
+    pub unsafe fn unlock_exclusive_fair(&self) {
         self.release_exclusive();
     }
 
+    /// Atomically releases and re-acquires the shared reader lock.
+    ///
+    /// # Safety
+    ///
+    /// The caller must currently hold a shared reader lock.
     #[inline]
-    unsafe fn bump_shared(&self) {
+    pub unsafe fn bump_shared(&self) {
         self.release_shared();
         self.lock_shared();
     }
 
+    /// Atomically releases and re-acquires the exclusive writer lock.
+    ///
+    /// # Safety
+    ///
+    /// The caller must currently hold the exclusive writer lock.
     #[inline]
-    unsafe fn bump_exclusive(&self) {
+    pub unsafe fn bump_exclusive(&self) {
         self.release_exclusive();
         self.lock_exclusive();
     }
 }
 
-unsafe impl RawRwLockDowngrade for RawRwLock {
-    #[inline]
-    unsafe fn downgrade(&self) {
-        self.downgrade_exclusive();
+impl Default for RawRwLock {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
+#[cfg(not(feature = "loom"))]
+unsafe impl RawRwLockTrait for RawRwLock {
+    const INIT: Self = Self::new();
+
+    type GuardMarker = GuardSend;
+
+    #[inline]
+    fn lock_shared(&self) {
+        self.lock_shared();
+    }
+
+    #[inline]
+    fn try_lock_shared(&self) -> bool {
+        self.try_lock_shared()
+    }
+
+    #[inline]
+    unsafe fn unlock_shared(&self) {
+        unsafe { self.unlock_shared() };
+    }
+
+    #[inline]
+    fn lock_exclusive(&self) {
+        self.lock_exclusive();
+    }
+
+    #[inline]
+    fn try_lock_exclusive(&self) -> bool {
+        self.try_lock_exclusive()
+    }
+
+    #[inline]
+    unsafe fn unlock_exclusive(&self) {
+        unsafe { self.unlock_exclusive() };
+    }
+
+    #[inline]
+    fn is_locked(&self) -> bool {
+        self.is_locked()
+    }
+
+    #[inline]
+    fn is_locked_exclusive(&self) -> bool {
+        self.is_locked_exclusive()
+    }
+}
+
+#[cfg(not(feature = "loom"))]
+unsafe impl RawRwLockFair for RawRwLock {
+    #[inline]
+    unsafe fn unlock_shared_fair(&self) {
+        unsafe { self.unlock_shared_fair() };
+    }
+
+    #[inline]
+    unsafe fn unlock_exclusive_fair(&self) {
+        unsafe { self.unlock_exclusive_fair() };
+    }
+
+    #[inline]
+    unsafe fn bump_shared(&self) {
+        unsafe { self.bump_shared() };
+    }
+
+    #[inline]
+    unsafe fn bump_exclusive(&self) {
+        unsafe { self.bump_exclusive() };
+    }
+}
+
+#[cfg(not(feature = "loom"))]
+unsafe impl RawRwLockDowngrade for RawRwLock {
+    #[inline]
+    unsafe fn downgrade(&self) {
+        unsafe { self.downgrade() };
+    }
+}
+
+#[cfg(not(feature = "loom"))]
 unsafe impl RawRwLockTimed for RawRwLock {
     type Duration = Duration;
     type Instant = Instant;
 
     #[inline]
     fn try_lock_shared_for(&self, timeout: Self::Duration) -> bool {
-        self.try_lock_shared_until(Instant::now() + timeout)
+        self.try_lock_shared_for(timeout)
     }
 
     #[inline]
     fn try_lock_shared_until(&self, timeout: Self::Instant) -> bool {
-        self.lock_shared_until(Some(timeout))
+        self.try_lock_shared_until(timeout)
     }
 
     #[inline]
     fn try_lock_exclusive_for(&self, timeout: Self::Duration) -> bool {
-        self.try_lock_exclusive_until(Instant::now() + timeout)
+        self.try_lock_exclusive_for(timeout)
     }
 
     #[inline]
     fn try_lock_exclusive_until(&self, timeout: Self::Instant) -> bool {
-        self.lock_exclusive_until(Some(timeout))
+        self.try_lock_exclusive_until(timeout)
     }
 }
 
@@ -472,9 +603,10 @@ mod tests {
         thread,
     };
 
+    #[cfg(not(feature = "loom"))]
     #[test]
     fn failed_reader_cas_uses_actual_state() {
-        let lock = RawRwLock::INIT;
+        let lock = RawRwLock::new();
         assert!(lock.try_lock_shared());
         unsafe { lock.unlock_shared() };
 
@@ -491,7 +623,7 @@ mod tests {
     #[cfg(not(feature = "loom"))]
     #[test]
     fn reader_progresses_after_stale_cas_observation() {
-        let lock = Arc::new(RawRwLock::INIT);
+        let lock = Arc::new(RawRwLock::new());
         assert!(lock.try_lock_exclusive());
         let stale = lock.state.load(Ordering::Acquire);
         let control = Arc::clone(&lock);
@@ -525,7 +657,7 @@ mod tests {
     #[cfg(not(feature = "loom"))]
     #[test]
     fn timed_reader_retries_after_stale_cas_observation() {
-        let lock = Arc::new(RawRwLock::INIT);
+        let lock = Arc::new(RawRwLock::new());
         assert!(lock.try_lock_exclusive());
         let stale = lock.state.load(Ordering::Acquire);
         let control = Arc::clone(&lock);
@@ -557,9 +689,10 @@ mod tests {
         reader.join().unwrap();
     }
 
+    #[cfg(not(feature = "loom"))]
     #[test]
     fn timed_writer_unregisters_and_wakes_readers() {
-        let lock = RawRwLock::INIT;
+        let lock = RawRwLock::new();
         assert!(lock.try_lock_exclusive());
         let waiter_state = lock.register_exclusive_waiter();
         assert_eq!(RawRwLock::writer_waiter_count(waiter_state), 1);
@@ -576,7 +709,7 @@ mod tests {
     #[cfg(not(feature = "loom"))]
     #[test]
     fn timed_writer_unregistration_wakes_blocked_reader() {
-        let lock = Arc::new(RawRwLock::INIT);
+        let lock = Arc::new(RawRwLock::new());
         assert!(lock.try_lock_exclusive());
         let registered_state = lock.register_exclusive_waiter();
         assert_eq!(RawRwLock::writer_waiter_count(registered_state), 1);
@@ -607,18 +740,20 @@ mod tests {
         reader.join().unwrap();
     }
 
+    #[cfg(not(feature = "loom"))]
     #[test]
     #[should_panic(expected = "RwLock reader count overflow")]
     fn reader_count_overflow_is_rejected() {
-        let lock = RawRwLock::INIT;
+        let lock = RawRwLock::new();
         lock.state.store(READER_MASK, Ordering::Relaxed);
         let _ = lock.try_lock_shared();
     }
 
+    #[cfg(not(feature = "loom"))]
     #[test]
     #[should_panic(expected = "RwLock writer waiter count overflow")]
     fn writer_waiter_overflow_is_rejected() {
-        let lock = RawRwLock::INIT;
+        let lock = RawRwLock::new();
         lock.state.store(WRITER_WAITING_MASK, Ordering::Relaxed);
         let _ = lock.register_exclusive_waiter();
     }
@@ -627,22 +762,20 @@ mod tests {
     #[test]
     fn loom_uses_production_raw_lock() {
         loom::model(|| {
-            let raw = RawRwLock::INIT;
-            let _ = raw.state.load(Ordering::Relaxed);
-            let lock = loom::sync::Arc::new(lock_api::RwLock::const_new(raw, 0usize));
+            let lock = loom::sync::Arc::new(RawRwLock::new());
             let reader_lock = lock.clone();
             let reader = loom::thread::spawn(move || {
-                let guard = reader_lock.read();
-                assert!(*guard <= 1);
+                reader_lock.lock_shared();
+                unsafe { reader_lock.unlock_shared() };
             });
             let writer_lock = lock.clone();
             let writer = loom::thread::spawn(move || {
-                let mut guard = writer_lock.write();
-                *guard += 1;
+                writer_lock.lock_exclusive();
+                unsafe { writer_lock.unlock_exclusive() };
             });
             reader.join().unwrap();
             writer.join().unwrap();
-            assert_eq!(*lock.read(), 1);
+            assert!(!lock.is_locked());
         });
     }
 }

@@ -555,7 +555,46 @@ mod normal_tests {
 #[cfg(feature = "loom")]
 mod loom_tests {
     use loom::{cell::Cell, thread};
-    use veloq_std::sync::{Arc, Condvar, Mutex, ReentrantMutex};
+    use veloq_std::sync::{
+        Arc, Condvar, Mutex, RawMutex, RawRwLock, ReentrantMutex, RwLock, RwLockWriteGuard,
+    };
+
+    #[test]
+    fn test_loom_mutex_simple() {
+        loom::model(|| {
+            let lock = Arc::new(Mutex::new(0));
+            let lock2 = lock.clone();
+            let h = thread::spawn(move || {
+                let mut g = lock2.lock();
+                *g += 1;
+            });
+            {
+                let mut g = lock.lock();
+                *g += 1;
+            }
+            h.join().unwrap();
+            assert_eq!(*lock.lock(), 2);
+        });
+    }
+
+    #[test]
+    fn test_loom_raw_mutex_concurrency() {
+        loom::model(|| {
+            let lock = Arc::new(RawMutex::new());
+            let l2 = lock.clone();
+
+            let h = thread::spawn(move || {
+                l2.lock();
+                unsafe { l2.unlock() };
+            });
+
+            lock.lock();
+            unsafe { lock.unlock() };
+
+            h.join().unwrap();
+            assert!(!lock.is_locked());
+        });
+    }
 
     #[test]
     fn test_loom_condvar() {
@@ -563,7 +602,7 @@ mod loom_tests {
             let pair = Arc::new((Mutex::new(false), Condvar::new()));
             let pair2 = pair.clone();
 
-            thread::spawn(move || {
+            let handle = thread::spawn(move || {
                 let (lock, cvar) = &*pair2;
                 let mut started = lock.lock();
                 *started = true;
@@ -576,6 +615,95 @@ mod loom_tests {
                 started = cvar.wait(started);
             }
             assert!(*started);
+            handle.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_loom_condvar_notify_all() {
+        loom::model(|| {
+            let pair = Arc::new((Mutex::new(false), Condvar::new()));
+            let pair2 = pair.clone();
+
+            let handle = thread::spawn(move || {
+                let (lock, cvar) = &*pair2;
+                let mut started = lock.lock();
+                *started = true;
+                cvar.notify_all();
+            });
+
+            let (lock, cvar) = &*pair;
+            let mut started = lock.lock();
+            while !*started {
+                started = cvar.wait(started);
+            }
+            assert!(*started);
+            handle.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn test_loom_rwlock_read_write() {
+        loom::model(|| {
+            let lock = Arc::new(RwLock::new(0));
+            let l1 = lock.clone();
+            let l2 = lock.clone();
+
+            let h1 = thread::spawn(move || {
+                let r = l1.read();
+                assert!(*r == 0 || *r == 1);
+            });
+
+            let h2 = thread::spawn(move || {
+                let mut w = l2.write();
+                *w = 1;
+            });
+
+            h1.join().unwrap();
+            h2.join().unwrap();
+            assert_eq!(*lock.read(), 1);
+        });
+    }
+
+    #[test]
+    fn test_loom_rwlock_downgrade() {
+        loom::model(|| {
+            let lock = Arc::new(RwLock::new(0));
+            let l1 = lock.clone();
+
+            let h = thread::spawn(move || {
+                let mut w = l1.write();
+                *w = 42;
+                let r = RwLockWriteGuard::downgrade(w);
+                assert_eq!(*r, 42);
+            });
+
+            let r = lock.read();
+            assert!(*r == 0 || *r == 42);
+            drop(r);
+
+            h.join().unwrap();
+            assert_eq!(*lock.read(), 42);
+        });
+    }
+
+    #[test]
+    fn test_loom_raw_rwlock_direct() {
+        loom::model(|| {
+            let lock = Arc::new(RawRwLock::new());
+            let l1 = lock.clone();
+
+            let h = thread::spawn(move || {
+                l1.lock_exclusive();
+                unsafe { l1.downgrade() };
+                unsafe { l1.unlock_shared() };
+            });
+
+            lock.lock_shared();
+            unsafe { lock.unlock_shared() };
+
+            h.join().unwrap();
+            assert!(!lock.is_locked());
         });
     }
 
@@ -631,6 +759,33 @@ mod loom_tests {
             h.join().unwrap();
 
             assert_eq!(m.lock().get(), 2);
+        });
+    }
+
+    #[test]
+    fn test_loom_reentrant_mutex_nested_contention() {
+        loom::model(|| {
+            let m = Arc::new(ReentrantMutex::new(Cell::new(0)));
+            let m2 = m.clone();
+
+            let h = thread::spawn(move || {
+                let g1 = m2.lock();
+                let g2 = m2.lock();
+                let g3 = m2.lock();
+                g3.set(g3.get() + 1);
+                drop(g3);
+                drop(g2);
+                drop(g1);
+            });
+
+            {
+                let g = m.lock();
+                g.set(g.get() + 10);
+            }
+
+            h.join().unwrap();
+            let final_val = m.lock().get();
+            assert_eq!(final_val, 11);
         });
     }
 

@@ -53,15 +53,18 @@ impl Key {
     }
 }
 
-pub(crate) struct AtomicKey(AtomicU32);
+pub(crate) struct AtomicKey<T>(AtomicU32, core::marker::PhantomData<fn() -> T>);
 
-impl AtomicKey {
+unsafe impl<T> Send for AtomicKey<T> {}
+unsafe impl<T> Sync for AtomicKey<T> {}
+
+impl<T> AtomicKey<T> {
     pub const fn new() -> Self {
-        Self(AtomicU32::new(0))
+        Self(AtomicU32::new(0), core::marker::PhantomData)
     }
 
     #[inline]
-    pub fn get<T>(&self) -> Result<Key, TlsErrorKind> {
+    pub fn get(&self) -> Result<Key, TlsErrorKind> {
         let mut val = self.0.load(Ordering::Acquire);
         if val > 1 {
             return Ok(Key(val - 2));

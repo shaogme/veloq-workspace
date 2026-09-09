@@ -1,4 +1,81 @@
-use crate::{sync::atomic::AtomicU32, time::Duration};
+use crate::{
+    sync::atomic::{AtomicU32, Ordering},
+    time::Duration,
+};
+
+pub struct WaitChannel {
+    mutex: loom::sync::Mutex<()>,
+    cvar: loom::sync::Condvar,
+}
+
+impl WaitChannel {
+    pub fn new() -> Self {
+        Self {
+            mutex: loom::sync::Mutex::new(()),
+            cvar: loom::sync::Condvar::new(),
+        }
+    }
+
+    /// 模拟操作系统 Futex 挂起：在持锁保护下检查 address == expected，若相等则等待一次唤醒后返回。
+    pub fn wait(&self, address: &AtomicU32, expected: u32) {
+        let guard = self.mutex.lock().unwrap();
+        if address.load(Ordering::Acquire) == expected {
+            let _ = self.cvar.wait(guard).unwrap();
+        }
+    }
+
+    /// 模拟操作系统 Futex 超时挂起。返回是否未超时。
+    pub fn wait_timeout(&self, address: &AtomicU32, expected: u32, dur: Duration) -> bool {
+        let guard = self.mutex.lock().unwrap();
+        if address.load(Ordering::Acquire) == expected {
+            let (_guard, res) = self.cvar.wait_timeout(guard, dur).unwrap();
+            !res.timed_out()
+        } else {
+            true
+        }
+    }
+
+    /// 等待满足特定条件。若 condition 返回 true，则在 Condvar 上挂起当前线程。
+    #[allow(dead_code)]
+    pub fn wait_while<F: Fn() -> bool>(&self, condition: F) {
+        let mut guard = self.mutex.lock().unwrap();
+        while condition() {
+            guard = self.cvar.wait(guard).unwrap();
+        }
+    }
+
+    /// 尝试等待，带有超时判定。
+    #[allow(dead_code)]
+    pub fn wait_timeout_while<F: Fn() -> bool>(&self, condition: F, dur: Duration) -> bool {
+        let mut guard = self.mutex.lock().unwrap();
+        while condition() {
+            let (next_guard, res) = self.cvar.wait_timeout(guard, dur).unwrap();
+            guard = next_guard;
+            if res.timed_out() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// 精准唤醒一个挂起的等待者。
+    pub fn wake_one(&self) {
+        let _g = self.mutex.lock().unwrap();
+        self.cvar.notify_one();
+    }
+
+    /// 广播唤醒所有挂起的等待者。
+    pub fn wake_all(&self) {
+        let _g = self.mutex.lock().unwrap();
+        self.cvar.notify_all();
+    }
+}
+
+impl Default for WaitChannel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 pub fn wait_on_address(address: &AtomicU32, expected: u32) {
     wait_on_address_timeout(address, expected, None);

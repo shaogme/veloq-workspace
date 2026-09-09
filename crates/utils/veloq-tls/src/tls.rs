@@ -16,7 +16,7 @@ use core::{marker::PhantomData, ptr::null_mut};
 /// - If a `Tls` instance is dropped prematurely, subsequent accesses from other threads or cleanup upon thread exit may lead to undefined behavior (UB).
 /// - You must guarantee that the lifetime of the `Tls` instance is longer than all threads accessing it.
 pub struct Tls<T> {
-    key: AtomicKey,
+    key: AtomicKey<T>,
     marker: PhantomData<T>,
 }
 
@@ -39,7 +39,7 @@ impl<T> Tls<T> {
 
     #[inline]
     fn get_key(&self) -> Result<Key, TlsErrorKind> {
-        self.key.get::<T>()
+        self.key.get()
     }
 
     /// Helper to retrieve the TLS value pointer, optionally initializing it.
@@ -291,7 +291,7 @@ impl<T> Drop for Tls<T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "loom")))]
 mod tests {
     extern crate std;
     use super::*;

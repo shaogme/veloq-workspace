@@ -9,6 +9,8 @@ mod linux;
 pub use linux::{wait_on_address, wait_on_address_timeout, wake_all_by_address, wake_by_address};
 
 #[cfg(feature = "loom")]
-mod loom;
+pub(crate) mod loom;
+
 #[cfg(feature = "loom")]
+#[allow(unused_imports)]
 pub use loom::{wait_on_address, wait_on_address_timeout, wake_all_by_address, wake_by_address};
