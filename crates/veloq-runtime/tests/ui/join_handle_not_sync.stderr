@@ -14,7 +14,7 @@ note: required because it appears within the type `PhantomData<Cell<()>>`
 note: required because it appears within the type `veloq_runtime::scope::JoinHandle<'_, usize, SendTaskRef, GenericAsyncScope<'_, '_, '_, AtomicStorage, ArcOwnership, _>, _>`
  --> src/scope/join.rs
   |
-  | pub struct JoinHandle<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra> {
+  | pub struct JoinHandle<
   |            ^^^^^^^^^^
   = note: required for the cast from `&veloq_runtime::scope::JoinHandle<'_, usize, SendTaskRef, GenericAsyncScope<'_, '_, '_, AtomicStorage, ArcOwnership, _>, _>` to `&dyn Sync`
 
@@ -34,7 +34,7 @@ note: required because it appears within the type `scope::join::JoinSource<'_, u
 note: required because it appears within the type `veloq_runtime::scope::JoinHandle<'_, usize, SendTaskRef, GenericAsyncScope<'_, '_, '_, AtomicStorage, ArcOwnership, _>, _>`
  --> src/scope/join.rs
   |
-  | pub struct JoinHandle<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra> {
+  | pub struct JoinHandle<
   |            ^^^^^^^^^^
   = note: required for the cast from `&veloq_runtime::scope::JoinHandle<'_, usize, SendTaskRef, GenericAsyncScope<'_, '_, '_, AtomicStorage, ArcOwnership, _>, _>` to `&dyn Sync`
 
@@ -74,6 +74,6 @@ note: required because it appears within the type `scope::join::JoinSource<'_, u
 note: required because it appears within the type `veloq_runtime::scope::JoinHandle<'_, usize, SendTaskRef, GenericAsyncScope<'_, '_, '_, AtomicStorage, ArcOwnership, _>, _>`
  --> src/scope/join.rs
   |
-  | pub struct JoinHandle<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra> {
+  | pub struct JoinHandle<
   |            ^^^^^^^^^^
   = note: required for the cast from `&veloq_runtime::scope::JoinHandle<'_, usize, SendTaskRef, GenericAsyncScope<'_, '_, '_, AtomicStorage, ArcOwnership, _>, _>` to `&dyn Sync`

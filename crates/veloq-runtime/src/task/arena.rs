@@ -1,7 +1,7 @@
-use super::TaskJoinGate;
 use std::{
-    alloc::{Layout, alloc, dealloc, handle_alloc_error},
+    alloc::{Layout, alloc, dealloc},
     marker::PhantomData,
+    num::NonZeroUsize,
     pin::Pin,
     ptr::{self, NonNull},
     sync::atomic::Ordering,
@@ -11,57 +11,54 @@ use veloq_storage::{StateInt, StateLock, StateOptionPtr, Storage, ThreadSafeStor
 
 /// 一个高性能的、块分配器接口。
 pub trait Arena {
+    type Allocation<'arena>: ArenaAllocation
+    where
+        Self: 'arena;
+
     /// # Safety
-    /// The layout must be valid. If `drop_fn` is provided, it must be safe to call on the returned
-    /// pointer. Only allocations created with `Some(drop_fn)` may later be passed to
-    /// [`Arena::drop_object_raw`]; an allocation created with `None` has no reclaim metadata.
-    unsafe fn alloc_raw(
-        &self,
+    /// `layout` must describe the initialized object that will be stored in the returned slot,
+    /// and `drop_fn` must be safe to call with the slot's data pointer after that object has been
+    /// initialized. The returned token must not be reclaimed before initialization is complete.
+    unsafe fn alloc_managed<'arena>(
+        &'arena self,
         layout: Layout,
-        drop_fn: Option<unsafe fn(*mut u8)>,
-    ) -> Option<NonNull<u8>>;
+        drop_fn: unsafe fn(*mut u8),
+    ) -> Option<Self::Allocation<'arena>>;
+}
+
+/// 不可复制的 arena 回收令牌。
+///
+/// 令牌由带 `DropNode` 的分配产生，并且只能按值消费一次。普通字节分配不产生此令牌，
+/// 因而不能被传给对象回收路径。
+pub trait ArenaAllocation {
+    fn data_ptr(&self) -> NonNull<u8>;
+
     /// # Safety
-    /// `data_ptr` must be a pointer previously returned by `alloc_raw` with a non-`None` drop
-    /// function, and `layout` must be identical to the allocation layout.
-    unsafe fn drop_object_raw(&self, data_ptr: *mut u8, layout: Layout);
+    /// The object at [`Self::data_ptr`] must have been initialized with the type described by the
+    /// allocation's drop function. Consuming a token without initializing its object is invalid.
+    unsafe fn reclaim(self);
 }
 
 /// One-shot owner for an arena-backed task node.
 ///
 /// A lease may only be created after the task header has published
-/// `RECLAIMABLE`. Its destructor is the single fallback that invokes the node's
-/// arena reclaim callback, so result extraction and error paths cannot leak or
+/// `RECLAIMABLE`. Its destructor is the single fallback that consumes the
+/// managed allocation, so result extraction and error paths cannot leak or
 /// reclaim the same node twice.
-pub(crate) struct TaskLease<'scope_ref, 'arena, T, A: Arena> {
-    arena: &'arena A,
-    gate: &'scope_ref dyn TaskJoinGate<T>,
-    reclaim: Option<unsafe fn(&A, &'scope_ref dyn TaskJoinGate<T>)>,
-    marker: PhantomData<T>,
+pub(crate) struct TaskLease<A: ArenaAllocation> {
+    allocation: Option<A>,
 }
 
-impl<'scope_ref, 'arena, T, A: Arena> TaskLease<'scope_ref, 'arena, T, A> {
-    /// # Safety
-    ///
-    /// The caller must have observed `GenericTaskHeader::is_reclaimable()` and
-    /// the callback must reclaim exactly the node represented by `gate`.
-    pub(crate) unsafe fn new(
-        arena: &'arena A,
-        gate: &'scope_ref dyn TaskJoinGate<T>,
-        reclaim: Option<unsafe fn(&A, &'scope_ref dyn TaskJoinGate<T>)>,
-    ) -> Self {
-        Self {
-            arena,
-            gate,
-            reclaim,
-            marker: PhantomData,
-        }
+impl<A: ArenaAllocation> TaskLease<A> {
+    pub(crate) fn new(allocation: Option<A>) -> Self {
+        Self { allocation }
     }
 }
 
-impl<T, A: Arena> Drop for TaskLease<'_, '_, T, A> {
+impl<A: ArenaAllocation> Drop for TaskLease<A> {
     fn drop(&mut self) {
-        if let Some(reclaim) = self.reclaim.take() {
-            unsafe { reclaim(self.arena, self.gate) };
+        if let Some(allocation) = self.allocation.take() {
+            unsafe { allocation.reclaim() };
         }
     }
 }
@@ -90,11 +87,9 @@ pub(crate) struct GenericChunk<S: Storage> {
 }
 
 struct FreeBlock {
-    data: NonNull<u8>,
+    ptr: NonNull<u8>,
     chunk: NonNull<u8>,
-    size: usize,
-    align: usize,
-    has_drop_node: bool,
+    layout: Layout,
 }
 
 unsafe impl Send for FreeBlock {}
@@ -128,102 +123,65 @@ impl<S: Storage> Default for GenericArena<S> {
 }
 
 impl<S: Storage> GenericArena<S> {
-    /// 分配内存并记录其析构函数。
+    /// 分配一个带 `DropNode` 的未初始化对象槽位。
     /// # Safety
-    /// The caller must ensure that `drop_fn` is valid.
-    pub unsafe fn alloc<T>(
-        &self,
+    /// `layout` must be the layout of the object written to the returned data pointer, and
+    /// `drop_fn` must be valid for that initialized object.
+    pub unsafe fn alloc_managed<'arena>(
+        &'arena self,
         layout: Layout,
-        drop_fn: Option<unsafe fn(*mut u8)>,
-    ) -> Option<NonNull<u8>> {
-        // 1. 如果有析构函数，需要额外分配 DropNode 空间
-        let (total_layout, offset) = if drop_fn.is_some() {
-            let node_layout = Layout::new::<GenericDropNode<S>>();
-            match node_layout.extend(layout) {
-                Ok(v) => v,
-                Err(_) => return None,
-            }
-        } else {
-            (layout, 0)
-        };
+        drop_fn: unsafe fn(*mut u8),
+    ) -> Option<ManagedAllocation<'arena, S>>
+    where
+        S: 'arena,
+    {
+        let node_layout = Layout::new::<GenericDropNode<S>>();
+        let (total_layout, offset) = node_layout.extend(layout).ok()?;
 
-        // 2. 尝试快速分配
-        let mut res = self.try_alloc_fast(total_layout);
+        let (ptr, chunk_ptr) = self
+            .try_alloc_fast(total_layout)
+            .or_else(|| self.alloc_slow(total_layout, true))?;
+        let node_ptr = ptr as *mut GenericDropNode<S>;
+        let data_ptr = unsafe { ptr.add(offset) };
 
-        // 3. 快速分配失败，进入慢速路径（分配新块）
-        if res.is_none() {
-            res = Some(self.alloc_slow(total_layout, drop_fn.is_some()));
-        }
+        unsafe {
+            ptr::write(
+                node_ptr,
+                GenericDropNode {
+                    link: Link::new(),
+                    data_ptr,
+                    drop_fn: S::Usize::new(drop_fn as usize),
+                    chunk: chunk_ptr,
+                },
+            );
 
-        let (ptr, chunk_ptr) = res?;
+            let mut drop_list = (*chunk_ptr).drop_list.lock();
+            drop_list.push_front(Pin::new_unchecked(&mut *node_ptr));
 
-        // 4. 如果需要销毁，初始化 DropNode 并压入块内链表
-        if let Some(drop_fn) = drop_fn {
-            let node_ptr = ptr as *mut GenericDropNode<S>;
-            let data_ptr = unsafe { ptr.add(offset) };
-
-            unsafe {
-                ptr::write(
-                    node_ptr,
-                    GenericDropNode {
-                        link: Link::new(),
-                        drop_fn: S::Usize::new(drop_fn as usize),
-                        data_ptr,
-                        chunk: chunk_ptr,
-                    },
-                );
-
-                // 在锁保护下插入链表
-                let mut drop_list = (*chunk_ptr).drop_list.lock();
-                drop_list.push_front(Pin::new_unchecked(&mut *node_ptr));
-            }
-            NonNull::new(data_ptr)
-        } else {
-            NonNull::new(ptr)
+            Some(ManagedAllocation {
+                data_ptr: NonNull::new_unchecked(data_ptr),
+                node: NonNull::new_unchecked(node_ptr),
+                layout: total_layout,
+                arena: self,
+                marker: PhantomData,
+            })
         }
     }
 
-    /// 手动触发对象的析构并将其完整分配块放入 free-list。
-    /// # Safety
-    /// The `data_ptr` must be valid and points to an object allocated by this arena.
-    pub unsafe fn drop_object<T>(&self, data_ptr: *mut T, layout: Layout) {
-        // 1. 计算 DropNode 的位置
-        let node_layout = Layout::new::<GenericDropNode<S>>();
-        let Ok((total_layout, offset)) = node_layout.extend(layout) else {
-            return;
-        };
-        let node_ptr = unsafe { (data_ptr as *mut u8).sub(offset) as *mut GenericDropNode<S> };
-
-        // 2. 执行析构
-        let drop_fn_val = unsafe { (*node_ptr).drop_fn.fetch_and(0, Ordering::AcqRel) };
-        let chunk_ptr = unsafe { (*node_ptr).chunk as *mut GenericChunk<S> };
-
-        if drop_fn_val == 0 {
-            return;
+    /// 分配不会进入对象回收 free-list 的原始字节空间。
+    ///
+    /// 该接口不创建 `DropNode`，返回的指针不能转换为 [`ArenaAllocation`]，并且其存储会
+    /// 一直保留到 arena 析构。零大小布局返回满足其对齐要求的无 provenance 悬空指针，
+    /// 不会触碰底层分配器。
+    pub fn alloc_bytes(&self, layout: Layout) -> Option<NonNull<u8>> {
+        if layout.size() == 0 {
+            let align = NonZeroUsize::new(layout.align()).expect("Layout alignment is non-zero");
+            return Some(NonNull::without_provenance(align));
         }
 
-        unsafe {
-            let drop_fn = *(&drop_fn_val as *const usize as *const unsafe fn(*mut u8));
-            (drop_fn)(data_ptr as *mut u8);
-        }
-
-        // 3. 从双向链表安全移除节点，并把完整分配块放入复用链表
-        unsafe {
-            let mut drop_list = (*chunk_ptr).drop_list.lock();
-            let mut cursor = drop_list.cursor_mut_from_ptr(NonNull::new_unchecked(node_ptr));
-            if cursor.get_raw().is_some() {
-                cursor.remove();
-            }
-        }
-
-        let mut free_list = self.free_list.lock();
-        free_list.push(FreeBlock {
-            data: unsafe { NonNull::new_unchecked(node_ptr as *mut u8) },
-            chunk: unsafe { NonNull::new_unchecked(chunk_ptr as *mut u8) },
-            size: total_layout.size(),
-            align: total_layout.align(),
-            has_drop_node: true,
-        });
+        self.try_alloc_fast(layout)
+            .or_else(|| self.alloc_slow(layout, false))
+            .map(|(ptr, _)| unsafe { NonNull::new_unchecked(ptr) })
     }
 
     fn try_alloc_fast(&self, layout: Layout) -> Option<(*mut u8, *mut GenericChunk<S>)> {
@@ -237,14 +195,18 @@ impl<S: Storage> GenericArena<S> {
     }
 
     #[inline(never)]
-    fn alloc_slow(&self, layout: Layout, has_drop_node: bool) -> (*mut u8, *mut GenericChunk<S>) {
+    fn alloc_slow(
+        &self,
+        layout: Layout,
+        reuse_managed_block: bool,
+    ) -> Option<(*mut u8, *mut GenericChunk<S>)> {
         let mut chunks = self.chunks.lock();
 
-        if let Some(block) = self.take_free_block(layout, has_drop_node) {
-            return (
-                block.data.as_ptr(),
+        if reuse_managed_block && let Some(block) = self.take_free_block(layout) {
+            return Some((
+                block.ptr.as_ptr(),
                 block.chunk.as_ptr() as *mut GenericChunk<S>,
-            );
+            ));
         }
 
         // Double-check
@@ -252,28 +214,20 @@ impl<S: Storage> GenericArena<S> {
             let a_ref = unsafe { current_active.as_ref() };
             let p = a_ref.try_alloc(layout);
             if !p.is_null() {
-                return (p, current_active.as_ptr());
+                return Some((p, current_active.as_ptr()));
             }
         }
 
         // 分配新块
-        let required_size = layout
-            .size()
-            .checked_add(layout.align())
-            .unwrap_or_else(|| handle_alloc_error(layout));
+        let required_size = layout.size().checked_add(layout.align())?;
         let chunk_size = 8192.max(required_size);
-        let new_chunk_layout = match Layout::from_size_align(chunk_size, 64) {
-            Ok(layout) => layout,
-            Err(_) => handle_alloc_error(layout),
-        };
+        let new_chunk_layout = Layout::from_size_align(chunk_size, 64).ok()?;
         let ptr = unsafe { alloc(new_chunk_layout) };
-        if ptr.is_null() {
-            handle_alloc_error(new_chunk_layout);
-        }
+        let ptr = NonNull::new(ptr)?;
 
         let new_chunk = Box::new(GenericChunk {
             link: Link::new(),
-            ptr: NonNull::new(ptr).unwrap_or_else(|| handle_alloc_error(new_chunk_layout)),
+            ptr,
             layout: new_chunk_layout,
             used: S::Usize::new(0),
             drop_list: S::Lock::new(LinkedList::new(DropAdapter::<S>::new())),
@@ -281,6 +235,13 @@ impl<S: Storage> GenericArena<S> {
 
         let chunk_ptr: *mut GenericChunk<S> = Box::into_raw(new_chunk);
         let allocated_ptr = unsafe { (*chunk_ptr).try_alloc(layout) };
+        if allocated_ptr.is_null() {
+            unsafe {
+                drop(Box::from_raw(chunk_ptr));
+                dealloc(ptr.as_ptr(), new_chunk_layout);
+            }
+            return None;
+        }
 
         unsafe {
             chunks.push_back(Pin::new_unchecked(&mut *chunk_ptr));
@@ -289,16 +250,12 @@ impl<S: Storage> GenericArena<S> {
         self.active_chunk
             .swap(Some(NonNull::new(chunk_ptr).unwrap()), Ordering::AcqRel);
 
-        (allocated_ptr, chunk_ptr)
+        Some((allocated_ptr, chunk_ptr))
     }
 
-    fn take_free_block(&self, layout: Layout, has_drop_node: bool) -> Option<FreeBlock> {
+    fn take_free_block(&self, layout: Layout) -> Option<FreeBlock> {
         let mut free_list = self.free_list.lock();
-        let index = free_list.iter().position(|block| {
-            block.size == layout.size()
-                && block.align == layout.align()
-                && block.has_drop_node == has_drop_node
-        })?;
+        let index = free_list.iter().position(|block| block.layout == layout)?;
         Some(free_list.swap_remove(index))
     }
 }
@@ -307,7 +264,9 @@ impl<S: Storage> GenericChunk<S> {
     fn try_alloc(&self, layout: Layout) -> *mut u8 {
         let align = layout.align();
         let size = layout.size();
-        let mask = align - 1;
+        let Some(mask) = align.checked_sub(1) else {
+            return ptr::null_mut();
+        };
 
         let base_addr = self.ptr.as_ptr() as usize;
         let mut current_used = self.used.load(Ordering::Acquire);
@@ -316,9 +275,18 @@ impl<S: Storage> GenericChunk<S> {
                 Some(addr) => addr,
                 None => return ptr::null_mut(),
             };
-            let aligned_ptr = (current_ptr + mask) & !mask;
-            let offset = aligned_ptr - base_addr;
-            let new_used = offset + size;
+            let aligned_ptr = match current_ptr.checked_add(mask) {
+                Some(addr) => addr & !mask,
+                None => return ptr::null_mut(),
+            };
+            let offset = match aligned_ptr.checked_sub(base_addr) {
+                Some(offset) => offset,
+                None => return ptr::null_mut(),
+            };
+            let new_used = match offset.checked_add(size) {
+                Some(used) => used,
+                None => return ptr::null_mut(),
+            };
 
             if new_used <= self.layout.size() {
                 match self.used.compare_exchange_weak(
@@ -365,20 +333,73 @@ impl<S: Storage> Drop for GenericArena<S> {
 }
 
 impl<S: Storage> Arena for GenericArena<S> {
-    #[inline]
-    unsafe fn alloc_raw(
-        &self,
-        layout: Layout,
-        drop_fn: Option<unsafe fn(*mut u8)>,
-    ) -> Option<NonNull<u8>> {
-        unsafe { self.alloc::<()>(layout, drop_fn) }
-    }
+    type Allocation<'arena>
+        = ManagedAllocation<'arena, S>
+    where
+        Self: 'arena;
 
     #[inline]
-    unsafe fn drop_object_raw(&self, data_ptr: *mut u8, layout: Layout) {
-        unsafe { self.drop_object::<()>(data_ptr as *mut (), layout) }
+    unsafe fn alloc_managed<'arena>(
+        &'arena self,
+        layout: Layout,
+        drop_fn: unsafe fn(*mut u8),
+    ) -> Option<Self::Allocation<'arena>> {
+        unsafe { GenericArena::alloc_managed(self, layout, drop_fn) }
     }
 }
+
+/// `alloc_managed` 返回的、带有 arena 生命周期的回收令牌。
+pub struct ManagedAllocation<'arena, S: Storage> {
+    data_ptr: NonNull<u8>,
+    node: NonNull<GenericDropNode<S>>,
+    layout: Layout,
+    arena: &'arena GenericArena<S>,
+    marker: PhantomData<&'arena S>,
+}
+
+impl<S: Storage> ArenaAllocation for ManagedAllocation<'_, S> {
+    fn data_ptr(&self) -> NonNull<u8> {
+        self.data_ptr
+    }
+
+    unsafe fn reclaim(self) {
+        let Self {
+            data_ptr,
+            node,
+            layout,
+            arena,
+            marker: _,
+        } = self;
+
+        let drop_fn_val = unsafe { node.as_ref().drop_fn.fetch_and(0, Ordering::AcqRel) };
+        if drop_fn_val == 0 {
+            return;
+        }
+
+        let drop_fn = unsafe { *(&drop_fn_val as *const usize as *const unsafe fn(*mut u8)) };
+        unsafe { drop_fn(data_ptr.as_ptr()) };
+
+        let chunk_ptr = unsafe { node.as_ref().chunk as *mut GenericChunk<S> };
+        unsafe {
+            let mut drop_list = (*chunk_ptr).drop_list.lock();
+            let mut cursor = drop_list.cursor_mut_from_ptr(node);
+            debug_assert!(cursor.get_raw().is_some());
+            if cursor.get_raw().is_some() {
+                cursor.remove();
+            }
+        }
+
+        let mut free_list = arena.free_list.lock();
+        free_list.push(FreeBlock {
+            ptr: node.cast(),
+            chunk: unsafe { NonNull::new_unchecked(chunk_ptr as *mut u8) },
+            layout,
+        });
+    }
+}
+
+unsafe impl<S: ThreadSafeStorage> Send for ManagedAllocation<'_, S> {}
+unsafe impl<S: ThreadSafeStorage> Sync for ManagedAllocation<'_, S> {}
 
 // 安全性：GenericArena 的 Send/Sync 性质取决于 Storage 的实现
 unsafe impl<S: ThreadSafeStorage> Send for GenericArena<S>
@@ -407,12 +428,23 @@ unsafe impl<S: ThreadSafeStorage> Sync for GenericChunk<S> where
 
 #[cfg(test)]
 mod tests {
-    use super::{Arena, GenericArena};
+    use super::{ArenaAllocation, DropAdapter, GenericArena, GenericChunk};
     use std::{
         alloc::Layout,
+        num::NonZeroUsize,
+        ptr::{self, NonNull},
         sync::atomic::{AtomicUsize, Ordering},
     };
-    use veloq_storage::AtomicStorage;
+    use veloq_intrusive_linklist::LinkedList;
+    use veloq_storage::{AtomicStorage, StateLock, Storage};
+
+    #[repr(C, align(8))]
+    struct Large([u8; 9000]);
+
+    #[repr(align(256))]
+    struct HighlyAligned {
+        _value: u8,
+    }
 
     static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -426,13 +458,105 @@ mod tests {
         let arena = GenericArena::<AtomicStorage>::new();
         let layout = Layout::from_size_align(9000, 8).unwrap();
 
-        let first = unsafe { arena.alloc_raw(layout, Some(count_drop)) }.unwrap();
-        unsafe { arena.drop_object_raw(first.as_ptr(), layout) };
+        let first = unsafe { arena.alloc_managed(layout, count_drop) }.unwrap();
+        let first_ptr = first.data_ptr();
+        unsafe { ptr::write(first_ptr.as_ptr() as *mut Large, Large([0; 9000])) };
+        unsafe { first.reclaim() };
 
-        let second = unsafe { arena.alloc_raw(layout, Some(count_drop)) }.unwrap();
-        assert_eq!(first, second);
-        unsafe { arena.drop_object_raw(second.as_ptr(), layout) };
+        let second = unsafe { arena.alloc_managed(layout, count_drop) }.unwrap();
+        assert_eq!(first_ptr, second.data_ptr());
+        unsafe { ptr::write(second.data_ptr().as_ptr() as *mut Large, Large([0; 9000])) };
+        unsafe { second.reclaim() };
 
         assert_eq!(DROP_COUNT.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn arena_reclaims_live_managed_allocation_on_drop() {
+        DROP_COUNT.store(0, Ordering::Relaxed);
+        {
+            let arena = GenericArena::<AtomicStorage>::new();
+            let allocation =
+                unsafe { arena.alloc_managed(Layout::new::<u64>(), count_drop) }.unwrap();
+            unsafe { ptr::write(allocation.data_ptr().as_ptr() as *mut u64, 0) };
+            assert_eq!(DROP_COUNT.load(Ordering::Relaxed), 0);
+        }
+        assert_eq!(DROP_COUNT.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn byte_allocation_does_not_enter_managed_free_list() {
+        let arena = GenericArena::<AtomicStorage>::new();
+        let layout = Layout::from_size_align(9000, 8).unwrap();
+        let first = unsafe { arena.alloc_managed(layout, count_drop) }.unwrap();
+        let first_ptr = first.data_ptr();
+        unsafe { ptr::write(first_ptr.as_ptr() as *mut Large, Large([0; 9000])) };
+        unsafe { first.reclaim() };
+
+        let bytes = arena.alloc_bytes(layout).unwrap();
+        assert_ne!(bytes, first_ptr);
+
+        let managed = unsafe { arena.alloc_managed(layout, count_drop) }.unwrap();
+        assert_eq!(first_ptr, managed.data_ptr());
+        unsafe { ptr::write(managed.data_ptr().as_ptr() as *mut Large, Large([0; 9000])) };
+        unsafe { managed.reclaim() };
+    }
+
+    #[test]
+    fn managed_allocation_supports_zero_and_high_alignment() {
+        let arena = GenericArena::<AtomicStorage>::new();
+
+        let zero = unsafe { arena.alloc_managed(Layout::new::<()>(), count_drop) }.unwrap();
+        unsafe { ptr::write(zero.data_ptr().as_ptr() as *mut (), ()) };
+        unsafe { zero.reclaim() };
+
+        let aligned_layout = Layout::new::<HighlyAligned>();
+        let aligned = unsafe { arena.alloc_managed(aligned_layout, count_drop) }.unwrap();
+        assert_eq!(aligned.data_ptr().as_ptr() as usize % 256, 0);
+        unsafe {
+            ptr::write(
+                aligned.data_ptr().as_ptr() as *mut HighlyAligned,
+                HighlyAligned { _value: 0 },
+            );
+            aligned.reclaim();
+        }
+
+        let bytes = arena
+            .alloc_bytes(Layout::from_size_align(0, 256).unwrap())
+            .unwrap();
+        assert_eq!(bytes.as_ptr() as usize % 256, 0);
+    }
+
+    #[test]
+    fn layout_extension_failure_returns_none() {
+        let arena = GenericArena::<AtomicStorage>::new();
+        let oversized = Layout::from_size_align(isize::MAX as usize, 1).unwrap();
+        assert!(unsafe { arena.alloc_managed(oversized, count_drop) }.is_none());
+    }
+
+    #[test]
+    fn try_alloc_rejects_address_arithmetic_overflow() {
+        let layout = Layout::from_size_align(8, 8).unwrap();
+        let base_overflow = GenericChunk::<AtomicStorage> {
+            link: veloq_intrusive_linklist::Link::new(),
+            ptr: NonNull::without_provenance(NonZeroUsize::new(0x1000).unwrap()),
+            layout,
+            used: <AtomicStorage as Storage>::Usize::new(usize::MAX),
+            drop_list: <AtomicStorage as Storage>::Lock::new(LinkedList::new(DropAdapter::<
+                AtomicStorage,
+            >::new())),
+        };
+        assert!(base_overflow.try_alloc(layout).is_null());
+
+        let alignment_overflow = GenericChunk::<AtomicStorage> {
+            link: veloq_intrusive_linklist::Link::new(),
+            ptr: NonNull::without_provenance(NonZeroUsize::new(usize::MAX).unwrap()),
+            layout,
+            used: <AtomicStorage as Storage>::Usize::new(0),
+            drop_list: <AtomicStorage as Storage>::Lock::new(LinkedList::new(DropAdapter::<
+                AtomicStorage,
+            >::new())),
+        };
+        assert!(alignment_overflow.try_alloc(layout).is_null());
     }
 }

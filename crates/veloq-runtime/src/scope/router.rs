@@ -1,10 +1,11 @@
 use crate::{
     error::{Result as RuntimeResult, RuntimeError},
     runtime::{EnqueuePinnedOutcome, RuntimeCtx, RuntimeShared},
-    scope::{GenericScopeCompletion, SendPtr, guard::ScopeTaskGuard},
+    scope::{GenericScopeCompletion, guard::ScopeTaskGuard},
     task::{
-        Arena, GenericArena, GenericTaskHeader, RawScope, RawTask, ScopeRef, ScopeStorage,
-        SendBoxedTaskNode, SendTask, SendTaskRef, Task, TaskError, TaskHandleRef,
+        ArenaAllocation, GenericArena, GenericTaskHeader, ManagedAllocation, RawScope, RawTask,
+        ScopeRef, ScopeStorage, SendBoxedTaskNode, SendTask, SendTaskRef, Task, TaskError,
+        TaskHandleRef,
     },
     utils::ownership::{ArcOwnership, Ownership},
 };
@@ -15,7 +16,7 @@ use std::{
     marker::PhantomData,
     mem,
     panic::{AssertUnwindSafe, catch_unwind},
-    ptr::{NonNull, drop_in_place, write},
+    ptr::{drop_in_place, write},
     sync::Arc,
     task::Waker,
 };
@@ -37,7 +38,7 @@ pub(crate) enum RoutedTakeReadyOutcome<'scope_ref, T> {
 
 pub(crate) trait RoutedTaskAccess<T>: Send {
     fn take_result(&self) -> RoutedTakeResult<T>;
-    fn reclaim(self: Box<Self>, arena: &dyn Arena);
+    fn reclaim(self: Box<Self>);
 }
 
 pub(crate) struct RoutedSpawnReady<'scope_ref, T> {
@@ -95,52 +96,43 @@ impl<F> RoutedJobCell<F> {
 ///
 /// 这样就不再需要主线程按「结果状态」反推所有权 —— 结果状态并不携带「cell 归谁释放」
 /// 的信息，避免了由此引发的双重释放问题。
-pub(crate) struct RoutedJobCellOwner<F> {
-    arena: SendPtr<GenericArena<AtomicStorage>>,
-    cell: SendPtr<RoutedJobCell<F>>,
-    layout: Layout,
-    released: bool,
+pub(crate) struct RoutedJobCellOwner<'scope_ref, F> {
+    allocation: Option<ManagedAllocation<'scope_ref, AtomicStorage>>,
+    marker: PhantomData<F>,
 }
 
-impl<F> RoutedJobCellOwner<F> {
-    /// # Safety
-    ///
-    /// `cell` 必须是 `arena` 上刚写入完成的 `RoutedJobCell<F>`，`layout` 与其分配布局
-    /// 一致，且 `arena` 的存活期必须覆盖本守卫。
-    pub(crate) unsafe fn new(
-        arena: &GenericArena<AtomicStorage>,
-        cell: NonNull<RoutedJobCell<F>>,
-        layout: Layout,
-    ) -> Self {
+impl<'scope_ref, F> RoutedJobCellOwner<'scope_ref, F> {
+    pub(crate) fn new(allocation: ManagedAllocation<'scope_ref, AtomicStorage>) -> Self {
         Self {
-            arena: SendPtr::new(NonNull::from(arena)),
-            cell: SendPtr::new(cell),
-            layout,
-            released: false,
+            allocation: Some(allocation),
+            marker: PhantomData,
         }
     }
 
     /// 取出 job 并立刻释放 cell（cell 的用途已尽，不必等到守卫析构）。
     pub(crate) fn take_job(&mut self) -> RuntimeResult<F> {
-        let job = unsafe { self.cell.as_mut().take() };
+        let job = {
+            let allocation = self.allocation.as_ref().ok_or_else(|| {
+                RuntimeError::InvariantViolation {
+                    site: "RoutedJobCellOwner::take_job",
+                    detail: "allocation has already been released".into(),
+                }
+                .to_report()
+            })?;
+            unsafe { (&mut *(allocation.data_ptr().as_ptr() as *mut RoutedJobCell<F>)).take() }
+        };
         self.release();
         job
     }
 
     fn release(&mut self) {
-        if self.released {
-            return;
-        }
-        self.released = true;
-        unsafe {
-            self.arena
-                .as_ref()
-                .drop_object_raw(self.cell.as_ptr() as *mut u8, self.layout);
+        if let Some(allocation) = self.allocation.take() {
+            unsafe { allocation.reclaim() };
         }
     }
 }
 
-impl<F> Drop for RoutedJobCellOwner<F> {
+impl<F> Drop for RoutedJobCellOwner<'_, F> {
     fn drop(&mut self) {
         self.release();
     }
@@ -168,7 +160,7 @@ where
         }
     }
 
-    fn reclaim(self: Box<Self>, _arena: &dyn Arena) {}
+    fn reclaim(self: Box<Self>) {}
 }
 
 unsafe impl<'scope_ref, T, S_> Send for SpawnToAccess<'scope_ref, T, S_> where
@@ -191,6 +183,7 @@ where
 
 struct BoxedTaskAccess<'scope_ref, T, Fut> {
     node: &'scope_ref SendBoxedTaskNode<T, Fut>,
+    allocation: ManagedAllocation<'scope_ref, AtomicStorage>,
     marker: PhantomData<T>,
 }
 
@@ -212,11 +205,8 @@ where
         }
     }
 
-    fn reclaim(self: Box<Self>, arena: &dyn Arena) {
-        let layout = Layout::new::<SendBoxedTaskNode<T, Fut>>();
-        unsafe {
-            arena.drop_object_raw(self.node as *const _ as *mut u8, layout);
-        }
+    fn reclaim(self: Box<Self>) {
+        unsafe { self.allocation.reclaim() };
     }
 }
 
@@ -229,6 +219,7 @@ where
 
 pub(crate) fn make_boxed_task_access<'scope_ref, T, Fut>(
     node: &'scope_ref SendBoxedTaskNode<T, Fut>,
+    allocation: ManagedAllocation<'scope_ref, AtomicStorage>,
 ) -> Box<dyn RoutedTaskAccess<T> + 'scope_ref>
 where
     T: Send + 'scope_ref,
@@ -236,6 +227,7 @@ where
 {
     Box::new(BoxedTaskAccess {
         node,
+        allocation,
         marker: PhantomData,
     })
 }
@@ -481,6 +473,10 @@ pub(crate) fn dispatch_routed<'rt, 'scope_ref, S: ScopeStorage, O: Ownership, T,
             } else {
                 completion.settle_task();
             }
+        } else if guard.is_armed() {
+            // The job closure may own values borrowed from the scope arena. Settle only after the
+            // FnOnce call has returned and all of its captures have been dropped.
+            guard.settle();
         }
         ready(())
     }) {
@@ -497,7 +493,7 @@ pub(crate) fn handle_enqueue_pinned_outcome(outcome: EnqueuePinnedOutcome) -> bo
 
 pub(crate) fn install_routed_pinned_task<'scope_ref, 'rt, T, Fut, TExtra>(
     runtime: &'rt RuntimeShared<TExtra>,
-    arena: &GenericArena<AtomicStorage>,
+    arena: &'scope_ref GenericArena<AtomicStorage>,
     guard: &mut ScopeTaskGuard<AtomicStorage, ArcOwnership>,
     worker_id: usize,
     state: Arc<RoutedSpawnState<'scope_ref, T>>,
@@ -510,24 +506,25 @@ pub(crate) fn install_routed_pinned_task<'scope_ref, 'rt, T, Fut, TExtra>(
         let non_null = RawScope::clone_raw(guard.completion_ref());
         ScopeRef::new(non_null)
     };
+    let layout = Layout::new::<SendBoxedTaskNode<T, Fut>>();
+    let allocation = unsafe {
+        arena.alloc_managed(layout, |ptr| {
+            drop_in_place(ptr as *mut SendBoxedTaskNode<T, Fut>)
+        })
+    };
+    let Some(allocation) = allocation else {
+        // `future` may own values borrowed from the scope. Drop it before settling the scope so
+        // the arena cannot be destroyed while this route closure still owns the future.
+        drop(future);
+        state.fail_task(TaskError::Panic);
+        return;
+    };
     let node = SendBoxedTaskNode::new(future);
     let node_header_ptr = &node.header as *const GenericTaskHeader<AtomicStorage>;
     unsafe {
         (*node_header_ptr).initialize(&runtime.base, worker_id, scope_ref);
     }
-    let layout = Layout::new::<SendBoxedTaskNode<T, Fut>>();
-    let node_ptr = unsafe {
-        arena.alloc::<SendBoxedTaskNode<T, Fut>>(
-            layout,
-            Some(|ptr| drop_in_place(ptr as *mut SendBoxedTaskNode<T, Fut>)),
-        )
-    };
-    let Some(node_ptr) = node_ptr else {
-        state.fail_task(TaskError::Panic);
-        guard.settle();
-        return;
-    };
-    let node_ptr = node_ptr.as_ptr() as *mut SendBoxedTaskNode<T, Fut>;
+    let node_ptr = allocation.data_ptr().as_ptr() as *mut SendBoxedTaskNode<T, Fut>;
     unsafe { write(node_ptr, node) };
 
     let node_ref = unsafe { &*node_ptr };
@@ -542,7 +539,7 @@ pub(crate) fn install_routed_pinned_task<'scope_ref, 'rt, T, Fut, TExtra>(
 
     let outcome = runtime.enqueue_pinned(worker_id, task_ctx);
     if !handle_enqueue_pinned_outcome(outcome) {
-        unsafe { arena.drop_object_raw(node_ptr as *mut u8, layout) };
+        unsafe { allocation.reclaim() };
         state.fail_task(TaskError::Panic);
         return;
     }
@@ -553,7 +550,7 @@ pub(crate) fn install_routed_pinned_task<'scope_ref, 'rt, T, Fut, TExtra>(
 
     state.set_ready(RoutedSpawnReady {
         task: task_ready,
-        access: make_boxed_task_access(node_ref),
+        access: make_boxed_task_access(node_ref, allocation),
     });
 }
 
@@ -587,7 +584,7 @@ mod tests {
             RoutedTakeResult::TaskErr(TaskError::Cancelled)
         }
 
-        fn reclaim(self: Box<Self>, _arena: &dyn Arena) {}
+        fn reclaim(self: Box<Self>) {}
     }
 
     impl Drop for DropAccess {

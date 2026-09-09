@@ -6,8 +6,8 @@ use crate::{
     error::{Result as RuntimeResult, RuntimeError},
     runtime::{GenericCancellationToken, primitives::CancelledFuture},
     task::{
-        GenericTaskHeader, GenericWakerNode, LocalTaskRef, SendTaskRef, TaskError, TaskHandleRef,
-        TaskJoinGate, TaskLease,
+        Arena, GenericTaskHeader, GenericWakerNode, LocalTaskRef, SendTaskRef, TaskError,
+        TaskHandleRef, TaskJoinGate, TaskLease,
     },
 };
 use diagweave::{Report, prelude::*};
@@ -22,8 +22,6 @@ use std::{
 };
 use veloq_intrusive_linklist::Link;
 use veloq_storage::{AtomicStorage, StateLock, Storage};
-
-pub(crate) type ReclaimFn<'scope_ref, T, A> = unsafe fn(&A, &'scope_ref dyn TaskJoinGate<T>);
 
 /// Outcome of awaiting a [`JoinHandle`].
 #[derive(Debug)]
@@ -80,12 +78,20 @@ pub(crate) enum JoinSource<'scope_ref, T, R: TaskHandleRef> {
 /// `is_cancel_requested`, and `Drop` operations must not run concurrently. In
 /// particular, this type is not a cross-thread cancellation handle: move the
 /// handle to the thread that owns it, or use a separate cancellation token.
-pub struct JoinHandle<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra> {
+pub struct JoinHandle<
+    'scope_ref,
+    T,
+    R: TaskHandleRef,
+    S: ScopeProvider<TExtra> + 'scope_ref,
+    TExtra,
+> where
+    S::Arena: 'scope_ref,
+{
     pub(crate) source: JoinSource<'scope_ref, T, R>,
     pub(crate) scope: &'scope_ref S,
     pub(crate) cancel_token: CancelTokenSlot<S::Storage, S::Ownership>,
     pub(crate) waker_node: Option<GenericWakerNode<R::Storage>>,
-    pub(crate) reclaim: Option<ReclaimFn<'scope_ref, T, S::Arena>>,
+    pub(crate) allocation: Option<<S::Arena as Arena>::Allocation<'scope_ref>>,
     pub(crate) marker: PhantomData<TExtra>,
     pub(crate) _not_sync: PhantomData<Cell<()>>,
     pub(crate) _pin: PhantomPinned,
@@ -109,7 +115,7 @@ pub type SendJoinHandle<'rt, 'scope_ref, 'env, T, TExtra> =
 pub type LocalAsyncJoinHandle<'rt, 'scope_ref, 'env, T, TExtra> =
     JoinHandle<'scope_ref, T, LocalTaskRef, LocalAsyncScope<'rt, 'scope_ref, 'env, TExtra>, TExtra>;
 
-impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
+impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TExtra>
     JoinHandle<'scope_ref, T, R, S, TExtra>
 {
     /// Requests cancellation of the task.
@@ -214,14 +220,14 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
         scope: &'scope_ref S,
         task: R,
         gate: &'scope_ref dyn TaskJoinGate<T>,
-        reclaim: Option<ReclaimFn<'scope_ref, T, S::Arena>>,
+        allocation: Option<<S::Arena as Arena>::Allocation<'scope_ref>>,
     ) -> Self {
         Self {
             source: JoinSource::Direct { task, gate },
             scope,
             cancel_token: super::new_cancel_slot::<S::Storage, S::Ownership>(),
             waker_node: None,
-            reclaim,
+            allocation,
             marker: PhantomData,
             _not_sync: PhantomData,
             _pin: PhantomPinned,
@@ -240,7 +246,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
             scope,
             cancel_token: super::new_cancel_slot::<S::Storage, S::Ownership>(),
             waker_node: None,
-            reclaim: None,
+            allocation: None,
             marker: PhantomData,
             _not_sync: PhantomData,
             _pin: PhantomPinned,
@@ -300,15 +306,12 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TEx
     /// handle 会因取不到 TLS 直接 panic。
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        let arena = this.scope.arena();
-        let reclaim = this.reclaim;
-
         match &mut this.source {
             JoinSource::Direct { task, gate, .. } => {
                 let header = task.header();
                 if header.is_reclaimable() {
                     Self::remove_waker_on(&mut this.waker_node, header);
-                    let lease = unsafe { TaskLease::new(arena, *gate, reclaim) };
+                    let lease = TaskLease::new(this.allocation.take());
                     let outcome = if let Some(res) = gate.take_result_erased() {
                         match res {
                             Ok(value) => JoinOutcome::Ok(value),
@@ -350,7 +353,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TEx
                             ));
                         };
                         let outcome = access.take_result();
-                        access.reclaim(arena);
+                        access.reclaim();
                         return Poll::Ready(match outcome {
                             RoutedTakeResult::Ok(value) => JoinOutcome::Ok(value),
                             RoutedTakeResult::TaskErr(err) => JoinOutcome::TaskErr(err),

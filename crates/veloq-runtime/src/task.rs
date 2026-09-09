@@ -5,7 +5,7 @@ mod scope;
 mod wake;
 
 pub(crate) use arena::TaskLease;
-pub use arena::{Arena, GenericArena};
+pub use arena::{Arena, ArenaAllocation, GenericArena, ManagedAllocation};
 pub(crate) use header::GenericWakerNode;
 pub use header::{GenericTaskHeader, PollStatus, TaskVTable};
 pub(crate) use header::{INTRUSIVE_WAKER_VTABLE, LOCAL_INTRUSIVE_WAKER_VTABLE};

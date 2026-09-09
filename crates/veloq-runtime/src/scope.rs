@@ -2,9 +2,9 @@ use crate::{
     error::{Result, RuntimeError},
     runtime::{RuntimeCtx, RuntimeShared, primitives::GenericCancellationToken},
     task::{
-        AnyScopeRef, Arena, ErasedCancellationToken, GenericArena, GenericTaskNode, LocalTask,
-        LocalTaskRef, RawScope, RawTask, ScopeRef, ScopeStorage, SendTask, SendTaskRef, Task,
-        TaskBounds, TaskError, TaskHandleRef, TaskJoinGate, TaskStorage,
+        AnyScopeRef, Arena, ArenaAllocation, ErasedCancellationToken, GenericArena,
+        GenericTaskNode, LocalTask, LocalTaskRef, RawScope, RawTask, ScopeRef, ScopeStorage,
+        SendTask, SendTaskRef, Task, TaskBounds, TaskError, TaskHandleRef, TaskStorage,
     },
     utils::ownership::{ArcOwnership, Ownership, RcOwnership},
 };
@@ -52,14 +52,6 @@ impl<T> Clone for SendPtr<T> {
 impl<T> SendPtr<T> {
     pub(crate) fn new(ptr: NonNull<T>) -> Self {
         Self(ptr)
-    }
-
-    pub(crate) unsafe fn as_ref(&self) -> &T {
-        unsafe { self.0.as_ref() }
-    }
-
-    pub(crate) unsafe fn as_mut(&mut self) -> &mut T {
-        unsafe { self.0.as_mut() }
     }
 
     pub(crate) fn as_ptr(&self) -> *mut T {
@@ -308,13 +300,12 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra>
                 .initialize(&self.context.shared().base, worker_id, scope_ref);
         }
         let layout = Layout::new::<GenericTaskNode<H::Storage, T, F>>();
-        let node_ptr = unsafe {
-            self.arena.alloc::<GenericTaskNode<H::Storage, T, F>>(
-                layout,
-                Some(|ptr| drop_in_place(ptr as *mut GenericTaskNode<H::Storage, T, F>)),
-            )
+        let allocation = unsafe {
+            self.arena.alloc_managed(layout, |ptr| {
+                drop_in_place(ptr as *mut GenericTaskNode<H::Storage, T, F>)
+            })
         };
-        let Some(node_ptr) = node_ptr else {
+        let Some(allocation) = allocation else {
             guard.settle();
             return JoinHandle::new_routed(
                 self,
@@ -326,7 +317,7 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra>
                 ),
             );
         };
-        let node_ptr = node_ptr.as_ptr() as *mut GenericTaskNode<H::Storage, T, F>;
+        let node_ptr = allocation.data_ptr().as_ptr() as *mut GenericTaskNode<H::Storage, T, F>;
         unsafe { write(node_ptr, node) };
 
         let node_ref = unsafe { &*node_ptr };
@@ -336,20 +327,12 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra>
         if let Err(err) = enqueue_fn(self.context.shared(), worker_id, task_ref) {
             task_ref.header().abandon_before_enqueue();
             if task_ref.header().is_reclaimable() {
-                unsafe { self.arena.drop_object_raw(node_ptr as *mut u8, layout) };
+                unsafe { allocation.reclaim() };
             }
             return JoinHandle::new_routed(self, new_failed_routed_state(err));
         }
 
-        JoinHandle::new_direct(
-            self,
-            task_ref,
-            node_ref,
-            Some(|arena, gate| unsafe {
-                let layout = Layout::new::<GenericTaskNode<H::Storage, T, F>>();
-                arena.drop_object_raw(gate as *const dyn TaskJoinGate<T> as *mut u8, layout);
-            }),
-        )
+        JoinHandle::new_direct(self, task_ref, node_ref, Some(allocation))
     }
 }
 
@@ -518,13 +501,12 @@ impl<'rt, 'scope, 'env, TExtra>
         let runtime_ptr = SendPtr::new(NonNull::from(runtime));
         let state_for_job = state.clone();
         let job_layout = Layout::new::<RoutedJobCell<F>>();
-        let job_ptr = unsafe {
-            self.arena.alloc::<RoutedJobCell<F>>(
-                job_layout,
-                Some(|ptr| drop_in_place(ptr as *mut RoutedJobCell<F>)),
-            )
+        let allocation = unsafe {
+            self.arena.alloc_managed(job_layout, |ptr| {
+                drop_in_place(ptr as *mut RoutedJobCell<F>)
+            })
         };
-        let Some(job_ptr) = job_ptr else {
+        let Some(allocation) = allocation else {
             state.fail_runtime(
                 RuntimeError::ArenaAllocationNull {
                     op: "AsyncScope::spawn_boxed_to::alloc_job",
@@ -533,14 +515,12 @@ impl<'rt, 'scope, 'env, TExtra>
             );
             return JoinHandle::new_routed(self, state);
         };
-        let job_ptr = job_ptr.as_ptr() as *mut RoutedJobCell<F>;
+        let job_ptr = allocation.data_ptr().as_ptr() as *mut RoutedJobCell<F>;
         unsafe { write(job_ptr, RoutedJobCell::new(job)) };
         // job cell 的所有权自此完全交给守卫，并随闭包一起移交给目标 worker。
-        let job_owner = unsafe {
-            RoutedJobCellOwner::new(&self.arena, NonNull::new_unchecked(job_ptr), job_layout)
-        };
+        let job_owner: RoutedJobCellOwner<'scope_ref, F> = RoutedJobCellOwner::new(allocation);
 
-        let arena_ptr = SendPtr::new(NonNull::from(&self.arena));
+        let arena = &self.arena;
         dispatch_routed::<AtomicStorage, ArcOwnership, T, _, TExtra>(
             &self.context,
             guard,
@@ -549,30 +529,33 @@ impl<'rt, 'scope, 'env, TExtra>
             move |guard| {
                 let mut job_owner = job_owner;
                 if state_for_job.is_cancel_requested() {
+                    // The owner borrows the scope arena. Release it before publishing the
+                    // terminal failure; dispatch_routed settles the scope after this closure
+                    // returns, otherwise the arena could be dropped while captures unwind.
+                    drop(job_owner);
                     state_for_job.fail_task(TaskError::Cancelled);
-                    guard.settle();
                     return;
                 }
 
                 let job = match job_owner.take_job() {
                     Ok(job) => job,
                     Err(err) => {
+                        drop(job_owner);
                         state_for_job.fail_runtime(err);
-                        guard.settle();
                         return;
                     }
                 };
                 let future = job();
 
                 if state_for_job.is_cancel_requested() {
+                    drop(future);
                     state_for_job.fail_task(TaskError::Cancelled);
-                    guard.settle();
                     return;
                 }
 
                 install_routed_pinned_task(
                     unsafe { &*runtime_ptr.as_ptr() },
-                    unsafe { arena_ptr.as_ref() },
+                    arena,
                     guard,
                     worker_id,
                     state_for_job,
