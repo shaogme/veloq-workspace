@@ -16,7 +16,7 @@ use crate::{
         atomic::{AtomicU8, Ordering},
     },
     thread::{
-        AbortedError, Thread, ThreadErrorKind, ThreadId, current,
+        AbortedError, Thread, ThreadErrorKind, ThreadId,
         traits::{RawJoinHandleTrait, RawThreadErrorTrait, SystermImpl},
     },
     time::Duration,
@@ -25,8 +25,9 @@ use crate::{
 use windows_sys::Win32::{
     Foundation::{CloseHandle, GetLastError, HANDLE, WAIT_OBJECT_0},
     System::Threading::{
-        ALL_PROCESSOR_GROUPS, CreateThread, GetActiveProcessorCount, GetCurrentThread, INFINITE,
-        SetThreadDescription, Sleep, SwitchToThread, WaitForSingleObject,
+        ALL_PROCESSOR_GROUPS, CreateThread, GetActiveProcessorCount, GetCurrentThread,
+        GetCurrentThreadId, INFINITE, SetThreadDescription, Sleep, SwitchToThread,
+        WaitForSingleObject,
     },
 };
 
@@ -349,7 +350,7 @@ impl SystermImpl for Systerm {
     }
 
     fn current_id() -> ThreadId {
-        current().id()
+        ThreadId(unsafe { GetCurrentThreadId() } as u64)
     }
 
     fn available_parallelism() -> Result<NonZeroUsize, Self::Error> {

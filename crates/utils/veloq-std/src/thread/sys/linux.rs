@@ -17,13 +17,14 @@ use crate::{
         atomic::{AtomicU8, Ordering},
     },
     thread::{
-        AbortedError, Thread, ThreadErrorKind, ThreadId, current,
+        AbortedError, Thread, ThreadErrorKind, ThreadId,
         traits::{RawJoinHandleTrait, RawThreadErrorTrait, SystermImpl},
     },
     time::Duration,
 };
 use libc::{
-    nanosleep, pthread_create, pthread_detach, pthread_join, pthread_t, sched_yield, timespec,
+    nanosleep, pthread_create, pthread_detach, pthread_join, pthread_self, pthread_t, sched_yield,
+    timespec,
 };
 
 use super::SendSyncPanicPayload;
@@ -367,7 +368,7 @@ impl SystermImpl for Systerm {
     }
 
     fn current_id() -> ThreadId {
-        current().id()
+        ThreadId(unsafe { pthread_self() as u64 })
     }
 
     fn available_parallelism() -> Result<NonZeroUsize, Self::Error> {

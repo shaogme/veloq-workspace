@@ -1,291 +1,289 @@
-#![cfg(not(feature = "loom"))]
+#[cfg(not(feature = "loom"))]
+mod normal_tests {
+    use core::cell::Cell;
+    use std::{panic, vec::Vec};
 
-use veloq_std::{
-    sync::atomic::{CoreAtomicU32, Ordering},
-    sync::{Once, OnceLock},
-    thread,
-    time::Duration,
-};
+    use veloq_std::{
+        io::{_eprint, _print, stderr, stdout},
+        sync::{
+            Arc, Condvar, Mutex, Once, OnceLock, ReentrantMutex,
+            atomic::{CoreAtomicU32, Ordering},
+        },
+        thread,
+        time::{Duration, Instant},
+    };
 
-use std::panic;
+    #[test]
+    fn test_once_basic() {
+        let once = Once::new();
+        assert!(!once.is_completed());
 
-#[test]
-fn test_once_basic() {
-    let once = Once::new();
-    assert!(!once.is_completed());
-
-    let mut counter = 0;
-    once.call_once(|| {
-        counter += 1;
-    });
-    assert_eq!(counter, 1);
-    assert!(once.is_completed());
-
-    once.call_once(|| {
-        counter += 1;
-    });
-    assert_eq!(counter, 1);
-}
-
-#[test]
-fn test_once_panic_poison() {
-    let once = Once::new();
-
-    let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let mut counter = 0;
         once.call_once(|| {
-            panic!("poisoning");
+            counter += 1;
         });
-    }));
-    assert!(res.is_err());
-    assert!(!once.is_completed());
+        assert_eq!(counter, 1);
+        assert!(once.is_completed());
 
-    // Subsequent call_once should panic due to poison
-    let res2 = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        once.call_once(|| {});
-    }));
-    assert!(res2.is_err());
-}
-
-#[test]
-fn test_once_force_recovery() {
-    let once = Once::new();
-
-    let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         once.call_once(|| {
-            panic!("poisoning");
+            counter += 1;
         });
-    }));
+        assert_eq!(counter, 1);
+    }
 
-    let mut recovered = false;
-    once.call_once_force(|state| {
-        assert!(state.is_poisoned());
-        recovered = true;
-    });
-    assert!(recovered);
-    assert!(once.is_completed());
-}
+    #[test]
+    fn test_once_panic_poison() {
+        let once = Once::new();
 
-#[test]
-fn test_once_wait() {
-    let once = Once::new();
-    thread::scope(|s| {
-        s.spawn(|| {
+        let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
             once.call_once(|| {
-                thread::sleep(Duration::from_millis(50)).unwrap();
+                panic!("poisoning");
             });
-        })
-        .unwrap();
+        }));
+        assert!(res.is_err());
+        assert!(!once.is_completed());
 
-        s.spawn(|| {
-            once.wait();
-            assert!(once.is_completed());
-        })
-        .unwrap();
-    });
-}
+        // Subsequent call_once should panic due to poison
+        let res2 = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            once.call_once(|| {});
+        }));
+        assert!(res2.is_err());
+    }
 
-#[test]
-fn test_once_wait_force() {
-    let once = Once::new();
-    let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        once.call_once(|| {
-            panic!("poisoning");
+    #[test]
+    fn test_once_force_recovery() {
+        let once = Once::new();
+
+        let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            once.call_once(|| {
+                panic!("poisoning");
+            });
+        }));
+
+        let mut recovered = false;
+        once.call_once_force(|state| {
+            assert!(state.is_poisoned());
+            recovered = true;
         });
-    }));
+        assert!(recovered);
+        assert!(once.is_completed());
+    }
 
-    // wait should panic
-    let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        once.wait();
-    }));
-    assert!(res.is_err());
+    #[test]
+    fn test_once_wait() {
+        let once = Once::new();
+        thread::scope(|s| {
+            s.spawn(|| {
+                once.call_once(|| {
+                    thread::sleep(Duration::from_millis(50)).unwrap();
+                });
+            })
+            .unwrap();
 
-    // Spawn a thread to initialize it and wake up wait_force
-    thread::scope(|s| {
-        s.spawn(|| {
-            thread::sleep(Duration::from_millis(50)).unwrap();
-            once.call_once_force(|state| {
-                assert!(state.is_poisoned());
+            s.spawn(|| {
+                once.wait();
+                assert!(once.is_completed());
+            })
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn test_once_wait_force() {
+        let once = Once::new();
+        let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            once.call_once(|| {
+                panic!("poisoning");
             });
-        })
-        .unwrap();
+        }));
 
-        // wait_force should block until the other thread completes the initialization
-        once.wait_force();
-    });
-    assert!(once.is_completed());
-}
+        // wait should panic
+        let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            once.wait();
+        }));
+        assert!(res.is_err());
 
-#[test]
-fn test_once_debug() {
-    let once = Once::new();
-    let format_str = format!("{once:?}");
-    assert!(format_str.contains("Once"));
-}
-
-#[test]
-fn test_once_lock_basic() {
-    let lock = OnceLock::new();
-    assert_eq!(lock.get(), None);
-
-    assert_eq!(lock.set(42), Ok(()));
-    assert_eq!(lock.get(), Some(&42));
-    assert_eq!(lock.set(100), Err(100));
-}
-
-#[test]
-fn test_once_lock_try_insert() {
-    let lock = OnceLock::new();
-    assert_eq!(lock.try_insert(42), Ok(&42));
-    assert_eq!(lock.try_insert(100), Err((&42, 100)));
-}
-
-#[test]
-fn test_once_lock_get_or_init() {
-    let lock = OnceLock::new();
-    let val = lock.get_or_init(|| 42);
-    assert_eq!(*val, 42);
-
-    let val2 = lock.get_or_init(|| 100);
-    assert_eq!(*val2, 42);
-}
-
-#[test]
-fn test_once_lock_get_mut() {
-    let mut lock = OnceLock::new();
-    assert_eq!(lock.get_mut(), None);
-
-    lock.set(42).unwrap();
-    assert_eq!(lock.get_mut(), Some(&mut 42));
-
-    *lock.get_mut().unwrap() = 100;
-    assert_eq!(lock.get(), Some(&100));
-}
-
-#[test]
-fn test_once_lock_get_mut_or_init() {
-    let mut lock = OnceLock::new();
-    let val = lock.get_mut_or_init(|| 42);
-    assert_eq!(*val, 42);
-    *val = 100;
-
-    let val2 = lock.get_mut_or_init(|| 200);
-    assert_eq!(*val2, 100);
-}
-
-#[test]
-fn test_once_lock_get_or_try_init() {
-    let lock = OnceLock::new();
-
-    // Failed init
-    let res: Result<&i32, &str> = lock.get_or_try_init(|| Err("error"));
-    assert_eq!(res, Err("error"));
-    assert_eq!(lock.get(), None);
-
-    // Successful init after failure
-    let res2: Result<&i32, &str> = lock.get_or_try_init(|| Ok(42));
-    assert_eq!(res2, Ok(&42));
-    assert_eq!(lock.get(), Some(&42));
-}
-
-#[test]
-fn test_once_lock_get_mut_or_try_init() {
-    let mut lock = OnceLock::new();
-
-    // Failed init
-    let res: Result<&mut i32, &str> = lock.get_mut_or_try_init(|| Err("error"));
-    assert_eq!(res, Err("error"));
-    assert_eq!(lock.get_mut(), None);
-
-    // Successful init after failure
-    let res2: Result<&mut i32, &str> = lock.get_mut_or_try_init(|| Ok(42));
-    assert_eq!(res2, Ok(&mut 42));
-    assert_eq!(lock.get(), Some(&42));
-}
-
-#[test]
-fn test_once_lock_into_inner() {
-    let lock: OnceLock<i32> = OnceLock::new();
-    assert_eq!(lock.into_inner(), None);
-
-    let lock2 = OnceLock::from(42);
-    assert_eq!(lock2.into_inner(), Some(42));
-}
-
-#[test]
-fn test_once_lock_take() {
-    let mut lock = OnceLock::new();
-    lock.set(42).unwrap();
-    assert_eq!(lock.take(), Some(42));
-    assert_eq!(lock.get(), None);
-}
-
-#[test]
-fn test_once_lock_wait() {
-    let lock = OnceLock::new();
-    thread::scope(|s| {
-        s.spawn(|| {
-            lock.get_or_init(|| {
+        // Spawn a thread to initialize it and wake up wait_force
+        thread::scope(|s| {
+            s.spawn(|| {
                 thread::sleep(Duration::from_millis(50)).unwrap();
-                42
-            });
-        })
-        .unwrap();
+                once.call_once_force(|state| {
+                    assert!(state.is_poisoned());
+                });
+            })
+            .unwrap();
 
-        s.spawn(|| {
-            assert_eq!(*lock.wait(), 42);
-        })
-        .unwrap();
-    });
-}
-
-#[test]
-fn test_once_lock_traits() {
-    // Default
-    let lock: OnceLock<i32> = Default::default();
-    assert_eq!(lock.get(), None);
-
-    // From
-    let lock_from = OnceLock::from(42);
-    assert_eq!(lock_from.get(), Some(&42));
-
-    // Clone
-    let lock_clone = lock_from.clone();
-    assert_eq!(lock_clone.get(), Some(&42));
-
-    // PartialEq / Eq
-    assert_eq!(lock_from, lock_clone);
-    let lock_empty: OnceLock<i32> = OnceLock::new();
-    assert_ne!(lock_from, lock_empty);
-
-    // Debug
-    let debug_empty = format!("{lock_empty:?}");
-    assert!(debug_empty.contains("<uninit>"));
-    let debug_full = format!("{lock_from:?}");
-    assert!(debug_full.contains("42"));
-}
-
-#[test]
-fn test_once_lock_drop() {
-    static DROP_COUNTER: CoreAtomicU32 = CoreAtomicU32::new(0);
-    struct Detector;
-    impl Drop for Detector {
-        fn drop(&mut self) {
-            DROP_COUNTER.fetch_add(1, Ordering::SeqCst);
-        }
+            // wait_force should block until the other thread completes the initialization
+            once.wait_force();
+        });
+        assert!(once.is_completed());
     }
 
-    {
+    #[test]
+    fn test_once_debug() {
+        let once = Once::new();
+        let format_str = format!("{once:?}");
+        assert!(format_str.contains("Once"));
+    }
+
+    #[test]
+    fn test_once_lock_basic() {
         let lock = OnceLock::new();
-        let _ = lock.set(Detector);
-    }
-    assert_eq!(DROP_COUNTER.load(Ordering::SeqCst), 1);
-}
+        assert_eq!(lock.get(), None);
 
-mod condvar_tests {
-    use std::vec::Vec;
-    use veloq_std::sync::{Arc, Condvar, Mutex};
-    use veloq_std::thread;
-    use veloq_std::time::Duration;
+        assert_eq!(lock.set(42), Ok(()));
+        assert_eq!(lock.get(), Some(&42));
+        assert_eq!(lock.set(100), Err(100));
+    }
+
+    #[test]
+    fn test_once_lock_try_insert() {
+        let lock = OnceLock::new();
+        assert_eq!(lock.try_insert(42), Ok(&42));
+        assert_eq!(lock.try_insert(100), Err((&42, 100)));
+    }
+
+    #[test]
+    fn test_once_lock_get_or_init() {
+        let lock = OnceLock::new();
+        let val = lock.get_or_init(|| 42);
+        assert_eq!(*val, 42);
+
+        let val2 = lock.get_or_init(|| 100);
+        assert_eq!(*val2, 42);
+    }
+
+    #[test]
+    fn test_once_lock_get_mut() {
+        let mut lock = OnceLock::new();
+        assert_eq!(lock.get_mut(), None);
+
+        lock.set(42).unwrap();
+        assert_eq!(lock.get_mut(), Some(&mut 42));
+
+        *lock.get_mut().unwrap() = 100;
+        assert_eq!(lock.get(), Some(&100));
+    }
+
+    #[test]
+    fn test_once_lock_get_mut_or_init() {
+        let mut lock = OnceLock::new();
+        let val = lock.get_mut_or_init(|| 42);
+        assert_eq!(*val, 42);
+        *val = 100;
+
+        let val2 = lock.get_mut_or_init(|| 200);
+        assert_eq!(*val2, 100);
+    }
+
+    #[test]
+    fn test_once_lock_get_or_try_init() {
+        let lock = OnceLock::new();
+
+        // Failed init
+        let res: Result<&i32, &str> = lock.get_or_try_init(|| Err("error"));
+        assert_eq!(res, Err("error"));
+        assert_eq!(lock.get(), None);
+
+        // Successful init after failure
+        let res2: Result<&i32, &str> = lock.get_or_try_init(|| Ok(42));
+        assert_eq!(res2, Ok(&42));
+        assert_eq!(lock.get(), Some(&42));
+    }
+
+    #[test]
+    fn test_once_lock_get_mut_or_try_init() {
+        let mut lock = OnceLock::new();
+
+        // Failed init
+        let res: Result<&mut i32, &str> = lock.get_mut_or_try_init(|| Err("error"));
+        assert_eq!(res, Err("error"));
+        assert_eq!(lock.get_mut(), None);
+
+        // Successful init after failure
+        let res2: Result<&mut i32, &str> = lock.get_mut_or_try_init(|| Ok(42));
+        assert_eq!(res2, Ok(&mut 42));
+        assert_eq!(lock.get(), Some(&42));
+    }
+
+    #[test]
+    fn test_once_lock_into_inner() {
+        let lock: OnceLock<i32> = OnceLock::new();
+        assert_eq!(lock.into_inner(), None);
+
+        let lock2 = OnceLock::from(42);
+        assert_eq!(lock2.into_inner(), Some(42));
+    }
+
+    #[test]
+    fn test_once_lock_take() {
+        let mut lock = OnceLock::new();
+        lock.set(42).unwrap();
+        assert_eq!(lock.take(), Some(42));
+        assert_eq!(lock.get(), None);
+    }
+
+    #[test]
+    fn test_once_lock_wait() {
+        let lock = OnceLock::new();
+        thread::scope(|s| {
+            s.spawn(|| {
+                lock.get_or_init(|| {
+                    thread::sleep(Duration::from_millis(50)).unwrap();
+                    42
+                });
+            })
+            .unwrap();
+
+            s.spawn(|| {
+                assert_eq!(*lock.wait(), 42);
+            })
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn test_once_lock_traits() {
+        // Default
+        let lock: OnceLock<i32> = Default::default();
+        assert_eq!(lock.get(), None);
+
+        // From
+        let lock_from = OnceLock::from(42);
+        assert_eq!(lock_from.get(), Some(&42));
+
+        // Clone
+        let lock_clone = lock_from.clone();
+        assert_eq!(lock_clone.get(), Some(&42));
+
+        // PartialEq / Eq
+        assert_eq!(lock_from, lock_clone);
+        let lock_empty: OnceLock<i32> = OnceLock::new();
+        assert_ne!(lock_from, lock_empty);
+
+        // Debug
+        let debug_empty = format!("{lock_empty:?}");
+        assert!(debug_empty.contains("<uninit>"));
+        let debug_full = format!("{lock_from:?}");
+        assert!(debug_full.contains("42"));
+    }
+
+    #[test]
+    fn test_once_lock_drop() {
+        static DROP_COUNTER: CoreAtomicU32 = CoreAtomicU32::new(0);
+        struct Detector;
+        impl Drop for Detector {
+            fn drop(&mut self) {
+                DROP_COUNTER.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        {
+            let lock = OnceLock::new();
+            let _ = lock.set(Detector);
+        }
+        assert_eq!(DROP_COUNTER.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn test_condvar_basic() {
@@ -379,12 +377,185 @@ mod condvar_tests {
 
         assert_eq!(*lock.lock(), 4);
     }
+
+    #[test]
+    fn test_reentrant_mutex_basic() {
+        let m = ReentrantMutex::new(42);
+        assert!(!m.is_locked());
+        assert_eq!(m.reentrancy_count(), 0);
+
+        {
+            let g1 = m.lock();
+            assert_eq!(*g1, 42);
+            assert!(m.is_locked());
+            assert!(m.is_owned_by_current_thread());
+            assert_eq!(m.reentrancy_count(), 1);
+
+            {
+                let g2 = m.lock();
+                assert_eq!(*g2, 42);
+                assert_eq!(m.reentrancy_count(), 2);
+
+                {
+                    let g3 = m.lock();
+                    assert_eq!(*g3, 42);
+                    assert_eq!(m.reentrancy_count(), 3);
+                }
+                assert_eq!(m.reentrancy_count(), 2);
+                assert!(m.is_locked());
+            }
+            assert_eq!(m.reentrancy_count(), 1);
+            assert!(m.is_locked());
+        }
+
+        assert_eq!(m.reentrancy_count(), 0);
+        assert!(!m.is_locked());
+    }
+
+    #[test]
+    fn test_reentrant_mutex_depth() {
+        let m = ReentrantMutex::new(100);
+        let mut guards = Vec::new();
+        for i in 1..=15 {
+            guards.push(m.lock());
+            assert_eq!(m.reentrancy_count(), i);
+            assert!(m.is_locked());
+        }
+        for expected in (0..15).rev() {
+            guards.pop();
+            assert_eq!(m.reentrancy_count(), expected);
+            if expected > 0 {
+                assert!(m.is_locked());
+            }
+        }
+        assert!(!m.is_locked());
+    }
+
+    #[test]
+    fn test_reentrant_mutex_threads() {
+        let m = Arc::new(ReentrantMutex::new(Cell::new(0)));
+        let num_threads = 4;
+        let iters = 100;
+        let mut handles = Vec::new();
+
+        for _ in 0..num_threads {
+            let m = m.clone();
+            let h = thread::spawn(move || {
+                for _ in 0..iters {
+                    let g1 = m.lock();
+                    let g2 = m.lock();
+                    let val = g1.get();
+                    g2.set(val + 1);
+                }
+            })
+            .unwrap();
+            handles.push(h);
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(m.lock().get(), num_threads * iters);
+    }
+
+    #[test]
+    fn test_reentrant_mutex_try_lock() {
+        let m = Arc::new(ReentrantMutex::new(10));
+        let g1 = m.try_lock();
+        assert!(g1.is_some());
+        let g1 = g1.unwrap();
+
+        // 同一线程多次 try_lock 成功重入
+        let g2 = m.try_lock();
+        assert!(g2.is_some());
+        drop(g2);
+
+        // 异线程 try_lock 互斥排他失败
+        let m_clone = m.clone();
+        let handle = thread::spawn(move || {
+            let res = m_clone.try_lock();
+            assert!(res.is_none());
+        })
+        .unwrap();
+        handle.join().unwrap();
+
+        drop(g1);
+
+        // 释放后异线程成功获取
+        let m_clone = m.clone();
+        let handle = thread::spawn(move || {
+            let res = m_clone.try_lock();
+            assert!(res.is_some());
+        })
+        .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn test_reentrant_mutex_timed() {
+        let m = Arc::new(ReentrantMutex::new(0));
+        let g = m.lock();
+
+        // 同一线程超时尝试成功
+        let reentered = m.try_lock_for(Duration::from_millis(10));
+        assert!(reentered.is_some());
+        drop(reentered);
+
+        // 异线程超时返回 None
+        let m_clone = m.clone();
+        let handle = thread::spawn(move || {
+            let start = Instant::now();
+            let res = m_clone.try_lock_for(Duration::from_millis(50));
+            assert!(res.is_none());
+            assert!(start.elapsed() >= Duration::from_millis(40));
+        })
+        .unwrap();
+        handle.join().unwrap();
+        drop(g);
+    }
+
+    #[test]
+    fn test_reentrant_mutex_stdio_reentrant() {
+        // 嵌套获取 stdout lock 并输出
+        {
+            let lock1 = stdout().lock();
+            let lock2 = stdout().lock();
+            _print(format_args!("testing stdout reentrancy\n"));
+            drop(lock2);
+            drop(lock1);
+        }
+
+        // 嵌套获取 stderr lock 并输出
+        {
+            let lock1 = stderr().lock();
+            let lock2 = stderr().lock();
+            _eprint(format_args!("testing stderr reentrancy\n"));
+            drop(lock2);
+            drop(lock1);
+        }
+    }
+
+    #[test]
+    fn test_reentrant_mutex_api() {
+        let mut m = ReentrantMutex::new(5);
+        *m.get_mut() = 10;
+        assert_eq!(m.into_inner(), 10);
+
+        let m2 = ReentrantMutex::new(20);
+        let debug_str = format!("{m2:?}");
+        assert!(debug_str.contains("20"));
+
+        let _guard = m2.lock();
+        let debug_locked = format!("{m2:?}");
+        assert!(debug_locked.contains("20"));
+    }
 }
 
 #[cfg(feature = "loom")]
 mod loom_tests {
-    use loom::thread;
-    use veloq_std::sync::{Arc, Condvar, Mutex};
+    use loom::{cell::Cell, thread};
+    use veloq_std::sync::{Arc, Condvar, Mutex, ReentrantMutex};
 
     #[test]
     fn test_loom_condvar() {
@@ -405,6 +576,83 @@ mod loom_tests {
                 started = cvar.wait(started);
             }
             assert!(*started);
+        });
+    }
+
+    #[test]
+    fn test_loom_reentrant_mutex_basic() {
+        loom::model(|| {
+            let m = ReentrantMutex::new(42);
+            assert!(!m.is_locked());
+            assert_eq!(m.reentrancy_count(), 0);
+
+            {
+                let g1 = m.lock();
+                assert_eq!(*g1, 42);
+                assert!(m.is_locked());
+                assert!(m.is_owned_by_current_thread());
+                assert_eq!(m.reentrancy_count(), 1);
+
+                {
+                    let g2 = m.lock();
+                    assert_eq!(*g2, 42);
+                    assert_eq!(m.reentrancy_count(), 2);
+                }
+
+                assert_eq!(m.reentrancy_count(), 1);
+                assert!(m.is_locked());
+            }
+
+            assert_eq!(m.reentrancy_count(), 0);
+            assert!(!m.is_locked());
+        });
+    }
+
+    #[test]
+    fn test_loom_reentrant_mutex_concurrency() {
+        loom::model(|| {
+            let m = Arc::new(ReentrantMutex::new(Cell::new(0)));
+            let m2 = m.clone();
+
+            let h = thread::spawn(move || {
+                let g1 = m2.lock();
+                let g2 = m2.lock();
+                let val = g1.get();
+                g2.set(val + 1);
+            });
+
+            {
+                let g1 = m.lock();
+                let g2 = m.lock();
+                let val = g1.get();
+                g2.set(val + 1);
+            }
+
+            h.join().unwrap();
+
+            assert_eq!(m.lock().get(), 2);
+        });
+    }
+
+    #[test]
+    fn test_loom_reentrant_mutex_try_lock() {
+        loom::model(|| {
+            let m = Arc::new(ReentrantMutex::new(10));
+            let m2 = m.clone();
+
+            let h = thread::spawn(move || {
+                if let Some(g1) = m2.try_lock() {
+                    assert!(m2.try_lock().is_some());
+                    assert_eq!(*g1, 10);
+                }
+            });
+
+            if let Some(g1) = m.try_lock() {
+                assert!(m.try_lock().is_some());
+                assert_eq!(*g1, 10);
+            }
+
+            h.join().unwrap();
         });
     }
 }

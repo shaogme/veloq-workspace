@@ -9,7 +9,7 @@ use crate::{
     string::String,
     sync::{Arc, atomic::Ordering},
     thread::{
-        AbortedError, Thread, ThreadErrorKind, ThreadId, current,
+        AbortedError, Thread, ThreadErrorKind, ThreadId,
         traits::{RawJoinHandleTrait, RawThreadErrorTrait, SystermImpl},
     },
     time::Duration,
@@ -282,7 +282,10 @@ impl SystermImpl for Systerm {
     }
 
     fn current_id() -> ThreadId {
-        current().id()
+        use core::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::new();
+        loom::thread::current().id().hash(&mut hasher);
+        ThreadId(hasher.finish())
     }
 
     fn available_parallelism() -> Result<NonZeroUsize, Self::Error> {

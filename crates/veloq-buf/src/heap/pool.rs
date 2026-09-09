@@ -23,7 +23,7 @@ use veloq_std::{
     ptr::NonNull,
     string::ToString,
     sync::{Arc, Mutex, RwLock},
-    thread::{available_parallelism, current},
+    thread::{available_parallelism, current_id},
     vec,
     vec::Vec,
 };
@@ -253,7 +253,7 @@ impl Chunk {
             // (s * 0x27bb2ee687b0b0fd) is a simple way to spread bits if needed, but s is usually small
             s.wrapping_mul(0x27bb2ee687b0b0fd)
         } else {
-            let thread_id = current().id();
+            let thread_id = current_id();
             let mut hasher = DefaultHasher::new();
             thread_id.hash(&mut hasher);
             hasher.finish() as usize

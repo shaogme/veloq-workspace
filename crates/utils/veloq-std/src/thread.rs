@@ -165,7 +165,6 @@ pub struct Thread {
 impl fmt::Debug for Thread {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("Thread")
-            .field("id", &self.id())
             .field("name", &self.name())
             .finish_non_exhaustive()
     }
@@ -179,11 +178,6 @@ impl Thread {
                 parker: Parker::new(),
             }),
         }
-    }
-
-    /// 获取当前线程的唯一标识符
-    pub fn id(&self) -> ThreadId {
-        ThreadId(Arc::as_ptr(&self.inner) as *const () as u64)
     }
 
     /// 获取线程的名称（如果有）
@@ -210,6 +204,12 @@ impl Thread {
 /// 获取当前线程
 pub fn current() -> Thread {
     sys::CURRENT_THREAD.with_or_init(|t| t.clone(), || Thread::new(None))
+}
+
+/// 获取当前线程的唯一标识符
+#[inline]
+pub fn current_id() -> ThreadId {
+    Systerm::current_id()
 }
 
 /// 阻塞当前线程。
