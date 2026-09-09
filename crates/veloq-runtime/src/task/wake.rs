@@ -294,6 +294,7 @@ impl<S: Storage> Drop for TaskWakeGuard<'_, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Barrier, mpsc::sync_channel};
 
     fn assert_send_sync<T: Send + Sync>() {}
 
@@ -338,5 +339,33 @@ mod tests {
         let queued = target.pop().expect("wake request");
         token.deactivate_and_wait();
         queued.dispatch_on_owner();
+    }
+
+    #[test]
+    fn deactivation_waits_for_active_wake_callback() {
+        let token = Arc::new(TaskWakeToken::<LocalStorage>::new());
+        let active = token.try_acquire().expect("token must start alive");
+        let barrier = Arc::new(Barrier::new(2));
+        let (done_tx, done_rx) = sync_channel(0);
+        let token_for_thread = Arc::clone(&token);
+        let barrier_for_thread = Arc::clone(&barrier);
+        let thread = thread::spawn(move || {
+            barrier_for_thread.wait();
+            token_for_thread.deactivate_and_wait();
+            done_tx.send(()).unwrap();
+        });
+
+        barrier.wait();
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(20))
+                .is_err(),
+            "deactivation must wait while a wake callback is active"
+        );
+        drop(active);
+        done_rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .expect("deactivation must finish after callback quiescence");
+        thread.join().unwrap();
     }
 }

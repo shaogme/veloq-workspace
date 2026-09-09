@@ -3,7 +3,7 @@ use std::{
     num::NonZeroUsize,
     ptr::NonNull,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
@@ -20,7 +20,9 @@ use crate::{
     error::{Result, RuntimeError},
     runtime::primitives::{EventCount, Unparker, WakeFailureState},
     scope::{GenericScopeCompletion, ScopeBlockingWaiter},
-    task::{LocalTaskRef, LocalWakeTarget, ScopeStorage, SendTaskRef, TaskHandleRef},
+    task::{
+        GenericTaskHeader, LocalTaskRef, LocalWakeTarget, ScopeStorage, SendTaskRef, TaskHandleRef,
+    },
     utils::{FastRand, ownership::Ownership},
 };
 
@@ -42,19 +44,17 @@ const GLOBAL_QUEUE_INTERVAL: u32 = 61;
 /// 本地与全局队列都空时的偷取尝试次数。
 const STEAL_ATTEMPTS: usize = 4;
 
-/// `enqueue_pinned` 的结果：区分 scope 是否已由 `acknowledge_completion` 结算。
+/// `enqueue_pinned` 的结果：所有终态结算都由任务 header 状态机负责。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnqueuePinnedOutcome {
     /// 成功入队到目标 worker 的 pinned channel。
     Enqueued,
     /// 任务已在队列中，无需额外 scope 操作。
     AlreadyQueued,
-    /// 入队 abort，scope 义务已由 `acknowledge_completion` 结算。
+    /// 入队 abort，任务已由 header 终结。
     AbortedAcknowledged,
-    /// 任务已完成且 scope 已结算。
+    /// 任务已进入终态，调用方不得重复结算。
     AlreadySettled,
-    /// 无法通过 header ack 结算，caller 的 `ScopeTaskGuard` 须 `settle`。
-    NeedsCallerSettle,
 }
 
 pub struct RuntimeSharedBase {
@@ -63,6 +63,9 @@ pub struct RuntimeSharedBase {
     pub(crate) scheduler: TaskScheduler,
     pub(crate) idle: IdleController,
     pub(crate) shutdown: Arc<AtomicBool>,
+    /// Serializes shutdown with queue publication so no task can be published
+    /// after all workers have started draining their backlogs.
+    pub(crate) shutdown_gate: Mutex<()>,
     pub(crate) wake_failure: Arc<WakeFailureState>,
     pub(crate) local_wake_targets: Box<[Arc<LocalWakeTarget>]>,
     pub(crate) worker_tick_hook: Option<WorkerTickHook>,
@@ -208,6 +211,7 @@ impl<T> RuntimeShared<T> {
                     event_count,
                 },
                 shutdown,
+                shutdown_gate: Mutex::new(()),
                 wake_failure,
                 local_wake_targets,
                 worker_tick_hook,
@@ -285,59 +289,68 @@ impl RuntimeSharedBase {
 
     /// 入队失败后放弃任务：先归还 `STATE_QUEUED` 持有的引用，再终结任务本体，
     /// 确保 scope 义务一定被结算。
+    ///
+    /// 这里只处理 header 状态，不释放任务对象。入队失败的调用方仍可能拥有对象本身
+    /// （例如 `route_to` 持有 `Box<RouteJobTask>`），由它负责最后一次析构；worker backlog
+    /// 则使用 [`Self::abandon_queued_task_and_drop`] 接管这份释放责任。
     fn abandon_queued_task<H: TaskHandleRef>(task: &H) {
         let header = task.header();
         if header.clear_queued() {
-            // 队列引用恰好是最后一个引用，直接结算。
-            header.try_acknowledge_completion();
+            // clear_queued 已把最后一个队列引用交给统一终态状态机。
         } else {
             header.abandon_before_enqueue();
+        }
+    }
+
+    /// 放弃一个已脱离队列、且当前 worker 已成为其对象所有者的任务。
+    fn abandon_queued_task_and_drop<H: TaskHandleRef>(task: &H) {
+        let header = task.header();
+        Self::abandon_queued_task(task);
+        if header.drop_after_poll() && header.is_reclaimable() {
+            unsafe { GenericTaskHeader::drop_task(NonNull::from(header)) };
         }
     }
 
     /// 放弃当前 worker 队列里的全部积压任务并结算它们的 scope 义务。
     ///
     /// 只在 worker 因 shutdown 退出调度循环时调用：这些任务已经不可能再被 poll，若不在
-    /// 这里终结，等待它们的作用域会永久挂起。任务体本身不在这里析构 —— 它随所属 arena /
-    /// 调用栈一起释放，与「入队失败」路径的约定一致。
+    /// 这里终结，等待它们的作用域会永久挂起。arena-backed 节点仍由 arena 回收；拥有独立
+    /// 析构责任的自定义任务则由这里按 vtable 回收。
     pub(crate) fn abandon_worker_backlog(&self, worker_id: usize) {
         self.drain_local_wake_mailbox(worker_id);
         let worker = &self.registry.workers[worker_id];
 
         if let Some(header) = worker.lifo.swap(None, Ordering::AcqRel) {
-            Self::abandon_queued_task(&unsafe { SendTaskRef::from_header(header.as_ptr()) });
+            Self::abandon_queued_task_and_drop(&unsafe {
+                SendTaskRef::from_header(header.as_ptr())
+            });
         }
         while let Ok(Some(task)) = self.tls.try_with(|ctx| ctx.worker.pop()) {
-            Self::abandon_queued_task(&task);
+            Self::abandon_queued_task_and_drop(&task);
         }
         while let Some(task) = worker.pinned_queue.pop() {
             worker.pinned_count.fetch_sub(1, Ordering::Release);
-            Self::abandon_queued_task(&task);
+            Self::abandon_queued_task_and_drop(&task);
         }
         while let Some(task) = worker.local_queue.pop() {
             worker.local_count.fetch_sub(1, Ordering::Release);
-            Self::abandon_queued_task(&task);
+            Self::abandon_queued_task_and_drop(&task);
         }
         while let Some(task) = worker.remote_queue.pop() {
             worker.remote_count.fetch_sub(1, Ordering::Release);
-            Self::abandon_queued_task(&task);
+            Self::abandon_queued_task_and_drop(&task);
         }
         // shutdown 期间 foreign wake 仍可能在第一次 drain 后到达；再次 drain 后，
-        // `abandon_if_shutdown` 会把它们结算，而不是把任务留在已经退出的 worker 上。
+        // mailbox 中的 stale token 也不会把任务重新发布到已关闭的队列。
         self.drain_local_wake_mailbox(worker_id);
+        self.abandon_global_backlog();
     }
 
-    /// 运行时已关停时，入队等于把任务送进一个再也不会被 poll 的队列。
-    ///
-    /// 关停之后所有 worker 都在退出并放弃自己的积压任务，此时新入队的任务会被永远遗忘 ——
-    /// 等待它的作用域（`wait_all` / 析构 join）也就永远等不到 `remaining` 归零。取消唤醒
-    /// 一个挂起的任务恰好会走到这里，所以必须在这里终结它而不是入队。
-    fn abandon_if_shutdown<H: TaskHandleRef>(&self, task: &H) -> bool {
-        if !self.shutdown.load(Ordering::Acquire) {
-            return false;
-        }
-        task.header().abandon_before_enqueue();
-        true
+    /// 放弃 global injector 中尚未被任何 worker 取出的任务。
+    pub(crate) fn abandon_global_backlog(&self) {
+        self.scheduler.injector.drain(|task| {
+            Self::abandon_queued_task_and_drop(&task);
+        });
     }
 
     /// 将本地任务入队当前线程的本地队列。
@@ -347,24 +360,35 @@ impl RuntimeSharedBase {
             Some(worker_id),
             "local task enqueue must run on the owner worker"
         );
-        if task.header().is_completed() {
-            return Ok(());
-        }
-        if self.abandon_if_shutdown(&task) {
-            return Ok(());
-        }
-        if task.header().try_mark_queued() {
-            let worker = &self.registry.workers[worker_id];
-            worker.local_count.fetch_add(1, Ordering::Release);
-            if let Err(task) = worker.local_queue.push(task) {
-                worker.local_count.fetch_sub(1, Ordering::Release);
-                Self::abandon_queued_task(&task);
+        let enqueued = {
+            let _shutdown_gate = self
+                .shutdown_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if task.header().is_result_ready() {
+                false
+            } else if self.shutdown.load(Ordering::Acquire) {
+                task.header().abandon_before_enqueue();
+                false
+            } else if task.header().try_mark_queued() {
+                let worker = &self.registry.workers[worker_id];
+                worker.local_count.fetch_add(1, Ordering::Release);
+                if let Err(task) = worker.local_queue.push(task) {
+                    worker.local_count.fetch_sub(1, Ordering::Release);
+                    Self::abandon_queued_task(&task);
+                    false
+                } else {
+                    true
+                }
             } else {
-                // 唤醒失败会设置共享 shutdown。任务已经在队列中可见，必须保留队列引用和
-                // 计数，交给 worker 的 shutdown drain 结算；此处提前清理会让 drain 对计数
-                // 再次递减，并可能把仍在队列中的任务变成悬挂引用。
-                task.header().notify_runtime_active()?;
+                false
             }
+        };
+        if enqueued {
+            // 唤醒失败会设置共享 shutdown。任务已经在队列中可见，必须保留队列引用和
+            // 计数，交给 worker 的 shutdown drain 结算；此处提前清理会让 drain 对计数
+            // 再次递减，并可能把仍在队列中的任务变成悬挂引用。
+            task.header().notify_runtime_active()?;
         }
         Ok(())
     }
@@ -374,33 +398,39 @@ impl RuntimeSharedBase {
             task.header().abandon_before_enqueue();
             return EnqueuePinnedOutcome::AbortedAcknowledged;
         }
-        let header = task.header();
-        if header.is_completed() {
-            if header.is_scope_acknowledged() {
-                return EnqueuePinnedOutcome::AlreadySettled;
+        let outcome = {
+            let _shutdown_gate = self
+                .shutdown_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let header = task.header();
+            if header.is_result_ready() {
+                EnqueuePinnedOutcome::AlreadySettled
+            } else if self.shutdown.load(Ordering::Acquire) {
+                header.abandon_before_enqueue();
+                EnqueuePinnedOutcome::AbortedAcknowledged
+            } else if header.try_mark_queued() {
+                let worker = &self.registry.workers[worker_id];
+                worker.pinned_count.fetch_add(1, Ordering::Release);
+                if let Err(task) = worker.pinned_queue.push(task) {
+                    worker.pinned_count.fetch_sub(1, Ordering::Release);
+                    Self::abandon_queued_task(&task);
+                    EnqueuePinnedOutcome::AbortedAcknowledged
+                } else {
+                    EnqueuePinnedOutcome::Enqueued
+                }
+            } else {
+                EnqueuePinnedOutcome::AlreadyQueued
             }
-            return EnqueuePinnedOutcome::NeedsCallerSettle;
-        }
-        if self.abandon_if_shutdown(&task) {
-            return EnqueuePinnedOutcome::AbortedAcknowledged;
-        }
-        if header.try_mark_queued() {
-            let worker = &self.registry.workers[worker_id];
-            worker.pinned_count.fetch_add(1, Ordering::Release);
-            if let Err(task) = worker.pinned_queue.push(task) {
-                worker.pinned_count.fetch_sub(1, Ordering::Release);
-                Self::abandon_queued_task(&task);
-                return EnqueuePinnedOutcome::AbortedAcknowledged;
-            }
+        };
+        if outcome == EnqueuePinnedOutcome::Enqueued {
             // 序列号只能在任务**已经可见之后**递增，见 `EventCount::notify`。
             self.idle.event_count.notify();
             if self.wake_worker(worker_id).is_err() {
                 // 任务已可见；唤醒失败由共享 fatal 通道终止 runtime。
             }
-            EnqueuePinnedOutcome::Enqueued
-        } else {
-            EnqueuePinnedOutcome::AlreadyQueued
         }
+        outcome
     }
 
     #[inline]
@@ -450,24 +480,47 @@ impl RuntimeSharedBase {
     }
 
     pub(crate) fn poll_local_task(&self, worker_id: usize, task: LocalTaskRef) -> Result<()> {
+        let header = task.header();
+        let should_drop = header.drop_after_poll();
+        let header_ptr = NonNull::from(header);
         if task.header().clear_queued() {
-            task.header().acknowledge_completion();
+            if should_drop && header.is_reclaimable() {
+                unsafe { GenericTaskHeader::drop_task(header_ptr) };
+            }
             Ok(())
         } else {
-            task.poll_task(worker_id).map(|_| ())
+            let completed = task.poll_task(worker_id)?;
+            if completed && should_drop {
+                unsafe { GenericTaskHeader::drop_task(header_ptr) };
+            }
+            Ok(())
         }
     }
 
     pub(crate) fn poll_send_task(&self, worker_id: usize, task: SendTaskRef) -> Result<()> {
-        if task.header().clear_queued() {
-            task.header().acknowledge_completion();
+        let header = task.header();
+        let should_drop = header.drop_after_poll();
+        let header_ptr = NonNull::from(header);
+        let cleared = task.header().clear_queued();
+        if cleared {
+            if should_drop && header.is_reclaimable() {
+                unsafe { GenericTaskHeader::drop_task(header_ptr) };
+            }
             Ok(())
         } else {
-            task.poll_task(worker_id).map(|_| ())
+            let completed = task.poll_task(worker_id)?;
+            if completed && should_drop {
+                unsafe { GenericTaskHeader::drop_task(header_ptr) };
+            }
+            Ok(())
         }
     }
 
     pub(crate) fn shutdown(&self) {
+        let _shutdown_gate = self
+            .shutdown_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.shutdown.store(true, Ordering::Release);
         for i in 0..self.registry.unparkers.len() {
             if self.registry.unpark(i).is_err() {
@@ -483,28 +536,45 @@ impl RuntimeSharedBase {
             task.header().abandon_before_enqueue();
             return;
         }
-        if task.header().is_completed() {
-            return;
-        }
-        if self.abandon_if_shutdown(&task) {
-            return;
-        }
-        if task.header().try_mark_queued() {
-            let worker = &self.registry.workers[worker_id];
-            // 两条分支都先让任务可见、再 bump 序列号。
-            if let Err(task) = worker.remote_queue.push(task) {
-                self.scheduler.injector.push(task);
-                self.idle.event_count.notify();
-                let group_idx = self.topo.worker_to_group[worker_id];
-                self.idle
-                    .wake_idle_in_group(group_idx, &self.topo, &self.registry);
-            } else {
+        let destination = {
+            let _shutdown_gate = self
+                .shutdown_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if task.header().is_result_ready() {
+                None
+            } else if self.shutdown.load(Ordering::Acquire) {
+                task.header().abandon_before_enqueue();
+                None
+            } else if task.header().try_mark_queued() {
+                let worker = &self.registry.workers[worker_id];
+                // 计数必须先于发布队列元素，避免 worker 先弹出任务再对零计数执行减法。
                 worker.remote_count.fetch_add(1, Ordering::Release);
+                if let Err(task) = worker.remote_queue.push(task) {
+                    worker.remote_count.fetch_sub(1, Ordering::Release);
+                    self.scheduler.injector.push(task);
+                    Some(false)
+                } else {
+                    Some(true)
+                }
+            } else {
+                None
+            }
+        };
+        match destination {
+            Some(true) => {
                 self.idle.event_count.notify();
                 if self.wake_worker(worker_id).is_err() {
                     // 任务已可见；唤醒失败由共享 fatal 通道终止 runtime。
                 }
             }
+            Some(false) => {
+                self.idle.event_count.notify();
+                let group_idx = self.topo.worker_to_group[worker_id];
+                self.idle
+                    .wake_idle_in_group(group_idx, &self.topo, &self.registry);
+            }
+            None => {}
         }
     }
 
@@ -628,46 +698,56 @@ impl<T> RuntimeShared<T> {
     }
 
     pub(crate) fn enqueue_send(&self, worker_id: usize, task: SendTaskRef) {
-        if self.base.validate_worker_id(worker_id).is_err() {
-            task.header().abandon_before_enqueue();
-            return;
-        }
-        if task.header().is_completed() {
-            return;
-        }
-        if self.base.abandon_if_shutdown(&task) {
-            return;
-        }
-
         let current = self
             .base
             .tls
             .try_with(|ctx| ctx.worker_id)
             .unwrap_or(usize::MAX);
 
-        if current == worker_id && task.header().try_mark_queued() {
-            let worker = &self.base.registry.workers[worker_id];
-            let header_ptr = task.header() as *const _ as *mut _;
-            if worker
-                .lifo
-                .compare_exchange(
-                    None,
-                    NonNull::new(header_ptr),
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_err()
-            {
-                self.base.tls.with(|ctx| {
-                    ctx.worker.push(task);
-                });
+        if current == worker_id {
+            let enqueued = {
+                let _shutdown_gate = self
+                    .base
+                    .shutdown_gate
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if self.base.validate_worker_id(worker_id).is_err()
+                    || task.header().is_result_ready()
+                {
+                    false
+                } else if self.base.shutdown.load(Ordering::Acquire) {
+                    task.header().abandon_before_enqueue();
+                    false
+                } else if task.header().try_mark_queued() {
+                    let worker = &self.base.registry.workers[worker_id];
+                    let header_ptr = task.header() as *const _ as *mut _;
+                    if worker
+                        .lifo
+                        .compare_exchange(
+                            None,
+                            NonNull::new(header_ptr),
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_err()
+                    {
+                        self.base.tls.with(|ctx| {
+                            ctx.worker.push(task);
+                        });
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
+            if enqueued {
+                // 任务已进入 lifo 槽或本地 deque，此刻才可以 bump 序列号。
+                self.base.idle.event_count.notify();
+                if self.wake_worker(worker_id).is_err() {
+                    // 任务已可见；唤醒失败由共享 fatal 通道终止 runtime。
+                }
+                return;
             }
-            // 任务已进入 lifo 槽或本地 deque，此刻才可以 bump 序列号。
-            self.base.idle.event_count.notify();
-            if self.wake_worker(worker_id).is_err() {
-                // 任务已可见；唤醒失败由共享 fatal 通道终止 runtime。
-            }
-            return;
         }
 
         self.base.enqueue_send(worker_id, task);

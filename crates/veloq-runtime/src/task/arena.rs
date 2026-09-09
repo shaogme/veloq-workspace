@@ -1,5 +1,7 @@
+use super::TaskJoinGate;
 use std::{
     alloc::{Layout, alloc, dealloc, handle_alloc_error},
+    marker::PhantomData,
     pin::Pin,
     ptr::{self, NonNull},
     sync::atomic::Ordering,
@@ -10,15 +12,58 @@ use veloq_storage::{StateInt, StateLock, StateOptionPtr, Storage, ThreadSafeStor
 /// 一个高性能的、块分配器接口。
 pub trait Arena {
     /// # Safety
-    /// The layout must be valid. If `drop_fn` is provided, it must be safe to call on the returned pointer.
+    /// The layout must be valid. If `drop_fn` is provided, it must be safe to call on the returned
+    /// pointer. Only allocations created with `Some(drop_fn)` may later be passed to
+    /// [`Arena::drop_object_raw`]; an allocation created with `None` has no reclaim metadata.
     unsafe fn alloc_raw(
         &self,
         layout: Layout,
         drop_fn: Option<unsafe fn(*mut u8)>,
     ) -> Option<NonNull<u8>>;
     /// # Safety
-    /// `data_ptr` must be a pointer previously returned by `alloc_raw`.
+    /// `data_ptr` must be a pointer previously returned by `alloc_raw` with a non-`None` drop
+    /// function, and `layout` must be identical to the allocation layout.
     unsafe fn drop_object_raw(&self, data_ptr: *mut u8, layout: Layout);
+}
+
+/// One-shot owner for an arena-backed task node.
+///
+/// A lease may only be created after the task header has published
+/// `RECLAIMABLE`. Its destructor is the single fallback that invokes the node's
+/// arena reclaim callback, so result extraction and error paths cannot leak or
+/// reclaim the same node twice.
+pub(crate) struct TaskLease<'scope_ref, 'arena, T, A: Arena> {
+    arena: &'arena A,
+    gate: &'scope_ref dyn TaskJoinGate<T>,
+    reclaim: Option<unsafe fn(&A, &'scope_ref dyn TaskJoinGate<T>)>,
+    marker: PhantomData<T>,
+}
+
+impl<'scope_ref, 'arena, T, A: Arena> TaskLease<'scope_ref, 'arena, T, A> {
+    /// # Safety
+    ///
+    /// The caller must have observed `GenericTaskHeader::is_reclaimable()` and
+    /// the callback must reclaim exactly the node represented by `gate`.
+    pub(crate) unsafe fn new(
+        arena: &'arena A,
+        gate: &'scope_ref dyn TaskJoinGate<T>,
+        reclaim: Option<unsafe fn(&A, &'scope_ref dyn TaskJoinGate<T>)>,
+    ) -> Self {
+        Self {
+            arena,
+            gate,
+            reclaim,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<T, A: Arena> Drop for TaskLease<'_, '_, T, A> {
+    fn drop(&mut self) {
+        if let Some(reclaim) = self.reclaim.take() {
+            unsafe { reclaim(self.arena, self.gate) };
+        }
+    }
 }
 
 /// 通用的块分配器，通过 Storage 策略支持线程安全或本地分配。
@@ -212,7 +257,11 @@ impl<S: Storage> GenericArena<S> {
         }
 
         // 分配新块
-        let chunk_size = 8192.max(layout.size() + layout.align());
+        let required_size = layout
+            .size()
+            .checked_add(layout.align())
+            .unwrap_or_else(|| handle_alloc_error(layout));
+        let chunk_size = 8192.max(required_size);
         let new_chunk_layout = match Layout::from_size_align(chunk_size, 64) {
             Ok(layout) => layout,
             Err(_) => handle_alloc_error(layout),

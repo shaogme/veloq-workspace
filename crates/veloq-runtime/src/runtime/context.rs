@@ -4,6 +4,7 @@ use std::{
     marker::PhantomData,
     num::NonZeroUsize,
     ops::AsyncFnOnce,
+    panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
     ptr::NonNull,
     sync::{Arc, Mutex, atomic::Ordering},
@@ -18,8 +19,8 @@ use crate::{
     outcome::{IntoOutcome, Outcome},
     scope::{AsyncScope, LocalAsyncScope},
     task::{
-        AnyScopeRef, GenericTaskHeader, RawTask, RuntimeContextExt, ScopeRef, SendTaskRef,
-        TaskHandleRef, TaskHeader, TaskVTable,
+        AnyScopeRef, GenericTaskHeader, PollStatus, RawTask, RuntimeContextExt, ScopeRef,
+        SendTaskRef, TaskHandleRef, TaskHeader, TaskVTable,
     },
     utils::FastRand,
 };
@@ -257,30 +258,52 @@ impl<'rt, T> RuntimeCtx<'rt, T> {
             type Storage = AtomicStorage;
 
             fn poll_raw(&self, _worker_id: usize) -> Result<bool> {
+                match self.header.try_enter_poll() {
+                    PollStatus::Complete => return Ok(true),
+                    PollStatus::Yield => return Ok(false),
+                    PollStatus::Proceed => {}
+                }
+
                 let Some(job) = (unsafe { &mut *self.job.get() }).take() else {
-                    self.slot.fail(
+                    let _ = self.slot.fail(
                         RuntimeError::InvariantViolation {
                             site: "RuntimeCtx::route_to::RouteJobTask::poll_raw",
                             detail: "job already taken".into(),
                         }
                         .to_report()
                         .with_category("runtime.route"),
-                    )?;
-                    self.header.mark_completed_and_notify();
-                    unsafe {
-                        let header_ptr = NonNull::from(&self.header);
-                        GenericTaskHeader::drop_task(header_ptr);
-                    }
+                    );
+                    self.finish();
                     return Ok(true);
                 };
-                let fut = job();
-                self.slot.set(fut)?;
-                // Mark as completed before self-destruct
-                self.header.mark_completed_and_notify();
-                unsafe {
-                    let header_ptr = NonNull::from(&self.header);
-                    GenericTaskHeader::drop_task(header_ptr);
+
+                match catch_unwind(AssertUnwindSafe(job)) {
+                    Ok(fut) => {
+                        if let Err(err) = self.slot.set(fut) {
+                            let _ = self.slot.fail(
+                                RuntimeError::InvariantViolation {
+                                    site: "RuntimeCtx::route_to::RouteJobTask::poll_raw",
+                                    detail: format!("route result slot rejected value: {err}")
+                                        .into(),
+                                }
+                                .to_report()
+                                .with_category("runtime.route"),
+                            );
+                        }
+                    }
+                    Err(_) => {
+                        let _ = self.slot.fail(
+                            RuntimeError::InvariantViolation {
+                                site: "RuntimeCtx::route_to::RouteJobTask::poll_raw",
+                                detail: "route job panicked".into(),
+                            }
+                            .to_report()
+                            .with_category("runtime.route"),
+                        );
+                    }
                 }
+
+                self.finish();
                 Ok(true)
             }
 
@@ -294,6 +317,13 @@ impl<'rt, T> RuntimeCtx<'rt, T> {
             F: FnOnce() -> Fut + Send + 'scope_ref,
             Fut: Future + Send + 'scope_ref,
         {
+            fn finish(&self) {
+                self.header.publish_result_and_notify();
+                self.header.exit_poll();
+                self.header.decrement_ref_count();
+                self.header.finish_finalization();
+            }
+
             const VTABLE: &'static TaskVTable<AtomicStorage> = &TaskVTable {
                 wake: |_| {},
                 wake_by_ref: |_| {},
@@ -306,6 +336,7 @@ impl<'rt, T> RuntimeCtx<'rt, T> {
                     let ptr = data.as_ptr() as *mut Self;
                     let _ = Box::from_raw(ptr);
                 },
+                drop_after_poll: true,
             };
         }
 
@@ -330,9 +361,7 @@ impl<'rt, T> RuntimeCtx<'rt, T> {
 
         match self.shared().enqueue_pinned(worker_id, task_ctx) {
             EnqueuePinnedOutcome::Enqueued | EnqueuePinnedOutcome::AlreadyQueued => {}
-            EnqueuePinnedOutcome::AbortedAcknowledged
-            | EnqueuePinnedOutcome::AlreadySettled
-            | EnqueuePinnedOutcome::NeedsCallerSettle => {
+            EnqueuePinnedOutcome::AbortedAcknowledged | EnqueuePinnedOutcome::AlreadySettled => {
                 unsafe {
                     let _ = Box::from_raw(ptr);
                 }

@@ -112,6 +112,7 @@ where
             (*raw_ptr).poll_raw(worker_id)
         },
         drop: |_| {},
+        drop_after_poll: false,
     };
 
     pub fn new(future: F) -> Self {

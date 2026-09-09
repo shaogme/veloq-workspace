@@ -7,7 +7,7 @@ use crate::{
     runtime::{GenericCancellationToken, primitives::CancelledFuture},
     task::{
         GenericTaskHeader, GenericWakerNode, LocalTaskRef, SendTaskRef, TaskError, TaskHandleRef,
-        TaskJoinGate,
+        TaskJoinGate, TaskLease,
     },
 };
 use diagweave::{Report, prelude::*};
@@ -155,10 +155,10 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra>
     /// Returns whether the task has fully completed (equivalent to `await` returning `Ready`).
     pub fn is_finished(&self) -> bool {
         match &self.source {
-            JoinSource::Direct { task, .. } => task.header().is_completed(),
+            JoinSource::Direct { task, .. } => task.header().is_reclaimable(),
             JoinSource::Routed { state, resolved } => {
                 if let Some(res) = resolved {
-                    res.task.header().is_completed()
+                    res.task.header().is_reclaimable()
                 } else {
                     state.has_failed_outcome()
                 }
@@ -295,28 +295,26 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TEx
         match &mut this.source {
             JoinSource::Direct { task, gate, .. } => {
                 let header = task.header();
-                if header.is_completed() {
+                if header.is_reclaimable() {
                     Self::remove_waker_on(&mut this.waker_node, header);
-                    let Some(res) = gate.take_result_erased() else {
-                        // 任务在入队失败后被 `abandon_before_enqueue` 终结：没有结果，
-                        // 但状态是可判别的取消。
-                        if header.is_locally_cancelled() {
-                            return Poll::Ready(JoinOutcome::TaskErr(TaskError::Cancelled));
+                    let lease = unsafe { TaskLease::new(arena, *gate, reclaim) };
+                    let outcome = if let Some(res) = gate.take_result_erased() {
+                        match res {
+                            Ok(value) => JoinOutcome::Ok(value),
+                            Err(err) => JoinOutcome::TaskErr(err),
                         }
-                        return Poll::Ready(JoinOutcome::RuntimeErr(
+                    } else if header.is_locally_cancelled() {
+                        JoinOutcome::TaskErr(TaskError::Cancelled)
+                    } else {
+                        JoinOutcome::RuntimeErr(
                             RuntimeError::TaskResultUnavailable {
                                 stage: "JoinHandle::poll(Direct)",
                             }
                             .to_report(),
-                        ));
+                        )
                     };
-                    if let Some(reclaim) = reclaim {
-                        unsafe { (reclaim)(arena, *gate) };
-                    }
-                    return Poll::Ready(match res {
-                        Ok(value) => JoinOutcome::Ok(value),
-                        Err(err) => JoinOutcome::TaskErr(err),
-                    });
+                    drop(lease);
+                    return Poll::Ready(outcome);
                 }
 
                 if let Err(err) =
@@ -329,7 +327,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TEx
             JoinSource::Routed { state, resolved } => loop {
                 if let Some(res) = resolved {
                     let header = res.task.header();
-                    if header.is_completed() {
+                    if header.is_reclaimable() {
                         Self::remove_waker_on(&mut this.waker_node, header);
                         let Some(access) = res.access.take() else {
                             return Poll::Ready(JoinOutcome::RuntimeErr(
@@ -417,7 +415,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra> Drop
             };
 
             if let Some(task) = task {
-                // 无条件摘链：任务已完成也可能正处在「COMPLETED 已置位、链表尚未清空」
+                // 无条件摘链：任务已完成也可能正处在「结果已发布、链表尚未清空」
                 // 的窗口里，此时提前返回会留下悬垂节点。
                 unsafe {
                     task.header().remove_waker(node_ptr);

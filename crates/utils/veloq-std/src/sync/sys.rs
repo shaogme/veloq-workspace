@@ -11,4 +11,4 @@ pub use linux::{wait_on_address, wait_on_address_timeout, wake_all_by_address, w
 #[cfg(feature = "loom")]
 mod loom;
 #[cfg(feature = "loom")]
-pub use loom::{wait_on_address, wake_all_by_address, wake_by_address};
+pub use loom::{wait_on_address, wait_on_address_timeout, wake_all_by_address, wake_by_address};

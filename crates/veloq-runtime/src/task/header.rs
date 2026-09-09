@@ -21,7 +21,7 @@ use veloq_storage::{
     AtomicStorage, LocalStorage, StateInt, StateLock, Storage, StrategyType, ThreadSafeStorage,
 };
 
-pub(crate) const STATE_COMPLETED: usize = 1 << 0;
+pub(crate) const STATE_RESULT_READY: usize = 1 << 0;
 pub(crate) const STATE_QUEUED: usize = 1 << 1;
 pub(crate) const STATE_READY: usize = 1 << 2;
 pub(crate) const STATE_CANCELLED: usize = 1 << 3;
@@ -32,6 +32,8 @@ pub(crate) const STATE_SCOPE_OBLIGATED: usize = 1 << 7;
 pub(crate) const STATE_SCOPE_ACKED: usize = 1 << 8;
 /// 任务已把自己的等待节点挂到所属 scope 的取消队列上。
 pub(crate) const STATE_CANCEL_ARMED: usize = 1 << 9;
+pub(crate) const STATE_FINALIZED: usize = 1 << 10;
+pub(crate) const STATE_RECLAIMABLE: usize = 1 << 11;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PollStatus {
     Proceed,
@@ -44,6 +46,7 @@ pub struct TaskVTable<S: Storage> {
     pub wake_by_ref: unsafe fn(data: &GenericTaskHeader<S>),
     pub poll: unsafe fn(data: &GenericTaskHeader<S>, worker_id: usize) -> Result<bool>,
     pub drop: unsafe fn(data: NonNull<GenericTaskHeader<S>>),
+    pub drop_after_poll: bool,
 }
 
 pub(crate) struct GenericWakerNode<S: Storage> {
@@ -122,8 +125,18 @@ impl<S: Storage> GenericTaskHeader<S> {
     }
 
     #[inline]
-    pub(crate) fn is_completed(&self) -> bool {
-        self.state.load(Ordering::Acquire) & STATE_COMPLETED != 0
+    pub(crate) fn is_result_ready(&self) -> bool {
+        self.state.load(Ordering::Acquire) & STATE_RESULT_READY != 0
+    }
+
+    #[inline]
+    pub(crate) fn is_reclaimable(&self) -> bool {
+        self.state.load(Ordering::Acquire) & STATE_RECLAIMABLE != 0
+    }
+
+    #[inline]
+    pub(crate) fn drop_after_poll(&self) -> bool {
+        self.vtable.drop_after_poll
     }
 
     #[inline]
@@ -161,7 +174,7 @@ impl<S: Storage> GenericTaskHeader<S> {
     #[inline]
     pub(crate) fn cancel_and_wake(&self) {
         let old = self.state.fetch_or(STATE_CANCELLED, Ordering::AcqRel);
-        if old & (STATE_CANCELLED | STATE_COMPLETED) != 0 {
+        if old & (STATE_CANCELLED | STATE_RESULT_READY) != 0 {
             return;
         }
         self.wake_by_ref();
@@ -206,7 +219,7 @@ impl<S: Storage> GenericTaskHeader<S> {
     pub(crate) fn try_mark_queued(&self) -> bool {
         loop {
             let state = self.state.load(Ordering::Acquire);
-            if state & STATE_QUEUED != 0 || state & STATE_COMPLETED != 0 {
+            if state & STATE_QUEUED != 0 || state & STATE_RESULT_READY != 0 {
                 return false;
             }
             if self
@@ -228,8 +241,13 @@ impl<S: Storage> GenericTaskHeader<S> {
     #[inline]
     pub(crate) fn clear_queued(&self) -> bool {
         let old_state = self.state.fetch_and(!STATE_QUEUED, Ordering::Release);
-        if old_state & STATE_QUEUED != 0 && self.ref_count.fetch_sub(1, Ordering::AcqRel) == 1 {
-            return true;
+        if old_state & STATE_QUEUED != 0 {
+            let previous = self.ref_count.fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(previous != 0, "task reference count underflow");
+            if previous == 1 {
+                self.try_advance_terminal_state();
+                return true;
+            }
         }
         false
     }
@@ -239,7 +257,7 @@ impl<S: Storage> GenericTaskHeader<S> {
     pub(crate) fn try_enter_poll(&self) -> PollStatus {
         let mut state = self.state.load(Ordering::Acquire);
         loop {
-            if state & STATE_COMPLETED != 0 {
+            if state & STATE_RESULT_READY != 0 {
                 return PollStatus::Complete;
             }
             if state & STATE_POLLING != 0 {
@@ -316,13 +334,13 @@ impl<S: Storage> GenericTaskHeader<S> {
         mut node: Pin<&mut GenericWakerNode<S>>,
         waker: &Waker,
     ) {
-        if self.is_completed() {
+        if self.is_reclaimable() {
             waker.wake_by_ref();
             return;
         }
 
         let mut wakers = self.wakers.lock();
-        if self.is_completed() {
+        if self.is_reclaimable() {
             drop(wakers);
             waker.wake_by_ref();
             return;
@@ -339,17 +357,40 @@ impl<S: Storage> GenericTaskHeader<S> {
         }
     }
 
-    /// 标记任务为完成状态，并通知所有等待完成的 waker。
-    pub fn mark_completed_and_notify(&self) {
+    /// Publish the task result and wake joiners for a finalization re-check.
+    pub(crate) fn publish_result_and_notify(&self) {
         let old_state = self
             .state
-            .fetch_or(STATE_READY | STATE_COMPLETED, Ordering::AcqRel);
-        if old_state & STATE_COMPLETED != 0 {
+            .fetch_or(STATE_READY | STATE_RESULT_READY, Ordering::AcqRel);
+        self.disarm_scope_cancel_waiter();
+        if old_state & STATE_RESULT_READY != 0 {
             return;
         }
 
-        self.disarm_scope_cancel_waiter();
         self.notify_completion_wakers();
+    }
+
+    /// Mark finalizer work complete and attempt the one permitted reclaim transition.
+    pub(crate) fn finish_finalization(&self) {
+        self.wake_token.deactivate_and_wait();
+        let old_state = self.state.fetch_or(STATE_FINALIZED, Ordering::AcqRel);
+        debug_assert!(
+            old_state & STATE_RESULT_READY != 0,
+            "finalization requires a published result"
+        );
+        self.notify_completion_wakers();
+        self.try_advance_terminal_state();
+    }
+
+    /// Completes a custom task whose poll implementation owns its result storage.
+    ///
+    /// The caller must invoke this exactly once after the custom operation has
+    /// returned and while the task execution reference is still held.
+    pub fn complete_external_poll(&self) {
+        self.publish_result_and_notify();
+        self.exit_poll();
+        self.decrement_ref_count();
+        self.finish_finalization();
     }
 
     /// 摘下并唤醒全部完成等待者。
@@ -393,42 +434,33 @@ impl<S: Storage> GenericTaskHeader<S> {
         self.state.load(Ordering::Acquire) & STATE_SCOPE_OBLIGATED != 0
     }
 
-    #[inline]
-    pub(crate) fn is_scope_acknowledged(&self) -> bool {
-        self.state.load(Ordering::Acquire) & STATE_SCOPE_ACKED != 0
-    }
-
-    pub(crate) fn acknowledge_completion(&self) {
-        let old = self.state.fetch_or(STATE_SCOPE_ACKED, Ordering::AcqRel);
-        if old & STATE_SCOPE_ACKED != 0 {
-            debug_assert!(false, "duplicate acknowledge_completion");
-            return;
-        }
-        debug_assert!(
-            old & STATE_SCOPE_OBLIGATED != 0,
-            "acknowledge_completion without scope obligation"
-        );
-        self.scope_completion_ref().task_done();
-    }
-
-    /// `acknowledge_completion` 的幂等版本：只有真正翻转 ACK 标记的一方结算 scope。
+    /// Advance `FINALIZED + ref_count == 0` exactly once.
     ///
-    /// 用于「任务被放弃」这类防御路径 —— 那里无法静态断定义务是否已被结算，
-    /// 因此不能使用带 `debug_assert!` 的 `acknowledge_completion`。
-    pub(crate) fn try_acknowledge_completion(&self) -> bool {
+    /// The successful CAS is the sole owner of both arena-reclamation eligibility and
+    /// the scope acknowledgement. This prevents a queue-drain observer from settling
+    /// a scope while the finalizer still has header accesses outstanding.
+    pub(crate) fn try_advance_terminal_state(&self) -> bool {
         let mut state = self.state.load(Ordering::Acquire);
         loop {
-            if state & STATE_SCOPE_OBLIGATED == 0 || state & STATE_SCOPE_ACKED != 0 {
+            if state & STATE_FINALIZED == 0
+                || state & STATE_RECLAIMABLE != 0
+                || self.ref_count.load(Ordering::Acquire) != 0
+            {
                 return false;
             }
-            match self.state.compare_exchange_weak(
-                state,
-                state | STATE_SCOPE_ACKED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
+            let mut next = state | STATE_RECLAIMABLE;
+            if state & STATE_SCOPE_OBLIGATED != 0 {
+                next |= STATE_SCOPE_ACKED;
+            }
+            match self
+                .state
+                .compare_exchange_weak(state, next, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => {
-                    self.scope_completion_ref().task_done();
+                    self.notify_completion_wakers();
+                    if state & STATE_SCOPE_OBLIGATED != 0 {
+                        self.scope_completion_ref().task_done();
+                    }
                     return true;
                 }
                 Err(s) => state = s,
@@ -444,21 +476,26 @@ impl<S: Storage> GenericTaskHeader<S> {
     /// 挂起。
     ///
     /// 调用者必须先归还 `STATE_QUEUED` 持有的引用（`clear_queued`）；仍处于
-    /// `QUEUED` 或已 `COMPLETED` 的任务由出队 / 完成路径负责结算，此处直接跳过。
+    /// `QUEUED` 或已 `RESULT_READY` 的任务由出队 / 完成路径负责结算，此处直接跳过。
     pub(crate) fn abandon_before_enqueue(&self) {
         let old = self.state.fetch_or(
-            STATE_CANCELLED | STATE_READY | STATE_COMPLETED,
+            STATE_CANCELLED | STATE_READY | STATE_RESULT_READY,
             Ordering::AcqRel,
         );
-        if old & (STATE_COMPLETED | STATE_QUEUED) != 0 {
+        if old & (STATE_RESULT_READY | STATE_QUEUED) != 0 {
             return;
         }
 
         self.disarm_scope_cancel_waiter();
         self.notify_completion_wakers();
-        if self.decrement_ref_count() {
-            self.try_acknowledge_completion();
+        if old & STATE_POLLING != 0 {
+            // 当前 poll 仍持有 execution reference。只发布取消/结果就绪标记，让
+            // poll_task_internal 在本次 future poll 返回后负责写入取消结果并完成最终化；
+            // 此处不能提前 decrement 或 deactivate wake token，否则会在 poll 栈内回收任务。
+            return;
         }
+        self.decrement_ref_count();
+        self.finish_finalization();
     }
 
     /// 任务自身是否被显式取消（不考虑所属 scope 的取消状态）。
@@ -485,7 +522,9 @@ impl<S: Storage> GenericTaskHeader<S> {
 
     #[inline]
     pub(crate) fn decrement_ref_count(&self) -> bool {
-        self.ref_count.fetch_sub(1, Ordering::AcqRel) == 1
+        let previous = self.ref_count.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous != 0, "task reference count underflow");
+        previous == 1
     }
 
     #[inline]
@@ -564,19 +603,7 @@ impl<S: Storage> GenericTaskHeader<S> {
             match runtime.enqueue_pinned(self.worker_id(), task) {
                 EnqueuePinnedOutcome::Enqueued | EnqueuePinnedOutcome::AlreadyQueued => {}
                 EnqueuePinnedOutcome::AbortedAcknowledged
-                | EnqueuePinnedOutcome::AlreadySettled => {}
-                // 唤醒一个已完成的任务时**不能**在这里结算。
-                //
-                // `NeedsCallerSettle` 只是一次观察：「已完成、尚未结算」。这个状态在
-                // `TaskFinalizer::finalize` 里转瞬即逝 —— 它先 `mark_completed_and_notify`，
-                // 之后才按引用计数结算。在窗口里替它结算有两重错：`remaining` 可能提前归零，
-                // 让 `wait_all` 放行、作用域析构、arena 连着任务节点一起释放，而 `finalize`
-                // 还在往那块内存里写（`exit_poll`）；随后 finalize 自己的结算也成了重复结算。
-                //
-                // 任务义务本来就由引用计数协议兜底：最后一个引用（任务自身或某个队列引用）
-                // 归还时一定会结算。非 pinned 的 `enqueue_send` / `enqueue_local` 在
-                // `is_completed()` 时也是直接返回，这里与它们保持一致。
-                EnqueuePinnedOutcome::NeedsCallerSettle => {}
+                | EnqueuePinnedOutcome::AlreadySettled => {} // 终态任务的 wake 只会触发一次状态机检查，不能由调用者结算 scope。
             }
             return Ok(());
         }
@@ -586,8 +613,8 @@ impl<S: Storage> GenericTaskHeader<S> {
 
     /// 尝试将一个 waker 节点从任务的 waker 列表中移除。
     ///
-    /// 这里**不能**用 `is_completed()` 做提前返回：`mark_completed_and_notify` 先置位
-    /// `COMPLETED`、之后才拿锁清链，窗口内提前返回会把一个仍然在链表里的节点留下，
+    /// 这里**不能**用 `is_reclaimable()` 做提前返回：结果发布与清链不是同一个临界区，
+    /// 窗口内提前返回会把一个仍然在链表里的节点留下，
     /// 等 arena 释放后链表中就是悬垂指针。正确性由锁 + `is_linked()` 保证。
     ///
     /// # Safety
@@ -698,6 +725,7 @@ mod tests {
         wake_by_ref: |_| {},
         poll: |_, _| Ok(true),
         drop: |_| {},
+        drop_after_poll: false,
     };
 
     struct WakeCounter {
@@ -737,7 +765,7 @@ mod tests {
     }
 
     /// 同一个节点用不同 waker 重复注册时只能在链表中出现一次，否则链表成环，
-    /// `mark_completed_and_notify` 的遍历会死循环。
+    /// 完成通知的遍历会死循环。
     #[test]
     fn register_completion_is_idempotent_for_linked_node() {
         let header = GenericTaskHeader::<AtomicStorage>::new_placeholder(&TEST_VTABLE);
@@ -756,7 +784,7 @@ mod tests {
             header.register_completion(node.as_mut(), &counting_waker(&second));
         }
 
-        header.mark_completed_and_notify();
+        header.publish_result_and_notify();
 
         assert_eq!(first.count.load(Ordering::Acquire), 0);
         assert_eq!(second.count.load(Ordering::Acquire), 1);
@@ -786,8 +814,8 @@ mod tests {
         unsafe { header.register_completion(node.as_mut(), &counting_waker(&counter)) };
         assert!(node.link.is_linked());
 
-        // 模拟 `mark_completed_and_notify` 置位 COMPLETED 与清链之间的窗口。
-        header.state.fetch_or(STATE_COMPLETED, Ordering::AcqRel);
+        // 模拟 result ready 与清链之间的窗口。
+        header.state.fetch_or(STATE_RESULT_READY, Ordering::AcqRel);
 
         let node_ptr = unsafe { NonNull::from(node.as_mut().get_unchecked_mut()) };
         unsafe { header.remove_waker(node_ptr) };
@@ -802,13 +830,41 @@ mod tests {
 
         header.abandon_before_enqueue();
 
-        assert!(header.is_completed());
+        assert!(header.is_result_ready());
         assert!(header.is_locally_cancelled());
-        assert!(header.is_scope_acknowledged());
+        assert_ne!(header.state.load(Ordering::Acquire) & STATE_SCOPE_ACKED, 0);
+        assert!(header.is_reclaimable());
 
         // 幂等：重复调用不会再次结算。
         header.abandon_before_enqueue();
-        assert!(!header.try_acknowledge_completion());
+        assert!(!header.try_advance_terminal_state());
+    }
+
+    #[test]
+    fn reclaim_waits_for_the_queue_reference() {
+        let header = GenericTaskHeader::<AtomicStorage>::new_placeholder(&TEST_VTABLE);
+        assert!(header.try_mark_queued());
+
+        header.publish_result_and_notify();
+        header.decrement_ref_count();
+        header.finish_finalization();
+
+        assert!(header.is_result_ready());
+        assert_ne!(header.state.load(Ordering::Acquire) & STATE_FINALIZED, 0);
+        assert!(!header.is_reclaimable());
+
+        assert!(header.clear_queued());
+        assert!(header.is_reclaimable());
+    }
+
+    #[test]
+    fn result_ready_is_not_reclaim_permission() {
+        let header = GenericTaskHeader::<AtomicStorage>::new_placeholder(&TEST_VTABLE);
+
+        header.publish_result_and_notify();
+
+        assert!(header.is_result_ready());
+        assert!(!header.is_reclaimable());
     }
 
     #[cfg(not(feature = "loom"))]

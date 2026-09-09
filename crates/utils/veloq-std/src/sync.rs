@@ -17,10 +17,7 @@ pub use mutex::raw::RawMutex;
 pub use mutex::{Mutex, MutexGuard};
 pub use once::{Once, OnceState};
 pub use once_lock::OnceLock;
-#[cfg(not(feature = "loom"))]
 pub use rwlock::const_rwlock;
-#[cfg(not(feature = "loom"))]
-pub use rwlock::raw::RawRwLock;
 pub use rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 pub use spin_lock::{SpinLock, SpinLockGuard};
 

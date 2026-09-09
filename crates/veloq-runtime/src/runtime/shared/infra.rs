@@ -342,6 +342,13 @@ impl GlobalInjector {
             }
         }
     }
+
+    /// Drain all task references still owned by the global injector.
+    pub(crate) fn drain(&self, mut f: impl FnMut(SendTaskRef)) {
+        while let Some(task) = self.pop() {
+            f(task);
+        }
+    }
 }
 
 pub(crate) struct TaskScheduler {

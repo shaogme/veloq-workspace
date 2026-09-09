@@ -281,7 +281,7 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra>
         }
         guard.handoff_to(task_ref.header());
         if let Err(err) = enqueue_fn(self.context.shared(), worker_id, task_ref) {
-            guard.settle_enqueue_failure(task_ref.header());
+            task_ref.header().abandon_before_enqueue();
             return JoinHandle::new_routed(self, new_failed_routed_state(err));
         }
 
@@ -334,7 +334,10 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra>
 
         let task_ref = unsafe { H::from_concrete(node_ptr) };
         if let Err(err) = enqueue_fn(self.context.shared(), worker_id, task_ref) {
-            guard.settle_enqueue_failure(task_ref.header());
+            task_ref.header().abandon_before_enqueue();
+            if task_ref.header().is_reclaimable() {
+                unsafe { self.arena.drop_object_raw(node_ptr as *mut u8, layout) };
+            }
             return JoinHandle::new_routed(self, new_failed_routed_state(err));
         }
 
@@ -448,7 +451,7 @@ impl<'rt, 'scope, 'env, TExtra>
 
                 let outcome =
                     unsafe { &*runtime_base_ptr.as_ptr() }.enqueue_pinned(worker_id, task_ref);
-                if !handle_enqueue_pinned_outcome(guard, task_ref.header(), outcome) {
+                if !handle_enqueue_pinned_outcome(outcome) {
                     state_for_job.fail_task(TaskError::Panic);
                     return;
                 }

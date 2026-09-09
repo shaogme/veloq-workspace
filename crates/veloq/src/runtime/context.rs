@@ -475,11 +475,7 @@ pub(crate) fn submit_control_task<'rt>(
                 let mut driver = extra.driver.borrow_mut();
                 let _ = driver.unregister_files(vec![self.fd]);
             });
-            self.header.mark_completed_and_notify();
-            unsafe {
-                let header_ptr = NonNull::from(&self.header);
-                GenericTaskHeader::drop_task(header_ptr);
-            }
+            self.header.complete_external_poll();
             Ok(true)
         }
 
@@ -500,6 +496,7 @@ pub(crate) fn submit_control_task<'rt>(
                 let ptr = data.as_ptr() as *mut Self;
                 let _ = Box::from_raw(ptr);
             },
+            drop_after_poll: true,
         };
     }
 
@@ -524,9 +521,7 @@ pub(crate) fn submit_control_task<'rt>(
                 // Unparker 已将 backend 错误写入 runtime fatal 通道。
             }
         }
-        EnqueuePinnedOutcome::AbortedAcknowledged
-        | EnqueuePinnedOutcome::AlreadySettled
-        | EnqueuePinnedOutcome::NeedsCallerSettle => unsafe {
+        EnqueuePinnedOutcome::AbortedAcknowledged | EnqueuePinnedOutcome::AlreadySettled => unsafe {
             let _ = Box::from_raw(ptr);
         },
     }

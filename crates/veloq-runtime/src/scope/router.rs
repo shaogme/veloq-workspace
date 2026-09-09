@@ -21,7 +21,7 @@ use std::{
     },
     task::Waker,
 };
-use veloq_storage::{AtomicOptionPtr, AtomicStorage, StateOptionPtr, Storage};
+use veloq_storage::{AtomicOptionPtr, AtomicStorage, StateOptionPtr};
 use veloq_waker::MwsrWaker;
 
 pub(crate) enum RoutedTakeResult<T> {
@@ -229,6 +229,7 @@ where
 pub(crate) struct RoutedSpawnState<'scope_ref, T> {
     outcome: AtomicOptionPtr<RoutedSpawnOutcomeInner<'scope_ref, T>>,
     cancel_requested: AtomicBool,
+    failed: AtomicBool,
     waker: MwsrWaker,
 }
 
@@ -245,6 +246,7 @@ impl<'scope_ref, T> RoutedSpawnState<'scope_ref, T> {
         Arc::new(Self {
             outcome: AtomicOptionPtr::new(None),
             cancel_requested: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
             waker: MwsrWaker::new(),
         })
     }
@@ -259,17 +261,7 @@ impl<'scope_ref, T> RoutedSpawnState<'scope_ref, T> {
     }
 
     pub(crate) fn has_failed_outcome(&self) -> bool {
-        if let Some(raw) = self.outcome.load(Ordering::Acquire) {
-            unsafe {
-                matches!(
-                    raw.as_ref(),
-                    RoutedSpawnOutcomeInner::FailedTask(_)
-                        | RoutedSpawnOutcomeInner::FailedRuntime(_)
-                )
-            }
-        } else {
-            false
-        }
+        self.failed.load(Ordering::Acquire)
     }
 
     fn set_outcome(&self, inner: RoutedSpawnOutcomeInner<'scope_ref, T>) {
@@ -298,10 +290,12 @@ impl<'scope_ref, T> RoutedSpawnState<'scope_ref, T> {
     }
 
     pub(crate) fn fail_task(&self, err: TaskError) {
+        self.failed.store(true, Ordering::Release);
         self.set_outcome(RoutedSpawnOutcomeInner::FailedTask(err));
     }
 
     pub(crate) fn fail_runtime(&self, err: Report<RuntimeError>) {
+        self.failed.store(true, Ordering::Release);
         self.set_outcome(RoutedSpawnOutcomeInner::FailedRuntime(err));
     }
 
@@ -321,11 +315,25 @@ impl<'scope_ref, T> RoutedSpawnState<'scope_ref, T> {
     }
 
     pub(crate) fn cancel_ready_task_if_any(&self) {
-        if let Some(raw) = self.outcome.load(Ordering::Acquire) {
-            let inner = unsafe { raw.as_ref() };
-            if let RoutedSpawnOutcomeInner::Ready(ready) = inner {
-                ready.task.header().cancel_and_wake();
-            }
+        let Some(raw) = self.outcome.swap(None, Ordering::AcqRel) else {
+            return;
+        };
+
+        let boxed = unsafe { Box::from_raw(raw.as_ptr()) };
+        if let RoutedSpawnOutcomeInner::Ready(ready) = &*boxed {
+            ready.task.header().cancel_and_wake();
+        }
+
+        let raw = NonNull::from(Box::leak(boxed));
+        if self
+            .outcome
+            .compare_exchange(None, Some(raw), Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            // A second terminal outcome is a protocol violation. The temporary
+            // owner must still release its old value without touching the newer
+            // value now owned by the state.
+            unsafe { drop(Box::from_raw(raw.as_ptr())) };
         }
     }
 
@@ -382,18 +390,10 @@ pub(crate) fn dispatch_routed<'rt, 'scope_ref, S: ScopeStorage, O: Ownership, T,
     }
 }
 
-pub(crate) fn handle_enqueue_pinned_outcome<H: Storage, S: ScopeStorage, O: Ownership>(
-    guard: &mut ScopeTaskGuard<S, O>,
-    header: &GenericTaskHeader<H>,
-    outcome: EnqueuePinnedOutcome,
-) -> bool {
+pub(crate) fn handle_enqueue_pinned_outcome(outcome: EnqueuePinnedOutcome) -> bool {
     match outcome {
         EnqueuePinnedOutcome::Enqueued | EnqueuePinnedOutcome::AlreadyQueued => true,
         EnqueuePinnedOutcome::AbortedAcknowledged | EnqueuePinnedOutcome::AlreadySettled => false,
-        EnqueuePinnedOutcome::NeedsCallerSettle => {
-            guard.settle_enqueue_failure(header);
-            false
-        }
     }
 }
 
@@ -443,7 +443,7 @@ pub(crate) fn install_routed_pinned_task<'scope_ref, 'rt, T, Fut, TExtra>(
     guard.handoff_to(header);
 
     let outcome = runtime.enqueue_pinned(worker_id, task_ctx);
-    if !handle_enqueue_pinned_outcome(guard, header, outcome) {
+    if !handle_enqueue_pinned_outcome(outcome) {
         unsafe { arena.drop_object_raw(node_ptr as *mut u8, layout) };
         state.fail_task(TaskError::Panic);
         return;
@@ -461,4 +461,60 @@ pub(crate) fn install_routed_pinned_task<'scope_ref, 'rt, T, Fut, TExtra>(
         task: task_ready,
         access: make_boxed_task_access(node_ref),
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::task::TaskVTable;
+    use std::ptr::NonNull;
+
+    static TEST_VTABLE: TaskVTable<AtomicStorage> = TaskVTable {
+        wake: |_| {},
+        wake_by_ref: |_| {},
+        poll: |_, _| Ok(true),
+        drop: |_| {},
+        drop_after_poll: false,
+    };
+
+    struct NoopAccess;
+
+    impl RoutedTaskAccess<()> for NoopAccess {
+        fn take_result(&self) -> RoutedTakeResult<()> {
+            RoutedTakeResult::TaskErr(TaskError::Cancelled)
+        }
+
+        fn reclaim(self: Box<Self>, _arena: &dyn Arena) {}
+    }
+
+    #[test]
+    fn cancel_ready_task_peeks_with_temporary_ownership() {
+        let header = GenericTaskHeader::<AtomicStorage>::new_placeholder(&TEST_VTABLE);
+        let task = unsafe { SendTaskRef::from_header(NonNull::from(&header).as_ptr()) };
+        let state = RoutedSpawnState::<()>::new();
+        state.set_ready(RoutedSpawnReady {
+            task,
+            access: Box::new(NoopAccess),
+        });
+
+        state.cancel_ready_task_if_any();
+
+        assert!(header.is_locally_cancelled());
+        assert!(matches!(
+            state.try_take_ready(),
+            RoutedTakeReadyOutcome::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn failed_state_is_observable_without_raw_pointer_peek() {
+        let state = RoutedSpawnState::<()>::new();
+        assert!(!state.has_failed_outcome());
+        state.fail_task(TaskError::Panic);
+        assert!(state.has_failed_outcome());
+        assert!(matches!(
+            state.try_take_ready(),
+            RoutedTakeReadyOutcome::TaskErr(TaskError::Panic)
+        ));
+    }
 }

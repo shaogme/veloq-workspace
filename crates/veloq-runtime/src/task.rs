@@ -4,6 +4,7 @@ mod nodes;
 mod scope;
 mod wake;
 
+pub(crate) use arena::TaskLease;
 pub use arena::{Arena, GenericArena};
 pub(crate) use header::GenericWakerNode;
 pub use header::{GenericTaskHeader, PollStatus, TaskVTable};
@@ -142,7 +143,7 @@ impl<'a, S: Storage> LifecycleManager<'a, S> {
 
     pub fn enter_poll(&self, is_local: bool) -> PollStatus {
         if is_local {
-            if self.header.is_completed() {
+            if self.header.is_result_ready() {
                 return PollStatus::Complete;
             }
             return PollStatus::Proceed;
@@ -213,17 +214,20 @@ where
     }
 
     fn finalize(&self, is_local: bool) {
-        self.header.mark_completed_and_notify();
-
-        let should_acknowledge = self.header.decrement_ref_count();
+        // Publish the result before closing the wake token so a concurrent waker can
+        // still observe a live header. This is notification only; it is not a reclaim
+        // permission.
+        self.header.publish_result_and_notify();
 
         if !is_local {
             self.header.exit_poll();
         }
 
-        if should_acknowledge {
-            self.header.acknowledge_completion();
-        }
+        // The execution reference is returned before finalization is published. The
+        // finalizer then waits for all active wake callbacks before any joiner may
+        // observe RECLAIMABLE.
+        self.header.decrement_ref_count();
+        self.header.finish_finalization();
     }
 }
 
