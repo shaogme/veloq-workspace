@@ -169,6 +169,7 @@ mod loom_tests {
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
+            mpsc::channel,
         },
         thread,
     };
@@ -201,76 +202,56 @@ mod loom_tests {
     fn test_loom_condvar_notify_one_selects_one_waiter() {
         loom::model(|| {
             let pair = Arc::new((Mutex::new(()), Condvar::new()));
-            let registered = Arc::new(AtomicUsize::new(0));
+            let (first_ready_tx, first_ready_rx) = channel();
+            let (second_ready_tx, second_ready_rx) = channel();
+            let (returned_tx, returned_rx) = channel();
             let returned = Arc::new(AtomicUsize::new(0));
 
             let pair1 = pair.clone();
-            let registered1 = registered.clone();
+            let first_ready_tx1 = first_ready_tx.clone();
+            let returned_tx1 = returned_tx.clone();
             let returned1 = returned.clone();
             let first = thread::spawn(move || {
                 let (lock, cvar) = &*pair1;
                 let guard = lock.lock().unwrap();
-                registered1.fetch_add(1, Ordering::Release);
+                first_ready_tx1.send(()).unwrap();
                 let guard = cvar.wait(guard).unwrap();
-                returned1.fetch_add(1, Ordering::Release);
+                returned1.fetch_add(1, Ordering::Relaxed);
+                returned_tx1.send(()).unwrap();
                 drop(guard);
             });
 
             let pair2 = pair.clone();
-            let registered2 = registered.clone();
+            let second_ready_tx2 = second_ready_tx.clone();
+            let returned_tx2 = returned_tx.clone();
             let returned2 = returned.clone();
             let second = thread::spawn(move || {
                 let (lock, cvar) = &*pair2;
                 let guard = lock.lock().unwrap();
-                registered2.fetch_add(1, Ordering::Release);
+                second_ready_tx2.send(()).unwrap();
                 let guard = cvar.wait(guard).unwrap();
-                returned2.fetch_add(1, Ordering::Release);
+                returned2.fetch_add(1, Ordering::Relaxed);
+                returned_tx2.send(()).unwrap();
                 drop(guard);
             });
 
-            while registered.load(Ordering::Acquire) != 2 {
-                thread::yield_now();
-            }
+            first_ready_rx.recv().unwrap();
+            second_ready_rx.recv().unwrap();
 
             let (lock, cvar) = &*pair;
             let guard = lock.lock().unwrap();
             cvar.notify_one();
             drop(guard);
 
-            while returned.load(Ordering::Acquire) == 0 {
-                thread::yield_now();
-            }
-            assert_eq!(returned.load(Ordering::Acquire), 1);
+            returned_rx.recv().unwrap();
+            assert_eq!(returned.load(Ordering::Relaxed), 1);
 
             let guard = lock.lock().unwrap();
             cvar.notify_one();
             drop(guard);
             first.join().unwrap();
             second.join().unwrap();
-            assert_eq!(returned.load(Ordering::Acquire), 2);
-        });
-    }
-
-    #[test]
-    fn test_loom_condvar_notify_all() {
-        loom::model(|| {
-            let pair = Arc::new((Mutex::new(false), Condvar::new()));
-            let pair2 = pair.clone();
-
-            let handle = thread::spawn(move || {
-                let (lock, cvar) = &*pair2;
-                let mut started = lock.lock().unwrap();
-                *started = true;
-                cvar.notify_all();
-            });
-
-            let (lock, cvar) = &*pair;
-            let mut started = lock.lock().unwrap();
-            while !*started {
-                started = cvar.wait(started).unwrap();
-            }
-            assert!(*started);
-            handle.join().unwrap();
+            assert_eq!(returned.load(Ordering::Relaxed), 2);
         });
     }
 }

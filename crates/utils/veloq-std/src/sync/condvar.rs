@@ -1,9 +1,10 @@
 use core::{fmt, ptr::null_mut, sync::atomic::Ordering, time::Duration};
 
 use crate::{
+    cell::NativeUnsafeCell,
     sync::{
         LockResult,
-        atomic::{NativeAtomicPtr, NativeAtomicU32},
+        atomic::NativeAtomicU32,
         mutex::{NativeMutex, NativeMutexGuard},
         sys::native,
         unpoisoned_mutex::{NativeUnpoisonedMutex, NativeUnpoisonedMutexGuard},
@@ -12,17 +13,76 @@ use crate::{
 };
 
 #[cfg(feature = "loom")]
-use crate::sync::{
-    atomic::{LoomAtomicPtr, LoomAtomicU32},
-    mutex::{LoomMutex, LoomMutexGuard},
-    sys::loom::WaitChannel,
-    unpoisoned_mutex::{LoomUnpoisonedMutex, LoomUnpoisonedMutexGuard},
+use crate::{
+    cell::LoomUnsafeCell,
+    sync::{
+        atomic::LoomAtomicU32,
+        mutex::{LoomMutex, LoomMutexGuard},
+        sys::loom::{LoomQueueMutex, LoomQueueMutexGuard, WaiterChannel},
+        unpoisoned_mutex::{LoomUnpoisonedMutex, LoomUnpoisonedMutexGuard},
+    },
 };
 
 const WAITING: u32 = 0;
 const NOTIFYING: u32 = 1;
 const NOTIFIED: u32 = 2;
 const TIMED_OUT: u32 = 3;
+
+/// 队列锁保护的非原子指针。
+///
+/// 条件变量队列的头尾指针以及 waiter 的前后链接只在队列锁内访问，使用原子
+/// 指针会把已经由队列锁串行化的链表操作重复暴露给 Loom。这里保留显式的
+/// `UnsafeCell` 封装，并由队列锁保证访问安全。
+struct NativeQueuePtr<T> {
+    inner: NativeUnsafeCell<*mut T>,
+}
+
+impl<T> NativeQueuePtr<T> {
+    const fn new(value: *mut T) -> Self {
+        Self {
+            inner: NativeUnsafeCell::new(value),
+        }
+    }
+
+    fn load(&self, _order: Ordering) -> *mut T {
+        unsafe { self.inner.with(|value| *value) }
+    }
+
+    fn store(&self, value: *mut T, _order: Ordering) {
+        unsafe { self.inner.with_mut(|slot| *slot = value) };
+    }
+}
+
+unsafe impl<T> Send for NativeQueuePtr<T> {}
+unsafe impl<T> Sync for NativeQueuePtr<T> {}
+
+#[cfg(feature = "loom")]
+struct LoomQueuePtr<T> {
+    inner: LoomUnsafeCell<*mut T>,
+}
+
+#[cfg(feature = "loom")]
+impl<T> LoomQueuePtr<T> {
+    fn new(value: *mut T) -> Self {
+        Self {
+            inner: LoomUnsafeCell::new(value),
+        }
+    }
+
+    fn load(&self, _order: Ordering) -> *mut T {
+        unsafe { self.inner.with(|value| *value) }
+    }
+
+    fn store(&self, value: *mut T, _order: Ordering) {
+        unsafe { self.inner.with_mut(|slot| *slot = value) };
+    }
+}
+
+#[cfg(feature = "loom")]
+unsafe impl<T> Send for LoomQueuePtr<T> {}
+
+#[cfg(feature = "loom")]
+unsafe impl<T> Sync for LoomQueuePtr<T> {}
 
 /// 状态等待结果，用于表示等待是否超时。
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -46,7 +106,9 @@ macro_rules! impl_condvar {
         queue: $queue_name:ident,
         guard: $guard_name:ident,
         atomic_u32: $atomic_u32_ty:ident,
-        atomic_ptr: $atomic_ptr_ty:ident,
+        queue_ptr: $queue_ptr_ty:ident,
+        queue_mutex: $queue_mutex_ty:ident,
+        queue_guard: $queue_guard_ty:ident,
         unpoisoned_mutex: $unpoisoned_mutex_ty:ident,
         unpoisoned_guard: $unpoisoned_guard_ty:ident,
         mutex: $mutex_ty:ident,
@@ -59,8 +121,8 @@ macro_rules! impl_condvar {
     ) => {
         struct $waiter_name {
             state: $atomic_u32_ty,
-            prev: $atomic_ptr_ty<$waiter_name>,
-            next: $atomic_ptr_ty<$waiter_name>,
+            prev: $queue_ptr_ty<$waiter_name>,
+            next: $queue_ptr_ty<$waiter_name>,
             $($channel_field: $channel_ty,)?
         }
 
@@ -68,8 +130,8 @@ macro_rules! impl_condvar {
             fn new() -> Self {
                 Self {
                     state: <$atomic_u32_ty>::new(WAITING),
-                    prev: <$atomic_ptr_ty<$waiter_name>>::new(null_mut()),
-                    next: <$atomic_ptr_ty<$waiter_name>>::new(null_mut()),
+                    prev: <$queue_ptr_ty<$waiter_name>>::new(null_mut()),
+                    next: <$queue_ptr_ty<$waiter_name>>::new(null_mut()),
                     $($channel_field: $init_channel,)?
                 }
             }
@@ -163,13 +225,13 @@ macro_rules! impl_condvar {
         }
 
         struct $queue_name {
-            lock: $unpoisoned_mutex_ty<()>,
-            head: $atomic_ptr_ty<$waiter_name>,
-            tail: $atomic_ptr_ty<$waiter_name>,
+            lock: $queue_mutex_ty<()>,
+            head: $queue_ptr_ty<$waiter_name>,
+            tail: $queue_ptr_ty<$waiter_name>,
         }
 
         impl $queue_name {
-            impl_condvar!(@queue_new $is_const, $unpoisoned_mutex_ty, $atomic_ptr_ty, $waiter_name);
+            impl_condvar!(@queue_new $is_const, $queue_mutex_ty, $queue_ptr_ty, $waiter_name);
 
             fn lock(&self) -> $guard_name<'_> {
                 $guard_name {
@@ -181,7 +243,7 @@ macro_rules! impl_condvar {
 
         struct $guard_name<'a> {
             queue: &'a $queue_name,
-            _lock: $unpoisoned_guard_ty<'a, ()>,
+            _lock: $queue_guard_ty<'a, ()>,
         }
 
         impl $guard_name<'_> {
@@ -562,7 +624,9 @@ impl_condvar!(
     queue: NativeWaitQueue,
     guard: NativeWaitQueueGuard,
     atomic_u32: NativeAtomicU32,
-    atomic_ptr: NativeAtomicPtr,
+    queue_ptr: NativeQueuePtr,
+    queue_mutex: NativeUnpoisonedMutex,
+    queue_guard: NativeUnpoisonedMutexGuard,
     unpoisoned_mutex: NativeUnpoisonedMutex,
     unpoisoned_guard: NativeUnpoisonedMutexGuard,
     mutex: NativeMutex,
@@ -587,12 +651,14 @@ impl_condvar!(
     queue: LoomWaitQueue,
     guard: LoomWaitQueueGuard,
     atomic_u32: LoomAtomicU32,
-    atomic_ptr: LoomAtomicPtr,
+    queue_ptr: LoomQueuePtr,
+    queue_mutex: LoomQueueMutex,
+    queue_guard: LoomQueueMutexGuard,
     unpoisoned_mutex: LoomUnpoisonedMutex,
     unpoisoned_guard: LoomUnpoisonedMutexGuard,
     mutex: LoomMutex,
     mutex_guard: LoomMutexGuard,
-    waiter_channel: channel: WaitChannel, init_channel: WaitChannel::new(),
+    waiter_channel: channel: WaiterChannel, init_channel: WaiterChannel::new(),
     wait_once: |s, expected| s.channel.wait(&s.state, expected),
     wait_timeout_sub: |s, remaining| !s.channel.wait_timeout(&s.state, WAITING, remaining),
     finish_notify: |s| {

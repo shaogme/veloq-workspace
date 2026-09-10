@@ -3,6 +3,7 @@ use crate::{
     time::Duration,
 };
 
+/// 用于模拟共享原始锁的多等待者通道。
 pub struct WaitChannel {
     mutex: loom::sync::Mutex<()>,
     cvar: loom::sync::Condvar,
@@ -41,14 +42,6 @@ impl WaitChannel {
         self.cvar.notify_one();
     }
 
-    /// 在节点通道锁内发布最终通知，避免状态检查和通道唤醒之间出现窗口。
-    pub fn finish_notify(&self, address: &LoomAtomicU32, notified: u32) -> u32 {
-        let _g = self.mutex.lock().unwrap();
-        let previous = address.swap(notified, Ordering::AcqRel);
-        self.cvar.notify_one();
-        previous
-    }
-
     /// 广播唤醒所有挂起的等待者。
     pub fn wake_all(&self) {
         let _g = self.mutex.lock().unwrap();
@@ -59,6 +52,68 @@ impl WaitChannel {
 impl Default for WaitChannel {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// 用于模拟单个条件变量 waiter 的一次性通知通道。
+///
+/// 每个条件变量 waiter 都独占一个通道，因此不需要再用一把 Loom 锁保护
+/// 条件变量；`Notify` 自身会保留尚未消费的通知，从而关闭检查状态与进入等待
+/// 之间的通知窗口。
+pub struct WaiterChannel {
+    notify: loom::sync::Notify,
+}
+
+impl WaiterChannel {
+    pub fn new() -> Self {
+        Self {
+            notify: loom::sync::Notify::new(),
+        }
+    }
+
+    pub fn wait(&self, address: &LoomAtomicU32, expected: u32) {
+        if address.load(Ordering::Acquire) == expected {
+            self.notify.wait();
+        }
+    }
+
+    pub fn wait_timeout(&self, address: &LoomAtomicU32, expected: u32, _dur: Duration) -> bool {
+        self.wait(address, expected);
+        true
+    }
+
+    pub fn finish_notify(&self, address: &LoomAtomicU32, notified: u32) -> u32 {
+        let previous = address.swap(notified, Ordering::AcqRel);
+        self.notify.notify();
+        previous
+    }
+}
+
+impl Default for WaiterChannel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 条件变量内部队列使用的单层 Loom 互斥锁。
+///
+/// 条件变量的公共互斥锁和 `LoomRawMutex` 仍然使用项目自己的实现；队列锁只是
+/// 内部串行化链表访问，不应在条件变量模型中再次展开原始锁的等待后端。
+pub struct LoomQueueMutex<T>(loom::sync::Mutex<T>);
+
+pub struct LoomQueueMutexGuard<'a, T> {
+    _inner: loom::sync::MutexGuard<'a, T>,
+}
+
+impl<T> LoomQueueMutex<T> {
+    pub fn new(value: T) -> Self {
+        Self(loom::sync::Mutex::new(value))
+    }
+
+    pub fn lock(&self) -> LoomQueueMutexGuard<'_, T> {
+        LoomQueueMutexGuard {
+            _inner: self.0.lock().unwrap(),
+        }
     }
 }
 
