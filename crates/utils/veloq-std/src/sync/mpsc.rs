@@ -1,28 +1,17 @@
-//! Multi-producer, single-consumer FIFO queue communication channel.
+//! Multi-producer, single-consumer FIFO queue communication channels.
 
 use core::{cell::Cell, marker::PhantomData};
 
-use crate::{
-    error::Error,
-    fmt,
-    sync::{
-        Arc, UnpoisonedMutex, UnpoisonedRwLock,
-        atomic::{AtomicUsize, Ordering},
-    },
-    thread::{Thread, current, park, park_timeout},
-    time::{Duration, Instant},
-};
+use crate::{error::Error, fmt, sync::Arc, time::Duration};
 
+mod bounded;
 mod queue;
-use queue::SegQueue;
+mod unbounded;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Lifecycle {
-    Open,
-    Closed,
-}
+pub use bounded::SyncSender;
+pub use unbounded::Sender;
 
-/// An error returned from the [`Sender::send`] function.
+/// An error returned from [`Sender::send`] or [`SyncSender::send`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SendError<T>(pub T);
 
@@ -34,7 +23,27 @@ impl<T> fmt::Display for SendError<T> {
 
 impl<T: fmt::Debug> Error for SendError<T> {}
 
-/// An error returned from the [`Receiver::recv`] function.
+/// An error returned from [`SyncSender::try_send`].
+#[derive(PartialEq, Eq, Debug)]
+pub enum TrySendError<T> {
+    /// The channel is currently full, and the value was not sent.
+    Full(T),
+    /// All receivers have been disconnected, and the value was not sent.
+    Disconnected(T),
+}
+
+impl<T> fmt::Display for TrySendError<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TrySendError::Full(_) => write!(f, "sending on a full channel"),
+            TrySendError::Disconnected(_) => write!(f, "sending on a closed channel"),
+        }
+    }
+}
+
+impl<T: fmt::Debug> Error for TrySendError<T> {}
+
+/// An error returned from [`Receiver::recv`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RecvError;
 
@@ -46,7 +55,7 @@ impl fmt::Display for RecvError {
 
 impl Error for RecvError {}
 
-/// An error returned from the [`Receiver::try_recv`] function.
+/// An error returned from [`Receiver::try_recv`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TryRecvError {
     /// The channel is currently empty, but the sender(s) are still active.
@@ -66,7 +75,7 @@ impl fmt::Display for TryRecvError {
 
 impl Error for TryRecvError {}
 
-/// An error returned from the [`Receiver::recv_timeout`] function.
+/// An error returned from [`Receiver::recv_timeout`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RecvTimeoutError {
     /// The timeout elapsed before a message was received.
@@ -86,84 +95,22 @@ impl fmt::Display for RecvTimeoutError {
 
 impl Error for RecvTimeoutError {}
 
-struct Shared<T> {
-    queue: SegQueue<T>,
-    senders: AtomicUsize,
-    lifecycle: UnpoisonedRwLock<Lifecycle>,
-    blocked_thread: UnpoisonedMutex<Option<Thread>>,
-}
-
-/// The sending-half of a channel.
-pub struct Sender<T> {
-    inner: Arc<Shared<T>>,
-}
-
-impl<T> Clone for Sender<T> {
-    fn clone(&self) -> Self {
-        self.inner.senders.fetch_add(1, Ordering::Relaxed);
-        Self {
-            inner: self.inner.clone(),
-        }
-    }
-}
-
-impl<T> Drop for Sender<T> {
-    fn drop(&mut self) {
-        if self.inner.senders.fetch_sub(1, Ordering::Release) == 1 {
-            // Wake up receiver so it can notice that all senders have disconnected.
-            let thread = self.inner.blocked_thread.lock().take();
-            if let Some(thread) = thread {
-                thread.unpark();
-            }
-        }
-    }
-}
-
-impl<T> fmt::Debug for Sender<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Sender").finish_non_exhaustive()
-    }
-}
-
-impl<T> Sender<T> {
-    /// Sends a value on this channel.
-    pub fn send(&self, t: T) -> Result<(), SendError<T>> {
-        {
-            let lifecycle = self.inner.lifecycle.read();
-            if *lifecycle == Lifecycle::Closed {
-                return Err(SendError(t));
-            }
-            self.inner.queue.push(t);
-        }
-
-        let thread = self.inner.blocked_thread.lock().take();
-        if let Some(thread) = thread {
-            thread.unpark();
-        }
-        Ok(())
-    }
+enum ReceiverInner<T> {
+    Unbounded(Arc<unbounded::Shared<T>>),
+    Bounded(Arc<bounded::Shared<T>>),
 }
 
 /// The receiving-half of a channel.
 pub struct Receiver<T> {
-    inner: Arc<Shared<T>>,
+    inner: ReceiverInner<T>,
     _not_sync: PhantomData<Cell<()>>,
 }
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        {
-            let mut lifecycle = self.inner.lifecycle.write();
-            *lifecycle = Lifecycle::Closed;
-        }
-
-        let thread = self.inner.blocked_thread.lock().take();
-        while let Some(message) = self.inner.queue.pop() {
-            drop(message);
-        }
-
-        if let Some(thread) = thread {
-            thread.unpark();
+        match &self.inner {
+            ReceiverInner::Unbounded(inner) => inner.close(),
+            ReceiverInner::Bounded(inner) => inner.close(),
         }
     }
 }
@@ -177,102 +124,25 @@ impl<T> fmt::Debug for Receiver<T> {
 impl<T> Receiver<T> {
     /// Attempts to receive a value from the channel without blocking.
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        if let Some(val) = self.inner.queue.pop() {
-            Ok(val)
-        } else if self.inner.senders.load(Ordering::Acquire) == 0 {
-            if let Some(val) = self.inner.queue.pop() {
-                Ok(val)
-            } else {
-                Err(TryRecvError::Disconnected)
-            }
-        } else {
-            Err(TryRecvError::Empty)
+        match &self.inner {
+            ReceiverInner::Unbounded(inner) => inner.try_recv(),
+            ReceiverInner::Bounded(inner) => inner.try_recv(),
         }
     }
 
     /// Attempts to receive a value from the channel, blocking the current thread until one is available.
     pub fn recv(&self) -> Result<T, RecvError> {
-        loop {
-            if let Some(val) = self.inner.queue.pop() {
-                return Ok(val);
-            }
-            if self.inner.senders.load(Ordering::Acquire) == 0 {
-                if let Some(val) = self.inner.queue.pop() {
-                    return Ok(val);
-                }
-                return Err(RecvError);
-            }
-
-            {
-                let mut blocked = self.inner.blocked_thread.lock();
-                *blocked = Some(current());
-            }
-
-            if !self.inner.queue.is_empty() {
-                let mut blocked = self.inner.blocked_thread.lock();
-                *blocked = None;
-                continue;
-            }
-
-            if self.inner.senders.load(Ordering::Acquire) == 0 {
-                let mut blocked = self.inner.blocked_thread.lock();
-                *blocked = None;
-                if let Some(val) = self.inner.queue.pop() {
-                    return Ok(val);
-                }
-                return Err(RecvError);
-            }
-
-            park();
-
-            let mut blocked = self.inner.blocked_thread.lock();
-            *blocked = None;
+        match &self.inner {
+            ReceiverInner::Unbounded(inner) => inner.recv(),
+            ReceiverInner::Bounded(inner) => inner.recv(),
         }
     }
 
     /// Attempts to receive a value from the channel, blocking the current thread until one is available or a timeout occurs.
     pub fn recv_timeout(&self, timeout: Duration) -> Result<T, RecvTimeoutError> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(val) = self.inner.queue.pop() {
-                return Ok(val);
-            }
-            if self.inner.senders.load(Ordering::Acquire) == 0 {
-                if let Some(val) = self.inner.queue.pop() {
-                    return Ok(val);
-                }
-                return Err(RecvTimeoutError::Disconnected);
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(RecvTimeoutError::Timeout);
-            }
-            let remaining = deadline - now;
-
-            {
-                let mut blocked = self.inner.blocked_thread.lock();
-                *blocked = Some(current());
-            }
-
-            if !self.inner.queue.is_empty() {
-                let mut blocked = self.inner.blocked_thread.lock();
-                *blocked = None;
-                continue;
-            }
-
-            if self.inner.senders.load(Ordering::Acquire) == 0 {
-                let mut blocked = self.inner.blocked_thread.lock();
-                *blocked = None;
-                if let Some(val) = self.inner.queue.pop() {
-                    return Ok(val);
-                }
-                return Err(RecvTimeoutError::Disconnected);
-            }
-
-            park_timeout(remaining);
-
-            let mut blocked = self.inner.blocked_thread.lock();
-            *blocked = None;
+        match &self.inner {
+            ReceiverInner::Unbounded(inner) => inner.recv_timeout(timeout),
+            ReceiverInner::Bounded(inner) => inner.recv_timeout(timeout),
         }
     }
 
@@ -344,21 +214,35 @@ impl<T> IntoIterator for Receiver<T> {
     }
 }
 
-/// Creates a new asynchronous channel, returning the sender/receiver halves.
+/// Creates a new unbounded channel, returning the sender/receiver halves.
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
-    let shared = Arc::new(Shared {
-        queue: SegQueue::new(),
-        senders: AtomicUsize::new(1),
-        lifecycle: UnpoisonedRwLock::new(Lifecycle::Open),
-        blocked_thread: UnpoisonedMutex::new(None),
-    });
+    let shared = unbounded::Shared::new();
 
     (
         Sender {
             inner: shared.clone(),
         },
         Receiver {
-            inner: shared,
+            inner: ReceiverInner::Unbounded(shared),
+            _not_sync: PhantomData,
+        },
+    )
+}
+
+/// Creates a new synchronous, bounded channel.
+///
+/// A `bound` greater than zero limits the number of values waiting in the
+/// channel. A zero bound creates a rendezvous channel where each send waits
+/// for a receiver to accept the value.
+pub fn sync_channel<T>(bound: usize) -> (SyncSender<T>, Receiver<T>) {
+    let shared = bounded::Shared::new(bound);
+
+    (
+        SyncSender {
+            inner: shared.clone(),
+        },
+        Receiver {
+            inner: ReceiverInner::Bounded(shared),
             _not_sync: PhantomData,
         },
     )
