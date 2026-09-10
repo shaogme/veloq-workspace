@@ -1,13 +1,13 @@
 #![cfg(not(feature = "loom"))]
 
 use veloq_std::{
-    sync::atomic::{CoreAtomicBool, Ordering},
+    sync::atomic::{NativeAtomicBool, Ordering},
     thread::spawn,
 };
 
 #[test]
 fn test_spawn_and_join() {
-    static CALLED: CoreAtomicBool = CoreAtomicBool::new(false);
+    static CALLED: NativeAtomicBool = NativeAtomicBool::new(false);
 
     let thread = spawn(|| {
         CALLED.store(true, Ordering::SeqCst);

@@ -7,7 +7,10 @@ use crate::{
     marker::PhantomData,
     panic::catch_unwind_safe,
     string::String,
-    sync::{Arc, atomic::Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
     thread::{
         AbortedError, Thread, ThreadErrorKind, ThreadId,
         traits::{RawJoinHandleTrait, RawThreadErrorTrait, SystermImpl},
@@ -147,7 +150,7 @@ impl SystermImpl for Systerm {
 
         let state = Arc::new(ThreadSharedState {
             closure: UnsafeCell::new(Some(Box::new(f) as BoxF<'a, T>)),
-            status: loom::sync::atomic::AtomicU8::new(super::STATE_INCOMPLETE),
+            status: AtomicU8::new(super::STATE_INCOMPLETE),
             result: SafeUnsafeCell::new(None),
             #[cfg(feature = "std")]
             panic_payload: SafeUnsafeCell::new(None),
@@ -176,7 +179,7 @@ impl SystermImpl for Systerm {
                 let _ = super::CURRENT_THREAD.set_owned(self.thread.clone());
                 let _ = &self.name;
                 super::CURRENT_THREAD_STATUS.with_or_default(|cell| {
-                    cell.set(Some(&self.status as *const loom::sync::atomic::AtomicU8));
+                    cell.set(Some(&self.status as *const AtomicU8));
                 });
 
                 struct ThreadStatusGuard;

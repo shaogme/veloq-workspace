@@ -3,7 +3,7 @@ mod normal_tests {
     use veloq_std::{
         sync::{
             OnceLock,
-            atomic::{CoreAtomicU32, Ordering},
+            atomic::{NativeAtomicU32, Ordering},
         },
         thread,
         time::Duration,
@@ -153,7 +153,7 @@ mod normal_tests {
 
     #[test]
     fn test_once_lock_drop() {
-        static DROP_COUNTER: CoreAtomicU32 = CoreAtomicU32::new(0);
+        static DROP_COUNTER: NativeAtomicU32 = NativeAtomicU32::new(0);
         struct Detector;
         impl Drop for Detector {
             fn drop(&mut self) {

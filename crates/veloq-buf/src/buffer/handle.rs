@@ -6,7 +6,7 @@ use veloq_std::{
     ops::Range,
     ptr::NonNull,
     slice::{from_raw_parts, from_raw_parts_mut},
-    sync::atomic::{CoreAtomicU64, Ordering},
+    sync::atomic::{NativeAtomicU64, Ordering},
 };
 
 use bilge::prelude::*;
@@ -281,7 +281,7 @@ impl FixedBuf {
 
         let ptr = unsafe { NonNull::new_unchecked(base_ptr.add(4096)) };
 
-        static HEAP_BUF_COOKIE_GEN: CoreAtomicU64 = CoreAtomicU64::new(1);
+        static HEAP_BUF_COOKIE_GEN: NativeAtomicU64 = NativeAtomicU64::new(1);
         let cookie = HEAP_BUF_COOKIE_GEN.fetch_add(1, Ordering::Relaxed) & 0x00FFFFFFFFFFFFFF;
 
         Ok(unsafe {

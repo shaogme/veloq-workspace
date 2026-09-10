@@ -1,13 +1,11 @@
 use crate::{
-    sync::atomic::Ordering,
+    sync::atomic::{NativeAtomicU64, Ordering},
     time::{Duration, sys::Systerm},
 };
 
-use crate::sync::atomic::CoreAtomicU64;
-
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 
-static FREQUENCY: CoreAtomicU64 = CoreAtomicU64::new(0);
+static FREQUENCY: NativeAtomicU64 = NativeAtomicU64::new(0);
 
 fn get_frequency() -> u64 {
     let cached = FREQUENCY.load(Ordering::Relaxed);
