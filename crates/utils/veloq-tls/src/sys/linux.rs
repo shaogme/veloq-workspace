@@ -54,6 +54,16 @@ pub(crate) struct AtomicKey<T>(AtomicU32, core::marker::PhantomData<fn() -> T>);
 unsafe impl<T> Send for AtomicKey<T> {}
 unsafe impl<T> Sync for AtomicKey<T> {}
 
+#[cfg(target_os = "android")]
+fn key_to_raw(key: pthread_key_t) -> Option<u32> {
+    u32::try_from(key).ok()
+}
+
+#[cfg(not(target_os = "android"))]
+fn key_to_raw(key: pthread_key_t) -> Option<u32> {
+    Some(key as _)
+}
+
 impl<T> AtomicKey<T> {
     pub const fn new() -> Self {
         Self(AtomicU32::new(0), core::marker::PhantomData)
@@ -63,7 +73,7 @@ impl<T> AtomicKey<T> {
     pub fn get(&self) -> Result<Key, TlsErrorKind> {
         let mut val = self.0.load(Ordering::Acquire);
         if val > 1 {
-            return Ok(Key(val - 2));
+            return Ok(Key((val - 2) as _));
         }
 
         loop {
@@ -74,7 +84,14 @@ impl<T> AtomicKey<T> {
                 {
                     Ok(_) => match Key::alloc::<T>() {
                         Ok(k) => {
-                            let stored = k.0 + 2;
+                            let Some(stored) = key_to_raw(k.0).and_then(|key| key.checked_add(2))
+                            else {
+                                unsafe {
+                                    pthread_key_delete(k.0);
+                                }
+                                self.0.store(0, Ordering::Release);
+                                return Err(TlsErrorKind::AllocationFailed);
+                            };
                             self.0.store(stored, Ordering::Release);
                             return Ok(k);
                         }
@@ -88,7 +105,7 @@ impl<T> AtomicKey<T> {
                     }
                 }
             } else if val > 1 {
-                return Ok(Key(val - 2));
+                return Ok(Key((val - 2) as _));
             } else {
                 spin_loop();
                 val = self.0.load(Ordering::Acquire);
@@ -99,7 +116,11 @@ impl<T> AtomicKey<T> {
     #[inline]
     pub fn take(&mut self) -> Option<Key> {
         let val = *self.0.get_mut();
-        if val > 1 { Some(Key(val - 2)) } else { None }
+        if val > 1 {
+            Some(Key((val - 2) as _))
+        } else {
+            None
+        }
     }
 }
 

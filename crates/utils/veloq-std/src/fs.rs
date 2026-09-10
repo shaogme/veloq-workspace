@@ -673,7 +673,7 @@ impl UnixMetadataExt for Metadata {
 
     #[inline]
     fn ino(&self) -> u64 {
-        self.0.stat.st_ino
+        self.0.stat.st_ino as _
     }
 
     #[inline]
@@ -683,7 +683,7 @@ impl UnixMetadataExt for Metadata {
 
     #[inline]
     fn nlink(&self) -> u64 {
-        self.0.stat.st_nlink
+        self.0.stat.st_nlink as _
     }
 
     #[inline]
@@ -708,32 +708,32 @@ impl UnixMetadataExt for Metadata {
 
     #[inline]
     fn atime(&self) -> i64 {
-        self.0.stat.st_atime
+        self.0.stat.st_atime as _
     }
 
     #[inline]
     fn atime_nsec(&self) -> i64 {
-        self.0.stat.st_atime_nsec
+        self.0.stat.st_atime_nsec as _
     }
 
     #[inline]
     fn mtime(&self) -> i64 {
-        self.0.stat.st_mtime
+        self.0.stat.st_mtime as _
     }
 
     #[inline]
     fn mtime_nsec(&self) -> i64 {
-        self.0.stat.st_mtime_nsec
+        self.0.stat.st_mtime_nsec as _
     }
 
     #[inline]
     fn ctime(&self) -> i64 {
-        self.0.stat.st_ctime
+        self.0.stat.st_ctime as _
     }
 
     #[inline]
     fn ctime_nsec(&self) -> i64 {
-        self.0.stat.st_ctime_nsec
+        self.0.stat.st_ctime_nsec as _
     }
 
     #[inline]

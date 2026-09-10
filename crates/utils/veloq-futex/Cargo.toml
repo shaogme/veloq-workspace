@@ -1,0 +1,19 @@
+[package]
+name = "veloq-futex"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Portable Linux futex ABI backend."
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true

@@ -32,6 +32,7 @@ loom = ["std", "dep:loom", "veloq-tls/loom"]
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc.workspace = true
+veloq-futex.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { workspace = true, features = [

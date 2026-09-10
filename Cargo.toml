@@ -18,6 +18,7 @@ members = [
     "crates/utils/veloq-tls",
     "crates/utils/veloq-storage",
     "crates/utils/veloq-hash",
+    "crates/utils/veloq-futex",
     "crates/utils/veloq-std",
     "crates/test-utils/xtest-runner"
 ]
@@ -38,6 +39,7 @@ default-members = [
     "crates/utils/veloq-tls",
     "crates/utils/veloq-storage",
     "crates/utils/veloq-hash",
+    "crates/utils/veloq-futex",
     "crates/utils/veloq-std",
     "crates/test-utils/xtest-runner"
 ]
@@ -77,6 +79,7 @@ veloq-pod = { path = "crates/utils/veloq-pod", version = "0.1.0" }
 veloq-tls = { path = "crates/utils/veloq-tls", version = "0.1.0" }
 veloq-storage = { path = "crates/utils/veloq-storage", version = "0.1.0" }
 veloq-hash = { path = "crates/utils/veloq-hash", version = "0.1.0" }
+veloq-futex = { path = "crates/utils/veloq-futex", version = "0.1.0" }
 veloq-std = { path = "crates/utils/veloq-std", version = "0.1.0" }
 
 # External Crates

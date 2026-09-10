@@ -1,5 +1,5 @@
 use super::header::GenericTaskHeader;
-use crate::runtime::primitives::{EventCount, Unparker};
+use crate::runtime::primitives::{EventCount, Unparker, sys};
 use crossbeam_queue::SegQueue;
 use std::{
     hint::spin_loop,
@@ -197,7 +197,8 @@ impl<S: Storage> TaskWakeToken<S> {
                 yield_now();
                 spin_count += 1;
             } else {
-                unsafe { crate::runtime::primitives::sys::wait(&self.state, curr) };
+                unsafe { sys::wait(&self.state, curr) }
+                    .unwrap_or_else(|error| panic!("runtime futex wait failed: {error:?}"));
                 spin_count = 0;
             }
         }
@@ -296,7 +297,8 @@ impl<S: Storage> Drop for TaskWakeGuard<'_, S> {
             .state
             .fetch_sub(WAKE_TOKEN_ACTIVE_UNIT, Ordering::AcqRel);
         if prev == WAKE_TOKEN_ACTIVE_UNIT {
-            unsafe { crate::runtime::primitives::sys::wake_all(&self.token.state) };
+            unsafe { sys::wake_all(&self.token.state) }
+                .unwrap_or_else(|error| panic!("runtime futex wake_all failed: {error:?}"));
         }
     }
 }

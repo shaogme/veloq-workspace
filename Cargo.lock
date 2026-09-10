@@ -1487,6 +1487,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "veloq-futex"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "veloq-hash"
 version = "0.1.0"
 dependencies = [
@@ -1524,10 +1531,10 @@ dependencies = [
  "crossbeam-deque",
  "crossbeam-queue",
  "diagweave",
- "libc",
  "loom",
  "numaperf-topo",
  "trybuild",
+ "veloq-futex",
  "veloq-intrusive-linklist",
  "veloq-std",
  "veloq-storage",
@@ -1546,6 +1553,7 @@ dependencies = [
  "lock_api",
  "loom",
  "trybuild",
+ "veloq-futex",
  "veloq-hash",
  "veloq-tls",
  "windows-sys",

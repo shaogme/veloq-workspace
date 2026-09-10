@@ -14,8 +14,17 @@ use std::{
 pub(crate) mod sys {
     use std::{sync::atomic::AtomicU32, time::Duration};
 
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    use veloq_futex::{FutexError, WaitOutcome, wait as futex_wait, wake as futex_wake};
+
+    #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
     use std::thread;
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub type WaitError = FutexError;
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub type WaitError = std::convert::Infallible;
 
     #[cfg(windows)]
     mod win {
@@ -34,7 +43,7 @@ pub(crate) mod sys {
     }
 
     #[cfg(windows)]
-    pub unsafe fn wait(addr: &AtomicU32, expected: u32) {
+    pub unsafe fn wait(addr: &AtomicU32, expected: u32) -> Result<(), WaitError> {
         let expected_val = expected;
         unsafe {
             win::WaitOnAddress(
@@ -44,10 +53,15 @@ pub(crate) mod sys {
                 0xFFFFFFFF, // INFINITE
             );
         }
+        Ok(())
     }
 
     #[cfg(windows)]
-    pub unsafe fn wait_timeout(addr: &AtomicU32, expected: u32, timeout: Duration) -> bool {
+    pub unsafe fn wait_timeout(
+        addr: &AtomicU32,
+        expected: u32,
+        timeout: Duration,
+    ) -> Result<(), WaitError> {
         let expected_val = expected;
         let millis = if timeout.is_zero() {
             0
@@ -65,73 +79,67 @@ pub(crate) mod sys {
                 &expected_val as *const _ as *const _,
                 4,
                 millis,
-            ) != 0
+            );
         }
+        Ok(())
     }
 
     #[cfg(windows)]
-    pub unsafe fn wake_all(addr: &AtomicU32) {
+    pub unsafe fn wake_all(addr: &AtomicU32) -> Result<(), WaitError> {
         unsafe {
             win::WakeByAddressAll(addr as *const _ as *const _);
         }
+        Ok(())
     }
 
-    #[cfg(target_os = "linux")]
-    pub unsafe fn wait(addr: &AtomicU32, expected: u32) {
-        use std::ptr::null;
-        unsafe {
-            libc::syscall(
-                libc::SYS_futex,
-                addr as *const _ as *mut i32,
-                libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
-                expected as i32,
-                null::<libc::timespec>(),
-            );
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub unsafe fn wait(addr: &AtomicU32, expected: u32) -> Result<(), WaitError> {
+        match unsafe { futex_wait(addr as *const AtomicU32 as *const u32, expected, None) }? {
+            WaitOutcome::Woken | WaitOutcome::TimedOut => Ok(()),
         }
     }
 
-    #[cfg(target_os = "linux")]
-    pub unsafe fn wait_timeout(addr: &AtomicU32, expected: u32, timeout: Duration) -> bool {
-        let ts = libc::timespec {
-            tv_sec: timeout.as_secs() as libc::time_t,
-            tv_nsec: timeout.subsec_nanos() as libc::c_long,
-        };
-        let ret = unsafe {
-            libc::syscall(
-                libc::SYS_futex,
-                addr as *const _ as *mut i32,
-                libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
-                expected as i32,
-                &ts as *const libc::timespec,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub unsafe fn wait_timeout(
+        addr: &AtomicU32,
+        expected: u32,
+        timeout: Duration,
+    ) -> Result<(), WaitError> {
+        unsafe {
+            futex_wait(
+                addr as *const AtomicU32 as *const u32,
+                expected,
+                Some(timeout),
             )
-        };
-        ret == 0
-    }
-
-    #[cfg(target_os = "linux")]
-    pub unsafe fn wake_all(addr: &AtomicU32) {
-        unsafe {
-            libc::syscall(
-                libc::SYS_futex,
-                addr as *const _ as *mut i32,
-                libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
-                i32::MAX,
-            );
         }
+        .map(|_| ())
     }
 
-    #[cfg(not(any(windows, target_os = "linux")))]
-    pub unsafe fn wait(_addr: &AtomicU32, _expected: u32) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub unsafe fn wake_all(addr: &AtomicU32) -> Result<(), WaitError> {
+        unsafe { futex_wake(addr as *const AtomicU32 as *const u32, i32::MAX as u32) }.map(|_| ())
+    }
+
+    #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
+    pub unsafe fn wait(_addr: &AtomicU32, _expected: u32) -> Result<(), WaitError> {
         thread::yield_now();
-    }
-    #[cfg(not(any(windows, target_os = "linux")))]
-    pub unsafe fn wait_timeout(_addr: &AtomicU32, _expected: u32, timeout: Duration) -> bool {
-        thread::sleep(timeout);
-        false
+        Ok(())
     }
 
-    #[cfg(not(any(windows, target_os = "linux")))]
-    pub unsafe fn wake_all(_addr: &AtomicU32) {}
+    #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
+    pub unsafe fn wait_timeout(
+        _addr: &AtomicU32,
+        _expected: u32,
+        timeout: Duration,
+    ) -> Result<(), WaitError> {
+        thread::sleep(timeout);
+        Ok(())
+    }
+
+    #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
+    pub unsafe fn wake_all(_addr: &AtomicU32) -> Result<(), WaitError> {
+        Ok(())
+    }
 }
 
 // --- 事件通知机制 ---
@@ -159,7 +167,8 @@ impl Signal {
 
     pub fn notify(&self) {
         if self.state.swap(1, Ordering::AcqRel) == 0 {
-            unsafe { sys::wake_all(&self.state) };
+            unsafe { sys::wake_all(&self.state) }
+                .unwrap_or_else(|error| panic!("runtime futex wake_all failed: {error:?}"));
         }
     }
 
@@ -174,7 +183,8 @@ impl Signal {
                 return;
             }
             // Slow-path: block until notified
-            unsafe { sys::wait(&self.state, 0) };
+            unsafe { sys::wait(&self.state, 0) }
+                .unwrap_or_else(|error| panic!("runtime futex wait failed: {error:?}"));
         }
     }
 
@@ -187,7 +197,8 @@ impl Signal {
             return true;
         }
 
-        unsafe { sys::wait_timeout(&self.state, 0, duration) };
+        unsafe { sys::wait_timeout(&self.state, 0, duration) }
+            .unwrap_or_else(|error| panic!("runtime futex timed wait failed: {error:?}"));
 
         self.state
             .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)

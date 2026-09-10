@@ -1,10 +1,10 @@
 use crate::time::{Duration, sys::Systerm};
 
-use libc::{CLOCK_MONOTONIC, c_long, clock_gettime, time_t, timespec};
+use libc::{CLOCK_MONOTONIC, c_long, clock_gettime, timespec};
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Timespec {
-    pub tv_sec: time_t,
+    pub tv_sec: i64,
     pub tv_nsec: c_long,
 }
 
@@ -22,7 +22,7 @@ impl Systerm for SystermImpl {
             clock_gettime(CLOCK_MONOTONIC, &mut ts);
         }
         Timespec {
-            tv_sec: ts.tv_sec,
+            tv_sec: ts.tv_sec as _,
             tv_nsec: ts.tv_nsec,
         }
     }
@@ -41,7 +41,7 @@ impl Systerm for SystermImpl {
     }
 
     fn checked_add(instant: Self::RawInstant, duration: Duration) -> Option<Self::RawInstant> {
-        let secs_to_add: time_t = duration.as_secs().try_into().ok()?;
+        let secs_to_add: i64 = duration.as_secs().try_into().ok()?;
         let secs = instant.tv_sec.checked_add(secs_to_add)?;
         let nsecs = instant
             .tv_nsec
@@ -60,7 +60,7 @@ impl Systerm for SystermImpl {
     }
 
     fn checked_sub(instant: Self::RawInstant, duration: Duration) -> Option<Self::RawInstant> {
-        let secs_to_sub: time_t = duration.as_secs().try_into().ok()?;
+        let secs_to_sub: i64 = duration.as_secs().try_into().ok()?;
         let secs = instant.tv_sec.checked_sub(secs_to_sub)?;
         let nsecs = instant
             .tv_nsec

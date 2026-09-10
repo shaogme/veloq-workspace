@@ -1,13 +1,15 @@
-use crate::{
-    ffi::c_void,
-    ptr::{null, null_mut},
-    sync::atomic::AtomicU32,
-    time::Duration,
-};
-use libc::{FUTEX_PRIVATE_FLAG, FUTEX_WAIT, FUTEX_WAKE, SYS_futex, syscall, timespec};
+use crate::{sync::atomic::AtomicU32, time::Duration};
+use veloq_futex::{FutexError, WaitOutcome, wait, wake};
+
+fn fail(operation: &str, error: FutexError) -> ! {
+    panic!("veloq-std {operation} failed: {error}");
+}
 
 pub fn wait_on_address(address: &AtomicU32, expected: u32) {
-    wait_on_address_timeout(address, expected, None);
+    let result = unsafe { wait(address as *const AtomicU32 as *const u32, expected, None) };
+    if let Err(error) = result {
+        fail("futex wait", error);
+    }
 }
 
 pub fn wait_on_address_timeout(
@@ -15,51 +17,24 @@ pub fn wait_on_address_timeout(
     expected: u32,
     timeout: Option<Duration>,
 ) -> bool {
-    let timespec_timeout = timeout.map(|dur| timespec {
-        tv_sec: dur.as_secs() as _,
-        tv_nsec: dur.subsec_nanos() as _,
-    });
-    let timeout_ptr = match timespec_timeout {
-        Some(ref ts) => ts as *const timespec,
-        None => null(),
-    };
-    unsafe {
-        let res = syscall(
-            SYS_futex,
-            address as *const AtomicU32 as *const c_void as *mut c_void,
-            FUTEX_WAIT | FUTEX_PRIVATE_FLAG,
-            expected as i32,
-            timeout_ptr,
-            null_mut::<c_void>(),
-            0,
-        );
-        if res < 0 {
-            let err = *libc::__errno_location();
-            err == libc::ETIMEDOUT
-        } else {
-            false
-        }
+    let result = unsafe { wait(address as *const AtomicU32 as *const u32, expected, timeout) };
+    match result {
+        Ok(WaitOutcome::Woken) => false,
+        Ok(WaitOutcome::TimedOut) => true,
+        Err(error) => fail("futex wait with timeout", error),
     }
 }
 
 pub fn wake_by_address(address: &AtomicU32) {
-    unsafe {
-        let _ = syscall(
-            SYS_futex,
-            address as *const AtomicU32 as *const c_void as *mut c_void,
-            FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
-            1,
-        );
+    let result = unsafe { wake(address as *const AtomicU32 as *const u32, 1) };
+    if let Err(error) = result {
+        fail("futex wake_one", error);
     }
 }
 
 pub fn wake_all_by_address(address: &AtomicU32) {
-    unsafe {
-        let _ = syscall(
-            SYS_futex,
-            address as *const AtomicU32 as *const c_void as *mut c_void,
-            FUTEX_WAKE | FUTEX_PRIVATE_FLAG,
-            libc::INT_MAX,
-        );
+    let result = unsafe { wake(address as *const AtomicU32 as *const u32, i32::MAX as u32) };
+    if let Err(error) = result {
+        fail("futex wake_all", error);
     }
 }

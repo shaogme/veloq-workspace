@@ -473,7 +473,7 @@ impl<T, WF, H> RuntimeBuilder<T, WF, H> {
         });
         // worker id 会被编码进 idle 栈 head 的低 32 位，必须在构造期就拒绝越界的规模，
         // 而不是让 `IdleStack` 静默截断。
-        if worker_count.get() >= MAX_WORKER_COUNT {
+        if worker_count.get() > MAX_WORKER_COUNT - 1 {
             return RuntimeError::WorkerCountTooLarge {
                 worker_count: worker_count.get(),
                 max_worker_count: MAX_WORKER_COUNT - 1,

@@ -1,12 +1,12 @@
 use crate::{fmt::Debug, hash::Hash, time::Duration};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux;
 
 #[cfg(target_os = "windows")]
 mod windows;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use linux::SystermImpl;
 
 #[cfg(target_os = "windows")]

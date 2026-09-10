@@ -543,8 +543,8 @@ impl Socket {
                     ));
                 }
                 libc::timeval {
-                    tv_sec: cmp::min(dur.as_secs(), libc::time_t::MAX as u64) as libc::time_t,
-                    tv_usec: dur.subsec_micros() as libc::suseconds_t,
+                    tv_sec: dur.as_secs().min(i64::MAX as u64) as _,
+                    tv_usec: dur.subsec_micros() as _,
                 }
             }
             None => libc::timeval {

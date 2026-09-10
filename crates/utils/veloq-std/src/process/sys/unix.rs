@@ -316,7 +316,7 @@ impl Command {
 
             if self.clear_env {
                 unsafe {
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
                     libc::clearenv();
                 }
             }

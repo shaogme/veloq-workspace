@@ -250,13 +250,13 @@ impl File {
 
         if let Some(accessed) = times.accessed {
             ts[0] = libc::timespec {
-                tv_sec: accessed.as_secs() as libc::time_t,
+                tv_sec: accessed.as_secs() as _,
                 tv_nsec: accessed.subsec_nanos() as libc::c_long,
             };
         }
         if let Some(modified) = times.modified {
             ts[1] = libc::timespec {
-                tv_sec: modified.as_secs() as libc::time_t,
+                tv_sec: modified.as_secs() as _,
                 tv_nsec: modified.subsec_nanos() as libc::c_long,
             };
         }

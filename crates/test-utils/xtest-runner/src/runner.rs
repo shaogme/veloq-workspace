@@ -1,4 +1,4 @@
-use crate::{Config, RunnerError, Target, Task};
+use crate::{Config, LinuxTarget, RunnerError, Target, Task};
 use diagweave::prelude::*;
 use std::{
     env,
@@ -146,6 +146,7 @@ impl Runner {
                 self.config.features.as_deref(),
                 self.config.package.as_deref(),
                 self.config.filter.as_deref(),
+                self.config.linux_target.map(LinuxTarget::name),
             ),
             Target::Windows => windows_native_command(
                 Task::Test,
@@ -324,6 +325,7 @@ impl Runner {
                 self.config.features.as_deref(),
                 self.config.package.as_deref(),
                 self.config.filter.as_deref(),
+                self.config.linux_target.map(LinuxTarget::name),
             ),
             (_, Target::Windows) => windows_native_command(
                 self.config.task,
@@ -341,6 +343,7 @@ fn linux_native_command(
     features: Option<&str>,
     package: Option<&str>,
     filter: Option<&str>,
+    target: Option<&str>,
 ) -> CommandSpec {
     let mut args = match task {
         Task::Test => vec!["nextest".into(), "run".into()],
@@ -353,10 +356,7 @@ fn linux_native_command(
         args.push(f.into());
     }
 
-    if let Some(package) = package {
-        args.push("--package".into());
-        args.push(package.into());
-    }
+    append_packages(&mut args, package);
 
     match task {
         Task::Test => {
@@ -377,17 +377,33 @@ fn linux_native_command(
             }
         }
         Task::Clippy => {
-            args.extend(vec![
-                "--all-targets".into(),
-                "--".into(),
-                "-D".into(),
-                "warnings".into(),
-            ]);
+            if let Some(target) = target {
+                args.push("--target".into());
+                args.push(target.into());
+                args.push("--lib".into());
+            } else {
+                args.push("--all-targets".into());
+            }
+            args.extend(vec!["--".into(), "-D".into(), "warnings".into()]);
         }
-        Task::Check => {}
+        Task::Check => {
+            if let Some(target) = target {
+                args.push("--target".into());
+                args.push(target.into());
+            }
+        }
     }
 
     CommandSpec::new("cargo", args)
+}
+
+fn append_packages(args: &mut Vec<String>, packages: Option<&str>) {
+    if let Some(packages) = packages {
+        for package in packages.split(',').filter(|package| !package.is_empty()) {
+            args.push("--package".into());
+            args.push(package.into());
+        }
+    }
 }
 
 fn windows_native_command(
@@ -408,10 +424,7 @@ fn windows_native_command(
         args.push(f.into());
     }
 
-    if let Some(package) = package {
-        args.push("--package".into());
-        args.push(package.into());
-    }
+    append_packages(&mut args, package);
 
     match task {
         Task::Test => {

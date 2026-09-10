@@ -88,6 +88,38 @@ impl Target {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub(crate) enum LinuxTarget {
+    #[value(name = "x86_64-unknown-linux-gnu")]
+    X86_64UnknownLinuxGnu,
+    #[value(name = "i686-unknown-linux-gnu")]
+    I686UnknownLinuxGnu,
+    #[value(name = "riscv32gc-unknown-linux-gnu")]
+    Riscv32gcUnknownLinuxGnu,
+    #[value(name = "riscv32gc-unknown-linux-musl")]
+    Riscv32gcUnknownLinuxMusl,
+    #[value(name = "aarch64-unknown-linux-gnu")]
+    Aarch64UnknownLinuxGnu,
+    #[value(name = "x86_64-unknown-linux-musl")]
+    X86_64UnknownLinuxMusl,
+    #[value(name = "aarch64-linux-android")]
+    Aarch64LinuxAndroid,
+}
+
+impl LinuxTarget {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::X86_64UnknownLinuxGnu => "x86_64-unknown-linux-gnu",
+            Self::I686UnknownLinuxGnu => "i686-unknown-linux-gnu",
+            Self::Riscv32gcUnknownLinuxGnu => "riscv32gc-unknown-linux-gnu",
+            Self::Riscv32gcUnknownLinuxMusl => "riscv32gc-unknown-linux-musl",
+            Self::Aarch64UnknownLinuxGnu => "aarch64-unknown-linux-gnu",
+            Self::X86_64UnknownLinuxMusl => "x86_64-unknown-linux-musl",
+            Self::Aarch64LinuxAndroid => "aarch64-linux-android",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub(crate) enum Task {
     Test,
     Clippy,
@@ -142,6 +174,9 @@ struct Cli {
 
     #[arg(long, help = "仅执行指定 nextest 过滤表达式")]
     filter: Option<String>,
+
+    #[arg(long, value_enum, help = "Linux 编译目标（仅支持 check/clippy）")]
+    linux_target: Option<LinuxTarget>,
 }
 
 #[derive(Debug)]
@@ -153,6 +188,7 @@ pub(crate) struct Config {
     pub(crate) features: Option<String>,
     pub(crate) package: Option<String>,
     pub(crate) filter: Option<String>,
+    pub(crate) linux_target: Option<LinuxTarget>,
 }
 
 impl TryFrom<Cli> for Config {
@@ -176,6 +212,17 @@ impl TryFrom<Cli> for Config {
 
         let count = cli.count.unwrap_or_else(|| cli.task.default_count());
 
+        if cli.linux_target.is_some() && target != Target::Linux {
+            return Err(RunnerError::Cli(
+                "--linux-target 只能与 --target linux 一起使用".to_string(),
+            ));
+        }
+        if cli.linux_target.is_some() && cli.task == Task::Test {
+            return Err(RunnerError::Cli(
+                "Linux 非主机目标当前仅支持 compile-only 的 check/clippy".to_string(),
+            ));
+        }
+
         Ok(Self {
             target,
             task: cli.task,
@@ -184,6 +231,7 @@ impl TryFrom<Cli> for Config {
             features: cli.features,
             package: cli.package,
             filter: cli.filter,
+            linux_target: cli.linux_target,
         })
     }
 }
