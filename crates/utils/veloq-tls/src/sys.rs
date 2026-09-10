@@ -1,4 +1,4 @@
-pub(crate) trait SystermKey: Copy + Send + Sync {
+pub(crate) trait SystemKey: Copy + Send + Sync {
     /// # Safety
     ///
     /// The caller must ensure that the key is valid.

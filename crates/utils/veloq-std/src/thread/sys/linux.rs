@@ -18,7 +18,7 @@ use crate::{
     },
     thread::{
         AbortedError, Thread, ThreadErrorKind, ThreadId, native_current_id,
-        traits::{RawJoinHandleTrait, RawThreadErrorTrait, SystermImpl},
+        traits::{RawJoinHandleTrait, RawThreadErrorTrait, SystemImpl},
     },
     time::Duration,
 };
@@ -297,9 +297,9 @@ impl<'a, T: Send> RawJoinHandleTrait<T> for RawJoinHandle<'a, T> {
 }
 
 /// Linux 平台下的平台实现结构体
-pub struct Systerm;
+pub struct System;
 
-impl SystermImpl for Systerm {
+impl SystemImpl for System {
     type Error = RawThreadError;
     type RawJoinHandle<'a, T: Send>
         = RawJoinHandle<'a, T>

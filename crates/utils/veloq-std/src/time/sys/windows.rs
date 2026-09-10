@@ -1,6 +1,6 @@
 use crate::{
     sync::atomic::{NativeAtomicU64, Ordering},
-    time::{Duration, sys::Systerm},
+    time::{Duration, sys::System},
 };
 
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
@@ -21,9 +21,9 @@ fn get_frequency() -> u64 {
     val
 }
 
-pub struct SystermImpl;
+pub struct SystemImpl;
 
-impl Systerm for SystermImpl {
+impl System for SystemImpl {
     type RawInstant = u64;
 
     fn now() -> Self::RawInstant {

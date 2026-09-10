@@ -1,4 +1,4 @@
-use crate::time::{Duration, sys::Systerm};
+use crate::time::{Duration, sys::System};
 
 use libc::{CLOCK_MONOTONIC, c_long, clock_gettime, timespec};
 
@@ -8,9 +8,9 @@ pub struct Timespec {
     pub tv_nsec: c_long,
 }
 
-pub struct SystermImpl;
+pub struct SystemImpl;
 
-impl Systerm for SystermImpl {
+impl System for SystemImpl {
     type RawInstant = Timespec;
 
     fn now() -> Self::RawInstant {

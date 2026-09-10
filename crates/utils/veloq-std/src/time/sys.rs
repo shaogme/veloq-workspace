@@ -7,12 +7,12 @@ mod linux;
 mod windows;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub use linux::SystermImpl;
+pub use linux::SystemImpl;
 
 #[cfg(target_os = "windows")]
-pub use windows::SystermImpl;
+pub use windows::SystemImpl;
 
-pub trait Systerm {
+pub trait System {
     type RawInstant: Copy + Clone + Ord + Eq + Hash + Debug + Send + Sync;
 
     fn now() -> Self::RawInstant;

@@ -1,4 +1,4 @@
-use crate::{SystermKey, TlsErrorKind, is_sentinel};
+use crate::{SystemKey, TlsErrorKind, is_sentinel};
 use alloc::{boxed::Box, vec::Vec};
 use core::{
     cell::RefCell,
@@ -48,7 +48,7 @@ unsafe fn tls_destructor_shim<T>(ptr: *mut ()) {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Key(u32);
 
-impl SystermKey for Key {
+impl SystemKey for Key {
     #[inline]
     unsafe fn free(self) {
         let _ = THREAD_VALUES.try_with(|cell| {

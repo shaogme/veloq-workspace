@@ -5,7 +5,7 @@ use crate::{
         atomic::{AtomicBool, AtomicU32, Ordering},
         sys,
     },
-    thread::traits::{RawJoinHandleTrait, RawThreadErrorTrait, SystermImpl},
+    thread::traits::{RawJoinHandleTrait, RawThreadErrorTrait, SystemImpl},
 };
 
 #[cfg(feature = "std")]
@@ -17,7 +17,7 @@ use crate::{
     thread::panicking,
 };
 
-pub(crate) struct RawScopeData<P: SystermImpl> {
+pub(crate) struct RawScopeData<P: SystemImpl> {
     pub(crate) num_running_threads: AtomicU32,
     pub(crate) cancelled: AtomicBool,
     _platform: PhantomData<fn() -> P>,
@@ -25,7 +25,7 @@ pub(crate) struct RawScopeData<P: SystermImpl> {
     pub(crate) panics: AtomicPtr<P::Error>,
 }
 
-impl<P: SystermImpl> RawScopeData<P> {
+impl<P: SystemImpl> RawScopeData<P> {
     #[cfg(feature = "std")]
     fn pop_panic(&self) -> Option<P::Error> {
         let ptr = self.panics.swap(null_mut(), Ordering::Acquire);
@@ -40,7 +40,7 @@ impl<P: SystermImpl> RawScopeData<P> {
     }
 }
 
-impl<P: SystermImpl> Drop for RawScopeData<P> {
+impl<P: SystemImpl> Drop for RawScopeData<P> {
     fn drop(&mut self) {
         #[cfg(feature = "std")]
         {
@@ -55,14 +55,14 @@ impl<P: SystermImpl> Drop for RawScopeData<P> {
 }
 
 /// 结构化并发的作用域，用于管理在其中生成的线程的生命周期。
-pub struct RawScope<'scope, 'env: 'scope, P: SystermImpl> {
+pub struct RawScope<'scope, 'env: 'scope, P: SystemImpl> {
     data: &'scope RawScopeData<P>,
     _scope: PhantomData<&'scope mut &'scope ()>,
     _env: PhantomData<&'env mut &'env ()>,
 }
 
 /// 作用域内生成的线程的加入句柄，允许等待线程完成并获取其返回值。
-pub struct RawScopedJoinHandle<'scope, P: SystermImpl, R: Send + 'scope> {
+pub struct RawScopedJoinHandle<'scope, P: SystemImpl, R: Send + 'scope> {
     handle: Option<P::RawJoinHandle<'scope, Option<R>>>,
     #[cfg(feature = "std")]
     scope_data: &'scope RawScopeData<P>,
@@ -70,13 +70,13 @@ pub struct RawScopedJoinHandle<'scope, P: SystermImpl, R: Send + 'scope> {
     _scope_data: PhantomData<&'scope RawScopeData<P>>,
 }
 
-unsafe impl<'scope, P: SystermImpl, R: Send + 'scope> Send for RawScopedJoinHandle<'scope, P, R> {}
-unsafe impl<'scope, P: SystermImpl, R: Send + Sync + 'scope> Sync
+unsafe impl<'scope, P: SystemImpl, R: Send + 'scope> Send for RawScopedJoinHandle<'scope, P, R> {}
+unsafe impl<'scope, P: SystemImpl, R: Send + Sync + 'scope> Sync
     for RawScopedJoinHandle<'scope, P, R>
 {
 }
 
-impl<'scope, 'env, P: SystermImpl> RawScope<'scope, 'env, P> {
+impl<'scope, 'env, P: SystemImpl> RawScope<'scope, 'env, P> {
     /// 检查当前作用域是否已被取消（例如主线程发生 panic）
     pub fn is_cancelled(&self) -> bool {
         self.data.cancelled.load(Ordering::Acquire)
@@ -185,7 +185,7 @@ impl<'scope, 'env, P: SystermImpl> RawScope<'scope, 'env, P> {
     }
 }
 
-impl<'scope, P: SystermImpl, R: Send + 'scope> RawScopedJoinHandle<'scope, P, R> {
+impl<'scope, P: SystemImpl, R: Send + 'scope> RawScopedJoinHandle<'scope, P, R> {
     /// 等待子线程执行结束并返回其结果。
     pub fn join(mut self) -> Result<R, P::Error> {
         let handle = self.handle.take().expect("handle already joined");
@@ -221,11 +221,11 @@ impl<'scope, P: SystermImpl, R: Send + 'scope> RawScopedJoinHandle<'scope, P, R>
     }
 }
 
-struct RawScopeGuard<'scope, P: SystermImpl> {
+struct RawScopeGuard<'scope, P: SystemImpl> {
     data: &'scope RawScopeData<P>,
     completed_successfully: bool,
 }
-impl<P: SystermImpl> Drop for RawScopeGuard<'_, P> {
+impl<P: SystemImpl> Drop for RawScopeGuard<'_, P> {
     fn drop(&mut self) {
         if !self.completed_successfully {
             self.data.cancelled.store(true, Ordering::Release);
@@ -255,7 +255,7 @@ impl<P: SystermImpl> Drop for RawScopeGuard<'_, P> {
 
 pub fn scope<'env, P, F, R>(f: F) -> R
 where
-    P: SystermImpl,
+    P: SystemImpl,
     F: for<'scope> FnOnce(&'scope RawScope<'scope, 'env, P>) -> R,
 {
     let scope_data = RawScopeData {

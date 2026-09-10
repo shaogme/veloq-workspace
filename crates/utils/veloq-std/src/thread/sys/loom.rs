@@ -13,7 +13,7 @@ use crate::{
     },
     thread::{
         AbortedError, Thread, ThreadErrorKind, ThreadId, loom_current_id,
-        traits::{RawJoinHandleTrait, RawThreadErrorTrait, SystermImpl},
+        traits::{RawJoinHandleTrait, RawThreadErrorTrait, SystemImpl},
     },
     time::Duration,
 };
@@ -126,9 +126,9 @@ impl<'a, T: Send> RawJoinHandleTrait<T> for RawJoinHandle<'a, T> {
     }
 }
 
-pub struct Systerm;
+pub struct System;
 
-impl SystermImpl for Systerm {
+impl SystemImpl for System {
     type Error = RawThreadError;
     type RawJoinHandle<'a, T: Send>
         = RawJoinHandle<'a, T>

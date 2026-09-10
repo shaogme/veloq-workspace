@@ -1,4 +1,4 @@
-use crate::{Key, SystermKey};
+use crate::{Key, SystemKey};
 
 /// Helper to check if a pointer is the reentrancy sentinel.
 ///
