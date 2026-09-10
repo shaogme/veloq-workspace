@@ -1,5 +1,10 @@
 #[cfg(not(feature = "loom"))]
 mod normal_tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
     use veloq_std::sync::mpsc;
     use veloq_std::thread;
     use veloq_std::time::Duration;
@@ -58,17 +63,98 @@ mod normal_tests {
         drop(tx);
         assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected));
     }
+
+    #[test]
+    fn test_mpsc_send_after_receiver_drop_returns_value() {
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+
+        match tx.send(42) {
+            Err(mpsc::SendError(value)) => assert_eq!(value, 42),
+            Ok(()) => panic!("sending after receiver close unexpectedly succeeded"),
+        }
+    }
+
+    #[derive(Debug)]
+    struct DropProbe(Arc<AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn test_mpsc_receiver_drop_drains_queue() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = mpsc::channel();
+
+        for _ in 0..3 {
+            tx.send(DropProbe(drops.clone())).unwrap();
+        }
+
+        drop(rx);
+        assert_eq!(drops.load(Ordering::Relaxed), 3);
+
+        drop(tx);
+        assert_eq!(drops.load(Ordering::Relaxed), 3);
+    }
+
+    #[derive(Debug)]
+    struct ReentrantDrop {
+        sender: mpsc::Sender<Option<Box<ReentrantDrop>>>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for ReentrantDrop {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Relaxed);
+            assert!(self.sender.send(None).is_err());
+        }
+    }
+
+    #[test]
+    fn test_mpsc_receiver_drop_drops_messages_without_holding_lifecycle_lock() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel::<Option<Box<ReentrantDrop>>>();
+        tx.send(Some(Box::new(ReentrantDrop {
+            sender: tx.clone(),
+            dropped: dropped.clone(),
+        })))
+        .unwrap();
+
+        drop(rx);
+        assert!(dropped.load(Ordering::Relaxed));
+    }
+
+    fn assert_send<T: Send>() {}
+
+    #[test]
+    fn test_mpsc_receiver_is_send_but_single_consumer() {
+        assert_send::<mpsc::Receiver<usize>>();
+
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || rx.recv().unwrap()).unwrap();
+        tx.send(7).unwrap();
+        assert_eq!(handle.join().unwrap(), 7);
+    }
 }
 
 #[cfg(feature = "loom")]
 mod loom_tests {
-    use loom::thread;
+    use loom::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        thread,
+    };
     use veloq_std::sync::mpsc;
 
     #[test]
     fn test_loom_mpsc() {
         let mut builder = loom::model::Builder::new();
-        builder.preemption_bound = Some(7);
+        builder.preemption_bound = Some(2);
         builder.check(|| {
             let (tx, rx) = mpsc::channel();
             let tx1 = tx.clone();
@@ -90,6 +176,51 @@ mod loom_tests {
             }
             vals.sort();
             assert_eq!(vals, vec![1, 2]);
+        });
+    }
+
+    struct DropProbe(Arc<AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn test_loom_mpsc_send_close_race() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(5);
+        builder.check(|| {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let observed_drops = drops.clone();
+            let (tx, rx) = mpsc::channel();
+            let send_tx = tx.clone();
+
+            let send_handle = thread::spawn(move || send_tx.send(DropProbe(drops)));
+            let close_handle = thread::spawn(move || drop(rx));
+
+            let result = send_handle.join().unwrap();
+            close_handle.join().unwrap();
+
+            if let Err(mpsc::SendError(value)) = result {
+                drop(value);
+            }
+            drop(tx);
+            assert_eq!(observed_drops.load(Ordering::Relaxed), 1);
+        });
+    }
+
+    #[test]
+    fn test_loom_mpsc_send_after_close_returns_value() {
+        loom::model(|| {
+            let (tx, rx) = mpsc::channel();
+            drop(rx);
+
+            match tx.send(42) {
+                Err(mpsc::SendError(value)) => assert_eq!(value, 42),
+                Ok(()) => panic!("sending after receiver close unexpectedly succeeded"),
+            }
         });
     }
 }

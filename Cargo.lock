@@ -1545,6 +1545,7 @@ dependencies = [
  "libc",
  "lock_api",
  "loom",
+ "trybuild",
  "veloq-hash",
  "veloq-tls",
  "windows-sys",

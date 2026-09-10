@@ -48,3 +48,6 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Pipes",
     "Win32_Security",
 ] }
+
+[dev-dependencies]
+trybuild = "1.0"

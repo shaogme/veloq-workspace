@@ -1,11 +1,13 @@
 //! Multi-producer, single-consumer FIFO queue communication channel.
 
+use core::{cell::Cell, marker::PhantomData};
+
 use crate::{
     error::Error,
     fmt,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex, RwLock,
+        atomic::{AtomicUsize, Ordering},
     },
     thread::{Thread, current, park, park_timeout},
     time::{Duration, Instant},
@@ -13,6 +15,12 @@ use crate::{
 
 mod queue;
 use queue::SegQueue;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lifecycle {
+    Open,
+    Closed,
+}
 
 /// An error returned from the [`Sender::send`] function.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -81,7 +89,7 @@ impl Error for RecvTimeoutError {}
 struct Shared<T> {
     queue: SegQueue<T>,
     senders: AtomicUsize,
-    receiver_alive: AtomicBool,
+    lifecycle: RwLock<Lifecycle>,
     blocked_thread: Mutex<Option<Thread>>,
 }
 
@@ -120,10 +128,14 @@ impl<T> fmt::Debug for Sender<T> {
 impl<T> Sender<T> {
     /// Sends a value on this channel.
     pub fn send(&self, t: T) -> Result<(), SendError<T>> {
-        if !self.inner.receiver_alive.load(Ordering::Acquire) {
-            return Err(SendError(t));
+        {
+            let lifecycle = self.inner.lifecycle.read();
+            if *lifecycle == Lifecycle::Closed {
+                return Err(SendError(t));
+            }
+            self.inner.queue.push(t);
         }
-        self.inner.queue.push(t);
+
         let thread = self.inner.blocked_thread.lock().take();
         if let Some(thread) = thread {
             thread.unpark();
@@ -135,11 +147,24 @@ impl<T> Sender<T> {
 /// The receiving-half of a channel.
 pub struct Receiver<T> {
     inner: Arc<Shared<T>>,
+    _not_sync: PhantomData<Cell<()>>,
 }
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        self.inner.receiver_alive.store(false, Ordering::Release);
+        {
+            let mut lifecycle = self.inner.lifecycle.write();
+            *lifecycle = Lifecycle::Closed;
+        }
+
+        let thread = self.inner.blocked_thread.lock().take();
+        while let Some(message) = self.inner.queue.pop() {
+            drop(message);
+        }
+
+        if let Some(thread) = thread {
+            thread.unpark();
+        }
     }
 }
 
@@ -324,7 +349,7 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let shared = Arc::new(Shared {
         queue: SegQueue::new(),
         senders: AtomicUsize::new(1),
-        receiver_alive: AtomicBool::new(true),
+        lifecycle: RwLock::new(Lifecycle::Open),
         blocked_thread: Mutex::new(None),
     });
 
@@ -332,6 +357,9 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
         Sender {
             inner: shared.clone(),
         },
-        Receiver { inner: shared },
+        Receiver {
+            inner: shared,
+            _not_sync: PhantomData,
+        },
     )
 }
