@@ -413,7 +413,7 @@ pub(crate) mod test_helpers {
         ffi::c_void,
         num::NonZeroUsize,
         sync::{
-            Mutex, MutexGuard,
+            UnpoisonedMutex, UnpoisonedMutexGuard,
             atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
         },
     };
@@ -423,8 +423,9 @@ pub(crate) mod test_helpers {
 
     pub(crate) static NEXT_REGISTER_ID: AtomicUsize = AtomicUsize::new(100);
     pub(crate) static REGISTER_FAILS: AtomicBool = AtomicBool::new(false);
-    pub(crate) static DISPATCH_TEST_LOCK: Mutex<()> = Mutex::new(());
-    pub(crate) static DEREGISTERED_IDS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    pub(crate) static DISPATCH_TEST_LOCK: UnpoisonedMutex<()> = UnpoisonedMutex::new(());
+    pub(crate) static DEREGISTERED_IDS: UnpoisonedMutex<Vec<usize>> =
+        UnpoisonedMutex::new(Vec::new());
 
     pub(crate) fn fixed_buf(capacity: usize, len: usize) -> FixedBuf {
         FixedBuf::alloc_heap(NonZeroUsize::new(capacity).expect("non-zero capacity"), len)
@@ -437,7 +438,7 @@ pub(crate) mod test_helpers {
         DEREGISTERED_IDS.lock().clear();
     }
 
-    pub(crate) fn lock_dispatch_state() -> MutexGuard<'static, ()> {
+    pub(crate) fn lock_dispatch_state() -> UnpoisonedMutexGuard<'static, ()> {
         DISPATCH_TEST_LOCK.lock()
     }
 

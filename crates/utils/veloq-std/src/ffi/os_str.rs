@@ -9,7 +9,12 @@ use core::{
 };
 
 use crate::alloc_crate::{
-    borrow::Cow, boxed::Box, collections::TryReserveError, rc::Rc, string::String, sync::Arc,
+    borrow::{Cow, ToOwned},
+    boxed::Box,
+    collections::TryReserveError,
+    rc::Rc,
+    string::String,
+    sync::Arc,
     vec::Vec,
 };
 

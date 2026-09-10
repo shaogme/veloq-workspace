@@ -6,7 +6,7 @@ use crate::{
     error::Error,
     fmt,
     sync::{
-        Arc, Mutex, RwLock,
+        Arc, UnpoisonedMutex, UnpoisonedRwLock,
         atomic::{AtomicUsize, Ordering},
     },
     thread::{Thread, current, park, park_timeout},
@@ -89,8 +89,8 @@ impl Error for RecvTimeoutError {}
 struct Shared<T> {
     queue: SegQueue<T>,
     senders: AtomicUsize,
-    lifecycle: RwLock<Lifecycle>,
-    blocked_thread: Mutex<Option<Thread>>,
+    lifecycle: UnpoisonedRwLock<Lifecycle>,
+    blocked_thread: UnpoisonedMutex<Option<Thread>>,
 }
 
 /// The sending-half of a channel.
@@ -349,8 +349,8 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let shared = Arc::new(Shared {
         queue: SegQueue::new(),
         senders: AtomicUsize::new(1),
-        lifecycle: RwLock::new(Lifecycle::Open),
-        blocked_thread: Mutex::new(None),
+        lifecycle: UnpoisonedRwLock::new(Lifecycle::Open),
+        blocked_thread: UnpoisonedMutex::new(None),
     });
 
     (

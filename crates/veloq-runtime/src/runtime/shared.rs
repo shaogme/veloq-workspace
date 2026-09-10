@@ -3,13 +3,14 @@ use std::{
     num::NonZeroUsize,
     panic::{AssertUnwindSafe, catch_unwind},
     ptr::NonNull,
-    sync::{Arc, MutexGuard, atomic::Ordering},
+    sync::{Arc, atomic::Ordering},
 };
 
 use crossbeam_deque::Worker;
 use crossbeam_queue::ArrayQueue;
 use diagweave::prelude::*;
 use numaperf_topo::Topology;
+use veloq_std::sync::UnpoisonedMutexGuard;
 use veloq_storage::StateOptionPtr;
 use veloq_tls::Tls;
 
@@ -683,7 +684,7 @@ impl RuntimeSharedBase {
         &self,
         task: SendTaskRef,
         target_group: usize,
-        publication_gate: MutexGuard<'_, ()>,
+        publication_gate: UnpoisonedMutexGuard<'_, ()>,
     ) {
         self.scheduler.push_global(task);
         drop(publication_gate);

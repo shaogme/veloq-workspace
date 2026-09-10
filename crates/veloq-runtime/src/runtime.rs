@@ -4,9 +4,7 @@ use std::{
     ops::AsyncFnOnce,
     panic::{AssertUnwindSafe, catch_unwind},
     pin::pin,
-    ptr,
-    sync::Mutex,
-    thread,
+    ptr, thread,
 };
 
 use crate::{
@@ -14,6 +12,7 @@ use crate::{
     utils::FastRand,
 };
 use diagweave::prelude::*;
+use veloq_std::sync::Mutex;
 
 pub mod cancellation;
 pub mod context;

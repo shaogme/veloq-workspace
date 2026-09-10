@@ -1,16 +1,16 @@
 #[cfg(feature = "loom")]
-use crate::{collections::VecDeque, sync::Mutex};
+use crate::{collections::VecDeque, sync::UnpoisonedMutex};
 
 #[cfg(feature = "loom")]
 pub(crate) struct SegQueue<T> {
-    inner: Mutex<VecDeque<T>>,
+    inner: UnpoisonedMutex<VecDeque<T>>,
 }
 
 #[cfg(feature = "loom")]
 impl<T> SegQueue<T> {
     pub(crate) fn new() -> Self {
         Self {
-            inner: Mutex::new(VecDeque::new()),
+            inner: UnpoisonedMutex::new(VecDeque::new()),
         }
     }
 

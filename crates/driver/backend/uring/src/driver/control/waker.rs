@@ -9,7 +9,7 @@ use veloq_std::{
     io, mem,
     string::ToString,
     sync::{
-        Arc, Mutex, MutexGuard,
+        Arc, UnpoisonedMutex, UnpoisonedMutexGuard,
         atomic::{AtomicU8, Ordering},
     },
 };
@@ -25,17 +25,19 @@ pub(crate) struct EventFd {
 }
 
 pub(crate) struct WakerFdState {
-    fd: Mutex<Arc<EventFd>>,
+    fd: UnpoisonedMutex<Arc<EventFd>>,
 }
 
 impl WakerFdState {
     #[inline]
     pub(crate) fn new(fd: Arc<EventFd>) -> Self {
-        Self { fd: Mutex::new(fd) }
+        Self {
+            fd: UnpoisonedMutex::new(fd),
+        }
     }
 
     #[inline]
-    fn lock_fd(&self) -> MutexGuard<'_, Arc<EventFd>> {
+    fn lock_fd(&self) -> UnpoisonedMutexGuard<'_, Arc<EventFd>> {
         self.fd.lock()
     }
 

@@ -2,12 +2,14 @@ use crate::error::RuntimeWakeError;
 use std::{
     mem::ManuallyDrop,
     sync::{
-        Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak,
+        Arc, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
     task::{RawWaker, RawWakerVTable, Waker},
     time::Duration,
 };
+
+use veloq_std::sync::{UnpoisonedCondvar, UnpoisonedMutex, UnpoisonedMutexGuard};
 
 // --- 系统级同步原语 (WaitOnAddress / Futex) ---
 
@@ -242,10 +244,10 @@ pub(crate) struct ShutdownCoordinator {
     local_drained_workers: AtomicUsize,
     quiescent_arrivals: Box<[AtomicBool]>,
     local_drained_arrivals: Box<[AtomicBool]>,
-    publication_gate: Mutex<()>,
-    barrier_lock: Mutex<()>,
-    barrier: Condvar,
-    shutdown_targets: Mutex<Option<Box<[Unparker]>>>,
+    publication_gate: UnpoisonedMutex<()>,
+    barrier_lock: UnpoisonedMutex<()>,
+    barrier: UnpoisonedCondvar,
+    shutdown_targets: UnpoisonedMutex<Option<Box<[Unparker]>>>,
     drain_failed: AtomicBool,
 }
 
@@ -260,27 +262,22 @@ impl ShutdownCoordinator {
             local_drained_workers: AtomicUsize::new(0),
             quiescent_arrivals,
             local_drained_arrivals,
-            publication_gate: Mutex::new(()),
-            barrier_lock: Mutex::new(()),
-            barrier: Condvar::new(),
-            shutdown_targets: Mutex::new(None),
+            publication_gate: UnpoisonedMutex::new(()),
+            barrier_lock: UnpoisonedMutex::new(()),
+            barrier: UnpoisonedCondvar::new(),
+            shutdown_targets: UnpoisonedMutex::new(None),
             drain_failed: AtomicBool::new(false),
         }
     }
 
     pub(crate) fn install_shutdown_targets(&self, targets: Box<[Unparker]>) {
-        let mut guard = self
-            .shutdown_targets
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = self.shutdown_targets.lock();
         assert!(guard.is_none(), "shutdown targets installed twice");
         *guard = Some(targets);
     }
 
-    pub(crate) fn lock_publication(&self) -> MutexGuard<'_, ()> {
-        self.publication_gate
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    pub(crate) fn lock_publication(&self) -> UnpoisonedMutexGuard<'_, ()> {
+        self.publication_gate.lock()
     }
 
     pub(crate) fn is_running(&self) -> bool {
@@ -313,7 +310,6 @@ impl ShutdownCoordinator {
         let targets = self
             .shutdown_targets
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
             .map(|targets| targets.to_vec());
         if let Some(targets) = targets {
@@ -324,10 +320,7 @@ impl ShutdownCoordinator {
     }
 
     fn notify_barrier(&self) {
-        let _guard = self
-            .barrier_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = self.barrier_lock.lock();
         self.barrier.notify_all();
     }
 
@@ -374,28 +367,16 @@ impl ShutdownCoordinator {
     }
 
     pub(crate) fn wait_for_quiescent(&self) {
-        let mut guard = self
-            .barrier_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = self.barrier_lock.lock();
         while self.quiescent_workers.load(Ordering::Acquire) < self.worker_count {
-            guard = self
-                .barrier
-                .wait(guard)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard = self.barrier.wait(guard);
         }
     }
 
     pub(crate) fn wait_for_local_drained(&self) {
-        let mut guard = self
-            .barrier_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = self.barrier_lock.lock();
         while self.local_drained_workers.load(Ordering::Acquire) < self.worker_count {
-            guard = self
-                .barrier
-                .wait(guard)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard = self.barrier.wait(guard);
         }
     }
 
@@ -438,15 +419,9 @@ impl ShutdownCoordinator {
     }
 
     pub(crate) fn wait_for_drained(&self) {
-        let mut guard = self
-            .barrier_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut guard = self.barrier_lock.lock();
         while self.phase() != ShutdownPhase::Drained {
-            guard = self
-                .barrier
-                .wait(guard)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard = self.barrier.wait(guard);
         }
     }
 
@@ -465,7 +440,7 @@ impl ShutdownCoordinator {
 /// 第一个错误写入这里，并设置 shutdown；仍能处理返回值的同步调用者会同时收到原始的
 /// `RuntimeWakeError`。
 pub(crate) struct WakeFailureState {
-    first_error: Mutex<Option<RuntimeWakeError>>,
+    first_error: UnpoisonedMutex<Option<RuntimeWakeError>>,
     failed: AtomicBool,
     error_count: AtomicU64,
     coordinator: Weak<ShutdownCoordinator>,
@@ -474,7 +449,7 @@ pub(crate) struct WakeFailureState {
 impl WakeFailureState {
     pub(crate) fn new(coordinator: Weak<ShutdownCoordinator>) -> Self {
         Self {
-            first_error: Mutex::new(None),
+            first_error: UnpoisonedMutex::new(None),
             failed: AtomicBool::new(false),
             error_count: AtomicU64::new(0),
             coordinator,
@@ -483,7 +458,7 @@ impl WakeFailureState {
 
     pub(crate) fn record(&self, error: RuntimeWakeError) {
         self.error_count.fetch_add(1, Ordering::Relaxed);
-        let mut first_error = self.first_error.lock().unwrap_or_else(|e| e.into_inner());
+        let mut first_error = self.first_error.lock();
         if first_error.is_none() {
             *first_error = Some(error);
         }
@@ -495,10 +470,7 @@ impl WakeFailureState {
     }
 
     pub(crate) fn first_error(&self) -> Option<RuntimeWakeError> {
-        self.first_error
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        self.first_error.lock().clone()
     }
 
     pub(crate) fn is_failed(&self) -> bool {

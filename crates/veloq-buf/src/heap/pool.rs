@@ -22,7 +22,7 @@ use veloq_std::{
     num::NonZeroUsize,
     ptr::NonNull,
     string::ToString,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, UnpoisonedMutex, UnpoisonedRwLock},
     thread::{available_parallelism, current_id},
     vec,
     vec::Vec,
@@ -100,7 +100,7 @@ pub struct Chunk {
     /// `BuddyAllocator` accesses the raw pointers in `memory` during its Drop implementation.
     /// Rust drops fields in declaration order, so `shards` will be dropped first, allowing
     /// safe access to `memory`.
-    pub(crate) shards: Box<[CachePadded<Mutex<BuddyAllocator>>]>,
+    pub(crate) shards: Box<[CachePadded<UnpoisonedMutex<BuddyAllocator>>]>,
 
     /// Superblock States Array
     /// Mapped 1:1 to the 64-slot chunks of the memory.
@@ -163,7 +163,7 @@ impl Chunk {
 
             // Initialize BuddyAllocator for this slice
             let allocator = unsafe { BuddyAllocator::new(shard_ptr, bytes_per_shard) };
-            shards.push(CachePadded::new(Mutex::new(allocator)));
+            shards.push(CachePadded::new(UnpoisonedMutex::new(allocator)));
         }
 
         // 4. Initialize Superblock States
@@ -395,9 +395,9 @@ pub type ChunkListener = Box<dyn Fn(ChunkInfo) + Send + Sync>;
 /// The basic unit is a 4KB `Slot`.
 pub struct GlobalSlotPool {
     /// Active chunks
-    pub(crate) chunks: CachePadded<RwLock<Vec<Arc<Chunk>>>>,
+    pub(crate) chunks: CachePadded<UnpoisonedRwLock<Vec<Arc<Chunk>>>>,
     /// Listener for new chunk allocation (used to notify Runtime/Driver)
-    pub(crate) listener: CachePadded<RwLock<Option<ChunkListener>>>,
+    pub(crate) listener: CachePadded<UnpoisonedRwLock<Option<ChunkListener>>>,
 }
 
 impl GlobalSlotPool {
@@ -416,8 +416,8 @@ impl GlobalSlotPool {
         let chunk0 = Chunk::new(ChunkId::ZERO, total_size)?;
 
         Ok(Self {
-            chunks: CachePadded::new(RwLock::new(vec![Arc::new(chunk0)])),
-            listener: CachePadded::new(RwLock::new(None)),
+            chunks: CachePadded::new(UnpoisonedRwLock::new(vec![Arc::new(chunk0)])),
+            listener: CachePadded::new(UnpoisonedRwLock::new(None)),
         })
     }
 

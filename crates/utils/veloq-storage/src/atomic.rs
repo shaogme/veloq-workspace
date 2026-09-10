@@ -3,7 +3,7 @@ use veloq_std::{
     marker::PhantomData,
     ptr::{NonNull, null_mut},
     sync::{
-        Arc, Mutex, MutexGuard,
+        Arc, UnpoisonedMutex, UnpoisonedMutexGuard,
         atomic::{AtomicPtr, AtomicUsize, Ordering},
     },
 };
@@ -30,14 +30,14 @@ impl Storage for AtomicStorage {
     type OptionFatArc<T: ?Sized + Send + Sync> = AtomicOptionFatArc<T>;
 }
 
-pub struct AtomicLock<T>(Mutex<T>);
+pub struct AtomicLock<T>(UnpoisonedMutex<T>);
 impl<T> StateLock<T> for AtomicLock<T> {
     type Guard<'a>
-        = MutexGuard<'a, T>
+        = UnpoisonedMutexGuard<'a, T>
     where
         T: 'a;
     fn new(val: T) -> Self {
-        Self(Mutex::new(val))
+        Self(UnpoisonedMutex::new(val))
     }
     fn lock(&self) -> Self::Guard<'_> {
         self.0.lock()

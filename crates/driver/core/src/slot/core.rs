@@ -9,7 +9,7 @@ use veloq_std::{
     fmt::{self, Debug},
     marker::PhantomData,
     sync::{
-        Mutex,
+        UnpoisonedMutex,
         atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
 };
@@ -242,7 +242,7 @@ pub struct SlotData<Spec: SlotSpec> {
     pub next_free: AtomicUsize,
     pub(crate) completion_res: AtomicI32,
     pub(crate) completion_flags: AtomicU32,
-    pub(crate) completion_mailbox: Mutex<CompletionMailbox<Spec>>,
+    pub(crate) completion_mailbox: UnpoisonedMutex<CompletionMailbox<Spec>>,
     pub(crate) completion_waker: AtomicWaker,
     marker: SlotMarker<Spec>,
 }
@@ -343,7 +343,7 @@ impl<Spec: SlotSpec> SlotData<Spec> {
             next_free: AtomicUsize::new(Self::NULL_INDEX),
             completion_res: AtomicI32::new(0),
             completion_flags: AtomicU32::new(0),
-            completion_mailbox: Mutex::new(CompletionMailbox::<Spec>::new()),
+            completion_mailbox: UnpoisonedMutex::new(CompletionMailbox::<Spec>::new()),
             completion_waker: AtomicWaker::new(),
             marker: PhantomData,
         }

@@ -5,7 +5,7 @@ use veloq_std::{
     boxed::Box,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, UnpoisonedCondvar, UnpoisonedMutex,
         atomic::{AtomicUsize, Ordering},
     },
     thread,
@@ -52,8 +52,8 @@ impl BlockingTask {
 struct PoolState {
     queue: SegQueue<BlockingTask>,
     task_count: AtomicUsize,
-    sleeper_lock: Mutex<()>,
-    cond: Condvar,
+    sleeper_lock: UnpoisonedMutex<()>,
+    cond: UnpoisonedCondvar,
     active_workers: AtomicUsize,
     idle_workers: AtomicUsize,
 }
@@ -89,8 +89,8 @@ impl ThreadPool {
         let state = Arc::new(PoolState {
             queue: SegQueue::new(),
             task_count: AtomicUsize::new(0),
-            sleeper_lock: Mutex::new(()),
-            cond: Condvar::new(),
+            sleeper_lock: UnpoisonedMutex::new(()),
+            cond: UnpoisonedCondvar::new(),
             active_workers: AtomicUsize::new(0),
             idle_workers: AtomicUsize::new(0),
         });

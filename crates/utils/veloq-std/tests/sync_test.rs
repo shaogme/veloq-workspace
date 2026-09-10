@@ -292,7 +292,7 @@ mod normal_tests {
 
         thread::spawn(move || {
             let (lock, cvar) = &*pair2;
-            let mut started = lock.lock();
+            let mut started = lock.lock().unwrap();
             *started = true;
             cvar.notify_one();
         })
@@ -301,9 +301,9 @@ mod normal_tests {
         .unwrap();
 
         let (lock, cvar) = &*pair;
-        let mut started = lock.lock();
+        let mut started = lock.lock().unwrap();
         while !*started {
-            started = cvar.wait(started);
+            started = cvar.wait(started).unwrap();
         }
         assert!(*started);
     }
@@ -318,16 +318,16 @@ mod normal_tests {
 
         let handle = thread::spawn(move || {
             let (lock, cvar) = &*pair2;
-            let guard = lock.lock();
+            let guard = lock.lock().unwrap();
             ready_tx.send(()).unwrap();
-            let _guard = cvar.wait(guard);
+            let _guard = cvar.wait(guard).unwrap();
             done_tx.send(()).unwrap();
         })
         .unwrap();
 
         ready_rx.recv().unwrap();
         let (lock, cvar) = &*pair;
-        let guard = lock.lock();
+        let guard = lock.lock().unwrap();
         assert!(done_rx.try_recv().is_err());
         cvar.notify_one();
         drop(guard);
@@ -343,17 +343,17 @@ mod normal_tests {
 
         let handle = thread::spawn(move || {
             let (lock, cvar) = &*pair2;
-            let mut started = lock.lock();
+            let mut started = lock.lock().unwrap();
             *started = true;
             cvar.notify_one();
         })
         .unwrap();
 
         let (lock, cvar) = &*pair;
-        let mut started = lock.lock();
+        let mut started = lock.lock().unwrap();
         while !*started {
             let (g, res) = cvar.wait_timeout(started, Duration::from_millis(100));
-            started = g;
+            started = g.unwrap();
             if res.timed_out() {
                 break;
             }
@@ -366,8 +366,9 @@ mod normal_tests {
     fn test_condvar_timeout_expired() {
         let pair = Arc::new((Mutex::new(false), Condvar::new()));
         let (lock, cvar) = &*pair;
-        let started = lock.lock();
-        let (_g, res) = cvar.wait_timeout(started, Duration::from_millis(10));
+        let started = lock.lock().unwrap();
+        let (g, res) = cvar.wait_timeout(started, Duration::from_millis(10));
+        drop(g.unwrap());
         assert!(res.timed_out());
     }
 
@@ -380,16 +381,17 @@ mod normal_tests {
 
         let handle = thread::spawn(move || {
             let (lock, cvar) = &*pair2;
-            let guard = lock.lock();
+            let guard = lock.lock().unwrap();
             ready_tx.send(()).unwrap();
-            let (_guard, result) = cvar.wait_timeout(guard, Duration::from_millis(5));
+            let (guard, result) = cvar.wait_timeout(guard, Duration::from_millis(5));
+            drop(guard.unwrap());
             done_tx.send(result.timed_out()).unwrap();
         })
         .unwrap();
 
         ready_rx.recv().unwrap();
         let (lock, cvar) = &*pair;
-        let guard = lock.lock();
+        let guard = lock.lock().unwrap();
         drop(guard);
         assert!(done_rx.recv().unwrap());
         cvar.notify_one();
@@ -407,10 +409,10 @@ mod normal_tests {
             let ready_tx = ready_tx.clone();
             let handle = thread::spawn(move || {
                 let (lock, cvar) = &*pair_clone;
-                let mut count = lock.lock();
+                let mut count = lock.lock().unwrap();
                 ready_tx.send(()).unwrap();
                 while *count == 0 {
-                    count = cvar.wait(count);
+                    count = cvar.wait(count).unwrap();
                 }
                 *count += 1;
             })
@@ -424,7 +426,7 @@ mod normal_tests {
 
         let (lock, cvar) = &*pair;
         {
-            let mut count = lock.lock();
+            let mut count = lock.lock().unwrap();
             *count = 1;
             cvar.notify_all();
         }
@@ -433,7 +435,7 @@ mod normal_tests {
             handle.join().unwrap();
         }
 
-        assert_eq!(*lock.lock(), 4);
+        assert_eq!(*lock.lock().unwrap(), 4);
     }
 
     #[test]
@@ -618,13 +620,14 @@ mod loom_tests {
         thread,
     };
     use veloq_std::sync::{
-        Arc, Condvar, Mutex, RawMutex, RawRwLock, ReentrantMutex, RwLock, RwLockWriteGuard,
+        Arc, Condvar, Mutex, RawMutex, RawRwLock, ReentrantMutex, UnpoisonedMutex,
+        UnpoisonedRwLock, UnpoisonedRwLockWriteGuard,
     };
 
     #[test]
     fn test_loom_mutex_simple() {
         loom::model(|| {
-            let lock = Arc::new(Mutex::new(0));
+            let lock = Arc::new(UnpoisonedMutex::new(0));
             let lock2 = lock.clone();
             let h = thread::spawn(move || {
                 let mut g = lock2.lock();
@@ -666,15 +669,15 @@ mod loom_tests {
 
             let handle = thread::spawn(move || {
                 let (lock, cvar) = &*pair2;
-                let mut started = lock.lock();
+                let mut started = lock.lock().unwrap();
                 *started = true;
                 cvar.notify_one();
             });
 
             let (lock, cvar) = &*pair;
-            let mut started = lock.lock();
+            let mut started = lock.lock().unwrap();
             while !*started {
-                started = cvar.wait(started);
+                started = cvar.wait(started).unwrap();
             }
             assert!(*started);
             handle.join().unwrap();
@@ -693,9 +696,9 @@ mod loom_tests {
             let returned1 = returned.clone();
             let first = thread::spawn(move || {
                 let (lock, cvar) = &*pair1;
-                let guard = lock.lock();
+                let guard = lock.lock().unwrap();
                 registered1.fetch_add(1, Ordering::Release);
-                let guard = cvar.wait(guard);
+                let guard = cvar.wait(guard).unwrap();
                 returned1.fetch_add(1, Ordering::Release);
                 drop(guard);
             });
@@ -705,9 +708,9 @@ mod loom_tests {
             let returned2 = returned.clone();
             let second = thread::spawn(move || {
                 let (lock, cvar) = &*pair2;
-                let guard = lock.lock();
+                let guard = lock.lock().unwrap();
                 registered2.fetch_add(1, Ordering::Release);
-                let guard = cvar.wait(guard);
+                let guard = cvar.wait(guard).unwrap();
                 returned2.fetch_add(1, Ordering::Release);
                 drop(guard);
             });
@@ -717,7 +720,7 @@ mod loom_tests {
             }
 
             let (lock, cvar) = &*pair;
-            let guard = lock.lock();
+            let guard = lock.lock().unwrap();
             cvar.notify_one();
             drop(guard);
 
@@ -726,7 +729,7 @@ mod loom_tests {
             }
             assert_eq!(returned.load(Ordering::Acquire), 1);
 
-            let guard = lock.lock();
+            let guard = lock.lock().unwrap();
             cvar.notify_one();
             drop(guard);
             first.join().unwrap();
@@ -743,15 +746,15 @@ mod loom_tests {
 
             let handle = thread::spawn(move || {
                 let (lock, cvar) = &*pair2;
-                let mut started = lock.lock();
+                let mut started = lock.lock().unwrap();
                 *started = true;
                 cvar.notify_all();
             });
 
             let (lock, cvar) = &*pair;
-            let mut started = lock.lock();
+            let mut started = lock.lock().unwrap();
             while !*started {
-                started = cvar.wait(started);
+                started = cvar.wait(started).unwrap();
             }
             assert!(*started);
             handle.join().unwrap();
@@ -761,7 +764,7 @@ mod loom_tests {
     #[test]
     fn test_loom_rwlock_read_write() {
         loom::model(|| {
-            let lock = Arc::new(RwLock::new(0));
+            let lock = Arc::new(UnpoisonedRwLock::new(0));
             let l1 = lock.clone();
             let l2 = lock.clone();
 
@@ -784,13 +787,13 @@ mod loom_tests {
     #[test]
     fn test_loom_rwlock_downgrade() {
         loom::model(|| {
-            let lock = Arc::new(RwLock::new(0));
+            let lock = Arc::new(UnpoisonedRwLock::new(0));
             let l1 = lock.clone();
 
             let h = thread::spawn(move || {
                 let mut w = l1.write();
                 *w = 42;
-                let r = RwLockWriteGuard::downgrade(w);
+                let r = UnpoisonedRwLockWriteGuard::downgrade(w);
                 assert_eq!(*r, 42);
             });
 

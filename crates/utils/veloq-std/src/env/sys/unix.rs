@@ -14,15 +14,15 @@ use crate::{
         unix::ffi::{OsStrExt, OsStringExt},
     },
     path::{Path, PathBuf},
-    sync::RwLock,
+    sync::UnpoisonedRwLock,
     vec,
 };
 
 #[cfg(not(feature = "loom"))]
-static ENV_LOCK: RwLock<()> = RwLock::new(());
+static ENV_LOCK: UnpoisonedRwLock<()> = UnpoisonedRwLock::new(());
 
 #[cfg(feature = "loom")]
-static ENV_LOCK: LazyLock<RwLock<()>> = LazyLock::new(|| RwLock::new(()));
+static ENV_LOCK: LazyLock<UnpoisonedRwLock<()>> = LazyLock::new(|| UnpoisonedRwLock::new(()));
 
 #[cfg(not(any(target_os = "freebsd", target_vendor = "apple")))]
 unsafe fn environ() -> *mut *const *const libc::c_char {

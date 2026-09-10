@@ -7,13 +7,25 @@ use core::{
 
 use crate::{
     cell::UnsafeCell,
+    sync::{
+        LockResult, PoisonError, TryLockError, TryLockResult, UnpoisonedMutex,
+        UnpoisonedMutexGuard, poison::PoisonState,
+    },
+    thread,
     time::{Duration, Instant},
 };
 
-pub use self::raw::RawMutex;
+use self::raw::RawMutex;
 
+/// A mutex with poisoning behavior compatible with `std::sync::Mutex`.
+///
+/// The `std` and `loom` feature configurations observe panic unwinding and set
+/// the poison flag when a mutable guard is dropped during a panic. In a
+/// `no_std` build, [`crate::thread::panicking`] cannot observe a portable panic
+/// state, so the flag is not set automatically during unwinding.
 pub struct Mutex<T: ?Sized> {
-    raw: RawMutex,
+    inner: UnpoisonedMutex<()>,
+    poison: PoisonState,
     data: UnsafeCell<T>,
 }
 
@@ -24,7 +36,8 @@ impl<T> Mutex<T> {
     #[cfg(not(feature = "loom"))]
     pub const fn new(val: T) -> Self {
         Self {
-            raw: RawMutex::new(),
+            inner: UnpoisonedMutex::new(()),
+            poison: PoisonState::new(),
             data: UnsafeCell::new(val),
         }
     }
@@ -32,14 +45,22 @@ impl<T> Mutex<T> {
     #[cfg(feature = "loom")]
     pub fn new(val: T) -> Self {
         Self {
-            raw: RawMutex::new(),
+            inner: UnpoisonedMutex::new(()),
+            poison: PoisonState::new(),
             data: UnsafeCell::new(val),
         }
     }
 
+    /// Consumes the mutex and returns its protected value.
     #[inline]
-    pub fn into_inner(self) -> T {
-        self.data.into_inner()
+    pub fn into_inner(self) -> LockResult<T> {
+        let poisoned = self.poison.is_poisoned();
+        let data = self.data.into_inner();
+        if poisoned {
+            Err(PoisonError::new(data))
+        } else {
+            Ok(data)
+        }
     }
 }
 
@@ -50,87 +71,121 @@ pub const fn const_mutex<T>(val: T) -> Mutex<T> {
 
 impl<T: ?Sized> Mutex<T> {
     #[inline]
-    pub fn lock(&self) -> MutexGuard<'_, T> {
-        self.raw.lock();
-        MutexGuard { mutex: self }
-    }
-
-    #[inline]
-    pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
-        if self.raw.try_lock() {
-            Some(MutexGuard { mutex: self })
+    fn guard<'a>(&'a self, inner: UnpoisonedMutexGuard<'a, ()>) -> LockResult<MutexGuard<'a, T>> {
+        let guard = MutexGuard {
+            mutex: self,
+            _inner: inner,
+        };
+        if self.poison.is_poisoned() {
+            Err(PoisonError::new(guard))
         } else {
-            None
+            Ok(guard)
         }
     }
 
+    /// Acquires the mutex, returning a poisoned guard when necessary.
     #[inline]
-    pub fn try_lock_for(&self, timeout: Duration) -> Option<MutexGuard<'_, T>> {
-        if self.raw.try_lock_for(timeout) {
-            Some(MutexGuard { mutex: self })
-        } else {
-            None
+    pub fn lock(&self) -> LockResult<MutexGuard<'_, T>> {
+        self.guard(self.inner.lock())
+    }
+
+    /// Attempts to acquire the mutex without blocking.
+    #[inline]
+    pub fn try_lock(&self) -> TryLockResult<MutexGuard<'_, T>> {
+        match self.inner.try_lock() {
+            Some(inner) => self.guard(inner).map_err(TryLockError::Poisoned),
+            None => Err(TryLockError::WouldBlock),
         }
     }
 
+    /// Attempts to acquire the mutex for at most `timeout`.
     #[inline]
-    pub fn try_lock_until(&self, timeout: Instant) -> Option<MutexGuard<'_, T>> {
-        if self.raw.try_lock_until(timeout) {
-            Some(MutexGuard { mutex: self })
-        } else {
-            None
+    pub fn try_lock_for(&self, timeout: Duration) -> TryLockResult<MutexGuard<'_, T>> {
+        match self.inner.try_lock_for(timeout) {
+            Some(inner) => self.guard(inner).map_err(TryLockError::Poisoned),
+            None => Err(TryLockError::WouldBlock),
         }
     }
 
+    /// Attempts to acquire the mutex until `timeout`.
+    #[inline]
+    pub fn try_lock_until(&self, timeout: Instant) -> TryLockResult<MutexGuard<'_, T>> {
+        match self.inner.try_lock_until(timeout) {
+            Some(inner) => self.guard(inner).map_err(TryLockError::Poisoned),
+            None => Err(TryLockError::WouldBlock),
+        }
+    }
+
+    /// Returns a concurrent snapshot of the poison state.
+    #[inline]
+    pub fn is_poisoned(&self) -> bool {
+        self.poison.is_poisoned()
+    }
+
+    /// Clears the poison flag after the protected data has been repaired.
+    #[inline]
+    pub fn clear_poison(&self) {
+        self.poison.clear();
+    }
+
+    /// Returns whether the underlying mutex is currently locked.
     #[inline]
     pub fn is_locked(&self) -> bool {
-        self.raw.is_locked()
+        self.inner.is_locked()
     }
 
+    /// Returns the protected value through exclusive access to the mutex.
     #[inline]
-    pub fn get_mut(&mut self) -> &mut T {
-        unsafe { &mut *self.data.with_mut(|p| p as *mut T) }
+    pub fn get_mut(&mut self) -> LockResult<&mut T> {
+        let data = unsafe { &mut *self.data.with_mut(|p| p as *mut T) };
+        if self.poison.is_poisoned() {
+            Err(PoisonError::new(data))
+        } else {
+            Ok(data)
+        }
     }
 
+    /// Returns the underlying raw mutex.
     #[inline]
     pub fn raw(&self) -> &RawMutex {
-        &self.raw
+        self.inner.raw()
     }
 }
 
 impl<T: Default> Default for Mutex<T> {
-    #[inline]
     fn default() -> Self {
         Self::new(T::default())
     }
 }
 
 impl<T> From<T> for Mutex<T> {
-    #[inline]
-    fn from(val: T) -> Self {
-        Self::new(val)
+    fn from(value: T) -> Self {
+        Self::new(value)
     }
 }
 
 impl<T: ?Sized + fmt::Debug> fmt::Debug for Mutex<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut d = f.debug_struct("Mutex");
-        if let Some(guard) = self.try_lock() {
-            d.field("data", &&*guard);
-        } else {
-            d.field("data", &"<locked>");
-        }
-        d.finish_non_exhaustive()
+        let mut debug = f.debug_struct("Mutex");
+        match self.try_lock() {
+            Ok(guard) => debug.field("data", &&*guard),
+            Err(TryLockError::Poisoned(error)) => debug.field("data", &&**error.get_ref()),
+            Err(TryLockError::WouldBlock) => debug.field("data", &"<locked>"),
+        };
+        debug.finish_non_exhaustive()
     }
 }
 
+/// A RAII guard returned by [`Mutex::lock`] and its try-lock variants.
 pub struct MutexGuard<'a, T: ?Sized> {
     mutex: &'a Mutex<T>,
+    _inner: UnpoisonedMutexGuard<'a, ()>,
 }
 
 unsafe impl<T: ?Sized + Sync> Sync for MutexGuard<'_, T> {}
 
 impl<'a, T: ?Sized> MutexGuard<'a, T> {
+    /// Returns the mutex associated with this guard.
     #[inline]
     pub fn mutex(guard: &Self) -> &'a Mutex<T> {
         guard.mutex
@@ -140,92 +195,27 @@ impl<'a, T: ?Sized> MutexGuard<'a, T> {
 impl<T: ?Sized> Deref for MutexGuard<'_, T> {
     type Target = T;
 
-    #[inline]
     fn deref(&self) -> &Self::Target {
         unsafe { &*self.mutex.data.with(|p| p as *const T) }
     }
 }
 
 impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
-    #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { &mut *self.mutex.data.with_mut(|p| p as *mut T) }
     }
 }
 
 impl<T: ?Sized> Drop for MutexGuard<'_, T> {
-    #[inline]
     fn drop(&mut self) {
-        unsafe { self.mutex.raw.unlock() };
+        if thread::panicking() {
+            self.mutex.poison.poison();
+        }
     }
 }
 
 impl<T: ?Sized + fmt::Debug> fmt::Debug for MutexGuard<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&**self, f)
-    }
-}
-
-#[cfg(all(test, not(feature = "loom")))]
-mod tests {
-    use crate::{
-        sync::{Arc, Mutex},
-        thread,
-        time::{Duration, Instant},
-        vec::Vec,
-    };
-
-    #[test]
-    fn test_mutex_basic() {
-        let m = Mutex::new(0);
-        {
-            let mut guard = m.lock();
-            *guard = 42;
-        }
-        assert_eq!(*m.lock(), 42);
-        assert!(m.try_lock().is_some());
-    }
-
-    #[test]
-    fn test_mutex_threads() {
-        let mutex = Arc::new(Mutex::new(0));
-        let num_threads = 4;
-        let mut handles = Vec::new();
-
-        for _ in 0..num_threads {
-            let m = mutex.clone();
-            let handle = thread::spawn(move || {
-                for _ in 0..100 {
-                    let mut guard = m.lock();
-                    *guard += 1;
-                }
-            })
-            .unwrap();
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
-        assert_eq!(*mutex.lock(), num_threads * 100);
-    }
-
-    #[test]
-    fn test_mutex_timed() {
-        let mutex = Arc::new(Mutex::new(0));
-        let m = mutex.clone();
-        let guard = mutex.lock();
-
-        let handle = thread::spawn(move || {
-            let start = Instant::now();
-            let res = m.try_lock_for(Duration::from_millis(10));
-            assert!(res.is_none()); // Should fail to acquire because guard is held
-            assert!(start.elapsed() >= Duration::from_millis(10));
-        })
-        .unwrap();
-
-        handle.join().unwrap();
-        drop(guard);
     }
 }

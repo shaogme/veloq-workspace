@@ -2,7 +2,7 @@ use core::{fmt, ptr::null_mut, sync::atomic::Ordering, time::Duration};
 
 use crate::{
     sync::{
-        Mutex, MutexGuard, RawMutex,
+        LockResult, Mutex, MutexGuard, UnpoisonedMutex, UnpoisonedMutexGuard,
         atomic::{AtomicPtr, AtomicU32},
     },
     time::Instant,
@@ -159,7 +159,7 @@ impl Waiter {
 /// 队列保存的节点都是调用方栈上的对象；节点必须保持存活到它被超时摘除，或由
 /// 通知者完成 `NOTIFYING -> NOTIFIED` 并释放队列锁之后。
 struct WaitQueue {
-    lock: RawMutex,
+    lock: UnpoisonedMutex<()>,
     head: AtomicPtr<Waiter>,
     tail: AtomicPtr<Waiter>,
 }
@@ -168,7 +168,7 @@ struct WaitQueue {
 impl WaitQueue {
     const fn new() -> Self {
         Self {
-            lock: RawMutex::new(),
+            lock: UnpoisonedMutex::new(()),
             head: AtomicPtr::new(null_mut()),
             tail: AtomicPtr::new(null_mut()),
         }
@@ -179,7 +179,7 @@ impl WaitQueue {
 impl WaitQueue {
     fn new() -> Self {
         Self {
-            lock: RawMutex::new(),
+            lock: UnpoisonedMutex::new(()),
             head: AtomicPtr::new(null_mut()),
             tail: AtomicPtr::new(null_mut()),
         }
@@ -188,13 +188,16 @@ impl WaitQueue {
 
 impl WaitQueue {
     fn lock(&self) -> WaitQueueGuard<'_> {
-        self.lock.lock();
-        WaitQueueGuard { queue: self }
+        WaitQueueGuard {
+            queue: self,
+            _lock: self.lock.lock(),
+        }
     }
 }
 
 struct WaitQueueGuard<'a> {
     queue: &'a WaitQueue,
+    _lock: UnpoisonedMutexGuard<'a, ()>,
 }
 
 impl WaitQueueGuard<'_> {
@@ -314,11 +317,7 @@ impl WaitQueueGuard<'_> {
 }
 
 impl Drop for WaitQueueGuard<'_> {
-    fn drop(&mut self) {
-        // SAFETY: this guard is created only after locking `queue.lock` and is dropped
-        // exactly once while owning that lock.
-        unsafe { self.queue.lock.unlock() };
-    }
+    fn drop(&mut self) {}
 }
 
 /// 条件变量。
@@ -363,8 +362,26 @@ impl Condvar {
         mutex
     }
 
+    fn register_unpoisoned<'a, T>(
+        &self,
+        waiter: &mut Waiter,
+        guard: UnpoisonedMutexGuard<'a, T>,
+    ) -> &'a UnpoisonedMutex<T> {
+        let mutex = UnpoisonedMutexGuard::mutex(&guard);
+        {
+            let queue = self.waiters.lock();
+            // SAFETY: `waiter` remains on this stack frame until all notification or
+            // cancellation ownership has been completed.
+            unsafe { queue.push_back(waiter) };
+            // Keep the queue lock while releasing the external mutex. This closes the
+            // registration window for callers that update their predicate under it.
+            drop(guard);
+        }
+        mutex
+    }
+
     /// 阻塞当前线程，直到此条件变量收到通知。
-    pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+    pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> LockResult<MutexGuard<'a, T>> {
         let mut waiter = Waiter::new();
         let mutex = self.register(&mut waiter, guard);
         waiter.wait(&self.waiters);
@@ -376,7 +393,7 @@ impl Condvar {
         &self,
         guard: MutexGuard<'a, T>,
         dur: Duration,
-    ) -> (MutexGuard<'a, T>, WaitTimeoutResult) {
+    ) -> (LockResult<MutexGuard<'a, T>>, WaitTimeoutResult) {
         let mut waiter = Waiter::new();
         let mutex = self.register(&mut waiter, guard);
         let timed_out = waiter.wait_timeout(&self.waiters, dur);
@@ -437,6 +454,75 @@ impl Condvar {
 }
 
 impl Default for Condvar {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A condition variable paired with [`UnpoisonedMutex`].
+///
+/// This variant is intended for synchronization protocols whose recovery path
+/// is explicit and must not acquire poison bookkeeping overhead. It shares the
+/// same waiter and timeout implementation as [`Condvar`].
+pub struct UnpoisonedCondvar {
+    inner: Condvar,
+}
+
+impl UnpoisonedCondvar {
+    /// Creates a new unpoisoned condition variable.
+    #[cfg(not(feature = "loom"))]
+    pub const fn new() -> Self {
+        Self {
+            inner: Condvar::new(),
+        }
+    }
+
+    /// Creates a new unpoisoned condition variable.
+    #[cfg(feature = "loom")]
+    pub fn new() -> Self {
+        Self {
+            inner: Condvar::new(),
+        }
+    }
+
+    /// Blocks until notified, returning the reacquired unpoisoned guard.
+    pub fn wait<'a, T>(&self, guard: UnpoisonedMutexGuard<'a, T>) -> UnpoisonedMutexGuard<'a, T> {
+        let mut waiter = Waiter::new();
+        let mutex = self.inner.register_unpoisoned(&mut waiter, guard);
+        waiter.wait(&self.inner.waiters);
+        mutex.lock()
+    }
+
+    /// Blocks until notified or `dur` expires.
+    pub fn wait_timeout<'a, T>(
+        &self,
+        guard: UnpoisonedMutexGuard<'a, T>,
+        dur: Duration,
+    ) -> (UnpoisonedMutexGuard<'a, T>, WaitTimeoutResult) {
+        let mut waiter = Waiter::new();
+        let mutex = self.inner.register_unpoisoned(&mut waiter, guard);
+        let timed_out = waiter.wait_timeout(&self.inner.waiters, dur);
+        (mutex.lock(), WaitTimeoutResult(timed_out))
+    }
+
+    /// Wakes one waiting thread.
+    pub fn notify_one(&self) {
+        self.inner.notify_one();
+    }
+
+    /// Wakes all waiting threads.
+    pub fn notify_all(&self) {
+        self.inner.notify_all();
+    }
+}
+
+impl fmt::Debug for UnpoisonedCondvar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UnpoisonedCondvar").finish_non_exhaustive()
+    }
+}
+
+impl Default for UnpoisonedCondvar {
     fn default() -> Self {
         Self::new()
     }

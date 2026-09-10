@@ -138,11 +138,6 @@ set! {
             source: RuntimeDriverError,
         },
 
-        #[display("mutex poisoned: {component}")]
-        PoisonedLock {
-            component: &'static str,
-        },
-
         #[display("runtime binding is missing")]
         MissingRuntimeBinding,
 

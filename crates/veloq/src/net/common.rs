@@ -4,7 +4,7 @@ use veloq_std::{
     ops::Deref,
     ptr::null_mut,
     rc::Rc,
-    sync::{Arc, Mutex},
+    sync::{Arc, UnpoisonedMutex},
 };
 
 use crate::{
@@ -45,8 +45,8 @@ pub struct SocketToken<'rt> {
     fd: IoFd,
     owner_worker_id: usize,
     ctx: Ctx<'rt>,
-    accept_stash: Mutex<Option<StashedBox>>,
-    recv_stash: Mutex<Option<StashedBox>>,
+    accept_stash: UnpoisonedMutex<Option<StashedBox>>,
+    recv_stash: UnpoisonedMutex<Option<StashedBox>>,
 }
 
 impl<'rt> SocketToken<'rt> {
@@ -67,8 +67,8 @@ impl<'rt> SocketToken<'rt> {
             fd,
             owner_worker_id: ctx.runtime_ctx.worker_id(),
             ctx,
-            accept_stash: Mutex::new(None),
-            recv_stash: Mutex::new(None),
+            accept_stash: UnpoisonedMutex::new(None),
+            recv_stash: UnpoisonedMutex::new(None),
         })
     }
 
