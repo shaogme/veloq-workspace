@@ -109,6 +109,8 @@ macro_rules! impl_once {
         impl $name {
             $(impl_once!(@new_fn $is_const, $atomic_ty);)?
 
+            $(impl_once!(@new_complete_fn $is_const, $atomic_ty);)?
+
             #[inline]
             pub fn is_completed(&self) -> bool {
                 self.state_and_queued.load(Acquire) == COMPLETE
@@ -276,6 +278,24 @@ macro_rules! impl_once {
         pub fn new() -> Self {
             Self {
                 state_and_queued: <$atomic_ty>::new(INCOMPLETE),
+            }
+        }
+    };
+
+    (@new_complete_fn const, $atomic_ty:ty) => {
+        #[inline]
+        pub(crate) const fn new_complete() -> Self {
+            Self {
+                state_and_queued: <$atomic_ty>::new(COMPLETE),
+            }
+        }
+    };
+
+    (@new_complete_fn non_const, $atomic_ty:ty) => {
+        #[inline]
+        pub(crate) fn new_complete() -> Self {
+            Self {
+                state_and_queued: <$atomic_ty>::new(COMPLETE),
             }
         }
     };

@@ -1,5 +1,6 @@
 mod barrier;
 mod condvar;
+mod lazy_lock;
 pub mod mutex;
 mod once;
 mod once_lock;
@@ -19,6 +20,7 @@ pub use condvar::{
     NativeCondvar, NativeUnpoisonedCondvar, WaitTimeoutResult, const_native_condvar,
     const_native_unpoisoned_condvar,
 };
+pub use lazy_lock::{LazyLock, NativeLazyLock};
 pub use once::{NativeOnce, Once, OnceState};
 pub use once_lock::{NativeOnceLock, OnceLock};
 pub use poison::{LockResult, PoisonError, TryLockError, TryLockResult};
@@ -114,6 +116,9 @@ pub use unpoisoned_rwlock::{
 pub use unpoisoned_rwlock::{
     UnpoisonedRwLock, UnpoisonedRwLockReadGuard, UnpoisonedRwLockWriteGuard,
 };
+
+#[cfg(feature = "loom")]
+pub use lazy_lock::LoomLazyLock;
 
 #[cfg(feature = "loom")]
 pub use once::LoomOnce;

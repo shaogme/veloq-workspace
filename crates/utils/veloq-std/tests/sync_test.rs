@@ -2,6 +2,8 @@
 mod barrier_test;
 #[path = "sync_test/condvar_test.rs"]
 mod condvar_test;
+#[path = "sync_test/lazy_lock_test.rs"]
+mod lazy_lock_test;
 #[path = "sync_test/mpsc_test.rs"]
 mod mpsc_test;
 #[path = "sync_test/mutex_test.rs"]
