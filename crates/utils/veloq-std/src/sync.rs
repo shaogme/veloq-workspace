@@ -14,13 +14,18 @@ pub mod unpoisoned_rwlock;
 pub mod atomic;
 pub mod mpsc;
 
-pub use barrier::{Barrier, BarrierWaitResult};
-pub use condvar::{Condvar, UnpoisonedCondvar, WaitTimeoutResult};
+pub use barrier::{BarrierWaitResult, NativeBarrier, const_native_barrier};
+pub use condvar::{
+    NativeCondvar, NativeUnpoisonedCondvar, WaitTimeoutResult, const_native_condvar,
+    const_native_unpoisoned_condvar,
+};
 pub use once::{NativeOnce, Once, OnceState};
 pub use once_lock::{NativeOnceLock, OnceLock};
 pub use poison::{LockResult, PoisonError, TryLockError, TryLockResult};
-pub use reentrant_mutex::{ReentrantMutex, ReentrantMutexGuard};
-pub use spin_lock::{SpinLock, SpinLockGuard};
+pub use reentrant_mutex::{
+    NativeReentrantMutex, NativeReentrantMutexGuard, const_native_reentrant_mutex,
+};
+pub use spin_lock::{NativeSpinLock, NativeSpinLockGuard, const_native_spin_lock};
 
 #[cfg(not(feature = "loom"))]
 pub use alloc_crate::sync::Arc;
@@ -56,10 +61,19 @@ pub use unpoisoned_rwlock::{
 };
 
 #[cfg(not(feature = "loom"))]
-pub use mutex::const_mutex;
+pub use barrier::{Barrier, const_barrier};
 
 #[cfg(not(feature = "loom"))]
-pub use reentrant_mutex::const_reentrant_mutex;
+pub use condvar::{Condvar, UnpoisonedCondvar, const_condvar, const_unpoisoned_condvar};
+
+#[cfg(not(feature = "loom"))]
+pub use reentrant_mutex::{ReentrantMutex, ReentrantMutexGuard, const_reentrant_mutex};
+
+#[cfg(not(feature = "loom"))]
+pub use spin_lock::{SpinLock, SpinLockGuard, const_spin_lock};
+
+#[cfg(not(feature = "loom"))]
+pub use mutex::const_mutex;
 
 #[cfg(not(feature = "loom"))]
 pub use rwlock::const_rwlock;
@@ -106,3 +120,17 @@ pub use once::LoomOnce;
 
 #[cfg(feature = "loom")]
 pub use once_lock::LoomOnceLock;
+
+#[cfg(feature = "loom")]
+pub use barrier::{Barrier, LoomBarrier};
+
+#[cfg(feature = "loom")]
+pub use condvar::{Condvar, LoomCondvar, LoomUnpoisonedCondvar, UnpoisonedCondvar};
+
+#[cfg(feature = "loom")]
+pub use reentrant_mutex::{
+    LoomReentrantMutex, LoomReentrantMutexGuard, ReentrantMutex, ReentrantMutexGuard,
+};
+
+#[cfg(feature = "loom")]
+pub use spin_lock::{LoomSpinLock, LoomSpinLockGuard, SpinLock, SpinLockGuard};

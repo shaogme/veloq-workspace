@@ -3,9 +3,6 @@ use core::{
     fmt::{self, Debug, Formatter},
 };
 
-#[cfg(feature = "loom")]
-use loom::cell::UnsafeCell as LoomCell;
-
 pub use core::cell::{Cell, RefCell, RefMut};
 
 #[repr(transparent)]
@@ -56,7 +53,7 @@ impl<T: ?Sized> NativeUnsafeCell<T> {
 #[cfg(feature = "loom")]
 #[repr(transparent)]
 pub struct LoomUnsafeCell<T: ?Sized> {
-    inner: LoomCell<T>,
+    inner: loom::cell::UnsafeCell<T>,
 }
 
 #[cfg(feature = "loom")]
@@ -70,7 +67,7 @@ impl<T: ?Sized + Debug> Debug for LoomUnsafeCell<T> {
 impl<T> LoomUnsafeCell<T> {
     pub fn new(data: T) -> Self {
         Self {
-            inner: LoomCell::new(data),
+            inner: loom::cell::UnsafeCell::new(data),
         }
     }
 

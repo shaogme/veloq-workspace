@@ -16,3 +16,5 @@ mod poison_test;
 mod reentrant_mutex_test;
 #[path = "sync_test/rwlock_test.rs"]
 mod rwlock_test;
+#[path = "sync_test/spin_lock_test.rs"]
+mod spin_lock_test;
