@@ -1,5 +1,5 @@
 use crate::{
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{LoomAtomicU32, Ordering},
     time::Duration,
 };
 
@@ -17,7 +17,7 @@ impl WaitChannel {
     }
 
     /// 模拟操作系统 Futex 挂起：在持锁保护下检查 address == expected，若相等则等待一次唤醒后返回。
-    pub fn wait(&self, address: &AtomicU32, expected: u32) {
+    pub fn wait(&self, address: &LoomAtomicU32, expected: u32) {
         let guard = self.mutex.lock().unwrap();
         if address.load(Ordering::Acquire) == expected {
             let _ = self.cvar.wait(guard).unwrap();
@@ -25,7 +25,7 @@ impl WaitChannel {
     }
 
     /// 模拟操作系统 Futex 超时挂起。返回是否未超时。
-    pub fn wait_timeout(&self, address: &AtomicU32, expected: u32, dur: Duration) -> bool {
+    pub fn wait_timeout(&self, address: &LoomAtomicU32, expected: u32, dur: Duration) -> bool {
         let guard = self.mutex.lock().unwrap();
         if address.load(Ordering::Acquire) == expected {
             let (_guard, res) = self.cvar.wait_timeout(guard, dur).unwrap();
@@ -42,7 +42,7 @@ impl WaitChannel {
     }
 
     /// 在节点通道锁内发布最终通知，避免状态检查和通道唤醒之间出现窗口。
-    pub fn finish_notify(&self, address: &AtomicU32, notified: u32) -> u32 {
+    pub fn finish_notify(&self, address: &LoomAtomicU32, notified: u32) -> u32 {
         let _g = self.mutex.lock().unwrap();
         let previous = address.swap(notified, Ordering::AcqRel);
         self.cvar.notify_one();
@@ -62,16 +62,15 @@ impl Default for WaitChannel {
     }
 }
 
-pub fn wait_on_address(address: &AtomicU32, expected: u32) {
+pub fn wait_on_address(address: &LoomAtomicU32, expected: u32) {
     wait_on_address_timeout(address, expected, None);
 }
 
 pub fn wait_on_address_timeout(
-    address: &AtomicU32,
+    address: &LoomAtomicU32,
     expected: u32,
     timeout: Option<Duration>,
 ) -> bool {
-    use core::sync::atomic::Ordering;
     let is_timeout = timeout.is_some();
     let mut limit = if is_timeout { 10 } else { 1000 };
 
@@ -87,6 +86,6 @@ pub fn wait_on_address_timeout(
     false
 }
 
-pub fn wake_by_address(_address: &AtomicU32) {}
+pub fn wake_by_address(_address: &LoomAtomicU32) {}
 
-pub fn wake_all_by_address(_address: &AtomicU32) {}
+pub fn wake_all_by_address(_address: &LoomAtomicU32) {}

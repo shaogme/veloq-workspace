@@ -1,11 +1,8 @@
-use crate::{ffi::c_void, sync::atomic::NativeAtomicU32};
+use crate::{ffi::c_void, sync::atomic::NativeAtomicU32, time::Duration};
 use windows_sys::Win32::{
     Foundation::GetLastError,
     System::Threading::{INFINITE, WaitOnAddress, WakeByAddressAll, WakeByAddressSingle},
 };
-
-#[cfg(not(feature = "loom"))]
-use crate::time::Duration;
 
 pub fn wait_on_address(address: &NativeAtomicU32, expected: u32) {
     unsafe {
@@ -24,7 +21,6 @@ pub fn wake_all_by_address(address: &NativeAtomicU32) {
     }
 }
 
-#[cfg(not(feature = "loom"))]
 pub fn wait_on_address_timeout(
     address: &NativeAtomicU32,
     expected: u32,
@@ -62,7 +58,6 @@ pub fn wait_on_address_timeout(
     }
 }
 
-#[cfg(not(feature = "loom"))]
 pub fn wake_by_address(address: &NativeAtomicU32) {
     unsafe {
         WakeByAddressSingle(address.as_ptr() as *const c_void);

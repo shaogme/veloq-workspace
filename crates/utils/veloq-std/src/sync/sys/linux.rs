@@ -1,10 +1,5 @@
-use crate::sync::atomic::NativeAtomicU32;
-use veloq_futex::{FutexError, wait, wake};
-
-#[cfg(not(feature = "loom"))]
-use crate::time::Duration;
-#[cfg(not(feature = "loom"))]
-use veloq_futex::WaitOutcome;
+use crate::{sync::atomic::NativeAtomicU32, time::Duration};
+use veloq_futex::{FutexError, WaitOutcome, wait, wake};
 
 fn fail(operation: &str, error: FutexError) -> ! {
     panic!("veloq-std {operation} failed: {error}");
@@ -24,7 +19,6 @@ pub fn wake_all_by_address(address: &NativeAtomicU32) {
     }
 }
 
-#[cfg(not(feature = "loom"))]
 pub fn wait_on_address_timeout(
     address: &NativeAtomicU32,
     expected: u32,
@@ -38,7 +32,6 @@ pub fn wait_on_address_timeout(
     }
 }
 
-#[cfg(not(feature = "loom"))]
 pub fn wake_by_address(address: &NativeAtomicU32) {
     let result = unsafe { wake(address.as_ptr() as *const u32, 1) };
     if let Err(error) = result {

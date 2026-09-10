@@ -1,6 +1,9 @@
 use core::fmt;
 
-use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::sync::atomic::{NativeAtomicBool, Ordering};
+
+#[cfg(feature = "loom")]
+use crate::sync::atomic::LoomAtomicBool;
 
 /// A value returned when a lock was acquired after its protected data may have
 /// been left inconsistent by a panic.
@@ -88,22 +91,43 @@ impl<T> fmt::Display for TryLockError<T> {
 
 impl<T> core::error::Error for TryLockError<T> {}
 
-pub(crate) struct PoisonState {
-    poisoned: AtomicBool,
+pub(crate) struct NativePoisonState {
+    poisoned: NativeAtomicBool,
 }
 
-impl PoisonState {
-    #[cfg(not(feature = "loom"))]
+impl NativePoisonState {
     pub(crate) const fn new() -> Self {
         Self {
-            poisoned: AtomicBool::new(false),
+            poisoned: NativeAtomicBool::new(false),
         }
     }
 
-    #[cfg(feature = "loom")]
+    #[inline]
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub(crate) fn poison(&self) {
+        self.poisoned.store(true, Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn clear(&self) {
+        self.poisoned.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(feature = "loom")]
+pub(crate) struct LoomPoisonState {
+    poisoned: LoomAtomicBool,
+}
+
+#[cfg(feature = "loom")]
+impl LoomPoisonState {
     pub(crate) fn new() -> Self {
         Self {
-            poisoned: AtomicBool::new(false),
+            poisoned: LoomAtomicBool::new(false),
         }
     }
 
