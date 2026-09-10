@@ -64,6 +64,14 @@ impl WaitChannel {
         self.cvar.notify_one();
     }
 
+    /// 在节点通道锁内发布最终通知，避免状态检查和通道唤醒之间出现窗口。
+    pub fn finish_notify(&self, address: &AtomicU32, notified: u32) -> u32 {
+        let _g = self.mutex.lock().unwrap();
+        let previous = address.swap(notified, Ordering::AcqRel);
+        self.cvar.notify_one();
+        previous
+    }
+
     /// 广播唤醒所有挂起的等待者。
     pub fn wake_all(&self) {
         let _g = self.mutex.lock().unwrap();

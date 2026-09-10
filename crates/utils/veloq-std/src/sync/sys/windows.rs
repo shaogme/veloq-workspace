@@ -15,10 +15,16 @@ pub fn wait_on_address_timeout(
 ) -> bool {
     let ms = match timeout {
         Some(dur) => {
-            if dur.as_millis() > INFINITE as u128 {
+            let millis = dur.as_millis();
+            let rounded_millis = if dur.subsec_nanos() % 1_000_000 == 0 {
+                millis
+            } else {
+                millis.saturating_add(1)
+            };
+            if rounded_millis > INFINITE as u128 {
                 INFINITE
             } else {
-                dur.as_millis() as u32
+                rounded_millis as u32
             }
         }
         None => INFINITE,
