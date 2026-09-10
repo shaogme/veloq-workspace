@@ -1,3 +1,5 @@
+#[path = "sync_test/barrier_test.rs"]
+mod barrier_test;
 #[path = "sync_test/condvar_test.rs"]
 mod condvar_test;
 #[path = "sync_test/mpsc_test.rs"]

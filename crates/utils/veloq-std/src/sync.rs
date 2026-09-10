@@ -1,3 +1,4 @@
+mod barrier;
 mod condvar;
 mod mutex;
 mod once;
@@ -13,6 +14,7 @@ mod unpoisoned_rwlock;
 pub mod atomic;
 pub mod mpsc;
 
+pub use barrier::{Barrier, BarrierWaitResult};
 pub use condvar::{Condvar, UnpoisonedCondvar, WaitTimeoutResult};
 pub use mutex::raw::RawMutex;
 pub use mutex::{Mutex, MutexGuard};

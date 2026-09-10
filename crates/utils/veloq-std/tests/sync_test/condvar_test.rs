@@ -165,7 +165,13 @@ mod normal_tests {
 
 #[cfg(feature = "loom")]
 mod loom_tests {
-    use loom::{sync::Arc, thread};
+    use loom::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        thread,
+    };
     use veloq_std::sync::{Condvar, Mutex};
 
     #[test]
