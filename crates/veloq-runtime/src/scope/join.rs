@@ -3,7 +3,7 @@ use super::{
     router::{RoutedSpawnState, RoutedTakeReadyOutcome, RoutedTakeResult, RoutedTaskAccess},
 };
 use crate::{
-    error::{Result as RuntimeResult, RuntimeError},
+    error::{EnqueueError, Result as RuntimeResult, RuntimeError},
     runtime::cancellation::{CancelledFuture, GenericCancellationToken},
     task::{
         Arena, GenericTaskHeader, GenericWakerNode, LocalTaskRef, SendTaskRef, TaskError,
@@ -28,6 +28,8 @@ use veloq_storage::{AtomicStorage, StateLock, Storage};
 pub enum JoinOutcome<T> {
     /// The task completed successfully.
     Ok(T),
+    /// The task could not be published to its owner worker's local queue.
+    Rejected(EnqueueError),
     /// The task failed due to cancellation or panic during execution.
     TaskErr(TaskError),
     /// The runtime encountered a protocol or infrastructure error while joining.
@@ -38,6 +40,7 @@ impl<T> JoinOutcome<T> {
     pub fn unwrap(self) -> T {
         match self {
             Self::Ok(value) => value,
+            Self::Rejected(err) => panic!("task rejected: {err}"),
             Self::TaskErr(err) => panic!("task error: {err:?}"),
             Self::RuntimeErr(err) => panic!("runtime error: {err}"),
         }
@@ -45,6 +48,7 @@ impl<T> JoinOutcome<T> {
     pub fn expect(self, msg: &str) -> T {
         match self {
             Self::Ok(value) => value,
+            Self::Rejected(err) => panic!("{msg}: task rejected: {err}"),
             Self::TaskErr(err) => panic!("{msg}: task error: {err:?}"),
             Self::RuntimeErr(err) => panic!("{msg}: runtime error: {err}"),
         }
@@ -72,7 +76,9 @@ pub(crate) enum JoinSource<'scope_ref, T, R: TaskHandleRef> {
 /// As a `Future`, `await` waits until the task has **finished executing**, not merely
 /// until cancellation has been requested. If the task ends due to cancellation, the
 /// result is [`JoinOutcome::TaskErr`] with [`TaskError::Cancelled`]. For immediate
-/// notification when cancellation is requested, use [`JoinHandle::cancelled`].
+/// notification when cancellation is requested, use [`JoinHandle::cancelled`]. A local task
+/// whose owner queue is full completes as [`JoinOutcome::Rejected`] with the worker and queue
+/// capacity; this is distinct from cancellation and does not imply that the task was polled.
 ///
 /// A join handle has a single owner. Its `poll`, `cancel`, `is_finished`,
 /// `is_cancel_requested`, and `Drop` operations must not run concurrently. In
@@ -312,7 +318,9 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TEx
                 if header.is_reclaimable() {
                     Self::remove_waker_on(&mut this.waker_node, header);
                     let lease = TaskLease::new(this.allocation.take());
-                    let outcome = if let Some(res) = gate.take_result_erased() {
+                    let outcome = if let Some(reason) = header.take_enqueue_rejection() {
+                        JoinOutcome::Rejected(reason)
+                    } else if let Some(res) = gate.take_result_erased() {
                         match res {
                             Ok(value) => JoinOutcome::Ok(value),
                             Err(err) => JoinOutcome::TaskErr(err),

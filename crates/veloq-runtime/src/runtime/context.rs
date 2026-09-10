@@ -2,12 +2,13 @@ use core::cell::UnsafeCell;
 use std::{
     future::{Future, poll_fn},
     marker::PhantomData,
+    mem::replace,
     num::NonZeroUsize,
     ops::AsyncFnOnce,
     panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
     ptr::NonNull,
-    sync::{Arc, Mutex},
+    sync::Arc,
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -27,7 +28,7 @@ use crate::{
 
 use crossbeam_deque::Worker;
 use diagweave::prelude::*;
-use veloq_storage::AtomicStorage;
+use veloq_storage::{AtomicLock, AtomicStorage, StateLock};
 use veloq_waker::MwsrWaker;
 
 /// Worker 空闲时的等待策略。
@@ -145,6 +146,155 @@ impl<'rt, T> IntoRuntimeCtx<'rt, T> for &RuntimeCtx<'rt, T> {
     }
 }
 
+#[repr(C)]
+struct RouteJobTask<'scope_ref, F, Fut> {
+    header: TaskHeader,
+    job: UnsafeCell<Option<F>>,
+    slot: Arc<RouteCell<Fut>>,
+    marker: PhantomData<&'scope_ref ()>,
+}
+
+struct RouteTaskFinalizer<'a, Fut> {
+    header: &'a TaskHeader,
+    slot: &'a RouteCell<Fut>,
+    published: bool,
+    finalized: bool,
+}
+
+impl<'a, Fut> RouteTaskFinalizer<'a, Fut> {
+    fn new(header: &'a TaskHeader, slot: &'a RouteCell<Fut>) -> Self {
+        Self {
+            header,
+            slot,
+            published: false,
+            finalized: false,
+        }
+    }
+
+    fn publish_ok(&mut self, future: Fut) {
+        if !self.published {
+            self.slot.publish(future);
+            self.published = true;
+        }
+    }
+
+    fn publish_err(&mut self, error: Report<RuntimeError>) {
+        if !self.published {
+            self.slot.publish_error_if_pending(error);
+            self.published = true;
+        }
+    }
+
+    fn finish(&mut self) {
+        if !self.finalized {
+            self.finalized = true;
+            self.header.complete_external_poll();
+        }
+    }
+}
+
+impl<Fut> Drop for RouteTaskFinalizer<'_, Fut> {
+    fn drop(&mut self) {
+        if !self.published {
+            self.slot.publish_error_if_pending(route_error(
+                "RuntimeCtx::route_to::RouteTaskFinalizer::drop",
+                "route task exited without publishing a result",
+            ));
+        }
+        if !self.finalized {
+            self.header.complete_external_poll();
+        }
+    }
+}
+
+fn route_error(site: &'static str, detail: impl Into<String>) -> Report<RuntimeError> {
+    RuntimeError::InvariantViolation {
+        site,
+        detail: detail.into().into(),
+    }
+    .to_report()
+    .with_category("runtime.route")
+}
+
+impl<'scope_ref, F, Fut> RawTask for RouteJobTask<'scope_ref, F, Fut>
+where
+    F: FnOnce() -> Fut + Send + 'scope_ref,
+    Fut: Future + Send + 'scope_ref,
+{
+    type Storage = AtomicStorage;
+
+    fn poll_raw(&self, _worker_id: usize) -> Result<bool> {
+        match self.header.try_enter_poll() {
+            PollStatus::Complete => return Ok(true),
+            PollStatus::Yield => return Ok(false),
+            PollStatus::Proceed => {}
+        }
+
+        let mut finalizer = RouteTaskFinalizer::new(&self.header, &self.slot);
+        let operation = catch_unwind(AssertUnwindSafe(|| {
+            let Some(job) = (unsafe { &mut *self.job.get() }).take() else {
+                finalizer.publish_err(route_error(
+                    "RuntimeCtx::route_to::RouteJobTask::poll_raw",
+                    "job already taken",
+                ));
+                return;
+            };
+
+            match catch_unwind(AssertUnwindSafe(job)) {
+                Ok(future) => finalizer.publish_ok(future),
+                Err(_) => finalizer.publish_err(route_error(
+                    "RuntimeCtx::route_to::RouteJobTask::poll_raw",
+                    "route job panicked",
+                )),
+            }
+        }));
+
+        if operation.is_err() {
+            finalizer.publish_err(route_error(
+                "RuntimeCtx::route_to::RouteJobTask::poll_raw",
+                "route task infrastructure panicked",
+            ));
+        }
+        finalizer.finish();
+        Ok(true)
+    }
+
+    fn header(&self) -> &GenericTaskHeader<Self::Storage> {
+        &self.header
+    }
+}
+
+impl<F, Fut> Drop for RouteJobTask<'_, F, Fut> {
+    fn drop(&mut self) {
+        self.slot.publish_error_if_pending(
+            RuntimeError::ShutdownBeforeCompletion
+                .to_report()
+                .with_category("runtime.route"),
+        );
+    }
+}
+
+impl<'scope_ref, F, Fut> RouteJobTask<'scope_ref, F, Fut>
+where
+    F: FnOnce() -> Fut + Send + 'scope_ref,
+    Fut: Future + Send + 'scope_ref,
+{
+    const VTABLE: &'static TaskVTable<AtomicStorage> = &TaskVTable {
+        wake: |_| {},
+        wake_by_ref: |_| {},
+        poll: |header, worker_id| unsafe {
+            let raw_ptr = header as *const GenericTaskHeader<AtomicStorage> as *const Self;
+            let node = &*raw_ptr;
+            RawTask::poll_raw(node, worker_id)
+        },
+        drop: |data| unsafe {
+            let ptr = data.as_ptr() as *mut Self;
+            drop(Box::from_raw(ptr));
+        },
+        drop_after_poll: true,
+    };
+}
+
 impl<'rt, T> RuntimeCtx<'rt, T> {
     pub(crate) fn new(shared: &'rt RuntimeShared<T>) -> Self {
         Self {
@@ -242,104 +392,6 @@ impl<'rt, T> RuntimeCtx<'rt, T> {
         let slot = RouteCell::new();
         let slot_for_job = slot.clone();
 
-        #[repr(C)]
-        struct RouteJobTask<'scope_ref, F, Fut> {
-            header: TaskHeader,
-            job: UnsafeCell<Option<F>>,
-            slot: Arc<RouteCell<Fut>>,
-            marker: PhantomData<&'scope_ref ()>,
-        }
-
-        impl<'scope_ref, F, Fut> RawTask for RouteJobTask<'scope_ref, F, Fut>
-        where
-            F: FnOnce() -> Fut + Send + 'scope_ref,
-            Fut: Future + Send + 'scope_ref,
-        {
-            type Storage = AtomicStorage;
-
-            fn poll_raw(&self, _worker_id: usize) -> Result<bool> {
-                match self.header.try_enter_poll() {
-                    PollStatus::Complete => return Ok(true),
-                    PollStatus::Yield => return Ok(false),
-                    PollStatus::Proceed => {}
-                }
-
-                let Some(job) = (unsafe { &mut *self.job.get() }).take() else {
-                    let _ = self.slot.fail(
-                        RuntimeError::InvariantViolation {
-                            site: "RuntimeCtx::route_to::RouteJobTask::poll_raw",
-                            detail: "job already taken".into(),
-                        }
-                        .to_report()
-                        .with_category("runtime.route"),
-                    );
-                    self.finish();
-                    return Ok(true);
-                };
-
-                match catch_unwind(AssertUnwindSafe(job)) {
-                    Ok(fut) => {
-                        if let Err(err) = self.slot.set(fut) {
-                            let _ = self.slot.fail(
-                                RuntimeError::InvariantViolation {
-                                    site: "RuntimeCtx::route_to::RouteJobTask::poll_raw",
-                                    detail: format!("route result slot rejected value: {err}")
-                                        .into(),
-                                }
-                                .to_report()
-                                .with_category("runtime.route"),
-                            );
-                        }
-                    }
-                    Err(_) => {
-                        let _ = self.slot.fail(
-                            RuntimeError::InvariantViolation {
-                                site: "RuntimeCtx::route_to::RouteJobTask::poll_raw",
-                                detail: "route job panicked".into(),
-                            }
-                            .to_report()
-                            .with_category("runtime.route"),
-                        );
-                    }
-                }
-
-                self.finish();
-                Ok(true)
-            }
-
-            fn header(&self) -> &GenericTaskHeader<Self::Storage> {
-                &self.header
-            }
-        }
-
-        impl<'scope_ref, F, Fut> RouteJobTask<'scope_ref, F, Fut>
-        where
-            F: FnOnce() -> Fut + Send + 'scope_ref,
-            Fut: Future + Send + 'scope_ref,
-        {
-            fn finish(&self) {
-                self.header.publish_result_and_notify();
-                self.header.exit_poll();
-                self.header.decrement_ref_count();
-                self.header.finish_finalization();
-            }
-
-            const VTABLE: &'static TaskVTable<AtomicStorage> = &TaskVTable {
-                wake: |_| {},
-                wake_by_ref: |_| {},
-                poll: |header, worker_id| unsafe {
-                    let raw_ptr = header as *const GenericTaskHeader<AtomicStorage> as *const ();
-                    let node = &*(raw_ptr as *const Self);
-                    RawTask::poll_raw(node, worker_id)
-                },
-                drop: |data| unsafe {
-                    let ptr = data.as_ptr() as *mut Self;
-                    let _ = Box::from_raw(ptr);
-                },
-                drop_after_poll: true,
-            };
-        }
-
         let task = Box::new(RouteJobTask {
             header: TaskHeader::new(
                 RouteJobTask::<'scope_ref, F, Fut>::VTABLE,
@@ -365,13 +417,14 @@ impl<'rt, T> RuntimeCtx<'rt, T> {
                 unsafe {
                     let _ = Box::from_raw(ptr);
                 }
-                let current_worker = self.worker_id();
+                let current_worker = self.try_worker_id().unwrap_or(usize::MAX);
                 let is_shutdown = self.is_shutdown();
                 return RuntimeError::DispatchFailed {
                     target_worker: worker_id,
                     current_worker,
                 }
-                .with_ctx("is_shutdown", is_shutdown);
+                .with_ctx("is_shutdown", is_shutdown)
+                .with_ctx("on_worker", current_worker != usize::MAX);
             }
         }
 
@@ -394,11 +447,12 @@ impl<'rt, T> RuntimeCtx<'rt, T> {
 
     /// Returns the current worker id.
     pub fn worker_id(&self) -> usize {
-        self.shared()
-            .base
-            .tls
-            .try_with(|ctx| ctx.worker_id)
+        self.try_worker_id()
             .expect("Failed to get worker id: this should be invoked from a worker thread")
+    }
+
+    pub(crate) fn try_worker_id(&self) -> Option<usize> {
+        self.shared().base.tls.try_with(|ctx| ctx.worker_id).ok()
     }
 }
 
@@ -418,54 +472,74 @@ pub async fn current_scope() -> Option<AnyScopeRef> {
 pub type IdleHook<T> = fn(&RuntimeShared<T>) -> Result<IdleDecision>;
 pub(crate) type WorkerTickHook = fn();
 
+enum RouteCellState<T> {
+    Pending,
+    Published(Result<T>),
+    Consumed,
+}
+
 pub(crate) struct RouteCell<T> {
-    value: Mutex<Option<Result<T>>>,
+    state: AtomicLock<RouteCellState<T>>,
     waker: MwsrWaker,
 }
 
 impl<T> RouteCell<T> {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
-            value: Mutex::new(None),
+            state: AtomicLock::new(RouteCellState::Pending),
             waker: MwsrWaker::new(),
         })
     }
 
-    pub(crate) fn set(&self, value: T) -> Result<()> {
-        let mut slot = self.value.lock().map_err(|_| RuntimeError::PoisonedLock {
-            component: "runtime.route_slot",
-        })?;
-        debug_assert!(slot.is_none(), "worker route slot already populated");
-        *slot = Some(Ok(value));
-        self.waker.wake();
-        Ok(())
+    pub(crate) fn publish(&self, value: T) -> bool {
+        let published = {
+            let mut state = self.state.lock();
+            debug_assert!(
+                matches!(&*state, RouteCellState::Pending),
+                "worker route slot already has a terminal state"
+            );
+            if matches!(&*state, RouteCellState::Pending) {
+                *state = RouteCellState::Published(Ok(value));
+                true
+            } else {
+                false
+            }
+        };
+        if published {
+            self.waker.wake();
+        }
+        published
     }
 
-    pub(crate) fn fail(&self, err: Report<RuntimeError>) -> Result<()> {
-        let mut slot = self.value.lock().map_err(|_| RuntimeError::PoisonedLock {
-            component: "runtime.route_slot",
-        })?;
-        debug_assert!(slot.is_none(), "worker route slot already populated");
-        *slot = Some(Err(err));
-        self.waker.wake();
-        Ok(())
+    pub(crate) fn publish_error_if_pending(&self, error: Report<RuntimeError>) -> bool {
+        let published = {
+            let mut state = self.state.lock();
+            if matches!(&*state, RouteCellState::Pending) {
+                *state = RouteCellState::Published(Err(error));
+                true
+            } else {
+                false
+            }
+        };
+        if published {
+            self.waker.wake();
+        }
+        published
     }
 
     pub(crate) fn is_populated(&self) -> bool {
-        self.value
-            .lock()
-            .map(|slot| slot.is_some())
-            .unwrap_or(false)
+        matches!(&*self.state.lock(), RouteCellState::Published(_))
     }
 
-    pub(crate) fn take(&self) -> Result<Option<Result<T>>> {
-        Ok(self
-            .value
-            .lock()
-            .map_err(|_| RuntimeError::PoisonedLock {
-                component: "runtime.route_slot",
-            })?
-            .take())
+    pub(crate) fn take(&self) -> Option<Result<T>> {
+        let mut state = self.state.lock();
+        if !matches!(&*state, RouteCellState::Published(_)) {
+            return None;
+        }
+        match replace(&mut *state, RouteCellState::Consumed) {
+            RouteCellState::Published(value) => Some(value),
+            RouteCellState::Pending | RouteCellState::Consumed => unreachable!(),
+        }
     }
 
     pub(crate) fn register(&self, waker: &Waker) {
@@ -499,7 +573,7 @@ impl<F> RoutedFuture<F> {
             return Poll::Ready(Ok(()));
         }
 
-        if let Some(op) = self.slot.take()? {
+        if let Some(op) = self.slot.take() {
             match op {
                 Ok(op) => {
                     self.inner = Some(op);
@@ -509,7 +583,7 @@ impl<F> RoutedFuture<F> {
             }
         } else {
             self.slot.register(cx.waker());
-            if let Some(op) = self.slot.take()? {
+            if let Some(op) = self.slot.take() {
                 match op {
                     Ok(op) => {
                         self.inner = Some(op);
@@ -566,7 +640,54 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::{
+        mem::ManuallyDrop,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        task::{RawWaker, RawWakerVTable, Waker},
+        time::Duration,
+    };
+
+    struct ReentrantWake {
+        slot: Arc<RouteCell<usize>>,
+        took_value: AtomicBool,
+    }
+
+    unsafe fn clone_reentrant(data: *const ()) -> RawWaker {
+        unsafe {
+            Arc::increment_strong_count(data as *const ReentrantWake);
+        }
+        RawWaker::new(data, &REENTRANT_WAKER_VTABLE)
+    }
+
+    unsafe fn wake_reentrant(data: *const ()) {
+        let state = unsafe { Arc::from_raw(data as *const ReentrantWake) };
+        state
+            .took_value
+            .store(state.slot.take().is_some(), Ordering::Release);
+    }
+
+    unsafe fn wake_reentrant_by_ref(data: *const ()) {
+        let state = ManuallyDrop::new(unsafe { Arc::from_raw(data as *const ReentrantWake) });
+        state
+            .took_value
+            .store(state.slot.take().is_some(), Ordering::Release);
+    }
+
+    unsafe fn drop_reentrant(data: *const ()) {
+        unsafe {
+            drop(Arc::from_raw(data as *const ReentrantWake));
+        }
+    }
+
+    static REENTRANT_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        clone_reentrant,
+        wake_reentrant,
+        wake_reentrant_by_ref,
+        drop_reentrant,
+    );
 
     #[test]
     fn idle_decision_continue_marks_continue() {
@@ -580,5 +701,114 @@ mod tests {
             decision.into_wait_strategy(),
             Some(IdleWaitStrategy::Timeout(Duration::from_millis(5)))
         );
+    }
+
+    #[test]
+    fn route_cell_consumed_state_is_not_pending() {
+        let slot = RouteCell::new();
+
+        assert!(!slot.is_populated());
+        assert!(slot.publish(7));
+        assert!(slot.is_populated());
+        assert_eq!(slot.take().and_then(|result| result.ok()), Some(7));
+        assert!(!slot.is_populated());
+        assert!(!slot.publish_error_if_pending(route_error(
+            "context::tests",
+            "result was already consumed",
+        )));
+        assert!(slot.take().is_none());
+    }
+
+    #[test]
+    fn route_cell_wakes_after_releasing_state_lock() {
+        let slot = RouteCell::new();
+        let state = Arc::new(ReentrantWake {
+            slot: slot.clone(),
+            took_value: AtomicBool::new(false),
+        });
+        let raw = Arc::into_raw(state.clone()) as *const ();
+        let waker = unsafe { Waker::from_raw(RawWaker::new(raw, &REENTRANT_WAKER_VTABLE)) };
+
+        slot.register(&waker);
+        assert!(slot.publish(11));
+        assert!(state.took_value.load(Ordering::Acquire));
+        drop(waker);
+    }
+
+    #[test]
+    fn route_job_drop_publishes_shutdown_error() {
+        type Job = fn() -> std::future::Ready<()>;
+
+        let slot = RouteCell::<std::future::Ready<()>>::new();
+        let task = RouteJobTask::<Job, std::future::Ready<()>> {
+            header: GenericTaskHeader::new_placeholder(
+                RouteJobTask::<Job, std::future::Ready<()>>::VTABLE,
+            ),
+            job: UnsafeCell::new(Some(|| std::future::ready(()))),
+            slot: slot.clone(),
+            marker: PhantomData,
+        };
+
+        drop(task);
+
+        let error = slot
+            .take()
+            .expect("route drop must publish a result")
+            .expect_err("route drop must publish a shutdown error");
+        assert!(matches!(
+            error.inner(),
+            RuntimeError::ShutdownBeforeCompletion
+        ));
+    }
+
+    #[test]
+    fn route_finalizer_drop_finishes_header_and_slot() {
+        type Job = fn() -> std::future::Ready<()>;
+
+        let slot = RouteCell::<std::future::Ready<()>>::new();
+        let header =
+            GenericTaskHeader::new_placeholder(RouteJobTask::<Job, std::future::Ready<()>>::VTABLE);
+        let mut finalizer = RouteTaskFinalizer::new(&header, &slot);
+        finalizer.publish_err(route_error(
+            "context::tests",
+            "synthetic route finalizer failure",
+        ));
+        drop(finalizer);
+
+        assert!(header.is_reclaimable());
+        assert!(slot.take().is_some());
+    }
+
+    #[cfg(feature = "loom")]
+    #[test]
+    fn loom_route_cell_publish_and_take_have_one_terminal_value() {
+        loom::model(|| {
+            let slot = Arc::new(RouteCell::new());
+            let published = Arc::new(AtomicBool::new(false));
+            let consumed = Arc::new(AtomicBool::new(false));
+
+            let publisher_slot = slot.clone();
+            let publisher_published = published.clone();
+            let publisher = loom::thread::spawn(move || {
+                if publisher_slot.publish(17) {
+                    publisher_published.store(true, Ordering::Release);
+                }
+            });
+
+            let consumer_slot = slot.clone();
+            let consumer_consumed = consumed.clone();
+            let consumer = loom::thread::spawn(move || {
+                if consumer_slot.take().is_some() {
+                    consumer_consumed.store(true, Ordering::Release);
+                }
+            });
+
+            publisher.join().unwrap();
+            consumer.join().unwrap();
+            if !consumed.load(Ordering::Acquire) {
+                assert!(slot.take().is_some());
+            }
+            assert!(published.load(Ordering::Acquire));
+        });
     }
 }

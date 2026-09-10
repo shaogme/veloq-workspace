@@ -24,6 +24,7 @@ pub(crate) struct WorkerQueue {
     pub(crate) remote_queue: ArrayQueue<SendTaskRef>,
     pub(crate) pinned_queue: ArrayQueue<SendTaskRef>,
     pub(crate) local_queue: ArrayQueue<LocalTaskRef>,
+    local_capacity: usize,
     pub(crate) remote_count: AtomicUsize,
     pub(crate) pinned_count: AtomicUsize,
     pub(crate) local_count: AtomicUsize,
@@ -38,18 +39,25 @@ impl WorkerQueue {
         remote_queue: ArrayQueue<SendTaskRef>,
         pinned_queue: ArrayQueue<SendTaskRef>,
         local_queue: ArrayQueue<LocalTaskRef>,
+        local_capacity: usize,
         stealer: Stealer<SendTaskRef>,
     ) -> Self {
         Self {
             remote_queue,
             pinned_queue,
             local_queue,
+            local_capacity,
             remote_count: AtomicUsize::new(0),
             pinned_count: AtomicUsize::new(0),
             local_count: AtomicUsize::new(0),
             lifo: AtomicOptionPtr::new(None),
             stealer,
         }
+    }
+
+    #[inline]
+    pub(crate) fn local_capacity(&self) -> usize {
+        self.local_capacity
     }
 }
 

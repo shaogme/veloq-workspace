@@ -1,6 +1,29 @@
 use diagweave::{Report, set};
 use std::{borrow::Cow, error::Error, fmt, result::Result as StdResult};
 
+/// 本地任务无法发布到 owner worker 队列时的结构化原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnqueueError {
+    /// The task could not be published because its owner worker's local queue was full.
+    LocalQueueFull { worker_id: usize, capacity: usize },
+}
+
+impl fmt::Display for EnqueueError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LocalQueueFull {
+                worker_id,
+                capacity,
+            } => write!(
+                f,
+                "local queue for worker {worker_id} is full (capacity: {capacity})"
+            ),
+        }
+    }
+}
+
+impl Error for EnqueueError {}
+
 /// 后端 remote waker 失败时跨 runtime 边界传递的稳定诊断。
 ///
 /// 该类型不携带 backend 泛型，因此 runtime 不需要依赖任何平台 driver。`detail` 保留
@@ -69,6 +92,9 @@ set! {
             target_worker: usize,
             current_worker: usize,
         },
+
+        #[display("local queue for worker {worker_id} is full (capacity: {capacity})")]
+        QueueFull { worker_id: usize, capacity: usize },
 
         #[display("failed to spawn worker thread: {source}")]
         ThreadSpawnFailed {
@@ -141,3 +167,21 @@ set! {
 }
 
 pub type Result<T> = StdResult<T, Report<RuntimeError>>;
+
+#[cfg(test)]
+mod tests {
+    use super::EnqueueError;
+
+    #[test]
+    fn enqueue_error_display_contains_worker_and_capacity() {
+        let error = EnqueueError::LocalQueueFull {
+            worker_id: 4,
+            capacity: 8,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "local queue for worker 4 is full (capacity: 8)"
+        );
+    }
+}

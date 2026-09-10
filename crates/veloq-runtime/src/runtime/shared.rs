@@ -15,7 +15,7 @@ use veloq_tls::Tls;
 
 use super::context::{IdleHook, IdleWaitStrategy, RuntimeTlsInner, WorkerTickHook};
 use crate::{
-    error::{Result, RuntimeError},
+    error::{EnqueueError, Result, RuntimeError},
     runtime::primitives::{
         EventCount, ShutdownCoordinator, ShutdownPhase, Unparker, WakeFailureState,
     },
@@ -127,6 +127,7 @@ pub(crate) fn init_runtime_components_with_topology(
             remote_queue,
             pinned_queue,
             local_queue,
+            queue_capacity.get(),
             stealer,
         ));
     }
@@ -458,7 +459,13 @@ impl RuntimeSharedBase {
                 worker.local_count.fetch_add(1, Ordering::Release);
                 if let Err(task) = worker.local_queue.push(task) {
                     worker.local_count.fetch_sub(1, Ordering::Release);
-                    queue_rejected = Some(task);
+                    queue_rejected = Some((
+                        task,
+                        EnqueueError::LocalQueueFull {
+                            worker_id,
+                            capacity: worker.local_capacity(),
+                        },
+                    ));
                     false
                 } else {
                     true
@@ -474,12 +481,21 @@ impl RuntimeSharedBase {
                 task.header().abandon_before_enqueue();
             }
         }
-        if let Some(task) = queue_rejected {
+        if let Some((task, reason)) = queue_rejected {
+            task.header().clear_queued();
+            task.header().record_enqueue_rejection(reason);
             if from_wake {
-                Self::abandon_queued_task_from_wake(&task);
+                task.header().abandon_before_enqueue_from_wake();
             } else {
-                Self::abandon_queued_task(&task);
+                task.header().abandon_before_enqueue();
             }
+            return Err(RuntimeError::QueueFull {
+                worker_id,
+                capacity: match reason {
+                    EnqueueError::LocalQueueFull { capacity, .. } => capacity,
+                },
+            }
+            .to_report());
         }
         if enqueued {
             // 唤醒失败会设置共享 shutdown。任务已经在队列中可见，必须保留队列引用和

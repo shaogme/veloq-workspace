@@ -1,5 +1,5 @@
 use crate::{
-    error::{Result, RuntimeError},
+    error::{EnqueueError, Result, RuntimeError},
     runtime::{
         EnqueuePinnedOutcome, RuntimeSharedBase,
         cancellation::{AncestorRegistration, CancelWaiterLinkResult},
@@ -70,6 +70,7 @@ intrusive_adapter!(pub(crate) WakerAdapter<S> = GenericWakerNode<S> { link: Link
 pub struct GenericTaskHeader<S: Storage> {
     state: S::Usize,
     ref_count: S::Usize,
+    enqueue_rejection: S::Lock<Option<EnqueueError>>,
     wakers: S::Lock<LinkedList<WakerAdapter<S>>>,
     wake_token: Arc<TaskWakeToken<S>>,
     cached_waker: UnsafeCell<Option<Waker>>,
@@ -104,6 +105,7 @@ impl<S: Storage> GenericTaskHeader<S> {
         Self {
             state: S::Usize::new(0),
             ref_count: S::Usize::new(1),
+            enqueue_rejection: S::Lock::new(None),
             wakers: S::Lock::new(LinkedList::new(WakerAdapter::<S>::new())),
             wake_token: Arc::new(TaskWakeToken::new()),
             cached_waker: UnsafeCell::new(None),
@@ -139,6 +141,28 @@ impl<S: Storage> GenericTaskHeader<S> {
     #[inline]
     pub(crate) fn is_result_ready(&self) -> bool {
         self.state.load(Ordering::Acquire) & STATE_RESULT_READY != 0
+    }
+
+    /// 记录一次本地入队拒绝原因。结果终态发布前必须完成该写入。
+    pub(crate) fn record_enqueue_rejection(&self, reason: EnqueueError) {
+        let mut rejection = self.enqueue_rejection.lock();
+        debug_assert!(
+            rejection.is_none(),
+            "task enqueue rejection reason must only be recorded once"
+        );
+        if rejection.is_none() {
+            *rejection = Some(reason);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn has_enqueue_rejection(&self) -> bool {
+        self.enqueue_rejection.lock().is_some()
+    }
+
+    #[inline]
+    pub(crate) fn take_enqueue_rejection(&self) -> Option<EnqueueError> {
+        self.enqueue_rejection.lock().take()
     }
 
     #[inline]
@@ -939,6 +963,22 @@ mod tests {
 
         assert!(header.is_result_ready());
         assert!(!header.is_reclaimable());
+    }
+
+    #[test]
+    fn enqueue_rejection_reason_is_taken_once() {
+        let header = GenericTaskHeader::<AtomicStorage>::new_placeholder(&TEST_VTABLE);
+        let reason = EnqueueError::LocalQueueFull {
+            worker_id: 3,
+            capacity: 7,
+        };
+
+        header.record_enqueue_rejection(reason);
+
+        assert!(header.has_enqueue_rejection());
+        assert_eq!(header.take_enqueue_rejection(), Some(reason));
+        assert!(!header.has_enqueue_rejection());
+        assert_eq!(header.take_enqueue_rejection(), None);
     }
 
     #[cfg(not(feature = "loom"))]

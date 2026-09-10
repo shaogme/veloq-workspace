@@ -270,6 +270,9 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra>
         }
         guard.handoff_to(task_ref.header());
         if let Err(err) = enqueue_fn(self.context.shared(), worker_id, task_ref) {
+            if task_ref.header().has_enqueue_rejection() {
+                return JoinHandle::new_direct(self, task_ref, task, None);
+            }
             task_ref.header().abandon_before_enqueue();
             return JoinHandle::new_routed(self, new_failed_routed_state(err));
         }
@@ -322,6 +325,9 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra>
 
         let task_ref = unsafe { H::from_concrete(node_ptr) };
         if let Err(err) = enqueue_fn(self.context.shared(), worker_id, task_ref) {
+            if task_ref.header().has_enqueue_rejection() {
+                return JoinHandle::new_direct(self, task_ref, node_ref, Some(allocation));
+            }
             task_ref.header().abandon_before_enqueue();
             if task_ref.header().is_reclaimable() {
                 unsafe { allocation.reclaim() };
