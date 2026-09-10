@@ -10,13 +10,7 @@ pub mod generic;
 use core::fmt;
 
 use crate::io::{Error, IoSlice, IoSliceMut, Read, Result, Write};
-use crate::sync::{ReentrantMutex, ReentrantMutexGuard};
-
-#[cfg(not(feature = "loom"))]
-use crate::sync::const_reentrant_mutex;
-
-#[cfg(feature = "loom")]
-use std::sync::LazyLock;
+use crate::sync::{NativeReentrantMutex, NativeReentrantMutexGuard};
 
 #[cfg(unix)]
 use unix as sys;
@@ -27,46 +21,19 @@ use windows as sys;
 #[cfg(not(any(unix, windows)))]
 use generic as sys;
 
-fn stdin_mutex() -> &'static ReentrantMutex<()> {
-    #[cfg(not(feature = "loom"))]
-    {
-        static LOCK: ReentrantMutex<()> = const_reentrant_mutex(());
-        &LOCK
-    }
-
-    #[cfg(feature = "loom")]
-    {
-        static LOCK: LazyLock<ReentrantMutex<()>> = LazyLock::new(|| ReentrantMutex::new(()));
-        &LOCK
-    }
+fn stdin_mutex() -> &'static NativeReentrantMutex<()> {
+    static LOCK: NativeReentrantMutex<()> = NativeReentrantMutex::new(());
+    &LOCK
 }
 
-fn stdout_mutex() -> &'static ReentrantMutex<()> {
-    #[cfg(not(feature = "loom"))]
-    {
-        static LOCK: ReentrantMutex<()> = const_reentrant_mutex(());
-        &LOCK
-    }
-
-    #[cfg(feature = "loom")]
-    {
-        static LOCK: LazyLock<ReentrantMutex<()>> = LazyLock::new(|| ReentrantMutex::new(()));
-        &LOCK
-    }
+fn stdout_mutex() -> &'static NativeReentrantMutex<()> {
+    static LOCK: NativeReentrantMutex<()> = NativeReentrantMutex::new(());
+    &LOCK
 }
 
-fn stderr_mutex() -> &'static ReentrantMutex<()> {
-    #[cfg(not(feature = "loom"))]
-    {
-        static LOCK: ReentrantMutex<()> = const_reentrant_mutex(());
-        &LOCK
-    }
-
-    #[cfg(feature = "loom")]
-    {
-        static LOCK: LazyLock<ReentrantMutex<()>> = LazyLock::new(|| ReentrantMutex::new(()));
-        &LOCK
-    }
+fn stderr_mutex() -> &'static NativeReentrantMutex<()> {
+    static LOCK: NativeReentrantMutex<()> = NativeReentrantMutex::new(());
+    &LOCK
 }
 
 /// A handle to the standard input stream of a process.
@@ -77,7 +44,7 @@ pub struct Stdin {
 
 /// A locked reference to the [`Stdin`] handle.
 pub struct StdinLock<'a> {
-    _guard: ReentrantMutexGuard<'a, ()>,
+    _guard: NativeReentrantMutexGuard<'a, ()>,
 }
 
 /// Constructs a new handle to the standard input of the current process.
@@ -186,7 +153,7 @@ pub struct Stdout {
 
 /// A locked reference to the [`Stdout`] handle.
 pub struct StdoutLock<'a> {
-    _guard: ReentrantMutexGuard<'a, ()>,
+    _guard: NativeReentrantMutexGuard<'a, ()>,
 }
 
 /// Constructs a new handle to the standard output of the current process.
@@ -294,7 +261,7 @@ pub struct Stderr {
 
 /// A locked reference to the [`Stderr`] handle.
 pub struct StderrLock<'a> {
-    _guard: ReentrantMutexGuard<'a, ()>,
+    _guard: NativeReentrantMutexGuard<'a, ()>,
 }
 
 /// Constructs a new handle to the standard error of the current process.

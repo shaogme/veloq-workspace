@@ -1,8 +1,5 @@
 use core::ffi::CStr;
 
-#[cfg(feature = "loom")]
-use std::sync::LazyLock;
-
 use crate::{
     alloc_crate::{ffi::CString, vec::Vec},
     env::JoinPathsError,
@@ -14,15 +11,11 @@ use crate::{
         unix::ffi::{OsStrExt, OsStringExt},
     },
     path::{Path, PathBuf},
-    sync::UnpoisonedRwLock,
+    sync::NativeUnpoisonedRwLock,
     vec,
 };
 
-#[cfg(not(feature = "loom"))]
-static ENV_LOCK: UnpoisonedRwLock<()> = UnpoisonedRwLock::new(());
-
-#[cfg(feature = "loom")]
-static ENV_LOCK: LazyLock<UnpoisonedRwLock<()>> = LazyLock::new(|| UnpoisonedRwLock::new(()));
+static ENV_LOCK: NativeUnpoisonedRwLock<()> = NativeUnpoisonedRwLock::new(());
 
 #[cfg(not(any(target_os = "freebsd", target_vendor = "apple")))]
 unsafe fn environ() -> *mut *const *const libc::c_char {

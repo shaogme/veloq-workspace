@@ -186,7 +186,18 @@ mod normal_tests {
 #[cfg(feature = "loom")]
 mod loom_tests {
     use loom::{cell::Cell, sync::Arc, thread};
-    use veloq_std::sync::ReentrantMutex;
+    use veloq_std::sync::{NativeReentrantMutex, ReentrantMutex};
+
+    #[test]
+    fn test_native_reentrant_mutex_outside_model() {
+        let mutex = NativeReentrantMutex::new(42);
+        let guard = mutex.lock();
+        let reentrant_guard = mutex.lock();
+
+        assert_eq!(*guard, 42);
+        assert_eq!(*reentrant_guard, 42);
+        assert_eq!(mutex.reentrancy_count(), 2);
+    }
 
     #[test]
     fn test_loom_reentrant_mutex_basic() {

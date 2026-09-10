@@ -1,12 +1,24 @@
 pub mod traits;
 use traits::*;
 
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
+mod native;
+
+#[cfg(feature = "loom")]
+mod loom;
+
 #[cfg(feature = "std")]
 use std::thread::panicking as panicking_std;
 
 mod parker;
 mod sys;
 pub use sys::{RawJoinHandle, RawThreadError, Systerm};
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
+pub(crate) use native::current_id as native_current_id;
+
+#[cfg(feature = "loom")]
+pub(crate) use loom::current_id as loom_current_id;
 
 mod scope;
 pub use scope::{
