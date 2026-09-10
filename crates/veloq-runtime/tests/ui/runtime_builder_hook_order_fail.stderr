@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+  --> tests/ui/runtime_builder_hook_order_fail.rs:22:25
+   |
+22 |         .with_idle_hook(idle_custom);
+   |          -------------- ^^^^^^^^^^^ expected fn pointer, found fn item
+   |          |
+   |          arguments to this method are incorrect
+   |
+   = note: expected fn pointer `for<'a> fn(&'a RuntimeShared<()>) -> Result<IdleDecision, diagweave::report_impl::Report<RuntimeError>>`
+                 found fn item `for<'a> fn(&'a RuntimeShared<CustomExtra>) -> Result<IdleDecision, diagweave::report_impl::Report<RuntimeError>> {idle_custom}`
+note: method defined here
+  --> src/runtime.rs
+   |
+   |     pub fn with_idle_hook(mut self, hook: IdleHook<T>) -> Self {
+   |            ^^^^^^^^^^^^^^

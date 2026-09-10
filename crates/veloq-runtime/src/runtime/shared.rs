@@ -70,6 +70,11 @@ pub struct RuntimeSharedBase {
     pub(crate) tls: Tls<RuntimeTlsInner>,
 }
 
+/// Worker 进入 idle 等待阶段时调用的 hook。
+///
+/// Hook 接收与 worker factory 使用同一个 `T` 的 [`RuntimeShared`]，并获得运行时选定的
+/// [`IdleWaitStrategy`]。它必须实现实际的等待/驱动 park 逻辑，并通过同一个 runtime
+/// 的 `Unparker` 支持唤醒。
 pub type ParkHook<T> = fn(&RuntimeShared<T>, IdleWaitStrategy) -> Result<()>;
 
 pub struct RuntimeShared<T> {

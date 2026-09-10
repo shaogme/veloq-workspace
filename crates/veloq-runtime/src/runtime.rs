@@ -21,8 +21,10 @@ pub mod primitives;
 pub mod shared;
 
 pub use cancellation::GenericCancellationToken;
-pub use context::{IdleDecision, IdleWaitStrategy, IntoRuntimeCtx, RuntimeCtx, current_scope};
-pub(crate) use context::{IdleHook, RuntimeTlsInner, WorkerTickHook};
+pub use context::{
+    IdleDecision, IdleHook, IdleWaitStrategy, IntoRuntimeCtx, RuntimeCtx, current_scope,
+};
+pub(crate) use context::{RuntimeTlsInner, WorkerTickHook};
 pub use shared::{EnqueuePinnedOutcome, ParkHook, RuntimeShared, RuntimeSharedBase};
 
 use primitives::BlockOnSignal;
@@ -315,7 +317,21 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
     }
 }
 
-pub struct RuntimeBuilder<T, WF> {
+/// 表示尚未配置 idle 或 park hook 的 builder 状态。
+#[doc(hidden)]
+pub struct HooksUnconfigured;
+
+/// 表示至少配置了一个 idle 或 park hook 的 builder 状态。
+#[doc(hidden)]
+pub struct HooksConfigured;
+
+/// 用于配置并创建运行时的 builder。
+///
+/// `H` 是隐藏的 hook 配置状态参数。新 builder 处于 [`HooksUnconfigured`] 状态，首次
+/// 设置 idle 或 park hook 时可以选择 worker extra 类型；设置任意一个 hook 后，builder
+/// 处于 [`HooksConfigured`] 状态，后续 hook setter 只能接受相同的 `T`。因此，两个 hook
+/// 始终与 [`RuntimeShared<T>`] 使用相同的类型，配置顺序不会静默丢弃 park hook。
+pub struct RuntimeBuilder<T, WF, H = HooksUnconfigured> {
     worker_count: Option<NonZeroUsize>,
     queue_capacity: NonZeroUsize,
     topology_override: Option<Box<[usize]>>,
@@ -323,15 +339,17 @@ pub struct RuntimeBuilder<T, WF> {
     idle_hook: Option<IdleHook<T>>,
     park_hook: Option<ParkHook<T>>,
     worker_tick_hook: Option<WorkerTickHook>,
+    _hook_state: PhantomData<fn() -> H>,
 }
 
-impl Default for RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
+impl Default for RuntimeBuilder<(), DefaultWorkerFactoryFor<()>, HooksUnconfigured> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
+impl RuntimeBuilder<(), DefaultWorkerFactoryFor<()>, HooksUnconfigured> {
+    /// 创建一个尚未配置 hook 的默认 builder。
     pub fn new() -> Self {
         RuntimeBuilder {
             worker_count: None,
@@ -341,11 +359,69 @@ impl RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
             idle_hook: None,
             park_hook: None,
             worker_tick_hook: None,
+            _hook_state: PhantomData,
         }
     }
 }
 
-impl<T, WF> RuntimeBuilder<T, WF> {
+impl<T, WF> RuntimeBuilder<T, WF, HooksUnconfigured> {
+    /// 设置 idle hook，并在此处选择 worker extra 的类型。
+    ///
+    /// 这是 builder 唯一可以改变 `T` 的 hook setter。配置任意一个 hook 后，后续 setter
+    /// 只能接受相同的 `T`，从而保证 idle hook、park hook、worker factory 和
+    /// [`RuntimeShared`] 始终使用同一个 extra 类型。
+    pub fn with_idle_hook<NewT>(
+        self,
+        hook: IdleHook<NewT>,
+    ) -> RuntimeBuilder<NewT, WF, HooksConfigured> {
+        RuntimeBuilder {
+            idle_hook: Some(hook),
+            park_hook: None,
+            worker_count: self.worker_count,
+            queue_capacity: self.queue_capacity,
+            topology_override: self.topology_override,
+            worker_factory: self.worker_factory,
+            worker_tick_hook: self.worker_tick_hook,
+            _hook_state: PhantomData,
+        }
+    }
+
+    /// 设置 park hook，并在此处选择 worker extra 的类型。
+    ///
+    /// 这是 builder 唯一可以改变 `T` 的 hook setter。之后可以继续设置同一个 `T` 的
+    /// idle hook，已有 park hook 会被保留。
+    pub fn with_park_hook<NewT>(
+        self,
+        hook: ParkHook<NewT>,
+    ) -> RuntimeBuilder<NewT, WF, HooksConfigured> {
+        RuntimeBuilder {
+            idle_hook: None,
+            park_hook: Some(hook),
+            worker_count: self.worker_count,
+            queue_capacity: self.queue_capacity,
+            topology_override: self.topology_override,
+            worker_factory: self.worker_factory,
+            worker_tick_hook: self.worker_tick_hook,
+            _hook_state: PhantomData,
+        }
+    }
+}
+
+impl<T, WF> RuntimeBuilder<T, WF, HooksConfigured> {
+    /// 设置同一个 worker extra 类型的 idle hook。
+    pub fn with_idle_hook(mut self, hook: IdleHook<T>) -> Self {
+        self.idle_hook = Some(hook);
+        self
+    }
+
+    /// 设置同一个 worker extra 类型的 park hook。
+    pub fn with_park_hook(mut self, hook: ParkHook<T>) -> Self {
+        self.park_hook = Some(hook);
+        self
+    }
+}
+
+impl<T, WF, H> RuntimeBuilder<T, WF, H> {
     pub fn with_worker_count(mut self, count: Option<NonZeroUsize>) -> Self {
         self.worker_count = count;
         self
@@ -365,29 +441,13 @@ impl<T, WF> RuntimeBuilder<T, WF> {
         self
     }
 
-    pub fn with_idle_hook<NewT>(self, hook: IdleHook<NewT>) -> RuntimeBuilder<NewT, WF> {
-        RuntimeBuilder {
-            idle_hook: Some(hook),
-            park_hook: None,
-            worker_count: self.worker_count,
-            queue_capacity: self.queue_capacity,
-            topology_override: self.topology_override,
-            worker_factory: self.worker_factory,
-            worker_tick_hook: self.worker_tick_hook,
-        }
-    }
-
-    pub fn with_park_hook(mut self, hook: ParkHook<T>) -> Self {
-        self.park_hook = Some(hook);
-        self
-    }
-
     pub fn with_worker_tick_hook(mut self, hook: WorkerTickHook) -> Self {
         self.worker_tick_hook = Some(hook);
         self
     }
 
-    pub fn with_worker_factory<NWF>(self, factory: NWF) -> RuntimeBuilder<T, NWF> {
+    /// 替换 worker factory，同时保留当前 hook 配置状态和两个 hook。
+    pub fn with_worker_factory<NWF>(self, factory: NWF) -> RuntimeBuilder<T, NWF, H> {
         RuntimeBuilder {
             worker_count: self.worker_count,
             queue_capacity: self.queue_capacity,
@@ -396,6 +456,7 @@ impl<T, WF> RuntimeBuilder<T, WF> {
             idle_hook: self.idle_hook,
             park_hook: self.park_hook,
             worker_tick_hook: self.worker_tick_hook,
+            _hook_state: PhantomData,
         }
     }
 

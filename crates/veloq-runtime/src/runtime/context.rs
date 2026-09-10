@@ -411,7 +411,11 @@ pub async fn current_scope() -> Option<AnyScopeRef> {
     poll_fn(|cx| Poll::Ready(cx.scope_completion())).await
 }
 
-pub(crate) type IdleHook<T> = fn(&RuntimeShared<T>) -> Result<IdleDecision>;
+/// Worker 空闲时调用的 hook。
+///
+/// Hook 接收与 worker factory 使用同一个 `T` 的 [`RuntimeShared`]，因此可以通过
+/// [`RuntimeShared::extra_tls`] 访问类型安全的 worker extra 状态。
+pub type IdleHook<T> = fn(&RuntimeShared<T>) -> Result<IdleDecision>;
 pub(crate) type WorkerTickHook = fn();
 
 pub(crate) struct RouteCell<T> {
