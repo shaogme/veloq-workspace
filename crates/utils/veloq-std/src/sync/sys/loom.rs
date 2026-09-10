@@ -35,29 +35,6 @@ impl WaitChannel {
         }
     }
 
-    /// 等待满足特定条件。若 condition 返回 true，则在 Condvar 上挂起当前线程。
-    #[allow(dead_code)]
-    pub fn wait_while<F: Fn() -> bool>(&self, condition: F) {
-        let mut guard = self.mutex.lock().unwrap();
-        while condition() {
-            guard = self.cvar.wait(guard).unwrap();
-        }
-    }
-
-    /// 尝试等待，带有超时判定。
-    #[allow(dead_code)]
-    pub fn wait_timeout_while<F: Fn() -> bool>(&self, condition: F, dur: Duration) -> bool {
-        let mut guard = self.mutex.lock().unwrap();
-        while condition() {
-            let (next_guard, res) = self.cvar.wait_timeout(guard, dur).unwrap();
-            guard = next_guard;
-            if res.timed_out() {
-                return false;
-            }
-        }
-        true
-    }
-
     /// 精准唤醒一个挂起的等待者。
     pub fn wake_one(&self) {
         let _g = self.mutex.lock().unwrap();

@@ -18,8 +18,8 @@ pub use barrier::{Barrier, BarrierWaitResult};
 pub use condvar::{Condvar, UnpoisonedCondvar, WaitTimeoutResult};
 pub use mutex::raw::RawMutex;
 pub use mutex::{Mutex, MutexGuard};
-pub use once::{Once, OnceState};
-pub use once_lock::OnceLock;
+pub use once::{NativeOnce, Once, OnceState};
+pub use once_lock::{NativeOnceLock, OnceLock};
 pub use poison::{LockResult, PoisonError, TryLockError, TryLockResult};
 pub use reentrant_mutex::{ReentrantMutex, ReentrantMutexGuard};
 pub use rwlock::raw::RawRwLock;
@@ -45,3 +45,7 @@ pub use unpoisoned_rwlock::const_unpoisoned_rwlock;
 
 #[cfg(feature = "loom")]
 pub use loom::sync::Arc;
+#[cfg(feature = "loom")]
+pub use once::LoomOnce;
+#[cfg(feature = "loom")]
+pub use once_lock::LoomOnceLock;
