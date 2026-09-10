@@ -1,29 +1,37 @@
+use core::{
+    cell::UnsafeCell as CoreUnsafeCell,
+    fmt::{self, Debug, Formatter},
+};
+
+#[cfg(feature = "loom")]
+use loom::cell::UnsafeCell as LoomCell;
+
 pub use core::cell::{Cell, RefCell, RefMut};
 
-#[cfg(not(feature = "loom"))]
 #[repr(transparent)]
-pub struct UnsafeCell<T: ?Sized> {
-    cell: core::cell::UnsafeCell<T>,
+pub struct NativeUnsafeCell<T: ?Sized> {
+    cell: CoreUnsafeCell<T>,
 }
 
-#[cfg(not(feature = "loom"))]
-impl<T: ?Sized + core::fmt::Debug> core::fmt::Debug for UnsafeCell<T> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl<T: ?Sized + Debug> Debug for NativeUnsafeCell<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         unsafe { (*self.cell.get()).fmt(f) }
     }
 }
 
-#[cfg(not(feature = "loom"))]
-impl<T> UnsafeCell<T> {
+impl<T> NativeUnsafeCell<T> {
     pub const fn new(value: T) -> Self {
         Self {
-            cell: core::cell::UnsafeCell::new(value),
+            cell: CoreUnsafeCell::new(value),
         }
+    }
+
+    pub fn into_inner(self) -> T {
+        self.cell.into_inner()
     }
 }
 
-#[cfg(not(feature = "loom"))]
-impl<T: ?Sized> UnsafeCell<T> {
+impl<T: ?Sized> NativeUnsafeCell<T> {
     /// # Safety
     ///
     /// The caller must ensure that there are no other references to the underlying data while the closure is executing.
@@ -45,31 +53,24 @@ impl<T: ?Sized> UnsafeCell<T> {
     }
 }
 
-#[cfg(not(feature = "loom"))]
-impl<T> UnsafeCell<T> {
-    pub fn into_inner(self) -> T {
-        self.cell.into_inner()
-    }
-}
-
 #[cfg(feature = "loom")]
 #[repr(transparent)]
-pub struct UnsafeCell<T: ?Sized> {
-    inner: loom::cell::UnsafeCell<T>,
+pub struct LoomUnsafeCell<T: ?Sized> {
+    inner: LoomCell<T>,
 }
 
 #[cfg(feature = "loom")]
-impl<T: ?Sized + core::fmt::Debug> core::fmt::Debug for UnsafeCell<T> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl<T: ?Sized + Debug> Debug for LoomUnsafeCell<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         self.inner.get().with(|ptr| unsafe { (*ptr).fmt(f) })
     }
 }
 
 #[cfg(feature = "loom")]
-impl<T> UnsafeCell<T> {
+impl<T> LoomUnsafeCell<T> {
     pub fn new(data: T) -> Self {
         Self {
-            inner: loom::cell::UnsafeCell::new(data),
+            inner: LoomCell::new(data),
         }
     }
 
@@ -79,7 +80,7 @@ impl<T> UnsafeCell<T> {
 }
 
 #[cfg(feature = "loom")]
-impl<T: ?Sized> UnsafeCell<T> {
+impl<T: ?Sized> LoomUnsafeCell<T> {
     /// # Safety
     ///
     /// The caller must ensure that there are no mutable references to the underlying data while the closure is executing.
@@ -98,5 +99,79 @@ impl<T: ?Sized> UnsafeCell<T> {
         F: FnOnce(&mut T) -> R,
     {
         self.inner.get_mut().with(|ptr| unsafe { f(&mut *ptr) })
+    }
+}
+
+#[cfg(not(feature = "loom"))]
+pub type UnsafeCell<T> = NativeUnsafeCell<T>;
+
+#[cfg(feature = "loom")]
+pub type UnsafeCell<T> = LoomUnsafeCell<T>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_native_unsafe_cell() {
+        let cell = NativeUnsafeCell::new(42);
+        unsafe {
+            cell.with(|val| {
+                assert_eq!(*val, 42);
+            });
+            cell.with_mut(|val| {
+                *val = 100;
+            });
+            cell.with(|val| {
+                assert_eq!(*val, 100);
+            });
+        }
+        assert_eq!(cell.into_inner(), 100);
+    }
+
+    #[cfg(feature = "loom")]
+    #[test]
+    fn test_loom_unsafe_cell() {
+        loom::model(|| {
+            let cell = LoomUnsafeCell::new(42);
+            unsafe {
+                cell.with(|val| {
+                    assert_eq!(*val, 42);
+                });
+                cell.with_mut(|val| {
+                    *val = 100;
+                });
+                cell.with(|val| {
+                    assert_eq!(*val, 100);
+                });
+            }
+            assert_eq!(cell.into_inner(), 100);
+        });
+    }
+
+    #[cfg(not(feature = "loom"))]
+    #[test]
+    fn test_unsafe_cell_alias() {
+        let cell = UnsafeCell::new(10);
+        unsafe {
+            cell.with(|val| {
+                assert_eq!(*val, 10);
+            });
+        }
+        assert_eq!(cell.into_inner(), 10);
+    }
+
+    #[cfg(feature = "loom")]
+    #[test]
+    fn test_unsafe_cell_alias() {
+        loom::model(|| {
+            let cell = UnsafeCell::new(10);
+            unsafe {
+                cell.with(|val| {
+                    assert_eq!(*val, 10);
+                });
+            }
+            assert_eq!(cell.into_inner(), 10);
+        });
     }
 }
