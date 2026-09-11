@@ -6,14 +6,6 @@ use crate::{
     runtime::context::{Ctx, submit_control_task},
 };
 use diagweave::prelude::*;
-use std::{
-    cell::Cell,
-    future::{Future, IntoFuture},
-    path::Path,
-    pin::Pin,
-    sync::atomic::{AtomicU64, Ordering},
-    task::{Context, Poll},
-};
 use veloq_buf::FixedBuf;
 use veloq_driver_native::{
     RawHandle, RawHandleKind,
@@ -22,6 +14,15 @@ use veloq_driver_native::{
         DetachedSubmitter, Fallocate, FileSyncFileRangeRaw, Fsync, IoFd, LocalSubmitter, Op,
         OpSubmitter, ReadFixed, WriteFixed,
     },
+};
+use veloq_std::{
+    cell::Cell,
+    future::{Future, IntoFuture},
+    path::Path,
+    pin::Pin,
+    sync::atomic::{AtomicU64, Ordering},
+    task::{Context, Poll},
+    vec,
 };
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::CloseHandle;

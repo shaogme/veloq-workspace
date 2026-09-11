@@ -1,4 +1,4 @@
-use std::ops::AsyncFnOnce;
+use veloq_std::ops::AsyncFnOnce;
 
 use veloq::{
     local::mpsc,
@@ -171,7 +171,7 @@ fn test_bounded_backpressure() {
 #[test]
 fn test_stream_conversion() {
     use futures_util::Stream;
-    use std::pin::Pin;
+    use veloq_std::pin::Pin;
 
     run_test(async |ctx| {
         let state = mpsc::unbounded();
@@ -188,7 +188,7 @@ fn test_stream_conversion() {
 
             // Let's utilize a simple helper generic function to await the stream next
             async fn next_item<S: Stream<Item = i32> + Unpin>(s: &mut S) -> Option<i32> {
-                use std::future::poll_fn;
+                use veloq_std::future::poll_fn;
                 poll_fn(|cx| Pin::new(&mut *s).poll_next(cx)).await
             }
 

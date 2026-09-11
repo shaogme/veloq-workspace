@@ -1,4 +1,4 @@
-use std::{
+use veloq_std::{
     error::Error,
     fmt,
     io::{self, ErrorKind::TimedOut},

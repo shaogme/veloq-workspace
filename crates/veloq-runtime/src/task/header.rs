@@ -10,18 +10,18 @@ use crate::{
     },
 };
 use diagweave::prelude::*;
-use std::{
+use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
+use veloq_std::cell::UnsafeCell;
+use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
+use veloq_std::{
     marker::{PhantomData, PhantomPinned},
     mem::ManuallyDrop,
     pin::Pin,
     ptr::{self, NonNull},
-    sync::{Arc, atomic::Ordering},
+    sync::{NativeArc as Arc, atomic::Ordering},
     task::{RawWaker, RawWakerVTable, Waker},
     vec::Vec,
 };
-use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
-use veloq_std::cell::UnsafeCell;
-use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
 use veloq_storage::{
     AtomicStorage, LocalStorage, StateInt, StateLock, Storage, StrategyType, ThreadSafeStorage,
 };
@@ -850,8 +850,8 @@ mod tests {
     use super::*;
     #[cfg(not(feature = "loom"))]
     use crate::{scope::GenericScopeCompletion, utils::ownership::ArcOwnership};
-    use std::sync::atomic::AtomicU32;
     use veloq_intrusive_linklist::Link;
+    use veloq_std::sync::atomic::NativeAtomicU32 as AtomicU32;
 
     static TEST_VTABLE: TaskVTable<AtomicStorage> = TaskVTable {
         wake: |_| {},

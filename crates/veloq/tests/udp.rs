@@ -1,4 +1,4 @@
-use std::{
+use veloq_std::{
     collections::HashSet,
     net::SocketAddr,
     num::NonZeroUsize,
@@ -634,7 +634,7 @@ fn multithread_concurrent_udp_clients() {
             }
 
             // 4. 汇总验证
-            let mut unique_peers = HashSet::new();
+            let mut unique_peers = HashSet::default();
             for _ in 0..NUM_CLIENTS {
                 let peer_addr = peer_rx.recv().await.expect("peer channel closed");
                 unique_peers.insert(peer_addr);

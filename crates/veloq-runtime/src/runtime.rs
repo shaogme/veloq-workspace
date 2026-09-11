@@ -1,4 +1,8 @@
-use std::{marker::PhantomData, num::NonZeroUsize, ops::AsyncFnOnce, pin::pin, ptr, thread};
+use veloq_std::vec;
+use veloq_std::{
+    boxed::Box, marker::PhantomData, num::NonZeroUsize, ops::AsyncFnOnce, pin::pin, ptr, thread,
+    vec::Vec,
+};
 
 use crate::{
     error::{Result, RuntimeError},
@@ -461,9 +465,9 @@ impl<T, WF, H> RuntimeBuilder<T, WF, H> {
         WF: Fn(usize, &'rt RuntimeShared<T>) -> T + Send + Sync + 'rt,
         F: for<'a> AsyncFnOnce(RuntimeCtx<'a, T>) -> R,
     {
-        let worker_count = self.worker_count.unwrap_or_else(|| {
-            thread::available_parallelism().unwrap_or(NonZeroUsize::new(1).unwrap())
-        });
+        let worker_count = self
+            .worker_count
+            .unwrap_or_else(|| thread::available_parallelism().unwrap_or(NonZeroUsize::MIN));
         // worker id 会被编码进 idle 栈 head 的低 32 位，必须在构造期就拒绝越界的规模，
         // 而不是让 `IdleStack` 静默截断。
         if worker_count.get() > MAX_WORKER_COUNT - 1 {

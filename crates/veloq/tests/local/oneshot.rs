@@ -1,4 +1,4 @@
-use std::ops::AsyncFnOnce;
+use veloq_std::ops::AsyncFnOnce;
 
 use veloq::{
     local::oneshot,

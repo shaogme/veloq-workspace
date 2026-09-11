@@ -3,16 +3,17 @@ use crate::{
     scope::GenericScopeCompletion,
     utils::ownership::Ownership,
 };
-use std::{
+use veloq_intrusive_linklist::{Link, intrusive_adapter};
+use veloq_std::cell::UnsafeCell;
+use veloq_std::panic::PanicPayload;
+use veloq_std::{
     fmt::{Debug, Formatter, Result as FmtResult},
     marker::PhantomData,
     mem::ManuallyDrop,
     ptr::NonNull,
     task::Waker,
+    vec::Vec,
 };
-use veloq_intrusive_linklist::{Link, intrusive_adapter};
-use veloq_std::cell::UnsafeCell;
-use veloq_std::panic::PanicPayload;
 use veloq_storage::{AtomicStorage, LocalStorage, Storage, StrategyType, ThreadSafeStorage};
 
 /// 任务挂在所属 scope 取消队列上的等待节点。
@@ -142,7 +143,7 @@ pub trait RawScope {
     unsafe fn link_cancel_waiter(
         &self,
         waiter: NonNull<CancellationWaiter>,
-        waker: &std::task::Waker,
+        waker: &veloq_std::task::Waker,
     ) -> CancelWaiterLinkResult;
     /// # Safety
     ///
@@ -182,7 +183,7 @@ impl<S: Storage> RawScope for DummyScope<S> {
     unsafe fn link_cancel_waiter(
         &self,
         _waiter: NonNull<CancellationWaiter>,
-        _waker: &std::task::Waker,
+        _waker: &veloq_std::task::Waker,
     ) -> CancelWaiterLinkResult {
         CancelWaiterLinkResult::Linked
     }
@@ -306,7 +307,7 @@ impl<S: Storage> ScopeRef<S> {
     pub(crate) unsafe fn link_cancel_waiter(
         &self,
         waiter: NonNull<CancellationWaiter>,
-        waker: &std::task::Waker,
+        waker: &veloq_std::task::Waker,
     ) -> CancelWaiterLinkResult {
         unsafe { self.as_ref().link_cancel_waiter(waiter, waker) }
     }
@@ -420,7 +421,7 @@ impl AnySendScopeRef {
     pub(crate) unsafe fn link_cancel_waiter(
         &self,
         waiter: NonNull<CancellationWaiter>,
-        waker: &std::task::Waker,
+        waker: &veloq_std::task::Waker,
     ) -> CancelWaiterLinkResult {
         unsafe { self.0.link_cancel_waiter(waiter, waker) }
     }

@@ -1,5 +1,5 @@
 use diagweave::{report::Report, union};
-use std::result::Result as StdResult;
+use veloq_std::result::Result as StdResult;
 
 union! {
     pub enum Error =

@@ -1,4 +1,4 @@
-use std::{
+use veloq_std::{
     future::poll_fn,
     net::{SocketAddr, TcpStream as StdTcpStream},
     num::NonZeroUsize,
@@ -550,7 +550,8 @@ fn a_local_listener_streams_connections_without_a_detached_op() {
                 let stream = StdTcpStream::connect(listen_addr).expect("Failed to connect");
                 drop(stream);
             }
-        });
+        })
+        .expect("Failed to spawn client thread");
 
         let mut accepted = listener.accept_multi();
         for i in 0..CONNECTIONS {

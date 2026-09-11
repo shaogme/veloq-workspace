@@ -1,16 +1,19 @@
 use super::header::GenericTaskHeader;
-use crate::runtime::primitives::{EventCount, Unparker, sys};
+use crate::runtime::primitives::{EventCount, Unparker, WaitError, sys};
 use crossbeam_queue::SegQueue;
-use std::{
+use veloq_std::{
     hint::spin_loop,
     marker::PhantomData,
     ops::Deref,
     ptr::NonNull,
     sync::atomic::{AtomicU32, Ordering},
-    sync::{Arc, OnceLock, Weak},
+    sync::{NativeArc as Arc, NativeWeak as Weak, OnceLock},
     thread::{self, ThreadId, yield_now},
 };
 use veloq_storage::{AtomicOptionPtr, LocalStorage, StateOptionPtr, Storage};
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use veloq_std::string::ToString;
 
 const WAKE_TOKEN_ALIVE: u32 = 1 << 0;
 const WAKE_TOKEN_PENDING: u32 = 1 << 1;
@@ -124,7 +127,7 @@ impl<S: Storage> TaskWakeToken<S> {
     #[inline]
     pub(crate) fn bind_local_target(&self, target: &Arc<LocalWakeTarget>) {
         let target_result = self.local_target.set(Arc::downgrade(target));
-        let owner_result = self.owner_thread.set(thread::current().id());
+        let owner_result = self.owner_thread.set(thread::current_id());
         debug_assert!(target_result.is_ok(), "local wake target is bound twice");
         debug_assert!(owner_result.is_ok(), "local wake owner is bound twice");
     }
@@ -194,15 +197,47 @@ impl<S: Storage> TaskWakeToken<S> {
                 spin_loop();
                 spin_count += 1;
             } else if spin_count == SPIN_LIMIT {
-                yield_now();
+                match yield_now() {
+                    Ok(_) => {}
+                    Err(error) => self.record_wait_error(WaitError::Aborted(error)),
+                }
                 spin_count += 1;
             } else {
-                unsafe { sys::wait(&self.state, curr) }
-                    .unwrap_or_else(|error| panic!("runtime futex wait failed: {error:?}"));
+                match unsafe { sys::wait(&self.state, curr) } {
+                    Ok(()) => {}
+                    Err(error) => self.record_wait_error(error),
+                }
                 spin_count = 0;
             }
         }
         self.header.store(None, Ordering::Release);
+    }
+
+    fn record_wait_error(&self, error: WaitError) {
+        let Some(header) = self.header.load(Ordering::Acquire) else {
+            return;
+        };
+        let header = unsafe { header.as_ref() };
+        let worker_id = header.worker_id();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let detail = error.to_string();
+        match error {
+            WaitError::Aborted(_) => {
+                if let Err(error) = header.with_runtime(|runtime| {
+                    runtime.record_thread_abort(worker_id);
+                }) {
+                    drop(error);
+                }
+            }
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            WaitError::Futex(_) => {
+                if let Err(error) = header.with_runtime(|runtime| {
+                    runtime.record_wait_failure(worker_id, detail);
+                }) {
+                    drop(error);
+                }
+            }
+        }
     }
 }
 
@@ -248,7 +283,7 @@ impl TaskWakeToken<LocalStorage> {
         let Some(owner) = self.owner_thread.get().copied() else {
             return;
         };
-        if thread::current().id() != owner {
+        if thread::current_id() != owner {
             return;
         }
 
@@ -277,7 +312,7 @@ impl TaskWakeToken<LocalStorage> {
     /// 仅供 owner-side `RuntimeContextExt` 反查；foreign thread 一律返回 `None`。
     pub(crate) fn local_header_on_owner(&self) -> Option<LocalWakeHeaderGuard<'_>> {
         let owner = self.owner_thread.get().copied()?;
-        if thread::current().id() != owner {
+        if thread::current_id() != owner {
             return None;
         }
 
@@ -306,7 +341,8 @@ impl<S: Storage> Drop for TaskWakeGuard<'_, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Barrier, mpsc::sync_channel};
+    use veloq_std::sync::{Barrier, mpsc::sync_channel};
+    use veloq_std::thread::ThreadErrorKind;
 
     fn assert_send_sync<T: Send + Sync>() {}
 
@@ -370,14 +406,52 @@ mod tests {
         barrier.wait();
         assert!(
             done_rx
-                .recv_timeout(std::time::Duration::from_millis(20))
+                .recv_timeout(veloq_std::time::Duration::from_millis(20))
                 .is_err(),
             "deactivation must wait while a wake callback is active"
         );
         drop(active);
         done_rx
-            .recv_timeout(std::time::Duration::from_millis(200))
+            .recv_timeout(veloq_std::time::Duration::from_millis(200))
             .expect("deactivation must finish after callback quiescence");
-        thread.join().unwrap();
+        thread
+            .expect("wake waiter failed to spawn")
+            .join()
+            .expect("wake waiter panicked");
+    }
+
+    #[test]
+    fn abort_during_deactivation_still_waits_for_active_wake_callback() {
+        let token = Arc::new(TaskWakeToken::<LocalStorage>::new());
+        let active = token.try_acquire().expect("token must start alive");
+        let barrier = Arc::new(Barrier::new(2));
+        let (done_tx, done_rx) = sync_channel(0);
+        let token_for_thread = Arc::clone(&token);
+        let barrier_for_thread = Arc::clone(&barrier);
+        let thread = thread::spawn(move || {
+            barrier_for_thread.wait();
+            token_for_thread.deactivate_and_wait();
+            done_tx
+                .send(())
+                .expect("deactivation completion must be reported");
+        })
+        .expect("wake waiter failed to spawn");
+
+        barrier.wait();
+        thread.abort().expect("wake waiter abort must succeed");
+        assert!(
+            done_rx
+                .recv_timeout(veloq_std::time::Duration::from_millis(20))
+                .is_err(),
+            "aborting the waiter must not skip the active callback"
+        );
+        drop(active);
+        done_rx
+            .recv_timeout(veloq_std::time::Duration::from_millis(200))
+            .expect("deactivation must finish after callback quiescence");
+        let error = thread
+            .join()
+            .expect_err("aborted waiter must report an error");
+        assert_eq!(error.kind(), ThreadErrorKind::Aborted);
     }
 }

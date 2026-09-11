@@ -6,14 +6,14 @@
 //! `WaitOnAddress` 上），可测的是它依赖的那些唤醒路径 —— 一旦某条唤醒丢失，从前的忙等会
 //! 把它掩盖过去，现在则直接挂死，由 nextest 的 20s 超时抓住。
 
-use std::{
+use veloq_std::{
     convert::Infallible,
     future::Future,
     num::NonZeroUsize,
     pin::Pin,
     sync::{
-        Mutex,
-        atomic::{AtomicBool, Ordering},
+        NativeMutex as Mutex,
+        atomic::{NativeAtomicBool as AtomicBool, Ordering},
     },
     task::{Context, Poll, Waker},
     thread::{scope, sleep, yield_now as thread_yield},
@@ -190,18 +190,20 @@ fn a_parked_worker_wakes_on_a_foreign_thread_wake() {
     let fired = AtomicBool::new(false);
 
     scope(|threads| {
-        threads.spawn(|| {
-            loop {
-                let waker = slot.lock().expect("waker slot").take();
-                if let Some(waker) = waker {
-                    sleep(Duration::from_millis(50));
-                    fired.store(true, Ordering::Release);
-                    waker.wake();
-                    return;
+        threads
+            .spawn(|| {
+                loop {
+                    let waker = slot.lock().expect("waker slot").take();
+                    if let Some(waker) = waker {
+                        sleep(Duration::from_millis(50)).expect("foreign wake thread aborted");
+                        fired.store(true, Ordering::Release);
+                        waker.wake();
+                        return;
+                    }
+                    thread_yield().expect("foreign wake thread aborted");
                 }
-                thread_yield();
-            }
-        });
+            })
+            .expect("foreign wake thread failed to spawn");
 
         with_workers(2)
             .scope(async |ctx| {

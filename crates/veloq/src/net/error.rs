@@ -1,5 +1,5 @@
 use diagweave::set;
-use std::io::Error as IoError;
+use veloq_std::io::Error as IoError;
 
 set! {
     pub TcpError = {

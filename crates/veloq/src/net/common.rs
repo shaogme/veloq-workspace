@@ -1,10 +1,12 @@
 use veloq_std::{
+    boxed::Box,
     marker::PhantomData,
     net::SocketAddr,
     ops::Deref,
     ptr::null_mut,
     rc::Rc,
     sync::{Arc, UnpoisonedMutex},
+    vec,
 };
 
 use crate::{

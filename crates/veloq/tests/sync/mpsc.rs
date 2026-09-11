@@ -1,10 +1,10 @@
-use std::ops::AsyncFnOnce;
 use veloq::{
     nz,
     runtime::{Runtime, context::Ctx, scope},
 };
 use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier};
 use veloq_runtime::task::yield_now;
+use veloq_std::ops::AsyncFnOnce;
 use veloq_sync::mpsc;
 
 fn run_test<F, R>(f: F) -> R
@@ -62,7 +62,7 @@ fn test_sync_unbounded_multi_thread() {
 #[test]
 fn test_sync_unbounded_stream() {
     use futures_util::Stream;
-    use std::pin::Pin;
+    use veloq_std::pin::Pin;
 
     run_test(async |ctx| {
         let state = mpsc::unbounded();
@@ -77,7 +77,7 @@ fn test_sync_unbounded_stream() {
 
             let mut stream = Box::pin(rx);
             async fn next_item<S: Stream<Item = i32> + Unpin>(s: &mut S) -> Option<i32> {
-                use std::future::poll_fn;
+                use veloq_std::future::poll_fn;
                 poll_fn(|cx| Pin::new(&mut *s).poll_next(cx)).await
             }
 

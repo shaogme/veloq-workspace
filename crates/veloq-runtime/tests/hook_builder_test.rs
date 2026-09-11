@@ -1,9 +1,9 @@
-use std::{
+use veloq_std::{
     future::poll_fn,
     num::NonZeroUsize,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        NativeArc as Arc, NativeMutex as Mutex,
+        atomic::{NativeAtomicUsize as AtomicUsize, Ordering},
     },
     task::{Context, Poll, Waker},
 };

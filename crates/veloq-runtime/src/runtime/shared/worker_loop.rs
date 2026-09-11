@@ -9,10 +9,10 @@
 //! - [`ScopeJoinController`]：作用域析构 join，跑到该作用域的子任务全部结束。
 //! - [`BlockOnController`]：`block_on` 主线程，额外驱动外层 future，跑到它就绪。
 
-use std::{
+use veloq_std::{
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::NativeArc as Arc,
     task::{Context, Poll, Waker},
 };
 

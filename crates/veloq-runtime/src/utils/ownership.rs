@@ -1,8 +1,9 @@
-use std::{
+use veloq_std::{
     ops::Deref,
     rc::{Rc, Weak as RcWeak},
-    sync::{Arc, Weak as ArcWeak},
 };
+
+use veloq_std::sync::{NativeArc as Arc, NativeWeak as ArcWeak};
 
 use veloq_storage::StrategyType;
 

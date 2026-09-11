@@ -1,4 +1,4 @@
-use std::{future::Future, ops::AsyncFnOnce};
+use veloq_std::{future::Future, ops::AsyncFnOnce};
 
 use crate::{
     error::Result,

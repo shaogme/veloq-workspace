@@ -1,4 +1,4 @@
-use std::future::Ready;
+use veloq_std::future::Ready;
 
 use veloq_runtime::{error::RuntimeError, runtime::Runtime};
 

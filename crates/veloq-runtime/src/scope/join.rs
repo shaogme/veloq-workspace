@@ -11,16 +11,17 @@ use crate::{
     },
 };
 use diagweave::{Report, prelude::*};
-use std::{
+use veloq_intrusive_linklist::Link;
+use veloq_std::{
+    boxed::Box,
     cell::Cell,
     future::Future,
     marker::{PhantomData, PhantomPinned},
     pin::Pin,
     ptr::NonNull,
-    sync::Arc,
+    sync::NativeArc as Arc,
     task::{Context, Poll},
 };
-use veloq_intrusive_linklist::Link;
 use veloq_storage::{AtomicStorage, StateLock, Storage};
 
 /// Outcome of awaiting a [`JoinHandle`].

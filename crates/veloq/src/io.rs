@@ -1,4 +1,4 @@
-use std::{error::Error, future::Future};
+use veloq_std::{error::Error, future::Future};
 
 use veloq_buf::FixedBuf;
 

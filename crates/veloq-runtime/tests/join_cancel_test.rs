@@ -1,6 +1,6 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use veloq_std::sync::{
+    NativeArc as Arc,
+    atomic::{NativeAtomicBool as AtomicBool, Ordering},
 };
 
 use veloq_runtime::{
@@ -121,7 +121,7 @@ fn routed_handle_can_cancel_after_remote_job_is_published() {
                 let task_started = started.clone();
                 let mut handle = scope.spawn_boxed_to(1, async move || {
                     task_started.store(true, Ordering::Release);
-                    std::future::pending::<usize>().await
+                    veloq_std::future::pending::<usize>().await
                 });
 
                 while !started.load(Ordering::Acquire) {

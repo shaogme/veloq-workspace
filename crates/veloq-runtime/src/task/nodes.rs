@@ -7,14 +7,14 @@ use crate::{
         poll_task_internal,
     },
 };
-use std::{
+use veloq_std::cell::UnsafeCell;
+use veloq_std::{
     future::Future,
     pin::Pin,
     ptr::NonNull,
     sync::atomic::Ordering,
     task::{Context, Poll, RawWakerVTable},
 };
-use veloq_std::cell::UnsafeCell;
 use veloq_storage::{AtomicStorage, LocalStorage, StateInt, Storage, ThreadSafeStorage};
 
 const STATUS_RUNNING: usize = 0;

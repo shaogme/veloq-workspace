@@ -1,9 +1,9 @@
-use std::{
+use veloq_std::{
     future::Future,
     pin::Pin,
     sync::{
-        Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        NativeMutex as Mutex,
+        atomic::{NativeAtomicBool as AtomicBool, NativeAtomicUsize as AtomicUsize, Ordering},
     },
     task::{Context, Poll, Waker},
     thread::{scope, yield_now as thread_yield},
@@ -83,29 +83,31 @@ fn local_task_foreign_wake_uses_owner_mailbox() {
     let stale_waker = Mutex::new(None);
 
     scope(|threads| {
-        threads.spawn(|| {
-            loop {
-                let waker = waker_slot.lock().expect("local waker slot").take();
-                let Some(waker) = waker else {
-                    thread_yield();
-                    continue;
-                };
+        threads
+            .spawn(|| {
+                loop {
+                    let waker = waker_slot.lock().expect("local waker slot").take();
+                    let Some(waker) = waker else {
+                        thread_yield().expect("foreign wake thread aborted");
+                        continue;
+                    };
 
-                let foreign_context = Context::from_waker(&waker);
-                foreign_context_is_cancelled
-                    .store(foreign_context.is_cancelled(), Ordering::Release);
-                foreign_context_has_scope.store(
-                    foreign_context.scope_completion().is_some(),
-                    Ordering::Release,
-                );
-                fired.store(true, Ordering::Release);
-                for _ in 0..32 {
-                    waker.wake_by_ref();
+                    let foreign_context = Context::from_waker(&waker);
+                    foreign_context_is_cancelled
+                        .store(foreign_context.is_cancelled(), Ordering::Release);
+                    foreign_context_has_scope.store(
+                        foreign_context.scope_completion().is_some(),
+                        Ordering::Release,
+                    );
+                    fired.store(true, Ordering::Release);
+                    for _ in 0..32 {
+                        waker.wake_by_ref();
+                    }
+                    *stale_waker.lock().expect("stale local waker slot") = Some(waker);
+                    return;
                 }
-                *stale_waker.lock().expect("stale local waker slot") = Some(waker);
-                return;
-            }
-        });
+            })
+            .expect("foreign wake thread failed to spawn");
 
         Runtime::<(), _>::scope(async |ctx| {
             scope_local!(ctx, async |local_scope| {

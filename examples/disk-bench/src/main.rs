@@ -1,14 +1,5 @@
 use clap::{Parser, ValueEnum};
 use rand::prelude::*;
-use std::{
-    cmp::Ordering,
-    fmt::{self, Display, Formatter},
-    fs::remove_file,
-    io,
-    num::NonZeroUsize,
-    path::PathBuf,
-    time::{Duration, Instant},
-};
 use veloq::{
     buf::{UniformSlot, heap::ThreadMemoryMultiplier},
     fs::{BufferingMode, File, OpenOptions},
@@ -16,6 +7,18 @@ use veloq::{
     nz,
     runtime::{Runtime, context::Ctx, scope},
     sync::mpsc,
+};
+use veloq_std::{
+    cmp::Ordering,
+    fmt::{self, Display, Formatter},
+    format,
+    fs::remove_file,
+    io,
+    num::NonZeroUsize,
+    path::PathBuf,
+    println,
+    time::{Duration, Instant},
+    vec::Vec,
 };
 
 #[derive(Clone, Copy, ValueEnum, Debug)]

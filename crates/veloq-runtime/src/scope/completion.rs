@@ -1,7 +1,8 @@
 use crate::{
+    error::Result,
     runtime::{
         cancellation::{CancelWaiterLinkResult, GenericCancellationToken},
-        primitives::{Unparker, create_unpark_waker},
+        primitives::{Unparker, create_unpark_waker, wait_error_to_runtime},
     },
     task::{
         AnyScopeRef, AnySendScopeRef, CancellationWaiter, ErasedCancellationToken, RawScope,
@@ -9,16 +10,18 @@ use crate::{
     },
     utils::ownership::{ArcOwnership, Ownership, RcOwnership},
 };
-use std::{
+use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
+use veloq_std::panic::{AssertUnwindSafe, PanicPayload, catch_unwind};
+use veloq_std::{
+    boxed::Box,
     future::Future,
     marker::{PhantomData, PhantomPinned},
     pin::Pin,
     ptr::NonNull,
     sync::atomic::Ordering,
     task::{Context, Poll, Waker},
+    vec::Vec,
 };
-use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
-use veloq_std::panic::{AssertUnwindSafe, PanicPayload, catch_unwind};
 use veloq_storage::{
     AtomicStorage, LocalStorage, StateInt, StateLock, StateOptionBox, StrategyType,
 };
@@ -101,8 +104,10 @@ impl<'a, S: ScopeStorage, O: Ownership> ScopeBlockingWaiter<'a, S, O> {
     }
 
     /// 消费一次通知；没有通知时进入操作系统阻塞。
-    pub(crate) fn park(&self) {
-        self.unparker.park();
+    pub(crate) fn park(&self, worker_id: usize) -> Result<()> {
+        self.unparker
+            .park()
+            .map_err(|error| wait_error_to_runtime(error, worker_id))
     }
 }
 
@@ -398,8 +403,8 @@ impl<S: ScopeStorage, O: Ownership + 'static> RawScope for GenericScopeCompletio
 mod tests {
     use super::*;
     use crate::utils::ownership::ArcOwnership;
-    use std::sync::{Arc, Barrier, mpsc::sync_channel};
-    use std::thread;
+    use veloq_std::sync::{NativeArc as Arc, NativeBarrier as Barrier, mpsc::sync_channel};
+    use veloq_std::thread;
     use veloq_storage::AtomicStorage;
 
     #[test]
@@ -429,13 +434,16 @@ mod tests {
                 if completion_for_thread.is_done() {
                     break;
                 }
-                waiter.park();
+                waiter.park(usize::MAX).expect("waiter park failed");
             }
         });
 
         armed_rx.recv().expect("waiter thread exited early");
         completion.settle_task();
-        waiter_thread.join().expect("waiter thread panicked");
+        waiter_thread
+            .expect("waiter thread failed to spawn")
+            .join()
+            .expect("waiter thread panicked");
     }
 
     #[test]
@@ -446,7 +454,7 @@ mod tests {
 
         waiter.arm();
         completion.settle_task();
-        waiter.park();
+        waiter.park(usize::MAX).expect("waiter park failed");
         assert!(completion.is_done());
     }
 
@@ -458,12 +466,12 @@ mod tests {
 
         waiter.arm();
         completion.cancel();
-        waiter.park();
+        waiter.park(usize::MAX).expect("waiter park failed");
         assert!(!completion.is_done());
 
         waiter.arm();
         completion.settle_task();
-        waiter.park();
+        waiter.park(usize::MAX).expect("waiter park failed");
         assert!(completion.is_done());
     }
 
@@ -477,20 +485,22 @@ mod tests {
             for _ in 0..2 {
                 let completion_for_thread = completion.clone();
                 let barrier_for_thread = barrier.clone();
-                scope.spawn(move || {
-                    let mut waiter =
-                        ScopeBlockingWaiter::new(&completion_for_thread, Unparker::new());
-                    waiter.arm();
-                    barrier_for_thread.wait();
-
-                    while !completion_for_thread.is_done() {
+                scope
+                    .spawn(move || {
+                        let mut waiter =
+                            ScopeBlockingWaiter::new(&completion_for_thread, Unparker::new());
                         waiter.arm();
-                        if completion_for_thread.is_done() {
-                            break;
+                        barrier_for_thread.wait();
+
+                        while !completion_for_thread.is_done() {
+                            waiter.arm();
+                            if completion_for_thread.is_done() {
+                                break;
+                            }
+                            waiter.park(usize::MAX).expect("waiter park failed");
                         }
-                        waiter.park();
-                    }
-                });
+                    })
+                    .expect("scope waiter failed to spawn");
             }
 
             barrier.wait();

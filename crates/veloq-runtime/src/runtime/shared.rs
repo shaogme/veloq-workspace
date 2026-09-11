@@ -1,8 +1,15 @@
-use std::{
+use veloq_std::vec;
+use veloq_std::{
+    boxed::Box,
     hint::spin_loop,
     num::NonZeroUsize,
     ptr::NonNull,
-    sync::{Arc, atomic::Ordering},
+    string::String,
+    sync::{
+        NativeArc as Arc, UnpoisonedMutex, UnpoisonedMutexGuard, atomic::AtomicUsize,
+        atomic::Ordering,
+    },
+    vec::Vec,
 };
 
 use crossbeam_deque::Worker;
@@ -10,7 +17,6 @@ use crossbeam_queue::ArrayQueue;
 use diagweave::prelude::*;
 use numaperf_topo::Topology;
 use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
-use veloq_std::sync::UnpoisonedMutexGuard;
 use veloq_storage::StateOptionPtr;
 use veloq_tls::Tls;
 
@@ -65,10 +71,18 @@ pub struct RuntimeSharedBase {
     pub(crate) idle: IdleController,
     pub(crate) shutdown: Arc<ShutdownCoordinator>,
     pub(crate) wake_failure: Arc<WakeFailureState>,
+    worker_abort: AtomicUsize,
+    wait_failure: UnpoisonedMutex<Option<WaitFailure>>,
     pub(crate) local_wake_targets: Box<[Arc<LocalWakeTarget>]>,
     pub(crate) worker_tick_hook: Option<WorkerTickHook>,
     /// Worker 线程核心上下文（不含用户 extra 状态）。
     pub(crate) tls: Tls<RuntimeTlsInner>,
+}
+
+#[derive(Clone)]
+struct WaitFailure {
+    worker_id: usize,
+    detail: String,
 }
 
 /// Worker 进入 idle 等待阶段时调用的 hook。
@@ -224,6 +238,8 @@ impl<T> RuntimeShared<T> {
                 idle: IdleController::new(worker_count.get(), event_count),
                 shutdown,
                 wake_failure,
+                worker_abort: AtomicUsize::new(usize::MAX),
+                wait_failure: UnpoisonedMutex::new(None),
                 local_wake_targets,
                 worker_tick_hook,
                 tls: Tls::new(),
@@ -245,7 +261,42 @@ impl RuntimeSharedBase {
         &self.registry.unparkers[worker_id]
     }
 
+    pub(crate) fn record_thread_abort(&self, worker_id: usize) {
+        if self
+            .worker_abort
+            .compare_exchange(usize::MAX, worker_id, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.shutdown.request_shutdown();
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn record_wait_failure(&self, worker_id: usize, detail: String) {
+        let mut failure = self.wait_failure.lock();
+        if failure.is_none() {
+            *failure = Some(WaitFailure { worker_id, detail });
+        }
+        drop(failure);
+        self.shutdown.request_shutdown();
+    }
+
     pub(crate) fn fatal_error(&self) -> Option<Report<RuntimeError>> {
+        if let Some(worker_id) = match self.worker_abort.load(Ordering::Acquire) {
+            usize::MAX => None,
+            worker_id => Some(worker_id),
+        } {
+            return Some(RuntimeError::ThreadAborted { worker_id }.to_report());
+        }
+        if let Some(failure) = self.wait_failure.lock().clone() {
+            return Some(
+                RuntimeError::WaitFailed {
+                    worker_id: failure.worker_id,
+                    detail: failure.detail,
+                }
+                .to_report(),
+            );
+        }
         if self.shutdown.drain_failed() {
             return Some(
                 RuntimeError::InvariantViolation {
@@ -968,7 +1019,7 @@ impl<T> RuntimeShared<T> {
                 if completion.is_done() {
                     break;
                 }
-                waiter.park();
+                waiter.park(usize::MAX)?;
             }
             return self.base.fatal_error().map_or(Ok(()), Err);
         }
@@ -993,7 +1044,7 @@ impl<T> RuntimeShared<T> {
                     if completion.is_done() {
                         break;
                     }
-                    waiter.park();
+                    waiter.park(worker_id)?;
                 }
             }
         }
@@ -1018,17 +1069,17 @@ mod tests {
         task::{GenericWakerNode, ScopeRef, TaskVTable},
         utils::ownership::ArcOwnership,
     };
-    use std::{
+    use veloq_intrusive_linklist::Link;
+    use veloq_std::{
         marker::{PhantomData, PhantomPinned},
         pin::Pin,
         result::Result as StdResult,
         sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
+            NativeArc as Arc,
+            atomic::{NativeAtomicUsize as AtomicUsize, Ordering},
         },
         task::{RawWaker, Waker},
     };
-    use veloq_intrusive_linklist::Link;
     use veloq_storage::AtomicStorage;
 
     struct RecordingWaker {
@@ -1043,12 +1094,13 @@ mod tests {
         }
     }
 
-    static PANIC_WAKER_VTABLE: std::task::RawWakerVTable = std::task::RawWakerVTable::new(
-        |_| std::task::RawWaker::new(std::ptr::null(), &PANIC_WAKER_VTABLE),
-        |_| panic!("completion waker panic"),
-        |_| {},
-        |_| {},
-    );
+    static PANIC_WAKER_VTABLE: veloq_std::task::RawWakerVTable =
+        veloq_std::task::RawWakerVTable::new(
+            |_| veloq_std::task::RawWaker::new(veloq_std::ptr::null(), &PANIC_WAKER_VTABLE),
+            |_| panic!("completion waker panic"),
+            |_| {},
+            |_| {},
+        );
 
     static GLOBAL_DRAIN_DROPS: AtomicUsize = AtomicUsize::new(0);
 
@@ -1073,6 +1125,23 @@ mod tests {
         let queue_capacity = NonZeroUsize::new(1).expect("one queue slot");
         let (registry, topo, _) = init_runtime_components(worker_count, queue_capacity);
         RuntimeShared::new(registry, topo, worker_count, None, None, None)
+    }
+
+    #[test]
+    fn worker_abort_is_recorded_as_fatal_runtime_error() {
+        let shared = test_shared();
+
+        shared.base.record_thread_abort(0);
+
+        assert_eq!(shared.base.shutdown.phase(), ShutdownPhase::StopRequested);
+        let report = shared
+            .base
+            .fatal_error()
+            .expect("worker abort must be observable");
+        assert!(matches!(
+            report.inner(),
+            RuntimeError::ThreadAborted { worker_id: 0 }
+        ));
     }
 
     #[test]
@@ -1112,7 +1181,7 @@ mod tests {
         unsafe { header.initialize(&shared.base, 0, scope) };
         header.claim_scope_obligation();
         let panic_waker =
-            unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &PANIC_WAKER_VTABLE)) };
+            unsafe { Waker::from_raw(RawWaker::new(veloq_std::ptr::null(), &PANIC_WAKER_VTABLE)) };
         let mut node = GenericWakerNode {
             waker: panic_waker.clone(),
             link: Link::new(),

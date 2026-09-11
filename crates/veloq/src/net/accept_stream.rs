@@ -16,7 +16,7 @@
 //! [`crate::net::TcpListener`] 上的流走 `DetachedOp`——和这两种 listener 上其它每个操作
 //! 的选择一致。
 
-use std::{
+use veloq_std::{
     mem::size_of,
     net::SocketAddr,
     pin::Pin,

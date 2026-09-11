@@ -1,5 +1,5 @@
 use diagweave::{Report, set};
-use std::{borrow::Cow, error::Error, fmt, result::Result as StdResult};
+use veloq_std::{borrow::Cow, error::Error, fmt, result::Result as StdResult, string::String};
 
 /// 本地任务无法发布到 owner worker 队列时的结构化原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +102,15 @@ set! {
             source: veloq_std::thread::ThreadError,
         },
 
+        #[display("worker thread {worker_id} observed cooperative abort")]
+        ThreadAborted { worker_id: usize },
+
+        #[display("runtime wait failed on worker {worker_id}: {detail}")]
+        WaitFailed {
+            worker_id: usize,
+            detail: String,
+        },
+
         #[display("worker_factory has already been taken")]
         WorkerFactoryAlreadyTaken,
 
@@ -166,6 +175,7 @@ pub type Result<T> = StdResult<T, Report<RuntimeError>>;
 #[cfg(test)]
 mod tests {
     use super::EnqueueError;
+    use veloq_std::string::ToString;
 
     #[test]
     fn enqueue_error_display_contains_worker_and_capacity() {

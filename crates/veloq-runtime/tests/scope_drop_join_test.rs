@@ -5,19 +5,20 @@
 //! 的，一个已经挂起的任务在没有唤醒的情况下永远看不到取消状态。**用例同时靠 nextest 的
 //! 超时兜底：只要 join 或取消唤醒任何一环缺失，它们就会挂住或断言失败。**
 
-use std::{
+use veloq_runtime::{
+    runtime::{RuntimeBuilder, RuntimeShared},
+    scope, select, task,
+    task::{RawTask, Task, TaskError},
+};
+use veloq_std::{
     future::Future,
     hint::spin_loop,
     num::NonZeroUsize,
     panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
-    sync::atomic::{AtomicBool, Ordering},
+    string::String,
+    sync::atomic::{NativeAtomicBool as AtomicBool, Ordering},
     task::{Context, Poll},
-};
-use veloq_runtime::{
-    runtime::{RuntimeBuilder, RuntimeShared},
-    scope, select, task,
-    task::{RawTask, Task, TaskError},
 };
 
 fn with_workers(count: usize) -> RuntimeBuilder<(), fn(usize, &RuntimeShared<()>)> {
@@ -99,7 +100,7 @@ fn dropping_a_scope_joins_a_parked_child() {
 /// `wait_all()` 抛出。
 #[test]
 fn panic_survives_a_dropped_scope() {
-    let result = catch_unwind(AssertUnwindSafe(|| {
+    let result = catch_unwind(AssertUnwindSafe::new(|| {
         with_workers(1)
             .scope(async |ctx| {
                 scope!(ctx, async |outer| {

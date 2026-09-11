@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use veloq_std::cell::Cell;
 
 /// 一个使用 WyRand 算法实现的快速伪随机数生成器。
 pub struct FastRand {

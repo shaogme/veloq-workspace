@@ -1,3 +1,5 @@
+#![no_std]
+
 pub mod config;
 pub mod error;
 pub mod fs;

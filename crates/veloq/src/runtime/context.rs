@@ -1,4 +1,7 @@
-use std::{cell::RefCell, fmt::Display, num::NonZeroUsize, ptr::NonNull, sync::mpsc};
+use veloq_std::{
+    boxed::Box, cell::RefCell, fmt::Display, format, num::NonZeroUsize, ptr::NonNull, sync::mpsc,
+    vec, vec::Vec,
+};
 
 use diagweave::prelude::*;
 use veloq_buf::{
@@ -604,7 +607,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use veloq_std::time::Duration;
 
     use super::*;
 

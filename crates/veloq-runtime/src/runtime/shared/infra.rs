@@ -1,19 +1,25 @@
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_queue::ArrayQueue;
-use std::{
+use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
+use veloq_std::vec;
+use veloq_std::{
+    boxed::Box,
     result::Result as StdResult,
-    sync::Arc,
+    sync::NativeArc as Arc,
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     thread,
+    vec::Vec,
 };
-use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
 use veloq_storage::{AtomicOptionPtr, StateOptionPtr};
 
 use crate::{
     error::{Result, RuntimeWakeError},
     runtime::{
         context::{IdleDecision, IdleWaitStrategy},
-        primitives::{EventCount, ShutdownCoordinator, Unparker, WakeFailureState},
+        primitives::{
+            EventCount, ShutdownCoordinator, Unparker, WaitError, WakeFailureState,
+            wait_error_to_runtime,
+        },
         shared::{RuntimeShared, worker_loop::LoopController},
     },
     task::{LocalTaskRef, SendTaskRef, TaskHeader},
@@ -664,7 +670,9 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
             None => IdleDecision::wait(IdleWaitStrategy::Block),
         };
         let Some(wait_strategy) = idle_decision.into_wait_strategy() else {
-            thread::yield_now();
+            thread::yield_now().map_err(|error| {
+                wait_error_to_runtime(WaitError::Aborted(error), self.worker_id)
+            })?;
             return Ok(());
         };
 
@@ -711,9 +719,9 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
         let unparker = self.shared.base.unparker(self.worker_id);
         match wait_strategy {
             IdleWaitStrategy::Block => unparker.park(),
-            IdleWaitStrategy::Timeout(timeout) => unparker.park_timeout(timeout),
+            IdleWaitStrategy::Timeout(timeout) => unparker.park_timeout(timeout).map(|_| ()),
         }
-        Ok(())
+        .map_err(|error| wait_error_to_runtime(error, self.worker_id))
     }
 
     /// 离开 idle 状态。
@@ -729,14 +737,15 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    use veloq_std::sync::{
+        NativeArc as Arc,
+        atomic::{NativeAtomicUsize as AtomicUsize, Ordering},
     };
+    use veloq_std::vec::Vec;
 
     use super::{AtomicBitset, EventCount, IdleController, IdleSlots, IdleStack, WakeResult};
     use crate::{error::RuntimeWakeError, runtime::primitives::RuntimeWaker};
-    use std::result::Result as StdResult;
+    use veloq_std::result::Result as StdResult;
 
     struct RecordingWaker {
         worker_id: usize,
@@ -757,8 +766,8 @@ mod tests {
         Arc<[AtomicUsize]>,
     ) {
         let worker_count = 4;
-        let worker_count_nz = std::num::NonZeroUsize::new(worker_count).expect("workers");
-        let queue_capacity = std::num::NonZeroUsize::new(1).expect("queue capacity");
+        let worker_count_nz = veloq_std::num::NonZeroUsize::new(worker_count).expect("workers");
+        let queue_capacity = veloq_std::num::NonZeroUsize::new(1).expect("queue capacity");
         let (registry, _, _) =
             crate::runtime::shared::init_runtime_components(worker_count_nz, queue_capacity);
         let calls: Arc<[AtomicUsize]> = (0..worker_count)
@@ -857,7 +866,7 @@ mod tests {
 
     #[test]
     fn idle_stack_generation_never_resets_on_empty() {
-        use std::sync::atomic::Ordering;
+        use veloq_std::sync::atomic::Ordering;
 
         let (stack, slots, _mask) = fixture(1);
         stack.push(0, &slots);

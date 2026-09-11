@@ -1,13 +1,13 @@
 use crate::runtime::context::Ctx;
-use std::{
+use veloq_driver_native::{
+    driver::{DriverRaw, PlatformDriver},
+    op::{DetachedOp, LocalOp, Op, Timeout as OpTimeout},
+};
+use veloq_std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
     time::{Duration, Instant},
-};
-use veloq_driver_native::{
-    driver::{DriverRaw, PlatformDriver},
-    op::{DetachedOp, LocalOp, Op, Timeout as OpTimeout},
 };
 
 type SleepDetachedOp<'rt> = DetachedOp<OpTimeout, <PlatformDriver<'rt> as DriverRaw>::SlotSpec>;

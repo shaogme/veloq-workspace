@@ -1,6 +1,14 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
-use std::{
+use veloq::{
+    buf::{UniformSlot, heap::ThreadMemoryMultiplier},
+    error,
+    fs::{BufferingMode, File},
+    nz,
+    runtime::{Runtime, context::Ctx, scope, scope_local},
+};
+use veloq_buf::FixedBuf;
+use veloq_std::{
     cmp::min,
     collections::VecDeque,
     env,
@@ -12,14 +20,6 @@ use std::{
     rc::Rc,
     time::{Duration, Instant},
 };
-use veloq::{
-    buf::{UniformSlot, heap::ThreadMemoryMultiplier},
-    error,
-    fs::{BufferingMode, File},
-    nz,
-    runtime::{Runtime, context::Ctx, scope, scope_local},
-};
-use veloq_buf::FixedBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BenchSyncMode {

@@ -30,7 +30,7 @@ pub use reentrant_mutex::{
 pub use spin_lock::{NativeSpinLock, NativeSpinLockGuard, const_native_spin_lock};
 
 #[cfg(not(feature = "loom"))]
-pub use alloc_crate::sync::Arc;
+pub use alloc_crate::sync::{Arc, Arc as NativeArc, Weak, Weak as NativeWeak};
 
 pub use mutex::raw::NativeRawMutex;
 pub use mutex::{NativeMutex, NativeMutexGuard, const_native_mutex};
@@ -88,6 +88,9 @@ pub use unpoisoned_rwlock::const_unpoisoned_rwlock;
 
 #[cfg(feature = "loom")]
 pub use loom::sync::Arc;
+
+#[cfg(feature = "loom")]
+pub use alloc_crate::sync::{Arc as NativeArc, Weak, Weak as NativeWeak};
 
 #[cfg(feature = "loom")]
 pub use mutex::{LoomMutex, LoomMutexGuard, raw::LoomRawMutex};

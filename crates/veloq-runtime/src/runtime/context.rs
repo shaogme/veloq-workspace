@@ -1,4 +1,5 @@
-use std::{
+use veloq_std::{
+    boxed::Box,
     future::{Future, poll_fn},
     marker::PhantomData,
     mem::replace,
@@ -6,7 +7,8 @@ use std::{
     ops::AsyncFnOnce,
     pin::Pin,
     ptr::NonNull,
-    sync::Arc,
+    string::String,
+    sync::NativeArc as Arc,
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -641,11 +643,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
+    use veloq_std::{
         mem::ManuallyDrop,
         sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
+            NativeArc as Arc,
+            atomic::{NativeAtomicBool as AtomicBool, Ordering},
         },
         task::{RawWaker, RawWakerVTable, Waker},
         time::Duration,
@@ -738,14 +740,14 @@ mod tests {
 
     #[test]
     fn route_job_drop_publishes_shutdown_error() {
-        type Job = fn() -> std::future::Ready<()>;
+        type Job = fn() -> veloq_std::future::Ready<()>;
 
-        let slot = RouteCell::<std::future::Ready<()>>::new();
-        let task = RouteJobTask::<Job, std::future::Ready<()>> {
+        let slot = RouteCell::<veloq_std::future::Ready<()>>::new();
+        let task = RouteJobTask::<Job, veloq_std::future::Ready<()>> {
             header: GenericTaskHeader::new_placeholder(
-                RouteJobTask::<Job, std::future::Ready<()>>::VTABLE,
+                RouteJobTask::<Job, veloq_std::future::Ready<()>>::VTABLE,
             ),
-            job: UnsafeCell::new(Some(|| std::future::ready(()))),
+            job: UnsafeCell::new(Some(|| veloq_std::future::ready(()))),
             slot: slot.clone(),
             marker: PhantomData,
         };
@@ -764,11 +766,12 @@ mod tests {
 
     #[test]
     fn route_finalizer_drop_finishes_header_and_slot() {
-        type Job = fn() -> std::future::Ready<()>;
+        type Job = fn() -> veloq_std::future::Ready<()>;
 
-        let slot = RouteCell::<std::future::Ready<()>>::new();
-        let header =
-            GenericTaskHeader::new_placeholder(RouteJobTask::<Job, std::future::Ready<()>>::VTABLE);
+        let slot = RouteCell::<veloq_std::future::Ready<()>>::new();
+        let header = GenericTaskHeader::new_placeholder(
+            RouteJobTask::<Job, veloq_std::future::Ready<()>>::VTABLE,
+        );
         let mut finalizer = RouteTaskFinalizer::new(&header, &slot);
         finalizer.publish_err(route_error(
             "context::tests",

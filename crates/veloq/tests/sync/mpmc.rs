@@ -1,7 +1,9 @@
-use std::ops::AsyncFnOnce;
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+use veloq_std::{
+    ops::AsyncFnOnce,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use veloq::{

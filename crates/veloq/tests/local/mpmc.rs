@@ -1,4 +1,4 @@
-use std::ops::AsyncFnOnce;
+use veloq_std::ops::AsyncFnOnce;
 
 use veloq::{
     local::mpmc,
@@ -74,8 +74,7 @@ fn test_multiple_producers_consumers() {
         let state = mpmc::bounded(2);
         let (tx, rx) = state.split();
 
-        use std::cell::RefCell;
-        use std::rc::Rc;
+        use veloq_std::{cell::RefCell, rc::Rc};
         let results = Rc::new(RefCell::new(Vec::new()));
 
         scope_local!(ctx, async |s| {
@@ -197,7 +196,7 @@ fn test_bounded_backpressure() {
 #[test]
 fn test_stream_conversion() {
     use futures_util::Stream;
-    use std::pin::Pin;
+    use veloq_std::pin::Pin;
 
     run_test(async |ctx| {
         let state = mpmc::unbounded();
@@ -212,7 +211,7 @@ fn test_stream_conversion() {
             let mut stream = Box::pin(rx.stream());
 
             async fn next_item<S: Stream<Item = i32> + Unpin>(s: &mut S) -> Option<i32> {
-                use std::future::poll_fn;
+                use veloq_std::future::poll_fn;
                 poll_fn(|cx| Pin::new(&mut *s).poll_next(cx)).await
             }
 

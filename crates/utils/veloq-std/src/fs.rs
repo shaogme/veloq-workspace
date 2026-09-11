@@ -10,6 +10,10 @@ use crate::{
     path::Path,
 };
 
+pub(crate) fn path_exists(path: &Path) -> bool {
+    sys::path_exists(path)
+}
+
 #[cfg(unix)]
 use crate::os::unix::{
     fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd},

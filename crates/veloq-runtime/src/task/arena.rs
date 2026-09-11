@@ -1,12 +1,14 @@
-use std::{
+use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
+use veloq_std::{
     alloc::{Layout, alloc, dealloc},
+    boxed::Box,
     marker::PhantomData,
     num::NonZeroUsize,
     pin::Pin,
     ptr::{self, NonNull},
     sync::atomic::Ordering,
+    vec::Vec,
 };
-use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 use veloq_storage::{StateInt, StateLock, StateOptionPtr, Storage, ThreadSafeStorage};
 
 /// 一个高性能的、块分配器接口。
@@ -429,13 +431,13 @@ unsafe impl<S: ThreadSafeStorage> Sync for GenericChunk<S> where
 #[cfg(test)]
 mod tests {
     use super::{ArenaAllocation, DropAdapter, GenericArena, GenericChunk};
-    use std::{
+    use veloq_intrusive_linklist::LinkedList;
+    use veloq_std::{
         alloc::Layout,
         num::NonZeroUsize,
         ptr::{self, NonNull},
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::atomic::{NativeAtomicUsize as AtomicUsize, Ordering},
     };
-    use veloq_intrusive_linklist::LinkedList;
     use veloq_storage::{AtomicStorage, StateLock, Storage};
 
     #[repr(C, align(8))]

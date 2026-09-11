@@ -24,6 +24,10 @@ pub mod array {
     pub use core::array::*;
 }
 
+pub mod borrow {
+    pub use alloc_crate::borrow::*;
+}
+
 pub mod any {
     pub use core::any::*;
 }
@@ -51,6 +55,10 @@ pub mod hint {
 
 pub mod ptr {
     pub use core::ptr::*;
+}
+
+pub mod result {
+    pub use core::result::*;
 }
 
 pub mod task {

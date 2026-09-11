@@ -19,7 +19,8 @@ pub(crate) use scope::{CancellationWaiter, CancellationWaiterAdapter};
 pub(crate) use wake::{LocalWakeHeaderGuard, LocalWakeTarget, TaskWakeToken};
 
 use crate::error::Result as RuntimeResult;
-use std::{
+use veloq_std::panic::{AssertUnwindSafe, PanicPayload, catch_unwind};
+use veloq_std::{
     fmt::{Debug, Formatter, Result as FmtResult},
     future::Future,
     marker::PhantomData,
@@ -27,7 +28,6 @@ use std::{
     ptr::NonNull,
     task::{Context, Poll},
 };
-use veloq_std::panic::{AssertUnwindSafe, PanicPayload, catch_unwind};
 use veloq_storage::{AtomicStorage, LocalStorage, StateLock, Storage};
 
 pub type TaskHeader = GenericTaskHeader<AtomicStorage>;

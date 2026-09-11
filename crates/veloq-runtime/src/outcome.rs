@@ -1,4 +1,4 @@
-use std::{convert::Infallible, fmt::Debug, result::Result as StdResult};
+use veloq_std::{convert::Infallible, fmt::Debug, result::Result as StdResult};
 
 /// Describes how a scope body completed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

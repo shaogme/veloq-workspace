@@ -1037,6 +1037,16 @@ impl Path {
         self.inner.as_encoded_bytes()
     }
 
+    /// Returns `true` if the path points to an existing file or directory.
+    ///
+    /// Errors while querying the path, including invalid path encodings, are
+    /// reported as `false`.
+    #[must_use]
+    #[inline]
+    pub fn exists(&self) -> bool {
+        crate::fs::path_exists(self)
+    }
+
     /// Copies `self` into a new `PathBuf`.
     #[must_use]
     #[inline]

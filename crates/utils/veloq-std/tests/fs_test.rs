@@ -190,6 +190,22 @@ fn test_file_set_len_and_metadata() {
 }
 
 #[test]
+fn test_path_exists() {
+    let guard = TempFileGuard::new("path_exists");
+    let path = guard.path();
+
+    assert!(!path.exists());
+    assert!(env::temp_dir().as_path().exists());
+
+    write(path, b"path exists").expect("write test file failed");
+    assert!(path.exists());
+
+    remove_file(path).expect("remove test file failed");
+    assert!(!path.exists());
+    assert!(!Path::new("invalid\0path").exists());
+}
+
+#[test]
 fn test_file_try_clone() {
     let guard = TempFileGuard::new("try_clone");
     let path = guard.path();

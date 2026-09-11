@@ -1,9 +1,9 @@
-use std::{
+use veloq_runtime::{runtime::Runtime, scope, scope::JoinOutcome, select, task::TaskError};
+use veloq_std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
 };
-use veloq_runtime::{runtime::Runtime, scope, scope::JoinOutcome, select, task::TaskError};
 
 struct ReadyFuture<T>(Option<T>);
 impl<T: Unpin + Copy> Future for ReadyFuture<T> {

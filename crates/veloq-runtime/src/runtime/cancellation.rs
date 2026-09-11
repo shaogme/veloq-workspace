@@ -1,10 +1,12 @@
-use std::{
+use veloq_std::{
+    boxed::Box,
     future::Future,
     marker::PhantomPinned,
     pin::Pin,
     ptr::NonNull,
     sync::atomic::Ordering,
     task::{Context, Poll, Waker},
+    vec::Vec,
 };
 
 use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
@@ -137,7 +139,7 @@ pub(crate) struct CancellationRegistration {
     /// 本地节点地址在注册期间必须保持稳定，因此不放入 `UnsafeCell`。
     pub(crate) local: CancellationWaiter,
     pub(crate) ancestors: UnsafeCell<Vec<AncestorRegistration>>,
-    armed: std::sync::atomic::AtomicBool,
+    armed: veloq_std::sync::atomic::AtomicBool,
 }
 
 impl CancellationRegistration {
@@ -145,7 +147,7 @@ impl CancellationRegistration {
         Self {
             local: CancellationWaiter::new(),
             ancestors: UnsafeCell::new(Vec::new()),
-            armed: std::sync::atomic::AtomicBool::new(false),
+            armed: veloq_std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -456,9 +458,9 @@ mod tests {
         task::{AnySendScopeRef, RawScope, ScopeRef},
         utils::ownership::ArcOwnership,
     };
-    use std::{
+    use veloq_std::{
         mem::ManuallyDrop,
-        sync::{Arc, atomic::AtomicUsize},
+        sync::{NativeArc as Arc, atomic::AtomicUsize},
         task::{Context, RawWaker, RawWakerVTable},
     };
     use veloq_storage::AtomicStorage;
@@ -552,7 +554,7 @@ mod tests {
         let mut cx = Context::from_waker(waker);
 
         {
-            let mut future = std::pin::pin!(token.cancelled());
+            let mut future = veloq_std::pin::pin!(token.cancelled());
             assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
             assert_eq!(token.inner.waiters.lock().len(), 1);
         }
@@ -562,7 +564,7 @@ mod tests {
     #[test]
     fn repeated_poll_keeps_one_waiter_and_refreshes_waker() {
         let token = GenericCancellationToken::<AtomicStorage, ArcOwnership>::new();
-        let mut future = std::pin::pin!(token.cancelled());
+        let mut future = veloq_std::pin::pin!(token.cancelled());
         let first = Waker::noop().clone();
         let second = Waker::noop().clone();
         let mut first_cx = Context::from_waker(&first);
@@ -579,7 +581,7 @@ mod tests {
     #[test]
     fn ready_future_disarms_before_it_is_dropped() {
         let token = GenericCancellationToken::<AtomicStorage, ArcOwnership>::new();
-        let mut future = std::pin::pin!(token.cancelled());
+        let mut future = veloq_std::pin::pin!(token.cancelled());
         let mut cx = Context::from_waker(Waker::noop());
 
         assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
@@ -629,7 +631,7 @@ mod tests {
             let waker = counting_waker(&counters);
             let mut cx = Context::from_waker(&waker);
             {
-                let mut future = std::pin::pin!(token.cancelled());
+                let mut future = veloq_std::pin::pin!(token.cancelled());
                 assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
                 assert_eq!(token.inner.waiters.lock().len(), 1);
             }
@@ -653,7 +655,7 @@ mod tests {
             wakes: AtomicUsize::new(0),
             drops: AtomicUsize::new(0),
         });
-        let mut future = std::pin::pin!(token.cancelled());
+        let mut future = veloq_std::pin::pin!(token.cancelled());
         let first_waker = counting_waker(&first);
         let second_waker = counting_waker(&second);
         let mut first_cx = Context::from_waker(&first_waker);
@@ -674,11 +676,11 @@ mod tests {
     #[test]
     fn independent_futures_have_independent_registrations() {
         let token = GenericCancellationToken::<AtomicStorage, ArcOwnership>::new();
-        let mut second = std::pin::pin!(token.cancelled());
+        let mut second = veloq_std::pin::pin!(token.cancelled());
         let mut cx = Context::from_waker(Waker::noop());
 
         {
-            let mut first = std::pin::pin!(token.cancelled());
+            let mut first = veloq_std::pin::pin!(token.cancelled());
             assert!(matches!(first.as_mut().poll(&mut cx), Poll::Pending));
             assert!(matches!(second.as_mut().poll(&mut cx), Poll::Pending));
             assert_eq!(token.inner.waiters.lock().len(), 2);
@@ -698,7 +700,7 @@ mod tests {
         let token = GenericCancellationToken::<AtomicStorage, ArcOwnership>::new_with_parent(Some(
             scope_ref(&parent),
         ));
-        let mut future = std::pin::pin!(token.cancelled());
+        let mut future = veloq_std::pin::pin!(token.cancelled());
         let mut cx = Context::from_waker(Waker::noop());
 
         assert!(matches!(future.as_mut().poll(&mut cx), Poll::Ready(())));
@@ -724,7 +726,7 @@ mod tests {
         let token = GenericCancellationToken::<AtomicStorage, ArcOwnership>::new_with_parent(Some(
             scope_ref(&parent),
         ));
-        let mut future = std::pin::pin!(token.cancelled());
+        let mut future = veloq_std::pin::pin!(token.cancelled());
         let mut cx = Context::from_waker(Waker::noop());
 
         assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
@@ -745,7 +747,7 @@ mod tests {
         let token = GenericCancellationToken::<AtomicStorage, ArcOwnership>::new_with_parent(Some(
             scope_ref(&parent),
         ));
-        let mut future = std::pin::pin!(token.cancelled());
+        let mut future = veloq_std::pin::pin!(token.cancelled());
         let mut cx = Context::from_waker(Waker::noop());
 
         assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
@@ -765,7 +767,7 @@ mod tests {
         ));
 
         {
-            let mut future = std::pin::pin!(token.cancelled());
+            let mut future = veloq_std::pin::pin!(token.cancelled());
             let mut cx = Context::from_waker(Waker::noop());
             assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
             assert_eq!(parent.cancel_token().inner.waiters.lock().len(), 1);

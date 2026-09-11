@@ -295,6 +295,15 @@ impl File {
     }
 }
 
+pub fn path_exists(path: &Path) -> bool {
+    let c_path = match CString::new(path.as_bytes()) {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
+    let mut stat: libc::stat = unsafe { core::mem::zeroed() };
+    unsafe { libc::stat(c_path.as_ptr(), &mut stat) == 0 }
+}
+
 #[derive(Clone, Debug)]
 pub struct FileAttr {
     pub(crate) stat: libc::stat,

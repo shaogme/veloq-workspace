@@ -3,7 +3,7 @@
 //! 验证入队失败时避免 job cell 双重释放，以及确保 scope 义务得到妥善结算（防止
 //! `wait_all` 永久挂起），用 `with_queue_capacity(1)` 把它们逼出来。
 
-use std::{convert::Infallible, num::NonZeroUsize, pin::Pin};
+use veloq_std::{convert::Infallible, num::NonZeroUsize, pin::Pin, vec};
 
 use veloq_runtime::{
     Outcome,

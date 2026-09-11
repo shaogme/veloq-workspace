@@ -9,7 +9,7 @@ use crate::{
     utils::ownership::{ArcOwnership, Ownership, RcOwnership},
 };
 use diagweave::prelude::*;
-use std::{
+use veloq_std::{
     alloc::Layout,
     future::Future,
     marker::PhantomData,

@@ -1,4 +1,4 @@
-use std::{
+use veloq_std::{
     num::NonZeroUsize,
     ops::AsyncFnOnce,
     time::{Duration, Instant},

@@ -9,9 +9,10 @@ use windows_sys::Win32::{
         BY_HANDLE_FILE_INFORMATION, CREATE_ALWAYS, CREATE_NEW, CreateFileW, DeleteFileW,
         FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_READONLY,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_BEGIN, FILE_CURRENT, FILE_END, FlushFileBuffers,
-        GetFileInformationByHandle, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
-        OPEN_ALWAYS, OPEN_EXISTING, ReadFile, SetEndOfFile, SetFilePointerEx, SetFileTime,
-        TRUNCATE_EXISTING, UnlockFile, WriteFile,
+        GetFileAttributesW, GetFileInformationByHandle, INVALID_FILE_ATTRIBUTES,
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, OPEN_ALWAYS, OPEN_EXISTING,
+        ReadFile, SetEndOfFile, SetFilePointerEx, SetFileTime, TRUNCATE_EXISTING, UnlockFile,
+        WriteFile,
     },
     System::IO::OVERLAPPED,
 };
@@ -522,6 +523,15 @@ impl File {
     pub fn into_inner(self) -> OwnedHandle {
         self.0
     }
+}
+
+pub fn path_exists(path: &Path) -> bool {
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return false;
+    }
+    wide.push(0);
+    unsafe { GetFileAttributesW(wide.as_ptr()) != INVALID_FILE_ATTRIBUTES }
 }
 
 #[derive(Clone, Debug)]

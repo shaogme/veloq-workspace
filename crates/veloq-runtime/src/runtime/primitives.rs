@@ -1,36 +1,61 @@
-use crate::error::RuntimeWakeError;
-use std::{
+use crate::error::{RuntimeError, RuntimeWakeError};
+use diagweave::{Report, prelude::*};
+use veloq_std::{
+    boxed::Box,
     mem::ManuallyDrop,
+    result::Result as StdResult,
     sync::{
-        Arc, OnceLock, Weak,
+        NativeArc as Arc, NativeWeak as Weak, OnceLock,
         atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
     task::{RawWaker, RawWakerVTable, Waker},
     time::Duration,
 };
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use veloq_std::string::ToString;
+
 use veloq_std::sync::{UnpoisonedCondvar, UnpoisonedMutex, UnpoisonedMutexGuard};
 
 // --- 系统级同步原语 (WaitOnAddress / Futex) ---
 
 pub(crate) mod sys {
-    use std::{sync::atomic::AtomicU32, time::Duration};
+    use veloq_std::{
+        fmt::{self, Display, Formatter},
+        result::Result as StdResult,
+        sync::atomic::AtomicU32,
+        thread::AbortedError,
+        time::Duration,
+    };
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     use veloq_futex::{FutexError, WaitOutcome, wait as futex_wait, wake as futex_wake};
 
     #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
-    use std::thread;
+    use veloq_std::thread;
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    pub type WaitError = FutexError;
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum WaitError {
+        Aborted(AbortedError),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        Futex(FutexError),
+    }
 
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    pub type WaitError = std::convert::Infallible;
+    impl Display for WaitError {
+        fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Aborted(error) => Display::fmt(error, formatter),
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                Self::Futex(error) => Display::fmt(error, formatter),
+            }
+        }
+    }
+
+    impl veloq_std::error::Error for WaitError {}
 
     #[cfg(windows)]
     mod win {
-        use std::ffi::c_void;
+        use veloq_std::ffi::c_void;
 
         #[link(name = "synchronization")]
         unsafe extern "system" {
@@ -45,7 +70,7 @@ pub(crate) mod sys {
     }
 
     #[cfg(windows)]
-    pub unsafe fn wait(addr: &AtomicU32, expected: u32) -> Result<(), WaitError> {
+    pub unsafe fn wait(addr: &AtomicU32, expected: u32) -> StdResult<(), WaitError> {
         let expected_val = expected;
         unsafe {
             win::WaitOnAddress(
@@ -63,7 +88,7 @@ pub(crate) mod sys {
         addr: &AtomicU32,
         expected: u32,
         timeout: Duration,
-    ) -> Result<(), WaitError> {
+    ) -> StdResult<(), WaitError> {
         let expected_val = expected;
         let millis = if timeout.is_zero() {
             0
@@ -87,7 +112,7 @@ pub(crate) mod sys {
     }
 
     #[cfg(windows)]
-    pub unsafe fn wake_all(addr: &AtomicU32) -> Result<(), WaitError> {
+    pub unsafe fn wake_all(addr: &AtomicU32) -> StdResult<(), WaitError> {
         unsafe {
             win::WakeByAddressAll(addr as *const _ as *const _);
         }
@@ -95,8 +120,10 @@ pub(crate) mod sys {
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    pub unsafe fn wait(addr: &AtomicU32, expected: u32) -> Result<(), WaitError> {
-        match unsafe { futex_wait(addr as *const AtomicU32 as *const u32, expected, None) }? {
+    pub unsafe fn wait(addr: &AtomicU32, expected: u32) -> StdResult<(), WaitError> {
+        match unsafe { futex_wait(addr as *const AtomicU32 as *const u32, expected, None) }
+            .map_err(WaitError::Futex)?
+        {
             WaitOutcome::Woken | WaitOutcome::TimedOut => Ok(()),
         }
     }
@@ -106,7 +133,7 @@ pub(crate) mod sys {
         addr: &AtomicU32,
         expected: u32,
         timeout: Duration,
-    ) -> Result<(), WaitError> {
+    ) -> StdResult<(), WaitError> {
         unsafe {
             futex_wait(
                 addr as *const AtomicU32 as *const u32,
@@ -115,17 +142,19 @@ pub(crate) mod sys {
             )
         }
         .map(|_| ())
+        .map_err(WaitError::Futex)
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    pub unsafe fn wake_all(addr: &AtomicU32) -> Result<(), WaitError> {
-        unsafe { futex_wake(addr as *const AtomicU32 as *const u32, i32::MAX as u32) }.map(|_| ())
+    pub unsafe fn wake_all(addr: &AtomicU32) -> StdResult<(), WaitError> {
+        unsafe { futex_wake(addr as *const AtomicU32 as *const u32, i32::MAX as u32) }
+            .map(|_| ())
+            .map_err(WaitError::Futex)
     }
 
     #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
-    pub unsafe fn wait(_addr: &AtomicU32, _expected: u32) -> Result<(), WaitError> {
-        thread::yield_now();
-        Ok(())
+    pub unsafe fn wait(_addr: &AtomicU32, _expected: u32) -> StdResult<(), WaitError> {
+        thread::yield_now().map(|_| ()).map_err(WaitError::Aborted)
     }
 
     #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
@@ -133,14 +162,27 @@ pub(crate) mod sys {
         _addr: &AtomicU32,
         _expected: u32,
         timeout: Duration,
-    ) -> Result<(), WaitError> {
-        thread::sleep(timeout);
-        Ok(())
+    ) -> StdResult<(), WaitError> {
+        thread::sleep(timeout).map_err(WaitError::Aborted)
     }
 
     #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
-    pub unsafe fn wake_all(_addr: &AtomicU32) -> Result<(), WaitError> {
+    pub unsafe fn wake_all(_addr: &AtomicU32) -> StdResult<(), WaitError> {
         Ok(())
+    }
+}
+
+pub(crate) use sys::WaitError;
+
+pub(crate) fn wait_error_to_runtime(error: WaitError, worker_id: usize) -> Report<RuntimeError> {
+    match error {
+        WaitError::Aborted(_) => RuntimeError::ThreadAborted { worker_id }.to_report(),
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        WaitError::Futex(error) => RuntimeError::WaitFailed {
+            worker_id,
+            detail: error.to_string(),
+        }
+        .to_report(),
     }
 }
 
@@ -174,7 +216,7 @@ impl Signal {
         }
     }
 
-    pub fn wait(&self) {
+    pub(crate) fn wait(&self) -> StdResult<(), WaitError> {
         loop {
             // Fast-path: try to consume the notification
             if self
@@ -182,29 +224,28 @@ impl Signal {
                 .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return;
+                return Ok(());
             }
             // Slow-path: block until notified
-            unsafe { sys::wait(&self.state, 0) }
-                .unwrap_or_else(|error| panic!("runtime futex wait failed: {error:?}"));
+            unsafe { sys::wait(&self.state, 0) }?;
         }
     }
 
-    pub fn wait_timeout(&self, duration: Duration) -> bool {
+    pub(crate) fn wait_timeout(&self, duration: Duration) -> StdResult<bool, WaitError> {
         if self
             .state
             .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            return true;
+            return Ok(true);
         }
 
-        unsafe { sys::wait_timeout(&self.state, 0, duration) }
-            .unwrap_or_else(|error| panic!("runtime futex timed wait failed: {error:?}"));
+        unsafe { sys::wait_timeout(&self.state, 0, duration) }?;
 
-        self.state
+        Ok(self
+            .state
             .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+            .is_ok())
     }
 }
 
@@ -567,7 +608,7 @@ static UNPARK_VTABLE: RawWakerVTable = RawWakerVTable::new(
 // --- 高性能唤醒原语 (Unparker) ---
 
 pub trait RuntimeWaker: Send + Sync {
-    fn wake(&self) -> Result<(), RuntimeWakeError>;
+    fn wake(&self) -> StdResult<(), RuntimeWakeError>;
 }
 
 pub(crate) struct UnparkerInner {
@@ -583,7 +624,7 @@ impl UnparkerInner {
     /// `bind` 之前的唤醒只能落到内置信号上 —— 未绑定时若静默什么都不做，等于丢唤醒；
     /// 而绑定了驱动 waker 的 worker 阻塞在驱动里、看不到信号，只能靠 waker 叫醒。
     /// 信号侧的额外成本只有一次 swap：状态停在「已通知」之后就不会再发系统调用。
-    fn wake(&self) -> Result<(), RuntimeWakeError> {
+    fn wake(&self) -> StdResult<(), RuntimeWakeError> {
         self.signal.notify();
         if self.failure.is_failed()
             && let Some(error) = self.failure.first_error()
@@ -643,7 +684,7 @@ impl Unparker {
         }
     }
 
-    pub fn bind(&self, waker: Arc<dyn RuntimeWaker>) -> Result<(), RuntimeWakeError> {
+    pub fn bind(&self, waker: Arc<dyn RuntimeWaker>) -> StdResult<(), RuntimeWakeError> {
         self.inner.waker.set(waker).map_err(|_| RuntimeWakeError {
             backend: "runtime",
             worker_id: usize::MAX,
@@ -652,7 +693,7 @@ impl Unparker {
         })
     }
 
-    pub fn unpark(&self) -> Result<(), RuntimeWakeError> {
+    pub fn unpark(&self) -> StdResult<(), RuntimeWakeError> {
         self.inner.wake()
     }
 
@@ -661,13 +702,13 @@ impl Unparker {
     }
 
     /// 阻塞直到本 worker 被 unpark。运行时未安装 `park_hook` 时的默认 park 实现。
-    pub(crate) fn park(&self) {
-        self.inner.signal.wait();
+    pub(crate) fn park(&self) -> StdResult<(), WaitError> {
+        self.inner.signal.wait()
     }
 
     /// 带超时的 [`Self::park`]。
-    pub(crate) fn park_timeout(&self, timeout: Duration) {
-        self.inner.signal.wait_timeout(timeout);
+    pub(crate) fn park_timeout(&self, timeout: Duration) -> StdResult<bool, WaitError> {
+        self.inner.signal.wait_timeout(timeout)
     }
 }
 
@@ -712,9 +753,9 @@ impl EventCount {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
+    use veloq_std::{
         sync::atomic::{AtomicUsize, Ordering},
-        thread::{scope, sleep},
+        thread::{AbortedError, scope, sleep},
         time::Duration,
     };
 
@@ -723,7 +764,7 @@ mod tests {
     }
 
     impl RuntimeWaker for FailingWaker {
-        fn wake(&self) -> Result<(), RuntimeWakeError> {
+        fn wake(&self) -> StdResult<(), RuntimeWakeError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Err(RuntimeWakeError {
                 backend: "test",
@@ -740,7 +781,7 @@ mod tests {
     fn unpark_before_park_does_not_block() {
         let unparker = Unparker::new();
         unparker.unpark().expect("unpark failed");
-        unparker.park();
+        unparker.park().expect("park failed");
     }
 
     /// 未 `bind` 任何驱动 waker 时，`unpark` 也必须能把线程从 `park` 里叫回来 ——
@@ -752,11 +793,13 @@ mod tests {
         assert!(!unparker.inner.signal.is_notified());
 
         scope(|threads| {
-            threads.spawn(|| {
-                sleep(Duration::from_millis(20));
-                unparker.unpark().expect("unpark failed");
-            });
-            unparker.park();
+            threads
+                .spawn(|| {
+                    sleep(Duration::from_millis(20)).expect("sleep failed");
+                    unparker.unpark().expect("unpark failed");
+                })
+                .expect("sleep worker failed to spawn");
+            unparker.park().expect("park failed");
         });
     }
 
@@ -764,7 +807,9 @@ mod tests {
     #[test]
     fn park_timeout_returns_without_an_unpark() {
         let unparker = Unparker::new();
-        unparker.park_timeout(Duration::from_millis(5));
+        unparker
+            .park_timeout(Duration::from_millis(5))
+            .expect("timed park failed");
     }
 
     /// `BlockOnSignal` 初始就是「待 poll」，且取走一次之后不会重复触发。
@@ -796,6 +841,16 @@ mod tests {
         assert_eq!(waker.calls.load(Ordering::Relaxed), 1);
         assert_eq!(unparker.inner.failure.error_count(), 1);
         assert_eq!(unparker.inner.failure.first_error(), Some(first));
+    }
+
+    #[test]
+    fn cooperative_abort_converts_to_runtime_error() {
+        let report = wait_error_to_runtime(WaitError::Aborted(AbortedError), 7);
+
+        assert!(matches!(
+            report.inner(),
+            RuntimeError::ThreadAborted { worker_id: 7 }
+        ));
     }
 
     #[test]
@@ -849,10 +904,13 @@ mod tests {
         scope(|threads| {
             let coordinator_for_thread = coordinator.clone();
             let handle = threads.spawn(move || coordinator_for_thread.request_shutdown());
-            std::thread::yield_now();
+            veloq_std::thread::yield_now().expect("yield failed");
             assert_eq!(coordinator.phase(), ShutdownPhase::Running);
             drop(gate);
-            handle.join().expect("shutdown requester panicked");
+            handle
+                .expect("shutdown requester failed to spawn")
+                .join()
+                .expect("shutdown requester panicked");
         });
 
         assert_eq!(coordinator.phase(), ShutdownPhase::StopRequested);

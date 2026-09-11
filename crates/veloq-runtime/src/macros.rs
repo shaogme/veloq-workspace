@@ -54,9 +54,9 @@ macro_rules! select {
     { $ctx:expr; biased; $pat:pat = $fut:expr => $handler:expr, $($r_pat:pat = $r_fut:expr => $r_handler:expr),+ $(,)? } => {
         {
             let _ = $ctx;
-            use std::future::{poll_fn, Future, IntoFuture};
-            use std::pin::Pin;
-            use std::task::Poll;
+            use $crate::__veloq_std::future::{poll_fn, Future, IntoFuture};
+            use $crate::__veloq_std::pin::Pin;
+            use $crate::__veloq_std::task::Poll;
             use $crate::task::RuntimeContextExt;
 
             const BRANCHES: usize = $crate::select!(@branch_len $pat = $fut => $handler $(, $r_pat = $r_fut => $r_handler)*);
@@ -87,9 +87,9 @@ macro_rules! select {
 
     { $ctx:expr; $pat:pat = $fut:expr => $handler:expr, $($r_pat:pat = $r_fut:expr => $r_handler:expr),+ $(,)? } => {
         {
-            use std::future::{poll_fn, Future, IntoFuture};
-            use std::pin::Pin;
-            use std::task::Poll;
+            use $crate::__veloq_std::future::{poll_fn, Future, IntoFuture};
+            use $crate::__veloq_std::pin::Pin;
+            use $crate::__veloq_std::task::Poll;
             use $crate::task::RuntimeContextExt;
 
             const BRANCHES: usize = $crate::select!(@branch_len $pat = $fut => $handler $(, $r_pat = $r_fut => $r_handler)*);
@@ -120,7 +120,7 @@ macro_rules! select {
 
     (@into_future $fut:expr) => {
         {
-            use std::future::IntoFuture;
+            use $crate::__veloq_std::future::IntoFuture;
             IntoFuture::into_future($fut)
         }
     };

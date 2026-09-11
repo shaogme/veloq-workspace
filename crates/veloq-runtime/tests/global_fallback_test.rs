@@ -1,13 +1,14 @@
 //! Global injector 在目标 NUMA 组没有 idle worker 时的跨组唤醒回归测试。
 
-use std::{
+use veloq_std::{
     future::{Future, poll_fn},
     pin::Pin,
     sync::{
-        Arc, Condvar, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        NativeArc as Arc, NativeCondvar as Condvar, NativeMutex as Mutex,
+        atomic::{NativeAtomicBool as AtomicBool, NativeAtomicUsize as AtomicUsize, Ordering},
     },
     task::{Context, Poll, Waker},
+    vec,
 };
 
 use veloq_runtime::{
@@ -26,7 +27,7 @@ struct RecordingWaker {
 }
 
 impl RuntimeWaker for RecordingWaker {
-    fn wake(&self) -> std::result::Result<(), RuntimeWakeError> {
+    fn wake(&self) -> veloq_std::result::Result<(), RuntimeWakeError> {
         self.calls[self.worker_id].fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -137,8 +138,8 @@ fn global_fallback_wakes_an_idle_worker_in_another_group() {
         .collect::<Vec<_>>()
         .into();
     let result = RuntimeBuilder::new()
-        .with_worker_count(std::num::NonZeroUsize::new(4))
-        .with_queue_capacity(std::num::NonZeroUsize::new(1).expect("queue capacity"))
+        .with_worker_count(veloq_std::num::NonZeroUsize::new(4))
+        .with_queue_capacity(veloq_std::num::NonZeroUsize::new(1).expect("queue capacity"))
         .with_test_topology(vec![0, 0, 1, 1])
         .with_idle_hook(keep_target_group_active)
         .with_park_hook(hold_other_group_workers)
@@ -261,13 +262,13 @@ fn global_fallback_wakes_an_idle_worker_in_another_group() {
 #[test]
 fn rejects_invalid_synthetic_topology() {
     let length_mismatch = RuntimeBuilder::new()
-        .with_worker_count(std::num::NonZeroUsize::new(2))
+        .with_worker_count(veloq_std::num::NonZeroUsize::new(2))
         .with_test_topology(vec![0])
         .scope(async |_ctx| ());
     assert!(length_mismatch.is_err());
 
     let invalid_group = RuntimeBuilder::new()
-        .with_worker_count(std::num::NonZeroUsize::new(2))
+        .with_worker_count(veloq_std::num::NonZeroUsize::new(2))
         .with_test_topology(vec![0, 2])
         .scope(async |_ctx| ());
     assert!(invalid_group.is_err());

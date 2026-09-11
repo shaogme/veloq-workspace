@@ -6,6 +6,12 @@ use veloq_runtime::{
     task::{TaskError, yield_now},
     task_local,
 };
+use veloq_std::{
+    format, println,
+    result::Result,
+    string::{String, ToString},
+    vec::Vec,
+};
 
 // --- 测试用例 ---
 

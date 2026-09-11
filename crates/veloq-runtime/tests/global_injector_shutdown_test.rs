@@ -3,12 +3,12 @@
 //! 通过可控的 runtime waker 触发 wake failure，并让作用域同时持有一批挂起任务。
 //! 运行时必须在停止发布后完成统一收尾，不能因为任务仍在队列或作用域中而永久等待。
 
-use std::{
+use veloq_std::{
     future::{pending, poll_fn},
     num::NonZeroUsize,
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        NativeArc as Arc,
+        atomic::{NativeAtomicBool as AtomicBool, Ordering},
     },
     task::Poll,
 };

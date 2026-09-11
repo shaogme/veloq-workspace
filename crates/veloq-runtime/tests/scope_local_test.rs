@@ -1,4 +1,4 @@
-use std::convert::Infallible;
+use veloq_std::convert::Infallible;
 
 use veloq_runtime::{
     Outcome,

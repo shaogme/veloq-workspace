@@ -365,6 +365,7 @@ dependencies = [
  "clap",
  "rand",
  "veloq",
+ "veloq-std",
 ]
 
 [[package]]

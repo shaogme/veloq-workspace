@@ -1,6 +1,4 @@
-use std::num::NonZeroUsize;
-
-use veloq_std::nz;
+use veloq_std::{num::NonZeroUsize, nz};
 
 pub use veloq_blocking::BlockingPoolConfig;
 pub use veloq_driver_native::config::{

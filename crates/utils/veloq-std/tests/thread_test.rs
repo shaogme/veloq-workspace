@@ -2,7 +2,8 @@
 
 use veloq_std::{
     sync::atomic::{NativeAtomicBool, Ordering},
-    thread::spawn,
+    thread::{ThreadErrorKind, spawn},
+    time::Duration,
 };
 
 #[test]
@@ -65,11 +66,11 @@ fn test_scope_nested() {
 fn test_yield_now() {
     veloq_std::thread::scope(|s| {
         s.spawn(|| {
-            let _ = veloq_std::thread::yield_now();
+            veloq_std::thread::yield_now().expect("yield should succeed");
         })
         .expect("Failed to spawn scoped thread");
     });
-    let _ = veloq_std::thread::yield_now();
+    veloq_std::thread::yield_now().expect("yield should succeed");
 }
 
 #[test]
@@ -78,7 +79,26 @@ fn test_thread_abort() {
         .expect("Failed to spawn RawJoinHandle");
 
     thread.abort().expect("Failed to abort RawJoinHandle");
-    let _ = thread.join();
+    let error = thread
+        .join()
+        .expect_err("aborted thread must report an error");
+    assert_eq!(error.kind(), ThreadErrorKind::Aborted);
+}
+
+#[test]
+fn test_sleep_reports_abort() {
+    let thread = spawn(
+        || {
+            while veloq_std::thread::sleep(Duration::from_millis(1)).is_ok() {}
+        },
+    )
+    .expect("Failed to spawn RawJoinHandle");
+
+    thread.abort().expect("Failed to abort RawJoinHandle");
+    let error = thread
+        .join()
+        .expect_err("aborted sleep must report an error");
+    assert_eq!(error.kind(), ThreadErrorKind::Aborted);
 }
 
 #[test]

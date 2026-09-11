@@ -1,4 +1,4 @@
-use std::net::{SocketAddr, ToSocketAddrs};
+use veloq_std::net::{SocketAddr, ToSocketAddrs};
 
 use crate::{
     error::Result,

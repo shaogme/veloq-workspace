@@ -1,7 +1,7 @@
 use super::error::Elapsed;
 use super::sleep::{LocalSleep, Sleep, sleep_until, sleep_until_local};
 use crate::runtime::context::Ctx;
-use std::{
+use veloq_std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},

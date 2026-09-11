@@ -9,16 +9,17 @@ use crate::{
     utils::ownership::{ArcOwnership, Ownership},
 };
 use diagweave::prelude::*;
-use std::{
+use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
+use veloq_std::{
     alloc::Layout,
+    boxed::Box,
     future::{Future, ready},
     marker::PhantomData,
     mem,
     ptr::{drop_in_place, write},
-    sync::Arc,
+    sync::NativeArc as Arc,
     task::Waker,
 };
-use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
 use veloq_storage::{AtomicLock, AtomicStorage, StateLock};
 use veloq_waker::MwsrWaker;
 
@@ -554,12 +555,12 @@ pub(crate) fn install_routed_pinned_task<'scope_ref, 'rt, T, Fut, TExtra>(
 mod tests {
     use super::*;
     use crate::task::TaskVTable;
-    use std::{
+    use veloq_std::{
         panic::{AssertUnwindSafe, catch_unwind},
         ptr::NonNull,
         sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
+            NativeArc as Arc,
+            atomic::{NativeAtomicUsize as AtomicUsize, Ordering},
         },
     };
 
@@ -655,7 +656,7 @@ mod tests {
         let state = RoutedSpawnState::<()>::new();
         state.fail_task(TaskError::Panic);
 
-        let duplicate = catch_unwind(AssertUnwindSafe(|| {
+        let duplicate = catch_unwind(AssertUnwindSafe::new(|| {
             state.fail_task(TaskError::Cancelled);
         }));
 
