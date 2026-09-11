@@ -1492,6 +1492,7 @@ name = "veloq-futex"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "veloq-std",
 ]
 
 [[package]]
@@ -1501,6 +1502,7 @@ dependencies = [
  "criterion",
  "libc",
  "rustc-hash",
+ "veloq-std",
 ]
 
 [[package]]
@@ -1524,6 +1526,9 @@ dependencies = [
 [[package]]
 name = "veloq-pod"
 version = "0.1.0"
+dependencies = [
+ "veloq-std",
+]
 
 [[package]]
 name = "veloq-runtime"
@@ -1587,6 +1592,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "loom",
+ "veloq-std",
  "windows-sys",
 ]
 
@@ -1605,6 +1611,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "slotmap",
+ "veloq-std",
 ]
 
 [[package]]

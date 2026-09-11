@@ -1,9 +1,6 @@
 #![no_std]
 #![deny(warnings)]
 
-#[cfg(test)]
-extern crate std;
-
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux;
 

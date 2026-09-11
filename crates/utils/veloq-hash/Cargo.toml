@@ -19,8 +19,8 @@ libc.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 rustc-hash.workspace = true
+veloq-std.workspace = true
 
 [[bench]]
 name = "collision_and_perf_bench"
 harness = false
-

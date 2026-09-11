@@ -59,10 +59,11 @@ pub use slot_pool::*;
 
 #[cfg(test)]
 mod tests {
-    extern crate std;
     use super::*;
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-    use veloq_std::num::NonZeroUsize;
+    use veloq_std::{
+        num::NonZeroUsize,
+        panic::{AssertUnwindSafe, catch_unwind},
+    };
 
     #[test]
     fn heap_view_preserves_borrow_semantics() {
@@ -99,7 +100,7 @@ mod tests {
 
         let start = 3;
         let end = 2;
-        let result = catch_unwind(AssertUnwindSafe(|| buf.view(start..end)));
+        let result = catch_unwind(AssertUnwindSafe::new(|| buf.view(start..end)));
         assert!(result.is_err());
 
         drop(buf);

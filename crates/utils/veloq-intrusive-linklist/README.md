@@ -27,8 +27,8 @@
 
 ```rust
 use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
-use std::boxed::Box;
-use std::pin::Pin;
+use veloq_std::boxed::Box;
+use veloq_std::pin::Pin;
 
 pub struct MyNode {
     pub data: i32,
@@ -71,8 +71,8 @@ fn main() {
 
 ```rust
 use veloq_intrusive_linklist::{ConcurrentLink, ConcurrentLinkedList, concurrent_intrusive_adapter};
-use std::boxed::Box;
-use std::pin::Pin;
+use veloq_std::boxed::Box;
+use veloq_std::pin::Pin;
 
 pub struct ConcurrentNode {
     pub value: String,

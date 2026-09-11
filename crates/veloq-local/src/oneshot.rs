@@ -1,5 +1,7 @@
-use std::{
-    cell::{Cell, UnsafeCell},
+use core::cell::UnsafeCell;
+
+use veloq_std::{
+    cell::Cell,
     error::Error,
     fmt,
     future::Future,

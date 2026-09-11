@@ -1,6 +1,6 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use std::hint::black_box;
-use std::time::Duration;
+use veloq_std::hint::black_box;
+use veloq_std::time::Duration;
 use veloq_wheel::{Wheel, WheelConfig};
 
 fn bench_wheel_advance(c: &mut Criterion) {

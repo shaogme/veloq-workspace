@@ -1,8 +1,8 @@
 #![cfg(feature = "loom")]
 use loom::thread;
-use std::future::Future;
-use std::ptr;
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use veloq_std::future::Future;
+use veloq_std::ptr;
+use veloq_std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use veloq_sync::oneshot;
 
 // --- Helper for manual polling (Same as loom_mpsc.rs) ---

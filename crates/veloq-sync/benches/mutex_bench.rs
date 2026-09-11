@@ -1,5 +1,5 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use std::{hint::black_box, sync::Arc};
+use veloq_std::{hint::black_box, sync::Arc};
 use veloq_sync::mutex::Mutex;
 
 fn bench_mutex_uncontended(c: &mut Criterion) {

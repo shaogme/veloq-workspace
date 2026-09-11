@@ -1,13 +1,13 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use std::{
+use veloq_buf::heap::{GlobalAllocatorConfig, GlobalSlotPool};
+use veloq_buf::{BufPool, SlotBasedPool};
+use veloq_std::{
     hint::black_box,
     num::NonZeroUsize,
     sync::{Arc, Barrier},
     thread::spawn,
     time::Instant,
 };
-use veloq_buf::heap::{GlobalAllocatorConfig, GlobalSlotPool};
-use veloq_buf::{BufPool, SlotBasedPool};
 
 fn bench_alloc(c: &mut Criterion) {
     let config = GlobalAllocatorConfig {
@@ -47,7 +47,10 @@ fn find_fastest_cores(count: usize) -> Vec<core_affinity::CoreId> {
             }
             sum
         });
-        let _ = handle.join().unwrap();
+        let _ = handle
+            .expect("thread spawn failed")
+            .join()
+            .expect("thread join failed");
         results.push((id, start.elapsed()));
     }
 
@@ -118,7 +121,9 @@ fn bench_threaded(c: &mut Criterion) {
             let elapsed = start.elapsed();
 
             for h in handles {
-                h.join().unwrap();
+                h.expect("thread spawn failed")
+                    .join()
+                    .expect("thread join failed");
             }
             elapsed
         })

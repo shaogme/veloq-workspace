@@ -1,7 +1,7 @@
 use core::{hash::Hasher, hint::black_box};
 use rustc_hash::FxHasher;
-use std::{collections::hash_map::DefaultHasher, time::Instant};
 use veloq_hash::{VeloqFastHasher, VeloqHasher};
+use veloq_std::{collections::hash_map::DefaultHasher, time::Instant};
 
 fn run_perf_bench<H, F>(name: &str, sizes: &[usize], mut build_hasher: F)
 where

@@ -1,3 +1,5 @@
+#![no_std]
+
 pub mod atomic;
 mod common;
 pub mod mwsr;

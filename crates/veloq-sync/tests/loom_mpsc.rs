@@ -2,9 +2,9 @@
 
 use loom::sync::Arc;
 use loom::thread;
-use std::future::Future;
-use std::ptr;
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use veloq_std::future::Future;
+use veloq_std::ptr;
+use veloq_std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use veloq_sync::mpsc;
 
 // --- Helper for manual polling ---

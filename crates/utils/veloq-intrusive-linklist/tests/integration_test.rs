@@ -1,5 +1,5 @@
-use std::boxed::Box;
 use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
+use veloq_std::boxed::Box;
 
 struct MyNode {
     id: usize,

@@ -1,8 +1,9 @@
+use core::cell::UnsafeCell;
 use futures_core::Future;
 use futures_core::stream::Stream;
-use std::{
+
+use veloq_std::{
     alloc::{Layout, alloc, dealloc, handle_alloc_error},
-    cell::UnsafeCell,
     fmt, mem,
     mem::ManuallyDrop,
     pin::Pin,

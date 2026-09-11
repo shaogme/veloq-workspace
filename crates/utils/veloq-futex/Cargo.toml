@@ -15,5 +15,8 @@ categories.workspace = true
 [dependencies]
 libc.workspace = true
 
+[dev-dependencies]
+veloq-std.workspace = true
+
 [lints]
 workspace = true

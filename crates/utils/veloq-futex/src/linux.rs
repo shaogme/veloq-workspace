@@ -412,7 +412,7 @@ fn errno_result() -> i32 {
 mod tests {
     use super::*;
     use core::sync::atomic::AtomicU32;
-    use std::{string::ToString, sync::Arc, thread, time::Duration as StdDuration};
+    use veloq_std::{string::ToString, sync::Arc, thread, time::Duration as StdDuration};
 
     #[test]
     fn expected_mismatch_returns_woken() {
@@ -450,8 +450,9 @@ mod tests {
                 0,
                 None,
             )
-        });
-        thread::sleep(StdDuration::from_millis(5));
+        })
+        .expect("thread spawn failed");
+        thread::sleep(StdDuration::from_millis(5)).expect("thread sleep failed");
         let woken = unsafe { wake(value.as_ref() as *const AtomicU32 as *const u32, 1) }
             .expect("wake failed");
         assert!(woken <= 1);

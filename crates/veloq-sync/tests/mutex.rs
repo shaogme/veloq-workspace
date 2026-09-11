@@ -1,5 +1,5 @@
 #![cfg(not(feature = "loom"))]
-use std::sync::Arc;
+use veloq_std::sync::Arc;
 use veloq_sync::mutex::Mutex;
 
 #[tokio::test]

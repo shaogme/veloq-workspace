@@ -1,5 +1,5 @@
-use std::mem::size_of;
 use veloq_pod::*;
+use veloq_std::mem::size_of;
 
 #[test]
 fn test_bytes_of() {

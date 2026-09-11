@@ -1,4 +1,4 @@
-use std::{
+use veloq_std::{
     ptr::NonNull,
     sync::{Arc, atomic::Ordering},
 };

@@ -1,5 +1,5 @@
-use std::task::Waker;
-use std::{error::Error, fmt};
+use veloq_std::task::Waker;
+use veloq_std::{error::Error, fmt};
 
 /// Channel capacity configuration
 #[derive(Debug, Clone, Copy)]

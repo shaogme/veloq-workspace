@@ -5,7 +5,7 @@ use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 use crate::common::update_waker;
 pub use crate::common::{ChannelCapacity, SendError, TryRecvError};
 
-use std::{
+use veloq_std::{
     cell::RefCell,
     collections::VecDeque,
     marker::{PhantomData, PhantomPinned},

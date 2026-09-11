@@ -1,7 +1,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use std::future::Future;
-use std::task::{Context, Waker};
 use veloq_local::mpsc;
+use veloq_std::future::Future;
+use veloq_std::task::{Context, Waker};
 
 fn bench_poll_pending(c: &mut Criterion) {
     let state = mpsc::unbounded::<i32>();

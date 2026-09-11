@@ -1,11 +1,12 @@
 #[cfg(not(feature = "loom"))]
 mod normal_tests {
-    use std::{
+    use veloq_std::alloc_crate::task::Wake;
+    use veloq_std::{
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
-        task::{Wake, Waker},
+        task::Waker,
         thread,
     };
     use veloq_waker::AtomicWaker;
@@ -77,13 +78,15 @@ mod normal_tests {
         let waker1_clone = waker1.clone();
         let t1 = thread::spawn(move || {
             aw1.register(&waker1_clone);
-        });
+        })
+        .expect("thread spawn failed");
 
         let aw2 = atomic_waker.clone();
         let waker2_clone = waker2.clone();
         let t2 = thread::spawn(move || {
             aw2.register(&waker2_clone);
-        });
+        })
+        .expect("thread spawn failed");
 
         t1.join().unwrap();
         t2.join().unwrap();
@@ -164,10 +167,8 @@ mod loom_tests {
         },
         thread,
     };
-    use std::{
-        sync::Arc as StdArc,
-        task::{Wake, Waker},
-    };
+    use veloq_std::alloc_crate::task::Wake;
+    use veloq_std::{sync::NativeArc as StdArc, task::Waker};
     use veloq_waker::AtomicWaker;
 
     struct TestWaker(Arc<AtomicBool>);

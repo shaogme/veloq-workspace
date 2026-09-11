@@ -13,6 +13,7 @@ readme.workspace = true
 
 [dependencies]
 slotmap.workspace = true
+veloq-std.workspace = true
 [[bench]]
 name = "wheel_bench"
 harness = false

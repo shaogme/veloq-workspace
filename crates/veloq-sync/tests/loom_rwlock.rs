@@ -2,10 +2,10 @@
 
 use loom::sync::Arc;
 use loom::thread;
-use std::future::Future;
-use std::pin::Pin;
-use std::ptr;
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use veloq_std::future::Future;
+use veloq_std::pin::Pin;
+use veloq_std::ptr;
+use veloq_std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 use veloq_sync::rwlock::RwLock;
 
 fn dummy_waker() -> Waker {

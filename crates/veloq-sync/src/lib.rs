@@ -1,3 +1,5 @@
+#![no_std]
+
 pub mod mpmc;
 pub mod mpsc;
 pub mod mutex;

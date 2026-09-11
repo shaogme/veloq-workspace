@@ -18,7 +18,7 @@ veloq-intrusive-linklist.workspace = true
 veloq-std.workspace = true
 
 [features]
-loom = ["veloq-intrusive-linklist/loom"]
+loom = ["veloq-intrusive-linklist/loom", "veloq-std/loom"]
 std = ["veloq-intrusive-linklist/std", "veloq-std/std"]
 
 [dev-dependencies]

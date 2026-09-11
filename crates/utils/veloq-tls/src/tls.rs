@@ -293,11 +293,10 @@ impl<T> Drop for Tls<T> {
 
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
-    extern crate std;
     use super::*;
     use crate::veloq_tls;
     use alloc::string::{String, ToString};
-    use std::thread;
+    use veloq_std::thread;
 
     veloq_tls! {
         static MACRO_TLS_INT: i32 = 100;
@@ -330,6 +329,7 @@ mod tests {
                 )
                 .unwrap();
         })
+        .expect("thread spawn failed")
         .join()
         .unwrap();
 

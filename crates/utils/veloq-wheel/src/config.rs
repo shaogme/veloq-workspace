@@ -20,7 +20,7 @@ use core::{error::Error, fmt, time::Duration};
 /// # Examples (示例)
 /// ```no_run
 /// use veloq_wheel::WheelConfig;
-/// use std::time::Duration;
+/// use veloq_std::time::Duration;
 ///
 /// // Use default configuration (使用默认配置，分层模式)
 /// let config = WheelConfig::default();

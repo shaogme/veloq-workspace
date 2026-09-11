@@ -1,5 +1,5 @@
 #![cfg(not(feature = "loom"))]
-use std::{sync::Arc, time::Duration};
+use veloq_std::{sync::Arc, time::Duration};
 use veloq_sync::rwlock::RwLock;
 
 #[tokio::test]
