@@ -4,7 +4,6 @@ use crate::{
     utils::ownership::Ownership,
 };
 use std::{
-    any::Any,
     cell::UnsafeCell,
     fmt::{Debug, Formatter, Result as FmtResult},
     marker::PhantomData,
@@ -13,6 +12,7 @@ use std::{
     task::Waker,
 };
 use veloq_intrusive_linklist::{Link, intrusive_adapter};
+use veloq_std::panic::PanicPayload;
 use veloq_storage::{AtomicStorage, LocalStorage, Storage, StrategyType, ThreadSafeStorage};
 
 /// 任务挂在所属 scope 取消队列上的等待节点。
@@ -126,7 +126,7 @@ impl ErasedCancellationToken {
 pub trait RawScope {
     fn task_done(&self);
     fn cancel(&self);
-    fn report_panic(&self, payload: Box<dyn Any + Send + 'static>);
+    fn report_panic(&self, payload: PanicPayload);
     fn is_cancelled(&self) -> bool;
     fn try_link_child(&self, child_token: &ErasedCancellationToken) -> bool;
     fn parent(&self) -> Option<AnyScopeRef>;
@@ -162,7 +162,7 @@ unsafe impl<S: Storage> Sync for DummyScope<S> {}
 impl<S: Storage> RawScope for DummyScope<S> {
     fn task_done(&self) {}
     fn cancel(&self) {}
-    fn report_panic(&self, _payload: Box<dyn Any + Send + 'static>) {}
+    fn report_panic(&self, _payload: PanicPayload) {}
     fn is_cancelled(&self) -> bool {
         false
     }
@@ -327,7 +327,7 @@ impl<S: Storage> ScopeRef<S> {
     }
 
     #[inline]
-    pub fn report_panic(&self, payload: Box<dyn Any + Send + 'static>) {
+    pub fn report_panic(&self, payload: PanicPayload) {
         unsafe { self.as_ref().report_panic(payload) }
     }
 
@@ -428,7 +428,7 @@ impl AnySendScopeRef {
     }
 
     #[inline]
-    pub fn report_panic(&self, payload: Box<dyn Any + Send + 'static>) {
+    pub fn report_panic(&self, payload: PanicPayload) {
         self.0.report_panic(payload);
     }
 }
@@ -482,7 +482,7 @@ impl AnyScopeRef {
     /// payload 不能就地 `resume_unwind`（那会在任意 worker 线程上抛出），也不能静默丢弃，
     /// 于是沿 scope 树上交，由某一层的 `wait_all()` 抛出。
     #[inline]
-    pub fn report_panic(&self, payload: Box<dyn Any + Send + 'static>) {
+    pub fn report_panic(&self, payload: PanicPayload) {
         match self {
             Self::Local(s) => s.report_panic(payload),
             Self::Send(s) => s.report_panic(payload),

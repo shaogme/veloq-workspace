@@ -1,14 +1,14 @@
 pub mod traits;
 use traits::*;
 
+mod panic_state;
+pub use panic_state::{PanicState, PanicStateGuard, enter_panicking, panic_state};
+
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
 mod native;
 
 #[cfg(feature = "loom")]
 mod loom;
-
-#[cfg(feature = "std")]
-use std::thread::panicking as panicking_std;
 
 mod parker;
 mod sys;
@@ -241,14 +241,7 @@ pub fn available_parallelism() -> Result<NonZeroUsize, ThreadError> {
 
 /// 获取当前线程是否正在 panic。
 pub fn panicking() -> bool {
-    #[cfg(feature = "std")]
-    {
-        panicking_std()
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        false
-    }
+    panic_state::panicking()
 }
 
 /// 线程工厂，可用于配置新线程的属性。

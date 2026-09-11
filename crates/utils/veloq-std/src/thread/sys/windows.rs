@@ -8,7 +8,7 @@ use crate::{
     ffi::c_void,
     fmt::{Display, Formatter, Result as FmtResult},
     marker::PhantomData,
-    panic::catch_unwind_safe,
+    panic::{AssertUnwindSafe, catch_unwind},
     ptr::{null, null_mut},
     string::String,
     sync::{
@@ -139,7 +139,7 @@ where
     };
 
     if let Some(f) = unsafe { state.closure.with_mut(|x| x.take()) } {
-        let res = catch_unwind_safe(f);
+        let res = catch_unwind(AssertUnwindSafe::new(f));
         match res {
             Ok(r) => {
                 unsafe {
@@ -153,12 +153,9 @@ where
                     Ordering::Acquire,
                 );
             }
-            #[cfg(feature = "std")]
             Err(err) => unsafe {
-                state.panic_payload.with_mut(|opt| *opt = err);
+                state.panic_payload.with_mut(|opt| *opt = Some(err));
             },
-            #[cfg(not(feature = "std"))]
-            Err(err) => match err {},
         }
     }
 
@@ -180,10 +177,7 @@ where
         closure: UnsafeCell::new(Some(f)),
         status: AtomicU8::new(super::STATE_INCOMPLETE),
         result: SafeUnsafeCell::new(None),
-        #[cfg(feature = "std")]
         panic_payload: SafeUnsafeCell::new(None),
-        #[cfg(not(feature = "std"))]
-        panic_payload: SafeUnsafeCell::new(()),
         name,
         thread: thread.clone(),
     });
@@ -238,15 +232,9 @@ impl<'a, T: Send> RawJoinHandle<'a, T> {
             match receiver.receive() {
                 Ok(Some(val)) => Ok(val),
                 Ok(None) => Err(RawThreadError::ResultMissing),
-                #[cfg(feature = "std")]
                 Err(super::STATE_PANICKED) => {
                     let payload = state.take_panic();
                     Err(RawThreadError::from_panic(payload))
-                }
-                #[cfg(not(feature = "std"))]
-                Err(super::STATE_PANICKED) => {
-                    state.take_panic();
-                    Err(RawThreadError::from_panic(()))
                 }
                 Err(super::STATE_ABORTED) => Err(RawThreadError::Aborted),
                 Err(_) => Err(RawThreadError::Aborted),

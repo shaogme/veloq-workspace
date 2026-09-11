@@ -14,11 +14,11 @@ use std::{
     future::{Future, ready},
     marker::PhantomData,
     mem,
-    panic::{AssertUnwindSafe, catch_unwind},
     ptr::{drop_in_place, write},
     sync::Arc,
     task::Waker,
 };
+use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
 use veloq_storage::{AtomicLock, AtomicStorage, StateLock};
 use veloq_waker::MwsrWaker;
 
@@ -461,7 +461,7 @@ pub(crate) fn dispatch_routed<'rt, 'scope_ref, S: ScopeStorage, O: Ownership, T,
     let state_for_route = state.clone();
 
     if let Err(err) = context.route_to(worker_id, move || {
-        let result = catch_unwind(AssertUnwindSafe(|| job(&mut guard)));
+        let result = catch_unwind(AssertUnwindSafe::new(|| job(&mut guard)));
 
         if let Err(panic_err) = result {
             completion.report_panic(panic_err);

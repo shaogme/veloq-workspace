@@ -14,9 +14,11 @@ use std::{
     future::Future,
     marker::PhantomData,
     ops::AsyncFnOnce,
-    panic::resume_unwind,
     ptr::{NonNull, drop_in_place, write},
-    thread::panicking,
+};
+use veloq_std::{
+    panic::resume_unwind,
+    thread::{PanicState, panic_state},
 };
 use veloq_storage::{AtomicStorage, LocalStorage, StateLock, Storage};
 
@@ -360,7 +362,7 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra> Drop
         if let Some(payload) = self.completion.take_panic() {
             match self.completion.parent() {
                 Some(parent) => parent.report_panic(payload),
-                None if !panicking() => resume_unwind(payload),
+                None if matches!(panic_state(), PanicState::NotPanicking) => resume_unwind(payload),
                 None => {}
             }
         }

@@ -630,7 +630,7 @@ pub type RawRwLock = NativeRawRwLock;
 #[cfg(feature = "loom")]
 pub type RawRwLock = LoomRawRwLock;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::*;
 

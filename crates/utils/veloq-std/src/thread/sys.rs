@@ -22,61 +22,35 @@ use crate::{
     },
 };
 
-#[cfg(any(feature = "std", feature = "loom"))]
+#[cfg(feature = "loom")]
 use crate::boxed::Box;
 
-#[cfg(feature = "std")]
 use crate::{
-    any::Any,
     fmt::{self, Formatter, Result as FmtResult},
+    panic::PanicPayload,
 };
 
-#[cfg(feature = "std")]
-pub(crate) type ThreadPanicPayload = Option<Box<dyn Any + Send + 'static>>;
+pub(crate) type ThreadPanicPayload = Option<PanicPayload>;
 
-#[cfg(feature = "std")]
-pub struct SendSyncPanicPayload(pub Box<dyn Any + Send + 'static>);
+pub struct SendSyncPanicPayload(PanicPayload);
 
-#[cfg(feature = "std")]
 unsafe impl Send for SendSyncPanicPayload {}
-#[cfg(feature = "std")]
 unsafe impl Sync for SendSyncPanicPayload {}
 
-#[cfg(feature = "std")]
 impl fmt::Debug for SendSyncPanicPayload {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.write_str("SendSyncPanicPayload")
     }
 }
 
-#[cfg(not(feature = "std"))]
-pub(crate) type ThreadPanicPayload = ();
-
-#[cfg(not(feature = "std"))]
-pub type SendSyncPanicPayload = ();
-
 #[inline]
 pub(crate) fn from_panic_payload(payload: ThreadPanicPayload) -> Option<SendSyncPanicPayload> {
-    #[cfg(feature = "std")]
-    {
-        payload.map(SendSyncPanicPayload)
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        Some(payload)
-    }
+    payload.map(SendSyncPanicPayload)
 }
 
 #[inline]
 pub(crate) fn take_panic_payload(opt: &mut Option<SendSyncPanicPayload>) -> ThreadPanicPayload {
-    #[cfg(feature = "std")]
-    {
-        opt.take().map(|p| p.0)
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        opt.take();
-    }
+    opt.take().map(|p| p.0)
 }
 
 pub(crate) const STATE_INCOMPLETE: u8 = 0;

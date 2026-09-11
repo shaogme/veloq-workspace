@@ -1,6 +1,13 @@
 use crate::{Link, LinkedList};
 use veloq_std::boxed::Box;
 
+extern crate std;
+
+use std::{
+    mem::ManuallyDrop,
+    panic::{AssertUnwindSafe, catch_unwind},
+};
+
 struct TestNode {
     val: i32,
     link: Link,
@@ -188,4 +195,36 @@ fn test_readonly_cursor_traversal() {
     assert_eq!(list.len(), 2);
 
     while list.pop_front().is_some() {}
+}
+
+#[test]
+fn linked_node_drop_panics_on_a_normal_path() {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let mut list = ManuallyDrop::new(LinkedList::new(TestAdapter));
+        let mut node = Box::pin(TestNode {
+            val: 99,
+            link: Link::new(),
+        });
+
+        unsafe { (*list).push_back(node.as_mut()) };
+        drop(node);
+    }));
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn linked_node_drop_is_suppressed_during_panic_unwind() {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let mut list = ManuallyDrop::new(LinkedList::new(TestAdapter));
+        let mut node = Box::pin(TestNode {
+            val: 100,
+            link: Link::new(),
+        });
+
+        unsafe { (*list).push_back(node.as_mut()) };
+        panic!("outer panic");
+    }));
+
+    assert!(result.is_err());
 }

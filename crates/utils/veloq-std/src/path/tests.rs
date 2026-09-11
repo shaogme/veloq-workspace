@@ -1,5 +1,6 @@
 use core::hash::{Hash, Hasher};
 
+use crate::alloc_crate::vec;
 use crate::{
     alloc_crate::{
         boxed::Box,

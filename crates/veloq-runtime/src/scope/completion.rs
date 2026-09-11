@@ -10,16 +10,15 @@ use crate::{
     utils::ownership::{ArcOwnership, Ownership, RcOwnership},
 };
 use std::{
-    any::Any,
     future::Future,
     marker::{PhantomData, PhantomPinned},
-    panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
     ptr::NonNull,
     sync::atomic::Ordering,
     task::{Context, Poll, Waker},
 };
 use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
+use veloq_std::panic::{AssertUnwindSafe, PanicPayload, catch_unwind};
 use veloq_storage::{
     AtomicStorage, LocalStorage, StateInt, StateLock, StateOptionBox, StrategyType,
 };
@@ -162,7 +161,7 @@ pub struct GenericScopeCompletion<S: ScopeStorage, O: Ownership> {
     remaining: S::Usize,
     wakers: S::Lock<LinkedList<ScopeWakerAdapter<S>>>,
     cancel_token: GenericCancellationToken<S, O>,
-    panic_info: S::OptionFatBox<dyn Any + Send + 'static>,
+    panic_info: S::OptionBox<PanicPayload>,
     parent: S::Parent,
 }
 
@@ -184,7 +183,7 @@ impl<S: ScopeStorage, O: Ownership> GenericScopeCompletion<S, O> {
             remaining: S::Usize::new(0),
             wakers: S::Lock::new(LinkedList::new(ScopeWakerAdapter::<S>::new())),
             cancel_token: GenericCancellationToken::<S, O>::new_with_parent(cross_parent),
-            panic_info: S::OptionFatBox::new(None),
+            panic_info: S::OptionBox::new(None),
             parent,
         })
     }
@@ -199,7 +198,7 @@ impl<S: ScopeStorage, O: Ownership> GenericScopeCompletion<S, O> {
         }
 
         for waker in ready {
-            let _ = catch_unwind(AssertUnwindSafe(|| waker.wake()));
+            let _ = catch_unwind(AssertUnwindSafe::new(|| waker.wake()));
         }
     }
 
@@ -292,14 +291,18 @@ impl<S: ScopeStorage, O: Ownership> GenericScopeCompletion<S, O> {
         self.remaining.load(Ordering::Acquire) == 0
     }
 
-    pub(crate) fn report_panic(&self, payload: Box<dyn Any + Send + 'static>) {
-        let _ = self
-            .panic_info
-            .compare_exchange_none(payload, Ordering::AcqRel, Ordering::Acquire);
+    pub(crate) fn report_panic(&self, payload: PanicPayload) {
+        let _ = self.panic_info.compare_exchange_none(
+            Box::new(payload),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 
-    pub(crate) fn take_panic(&self) -> Option<Box<dyn Any + Send + 'static>> {
-        self.panic_info.take(Ordering::AcqRel)
+    pub(crate) fn take_panic(&self) -> Option<PanicPayload> {
+        self.panic_info
+            .take(Ordering::AcqRel)
+            .map(|payload| *payload)
     }
 
     pub fn parent(&self) -> Option<AnyScopeRef> {
@@ -332,7 +335,7 @@ impl<S: ScopeStorage, O: Ownership + 'static> RawScope for GenericScopeCompletio
     }
 
     #[inline]
-    fn report_panic(&self, payload: Box<dyn Any + Send + 'static>) {
+    fn report_panic(&self, payload: PanicPayload) {
         self.report_panic(payload);
     }
 

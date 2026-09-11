@@ -5,7 +5,6 @@ use std::{
     mem::replace,
     num::NonZeroUsize,
     ops::AsyncFnOnce,
-    panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
     ptr::NonNull,
     sync::Arc,
@@ -28,6 +27,7 @@ use crate::{
 
 use crossbeam_deque::Worker;
 use diagweave::prelude::*;
+use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
 use veloq_storage::{AtomicLock, AtomicStorage, StateLock};
 use veloq_waker::MwsrWaker;
 
@@ -231,7 +231,7 @@ where
         }
 
         let mut finalizer = RouteTaskFinalizer::new(&self.header, &self.slot);
-        let operation = catch_unwind(AssertUnwindSafe(|| {
+        let operation = catch_unwind(AssertUnwindSafe::new(|| {
             let Some(job) = (unsafe { &mut *self.job.get() }).take() else {
                 finalizer.publish_err(route_error(
                     "RuntimeCtx::route_to::RouteJobTask::poll_raw",
@@ -240,7 +240,7 @@ where
                 return;
             };
 
-            match catch_unwind(AssertUnwindSafe(job)) {
+            match catch_unwind(AssertUnwindSafe::new(job)) {
                 Ok(future) => finalizer.publish_ok(future),
                 Err(_) => finalizer.publish_err(route_error(
                     "RuntimeCtx::route_to::RouteJobTask::poll_raw",

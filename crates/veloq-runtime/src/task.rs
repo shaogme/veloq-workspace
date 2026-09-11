@@ -20,15 +20,14 @@ pub(crate) use wake::{LocalWakeHeaderGuard, LocalWakeTarget, TaskWakeToken};
 
 use crate::error::Result as RuntimeResult;
 use std::{
-    any::Any,
     fmt::{Debug, Formatter, Result as FmtResult},
     future::Future,
     marker::PhantomData,
-    panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
     ptr::NonNull,
     task::{Context, Poll},
 };
+use veloq_std::panic::{AssertUnwindSafe, PanicPayload, catch_unwind};
 use veloq_storage::{AtomicStorage, LocalStorage, StateLock, Storage};
 
 pub type TaskHeader = GenericTaskHeader<AtomicStorage>;
@@ -191,7 +190,7 @@ where
         self.finalize(is_local);
     }
 
-    pub fn complete_panic(&self, panic_err: Box<dyn Any + Send + 'static>, is_local: bool) {
+    pub fn complete_panic(&self, panic_err: PanicPayload, is_local: bool) {
         let is_cancelled = if let Some(e) = panic_err.downcast_ref::<TaskError>() {
             matches!(e, TaskError::Cancelled)
         } else {
@@ -258,7 +257,7 @@ where
             return true;
         }
 
-        let res = catch_unwind(AssertUnwindSafe(|| poll_fn(cx)));
+        let res = catch_unwind(AssertUnwindSafe::new(|| poll_fn(cx)));
         match res {
             Ok(Poll::Ready(val)) => {
                 finalizer.complete(Ok(val), is_local);

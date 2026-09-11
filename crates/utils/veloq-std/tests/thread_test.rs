@@ -116,3 +116,31 @@ fn test_thread_panic_error() {
         veloq_std::thread::ThreadErrorKind::Panicked
     );
 }
+
+#[cfg(feature = "std")]
+#[test]
+fn panicking_reports_the_std_unwind_state() {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert!(veloq_std::thread::panicking());
+        panic!("intentional panic");
+    }));
+
+    assert!(result.is_err());
+    assert!(!veloq_std::thread::panicking());
+}
+
+#[cfg(not(feature = "std"))]
+#[test]
+fn no_std_panic_state_guard_supports_nested_normal_returns() {
+    use veloq_std::thread::{PanicState, enter_panicking, panic_state};
+
+    assert_eq!(panic_state(), PanicState::NotPanicking);
+    let outer = enter_panicking();
+    assert_eq!(panic_state(), PanicState::Panicking);
+    let inner = enter_panicking();
+    assert_eq!(panic_state(), PanicState::Panicking);
+    inner.finish();
+    assert_eq!(panic_state(), PanicState::Panicking);
+    outer.finish();
+    assert_eq!(panic_state(), PanicState::NotPanicking);
+}

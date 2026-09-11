@@ -14,7 +14,6 @@ use std::{
     cell::UnsafeCell,
     marker::{PhantomData, PhantomPinned},
     mem::ManuallyDrop,
-    panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
     ptr::{self, NonNull},
     sync::{Arc, atomic::Ordering},
@@ -22,6 +21,7 @@ use std::{
     vec::Vec,
 };
 use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
+use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
 use veloq_storage::{
     AtomicStorage, LocalStorage, StateInt, StateLock, Storage, StrategyType, ThreadSafeStorage,
 };
@@ -463,7 +463,7 @@ impl<S: Storage> GenericTaskHeader<S> {
         }
 
         for waker in ready {
-            if catch_unwind(AssertUnwindSafe(|| waker.wake())).is_err() {
+            if catch_unwind(AssertUnwindSafe::new(|| waker.wake())).is_err() {
                 self.state.fetch_or(STATE_WAKER_PANICKED, Ordering::Release);
             }
         }

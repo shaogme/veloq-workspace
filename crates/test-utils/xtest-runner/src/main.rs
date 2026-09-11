@@ -169,6 +169,9 @@ struct Cli {
     #[arg(long, help = "启用 features")]
     features: Option<String>,
 
+    #[arg(long, help = "禁用 package 的默认 features")]
+    no_default_features: bool,
+
     #[arg(long, help = "仅执行指定 package")]
     package: Option<String>,
 
@@ -186,6 +189,7 @@ pub(crate) struct Config {
     pub(crate) count: usize,
     pub(crate) quiet: bool,
     pub(crate) features: Option<String>,
+    pub(crate) no_default_features: bool,
     pub(crate) package: Option<String>,
     pub(crate) filter: Option<String>,
     pub(crate) linux_target: Option<LinuxTarget>,
@@ -229,6 +233,7 @@ impl TryFrom<Cli> for Config {
             count,
             quiet: cli.quiet,
             features: cli.features,
+            no_default_features: cli.no_default_features,
             package: cli.package,
             filter: cli.filter,
             linux_target: cli.linux_target,

@@ -202,7 +202,7 @@ impl ThreadPool {
             };
 
             if let Some(task) = task {
-                let _ = catch_unwind(AssertUnwindSafe(|| task.run()));
+                let _ = catch_unwind(AssertUnwindSafe::new(|| task.run()));
             }
         }
     }

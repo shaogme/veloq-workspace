@@ -1,12 +1,12 @@
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_queue::ArrayQueue;
 use std::{
-    panic::{AssertUnwindSafe, catch_unwind},
     result::Result as StdResult,
     sync::Arc,
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     thread,
 };
+use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
 use veloq_storage::{AtomicOptionPtr, StateOptionPtr};
 
 use crate::{
@@ -404,7 +404,7 @@ impl GlobalInjector {
         let mut panicked = false;
         while let Some(task) = self.pop() {
             drained += 1;
-            if catch_unwind(AssertUnwindSafe(|| f(task))).is_err() {
+            if catch_unwind(AssertUnwindSafe::new(|| f(task))).is_err() {
                 panicked = true;
             }
         }

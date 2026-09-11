@@ -1,17 +1,11 @@
-use std::{
-    marker::PhantomData,
-    num::NonZeroUsize,
-    ops::AsyncFnOnce,
-    panic::{AssertUnwindSafe, catch_unwind},
-    pin::pin,
-    ptr, thread,
-};
+use std::{marker::PhantomData, num::NonZeroUsize, ops::AsyncFnOnce, pin::pin, ptr, thread};
 
 use crate::{
     error::{Result, RuntimeError},
     utils::FastRand,
 };
 use diagweave::prelude::*;
+use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
 use veloq_std::sync::Mutex;
 
 pub mod cancellation;
@@ -154,7 +148,7 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                 if let Err(e) = scope.spawn(move || {
                     let _tls_cleanup = TlsCleanupGuard(&shared_ref.base.tls);
                     let _extra_cleanup = TlsCleanupGuard(&shared_ref.extra_tls);
-                    let init_res = catch_unwind(AssertUnwindSafe(|| {
+                    let init_res = catch_unwind(AssertUnwindSafe::new(|| {
                         shared_ref.base.tls.set_owned(context).map_err(|source| {
                             RuntimeError::TlsSetOwnedFailed {
                                 worker_id,
@@ -199,7 +193,7 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                         return;
                     }
 
-                    match catch_unwind(AssertUnwindSafe(|| shared_ref.run_worker())) {
+                    match catch_unwind(AssertUnwindSafe::new(|| shared_ref.run_worker())) {
                         Ok(Ok(())) => {}
                         Ok(Err(err)) => report_fatal(err),
                         Err(_) => report_fatal(
@@ -253,17 +247,17 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                 }
                 .trans();
             }
-            let main_extra = match catch_unwind(AssertUnwindSafe(|| worker_factory(0, shared_ref)))
-            {
-                Ok(extra) => extra,
-                Err(_) => {
-                    return RuntimeError::InvariantViolation {
-                        site: "worker-initialization",
-                        detail: "worker factory panicked".into(),
+            let main_extra =
+                match catch_unwind(AssertUnwindSafe::new(|| worker_factory(0, shared_ref))) {
+                    Ok(extra) => extra,
+                    Err(_) => {
+                        return RuntimeError::InvariantViolation {
+                            site: "worker-initialization",
+                            detail: "worker factory panicked".into(),
+                        }
+                        .trans();
                     }
-                    .trans();
-                }
-            };
+                };
             if let Err(source) = shared_ref.extra_tls.set_owned(main_extra) {
                 return RuntimeError::TlsSetOwnedFailed {
                     worker_id: 0,

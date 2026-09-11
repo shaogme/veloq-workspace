@@ -121,7 +121,7 @@ impl<'scope, 'env, P: SystemImpl> RawScope<'scope, 'env, P> {
 
             #[cfg(feature = "std")]
             {
-                let res = catch_unwind(AssertUnwindSafe(f));
+                let res = catch_unwind(AssertUnwindSafe::new(f));
                 match res {
                     Ok(r) => Some(r),
                     Err(err) => {
@@ -207,7 +207,7 @@ impl<'scope, P: SystemImpl, R: Send + 'scope> RawScopedJoinHandle<'scope, P, R> 
             }
             #[cfg(not(feature = "std"))]
             {
-                Err(P::Error::from_panic(()))
+                Err(P::Error::from_panic(Default::default()))
             }
         }
     }

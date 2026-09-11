@@ -1,7 +1,6 @@
 use std::{
     hint::spin_loop,
     num::NonZeroUsize,
-    panic::{AssertUnwindSafe, catch_unwind},
     ptr::NonNull,
     sync::{Arc, atomic::Ordering},
 };
@@ -10,6 +9,7 @@ use crossbeam_deque::Worker;
 use crossbeam_queue::ArrayQueue;
 use diagweave::prelude::*;
 use numaperf_topo::Topology;
+use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
 use veloq_std::sync::UnpoisonedMutexGuard;
 use veloq_storage::StateOptionPtr;
 use veloq_tls::Tls;
@@ -346,7 +346,7 @@ impl RuntimeSharedBase {
         let mut failed = header.waker_panicked();
         if header.drop_after_poll()
             && header.is_reclaimable()
-            && catch_unwind(AssertUnwindSafe(|| unsafe {
+            && catch_unwind(AssertUnwindSafe::new(|| unsafe {
                 GenericTaskHeader::drop_task(NonNull::from(header))
             }))
             .is_err()

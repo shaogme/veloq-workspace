@@ -144,6 +144,7 @@ impl Runner {
             Target::Linux => linux_native_command(
                 Task::Test,
                 self.config.features.as_deref(),
+                self.config.no_default_features,
                 self.config.package.as_deref(),
                 self.config.filter.as_deref(),
                 self.config.linux_target.map(LinuxTarget::name),
@@ -151,6 +152,7 @@ impl Runner {
             Target::Windows => windows_native_command(
                 Task::Test,
                 self.config.features.as_deref(),
+                self.config.no_default_features,
                 self.windows_target.as_deref(),
                 self.config.package.as_deref(),
                 self.config.filter.as_deref(),
@@ -323,6 +325,7 @@ impl Runner {
             (_, Target::Linux) => linux_native_command(
                 self.config.task,
                 self.config.features.as_deref(),
+                self.config.no_default_features,
                 self.config.package.as_deref(),
                 self.config.filter.as_deref(),
                 self.config.linux_target.map(LinuxTarget::name),
@@ -330,6 +333,7 @@ impl Runner {
             (_, Target::Windows) => windows_native_command(
                 self.config.task,
                 self.config.features.as_deref(),
+                self.config.no_default_features,
                 self.windows_target.as_deref(),
                 self.config.package.as_deref(),
                 self.config.filter.as_deref(),
@@ -341,6 +345,7 @@ impl Runner {
 fn linux_native_command(
     task: Task,
     features: Option<&str>,
+    no_default_features: bool,
     package: Option<&str>,
     filter: Option<&str>,
     target: Option<&str>,
@@ -350,6 +355,10 @@ fn linux_native_command(
         Task::Clippy => vec!["clippy".into()],
         Task::Check => vec!["check".into()],
     };
+
+    if no_default_features {
+        args.push("--no-default-features".into());
+    }
 
     if let Some(f) = features {
         args.push("--features".into());
@@ -409,6 +418,7 @@ fn append_packages(args: &mut Vec<String>, packages: Option<&str>) {
 fn windows_native_command(
     task: Task,
     features: Option<&str>,
+    no_default_features: bool,
     target: Option<&str>,
     package: Option<&str>,
     filter: Option<&str>,
@@ -418,6 +428,10 @@ fn windows_native_command(
         Task::Clippy => vec!["clippy".into()],
         Task::Check => vec!["check".into()],
     };
+
+    if no_default_features {
+        args.push("--no-default-features".into());
+    }
 
     if let Some(f) = features {
         args.push("--features".into());

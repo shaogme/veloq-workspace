@@ -1,3 +1,5 @@
+#![cfg(feature = "std")]
+
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use veloq_std::{

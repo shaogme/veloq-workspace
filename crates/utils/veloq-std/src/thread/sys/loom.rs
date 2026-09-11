@@ -5,7 +5,7 @@ use crate::{
     error::Error,
     fmt::{Display, Formatter, Result as FmtResult},
     marker::PhantomData,
-    panic::catch_unwind_safe,
+    panic::{AssertUnwindSafe, catch_unwind},
     string::String,
     sync::{
         Arc,
@@ -152,10 +152,7 @@ impl SystemImpl for System {
             closure: UnsafeCell::new(Some(Box::new(f) as BoxF<'a, T>)),
             status: AtomicU8::new(super::STATE_INCOMPLETE),
             result: SafeUnsafeCell::new(None),
-            #[cfg(feature = "std")]
             panic_payload: SafeUnsafeCell::new(None),
-            #[cfg(not(feature = "std"))]
-            panic_payload: SafeUnsafeCell::new(()),
             name,
             thread: thread.clone(),
         });
@@ -198,7 +195,7 @@ impl SystemImpl for System {
                 };
 
                 if let Some(f) = unsafe { self.closure.with_mut(|x| x.take()) } {
-                    let res = catch_unwind_safe(f);
+                    let res = catch_unwind(AssertUnwindSafe::new(f));
                     match res {
                         Ok(r) => {
                             unsafe {
@@ -212,12 +209,9 @@ impl SystemImpl for System {
                                 Ordering::Acquire,
                             );
                         }
-                        #[cfg(feature = "std")]
                         Err(err) => unsafe {
-                            self.panic_payload.with_mut(|opt| *opt = err);
+                            self.panic_payload.with_mut(|opt| *opt = Some(err));
                         },
-                        #[cfg(not(feature = "std"))]
-                        Err(err) => match err {},
                     }
                 }
             }
