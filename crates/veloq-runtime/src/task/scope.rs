@@ -4,7 +4,6 @@ use crate::{
     utils::ownership::Ownership,
 };
 use std::{
-    cell::UnsafeCell,
     fmt::{Debug, Formatter, Result as FmtResult},
     marker::PhantomData,
     mem::ManuallyDrop,
@@ -12,6 +11,7 @@ use std::{
     task::Waker,
 };
 use veloq_intrusive_linklist::{Link, intrusive_adapter};
+use veloq_std::cell::UnsafeCell;
 use veloq_std::panic::PanicPayload;
 use veloq_storage::{AtomicStorage, LocalStorage, Storage, StrategyType, ThreadSafeStorage};
 
@@ -39,20 +39,23 @@ impl CancellationWaiter {
 
     /// # Safety
     ///
-    /// 调用者必须持有所属取消令牌的锁。
+    /// 调用者必须持有所属取消令牌的锁。该锁同时保证没有其它线程访问
+    /// `waker`，因为 `UnsafeCell` 本身不提供同步或锁。
     pub(crate) unsafe fn set_waker(&self, waker: &Waker) {
-        let slot = unsafe { &mut *self.waker.get() };
-        match slot {
-            Some(existing) if existing.will_wake(waker) => {}
-            slot => *slot = Some(waker.clone()),
+        unsafe {
+            self.waker.with_mut(|slot| match slot {
+                Some(existing) if existing.will_wake(waker) => {}
+                slot => *slot = Some(waker.clone()),
+            });
         }
     }
 
     /// # Safety
     ///
-    /// 调用者必须持有所属取消令牌的锁。
+    /// 调用者必须持有所属取消令牌的锁。该锁同时保证没有其它线程访问
+    /// `waker`，因为 `UnsafeCell` 本身不提供同步或锁。
     pub(crate) unsafe fn take_waker(&self) -> Option<Waker> {
-        unsafe { (*self.waker.get()).take() }
+        unsafe { self.waker.with_mut(|slot| slot.take()) }
     }
 }
 

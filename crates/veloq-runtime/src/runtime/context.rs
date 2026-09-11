@@ -1,4 +1,3 @@
-use core::cell::UnsafeCell;
 use std::{
     future::{Future, poll_fn},
     marker::PhantomData,
@@ -27,6 +26,7 @@ use crate::{
 
 use crossbeam_deque::Worker;
 use diagweave::prelude::*;
+use veloq_std::cell::UnsafeCell;
 use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
 use veloq_storage::{AtomicLock, AtomicStorage, StateLock};
 use veloq_waker::MwsrWaker;
@@ -232,7 +232,8 @@ where
 
         let mut finalizer = RouteTaskFinalizer::new(&self.header, &self.slot);
         let operation = catch_unwind(AssertUnwindSafe::new(|| {
-            let Some(job) = (unsafe { &mut *self.job.get() }).take() else {
+            let job = unsafe { self.job.with_mut(|slot| slot.take()) };
+            let Some(job) = job else {
                 finalizer.publish_err(route_error(
                     "RuntimeCtx::route_to::RouteJobTask::poll_raw",
                     "job already taken",

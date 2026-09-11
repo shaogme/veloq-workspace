@@ -11,7 +11,6 @@ use crate::{
 };
 use diagweave::prelude::*;
 use std::{
-    cell::UnsafeCell,
     marker::{PhantomData, PhantomPinned},
     mem::ManuallyDrop,
     pin::Pin,
@@ -21,6 +20,7 @@ use std::{
     vec::Vec,
 };
 use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
+use veloq_std::cell::UnsafeCell;
 use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
 use veloq_storage::{
     AtomicStorage, LocalStorage, StateInt, StateLock, Storage, StrategyType, ThreadSafeStorage,
@@ -73,12 +73,15 @@ pub struct GenericTaskHeader<S: Storage> {
     enqueue_rejection: S::Lock<Option<EnqueueError>>,
     wakers: S::Lock<LinkedList<WakerAdapter<S>>>,
     wake_token: Arc<TaskWakeToken<S>>,
+    /// 只在任务 header 尚未发布或 owner poll 协议允许的阶段访问。
     cached_waker: UnsafeCell<Option<Waker>>,
+    /// 只能在 `initialize` 完成并发布任务后读取。
     scope: UnsafeCell<ScopeRef<S>>,
     /// 本任务在所属 scope 取消队列中的等待节点；由 scope 的取消令牌锁保护。
     cancel_waiter: CancellationWaiter,
     /// 跨 scope parent 的取消等待节点；每个节点地址在入链期间保持稳定。
     cancel_ancestors: UnsafeCell<Vec<AncestorRegistration>>,
+    /// 只能在 `initialize` 完成并发布任务后读取。
     runtime: UnsafeCell<Option<NonNull<RuntimeSharedBase>>>,
     worker_id: S::Usize,
     vtable: &'static TaskVTable<S>,
@@ -128,8 +131,9 @@ impl<S: Storage> GenericTaskHeader<S> {
         scope: ScopeRef<S>,
     ) {
         unsafe {
-            *self.runtime.get() = Some(NonNull::from(runtime));
-            *self.scope.get() = scope;
+            self.runtime
+                .with_mut(|slot| *slot = Some(NonNull::from(runtime)));
+            self.scope.with_mut(|slot| *slot = scope);
         }
         if S::strategy_type() == StrategyType::Local {
             self.wake_token
@@ -236,15 +240,24 @@ impl<S: Storage> GenericTaskHeader<S> {
             CancelWaiterLinkResult::Linked => {
                 let scope = self.scope_completion_ref();
                 let parent_chain = scope.cancel_parent_chain();
-                let ancestors = unsafe { &mut *self.cancel_ancestors.get() };
-                if ancestors.is_empty() {
-                    ancestors.extend(parent_chain.into_iter().map(AncestorRegistration::new));
+                unsafe {
+                    self.cancel_ancestors.with_mut(|ancestors| {
+                        if ancestors.is_empty() {
+                            ancestors
+                                .extend(parent_chain.into_iter().map(AncestorRegistration::new));
+                        }
+                    });
                 }
-                for ancestor in ancestors.iter() {
-                    if ancestor.link(waker) == CancelWaiterLinkResult::RejectedByCancellation {
-                        self.disarm_scope_cancel_waiter();
-                        return false;
-                    }
+                let ancestor_rejected = unsafe {
+                    self.cancel_ancestors.with(|ancestors| {
+                        ancestors.iter().any(|ancestor| {
+                            ancestor.link(waker) == CancelWaiterLinkResult::RejectedByCancellation
+                        })
+                    })
+                };
+                if ancestor_rejected {
+                    self.disarm_scope_cancel_waiter();
+                    return false;
                 }
                 true
             }
@@ -263,11 +276,14 @@ impl<S: Storage> GenericTaskHeader<S> {
         let waiter = NonNull::from(&self.cancel_waiter);
         let scope = self.scope_completion_ref();
         unsafe { scope.unlink_cancel_waiter(waiter) };
-        let ancestors = unsafe { &mut *self.cancel_ancestors.get() };
-        for ancestor in ancestors.iter().rev() {
-            ancestor.unlink();
+        unsafe {
+            self.cancel_ancestors.with_mut(|ancestors| {
+                for ancestor in ancestors.iter().rev() {
+                    ancestor.unlink();
+                }
+                ancestors.clear();
+            });
         }
-        ancestors.clear();
         self.state.fetch_and(!STATE_CANCEL_ARMED, Ordering::AcqRel);
     }
 
@@ -606,16 +622,31 @@ impl<S: Storage> GenericTaskHeader<S> {
         self.state.load(Ordering::Acquire) & STATE_READY != 0
     }
 
-    pub(crate) fn create_waker(&self, vtable: &'static RawWakerVTable) -> &Waker {
-        let cached_waker = unsafe { &mut *self.cached_waker.get() };
-        if cached_waker.is_none() {
-            self.wake_token.bind_header(NonNull::from(self));
-            let data = Arc::into_raw(Arc::clone(&self.wake_token)) as *const ();
-            *cached_waker = Some(unsafe { Waker::from_raw(RawWaker::new(data, vtable)) });
+    /// 在 callback 内访问缓存 waker，避免将其内部借用带出 `UnsafeCell`。
+    ///
+    /// 缓存 waker 只能在 header 尚未发布或 owner poll 协议允许的阶段初始化和读取；
+    /// callback 不得递归进入会修改 `cached_waker` 的路径。
+    pub(crate) fn with_waker<R>(
+        &self,
+        vtable: &'static RawWakerVTable,
+        callback: impl FnOnce(&Waker) -> R,
+    ) -> R {
+        unsafe {
+            self.cached_waker.with_mut(|cached_waker| {
+                if cached_waker.is_none() {
+                    self.wake_token.bind_header(NonNull::from(self));
+                    let data = Arc::into_raw(Arc::clone(&self.wake_token)) as *const ();
+                    *cached_waker = Some(Waker::from_raw(RawWaker::new(data, vtable)));
+                }
+            });
+            self.cached_waker.with(|cached_waker| {
+                callback(
+                    cached_waker
+                        .as_ref()
+                        .expect("task waker must be initialized before use"),
+                )
+            })
         }
-        cached_waker
-            .as_ref()
-            .expect("task waker must be initialized before use")
     }
 
     #[inline]
@@ -627,29 +658,33 @@ impl<S: Storage> GenericTaskHeader<S> {
 
     #[inline]
     pub(crate) fn with_scope<R>(&self, callback: impl FnOnce(&dyn RawScope) -> R) -> R {
-        let scope = unsafe { &*self.scope.get() };
-        unsafe { callback(scope.as_ref()) }
+        unsafe { self.scope.with(|scope| callback(scope.as_ref())) }
     }
 
     #[inline]
     pub(crate) fn scope_completion_ref(&self) -> ScopeRef<S> {
-        unsafe { (*self.scope.get()).clone() }
+        unsafe { self.scope.with(|scope| scope.clone()) }
     }
 
     #[inline]
-    pub(crate) fn runtime(&self) -> Result<&RuntimeSharedBase> {
-        unsafe { *self.runtime.get() }
-            .map(|ptr| unsafe { ptr.as_ref() })
-            .ok_or(RuntimeError::MissingRuntimeBinding)
-            .trans()
+    pub(crate) fn with_runtime<R>(
+        &self,
+        callback: impl FnOnce(&RuntimeSharedBase) -> R,
+    ) -> Result<R> {
+        unsafe {
+            self.runtime
+                .with(|runtime| runtime.map(|ptr| callback(ptr.as_ref())))
+                .ok_or(RuntimeError::MissingRuntimeBinding)
+        }
+        .trans()
     }
 
     #[inline]
     pub(crate) fn notify_runtime_active(&self) -> Result<()> {
-        let runtime = self.runtime()?;
-        runtime.idle.event_count.notify();
-        runtime.wake_worker(self.worker_id())?;
-        Ok(())
+        self.with_runtime(|runtime| {
+            runtime.idle.event_count.notify();
+            runtime.wake_worker(self.worker_id())
+        })?
     }
 
     /// 唤醒任务（消耗所有权）。
@@ -695,18 +730,18 @@ impl<S: Storage> GenericTaskHeader<S> {
     where
         S: TaskStorage,
     {
-        let runtime = self.runtime()?;
-        if !S::IS_LOCAL && self.is_pinned() {
-            let task = unsafe { SendTaskRef::from_header(self_ptr.as_ptr() as *const _) };
-            match runtime.enqueue_pinned_from_wake(self.worker_id(), task) {
-                EnqueuePinnedOutcome::Enqueued | EnqueuePinnedOutcome::AlreadyQueued => {}
-                EnqueuePinnedOutcome::AbortedAcknowledged
-                | EnqueuePinnedOutcome::AlreadySettled => {} // 终态任务的 wake 只会触发一次状态机检查，不能由调用者结算 scope。
+        self.with_runtime(|runtime| {
+            if !S::IS_LOCAL && self.is_pinned() {
+                let task = unsafe { SendTaskRef::from_header(self_ptr.as_ptr() as *const _) };
+                match runtime.enqueue_pinned_from_wake(self.worker_id(), task) {
+                    EnqueuePinnedOutcome::Enqueued | EnqueuePinnedOutcome::AlreadyQueued => {}
+                    EnqueuePinnedOutcome::AbortedAcknowledged
+                    | EnqueuePinnedOutcome::AlreadySettled => {} // 终态任务的 wake 只会触发一次状态机检查，不能由调用者结算 scope。
+                }
+                return Ok(());
             }
-            return Ok(());
-        }
-        S::enqueue(runtime, self.worker_id(), self_ptr)?;
-        Ok(())
+            S::enqueue(runtime, self.worker_id(), self_ptr)
+        })?
     }
 
     /// 尝试将一个 waker 节点从任务的 waker 列表中移除。
@@ -731,7 +766,7 @@ impl<S: Storage> GenericTaskHeader<S> {
 impl GenericTaskHeader<AtomicStorage> {
     /// # Safety
     ///
-    /// `waker` 必须由 send task 的 `create_waker` 创建，且 `vtable` 必须匹配。
+    /// `waker` 必须由 send task 的 `with_waker` 创建，且 `vtable` 必须匹配。
     pub(crate) unsafe fn from_waker<'a>(
         waker: &'a Waker,
         vtable: &'static RawWakerVTable,
@@ -747,7 +782,7 @@ impl GenericTaskHeader<AtomicStorage> {
 impl GenericTaskHeader<LocalStorage> {
     /// # Safety
     ///
-    /// `waker` 必须由 local task 的 `create_waker` 创建，且 `vtable` 必须匹配。只有 owner
+    /// `waker` 必须由 local task 的 `with_waker` 创建，且 `vtable` 必须匹配。只有 owner
     /// worker 可以取得 header；foreign thread 返回 `None`，不会读取 local header。
     pub(crate) unsafe fn local_from_waker<'a>(
         waker: &'a Waker,
@@ -890,13 +925,16 @@ mod tests {
     }
 
     #[test]
-    fn create_waker_reuses_cached_waker() {
+    fn with_waker_reuses_cached_waker() {
         let header = GenericTaskHeader::<AtomicStorage>::new_placeholder(&TEST_VTABLE);
 
-        let first = header.create_waker(&INTRUSIVE_WAKER_VTABLE).clone();
-        let second = header.create_waker(&INTRUSIVE_WAKER_VTABLE).clone();
-
-        assert!(first.will_wake(&second));
+        let mut first = None;
+        header.with_waker(&INTRUSIVE_WAKER_VTABLE, |waker| {
+            first = Some(waker.clone());
+        });
+        header.with_waker(&INTRUSIVE_WAKER_VTABLE, |waker| {
+            assert!(waker.will_wake(first.as_ref().expect("first waker must be recorded")));
+        });
     }
 
     /// `remove_waker` 在任务已完成时也必须真正摘链，不能提前返回。
@@ -987,7 +1025,7 @@ mod tests {
         let scope_ptr = ScopeRef::from_shared::<ArcOwnership>(&completion);
         let header = GenericTaskHeader::<AtomicStorage>::new_placeholder(&TEST_VTABLE);
         unsafe {
-            *header.scope.get() = scope_ptr;
+            header.scope.with_mut(|scope| *scope = scope_ptr);
         }
         completion.cancel();
         header
@@ -1010,7 +1048,7 @@ mod tests {
         let scope_ptr = ScopeRef::from_shared::<ArcOwnership>(&completion);
         let header = GenericTaskHeader::<AtomicStorage>::new_placeholder(&TEST_VTABLE);
         unsafe {
-            *header.scope.get() = scope_ptr;
+            header.scope.with_mut(|scope| *scope = scope_ptr);
         }
 
         assert!(header.arm_scope_cancel_waiter(Waker::noop()));

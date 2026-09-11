@@ -8,13 +8,13 @@ use crate::{
     },
 };
 use std::{
-    cell::UnsafeCell,
     future::Future,
     pin::Pin,
     ptr::NonNull,
     sync::atomic::Ordering,
     task::{Context, Poll, RawWakerVTable},
 };
+use veloq_std::cell::UnsafeCell;
 use veloq_storage::{AtomicStorage, LocalStorage, StateInt, Storage, ThreadSafeStorage};
 
 const STATUS_RUNNING: usize = 0;
@@ -70,7 +70,9 @@ impl<T, F> TaskBounds<T, F> for AtomicStorage where T: Send {}
 pub struct GenericTaskNode<S: TaskStorage, T, F> {
     pub(crate) header: GenericTaskHeader<S>,
     pub(crate) status: S::Usize,
+    /// 只在任务 poll 或终态清理协议允许的阶段访问。
     pub(crate) future: UnsafeCell<Option<F>>,
+    /// 只在结果发布/消费协议允许的阶段访问。
     pub(crate) result: UnsafeCell<Option<Result<T, TaskError>>>,
 }
 
@@ -135,9 +137,9 @@ where
     #[inline]
     fn set_result(&self, res: Result<T, TaskError>) {
         unsafe {
-            *self.result.get() = Some(res);
+            self.result.with_mut(|slot| *slot = Some(res));
             self.status.store(STATUS_DONE, Ordering::Release);
-            *self.future.get() = None;
+            self.future.with_mut(|slot| *slot = None);
         }
     }
 }
@@ -150,9 +152,11 @@ where
     type Storage = S;
 
     fn poll_raw(&self, _worker_id: usize) -> RuntimeResult<bool> {
-        let waker = self.header.create_waker(S::WAKER_VTABLE);
-        let mut cx = Context::from_waker(waker);
-        Ok(self.poll_task(&mut cx))
+        let polled = self.header.with_waker(S::WAKER_VTABLE, |waker| {
+            let mut cx = Context::from_waker(waker);
+            self.poll_task(&mut cx)
+        });
+        Ok(polled)
     }
 
     fn header(&self) -> &GenericTaskHeader<Self::Storage> {
@@ -172,11 +176,14 @@ where
             cx,
             |cx| {
                 if self.status.load(Ordering::Acquire) == STATUS_RUNNING {
-                    let fut_opt = unsafe { &mut *self.future.get() };
-                    if let Some(f) = fut_opt {
-                        unsafe { Pin::new_unchecked(f) }.poll(cx)
-                    } else {
-                        Poll::Pending
+                    unsafe {
+                        self.future.with_mut(|fut_opt| {
+                            if let Some(f) = fut_opt {
+                                Pin::new_unchecked(f).poll(cx)
+                            } else {
+                                Poll::Pending
+                            }
+                        })
                     }
                 } else {
                     Poll::Pending
@@ -197,10 +204,7 @@ where
             )
             .is_ok()
         {
-            unsafe {
-                let res = &mut *self.result.get();
-                res.take()
-            }
+            unsafe { self.result.with_mut(|slot| slot.take()) }
         } else {
             None
         }

@@ -1,5 +1,4 @@
 use std::{
-    cell::UnsafeCell,
     future::Future,
     marker::PhantomPinned,
     pin::Pin,
@@ -9,6 +8,7 @@ use std::{
 };
 
 use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
+use veloq_std::cell::UnsafeCell;
 use veloq_storage::{StateInt, StateLock, Storage};
 
 use crate::{
@@ -134,7 +134,8 @@ impl AncestorRegistration {
 
 /// `CancelledFuture` 对当前 token 和完整跨 scope parent 链的 RAII 注册。
 pub(crate) struct CancellationRegistration {
-    pub(crate) local: UnsafeCell<CancellationWaiter>,
+    /// 本地节点地址在注册期间必须保持稳定，因此不放入 `UnsafeCell`。
+    pub(crate) local: CancellationWaiter,
     pub(crate) ancestors: UnsafeCell<Vec<AncestorRegistration>>,
     armed: std::sync::atomic::AtomicBool,
 }
@@ -142,7 +143,7 @@ pub(crate) struct CancellationRegistration {
 impl CancellationRegistration {
     pub(crate) fn new() -> Self {
         Self {
-            local: UnsafeCell::new(CancellationWaiter::new()),
+            local: CancellationWaiter::new(),
             ancestors: UnsafeCell::new(Vec::new()),
             armed: std::sync::atomic::AtomicBool::new(false),
         }
@@ -156,20 +157,19 @@ impl CancellationRegistration {
         &self,
         token: &GenericCancellationToken<S, O>,
     ) {
-        let ancestors = unsafe { &mut *self.ancestors.get() };
-        if ancestors.is_empty() {
-            ancestors.extend(
-                token
-                    .parent_chain()
-                    .into_iter()
-                    .map(AncestorRegistration::new),
-            );
+        let parent_chain = token.parent_chain();
+        unsafe {
+            self.ancestors.with_mut(|ancestors| {
+                if ancestors.is_empty() {
+                    ancestors.extend(parent_chain.into_iter().map(AncestorRegistration::new));
+                }
+            });
         }
     }
 
     #[cfg(test)]
     fn ancestor_count(&self) -> usize {
-        unsafe { (&*self.ancestors.get()).len() }
+        unsafe { self.ancestors.with(|ancestors| ancestors.len()) }
     }
 
     /// 注册当前 token 和所有跨 scope parent。
@@ -180,18 +180,22 @@ impl CancellationRegistration {
     ) -> bool {
         self.armed.store(true, Ordering::Relaxed);
 
-        let local = unsafe { NonNull::new_unchecked(self.local.get()) };
+        let local = NonNull::from(&self.local);
         if unsafe { token.link_cancel_waiter(local, waker) }
             == CancelWaiterLinkResult::RejectedByCancellation
         {
             return false;
         }
 
-        let ancestors = unsafe { &*self.ancestors.get() };
-        for ancestor in ancestors {
-            if ancestor.link(waker) == CancelWaiterLinkResult::RejectedByCancellation {
-                return false;
-            }
+        let ancestor_rejected = unsafe {
+            self.ancestors.with(|ancestors| {
+                ancestors.iter().any(|ancestor| {
+                    ancestor.link(waker) == CancelWaiterLinkResult::RejectedByCancellation
+                })
+            })
+        };
+        if ancestor_rejected {
+            return false;
         }
         true
     }
@@ -202,13 +206,16 @@ impl CancellationRegistration {
             return;
         }
 
-        let local = unsafe { NonNull::new_unchecked(self.local.get()) };
+        let local = NonNull::from(&self.local);
         unsafe { token.unlink_cancel_waiter(local) };
-        let ancestors = unsafe { &mut *self.ancestors.get() };
-        for ancestor in ancestors.iter().rev() {
-            ancestor.unlink();
+        unsafe {
+            self.ancestors.with_mut(|ancestors| {
+                for ancestor in ancestors.iter().rev() {
+                    ancestor.unlink();
+                }
+                ancestors.clear();
+            });
         }
-        ancestors.clear();
         self.armed.store(false, Ordering::Relaxed);
     }
 }
