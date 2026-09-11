@@ -18,7 +18,6 @@ use crate::{
     },
 };
 use diagweave::prelude::*;
-use rustc_hash::FxHashMap;
 use veloq_buf::BufferRegistrar;
 use veloq_driver_core::{
     driver::{
@@ -30,6 +29,7 @@ use veloq_driver_core::{
     slot::{Generation, InFlightOrphaned, InFlightWaiting, SlotState, SlotStatus},
 };
 use veloq_std::{
+    collections::FastHashMap,
     format,
     mem::{take, zeroed},
     string::ToString,
@@ -110,7 +110,7 @@ impl RioBackendEffect {
 
 struct RioCompletionHooks<'a> {
     outstanding_count: &'a mut usize,
-    socket_runtime: &'a mut FxHashMap<SocketKey, SocketRuntimeState>,
+    socket_runtime: &'a mut FastHashMap<SocketKey, SocketRuntimeState>,
     registry: &'a mut RioRegistry,
     env: RioEnv<'a>,
     ext: &'a Extensions,
@@ -120,7 +120,7 @@ struct RioCompletionHooks<'a> {
 impl<'a> RioCompletionHooks<'a> {
     fn new(
         outstanding_count: &'a mut usize,
-        socket_runtime: &'a mut FxHashMap<SocketKey, SocketRuntimeState>,
+        socket_runtime: &'a mut FastHashMap<SocketKey, SocketRuntimeState>,
         registry: &'a mut RioRegistry,
         env: RioEnv<'a>,
         ext: &'a Extensions,

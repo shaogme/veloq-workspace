@@ -17,9 +17,8 @@ use crate::{
     BufferRegistrationMode, config::SocketKey, driver::IocpDriverCompletionDiagnostics,
     op::IocpUserPayload,
 };
-use rustc_hash::FxHashMap;
 use slotmap::{SlotMap, new_key_type};
-use veloq_std::vec::Vec;
+use veloq_std::{collections::FastHashMap, vec::Vec};
 
 use self::{
     core::{RioCq, RioDispatch, RioKernel, RioRegistry},
@@ -93,8 +92,8 @@ pub(crate) struct RioState {
     pub(crate) registration_mode: BufferRegistrationMode,
     pub(crate) submissions_closed: bool,
     pub(crate) actors: SlotMap<ActorKey, RioSocketActor>,
-    pub(crate) actor_by_handle: FxHashMap<SocketKey, ActorKey>,
-    pub(crate) socket_runtime: FxHashMap<SocketKey, SocketRuntimeState>,
+    pub(crate) actor_by_handle: FastHashMap<SocketKey, ActorKey>,
+    pub(crate) socket_runtime: FastHashMap<SocketKey, SocketRuntimeState>,
     pub(crate) outstanding_count: usize,
     pub(crate) next_request_id: u64,
     pub(crate) deferred_payloads: Vec<IocpUserPayload>,

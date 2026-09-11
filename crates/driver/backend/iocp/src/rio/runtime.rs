@@ -14,11 +14,11 @@ use crate::{
 
 #[cfg(test)]
 use crate::driver::IocpDriverCompletionDiagnostics;
+
 use diagweave::prelude::*;
-use rustc_hash::FxHashMap;
 use veloq_buf::{BufferRegistrar, FixedBuf};
 use veloq_driver_core::driver::OpToken;
-use veloq_std::ffi::c_void;
+use veloq_std::{collections::FastHashMap, ffi::c_void};
 
 pub(crate) use control_flow::RioSocketActor;
 
@@ -277,7 +277,7 @@ impl Drop for SocketInflightGuard<'_> {
 }
 
 pub(crate) fn release_socket_inflight_token_from(
-    socket_runtime: &mut FxHashMap<SocketKey, SocketRuntimeState>,
+    socket_runtime: &mut FastHashMap<SocketKey, SocketRuntimeState>,
     token: SocketInflightToken,
 ) -> RioResult<()> {
     let socket_key = token.socket_key();
@@ -305,18 +305,17 @@ mod tests {
         config::IocpHandle,
         rio::core::{RioKernel, RioRegistry, RioRq},
     };
-    use veloq_std::{ptr::null_mut, vec::Vec};
+    use veloq_std::{collections::FastHashMap, ptr::null_mut, vec::Vec};
 
     fn test_state() -> RioState {
-        use rustc_hash::FxHashMap;
         RioState {
             kernel: RioKernel::noop(),
             registry: RioRegistry::new(32, 1),
             registration_mode: BufferRegistrationMode::default(),
             submissions_closed: false,
             actors: slotmap::SlotMap::with_key(),
-            actor_by_handle: FxHashMap::default(),
-            socket_runtime: FxHashMap::default(),
+            actor_by_handle: FastHashMap::default(),
+            socket_runtime: FastHashMap::default(),
             outstanding_count: 0,
             next_request_id: 0,
             deferred_payloads: Vec::new(),

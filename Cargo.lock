@@ -1437,7 +1437,6 @@ dependencies = [
  "crossbeam-queue",
  "crossbeam-utils",
  "diagweave",
- "rustc-hash",
  "slotmap",
  "tracing",
  "veloq-blocking",

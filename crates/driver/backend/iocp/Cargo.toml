@@ -29,7 +29,6 @@ crossbeam-queue.workspace = true
 tracing.workspace = true
 windows-sys.workspace = true
 veloq-pod.workspace = true
-rustc-hash.workspace = true
 slotmap.workspace = true
 diagweave.workspace = true
 

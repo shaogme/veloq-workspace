@@ -21,11 +21,11 @@ use crate::{
     },
 };
 use diagweave::prelude::*;
-use rustc_hash::FxHashMap;
 use slotmap::SlotMap;
 use veloq_buf::NoopRegistrar;
 use veloq_driver_core::driver::AnomalyAttach;
 use veloq_std::{
+    collections::FastHashMap,
     mem::{self, zeroed},
     string::ToString,
     sync::{OnceLock, mpsc},
@@ -43,8 +43,8 @@ pub(crate) struct DeferredRioCleanup {
     registration_mode: BufferRegistrationMode,
     submissions_closed: bool,
     actors: SlotMap<ActorKey, RioSocketActor>,
-    actor_by_handle: FxHashMap<SocketKey, ActorKey>,
-    socket_runtime: FxHashMap<SocketKey, SocketRuntimeState>,
+    actor_by_handle: FastHashMap<SocketKey, ActorKey>,
+    socket_runtime: FastHashMap<SocketKey, SocketRuntimeState>,
     outstanding_count: usize,
     next_request_id: u64,
     deferred_payloads: Vec<IocpUserPayload>,

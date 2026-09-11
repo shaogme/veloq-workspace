@@ -24,7 +24,7 @@ use crate::{
     },
 };
 use veloq_buf::{BufferRegistrar, FixedBuf, NoopRegistrar, heap::ChunkId};
-use veloq_std::vec::Vec;
+use veloq_std::{collections::FastHashMap, vec::Vec};
 
 impl RioState {
     pub(crate) fn new(
@@ -46,8 +46,8 @@ impl RioState {
             registration_mode,
             submissions_closed: false,
             actors: slotmap::SlotMap::with_key(),
-            actor_by_handle: rustc_hash::FxHashMap::default(),
-            socket_runtime: rustc_hash::FxHashMap::default(),
+            actor_by_handle: FastHashMap::default(),
+            socket_runtime: FastHashMap::default(),
             outstanding_count: 0,
             next_request_id: 0,
             deferred_payloads: Vec::new(),

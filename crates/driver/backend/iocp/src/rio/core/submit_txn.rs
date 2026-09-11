@@ -581,11 +581,10 @@ mod tests {
         net::addr::SockAddrStorage,
         rio::core::RioOpKind,
     };
-    use rustc_hash::FxHashMap;
     use slotmap::SlotMap;
     use veloq_buf::{FixedBuf, NoopRegistrar};
     use veloq_driver_core::{driver::OpToken, slot::Generation};
-    use veloq_std::{cell::Cell, sync::atomic::Ordering, vec::Vec};
+    use veloq_std::{cell::Cell, collections::FastHashMap, sync::atomic::Ordering, vec::Vec};
 
     fn test_state_with_dispatch(addr_capacity: usize) -> RioState {
         let mut kernel = RioKernel::noop();
@@ -596,8 +595,8 @@ mod tests {
             registration_mode: BufferRegistrationMode::Strict,
             submissions_closed: false,
             actors: SlotMap::with_key(),
-            actor_by_handle: FxHashMap::default(),
-            socket_runtime: FxHashMap::default(),
+            actor_by_handle: FastHashMap::default(),
+            socket_runtime: FastHashMap::default(),
             outstanding_count: 0,
             next_request_id: 0,
             deferred_payloads: Vec::new(),

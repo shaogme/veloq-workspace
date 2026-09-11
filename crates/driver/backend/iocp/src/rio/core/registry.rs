@@ -28,12 +28,11 @@ use crate::{
     },
 };
 use diagweave::prelude::*;
-use rustc_hash::FxHashMap;
 use veloq_buf::{FixedBuf, heap::ChunkId};
 use veloq_driver_core::slot::Generation;
 use veloq_std::{
     boxed::Box,
-    collections::HashSet,
+    collections::{FastHashMap, HashSet},
     mem::replace,
     ptr,
     string::ToString,
@@ -73,18 +72,18 @@ pub(crate) struct RioRegistrationStats {
 pub(crate) struct RioRegistry {
     pub(crate) chunk_registry: Vec<Option<RioChunkRegistration>>,
     pub(crate) retired_chunk_registrations:
-        FxHashMap<RioChunkRegistrationKey, RioBufferRegistration>,
+        FastHashMap<RioChunkRegistrationKey, RioBufferRegistration>,
     pub(crate) addr_slots: Box<[SockAddrStorage]>,
     pub(crate) addr_slot_in_use: Vec<bool>,
     pub(crate) addr_free_slots: Vec<usize>,
     pub(crate) addr_buffer_id: RioBufferId,
     /// Heap-buffer lazy registrations: (ptr, cap, cookie) -> RIO buffer registration.
-    pub(crate) heap_rio_bufs: FxHashMap<RioHeapBufferKey, RioBufferRegistration>,
+    pub(crate) heap_rio_bufs: FastHashMap<RioHeapBufferKey, RioBufferRegistration>,
     pub(crate) pending_deregistrations: Vec<RioBufferId>,
     pub(crate) rq_depth: u32,
     pub(crate) registration_stats: RioRegistrationStats,
-    pub(crate) chunk_register_failures_recent: FxHashMap<ChunkId, Instant>,
-    pub(crate) heap_register_failures_recent: FxHashMap<RioHeapBufferKey, Instant>,
+    pub(crate) chunk_register_failures_recent: FastHashMap<ChunkId, Instant>,
+    pub(crate) heap_register_failures_recent: FastHashMap<RioHeapBufferKey, Instant>,
     pub(crate) next_registration_generation: u64,
     request_contexts: Vec<RioRequestContextSlot>,
     request_context_free: Vec<usize>,
@@ -167,17 +166,17 @@ impl RioRegistry {
 
         Self {
             chunk_registry: Vec::new(),
-            retired_chunk_registrations: FxHashMap::default(),
+            retired_chunk_registrations: FastHashMap::default(),
             addr_slots: vec![SockAddrStorage::default(); addr_capacity].into_boxed_slice(),
             addr_slot_in_use: vec![false; addr_capacity],
             addr_free_slots,
             addr_buffer_id: RioBufferId::INVALID,
-            heap_rio_bufs: FxHashMap::default(),
+            heap_rio_bufs: FastHashMap::default(),
             pending_deregistrations: Vec::new(),
             rq_depth,
             registration_stats: RioRegistrationStats::default(),
-            chunk_register_failures_recent: FxHashMap::default(),
-            heap_register_failures_recent: FxHashMap::default(),
+            chunk_register_failures_recent: FastHashMap::default(),
+            heap_register_failures_recent: FastHashMap::default(),
             next_registration_generation: 0,
             request_contexts: Vec::new(),
             request_context_free: Vec::new(),
