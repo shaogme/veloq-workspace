@@ -3,9 +3,11 @@
 //! Provides hierarchical configuration structure and Builder pattern for configuring timing wheel, service, and batch processing behavior.
 //!
 //! 定时器配置模块，提供分层的配置结构和 Builder 模式，用于配置时间轮、服务和批处理行为。
-use std::error::Error;
-use std::fmt;
-use std::time::Duration;
+use alloc::{
+    format,
+    string::{String, ToString},
+};
+use core::{error::Error, fmt, time::Duration};
 
 /// Timing Wheel Configuration
 ///

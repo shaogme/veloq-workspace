@@ -1,3 +1,7 @@
+#![no_std]
+
+extern crate alloc;
+
 mod config;
 mod task;
 mod wheel;

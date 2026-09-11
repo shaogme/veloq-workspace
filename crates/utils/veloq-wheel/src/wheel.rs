@@ -1,7 +1,8 @@
-use crate::config::WheelConfig;
-use crate::task::TaskId;
+use alloc::{vec, vec::Vec};
+use core::time::Duration;
 use slotmap::{DefaultKey, SlotMap};
-use std::time::Duration;
+
+use crate::{config::WheelConfig, task::TaskId};
 
 /// Internal entry in the slotmap.
 /// Acts as a node in a singly-linked list (lazy cancellation).
