@@ -51,23 +51,28 @@ struct ForeignWakeLocal<'a> {
     waker_slot: &'a Mutex<Option<Waker>>,
     fired: &'a AtomicBool,
     polls: &'a AtomicUsize,
+    first_poll: bool,
 }
 
 impl Future for ForeignWakeLocal<'_> {
     type Output = u32;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.polls.fetch_add(1, Ordering::AcqRel);
-        if self.fired.load(Ordering::Acquire) {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.as_mut().get_mut();
+        this.polls.fetch_add(1, Ordering::AcqRel);
+
+        if !this.first_poll {
+            this.first_poll = true;
+            *this.waker_slot.lock().expect("local waker slot") = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+
+        if this.fired.load(Ordering::Acquire) {
             return Poll::Ready(7);
         }
 
-        *self.waker_slot.lock().expect("local waker slot") = Some(cx.waker().clone());
-        if self.fired.load(Ordering::Acquire) {
-            Poll::Ready(7)
-        } else {
-            Poll::Pending
-        }
+        *this.waker_slot.lock().expect("local waker slot") = Some(cx.waker().clone());
+        Poll::Pending
     }
 }
 
@@ -115,6 +120,7 @@ fn local_task_foreign_wake_uses_owner_mailbox() {
                     waker_slot: &waker_slot,
                     fired: &fired,
                     polls: &polls,
+                    first_poll: false,
                 });
                 assert_eq!(handle.await.unwrap(), 7);
             })
