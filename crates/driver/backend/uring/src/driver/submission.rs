@@ -19,6 +19,22 @@ use veloq_driver_core::{
 };
 use veloq_std::{format, task::Poll, vec};
 
+pub(super) fn validate_resolved_chunk_count(
+    count: usize,
+    capacity: usize,
+    scope: &'static str,
+) -> UringResult<()> {
+    if count <= capacity {
+        return Ok(());
+    }
+
+    UringError::InvalidState
+        .push_ctx("scope", scope)
+        .with_ctx("resolved_chunk_count", count)
+        .with_ctx("chunk_output_capacity", capacity)
+        .attach_note("operation resolved more chunks than the submission scratch buffer holds")
+}
+
 /// Turns a reserved slot's op into an SQE (or a wheel entry) and hands it to the kernel.
 ///
 /// Takes the driver split in two: `slot` borrows out of `UringDriver::ops`, `env` covers every
@@ -64,6 +80,11 @@ pub(crate) fn submit_queued_from_slot(
         slot.with_op_and_payload_mut(|op, payload| {
             let vtable = op.vtable;
             let count = unsafe { (vtable.resolve_chunks)(op, payload, &mut chunks) };
+            validate_resolved_chunk_count(
+                count,
+                chunks.len(),
+                "driver.submit_queued_from_slot.resolve_chunks",
+            )?;
             let completion_token = CompletionToken::user(token);
             let sqe = unsafe {
                 (vtable.make_sqe)(

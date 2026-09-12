@@ -1,8 +1,5 @@
 use crate::{
-    driver::{
-        env::{ChunkRegistrationDecision, SubmitEnv},
-        lifecycle::UringSubmissionState,
-    },
+    driver::{env::SubmitEnv, lifecycle::UringSubmissionState},
     error::{UringError, UringResult},
     op::{Reserved, Slot, SubmissionStrategy, UringSlotSpec},
 };
@@ -34,8 +31,6 @@ pub(crate) struct UringSubmitTxn<'a, 'b, 'e, 's> {
     env: &'e mut SubmitEnv<'a, 'b>,
     token: OpToken,
     slot_guard: Option<SubmissionGuard<'s, UringSlotSpec>>,
-    newly_registered_chunks: [ChunkId; 4],
-    newly_registered_count: usize,
     timer_inserted: Option<TaskId>,
     submitted: bool,
 }
@@ -54,8 +49,6 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
             env,
             token,
             slot_guard: Some(slot_guard),
-            newly_registered_chunks: [ChunkId::ZERO; 4],
-            newly_registered_count: 0,
             timer_inserted: None,
             submitted: false,
         })
@@ -87,6 +80,11 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                     slot.with_op_and_payload_mut(|op, payload| {
                         let vtable = op.vtable;
                         let count = unsafe { (vtable.resolve_chunks)(op, payload, &mut chunks) };
+                        super::validate_resolved_chunk_count(
+                            count,
+                            chunks.len(),
+                            "driver.submit_txn.resolve_chunks",
+                        )?;
                         let completion_token = CompletionToken::user(token);
                         let sqe = unsafe {
                             (vtable.make_sqe)(
@@ -104,19 +102,11 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                 };
 
                 for &chunk_id in chunks.iter().take(count) {
-                    let is_registered = self.env.is_chunk_registered(chunk_id);
-                    let decision = self.env.ensure_chunk_registered(
+                    let _decision = self.env.ensure_chunk_registered(
                         chunk_id,
                         user_data,
                         "driver.submit_txn.ensure_chunk_registered",
                     )?;
-                    if !is_registered
-                        && matches!(decision, ChunkRegistrationDecision::Fixed)
-                        && self.newly_registered_count < 4
-                    {
-                        self.newly_registered_chunks[self.newly_registered_count] = chunk_id;
-                        self.newly_registered_count += 1;
-                    }
                 }
 
                 let pushed = self.env.push_entry(sqe);
@@ -180,9 +170,8 @@ impl Drop for UringSubmitTxn<'_, '_, '_, '_> {
             self.env.wheel.cancel(task_id);
         }
 
-        for i in 0..self.newly_registered_count {
-            let chunk_id = self.newly_registered_chunks[i];
-            self.env.unmark_registered_chunk(chunk_id);
-        }
+        // Fixed-buffer registration is a persistent registry resource. It is deliberately not
+        // rolled back here: Drop cannot report a cleanup syscall failure, and clearing only the
+        // user-space bitset would diverge from the kernel table.
     }
 }

@@ -46,7 +46,7 @@ pub type RemoteCancelSender = mpsc::Sender<CancelRequest>;
 /// 仍然安全。其它错误必须继续通过 driver 的错误类型返回。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferRegistrationStatus {
-    /// Backend 已完成 preferred registration path。
+    /// Backend 已完成 preferred registration path；该登记在 ring 生命周期内持续有效。
     Registered,
     /// Registration 优化不可用，但调用方可以继续使用 raw buffer I/O。
     Unavailable,
@@ -728,6 +728,14 @@ pub mod test_hooks {
 
         fn debug_inject_register_buffers_update_failure(&mut self, _errno: i32) {}
 
+        fn debug_inject_register_buffers_update_sequence(&mut self, _outcomes: &[Option<i32>]) {}
+
+        fn debug_inject_bitset_set_failure(&mut self) {}
+
+        fn debug_chunk_registered(&self, _chunk_id: usize) -> bool {
+            false
+        }
+
         fn debug_inject_push_entry_failure(&mut self) {}
     }
 }
@@ -772,6 +780,21 @@ impl<'a, D: Driver + ?Sized + DriverTestHooks, P: ContextDriverProvider<D> + ?Si
     fn debug_inject_register_buffers_update_failure(&mut self, errno: i32) {
         self.provider
             .with_driver_mut(|d| d.debug_inject_register_buffers_update_failure(errno))
+    }
+
+    fn debug_inject_register_buffers_update_sequence(&mut self, outcomes: &[Option<i32>]) {
+        self.provider
+            .with_driver_mut(|d| d.debug_inject_register_buffers_update_sequence(outcomes))
+    }
+
+    fn debug_inject_bitset_set_failure(&mut self) {
+        self.provider
+            .with_driver_mut(|d| d.debug_inject_bitset_set_failure())
+    }
+
+    fn debug_chunk_registered(&self, chunk_id: usize) -> bool {
+        self.provider
+            .with_driver_ref(|d| d.debug_chunk_registered(chunk_id))
     }
 
     fn debug_inject_push_entry_failure(&mut self) {

@@ -12,7 +12,7 @@ pub(crate) mod buffer;
 pub(crate) mod file_table;
 pub(crate) mod provided_buf;
 
-pub(crate) use buffer::UringBufferRegistry;
+pub(crate) use buffer::{BufferRegistrationQuarantine, UringBufferRegistry};
 pub(crate) use file_table::{FileTable, RegisteredFileEntry, SqeFd};
 pub use provided_buf::ProvidedBufStats;
 pub(crate) use provided_buf::{PROVIDED_BUF_GROUP_ID, ProvidedBufGroup};

@@ -298,6 +298,124 @@ fn strict_mode_rejects_registration_failure_and_recovers_payload() {
 }
 
 #[test]
+fn bitset_failure_clears_kernel_slot_before_returning_error() {
+    let (mut buffers, registrar) = slot_buffers(1, 4096);
+    let (_file_path, file) = open_file("bitset-cleanup", b"bitset-cleanup");
+    let Some(mut driver) = new_driver_or_skip(
+        veloq_driver_uring::BufferRegistrationMode::Strict,
+        registrar,
+    ) else {
+        return;
+    };
+    let fd = register_file(&mut driver, &file);
+    {
+        let hooks = &mut driver as &mut dyn DriverTestHooks;
+        if !hooks.debug_fixed_buffers_available() {
+            return;
+        }
+        // The first outcome is the registration syscall and the second is the cleanup syscall.
+        hooks.debug_inject_register_buffers_update_sequence(&[None, None]);
+        hooks.debug_inject_bitset_set_failure();
+    }
+
+    let (kernel, payload) = <ReadFixed as IntoPlatformOp<UringSlotSpec>>::into_kernel_and_payload(
+        fixed_read(buffers.pop().expect("bitset test buffer"), fd),
+    );
+    let mut kernel_op: Option<UringOp> = Some(kernel);
+    let mut slot = driver.reserve_op().expect("reserve operation");
+    slot.set_payload(<ReadFixed as IntoPlatformOp<UringSlotSpec>>::payload_into_erased(payload));
+
+    match slot.submit(&mut kernel_op) {
+        DriverSubmitResult::Failed {
+            report,
+            status: SubmitStatus::Void,
+        } => assert_eq!(*report.inner(), UringError::InvalidState),
+        DriverSubmitResult::Failed { status, .. } => {
+            panic!("bitset failure must be void, got {status:?}")
+        }
+        DriverSubmitResult::Submitted(_) => panic!("bitset failure was submitted"),
+    }
+
+    assert!(matches!(
+        slot.recover_payload(),
+        Some(UringUserPayload::ReadFixed(_))
+    ));
+    let hooks = &driver as &dyn DriverTestHooks;
+    assert!(!hooks.debug_chunk_registered(0));
+    assert_eq!(hooks.debug_chunk_register_attempts(), 1);
+    assert_eq!(hooks.debug_chunk_register_failures(), 0);
+}
+
+#[test]
+fn failed_bitset_cleanup_quarantines_the_fixed_buffer_registry() {
+    let (mut buffers, registrar) = slot_buffers(2, 4096);
+    let (_file_path, file) = open_file("bitset-quarantine", b"bitset-quarantine");
+    let Some(mut driver) = new_driver_or_skip(
+        veloq_driver_uring::BufferRegistrationMode::Strict,
+        registrar,
+    ) else {
+        return;
+    };
+    let fd = register_file(&mut driver, &file);
+    {
+        let hooks = &mut driver as &mut dyn DriverTestHooks;
+        if !hooks.debug_fixed_buffers_available() {
+            return;
+        }
+        // The cleanup failure leaves the kernel slot unknown, so all later buffer submissions must
+        // fail until this ring is rebuilt.
+        hooks.debug_inject_register_buffers_update_sequence(&[None, Some(libc::EIO)]);
+        hooks.debug_inject_bitset_set_failure();
+    }
+
+    let (kernel, payload) = <ReadFixed as IntoPlatformOp<UringSlotSpec>>::into_kernel_and_payload(
+        fixed_read(buffers.pop().expect("first quarantine buffer"), fd),
+    );
+    let mut kernel_op: Option<UringOp> = Some(kernel);
+    let mut slot = driver.reserve_op().expect("reserve first operation");
+    slot.set_payload(<ReadFixed as IntoPlatformOp<UringSlotSpec>>::payload_into_erased(payload));
+    match slot.submit(&mut kernel_op) {
+        DriverSubmitResult::Failed {
+            report,
+            status: SubmitStatus::Void,
+        } => assert_eq!(*report.inner(), UringError::InvalidState),
+        DriverSubmitResult::Failed { status, .. } => {
+            panic!("quarantine trigger must be void, got {status:?}")
+        }
+        DriverSubmitResult::Submitted(_) => panic!("quarantine trigger was submitted"),
+    }
+    assert!(matches!(
+        slot.recover_payload(),
+        Some(UringUserPayload::ReadFixed(_))
+    ));
+
+    let (kernel, payload) = <ReadFixed as IntoPlatformOp<UringSlotSpec>>::into_kernel_and_payload(
+        fixed_read(buffers.pop().expect("second quarantine buffer"), fd),
+    );
+    let mut kernel_op: Option<UringOp> = Some(kernel);
+    let mut slot = driver.reserve_op().expect("reserve second operation");
+    slot.set_payload(<ReadFixed as IntoPlatformOp<UringSlotSpec>>::payload_into_erased(payload));
+    match slot.submit(&mut kernel_op) {
+        DriverSubmitResult::Failed {
+            report,
+            status: SubmitStatus::Void,
+        } => assert_eq!(*report.inner(), UringError::InvalidState),
+        DriverSubmitResult::Failed { status, .. } => {
+            panic!("quarantined registry must be void, got {status:?}")
+        }
+        DriverSubmitResult::Submitted(_) => panic!("quarantined registry submitted I/O"),
+    }
+    assert!(matches!(
+        slot.recover_payload(),
+        Some(UringUserPayload::ReadFixed(_))
+    ));
+    let hooks = &driver as &dyn DriverTestHooks;
+    assert!(!hooks.debug_chunk_registered(0));
+    assert_eq!(hooks.debug_chunk_register_attempts(), 1);
+    assert_eq!(hooks.debug_chunk_register_failures(), 0);
+}
+
+#[test]
 fn compatible_mode_falls_back_for_fixed_read_and_respects_cooldown() {
     let (mut buffers, registrar) = slot_buffers(2, 4096);
     let (_file_path, file) = open_file("compatible-read", b"compatible-read");

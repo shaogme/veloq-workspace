@@ -462,6 +462,23 @@ impl DriverTestHooks for UringDriver<'_> {
             .inject_register_buffers_update_failure(errno);
     }
 
+    fn debug_inject_register_buffers_update_sequence(&mut self, outcomes: &[Option<i32>]) {
+        self.buffer_registry
+            .inject_register_buffers_update_sequence(outcomes);
+    }
+
+    fn debug_inject_bitset_set_failure(&mut self) {
+        self.buffer_registry.inject_bitset_set_failure();
+    }
+
+    fn debug_chunk_registered(&self, chunk_id: usize) -> bool {
+        let Ok(raw) = u16::try_from(chunk_id) else {
+            return false;
+        };
+        self.buffer_registry
+            .is_chunk_registered(ChunkId::from_raw(raw))
+    }
+
     fn debug_inject_push_entry_failure(&mut self) {
         self.buffer_registry.inject_push_entry_failure();
     }

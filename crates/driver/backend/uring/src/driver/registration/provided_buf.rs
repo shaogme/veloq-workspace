@@ -458,6 +458,20 @@ pub(crate) fn test_group(entries: u16) -> ProvidedBufGroup {
     group
 }
 
+impl Default for ProvidedBufStats {
+    fn default() -> Self {
+        Self {
+            handed_out: 0,
+            returned: 0,
+            refilled: 0,
+            refill_failed: 0,
+            exhausted: 0,
+            available: 0,
+            available_low_water: u16::MAX,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -533,7 +547,6 @@ mod tests {
             result.is_err(),
             "an allocator that always fails must reject the group"
         );
-        drop(submitter);
         drop(ring);
     }
 
@@ -572,21 +585,6 @@ mod tests {
             Ok(()) => {}
             Err(_) => panic!("a registered test ring must unregister successfully"),
         }
-        drop(submitter);
         drop(ring);
-    }
-}
-
-impl Default for ProvidedBufStats {
-    fn default() -> Self {
-        Self {
-            handed_out: 0,
-            returned: 0,
-            refilled: 0,
-            refill_failed: 0,
-            exhausted: 0,
-            available: 0,
-            available_low_water: u16::MAX,
-        }
     }
 }

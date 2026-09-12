@@ -10,8 +10,19 @@ use crate::{
     driver::env::ProvidedBufSqeInfo,
     error::UringResult,
 };
-use veloq_buf::{AnyBufPool, BufferRegistrar};
+use veloq_buf::{AnyBufPool, BufferRegistrar, heap::ChunkId};
 use veloq_std::{boxed::Box, collections::BitSet, time::Instant, vec};
+
+#[cfg(feature = "test-hooks")]
+use veloq_std::collections::VecDeque;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BufferRegistrationQuarantine {
+    pub(crate) chunk_id: ChunkId,
+    pub(crate) register_errno: Option<i32>,
+    pub(crate) cleanup_errno: Option<i32>,
+    pub(crate) scope: &'static str,
+}
 
 pub(crate) struct BufferRegistrySubmitView<'r, 'a> {
     pub(crate) registered_chunks: &'r mut BitSet,
@@ -21,8 +32,11 @@ pub(crate) struct BufferRegistrySubmitView<'r, 'a> {
     pub(crate) fixed_buffers_available: bool,
     pub(crate) fixed_buffers_failure_errno: Option<i32>,
     pub(crate) chunk_register_failure_at: &'r mut [Option<Instant>],
+    pub(crate) registration_quarantine: &'r mut Option<BufferRegistrationQuarantine>,
     #[cfg(feature = "test-hooks")]
-    pub(crate) register_buffers_update_failure: &'r mut Option<i32>,
+    pub(crate) register_buffers_update_outcomes: &'r mut VecDeque<Option<i32>>,
+    #[cfg(feature = "test-hooks")]
+    pub(crate) bitset_set_failure: &'r mut bool,
     #[cfg(feature = "test-hooks")]
     pub(crate) push_entry_failure: &'r mut bool,
     pub(crate) provided: Option<ProvidedBufSqeInfo>,
@@ -36,8 +50,11 @@ pub(crate) struct UringBufferRegistry<'a> {
     fixed_buffers_available: bool,
     fixed_buffers_failure_errno: Option<i32>,
     chunk_register_failure_at: Box<[Option<Instant>]>,
+    registration_quarantine: Option<BufferRegistrationQuarantine>,
     #[cfg(feature = "test-hooks")]
-    register_buffers_update_failure: Option<i32>,
+    register_buffers_update_outcomes: VecDeque<Option<i32>>,
+    #[cfg(feature = "test-hooks")]
+    bitset_set_failure: bool,
     #[cfg(feature = "test-hooks")]
     push_entry_failure: bool,
     provided_buf_config: Option<ProvidedBufConfig>,
@@ -58,8 +75,11 @@ impl<'a> UringBufferRegistry<'a> {
             fixed_buffers_available: false,
             fixed_buffers_failure_errno: None,
             chunk_register_failure_at: vec![None; MAX_CHUNKS].into_boxed_slice(),
+            registration_quarantine: None,
             #[cfg(feature = "test-hooks")]
-            register_buffers_update_failure: None,
+            register_buffers_update_outcomes: VecDeque::new(),
+            #[cfg(feature = "test-hooks")]
+            bitset_set_failure: false,
             #[cfg(feature = "test-hooks")]
             push_entry_failure: false,
             provided_buf_config,
@@ -80,8 +100,11 @@ impl<'a> UringBufferRegistry<'a> {
             fixed_buffers_available: self.fixed_buffers_available,
             fixed_buffers_failure_errno: self.fixed_buffers_failure_errno,
             chunk_register_failure_at: &mut self.chunk_register_failure_at,
+            registration_quarantine: &mut self.registration_quarantine,
             #[cfg(feature = "test-hooks")]
-            register_buffers_update_failure: &mut self.register_buffers_update_failure,
+            register_buffers_update_outcomes: &mut self.register_buffers_update_outcomes,
+            #[cfg(feature = "test-hooks")]
+            bitset_set_failure: &mut self.bitset_set_failure,
             #[cfg(feature = "test-hooks")]
             push_entry_failure: &mut self.push_entry_failure,
             provided,
@@ -101,7 +124,19 @@ impl<'a> UringBufferRegistry<'a> {
 
     #[cfg(feature = "test-hooks")]
     pub(crate) fn inject_register_buffers_update_failure(&mut self, errno: i32) {
-        self.register_buffers_update_failure = Some(errno);
+        self.register_buffers_update_outcomes.push_back(Some(errno));
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn inject_register_buffers_update_sequence(&mut self, outcomes: &[Option<i32>]) {
+        self.register_buffers_update_outcomes.clear();
+        self.register_buffers_update_outcomes
+            .extend(outcomes.iter().copied());
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn inject_bitset_set_failure(&mut self) {
+        self.bitset_set_failure = true;
     }
 
     #[cfg(feature = "test-hooks")]
@@ -118,6 +153,13 @@ impl<'a> UringBufferRegistry<'a> {
     #[inline]
     pub(crate) fn stats_mut(&mut self) -> &mut UringRegistrationStats {
         &mut self.stats
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn is_chunk_registered(&self, chunk_id: ChunkId) -> bool {
+        self.registered_chunks
+            .get(chunk_id.as_usize())
+            .unwrap_or(false)
     }
 
     #[inline]
