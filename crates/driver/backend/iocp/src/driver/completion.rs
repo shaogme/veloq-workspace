@@ -107,10 +107,18 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
     fn handle_control(
         &mut self,
         control: CompletionControl,
-    ) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
-        Ok(match control {
+    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
+        match control {
             CompletionControl::Waker { raw, .. } => {
-                let rearmed = self.completion.clear_notification()?;
+                let rearmed = match self.completion.clear_notification() {
+                    Ok(rearmed) => rearmed,
+                    Err(error) => {
+                        return CompletionHookOutcome::Failed {
+                            error: error.attach_note("failed to clear IOCP waker notification"),
+                            effect: IocpBackendEffect::None,
+                        };
+                    }
+                };
                 if raw.res >= 0 {
                     self.diagnostics.backend().inc_waker_ok();
                     self.diagnostics.backend().inc_wait_waker_return();
@@ -119,23 +127,27 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
                     }
                 } else {
                     self.diagnostics.backend().inc_waker_error();
-                    return Err(IocpError::Internal
-                        .to_report()
-                        .push_ctx("scope", "iocp.driver.completion.waker")
-                        .set_error_code(-raw.res)
-                        .attach_note("IOCP waker completion reported an error"));
+                    return CompletionHookOutcome::Failed {
+                        error: IocpError::Internal
+                            .to_report()
+                            .push_ctx("scope", "iocp.driver.completion.waker")
+                            .set_error_code(-raw.res)
+                            .attach_note("IOCP waker completion reported an error"),
+                        effect: IocpBackendEffect::None,
+                    };
                 }
                 CompletionHookOutcome::ControlHandled {
                     effect: IocpBackendEffect::None,
                 }
             }
-            CompletionControl::Cancel { .. } => {
-                return Err(IocpError::InvalidState.report(
+            CompletionControl::Cancel { .. } => CompletionHookOutcome::Failed {
+                error: IocpError::InvalidState.report(
                     "iocp.completion.handle_control",
                     "async cancel completion had no pending request (programming error)",
-                ));
-            }
-        })
+                ),
+                effect: IocpBackendEffect::None,
+            },
+        }
     }
 
     fn complete_waiting(

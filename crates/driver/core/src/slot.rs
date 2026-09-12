@@ -575,9 +575,8 @@ mod tests {
         fn handle_control(
             &mut self,
             _control: CompletionControl,
-        ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>>
-        {
-            Ok(CompletionHookOutcome::Ignore { effect: () })
+        ) -> CompletionHookOutcome<DummySlotSpec, Self::BackendEffect> {
+            CompletionHookOutcome::Ignore { effect: () }
         }
 
         fn complete_waiting(

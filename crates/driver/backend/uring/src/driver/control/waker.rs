@@ -6,7 +6,7 @@ use diagweave::prelude::*;
 use veloq_driver_core::driver::RemoteWaker;
 use veloq_std::{
     boxed::Box,
-    io, mem,
+    io,
     string::ToString,
     sync::{
         Arc, UnpoisonedMutex, UnpoisonedMutexGuard,
@@ -46,9 +46,12 @@ impl WakerFdState {
         self.lock_fd().clone()
     }
 
-    #[inline]
-    pub(crate) fn replace(&self, fd: Arc<EventFd>) -> Arc<EventFd> {
-        mem::replace(&mut *self.lock_fd(), fd)
+    pub(crate) fn with_lock<F, T>(&self, f: F) -> T
+    where
+        F: FnOnce(&mut Arc<EventFd>) -> T,
+    {
+        let mut fd = self.lock_fd();
+        f(&mut fd)
     }
 }
 
@@ -104,22 +107,23 @@ impl RemoteWaker<UringError> for UringWaker {
 
 impl UringWaker {
     fn notify_event_fd(&self) -> UringResult<()> {
+        let result = self.state.with_lock(|fd| Self::write_event_fd(fd));
+        if result.is_ok() {
+            return Ok(());
+        }
+
+        self.rollback_notification();
+        result
+    }
+
+    pub(crate) fn write_event_fd(fd: &EventFd) -> UringResult<()> {
         let buf = 1u64.to_ne_bytes();
-        let fd = self.state.current();
         let ret = unsafe { libc::write(fd.fd.raw().as_fd(), buf.as_ptr() as *const _, 8) };
         if ret < 0 {
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EAGAIN) {
                 return Ok(());
             }
-            self.notification_state
-                .compare_exchange(
-                    WAKER_NOTIFIED,
-                    WAKER_IDLE,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .ok();
             return Err(UringError::Internal
                 .to_report()
                 .push_ctx("scope", "uring.driver.waker.wake")
@@ -127,14 +131,6 @@ impl UringWaker {
                 .attach_note(err.to_string()));
         }
         if ret != 8 {
-            self.notification_state
-                .compare_exchange(
-                    WAKER_NOTIFIED,
-                    WAKER_IDLE,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .ok();
             return Err(UringError::Internal
                 .to_report()
                 .push_ctx("scope", "uring.driver.waker.wake")
@@ -142,6 +138,42 @@ impl UringWaker {
                 .attach_note("eventfd write returned an unexpected byte count"));
         }
         Ok(())
+    }
+
+    fn rollback_notification(&self) {
+        loop {
+            match self.notification_state.load(Ordering::Acquire) {
+                WAKER_NOTIFIED => {
+                    if self
+                        .notification_state
+                        .compare_exchange(
+                            WAKER_NOTIFIED,
+                            WAKER_IDLE,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+                WAKER_RENOTIFIED => {
+                    if self
+                        .notification_state
+                        .compare_exchange(
+                            WAKER_RENOTIFIED,
+                            WAKER_NOTIFIED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+                _ => return,
+            }
+        }
     }
 }
 
@@ -185,6 +217,11 @@ impl UringWakerManager {
     }
 
     #[inline]
+    pub(crate) fn write_event_fd(fd: &EventFd) -> UringResult<()> {
+        UringWaker::write_event_fd(fd)
+    }
+
+    #[inline]
     pub(crate) fn create_waker(&self) -> Arc<dyn RemoteWaker<UringError>> {
         Arc::new(UringWaker {
             state: self.state.clone(),
@@ -222,6 +259,14 @@ impl UringWakerManager {
     }
 
     #[inline]
+    pub(crate) fn has_pending_notification(&self) -> bool {
+        matches!(
+            self.notification_state.load(Ordering::Acquire),
+            WAKER_NOTIFIED | WAKER_RENOTIFIED
+        )
+    }
+
+    #[inline]
     pub(crate) fn registered_fd(&self) -> Option<IoFd> {
         self.registered_fd
     }
@@ -245,10 +290,6 @@ impl UringWakerManager {
     pub(crate) fn buf_len(&self) -> usize {
         self.buf.len()
     }
-
-    pub(crate) fn replace_state_fd(&mut self, new_fd: Arc<EventFd>) -> Arc<EventFd> {
-        self.state.replace(new_fd)
-    }
 }
 
 fn begin_processing(state: &AtomicU8) {
@@ -271,5 +312,54 @@ fn begin_processing(state: &AtomicU8) {
             WAKER_PROCESSING | WAKER_REARM => return,
             _ => unreachable!("invalid io_uring waker state"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use veloq_std::mem;
+
+    fn read_event_fd(fd: &EventFd) -> u64 {
+        let mut value = 0u64;
+        let ret = unsafe {
+            libc::read(
+                fd.fd.raw().as_fd(),
+                (&mut value as *mut u64).cast(),
+                mem::size_of::<u64>(),
+            )
+        };
+        assert_eq!(ret, mem::size_of::<u64>() as isize);
+        value
+    }
+
+    #[test]
+    fn pending_notification_is_migrated_to_the_replaced_eventfd() {
+        let manager = UringWakerManager::new().expect("eventfd should be created");
+        let remote_waker = manager.create_waker();
+        let old_fd = manager.state.current();
+        let new_fd =
+            UringWakerManager::create_event_fd("uring.test.pending_notification.new_eventfd")
+                .expect("replacement eventfd should be created");
+
+        manager.begin_processing();
+        remote_waker
+            .wake()
+            .expect("initial notification should succeed");
+        assert!(manager.has_pending_notification());
+
+        manager.state.with_lock(|current_fd| {
+            UringWakerManager::write_event_fd(&new_fd)
+                .expect("pending notification should be copied");
+            *current_fd = new_fd.clone();
+        });
+
+        remote_waker
+            .wake()
+            .expect("notification after replacement should succeed");
+        assert_eq!(read_event_fd(&new_fd), 2);
+        assert_eq!(read_event_fd(&old_fd), 1);
+        assert_eq!(manager.state.current().fd.raw(), new_fd.fd.raw());
+        assert_ne!(old_fd.fd.raw(), new_fd.fd.raw());
     }
 }

@@ -6,7 +6,7 @@ use crate::{
         SlotError, SlotPayload, SlotRegistryExt, SlotSpec,
     },
 };
-use diagweave::DiagnosticError;
+use diagweave::{DiagnosticError, Report};
 use veloq_std::format;
 
 use super::{
@@ -100,6 +100,14 @@ where
         attach: AnomalyAttach,
         effect: Effect,
     },
+    /// 控制完成本身失败，但仍有一个必须执行的后端收尾 effect。
+    ///
+    /// `finish_hook_outcome` 会先执行 `effect`，再把 `error` 返回给调用方。这样控制
+    /// 完成不能用错误短路掉 waker、cancel 等资源收尾。
+    Failed {
+        error: Report<SlotError<Spec>>,
+        effect: Effect,
+    },
     ControlHandled {
         effect: Effect,
     },
@@ -126,7 +134,7 @@ where
     fn handle_control(
         &mut self,
         control: CompletionControl,
-    ) -> HookResult<Spec, CompletionHookOutcome<Spec, Self::BackendEffect>>;
+    ) -> CompletionHookOutcome<Spec, Self::BackendEffect>;
 
     fn complete_waiting(
         &mut self,
@@ -291,11 +299,11 @@ where
                     CompletionSource::Kernel,
                 ),
                 CompletionDispatch::Waker { id, raw } => {
-                    let outcome = hooks.handle_control(CompletionControl::Waker { id, raw })?;
+                    let outcome = hooks.handle_control(CompletionControl::Waker { id, raw });
                     finish_hook_outcome(self, table, diagnostics, hooks, outcome, None)
                 }
                 CompletionDispatch::Cancel { id, raw } => {
-                    let outcome = hooks.handle_control(CompletionControl::Cancel { id, raw })?;
+                    let outcome = hooks.handle_control(CompletionControl::Cancel { id, raw });
                     finish_hook_outcome(self, table, diagnostics, hooks, outcome, None)
                 }
                 CompletionDispatch::Unknown { envelope } => {
@@ -484,6 +492,12 @@ where
             };
             hooks.finish_backend_effect(effect)?;
             Ok(progress)
+        }
+        CompletionHookOutcome::Failed { error, effect } => {
+            match hooks.finish_backend_effect(effect) {
+                Ok(()) => Err(error),
+                Err(finish_error) => Err(finish_error.with_diag_src_err(error)),
+            }
         }
         CompletionHookOutcome::ControlHandled { effect } => {
             hooks.finish_backend_effect(effect)?;

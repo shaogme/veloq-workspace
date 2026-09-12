@@ -14,9 +14,11 @@ use crate::{
         SlotState, SlotView,
     },
 };
+use diagweave::Report;
 use veloq_std::{
     error::Error,
     fmt, format,
+    string::ToString,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -70,6 +72,9 @@ struct TestHooks {
     cleanup: Option<CompletionCleanupGuard>,
     /// 还要产出多少条 `More` 完成，用来模拟一个 multishot 操作。
     remaining_more: usize,
+    control_failure: bool,
+    finish_calls: usize,
+    finish_failure: bool,
 }
 
 impl TestHooks {
@@ -77,6 +82,9 @@ impl TestHooks {
         Self {
             cleanup: None,
             remaining_more,
+            control_failure: false,
+            finish_calls: 0,
+            finish_failure: false,
         }
     }
 
@@ -96,8 +104,17 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
     fn handle_control(
         &mut self,
         _control: CompletionControl,
-    ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>> {
-        Ok(CompletionHookOutcome::Ignore { effect: () })
+    ) -> CompletionHookOutcome<DummySlotSpec, Self::BackendEffect> {
+        if self.control_failure {
+            CompletionHookOutcome::Failed {
+                error: Report::new(DummyError)
+                    .set_error_code(101)
+                    .attach_note("control completion failed"),
+                effect: (),
+            }
+        } else {
+            CompletionHookOutcome::Ignore { effect: () }
+        }
     }
 
     fn complete_waiting(
@@ -168,8 +185,74 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
         &mut self,
         _effect: Self::BackendEffect,
     ) -> HookResult<DummySlotSpec, ()> {
-        Ok(())
+        self.finish_calls += 1;
+        if self.finish_failure {
+            Err(Report::new(DummyError)
+                .set_error_code(202)
+                .attach_note("backend effect failed"))
+        } else {
+            Ok(())
+        }
     }
+}
+
+fn accept_kernel_control(
+    registry: &mut OpRegistry<DummySlotSpec>,
+    hooks: &mut TestHooks,
+) -> Result<CompletionFlowOutcome, Report<DummyError>> {
+    let diagnostics = registry.shared.completion_diagnostics();
+    let table: SharedCompletionTable<DummySlotSpec> = registry.shared.clone();
+    let envelope = CompletionEnvelope::from_raw_parts(
+        CompletionBackend::Core,
+        CompletionToken::waker(0).raw(),
+        0,
+        0,
+    );
+    registry.accept_completion(
+        &table,
+        &diagnostics,
+        hooks,
+        CompletionIngress::Kernel(envelope),
+    )
+}
+
+#[test]
+fn failed_control_outcome_finishes_effect_before_returning_error() {
+    let mut registry = OpRegistry::<DummySlotSpec>::new(1);
+    let mut hooks = TestHooks {
+        control_failure: true,
+        ..TestHooks::default()
+    };
+
+    let error = accept_kernel_control(&mut registry, &mut hooks)
+        .expect_err("failed control outcome should be returned");
+
+    assert_eq!(hooks.finish_calls, 1);
+    assert_eq!(
+        error.error_code().map(ToString::to_string).as_deref(),
+        Some("101")
+    );
+    assert!(error.iter_diag_sources().next().is_none());
+}
+
+#[test]
+fn failed_effect_takes_priority_and_keeps_control_error_as_source() {
+    let mut registry = OpRegistry::<DummySlotSpec>::new(1);
+    let mut hooks = TestHooks {
+        control_failure: true,
+        finish_failure: true,
+        ..TestHooks::default()
+    };
+
+    let error = accept_kernel_control(&mut registry, &mut hooks)
+        .expect_err("effect failure should be returned");
+
+    assert_eq!(hooks.finish_calls, 1);
+    assert_eq!(
+        error.error_code().map(ToString::to_string).as_deref(),
+        Some("202")
+    );
+    assert!(error.iter_diag_sources().next().is_some());
 }
 
 fn active_registry() -> (OpRegistry<DummySlotSpec>, OpToken) {

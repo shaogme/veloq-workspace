@@ -69,8 +69,8 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
     fn handle_control(
         &mut self,
         _control: CompletionControl,
-    ) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
-        Ok(CompletionHookOutcome::Ignore { effect: () })
+    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
+        CompletionHookOutcome::Ignore { effect: () }
     }
 
     fn complete_waiting(

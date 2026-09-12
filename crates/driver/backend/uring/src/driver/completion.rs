@@ -117,7 +117,7 @@ struct UringPostCompletionEffects {
 enum UringBackendEffect {
     None,
     Waker {
-        should_rebuild: bool,
+        recovery: WakerRecovery,
     },
     CancelEnoent {
         cancel_id: CancelCompletionId,
@@ -127,6 +127,12 @@ enum UringBackendEffect {
     CloseCompleted {
         fd: IoFd,
     },
+}
+
+#[derive(Clone, Copy)]
+enum WakerRecovery {
+    Rearm,
+    RebuildAndRearm,
 }
 
 impl Default for UringBackendEffect {
@@ -178,11 +184,18 @@ impl<'a> UringCompletionHooks<'a> {
         CqeEnv::new(self.provided_buffers.as_deref_mut())
     }
 
-    fn handle_waker_control(&mut self, raw: RawCompletion) -> UringResult<UringBackendEffect> {
-        let should_rebuild = false;
+    fn handle_waker_control(
+        &mut self,
+        raw: RawCompletion,
+    ) -> CompletionHookOutcome<UringSlotSpec, UringBackendEffect> {
         if raw.res == self.waker_buf_len as i32 {
             self.diagnostics.backend().inc_waker_ok();
             self.diagnostics.backend().inc_wait_waker_return();
+            CompletionHookOutcome::ControlHandled {
+                effect: UringBackendEffect::Waker {
+                    recovery: WakerRecovery::Rearm,
+                },
+            }
         } else if raw.res >= 0 {
             self.diagnostics.backend().inc_waker_error();
             warn!(
@@ -190,50 +203,66 @@ impl<'a> UringCompletionHooks<'a> {
                 expected = self.waker_buf_len,
                 "eventfd waker read returned unexpected byte count"
             );
-            return Err(UringError::CompletionWait
-                .report(
-                    "uring.completion.handle_waker_control",
-                    format!(
-                        "eventfd waker read returned {} bytes, expected {}",
-                        raw.res, self.waker_buf_len
-                    ),
-                )
-                .with_ctx("completion_result", raw.res));
+            CompletionHookOutcome::Failed {
+                error: UringError::CompletionWait
+                    .report(
+                        "uring.completion.handle_waker_control",
+                        format!(
+                            "eventfd waker read returned {} bytes, expected {}",
+                            raw.res, self.waker_buf_len
+                        ),
+                    )
+                    .with_ctx("completion_result", raw.res),
+                effect: UringBackendEffect::Waker {
+                    recovery: WakerRecovery::RebuildAndRearm,
+                },
+            }
         } else {
             self.diagnostics.backend().inc_waker_error();
             match -raw.res {
                 libc::EAGAIN | libc::EINTR => {
                     debug!(res = raw.res, "recoverable eventfd waker read completion");
+                    CompletionHookOutcome::ControlHandled {
+                        effect: UringBackendEffect::Waker {
+                            recovery: WakerRecovery::Rearm,
+                        },
+                    }
                 }
                 errno => {
                     warn!(res = raw.res, errno, "eventfd waker read failed");
-                    return Err(UringError::CompletionWait
-                        .report(
-                            "uring.completion.handle_waker_control",
-                            "eventfd waker read failed",
-                        )
-                        .set_error_code(errno));
+                    CompletionHookOutcome::Failed {
+                        error: UringError::CompletionWait
+                            .report(
+                                "uring.completion.handle_waker_control",
+                                "eventfd waker read failed",
+                            )
+                            .set_error_code(errno),
+                        effect: UringBackendEffect::Waker {
+                            recovery: WakerRecovery::RebuildAndRearm,
+                        },
+                    }
                 }
             }
         }
-
-        Ok(UringBackendEffect::Waker { should_rebuild })
     }
 
     fn handle_cancel_control(
         &mut self,
         cancel_id: CancelCompletionId,
         raw: RawCompletion,
-    ) -> UringResult<CompletionHookOutcome<UringSlotSpec, UringBackendEffect>> {
+    ) -> CompletionHookOutcome<UringSlotSpec, UringBackendEffect> {
         let request = self.pending_cancel_cqes.remove(&cancel_id);
         let Some(request) = request else {
-            return Err(UringError::InvalidState.report(
-                "uring.completion.handle_cancel_control",
-                format!(
-                    "async cancel completion had no pending request for cancel_id: {}",
-                    cancel_id.raw()
+            return CompletionHookOutcome::Failed {
+                error: UringError::InvalidState.report(
+                    "uring.completion.handle_cancel_control",
+                    format!(
+                        "async cancel completion had no pending request for cancel_id: {}",
+                        cancel_id.raw()
+                    ),
                 ),
-            ));
+                effect: UringBackendEffect::None,
+            };
         };
 
         match raw.res {
@@ -245,9 +274,9 @@ impl<'a> UringCompletionHooks<'a> {
                     result = value,
                     "async cancel completed"
                 );
-                Ok(CompletionHookOutcome::ControlHandled {
+                CompletionHookOutcome::ControlHandled {
                     effect: UringBackendEffect::None,
-                })
+                }
             }
             value if value == -libc::ENOENT => {
                 self.diagnostics.backend().inc_cancel_ack_not_found();
@@ -256,13 +285,13 @@ impl<'a> UringCompletionHooks<'a> {
                     request = ?request,
                     "async cancel target was already complete or absent"
                 );
-                Ok(CompletionHookOutcome::ControlHandled {
+                CompletionHookOutcome::ControlHandled {
                     effect: UringBackendEffect::CancelEnoent {
                         cancel_id,
                         request,
                         raw,
                     },
-                })
+                }
             }
             value => {
                 self.diagnostics.backend().inc_cancel_ack_error();
@@ -273,9 +302,9 @@ impl<'a> UringCompletionHooks<'a> {
                     errno = -value,
                     "async cancel request failed"
                 );
-                Ok(CompletionHookOutcome::ControlHandled {
+                CompletionHookOutcome::ControlHandled {
                     effect: UringBackendEffect::None,
-                })
+                }
             }
         }
     }
@@ -288,11 +317,9 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
     fn handle_control(
         &mut self,
         control: CompletionControl,
-    ) -> UringResult<CompletionHookOutcome<UringSlotSpec, Self::BackendEffect>> {
+    ) -> CompletionHookOutcome<UringSlotSpec, Self::BackendEffect> {
         match control {
-            CompletionControl::Waker { raw, .. } => Ok(CompletionHookOutcome::ControlHandled {
-                effect: self.handle_waker_control(raw)?,
-            }),
+            CompletionControl::Waker { raw, .. } => self.handle_waker_control(raw),
             CompletionControl::Cancel { id, raw } => self.handle_cancel_control(id, raw),
         }
     }
@@ -385,7 +412,7 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
     fn finish_backend_effect(&mut self, effect: Self::BackendEffect) -> UringResult<()> {
         match effect {
             UringBackendEffect::None => Ok(()),
-            UringBackendEffect::Waker { should_rebuild } => {
+            UringBackendEffect::Waker { recovery } => {
                 *self.waker_armed = false;
                 self.notification_state
                     .compare_exchange(
@@ -395,7 +422,7 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
                         Ordering::Acquire,
                     )
                     .ok();
-                self.post.rebuild_waker |= should_rebuild;
+                self.post.rebuild_waker |= matches!(recovery, WakerRecovery::RebuildAndRearm);
                 self.post.resubmit_waker = true;
                 self.post.flush_backlog = true;
                 Ok(())
@@ -631,15 +658,20 @@ impl<'a> UringDriver<'a> {
             self.buffer_registry.provided_buffers_mut(),
             synthetic,
         );
-        let outcome = self.ops.accept_completion(
+        let flow_result = self.ops.accept_completion(
             &self.completion_table,
             &self.completion_diagnostics,
             &mut hooks,
             ingress,
-        )?;
+        );
         let post = hooks.into_post_effects();
-        self.apply_post_completion_effects(post)?;
-        Ok(outcome)
+        let post_result = self.apply_post_completion_effects(post);
+        match (flow_result, post_result) {
+            (Ok(outcome), Ok(())) => Ok(outcome),
+            (Err(flow_error), Ok(())) => Err(flow_error),
+            (Ok(_), Err(post_error)) => Err(post_error),
+            (Err(flow_error), Err(post_error)) => Err(post_error.with_diag_src_err(flow_error)),
+        }
     }
 
     fn apply_post_completion_effects(
@@ -991,7 +1023,7 @@ mod tests {
         let diagnostics = DriverCompletionDiagnostics::<UringCompletionDiagnostics>::default();
         let mut pending_cancel_cqes = HashMap::default();
         let mut waker_armed = true;
-        let notification_state = AtomicU8::new(WAKER_NOTIFIED);
+        let notification_state = AtomicU8::new(WAKER_PROCESSING);
         let mut hooks = test_hooks(
             &diagnostics,
             &mut pending_cancel_cqes,
@@ -1000,10 +1032,117 @@ mod tests {
         );
         let raw = RawCompletion::new(COMP_BACKEND_URING, CompletionToken::waker(0), 4, 0);
 
-        let effect = hooks.handle_waker_control(raw);
+        let outcome = hooks.handle_waker_control(raw);
+        let (error, effect) = match outcome {
+            CompletionHookOutcome::Failed { error, effect } => (error, effect),
+            _ => panic!("unexpected byte count must produce a failed outcome"),
+        };
+        hooks
+            .finish_backend_effect(effect)
+            .expect("waker recovery effect should be recorded");
 
-        assert!(effect.is_err());
+        assert_eq!(*error.inner(), UringError::CompletionWait);
+        let rebuild_waker = hooks.post.rebuild_waker;
+        let resubmit_waker = hooks.post.resubmit_waker;
+        drop(hooks);
+        assert!(!waker_armed);
+        assert_eq!(notification_state.load(Ordering::Acquire), WAKER_REARM);
+        assert!(rebuild_waker);
+        assert!(resubmit_waker);
         assert_eq!(diagnostics.snapshot().backend.waker_error, 1);
+    }
+
+    #[test]
+    fn waker_control_rearms_successful_completion() {
+        let diagnostics = DriverCompletionDiagnostics::<UringCompletionDiagnostics>::default();
+        let mut pending_cancel_cqes = HashMap::default();
+        let mut waker_armed = true;
+        let notification_state = AtomicU8::new(WAKER_PROCESSING);
+        let mut hooks = test_hooks(
+            &diagnostics,
+            &mut pending_cancel_cqes,
+            &mut waker_armed,
+            &notification_state,
+        );
+        let raw = RawCompletion::new(COMP_BACKEND_URING, CompletionToken::waker(0), 8, 0);
+
+        let outcome = hooks.handle_waker_control(raw);
+        let effect = match outcome {
+            CompletionHookOutcome::ControlHandled { effect } => effect,
+            _ => panic!("a valid eventfd read must be handled successfully"),
+        };
+        hooks
+            .finish_backend_effect(effect)
+            .expect("waker rearm effect should be recorded");
+
+        let resubmit_waker = hooks.post.resubmit_waker;
+        let rebuild_waker = hooks.post.rebuild_waker;
+        drop(hooks);
+        assert!(!waker_armed);
+        assert_eq!(notification_state.load(Ordering::Acquire), WAKER_REARM);
+        assert!(resubmit_waker);
+        assert!(!rebuild_waker);
+        assert_eq!(diagnostics.snapshot().backend.waker_ok, 1);
+        assert_eq!(diagnostics.snapshot().backend.waker_error, 0);
+    }
+
+    #[test]
+    fn recoverable_waker_errors_still_rearm() {
+        let diagnostics = DriverCompletionDiagnostics::<UringCompletionDiagnostics>::default();
+        for res in [-libc::EAGAIN, -libc::EINTR] {
+            let mut pending_cancel_cqes = HashMap::default();
+            let mut waker_armed = true;
+            let notification_state = AtomicU8::new(WAKER_PROCESSING);
+            let mut hooks = test_hooks(
+                &diagnostics,
+                &mut pending_cancel_cqes,
+                &mut waker_armed,
+                &notification_state,
+            );
+            let raw = RawCompletion::new(COMP_BACKEND_URING, CompletionToken::waker(0), res, 0);
+
+            let outcome = hooks.handle_waker_control(raw);
+            let effect = match outcome {
+                CompletionHookOutcome::ControlHandled { effect } => effect,
+                _ => panic!("recoverable eventfd errors must be rearmed"),
+            };
+            hooks
+                .finish_backend_effect(effect)
+                .expect("waker rearm effect should be recorded");
+            drop(hooks);
+
+            assert!(!waker_armed);
+            assert_eq!(notification_state.load(Ordering::Acquire), WAKER_REARM);
+        }
+
+        let snapshot = diagnostics.snapshot().backend;
+        assert_eq!(snapshot.waker_error, 2);
+        assert_eq!(snapshot.waker_rearm, 0);
+    }
+
+    #[test]
+    fn waker_finish_does_not_overwrite_a_concurrent_notification() {
+        let diagnostics = DriverCompletionDiagnostics::<UringCompletionDiagnostics>::default();
+        let mut pending_cancel_cqes = HashMap::default();
+        let mut waker_armed = true;
+        let notification_state = AtomicU8::new(WAKER_PROCESSING);
+        let mut hooks = test_hooks(
+            &diagnostics,
+            &mut pending_cancel_cqes,
+            &mut waker_armed,
+            &notification_state,
+        );
+
+        notification_state.store(WAKER_NOTIFIED, Ordering::Release);
+        hooks
+            .finish_backend_effect(UringBackendEffect::Waker {
+                recovery: WakerRecovery::Rearm,
+            })
+            .expect("waker rearm effect should be recorded");
+        drop(hooks);
+
+        assert!(!waker_armed);
+        assert_eq!(notification_state.load(Ordering::Acquire), WAKER_NOTIFIED);
     }
 
     #[test]
@@ -1056,7 +1195,13 @@ mod tests {
 
         let outcome = hooks.handle_cancel_control(cancel_id, raw);
 
-        let err = outcome.err().expect("outcome should be Err");
+        let err = match outcome {
+            CompletionHookOutcome::Failed { error, effect } => {
+                assert!(matches!(effect, UringBackendEffect::None));
+                error
+            }
+            _ => panic!("untracked cancel must produce a failed outcome"),
+        };
         assert_eq!(*err.inner(), UringError::InvalidState);
     }
 }

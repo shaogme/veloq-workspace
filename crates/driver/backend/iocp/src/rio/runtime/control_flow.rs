@@ -143,10 +143,10 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
     fn handle_control(
         &mut self,
         _control: CompletionControl,
-    ) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
-        Ok(CompletionHookOutcome::Ignore {
+    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
+        CompletionHookOutcome::Ignore {
             effect: RioBackendEffect::default(),
-        })
+        }
     }
 
     fn complete_waiting(

@@ -173,17 +173,32 @@ impl<'a> UringDriver<'a> {
     pub(crate) fn rebuild_waker_fd(&mut self) -> UringResult<()> {
         let new_fd = UringWakerManager::create_event_fd("driver.rebuild_waker_fd.eventfd")?;
         let raw = RawHandle::new(UringRawHandle::for_file(new_fd.fd.raw().as_fd()));
-        match self.waker.registered_fd() {
-            // A registered waker keeps its slot: only the kernel table entry changes, so the
-            // descriptor stays valid across the rebuild.
-            Some(fd @ IoFd::Registered { .. }) => self.replace_registered_fixed_fd(fd, raw)?,
-            // A direct descriptor *is* the fd, so a rebuilt eventfd needs a new one. Only the
-            // driver holds this descriptor, so replacing it invalidates nothing.
-            Some(IoFd::Direct(_)) => self.waker.set_registered_fd(Some(IoFd::direct(raw.raw()))),
-            None => {}
-        }
-        let _old_fd = self.waker.replace_state_fd(new_fd);
-        Ok(())
+        let registered_fd = self.waker.registered_fd();
+        let state = self.waker.state();
+
+        state.with_lock(|current_fd| {
+            // Keep fd replacement and remote wake writes under the same mutex. A pending
+            // notification is copied to the new eventfd before the shared fd is swapped, so a
+            // failed copy leaves both the old fd and the notification state intact.
+            if self.waker.has_pending_notification() {
+                UringWakerManager::write_event_fd(&new_fd)?;
+            }
+
+            match registered_fd {
+                // A registered waker keeps its slot: only the kernel table entry changes, so the
+                // descriptor stays valid across the rebuild.
+                Some(fd @ IoFd::Registered { .. }) => self.replace_registered_fixed_fd(fd, raw)?,
+                // A direct descriptor *is* the fd, so a rebuilt eventfd needs a new one. Only the
+                // driver holds this descriptor, so replacing it invalidates nothing.
+                Some(IoFd::Direct(_)) => {
+                    self.waker.set_registered_fd(Some(IoFd::direct(raw.raw())));
+                }
+                None => {}
+            }
+
+            *current_fd = new_fd.clone();
+            Ok(())
+        })
     }
 }
 
