@@ -137,7 +137,7 @@ pub(super) fn run_rejected_cleanup<Spec: SlotSpec>(
 }
 
 #[inline]
-pub(super) fn run_completion_cleanup<B>(
+pub fn run_completion_cleanup<B>(
     diagnostics: &DriverCompletionDiagnostics<B>,
     cleanup: &mut CompletionCleanupGuard,
 ) -> bool {

@@ -75,7 +75,7 @@ pub(crate) fn submit_queued_from_slot(
     }
 
     let mut chunks = [ChunkId::ZERO; 4];
-    let (count, sqe) = {
+    let (count, sqe, completion_token, cleanup_hint) = {
         let sqe_env = env.sqe_env();
         slot.with_op_and_payload_mut(|op, payload| {
             let vtable = op.vtable;
@@ -96,7 +96,12 @@ pub(crate) fn submit_queued_from_slot(
                 .attach_note("driver.submit_queued_from_slot.make_sqe")?
                 .user_data(completion_token.raw())
             };
-            Ok::<_, Report<UringError>>((count, sqe))
+            Ok::<_, Report<UringError>>((
+                count,
+                sqe,
+                completion_token,
+                vtable.completion_cleanup_hint,
+            ))
         })
         .map_err(|err| slot_access_report("driver.submit_queued_from_slot.op_payload", err))??
     };
@@ -111,6 +116,7 @@ pub(crate) fn submit_queued_from_slot(
 
     if env.push_entry(sqe) {
         slot.platform_mut().submission_state = UringSubmissionState::KernelSubmitted;
+        env.register_completion_cleanup_hint(completion_token, cleanup_hint);
         trace!(user_data, "Submitted queued backlog entry to SQ");
         Ok(true)
     } else {

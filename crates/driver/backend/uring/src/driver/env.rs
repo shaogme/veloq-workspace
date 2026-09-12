@@ -13,14 +13,18 @@ use crate::{
         registration::{BufferRegistrationQuarantine, REGISTER_FAILURE_RETRY_COOLDOWN},
     },
     error::{UringError, UringResult},
-    op::UringOpRegistry,
+    op::{CompletionCleanupHintFn, UringOpRegistry},
 };
 use diagweave::prelude::*;
 use io_uring::{IoUring, cqueue, squeue};
 use tracing::{debug, trace};
 use veloq_buf::{BufferRegistrar, FixedBuf, heap::ChunkId};
-use veloq_driver_core::driver::{BufferRegistrationStatus, OpToken};
-use veloq_std::{collections::BitSet, format, io, ptr, time::Instant};
+use veloq_driver_core::driver::{BufferRegistrationStatus, CompletionToken, OpToken};
+use veloq_std::{
+    collections::{BitSet, HashMap},
+    format, io, ptr,
+    time::Instant,
+};
 use veloq_wheel::Wheel;
 
 #[cfg(feature = "test-hooks")]
@@ -152,6 +156,7 @@ impl<'d> CqeEnv<'d> {
 pub(crate) struct SubmitEnv<'d, 'r> {
     pub(crate) ring: &'d mut IoUring,
     pub(crate) wheel: &'d mut Wheel<OpToken>,
+    completion_cleanup_hints: &'d mut HashMap<CompletionToken, Option<CompletionCleanupHintFn>>,
     file_table: &'d FileTable,
     registered_chunks: &'d mut BitSet,
     registrar: &'r (dyn BufferRegistrar + 'r),
@@ -171,6 +176,23 @@ pub(crate) struct SubmitEnv<'d, 'r> {
 }
 
 impl SubmitEnv<'_, '_> {
+    /// Records the cleanup capability only after the SQE has entered the user-space queue.
+    ///
+    /// The value is optional by design: a present `None` records that this token is a known
+    /// non-fd operation, whereas a missing token means that completion metadata was lost.
+    #[inline]
+    pub(crate) fn register_completion_cleanup_hint(
+        &mut self,
+        token: CompletionToken,
+        hint: Option<CompletionCleanupHintFn>,
+    ) {
+        let previous = self.completion_cleanup_hints.insert(token, hint);
+        debug_assert!(
+            previous.is_none(),
+            "completion cleanup hint was registered twice for one token"
+        );
+    }
+
     /// Narrows this view down to what a `make_sqe` implementation may see.
     #[inline]
     pub(crate) fn sqe_env(&self) -> SqeEnv<'_> {
@@ -614,6 +636,7 @@ impl<'a> UringDriver<'a> {
             SubmitEnv {
                 ring: &mut self.ring,
                 wheel: self.timers.wheel_mut(),
+                completion_cleanup_hints: &mut self.completion_cleanup_hints,
                 file_table: &self.file_table,
                 registered_chunks: view.registered_chunks,
                 registrar: view.registrar,

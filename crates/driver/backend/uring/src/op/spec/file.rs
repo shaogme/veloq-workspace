@@ -4,8 +4,9 @@ use crate::{
     driver::SqeEnv,
     error::UringResult,
     op::{
-        Close, Fallocate, FallocateRaw, Fsync, FsyncRaw, Open, ReadFixed, ReadRaw,
-        SubmissionStrategy, SyncFileRange, SyncFileRangeRaw, WriteFixed, WriteRaw, payload, submit,
+        Close, CompletionCleanupHintFn, Fallocate, FallocateRaw, Fsync, FsyncRaw, Open, ReadFixed,
+        ReadRaw, SubmissionStrategy, SyncFileRange, SyncFileRangeRaw, WriteFixed, WriteRaw,
+        payload, submit,
     },
 };
 use io_uring::squeue;
@@ -339,6 +340,9 @@ impl UringOpSpec for Open {
     ) -> CompletionCleanupGuard {
         submit::completion_cleanup_close_raw_fd(result)
     }
+
+    const COMPLETION_CLEANUP_HINT: Option<CompletionCleanupHintFn> =
+        Some(submit::completion_cleanup_close_raw_fd);
 
     fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
         res.map(|raw| unsafe {

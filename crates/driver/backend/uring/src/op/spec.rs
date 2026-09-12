@@ -6,11 +6,11 @@ use crate::{
     driver::{CqeEnv, SqeEnv},
     error::{UringError, UringResult},
     op::{
-        Accept, AcceptMulti, AcceptedSocket, Close, Connect, Fallocate, FallocateRaw, Fsync,
-        FsyncRaw, OpSend, OpVTable, Open, ProvidedBuf, ReadFixed, ReadRaw, Recv, RecvMulti,
-        RecvProvided, SendTo, SubmissionStrategy, SyncFileRange, SyncFileRangeRaw, Timeout,
-        UdpConnect, UdpRecv, UdpRecvFrom, UdpSend, UringKernelOp, UringOpPayload, UringSlotSpec,
-        UringUserPayload, Wakeup, WriteFixed, WriteRaw, payload, submit,
+        Accept, AcceptMulti, AcceptedSocket, Close, CompletionCleanupHintFn, Connect, Fallocate,
+        FallocateRaw, Fsync, FsyncRaw, OpSend, OpVTable, Open, ProvidedBuf, ReadFixed, ReadRaw,
+        Recv, RecvMulti, RecvProvided, SendTo, SubmissionStrategy, SyncFileRange, SyncFileRangeRaw,
+        Timeout, UdpConnect, UdpRecv, UdpRecvFrom, UdpSend, UringKernelOp, UringOpPayload,
+        UringSlotSpec, UringUserPayload, Wakeup, WriteFixed, WriteRaw, payload, submit,
     },
 };
 use diagweave::prelude::*;
@@ -64,6 +64,8 @@ pub(crate) trait UringOpSpec: Sized + Send + 'static {
     ) -> CompletionCleanupGuard {
         CompletionCleanupGuard::default()
     }
+
+    const COMPLETION_CLEANUP_HINT: Option<CompletionCleanupHintFn> = None;
 
     fn orphan_cleanup(kernel: &mut Self::KernelPayload, result: i32) -> CompletionCleanupGuard {
         Self::completion_cleanup(kernel, result)
@@ -286,6 +288,7 @@ macro_rules! impl_uring_op_erasure {
                     make_sqe: make_sqe_shim::<$OpType>,
                     on_complete: on_complete_shim::<$OpType>,
                     completion_cleanup: completion_cleanup_shim::<$OpType>,
+                    completion_cleanup_hint: <$OpType as UringOpSpec>::COMPLETION_CLEANUP_HINT,
                     orphan_cleanup: orphan_cleanup_shim::<$OpType>,
                     strategy: <$OpType as UringOpSpec>::STRATEGY,
                     get_timeout: get_timeout_shim::<$OpType>,

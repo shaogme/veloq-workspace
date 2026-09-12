@@ -28,6 +28,9 @@ pub(crate) use file_table::{FileTable, FileTablePoisonContext, RegisteredFileEnt
 pub use provided_buf::ProvidedBufStats;
 pub(crate) use provided_buf::{PROVIDED_BUF_GROUP_ID, ProvidedBufGroup};
 
+#[cfg(test)]
+pub(crate) use provided_buf::test_group;
+
 pub(crate) const MAX_CHUNKS: usize = 1024;
 pub(crate) const REGISTER_FAILURE_RETRY_COOLDOWN: Duration = Duration::from_millis(250);
 /// Upper bound on [`UringConfig::file_table_capacity`](crate::config::UringConfig).

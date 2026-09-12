@@ -25,6 +25,7 @@ pub use flow::{
 };
 pub use packet::{
     CompletionContinuation, CompletionInput, CompletionPacket, CompletionRecord, UserCompletion,
+    run_completion_cleanup,
 };
 pub use routing::{FinalizeOutcome, RoutedSlotCompletion, SlotLookupFailure};
 pub use table::{
@@ -70,5 +71,5 @@ impl CompletionValue for usize {
 }
 
 use event::dispatch_envelope;
-use packet::{run_completion_cleanup, run_rejected_cleanup};
+use packet::run_rejected_cleanup;
 use routing::{finalize_orphaned_checked, finalize_waiting_checked, route_user_completion};

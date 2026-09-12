@@ -98,6 +98,7 @@ where
     Anomaly {
         kind: CompletionAnomalyKind,
         attach: AnomalyAttach,
+        cleanup: CompletionCleanupGuard,
         effect: Effect,
     },
     /// 控制完成本身失败，但仍有一个必须执行的后端收尾 effect。
@@ -159,6 +160,7 @@ where
         Ok(CompletionHookOutcome::Anomaly {
             kind,
             attach: AnomalyAttach::from_raw_completion(_event.raw()),
+            cleanup: CompletionCleanupGuard::default(),
             effect: Self::BackendEffect::default(),
         })
     }
@@ -484,14 +486,13 @@ where
         CompletionHookOutcome::Anomaly {
             kind,
             attach,
+            mut cleanup,
             effect,
         } => {
-            let progress = {
-                diagnostics.record_anomaly_kind(kind, attach);
-                CompletionFlowOutcome::anomaly()
-            };
-            hooks.finish_backend_effect(effect)?;
-            Ok(progress)
+            diagnostics.record_anomaly_kind(kind, attach);
+            let effect_result = hooks.finish_backend_effect(effect);
+            let _ = run_completion_cleanup(diagnostics, &mut cleanup);
+            effect_result.map(|()| CompletionFlowOutcome::anomaly())
         }
         CompletionHookOutcome::Failed { error, effect } => {
             match hooks.finish_backend_effect(effect) {

@@ -16,7 +16,7 @@ use crate::{
     driver::control::waker::{WAKER_PROCESSING, WAKER_REARM},
     driver::{CqeEnv, PendingCancel, ProvidedBufGroup, UringDriver},
     error::{UringError, UringResult, uring_report_to_event_res},
-    op::{Slot, UringSlotSpec, UringUserPayload},
+    op::{CompletionCleanupHintFn, Slot, UringSlotSpec, UringUserPayload},
 };
 
 #[cfg(test)]
@@ -28,6 +28,7 @@ use veloq_driver_core::{
         CompletionEnvelope, CompletionFlowExt, CompletionFlowOutcome, CompletionHookOutcome,
         CompletionIngress, CompletionSource, CompletionToken, Driver, DriverCompletionDiagnostics,
         OpToken, PlatformOp, RawCompletion, SyntheticCompletionSource, UserCompletionEvent,
+        run_completion_cleanup,
     },
     slot::{CheckedSlotView, InFlightOrphaned, InFlightWaiting, SlotRegistryExt, SlotView},
 };
@@ -38,6 +39,11 @@ pub(crate) const COMP_BACKEND_URING: CompletionBackend =
         Some(val) => val,
         None => unreachable!(),
     });
+
+enum CompletionCleanupHintState {
+    Missing,
+    Known(Option<CompletionCleanupHintFn>),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WaitBudgetSource {
@@ -142,9 +148,14 @@ impl Default for UringBackendEffect {
     }
 }
 
+struct UringCompletionSidecar<'a> {
+    pending_cancel_cqes: &'a mut HashMap<CancelCompletionId, PendingCancel>,
+    completion_cleanup_hints: &'a mut HashMap<CompletionToken, Option<CompletionCleanupHintFn>>,
+}
+
 struct UringCompletionHooks<'a> {
     diagnostics: &'a DriverCompletionDiagnostics<UringCompletionDiagnostics>,
-    pending_cancel_cqes: &'a mut HashMap<CancelCompletionId, PendingCancel>,
+    sidecar: UringCompletionSidecar<'a>,
     waker_buf_len: usize,
     waker_armed: &'a mut bool,
     notification_state: &'a AtomicU8,
@@ -156,7 +167,7 @@ struct UringCompletionHooks<'a> {
 impl<'a> UringCompletionHooks<'a> {
     fn new(
         diagnostics: &'a DriverCompletionDiagnostics<UringCompletionDiagnostics>,
-        pending_cancel_cqes: &'a mut HashMap<CancelCompletionId, PendingCancel>,
+        sidecar: UringCompletionSidecar<'a>,
         waker_buf_len: usize,
         waker_armed: &'a mut bool,
         notification_state: &'a AtomicU8,
@@ -165,7 +176,7 @@ impl<'a> UringCompletionHooks<'a> {
     ) -> Self {
         Self {
             diagnostics,
-            pending_cancel_cqes,
+            sidecar,
             waker_buf_len,
             waker_armed,
             notification_state,
@@ -182,6 +193,62 @@ impl<'a> UringCompletionHooks<'a> {
     #[inline]
     fn cqe_env(&mut self) -> CqeEnv<'_> {
         CqeEnv::new(self.provided_buffers.as_deref_mut())
+    }
+
+    fn completion_cleanup_hint_for(
+        &mut self,
+        token: CompletionToken,
+        flags: u32,
+    ) -> CompletionCleanupHintState {
+        let entry = if io_uring::cqueue::more(flags) {
+            self.sidecar.completion_cleanup_hints.get(&token).copied()
+        } else {
+            self.sidecar.completion_cleanup_hints.remove(&token)
+        };
+        match entry {
+            Some(hint) => CompletionCleanupHintState::Known(hint),
+            None => CompletionCleanupHintState::Missing,
+        }
+    }
+
+    fn cleanup_corrupt_completion(
+        &mut self,
+        event: UserCompletionEvent,
+        kind: CompletionAnomalyKind,
+        source: CompletionSource<'_, ()>,
+    ) -> CompletionCleanupGuard {
+        let raw = event.raw();
+        self.cqe_env().return_provided_buf(raw.flags);
+        let hint = if matches!(source, CompletionSource::Kernel) {
+            match self.completion_cleanup_hint_for(raw.token, raw.flags) {
+                CompletionCleanupHintState::Known(hint) => {
+                    if hint.is_some() {
+                        self.diagnostics.backend().inc_corrupt_cleanup_attempt();
+                        if raw.res >= 0 {
+                            self.diagnostics.backend().inc_corrupt_raw_fd_cleanup();
+                        }
+                    }
+                    hint
+                }
+                CompletionCleanupHintState::Missing => {
+                    self.diagnostics
+                        .backend()
+                        .inc_corrupt_cleanup_hint_missing();
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        debug!(
+            completion_token = raw.token.raw(),
+            cqe_result = raw.res,
+            cqe_flags = raw.flags,
+            anomaly = ?kind,
+            "corrupt uring completion"
+        );
+        hint.map_or_else(CompletionCleanupGuard::default, |hint| hint(raw.res))
     }
 
     fn handle_waker_control(
@@ -251,7 +318,7 @@ impl<'a> UringCompletionHooks<'a> {
         cancel_id: CancelCompletionId,
         raw: RawCompletion,
     ) -> CompletionHookOutcome<UringSlotSpec, UringBackendEffect> {
-        let request = self.pending_cancel_cqes.remove(&cancel_id);
+        let request = self.sidecar.pending_cancel_cqes.remove(&cancel_id);
         let Some(request) = request else {
             return CompletionHookOutcome::Failed {
                 error: UringError::InvalidState.report(
@@ -349,7 +416,23 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
                 if raw.res == -libc::ENOBUFS {
                     self.cqe_env().note_exhausted();
                 }
-                complete_kernel_waiting_slot(slot, event.token(), raw, &mut self.cqe_env())
+                let hint = if matches!(source, CompletionSource::Kernel) {
+                    Some(self.completion_cleanup_hint_for(event.completion_token(), raw.flags))
+                } else {
+                    None
+                };
+                match complete_kernel_waiting_slot(slot, event.token(), raw, &mut self.cqe_env()) {
+                    Ok(outcome) => Ok(outcome),
+                    Err(error) => {
+                        if error.fallback_cleanup
+                            && let Some(CompletionCleanupHintState::Known(Some(hint))) = hint
+                        {
+                            let mut cleanup = hint(raw.res);
+                            let _ = run_completion_cleanup(self.diagnostics, &mut cleanup);
+                        }
+                        Err(error.report)
+                    }
+                }
             }
         }
     }
@@ -364,11 +447,11 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
         kind: CompletionAnomalyKind,
         _source: CompletionSource<'_, Self::BackendIngress>,
     ) -> UringResult<CompletionHookOutcome<UringSlotSpec, Self::BackendEffect>> {
-        let flags = event.raw().flags;
-        self.cqe_env().return_provided_buf(flags);
+        let cleanup = self.cleanup_corrupt_completion(event, kind, _source);
         Ok(CompletionHookOutcome::Anomaly {
             kind,
             attach: AnomalyAttach::from_raw_completion(event.raw()),
+            cleanup,
             effect: UringBackendEffect::None,
         })
     }
@@ -397,10 +480,23 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
         } else {
             CompletionContinuation::Final
         };
-        let cleanup = if continuation.is_more() {
+        let hint = if matches!(source, CompletionSource::Kernel) {
+            Some(self.completion_cleanup_hint_for(event.completion_token(), event.raw().flags))
+        } else {
+            None
+        };
+        let (slot_cleanup, slot_accessed) = if continuation.is_more() {
             cleanup_orphaned_streaming_slot(slot, res)
         } else {
             cleanup_orphaned_slot(slot, res)
+        };
+        let cleanup = if slot_accessed {
+            slot_cleanup
+        } else {
+            match hint {
+                Some(CompletionCleanupHintState::Known(Some(hint))) => hint(res),
+                _ => CompletionCleanupGuard::default(),
+            }
         };
         Ok(CompletionHookOutcome::Cleanup {
             cleanup,
@@ -649,9 +745,13 @@ impl<'a> UringDriver<'a> {
         synthetic: UringSyntheticCompletion,
     ) -> UringResult<CompletionFlowOutcome> {
         let waker_view = self.waker.hooks_view();
+        let sidecar = UringCompletionSidecar {
+            pending_cancel_cqes: self.cancellations.in_flight_mut(),
+            completion_cleanup_hints: &mut self.completion_cleanup_hints,
+        };
         let mut hooks = UringCompletionHooks::new(
             &self.completion_diagnostics,
-            self.cancellations.in_flight_mut(),
+            sidecar,
             waker_view.buf_len,
             waker_view.armed,
             waker_view.notification_state,
@@ -776,12 +876,17 @@ impl<'a> UringDriver<'a> {
     }
 }
 
+struct KernelCompletionError {
+    report: Report<UringError>,
+    fallback_cleanup: bool,
+}
+
 fn complete_kernel_waiting_slot(
     mut slot: Slot<'_, InFlightWaiting>,
     token: OpToken,
     raw: RawCompletion,
     cqe_env: &mut CqeEnv<'_>,
-) -> UringResult<CompletionHookOutcome<UringSlotSpec, UringBackendEffect>> {
+) -> Result<CompletionHookOutcome<UringSlotSpec, UringBackendEffect>, KernelCompletionError> {
     // `IORING_CQE_F_MORE`：内核声明这个操作还会继续投递完成。flags 的解读到此为止，
     // core 只见 `CompletionContinuation`。
     let continuation = if io_uring::cqueue::more(raw.flags) {
@@ -798,13 +903,19 @@ fn complete_kernel_waiting_slot(
     }) {
         Ok(result) => result,
         Err(err) => {
-            return Err(UringError::InvalidState.report(
-                "uring.complete_kernel_waiting_slot",
-                format!("slot corruption detected on completion: {:?}", err),
-            ));
+            return Err(KernelCompletionError {
+                report: UringError::InvalidState.report(
+                    "uring.complete_kernel_waiting_slot",
+                    format!("slot corruption detected on completion: {:?}", err),
+                ),
+                fallback_cleanup: true,
+            });
         }
     };
-    let item = item?;
+    let item = item.map_err(|report| KernelCompletionError {
+        report,
+        fallback_cleanup: false,
+    })?;
     let res_code = driver_result_to_event_res(&final_res);
     let event = UserCompletionEvent::from_parts(COMP_BACKEND_URING, token, res_code, raw.flags);
     let res_is_ok = final_res.is_ok();
@@ -815,10 +926,13 @@ fn complete_kernel_waiting_slot(
         // slot 原地不动：op 与提交 payload 还要给内核后续的完成用，cell 也必须停在
         // `InFlightWaiting` 才能继续路由。
         let Some(item) = item else {
-            return Err(UringError::InvalidState.report(
-                "uring.complete_kernel_waiting_slot",
-                "kernel reported IORING_CQE_F_MORE for an operation that produces no item",
-            ));
+            return Err(KernelCompletionError {
+                report: UringError::InvalidState.report(
+                    "uring.complete_kernel_waiting_slot",
+                    "kernel reported IORING_CQE_F_MORE for an operation that produces no item",
+                ),
+                fallback_cleanup: false,
+            });
         };
         return Ok(CompletionHookOutcome::User {
             event,
@@ -841,10 +955,13 @@ fn complete_kernel_waiting_slot(
         None => {
             let Some(payload) = submit_payload else {
                 drop(detail);
-                return Err(UringError::InvalidState.report(
-                    "uring.complete_kernel_waiting_slot",
-                    "slot payload missing on completion",
-                ));
+                return Err(KernelCompletionError {
+                    report: UringError::InvalidState.report(
+                        "uring.complete_kernel_waiting_slot",
+                        "slot payload missing on completion",
+                    ),
+                    fallback_cleanup: false,
+                });
             };
             payload
         }
@@ -993,21 +1110,27 @@ fn complete_local_cancel_slot(
 fn cleanup_orphaned_streaming_slot(
     mut slot: Slot<'_, InFlightOrphaned>,
     cqe_res: i32,
-) -> CompletionCleanupGuard {
-    slot.with_op_mut(|op| op.orphan_cleanup(cqe_res))
-        .unwrap_or_default()
+) -> (CompletionCleanupGuard, bool) {
+    match slot.with_op_mut(|op| op.orphan_cleanup(cqe_res)) {
+        Ok(cleanup) => (cleanup, true),
+        Err(_) => (CompletionCleanupGuard::default(), false),
+    }
 }
 
-fn cleanup_orphaned_slot(slot: Slot<'_, InFlightOrphaned>, cqe_res: i32) -> CompletionCleanupGuard {
+fn cleanup_orphaned_slot(
+    slot: Slot<'_, InFlightOrphaned>,
+    cqe_res: i32,
+) -> (CompletionCleanupGuard, bool) {
     let mut completed = slot.complete();
-    let cleanup = completed
-        .with_op_mut(|op| op.orphan_cleanup(cqe_res))
-        .unwrap_or_default();
+    let (cleanup, slot_accessed) = match completed.with_op_mut(|op| op.orphan_cleanup(cqe_res)) {
+        Ok(cleanup) => (cleanup, true),
+        Err(_) => (CompletionCleanupGuard::default(), false),
+    };
     let (payload, detail) = completed.take_completion_data();
     let _ = completed.take_op();
     drop(payload);
     drop(detail);
-    cleanup
+    (cleanup, slot_accessed)
 }
 
 #[inline]
@@ -1021,17 +1144,27 @@ pub(crate) fn driver_result_to_event_res(res: &UringResult<usize>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use veloq_driver_core::driver::CompletionToken;
+    use crate::driver::{ProvidedBufGroup, registration::test_group};
+    use crate::op::{
+        Accept, AcceptMulti, Open, ReadRaw, Recv, UringOpErasure, UringOpRegistry, WriteRaw,
+    };
+    use veloq_driver_core::driver::{CompletionToken, SharedCompletionTable};
+    use veloq_driver_core::slot::Generation;
 
     fn test_hooks<'a>(
         diagnostics: &'a DriverCompletionDiagnostics<UringCompletionDiagnostics>,
         pending_cancel_cqes: &'a mut HashMap<CancelCompletionId, PendingCancel>,
+        completion_cleanup_hints: &'a mut HashMap<CompletionToken, Option<CompletionCleanupHintFn>>,
         waker_armed: &'a mut bool,
         notification_state: &'a AtomicU8,
     ) -> UringCompletionHooks<'a> {
+        let sidecar = UringCompletionSidecar {
+            pending_cancel_cqes,
+            completion_cleanup_hints,
+        };
         UringCompletionHooks::new(
             diagnostics,
-            pending_cancel_cqes,
+            sidecar,
             8,
             waker_armed,
             notification_state,
@@ -1040,15 +1173,86 @@ mod tests {
         )
     }
 
+    fn test_hooks_with_buffers<'a>(
+        diagnostics: &'a DriverCompletionDiagnostics<UringCompletionDiagnostics>,
+        pending_cancel_cqes: &'a mut HashMap<CancelCompletionId, PendingCancel>,
+        completion_cleanup_hints: &'a mut HashMap<CompletionToken, Option<CompletionCleanupHintFn>>,
+        waker_armed: &'a mut bool,
+        notification_state: &'a AtomicU8,
+        provided_buffers: Option<&'a mut ProvidedBufGroup>,
+    ) -> UringCompletionHooks<'a> {
+        let sidecar = UringCompletionSidecar {
+            pending_cancel_cqes,
+            completion_cleanup_hints,
+        };
+        UringCompletionHooks::new(
+            diagnostics,
+            sidecar,
+            8,
+            waker_armed,
+            notification_state,
+            provided_buffers,
+            UringSyntheticCompletion::None,
+        )
+    }
+
+    fn accept_corrupt(
+        registry: &mut UringOpRegistry,
+        sidecar: &mut HashMap<CompletionToken, Option<CompletionCleanupHintFn>>,
+        token: OpToken,
+        result: i32,
+        flags: u32,
+    ) -> CompletionFlowOutcome {
+        let diagnostics = registry.shared.completion_diagnostics();
+        let table: SharedCompletionTable<UringSlotSpec> = registry.shared.clone();
+        let mut pending_cancel_cqes = HashMap::default();
+        let mut waker_armed = true;
+        let notification_state = AtomicU8::new(WAKER_NOTIFIED);
+        let mut hooks = test_hooks(
+            &diagnostics,
+            &mut pending_cancel_cqes,
+            sidecar,
+            &mut waker_armed,
+            &notification_state,
+        );
+        let envelope = CompletionEnvelope::from_raw_parts(
+            COMP_BACKEND_URING,
+            CompletionToken::user(token).raw(),
+            result,
+            flags,
+        );
+        registry
+            .accept_completion(
+                &table,
+                &diagnostics,
+                &mut hooks,
+                CompletionIngress::Kernel(envelope),
+            )
+            .expect("corrupt completion should be handled")
+    }
+
+    fn open_test_fds() -> [i32; 2] {
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        assert!(fds[0] > 2 && fds[1] > 2);
+        fds
+    }
+
+    fn assert_closed(fd: i32) {
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+    }
+
     #[test]
     fn waker_control_records_unexpected_byte_count_as_error() {
         let diagnostics = DriverCompletionDiagnostics::<UringCompletionDiagnostics>::default();
         let mut pending_cancel_cqes = HashMap::default();
+        let mut completion_cleanup_hints = HashMap::default();
         let mut waker_armed = true;
         let notification_state = AtomicU8::new(WAKER_PROCESSING);
         let mut hooks = test_hooks(
             &diagnostics,
             &mut pending_cancel_cqes,
+            &mut completion_cleanup_hints,
             &mut waker_armed,
             &notification_state,
         );
@@ -1078,11 +1282,13 @@ mod tests {
     fn waker_control_rearms_successful_completion() {
         let diagnostics = DriverCompletionDiagnostics::<UringCompletionDiagnostics>::default();
         let mut pending_cancel_cqes = HashMap::default();
+        let mut completion_cleanup_hints = HashMap::default();
         let mut waker_armed = true;
         let notification_state = AtomicU8::new(WAKER_PROCESSING);
         let mut hooks = test_hooks(
             &diagnostics,
             &mut pending_cancel_cqes,
+            &mut completion_cleanup_hints,
             &mut waker_armed,
             &notification_state,
         );
@@ -1113,11 +1319,13 @@ mod tests {
         let diagnostics = DriverCompletionDiagnostics::<UringCompletionDiagnostics>::default();
         for res in [-libc::EAGAIN, -libc::EINTR] {
             let mut pending_cancel_cqes = HashMap::default();
+            let mut completion_cleanup_hints = HashMap::default();
             let mut waker_armed = true;
             let notification_state = AtomicU8::new(WAKER_PROCESSING);
             let mut hooks = test_hooks(
                 &diagnostics,
                 &mut pending_cancel_cqes,
+                &mut completion_cleanup_hints,
                 &mut waker_armed,
                 &notification_state,
             );
@@ -1146,11 +1354,13 @@ mod tests {
     fn waker_finish_does_not_overwrite_a_concurrent_notification() {
         let diagnostics = DriverCompletionDiagnostics::<UringCompletionDiagnostics>::default();
         let mut pending_cancel_cqes = HashMap::default();
+        let mut completion_cleanup_hints = HashMap::default();
         let mut waker_armed = true;
         let notification_state = AtomicU8::new(WAKER_PROCESSING);
         let mut hooks = test_hooks(
             &diagnostics,
             &mut pending_cancel_cqes,
+            &mut completion_cleanup_hints,
             &mut waker_armed,
             &notification_state,
         );
@@ -1204,11 +1414,13 @@ mod tests {
     fn untracked_cancel_cqe_is_anomaly_not_user_completion() {
         let diagnostics = DriverCompletionDiagnostics::<UringCompletionDiagnostics>::default();
         let mut pending_cancel_cqes = HashMap::default();
+        let mut completion_cleanup_hints = HashMap::default();
         let mut waker_armed = true;
         let notification_state = AtomicU8::new(WAKER_NOTIFIED);
         let mut hooks = test_hooks(
             &diagnostics,
             &mut pending_cancel_cqes,
+            &mut completion_cleanup_hints,
             &mut waker_armed,
             &notification_state,
         );
@@ -1225,5 +1437,232 @@ mod tests {
             _ => panic!("untracked cancel must produce a failed outcome"),
         };
         assert_eq!(*err.inner(), UringError::InvalidState);
+    }
+
+    #[test]
+    fn raw_fd_cleanup_hint_is_exposed_only_for_fd_producing_ops() {
+        assert!(
+            <Open as UringOpErasure>::vtable()
+                .completion_cleanup_hint
+                .is_some()
+        );
+        assert!(
+            <Accept as UringOpErasure>::vtable()
+                .completion_cleanup_hint
+                .is_some()
+        );
+        assert!(
+            <AcceptMulti as UringOpErasure>::vtable()
+                .completion_cleanup_hint
+                .is_some()
+        );
+        assert!(
+            <ReadRaw as UringOpErasure>::vtable()
+                .completion_cleanup_hint
+                .is_none()
+        );
+        assert!(
+            <WriteRaw as UringOpErasure>::vtable()
+                .completion_cleanup_hint
+                .is_none()
+        );
+        assert!(
+            <Recv as UringOpErasure>::vtable()
+                .completion_cleanup_hint
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn stale_fd_completion_is_closed_and_final_hint_is_removed() {
+        let mut registry = UringOpRegistry::new(1);
+        let token = OpToken::from_registry_parts(0, Generation::new(1)).expect("test token");
+        let fd_pair = open_test_fds();
+        let fd = fd_pair[0];
+        let hint = <Open as UringOpErasure>::vtable()
+            .completion_cleanup_hint
+            .expect("open must expose a cleanup hint");
+        let mut sidecar = HashMap::default();
+        sidecar.insert(CompletionToken::user(token), Some(hint));
+
+        let outcome = accept_corrupt(&mut registry, &mut sidecar, token, fd, 0);
+
+        assert_eq!(outcome.anomaly, 1);
+        assert!(sidecar.is_empty());
+        assert_closed(fd);
+        unsafe { libc::close(fd_pair[1]) };
+        let snapshot = registry.shared.completion_diagnostics().snapshot().backend;
+        assert_eq!(snapshot.corrupt_cleanup_attempts, 1);
+        assert_eq!(snapshot.corrupt_raw_fd_cleanups, 1);
+        assert_eq!(snapshot.corrupt_cleanup_hint_missing, 0);
+    }
+
+    #[test]
+    fn negative_fd_completion_does_not_close_or_retain_hint() {
+        let mut registry = UringOpRegistry::new(1);
+        let token = OpToken::from_registry_parts(0, Generation::new(1)).expect("test token");
+        let fd_pair = open_test_fds();
+        let hint = <Accept as UringOpErasure>::vtable()
+            .completion_cleanup_hint
+            .expect("accept must expose a cleanup hint");
+        let mut sidecar = HashMap::default();
+        sidecar.insert(CompletionToken::user(token), Some(hint));
+
+        accept_corrupt(&mut registry, &mut sidecar, token, -libc::ECANCELED, 0);
+
+        assert!(sidecar.is_empty());
+        assert_ne!(unsafe { libc::fcntl(fd_pair[0], libc::F_GETFD) }, -1);
+        unsafe {
+            libc::close(fd_pair[0]);
+            libc::close(fd_pair[1]);
+        }
+        let snapshot = registry.shared.completion_diagnostics().snapshot().backend;
+        assert_eq!(snapshot.corrupt_cleanup_attempts, 1);
+        assert_eq!(snapshot.corrupt_raw_fd_cleanups, 0);
+        assert_eq!(snapshot.corrupt_cleanup_hint_missing, 0);
+    }
+
+    #[test]
+    fn corrupt_completion_returns_selected_provided_buffer() {
+        let mut registry = UringOpRegistry::new(1);
+        let token = OpToken::from_registry_parts(0, Generation::new(1)).expect("test token");
+        let mut sidecar = HashMap::default();
+        let diagnostics = registry.shared.completion_diagnostics();
+        let mut pending_cancel_cqes = HashMap::default();
+        let mut waker_armed = true;
+        let notification_state = AtomicU8::new(WAKER_NOTIFIED);
+        let mut provided_buffers = test_group(2);
+        let before = provided_buffers.stats();
+        let table: SharedCompletionTable<UringSlotSpec> = registry.shared.clone();
+        let mut hooks = test_hooks_with_buffers(
+            &diagnostics,
+            &mut pending_cancel_cqes,
+            &mut sidecar,
+            &mut waker_armed,
+            &notification_state,
+            Some(&mut provided_buffers),
+        );
+        let flags = 1 | (1 << 16);
+        let envelope = CompletionEnvelope::from_raw_parts(
+            COMP_BACKEND_URING,
+            CompletionToken::user(token).raw(),
+            7,
+            flags,
+        );
+
+        let outcome = registry
+            .accept_completion(
+                &table,
+                &diagnostics,
+                &mut hooks,
+                CompletionIngress::Kernel(envelope),
+            )
+            .expect("corrupt completion should be handled");
+
+        assert_eq!(outcome.anomaly, 1);
+        assert_eq!(provided_buffers.stats().returned, before.returned + 1);
+        assert_eq!(provided_buffers.stats().available, before.available);
+    }
+
+    #[test]
+    fn stale_non_fd_completion_does_not_close_a_positive_result() {
+        let mut registry = UringOpRegistry::new(1);
+        let token = OpToken::from_registry_parts(0, Generation::new(1)).expect("test token");
+        let fd_pair = open_test_fds();
+        let fd = fd_pair[0];
+        let mut sidecar = HashMap::default();
+        sidecar.insert(CompletionToken::user(token), None);
+
+        let outcome = accept_corrupt(&mut registry, &mut sidecar, token, fd, 0);
+
+        assert_eq!(outcome.anomaly, 1);
+        assert!(sidecar.is_empty());
+        assert_ne!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        unsafe {
+            libc::close(fd);
+            libc::close(fd_pair[1]);
+        }
+        let snapshot = registry.shared.completion_diagnostics().snapshot().backend;
+        assert_eq!(snapshot.corrupt_cleanup_attempts, 0);
+        assert_eq!(snapshot.corrupt_cleanup_hint_missing, 0);
+    }
+
+    #[test]
+    fn missing_fd_cleanup_hint_does_not_guess_close() {
+        let mut registry = UringOpRegistry::new(1);
+        let token = OpToken::from_registry_parts(0, Generation::new(1)).expect("test token");
+        let fd_pair = open_test_fds();
+
+        accept_corrupt(&mut registry, &mut HashMap::default(), token, fd_pair[0], 0);
+
+        assert_ne!(unsafe { libc::fcntl(fd_pair[0], libc::F_GETFD) }, -1);
+        unsafe {
+            libc::close(fd_pair[0]);
+            libc::close(fd_pair[1]);
+        }
+        let snapshot = registry.shared.completion_diagnostics().snapshot().backend;
+        assert_eq!(snapshot.corrupt_cleanup_attempts, 0);
+        assert_eq!(snapshot.corrupt_raw_fd_cleanups, 0);
+        assert_eq!(snapshot.corrupt_cleanup_hint_missing, 1);
+    }
+
+    #[test]
+    fn multishot_corrupt_completions_close_each_fd_and_retain_hint_until_final() {
+        const CQE_MORE: u32 = 2;
+
+        let mut registry = UringOpRegistry::new(1);
+        let token = OpToken::from_registry_parts(0, Generation::new(1)).expect("test token");
+        let first_pair = open_test_fds();
+        let second_pair = open_test_fds();
+        let hint = <AcceptMulti as UringOpErasure>::vtable()
+            .completion_cleanup_hint
+            .expect("accept multi must expose a cleanup hint");
+        let mut sidecar = HashMap::default();
+        sidecar.insert(CompletionToken::user(token), Some(hint));
+
+        let first = accept_corrupt(&mut registry, &mut sidecar, token, first_pair[0], CQE_MORE);
+        assert_eq!(first.anomaly, 1);
+        assert_eq!(sidecar.len(), 1);
+        assert_closed(first_pair[0]);
+
+        let final_outcome = accept_corrupt(&mut registry, &mut sidecar, token, second_pair[0], 0);
+        assert_eq!(final_outcome.anomaly, 1);
+        assert!(sidecar.is_empty());
+        assert_closed(second_pair[0]);
+        unsafe {
+            libc::close(first_pair[1]);
+            libc::close(second_pair[1]);
+        }
+        let snapshot = registry.shared.completion_diagnostics().snapshot().backend;
+        assert_eq!(snapshot.corrupt_cleanup_attempts, 2);
+        assert_eq!(snapshot.corrupt_raw_fd_cleanups, 2);
+    }
+
+    #[test]
+    fn generation_reuse_keeps_old_and_new_cleanup_hints_separate() {
+        let mut registry = UringOpRegistry::new(1);
+        let old_token = OpToken::from_registry_parts(0, Generation::new(1)).expect("old token");
+        let new_token = OpToken::from_registry_parts(0, Generation::new(2)).expect("new token");
+        let old_pair = open_test_fds();
+        let new_pair = open_test_fds();
+        let hint = <Accept as UringOpErasure>::vtable()
+            .completion_cleanup_hint
+            .expect("accept must expose a cleanup hint");
+        let mut sidecar = HashMap::default();
+        sidecar.insert(CompletionToken::user(old_token), Some(hint));
+        sidecar.insert(CompletionToken::user(new_token), Some(hint));
+
+        accept_corrupt(&mut registry, &mut sidecar, old_token, old_pair[0], 0);
+        assert_closed(old_pair[0]);
+        assert_eq!(sidecar.len(), 1);
+        assert!(sidecar.contains_key(&CompletionToken::user(new_token)));
+
+        accept_corrupt(&mut registry, &mut sidecar, new_token, new_pair[0], 0);
+        assert_closed(new_pair[0]);
+        assert!(sidecar.is_empty());
+        unsafe {
+            libc::close(old_pair[1]);
+            libc::close(new_pair[1]);
+        }
     }
 }

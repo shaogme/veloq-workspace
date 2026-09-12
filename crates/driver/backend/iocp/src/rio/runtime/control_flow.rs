@@ -22,9 +22,9 @@ use veloq_buf::BufferRegistrar;
 use veloq_driver_core::{
     driver::{
         AnomalyAttach, CompletionAnomalyKind, CompletionBackendHooks,
-        CompletionBackendIngressAction, CompletionContinuation, CompletionControl,
-        CompletionFlowExt, CompletionHookOutcome, CompletionIngress, CompletionSource,
-        RawCompletion, SharedCompletionTable, UserCompletionEvent,
+        CompletionBackendIngressAction, CompletionCleanupGuard, CompletionContinuation,
+        CompletionControl, CompletionFlowExt, CompletionHookOutcome, CompletionIngress,
+        CompletionSource, RawCompletion, SharedCompletionTable, UserCompletionEvent,
     },
     slot::{Generation, InFlightOrphaned, InFlightWaiting, SlotState, SlotStatus},
 };
@@ -207,6 +207,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
         Ok(CompletionHookOutcome::Anomaly {
             kind,
             attach: AnomalyAttach::from_raw_completion(event.raw()),
+            cleanup: CompletionCleanupGuard::default(),
             effect,
         })
     }

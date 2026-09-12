@@ -3,9 +3,9 @@ use crate::{
     driver::{CqeEnv, SqeEnv},
     error::UringResult,
     op::{
-        Accept, AcceptMulti, AcceptedSocket, Connect, OpSend, ProvidedBuf, Recv, RecvMulti,
-        RecvProvided, SendTo, UdpConnect, UdpRecv, UdpRecvFrom, UdpSend, UringUserPayload, payload,
-        submit,
+        Accept, AcceptMulti, AcceptedSocket, CompletionCleanupHintFn, Connect, OpSend, ProvidedBuf,
+        Recv, RecvMulti, RecvProvided, SendTo, UdpConnect, UdpRecv, UdpRecvFrom, UdpSend,
+        UringUserPayload, payload, submit,
     },
 };
 use io_uring::squeue;
@@ -278,6 +278,9 @@ impl UringOpSpec for Accept {
         submit::completion_cleanup_close_raw_fd(result)
     }
 
+    const COMPLETION_CLEANUP_HINT: Option<CompletionCleanupHintFn> =
+        Some(submit::completion_cleanup_close_raw_fd);
+
     fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
         submit::accepted_handle_from_res(res)
     }
@@ -322,6 +325,9 @@ impl UringOpSpec for AcceptMulti {
     ) -> CompletionCleanupGuard {
         submit::completion_cleanup_close_raw_fd(result)
     }
+
+    const COMPLETION_CLEANUP_HINT: Option<CompletionCleanupHintFn> =
+        Some(submit::completion_cleanup_close_raw_fd);
 
     fn map_completion(_payload: &Self, res: UringResult<usize>) -> UringResult<Self::Completion> {
         submit::accepted_handle_from_res(res)

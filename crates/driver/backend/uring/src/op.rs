@@ -28,6 +28,10 @@ pub(crate) use payload::{
     SyncFileRange, SyncFileRangeRaw, Timeout, UdpConnect, UdpRecv, UdpRecvFrom, UdpSend, Wakeup,
     WriteFixed, WriteRaw,
 };
+
+#[cfg(test)]
+pub(crate) use spec::UringOpErasure;
+
 pub(crate) use submit::sqe_with_fd;
 
 // ============================================================================
@@ -52,6 +56,7 @@ pub(crate) type OnCompleteFn = unsafe fn(
 ) -> UringResult<usize>;
 pub(crate) type CompletionCleanupFn =
     unsafe fn(op: &mut UringKernelOp, result: i32) -> CompletionCleanupGuard;
+pub(crate) type CompletionCleanupHintFn = fn(result: i32) -> CompletionCleanupGuard;
 pub(crate) type OrphanCleanupFn =
     unsafe fn(op: &mut UringKernelOp, result: i32) -> CompletionCleanupGuard;
 pub(crate) type GetTimeoutFn =
@@ -90,6 +95,7 @@ pub(crate) struct OpVTable {
     pub(crate) make_sqe: MakeSqeFn,
     pub(crate) on_complete: OnCompleteFn,
     pub(crate) completion_cleanup: CompletionCleanupFn,
+    pub(crate) completion_cleanup_hint: Option<CompletionCleanupHintFn>,
     pub(crate) orphan_cleanup: OrphanCleanupFn,
     pub(crate) strategy: SubmissionStrategy,
     pub(crate) get_timeout: GetTimeoutFn,

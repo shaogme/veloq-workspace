@@ -70,6 +70,7 @@ fn test_event(token: OpToken, res: i32) -> UserCompletionEvent {
 #[derive(Default)]
 struct TestHooks {
     cleanup: Option<CompletionCleanupGuard>,
+    corrupt_cleanup: Option<CompletionCleanupGuard>,
     /// 还要产出多少条 `More` 完成，用来模拟一个 multishot 操作。
     remaining_more: usize,
     control_failure: bool,
@@ -81,6 +82,7 @@ impl TestHooks {
     fn multishot(remaining_more: usize) -> Self {
         Self {
             cleanup: None,
+            corrupt_cleanup: None,
             remaining_more,
             control_failure: false,
             finish_calls: 0,
@@ -177,6 +179,7 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
         Ok(CompletionHookOutcome::Anomaly {
             kind,
             attach: AnomalyAttach::from_raw_completion(event.raw()),
+            cleanup: self.corrupt_cleanup.take().unwrap_or_default(),
             effect: (),
         })
     }
@@ -313,11 +316,17 @@ fn accept_ingress(
     ingress: CompletionIngress,
     hooks: &mut TestHooks,
 ) -> CompletionFlowOutcome {
+    accept_ingress_result(registry, ingress, hooks).expect("test completion should succeed")
+}
+
+fn accept_ingress_result(
+    registry: &mut OpRegistry<DummySlotSpec>,
+    ingress: CompletionIngress,
+    hooks: &mut TestHooks,
+) -> Result<CompletionFlowOutcome, Report<DummyError>> {
     let diagnostics = registry.shared.completion_diagnostics();
     let table: SharedCompletionTable<DummySlotSpec> = registry.shared.clone();
-    registry
-        .accept_completion(&table, &diagnostics, hooks, ingress)
-        .expect("test completion should succeed")
+    registry.accept_completion(&table, &diagnostics, hooks, ingress)
 }
 
 fn accept_user(registry: &mut OpRegistry<DummySlotSpec>, token: OpToken, res: i32) {
@@ -836,4 +845,49 @@ fn a_second_completion_on_a_single_shot_slot_is_still_rejected() {
         table.try_take_record(token).unwrap(),
         PollRecordResult::Unavailable { .. }
     ));
+}
+
+#[test]
+fn corrupt_completion_cleanup_runs_once_after_anomaly_is_recorded() {
+    let mut registry = OpRegistry::<DummySlotSpec>::new(1);
+    let counter = Arc::new(AtomicUsize::new(0));
+    let mut hooks = TestHooks {
+        corrupt_cleanup: Some(counting_cleanup(&counter)),
+        ..TestHooks::default()
+    };
+
+    let outcome = accept_with_hooks(&mut registry, test_event(test_token(0, 1), 0), &mut hooks);
+
+    assert_eq!(outcome.anomaly, 1);
+    assert_eq!(counter.load(Ordering::Acquire), 1);
+    assert_eq!(
+        registry
+            .shared
+            .completion_diagnostics()
+            .snapshot()
+            .stale_completion,
+        1
+    );
+}
+
+#[test]
+fn corrupt_completion_cleanup_runs_when_backend_effect_fails() {
+    let mut registry = OpRegistry::<DummySlotSpec>::new(1);
+    let counter = Arc::new(AtomicUsize::new(0));
+    let mut hooks = TestHooks {
+        corrupt_cleanup: Some(counting_cleanup(&counter)),
+        finish_failure: true,
+        ..TestHooks::default()
+    };
+
+    let error = accept_ingress_result(
+        &mut registry,
+        CompletionIngress::User(test_event(test_token(0, 1), 0)),
+        &mut hooks,
+    )
+    .expect_err("backend effect failure should be returned");
+
+    assert_eq!(*error.inner(), DummyError);
+    assert_eq!(hooks.finish_calls, 1);
+    assert_eq!(counter.load(Ordering::Acquire), 1);
 }

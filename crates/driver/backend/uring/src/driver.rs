@@ -2,17 +2,26 @@ use diagweave::prelude::*;
 use io_uring::{IoUring, opcode};
 use tracing::{debug, trace};
 use veloq_buf::{AnyBufPool, BufferRegistrar, heap::ChunkId};
-use veloq_std::{collections::VecDeque, format, ptr, sync::Arc, vec, vec::Vec};
+use veloq_std::{
+    collections::{HashMap, VecDeque},
+    format, ptr,
+    sync::Arc,
+    vec,
+    vec::Vec,
+};
 
 use crate::{
     config::{IoFd, IoMode, RawHandle, UringConfig, UringRawHandle},
     diagnostics::{UringCompletionDiagnostics, UringCompletionDiagnosticsSnapshot},
     error::{UringError, UringResult},
-    op::{SubmissionStrategy, UringOp, UringOpRegistry, UringSlotSpec, UringUserPayload},
+    op::{
+        CompletionCleanupHintFn, SubmissionStrategy, UringOp, UringOpRegistry, UringSlotSpec,
+        UringUserPayload,
+    },
 };
 use veloq_driver_core::driver::{
-    BufferRegistrationStatus, CancelRequest, CancelSubmitOutcome, DriveMode, DriveOutcome,
-    DriverCapabilities, DriverCapability, DriverCompletionDiagnostics,
+    BufferRegistrationStatus, CancelRequest, CancelSubmitOutcome, CompletionToken, DriveMode,
+    DriveOutcome, DriverCapabilities, DriverCapability, DriverCompletionDiagnostics,
     DriverCompletionDiagnosticsSnapshot, DriverRaw, DriverSubmitResult, OpToken, RegisterFd,
     RemoteCancelSender, RemoteWaker, SharedCompletionTable, SharedSlotTable, SubmitStatus,
     registry::{OpEntry, OpHandle},
@@ -57,6 +66,13 @@ pub struct UringDriver<'a> {
     pub(crate) ring: IoUring,
     pub(crate) ops: UringOpRegistry,
     pub(crate) backlog: VecDeque<OpToken>,
+    /// Tracks the cleanup capability of every user SQE until its final CQE is consumed.
+    ///
+    /// `None` means that the operation is known not to return an owned fd (for example, a read
+    /// whose non-negative completion result is a byte count). Keeping that state is important:
+    /// an absent entry means the driver lost metadata, while a present `None` is an intentional
+    /// no-op hint.
+    pub(crate) completion_cleanup_hints: HashMap<CompletionToken, Option<CompletionCleanupHintFn>>,
     pub(crate) completion_diagnostics: DriverCompletionDiagnostics<UringCompletionDiagnostics>,
     pub(crate) completion_table: SharedCompletionTable<UringSlotSpec>,
 
@@ -123,6 +139,7 @@ impl<'a> UringDriver<'a> {
             ring,
             ops,
             backlog: VecDeque::new(),
+            completion_cleanup_hints: HashMap::default(),
             completion_diagnostics,
             completion_table,
             cancellations: UringCancelManager::new(),
@@ -318,6 +335,8 @@ impl<'a> DriverRaw for UringDriver<'a> {
     }
 
     fn release_op_slot_raw(&mut self, token: OpToken) {
+        self.completion_cleanup_hints
+            .remove(&CompletionToken::user(token));
         let _ = self.ops.remove(token);
     }
 

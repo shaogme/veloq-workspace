@@ -74,7 +74,7 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
         match strategy {
             SubmissionStrategy::SubmitSqe => {
                 let mut chunks = [ChunkId::ZERO; 4];
-                let (count, sqe) = {
+                let (count, sqe, completion_token, cleanup_hint) = {
                     let sqe_env = self.env.sqe_env();
                     let token = self.token;
                     slot.with_op_and_payload_mut(|op, payload| {
@@ -96,7 +96,12 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                             .attach_note("driver.submit_txn.make_sqe")?
                             .user_data(completion_token.raw())
                         };
-                        Ok::<_, Report<UringError>>((count, sqe))
+                        Ok::<_, Report<UringError>>((
+                            count,
+                            sqe,
+                            completion_token,
+                            vtable.completion_cleanup_hint,
+                        ))
                     })
                     .map_err(|err| slot_access_report("driver.submit_txn.op_payload", err))??
                 };
@@ -115,6 +120,10 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                 } else {
                     UringSubmissionState::Queued
                 };
+                if pushed {
+                    self.env
+                        .register_completion_cleanup_hint(completion_token, cleanup_hint);
+                }
 
                 self.commit();
 

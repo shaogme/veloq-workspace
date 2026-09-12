@@ -33,6 +33,9 @@ pub struct UringCompletionDiagnostics {
     file_table_quarantines: AtomicU64,
     file_table_rollback_failures: AtomicU64,
     file_table_poisonings: AtomicU64,
+    corrupt_cleanup_attempts: AtomicU64,
+    corrupt_raw_fd_cleanups: AtomicU64,
+    corrupt_cleanup_hint_missing: AtomicU64,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +74,12 @@ pub struct UringCompletionDiagnosticsSnapshot {
     pub file_table_rollback_failures: u64,
     /// Number of transitions from a healthy to a poisoned file table.
     pub file_table_poisonings: u64,
+    /// Number of corrupt completions whose registered cleanup hint was invoked.
+    pub corrupt_cleanup_attempts: u64,
+    /// Number of non-negative raw fd results handled through a corrupt-completion hint.
+    pub corrupt_raw_fd_cleanups: u64,
+    /// Number of kernel corrupt completions for which no sidecar metadata existed.
+    pub corrupt_cleanup_hint_missing: u64,
 }
 
 impl UringCompletionDiagnostics {
@@ -228,6 +237,21 @@ impl UringCompletionDiagnostics {
     pub(crate) fn inc_file_table_poisoning(&self) {
         Self::inc(&self.file_table_poisonings);
     }
+
+    #[inline]
+    pub(crate) fn inc_corrupt_cleanup_attempt(&self) {
+        Self::inc(&self.corrupt_cleanup_attempts);
+    }
+
+    #[inline]
+    pub(crate) fn inc_corrupt_raw_fd_cleanup(&self) {
+        Self::inc(&self.corrupt_raw_fd_cleanups);
+    }
+
+    #[inline]
+    pub(crate) fn inc_corrupt_cleanup_hint_missing(&self) {
+        Self::inc(&self.corrupt_cleanup_hint_missing);
+    }
 }
 
 impl DriverCompletionDiagnosticsBackend for UringCompletionDiagnostics {
@@ -265,6 +289,9 @@ impl DriverCompletionDiagnosticsBackend for UringCompletionDiagnostics {
             file_table_quarantines: Self::load(&self.file_table_quarantines),
             file_table_rollback_failures: Self::load(&self.file_table_rollback_failures),
             file_table_poisonings: Self::load(&self.file_table_poisonings),
+            corrupt_cleanup_attempts: Self::load(&self.corrupt_cleanup_attempts),
+            corrupt_raw_fd_cleanups: Self::load(&self.corrupt_raw_fd_cleanups),
+            corrupt_cleanup_hint_missing: Self::load(&self.corrupt_cleanup_hint_missing),
         }
     }
 
