@@ -3,6 +3,7 @@
 use veloq_std::{
     future::{Future, poll_fn},
     pin::Pin,
+    result::Result,
     sync::{
         NativeArc as Arc, NativeCondvar as Condvar, NativeMutex as Mutex,
         atomic::{NativeAtomicBool as AtomicBool, NativeAtomicUsize as AtomicUsize, Ordering},
@@ -27,8 +28,12 @@ struct RecordingWaker {
 }
 
 impl RuntimeWaker for RecordingWaker {
-    fn wake(&self) -> veloq_std::result::Result<(), RuntimeWakeError> {
+    fn wake(&self) -> Result<(), RuntimeWakeError> {
         self.calls[self.worker_id].fetch_add(1, Ordering::Relaxed);
+        let worker_mask = 1 << self.worker_id;
+        let mut state = OTHER_GROUP_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        state.wake_permits |= worker_mask;
+        OTHER_GROUP_CONDVAR.notify_all();
         Ok(())
     }
 }
@@ -92,11 +97,15 @@ const OTHER_GROUP_MASK: usize = (1 << 2) | (1 << 3);
 
 struct OtherGroupState {
     parked: usize,
+    wake_permits: usize,
+    resumed: usize,
     released: bool,
 }
 
 static OTHER_GROUP_STATE: Mutex<OtherGroupState> = Mutex::new(OtherGroupState {
     parked: 0,
+    wake_permits: 0,
+    resumed: 0,
     released: false,
 });
 static OTHER_GROUP_CONDVAR: Condvar = Condvar::new();
@@ -105,13 +114,19 @@ fn hold_other_group_workers(
     shared: &RuntimeShared<()>,
     _wait_strategy: IdleWaitStrategy,
 ) -> RuntimeResult<()> {
+    let worker_mask = 1 << shared.worker_id();
     let mut state = OTHER_GROUP_STATE.lock().unwrap_or_else(|e| e.into_inner());
-    state.parked |= 1 << shared.worker_id();
+    state.parked |= worker_mask;
     OTHER_GROUP_CONDVAR.notify_all();
-    while !state.released {
+    while !state.released && state.wake_permits & worker_mask == 0 {
         state = OTHER_GROUP_CONDVAR
             .wait(state)
             .unwrap_or_else(|e| e.into_inner());
+    }
+    if !state.released {
+        state.wake_permits &= !worker_mask;
+        state.resumed |= worker_mask;
+        OTHER_GROUP_CONDVAR.notify_all();
     }
     Ok(())
 }
@@ -131,6 +146,8 @@ fn global_fallback_wakes_an_idle_worker_in_another_group() {
     {
         let mut state = OTHER_GROUP_STATE.lock().unwrap_or_else(|e| e.into_inner());
         state.parked = 0;
+        state.wake_permits = 0;
+        state.resumed = 0;
         state.released = false;
     }
     let calls: Arc<[AtomicUsize]> = (0..4)
@@ -232,6 +249,16 @@ fn global_fallback_wakes_an_idle_worker_in_another_group() {
                 let backlog_after_wakes = scope.shared().global_queue_backlog();
                 let cross_group_wakes =
                     calls[2].load(Ordering::Relaxed) + calls[3].load(Ordering::Relaxed);
+                {
+                    let mut state = OTHER_GROUP_STATE
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    while state.resumed & OTHER_GROUP_MASK == 0 {
+                        state = OTHER_GROUP_CONDVAR
+                            .wait(state)
+                            .unwrap_or_else(|e| e.into_inner());
+                    }
+                }
                 {
                     let mut state = OTHER_GROUP_STATE
                         .lock()
