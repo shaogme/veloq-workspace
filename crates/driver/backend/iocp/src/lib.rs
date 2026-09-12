@@ -16,8 +16,8 @@ mod tests;
 
 // Re-exports used by the Windows backend and its callers.
 pub use config::{
-    BorrowedRawHandle, BufferRegistrationMode, IoFd, IocpConfig, IocpHandle, OwnedRawHandle,
-    RawHandle, RawHandleKind, RegisteredHandle, SocketKey,
+    BorrowedRawHandle, BufferRegistrationMode, DirectOwnerId, IoFd, IocpConfig, IocpHandle,
+    OwnedRawHandle, RawHandle, RawHandleKind, RegisteredHandle, SocketKey,
 };
 pub use diagnostics::{
     IocpCompletionDiagnostics, IocpCompletionDiagnosticsSnapshot, RioCompletionDiagnosticsSnapshot,

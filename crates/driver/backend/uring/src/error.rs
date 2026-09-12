@@ -15,6 +15,8 @@ set! {
         Registration,
         #[display("failed to resolve io_uring file descriptor")]
         ResolveFd,
+        #[display("duplicate owned file descriptor")]
+        DuplicateOwnedFd,
         #[display("io_uring file table slot was quarantined")]
         FileTableQuarantined,
         #[display("io_uring registered file table is poisoned and requires driver recreation")]
@@ -87,6 +89,7 @@ pub(crate) fn uring_fallback_errno(kind: UringError) -> i32 {
         UringError::Submission => 11,          // EAGAIN
         UringError::Registration => 12,        // ENOMEM
         UringError::ResolveFd => 9,            // EBADF
+        UringError::DuplicateOwnedFd => 17,    // EEXIST
         UringError::FileTableQuarantined => 5, // EIO
         UringError::FileTablePoisoned => 5,    // EIO
         UringError::Socket => 5,               // EIO

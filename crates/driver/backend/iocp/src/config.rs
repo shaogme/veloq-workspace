@@ -10,7 +10,7 @@ use veloq_std::{
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Networking::WinSock::{INVALID_SOCKET, SOCKET, closesocket};
 
-pub use veloq_driver_core::RawHandleKind;
+pub use veloq_driver_core::{DirectOwnerId, RawHandleKind};
 
 /// Specifies how buffers are registered and validated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

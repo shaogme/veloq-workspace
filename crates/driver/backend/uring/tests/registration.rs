@@ -66,6 +66,11 @@ fn raw_file(file: &File) -> RawHandle {
     RawHandle::new(UringRawHandle::for_file(file.as_raw_fd()))
 }
 
+fn owned_file_fd(fd: i32) -> OwnedRawHandle {
+    // SAFETY: every caller transfers one uniquely owned raw fd into this wrapper.
+    unsafe { OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_file(fd))) }
+}
+
 fn invalid_file_handle() -> RawHandle {
     RawHandle::new(UringRawHandle::for_file(i32::MAX))
 }
@@ -154,6 +159,36 @@ fn assert_fsync_is_rejected_with(
 
 fn assert_stale_fsync_is_rejected(driver: &mut UringDriver<'static>, fd: IoFd) {
     assert_fsync_is_rejected_with(driver, fd, UringError::ResolveFd);
+}
+
+fn assert_close_is_rejected_with(
+    driver: &mut UringDriver<'static>,
+    fd: IoFd,
+    expected_error: UringError,
+) {
+    let op = Close { fd };
+    let (uring_kernel, payload) =
+        <Close as IntoPlatformOp<UringSlotSpec>>::into_kernel_and_payload(op);
+    let mut uring_op: Option<UringOp> = Some(uring_kernel);
+    let mut slot = driver.reserve_op().expect("reserve op failed");
+    slot.set_payload(<Close as IntoPlatformOp<UringSlotSpec>>::payload_into_erased(payload));
+
+    match slot.submit(&mut uring_op) {
+        DriverSubmitResult::Failed {
+            report,
+            status: SubmitStatus::Void,
+        } => assert_eq!(*report.inner(), expected_error),
+        DriverSubmitResult::Failed { status, .. } => {
+            panic!("Close should fail before in-flight state, got {status:?}")
+        }
+        DriverSubmitResult::Submitted(_) => panic!("Close unexpectedly succeeded"),
+    }
+
+    let recovered = slot.recover_payload();
+    assert!(
+        matches!(recovered, Some(UringUserPayload::Close(_))),
+        "payload should be recoverable after void failure"
+    );
 }
 
 #[test]
@@ -885,6 +920,168 @@ fn close_owned_fallback_file() {
             .metadata()
             .expect("closing a retired fallback descriptor must not close the reused fd");
     }
+}
+
+#[test]
+fn duplicate_owned_direct_registration_preserves_the_existing_owner() {
+    let Some(mut driver) = new_driver_with_file_table_or_skip(0, FileTableExhaustion::Fallback)
+    else {
+        return;
+    };
+
+    let file = File::open("Cargo.toml").unwrap();
+    let raw_fd = file.as_raw_fd();
+    mem::forget(file);
+    let first = driver
+        .register_files(vec![RegisterFd::Owned(owned_file_fd(raw_fd))])
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert!(first.is_direct());
+    assert!(first.direct_owner().is_some());
+
+    let report = driver
+        .register_files(vec![RegisterFd::Owned(owned_file_fd(raw_fd))])
+        .expect_err("the same raw fd must not receive a second owned registration");
+    assert_eq!(*report.inner(), UringError::DuplicateOwnedFd);
+    assert!(report.context().contains_key("raw_fd"));
+    assert!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) } >= 0);
+
+    driver.unregister_files(vec![first]).unwrap();
+    assert_eq!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }, -1);
+}
+
+#[test]
+fn duplicate_owned_fixed_registration_preserves_the_existing_owner() {
+    let Some(mut driver) = new_driver_with_file_table_or_skip(2, FileTableExhaustion::Fail) else {
+        return;
+    };
+
+    let file = File::open("Cargo.toml").unwrap();
+    let raw_fd = file.as_raw_fd();
+    mem::forget(file);
+    let first = driver
+        .register_files(vec![RegisterFd::Owned(owned_file_fd(raw_fd))])
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert!(first.is_registered());
+
+    let report = driver
+        .register_files(vec![RegisterFd::Owned(owned_file_fd(raw_fd))])
+        .expect_err("a fixed owner must reject a second owned registration");
+    assert_eq!(*report.inner(), UringError::DuplicateOwnedFd);
+    assert!(report.context().contains_key("existing_file_index"));
+    assert!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) } >= 0);
+
+    driver.unregister_files(vec![first]).unwrap();
+    assert_eq!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }, -1);
+}
+
+#[test]
+fn borrowed_and_owned_descriptors_may_share_a_raw_fd() {
+    let Some(mut driver) = new_driver_with_file_table_or_skip(0, FileTableExhaustion::Fallback)
+    else {
+        return;
+    };
+
+    let file = File::open("Cargo.toml").unwrap();
+    let raw_fd = file.as_raw_fd();
+    let raw = raw_file(&file);
+    mem::forget(file);
+    let descriptors = driver
+        .register_files(vec![
+            RegisterFd::Borrowed(raw.borrow()),
+            RegisterFd::Owned(owned_file_fd(raw_fd)),
+        ])
+        .unwrap();
+    assert_eq!(descriptors.len(), 2);
+    assert_eq!(descriptors[0].direct_owner(), None);
+    assert!(descriptors[1].direct_owner().is_some());
+
+    driver.unregister_files(descriptors).unwrap();
+    assert_eq!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }, -1);
+}
+
+#[test]
+fn stale_owned_direct_descriptor_cannot_unregister_or_submit_to_a_reused_fd() {
+    let Some(mut driver) = new_driver_with_file_table_or_skip(0, FileTableExhaustion::Fallback)
+    else {
+        return;
+    };
+
+    let first_file = File::open("Cargo.toml").unwrap();
+    let raw_fd = first_file.as_raw_fd();
+    mem::forget(first_file);
+    let replacement_source = File::open("Cargo.toml").unwrap();
+    assert_ne!(replacement_source.as_raw_fd(), raw_fd);
+
+    let first = driver
+        .register_files(vec![RegisterFd::Owned(owned_file_fd(raw_fd))])
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    driver.unregister_files(vec![first]).unwrap();
+
+    assert_eq!(
+        unsafe { libc::dup2(replacement_source.as_raw_fd(), raw_fd) },
+        raw_fd
+    );
+    drop(replacement_source);
+    let replacement = driver
+        .register_files(vec![RegisterFd::Owned(owned_file_fd(raw_fd))])
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_ne!(first.direct_owner(), replacement.direct_owner());
+    assert!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) } >= 0);
+
+    driver.unregister_files(vec![first]).unwrap();
+    assert!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) } >= 0);
+    assert_stale_fsync_is_rejected(&mut driver, first);
+    assert_close_is_rejected_with(&mut driver, first, UringError::InvalidInput);
+
+    driver.unregister_files(vec![replacement]).unwrap();
+    assert_eq!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }, -1);
+}
+
+#[test]
+fn duplicate_owned_batch_is_rejected_before_claiming_fixed_slots() {
+    let Some(mut driver) = new_driver_with_file_table_or_skip(2, FileTableExhaustion::Fail) else {
+        return;
+    };
+
+    let duplicate_file = File::open("Cargo.toml").unwrap();
+    let duplicate_fd = duplicate_file.as_raw_fd();
+    mem::forget(duplicate_file);
+    let report = driver
+        .register_files(vec![
+            RegisterFd::Owned(owned_file_fd(duplicate_fd)),
+            RegisterFd::Owned(owned_file_fd(duplicate_fd)),
+        ])
+        .expect_err("a duplicate owned fd in one batch must be rejected");
+    assert_eq!(*report.inner(), UringError::DuplicateOwnedFd);
+    assert_eq!(unsafe { libc::fcntl(duplicate_fd, libc::F_GETFD) }, -1);
+
+    let valid_file = File::open("Cargo.toml").unwrap();
+    let valid_fd = valid_file.as_raw_fd();
+    mem::forget(valid_file);
+    let valid = driver
+        .register_files(vec![RegisterFd::Owned(owned_file_fd(valid_fd))])
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert!(
+        valid.is_registered(),
+        "the rejected batch must not claim a slot"
+    );
+    driver.unregister_files(vec![valid]).unwrap();
+    assert_eq!(unsafe { libc::fcntl(valid_fd, libc::F_GETFD) }, -1);
 }
 
 #[test]

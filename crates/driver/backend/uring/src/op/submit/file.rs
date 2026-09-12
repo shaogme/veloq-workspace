@@ -157,7 +157,8 @@ pub(crate) unsafe fn make_sqe_close(
             env.file_table.entry(index),
             Some(RegisteredFileEntry::BorrowedFd { .. })
         ),
-        IoFd::Direct(raw) => env.file_table.owns_direct(raw),
+        IoFd::Direct(_) => false,
+        IoFd::OwnedDirect { .. } => env.file_table.owns_direct(close_op.fd),
     };
     if !owned {
         return Err(UringError::InvalidInput

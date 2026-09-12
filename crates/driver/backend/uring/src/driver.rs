@@ -250,6 +250,14 @@ impl<'a> UringDriver<'a> {
                 Some(IoFd::Direct(_)) => {
                     self.waker.set_registered_fd(Some(IoFd::direct(raw.raw())));
                 }
+                Some(IoFd::OwnedDirect { .. }) => {
+                    return Err(UringError::InvalidState
+                        .report(
+                            "driver.rebuild_waker_fd",
+                            "owned direct waker descriptors are unsupported",
+                        )
+                        .with_ctx("fd", format!("{:?}", registered_fd.unwrap())));
+                }
                 None => {}
             }
 

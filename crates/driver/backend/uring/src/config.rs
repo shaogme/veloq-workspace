@@ -1,8 +1,8 @@
-pub use veloq_driver_core::RawHandleKind;
 use veloq_driver_core::{
     BorrowedRawHandle as CoreBorrowedRawHandle, IoFd as CoreIoFd,
     OwnedRawHandle as CoreOwnedRawHandle, RawHandle as CoreRawHandle, RawHandleMeta,
 };
+pub use veloq_driver_core::{DirectOwnerId, RawHandleKind};
 use veloq_std::{
     mem,
     num::{NonZeroU16, NonZeroU32, NonZeroUsize},

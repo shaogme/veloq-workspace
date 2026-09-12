@@ -7,6 +7,7 @@ use veloq_std::{
     marker::{PhantomData, Send, Sync},
     mem,
     net::SocketAddr,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 pub mod driver;
@@ -36,6 +37,28 @@ impl<T> SlotSidecar for T where T: Default + Send {}
 // IoFd
 // ============================================================================
 
+static NEXT_DIRECT_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Opaque identity for a direct descriptor whose lifetime is owned by a backend.
+///
+/// The value is intentionally not constructible outside this crate. It distinguishes owned
+/// direct descriptors even when the operating system reuses the same raw descriptor number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DirectOwnerId {
+    id: u64,
+}
+
+impl DirectOwnerId {
+    fn next() -> Self {
+        let id = NEXT_DIRECT_OWNER_ID
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .unwrap_or_else(|_| panic!("direct descriptor owner identity exhausted"));
+        Self { id }
+    }
+}
+
 /// Names the descriptor an operation runs against.
 ///
 /// A descriptor reaches the kernel one of two ways, and which one it is decided when the
@@ -45,12 +68,13 @@ impl<T> SlotSidecar for T where T: Default + Send {}
 ///   with the generation that registration was handed out under. The generation is what makes
 ///   use-after-close detectable: releasing a slot advances it, so a stale descriptor is
 ///   rejected instead of silently naming whatever took the slot's place.
-/// - [`Direct`](Self::Direct) carries the platform handle itself, for descriptors that live
-///   outside the registry. Submitting one needs no registry lookup at all, and its
-///   [`RawHandleKind`] comes from the handle rather than from a table — but **it carries no
-///   generation**, so a `Direct` descriptor whose handle has been closed will silently name
-///   whatever the platform later assigns that same number. Producing one is a backend's
-///   decision; a backend that keeps every descriptor in its registry never does.
+/// - [`Direct`](Self::Direct) carries the platform handle itself, for borrowed descriptors that
+///   live outside the registry. Submitting one needs no registry lookup at all, and its
+///   [`RawHandleKind`] comes from the handle rather than from a table. It carries no ownership
+///   or generation, so the caller must keep the handle valid.
+/// - [`OwnedDirect`](Self::OwnedDirect) carries a platform handle plus an opaque owner identity.
+///   Backends use the identity to keep the owned handle alive and to reject stale descriptors
+///   after the raw descriptor number is reused.
 ///
 /// `H` is the backend's raw handle type, so this enum stays free of platform types the way a
 /// bare index did. Backends alias it once (`type IoFd = IoFd<UringRawHandle>`) and their own
@@ -66,6 +90,14 @@ pub enum IoFd<H: Handle> {
     },
     /// A platform handle submitted as-is, with no registry entry behind it.
     Direct(H),
+    /// A platform handle whose backend-owned lifetime is identified independently of its raw
+    /// descriptor number.
+    OwnedDirect {
+        /// The platform handle submitted to the kernel.
+        handle: H,
+        /// Opaque identity minted by [`Self::owned_direct`].
+        owner: DirectOwnerId,
+    },
 }
 
 impl<H: Handle> IoFd<H> {
@@ -87,11 +119,19 @@ impl<H: Handle> IoFd<H> {
         Self::Direct(handle)
     }
 
+    /// Creates a descriptor with a fresh backend-owned direct identity.
+    pub fn owned_direct(handle: H) -> Self {
+        Self::OwnedDirect {
+            handle,
+            owner: DirectOwnerId::next(),
+        }
+    }
+
     /// Returns the registry index and generation, or `None` for a direct descriptor.
     pub const fn registered_parts(self) -> Option<(u32, u64)> {
         match self {
             Self::Registered { index, generation } => Some((index, generation)),
-            Self::Direct(_) => None,
+            Self::Direct(_) | Self::OwnedDirect { .. } => None,
         }
     }
 
@@ -99,7 +139,7 @@ impl<H: Handle> IoFd<H> {
     pub const fn fixed_index(self) -> Option<u32> {
         match self {
             Self::Registered { index, .. } => Some(index),
-            Self::Direct(_) => None,
+            Self::Direct(_) | Self::OwnedDirect { .. } => None,
         }
     }
 
@@ -107,7 +147,7 @@ impl<H: Handle> IoFd<H> {
     pub const fn generation(self) -> Option<u64> {
         match self {
             Self::Registered { generation, .. } => Some(generation),
-            Self::Direct(_) => None,
+            Self::Direct(_) | Self::OwnedDirect { .. } => None,
         }
     }
 
@@ -115,7 +155,16 @@ impl<H: Handle> IoFd<H> {
     pub const fn direct_handle(self) -> Option<H> {
         match self {
             Self::Direct(handle) => Some(handle),
+            Self::OwnedDirect { handle, .. } => Some(handle),
             Self::Registered { .. } => None,
+        }
+    }
+
+    /// Returns the opaque owner identity of an owned direct descriptor.
+    pub const fn direct_owner(self) -> Option<DirectOwnerId> {
+        match self {
+            Self::OwnedDirect { owner, .. } => Some(owner),
+            Self::Registered { .. } | Self::Direct(_) => None,
         }
     }
 
@@ -126,7 +175,7 @@ impl<H: Handle> IoFd<H> {
 
     /// Whether this descriptor carries its platform handle directly.
     pub const fn is_direct(self) -> bool {
-        matches!(self, Self::Direct(_))
+        matches!(self, Self::Direct(_) | Self::OwnedDirect { .. })
     }
 }
 
@@ -136,7 +185,7 @@ impl<H: RawHandleMeta> IoFd<H> {
     /// A registered descriptor returns `None`: only the registry knows what it points at.
     pub fn direct_kind(self) -> Option<RawHandleKind> {
         match self {
-            Self::Direct(handle) => Some(handle.kind()),
+            Self::Direct(handle) | Self::OwnedDirect { handle, .. } => Some(handle.kind()),
             Self::Registered { .. } => None,
         }
     }
@@ -153,6 +202,7 @@ impl<H: Handle + fmt::Debug> fmt::Display for IoFd<H> {
                 write!(f, "registered(index={index}, generation={generation})")
             }
             Self::Direct(handle) => write!(f, "direct({handle:?})"),
+            Self::OwnedDirect { handle, .. } => write!(f, "owned_direct({handle:?})"),
         }
     }
 }
@@ -341,4 +391,68 @@ pub trait SocketAddrCodec: SockAddr {
 
     fn to_socket_addr(buf: &[u8]) -> Result<SocketAddr, Report<Self::Error>>;
     fn socket_addr_to_storage(addr: SocketAddr) -> (Self, Self::Len);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IoFd, RawHandleKind, RawHandleMeta};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    struct TestHandle {
+        kind: RawHandleKind,
+        raw: u32,
+    }
+
+    impl RawHandleMeta for TestHandle {
+        fn kind(self) -> RawHandleKind {
+            self.kind
+        }
+
+        fn close(self) {}
+    }
+
+    fn file(raw: u32) -> TestHandle {
+        TestHandle {
+            kind: RawHandleKind::File,
+            raw,
+        }
+    }
+
+    #[test]
+    fn borrowed_direct_descriptor_has_no_owner() {
+        let descriptor = IoFd::direct(file(7));
+
+        assert_eq!(descriptor.direct_owner(), None);
+        assert_eq!(descriptor.direct_handle(), Some(file(7)));
+        assert_eq!(descriptor.direct_kind(), Some(RawHandleKind::File));
+        assert!(descriptor.is_direct());
+        assert_eq!(descriptor.registered_parts(), None);
+        assert_eq!(descriptor.fixed_index(), None);
+        assert_eq!(descriptor.generation(), None);
+    }
+
+    #[test]
+    fn owned_direct_descriptors_have_distinct_opaque_owners() {
+        let first = IoFd::owned_direct(file(7));
+        let second = IoFd::owned_direct(file(7));
+
+        assert_ne!(first.direct_owner(), second.direct_owner());
+        assert_eq!(first.direct_handle(), Some(file(7)));
+        assert_eq!(first.direct_handle().expect("owned handle").raw, 7);
+        assert_eq!(first.direct_kind(), Some(RawHandleKind::File));
+        assert!(first.is_direct());
+        assert_eq!(first.registered_parts(), None);
+        assert_eq!(first.fixed_index(), None);
+        assert_eq!(first.generation(), None);
+    }
+
+    #[test]
+    fn registered_descriptor_has_no_direct_owner() {
+        let descriptor = IoFd::<TestHandle>::fixed_with_generation(3, 9);
+
+        assert_eq!(descriptor.direct_owner(), None);
+        assert_eq!(descriptor.direct_handle(), None);
+        assert_eq!(descriptor.direct_kind(), None);
+        assert!(descriptor.is_registered());
+    }
 }

@@ -8,7 +8,8 @@ use tracing::error;
 use veloq_buf::heap::ChunkId;
 use veloq_driver_core::driver::{BufferRegistrationStatus, RegisterFd};
 use veloq_std::{
-    io,
+    collections::HashMap,
+    format, io,
     mem::{self, ManuallyDrop},
     string::ToString,
     time::Duration,
@@ -24,7 +25,9 @@ pub(crate) mod file_table;
 pub(crate) mod provided_buf;
 
 pub(crate) use buffer::{BufferRegistrationQuarantine, UringBufferRegistry};
-pub(crate) use file_table::{FileTable, FileTablePoisonContext, RegisteredFileEntry, SqeFd};
+pub(crate) use file_table::{
+    FileTable, FileTablePoisonContext, OwnedLocation, RegisteredFileEntry, SqeFd,
+};
 pub use provided_buf::ProvidedBufStats;
 pub(crate) use provided_buf::{PROVIDED_BUF_GROUP_ID, ProvidedBufGroup};
 
@@ -70,6 +73,147 @@ impl FileTableUpdateFailure {
             start_index: self.start_index,
             requested_files: self.requested_files,
             updated_files: self.updated_files,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OwnedInputInfo {
+    first_position: usize,
+    count: usize,
+    existing: Option<OwnedLocation>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OwnedFdConflictSource {
+    Existing(OwnedLocation),
+    CurrentBatch(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OwnedFdConflict {
+    raw_fd: i32,
+    input_position: usize,
+    source: OwnedFdConflictSource,
+}
+
+fn owned_input_raw(file: &RegisterFd<'_, UringRawHandle>) -> Option<UringRawHandle> {
+    match file {
+        RegisterFd::Borrowed(_) => None,
+        RegisterFd::Owned(handle) => Some(handle.raw()),
+    }
+}
+
+fn preflight_owned_files(
+    table: &FileTable,
+    files: &[RegisterFd<'_, UringRawHandle>],
+) -> (HashMap<i32, OwnedInputInfo>, Option<OwnedFdConflict>) {
+    let mut inputs: HashMap<i32, OwnedInputInfo> = HashMap::default();
+    let mut conflict = None;
+
+    for (input_position, file) in files.iter().enumerate() {
+        let Some(raw) = owned_input_raw(file) else {
+            continue;
+        };
+        let raw_fd = raw.as_fd();
+        if let Some(info) = inputs.get_mut(&raw_fd) {
+            if conflict.is_none() {
+                conflict = Some(OwnedFdConflict {
+                    raw_fd,
+                    input_position,
+                    source: info.existing.map_or(
+                        OwnedFdConflictSource::CurrentBatch(info.first_position),
+                        OwnedFdConflictSource::Existing,
+                    ),
+                });
+            }
+            info.count += 1;
+        } else {
+            let existing = table.owned_location(raw);
+            if conflict.is_none()
+                && let Some(location) = existing
+            {
+                conflict = Some(OwnedFdConflict {
+                    raw_fd,
+                    input_position,
+                    source: OwnedFdConflictSource::Existing(location),
+                });
+            }
+            inputs.insert(
+                raw_fd,
+                OwnedInputInfo {
+                    first_position: input_position,
+                    count: 1,
+                    existing,
+                },
+            );
+        }
+    }
+
+    (inputs, conflict)
+}
+
+fn duplicate_owned_fd_report(conflict: OwnedFdConflict) -> Report<UringError> {
+    let mut report = UringError::DuplicateOwnedFd
+        .report(
+            "driver.register_files_internal.preflight",
+            "an owned file descriptor is already registered",
+        )
+        .with_ctx("raw_fd", conflict.raw_fd)
+        .with_ctx("input_position", conflict.input_position);
+    match conflict.source {
+        OwnedFdConflictSource::Existing(OwnedLocation::Fixed(index)) => {
+            report = report
+                .with_ctx("conflict_source", "existing_registration")
+                .with_ctx("existing_location", "fixed")
+                .with_ctx("existing_file_index", index);
+        }
+        OwnedFdConflictSource::Existing(OwnedLocation::Direct(owner)) => {
+            report = report
+                .with_ctx("conflict_source", "existing_registration")
+                .with_ctx("existing_location", "direct")
+                .with_ctx("existing_direct_owner", format!("{owner:?}"));
+        }
+        OwnedFdConflictSource::CurrentBatch(previous_position) => {
+            report = report
+                .with_ctx("conflict_source", "current_batch")
+                .with_ctx("previous_input_position", previous_position);
+        }
+    }
+    report
+}
+
+fn cleanup_rejected_owned_inputs<'h>(
+    files: Vec<RegisterFd<'h, UringRawHandle>>,
+    inputs: &HashMap<i32, OwnedInputInfo>,
+) {
+    let mut dropped_batch_duplicates = HashMap::default();
+
+    for file in files {
+        match file {
+            RegisterFd::Borrowed(_) => {}
+            RegisterFd::Owned(handle) => {
+                let raw = handle.raw();
+                let Some(info) = inputs.get(&raw.as_fd()) else {
+                    drop(handle);
+                    continue;
+                };
+
+                if info.existing.is_some() {
+                    // The existing registration remains the sole actual owner of this raw fd.
+                    mem::forget(handle);
+                } else if info.count > 1 {
+                    // This malformed batch contains several owners for one raw fd. Close one
+                    // wrapper and forget the rest so the number is closed at most once.
+                    if dropped_batch_duplicates.insert(raw.as_fd(), ()).is_none() {
+                        drop(handle);
+                    } else {
+                        mem::forget(handle);
+                    }
+                } else {
+                    drop(handle);
+                }
+            }
         }
     }
 }
@@ -251,12 +395,48 @@ impl<'a> UringDriver<'a> {
         Ok(())
     }
 
+    fn rollback_descriptors_after_registration_failure(
+        &mut self,
+        descriptors: &[IoFd],
+        primary: Report<UringError>,
+    ) -> Report<UringError> {
+        let mut registered = descriptors
+            .iter()
+            .filter_map(|fd| match fd {
+                IoFd::Registered { index, .. } => Some(*index),
+                IoFd::Direct(_) | IoFd::OwnedDirect { .. } => None,
+            })
+            .collect::<Vec<_>>();
+
+        for fd in descriptors.iter().copied() {
+            if matches!(fd, IoFd::OwnedDirect { .. }) {
+                drop(self.file_table.release_direct(fd));
+            }
+        }
+
+        match self.rollback_file_slots(&mut registered) {
+            Ok(()) => primary,
+            Err(rollback) => {
+                let context = rollback.failure.poison_context(Some(rollback.failed_index));
+                self.poison_file_table(
+                    "driver.register_files_internal.rollback",
+                    context,
+                    primary,
+                    Some(rollback.failure.report),
+                    true,
+                    rollback.remaining_indices.len(),
+                )
+                .attach_note("rollback failed after owned direct adoption failure")
+            }
+        }
+    }
+
     pub(crate) fn unregister_fixed_fd(&mut self, fd: IoFd) -> UringResult<()> {
         match fd {
-            // A direct descriptor has no slot; all the table can hold for it is the handle it
-            // owns, and dropping that closes the fd.
-            IoFd::Direct(raw) => {
-                drop(self.file_table.release_direct(raw));
+            // Borrowed direct descriptors have no backend ownership to release.
+            IoFd::Direct(_) => Ok(()),
+            IoFd::OwnedDirect { .. } => {
+                drop(self.file_table.release_direct(fd));
                 Ok(())
             }
             IoFd::Registered { index, generation } => {
@@ -294,8 +474,11 @@ impl<'a> UringDriver<'a> {
     /// close a number the kernel may have already handed to someone else.
     pub(crate) fn unregister_close_owned_fd(&mut self, fd: IoFd) -> UringResult<()> {
         let (index, generation) = match fd {
-            IoFd::Direct(raw) => {
-                if let Some(handle) = self.file_table.release_direct(raw) {
+            IoFd::Direct(_) => {
+                return Ok(());
+            }
+            IoFd::OwnedDirect { .. } => {
+                if let Some(handle) = self.file_table.release_direct(fd) {
                     let _ = ManuallyDrop::new(handle);
                 }
                 return Ok(());
@@ -406,13 +589,14 @@ impl<'a> UringDriver<'a> {
             let context = failure.poison_context(Some(index));
             return Err(self.poison_file_table(scope, context, failure.report, None, false, 0));
         }
-        self.file_table.install_entry(
+        let old_entry = self.file_table.replace_entry(
             index,
             RegisteredFileEntry::BorrowedFd {
                 fd,
                 kind: raw.kind(),
             },
         );
+        drop(old_entry);
         Ok(())
     }
 
@@ -463,13 +647,21 @@ impl<'a> UringDriver<'a> {
         &mut self,
         files: Vec<RegisterFd<'h, UringRawHandle>>,
     ) -> UringResult<Vec<IoFd>> {
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let (owned_inputs, conflict) = preflight_owned_files(&self.file_table, &files);
+        if let Some(conflict) = conflict {
+            let report = duplicate_owned_fd_report(conflict);
+            cleanup_rejected_owned_inputs(files, &owned_inputs);
+            return Err(report);
+        }
+
         if self.file_table.is_poisoned() {
             return Err(self
                 .file_table
                 .poisoned_report("driver.register_files_internal", None));
-        }
-        if files.is_empty() {
-            return Ok(Vec::new());
         }
 
         self.ensure_file_table_initialized()?;
@@ -502,12 +694,21 @@ impl<'a> UringDriver<'a> {
         let mut descriptors = self.install_claimed_files(claimed, entries)?;
 
         for file in files {
-            descriptors.push(match file {
+            let descriptor = match file {
                 RegisterFd::Borrowed(b) => IoFd::direct(b.raw()),
                 // A direct descriptor is only a handle value, so the driver has to keep the
                 // owned handle alive itself until the descriptor is unregistered.
-                RegisterFd::Owned(o) => self.file_table.adopt_direct(o),
-            });
+                RegisterFd::Owned(o) => match self.file_table.adopt_direct(o) {
+                    Ok(fd) => fd,
+                    Err(report) => {
+                        return Err(self.rollback_descriptors_after_registration_failure(
+                            &descriptors,
+                            report,
+                        ));
+                    }
+                },
+            };
+            descriptors.push(descriptor);
         }
         Ok(descriptors)
     }

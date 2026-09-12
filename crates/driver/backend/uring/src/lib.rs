@@ -9,7 +9,7 @@ mod net;
 mod op;
 
 pub use config::{
-    BorrowedRawHandle, BufferRegistrationMode, FileTableExhaustion, IoFd, IoMode,
+    BorrowedRawHandle, BufferRegistrationMode, DirectOwnerId, FileTableExhaustion, IoFd, IoMode,
     MAX_PROVIDED_BUF_ENTRIES, OwnedRawHandle, ProvidedBufConfig, RawHandle, RawHandleKind,
     SockAddrStorage, UringConfig, UringRawHandle,
 };

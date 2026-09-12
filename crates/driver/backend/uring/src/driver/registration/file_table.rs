@@ -5,15 +5,14 @@
 //! table is the userspace mirror of it, one slot per kernel entry, and a descriptor pointing
 //! into it is an [`IoFd::Registered`] — an index plus the generation it was handed out under.
 //!
-//! Descriptors that do not fit are handed out as [`IoFd::Direct`] instead, which carries the
-//! raw fd inside the descriptor itself: submitting one consults no table at all, and its
-//! [`RawHandleKind`] comes from the handle rather than from a slot. What the table still owes
-//! them is *ownership* — a descriptor registered from [`RegisterFd::Owned`] must stay open
-//! until it is unregistered — so owned fallback handles are parked in `direct_owned`, which is
-//! touched only on registration and unregistration, never on submission.
+//! Descriptors that do not fit are handed out as [`IoFd::Direct`] or
+//! [`IoFd::OwnedDirect`]. Both carry the raw fd inside the descriptor itself and submit without
+//! a fixed-file lookup. Only the latter transfers ownership to the driver; those handles are
+//! parked in `direct_owned`, keyed by their opaque owner identity.
 //!
-//! The trade this makes is explicit: a direct descriptor has no generation, so it cannot
-//! detect use-after-close the way a registered one does. See [`FileTable::resolve`].
+//! Borrowed direct descriptors have no generation and retain their caller-owned lifetime
+//! contract. Owned direct descriptors instead use owner identity to reject stale resolve,
+//! unregister, and close operations. See [`FileTable::resolve`].
 //!
 //! [`RegisterFd::Owned`]: veloq_driver_core::driver::RegisterFd::Owned
 
@@ -23,8 +22,8 @@ use crate::{
 };
 use diagweave::prelude::*;
 use tracing::warn;
-use veloq_driver_core::RawHandleMeta;
-use veloq_std::{collections::HashMap, format, string::ToString, vec::Vec};
+use veloq_driver_core::{DirectOwnerId, RawHandleMeta};
+use veloq_std::{collections::HashMap, format, mem, string::ToString, vec::Vec};
 
 const INITIAL_FILE_GENERATION: u64 = 1;
 
@@ -83,6 +82,12 @@ enum FileTableHealth {
     Poisoned(FileTablePoisonContext),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnedLocation {
+    Fixed(u32),
+    Direct(DirectOwnerId),
+}
+
 #[derive(Debug)]
 struct FileSlot {
     entry: Option<RegisteredFileEntry>,
@@ -106,11 +111,17 @@ pub(crate) struct FileTable {
     slots: Vec<FileSlot>,
     fixed_capacity: usize,
     free_fixed: Vec<u32>,
-    /// Handles owned by the driver behind an [`IoFd::Direct`], keyed by raw fd.
+    /// Handles owned by the driver behind an [`IoFd::OwnedDirect`], keyed by owner identity.
     ///
     /// Only [`RegisterFd::Owned`](veloq_driver_core::driver::RegisterFd::Owned) registrations
-    /// land here — a borrowed fallback descriptor is nothing but the number in the `IoFd`.
-    direct_owned: HashMap<i32, OwnedRawHandle>,
+    /// that fall back to direct descriptors land here. A borrowed fallback descriptor is
+    /// nothing but the number in the `IoFd`.
+    direct_owned: HashMap<DirectOwnerId, OwnedRawHandle>,
+    /// Raw descriptor numbers currently held by an owned fixed or direct registration.
+    ///
+    /// This is a duplicate-detection index only. It must never be used to release an owned
+    /// handle because raw descriptor numbers can be reused by the operating system.
+    owned_raw_index: HashMap<i32, OwnedLocation>,
     exhaustion: FileTableExhaustion,
     initialized: bool,
     fallback_reported: bool,
@@ -124,6 +135,7 @@ impl FileTable {
             fixed_capacity: fixed_capacity as usize,
             free_fixed: Vec::new(),
             direct_owned: HashMap::default(),
+            owned_raw_index: HashMap::default(),
             exhaustion,
             initialized: false,
             fallback_reported: false,
@@ -229,13 +241,13 @@ impl FileTable {
 
     /// Turns a user-facing descriptor into the form an SQE needs.
     ///
-    /// The two variants are checked differently, and the difference is the whole point of the
+    /// The three variants are checked differently, and the difference is the whole point of the
     /// split. A registered descriptor is validated against its slot: bounds, generation
     /// (which is what makes a stale descriptor an error rather than a silent hit on whatever
-    /// took the slot's place), and the registered handle's kind. A direct descriptor carries
-    /// its handle, so the kind check reads straight off it and no lookup happens at all — but
-    /// there is **no generation to check**, so a direct descriptor whose fd has since been
-    /// closed resolves happily onto whatever the kernel has since assigned that number.
+    /// took the slot's place), and the registered handle's kind. A borrowed direct descriptor
+    /// carries its handle, so the kind check reads straight off it and no lookup happens at all.
+    /// An owned direct descriptor performs an owner identity lookup before it is accepted,
+    /// preventing a stale descriptor from naming a reused raw fd.
     pub(crate) fn resolve(
         &self,
         fd: IoFd,
@@ -256,6 +268,9 @@ impl FileTable {
                     }
                 }
                 return Ok(SqeFd::Direct(raw.as_fd()));
+            }
+            IoFd::OwnedDirect { .. } => {
+                return self.resolve_owned_direct(fd, expected_kind, scope);
             }
             IoFd::Registered { index, generation } => (index, generation),
         };
@@ -331,6 +346,9 @@ impl FileTable {
                     }
                 }
                 return Ok(SqeFd::Direct(raw.as_fd()));
+            }
+            IoFd::OwnedDirect { .. } => {
+                return self.resolve_owned_direct(fd, expected_kind, scope);
             }
             IoFd::Registered { index, generation } => (index, generation),
         };
@@ -447,29 +465,130 @@ impl FileTable {
         );
     }
 
-    /// Takes ownership of a handle handed out as a direct descriptor.
+    fn resolve_owned_direct(
+        &self,
+        fd: IoFd,
+        expected_kind: Option<RawHandleKind>,
+        scope: &'static str,
+    ) -> UringResult<SqeFd> {
+        let IoFd::OwnedDirect { handle: raw, owner } = fd else {
+            unreachable!("owned direct resolver called for another descriptor kind")
+        };
+
+        let Some(owned) = self.direct_owned.get(&owner) else {
+            return UringError::ResolveFd
+                .push_ctx("scope", scope)
+                .with_ctx("fd", fd.to_string())
+                .with_ctx("direct_owner", format!("{owner:?}"))
+                .attach_note("owned direct descriptor is stale or already unregistered");
+        };
+        if owned.raw() != raw
+            || !matches!(
+                self.owned_raw_index.get(&raw.as_fd()),
+                Some(OwnedLocation::Direct(current)) if *current == owner
+            )
+        {
+            return UringError::ResolveFd
+                .push_ctx("scope", scope)
+                .with_ctx("fd", fd.to_string())
+                .with_ctx("direct_owner", format!("{owner:?}"))
+                .attach_note("owned direct descriptor identity does not match its live handle");
+        }
+
+        if let Some(expected_kind) = expected_kind {
+            let current_kind = owned.kind();
+            if current_kind != expected_kind {
+                return UringError::ResolveFd
+                    .push_ctx("scope", scope)
+                    .with_ctx("fd", fd.to_string())
+                    .with_ctx("expected_kind", format!("{expected_kind:?}"))
+                    .with_ctx("current_kind", format!("{current_kind:?}"))
+                    .attach_note("owned direct file descriptor kind mismatch");
+            }
+        }
+
+        Ok(SqeFd::Direct(raw.as_fd()))
+    }
+
+    /// Returns the current owned registration for `raw`, if any.
+    #[inline]
+    pub(crate) fn owned_location(&self, raw: UringRawHandle) -> Option<OwnedLocation> {
+        self.owned_raw_index.get(&raw.as_fd()).copied()
+    }
+
+    /// Takes ownership of a handle handed out as an owned direct descriptor.
     ///
     /// The handle stays parked here until [`Self::release_direct`] retires it, which is what
     /// keeps a `RegisterFd::Owned` fallback registration open for as long as its descriptor
     /// is valid.
-    pub(crate) fn adopt_direct(&mut self, handle: OwnedRawHandle) -> IoFd {
+    pub(crate) fn adopt_direct(&mut self, handle: OwnedRawHandle) -> UringResult<IoFd> {
         let raw = handle.raw();
-        self.direct_owned.insert(raw.as_fd(), handle);
-        IoFd::direct(raw)
+        if let Some(location) = self.owned_location(raw) {
+            let report = UringError::DuplicateOwnedFd
+                .report(
+                    "driver.file_table.adopt_direct",
+                    "owned descriptor is already registered",
+                )
+                .with_ctx("raw_fd", raw.as_fd())
+                .with_ctx("existing_location", format!("{location:?}"));
+            // This is an internal invariant failure after registration preflight. Do not let
+            // the duplicate wrapper close the descriptor held by the existing registration.
+            mem::forget(handle);
+            return Err(report);
+        }
+
+        let descriptor = IoFd::owned_direct(raw);
+        let owner = descriptor
+            .direct_owner()
+            .expect("owned_direct always carries an owner identity");
+        assert!(
+            self.direct_owned.insert(owner, handle).is_none(),
+            "direct owner identity was unexpectedly reused"
+        );
+        assert!(
+            self.owned_raw_index.get(&raw.as_fd()).is_none(),
+            "owned raw descriptor index changed after preflight"
+        );
+        self.owned_raw_index
+            .insert(raw.as_fd(), OwnedLocation::Direct(owner));
+        Ok(descriptor)
     }
 
-    /// Whether the driver holds the handle behind a direct descriptor.
+    /// Whether the driver holds the handle behind this owned direct descriptor.
     #[inline]
-    pub(crate) fn owns_direct(&self, raw: UringRawHandle) -> bool {
-        self.direct_owned.contains_key(&raw.as_fd())
+    pub(crate) fn owns_direct(&self, fd: IoFd) -> bool {
+        let IoFd::OwnedDirect { handle: raw, owner } = fd else {
+            return false;
+        };
+        self.direct_owned
+            .get(&owner)
+            .is_some_and(|handle| handle.raw() == raw)
+            && matches!(
+                self.owned_raw_index.get(&raw.as_fd()),
+                Some(OwnedLocation::Direct(current)) if *current == owner
+            )
     }
 
-    /// Retires a direct descriptor, returning the handle when the driver owned one.
+    /// Retires an owned direct descriptor, returning its handle when the identity matches.
     ///
     /// Dropping the returned handle closes the fd; callers whose descriptor was already closed
     /// by the kernel must forget it instead.
-    pub(crate) fn release_direct(&mut self, raw: UringRawHandle) -> Option<OwnedRawHandle> {
-        self.direct_owned.remove(&raw.as_fd())
+    pub(crate) fn release_direct(&mut self, fd: IoFd) -> Option<OwnedRawHandle> {
+        let IoFd::OwnedDirect { handle: raw, owner } = fd else {
+            return None;
+        };
+        let owned = self.direct_owned.get(&owner)?;
+        if owned.raw() != raw
+            || !matches!(
+                self.owned_raw_index.get(&raw.as_fd()),
+                Some(OwnedLocation::Direct(current)) if *current == owner
+            )
+        {
+            return None;
+        }
+
+        self.owned_raw_index.remove(&raw.as_fd());
+        self.direct_owned.remove(&owner)
     }
 
     /// Stores the handle backing `index`. The slot must have been claimed first.
@@ -484,12 +603,60 @@ impl FileTable {
             self.slots[index as usize].entry.is_none(),
             "installed an entry into an occupied file slot"
         );
+        if let RegisteredFileEntry::OwnedHandle(handle) = &entry {
+            assert!(
+                self.owned_raw_index.get(&handle.raw().as_fd()).is_none(),
+                "installed a duplicate owned file descriptor"
+            );
+            self.owned_raw_index
+                .insert(handle.raw().as_fd(), OwnedLocation::Fixed(index));
+        }
         self.slots[index as usize].entry = Some(entry);
     }
 
     #[inline]
     pub(crate) fn take_entry(&mut self, index: u32) -> Option<RegisteredFileEntry> {
-        self.slots.get_mut(index as usize)?.entry.take()
+        let entry = self.slots.get_mut(index as usize)?.entry.take()?;
+        if let RegisteredFileEntry::OwnedHandle(handle) = &entry {
+            let raw = handle.raw().as_fd();
+            debug_assert_eq!(
+                self.owned_raw_index.remove(&raw),
+                Some(OwnedLocation::Fixed(index)),
+                "owned fixed file descriptor index was inconsistent"
+            );
+        }
+        Some(entry)
+    }
+
+    /// Replaces the entry in a live fixed slot while maintaining the owned indexes.
+    pub(crate) fn replace_entry(
+        &mut self,
+        index: u32,
+        entry: RegisteredFileEntry,
+    ) -> Option<RegisteredFileEntry> {
+        let old = {
+            let slot = self.slots.get_mut(index as usize)?;
+            debug_assert_eq!(slot.state, FileSlotState::Occupied);
+            slot.entry.replace(entry)
+        };
+
+        if let Some(RegisteredFileEntry::OwnedHandle(handle)) = old.as_ref() {
+            let raw = handle.raw().as_fd();
+            debug_assert_eq!(
+                self.owned_raw_index.remove(&raw),
+                Some(OwnedLocation::Fixed(index)),
+                "replaced owned fixed file descriptor index was inconsistent"
+            );
+        }
+        if let Some(RegisteredFileEntry::OwnedHandle(handle)) = self.entry(index) {
+            assert!(
+                self.owned_raw_index.get(&handle.raw().as_fd()).is_none(),
+                "replaced with a duplicate owned file descriptor"
+            );
+            self.owned_raw_index
+                .insert(handle.raw().as_fd(), OwnedLocation::Fixed(index));
+        }
+        old
     }
 
     /// Returns `index` to the free list. The entry must already be gone.
@@ -568,7 +735,9 @@ impl FileTable {
 #[cfg(test)]
 mod tests {
     use super::{FileTable, FileTablePoisonContext, RegisteredFileEntry, SqeFd};
-    use crate::config::{FileTableExhaustion, IoFd, RawHandleKind, UringRawHandle};
+    use crate::config::{
+        FileTableExhaustion, IoFd, OwnedRawHandle, RawHandle, RawHandleKind, UringRawHandle,
+    };
     use crate::error::UringError;
     use veloq_std::vec::Vec;
 
@@ -583,6 +752,13 @@ mod tests {
         let mut table = FileTable::new(capacity, exhaustion);
         table.mark_initialized();
         table
+    }
+
+    fn owned_eventfd() -> OwnedRawHandle {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        assert!(fd >= 0, "eventfd creation failed");
+        // SAFETY: eventfd returns a freshly created descriptor owned by this value.
+        unsafe { OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_file(fd))) }
     }
 
     /// Registers `fds` the way `register_files_internal` does: kernel slots first, the rest as
@@ -645,6 +821,99 @@ mod tests {
             table.resolve(fds[0], None, "test").unwrap(),
             SqeFd::Direct(7)
         );
+    }
+
+    #[test]
+    fn owned_direct_entries_are_keyed_by_distinct_owner_identities() {
+        let mut table = table(0, FileTableExhaustion::Fallback);
+        let first = table.adopt_direct(owned_eventfd()).unwrap();
+        let second = table.adopt_direct(owned_eventfd()).unwrap();
+
+        assert_ne!(first.direct_owner(), second.direct_owner());
+        assert!(table.owns_direct(first));
+        assert!(table.owns_direct(second));
+        assert_eq!(
+            table.resolve(first, None, "test").unwrap(),
+            SqeFd::Direct(first.direct_handle().unwrap().as_fd())
+        );
+        assert_eq!(
+            table.resolve(second, None, "test").unwrap(),
+            SqeFd::Direct(second.direct_handle().unwrap().as_fd())
+        );
+
+        drop(table.release_direct(first));
+        assert!(!table.owns_direct(first));
+        assert!(table.owns_direct(second));
+        drop(table.release_direct(second));
+    }
+
+    #[test]
+    fn releasing_an_old_owner_does_not_remove_a_reused_raw_fd_owner() {
+        let mut table = table(0, FileTableExhaustion::Fallback);
+        let first_handle = owned_eventfd();
+        let first_fd = first_handle.raw().as_fd();
+        let replacement_source =
+            unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        assert!(replacement_source >= 0);
+        let first = table.adopt_direct(first_handle).unwrap();
+
+        drop(table.release_direct(first));
+        assert_eq!(
+            unsafe { libc::dup2(replacement_source, first_fd) },
+            first_fd
+        );
+        assert_eq!(unsafe { libc::close(replacement_source) }, 0);
+
+        let replacement_handle = unsafe {
+            OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_file(first_fd)))
+        };
+        let replacement = table.adopt_direct(replacement_handle).unwrap();
+        assert!(table.owns_direct(replacement));
+        assert!(table.release_direct(first).is_none());
+        assert!(table.owns_direct(replacement));
+        assert_eq!(
+            table.resolve(first, None, "test").unwrap_err().inner(),
+            &UringError::ResolveFd
+        );
+        assert_eq!(
+            table.resolve(replacement, None, "test").unwrap(),
+            SqeFd::Direct(first_fd)
+        );
+
+        drop(table.release_direct(replacement));
+    }
+
+    #[test]
+    fn fixed_owned_index_survives_take_install_and_replace() {
+        let mut table = table(1, FileTableExhaustion::Fail);
+        let owned = owned_eventfd();
+        let raw_fd = owned.raw().as_fd();
+        let index = table.claim(1).unwrap()[0];
+        table.install_entry(index, RegisteredFileEntry::OwnedHandle(owned));
+        assert_eq!(
+            table.owned_location(UringRawHandle::for_file(raw_fd)),
+            Some(super::OwnedLocation::Fixed(index))
+        );
+
+        let entry = table.take_entry(index).expect("owned entry exists");
+        assert_eq!(table.owned_location(UringRawHandle::for_file(raw_fd)), None);
+        table.install_entry(index, entry);
+        assert_eq!(
+            table.owned_location(UringRawHandle::for_file(raw_fd)),
+            Some(super::OwnedLocation::Fixed(index))
+        );
+
+        let old = table.replace_entry(
+            index,
+            RegisteredFileEntry::BorrowedFd {
+                fd: 42,
+                kind: RawHandleKind::File,
+            },
+        );
+        drop(old);
+        assert_eq!(table.owned_location(UringRawHandle::for_file(raw_fd)), None);
+        let _ = table.take_entry(index);
+        table.release(index);
     }
 
     #[test]
