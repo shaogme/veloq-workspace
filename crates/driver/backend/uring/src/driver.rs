@@ -31,8 +31,8 @@ pub(crate) use env::{CqeEnv, SqeEnv};
 pub use lifecycle::UringOpState;
 pub use registration::ProvidedBufStats;
 pub(crate) use registration::{
-    FileTable, MAX_CHUNKS, ProvidedBufGroup, RegisteredFileEntry, SqeFd, UringBufferRegistry,
-    UringRegistrationStats,
+    FileTable, MAX_CHUNKS, PROVIDED_BUF_GROUP_ID, ProvidedBufGroup, RegisteredFileEntry, SqeFd,
+    UringBufferRegistry, UringRegistrationStats,
 };
 
 /// 从 opcode 探测结果得出乐观的能力集合。
@@ -50,11 +50,10 @@ fn probe_capabilities(probe: &io_uring::Probe) -> DriverCapabilities {
 }
 
 pub struct UringDriver<'a> {
-    // Rust 按声明顺序从上到下析构字段。
-    // `ring` 必须在 `ops`（以及其它持有 buffer/slot 的字段）之前声明：
-    // 当 `UringDriver` 被 drop 时，`ring` (IoUring) 最先被析构并关闭 ring file descriptor，
-    // 内核随之取消所有在途 Operation 并释放对用户 Buffer 的引用；
-    // 之后 `ops` 才会析构并释放底层 `LocalSlot` 内存，避免内存提前释放导致的 Use-After-Free。
+    // Rust 按声明顺序从上到下析构字段。`ring` 必须在 `buffer_registry` 之前声明：
+    // Drop 函数体只尝试显式反注册；如果 syscall 失败，group 会留在 registry 中。函数体
+    // 返回后，`IoUring` 先析构并关闭 ring fd，内核随之不再持有 provided-buffer ring；
+    // 之后 registry 才释放 `FixedBuf` 和 `RingMapping`。这是失败路径的有意生命周期兜底。
     pub(crate) ring: IoUring,
     pub(crate) ops: UringOpRegistry,
     pub(crate) backlog: VecDeque<OpToken>,
@@ -193,11 +192,18 @@ impl<'a> Drop for UringDriver<'a> {
         if self.ops.has_active_ops() {
             tracing::warn!("UringDriver dropped with active in-flight operations");
         }
-        // 顺序不能反：先反注册，内核才不会再碰那段环内存和里面的 buffer；然后 `group`
-        // 落地析构，`FixedBuf` 各自回池、映射还给内核。`Drop::drop` 在任何字段析构之前
-        // 跑完，所以这里不依赖字段声明顺序。
-        self.buffer_registry
-            .release_provided_buffers(&self.ring.submitter());
+        // 正常关闭优先显式反注册。失败时 release_provided_buffers 会恢复 group 的所有权，
+        // 不在仍存活的 IoUring 前释放映射；随后依靠上面的字段声明顺序完成最终兜底。
+        if let Err(report) = self
+            .buffer_registry
+            .release_provided_buffers(&self.ring.submitter())
+        {
+            tracing::warn!(
+                bgid = PROVIDED_BUF_GROUP_ID,
+                report = ?report,
+                "failed to unregister provided buffer ring; retaining it until io_uring drops"
+            );
+        }
     }
 }
 

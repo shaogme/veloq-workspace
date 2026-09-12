@@ -1,6 +1,9 @@
 use super::{
     MAX_CHUNKS, UringRegistrationStats,
-    provided_buf::{ProvidedBufGroup, ProvidedBufStats},
+    provided_buf::{
+        ProvidedBufGroup, ProvidedBufStats, ProvidedBufUnregisterFailure,
+        ProvidedBufUnregisterResult,
+    },
 };
 use crate::{
     config::{BufferRegistrationMode, ProvidedBufConfig},
@@ -109,9 +112,57 @@ impl<'a> UringBufferRegistry<'a> {
         }
     }
 
-    pub(crate) fn release_provided_buffers(&mut self, submitter: &io_uring::Submitter<'_>) {
-        if let Some(group) = self.provided_buffers.take() {
-            group.release(submitter);
+    pub(crate) fn release_provided_buffers(
+        &mut self,
+        submitter: &io_uring::Submitter<'_>,
+    ) -> UringResult<()> {
+        self.release_provided_buffers_with(|group| group.try_unregister(submitter))
+    }
+
+    fn release_provided_buffers_with<F>(&mut self, unregister: F) -> UringResult<()>
+    where
+        F: FnOnce(ProvidedBufGroup) -> ProvidedBufUnregisterResult,
+    {
+        let Some(group) = self.provided_buffers.take() else {
+            return Ok(());
+        };
+
+        match unregister(group) {
+            Ok(()) => Ok(()),
+            Err(failure) => {
+                let ProvidedBufUnregisterFailure { report, group } = *failure;
+                // 反注册失败时，内核可能仍持有 ring 地址；必须在返回错误前把 group 放回
+                // registry，直到 `UringDriver` 的 `ring` 字段先于本 registry 析构。
+                self.provided_buffers = Some(group);
+                Err(report)
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BufferRegistrationMode, UringBufferRegistry};
+    use crate::driver::registration::provided_buf::test_group;
+    use crate::error::UringResult;
+    use veloq_buf::NoopRegistrar;
+
+    #[test]
+    fn failed_unregister_restores_group_to_registry() -> UringResult<()> {
+        static REGISTRAR: NoopRegistrar = NoopRegistrar;
+        let mut registry =
+            UringBufferRegistry::new(BufferRegistrationMode::Compatible, None, &REGISTRAR);
+        registry.provided_buffers = Some(test_group(2));
+        let original_stats = registry.provided_buf_stats().expect("test group exists");
+
+        let result = registry
+            .release_provided_buffers_with(|group| group.try_unregister_with(|_| Err(libc::EIO)));
+
+        assert!(result.is_err(), "injected unregister must fail");
+        assert_eq!(registry.provided_buf_stats(), Some(original_stats));
+
+        registry.release_provided_buffers_with(|group| group.try_unregister_with(|_| Ok(())))?;
+        assert!(registry.provided_buffers.is_none());
+        Ok(())
     }
 }

@@ -65,8 +65,9 @@ pub struct ProvidedBufStats {
 
 /// 注册给内核的那一段环内存。
 ///
-/// 单独一层是为了让 munmap 挂在 `Drop` 上：注册之后的任何一步失败都能靠它把这段映射还
-/// 回去，不必在每个 `?` 后面手写清理。
+/// 单独一层是为了让 munmap 挂在 `Drop` 上：未注册的 group 可以在任意初始化错误路径
+/// 自动释放；已注册的 group 则由 registry 保留到反注册成功，或等 `IoUring` 先销毁后
+/// 再释放。后者是故意维护的生命周期边界，不依赖 `munmap` 偶然没有被内核访问。
 struct RingMapping {
     ptr: NonNull<BufRingEntry>,
     bytes: usize,
@@ -129,6 +130,18 @@ pub(crate) struct ProvidedBufGroup {
     stats: ProvidedBufStats,
 }
 
+/// 反注册失败时的错误和所有权载体。
+///
+/// `unregister_buf_ring` 返回错误只说明这一次 syscall 没有完成，不能证明内核已经不再
+/// 使用 ring。因此失败结果必须把 group 一起交还给调用方，避免 `RingMapping` 和仍发布
+/// 给内核的 `FixedBuf` 提前析构。
+pub(crate) struct ProvidedBufUnregisterFailure {
+    pub(crate) report: Report<UringError>,
+    pub(crate) group: ProvidedBufGroup,
+}
+
+pub(crate) type ProvidedBufUnregisterResult = Result<(), Box<ProvidedBufUnregisterFailure>>;
+
 impl ProvidedBufGroup {
     /// 注册一组 provided buffer 并把它填满。
     ///
@@ -139,6 +152,18 @@ impl ProvidedBufGroup {
         config: ProvidedBufConfig,
         pool: AnyBufPool,
     ) -> UringResult<Self> {
+        Self::new_with_allocator(submitter, config, pool, |group| group.alloc_buf())
+    }
+
+    fn new_with_allocator<F>(
+        submitter: &Submitter<'_>,
+        config: ProvidedBufConfig,
+        pool: AnyBufPool,
+        allocate: F,
+    ) -> UringResult<Self>
+    where
+        F: Fn(&Self) -> Option<FixedBuf>,
+    {
         let entries = config.entries.get();
         if !entries.is_power_of_two() || entries > MAX_PROVIDED_BUF_ENTRIES {
             return UringError::InvalidInput
@@ -150,17 +175,9 @@ impl ProvidedBufGroup {
                 );
         }
 
-        let ring = RingMapping::new(entries)?;
-        // SAFETY: 这段映射活到 `unregister_buf_ring` 之后才释放——`Self::release` 保证这个
-        // 顺序，而失败路径下 `ring` 在本函数返回前就已经反注册过了。
-        unsafe {
-            submitter.register_buf_ring_with_flags(ring.addr(), entries, PROVIDED_BUF_GROUP_ID, 0)
-        }
-        .map_err(|err| UringError::Registration.io_report("uring.provided_buf.register", err))?;
-
         let mut group = Self {
             bgid: PROVIDED_BUF_GROUP_ID,
-            ring,
+            ring: RingMapping::new(entries)?,
             mask: entries - 1,
             tail: 0,
             bufs: (0..entries).map(|_| None).collect(),
@@ -170,19 +187,46 @@ impl ProvidedBufGroup {
             stats: ProvidedBufStats::default(),
         };
 
+        // 先准备用户态所有权，不写 entry，也不推进 tail。这样注册 syscall 失败时，内核
+        // 从未获得这段映射或其中 buffer 的可见引用，group 可以直接析构。
         for bid in 0..entries {
-            if !group.refill(bid) {
-                group.vacant.push(bid);
+            match allocate(&group) {
+                Some(buf) => group.bufs[bid as usize] = Some(buf),
+                None => {
+                    group.stats.refill_failed = group.stats.refill_failed.saturating_add(1);
+                    group.vacant.push(bid);
+                }
             }
         }
 
-        if group.stats.available == 0 {
-            group.unregister(submitter);
+        if !group.bufs.iter().any(|buf| buf.is_some()) {
             return UringError::Registration
                 .push_ctx("scope", "uring.provided_buf.new")
                 .with_ctx("entries", entries)
                 .with_ctx("buf_size", config.buf_size.get())
                 .attach_note("buffer pool could not fill a single provided buffer");
+        }
+
+        // SAFETY: group 保有 ring mapping。注册成功后，group 会被 registry 保留到
+        // `try_unregister` 成功，或者等字段析构时 `IoUring` 先销毁；注册失败时 group
+        // 仍未进入内核可见状态，可以安全析构。
+        unsafe {
+            submitter.register_buf_ring_with_flags(
+                group.ring.addr(),
+                entries,
+                PROVIDED_BUF_GROUP_ID,
+                0,
+            )
+        }
+        .map_err(|err| UringError::Registration.io_report("uring.provided_buf.register", err))?;
+
+        // 只有注册成功后才发布 entry。保持 entry 的 reserved 字段不变，并保留原有的
+        // tail、available 和 refilled 统计语义。
+        for bid in 0..entries {
+            if group.bufs[bid as usize].is_some() {
+                group.publish(bid);
+                group.stats.refilled = group.stats.refilled.saturating_add(1);
+            }
         }
 
         // 起始水位是「填满之后」的那个数，否则低水位线永远停在 0 而不说明任何事。
@@ -257,16 +301,35 @@ impl ProvidedBufGroup {
         self.retry_vacant();
     }
 
-    /// 反注册并释放。**顺序不能反**：内核在反注册之前仍可能往环里读写。
-    pub(crate) fn release(mut self, submitter: &Submitter<'_>) {
-        self.unregister(submitter);
-        // `self` 随即 drop：先是 `bufs`（每个 `FixedBuf` 回自己的池），然后 `RingMapping`
-        // 把那段映射还给内核。
+    /// 尝试反注册。**顺序不能反**：内核在反注册之前仍可能往环里读写。
+    ///
+    /// 成功才消费 group；失败会把 group 原样放入错误载体，调用方必须继续持有它。
+    pub(crate) fn try_unregister(self, submitter: &Submitter<'_>) -> ProvidedBufUnregisterResult {
+        self.try_unregister_with(|bgid| {
+            submitter
+                .unregister_buf_ring(bgid)
+                .map_err(|err| err.raw_os_error().unwrap_or(libc::EIO))
+        })
     }
 
-    fn unregister(&mut self, submitter: &Submitter<'_>) {
-        if let Err(err) = submitter.unregister_buf_ring(self.bgid) {
-            warn!(bgid = self.bgid, %err, "failed to unregister provided buffer ring");
+    /// 反注册的最小注入点。生产路径通过 [`Self::try_unregister`] 使用 io_uring syscall；
+    /// 测试可以传入闭包验证失败时 group 没有被消费，不需要全局可变 syscall hook。
+    pub(crate) fn try_unregister_with<F>(self, unregister: F) -> ProvidedBufUnregisterResult
+    where
+        F: FnOnce(u16) -> Result<(), i32>,
+    {
+        let bgid = self.bgid;
+        match unregister(bgid) {
+            Ok(()) => Ok(()),
+            Err(err) => Err(Box::new(ProvidedBufUnregisterFailure {
+                report: UringError::Registration
+                    .io_report(
+                        "uring.provided_buf.unregister",
+                        io::Error::from_raw_os_error(err),
+                    )
+                    .with_ctx("bgid", bgid),
+                group: self,
+            })),
         }
     }
 
@@ -359,6 +422,158 @@ impl ProvidedBufGroup {
         if self.stats.available < self.stats.available_low_water {
             self.stats.available_low_water = self.stats.available;
         }
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct TestPool;
+
+#[cfg(test)]
+impl BufPool for TestPool {
+    fn alloc(&self, cap: NonZeroUsize, len: usize) -> Option<FixedBuf> {
+        FixedBuf::alloc_heap(cap, len).ok()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_group(entries: u16) -> ProvidedBufGroup {
+    let mut group = ProvidedBufGroup {
+        bgid: PROVIDED_BUF_GROUP_ID,
+        ring: RingMapping::new(entries).expect("test ring mapping must be created"),
+        mask: entries - 1,
+        tail: 0,
+        bufs: (0..entries).map(|_| None).collect(),
+        vacant: Vec::new(),
+        buf_size: NonZeroUsize::new(64).expect("test buffer size is non-zero"),
+        pool: AnyBufPool::new(TestPool),
+        stats: ProvidedBufStats::default(),
+    };
+    for bid in 0..entries {
+        group.bufs[bid as usize] = group.alloc_buf();
+    }
+    group.stats.available = entries;
+    group.stats.available_low_water = entries;
+    group.stats.refilled = entries as u64;
+    group
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AnyBufPool, PROVIDED_BUF_GROUP_ID, ProvidedBufConfig, ProvidedBufGroup, TestPool,
+        test_group,
+    };
+    use veloq_std::num::{NonZeroU16, NonZeroUsize};
+
+    #[test]
+    fn failed_unregister_returns_the_group_and_keeps_resources_alive() {
+        let group = test_group(2);
+        let original_stats = group.stats;
+        let original_ptr = group.bufs[0]
+            .as_ref()
+            .expect("test group has an initial buffer")
+            .as_ptr();
+
+        let failure = match group.try_unregister_with(|bgid| {
+            assert_eq!(bgid, PROVIDED_BUF_GROUP_ID);
+            Err(libc::EIO)
+        }) {
+            Ok(()) => panic!("injected unregister must fail"),
+            Err(failure) => failure,
+        };
+        assert_eq!(
+            failure
+                .report
+                .error_code()
+                .and_then(|code| i32::try_from(code).ok()),
+            Some(libc::EIO)
+        );
+
+        let mut group = failure.group;
+        let entry = unsafe { &mut *group.ring.ptr.as_ptr() };
+        entry.set_addr(original_ptr as u64);
+        entry.set_len(64);
+        entry.set_bid(0);
+        group.bufs[0]
+            .as_mut()
+            .expect("failed unregister must retain the buffer")
+            .spare_capacity_mut()[0] = 0xA5;
+
+        assert_eq!(group.stats, original_stats);
+        assert_eq!(group.bufs[0].as_ref().unwrap().as_ptr(), original_ptr);
+        assert_eq!(group.bufs[0].as_ref().unwrap().as_slice()[0], 0xA5);
+
+        match group.try_unregister_with(|_| Ok(())) {
+            Ok(()) => {}
+            Err(_) => panic!("test group is unregistered and can be dropped"),
+        }
+    }
+
+    #[test]
+    fn allocation_failure_happens_before_registration() {
+        let ring = match io_uring::IoUring::new(8) {
+            Ok(ring) => ring,
+            Err(_) => return,
+        };
+        let submitter = ring.submitter();
+        let config = ProvidedBufConfig {
+            entries: NonZeroU16::new(2).expect("test entries are non-zero"),
+            buf_size: NonZeroUsize::new(64).expect("test buffer size is non-zero"),
+        };
+
+        let result = ProvidedBufGroup::new_with_allocator(
+            &submitter,
+            config,
+            AnyBufPool::new(TestPool),
+            |_| None,
+        );
+
+        assert!(
+            result.is_err(),
+            "an allocator that always fails must reject the group"
+        );
+        drop(submitter);
+        drop(ring);
+    }
+
+    #[test]
+    fn registered_group_can_be_cleaned_after_an_injected_failure() {
+        let ring = match io_uring::IoUring::new(8) {
+            Ok(ring) => ring,
+            Err(_) => return,
+        };
+        let submitter = ring.submitter();
+        let group = test_group(2);
+
+        // SAFETY: the group owns a zeroed, page-aligned mapping with two entries and keeps it
+        // alive until the real successful unregister below.
+        if unsafe {
+            submitter.register_buf_ring_with_flags(group.ring.addr(), 2, PROVIDED_BUF_GROUP_ID, 0)
+        }
+        .is_err()
+        {
+            return;
+        }
+
+        let failure = match group.try_unregister_with(|_| Err(libc::EIO)) {
+            Ok(()) => panic!("injected unregister must fail"),
+            Err(failure) => failure,
+        };
+        let mut group = failure.group;
+        let entry = unsafe { &mut *group.ring.ptr.as_ptr() };
+        entry.set_bid(0);
+        group.bufs[0]
+            .as_mut()
+            .expect("registered group retains its buffer")
+            .spare_capacity_mut()[0] = 0x5A;
+
+        match group.try_unregister(&submitter) {
+            Ok(()) => {}
+            Err(_) => panic!("a registered test ring must unregister successfully"),
+        }
+        drop(submitter);
+        drop(ring);
     }
 }
 

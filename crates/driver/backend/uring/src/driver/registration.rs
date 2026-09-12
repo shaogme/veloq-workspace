@@ -14,8 +14,8 @@ pub(crate) mod provided_buf;
 
 pub(crate) use buffer::UringBufferRegistry;
 pub(crate) use file_table::{FileTable, RegisteredFileEntry, SqeFd};
-pub(crate) use provided_buf::ProvidedBufGroup;
 pub use provided_buf::ProvidedBufStats;
+pub(crate) use provided_buf::{PROVIDED_BUF_GROUP_ID, ProvidedBufGroup};
 
 pub(crate) const MAX_CHUNKS: usize = 1024;
 pub(crate) const REGISTER_FAILURE_RETRY_COOLDOWN: Duration = Duration::from_millis(250);
