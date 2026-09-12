@@ -14,6 +14,9 @@ use veloq_driver_core::driver::{
     CompletionRecord, CompletionValue, DriveMode, Driver, DriverSubmitResult, PollRecordResult,
     RegisterFd, SubmitStatus,
 };
+
+#[cfg(feature = "test-hooks")]
+use veloq_driver_core::driver::test_hooks::{DriverTestHooks, RegisterFilesUpdateOutcome};
 use veloq_driver_core::op::{
     IntoPlatformOp,
     types::{Close as CoreClose, Fsync as CoreFsync},
@@ -114,7 +117,11 @@ fn stale_registered_fd_generation_rejected_on_submit() {
 }
 
 /// Submits an `Fsync` on `fd` and asserts it is rejected before going in flight.
-fn assert_stale_fsync_is_rejected(driver: &mut UringDriver<'static>, fd: IoFd) {
+fn assert_fsync_is_rejected_with(
+    driver: &mut UringDriver<'static>,
+    fd: IoFd,
+    expected_error: UringError,
+) {
     let op = Fsync {
         fd,
         datasync: false,
@@ -130,7 +137,7 @@ fn assert_stale_fsync_is_rejected(driver: &mut UringDriver<'static>, fd: IoFd) {
             report,
             status: SubmitStatus::Void,
         } => {
-            assert_eq!(*report.inner(), UringError::ResolveFd);
+            assert_eq!(*report.inner(), expected_error);
         }
         DriverSubmitResult::Failed { status, .. } => {
             panic!("stale fd submit should fail before in-flight state, got {status:?}")
@@ -143,6 +150,10 @@ fn assert_stale_fsync_is_rejected(driver: &mut UringDriver<'static>, fd: IoFd) {
         matches!(recovered, Some(UringUserPayload::Fsync(_))),
         "payload should be recoverable after void failure"
     );
+}
+
+fn assert_stale_fsync_is_rejected(driver: &mut UringDriver<'static>, fd: IoFd) {
+    assert_fsync_is_rejected_with(driver, fd, UringError::ResolveFd);
 }
 
 #[test]
@@ -188,6 +199,241 @@ fn failed_batch_registration_rolls_back_successful_prefix() {
     assert_eq!(fds.len(), files.len());
 
     driver.unregister_files(fds).unwrap();
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn batch_rollback_failure_poisoned_file_table_is_fail_stop() {
+    let Some(mut driver) = new_driver_with_file_table_or_skip(2, FileTableExhaustion::Fallback)
+    else {
+        return;
+    };
+
+    let file = File::open("Cargo.toml").unwrap();
+    let raw = raw_file(&file);
+    {
+        let hooks = &mut driver as &mut dyn DriverTestHooks;
+        hooks.debug_inject_register_files_update_sequence(&[
+            RegisterFilesUpdateOutcome::Error(libc::EIO),
+            RegisterFilesUpdateOutcome::Error(libc::EIO),
+            RegisterFilesUpdateOutcome::Actual,
+        ]);
+    }
+
+    let report = driver
+        .register_files(vec![RegisterFd::Borrowed(raw.borrow())])
+        .expect_err("rollback failure must poison the file table");
+    assert_eq!(*report.inner(), UringError::FileTablePoisoned);
+    assert!(format!("{report:?}").contains("recreate"));
+    {
+        let hooks = &driver as &dyn DriverTestHooks;
+        assert!(hooks.debug_file_table_poisoned());
+        assert_eq!(hooks.debug_register_files_update_outcomes_pending(), 1);
+    }
+
+    let replacement = File::open("Cargo.toml").unwrap();
+    let replacement_raw = raw_file(&replacement);
+    let second = driver
+        .register_files(vec![RegisterFd::Borrowed(replacement_raw.borrow())])
+        .expect_err("fallback must not hide a poisoned table");
+    assert_eq!(*second.inner(), UringError::FileTablePoisoned);
+    assert_eq!(
+        (&driver as &dyn DriverTestHooks).debug_register_files_update_outcomes_pending(),
+        1
+    );
+
+    let snapshot = driver.completion_diagnostics_snapshot();
+    assert_eq!(snapshot.backend.file_table_rollback_failures, 1);
+    assert_eq!(snapshot.backend.file_table_poisonings, 1);
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn short_registration_then_rollback_failure_uses_the_same_terminal_error() {
+    let Some(mut driver) = new_driver_with_file_table_or_skip(3, FileTableExhaustion::Fail) else {
+        return;
+    };
+
+    let files = open_cargo_files::<2>();
+    let raw_files = files.iter().map(raw_file).collect::<Vec<_>>();
+    let registrations = raw_files
+        .iter()
+        .map(|raw| RegisterFd::Borrowed(raw.borrow()))
+        .collect::<Vec<_>>();
+    {
+        let hooks = &mut driver as &mut dyn DriverTestHooks;
+        hooks.debug_inject_register_files_update_sequence(&[
+            RegisterFilesUpdateOutcome::Updated(1),
+            RegisterFilesUpdateOutcome::Error(libc::EIO),
+        ]);
+    }
+
+    let report = driver
+        .register_files(registrations)
+        .expect_err("short update followed by rollback failure must poison");
+    assert_eq!(*report.inner(), UringError::FileTablePoisoned);
+    assert!(report.context().contains_key("start_index"));
+    assert!(report.context().contains_key("requested_files"));
+    assert!(report.context().contains_key("updated_files"));
+    assert!((&driver as &dyn DriverTestHooks).debug_file_table_poisoned());
+
+    let snapshot = driver.completion_diagnostics_snapshot();
+    assert_eq!(snapshot.backend.file_table_rollback_failures, 1);
+    assert_eq!(snapshot.backend.file_table_poisonings, 1);
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn successful_batch_rollback_keeps_the_file_table_healthy() {
+    let Some(mut driver) = new_driver_with_file_table_or_skip(2, FileTableExhaustion::Fail) else {
+        return;
+    };
+
+    let failed = File::open("Cargo.toml").unwrap();
+    let failed_raw = raw_file(&failed);
+    {
+        let hooks = &mut driver as &mut dyn DriverTestHooks;
+        hooks.debug_inject_register_files_update_sequence(&[
+            RegisterFilesUpdateOutcome::Error(libc::EIO),
+            RegisterFilesUpdateOutcome::Actual,
+        ]);
+    }
+    let report = driver
+        .register_files(vec![RegisterFd::Borrowed(failed_raw.borrow())])
+        .expect_err("the injected initial registration must fail");
+    assert_eq!(*report.inner(), UringError::Registration);
+    assert!(!(&driver as &dyn DriverTestHooks).debug_file_table_poisoned());
+
+    let healthy = File::open("Cargo.toml").unwrap();
+    let healthy_raw = raw_file(&healthy);
+    let fd = driver
+        .register_files(vec![RegisterFd::Borrowed(healthy_raw.borrow())])
+        .expect("a successful rollback must return the slot");
+    driver.unregister_files(fd).unwrap();
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn failed_registered_unregister_poison_keeps_owned_entry_until_driver_drop() {
+    let Some(mut driver) = new_driver_with_file_table_or_skip(2, FileTableExhaustion::Fail) else {
+        return;
+    };
+
+    let file = File::open("Cargo.toml").unwrap();
+    let raw_fd = file.as_raw_fd();
+    mem::forget(file);
+    let owned =
+        unsafe { OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_file(raw_fd))) };
+    let fd = driver
+        .register_files(vec![RegisterFd::Owned(owned)])
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+
+    {
+        let hooks = &mut driver as &mut dyn DriverTestHooks;
+        hooks.debug_inject_register_files_update_failure(libc::EIO);
+    }
+    let report = driver
+        .unregister_files(vec![fd])
+        .expect_err("an uncertain unregister update must poison the table");
+    assert_eq!(*report.inner(), UringError::FileTablePoisoned);
+    assert!((&driver as &dyn DriverTestHooks).debug_file_table_poisoned());
+    assert_eq!(
+        driver
+            .completion_diagnostics_snapshot()
+            .backend
+            .file_table_poisonings,
+        1
+    );
+    assert!(
+        unsafe { libc::fcntl(raw_fd, libc::F_GETFD) } >= 0,
+        "owned entry must remain live while the poisoned driver exists"
+    );
+
+    drop(driver);
+    assert_eq!(
+        unsafe { libc::fcntl(raw_fd, libc::F_GETFD) },
+        -1,
+        "owned entry must be released after the ring is dropped"
+    );
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn poisoned_file_table_rejects_old_registered_sqes_before_kernel_submission() {
+    let Some(mut driver) = new_driver_with_file_table_or_skip(3, FileTableExhaustion::Fail) else {
+        return;
+    };
+
+    let valid = File::open("Cargo.toml").unwrap();
+    let valid_fd = driver
+        .register_files(vec![RegisterFd::Borrowed(raw_file(&valid).borrow())])
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let failed = File::open("Cargo.toml").unwrap();
+    let failed_raw = raw_file(&failed);
+    {
+        let hooks = &mut driver as &mut dyn DriverTestHooks;
+        hooks.debug_inject_register_files_update_sequence(&[
+            RegisterFilesUpdateOutcome::Error(libc::EIO),
+            RegisterFilesUpdateOutcome::Error(libc::EIO),
+        ]);
+    }
+    driver
+        .register_files(vec![RegisterFd::Borrowed(failed_raw.borrow())])
+        .expect_err("injected rollback failure must poison the table");
+
+    assert_fsync_is_rejected_with(&mut driver, valid_fd, UringError::FileTablePoisoned);
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_close_already_in_flight_forgets_owned_entry_after_poison() {
+    let Some(mut driver) = new_driver_with_file_table_or_skip(3, FileTableExhaustion::Fail) else {
+        return;
+    };
+
+    let file = File::open("Cargo.toml").unwrap();
+    let raw_fd = file.as_raw_fd();
+    mem::forget(file);
+    let owned =
+        unsafe { OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_file(raw_fd))) };
+    let fd = driver
+        .register_files(vec![RegisterFd::Owned(owned)])
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let close_token = submit_test_op(&mut driver, Close { fd });
+
+    let failed = File::open("Cargo.toml").unwrap();
+    let failed_raw = raw_file(&failed);
+    {
+        let hooks = &mut driver as &mut dyn DriverTestHooks;
+        hooks.debug_inject_register_files_update_sequence(&[
+            RegisterFilesUpdateOutcome::Error(libc::EIO),
+            RegisterFilesUpdateOutcome::Error(libc::EIO),
+        ]);
+    }
+    driver
+        .register_files(vec![RegisterFd::Borrowed(failed_raw.borrow())])
+        .expect_err("the table must be poisoned while Close is in flight");
+
+    let (closed, drive_error) =
+        wait_completion_with_driver_error(&mut driver, close_token, Duration::from_secs(5));
+    assert_eq!(closed, 0);
+    assert_eq!(drive_error, Some(UringError::FileTablePoisoned));
+
+    let reopened = File::open("Cargo.toml").unwrap();
+    drop(driver);
+    reopened
+        .metadata()
+        .expect("forgotten owned entry must not close a reused fd");
 }
 
 #[test]
@@ -256,6 +502,47 @@ fn wait_completion(
     }
 }
 
+#[cfg(feature = "test-hooks")]
+fn wait_completion_with_driver_error(
+    driver: &mut UringDriver<'static>,
+    token: veloq_driver_core::driver::OpToken,
+    timeout: Duration,
+) -> (usize, Option<UringError>) {
+    let start = Instant::now();
+    loop {
+        if start.elapsed() > timeout {
+            panic!("wait_completion timed out");
+        }
+        let drive_error = driver
+            .drive(DriveMode::Poll)
+            .err()
+            .map(|report| *report.inner());
+        let table = driver.completion_table();
+        match table.try_take_record(token).unwrap() {
+            PollRecordResult::Ready(record) => {
+                let CompletionRecord {
+                    event,
+                    payload: _,
+                    mut detail,
+                    mut cleanup,
+                    continuation: _,
+                } = record;
+                cleanup.disarm();
+                let result = detail
+                    .take()
+                    .unwrap_or_else(|| usize::from_event_res::<UringError>(event.res()))
+                    .expect("completion reported error");
+                return (result, drive_error);
+            }
+            PollRecordResult::Unavailable { kind, .. } => {
+                panic!("completion record unavailable: {kind:?}");
+            }
+            PollRecordResult::Pending => {}
+        }
+        let _ = thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn submit_test_op<T>(
     driver: &mut UringDriver<'static>,
     data: T,
@@ -312,6 +599,153 @@ fn close_owned_registered_file() {
     assert_stale_fsync_is_rejected(&mut driver, stale_fd);
 
     driver.unregister_files(vec![fsync_fd]).unwrap();
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn close_cleanup_error_quarantines_registered_owned_slot() {
+    let Some(mut driver) = new_driver_with_file_table_or_skip(2, FileTableExhaustion::Fail) else {
+        return;
+    };
+
+    let file = File::open("Cargo.toml").unwrap();
+    let raw_fd = file.as_raw_fd();
+    mem::forget(file);
+    let owned =
+        unsafe { OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_file(raw_fd))) };
+    let fd = driver
+        .register_files(vec![RegisterFd::Owned(owned)])
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let hooks = &mut driver as &mut dyn DriverTestHooks;
+    hooks.debug_inject_register_files_update_failure(libc::EIO);
+    let token = submit_test_op(&mut driver, Close { fd });
+    let (closed, cleanup_error) =
+        wait_completion_with_driver_error(&mut driver, token, Duration::from_secs(5));
+
+    assert_eq!(closed, 0);
+    assert_eq!(cleanup_error, Some(UringError::FileTableQuarantined));
+    assert_stale_fsync_is_rejected(&mut driver, fd);
+
+    let replacement = File::open("Cargo.toml").unwrap();
+    let replacement_raw = raw_file(&replacement);
+    let report = driver
+        .register_files(vec![RegisterFd::Borrowed(replacement_raw.borrow())])
+        .expect_err("waker plus quarantined slot must exhaust fixed capacity");
+    assert_eq!(*report.inner(), UringError::InvalidState);
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn close_cleanup_short_update_quarantines_without_releasing_slot() {
+    let Some(mut driver) = new_driver_with_file_table_or_skip(2, FileTableExhaustion::Fail) else {
+        return;
+    };
+
+    let file = File::open("Cargo.toml").unwrap();
+    let raw_fd = file.as_raw_fd();
+    mem::forget(file);
+    let owned =
+        unsafe { OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_file(raw_fd))) };
+    let fd = driver
+        .register_files(vec![RegisterFd::Owned(owned)])
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let hooks = &mut driver as &mut dyn DriverTestHooks;
+    hooks.debug_inject_register_files_update_sequence(&[RegisterFilesUpdateOutcome::Updated(0)]);
+    let token = submit_test_op(&mut driver, Close { fd });
+    let (closed, cleanup_error) =
+        wait_completion_with_driver_error(&mut driver, token, Duration::from_secs(5));
+
+    assert_eq!(closed, 0);
+    assert_eq!(cleanup_error, Some(UringError::FileTableQuarantined));
+    assert_stale_fsync_is_rejected(&mut driver, fd);
+    let snapshot = driver.completion_diagnostics_snapshot();
+    assert_eq!(snapshot.backend.file_table_cleanup_failures, 1);
+    assert_eq!(snapshot.backend.file_table_cleanup_short_updates, 1);
+    assert_eq!(snapshot.backend.file_table_quarantines, 1);
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn quarantined_slot_uses_direct_fallback_when_fixed_capacity_is_degraded() {
+    let Some(mut driver) = new_driver_with_file_table_or_skip(2, FileTableExhaustion::Fallback)
+    else {
+        return;
+    };
+
+    let file = File::open("Cargo.toml").unwrap();
+    let raw_fd = file.as_raw_fd();
+    mem::forget(file);
+    let owned =
+        unsafe { OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_file(raw_fd))) };
+    let fd = driver
+        .register_files(vec![RegisterFd::Owned(owned)])
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let hooks = &mut driver as &mut dyn DriverTestHooks;
+    hooks.debug_inject_register_files_update_failure(libc::EIO);
+    let token = submit_test_op(&mut driver, Close { fd });
+    let (closed, cleanup_error) =
+        wait_completion_with_driver_error(&mut driver, token, Duration::from_secs(5));
+    assert_eq!(closed, 0);
+    assert_eq!(cleanup_error, Some(UringError::FileTableQuarantined));
+
+    let replacement = File::open("Cargo.toml").unwrap();
+    let replacement_raw = raw_file(&replacement);
+    let fallback = driver
+        .register_files(vec![RegisterFd::Borrowed(replacement_raw.borrow())])
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert!(fallback.is_direct());
+    driver.unregister_files(vec![fallback]).unwrap();
+}
+
+#[cfg(feature = "test-hooks")]
+#[test]
+fn close_cleanup_failure_does_not_close_reused_raw_fd_on_driver_drop() {
+    let Some(mut driver) = new_driver_with_file_table_or_skip(2, FileTableExhaustion::Fail) else {
+        return;
+    };
+
+    let file = File::open("Cargo.toml").unwrap();
+    let raw_fd = file.as_raw_fd();
+    mem::forget(file);
+    let owned =
+        unsafe { OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_file(raw_fd))) };
+    let fd = driver
+        .register_files(vec![RegisterFd::Owned(owned)])
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let hooks = &mut driver as &mut dyn DriverTestHooks;
+    hooks.debug_inject_register_files_update_failure(libc::EIO);
+    let token = submit_test_op(&mut driver, Close { fd });
+    let (closed, cleanup_error) =
+        wait_completion_with_driver_error(&mut driver, token, Duration::from_secs(5));
+    assert_eq!(closed, 0);
+    assert_eq!(cleanup_error, Some(UringError::FileTableQuarantined));
+
+    let replacement = File::open("Cargo.toml").unwrap();
+    let duplicate = unsafe { libc::dup2(replacement.as_raw_fd(), raw_fd) };
+    assert_eq!(duplicate, raw_fd);
+    drop(driver);
+    replacement
+        .metadata()
+        .expect("driver drop must not close a reused raw fd");
 }
 
 /// Registers one file past the kernel table and returns its direct descriptor.

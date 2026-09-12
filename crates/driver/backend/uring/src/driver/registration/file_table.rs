@@ -61,10 +61,33 @@ impl RegisteredFileEntry {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileSlotState {
+    Vacant,
+    Occupied,
+    Quarantined,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileTablePoisonContext {
+    pub(crate) scope: &'static str,
+    pub(crate) failed_index: Option<u32>,
+    pub(crate) start_index: u32,
+    pub(crate) requested_files: usize,
+    pub(crate) updated_files: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileTableHealth {
+    Healthy,
+    Poisoned(FileTablePoisonContext),
+}
+
 #[derive(Debug)]
 struct FileSlot {
     entry: Option<RegisteredFileEntry>,
     generation: u64,
+    state: FileSlotState,
 }
 
 impl FileSlot {
@@ -73,6 +96,7 @@ impl FileSlot {
         Self {
             entry: None,
             generation: INITIAL_FILE_GENERATION,
+            state: FileSlotState::Vacant,
         }
     }
 }
@@ -90,6 +114,7 @@ pub(crate) struct FileTable {
     exhaustion: FileTableExhaustion,
     initialized: bool,
     fallback_reported: bool,
+    health: FileTableHealth,
 }
 
 impl FileTable {
@@ -102,6 +127,7 @@ impl FileTable {
             exhaustion,
             initialized: false,
             fallback_reported: false,
+            health: FileTableHealth::Healthy,
         }
     }
 
@@ -113,6 +139,63 @@ impl FileTable {
     #[inline]
     pub(crate) const fn fixed_capacity(&self) -> usize {
         self.fixed_capacity
+    }
+
+    #[inline]
+    pub(crate) const fn is_poisoned(&self) -> bool {
+        matches!(self.health, FileTableHealth::Poisoned(_))
+    }
+
+    /// Permanently marks the registered-file table as unusable.
+    ///
+    /// Existing entries are deliberately retained. The ring must be destroyed before those
+    /// entries are dropped, because the kernel may still refer to an unknown table value.
+    pub(crate) fn poison(&mut self, context: FileTablePoisonContext) -> bool {
+        if self.is_poisoned() {
+            return false;
+        }
+        self.free_fixed.clear();
+        self.health = FileTableHealth::Poisoned(context);
+        true
+    }
+
+    #[inline]
+    pub(crate) fn poison_context(&self) -> Option<FileTablePoisonContext> {
+        match self.health {
+            FileTableHealth::Healthy => None,
+            FileTableHealth::Poisoned(context) => Some(context),
+        }
+    }
+
+    pub(crate) fn poisoned_report(
+        &self,
+        scope: &'static str,
+        fd: Option<IoFd>,
+    ) -> Report<UringError> {
+        let Some(context) = self.poison_context() else {
+            return UringError::InvalidState.report(
+                scope,
+                "file table poison report requested while table is healthy",
+            );
+        };
+
+        let mut report = UringError::FileTablePoisoned
+            .to_report()
+            .push_ctx("scope", scope)
+            .with_ctx("poison_scope", context.scope)
+            .with_ctx("start_index", context.start_index)
+            .with_ctx("requested_files", context.requested_files)
+            .attach_note("registered file table is unrecoverable; recreate the io_uring driver");
+        if let Some(index) = context.failed_index {
+            report = report.with_ctx("file_index", index);
+        }
+        if let Some(updated_files) = context.updated_files {
+            report = report.with_ctx("updated_files", updated_files);
+        }
+        if let Some(fd) = fd {
+            report = report.with_ctx("fd", fd.to_string());
+        }
+        report
     }
 
     /// Seeds the userspace mirror once the kernel table exists.
@@ -177,6 +260,10 @@ impl FileTable {
             IoFd::Registered { index, generation } => (index, generation),
         };
 
+        if self.is_poisoned() {
+            return Err(self.poisoned_report(scope, Some(fd)));
+        }
+
         let Some(slot) = self.slots.get(index as usize) else {
             return UringError::ResolveFd
                 .push_ctx("scope", scope)
@@ -190,6 +277,15 @@ impl FileTable {
                 .with_ctx("fd", fd.to_string())
                 .attach_note("stale registered file descriptor generation")
                 .with_ctx("current_generation", slot.generation);
+        }
+
+        if self.is_quarantined(index) {
+            return UringError::FileTableQuarantined
+                .push_ctx("scope", scope)
+                .with_ctx("fd", fd.to_string())
+                .with_ctx("file_index", index)
+                .with_ctx("generation", generation)
+                .attach_note("registered file slot is quarantined and requires driver rebuild");
         }
 
         let Some(entry) = slot.entry.as_ref() else {
@@ -239,6 +335,10 @@ impl FileTable {
             IoFd::Registered { index, generation } => (index, generation),
         };
 
+        if self.is_poisoned() {
+            return Err(self.poisoned_report(scope, Some(fd)));
+        }
+
         let Some(slot) = self.slots.get(index as usize) else {
             return UringError::ResolveFd
                 .push_ctx("scope", scope)
@@ -252,6 +352,15 @@ impl FileTable {
                 .with_ctx("fd", fd.to_string())
                 .attach_note("stale registered file descriptor generation")
                 .with_ctx("current_generation", slot.generation);
+        }
+
+        if self.is_quarantined(index) {
+            return UringError::FileTableQuarantined
+                .push_ctx("scope", scope)
+                .with_ctx("fd", fd.to_string())
+                .with_ctx("file_index", index)
+                .with_ctx("generation", generation)
+                .attach_note("registered file slot is quarantined and requires driver rebuild");
         }
 
         let Some(entry) = slot.entry.as_ref() else {
@@ -285,6 +394,10 @@ impl FileTable {
     /// With [`FileTableExhaustion::Fail`] a short claim is an error instead, and nothing is
     /// consumed.
     pub(crate) fn claim(&mut self, count: usize) -> UringResult<Vec<u32>> {
+        if self.is_poisoned() {
+            return Err(self.poisoned_report("driver.file_table.claim", None));
+        }
+
         let from_kernel_table = count.min(self.free_fixed.len());
         let overflow = count - from_kernel_table;
 
@@ -304,6 +417,13 @@ impl FileTable {
                     .pop()
                     .expect("claim takes at most free_fixed.len() entries"),
             );
+            let index = *fixed.last().expect("just-claimed slot exists");
+            debug_assert_eq!(
+                self.slots[index as usize].state,
+                FileSlotState::Vacant,
+                "free list contained a non-vacant file slot"
+            );
+            self.slots[index as usize].state = FileSlotState::Occupied;
         }
         // The free list is seeded in reverse, so a fresh table hands out consecutive indices;
         // sorting keeps that property visible to the batching in `register_files_internal`.
@@ -355,6 +475,15 @@ impl FileTable {
     /// Stores the handle backing `index`. The slot must have been claimed first.
     #[inline]
     pub(crate) fn install_entry(&mut self, index: u32, entry: RegisteredFileEntry) {
+        debug_assert_eq!(
+            self.slots[index as usize].state,
+            FileSlotState::Occupied,
+            "installed an entry into an unclaimed file slot"
+        );
+        debug_assert!(
+            self.slots[index as usize].entry.is_none(),
+            "installed an entry into an occupied file slot"
+        );
         self.slots[index as usize].entry = Some(entry);
     }
 
@@ -365,10 +494,19 @@ impl FileTable {
 
     /// Returns `index` to the free list. The entry must already be gone.
     pub(crate) fn release(&mut self, index: u32) {
+        if self.is_poisoned() {
+            return;
+        }
         debug_assert!(
             self.entry(index).is_none(),
             "released a file slot that still owns a handle"
         );
+        debug_assert_eq!(
+            self.slots[index as usize].state,
+            FileSlotState::Occupied,
+            "released a file slot that was not claimed"
+        );
+        self.slots[index as usize].state = FileSlotState::Vacant;
         self.free_fixed.push(index);
     }
 
@@ -376,6 +514,32 @@ impl FileTable {
         for index in indices {
             self.release(index);
         }
+    }
+
+    /// Permanently removes a slot from the reusable fixed-file set.
+    ///
+    /// The caller must have taken the entry first. A quarantined slot deliberately remains out
+    /// of `free_fixed` until the driver is destroyed, because the kernel may still contain an
+    /// unknown value after a failed cleanup update.
+    pub(crate) fn quarantine(&mut self, index: u32) {
+        let slot = &mut self.slots[index as usize];
+        debug_assert!(
+            slot.entry.is_none(),
+            "quarantined a file slot with an entry"
+        );
+        debug_assert_eq!(
+            slot.state,
+            FileSlotState::Occupied,
+            "quarantined a file slot that was not claimed"
+        );
+        slot.state = FileSlotState::Quarantined;
+    }
+
+    #[inline]
+    pub(crate) fn is_quarantined(&self, index: u32) -> bool {
+        self.slots
+            .get(index as usize)
+            .is_some_and(|slot| slot.state == FileSlotState::Quarantined)
     }
 
     /// Invalidates every [`IoFd`] previously handed out for `index`.
@@ -392,14 +556,20 @@ impl FileTable {
     /// The descriptor for `index`, valid until the slot is released.
     #[inline]
     pub(crate) fn descriptor(&self, index: u32) -> Option<IoFd> {
-        Some(IoFd::fixed_with_generation(index, self.generation(index)?))
+        if self.is_poisoned() {
+            return None;
+        }
+        let slot = self.slots.get(index as usize)?;
+        (slot.state == FileSlotState::Occupied && slot.entry.is_some())
+            .then(|| IoFd::fixed_with_generation(index, slot.generation))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{FileTable, RegisteredFileEntry, SqeFd};
+    use super::{FileTable, FileTablePoisonContext, RegisteredFileEntry, SqeFd};
     use crate::config::{FileTableExhaustion, IoFd, RawHandleKind, UringRawHandle};
+    use crate::error::UringError;
     use veloq_std::vec::Vec;
 
     fn borrowed(fd: i32) -> RegisteredFileEntry {
@@ -565,5 +735,135 @@ mod tests {
                 .resolve(fds[0], Some(RawHandleKind::File), "test")
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn quarantined_slot_is_not_described_or_reused() {
+        let mut table = table(2, FileTableExhaustion::Fail);
+        let fds = register(&mut table, &[10]);
+        let old = fds[0];
+        let index = old.fixed_index().expect("registered descriptor");
+
+        table.take_entry(index);
+        table.quarantine(index);
+        table.advance_generation(index);
+
+        assert!(table.is_quarantined(index));
+        assert!(table.descriptor(index).is_none());
+        assert!(matches!(
+            table.resolve(old, None, "test"),
+            Err(report) if *report.inner() == UringError::ResolveFd
+        ));
+
+        let current = IoFd::fixed_with_generation(index, table.generation(index).unwrap());
+        assert!(matches!(
+            table.resolve(current, None, "test"),
+            Err(report) if *report.inner() == UringError::FileTableQuarantined
+        ));
+
+        let other = register(&mut table, &[11]);
+        assert_eq!(other[0].fixed_index(), Some(1));
+        assert!(table.claim(1).is_err());
+    }
+
+    #[test]
+    fn poisoned_table_rejects_registered_access_without_dropping_entries() {
+        let mut table = table(2, FileTableExhaustion::Fallback);
+        let fds = register(&mut table, &[10]);
+        let index = fds[0].fixed_index().expect("registered descriptor");
+        let context = FileTablePoisonContext {
+            scope: "test.poison",
+            failed_index: Some(index),
+            start_index: index,
+            requested_files: 2,
+            updated_files: Some(1),
+        };
+
+        assert_eq!(table.free_fixed.len(), 1);
+        assert!(table.poison(context));
+        assert!(table.free_fixed.is_empty());
+        assert!(table.entry(index).is_some());
+        assert!(table.descriptor(index).is_none());
+        assert!(matches!(
+            table.resolve(fds[0], None, "test.resolve"),
+            Err(report) if *report.inner() == UringError::FileTablePoisoned
+        ));
+        assert!(table.claim(1).is_err());
+    }
+
+    #[test]
+    fn poisoned_table_keeps_direct_descriptors_on_the_raw_fd_path() {
+        let mut table = table(2, FileTableExhaustion::Fallback);
+        let fds = register(&mut table, &[10, 11, 12]);
+        let index = fds[0].fixed_index().expect("registered descriptor");
+        let direct = fds[2];
+
+        assert!(table.poison(FileTablePoisonContext {
+            scope: "test.poison",
+            failed_index: Some(index),
+            start_index: index,
+            requested_files: 1,
+            updated_files: None,
+        }));
+
+        assert_eq!(
+            table.resolve(direct, None, "test.direct").unwrap(),
+            SqeFd::Direct(12)
+        );
+        assert_eq!(
+            table.resolve_direct(direct, None, "test.direct").unwrap(),
+            SqeFd::Direct(12)
+        );
+        assert!(matches!(
+            table.resolve_direct(fds[1], None, "test.registered"),
+            Err(report) if *report.inner() == UringError::FileTablePoisoned
+        ));
+    }
+
+    #[test]
+    fn poisoning_is_idempotent_and_cannot_be_recovered() {
+        let mut table = table(1, FileTableExhaustion::Fallback);
+        let first = FileTablePoisonContext {
+            scope: "test.first",
+            failed_index: Some(0),
+            start_index: 0,
+            requested_files: 1,
+            updated_files: None,
+        };
+        let second = FileTablePoisonContext {
+            scope: "test.second",
+            failed_index: Some(1),
+            start_index: 1,
+            requested_files: 2,
+            updated_files: Some(1),
+        };
+
+        assert!(table.poison(first));
+        assert!(!table.poison(second));
+        assert_eq!(table.poison_context(), Some(first));
+        assert!(table.is_poisoned());
+        assert!(table.claim(0).is_err());
+    }
+
+    #[test]
+    fn a_non_quarantined_slot_remains_reusable() {
+        let mut table = table(3, FileTableExhaustion::Fail);
+        let first = register(&mut table, &[10]);
+        let quarantined = first[0].fixed_index().expect("registered descriptor");
+        table.take_entry(quarantined);
+        table.quarantine(quarantined);
+        table.advance_generation(quarantined);
+
+        let second = register(&mut table, &[11]);
+        let second_index = second[0].fixed_index().expect("registered descriptor");
+        assert_ne!(second_index, quarantined);
+
+        table.take_entry(second_index);
+        table.release(second_index);
+        table.advance_generation(second_index);
+
+        let third = register(&mut table, &[12]);
+        assert_eq!(third[0].fixed_index(), Some(second_index));
+        assert_ne!(third[0].generation(), second[0].generation());
     }
 }

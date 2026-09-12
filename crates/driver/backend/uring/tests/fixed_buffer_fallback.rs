@@ -474,7 +474,7 @@ fn compatible_mode_falls_back_for_fixed_read_and_respects_cooldown() {
         assert_eq!(failures_after_first, 0);
         assert_eq!(hooks.debug_chunk_register_attempts(), attempts_after_first);
     }
-    assert!(hooks.debug_raw_buffer_fallbacks() >= fallbacks_after_first + 1);
+    assert!(hooks.debug_raw_buffer_fallbacks() > fallbacks_after_first);
 }
 
 #[test]

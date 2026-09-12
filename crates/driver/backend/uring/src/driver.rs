@@ -6,15 +6,15 @@ use veloq_std::{collections::VecDeque, format, ptr, sync::Arc, vec, vec::Vec};
 
 use crate::{
     config::{IoFd, IoMode, RawHandle, UringConfig, UringRawHandle},
-    diagnostics::UringCompletionDiagnostics,
+    diagnostics::{UringCompletionDiagnostics, UringCompletionDiagnosticsSnapshot},
     error::{UringError, UringResult},
     op::{SubmissionStrategy, UringOp, UringOpRegistry, UringSlotSpec, UringUserPayload},
 };
 use veloq_driver_core::driver::{
     BufferRegistrationStatus, CancelRequest, CancelSubmitOutcome, DriveMode, DriveOutcome,
-    DriverCapabilities, DriverCapability, DriverCompletionDiagnostics, DriverRaw,
-    DriverSubmitResult, OpToken, RegisterFd, RemoteCancelSender, RemoteWaker,
-    SharedCompletionTable, SharedSlotTable, SubmitStatus,
+    DriverCapabilities, DriverCapability, DriverCompletionDiagnostics,
+    DriverCompletionDiagnosticsSnapshot, DriverRaw, DriverSubmitResult, OpToken, RegisterFd,
+    RemoteCancelSender, RemoteWaker, SharedCompletionTable, SharedSlotTable, SubmitStatus,
     registry::{OpEntry, OpHandle},
     sealed,
 };
@@ -68,6 +68,8 @@ pub struct UringDriver<'a> {
     /// Reused across `process_completions_internal` calls so draining the CQ never allocates.
     pub(crate) cqe_buffer: Vec<(u64, i32, u32)>,
     pub(crate) file_table: FileTable,
+    #[cfg(feature = "test-hooks")]
+    pub(crate) register_files_update_outcomes: VecDeque<RegisterFilesUpdateOutcome>,
     pub(crate) capabilities: DriverCapabilities,
 }
 
@@ -133,6 +135,8 @@ impl<'a> UringDriver<'a> {
             ),
             cqe_buffer: Vec::with_capacity(entries as usize),
             file_table: FileTable::new(config.file_table_capacity, config.file_table_exhaustion),
+            #[cfg(feature = "test-hooks")]
+            register_files_update_outcomes: VecDeque::new(),
             capabilities: probe_capabilities(&ring_probe),
         };
 
@@ -194,7 +198,19 @@ impl<'a> UringDriver<'a> {
         self.buffer_registry.provided_buf_stats()
     }
 
+    /// Returns a point-in-time snapshot of completion and backend cleanup diagnostics.
+    pub fn completion_diagnostics_snapshot(
+        &self,
+    ) -> DriverCompletionDiagnosticsSnapshot<UringCompletionDiagnosticsSnapshot> {
+        self.completion_diagnostics.snapshot()
+    }
+
     pub(crate) fn rebuild_waker_fd(&mut self) -> UringResult<()> {
+        if self.file_table.is_poisoned() {
+            return Err(self
+                .file_table
+                .poisoned_report("driver.rebuild_waker_fd", self.waker.registered_fd()));
+        }
         let new_fd = UringWakerManager::create_event_fd("driver.rebuild_waker_fd.eventfd")?;
         let raw = RawHandle::new(UringRawHandle::for_file(new_fd.fd.raw().as_fd()));
         let registered_fd = self.waker.registered_fd();
@@ -427,7 +443,7 @@ impl<'a> DriverRaw for UringDriver<'a> {
 }
 
 #[cfg(feature = "test-hooks")]
-use veloq_driver_core::driver::test_hooks::DriverTestHooks;
+use veloq_driver_core::driver::test_hooks::{DriverTestHooks, RegisterFilesUpdateOutcome};
 
 #[cfg(feature = "test-hooks")]
 impl DriverTestHooks for UringDriver<'_> {
@@ -465,6 +481,28 @@ impl DriverTestHooks for UringDriver<'_> {
     fn debug_inject_register_buffers_update_sequence(&mut self, outcomes: &[Option<i32>]) {
         self.buffer_registry
             .inject_register_buffers_update_sequence(outcomes);
+    }
+
+    fn debug_inject_register_files_update_failure(&mut self, errno: i32) {
+        self.register_files_update_outcomes
+            .push_back(RegisterFilesUpdateOutcome::Error(errno));
+    }
+
+    fn debug_inject_register_files_update_sequence(
+        &mut self,
+        outcomes: &[RegisterFilesUpdateOutcome],
+    ) {
+        self.register_files_update_outcomes.clear();
+        self.register_files_update_outcomes
+            .extend(outcomes.iter().copied());
+    }
+
+    fn debug_file_table_poisoned(&self) -> bool {
+        self.file_table.is_poisoned()
+    }
+
+    fn debug_register_files_update_outcomes_pending(&self) -> usize {
+        self.register_files_update_outcomes.len()
     }
 
     fn debug_inject_bitset_set_failure(&mut self) {

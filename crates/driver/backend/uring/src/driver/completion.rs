@@ -678,33 +678,55 @@ impl<'a> UringDriver<'a> {
         &mut self,
         post: UringPostCompletionEffects,
     ) -> UringResult<()> {
+        let mut first_error = None;
         for (cancel_id, request, raw) in post.cancel_enoent {
-            self.record_cancel_enoent_if_target_active(cancel_id, request, raw)?;
+            if let Err(report) = self.record_cancel_enoent_if_target_active(cancel_id, request, raw)
+                && first_error.is_none()
+            {
+                first_error = Some(report);
+            }
         }
 
+        // The user completion has already been published when this post-effect runs. A cleanup
+        // failure must be reported without stopping the remaining Close effects: every successful
+        // kernel Close still has to consume its owned handle exactly once.
         for fd in post.close_unregister {
-            self.unregister_close_owned_fd(fd)?;
+            if let Err(report) = self.unregister_close_owned_fd(fd)
+                && first_error.is_none()
+            {
+                first_error = Some(report);
+            }
         }
 
         if post.rebuild_waker {
             self.completion_diagnostics.backend().inc_waker_rebuild();
-            self.rebuild_waker_fd()
-                .attach_note("failed to rebuild eventfd waker")?;
+            if let Err(report) = self
+                .rebuild_waker_fd()
+                .attach_note("failed to rebuild eventfd waker")
+                && first_error.is_none()
+            {
+                first_error = Some(report);
+            }
         }
         if post.resubmit_waker
             && let Err(e) = self.submit_waker()
         {
             self.completion_diagnostics.backend().inc_waker_rebuild();
             error!(report = ?e, "failed to resubmit waker");
-            return Err(e);
+            if first_error.is_none() {
+                first_error = Some(e);
+            }
         }
         if post.resubmit_waker {
             self.completion_diagnostics.backend().inc_waker_rearm();
         }
-        if post.flush_backlog {
-            self.flush_backlog()?;
+        if post.flush_backlog
+            && let Err(report) = self.flush_backlog()
+            && first_error.is_none()
+        {
+            first_error = Some(report);
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     fn record_cancel_enoent_if_target_active(

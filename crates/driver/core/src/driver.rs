@@ -703,6 +703,13 @@ pub enum SubmitStatus {
 
 #[cfg(feature = "test-hooks")]
 pub mod test_hooks {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum RegisterFilesUpdateOutcome {
+        Actual,
+        Error(i32),
+        Updated(usize),
+    }
+
     pub trait DriverTestHooks {
         fn debug_chunk_register_attempts(&self) -> u64;
 
@@ -730,6 +737,22 @@ pub mod test_hooks {
 
         fn debug_inject_register_buffers_update_sequence(&mut self, _outcomes: &[Option<i32>]) {}
 
+        fn debug_inject_register_files_update_failure(&mut self, _errno: i32) {}
+
+        fn debug_inject_register_files_update_sequence(
+            &mut self,
+            _outcomes: &[RegisterFilesUpdateOutcome],
+        ) {
+        }
+
+        fn debug_file_table_poisoned(&self) -> bool {
+            false
+        }
+
+        fn debug_register_files_update_outcomes_pending(&self) -> usize {
+            0
+        }
+
         fn debug_inject_bitset_set_failure(&mut self) {}
 
         fn debug_chunk_registered(&self, _chunk_id: usize) -> bool {
@@ -741,7 +764,7 @@ pub mod test_hooks {
 }
 
 #[cfg(feature = "test-hooks")]
-use test_hooks::DriverTestHooks;
+use test_hooks::{DriverTestHooks, RegisterFilesUpdateOutcome};
 
 #[cfg(feature = "test-hooks")]
 impl<'a, D: Driver + ?Sized + DriverTestHooks, P: ContextDriverProvider<D> + ?Sized> DriverTestHooks
@@ -785,6 +808,29 @@ impl<'a, D: Driver + ?Sized + DriverTestHooks, P: ContextDriverProvider<D> + ?Si
     fn debug_inject_register_buffers_update_sequence(&mut self, outcomes: &[Option<i32>]) {
         self.provider
             .with_driver_mut(|d| d.debug_inject_register_buffers_update_sequence(outcomes))
+    }
+
+    fn debug_inject_register_files_update_failure(&mut self, errno: i32) {
+        self.provider
+            .with_driver_mut(|d| d.debug_inject_register_files_update_failure(errno))
+    }
+
+    fn debug_inject_register_files_update_sequence(
+        &mut self,
+        outcomes: &[RegisterFilesUpdateOutcome],
+    ) {
+        self.provider
+            .with_driver_mut(|d| d.debug_inject_register_files_update_sequence(outcomes))
+    }
+
+    fn debug_file_table_poisoned(&self) -> bool {
+        self.provider
+            .with_driver_ref(|d| d.debug_file_table_poisoned())
+    }
+
+    fn debug_register_files_update_outcomes_pending(&self) -> usize {
+        self.provider
+            .with_driver_ref(|d| d.debug_register_files_update_outcomes_pending())
     }
 
     fn debug_inject_bitset_set_failure(&mut self) {

@@ -28,6 +28,11 @@ pub struct UringCompletionDiagnostics {
     wait_timer_return: AtomicU64,
     wait_completion_return: AtomicU64,
     waker_rearm: AtomicU64,
+    file_table_cleanup_failures: AtomicU64,
+    file_table_cleanup_short_updates: AtomicU64,
+    file_table_quarantines: AtomicU64,
+    file_table_rollback_failures: AtomicU64,
+    file_table_poisonings: AtomicU64,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +61,16 @@ pub struct UringCompletionDiagnosticsSnapshot {
     pub wait_timer_return: u64,
     pub wait_completion_return: u64,
     pub waker_rearm: u64,
+    /// Number of owned Close cleanup attempts that failed and quarantined a slot.
+    pub file_table_cleanup_failures: u64,
+    /// Number of quarantines caused by a short `register_files_update` result.
+    pub file_table_cleanup_short_updates: u64,
+    /// Number of fixed-file slots permanently removed from reuse.
+    pub file_table_quarantines: u64,
+    /// Number of batch rollback operations that stopped at their first failed update.
+    pub file_table_rollback_failures: u64,
+    /// Number of transitions from a healthy to a poisoned file table.
+    pub file_table_poisonings: u64,
 }
 
 impl UringCompletionDiagnostics {
@@ -188,6 +203,31 @@ impl UringCompletionDiagnostics {
     pub(crate) fn inc_waker_rearm(&self) {
         Self::inc(&self.waker_rearm);
     }
+
+    #[inline]
+    pub(crate) fn inc_file_table_cleanup_failure(&self) {
+        Self::inc(&self.file_table_cleanup_failures);
+    }
+
+    #[inline]
+    pub(crate) fn inc_file_table_cleanup_short_update(&self) {
+        Self::inc(&self.file_table_cleanup_short_updates);
+    }
+
+    #[inline]
+    pub(crate) fn inc_file_table_quarantine(&self) {
+        Self::inc(&self.file_table_quarantines);
+    }
+
+    #[inline]
+    pub(crate) fn inc_file_table_rollback_failure(&self) {
+        Self::inc(&self.file_table_rollback_failures);
+    }
+
+    #[inline]
+    pub(crate) fn inc_file_table_poisoning(&self) {
+        Self::inc(&self.file_table_poisonings);
+    }
 }
 
 impl DriverCompletionDiagnosticsBackend for UringCompletionDiagnostics {
@@ -220,6 +260,11 @@ impl DriverCompletionDiagnosticsBackend for UringCompletionDiagnostics {
             wait_timer_return: Self::load(&self.wait_timer_return),
             wait_completion_return: Self::load(&self.wait_completion_return),
             waker_rearm: Self::load(&self.waker_rearm),
+            file_table_cleanup_failures: Self::load(&self.file_table_cleanup_failures),
+            file_table_cleanup_short_updates: Self::load(&self.file_table_cleanup_short_updates),
+            file_table_quarantines: Self::load(&self.file_table_quarantines),
+            file_table_rollback_failures: Self::load(&self.file_table_rollback_failures),
+            file_table_poisonings: Self::load(&self.file_table_poisonings),
         }
     }
 
