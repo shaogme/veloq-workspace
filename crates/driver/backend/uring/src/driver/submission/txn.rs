@@ -1,5 +1,8 @@
 use crate::{
-    driver::{env::SubmitEnv, lifecycle::UringSubmissionState},
+    driver::{
+        env::{ChunkRegistrationDecision, SubmitEnv},
+        lifecycle::UringSubmissionState,
+    },
     error::{UringError, UringResult},
     op::{Reserved, Slot, SubmissionStrategy, UringSlotSpec},
 };
@@ -102,12 +105,15 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
 
                 for &chunk_id in chunks.iter().take(count) {
                     let is_registered = self.env.is_chunk_registered(chunk_id);
-                    self.env.ensure_chunk_registered(
+                    let decision = self.env.ensure_chunk_registered(
                         chunk_id,
                         user_data,
                         "driver.submit_txn.ensure_chunk_registered",
                     )?;
-                    if !is_registered && self.newly_registered_count < 4 {
+                    if !is_registered
+                        && matches!(decision, ChunkRegistrationDecision::Fixed)
+                        && self.newly_registered_count < 4
+                    {
                         self.newly_registered_chunks[self.newly_registered_count] = chunk_id;
                         self.newly_registered_count += 1;
                     }

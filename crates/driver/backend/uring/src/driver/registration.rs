@@ -34,6 +34,7 @@ pub(crate) struct UringRegistrationStats {
     pub(crate) chunk_register_failures: u64,
     pub(crate) chunk_register_skipped_recent_failure: u64,
     pub(crate) submission_missing_chunk_info: u64,
+    pub(crate) raw_buffer_fallbacks: u64,
     /// Descriptors handed out without a kernel table entry because the table was full.
     pub(crate) file_table_fallback_registrations: u64,
 }

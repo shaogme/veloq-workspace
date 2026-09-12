@@ -82,7 +82,14 @@ impl<'rt> DriverRegistrar<'rt> {
 
 impl<'rt> BufferRegistrar for DriverRegistrar<'rt> {
     fn register(&self, regions: &[BufferRegion]) -> BufResult<Vec<ChunkId>> {
-        self.extra(|extra| register_internal(&extra.driver, &extra.registrar_state, regions))
+        self.extra(|extra| {
+            register_internal(
+                &extra.driver,
+                &extra.registrar_state,
+                extra.registration_mode,
+                regions,
+            )
+        })
     }
 
     fn resolve_chunk_info(&self, chunk_id: ChunkId) -> Option<ChunkInfo> {
@@ -116,7 +123,14 @@ impl<'rt> BufferRegistrar for SharedRegistrar<'rt> {
         let shared = unsafe { &*(self as *const Self as *const RuntimeShared<WorkerState<'rt>>) };
         shared
             .extra_tls
-            .try_with(|extra| register_internal(&extra.driver, &extra.registrar_state, regions))
+            .try_with(|extra| {
+                register_internal(
+                    &extra.driver,
+                    &extra.registrar_state,
+                    extra.registration_mode,
+                    regions,
+                )
+            })
             .expect("Ctx accessed outside of a worker thread")
     }
 
@@ -144,7 +158,7 @@ pub(crate) struct BorrowedRegistrar<'a, 'rt> {
 
 impl<'a, 'rt> BufferRegistrar for BorrowedRegistrar<'a, 'rt> {
     fn register(&self, regions: &[BufferRegion]) -> BufResult<Vec<ChunkId>> {
-        register_internal(self.driver, self.state, regions)
+        register_internal(self.driver, self.state, self.registration_mode, regions)
     }
 
     fn resolve_chunk_info(&self, chunk_id: ChunkId) -> Option<ChunkInfo> {
@@ -155,6 +169,7 @@ impl<'a, 'rt> BufferRegistrar for BorrowedRegistrar<'a, 'rt> {
 fn register_internal(
     driver: &RefCell<PlatformDriver<'_>>,
     state: &RefCell<WorkerRegistrarState>,
+    registration_mode: BufferRegistrationMode,
     regions: &[BufferRegion],
 ) -> BufResult<Vec<ChunkId>> {
     let mut indices = Vec::with_capacity(regions.len());
@@ -164,16 +179,40 @@ fn register_internal(
         let mut driver = driver.borrow_mut();
         for region in regions {
             let chunk_id = region.id();
-            driver
-                .register_chunk(chunk_id, region.as_ptr(), region.len())
-                .map_err(|err| BufError::Other(format!("{err:#}")))?;
+            let registered = match driver.register_chunk(chunk_id, region.as_ptr(), region.len()) {
+                Ok(()) => true,
+                Err(err) => {
+                    #[cfg(target_os = "linux")]
+                    let compatible_registration_failure = registration_mode
+                        == BufferRegistrationMode::Compatible
+                        && *err.inner() == DriverError::Registration;
+                    #[cfg(not(target_os = "linux"))]
+                    let compatible_registration_failure = false;
+
+                    if !compatible_registration_failure {
+                        return BufError::Other(format!("{err:#}")).trans();
+                    }
+
+                    tracing::warn!(
+                        registration_mode = ?registration_mode,
+                        chunk_id = chunk_id.raw(),
+                        errno = ?err.error_code(),
+                        fallback = true,
+                        error = ?err,
+                        "fixed-buffer registration failed during pool initialization; retaining chunk for raw I/O"
+                    );
+                    false
+                }
+            };
 
             new_chunks.push(ChunkInfo {
                 id: chunk_id,
                 ptr: unsafe { NonNull::new_unchecked(region.as_ptr() as *mut u8) },
                 len: unsafe { NonZeroUsize::new_unchecked(region.len()) },
             });
-            indices.push(chunk_id);
+            if registered {
+                indices.push(chunk_id);
+            }
         }
     }
 
@@ -229,7 +268,23 @@ fn sync_to_driver_internal(
 
     if matches!(registration_mode, BufferRegistrationMode::Compatible) {
         for chunk in &new_chunks {
-            let _ = driver.register_chunk(chunk.id, chunk.ptr.as_ptr(), chunk.len.get());
+            if let Err(err) = driver.register_chunk(chunk.id, chunk.ptr.as_ptr(), chunk.len.get()) {
+                #[cfg(target_os = "linux")]
+                let compatible_registration_failure = *err.inner() == DriverError::Registration;
+                #[cfg(not(target_os = "linux"))]
+                let compatible_registration_failure = false;
+
+                if compatible_registration_failure {
+                    tracing::warn!(
+                        registration_mode = ?registration_mode,
+                        chunk_id = chunk.id.raw(),
+                        errno = ?err.error_code(),
+                        fallback = true,
+                        error = ?err,
+                        "fixed-buffer registration failed while syncing pool chunk; using raw I/O"
+                    );
+                }
+            }
         }
     }
 

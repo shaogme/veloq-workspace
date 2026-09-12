@@ -81,7 +81,7 @@ pub(crate) fn submit_queued_from_slot(
     };
 
     for &chunk_id in chunks.iter().take(count) {
-        env.ensure_chunk_registered(
+        let _decision = env.ensure_chunk_registered(
             chunk_id,
             user_data,
             "driver.submit_queued_from_slot.ensure_chunk_registered",

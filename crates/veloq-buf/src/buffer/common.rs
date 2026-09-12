@@ -147,7 +147,9 @@ unsafe impl Sync for BufferRegion {}
 /// Trait abstraction for driver-specific buffer registration
 pub trait BufferRegistrar {
     /// Register memory regions with the kernel.
-    /// Returns a list of handles (tokens) corresponding to the regions.
+    /// Returns handles only for regions that were actually registered. A compatible backend may
+    /// retain the metadata for a region and omit its handle when fixed registration is unavailable,
+    /// allowing later raw I/O to use the same buffer without copying it.
     /// For RIO this is RIO_BUFFERID, for uring it might be ignored or index.
     fn register(&self, regions: &[BufferRegion]) -> BufResult<Vec<ChunkId>>;
 

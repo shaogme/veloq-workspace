@@ -73,8 +73,11 @@ impl Default for SockAddrStorage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BufferRegistrationMode {
+    /// Fixed-buffer registration is required before a submission can proceed.
     #[default]
     Strict,
+    /// Fixed-buffer registration is an optimization; valid operations use raw I/O when it is
+    /// unavailable.
     Compatible,
 }
 
@@ -82,6 +85,14 @@ impl BufferRegistrationMode {
     #[inline]
     pub const fn is_strict(self) -> bool {
         matches!(self, Self::Strict)
+    }
+
+    #[inline]
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Compatible => "compatible",
+        }
     }
 }
 

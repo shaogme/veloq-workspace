@@ -20,8 +20,14 @@ use io_uring::{IoUring, cqueue, squeue};
 use tracing::{debug, trace};
 use veloq_buf::{BufferRegistrar, FixedBuf, heap::ChunkId};
 use veloq_driver_core::driver::OpToken;
-use veloq_std::{collections::BitSet, format, time::Instant};
+use veloq_std::{collections::BitSet, format, io, time::Instant};
 use veloq_wheel::Wheel;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChunkRegistrationDecision {
+    Fixed,
+    RawFallback,
+}
 
 /// What a `IOSQE_BUFFER_SELECT` submission needs to know about the provided-buffer ring.
 ///
@@ -148,7 +154,13 @@ pub(crate) struct SubmitEnv<'d, 'r> {
     registrar: &'r (dyn BufferRegistrar + 'r),
     registration_stats: &'d mut UringRegistrationStats,
     registration_mode: BufferRegistrationMode,
+    fixed_buffers_available: bool,
+    fixed_buffers_failure_errno: Option<i32>,
     chunk_register_failure_at: &'d mut [Option<Instant>],
+    #[cfg(feature = "test-hooks")]
+    register_buffers_update_failure: &'d mut Option<i32>,
+    #[cfg(feature = "test-hooks")]
+    push_entry_failure: &'d mut bool,
     provided: Option<ProvidedBufSqeInfo>,
 }
 
@@ -166,6 +178,13 @@ impl SubmitEnv<'_, '_> {
     /// Pushes `entry` onto the submission queue, flushing once if the ring is full.
     pub(crate) fn push_entry(&mut self, entry: squeue::Entry) -> bool {
         trace!("Pushing SQE user_data={}", entry.get_user_data());
+        #[cfg(feature = "test-hooks")]
+        if *self.push_entry_failure {
+            *self.push_entry_failure = false;
+            debug!("injected SQ push failure");
+            return false;
+        }
+
         let mut sq = self.ring.submission();
 
         if unsafe { sq.push(&entry) }.is_ok() {
@@ -203,6 +222,14 @@ impl SubmitEnv<'_, '_> {
                 .attach_note("chunk id exceeds maximum registered chunk count");
         }
 
+        if !self.fixed_buffers_available {
+            return Err(self.fixed_buffers_unavailable_report(
+                "driver.register_chunk_internal",
+                id,
+                None,
+            ));
+        }
+
         if let Some(last_fail) = self.chunk_register_failure_at[index] {
             if last_fail.elapsed() < REGISTER_FAILURE_RETRY_COOLDOWN {
                 self.registration_stats
@@ -225,16 +252,13 @@ impl SubmitEnv<'_, '_> {
             iov_len: len,
         }];
 
-        // Use register_buffers_update
+        // Use register_buffers_update. The wrapper is also the deterministic test-only fault
+        // injection boundary; production builds call the io_uring syscall directly.
         self.registration_stats.chunk_register_attempts = self
             .registration_stats
             .chunk_register_attempts
             .saturating_add(1);
-        let register_result = unsafe {
-            self.ring
-                .submitter()
-                .register_buffers_update(index as u32, &iovecs, None)
-        };
+        let register_result = self.register_buffers_update(index as u32, &iovecs);
         if let Err(e) = register_result {
             self.registration_stats.chunk_register_failures = self
                 .registration_stats
@@ -265,7 +289,7 @@ impl SubmitEnv<'_, '_> {
         chunk_id: ChunkId,
         user_data: usize,
         scope: &'static str,
-    ) -> UringResult<()> {
+    ) -> UringResult<ChunkRegistrationDecision> {
         let index = chunk_id.as_usize();
         let is_registered = self.registered_chunks.get(index).map_err(|e| {
             UringError::InvalidState
@@ -276,7 +300,23 @@ impl SubmitEnv<'_, '_> {
                 .attach_note("BitSet get failed")
         })?;
         if is_registered {
-            return Ok(());
+            return Ok(ChunkRegistrationDecision::Fixed);
+        }
+
+        if !self.fixed_buffers_available {
+            if self.registration_mode.is_strict() {
+                return Err(self.fixed_buffers_unavailable_report(
+                    scope,
+                    chunk_id,
+                    Some(user_data),
+                ));
+            }
+            return Ok(self.raw_fallback(
+                chunk_id,
+                user_data,
+                self.fixed_buffers_failure_errno,
+                "sparse fixed-buffer registration unavailable",
+            ));
         }
 
         let Some(info) = self.registrar.resolve_chunk_info(chunk_id) else {
@@ -291,21 +331,114 @@ impl SubmitEnv<'_, '_> {
                     .with_ctx("user_data", user_data)
                     .attach_note("strict mode missing chunk info for lazy registration");
             }
-            return UringError::InvalidInput
+            return Ok(self.raw_fallback(
+                chunk_id,
+                user_data,
+                None,
+                "missing chunk info for lazy registration",
+            ));
+        };
+
+        if info.id != chunk_id {
+            return UringError::InvalidState
                 .push_ctx("scope", scope)
                 .with_ctx("chunk_id", chunk_id.raw())
+                .with_ctx("resolved_chunk_id", info.id.raw())
                 .with_ctx("user_data", user_data)
-                .attach_note("missing chunk info for lazy registration");
+                .attach_note("chunk registrar returned mismatched chunk info");
+        }
+
+        // Resolving a missing local snapshot may have drained the worker's chunk message queue,
+        // and that eager path can have registered the chunk already.
+        if self.is_chunk_registered(info.id) {
+            return Ok(ChunkRegistrationDecision::Fixed);
         };
 
         match self.register_chunk(info.id, info.ptr.as_ptr(), info.len.get()) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(ChunkRegistrationDecision::Fixed),
             Err(e) if self.registration_mode.is_strict() => Err(e
                 .with_ctx("chunk_id", chunk_id.raw())
                 .with_ctx("user_data", user_data)
                 .attach_note("strict mode lazy register failed")),
+            Err(e) if *e.inner() == UringError::Registration => Ok(self.raw_fallback(
+                chunk_id,
+                user_data,
+                Self::report_errno(&e),
+                "chunk fixed-buffer registration failed",
+            )),
             Err(e) => Err(e),
         }
+    }
+
+    fn fixed_buffers_unavailable_report(
+        &self,
+        scope: &'static str,
+        chunk_id: ChunkId,
+        user_data: Option<usize>,
+    ) -> Report<UringError> {
+        let report = UringError::Registration
+            .to_report()
+            .push_ctx("scope", scope)
+            .with_ctx("chunk_id", chunk_id.raw())
+            .with_ctx("registration_mode", self.registration_mode.as_str())
+            .with_ctx("fallback", false)
+            .attach_note("sparse fixed-buffer registration is unavailable");
+        let report = if let Some(user_data) = user_data {
+            report.with_ctx("user_data", user_data)
+        } else {
+            report
+        };
+        if let Some(errno) = self.fixed_buffers_failure_errno {
+            report.with_ctx("errno", errno)
+        } else {
+            report
+        }
+    }
+
+    fn raw_fallback(
+        &mut self,
+        chunk_id: ChunkId,
+        user_data: usize,
+        errno: Option<i32>,
+        reason: &'static str,
+    ) -> ChunkRegistrationDecision {
+        self.registration_stats.raw_buffer_fallbacks = self
+            .registration_stats
+            .raw_buffer_fallbacks
+            .saturating_add(1);
+        debug!(
+            chunk_id = chunk_id.raw(),
+            user_data,
+            errno = ?errno,
+            registration_mode = self.registration_mode.as_str(),
+            fallback = true,
+            reason,
+            "using raw buffer I/O"
+        );
+        ChunkRegistrationDecision::RawFallback
+    }
+
+    fn register_buffers_update(&mut self, index: u32, iovecs: &[libc::iovec]) -> io::Result<()> {
+        #[cfg(feature = "test-hooks")]
+        if let Some(errno) = self.register_buffers_update_failure.take() {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+
+        // SAFETY: `iovecs` points at live chunk memory for the duration of this syscall, and the
+        // caller retains ownership of that memory until every in-flight operation completes.
+        unsafe {
+            self.ring
+                .submitter()
+                .register_buffers_update(index, iovecs, None)
+        }
+        .map_err(io::Error::from)
+    }
+
+    #[inline]
+    fn report_errno(report: &Report<UringError>) -> Option<i32> {
+        report
+            .error_code()
+            .and_then(|code| i32::try_from(code).ok())
     }
 
     #[inline]
@@ -338,7 +471,13 @@ impl<'a> UringDriver<'a> {
                 registrar: view.registrar,
                 registration_stats: view.registration_stats,
                 registration_mode: view.registration_mode,
+                fixed_buffers_available: view.fixed_buffers_available,
+                fixed_buffers_failure_errno: view.fixed_buffers_failure_errno,
                 chunk_register_failure_at: view.chunk_register_failure_at,
+                #[cfg(feature = "test-hooks")]
+                register_buffers_update_failure: view.register_buffers_update_failure,
+                #[cfg(feature = "test-hooks")]
+                push_entry_failure: view.push_entry_failure,
                 provided: view.provided,
             },
         )

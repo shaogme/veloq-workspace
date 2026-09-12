@@ -693,6 +693,30 @@ pub enum SubmitStatus {
 pub mod test_hooks {
     pub trait DriverTestHooks {
         fn debug_chunk_register_attempts(&self) -> u64;
+
+        fn debug_chunk_register_failures(&self) -> u64 {
+            0
+        }
+
+        fn debug_chunk_register_skipped_recent_failure(&self) -> u64 {
+            0
+        }
+
+        fn debug_submission_missing_chunk_info(&self) -> u64 {
+            0
+        }
+
+        fn debug_raw_buffer_fallbacks(&self) -> u64 {
+            0
+        }
+
+        fn debug_fixed_buffers_available(&self) -> bool {
+            false
+        }
+
+        fn debug_inject_register_buffers_update_failure(&mut self, _errno: i32) {}
+
+        fn debug_inject_push_entry_failure(&mut self) {}
     }
 }
 
@@ -706,5 +730,40 @@ impl<'a, D: Driver + ?Sized + DriverTestHooks, P: ContextDriverProvider<D> + ?Si
     fn debug_chunk_register_attempts(&self) -> u64 {
         self.provider
             .with_driver_ref(|d| d.debug_chunk_register_attempts())
+    }
+
+    fn debug_chunk_register_failures(&self) -> u64 {
+        self.provider
+            .with_driver_ref(|d| d.debug_chunk_register_failures())
+    }
+
+    fn debug_chunk_register_skipped_recent_failure(&self) -> u64 {
+        self.provider
+            .with_driver_ref(|d| d.debug_chunk_register_skipped_recent_failure())
+    }
+
+    fn debug_submission_missing_chunk_info(&self) -> u64 {
+        self.provider
+            .with_driver_ref(|d| d.debug_submission_missing_chunk_info())
+    }
+
+    fn debug_raw_buffer_fallbacks(&self) -> u64 {
+        self.provider
+            .with_driver_ref(|d| d.debug_raw_buffer_fallbacks())
+    }
+
+    fn debug_fixed_buffers_available(&self) -> bool {
+        self.provider
+            .with_driver_ref(|d| d.debug_fixed_buffers_available())
+    }
+
+    fn debug_inject_register_buffers_update_failure(&mut self, errno: i32) {
+        self.provider
+            .with_driver_mut(|d| d.debug_inject_register_buffers_update_failure(errno))
+    }
+
+    fn debug_inject_push_entry_failure(&mut self) {
+        self.provider
+            .with_driver_mut(|d| d.debug_inject_push_entry_failure())
     }
 }

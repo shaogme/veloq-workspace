@@ -147,8 +147,32 @@ impl<'a> UringDriver<'a> {
             MAX_CHUNKS
         ];
 
-        if let Err(e) = unsafe { driver.ring.submitter().register_buffers(&iovecs) } {
-            tracing::warn!("Failed to register sparse buffers: {}", e);
+        match unsafe { driver.ring.submitter().register_buffers(&iovecs) } {
+            Ok(_) => {
+                driver
+                    .buffer_registry
+                    .set_fixed_buffers_available(true, None);
+                debug!(
+                    registration_mode = config.registration_mode.as_str(),
+                    fixed_buffers_available = true,
+                    fallback = false,
+                    "registered sparse fixed-buffer table"
+                );
+            }
+            Err(e) => {
+                let errno = e.raw_os_error();
+                driver
+                    .buffer_registry
+                    .set_fixed_buffers_available(false, errno);
+                tracing::warn!(
+                    registration_mode = config.registration_mode.as_str(),
+                    errno = ?errno,
+                    fixed_buffers_available = false,
+                    fallback = !config.registration_mode.is_strict(),
+                    error = %e,
+                    "sparse fixed-buffer registration unavailable"
+                );
+            }
         }
 
         Ok(driver)
@@ -405,5 +429,36 @@ use veloq_driver_core::driver::test_hooks::DriverTestHooks;
 impl DriverTestHooks for UringDriver<'_> {
     fn debug_chunk_register_attempts(&self) -> u64 {
         self.buffer_registry.stats().chunk_register_attempts
+    }
+
+    fn debug_chunk_register_failures(&self) -> u64 {
+        self.buffer_registry.stats().chunk_register_failures
+    }
+
+    fn debug_chunk_register_skipped_recent_failure(&self) -> u64 {
+        self.buffer_registry
+            .stats()
+            .chunk_register_skipped_recent_failure
+    }
+
+    fn debug_submission_missing_chunk_info(&self) -> u64 {
+        self.buffer_registry.stats().submission_missing_chunk_info
+    }
+
+    fn debug_raw_buffer_fallbacks(&self) -> u64 {
+        self.buffer_registry.stats().raw_buffer_fallbacks
+    }
+
+    fn debug_fixed_buffers_available(&self) -> bool {
+        self.buffer_registry.fixed_buffers_available()
+    }
+
+    fn debug_inject_register_buffers_update_failure(&mut self, errno: i32) {
+        self.buffer_registry
+            .inject_register_buffers_update_failure(errno);
+    }
+
+    fn debug_inject_push_entry_failure(&mut self) {
+        self.buffer_registry.inject_push_entry_failure();
     }
 }

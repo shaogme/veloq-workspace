@@ -18,7 +18,13 @@ pub(crate) struct BufferRegistrySubmitView<'r, 'a> {
     pub(crate) registrar: &'a (dyn BufferRegistrar + 'a),
     pub(crate) registration_stats: &'r mut UringRegistrationStats,
     pub(crate) registration_mode: BufferRegistrationMode,
+    pub(crate) fixed_buffers_available: bool,
+    pub(crate) fixed_buffers_failure_errno: Option<i32>,
     pub(crate) chunk_register_failure_at: &'r mut [Option<Instant>],
+    #[cfg(feature = "test-hooks")]
+    pub(crate) register_buffers_update_failure: &'r mut Option<i32>,
+    #[cfg(feature = "test-hooks")]
+    pub(crate) push_entry_failure: &'r mut bool,
     pub(crate) provided: Option<ProvidedBufSqeInfo>,
 }
 
@@ -27,7 +33,13 @@ pub(crate) struct UringBufferRegistry<'a> {
     registrar: &'a (dyn BufferRegistrar + 'a),
     stats: UringRegistrationStats,
     mode: BufferRegistrationMode,
+    fixed_buffers_available: bool,
+    fixed_buffers_failure_errno: Option<i32>,
     chunk_register_failure_at: Box<[Option<Instant>]>,
+    #[cfg(feature = "test-hooks")]
+    register_buffers_update_failure: Option<i32>,
+    #[cfg(feature = "test-hooks")]
+    push_entry_failure: bool,
     provided_buf_config: Option<ProvidedBufConfig>,
     provided_buffers: Option<ProvidedBufGroup>,
 }
@@ -43,7 +55,13 @@ impl<'a> UringBufferRegistry<'a> {
             registrar,
             stats: UringRegistrationStats::default(),
             mode,
+            fixed_buffers_available: false,
+            fixed_buffers_failure_errno: None,
             chunk_register_failure_at: vec![None; MAX_CHUNKS].into_boxed_slice(),
+            #[cfg(feature = "test-hooks")]
+            register_buffers_update_failure: None,
+            #[cfg(feature = "test-hooks")]
+            push_entry_failure: false,
             provided_buf_config,
             provided_buffers: None,
         }
@@ -59,9 +77,35 @@ impl<'a> UringBufferRegistry<'a> {
             registrar: self.registrar,
             registration_stats: &mut self.stats,
             registration_mode: self.mode,
+            fixed_buffers_available: self.fixed_buffers_available,
+            fixed_buffers_failure_errno: self.fixed_buffers_failure_errno,
             chunk_register_failure_at: &mut self.chunk_register_failure_at,
+            #[cfg(feature = "test-hooks")]
+            register_buffers_update_failure: &mut self.register_buffers_update_failure,
+            #[cfg(feature = "test-hooks")]
+            push_entry_failure: &mut self.push_entry_failure,
             provided,
         }
+    }
+
+    pub(crate) fn set_fixed_buffers_available(&mut self, available: bool, errno: Option<i32>) {
+        self.fixed_buffers_available = available;
+        self.fixed_buffers_failure_errno = (!available).then_some(errno).flatten();
+    }
+
+    #[inline]
+    pub(crate) fn fixed_buffers_available(&self) -> bool {
+        self.fixed_buffers_available
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn inject_register_buffers_update_failure(&mut self, errno: i32) {
+        self.register_buffers_update_failure = Some(errno);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn inject_push_entry_failure(&mut self) {
+        self.push_entry_failure = true;
     }
 
     #[cfg(feature = "test-hooks")]
