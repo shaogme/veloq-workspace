@@ -40,6 +40,18 @@ pub type SharedSlotTable<Spec> = Arc<slot::SlotTable<Spec>>;
 pub type SharedDriverSlotTable<D> = SharedSlotTable<<D as DriverRaw>::SlotSpec>;
 pub type RemoteCancelSender = mpsc::Sender<CancelRequest>;
 
+/// 说明 buffer registration 优化是否可用于指定 chunk。
+///
+/// `Unavailable` 只表示 backend 已确认 registration 优化不可用且 raw buffer I/O
+/// 仍然安全。其它错误必须继续通过 driver 的错误类型返回。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferRegistrationStatus {
+    /// Backend 已完成 preferred registration path。
+    Registered,
+    /// Registration 优化不可用，但调用方可以继续使用 raw buffer I/O。
+    Unavailable,
+}
+
 #[must_use]
 pub enum DriverSubmitResult<E> {
     Submitted(Poll<()>),
@@ -291,16 +303,16 @@ pub trait DriverRaw: sealed::Sealed {
         request: CancelRequest,
     ) -> DriverResult<CancelSubmitOutcome, SlotError<Self::SlotSpec>>;
 
-    /// 注册一段可供后端定位的 buffer chunk。
+    /// 注册一段可供后端定位的 buffer chunk，并返回 registration 能力状态。
     ///
-    /// 成功后后端必须能够按 `id` 解析这段仍由调用者保持有效的内存；失败不得留下半个
-    /// 注册项。
-    fn register_chunk_raw(
+    /// `Registered` 只允许在真实注册完成后返回；`Unavailable` 只允许在 backend 确认
+    /// raw buffer I/O 仍然安全时返回。其它失败不得留下半个注册项。
+    fn register_buffer_raw(
         &mut self,
         id: ChunkId,
         ptr: *const u8,
         len: usize,
-    ) -> DriverResult<(), SlotError<Self::SlotSpec>>;
+    ) -> DriverResult<BufferRegistrationStatus, SlotError<Self::SlotSpec>>;
 
     /// 注册文件或 socket，并返回带 generation 的后端 descriptor。
     ///
@@ -395,13 +407,13 @@ pub trait Driver: DriverRaw {
         self.cancel_op_raw(request)
     }
 
-    fn register_chunk(
+    fn register_buffer(
         &mut self,
         id: ChunkId,
         ptr: *const u8,
         len: usize,
-    ) -> DriverResult<(), SlotError<<Self as DriverRaw>::SlotSpec>> {
-        self.register_chunk_raw(id, ptr, len)
+    ) -> DriverResult<BufferRegistrationStatus, SlotError<<Self as DriverRaw>::SlotSpec>> {
+        self.register_buffer_raw(id, ptr, len)
     }
 
     fn register_files<'f>(
@@ -541,14 +553,14 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> DriverRaw
         self.provider.with_driver_mut(|d| d.cancel_op(request))
     }
 
-    fn register_chunk_raw(
+    fn register_buffer_raw(
         &mut self,
         id: ChunkId,
         ptr: *const u8,
         len: usize,
-    ) -> DriverResult<(), SlotError<Self::SlotSpec>> {
+    ) -> DriverResult<BufferRegistrationStatus, SlotError<Self::SlotSpec>> {
         self.provider
-            .with_driver_mut(|d| d.register_chunk(id, ptr, len))
+            .with_driver_mut(|d| d.register_buffer(id, ptr, len))
     }
 
     fn register_files_raw<'f>(

@@ -37,7 +37,7 @@ fn register_buf_chunk(
         .chunk_info(region.id)
         .unwrap_or_else(|| panic!("{label} chunk not found"));
     driver
-        .register_chunk(region.id, chunk.ptr.as_ptr(), chunk.len.get())
+        .register_buffer(region.id, chunk.ptr.as_ptr(), chunk.len.get())
         .unwrap_or_else(|_| panic!("register {label} chunk failed"));
 }
 

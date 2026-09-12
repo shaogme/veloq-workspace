@@ -93,6 +93,7 @@ impl<'a> UringBufferRegistry<'a> {
         self.fixed_buffers_failure_errno = (!available).then_some(errno).flatten();
     }
 
+    #[cfg(feature = "test-hooks")]
     #[inline]
     pub(crate) fn fixed_buffers_available(&self) -> bool {
         self.fixed_buffers_available

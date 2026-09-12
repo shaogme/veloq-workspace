@@ -34,8 +34,8 @@ use crate::{
 
 use veloq_buf::heap::ChunkId;
 use veloq_driver_core::driver::{
-    CancelRequest, CancelSubmitOutcome, CompletionToken, DriveMode, DriveOutcome,
-    DriverCompletionDiagnostics, DriverRaw, DriverSubmitResult, OpToken, RegisterFd,
+    BufferRegistrationStatus, CancelRequest, CancelSubmitOutcome, CompletionToken, DriveMode,
+    DriveOutcome, DriverCompletionDiagnostics, DriverRaw, DriverSubmitResult, OpToken, RegisterFd,
     RemoteCancelSender, RemoteWaker, SharedCompletionTable, SharedSlotTable, SubmitStatus,
     registry::OpEntry, sealed,
 };
@@ -286,10 +286,15 @@ impl<'a> DriverRaw for IocpDriver<'a> {
         self.cancel_op_internal(request)
     }
 
-    fn register_chunk_raw(&mut self, id: ChunkId, ptr: *const u8, len: usize) -> IocpResult<()> {
-        IocpDriver::register_chunk(self, id, ptr, len)
+    fn register_buffer_raw(
+        &mut self,
+        id: ChunkId,
+        ptr: *const u8,
+        len: usize,
+    ) -> IocpResult<BufferRegistrationStatus> {
+        IocpDriver::register_buffer_backend(self, id, ptr, len)
             .push_ctx("scope", "iocp/driver")
-            .attach_note("register chunk failed")
+            .attach_note("register buffer failed")
     }
 
     fn register_files_raw<'f>(

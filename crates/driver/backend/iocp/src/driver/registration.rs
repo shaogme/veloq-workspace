@@ -2,7 +2,7 @@ use veloq_std::{collections::VecDeque, io, mem, string::ToString, vec::Vec};
 
 use diagweave::prelude::*;
 use veloq_buf::heap::ChunkId;
-use veloq_driver_core::driver::RegisterFd;
+use veloq_driver_core::driver::{BufferRegistrationStatus, RegisterFd};
 use windows_sys::Win32::{
     Foundation::CloseHandle,
     Networking::WinSock::{
@@ -332,20 +332,19 @@ impl<'a> IocpDriver<'a> {
         }
     }
 
-    /// Registers a chunk of memory for RIO operations.
-    pub(crate) fn register_chunk(
+    /// Registers a buffer chunk for RIO operations.
+    pub(crate) fn register_buffer_backend(
         &mut self,
         id: ChunkId,
         ptr: *const u8,
         len: usize,
-    ) -> IocpResult<()> {
+    ) -> IocpResult<BufferRegistrationStatus> {
         self.rio
             .state_mut()
-            .register_chunk(id, ptr, len)
+            .register_buffer_backend(id, ptr, len)
             .push_ctx("scope", "iocp/driver")
-            .attach_note("failed to register RIO chunk")
-            .trans()?;
-        Ok(())
+            .attach_note("failed to register RIO buffer")
+            .trans()
     }
 
     /// Registers a set of file/socket handles for use with the driver.

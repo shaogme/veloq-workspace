@@ -159,7 +159,7 @@ fn test_iocp_recv_with_buffer_pool() {
         .chunk_info(region.id)
         .expect("Chunk info for buffer not found");
     driver
-        .register_chunk(region.id, chunk.ptr.as_ptr(), chunk.len.get())
+        .register_buffer(region.id, chunk.ptr.as_ptr(), chunk.len.get())
         .expect("register chunk failed");
 
     // Poll connect completion before issuing recv.
@@ -234,7 +234,7 @@ fn test_unregister_owned_socket_waits_for_inflight_recv() {
         .chunk_info(region.id)
         .expect("Chunk info for buffer not found");
     driver
-        .register_chunk(region.id, chunk.ptr.as_ptr(), chunk.len.get())
+        .register_buffer(region.id, chunk.ptr.as_ptr(), chunk.len.get())
         .expect("register chunk failed");
 
     let recv_op = Recv {
@@ -308,7 +308,7 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
         .chunk_info(region.id)
         .expect("Chunk info for buffer not found");
     driver
-        .register_chunk(region.id, chunk.ptr.as_ptr(), chunk.len.get())
+        .register_buffer(region.id, chunk.ptr.as_ptr(), chunk.len.get())
         .expect("register chunk failed");
 
     let recv_op = Recv {
@@ -380,7 +380,7 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
         .chunk_info(region.id)
         .expect("Chunk info for buffer not found");
     driver
-        .register_chunk(region.id, chunk.ptr.as_ptr(), chunk.len.get())
+        .register_buffer(region.id, chunk.ptr.as_ptr(), chunk.len.get())
         .expect("register chunk failed");
 
     let recv_op = Recv {

@@ -2,7 +2,7 @@ use diagweave::prelude::*;
 use io_uring::{IoUring, opcode};
 use tracing::{debug, trace};
 use veloq_buf::{AnyBufPool, BufferRegistrar, heap::ChunkId};
-use veloq_std::{collections::VecDeque, format, ptr, string::ToString, sync::Arc, vec, vec::Vec};
+use veloq_std::{collections::VecDeque, format, ptr, sync::Arc, vec, vec::Vec};
 
 use crate::{
     config::{IoFd, IoMode, RawHandle, UringConfig, UringRawHandle},
@@ -11,10 +11,10 @@ use crate::{
     op::{SubmissionStrategy, UringOp, UringOpRegistry, UringSlotSpec, UringUserPayload},
 };
 use veloq_driver_core::driver::{
-    CancelRequest, CancelSubmitOutcome, DriveMode, DriveOutcome, DriverCapabilities,
-    DriverCapability, DriverCompletionDiagnostics, DriverRaw, DriverSubmitResult, OpToken,
-    RegisterFd, RemoteCancelSender, RemoteWaker, SharedCompletionTable, SharedSlotTable,
-    SubmitStatus,
+    BufferRegistrationStatus, CancelRequest, CancelSubmitOutcome, DriveMode, DriveOutcome,
+    DriverCapabilities, DriverCapability, DriverCompletionDiagnostics, DriverRaw,
+    DriverSubmitResult, OpToken, RegisterFd, RemoteCancelSender, RemoteWaker,
+    SharedCompletionTable, SharedSlotTable, SubmitStatus,
     registry::{OpEntry, OpHandle},
     sealed,
 };
@@ -358,11 +358,15 @@ impl<'a> DriverRaw for UringDriver<'a> {
         self.cancel_op_internal(request)
     }
 
-    fn register_chunk_raw(&mut self, id: ChunkId, ptr: *const u8, len: usize) -> UringResult<()> {
-        self.register_chunk_internal(id, ptr, len)
-            .push_ctx("scope", "uring.driver.register_chunk")
-            .with_ctx("driver_error_kind", UringError::Registration.to_string())
-            .attach_note("register chunk")
+    fn register_buffer_raw(
+        &mut self,
+        id: ChunkId,
+        ptr: *const u8,
+        len: usize,
+    ) -> UringResult<BufferRegistrationStatus> {
+        self.register_buffer_internal(id, ptr, len)
+            .push_ctx("scope", "uring.driver.register_buffer")
+            .attach_note("register buffer")
     }
 
     fn register_files_raw<'f>(

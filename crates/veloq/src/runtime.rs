@@ -176,7 +176,6 @@ impl<T: PoolTopology> Runtime<T> {
                 let config = config.clone();
                 let receiver = receivers.take(worker_id);
 
-                let registration_mode = config.registration_mode();
                 let registrar = unsafe { SharedRegistrar::from_shared(shared) };
                 let registrar_state = RefCell::new(WorkerRegistrarState {
                     receiver,
@@ -223,7 +222,6 @@ impl<T: PoolTopology> Runtime<T> {
                     let borrowed_registrar = BorrowedRegistrar {
                         driver: &driver_cell,
                         state: &registrar_state,
-                        registration_mode,
                     };
                     topology
                         .build(&state, worker_id, &borrowed_registrar)
@@ -242,7 +240,6 @@ impl<T: PoolTopology> Runtime<T> {
                     driver: driver_cell,
                     buf_pool,
                     registrar_state,
-                    registration_mode,
                 }
             })
             .scope(async move |runtime_ctx| {

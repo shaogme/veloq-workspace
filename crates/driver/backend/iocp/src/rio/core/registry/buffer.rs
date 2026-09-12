@@ -104,7 +104,7 @@ impl RioRegistry {
         if lease.is_none()
             && let Some(chunk_info) = env.registrar.resolve_chunk_info(info.id)
         {
-            self.register_chunk(
+            self.register_buffer_backend(
                 info.id,
                 (chunk_info.ptr.as_ptr(), chunk_info.len.get()),
                 env,
@@ -124,7 +124,7 @@ impl RioRegistry {
         }
     }
 
-    pub(crate) fn register_chunk(
+    pub(crate) fn register_buffer_backend(
         &mut self,
         id: ChunkId,
         mem: (*const u8, usize),
@@ -678,7 +678,7 @@ mod tests {
         REGISTER_FAILS.store(true, SeqCst);
 
         registry
-            .register_chunk(chunk_id, (&byte as *const u8, 1), env)
+            .register_buffer_backend(chunk_id, (&byte as *const u8, 1), env)
             .expect_err("failed registration should be reported");
 
         let current = registry.chunk_registry[chunk_index]

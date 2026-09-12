@@ -65,10 +65,7 @@ fn run_auto_expansion_single_worker(mode: BufferRegistrationMode) {
         .unwrap();
 }
 
-fn run_expansion_immediate_registration_check(
-    mode: BufferRegistrationMode,
-    _should_immediate: bool,
-) {
+fn run_expansion_metadata_sync_check(mode: BufferRegistrationMode) {
     Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(1))))
         .worker_count(Some(nz!(1)))
         .with_config(|c| c.iocp_registration_mode(mode).uring_registration_mode(mode))
@@ -105,17 +102,10 @@ fn run_expansion_immediate_registration_check(
             #[cfg(feature = "test-hooks")]
             {
                 let after = current_chunk_register_attempts(ctx);
-                if _should_immediate {
-                    assert!(
-                        after > before,
-                        "compatible mode should eagerly register new chunk after expansion: before={before}, after={after}"
-                    );
-                } else {
-                    assert_eq!(
-                        after, before,
-                        "strict mode should not eagerly register after expansion without I/O submit: before={before}, after={after}"
-                    );
-                }
+                assert_eq!(
+                    after, before,
+                    "chunk metadata sync must not eagerly register after expansion: before={before}, after={after}"
+                );
             }
         }).unwrap();
 }
@@ -188,13 +178,13 @@ fn test_memory_auto_expansion_compatible_mode() {
 }
 
 #[test]
-fn test_expansion_does_not_immediately_register_in_strict_mode() {
-    run_expansion_immediate_registration_check(BufferRegistrationMode::Strict, false);
+fn test_expansion_metadata_sync_does_not_register_in_strict_mode() {
+    run_expansion_metadata_sync_check(BufferRegistrationMode::Strict);
 }
 
 #[test]
-fn test_expansion_immediately_registers_in_compatible_mode() {
-    run_expansion_immediate_registration_check(BufferRegistrationMode::Compatible, true);
+fn test_expansion_metadata_sync_does_not_register_in_compatible_mode() {
+    run_expansion_metadata_sync_check(BufferRegistrationMode::Compatible);
 }
 
 #[test]

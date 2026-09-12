@@ -19,7 +19,7 @@ use diagweave::prelude::*;
 use io_uring::{IoUring, cqueue, squeue};
 use tracing::{debug, trace};
 use veloq_buf::{BufferRegistrar, FixedBuf, heap::ChunkId};
-use veloq_driver_core::driver::OpToken;
+use veloq_driver_core::driver::{BufferRegistrationStatus, OpToken};
 use veloq_std::{collections::BitSet, format, io, time::Instant};
 use veloq_wheel::Wheel;
 
@@ -207,27 +207,34 @@ impl SubmitEnv<'_, '_> {
     }
 
     /// Registers `[ptr, ptr + len)` as the kernel's fixed buffer number `id`.
-    pub(crate) fn register_chunk(
+    pub(crate) fn register_buffer_backend(
         &mut self,
         id: ChunkId,
         ptr: *const u8,
         len: usize,
-    ) -> UringResult<()> {
+    ) -> UringResult<BufferRegistrationStatus> {
         let index = id.as_usize();
         if index >= MAX_CHUNKS {
             return UringError::InvalidInput
-                .push_ctx("scope", "driver.register_chunk_internal")
+                .push_ctx("scope", "driver.register_buffer_internal")
                 .with_ctx("chunk_id", index)
                 .with_ctx("max_chunks", MAX_CHUNKS)
                 .attach_note("chunk id exceeds maximum registered chunk count");
         }
 
         if !self.fixed_buffers_available {
-            return Err(self.fixed_buffers_unavailable_report(
-                "driver.register_chunk_internal",
+            if self.registration_mode.is_strict() {
+                return Err(self.fixed_buffers_unavailable_report(
+                    "driver.register_buffer_internal",
+                    id,
+                    None,
+                ));
+            }
+            return self.registration_unavailable(
                 id,
-                None,
-            ));
+                self.fixed_buffers_failure_errno,
+                "sparse fixed-buffer registration unavailable",
+            );
         }
 
         if let Some(last_fail) = self.chunk_register_failure_at[index] {
@@ -237,10 +244,17 @@ impl SubmitEnv<'_, '_> {
                     .registration_stats
                     .chunk_register_skipped_recent_failure
                     .saturating_add(1);
-                return UringError::Registration
-                    .push_ctx("scope", "driver.register_chunk_internal")
-                    .with_ctx("chunk_id", id.raw())
-                    .attach_note("recent chunk registration failure cooldown");
+                if self.registration_mode.is_strict() {
+                    return UringError::Registration
+                        .push_ctx("scope", "driver.register_buffer_internal")
+                        .with_ctx("chunk_id", id.raw())
+                        .attach_note("recent chunk registration failure cooldown");
+                }
+                return self.registration_unavailable(
+                    id,
+                    None,
+                    "recent chunk registration failure cooldown",
+                );
             }
             // The cooldown expired: drop the record now instead of letting it sit here for
             // the lifetime of the driver.
@@ -265,8 +279,17 @@ impl SubmitEnv<'_, '_> {
                 .chunk_register_failures
                 .saturating_add(1);
             self.chunk_register_failure_at[index] = Some(Instant::now());
-            return Err(UringError::Registration
-                .io_report("driver.register_chunk_internal.register_buffers_update", e));
+            let report = UringError::Registration
+                .io_report("driver.register_buffer_internal.register_buffers_update", e);
+            return if self.registration_mode.is_strict() {
+                Err(report)
+            } else {
+                self.registration_unavailable(
+                    id,
+                    Self::report_errno(&report),
+                    "chunk fixed-buffer registration failed",
+                )
+            };
         }
 
         // Mark as registered in local bitset
@@ -277,7 +300,7 @@ impl SubmitEnv<'_, '_> {
             .chunk_register_success
             .saturating_add(1);
 
-        Ok(())
+        Ok(BufferRegistrationStatus::Registered)
     }
 
     /// Registers `chunk_id` on demand so the kernel can reach the buffer this SQE points at.
@@ -348,26 +371,38 @@ impl SubmitEnv<'_, '_> {
                 .attach_note("chunk registrar returned mismatched chunk info");
         }
 
-        // Resolving a missing local snapshot may have drained the worker's chunk message queue,
-        // and that eager path can have registered the chunk already.
+        // Resolving a missing local snapshot may have drained the worker's chunk message queue;
+        // the backend may have registered the chunk through another path in the meantime.
         if self.is_chunk_registered(info.id) {
             return Ok(ChunkRegistrationDecision::Fixed);
         };
 
-        match self.register_chunk(info.id, info.ptr.as_ptr(), info.len.get()) {
-            Ok(()) => Ok(ChunkRegistrationDecision::Fixed),
-            Err(e) if self.registration_mode.is_strict() => Err(e
-                .with_ctx("chunk_id", chunk_id.raw())
-                .with_ctx("user_data", user_data)
-                .attach_note("strict mode lazy register failed")),
-            Err(e) if *e.inner() == UringError::Registration => Ok(self.raw_fallback(
+        match self.register_buffer_backend(info.id, info.ptr.as_ptr(), info.len.get())? {
+            BufferRegistrationStatus::Registered => Ok(ChunkRegistrationDecision::Fixed),
+            BufferRegistrationStatus::Unavailable => Ok(self.raw_fallback(
                 chunk_id,
                 user_data,
-                Self::report_errno(&e),
-                "chunk fixed-buffer registration failed",
+                self.fixed_buffers_failure_errno,
+                "chunk fixed-buffer registration unavailable",
             )),
-            Err(e) => Err(e),
         }
+    }
+
+    fn registration_unavailable(
+        &mut self,
+        chunk_id: ChunkId,
+        errno: Option<i32>,
+        reason: &'static str,
+    ) -> UringResult<BufferRegistrationStatus> {
+        debug!(
+            chunk_id = chunk_id.raw(),
+            errno = ?errno,
+            registration_mode = self.registration_mode.as_str(),
+            fallback = true,
+            reason,
+            "fixed-buffer registration unavailable; using raw buffer I/O"
+        );
+        Ok(BufferRegistrationStatus::Unavailable)
     }
 
     fn fixed_buffers_unavailable_report(

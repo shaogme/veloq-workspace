@@ -5,7 +5,7 @@ use crate::{
 };
 use diagweave::prelude::*;
 use veloq_buf::heap::ChunkId;
-use veloq_driver_core::driver::RegisterFd;
+use veloq_driver_core::driver::{BufferRegistrationStatus, RegisterFd};
 use veloq_std::{mem::ManuallyDrop, string::ToString, time::Duration, vec, vec::Vec};
 
 pub(crate) mod buffer;
@@ -41,13 +41,13 @@ pub(crate) struct UringRegistrationStats {
 
 impl<'a> UringDriver<'a> {
     #[inline]
-    pub(crate) fn register_chunk_internal(
+    pub(crate) fn register_buffer_internal(
         &mut self,
         id: ChunkId,
         ptr: *const u8,
         len: usize,
-    ) -> UringResult<()> {
-        self.submit_env().register_chunk(id, ptr, len)
+    ) -> UringResult<BufferRegistrationStatus> {
+        self.submit_env().register_buffer_backend(id, ptr, len)
     }
 
     /// Clears the kernel table entry for `idx`.

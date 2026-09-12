@@ -10,8 +10,8 @@ use veloq_buf::{
 };
 use veloq_driver_native::{
     driver::{
-        ContextDriverProvider, DriveMode, DriveOutcome, Driver, DriverRaw, PlatformDriver,
-        RuntimeContextDriver,
+        BufferRegistrationStatus, ContextDriverProvider, DriveMode, DriveOutcome, Driver,
+        DriverRaw, PlatformDriver, RuntimeContextDriver,
     },
     error::{DriverReport, Error as DriverError},
     op::{DetachedSubmitter, DriverProvider, IntoPlatformOp, IoFd, Op, OpSubmitter, SingleShotOp},
@@ -29,7 +29,7 @@ use veloq_runtime::{
     },
 };
 
-use crate::{config::BufferRegistrationMode, error::Result as VeloqResult};
+use crate::error::Result as VeloqResult;
 
 /// 驱动注册中心的消息类型
 #[derive(Debug, Clone)]
@@ -49,7 +49,6 @@ pub struct WorkerState<'rt> {
     pub driver: RefCell<PlatformDriver<'rt>>,
     pub buf_pool: AnyBufPool,
     pub registrar_state: RefCell<WorkerRegistrarState>,
-    pub registration_mode: BufferRegistrationMode,
 }
 
 #[derive(Clone)]
@@ -69,38 +68,20 @@ impl<'rt> DriverRegistrar<'rt> {
             .expect("Ctx accessed outside of a worker thread")
     }
 
-    pub fn sync_to_driver(&self) {
+    pub fn sync_chunk_metadata(&self) {
         self.extra(|extra| {
-            sync_to_driver_internal(
-                &extra.driver,
-                &extra.registrar_state,
-                extra.registration_mode,
-            );
+            sync_chunk_metadata_internal(&extra.registrar_state);
         })
     }
 }
 
 impl<'rt> BufferRegistrar for DriverRegistrar<'rt> {
     fn register(&self, regions: &[BufferRegion]) -> BufResult<Vec<ChunkId>> {
-        self.extra(|extra| {
-            register_internal(
-                &extra.driver,
-                &extra.registrar_state,
-                extra.registration_mode,
-                regions,
-            )
-        })
+        self.extra(|extra| register_internal(&extra.driver, &extra.registrar_state, regions))
     }
 
     fn resolve_chunk_info(&self, chunk_id: ChunkId) -> Option<ChunkInfo> {
-        self.extra(|extra| {
-            resolve_chunk_info_internal(
-                &extra.driver,
-                &extra.registrar_state,
-                extra.registration_mode,
-                chunk_id,
-            )
-        })
+        self.extra(|extra| resolve_chunk_info_internal(&extra.registrar_state, chunk_id))
     }
 }
 
@@ -123,14 +104,7 @@ impl<'rt> BufferRegistrar for SharedRegistrar<'rt> {
         let shared = unsafe { &*(self as *const Self as *const RuntimeShared<WorkerState<'rt>>) };
         shared
             .extra_tls
-            .try_with(|extra| {
-                register_internal(
-                    &extra.driver,
-                    &extra.registrar_state,
-                    extra.registration_mode,
-                    regions,
-                )
-            })
+            .try_with(|extra| register_internal(&extra.driver, &extra.registrar_state, regions))
             .expect("Ctx accessed outside of a worker thread")
     }
 
@@ -138,14 +112,7 @@ impl<'rt> BufferRegistrar for SharedRegistrar<'rt> {
         let shared = unsafe { &*(self as *const Self as *const RuntimeShared<WorkerState<'rt>>) };
         shared
             .extra_tls
-            .try_with(|extra| {
-                resolve_chunk_info_internal(
-                    &extra.driver,
-                    &extra.registrar_state,
-                    extra.registration_mode,
-                    chunk_id,
-                )
-            })
+            .try_with(|extra| resolve_chunk_info_internal(&extra.registrar_state, chunk_id))
             .expect("Ctx accessed outside of a worker thread")
     }
 }
@@ -153,23 +120,21 @@ impl<'rt> BufferRegistrar for SharedRegistrar<'rt> {
 pub(crate) struct BorrowedRegistrar<'a, 'rt> {
     pub driver: &'a RefCell<PlatformDriver<'rt>>,
     pub state: &'a RefCell<WorkerRegistrarState>,
-    pub registration_mode: BufferRegistrationMode,
 }
 
 impl<'a, 'rt> BufferRegistrar for BorrowedRegistrar<'a, 'rt> {
     fn register(&self, regions: &[BufferRegion]) -> BufResult<Vec<ChunkId>> {
-        register_internal(self.driver, self.state, self.registration_mode, regions)
+        register_internal(self.driver, self.state, regions)
     }
 
     fn resolve_chunk_info(&self, chunk_id: ChunkId) -> Option<ChunkInfo> {
-        resolve_chunk_info_internal(self.driver, self.state, self.registration_mode, chunk_id)
+        resolve_chunk_info_internal(self.state, chunk_id)
     }
 }
 
 fn register_internal(
     driver: &RefCell<PlatformDriver<'_>>,
     state: &RefCell<WorkerRegistrarState>,
-    registration_mode: BufferRegistrationMode,
     regions: &[BufferRegion],
 ) -> BufResult<Vec<ChunkId>> {
     let mut indices = Vec::with_capacity(regions.len());
@@ -179,38 +144,16 @@ fn register_internal(
         let mut driver = driver.borrow_mut();
         for region in regions {
             let chunk_id = region.id();
-            let registered = match driver.register_chunk(chunk_id, region.as_ptr(), region.len()) {
-                Ok(()) => true,
-                Err(err) => {
-                    #[cfg(target_os = "linux")]
-                    let compatible_registration_failure = registration_mode
-                        == BufferRegistrationMode::Compatible
-                        && *err.inner() == DriverError::Registration;
-                    #[cfg(not(target_os = "linux"))]
-                    let compatible_registration_failure = false;
-
-                    if !compatible_registration_failure {
-                        return BufError::Other(format!("{err:#}")).trans();
-                    }
-
-                    tracing::warn!(
-                        registration_mode = ?registration_mode,
-                        chunk_id = chunk_id.raw(),
-                        errno = ?err.error_code(),
-                        fallback = true,
-                        error = ?err,
-                        "fixed-buffer registration failed during pool initialization; retaining chunk for raw I/O"
-                    );
-                    false
-                }
-            };
+            let status = driver
+                .register_buffer(chunk_id, region.as_ptr(), region.len())
+                .map_err(|err| BufError::Other(format!("{err:#}")))?;
 
             new_chunks.push(ChunkInfo {
                 id: chunk_id,
                 ptr: unsafe { NonNull::new_unchecked(region.as_ptr() as *mut u8) },
                 len: unsafe { NonZeroUsize::new_unchecked(region.len()) },
             });
-            if registered {
+            if matches!(status, BufferRegistrationStatus::Registered) {
                 indices.push(chunk_id);
             }
         }
@@ -223,9 +166,7 @@ fn register_internal(
 }
 
 fn resolve_chunk_info_internal(
-    driver: &RefCell<PlatformDriver<'_>>,
     state: &RefCell<WorkerRegistrarState>,
-    registration_mode: BufferRegistrationMode,
     chunk_id: ChunkId,
 ) -> Option<ChunkInfo> {
     // 首先在本地快照中查找
@@ -239,18 +180,13 @@ fn resolve_chunk_info_internal(
     }
 
     // 如果没找到，尝试同步一次消息队列后再查找
-    sync_to_driver_internal(driver, state, registration_mode);
+    sync_chunk_metadata_internal(state);
 
     let state = state.borrow();
     state.chunks.iter().find(|c| c.id == chunk_id).copied()
 }
 
-fn sync_to_driver_internal(
-    driver: &RefCell<PlatformDriver<'_>>,
-    state: &RefCell<WorkerRegistrarState>,
-    registration_mode: BufferRegistrationMode,
-) {
-    let mut driver = driver.borrow_mut();
+fn sync_chunk_metadata_internal(state: &RefCell<WorkerRegistrarState>) {
     let mut state = state.borrow_mut();
 
     let mut new_chunks = Vec::new();
@@ -262,33 +198,6 @@ fn sync_to_driver_internal(
         }
     }
 
-    if new_chunks.is_empty() {
-        return;
-    }
-
-    if matches!(registration_mode, BufferRegistrationMode::Compatible) {
-        for chunk in &new_chunks {
-            if let Err(err) = driver.register_chunk(chunk.id, chunk.ptr.as_ptr(), chunk.len.get()) {
-                #[cfg(target_os = "linux")]
-                let compatible_registration_failure = *err.inner() == DriverError::Registration;
-                #[cfg(not(target_os = "linux"))]
-                let compatible_registration_failure = false;
-
-                if compatible_registration_failure {
-                    tracing::warn!(
-                        registration_mode = ?registration_mode,
-                        chunk_id = chunk.id.raw(),
-                        errno = ?err.error_code(),
-                        fallback = true,
-                        error = ?err,
-                        "fixed-buffer registration failed while syncing pool chunk; using raw I/O"
-                    );
-                }
-            }
-        }
-    }
-
-    // 更新本地快照
     state.chunks.extend(new_chunks);
 }
 
@@ -369,8 +278,8 @@ impl<'rt> Ctx<'rt> {
     }
 
     #[inline]
-    pub fn sync_registrar(&self) {
-        self.registrar().sync_to_driver();
+    pub fn sync_chunk_metadata(&self) {
+        self.registrar().sync_chunk_metadata();
     }
 
     pub fn try_alloc_from_pool(&self, cap: NonZeroUsize, len: usize) -> Option<FixedBuf> {
@@ -399,7 +308,7 @@ impl<'rt> Ctx<'rt> {
     }
 
     pub fn drive_wait(&self) -> VeloqResult<IdleDecision> {
-        self.sync_registrar();
+        self.sync_chunk_metadata();
         self.driver(|mut driver| {
             let outcome = driver
                 .drive(DriveMode::Wait { timeout: None })
@@ -415,7 +324,7 @@ impl<'rt> Ctx<'rt> {
         S: OpSubmitter<'rt, Ctx<'rt>> + Copy + 'd,
         T: SingleShotOp<<PlatformDriver<'rt> as DriverRaw>::SlotSpec> + Send,
     {
-        self.sync_registrar();
+        self.sync_chunk_metadata();
         submitter.submit(op, *self)
     }
 
@@ -428,12 +337,12 @@ impl<'rt> Ctx<'rt> {
         S: OpSubmitter<'rt, Ctx<'rt>> + Copy + 'd,
         T: IntoPlatformOp<<PlatformDriver<'rt> as DriverRaw>::SlotSpec> + Send,
     {
-        self.sync_registrar();
+        self.sync_chunk_metadata();
         submitter.submit_stream(op, *self)
     }
 
     pub async fn yield_now(&self) {
-        self.sync_registrar();
+        self.sync_chunk_metadata();
         yield_now().await;
     }
 
@@ -483,11 +392,7 @@ pub fn poll_current_driver<'rt>(
         .extra_tls
         .try_with(|extra| {
             // sync registrar
-            sync_to_driver_internal(
-                &extra.driver,
-                &extra.registrar_state,
-                extra.registration_mode,
-            );
+            sync_chunk_metadata_internal(&extra.registrar_state);
 
             let mut driver = extra.driver.borrow_mut();
 
@@ -591,11 +496,7 @@ pub fn park_current_driver<'rt>(
 ) -> RuntimeResult<()> {
     let res = shared.extra_tls.try_with(|extra| {
         // sync registrar
-        sync_to_driver_internal(
-            &extra.driver,
-            &extra.registrar_state,
-            extra.registration_mode,
-        );
+        sync_chunk_metadata_internal(&extra.registrar_state);
 
         let mut driver = extra.driver.borrow_mut();
 

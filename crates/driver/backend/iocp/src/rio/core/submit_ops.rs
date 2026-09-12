@@ -23,7 +23,9 @@ use crate::{
         error::{RioError, RioResult},
     },
 };
+use diagweave::prelude::*;
 use veloq_buf::{BufferRegistrar, FixedBuf, NoopRegistrar, heap::ChunkId};
+use veloq_driver_core::driver::BufferRegistrationStatus;
 use veloq_std::{collections::FastHashMap, vec::Vec};
 
 impl RioState {
@@ -56,16 +58,20 @@ impl RioState {
         })
     }
 
-    pub(crate) fn register_chunk(
+    pub(crate) fn register_buffer_backend(
         &mut self,
         id: ChunkId,
         ptr: *const u8,
         len: usize,
-    ) -> RioResult<()> {
+    ) -> RioResult<BufferRegistrationStatus> {
         let Some(env) = self.kernel.env(&NoopRegistrar, self.registration_mode) else {
-            return Ok(());
+            return Err(RioError::NotSupported
+                .to_report()
+                .attach_note("RIO buffer registration is unavailable without a dispatch table"));
         };
-        self.registry.register_chunk(id, (ptr, len), env)
+        self.registry
+            .register_buffer_backend(id, (ptr, len), env)
+            .map(|_| BufferRegistrationStatus::Registered)
     }
 
     pub(crate) fn try_submit_recv(
