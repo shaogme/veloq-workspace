@@ -1,5 +1,6 @@
 use crate::{
-    config::IoFd,
+    OwnedRawHandle, RawHandle,
+    config::{IoFd, UringRawHandle},
     driver::{RegisteredFileEntry, SqeEnv, SqeFd},
     error::{UringError, UringResult},
     op::{
@@ -314,6 +315,12 @@ pub(crate) unsafe fn make_sqe_open(
         .flags(user.flags)
         .mode(user.mode)
         .build())
+}
+
+pub(crate) fn opened_handle_from_res(res: UringResult<usize>) -> UringResult<OwnedRawHandle> {
+    res.map(|raw| unsafe {
+        OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_file(raw as i32)))
+    })
 }
 
 pub(crate) fn resolve_chunks_read_fixed(

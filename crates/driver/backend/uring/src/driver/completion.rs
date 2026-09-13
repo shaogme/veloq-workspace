@@ -23,10 +23,10 @@ use crate::{
     driver::lifecycle::{CancellationPhase, SubmissionPhase},
     driver::{
         CompletionControlView, CqeEnv, PendingCancel, ProvidedBufGroup, UringControlPlane,
-        UringDriver,
+        UringDriver, submission::txn::slot_access_report,
     },
     error::{UringError, UringResult, uring_report_to_event_res},
-    op::{CompletionCleanupHintFn, Slot, UringSlotSpec, UringUserPayload},
+    op::{CompletionCleanupHintFn, Slot, UringRecordItem, UringSlotSpec, UringUserPayload},
 };
 
 #[cfg(test)]
@@ -39,7 +39,7 @@ use veloq_driver_core::{
         CompletionBackendHooks, CompletionCleanupGuard, CompletionContinuation, CompletionControl,
         CompletionEnvelope, CompletionFlowExt, CompletionFlowOutcome, CompletionHookOutcome,
         CompletionIngress, CompletionSource, CompletionToken, Driver, DriverCompletionDiagnostics,
-        OpToken, PlatformOp, RawCompletion, SyntheticCompletionSource, UserCompletionEvent,
+        OpToken, RawCompletion, SyntheticCompletionSource, UserCompletionEvent,
         run_completion_cleanup,
     },
     slot::{CheckedSlotView, InFlightOrphaned, InFlightWaiting, SlotRegistryExt, SlotView},
@@ -723,7 +723,7 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
             cleanup_orphaned_streaming_slot(slot, res)
         } else {
             cleanup_orphaned_slot(slot, res)
-        };
+        }?;
         let cleanup = if slot_accessed {
             slot_cleanup
         } else {
@@ -1317,6 +1317,17 @@ struct KernelCompletionError {
     fallback_cleanup: bool,
 }
 
+fn record_item_policy_report(operation: &'static str, token: OpToken) -> Report<UringError> {
+    UringError::Internal
+        .report(
+            "uring.driver.completion.record_item",
+            "operation record-item policy did not produce a completion item",
+        )
+        .with_ctx("operation", operation)
+        .with_ctx("token_index", token.index())
+        .with_ctx("token_generation", token.generation())
+}
+
 fn complete_kernel_waiting_slot(
     mut slot: Slot<'_, InFlightWaiting>,
     token: OpToken,
@@ -1331,24 +1342,31 @@ fn complete_kernel_waiting_slot(
         CompletionContinuation::Final
     };
 
-    let (final_res, cleanup, item) = match slot.with_op_and_payload_mut(|op, payload| {
-        let final_res = unsafe { (op.vtable.on_complete)(op, payload, raw.res) };
-        let cleanup = op.completion_cleanup(raw.res);
-        let item = unsafe { (op.vtable.record_item)(op, payload, raw.res, raw.flags, cqe_env) };
-        (final_res, cleanup, item)
-    }) {
-        Ok(result) => result,
-        Err(err) => {
-            return Err(KernelCompletionError {
-                report: UringError::InvalidState.report(
-                    "uring.complete_kernel_waiting_slot",
-                    format!("slot corruption detected on completion: {:?}", err),
-                ),
-                fallback_cleanup: true,
-            });
-        }
-    };
-    let item = item.map_err(|report| KernelCompletionError {
+    let (final_res, cleanup, record_item, operation_name) =
+        match slot.with_op_and_payload_mut(|op, payload| {
+            let final_res = unsafe { (op.vtable().on_complete)(op, payload, token, raw.res) };
+            let cleanup = op.completion_cleanup_checked(raw.res);
+            let record_item = unsafe {
+                (op.vtable().record_item)(op, payload, token, raw.res, raw.flags, cqe_env)
+            };
+            (final_res, cleanup, record_item, op.vtable().operation_name)
+        }) {
+            Ok(result) => result,
+            Err(err) => {
+                return Err(KernelCompletionError {
+                    report: UringError::InvalidState.report(
+                        "uring.complete_kernel_waiting_slot",
+                        format!("slot corruption detected on completion: {:?}", err),
+                    ),
+                    fallback_cleanup: true,
+                });
+            }
+        };
+    let cleanup = cleanup.map_err(|report| KernelCompletionError {
+        report,
+        fallback_cleanup: true,
+    })?;
+    let record_item = record_item.map_err(|report| KernelCompletionError {
         report,
         fallback_cleanup: false,
     })?;
@@ -1361,12 +1379,9 @@ fn complete_kernel_waiting_slot(
     if continuation.is_more() {
         // slot 原地不动：op 与提交 payload 还要给内核后续的完成用，cell 也必须停在
         // `InFlightWaiting` 才能继续路由。
-        let Some(item) = item else {
+        let UringRecordItem::New(item) = record_item else {
             return Err(KernelCompletionError {
-                report: UringError::InvalidState.report(
-                    "uring.complete_kernel_waiting_slot",
-                    "kernel reported IORING_CQE_F_MORE for an operation that produces no item",
-                ),
+                report: record_item_policy_report(operation_name, token),
                 fallback_cleanup: false,
             });
         };
@@ -1384,12 +1399,12 @@ fn complete_kernel_waiting_slot(
     let mut completed = slot.complete();
     let (submit_payload, detail) = completed.take_completion_data();
     // multishot 的终态完成同样产出一条 item，提交 payload（监听 socket 之类）到此为止。
-    let payload = match item {
-        Some(item) => {
+    let payload = match record_item {
+        UringRecordItem::New(item) => {
             drop(submit_payload);
             item
         }
-        None => {
+        UringRecordItem::UseSubmitPayload => {
             let Some(payload) = submit_payload else {
                 drop(detail);
                 return Err(KernelCompletionError {
@@ -1474,8 +1489,10 @@ fn complete_submission_failure_slot(
     slot.platform_mut().control.submission = SubmissionPhase::Terminal;
     let mut completed = slot.complete();
     let cleanup = completed
-        .with_op_mut(|op| op.completion_cleanup(event_res))
-        .unwrap_or_default();
+        .with_op_mut(|op| op.completion_cleanup_checked(event_res))
+        .map_err(|err| {
+            slot_access_report("uring.complete_submission_failure_slot.cleanup", err)
+        })??;
     let _ = completed.take_op();
     let (payload, detail) = completed.take_completion_data();
     let Some(payload) = payload else {
@@ -1508,12 +1525,12 @@ fn complete_local_cancel_slot(
     let cleanup = completed
         .with_op_mut(|op| {
             if mode == CancelMode::Abandon || orphaned {
-                op.orphan_cleanup(event.res())
+                op.orphan_cleanup_checked(event.res())
             } else {
-                op.completion_cleanup(event.res())
+                op.completion_cleanup_checked(event.res())
             }
         })
-        .unwrap_or_default();
+        .map_err(|err| slot_access_report("uring.complete_local_cancel_slot.cleanup", err))??;
     let (payload, detail) = completed.take_completion_data();
     let _ = completed.take_op();
 
@@ -1553,28 +1570,29 @@ fn complete_local_cancel_slot(
 fn cleanup_orphaned_streaming_slot(
     mut slot: Slot<'_, InFlightOrphaned>,
     cqe_res: i32,
-) -> (CompletionCleanupGuard, bool) {
-    match slot.with_op_mut(|op| op.orphan_cleanup(cqe_res)) {
-        Ok(cleanup) => (cleanup, true),
-        Err(_) => (CompletionCleanupGuard::default(), false),
-    }
+) -> UringResult<(CompletionCleanupGuard, bool)> {
+    let cleanup = slot
+        .with_op_mut(|op| op.orphan_cleanup_checked(cqe_res))
+        .map_err(|err| {
+            slot_access_report("uring.cleanup_orphaned_streaming_slot.cleanup", err)
+        })??;
+    Ok((cleanup, true))
 }
 
 fn cleanup_orphaned_slot(
     mut slot: Slot<'_, InFlightOrphaned>,
     cqe_res: i32,
-) -> (CompletionCleanupGuard, bool) {
+) -> UringResult<(CompletionCleanupGuard, bool)> {
     slot.platform_mut().control.submission = SubmissionPhase::Terminal;
     let mut completed = slot.complete();
-    let (cleanup, slot_accessed) = match completed.with_op_mut(|op| op.orphan_cleanup(cqe_res)) {
-        Ok(cleanup) => (cleanup, true),
-        Err(_) => (CompletionCleanupGuard::default(), false),
-    };
+    let cleanup = completed
+        .with_op_mut(|op| op.orphan_cleanup_checked(cqe_res))
+        .map_err(|err| slot_access_report("uring.cleanup_orphaned_slot.cleanup", err))??;
     let (payload, detail) = completed.take_completion_data();
     let _ = completed.take_op();
     drop(payload);
     drop(detail);
-    (cleanup, slot_accessed)
+    Ok((cleanup, true))
 }
 
 #[inline]

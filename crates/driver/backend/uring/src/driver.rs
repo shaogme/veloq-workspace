@@ -698,7 +698,7 @@ impl<'a> DriverRaw for UringDriver<'a> {
             );
         };
         let op: UringOp = op;
-        let strategy = op.vtable.strategy;
+        let strategy = op.vtable().strategy;
 
         match strategy {
             SubmissionStrategy::SubmitSqe => self.submit_sqe_internal(token, op, op_in),

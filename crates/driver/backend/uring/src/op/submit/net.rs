@@ -3,7 +3,7 @@ use crate::{
     config::UringRawHandle,
     driver::{SqeEnv, SqeFd},
     error::{UringError, UringResult},
-    net::{socket_addr_to_storage, to_socket_addr},
+    net::{bounded_sockaddr_bytes, to_socket_addr},
     op::{
         Accept, AcceptMulti, Connect, OpSend, Recv, RecvMulti, RecvProvided, SendTo, UdpConnect,
         UdpRecv, UdpRecvFrom, UdpSend,
@@ -12,7 +12,7 @@ use crate::{
 };
 use io_uring::{opcode, squeue, types};
 use veloq_driver_core::driver::SubmitTokenContext;
-use veloq_std::{mem::size_of, ptr, slice::from_raw_parts};
+use veloq_std::ptr;
 
 use super::{invalid_buf_io_range, resolve_socket_fd, resolve_socket_fd_direct, sqe_with_fd};
 
@@ -205,12 +205,11 @@ pub(crate) unsafe fn on_complete_accept(
             .set_error_code(-result));
     }
 
-    let addr_bytes = unsafe {
-        from_raw_parts(
-            &accept_op.addr.0 as *const _ as *const u8,
-            accept_op.addr_len as usize,
-        )
-    };
+    let addr_bytes = bounded_sockaddr_bytes(
+        &accept_op.addr.0,
+        accept_op.addr_len as usize,
+        "uring.op.submit.on_complete_accept",
+    )?;
     if let Ok(addr) = to_socket_addr(addr_bytes) {
         accept_op.remote_addr = Some(addr);
     }
@@ -223,25 +222,11 @@ pub(crate) unsafe fn make_sqe_send_to(
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
-    let (ptr, len) = user
-        .buf
-        .checked_write_range(user.buf_offset)
+    let msg = unsafe { kernel.init_send_to(user) }
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_send_to", err))?;
-    kernel.iovec[0].iov_base = ptr as *mut _;
-    kernel.iovec[0].iov_len = len as usize;
-
-    let (msg_name, msg_namelen) = socket_addr_to_storage(user.addr);
-    kernel.msg_name = msg_name.0;
-    kernel.msg_namelen = msg_namelen;
-
-    kernel.msghdr.msg_name = &mut kernel.msg_name as *mut _ as *mut libc::c_void;
-    kernel.msghdr.msg_namelen = kernel.msg_namelen;
-    kernel.msghdr.msg_iov = kernel.iovec.as_mut_ptr();
-    kernel.msghdr.msg_iovlen = 1;
 
     let fd = resolve_socket_fd(env.file_table, user.fd, "uring.op.submit.make_sqe_send_to")?;
-    let msghdr = &kernel.msghdr as *const _;
-    Ok(sqe_with_fd!(fd, |f| opcode::SendMsg::new(f, msghdr).build()))
+    Ok(sqe_with_fd!(fd, |f| opcode::SendMsg::new(f, msg.as_ptr()).build()))
 }
 
 pub(crate) unsafe fn make_sqe_udp_recv_from(
@@ -250,23 +235,17 @@ pub(crate) unsafe fn make_sqe_udp_recv_from(
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
-    let fd = user.fd;
-    let recv_buf = &mut user.buf;
-
-    let (ptr, len) = recv_buf
-        .checked_read_range(user.buf_offset)
+    let msg = unsafe { kernel.init_recv_from(user) }
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_udp_recv_from", err))?;
-    kernel.iovec[0].iov_base = ptr as *mut _;
-    kernel.iovec[0].iov_len = len as usize;
 
-    kernel.msghdr.msg_name = &mut kernel.msg_name as *mut _ as *mut libc::c_void;
-    kernel.msghdr.msg_namelen = size_of::<libc::sockaddr_storage>() as _;
-    kernel.msghdr.msg_iov = kernel.iovec.as_mut_ptr();
-    kernel.msghdr.msg_iovlen = 1;
-
-    let sqe_fd = resolve_socket_fd(env.file_table, fd, "uring.op.submit.make_sqe_udp_recv_from")?;
-    let msghdr = &mut kernel.msghdr as *mut _;
-    Ok(sqe_with_fd!(sqe_fd, |f| opcode::RecvMsg::new(f, msghdr).build()))
+    let sqe_fd = resolve_socket_fd(
+        env.file_table,
+        user.fd,
+        "uring.op.submit.make_sqe_udp_recv_from",
+    )?;
+    Ok(sqe_with_fd!(sqe_fd, |f| {
+        opcode::RecvMsg::new(f, msg.into_ptr()).build()
+    }))
 }
 
 pub(crate) unsafe fn on_complete_udp_recv_from(
@@ -283,10 +262,6 @@ pub(crate) unsafe fn on_complete_udp_recv_from(
             .set_error_code(-result));
     }
 
-    let len = kernel.msghdr.msg_namelen as usize;
-    let addr_bytes = unsafe { from_raw_parts(&kernel.msg_name as *const _ as *const u8, len) };
-    if let Ok(addr) = to_socket_addr(addr_bytes) {
-        user.addr = Some(addr);
-    }
+    user.addr = Some(kernel.finish_recv_from()?);
     Ok(result as usize)
 }

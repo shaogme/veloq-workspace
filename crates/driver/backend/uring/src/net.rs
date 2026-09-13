@@ -145,9 +145,11 @@ impl Socket {
             return Err(UringError::Socket
                 .io_report("socket.local_addr.getsockname", io::Error::last_os_error()));
         }
-        to_socket_addr(unsafe {
-            slice::from_raw_parts(&storage as *const _ as *const u8, len as usize)
-        })
+        to_socket_addr(bounded_sockaddr_bytes(
+            &storage,
+            len as usize,
+            "socket.local_addr.getsockname",
+        )?)
         .attach_note("socket.local_addr.decode")
     }
 
@@ -287,9 +289,11 @@ fn peer_addr_of(fd: RawFd) -> UringResult<SocketAddr> {
         return Err(UringError::Socket
             .io_report("socket.peer_addr.getpeername", io::Error::last_os_error()));
     }
-    to_socket_addr(unsafe {
-        slice::from_raw_parts(&storage as *const _ as *const u8, len as usize)
-    })
+    to_socket_addr(bounded_sockaddr_bytes(
+        &storage,
+        len as usize,
+        "socket.peer_addr.getpeername",
+    )?)
     .attach_note("socket.peer_addr.decode")
 }
 
@@ -355,6 +359,29 @@ pub fn to_socket_addr(buf: &[u8]) -> UringResult<SocketAddr> {
     }
 }
 
+/// Returns the initialized prefix of a C socket-address buffer.
+///
+/// The length comes from a kernel-written `socklen_t` or from a C socket API. Keep this check
+/// next to the only `from_raw_parts` call so every caller proves that the length fits the storage
+/// object before exposing the bytes to the address decoder.
+pub(crate) fn bounded_sockaddr_bytes<'a>(
+    storage: &'a libc::sockaddr_storage,
+    len: usize,
+    scope: &'static str,
+) -> UringResult<&'a [u8]> {
+    let capacity = size_of::<libc::sockaddr_storage>();
+    if len > capacity {
+        return Err(UringError::InvalidState
+            .report(scope, "socket address length exceeds storage capacity")
+            .with_ctx("address_length", len)
+            .with_ctx("address_capacity", capacity));
+    }
+
+    // SAFETY: `storage` is a valid initialized sockaddr buffer and `len` was checked against its
+    // size immediately above.
+    Ok(unsafe { slice::from_raw_parts(storage as *const _ as *const u8, len) })
+}
+
 pub fn socket_addr_to_storage(addr: SocketAddr) -> (SockAddrStorage, socklen_t) {
     let mut storage = SockAddrStorage::default();
     let len = match addr {
@@ -380,4 +407,42 @@ pub fn socket_addr_to_storage(addr: SocketAddr) -> (SockAddrStorage, socklen_t) 
         }
     };
     (storage, len)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use veloq_std::mem::size_of;
+
+    fn storage() -> libc::sockaddr_storage {
+        let mut storage: libc::sockaddr_storage = unsafe { zeroed() };
+        storage.ss_family = libc::AF_INET as _;
+        storage
+    }
+
+    #[test]
+    fn bounded_sockaddr_bytes_accepts_lengths_within_storage() {
+        let storage = storage();
+        let bytes = bounded_sockaddr_bytes(
+            &storage,
+            size_of::<libc::sockaddr_in>(),
+            "uring.net.tests.valid_sockaddr",
+        )
+        .expect("a sockaddr_in fits in sockaddr_storage");
+        assert_eq!(bytes.len(), size_of::<libc::sockaddr_in>());
+    }
+
+    #[test]
+    fn bounded_sockaddr_bytes_rejects_lengths_beyond_storage() {
+        let storage = storage();
+        let result = bounded_sockaddr_bytes(
+            &storage,
+            size_of::<libc::sockaddr_storage>() + 1,
+            "uring.net.tests.invalid_sockaddr",
+        );
+        let Err(report) = result else {
+            panic!("an oversized sockaddr length must be rejected");
+        };
+        assert_eq!(*report.inner(), UringError::InvalidState);
+    }
 }

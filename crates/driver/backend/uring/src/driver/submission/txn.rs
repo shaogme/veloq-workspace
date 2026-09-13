@@ -71,7 +71,7 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
         let strategy = slot
             .op_mut()
             .map_err(|err| slot_access_report("driver.submit_txn.strategy", err))?
-            .vtable
+            .vtable()
             .strategy;
 
         match strategy {
@@ -81,8 +81,9 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                     let sqe_env = self.env.sqe_env();
                     let token = self.token;
                     slot.with_op_and_payload_mut(|op, payload| {
-                        let vtable = op.vtable;
-                        let count = unsafe { (vtable.resolve_chunks)(op, payload, &mut chunks) };
+                        let vtable = op.vtable();
+                        let count =
+                            unsafe { (vtable.resolve_chunks)(op, payload, token, &mut chunks) }?;
                         super::validate_resolved_chunk_count(
                             count,
                             chunks.len(),
@@ -151,10 +152,12 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
             SubmissionStrategy::SoftwareTimer => {
                 let duration_opt = slot
                     .with_op_and_payload_mut(|op, payload| {
-                        let vtable = op.vtable;
-                        unsafe { (vtable.get_timeout)(op, payload) }
+                        let vtable = op.vtable();
+                        unsafe { (vtable.get_timeout)(op, payload, self.token) }
                     })
-                    .map_err(|err| slot_access_report("driver.submit_txn.timer.op_payload", err))?;
+                    .map_err(|err| {
+                        slot_access_report("driver.submit_txn.timer.op_payload", err)
+                    })??;
                 let Some(duration) = duration_opt else {
                     return Err(UringError::InvalidInput
                         .report("driver.submit_txn.timer_duration", "Timer duration missing"));

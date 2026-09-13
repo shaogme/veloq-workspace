@@ -10,11 +10,18 @@ pub(crate) use veloq_driver_core::op::types::{
     WriteRaw as CoreWriteRaw,
 };
 
-use crate::config::{SockAddrStorage, UringRawHandle};
+use crate::{
+    config::{SockAddrStorage, UringRawHandle},
+    error::UringResult,
+    net::{bounded_sockaddr_bytes, socket_addr_to_storage, to_socket_addr},
+};
 use io_uring::types::Timespec;
+use veloq_buf::BufIoRangeError;
 use veloq_std::{
     marker::{PhantomData, PhantomPinned},
-    mem, ptr,
+    mem,
+    net::SocketAddr,
+    ptr,
 };
 
 pub(crate) type ReadFixed = CoreReadFixed<UringRawHandle>;
@@ -41,6 +48,83 @@ pub(crate) type AcceptMulti = CoreAcceptMulti<UringRawHandle>;
 pub(crate) type SendTo = CoreSendTo<UringRawHandle>;
 pub(crate) type UdpRecvFrom = CoreUdpRecvFrom<UringRawHandle>;
 pub(crate) type Wakeup = CoreWakeup<UringRawHandle>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UringPayloadTag {
+    ReadFixed,
+    Read,
+    ReadRaw,
+    WriteFixed,
+    Write,
+    WriteRaw,
+    Recv,
+    RecvProvided,
+    RecvMulti,
+    ProvidedBuf,
+    OpSend,
+    Send,
+    UdpRecv,
+    UdpSend,
+    Connect,
+    UdpConnect,
+    Close,
+    Fsync,
+    FsyncRaw,
+    SyncFileRange,
+    SyncRange,
+    SyncFileRangeRaw,
+    SyncRangeRaw,
+    Fallocate,
+    FallocateRaw,
+    Accept,
+    AcceptMulti,
+    AcceptedSocket,
+    SendTo,
+    UdpRecvFrom,
+    Open,
+    Wakeup,
+    Timeout,
+}
+
+impl UringPayloadTag {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::ReadFixed => "ReadFixed",
+            Self::Read => "Read",
+            Self::ReadRaw => "ReadRaw",
+            Self::WriteFixed => "WriteFixed",
+            Self::Write => "Write",
+            Self::WriteRaw => "WriteRaw",
+            Self::Recv => "Recv",
+            Self::RecvProvided => "RecvProvided",
+            Self::RecvMulti => "RecvMulti",
+            Self::ProvidedBuf => "ProvidedBuf",
+            Self::OpSend => "OpSend",
+            Self::Send => "Send",
+            Self::UdpRecv => "UdpRecv",
+            Self::UdpSend => "UdpSend",
+            Self::Connect => "Connect",
+            Self::UdpConnect => "UdpConnect",
+            Self::Close => "Close",
+            Self::Fsync => "Fsync",
+            Self::FsyncRaw => "FsyncRaw",
+            Self::SyncFileRange => "SyncFileRange",
+            Self::SyncRange => "SyncRange",
+            Self::SyncFileRangeRaw => "SyncFileRangeRaw",
+            Self::SyncRangeRaw => "SyncRangeRaw",
+            Self::Fallocate => "Fallocate",
+            Self::FallocateRaw => "FallocateRaw",
+            Self::Accept => "Accept",
+            Self::AcceptMulti => "AcceptMulti",
+            Self::AcceptedSocket => "AcceptedSocket",
+            Self::SendTo => "SendTo",
+            Self::UdpRecvFrom => "UdpRecvFrom",
+            Self::Open => "Open",
+            Self::Wakeup => "Wakeup",
+            Self::Timeout => "Timeout",
+        }
+    }
+}
 
 pub enum UringUserPayload {
     ReadFixed(ReadFixed),
@@ -83,6 +167,41 @@ pub enum UringUserPayload {
     Timeout(Timeout),
 }
 
+impl UringUserPayload {
+    pub(crate) const fn tag(&self) -> UringPayloadTag {
+        match self {
+            Self::ReadFixed(_) => UringPayloadTag::ReadFixed,
+            Self::ReadRaw(_) => UringPayloadTag::ReadRaw,
+            Self::WriteFixed(_) => UringPayloadTag::WriteFixed,
+            Self::WriteRaw(_) => UringPayloadTag::WriteRaw,
+            Self::Recv(_) => UringPayloadTag::Recv,
+            Self::RecvProvided(_) => UringPayloadTag::RecvProvided,
+            Self::RecvMulti(_) => UringPayloadTag::RecvMulti,
+            Self::ProvidedBuf(_) => UringPayloadTag::ProvidedBuf,
+            Self::OpSend(_) => UringPayloadTag::OpSend,
+            Self::UdpRecv(_) => UringPayloadTag::UdpRecv,
+            Self::UdpSend(_) => UringPayloadTag::UdpSend,
+            Self::Connect(_) => UringPayloadTag::Connect,
+            Self::UdpConnect(_) => UringPayloadTag::UdpConnect,
+            Self::Close(_) => UringPayloadTag::Close,
+            Self::Fsync(_) => UringPayloadTag::Fsync,
+            Self::FsyncRaw(_) => UringPayloadTag::FsyncRaw,
+            Self::SyncFileRange(_) => UringPayloadTag::SyncFileRange,
+            Self::SyncFileRangeRaw(_) => UringPayloadTag::SyncFileRangeRaw,
+            Self::Fallocate(_) => UringPayloadTag::Fallocate,
+            Self::FallocateRaw(_) => UringPayloadTag::FallocateRaw,
+            Self::Accept(_) => UringPayloadTag::Accept,
+            Self::AcceptMulti(_) => UringPayloadTag::AcceptMulti,
+            Self::AcceptedSocket(_) => UringPayloadTag::AcceptedSocket,
+            Self::SendTo(_) => UringPayloadTag::SendTo,
+            Self::UdpRecvFrom(_) => UringPayloadTag::UdpRecvFrom,
+            Self::Open(_) => UringPayloadTag::Open,
+            Self::Wakeup(_) => UringPayloadTag::Wakeup,
+            Self::Timeout(_) => UringPayloadTag::Timeout,
+        }
+    }
+}
+
 pub(crate) struct KernelRef<T> {
     pub(crate) marker: PhantomData<T>,
 }
@@ -104,11 +223,11 @@ pub(crate) struct AcceptPayload {}
 /// Once populated, this payload MUST NOT be moved in memory until the operation completes
 /// or fails in the kernel. `PhantomPinned` enforces !Unpin in the type system.
 pub(crate) struct SendToPayload {
-    pub(crate) msg_name: libc::sockaddr_storage,
-    pub(crate) msg_namelen: libc::socklen_t,
-    pub(crate) iovec: [libc::iovec; 1],
-    pub(crate) msghdr: libc::msghdr,
-    pub(crate) _pin: PhantomPinned,
+    msg_name: libc::sockaddr_storage,
+    msg_namelen: libc::socklen_t,
+    iovec: [libc::iovec; 1],
+    msghdr: libc::msghdr,
+    _pin: PhantomPinned,
 }
 
 /// Kernel payload for [`UdpRecvFrom`].
@@ -120,10 +239,34 @@ pub(crate) struct SendToPayload {
 /// Once populated, this payload MUST NOT be moved in memory until the operation completes
 /// or fails in the kernel. `PhantomPinned` enforces !Unpin in the type system.
 pub(crate) struct UdpRecvFromPayload {
-    pub(crate) msg_name: libc::sockaddr_storage,
-    pub(crate) iovec: [libc::iovec; 1],
-    pub(crate) msghdr: libc::msghdr,
-    pub(crate) _pin: PhantomPinned,
+    msg_name: libc::sockaddr_storage,
+    iovec: [libc::iovec; 1],
+    msghdr: libc::msghdr,
+    _pin: PhantomPinned,
+}
+
+/// A read-only SQE pointer backed by a [`SendToPayload`].
+pub(crate) struct SendMsgView<'a> {
+    msghdr: &'a libc::msghdr,
+}
+
+impl SendMsgView<'_> {
+    #[inline]
+    pub(crate) fn as_ptr(&self) -> *const libc::msghdr {
+        self.msghdr
+    }
+}
+
+/// A writable SQE pointer backed by a [`UdpRecvFromPayload`].
+pub(crate) struct RecvMsgView<'a> {
+    msghdr: &'a mut libc::msghdr,
+}
+
+impl RecvMsgView<'_> {
+    #[inline]
+    pub(crate) fn into_ptr(self) -> *mut libc::msghdr {
+        self.msghdr
+    }
 }
 
 pub(crate) struct OpenPayload {}
@@ -167,6 +310,45 @@ impl SendToPayload {
             _pin: PhantomPinned,
         }
     }
+
+    /// Initializes the address buffer, iovec, and `sendmsg` header for submission.
+    ///
+    /// # Safety
+    ///
+    /// The caller must keep `self` at the same address until the kernel has stopped using the
+    /// returned message view. The view stores a pointer into `self`, and the SQE can outlive this
+    /// Rust borrow until its completion or cancellation is observed.
+    pub(crate) unsafe fn init_send_to<'a>(
+        &'a mut self,
+        user: &mut SendTo,
+    ) -> Result<SendMsgView<'a>, BufIoRangeError> {
+        let (ptr, len) = user.buf.checked_write_range(user.buf_offset)?;
+        self.iovec[0].iov_base = ptr as *mut _;
+        self.iovec[0].iov_len = len as usize;
+
+        let (msg_name, msg_namelen) = socket_addr_to_storage(user.addr);
+        self.msg_name = msg_name.0;
+        self.msg_namelen = msg_namelen;
+        self.msghdr.msg_name = ptr::addr_of_mut!(self.msg_name).cast();
+        self.msghdr.msg_namelen = self.msg_namelen;
+        self.msghdr.msg_iov = self.iovec.as_mut_ptr();
+        self.msghdr.msg_iovlen = 1;
+
+        Ok(SendMsgView {
+            msghdr: &self.msghdr,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pointers(
+        &mut self,
+    ) -> (*mut libc::c_void, *mut libc::iovec, *const libc::msghdr) {
+        (
+            ptr::addr_of_mut!(self.msg_name).cast(),
+            self.iovec.as_mut_ptr(),
+            ptr::addr_of!(self.msghdr),
+        )
+    }
 }
 
 impl UdpRecvFromPayload {
@@ -181,6 +363,61 @@ impl UdpRecvFromPayload {
             msghdr: zeroed_msghdr(),
             _pin: PhantomPinned,
         }
+    }
+
+    /// Initializes the address buffer, iovec, and `recvmsg` header for submission.
+    ///
+    /// # Safety
+    ///
+    /// The caller must keep `self` at the same address until the kernel has stopped using the
+    /// returned message view. The view stores pointers into `self`, and the SQE can outlive this
+    /// Rust borrow until its completion or cancellation is observed.
+    pub(crate) unsafe fn init_recv_from<'a>(
+        &'a mut self,
+        user: &mut UdpRecvFrom,
+    ) -> Result<RecvMsgView<'a>, BufIoRangeError> {
+        let (ptr, len) = user.buf.checked_read_range(user.buf_offset)?;
+        self.iovec[0].iov_base = ptr as *mut _;
+        self.iovec[0].iov_len = len as usize;
+
+        self.msghdr.msg_name = ptr::addr_of_mut!(self.msg_name).cast();
+        self.msghdr.msg_namelen = mem::size_of::<libc::sockaddr_storage>() as _;
+        self.msghdr.msg_iov = self.iovec.as_mut_ptr();
+        self.msghdr.msg_iovlen = 1;
+
+        Ok(RecvMsgView {
+            msghdr: &mut self.msghdr,
+        })
+    }
+
+    pub(crate) fn finish_recv_from(&self) -> UringResult<SocketAddr> {
+        let addr_bytes = bounded_sockaddr_bytes(
+            &self.msg_name,
+            self.msghdr.msg_namelen as usize,
+            "uring.op.payload.finish_recv_from",
+        )?;
+        to_socket_addr(addr_bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pointers(
+        &mut self,
+    ) -> (*mut libc::c_void, *mut libc::iovec, *const libc::msghdr) {
+        (
+            ptr::addr_of_mut!(self.msg_name).cast(),
+            self.iovec.as_mut_ptr(),
+            ptr::addr_of!(self.msghdr),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_received_address(
+        &mut self,
+        storage: libc::sockaddr_storage,
+        len: usize,
+    ) {
+        self.msg_name = storage;
+        self.msghdr.msg_namelen = len as _;
     }
 }
 
@@ -234,4 +471,37 @@ pub(crate) enum UringOpPayload {
     Open(OpenPayload),
     Wakeup(WakeupPayload),
     Timeout(TimeoutPayload),
+}
+
+impl UringOpPayload {
+    pub(crate) const fn tag(&self) -> UringPayloadTag {
+        match self {
+            Self::Read(_) => UringPayloadTag::Read,
+            Self::ReadRaw(_) => UringPayloadTag::ReadRaw,
+            Self::Write(_) => UringPayloadTag::Write,
+            Self::WriteRaw(_) => UringPayloadTag::WriteRaw,
+            Self::Recv(_) => UringPayloadTag::Recv,
+            Self::RecvProvided(_) => UringPayloadTag::RecvProvided,
+            Self::RecvMulti(_) => UringPayloadTag::RecvMulti,
+            Self::Send(_) => UringPayloadTag::Send,
+            Self::UdpRecv(_) => UringPayloadTag::UdpRecv,
+            Self::UdpSend(_) => UringPayloadTag::UdpSend,
+            Self::Connect(_) => UringPayloadTag::Connect,
+            Self::UdpConnect(_) => UringPayloadTag::UdpConnect,
+            Self::Close(_) => UringPayloadTag::Close,
+            Self::Fsync(_) => UringPayloadTag::Fsync,
+            Self::FsyncRaw(_) => UringPayloadTag::FsyncRaw,
+            Self::SyncRange(_) => UringPayloadTag::SyncRange,
+            Self::SyncRangeRaw(_) => UringPayloadTag::SyncRangeRaw,
+            Self::Fallocate(_) => UringPayloadTag::Fallocate,
+            Self::FallocateRaw(_) => UringPayloadTag::FallocateRaw,
+            Self::Accept(_) => UringPayloadTag::Accept,
+            Self::AcceptMulti(_) => UringPayloadTag::AcceptMulti,
+            Self::SendTo(_) => UringPayloadTag::SendTo,
+            Self::UdpRecvFrom(_) => UringPayloadTag::UdpRecvFrom,
+            Self::Open(_) => UringPayloadTag::Open,
+            Self::Wakeup(_) => UringPayloadTag::Wakeup,
+            Self::Timeout(_) => UringPayloadTag::Timeout,
+        }
+    }
 }

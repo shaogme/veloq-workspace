@@ -70,7 +70,7 @@ pub(crate) fn submit_queued_from_slot(
     let strategy = slot
         .op_mut()
         .map_err(|err| slot_access_report("driver.submit_queued_from_slot.strategy", err))?
-        .vtable
+        .vtable()
         .strategy;
     if strategy != SubmissionStrategy::SubmitSqe {
         return UringError::InvalidState
@@ -84,8 +84,8 @@ pub(crate) fn submit_queued_from_slot(
     let (count, sqe, completion_token, cleanup_hint) = {
         let sqe_env = env.sqe_env();
         slot.with_op_and_payload_mut(|op, payload| {
-            let vtable = op.vtable;
-            let count = unsafe { (vtable.resolve_chunks)(op, payload, &mut chunks) };
+            let vtable = op.vtable();
+            let count = unsafe { (vtable.resolve_chunks)(op, payload, token, &mut chunks) }?;
             validate_resolved_chunk_count(
                 count,
                 chunks.len(),

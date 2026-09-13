@@ -9,7 +9,7 @@ use io_uring::squeue;
 use veloq_buf::heap::ChunkId;
 use veloq_driver_core::{
     driver::{
-        CompletionCleanupGuard, PlatformOp, SubmitTokenContext,
+        CompletionCleanupGuard, OpToken, PlatformOp, SubmitTokenContext,
         registry::OpRegistry as CoreOpRegistry,
     },
     slot::{Slot as CoreSlot, SlotSpec as CoreSlotSpec},
@@ -20,7 +20,6 @@ mod payload;
 mod spec;
 mod submit;
 
-pub(crate) use payload::UringOpPayload;
 pub use payload::UringUserPayload;
 pub(crate) use payload::{
     Accept, AcceptMulti, AcceptedSocket, Close, Connect, Fallocate, FallocateRaw, Fsync, FsyncRaw,
@@ -28,8 +27,8 @@ pub(crate) use payload::{
     SyncFileRange, SyncFileRangeRaw, Timeout, UdpConnect, UdpRecv, UdpRecvFrom, UdpSend, Wakeup,
     WriteFixed, WriteRaw,
 };
+pub(crate) use payload::{UringOpPayload, UringPayloadTag};
 
-#[cfg(test)]
 pub(crate) use spec::UringOpErasure;
 
 pub(crate) use submit::sqe_with_fd;
@@ -52,22 +51,36 @@ pub(crate) type MakeSqeFn = unsafe fn(
 pub(crate) type OnCompleteFn = unsafe fn(
     op: &mut UringKernelOp,
     payload: &mut UringUserPayload,
+    token: OpToken,
     result: i32,
 ) -> UringResult<usize>;
 pub(crate) type CompletionCleanupFn =
-    unsafe fn(op: &mut UringKernelOp, result: i32) -> CompletionCleanupGuard;
+    unsafe fn(op: &mut UringKernelOp, result: i32) -> UringResult<CompletionCleanupGuard>;
 pub(crate) type CompletionCleanupHintFn = fn(result: i32) -> CompletionCleanupGuard;
 pub(crate) type OrphanCleanupFn =
-    unsafe fn(op: &mut UringKernelOp, result: i32) -> CompletionCleanupGuard;
-pub(crate) type GetTimeoutFn =
-    unsafe fn(op: &UringKernelOp, payload: &UringUserPayload) -> Option<Duration>;
-pub(crate) type ResolveChunksFn =
-    unsafe fn(op: &UringKernelOp, payload: &UringUserPayload, chunks: &mut [ChunkId]) -> usize;
+    unsafe fn(op: &mut UringKernelOp, result: i32) -> UringResult<CompletionCleanupGuard>;
+pub(crate) type GetTimeoutFn = unsafe fn(
+    op: &UringKernelOp,
+    payload: &UringUserPayload,
+    token: OpToken,
+) -> UringResult<Option<Duration>>;
+pub(crate) type ResolveChunksFn = unsafe fn(
+    op: &UringKernelOp,
+    payload: &UringUserPayload,
+    token: OpToken,
+    chunks: &mut [ChunkId],
+) -> UringResult<usize>;
+
+pub(crate) enum UringRecordItem {
+    UseSubmitPayload,
+    New(UringUserPayload),
+}
 
 /// 为一条完成构造它自己的记录 payload。
 ///
-/// 返回 `None` 表示这个操作的记录 payload **就是**提交 payload——绝大多数操作如此，完成
-/// 路径照旧把 slot 里那个取走。返回 `Some` 表示两者不是一回事：
+/// 返回 [`UringRecordItem::UseSubmitPayload`] 表示这个操作的记录 payload **就是**提交
+/// payload——绝大多数操作如此，完成路径照旧把 slot 里那个取走。返回
+/// [`UringRecordItem::New`] 表示两者不是一回事：
 ///
 /// - multishot（`AcceptMulti`）：提交 payload 是监听 socket，必须留在 slot 里给内核后续
 ///   的完成用，每条完成的产物是一个新连接；
@@ -78,10 +91,11 @@ pub(crate) type ResolveChunksFn =
 pub(crate) type RecordItemFn = unsafe fn(
     op: &mut UringKernelOp,
     payload: &mut UringUserPayload,
+    token: OpToken,
     result: i32,
     flags: u32,
     env: &mut CqeEnv<'_>,
-) -> UringResult<Option<UringUserPayload>>;
+) -> UringResult<UringRecordItem>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SubmissionStrategy {
@@ -92,6 +106,7 @@ pub(crate) enum SubmissionStrategy {
 }
 
 pub(crate) struct OpVTable {
+    pub(crate) operation_name: &'static str,
     pub(crate) make_sqe: MakeSqeFn,
     pub(crate) on_complete: OnCompleteFn,
     pub(crate) completion_cleanup: CompletionCleanupFn,
@@ -110,10 +125,10 @@ pub(crate) struct OpVTable {
 #[repr(C)]
 pub struct UringKernelOp {
     /// Virtual Table for dynamic dispatch
-    pub(crate) vtable: &'static OpVTable,
+    vtable: &'static OpVTable,
 
     /// Type-erased payload (kernel-side data)
-    pub(crate) payload: UringOpPayload,
+    payload: UringOpPayload,
 }
 
 impl PlatformOp for UringKernelOp {
@@ -121,16 +136,76 @@ impl PlatformOp for UringKernelOp {
 
     #[inline]
     fn completion_cleanup(&mut self, result: Self::CleanupContext<'_>) -> CompletionCleanupGuard {
-        unsafe { (self.vtable.completion_cleanup)(self, result) }
+        match self.completion_cleanup_checked(result) {
+            Ok(cleanup) => cleanup,
+            Err(report) => {
+                tracing::error!(
+                    operation = self.vtable.operation_name,
+                    report = ?report,
+                    "uring completion cleanup projection mismatch"
+                );
+                CompletionCleanupGuard::default()
+            }
+        }
     }
 
     #[inline]
     fn orphan_cleanup(&mut self, result: Self::CleanupContext<'_>) -> CompletionCleanupGuard {
-        unsafe { (self.vtable.orphan_cleanup)(self, result) }
+        match self.orphan_cleanup_checked(result) {
+            Ok(cleanup) => cleanup,
+            Err(report) => {
+                tracing::error!(
+                    operation = self.vtable.operation_name,
+                    report = ?report,
+                    "uring orphan cleanup projection mismatch"
+                );
+                CompletionCleanupGuard::default()
+            }
+        }
     }
 }
 
 impl UringKernelOp {
+    /// Constructs a type-erased operation with its vtable and kernel payload paired together.
+    #[inline]
+    pub(crate) fn new<S>(kernel_payload: S::KernelPayload) -> Self
+    where
+        S: UringOpErasure,
+    {
+        Self {
+            vtable: S::vtable(),
+            payload: S::erase_kernel_payload(kernel_payload),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn vtable(&self) -> &'static OpVTable {
+        self.vtable
+    }
+
+    #[inline]
+    pub(crate) fn completion_cleanup_checked(
+        &mut self,
+        result: i32,
+    ) -> UringResult<CompletionCleanupGuard> {
+        unsafe { (self.vtable.completion_cleanup)(self, result) }
+    }
+
+    #[inline]
+    pub(crate) fn orphan_cleanup_checked(
+        &mut self,
+        result: i32,
+    ) -> UringResult<CompletionCleanupGuard> {
+        unsafe { (self.vtable.orphan_cleanup)(self, result) }
+    }
+
+    /// Replaces the vtable with an intentionally mismatched one for projection tests only.
+    #[cfg(test)]
+    pub(crate) fn with_vtable_for_test(mut self, vtable: &'static OpVTable) -> Self {
+        self.vtable = vtable;
+        self
+    }
+
     #[inline]
     pub(crate) fn is_provided_multishot(&self) -> bool {
         matches!(self.payload, UringOpPayload::RecvMulti(_))

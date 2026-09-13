@@ -117,6 +117,22 @@ impl SqeEnv<'_> {
     }
 }
 
+#[cfg(test)]
+impl<'d> SqeEnv<'d> {
+    /// Creates the smallest submission environment needed by projection tests.
+    pub(crate) fn for_test(
+        file_table: &'d FileTable,
+        registrar: &'d (dyn BufferRegistrar + 'd),
+    ) -> Self {
+        Self {
+            file_table,
+            chunk_records: &[],
+            registrar,
+            provided: None,
+        }
+    }
+}
+
 /// The driver state a completion is allowed to reach.
 ///
 /// Mirrors [`SqeEnv`] on the other end of an operation. The completion path holds a slot
