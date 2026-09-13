@@ -137,31 +137,38 @@ fn register_internal(
     state: &RefCell<WorkerRegistrarState>,
     regions: &[BufferRegion],
 ) -> BufResult<Vec<ChunkId>> {
+    let mut driver = driver.borrow_mut();
+    register_regions_with(state, regions, |region| {
+        let status = driver
+            .register_buffer(region.id(), region.as_ptr(), region.len())
+            .map_err(|err| BufError::Other(format!("{err:#}")))?;
+        Ok(status)
+    })
+}
+
+fn register_regions_with<F>(
+    state: &RefCell<WorkerRegistrarState>,
+    regions: &[BufferRegion],
+    mut register: F,
+) -> BufResult<Vec<ChunkId>>
+where
+    F: FnMut(&BufferRegion) -> BufResult<BufferRegistrationStatus>,
+{
     let mut indices = Vec::with_capacity(regions.len());
-    let mut new_chunks = Vec::with_capacity(regions.len());
-
-    {
-        let mut driver = driver.borrow_mut();
-        for region in regions {
-            let chunk_id = region.id();
-            let status = driver
-                .register_buffer(chunk_id, region.as_ptr(), region.len())
-                .map_err(|err| BufError::Other(format!("{err:#}")))?;
-
-            new_chunks.push(ChunkInfo {
-                id: chunk_id,
-                ptr: unsafe { NonNull::new_unchecked(region.as_ptr() as *mut u8) },
-                len: unsafe { NonZeroUsize::new_unchecked(region.len()) },
-            });
-            if matches!(status, BufferRegistrationStatus::Registered) {
-                indices.push(chunk_id);
-            }
+    for region in regions {
+        let status = register(region)?;
+        // Commit each prefix entry immediately. If a later region fails, the backend may already
+        // own a persistent registration for the earlier regions; resolve must expose exactly the
+        // same prefix so subsequent raw fallback can still use its buffers.
+        state.borrow_mut().chunks.push(ChunkInfo {
+            id: region.id(),
+            ptr: unsafe { NonNull::new_unchecked(region.as_ptr() as *mut u8) },
+            len: unsafe { NonZeroUsize::new_unchecked(region.len()) },
+        });
+        if matches!(status, BufferRegistrationStatus::Registered) {
+            indices.push(region.id());
         }
     }
-
-    let mut state = state.borrow_mut();
-    state.chunks.extend(new_chunks);
-
     Ok(indices)
 }
 
@@ -565,6 +572,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use veloq_buf::{BufferRegion, heap::ChunkInfo};
+    use veloq_driver_native::driver::BufferRegistrationStatus;
     use veloq_std::time::Duration;
 
     use super::*;
@@ -617,5 +626,51 @@ mod tests {
                 timeout: Some(Duration::from_millis(7))
             }
         );
+    }
+
+    #[test]
+    fn registrar_commits_only_the_processed_prefix() {
+        let (sender, receiver) = mpsc::channel();
+        drop(sender);
+        let state = RefCell::new(WorkerRegistrarState {
+            receiver,
+            chunks: Vec::new(),
+        });
+        let first = ChunkInfo {
+            id: ChunkId::from_raw(1),
+            ptr: NonNull::new(Box::leak(Box::new([0_u8; 4096])).as_mut_ptr())
+                .expect("first chunk pointer"),
+            len: NonZeroUsize::new(4096).expect("first chunk length"),
+        };
+        let second = ChunkInfo {
+            id: ChunkId::from_raw(2),
+            ptr: NonNull::new(Box::leak(Box::new([0_u8; 4096])).as_mut_ptr())
+                .expect("second chunk pointer"),
+            len: NonZeroUsize::new(4096).expect("second chunk length"),
+        };
+        let regions = [
+            BufferRegion::from_chunk_info(first).expect("first region"),
+            BufferRegion::from_chunk_info(second).expect("second region"),
+        ];
+
+        let result = register_regions_with(&state, &regions, |region| {
+            if region.id() == first.id {
+                Ok(BufferRegistrationStatus::Registered)
+            } else {
+                Err(BufError::Other("injected second-region failure".into()).into())
+            }
+        });
+
+        assert!(result.is_err());
+        {
+            let chunks = &state.borrow().chunks;
+            assert_eq!(chunks.len(), 1);
+            assert_eq!(chunks[0].id, first.id);
+        }
+        let resolved = resolve_chunk_info_internal(&state, first.id).expect("first metadata");
+        assert_eq!(resolved.id, first.id);
+        assert_eq!(resolved.ptr, first.ptr);
+        assert_eq!(resolved.len, first.len);
+        assert!(resolve_chunk_info_internal(&state, second.id).is_none());
     }
 }

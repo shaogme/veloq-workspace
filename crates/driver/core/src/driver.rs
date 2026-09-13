@@ -740,6 +740,9 @@ pub mod test_hooks {
 
         fn debug_inject_register_buffers_update_failure(&mut self, _errno: i32) {}
 
+        /// Injects a fixed-buffer update error whose kernel effect is deliberately unknown.
+        fn debug_inject_register_buffers_update_unknown(&mut self, _errno: i32) {}
+
         fn debug_inject_register_buffers_update_sequence(&mut self, _outcomes: &[Option<i32>]) {}
 
         fn debug_inject_register_files_update_failure(&mut self, _errno: i32) {}
@@ -818,6 +821,11 @@ impl<'a, D: Driver + ?Sized + DriverTestHooks, P: ContextDriverProvider<D> + ?Si
     fn debug_inject_register_buffers_update_failure(&mut self, errno: i32) {
         self.provider
             .with_driver_mut(|d| d.debug_inject_register_buffers_update_failure(errno))
+    }
+
+    fn debug_inject_register_buffers_update_unknown(&mut self, errno: i32) {
+        self.provider
+            .with_driver_mut(|d| d.debug_inject_register_buffers_update_unknown(errno))
     }
 
     fn debug_inject_register_buffers_update_sequence(&mut self, outcomes: &[Option<i32>]) {

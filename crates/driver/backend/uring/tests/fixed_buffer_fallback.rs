@@ -298,6 +298,55 @@ fn strict_mode_rejects_registration_failure_and_recovers_payload() {
 }
 
 #[test]
+fn compatible_mode_rejects_unknown_update_instead_of_falling_back() {
+    let (mut buffers, registrar) = slot_buffers(1, 4096);
+    let (_file_path, file) = open_file("unknown-update", b"unknown-update");
+    let Some(mut driver) = new_driver_or_skip(
+        veloq_driver_uring::BufferRegistrationMode::Compatible,
+        registrar,
+    ) else {
+        return;
+    };
+    let fd = register_file(&mut driver, &file);
+    {
+        let hooks = &mut driver as &mut dyn DriverTestHooks;
+        if !hooks.debug_fixed_buffers_available() {
+            return;
+        }
+        hooks.debug_inject_register_buffers_update_unknown(libc::EIO);
+    }
+
+    let (kernel, payload) = <ReadFixed as IntoPlatformOp<UringSlotSpec>>::into_kernel_and_payload(
+        fixed_read(buffers.pop().expect("unknown-update buffer"), fd),
+    );
+    let mut kernel_op: Option<UringOp> = Some(kernel);
+    let mut slot = driver
+        .reserve_op()
+        .expect("reserve unknown-update operation");
+    slot.set_payload(<ReadFixed as IntoPlatformOp<UringSlotSpec>>::payload_into_erased(payload));
+
+    match slot.submit(&mut kernel_op) {
+        DriverSubmitResult::Failed {
+            report,
+            status: SubmitStatus::Void,
+        } => assert_eq!(*report.inner(), UringError::Registration),
+        DriverSubmitResult::Failed { status, .. } => {
+            panic!("unknown update must be void, got {status:?}")
+        }
+        DriverSubmitResult::Submitted(_) => panic!("unknown update must not be submitted"),
+    }
+
+    assert!(matches!(
+        slot.recover_payload(),
+        Some(UringUserPayload::ReadFixed(_))
+    ));
+    let hooks = &driver as &dyn DriverTestHooks;
+    assert_eq!(hooks.debug_chunk_register_attempts(), 1);
+    assert_eq!(hooks.debug_chunk_register_failures(), 1);
+    assert_eq!(hooks.debug_raw_buffer_fallbacks(), 0);
+}
+
+#[test]
 fn bitset_failure_clears_kernel_slot_before_returning_error() {
     let (mut buffers, registrar) = slot_buffers(1, 4096);
     let (_file_path, file) = open_file("bitset-cleanup", b"bitset-cleanup");
@@ -364,7 +413,8 @@ fn failed_bitset_cleanup_quarantines_the_fixed_buffer_registry() {
         }
         // The cleanup failure leaves the kernel slot unknown, so all later buffer submissions must
         // fail until this ring is rebuilt.
-        hooks.debug_inject_register_buffers_update_sequence(&[None, Some(libc::EIO)]);
+        hooks.debug_inject_register_buffers_update_sequence(&[None]);
+        hooks.debug_inject_register_buffers_update_unknown(libc::EIO);
         hooks.debug_inject_bitset_set_failure();
     }
 

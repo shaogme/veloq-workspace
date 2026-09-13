@@ -8,6 +8,7 @@
 
 use crate::{
     config::{BufferRegistrationMode, IoFd},
+    diagnostics::UringCompletionDiagnostics,
     driver::lifecycle::{CancellationPhase, SubmissionPhase},
     driver::{
         FileTable, MAX_CHUNKS, PendingCancel, ProvidedBufGroup, UringDriver,
@@ -16,7 +17,10 @@ use crate::{
             ControlPlaneEvent, ControlPlaneObserver, StagedEntry, UringControlEffectKind,
             UringControlPlane, UringPostCompletionEffects, transition_submission_phase,
         },
-        registration::{BufferRegistrationQuarantine, REGISTER_FAILURE_RETRY_COOLDOWN},
+        registration::{
+            BufferRegistrationQuarantine, ChunkRegistrationRecord, ChunkRegistrationState,
+            KernelUpdateOutcome, REGISTER_FAILURE_RETRY_COOLDOWN, UpdateEvidence,
+        },
     },
     error::{UringError, UringResult},
     op::{CompletionCleanupHintFn, UringOpRegistry},
@@ -31,10 +35,15 @@ use veloq_driver_core::driver::{
 use veloq_driver_core::slot::Generation;
 use veloq_std::{
     collections::{BitSet, HashMap, VecDeque},
-    format, io, ptr,
-    time::Instant,
+    format, ptr,
 };
 use veloq_wheel::Wheel;
+
+#[cfg(feature = "test-hooks")]
+use crate::driver::registration::buffer::BufferUpdateInjection;
+
+#[cfg(feature = "test-hooks")]
+use veloq_std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChunkRegistrationDecision {
@@ -67,7 +76,8 @@ impl ProvidedBufSqeInfo {
 /// *after* `make_sqe` returns, so nothing here needs to be mutated during SQE construction.
 pub(crate) struct SqeEnv<'d> {
     pub(crate) file_table: &'d FileTable,
-    registered_chunks: &'d BitSet,
+    chunk_records: &'d [Option<ChunkRegistrationRecord>],
+    registrar: &'d (dyn BufferRegistrar + 'd),
     provided: Option<ProvidedBufSqeInfo>,
 }
 
@@ -91,9 +101,19 @@ impl SqeEnv<'_> {
     /// same outcome as a chunk that has not been registered yet.
     #[inline]
     pub(crate) fn is_chunk_registered(&self, chunk: ChunkId) -> bool {
-        self.registered_chunks
+        let Some(record) = self
+            .chunk_records
             .get(chunk.as_usize())
-            .unwrap_or(false)
+            .and_then(Option::as_ref)
+        else {
+            return false;
+        };
+        let Some(info) = self.registrar.resolve_chunk_info(chunk) else {
+            return false;
+        };
+        record.state == ChunkRegistrationState::Registered
+            && info.id == chunk
+            && record.matches(chunk, info.ptr.as_ptr(), info.len.get())
     }
 }
 
@@ -106,14 +126,19 @@ impl SqeEnv<'_> {
 /// record leaves this function.
 pub(crate) struct CqeEnv<'d> {
     provided: Option<&'d mut ProvidedBufGroup>,
+    diagnostics: &'d UringCompletionDiagnostics,
     selected_buffer_settled: bool,
 }
 
 impl<'d> CqeEnv<'d> {
     #[inline]
-    pub(crate) fn new(provided: Option<&'d mut ProvidedBufGroup>) -> Self {
+    pub(crate) fn new(
+        provided: Option<&'d mut ProvidedBufGroup>,
+        diagnostics: &'d UringCompletionDiagnostics,
+    ) -> Self {
         Self {
             provided,
+            diagnostics,
             selected_buffer_settled: false,
         }
     }
@@ -133,8 +158,12 @@ impl<'d> CqeEnv<'d> {
         match self.provided.as_deref_mut() {
             Some(group) => {
                 let buffer = group.take_selected(flags, res);
-                if selected && buffer.is_some() {
-                    self.selected_buffer_settled = true;
+                if selected {
+                    if buffer.is_some() {
+                        self.selected_buffer_settled = true;
+                    } else {
+                        self.diagnostics.inc_provided_unknown_bid();
+                    }
                 }
                 Ok(buffer)
             }
@@ -156,7 +185,9 @@ impl<'d> CqeEnv<'d> {
             return;
         }
         if let Some(group) = self.provided.as_deref_mut() {
-            group.return_selected(flags);
+            if group.return_selected(flags) {
+                self.diagnostics.inc_provided_unknown_bid();
+            }
             self.selected_buffer_settled = true;
         }
     }
@@ -344,16 +375,17 @@ pub(crate) enum StageResult {
 pub(crate) struct SubmitResourceView<'d, 'r> {
     submitter: Submitter<'d>,
     file_table: &'d FileTable,
-    registered_chunks: &'d mut BitSet,
+    registered_chunks_cache: &'d mut BitSet,
+    chunk_records: &'d mut [Option<ChunkRegistrationRecord>],
+    registration_diagnostics: &'d UringCompletionDiagnostics,
     registrar: &'r (dyn BufferRegistrar + 'r),
     registration_stats: &'d mut UringRegistrationStats,
     registration_mode: BufferRegistrationMode,
     fixed_buffers_available: bool,
     fixed_buffers_failure_errno: Option<i32>,
-    chunk_register_failure_at: &'d mut [Option<Instant>],
     registration_quarantine: &'d mut Option<BufferRegistrationQuarantine>,
     #[cfg(feature = "test-hooks")]
-    register_buffers_update_outcomes: &'d mut VecDeque<Option<i32>>,
+    register_buffers_update_outcomes: &'d mut VecDeque<BufferUpdateInjection>,
     #[cfg(feature = "test-hooks")]
     bitset_set_failure: &'d mut bool,
     provided: Option<ProvidedBufSqeInfo>,
@@ -548,7 +580,8 @@ impl SubmitResourceView<'_, '_> {
     pub(crate) fn sqe_env(&self) -> SqeEnv<'_> {
         SqeEnv {
             file_table: self.file_table,
-            registered_chunks: self.registered_chunks,
+            chunk_records: self.chunk_records,
+            registrar: self.registrar,
             provided: self.provided,
         }
     }
@@ -560,44 +593,24 @@ impl SubmitResourceView<'_, '_> {
         ptr: *const u8,
         len: usize,
     ) -> UringResult<BufferRegistrationStatus> {
-        let index = id.as_usize();
-        if index >= MAX_CHUNKS {
-            return UringError::InvalidInput
-                .push_ctx("scope", "driver.register_buffer_internal")
-                .with_ctx("chunk_id", index)
-                .with_ctx("max_chunks", MAX_CHUNKS)
-                .attach_note("chunk id exceeds maximum registered chunk count");
-        }
+        let scope = "driver.register_buffer_internal";
+        let index = self.prepare_chunk_registration(id, ptr, len, scope)?;
+        self.ensure_registration_healthy(scope, id, None)?;
 
-        if ptr.is_null() || len == 0 {
-            return UringError::InvalidInput
-                .push_ctx("scope", "driver.register_buffer_internal")
-                .with_ctx("chunk_id", index)
-                .with_ctx("buffer_len", len)
-                .attach_note("fixed-buffer registration requires a non-null pointer and length");
-        }
-
-        self.ensure_registration_healthy("driver.register_buffer_internal", id, None)?;
-
-        let is_registered = self.registered_chunks.get(index).map_err(|e| {
-            UringError::InvalidState
-                .to_report()
-                .push_ctx("scope", "driver.register_buffer_internal")
-                .with_ctx("chunk_index", index)
-                .with_ctx("bitset_error", format!("{e:?}"))
-                .attach_note("BitSet get failed")
-        })?;
-        if is_registered {
-            return Ok(BufferRegistrationStatus::Registered);
+        if let Some(record) = self.chunk_records[index]
+            && record.state == ChunkRegistrationState::Registered
+        {
+            if record.matches(id, ptr, len) {
+                debug_assert!(self.cache_is_registered(index));
+                return Ok(BufferRegistrationStatus::Registered);
+            }
+            return self.identity_mismatch_status(id, ptr, len, scope, None, record);
         }
 
         if !self.fixed_buffers_available {
+            self.set_chunk_record(id, ptr, len, ChunkRegistrationState::Fallback);
             if self.registration_mode.is_strict() {
-                return Err(self.fixed_buffers_unavailable_report(
-                    "driver.register_buffer_internal",
-                    id,
-                    None,
-                ));
+                return Err(self.fixed_buffers_unavailable_report(scope, id, None));
             }
             return self.registration_unavailable(
                 id,
@@ -606,16 +619,17 @@ impl SubmitResourceView<'_, '_> {
             );
         }
 
-        if let Some(last_fail) = self.chunk_register_failure_at[index] {
+        if let Some(last_fail) = self.chunk_records[index].and_then(|record| record.last_failure) {
             if last_fail.elapsed() < REGISTER_FAILURE_RETRY_COOLDOWN {
                 self.registration_stats
                     .chunk_register_skipped_recent_failure = self
                     .registration_stats
                     .chunk_register_skipped_recent_failure
                     .saturating_add(1);
+                self.set_chunk_record(id, ptr, len, ChunkRegistrationState::Fallback);
                 if self.registration_mode.is_strict() {
                     return UringError::Registration
-                        .push_ctx("scope", "driver.register_buffer_internal")
+                        .push_ctx("scope", scope)
                         .with_ctx("chunk_id", id.raw())
                         .attach_note("recent chunk registration failure cooldown");
                 }
@@ -625,79 +639,266 @@ impl SubmitResourceView<'_, '_> {
                     "recent chunk registration failure cooldown",
                 );
             }
-            // The cooldown expired: drop the record now instead of letting it sit here for
-            // the lifetime of the driver.
-            self.chunk_register_failure_at[index] = None;
+            self.clear_chunk_failure(index);
         }
 
         let iovecs = [libc::iovec {
             iov_base: ptr as *mut _,
             iov_len: len,
         }];
-
-        // Use register_buffers_update. The wrapper is also the deterministic test-only fault
-        // injection boundary; production builds call the io_uring syscall directly.
+        self.set_chunk_record(id, ptr, len, ChunkRegistrationState::Registering);
         self.registration_stats.chunk_register_attempts = self
             .registration_stats
             .chunk_register_attempts
             .saturating_add(1);
-        let register_result = self.register_buffers_update(index as u32, &iovecs);
-        if let Err(e) = register_result {
-            self.registration_stats.chunk_register_failures = self
-                .registration_stats
-                .chunk_register_failures
-                .saturating_add(1);
-            self.chunk_register_failure_at[index] = Some(Instant::now());
-            let report = UringError::Registration
-                .io_report("driver.register_buffer_internal.register_buffers_update", e);
-            return if self.registration_mode.is_strict() {
-                Err(report)
-            } else {
-                self.registration_unavailable(
-                    id,
-                    Self::report_errno(&report),
-                    "chunk fixed-buffer registration failed",
-                )
-            };
-        }
+        let register = self.issue_chunk_update(index as u32, &iovecs);
 
-        if let Err(set_report) = self.mark_registered_chunk(index) {
-            let zero_iovec = [libc::iovec {
-                iov_base: ptr::null_mut(),
-                iov_len: 0,
-            }];
-            match self.register_buffers_update(index as u32, &zero_iovec) {
-                Ok(()) => {
-                    return Err(set_report.attach_note(
-                        "fixed-buffer registration was cleared after bitset update failed",
-                    ));
+        match register.outcome {
+            KernelUpdateOutcome::Applied(updated) if updated == register.requested => {
+                if let Err(set_report) = self.commit_chunk_registration(index, id, ptr, len) {
+                    return self.recover_failed_commit(id, ptr, len, set_report);
                 }
-                Err(cleanup_error) => {
-                    let cleanup_errno = cleanup_error.raw_os_error();
-                    *self.registration_quarantine = Some(BufferRegistrationQuarantine {
-                        chunk_id: id,
-                        register_errno: None,
-                        cleanup_errno,
-                        scope: "driver.register_buffer_internal.bitset_cleanup",
-                    });
-                    let report = if let Some(errno) = cleanup_errno {
-                        set_report.with_ctx("cleanup_errno", errno)
-                    } else {
-                        set_report.attach_note("fixed-buffer cleanup returned no errno")
-                    };
-                    return Err(report.attach_note(
-                        "fixed-buffer registration cleanup failed; ring is quarantined",
-                    ));
+                self.registration_stats.chunk_register_success = self
+                    .registration_stats
+                    .chunk_register_success
+                    .saturating_add(1);
+                debug_assert!(self.chunk_ledger_is_consistent());
+                Ok(BufferRegistrationStatus::Registered)
+            }
+            #[cfg(feature = "test-hooks")]
+            KernelUpdateOutcome::Rejected(errno) => {
+                self.note_chunk_registration_failure(id, ptr, len);
+                let report = self.chunk_update_report(
+                    "driver.register_buffer_internal.register_buffers_update",
+                    register,
+                    "fixed-buffer registration was rejected before reaching the kernel",
+                );
+                if self.registration_mode.is_strict() {
+                    Err(report)
+                } else {
+                    self.registration_unavailable(
+                        id,
+                        Some(errno),
+                        "fixed-buffer registration was explicitly rejected",
+                    )
                 }
             }
+            KernelUpdateOutcome::Unknown(_, _) => {
+                self.registration_stats.chunk_register_failures = self
+                    .registration_stats
+                    .chunk_register_failures
+                    .saturating_add(1);
+                self.quarantine_chunk(id, ptr, len, register, None);
+                Err(self.chunk_update_report(
+                    "driver.register_buffer_internal.register_buffers_update",
+                    register,
+                    "fixed-buffer registration result is unknown; ring is quarantined",
+                ))
+            }
+            KernelUpdateOutcome::Applied(_) => {
+                self.registration_stats.chunk_register_failures = self
+                    .registration_stats
+                    .chunk_register_failures
+                    .saturating_add(1);
+                self.quarantine_chunk(id, ptr, len, register, None);
+                Err(self.chunk_update_report(
+                    "driver.register_buffer_internal.register_buffers_update",
+                    register,
+                    "fixed-buffer registration applied an unexpected update count",
+                ))
+            }
         }
-        self.chunk_register_failure_at[index] = None;
-        self.registration_stats.chunk_register_success = self
-            .registration_stats
-            .chunk_register_success
-            .saturating_add(1);
+    }
 
-        Ok(BufferRegistrationStatus::Registered)
+    fn prepare_chunk_registration(
+        &self,
+        id: ChunkId,
+        ptr: *const u8,
+        len: usize,
+        scope: &'static str,
+    ) -> UringResult<usize> {
+        let index = id.as_usize();
+        if index >= MAX_CHUNKS {
+            return UringError::InvalidInput
+                .push_ctx("scope", scope)
+                .with_ctx("chunk_id", index)
+                .with_ctx("max_chunks", MAX_CHUNKS)
+                .attach_note("chunk id exceeds maximum registered chunk count");
+        }
+
+        if ptr.is_null() || len == 0 {
+            return UringError::InvalidInput
+                .push_ctx("scope", scope)
+                .with_ctx("chunk_id", index)
+                .with_ctx("buffer_len", len)
+                .attach_note("fixed-buffer registration requires a non-null pointer and length");
+        }
+        Ok(index)
+    }
+
+    fn set_chunk_record(
+        &mut self,
+        id: ChunkId,
+        ptr: *const u8,
+        len: usize,
+        state: ChunkRegistrationState,
+    ) {
+        let last_failure = (state == ChunkRegistrationState::Fallback)
+            .then(|| self.chunk_records[id.as_usize()].and_then(|record| record.last_failure))
+            .flatten();
+        self.chunk_records[id.as_usize()] =
+            Some(ChunkRegistrationRecord::new(id, ptr, len, state).with_last_failure(last_failure));
+    }
+
+    fn clear_chunk_failure(&mut self, index: usize) {
+        if let Some(record) = self.chunk_records[index].as_mut() {
+            record.last_failure = None;
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn note_chunk_registration_failure(&mut self, id: ChunkId, ptr: *const u8, len: usize) {
+        self.registration_stats.chunk_register_failures = self
+            .registration_stats
+            .chunk_register_failures
+            .saturating_add(1);
+        self.set_chunk_record(id, ptr, len, ChunkRegistrationState::Fallback);
+        if let Some(record) = self.chunk_records[id.as_usize()].as_mut() {
+            record.last_failure = Some(Instant::now());
+        }
+    }
+
+    fn cache_is_registered(&self, index: usize) -> bool {
+        self.registered_chunks_cache.get(index).unwrap_or(false)
+    }
+
+    #[inline]
+    fn is_record_registered(&self, id: ChunkId) -> bool {
+        let index = id.as_usize();
+        self.chunk_records
+            .get(index)
+            .and_then(Option::as_ref)
+            .is_some_and(|record| record.state == ChunkRegistrationState::Registered)
+    }
+
+    fn commit_chunk_registration(
+        &mut self,
+        index: usize,
+        id: ChunkId,
+        ptr: *const u8,
+        len: usize,
+    ) -> UringResult<()> {
+        // The record is authoritative. The bitset is updated afterwards and is only a derived
+        // cache used to diagnose an incomplete commit.
+        self.set_chunk_record(id, ptr, len, ChunkRegistrationState::Registered);
+        self.mark_registered_cache(index)
+    }
+
+    fn recover_failed_commit(
+        &mut self,
+        id: ChunkId,
+        ptr: *const u8,
+        len: usize,
+        set_report: Report<UringError>,
+    ) -> UringResult<BufferRegistrationStatus> {
+        let index = id.as_usize();
+        let zero_iovec = [libc::iovec {
+            iov_base: ptr::null_mut(),
+            iov_len: 0,
+        }];
+        let cleanup = self.issue_chunk_update(index as u32, &zero_iovec);
+        match cleanup.outcome {
+            KernelUpdateOutcome::Applied(updated) if updated == cleanup.requested => {
+                self.set_chunk_record(id, ptr, len, ChunkRegistrationState::Fallback);
+                self.clear_registered_cache(index)?;
+                if self.registration_mode.is_strict() {
+                    Err(set_report.attach_note(
+                        "fixed-buffer registration was cleared after ledger cache update failed",
+                    ))
+                } else {
+                    self.registration_unavailable(
+                        id,
+                        None,
+                        "fixed-buffer ledger commit failed; using raw buffer I/O",
+                    )
+                }
+            }
+            _ => {
+                self.quarantine_chunk(
+                    id,
+                    ptr,
+                    len,
+                    UpdateEvidence {
+                        requested: 1,
+                        outcome: KernelUpdateOutcome::Applied(1),
+                    },
+                    Some(cleanup),
+                );
+                let report = set_report
+                    .with_ctx("cleanup_evidence", format!("{:?}", cleanup.outcome))
+                    .attach_note(
+                        "fixed-buffer cleanup result is not fully applied; registry is quarantined",
+                    );
+                Err(report)
+            }
+        }
+    }
+
+    fn fixed_identity_mismatch_report(
+        &self,
+        id: ChunkId,
+        ptr: *const u8,
+        len: usize,
+        scope: &'static str,
+        user_data: Option<usize>,
+        record: ChunkRegistrationRecord,
+    ) -> Report<UringError> {
+        let report = UringError::InvalidState
+            .to_report()
+            .push_ctx("scope", scope)
+            .with_ctx("chunk_id", id.raw())
+            .with_ctx("buffer_ptr", ptr as usize)
+            .with_ctx("buffer_len", len)
+            .with_ctx("registered_ptr", record.ptr)
+            .with_ctx("registered_len", record.len)
+            .attach_note("fixed-buffer ledger identity does not match the registered kernel entry");
+        if let Some(user_data) = user_data {
+            report.with_ctx("user_data", user_data)
+        } else {
+            report
+        }
+    }
+
+    fn identity_mismatch_status(
+        &mut self,
+        id: ChunkId,
+        ptr: *const u8,
+        len: usize,
+        scope: &'static str,
+        user_data: Option<usize>,
+        record: ChunkRegistrationRecord,
+    ) -> UringResult<BufferRegistrationStatus> {
+        self.registration_diagnostics
+            .inc_fixed_chunk_identity_mismatch();
+        let report = self.fixed_identity_mismatch_report(id, ptr, len, scope, user_data, record);
+        if self.registration_mode.is_strict() {
+            Err(report)
+        } else {
+            self.registration_unavailable(
+                id,
+                None,
+                "fixed-buffer identity mismatch; using raw buffer I/O",
+            )
+        }
+    }
+
+    fn chunk_ledger_is_consistent(&self) -> bool {
+        (0..MAX_CHUNKS).all(|index| {
+            let registered = self.registered_chunks_cache.get(index).unwrap_or(false);
+            let ledger_registered = self.chunk_records[index]
+                .is_some_and(|record| record.state == ChunkRegistrationState::Registered);
+            registered == ledger_registered
+        })
     }
 
     /// Registers `chunk_id` on demand so the kernel can reach the buffer this SQE points at.
@@ -720,45 +921,20 @@ impl SubmitResourceView<'_, '_> {
                 .attach_note("chunk id exceeds maximum registered chunk count");
         }
         self.ensure_registration_healthy(scope, chunk_id, Some(user_data))?;
-        let is_registered = self.registered_chunks.get(index).map_err(|e| {
-            UringError::InvalidState
-                .to_report()
-                .push_ctx("scope", scope)
-                .with_ctx("chunk_index", index)
-                .with_ctx("bitset_error", format!("{e:?}"))
-                .attach_note("BitSet get failed")
-        })?;
-        if is_registered {
-            return Ok(ChunkRegistrationDecision::Fixed);
-        }
-
-        if !self.fixed_buffers_available {
-            if self.registration_mode.is_strict() {
-                return Err(self.fixed_buffers_unavailable_report(
-                    scope,
-                    chunk_id,
-                    Some(user_data),
-                ));
-            }
-            return Ok(self.raw_fallback(
-                chunk_id,
-                user_data,
-                self.fixed_buffers_failure_errno,
-                "sparse fixed-buffer registration unavailable",
-            ));
-        }
-
+        let record = self.chunk_records[index];
         let Some(info) = self.registrar.resolve_chunk_info(chunk_id) else {
             self.registration_stats.submission_missing_chunk_info = self
                 .registration_stats
                 .submission_missing_chunk_info
                 .saturating_add(1);
-            if self.registration_mode.is_strict() {
+            if record.is_some_and(|record| record.state == ChunkRegistrationState::Registered)
+                || self.registration_mode.is_strict()
+            {
                 return UringError::InvalidState
                     .push_ctx("scope", scope)
                     .with_ctx("chunk_id", chunk_id.raw())
                     .with_ctx("user_data", user_data)
-                    .attach_note("strict mode missing chunk info for lazy registration");
+                    .attach_note("fixed-buffer identity cannot be verified without chunk info");
             }
             return Ok(self.raw_fallback(
                 chunk_id,
@@ -777,11 +953,51 @@ impl SubmitResourceView<'_, '_> {
                 .attach_note("chunk registrar returned mismatched chunk info");
         }
 
+        if let Some(record) = record
+            && record.state == ChunkRegistrationState::Registered
+        {
+            if record.matches(info.id, info.ptr.as_ptr(), info.len.get()) {
+                return Ok(ChunkRegistrationDecision::Fixed);
+            }
+            return match self.identity_mismatch_status(
+                chunk_id,
+                info.ptr.as_ptr(),
+                info.len.get(),
+                scope,
+                Some(user_data),
+                record,
+            )? {
+                BufferRegistrationStatus::Registered => Ok(ChunkRegistrationDecision::Fixed),
+                BufferRegistrationStatus::Unavailable => Ok(self.raw_fallback(
+                    chunk_id,
+                    user_data,
+                    None,
+                    "fixed-buffer identity mismatch",
+                )),
+            };
+        }
+
+        if !self.fixed_buffers_available {
+            if self.registration_mode.is_strict() {
+                return Err(self.fixed_buffers_unavailable_report(
+                    scope,
+                    chunk_id,
+                    Some(user_data),
+                ));
+            }
+            return Ok(self.raw_fallback(
+                chunk_id,
+                user_data,
+                self.fixed_buffers_failure_errno,
+                "sparse fixed-buffer registration unavailable",
+            ));
+        }
+
         // Resolving a missing local snapshot may have drained the worker's chunk message queue;
         // the backend may have registered the chunk through another path in the meantime.
-        if self.is_chunk_registered(info.id) {
+        if self.is_record_registered(info.id) {
             return Ok(ChunkRegistrationDecision::Fixed);
-        };
+        }
 
         match self.register_buffer_backend(info.id, info.ptr.as_ptr(), info.len.get())? {
             BufferRegistrationStatus::Registered => Ok(ChunkRegistrationDecision::Fixed),
@@ -859,29 +1075,96 @@ impl SubmitResourceView<'_, '_> {
         ChunkRegistrationDecision::RawFallback
     }
 
-    fn register_buffers_update(&mut self, index: u32, iovecs: &[libc::iovec]) -> io::Result<()> {
+    fn issue_chunk_update(&mut self, index: u32, iovecs: &[libc::iovec]) -> UpdateEvidence {
         #[cfg(feature = "test-hooks")]
-        if let Some(outcome) = self.register_buffers_update_outcomes.pop_front() {
-            if let Some(errno) = outcome {
-                return Err(io::Error::from_raw_os_error(errno));
-            }
-            return Ok(());
+        if let Some(injection) = self.register_buffers_update_outcomes.pop_front() {
+            let outcome = match injection {
+                BufferUpdateInjection::Applied => KernelUpdateOutcome::Applied(iovecs.len()),
+                BufferUpdateInjection::Rejected(errno) => KernelUpdateOutcome::Rejected(errno),
+                BufferUpdateInjection::Unknown(errno) => {
+                    KernelUpdateOutcome::Unknown(Some(errno), "test-injected unknown buffer update")
+                }
+            };
+            return UpdateEvidence {
+                requested: iovecs.len(),
+                outcome,
+            };
         }
 
         // SAFETY: `iovecs` points at live chunk memory for the duration of this syscall, and the
         // caller retains ownership of that memory until every in-flight operation completes.
-        unsafe { self.submitter.register_buffers_update(index, iovecs, None) }
-            .map_err(io::Error::from)
+        let outcome = match unsafe { self.submitter.register_buffers_update(index, iovecs, None) } {
+            Ok(()) => KernelUpdateOutcome::Applied(iovecs.len()),
+            Err(error) => KernelUpdateOutcome::Unknown(
+                error.raw_os_error(),
+                "kernel fixed-buffer update returned an error",
+            ),
+        };
+        UpdateEvidence {
+            requested: iovecs.len(),
+            outcome,
+        }
     }
 
-    #[inline]
-    fn report_errno(report: &Report<UringError>) -> Option<i32> {
-        report
-            .error_code()
-            .and_then(|code| i32::try_from(code).ok())
+    fn chunk_update_report(
+        &self,
+        scope: &'static str,
+        evidence: UpdateEvidence,
+        note: &'static str,
+    ) -> Report<UringError> {
+        let report = UringError::Registration
+            .to_report()
+            .push_ctx("scope", scope)
+            .with_ctx("requested_buffers", evidence.requested)
+            .with_ctx("update_evidence", format!("{:?}", evidence.outcome))
+            .attach_note(note);
+        match evidence.outcome {
+            KernelUpdateOutcome::Applied(_) => report,
+            #[cfg(feature = "test-hooks")]
+            KernelUpdateOutcome::Rejected(errno) => report.with_ctx("errno", errno),
+            KernelUpdateOutcome::Unknown(errno, _) => {
+                if let Some(errno) = errno {
+                    report.with_ctx("errno", errno)
+                } else {
+                    report
+                }
+            }
+        }
     }
 
-    fn mark_registered_chunk(&mut self, index: usize) -> UringResult<()> {
+    fn quarantine_chunk(
+        &mut self,
+        id: ChunkId,
+        ptr: *const u8,
+        len: usize,
+        register: UpdateEvidence,
+        cleanup: Option<UpdateEvidence>,
+    ) {
+        if let Some(quarantine) = self.registration_quarantine.as_mut() {
+            quarantine.note_anomaly();
+        } else {
+            *self.registration_quarantine = Some(BufferRegistrationQuarantine::new(
+                id,
+                register,
+                cleanup,
+                "driver.register_buffer_internal",
+            ));
+        }
+        self.set_chunk_record(id, ptr, len, ChunkRegistrationState::Quarantined);
+    }
+
+    fn clear_registered_cache(&mut self, index: usize) -> UringResult<()> {
+        self.registered_chunks_cache.clear(index).map_err(|error| {
+            UringError::InvalidState
+                .to_report()
+                .push_ctx("scope", "driver.register_buffer_internal.bitset_clear")
+                .with_ctx("chunk_index", index)
+                .with_ctx("bitset_error", format!("{error:?}"))
+                .attach_note("failed to clear derived fixed-buffer registration cache")
+        })
+    }
+
+    fn mark_registered_cache(&mut self, index: usize) -> UringResult<()> {
         #[cfg(feature = "test-hooks")]
         if *self.bitset_set_failure {
             *self.bitset_set_failure = false;
@@ -891,7 +1174,7 @@ impl SubmitResourceView<'_, '_> {
                 .attach_note("injected registered chunk bitset failure");
         }
 
-        self.registered_chunks.set(index).map_err(|e| {
+        self.registered_chunks_cache.set(index).map_err(|e| {
             UringError::InvalidState
                 .to_report()
                 .push_ctx("scope", "driver.register_buffer_internal.bitset_set")
@@ -917,6 +1200,15 @@ impl SubmitResourceView<'_, '_> {
             .with_ctx("chunk_id", chunk_id.raw())
             .with_ctx("quarantine_chunk_id", quarantine.chunk_id.raw())
             .with_ctx("quarantine_scope", quarantine.scope)
+            .with_ctx("quarantine_anomalies", quarantine.anomaly_count)
+            .with_ctx(
+                "registration_evidence",
+                format!("{:?}", quarantine.register_outcome),
+            )
+            .with_ctx(
+                "cleanup_evidence",
+                format!("{:?}", quarantine.cleanup_outcome),
+            )
             .attach_note("fixed-buffer registry is quarantined and requires ring rebuild");
         if let Some(errno) = quarantine.register_errno {
             report = report.with_ctx("registration_errno", errno);
@@ -929,13 +1221,6 @@ impl SubmitResourceView<'_, '_> {
         } else {
             Err(report)
         }
-    }
-
-    #[inline]
-    pub(crate) fn is_chunk_registered(&self, chunk_id: ChunkId) -> bool {
-        self.registered_chunks
-            .get(chunk_id.as_usize())
-            .unwrap_or(false)
     }
 }
 
@@ -982,13 +1267,14 @@ impl<'a> UringDriver<'a> {
         let resources = SubmitResourceView {
             submitter,
             file_table: &self.file_table,
-            registered_chunks: view.registered_chunks,
+            registered_chunks_cache: view.registered_chunks_cache,
+            chunk_records: view.chunk_records,
+            registration_diagnostics: self.completion_diagnostics.backend(),
             registrar: view.registrar,
             registration_stats: view.registration_stats,
             registration_mode: view.registration_mode,
             fixed_buffers_available: view.fixed_buffers_available,
             fixed_buffers_failure_errno: view.fixed_buffers_failure_errno,
-            chunk_register_failure_at: view.chunk_register_failure_at,
             registration_quarantine: view.registration_quarantine,
             #[cfg(feature = "test-hooks")]
             register_buffers_update_outcomes: view.register_buffers_update_outcomes,

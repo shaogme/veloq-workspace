@@ -192,42 +192,45 @@ fn assert_close_is_rejected_with(
 }
 
 #[test]
-fn failed_single_registration_restores_popped_slot() {
+fn unknown_single_registration_poisoned_file_table_is_fail_stop() {
     let Some(mut driver) = new_driver_with_file_table_or_skip(4, FileTableExhaustion::Fail) else {
         return;
     };
 
     let invalid = invalid_file_handle();
-    assert!(
-        driver
-            .register_files(vec![RegisterFd::Borrowed(invalid.borrow())])
-            .is_err()
-    );
+    let report = driver
+        .register_files(vec![RegisterFd::Borrowed(invalid.borrow())])
+        .expect_err("an uncertain kernel update must poison the file table");
+    assert_eq!(*report.inner(), UringError::FileTablePoisoned);
 
     let files = open_cargo_files::<3>();
-    let fds = register_borrowed_files(&mut driver, &files);
-    assert_eq!(fds.len(), files.len());
-
-    driver.unregister_files(fds).unwrap();
+    let report = register_borrowed_files_result(&mut driver, &files)
+        .expect_err("a poisoned table must reject future fixed registrations");
+    assert_eq!(*report.inner(), UringError::FileTablePoisoned);
 }
 
+#[cfg(feature = "test-hooks")]
 #[test]
-fn failed_batch_registration_rolls_back_successful_prefix() {
+fn partial_batch_registration_rolls_back_successful_prefix() {
     let Some(mut driver) = new_driver_with_file_table_or_skip(4, FileTableExhaustion::Fail) else {
         return;
     };
 
-    let first = File::open("Cargo.toml").unwrap();
-    let first_raw = raw_file(&first);
-    let invalid = invalid_file_handle();
-    assert!(
-        driver
-            .register_files(vec![
-                RegisterFd::Borrowed(first_raw.borrow()),
-                RegisterFd::Borrowed(invalid.borrow()),
-            ])
-            .is_err()
-    );
+    let files = open_cargo_files::<2>();
+    let raw_files = files.iter().map(raw_file).collect::<Vec<_>>();
+    let registrations = raw_files
+        .iter()
+        .map(|raw| RegisterFd::Borrowed(raw.borrow()))
+        .collect::<Vec<_>>();
+    (&mut driver as &mut dyn DriverTestHooks).debug_inject_register_files_update_sequence(&[
+        RegisterFilesUpdateOutcome::Updated(1),
+        RegisterFilesUpdateOutcome::Actual,
+    ]);
+    let report = driver
+        .register_files(registrations)
+        .expect_err("a short update must abort the batch");
+    assert_eq!(*report.inner(), UringError::Registration);
+    assert!(!(&driver as &dyn DriverTestHooks).debug_file_table_poisoned());
 
     let files = open_cargo_files::<3>();
     let fds = register_borrowed_files(&mut driver, &files);
@@ -238,7 +241,7 @@ fn failed_batch_registration_rolls_back_successful_prefix() {
 
 #[cfg(feature = "test-hooks")]
 #[test]
-fn batch_rollback_failure_poisoned_file_table_is_fail_stop() {
+fn rejected_registration_releases_batch_without_rollback() {
     let Some(mut driver) = new_driver_with_file_table_or_skip(2, FileTableExhaustion::Fallback)
     else {
         return;
@@ -248,38 +251,30 @@ fn batch_rollback_failure_poisoned_file_table_is_fail_stop() {
     let raw = raw_file(&file);
     {
         let hooks = &mut driver as &mut dyn DriverTestHooks;
-        hooks.debug_inject_register_files_update_sequence(&[
-            RegisterFilesUpdateOutcome::Error(libc::EIO),
-            RegisterFilesUpdateOutcome::Error(libc::EIO),
-            RegisterFilesUpdateOutcome::Actual,
-        ]);
+        hooks.debug_inject_register_files_update_failure(libc::EIO);
     }
 
     let report = driver
         .register_files(vec![RegisterFd::Borrowed(raw.borrow())])
-        .expect_err("rollback failure must poison the file table");
-    assert_eq!(*report.inner(), UringError::FileTablePoisoned);
-    assert!(format!("{report:?}").contains("recreate"));
-    {
-        let hooks = &driver as &dyn DriverTestHooks;
-        assert!(hooks.debug_file_table_poisoned());
-        assert_eq!(hooks.debug_register_files_update_outcomes_pending(), 1);
-    }
+        .expect_err("a rejected update must abort the batch");
+    assert_eq!(*report.inner(), UringError::Registration);
+    assert!(!(&driver as &dyn DriverTestHooks).debug_file_table_poisoned());
 
     let replacement = File::open("Cargo.toml").unwrap();
     let replacement_raw = raw_file(&replacement);
     let second = driver
         .register_files(vec![RegisterFd::Borrowed(replacement_raw.borrow())])
-        .expect_err("fallback must not hide a poisoned table");
-    assert_eq!(*second.inner(), UringError::FileTablePoisoned);
+        .expect("the rejected batch must release its reserved slot");
+    assert!(second[0].is_registered());
     assert_eq!(
         (&driver as &dyn DriverTestHooks).debug_register_files_update_outcomes_pending(),
-        1
+        0
     );
+    driver.unregister_files(second).unwrap();
 
     let snapshot = driver.completion_diagnostics_snapshot();
-    assert_eq!(snapshot.backend.file_table_rollback_failures, 1);
-    assert_eq!(snapshot.backend.file_table_poisonings, 1);
+    assert_eq!(snapshot.backend.file_table_rollback_failures, 0);
+    assert_eq!(snapshot.backend.file_table_poisonings, 0);
 }
 
 #[cfg(feature = "test-hooks")]
@@ -398,7 +393,7 @@ fn failed_registered_unregister_poison_keeps_owned_entry_until_driver_drop() {
 #[cfg(feature = "test-hooks")]
 #[test]
 fn poisoned_file_table_rejects_old_registered_sqes_before_kernel_submission() {
-    let Some(mut driver) = new_driver_with_file_table_or_skip(3, FileTableExhaustion::Fail) else {
+    let Some(mut driver) = new_driver_with_file_table_or_skip(4, FileTableExhaustion::Fail) else {
         return;
     };
 
@@ -410,17 +405,21 @@ fn poisoned_file_table_rejects_old_registered_sqes_before_kernel_submission() {
         .next()
         .unwrap();
 
-    let failed = File::open("Cargo.toml").unwrap();
-    let failed_raw = raw_file(&failed);
+    let failed = open_cargo_files::<2>();
+    let failed_raw = failed.iter().map(raw_file).collect::<Vec<_>>();
+    let failed_registrations = failed_raw
+        .iter()
+        .map(|raw| RegisterFd::Borrowed(raw.borrow()))
+        .collect::<Vec<_>>();
     {
         let hooks = &mut driver as &mut dyn DriverTestHooks;
         hooks.debug_inject_register_files_update_sequence(&[
-            RegisterFilesUpdateOutcome::Error(libc::EIO),
+            RegisterFilesUpdateOutcome::Updated(1),
             RegisterFilesUpdateOutcome::Error(libc::EIO),
         ]);
     }
     driver
-        .register_files(vec![RegisterFd::Borrowed(failed_raw.borrow())])
+        .register_files(failed_registrations)
         .expect_err("injected rollback failure must poison the table");
 
     assert_fsync_is_rejected_with(&mut driver, valid_fd, UringError::FileTablePoisoned);
@@ -429,7 +428,7 @@ fn poisoned_file_table_rejects_old_registered_sqes_before_kernel_submission() {
 #[cfg(feature = "test-hooks")]
 #[test]
 fn a_close_already_in_flight_forgets_owned_entry_after_poison() {
-    let Some(mut driver) = new_driver_with_file_table_or_skip(3, FileTableExhaustion::Fail) else {
+    let Some(mut driver) = new_driver_with_file_table_or_skip(4, FileTableExhaustion::Fail) else {
         return;
     };
 
@@ -446,17 +445,21 @@ fn a_close_already_in_flight_forgets_owned_entry_after_poison() {
         .unwrap();
     let close_token = submit_test_op(&mut driver, Close { fd });
 
-    let failed = File::open("Cargo.toml").unwrap();
-    let failed_raw = raw_file(&failed);
+    let failed = open_cargo_files::<2>();
+    let failed_raw = failed.iter().map(raw_file).collect::<Vec<_>>();
+    let failed_registrations = failed_raw
+        .iter()
+        .map(|raw| RegisterFd::Borrowed(raw.borrow()))
+        .collect::<Vec<_>>();
     {
         let hooks = &mut driver as &mut dyn DriverTestHooks;
         hooks.debug_inject_register_files_update_sequence(&[
-            RegisterFilesUpdateOutcome::Error(libc::EIO),
+            RegisterFilesUpdateOutcome::Updated(1),
             RegisterFilesUpdateOutcome::Error(libc::EIO),
         ]);
     }
     driver
-        .register_files(vec![RegisterFd::Borrowed(failed_raw.borrow())])
+        .register_files(failed_registrations)
         .expect_err("the table must be poisoned while Close is in flight");
 
     let (closed, drive_error) =

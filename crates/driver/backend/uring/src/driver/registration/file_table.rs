@@ -23,7 +23,7 @@ use crate::{
 use diagweave::prelude::*;
 use tracing::warn;
 use veloq_driver_core::{DirectOwnerId, RawHandleMeta};
-use veloq_std::{collections::HashMap, format, mem, string::ToString, vec::Vec};
+use veloq_std::{collections::HashMap, format, mem, string::ToString, vec, vec::Vec};
 
 const INITIAL_FILE_GENERATION: u64 = 1;
 
@@ -63,8 +63,15 @@ impl RegisteredFileEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileSlotState {
     Vacant,
+    /// The slot is owned by a registration/cleanup lease but is not a live descriptor.
+    ///
+    /// This covers both a fresh claim before the kernel update and the short interval where a
+    /// live entry is held by a cleanup transaction. `descriptor` intentionally ignores it.
+    Reserved,
     Occupied,
     Quarantined,
+    /// The generation counter is exhausted; this slot is never reusable.
+    Retired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,6 +228,7 @@ impl FileTable {
             .collect();
         self.free_fixed = (0..self.fixed_capacity as u32).rev().collect();
         self.initialized = true;
+        debug_assert!(self.ledger_is_consistent());
     }
 
     #[inline]
@@ -441,7 +449,7 @@ impl FileTable {
                 FileSlotState::Vacant,
                 "free list contained a non-vacant file slot"
             );
-            self.slots[index as usize].state = FileSlotState::Occupied;
+            self.slots[index as usize].state = FileSlotState::Reserved;
         }
         // The free list is seeded in reverse, so a fresh table hands out consecutive indices;
         // sorting keeps that property visible to the batching in `register_files_internal`.
@@ -450,6 +458,7 @@ impl FileTable {
         if overflow > 0 {
             self.report_fallback(overflow);
         }
+        debug_assert!(self.ledger_is_consistent());
         Ok(fixed)
     }
 
@@ -596,7 +605,7 @@ impl FileTable {
     pub(crate) fn install_entry(&mut self, index: u32, entry: RegisteredFileEntry) {
         debug_assert_eq!(
             self.slots[index as usize].state,
-            FileSlotState::Occupied,
+            FileSlotState::Reserved,
             "installed an entry into an unclaimed file slot"
         );
         debug_assert!(
@@ -612,11 +621,16 @@ impl FileTable {
                 .insert(handle.raw().as_fd(), OwnedLocation::Fixed(index));
         }
         self.slots[index as usize].entry = Some(entry);
+        self.slots[index as usize].state = FileSlotState::Occupied;
+        debug_assert!(self.ledger_is_consistent());
     }
 
     #[inline]
     pub(crate) fn take_entry(&mut self, index: u32) -> Option<RegisteredFileEntry> {
-        let entry = self.slots.get_mut(index as usize)?.entry.take()?;
+        let slot = self.slots.get_mut(index as usize)?;
+        let entry = slot.entry.take()?;
+        debug_assert_eq!(slot.state, FileSlotState::Occupied);
+        slot.state = FileSlotState::Reserved;
         if let RegisteredFileEntry::OwnedHandle(handle) = &entry {
             let raw = handle.raw().as_fd();
             debug_assert_eq!(
@@ -625,6 +639,7 @@ impl FileTable {
                 "owned fixed file descriptor index was inconsistent"
             );
         }
+        debug_assert!(self.ledger_is_consistent());
         Some(entry)
     }
 
@@ -656,6 +671,7 @@ impl FileTable {
             self.owned_raw_index
                 .insert(handle.raw().as_fd(), OwnedLocation::Fixed(index));
         }
+        debug_assert!(self.ledger_is_consistent());
         old
     }
 
@@ -670,17 +686,12 @@ impl FileTable {
         );
         debug_assert_eq!(
             self.slots[index as usize].state,
-            FileSlotState::Occupied,
+            FileSlotState::Reserved,
             "released a file slot that was not claimed"
         );
         self.slots[index as usize].state = FileSlotState::Vacant;
         self.free_fixed.push(index);
-    }
-
-    pub(crate) fn release_all(&mut self, indices: impl IntoIterator<Item = u32>) {
-        for index in indices {
-            self.release(index);
-        }
+        debug_assert!(self.ledger_is_consistent());
     }
 
     /// Permanently removes a slot from the reusable fixed-file set.
@@ -696,17 +707,21 @@ impl FileTable {
         );
         debug_assert_eq!(
             slot.state,
-            FileSlotState::Occupied,
+            FileSlotState::Reserved,
             "quarantined a file slot that was not claimed"
         );
         slot.state = FileSlotState::Quarantined;
+        debug_assert!(self.ledger_is_consistent());
     }
 
     #[inline]
     pub(crate) fn is_quarantined(&self, index: u32) -> bool {
-        self.slots
-            .get(index as usize)
-            .is_some_and(|slot| slot.state == FileSlotState::Quarantined)
+        self.slots.get(index as usize).is_some_and(|slot| {
+            matches!(
+                slot.state,
+                FileSlotState::Quarantined | FileSlotState::Retired
+            )
+        })
     }
 
     /// Invalidates every [`IoFd`] previously handed out for `index`.
@@ -714,10 +729,50 @@ impl FileTable {
         let Some(slot) = self.slots.get_mut(index as usize) else {
             return;
         };
-        slot.generation = slot.generation.wrapping_add(1);
-        if slot.generation == 0 {
-            slot.generation = INITIAL_FILE_GENERATION;
+        if slot.generation == u64::MAX {
+            slot.state = FileSlotState::Retired;
+            self.free_fixed.retain(|candidate| *candidate != index);
+        } else {
+            slot.generation += 1;
         }
+        debug_assert!(self.ledger_is_consistent());
+    }
+
+    /// Checks the Rust-side resource ledger without consulting the kernel mirror.
+    ///
+    /// This is intentionally a debug-only assertion surface for the first migration round. The
+    /// existing free list and maps remain the operational data structures; this check makes
+    /// their relationship with the explicit slot state observable while the commit/abort model
+    /// is still being introduced.
+    fn ledger_is_consistent(&self) -> bool {
+        let mut free_seen = vec![false; self.slots.len()];
+        for &index in &self.free_fixed {
+            let Some(seen) = free_seen.get_mut(index as usize) else {
+                return false;
+            };
+            if *seen {
+                return false;
+            }
+            *seen = true;
+        }
+
+        for (index, slot) in self.slots.iter().enumerate() {
+            let valid_slot = match slot.state {
+                FileSlotState::Vacant => slot.entry.is_none(),
+                FileSlotState::Reserved => slot.entry.is_none(),
+                FileSlotState::Occupied => slot.entry.is_some(),
+                FileSlotState::Quarantined => slot.entry.is_none(),
+                FileSlotState::Retired => slot.entry.is_none(),
+            };
+            if !valid_slot {
+                return false;
+            }
+            if !self.is_poisoned() && (slot.state == FileSlotState::Vacant) != free_seen[index] {
+                return false;
+            }
+        }
+
+        !self.is_poisoned() || self.free_fixed.is_empty()
     }
 
     /// The descriptor for `index`, valid until the slot is released.
@@ -734,7 +789,7 @@ impl FileTable {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileTable, FileTablePoisonContext, RegisteredFileEntry, SqeFd};
+    use super::{FileSlotState, FileTable, FileTablePoisonContext, RegisteredFileEntry, SqeFd};
     use crate::config::{
         FileTableExhaustion, IoFd, OwnedRawHandle, RawHandle, RawHandleKind, UringRawHandle,
     };
@@ -949,6 +1004,25 @@ mod tests {
     }
 
     #[test]
+    fn reserved_slots_never_produce_descriptors_and_return_to_the_ledger() {
+        let mut table = table(1, FileTableExhaustion::Fail);
+        let index = table.claim(1).unwrap()[0];
+
+        assert!(table.descriptor(index).is_none());
+        assert!(table.ledger_is_consistent());
+
+        table.install_entry(index, borrowed(10));
+        assert!(table.descriptor(index).is_some());
+        assert!(table.ledger_is_consistent());
+
+        table.take_entry(index);
+        assert!(table.descriptor(index).is_none());
+        assert!(table.ledger_is_consistent());
+        table.release(index);
+        assert!(table.ledger_is_consistent());
+    }
+
+    #[test]
     fn a_partially_claimed_batch_is_fully_returned_on_failure() {
         let mut table = table(1, FileTableExhaustion::Fail);
         assert!(table.claim(2).is_err());
@@ -987,6 +1061,28 @@ mod tests {
         let again = register(&mut table, &[11]);
         assert_eq!(again[0].fixed_index(), Some(index));
         assert_ne!(again[0].generation(), fds[0].generation());
+    }
+
+    #[test]
+    fn generation_exhaustion_retires_the_slot_without_wrapping() {
+        let mut table = table(1, FileTableExhaustion::Fail);
+        let fd = register(&mut table, &[10])[0];
+        let index = fd.fixed_index().expect("registered descriptor");
+
+        table.take_entry(index);
+        table.release(index);
+        table.slots[index as usize].generation = u64::MAX;
+        table.advance_generation(index);
+
+        assert_eq!(table.slots[index as usize].state, FileSlotState::Retired);
+        assert!(table.free_fixed.is_empty());
+        assert!(table.claim(1).is_err());
+
+        let retired = IoFd::fixed_with_generation(index, u64::MAX);
+        assert!(matches!(
+            table.resolve(retired, None, "test.retired"),
+            Err(report) if *report.inner() == UringError::FileTableQuarantined
+        ));
     }
 
     #[test]

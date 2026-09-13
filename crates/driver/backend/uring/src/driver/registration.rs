@@ -24,12 +24,15 @@ pub(crate) mod buffer;
 pub(crate) mod file_table;
 pub(crate) mod provided_buf;
 
-pub(crate) use buffer::{BufferRegistrationQuarantine, UringBufferRegistry};
+pub(crate) use buffer::{
+    BufferRegistrationQuarantine, ChunkRegistrationRecord, ChunkRegistrationState,
+    UringBufferRegistry,
+};
 pub(crate) use file_table::{
     FileTable, FileTablePoisonContext, OwnedLocation, RegisteredFileEntry, SqeFd,
 };
 pub use provided_buf::ProvidedBufStats;
-pub(crate) use provided_buf::{PROVIDED_BUF_GROUP_ID, ProvidedBufGroup};
+pub(crate) use provided_buf::{PROVIDED_BUF_GROUP_ID, ProvidedBufGroup, RingLifetimeOwner};
 
 #[cfg(test)]
 pub(crate) use provided_buf::test_group;
@@ -56,23 +59,58 @@ pub(crate) struct UringRegistrationStats {
     pub(crate) file_table_fallback_registrations: u64,
 }
 
-struct FileTableUpdateFailure {
+/// The kernel-side fact established by one resource update syscall.
+///
+/// A short successful update is deliberately kept as `Applied(n)`: callers need to know the
+/// exact prefix that may be visible in the kernel, instead of treating it as an ordinary error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KernelUpdateOutcome {
+    Applied(usize),
+    #[cfg(feature = "test-hooks")]
+    Rejected(i32),
+    Unknown(Option<i32>, &'static str),
+}
+
+/// Evidence recorded independently from the diagnostic report produced for an update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UpdateEvidence {
+    pub(crate) requested: usize,
+    pub(crate) outcome: KernelUpdateOutcome,
+}
+
+impl UpdateEvidence {
+    #[inline]
+    fn updated(self) -> Option<usize> {
+        match self.outcome {
+            KernelUpdateOutcome::Applied(updated) => Some(updated),
+            #[cfg(feature = "test-hooks")]
+            KernelUpdateOutcome::Rejected(_) => None,
+            KernelUpdateOutcome::Unknown(_, _) => None,
+        }
+    }
+}
+
+struct FileTableUpdateReport {
     report: Report<UringError>,
     cleanup_errno: Option<i32>,
-    updated_files: Option<usize>,
     scope: &'static str,
     start_index: u32,
     requested_files: usize,
 }
 
+struct FileTableUpdateFailure {
+    report: FileTableUpdateReport,
+    evidence: UpdateEvidence,
+}
+
 impl FileTableUpdateFailure {
     fn poison_context(&self, failed_index: Option<u32>) -> FileTablePoisonContext {
         FileTablePoisonContext {
-            scope: self.scope,
+            scope: self.report.scope,
             failed_index,
-            start_index: self.start_index,
-            requested_files: self.requested_files,
-            updated_files: self.updated_files,
+            start_index: self.report.start_index,
+            requested_files: self.report.requested_files,
+            updated_files: self.evidence.updated(),
         }
     }
 }
@@ -95,6 +133,227 @@ struct OwnedFdConflict {
     raw_fd: i32,
     input_position: usize,
     source: OwnedFdConflictSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileUpdateDirection {
+    Register,
+    Clear,
+}
+
+/// One kernel file-table update, kept separate from the resource-state commit.
+///
+/// The transaction owns only the syscall input. The [`FileRegistrationBatch`] owns the entries
+/// and decides whether they can be committed after the kernel outcome is known.
+struct FileUpdateTxn {
+    start: u32,
+    fds: Vec<i32>,
+    direction: FileUpdateDirection,
+    scope: &'static str,
+}
+
+impl FileUpdateTxn {
+    fn register(start: u32, fds: Vec<i32>, scope: &'static str) -> Self {
+        Self {
+            start,
+            fds,
+            direction: FileUpdateDirection::Register,
+            scope,
+        }
+    }
+
+    fn clear(start: u32, count: usize, scope: &'static str) -> Self {
+        Self {
+            start,
+            fds: vec![-1; count],
+            direction: FileUpdateDirection::Clear,
+            scope,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileLeaseState {
+    Reserved,
+    Committed,
+    Retained,
+    Released,
+}
+
+struct FileLease {
+    index: u32,
+    entry: Option<RegisteredFileEntry>,
+    state: FileLeaseState,
+}
+
+/// Owns one complete registration batch until it is committed or explicitly aborted.
+///
+/// Fixed entries remain in this lease until a full register update is applied. This prevents a
+/// short or unknown update from being represented as a live userspace entry by accident. Direct
+/// fallback inputs stay here until all fixed runs have committed; adopted direct descriptors are
+/// tracked so an internal adoption failure can abort the whole batch.
+struct FileRegistrationBatch<'h> {
+    fixed: Vec<FileLease>,
+    direct_files: Vec<RegisterFd<'h, UringRawHandle>>,
+    direct_descriptors: Vec<IoFd>,
+}
+
+impl<'h> FileRegistrationBatch<'h> {
+    fn new(claimed: Vec<u32>, files: Vec<RegisterFd<'h, UringRawHandle>>) -> Self {
+        let mut files = files.into_iter();
+        let fixed = claimed
+            .into_iter()
+            .map(|index| FileLease {
+                index,
+                entry: Some(Self::entry_from_file(
+                    files.next().expect("one input per claimed slot"),
+                )),
+                state: FileLeaseState::Reserved,
+            })
+            .collect();
+        let direct_files = files.collect();
+        Self {
+            fixed,
+            direct_files,
+            direct_descriptors: Vec::new(),
+        }
+    }
+
+    fn entry_from_file(file: RegisterFd<'h, UringRawHandle>) -> RegisteredFileEntry {
+        match file {
+            RegisterFd::Borrowed(b) => RegisteredFileEntry::BorrowedFd {
+                fd: b.raw().as_fd(),
+                kind: b.kind(),
+            },
+            RegisterFd::Owned(o) => RegisteredFileEntry::OwnedHandle(o),
+        }
+    }
+
+    fn fixed_len(&self) -> usize {
+        self.fixed.len()
+    }
+
+    fn fixed_indices(&self) -> Vec<u32> {
+        self.fixed.iter().map(|lease| lease.index).collect()
+    }
+
+    fn registration_txn(&self, start: usize, end: usize) -> FileUpdateTxn {
+        let fds = self.fixed[start..end]
+            .iter()
+            .map(|lease| {
+                lease
+                    .entry
+                    .as_ref()
+                    .expect("uncommitted file lease owns its entry")
+                    .fd()
+            })
+            .collect::<Vec<_>>();
+        FileUpdateTxn::register(
+            self.fixed[start].index,
+            fds,
+            "driver.register_files_internal.register_files_update",
+        )
+    }
+
+    fn commit_range(&mut self, table: &mut FileTable, start: usize, end: usize) {
+        for lease in &mut self.fixed[start..end] {
+            debug_assert_eq!(lease.state, FileLeaseState::Reserved);
+            table.install_entry(
+                lease.index,
+                lease
+                    .entry
+                    .take()
+                    .expect("committing file lease with no entry"),
+            );
+            lease.state = FileLeaseState::Committed;
+        }
+    }
+
+    fn retain_range(&mut self, table: &mut FileTable, start: usize, end: usize) {
+        for lease in &mut self.fixed[start..end] {
+            debug_assert_eq!(lease.state, FileLeaseState::Reserved);
+            table.install_entry(
+                lease.index,
+                lease
+                    .entry
+                    .take()
+                    .expect("retaining file lease with no entry"),
+            );
+            lease.state = FileLeaseState::Retained;
+        }
+    }
+
+    fn release_range(&mut self, table: &mut FileTable, start: usize, end: usize) {
+        for lease in &mut self.fixed[start..end] {
+            debug_assert_eq!(lease.state, FileLeaseState::Reserved);
+            table.release(lease.index);
+            lease.state = FileLeaseState::Released;
+        }
+    }
+
+    fn release_reserved(&mut self, table: &mut FileTable) {
+        for lease in &mut self.fixed {
+            if lease.state == FileLeaseState::Reserved {
+                table.release(lease.index);
+                lease.state = FileLeaseState::Released;
+            }
+        }
+    }
+
+    fn committed_indices(&self) -> Vec<u32> {
+        self.fixed
+            .iter()
+            .filter(|lease| lease.state == FileLeaseState::Committed)
+            .map(|lease| lease.index)
+            .collect()
+    }
+
+    fn mark_rolled_back(&mut self, retained: &[u32]) {
+        for lease in &mut self.fixed {
+            if lease.state == FileLeaseState::Committed && !retained.contains(&lease.index) {
+                lease.state = FileLeaseState::Released;
+            }
+        }
+    }
+
+    fn retained_slot_count(&self) -> usize {
+        self.fixed
+            .iter()
+            .filter(|lease| {
+                matches!(
+                    lease.state,
+                    FileLeaseState::Committed | FileLeaseState::Retained
+                )
+            })
+            .count()
+    }
+
+    fn fixed_descriptors(&self, table: &FileTable) -> Vec<IoFd> {
+        self.fixed
+            .iter()
+            .map(|lease| {
+                debug_assert_eq!(lease.state, FileLeaseState::Committed);
+                table
+                    .descriptor(lease.index)
+                    .expect("committed file lease has a live descriptor")
+            })
+            .collect()
+    }
+
+    fn take_direct_files(&mut self) -> Vec<RegisterFd<'h, UringRawHandle>> {
+        mem::take(&mut self.direct_files)
+    }
+
+    fn push_direct_descriptor(&mut self, descriptor: IoFd) {
+        self.direct_descriptors.push(descriptor);
+    }
+
+    fn descriptors(&self, table: &FileTable) -> Vec<IoFd> {
+        self.fixed_descriptors(table)
+            .into_iter()
+            .chain(self.direct_descriptors.iter().copied())
+            .collect()
+    }
 }
 
 fn owned_input_raw(file: &RegisterFd<'_, UringRawHandle>) -> Option<UringRawHandle> {
@@ -235,65 +494,134 @@ impl<'a> UringDriver<'a> {
         self.submit_env().register_buffer_backend(id, ptr, len)
     }
 
-    /// Runs one `register_files_update` call, with deterministic test-only outcomes when enabled.
-    fn register_files_update(&mut self, start: u32, files: &[i32]) -> io::Result<usize> {
+    /// Runs one `register_files_update` call and retains the evidence needed by rollback.
+    fn register_files_update(
+        &mut self,
+        start: u32,
+        files: &[i32],
+    ) -> (io::Result<usize>, KernelUpdateOutcome) {
         #[cfg(feature = "test-hooks")]
         if let Some(outcome) = self.register_files_update_outcomes.pop_front() {
             return match outcome {
-                RegisterFilesUpdateOutcome::Actual => self
-                    .ring
-                    .submitter()
-                    .register_files_update(start, files)
-                    .map_err(io::Error::from),
-                RegisterFilesUpdateOutcome::Error(errno) => {
-                    Err(io::Error::from_raw_os_error(errno))
+                RegisterFilesUpdateOutcome::Actual => {
+                    let result = self
+                        .ring
+                        .submitter()
+                        .register_files_update(start, files)
+                        .map_err(io::Error::from);
+                    let evidence = match &result {
+                        Ok(updated) => KernelUpdateOutcome::Applied(*updated),
+                        Err(error) => KernelUpdateOutcome::Unknown(
+                            error.raw_os_error(),
+                            "kernel file table update returned an error",
+                        ),
+                    };
+                    (result, evidence)
                 }
-                RegisterFilesUpdateOutcome::Updated(updated) => Ok(updated),
+                RegisterFilesUpdateOutcome::Error(errno) => (
+                    Err(io::Error::from_raw_os_error(errno)),
+                    KernelUpdateOutcome::Rejected(errno),
+                ),
+                RegisterFilesUpdateOutcome::Updated(updated) => {
+                    (Ok(updated), KernelUpdateOutcome::Applied(updated))
+                }
             };
         }
 
-        self.ring
+        let result = self
+            .ring
             .submitter()
             .register_files_update(start, files)
-            .map_err(io::Error::from)
+            .map_err(io::Error::from);
+        let evidence = match &result {
+            Ok(updated) => KernelUpdateOutcome::Applied(*updated),
+            Err(error) => KernelUpdateOutcome::Unknown(
+                error.raw_os_error(),
+                "kernel file table update returned an error",
+            ),
+        };
+        (result, evidence)
+    }
+
+    fn record_file_update_outcome(
+        &self,
+        evidence: UpdateEvidence,
+        direction: FileUpdateDirection,
+        scope: &'static str,
+        start: u32,
+    ) {
+        match evidence.outcome {
+            KernelUpdateOutcome::Applied(_) => self
+                .completion_diagnostics
+                .backend()
+                .inc_file_table_update_applied(),
+            #[cfg(feature = "test-hooks")]
+            KernelUpdateOutcome::Rejected(_) => self
+                .completion_diagnostics
+                .backend()
+                .inc_file_table_update_rejected(),
+            KernelUpdateOutcome::Unknown(_, _) => self
+                .completion_diagnostics
+                .backend()
+                .inc_file_table_update_unknown(),
+        }
+        tracing::debug!(
+            scope,
+            direction = ?direction,
+            start_index = start,
+            requested_files = evidence.requested,
+            updated_files = ?evidence.updated(),
+            evidence = ?evidence.outcome,
+            "recorded kernel file table update evidence"
+        );
     }
 
     fn update_kernel_file_entries(
         &mut self,
-        start: u32,
-        files: &[i32],
-        scope: &'static str,
+        txn: &FileUpdateTxn,
     ) -> Result<(), FileTableUpdateFailure> {
-        let requested_files = files.len();
-        let updated_files = self.register_files_update(start, files).map_err(|error| {
+        let requested_files = txn.fds.len();
+        let (result, outcome) = self.register_files_update(txn.start, &txn.fds);
+        let evidence = UpdateEvidence {
+            requested: requested_files,
+            outcome,
+        };
+        self.record_file_update_outcome(evidence, txn.direction, txn.scope, txn.start);
+        let updated_files = result.map_err(|error| {
             let cleanup_errno = error.raw_os_error();
             let report = UringError::Registration
-                .io_report(scope, error)
-                .with_ctx("start_index", start)
+                .io_report(txn.scope, error)
+                .with_ctx("start_index", txn.start)
                 .with_ctx("requested_files", requested_files);
             FileTableUpdateFailure {
-                cleanup_errno,
-                report,
-                updated_files: None,
-                scope,
-                start_index: start,
-                requested_files,
+                report: FileTableUpdateReport {
+                    cleanup_errno,
+                    report,
+                    scope: txn.scope,
+                    start_index: txn.start,
+                    requested_files,
+                },
+                evidence,
             }
         })?;
-        if updated_files != files.len() {
+        if updated_files != txn.fds.len() {
             return Err(FileTableUpdateFailure {
-                report: UringError::Registration
-                    .to_report()
-                    .push_ctx("scope", scope)
-                    .with_ctx("start_index", start)
-                    .with_ctx("requested_files", files.len())
-                    .with_ctx("updated_files", updated_files)
-                    .attach_note("io_uring updated fewer registered file entries than requested"),
-                cleanup_errno: None,
-                updated_files: Some(updated_files),
-                scope,
-                start_index: start,
-                requested_files,
+                report: FileTableUpdateReport {
+                    report: UringError::Registration
+                        .to_report()
+                        .push_ctx("scope", txn.scope)
+                        .with_ctx("start_index", txn.start)
+                        .with_ctx("requested_files", txn.fds.len())
+                        .with_ctx("updated_files", updated_files)
+                        .attach_note(
+                            "io_uring updated fewer registered file entries than requested",
+                        ),
+                    cleanup_errno: None,
+                    scope: txn.scope,
+                    start_index: txn.start,
+                    requested_files,
+                },
+                evidence,
             });
         }
         Ok(())
@@ -308,7 +636,18 @@ impl<'a> UringDriver<'a> {
         idx: u32,
         scope: &'static str,
     ) -> Result<(), FileTableUpdateFailure> {
-        self.update_kernel_file_entries(idx, &[-1], scope)
+        let txn = FileUpdateTxn::clear(idx, 1, scope);
+        self.update_kernel_file_entries(&txn)
+    }
+
+    fn clear_kernel_file_entries(
+        &mut self,
+        start: u32,
+        count: usize,
+        scope: &'static str,
+    ) -> Result<(), FileTableUpdateFailure> {
+        let txn = FileUpdateTxn::clear(start, count, scope);
+        self.update_kernel_file_entries(&txn)
     }
 
     fn poison_file_table(
@@ -388,45 +727,155 @@ impl<'a> UringDriver<'a> {
                 return Err(FileTableRollbackFailure {
                     failed_index: idx,
                     failure,
-                    remaining_indices: mem::take(registered),
+                    // `unregister_file_slot` restores `idx` when its clear update fails, so the
+                    // failed slot is retained alongside the entries still waiting for rollback.
+                    remaining_indices: {
+                        let mut remaining = mem::take(registered);
+                        remaining.push(idx);
+                        remaining
+                    },
                 });
             }
         }
         Ok(())
     }
 
-    fn rollback_descriptors_after_registration_failure(
+    fn rollback_committed_batch(
         &mut self,
-        descriptors: &[IoFd],
-        primary: Report<UringError>,
-    ) -> Report<UringError> {
-        let mut registered = descriptors
-            .iter()
-            .filter_map(|fd| match fd {
-                IoFd::Registered { index, .. } => Some(*index),
-                IoFd::Direct(_) | IoFd::OwnedDirect { .. } => None,
-            })
-            .collect::<Vec<_>>();
+        batch: &mut FileRegistrationBatch<'_>,
+    ) -> Result<(), FileTableRollbackFailure> {
+        let mut registered = batch.committed_indices();
+        let result = self.rollback_file_slots(&mut registered);
+        match &result {
+            Ok(()) => batch.mark_rolled_back(&[]),
+            Err(rollback) => batch.mark_rolled_back(&rollback.remaining_indices),
+        }
+        result
+    }
 
-        for fd in descriptors.iter().copied() {
-            if matches!(fd, IoFd::OwnedDirect { .. }) {
-                drop(self.file_table.release_direct(fd));
+    fn abort_file_batch(
+        &mut self,
+        batch: &mut FileRegistrationBatch<'_>,
+        primary: Report<UringError>,
+        note: &'static str,
+    ) -> Report<UringError> {
+        batch.release_reserved(&mut self.file_table);
+        for descriptor in mem::take(&mut batch.direct_descriptors) {
+            if matches!(descriptor, IoFd::OwnedDirect { .. }) {
+                drop(self.file_table.release_direct(descriptor));
             }
         }
 
-        match self.rollback_file_slots(&mut registered) {
+        match self.rollback_committed_batch(batch) {
             Ok(()) => primary,
             Err(rollback) => {
                 let context = rollback.failure.poison_context(Some(rollback.failed_index));
+                let remaining_slots = batch.retained_slot_count();
                 self.poison_file_table(
                     "driver.register_files_internal.rollback",
                     context,
                     primary,
-                    Some(rollback.failure.report),
+                    Some(rollback.failure.report.report),
                     true,
-                    rollback.remaining_indices.len(),
+                    remaining_slots,
                 )
-                .attach_note("rollback failed after owned direct adoption failure")
+                .attach_note(note)
+            }
+        }
+    }
+
+    fn abort_file_batch_after_update_failure(
+        &mut self,
+        batch: &mut FileRegistrationBatch<'_>,
+        cursor: usize,
+        run_end: usize,
+        failure: FileTableUpdateFailure,
+    ) -> Report<UringError> {
+        let failed_index = batch.fixed[cursor].index;
+        let context = failure.poison_context(Some(failed_index));
+        let evidence = failure.evidence;
+        let primary = failure.report.report;
+        let run_len = run_end - cursor;
+
+        match evidence.outcome {
+            KernelUpdateOutcome::Applied(updated) => {
+                let touched = updated.min(run_len);
+                if touched == 0 {
+                    batch.release_range(&mut self.file_table, cursor, run_end);
+                    return self.abort_file_batch(
+                        batch,
+                        primary,
+                        "registration update applied no entries before abort",
+                    );
+                }
+
+                match self.clear_kernel_file_entries(
+                    failed_index,
+                    touched,
+                    "driver.register_files_internal.abort.clear_prefix",
+                ) {
+                    Ok(()) => {
+                        batch.release_range(&mut self.file_table, cursor, cursor + touched);
+                        batch.release_range(&mut self.file_table, cursor + touched, run_end);
+                        self.abort_file_batch(
+                            batch,
+                            primary,
+                            "registration update was rolled back after a partial apply",
+                        )
+                    }
+                    Err(clear_failure) => {
+                        let clear_evidence = clear_failure.evidence;
+                        let cleared = match clear_evidence.outcome {
+                            KernelUpdateOutcome::Applied(updated) => updated.min(touched),
+                            #[cfg(feature = "test-hooks")]
+                            KernelUpdateOutcome::Rejected(_) => 0,
+                            KernelUpdateOutcome::Unknown(_, _) => 0,
+                        };
+                        batch.release_range(&mut self.file_table, cursor, cursor + cleared);
+                        batch.retain_range(
+                            &mut self.file_table,
+                            cursor + cleared,
+                            cursor + touched,
+                        );
+                        batch.release_range(&mut self.file_table, cursor + touched, run_end);
+                        batch.release_reserved(&mut self.file_table);
+
+                        self.poison_file_table(
+                            "driver.register_files_internal.rollback",
+                            context,
+                            primary,
+                            Some(clear_failure.report.report),
+                            true,
+                            batch.retained_slot_count(),
+                        )
+                        .attach_note("partial registration apply could not be fully cleared")
+                    }
+                }
+            }
+            #[cfg(feature = "test-hooks")]
+            KernelUpdateOutcome::Rejected(_) => {
+                batch.release_range(&mut self.file_table, cursor, run_end);
+                self.abort_file_batch(
+                    batch,
+                    primary,
+                    "registration update was rejected before kernel state changed",
+                )
+            }
+            KernelUpdateOutcome::Unknown(_, _) => {
+                batch.retain_range(&mut self.file_table, cursor, run_end);
+                batch.release_range(&mut self.file_table, run_end, batch.fixed_len());
+                batch.release_reserved(&mut self.file_table);
+                self.poison_file_table(
+                    "driver.register_files_internal",
+                    context,
+                    primary,
+                    None,
+                    false,
+                    batch.retained_slot_count(),
+                )
+                .attach_note(
+                    "registration update result was unknown; all touched file owners were retained",
+                )
             }
         }
     }
@@ -457,7 +906,7 @@ impl<'a> UringDriver<'a> {
                         Err(self.poison_file_table(
                             "driver.unregister_fixed_fd",
                             context,
-                            failure.report,
+                            failure.report.report,
                             None,
                             false,
                             0,
@@ -515,7 +964,7 @@ impl<'a> UringDriver<'a> {
             self.completion_diagnostics
                 .backend()
                 .inc_file_table_quarantine();
-            if failure.updated_files.is_some() {
+            if failure.evidence.updated().is_some() {
                 self.completion_diagnostics
                     .backend()
                     .inc_file_table_cleanup_short_update();
@@ -528,13 +977,13 @@ impl<'a> UringDriver<'a> {
                 .with_ctx("generation", generation)
                 .with_ctx("expected_files", 1usize)
                 .attach_note("closed owned fd was consumed; file slot was quarantined");
-            if let Some(errno) = failure.cleanup_errno {
+            if let Some(errno) = failure.report.cleanup_errno {
                 report = report.with_ctx("cleanup_errno", errno);
             }
-            if let Some(updated_files) = failure.updated_files {
+            if let Some(updated_files) = failure.evidence.updated() {
                 report = report.with_ctx("updated_files", updated_files);
             }
-            return Err(report.with_diag_src_err(failure.report));
+            return Err(report.with_diag_src_err(failure.report.report));
         }
         self.file_table.release(index);
         self.file_table.advance_generation(index);
@@ -580,22 +1029,28 @@ impl<'a> UringDriver<'a> {
         }
 
         let fd = raw.raw().as_fd();
-        let update = self.update_kernel_file_entries(
+        let new_entry = RegisteredFileEntry::BorrowedFd {
+            fd,
+            kind: raw.kind(),
+        };
+        let txn = FileUpdateTxn::register(
             index,
-            &[fd],
+            vec![fd],
             "driver.replace_registered_fixed_fd.register_files_update",
         );
+        let update = self.update_kernel_file_entries(&txn);
         if let Err(failure) = update {
             let context = failure.poison_context(Some(index));
-            return Err(self.poison_file_table(scope, context, failure.report, None, false, 0));
+            return Err(self.poison_file_table(
+                scope,
+                context,
+                failure.report.report,
+                None,
+                false,
+                0,
+            ));
         }
-        let old_entry = self.file_table.replace_entry(
-            index,
-            RegisteredFileEntry::BorrowedFd {
-                fd,
-                kind: raw.kind(),
-            },
-        );
+        let old_entry = self.file_table.replace_entry(index, new_entry);
         drop(old_entry);
         Ok(())
     }
@@ -627,15 +1082,6 @@ impl<'a> UringDriver<'a> {
 
         self.file_table.mark_initialized();
         Ok(())
-    }
-
-    /// Registers `fds` into the `fds.len()` consecutive table slots starting at `start`.
-    fn register_file_run(&mut self, start: u32, fds: &[i32]) -> Result<(), FileTableUpdateFailure> {
-        self.update_kernel_file_entries(
-            start,
-            fds,
-            "driver.register_files_internal.register_files_update",
-        )
     }
 
     /// Registers `files`, taking kernel table slots while they last.
@@ -676,24 +1122,21 @@ impl<'a> UringDriver<'a> {
             .file_table_fallback_registrations
             .saturating_add(fallback as u64);
 
-        let mut files = files.into_iter();
-        let entries = files
-            .by_ref()
-            .take(claimed.len())
-            .map(|file| match file {
-                RegisterFd::Borrowed(b) => RegisteredFileEntry::BorrowedFd {
-                    fd: b.raw().as_fd(),
-                    kind: b.kind(),
-                },
-                RegisterFd::Owned(o) => RegisteredFileEntry::OwnedHandle(o),
-            })
-            .collect::<Vec<_>>();
+        let mut batch = FileRegistrationBatch::new(claimed, files);
+        let fixed_indices = batch.fixed_indices();
+        let mut cursor = 0usize;
+        while cursor < batch.fixed_len() {
+            let run_end = consecutive_run_end(&fixed_indices, cursor);
+            let txn = batch.registration_txn(cursor, run_end);
+            if let Err(failure) = self.update_kernel_file_entries(&txn) {
+                return Err(self
+                    .abort_file_batch_after_update_failure(&mut batch, cursor, run_end, failure));
+            }
+            batch.commit_range(&mut self.file_table, cursor, run_end);
+            cursor = run_end;
+        }
 
-        // On failure the untaken `files` drop here, closing any owned handles among them —
-        // the same thing that happens to the entries the rollback discards.
-        let mut descriptors = self.install_claimed_files(claimed, entries)?;
-
-        for file in files {
+        for file in batch.take_direct_files() {
             let descriptor = match file {
                 RegisterFd::Borrowed(b) => IoFd::direct(b.raw()),
                 // A direct descriptor is only a handle value, so the driver has to keep the
@@ -701,80 +1144,17 @@ impl<'a> UringDriver<'a> {
                 RegisterFd::Owned(o) => match self.file_table.adopt_direct(o) {
                     Ok(fd) => fd,
                     Err(report) => {
-                        return Err(self.rollback_descriptors_after_registration_failure(
-                            &descriptors,
+                        return Err(self.abort_file_batch(
+                            &mut batch,
                             report,
+                            "rollback failed after owned direct adoption failure",
                         ));
                     }
                 },
             };
-            descriptors.push(descriptor);
+            batch.push_direct_descriptor(descriptor);
         }
-        Ok(descriptors)
-    }
-
-    /// Publishes `entries` into `claimed`, telling the kernel about each consecutive run.
-    fn install_claimed_files(
-        &mut self,
-        claimed: Vec<u32>,
-        entries: Vec<RegisteredFileEntry>,
-    ) -> UringResult<Vec<IoFd>> {
-        debug_assert_eq!(claimed.len(), entries.len());
-        let fds = entries
-            .iter()
-            .map(RegisteredFileEntry::fd)
-            .collect::<Vec<_>>();
-        let mut entries = entries.into_iter();
-
-        let mut installed = Vec::with_capacity(fds.len());
-        let mut cursor = 0usize;
-        while cursor < claimed.len() {
-            let run_end = consecutive_run_end(&claimed, cursor);
-            let outcome = self.register_file_run(claimed[cursor], &fds[cursor..run_end]);
-
-            // The run's entries are recorded even when the update failed: a partial update may
-            // have left some fds in the kernel table, and the rollback below needs the entries
-            // in place to reset those slots to -1.
-            for idx in claimed[cursor..run_end].iter().copied() {
-                let entry = entries
-                    .next()
-                    .expect("one registered file entry per claimed file slot");
-                self.file_table.install_entry(idx, entry);
-                installed.push(idx);
-            }
-            cursor = run_end;
-
-            if let Err(failure) = outcome {
-                // Hand back the slots this batch never got to.
-                self.file_table
-                    .release_all(claimed[cursor..].iter().copied());
-                if let Err(rollback) = self.rollback_file_slots(&mut installed) {
-                    let context = failure.poison_context(Some(rollback.failed_index));
-                    let original_report = failure.report;
-                    let rollback_report = rollback.failure.report;
-                    return Err(self
-                        .poison_file_table(
-                            "driver.register_files_internal.rollback",
-                            context,
-                            original_report,
-                            Some(rollback_report),
-                            true,
-                            rollback.remaining_indices.len(),
-                        )
-                        .attach_note("rollback failed after registered file update failure"));
-                }
-                return Err(failure.report);
-            }
-        }
-
-        Ok(claimed
-            .into_iter()
-            .map(|idx| {
-                self.file_table
-                    .descriptor(idx)
-                    .expect("installed slot exists")
-            })
-            .collect())
+        Ok(batch.descriptors(&self.file_table))
     }
 }
 
@@ -789,7 +1169,7 @@ fn consecutive_run_end(slots: &[u32], start: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::consecutive_run_end;
+    use super::{KernelUpdateOutcome, UpdateEvidence, consecutive_run_end};
     use veloq_std::{vec, vec::Vec};
 
     /// Walks `slots` the way `install_claimed_files` does, collecting one run per syscall.
@@ -820,5 +1200,31 @@ mod tests {
     #[test]
     fn a_single_slot_is_one_run() {
         assert_eq!(runs(&[7]), vec![&[7][..]]);
+    }
+
+    #[test]
+    fn update_evidence_preserves_partial_kernel_application() {
+        let evidence = UpdateEvidence {
+            requested: 3,
+            outcome: KernelUpdateOutcome::Applied(1),
+        };
+
+        assert_eq!(evidence.updated(), Some(1));
+        assert_eq!(evidence.requested, 3);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn rejected_and_unknown_updates_do_not_claim_applied_entries() {
+        for outcome in [
+            KernelUpdateOutcome::Rejected(libc::EIO),
+            KernelUpdateOutcome::Unknown(Some(libc::EIO), "test evidence"),
+        ] {
+            let evidence = UpdateEvidence {
+                requested: 1,
+                outcome,
+            };
+            assert_eq!(evidence.updated(), None);
+        }
     }
 }

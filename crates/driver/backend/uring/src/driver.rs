@@ -40,8 +40,8 @@ pub(crate) use env::{CompletionControlView, CqeEnv, SqeEnv};
 pub use lifecycle::UringOpState;
 pub use registration::ProvidedBufStats;
 pub(crate) use registration::{
-    FileTable, MAX_CHUNKS, PROVIDED_BUF_GROUP_ID, ProvidedBufGroup, RegisteredFileEntry, SqeFd,
-    UringBufferRegistry, UringRegistrationStats,
+    FileTable, MAX_CHUNKS, PROVIDED_BUF_GROUP_ID, ProvidedBufGroup, RegisteredFileEntry,
+    RingLifetimeOwner, SqeFd, UringBufferRegistry, UringRegistrationStats,
 };
 
 /// 从 opcode 探测结果得出乐观的能力集合。
@@ -58,12 +58,32 @@ fn probe_capabilities(probe: &io_uring::Probe) -> DriverCapabilities {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProvidedBufQuiesce {
+    active_operations: usize,
+    armed_provided_multishot: bool,
+    pending_completions: bool,
+    selected_bids: bool,
+}
+
+impl ProvidedBufQuiesce {
+    #[inline]
+    const fn is_quiescent(self) -> bool {
+        self.active_operations == 0
+            && !self.armed_provided_multishot
+            && !self.pending_completions
+            && !self.selected_bids
+    }
+}
+
 pub struct UringDriver<'a> {
-    // Rust 按声明顺序从上到下析构字段。`ring` 必须在 `buffer_registry` 之前声明：
-    // Drop 函数体只尝试显式反注册；如果 syscall 失败，group 会留在 registry 中。函数体
-    // 返回后，`IoUring` 先析构并关闭 ring fd，内核随之不再持有 provided-buffer ring；
-    // 之后 registry 才释放 `FixedBuf` 和 `RingMapping`。这是失败路径的有意生命周期兜底。
+    // Rust 按声明顺序从上到下析构字段。`ring`、`ring_lifetime` 必须在
+    // `buffer_registry` 之前声明：Drop 函数体只尝试显式反注册；如果 syscall 失败或 driver
+    // 尚未 quiescent，group 会留在 registry 中。函数体返回后，`IoUring` 先析构并关闭 ring
+    // fd，随后 `ring_lifetime` 把 owner token 标记为 dead，最后 registry 才释放 mapping 和
+    // `FixedBuf`。这把原来仅靠字段顺序的兜底变成了可断言的生命周期协议。
     pub(crate) ring: IoUring,
+    ring_lifetime: RingLifetimeOwner,
     pub(crate) ops: UringOpRegistry,
     pub(crate) completion_diagnostics: DriverCompletionDiagnostics<UringCompletionDiagnostics>,
     pub(crate) completion_table: SharedCompletionTable<UringSlotSpec>,
@@ -113,6 +133,7 @@ impl<'a> UringDriver<'a> {
         let completion_diagnostics = ops.shared.completion_diagnostics();
 
         let waker = UringWakerManager::new()?;
+        let ring_lifetime = RingLifetimeOwner::new();
 
         // opcode 探测只能回答「这个 opcode 存在吗」，回答不了「它的 multishot 变体存在
         // 吗」——那是同一个 opcode 上后加的标志位。所以这里只排除掉真正缺 opcode 的内核，
@@ -127,6 +148,7 @@ impl<'a> UringDriver<'a> {
 
         let mut driver = Self {
             ring,
+            ring_lifetime,
             ops,
             completion_diagnostics,
             completion_table,
@@ -194,6 +216,57 @@ impl<'a> UringDriver<'a> {
 
     fn has_active_ops_internal(&self) -> bool {
         self.ops.has_active_ops()
+    }
+
+    fn has_armed_provided_multishot(&mut self) -> bool {
+        let active_tokens: Vec<OpToken> = self.ops.active_tokens().collect();
+        active_tokens.into_iter().any(|token| {
+            let Ok(view) = self.ops.checked_slot_view(token) else {
+                return true;
+            };
+            match view {
+                CheckedSlotView::Valid(SlotView::Reserved(mut slot)) => slot
+                    .with_op_mut(|op| op.is_provided_multishot())
+                    .unwrap_or(true),
+                CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => slot
+                    .with_op_mut(|op| op.is_provided_multishot())
+                    .unwrap_or(true),
+                CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot)) => slot
+                    .with_op_mut(|op| op.is_provided_multishot())
+                    .unwrap_or(true),
+                CheckedSlotView::Empty(_)
+                | CheckedSlotView::Missing { .. }
+                | CheckedSlotView::Stale(_) => true,
+            }
+        })
+    }
+
+    fn has_pending_completion_work(&mut self) -> bool {
+        if !self.cqe_buffer.is_empty() || self.ops.shared.has_ready_completion() {
+            return true;
+        }
+        let mut completion = self.ring.completion();
+        completion.sync();
+        !completion.is_empty()
+    }
+
+    fn quiesce_provided_buffers(&mut self) -> ProvidedBufQuiesce {
+        let state = ProvidedBufQuiesce {
+            active_operations: self.ops.active_count(),
+            armed_provided_multishot: self.has_armed_provided_multishot(),
+            pending_completions: self.has_pending_completion_work(),
+            selected_bids: self.buffer_registry.provided_buffers_have_selected_bids(),
+        };
+        if !state.is_quiescent() {
+            tracing::debug!(
+                active_operations = state.active_operations,
+                armed_provided_multishot = state.armed_provided_multishot,
+                pending_completions = state.pending_completions,
+                selected_bids = state.selected_bids,
+                "provided buffer ring is not quiescent"
+            );
+        }
+        state
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -494,8 +567,41 @@ impl<'a> UringDriver<'a> {
 
 impl<'a> Drop for UringDriver<'a> {
     fn drop(&mut self) {
+        let has_provided_buffers = self.buffer_registry.has_provided_buffers();
         if self.ops.has_active_ops() {
             tracing::warn!("UringDriver dropped with active in-flight operations");
+        }
+        if !has_provided_buffers {
+            self.completion_diagnostics
+                .backend()
+                .inc_provided_drop_skipped_unregister();
+        } else {
+            let quiesce = self.quiesce_provided_buffers();
+            if quiesce.is_quiescent() {
+                // 正常关闭优先显式反注册。失败时 release_provided_buffers 会恢复 group 的所有权，
+                // 不在仍存活的 IoUring 前释放映射；随后依靠 owner token 和字段顺序完成最终兜底。
+                if let Err(report) = self
+                    .buffer_registry
+                    .release_provided_buffers(&self.ring.submitter())
+                {
+                    tracing::warn!(
+                        bgid = PROVIDED_BUF_GROUP_ID,
+                        report = ?report,
+                        "failed to unregister provided buffer ring; retaining it until io_uring drops"
+                    );
+                }
+            } else {
+                self.completion_diagnostics
+                    .backend()
+                    .inc_provided_drop_deferred_unregister();
+                tracing::warn!(
+                    active_operations = quiesce.active_operations,
+                    armed_provided_multishot = quiesce.armed_provided_multishot,
+                    pending_completions = quiesce.pending_completions,
+                    selected_bids = quiesce.selected_bids,
+                    "deferring provided buffer ring unregister until io_uring drops"
+                );
+            }
         }
         let outstanding_cancel_tickets = self.control.cancellations.in_flight_len();
         if outstanding_cancel_tickets != 0 {
@@ -505,18 +611,6 @@ impl<'a> Drop for UringDriver<'a> {
             );
         }
         self.control.cancellations.clear_in_flight();
-        // 正常关闭优先显式反注册。失败时 release_provided_buffers 会恢复 group 的所有权，
-        // 不在仍存活的 IoUring 前释放映射；随后依靠上面的字段声明顺序完成最终兜底。
-        if let Err(report) = self
-            .buffer_registry
-            .release_provided_buffers(&self.ring.submitter())
-        {
-            tracing::warn!(
-                bgid = PROVIDED_BUF_GROUP_ID,
-                report = ?report,
-                "failed to unregister provided buffer ring; retaining it until io_uring drops"
-            );
-        }
     }
 }
 
@@ -681,11 +775,12 @@ impl<'a> DriverRaw for UringDriver<'a> {
     /// 最低内核是 5.6。失败就把能力留在 `false`，门面层据此拒绝那些需要它的操作，其余一切
     /// 照旧。
     fn attach_buffer_pool_raw(&mut self, pool: AnyBufPool) -> UringResult<()> {
-        if self
-            .buffer_registry
-            .attach_buffer_pool(&self.ring.submitter(), pool)?
-        {
-            self.capabilities.provided_buffers = true;
+        if self.buffer_registry.attach_buffer_pool(
+            &self.ring.submitter(),
+            pool,
+            self.ring_lifetime.token(),
+        )? {
+            self.capabilities.provided_buffers = self.buffer_registry.provided_buffers_enabled();
         }
         Ok(())
     }
@@ -744,6 +839,11 @@ impl DriverTestHooks for UringDriver<'_> {
     fn debug_inject_register_buffers_update_failure(&mut self, errno: i32) {
         self.buffer_registry
             .inject_register_buffers_update_failure(errno);
+    }
+
+    fn debug_inject_register_buffers_update_unknown(&mut self, errno: i32) {
+        self.buffer_registry
+            .inject_register_buffers_update_unknown(errno);
     }
 
     fn debug_inject_register_buffers_update_sequence(&mut self, outcomes: &[Option<i32>]) {

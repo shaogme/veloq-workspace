@@ -375,7 +375,10 @@ impl<'a> UringCompletionHooks<'a> {
 
     #[inline]
     fn cqe_env(&mut self) -> CqeEnv<'_> {
-        CqeEnv::new(self.provided_buffers.as_deref_mut())
+        CqeEnv::new(
+            self.provided_buffers.as_deref_mut(),
+            self.diagnostics.backend(),
+        )
     }
 
     fn completion_cleanup_hint_for(
@@ -1126,6 +1129,7 @@ impl<'a> UringDriver<'a> {
             ingress,
         );
         drop(hooks);
+        self.capabilities.provided_buffers = self.buffer_registry.provided_buffers_enabled();
         if flow_result.is_err()
             && let Some((token, _)) = observation
         {

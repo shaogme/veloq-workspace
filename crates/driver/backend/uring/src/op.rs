@@ -130,6 +130,13 @@ impl PlatformOp for UringKernelOp {
     }
 }
 
+impl UringKernelOp {
+    #[inline]
+    pub(crate) fn is_provided_multishot(&self) -> bool {
+        matches!(self.payload, UringOpPayload::RecvMulti(_))
+    }
+}
+
 pub type UringOp = UringKernelOp;
 
 // ============================================================================

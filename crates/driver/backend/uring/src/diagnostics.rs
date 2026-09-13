@@ -36,6 +36,14 @@ pub struct UringCompletionDiagnostics {
     file_table_quarantines: AtomicU64,
     file_table_rollback_failures: AtomicU64,
     file_table_poisonings: AtomicU64,
+    file_table_update_applied: AtomicU64,
+    file_table_update_rejected: AtomicU64,
+    file_table_update_unknown: AtomicU64,
+    fixed_chunk_identity_mismatches: AtomicU64,
+    provided_unknown_bids: AtomicU64,
+    provided_drop_skipped_unregister: AtomicU64,
+    provided_drop_active_unregister_attempts: AtomicU64,
+    provided_drop_deferred_unregister: AtomicU64,
     corrupt_cleanup_attempts: AtomicU64,
     corrupt_raw_fd_cleanups: AtomicU64,
     corrupt_cleanup_hint_missing: AtomicU64,
@@ -80,6 +88,22 @@ pub struct UringCompletionDiagnosticsSnapshot {
     pub file_table_rollback_failures: u64,
     /// Number of transitions from a healthy to a poisoned file table.
     pub file_table_poisonings: u64,
+    /// Number of file-table update calls with a known applied result.
+    pub file_table_update_applied: u64,
+    /// Number of test-injected file-table update calls known not to have run.
+    pub file_table_update_rejected: u64,
+    /// Number of file-table update calls whose kernel effect is unknown.
+    pub file_table_update_unknown: u64,
+    /// Number of fixed chunks submitted with metadata that differs from the ledger.
+    pub fixed_chunk_identity_mismatches: u64,
+    /// Number of provided-buffer completions with an unknown local bid.
+    pub provided_unknown_bids: u64,
+    /// Number of driver drops that had no provided ring to unregister.
+    pub provided_drop_skipped_unregister: u64,
+    /// Number of driver drops that attempted provided-ring unregister with active operations.
+    pub provided_drop_active_unregister_attempts: u64,
+    /// Number of driver drops that deferred provided-ring unregister until ring teardown.
+    pub provided_drop_deferred_unregister: u64,
     /// Number of corrupt completions whose registered cleanup hint was invoked.
     pub corrupt_cleanup_attempts: u64,
     /// Number of non-negative raw fd results handled through a corrupt-completion hint.
@@ -260,6 +284,42 @@ impl UringCompletionDiagnostics {
     }
 
     #[inline]
+    pub(crate) fn inc_file_table_update_applied(&self) {
+        Self::inc(&self.file_table_update_applied);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[inline]
+    pub(crate) fn inc_file_table_update_rejected(&self) {
+        Self::inc(&self.file_table_update_rejected);
+    }
+
+    #[inline]
+    pub(crate) fn inc_file_table_update_unknown(&self) {
+        Self::inc(&self.file_table_update_unknown);
+    }
+
+    #[inline]
+    pub(crate) fn inc_fixed_chunk_identity_mismatch(&self) {
+        Self::inc(&self.fixed_chunk_identity_mismatches);
+    }
+
+    #[inline]
+    pub(crate) fn inc_provided_unknown_bid(&self) {
+        Self::inc(&self.provided_unknown_bids);
+    }
+
+    #[inline]
+    pub(crate) fn inc_provided_drop_skipped_unregister(&self) {
+        Self::inc(&self.provided_drop_skipped_unregister);
+    }
+
+    #[inline]
+    pub(crate) fn inc_provided_drop_deferred_unregister(&self) {
+        Self::inc(&self.provided_drop_deferred_unregister);
+    }
+
+    #[inline]
     pub(crate) fn inc_corrupt_cleanup_attempt(&self) {
         Self::inc(&self.corrupt_cleanup_attempts);
     }
@@ -313,6 +373,16 @@ impl DriverCompletionDiagnosticsBackend for UringCompletionDiagnostics {
             file_table_quarantines: Self::load(&self.file_table_quarantines),
             file_table_rollback_failures: Self::load(&self.file_table_rollback_failures),
             file_table_poisonings: Self::load(&self.file_table_poisonings),
+            file_table_update_applied: Self::load(&self.file_table_update_applied),
+            file_table_update_rejected: Self::load(&self.file_table_update_rejected),
+            file_table_update_unknown: Self::load(&self.file_table_update_unknown),
+            fixed_chunk_identity_mismatches: Self::load(&self.fixed_chunk_identity_mismatches),
+            provided_unknown_bids: Self::load(&self.provided_unknown_bids),
+            provided_drop_skipped_unregister: Self::load(&self.provided_drop_skipped_unregister),
+            provided_drop_active_unregister_attempts: Self::load(
+                &self.provided_drop_active_unregister_attempts,
+            ),
+            provided_drop_deferred_unregister: Self::load(&self.provided_drop_deferred_unregister),
             corrupt_cleanup_attempts: Self::load(&self.corrupt_cleanup_attempts),
             corrupt_raw_fd_cleanups: Self::load(&self.corrupt_raw_fd_cleanups),
             corrupt_cleanup_hint_missing: Self::load(&self.corrupt_cleanup_hint_missing),
