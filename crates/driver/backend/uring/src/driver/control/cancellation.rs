@@ -1,8 +1,8 @@
 use veloq_driver_core::driver::{
-    CancelCompletionId, CancelMode, CancelRequest, OpToken, RemoteCancelSender,
+    CancelMode, CancelRequest, CancelTicket, CancelTicketError, OpToken, RemoteCancelSender,
 };
 use veloq_std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, VecDeque, hash_map::Entry},
     sync::mpsc,
 };
 
@@ -29,8 +29,8 @@ impl PendingCancel {
 
 pub(crate) struct UringCancelManager {
     pending_cancellations: VecDeque<PendingCancel>,
-    pending_cancel_cqes: HashMap<CancelCompletionId, PendingCancel>,
-    next_cancel_id: u16,
+    pending_cancel_cqes: HashMap<CancelTicket, PendingCancel>,
+    next_cancel_ticket: u64,
     remote_cancel_sender: RemoteCancelSender,
     remote_cancel_receiver: mpsc::Receiver<CancelRequest>,
 }
@@ -41,7 +41,7 @@ impl UringCancelManager {
         Self {
             pending_cancellations: VecDeque::new(),
             pending_cancel_cqes: HashMap::default(),
-            next_cancel_id: 1,
+            next_cancel_ticket: 1,
             remote_cancel_sender: sender,
             remote_cancel_receiver: receiver,
         }
@@ -78,37 +78,42 @@ impl UringCancelManager {
     }
 
     #[inline]
-    pub(crate) fn allocate_cancel_id(&mut self) -> Option<CancelCompletionId> {
-        for _ in 0..u16::MAX {
-            let raw = self.next_cancel_id;
-            self.next_cancel_id = self.next_cancel_id.wrapping_add(1);
-            if self.next_cancel_id == 0 {
-                self.next_cancel_id = 1;
-            }
-            let id = CancelCompletionId::new(raw);
-            if !self.pending_cancel_cqes.contains_key(&id) {
-                return Some(id);
-            }
-        }
-        None
+    pub(crate) fn allocate_cancel_ticket(&mut self) -> Result<CancelTicket, CancelTicketError> {
+        let raw = self.next_cancel_ticket;
+        let ticket = CancelTicket::try_new(raw).map_err(|_| CancelTicketError::Exhausted)?;
+        let next = raw.checked_add(1).ok_or(CancelTicketError::Exhausted)?;
+        self.next_cancel_ticket = next;
+        Ok(ticket)
     }
 
     #[inline]
     pub(crate) fn insert_in_flight(
         &mut self,
-        id: CancelCompletionId,
+        ticket: CancelTicket,
         pending: PendingCancel,
     ) -> Result<(), PendingCancel> {
-        if self.pending_cancel_cqes.contains_key(&id) {
-            return Err(pending);
+        match self.pending_cancel_cqes.entry(ticket) {
+            Entry::Vacant(entry) => {
+                entry.insert(pending);
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(pending),
         }
-        self.pending_cancel_cqes.insert(id, pending);
-        Ok(())
     }
 
     #[inline]
-    pub(crate) fn in_flight_mut(&mut self) -> &mut HashMap<CancelCompletionId, PendingCancel> {
+    pub(crate) fn in_flight_mut(&mut self) -> &mut HashMap<CancelTicket, PendingCancel> {
         &mut self.pending_cancel_cqes
+    }
+
+    #[inline]
+    pub(crate) fn in_flight_len(&self) -> usize {
+        self.pending_cancel_cqes.len()
+    }
+
+    #[inline]
+    pub(crate) fn clear_in_flight(&mut self) {
+        self.pending_cancel_cqes.clear();
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -119,12 +124,10 @@ impl UringCancelManager {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn in_flight_targets(
-        &self,
-    ) -> impl Iterator<Item = (CancelCompletionId, OpToken)> + '_ {
+    pub(crate) fn in_flight_targets(&self) -> impl Iterator<Item = (CancelTicket, OpToken)> + '_ {
         self.pending_cancel_cqes
             .iter()
-            .map(|(id, request)| (*id, request.target))
+            .map(|(ticket, request)| (*ticket, request.target))
     }
 }
 
@@ -141,15 +144,42 @@ mod tests {
     }
 
     #[test]
-    fn allocator_skips_an_unacknowledged_id() {
+    fn allocator_is_monotonic_and_ignores_in_flight_map() {
         let mut manager = UringCancelManager::new();
-        let first = manager.allocate_cancel_id().expect("first id");
+        let first = manager.allocate_cancel_ticket().expect("first ticket");
         manager
             .insert_in_flight(first, pending())
-            .expect("unique id");
-        manager.next_cancel_id = first.raw();
+            .expect("unique ticket");
 
-        let next = manager.allocate_cancel_id().expect("second id");
+        let next = manager.allocate_cancel_ticket().expect("second ticket");
+        assert_eq!(next.raw(), first.raw() + 1);
+    }
+
+    #[test]
+    fn allocator_never_reuses_a_ticket_removed_from_the_sidecar() {
+        let mut manager = UringCancelManager::new();
+        let first = manager.allocate_cancel_ticket().expect("first ticket");
+        manager
+            .insert_in_flight(first, pending())
+            .expect("unique ticket");
+        assert!(manager.in_flight_mut().remove(&first).is_some());
+
+        let next = manager.allocate_cancel_ticket().expect("next ticket");
         assert_ne!(next, first);
+        assert_eq!(next.raw(), first.raw() + 1);
+    }
+
+    #[test]
+    fn allocator_reports_exhaustion_without_wrapping() {
+        let mut manager = UringCancelManager::new();
+        manager.next_cancel_ticket = CancelTicket::MAX_RAW;
+
+        let last = manager.allocate_cancel_ticket().expect("maximum ticket");
+        assert_eq!(last.raw(), CancelTicket::MAX_RAW);
+        assert_eq!(
+            manager.allocate_cancel_ticket(),
+            Err(CancelTicketError::Exhausted)
+        );
+        assert_eq!(manager.next_cancel_ticket, CancelTicket::MAX_RAW + 1);
     }
 }

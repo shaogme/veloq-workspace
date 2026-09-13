@@ -35,7 +35,7 @@ use crate::driver::control::ControlPlaneObserver;
 use crate::driver::control::waker::{WAKER_NOTIFIED, WAKER_PROCESSING};
 use veloq_driver_core::{
     driver::{
-        AnomalyAttach, CancelCompletionId, CancelMode, CompletionAnomalyKind, CompletionBackend,
+        AnomalyAttach, CancelMode, CancelTicket, CompletionAnomalyKind, CompletionBackend,
         CompletionBackendHooks, CompletionCleanupGuard, CompletionContinuation, CompletionControl,
         CompletionEnvelope, CompletionFlowExt, CompletionFlowOutcome, CompletionHookOutcome,
         CompletionIngress, CompletionSource, CompletionToken, Driver, DriverCompletionDiagnostics,
@@ -130,14 +130,14 @@ enum UringBackendEffect {
         generation: u64,
     },
     CancelEnoent {
-        cancel_id: CancelCompletionId,
+        cancel_ticket: CancelTicket,
         request: PendingCancel,
         raw: RawCompletion,
     },
     CancelPhase {
         target: OpToken,
         phase: CancellationPhase,
-        cancel_id: CancelCompletionId,
+        cancel_ticket: CancelTicket,
     },
     CloseCompleted {
         token: OpToken,
@@ -507,17 +507,18 @@ impl<'a> UringCompletionHooks<'a> {
 
     fn handle_cancel_control(
         &mut self,
-        cancel_id: CancelCompletionId,
+        cancel_ticket: CancelTicket,
         raw: RawCompletion,
     ) -> CompletionHookOutcome<UringSlotSpec, UringBackendEffect> {
-        let request = self.control.take_pending_cancel(cancel_id);
+        let request = self.control.take_pending_cancel(cancel_ticket);
         let Some(request) = request else {
+            self.diagnostics.backend().inc_cancel_untracked_cqe();
             return CompletionHookOutcome::Failed {
                 error: UringError::InvalidState.report(
                     "uring.completion.handle_cancel_control",
                     format!(
-                        "async cancel completion had no pending request for cancel_id: {}",
-                        cancel_id.raw()
+                        "async cancel completion had no pending request for cancel_ticket: {}",
+                        cancel_ticket.raw()
                     ),
                 ),
                 effect: UringBackendEffect::None,
@@ -527,7 +528,7 @@ impl<'a> UringCompletionHooks<'a> {
             value if value >= 0 => {
                 self.diagnostics.backend().inc_cancel_ack_ok();
                 trace!(
-                    cancel_id = cancel_id.raw(),
+                    cancel_ticket = cancel_ticket.raw(),
                     request = ?request,
                     result = value,
                     "async cancel completed"
@@ -536,20 +537,20 @@ impl<'a> UringCompletionHooks<'a> {
                     effect: UringBackendEffect::CancelPhase {
                         target: request.target,
                         phase: CancellationPhase::Acked,
-                        cancel_id,
+                        cancel_ticket,
                     },
                 }
             }
             value if value == -libc::ENOENT => {
                 self.diagnostics.backend().inc_cancel_ack_not_found();
                 debug!(
-                    cancel_id = cancel_id.raw(),
+                    cancel_ticket = cancel_ticket.raw(),
                     request = ?request,
                     "async cancel target was already complete or absent"
                 );
                 CompletionHookOutcome::ControlHandled {
                     effect: UringBackendEffect::CancelEnoent {
-                        cancel_id,
+                        cancel_ticket,
                         request,
                         raw,
                     },
@@ -558,7 +559,7 @@ impl<'a> UringCompletionHooks<'a> {
             value => {
                 self.diagnostics.backend().inc_cancel_ack_error();
                 warn!(
-                    cancel_id = cancel_id.raw(),
+                    cancel_ticket = cancel_ticket.raw(),
                     request = ?request,
                     result = value,
                     errno = -value,
@@ -568,7 +569,7 @@ impl<'a> UringCompletionHooks<'a> {
                     effect: UringBackendEffect::CancelPhase {
                         target: request.target,
                         phase: CancellationPhase::Failed,
-                        cancel_id,
+                        cancel_ticket,
                     },
                 }
             }
@@ -586,7 +587,7 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
     ) -> CompletionHookOutcome<UringSlotSpec, Self::BackendEffect> {
         match control {
             CompletionControl::Waker { raw, .. } => self.handle_waker_control(raw),
-            CompletionControl::Cancel { id, raw } => self.handle_cancel_control(id, raw),
+            CompletionControl::Cancel { ticket, raw } => self.handle_cancel_control(ticket, raw),
         }
     }
 
@@ -749,20 +750,21 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
                 Ok(())
             }
             UringBackendEffect::CancelEnoent {
-                cancel_id,
+                cancel_ticket,
                 request,
                 raw,
             } => {
-                self.control.append_cancel_enoent(cancel_id, request, raw);
+                self.control
+                    .append_cancel_enoent(cancel_ticket, request, raw);
                 Ok(())
             }
             UringBackendEffect::CancelPhase {
                 target,
                 phase,
-                cancel_id,
+                cancel_ticket,
             } => {
                 self.control
-                    .append_cancel_phase_update(cancel_id, target, phase);
+                    .append_cancel_phase_update(cancel_ticket, target, phase);
                 Ok(())
             }
             UringBackendEffect::CloseCompleted { token, fd } => {
@@ -1173,12 +1175,12 @@ impl<'a> UringDriver<'a> {
                     }
                 }
                 UringControlEffectKind::CancelReconcile {
-                    cancel_id,
+                    cancel_ticket,
                     request,
                     raw,
                 } => {
                     if let Err(report) =
-                        self.record_cancel_enoent_if_target_active(cancel_id, request, raw)
+                        self.record_cancel_enoent_if_target_active(cancel_ticket, request, raw)
                     {
                         remember_first_error(first_error, report);
                     }
@@ -1258,7 +1260,7 @@ impl<'a> UringDriver<'a> {
 
     fn record_cancel_enoent_if_target_active(
         &mut self,
-        cancel_id: CancelCompletionId,
+        cancel_ticket: CancelTicket,
         request: PendingCancel,
         raw: RawCompletion,
     ) -> UringResult<()> {
@@ -1288,7 +1290,7 @@ impl<'a> UringDriver<'a> {
                 "record_cancel_enoent_if_target_active",
                 "io_uring cancel returned ENOENT but target slot is still active",
             )
-            .with_ctx("cancel_id", cancel_id.raw())
+            .with_ctx("cancel_ticket", cancel_ticket.raw())
             .with_ctx("expected_index", request.target.index())
             .with_ctx("expected_generation", request.target.generation())
             .with_ctx("actual_index", snapshot.index)
@@ -1591,7 +1593,7 @@ mod tests {
 
     fn test_hooks<'a>(
         diagnostics: &'a DriverCompletionDiagnostics<UringCompletionDiagnostics>,
-        pending_cancel_cqes: &'a mut HashMap<CancelCompletionId, PendingCancel>,
+        pending_cancel_cqes: &'a mut HashMap<CancelTicket, PendingCancel>,
         completion_cleanup_hints: &'a mut HashMap<CompletionToken, Option<CompletionCleanupHintFn>>,
         _waker_armed: &'a mut bool,
         _notification_state: &'a AtomicU8,
@@ -1612,7 +1614,7 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn test_hooks_with_buffers<'a>(
         diagnostics: &'a DriverCompletionDiagnostics<UringCompletionDiagnostics>,
-        pending_cancel_cqes: &'a mut HashMap<CancelCompletionId, PendingCancel>,
+        pending_cancel_cqes: &'a mut HashMap<CancelTicket, PendingCancel>,
         completion_cleanup_hints: &'a mut HashMap<CompletionToken, Option<CompletionCleanupHintFn>>,
         _waker_armed: &'a mut bool,
         _notification_state: &'a AtomicU8,
@@ -1905,10 +1907,15 @@ mod tests {
             &mut observer,
             &mut post,
         );
-        let cancel_id = CancelCompletionId::new(7);
-        let raw = RawCompletion::new(COMP_BACKEND_URING, CompletionToken::cancel(cancel_id), 0, 0);
+        let cancel_ticket = CancelTicket::try_new(7).expect("test ticket");
+        let raw = RawCompletion::new(
+            COMP_BACKEND_URING,
+            CompletionToken::cancel(cancel_ticket),
+            0,
+            0,
+        );
 
-        let outcome = hooks.handle_cancel_control(cancel_id, raw);
+        let outcome = hooks.handle_cancel_control(cancel_ticket, raw);
 
         let err = match outcome {
             CompletionHookOutcome::Failed { error, effect } => {
@@ -1918,6 +1925,7 @@ mod tests {
             _ => panic!("untracked cancel must produce a failed outcome"),
         };
         assert_eq!(*err.inner(), UringError::InvalidState);
+        assert_eq!(diagnostics.snapshot().backend.cancel_untracked_cqe, 1);
     }
 
     #[test]

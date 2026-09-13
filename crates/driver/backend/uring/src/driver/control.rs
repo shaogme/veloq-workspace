@@ -13,7 +13,7 @@ pub(crate) use waker::UringWakerManager;
 
 use crate::driver::lifecycle::SubmissionPhase;
 use veloq_driver_core::{
-    driver::{CancelCompletionId, CompletionToken, OpToken},
+    driver::{CancelTicket, CompletionToken, OpToken},
     slot::SlotSnapshot,
 };
 use veloq_std::vec::Vec;
@@ -80,17 +80,17 @@ pub(crate) enum ControlInvariantError {
     CleanupHintRemoveMissing {
         token: CompletionToken,
     },
-    CancelIdDuplicate {
-        id: CancelCompletionId,
+    CancelTicketDuplicate {
+        ticket: CancelTicket,
         target: OpToken,
     },
-    CancelIdTargetMismatch {
-        id: CancelCompletionId,
+    CancelTicketTargetMismatch {
+        ticket: CancelTicket,
         expected: OpToken,
         actual: OpToken,
     },
-    CancelIdRemoveMissing {
-        id: CancelCompletionId,
+    CancelTicketRemoveMissing {
+        ticket: CancelTicket,
         target: OpToken,
     },
 }
@@ -104,11 +104,11 @@ pub(crate) enum ControlPlaneEvent {
     CancelPendingPush(OpToken),
     CancelPendingPop(OpToken),
     CancelInFlightInsert {
-        id: CancelCompletionId,
+        ticket: CancelTicket,
         target: OpToken,
     },
     CancelInFlightRemove {
-        id: CancelCompletionId,
+        ticket: CancelTicket,
         target: OpToken,
     },
     TimerInsert {
@@ -153,7 +153,7 @@ pub(crate) struct ControlPlaneSnapshot {
     pub(crate) active_tokens: Vec<ControlTokenSnapshot>,
     pub(crate) backlog_tokens: Vec<OpToken>,
     pub(crate) pending_cancel_targets: Vec<OpToken>,
-    pub(crate) in_flight_cancel_targets: Vec<(CancelCompletionId, OpToken)>,
+    pub(crate) in_flight_cancel_targets: Vec<(CancelTicket, OpToken)>,
     pub(crate) timer_tokens: Vec<(TaskId, OpToken)>,
     pub(crate) cleanup_hint_tokens: Vec<CompletionToken>,
     pub(crate) quarantined_tokens: Vec<OpToken>,
@@ -174,7 +174,7 @@ pub(crate) struct ControlPlaneObserver {
     #[cfg(any(test, feature = "test-hooks"))]
     staged_kernel_tokens: veloq_std::collections::HashSet<OpToken>,
     #[cfg(any(test, feature = "test-hooks"))]
-    cancel_in_flight: veloq_std::collections::HashMap<CancelCompletionId, OpToken>,
+    cancel_in_flight: veloq_std::collections::HashMap<CancelTicket, OpToken>,
 }
 
 impl ControlPlaneObserver {
@@ -240,22 +240,28 @@ impl ControlPlaneObserver {
                     None => Some(ControlInvariantError::TimerExpireMissing { token }),
                 }
             }
-            ControlPlaneEvent::CancelInFlightInsert { id, target } => {
-                if self.cancel_in_flight.insert(id, target).is_none() {
-                    None
-                } else {
-                    Some(ControlInvariantError::CancelIdDuplicate { id, target })
+            ControlPlaneEvent::CancelInFlightInsert { ticket, target } => {
+                match self.cancel_in_flight.entry(ticket) {
+                    veloq_std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(target);
+                        None
+                    }
+                    veloq_std::collections::hash_map::Entry::Occupied(_) => {
+                        Some(ControlInvariantError::CancelTicketDuplicate { ticket, target })
+                    }
                 }
             }
-            ControlPlaneEvent::CancelInFlightRemove { id, target } => {
-                match self.cancel_in_flight.remove(&id) {
+            ControlPlaneEvent::CancelInFlightRemove { ticket, target } => {
+                match self.cancel_in_flight.remove(&ticket) {
                     Some(actual) if actual == target => None,
-                    Some(actual) => Some(ControlInvariantError::CancelIdTargetMismatch {
-                        id,
+                    Some(actual) => Some(ControlInvariantError::CancelTicketTargetMismatch {
+                        ticket,
                         expected: target,
                         actual,
                     }),
-                    None => Some(ControlInvariantError::CancelIdRemoveMissing { id, target }),
+                    None => {
+                        Some(ControlInvariantError::CancelTicketRemoveMissing { ticket, target })
+                    }
                 }
             }
             ControlPlaneEvent::CleanupHintInsert(token) => {
@@ -420,7 +426,7 @@ mod tests {
     fn records_round_one_control_plane_sequences() {
         let token = token();
         let expire_token = other_token();
-        let cancel_id = CancelCompletionId::new(1);
+        let cancel_ticket = CancelTicket::try_new(1).expect("test ticket");
         let mut wheel = Wheel::new(WheelConfig::default());
         let task_id = wheel.insert(token, Duration::from_secs(1));
         let expire_task_id = wheel.insert(expire_token, Duration::from_secs(1));
@@ -485,11 +491,11 @@ mod tests {
 
         // Async cancel bookkeeping is paired around the cancel CQE.
         observer.record(ControlPlaneEvent::CancelInFlightInsert {
-            id: cancel_id,
+            ticket: cancel_ticket,
             target: token,
         });
         observer.record(ControlPlaneEvent::CancelInFlightRemove {
-            id: cancel_id,
+            ticket: cancel_ticket,
             target: token,
         });
 
@@ -514,7 +520,7 @@ mod tests {
         assert_eq!(
             events[18],
             ControlPlaneEvent::CancelInFlightInsert {
-                id: cancel_id,
+                ticket: cancel_ticket,
                 target: token,
             }
         );

@@ -36,10 +36,7 @@ where
     let mut slot = driver.reserve_op().expect("reserve op failed");
     slot.set_payload(T::payload_into_erased(payload));
     match slot.submit(&mut iocp_op) {
-        DriverSubmitResult::Submitted(_) => {
-            let submitted = slot.persist().token();
-            submitted
-        }
+        DriverSubmitResult::Submitted(_) => slot.persist().token(),
         DriverSubmitResult::Failed { report, status } => {
             panic!("submit op failed: status={status:?}, error={report}")
         }
@@ -107,7 +104,7 @@ pub(crate) fn wait_completion(
     usize::from_event_res::<IocpError>(record.event.res()).map_err(|e| {
         let code = iocp_report_to_event_res(&e);
         let io_error = io::Error::from_raw_os_error(-code);
-        IocpError::CompletionWait.io_report("iocp.tests.wait_completion", io_error.into())
+        IocpError::CompletionWait.io_report("iocp.tests.wait_completion", io_error)
     })
 }
 

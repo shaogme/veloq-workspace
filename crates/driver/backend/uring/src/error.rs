@@ -27,6 +27,8 @@ set! {
         InvalidInput,
         #[display("invalid internal state")]
         InvalidState,
+        #[display("cancel ticket space exhausted")]
+        CancelTicketExhausted,
         #[display("unsupported operation")]
         Unsupported,
         #[display("internal error")]
@@ -84,19 +86,20 @@ fn neg_code(code: i32) -> Option<i32> {
 #[inline]
 pub(crate) fn uring_fallback_errno(kind: UringError) -> i32 {
     match kind {
-        UringError::DriverInit => 5,           // EIO
-        UringError::CompletionWait => 5,       // EIO
-        UringError::Submission => 11,          // EAGAIN
-        UringError::Registration => 12,        // ENOMEM
-        UringError::ResolveFd => 9,            // EBADF
-        UringError::DuplicateOwnedFd => 17,    // EEXIST
-        UringError::FileTableQuarantined => 5, // EIO
-        UringError::FileTablePoisoned => 5,    // EIO
-        UringError::Socket => 5,               // EIO
-        UringError::InvalidInput => 22,        // EINVAL
-        UringError::InvalidState => 5,         // EIO
-        UringError::Unsupported => 95,         // EOPNOTSUPP
-        UringError::Internal => 5,             // EIO
+        UringError::DriverInit => 5,             // EIO
+        UringError::CompletionWait => 5,         // EIO
+        UringError::Submission => 11,            // EAGAIN
+        UringError::Registration => 12,          // ENOMEM
+        UringError::ResolveFd => 9,              // EBADF
+        UringError::DuplicateOwnedFd => 17,      // EEXIST
+        UringError::FileTableQuarantined => 5,   // EIO
+        UringError::FileTablePoisoned => 5,      // EIO
+        UringError::Socket => 5,                 // EIO
+        UringError::InvalidInput => 22,          // EINVAL
+        UringError::InvalidState => 5,           // EIO
+        UringError::CancelTicketExhausted => 75, // EOVERFLOW
+        UringError::Unsupported => 95,           // EOPNOTSUPP
+        UringError::Internal => 5,               // EIO
     }
 }
 

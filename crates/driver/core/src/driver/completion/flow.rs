@@ -64,11 +64,11 @@ pub enum CompletionSource<'a, BackendIngress> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionControl {
     Waker {
-        id: u16,
+        id: u64,
         raw: RawCompletion,
     },
     Cancel {
-        id: super::CancelCompletionId,
+        ticket: super::CancelTicket,
         raw: RawCompletion,
     },
 }
@@ -304,8 +304,8 @@ where
                     let outcome = hooks.handle_control(CompletionControl::Waker { id, raw });
                     finish_hook_outcome(self, table, diagnostics, hooks, outcome, None)
                 }
-                CompletionDispatch::Cancel { id, raw } => {
-                    let outcome = hooks.handle_control(CompletionControl::Cancel { id, raw });
+                CompletionDispatch::Cancel { ticket, raw } => {
+                    let outcome = hooks.handle_control(CompletionControl::Cancel { ticket, raw });
                     finish_hook_outcome(self, table, diagnostics, hooks, outcome, None)
                 }
                 CompletionDispatch::Unknown { envelope } => {

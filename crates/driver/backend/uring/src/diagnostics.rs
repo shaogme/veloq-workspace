@@ -14,6 +14,9 @@ pub struct UringCompletionDiagnostics {
     cancel_ack_not_found: AtomicU64,
     cancel_ack_error: AtomicU64,
     cancel_ack_enoent_active: AtomicU64,
+    cancel_ticket_exhausted: AtomicU64,
+    cancel_duplicate_ticket: AtomicU64,
+    cancel_untracked_cqe: AtomicU64,
     waker_ok: AtomicU64,
     waker_error: AtomicU64,
     waker_rebuild: AtomicU64,
@@ -50,6 +53,9 @@ pub struct UringCompletionDiagnosticsSnapshot {
     pub cancel_ack_not_found: u64,
     pub cancel_ack_error: u64,
     pub cancel_ack_enoent_active: u64,
+    pub cancel_ticket_exhausted: u64,
+    pub cancel_duplicate_ticket: u64,
+    pub cancel_untracked_cqe: u64,
     pub waker_ok: u64,
     pub waker_error: u64,
     pub waker_rebuild: u64,
@@ -141,6 +147,21 @@ impl UringCompletionDiagnostics {
     #[inline]
     pub(crate) fn inc_cancel_ack_enoent_active(&self) {
         Self::inc(&self.cancel_ack_enoent_active);
+    }
+
+    #[inline]
+    pub(crate) fn inc_cancel_ticket_exhausted(&self) {
+        Self::inc(&self.cancel_ticket_exhausted);
+    }
+
+    #[inline]
+    pub(crate) fn inc_cancel_duplicate_ticket(&self) {
+        Self::inc(&self.cancel_duplicate_ticket);
+    }
+
+    #[inline]
+    pub(crate) fn inc_cancel_untracked_cqe(&self) {
+        Self::inc(&self.cancel_untracked_cqe);
     }
 
     #[inline]
@@ -270,6 +291,9 @@ impl DriverCompletionDiagnosticsBackend for UringCompletionDiagnostics {
             cancel_ack_not_found: Self::load(&self.cancel_ack_not_found),
             cancel_ack_error: Self::load(&self.cancel_ack_error),
             cancel_ack_enoent_active: Self::load(&self.cancel_ack_enoent_active),
+            cancel_ticket_exhausted: Self::load(&self.cancel_ticket_exhausted),
+            cancel_duplicate_ticket: Self::load(&self.cancel_duplicate_ticket),
+            cancel_untracked_cqe: Self::load(&self.cancel_untracked_cqe),
             waker_ok: Self::load(&self.waker_ok),
             waker_error: Self::load(&self.waker_error),
             waker_rebuild: Self::load(&self.waker_rebuild),

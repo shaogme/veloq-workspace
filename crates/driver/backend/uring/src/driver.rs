@@ -18,11 +18,10 @@ use crate::{
     },
 };
 use veloq_driver_core::driver::{
-    BufferRegistrationStatus, CancelCompletionId, CancelRequest, CancelSubmitOutcome,
-    CompletionToken, DriveMode, DriveOutcome, DriverCapabilities, DriverCapability,
-    DriverCompletionDiagnostics, DriverCompletionDiagnosticsSnapshot, DriverRaw,
-    DriverSubmitResult, OpToken, RegisterFd, RemoteCancelSender, RemoteWaker,
-    SharedCompletionTable, SharedSlotTable, SubmitStatus,
+    BufferRegistrationStatus, CancelRequest, CancelSubmitOutcome, CancelTicket, CompletionToken,
+    DriveMode, DriveOutcome, DriverCapabilities, DriverCapability, DriverCompletionDiagnostics,
+    DriverCompletionDiagnosticsSnapshot, DriverRaw, DriverSubmitResult, OpToken, RegisterFd,
+    RemoteCancelSender, RemoteWaker, SharedCompletionTable, SharedSlotTable, SubmitStatus,
     registry::{OpEntry, OpHandle},
     sealed,
 };
@@ -254,9 +253,9 @@ impl<'a> UringDriver<'a> {
         let mut pending_cancel_targets: Vec<OpToken> =
             self.control.cancellations.pending_targets().collect();
         pending_cancel_targets.sort_by_key(|token| (token.index(), token.generation().get()));
-        let mut in_flight_cancel_targets: Vec<(CancelCompletionId, OpToken)> =
+        let mut in_flight_cancel_targets: Vec<(CancelTicket, OpToken)> =
             self.control.cancellations.in_flight_targets().collect();
-        in_flight_cancel_targets.sort_by_key(|(id, _)| id.raw());
+        in_flight_cancel_targets.sort_by_key(|(ticket, _)| ticket.raw());
         let mut timer_tokens = self.control.timer_entries();
         timer_tokens.sort_by_key(|(task_id, _)| task_id.raw());
         let mut cleanup_hint_tokens: Vec<CompletionToken> = self
@@ -498,6 +497,14 @@ impl<'a> Drop for UringDriver<'a> {
         if self.ops.has_active_ops() {
             tracing::warn!("UringDriver dropped with active in-flight operations");
         }
+        let outstanding_cancel_tickets = self.control.cancellations.in_flight_len();
+        if outstanding_cancel_tickets != 0 {
+            tracing::warn!(
+                count = outstanding_cancel_tickets,
+                "UringDriver dropped with outstanding cancel tickets"
+            );
+        }
+        self.control.cancellations.clear_in_flight();
         // 正常关闭优先显式反注册。失败时 release_provided_buffers 会恢复 group 的所有权，
         // 不在仍存活的 IoUring 前释放映射；随后依靠上面的字段声明顺序完成最终兜底。
         if let Err(report) = self

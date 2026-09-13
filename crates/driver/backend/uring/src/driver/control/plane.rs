@@ -8,7 +8,7 @@ use crate::{
     op::CompletionCleanupHintFn,
 };
 use veloq_driver_core::{
-    driver::{CancelCompletionId, CompletionToken, OpToken, RawCompletion},
+    driver::{CancelTicket, CompletionToken, OpToken, RawCompletion},
     slot::Generation,
 };
 use veloq_std::{
@@ -92,7 +92,7 @@ impl SubmissionBacklog {
 pub(crate) enum StagedEntry {
     User(OpToken),
     Cancel {
-        id: CancelCompletionId,
+        ticket: CancelTicket,
         target: OpToken,
     },
     Waker,
@@ -114,11 +114,11 @@ pub(crate) struct UringControlEffect {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UringControlEffectKind {
     CancelAck {
-        cancel_id: CancelCompletionId,
+        cancel_ticket: CancelTicket,
         phase: CancellationPhase,
     },
     CancelReconcile {
-        cancel_id: CancelCompletionId,
+        cancel_ticket: CancelTicket,
         request: PendingCancel,
         raw: RawCompletion,
     },
@@ -289,6 +289,29 @@ impl UringControlPlane {
         self.staged_entries.push_back(entry);
     }
 
+    /// Atomically records a staged cancel SQE in the sidecar and submission metadata.
+    ///
+    /// The caller invokes this only after the SQE has entered the user-space submission queue.
+    /// A full queue therefore never creates an in-flight sidecar entry, while an allocator bug
+    /// cannot overwrite an existing request.
+    pub(crate) fn stage_cancel(
+        &mut self,
+        ticket: CancelTicket,
+        request: PendingCancel,
+    ) -> Result<(), PendingCancel> {
+        self.cancellations.insert_in_flight(ticket, request)?;
+        self.stage_entry(StagedEntry::Cancel {
+            ticket,
+            target: request.target,
+        });
+        self.observer
+            .record(ControlPlaneEvent::CancelInFlightInsert {
+                ticket,
+                target: request.target,
+            });
+        Ok(())
+    }
+
     #[inline]
     pub(crate) fn staged_entry_count(&self) -> usize {
         self.staged_entries.len()
@@ -347,6 +370,7 @@ impl UringControlPlane {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use veloq_driver_core::driver::CancelMode;
     use veloq_driver_core::slot::Generation;
 
     fn token(index: usize, generation: u32) -> OpToken {
@@ -383,7 +407,7 @@ mod tests {
         plane.stage_entry(StagedEntry::User(first));
         plane.stage_entry(StagedEntry::Waker);
         plane.stage_entry(StagedEntry::Cancel {
-            id: CancelCompletionId::new(7),
+            ticket: CancelTicket::try_new(7).expect("test ticket"),
             target: second,
         });
 
@@ -396,10 +420,62 @@ mod tests {
         assert_eq!(
             plane.mark_submitted_entries(1),
             veloq_std::vec![StagedEntry::Cancel {
-                id: CancelCompletionId::new(7),
+                ticket: CancelTicket::try_new(7).expect("test ticket"),
                 target: second,
             }]
         );
+    }
+
+    #[test]
+    fn stage_cancel_records_one_sidecar_entry_and_one_staged_entry() {
+        let target = token(8, 5);
+        let ticket = CancelTicket::try_new(11).expect("test ticket");
+        let request = PendingCancel {
+            target,
+            mode: CancelMode::Abandon,
+        };
+        let mut plane = UringControlPlane::new(UringWakerManager::new().expect("test eventfd"));
+
+        plane
+            .stage_cancel(ticket, request)
+            .expect("ticket should be staged");
+
+        assert_eq!(plane.staged_entry_count(), 1);
+        assert_eq!(plane.cancellations.in_flight_len(), 1);
+        assert_eq!(plane.cancellations.in_flight_targets().count(), 1);
+        assert_eq!(
+            plane.observer.take_events(),
+            veloq_std::vec![ControlPlaneEvent::CancelInFlightInsert { ticket, target }]
+        );
+    }
+
+    #[test]
+    fn duplicate_stage_cancel_preserves_the_original_request() {
+        let target = token(9, 5);
+        let replacement = token(10, 6);
+        let ticket = CancelTicket::try_new(12).expect("test ticket");
+        let first = PendingCancel {
+            target,
+            mode: CancelMode::UserVisible,
+        };
+        let second = PendingCancel {
+            target: replacement,
+            mode: CancelMode::Abandon,
+        };
+        let mut plane = UringControlPlane::new(UringWakerManager::new().expect("test eventfd"));
+
+        plane.stage_cancel(ticket, first).expect("first stage");
+        assert!(plane.stage_cancel(ticket, second).is_err());
+
+        assert_eq!(plane.staged_entry_count(), 1);
+        assert_eq!(
+            plane
+                .cancellations
+                .in_flight_targets()
+                .collect::<veloq_std::vec::Vec<_>>(),
+            veloq_std::vec![(ticket, target)]
+        );
+        assert_eq!(plane.observer.take_events().len(), 1);
     }
 
     #[test]
@@ -448,7 +524,7 @@ mod tests {
             Some(token),
             Some(token.generation()),
             UringControlEffectKind::CancelAck {
-                cancel_id: CancelCompletionId::new(2),
+                cancel_ticket: CancelTicket::try_new(2).expect("test ticket"),
                 phase: CancellationPhase::Acked,
             },
         );

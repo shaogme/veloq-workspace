@@ -2,7 +2,7 @@ use crate::{
     driver::{
         PendingCancel, UringDriver,
         completion::{COMP_BACKEND_URING, UringSyntheticCompletion},
-        control::{BacklogStageKind, ControlPlaneEvent, StagedEntry},
+        control::{BacklogStageKind, ControlPlaneEvent},
         submission::{submit_queued_from_slot, txn::slot_access_report},
     },
     error::{UringError, UringResult, uring_report_to_event_res},
@@ -12,9 +12,9 @@ use diagweave::prelude::*;
 use io_uring::opcode;
 use tracing::{debug, trace};
 use veloq_driver_core::driver::{
-    AnomalyAttach, CancelCompletionId, CancelMode, CancelRequest, CancelSubmitOutcome,
-    CancelTargetGoneReason, CompletionToken, OpToken, SyntheticCompletionSource,
-    UserCompletionEvent, cancel_target_kind,
+    AnomalyAttach, CancelMode, CancelRequest, CancelSubmitOutcome, CancelTargetGoneReason,
+    CancelTicket, CompletionToken, OpToken, SyntheticCompletionSource, UserCompletionEvent,
+    cancel_target_kind,
 };
 use veloq_std::vec::Vec;
 use veloq_wheel::TaskId;
@@ -77,48 +77,50 @@ impl<'a> UringDriver<'a> {
     fn try_submit_cancel_request(
         &mut self,
         request: PendingCancel,
-    ) -> UringResult<Option<CancelCompletionId>> {
+    ) -> UringResult<Option<CancelTicket>> {
         let (user_data, generation) = request.user_parts();
 
-        let Some(cancel_id) = self.control.cancellations.allocate_cancel_id() else {
-            return Err(UringError::InvalidState
-                .report("uring.cancel.allocate_id", "cancel id space is saturated")
-                .attach_note("target remains active and no cancel map entry was overwritten"));
-        };
+        let cancel_ticket = self
+            .control
+            .cancellations
+            .allocate_cancel_ticket()
+            .map_err(|_| {
+                self.completion_diagnostics
+                    .backend()
+                    .inc_cancel_ticket_exhausted();
+                UringError::CancelTicketExhausted
+                    .report(
+                        "uring.cancel.allocate_ticket",
+                        "cancel ticket space exhausted",
+                    )
+                    .attach_note("target remains active and no cancel map entry was overwritten")
+            })?;
         let cancel_sqe = opcode::AsyncCancel::new(CompletionToken::user(request.target).raw())
             .build()
-            .user_data(CompletionToken::cancel(cancel_id).raw());
+            .user_data(CompletionToken::cancel(cancel_ticket).raw());
 
         if self.push_entry(cancel_sqe) == crate::driver::env::StageResult::Staged {
-            if self
-                .control
-                .cancellations
-                .insert_in_flight(cancel_id, request)
-                .is_err()
-            {
+            if self.control.stage_cancel(cancel_ticket, request).is_err() {
+                self.completion_diagnostics
+                    .backend()
+                    .inc_cancel_duplicate_ticket();
                 return Err(UringError::InvalidState
-                    .report("uring.cancel.insert_id", "cancel id was already in use")
+                    .report(
+                        "uring.cancel.stage_ticket",
+                        "cancel ticket was already in use",
+                    )
                     .attach_note("staged cancel bookkeeping could not be made authoritative"));
             }
-            self.control.stage_entry(StagedEntry::Cancel {
-                id: cancel_id,
-                target: request.target,
-            });
             self.set_cancel_phase(request.target, CancellationPhase::CancelStaged);
-            self.control
-                .record(ControlPlaneEvent::CancelInFlightInsert {
-                    id: cancel_id,
-                    target: request.target,
-                });
             self.completion_diagnostics.backend().inc_cancel_submitted();
             trace!(
                 user_data,
                 generation = generation.get(),
-                cancel_id = cancel_id.raw(),
+                cancel_ticket = cancel_ticket.raw(),
                 mode = ?request.mode,
                 "submitted async cancel"
             );
-            Ok(Some(cancel_id))
+            Ok(Some(cancel_ticket))
         } else {
             Ok(None)
         }

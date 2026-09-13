@@ -33,8 +33,8 @@ pub use table::{
     CompletionAccess, PollRecordResult, SharedCompletionTable,
 };
 pub use token::{
-    CancelCompletionId, CompletionControlKind, CompletionToken, CompletionTokenClass, OpToken,
-    OpTokenError, SubmitTokenContext,
+    CancelTicket, CancelTicketError, CompletionControlKind, CompletionToken, CompletionTokenClass,
+    CompletionTokenError, OpToken, OpTokenError, SubmitTokenContext,
 };
 pub use types::{
     AnomalyAttach, AnomalyOutcome, BackendSlotRef, CompletionAnomaly, CompletionAnomalyKind,

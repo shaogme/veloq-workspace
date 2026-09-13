@@ -26,7 +26,7 @@ use io_uring::{SubmissionQueue, Submitter, cqueue, squeue};
 use tracing::{debug, trace};
 use veloq_buf::{BufferRegistrar, FixedBuf, heap::ChunkId};
 use veloq_driver_core::driver::{
-    BufferRegistrationStatus, CancelCompletionId, CompletionToken, OpToken, RawCompletion,
+    BufferRegistrationStatus, CancelTicket, CompletionToken, OpToken, RawCompletion,
 };
 use veloq_driver_core::slot::Generation;
 use veloq_std::{
@@ -176,7 +176,7 @@ impl<'d> CqeEnv<'d> {
 /// buffers remain in the separate [`CqeEnv`] projection so completion hooks cannot reach
 /// registration state.
 pub(crate) struct CompletionControlView<'d> {
-    pending_cancel_cqes: &'d mut HashMap<CancelCompletionId, PendingCancel>,
+    pending_cancel_cqes: &'d mut HashMap<CancelTicket, PendingCancel>,
     completion_cleanup_hints: &'d mut HashMap<CompletionToken, Option<CompletionCleanupHintFn>>,
     waker_buf_len: usize,
     waker_generation: u64,
@@ -187,7 +187,7 @@ pub(crate) struct CompletionControlView<'d> {
 impl<'d> CompletionControlView<'d> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        pending_cancel_cqes: &'d mut HashMap<CancelCompletionId, PendingCancel>,
+        pending_cancel_cqes: &'d mut HashMap<CancelTicket, PendingCancel>,
         completion_cleanup_hints: &'d mut HashMap<CompletionToken, Option<CompletionCleanupHintFn>>,
         waker_buf_len: usize,
         waker_generation: u64,
@@ -231,14 +231,11 @@ impl<'d> CompletionControlView<'d> {
     }
 
     #[inline]
-    pub(crate) fn take_pending_cancel(
-        &mut self,
-        cancel_id: CancelCompletionId,
-    ) -> Option<PendingCancel> {
-        let request = self.pending_cancel_cqes.remove(&cancel_id)?;
+    pub(crate) fn take_pending_cancel(&mut self, ticket: CancelTicket) -> Option<PendingCancel> {
+        let request = self.pending_cancel_cqes.remove(&ticket)?;
         self.observer
             .record(ControlPlaneEvent::CancelInFlightRemove {
-                id: cancel_id,
+                ticket,
                 target: request.target,
             });
         Some(request)
@@ -274,7 +271,7 @@ impl<'d> CompletionControlView<'d> {
     #[inline]
     pub(crate) fn append_cancel_enoent(
         &mut self,
-        cancel_id: CancelCompletionId,
+        cancel_ticket: CancelTicket,
         request: PendingCancel,
         raw: RawCompletion,
     ) {
@@ -282,7 +279,7 @@ impl<'d> CompletionControlView<'d> {
             Some(request.target),
             Some(request.target.generation()),
             UringControlEffectKind::CancelReconcile {
-                cancel_id,
+                cancel_ticket,
                 request,
                 raw,
             },
@@ -292,14 +289,17 @@ impl<'d> CompletionControlView<'d> {
     #[inline]
     pub(crate) fn append_cancel_phase_update(
         &mut self,
-        cancel_id: CancelCompletionId,
+        cancel_ticket: CancelTicket,
         target: OpToken,
         phase: CancellationPhase,
     ) {
         self.append_effect(
             Some(target),
             Some(target.generation()),
-            UringControlEffectKind::CancelAck { cancel_id, phase },
+            UringControlEffectKind::CancelAck {
+                cancel_ticket,
+                phase,
+            },
         );
     }
 

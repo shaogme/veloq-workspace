@@ -1,6 +1,6 @@
 use super::{
-    CancelCompletionId, CompletionAnomaly, CompletionBackend, CompletionControlKind,
-    CompletionToken, CompletionTokenClass, OpToken,
+    CancelTicket, CompletionAnomaly, CompletionBackend, CompletionControlKind, CompletionToken,
+    CompletionTokenClass, OpToken,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,11 +107,11 @@ pub enum CompletionDispatch {
         event: UserCompletionEvent,
     },
     Waker {
-        id: u16,
+        id: u64,
         raw: RawCompletion,
     },
     Cancel {
-        id: CancelCompletionId,
+        ticket: CancelTicket,
         raw: RawCompletion,
     },
     Unknown {
@@ -122,9 +122,9 @@ pub enum CompletionDispatch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionIdentity {
     User(OpToken),
-    Waker(u16),
-    Cancel(CancelCompletionId),
-    UnknownControl { kind: u16, id: u16 },
+    Waker(u64),
+    Cancel(CancelTicket),
+    UnknownControl { kind: u16, payload: u64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,20 +164,29 @@ impl CompletionEnvelope {
             ),
             CompletionTokenClass::Control {
                 kind: CompletionControlKind::Waker,
-                id,
+                payload,
             } => (
-                CompletionIdentity::Waker(id),
+                CompletionIdentity::Waker(payload),
                 CompletionIdentitySource::ControlToken,
             ),
             CompletionTokenClass::Control {
                 kind: CompletionControlKind::Cancel,
-                id,
-            } => (
-                CompletionIdentity::Cancel(CancelCompletionId::new(id)),
-                CompletionIdentitySource::ControlToken,
-            ),
-            CompletionTokenClass::UnknownControl { kind, id } => (
-                CompletionIdentity::UnknownControl { kind, id },
+                payload,
+            } => match CancelTicket::try_new(payload) {
+                Ok(ticket) => (
+                    CompletionIdentity::Cancel(ticket),
+                    CompletionIdentitySource::ControlToken,
+                ),
+                Err(_) => (
+                    CompletionIdentity::UnknownControl {
+                        kind: CompletionControlKind::Cancel as u16,
+                        payload,
+                    },
+                    CompletionIdentitySource::ControlToken,
+                ),
+            },
+            CompletionTokenClass::UnknownControl { kind, payload } => (
+                CompletionIdentity::UnknownControl { kind, payload },
                 CompletionIdentitySource::ControlToken,
             ),
         };
@@ -228,7 +237,7 @@ pub(super) fn dispatch_envelope(envelope: CompletionEnvelope) -> CompletionDispa
             event: UserCompletionEvent::from_classified(token, raw),
         },
         CompletionIdentity::Waker(id) => CompletionDispatch::Waker { id, raw },
-        CompletionIdentity::Cancel(id) => CompletionDispatch::Cancel { id, raw },
+        CompletionIdentity::Cancel(ticket) => CompletionDispatch::Cancel { ticket, raw },
         CompletionIdentity::UnknownControl { .. } => CompletionDispatch::Unknown { envelope },
     }
 }
