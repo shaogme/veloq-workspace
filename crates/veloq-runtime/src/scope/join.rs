@@ -1,7 +1,4 @@
-use super::{
-    AsyncScope, CancelTokenSlot, LocalAsyncScope, ScopeProvider,
-    router::{RoutedSpawnState, RoutedTakeReadyOutcome, RoutedTakeResult, RoutedTaskAccess},
-};
+use super::{AsyncScope, CancelTokenSlot, LocalAsyncScope, ScopeProvider};
 use crate::{
     error::{EnqueueError, Result as RuntimeResult, RuntimeError},
     runtime::cancellation::{CancelledFuture, GenericCancellationToken},
@@ -13,16 +10,14 @@ use crate::{
 use diagweave::{Report, prelude::*};
 use veloq_intrusive_linklist::Link;
 use veloq_std::{
-    boxed::Box,
     cell::Cell,
     future::Future,
     marker::{PhantomData, PhantomPinned},
     pin::Pin,
     ptr::NonNull,
-    sync::NativeArc as Arc,
     task::{Context, Poll},
 };
-use veloq_storage::{AtomicStorage, StateLock, Storage};
+use veloq_storage::{StateLock, Storage};
 
 /// Outcome of awaiting a [`JoinHandle`].
 #[derive(Debug)]
@@ -56,19 +51,13 @@ impl<T> JoinOutcome<T> {
     }
 }
 
-pub(crate) struct ResolvedRoutedTask<'scope_ref, T, R: TaskHandleRef> {
-    pub(crate) task: R,
-    pub(crate) access: Option<Box<dyn RoutedTaskAccess<T> + 'scope_ref>>,
-}
-
 pub(crate) enum JoinSource<'scope_ref, T, R: TaskHandleRef> {
     Direct {
         task: R,
         gate: &'scope_ref dyn TaskJoinGate<T>,
     },
-    Routed {
-        state: Arc<RoutedSpawnState<'scope_ref, T>>,
-        resolved: Option<ResolvedRoutedTask<'scope_ref, T, R>>,
+    Immediate {
+        outcome: Option<JoinOutcome<T>>,
     },
 }
 
@@ -143,12 +132,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TEx
             JoinSource::Direct { task, .. } => {
                 task.header().cancel_and_wake();
             }
-            JoinSource::Routed { state, resolved } => {
-                state.request_cancel();
-                if let Some(resolved) = resolved {
-                    resolved.task.header().cancel_and_wake();
-                }
-            }
+            JoinSource::Immediate { .. } => {}
         }
     }
 
@@ -164,13 +148,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TEx
     pub fn is_cancel_requested(&self) -> bool {
         match &self.source {
             JoinSource::Direct { task, .. } => task.header().is_cancelled(),
-            JoinSource::Routed { state, resolved } => {
-                state.is_cancel_requested()
-                    || self.scope.completion().is_cancelled()
-                    || resolved
-                        .as_ref()
-                        .is_some_and(|r| r.task.header().is_cancelled())
-            }
+            JoinSource::Immediate { .. } => false,
         }
     }
 
@@ -178,13 +156,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TEx
     pub fn is_finished(&self) -> bool {
         match &self.source {
             JoinSource::Direct { task, .. } => task.header().is_reclaimable(),
-            JoinSource::Routed { state, resolved } => {
-                if let Some(res) = resolved {
-                    res.task.header().is_reclaimable()
-                } else {
-                    state.has_failed_outcome()
-                }
-            }
+            JoinSource::Immediate { .. } => true,
         }
     }
 
@@ -199,15 +171,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TEx
         let token = self.scope.completion().cancel_token().child();
         let is_cancelled = match &self.source {
             JoinSource::Direct { task, .. } => task.header().is_cancelled(),
-            JoinSource::Routed { state, resolved } => {
-                if state.is_cancel_requested() {
-                    true
-                } else if let Some(resolved) = resolved {
-                    resolved.task.header().is_cancelled()
-                } else {
-                    false
-                }
-            }
+            JoinSource::Immediate { .. } => false,
         };
 
         if is_cancelled {
@@ -241,14 +205,10 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TEx
         }
     }
 
-    pub(crate) fn new_routed(
-        scope: &'scope_ref S,
-        state: Arc<RoutedSpawnState<'scope_ref, T>>,
-    ) -> Self {
+    pub(crate) fn new_immediate_error(scope: &'scope_ref S, error: Report<RuntimeError>) -> Self {
         Self {
-            source: JoinSource::Routed {
-                state,
-                resolved: None,
+            source: JoinSource::Immediate {
+                outcome: Some(JoinOutcome::RuntimeErr(error)),
             },
             scope,
             cancel_token: super::new_cancel_slot::<S::Storage, S::Ownership>(),
@@ -347,81 +307,18 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra> + 'scope_ref, TEx
                 }
                 Poll::Pending
             }
-            JoinSource::Routed { state, resolved } => loop {
-                if let Some(res) = resolved {
-                    let header = res.task.header();
-                    if header.is_reclaimable() {
-                        Self::remove_waker_on(&mut this.waker_node, header);
-                        let Some(access) = res.access.take() else {
-                            return Poll::Ready(JoinOutcome::RuntimeErr(
-                                RuntimeError::InvariantViolation {
-                                    site: "JoinHandle::poll(Routed)",
-                                    detail: "routed task access already taken".into(),
-                                }
-                                .to_report(),
-                            ));
-                        };
-                        let outcome = access.take_result();
-                        access.reclaim();
-                        return Poll::Ready(match outcome {
-                            RoutedTakeResult::Ok(value) => JoinOutcome::Ok(value),
-                            RoutedTakeResult::TaskErr(err) => JoinOutcome::TaskErr(err),
-                            RoutedTakeResult::RuntimeErr(err) => JoinOutcome::RuntimeErr(err),
-                        });
-                    }
-
-                    if let Err(err) =
-                        Self::register_waker_on::<R::Storage>(&mut this.waker_node, header, cx)
-                    {
-                        return Poll::Ready(JoinOutcome::RuntimeErr(err));
-                    }
-                    return Poll::Pending;
-                } else {
-                    match state.try_take_ready() {
-                        RoutedTakeReadyOutcome::Ready(ready) => {
-                            let converted_task = unsafe {
-                                R::from_header(ready.task.header()
-                                    as *const GenericTaskHeader<AtomicStorage>
-                                    as *const GenericTaskHeader<R::Storage>)
-                            };
-                            *resolved = Some(ResolvedRoutedTask {
-                                task: converted_task,
-                                access: Some(ready.access),
-                            });
+            JoinSource::Immediate { outcome } => {
+                let Some(outcome) = outcome.take() else {
+                    return Poll::Ready(JoinOutcome::RuntimeErr(
+                        RuntimeError::InvariantViolation {
+                            site: "JoinHandle::poll(Immediate)",
+                            detail: "immediate outcome already consumed".into(),
                         }
-                        RoutedTakeReadyOutcome::Pending => {
-                            state.register(cx.waker());
-                            match state.try_take_ready() {
-                                RoutedTakeReadyOutcome::Ready(ready) => {
-                                    let converted_task = unsafe {
-                                        R::from_header(ready.task.header()
-                                            as *const GenericTaskHeader<AtomicStorage>
-                                            as *const GenericTaskHeader<R::Storage>)
-                                    };
-                                    *resolved = Some(ResolvedRoutedTask {
-                                        task: converted_task,
-                                        access: Some(ready.access),
-                                    });
-                                    continue;
-                                }
-                                RoutedTakeReadyOutcome::Pending => return Poll::Pending,
-                                RoutedTakeReadyOutcome::TaskErr(err) => {
-                                    return Poll::Ready(JoinOutcome::TaskErr(err));
-                                }
-                                RoutedTakeReadyOutcome::RuntimeErr(err) => {
-                                    return Poll::Ready(JoinOutcome::RuntimeErr(err));
-                                }
-                            }
-                        }
-                        RoutedTakeReadyOutcome::TaskErr(err) => {
-                            return Poll::Ready(JoinOutcome::TaskErr(err));
-                        }
-                        RoutedTakeReadyOutcome::RuntimeErr(err) => {
-                            return Poll::Ready(JoinOutcome::RuntimeErr(err));
-                        }
-                    }
-                }
-            },
+                        .to_report(),
+                    ));
+                };
+                Poll::Ready(outcome)
+            }
         }
     }
 }
@@ -434,7 +331,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider<TExtra>, TExtra> Drop
             let node_ptr = NonNull::from(&mut *node);
             let task = match &self.source {
                 JoinSource::Direct { task, .. } => Some(*task),
-                JoinSource::Routed { resolved, .. } => resolved.as_ref().map(|r| r.task),
+                JoinSource::Immediate { .. } => None,
             };
 
             if let Some(task) = task {

@@ -416,7 +416,9 @@ impl<'rt, T> RuntimeCtx<'rt, T> {
 
         match self.shared().enqueue_pinned(worker_id, task_ctx) {
             EnqueuePinnedOutcome::Enqueued | EnqueuePinnedOutcome::AlreadyQueued => {}
-            EnqueuePinnedOutcome::AbortedAcknowledged | EnqueuePinnedOutcome::AlreadySettled => {
+            EnqueuePinnedOutcome::AbortedAcknowledged
+            | EnqueuePinnedOutcome::AlreadySettled
+            | EnqueuePinnedOutcome::Rejected(_) => {
                 unsafe {
                     let _ = Box::from_raw(ptr);
                 }

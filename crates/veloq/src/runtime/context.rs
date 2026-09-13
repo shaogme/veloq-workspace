@@ -484,7 +484,9 @@ pub(crate) fn submit_control_task<'rt>(
                 // Unparker 已将 backend 错误写入 runtime fatal 通道。
             }
         }
-        EnqueuePinnedOutcome::AbortedAcknowledged | EnqueuePinnedOutcome::AlreadySettled => unsafe {
+        EnqueuePinnedOutcome::AbortedAcknowledged
+        | EnqueuePinnedOutcome::AlreadySettled
+        | EnqueuePinnedOutcome::Rejected(_) => unsafe {
             let _ = Box::from_raw(ptr);
         },
     }

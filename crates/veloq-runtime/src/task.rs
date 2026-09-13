@@ -9,7 +9,7 @@ pub use arena::{Arena, ArenaAllocation, GenericArena, ManagedAllocation};
 pub(crate) use header::GenericWakerNode;
 pub use header::{GenericTaskHeader, PollStatus, TaskVTable};
 pub(crate) use header::{INTRUSIVE_WAKER_VTABLE, LOCAL_INTRUSIVE_WAKER_VTABLE};
-pub(crate) use nodes::{GenericTaskNode, TaskBounds, TaskStorage};
+pub(crate) use nodes::{DeferredFuture, GenericTaskNode, TaskBounds, TaskStorage};
 pub use nodes::{LocalBoxedTaskNode, LocalTaskNode, SendBoxedTaskNode, SendTaskNode};
 pub use scope::{
     AnyScopeRef, AnySendScopeRef, ErasedCancellationToken, OpaqueScope, OpaqueToken, RawScope,

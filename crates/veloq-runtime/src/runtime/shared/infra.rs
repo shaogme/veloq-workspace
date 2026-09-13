@@ -34,6 +34,7 @@ pub(crate) struct WorkerQueue {
     pub(crate) remote_count: AtomicUsize,
     pub(crate) pinned_count: AtomicUsize,
     pub(crate) local_count: AtomicUsize,
+    pinned_capacity: usize,
     /// LIFO slot for high-priority task (cache locality)
     pub(crate) lifo: AtomicOptionPtr<TaskHeader>,
     /// Stealer for work-stealing
@@ -56,6 +57,7 @@ impl WorkerQueue {
             remote_count: AtomicUsize::new(0),
             pinned_count: AtomicUsize::new(0),
             local_count: AtomicUsize::new(0),
+            pinned_capacity: local_capacity,
             lifo: AtomicOptionPtr::new(None),
             stealer,
         }
@@ -64,6 +66,11 @@ impl WorkerQueue {
     #[inline]
     pub(crate) fn local_capacity(&self) -> usize {
         self.local_capacity
+    }
+
+    #[inline]
+    pub(crate) fn pinned_capacity(&self) -> usize {
+        self.pinned_capacity
     }
 }
 

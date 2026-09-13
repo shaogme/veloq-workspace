@@ -2,9 +2,9 @@ use crate::{
     error::{Result, RuntimeError},
     runtime::{RuntimeCtx, RuntimeShared, cancellation::GenericCancellationToken},
     task::{
-        AnyScopeRef, Arena, ArenaAllocation, ErasedCancellationToken, GenericArena,
+        AnyScopeRef, Arena, ArenaAllocation, DeferredFuture, ErasedCancellationToken, GenericArena,
         GenericTaskNode, LocalTask, LocalTaskRef, RawTask, ScopeRef, ScopeStorage, SendTask,
-        SendTaskRef, Task, TaskBounds, TaskError, TaskHandleRef, TaskStorage,
+        SendTaskRef, Task, TaskBounds, TaskHandleRef, TaskStorage,
     },
     utils::ownership::{ArcOwnership, Ownership, RcOwnership},
 };
@@ -14,7 +14,7 @@ use veloq_std::{
     future::Future,
     marker::PhantomData,
     ops::AsyncFnOnce,
-    ptr::{NonNull, drop_in_place, write},
+    ptr::{drop_in_place, write},
 };
 use veloq_std::{
     panic::resume_unwind,
@@ -25,41 +25,12 @@ use veloq_storage::{AtomicStorage, LocalStorage, StateLock, Storage};
 mod completion;
 mod guard;
 mod join;
-mod router;
 
 pub use completion::{GenericScopeCompletion, LocalScopeCompletion, ScopeCompletion};
 pub(crate) use completion::{ScopeBlockingWaiter, ScopeCompletionRegistration, ScopeJoinFuture};
 pub use join::{JoinHandle, JoinOutcome, LocalAsyncJoinHandle, LocalJoinHandle, SendJoinHandle};
 
 use guard::ScopeTaskGuard;
-use router::{
-    RoutedJobCell, RoutedJobCellOwner, RoutedSpawnReady, RoutedSpawnState, dispatch_routed,
-    handle_enqueue_pinned_outcome, install_routed_pinned_task, make_spawn_to_access,
-    new_failed_routed_state,
-};
-
-pub(crate) struct SendPtr<T>(NonNull<T>);
-
-unsafe impl<T> Send for SendPtr<T> {}
-unsafe impl<T> Sync for SendPtr<T> {}
-
-impl<T> Copy for SendPtr<T> {}
-
-impl<T> Clone for SendPtr<T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<T> SendPtr<T> {
-    pub(crate) fn new(ptr: NonNull<T>) -> Self {
-        Self(ptr)
-    }
-
-    pub(crate) fn as_ptr(&self) -> *mut T {
-        self.0.as_ptr()
-    }
-}
 
 pub trait ScopeProvider<T> {
     type Storage: ScopeStorage;
@@ -276,7 +247,7 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra>
                 return JoinHandle::new_direct(self, task_ref, task, None);
             }
             task_ref.header().abandon_before_enqueue();
-            return JoinHandle::new_routed(self, new_failed_routed_state(err));
+            return JoinHandle::new_immediate_error(self, err);
         }
 
         JoinHandle::new_direct(self, task_ref, task, None)
@@ -309,14 +280,12 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra>
         };
         let Some(allocation) = allocation else {
             guard.settle();
-            return JoinHandle::new_routed(
+            return JoinHandle::new_immediate_error(
                 self,
-                new_failed_routed_state(
-                    RuntimeError::ArenaAllocationNull {
-                        op: "AsyncScope::spawn_boxed_impl::alloc_task_node",
-                    }
-                    .to_report(),
-                ),
+                RuntimeError::ArenaAllocationNull {
+                    op: "AsyncScope::spawn_boxed_impl::alloc_task_node",
+                }
+                .to_report(),
             );
         };
         let node_ptr = allocation.data_ptr().as_ptr() as *mut GenericTaskNode<H::Storage, T, F>;
@@ -334,7 +303,7 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra>
             if task_ref.header().is_reclaimable() {
                 unsafe { allocation.reclaim() };
             }
-            return JoinHandle::new_routed(self, new_failed_routed_state(err));
+            return JoinHandle::new_immediate_error(self, err);
         }
 
         JoinHandle::new_direct(self, task_ref, node_ref, Some(allocation))
@@ -402,56 +371,23 @@ impl<'rt, 'scope, 'env, TExtra>
     where
         S_: SendTask<T> + Sized + Sync + 'env,
     {
-        let state = RoutedSpawnState::new();
         if let Err(err) = self.context.shared().validate_worker_id(worker_id) {
-            state.fail_runtime(err);
-            return JoinHandle::new_routed(self, state);
+            return JoinHandle::new_immediate_error(self, err);
         }
 
-        let guard: ScopeTaskGuard<AtomicStorage, ArcOwnership> =
+        let mut guard: ScopeTaskGuard<AtomicStorage, ArcOwnership> =
             ScopeTaskGuard::new(&self.completion);
-
-        let runtime = self.context.shared();
-        let runtime_base_ptr = SendPtr::new(NonNull::from(&runtime.base));
-        let state_for_job = state.clone();
         let scope_ref = self.scope_completion_ref();
+        unsafe {
+            task.header()
+                .initialize(&self.context.shared().base, worker_id, scope_ref);
+        }
+        task.header().set_pinned();
 
-        dispatch_routed::<AtomicStorage, ArcOwnership, T, _, TExtra>(
-            &self.context,
-            guard,
-            state.clone(),
-            worker_id,
-            move |guard| {
-                if state_for_job.is_cancel_requested() {
-                    state_for_job.fail_task(TaskError::Cancelled);
-                    guard.settle();
-                    return;
-                }
-
-                unsafe {
-                    task.header()
-                        .initialize(&*runtime_base_ptr.as_ptr(), worker_id, scope_ref);
-                }
-                task.header().set_pinned();
-
-                let task_ref = unsafe { SendTaskRef::from_concrete(task) };
-                guard.handoff_to(task.header());
-
-                let outcome =
-                    unsafe { &*runtime_base_ptr.as_ptr() }.enqueue_pinned(worker_id, task_ref);
-                if !handle_enqueue_pinned_outcome(outcome) {
-                    state_for_job.fail_task(TaskError::Panic);
-                    return;
-                }
-
-                state_for_job.set_ready(RoutedSpawnReady {
-                    task: task_ref,
-                    access: make_spawn_to_access::<T, S_>(task),
-                });
-            },
-        );
-
-        JoinHandle::new_routed(self, state)
+        let task_ref = unsafe { SendTaskRef::from_concrete(task) };
+        guard.handoff_to(task.header());
+        let _ = self.context.shared().enqueue_pinned(worker_id, task_ref);
+        JoinHandle::new_direct(self, task_ref, task, None)
     }
 
     pub fn spawn<'scope_ref, T: Send, S_>(
@@ -485,91 +421,57 @@ impl<'rt, 'scope, 'env, TExtra>
         }
     }
 
-    pub fn spawn_boxed_to<'scope_ref, T: Send, F>(
+    pub fn spawn_boxed_to<'scope_ref, T: Send, F, Fut>(
         &'scope_ref self,
         worker_id: usize,
         job: F,
     ) -> JoinHandle<'scope_ref, T, SendTaskRef, Self, TExtra>
     where
-        F: AsyncFnOnce() -> T + Send + 'env,
+        F: AsyncFnOnce() -> T + FnOnce() -> Fut + Send + 'env,
+        Fut: Future<Output = T> + Send + 'env,
     {
-        let state = RoutedSpawnState::new();
         if let Err(err) = self.context.shared().validate_worker_id(worker_id) {
-            state.fail_runtime(err);
-            return JoinHandle::new_routed(self, state);
+            return JoinHandle::new_immediate_error(self, err);
         }
 
-        let guard: ScopeTaskGuard<AtomicStorage, ArcOwnership> =
+        let mut guard: ScopeTaskGuard<AtomicStorage, ArcOwnership> =
             ScopeTaskGuard::new(&self.completion);
 
-        let runtime = self.context.shared();
-        let runtime_ptr = SendPtr::new(NonNull::from(runtime));
-        let state_for_job = state.clone();
-        let job_layout = Layout::new::<RoutedJobCell<F>>();
+        let deferred = DeferredFuture::new(job);
+        let layout = Layout::new::<GenericTaskNode<AtomicStorage, T, DeferredFuture<F, Fut>>>();
         let allocation = unsafe {
-            self.arena.alloc_managed(job_layout, |ptr| {
-                drop_in_place(ptr as *mut RoutedJobCell<F>)
+            self.arena.alloc_managed(layout, |ptr| {
+                drop_in_place(ptr as *mut GenericTaskNode<AtomicStorage, T, DeferredFuture<F, Fut>>)
             })
         };
         let Some(allocation) = allocation else {
-            state.fail_runtime(
+            guard.settle();
+            return JoinHandle::new_immediate_error(
+                self,
                 RuntimeError::ArenaAllocationNull {
-                    op: "AsyncScope::spawn_boxed_to::alloc_job",
+                    op: "AsyncScope::spawn_boxed_to::alloc_task_node",
                 }
                 .to_report(),
             );
-            return JoinHandle::new_routed(self, state);
         };
-        let job_ptr = allocation.data_ptr().as_ptr() as *mut RoutedJobCell<F>;
-        unsafe { write(job_ptr, RoutedJobCell::new(job)) };
-        // job cell 的所有权自此完全交给守卫，并随闭包一起移交给目标 worker。
-        let job_owner: RoutedJobCellOwner<'scope_ref, F> = RoutedJobCellOwner::new(allocation);
+        let node = GenericTaskNode::<AtomicStorage, T, DeferredFuture<F, Fut>>::new(deferred);
+        unsafe {
+            node.header.initialize(
+                &self.context.shared().base,
+                worker_id,
+                self.scope_completion_ref(),
+            );
+        }
+        let node_ptr = allocation.data_ptr().as_ptr()
+            as *mut GenericTaskNode<AtomicStorage, T, DeferredFuture<F, Fut>>;
+        unsafe { write(node_ptr, node) };
+        let node_ref = unsafe { &*node_ptr };
+        node_ref.header.set_pinned();
+        guard.handoff_to(node_ref.header());
 
-        let arena = &self.arena;
-        dispatch_routed::<AtomicStorage, ArcOwnership, T, _, TExtra>(
-            &self.context,
-            guard,
-            state.clone(),
-            worker_id,
-            move |guard| {
-                let mut job_owner = job_owner;
-                if state_for_job.is_cancel_requested() {
-                    // The owner borrows the scope arena. Release it before publishing the
-                    // terminal failure; dispatch_routed settles the scope after this closure
-                    // returns, otherwise the arena could be dropped while captures unwind.
-                    drop(job_owner);
-                    state_for_job.fail_task(TaskError::Cancelled);
-                    return;
-                }
-
-                let job = match job_owner.take_job() {
-                    Ok(job) => job,
-                    Err(err) => {
-                        drop(job_owner);
-                        state_for_job.fail_runtime(err);
-                        return;
-                    }
-                };
-                let future = job();
-
-                if state_for_job.is_cancel_requested() {
-                    drop(future);
-                    state_for_job.fail_task(TaskError::Cancelled);
-                    return;
-                }
-
-                install_routed_pinned_task(
-                    unsafe { &*runtime_ptr.as_ptr() },
-                    arena,
-                    guard,
-                    worker_id,
-                    state_for_job,
-                    future,
-                );
-            },
-        );
-
-        JoinHandle::new_routed(self, state)
+        let task_ref = unsafe { SendTaskRef::from_concrete(node_ptr) };
+        let _ = self.context.shared().enqueue_pinned(worker_id, task_ref);
+        JoinHandle::new_direct(self, task_ref, node_ref, Some(allocation))
     }
 
     pub fn spawn_boxed<'scope_ref, T: Send, F>(

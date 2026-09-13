@@ -89,21 +89,43 @@ fn test_join_handle_scope_cancel_waits_for_completion() {
 }
 
 #[test]
-fn routed_handle_can_cancel_before_remote_job_is_published() {
+fn handle_can_cancel_before_target_poll_without_calling_job() {
     RuntimeBuilder::new()
         .with_worker_count(Some(nz!(2)))
+        .with_queue_capacity(nz!(2))
         .scope(async |ctx| {
             scope!(ctx, async |scope| {
-                let mut handle = scope.spawn_boxed_to(1, async || 7usize);
-                for _ in 0..8 {
-                    handle.cancel();
+                let blocker_started = Arc::new(AtomicBool::new(false));
+                let blocker_started_for_job = blocker_started.clone();
+                let mut blocker = scope.spawn_boxed_to(1, async move || {
+                    blocker_started_for_job.store(true, Ordering::Release);
+                    veloq_std::future::pending::<usize>().await
+                });
+                while !blocker_started.load(Ordering::Acquire) {
+                    yield_now().await;
                 }
 
+                let job_called = Arc::new(AtomicBool::new(false));
+                let job_called_for_job = job_called.clone();
+                let mut handle = scope.spawn_boxed_to(1, async move || {
+                    job_called_for_job.store(true, Ordering::Release);
+                    7usize
+                });
+                handle.cancel();
                 assert!(handle.is_cancel_requested());
+                assert!(!handle.is_finished());
+
+                blocker.cancel();
+                assert!(matches!(
+                    blocker.await,
+                    JoinOutcome::TaskErr(TaskError::Cancelled)
+                ));
+
                 assert!(matches!(
                     handle.await,
                     JoinOutcome::TaskErr(TaskError::Cancelled)
                 ));
+                assert!(!job_called.load(Ordering::Acquire));
             })
             .await
             .unwrap();
@@ -112,7 +134,7 @@ fn routed_handle_can_cancel_before_remote_job_is_published() {
 }
 
 #[test]
-fn routed_handle_can_cancel_after_remote_job_is_published() {
+fn handle_can_cancel_after_target_poll_begins() {
     RuntimeBuilder::new()
         .with_worker_count(Some(nz!(2)))
         .scope(async |ctx| {

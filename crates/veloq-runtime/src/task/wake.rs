@@ -86,6 +86,7 @@ unsafe impl Sync for TaskWakeToken<LocalStorage> {}
 
 pub(crate) struct TaskWakeGuard<'a, S: Storage> {
     token: &'a TaskWakeToken<S>,
+    retained_header: Option<NonNull<GenericTaskHeader<S>>>,
 }
 
 /// 只有 owner worker 才能取得的 local header 访问保护。
@@ -156,7 +157,12 @@ impl<S: Storage> TaskWakeToken<S> {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return Some(TaskWakeGuard { token: self }),
+                Ok(_) => {
+                    return Some(TaskWakeGuard {
+                        token: self,
+                        retained_header: None,
+                    });
+                }
                 Err(actual) => {
                     state = actual;
                     spin_loop();
@@ -168,20 +174,14 @@ impl<S: Storage> TaskWakeToken<S> {
     /// send task 的原子 header 直接唤醒路径。
     #[inline]
     pub(crate) fn wake_impl(&self) {
-        let header = {
-            let Some(_guard) = self.try_acquire() else {
-                return;
-            };
-
-            let Some(header) = self.header() else {
-                return;
-            };
-
-            header.wake_by_ref();
-            NonNull::from(header)
+        let Some(mut guard) = self.try_acquire() else {
+            return;
         };
 
-        unsafe { header.as_ref().finish_deferred_finalization() };
+        if let Some(header) = self.header() {
+            guard.retain_header(header);
+            header.wake_by_ref();
+        }
     }
 
     pub(crate) fn deactivate_and_wait(&self) {
@@ -287,8 +287,8 @@ impl TaskWakeToken<LocalStorage> {
             return;
         }
 
-        let header = {
-            let Some(_guard) = self.try_acquire() else {
+        {
+            let Some(mut guard) = self.try_acquire() else {
                 return;
             };
             let old_state = self.state.fetch_and(!WAKE_TOKEN_PENDING, Ordering::AcqRel);
@@ -302,11 +302,10 @@ impl TaskWakeToken<LocalStorage> {
             };
             // `ALIVE` 已由 try_acquire 证明，active guard 保证 header 在这次 owner dispatch
             // 完成前不会被 Drop 清理。
+            let header_ref = unsafe { header.as_ref() };
+            guard.retain_header(header_ref);
             unsafe { header.as_ref().wake_by_ref() };
-            header
-        };
-
-        unsafe { header.as_ref().finish_deferred_finalization() };
+        }
     }
 
     /// 仅供 owner-side `RuntimeContextExt` 反查；foreign thread 一律返回 `None`。
@@ -327,6 +326,7 @@ impl TaskWakeToken<LocalStorage> {
 
 impl<S: Storage> Drop for TaskWakeGuard<'_, S> {
     fn drop(&mut self) {
+        let retained_header = self.retained_header.take();
         let prev = self
             .token
             .state
@@ -335,6 +335,21 @@ impl<S: Storage> Drop for TaskWakeGuard<'_, S> {
             unsafe { sys::wake_all(&self.token.state) }
                 .unwrap_or_else(|error| panic!("runtime futex wake_all failed: {error:?}"));
         }
+
+        if let Some(header) = retained_header {
+            let header = unsafe { header.as_ref() };
+            header.finish_deferred_finalization();
+            header.decrement_ref_count();
+            header.try_advance_terminal_state();
+        }
+    }
+}
+
+impl<S: Storage> TaskWakeGuard<'_, S> {
+    fn retain_header(&mut self, header: &GenericTaskHeader<S>) {
+        debug_assert!(self.retained_header.is_none());
+        header.increment_ref_count();
+        self.retained_header = Some(NonNull::from(header));
     }
 }
 

@@ -6,6 +6,8 @@ use veloq_std::{borrow::Cow, error::Error, fmt, result::Result as StdResult, str
 pub enum EnqueueError {
     /// The task could not be published because its owner worker's local queue was full.
     LocalQueueFull { worker_id: usize, capacity: usize },
+    /// The task could not be published because its target worker's pinned queue was full.
+    PinnedQueueFull { worker_id: usize, capacity: usize },
 }
 
 impl fmt::Display for EnqueueError {
@@ -17,6 +19,13 @@ impl fmt::Display for EnqueueError {
             } => write!(
                 f,
                 "local queue for worker {worker_id} is full (capacity: {capacity})"
+            ),
+            Self::PinnedQueueFull {
+                worker_id,
+                capacity,
+            } => write!(
+                f,
+                "pinned queue for worker {worker_id} is full (capacity: {capacity})"
             ),
         }
     }

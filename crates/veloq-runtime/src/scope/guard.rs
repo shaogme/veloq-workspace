@@ -20,14 +20,6 @@ impl<S: ScopeStorage, O: Ownership> ScopeTaskGuard<S, O> {
         }
     }
 
-    pub(crate) fn completion(&self) -> &O::Shared<GenericScopeCompletion<S, O>> {
-        &self.completion
-    }
-
-    pub(crate) fn is_armed(&self) -> bool {
-        self.armed
-    }
-
     /// 将义务移交给已初始化的 task header；之后由终态状态机结算。
     pub(crate) fn handoff_to<H: Storage>(&mut self, header: &GenericTaskHeader<H>) {
         debug_assert!(self.armed, "scope guard already disarmed");

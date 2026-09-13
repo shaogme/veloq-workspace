@@ -222,3 +222,50 @@ pub type SendTaskNode<'future, T, F> = GenericTaskNode<AtomicStorage, T, Pin<&'f
 
 /// 堆上/拥有所有权的 Send 任务。
 pub type SendBoxedTaskNode<T, F> = GenericTaskNode<AtomicStorage, T, F>;
+
+/// A future that creates its inner future only when the owning worker first polls it.
+///
+/// Keeping this as the payload of the existing `GenericTaskNode` reuses its tested result,
+/// wake, and finalization protocol. The task-level cancellation check runs before this future is
+/// polled, so cancellation before the first poll never invokes the async closure.
+pub(crate) struct DeferredFuture<F, Fut> {
+    job: Option<F>,
+    future: Option<Fut>,
+}
+
+impl<F, Fut> DeferredFuture<F, Fut> {
+    pub(crate) fn new(job: F) -> Self {
+        Self {
+            job: Some(job),
+            future: None,
+        }
+    }
+}
+
+impl<T, F, Fut> Future for DeferredFuture<F, Fut>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = T>,
+{
+    type Output = T;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+        let this = unsafe { self.as_mut().get_unchecked_mut() };
+        if this.future.is_none() {
+            let job = this
+                .job
+                .take()
+                .expect("deferred future job has already been taken");
+            this.future = Some(job());
+        }
+
+        unsafe {
+            Pin::new_unchecked(
+                this.future
+                    .as_mut()
+                    .expect("deferred future was not created"),
+            )
+            .poll(cx)
+        }
+    }
+}

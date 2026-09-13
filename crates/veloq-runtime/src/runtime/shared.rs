@@ -62,6 +62,8 @@ pub enum EnqueuePinnedOutcome {
     AbortedAcknowledged,
     /// 任务已进入终态，调用方不得重复结算。
     AlreadySettled,
+    /// The task was rejected because the target worker's pinned queue was full.
+    Rejected(EnqueueError),
 }
 
 pub struct RuntimeSharedBase {
@@ -545,6 +547,7 @@ impl RuntimeSharedBase {
                 worker_id,
                 capacity: match reason {
                     EnqueueError::LocalQueueFull { capacity, .. } => capacity,
+                    EnqueueError::PinnedQueueFull { capacity, .. } => capacity,
                 },
             }
             .to_report());
@@ -599,8 +602,12 @@ impl RuntimeSharedBase {
                 worker.pinned_count.fetch_add(1, Ordering::Release);
                 if let Err(task) = worker.pinned_queue.push(task) {
                     worker.pinned_count.fetch_sub(1, Ordering::Release);
-                    queue_rejected = Some(task);
-                    EnqueuePinnedOutcome::AbortedAcknowledged
+                    let reason = EnqueueError::PinnedQueueFull {
+                        worker_id,
+                        capacity: worker.pinned_capacity(),
+                    };
+                    queue_rejected = Some((task, reason));
+                    EnqueuePinnedOutcome::Rejected(reason)
                 } else {
                     EnqueuePinnedOutcome::Enqueued
                 }
@@ -615,7 +622,8 @@ impl RuntimeSharedBase {
                 task.header().abandon_before_enqueue();
             }
         }
-        if let Some(task) = queue_rejected {
+        if let Some((task, reason)) = queue_rejected {
+            task.header().record_enqueue_rejection(reason);
             if from_wake {
                 Self::abandon_queued_task_from_wake(&task);
             } else {
@@ -692,39 +700,49 @@ impl RuntimeSharedBase {
 
     pub(crate) fn poll_local_task(&self, worker_id: usize, task: LocalTaskRef) -> Result<()> {
         let header = task.header();
+        header.increment_ref_count();
         let should_drop = header.drop_after_poll();
         let header_ptr = NonNull::from(header);
-        if task.header().clear_queued() {
+        let poll_result = if task.header().clear_queued() {
+            Ok(None)
+        } else {
+            task.poll_task(worker_id).map(Some)
+        };
+        header.decrement_ref_count();
+        header.try_advance_terminal_state();
+        let completed = poll_result?;
+        if completed.is_none() {
             if should_drop && header.is_reclaimable() {
                 unsafe { GenericTaskHeader::drop_task(header_ptr) };
             }
-            Ok(())
-        } else {
-            let completed = task.poll_task(worker_id)?;
-            if completed && should_drop {
-                unsafe { GenericTaskHeader::drop_task(header_ptr) };
-            }
-            Ok(())
+        } else if completed == Some(true) && should_drop {
+            unsafe { GenericTaskHeader::drop_task(header_ptr) };
         }
+        Ok(())
     }
 
     pub(crate) fn poll_send_task(&self, worker_id: usize, task: SendTaskRef) -> Result<()> {
         let header = task.header();
+        header.increment_ref_count();
         let should_drop = header.drop_after_poll();
         let header_ptr = NonNull::from(header);
         let cleared = task.header().clear_queued();
-        if cleared {
+        let poll_result = if cleared {
+            Ok(None)
+        } else {
+            task.poll_task(worker_id).map(Some)
+        };
+        header.decrement_ref_count();
+        header.try_advance_terminal_state();
+        let completed = poll_result?;
+        if completed.is_none() {
             if should_drop && header.is_reclaimable() {
                 unsafe { GenericTaskHeader::drop_task(header_ptr) };
             }
-            Ok(())
-        } else {
-            let completed = task.poll_task(worker_id)?;
-            if completed && should_drop {
-                unsafe { GenericTaskHeader::drop_task(header_ptr) };
-            }
-            Ok(())
+        } else if completed == Some(true) && should_drop {
+            unsafe { GenericTaskHeader::drop_task(header_ptr) };
         }
+        Ok(())
     }
 
     pub(crate) fn shutdown(&self) {

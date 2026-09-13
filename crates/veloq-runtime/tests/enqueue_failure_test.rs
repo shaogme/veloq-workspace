@@ -40,6 +40,14 @@ impl OutcomeTally {
                 assert_eq!(capacity, 1);
                 self.rejected += 1;
             }
+            JoinOutcome::Rejected(EnqueueError::PinnedQueueFull {
+                worker_id,
+                capacity,
+            }) => {
+                assert_eq!(worker_id, 1);
+                assert_eq!(capacity, 1);
+                self.rejected += 1;
+            }
             JoinOutcome::TaskErr(TaskError::Cancelled) => self.cancelled += 1,
             JoinOutcome::TaskErr(TaskError::Panic) => self.panicked += 1,
             JoinOutcome::RuntimeErr(_) => self.runtime_err += 1,
@@ -134,10 +142,10 @@ fn local_queue_exhaustion_returns_rejected_for_borrowed_tasks() {
     );
 }
 
-/// `spawn_boxed_to` 在 pinned 队列打满时会走「路由投递失败」与「任务安装失败」两条降级
-/// 路径：job cell 只允许被释放一次，且每个 handle 都必须能被 join 到结果。
+/// `spawn_boxed_to` 在 pinned 队列打满时必须保留 direct task 的生命周期，且每个 handle
+/// 都必须能被 join 到结构化结果。
 #[test]
-fn routed_spawn_boxed_survives_pinned_queue_exhaustion() {
+fn spawn_boxed_to_survives_pinned_queue_exhaustion() {
     const SPAWNS: usize = 32;
 
     let tally = RuntimeBuilder::new()
@@ -174,7 +182,7 @@ fn routed_spawn_boxed_survives_pinned_queue_exhaustion() {
 /// 越界 worker id 是一条纯粹的「入队前置校验失败」路径：既要报错，也要结算 scope 义务
 /// （否则 `wait_all` 会挂死）。
 #[test]
-fn routed_spawn_to_invalid_worker_reports_error() {
+fn spawn_boxed_to_invalid_worker_reports_error() {
     RuntimeBuilder::new()
         .with_worker_count(Some(nz(1)))
         .scope(async |ctx| {
@@ -199,8 +207,7 @@ fn routed_spawn_to_invalid_worker_reports_error() {
 }
 
 /// 取消一批可能已被拒绝的 handle 不应 panic，也不应破坏 scope 的结算。
-#[test]
-fn cancelling_rejected_handles_is_safe() {
+fn cancelling_rejected_handles_is_safe_once() {
     const SPAWNS: usize = 8;
 
     RuntimeBuilder::new()
@@ -223,4 +230,9 @@ fn cancelling_rejected_handles_is_safe() {
             .expect("send scope")
         })
         .expect("runtime");
+}
+
+#[test]
+fn cancelling_rejected_handles_is_safe() {
+    cancelling_rejected_handles_is_safe_once();
 }

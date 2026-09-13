@@ -43,6 +43,8 @@ pub(crate) const STATE_RECLAIMABLE: usize = 1 << 11;
 pub(crate) const STATE_FINALIZATION_DEFERRED: usize = 1 << 12;
 /// A completion waker panicked; shutdown drain reports this after still finalizing the task.
 pub(crate) const STATE_WAKER_PANICKED: usize = 1 << 13;
+/// Terminal notification is in progress; reclaim must wait until the notifier releases the bit.
+pub(crate) const STATE_TERMINALIZING: usize = 1 << 14;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PollStatus {
     Proceed,
@@ -171,7 +173,13 @@ impl<S: Storage> GenericTaskHeader<S> {
 
     #[inline]
     pub(crate) fn is_reclaimable(&self) -> bool {
-        self.state.load(Ordering::Acquire) & STATE_RECLAIMABLE != 0
+        let state = self.state.load(Ordering::Acquire);
+        state & (STATE_RECLAIMABLE | STATE_TERMINALIZING) == STATE_RECLAIMABLE
+    }
+
+    #[inline]
+    fn is_terminalizing(&self) -> bool {
+        self.state.load(Ordering::Acquire) & STATE_TERMINALIZING != 0
     }
 
     #[inline]
@@ -218,6 +226,9 @@ impl<S: Storage> GenericTaskHeader<S> {
             return;
         }
         self.wake_by_ref();
+        // `wake_by_ref` above is invoked directly rather than through the raw-waker callback,
+        // so it does not have the callback guard that normally completes deferred finalization.
+        self.finish_deferred_finalization();
     }
 
     /// 把任务自己挂到所属 scope 的取消队列上，使 scope 取消能唤醒它。
@@ -289,9 +300,15 @@ impl<S: Storage> GenericTaskHeader<S> {
 
     #[inline]
     pub(crate) fn try_mark_queued(&self) -> bool {
+        // 先取得队列引用，再发布 `STATE_QUEUED`。如果顺序相反，出队线程可能在两次
+        // 原子操作之间清掉队列位并把引用计数减到零，导致任务在入队线程仍会访问时被回收。
+        self.ref_count.fetch_add(1, Ordering::AcqRel);
         loop {
             let state = self.state.load(Ordering::Acquire);
             if state & STATE_QUEUED != 0 || state & STATE_RESULT_READY != 0 {
+                if self.decrement_ref_count() {
+                    self.try_advance_terminal_state();
+                }
                 return false;
             }
             if self
@@ -304,7 +321,6 @@ impl<S: Storage> GenericTaskHeader<S> {
                 )
                 .is_ok()
             {
-                self.ref_count.fetch_add(1, Ordering::Release);
                 return true;
             }
         }
@@ -406,13 +422,13 @@ impl<S: Storage> GenericTaskHeader<S> {
         mut node: Pin<&mut GenericWakerNode<S>>,
         waker: &Waker,
     ) {
-        if self.is_reclaimable() {
+        if self.is_reclaimable() || self.is_terminalizing() {
             waker.wake_by_ref();
             return;
         }
 
         let mut wakers = self.wakers.lock();
-        if self.is_reclaimable() {
+        if self.is_reclaimable() || self.is_terminalizing() {
             drop(wakers);
             waker.wake_by_ref();
             return;
@@ -527,7 +543,7 @@ impl<S: Storage> GenericTaskHeader<S> {
             {
                 return false;
             }
-            let mut next = state | STATE_RECLAIMABLE;
+            let mut next = state | STATE_RECLAIMABLE | STATE_TERMINALIZING;
             if state & STATE_SCOPE_OBLIGATED != 0 {
                 next |= STATE_SCOPE_ACKED;
             }
@@ -536,10 +552,31 @@ impl<S: Storage> GenericTaskHeader<S> {
                 .compare_exchange_weak(state, next, Ordering::AcqRel, Ordering::Acquire)
             {
                 Ok(_) => {
-                    self.notify_completion_wakers();
-                    if state & STATE_SCOPE_OBLIGATED != 0 {
-                        self.scope_completion_ref().task_done();
+                    let scope =
+                        (state & STATE_SCOPE_OBLIGATED != 0).then(|| self.scope_completion_ref());
+                    let mut ready = Vec::new();
+                    {
+                        let mut wakers = self.wakers.lock();
+                        while let Some(node) = wakers.pop_front() {
+                            ready.push(node.as_ref().get_ref().waker.clone());
+                        }
                     }
+                    if let Some(scope) = scope {
+                        scope.task_done();
+                    }
+                    let mut waker_panicked = false;
+                    for waker in ready {
+                        if catch_unwind(AssertUnwindSafe::new(|| waker.wake())).is_err() {
+                            waker_panicked = true;
+                        }
+                    }
+                    if waker_panicked {
+                        self.state.fetch_or(STATE_WAKER_PANICKED, Ordering::Release);
+                    }
+                    // This is the final header access in the terminalizer. Once the bit is
+                    // cleared, joiners may reclaim the arena allocation immediately.
+                    self.state
+                        .fetch_and(!STATE_TERMINALIZING, Ordering::Release);
                     return true;
                 }
                 Err(s) => state = s,
@@ -736,7 +773,8 @@ impl<S: Storage> GenericTaskHeader<S> {
                 match runtime.enqueue_pinned_from_wake(self.worker_id(), task) {
                     EnqueuePinnedOutcome::Enqueued | EnqueuePinnedOutcome::AlreadyQueued => {}
                     EnqueuePinnedOutcome::AbortedAcknowledged
-                    | EnqueuePinnedOutcome::AlreadySettled => {} // 终态任务的 wake 只会触发一次状态机检查，不能由调用者结算 scope。
+                    | EnqueuePinnedOutcome::AlreadySettled
+                    | EnqueuePinnedOutcome::Rejected(_) => {} // 终态任务的 wake 只会触发一次状态机检查，不能由调用者结算 scope。
                 }
                 return Ok(());
             }
@@ -760,6 +798,11 @@ impl<S: Storage> GenericTaskHeader<S> {
                 cursor.remove();
             }
         }
+    }
+
+    #[inline]
+    pub(crate) fn increment_ref_count(&self) {
+        self.ref_count.fetch_add(1, Ordering::Release);
     }
 }
 
