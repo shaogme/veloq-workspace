@@ -7,28 +7,34 @@
 //! views below and the borrow checker verifies the split.
 
 use crate::{
-    config::BufferRegistrationMode,
+    config::{BufferRegistrationMode, IoFd},
+    driver::lifecycle::{CancellationPhase, SubmissionPhase},
     driver::{
-        FileTable, MAX_CHUNKS, ProvidedBufGroup, UringDriver, UringRegistrationStats,
+        FileTable, MAX_CHUNKS, PendingCancel, ProvidedBufGroup, UringDriver,
+        UringRegistrationStats,
+        control::{
+            ControlPlaneEvent, ControlPlaneObserver, StagedEntry, UringControlEffectKind,
+            UringControlPlane, UringPostCompletionEffects, transition_submission_phase,
+        },
         registration::{BufferRegistrationQuarantine, REGISTER_FAILURE_RETRY_COOLDOWN},
     },
     error::{UringError, UringResult},
     op::{CompletionCleanupHintFn, UringOpRegistry},
 };
 use diagweave::prelude::*;
-use io_uring::{IoUring, cqueue, squeue};
+use io_uring::{SubmissionQueue, Submitter, cqueue, squeue};
 use tracing::{debug, trace};
 use veloq_buf::{BufferRegistrar, FixedBuf, heap::ChunkId};
-use veloq_driver_core::driver::{BufferRegistrationStatus, CompletionToken, OpToken};
+use veloq_driver_core::driver::{
+    BufferRegistrationStatus, CancelCompletionId, CompletionToken, OpToken, RawCompletion,
+};
+use veloq_driver_core::slot::Generation;
 use veloq_std::{
-    collections::{BitSet, HashMap},
+    collections::{BitSet, HashMap, VecDeque},
     format, io, ptr,
     time::Instant,
 };
 use veloq_wheel::Wheel;
-
-#[cfg(feature = "test-hooks")]
-use veloq_std::collections::VecDeque;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChunkRegistrationDecision {
@@ -100,12 +106,16 @@ impl SqeEnv<'_> {
 /// record leaves this function.
 pub(crate) struct CqeEnv<'d> {
     provided: Option<&'d mut ProvidedBufGroup>,
+    selected_buffer_settled: bool,
 }
 
 impl<'d> CqeEnv<'d> {
     #[inline]
     pub(crate) fn new(provided: Option<&'d mut ProvidedBufGroup>) -> Self {
-        Self { provided }
+        Self {
+            provided,
+            selected_buffer_settled: false,
+        }
     }
 
     /// Takes the buffer this CQE selected and refills its slot in the ring.
@@ -119,9 +129,16 @@ impl<'d> CqeEnv<'d> {
         flags: u32,
         res: i32,
     ) -> UringResult<Option<FixedBuf>> {
+        let selected = cqueue::buffer_select(flags).is_some();
         match self.provided.as_deref_mut() {
-            Some(group) => Ok(group.take_selected(flags, res)),
-            None if cqueue::buffer_select(flags).is_some() => UringError::InvalidState
+            Some(group) => {
+                let buffer = group.take_selected(flags, res);
+                if selected && buffer.is_some() {
+                    self.selected_buffer_settled = true;
+                }
+                Ok(buffer)
+            }
+            None if selected => UringError::InvalidState
                 .push_ctx("scope", "uring.driver.cqe_env.take_provided_buf")
                 .with_ctx("cqe_flags", flags)
                 .attach_note("completion selected a provided buffer but no ring is registered"),
@@ -135,8 +152,12 @@ impl<'d> CqeEnv<'d> {
     /// leaks one buffer id per discarded completion — "cancellation is not termination" in its
     /// provided-buffer form.
     pub(crate) fn return_provided_buf(&mut self, flags: u32) {
+        if self.selected_buffer_settled || cqueue::buffer_select(flags).is_none() {
+            return;
+        }
         if let Some(group) = self.provided.as_deref_mut() {
             group.return_selected(flags);
+            self.selected_buffer_settled = true;
         }
     }
 
@@ -148,15 +169,180 @@ impl<'d> CqeEnv<'d> {
     }
 }
 
-/// Every [`UringDriver`] field outside `ops` that the submission path touches.
+/// The completion-side control projection.
 ///
-/// Obtained together with `&mut ops` from [`UringDriver::split_for_submit`], which is what
-/// lets a submission keep a slot borrow alive while it registers chunks, pushes the SQE and
-/// arms software timers.
-pub(crate) struct SubmitEnv<'d, 'r> {
-    pub(crate) ring: &'d mut IoUring,
-    pub(crate) wheel: &'d mut Wheel<OpToken>,
+/// It contains only bookkeeping needed to acknowledge control completions, settle cleanup
+/// hints, identify the current waker generation, and append deferred control effects. Provided
+/// buffers remain in the separate [`CqeEnv`] projection so completion hooks cannot reach
+/// registration state.
+pub(crate) struct CompletionControlView<'d> {
+    pending_cancel_cqes: &'d mut HashMap<CancelCompletionId, PendingCancel>,
     completion_cleanup_hints: &'d mut HashMap<CompletionToken, Option<CompletionCleanupHintFn>>,
+    waker_buf_len: usize,
+    waker_generation: u64,
+    observer: &'d mut ControlPlaneObserver,
+    post: &'d mut UringPostCompletionEffects,
+}
+
+impl<'d> CompletionControlView<'d> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        pending_cancel_cqes: &'d mut HashMap<CancelCompletionId, PendingCancel>,
+        completion_cleanup_hints: &'d mut HashMap<CompletionToken, Option<CompletionCleanupHintFn>>,
+        waker_buf_len: usize,
+        waker_generation: u64,
+        observer: &'d mut ControlPlaneObserver,
+        post: &'d mut UringPostCompletionEffects,
+    ) -> Self {
+        Self {
+            pending_cancel_cqes,
+            completion_cleanup_hints,
+            waker_buf_len,
+            waker_generation,
+            observer,
+            post,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn peek_completion_cleanup_hint(
+        &mut self,
+        token: CompletionToken,
+    ) -> Option<Option<CompletionCleanupHintFn>> {
+        self.completion_cleanup_hints.get(&token).copied()
+    }
+
+    #[inline]
+    pub(crate) fn remove_completion_cleanup_hint(
+        &mut self,
+        token: CompletionToken,
+        flags: u32,
+    ) -> Option<Option<CompletionCleanupHintFn>> {
+        let entry = if cqueue::more(flags) {
+            self.completion_cleanup_hints.get(&token).copied()
+        } else {
+            self.completion_cleanup_hints.remove(&token)
+        };
+        if entry.is_some() {
+            self.observer
+                .record(ControlPlaneEvent::CleanupHintRemove(token));
+        }
+        entry
+    }
+
+    #[inline]
+    pub(crate) fn take_pending_cancel(
+        &mut self,
+        cancel_id: CancelCompletionId,
+    ) -> Option<PendingCancel> {
+        let request = self.pending_cancel_cqes.remove(&cancel_id)?;
+        self.observer
+            .record(ControlPlaneEvent::CancelInFlightRemove {
+                id: cancel_id,
+                target: request.target,
+            });
+        Some(request)
+    }
+
+    #[inline]
+    pub(crate) fn waker_buf_len(&self) -> usize {
+        self.waker_buf_len
+    }
+
+    #[inline]
+    pub(crate) fn waker_generation(&self) -> u64 {
+        self.waker_generation
+    }
+
+    #[inline]
+    pub(crate) fn append_waker_effect(&mut self, generation: u64, rebuild: bool) {
+        if rebuild {
+            self.append_effect(
+                None,
+                None,
+                UringControlEffectKind::WakerRebuild { generation },
+            );
+        }
+        self.append_effect(
+            None,
+            None,
+            UringControlEffectKind::WakerRearm { generation },
+        );
+        self.append_effect(None, None, UringControlEffectKind::BacklogKick);
+    }
+
+    #[inline]
+    pub(crate) fn append_cancel_enoent(
+        &mut self,
+        cancel_id: CancelCompletionId,
+        request: PendingCancel,
+        raw: RawCompletion,
+    ) {
+        self.append_effect(
+            Some(request.target),
+            Some(request.target.generation()),
+            UringControlEffectKind::CancelReconcile {
+                cancel_id,
+                request,
+                raw,
+            },
+        );
+    }
+
+    #[inline]
+    pub(crate) fn append_cancel_phase_update(
+        &mut self,
+        cancel_id: CancelCompletionId,
+        target: OpToken,
+        phase: CancellationPhase,
+    ) {
+        self.append_effect(
+            Some(target),
+            Some(target.generation()),
+            UringControlEffectKind::CancelAck { cancel_id, phase },
+        );
+    }
+
+    #[inline]
+    pub(crate) fn append_close_unregister(&mut self, token: OpToken, fd: IoFd) {
+        self.append_effect(
+            Some(token),
+            Some(token.generation()),
+            UringControlEffectKind::CloseUnregister { fd },
+        );
+    }
+
+    #[inline]
+    fn append_effect(
+        &mut self,
+        token: Option<OpToken>,
+        generation: Option<Generation>,
+        kind: UringControlEffectKind,
+    ) {
+        self.post.append(token, generation, kind);
+    }
+}
+
+/// The control-plane fields a submission may mutate while an op slot is borrowed.
+pub(crate) struct SubmitControlView<'d> {
+    submission_queue: SubmissionQueue<'d>,
+    staged_entries: &'d mut VecDeque<StagedEntry>,
+    wheel: &'d mut Wheel<OpToken>,
+    control_observer: &'d mut ControlPlaneObserver,
+    completion_cleanup_hints: &'d mut HashMap<CompletionToken, Option<CompletionCleanupHintFn>>,
+    #[cfg(feature = "test-hooks")]
+    push_entry_failure: &'d mut bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StageResult {
+    Staged,
+    Full,
+}
+
+/// The resource-registration fields a submission may consult or update.
+pub(crate) struct SubmitResourceView<'d, 'r> {
+    submitter: Submitter<'d>,
     file_table: &'d FileTable,
     registered_chunks: &'d mut BitSet,
     registrar: &'r (dyn BufferRegistrar + 'r),
@@ -170,12 +356,16 @@ pub(crate) struct SubmitEnv<'d, 'r> {
     register_buffers_update_outcomes: &'d mut VecDeque<Option<i32>>,
     #[cfg(feature = "test-hooks")]
     bitset_set_failure: &'d mut bool,
-    #[cfg(feature = "test-hooks")]
-    push_entry_failure: &'d mut bool,
     provided: Option<ProvidedBufSqeInfo>,
 }
 
-impl SubmitEnv<'_, '_> {
+/// The two narrow submission projections kept together for the transaction API.
+pub(crate) struct SubmitEnv<'d, 'r> {
+    control: SubmitControlView<'d>,
+    resources: SubmitResourceView<'d, 'r>,
+}
+
+impl SubmitControlView<'_> {
     /// Records the cleanup capability only after the SQE has entered the user-space queue.
     ///
     /// The value is optional by design: a present `None` records that this token is a known
@@ -191,8 +381,168 @@ impl SubmitEnv<'_, '_> {
             previous.is_none(),
             "completion cleanup hint was registered twice for one token"
         );
+        self.control_observer
+            .record(ControlPlaneEvent::CleanupHintInsert(token));
     }
 
+    #[inline]
+    pub(crate) fn transition_submission_state(
+        &mut self,
+        token: OpToken,
+        phase: &mut SubmissionPhase,
+        next: SubmissionPhase,
+        reason: &'static str,
+    ) {
+        transition_submission_phase(phase, token, next, reason, self.control_observer);
+    }
+
+    #[inline]
+    pub(crate) fn cancel_timer(&mut self, token: OpToken, task_id: veloq_wheel::TaskId) {
+        self.wheel.cancel(task_id);
+        self.control_observer
+            .record(ControlPlaneEvent::TimerCancel { task_id, token });
+    }
+
+    #[inline]
+    pub(crate) fn record_timer_insert(&mut self, token: OpToken, task_id: veloq_wheel::TaskId) {
+        self.control_observer
+            .record(ControlPlaneEvent::TimerInsert { task_id, token });
+    }
+
+    #[inline]
+    pub(crate) fn insert_timer(
+        &mut self,
+        token: OpToken,
+        duration: veloq_std::time::Duration,
+    ) -> veloq_wheel::TaskId {
+        self.wheel.insert(token, duration)
+    }
+
+    /// Stages `entry` in the user-space submission queue.
+    pub(crate) fn push_entry(&mut self, entry: squeue::Entry) -> StageResult {
+        trace!("Pushing SQE user_data={}", entry.get_user_data());
+        #[cfg(feature = "test-hooks")]
+        if *self.push_entry_failure {
+            *self.push_entry_failure = false;
+            debug!("injected SQ push failure");
+            return StageResult::Full;
+        }
+
+        if unsafe { self.submission_queue.push(&entry) }.is_ok() {
+            return StageResult::Staged;
+        }
+
+        StageResult::Full
+    }
+
+    pub(crate) fn stage_user_entry(
+        &mut self,
+        token: OpToken,
+        entry: squeue::Entry,
+    ) -> UringResult<StageResult> {
+        if self
+            .staged_entries
+            .iter()
+            .any(|staged| matches!(staged, StagedEntry::User(active) if *active == token))
+        {
+            return Err(UringError::InvalidState
+                .report(
+                    "uring.submit.stage_user_entry",
+                    "user token already has a staged SQE",
+                )
+                .attach_note("control-plane phase would become ambiguous"));
+        }
+        let result = self.push_entry(entry);
+        if result == StageResult::Staged {
+            self.staged_entries.push_back(StagedEntry::User(token));
+        }
+        Ok(result)
+    }
+}
+
+impl SubmitEnv<'_, '_> {
+    #[inline]
+    pub(crate) fn register_completion_cleanup_hint(
+        &mut self,
+        token: CompletionToken,
+        hint: Option<CompletionCleanupHintFn>,
+    ) {
+        self.control.register_completion_cleanup_hint(token, hint);
+    }
+
+    #[inline]
+    pub(crate) fn transition_submission_state(
+        &mut self,
+        token: OpToken,
+        phase: &mut SubmissionPhase,
+        next: SubmissionPhase,
+        reason: &'static str,
+    ) {
+        self.control
+            .transition_submission_state(token, phase, next, reason);
+    }
+
+    #[inline]
+    pub(crate) fn cancel_timer(&mut self, token: OpToken, task_id: veloq_wheel::TaskId) {
+        self.control.cancel_timer(token, task_id);
+    }
+
+    #[inline]
+    pub(crate) fn record_timer_insert(&mut self, token: OpToken, task_id: veloq_wheel::TaskId) {
+        self.control.record_timer_insert(token, task_id);
+    }
+
+    #[inline]
+    pub(crate) fn insert_timer(
+        &mut self,
+        token: OpToken,
+        duration: veloq_std::time::Duration,
+    ) -> veloq_wheel::TaskId {
+        self.control.insert_timer(token, duration)
+    }
+
+    #[inline]
+    pub(crate) fn sqe_env(&self) -> SqeEnv<'_> {
+        self.resources.sqe_env()
+    }
+
+    #[inline]
+    pub(crate) fn push_entry(&mut self, entry: squeue::Entry) -> StageResult {
+        self.control.push_entry(entry)
+    }
+
+    #[inline]
+    pub(crate) fn stage_user_entry(
+        &mut self,
+        token: OpToken,
+        entry: squeue::Entry,
+    ) -> UringResult<StageResult> {
+        self.control.stage_user_entry(token, entry)
+    }
+
+    #[inline]
+    pub(crate) fn ensure_chunk_registered(
+        &mut self,
+        chunk_id: ChunkId,
+        user_data: usize,
+        scope: &'static str,
+    ) -> UringResult<ChunkRegistrationDecision> {
+        self.resources
+            .ensure_chunk_registered(chunk_id, user_data, scope)
+    }
+
+    #[inline]
+    pub(crate) fn register_buffer_backend(
+        &mut self,
+        id: ChunkId,
+        ptr: *const u8,
+        len: usize,
+    ) -> UringResult<BufferRegistrationStatus> {
+        self.resources.register_buffer_backend(id, ptr, len)
+    }
+}
+
+impl SubmitResourceView<'_, '_> {
     /// Narrows this view down to what a `make_sqe` implementation may see.
     #[inline]
     pub(crate) fn sqe_env(&self) -> SqeEnv<'_> {
@@ -201,37 +551,6 @@ impl SubmitEnv<'_, '_> {
             registered_chunks: self.registered_chunks,
             provided: self.provided,
         }
-    }
-
-    /// Pushes `entry` onto the submission queue, flushing once if the ring is full.
-    pub(crate) fn push_entry(&mut self, entry: squeue::Entry) -> bool {
-        trace!("Pushing SQE user_data={}", entry.get_user_data());
-        #[cfg(feature = "test-hooks")]
-        if *self.push_entry_failure {
-            *self.push_entry_failure = false;
-            debug!("injected SQ push failure");
-            return false;
-        }
-
-        let mut sq = self.ring.submission();
-
-        if unsafe { sq.push(&entry) }.is_ok() {
-            return true;
-        }
-
-        drop(sq);
-        // push 失败意味着用户态 SQ 环被已填充、内核尚未消费的条目占满。要腾出空间只能
-        // 让内核消费它们，即带 `to_submit > 0` 进 `io_uring_enter`——单纯 GETEVENTS 只
-        // 收割 CQ，一条 SQE 都不会被消费，重试必然再次失败并白付一次系统调用。
-        let _ = self.ring.submit();
-
-        let mut sq = self.ring.submission();
-        if unsafe { sq.push(&entry) }.is_ok() {
-            return true;
-        }
-
-        debug!("SQ full even after flush");
-        false
     }
 
     /// Registers `[ptr, ptr + len)` as the kernel's fixed buffer number `id`.
@@ -551,12 +870,8 @@ impl SubmitEnv<'_, '_> {
 
         // SAFETY: `iovecs` points at live chunk memory for the duration of this syscall, and the
         // caller retains ownership of that memory until every in-flight operation completes.
-        unsafe {
-            self.ring
-                .submitter()
-                .register_buffers_update(index, iovecs, None)
-        }
-        .map_err(io::Error::from)
+        unsafe { self.submitter.register_buffers_update(index, iovecs, None) }
+            .map_err(io::Error::from)
     }
 
     #[inline]
@@ -624,37 +939,65 @@ impl SubmitEnv<'_, '_> {
     }
 }
 
+impl UringControlPlane {
+    /// Projects only submission-owned control state.
+    pub(crate) fn with_submit_view<'d>(
+        &'d mut self,
+        submission_queue: SubmissionQueue<'d>,
+    ) -> SubmitControlView<'d> {
+        SubmitControlView {
+            submission_queue,
+            staged_entries: &mut self.staged_entries,
+            wheel: self.timers.wheel_mut(),
+            control_observer: &mut self.observer,
+            completion_cleanup_hints: &mut self.completion_cleanup_hints,
+            #[cfg(feature = "test-hooks")]
+            push_entry_failure: &mut self.push_entry_failure,
+        }
+    }
+
+    /// Projects only completion-owned control state.
+    pub(crate) fn with_completion_view(&mut self) -> CompletionControlView<'_> {
+        let waker_view = self.waker.hooks_view();
+        CompletionControlView::new(
+            self.cancellations.in_flight_mut(),
+            &mut self.completion_cleanup_hints,
+            waker_view.buf_len,
+            waker_view.generation,
+            &mut self.observer,
+            &mut self.post,
+        )
+    }
+}
+
 impl<'a> UringDriver<'a> {
     /// Splits off the op registry from the rest of the driver so a slot borrow and the ring
     /// can be held at the same time. Both halves are plain field projections, so the compiler
     /// — not a raw pointer — is what guarantees they do not alias.
     pub(crate) fn split_for_submit(&mut self) -> (&mut UringOpRegistry, SubmitEnv<'_, 'a>) {
         let view = self.buffer_registry.split_for_submit();
+        let (submitter, submission_queue, completion_queue) = self.ring.split();
+        drop(completion_queue);
+        let control = self.control.with_submit_view(submission_queue);
+        let resources = SubmitResourceView {
+            submitter,
+            file_table: &self.file_table,
+            registered_chunks: view.registered_chunks,
+            registrar: view.registrar,
+            registration_stats: view.registration_stats,
+            registration_mode: view.registration_mode,
+            fixed_buffers_available: view.fixed_buffers_available,
+            fixed_buffers_failure_errno: view.fixed_buffers_failure_errno,
+            chunk_register_failure_at: view.chunk_register_failure_at,
+            registration_quarantine: view.registration_quarantine,
+            #[cfg(feature = "test-hooks")]
+            register_buffers_update_outcomes: view.register_buffers_update_outcomes,
+            #[cfg(feature = "test-hooks")]
+            bitset_set_failure: view.bitset_set_failure,
+            provided: view.provided,
+        };
 
-        (
-            &mut self.ops,
-            SubmitEnv {
-                ring: &mut self.ring,
-                wheel: self.timers.wheel_mut(),
-                completion_cleanup_hints: &mut self.completion_cleanup_hints,
-                file_table: &self.file_table,
-                registered_chunks: view.registered_chunks,
-                registrar: view.registrar,
-                registration_stats: view.registration_stats,
-                registration_mode: view.registration_mode,
-                fixed_buffers_available: view.fixed_buffers_available,
-                fixed_buffers_failure_errno: view.fixed_buffers_failure_errno,
-                chunk_register_failure_at: view.chunk_register_failure_at,
-                registration_quarantine: view.registration_quarantine,
-                #[cfg(feature = "test-hooks")]
-                register_buffers_update_outcomes: view.register_buffers_update_outcomes,
-                #[cfg(feature = "test-hooks")]
-                bitset_set_failure: view.bitset_set_failure,
-                #[cfg(feature = "test-hooks")]
-                push_entry_failure: view.push_entry_failure,
-                provided: view.provided,
-            },
-        )
+        (&mut self.ops, SubmitEnv { control, resources })
     }
 
     /// The submission half of [`Self::split_for_submit`], for callers that hold no slot.

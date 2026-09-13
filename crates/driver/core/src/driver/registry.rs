@@ -255,6 +255,16 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
             })
     }
 
+    /// Returns tokens currently owned by this registry, excluding slots whose completion mailbox
+    /// is ready but whose driver-side lifecycle has already been finalized.
+    pub fn local_active_tokens(&self) -> impl Iterator<Item = OpToken> + '_ {
+        self.local.iter().enumerate().filter_map(|(index, slot)| {
+            slot.active
+                .then(|| OpToken::from_registry_parts(index, slot.generation).ok())
+                .flatten()
+        })
+    }
+
     pub fn capacity(&self) -> usize {
         self.local.len()
     }
@@ -415,11 +425,19 @@ mod tests {
         assert_eq!(tokens.len(), 2);
         assert!(tokens.contains(&first_token));
         assert!(tokens.contains(&second_token));
+        assert_eq!(
+            registry.local_active_tokens().collect::<Vec<_>>(),
+            vec![first_token, second_token]
+        );
 
         let _ = registry.remove(first_token);
         let tokens = registry.active_tokens().collect::<Vec<_>>();
 
         assert_eq!(tokens, vec![second_token]);
+        assert_eq!(
+            registry.local_active_tokens().collect::<Vec<_>>(),
+            vec![second_token]
+        );
     }
 
     #[test]

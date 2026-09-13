@@ -244,10 +244,10 @@ pub(crate) fn locate_registered_slot(
                 .with_ctx("fd", fd.to_string())
                 .attach_note("direct descriptors require the handle to be registered first")
         }),
-        IoFd::OwnedDirect { .. } => IocpError::ResolveFd
+        IoFd::OwnedDirect { .. } => Err(IocpError::ResolveFd
             .to_report()
             .with_ctx("fd", fd.to_string())
-            .attach_note("owned direct descriptors are unsupported by the IOCP backend"),
+            .attach_note("owned direct descriptors are unsupported by the IOCP backend")),
     }
 }
 

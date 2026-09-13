@@ -3,7 +3,13 @@ pub(crate) mod txn;
 use self::txn::{UringSubmitTxn, slot_access_report};
 use crate::{
     config::{RawHandle, UringRawHandle},
-    driver::{SqeFd, UringDriver, env::SubmitEnv, lifecycle::UringSubmissionState},
+    driver::{
+        SqeFd, UringDriver,
+        control::{BacklogStageKind, ControlPlaneEvent, StagedEntry, transition_submission_phase},
+        env::StageResult,
+        env::SubmitEnv,
+        lifecycle::{CancellationPhase, SubmissionPhase},
+    },
     error::{UringError, UringResult},
     op::{Reserved, Slot, SlotView, SubmissionStrategy, UringOp, UringOpRegistryExt, sqe_with_fd},
 };
@@ -57,7 +63,7 @@ pub(crate) fn submit_queued_from_slot(
     mut slot: Slot<'_, InFlightWaiting>,
 ) -> UringResult<bool> {
     let user_data = token.index();
-    if slot.platform().submission_state != UringSubmissionState::Queued {
+    if slot.platform().control.submission != SubmissionPhase::Reserved {
         return Ok(true);
     }
 
@@ -114,13 +120,23 @@ pub(crate) fn submit_queued_from_slot(
         )?;
     }
 
-    if env.push_entry(sqe) {
-        slot.platform_mut().submission_state = UringSubmissionState::KernelSubmitted;
+    if env.stage_user_entry(token, sqe)? == StageResult::Staged {
+        env.transition_submission_state(
+            token,
+            &mut slot.platform_mut().control.submission,
+            SubmissionPhase::SqeStaged,
+            "queued submission staged SQE",
+        );
         env.register_completion_cleanup_hint(completion_token, cleanup_hint);
         trace!(user_data, "Submitted queued backlog entry to SQ");
         Ok(true)
     } else {
-        slot.platform_mut().submission_state = UringSubmissionState::Queued;
+        env.transition_submission_state(
+            token,
+            &mut slot.platform_mut().control.submission,
+            SubmissionPhase::Reserved,
+            "queued submission remains queued after SQ full",
+        );
         debug!(user_data, "SQ still full for queued backlog entry");
         Ok(false)
     }
@@ -140,14 +156,14 @@ impl<'a> UringDriver<'a> {
     }
 
     pub(crate) fn submit_waker(&mut self) -> UringResult<()> {
-        if self.waker.is_armed() {
+        if self.control.waker.is_armed() {
             return Ok(());
         }
 
-        let waker_fd = match self.waker.registered_fd() {
+        let waker_fd = match self.control.waker.registered_fd() {
             Some(fd) => fd,
             None => {
-                let event_fd = self.waker.state().current();
+                let event_fd = self.control.waker.state().current();
                 let fd = event_fd.fd.raw().as_fd();
                 let raw = RawHandle::new(UringRawHandle::for_file(fd));
                 let mut fds =
@@ -156,7 +172,7 @@ impl<'a> UringDriver<'a> {
                     UringError::InvalidState
                         .report("driver.submit_waker", "register_files returned empty")
                 })?;
-                self.waker.set_registered_fd(Some(waker_fd));
+                self.control.waker.set_registered_fd(Some(waker_fd));
                 waker_fd
             }
         };
@@ -165,48 +181,145 @@ impl<'a> UringDriver<'a> {
         let sqe_fd = self
             .file_table
             .resolve(waker_fd, None, "driver.submit_waker.resolve")?;
-        let buf = self.waker.buf_mut_ptr();
-        let len = self.waker.buf_len() as u32;
+        let buf = self.control.waker.buf_mut_ptr();
+        let len = self.control.waker.buf_len() as u32;
         let sqe = sqe_with_fd!(sqe_fd, |f| opcode::Read::new(f, buf, len).build())
             .user_data(CompletionToken::waker(0).raw());
 
-        if self.push_entry(sqe) {
-            self.waker.set_armed(true);
-            self.waker.finish_rearm();
+        if self.push_entry(sqe) == StageResult::Staged {
+            self.control.stage_entry(StagedEntry::Waker);
+            self.control.waker_stage_pending = false;
+            self.control.waker.arm();
+            self.control
+                .record(ControlPlaneEvent::WakerArm { armed: true });
+            self.control.waker.finish_rearm();
+            self.control.record(ControlPlaneEvent::WakerRearmed);
             Ok(())
         } else {
-            Err(UringError::Submission.report("driver.submit_waker", "failed to enqueue waker SQE"))
+            self.control.waker_stage_pending = true;
+            Ok(())
         }
     }
 
     pub(crate) fn submit_to_kernel(&mut self) -> UringResult<()> {
         trace!("submit_to_kernel entered");
-        if self.ring.params().is_setup_sqpoll() {
-            if self.ring.submission().need_wakeup() {
-                self.ring.submit().map_err(|e| {
-                    UringError::Submission.io_report("driver.submit_to_kernel.submit.sqpoll", e)
-                })?;
-            }
-        } else {
-            let n = self.ring.submission().len();
-            if n > 0 {
-                // We use enter with IORING_ENTER_GETEVENTS (1) to ensure tasks are triggered even with DEFER_TASKRUN.
-                unsafe {
-                    self.ring
-                        .submitter()
-                        .enter::<()>(n as u32, 0, 1 /* IORING_ENTER_GETEVENTS */, None)
-                        .map_err(|e| {
-                            UringError::Submission.io_report("driver.submit_to_kernel.enter", e)
-                        })?;
-                }
-            }
+        let submitted = self.submit_staged_batch()?;
+        self.mark_kernel_submissions(submitted)?;
+        if self.control.waker_stage_pending {
+            self.submit_waker()?;
+            let submitted = self.submit_staged_batch()?;
+            self.mark_kernel_submissions(submitted)?;
         }
         self.flush_backlog()?;
         Ok(())
     }
 
+    fn submit_staged_batch(&mut self) -> UringResult<usize> {
+        let to_submit = self.ring.submission().len();
+        if to_submit == 0 {
+            return Ok(0);
+        }
+
+        if self.ring.params().is_setup_sqpoll() {
+            if self.ring.submission().need_wakeup() {
+                return self.ring.submit().map_err(|e| {
+                    UringError::Submission.io_report("driver.submit_to_kernel.submit.sqpoll", e)
+                });
+            }
+            return Ok(to_submit);
+        }
+
+        unsafe {
+            self.ring
+                .submitter()
+                .enter::<()>(
+                    to_submit as u32,
+                    0,
+                    1, /* IORING_ENTER_GETEVENTS */
+                    None,
+                )
+                .map_err(|e| UringError::Submission.io_report("driver.submit_to_kernel.enter", e))
+        }
+    }
+
+    fn mark_kernel_submissions(&mut self, submitted: usize) -> UringResult<()> {
+        let available = self.control.staged_entry_count();
+        if submitted > available {
+            return Err(UringError::InvalidState
+                .report(
+                    "uring.submit.mark_kernel_submissions",
+                    "kernel submit count exceeds staged metadata",
+                )
+                .with_ctx("submitted", submitted)
+                .with_ctx("staged_entries", available));
+        }
+        let entries = self.control.mark_submitted_entries(submitted);
+        let (ops, control) = (&mut self.ops, &mut self.control);
+        for entry in entries {
+            match entry {
+                StagedEntry::User(token) => {
+                    let view = ops.checked_slot_view(token)?;
+                    match view {
+                        CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
+                            transition_submission_phase(
+                                &mut slot.platform_mut().control.submission,
+                                token,
+                                SubmissionPhase::KernelOutstanding,
+                                "submit boundary handed SQE to kernel",
+                                &mut control.observer,
+                            );
+                        }
+                        CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot)) => {
+                            transition_submission_phase(
+                                &mut slot.platform_mut().control.submission,
+                                token,
+                                SubmissionPhase::KernelOutstanding,
+                                "submit boundary handed orphaned SQE to kernel",
+                                &mut control.observer,
+                            );
+                        }
+                        _ => {
+                            return Err(UringError::InvalidState
+                                .report(
+                                    "uring.submit.mark_kernel_submissions",
+                                    "staged user token is no longer in flight",
+                                )
+                                .with_ctx("token", token.index()));
+                        }
+                    }
+                }
+                StagedEntry::Cancel { target, .. } => {
+                    if let Ok(view) = ops.checked_slot_view(target) {
+                        match view {
+                            CheckedSlotView::Valid(SlotView::Reserved(mut slot)) => {
+                                slot.platform_mut().control.cancellation =
+                                    CancellationPhase::CancelOutstanding;
+                            }
+                            CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
+                                slot.platform_mut().control.cancellation =
+                                    CancellationPhase::CancelOutstanding;
+                            }
+                            CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot)) => {
+                                slot.platform_mut().control.cancellation =
+                                    CancellationPhase::CancelOutstanding;
+                            }
+                            CheckedSlotView::Empty(_)
+                            | CheckedSlotView::Missing { .. }
+                            | CheckedSlotView::Stale(_) => {}
+                        }
+                    }
+                }
+                StagedEntry::Waker => {}
+            }
+        }
+        Ok(())
+    }
+
     #[inline]
-    pub(crate) fn push_entry(&mut self, entry: io_uring::squeue::Entry) -> bool {
+    pub(crate) fn push_entry(
+        &mut self,
+        entry: io_uring::squeue::Entry,
+    ) -> crate::driver::env::StageResult {
         self.submit_env().push_entry(entry)
     }
 
@@ -226,6 +339,7 @@ impl<'a> UringDriver<'a> {
                         match slot.op_mut() {
                             Ok(slot_op) => *slot_op = op,
                             Err(err) => {
+                                *op_in = Some(op);
                                 return DriverSubmitResult::failed(
                                     slot_access_report(
                                         "uring.driver.submit_sqe_internal.op_mut",
@@ -252,6 +366,7 @@ impl<'a> UringDriver<'a> {
                     }
                 }
                 Ok(_) => {
+                    *op_in = Some(op);
                     return DriverSubmitResult::failed(
                         UringError::InvalidState.report(
                             "uring.driver.submit_sqe_internal",
@@ -261,6 +376,7 @@ impl<'a> UringDriver<'a> {
                     );
                 }
                 Err(report) => {
+                    *op_in = Some(op);
                     return DriverSubmitResult::failed(report, SubmitStatus::Void);
                 }
             };
@@ -272,8 +388,19 @@ impl<'a> UringDriver<'a> {
             Ok(true) => DriverSubmitResult::submitted(Poll::Ready(())),
             Ok(false) => {
                 debug!(user_data, "SQ full, pushing to backlog");
-                self.push_backlog(token);
-                DriverSubmitResult::submitted(Poll::Pending)
+                match self.push_backlog(token, BacklogStageKind::Sqe) {
+                    Ok(()) => DriverSubmitResult::submitted(Poll::Pending),
+                    Err(report) => {
+                        if let Some(op) = self
+                            .ops
+                            .active_slot_bundle_mut(token)
+                            .and_then(|(_, _, op, _)| op.take())
+                        {
+                            *op_in = Some(op);
+                        }
+                        DriverSubmitResult::failed(report, SubmitStatus::Void)
+                    }
+                }
             }
             Err(e) => {
                 if let Some(op) = self
@@ -308,6 +435,7 @@ impl<'a> UringDriver<'a> {
                         match slot.op_mut() {
                             Ok(slot_op) => *slot_op = op,
                             Err(err) => {
+                                *op_in = Some(op);
                                 return DriverSubmitResult::failed(
                                     slot_access_report(
                                         "uring.driver.submit_timer_internal.op_mut",
@@ -334,6 +462,7 @@ impl<'a> UringDriver<'a> {
                     }
                 }
                 Ok(_) => {
+                    *op_in = Some(op);
                     return DriverSubmitResult::failed(
                         UringError::InvalidState.report(
                             "uring.driver.submit_timer_internal",
@@ -343,6 +472,7 @@ impl<'a> UringDriver<'a> {
                     );
                 }
                 Err(report) => {
+                    *op_in = Some(op);
                     return DriverSubmitResult::failed(report, SubmitStatus::Void);
                 }
             };
@@ -357,8 +487,19 @@ impl<'a> UringDriver<'a> {
                     user_data,
                     "SQ full (unexpected for timer), pushing to backlog"
                 );
-                self.push_backlog(token);
-                DriverSubmitResult::submitted(Poll::Pending)
+                match self.push_backlog(token, BacklogStageKind::Timer) {
+                    Ok(()) => DriverSubmitResult::submitted(Poll::Pending),
+                    Err(report) => {
+                        if let Some(op) = self
+                            .ops
+                            .active_slot_bundle_mut(token)
+                            .and_then(|(_, _, op, _)| op.take())
+                        {
+                            *op_in = Some(op);
+                        }
+                        DriverSubmitResult::failed(report, SubmitStatus::Void)
+                    }
+                }
             }
             Err(e) => {
                 if let Some(op) = self

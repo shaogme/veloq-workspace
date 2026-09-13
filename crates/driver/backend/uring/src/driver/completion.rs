@@ -1,11 +1,15 @@
 use veloq_std::{
-    collections::HashMap,
+    collections::VecDeque,
     format, mem,
     num::NonZeroU8,
-    sync::atomic::{AtomicU8, Ordering},
     time::{Duration, Instant},
-    vec::Vec,
 };
+
+#[cfg(test)]
+use veloq_std::sync::atomic::Ordering;
+
+#[cfg(test)]
+use veloq_std::{collections::HashMap, sync::atomic::AtomicU8};
 
 use diagweave::prelude::*;
 use tracing::{debug, error, trace, warn};
@@ -13,14 +17,22 @@ use tracing::{debug, error, trace, warn};
 use crate::{
     config::IoFd,
     diagnostics::UringCompletionDiagnostics,
-    driver::control::waker::{WAKER_PROCESSING, WAKER_REARM},
-    driver::{CqeEnv, PendingCancel, ProvidedBufGroup, UringDriver},
+    driver::control::{
+        ControlPlaneEvent, UringControlEffect, UringControlEffectKind, UringPostCompletionEffects,
+    },
+    driver::lifecycle::{CancellationPhase, SubmissionPhase},
+    driver::{
+        CompletionControlView, CqeEnv, PendingCancel, ProvidedBufGroup, UringControlPlane,
+        UringDriver,
+    },
     error::{UringError, UringResult, uring_report_to_event_res},
     op::{CompletionCleanupHintFn, Slot, UringSlotSpec, UringUserPayload},
 };
 
 #[cfg(test)]
-use crate::driver::control::waker::WAKER_NOTIFIED;
+use crate::driver::control::ControlPlaneObserver;
+#[cfg(test)]
+use crate::driver::control::waker::{WAKER_NOTIFIED, WAKER_PROCESSING};
 use veloq_driver_core::{
     driver::{
         AnomalyAttach, CancelCompletionId, CancelMode, CompletionAnomalyKind, CompletionBackend,
@@ -111,26 +123,24 @@ impl UringSyntheticCompletion {
     }
 }
 
-#[derive(Default)]
-struct UringPostCompletionEffects {
-    rebuild_waker: bool,
-    resubmit_waker: bool,
-    flush_backlog: bool,
-    cancel_enoent: Vec<(CancelCompletionId, PendingCancel, RawCompletion)>,
-    close_unregister: Vec<IoFd>,
-}
-
 enum UringBackendEffect {
     None,
     Waker {
         recovery: WakerRecovery,
+        generation: u64,
     },
     CancelEnoent {
         cancel_id: CancelCompletionId,
         request: PendingCancel,
         raw: RawCompletion,
     },
+    CancelPhase {
+        target: OpToken,
+        phase: CancellationPhase,
+        cancel_id: CancelCompletionId,
+    },
     CloseCompleted {
+        token: OpToken,
         fd: IoFd,
     },
 }
@@ -141,6 +151,199 @@ enum WakerRecovery {
     RebuildAndRearm,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionIngressKind {
+    Kernel,
+    User,
+    Timer,
+    Cancel,
+    SubmissionFailure,
+    Backend,
+    Anomaly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionSlotDisposition {
+    NoSlot,
+    Retained,
+    Terminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionMailboxAction {
+    None,
+    User,
+    Cleanup,
+    Anomaly,
+    Control,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionCleanupAction {
+    None,
+    DeferredToCore,
+}
+
+/// Atomic unit produced by completion routing.
+///
+/// The core still owns mailbox publication and slot finalization. This packet only records their
+/// result together with backend effects; the executor is allowed to run after the core has
+/// released the slot borrow. A batch can therefore collect several packets before reconciling
+/// control effects such as cancel ENOENT.
+struct CompletionTransaction {
+    ingress: CompletionIngressKind,
+    observation: Option<(OpToken, bool)>,
+    slot: CompletionSlotDisposition,
+    mailbox: CompletionMailboxAction,
+    cleanup: CompletionCleanupAction,
+    flow_result: UringResult<CompletionFlowOutcome>,
+    effects: UringPostCompletionEffects,
+}
+
+#[derive(Default)]
+struct PostCompletionEffectGroups {
+    bookkeeping: VecDeque<UringControlEffect>,
+    close_unregister: VecDeque<UringControlEffect>,
+    waker_rebuilds: VecDeque<UringControlEffect>,
+    waker_rearms: VecDeque<UringControlEffect>,
+    backlog_kick: bool,
+}
+
+fn group_post_completion_effects(
+    mut post: UringPostCompletionEffects,
+) -> PostCompletionEffectGroups {
+    let mut groups = PostCompletionEffectGroups::default();
+    let mut last_sequence = None;
+    while let Some(effect) = post.pop_front() {
+        debug_assert!(match (last_sequence, effect.sequence) {
+            (Some(previous), current) => previous < current,
+            (None, _) => true,
+        });
+        last_sequence = Some(effect.sequence);
+        if let Some(token) = effect.token {
+            debug_assert_eq!(effect.generation, Some(token.generation()));
+        }
+        match effect.kind {
+            UringControlEffectKind::CancelAck { .. }
+            | UringControlEffectKind::CancelReconcile { .. } => {
+                groups.bookkeeping.push_back(effect);
+            }
+            UringControlEffectKind::CloseUnregister { .. } => {
+                groups.close_unregister.push_back(effect);
+            }
+            UringControlEffectKind::WakerRebuild { .. } => {
+                groups.waker_rebuilds.push_back(effect);
+            }
+            UringControlEffectKind::WakerRearm { .. } => {
+                groups.waker_rearms.push_back(effect);
+            }
+            UringControlEffectKind::BacklogKick => groups.backlog_kick = true,
+        }
+    }
+    groups
+}
+
+#[inline]
+fn remember_first_error(first_error: &mut Option<Report<UringError>>, report: Report<UringError>) {
+    if first_error.is_none() {
+        *first_error = Some(report);
+    }
+}
+
+impl CompletionTransaction {
+    fn new(
+        ingress: CompletionIngressKind,
+        observation: Option<(OpToken, bool)>,
+        flow_result: UringResult<CompletionFlowOutcome>,
+        effects: UringPostCompletionEffects,
+    ) -> Self {
+        let (slot, mailbox, cleanup) = match (observation, &flow_result) {
+            (Some((_, false)), Ok(progress)) => (
+                CompletionSlotDisposition::Retained,
+                if progress.user_completed > 0 {
+                    CompletionMailboxAction::User
+                } else if progress.orphan_cleaned > 0 {
+                    CompletionMailboxAction::Cleanup
+                } else if progress.anomaly > 0 {
+                    CompletionMailboxAction::Anomaly
+                } else {
+                    CompletionMailboxAction::Control
+                },
+                if progress.user_completed > 0 || progress.orphan_cleaned > 0 {
+                    CompletionCleanupAction::DeferredToCore
+                } else {
+                    CompletionCleanupAction::None
+                },
+            ),
+            (Some((_, true)), Ok(progress)) => (
+                CompletionSlotDisposition::Terminal,
+                if progress.user_completed > 0 {
+                    CompletionMailboxAction::User
+                } else if progress.orphan_cleaned > 0 {
+                    CompletionMailboxAction::Cleanup
+                } else if progress.anomaly > 0 {
+                    CompletionMailboxAction::Anomaly
+                } else {
+                    CompletionMailboxAction::Control
+                },
+                if progress.user_completed > 0 || progress.orphan_cleaned > 0 {
+                    CompletionCleanupAction::DeferredToCore
+                } else {
+                    CompletionCleanupAction::None
+                },
+            ),
+            (None, Ok(_)) => (
+                CompletionSlotDisposition::NoSlot,
+                match ingress {
+                    CompletionIngressKind::Kernel
+                    | CompletionIngressKind::User
+                    | CompletionIngressKind::Timer
+                    | CompletionIngressKind::Cancel
+                    | CompletionIngressKind::SubmissionFailure
+                    | CompletionIngressKind::Backend => CompletionMailboxAction::Control,
+                    CompletionIngressKind::Anomaly => CompletionMailboxAction::Anomaly,
+                },
+                CompletionCleanupAction::None,
+            ),
+            (_, Err(_)) => (
+                CompletionSlotDisposition::NoSlot,
+                CompletionMailboxAction::None,
+                CompletionCleanupAction::None,
+            ),
+        };
+
+        Self {
+            ingress,
+            observation,
+            slot,
+            mailbox,
+            cleanup,
+            flow_result,
+            effects,
+        }
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        Option<(OpToken, bool)>,
+        UringResult<CompletionFlowOutcome>,
+        UringPostCompletionEffects,
+    ) {
+        let Self {
+            ingress,
+            observation,
+            slot,
+            mailbox,
+            cleanup,
+            flow_result,
+            effects,
+        } = self;
+        let _metadata = (ingress, slot, mailbox, cleanup);
+        (observation, flow_result, effects)
+    }
+}
+
 impl Default for UringBackendEffect {
     #[inline]
     fn default() -> Self {
@@ -148,46 +351,26 @@ impl Default for UringBackendEffect {
     }
 }
 
-struct UringCompletionSidecar<'a> {
-    pending_cancel_cqes: &'a mut HashMap<CancelCompletionId, PendingCancel>,
-    completion_cleanup_hints: &'a mut HashMap<CompletionToken, Option<CompletionCleanupHintFn>>,
-}
-
 struct UringCompletionHooks<'a> {
     diagnostics: &'a DriverCompletionDiagnostics<UringCompletionDiagnostics>,
-    sidecar: UringCompletionSidecar<'a>,
-    waker_buf_len: usize,
-    waker_armed: &'a mut bool,
-    notification_state: &'a AtomicU8,
+    control: CompletionControlView<'a>,
     provided_buffers: Option<&'a mut ProvidedBufGroup>,
     synthetic: UringSyntheticCompletion,
-    post: UringPostCompletionEffects,
 }
 
 impl<'a> UringCompletionHooks<'a> {
     fn new(
         diagnostics: &'a DriverCompletionDiagnostics<UringCompletionDiagnostics>,
-        sidecar: UringCompletionSidecar<'a>,
-        waker_buf_len: usize,
-        waker_armed: &'a mut bool,
-        notification_state: &'a AtomicU8,
+        control: CompletionControlView<'a>,
         provided_buffers: Option<&'a mut ProvidedBufGroup>,
         synthetic: UringSyntheticCompletion,
     ) -> Self {
         Self {
             diagnostics,
-            sidecar,
-            waker_buf_len,
-            waker_armed,
-            notification_state,
+            control,
             provided_buffers,
             synthetic,
-            post: UringPostCompletionEffects::default(),
         }
-    }
-
-    fn into_post_effects(self) -> UringPostCompletionEffects {
-        self.post
     }
 
     #[inline]
@@ -201,9 +384,9 @@ impl<'a> UringCompletionHooks<'a> {
         flags: u32,
     ) -> CompletionCleanupHintState {
         let entry = if io_uring::cqueue::more(flags) {
-            self.sidecar.completion_cleanup_hints.get(&token).copied()
+            self.control.peek_completion_cleanup_hint(token)
         } else {
-            self.sidecar.completion_cleanup_hints.remove(&token)
+            self.control.remove_completion_cleanup_hint(token, flags)
         };
         match entry {
             Some(hint) => CompletionCleanupHintState::Known(hint),
@@ -220,8 +403,11 @@ impl<'a> UringCompletionHooks<'a> {
         let raw = event.raw();
         self.cqe_env().return_provided_buf(raw.flags);
         let hint = if matches!(source, CompletionSource::Kernel) {
-            match self.completion_cleanup_hint_for(raw.token, raw.flags) {
-                CompletionCleanupHintState::Known(hint) => {
+            match self
+                .control
+                .remove_completion_cleanup_hint(raw.token, raw.flags)
+            {
+                Some(hint) => {
                     if hint.is_some() {
                         self.diagnostics.backend().inc_corrupt_cleanup_attempt();
                         if raw.res >= 0 {
@@ -230,7 +416,7 @@ impl<'a> UringCompletionHooks<'a> {
                     }
                     hint
                 }
-                CompletionCleanupHintState::Missing => {
+                None => {
                     self.diagnostics
                         .backend()
                         .inc_corrupt_cleanup_hint_missing();
@@ -255,19 +441,21 @@ impl<'a> UringCompletionHooks<'a> {
         &mut self,
         raw: RawCompletion,
     ) -> CompletionHookOutcome<UringSlotSpec, UringBackendEffect> {
-        if raw.res == self.waker_buf_len as i32 {
+        let generation = self.control.waker_generation();
+        if raw.res == self.control.waker_buf_len() as i32 {
             self.diagnostics.backend().inc_waker_ok();
             self.diagnostics.backend().inc_wait_waker_return();
             CompletionHookOutcome::ControlHandled {
                 effect: UringBackendEffect::Waker {
                     recovery: WakerRecovery::Rearm,
+                    generation,
                 },
             }
         } else if raw.res >= 0 {
             self.diagnostics.backend().inc_waker_error();
             warn!(
                 res = raw.res,
-                expected = self.waker_buf_len,
+                expected = self.control.waker_buf_len(),
                 "eventfd waker read returned unexpected byte count"
             );
             CompletionHookOutcome::Failed {
@@ -276,12 +464,14 @@ impl<'a> UringCompletionHooks<'a> {
                         "uring.completion.handle_waker_control",
                         format!(
                             "eventfd waker read returned {} bytes, expected {}",
-                            raw.res, self.waker_buf_len
+                            raw.res,
+                            self.control.waker_buf_len()
                         ),
                     )
                     .with_ctx("completion_result", raw.res),
                 effect: UringBackendEffect::Waker {
                     recovery: WakerRecovery::RebuildAndRearm,
+                    generation,
                 },
             }
         } else {
@@ -292,6 +482,7 @@ impl<'a> UringCompletionHooks<'a> {
                     CompletionHookOutcome::ControlHandled {
                         effect: UringBackendEffect::Waker {
                             recovery: WakerRecovery::Rearm,
+                            generation,
                         },
                     }
                 }
@@ -306,6 +497,7 @@ impl<'a> UringCompletionHooks<'a> {
                             .set_error_code(errno),
                         effect: UringBackendEffect::Waker {
                             recovery: WakerRecovery::RebuildAndRearm,
+                            generation,
                         },
                     }
                 }
@@ -318,7 +510,7 @@ impl<'a> UringCompletionHooks<'a> {
         cancel_id: CancelCompletionId,
         raw: RawCompletion,
     ) -> CompletionHookOutcome<UringSlotSpec, UringBackendEffect> {
-        let request = self.sidecar.pending_cancel_cqes.remove(&cancel_id);
+        let request = self.control.take_pending_cancel(cancel_id);
         let Some(request) = request else {
             return CompletionHookOutcome::Failed {
                 error: UringError::InvalidState.report(
@@ -331,7 +523,6 @@ impl<'a> UringCompletionHooks<'a> {
                 effect: UringBackendEffect::None,
             };
         };
-
         match raw.res {
             value if value >= 0 => {
                 self.diagnostics.backend().inc_cancel_ack_ok();
@@ -342,7 +533,11 @@ impl<'a> UringCompletionHooks<'a> {
                     "async cancel completed"
                 );
                 CompletionHookOutcome::ControlHandled {
-                    effect: UringBackendEffect::None,
+                    effect: UringBackendEffect::CancelPhase {
+                        target: request.target,
+                        phase: CancellationPhase::Acked,
+                        cancel_id,
+                    },
                 }
             }
             value if value == -libc::ENOENT => {
@@ -370,7 +565,11 @@ impl<'a> UringCompletionHooks<'a> {
                     "async cancel request failed"
                 );
                 CompletionHookOutcome::ControlHandled {
-                    effect: UringBackendEffect::None,
+                    effect: UringBackendEffect::CancelPhase {
+                        target: request.target,
+                        phase: CancellationPhase::Failed,
+                        cancel_id,
+                    },
                 }
             }
         }
@@ -417,18 +616,49 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
                     self.cqe_env().note_exhausted();
                 }
                 let hint = if matches!(source, CompletionSource::Kernel) {
-                    Some(self.completion_cleanup_hint_for(event.completion_token(), raw.flags))
+                    Some(
+                        match self
+                            .control
+                            .peek_completion_cleanup_hint(event.completion_token())
+                        {
+                            Some(hint) => CompletionCleanupHintState::Known(hint),
+                            None => CompletionCleanupHintState::Missing,
+                        },
+                    )
                 } else {
                     None
                 };
-                match complete_kernel_waiting_slot(slot, event.token(), raw, &mut self.cqe_env()) {
-                    Ok(outcome) => Ok(outcome),
+                let mut cqe_env = self.cqe_env();
+                match complete_kernel_waiting_slot(slot, event.token(), raw, &mut cqe_env) {
+                    Ok(outcome) => {
+                        if matches!(source, CompletionSource::Kernel)
+                            && !io_uring::cqueue::more(raw.flags)
+                        {
+                            let _ = self.control.remove_completion_cleanup_hint(
+                                event.completion_token(),
+                                raw.flags,
+                            );
+                        }
+                        Ok(outcome)
+                    }
                     Err(error) => {
+                        // The hook may fail before it can take a selected provided buffer. The
+                        // completion transaction owns that fallback, while the operation's own
+                        // cleanup guard remains the sole owner of operation-specific cleanup.
+                        cqe_env.return_provided_buf(raw.flags);
                         if error.fallback_cleanup
                             && let Some(CompletionCleanupHintState::Known(Some(hint))) = hint
                         {
                             let mut cleanup = hint(raw.res);
                             let _ = run_completion_cleanup(self.diagnostics, &mut cleanup);
+                        }
+                        if matches!(source, CompletionSource::Kernel)
+                            && !io_uring::cqueue::more(raw.flags)
+                        {
+                            let _ = self.control.remove_completion_cleanup_hint(
+                                event.completion_token(),
+                                raw.flags,
+                            );
                         }
                         Err(error.report)
                     }
@@ -508,19 +738,14 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
     fn finish_backend_effect(&mut self, effect: Self::BackendEffect) -> UringResult<()> {
         match effect {
             UringBackendEffect::None => Ok(()),
-            UringBackendEffect::Waker { recovery } => {
-                *self.waker_armed = false;
-                self.notification_state
-                    .compare_exchange(
-                        WAKER_PROCESSING,
-                        WAKER_REARM,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .ok();
-                self.post.rebuild_waker |= matches!(recovery, WakerRecovery::RebuildAndRearm);
-                self.post.resubmit_waker = true;
-                self.post.flush_backlog = true;
+            UringBackendEffect::Waker {
+                recovery,
+                generation,
+            } => {
+                self.control.append_waker_effect(
+                    generation,
+                    matches!(recovery, WakerRecovery::RebuildAndRearm),
+                );
                 Ok(())
             }
             UringBackendEffect::CancelEnoent {
@@ -528,15 +753,70 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
                 request,
                 raw,
             } => {
-                self.post.cancel_enoent.push((cancel_id, request, raw));
+                self.control.append_cancel_enoent(cancel_id, request, raw);
                 Ok(())
             }
-            UringBackendEffect::CloseCompleted { fd } => {
-                self.post.close_unregister.push(fd);
+            UringBackendEffect::CancelPhase {
+                target,
+                phase,
+                cancel_id,
+            } => {
+                self.control
+                    .append_cancel_phase_update(cancel_id, target, phase);
+                Ok(())
+            }
+            UringBackendEffect::CloseCompleted { token, fd } => {
+                self.control.append_close_unregister(token, fd);
                 Ok(())
             }
         }
     }
+}
+
+fn completion_ingress_kind(ingress: &CompletionIngress<()>) -> CompletionIngressKind {
+    match ingress {
+        CompletionIngress::Kernel(_) => CompletionIngressKind::Kernel,
+        CompletionIngress::User(_) => CompletionIngressKind::User,
+        CompletionIngress::Synthetic { source, .. } => match source {
+            SyntheticCompletionSource::Timer => CompletionIngressKind::Timer,
+            SyntheticCompletionSource::Cancel => CompletionIngressKind::Cancel,
+            SyntheticCompletionSource::SubmissionFailure => {
+                CompletionIngressKind::SubmissionFailure
+            }
+        },
+        CompletionIngress::Backend(_) => CompletionIngressKind::Backend,
+        CompletionIngress::Anomaly { .. } => CompletionIngressKind::Anomaly,
+    }
+}
+
+fn completion_observation(ingress: &CompletionIngress<()>) -> Option<(OpToken, bool)> {
+    let (token, flags) = match ingress {
+        CompletionIngress::Kernel(envelope) => (envelope.raw.token.op_token()?, envelope.raw.flags),
+        CompletionIngress::User(event) | CompletionIngress::Synthetic { event, .. } => {
+            (event.token(), event.flags())
+        }
+        CompletionIngress::Backend(_) | CompletionIngress::Anomaly { .. } => return None,
+    };
+    Some((token, !io_uring::cqueue::more(flags)))
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn observe_completion_result(
+    control: &mut UringControlPlane,
+    observation: Option<(OpToken, bool)>,
+    result: &UringResult<CompletionFlowOutcome>,
+) {
+    let Some((token, final_completion)) = observation else {
+        return;
+    };
+    let Ok(progress) = result else {
+        return;
+    };
+    if progress.user_completed == 0 && progress.orphan_cleaned == 0 {
+        return;
+    }
+
+    control.record_completion_observation(token, final_completion);
 }
 
 impl<'a> UringDriver<'a> {
@@ -569,7 +849,7 @@ impl<'a> UringDriver<'a> {
 
         let budget = wait_budget(
             external_timeout,
-            self.timers.next_timeout(),
+            self.control.timers.next_timeout(),
             Self::WAKE_FAILURE_PROBE_INTERVAL,
         );
         let zero_timeout = budget.duration.is_zero();
@@ -628,23 +908,71 @@ impl<'a> UringDriver<'a> {
         }
         self.flush_cancellations()?;
         self.flush_backlog()?;
+        self.check_control_plane_invariants()?;
         Ok(())
     }
 
     /// Advances the timer wheel by however many whole ticks elapsed since the last poll.
     fn advance_timer_clock(&mut self) -> UringResult<usize> {
         let now = Instant::now();
-        let expired = self.timers.advance_timer_wheel(now).to_vec();
+        let expired = self.control.timers.advance_timer_wheel(now);
         let expired_count = expired.len();
-        for &token in &expired {
+
+        #[cfg(any(test, feature = "test-hooks"))]
+        for &token in expired.iter() {
+            let task_id = self.control.timer_for(token);
+            self.control
+                .record(ControlPlaneEvent::TimerExpire { task_id, token });
+        }
+
+        let mut first_error = None;
+        for &token in expired.iter() {
             let event = UserCompletionEvent::from_parts(COMP_BACKEND_URING, token, 0, 0);
-            self.accept_synthetic_completion(
+            if let Err(report) = self.accept_synthetic_completion(
                 event,
                 SyntheticCompletionSource::Timer,
                 UringSyntheticCompletion::None,
-            )?;
+            ) {
+                if first_error.is_none() {
+                    first_error = Some(report);
+                }
+                self.quarantine_expired_timer(token);
+            }
         }
-        Ok(expired_count)
+        self.control.timers.recycle_expired(expired);
+
+        let invariant_result = self.check_control_plane_invariants();
+        if let Err(invariant_error) = invariant_result {
+            return match first_error {
+                Some(first_error) => Err(invariant_error.with_diag_src_err(first_error)),
+                None => Err(invariant_error),
+            };
+        }
+        first_error.map_or(Ok(expired_count), Err)
+    }
+
+    fn quarantine_expired_timer(&mut self, token: OpToken) {
+        self.control.quarantine_timer(token);
+        let Ok(view) = self.ops.checked_slot_view(token) else {
+            return;
+        };
+        match view {
+            CheckedSlotView::Valid(SlotView::Reserved(mut slot)) => {
+                slot.platform_mut().timer_id = None;
+                slot.platform_mut().control.submission = SubmissionPhase::Terminal;
+            }
+            CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
+                slot.platform_mut().timer_id = None;
+                slot.platform_mut().control.submission = SubmissionPhase::Terminal;
+            }
+            CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot)) => {
+                slot.platform_mut().timer_id = None;
+                slot.platform_mut().control.submission = SubmissionPhase::Terminal;
+            }
+            CheckedSlotView::Empty(_)
+            | CheckedSlotView::Missing { .. }
+            | CheckedSlotView::Stale(_) => {}
+        }
     }
 
     pub(crate) fn poll_nonblocking_internal(&mut self) -> UringResult<()> {
@@ -659,6 +987,7 @@ impl<'a> UringDriver<'a> {
 
         self.flush_cancellations()?;
         self.flush_backlog()?;
+        self.check_control_plane_invariants()?;
         Ok(())
     }
 
@@ -686,7 +1015,7 @@ impl<'a> UringDriver<'a> {
             for cqe in cqe_kicker {
                 let raw_token = cqe.user_data();
                 if raw_token == CompletionToken::waker(0).raw() {
-                    self.waker.begin_processing();
+                    self.control.waker.begin_processing();
                 }
                 cqes.push((raw_token, cqe.result(), cqe.flags()));
             }
@@ -694,8 +1023,9 @@ impl<'a> UringDriver<'a> {
 
         let mut progress = CompletionProgress::default();
         let mut first_error = None;
+        let mut batch_effects = UringPostCompletionEffects::default();
         for &(raw_token, cqe_res, cqe_flags) in &cqes {
-            let outcome = self.accept_completion_ingress(
+            let transaction = self.accept_completion_transaction(
                 CompletionIngress::Kernel(CompletionEnvelope::from_raw_parts(
                     COMP_BACKEND_URING,
                     raw_token,
@@ -704,6 +1034,10 @@ impl<'a> UringDriver<'a> {
                 )),
                 UringSyntheticCompletion::None,
             );
+            let (observation, outcome, effects) = transaction.into_parts();
+            #[cfg(any(test, feature = "test-hooks"))]
+            observe_completion_result(&mut self.control, observation, &outcome);
+            batch_effects.extend(effects);
             match outcome {
                 Ok(outcome) => progress.merge(outcome),
                 Err(report) => {
@@ -714,9 +1048,21 @@ impl<'a> UringDriver<'a> {
             }
         }
 
+        if let Err(report) = self.apply_post_completion_effects(batch_effects)
+            && first_error.is_none()
+        {
+            first_error = Some(report);
+        }
+
         cqes.clear();
         self.cqe_buffer = cqes;
-        first_error.map_or(Ok(progress), Err)
+        match self.check_control_plane_invariants() {
+            Ok(()) => first_error.map_or(Ok(progress), Err),
+            Err(invariant_error) => match first_error {
+                Some(first_error) => Err(invariant_error.with_diag_src_err(first_error)),
+                None => Err(invariant_error),
+            },
+        }
     }
 
     pub(crate) fn accept_synthetic_completion(
@@ -744,27 +1090,10 @@ impl<'a> UringDriver<'a> {
         ingress: CompletionIngress<()>,
         synthetic: UringSyntheticCompletion,
     ) -> UringResult<CompletionFlowOutcome> {
-        let waker_view = self.waker.hooks_view();
-        let sidecar = UringCompletionSidecar {
-            pending_cancel_cqes: self.cancellations.in_flight_mut(),
-            completion_cleanup_hints: &mut self.completion_cleanup_hints,
-        };
-        let mut hooks = UringCompletionHooks::new(
-            &self.completion_diagnostics,
-            sidecar,
-            waker_view.buf_len,
-            waker_view.armed,
-            waker_view.notification_state,
-            self.buffer_registry.provided_buffers_mut(),
-            synthetic,
-        );
-        let flow_result = self.ops.accept_completion(
-            &self.completion_table,
-            &self.completion_diagnostics,
-            &mut hooks,
-            ingress,
-        );
-        let post = hooks.into_post_effects();
+        let transaction = self.accept_completion_transaction(ingress, synthetic);
+        let (observation, flow_result, post) = transaction.into_parts();
+        #[cfg(any(test, feature = "test-hooks"))]
+        observe_completion_result(&mut self.control, observation, &flow_result);
         let post_result = self.apply_post_completion_effects(post);
         match (flow_result, post_result) {
             (Ok(outcome), Ok(())) => Ok(outcome),
@@ -774,59 +1103,157 @@ impl<'a> UringDriver<'a> {
         }
     }
 
+    fn accept_completion_transaction(
+        &mut self,
+        ingress: CompletionIngress<()>,
+        synthetic: UringSyntheticCompletion,
+    ) -> CompletionTransaction {
+        let ingress_kind = completion_ingress_kind(&ingress);
+        let observation = completion_observation(&ingress);
+        let control = self.control.with_completion_view();
+        let mut hooks = UringCompletionHooks::new(
+            &self.completion_diagnostics,
+            control,
+            self.buffer_registry.provided_buffers_mut(),
+            synthetic,
+        );
+        let flow_result = self.ops.accept_completion(
+            &self.completion_table,
+            &self.completion_diagnostics,
+            &mut hooks,
+            ingress,
+        );
+        drop(hooks);
+        if flow_result.is_err()
+            && let Some((token, _)) = observation
+        {
+            self.control.quarantine_token(token);
+        }
+        if let Some((token, true)) = observation
+            && let Ok(progress) = &flow_result
+            && (progress.user_completed > 0 || progress.orphan_cleaned > 0)
+        {
+            self.control.release_quarantined_token(token);
+        }
+        let post = self.control.take_post_effects();
+        CompletionTransaction::new(ingress_kind, observation, flow_result, post)
+    }
+
     fn apply_post_completion_effects(
         &mut self,
         post: UringPostCompletionEffects,
     ) -> UringResult<()> {
+        let groups = group_post_completion_effects(post);
         let mut first_error = None;
-        for (cancel_id, request, raw) in post.cancel_enoent {
-            if let Err(report) = self.record_cancel_enoent_if_target_active(cancel_id, request, raw)
-                && first_error.is_none()
-            {
-                first_error = Some(report);
-            }
-        }
+        self.execute_bookkeeping(groups.bookkeeping, &mut first_error);
 
         // The user completion has already been published when this post-effect runs. A cleanup
         // failure must be reported without stopping the remaining Close effects: every successful
         // kernel Close still has to consume its owned handle exactly once.
-        for fd in post.close_unregister {
-            if let Err(report) = self.unregister_close_owned_fd(fd)
-                && first_error.is_none()
-            {
-                first_error = Some(report);
+        self.execute_close_effects(groups.close_unregister, &mut first_error);
+        let resubmit_waker = self.execute_waker_effects(
+            groups.waker_rebuilds,
+            groups.waker_rearms,
+            &mut first_error,
+        );
+        self.execute_backlog_effect(groups.backlog_kick, resubmit_waker, &mut first_error);
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn execute_bookkeeping(
+        &mut self,
+        mut effects: VecDeque<UringControlEffect>,
+        first_error: &mut Option<Report<UringError>>,
+    ) {
+        while let Some(effect) = effects.pop_front() {
+            match effect.kind {
+                UringControlEffectKind::CancelAck { phase, .. } => {
+                    if let Some(target) = effect.token {
+                        self.set_cancel_phase(target, phase);
+                    }
+                }
+                UringControlEffectKind::CancelReconcile {
+                    cancel_id,
+                    request,
+                    raw,
+                } => {
+                    if let Err(report) =
+                        self.record_cancel_enoent_if_target_active(cancel_id, request, raw)
+                    {
+                        remember_first_error(first_error, report);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn execute_close_effects(
+        &mut self,
+        mut effects: VecDeque<UringControlEffect>,
+        first_error: &mut Option<Report<UringError>>,
+    ) {
+        while let Some(effect) = effects.pop_front() {
+            let UringControlEffectKind::CloseUnregister { fd } = effect.kind else {
+                continue;
+            };
+            if let Err(report) = self.unregister_close_owned_fd(fd) {
+                remember_first_error(first_error, report);
+            }
+        }
+    }
+
+    fn execute_waker_effects(
+        &mut self,
+        mut rebuilds: VecDeque<UringControlEffect>,
+        mut rearms: VecDeque<UringControlEffect>,
+        first_error: &mut Option<Report<UringError>>,
+    ) -> bool {
+        while let Some(effect) = rebuilds.pop_front() {
+            if let UringControlEffectKind::WakerRebuild { generation } = effect.kind {
+                if generation != self.control.waker.armed_generation() {
+                    continue;
+                }
+                self.completion_diagnostics.backend().inc_waker_rebuild();
+                if let Err(report) = self
+                    .rebuild_waker_fd()
+                    .attach_note("failed to rebuild eventfd waker")
+                {
+                    remember_first_error(first_error, report);
+                }
             }
         }
 
-        if post.rebuild_waker {
-            self.completion_diagnostics.backend().inc_waker_rebuild();
-            if let Err(report) = self
-                .rebuild_waker_fd()
-                .attach_note("failed to rebuild eventfd waker")
-                && first_error.is_none()
+        let mut resubmit = false;
+        while let Some(effect) = rearms.pop_front() {
+            if let UringControlEffectKind::WakerRearm { generation } = effect.kind
+                && self.control.waker.prepare_rearm(generation)
             {
-                first_error = Some(report);
+                self.control
+                    .record(ControlPlaneEvent::WakerArm { armed: false });
+                self.control.record(ControlPlaneEvent::WakerRearmRequested);
+                resubmit = true;
             }
         }
-        if post.resubmit_waker
-            && let Err(e) = self.submit_waker()
-        {
-            self.completion_diagnostics.backend().inc_waker_rebuild();
-            error!(report = ?e, "failed to resubmit waker");
-            if first_error.is_none() {
-                first_error = Some(e);
+        resubmit
+    }
+
+    fn execute_backlog_effect(
+        &mut self,
+        backlog_kick: bool,
+        resubmit_waker: bool,
+        first_error: &mut Option<Report<UringError>>,
+    ) {
+        if resubmit_waker {
+            if let Err(report) = self.submit_waker() {
+                error!(report = ?report, "failed to resubmit waker");
+                remember_first_error(first_error, report);
             }
-        }
-        if post.resubmit_waker {
             self.completion_diagnostics.backend().inc_waker_rearm();
         }
-        if post.flush_backlog
-            && let Err(report) = self.flush_backlog()
-            && first_error.is_none()
-        {
-            first_error = Some(report);
+        if backlog_kick && let Err(report) = self.flush_backlog() {
+            remember_first_error(first_error, report);
         }
-        first_error.map_or(Ok(()), Err)
     }
 
     fn record_cancel_enoent_if_target_active(
@@ -854,6 +1281,8 @@ impl<'a> UringDriver<'a> {
         self.completion_diagnostics
             .backend()
             .inc_cancel_ack_enoent_active();
+        self.control.quarantine_token(request.target);
+        self.set_cancel_phase(request.target, CancellationPhase::NotFound);
         Err(UringError::InvalidState
             .report(
                 "record_cancel_enoent_if_target_active",
@@ -870,8 +1299,9 @@ impl<'a> UringDriver<'a> {
             .attach_note(
                 "The io_uring asynchronous cancel operation completed with -ENOENT (indicating \
                  the operation was not found in kernel's pending queue), but the corresponding \
-                 user-space I/O slot remains active (InFlightWaiting or InFlightOrphaned). \
-                 This state mismatch indicates a potential memory leak or race condition.",
+                 user-space I/O slot remains active (InFlightWaiting or InFlightOrphaned). The \
+                 token has been quarantined and will not be reused until a reliable completion or \
+                 driver shutdown cleanup path observes it.",
             ))
     }
 }
@@ -944,6 +1374,7 @@ fn complete_kernel_waiting_slot(
         });
     }
 
+    slot.platform_mut().control.submission = SubmissionPhase::Terminal;
     let mut completed = slot.complete();
     let (submit_payload, detail) = completed.take_completion_data();
     // multishot 的终态完成同样产出一条 item，提交 payload（监听 socket 之类）到此为止。
@@ -969,7 +1400,10 @@ fn complete_kernel_waiting_slot(
 
     let effect = if res_is_ok {
         match &payload {
-            UringUserPayload::Close(close) => UringBackendEffect::CloseCompleted { fd: close.fd },
+            UringUserPayload::Close(close) => UringBackendEffect::CloseCompleted {
+                token,
+                fd: close.fd,
+            },
             _ => UringBackendEffect::None,
         }
     } else {
@@ -994,6 +1428,7 @@ fn complete_timer_waiting_slot(
     event: UserCompletionEvent,
 ) -> UringResult<CompletionHookOutcome<UringSlotSpec, UringBackendEffect>> {
     slot.platform_mut().timer_id = None;
+    slot.platform_mut().control.submission = SubmissionPhase::Terminal;
     let mut completed = slot.complete();
     let _ = completed.take_op();
     let (payload, detail) = completed.take_completion_data();
@@ -1025,11 +1460,12 @@ fn complete_cancel_waiting_slot(
 }
 
 fn complete_submission_failure_slot(
-    slot: Slot<'_, InFlightWaiting>,
+    mut slot: Slot<'_, InFlightWaiting>,
     event: UserCompletionEvent,
     report: Option<Report<UringError>>,
 ) -> UringResult<CompletionHookOutcome<UringSlotSpec, UringBackendEffect>> {
     let event_res = event.res();
+    slot.platform_mut().control.submission = SubmissionPhase::Terminal;
     let mut completed = slot.complete();
     let cleanup = completed
         .with_op_mut(|op| op.completion_cleanup(event_res))
@@ -1056,11 +1492,12 @@ fn complete_submission_failure_slot(
 }
 
 fn complete_local_cancel_slot(
-    slot: Slot<'_, InFlightWaiting>,
+    mut slot: Slot<'_, InFlightWaiting>,
     event: UserCompletionEvent,
     mode: CancelMode,
     orphaned: bool,
 ) -> UringResult<CompletionHookOutcome<UringSlotSpec, UringBackendEffect>> {
+    slot.platform_mut().control.submission = SubmissionPhase::Terminal;
     let mut completed = slot.complete();
     let cleanup = completed
         .with_op_mut(|op| {
@@ -1118,9 +1555,10 @@ fn cleanup_orphaned_streaming_slot(
 }
 
 fn cleanup_orphaned_slot(
-    slot: Slot<'_, InFlightOrphaned>,
+    mut slot: Slot<'_, InFlightOrphaned>,
     cqe_res: i32,
 ) -> (CompletionCleanupGuard, bool) {
+    slot.platform_mut().control.submission = SubmissionPhase::Terminal;
     let mut completed = slot.complete();
     let (cleanup, slot_accessed) = match completed.with_op_mut(|op| op.orphan_cleanup(cqe_res)) {
         Ok(cleanup) => (cleanup, true),
@@ -1155,42 +1593,44 @@ mod tests {
         diagnostics: &'a DriverCompletionDiagnostics<UringCompletionDiagnostics>,
         pending_cancel_cqes: &'a mut HashMap<CancelCompletionId, PendingCancel>,
         completion_cleanup_hints: &'a mut HashMap<CompletionToken, Option<CompletionCleanupHintFn>>,
-        waker_armed: &'a mut bool,
-        notification_state: &'a AtomicU8,
+        _waker_armed: &'a mut bool,
+        _notification_state: &'a AtomicU8,
+        observer: &'a mut ControlPlaneObserver,
+        post: &'a mut UringPostCompletionEffects,
     ) -> UringCompletionHooks<'a> {
-        let sidecar = UringCompletionSidecar {
+        let control = CompletionControlView::new(
             pending_cancel_cqes,
             completion_cleanup_hints,
-        };
-        UringCompletionHooks::new(
-            diagnostics,
-            sidecar,
             8,
-            waker_armed,
-            notification_state,
-            None,
-            UringSyntheticCompletion::None,
-        )
+            0,
+            observer,
+            post,
+        );
+        UringCompletionHooks::new(diagnostics, control, None, UringSyntheticCompletion::None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn test_hooks_with_buffers<'a>(
         diagnostics: &'a DriverCompletionDiagnostics<UringCompletionDiagnostics>,
         pending_cancel_cqes: &'a mut HashMap<CancelCompletionId, PendingCancel>,
         completion_cleanup_hints: &'a mut HashMap<CompletionToken, Option<CompletionCleanupHintFn>>,
-        waker_armed: &'a mut bool,
-        notification_state: &'a AtomicU8,
+        _waker_armed: &'a mut bool,
+        _notification_state: &'a AtomicU8,
         provided_buffers: Option<&'a mut ProvidedBufGroup>,
+        observer: &'a mut ControlPlaneObserver,
+        post: &'a mut UringPostCompletionEffects,
     ) -> UringCompletionHooks<'a> {
-        let sidecar = UringCompletionSidecar {
+        let control = CompletionControlView::new(
             pending_cancel_cqes,
             completion_cleanup_hints,
-        };
+            8,
+            0,
+            observer,
+            post,
+        );
         UringCompletionHooks::new(
             diagnostics,
-            sidecar,
-            8,
-            waker_armed,
-            notification_state,
+            control,
             provided_buffers,
             UringSyntheticCompletion::None,
         )
@@ -1208,12 +1648,19 @@ mod tests {
         let mut pending_cancel_cqes = HashMap::default();
         let mut waker_armed = true;
         let notification_state = AtomicU8::new(WAKER_NOTIFIED);
+        let mut observer = ControlPlaneObserver::default();
+        let mut post = UringPostCompletionEffects::default();
+        for token in sidecar.keys().copied() {
+            observer.record(ControlPlaneEvent::CleanupHintInsert(token));
+        }
         let mut hooks = test_hooks(
             &diagnostics,
             &mut pending_cancel_cqes,
             sidecar,
             &mut waker_armed,
             &notification_state,
+            &mut observer,
+            &mut post,
         );
         let envelope = CompletionEnvelope::from_raw_parts(
             COMP_BACKEND_URING,
@@ -1249,12 +1696,16 @@ mod tests {
         let mut completion_cleanup_hints = HashMap::default();
         let mut waker_armed = true;
         let notification_state = AtomicU8::new(WAKER_PROCESSING);
+        let mut observer = ControlPlaneObserver::default();
+        let mut post = UringPostCompletionEffects::default();
         let mut hooks = test_hooks(
             &diagnostics,
             &mut pending_cancel_cqes,
             &mut completion_cleanup_hints,
             &mut waker_armed,
             &notification_state,
+            &mut observer,
+            &mut post,
         );
         let raw = RawCompletion::new(COMP_BACKEND_URING, CompletionToken::waker(0), 4, 0);
 
@@ -1268,13 +1719,19 @@ mod tests {
             .expect("waker recovery effect should be recorded");
 
         assert_eq!(*error.inner(), UringError::CompletionWait);
-        let rebuild_waker = hooks.post.rebuild_waker;
-        let resubmit_waker = hooks.post.resubmit_waker;
         drop(hooks);
-        assert!(!waker_armed);
-        assert_eq!(notification_state.load(Ordering::Acquire), WAKER_REARM);
-        assert!(rebuild_waker);
-        assert!(resubmit_waker);
+        assert!(waker_armed);
+        assert_eq!(notification_state.load(Ordering::Acquire), WAKER_PROCESSING);
+        assert!(
+            post.effects()
+                .iter()
+                .any(|effect| matches!(effect.kind, UringControlEffectKind::WakerRebuild { .. }))
+        );
+        assert!(
+            post.effects()
+                .iter()
+                .any(|effect| matches!(effect.kind, UringControlEffectKind::WakerRearm { .. }))
+        );
         assert_eq!(diagnostics.snapshot().backend.waker_error, 1);
     }
 
@@ -1285,12 +1742,16 @@ mod tests {
         let mut completion_cleanup_hints = HashMap::default();
         let mut waker_armed = true;
         let notification_state = AtomicU8::new(WAKER_PROCESSING);
+        let mut observer = ControlPlaneObserver::default();
+        let mut post = UringPostCompletionEffects::default();
         let mut hooks = test_hooks(
             &diagnostics,
             &mut pending_cancel_cqes,
             &mut completion_cleanup_hints,
             &mut waker_armed,
             &notification_state,
+            &mut observer,
+            &mut post,
         );
         let raw = RawCompletion::new(COMP_BACKEND_URING, CompletionToken::waker(0), 8, 0);
 
@@ -1303,13 +1764,20 @@ mod tests {
             .finish_backend_effect(effect)
             .expect("waker rearm effect should be recorded");
 
-        let resubmit_waker = hooks.post.resubmit_waker;
-        let rebuild_waker = hooks.post.rebuild_waker;
         drop(hooks);
-        assert!(!waker_armed);
-        assert_eq!(notification_state.load(Ordering::Acquire), WAKER_REARM);
-        assert!(resubmit_waker);
-        assert!(!rebuild_waker);
+        assert!(waker_armed);
+        assert_eq!(notification_state.load(Ordering::Acquire), WAKER_PROCESSING);
+        assert!(
+            post.effects()
+                .iter()
+                .any(|effect| matches!(effect.kind, UringControlEffectKind::WakerRearm { .. }))
+        );
+        assert!(
+            !post
+                .effects()
+                .iter()
+                .any(|effect| matches!(effect.kind, UringControlEffectKind::WakerRebuild { .. }))
+        );
         assert_eq!(diagnostics.snapshot().backend.waker_ok, 1);
         assert_eq!(diagnostics.snapshot().backend.waker_error, 0);
     }
@@ -1322,12 +1790,16 @@ mod tests {
             let mut completion_cleanup_hints = HashMap::default();
             let mut waker_armed = true;
             let notification_state = AtomicU8::new(WAKER_PROCESSING);
+            let mut observer = ControlPlaneObserver::default();
+            let mut post = UringPostCompletionEffects::default();
             let mut hooks = test_hooks(
                 &diagnostics,
                 &mut pending_cancel_cqes,
                 &mut completion_cleanup_hints,
                 &mut waker_armed,
                 &notification_state,
+                &mut observer,
+                &mut post,
             );
             let raw = RawCompletion::new(COMP_BACKEND_URING, CompletionToken::waker(0), res, 0);
 
@@ -1341,8 +1813,8 @@ mod tests {
                 .expect("waker rearm effect should be recorded");
             drop(hooks);
 
-            assert!(!waker_armed);
-            assert_eq!(notification_state.load(Ordering::Acquire), WAKER_REARM);
+            assert!(waker_armed);
+            assert_eq!(notification_state.load(Ordering::Acquire), WAKER_PROCESSING);
         }
 
         let snapshot = diagnostics.snapshot().backend;
@@ -1357,23 +1829,28 @@ mod tests {
         let mut completion_cleanup_hints = HashMap::default();
         let mut waker_armed = true;
         let notification_state = AtomicU8::new(WAKER_PROCESSING);
+        let mut observer = ControlPlaneObserver::default();
+        let mut post = UringPostCompletionEffects::default();
         let mut hooks = test_hooks(
             &diagnostics,
             &mut pending_cancel_cqes,
             &mut completion_cleanup_hints,
             &mut waker_armed,
             &notification_state,
+            &mut observer,
+            &mut post,
         );
 
         notification_state.store(WAKER_NOTIFIED, Ordering::Release);
         hooks
             .finish_backend_effect(UringBackendEffect::Waker {
                 recovery: WakerRecovery::Rearm,
+                generation: 0,
             })
             .expect("waker rearm effect should be recorded");
         drop(hooks);
 
-        assert!(!waker_armed);
+        assert!(waker_armed);
         assert_eq!(notification_state.load(Ordering::Acquire), WAKER_NOTIFIED);
     }
 
@@ -1417,12 +1894,16 @@ mod tests {
         let mut completion_cleanup_hints = HashMap::default();
         let mut waker_armed = true;
         let notification_state = AtomicU8::new(WAKER_NOTIFIED);
+        let mut observer = ControlPlaneObserver::default();
+        let mut post = UringPostCompletionEffects::default();
         let mut hooks = test_hooks(
             &diagnostics,
             &mut pending_cancel_cqes,
             &mut completion_cleanup_hints,
             &mut waker_armed,
             &notification_state,
+            &mut observer,
+            &mut post,
         );
         let cancel_id = CancelCompletionId::new(7);
         let raw = RawCompletion::new(COMP_BACKEND_URING, CompletionToken::cancel(cancel_id), 0, 0);
@@ -1531,6 +2012,8 @@ mod tests {
         let mut pending_cancel_cqes = HashMap::default();
         let mut waker_armed = true;
         let notification_state = AtomicU8::new(WAKER_NOTIFIED);
+        let mut observer = ControlPlaneObserver::default();
+        let mut post = UringPostCompletionEffects::default();
         let mut provided_buffers = test_group(2);
         let before = provided_buffers.stats();
         let table: SharedCompletionTable<UringSlotSpec> = registry.shared.clone();
@@ -1541,6 +2024,8 @@ mod tests {
             &mut waker_armed,
             &notification_state,
             Some(&mut provided_buffers),
+            &mut observer,
+            &mut post,
         );
         let flags = 1 | (1 << 16);
         let envelope = CompletionEnvelope::from_raw_parts(

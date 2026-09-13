@@ -12,6 +12,9 @@ use veloq_std::{
     vec::Vec,
 };
 
+#[cfg(feature = "test-hooks")]
+use veloq_std::string::String;
+
 mod completion;
 pub mod registry;
 
@@ -703,6 +706,8 @@ pub enum SubmitStatus {
 
 #[cfg(feature = "test-hooks")]
 pub mod test_hooks {
+    use veloq_std::{string::String, vec::Vec};
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum RegisterFilesUpdateOutcome {
         Actual,
@@ -760,6 +765,16 @@ pub mod test_hooks {
         }
 
         fn debug_inject_push_entry_failure(&mut self) {}
+
+        /// Returns the backend control-plane snapshot used by protocol tests.
+        fn debug_control_plane_snapshot(&mut self) -> String {
+            String::new()
+        }
+
+        /// Drains the backend control-plane event trace used by protocol tests.
+        fn debug_control_plane_events(&mut self) -> Vec<String> {
+            Vec::new()
+        }
     }
 }
 
@@ -846,5 +861,15 @@ impl<'a, D: Driver + ?Sized + DriverTestHooks, P: ContextDriverProvider<D> + ?Si
     fn debug_inject_push_entry_failure(&mut self) {
         self.provider
             .with_driver_mut(|d| d.debug_inject_push_entry_failure())
+    }
+
+    fn debug_control_plane_snapshot(&mut self) -> String {
+        self.provider
+            .with_driver_mut(|d| d.debug_control_plane_snapshot())
+    }
+
+    fn debug_control_plane_events(&mut self) -> Vec<String> {
+        self.provider
+            .with_driver_mut(|d| d.debug_control_plane_events())
     }
 }

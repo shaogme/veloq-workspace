@@ -1,5 +1,8 @@
 use crate::{
-    driver::{env::SubmitEnv, lifecycle::UringSubmissionState},
+    driver::{
+        env::{StageResult, SubmitEnv},
+        lifecycle::SubmissionPhase,
+    },
     error::{UringError, UringResult},
     op::{Reserved, Slot, SubmissionStrategy, UringSlotSpec},
 };
@@ -114,12 +117,23 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                     )?;
                 }
 
-                let pushed = self.env.push_entry(sqe);
-                slot.platform_mut().submission_state = if pushed {
-                    UringSubmissionState::KernelSubmitted
+                let staged = self.env.stage_user_entry(self.token, sqe)?;
+                let pushed = staged == StageResult::Staged;
+                let next_phase = if pushed {
+                    SubmissionPhase::SqeStaged
                 } else {
-                    UringSubmissionState::Queued
+                    SubmissionPhase::Reserved
                 };
+                self.env.transition_submission_state(
+                    self.token,
+                    &mut slot.platform_mut().control.submission,
+                    next_phase,
+                    if pushed {
+                        "submit transaction staged SQE"
+                    } else {
+                        "submit transaction queued after SQ full"
+                    },
+                );
                 if pushed {
                     self.env
                         .register_completion_cleanup_hint(completion_token, cleanup_hint);
@@ -146,12 +160,18 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                         .report("driver.submit_txn.timer_duration", "Timer duration missing"));
                 };
 
-                let task_id = self.env.wheel.insert(self.token, duration);
+                let task_id = self.env.insert_timer(self.token, duration);
                 self.timer_inserted = Some(task_id);
+                self.env.record_timer_insert(self.token, task_id);
 
                 let platform = slot.platform_mut();
                 platform.timer_id = Some(task_id);
-                platform.submission_state = UringSubmissionState::Timer;
+                self.env.transition_submission_state(
+                    self.token,
+                    &mut platform.control.submission,
+                    SubmissionPhase::TimerArmed,
+                    "submit transaction armed software timer",
+                );
 
                 self.commit();
 
@@ -176,7 +196,7 @@ impl Drop for UringSubmitTxn<'_, '_, '_, '_> {
         }
 
         if let Some(task_id) = self.timer_inserted.take() {
-            self.env.wheel.cancel(task_id);
+            self.env.cancel_timer(self.token, task_id);
         }
 
         // Fixed-buffer registration is a persistent registry resource. It is deliberately not

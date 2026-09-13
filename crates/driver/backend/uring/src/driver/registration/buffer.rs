@@ -37,8 +37,6 @@ pub(crate) struct BufferRegistrySubmitView<'r, 'a> {
     pub(crate) register_buffers_update_outcomes: &'r mut VecDeque<Option<i32>>,
     #[cfg(feature = "test-hooks")]
     pub(crate) bitset_set_failure: &'r mut bool,
-    #[cfg(feature = "test-hooks")]
-    pub(crate) push_entry_failure: &'r mut bool,
     pub(crate) provided: Option<ProvidedBufSqeInfo>,
 }
 
@@ -55,8 +53,6 @@ pub(crate) struct UringBufferRegistry<'a> {
     register_buffers_update_outcomes: VecDeque<Option<i32>>,
     #[cfg(feature = "test-hooks")]
     bitset_set_failure: bool,
-    #[cfg(feature = "test-hooks")]
-    push_entry_failure: bool,
     provided_buf_config: Option<ProvidedBufConfig>,
     provided_buffers: Option<ProvidedBufGroup>,
 }
@@ -80,8 +76,6 @@ impl<'a> UringBufferRegistry<'a> {
             register_buffers_update_outcomes: VecDeque::new(),
             #[cfg(feature = "test-hooks")]
             bitset_set_failure: false,
-            #[cfg(feature = "test-hooks")]
-            push_entry_failure: false,
             provided_buf_config,
             provided_buffers: None,
         }
@@ -105,8 +99,6 @@ impl<'a> UringBufferRegistry<'a> {
             register_buffers_update_outcomes: &mut self.register_buffers_update_outcomes,
             #[cfg(feature = "test-hooks")]
             bitset_set_failure: &mut self.bitset_set_failure,
-            #[cfg(feature = "test-hooks")]
-            push_entry_failure: &mut self.push_entry_failure,
             provided,
         }
     }
@@ -137,11 +129,6 @@ impl<'a> UringBufferRegistry<'a> {
     #[cfg(feature = "test-hooks")]
     pub(crate) fn inject_bitset_set_failure(&mut self) {
         self.bitset_set_failure = true;
-    }
-
-    #[cfg(feature = "test-hooks")]
-    pub(crate) fn inject_push_entry_failure(&mut self) {
-        self.push_entry_failure = true;
     }
 
     #[cfg(feature = "test-hooks")]

@@ -177,10 +177,9 @@ impl UringWaker {
     }
 }
 
-pub(crate) struct WakerHooksView<'a> {
+pub(crate) struct WakerHooksView {
     pub(crate) buf_len: usize,
-    pub(crate) armed: &'a mut bool,
-    pub(crate) notification_state: &'a AtomicU8,
+    pub(crate) generation: u64,
 }
 
 pub(crate) struct UringWakerManager {
@@ -189,6 +188,8 @@ pub(crate) struct UringWakerManager {
     armed: bool,
     buf: Box<[u8; 8]>,
     notification_state: Arc<AtomicU8>,
+    next_generation: u64,
+    armed_generation: u64,
 }
 
 impl UringWakerManager {
@@ -200,6 +201,8 @@ impl UringWakerManager {
             armed: false,
             buf: Box::new([0; 8]),
             notification_state: Arc::new(AtomicU8::new(WAKER_IDLE)),
+            next_generation: 0,
+            armed_generation: 0,
         })
     }
 
@@ -235,17 +238,36 @@ impl UringWakerManager {
     }
 
     #[inline]
-    pub(crate) fn set_armed(&mut self, armed: bool) {
-        self.armed = armed;
+    pub(crate) fn hooks_view(&self) -> WakerHooksView {
+        WakerHooksView {
+            buf_len: self.buf.len(),
+            generation: self.armed_generation,
+        }
     }
 
     #[inline]
-    pub(crate) fn hooks_view(&mut self) -> WakerHooksView<'_> {
-        WakerHooksView {
-            buf_len: self.buf.len(),
-            armed: &mut self.armed,
-            notification_state: &self.notification_state,
+    pub(crate) fn arm(&mut self) -> u64 {
+        self.next_generation = self.next_generation.wrapping_add(1);
+        if self.next_generation == 0 {
+            self.next_generation = 1;
         }
+        self.armed_generation = self.next_generation;
+        self.armed = true;
+        self.armed_generation
+    }
+
+    #[inline]
+    pub(crate) fn armed_generation(&self) -> u64 {
+        self.armed_generation
+    }
+
+    #[inline]
+    pub(crate) fn prepare_rearm(&mut self, generation: u64) -> bool {
+        if !self.armed || self.armed_generation != generation {
+            return false;
+        }
+        self.armed = false;
+        true
     }
 
     pub(crate) fn begin_processing(&self) {
@@ -361,5 +383,19 @@ mod tests {
         assert_eq!(read_event_fd(&old_fd), 1);
         assert_eq!(manager.state.current().fd.raw(), new_fd.fd.raw());
         assert_ne!(old_fd.fd.raw(), new_fd.fd.raw());
+    }
+
+    #[test]
+    fn waker_rearm_is_bound_to_one_arm_generation() {
+        let mut manager = UringWakerManager::new().expect("eventfd should be created");
+        let first = manager.arm();
+        assert_eq!(manager.hooks_view().generation, first);
+        assert!(manager.prepare_rearm(first));
+        assert!(!manager.prepare_rearm(first));
+
+        let second = manager.arm();
+        assert_ne!(first, second);
+        assert!(!manager.prepare_rearm(first));
+        assert!(manager.prepare_rearm(second));
     }
 }

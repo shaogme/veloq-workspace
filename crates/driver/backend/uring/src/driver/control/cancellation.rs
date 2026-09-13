@@ -6,7 +6,7 @@ use veloq_std::{
     sync::mpsc,
 };
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PendingCancel {
     pub(crate) target: OpToken,
     pub(crate) mode: CancelMode,
@@ -78,22 +78,78 @@ impl UringCancelManager {
     }
 
     #[inline]
-    pub(crate) fn allocate_cancel_id(&mut self) -> CancelCompletionId {
-        let raw = self.next_cancel_id;
-        self.next_cancel_id = self.next_cancel_id.wrapping_add(1);
-        if self.next_cancel_id == 0 {
-            self.next_cancel_id = 1;
+    pub(crate) fn allocate_cancel_id(&mut self) -> Option<CancelCompletionId> {
+        for _ in 0..u16::MAX {
+            let raw = self.next_cancel_id;
+            self.next_cancel_id = self.next_cancel_id.wrapping_add(1);
+            if self.next_cancel_id == 0 {
+                self.next_cancel_id = 1;
+            }
+            let id = CancelCompletionId::new(raw);
+            if !self.pending_cancel_cqes.contains_key(&id) {
+                return Some(id);
+            }
         }
-        CancelCompletionId::new(raw)
+        None
     }
 
     #[inline]
-    pub(crate) fn insert_in_flight(&mut self, id: CancelCompletionId, pending: PendingCancel) {
+    pub(crate) fn insert_in_flight(
+        &mut self,
+        id: CancelCompletionId,
+        pending: PendingCancel,
+    ) -> Result<(), PendingCancel> {
+        if self.pending_cancel_cqes.contains_key(&id) {
+            return Err(pending);
+        }
         self.pending_cancel_cqes.insert(id, pending);
+        Ok(())
     }
 
     #[inline]
     pub(crate) fn in_flight_mut(&mut self) -> &mut HashMap<CancelCompletionId, PendingCancel> {
         &mut self.pending_cancel_cqes
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn pending_targets(&self) -> impl Iterator<Item = OpToken> + '_ {
+        self.pending_cancellations
+            .iter()
+            .map(|request| request.target)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn in_flight_targets(
+        &self,
+    ) -> impl Iterator<Item = (CancelCompletionId, OpToken)> + '_ {
+        self.pending_cancel_cqes
+            .iter()
+            .map(|(id, request)| (*id, request.target))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use veloq_driver_core::slot::Generation;
+
+    fn pending() -> PendingCancel {
+        PendingCancel {
+            target: OpToken::from_registry_parts(1, Generation::new(1)).expect("test token"),
+            mode: CancelMode::Abandon,
+        }
+    }
+
+    #[test]
+    fn allocator_skips_an_unacknowledged_id() {
+        let mut manager = UringCancelManager::new();
+        let first = manager.allocate_cancel_id().expect("first id");
+        manager
+            .insert_in_flight(first, pending())
+            .expect("unique id");
+        manager.next_cancel_id = first.raw();
+
+        let next = manager.allocate_cancel_id().expect("second id");
+        assert_ne!(next, first);
     }
 }
