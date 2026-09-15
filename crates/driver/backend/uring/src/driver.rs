@@ -226,13 +226,13 @@ impl<'a> UringDriver<'a> {
             };
             match view {
                 CheckedSlotView::Valid(SlotView::Reserved(mut slot)) => slot
-                    .with_op_mut(|op| op.is_provided_multishot())
+                    .with_access_mut(|access| access.operation().get_ref().is_provided_multishot())
                     .unwrap_or(true),
                 CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => slot
-                    .with_pinned_op_mut(|op| op.as_ref().get_ref().is_provided_multishot())
+                    .with_access_mut(|access| access.operation().get_ref().is_provided_multishot())
                     .unwrap_or(true),
                 CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot)) => slot
-                    .with_pinned_op_mut(|op| op.as_ref().get_ref().is_provided_multishot())
+                    .with_access_mut(|access| access.operation().get_ref().is_provided_multishot())
                     .unwrap_or(true),
                 CheckedSlotView::Empty(_)
                 | CheckedSlotView::Missing { .. }

@@ -68,7 +68,7 @@ pub(crate) fn submit_queued_from_slot(
     }
 
     let strategy = slot
-        .with_pinned_op_mut(|op| op.as_ref().get_ref().descriptor().strategy)
+        .with_access_mut(|access| access.operation().get_ref().descriptor().strategy)
         .map_err(|err| slot_access_report("driver.submit_queued_from_slot.strategy", err))?;
     if strategy != SubmissionStrategy::SubmitSqe {
         return UringError::InvalidState
@@ -81,9 +81,9 @@ pub(crate) fn submit_queued_from_slot(
     let mut chunks = [ChunkId::ZERO; 4];
     let (count, sqe, completion_token, cleanup_hint) = {
         let sqe_env = env.sqe_env();
-        slot.with_pinned_op_and_payload_mut(|parts| {
-            let descriptor = parts.op_ref().get_ref().descriptor();
-            let count = unsafe { (descriptor.resolve_chunks)(parts, token, &mut chunks) }?;
+        slot.with_access_mut(|access| {
+            let descriptor = access.operation().get_ref().descriptor();
+            let count = unsafe { (descriptor.resolve_chunks)(access, token, &mut chunks) }?;
             validate_resolved_chunk_count(
                 count,
                 chunks.len(),
@@ -92,7 +92,7 @@ pub(crate) fn submit_queued_from_slot(
             let completion_token = CompletionToken::user(token);
             let sqe = unsafe {
                 (descriptor.make_sqe)(
-                    parts,
+                    access,
                     &sqe_env,
                     SubmitTokenContext::new(token, completion_token),
                 )
@@ -333,18 +333,14 @@ impl<'a> UringDriver<'a> {
                 Ok(CheckedSlotView::Valid(SlotView::Reserved(slot))) => {
                     if slot.has_op() {
                         let mut slot = slot;
-                        match slot.op_mut() {
-                            Ok(slot_op) => *slot_op = op,
-                            Err(err) => {
-                                *op_in = Some(op);
-                                return DriverSubmitResult::failed(
-                                    slot_access_report(
-                                        "uring.driver.submit_sqe_internal.op_mut",
-                                        err,
-                                    ),
-                                    SubmitStatus::Void,
-                                );
-                            }
+                        if let Err(err) = slot.replace_op(op) {
+                            return DriverSubmitResult::failed(
+                                slot_access_report(
+                                    "uring.driver.submit_sqe_internal.replace_op",
+                                    err,
+                                ),
+                                SubmitStatus::Void,
+                            );
                         }
                         slot
                     } else {
@@ -429,18 +425,14 @@ impl<'a> UringDriver<'a> {
                 Ok(CheckedSlotView::Valid(SlotView::Reserved(slot))) => {
                     if slot.has_op() {
                         let mut slot = slot;
-                        match slot.op_mut() {
-                            Ok(slot_op) => *slot_op = op,
-                            Err(err) => {
-                                *op_in = Some(op);
-                                return DriverSubmitResult::failed(
-                                    slot_access_report(
-                                        "uring.driver.submit_timer_internal.op_mut",
-                                        err,
-                                    ),
-                                    SubmitStatus::Void,
-                                );
-                            }
+                        if let Err(err) = slot.replace_op(op) {
+                            return DriverSubmitResult::failed(
+                                slot_access_report(
+                                    "uring.driver.submit_timer_internal.replace_op",
+                                    err,
+                                ),
+                                SubmitStatus::Void,
+                            );
                         }
                         slot
                     } else {

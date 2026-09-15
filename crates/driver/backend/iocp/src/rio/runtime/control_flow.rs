@@ -24,7 +24,7 @@ use veloq_driver_core::{
         AnomalyAttach, CompletionAnomalyKind, CompletionBackendHooks,
         CompletionBackendIngressAction, CompletionCleanupGuard, CompletionContinuation,
         CompletionControl, CompletionFlowExt, CompletionHookOutcome, CompletionIngress,
-        CompletionSource, RawCompletion, SharedCompletionTable, UserCompletionEvent,
+        CompletionSource, PlatformOp, RawCompletion, SharedCompletionTable, UserCompletionEvent,
     },
     slot::{Generation, InFlightOrphaned, InFlightWaiting, SlotState, SlotStatus},
 };
@@ -294,7 +294,8 @@ fn complete_rio_waiting_slot(
             .attach_note("rio completion returned os error")
     };
 
-    let _ = slot.with_op_mut(|iocp_op| {
+    let _ = slot.with_access_mut(|access| {
+        let iocp_op = access.operation_mut().get_mut();
         if let Some(addr_slot) = init.addr_slot
             && let IocpOpPayload::UdpRecvFrom(payload) = &mut iocp_op.payload
             && !cancelled
@@ -324,7 +325,9 @@ fn complete_rio_waiting_slot(
     let res_code = rio_result_to_event_res(&completion);
     let mut guard = slot.complete();
     let cleanup = guard
-        .with_op_mut(|op| op.completion_cleanup(&completion))
+        .with_access_mut(|access| {
+            PlatformOp::completion_cleanup(access.operation_mut(), &completion)
+        })
         .unwrap_or_default();
     let _ = guard.take_op();
     let (payload, detail) = guard.take_completion_data();
@@ -382,7 +385,9 @@ fn complete_rio_orphaned_slot(
             .attach_note("orphaned RIO completion returned os error")
     };
     let cleanup = guard
-        .with_op_mut(|op| op.orphan_cleanup(&orphan_result))
+        .with_access_mut(|access| {
+            PlatformOp::orphan_cleanup(access.operation_mut(), &orphan_result)
+        })
         .unwrap_or_default();
     let _ = guard.take_op();
     let _ = guard.take_completion_data();

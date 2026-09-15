@@ -6,7 +6,8 @@ use veloq_driver_core::{
         AnomalyAttach, CancelMode, CompletionAnomalyKind, CompletionBackend,
         CompletionBackendHooks, CompletionCleanupGuard, CompletionContinuation, CompletionControl,
         CompletionEnvelope, CompletionFlowExt, CompletionFlowOutcome, CompletionHookOutcome,
-        CompletionIngress, CompletionSource, SyntheticCompletionSource, UserCompletionEvent,
+        CompletionIngress, CompletionSource, PlatformOp, SyntheticCompletionSource,
+        UserCompletionEvent,
     },
     slot::{CheckedSlotView, InFlightOrphaned, InFlightWaiting, SlotRegistryExt, SlotView},
 };
@@ -342,7 +343,8 @@ fn calculate_io_result_from_slot(
         Ok(event_res as usize)
     };
 
-    let op_res = guard.with_op_mut(|iocp_op: &mut IocpOp| {
+    let op_res = guard.with_access_mut(|access| {
+        let iocp_op = access.operation_mut().get_mut();
         let blocking_res = iocp_op
             .header
             .blocking_completion
@@ -411,14 +413,16 @@ fn complete_iocp_waiting_slot(
         .unwrap_or(event.res());
     let cleanup = if let Some(io_result) = io_detail.as_ref() {
         guard
-            .with_op_mut(|op| {
-                let cleanup = op.completion_cleanup(io_result);
-                op.unbind_user_payload();
+            .with_access_mut(|access| {
+                let cleanup = PlatformOp::completion_cleanup(access.operation_mut(), io_result);
+                access.operation_mut().get_mut().unbind_user_payload();
                 cleanup
             })
             .unwrap_or_default()
     } else {
-        let _ = guard.with_op_mut(|op| op.unbind_user_payload());
+        let _ = guard.with_access_mut(|access| {
+            access.operation_mut().get_mut().unbind_user_payload();
+        });
         CompletionCleanupGuard::default()
     };
     let (payload, detail) = guard.take_completion_data();
@@ -484,7 +488,9 @@ fn complete_cancel_waiting_slot(
     } else {
         let mut completed = slot.complete();
         let cleanup = completed
-            .with_op_mut(|op| op.orphan_cleanup(&abort_result))
+            .with_access_mut(|access| {
+                PlatformOp::orphan_cleanup(access.operation_mut(), &abort_result)
+            })
             .unwrap_or_default();
         let _ = completed.take_op();
         let (payload, detail) = completed.take_completion_data();
@@ -512,9 +518,9 @@ fn complete_iocp_orphaned_slot(
         ))
     };
     let (cleanup, socket_inflight) = completed
-        .with_op_mut(|op| {
-            let cleanup = op.orphan_cleanup(&io_result);
-            let socket_inflight = take_socket_inflight_from_op(op);
+        .with_access_mut(|access| {
+            let cleanup = PlatformOp::orphan_cleanup(access.operation_mut(), &io_result);
+            let socket_inflight = take_socket_inflight_from_op(access.operation_mut().get_mut());
             (cleanup, socket_inflight)
         })
         .unwrap_or_default();
@@ -527,7 +533,7 @@ fn complete_iocp_orphaned_slot(
 fn take_socket_inflight_from_slot(
     slot: &mut Slot<'_, InFlightWaiting>,
 ) -> Option<SocketInflightToken> {
-    slot.with_op_mut(take_socket_inflight_from_op)
+    slot.with_access_mut(|access| take_socket_inflight_from_op(access.operation_mut().get_mut()))
         .ok()
         .flatten()
 }

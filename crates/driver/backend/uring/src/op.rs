@@ -52,13 +52,19 @@ impl PlatformOp for UringKernelOp {
     type CleanupContext<'a> = i32;
 
     #[inline]
-    fn completion_cleanup(&mut self, result: Self::CleanupContext<'_>) -> CompletionCleanupGuard {
-        (self.descriptor.completion_cleanup)(result)
+    fn completion_cleanup(
+        self: Pin<&mut Self>,
+        result: Self::CleanupContext<'_>,
+    ) -> CompletionCleanupGuard {
+        (self.as_ref().get_ref().descriptor.completion_cleanup)(result)
     }
 
     #[inline]
-    fn orphan_cleanup(&mut self, result: Self::CleanupContext<'_>) -> CompletionCleanupGuard {
-        (self.descriptor.orphan_cleanup)(result)
+    fn orphan_cleanup(
+        self: Pin<&mut Self>,
+        result: Self::CleanupContext<'_>,
+    ) -> CompletionCleanupGuard {
+        (self.as_ref().get_ref().descriptor.orphan_cleanup)(result)
     }
 }
 
@@ -79,37 +85,6 @@ impl UringKernelOp {
     #[inline]
     pub(crate) fn descriptor(&self) -> &'static ErasedOperationDescriptor {
         self.descriptor
-    }
-
-    #[inline]
-    pub(crate) fn completion_cleanup(&mut self, result: i32) -> CompletionCleanupGuard {
-        (self.descriptor.completion_cleanup)(result)
-    }
-
-    #[inline]
-    pub(crate) fn orphan_cleanup(&mut self, result: i32) -> CompletionCleanupGuard {
-        (self.descriptor.orphan_cleanup)(result)
-    }
-
-    #[inline]
-    pub(crate) fn completion_cleanup_pinned(
-        self: Pin<&mut Self>,
-        result: i32,
-    ) -> CompletionCleanupGuard {
-        // SAFETY: the pinned receiver remains in the slot for this callback and this method only
-        // reads its descriptor pointer; it never moves the operation or its payload.
-        let this = unsafe { self.get_unchecked_mut() };
-        this.completion_cleanup(result)
-    }
-
-    #[inline]
-    pub(crate) fn orphan_cleanup_pinned(
-        self: Pin<&mut Self>,
-        result: i32,
-    ) -> CompletionCleanupGuard {
-        // SAFETY: see `completion_cleanup_pinned`.
-        let this = unsafe { self.get_unchecked_mut() };
-        this.orphan_cleanup(result)
     }
 
     /// Replaces the descriptor with an intentionally mismatched one for projection tests only.

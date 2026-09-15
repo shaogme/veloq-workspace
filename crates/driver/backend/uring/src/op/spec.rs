@@ -17,9 +17,9 @@ use veloq_buf::heap::ChunkId;
 use veloq_driver_core::{
     driver::{CompletionCleanupGuard, OpToken, SubmitTokenContext},
     op::{IntoPlatformOp, LostReason, OpCompletion, OpError, OpKind, OpResult, SingleShotOp},
-    slot::PinnedSlotParts,
+    slot::{SlotAccess, SlotAccessError},
 };
-use veloq_std::{convert::identity, pin::Pin, time::Duration};
+use veloq_std::{convert::identity, format, pin::Pin, time::Duration};
 
 use submit::{
     completion_cleanup_close_raw_fd as cleanup_close_raw_fd,
@@ -110,8 +110,8 @@ pub(crate) trait UringOperationDescriptor: UringOpSpec {
     fn kernel_payload_ref(payload: &UringKernelPayloadStorage) -> Option<&Self::KernelPayload>;
     fn user_payload_ref(payload: &UringUserPayload) -> Option<&Self>;
 
-    unsafe fn with_projected_parts<F, R>(
-        parts: &mut PinnedSlotParts<'_, UringSlotSpec>,
+    unsafe fn with_projected_access<F, R>(
+        access: &mut SlotAccess<'_, UringSlotSpec>,
         token: Option<OpToken>,
         scope: &'static str,
         f: F,
@@ -120,26 +120,26 @@ pub(crate) trait UringOperationDescriptor: UringOpSpec {
         F: FnOnce(Pin<&mut Self::KernelPayload>, &mut Self) -> R;
 
     unsafe fn make_sqe_dispatch(
-        parts: &mut PinnedSlotParts<'_, UringSlotSpec>,
+        access: &mut SlotAccess<'_, UringSlotSpec>,
         env: &SqeEnv<'_>,
         token: SubmitTokenContext,
     ) -> UringResult<squeue::Entry>;
     unsafe fn on_complete_dispatch(
-        parts: &mut PinnedSlotParts<'_, UringSlotSpec>,
+        access: &mut SlotAccess<'_, UringSlotSpec>,
         token: OpToken,
         result: i32,
     ) -> UringResult<usize>;
     unsafe fn get_timeout_dispatch(
-        parts: &mut PinnedSlotParts<'_, UringSlotSpec>,
+        access: &mut SlotAccess<'_, UringSlotSpec>,
         token: OpToken,
     ) -> UringResult<Option<Duration>>;
     unsafe fn resolve_chunks_dispatch(
-        parts: &mut PinnedSlotParts<'_, UringSlotSpec>,
+        access: &mut SlotAccess<'_, UringSlotSpec>,
         token: OpToken,
         chunks: &mut [ChunkId],
     ) -> UringResult<usize>;
     unsafe fn record_item_dispatch(
-        parts: &mut PinnedSlotParts<'_, UringSlotSpec>,
+        access: &mut SlotAccess<'_, UringSlotSpec>,
         token: OpToken,
         result: i32,
         flags: u32,
@@ -298,6 +298,31 @@ fn projection_mismatch_report(
     }
     if let Some(tag) = actual_user {
         report = report.with_ctx("actual_user_payload", tag.name());
+    }
+    report
+}
+
+fn projection_access_report(
+    scope: &'static str,
+    token: Option<OpToken>,
+    error: SlotAccessError,
+) -> Report<UringError> {
+    let mut report = UringError::Internal
+        .report(
+            scope,
+            "slot access failed during operation payload projection",
+        )
+        .with_ctx("slot_index", error.snapshot.index)
+        .with_ctx("slot_generation", error.snapshot.generation)
+        .with_ctx("slot_status", format!("{:?}", error.snapshot.status))
+        .with_ctx("slot_has_op", error.snapshot.has_op)
+        .with_ctx("slot_has_payload", error.snapshot.has_payload)
+        .with_ctx("slot_access_action", format!("{:?}", error.action))
+        .with_ctx("slot_access_reason", format!("{:?}", error.reason));
+    if let Some(token) = token {
+        report = report
+            .with_ctx("token_index", token.index())
+            .with_ctx("token_generation", token.generation());
     }
     report
 }
@@ -533,8 +558,8 @@ macro_rules! impl_uring_operation_descriptor {
                 }
             }
 
-            unsafe fn with_projected_parts<F, R>(
-                parts: &mut PinnedSlotParts<'_, UringSlotSpec>,
+            unsafe fn with_projected_access<F, R>(
+                access: &mut SlotAccess<'_, UringSlotSpec>,
                 token: Option<OpToken>,
                 scope: &'static str,
                 f: F,
@@ -542,13 +567,17 @@ macro_rules! impl_uring_operation_descriptor {
             where
                 F: FnOnce(Pin<&mut Self::KernelPayload>, &mut Self) -> R,
             {
-                let (mut op, payload) = parts.split_mut();
+                let (mut op, payload) = access
+                    .operation_and_payload_mut()
+                    .map_err(|err: SlotAccessError| {
+                        projection_access_report(scope, token, err)
+                    })?;
                 let actual_kernel = op.as_ref().get_ref().payload.payload_id();
                 let actual_user = payload.payload_id();
                 let op = unsafe { op.as_mut().get_unchecked_mut() };
                 let kernel = match &mut op.payload {
                     UringKernelPayloadStorage::$kernel_variant(kernel) => {
-                        // SAFETY: `op` is borrowed through `PinnedSlotParts`, so this variant
+                        // SAFETY: `op` is borrowed through `SlotAccess`, so this variant
                         // remains at its stable slot address for the duration of the callback.
                         unsafe { Pin::new_unchecked(kernel) }
                     }
@@ -582,13 +611,13 @@ macro_rules! impl_uring_operation_descriptor {
             }
 
             unsafe fn make_sqe_dispatch(
-                parts: &mut PinnedSlotParts<'_, UringSlotSpec>,
+                access: &mut SlotAccess<'_, UringSlotSpec>,
                 env: &SqeEnv<'_>,
                 token: SubmitTokenContext,
             ) -> UringResult<squeue::Entry> {
                 unsafe {
-                    Self::with_projected_parts(
-                        parts,
+                    Self::with_projected_access(
+                        access,
                         Some(token.op_token),
                         "uring.op.spec.make_sqe",
                         |kernel, user| Self::make_sqe(kernel, user, env, token),
@@ -597,13 +626,13 @@ macro_rules! impl_uring_operation_descriptor {
             }
 
             unsafe fn on_complete_dispatch(
-                parts: &mut PinnedSlotParts<'_, UringSlotSpec>,
+                access: &mut SlotAccess<'_, UringSlotSpec>,
                 token: OpToken,
                 result: i32,
             ) -> UringResult<usize> {
                 unsafe {
-                    Self::with_projected_parts(
-                        parts,
+                    Self::with_projected_access(
+                        access,
                         Some(token),
                         "uring.op.spec.on_complete",
                         |kernel, user| Self::on_complete(kernel, user, result),
@@ -612,12 +641,12 @@ macro_rules! impl_uring_operation_descriptor {
             }
 
             unsafe fn get_timeout_dispatch(
-                parts: &mut PinnedSlotParts<'_, UringSlotSpec>,
+                access: &mut SlotAccess<'_, UringSlotSpec>,
                 token: OpToken,
             ) -> UringResult<Option<Duration>> {
                 unsafe {
-                    Self::with_projected_parts(
-                        parts,
+                    Self::with_projected_access(
+                        access,
                         Some(token),
                         "uring.op.spec.get_timeout",
                         |kernel, user| Self::get_timeout(kernel.as_ref(), user),
@@ -626,13 +655,13 @@ macro_rules! impl_uring_operation_descriptor {
             }
 
             unsafe fn resolve_chunks_dispatch(
-                parts: &mut PinnedSlotParts<'_, UringSlotSpec>,
+                access: &mut SlotAccess<'_, UringSlotSpec>,
                 token: OpToken,
                 chunks: &mut [ChunkId],
             ) -> UringResult<usize> {
                 unsafe {
-                    Self::with_projected_parts(
-                        parts,
+                    Self::with_projected_access(
+                        access,
                         Some(token),
                         "uring.op.spec.resolve_chunks",
                         |kernel, user| Self::resolve_chunks(kernel.as_ref(), user, chunks),
@@ -641,15 +670,15 @@ macro_rules! impl_uring_operation_descriptor {
             }
 
             unsafe fn record_item_dispatch(
-                parts: &mut PinnedSlotParts<'_, UringSlotSpec>,
+                access: &mut SlotAccess<'_, UringSlotSpec>,
                 token: OpToken,
                 result: i32,
                 flags: u32,
                 env: &mut CqeEnv<'_>,
             ) -> UringResult<UringRecordItem> {
                 unsafe {
-                    Self::with_projected_parts(
-                        parts,
+                    Self::with_projected_access(
+                        access,
                         Some(token),
                         "uring.op.spec.record_item",
                         |kernel, user| Self::record_item(kernel, user, token, result, flags, env),
@@ -1972,23 +2001,25 @@ mod tests {
     use crate::{
         config::{FileTableExhaustion, IoFd, SockAddrStorage, UringRawHandle},
         diagnostics::UringCompletionDiagnostics,
-        driver::{CqeEnv, FileTable, SqeEnv},
+        driver::{CqeEnv, FileTable, SqeEnv, UringOpState},
         net::socket_addr_to_storage,
-        op::{UringOp, UringOperationDescriptor},
+        op::{UringOp, UringOpRegistry, UringOperationDescriptor},
         test_alloc::{AllocationCounts, measure},
     };
     use io_uring::squeue;
     use veloq_buf::{FixedBuf, NoopRegistrar, heap::ChunkId};
     use veloq_driver_core::{
-        driver::{OpToken, SubmitTokenContext},
+        driver::{OpToken, SubmitTokenContext, registry::OpEntry},
         op::IntoPlatformOp,
-        slot::{Generation, PinnedSlotParts},
+        slot::{
+            CheckedSlotView, Reserved, Slot, SlotAccess, SlotAccessOutcome, SlotRegistryExt,
+            SlotView,
+        },
     };
     use veloq_std::{
         mem::{align_of, size_of},
         net::{Ipv4Addr, SocketAddr, SocketAddrV4},
         num::NonZeroUsize,
-        pin::Pin,
     };
 
     fn buffer(len: usize) -> FixedBuf {
@@ -2015,12 +2046,6 @@ mod tests {
         socket_addr_to_storage(socket_addr())
     }
 
-    fn test_token() -> SubmitTokenContext {
-        let token = OpToken::from_registry_parts(0, Generation::new(1))
-            .expect("test token should be encodable");
-        SubmitTokenContext::user(token)
-    }
-
     fn test_sqe_env<'a>(file_table: &'a FileTable, registrar: &'a NoopRegistrar) -> SqeEnv<'a> {
         SqeEnv::for_test(file_table, registrar)
     }
@@ -2032,12 +2057,53 @@ mod tests {
         SqeEnv::for_test_with_provided(file_table, registrar, 7, 16)
     }
 
-    fn pinned_parts<'a>(
-        op: &'a mut UringOp,
-        payload: &'a mut UringUserPayload,
-    ) -> PinnedSlotParts<'a, UringSlotSpec> {
-        // SAFETY: test callers keep the operation in place until the callback returns.
-        PinnedSlotParts::from_parts(unsafe { Pin::new_unchecked(op) }, payload)
+    fn with_test_slot_pair<F, R>(op: UringOp, payload: UringUserPayload, f: F) -> R
+    where
+        F: FnOnce(OpToken, &mut Slot<'_, Reserved, UringSlotSpec>) -> R,
+    {
+        let mut registry = UringOpRegistry::new(1);
+        let handle = registry
+            .insert(OpEntry::new(UringOpState::new()))
+            .unwrap_or_else(|_| panic!("test registry should have capacity"));
+        let token = OpToken::from_registry_parts(handle.index, handle.generation)
+            .expect("test token should be encodable");
+        registry
+            .with_slot_storage_mut(token, |_result, slot_payload, _sidecar| {
+                *slot_payload = Some(payload);
+            })
+            .expect("test slot storage should exist");
+        let reserved = match registry
+            .checked_slot_view(token)
+            .expect("test slot lookup should succeed")
+        {
+            CheckedSlotView::Valid(SlotView::Reserved(slot)) => slot,
+            _ => panic!("test slot should be reserved"),
+        };
+        let mut reserved = reserved
+            .init_op_with(op, |_| {})
+            .expect("test reserved slot should accept operation");
+        f(token, &mut reserved)
+    }
+
+    fn with_test_slot<S, F, R>(operation: S, f: F) -> R
+    where
+        S: UringOperationDescriptor + IntoPlatformOp<UringSlotSpec>,
+        F: FnOnce(OpToken, &mut Slot<'_, Reserved, UringSlotSpec>) -> R,
+    {
+        let (op, payload) =
+            <S as IntoPlatformOp<UringSlotSpec>>::into_kernel_and_payload(operation);
+        let payload = <S as IntoPlatformOp<UringSlotSpec>>::payload_into_erased(payload);
+        with_test_slot_pair(op, payload, f)
+    }
+
+    fn with_test_access<F, R>(
+        slot: &mut Slot<'_, Reserved, UringSlotSpec>,
+        f: F,
+    ) -> SlotAccessOutcome<R>
+    where
+        F: FnOnce(&mut SlotAccess<'_, UringSlotSpec>) -> R,
+    {
+        slot.with_access_mut(f)
     }
 
     fn assert_no_fast_path_allocations(name: &str, counts: AllocationCounts) {
@@ -2062,32 +2128,28 @@ mod tests {
     {
         let diagnostics = UringCompletionDiagnostics::default();
         let mut cqe_env = CqeEnv::new(None, &diagnostics);
-        let (_, counts) = measure(|| {
-            let (mut op, payload) =
-                <S as IntoPlatformOp<UringSlotSpec>>::into_kernel_and_payload(operation);
-            let mut payload = <S as IntoPlatformOp<UringSlotSpec>>::payload_into_erased(payload);
-            let descriptor = op.descriptor();
-            let mut parts = pinned_parts(&mut op, &mut payload);
-            let _entry = unsafe { (descriptor.make_sqe)(&mut parts, env, test_token()) }
-                .expect("baseline SQE dispatch should succeed");
-            let completion = unsafe {
-                (descriptor.on_complete)(&mut parts, test_token().op_token, completion_result)
-            }
-            .expect("baseline completion dispatch should succeed");
-            assert_eq!(completion, completion_result as usize);
-            let _record = unsafe {
-                (descriptor.record_item)(
-                    &mut parts,
-                    test_token().op_token,
-                    completion_result,
-                    0,
-                    &mut cqe_env,
-                )
-            }
-            .expect("baseline record dispatch should succeed");
-            let _cleanup = (descriptor.completion_cleanup)(completion_result);
-        });
-        counts
+        with_test_slot(operation, |token, slot| {
+            let (_, counts) = measure(|| {
+                with_test_access(slot, |access| {
+                    let descriptor = access.operation().get_ref().descriptor();
+                    let _entry = unsafe {
+                        (descriptor.make_sqe)(access, env, SubmitTokenContext::user(token))
+                    }
+                    .expect("baseline SQE dispatch should succeed");
+                    let completion =
+                        unsafe { (descriptor.on_complete)(access, token, completion_result) }
+                            .expect("baseline completion dispatch should succeed");
+                    assert_eq!(completion, completion_result as usize);
+                    let _record = unsafe {
+                        (descriptor.record_item)(access, token, completion_result, 0, &mut cqe_env)
+                    }
+                    .expect("baseline record dispatch should succeed");
+                    let _cleanup = (descriptor.completion_cleanup)(completion_result);
+                })
+                .expect("test operation access should succeed");
+            });
+            counts
+        })
     }
 
     fn measure_udp_recv_from_dispatch(
@@ -2097,71 +2159,64 @@ mod tests {
         let diagnostics = UringCompletionDiagnostics::default();
         let mut cqe_env = CqeEnv::new(None, &diagnostics);
         let (storage, storage_len) = storage_addr();
-        let (_, counts) = measure(|| {
-            let (mut op, payload) =
-                <UdpRecvFrom as IntoPlatformOp<UringSlotSpec>>::into_kernel_and_payload(operation);
-            let mut payload =
-                <UdpRecvFrom as IntoPlatformOp<UringSlotSpec>>::payload_into_erased(payload);
-            let descriptor = op.descriptor();
-            let mut parts = pinned_parts(&mut op, &mut payload);
-            let _entry = unsafe { (descriptor.make_sqe)(&mut parts, env, test_token()) }
-                .expect("baseline UDP recv-from SQE dispatch should succeed");
-            unsafe {
-                <UdpRecvFrom as UringOperationDescriptor>::with_projected_parts(
-                    &mut parts,
-                    Some(test_token().op_token),
-                    "uring.op.spec.test.measure_udp_recv_from",
-                    |kernel, _| {
-                        kernel
-                            .get_unchecked_mut()
-                            .test_set_received_address(storage.0, storage_len as usize);
-                    },
-                )
-            }
-            .expect("UDP kernel payload projection should succeed");
-            let completion = unsafe {
-                (descriptor.on_complete)(&mut parts, test_token().op_token, storage_len as i32)
-            }
-            .expect("baseline UDP recv-from completion dispatch should succeed");
-            assert_eq!(completion, storage_len as usize);
-            let _record = unsafe {
-                (descriptor.record_item)(
-                    &mut parts,
-                    test_token().op_token,
-                    storage_len as i32,
-                    0,
-                    &mut cqe_env,
-                )
-            }
-            .expect("baseline UDP recv-from record dispatch should succeed");
-        });
-        counts
+        with_test_slot(operation, |token, slot| {
+            let (_, counts) = measure(|| {
+                with_test_access(slot, |access| {
+                    let descriptor = access.operation().get_ref().descriptor();
+                    let _entry = unsafe {
+                        (descriptor.make_sqe)(access, env, SubmitTokenContext::user(token))
+                    }
+                    .expect("baseline UDP recv-from SQE dispatch should succeed");
+                    unsafe {
+                        <UdpRecvFrom as UringOperationDescriptor>::with_projected_access(
+                            access,
+                            Some(token),
+                            "uring.op.spec.test.measure_udp_recv_from",
+                            |kernel, _| {
+                                kernel
+                                    .get_unchecked_mut()
+                                    .test_set_received_address(storage.0, storage_len as usize);
+                            },
+                        )
+                    }
+                    .expect("UDP kernel payload projection should succeed");
+                    let completion =
+                        unsafe { (descriptor.on_complete)(access, token, storage_len as i32) }
+                            .expect("baseline UDP recv-from completion dispatch should succeed");
+                    assert_eq!(completion, storage_len as usize);
+                    let _record = unsafe {
+                        (descriptor.record_item)(access, token, storage_len as i32, 0, &mut cqe_env)
+                    }
+                    .expect("baseline UDP recv-from record dispatch should succeed");
+                })
+                .expect("test operation access should succeed");
+            });
+            counts
+        })
     }
 
     fn measure_timer_dispatch(operation: Timeout) -> AllocationCounts {
         let diagnostics = UringCompletionDiagnostics::default();
         let mut cqe_env = CqeEnv::new(None, &diagnostics);
-        let (_, counts) = measure(|| {
-            let (mut op, payload) =
-                <Timeout as IntoPlatformOp<UringSlotSpec>>::into_kernel_and_payload(operation);
-            let mut payload =
-                <Timeout as IntoPlatformOp<UringSlotSpec>>::payload_into_erased(payload);
-            let descriptor = op.descriptor();
-            let mut parts = pinned_parts(&mut op, &mut payload);
-            let duration = unsafe { (descriptor.get_timeout)(&mut parts, test_token().op_token) }
-                .expect("baseline timer dispatch should succeed")
-                .expect("baseline timer should expose a duration");
-            assert_eq!(duration, Duration::from_secs(1));
-            let completion =
-                unsafe { (descriptor.on_complete)(&mut parts, test_token().op_token, 0) }
-                    .expect("baseline timer completion dispatch should succeed");
-            assert_eq!(completion, 0);
-            let _record = unsafe {
-                (descriptor.record_item)(&mut parts, test_token().op_token, 0, 0, &mut cqe_env)
-            }
-            .expect("baseline timer record dispatch should succeed");
-        });
-        counts
+        with_test_slot(operation, |token, slot| {
+            let (_, counts) = measure(|| {
+                with_test_access(slot, |access| {
+                    let descriptor = access.operation().get_ref().descriptor();
+                    let duration = unsafe { (descriptor.get_timeout)(access, token) }
+                        .expect("baseline timer dispatch should succeed")
+                        .expect("baseline timer should expose a duration");
+                    assert_eq!(duration, Duration::from_secs(1));
+                    let completion = unsafe { (descriptor.on_complete)(access, token, 0) }
+                        .expect("baseline timer completion dispatch should succeed");
+                    assert_eq!(completion, 0);
+                    let _record =
+                        unsafe { (descriptor.record_item)(access, token, 0, 0, &mut cqe_env) }
+                            .expect("baseline timer record dispatch should succeed");
+                })
+                .expect("test operation access should succeed");
+            });
+            counts
+        })
     }
 
     #[test]
@@ -2750,101 +2805,119 @@ mod tests {
 
     #[test]
     fn descriptor_dispatch_returns_explicit_internal_errors() {
-        let (mut op, _) = read_raw_parts();
-        let mut user = write_raw_payload();
         let file_table = FileTable::new(0, FileTableExhaustion::Fallback);
         let registrar = NoopRegistrar;
         let env = test_sqe_env(&file_table, &registrar);
 
         // SQE construction and completion report the same internal mismatch class.
-        let mut parts = pinned_parts(&mut op, &mut user);
-        assert_internal_error(unsafe {
-            <ReadRaw as UringOperationDescriptor>::make_sqe_dispatch(&mut parts, &env, test_token())
-        });
-        assert_internal_error(unsafe {
-            <ReadRaw as UringOperationDescriptor>::on_complete_dispatch(
-                &mut parts,
-                test_token().op_token,
-                0,
-            )
-        });
+        let (read_op, _) = read_raw_parts();
+        let result = with_test_slot_pair(read_op, write_raw_payload(), |token, slot| {
+            with_test_access(slot, |access| unsafe {
+                <ReadRaw as UringOperationDescriptor>::make_sqe_dispatch(
+                    access,
+                    &env,
+                    SubmitTokenContext::user(token),
+                )
+            })
+        })
+        .expect("test operation access should succeed");
+        assert_internal_error(result);
+
+        let (valid_op, _) = read_raw_parts();
+        let result = with_test_slot_pair(valid_op, write_raw_payload(), |token, slot| {
+            with_test_access(slot, |access| unsafe {
+                <ReadRaw as UringOperationDescriptor>::on_complete_dispatch(access, token, 0)
+            })
+        })
+        .expect("test operation access should succeed");
+        assert_internal_error(result);
 
         // Cleanup is result-only and deliberately does not project either payload.
-        let mut wrong_op = wrong_kernel_op();
-        let _cleanup = wrong_op.completion_cleanup(0);
-
-        let mut wrong_op = wrong_kernel_op();
-        let _cleanup = wrong_op.orphan_cleanup(0);
+        let wrong_op = wrong_kernel_op();
+        let _cleanup = (wrong_op.descriptor().completion_cleanup)(0);
 
         let wrong_op = wrong_kernel_op();
-        let (_, mut valid_user) = read_raw_parts();
-        let mut wrong_op = wrong_op;
-        let mut parts = pinned_parts(&mut wrong_op, &mut valid_user);
-        assert_internal_error(unsafe {
-            <ReadRaw as UringOperationDescriptor>::get_timeout_dispatch(
-                &mut parts,
-                test_token().op_token,
-            )
-        });
-        let (mut valid_op, _) = read_raw_parts();
-        let mut user = write_raw_payload();
-        let mut parts = pinned_parts(&mut valid_op, &mut user);
-        assert_internal_error(unsafe {
-            <ReadRaw as UringOperationDescriptor>::get_timeout_dispatch(
-                &mut parts,
-                test_token().op_token,
-            )
-        });
+        let _cleanup = (wrong_op.descriptor().orphan_cleanup)(0);
+
+        let wrong_op = wrong_kernel_op();
+        let (_, valid_user) = read_raw_parts();
+        let result = with_test_slot_pair(wrong_op, valid_user, |token, slot| {
+            with_test_access(slot, |access| unsafe {
+                <ReadRaw as UringOperationDescriptor>::get_timeout_dispatch(access, token)
+            })
+        })
+        .expect("test operation access should succeed");
+        assert_internal_error(result);
+
+        let (valid_op, _) = read_raw_parts();
+        let result = with_test_slot_pair(valid_op, write_raw_payload(), |token, slot| {
+            with_test_access(slot, |access| unsafe {
+                <ReadRaw as UringOperationDescriptor>::get_timeout_dispatch(access, token)
+            })
+        })
+        .expect("test operation access should succeed");
+        assert_internal_error(result);
 
         let mut chunks = [ChunkId::ZERO; 1];
-        let mut wrong_op = wrong_kernel_op();
-        let (_, mut valid_user) = read_raw_parts();
-        let mut parts = pinned_parts(&mut wrong_op, &mut valid_user);
-        assert_internal_error(unsafe {
-            <ReadRaw as UringOperationDescriptor>::resolve_chunks_dispatch(
-                &mut parts,
-                test_token().op_token,
-                &mut chunks,
-            )
-        });
-        let (mut valid_op, _) = read_raw_parts();
-        let mut user = write_raw_payload();
-        let mut parts = pinned_parts(&mut valid_op, &mut user);
-        assert_internal_error(unsafe {
-            <ReadRaw as UringOperationDescriptor>::resolve_chunks_dispatch(
-                &mut parts,
-                test_token().op_token,
-                &mut chunks,
-            )
-        });
+        let wrong_op = wrong_kernel_op();
+        let (_, valid_user) = read_raw_parts();
+        let result = with_test_slot_pair(wrong_op, valid_user, |token, slot| {
+            with_test_access(slot, |access| unsafe {
+                <ReadRaw as UringOperationDescriptor>::resolve_chunks_dispatch(
+                    access,
+                    token,
+                    &mut chunks,
+                )
+            })
+        })
+        .expect("test operation access should succeed");
+        assert_internal_error(result);
+
+        let (valid_op, _) = read_raw_parts();
+        let result = with_test_slot_pair(valid_op, write_raw_payload(), |token, slot| {
+            with_test_access(slot, |access| unsafe {
+                <ReadRaw as UringOperationDescriptor>::resolve_chunks_dispatch(
+                    access,
+                    token,
+                    &mut chunks,
+                )
+            })
+        })
+        .expect("test operation access should succeed");
+        assert_internal_error(result);
 
         let diagnostics = UringCompletionDiagnostics::default();
         let mut cqe_env = CqeEnv::new(None, &diagnostics);
-        let mut wrong_op = wrong_kernel_op();
-        let (_, mut valid_user) = read_raw_parts();
-        let mut parts = pinned_parts(&mut wrong_op, &mut valid_user);
-        assert_internal_error(unsafe {
-            <ReadRaw as UringOperationDescriptor>::record_item_dispatch(
-                &mut parts,
-                test_token().op_token,
-                0,
-                0,
-                &mut cqe_env,
-            )
-        });
+        let wrong_op = wrong_kernel_op();
+        let (_, valid_user) = read_raw_parts();
+        let result = with_test_slot_pair(wrong_op, valid_user, |token, slot| {
+            with_test_access(slot, |access| unsafe {
+                <ReadRaw as UringOperationDescriptor>::record_item_dispatch(
+                    access,
+                    token,
+                    0,
+                    0,
+                    &mut cqe_env,
+                )
+            })
+        })
+        .expect("test operation access should succeed");
+        assert_internal_error(result);
 
-        let (mut valid_op, _) = read_raw_parts();
-        let mut user = write_raw_payload();
-        let mut parts = pinned_parts(&mut valid_op, &mut user);
-        assert_internal_error(unsafe {
-            <ReadRaw as UringOperationDescriptor>::record_item_dispatch(
-                &mut parts,
-                test_token().op_token,
-                0,
-                0,
-                &mut cqe_env,
-            )
-        });
+        let (valid_op, _) = read_raw_parts();
+        let result = with_test_slot_pair(valid_op, write_raw_payload(), |token, slot| {
+            with_test_access(slot, |access| unsafe {
+                <ReadRaw as UringOperationDescriptor>::record_item_dispatch(
+                    access,
+                    token,
+                    0,
+                    0,
+                    &mut cqe_env,
+                )
+            })
+        })
+        .expect("test operation access should succeed");
+        assert_internal_error(result);
     }
 
     /// Reads `io_uring_sqe.addr`, which is the second 64-bit union field in the C ABI SQE.
@@ -2876,29 +2949,31 @@ mod tests {
         };
         // Moving this operation through the descriptor layer is valid before make_sqe establishes
         // any self-reference.
-        let (mut op, user) =
-            <SendTo as IntoPlatformOp<UringSlotSpec>>::into_kernel_and_payload(user);
-        let mut user = <SendTo as IntoPlatformOp<UringSlotSpec>>::payload_into_erased(user);
         let file_table = FileTable::new(0, FileTableExhaustion::Fallback);
         let registrar = NoopRegistrar;
         let env = test_sqe_env(&file_table, &registrar);
-        let descriptor = op.descriptor();
-        let mut parts = pinned_parts(&mut op, &mut user);
-        let entry = unsafe { (descriptor.make_sqe)(&mut parts, &env, test_token()) }
+        with_test_slot(user, |token, slot| {
+            let entry = with_test_access(slot, |access| {
+                let descriptor = access.operation().get_ref().descriptor();
+                unsafe { (descriptor.make_sqe)(access, &env, SubmitTokenContext::user(token)) }
+            })
+            .expect("test operation access should succeed")
             .expect("send_to SQE should be built with a direct socket descriptor");
 
-        let (msg_name, iovec, msghdr) = unsafe {
-            <SendTo as UringOperationDescriptor>::with_projected_parts(
-                &mut parts,
-                Some(test_token().op_token),
-                "uring.op.spec.test.send_to_pointers",
-                |kernel, _| kernel.get_unchecked_mut().test_pointers(),
-            )
-        }
-        .expect("SendTo kernel payload projection should succeed");
-        assert_eq!(unsafe { (*msghdr).msg_name }, msg_name);
-        assert_eq!(unsafe { (*msghdr).msg_iov }, iovec);
-        assert_eq!(sqe_addr(&entry), msghdr as usize);
+            let (msg_name, iovec, msghdr) = with_test_access(slot, |access| unsafe {
+                <SendTo as UringOperationDescriptor>::with_projected_access(
+                    access,
+                    Some(token),
+                    "uring.op.spec.test.send_to_pointers",
+                    |kernel, _| kernel.get_unchecked_mut().test_pointers(),
+                )
+            })
+            .expect("test operation access should succeed")
+            .expect("SendTo kernel payload projection should succeed");
+            assert_eq!(unsafe { (*msghdr).msg_name }, msg_name);
+            assert_eq!(unsafe { (*msghdr).msg_iov }, iovec);
+            assert_eq!(sqe_addr(&entry), msghdr as usize);
+        });
     }
 
     #[test]
@@ -2910,52 +2985,66 @@ mod tests {
             addr: None,
         };
         // As above, the operation is moved before the kernel pointers are initialized.
-        let (mut op, user) =
-            <UdpRecvFrom as IntoPlatformOp<UringSlotSpec>>::into_kernel_and_payload(user);
-        let mut user = <UdpRecvFrom as IntoPlatformOp<UringSlotSpec>>::payload_into_erased(user);
         let file_table = FileTable::new(0, FileTableExhaustion::Fallback);
         let registrar = NoopRegistrar;
         let env = test_sqe_env(&file_table, &registrar);
-        let descriptor = op.descriptor();
-        let mut parts = pinned_parts(&mut op, &mut user);
-        let entry = unsafe { (descriptor.make_sqe)(&mut parts, &env, test_token()) }
-            .expect("udp_recv_from SQE should be built with a direct socket descriptor");
-
         let expected_addr = socket_addr();
         let (storage, len) = storage_addr();
-        let (msg_name, iovec, msghdr) = unsafe {
-            <UdpRecvFrom as UringOperationDescriptor>::with_projected_parts(
-                &mut parts,
-                Some(test_token().op_token),
-                "uring.op.spec.test.udp_recv_from_pointers",
-                |kernel, _| kernel.get_unchecked_mut().test_pointers(),
-            )
-        }
-        .expect("UdpRecvFrom kernel payload projection should succeed");
-        assert_eq!(unsafe { (*msghdr).msg_name }, msg_name);
-        assert_eq!(unsafe { (*msghdr).msg_iov }, iovec);
-        assert_eq!(sqe_addr(&entry), msghdr as usize);
+        with_test_slot(user, |token, slot| {
+            let entry = with_test_access(slot, |access| {
+                let descriptor = access.operation().get_ref().descriptor();
+                unsafe { (descriptor.make_sqe)(access, &env, SubmitTokenContext::user(token)) }
+            })
+            .expect("test operation access should succeed")
+            .expect("udp_recv_from SQE should be built with a direct socket descriptor");
 
-        // Writing the storage field in place does not move the payload; it models the kernel's
-        // address write before the existing completion callback reads it.
-        unsafe {
-            <UdpRecvFrom as UringOperationDescriptor>::with_projected_parts(
-                &mut parts,
-                Some(test_token().op_token),
-                "uring.op.spec.test.udp_recv_from_address",
-                |kernel, _| {
-                    kernel
-                        .get_unchecked_mut()
-                        .test_set_received_address(storage.0, len as usize);
-                },
-            )
-        }
-        .expect("UdpRecvFrom kernel payload projection should succeed");
-        let result = unsafe { (descriptor.on_complete)(&mut parts, test_token().op_token, 4) };
-        assert_eq!(result.expect("valid UDP completion"), 4);
-        let user = <UdpRecvFrom as UringOperationDescriptor>::try_user_payload(user)
-            .expect("completion must retain the UdpRecvFrom payload");
-        assert_eq!(user.addr, Some(expected_addr));
+            let (msg_name, iovec, msghdr) = with_test_access(slot, |access| unsafe {
+                <UdpRecvFrom as UringOperationDescriptor>::with_projected_access(
+                    access,
+                    Some(token),
+                    "uring.op.spec.test.udp_recv_from_pointers",
+                    |kernel, _| kernel.get_unchecked_mut().test_pointers(),
+                )
+            })
+            .expect("test operation access should succeed")
+            .expect("UdpRecvFrom kernel payload projection should succeed");
+            assert_eq!(unsafe { (*msghdr).msg_name }, msg_name);
+            assert_eq!(unsafe { (*msghdr).msg_iov }, iovec);
+            assert_eq!(sqe_addr(&entry), msghdr as usize);
+
+            // Writing the storage field in place does not move the payload; it models the
+            // kernel's address write before the existing completion callback reads it.
+            with_test_access(slot, |access| unsafe {
+                <UdpRecvFrom as UringOperationDescriptor>::with_projected_access(
+                    access,
+                    Some(token),
+                    "uring.op.spec.test.udp_recv_from_address",
+                    |kernel, _| {
+                        kernel
+                            .get_unchecked_mut()
+                            .test_set_received_address(storage.0, len as usize);
+                    },
+                )
+            })
+            .expect("test operation access should succeed")
+            .expect("UdpRecvFrom kernel payload projection should succeed");
+            let result = with_test_access(slot, |access| unsafe {
+                let descriptor = access.operation().get_ref().descriptor();
+                (descriptor.on_complete)(access, token, 4)
+            })
+            .expect("test operation access should succeed");
+            assert_eq!(result.expect("valid UDP completion"), 4);
+            let actual_addr = with_test_access(slot, |access| {
+                let (_, payload) = access
+                    .operation_and_payload_mut()
+                    .expect("test payload should remain bound");
+                <UdpRecvFrom as UringOperationDescriptor>::user_payload_ref(payload)
+                    .map(|user| user.addr)
+            })
+            .expect("test operation access should succeed")
+            .expect("test payload should contain UdpRecvFrom");
+            assert_eq!(actual_addr, Some(expected_addr));
+        });
     }
 
     #[test]
@@ -2966,31 +3055,33 @@ mod tests {
             buf_offset: 0,
             addr: None,
         };
-        let (mut op, user) =
-            <UdpRecvFrom as IntoPlatformOp<UringSlotSpec>>::into_kernel_and_payload(user);
-        let mut user = <UdpRecvFrom as IntoPlatformOp<UringSlotSpec>>::payload_into_erased(user);
-        let descriptor = op.descriptor();
-        let mut parts = pinned_parts(&mut op, &mut user);
         let (storage, _) = storage_addr();
-        unsafe {
-            <UdpRecvFrom as UringOperationDescriptor>::with_projected_parts(
-                &mut parts,
-                Some(test_token().op_token),
-                "uring.op.spec.test.udp_recv_from_oversized_address",
-                |kernel, _| {
-                    kernel.get_unchecked_mut().test_set_received_address(
-                        storage.0,
-                        size_of::<libc::sockaddr_storage>() + 1,
-                    );
-                },
-            )
-        }
-        .expect("UdpRecvFrom kernel payload projection should succeed");
+        with_test_slot(user, |token, slot| {
+            with_test_access(slot, |access| unsafe {
+                <UdpRecvFrom as UringOperationDescriptor>::with_projected_access(
+                    access,
+                    Some(token),
+                    "uring.op.spec.test.udp_recv_from_oversized_address",
+                    |kernel, _| {
+                        kernel.get_unchecked_mut().test_set_received_address(
+                            storage.0,
+                            size_of::<libc::sockaddr_storage>() + 1,
+                        );
+                    },
+                )
+            })
+            .expect("test operation access should succeed")
+            .expect("UdpRecvFrom kernel payload projection should succeed");
 
-        let result = unsafe { (descriptor.on_complete)(&mut parts, test_token().op_token, 4) };
-        let Err(report) = result else {
-            panic!("an oversized sockaddr length must be rejected");
-        };
-        assert_eq!(*report.inner(), UringError::InvalidState);
+            let result = with_test_access(slot, |access| unsafe {
+                let descriptor = access.operation().get_ref().descriptor();
+                (descriptor.on_complete)(access, token, 4)
+            })
+            .expect("test operation access should succeed");
+            let Err(report) = result else {
+                panic!("an oversized sockaddr length must be rejected");
+            };
+            assert_eq!(*report.inner(), UringError::InvalidState);
+        });
     }
 }

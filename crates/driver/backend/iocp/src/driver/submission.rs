@@ -12,7 +12,7 @@ use veloq_driver_core::{
     driver::{
         CompletionBackendHooks, CompletionContinuation, CompletionControl, CompletionFlowExt,
         CompletionHookOutcome, CompletionIngress, CompletionSource, CompletionToken,
-        DriverSubmitResult, OpToken, SharedCompletionTable, SubmitStatus,
+        DriverSubmitResult, OpToken, PlatformOp, SharedCompletionTable, SubmitStatus,
         SyntheticCompletionSource, UserCompletionEvent,
     },
     slot::{
@@ -82,14 +82,17 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
         let event_res = event.res();
         let mut guard = slot.complete();
         let cleanup = guard
-            .with_op_mut(|op| {
-                op.completion_cleanup(&Err(self.report.take().unwrap_or_else(|| {
-                    IocpError::Submission
-                        .to_report()
-                        .push_ctx("scope", "iocp.driver.handle_offload")
-                        .set_error_code((-event_res).max(1))
-                        .attach_note("offload task submission failed")
-                })))
+            .with_access_mut(|access| {
+                PlatformOp::completion_cleanup(
+                    access.operation_mut(),
+                    &Err(self.report.take().unwrap_or_else(|| {
+                        IocpError::Submission
+                            .to_report()
+                            .push_ctx("scope", "iocp.driver.handle_offload")
+                            .set_error_code((-event_res).max(1))
+                            .attach_note("offload task submission failed")
+                    })),
+                )
             })
             .unwrap_or_default();
         let _ = guard.take_op();
@@ -122,7 +125,12 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
     ) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
         let mut guard = slot.complete();
         let cleanup = guard
-            .with_op_mut(|op| op.orphan_cleanup(&Err(IocpError::Submission.to_report())))
+            .with_access_mut(|access| {
+                PlatformOp::orphan_cleanup(
+                    access.operation_mut(),
+                    &Err(IocpError::Submission.to_report()),
+                )
+            })
             .unwrap_or_default();
         let _ = guard.take_op();
         let _ = guard.take_completion_data();
@@ -138,7 +146,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
     }
 }
 
-fn close_fd_from_op(op: &mut IocpOp) -> IocpResult<Option<IoFd>> {
+fn close_fd_from_op(op: &IocpOp) -> IocpResult<Option<IoFd>> {
     match &op.payload {
         IocpOpPayload::Close(payload) => {
             // SAFETY: the slot payload is bound before submission starts.
@@ -189,7 +197,11 @@ impl<'a> IocpDriver<'a> {
             .map_err(|err| slot_access_report("iocp.driver.prep_op_slot.init_op", err))?;
 
         guard
-            .with_op_and_payload_mut(|op_ref, user_payload| {
+            .with_access_mut(|access| {
+                let (op_ref, user_payload) = access.operation_and_payload_mut().map_err(|err| {
+                    slot_access_report("iocp.driver.prep_op_slot.op_payload", err)
+                })?;
+                let op_ref = op_ref.get_mut();
                 op_ref.header.reset_for_token(token);
                 op_ref.bind_user_payload(user_payload)
             })
@@ -332,7 +344,7 @@ impl<'a> IocpDriver<'a> {
             }))
             .map_err(|err| slot_access_report("iocp.driver.call_op_submit.start", err))?;
         let close_fd = if let Some(slot) = sub_guard.slot.as_mut() {
-            slot.with_op_mut(close_fd_from_op)
+            slot.with_access_mut(|access| close_fd_from_op(access.operation().get_ref()))
                 .map_err(|err| slot_access_report("iocp.driver.call_op_submit.close_fd", err))??
         } else {
             None
@@ -354,7 +366,8 @@ impl<'a> IocpDriver<'a> {
                     IocpError::InvalidState
                         .report("iocp/driver", "submission guard slot missing during Close")
                 })?;
-                slot.with_op_mut(|op| {
+                slot.with_access_mut(|access| {
+                    let op = access.operation_mut().get_mut();
                     op.header.resolved_handle = Some(RawHandle::new(raw_handle));
                     op.header.blocking_completion = Some(completion);
                 })
@@ -382,7 +395,7 @@ impl<'a> IocpDriver<'a> {
                     "submission guard slot missing during submission",
                 )
             })?;
-            slot.with_op_mut(|op| op.submit(&mut ctx))
+            slot.with_access_mut(|access| access.operation_mut().get_mut().submit(&mut ctx))
                 .map_err(|err| slot_access_report("iocp.driver.call_op_submit.submit_op", err))?
         }
         .push_ctx("scope", "iocp/driver")
@@ -393,7 +406,8 @@ impl<'a> IocpDriver<'a> {
                 .slot
                 .as_mut()
                 .and_then(|slot| {
-                    slot.with_op_mut(|op| {
+                    slot.with_access_mut(|access| {
+                        let op = access.operation().get_ref();
                         !Self::is_rio_op(op)
                             && op.header.in_flight
                             && op.header.resolved_handle.is_some_and(|h| h.is_socket())

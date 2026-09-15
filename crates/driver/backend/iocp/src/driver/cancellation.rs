@@ -210,7 +210,7 @@ impl<'a> IocpDriver<'a> {
         let status = match ops.checked_slot_view(token)? {
             CheckedSlotView::Valid(SlotView::InFlightWaiting(mut guard)) => {
                 let is_rio = guard
-                    .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
+                    .with_access_mut(|access| Self::is_rio_op(access.operation().get_ref()))
                     .unwrap_or(false);
 
                 if is_rio {
@@ -218,12 +218,14 @@ impl<'a> IocpDriver<'a> {
                     CancelPerformStatus::RioRequested
                 } else {
                     let raw_handle = guard
-                        .with_op_mut(|iocp_op| iocp_op.header.resolved_handle)
+                        .with_access_mut(|access| {
+                            access.operation().get_ref().header.resolved_handle
+                        })
                         .ok()
                         .flatten()
                         .or_else(|| {
                             let fd = guard
-                                .with_op_mut(|iocp_op| iocp_op.get_fd())
+                                .with_access_mut(|access| access.operation().get_ref().get_fd())
                                 .ok()
                                 .flatten()?;
                             op::resolve_fd_handle(&fd, ctx.registered_slots).ok()
@@ -244,7 +246,7 @@ impl<'a> IocpDriver<'a> {
             }
             CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut guard)) => {
                 let is_rio = guard
-                    .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
+                    .with_access_mut(|access| Self::is_rio_op(access.operation().get_ref()))
                     .unwrap_or(false);
 
                 if is_rio {
@@ -252,12 +254,14 @@ impl<'a> IocpDriver<'a> {
                     CancelPerformStatus::RioRequested
                 } else {
                     let raw_handle = guard
-                        .with_op_mut(|iocp_op| iocp_op.header.resolved_handle)
+                        .with_access_mut(|access| {
+                            access.operation().get_ref().header.resolved_handle
+                        })
                         .ok()
                         .flatten()
                         .or_else(|| {
                             let fd = guard
-                                .with_op_mut(|iocp_op| iocp_op.get_fd())
+                                .with_access_mut(|access| access.operation().get_ref().get_fd())
                                 .ok()
                                 .flatten()?;
                             op::resolve_fd_handle(&fd, ctx.registered_slots).ok()

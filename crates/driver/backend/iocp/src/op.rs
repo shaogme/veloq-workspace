@@ -22,7 +22,7 @@ pub(crate) use state::{BlockingCompletion, BlockingSuccessCleanup, IocpOpRegistr
 pub use state::{IocpOpState, IocpSlotSpec, OverlappedEntry};
 pub(crate) use submit::{SubmissionResult, locate_registered_slot, resolve_fd_handle};
 
-use veloq_std::sync::Arc;
+use veloq_std::{pin::Pin, sync::Arc};
 
 use diagweave::{prelude::*, report::Report};
 
@@ -134,13 +134,21 @@ impl PlatformOp for IocpKernelOp {
     type CleanupContext<'a> = &'a IocpResult<usize>;
 
     #[inline]
-    fn completion_cleanup(&mut self, result: Self::CleanupContext<'_>) -> CompletionCleanupGuard {
-        unsafe { (self.vtable.completion_cleanup)(self, result) }
+    fn completion_cleanup(
+        self: Pin<&mut Self>,
+        result: Self::CleanupContext<'_>,
+    ) -> CompletionCleanupGuard {
+        let op = self.get_mut();
+        unsafe { (op.vtable.completion_cleanup)(op, result) }
     }
 
     #[inline]
-    fn orphan_cleanup(&mut self, result: Self::CleanupContext<'_>) -> CompletionCleanupGuard {
-        unsafe { (self.vtable.orphan_cleanup)(self, result) }
+    fn orphan_cleanup(
+        self: Pin<&mut Self>,
+        result: Self::CleanupContext<'_>,
+    ) -> CompletionCleanupGuard {
+        let op = self.get_mut();
+        unsafe { (op.vtable.orphan_cleanup)(op, result) }
     }
 }
 
@@ -163,17 +171,6 @@ impl IocpKernelOp {
 
     pub(crate) fn on_complete(&mut self, result: usize, ext: &Extensions) -> IocpResult<usize> {
         unsafe { (self.vtable.on_complete)(self, result, ext) }
-    }
-
-    pub(crate) fn completion_cleanup(
-        &mut self,
-        result: &IocpResult<usize>,
-    ) -> CompletionCleanupGuard {
-        PlatformOp::completion_cleanup(self, result)
-    }
-
-    pub(crate) fn orphan_cleanup(&mut self, result: &IocpResult<usize>) -> CompletionCleanupGuard {
-        PlatformOp::orphan_cleanup(self, result)
     }
 }
 

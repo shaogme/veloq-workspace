@@ -42,7 +42,7 @@ use veloq_driver_core::{
         CompletionBackendHooks, CompletionCleanupGuard, CompletionContinuation, CompletionControl,
         CompletionEnvelope, CompletionFlowExt, CompletionFlowOutcome, CompletionHookOutcome,
         CompletionIngress, CompletionSource, CompletionToken, Driver, DriverCompletionDiagnostics,
-        OpToken, RawCompletion, SyntheticCompletionSource, UserCompletionEvent,
+        OpToken, PlatformOp, RawCompletion, SyntheticCompletionSource, UserCompletionEvent,
         run_completion_cleanup,
     },
     slot::{CheckedSlotView, InFlightOrphaned, InFlightWaiting, SlotRegistryExt, SlotView},
@@ -1345,15 +1345,14 @@ fn complete_kernel_waiting_slot(
         CompletionContinuation::Final
     };
 
-    let (final_res, cleanup, record_item, operation_name) = match slot
-        .with_pinned_op_and_payload_mut(|parts| {
-            let descriptor = parts.op_ref().get_ref().descriptor();
-            let final_res = unsafe { (descriptor.on_complete)(parts, token, raw.res) };
-            let cleanup = (descriptor.completion_cleanup)(raw.res);
-            let record_item =
-                unsafe { (descriptor.record_item)(parts, token, raw.res, raw.flags, cqe_env) };
-            (final_res, cleanup, record_item, descriptor.name)
-        }) {
+    let (final_res, cleanup, record_item, operation_name) = match slot.with_access_mut(|access| {
+        let descriptor = access.operation().get_ref().descriptor();
+        let final_res = unsafe { (descriptor.on_complete)(access, token, raw.res) };
+        let cleanup = (descriptor.completion_cleanup)(raw.res);
+        let record_item =
+            unsafe { (descriptor.record_item)(access, token, raw.res, raw.flags, cqe_env) };
+        (final_res, cleanup, record_item, descriptor.name)
+    }) {
         Ok(result) => result,
         Err(err) => {
             return Err(KernelCompletionError {
@@ -1488,7 +1487,7 @@ fn complete_submission_failure_slot(
     let event_res = event.res();
     slot.platform_mut().control.submission = SubmissionPhase::Terminal;
     let cleanup = slot
-        .with_pinned_op_mut(|op| op.completion_cleanup_pinned(event_res))
+        .with_access_mut(|access| PlatformOp::completion_cleanup(access.operation_mut(), event_res))
         .map_err(|err| slot_access_report("uring.complete_submission_failure_slot.cleanup", err))?;
     let mut completed = slot.complete();
     let _ = completed.take_op();
@@ -1520,11 +1519,12 @@ fn complete_local_cancel_slot(
 ) -> UringResult<CompletionHookOutcome<UringSlotSpec, UringBackendEffect>> {
     slot.platform_mut().control.submission = SubmissionPhase::Terminal;
     let cleanup = slot
-        .with_pinned_op_mut(|op| {
+        .with_access_mut(|access| {
+            let operation = access.operation_mut();
             if mode == CancelMode::Abandon || orphaned {
-                op.orphan_cleanup_pinned(event.res())
+                PlatformOp::orphan_cleanup(operation, event.res())
             } else {
-                op.completion_cleanup_pinned(event.res())
+                PlatformOp::completion_cleanup(operation, event.res())
             }
         })
         .map_err(|err| slot_access_report("uring.complete_local_cancel_slot.cleanup", err))?;
@@ -1570,7 +1570,7 @@ fn cleanup_orphaned_streaming_slot(
     cqe_res: i32,
 ) -> UringResult<(CompletionCleanupGuard, bool)> {
     let cleanup = slot
-        .with_pinned_op_mut(|op| op.orphan_cleanup_pinned(cqe_res))
+        .with_access_mut(|access| PlatformOp::orphan_cleanup(access.operation_mut(), cqe_res))
         .map_err(|err| slot_access_report("uring.cleanup_orphaned_streaming_slot.cleanup", err))?;
     Ok((cleanup, true))
 }
@@ -1581,7 +1581,7 @@ fn cleanup_orphaned_slot(
 ) -> UringResult<(CompletionCleanupGuard, bool)> {
     slot.platform_mut().control.submission = SubmissionPhase::Terminal;
     let cleanup = slot
-        .with_pinned_op_mut(|op| op.orphan_cleanup_pinned(cqe_res))
+        .with_access_mut(|access| PlatformOp::orphan_cleanup(access.operation_mut(), cqe_res))
         .map_err(|err| slot_access_report("uring.cleanup_orphaned_slot.cleanup", err))?;
     let mut completed = slot.complete();
     let (payload, detail) = completed.take_completion_data();

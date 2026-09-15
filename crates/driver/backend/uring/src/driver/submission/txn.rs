@@ -66,7 +66,7 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                 UringError::InvalidState
                     .report("driver.submit_txn.submit", "submission guard missing")
             })?
-            .with_pinned_op_and_payload_mut(|parts| parts.op_ref().get_ref().descriptor().strategy)
+            .with_access_mut(|access| access.operation().get_ref().descriptor().strategy)
             .map_err(|err| slot_access_report("driver.submit_txn.strategy", err))?;
 
         match strategy {
@@ -82,10 +82,10 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                         )
                     })?;
                     guard
-                        .with_pinned_op_and_payload_mut(|parts| {
-                            let descriptor = parts.op_ref().get_ref().descriptor();
+                        .with_access_mut(|access| {
+                            let descriptor = access.operation().get_ref().descriptor();
                             let count =
-                                unsafe { (descriptor.resolve_chunks)(parts, token, &mut chunks) }?;
+                                unsafe { (descriptor.resolve_chunks)(access, token, &mut chunks) }?;
                             super::validate_resolved_chunk_count(
                                 count,
                                 chunks.len(),
@@ -94,7 +94,7 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                             let completion_token = CompletionToken::user(token);
                             let sqe = unsafe {
                                 (descriptor.make_sqe)(
-                                    parts,
+                                    access,
                                     &sqe_env,
                                     SubmitTokenContext::new(token, completion_token),
                                 )
@@ -170,8 +170,9 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                             "submission guard missing before timer dispatch",
                         )
                     })?
-                    .with_pinned_op_and_payload_mut(|parts| unsafe {
-                        (parts.op_ref().get_ref().descriptor().get_timeout)(parts, self.token)
+                    .with_access_mut(|access| unsafe {
+                        let descriptor = access.operation().get_ref().descriptor();
+                        (descriptor.get_timeout)(access, self.token)
                     })
                     .map_err(|err| {
                         slot_access_report("driver.submit_txn.timer.op_payload", err)

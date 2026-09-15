@@ -6,7 +6,7 @@ use io_uring::squeue;
 use veloq_buf::heap::ChunkId;
 use veloq_driver_core::{
     driver::{CompletionCleanupGuard, OpToken, SubmitTokenContext},
-    slot::PinnedSlotParts,
+    slot::SlotAccess,
 };
 use veloq_std::time::Duration;
 
@@ -36,28 +36,28 @@ pub(crate) enum RecordPolicy {
 }
 
 pub(crate) type MakeSqeFn = unsafe fn(
-    parts: &mut PinnedSlotParts<'_, UringSlotSpec>,
+    access: &mut SlotAccess<'_, UringSlotSpec>,
     env: &SqeEnv<'_>,
     token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry>;
 pub(crate) type OnCompleteFn = unsafe fn(
-    parts: &mut PinnedSlotParts<'_, UringSlotSpec>,
+    access: &mut SlotAccess<'_, UringSlotSpec>,
     token: OpToken,
     result: i32,
 ) -> UringResult<usize>;
 pub(crate) type CompletionCleanupFn = fn(result: i32) -> CompletionCleanupGuard;
 pub(crate) type CompletionCleanupHintFn = fn(result: i32) -> CompletionCleanupGuard;
 pub(crate) type GetTimeoutFn = unsafe fn(
-    parts: &mut PinnedSlotParts<'_, UringSlotSpec>,
+    access: &mut SlotAccess<'_, UringSlotSpec>,
     token: OpToken,
 ) -> UringResult<Option<Duration>>;
 pub(crate) type ResolveChunksFn = unsafe fn(
-    parts: &mut PinnedSlotParts<'_, UringSlotSpec>,
+    access: &mut SlotAccess<'_, UringSlotSpec>,
     token: OpToken,
     chunks: &mut [ChunkId],
 ) -> UringResult<usize>;
 pub(crate) type RecordItemFn = unsafe fn(
-    parts: &mut PinnedSlotParts<'_, UringSlotSpec>,
+    access: &mut SlotAccess<'_, UringSlotSpec>,
     token: OpToken,
     result: i32,
     flags: u32,

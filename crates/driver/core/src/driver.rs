@@ -6,6 +6,7 @@ use veloq_buf::{AnyBufPool, heap::ChunkId};
 use veloq_std::{
     error::Error,
     marker::PhantomData,
+    pin::Pin,
     sync::{Arc, mpsc},
     task::{Poll, Waker},
     time::Duration,
@@ -25,11 +26,17 @@ pub trait PlatformOp {
     where
         Self: 'a;
 
-    fn completion_cleanup(&mut self, _context: Self::CleanupContext<'_>) -> CompletionCleanupGuard {
+    fn completion_cleanup(
+        self: Pin<&mut Self>,
+        _context: Self::CleanupContext<'_>,
+    ) -> CompletionCleanupGuard {
         CompletionCleanupGuard::default()
     }
 
-    fn orphan_cleanup(&mut self, context: Self::CleanupContext<'_>) -> CompletionCleanupGuard {
+    fn orphan_cleanup(
+        self: Pin<&mut Self>,
+        context: Self::CleanupContext<'_>,
+    ) -> CompletionCleanupGuard {
         self.completion_cleanup(context)
     }
 }

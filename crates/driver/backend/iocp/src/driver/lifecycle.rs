@@ -190,7 +190,7 @@ impl<'a> IocpDriver<'a> {
                     if slot.platform().timer_id.is_some() {
                         Some(ShutdownOpKind::Immediate)
                     } else if slot
-                        .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
+                        .with_access_mut(|access| Self::is_rio_op(access.operation().get_ref()))
                         .unwrap_or(false)
                     {
                         Some(ShutdownOpKind::Rio)
@@ -202,7 +202,7 @@ impl<'a> IocpDriver<'a> {
                     if slot.platform().timer_id.is_some() {
                         Some(ShutdownOpKind::Immediate)
                     } else if slot
-                        .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
+                        .with_access_mut(|access| Self::is_rio_op(access.operation().get_ref()))
                         .unwrap_or(false)
                     {
                         Some(ShutdownOpKind::Rio)
@@ -260,10 +260,10 @@ impl<'a> IocpDriver<'a> {
         for token in self.ops.active_tokens().collect::<Vec<_>>() {
             let is_rio = match self.ops.checked_slot_view(token) {
                 Ok(CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot))) => slot
-                    .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
+                    .with_access_mut(|access| Self::is_rio_op(access.operation().get_ref()))
                     .unwrap_or(false),
                 Ok(CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot))) => slot
-                    .with_op_mut(|iocp_op| Self::is_rio_op(iocp_op))
+                    .with_access_mut(|access| Self::is_rio_op(access.operation().get_ref()))
                     .unwrap_or(false),
                 _ => false,
             };
@@ -277,11 +277,15 @@ impl<'a> IocpDriver<'a> {
             match self.ops.checked_slot_view(token) {
                 Ok(CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot))) => {
                     slot.platform_mut().rio_cancel_requested = true;
-                    let _ = slot.with_op_mut(|iocp_op| iocp_op.unbind_user_payload());
+                    let _ = slot.with_access_mut(|access| {
+                        access.operation_mut().get_mut().unbind_user_payload();
+                    });
                 }
                 Ok(CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot))) => {
                     slot.platform_mut().rio_cancel_requested = true;
-                    let _ = slot.with_op_mut(|iocp_op| iocp_op.unbind_user_payload());
+                    let _ = slot.with_access_mut(|access| {
+                        access.operation_mut().get_mut().unbind_user_payload();
+                    });
                 }
                 _ => {}
             }
