@@ -68,10 +68,8 @@ pub(crate) fn submit_queued_from_slot(
     }
 
     let strategy = slot
-        .op_mut()
-        .map_err(|err| slot_access_report("driver.submit_queued_from_slot.strategy", err))?
-        .vtable()
-        .strategy;
+        .with_pinned_op_mut(|op| op.as_ref().get_ref().descriptor().strategy)
+        .map_err(|err| slot_access_report("driver.submit_queued_from_slot.strategy", err))?;
     if strategy != SubmissionStrategy::SubmitSqe {
         return UringError::InvalidState
             .push_ctx("scope", "driver.submit_queued_from_slot.strategy")
@@ -83,9 +81,9 @@ pub(crate) fn submit_queued_from_slot(
     let mut chunks = [ChunkId::ZERO; 4];
     let (count, sqe, completion_token, cleanup_hint) = {
         let sqe_env = env.sqe_env();
-        slot.with_op_and_payload_mut(|op, payload| {
-            let vtable = op.vtable();
-            let count = unsafe { (vtable.resolve_chunks)(op, payload, token, &mut chunks) }?;
+        slot.with_pinned_op_and_payload_mut(|parts| {
+            let descriptor = parts.op_ref().get_ref().descriptor();
+            let count = unsafe { (descriptor.resolve_chunks)(parts, token, &mut chunks) }?;
             validate_resolved_chunk_count(
                 count,
                 chunks.len(),
@@ -93,9 +91,8 @@ pub(crate) fn submit_queued_from_slot(
             )?;
             let completion_token = CompletionToken::user(token);
             let sqe = unsafe {
-                (vtable.make_sqe)(
-                    op,
-                    payload,
+                (descriptor.make_sqe)(
+                    parts,
                     &sqe_env,
                     SubmitTokenContext::new(token, completion_token),
                 )
@@ -106,7 +103,7 @@ pub(crate) fn submit_queued_from_slot(
                 count,
                 sqe,
                 completion_token,
-                vtable.completion_cleanup_hint,
+                descriptor.completion_cleanup_hint,
             ))
         })
         .map_err(|err| slot_access_report("driver.submit_queued_from_slot.op_payload", err))??

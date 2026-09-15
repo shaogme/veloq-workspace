@@ -131,6 +131,20 @@ impl<'d> SqeEnv<'d> {
             provided: None,
         }
     }
+
+    pub(crate) fn for_test_with_provided(
+        file_table: &'d FileTable,
+        registrar: &'d (dyn BufferRegistrar + 'd),
+        bgid: u16,
+        buf_size: u32,
+    ) -> Self {
+        Self {
+            file_table,
+            chunk_records: &[],
+            registrar,
+            provided: Some(ProvidedBufSqeInfo::new(bgid, buf_size)),
+        }
+    }
 }
 
 /// The driver state a completion is allowed to reach.

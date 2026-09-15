@@ -1,5 +1,5 @@
 use veloq_std::sync::{
-    NativeArc as Arc,
+    NativeArc as Arc, NativeBarrier as Barrier,
     atomic::{NativeAtomicBool as AtomicBool, Ordering},
 };
 
@@ -97,8 +97,11 @@ fn handle_can_cancel_before_target_poll_without_calling_job() {
             scope!(ctx, async |scope| {
                 let blocker_started = Arc::new(AtomicBool::new(false));
                 let blocker_started_for_job = blocker_started.clone();
+                let blocker_gate = Arc::new(Barrier::new(2));
+                let blocker_gate_for_job = blocker_gate.clone();
                 let mut blocker = scope.spawn_boxed_to(1, async move || {
                     blocker_started_for_job.store(true, Ordering::Release);
+                    blocker_gate_for_job.wait();
                     veloq_std::future::pending::<usize>().await
                 });
                 while !blocker_started.load(Ordering::Acquire) {
@@ -115,6 +118,7 @@ fn handle_can_cancel_before_target_poll_without_calling_job() {
                 assert!(handle.is_cancel_requested());
                 assert!(!handle.is_finished());
 
+                blocker_gate.wait();
                 blocker.cancel();
                 assert!(matches!(
                     blocker.await,

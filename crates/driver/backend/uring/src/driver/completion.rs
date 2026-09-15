@@ -26,7 +26,10 @@ use crate::{
         UringDriver, submission::txn::slot_access_report,
     },
     error::{UringError, UringResult, uring_report_to_event_res},
-    op::{CompletionCleanupHintFn, Slot, UringRecordItem, UringSlotSpec, UringUserPayload},
+    op::{
+        Close, CompletionCleanupHintFn, Slot, UringOperationDescriptor, UringRecordItem,
+        UringSlotSpec,
+    },
 };
 
 #[cfg(test)]
@@ -1342,30 +1345,26 @@ fn complete_kernel_waiting_slot(
         CompletionContinuation::Final
     };
 
-    let (final_res, cleanup, record_item, operation_name) =
-        match slot.with_op_and_payload_mut(|op, payload| {
-            let final_res = unsafe { (op.vtable().on_complete)(op, payload, token, raw.res) };
-            let cleanup = op.completion_cleanup_checked(raw.res);
-            let record_item = unsafe {
-                (op.vtable().record_item)(op, payload, token, raw.res, raw.flags, cqe_env)
-            };
-            (final_res, cleanup, record_item, op.vtable().operation_name)
+    let (final_res, cleanup, record_item, operation_name) = match slot
+        .with_pinned_op_and_payload_mut(|parts| {
+            let descriptor = parts.op_ref().get_ref().descriptor();
+            let final_res = unsafe { (descriptor.on_complete)(parts, token, raw.res) };
+            let cleanup = (descriptor.completion_cleanup)(raw.res);
+            let record_item =
+                unsafe { (descriptor.record_item)(parts, token, raw.res, raw.flags, cqe_env) };
+            (final_res, cleanup, record_item, descriptor.name)
         }) {
-            Ok(result) => result,
-            Err(err) => {
-                return Err(KernelCompletionError {
-                    report: UringError::InvalidState.report(
-                        "uring.complete_kernel_waiting_slot",
-                        format!("slot corruption detected on completion: {:?}", err),
-                    ),
-                    fallback_cleanup: true,
-                });
-            }
-        };
-    let cleanup = cleanup.map_err(|report| KernelCompletionError {
-        report,
-        fallback_cleanup: true,
-    })?;
+        Ok(result) => result,
+        Err(err) => {
+            return Err(KernelCompletionError {
+                report: UringError::InvalidState.report(
+                    "uring.complete_kernel_waiting_slot",
+                    format!("slot corruption detected on completion: {:?}", err),
+                ),
+                fallback_cleanup: true,
+            });
+        }
+    };
     let record_item = record_item.map_err(|report| KernelCompletionError {
         report,
         fallback_cleanup: false,
@@ -1420,12 +1419,13 @@ fn complete_kernel_waiting_slot(
     };
 
     let effect = if res_is_ok {
-        match &payload {
-            UringUserPayload::Close(close) => UringBackendEffect::CloseCompleted {
+        if let Some(close) = <Close as UringOperationDescriptor>::user_payload_ref(&payload) {
+            UringBackendEffect::CloseCompleted {
                 token,
                 fd: close.fd,
-            },
-            _ => UringBackendEffect::None,
+            }
+        } else {
+            UringBackendEffect::None
         }
     } else {
         UringBackendEffect::None
@@ -1487,12 +1487,10 @@ fn complete_submission_failure_slot(
 ) -> UringResult<CompletionHookOutcome<UringSlotSpec, UringBackendEffect>> {
     let event_res = event.res();
     slot.platform_mut().control.submission = SubmissionPhase::Terminal;
+    let cleanup = slot
+        .with_pinned_op_mut(|op| op.completion_cleanup_pinned(event_res))
+        .map_err(|err| slot_access_report("uring.complete_submission_failure_slot.cleanup", err))?;
     let mut completed = slot.complete();
-    let cleanup = completed
-        .with_op_mut(|op| op.completion_cleanup_checked(event_res))
-        .map_err(|err| {
-            slot_access_report("uring.complete_submission_failure_slot.cleanup", err)
-        })??;
     let _ = completed.take_op();
     let (payload, detail) = completed.take_completion_data();
     let Some(payload) = payload else {
@@ -1521,16 +1519,16 @@ fn complete_local_cancel_slot(
     orphaned: bool,
 ) -> UringResult<CompletionHookOutcome<UringSlotSpec, UringBackendEffect>> {
     slot.platform_mut().control.submission = SubmissionPhase::Terminal;
-    let mut completed = slot.complete();
-    let cleanup = completed
-        .with_op_mut(|op| {
+    let cleanup = slot
+        .with_pinned_op_mut(|op| {
             if mode == CancelMode::Abandon || orphaned {
-                op.orphan_cleanup_checked(event.res())
+                op.orphan_cleanup_pinned(event.res())
             } else {
-                op.completion_cleanup_checked(event.res())
+                op.completion_cleanup_pinned(event.res())
             }
         })
-        .map_err(|err| slot_access_report("uring.complete_local_cancel_slot.cleanup", err))??;
+        .map_err(|err| slot_access_report("uring.complete_local_cancel_slot.cleanup", err))?;
+    let mut completed = slot.complete();
     let (payload, detail) = completed.take_completion_data();
     let _ = completed.take_op();
 
@@ -1572,10 +1570,8 @@ fn cleanup_orphaned_streaming_slot(
     cqe_res: i32,
 ) -> UringResult<(CompletionCleanupGuard, bool)> {
     let cleanup = slot
-        .with_op_mut(|op| op.orphan_cleanup_checked(cqe_res))
-        .map_err(|err| {
-            slot_access_report("uring.cleanup_orphaned_streaming_slot.cleanup", err)
-        })??;
+        .with_pinned_op_mut(|op| op.orphan_cleanup_pinned(cqe_res))
+        .map_err(|err| slot_access_report("uring.cleanup_orphaned_streaming_slot.cleanup", err))?;
     Ok((cleanup, true))
 }
 
@@ -1584,10 +1580,10 @@ fn cleanup_orphaned_slot(
     cqe_res: i32,
 ) -> UringResult<(CompletionCleanupGuard, bool)> {
     slot.platform_mut().control.submission = SubmissionPhase::Terminal;
+    let cleanup = slot
+        .with_pinned_op_mut(|op| op.orphan_cleanup_pinned(cqe_res))
+        .map_err(|err| slot_access_report("uring.cleanup_orphaned_slot.cleanup", err))?;
     let mut completed = slot.complete();
-    let cleanup = completed
-        .with_op_mut(|op| op.orphan_cleanup_checked(cqe_res))
-        .map_err(|err| slot_access_report("uring.cleanup_orphaned_slot.cleanup", err))??;
     let (payload, detail) = completed.take_completion_data();
     let _ = completed.take_op();
     drop(payload);
@@ -1608,7 +1604,8 @@ mod tests {
     use super::*;
     use crate::driver::{ProvidedBufGroup, registration::test_group};
     use crate::op::{
-        Accept, AcceptMulti, Open, ReadRaw, Recv, UringOpErasure, UringOpRegistry, WriteRaw,
+        Accept, AcceptMulti, Open, ReadRaw, Recv, UringOpRegistry, UringOperationDescriptor,
+        WriteRaw,
     };
     use veloq_driver_core::driver::{CompletionToken, SharedCompletionTable};
     use veloq_driver_core::slot::Generation;
@@ -1953,32 +1950,38 @@ mod tests {
     #[test]
     fn raw_fd_cleanup_hint_is_exposed_only_for_fd_producing_ops() {
         assert!(
-            <Open as UringOpErasure>::vtable()
+            <Open as UringOperationDescriptor>::descriptor()
+                .erased
                 .completion_cleanup_hint
                 .is_some()
         );
         assert!(
-            <Accept as UringOpErasure>::vtable()
+            <Accept as UringOperationDescriptor>::descriptor()
+                .erased
                 .completion_cleanup_hint
                 .is_some()
         );
         assert!(
-            <AcceptMulti as UringOpErasure>::vtable()
+            <AcceptMulti as UringOperationDescriptor>::descriptor()
+                .erased
                 .completion_cleanup_hint
                 .is_some()
         );
         assert!(
-            <ReadRaw as UringOpErasure>::vtable()
+            <ReadRaw as UringOperationDescriptor>::descriptor()
+                .erased
                 .completion_cleanup_hint
                 .is_none()
         );
         assert!(
-            <WriteRaw as UringOpErasure>::vtable()
+            <WriteRaw as UringOperationDescriptor>::descriptor()
+                .erased
                 .completion_cleanup_hint
                 .is_none()
         );
         assert!(
-            <Recv as UringOpErasure>::vtable()
+            <Recv as UringOperationDescriptor>::descriptor()
+                .erased
                 .completion_cleanup_hint
                 .is_none()
         );
@@ -1990,7 +1993,8 @@ mod tests {
         let token = OpToken::from_registry_parts(0, Generation::new(1)).expect("test token");
         let fd_pair = open_test_fds();
         let fd = fd_pair[0];
-        let hint = <Open as UringOpErasure>::vtable()
+        let hint = <Open as UringOperationDescriptor>::descriptor()
+            .erased
             .completion_cleanup_hint
             .expect("open must expose a cleanup hint");
         let mut sidecar = HashMap::default();
@@ -2013,7 +2017,8 @@ mod tests {
         let mut registry = UringOpRegistry::new(1);
         let token = OpToken::from_registry_parts(0, Generation::new(1)).expect("test token");
         let fd_pair = open_test_fds();
-        let hint = <Accept as UringOpErasure>::vtable()
+        let hint = <Accept as UringOperationDescriptor>::descriptor()
+            .erased
             .completion_cleanup_hint
             .expect("accept must expose a cleanup hint");
         let mut sidecar = HashMap::default();
@@ -2129,7 +2134,8 @@ mod tests {
         let token = OpToken::from_registry_parts(0, Generation::new(1)).expect("test token");
         let first_pair = open_test_fds();
         let second_pair = open_test_fds();
-        let hint = <AcceptMulti as UringOpErasure>::vtable()
+        let hint = <AcceptMulti as UringOperationDescriptor>::descriptor()
+            .erased
             .completion_cleanup_hint
             .expect("accept multi must expose a cleanup hint");
         let mut sidecar = HashMap::default();
@@ -2160,7 +2166,8 @@ mod tests {
         let new_token = OpToken::from_registry_parts(0, Generation::new(2)).expect("new token");
         let old_pair = open_test_fds();
         let new_pair = open_test_fds();
-        let hint = <Accept as UringOpErasure>::vtable()
+        let hint = <Accept as UringOperationDescriptor>::descriptor()
+            .erased
             .completion_cleanup_hint
             .expect("accept must expose a cleanup hint");
         let mut sidecar = HashMap::default();

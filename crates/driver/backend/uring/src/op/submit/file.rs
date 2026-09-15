@@ -13,12 +13,12 @@ use diagweave::prelude::*;
 use io_uring::{opcode, squeue, types};
 use veloq_buf::{PoolKind, heap::ChunkId};
 use veloq_driver_core::driver::SubmitTokenContext;
-use veloq_std::string::ToString;
+use veloq_std::{pin::Pin, string::ToString};
 
 use super::{invalid_buf_io_range, resolve_any_fd, resolve_file_fd, sqe_with_fd};
 
 pub(crate) unsafe fn make_sqe_read_fixed(
-    _kernel: &mut KernelRef<ReadFixed>,
+    _kernel: Pin<&mut KernelRef<ReadFixed>>,
     rw_op: &mut ReadFixed,
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
@@ -53,7 +53,7 @@ pub(crate) unsafe fn make_sqe_read_fixed(
 }
 
 pub(crate) unsafe fn make_sqe_read_raw(
-    _kernel: &mut KernelRef<ReadRaw>,
+    _kernel: Pin<&mut KernelRef<ReadRaw>>,
     rw_op: &mut ReadRaw,
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
@@ -81,7 +81,7 @@ pub(crate) unsafe fn make_sqe_read_raw(
 }
 
 pub(crate) unsafe fn make_sqe_write_fixed(
-    _kernel: &mut KernelRef<WriteFixed>,
+    _kernel: Pin<&mut KernelRef<WriteFixed>>,
     rw_op: &mut WriteFixed,
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
@@ -116,7 +116,7 @@ pub(crate) unsafe fn make_sqe_write_fixed(
 }
 
 pub(crate) unsafe fn make_sqe_write_raw(
-    _kernel: &mut KernelRef<WriteRaw>,
+    _kernel: Pin<&mut KernelRef<WriteRaw>>,
     rw_op: &mut WriteRaw,
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
@@ -144,7 +144,7 @@ pub(crate) unsafe fn make_sqe_write_raw(
 }
 
 pub(crate) unsafe fn make_sqe_close(
-    _kernel: &mut KernelRef<Close>,
+    _kernel: Pin<&mut KernelRef<Close>>,
     close_op: &mut Close,
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
@@ -176,7 +176,7 @@ pub(crate) unsafe fn make_sqe_close(
 }
 
 pub(crate) unsafe fn make_sqe_fsync(
-    _kernel: &mut KernelRef<Fsync>,
+    _kernel: Pin<&mut KernelRef<Fsync>>,
     fsync_op: &mut Fsync,
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
@@ -198,7 +198,7 @@ pub(crate) unsafe fn make_sqe_fsync(
 }
 
 pub(crate) unsafe fn make_sqe_fsync_raw(
-    _kernel: &mut KernelRef<FsyncRaw>,
+    _kernel: Pin<&mut KernelRef<FsyncRaw>>,
     fsync_op: &mut FsyncRaw,
     _env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
@@ -214,7 +214,7 @@ pub(crate) unsafe fn make_sqe_fsync_raw(
 }
 
 pub(crate) unsafe fn make_sqe_sync_range(
-    _kernel: &mut KernelRef<SyncFileRange>,
+    _kernel: Pin<&mut KernelRef<SyncFileRange>>,
     sync_op: &mut SyncFileRange,
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
@@ -245,7 +245,7 @@ pub(crate) unsafe fn make_sqe_sync_range(
 }
 
 pub(crate) unsafe fn make_sqe_sync_range_raw(
-    _kernel: &mut KernelRef<SyncFileRangeRaw>,
+    _kernel: Pin<&mut KernelRef<SyncFileRangeRaw>>,
     sync_op: &mut SyncFileRangeRaw,
     _env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
@@ -272,7 +272,7 @@ pub(crate) unsafe fn make_sqe_sync_range_raw(
 }
 
 pub(crate) unsafe fn make_sqe_fallocate(
-    _kernel: &mut KernelRef<Fallocate>,
+    _kernel: Pin<&mut KernelRef<Fallocate>>,
     fallocate_op: &mut Fallocate,
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
@@ -292,7 +292,7 @@ pub(crate) unsafe fn make_sqe_fallocate(
 }
 
 pub(crate) unsafe fn make_sqe_fallocate_raw(
-    _kernel: &mut KernelRef<FallocateRaw>,
+    _kernel: Pin<&mut KernelRef<FallocateRaw>>,
     fallocate_op: &mut FallocateRaw,
     _env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
@@ -305,7 +305,7 @@ pub(crate) unsafe fn make_sqe_fallocate_raw(
 }
 
 pub(crate) unsafe fn make_sqe_open(
-    _kernel: &mut OpenPayload,
+    _kernel: Pin<&mut OpenPayload>,
     user: &mut Open,
     _env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
@@ -324,7 +324,7 @@ pub(crate) fn opened_handle_from_res(res: UringResult<usize>) -> UringResult<Own
 }
 
 pub(crate) fn resolve_chunks_read_fixed(
-    _kernel: &KernelRef<ReadFixed>,
+    _kernel: Pin<&KernelRef<ReadFixed>>,
     rw_op: &ReadFixed,
     chunks: &mut [ChunkId],
 ) -> usize {
@@ -338,7 +338,7 @@ pub(crate) fn resolve_chunks_read_fixed(
 }
 
 pub(crate) fn resolve_chunks_read_raw(
-    _kernel: &KernelRef<ReadRaw>,
+    _kernel: Pin<&KernelRef<ReadRaw>>,
     rw_op: &ReadRaw,
     chunks: &mut [ChunkId],
 ) -> usize {
@@ -352,7 +352,7 @@ pub(crate) fn resolve_chunks_read_raw(
 }
 
 pub(crate) fn resolve_chunks_write_fixed(
-    _kernel: &KernelRef<WriteFixed>,
+    _kernel: Pin<&KernelRef<WriteFixed>>,
     rw_op: &WriteFixed,
     chunks: &mut [ChunkId],
 ) -> usize {
@@ -366,7 +366,7 @@ pub(crate) fn resolve_chunks_write_fixed(
 }
 
 pub(crate) fn resolve_chunks_write_raw(
-    _kernel: &KernelRef<WriteRaw>,
+    _kernel: Pin<&KernelRef<WriteRaw>>,
     rw_op: &WriteRaw,
     chunks: &mut [ChunkId],
 ) -> usize {

@@ -21,6 +21,7 @@ use veloq_std::{
     marker::{PhantomData, PhantomPinned},
     mem,
     net::SocketAddr,
+    pin::Pin,
     ptr,
 };
 
@@ -49,157 +50,13 @@ pub(crate) type SendTo = CoreSendTo<UringRawHandle>;
 pub(crate) type UdpRecvFrom = CoreUdpRecvFrom<UringRawHandle>;
 pub(crate) type Wakeup = CoreWakeup<UringRawHandle>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UringPayloadTag {
-    ReadFixed,
-    Read,
-    ReadRaw,
-    WriteFixed,
-    Write,
-    WriteRaw,
-    Recv,
-    RecvProvided,
-    RecvMulti,
-    ProvidedBuf,
-    OpSend,
-    Send,
-    UdpRecv,
-    UdpSend,
-    Connect,
-    UdpConnect,
-    Close,
-    Fsync,
-    FsyncRaw,
-    SyncFileRange,
-    SyncRange,
-    SyncFileRangeRaw,
-    SyncRangeRaw,
-    Fallocate,
-    FallocateRaw,
-    Accept,
-    AcceptMulti,
-    AcceptedSocket,
-    SendTo,
-    UdpRecvFrom,
-    Open,
-    Wakeup,
-    Timeout,
-}
-
-impl UringPayloadTag {
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            Self::ReadFixed => "ReadFixed",
-            Self::Read => "Read",
-            Self::ReadRaw => "ReadRaw",
-            Self::WriteFixed => "WriteFixed",
-            Self::Write => "Write",
-            Self::WriteRaw => "WriteRaw",
-            Self::Recv => "Recv",
-            Self::RecvProvided => "RecvProvided",
-            Self::RecvMulti => "RecvMulti",
-            Self::ProvidedBuf => "ProvidedBuf",
-            Self::OpSend => "OpSend",
-            Self::Send => "Send",
-            Self::UdpRecv => "UdpRecv",
-            Self::UdpSend => "UdpSend",
-            Self::Connect => "Connect",
-            Self::UdpConnect => "UdpConnect",
-            Self::Close => "Close",
-            Self::Fsync => "Fsync",
-            Self::FsyncRaw => "FsyncRaw",
-            Self::SyncFileRange => "SyncFileRange",
-            Self::SyncRange => "SyncRange",
-            Self::SyncFileRangeRaw => "SyncFileRangeRaw",
-            Self::SyncRangeRaw => "SyncRangeRaw",
-            Self::Fallocate => "Fallocate",
-            Self::FallocateRaw => "FallocateRaw",
-            Self::Accept => "Accept",
-            Self::AcceptMulti => "AcceptMulti",
-            Self::AcceptedSocket => "AcceptedSocket",
-            Self::SendTo => "SendTo",
-            Self::UdpRecvFrom => "UdpRecvFrom",
-            Self::Open => "Open",
-            Self::Wakeup => "Wakeup",
-            Self::Timeout => "Timeout",
-        }
-    }
-}
-
-pub enum UringUserPayload {
-    ReadFixed(ReadFixed),
-    ReadRaw(ReadRaw),
-    WriteFixed(WriteFixed),
-    WriteRaw(WriteRaw),
-    Recv(Recv),
-    /// provided-buffer recv 的**提交** payload：提交时还没有 buffer 可言。
-    RecvProvided(RecvProvided),
-    /// multishot provided-buffer recv 的**提交** payload：一直留在 slot 里直到操作终止。
-    RecvMulti(RecvMulti),
-    /// provided-buffer recv **每条完成**的产物：内核在数据到达时才从环里挑出来的那个
-    /// buffer（`None` 表示这条完成一个 buffer 都没消费，例如 `-ENOBUFS`）。
-    ///
-    /// 单发 [`RecvProvided`] 与 multishot [`RecvMulti`] 共用它——「产物不是提交物」与
-    /// 「一次提交多条完成」是两件正交的事，这个变体只表达前者。
-    ProvidedBuf(ProvidedBuf),
-    OpSend(OpSend),
-    UdpRecv(UdpRecv),
-    UdpSend(UdpSend),
-    Connect(Connect),
-    UdpConnect(UdpConnect),
-    Close(Close),
-    Fsync(Fsync),
-    FsyncRaw(FsyncRaw),
-    SyncFileRange(SyncFileRange),
-    SyncFileRangeRaw(SyncFileRangeRaw),
-    Fallocate(Fallocate),
-    FallocateRaw(FallocateRaw),
-    Accept(Accept),
-    /// multishot accept 的**提交** payload：一直留在 slot 里直到操作终止。
-    AcceptMulti(AcceptMulti),
-    /// multishot accept **每条完成**的产物。与上一个变体的区别见
-    /// [`veloq_driver_core::op::IntoPlatformOp`] 的 `SubmitPayload` / `RecordPayload`。
-    AcceptedSocket(AcceptedSocket),
-    SendTo(SendTo),
-    UdpRecvFrom(UdpRecvFrom),
-    Open(Open),
-    Wakeup(Wakeup),
-    Timeout(Timeout),
-}
-
-impl UringUserPayload {
-    pub(crate) const fn tag(&self) -> UringPayloadTag {
-        match self {
-            Self::ReadFixed(_) => UringPayloadTag::ReadFixed,
-            Self::ReadRaw(_) => UringPayloadTag::ReadRaw,
-            Self::WriteFixed(_) => UringPayloadTag::WriteFixed,
-            Self::WriteRaw(_) => UringPayloadTag::WriteRaw,
-            Self::Recv(_) => UringPayloadTag::Recv,
-            Self::RecvProvided(_) => UringPayloadTag::RecvProvided,
-            Self::RecvMulti(_) => UringPayloadTag::RecvMulti,
-            Self::ProvidedBuf(_) => UringPayloadTag::ProvidedBuf,
-            Self::OpSend(_) => UringPayloadTag::OpSend,
-            Self::UdpRecv(_) => UringPayloadTag::UdpRecv,
-            Self::UdpSend(_) => UringPayloadTag::UdpSend,
-            Self::Connect(_) => UringPayloadTag::Connect,
-            Self::UdpConnect(_) => UringPayloadTag::UdpConnect,
-            Self::Close(_) => UringPayloadTag::Close,
-            Self::Fsync(_) => UringPayloadTag::Fsync,
-            Self::FsyncRaw(_) => UringPayloadTag::FsyncRaw,
-            Self::SyncFileRange(_) => UringPayloadTag::SyncFileRange,
-            Self::SyncFileRangeRaw(_) => UringPayloadTag::SyncFileRangeRaw,
-            Self::Fallocate(_) => UringPayloadTag::Fallocate,
-            Self::FallocateRaw(_) => UringPayloadTag::FallocateRaw,
-            Self::Accept(_) => UringPayloadTag::Accept,
-            Self::AcceptMulti(_) => UringPayloadTag::AcceptMulti,
-            Self::AcceptedSocket(_) => UringPayloadTag::AcceptedSocket,
-            Self::SendTo(_) => UringPayloadTag::SendTo,
-            Self::UdpRecvFrom(_) => UringPayloadTag::UdpRecvFrom,
-            Self::Open(_) => UringPayloadTag::Open,
-            Self::Wakeup(_) => UringPayloadTag::Wakeup,
-            Self::Timeout(_) => UringPayloadTag::Timeout,
-        }
-    }
+/// Opaque user payload storage generated from the operation declaration rows.
+///
+/// The concrete storage remains inline in the slot, but callers cannot use the storage as an
+/// operation registry by matching on public variants.
+#[repr(transparent)]
+pub struct UringUserPayload {
+    pub(super) storage: super::spec::UringUserPayloadStorage,
 }
 
 pub(crate) struct KernelRef<T> {
@@ -319,23 +176,25 @@ impl SendToPayload {
     /// returned message view. The view stores a pointer into `self`, and the SQE can outlive this
     /// Rust borrow until its completion or cancellation is observed.
     pub(crate) unsafe fn init_send_to<'a>(
-        &'a mut self,
+        self: Pin<&'a mut Self>,
         user: &mut SendTo,
     ) -> Result<SendMsgView<'a>, BufIoRangeError> {
+        // SAFETY: this method requires a pinned receiver and never moves the payload.
+        let this = unsafe { self.get_unchecked_mut() };
         let (ptr, len) = user.buf.checked_write_range(user.buf_offset)?;
-        self.iovec[0].iov_base = ptr as *mut _;
-        self.iovec[0].iov_len = len as usize;
+        this.iovec[0].iov_base = ptr as *mut _;
+        this.iovec[0].iov_len = len as usize;
 
         let (msg_name, msg_namelen) = socket_addr_to_storage(user.addr);
-        self.msg_name = msg_name.0;
-        self.msg_namelen = msg_namelen;
-        self.msghdr.msg_name = ptr::addr_of_mut!(self.msg_name).cast();
-        self.msghdr.msg_namelen = self.msg_namelen;
-        self.msghdr.msg_iov = self.iovec.as_mut_ptr();
-        self.msghdr.msg_iovlen = 1;
+        this.msg_name = msg_name.0;
+        this.msg_namelen = msg_namelen;
+        this.msghdr.msg_name = ptr::addr_of_mut!(this.msg_name).cast();
+        this.msghdr.msg_namelen = this.msg_namelen;
+        this.msghdr.msg_iov = this.iovec.as_mut_ptr();
+        this.msghdr.msg_iovlen = 1;
 
         Ok(SendMsgView {
-            msghdr: &self.msghdr,
+            msghdr: &this.msghdr,
         })
     }
 
@@ -373,20 +232,22 @@ impl UdpRecvFromPayload {
     /// returned message view. The view stores pointers into `self`, and the SQE can outlive this
     /// Rust borrow until its completion or cancellation is observed.
     pub(crate) unsafe fn init_recv_from<'a>(
-        &'a mut self,
+        self: Pin<&'a mut Self>,
         user: &mut UdpRecvFrom,
     ) -> Result<RecvMsgView<'a>, BufIoRangeError> {
+        // SAFETY: this method requires a pinned receiver and never moves the payload.
+        let this = unsafe { self.get_unchecked_mut() };
         let (ptr, len) = user.buf.checked_read_range(user.buf_offset)?;
-        self.iovec[0].iov_base = ptr as *mut _;
-        self.iovec[0].iov_len = len as usize;
+        this.iovec[0].iov_base = ptr as *mut _;
+        this.iovec[0].iov_len = len as usize;
 
-        self.msghdr.msg_name = ptr::addr_of_mut!(self.msg_name).cast();
-        self.msghdr.msg_namelen = mem::size_of::<libc::sockaddr_storage>() as _;
-        self.msghdr.msg_iov = self.iovec.as_mut_ptr();
-        self.msghdr.msg_iovlen = 1;
+        this.msghdr.msg_name = ptr::addr_of_mut!(this.msg_name).cast();
+        this.msghdr.msg_namelen = mem::size_of::<libc::sockaddr_storage>() as _;
+        this.msghdr.msg_iov = this.iovec.as_mut_ptr();
+        this.msghdr.msg_iovlen = 1;
 
         Ok(RecvMsgView {
-            msghdr: &mut self.msghdr,
+            msghdr: &mut this.msghdr,
         })
     }
 
@@ -440,68 +301,6 @@ impl TimeoutPayload {
     pub(crate) fn new() -> Self {
         Self {
             ts: Timespec::new(),
-        }
-    }
-}
-
-pub(crate) enum UringOpPayload {
-    Read(KernelRef<ReadFixed>),
-    ReadRaw(KernelRef<ReadRaw>),
-    Write(KernelRef<WriteFixed>),
-    WriteRaw(KernelRef<WriteRaw>),
-    Recv(KernelRef<Recv>),
-    RecvProvided(KernelRef<RecvProvided>),
-    RecvMulti(KernelRef<RecvMulti>),
-    Send(KernelRef<OpSend>),
-    UdpRecv(KernelRef<UdpRecv>),
-    UdpSend(KernelRef<UdpSend>),
-    Connect(KernelRef<Connect>),
-    UdpConnect(KernelRef<UdpConnect>),
-    Close(KernelRef<Close>),
-    Fsync(KernelRef<Fsync>),
-    FsyncRaw(KernelRef<FsyncRaw>),
-    SyncRange(KernelRef<SyncFileRange>),
-    SyncRangeRaw(KernelRef<SyncFileRangeRaw>),
-    Fallocate(KernelRef<Fallocate>),
-    FallocateRaw(KernelRef<FallocateRaw>),
-    Accept(AcceptPayload),
-    AcceptMulti(KernelRef<AcceptMulti>),
-    SendTo(SendToPayload),
-    UdpRecvFrom(UdpRecvFromPayload),
-    Open(OpenPayload),
-    Wakeup(WakeupPayload),
-    Timeout(TimeoutPayload),
-}
-
-impl UringOpPayload {
-    pub(crate) const fn tag(&self) -> UringPayloadTag {
-        match self {
-            Self::Read(_) => UringPayloadTag::Read,
-            Self::ReadRaw(_) => UringPayloadTag::ReadRaw,
-            Self::Write(_) => UringPayloadTag::Write,
-            Self::WriteRaw(_) => UringPayloadTag::WriteRaw,
-            Self::Recv(_) => UringPayloadTag::Recv,
-            Self::RecvProvided(_) => UringPayloadTag::RecvProvided,
-            Self::RecvMulti(_) => UringPayloadTag::RecvMulti,
-            Self::Send(_) => UringPayloadTag::Send,
-            Self::UdpRecv(_) => UringPayloadTag::UdpRecv,
-            Self::UdpSend(_) => UringPayloadTag::UdpSend,
-            Self::Connect(_) => UringPayloadTag::Connect,
-            Self::UdpConnect(_) => UringPayloadTag::UdpConnect,
-            Self::Close(_) => UringPayloadTag::Close,
-            Self::Fsync(_) => UringPayloadTag::Fsync,
-            Self::FsyncRaw(_) => UringPayloadTag::FsyncRaw,
-            Self::SyncRange(_) => UringPayloadTag::SyncRange,
-            Self::SyncRangeRaw(_) => UringPayloadTag::SyncRangeRaw,
-            Self::Fallocate(_) => UringPayloadTag::Fallocate,
-            Self::FallocateRaw(_) => UringPayloadTag::FallocateRaw,
-            Self::Accept(_) => UringPayloadTag::Accept,
-            Self::AcceptMulti(_) => UringPayloadTag::AcceptMulti,
-            Self::SendTo(_) => UringPayloadTag::SendTo,
-            Self::UdpRecvFrom(_) => UringPayloadTag::UdpRecvFrom,
-            Self::Open(_) => UringPayloadTag::Open,
-            Self::Wakeup(_) => UringPayloadTag::Wakeup,
-            Self::Timeout(_) => UringPayloadTag::Timeout,
         }
     }
 }

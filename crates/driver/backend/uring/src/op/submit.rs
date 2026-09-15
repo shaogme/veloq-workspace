@@ -21,7 +21,7 @@ use veloq_driver_core::{
     DriverCoreError,
     driver::{CompletionCleanup, CompletionCleanupGuard, SubmitTokenContext},
 };
-use veloq_std::{io, string::ToString};
+use veloq_std::{io, pin::Pin, string::ToString};
 
 #[inline]
 fn invalid_buf_io_range(scope: &'static str, err: BufIoRangeError) -> Report<UringError> {
@@ -107,11 +107,12 @@ pub(crate) fn completion_cleanup_close_raw_fd(result: i32) -> CompletionCleanupG
 }
 
 pub(crate) unsafe fn make_sqe_timeout(
-    kernel: &mut TimeoutPayload,
+    mut kernel: Pin<&mut TimeoutPayload>,
     user: &mut Timeout,
     _env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
+    let kernel = kernel.as_mut().get_mut();
     kernel.ts = types::Timespec::new()
         .sec(user.duration.as_secs())
         .nsec(user.duration.subsec_nanos());
@@ -121,11 +122,12 @@ pub(crate) unsafe fn make_sqe_timeout(
 }
 
 pub(crate) unsafe fn make_sqe_wakeup(
-    kernel: &mut WakeupPayload,
+    mut kernel: Pin<&mut WakeupPayload>,
     user: &mut Wakeup,
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
+    let kernel = kernel.as_mut().get_mut();
     let fd = resolve_file_fd(env.file_table, user.fd, "uring.op.submit.make_sqe_wakeup")?;
     Ok(sqe_with_fd!(fd, |f| opcode::Read::new(
         f,

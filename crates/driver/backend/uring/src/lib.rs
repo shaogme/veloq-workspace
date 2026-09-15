@@ -8,6 +8,9 @@ mod error;
 mod net;
 mod op;
 
+#[cfg(test)]
+mod test_alloc;
+
 pub use config::{
     BorrowedRawHandle, BufferRegistrationMode, DirectOwnerId, FileTableExhaustion, IoFd, IoMode,
     MAX_PROVIDED_BUF_ENTRIES, OwnedRawHandle, ProvidedBufConfig, RawHandle, RawHandleKind,

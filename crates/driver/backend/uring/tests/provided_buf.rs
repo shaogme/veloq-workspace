@@ -4,7 +4,7 @@
 //! 支持的区间的一部分，不是失败。
 
 use veloq_std::{
-    any, io, mem,
+    any, io,
     num::{NonZeroU16, NonZeroU32, NonZeroUsize},
     os::fd::RawFd,
     thread,
@@ -24,7 +24,7 @@ use veloq_driver_core::{
 };
 use veloq_driver_uring::{
     IoFd, ProvidedBufConfig, RawHandle, UringConfig, UringDriver, UringOp, UringRawHandle,
-    UringSlotSpec, UringUserPayload,
+    UringSlotSpec,
 };
 
 type RecvProvided = CoreRecvProvided<UringRawHandle>;
@@ -227,13 +227,12 @@ fn take_completion(driver: &mut UringDriver<'static>, token: OpToken) -> (i32, O
                     ..
                 } = record;
                 cleanup.disarm();
-                let buf = match payload {
-                    UringUserPayload::ProvidedBuf(provided) => provided.buf,
-                    other => panic!(
-                        "a RecvProvided completion must carry a ProvidedBuf, got kind {:?}",
-                        mem::discriminant(&other)
-                    ),
-                };
+                let provided =
+                    <RecvProvided as IntoPlatformOp<UringSlotSpec>>::try_record_from_erased(
+                        payload,
+                    )
+                    .expect("a RecvProvided completion must carry a ProvidedBuf");
+                let buf = provided.buf;
                 return (event.res(), buf);
             }
             PollRecordResult::Unavailable { kind, .. } => {

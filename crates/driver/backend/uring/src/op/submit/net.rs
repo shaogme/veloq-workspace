@@ -12,12 +12,12 @@ use crate::{
 };
 use io_uring::{opcode, squeue, types};
 use veloq_driver_core::driver::SubmitTokenContext;
-use veloq_std::ptr;
+use veloq_std::{pin::Pin, ptr};
 
 use super::{invalid_buf_io_range, resolve_socket_fd, resolve_socket_fd_direct, sqe_with_fd};
 
 pub(crate) unsafe fn make_sqe_recv(
-    _kernel: &mut KernelRef<Recv>,
+    _kernel: Pin<&mut KernelRef<Recv>>,
     val: &mut Recv,
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
@@ -37,7 +37,7 @@ pub(crate) unsafe fn make_sqe_recv(
 /// Every buffer in the ring has the same capacity, so naming it costs nothing and behaves the
 /// same everywhere.
 pub(crate) unsafe fn make_sqe_recv_provided(
-    _kernel: &mut KernelRef<RecvProvided>,
+    _kernel: Pin<&mut KernelRef<RecvProvided>>,
     val: &mut RecvProvided,
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
@@ -65,7 +65,7 @@ pub(crate) unsafe fn make_sqe_recv_provided(
 /// multishot recv without buffer selection, which is why this operation exists only once a ring
 /// is registered.
 pub(crate) unsafe fn make_sqe_recv_multi(
-    _kernel: &mut KernelRef<RecvMulti>,
+    _kernel: Pin<&mut KernelRef<RecvMulti>>,
     val: &mut RecvMulti,
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
@@ -77,7 +77,7 @@ pub(crate) unsafe fn make_sqe_recv_multi(
 }
 
 pub(crate) unsafe fn make_sqe_send(
-    _kernel: &mut KernelRef<OpSend>,
+    _kernel: Pin<&mut KernelRef<OpSend>>,
     val: &mut OpSend,
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
@@ -91,7 +91,7 @@ pub(crate) unsafe fn make_sqe_send(
 }
 
 pub(crate) unsafe fn make_sqe_udp_recv(
-    _kernel: &mut KernelRef<UdpRecv>,
+    _kernel: Pin<&mut KernelRef<UdpRecv>>,
     val: &mut UdpRecv,
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
@@ -105,7 +105,7 @@ pub(crate) unsafe fn make_sqe_udp_recv(
 }
 
 pub(crate) unsafe fn make_sqe_udp_send(
-    _kernel: &mut KernelRef<UdpSend>,
+    _kernel: Pin<&mut KernelRef<UdpSend>>,
     val: &mut UdpSend,
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
@@ -119,7 +119,7 @@ pub(crate) unsafe fn make_sqe_udp_send(
 }
 
 pub(crate) unsafe fn make_sqe_connect(
-    _kernel: &mut KernelRef<Connect>,
+    _kernel: Pin<&mut KernelRef<Connect>>,
     val: &mut Connect,
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
@@ -135,7 +135,7 @@ pub(crate) unsafe fn make_sqe_connect(
 }
 
 pub(crate) unsafe fn make_sqe_udp_connect(
-    _kernel: &mut KernelRef<UdpConnect>,
+    _kernel: Pin<&mut KernelRef<UdpConnect>>,
     val: &mut UdpConnect,
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
@@ -155,7 +155,7 @@ pub(crate) unsafe fn make_sqe_udp_connect(
 }
 
 pub(crate) unsafe fn make_sqe_accept(
-    _kernel: &mut AcceptPayload,
+    _kernel: Pin<&mut AcceptPayload>,
     val: &mut Accept,
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
@@ -176,7 +176,7 @@ pub(crate) fn accepted_handle_from_res(res: UringResult<usize>) -> UringResult<O
 }
 
 pub(crate) unsafe fn make_sqe_accept_multi(
-    _kernel: &mut KernelRef<AcceptMulti>,
+    _kernel: Pin<&mut KernelRef<AcceptMulti>>,
     val: &mut AcceptMulti,
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
@@ -192,7 +192,7 @@ pub(crate) unsafe fn make_sqe_accept_multi(
 }
 
 pub(crate) unsafe fn on_complete_accept(
-    _kernel: &mut AcceptPayload,
+    _kernel: Pin<&mut AcceptPayload>,
     accept_op: &mut Accept,
     result: i32,
 ) -> UringResult<usize> {
@@ -217,7 +217,7 @@ pub(crate) unsafe fn on_complete_accept(
 }
 
 pub(crate) unsafe fn make_sqe_send_to(
-    kernel: &mut SendToPayload,
+    kernel: Pin<&mut SendToPayload>,
     user: &mut SendTo,
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
@@ -230,7 +230,7 @@ pub(crate) unsafe fn make_sqe_send_to(
 }
 
 pub(crate) unsafe fn make_sqe_udp_recv_from(
-    kernel: &mut UdpRecvFromPayload,
+    kernel: Pin<&mut UdpRecvFromPayload>,
     user: &mut UdpRecvFrom,
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
@@ -249,7 +249,7 @@ pub(crate) unsafe fn make_sqe_udp_recv_from(
 }
 
 pub(crate) unsafe fn on_complete_udp_recv_from(
-    kernel: &mut UdpRecvFromPayload,
+    kernel: Pin<&mut UdpRecvFromPayload>,
     user: &mut UdpRecvFrom,
     result: i32,
 ) -> UringResult<usize> {
@@ -262,6 +262,6 @@ pub(crate) unsafe fn on_complete_udp_recv_from(
             .set_error_code(-result));
     }
 
-    user.addr = Some(kernel.finish_recv_from()?);
+    user.addr = Some(kernel.as_ref().get_ref().finish_recv_from()?);
     Ok(result as usize)
 }

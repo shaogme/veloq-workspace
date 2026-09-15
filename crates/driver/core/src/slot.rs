@@ -6,7 +6,7 @@ use crate::{
     },
 };
 use diagweave::prelude::*;
-use veloq_std::{format, marker::PhantomData, sync::atomic::Ordering};
+use veloq_std::{format, marker::PhantomData, pin::Pin, sync::atomic::Ordering};
 
 pub trait SlotSpec {
     type Op: PlatformOp;
@@ -82,6 +82,37 @@ pub struct Slot<'a, State: SlotMarker, Spec: SlotSpec> {
     platform: &'a mut SlotPlatformData<Spec>,
     index: usize,
     _state: PhantomData<State>,
+}
+
+/// A non-owning view over the operation and its submit payload while the slot keeps both
+/// values in place.
+///
+/// The operation is pinned by the slot's stable registry storage.  This wrapper does not add an
+/// allocation or extend either borrow beyond the callback that received it.
+pub struct PinnedSlotParts<'a, Spec: SlotSpec> {
+    op: Pin<&'a mut SlotOp<Spec>>,
+    payload: &'a mut SlotPayload<Spec>,
+}
+
+impl<'a, Spec: SlotSpec> PinnedSlotParts<'a, Spec> {
+    /// Groups an already pinned operation with its submit payload.
+    ///
+    /// This constructor is useful to backend adapters and tests that already own a valid pin.
+    /// Production slot access should prefer [`Slot::with_pinned_op_and_payload_mut`] or
+    /// [`SubmissionGuard::with_pinned_op_and_payload_mut`].
+    pub fn from_parts(op: Pin<&'a mut SlotOp<Spec>>, payload: &'a mut SlotPayload<Spec>) -> Self {
+        Self { op, payload }
+    }
+
+    /// Returns a shared pinned view of the operation without moving it.
+    pub fn op_ref(&self) -> Pin<&SlotOp<Spec>> {
+        self.op.as_ref()
+    }
+
+    /// Reborrows both in-place values for one backend adapter call.
+    pub fn split_mut(&mut self) -> (Pin<&mut SlotOp<Spec>>, &mut SlotPayload<Spec>) {
+        (self.op.as_mut(), self.payload)
+    }
 }
 
 impl<'a, State: SlotMarker, Spec: SlotSpec> Slot<'a, State, Spec> {
@@ -161,6 +192,48 @@ impl<'a, State: SlotMarker, Spec: SlotSpec> Slot<'a, State, Spec> {
             self.op.as_mut().expect("checked Some above"),
             self.storage.payload.as_mut().expect("checked Some above"),
         ))
+    }
+
+    fn with_pinned_parts_mut<F, X>(&mut self, f: F) -> SlotAccessOutcome<X>
+    where
+        F: FnOnce(&mut PinnedSlotParts<'_, Spec>) -> X,
+    {
+        if self.op.is_none() {
+            return Err(self.access_error(
+                SlotAccessAction::OpPayloadMut,
+                SlotAccessErrorReason::MissingOp,
+            ));
+        }
+        if self.storage.payload.is_none() {
+            return Err(self.access_error(
+                SlotAccessAction::OpPayloadMut,
+                SlotAccessErrorReason::MissingPayload,
+            ));
+        }
+
+        let op = self.op.as_mut().expect("checked Some above");
+        let payload = self.storage.payload.as_mut().expect("checked Some above");
+        // SAFETY: the operation lives in the registry's stable slot allocation.  The returned
+        // pin is borrowed only for `f`; no slot method can take or replace the operation while
+        // that borrow is alive.
+        let op = unsafe { Pin::new_unchecked(op) };
+        let mut parts = PinnedSlotParts::from_parts(op, payload);
+        Ok(f(&mut parts))
+    }
+
+    fn with_pinned_op_mut_inner<F, X>(&mut self, f: F) -> SlotAccessOutcome<X>
+    where
+        F: FnOnce(Pin<&mut SlotOp<Spec>>) -> X,
+    {
+        if self.op.is_none() {
+            return Err(
+                self.access_error(SlotAccessAction::OpMut, SlotAccessErrorReason::MissingOp)
+            );
+        }
+        let op = self.op.as_mut().expect("checked Some above");
+        // SAFETY: see `with_pinned_parts_mut`; this borrow cannot outlive the slot access
+        // callback and the operation is stored at a stable registry address.
+        Ok(f(unsafe { Pin::new_unchecked(op) }))
     }
 }
 impl<'a, Spec: SlotSpec> Slot<'a, Reserved, Spec> {
@@ -266,6 +339,22 @@ impl<'a, Spec: SlotSpec> Slot<'a, InFlightWaiting, Spec> {
         self.op_mut().map(f)
     }
 
+    /// Runs a callback with the in-flight operation pinned beside its submit payload.
+    pub fn with_pinned_op_and_payload_mut<F, X>(&mut self, f: F) -> SlotAccessOutcome<X>
+    where
+        F: FnOnce(&mut PinnedSlotParts<'_, Spec>) -> X,
+    {
+        self.with_pinned_parts_mut(f)
+    }
+
+    /// Runs a callback with only the in-flight operation pinned.
+    pub fn with_pinned_op_mut<F, X>(&mut self, f: F) -> SlotAccessOutcome<X>
+    where
+        F: FnOnce(Pin<&mut SlotOp<Spec>>) -> X,
+    {
+        self.with_pinned_op_mut_inner(f)
+    }
+
     pub fn op_mut(&mut self) -> SlotAccessOutcome<&mut SlotOp<Spec>> {
         if self.op.is_none() {
             return Err(
@@ -341,6 +430,14 @@ impl<'a, Spec: SlotSpec> Slot<'a, InFlightOrphaned, Spec> {
         }
         Ok(f(self.op.as_mut().expect("checked Some above")))
     }
+
+    /// Runs orphan cleanup with the in-flight operation pinned in the slot.
+    pub fn with_pinned_op_mut<F, X>(&mut self, f: F) -> SlotAccessOutcome<X>
+    where
+        F: FnOnce(Pin<&mut SlotOp<Spec>>) -> X,
+    {
+        self.with_pinned_op_mut_inner(f)
+    }
 }
 
 type SubmissionRollback<'a, Spec> = fn(&mut Slot<'a, Reserved, Spec>);
@@ -352,6 +449,17 @@ pub struct SubmissionGuard<'a, Spec: SlotSpec> {
 }
 
 impl<'a, Spec: SlotSpec> SubmissionGuard<'a, Spec> {
+    /// Runs a submission callback while the operation and submit payload remain pinned in place.
+    pub fn with_pinned_op_and_payload_mut<F, X>(&mut self, f: F) -> SlotAccessOutcome<X>
+    where
+        F: FnOnce(&mut PinnedSlotParts<'_, Spec>) -> X,
+    {
+        self.slot
+            .as_mut()
+            .expect("submission guard slot missing before persist")
+            .with_pinned_parts_mut(f)
+    }
+
     pub fn persist(mut self) -> Slot<'a, InFlightWaiting, Spec> {
         self.persisted = true;
         let slot = self
@@ -814,5 +922,49 @@ mod tests {
 
         assert_eq!(token.index(), 0);
         assert_eq!(token.generation(), Generation::new(3));
+    }
+
+    #[test]
+    fn pinned_slot_access_preserves_operation_address_until_drain() {
+        let mut registry = OpRegistry::<DummySlotSpec>::new(1);
+        let handle = registry.alloc(()).expect("slot allocation failed").handle;
+        let token = OpToken::from_registry_parts(handle.index, handle.generation)
+            .expect("test handle should be encodable");
+
+        registry
+            .with_slot_storage_mut(token, |_result, payload, _sidecar| {
+                *payload = Some(());
+            })
+            .expect("slot storage should exist");
+        let mut slot = match registry.checked_slot_view(token).unwrap() {
+            CheckedSlotView::Valid(SlotView::Reserved(slot)) => slot
+                .init_op_with(DummyPlatformOp, |_| {})
+                .expect("reserved slot should accept op"),
+            _ => panic!("reserved slot should be available"),
+        };
+        let reserved_address = slot
+            .with_op_mut(|op| op as *mut DummyPlatformOp as usize)
+            .expect("reserved operation should exist");
+
+        let mut submission = slot
+            .start_submission_with(None)
+            .expect("reserved slot should start submission");
+        let pinned_address = submission
+            .with_pinned_op_and_payload_mut(|parts| {
+                parts.op_ref().get_ref() as *const DummyPlatformOp as usize
+            })
+            .expect("pinned submission access should succeed");
+        assert_eq!(pinned_address, reserved_address);
+
+        let mut in_flight = submission.persist();
+        let waiting_address = in_flight
+            .with_pinned_op_mut(|op| op.as_ref().get_ref() as *const DummyPlatformOp as usize)
+            .expect("pinned completion access should succeed");
+        assert_eq!(waiting_address, reserved_address);
+
+        let mut draining = in_flight.complete();
+        let _ = draining
+            .take_op()
+            .expect("draining should take the operation");
     }
 }

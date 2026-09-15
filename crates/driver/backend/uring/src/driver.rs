@@ -229,10 +229,10 @@ impl<'a> UringDriver<'a> {
                     .with_op_mut(|op| op.is_provided_multishot())
                     .unwrap_or(true),
                 CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => slot
-                    .with_op_mut(|op| op.is_provided_multishot())
+                    .with_pinned_op_mut(|op| op.as_ref().get_ref().is_provided_multishot())
                     .unwrap_or(true),
                 CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot)) => slot
-                    .with_op_mut(|op| op.is_provided_multishot())
+                    .with_pinned_op_mut(|op| op.as_ref().get_ref().is_provided_multishot())
                     .unwrap_or(true),
                 CheckedSlotView::Empty(_)
                 | CheckedSlotView::Missing { .. }
@@ -698,7 +698,7 @@ impl<'a> DriverRaw for UringDriver<'a> {
             );
         };
         let op: UringOp = op;
-        let strategy = op.vtable().strategy;
+        let strategy = op.descriptor().strategy;
 
         match strategy {
             SubmissionStrategy::SubmitSqe => self.submit_sqe_internal(token, op, op_in),

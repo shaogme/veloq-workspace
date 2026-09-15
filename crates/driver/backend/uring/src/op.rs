@@ -1,24 +1,21 @@
 //! io_uring Platform-Specific Operation Definitions
 
-use crate::{
-    diagnostics::UringCompletionDiagnostics,
-    driver::{CqeEnv, SqeEnv, UringOpState},
-    error::{UringError, UringResult},
-};
-use io_uring::squeue;
-use veloq_buf::heap::ChunkId;
+use crate::{diagnostics::UringCompletionDiagnostics, driver::UringOpState, error::UringError};
 use veloq_driver_core::{
-    driver::{
-        CompletionCleanupGuard, OpToken, PlatformOp, SubmitTokenContext,
-        registry::OpRegistry as CoreOpRegistry,
-    },
+    driver::{CompletionCleanupGuard, PlatformOp, registry::OpRegistry as CoreOpRegistry},
     slot::{Slot as CoreSlot, SlotSpec as CoreSlotSpec},
 };
-use veloq_std::time::Duration;
+use veloq_std::pin::Pin;
 
+mod descriptor;
 mod payload;
 mod spec;
 mod submit;
+
+pub(crate) use descriptor::{
+    CompletionCardinality, CompletionCleanupHintFn, ErasedOperationDescriptor, OperationDescriptor,
+    RecordPolicy, UringRecordItem,
+};
 
 pub use payload::UringUserPayload;
 pub(crate) use payload::{
@@ -27,75 +24,9 @@ pub(crate) use payload::{
     SyncFileRange, SyncFileRangeRaw, Timeout, UdpConnect, UdpRecv, UdpRecvFrom, UdpSend, Wakeup,
     WriteFixed, WriteRaw,
 };
-pub(crate) use payload::{UringOpPayload, UringPayloadTag};
-
-pub(crate) use spec::UringOpErasure;
+pub(crate) use spec::{UringKernelPayloadStorage, UringOperationDescriptor};
 
 pub(crate) use submit::sqe_with_fd;
-
-// ============================================================================
-// VTable Definition
-// ============================================================================
-
-/// Builds the SQE for one operation.
-///
-/// `env` is deliberately narrower than `&mut UringDriver`: the op and payload handed in are
-/// borrowed out of the driver's slot registry, so an implementation that could reach the
-/// registry again would alias them.
-pub(crate) type MakeSqeFn = unsafe fn(
-    op: &mut UringKernelOp,
-    payload: &mut UringUserPayload,
-    env: &SqeEnv<'_>,
-    token: SubmitTokenContext,
-) -> UringResult<squeue::Entry>;
-pub(crate) type OnCompleteFn = unsafe fn(
-    op: &mut UringKernelOp,
-    payload: &mut UringUserPayload,
-    token: OpToken,
-    result: i32,
-) -> UringResult<usize>;
-pub(crate) type CompletionCleanupFn =
-    unsafe fn(op: &mut UringKernelOp, result: i32) -> UringResult<CompletionCleanupGuard>;
-pub(crate) type CompletionCleanupHintFn = fn(result: i32) -> CompletionCleanupGuard;
-pub(crate) type OrphanCleanupFn =
-    unsafe fn(op: &mut UringKernelOp, result: i32) -> UringResult<CompletionCleanupGuard>;
-pub(crate) type GetTimeoutFn = unsafe fn(
-    op: &UringKernelOp,
-    payload: &UringUserPayload,
-    token: OpToken,
-) -> UringResult<Option<Duration>>;
-pub(crate) type ResolveChunksFn = unsafe fn(
-    op: &UringKernelOp,
-    payload: &UringUserPayload,
-    token: OpToken,
-    chunks: &mut [ChunkId],
-) -> UringResult<usize>;
-
-pub(crate) enum UringRecordItem {
-    UseSubmitPayload,
-    New(UringUserPayload),
-}
-
-/// 为一条完成构造它自己的记录 payload。
-///
-/// 返回 [`UringRecordItem::UseSubmitPayload`] 表示这个操作的记录 payload **就是**提交
-/// payload——绝大多数操作如此，完成路径照旧把 slot 里那个取走。返回
-/// [`UringRecordItem::New`] 表示两者不是一回事：
-///
-/// - multishot（`AcceptMulti`）：提交 payload 是监听 socket，必须留在 slot 里给内核后续
-///   的完成用，每条完成的产物是一个新连接；
-/// - provided buffer（`RecvProvided`）：提交时根本没有 buffer，它由内核在数据到达时才从
-///   环里挑一个，所以产物只能在这里构造。
-///
-/// `env` 就是为后一种情形存在的：从环里取 buffer 要改 driver 的状态。
-pub(crate) type RecordItemFn = unsafe fn(
-    op: &mut UringKernelOp,
-    payload: &mut UringUserPayload,
-    token: OpToken,
-    result: i32,
-    flags: u32,
-    env: &mut CqeEnv<'_>,
-) -> UringResult<UringRecordItem>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SubmissionStrategy {
@@ -105,30 +36,16 @@ pub(crate) enum SubmissionStrategy {
     SoftwareTimer,
 }
 
-pub(crate) struct OpVTable {
-    pub(crate) operation_name: &'static str,
-    pub(crate) make_sqe: MakeSqeFn,
-    pub(crate) on_complete: OnCompleteFn,
-    pub(crate) completion_cleanup: CompletionCleanupFn,
-    pub(crate) completion_cleanup_hint: Option<CompletionCleanupHintFn>,
-    pub(crate) orphan_cleanup: OrphanCleanupFn,
-    pub(crate) strategy: SubmissionStrategy,
-    pub(crate) get_timeout: GetTimeoutFn,
-    pub(crate) resolve_chunks: ResolveChunksFn,
-    pub(crate) record_item: RecordItemFn,
-}
-
 // ============================================================================
 // UringKernelOp Struct & Payload (Type-Erased)
 // ============================================================================
 
-#[repr(C)]
 pub struct UringKernelOp {
-    /// Virtual Table for dynamic dispatch
-    vtable: &'static OpVTable,
+    /// Static descriptor used for all runtime dispatch.
+    descriptor: &'static ErasedOperationDescriptor,
 
     /// Type-erased payload (kernel-side data)
-    payload: UringOpPayload,
+    payload: UringKernelPayloadStorage,
 }
 
 impl PlatformOp for UringKernelOp {
@@ -136,79 +53,79 @@ impl PlatformOp for UringKernelOp {
 
     #[inline]
     fn completion_cleanup(&mut self, result: Self::CleanupContext<'_>) -> CompletionCleanupGuard {
-        match self.completion_cleanup_checked(result) {
-            Ok(cleanup) => cleanup,
-            Err(report) => {
-                tracing::error!(
-                    operation = self.vtable.operation_name,
-                    report = ?report,
-                    "uring completion cleanup projection mismatch"
-                );
-                CompletionCleanupGuard::default()
-            }
-        }
+        (self.descriptor.completion_cleanup)(result)
     }
 
     #[inline]
     fn orphan_cleanup(&mut self, result: Self::CleanupContext<'_>) -> CompletionCleanupGuard {
-        match self.orphan_cleanup_checked(result) {
-            Ok(cleanup) => cleanup,
-            Err(report) => {
-                tracing::error!(
-                    operation = self.vtable.operation_name,
-                    report = ?report,
-                    "uring orphan cleanup projection mismatch"
-                );
-                CompletionCleanupGuard::default()
-            }
-        }
+        (self.descriptor.orphan_cleanup)(result)
     }
 }
 
 impl UringKernelOp {
-    /// Constructs a type-erased operation with its vtable and kernel payload paired together.
+    /// Constructs a type-erased operation with its descriptor and kernel payload paired together.
     #[inline]
     pub(crate) fn new<S>(kernel_payload: S::KernelPayload) -> Self
     where
-        S: UringOpErasure,
+        S: UringOperationDescriptor,
     {
+        let descriptor = S::descriptor();
         Self {
-            vtable: S::vtable(),
-            payload: S::erase_kernel_payload(kernel_payload),
+            descriptor: &descriptor.erased,
+            payload: (descriptor.encode_kernel)(kernel_payload),
         }
     }
 
     #[inline]
-    pub(crate) fn vtable(&self) -> &'static OpVTable {
-        self.vtable
+    pub(crate) fn descriptor(&self) -> &'static ErasedOperationDescriptor {
+        self.descriptor
     }
 
     #[inline]
-    pub(crate) fn completion_cleanup_checked(
-        &mut self,
-        result: i32,
-    ) -> UringResult<CompletionCleanupGuard> {
-        unsafe { (self.vtable.completion_cleanup)(self, result) }
+    pub(crate) fn completion_cleanup(&mut self, result: i32) -> CompletionCleanupGuard {
+        (self.descriptor.completion_cleanup)(result)
     }
 
     #[inline]
-    pub(crate) fn orphan_cleanup_checked(
-        &mut self,
-        result: i32,
-    ) -> UringResult<CompletionCleanupGuard> {
-        unsafe { (self.vtable.orphan_cleanup)(self, result) }
+    pub(crate) fn orphan_cleanup(&mut self, result: i32) -> CompletionCleanupGuard {
+        (self.descriptor.orphan_cleanup)(result)
     }
 
-    /// Replaces the vtable with an intentionally mismatched one for projection tests only.
+    #[inline]
+    pub(crate) fn completion_cleanup_pinned(
+        self: Pin<&mut Self>,
+        result: i32,
+    ) -> CompletionCleanupGuard {
+        // SAFETY: the pinned receiver remains in the slot for this callback and this method only
+        // reads its descriptor pointer; it never moves the operation or its payload.
+        let this = unsafe { self.get_unchecked_mut() };
+        this.completion_cleanup(result)
+    }
+
+    #[inline]
+    pub(crate) fn orphan_cleanup_pinned(
+        self: Pin<&mut Self>,
+        result: i32,
+    ) -> CompletionCleanupGuard {
+        // SAFETY: see `completion_cleanup_pinned`.
+        let this = unsafe { self.get_unchecked_mut() };
+        this.orphan_cleanup(result)
+    }
+
+    /// Replaces the descriptor with an intentionally mismatched one for projection tests only.
     #[cfg(test)]
-    pub(crate) fn with_vtable_for_test(mut self, vtable: &'static OpVTable) -> Self {
-        self.vtable = vtable;
+    pub(crate) fn with_descriptor_for_test(
+        mut self,
+        descriptor: &'static ErasedOperationDescriptor,
+    ) -> Self {
+        self.descriptor = descriptor;
         self
     }
 
     #[inline]
     pub(crate) fn is_provided_multishot(&self) -> bool {
-        matches!(self.payload, UringOpPayload::RecvMulti(_))
+        self.descriptor.cardinality == CompletionCardinality::Multi
+            && self.descriptor.record_policy == RecordPolicy::NewProvidedBuffer
     }
 }
 

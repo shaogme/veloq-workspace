@@ -3,18 +3,17 @@ x-app-base: &app-base
   image: ghcr.io/shaogme/coding-images/qemu-rust-cross:latest
   privileged: true
   environment:
-    - ROOT_PASSWORD=root # Set your secure password here
     - DEVBOX_AUTO_INIT=${DEVBOX_AUTO_INIT:-0} # Auto-initialize devbox.json if not present
-    - HOST_UID=${HOST_UID:-1000:1000} # Adaptive UID/GID mapping to avoid file permission conflicts
+    - HOST_UID # Set HOST_UID=host_uid[:host_gid] explicitly; otherwise infer the mounted workspace owner
     - CONTAINER_HOME=${CONTAINER_HOME:-/home/dev} # Default to /home/dev, override with /root for root user
     - CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-0} # Disabled by default for sccache caching compatibility
     - CARGO_TARGET_DIR=/data/.cargo/target # Isolate Rust target directory to persistent data volume
-    - RUSTC_WRAPPER=${RUSTC_WRAPPER:-sccache} # Enable sccache compiler wrapper by default
-    - SCCACHE_DIR=/data/sccache # Directory for sccache compiler cache storage
+    - SCCACHE_DIR=/data/cache/sccache # Directory for sccache compiler cache storage
     - SCCACHE_DISABLE=${SCCACHE_DISABLE:-0} # Set to 1 to explicitly disable sccache (also supports ENABLE_SCCACHE=0)
     - CROSS_CONTAINER_ENGINE=podman # Direct cross to use containerized Podman engine
+  cgroup: host # Share host cgroup namespace for in-container container execution
   security_opt:
-    - seccomp:unconfined # Required for VM, inner container execution and trace
+    - seccomp:unconfined # Required for inner container execution and trace
     - label:disable # Disable SELinux labeling separation for containers
   cap_add:
     - SYS_ADMIN
@@ -44,8 +43,8 @@ services:
       # Persist Cargo dependencies, crate index, and git checkouts
       - cargo-registry:${CONTAINER_HOME:-/home/dev}/.cargo/registry
       - cargo-git:${CONTAINER_HOME:-/home/dev}/.cargo/git
-      # Persist sccache compiler cache
-      - sccache-cache:/data/sccache
+      # Persist cache
+      - cache:/data/cache
       # Persist Podman containers and cached cross-compilation toolchain images
       - podman-containers:/var/lib/containers
       # Persist devbox data
@@ -58,7 +57,7 @@ volumes:
   rust-target:
   cargo-registry:
   cargo-git:
-  sccache-cache:
+  cache:
   podman-containers:
   devbox-data:
   coding-config:

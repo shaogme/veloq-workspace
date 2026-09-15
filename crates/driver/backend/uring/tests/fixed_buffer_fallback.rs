@@ -184,11 +184,31 @@ fn wait_completion(
     }
 }
 
-fn take_read_completion(
+fn payload_is<T>(payload: UringUserPayload) -> bool
+where
+    T: IntoPlatformOp<UringSlotSpec>,
+{
+    T::try_record_from_erased(payload).is_ok()
+}
+
+fn assert_payload<T>(payload: Option<UringUserPayload>)
+where
+    T: IntoPlatformOp<UringSlotSpec>,
+{
+    let Some(payload) = payload else {
+        panic!("payload should be recoverable after void failure");
+    };
+    assert!(payload_is::<T>(payload));
+}
+
+fn take_read_completion<T>(
     driver: &mut UringDriver<'static>,
     token: OpToken,
-    expected_variant: fn(&UringUserPayload) -> bool,
-) -> (usize, FixedBuf) {
+    take_buffer: fn(T) -> FixedBuf,
+) -> (usize, FixedBuf)
+where
+    T: IntoPlatformOp<UringSlotSpec, SubmitPayload = T, RecordPayload = T, Output = T>,
+{
     let record = wait_completion(driver, token);
     let CompletionRecord {
         event,
@@ -197,27 +217,16 @@ fn take_read_completion(
         ..
     } = record;
     cleanup.disarm();
-    assert!(
-        expected_variant(&payload),
-        "unexpected read payload variant"
-    );
-    let buf = match payload {
-        UringUserPayload::ReadFixed(op) => op.buf,
-        UringUserPayload::ReadRaw(op) => op.buf,
-        other => panic!(
-            "unexpected read payload: {:?}",
-            core::mem::discriminant(&other)
-        ),
-    };
+    let payload = T::try_record_from_erased(payload).expect("unexpected read payload type");
+    let buf = take_buffer(payload);
     let result = usize::from_event_res::<UringError>(event.res()).expect("read completion");
     (result, buf)
 }
 
-fn take_write_completion(
-    driver: &mut UringDriver<'static>,
-    token: OpToken,
-    expected_variant: fn(&UringUserPayload) -> bool,
-) -> usize {
+fn take_write_completion<T>(driver: &mut UringDriver<'static>, token: OpToken) -> usize
+where
+    T: IntoPlatformOp<UringSlotSpec, SubmitPayload = T, RecordPayload = T, Output = T>,
+{
     let record = wait_completion(driver, token);
     let CompletionRecord {
         event,
@@ -226,14 +235,7 @@ fn take_write_completion(
         ..
     } = record;
     cleanup.disarm();
-    assert!(
-        expected_variant(&payload),
-        "unexpected write payload variant"
-    );
-    assert!(matches!(
-        payload,
-        UringUserPayload::WriteFixed(_) | UringUserPayload::WriteRaw(_)
-    ));
+    let _payload = T::try_record_from_erased(payload).expect("unexpected write payload type");
     usize::from_event_res::<UringError>(event.res()).expect("write completion")
 }
 
@@ -291,10 +293,7 @@ fn strict_mode_rejects_registration_failure_and_recovers_payload() {
         DriverSubmitResult::Submitted(_) => panic!("strict registration failure was submitted"),
     }
 
-    assert!(matches!(
-        slot.recover_payload(),
-        Some(UringUserPayload::ReadFixed(_))
-    ));
+    assert_payload::<ReadFixed>(slot.recover_payload());
 }
 
 #[test]
@@ -336,10 +335,7 @@ fn compatible_mode_rejects_unknown_update_instead_of_falling_back() {
         DriverSubmitResult::Submitted(_) => panic!("unknown update must not be submitted"),
     }
 
-    assert!(matches!(
-        slot.recover_payload(),
-        Some(UringUserPayload::ReadFixed(_))
-    ));
+    assert_payload::<ReadFixed>(slot.recover_payload());
     let hooks = &driver as &dyn DriverTestHooks;
     assert_eq!(hooks.debug_chunk_register_attempts(), 1);
     assert_eq!(hooks.debug_chunk_register_failures(), 1);
@@ -385,10 +381,7 @@ fn bitset_failure_clears_kernel_slot_before_returning_error() {
         DriverSubmitResult::Submitted(_) => panic!("bitset failure was submitted"),
     }
 
-    assert!(matches!(
-        slot.recover_payload(),
-        Some(UringUserPayload::ReadFixed(_))
-    ));
+    assert_payload::<ReadFixed>(slot.recover_payload());
     let hooks = &driver as &dyn DriverTestHooks;
     assert!(!hooks.debug_chunk_registered(0));
     assert_eq!(hooks.debug_chunk_register_attempts(), 1);
@@ -434,10 +427,7 @@ fn failed_bitset_cleanup_quarantines_the_fixed_buffer_registry() {
         }
         DriverSubmitResult::Submitted(_) => panic!("quarantine trigger was submitted"),
     }
-    assert!(matches!(
-        slot.recover_payload(),
-        Some(UringUserPayload::ReadFixed(_))
-    ));
+    assert_payload::<ReadFixed>(slot.recover_payload());
 
     let (kernel, payload) = <ReadFixed as IntoPlatformOp<UringSlotSpec>>::into_kernel_and_payload(
         fixed_read(buffers.pop().expect("second quarantine buffer"), fd),
@@ -455,10 +445,7 @@ fn failed_bitset_cleanup_quarantines_the_fixed_buffer_registry() {
         }
         DriverSubmitResult::Submitted(_) => panic!("quarantined registry submitted I/O"),
     }
-    assert!(matches!(
-        slot.recover_payload(),
-        Some(UringUserPayload::ReadFixed(_))
-    ));
+    assert_payload::<ReadFixed>(slot.recover_payload());
     let hooks = &driver as &dyn DriverTestHooks;
     assert!(!hooks.debug_chunk_registered(0));
     assert_eq!(hooks.debug_chunk_register_attempts(), 1);
@@ -486,9 +473,8 @@ fn compatible_mode_falls_back_for_fixed_read_and_respects_cooldown() {
     };
 
     let first = submit(&mut driver, fixed_read(buffers.pop().unwrap(), fd));
-    let (read, read_buf) = take_read_completion(&mut driver, first, |payload| {
-        matches!(payload, UringUserPayload::ReadFixed(_))
-    });
+    let (read, read_buf) =
+        take_read_completion::<ReadFixed>(&mut driver, first, |payload| payload.buf);
     assert_eq!(read, b"compatible-read".len());
     assert_eq!(&read_buf.as_slice()[..read], b"compatible-read");
 
@@ -503,9 +489,8 @@ fn compatible_mode_falls_back_for_fixed_read_and_respects_cooldown() {
     };
 
     let second = submit(&mut driver, fixed_read(buffers.pop().unwrap(), fd));
-    let (read, read_buf) = take_read_completion(&mut driver, second, |payload| {
-        matches!(payload, UringUserPayload::ReadFixed(_))
-    });
+    let (read, read_buf) =
+        take_read_completion::<ReadFixed>(&mut driver, second, |payload| payload.buf);
     assert_eq!(read, b"compatible-read".len());
     assert_eq!(&read_buf.as_slice()[..read], b"compatible-read");
 
@@ -545,9 +530,7 @@ fn compatible_mode_falls_back_for_fixed_write() {
     }
 
     let token = submit(&mut driver, fixed_write(buffers.pop().unwrap(), fd));
-    let written = take_write_completion(&mut driver, token, |payload| {
-        matches!(payload, UringUserPayload::WriteFixed(_))
-    });
+    let written = take_write_completion::<WriteFixed>(&mut driver, token);
     assert_eq!(written, b"compatible-write".len());
 
     let mut check = File::open(_file_path.path()).expect("reopen written file");
@@ -583,9 +566,8 @@ fn compatible_mode_backlog_retry_preserves_raw_fallback() {
         &mut driver,
         fixed_read(buffers.pop().expect("backlog read buffer"), fd),
     );
-    let (read, read_buf) = take_read_completion(&mut driver, token, |payload| {
-        matches!(payload, UringUserPayload::ReadFixed(_))
-    });
+    let (read, read_buf) =
+        take_read_completion::<ReadFixed>(&mut driver, token, |payload| payload.buf);
     assert_eq!(read, b"compatible-backlog".len());
     assert_eq!(&read_buf.as_slice()[..read], b"compatible-backlog");
 
@@ -624,9 +606,8 @@ fn compatible_mode_accepts_raw_read_and_write_entries() {
             buf_offset: 0,
         },
     );
-    let (read, read_buf) = take_read_completion(&mut driver, read, |payload| {
-        matches!(payload, UringUserPayload::ReadRaw(_))
-    });
+    let (read, read_buf) =
+        take_read_completion::<ReadRaw>(&mut driver, read, |payload| payload.buf);
     assert_eq!(read, b"raw-read".len());
     assert_eq!(&read_buf.as_slice()[..read], b"raw-read");
 
@@ -639,8 +620,6 @@ fn compatible_mode_accepts_raw_read_and_write_entries() {
             buf_offset: 0,
         },
     );
-    let written = take_write_completion(&mut driver, write, |payload| {
-        matches!(payload, UringUserPayload::WriteRaw(_))
-    });
+    let written = take_write_completion::<WriteRaw>(&mut driver, write);
     assert_eq!(written, b"raw-write".len());
 }

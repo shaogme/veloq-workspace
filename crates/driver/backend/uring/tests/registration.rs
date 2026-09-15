@@ -23,7 +23,7 @@ use veloq_driver_core::op::{
 };
 use veloq_driver_uring::{
     FileTableExhaustion, IoFd, OwnedRawHandle, RawHandle, UringConfig, UringDriver, UringError,
-    UringOp, UringRawHandle, UringResult, UringSlotSpec, UringUserPayload,
+    UringOp, UringRawHandle, UringResult, UringSlotSpec,
 };
 
 type Close = CoreClose<UringRawHandle>;
@@ -152,7 +152,9 @@ fn assert_fsync_is_rejected_with(
 
     let recovered = slot.recover_payload();
     assert!(
-        matches!(recovered, Some(UringUserPayload::Fsync(_))),
+        recovered.is_some_and(|payload| {
+            <Fsync as IntoPlatformOp<UringSlotSpec>>::try_record_from_erased(payload).is_ok()
+        }),
         "payload should be recoverable after void failure"
     );
 }
@@ -186,7 +188,9 @@ fn assert_close_is_rejected_with(
 
     let recovered = slot.recover_payload();
     assert!(
-        matches!(recovered, Some(UringUserPayload::Close(_))),
+        recovered.is_some_and(|payload| {
+            <Close as IntoPlatformOp<UringSlotSpec>>::try_record_from_erased(payload).is_ok()
+        }),
         "payload should be recoverable after void failure"
     );
 }
@@ -1124,7 +1128,9 @@ fn close_borrowed_registered_file_is_rejected() {
 
     let recovered = slot.recover_payload();
     assert!(
-        matches!(recovered, Some(UringUserPayload::Close(_))),
+        recovered.is_some_and(|payload| {
+            <Close as IntoPlatformOp<UringSlotSpec>>::try_record_from_erased(payload).is_ok()
+        }),
         "payload should be recoverable after void failure"
     );
 

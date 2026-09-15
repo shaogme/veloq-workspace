@@ -59,20 +59,15 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
 
     pub(crate) fn submit(mut self) -> UringResult<bool> {
         let user_data = self.token.index();
-        let slot = self
+        let strategy = self
             .slot_guard
             .as_mut()
-            .and_then(|g| g.slot.as_mut())
             .ok_or_else(|| {
                 UringError::InvalidState
-                    .report("driver.submit_txn.submit", "submission guard slot missing")
-            })?;
-
-        let strategy = slot
-            .op_mut()
-            .map_err(|err| slot_access_report("driver.submit_txn.strategy", err))?
-            .vtable()
-            .strategy;
+                    .report("driver.submit_txn.submit", "submission guard missing")
+            })?
+            .with_pinned_op_and_payload_mut(|parts| parts.op_ref().get_ref().descriptor().strategy)
+            .map_err(|err| slot_access_report("driver.submit_txn.strategy", err))?;
 
         match strategy {
             SubmissionStrategy::SubmitSqe => {
@@ -80,34 +75,40 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                 let (count, sqe, completion_token, cleanup_hint) = {
                     let sqe_env = self.env.sqe_env();
                     let token = self.token;
-                    slot.with_op_and_payload_mut(|op, payload| {
-                        let vtable = op.vtable();
-                        let count =
-                            unsafe { (vtable.resolve_chunks)(op, payload, token, &mut chunks) }?;
-                        super::validate_resolved_chunk_count(
-                            count,
-                            chunks.len(),
-                            "driver.submit_txn.resolve_chunks",
-                        )?;
-                        let completion_token = CompletionToken::user(token);
-                        let sqe = unsafe {
-                            (vtable.make_sqe)(
-                                op,
-                                payload,
-                                &sqe_env,
-                                SubmitTokenContext::new(token, completion_token),
-                            )
-                            .attach_note("driver.submit_txn.make_sqe")?
-                            .user_data(completion_token.raw())
-                        };
-                        Ok::<_, Report<UringError>>((
-                            count,
-                            sqe,
-                            completion_token,
-                            vtable.completion_cleanup_hint,
-                        ))
-                    })
-                    .map_err(|err| slot_access_report("driver.submit_txn.op_payload", err))??
+                    let guard = self.slot_guard.as_mut().ok_or_else(|| {
+                        UringError::InvalidState.report(
+                            "driver.submit_txn.submit_sqe",
+                            "submission guard missing before SQE build",
+                        )
+                    })?;
+                    guard
+                        .with_pinned_op_and_payload_mut(|parts| {
+                            let descriptor = parts.op_ref().get_ref().descriptor();
+                            let count =
+                                unsafe { (descriptor.resolve_chunks)(parts, token, &mut chunks) }?;
+                            super::validate_resolved_chunk_count(
+                                count,
+                                chunks.len(),
+                                "driver.submit_txn.resolve_chunks",
+                            )?;
+                            let completion_token = CompletionToken::user(token);
+                            let sqe = unsafe {
+                                (descriptor.make_sqe)(
+                                    parts,
+                                    &sqe_env,
+                                    SubmitTokenContext::new(token, completion_token),
+                                )
+                                .attach_note("driver.submit_txn.make_sqe")?
+                                .user_data(completion_token.raw())
+                            };
+                            Ok::<_, Report<UringError>>((
+                                count,
+                                sqe,
+                                completion_token,
+                                descriptor.completion_cleanup_hint,
+                            ))
+                        })
+                        .map_err(|err| slot_access_report("driver.submit_txn.op_payload", err))??
                 };
 
                 for &chunk_id in chunks.iter().take(count) {
@@ -125,6 +126,16 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                 } else {
                     SubmissionPhase::Reserved
                 };
+                let slot = self
+                    .slot_guard
+                    .as_mut()
+                    .and_then(|guard| guard.slot.as_mut())
+                    .ok_or_else(|| {
+                        UringError::InvalidState.report(
+                            "driver.submit_txn.submit_sqe",
+                            "submission guard missing after SQE build",
+                        )
+                    })?;
                 self.env.transition_submission_state(
                     self.token,
                     &mut slot.platform_mut().control.submission,
@@ -150,10 +161,17 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                 Ok(pushed)
             }
             SubmissionStrategy::SoftwareTimer => {
-                let duration_opt = slot
-                    .with_op_and_payload_mut(|op, payload| {
-                        let vtable = op.vtable();
-                        unsafe { (vtable.get_timeout)(op, payload, self.token) }
+                let duration_opt = self
+                    .slot_guard
+                    .as_mut()
+                    .ok_or_else(|| {
+                        UringError::InvalidState.report(
+                            "driver.submit_txn.timer",
+                            "submission guard missing before timer dispatch",
+                        )
+                    })?
+                    .with_pinned_op_and_payload_mut(|parts| unsafe {
+                        (parts.op_ref().get_ref().descriptor().get_timeout)(parts, self.token)
                     })
                     .map_err(|err| {
                         slot_access_report("driver.submit_txn.timer.op_payload", err)
@@ -167,6 +185,16 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                 self.timer_inserted = Some(task_id);
                 self.env.record_timer_insert(self.token, task_id);
 
+                let slot = self
+                    .slot_guard
+                    .as_mut()
+                    .and_then(|guard| guard.slot.as_mut())
+                    .ok_or_else(|| {
+                        UringError::InvalidState.report(
+                            "driver.submit_txn.timer",
+                            "submission guard missing after timer dispatch",
+                        )
+                    })?;
                 let platform = slot.platform_mut();
                 platform.timer_id = Some(task_id);
                 self.env.transition_submission_state(

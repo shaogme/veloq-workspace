@@ -1,6 +1,8 @@
 pub mod traits;
 use traits::*;
 
+pub use veloq_tls::{Tls, TlsError, TlsErrorKind, veloq_tls};
+
 mod panic_state;
 pub use panic_state::{PanicState, PanicStateGuard, enter_panicking, panic_state};
 
