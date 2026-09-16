@@ -1,5 +1,5 @@
 use crate::{
-    DriverError, DriverResult,
+    DriverCoreError, DriverError, DriverResult,
     driver::registry::OpRegistry,
     slot::{
         InFlightOrphaned, InFlightWaiting, Slot, SlotCompletion, SlotCompletionDiagnostics,
@@ -15,7 +15,7 @@ use super::{
     DriverCompletionDiagnosticsBackend, RawCompletion, RecordCompletionOutcome,
     RecordCompletionResult, RoutedSlotCompletion, SharedCompletionTable, UserCompletionEvent,
     dispatch_envelope, finalize_orphaned_checked, finalize_waiting_checked, route_user_completion,
-    run_completion_cleanup, run_rejected_cleanup,
+    run_rejected_cleanup,
 };
 
 pub type HookResult<Spec, T> = DriverResult<T, SlotError<Spec>>;
@@ -73,7 +73,72 @@ pub enum CompletionControl {
     },
 }
 
-pub enum CompletionHookOutcome<Spec, Effect>
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionSlotDisposition {
+    /// The slot has reached a final state and may be removed from the registry.
+    Finalized,
+    /// The operation may still produce a completion and must remain addressable.
+    Retained,
+    /// The completion path failed while the kernel may still reference the operation.
+    Quarantined,
+    /// The settlement belongs to a control or diagnostic event, not to a slot.
+    NotApplicable,
+}
+
+/// Error and ownership information for a completion that could not be published normally.
+///
+/// A backend must return this value after a CQE has been consumed.  In particular, returning a
+/// bare `Err` is not sufficient because the core would no longer know whether the operation may
+/// be finalized or must remain addressable for a later `MORE` completion.
+pub struct CompletionFailure<Spec: SlotSpec, Effect> {
+    pub error: Report<SlotError<Spec>>,
+    pub cleanup: CompletionCleanupGuard,
+    pub continuation: CompletionContinuation,
+    pub disposition: CompletionSlotDisposition,
+    pub effect: Effect,
+}
+
+impl<Spec: SlotSpec, Effect> CompletionFailure<Spec, Effect> {
+    pub fn terminal(
+        error: Report<SlotError<Spec>>,
+        cleanup: CompletionCleanupGuard,
+        effect: Effect,
+    ) -> Self {
+        Self {
+            error,
+            cleanup,
+            continuation: CompletionContinuation::Final,
+            disposition: CompletionSlotDisposition::Finalized,
+            effect,
+        }
+    }
+
+    pub fn quarantined(
+        error: Report<SlotError<Spec>>,
+        cleanup: CompletionCleanupGuard,
+        effect: Effect,
+    ) -> Self {
+        Self {
+            error,
+            cleanup,
+            continuation: CompletionContinuation::More,
+            disposition: CompletionSlotDisposition::Quarantined,
+            effect,
+        }
+    }
+
+    pub fn control(error: Report<SlotError<Spec>>, effect: Effect) -> Self {
+        Self {
+            error,
+            cleanup: CompletionCleanupGuard::default(),
+            continuation: CompletionContinuation::Final,
+            disposition: CompletionSlotDisposition::NotApplicable,
+            effect,
+        }
+    }
+}
+
+pub enum CompletionSettlement<Spec, Effect>
 where
     Spec: SlotSpec,
 {
@@ -90,7 +155,7 @@ where
 
     Cleanup {
         cleanup: CompletionCleanupGuard,
-        /// 同 [`CompletionHookOutcome::User`]：一个**已放弃**的 multishot 仍然会一条条
+        /// 同 [`CompletionSettlement::User`]：一个**已放弃**的 multishot 仍然会一条条
         /// 投递完成，每一条都要跑 cleanup，但只有最后一条才能归还 slot。
         continuation: CompletionContinuation,
         effect: Effect,
@@ -101,13 +166,15 @@ where
         cleanup: CompletionCleanupGuard,
         effect: Effect,
     },
-    /// 控制完成本身失败，但仍有一个必须执行的后端收尾 effect。
-    ///
-    /// `finish_hook_outcome` 会先执行 `effect`，再把 `error` 返回给调用方。这样控制
-    /// 完成不能用错误短路掉 waker、cancel 等资源收尾。
-    Failed {
-        error: Report<SlotError<Spec>>,
-        effect: Effect,
+    /// A final completion failed after its CQE was consumed.  The core still owns the ordering
+    /// of cleanup and slot finalization.
+    TerminalFailure {
+        failure: CompletionFailure<Spec, Effect>,
+    },
+    /// A `MORE` completion failed.  The current CQE is settled, but the slot remains quarantined
+    /// and addressable until a safe final completion or shutdown cleanup is observed.
+    Quarantined {
+        failure: CompletionFailure<Spec, Effect>,
     },
     ControlHandled {
         effect: Effect,
@@ -122,7 +189,7 @@ where
     Spec: SlotSpec,
 {
     RouteUser(UserCompletionEvent),
-    Finish(CompletionHookOutcome<Spec, Effect>),
+    Finish(CompletionSettlement<Spec, Effect>),
 }
 
 pub trait CompletionBackendHooks<Spec>
@@ -135,45 +202,43 @@ where
     fn handle_control(
         &mut self,
         control: CompletionControl,
-    ) -> CompletionHookOutcome<Spec, Self::BackendEffect>;
+    ) -> CompletionSettlement<Spec, Self::BackendEffect>;
 
     fn complete_waiting(
         &mut self,
         event: UserCompletionEvent,
         slot: Slot<'_, InFlightWaiting, Spec>,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> HookResult<Spec, CompletionHookOutcome<Spec, Self::BackendEffect>>;
+    ) -> CompletionSettlement<Spec, Self::BackendEffect>;
 
     fn complete_orphaned(
         &mut self,
         event: UserCompletionEvent,
         slot: Slot<'_, InFlightOrphaned, Spec>,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> HookResult<Spec, CompletionHookOutcome<Spec, Self::BackendEffect>>;
+    ) -> CompletionSettlement<Spec, Self::BackendEffect>;
 
     fn complete_corrupt(
         &mut self,
         _event: UserCompletionEvent,
         kind: CompletionAnomalyKind,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> HookResult<Spec, CompletionHookOutcome<Spec, Self::BackendEffect>> {
-        Ok(CompletionHookOutcome::Anomaly {
+    ) -> CompletionSettlement<Spec, Self::BackendEffect> {
+        CompletionSettlement::Anomaly {
             kind,
             attach: AnomalyAttach::from_raw_completion(_event.raw()),
             cleanup: CompletionCleanupGuard::default(),
             effect: Self::BackendEffect::default(),
-        })
+        }
     }
 
     fn complete_backend_ingress(
         &mut self,
         _ingress: &Self::BackendIngress,
-    ) -> HookResult<Spec, CompletionBackendIngressAction<Spec, Self::BackendEffect>> {
-        Ok(CompletionBackendIngressAction::Finish(
-            CompletionHookOutcome::Ignore {
-                effect: Self::BackendEffect::default(),
-            },
-        ))
+    ) -> CompletionBackendIngressAction<Spec, Self::BackendEffect> {
+        CompletionBackendIngressAction::Finish(CompletionSettlement::Ignore {
+            effect: Self::BackendEffect::default(),
+        })
     }
 
     fn finish_backend_effect(&mut self, effect: Self::BackendEffect) -> HookResult<Spec, ()>;
@@ -331,20 +396,18 @@ where
                 event,
                 CompletionSource::Synthetic(source),
             ),
-            CompletionIngress::Backend(backend) => {
-                match hooks.complete_backend_ingress(&backend)? {
-                    CompletionBackendIngressAction::RouteUser(event) => self.accept_user_event(
-                        table,
-                        diagnostics,
-                        hooks,
-                        event,
-                        CompletionSource::Backend(&backend),
-                    ),
-                    CompletionBackendIngressAction::Finish(outcome) => {
-                        finish_hook_outcome(self, table, diagnostics, hooks, outcome, None)
-                    }
+            CompletionIngress::Backend(backend) => match hooks.complete_backend_ingress(&backend) {
+                CompletionBackendIngressAction::RouteUser(event) => self.accept_user_event(
+                    table,
+                    diagnostics,
+                    hooks,
+                    event,
+                    CompletionSource::Backend(&backend),
+                ),
+                CompletionBackendIngressAction::Finish(outcome) => {
+                    finish_hook_outcome(self, table, diagnostics, hooks, outcome, None)
                 }
-            }
+            },
             CompletionIngress::Anomaly { kind, attach } => {
                 diagnostics.record_anomaly_kind(kind, attach);
                 Ok(CompletionFlowOutcome::anomaly())
@@ -373,7 +436,7 @@ impl<Spec> CompletionFlowOpRegistryExt<Spec> for OpRegistry<Spec>
 where
     Spec: SlotSpec,
     SlotPayload<Spec>: Send,
-    SlotError<Spec>: Send,
+    SlotError<Spec>: Send + DriverError,
     SlotCompletion<Spec>: Send,
     SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
 {
@@ -391,7 +454,7 @@ where
         let token = event.token();
         match route_user_completion(event, self.checked_slot_view(token)?)? {
             RoutedSlotCompletion::Waiting(slot) => {
-                let outcome = hooks.complete_waiting(event, slot, source)?;
+                let outcome = hooks.complete_waiting(event, slot, source);
                 finish_hook_outcome(
                     self,
                     table,
@@ -402,7 +465,7 @@ where
                 )
             }
             RoutedSlotCompletion::Orphaned(slot) => {
-                let outcome = hooks.complete_orphaned(event, slot, source)?;
+                let outcome = hooks.complete_orphaned(event, slot, source);
                 finish_hook_outcome(
                     self,
                     table,
@@ -415,7 +478,7 @@ where
             RoutedSlotCompletion::Missing(kind)
             | RoutedSlotCompletion::Empty(kind)
             | RoutedSlotCompletion::Stale(kind) => {
-                let outcome = hooks.complete_corrupt(event, kind, source)?;
+                let outcome = hooks.complete_corrupt(event, kind, source);
                 finish_hook_outcome(self, table, diagnostics, hooks, outcome, None)
             }
         }
@@ -427,19 +490,19 @@ fn finish_hook_outcome<Spec, Hooks>(
     table: &SharedCompletionTable<Spec>,
     diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
     hooks: &mut Hooks,
-    outcome: CompletionHookOutcome<Spec, Hooks::BackendEffect>,
+    outcome: CompletionSettlement<Spec, Hooks::BackendEffect>,
     finalize: Option<FinalizeAction>,
 ) -> DriverResult<CompletionFlowOutcome, SlotError<Spec>>
 where
     Spec: SlotSpec,
     SlotPayload<Spec>: Send,
-    SlotError<Spec>: Send,
+    SlotError<Spec>: Send + DriverError,
     SlotCompletion<Spec>: Send,
     SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
     Hooks: CompletionBackendHooks<Spec>,
 {
     match outcome {
-        CompletionHookOutcome::User {
+        CompletionSettlement::User {
             event,
             payload,
             detail,
@@ -447,7 +510,7 @@ where
             continuation,
             effect,
         } => {
-            hooks.finish_backend_effect(effect)?;
+            let mut error = hooks.finish_backend_effect(effect).err();
             let record = record_user_completion::<Spec>(
                 table,
                 diagnostics,
@@ -457,58 +520,216 @@ where
             // `More` 的完成不归还 slot：op 与 payload 还要留给内核后续的完成，cell 也
             // 必须停在 `InFlightWaiting` 才能继续路由。
             if continuation.is_final() {
-                finish_waiting_if_needed(registry, finalize, event)?;
+                error = merge_settlement_error::<Spec>(
+                    error,
+                    finish_waiting_if_needed(registry, finalize, event).err(),
+                );
+            }
+            if let Some(error) = error {
+                return Err(error);
             }
             Ok(completion_progress_from_record(record))
         }
-        CompletionHookOutcome::Cleanup {
+        CompletionSettlement::Cleanup {
             mut cleanup,
             continuation,
             effect,
         } => {
-            hooks.finish_backend_effect(effect)?;
-            let _ = run_completion_cleanup(diagnostics, &mut cleanup);
+            let mut error = hooks.finish_backend_effect(effect).err();
+            error = merge_settlement_error::<Spec>(
+                error,
+                run_settlement_cleanup::<Spec>(diagnostics, &mut cleanup),
+            );
             // `More`：操作还在内核里，slot 必须留着——否则后续的完成落到一个已归还
             // （甚至已被重新分配）的 slot 上，`orphan_cleanup` 再也跑不到。
             if continuation.is_final() {
                 match finalize {
                     Some(FinalizeAction::Waiting(event)) => {
-                        finish_waiting_if_needed(registry, finalize, event)?;
+                        error = merge_settlement_error::<Spec>(
+                            error,
+                            finish_waiting_if_needed(registry, finalize, event).err(),
+                        );
                     }
                     Some(FinalizeAction::Orphaned(event)) => {
-                        finish_orphaned(registry, event)?;
+                        error = merge_settlement_error::<Spec>(
+                            error,
+                            finish_orphaned(registry, event).err(),
+                        );
                     }
                     None => {}
                 }
             }
+            if let Some(error) = error {
+                return Err(error);
+            }
             Ok(CompletionFlowOutcome::orphan_cleaned())
         }
-        CompletionHookOutcome::Anomaly {
+        CompletionSettlement::Anomaly {
             kind,
             attach,
             mut cleanup,
             effect,
         } => {
             diagnostics.record_anomaly_kind(kind, attach);
-            let effect_result = hooks.finish_backend_effect(effect);
-            let _ = run_completion_cleanup(diagnostics, &mut cleanup);
-            effect_result.map(|()| CompletionFlowOutcome::anomaly())
-        }
-        CompletionHookOutcome::Failed { error, effect } => {
-            match hooks.finish_backend_effect(effect) {
-                Ok(()) => Err(error),
-                Err(finish_error) => Err(finish_error.with_diag_src_err(error)),
+            let mut error = hooks.finish_backend_effect(effect).err();
+            error = merge_settlement_error::<Spec>(
+                error,
+                run_settlement_cleanup::<Spec>(diagnostics, &mut cleanup),
+            );
+            match error {
+                Some(error) => Err(error),
+                None => Ok(CompletionFlowOutcome::anomaly()),
             }
         }
-        CompletionHookOutcome::ControlHandled { effect } => {
+        CompletionSettlement::TerminalFailure { mut failure } => {
+            let mut error = hooks.finish_backend_effect(failure.effect).err();
+            error = merge_settlement_error::<Spec>(error, Some(failure.error));
+            error = merge_settlement_error::<Spec>(
+                error,
+                run_settlement_cleanup::<Spec>(diagnostics, &mut failure.cleanup),
+            );
+            error = merge_settlement_error::<Spec>(
+                error,
+                settle_slot_after_failure(
+                    registry,
+                    table,
+                    finalize,
+                    failure.disposition,
+                    failure.continuation,
+                ),
+            );
+            Err(error.expect("terminal failure must retain its primary error"))
+        }
+        CompletionSettlement::Quarantined { mut failure } => {
+            let mut error = hooks.finish_backend_effect(failure.effect).err();
+            error = merge_settlement_error::<Spec>(error, Some(failure.error));
+            error = merge_settlement_error::<Spec>(
+                error,
+                run_settlement_cleanup::<Spec>(diagnostics, &mut failure.cleanup),
+            );
+            error = merge_settlement_error::<Spec>(
+                error,
+                settle_slot_after_failure(
+                    registry,
+                    table,
+                    finalize,
+                    failure.disposition,
+                    failure.continuation,
+                ),
+            );
+            Err(error.expect("quarantined failure must retain its primary error"))
+        }
+        CompletionSettlement::ControlHandled { effect } => {
             hooks.finish_backend_effect(effect)?;
             Ok(CompletionFlowOutcome::internal())
         }
-        CompletionHookOutcome::Ignore { effect } => {
+        CompletionSettlement::Ignore { effect } => {
             hooks.finish_backend_effect(effect)?;
             Ok(CompletionFlowOutcome::ignored())
         }
     }
+}
+
+fn merge_settlement_error<Spec: SlotSpec>(
+    primary: Option<Report<SlotError<Spec>>>,
+    secondary: Option<Report<SlotError<Spec>>>,
+) -> Option<Report<SlotError<Spec>>> {
+    match (primary, secondary) {
+        (Some(primary), Some(secondary)) => Some(primary.with_diag_src_err(secondary)),
+        (Some(error), None) | (None, Some(error)) => Some(error),
+        (None, None) => None,
+    }
+}
+
+fn run_settlement_cleanup<Spec>(
+    diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
+    cleanup: &mut CompletionCleanupGuard,
+) -> Option<Report<SlotError<Spec>>>
+where
+    Spec: SlotSpec,
+    SlotError<Spec>: DriverError,
+    SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
+{
+    match cleanup.run() {
+        Ok(_) => None,
+        Err(error) => {
+            diagnostics.inc_orphan_cleanup_error();
+            Some(SlotError::<Spec>::from_core_report(error))
+        }
+    }
+}
+
+fn settle_slot_after_failure<Spec>(
+    registry: &mut OpRegistry<Spec>,
+    table: &SharedCompletionTable<Spec>,
+    finalize: Option<FinalizeAction>,
+    disposition: CompletionSlotDisposition,
+    continuation: CompletionContinuation,
+) -> Option<Report<SlotError<Spec>>>
+where
+    Spec: SlotSpec,
+    SlotError<Spec>: DriverError,
+    SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
+{
+    let disposition_is_valid = match continuation {
+        CompletionContinuation::Final => {
+            matches!(
+                disposition,
+                CompletionSlotDisposition::Finalized | CompletionSlotDisposition::NotApplicable
+            )
+        }
+        CompletionContinuation::More => {
+            matches!(
+                disposition,
+                CompletionSlotDisposition::Quarantined | CompletionSlotDisposition::NotApplicable
+            )
+        }
+    };
+    let mut error = if disposition_is_valid {
+        None
+    } else {
+        Some(invalid_failure_disposition::<Spec>(
+            "completion failure disposition does not match continuation",
+        ))
+    };
+
+    // The continuation is the safety boundary.  A malformed settlement must never free a slot
+    // while the kernel may still reference it, and a final CQE must never leave an active slot
+    // behind merely because a backend supplied an inconsistent disposition.
+    let lifecycle_error = match continuation {
+        CompletionContinuation::Final => match finalize {
+            Some(FinalizeAction::Waiting(event)) => {
+                finish_waiting_if_needed(registry, Some(FinalizeAction::Waiting(event)), event)
+                    .err()
+            }
+            Some(FinalizeAction::Orphaned(event)) => finish_orphaned(registry, event).err(),
+            None => None,
+        },
+        CompletionContinuation::More => match finalize {
+            Some(FinalizeAction::Waiting(event)) => {
+                let outcome = table.mark_orphaned(event.token());
+                if outcome.is_applied() {
+                    None
+                } else {
+                    Some(invalid_failure_disposition::<Spec>(
+                        "unable to quarantine waiting completion slot",
+                    ))
+                }
+            }
+            Some(FinalizeAction::Orphaned(_)) | None => None,
+        },
+    };
+    error = merge_settlement_error::<Spec>(error, lifecycle_error);
+    error
+}
+
+fn invalid_failure_disposition<Spec: SlotSpec>(note: &'static str) -> Report<SlotError<Spec>> {
+    SlotError::<Spec>::from_core_report(
+        DriverCoreError::Internal
+            .to_report()
+            .push_ctx("scope", "driver-core/completion.settlement")
+            .attach_note(note),
+    )
 }
 
 fn record_user_completion<Spec>(
@@ -542,11 +763,17 @@ where
     SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
     SlotError<Spec>: DriverError,
 {
-    let event = match finalize {
-        Some(FinalizeAction::Waiting(event)) => event,
-        Some(FinalizeAction::Orphaned(_)) | None => fallback_event,
-    };
-    let _ = finalize_waiting_checked(registry, event.token())?;
+    match finalize {
+        Some(FinalizeAction::Waiting(event)) => {
+            let _ = finalize_waiting_checked(registry, event.token())?;
+        }
+        Some(FinalizeAction::Orphaned(event)) => {
+            let _ = finalize_orphaned_checked(registry, event.token())?;
+        }
+        None => {
+            let _ = finalize_waiting_checked(registry, fallback_event.token())?;
+        }
+    }
     Ok(())
 }
 

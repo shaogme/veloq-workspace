@@ -72,7 +72,7 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
         match strategy {
             SubmissionStrategy::SubmitSqe => {
                 let mut chunks = [ChunkId::ZERO; 4];
-                let (count, sqe, completion_token, cleanup_hint) = {
+                let (count, sqe, cleanup_hint) = {
                     let sqe_env = self.env.sqe_env();
                     let token = self.token;
                     let guard = self.slot_guard.as_mut().ok_or_else(|| {
@@ -104,7 +104,6 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                             Ok::<_, Report<UringError>>((
                                 count,
                                 sqe,
-                                completion_token,
                                 descriptor.completion_cleanup_hint,
                             ))
                         })
@@ -119,7 +118,7 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                     )?;
                 }
 
-                let staged = self.env.stage_user_entry(self.token, sqe)?;
+                let staged = self.env.stage_user_entry(self.token, sqe, cleanup_hint)?;
                 let pushed = staged == StageResult::Staged;
                 let next_phase = if pushed {
                     SubmissionPhase::SqeStaged
@@ -146,11 +145,6 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                         "submit transaction queued after SQ full"
                     },
                 );
-                if pushed {
-                    self.env
-                        .register_completion_cleanup_hint(completion_token, cleanup_hint);
-                }
-
                 self.commit();
 
                 if pushed {

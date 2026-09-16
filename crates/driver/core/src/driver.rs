@@ -614,6 +614,8 @@ pub struct CancelDrainOutcome {
     pub requests: u64,
     pub submitted: u64,
     pub queued: u64,
+    pub already_pending: u64,
+    pub merged: u64,
     pub completed_locally: u64,
     pub target_missing: u64,
     pub target_stale: u64,
@@ -630,6 +632,12 @@ impl CancelDrainOutcome {
             }
             CancelSubmitOutcome::Queued => {
                 self.queued = self.queued.saturating_add(1);
+            }
+            CancelSubmitOutcome::AlreadyPending { .. } => {
+                self.already_pending = self.already_pending.saturating_add(1);
+            }
+            CancelSubmitOutcome::Merged { .. } => {
+                self.merged = self.merged.saturating_add(1);
             }
             CancelSubmitOutcome::CompletedLocally => {
                 self.completed_locally = self.completed_locally.saturating_add(1);

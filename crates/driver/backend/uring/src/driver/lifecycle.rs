@@ -2,7 +2,7 @@ use crate::{
     driver::{
         PendingCancel, UringDriver,
         completion::{COMP_BACKEND_URING, UringSyntheticCompletion},
-        control::{BacklogStageKind, ControlPlaneEvent},
+        control::{CancelIntentError, CancelRequestDisposition, ControlPlaneEvent},
         submission::{submit_queued_from_slot, txn::slot_access_report},
     },
     error::{UringError, UringResult, uring_report_to_event_res},
@@ -16,7 +16,7 @@ use veloq_driver_core::driver::{
     CancelTicket, CompletionToken, OpToken, SyntheticCompletionSource, UserCompletionEvent,
     cancel_target_kind,
 };
-use veloq_std::vec::Vec;
+use veloq_std::format;
 use veloq_wheel::TaskId;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -53,18 +53,12 @@ pub struct UringOpState {
     pub(crate) control: UringOpControl,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BacklogActionResult {
-    Submitted,
-    StillFull,
-    VoidRecovery,
-    SyntheticCompletion,
-    FatalControlError,
-}
-
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BacklogProgress {
-    pub(crate) actions: Vec<BacklogActionResult>,
+    pub(crate) actions: usize,
+    pub(crate) submitted: usize,
+    pub(crate) synthetic: usize,
+    pub(crate) still_full: bool,
 }
 
 impl UringOpState {
@@ -77,40 +71,26 @@ impl<'a> UringDriver<'a> {
     fn try_submit_cancel_request(
         &mut self,
         request: PendingCancel,
+        cancel_ticket: CancelTicket,
     ) -> UringResult<Option<CancelTicket>> {
         let (user_data, generation) = request.user_parts();
-
-        let cancel_ticket = self
-            .control
-            .cancellations
-            .allocate_cancel_ticket()
-            .map_err(|_| {
-                self.completion_diagnostics
-                    .backend()
-                    .inc_cancel_ticket_exhausted();
-                UringError::CancelTicketExhausted
-                    .report(
-                        "uring.cancel.allocate_ticket",
-                        "cancel ticket space exhausted",
-                    )
-                    .attach_note("target remains active and no cancel map entry was overwritten")
-            })?;
         let cancel_sqe = opcode::AsyncCancel::new(CompletionToken::user(request.target).raw())
             .build()
             .user_data(CompletionToken::cancel(cancel_ticket).raw());
 
-        if self.push_entry(cancel_sqe) == crate::driver::env::StageResult::Staged {
-            if self.control.stage_cancel(cancel_ticket, request).is_err() {
-                self.completion_diagnostics
-                    .backend()
-                    .inc_cancel_duplicate_ticket();
-                return Err(UringError::InvalidState
-                    .report(
-                        "uring.cancel.stage_ticket",
-                        "cancel ticket was already in use",
-                    )
-                    .attach_note("staged cancel bookkeeping could not be made authoritative"));
-            }
+        if self
+            .submit_env()
+            .stage_cancel_entry(cancel_ticket, request, cancel_sqe)?
+            == crate::driver::env::StageResult::Staged
+        {
+            self.control
+                .cancellations
+                .mark_staged(cancel_ticket, request.target)
+                .map_err(|error| {
+                    UringError::InvalidState
+                        .report("uring.cancel.stage_intent", format!("{error:?}"))
+                        .attach_note("cancel SQE was staged without a matching intent")
+                })?;
             self.set_cancel_phase(request.target, CancellationPhase::CancelStaged);
             self.completion_diagnostics.backend().inc_cancel_submitted();
             trace!(
@@ -130,14 +110,60 @@ impl<'a> UringDriver<'a> {
         &mut self,
         request: PendingCancel,
     ) -> UringResult<CancelSubmitOutcome> {
-        if self.try_submit_cancel_request(request)?.is_some() {
-            Ok(CancelSubmitOutcome::Submitted)
-        } else {
-            self.control.cancellations.push_pending(request);
+        let disposition =
             self.control
-                .record(ControlPlaneEvent::CancelPendingPush(request.target));
-            self.completion_diagnostics.backend().inc_cancel_queued();
-            Ok(CancelSubmitOutcome::Queued)
+                .cancellations
+                .request(request)
+                .map_err(|error| match error {
+                    CancelIntentError::TicketExhausted => {
+                        self.completion_diagnostics
+                            .backend()
+                            .inc_cancel_ticket_exhausted();
+                        UringError::CancelTicketExhausted
+                            .report(
+                                "uring.cancel.allocate_ticket",
+                                "cancel ticket space exhausted",
+                            )
+                            .attach_note(
+                                "target remains active and no cancel map entry was overwritten",
+                            )
+                    }
+                    CancelIntentError::Capacity => UringError::InvalidState
+                        .report("uring.cancel.intent", "cancel intent ledger is full")
+                        .attach_note("operation capacity and cancel ledger capacity diverged"),
+                    CancelIntentError::GenerationMismatch => UringError::InvalidState
+                        .report("uring.cancel.intent", "cancel intent generation mismatch")
+                        .attach_note("a stale cancel request targeted a reused slot"),
+                    CancelIntentError::InvalidPhase => UringError::InvalidState
+                        .report(
+                            "uring.cancel.intent",
+                            "cancel intent phase transition is invalid",
+                        )
+                        .attach_note("cancel intent bookkeeping observed an impossible phase"),
+                })?;
+
+        match disposition {
+            CancelRequestDisposition::AlreadyPending { ticket } => {
+                Ok(CancelSubmitOutcome::AlreadyPending { ticket })
+            }
+            CancelRequestDisposition::Merged { ticket } => {
+                Ok(CancelSubmitOutcome::Merged { ticket })
+            }
+            CancelRequestDisposition::New { ticket } => {
+                match self.try_submit_cancel_request(request, ticket) {
+                    Ok(Some(_)) => Ok(CancelSubmitOutcome::Submitted),
+                    Ok(None) => {
+                        self.completion_diagnostics.backend().inc_cancel_queued();
+                        Ok(CancelSubmitOutcome::Queued)
+                    }
+                    Err(report) => {
+                        self.control
+                            .cancellations
+                            .cancel_request_failed(ticket, request.target);
+                        Err(report)
+                    }
+                }
+            }
         }
     }
 
@@ -285,9 +311,20 @@ impl<'a> UringDriver<'a> {
         }
     }
 
-    pub(crate) fn flush_cancellations(&mut self) -> UringResult<()> {
+    pub(crate) fn drain_cancel_requests_bounded(&mut self, limit: usize) -> UringResult<usize> {
+        let mut drained = 0;
+        while drained < limit {
+            let Some(request) = self.control.cancellations.try_recv_remote() else {
+                break;
+            };
+            self.cancel_op_internal(request)?;
+            drained += 1;
+        }
+        Ok(drained)
+    }
+
+    pub(crate) fn stage_pending_cancellations(&mut self, limit: usize) -> UringResult<usize> {
         let mut submitted_count = 0;
-        let limit = self.control.cancellations.pending_len();
 
         while submitted_count < limit {
             if let Some(request) = self.control.cancellations.front_pending().copied() {
@@ -297,10 +334,10 @@ impl<'a> UringDriver<'a> {
                     CheckedSlotView::Missing { .. }
                     | CheckedSlotView::Empty(_)
                     | CheckedSlotView::Stale(_) => {
-                        if let Some(request) = self.control.cancellations.pop_pending() {
-                            self.control
-                                .record(ControlPlaneEvent::CancelPendingPop(request.target));
-                        }
+                        let _ = self
+                            .control
+                            .cancellations
+                            .remove_pending_target(request.target);
                         let (reason, kind) = cancel_target_kind(request.target, view);
                         self.record_cancel_target_gone(reason);
                         let attach = AnomalyAttach::from_op_token(request.target);
@@ -309,11 +346,12 @@ impl<'a> UringDriver<'a> {
                     }
                 }
 
-                if self.try_submit_cancel_request(request)?.is_some() {
-                    if let Some(request) = self.control.cancellations.pop_pending() {
-                        self.control
-                            .record(ControlPlaneEvent::CancelPendingPop(request.target));
-                    }
+                let Some(ticket) = self.control.cancellations.ticket_for(request.target) else {
+                    return Err(UringError::InvalidState
+                        .report("uring.cancel.stage", "pending cancel has no ticket")
+                        .with_ctx("target", request.target.index()));
+                };
+                if self.try_submit_cancel_request(request, ticket)?.is_some() {
                     submitted_count += 1;
                 } else {
                     break;
@@ -322,10 +360,10 @@ impl<'a> UringDriver<'a> {
                 break;
             }
         }
-        Ok(())
+        Ok(submitted_count)
     }
 
-    pub(crate) fn flush_backlog(&mut self) -> UringResult<BacklogProgress> {
+    pub(crate) fn stage_backlog_entries(&mut self, limit: usize) -> UringResult<BacklogProgress> {
         enum BacklogAction {
             SubmitReserved,
             SubmitQueued,
@@ -335,7 +373,11 @@ impl<'a> UringDriver<'a> {
         }
 
         let mut progress = BacklogProgress::default();
-        while let Some(entry) = self.control.backlog.front() {
+        while progress.actions < limit {
+            let Some(entry) = self.control.backlog.front() else {
+                break;
+            };
+            progress.actions += 1;
             let token = entry.token;
             let action = match self.ops.checked_slot_view(token)? {
                 CheckedSlotView::Valid(slot) => match slot {
@@ -369,44 +411,41 @@ impl<'a> UringDriver<'a> {
                     self.pop_backlog();
                     self.set_cancel_phase(token, CancellationPhase::Acked);
                     self.complete_local_cancel(token, CancelMode::Abandon)?;
-                    progress
-                        .actions
-                        .push(BacklogActionResult::SyntheticCompletion);
+                    progress.synthetic += 1;
                 }
                 BacklogAction::CancelKernel => {
                     self.pop_backlog();
                     let outcome = self.cancel_op_internal(CancelRequest::abandon(token))?;
-                    progress.actions.push(match outcome {
-                        CancelSubmitOutcome::Submitted => BacklogActionResult::Submitted,
-                        CancelSubmitOutcome::Queued => BacklogActionResult::StillFull,
+                    match outcome {
+                        CancelSubmitOutcome::Submitted => progress.submitted += 1,
+                        CancelSubmitOutcome::Queued => {
+                            progress.still_full = true;
+                        }
+                        CancelSubmitOutcome::AlreadyPending { .. }
+                        | CancelSubmitOutcome::Merged { .. } => progress.still_full = true,
                         CancelSubmitOutcome::CompletedLocally => {
-                            BacklogActionResult::SyntheticCompletion
+                            progress.synthetic += 1;
                         }
                         CancelSubmitOutcome::TargetGone { .. }
-                        | CancelSubmitOutcome::NoBackendHandle => {
-                            BacklogActionResult::FatalControlError
-                        }
-                    });
+                        | CancelSubmitOutcome::NoBackendHandle => {}
+                    }
                 }
                 BacklogAction::Drop => {
                     self.pop_backlog();
-                    progress.actions.push(BacklogActionResult::VoidRecovery);
                 }
                 BacklogAction::SubmitReserved => match self.submit_from_slot_token(token) {
                     Ok(true) => {
                         self.pop_backlog();
-                        progress.actions.push(BacklogActionResult::Submitted);
+                        progress.submitted += 1;
                     }
                     Ok(false) => {
-                        progress.actions.push(BacklogActionResult::StillFull);
+                        progress.still_full = true;
                         break;
                     }
                     Err(report) => {
                         self.pop_backlog();
                         self.complete_reserved_submission_error(token, report)?;
-                        progress
-                            .actions
-                            .push(BacklogActionResult::SyntheticCompletion);
+                        progress.synthetic += 1;
                     }
                 },
                 BacklogAction::SubmitQueued => {
@@ -422,18 +461,16 @@ impl<'a> UringDriver<'a> {
                     match result {
                         Ok(true) => {
                             self.pop_backlog();
-                            progress.actions.push(BacklogActionResult::Submitted);
+                            progress.submitted += 1;
                         }
                         Ok(false) => {
-                            progress.actions.push(BacklogActionResult::StillFull);
+                            progress.still_full = true;
                             break;
                         }
                         Err(report) => {
                             self.pop_backlog();
                             self.complete_queued_submission_error(token, report)?;
-                            progress
-                                .actions
-                                .push(BacklogActionResult::SyntheticCompletion);
+                            progress.synthetic += 1;
                         }
                     }
                 }
@@ -442,18 +479,15 @@ impl<'a> UringDriver<'a> {
         Ok(progress)
     }
 
-    pub(crate) fn push_backlog(
-        &mut self,
-        token: OpToken,
-        kind: BacklogStageKind,
-    ) -> UringResult<()> {
-        if self.control.backlog.push(token, kind).is_err() {
+    pub(crate) fn push_backlog(&mut self, token: OpToken) -> UringResult<()> {
+        if let Err(error) = self.control.backlog.push(token) {
             return Err(UringError::InvalidState
                 .report(
                     "uring.backlog.push",
-                    "backlog already contains the operation token",
+                    format!("backlog rejected token: {error:?}"),
                 )
-                .with_ctx("token", token.index()));
+                .with_ctx("token", token.index())
+                .with_ctx("generation", token.generation().get()));
         }
         self.control.record(ControlPlaneEvent::BacklogPush(token));
         Ok(())
@@ -468,7 +502,7 @@ impl<'a> UringDriver<'a> {
     }
 
     pub(crate) fn remove_backlog_token(&mut self, token: OpToken) -> bool {
-        if !self.control.backlog.remove(token) {
+        if self.control.backlog.remove(token).is_err() {
             return false;
         }
         self.control.record(ControlPlaneEvent::BacklogRemove(token));

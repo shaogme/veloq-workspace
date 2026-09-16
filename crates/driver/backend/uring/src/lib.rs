@@ -14,7 +14,7 @@ mod test_alloc;
 pub use config::{
     BorrowedRawHandle, BufferRegistrationMode, DirectOwnerId, FileTableExhaustion, IoFd, IoMode,
     MAX_PROVIDED_BUF_ENTRIES, OwnedRawHandle, ProvidedBufConfig, RawHandle, RawHandleKind,
-    SockAddrStorage, UringConfig, UringRawHandle,
+    SockAddrStorage, UringConfig, UringDriveLimits, UringRawHandle,
 };
 pub use diagnostics::{UringCompletionDiagnostics, UringCompletionDiagnosticsSnapshot};
 pub use driver::{ProvidedBufStats, UringDriver, UringOpState};

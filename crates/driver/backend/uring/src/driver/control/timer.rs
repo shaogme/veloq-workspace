@@ -14,6 +14,8 @@ pub(crate) struct UringTimerWheel {
 
 pub(crate) struct ExpiredBatch {
     tokens: Vec<OpToken>,
+    #[cfg(any(test, feature = "test-hooks"))]
+    pending_prefix_len: usize,
 }
 
 impl ExpiredBatch {
@@ -25,6 +27,12 @@ impl ExpiredBatch {
     #[inline]
     pub(crate) fn iter(&self) -> impl Iterator<Item = &OpToken> {
         self.tokens.iter()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[inline]
+    pub(crate) fn newly_expired_iter(&self) -> impl Iterator<Item = &OpToken> {
+        self.tokens.iter().skip(self.pending_prefix_len)
     }
 
     fn into_tokens(self) -> Vec<OpToken> {
@@ -62,18 +70,39 @@ impl UringTimerWheel {
         let elapsed = now.saturating_duration_since(self.last_poll);
         let tick_ms = (self.wheel.tick_duration().as_millis() as u64).max(1);
         let elapsed_ticks = elapsed.as_millis() as u64 / tick_ms;
-        if elapsed_ticks > 0 {
+        if elapsed_ticks > 0 || !self.timer_buffer.is_empty() {
             self.last_poll += Duration::from_millis(elapsed_ticks * tick_ms);
             let mut expired = mem::take(&mut self.timer_buffer);
-            expired.clear();
-            self.wheel.advance(elapsed, &mut expired);
-            ExpiredBatch { tokens: expired }
+            #[cfg(any(test, feature = "test-hooks"))]
+            let pending_prefix_len = expired.len();
+            if elapsed_ticks > 0 {
+                self.wheel.advance(elapsed, &mut expired);
+            }
+            ExpiredBatch {
+                tokens: expired,
+                #[cfg(any(test, feature = "test-hooks"))]
+                pending_prefix_len,
+            }
         } else {
-            ExpiredBatch { tokens: Vec::new() }
+            ExpiredBatch {
+                tokens: Vec::new(),
+                #[cfg(any(test, feature = "test-hooks"))]
+                pending_prefix_len: 0,
+            }
         }
     }
 
-    pub(crate) fn recycle_expired(&mut self, batch: ExpiredBatch) {
+    /// Returns the expired scratch buffer while retaining entries that were over the current
+    /// drive's timer budget for the next drive.
+    pub(crate) fn recycle_expired(&mut self, mut batch: ExpiredBatch, processed: usize) {
+        if processed != 0 {
+            batch.tokens.drain(..processed.min(batch.tokens.len()));
+        }
         self.timer_buffer = batch.into_tokens();
+    }
+
+    #[inline]
+    pub(crate) fn has_pending_expired(&self) -> bool {
+        !self.timer_buffer.is_empty()
     }
 }

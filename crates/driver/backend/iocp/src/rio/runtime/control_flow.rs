@@ -23,8 +23,9 @@ use veloq_driver_core::{
     driver::{
         AnomalyAttach, CompletionAnomalyKind, CompletionBackendHooks,
         CompletionBackendIngressAction, CompletionCleanupGuard, CompletionContinuation,
-        CompletionControl, CompletionFlowExt, CompletionHookOutcome, CompletionIngress,
-        CompletionSource, PlatformOp, RawCompletion, SharedCompletionTable, UserCompletionEvent,
+        CompletionControl, CompletionFailure, CompletionFlowExt, CompletionIngress,
+        CompletionSettlement, CompletionSource, PlatformOp, RawCompletion, SharedCompletionTable,
+        UserCompletionEvent,
     },
     slot::{Generation, InFlightOrphaned, InFlightWaiting, SlotState, SlotStatus},
 };
@@ -143,8 +144,8 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
     fn handle_control(
         &mut self,
         _control: CompletionControl,
-    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
-        CompletionHookOutcome::Ignore {
+    ) -> CompletionSettlement<IocpSlotSpec, Self::BackendEffect> {
+        CompletionSettlement::Ignore {
             effect: RioBackendEffect::default(),
         }
     }
@@ -154,7 +155,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
         event: UserCompletionEvent,
         slot: Slot<'_, InFlightWaiting>,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
+    ) -> CompletionSettlement<IocpSlotSpec, Self::BackendEffect> {
         let CompletionSource::Backend(ingress) = source else {
             let source_name = match source {
                 CompletionSource::Kernel => "Kernel",
@@ -162,18 +163,25 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
                 CompletionSource::Synthetic(_) => "Synthetic",
                 CompletionSource::Backend(_) => "Backend",
             };
-            return IocpError::InvalidState
-                .push_ctx("scope", "rio.runtime.control_flow.complete_waiting")
-                .with_ctx("token_index", event.token().index())
-                .with_ctx("token_generation", event.token().generation())
-                .with_ctx(
-                    "slot_status",
-                    format!("{:?}", SlotStatus::of(SlotState::InFlightWaiting)),
-                )
-                .with_ctx("completion_source", source_name)
-                .attach_note(
-                    "Backend invariant broken: RIO complete_waiting received non-Backend source",
-                );
+            return CompletionSettlement::TerminalFailure {
+                failure: CompletionFailure::terminal(
+                    IocpError::InvalidState
+                        .to_report()
+                        .push_ctx("scope", "rio.runtime.control_flow.complete_waiting")
+                        .with_ctx("token_index", event.token().index())
+                        .with_ctx("token_generation", event.token().generation())
+                        .with_ctx(
+                            "slot_status",
+                            format!("{:?}", SlotStatus::of(SlotState::InFlightWaiting)),
+                        )
+                        .with_ctx("completion_source", source_name)
+                        .attach_note(
+                            "Backend invariant broken: RIO complete_waiting received non-Backend source",
+                        ),
+                    CompletionCleanupGuard::default(),
+                    RioBackendEffect::default(),
+                ),
+            };
         };
         complete_rio_waiting_slot(self.registry, self.ext, slot, ingress)
     }
@@ -183,13 +191,13 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
         _event: UserCompletionEvent,
         slot: Slot<'_, InFlightOrphaned>,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
+    ) -> CompletionSettlement<IocpSlotSpec, Self::BackendEffect> {
         let CompletionSource::Backend(ingress) = source else {
-            return Ok(CompletionHookOutcome::Ignore {
+            return CompletionSettlement::Ignore {
                 effect: RioBackendEffect::default(),
-            });
+            };
         };
-        Ok(complete_rio_orphaned_slot(slot, ingress))
+        complete_rio_orphaned_slot(slot, ingress)
     }
 
     fn complete_corrupt(
@@ -197,32 +205,30 @@ impl CompletionBackendHooks<IocpSlotSpec> for RioCompletionHooks<'_> {
         event: UserCompletionEvent,
         kind: CompletionAnomalyKind,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
+    ) -> CompletionSettlement<IocpSlotSpec, Self::BackendEffect> {
         let effect = match source {
             CompletionSource::Backend(ingress) => RioBackendEffect::from_init(&ingress.init),
             CompletionSource::Kernel | CompletionSource::User | CompletionSource::Synthetic(_) => {
                 RioBackendEffect::default()
             }
         };
-        Ok(CompletionHookOutcome::Anomaly {
+        CompletionSettlement::Anomaly {
             kind,
             attach: AnomalyAttach::from_raw_completion(event.raw()),
             cleanup: CompletionCleanupGuard::default(),
             effect,
-        })
+        }
     }
 
     fn complete_backend_ingress(
         &mut self,
         ingress: &Self::BackendIngress,
-    ) -> IocpResult<CompletionBackendIngressAction<IocpSlotSpec, Self::BackendEffect>> {
-        Ok(CompletionBackendIngressAction::RouteUser(
-            UserCompletionEvent::from_parts(
-                COMP_BACKEND_RIO,
-                ingress.init.token,
-                ingress.result.raw_res(),
-                0,
-            ),
+    ) -> CompletionBackendIngressAction<IocpSlotSpec, Self::BackendEffect> {
+        CompletionBackendIngressAction::RouteUser(UserCompletionEvent::from_parts(
+            COMP_BACKEND_RIO,
+            ingress.init.token,
+            ingress.result.raw_res(),
+            0,
         ))
     }
 
@@ -248,7 +254,7 @@ fn complete_rio_waiting_slot(
     ext: &Extensions,
     mut slot: Slot<'_, InFlightWaiting>,
     ingress: &RioIngress,
-) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, RioBackendEffect>> {
+) -> CompletionSettlement<IocpSlotSpec, RioBackendEffect> {
     let init = &ingress.init;
     let result = ingress.result;
     let token = init.token;
@@ -265,7 +271,7 @@ fn complete_rio_waiting_slot(
             .with_ctx("rio_op_kind", init.op_kind.as_str())
             .with_ctx("rio_request_id", init.request_id)
             .attach_note("RIO slot platform generation mismatch");
-        return Err(report);
+        return complete_rio_failure_slot(slot, report, effect);
     }
 
     let cancelled = slot.platform().rio_cancel_requested;
@@ -333,7 +339,7 @@ fn complete_rio_waiting_slot(
     let (payload, detail) = guard.take_completion_data();
     let event = UserCompletionEvent::from_parts(COMP_BACKEND_RIO, token, res_code, 0);
     if let Some(payload) = payload {
-        Ok(CompletionHookOutcome::User {
+        CompletionSettlement::User {
             event,
             payload,
             detail: detail.or(Some(completion)),
@@ -341,23 +347,56 @@ fn complete_rio_waiting_slot(
             // RIO 也没有 multishot：一次请求恰好对应一条完成。
             continuation: CompletionContinuation::Final,
             effect,
-        })
+        }
     } else {
         drop(detail);
-        IocpError::InvalidState
-            .push_ctx("scope", "rio.runtime.control_flow.handle_op_completion")
-            .with_ctx("token_index", token.index())
-            .with_ctx("token_generation", token.generation())
-            .with_ctx("rio_op_kind", init.op_kind.as_str())
-            .with_ctx("rio_request_id", init.request_id)
-            .attach_note("Backend invariant broken: RIO slot completion payload is missing")
+        CompletionSettlement::TerminalFailure {
+            failure: CompletionFailure::terminal(
+                IocpError::InvalidState
+                    .to_report()
+                    .push_ctx("scope", "rio.runtime.control_flow.handle_op_completion")
+                    .with_ctx("token_index", token.index())
+                    .with_ctx("token_generation", token.generation())
+                    .with_ctx("rio_op_kind", init.op_kind.as_str())
+                    .with_ctx("rio_request_id", init.request_id)
+                    .attach_note(
+                        "Backend invariant broken: RIO slot completion payload is missing",
+                    ),
+                cleanup,
+                effect,
+            ),
+        }
+    }
+}
+
+fn complete_rio_failure_slot(
+    mut slot: Slot<'_, InFlightWaiting>,
+    error: Report<IocpError>,
+    effect: RioBackendEffect,
+) -> CompletionSettlement<IocpSlotSpec, RioBackendEffect> {
+    let completion_result: IocpResult<usize> = Err(error);
+    let cleanup = slot
+        .with_access_mut(|access| {
+            PlatformOp::completion_cleanup(access.operation_mut(), &completion_result)
+        })
+        .unwrap_or_default();
+    let mut completed = slot.complete();
+    let _ = completed.take_op();
+    let (_, detail) = completed.take_completion_data();
+    drop(detail);
+    let error = match completion_result {
+        Err(error) => error,
+        Ok(_) => unreachable!("failure result must contain the original completion error"),
+    };
+    CompletionSettlement::TerminalFailure {
+        failure: CompletionFailure::terminal(error, cleanup, effect),
     }
 }
 
 fn complete_rio_orphaned_slot(
     mut slot: Slot<'_, InFlightOrphaned>,
     ingress: &RioIngress,
-) -> CompletionHookOutcome<IocpSlotSpec, RioBackendEffect> {
+) -> CompletionSettlement<IocpSlotSpec, RioBackendEffect> {
     let init = &ingress.init;
     let result = ingress.result;
     let generation = init.token.generation();
@@ -392,7 +431,7 @@ fn complete_rio_orphaned_slot(
     let _ = guard.take_op();
     let _ = guard.take_completion_data();
     let _ = take(guard.platform_mut());
-    CompletionHookOutcome::Cleanup {
+    CompletionSettlement::Cleanup {
         cleanup,
         continuation: CompletionContinuation::Final,
         effect,

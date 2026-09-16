@@ -23,8 +23,8 @@ use veloq_driver_core::{
     },
 };
 use veloq_driver_uring::{
-    IoFd, ProvidedBufConfig, RawHandle, UringConfig, UringDriver, UringOp, UringRawHandle,
-    UringSlotSpec,
+    IoFd, ProvidedBufConfig, RawHandle, UringConfig, UringDriveLimits, UringDriver, UringOp,
+    UringRawHandle, UringSlotSpec,
 };
 
 type RecvProvided = CoreRecvProvided<UringRawHandle>;
@@ -45,6 +45,7 @@ impl BufPool for HeapPool {
 fn new_driver_or_skip(entries: u16, buf_size: usize) -> Option<UringDriver<'static>> {
     let config = UringConfig {
         entries: NonZeroU32::new(64).unwrap(),
+        drive_limits: UringDriveLimits::for_entries(64),
         provided_buffers: Some(ProvidedBufConfig {
             entries: NonZeroU16::new(entries).unwrap(),
             buf_size: NonZeroUsize::new(buf_size).unwrap(),

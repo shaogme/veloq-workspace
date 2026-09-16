@@ -10,10 +10,10 @@ use diagweave::prelude::*;
 use veloq_blocking::{BlockingTask, ThreadPool};
 use veloq_driver_core::{
     driver::{
-        CompletionBackendHooks, CompletionContinuation, CompletionControl, CompletionFlowExt,
-        CompletionHookOutcome, CompletionIngress, CompletionSource, CompletionToken,
-        DriverSubmitResult, OpToken, PlatformOp, SharedCompletionTable, SubmitStatus,
-        SyntheticCompletionSource, UserCompletionEvent,
+        CompletionBackendHooks, CompletionContinuation, CompletionControl, CompletionFailure,
+        CompletionFlowExt, CompletionIngress, CompletionSettlement, CompletionSource,
+        CompletionToken, DriverSubmitResult, OpToken, PlatformOp, SharedCompletionTable,
+        SubmitStatus, SyntheticCompletionSource, UserCompletionEvent,
     },
     slot::{
         CheckedSlotView, InFlightOrphaned, InFlightWaiting, Reserved, SlotAccessError,
@@ -69,8 +69,8 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
     fn handle_control(
         &mut self,
         _control: CompletionControl,
-    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
-        CompletionHookOutcome::Ignore { effect: () }
+    ) -> CompletionSettlement<IocpSlotSpec, Self::BackendEffect> {
+        CompletionSettlement::Ignore { effect: () }
     }
 
     fn complete_waiting(
@@ -78,7 +78,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
         event: UserCompletionEvent,
         slot: Slot<'_, InFlightWaiting>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
+    ) -> CompletionSettlement<IocpSlotSpec, Self::BackendEffect> {
         let event_res = event.res();
         let mut guard = slot.complete();
         let cleanup = guard
@@ -98,7 +98,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
         let _ = guard.take_op();
         let (payload, detail) = guard.take_completion_data();
         if let Some(payload) = payload {
-            Ok(CompletionHookOutcome::User {
+            CompletionSettlement::User {
                 event,
                 payload,
                 detail,
@@ -106,14 +106,23 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
                 // IOCP 没有 multishot：一次提交恰好对应一条完成。
                 continuation: CompletionContinuation::Final,
                 effect: (),
-            })
+            }
         } else {
             drop(detail);
-            IocpError::InvalidState
-                .push_ctx("scope", "iocp.driver.SubmissionFailureHooks")
-                .with_ctx("user_data", event.token().index())
-                .with_ctx("generation", event.token().generation())
-                .attach_note("payload missing in active slot during submission failure completion")
+            CompletionSettlement::TerminalFailure {
+                failure: CompletionFailure::terminal(
+                    IocpError::InvalidState
+                        .to_report()
+                        .push_ctx("scope", "iocp.driver.SubmissionFailureHooks")
+                        .with_ctx("user_data", event.token().index())
+                        .with_ctx("generation", event.token().generation())
+                        .attach_note(
+                            "payload missing in active slot during submission failure completion",
+                        ),
+                    cleanup,
+                    (),
+                ),
+            }
         }
     }
 
@@ -122,7 +131,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
         _event: UserCompletionEvent,
         slot: Slot<'_, InFlightOrphaned>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
+    ) -> CompletionSettlement<IocpSlotSpec, Self::BackendEffect> {
         let mut guard = slot.complete();
         let cleanup = guard
             .with_access_mut(|access| {
@@ -134,11 +143,11 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
             .unwrap_or_default();
         let _ = guard.take_op();
         let _ = guard.take_completion_data();
-        Ok(CompletionHookOutcome::Cleanup {
+        CompletionSettlement::Cleanup {
             cleanup,
             continuation: CompletionContinuation::Final,
             effect: (),
-        })
+        }
     }
 
     fn finish_backend_effect(&mut self, _effect: Self::BackendEffect) -> IocpResult<()> {

@@ -3,19 +3,24 @@ pub(crate) mod plane;
 pub(crate) mod timer;
 pub(crate) mod waker;
 
-pub(crate) use cancellation::{PendingCancel, UringCancelManager};
+pub(crate) use cancellation::{
+    CancelIntentError, CancelRequestDisposition, PendingCancel, UringCancelManager,
+};
+pub(crate) use plane::DeferredCancelReconcile;
 pub(crate) use plane::{
-    BacklogStageKind, StagedEntry, UringControlEffect, UringControlEffectKind, UringControlPlane,
+    StagedEntry, StagedLedger, StagedLedgerError, UringControlEffectKind, UringControlPlane,
     UringPostCompletionEffects,
 };
-pub(crate) use timer::UringTimerWheel;
+pub(crate) use timer::{ExpiredBatch, UringTimerWheel};
 pub(crate) use waker::UringWakerManager;
 
 use crate::driver::lifecycle::SubmissionPhase;
-use veloq_driver_core::{
-    driver::{CancelTicket, CompletionToken, OpToken},
-    slot::SlotSnapshot,
-};
+use veloq_driver_core::driver::{CancelTicket, CompletionToken, OpToken};
+
+#[cfg(any(test, feature = "test-hooks"))]
+use veloq_driver_core::slot::SlotSnapshot;
+
+#[cfg(any(test, feature = "test-hooks"))]
 use veloq_std::vec::Vec;
 use veloq_wheel::TaskId;
 
@@ -29,6 +34,7 @@ pub(crate) struct ControlTransition {
     pub(crate) reason: &'static str,
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ControlInvariantError {
     BacklogDuplicate {
@@ -101,8 +107,6 @@ pub(crate) enum ControlPlaneEvent {
     BacklogPush(OpToken),
     BacklogPop(OpToken),
     BacklogRemove(OpToken),
-    CancelPendingPush(OpToken),
-    CancelPendingPop(OpToken),
     CancelInFlightInsert {
         ticket: CancelTicket,
         target: OpToken,
@@ -119,6 +123,7 @@ pub(crate) enum ControlPlaneEvent {
         task_id: TaskId,
         token: OpToken,
     },
+    #[cfg(any(test, feature = "test-hooks"))]
     TimerExpire {
         task_id: Option<TaskId>,
         token: OpToken,
@@ -130,14 +135,18 @@ pub(crate) enum ControlPlaneEvent {
     WakerRearmed,
     CleanupHintInsert(CompletionToken),
     CleanupHintRemove(CompletionToken),
+    #[cfg(any(test, feature = "test-hooks"))]
     CompletionRecord {
         token: OpToken,
         final_completion: bool,
     },
+    #[cfg(any(test, feature = "test-hooks"))]
     CompletionFinalize(OpToken),
+    #[cfg(any(test, feature = "test-hooks"))]
     InvariantViolation(ControlInvariantError),
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ControlTokenSnapshot {
     pub(crate) token: OpToken,
@@ -148,6 +157,7 @@ pub(crate) struct ControlTokenSnapshot {
 }
 
 /// Point-in-time state used by invariant checks and test hooks.
+#[cfg(any(test, feature = "test-hooks"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ControlPlaneSnapshot {
     pub(crate) active_tokens: Vec<ControlTokenSnapshot>,
@@ -180,6 +190,8 @@ pub(crate) struct ControlPlaneObserver {
 impl ControlPlaneObserver {
     #[inline]
     pub(crate) fn record(&mut self, event: ControlPlaneEvent) {
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        let _ = event;
         #[cfg(any(test, feature = "test-hooks"))]
         {
             let violation = self.apply(event);
@@ -282,8 +294,6 @@ impl ControlPlaneObserver {
             }
             ControlPlaneEvent::InvariantViolation(_)
             | ControlPlaneEvent::SubmissionTransition(_)
-            | ControlPlaneEvent::CancelPendingPush(_)
-            | ControlPlaneEvent::CancelPendingPop(_)
             | ControlPlaneEvent::WakerArm { .. }
             | ControlPlaneEvent::WakerRearmRequested
             | ControlPlaneEvent::WakerRearmed
@@ -459,8 +469,6 @@ mod tests {
         );
 
         // Queued cancellation and timer cancellation.
-        observer.record(ControlPlaneEvent::CancelPendingPush(token));
-        observer.record(ControlPlaneEvent::CancelPendingPop(token));
         observer.record(ControlPlaneEvent::TimerInsert { task_id, token });
         observer.record(ControlPlaneEvent::TimerCancel { task_id, token });
         observer.record(ControlPlaneEvent::TimerInsert {
@@ -500,7 +508,7 @@ mod tests {
         });
 
         let events = observer.take_events();
-        assert_eq!(events.len(), 20);
+        assert_eq!(events.len(), 18);
         assert!(matches!(
             events[0],
             ControlPlaneEvent::SubmissionTransition(ControlTransition {
@@ -510,15 +518,15 @@ mod tests {
             })
         ));
         assert_eq!(
-            events[11],
+            events[9],
             ControlPlaneEvent::CompletionRecord {
                 token,
                 final_completion: false,
             }
         );
-        assert_eq!(events[14], ControlPlaneEvent::WakerArm { armed: false });
+        assert_eq!(events[12], ControlPlaneEvent::WakerArm { armed: false });
         assert_eq!(
-            events[18],
+            events[16],
             ControlPlaneEvent::CancelInFlightInsert {
                 ticket: cancel_ticket,
                 target: token,

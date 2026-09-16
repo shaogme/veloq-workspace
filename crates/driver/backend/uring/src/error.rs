@@ -7,6 +7,8 @@ set! {
     pub UringError = {
         #[display("io_uring driver initialization failed")]
         DriverInit,
+        #[display("io_uring polling mode is unavailable")]
+        PollingUnavailable,
         #[display("io_uring completion wait failed")]
         CompletionWait,
         #[display("io_uring operation submission failed")]
@@ -87,6 +89,7 @@ fn neg_code(code: i32) -> Option<i32> {
 pub(crate) fn uring_fallback_errno(kind: UringError) -> i32 {
     match kind {
         UringError::DriverInit => 5,             // EIO
+        UringError::PollingUnavailable => 95,    // EOPNOTSUPP
         UringError::CompletionWait => 5,         // EIO
         UringError::Submission => 11,            // EAGAIN
         UringError::Registration => 12,          // ENOMEM

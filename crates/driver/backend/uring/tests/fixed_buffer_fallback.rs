@@ -34,8 +34,8 @@ use veloq_driver_core::{
     },
 };
 use veloq_driver_uring::{
-    IoFd, RawHandle, UringConfig, UringDriver, UringError, UringOp, UringRawHandle, UringSlotSpec,
-    UringUserPayload,
+    IoFd, RawHandle, UringConfig, UringDriveLimits, UringDriver, UringError, UringOp,
+    UringRawHandle, UringSlotSpec, UringUserPayload,
 };
 
 type ReadFixed = CoreReadFixed<UringRawHandle>;
@@ -90,6 +90,7 @@ fn new_driver_or_skip(
 ) -> Option<UringDriver<'static>> {
     let config = UringConfig {
         entries: NonZeroU32::new(64).expect("non-zero ring entries"),
+        drive_limits: UringDriveLimits::for_entries(64),
         registration_mode: mode,
         ..UringConfig::default()
     };
@@ -465,6 +466,7 @@ fn compatible_mode_falls_back_for_fixed_read_and_respects_cooldown() {
     let fd = register_file(&mut driver, &file);
     let fixed_available = {
         let hooks = &mut driver as &mut dyn DriverTestHooks;
+        let _ = hooks.debug_control_plane_events();
         let fixed_available = hooks.debug_fixed_buffers_available();
         if fixed_available {
             hooks.debug_inject_register_buffers_update_failure(libc::EIO);
@@ -565,6 +567,13 @@ fn compatible_mode_backlog_retry_preserves_raw_fallback() {
     let token = submit(
         &mut driver,
         fixed_read(buffers.pop().expect("backlog read buffer"), fd),
+    );
+    let events = (&mut driver as &mut dyn DriverTestHooks).debug_control_plane_events();
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.contains("CleanupHintInsert")),
+        "a Full stage must roll back cleanup metadata and its observer event"
     );
     let (read, read_buf) =
         take_read_completion::<ReadFixed>(&mut driver, token, |payload| payload.buf);

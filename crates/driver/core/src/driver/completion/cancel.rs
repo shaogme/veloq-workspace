@@ -1,7 +1,7 @@
 use crate::slot::{self, CheckedSlotView, SlotView};
 
 use super::routing::{SlotLookupFailure, slot_view_kind};
-use super::{CompletionAnomalyKind, OpToken};
+use super::{CancelTicket, CompletionAnomalyKind, OpToken};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelMode {
@@ -33,8 +33,18 @@ impl CancelRequest {
 pub enum CancelSubmitOutcome {
     Submitted,
     Queued,
+    /// A cancel intent for this target already exists and has the same visibility mode.
+    AlreadyPending {
+        ticket: CancelTicket,
+    },
+    /// A new cancel request was merged into the existing intent. `Abandon` takes precedence.
+    Merged {
+        ticket: CancelTicket,
+    },
     CompletedLocally,
-    TargetGone { reason: CancelTargetGoneReason },
+    TargetGone {
+        reason: CancelTargetGoneReason,
+    },
     NoBackendHandle,
 }
 

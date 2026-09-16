@@ -14,6 +14,16 @@ pub struct UringCompletionDiagnostics {
     cancel_ack_not_found: AtomicU64,
     cancel_ack_error: AtomicU64,
     cancel_ack_enoent_active: AtomicU64,
+    cancel_reconcile_timeout: AtomicU64,
+    cancel_reconcile_deferred: AtomicU64,
+    cqe_batches: AtomicU64,
+    cqe_collected: AtomicU64,
+    cqe_budget_hits: AtomicU64,
+    cqe_emergency_drains: AtomicU64,
+    cqe_overflow: AtomicU64,
+    timer_synthetic: AtomicU64,
+    timer_budget_hits: AtomicU64,
+    completion_effect_overflows: AtomicU64,
     cancel_ticket_exhausted: AtomicU64,
     cancel_duplicate_ticket: AtomicU64,
     cancel_untracked_cqe: AtomicU64,
@@ -61,6 +71,16 @@ pub struct UringCompletionDiagnosticsSnapshot {
     pub cancel_ack_not_found: u64,
     pub cancel_ack_error: u64,
     pub cancel_ack_enoent_active: u64,
+    pub cancel_reconcile_timeout: u64,
+    pub cancel_reconcile_deferred: u64,
+    pub cqe_batches: u64,
+    pub cqe_collected: u64,
+    pub cqe_budget_hits: u64,
+    pub cqe_emergency_drains: u64,
+    pub cqe_overflow: u64,
+    pub timer_synthetic: u64,
+    pub timer_budget_hits: u64,
+    pub completion_effect_overflows: u64,
     pub cancel_ticket_exhausted: u64,
     pub cancel_duplicate_ticket: u64,
     pub cancel_untracked_cqe: u64,
@@ -174,13 +194,60 @@ impl UringCompletionDiagnostics {
     }
 
     #[inline]
-    pub(crate) fn inc_cancel_ticket_exhausted(&self) {
-        Self::inc(&self.cancel_ticket_exhausted);
+    pub(crate) fn inc_cancel_reconcile_timeout(&self) {
+        Self::inc(&self.cancel_reconcile_timeout);
     }
 
     #[inline]
-    pub(crate) fn inc_cancel_duplicate_ticket(&self) {
-        Self::inc(&self.cancel_duplicate_ticket);
+    pub(crate) fn inc_cancel_reconcile_deferred(&self) {
+        Self::inc(&self.cancel_reconcile_deferred);
+    }
+
+    #[inline]
+    pub(crate) fn inc_cqe_batch(&self) {
+        Self::inc(&self.cqe_batches);
+    }
+
+    #[inline]
+    pub(crate) fn add_cqes_collected(&self, count: usize) {
+        self.cqe_collected
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn inc_cqe_budget_hit(&self) {
+        Self::inc(&self.cqe_budget_hits);
+    }
+
+    #[inline]
+    pub(crate) fn inc_cqe_emergency_drain(&self) {
+        Self::inc(&self.cqe_emergency_drains);
+    }
+
+    #[inline]
+    pub(crate) fn inc_cqe_overflow(&self) {
+        Self::inc(&self.cqe_overflow);
+    }
+
+    #[inline]
+    pub(crate) fn add_timer_synthetic(&self, count: usize) {
+        self.timer_synthetic
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn inc_timer_budget_hit(&self) {
+        Self::inc(&self.timer_budget_hits);
+    }
+
+    #[inline]
+    pub(crate) fn inc_completion_effect_overflow(&self) {
+        Self::inc(&self.completion_effect_overflows);
+    }
+
+    #[inline]
+    pub(crate) fn inc_cancel_ticket_exhausted(&self) {
+        Self::inc(&self.cancel_ticket_exhausted);
     }
 
     #[inline]
@@ -351,6 +418,16 @@ impl DriverCompletionDiagnosticsBackend for UringCompletionDiagnostics {
             cancel_ack_not_found: Self::load(&self.cancel_ack_not_found),
             cancel_ack_error: Self::load(&self.cancel_ack_error),
             cancel_ack_enoent_active: Self::load(&self.cancel_ack_enoent_active),
+            cancel_reconcile_timeout: Self::load(&self.cancel_reconcile_timeout),
+            cancel_reconcile_deferred: Self::load(&self.cancel_reconcile_deferred),
+            cqe_batches: Self::load(&self.cqe_batches),
+            cqe_collected: Self::load(&self.cqe_collected),
+            cqe_budget_hits: Self::load(&self.cqe_budget_hits),
+            cqe_emergency_drains: Self::load(&self.cqe_emergency_drains),
+            cqe_overflow: Self::load(&self.cqe_overflow),
+            timer_synthetic: Self::load(&self.timer_synthetic),
+            timer_budget_hits: Self::load(&self.timer_budget_hits),
+            completion_effect_overflows: Self::load(&self.completion_effect_overflows),
             cancel_ticket_exhausted: Self::load(&self.cancel_ticket_exhausted),
             cancel_duplicate_ticket: Self::load(&self.cancel_duplicate_ticket),
             cancel_untracked_cqe: Self::load(&self.cancel_untracked_cqe),

@@ -22,8 +22,8 @@ use veloq_driver_core::op::{
     types::{Close as CoreClose, Fsync as CoreFsync},
 };
 use veloq_driver_uring::{
-    FileTableExhaustion, IoFd, OwnedRawHandle, RawHandle, UringConfig, UringDriver, UringError,
-    UringOp, UringRawHandle, UringResult, UringSlotSpec,
+    FileTableExhaustion, IoFd, OwnedRawHandle, RawHandle, UringConfig, UringDriveLimits,
+    UringDriver, UringError, UringOp, UringRawHandle, UringResult, UringSlotSpec,
 };
 
 type Close = CoreClose<UringRawHandle>;
@@ -48,6 +48,7 @@ fn new_driver_with_file_table_or_skip(
 ) -> Option<UringDriver<'static>> {
     let config = UringConfig {
         entries: NonZeroU32::new(64).unwrap(),
+        drive_limits: UringDriveLimits::for_entries(64),
         file_table_capacity: capacity,
         file_table_exhaustion: exhaustion,
         ..UringConfig::default()

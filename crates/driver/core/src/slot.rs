@@ -559,8 +559,8 @@ mod tests {
     use super::*;
     use crate::driver::{
         CompletionAccess, CompletionBackend, CompletionBackendHooks, CompletionCleanupGuard,
-        CompletionContinuation, CompletionControl, CompletionFlowExt, CompletionHookOutcome,
-        CompletionIngress, CompletionSource, CompletionToken, HookResult, PlatformOp,
+        CompletionContinuation, CompletionControl, CompletionFlowExt, CompletionIngress,
+        CompletionSettlement, CompletionSource, CompletionToken, HookResult, PlatformOp,
         PollRecordResult, SharedCompletionTable, UserCompletionEvent,
     };
     use crate::{DriverCoreError, DriverError};
@@ -611,8 +611,8 @@ mod tests {
         fn handle_control(
             &mut self,
             _control: CompletionControl,
-        ) -> CompletionHookOutcome<DummySlotSpec, Self::BackendEffect> {
-            CompletionHookOutcome::Ignore { effect: () }
+        ) -> CompletionSettlement<DummySlotSpec, Self::BackendEffect> {
+            CompletionSettlement::Ignore { effect: () }
         }
 
         fn complete_waiting(
@@ -620,19 +620,18 @@ mod tests {
             event: UserCompletionEvent,
             slot: Slot<'_, InFlightWaiting, DummySlotSpec>,
             _source: CompletionSource<'_, Self::BackendIngress>,
-        ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>>
-        {
+        ) -> CompletionSettlement<DummySlotSpec, Self::BackendEffect> {
             let mut completed = slot.complete();
             let _ = completed.take_op();
             let (payload, detail) = completed.take_completion_data();
-            Ok(CompletionHookOutcome::User {
+            CompletionSettlement::User {
                 event,
                 payload: payload.expect("test slot payload should exist"),
                 detail,
                 cleanup: CompletionCleanupGuard::default(),
                 continuation: CompletionContinuation::Final,
                 effect: (),
-            })
+            }
         }
 
         fn complete_orphaned(
@@ -640,18 +639,17 @@ mod tests {
             _event: UserCompletionEvent,
             slot: Slot<'_, InFlightOrphaned, DummySlotSpec>,
             _source: CompletionSource<'_, Self::BackendIngress>,
-        ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>>
-        {
+        ) -> CompletionSettlement<DummySlotSpec, Self::BackendEffect> {
             let mut completed = slot.complete();
             let _ = completed.take_op();
             let (payload, detail) = completed.take_completion_data();
             let _ = payload;
             drop(detail);
-            Ok(CompletionHookOutcome::Cleanup {
+            CompletionSettlement::Cleanup {
                 cleanup: CompletionCleanupGuard::default(),
                 continuation: CompletionContinuation::Final,
                 effect: (),
-            })
+            }
         }
 
         fn finish_backend_effect(

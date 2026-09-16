@@ -2,29 +2,38 @@ use diagweave::prelude::*;
 use io_uring::{IoUring, opcode};
 use tracing::{debug, trace};
 use veloq_buf::{AnyBufPool, BufferRegistrar, heap::ChunkId};
-use veloq_std::{collections::VecDeque, format, ptr, string::String, sync::Arc, vec, vec::Vec};
+use veloq_std::{format, ptr, sync::Arc, vec, vec::Vec};
+
+#[cfg(feature = "test-hooks")]
+use veloq_std::{collections::VecDeque, string::String};
 
 use crate::{
-    config::{IoFd, IoMode, RawHandle, UringConfig, UringRawHandle},
+    config::{IoFd, IoMode, RawHandle, UringConfig, UringDriveLimits, UringRawHandle},
     diagnostics::{UringCompletionDiagnostics, UringCompletionDiagnosticsSnapshot},
-    driver::control::{
-        ControlInvariantError, ControlPlaneEvent, ControlPlaneSnapshot, ControlTokenSnapshot,
-    },
-    driver::lifecycle::SubmissionPhase,
+    driver::control::ControlPlaneEvent,
     error::{UringError, UringResult},
     op::{
-        CheckedSlotView, SlotView, SubmissionStrategy, UringOp, UringOpRegistry,
-        UringOpRegistryExt, UringSlotSpec, UringUserPayload,
+        CheckedSlotView, SlotView, UringOp, UringOpRegistry, UringOpRegistryExt, UringSlotSpec,
+        UringUserPayload,
     },
 };
 use veloq_driver_core::driver::{
-    BufferRegistrationStatus, CancelRequest, CancelSubmitOutcome, CancelTicket, CompletionToken,
-    DriveMode, DriveOutcome, DriverCapabilities, DriverCapability, DriverCompletionDiagnostics,
+    BufferRegistrationStatus, CancelRequest, CancelSubmitOutcome, CompletionToken, DriveMode,
+    DriveOutcome, DriverCapabilities, DriverCapability, DriverCompletionDiagnostics,
     DriverCompletionDiagnosticsSnapshot, DriverRaw, DriverSubmitResult, OpToken, RegisterFd,
     RemoteCancelSender, RemoteWaker, SharedCompletionTable, SharedSlotTable, SubmitStatus,
     registry::{OpEntry, OpHandle},
     sealed,
 };
+
+#[cfg(any(test, feature = "test-hooks"))]
+use crate::{
+    driver::control::{ControlInvariantError, ControlPlaneSnapshot, ControlTokenSnapshot},
+    driver::lifecycle::SubmissionPhase,
+};
+
+#[cfg(any(test, feature = "test-hooks"))]
+use veloq_driver_core::driver::CancelTicket;
 
 mod completion;
 mod control;
@@ -33,8 +42,13 @@ mod lifecycle;
 mod registration;
 mod submission;
 
+#[cfg(test)]
+mod protocol_model;
+
+pub(crate) use completion::DriveCycle;
 pub(crate) use control::{
-    PendingCancel, UringCancelManager, UringControlPlane, UringTimerWheel, UringWakerManager,
+    PendingCancel, UringCancelManager, UringControlPlane, UringPostCompletionEffects,
+    UringTimerWheel, UringWakerManager,
 };
 pub(crate) use env::{CompletionControlView, CqeEnv, SqeEnv};
 pub use lifecycle::UringOpState;
@@ -91,12 +105,15 @@ pub struct UringDriver<'a> {
     pub(crate) control: UringControlPlane,
     pub(crate) buffer_registry: UringBufferRegistry<'a>,
 
-    /// Reused across `process_completions_internal` calls so draining the CQ never allocates.
+    /// Reused across completion batches so draining the CQ never allocates.
     pub(crate) cqe_buffer: Vec<(u64, i32, u32)>,
+    pub(crate) effect_accumulator: Option<UringPostCompletionEffects>,
+    pub(crate) drive_limits: UringDriveLimits,
     pub(crate) file_table: FileTable,
     #[cfg(feature = "test-hooks")]
     pub(crate) register_files_update_outcomes: VecDeque<RegisterFilesUpdateOutcome>,
     pub(crate) capabilities: DriverCapabilities,
+    pub(crate) submission_fail_stop: bool,
 }
 
 impl<'a> UringDriver<'a> {
@@ -105,6 +122,15 @@ impl<'a> UringDriver<'a> {
         registrar: &'a (dyn BufferRegistrar + 'a),
     ) -> UringResult<Self> {
         let config = config.as_ref();
+        let entries = config.entries.get();
+        config
+            .drive_limits
+            .validate(entries as usize)
+            .map_err(|message| {
+                UringError::DriverInit
+                    .report("driver.new.drive_limits", message)
+                    .attach_note("all io_uring drive budgets must be bounded and non-zero")
+            })?;
         let mut builder = IoUring::builder();
 
         builder
@@ -116,17 +142,20 @@ impl<'a> UringDriver<'a> {
             builder.setup_sqpoll(idle_ms.get());
         }
 
-        let entries = config.entries.get();
-        let ring = builder
-            .build(entries)
-            .or_else(|e| {
-                if e.raw_os_error() == Some(libc::EINVAL) {
-                    IoUring::new(entries)
-                } else {
-                    Err(e)
-                }
-            })
-            .map_err(|e| UringError::DriverInit.io_report("driver.new.build_ring", e))?;
+        let ring = match builder.build(entries) {
+            Ok(ring) => ring,
+            Err(error)
+                if matches!(config.mode, IoMode::Polling(_))
+                    && error.raw_os_error() == Some(libc::EINVAL) =>
+            {
+                return Err(UringError::PollingUnavailable
+                    .io_report("driver.new.build_polling_ring", error)
+                    .attach_note("the requested SQPOLL mode is unavailable on this kernel"));
+            }
+            Err(error) => {
+                return Err(UringError::DriverInit.io_report("driver.new.build_ring", error));
+            }
+        };
 
         let ops = UringOpRegistry::new(entries as usize);
         let completion_table: SharedCompletionTable<UringSlotSpec> = ops.shared.clone();
@@ -152,17 +181,35 @@ impl<'a> UringDriver<'a> {
             ops,
             completion_diagnostics,
             completion_table,
-            control: UringControlPlane::new(waker),
+            control: UringControlPlane::with_capacity(
+                waker,
+                (entries as usize).saturating_mul(2).saturating_add(1),
+            ),
             buffer_registry: UringBufferRegistry::new(
                 config.registration_mode,
                 config.provided_buffers,
                 registrar,
             ),
-            cqe_buffer: Vec::with_capacity(entries as usize),
+            cqe_buffer: Vec::with_capacity(
+                config
+                    .drive_limits
+                    .max_cqe_batch
+                    .max(config.drive_limits.emergency_drain_limit),
+            ),
+            effect_accumulator: Some(UringPostCompletionEffects::with_capacity(
+                config
+                    .drive_limits
+                    .max_cqe_batch
+                    .max(config.drive_limits.emergency_drain_limit)
+                    .saturating_mul(4)
+                    .saturating_add(8),
+            )),
+            drive_limits: config.drive_limits,
             file_table: FileTable::new(config.file_table_capacity, config.file_table_exhaustion),
             #[cfg(feature = "test-hooks")]
             register_files_update_outcomes: VecDeque::new(),
             capabilities: probe_capabilities(&ring_probe),
+            submission_fail_stop: false,
         };
 
         driver.submit_waker()?;
@@ -700,26 +747,14 @@ impl<'a> DriverRaw for UringDriver<'a> {
         let op: UringOp = op;
         let strategy = op.descriptor().strategy;
 
-        match strategy {
-            SubmissionStrategy::SubmitSqe => self.submit_sqe_internal(token, op, op_in),
-            SubmissionStrategy::SoftwareTimer => self.submit_timer_internal(token, op, op_in),
-        }
+        self.submit_operation_internal(token, op, op_in, strategy)
     }
 
     fn drive_raw(&mut self, mode: DriveMode) -> UringResult<DriveOutcome> {
-        match mode {
-            DriveMode::Poll => {
-                self.poll_nonblocking_internal()
-                    .push_ctx("scope", "uring.driver.drive.poll")
-                    .attach_note("poll completions")?;
-            }
-            DriveMode::Wait { timeout } => {
-                self.completion_diagnostics.backend().inc_wait_enter();
-                self.wait_internal(timeout)
-                    .push_ctx("scope", "uring.driver.drive.wait")
-                    .attach_note("wait for completions")?;
-            }
-        }
+        DriveCycle::new(mode)
+            .run(self)
+            .push_ctx("scope", "uring.driver.drive")
+            .attach_note("advance unified uring drive cycle")?;
 
         Ok(DriveOutcome {
             next_timeout_hint: self.control.timers.next_timeout(),

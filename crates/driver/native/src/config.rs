@@ -1,15 +1,58 @@
 use veloq_std::num::NonZeroU32;
 
 #[cfg(windows)]
+use veloq_std::time::Duration;
+
+#[cfg(windows)]
 use veloq_std::num::{NonZeroU16, NonZeroUsize};
 
 #[cfg(windows)]
 pub use veloq_driver_iocp::{BufferRegistrationMode, IocpConfig};
 use veloq_std::nz;
 
+/// Windows-side configuration shim for the Linux io_uring drive budgets.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UringDriveLimits {
+    pub max_control_events: usize,
+    pub max_cancel_actions: usize,
+    pub max_backlog_actions: usize,
+    pub max_submit_rounds: usize,
+    pub max_cqe_batch: usize,
+    pub max_cqes_per_drive: usize,
+    pub max_timer_expirations: usize,
+    pub emergency_drain_limit: usize,
+    pub cancel_reconcile_timeout: Duration,
+}
+
+#[cfg(windows)]
+impl UringDriveLimits {
+    pub const fn for_entries(entries: usize) -> Self {
+        Self {
+            max_control_events: entries,
+            max_cancel_actions: entries,
+            max_backlog_actions: entries,
+            max_submit_rounds: 2,
+            max_cqe_batch: entries,
+            max_cqes_per_drive: entries,
+            max_timer_expirations: entries,
+            emergency_drain_limit: entries,
+            cancel_reconcile_timeout: Duration::from_secs(1),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Default for UringDriveLimits {
+    fn default() -> Self {
+        Self::for_entries(1024)
+    }
+}
+
 #[cfg(not(windows))]
 pub use veloq_driver_uring::{
     BufferRegistrationMode, FileTableExhaustion, IoMode, ProvidedBufConfig, UringConfig,
+    UringDriveLimits,
 };
 
 /// I/O submission mode.
@@ -98,6 +141,8 @@ pub struct UringConfig {
     pub mode: IoMode,
     /// Number of entries in the ring.
     pub entries: NonZeroU32,
+    /// Per-drive fairness and safety budgets.
+    pub drive_limits: UringDriveLimits,
     /// Mode for buffer registration.
     pub registration_mode: BufferRegistrationMode,
     /// Provided-buffer ring to register, or `None` to run without one.
@@ -110,6 +155,12 @@ pub struct UringConfig {
 
 #[cfg(windows)]
 impl UringConfig {
+    /// Sets the Linux-side drive budget shim.
+    pub fn drive_limits(mut self, limits: UringDriveLimits) -> Self {
+        self.drive_limits = limits;
+        self
+    }
+
     /// Sets the registration mode.
     pub fn registration_mode(mut self, mode: BufferRegistrationMode) -> Self {
         self.registration_mode = mode;
@@ -141,6 +192,7 @@ impl Default for UringConfig {
         Self {
             mode: IoMode::Interrupt,
             entries: nz!(1024),
+            drive_limits: UringDriveLimits::default(),
             registration_mode: BufferRegistrationMode::Strict,
             provided_buffers: None,
             file_table_capacity: 1024,

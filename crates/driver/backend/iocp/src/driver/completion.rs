@@ -5,9 +5,9 @@ use veloq_driver_core::{
     driver::{
         AnomalyAttach, CancelMode, CompletionAnomalyKind, CompletionBackend,
         CompletionBackendHooks, CompletionCleanupGuard, CompletionContinuation, CompletionControl,
-        CompletionEnvelope, CompletionFlowExt, CompletionFlowOutcome, CompletionHookOutcome,
-        CompletionIngress, CompletionSource, PlatformOp, SyntheticCompletionSource,
-        UserCompletionEvent,
+        CompletionEnvelope, CompletionFailure, CompletionFlowExt, CompletionFlowOutcome,
+        CompletionIngress, CompletionSettlement, CompletionSource, PlatformOp,
+        SyntheticCompletionSource, UserCompletionEvent,
     },
     slot::{CheckedSlotView, InFlightOrphaned, InFlightWaiting, SlotRegistryExt, SlotView},
 };
@@ -108,15 +108,17 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
     fn handle_control(
         &mut self,
         control: CompletionControl,
-    ) -> CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect> {
+    ) -> CompletionSettlement<IocpSlotSpec, Self::BackendEffect> {
         match control {
             CompletionControl::Waker { raw, .. } => {
                 let rearmed = match self.completion.clear_notification() {
                     Ok(rearmed) => rearmed,
                     Err(error) => {
-                        return CompletionHookOutcome::Failed {
-                            error: error.attach_note("failed to clear IOCP waker notification"),
-                            effect: IocpBackendEffect::None,
+                        return CompletionSettlement::TerminalFailure {
+                            failure: CompletionFailure::control(
+                                error.attach_note("failed to clear IOCP waker notification"),
+                                IocpBackendEffect::None,
+                            ),
                         };
                     }
                 };
@@ -128,25 +130,29 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
                     }
                 } else {
                     self.diagnostics.backend().inc_waker_error();
-                    return CompletionHookOutcome::Failed {
-                        error: IocpError::Internal
-                            .to_report()
-                            .push_ctx("scope", "iocp.driver.completion.waker")
-                            .set_error_code(-raw.res)
-                            .attach_note("IOCP waker completion reported an error"),
-                        effect: IocpBackendEffect::None,
+                    return CompletionSettlement::TerminalFailure {
+                        failure: CompletionFailure::control(
+                            IocpError::Internal
+                                .to_report()
+                                .push_ctx("scope", "iocp.driver.completion.waker")
+                                .set_error_code(-raw.res)
+                                .attach_note("IOCP waker completion reported an error"),
+                            IocpBackendEffect::None,
+                        ),
                     };
                 }
-                CompletionHookOutcome::ControlHandled {
+                CompletionSettlement::ControlHandled {
                     effect: IocpBackendEffect::None,
                 }
             }
-            CompletionControl::Cancel { .. } => CompletionHookOutcome::Failed {
-                error: IocpError::InvalidState.report(
-                    "iocp.completion.handle_control",
-                    "async cancel completion had no pending request (programming error)",
+            CompletionControl::Cancel { .. } => CompletionSettlement::TerminalFailure {
+                failure: CompletionFailure::control(
+                    IocpError::InvalidState.report(
+                        "iocp.completion.handle_control",
+                        "async cancel completion had no pending request (programming error)",
+                    ),
+                    IocpBackendEffect::None,
                 ),
-                effect: IocpBackendEffect::None,
             },
         }
     }
@@ -156,7 +162,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
         event: UserCompletionEvent,
         mut slot: Slot<'_, InFlightWaiting>,
         source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
+    ) -> CompletionSettlement<IocpSlotSpec, Self::BackendEffect> {
         match source {
             CompletionSource::Synthetic(SyntheticCompletionSource::Timer) => {
                 complete_timer_waiting_slot(slot, event)
@@ -172,9 +178,22 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
                 )
             }
             CompletionSource::Kernel | CompletionSource::User | CompletionSource::Backend(_) => {
-                let io_result = calculate_io_result_from_slot(self.ext, &mut slot, event.res())?;
-                let socket_inflight = take_socket_inflight_from_slot(&mut slot);
-                complete_iocp_waiting_slot(slot, event, io_result, socket_inflight)
+                match calculate_io_result_from_slot(self.ext, &mut slot, event.res()) {
+                    Ok(io_result) => {
+                        let socket_inflight = take_socket_inflight_from_slot(&mut slot);
+                        complete_iocp_waiting_slot(slot, event, io_result, socket_inflight)
+                    }
+                    Err(error) => {
+                        let socket_inflight = take_socket_inflight_from_slot(&mut slot);
+                        complete_iocp_failure_slot(
+                            slot,
+                            error,
+                            socket_inflight
+                                .map(IocpBackendEffect::SocketInflight)
+                                .unwrap_or_default(),
+                        )
+                    }
+                }
             }
         }
     }
@@ -184,15 +203,15 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
         event: UserCompletionEvent,
         slot: Slot<'_, InFlightOrphaned>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, Self::BackendEffect>> {
+    ) -> CompletionSettlement<IocpSlotSpec, Self::BackendEffect> {
         let (cleanup, socket_inflight) = complete_iocp_orphaned_slot(slot, event.res());
-        Ok(CompletionHookOutcome::Cleanup {
+        CompletionSettlement::Cleanup {
             cleanup,
             continuation: CompletionContinuation::Final,
             effect: socket_inflight
                 .map(IocpBackendEffect::SocketInflight)
                 .unwrap_or_default(),
-        })
+        }
     }
 
     fn finish_backend_effect(&mut self, effect: Self::BackendEffect) -> IocpResult<()> {
@@ -389,7 +408,7 @@ fn complete_iocp_waiting_slot(
     event: UserCompletionEvent,
     io_result: IocpResult<usize>,
     socket_inflight: Option<SocketInflightToken>,
-) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, IocpBackendEffect>> {
+) -> CompletionSettlement<IocpSlotSpec, IocpBackendEffect> {
     let mut io_detail = Some(io_result);
     let effect = socket_inflight
         .map(IocpBackendEffect::SocketInflight)
@@ -400,11 +419,11 @@ fn complete_iocp_waiting_slot(
         let _ = guard.take_op();
         let _ = guard.take_completion_data();
         let _data = mem::take(guard.platform_mut());
-        return Ok(CompletionHookOutcome::Cleanup {
+        return CompletionSettlement::Cleanup {
             cleanup: CompletionCleanupGuard::default(),
             continuation: CompletionContinuation::Final,
             effect,
-        });
+        };
     }
 
     let completion_res = io_detail
@@ -431,7 +450,7 @@ fn complete_iocp_waiting_slot(
     if let Some(payload) = payload {
         let _ = guard.take_op();
         let _data = mem::take(guard.platform_mut());
-        Ok(CompletionHookOutcome::User {
+        CompletionSettlement::User {
             event,
             payload,
             detail: detail.or_else(|| io_detail.take()),
@@ -439,22 +458,55 @@ fn complete_iocp_waiting_slot(
             // IOCP 没有 multishot：一次提交恰好对应一条完成。
             continuation: CompletionContinuation::Final,
             effect,
-        })
+        }
     } else {
         drop(detail);
         let _ = guard.take_op();
         let _data = mem::take(guard.platform_mut());
-        Err(IocpError::InvalidState.report(
-            "iocp.complete_iocp_waiting_slot",
-            "slot payload missing on completion",
-        ))
+        CompletionSettlement::TerminalFailure {
+            failure: CompletionFailure::terminal(
+                IocpError::InvalidState.report(
+                    "iocp.complete_iocp_waiting_slot",
+                    "slot payload missing on completion",
+                ),
+                cleanup,
+                effect,
+            ),
+        }
+    }
+}
+
+fn complete_iocp_failure_slot(
+    mut slot: Slot<'_, InFlightWaiting>,
+    error: Report<IocpError>,
+    effect: IocpBackendEffect,
+) -> CompletionSettlement<IocpSlotSpec, IocpBackendEffect> {
+    let completion_result: IocpResult<usize> = Err(error);
+    let cleanup = slot
+        .with_access_mut(|access| {
+            let cleanup =
+                PlatformOp::completion_cleanup(access.operation_mut(), &completion_result);
+            access.operation_mut().get_mut().unbind_user_payload();
+            cleanup
+        })
+        .unwrap_or_default();
+    let mut completed = slot.complete();
+    let _ = completed.take_op();
+    let (_, detail) = completed.take_completion_data();
+    drop(detail);
+    let error = match completion_result {
+        Err(error) => error,
+        Ok(_) => unreachable!("failure result must contain the original completion error"),
+    };
+    CompletionSettlement::TerminalFailure {
+        failure: CompletionFailure::terminal(error, cleanup, effect),
     }
 }
 
 fn complete_timer_waiting_slot(
     slot: Slot<'_, InFlightWaiting>,
     event: UserCompletionEvent,
-) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, IocpBackendEffect>> {
+) -> CompletionSettlement<IocpSlotSpec, IocpBackendEffect> {
     let io_result: IocpResult<usize> = Ok(0);
     complete_iocp_waiting_slot(slot, event, io_result, None)
 }
@@ -463,7 +515,7 @@ fn complete_submission_failure_slot(
     slot: Slot<'_, InFlightWaiting>,
     event: UserCompletionEvent,
     report: Option<Report<IocpError>>,
-) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, IocpBackendEffect>> {
+) -> CompletionSettlement<IocpSlotSpec, IocpBackendEffect> {
     let io_result = report.unwrap_or_else(|| {
         IocpError::Submission
             .to_report()
@@ -478,7 +530,7 @@ fn complete_cancel_waiting_slot(
     slot: Slot<'_, InFlightWaiting>,
     event: UserCompletionEvent,
     mode: CancelMode,
-) -> IocpResult<CompletionHookOutcome<IocpSlotSpec, IocpBackendEffect>> {
+) -> CompletionSettlement<IocpSlotSpec, IocpBackendEffect> {
     let abort_result: IocpResult<usize> = IocpError::CompletionWait
         .push_ctx("scope", "iocp.driver.cancel")
         .set_error_code((-event.res()).max(1))
@@ -496,11 +548,11 @@ fn complete_cancel_waiting_slot(
         let (payload, detail) = completed.take_completion_data();
         drop(payload);
         drop(detail);
-        Ok(CompletionHookOutcome::Cleanup {
+        CompletionSettlement::Cleanup {
             cleanup,
             continuation: CompletionContinuation::Final,
             effect: IocpBackendEffect::None,
-        })
+        }
     }
 }
 

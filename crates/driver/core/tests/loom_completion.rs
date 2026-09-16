@@ -68,8 +68,8 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
     fn handle_control(
         &mut self,
         _control: CompletionControl,
-    ) -> CompletionHookOutcome<DummySlotSpec, Self::BackendEffect> {
-        CompletionHookOutcome::Ignore { effect: () }
+    ) -> CompletionSettlement<DummySlotSpec, Self::BackendEffect> {
+        CompletionSettlement::Ignore { effect: () }
     }
 
     fn complete_waiting(
@@ -77,29 +77,29 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
         event: UserCompletionEvent,
         slot: Slot<'_, InFlightWaiting, DummySlotSpec>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>> {
+    ) -> CompletionSettlement<DummySlotSpec, Self::BackendEffect> {
         if self.continuation.is_more() {
             // multishot：slot 的 op 与 payload 留给内核后续的完成。
-            return Ok(CompletionHookOutcome::User {
+            return CompletionSettlement::User {
                 event,
                 payload: (),
                 detail: None,
                 cleanup: CompletionCleanupGuard::default(),
                 continuation: self.continuation,
                 effect: (),
-            });
+            };
         }
         let mut completed = slot.complete();
         let _ = completed.take_op();
         let (payload, detail) = completed.take_completion_data();
-        Ok(CompletionHookOutcome::User {
+        CompletionSettlement::User {
             event,
             payload: payload.expect("loom test payload should exist"),
             detail,
             cleanup: CompletionCleanupGuard::default(),
             continuation: self.continuation,
             effect: (),
-        })
+        }
     }
 
     fn complete_orphaned(
@@ -107,17 +107,17 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
         _event: UserCompletionEvent,
         slot: Slot<'_, InFlightOrphaned, DummySlotSpec>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>> {
+    ) -> CompletionSettlement<DummySlotSpec, Self::BackendEffect> {
         let mut completed = slot.complete();
         let _ = completed.take_op();
         let (payload, detail) = completed.take_completion_data();
         let _ = payload;
         drop(detail);
-        Ok(CompletionHookOutcome::Cleanup {
+        CompletionSettlement::Cleanup {
             cleanup: CompletionCleanupGuard::default(),
             continuation: CompletionContinuation::Final,
             effect: (),
-        })
+        }
     }
 
     fn finish_backend_effect(

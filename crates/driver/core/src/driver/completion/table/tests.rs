@@ -5,9 +5,9 @@ use crate::{
     driver::{
         AnomalyAttach, AnomalyOutcome, CompletionAnomalyKind, CompletionAnomalyReason,
         CompletionBackend, CompletionBackendHooks, CompletionCleanup, CompletionCleanupGuard,
-        CompletionContinuation, CompletionControl, CompletionEnvelope, CompletionFlowExt,
-        CompletionFlowOutcome, CompletionHookOutcome, CompletionIngress, CompletionSource,
-        CompletionToken, HookResult, OpToken, PlatformOp, registry::OpRegistry,
+        CompletionContinuation, CompletionControl, CompletionEnvelope, CompletionFailure,
+        CompletionFlowExt, CompletionFlowOutcome, CompletionIngress, CompletionSettlement,
+        CompletionSource, CompletionToken, HookResult, OpToken, PlatformOp, registry::OpRegistry,
     },
     slot::{
         self, CheckedSlotView, Generation, InFlightOrphaned, InFlightWaiting, SlotRegistryExt,
@@ -71,6 +71,7 @@ fn test_event(token: OpToken, res: i32) -> UserCompletionEvent {
 struct TestHooks {
     cleanup: Option<CompletionCleanupGuard>,
     corrupt_cleanup: Option<CompletionCleanupGuard>,
+    waiting_failure: Option<CompletionSettlement<DummySlotSpec, ()>>,
     /// 还要产出多少条 `More` 完成，用来模拟一个 multishot 操作。
     remaining_more: usize,
     control_failure: bool,
@@ -83,6 +84,7 @@ impl TestHooks {
         Self {
             cleanup: None,
             corrupt_cleanup: None,
+            waiting_failure: None,
             remaining_more,
             control_failure: false,
             finish_calls: 0,
@@ -97,6 +99,13 @@ impl TestHooks {
         self.remaining_more -= 1;
         CompletionContinuation::More
     }
+
+    fn with_waiting_failure(failure: CompletionSettlement<DummySlotSpec, ()>) -> Self {
+        Self {
+            waiting_failure: Some(failure),
+            ..Self::default()
+        }
+    }
 }
 
 impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
@@ -106,16 +115,18 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
     fn handle_control(
         &mut self,
         _control: CompletionControl,
-    ) -> CompletionHookOutcome<DummySlotSpec, Self::BackendEffect> {
+    ) -> CompletionSettlement<DummySlotSpec, Self::BackendEffect> {
         if self.control_failure {
-            CompletionHookOutcome::Failed {
-                error: Report::new(DummyError)
-                    .set_error_code(101)
-                    .attach_note("control completion failed"),
-                effect: (),
+            CompletionSettlement::TerminalFailure {
+                failure: CompletionFailure::control(
+                    Report::new(DummyError)
+                        .set_error_code(101)
+                        .attach_note("control completion failed"),
+                    (),
+                ),
             }
         } else {
-            CompletionHookOutcome::Ignore { effect: () }
+            CompletionSettlement::Ignore { effect: () }
         }
     }
 
@@ -124,32 +135,35 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
         event: UserCompletionEvent,
         slot: slot::Slot<'_, InFlightWaiting, DummySlotSpec>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>> {
+    ) -> CompletionSettlement<DummySlotSpec, Self::BackendEffect> {
+        if let Some(failure) = self.waiting_failure.take() {
+            return failure;
+        }
         let continuation = self.next_continuation();
         if continuation.is_more() {
             // multishot：slot 的 op 与 payload 必须原地留给内核后续的完成，记录里携带的
             // 是**本次**完成新产出的东西（真实后端是一个 fd 或一个 FixedBuf）。
-            return Ok(CompletionHookOutcome::User {
+            return CompletionSettlement::User {
                 event,
                 payload: (),
                 detail: None,
                 cleanup: self.cleanup.take().unwrap_or_default(),
                 continuation,
                 effect: (),
-            });
+            };
         }
 
         let mut completed = slot.complete();
         let _ = completed.take_op();
         let (payload, detail) = completed.take_completion_data();
-        Ok(CompletionHookOutcome::User {
+        CompletionSettlement::User {
             event,
             payload: payload.expect("test slot payload should exist"),
             detail,
             cleanup: self.cleanup.take().unwrap_or_default(),
             continuation,
             effect: (),
-        })
+        }
     }
 
     fn complete_orphaned(
@@ -157,17 +171,17 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
         _event: UserCompletionEvent,
         slot: slot::Slot<'_, InFlightOrphaned, DummySlotSpec>,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>> {
+    ) -> CompletionSettlement<DummySlotSpec, Self::BackendEffect> {
         let mut completed = slot.complete();
         let _ = completed.take_op();
         let (payload, detail) = completed.take_completion_data();
         let _ = payload;
         drop(detail);
-        Ok(CompletionHookOutcome::Cleanup {
+        CompletionSettlement::Cleanup {
             cleanup: self.cleanup.take().unwrap_or_default(),
             continuation: CompletionContinuation::Final,
             effect: (),
-        })
+        }
     }
 
     fn complete_corrupt(
@@ -175,13 +189,13 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
         event: UserCompletionEvent,
         kind: CompletionAnomalyKind,
         _source: CompletionSource<'_, Self::BackendIngress>,
-    ) -> HookResult<DummySlotSpec, CompletionHookOutcome<DummySlotSpec, Self::BackendEffect>> {
-        Ok(CompletionHookOutcome::Anomaly {
+    ) -> CompletionSettlement<DummySlotSpec, Self::BackendEffect> {
+        CompletionSettlement::Anomaly {
             kind,
             attach: AnomalyAttach::from_raw_completion(event.raw()),
             cleanup: self.corrupt_cleanup.take().unwrap_or_default(),
             effect: (),
-        })
+        }
     }
 
     fn finish_backend_effect(
@@ -256,6 +270,159 @@ fn failed_effect_takes_priority_and_keeps_control_error_as_source() {
         Some("202")
     );
     assert!(error.iter_diag_sources().next().is_some());
+}
+
+#[test]
+fn terminal_hook_failure_finalizes_the_slot_and_runs_cleanup_once() {
+    let (mut registry, token) = active_registry();
+    let table = registry.shared.clone();
+    let cleanup_count = Arc::new(AtomicUsize::new(0));
+    let failure = CompletionSettlement::TerminalFailure {
+        failure: CompletionFailure::terminal(
+            Report::new(DummyError)
+                .set_error_code(303)
+                .attach_note("terminal completion hook failed"),
+            counting_cleanup(&cleanup_count),
+            (),
+        ),
+    };
+    let mut hooks = TestHooks::with_waiting_failure(failure);
+
+    let error = accept_ingress_result(
+        &mut registry,
+        CompletionIngress::User(test_event(token, 0)),
+        &mut hooks,
+    )
+    .expect_err("terminal failure must be returned");
+
+    assert_eq!(
+        error.error_code().map(ToString::to_string).as_deref(),
+        Some("303")
+    );
+    assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
+    assert!(
+        table.slots[token.index()]
+            .status(Ordering::Acquire)
+            .is_idle()
+    );
+    assert_eq!(registry.active_count(), 0);
+}
+
+#[test]
+fn more_hook_failure_quarantines_until_a_later_final_completion() {
+    let (mut registry, token) = active_registry();
+    let table = registry.shared.clone();
+    let cleanup_count = Arc::new(AtomicUsize::new(0));
+    let failure = CompletionSettlement::Quarantined {
+        failure: CompletionFailure::quarantined(
+            Report::new(DummyError)
+                .set_error_code(304)
+                .attach_note("streaming completion hook failed"),
+            counting_cleanup(&cleanup_count),
+            (),
+        ),
+    };
+    let mut hooks = TestHooks::with_waiting_failure(failure);
+
+    let error = accept_ingress_result(
+        &mut registry,
+        CompletionIngress::User(test_event(token, 0)),
+        &mut hooks,
+    )
+    .expect_err("MORE failure must be returned");
+
+    assert_eq!(
+        error.error_code().map(ToString::to_string).as_deref(),
+        Some("304")
+    );
+    assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
+    assert_eq!(
+        table.slots[token.index()].status(Ordering::Acquire).state,
+        SlotState::InFlightOrphaned
+    );
+    assert_eq!(registry.active_count(), 1);
+
+    let final_outcome = accept_with_hooks(&mut registry, test_event(token, 1), &mut hooks);
+    assert_eq!(final_outcome.orphan_cleaned, 1);
+    assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
+    assert!(
+        table.slots[token.index()]
+            .status(Ordering::Acquire)
+            .is_idle()
+    );
+    assert_eq!(registry.active_count(), 0);
+}
+
+#[test]
+fn backend_effect_failure_still_finalizes_a_successful_completion() {
+    let (mut registry, token) = active_registry();
+    let table = registry.shared.clone();
+    let mut hooks = TestHooks {
+        finish_failure: true,
+        ..TestHooks::default()
+    };
+
+    let error = accept_ingress_result(
+        &mut registry,
+        CompletionIngress::User(test_event(token, 0)),
+        &mut hooks,
+    )
+    .expect_err("backend effect failure must be returned");
+
+    assert_eq!(
+        error.error_code().map(ToString::to_string).as_deref(),
+        Some("202")
+    );
+    let status = table.slots[token.index()].status(Ordering::Acquire);
+    assert_eq!(status.state, SlotState::Idle);
+    assert!(
+        status.ready,
+        "the completed record remains available to the consumer"
+    );
+    assert_eq!(registry.active_count(), 0);
+}
+
+#[test]
+fn cleanup_failure_still_finalizes_a_terminal_hook_failure() {
+    let (mut registry, token) = active_registry();
+    let table = registry.shared.clone();
+    let failure = CompletionSettlement::TerminalFailure {
+        failure: CompletionFailure::terminal(
+            Report::new(DummyError)
+                .set_error_code(305)
+                .attach_note("terminal completion hook failed"),
+            CompletionCleanupGuard::new(CompletionCleanup::new(|| {
+                Err(DriverCoreError::Internal.to_report())
+            })),
+            (),
+        ),
+    };
+    let mut hooks = TestHooks::with_waiting_failure(failure);
+
+    let error = accept_ingress_result(
+        &mut registry,
+        CompletionIngress::User(test_event(token, 0)),
+        &mut hooks,
+    )
+    .expect_err("terminal failure must be returned");
+
+    assert_eq!(
+        error.error_code().map(ToString::to_string).as_deref(),
+        Some("305")
+    );
+    assert!(
+        table.slots[token.index()]
+            .status(Ordering::Acquire)
+            .is_idle()
+    );
+    assert_eq!(registry.active_count(), 0);
+    assert_eq!(
+        table
+            .completion_diagnostics()
+            .snapshot()
+            .orphan_cleanup_error,
+        1
+    );
 }
 
 fn active_registry() -> (OpRegistry<DummySlotSpec>, OpToken) {

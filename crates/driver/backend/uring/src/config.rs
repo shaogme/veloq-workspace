@@ -6,6 +6,7 @@ pub use veloq_driver_core::{DirectOwnerId, RawHandleKind};
 use veloq_std::{
     mem,
     num::{NonZeroU16, NonZeroU32, NonZeroUsize},
+    time::Duration,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +103,73 @@ pub enum IoMode {
     Polling(NonZeroU32),
 }
 
+/// Per-drive fairness and safety budgets for the io_uring backend.
+///
+/// The limits are deliberately part of the backend configuration.  A completion burst must not
+/// be able to turn one driver poll into an unbounded loop, and an exhausted budget must be
+/// visible to the caller's next drive rather than silently dropping work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UringDriveLimits {
+    pub max_control_events: usize,
+    pub max_cancel_actions: usize,
+    pub max_backlog_actions: usize,
+    pub max_submit_rounds: usize,
+    pub max_cqe_batch: usize,
+    pub max_cqes_per_drive: usize,
+    pub max_timer_expirations: usize,
+    /// Maximum number of CQEs a high-water emergency drain may consume in one batch.
+    pub emergency_drain_limit: usize,
+    /// Maximum time a cancel ENOENT may remain deferred while CQE collection is not exhausted.
+    pub cancel_reconcile_timeout: Duration,
+}
+
+impl UringDriveLimits {
+    /// Creates limits sized for a ring with `entries` slots.
+    pub const fn for_entries(entries: usize) -> Self {
+        Self {
+            max_control_events: entries,
+            max_cancel_actions: entries,
+            max_backlog_actions: entries,
+            max_submit_rounds: 2,
+            max_cqe_batch: entries,
+            max_cqes_per_drive: entries,
+            max_timer_expirations: entries,
+            emergency_drain_limit: entries,
+            cancel_reconcile_timeout: Duration::from_secs(1),
+        }
+    }
+
+    pub(crate) fn validate(self, ring_entries: usize) -> Result<(), &'static str> {
+        if self.max_control_events == 0
+            || self.max_cancel_actions == 0
+            || self.max_backlog_actions == 0
+            || self.max_submit_rounds == 0
+            || self.max_cqe_batch == 0
+            || self.max_cqes_per_drive == 0
+            || self.max_timer_expirations == 0
+            || self.emergency_drain_limit == 0
+        {
+            return Err("uring drive budgets must be non-zero");
+        }
+        if self.max_cqe_batch > ring_entries {
+            return Err("max_cqe_batch cannot exceed ring entries");
+        }
+        if self.emergency_drain_limit > ring_entries {
+            return Err("emergency_drain_limit cannot exceed ring entries");
+        }
+        if self.cancel_reconcile_timeout.is_zero() {
+            return Err("cancel_reconcile_timeout must be non-zero");
+        }
+        Ok(())
+    }
+}
+
+impl Default for UringDriveLimits {
+    fn default() -> Self {
+        Self::for_entries(1024)
+    }
+}
+
 /// What happens once every entry of the kernel's registered file table is taken.
 ///
 /// The table is a fixed-size kernel allocation, so it cannot grow on demand. The number of
@@ -161,6 +229,7 @@ impl ProvidedBufConfig {
 pub struct UringConfig {
     pub mode: IoMode,
     pub entries: NonZeroU32,
+    pub drive_limits: UringDriveLimits,
     pub registration_mode: BufferRegistrationMode,
     /// Provided-buffer ring to register, or `None` to run without one.
     ///
@@ -191,6 +260,7 @@ impl Default for UringConfig {
             mode: IoMode::Interrupt,
             // SAFETY: 1024 is non-zero.
             entries: unsafe { NonZeroU32::new_unchecked(1024) },
+            drive_limits: UringDriveLimits::default(),
             registration_mode: BufferRegistrationMode::Strict,
             provided_buffers: None,
             file_table_capacity: DEFAULT_FILE_TABLE_CAPACITY,
@@ -203,6 +273,11 @@ impl Default for UringConfig {
 const DEFAULT_FILE_TABLE_CAPACITY: u32 = 1024;
 
 impl UringConfig {
+    pub fn drive_limits(mut self, limits: UringDriveLimits) -> Self {
+        self.drive_limits = limits;
+        self
+    }
+
     pub fn registration_mode(mut self, mode: BufferRegistrationMode) -> Self {
         self.registration_mode = mode;
         self
@@ -221,5 +296,19 @@ impl UringConfig {
     pub fn file_table_exhaustion(mut self, exhaustion: FileTableExhaustion) -> Self {
         self.file_table_exhaustion = exhaustion;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UringDriveLimits;
+
+    #[test]
+    fn drive_limits_require_cqe_budgets_to_fit_the_ring() {
+        assert!(UringDriveLimits::for_entries(64).validate(64).is_ok());
+        assert_eq!(
+            UringDriveLimits::default().validate(64),
+            Err("max_cqe_batch cannot exceed ring entries")
+        );
     }
 }

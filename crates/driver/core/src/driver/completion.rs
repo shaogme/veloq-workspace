@@ -11,6 +11,9 @@ mod table;
 mod token;
 mod types;
 
+#[cfg(test)]
+mod settlement_model;
+
 pub use cancel::{
     CancelMode, CancelRequest, CancelSubmitOutcome, CancelTargetGoneReason, cancel_target_kind,
 };
@@ -19,9 +22,10 @@ pub use event::{
     CompletionIdentitySource, RawCompletion, UserCompletionEvent, UserCompletionEventMismatch,
 };
 pub use flow::{
-    CompletionBackendHooks, CompletionBackendIngressAction, CompletionControl, CompletionFlowExt,
-    CompletionFlowOutcome, CompletionHookOutcome, CompletionIngress, CompletionSource,
-    CompletionWritePermit, HookResult, SyntheticCompletionSource,
+    CompletionBackendHooks, CompletionBackendIngressAction, CompletionControl, CompletionFailure,
+    CompletionFlowExt, CompletionFlowOutcome, CompletionIngress, CompletionSettlement,
+    CompletionSlotDisposition, CompletionSource, CompletionWritePermit, HookResult,
+    SyntheticCompletionSource,
 };
 pub use packet::{
     CompletionContinuation, CompletionInput, CompletionPacket, CompletionRecord, UserCompletion,
