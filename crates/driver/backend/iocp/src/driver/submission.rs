@@ -5,7 +5,7 @@ use veloq_std::{
     time::{Duration, Instant},
 };
 
-use super::completion::COMP_BACKEND_IOCP;
+use super::{completion::COMP_BACKEND_IOCP, polling::TimerEngine};
 use diagweave::prelude::*;
 use veloq_blocking::{BlockingTask, ThreadPool};
 use veloq_driver_core::{
@@ -37,7 +37,7 @@ use crate::{
 
 pub(crate) struct SubmitContextInternal<'a> {
     port: Arc<IoCompletionPort>,
-    wheel: &'a mut veloq_wheel::Wheel<OpToken>,
+    timer: &'a mut TimerEngine,
     completion_table: &'a SharedCompletionTable<IocpSlotSpec>,
     diagnostics: &'a mut IocpDriverCompletionDiagnostics,
 }
@@ -45,13 +45,13 @@ pub(crate) struct SubmitContextInternal<'a> {
 impl<'a> SubmitContextInternal<'a> {
     pub(crate) fn new(
         port: Arc<IoCompletionPort>,
-        wheel: &'a mut veloq_wheel::Wheel<OpToken>,
+        timer: &'a mut TimerEngine,
         completion_table: &'a SharedCompletionTable<IocpSlotSpec>,
         diagnostics: &'a mut IocpDriverCompletionDiagnostics,
     ) -> Self {
         Self {
             port,
-            wheel,
+            timer,
             completion_table,
             diagnostics,
         }
@@ -317,12 +317,25 @@ impl<'a> IocpDriver<'a> {
         token: OpToken,
         duration: Duration,
     ) -> DriverSubmitResult<IocpError> {
-        let timeout = ctx.wheel.insert(token, duration);
+        let timeout = match ctx.timer.insert(token, duration) {
+            Ok(timeout) => timeout,
+            Err(error) => {
+                return DriverSubmitResult::failed(
+                    IocpError::InvalidInput
+                        .report(
+                            "iocp.driver.handle_timer_sub",
+                            "timer duration is outside the wheel range",
+                        )
+                        .with_ctx("timer_error", format!("{error:?}")),
+                    SubmitStatus::Void,
+                );
+            }
+        };
         if let Some(platform) = ops.platform_mut(token) {
             platform.timer_id = Some(timeout);
             platform.timer_deadline = Some(Instant::now() + duration);
         } else {
-            ctx.wheel.cancel(timeout);
+            ctx.timer.cancel(timeout);
             return DriverSubmitResult::failed(
                 IocpError::InvalidState
                     .to_report()

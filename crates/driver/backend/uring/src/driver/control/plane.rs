@@ -1026,13 +1026,13 @@ impl UringControlPlane {
 
     #[cfg(any(test, feature = "test-hooks"))]
     #[inline]
-    pub(crate) fn timer_for(&self, token: OpToken) -> Option<veloq_wheel::TaskId> {
+    pub(crate) fn timer_for(&self, token: OpToken) -> Option<veloq_wheel::TimerId> {
         self.observer.timer_for(token)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     #[inline]
-    pub(crate) fn timer_entries(&self) -> veloq_std::vec::Vec<(veloq_wheel::TaskId, OpToken)> {
+    pub(crate) fn timer_entries(&self) -> veloq_std::vec::Vec<(veloq_wheel::TimerId, OpToken)> {
         self.observer.timer_entries()
     }
 
@@ -1202,9 +1202,11 @@ mod tests {
                 .expect("staged entry should fit");
         }
         assert_eq!(ledger.mark_consumed(3, 3, 0), Ok(3));
-        assert!(ledger
-            .settle_completion(CompletionToken::user(middle), true)
-            .expect("middle completion should settle"));
+        assert!(
+            ledger
+                .settle_completion(CompletionToken::user(middle), true)
+                .expect("middle completion should settle")
+        );
 
         ledger
             .push(StagedEntry::User(replacement))

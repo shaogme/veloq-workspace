@@ -757,7 +757,7 @@ impl<'a> DriverRaw for UringDriver<'a> {
             .attach_note("advance unified uring drive cycle")?;
 
         Ok(DriveOutcome {
-            next_timeout_hint: self.control.timers.next_timeout(),
+            next_timeout_hint: self.control.timers.next_wakeup(),
             ready_completion: self.ops.shared.has_ready_completion(),
             in_flight: self.has_active_ops_internal(),
         })

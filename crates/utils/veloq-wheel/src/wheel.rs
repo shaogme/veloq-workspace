@@ -1,615 +1,741 @@
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 use core::time::Duration;
 use slotmap::{DefaultKey, SlotMap};
 
-use crate::{config::WheelConfig, task::TaskId};
+use crate::{config::WheelConfig, error::TimerError, id::TimerId, level::Level};
 
-/// Internal entry in the slotmap.
-/// Acts as a node in a singly-linked list (lazy cancellation).
-///
-/// Slotmap 中的内部条目。
-/// 作为单向链表中的一个节点（惰性取消）。
+const SMALL_ADVANCE_LIMIT: u64 = 4096;
+
 struct WheelEntry<T> {
-    /// The actual item/data stored in the wheel.
-    /// Wrapped in Option for lazy cancellation (take() leaves None).
-    ///
-    /// 时间轮中存储的实际项目/数据。
-    /// 包装在 Option 中以支持惰性取消（take() 留下 None）。
-    item: Option<T>,
-
-    /// Absolute tick timestamp when this item expires.
-    ///
-    /// 该项目过期的绝对 tick 时间戳。
-    deadline: u64,
-
-    // Linked list pointers (Singly linked now)
-    // 链表指针（现在是单向的）
-    /// Key of the next entry in the list.
-    ///
-    /// 链表中后一个条目的 Key。
-    next: Option<DefaultKey>,
-
-    // Location for Head update
-    // 用于 Head 更新的位置信息
-    /// The hierarchy level this entry is currently in (0 or 1).
-    ///
-    /// 该条目当前所在的层级（0 或 1）。
+    item: T,
+    deadline_tick: u64,
     level: u8,
-
-    /// The slot index within the level.
-    ///
-    /// 层级内的槽位索引。
-    slot_index: u32,
+    slot: u32,
+    prev: Option<DefaultKey>,
+    next: Option<DefaultKey>,
 }
 
-/// Represents a single level in the hierarchical timing wheel.
-///
-/// 表示分层时间轮中的单个层级。
-struct Level {
-    /// Heads of the linked lists for each slot.
-    /// Each slot contains the head key of a singly-linked list of tasks.
-    ///
-    /// 每个槽位的链表头。
-    /// 每个槽位包含一个任务单向链表的头 Key。
-    slots: Vec<Option<DefaultKey>>,
-
-    /// Bitmask for fast modulo operations (slot_count - 1).
-    ///
-    /// 用于快速模运算的位掩码 (slot_count - 1)。
-    mask: usize,
+pub struct Expired<T> {
+    pub id: TimerId,
+    pub item: T,
+    pub deadline_tick: u64,
 }
 
-impl Level {
-    /// Create a new level with the specified number of slots.
-    ///
-    /// 创建一个具有指定槽位数量的新层级。
-    fn new(slot_count: usize) -> Self {
-        // Initialize all slots to None (empty list)
-        // 将所有槽位初始化为 None（空链表）
-        let slots = vec![None; slot_count];
-        Self {
-            slots,
-            mask: slot_count - 1,
-        }
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdvanceReport {
+    pub elapsed_ticks: u64,
+    pub expired_count: usize,
+    pub fast_forwarded: bool,
 }
 
-/// A hierarchical timing wheel implementation.
-/// Uses `SlotMap` for O(1) task addressing and singly-linked lists with lazy cancellation.
-///
-/// 分层时间轮实现。
-/// 使用 `SlotMap` 进行 O(1) 的任务寻址，并使用具有惰性取消功能的单向链表。
 pub struct Wheel<T> {
-    /// Storage for tasks, providing stable keys (TaskId).
-    ///
-    /// 任务存储，提供稳定的 Key (TaskId)。
     tasks: SlotMap<DefaultKey, WheelEntry<T>>,
-
-    /// Wheel levels (L0, L1).
-    ///
-    /// 时间轮层级 (L0, L1)。
     levels: Vec<Level>,
-
-    /// Global tick count, strictly increasing.
-    ///
-    /// 全局 tick 计数，严格递增。
-    global_tick: u64,
-
-    /// L0 tick duration in milliseconds.
-    ///
-    /// L0 层 tick 的持续时间（毫秒）。
-    tick_duration_ms: u64,
-
-    /// Ratio of L1 tick to L0 tick (how many L0 ticks make one L1 tick).
-    ///
-    /// L1 tick 与 L0 tick 的比率（多少个 L0 tick 构成一个 L1 tick）。
-    l1_tick_ratio: u64,
-
-    /// Capacity of L0 in ticks (number of slots in L0).
-    ///
-    /// L0 的容量（以 tick 为单位，即 L0 的槽位数量）。
-    l0_capacity_ticks: u64,
+    current_tick: u64,
+    remainder_nanos: u64,
+    base_tick_nanos: u64,
 }
 
 impl<T> Wheel<T> {
-    /// Create a new Timing Wheel with the provided configuration.
-    ///
-    /// 使用提供的配置创建一个新的时间轮。
     pub fn new(config: WheelConfig) -> Self {
-        let l0 = Level::new(config.l0_slot_count);
-        let l1 = Level::new(config.l1_slot_count);
-
-        let tick_duration_ms = config.l0_tick_duration.as_millis() as u64;
-        let tick_duration_ms = tick_duration_ms.max(1);
-
-        let l1_ms = config.l1_tick_duration.as_millis() as u64;
-        let l1_tick_ratio = l1_ms / tick_duration_ms;
-        let l0_capacity_ticks = config.l0_slot_count as u64;
-
+        let levels = config
+            .levels()
+            .iter()
+            .map(|level| {
+                Level::new(
+                    level.unit_ticks,
+                    level.span_ticks,
+                    level.slot_count,
+                    level.mask,
+                )
+            })
+            .collect();
         Self {
             tasks: SlotMap::new(),
-            levels: vec![l0, l1],
-            global_tick: 0,
-            tick_duration_ms,
-            l1_tick_ratio,
-            l0_capacity_ticks,
+            levels,
+            current_tick: 0,
+            remainder_nanos: 0,
+            base_tick_nanos: config.base_tick_nanos(),
         }
     }
 
-    /// Convert a duration to a number of ticks based on L0 tick duration.
-    ///
-    /// 根据 L0 tick 持续时间将持续时间转换为 tick 数量。
-    fn delay_to_ticks(&self, delay: Duration) -> u64 {
-        let ms = delay.as_millis() as u64;
-        ms / self.tick_duration_ms
-    }
-
-    /// Insert a task into the wheel with a specified delay.
-    /// Returns a `TaskId` that can be used to cancel the task.
-    ///
-    /// 将任务以指定的延迟插入时间轮。
-    /// 返回一个 `TaskId`，可用于取消该任务。
-    pub fn insert(&mut self, item: T, delay: Duration) -> TaskId {
-        let ticks = self.delay_to_ticks(delay).max(1);
-        let deadline = self.global_tick.wrapping_add(ticks);
-        let (level, slot_index) = self.determine_location(deadline);
-
-        // Insert into SlotMap
-        // 插入到 SlotMap 中
+    pub fn insert(&mut self, item: T, delay: Duration) -> Result<TimerId, TimerError> {
+        let deadline_tick = self.deadline_after(delay)?;
         let key = self.tasks.insert(WheelEntry {
-            item: Some(item),
-            deadline,
+            item,
+            deadline_tick,
+            level: 0,
+            slot: 0,
+            prev: None,
             next: None,
-            level: level as u8,
-            slot_index: slot_index as u32,
         });
-
-        // Link into the determined slot
-        // 链接到确定的槽位中
-        self.link(key, level, slot_index);
-
-        TaskId::from_key(key)
-    }
-
-    /// Cancel a task by its ID.
-    /// Returns `Some(item)` if the task was found and canceled, or `None` otherwise.
-    ///
-    /// 通过 ID 取消任务。
-    /// 如果找到并取消了任务，则返回 `Some(item)`，否则返回 `None`。
-    pub fn cancel(&mut self, task_id: TaskId) -> Option<T> {
-        let key = task_id.key();
-
-        // Lazy cancellation: just take the item.
-        // The entry remains in the slotmap until the wheel advances to its deadline.
-        //
-        // 惰性取消：只需取出 item。
-        // 条目保留在 SlotMap 中，直到时间轮推进到其截止日期。
-        self.tasks.get_mut(key).and_then(|entry| entry.item.take())
-    }
-
-    /// Advance the wheel by the specified elapsed time and populate `expired` with expired items.
-    ///
-    /// This method is optimized to handle large time jumps efficiently by
-    /// batching L0 processing and jumping to L1 cascade points.
-    ///
-    /// 将时间轮推进指定的经过时间，并将过期的项目填充到 `expired` 中。
-    ///
-    /// 该方法经过优化，通过批量处理 L0 并跳转到 L1 级联点，可以高效地处理较大的时间跨度。
-    pub fn advance(&mut self, elapsed: Duration, expired: &mut Vec<T>) {
-        let ticks = self.delay_to_ticks(elapsed);
-
-        if ticks == 0 {
-            return;
+        let (level, slot) = self.determine_location(deadline_tick);
+        if let Err(error) = self.link(key, level, slot) {
+            self.tasks.remove(key);
+            return Err(error);
         }
+        self.debug_assert_invariants();
+        Ok(TimerId::from_key(key))
+    }
 
-        let mut remaining_ticks = ticks;
+    pub fn reschedule(&mut self, id: TimerId, delay: Duration) -> Result<(), TimerError> {
+        let deadline_tick = self.deadline_after(delay)?;
+        let key = id.key();
+        if !self.tasks.contains_key(key) {
+            return Err(TimerError::StaleTimerId);
+        }
+        self.unlink(key)?;
+        self.tasks
+            .get_mut(key)
+            .ok_or(TimerError::StaleTimerId)?
+            .deadline_tick = deadline_tick;
+        let (level, slot) = self.determine_location(deadline_tick);
+        self.link(key, level, slot)?;
+        self.debug_assert_invariants();
+        Ok(())
+    }
 
-        while remaining_ticks > 0 {
-            // Determine distance to the next L1 cascade point.
-            // Cascade happens when global_tick % l1_tick_ratio == 0.
-            // We want the distance to the NEXT multiple of ratio.
-            //
-            // 确定到下一个 L1 级联点的距离。
-            // 当 global_tick % l1_tick_ratio == 0 时发生级联。
-            // 我们希望得到距离下一个比率倍数的距离。
-            let current_mod = self.global_tick % self.l1_tick_ratio;
-            let ticks_to_cascade = self.l1_tick_ratio - current_mod;
+    pub fn cancel(&mut self, id: TimerId) -> Option<T> {
+        let key = id.key();
+        if !self.tasks.contains_key(key) {
+            return None;
+        }
+        self.unlink(key).ok()?;
+        let entry = self.tasks.remove(key)?;
+        self.debug_assert_invariants();
+        Some(entry.item)
+    }
 
-            // We can advance at most `remaining_ticks`, or until we hit the cascade point.
-            // If ticks_to_cascade is small, we process L0 slots logic then cascade.
-            //
-            // 我们最多可以推进 `remaining_ticks`，或者直到遇到级联点。
-            // 如果 ticks_to_cascade 很小，我们将处理 L0 槽位逻辑然后进行级联。
-            let step = remaining_ticks.min(ticks_to_cascade);
+    pub fn advance_by(
+        &mut self,
+        elapsed: Duration,
+        expired: &mut Vec<Expired<T>>,
+    ) -> Result<AdvanceReport, TimerError> {
+        let elapsed_nanos: u64 = elapsed
+            .as_nanos()
+            .try_into()
+            .map_err(|_| TimerError::ElapsedOverflow)?;
+        let total_nanos = self
+            .remainder_nanos
+            .checked_add(elapsed_nanos)
+            .ok_or(TimerError::ElapsedOverflow)?;
+        let elapsed_ticks = total_nanos / self.base_tick_nanos;
+        let remainder_nanos = total_nanos % self.base_tick_nanos;
+        let target_tick = self
+            .current_tick
+            .checked_add(elapsed_ticks)
+            .ok_or(TimerError::ClockOverflow)?;
 
-            // Process L0 slots covered by this step: [global_tick + 1, global_tick + step]
-            //
-            // 处理此步骤覆盖的 L0 槽位：[global_tick + 1, global_tick + step]
-            if step >= self.l0_capacity_ticks {
-                // Optimization: If the step covers the entire L0 wheel (and more),
-                // we just clear ALL slots in L0. L0 does not get refilled during this step (only at cascade).
-                //
-                // 优化：如果步骤覆盖了整个 L0 时间轮（甚至更多），
-                // 我们只需清除 L0 中的所有槽位。在此步骤期间 L0 不会被重新填充（仅在级联时填充）。
-
-                // Use explicit splitting of borrows to allow drain_list call
-                // 使用显式借用拆分以允许 drain_list 调用
-                let tasks = &mut self.tasks;
-                for slot in &mut self.levels[0].slots {
-                    if let Some(head) = slot.take() {
-                        Self::drain_list(tasks, head, expired);
-                    }
-                }
-            } else {
-                // Process specific slots
-                // 处理特定槽位
-                for i in 1..=step {
-                    let target_tick = self.global_tick.wrapping_add(i);
-                    let idx = (target_tick as usize) & self.levels[0].mask;
-                    if let Some(head) = self.levels[0].slots[idx].take() {
-                        Self::drain_list(&mut self.tasks, head, expired);
-                    }
-                }
-            }
-
-            self.global_tick = self.global_tick.wrapping_add(step);
-            remaining_ticks -= step;
-
-            // Check if we hit a cascade point
-            // 检查是否遇到级联点
-            if self.global_tick.is_multiple_of(self.l1_tick_ratio) {
-                let l1_tick = self.global_tick / self.l1_tick_ratio;
-                let l1_idx = (l1_tick as usize) & self.levels[1].mask;
-
-                if let Some(head) = self.levels[1].slots[l1_idx].take() {
-                    self.cascade_list(head, expired);
-                }
+        self.remainder_nanos = remainder_nanos;
+        let expired_start = expired.len();
+        let fast_forwarded = elapsed_ticks > SMALL_ADVANCE_LIMIT;
+        if fast_forwarded {
+            self.fast_forward(target_tick, expired)?;
+        } else {
+            self.cascade_at_current_tick(expired)?;
+            self.process_l0_slot(expired)?;
+            while self.current_tick < target_tick {
+                self.current_tick += 1;
+                self.cascade_at_current_tick(expired)?;
+                self.process_l0_slot(expired)?;
             }
         }
+        self.debug_assert_invariants();
+        Ok(AdvanceReport {
+            elapsed_ticks,
+            expired_count: expired.len() - expired_start,
+            fast_forwarded,
+        })
     }
 
-    pub fn tick_duration(&self) -> Duration {
-        Duration::from_millis(self.tick_duration_ms)
-    }
-
-    /// Calculate the duration until the next timed event triggers.
-    /// Returns `None` if the wheel is empty.
-    ///
-    /// 计算距离下一个定时事件触发的持续时间。
-    /// 如果时间轮为空，则返回 `None`。
-    pub fn next_timeout(&self) -> Option<Duration> {
+    pub fn next_wakeup(&self) -> Option<Duration> {
         if self.tasks.is_empty() {
             return None;
         }
 
-        // Check L0
-        // 检查 L0
-        let l0_start = (self.global_tick as usize) & self.levels[0].mask;
-        for i in 0..self.levels[0].slots.len() {
-            let idx = (l0_start + i) & self.levels[0].mask;
-            // Check if slot has a head
-            // 检查槽位是否有头节点
-            if self.levels[0].slots[idx].is_some() {
-                return Some(Duration::from_millis(i as u64 * self.tick_duration_ms));
-            }
-        }
+        let mut best_ticks = None;
+        for (level_index, level) in self.levels.iter().enumerate() {
+            let level_tick = self.current_tick / level.unit_ticks;
+            let cursor = (level_tick as usize) & level.mask;
+            let at_current_boundary = self.current_tick.is_multiple_of(level.unit_ticks);
+            let current_slot = level.slots[cursor].head.is_some();
+            let needs_processing_now = current_slot
+                && at_current_boundary
+                && (level_index == 0 || self.slot_can_move_down(level_index, cursor));
 
-        // Check L1
-        // 检查 L1
-        let l1_tick = self.global_tick / self.l1_tick_ratio;
-        let l1_start = (l1_tick as usize) & self.levels[1].mask;
-        let l1_mask = self.levels[1].mask;
-        let l1_len = self.levels[1].slots.len();
-        for i in 0..l1_len {
-            let idx = (l1_start + i) & l1_mask;
-            if self.levels[1].slots[idx].is_some() {
-                // Find the target_l1_tick for this slot idx
-                let diff = (idx.wrapping_sub(l1_tick as usize)) & l1_mask;
-                let mut target_l1_tick = l1_tick + diff as u64;
-                if target_l1_tick * self.l1_tick_ratio <= self.global_tick {
-                    target_l1_tick += l1_len as u64;
-                }
-                let slot_start_tick = target_l1_tick * self.l1_tick_ratio;
-                let delay_ticks = slot_start_tick.saturating_sub(self.global_tick);
-                return Some(Duration::from_millis(delay_ticks * self.tick_duration_ms));
-            }
-        }
-
-        // Should basically not be reached if tasks is not empty, unless tasks are very far in future (overflow?).
-        // Or perhaps in higher levels if we had them.
-        // Fallback to max L0 capacity to ensure we wake up eventually.
-        //
-        // 如果 tasks 不为空，基本上不应达到此处，除非任务在很远的未来（溢出？）。
-        // 或者如果我们有更高的层级。
-        // 回退到最大 L0 容量以确保我们最终会唤醒。
-        Some(Duration::from_millis(
-            self.l0_capacity_ticks * self.tick_duration_ms,
-        ))
-    }
-
-    // --- Internal Helpers (内部辅助函数) ---
-
-    /// Determine which level and slot index a deadline belongs to.
-    ///
-    /// 确定截止日期属于哪个层级和槽位索引。
-    fn determine_location(&self, deadline: u64) -> (usize, usize) {
-        let remaining = deadline.wrapping_sub(self.global_tick);
-        if remaining < self.l0_capacity_ticks {
-            let idx = (deadline as usize) & self.levels[0].mask;
-            (0, idx)
-        } else {
-            let l1_tick = deadline / self.l1_tick_ratio;
-            let idx = (l1_tick as usize) & self.levels[1].mask;
-            (1, idx)
-        }
-    }
-
-    /// Add a key to the head of the linked list at the specified slot.
-    ///
-    /// 将 Key 添加到指定槽位的链表头。
-    fn link(&mut self, key: DefaultKey, level: usize, slot_index: usize) {
-        let old_head = self.levels[level].slots[slot_index];
-
-        // key.next = old_head
-        if let Some(entry) = self.tasks.get_mut(key) {
-            entry.next = old_head;
-            // Also ensure we update the location fields, as we might be re-linking
-            // 还要确保更新位置字段，因为我们可能正在重新链接
-            entry.level = level as u8;
-            entry.slot_index = slot_index as u32;
-        }
-
-        // slot head = key
-        // 槽位头 = key
-        self.levels[level].slots[slot_index] = Some(key);
-    }
-
-    /// Drain a linked list starting at `head`, moving all items to `expired`.
-    /// This is an associated function to allow borrow splitting.
-    ///
-    /// 从 `head` 开始清空链表，将所有项目移动到 `expired`。
-    /// 这是一个关联函数，以允许借用拆分。
-    fn drain_list(
-        tasks: &mut SlotMap<DefaultKey, WheelEntry<T>>,
-        head: DefaultKey,
-        expired: &mut Vec<T>,
-    ) {
-        let mut current_opt = Some(head);
-        while let Some(key) = current_opt {
-            if let Some(mut entry) = tasks.remove(key) {
-                // Only push if item is Some (not cancelled)
-                // 仅当 item 为 Some（未取消）时才推送
-                if let Some(item) = entry.item.take() {
-                    expired.push(item);
-                }
-                current_opt = entry.next;
+            let boundary_distance = if needs_processing_now {
+                0
             } else {
+                let Some(next_level_tick) = level_tick.checked_add(1) else {
+                    best_ticks = Some(u64::MAX);
+                    continue;
+                };
+                let next_cursor = (next_level_tick as usize) & level.mask;
+                let Some((_, distance)) = level.next_occupied(next_cursor) else {
+                    continue;
+                };
+                let Some(boundary_tick) = next_level_tick
+                    .checked_add(distance as u64)
+                    .and_then(|value| value.checked_mul(level.unit_ticks))
+                else {
+                    best_ticks = Some(u64::MAX);
+                    continue;
+                };
+                boundary_tick.saturating_sub(self.current_tick)
+            };
+            best_ticks =
+                Some(best_ticks.map_or(boundary_distance, |best: u64| best.min(boundary_distance)));
+        }
+
+        best_ticks.map(|ticks| self.duration_from_ticks(ticks))
+    }
+
+    pub fn tick_duration(&self) -> Duration {
+        Duration::from_nanos(self.base_tick_nanos)
+    }
+
+    pub fn current_tick(&self) -> u64 {
+        self.current_tick
+    }
+
+    pub fn len(&self) -> usize {
+        self.tasks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+
+    pub fn clear(&mut self, out: &mut Vec<T>) {
+        for level in &mut self.levels {
+            level.clear_slots();
+        }
+        for (_, entry) in self.tasks.drain() {
+            out.push(entry.item);
+        }
+        self.debug_assert_invariants();
+    }
+
+    fn deadline_after(&self, delay: Duration) -> Result<u64, TimerError> {
+        let delay_ticks = if delay.is_zero() {
+            0
+        } else {
+            let offset = delay.as_nanos() + u128::from(self.remainder_nanos);
+            let ticks = offset.div_ceil(u128::from(self.base_tick_nanos));
+            ticks.try_into().map_err(|_| TimerError::DelayOverflow)?
+        };
+        self.current_tick
+            .checked_add(delay_ticks)
+            .ok_or(TimerError::DelayOverflow)
+    }
+
+    fn determine_location(&self, deadline_tick: u64) -> (usize, usize) {
+        let delta = deadline_tick.saturating_sub(self.current_tick);
+        let mut selected = self.levels.len() - 1;
+        for (index, level) in self.levels.iter().enumerate() {
+            if delta < level.span_ticks {
+                selected = index;
                 break;
             }
         }
+        let level = &self.levels[selected];
+        let slot = ((deadline_tick / level.unit_ticks) as usize) & level.mask;
+        (selected, slot)
     }
 
-    /// Process a list from L1, either moving items to L0 or expiring them immediately.
-    ///
-    /// 处理 L1 中的链表，将项目移动到 L0 或立即过期。
-    fn cascade_list(&mut self, head: DefaultKey, expired: &mut Vec<T>) {
-        let mut current_opt = Some(head);
-        while let Some(curr_key) = current_opt {
-            let (next_key, deadline, is_cancelled) = {
+    fn link(
+        &mut self,
+        key: DefaultKey,
+        level_index: usize,
+        slot_index: usize,
+    ) -> Result<(), TimerError> {
+        let old_head = self.levels[level_index].slots[slot_index].head;
+        if old_head.is_none() {
+            let slot = &mut self.levels[level_index].slots[slot_index];
+            slot.head = Some(key);
+            slot.tail = Some(key);
+            self.levels[level_index].set_occupied(slot_index);
+            let entry = self
+                .tasks
+                .get_mut(key)
+                .ok_or(TimerError::InvariantViolation)?;
+            entry.level = level_index as u8;
+            entry.slot = slot_index as u32;
+            entry.prev = None;
+            entry.next = None;
+            return Ok(());
+        }
+
+        let old_tail = self.levels[level_index].slots[slot_index]
+            .tail
+            .ok_or(TimerError::InvariantViolation)?;
+        self.tasks
+            .get_mut(old_tail)
+            .ok_or(TimerError::InvariantViolation)?
+            .next = Some(key);
+        let entry = self
+            .tasks
+            .get_mut(key)
+            .ok_or(TimerError::InvariantViolation)?;
+        entry.level = level_index as u8;
+        entry.slot = slot_index as u32;
+        entry.prev = Some(old_tail);
+        entry.next = None;
+        self.levels[level_index].slots[slot_index].tail = Some(key);
+        self.levels[level_index].set_occupied(slot_index);
+        Ok(())
+    }
+
+    fn unlink(&mut self, key: DefaultKey) -> Result<(), TimerError> {
+        let (level_index, slot_index, prev, next) = {
+            let entry = self.tasks.get(key).ok_or(TimerError::StaleTimerId)?;
+            (
+                usize::from(entry.level),
+                entry.slot as usize,
+                entry.prev,
+                entry.next,
+            )
+        };
+        if level_index >= self.levels.len() || slot_index >= self.levels[level_index].slots.len() {
+            return Err(TimerError::InvariantViolation);
+        }
+
+        match prev {
+            Some(prev) => {
+                self.tasks
+                    .get_mut(prev)
+                    .ok_or(TimerError::InvariantViolation)?
+                    .next = next;
+            }
+            None => self.levels[level_index].slots[slot_index].head = next,
+        }
+        match next {
+            Some(next) => {
+                self.tasks
+                    .get_mut(next)
+                    .ok_or(TimerError::InvariantViolation)?
+                    .prev = prev;
+            }
+            None => self.levels[level_index].slots[slot_index].tail = prev,
+        }
+        if self.levels[level_index].slots[slot_index].head.is_none() {
+            self.levels[level_index].clear_occupied(slot_index);
+        }
+        let entry = self
+            .tasks
+            .get_mut(key)
+            .ok_or(TimerError::InvariantViolation)?;
+        entry.prev = None;
+        entry.next = None;
+        Ok(())
+    }
+
+    fn process_l0_slot(&mut self, expired: &mut Vec<Expired<T>>) -> Result<(), TimerError> {
+        let slot_index = (self.current_tick as usize) & self.levels[0].mask;
+        self.process_slot(0, slot_index, expired)
+    }
+
+    fn cascade_at_current_tick(&mut self, expired: &mut Vec<Expired<T>>) -> Result<(), TimerError> {
+        for level_index in (1..self.levels.len()).rev() {
+            if self
+                .current_tick
+                .is_multiple_of(self.levels[level_index].unit_ticks)
+            {
+                let level_tick = self.current_tick / self.levels[level_index].unit_ticks;
+                let slot = (level_tick as usize) & self.levels[level_index].mask;
+                self.process_slot(level_index, slot, expired)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn process_slot(
+        &mut self,
+        level_index: usize,
+        slot_index: usize,
+        expired: &mut Vec<Expired<T>>,
+    ) -> Result<(), TimerError> {
+        let mut current = {
+            let slot = &mut self.levels[level_index].slots[slot_index];
+            let head = slot.head.take();
+            slot.tail = None;
+            self.levels[level_index].clear_occupied(slot_index);
+            head
+        };
+        while let Some(key) = current {
+            let next = self
+                .tasks
+                .get(key)
+                .ok_or(TimerError::InvariantViolation)?
+                .next;
+            self.detach_entry(key)?;
+            let deadline_tick = self
+                .tasks
+                .get(key)
+                .ok_or(TimerError::InvariantViolation)?
+                .deadline_tick;
+            if deadline_tick <= self.current_tick {
                 let entry = self
                     .tasks
-                    .get(curr_key)
-                    .expect("L1 Entry must exist during cascade");
-                (entry.next, entry.deadline, entry.item.is_none())
-            };
-
-            if is_cancelled {
-                // Remove ghost task
-                // 移除幽灵任务
-                self.tasks.remove(curr_key);
+                    .remove(key)
+                    .ok_or(TimerError::InvariantViolation)?;
+                expired.push(Expired {
+                    id: TimerId::from_key(key),
+                    item: entry.item,
+                    deadline_tick,
+                });
             } else {
-                // Calculate new location
-                // 计算新位置
-                if deadline <= self.global_tick {
-                    // Expired
-                    // 已过期
-                    if let Some(mut entry) = self.tasks.remove(curr_key)
-                        && let Some(item) = entry.item.take()
-                    {
-                        expired.push(item);
-                    }
-                } else {
-                    let (new_level, new_slot) = self.determine_location(deadline);
-                    // We re-link this item.
-                    // 重新链接此项目。
-                    self.link(curr_key, new_level, new_slot);
-                }
+                let (new_level, new_slot) = self.determine_location(deadline_tick);
+                self.link(key, new_level, new_slot)?;
             }
+            current = next;
+        }
+        Ok(())
+    }
 
-            current_opt = next_key;
+    fn detach_entry(&mut self, key: DefaultKey) -> Result<(), TimerError> {
+        let entry = self
+            .tasks
+            .get_mut(key)
+            .ok_or(TimerError::InvariantViolation)?;
+        entry.prev = None;
+        entry.next = None;
+        Ok(())
+    }
+
+    fn fast_forward(
+        &mut self,
+        target_tick: u64,
+        expired: &mut Vec<Expired<T>>,
+    ) -> Result<(), TimerError> {
+        let keys: Vec<DefaultKey> = self.tasks.keys().collect();
+        for level in &mut self.levels {
+            level.clear_slots();
+        }
+        self.current_tick = target_tick;
+        for key in keys {
+            let deadline_tick = self
+                .tasks
+                .get(key)
+                .ok_or(TimerError::InvariantViolation)?
+                .deadline_tick;
+            if deadline_tick <= target_tick {
+                let entry = self
+                    .tasks
+                    .remove(key)
+                    .ok_or(TimerError::InvariantViolation)?;
+                expired.push(Expired {
+                    id: TimerId::from_key(key),
+                    item: entry.item,
+                    deadline_tick,
+                });
+            } else {
+                let (level, slot) = self.determine_location(deadline_tick);
+                self.link(key, level, slot)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn slot_can_move_down(&self, level_index: usize, slot_index: usize) -> bool {
+        let mut key = self.levels[level_index].slots[slot_index].head;
+        while let Some(current) = key {
+            let Some(entry) = self.tasks.get(current) else {
+                return false;
+            };
+            if entry.deadline_tick <= self.current_tick
+                || entry.deadline_tick.saturating_sub(self.current_tick)
+                    < self.levels[level_index - 1].span_ticks
+            {
+                return true;
+            }
+            key = entry.next;
+        }
+        false
+    }
+
+    fn duration_from_ticks(&self, ticks: u64) -> Duration {
+        let nanos = u128::from(ticks) * u128::from(self.base_tick_nanos);
+        let seconds = nanos / 1_000_000_000;
+        let remainder = nanos % 1_000_000_000;
+        if seconds > u128::from(u64::MAX) {
+            Duration::from_secs(u64::MAX)
+        } else {
+            Duration::from_secs(seconds as u64) + Duration::from_nanos(remainder as u64)
         }
     }
+
+    #[cfg(debug_assertions)]
+    fn debug_assert_invariants(&self) {
+        let mut linked = 0usize;
+        for (level_index, level) in self.levels.iter().enumerate() {
+            for (slot_index, slot) in level.slots.iter().enumerate() {
+                let occupied = slot.head.is_some();
+                debug_assert_eq!(occupied, slot.tail.is_some());
+                debug_assert_eq!(occupied, level.is_occupied(slot_index));
+                let mut key = slot.head;
+                let mut prev = None;
+                while let Some(current) = key {
+                    let Some(entry) = self.tasks.get(current) else {
+                        debug_assert!(false, "linked wheel entry is missing");
+                        break;
+                    };
+                    debug_assert_eq!(entry.level, level_index as u8);
+                    debug_assert_eq!(entry.slot, slot_index as u32);
+                    debug_assert_eq!(entry.prev, prev);
+                    if let Some(next) = entry.next {
+                        debug_assert_eq!(
+                            self.tasks.get(next).and_then(|item| item.prev),
+                            Some(current)
+                        );
+                    } else {
+                        debug_assert_eq!(slot.tail, Some(current));
+                    }
+                    prev = Some(current);
+                    key = entry.next;
+                    linked += 1;
+                }
+            }
+        }
+        debug_assert_eq!(linked, self.tasks.len());
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn debug_assert_invariants(&self) {}
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use alloc::{vec, vec::Vec};
+    use core::time::Duration;
+
+    use crate::{ConfigError, TimerError, WheelConfig};
+
+    use super::{Expired, Wheel};
+
+    fn config(base_tick: u64, slots: &[usize]) -> WheelConfig {
+        let mut builder = WheelConfig::builder().base_tick(Duration::from_nanos(base_tick));
+        for &slot_count in slots {
+            builder = builder.level_slots(slot_count);
+        }
+        builder.build().expect("test wheel configuration")
+    }
+
+    fn expired_items(expired: &[Expired<&'static str>]) -> Vec<&'static str> {
+        expired.iter().map(|entry| entry.item).collect()
+    }
 
     #[test]
-    fn test_simple_insert_expire() {
-        let config = WheelConfig::default();
-        let mut wheel = Wheel::new(config);
+    fn validates_builder_and_derives_aligned_levels() {
+        assert_eq!(
+            WheelConfig::builder()
+                .base_tick(Duration::ZERO)
+                .level_slots(4)
+                .build(),
+            Err(ConfigError::ZeroTick)
+        );
+        assert!(matches!(
+            WheelConfig::builder().build(),
+            Err(ConfigError::InvalidLevelCount { .. })
+        ));
+        assert!(matches!(
+            WheelConfig::builder().level_slots(3).build(),
+            Err(ConfigError::InvalidSlotCount { level: 0, .. })
+        ));
+        assert!(matches!(
+            WheelConfig::builder()
+                .level_slots(1 << 16)
+                .level_slots(1 << 16)
+                .level_slots(1 << 16)
+                .level_slots(1 << 16)
+                .level_slots(2)
+                .build(),
+            Err(ConfigError::DerivedRangeOverflow { level: 3 })
+        ));
 
-        // Insert a task for 20ms (2 ticks with default 10ms tick)
-        let id = wheel.insert("task1", Duration::from_millis(20));
+        let config = config(10_000_000, &[4, 8, 2]);
+        assert_eq!(config.base_tick(), Duration::from_millis(10));
+        assert_eq!(config.level_count(), 3);
+        assert_eq!(config.total_slots(), 14);
+    }
 
-        // Advance 10ms - nothing should expire
+    #[test]
+    fn rounds_delays_up_without_early_expiration() {
+        let mut wheel = Wheel::new(config(10_000_000, &[16, 4]));
+        for (item, delay) in [
+            ("1ms", 1),
+            ("9ms", 9),
+            ("10ms", 10),
+            ("19ms", 19),
+            ("20ms", 20),
+        ] {
+            wheel
+                .insert(item, Duration::from_millis(delay))
+                .expect("timer insertion");
+        }
+
         let mut expired = Vec::new();
-        wheel.advance(Duration::from_millis(10), &mut expired);
+        wheel
+            .advance_by(Duration::from_millis(10), &mut expired)
+            .expect("wheel advance");
+        assert_eq!(expired_items(&expired), vec!["1ms", "9ms", "10ms"]);
+        expired.clear();
+        wheel
+            .advance_by(Duration::from_millis(9), &mut expired)
+            .expect("wheel advance");
         assert!(expired.is_empty());
-
-        // Advance another 10ms - should expire
-        wheel.advance(Duration::from_millis(10), &mut expired);
-        assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0], "task1");
-
-        // Verify emptiness
-        assert!(wheel.cancel(id).is_none());
+        wheel
+            .advance_by(Duration::from_millis(1), &mut expired)
+            .expect("wheel advance");
+        assert_eq!(expired_items(&expired), vec!["19ms", "20ms"]);
     }
 
     #[test]
-    fn test_cancel() {
-        let config = WheelConfig::default();
-        let mut wheel = Wheel::new(config);
-
-        let id = wheel.insert("task1", Duration::from_millis(100));
-
-        let checked = wheel.cancel(id);
-        assert_eq!(checked, Some("task1"));
-
-        // Advance past deadline, should get nothing
+    fn accumulates_sub_tick_time_and_expires_zero_delay() {
+        let mut wheel = Wheel::new(config(10_000_000, &[16]));
+        wheel
+            .insert("delayed", Duration::from_millis(10))
+            .expect("timer insertion");
         let mut expired = Vec::new();
-        wheel.advance(Duration::from_millis(200), &mut expired);
+        for _ in 0..9 {
+            wheel
+                .advance_by(Duration::from_millis(1), &mut expired)
+                .expect("wheel advance");
+        }
         assert!(expired.is_empty());
+        wheel
+            .advance_by(Duration::from_millis(1), &mut expired)
+            .expect("wheel advance");
+        assert_eq!(expired_items(&expired), vec!["delayed"]);
+
+        wheel
+            .insert("immediate", Duration::ZERO)
+            .expect("timer insertion");
+        expired.clear();
+        wheel
+            .advance_by(Duration::ZERO, &mut expired)
+            .expect("zero advance");
+        assert_eq!(expired_items(&expired), vec!["immediate"]);
     }
 
     #[test]
-    fn test_cascade_l1_to_l0() {
-        let config = WheelConfig {
-            l0_slot_count: 10, // Small L0 for easy cascade
-            l0_tick_duration: Duration::from_millis(10),
-            l1_slot_count: 4,
-            l1_tick_duration: Duration::from_millis(100), // 10 * 10
-        };
+    fn cancel_and_reschedule_are_immediate_and_generation_safe() {
+        let mut wheel = Wheel::new(config(10_000_000, &[4, 4, 4]));
+        let canceled = wheel
+            .insert("canceled", Duration::from_secs(10))
+            .expect("timer insertion");
+        assert_eq!(wheel.len(), 1);
+        assert_eq!(wheel.cancel(canceled), Some("canceled"));
+        assert_eq!(wheel.len(), 0);
+        assert!(wheel.is_empty());
+        assert!(wheel.next_wakeup().is_none());
+        assert_eq!(wheel.cancel(canceled), None);
 
-        let mut wheel: Wheel<&str> = Wheel::new(config);
-
-        // L0 capacity is 10 * 10ms = 100ms.
-        // Insert task for 150ms. Should go to L1.
-        wheel.insert("long_task", Duration::from_millis(150));
-
-        // Advance 90ms. Global tick: 9. L0 filled.
+        let reused = wheel
+            .insert("reused", Duration::from_secs(10))
+            .expect("timer insertion");
+        assert_eq!(wheel.cancel(canceled), None);
+        assert_eq!(wheel.len(), 1);
+        wheel
+            .reschedule(reused, Duration::from_millis(10))
+            .expect("timer reschedule");
         let mut expired = Vec::new();
-        wheel.advance(Duration::from_millis(90), &mut expired);
+        wheel
+            .advance_by(Duration::from_millis(10), &mut expired)
+            .expect("wheel advance");
+        assert_eq!(expired_items(&expired), vec!["reused"]);
+        assert_eq!(
+            wheel.reschedule(reused, Duration::ZERO),
+            Err(TimerError::StaleTimerId)
+        );
+    }
+
+    #[test]
+    fn cascades_multiple_levels_and_handles_rounds() {
+        let mut wheel = Wheel::new(config(10_000_000, &[4, 4, 4]));
+        wheel
+            .insert("level-one", Duration::from_millis(150))
+            .expect("timer insertion");
+        wheel
+            .insert("level-two-round", Duration::from_millis(700))
+            .expect("timer insertion");
+        let mut expired = Vec::new();
+        wheel
+            .advance_by(Duration::from_millis(149), &mut expired)
+            .expect("wheel advance");
         assert!(expired.is_empty());
-
-        // Advance 10ms. Global tick: 10. Cascade triggered (mod 10 == 0).
-        // "long_task" deadline is 15 ticks. Current is 10.
-        // It fits in L0 now? remaining = 5 ticks < 10. Yes.
-        // It should be moved to L0.
-        wheel.advance(Duration::from_millis(10), &mut expired);
-        assert!(expired.is_empty()); // Still 50ms to go.
-
-        // Advance 50ms. Global tick: 15. Expire.
-        wheel.advance(Duration::from_millis(50), &mut expired);
-        assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0], "long_task");
-    }
-
-    #[test]
-    fn test_large_advance() {
-        let config = WheelConfig {
-            l0_slot_count: 4,
-            l0_tick_duration: Duration::from_millis(10),
-            l1_slot_count: 4,
-            l1_tick_duration: Duration::from_millis(40),
-        };
-
-        let mut wheel = Wheel::new(config);
-
-        wheel.insert("short", Duration::from_millis(10));
-        wheel.insert("medium", Duration::from_millis(50));
-        wheel.insert("long", Duration::from_millis(100));
-
-        // Advance 200ms at once
-        let mut expired = Vec::new();
-        wheel.advance(Duration::from_millis(200), &mut expired);
-
-        assert_eq!(expired.len(), 3);
-        assert!(expired.contains(&"short"));
-        assert!(expired.contains(&"medium"));
-        assert!(expired.contains(&"long"));
-    }
-
-    #[test]
-    fn test_next_timeout() {
-        let config = WheelConfig {
-            l0_tick_duration: Duration::from_millis(10),
-            ..Default::default()
-        };
-        let mut wheel = Wheel::new(config);
-
-        assert!(wheel.next_timeout().is_none());
-
-        wheel.insert("task", Duration::from_millis(30));
-        // Should be 30ms (approx)
-        let t = wheel.next_timeout();
-        assert_eq!(t, Some(Duration::from_millis(30)));
-
-        let mut expired = Vec::new();
-        wheel.advance(Duration::from_millis(10), &mut expired);
-        let t = wheel.next_timeout();
-        assert_eq!(t, Some(Duration::from_millis(20)));
-    }
-
-    #[test]
-    fn test_heavy_overflow() {
-        // Setup a wheel with small capacity to force overflow
-        let config = WheelConfig {
-            l0_slot_count: 16,
-            l0_tick_duration: Duration::from_millis(10),
-            l1_slot_count: 4,
-            l1_tick_duration: Duration::from_millis(160), // 16 * 10ms
-        };
-
-        // Total L1 range = 4 * 160ms = 640ms.
-        // If we insert something > 640ms, it wraps safely.
-
-        let mut wheel = Wheel::new(config);
-
-        // Task 1: 800ms.
-        // L1 ticks = 800 / 160 = 5.
-        // L1 index = 5 & 3 = 1.
-        // Rounds = 1.
-        let id1 = wheel.insert("overflow_on_round_1", Duration::from_millis(800));
-
-        // Task 2: 1500ms
-        // L1 ticks = 1500 / 160 = 9.
-        // L1 index = 9 & 3 = 1.
-        // Rounds = 2.
-        let id2 = wheel.insert("overflow_on_round_2", Duration::from_millis(1500));
-
-        // Advance 160ms (one L1 tick) -> Global tick 16.
-        // Index 16/16 & 3 = 1. L1[1] processed.
-        // Both tasks are in L1[1].
-        // Task 1: target 80, current 16. Remaining 64. 64 > 16 (L0).
-        // New L1 tick = 80 / 16 = 5. Index 1. Re-queued to L1[1].
-        // Task 2: target 150, current 16. Remaining 134. Re-queued to L1[1].
-        let mut expired = Vec::new();
-        wheel.advance(Duration::from_millis(160), &mut expired);
+        wheel
+            .advance_by(Duration::from_millis(1), &mut expired)
+            .expect("wheel advance");
+        assert_eq!(expired_items(&expired), vec!["level-one"]);
+        expired.clear();
+        wheel
+            .advance_by(Duration::from_millis(549), &mut expired)
+            .expect("wheel advance");
         assert!(expired.is_empty());
+        wheel
+            .advance_by(Duration::from_millis(1), &mut expired)
+            .expect("wheel advance");
+        assert_eq!(expired_items(&expired), vec!["level-two-round"]);
+    }
 
-        // Advance another 640ms (4 full L1 slots).
-        // Total advanced: 800ms. Global tick 80.
-        // Task 1 matches exactly?
-        // At tick 80 (L1 tick 5, index 1).
-        // Cascade L1[1]. Task 1 deadline 80. 80 <= 80. Expired!
-        wheel.advance(Duration::from_millis(640), &mut expired);
+    #[test]
+    fn fast_forwards_large_jumps_and_keeps_future_timers() {
+        let mut wheel = Wheel::new(config(10_000_000, &[4, 4, 4]));
+        wheel
+            .insert("expired", Duration::from_secs(1))
+            .expect("timer insertion");
+        wheel
+            .insert("future", Duration::from_secs(1_000))
+            .expect("timer insertion");
+        let mut expired = Vec::new();
+        let report = wheel
+            .advance_by(Duration::from_secs(100), &mut expired)
+            .expect("wheel advance");
+        assert!(report.fast_forwarded);
+        assert_eq!(expired_items(&expired), vec!["expired"]);
+        assert_eq!(wheel.len(), 1);
+        assert!(wheel.next_wakeup().is_some());
+    }
 
-        let has_overflow_1 = expired.contains(&"overflow_on_round_1");
-        assert!(has_overflow_1, "Expected overflow_on_round_1 to expire");
+    #[test]
+    fn next_wakeup_is_only_a_boundary_hint() {
+        let mut wheel = Wheel::new(config(10_000_000, &[4, 4]));
+        wheel
+            .insert("upper", Duration::from_millis(50))
+            .expect("timer insertion");
+        assert_eq!(wheel.next_wakeup(), Some(Duration::from_millis(40)));
+        let mut expired = Vec::new();
+        wheel
+            .advance_by(Duration::from_millis(40), &mut expired)
+            .expect("wheel advance");
+        assert!(expired.is_empty());
+        assert_eq!(wheel.next_wakeup(), Some(Duration::from_millis(10)));
+        wheel
+            .advance_by(Duration::ZERO, &mut expired)
+            .expect("zero advance");
+        assert!(expired.is_empty());
+        wheel
+            .advance_by(Duration::from_millis(10), &mut expired)
+            .expect("wheel advance");
+        assert_eq!(expired_items(&expired), vec!["upper"]);
+    }
 
-        // Task 2 is at 1500ms, should not expire yet
-        assert!(!expired.contains(&"overflow_on_round_2"));
-
-        // Task 2 check
-        // Current global tick 80. Task 2 deadline 150.
-        // Remaining 70.
-        // Advance 700ms. Total 1500.
-        wheel.advance(Duration::from_millis(700), &mut expired);
-        assert!(expired.contains(&"overflow_on_round_2"));
-
-        assert!(wheel.cancel(id1).is_none());
-        assert!(wheel.cancel(id2).is_none());
+    #[test]
+    fn advance_overflow_does_not_change_clock() {
+        let mut wheel: Wheel<()> = Wheel::new(config(1, &[4]));
+        let mut expired = Vec::new();
+        wheel
+            .advance_by(Duration::from_nanos(u64::MAX - 1), &mut expired)
+            .expect("wheel advance");
+        assert_eq!(wheel.current_tick(), u64::MAX - 1);
+        wheel
+            .advance_by(Duration::from_nanos(1), &mut expired)
+            .expect("wheel may advance to the maximum tick");
+        assert_eq!(
+            wheel.advance_by(Duration::from_nanos(1), &mut expired),
+            Err(TimerError::ClockOverflow)
+        );
+        assert_eq!(wheel.current_tick(), u64::MAX);
     }
 }

@@ -232,7 +232,7 @@ impl<'a> DriverRaw for IocpDriver<'a> {
         let diagnostics = &mut self.completion_diagnostics;
         let ctx = SubmitContextInternal::new(
             completion.port_arc(),
-            timer.wheel_mut(),
+            timer,
             completion.table(),
             diagnostics,
         );
@@ -272,7 +272,7 @@ impl<'a> DriverRaw for IocpDriver<'a> {
         self.drain_deferred_socket_cleanup();
 
         Ok(DriveOutcome {
-            next_timeout_hint: self.timer.next_timeout(),
+            next_timeout_hint: self.timer.next_wakeup(),
             ready_completion: self.ops.shared.has_ready_completion(),
             in_flight: self.has_active_ops_internal(),
         })

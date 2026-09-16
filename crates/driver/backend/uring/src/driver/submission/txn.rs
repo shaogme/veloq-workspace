@@ -14,7 +14,7 @@ use veloq_driver_core::{
     slot::{SlotAccessError, SubmissionGuard},
 };
 use veloq_std::format;
-use veloq_wheel::TaskId;
+use veloq_wheel::TimerId;
 
 pub(crate) fn slot_access_report(scope: &'static str, err: SlotAccessError) -> Report<UringError> {
     UringError::InvalidState
@@ -34,7 +34,7 @@ pub(crate) struct UringSubmitTxn<'a, 'b, 'e, 's> {
     env: &'e mut SubmitEnv<'a, 'b>,
     token: OpToken,
     slot_guard: Option<SubmissionGuard<'s, UringSlotSpec>>,
-    timer_inserted: Option<TaskId>,
+    timer_inserted: Option<TimerId>,
     submitted: bool,
 }
 
@@ -176,7 +176,7 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                         .report("driver.submit_txn.timer_duration", "Timer duration missing"));
                 };
 
-                let task_id = self.env.insert_timer(self.token, duration);
+                let task_id = self.env.insert_timer(self.token, duration)?;
                 self.timer_inserted = Some(task_id);
                 self.env.record_timer_insert(self.token, task_id);
 

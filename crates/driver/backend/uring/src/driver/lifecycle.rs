@@ -17,7 +17,7 @@ use veloq_driver_core::driver::{
     cancel_target_kind,
 };
 use veloq_std::format;
-use veloq_wheel::TaskId;
+use veloq_wheel::TimerId;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum SubmissionPhase {
@@ -49,7 +49,7 @@ pub(crate) struct UringOpControl {
 
 #[derive(Clone, Default)]
 pub struct UringOpState {
-    pub(crate) timer_id: Option<TaskId>,
+    pub(crate) timer_id: Option<TimerId>,
     pub(crate) control: UringOpControl,
 }
 

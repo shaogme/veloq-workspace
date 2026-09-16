@@ -22,7 +22,7 @@ use veloq_driver_core::slot::SlotSnapshot;
 
 #[cfg(any(test, feature = "test-hooks"))]
 use veloq_std::vec::Vec;
-use veloq_wheel::TaskId;
+use veloq_wheel::TimerId;
 
 /// A single observed control-plane transition.
 ///
@@ -51,18 +51,18 @@ pub(crate) enum ControlInvariantError {
         observed: usize,
     },
     TimerDuplicate {
-        task_id: TaskId,
+        task_id: TimerId,
         token: OpToken,
     },
     TimerCancelMissing {
-        task_id: TaskId,
+        task_id: TimerId,
         token: OpToken,
     },
     TimerExpireMissing {
         token: OpToken,
     },
     TimerSlotMismatch {
-        task_id: TaskId,
+        task_id: TimerId,
         expected: OpToken,
         actual: Option<OpToken>,
     },
@@ -116,16 +116,16 @@ pub(crate) enum ControlPlaneEvent {
         target: OpToken,
     },
     TimerInsert {
-        task_id: TaskId,
+        task_id: TimerId,
         token: OpToken,
     },
     TimerCancel {
-        task_id: TaskId,
+        task_id: TimerId,
         token: OpToken,
     },
     #[cfg(any(test, feature = "test-hooks"))]
     TimerExpire {
-        task_id: Option<TaskId>,
+        task_id: Option<TimerId>,
         token: OpToken,
     },
     WakerArm {
@@ -152,7 +152,7 @@ pub(crate) struct ControlTokenSnapshot {
     pub(crate) token: OpToken,
     pub(crate) slot: SlotSnapshot,
     pub(crate) submission_phase: SubmissionPhase,
-    pub(crate) timer_id: Option<TaskId>,
+    pub(crate) timer_id: Option<TimerId>,
     pub(crate) has_cleanup_hint: bool,
 }
 
@@ -164,7 +164,7 @@ pub(crate) struct ControlPlaneSnapshot {
     pub(crate) backlog_tokens: Vec<OpToken>,
     pub(crate) pending_cancel_targets: Vec<OpToken>,
     pub(crate) in_flight_cancel_targets: Vec<(CancelTicket, OpToken)>,
-    pub(crate) timer_tokens: Vec<(TaskId, OpToken)>,
+    pub(crate) timer_tokens: Vec<(TimerId, OpToken)>,
     pub(crate) cleanup_hint_tokens: Vec<CompletionToken>,
     pub(crate) quarantined_tokens: Vec<OpToken>,
 }
@@ -180,7 +180,7 @@ pub(crate) struct ControlPlaneObserver {
     #[cfg(any(test, feature = "test-hooks"))]
     backlog: veloq_std::collections::HashSet<OpToken>,
     #[cfg(any(test, feature = "test-hooks"))]
-    timers: veloq_std::collections::HashMap<TaskId, OpToken>,
+    timers: veloq_std::collections::HashMap<TimerId, OpToken>,
     #[cfg(any(test, feature = "test-hooks"))]
     staged_kernel_tokens: veloq_std::collections::HashSet<OpToken>,
     #[cfg(any(test, feature = "test-hooks"))]
@@ -308,14 +308,14 @@ impl ControlPlaneObserver {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn timer_for(&self, token: OpToken) -> Option<TaskId> {
+    pub(crate) fn timer_for(&self, token: OpToken) -> Option<TimerId> {
         self.timers
             .iter()
             .find_map(|(task_id, active)| (*active == token).then_some(*task_id))
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn timer_entries(&self) -> Vec<(TaskId, OpToken)> {
+    pub(crate) fn timer_entries(&self) -> Vec<(TimerId, OpToken)> {
         self.timers
             .iter()
             .map(|(task_id, token)| (*task_id, *token))
@@ -438,8 +438,12 @@ mod tests {
         let expire_token = other_token();
         let cancel_ticket = CancelTicket::try_new(1).expect("test ticket");
         let mut wheel = Wheel::new(WheelConfig::default());
-        let task_id = wheel.insert(token, Duration::from_secs(1));
-        let expire_task_id = wheel.insert(expire_token, Duration::from_secs(1));
+        let task_id = wheel
+            .insert(token, Duration::from_secs(1))
+            .expect("test timer insertion");
+        let expire_task_id = wheel
+            .insert(expire_token, Duration::from_secs(1))
+            .expect("test timer insertion");
         let mut observer = ControlPlaneObserver::default();
         let mut state = SubmissionPhase::Reserved;
 

@@ -15,7 +15,7 @@ use crate::{
         UringRegistrationStats,
         control::{
             ControlPlaneEvent, ControlPlaneObserver, StagedEntry, StagedLedger,
-            UringControlEffectKind, UringControlPlane, UringPostCompletionEffects,
+            UringControlEffectKind, UringControlPlane, UringPostCompletionEffects, UringTimerWheel,
             transition_submission_phase,
         },
         registration::{
@@ -38,7 +38,7 @@ use veloq_std::{
     collections::{BitSet, HashMap},
     format, ptr,
 };
-use veloq_wheel::Wheel;
+use veloq_wheel::{TimerError, TimerId};
 
 #[cfg(feature = "test-hooks")]
 use crate::driver::registration::buffer::BufferUpdateInjection;
@@ -392,7 +392,7 @@ impl<'d> CompletionControlView<'d> {
 pub(crate) struct SubmitControlView<'d> {
     submission_queue: SubmissionQueue<'d>,
     staged_entries: &'d mut StagedLedger,
-    wheel: &'d mut Wheel<OpToken>,
+    timers: &'d mut UringTimerWheel,
     control_observer: &'d mut ControlPlaneObserver,
     completion_cleanup_hints: &'d mut HashMap<CompletionToken, Option<CompletionCleanupHintFn>>,
     completion_cleanup_capacity: usize,
@@ -655,14 +655,14 @@ impl SubmitControlView<'_> {
     }
 
     #[inline]
-    pub(crate) fn cancel_timer(&mut self, token: OpToken, task_id: veloq_wheel::TaskId) {
-        self.wheel.cancel(task_id);
+    pub(crate) fn cancel_timer(&mut self, token: OpToken, task_id: TimerId) {
+        self.timers.cancel(task_id);
         self.control_observer
             .record(ControlPlaneEvent::TimerCancel { task_id, token });
     }
 
     #[inline]
-    pub(crate) fn record_timer_insert(&mut self, token: OpToken, task_id: veloq_wheel::TaskId) {
+    pub(crate) fn record_timer_insert(&mut self, token: OpToken, task_id: TimerId) {
         self.control_observer
             .record(ControlPlaneEvent::TimerInsert { task_id, token });
     }
@@ -672,8 +672,17 @@ impl SubmitControlView<'_> {
         &mut self,
         token: OpToken,
         duration: veloq_std::time::Duration,
-    ) -> veloq_wheel::TaskId {
-        self.wheel.insert(token, duration)
+    ) -> UringResult<TimerId> {
+        self.timers
+            .insert(token, duration)
+            .map_err(|error: TimerError| {
+                UringError::InvalidInput
+                    .report(
+                        "uring.timer.insert",
+                        "timer duration is outside the wheel range",
+                    )
+                    .with_ctx("timer_error", format!("{error:?}"))
+            })
     }
 
     pub(crate) fn stage_user_entry(
@@ -728,12 +737,12 @@ impl SubmitEnv<'_, '_> {
     }
 
     #[inline]
-    pub(crate) fn cancel_timer(&mut self, token: OpToken, task_id: veloq_wheel::TaskId) {
+    pub(crate) fn cancel_timer(&mut self, token: OpToken, task_id: TimerId) {
         self.control.cancel_timer(token, task_id);
     }
 
     #[inline]
-    pub(crate) fn record_timer_insert(&mut self, token: OpToken, task_id: veloq_wheel::TaskId) {
+    pub(crate) fn record_timer_insert(&mut self, token: OpToken, task_id: TimerId) {
         self.control.record_timer_insert(token, task_id);
     }
 
@@ -742,7 +751,7 @@ impl SubmitEnv<'_, '_> {
         &mut self,
         token: OpToken,
         duration: veloq_std::time::Duration,
-    ) -> veloq_wheel::TaskId {
+    ) -> UringResult<TimerId> {
         self.control.insert_timer(token, duration)
     }
 
@@ -1459,7 +1468,7 @@ impl UringControlPlane {
         SubmitControlView {
             submission_queue,
             staged_entries: &mut self.staged_entries,
-            wheel: self.timers.wheel_mut(),
+            timers: &mut self.timers,
             control_observer: &mut self.observer,
             completion_cleanup_hints: &mut self.completion_cleanup_hints,
             completion_cleanup_capacity: self.completion_cleanup_capacity,

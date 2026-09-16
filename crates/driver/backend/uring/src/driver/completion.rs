@@ -844,7 +844,7 @@ impl<'a> UringDriver<'a> {
 
                 let budget = wait_budget(
                     timeout,
-                    self.control.timers.next_timeout(),
+                    self.control.timers.next_wakeup(),
                     Self::WAKE_FAILURE_PROBE_INTERVAL,
                 );
                 if budget.duration.is_zero() {
@@ -859,17 +859,29 @@ impl<'a> UringDriver<'a> {
     }
 
     /// Advances the timer wheel by however many whole ticks elapsed since the last poll.
-    fn advance_timer_clock(&mut self) -> ExpiredBatch {
+    fn advance_timer_clock(&mut self) -> UringResult<ExpiredBatch> {
         let now = Instant::now();
-        let expired = self.control.timers.advance_timer_wheel(now);
+        let expired = self
+            .control
+            .timers
+            .advance_timer_wheel(now)
+            .map_err(|error| {
+                UringError::InvalidState
+                    .report(
+                        "uring.completion.advance_timer",
+                        "timer wheel could not advance",
+                    )
+                    .with_ctx("timer_error", format!("{error:?}"))
+            })?;
 
         #[cfg(any(test, feature = "test-hooks"))]
-        for &token in expired.newly_expired_iter() {
-            let task_id = self.control.timer_for(token);
-            self.control
-                .record(ControlPlaneEvent::TimerExpire { task_id, token });
+        for entry in expired.newly_expired_iter() {
+            self.control.record(ControlPlaneEvent::TimerExpire {
+                task_id: Some(entry.id),
+                token: entry.item,
+            });
         }
-        expired
+        Ok(expired)
     }
 
     fn quarantine_expired_timer(&mut self, token: OpToken) {
@@ -986,13 +998,14 @@ impl<'a> UringDriver<'a> {
             }
         }
 
-        let expired = self.advance_timer_clock();
+        let expired = self.advance_timer_clock()?;
         let timer_count = expired.len().min(budget.timers);
         budget.timers = budget.timers.saturating_sub(timer_count);
         if expired.len() > timer_count {
             self.completion_diagnostics.backend().inc_timer_budget_hit();
         }
-        for &token in expired.iter().take(timer_count) {
+        for entry in expired.iter().take(timer_count) {
+            let token = entry.item;
             let event = UserCompletionEvent::from_parts(COMP_BACKEND_URING, token, 0, 0);
             let (_observation, outcome) = self.accept_completion_transaction_into(
                 CompletionIngress::Synthetic {

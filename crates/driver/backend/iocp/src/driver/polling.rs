@@ -11,7 +11,7 @@ use veloq_driver_core::driver::{
     AnomalyAttach, CompletionAnomalyKind, CompletionEnvelope, CompletionIdentity, CompletionToken,
     Driver, OpToken, RawCompletion, RemoteWaker, SharedCompletionTable,
 };
-use veloq_wheel::{TaskId, Wheel, WheelConfig};
+use veloq_wheel::{Expired, TimerError, TimerId, Wheel, WheelConfig};
 
 use crate::{
     common::{
@@ -233,9 +233,9 @@ impl CompletionPump {
     }
 }
 
-pub(super) struct TimerEngine {
+pub(crate) struct TimerEngine {
     wheel: Wheel<OpToken>,
-    buffer: Vec<OpToken>,
+    buffer: Vec<Expired<OpToken>>,
     last_poll: Instant,
 }
 
@@ -248,39 +248,36 @@ impl TimerEngine {
         }
     }
 
-    pub(super) fn wheel_mut(&mut self) -> &mut Wheel<OpToken> {
-        &mut self.wheel
-    }
-
-    pub(super) fn next_timeout(&self) -> Option<Duration> {
-        self.wheel.next_timeout().map(|timeout| {
+    pub(super) fn next_wakeup(&self) -> Option<Duration> {
+        self.wheel.next_wakeup().map(|timeout| {
             timeout.saturating_sub(Instant::now().saturating_duration_since(self.last_poll))
         })
     }
 
-    pub(super) fn insert(&mut self, token: OpToken, duration: Duration) -> TaskId {
+    pub(super) fn insert(
+        &mut self,
+        token: OpToken,
+        duration: Duration,
+    ) -> Result<TimerId, TimerError> {
         self.wheel.insert(token, duration)
     }
 
-    pub(super) fn cancel(&mut self, id: TaskId) {
-        self.wheel.cancel(id);
+    pub(super) fn cancel(&mut self, id: TimerId) {
+        let _ = self.wheel.cancel(id);
     }
 
-    pub(super) fn advance_to(&mut self, now: Instant) {
+    pub(super) fn advance_to(&mut self, now: Instant) -> Result<(), TimerError> {
         let elapsed = now.saturating_duration_since(self.last_poll);
-        let tick_ms = self.wheel.tick_duration().as_millis() as u64;
-        let ticks = elapsed.as_millis() as u64 / tick_ms;
-        if ticks > 0 {
-            self.wheel.advance(elapsed, &mut self.buffer);
-            self.last_poll += Duration::from_millis(ticks * tick_ms);
-        }
+        self.wheel.advance_by(elapsed, &mut self.buffer)?;
+        self.last_poll = now;
+        Ok(())
     }
 
-    pub(super) fn take_buffer(&mut self) -> Vec<OpToken> {
+    pub(super) fn take_buffer(&mut self) -> Vec<Expired<OpToken>> {
         mem::take(&mut self.buffer)
     }
 
-    pub(super) fn restore_cleared_buffer(&mut self, mut buffer: Vec<OpToken>) {
+    pub(super) fn restore_cleared_buffer(&mut self, mut buffer: Vec<Expired<OpToken>>) {
         buffer.clear();
         self.buffer = buffer;
     }
@@ -314,12 +311,16 @@ impl<'a> IocpDriver<'a> {
     /// Retrieves completion events from the I/O completion port.
     pub(crate) fn get_completion(&mut self, timeout: Option<Duration>) -> IocpResult<()> {
         let _ = self.drain_cancel_requests()?;
-        self.timer.advance_to(Instant::now());
+        self.timer.advance_to(Instant::now()).map_err(|error| {
+            IocpError::InvalidState
+                .report("iocp.timer.advance", "timer wheel could not advance")
+                .with_ctx("timer_error", format!("{error:?}"))
+        })?;
         self.process_timers()?;
         let ready_completion = self.ops.shared.has_ready_completion();
         let budget = wait_budget(
             timeout,
-            self.timer.next_timeout(),
+            self.timer.next_wakeup(),
             WAKE_FAILURE_PROBE_INTERVAL,
         );
         let wait_ms = if ready_completion {
@@ -376,7 +377,11 @@ impl<'a> IocpDriver<'a> {
             }
         }
 
-        self.timer.advance_to(Instant::now());
+        self.timer.advance_to(Instant::now()).map_err(|error| {
+            IocpError::InvalidState
+                .report("iocp.timer.advance", "timer wheel could not advance")
+                .with_ctx("timer_error", format!("{error:?}"))
+        })?;
         let timer_count = self.process_timers()?;
         if handled > 0 {
             self.completion_diagnostics

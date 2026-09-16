@@ -1,4 +1,4 @@
-use veloq_std::{format, io, mem, num::NonZeroU8, time::Instant, vec::Vec};
+use veloq_std::{format, io, mem, num::NonZeroU8, vec::Vec};
 
 use diagweave::prelude::*;
 use veloq_driver_core::{
@@ -229,31 +229,16 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
 impl<'a> IocpDriver<'a> {
     pub(super) fn process_timers(&mut self) -> IocpResult<usize> {
         let timer_buffer = self.timer.take_buffer();
-        let now = Instant::now();
-
         let mut expired = Vec::new();
-        for &token in &timer_buffer {
+        for entry in &timer_buffer {
+            let token = entry.item;
             match self.ops.checked_slot_view(token) {
                 Ok(CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot))) => {
-                    if let Some(deadline) = slot.platform().timer_deadline
-                        && now < deadline
-                    {
-                        let remain = deadline.saturating_duration_since(now);
-                        let timer_id = self.timer.insert(token, remain);
-                        slot.platform_mut().timer_id = Some(timer_id);
-                        continue;
-                    }
+                    slot.platform_mut().timer_id = None;
                     expired.push(token);
                 }
                 Ok(CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot))) => {
-                    if let Some(deadline) = slot.platform().timer_deadline
-                        && now < deadline
-                    {
-                        let remain = deadline.saturating_duration_since(now);
-                        let timer_id = self.timer.insert(token, remain);
-                        slot.platform_mut().timer_id = Some(timer_id);
-                        continue;
-                    }
+                    slot.platform_mut().timer_id = None;
                     expired.push(token);
                 }
                 _ => expired.push(token),
