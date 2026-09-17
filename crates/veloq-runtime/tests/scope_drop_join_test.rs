@@ -14,12 +14,15 @@ use veloq_std::{
     future::Future,
     hint::spin_loop,
     num::NonZeroUsize,
-    panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
-    string::String,
     sync::atomic::{NativeAtomicBool as AtomicBool, Ordering},
     task::{Context, Poll},
 };
+
+#[cfg(feature = "std")]
+use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
+#[cfg(feature = "std")]
+use veloq_std::string::String;
 
 fn with_workers(count: usize) -> RuntimeBuilder<(), fn(usize, &RuntimeShared<()>)> {
     RuntimeBuilder::new().with_worker_count(NonZeroUsize::new(count))
@@ -99,6 +102,7 @@ fn dropping_a_scope_joins_a_parked_child() {
 /// 同一条路径下，子任务的 panic 不能丢失：作用域析构时把 payload 交给上一层作用域，由后者的
 /// `wait_all()` 抛出。
 #[test]
+#[cfg(feature = "std")]
 fn panic_survives_a_dropped_scope() {
     let result = catch_unwind(AssertUnwindSafe::new(|| {
         with_workers(1)

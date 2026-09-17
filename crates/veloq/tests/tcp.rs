@@ -571,7 +571,7 @@ fn a_local_listener_streams_connections_without_a_detached_op() {
 /// 用一个开了 provided buffer 的运行时跑 `f`。
 ///
 /// 默认是关的：环按 worker 占住 `entries * buf_size` 的池内存，不该让没用到它的程序白付。
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn run_test_with_provided_buffers<F, R>(f: F) -> R
 where
     F: for<'s> AsyncFnOnce(Ctx<'s>) -> R,
@@ -589,7 +589,7 @@ where
 ///
 /// 这正是 provided buffer 的收益所在：连接空闲时不占接收缓冲，数据到了才绑一个。所以这条
 /// 用例特意在**连接建立之后、数据发出之前**就把 recv 挂上去。
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn tcp_recv_provided_delivers_a_kernel_picked_buffer() {
     const ROUNDS: usize = 8;
@@ -653,7 +653,7 @@ fn tcp_recv_provided_delivers_a_kernel_picked_buffer() {
 ///
 /// 客户端使用库自带的 [`TcpStream`]：驱动在反注册/关闭套接字时会确保发出 TCP FIN 报文，
 /// 即使同一 ring 的固定文件表上有在途 multishot，对端也能立即收到 FIN 并正常优雅关闭。
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn recv_multi_streams_every_chunk_until_the_peer_closes() {
     const ROUNDS: usize = 8;
@@ -719,7 +719,7 @@ fn recv_multi_streams_every_chunk_until_the_peer_closes() {
 /// 覆盖的是取消路径：句柄的 `Drop` 把 slot 收进 `InFlightOrphaned`，内核随后的完成才找得到
 /// slot 去跑 `orphan_cleanup`——而 multishot recv 的 orphan cleanup 要把内核挑走的 buffer
 /// 还回环。漏掉的话环会一次比一次短，最后所有 recv 都 `-ENOBUFS`。
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn dropping_a_recv_stream_leaves_the_connection_usable() {
     run_test_with_provided_buffers(async |ctx| {

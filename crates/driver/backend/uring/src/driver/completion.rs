@@ -12,6 +12,7 @@ use veloq_std::{collections::HashMap, sync::atomic::AtomicU8};
 
 use diagweave::prelude::*;
 use tracing::{debug, trace, warn};
+use veloq_io_uring::cqueue;
 
 use crate::{
     config::IoFd,
@@ -199,7 +200,7 @@ impl<'a> UringCompletionHooks<'a> {
         token: CompletionToken,
         flags: u32,
     ) -> CompletionCleanupHintState {
-        let entry = if io_uring::cqueue::more(flags) {
+        let entry = if cqueue::more(flags) {
             self.control.peek_completion_cleanup_hint(token)
         } else {
             self.control.remove_completion_cleanup_hint(token, flags)
@@ -454,9 +455,7 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
                 let mut cqe_env = self.cqe_env();
                 match complete_kernel_waiting_slot(slot, event.token(), raw, &mut cqe_env) {
                     Ok(outcome) => {
-                        if matches!(source, CompletionSource::Kernel)
-                            && !io_uring::cqueue::more(raw.flags)
-                        {
+                        if matches!(source, CompletionSource::Kernel) && !cqueue::more(raw.flags) {
                             let _ = self.control.remove_completion_cleanup_hint(
                                 event.completion_token(),
                                 raw.flags,
@@ -475,15 +474,13 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
                             let mut cleanup = hint(raw.res);
                             let _ = run_completion_cleanup(self.diagnostics, &mut cleanup);
                         }
-                        if matches!(source, CompletionSource::Kernel)
-                            && !io_uring::cqueue::more(raw.flags)
-                        {
+                        if matches!(source, CompletionSource::Kernel) && !cqueue::more(raw.flags) {
                             let _ = self.control.remove_completion_cleanup_hint(
                                 event.completion_token(),
                                 raw.flags,
                             );
                         }
-                        if io_uring::cqueue::more(raw.flags) {
+                        if cqueue::more(raw.flags) {
                             CompletionSettlement::Quarantined {
                                 failure: CompletionFailure::quarantined(
                                     error.report,
@@ -544,7 +541,7 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_> {
         self.cqe_env().return_provided_buf(event.raw().flags);
         // 一个已放弃的 multishot 会继续投递完成，每一条都要跑 cleanup（accept 的话就是
         // 关掉那个内核已经建好的连接），但只有终态那条才能归还 slot。
-        let continuation = if io_uring::cqueue::more(event.raw().flags) {
+        let continuation = if cqueue::more(event.raw().flags) {
             CompletionContinuation::More
         } else {
             CompletionContinuation::Final
@@ -643,7 +640,7 @@ fn completion_observation(ingress: &CompletionIngress<()>) -> Option<(OpToken, b
         }
         CompletionIngress::Backend(_) | CompletionIngress::Anomaly { .. } => return None,
     };
-    Some((token, !io_uring::cqueue::more(flags)))
+    Some((token, !cqueue::more(flags)))
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -971,7 +968,7 @@ impl<'a> UringDriver<'a> {
             );
             if let Err(error) = self
                 .control
-                .settle_staged_completion(envelope.raw.token, !io_uring::cqueue::more(cqe_flags))
+                .settle_staged_completion(envelope.raw.token, !cqueue::more(cqe_flags))
             {
                 remember_first_error(
                     &mut first_error,
@@ -1404,7 +1401,7 @@ fn complete_kernel_waiting_slot(
 ) -> Result<CompletionSettlement<UringSlotSpec, UringBackendEffect>, KernelCompletionError> {
     // `IORING_CQE_F_MORE`：内核声明这个操作还会继续投递完成。flags 的解读到此为止，
     // core 只见 `CompletionContinuation`。
-    let continuation = if io_uring::cqueue::more(raw.flags) {
+    let continuation = if cqueue::more(raw.flags) {
         CompletionContinuation::More
     } else {
         CompletionContinuation::Final

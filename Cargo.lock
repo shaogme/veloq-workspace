@@ -539,17 +539,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "io-uring"
-version = "0.7.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d09b98f7eace8982db770e4408e7470b028ce513ac28fecdc6bf4c30fe92b62"
-dependencies = [
- "bitflags",
- "cfg-if",
- "libc",
-]
-
-[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1456,7 +1445,6 @@ dependencies = [
  "crossbeam-utils",
  "diagweave",
  "futures-core",
- "io-uring",
  "libc",
  "tracing",
  "veloq-blocking",
@@ -1476,11 +1464,11 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-queue",
  "diagweave",
- "io-uring",
  "libc",
  "tracing",
  "veloq-buf",
  "veloq-driver-core",
+ "veloq-io-uring",
  "veloq-std",
  "veloq-wheel",
 ]
@@ -1507,6 +1495,14 @@ dependencies = [
 name = "veloq-intrusive-linklist"
 version = "0.1.0"
 dependencies = [
+ "veloq-std",
+]
+
+[[package]]
+name = "veloq-io-uring"
+version = "0.1.0"
+dependencies = [
+ "libc",
  "veloq-std",
 ]
 

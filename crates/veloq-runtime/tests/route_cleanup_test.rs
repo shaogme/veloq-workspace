@@ -1,8 +1,11 @@
+#[cfg(feature = "std")]
 use veloq_std::future::Ready;
 
+#[cfg(feature = "std")]
 use veloq_runtime::{error::RuntimeError, runtime::Runtime};
 
 #[test]
+#[cfg(feature = "std")]
 fn route_job_panic_is_published_to_the_route_future() {
     let result = Runtime::<(), _>::scope(async |ctx| {
         ctx.route_to(0, || -> Ready<()> { panic!("route job panic") })

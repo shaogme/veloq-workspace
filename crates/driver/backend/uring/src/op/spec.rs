@@ -12,13 +12,13 @@ use crate::{
     },
 };
 use diagweave::prelude::*;
-use io_uring::squeue;
 use veloq_buf::heap::ChunkId;
 use veloq_driver_core::{
     driver::{CompletionCleanupGuard, OpToken, SubmitTokenContext},
     op::{IntoPlatformOp, LostReason, OpCompletion, OpError, OpKind, OpResult, SingleShotOp},
     slot::{SlotAccess, SlotAccessError},
 };
+use veloq_io_uring::squeue;
 use veloq_std::{convert::identity, format, pin::Pin, time::Duration};
 
 use submit::{
@@ -2006,7 +2006,6 @@ mod tests {
         op::{UringOp, UringOpRegistry, UringOperationDescriptor},
         test_alloc::{AllocationCounts, measure},
     };
-    use io_uring::squeue;
     use veloq_buf::{FixedBuf, NoopRegistrar, heap::ChunkId};
     use veloq_driver_core::{
         driver::{OpToken, SubmitTokenContext, registry::OpEntry},
@@ -2016,6 +2015,7 @@ mod tests {
             SlotView,
         },
     };
+    use veloq_io_uring::squeue;
     use veloq_std::{
         mem::{align_of, size_of},
         net::{Ipv4Addr, SocketAddr, SocketAddrV4},

@@ -504,11 +504,7 @@ impl<'a> UringDriver<'a> {
         if let Some(outcome) = self.register_files_update_outcomes.pop_front() {
             return match outcome {
                 RegisterFilesUpdateOutcome::Actual => {
-                    let result = self
-                        .ring
-                        .submitter()
-                        .register_files_update(start, files)
-                        .map_err(io::Error::from);
+                    let result = self.ring.submitter().register_files_update(start, files);
                     let evidence = match &result {
                         Ok(updated) => KernelUpdateOutcome::Applied(*updated),
                         Err(error) => KernelUpdateOutcome::Unknown(
@@ -528,11 +524,7 @@ impl<'a> UringDriver<'a> {
             };
         }
 
-        let result = self
-            .ring
-            .submitter()
-            .register_files_update(start, files)
-            .map_err(io::Error::from);
+        let result = self.ring.submitter().register_files_update(start, files);
         let evidence = match &result {
             Ok(updated) => KernelUpdateOutcome::Applied(*updated),
             Err(error) => KernelUpdateOutcome::Unknown(

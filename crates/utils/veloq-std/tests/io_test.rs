@@ -64,7 +64,7 @@ fn test_raw_os_error() {
     let code: RawOsError = 2; // ENOENT on Linux
     let err = Error::from_raw_os_error(code);
     assert_eq!(err.raw_os_error(), Some(code));
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     assert_eq!(err.kind(), ErrorKind::NotFound);
 
     let display_str = format!("{err}");

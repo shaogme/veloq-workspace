@@ -1,6 +1,8 @@
 use crate::{Link, LinkedList};
+use veloq_std::boxed::Box;
+
+#[cfg(feature = "std")]
 use veloq_std::{
-    boxed::Box,
     mem::ManuallyDrop,
     panic::{AssertUnwindSafe, catch_unwind},
 };
@@ -195,6 +197,7 @@ fn test_readonly_cursor_traversal() {
 }
 
 #[test]
+#[cfg(feature = "std")]
 fn linked_node_drop_panics_on_a_normal_path() {
     let result = catch_unwind(AssertUnwindSafe::new(|| {
         let mut list = ManuallyDrop::new(LinkedList::new(TestAdapter));
@@ -211,6 +214,7 @@ fn linked_node_drop_panics_on_a_normal_path() {
 }
 
 #[test]
+#[cfg(feature = "std")]
 fn linked_node_drop_is_suppressed_during_panic_unwind() {
     let result = catch_unwind(AssertUnwindSafe::new(|| {
         let mut list = ManuallyDrop::new(LinkedList::new(TestAdapter));

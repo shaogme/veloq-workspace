@@ -1,4 +1,4 @@
-#[cfg(not(feature = "loom"))]
+#[cfg(all(not(feature = "loom"), feature = "std"))]
 mod normal_tests {
     use std::{sync::Arc, thread, time::Duration};
 

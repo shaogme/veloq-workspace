@@ -14,7 +14,6 @@ use crate::{
     op::{Reserved, Slot, SlotView, SubmissionStrategy, UringOp, UringOpRegistryExt, sqe_with_fd},
 };
 use diagweave::prelude::*;
-use io_uring::{opcode, types};
 use tracing::{debug, trace};
 use veloq_buf::heap::ChunkId;
 use veloq_driver_core::{
@@ -22,6 +21,10 @@ use veloq_driver_core::{
         CompletionToken, DriverSubmitResult, OpToken, RegisterFd, SubmitStatus, SubmitTokenContext,
     },
     slot::{CheckedSlotView, InFlightWaiting},
+};
+use veloq_io_uring::{
+    opcode,
+    types::{self, SubmitArgs, Timespec},
 };
 use veloq_std::{format, task::Poll, time::Duration, vec};
 
@@ -463,10 +466,10 @@ impl<'a> UringDriver<'a> {
         }
 
         if let Some(timeout) = plan.wait {
-            let timespec = io_uring::types::Timespec::new()
+            let timespec = Timespec::new()
                 .sec(timeout.as_secs())
                 .nsec(timeout.subsec_nanos());
-            let args = io_uring::types::SubmitArgs::new().timespec(&timespec);
+            let args = SubmitArgs::new().timespec(&timespec);
             match self.ring.submitter().submit_with_args(1, &args) {
                 Ok(consumed) => Ok((
                     if to_submit == 0 {

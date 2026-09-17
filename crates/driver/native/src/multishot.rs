@@ -16,7 +16,7 @@ use crate::error::Error as DriverError;
 ///
 /// 驱动把 CQE 的负数结果原样存进 `error_code`（见 uring 后端的 `on_complete`），所以这里
 /// 拿到的就是内核那一侧的 errno。
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[inline]
 fn errno_of(err: &Report<DriverError>) -> Option<i32> {
     err.error_code().and_then(|code| i32::try_from(code).ok())
@@ -26,7 +26,7 @@ fn errno_of(err: &Report<DriverError>) -> Option<i32> {
 ///
 /// 对 multishot 而言这不只是一次失败：内核**顺带把整个操作终止了**（那条 CQE 不带
 /// `IORING_CQE_F_MORE`），所以流必须重新 arm 才能继续。
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[inline]
 pub fn is_buffer_ring_exhausted(err: &Report<DriverError>) -> bool {
     errno_of(err) == Some(libc::ENOBUFS)
@@ -42,7 +42,7 @@ pub fn is_buffer_ring_exhausted(err: &Report<DriverError>) -> bool {
 /// 力被白白关掉。但那条路是自愈的——退回单发之后同一个错误会照样报出来，用户看到的仍是
 /// 真实原因，代价只是这个 driver 之后少一次优化。反过来漏判则是硬故障：整条流在旧内核上
 /// 永远只吐 `-EINVAL`。
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[inline]
 pub fn is_capability_rejected(err: &Report<DriverError>) -> bool {
     matches!(errno_of(err), Some(libc::EINVAL | libc::EOPNOTSUPP))

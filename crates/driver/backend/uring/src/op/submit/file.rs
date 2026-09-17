@@ -10,9 +10,9 @@ use crate::{
     },
 };
 use diagweave::prelude::*;
-use io_uring::{opcode, squeue, types};
 use veloq_buf::{PoolKind, heap::ChunkId};
 use veloq_driver_core::driver::SubmitTokenContext;
+use veloq_io_uring::{opcode, squeue, types};
 use veloq_std::{pin::Pin, string::ToString};
 
 use super::{invalid_buf_io_range, resolve_any_fd, resolve_file_fd, sqe_with_fd};
@@ -182,9 +182,9 @@ pub(crate) unsafe fn make_sqe_fsync(
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let flags = if fsync_op.datasync {
-        io_uring::types::FsyncFlags::DATASYNC
+        types::FsyncFlags::DATASYNC
     } else {
-        io_uring::types::FsyncFlags::empty()
+        types::FsyncFlags::empty()
     };
 
     let fd = resolve_file_fd(
@@ -204,9 +204,9 @@ pub(crate) unsafe fn make_sqe_fsync_raw(
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let flags = if fsync_op.datasync {
-        io_uring::types::FsyncFlags::DATASYNC
+        types::FsyncFlags::DATASYNC
     } else {
-        io_uring::types::FsyncFlags::empty()
+        types::FsyncFlags::empty()
     };
 
     let fd = fsync_op.fd.as_fd();

@@ -60,10 +60,10 @@ pub use slot_pool::*;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use veloq_std::{
-        num::NonZeroUsize,
-        panic::{AssertUnwindSafe, catch_unwind},
-    };
+    use veloq_std::num::NonZeroUsize;
+
+    #[cfg(feature = "std")]
+    use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
 
     #[test]
     fn heap_view_preserves_borrow_semantics() {
@@ -94,6 +94,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn heap_view_rejects_invalid_range_without_retaining() {
         let buf = FixedBuf::alloc_heap(NonZeroUsize::new(8).expect("non-zero length"), 8)
             .expect("heap allocation failed");

@@ -26,9 +26,9 @@ use veloq_std::{
 };
 
 use diagweave::prelude::*;
-use io_uring::{Submitter, cqueue, types::BufRingEntry};
 use tracing::{debug, warn};
 use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
+use veloq_io_uring::{Submitter, cqueue, types::BufRingEntry};
 
 use crate::{
     config::{MAX_PROVIDED_BUF_ENTRIES, ProvidedBufConfig},
@@ -921,6 +921,8 @@ impl Default for ProvidedBufStats {
 
 #[cfg(test)]
 mod tests {
+    use veloq_io_uring::IoUring;
+
     use super::{
         AnyBufPool, PROVIDED_BUF_GROUP_ID, ProvidedBufConfig, ProvidedBufGroup, TestPool,
         test_group,
@@ -981,7 +983,7 @@ mod tests {
 
     #[test]
     fn allocation_failure_happens_before_registration() {
-        let ring = match io_uring::IoUring::new(8) {
+        let ring = match IoUring::new(8) {
             Ok(ring) => ring,
             Err(_) => return,
         };
@@ -1008,7 +1010,7 @@ mod tests {
 
     #[test]
     fn registered_group_can_be_cleaned_after_an_injected_failure() {
-        let ring = match io_uring::IoUring::new(8) {
+        let ring = match IoUring::new(8) {
             Ok(ring) => ring,
             Err(_) => return,
         };

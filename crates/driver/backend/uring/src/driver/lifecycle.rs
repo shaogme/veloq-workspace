@@ -9,13 +9,13 @@ use crate::{
     op::{CheckedSlotView, Slot, SlotState, SlotView, UringOpRegistryExt},
 };
 use diagweave::prelude::*;
-use io_uring::opcode;
 use tracing::{debug, trace};
 use veloq_driver_core::driver::{
     AnomalyAttach, CancelMode, CancelRequest, CancelSubmitOutcome, CancelTargetGoneReason,
     CancelTicket, CompletionToken, OpToken, SyntheticCompletionSource, UserCompletionEvent,
     cancel_target_kind,
 };
+use veloq_io_uring::opcode;
 use veloq_std::format;
 use veloq_wheel::TimerId;
 

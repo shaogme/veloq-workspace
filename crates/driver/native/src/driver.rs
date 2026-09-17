@@ -7,18 +7,18 @@ pub use veloq_driver_core::driver::{
     DriverCapabilities, DriverCapability, DriverRaw, RegisterFd, RemoteWaker, RuntimeContextDriver,
 };
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub type PlatformDriver<'a> = veloq_driver_uring::UringDriver<'a>;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub type PlatformOp = veloq_driver_uring::UringOp;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub type PlatformUP = veloq_driver_uring::UringUserPayload;
 /// The active backend's [`veloq_driver_core::slot::SlotSpec`].
 ///
 /// Both backends spell it as an uninhabited marker type with no lifetime, so unlike
 /// [`PlatformDriver`] this alias takes no parameter — which is what lets facade-level types
 /// name driver futures without threading the driver's lifetime through.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub type PlatformSlotSpec = veloq_driver_uring::UringSlotSpec;
 #[cfg(target_os = "windows")]
 pub type PlatformSlotSpec = veloq_driver_iocp::IocpSlotSpec;

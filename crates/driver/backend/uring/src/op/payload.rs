@@ -15,8 +15,8 @@ use crate::{
     error::UringResult,
     net::{bounded_sockaddr_bytes, socket_addr_to_storage, to_socket_addr},
 };
-use io_uring::types::Timespec;
 use veloq_buf::BufIoRangeError;
+use veloq_io_uring::types::Timespec;
 use veloq_std::{
     marker::{PhantomData, PhantomPinned},
     mem,

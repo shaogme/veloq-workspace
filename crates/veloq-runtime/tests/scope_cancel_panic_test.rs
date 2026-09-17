@@ -6,11 +6,13 @@ use veloq_runtime::{
 use veloq_std::{
     future::Future,
     num::NonZeroUsize,
-    panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
     sync::atomic::{NativeAtomicBool as AtomicBool, Ordering},
     task::{Context, Poll},
 };
+
+#[cfg(feature = "std")]
+use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
 
 fn with_workers(count: usize) -> RuntimeBuilder<(), fn(usize, &RuntimeShared<()>)> {
     RuntimeBuilder::new().with_worker_count(NonZeroUsize::new(count))
@@ -26,6 +28,7 @@ impl Future for Park {
 }
 
 #[test]
+#[cfg(feature = "std")]
 fn panic_in_scope_cancels_and_joins_child_tasks() {
     let child_cancelled = AtomicBool::new(false);
 

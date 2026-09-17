@@ -27,13 +27,13 @@ use crate::{
     op::{CompletionCleanupHintFn, UringOpRegistry},
 };
 use diagweave::prelude::*;
-use io_uring::{SubmissionQueue, Submitter, cqueue, squeue};
 use tracing::{debug, trace};
 use veloq_buf::{BufferRegistrar, FixedBuf, heap::ChunkId};
 use veloq_driver_core::driver::{
     BufferRegistrationStatus, CancelTicket, CompletionToken, OpToken, RawCompletion,
 };
 use veloq_driver_core::slot::Generation;
+use veloq_io_uring::{SubmissionQueue, Submitter, cqueue, squeue};
 use veloq_std::{
     collections::{BitSet, HashMap},
     format, ptr,

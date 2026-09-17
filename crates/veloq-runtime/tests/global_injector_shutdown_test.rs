@@ -13,6 +13,9 @@ use veloq_std::{
     task::Poll,
 };
 
+#[cfg(feature = "std")]
+use veloq_std::hint::spin_loop;
+
 use veloq_runtime::{
     error::RuntimeWakeError,
     runtime::primitives::RuntimeWaker,
@@ -82,6 +85,7 @@ fn wake_failure_drains_pending_scope_without_hanging() {
 }
 
 #[test]
+#[cfg(feature = "std")]
 fn worker_initialization_panic_closes_runtime_without_waiting_for_missing_worker() {
     let result = RuntimeBuilder::new()
         .with_worker_count(NonZeroUsize::new(2))
@@ -97,11 +101,30 @@ fn worker_initialization_panic_closes_runtime_without_waiting_for_missing_worker
 }
 
 #[test]
+#[cfg(feature = "std")]
 fn main_worker_initialization_panic_runs_shutdown_completion() {
+    let worker_one_started = Arc::new(AtomicBool::new(false));
+    let worker_one_release = Arc::new(AtomicBool::new(false));
     let result = RuntimeBuilder::new()
         .with_worker_count(NonZeroUsize::new(2))
-        .with_worker_factory(|worker_id: usize, _shared: &RuntimeShared<()>| {
-            assert_eq!(worker_id, 1, "only worker 1 should finish initialization");
+        .with_worker_factory({
+            let worker_one_started = worker_one_started.clone();
+            let worker_one_release = worker_one_release.clone();
+            move |worker_id: usize, _shared: &RuntimeShared<()>| {
+                if worker_id == 1 {
+                    worker_one_started.store(true, Ordering::Release);
+                    while !worker_one_release.load(Ordering::Acquire) {
+                        spin_loop();
+                    }
+                } else {
+                    while !worker_one_started.load(Ordering::Acquire) {
+                        spin_loop();
+                    }
+                    worker_one_release.store(true, Ordering::Release);
+                }
+
+                assert_eq!(worker_id, 1, "only worker 1 should finish initialization");
+            }
         })
         .scope(async |_ctx| ());
 

@@ -7,7 +7,7 @@ use alloc::{format, string::String};
 
 #[inline]
 pub fn last_os_error() -> RawOsError {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     unsafe {
         *libc::__errno_location() as RawOsError
     }

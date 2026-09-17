@@ -1,6 +1,6 @@
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod linux;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub use linux::{alloc_huge_pages, alloc_pages, free_pages};
 
 #[cfg(target_os = "windows")]

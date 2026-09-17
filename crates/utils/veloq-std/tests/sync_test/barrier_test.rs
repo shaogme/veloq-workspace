@@ -133,6 +133,7 @@ mod normal_tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn barrier_state_is_not_poisoned_by_a_panicking_participant() {
         let barrier = Arc::new(Barrier::new(2));
         let barrier_for_worker = barrier.clone();

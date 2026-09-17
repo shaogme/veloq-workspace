@@ -2,12 +2,12 @@ use crate::{
     driver::{CqeEnv, SqeEnv},
     error::UringResult,
 };
-use io_uring::squeue;
 use veloq_buf::heap::ChunkId;
 use veloq_driver_core::{
     driver::{CompletionCleanupGuard, OpToken, SubmitTokenContext},
     slot::SlotAccess,
 };
+use veloq_io_uring::squeue;
 use veloq_std::time::Duration;
 
 use super::{

@@ -1,0 +1,24 @@
+[package]
+name = "veloq-io-uring"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Minimal no-std io_uring userspace ABI for Veloq."
+readme.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = []
+std = ["veloq-std/std"]
+
+[dependencies]
+veloq-std.workspace = true
+libc.workspace = true
+
+[lints]
+workspace = true

@@ -14,13 +14,13 @@ use crate::{
     },
 };
 use diagweave::prelude::*;
-use io_uring::{opcode, squeue, types};
 use tracing::warn;
 use veloq_buf::BufIoRangeError;
 use veloq_driver_core::{
     DriverCoreError,
     driver::{CompletionCleanup, CompletionCleanupGuard, SubmitTokenContext},
 };
+use veloq_io_uring::{opcode, squeue, types};
 use veloq_std::{io, pin::Pin, string::ToString};
 
 #[inline]
@@ -64,7 +64,7 @@ fn resolve_any_fd(table: &FileTable, fd: IoFd, scope: &'static str) -> UringResu
 /// Every `io_uring` opcode accepts `impl sealed::UseFixed`, which both `types::Fixed` and
 /// `types::Fd` implement — but the trait is crate-private, so the builder cannot be written
 /// generically over it. Expanding the body once per variant is the way to keep the two paths
-/// from drifting apart. Callers must have `SqeFd` and `io_uring::types` in scope.
+/// from drifting apart. Callers must have `SqeFd` and `types` in scope.
 macro_rules! sqe_with_fd {
     ($fd:expr, |$name:ident| $build:expr) => {
         match $fd {

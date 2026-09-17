@@ -11,6 +11,7 @@ use crate::{
     error::UringResult,
 };
 use veloq_buf::{AnyBufPool, BufferRegistrar, heap::ChunkId};
+use veloq_io_uring::Submitter;
 use veloq_std::{boxed::Box, collections::BitSet, time::Instant, vec};
 
 #[cfg(feature = "test-hooks")]
@@ -324,7 +325,7 @@ impl<'a> UringBufferRegistry<'a> {
 
     pub(crate) fn attach_buffer_pool(
         &mut self,
-        submitter: &io_uring::Submitter<'_>,
+        submitter: &Submitter<'_>,
         pool: AnyBufPool,
         ring_lifetime_token: RingLifetimeToken,
     ) -> UringResult<bool> {
@@ -352,7 +353,7 @@ impl<'a> UringBufferRegistry<'a> {
 
     pub(crate) fn release_provided_buffers(
         &mut self,
-        submitter: &io_uring::Submitter<'_>,
+        submitter: &Submitter<'_>,
     ) -> UringResult<()> {
         self.release_provided_buffers_with(|group| group.try_unregister(submitter))
     }

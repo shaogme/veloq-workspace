@@ -1081,22 +1081,28 @@ impl<T> RuntimeShared<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "std")]
+    use crate::task::GenericWakerNode;
     use crate::{error::RuntimeWakeError, runtime::primitives::RuntimeWaker};
     use crate::{
         scope::GenericScopeCompletion,
-        task::{GenericWakerNode, ScopeRef, TaskVTable},
+        task::{ScopeRef, TaskVTable},
         utils::ownership::ArcOwnership,
     };
+    #[cfg(feature = "std")]
     use veloq_intrusive_linklist::Link;
+    #[cfg(feature = "std")]
     use veloq_std::{
         marker::{PhantomData, PhantomPinned},
         pin::Pin,
+        task::{RawWaker, Waker},
+    };
+    use veloq_std::{
         result::Result as StdResult,
         sync::{
             NativeArc as Arc,
             atomic::{NativeAtomicUsize as AtomicUsize, Ordering},
         },
-        task::{RawWaker, Waker},
     };
     use veloq_storage::AtomicStorage;
 
@@ -1112,6 +1118,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "std")]
     static PANIC_WAKER_VTABLE: veloq_std::task::RawWakerVTable =
         veloq_std::task::RawWakerVTable::new(
             |_| veloq_std::task::RawWaker::new(veloq_std::ptr::null(), &PANIC_WAKER_VTABLE),
@@ -1189,6 +1196,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn global_drain_contains_waker_panic_and_finishes_task() {
         let shared = test_shared();
         let completion = GenericScopeCompletion::<AtomicStorage, ArcOwnership>::new(None);

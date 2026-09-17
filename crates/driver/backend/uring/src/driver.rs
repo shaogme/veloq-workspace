@@ -1,7 +1,7 @@
 use diagweave::prelude::*;
-use io_uring::{IoUring, opcode};
 use tracing::{debug, trace};
 use veloq_buf::{AnyBufPool, BufferRegistrar, heap::ChunkId};
+use veloq_io_uring::{IoUring, Probe, opcode, types};
 use veloq_std::{format, ptr, sync::Arc, vec, vec::Vec};
 
 #[cfg(feature = "test-hooks")]
@@ -64,10 +64,10 @@ pub(crate) use registration::{
 /// 提交（见 [`Driver::note_capability_rejected`]）。`provided_buffers` 不在此列——它不靠
 /// 猜：`register_buf_ring` 成功与否就是答案，而那要等池到位（见
 /// [`Driver::attach_buffer_pool`]），所以这里先记 `false`。
-fn probe_capabilities(probe: &io_uring::Probe) -> DriverCapabilities {
+fn probe_capabilities(probe: &Probe) -> DriverCapabilities {
     DriverCapabilities {
-        accept_multi: probe.is_supported(opcode::Accept::CODE),
-        recv_multi: probe.is_supported(opcode::Recv::CODE),
+        accept_multi: probe.is_supported(opcode::Accept::<types::Fd>::CODE),
+        recv_multi: probe.is_supported(opcode::Recv::<types::Fd>::CODE),
         provided_buffers: false,
     }
 }
@@ -167,10 +167,10 @@ impl<'a> UringDriver<'a> {
         // opcode 探测只能回答「这个 opcode 存在吗」，回答不了「它的 multishot 变体存在
         // 吗」——那是同一个 opcode 上后加的标志位。所以这里只排除掉真正缺 opcode 的内核，
         // 剩下的由第一次提交去问（`note_capability_rejected`）。
-        let mut ring_probe = io_uring::Probe::new();
+        let mut ring_probe = Probe::new();
         if ring.submitter().register_probe(&mut ring_probe).is_err() {
             debug!("IORING_REGISTER_PROBE unavailable; assuming no optional opcodes");
-            ring_probe = io_uring::Probe::new();
+            ring_probe = Probe::new();
         }
 
         debug!("Initalized UringDriver with {} entries", entries);

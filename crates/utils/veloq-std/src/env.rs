@@ -301,7 +301,7 @@ pub mod consts {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64", target_arch = "x86")))]
     pub const ARCH: &str = "unknown";
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub const OS: &str = "linux";
     #[cfg(target_os = "windows")]
     pub const OS: &str = "windows";

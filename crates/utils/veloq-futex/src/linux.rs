@@ -398,7 +398,7 @@ fn monotonic_now() -> Result<u128, FutexError> {
         .ok_or(FutexError::Errno(libc::EINVAL))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn errno_result() -> i32 {
     unsafe { *libc::__errno_location() }
 }

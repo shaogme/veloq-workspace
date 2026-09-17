@@ -123,6 +123,7 @@ fn test_thread_abort_error() {
 }
 
 #[test]
+#[cfg(feature = "std")]
 fn test_thread_panic_error() {
     let thread = spawn(|| {
         panic!("intentional panic");
