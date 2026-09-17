@@ -1,6 +1,9 @@
 //! Windows-specific file system primitives and extension traits.
 
-use crate::io::{Error, Result};
+use crate::io::Result;
+
+#[cfg(feature = "std")]
+use crate::io::Error;
 
 #[cfg(feature = "std")]
 use std::{

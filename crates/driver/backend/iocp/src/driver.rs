@@ -271,8 +271,17 @@ impl<'a> DriverRaw for IocpDriver<'a> {
 
         self.drain_deferred_socket_cleanup();
 
+        let next_timeout_hint = self.timer.next_deadline().map_err(|error| {
+            IocpError::InvalidState
+                .report(
+                    "iocp.timer.deadline",
+                    "timer wheel deadline could not be queried",
+                )
+                .with_ctx("timer_error", format!("{error:?}"))
+        })?;
+
         Ok(DriveOutcome {
-            next_timeout_hint: self.timer.next_wakeup(),
+            next_timeout_hint,
             ready_completion: self.ops.shared.has_ready_completion(),
             in_flight: self.has_active_ops_internal(),
         })

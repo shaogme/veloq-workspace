@@ -731,7 +731,7 @@ impl DriveCycle {
         let mut next_mode = self.mode;
         for round in 0..budget.limits.max_submit_rounds {
             driver.submit_waker()?;
-            let plan = driver.build_kernel_enter_plan(next_mode);
+            let plan = driver.build_kernel_enter_plan(next_mode)?;
             let submit_progress = driver.submit_to_kernel(plan)?;
             trace!(
                 round,
@@ -821,10 +821,13 @@ impl DriveCycle {
 impl<'a> UringDriver<'a> {
     const WAKE_FAILURE_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
-    pub(crate) fn build_kernel_enter_plan(&mut self, mode: DriveMode) -> KernelEnterPlan {
+    pub(crate) fn build_kernel_enter_plan(
+        &mut self,
+        mode: DriveMode,
+    ) -> UringResult<KernelEnterPlan> {
         let to_submit = self.ring.submission().len();
         match mode {
-            DriveMode::Poll => KernelEnterPlan::poll(to_submit),
+            DriveMode::Poll => Ok(KernelEnterPlan::poll(to_submit)),
             DriveMode::Wait { timeout } => {
                 let cq_ready = {
                     let mut completion = self.ring.completion();
@@ -836,20 +839,29 @@ impl<'a> UringDriver<'a> {
                     self.completion_diagnostics
                         .backend()
                         .inc_wait_ready_preflight();
-                    return KernelEnterPlan::poll_ready(to_submit);
+                    return Ok(KernelEnterPlan::poll_ready(to_submit));
                 }
 
-                let budget = wait_budget(
-                    timeout,
-                    self.control.timers.next_wakeup(),
-                    Self::WAKE_FAILURE_PROBE_INTERVAL,
-                );
+                let timer_deadline = self.control.timers.next_deadline().map_err(|error| {
+                    UringError::InvalidState
+                        .report(
+                            "uring.timer.deadline",
+                            "timer wheel deadline could not be queried",
+                        )
+                        .with_ctx("timer_error", format!("{error:?}"))
+                })?;
+                let budget =
+                    wait_budget(timeout, timer_deadline, Self::WAKE_FAILURE_PROBE_INTERVAL);
                 if budget.duration.is_zero() {
                     self.completion_diagnostics.backend().inc_wait_zero();
-                    KernelEnterPlan::poll_zero_timeout(to_submit)
+                    Ok(KernelEnterPlan::poll_zero_timeout(to_submit))
                 } else {
                     self.completion_diagnostics.backend().inc_wait_block();
-                    KernelEnterPlan::wait(to_submit, budget.duration, budget.source)
+                    Ok(KernelEnterPlan::wait(
+                        to_submit,
+                        budget.duration,
+                        budget.source,
+                    ))
                 }
             }
         }

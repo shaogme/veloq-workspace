@@ -50,10 +50,8 @@ impl UringTimerWheel {
     }
 
     #[inline]
-    pub(crate) fn next_wakeup(&self) -> Option<Duration> {
-        self.wheel.next_wakeup().map(|timeout| {
-            timeout.saturating_sub(Instant::now().saturating_duration_since(self.last_poll))
-        })
+    pub(crate) fn next_deadline(&self) -> Result<Option<Duration>, TimerError> {
+        self.wheel.next_deadline()
     }
 
     #[inline]

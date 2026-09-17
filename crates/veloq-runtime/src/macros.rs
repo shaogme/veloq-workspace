@@ -196,20 +196,13 @@ macro_rules! select {
 
 /// Runs `closure` inside a fresh thread-safe scope derived from the current task's scope.
 ///
-/// Equivalent to [`RuntimeCtx::scope`](crate::runtime::RuntimeCtx::scope), which is what you
-/// should reach for when the closure's parameter type is already pinned down (a named `async
-/// fn`, for instance). The macro exists because an `async |s| ..` literal cannot infer the
-/// scope reference type on its own.
-///
-/// The macro **cannot** simply forward the literal to `RuntimeCtx::scope`: handing an `async`
-/// closure to a generic function whose bound still carries unresolved regions makes rustc
-/// demand that the closure be higher-ranked over those regions too, which async closures
-/// cannot be (`implementation of AsyncFnOnce is not general enough`). That is why the scope is
-/// built and driven here, calling the closure in the same body where its argument exists.
+/// The macro exists because an `async |s| ..` literal cannot infer the scope reference type on
+/// its own. The scope is built and driven here, calling the closure in the same body where its
+/// argument exists, which avoids unresolved higher-ranked regions for the async closure.
 /// The body may return `()`, a `Result`, or an explicit [`Outcome`](crate::Outcome); returned
 /// errors cancel child tasks before the macro completes. Everything with actual semantics —
 /// parent lookup, `wait_all`, and the join/cancel/panic handling in
-/// [`AsyncScope`](crate::scope::AsyncScope)'s `Drop` — is shared with the method.
+/// [`AsyncScope`](crate::scope::AsyncScope)'s `Drop` — is shared with the scope implementation.
 #[macro_export]
 macro_rules! scope {
     ($ctx:expr, $closure:expr) => {
@@ -226,8 +219,8 @@ macro_rules! scope {
     };
 }
 
-/// Thread-local counterpart of [`scope!`]; see there for why the body is not a plain forward
-/// to [`RuntimeCtx::scope_local`](crate::runtime::RuntimeCtx::scope_local).
+/// Thread-local counterpart of [`scope!`]; see there for why the body is built directly in the
+/// macro expansion.
 #[macro_export]
 macro_rules! scope_local {
     ($ctx:expr, $closure:expr) => {

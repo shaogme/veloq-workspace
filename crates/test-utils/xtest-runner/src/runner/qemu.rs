@@ -360,13 +360,7 @@ impl QemuInstance {
     pub fn run_in_vm(&self, forward_args: &[String], quiet: bool) -> Result<Output, RunnerError> {
         let escaped_args = forward_args
             .iter()
-            .map(|arg| {
-                if arg.contains(' ') {
-                    format!("\"{arg}\"")
-                } else {
-                    arg.clone()
-                }
-            })
+            .map(|arg| format!("'{}'", arg.replace('\'', "''")))
             .collect::<Vec<_>>()
             .join(" ");
 

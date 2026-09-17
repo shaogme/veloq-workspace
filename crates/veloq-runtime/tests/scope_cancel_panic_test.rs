@@ -75,23 +75,22 @@ fn early_err_in_scope_cancels_and_joins_child_tasks() {
 }
 
 #[test]
-fn ctx_scope_early_err_cancels_child_tasks() {
+fn scope_macro_early_err_cancels_child_tasks() {
     let child_executed = AtomicBool::new(false);
 
     with_workers(2)
         .scope(async |ctx| {
-            let res: Outcome<(), &'static str> = ctx
-                .scope(async |s| {
-                    s.spawn_boxed(async {
-                        Park.await;
-                    });
-                    child_executed.store(true, Ordering::Release);
-                    Err("ctx scope error")
-                })
-                .await
-                .unwrap();
+            let res: Outcome<(), &'static str> = scope!(ctx, async |s| {
+                s.spawn_boxed(async {
+                    Park.await;
+                });
+                child_executed.store(true, Ordering::Release);
+                Err("scope macro error")
+            })
+            .await
+            .unwrap();
 
-            assert_eq!(res, Outcome::Err("ctx scope error"));
+            assert_eq!(res, Outcome::Err("scope macro error"));
             assert!(child_executed.load(Ordering::Acquire));
         })
         .unwrap();

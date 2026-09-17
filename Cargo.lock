@@ -1525,6 +1525,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "veloq-reliable-udp"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "tracing",
+ "tracing-subscriber",
+ "veloq",
+ "veloq-buf",
+ "veloq-runtime",
+ "veloq-std",
+ "veloq-sync",
+ "veloq-wheel",
+]
+
+[[package]]
 name = "veloq-runtime"
 version = "0.1.0"
 dependencies = [

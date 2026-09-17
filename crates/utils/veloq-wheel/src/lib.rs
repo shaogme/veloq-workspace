@@ -3,6 +3,7 @@
 extern crate alloc;
 
 mod config;
+mod deadline;
 mod error;
 mod id;
 mod level;

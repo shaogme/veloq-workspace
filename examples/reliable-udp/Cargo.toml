@@ -1,0 +1,32 @@
+[package]
+name = "veloq-reliable-udp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Reliable ordered message protocol core for Veloq UDP"
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+
+[dependencies]
+veloq.workspace = true
+veloq-buf.workspace = true
+veloq-runtime.workspace = true
+veloq-sync.workspace = true
+veloq-std.workspace = true
+veloq-wheel.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+tracing-subscriber.workspace = true
+
+[[bench]]
+name = "reliable_udp"
+harness = false
+
+[lints]
+workspace = true

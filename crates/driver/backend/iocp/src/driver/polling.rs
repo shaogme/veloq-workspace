@@ -248,10 +248,8 @@ impl TimerEngine {
         }
     }
 
-    pub(super) fn next_wakeup(&self) -> Option<Duration> {
-        self.wheel.next_wakeup().map(|timeout| {
-            timeout.saturating_sub(Instant::now().saturating_duration_since(self.last_poll))
-        })
+    pub(super) fn next_deadline(&self) -> Result<Option<Duration>, TimerError> {
+        self.wheel.next_deadline()
     }
 
     pub(super) fn insert(
@@ -318,11 +316,15 @@ impl<'a> IocpDriver<'a> {
         })?;
         self.process_timers()?;
         let ready_completion = self.ops.shared.has_ready_completion();
-        let budget = wait_budget(
-            timeout,
-            self.timer.next_wakeup(),
-            WAKE_FAILURE_PROBE_INTERVAL,
-        );
+        let timer_deadline = self.timer.next_deadline().map_err(|error| {
+            IocpError::InvalidState
+                .report(
+                    "iocp.timer.deadline",
+                    "timer wheel deadline could not be queried",
+                )
+                .with_ctx("timer_error", format!("{error:?}"))
+        })?;
+        let budget = wait_budget(timeout, timer_deadline, WAKE_FAILURE_PROBE_INTERVAL);
         let wait_ms = if ready_completion {
             self.completion_diagnostics
                 .backend()

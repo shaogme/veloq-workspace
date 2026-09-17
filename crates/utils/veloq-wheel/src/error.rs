@@ -42,6 +42,7 @@ pub enum TimerError {
     DelayOverflow,
     ElapsedOverflow,
     ClockOverflow,
+    DeadlineOverflow,
     StaleTimerId,
     InvariantViolation,
 }
@@ -52,6 +53,7 @@ impl fmt::Display for TimerError {
             Self::DelayOverflow => "timer delay cannot be represented by the wheel clock",
             Self::ElapsedOverflow => "elapsed duration cannot be represented by the wheel clock",
             Self::ClockOverflow => "wheel clock would overflow its u64 tick range",
+            Self::DeadlineOverflow => "timer deadline cannot be represented as a Duration",
             Self::StaleTimerId => "timer ID is stale or does not belong to this wheel",
             Self::InvariantViolation => "timing wheel invariant was violated",
         };

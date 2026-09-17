@@ -4,7 +4,6 @@ use veloq_std::{
     marker::PhantomData,
     mem::replace,
     num::NonZeroUsize,
-    ops::AsyncFnOnce,
     pin::Pin,
     ptr::NonNull,
     string::String,
@@ -16,9 +15,6 @@ use veloq_std::{
 use super::shared::{EnqueuePinnedOutcome, RuntimeShared};
 use crate::{
     error::{Result, RuntimeError},
-    macros::helpers::run_scope_eval,
-    outcome::{IntoOutcome, Outcome},
-    scope::{AsyncScope, LocalAsyncScope},
     task::{
         AnyScopeRef, GenericTaskHeader, PollStatus, RawTask, RuntimeContextExt, ScopeRef,
         SendTaskRef, TaskHandleRef, TaskHeader, TaskVTable,
@@ -337,50 +333,6 @@ impl<'rt, T> RuntimeCtx<'rt, T> {
             .with(|ctx| ctx.rand.next_u32(branches))
     }
 
-    /// Runs `f` inside a fresh thread-safe scope derived from the current task's scope.
-    ///
-    /// Prefer this over [`scope!`](macro@crate::scope) whenever `f`'s parameter type is already
-    /// pinned down; the macro exists for `async |s| ..` literals, and explains in its own docs
-    /// why it cannot just forward here. `self` is taken by value (the context is `Copy`) so the
-    /// returned future owns everything it needs.
-    ///
-    /// The body may return `()`, a `Result`, or an explicit [`Outcome`]. A returned error cancels
-    /// the child tasks before this method completes.
-    pub async fn scope<'env, 'scope, F, Body>(
-        self,
-        f: F,
-    ) -> Result<Outcome<Body::Output, Body::Error>>
-    where
-        'env: 'scope,
-        Body: IntoOutcome,
-        F: for<'scope_ref> AsyncFnOnce(&'scope_ref AsyncScope<'rt, 'scope, 'env, T>) -> Body,
-    {
-        let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
-        let scope = AsyncScope::new(self, parent);
-        let s_ref = &scope;
-        run_scope_eval(s_ref, f(s_ref)).await
-    }
-
-    /// Thread-local counterpart of [`RuntimeCtx::scope`], forwarded to by
-    /// [`scope_local!`](crate::scope_local).
-    ///
-    /// The body may return `()`, a `Result`, or an explicit [`Outcome`]. A returned error cancels
-    /// the child tasks before this method completes.
-    pub async fn scope_local<'env, 'scope, F, Body>(
-        self,
-        f: F,
-    ) -> Result<Outcome<Body::Output, Body::Error>>
-    where
-        'env: 'scope,
-        Body: IntoOutcome,
-        F: for<'scope_ref> AsyncFnOnce(&'scope_ref LocalAsyncScope<'rt, 'scope, 'env, T>) -> Body,
-    {
-        let parent = poll_fn(|cx| Poll::Ready(cx.scope_completion())).await;
-        let scope = LocalAsyncScope::new(self, parent);
-        let s_ref = &scope;
-        run_scope_eval(s_ref, f(s_ref)).await
-    }
-
     pub fn route_to<'scope_ref, F, Fut>(
         &self,
         worker_id: usize,
@@ -463,8 +415,8 @@ impl<'rt, T> RuntimeCtx<'rt, T> {
 
 /// 取当前任务所属的作用域，作为新建子作用域的父节点。
 ///
-/// [`RuntimeCtx::scope`] 与 `scope!` / `scope_local!` 宏共用这一步：父作用域只能从当前
-/// 任务的 waker 上取，两边不能各写一份。
+/// `scope!` / `scope_local!` 宏共用这一步：父作用域只能从当前任务的 waker 上取，
+/// 两边不能各写一份。
 #[doc(hidden)]
 pub async fn current_scope() -> Option<AnyScopeRef> {
     poll_fn(|cx| Poll::Ready(cx.scope_completion())).await

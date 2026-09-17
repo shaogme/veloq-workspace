@@ -8,24 +8,25 @@ use crate::{
     utils::ownership::Ownership,
 };
 
-/// 把 `async |s| ..` 字面量的参数类型钉成一个作用域引用。
+/// 将异步作用域闭包限制到当前作用域实例。
 ///
-/// 闭包在宏体内被立刻调用，所以除 `'r` 之外的生命周期可以自由推导 —— 这也正是宏无法直接
-/// 转发给 [`RuntimeCtx::scope`](crate::runtime::RuntimeCtx::scope) 的原因，详见 `scope!`。
+/// 这里只量化传入 `&scope` 的引用生命周期；runtime、scope 和环境生命周期保持为
+/// 独立参数，避免把 runtime extra 中的借用错误地推广成同一个高阶生命周期。
 #[doc(hidden)]
-pub fn _constrain<'g, 'env, O, F, TExtra>(f: F) -> F
+pub fn _constrain<'rt, 'scope, 'env: 'scope, O, F, TExtra>(f: F) -> F
 where
     O: IntoOutcome,
-    F: for<'r> AsyncFnOnce(&'r AsyncScope<'r, 'g, 'env, TExtra>) -> O,
+    F: for<'scope_ref> AsyncFnOnce(&'scope_ref AsyncScope<'rt, 'scope, 'env, TExtra>) -> O,
 {
     f
 }
 
+/// [`_constrain`] 的线程本地作用域版本。
 #[doc(hidden)]
-pub fn _constrain_local<'g, 'env, O, F, TExtra>(f: F) -> F
+pub fn _constrain_local<'rt, 'scope, 'env: 'scope, O, F, TExtra>(f: F) -> F
 where
     O: IntoOutcome,
-    F: for<'r> AsyncFnOnce(&'r LocalAsyncScope<'r, 'g, 'env, TExtra>) -> O,
+    F: for<'scope_ref> AsyncFnOnce(&'scope_ref LocalAsyncScope<'rt, 'scope, 'env, TExtra>) -> O,
 {
     f
 }

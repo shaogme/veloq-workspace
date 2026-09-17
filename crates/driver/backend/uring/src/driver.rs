@@ -756,8 +756,17 @@ impl<'a> DriverRaw for UringDriver<'a> {
             .push_ctx("scope", "uring.driver.drive")
             .attach_note("advance unified uring drive cycle")?;
 
+        let next_timeout_hint = self.control.timers.next_deadline().map_err(|error| {
+            UringError::InvalidState
+                .report(
+                    "uring.timer.deadline",
+                    "timer wheel deadline could not be queried",
+                )
+                .with_ctx("timer_error", format!("{error:?}"))
+        })?;
+
         Ok(DriveOutcome {
-            next_timeout_hint: self.control.timers.next_wakeup(),
+            next_timeout_hint,
             ready_completion: self.ops.shared.has_ready_completion(),
             in_flight: self.has_active_ops_internal(),
         })

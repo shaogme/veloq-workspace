@@ -17,9 +17,11 @@ use veloq::{
     nz,
     runtime::{Runtime, context::Ctx, scope},
     sync::mpsc,
+    time::timeout_at,
 };
 use veloq_buf::{FixedBuf, UniformSlot, heap::ThreadMemoryMultiplier};
 use veloq_runtime::{select, task::yield_now};
+use veloq_std::time::{Duration, Instant};
 
 fn run_test<F, R>(f: F) -> R
 where
@@ -93,6 +95,96 @@ fn udp_send_receive() {
         })
         .await
         .unwrap();
+    });
+}
+
+#[test]
+fn udp_single_send_reaches_receiver_with_multiple_armed_receives_within_15s() {
+    const SINGLE_DATAGRAM_BUDGET: Duration = Duration::from_secs(15);
+
+    run_test(async |ctx| {
+        let deadline = Instant::now() + SINGLE_DATAGRAM_BUDGET;
+        let source = bind_udp_socket(ctx, "127.0.0.1:0");
+        let relay = bind_udp_socket(ctx, "127.0.0.1:0");
+        let server = bind_udp_socket(ctx, "127.0.0.1:0");
+        let probe = bind_udp_socket(ctx, "127.0.0.1:0");
+        let relay_addr = relay.local_addr().expect("relay address");
+        let source_addr = source.local_addr().expect("source address");
+
+        let completed = timeout_at(ctx, deadline, async {
+            scope!(ctx, async |scope| {
+                let (ready_tx, mut ready_rx) = mpsc::owned_unbounded::<()>();
+                let relay_ready = ready_tx.clone();
+                let relay_task = scope.spawn_boxed(async move {
+                    let mut receive = relay.prepare_recv_from(ctx.alloc_full(nz!(1_200)));
+                    receive.arm().await.expect("arm relay receive");
+                    relay_ready.send(()).expect("relay ready channel closed");
+
+                    let datagram = receive.await.expect("relay receive failed");
+                    assert_eq!(datagram.addr, source_addr);
+                    assert_eq!(datagram.buf.as_slice(), b"single-runtime-datagram");
+                });
+
+                let server_ready = ready_tx.clone();
+                let mut server_task = scope.spawn_boxed(async move {
+                    let mut receive = server.prepare_recv_from(ctx.alloc_full(nz!(1_200)));
+                    receive.arm().await.expect("arm server receive");
+                    server_ready.send(()).expect("server ready channel closed");
+                    let _ = receive.await;
+                });
+
+                let probe_ready = ready_tx.clone();
+                let mut probe_task = scope.spawn_boxed(async move {
+                    let mut receive = probe.prepare_recv_from(ctx.alloc_full(nz!(1_200)));
+                    receive.arm().await.expect("arm probe receive");
+                    probe_ready.send(()).expect("probe ready channel closed");
+                    let _ = receive.await;
+                });
+
+                let source_ready = ready_tx;
+                let source_socket = source.clone();
+                let mut source_task = scope.spawn_boxed(async move {
+                    let mut receive = source_socket.prepare_recv_from(ctx.alloc_full(nz!(1_200)));
+                    receive.arm().await.expect("arm source receive");
+                    source_ready.send(()).expect("source ready channel closed");
+                    let _ = receive.await;
+                });
+
+                let sender = source.clone();
+                let sender_task = scope.spawn_boxed(async move {
+                    for _ in 0..4 {
+                        ready_rx.recv().await.expect("ready channel closed");
+                    }
+
+                    let payload = b"single-runtime-datagram";
+                    let mut buffer = ctx.alloc(nz!(1_200), payload.len());
+                    buffer.as_slice_mut().copy_from_slice(payload);
+                    let (sent, _) = sender
+                        .send_to(buffer, relay_addr)
+                        .await
+                        .expect("single runtime UDP send failed");
+                    assert_eq!(sent, payload.len());
+                });
+
+                relay_task.await.expect("relay task join failed");
+                sender_task.await.expect("sender task join failed");
+
+                server_task.cancel();
+                let _ = server_task.await;
+                probe_task.cancel();
+                let _ = probe_task.await;
+                source_task.cancel();
+                let _ = source_task.await;
+            })
+            .await
+            .expect("runtime UDP scope failed");
+        })
+        .await;
+
+        assert!(
+            completed.is_ok(),
+            "single runtime UDP datagram was not delivered within 15 seconds"
+        );
     });
 }
 

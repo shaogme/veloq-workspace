@@ -32,11 +32,12 @@ pub use join::{JoinHandle, JoinOutcome, LocalAsyncJoinHandle, LocalJoinHandle, S
 
 use guard::ScopeTaskGuard;
 
-pub trait ScopeProvider<T> {
+pub trait ScopeProvider {
+    type Extra;
     type Storage: ScopeStorage;
     type Ownership: Ownership;
     type Arena: Arena;
-    fn runtime(&self) -> &RuntimeShared<T>;
+    fn runtime(&self) -> &RuntimeShared<Self::Extra>;
     fn arena(&self) -> &Self::Arena;
     fn completion(
         &self,
@@ -109,9 +110,10 @@ impl<'guard, 'rt, 'scope, 'env: 'scope, S: ScopeStorage, O: Ownership + 'static,
     }
 }
 
-impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra> ScopeProvider<TExtra>
+impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra> ScopeProvider
     for GenericAsyncScope<'rt, 'scope, 'env, S, O, TExtra>
 {
+    type Extra = TExtra;
     type Storage = S;
     type Ownership = O;
     type Arena = GenericArena<S>;
@@ -152,7 +154,7 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra>
     pub fn spawn_local<'scope_ref, T: Send, TTask>(
         &'scope_ref self,
         task: &'env TTask,
-    ) -> JoinHandle<'scope_ref, T, LocalTaskRef, Self, TExtra>
+    ) -> JoinHandle<'scope_ref, T, LocalTaskRef, Self>
     where
         TTask: LocalTask<T> + Sized + 'env,
     {
@@ -168,7 +170,7 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra>
     pub fn spawn_boxed_local<'scope_ref, T, F>(
         &'scope_ref self,
         future: F,
-    ) -> JoinHandle<'scope_ref, T, LocalTaskRef, Self, TExtra>
+    ) -> JoinHandle<'scope_ref, T, LocalTaskRef, Self>
     where
         F: Future<Output = T> + 'env,
     {
@@ -228,7 +230,7 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra>
         worker_id: usize,
         task: &'env TTask,
         enqueue_fn: impl FnOnce(&RuntimeShared<TExtra>, usize, H) -> Result<()>,
-    ) -> JoinHandle<'scope_ref, T, H, Self, TExtra>
+    ) -> JoinHandle<'scope_ref, T, H, Self>
     where
         H: TaskHandleRef,
         TTask: Task<T, Storage = H::Storage> + Sized + 'env,
@@ -258,7 +260,7 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra>
         worker_id: usize,
         future: F,
         enqueue_fn: impl FnOnce(&RuntimeShared<TExtra>, usize, H) -> Result<()>,
-    ) -> JoinHandle<'scope_ref, T, H, Self, TExtra>
+    ) -> JoinHandle<'scope_ref, T, H, Self>
     where
         H: TaskHandleRef,
         H::Storage: TaskStorage + TaskBounds<T, F>,
@@ -346,7 +348,7 @@ impl<'rt, 'scope, 'env, TExtra>
         &'scope_ref self,
         worker_id: usize,
         task: &'env S_,
-    ) -> JoinHandle<'scope_ref, T, SendTaskRef, Self, TExtra>
+    ) -> JoinHandle<'scope_ref, T, SendTaskRef, Self>
     where
         S_: SendTask<T> + Sized + 'env,
     {
@@ -367,7 +369,7 @@ impl<'rt, 'scope, 'env, TExtra>
         &'scope_ref self,
         worker_id: usize,
         task: &'env S_,
-    ) -> JoinHandle<'scope_ref, T, SendTaskRef, Self, TExtra>
+    ) -> JoinHandle<'scope_ref, T, SendTaskRef, Self>
     where
         S_: SendTask<T> + Sized + Sync + 'env,
     {
@@ -393,7 +395,7 @@ impl<'rt, 'scope, 'env, TExtra>
     pub fn spawn<'scope_ref, T: Send, S_>(
         &'scope_ref self,
         task: &'env S_,
-    ) -> JoinHandle<'scope_ref, T, SendTaskRef, Self, TExtra>
+    ) -> JoinHandle<'scope_ref, T, SendTaskRef, Self>
     where
         S_: SendTask<T> + Sized + 'env,
     {
@@ -404,7 +406,7 @@ impl<'rt, 'scope, 'env, TExtra>
         &'scope_ref self,
         worker_id: usize,
         future: F,
-    ) -> JoinHandle<'scope_ref, T, SendTaskRef, Self, TExtra>
+    ) -> JoinHandle<'scope_ref, T, SendTaskRef, Self>
     where
         F: Future<Output = T> + Send + 'env,
     {
@@ -425,7 +427,7 @@ impl<'rt, 'scope, 'env, TExtra>
         &'scope_ref self,
         worker_id: usize,
         job: F,
-    ) -> JoinHandle<'scope_ref, T, SendTaskRef, Self, TExtra>
+    ) -> JoinHandle<'scope_ref, T, SendTaskRef, Self>
     where
         F: AsyncFnOnce() -> T + FnOnce() -> Fut + Send + 'env,
         Fut: Future<Output = T> + Send + 'env,
@@ -477,7 +479,7 @@ impl<'rt, 'scope, 'env, TExtra>
     pub fn spawn_boxed<'scope_ref, T: Send, F>(
         &'scope_ref self,
         future: F,
-    ) -> JoinHandle<'scope_ref, T, SendTaskRef, Self, TExtra>
+    ) -> JoinHandle<'scope_ref, T, SendTaskRef, Self>
     where
         F: Future<Output = T> + Send + 'env,
     {
@@ -492,7 +494,7 @@ impl<'rt, 'scope, 'env, TExtra>
     pub fn spawn<'scope_ref, T: Send, S_>(
         &'scope_ref self,
         task: &'env S_,
-    ) -> JoinHandle<'scope_ref, T, LocalTaskRef, Self, TExtra>
+    ) -> JoinHandle<'scope_ref, T, LocalTaskRef, Self>
     where
         S_: LocalTask<T> + Sized + 'env,
     {
@@ -502,7 +504,7 @@ impl<'rt, 'scope, 'env, TExtra>
     pub fn spawn_boxed<'scope_ref, T: Send, F>(
         &'scope_ref self,
         future: F,
-    ) -> JoinHandle<'scope_ref, T, LocalTaskRef, Self, TExtra>
+    ) -> JoinHandle<'scope_ref, T, LocalTaskRef, Self>
     where
         F: Future<Output = T> + 'env,
     {

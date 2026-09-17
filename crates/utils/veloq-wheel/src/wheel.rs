@@ -1,8 +1,10 @@
 use alloc::vec::Vec;
 use core::time::Duration;
-use slotmap::{DefaultKey, SlotMap};
+use slotmap::{DefaultKey, Key, SlotMap};
 
-use crate::{config::WheelConfig, error::TimerError, id::TimerId, level::Level};
+use crate::{
+    config::WheelConfig, deadline::DeadlineHeap, error::TimerError, id::TimerId, level::Level,
+};
 
 const SMALL_ADVANCE_LIMIT: u64 = 4096;
 
@@ -13,6 +15,7 @@ struct WheelEntry<T> {
     slot: u32,
     prev: Option<DefaultKey>,
     next: Option<DefaultKey>,
+    heap_index: usize,
 }
 
 pub struct Expired<T> {
@@ -30,6 +33,7 @@ pub struct AdvanceReport {
 
 pub struct Wheel<T> {
     tasks: SlotMap<DefaultKey, WheelEntry<T>>,
+    deadline_heap: DeadlineHeap,
     levels: Vec<Level>,
     current_tick: u64,
     remainder_nanos: u64,
@@ -52,6 +56,7 @@ impl<T> Wheel<T> {
             .collect();
         Self {
             tasks: SlotMap::new(),
+            deadline_heap: DeadlineHeap::new(),
             levels,
             current_tick: 0,
             remainder_nanos: 0,
@@ -68,9 +73,15 @@ impl<T> Wheel<T> {
             slot: 0,
             prev: None,
             next: None,
+            heap_index: 0,
         });
         let (level, slot) = self.determine_location(deadline_tick);
         if let Err(error) = self.link(key, level, slot) {
+            self.tasks.remove(key);
+            return Err(error);
+        }
+        if let Err(error) = self.insert_deadline(key, deadline_tick) {
+            let _ = self.unlink(key);
             self.tasks.remove(key);
             return Err(error);
         }
@@ -79,11 +90,11 @@ impl<T> Wheel<T> {
     }
 
     pub fn reschedule(&mut self, id: TimerId, delay: Duration) -> Result<(), TimerError> {
-        let deadline_tick = self.deadline_after(delay)?;
         let key = id.key();
         if !self.tasks.contains_key(key) {
             return Err(TimerError::StaleTimerId);
         }
+        let deadline_tick = self.deadline_after(delay)?;
         self.unlink(key)?;
         self.tasks
             .get_mut(key)
@@ -91,6 +102,12 @@ impl<T> Wheel<T> {
             .deadline_tick = deadline_tick;
         let (level, slot) = self.determine_location(deadline_tick);
         self.link(key, level, slot)?;
+        let heap_index = self
+            .tasks
+            .get(key)
+            .ok_or(TimerError::InvariantViolation)?
+            .heap_index;
+        self.update_deadline(key, heap_index, deadline_tick)?;
         self.debug_assert_invariants();
         Ok(())
     }
@@ -101,6 +118,8 @@ impl<T> Wheel<T> {
             return None;
         }
         self.unlink(key).ok()?;
+        let heap_index = self.tasks.get(key)?.heap_index;
+        self.remove_deadline(key, heap_index).ok()?;
         let entry = self.tasks.remove(key)?;
         self.debug_assert_invariants();
         Some(entry.item)
@@ -148,46 +167,22 @@ impl<T> Wheel<T> {
         })
     }
 
-    pub fn next_wakeup(&self) -> Option<Duration> {
-        if self.tasks.is_empty() {
-            return None;
-        }
-
-        let mut best_ticks = None;
-        for (level_index, level) in self.levels.iter().enumerate() {
-            let level_tick = self.current_tick / level.unit_ticks;
-            let cursor = (level_tick as usize) & level.mask;
-            let at_current_boundary = self.current_tick.is_multiple_of(level.unit_ticks);
-            let current_slot = level.slots[cursor].head.is_some();
-            let needs_processing_now = current_slot
-                && at_current_boundary
-                && (level_index == 0 || self.slot_can_move_down(level_index, cursor));
-
-            let boundary_distance = if needs_processing_now {
-                0
+    pub fn next_deadline(&self) -> Result<Option<Duration>, TimerError> {
+        let Some(node) = self.deadline_heap.peek() else {
+            return if self.tasks.is_empty() {
+                Ok(None)
             } else {
-                let Some(next_level_tick) = level_tick.checked_add(1) else {
-                    best_ticks = Some(u64::MAX);
-                    continue;
-                };
-                let next_cursor = (next_level_tick as usize) & level.mask;
-                let Some((_, distance)) = level.next_occupied(next_cursor) else {
-                    continue;
-                };
-                let Some(boundary_tick) = next_level_tick
-                    .checked_add(distance as u64)
-                    .and_then(|value| value.checked_mul(level.unit_ticks))
-                else {
-                    best_ticks = Some(u64::MAX);
-                    continue;
-                };
-                boundary_tick.saturating_sub(self.current_tick)
+                Err(TimerError::InvariantViolation)
             };
-            best_ticks =
-                Some(best_ticks.map_or(boundary_distance, |best: u64| best.min(boundary_distance)));
+        };
+        if self
+            .tasks
+            .get(node.key)
+            .is_none_or(|entry| entry.deadline_tick != node.deadline_tick)
+        {
+            return Err(TimerError::InvariantViolation);
         }
-
-        best_ticks.map(|ticks| self.duration_from_ticks(ticks))
+        self.duration_until_tick(node.deadline_tick).map(Some)
     }
 
     pub fn tick_duration(&self) -> Duration {
@@ -210,6 +205,7 @@ impl<T> Wheel<T> {
         for level in &mut self.levels {
             level.clear_slots();
         }
+        self.deadline_heap.clear();
         for (_, entry) in self.tasks.drain() {
             out.push(entry.item);
         }
@@ -254,7 +250,6 @@ impl<T> Wheel<T> {
             let slot = &mut self.levels[level_index].slots[slot_index];
             slot.head = Some(key);
             slot.tail = Some(key);
-            self.levels[level_index].set_occupied(slot_index);
             let entry = self
                 .tasks
                 .get_mut(key)
@@ -282,7 +277,6 @@ impl<T> Wheel<T> {
         entry.prev = Some(old_tail);
         entry.next = None;
         self.levels[level_index].slots[slot_index].tail = Some(key);
-        self.levels[level_index].set_occupied(slot_index);
         Ok(())
     }
 
@@ -317,9 +311,6 @@ impl<T> Wheel<T> {
                     .prev = prev;
             }
             None => self.levels[level_index].slots[slot_index].tail = prev,
-        }
-        if self.levels[level_index].slots[slot_index].head.is_none() {
-            self.levels[level_index].clear_occupied(slot_index);
         }
         let entry = self
             .tasks
@@ -359,7 +350,6 @@ impl<T> Wheel<T> {
             let slot = &mut self.levels[level_index].slots[slot_index];
             let head = slot.head.take();
             slot.tail = None;
-            self.levels[level_index].clear_occupied(slot_index);
             head
         };
         while let Some(key) = current {
@@ -375,6 +365,12 @@ impl<T> Wheel<T> {
                 .ok_or(TimerError::InvariantViolation)?
                 .deadline_tick;
             if deadline_tick <= self.current_tick {
+                let heap_index = self
+                    .tasks
+                    .get(key)
+                    .ok_or(TimerError::InvariantViolation)?
+                    .heap_index;
+                self.remove_deadline(key, heap_index)?;
                 let entry = self
                     .tasks
                     .remove(key)
@@ -420,6 +416,12 @@ impl<T> Wheel<T> {
                 .ok_or(TimerError::InvariantViolation)?
                 .deadline_tick;
             if deadline_tick <= target_tick {
+                let heap_index = self
+                    .tasks
+                    .get(key)
+                    .ok_or(TimerError::InvariantViolation)?
+                    .heap_index;
+                self.remove_deadline(key, heap_index)?;
                 let entry = self
                     .tasks
                     .remove(key)
@@ -437,42 +439,70 @@ impl<T> Wheel<T> {
         Ok(())
     }
 
-    fn slot_can_move_down(&self, level_index: usize, slot_index: usize) -> bool {
-        let mut key = self.levels[level_index].slots[slot_index].head;
-        while let Some(current) = key {
-            let Some(entry) = self.tasks.get(current) else {
-                return false;
-            };
-            if entry.deadline_tick <= self.current_tick
-                || entry.deadline_tick.saturating_sub(self.current_tick)
-                    < self.levels[level_index - 1].span_ticks
-            {
-                return true;
-            }
-            key = entry.next;
-        }
-        false
+    fn insert_deadline(&mut self, key: DefaultKey, deadline_tick: u64) -> Result<(), TimerError> {
+        let (tasks, deadline_heap) = (&mut self.tasks, &mut self.deadline_heap);
+        deadline_heap.insert(key, deadline_tick, |key, index| {
+            tasks
+                .get_mut(key)
+                .map(|entry| entry.heap_index = index)
+                .ok_or(TimerError::InvariantViolation)
+        })
     }
 
-    fn duration_from_ticks(&self, ticks: u64) -> Duration {
-        let nanos = u128::from(ticks) * u128::from(self.base_tick_nanos);
+    fn update_deadline(
+        &mut self,
+        key: DefaultKey,
+        heap_index: usize,
+        deadline_tick: u64,
+    ) -> Result<(), TimerError> {
+        let (tasks, deadline_heap) = (&mut self.tasks, &mut self.deadline_heap);
+        deadline_heap.update(key, heap_index, deadline_tick, |key, index| {
+            tasks
+                .get_mut(key)
+                .map(|entry| entry.heap_index = index)
+                .ok_or(TimerError::InvariantViolation)
+        })
+    }
+
+    fn remove_deadline(&mut self, key: DefaultKey, heap_index: usize) -> Result<(), TimerError> {
+        let (tasks, deadline_heap) = (&mut self.tasks, &mut self.deadline_heap);
+        deadline_heap.remove(key, heap_index, |key, index| {
+            tasks
+                .get_mut(key)
+                .map(|entry| entry.heap_index = index)
+                .ok_or(TimerError::InvariantViolation)
+        })
+    }
+
+    fn duration_until_tick(&self, deadline_tick: u64) -> Result<Duration, TimerError> {
+        if deadline_tick <= self.current_tick {
+            return Ok(Duration::ZERO);
+        }
+        let ticks = deadline_tick - self.current_tick;
+        let nanos = u128::from(ticks)
+            .checked_mul(u128::from(self.base_tick_nanos))
+            .ok_or(TimerError::DeadlineOverflow)?
+            .checked_sub(u128::from(self.remainder_nanos))
+            .ok_or(TimerError::DeadlineOverflow)?;
         let seconds = nanos / 1_000_000_000;
         let remainder = nanos % 1_000_000_000;
-        if seconds > u128::from(u64::MAX) {
-            Duration::from_secs(u64::MAX)
-        } else {
-            Duration::from_secs(seconds as u64) + Duration::from_nanos(remainder as u64)
-        }
+        let seconds = u64::try_from(seconds).map_err(|_| TimerError::DeadlineOverflow)?;
+        Ok(Duration::new(seconds, remainder as u32))
     }
 
     #[cfg(debug_assertions)]
     fn debug_assert_invariants(&self) {
+        self.debug_assert_level_invariants();
+        self.debug_assert_deadline_invariants();
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_assert_level_invariants(&self) {
         let mut linked = 0usize;
         for (level_index, level) in self.levels.iter().enumerate() {
             for (slot_index, slot) in level.slots.iter().enumerate() {
                 let occupied = slot.head.is_some();
                 debug_assert_eq!(occupied, slot.tail.is_some());
-                debug_assert_eq!(occupied, level.is_occupied(slot_index));
                 let mut key = slot.head;
                 let mut prev = None;
                 while let Some(current) = key {
@@ -498,6 +528,42 @@ impl<T> Wheel<T> {
             }
         }
         debug_assert_eq!(linked, self.tasks.len());
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_assert_deadline_invariants(&self) {
+        debug_assert_eq!(self.deadline_heap.len(), self.tasks.len());
+        for index in 0..self.deadline_heap.len() {
+            let Some(node) = self.deadline_heap.node(index) else {
+                debug_assert!(false, "deadline heap node is missing");
+                continue;
+            };
+            let Some(entry) = self.tasks.get(node.key) else {
+                debug_assert!(false, "deadline heap entry is missing");
+                continue;
+            };
+            debug_assert_eq!(entry.heap_index, index);
+            debug_assert_eq!(entry.deadline_tick, node.deadline_tick);
+            if index != 0 {
+                let parent = (index - 1) / 2;
+                let Some(parent_node) = self.deadline_heap.node(parent) else {
+                    debug_assert!(false, "deadline heap parent is missing");
+                    continue;
+                };
+                debug_assert!(
+                    (parent_node.deadline_tick, parent_node.key.data().as_ffi())
+                        <= (node.deadline_tick, node.key.data().as_ffi())
+                );
+            }
+        }
+        for (key, entry) in &self.tasks {
+            let Some(node) = self.deadline_heap.node(entry.heap_index) else {
+                debug_assert!(false, "task points to a missing deadline heap node");
+                continue;
+            };
+            debug_assert_eq!(node.key, key);
+            debug_assert_eq!(node.deadline_tick, entry.deadline_tick);
+        }
     }
 
     #[cfg(not(debug_assertions))]
@@ -628,8 +694,12 @@ mod tests {
         assert_eq!(wheel.cancel(canceled), Some("canceled"));
         assert_eq!(wheel.len(), 0);
         assert!(wheel.is_empty());
-        assert!(wheel.next_wakeup().is_none());
+        assert_eq!(wheel.next_deadline(), Ok(None));
         assert_eq!(wheel.cancel(canceled), None);
+        assert_eq!(
+            wheel.reschedule(canceled, Duration::MAX),
+            Err(TimerError::StaleTimerId)
+        );
 
         let reused = wheel
             .insert("reused", Duration::from_secs(10))
@@ -695,22 +765,22 @@ mod tests {
         assert!(report.fast_forwarded);
         assert_eq!(expired_items(&expired), vec!["expired"]);
         assert_eq!(wheel.len(), 1);
-        assert!(wheel.next_wakeup().is_some());
+        assert_eq!(wheel.next_deadline(), Ok(Some(Duration::from_secs(900))));
     }
 
     #[test]
-    fn next_wakeup_is_only_a_boundary_hint() {
+    fn next_deadline_returns_the_global_earliest_deadline() {
         let mut wheel = Wheel::new(config(10_000_000, &[4, 4]));
         wheel
             .insert("upper", Duration::from_millis(50))
             .expect("timer insertion");
-        assert_eq!(wheel.next_wakeup(), Some(Duration::from_millis(40)));
+        assert_eq!(wheel.next_deadline(), Ok(Some(Duration::from_millis(50))));
         let mut expired = Vec::new();
         wheel
             .advance_by(Duration::from_millis(40), &mut expired)
             .expect("wheel advance");
         assert!(expired.is_empty());
-        assert_eq!(wheel.next_wakeup(), Some(Duration::from_millis(10)));
+        assert_eq!(wheel.next_deadline(), Ok(Some(Duration::from_millis(10))));
         wheel
             .advance_by(Duration::ZERO, &mut expired)
             .expect("zero advance");
@@ -719,6 +789,76 @@ mod tests {
             .advance_by(Duration::from_millis(10), &mut expired)
             .expect("wheel advance");
         assert_eq!(expired_items(&expired), vec!["upper"]);
+    }
+
+    #[test]
+    fn next_deadline_subtracts_sub_tick_remainder() {
+        let mut wheel = Wheel::new(config(10_000_000, &[4]));
+        wheel
+            .insert("deadline", Duration::from_millis(20))
+            .expect("timer insertion");
+        let mut expired = Vec::new();
+        wheel
+            .advance_by(Duration::from_millis(5), &mut expired)
+            .expect("wheel advance");
+        assert!(expired.is_empty());
+        assert_eq!(wheel.next_deadline(), Ok(Some(Duration::from_millis(15))));
+        wheel
+            .advance_by(Duration::from_millis(1), &mut expired)
+            .expect("wheel advance");
+        assert_eq!(wheel.next_deadline(), Ok(Some(Duration::from_millis(14))));
+    }
+
+    #[test]
+    fn next_deadline_switches_root_after_insert_reschedule_and_cancel() {
+        let mut wheel = Wheel::new(config(10_000_000, &[4, 4, 4]));
+        let later = wheel
+            .insert("later", Duration::from_millis(30))
+            .expect("timer insertion");
+        let earliest = wheel
+            .insert("earliest", Duration::from_millis(10))
+            .expect("timer insertion");
+        assert_eq!(wheel.next_deadline(), Ok(Some(Duration::from_millis(10))));
+
+        wheel
+            .reschedule(earliest, Duration::from_millis(40))
+            .expect("timer reschedule");
+        assert_eq!(wheel.next_deadline(), Ok(Some(Duration::from_millis(30))));
+
+        let newest = wheel
+            .insert("newest", Duration::from_millis(10))
+            .expect("timer insertion");
+        assert_eq!(wheel.next_deadline(), Ok(Some(Duration::from_millis(10))));
+        assert_eq!(wheel.cancel(newest), Some("newest"));
+        assert_eq!(wheel.next_deadline(), Ok(Some(Duration::from_millis(30))));
+        assert_eq!(wheel.cancel(later), Some("later"));
+        assert_eq!(wheel.next_deadline(), Ok(Some(Duration::from_millis(40))));
+    }
+
+    #[test]
+    fn next_deadline_returns_zero_without_expiring_timer() {
+        let mut wheel = Wheel::new(config(10_000_000, &[4]));
+        wheel
+            .insert("immediate", Duration::ZERO)
+            .expect("timer insertion");
+        assert_eq!(wheel.next_deadline(), Ok(Some(Duration::ZERO)));
+        let mut expired = Vec::new();
+        assert_eq!(wheel.len(), 1);
+        wheel
+            .advance_by(Duration::ZERO, &mut expired)
+            .expect("zero advance");
+        assert_eq!(expired_items(&expired), vec!["immediate"]);
+    }
+
+    #[test]
+    fn next_deadline_reports_duration_overflow_without_mutating_state() {
+        let mut wheel = Wheel::new(config(u64::MAX, &[2]));
+        wheel
+            .insert("overflow", Duration::new(u64::MAX, 999_999_999))
+            .expect("timer insertion");
+        assert_eq!(wheel.next_deadline(), Err(TimerError::DeadlineOverflow));
+        assert_eq!(wheel.len(), 1);
+        assert!(!wheel.is_empty());
     }
 
     #[test]

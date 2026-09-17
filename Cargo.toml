@@ -6,6 +6,7 @@ members = [
     "crates/veloq-buf",
     "crates/veloq-local",
     "examples/disk-bench",
+    "examples/reliable-udp",
     "crates/driver/core",
     "crates/driver/backend/uring",
     "crates/driver/backend/iocp",
@@ -32,6 +33,7 @@ default-members = [
     "crates/driver/core",
     "crates/driver/native",
     "examples/disk-bench",
+    "examples/reliable-udp",
     "crates/utils/veloq-waker",
     "crates/utils/veloq-intrusive-linklist",
     "crates/utils/veloq-wheel",
@@ -104,6 +106,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Console",
 ] }
 tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
 bilge = "0.3.0"
 diagweave = { version = "0.5.4", default-features = false }
 
