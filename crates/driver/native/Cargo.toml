@@ -19,14 +19,35 @@ test-hooks = [
     "veloq-driver-uring/test-hooks",
     "veloq-driver-iocp/test-hooks",
 ]
+std = [
+    "veloq-std/std",
+    "veloq-driver-uring/std",
+    "veloq-driver-iocp/std",
+    "veloq-driver-core/std",
+    "veloq-waker/std",
+    "veloq-buf/std",
+    "veloq-wheel/std",
+    "veloq-blocking/std",
+]
+loom = [
+    "veloq-std/loom",
+    "veloq-driver-uring/loom",
+    "veloq-driver-iocp/loom",
+    "veloq-driver-core/loom",
+    "veloq-waker/loom",
+    "veloq-buf/loom",
+    "veloq-wheel/loom",
+    "veloq-blocking/loom",
+]
 
 [dependencies]
+veloq-std.workspace = true
+veloq-driver-core.workspace = true
 veloq-waker.workspace = true
 veloq-buf.workspace = true
-veloq-driver-core.workspace = true
 veloq-wheel.workspace = true
 veloq-blocking.workspace = true
-veloq-std.workspace = true
+
 futures-core.workspace = true
 diagweave.workspace = true
 

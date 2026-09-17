@@ -13,11 +13,13 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-futures-core.workspace = true
 veloq-intrusive-linklist.workspace = true
 veloq-std.workspace = true
 
+futures-core.workspace = true
+
 [features]
+default = []
 loom = ["veloq-intrusive-linklist/loom", "veloq-std/loom"]
 std = ["veloq-intrusive-linklist/std", "veloq-std/std"]
 

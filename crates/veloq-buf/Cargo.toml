@@ -15,20 +15,29 @@ readme.workspace = true
 veloq-std.workspace = true
 veloq-tls.workspace = true
 veloq-intrusive-linklist.workspace = true
+
 crossbeam-utils.workspace = true
 tracing.workspace = true
 bilge.workspace = true
 diagweave.workspace = true
-
-[features]
-loom = ["veloq-intrusive-linklist/loom"]
-std = ["veloq-intrusive-linklist/std"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys.workspace = true
+
+[features]
+default = []
+std = [
+    "veloq-std/std",
+    "veloq-intrusive-linklist/std"
+]
+loom = [
+    "veloq-std/loom",
+    "veloq-tls/loom",
+    "veloq-intrusive-linklist/loom"
+]
 
 [dev-dependencies]
 tempfile = "3"

@@ -14,5 +14,10 @@ readme.workspace = true
 [dependencies]
 veloq-std.workspace = true
 
+[features]
+default = []
+std = ["veloq-std/std"]
+loom = ["veloq-std/loom"]
+
 [lints]
 workspace = true

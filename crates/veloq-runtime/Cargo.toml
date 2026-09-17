@@ -12,15 +12,15 @@ categories.workspace = true
 readme.workspace = true
 
 [dependencies]
-crossbeam-queue.workspace = true
-numaperf-topo = "0.1"
-
 veloq-waker.workspace = true
 veloq-intrusive-linklist.workspace = true
 veloq-tls.workspace = true
 veloq-std.workspace = true
-crossbeam-deque.workspace = true
 veloq-storage.workspace = true
+
+crossbeam-queue.workspace = true
+numaperf-topo = "0.1"
+crossbeam-deque.workspace = true
 
 diagweave.workspace = true
 
@@ -28,14 +28,18 @@ diagweave.workspace = true
 veloq-futex.workspace = true
 
 [features]
+default = []
 loom = [
     "veloq-intrusive-linklist/loom",
     "veloq-waker/loom",
+    "veloq-tls/loom",
+    "veloq-storage/loom",
     "veloq-std/loom",
 ]
 std = [
     "veloq-intrusive-linklist/std",
     "veloq-waker/std",
+    "veloq-storage/std",
     "veloq-std/std",
 ]
 

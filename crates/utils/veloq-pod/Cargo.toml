@@ -12,7 +12,5 @@ documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
-[dependencies]
-
 [dev-dependencies]
 veloq-std.workspace = true

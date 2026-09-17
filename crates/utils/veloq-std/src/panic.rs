@@ -60,11 +60,20 @@ impl PanicPayload {
     pub fn as_any(&self) -> &(dyn std::any::Any + Send + 'static) {
         &*self.0
     }
+}
 
+impl PanicPayload {
     /// Attempts to view the payload as `T`.
     #[inline]
     pub fn downcast_ref<T: 'static>(&self) -> Option<&T> {
-        self.0.downcast_ref()
+        #[cfg(feature = "std")]
+        {
+            self.0.downcast_ref()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            None
+        }
     }
 }
 

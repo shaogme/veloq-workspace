@@ -23,17 +23,11 @@ crossbeam-queue.workspace = true
 tokio.workspace = true
 criterion.workspace = true
 
-[dependencies.loom]
-workspace = true
-features = ["futures"]
-optional = true
-
 [lints]
 workspace = true
 
 [features]
 loom = [
-    "dep:loom",
     "veloq-std/loom",
     "veloq-waker/loom",
     "veloq-intrusive-linklist/loom",

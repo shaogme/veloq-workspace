@@ -15,6 +15,7 @@ readme.workspace = true
 veloq-std.workspace = true
 
 [features]
+default = []
 loom = ["veloq-std/loom"]
 std = ["veloq-std/std"]
 

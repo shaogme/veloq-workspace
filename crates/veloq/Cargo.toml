@@ -14,6 +14,26 @@ readme.workspace = true
 [features]
 default = []
 test-hooks = ["veloq-driver-native/test-hooks"]
+std = [
+    "veloq-std/std",
+    "veloq-runtime/std",
+    "veloq-buf/std",
+    "veloq-driver-native/std",
+    "veloq-blocking/std",
+    "veloq-sync/std",
+    "veloq-local/std",
+    "veloq-waker/std",
+]
+loom = [
+    "veloq-std/loom",
+    "veloq-runtime/loom",
+    "veloq-buf/loom",
+    "veloq-driver-native/loom",
+    "veloq-blocking/loom",
+    "veloq-sync/loom",
+    "veloq-local/loom",
+    "veloq-waker/loom",
+]
 
 [dependencies]
 veloq-runtime.workspace = true
@@ -23,8 +43,8 @@ veloq-blocking.workspace = true
 veloq-sync.workspace = true
 veloq-local.workspace = true
 veloq-waker.workspace = true
-veloq-tls.workspace = true
 veloq-std.workspace = true
+
 futures-core.workspace = true
 tracing.workspace = true
 diagweave.workspace = true

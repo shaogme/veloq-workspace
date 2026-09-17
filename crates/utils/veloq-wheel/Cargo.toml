@@ -14,12 +14,18 @@ readme.workspace = true
 [dependencies]
 slotmap.workspace = true
 veloq-std.workspace = true
-[[bench]]
-name = "wheel_bench"
-harness = false
 
 [dev-dependencies]
 criterion.workspace = true
 
+[features]
+default = []
+std = ["veloq-std/std"]
+loom = ["veloq-std/loom"]
+
 [lints]
 workspace = true
+
+[[bench]]
+name = "wheel_bench"
+harness = false

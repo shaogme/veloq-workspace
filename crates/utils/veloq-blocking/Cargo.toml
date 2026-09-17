@@ -20,5 +20,10 @@ crossbeam-queue.workspace = true
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys.workspace = true
 
+[features]
+default = []
+std = ["veloq-std/std"]
+loom = ["veloq-std/loom"]
+
 [lints]
 workspace = true

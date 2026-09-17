@@ -1381,7 +1381,6 @@ dependencies = [
  "veloq-runtime",
  "veloq-std",
  "veloq-sync",
- "veloq-tls",
  "veloq-waker",
  "windows-sys",
 ]
@@ -1578,7 +1577,6 @@ dependencies = [
  "criterion",
  "crossbeam-queue",
  "futures-core",
- "loom",
  "tokio",
  "veloq-intrusive-linklist",
  "veloq-std",

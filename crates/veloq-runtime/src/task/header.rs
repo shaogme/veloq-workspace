@@ -11,11 +11,11 @@ use crate::{
 };
 use diagweave::prelude::*;
 use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
-use veloq_std::cell::UnsafeCell;
-use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
 use veloq_std::{
+    cell::UnsafeCell,
     marker::{PhantomData, PhantomPinned},
     mem::ManuallyDrop,
+    panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
     ptr::{self, NonNull},
     sync::{NativeArc as Arc, atomic::Ordering},

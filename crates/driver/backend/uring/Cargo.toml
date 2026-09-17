@@ -15,12 +15,24 @@ categories.workspace = true
 [features]
 default = []
 test-hooks = ["veloq-driver-core/test-hooks"]
+std = [
+    "veloq-std/std",
+    "veloq-driver-core/std",
+    "veloq-buf/std",
+    "veloq-wheel/std",
+]
+loom = [
+    "veloq-std/loom",
+    "veloq-driver-core/loom",
+    "veloq-buf/loom",
+    "veloq-wheel/loom",
+]
 
 [dependencies]
+veloq-std.workspace = true
 veloq-driver-core.workspace = true
 veloq-buf.workspace = true
 veloq-wheel.workspace = true
-veloq-std.workspace = true
 
 crossbeam-queue.workspace = true
 tracing.workspace = true
