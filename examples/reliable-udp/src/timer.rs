@@ -1,4 +1,4 @@
-use veloq_std::time::Duration;
+use veloq::std::time::Duration;
 
 use crate::packet::MessageSequence;
 

@@ -1,4 +1,4 @@
-use veloq_std::{fmt, num::NonZeroUsize, time::Duration};
+use veloq::std::{error::Error as StdError, fmt, num::NonZeroUsize, time::Duration};
 
 use veloq_wheel::WheelConfig;
 
@@ -53,7 +53,7 @@ impl fmt::Display for ConfigError {
     }
 }
 
-impl veloq_std::error::Error for ConfigError {}
+impl StdError for ConfigError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {

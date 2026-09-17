@@ -2,16 +2,16 @@ use std::sync::{Arc, Once};
 
 use tracing::trace;
 use veloq::{
+    buf::{UniformSlot, heap::ThreadMemoryMultiplier},
     net::UdpSocket,
     nz,
     runtime::{Runtime, context::Ctx, scope},
+    std::{
+        num::NonZeroUsize,
+        ops::AsyncFnOnce,
+        time::{Duration, Instant},
+    },
     time::timeout_at,
-};
-use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier};
-use veloq_std::{
-    num::NonZeroUsize,
-    ops::AsyncFnOnce,
-    time::{Duration, Instant},
 };
 
 use veloq_reliable_udp::{Ack, Config, ConnectionId, Endpoint, Error, Flags, Packet};

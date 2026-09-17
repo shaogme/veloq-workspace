@@ -24,11 +24,11 @@ pub use session::{
     SessionStatsSnapshot,
 };
 pub use timer::{TimerCommand, TimerKind};
-pub use veloq_buf::FixedBuf;
+pub use veloq::buf::FixedBuf;
 
 #[cfg(test)]
 mod tests {
-    use veloq_std::{collections::VecDeque, time::Duration, vec::Vec};
+    use veloq::std::{collections::VecDeque, num::NonZeroUsize, time::Duration, vec::Vec};
 
     use super::*;
 
@@ -440,7 +440,7 @@ mod tests {
     #[test]
     fn configuration_rejects_unsafe_windows_and_datagrams() {
         let oversized_window = Config::builder()
-            .send_window(veloq_std::num::NonZeroUsize::new(65).expect("non-zero"))
+            .send_window(NonZeroUsize::new(65).expect("non-zero"))
             .build()
             .expect_err("send window limit");
         assert!(matches!(
@@ -449,7 +449,7 @@ mod tests {
         ));
 
         let too_small = Config::builder()
-            .max_datagram_size(veloq_std::num::NonZeroUsize::new(HEADER_LEN).expect("non-zero"))
+            .max_datagram_size(NonZeroUsize::new(HEADER_LEN).expect("non-zero"))
             .build()
             .expect_err("header-only datagram");
         assert!(matches!(too_small, ConfigError::DatagramTooSmall { .. }));

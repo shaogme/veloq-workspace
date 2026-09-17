@@ -1,8 +1,8 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use veloq::std::time::Duration;
 use veloq_reliable_udp::{Ack, Config, ConnectionId, Flags, Session, SessionEvent};
-use veloq_std::time::Duration;
 
 fn outbound(events: Vec<SessionEvent>) -> Vec<Vec<u8>> {
     events

@@ -23,7 +23,7 @@ use veloq_runtime::{
     utils::StaticTransfer,
 };
 
-pub use veloq_runtime::{IntoOutcome, Outcome, scope, scope_local};
+pub use veloq_runtime::{IntoOutcome, Outcome, scope, scope_local, select, task};
 
 use crate::{
     config::{BlockingPoolConfig, Config},

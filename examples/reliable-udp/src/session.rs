@@ -1,5 +1,5 @@
 use tracing::{debug, trace};
-use veloq_std::{
+use veloq::std::{
     collections::{HashMap, VecDeque},
     time::Duration,
     vec::Vec,

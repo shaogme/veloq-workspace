@@ -1,10 +1,10 @@
-use veloq_std::{error::Error as CoreError, fmt};
+use veloq::std::{error::Error as StdError, fmt, result::Result as StdResult};
 
 use veloq_wheel::TimerError;
 
 use crate::{config::ConfigError, packet::PacketError};
 
-pub type Result<T> = veloq_std::result::Result<T, Error>;
+pub type Result<T> = StdResult<T, Error>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
@@ -51,7 +51,7 @@ impl fmt::Display for Error {
     }
 }
 
-impl CoreError for Error {}
+impl StdError for Error {}
 
 impl From<ConfigError> for Error {
     fn from(error: ConfigError) -> Self {

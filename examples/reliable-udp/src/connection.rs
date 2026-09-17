@@ -1,6 +1,8 @@
-use veloq_buf::FixedBuf;
-use veloq_std::{marker::PhantomData, net::SocketAddr};
-use veloq_sync::{mpmc::BoundedOwnedSender, oneshot};
+use veloq::{
+    buf::FixedBuf,
+    std::{marker::PhantomData, net::SocketAddr, vec::Vec},
+    sync::{mpmc::BoundedOwnedSender, oneshot},
+};
 
 use crate::{
     endpoint::{Command, ConnectionKey},
@@ -35,7 +37,7 @@ impl Message {
 }
 
 pub(crate) enum SendPayload {
-    Bytes(veloq_std::vec::Vec<u8>),
+    Bytes(Vec<u8>),
     Buffer(FixedBuf),
 }
 

@@ -1,27 +1,27 @@
 use tracing::{debug, trace, warn};
 use veloq::{
+    buf::FixedBuf,
     net::{PreparedUdpRecv, UdpSocket},
-    runtime::context::Ctx,
-    time::sleep,
-};
-use veloq_buf::FixedBuf;
-use veloq_runtime::{Outcome, scope, select};
-use veloq_std::{
-    collections::{HashMap, VecDeque},
-    marker::PhantomData,
-    net::{SocketAddr, ToSocketAddrs},
-    num::NonZeroUsize,
-    sync::{
-        Arc,
-        atomic::{NativeAtomicU64, Ordering},
+    runtime::{Outcome, context::Ctx, scope, select},
+    std::{
+        collections::{HashMap, VecDeque},
+        marker::PhantomData,
+        net::{SocketAddr, ToSocketAddrs},
+        num::NonZeroUsize,
+        result::Result as StdResult,
+        sync::{
+            Arc,
+            atomic::{NativeAtomicU64, Ordering},
+        },
+        time::{Duration, Instant},
+        vec::Vec,
     },
-    time::{Duration, Instant},
-    vec::Vec,
-};
-use veloq_sync::{
-    TrySendError,
-    mpmc::{BoundedOwnedReceiver, BoundedOwnedSender},
-    oneshot,
+    sync::{
+        TryRecvError, TrySendError,
+        mpmc::{BoundedOwnedReceiver, BoundedOwnedSender, owned_bounded},
+        oneshot,
+    },
+    time::sleep,
 };
 use veloq_wheel::{Expired, TimerId, Wheel};
 
@@ -393,8 +393,8 @@ impl<'rt> Endpoint<'rt> {
         config.validate()?;
         let socket = UdpSocket::bind(ctx, addr).map_err(|_| Error::Io)?;
         let local_addr = socket.local_addr().map_err(|_| Error::Io)?;
-        let (command, command_rx) = veloq_sync::mpmc::owned_bounded(config.command_capacity.get());
-        let (accept_tx, accept_rx) = veloq_sync::mpmc::owned_bounded(config.accept_capacity.get());
+        let (command, command_rx) = owned_bounded(config.command_capacity.get());
+        let (accept_tx, accept_rx) = owned_bounded(config.accept_capacity.get());
         let (ready, ready_receiver) = oneshot::owned_channel();
         let wheel = Wheel::new(config.wheel.clone());
         let stats = Arc::new(EndpointStats::new());
@@ -530,9 +530,9 @@ struct EventBatch {
 }
 
 enum DriverEvent {
-    Command(core::result::Result<Command, veloq_sync::TryRecvError>),
-    Packet(core::result::Result<InboundDatagram, veloq_sync::TryRecvError>),
-    Pump(core::result::Result<PumpEvent, veloq_sync::TryRecvError>),
+    Command(StdResult<Command, TryRecvError>),
+    Packet(StdResult<InboundDatagram, TryRecvError>),
+    Pump(StdResult<PumpEvent, TryRecvError>),
     Timer,
 }
 
@@ -550,16 +550,14 @@ impl<'rt> EndpointDriver<'rt> {
             "endpoint driver started"
         );
         let config = self.config.clone();
-        let (inbound_tx, inbound_rx) =
-            veloq_sync::mpmc::owned_bounded(config.inbound_capacity.get());
-        let (outbound_tx, outbound_rx) =
-            veloq_sync::mpmc::owned_bounded(config.outbound_capacity.get());
+        let (inbound_tx, inbound_rx) = owned_bounded(config.inbound_capacity.get());
+        let (outbound_tx, outbound_rx) = owned_bounded(config.outbound_capacity.get());
         let event_capacity = config
             .outbound_capacity
             .get()
             .checked_add(config.max_connections.get())
             .ok_or(Error::Io)?;
-        let (pump_tx, pump_rx) = veloq_sync::mpmc::owned_bounded(event_capacity);
+        let (pump_tx, pump_rx) = owned_bounded(event_capacity);
         let ctx = self.ctx;
         let receive_socket = socket.clone();
         let send_socket = socket.clone();
@@ -1895,7 +1893,7 @@ fn remove_session_gauges(stats: &EndpointStats, snapshot: SessionStatsSnapshot) 
 
 #[cfg(test)]
 mod tests {
-    use veloq_std::{
+    use veloq::std::{
         net::{Ipv4Addr, SocketAddr, SocketAddrV4},
         time::Duration,
         vec::Vec,

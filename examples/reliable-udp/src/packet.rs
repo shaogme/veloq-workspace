@@ -1,4 +1,5 @@
-use veloq_std::{
+use veloq::std::{
+    error::Error as StdError,
     fmt,
     num::NonZeroU64,
     ops::{BitOr, BitOrAssign},
@@ -56,7 +57,7 @@ impl fmt::Display for PacketError {
     }
 }
 
-impl veloq_std::error::Error for PacketError {}
+impl StdError for PacketError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]

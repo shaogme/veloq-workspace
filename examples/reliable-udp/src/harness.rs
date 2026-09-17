@@ -1,4 +1,4 @@
-use veloq_std::{collections::VecDeque, time::Duration, vec::Vec};
+use veloq::std::{collections::VecDeque, time::Duration, vec::Vec};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DatagramAction {

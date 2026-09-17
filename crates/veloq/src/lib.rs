@@ -10,6 +10,7 @@ pub mod time;
 pub use error::{Error, Result};
 pub use veloq_buf as buf;
 pub use veloq_local as local;
+pub use veloq_std as std;
 pub use veloq_sync as sync;
 
 pub use veloq_std::nz;

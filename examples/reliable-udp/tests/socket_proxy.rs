@@ -11,20 +11,27 @@ use std::{
 use tracing::{debug, trace, warn};
 use veloq::{
     net::{PreparedUdpRecv, UdpSocket},
-    runtime::context::Ctx,
+    runtime::{
+        Outcome,
+        context::Ctx,
+        scope,
+        scope::{JoinHandle, ScopeProvider},
+        select,
+        task::TaskHandleRef,
+    },
+    std::{
+        net::SocketAddr,
+        num::NonZeroUsize,
+        result::Result as StdResult,
+        time::{Duration, Instant},
+        vec::Vec,
+    },
+    sync::{
+        TryRecvError, TrySendError,
+        mpmc::{BoundedOwnedReceiver, BoundedOwnedSender, owned_bounded},
+        oneshot,
+    },
     time::sleep,
-};
-use veloq_runtime::{Outcome, scope, select};
-use veloq_std::{
-    net::SocketAddr,
-    num::NonZeroUsize,
-    time::{Duration, Instant},
-    vec::Vec,
-};
-use veloq_sync::{
-    TryRecvError, TrySendError,
-    mpmc::{BoundedOwnedReceiver, BoundedOwnedSender},
-    oneshot,
 };
 
 use veloq_reliable_udp::{Flags, MessageSequence, Packet};
@@ -251,7 +258,7 @@ impl<'rt> SocketProxy<'rt> {
     pub fn bind(ctx: Ctx<'rt>, max_datagram_size: NonZeroUsize) -> Result<Self, ProxyError> {
         let client_side = UdpSocket::bind(ctx, "127.0.0.1:0").map_err(|_| ProxyError::Io)?;
         let server_side = UdpSocket::bind(ctx, "127.0.0.1:0").map_err(|_| ProxyError::Io)?;
-        let (action_observed, action_receiver) = veloq_sync::mpmc::owned_bounded(1);
+        let (action_observed, action_receiver) = owned_bounded(1);
         Ok(Self {
             ctx,
             max_datagram_size,
@@ -344,20 +351,13 @@ impl ProxyDriver<'_> {
         } = self;
 
         let result = {
-            let (driver_events, mut driver_event_receiver) =
-                veloq_sync::mpmc::owned_bounded(EVENT_CAPACITY);
-            let (client_inbound, client_inbound_receiver) =
-                veloq_sync::mpmc::owned_bounded(CHANNEL_CAPACITY);
-            let (client_outbound, client_outbound_receiver) =
-                veloq_sync::mpmc::owned_bounded(CHANNEL_CAPACITY);
-            let (client_completions, client_completion_receiver) =
-                veloq_sync::mpmc::owned_bounded(CHANNEL_CAPACITY);
-            let (server_inbound, server_inbound_receiver) =
-                veloq_sync::mpmc::owned_bounded(CHANNEL_CAPACITY);
-            let (server_outbound, server_outbound_receiver) =
-                veloq_sync::mpmc::owned_bounded(CHANNEL_CAPACITY);
-            let (server_completions, server_completion_receiver) =
-                veloq_sync::mpmc::owned_bounded(CHANNEL_CAPACITY);
+            let (driver_events, mut driver_event_receiver) = owned_bounded(EVENT_CAPACITY);
+            let (client_inbound, client_inbound_receiver) = owned_bounded(CHANNEL_CAPACITY);
+            let (client_outbound, client_outbound_receiver) = owned_bounded(CHANNEL_CAPACITY);
+            let (client_completions, client_completion_receiver) = owned_bounded(CHANNEL_CAPACITY);
+            let (server_inbound, server_inbound_receiver) = owned_bounded(CHANNEL_CAPACITY);
+            let (server_outbound, server_outbound_receiver) = owned_bounded(CHANNEL_CAPACITY);
+            let (server_completions, server_completion_receiver) = owned_bounded(CHANNEL_CAPACITY);
 
             let scoped = scope!(ctx, async |scope| {
                 let mut client_receive = scope.spawn_boxed(receive_pump(
@@ -546,10 +546,10 @@ trait ProxyCancel {
     fn cancel_task(&mut self);
 }
 
-impl<'scope_ref, T, R, S> ProxyCancel for veloq_runtime::scope::JoinHandle<'scope_ref, T, R, S>
+impl<'scope_ref, T, R, S> ProxyCancel for JoinHandle<'scope_ref, T, R, S>
 where
-    R: veloq_runtime::task::TaskHandleRef,
-    S: veloq_runtime::scope::ScopeProvider + 'scope_ref,
+    R: TaskHandleRef,
+    S: ScopeProvider + 'scope_ref,
     S::Arena: 'scope_ref,
 {
     fn cancel_task(&mut self) {
@@ -608,7 +608,7 @@ async fn wait_for_startup(
 }
 
 enum StartupWait {
-    Event(core::result::Result<DriverEvent, TryRecvError>),
+    Event(StdResult<DriverEvent, TryRecvError>),
     Shutdown,
 }
 
