@@ -1,4 +1,9 @@
-use veloq::std::{error::Error as StdError, fmt, num::NonZeroUsize, time::Duration};
+use veloq::std::{
+    error::Error as StdError,
+    fmt,
+    num::{NonZeroU32, NonZeroUsize},
+    time::Duration,
+};
 
 use veloq_wheel::WheelConfig;
 
@@ -6,6 +11,7 @@ use crate::packet::HEADER_LEN;
 
 const MAX_SAFE_DATAGRAM_SIZE: usize = 65_507;
 const MAX_SEND_WINDOW: usize = 64;
+const MAX_RECEIVE_WINDOW: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigError {
@@ -13,6 +19,12 @@ pub enum ConfigError {
     DatagramTooLarge { size: usize, max: usize },
     SendWindowTooLarge { size: usize, max: usize },
     ReceiveWindowTooLarge { size: usize, max: usize },
+    MessageSizeTooLarge { size: usize, max: usize },
+    MessageSizeWireOverflow,
+    FragmentCountTooLarge { size: u32, max: u32 },
+    ReassemblyBudgetTooSmall { budget: usize, message: usize },
+    InboundBudgetTooSmall { budget: usize, message: usize },
+    ZeroBudget { name: &'static str },
     TimeoutOrder,
     TimeoutTooShort { name: &'static str },
     TimeoutRangeOverflow { name: &'static str },
@@ -38,6 +50,28 @@ impl fmt::Display for ConfigError {
             Self::ReceiveWindowTooLarge { size, max } => {
                 write!(f, "receive window {size} exceeds wire limit {max}")
             }
+            Self::MessageSizeTooLarge { size, max } => {
+                write!(f, "message size {size} exceeds wire limit {max}")
+            }
+            Self::MessageSizeWireOverflow => {
+                f.write_str("message size cannot be represented by the wire format")
+            }
+            Self::FragmentCountTooLarge { size, max } => {
+                write!(f, "fragment count {size} exceeds protocol limit {max}")
+            }
+            Self::ReassemblyBudgetTooSmall { budget, message } => {
+                write!(
+                    f,
+                    "reassembly budget {budget} is smaller than message size {message}"
+                )
+            }
+            Self::InboundBudgetTooSmall { budget, message } => {
+                write!(
+                    f,
+                    "inbound budget {budget} is smaller than message size {message}"
+                )
+            }
+            Self::ZeroBudget { name } => write!(f, "{name} must be non-zero"),
             Self::TimeoutOrder => f.write_str("RTO values must satisfy min <= initial <= max"),
             Self::TimeoutTooShort { name } => {
                 write!(f, "{name} must be longer than the wheel base tick")
@@ -58,6 +92,11 @@ impl StdError for ConfigError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub max_datagram_size: NonZeroUsize,
+    pub max_message_size: NonZeroUsize,
+    pub max_fragments_per_message: NonZeroU32,
+    pub max_reassembly_messages: NonZeroUsize,
+    pub max_reassembly_bytes: NonZeroUsize,
+    pub max_inbound_bytes: NonZeroUsize,
     pub send_window: NonZeroUsize,
     pub receive_window: NonZeroUsize,
     pub command_capacity: NonZeroUsize,
@@ -70,6 +109,9 @@ pub struct Config {
     pub max_retries: u8,
     pub ack_delay: Duration,
     pub ack_batch_size: NonZeroUsize,
+    pub reassembly_timeout: Duration,
+    pub message_ack_timeout: Duration,
+    pub message_ack_max_retries: u8,
     pub handshake_initial_rto: Duration,
     pub handshake_max_rto: Duration,
     pub handshake_deadline: Duration,
@@ -93,7 +135,7 @@ impl Config {
         ConfigBuilder::default()
     }
 
-    pub fn max_payload(&self) -> usize {
+    pub fn max_fragment_payload(&self) -> usize {
         self.max_datagram_size.get() - HEADER_LEN
     }
 
@@ -113,6 +155,11 @@ impl Default for ConfigBuilder {
         Self {
             config: Config {
                 max_datagram_size: non_zero(1_200),
+                max_message_size: non_zero(4 * 1024 * 1024),
+                max_fragments_per_message: non_zero_u32(4_096),
+                max_reassembly_messages: non_zero(64),
+                max_reassembly_bytes: non_zero(4 * 1024 * 1024),
+                max_inbound_bytes: non_zero(8 * 1024 * 1024),
                 send_window: non_zero(32),
                 receive_window: non_zero(32),
                 command_capacity: non_zero(64),
@@ -125,6 +172,9 @@ impl Default for ConfigBuilder {
                 max_retries: 8,
                 ack_delay: Duration::from_millis(5),
                 ack_batch_size: non_zero(2),
+                reassembly_timeout: Duration::from_secs(5),
+                message_ack_timeout: Duration::from_secs(1),
+                message_ack_max_retries: 5,
                 handshake_initial_rto: Duration::from_millis(50),
                 handshake_max_rto: Duration::from_millis(250),
                 handshake_deadline: Duration::from_secs(1),
@@ -141,6 +191,31 @@ impl Default for ConfigBuilder {
 impl ConfigBuilder {
     pub fn max_datagram_size(mut self, value: NonZeroUsize) -> Self {
         self.config.max_datagram_size = value;
+        self
+    }
+
+    pub fn max_message_size(mut self, value: NonZeroUsize) -> Self {
+        self.config.max_message_size = value;
+        self
+    }
+
+    pub fn max_fragments_per_message(mut self, value: NonZeroU32) -> Self {
+        self.config.max_fragments_per_message = value;
+        self
+    }
+
+    pub fn max_reassembly_messages(mut self, value: NonZeroUsize) -> Self {
+        self.config.max_reassembly_messages = value;
+        self
+    }
+
+    pub fn max_reassembly_bytes(mut self, value: NonZeroUsize) -> Self {
+        self.config.max_reassembly_bytes = value;
+        self
+    }
+
+    pub fn max_inbound_bytes(mut self, value: NonZeroUsize) -> Self {
+        self.config.max_inbound_bytes = value;
         self
     }
 
@@ -201,6 +276,21 @@ impl ConfigBuilder {
 
     pub fn ack_batch_size(mut self, value: NonZeroUsize) -> Self {
         self.config.ack_batch_size = value;
+        self
+    }
+
+    pub fn reassembly_timeout(mut self, value: Duration) -> Self {
+        self.config.reassembly_timeout = value;
+        self
+    }
+
+    pub fn message_ack_timeout(mut self, value: Duration) -> Self {
+        self.config.message_ack_timeout = value;
+        self
+    }
+
+    pub fn message_ack_max_retries(mut self, value: u8) -> Self {
+        self.config.message_ack_max_retries = value;
         self
     }
 
@@ -273,13 +363,51 @@ fn validate_values(config: &Config) -> Result<(), ConfigError> {
         });
     }
     let receive_window = config.receive_window.get();
-    if receive_window > usize::from(u16::MAX) {
+    if receive_window > MAX_RECEIVE_WINDOW {
         return Err(ConfigError::ReceiveWindowTooLarge {
             size: receive_window,
-            max: usize::from(u16::MAX),
+            max: MAX_RECEIVE_WINDOW,
         });
     }
 
+    let max_fragment_payload =
+        datagram_size
+            .checked_sub(HEADER_LEN)
+            .ok_or(ConfigError::DatagramTooSmall {
+                size: datagram_size,
+                header_len: HEADER_LEN,
+            })?;
+    let max_message_size = config.max_message_size.get();
+    if u64::try_from(max_message_size).is_err() {
+        return Err(ConfigError::MessageSizeWireOverflow);
+    }
+    if max_message_size > u32::MAX as usize {
+        return Err(ConfigError::MessageSizeTooLarge {
+            size: max_message_size,
+            max: u32::MAX as usize,
+        });
+    }
+    let max_wire_message_size = max_fragment_payload
+        .checked_mul(config.max_fragments_per_message.get() as usize)
+        .ok_or(ConfigError::MemoryBudgetOverflow)?;
+    if max_message_size > max_wire_message_size {
+        return Err(ConfigError::MessageSizeTooLarge {
+            size: max_message_size,
+            max: max_wire_message_size,
+        });
+    }
+    if config.max_reassembly_bytes.get() < max_message_size {
+        return Err(ConfigError::ReassemblyBudgetTooSmall {
+            budget: config.max_reassembly_bytes.get(),
+            message: max_message_size,
+        });
+    }
+    if config.max_inbound_bytes.get() < max_message_size {
+        return Err(ConfigError::InboundBudgetTooSmall {
+            budget: config.max_inbound_bytes.get(),
+            message: max_message_size,
+        });
+    }
     if !(config.min_rto <= config.initial_rto && config.initial_rto <= config.max_rto) {
         return Err(ConfigError::TimeoutOrder);
     }
@@ -293,6 +421,8 @@ fn validate_values(config: &Config) -> Result<(), ConfigError> {
         ("handshake_max_rto", config.handshake_max_rto),
         ("handshake_deadline", config.handshake_deadline),
         ("close_timeout", config.close_timeout),
+        ("reassembly_timeout", config.reassembly_timeout),
+        ("message_ack_timeout", config.message_ack_timeout),
     ] {
         if timeout <= tick {
             return Err(ConfigError::TimeoutTooShort { name });
@@ -341,8 +471,18 @@ fn validate_values(config: &Config) -> Result<(), ConfigError> {
         .and_then(|value| value.checked_add(config.inbound_capacity.get()))
         .and_then(|value| value.checked_add(config.outbound_capacity.get()))
         .ok_or(ConfigError::MemoryBudgetOverflow)?;
-    let per_connection = datagram_size
+    let frame_budget = datagram_size
         .checked_mul(queued)
+        .ok_or(ConfigError::MemoryBudgetOverflow)?;
+    let message_budget = config
+        .pending_send_capacity
+        .get()
+        .checked_mul(max_message_size)
+        .and_then(|value| value.checked_add(config.max_reassembly_bytes.get()))
+        .and_then(|value| value.checked_add(config.max_inbound_bytes.get()))
+        .ok_or(ConfigError::MemoryBudgetOverflow)?;
+    let per_connection = frame_budget
+        .checked_add(message_budget)
         .ok_or(ConfigError::MemoryBudgetOverflow)?;
     per_connection
         .checked_mul(config.max_connections.get())
@@ -352,4 +492,8 @@ fn validate_values(config: &Config) -> Result<(), ConfigError> {
 
 fn non_zero(value: usize) -> NonZeroUsize {
     NonZeroUsize::new(value).expect("configuration defaults must be non-zero")
+}
+
+fn non_zero_u32(value: u32) -> NonZeroU32 {
+    NonZeroU32::new(value).expect("configuration defaults must be non-zero")
 }

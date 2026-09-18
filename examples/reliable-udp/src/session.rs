@@ -12,7 +12,7 @@ use veloq::{
 use crate::{
     config::Config,
     error::{Error, Result},
-    packet::{ConnectionId, Flags, MessageSequence, PacketBufAllocator, PacketRef},
+    packet::{ConnectionId, Flags, FrameSequence, MessageId, PacketBufAllocator, PacketRef},
     timer::{TimerCommand, TimerKind},
 };
 
@@ -20,7 +20,7 @@ use self::{
     inbound::InboundState,
     lifecycle::{LifecycleAction, LifecycleState},
     metrics::SessionMetrics,
-    outbound::{FlushContext, OutboundAction, OutboundState},
+    outbound::{FlushContext, MessageAckContext, OutboundAction, OutboundState},
     timers::TimerState,
 };
 
@@ -45,7 +45,7 @@ pub enum SessionState {
 
 #[derive(Debug)]
 pub struct Message {
-    pub sequence: MessageSequence,
+    pub message_id: MessageId,
     pub payload: FixedBuf,
 }
 
@@ -71,9 +71,10 @@ impl SendToken {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SendReceipt {
     pub token: SendToken,
-    pub sequence: MessageSequence,
+    pub message_id: MessageId,
+    pub fragment_count: u32,
     pub rtt: Option<Duration>,
-    pub retransmissions: u8,
+    pub retransmissions: u64,
 }
 
 /// 累计协议计数器与当前发送状态的快照。
@@ -102,13 +103,19 @@ pub struct SessionStatsSnapshot {
     pub receive_window: usize,
     pub ack_delayed: u64,
     pub piggybacked_acks: u64,
+    pub reassembly_messages: usize,
+    pub reassembly_bytes: usize,
+    pub completed_messages: u64,
+    pub duplicate_fragments: u64,
+    pub message_ack_retries: u64,
+    pub reassembly_timeouts: u64,
 }
 
 #[derive(Debug)]
 pub enum SessionEvent {
     Outbound {
         datagram: FixedBuf,
-        retain_for_retransmit: Option<MessageSequence>,
+        frame_sequence: Option<FrameSequence>,
     },
     ArmTimer(TimerCommand),
     CancelTimer(TimerCommand),
@@ -116,7 +123,7 @@ pub enum SessionEvent {
     SendAcked(SendReceipt),
     SendFailed {
         token: SendToken,
-        sequence: Option<MessageSequence>,
+        message_id: Option<MessageId>,
         error: Error,
     },
     StateChanged(SessionState),
@@ -128,11 +135,11 @@ impl PartialEq for SessionEvent {
         match (self, other) {
             (
                 Self::Outbound {
-                    retain_for_retransmit: left,
+                    frame_sequence: left,
                     ..
                 },
                 Self::Outbound {
-                    retain_for_retransmit: right,
+                    frame_sequence: right,
                     ..
                 },
             ) => left == right,
@@ -143,17 +150,17 @@ impl PartialEq for SessionEvent {
             (
                 Self::SendFailed {
                     token: left_token,
-                    sequence: left_sequence,
+                    message_id: left_message_id,
                     error: left_error,
                 },
                 Self::SendFailed {
                     token: right_token,
-                    sequence: right_sequence,
+                    message_id: right_message_id,
                     error: right_error,
                 },
             ) => {
                 left_token == right_token
-                    && left_sequence == right_sequence
+                    && left_message_id == right_message_id
                     && left_error == right_error
             }
             (Self::StateChanged(left), Self::StateChanged(right)) => left == right,
@@ -257,6 +264,8 @@ impl Session {
             &self.config,
             self.outbound.view(&self.config),
             self.available_receive_window(),
+            self.inbound.reassembly_messages(),
+            self.inbound.reassembly_bytes(),
         )
     }
 
@@ -282,7 +291,12 @@ impl Session {
         allocator: &A,
     ) -> Result<Vec<SessionEvent>> {
         self.sync_now(now);
-        let packet = PacketRef::decode(datagram.as_slice())?;
+        let packet = PacketRef::decode_with_constraints(
+            datagram.as_slice(),
+            self.config.max_fragment_payload(),
+            self.config.max_message_size.get() as u64,
+            self.config.max_fragments_per_message.get(),
+        )?;
         let meta = packet.meta();
         self.ensure_receivable(meta.connection_id)?;
         self.metrics.record_received(
@@ -295,6 +309,14 @@ impl Session {
             .outbound
             .apply_ack(&meta, self.now, &self.config, &mut self.metrics)?;
         self.apply_outbound(outbound);
+
+        if meta.flags.contains(Flags::MESSAGE_ACK) {
+            let message_id = MessageId::new(meta.message_id).ok_or(Error::InvalidFragment)?;
+            let output = self
+                .outbound
+                .apply_message_ack(message_id, self.now, &self.config);
+            self.apply_outbound(output);
+        }
 
         if meta.flags.contains(Flags::RST) {
             let actions = self
@@ -339,11 +361,26 @@ impl Session {
                 meta,
                 &self.config,
                 self.connection_id(),
+                allocator,
                 &mut self.metrics,
             )?;
             for _ in 0..output.delivered() {
                 self.events.push_back(SessionEvent::MessageAvailable);
             }
+            for message_id in output.arm_reassembly() {
+                self.arm_timer(
+                    TimerKind::ReassemblyTimeout {
+                        message_id: *message_id,
+                    },
+                    self.config.reassembly_timeout,
+                );
+            }
+            for message_id in output.cancel_reassembly() {
+                self.cancel_timer(TimerKind::ReassemblyTimeout {
+                    message_id: *message_id,
+                });
+            }
+            self.emit_message_acks(output.message_acks(), allocator)?;
             self.apply_inbound_ack(output.ack(), allocator)?;
         }
 
@@ -359,11 +396,7 @@ impl Session {
     ) -> Result<SendToken> {
         self.sync_now(now);
         self.ensure_open_for_send()?;
-        let token = self.outbound.queue_send(
-            payload,
-            self.config.max_payload(),
-            self.config.pending_send_capacity.get(),
-        )?;
+        let token = self.outbound.queue_send(payload, &self.config)?;
         let _ = self.flush_pending(allocator)?;
         Ok(token)
     }
@@ -374,7 +407,12 @@ impl Session {
         allocator: &A,
     ) -> Option<Message> {
         self.sync_now(now);
-        let message = self.inbound.pop_message();
+        let (message, message_acks, cancel_reassembly) =
+            self.inbound.pop_message(&self.config, &mut self.metrics);
+        for message_id in cancel_reassembly {
+            self.cancel_timer(TimerKind::ReassemblyTimeout { message_id });
+        }
+        let _ = self.emit_message_acks(&message_acks, allocator);
         if message.is_some() {
             let _ = self.emit_ack(allocator);
         }
@@ -433,6 +471,33 @@ impl Session {
                     self.apply_lifecycle(actions, allocator)?;
                 }
             }
+            TimerKind::MessageAckRetry { message_id } => {
+                let output = self.outbound.on_message_ack_retry(
+                    message_id,
+                    &self.config,
+                    allocator,
+                    &mut self.metrics,
+                );
+                let terminal = output.terminal_error();
+                self.apply_outbound(output);
+                if let Some(error) = terminal {
+                    let actions = self
+                        .lifecycle
+                        .request_terminate(error, SessionState::Failed);
+                    self.apply_lifecycle(actions, allocator)?;
+                }
+            }
+            TimerKind::ReassemblyTimeout { message_id } => {
+                if self
+                    .inbound
+                    .on_reassembly_timeout(message_id, &mut self.metrics)
+                {
+                    let actions = self
+                        .lifecycle
+                        .request_terminate(Error::ReassemblyTimeout, SessionState::Failed);
+                    self.apply_lifecycle(actions, allocator)?;
+                }
+            }
             TimerKind::HandshakeRetry => {
                 let actions = self
                     .lifecycle
@@ -455,13 +520,17 @@ impl Session {
     pub fn on_send_completed(
         &mut self,
         now: Duration,
-        sequence: MessageSequence,
+        sequence: FrameSequence,
         datagram: FixedBuf,
     ) -> Result<Vec<SessionEvent>> {
         self.sync_now(now);
-        let output = self
-            .outbound
-            .on_send_completed(sequence, self.now, datagram);
+        let output = self.outbound.on_send_completed(
+            sequence,
+            self.now,
+            datagram,
+            &self.config,
+            &mut self.metrics,
+        );
         self.apply_outbound(output);
         Ok(self.take_events())
     }
@@ -500,6 +569,28 @@ impl Session {
         )?;
         self.apply_outbound(output);
         self.inbound.mark_ack_sent();
+        Ok(())
+    }
+
+    fn emit_message_acks<A: PacketBufAllocator + ?Sized>(
+        &mut self,
+        message_ids: &[MessageId],
+        allocator: &A,
+    ) -> Result<()> {
+        for message_id in message_ids {
+            let output = self.outbound.emit_message_ack(MessageAckContext {
+                connection_id: self.connection_id(),
+                config: &self.config,
+                allocator,
+                message_id: *message_id,
+                ack: self.inbound.ack_snapshot(),
+                receive_window: self.inbound.available_window(&self.config),
+                metrics: &mut self.metrics,
+            })?;
+            self.apply_outbound(output);
+            self.inbound.mark_ack_sent();
+            self.cancel_timer(TimerKind::AckDelay);
+        }
         Ok(())
     }
 
@@ -547,6 +638,14 @@ impl Session {
                     state,
                     generation,
                 } => {
+                    for message_id in self.inbound.clear() {
+                        if let Some(command) = self
+                            .timers
+                            .cancel(TimerKind::ReassemblyTimeout { message_id }, generation)
+                        {
+                            self.events.push_back(SessionEvent::CancelTimer(command));
+                        }
+                    }
                     for command in self.timers.cancel_all(generation).into_iter().flatten() {
                         self.events.push_back(SessionEvent::CancelTimer(command));
                     }
@@ -566,7 +665,7 @@ impl Session {
                 OutboundAction::Datagram { datagram, sequence } => {
                     self.events.push_back(SessionEvent::Outbound {
                         datagram,
-                        retain_for_retransmit: sequence,
+                        frame_sequence: sequence,
                     });
                 }
                 OutboundAction::ArmTimer { kind, delay } => self.arm_timer(kind, delay),
@@ -576,11 +675,11 @@ impl Session {
                 }
                 OutboundAction::SendFailed {
                     token,
-                    sequence,
+                    message_id,
                     error,
                 } => self.events.push_back(SessionEvent::SendFailed {
                     token,
-                    sequence,
+                    message_id,
                     error,
                 }),
             }

@@ -222,7 +222,7 @@ mod tests {
 
     use crate::{
         Config,
-        packet::{ConnectionId, MessageSequence},
+        packet::{ConnectionId, FrameSequence},
         timer::TimerKind,
     };
 
@@ -242,7 +242,7 @@ mod tests {
         let mut registry = EndpointTimerRegistry::new();
         let connection = key(10_001, 1);
         let kind = TimerKind::Retransmit {
-            sequence: MessageSequence::new(1).expect("sequence"),
+            sequence: FrameSequence::new(1).expect("sequence"),
         };
         registry
             .arm(

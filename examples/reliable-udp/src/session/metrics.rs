@@ -22,6 +22,10 @@ pub(super) struct SessionMetrics {
     max_rtt: Option<Duration>,
     ack_delayed: u64,
     piggybacked_acks: u64,
+    completed_messages: u64,
+    duplicate_fragments: u64,
+    message_ack_retries: u64,
+    reassembly_timeouts: u64,
     rtt: RttEstimator,
 }
 
@@ -153,11 +157,6 @@ impl SessionMetrics {
         self.receive_window_drops = self.receive_window_drops.saturating_add(1);
     }
 
-    pub(super) fn record_out_of_window_drop(&mut self) {
-        self.record_drop();
-        self.out_of_window_drops = self.out_of_window_drops.saturating_add(1);
-    }
-
     pub(super) fn record_duplicate_ack(&mut self) {
         self.duplicate_acks = self.duplicate_acks.saturating_add(1);
     }
@@ -168,6 +167,26 @@ impl SessionMetrics {
 
     pub(super) fn record_piggybacked_ack(&mut self) {
         self.piggybacked_acks = self.piggybacked_acks.saturating_add(1);
+    }
+
+    pub(super) fn record_duplicate_fragment(&mut self) {
+        self.duplicate_fragments = self.duplicate_fragments.saturating_add(1);
+    }
+
+    pub(super) fn record_reassembly_limit(&mut self) {
+        self.dropped_packets = self.dropped_packets.saturating_add(1);
+    }
+
+    pub(super) fn record_message_ack_retry(&mut self) {
+        self.message_ack_retries = self.message_ack_retries.saturating_add(1);
+    }
+
+    pub(super) fn record_reassembly_timeout(&mut self) {
+        self.reassembly_timeouts = self.reassembly_timeouts.saturating_add(1);
+    }
+
+    pub(super) fn record_completed_message(&mut self) {
+        self.completed_messages = self.completed_messages.saturating_add(1);
     }
 
     pub(super) fn record_rtt(&mut self, sample: Duration, config: &Config) {
@@ -183,6 +202,8 @@ impl SessionMetrics {
         _config: &Config,
         outbound: OutboundView,
         receive_window: usize,
+        reassembly_messages: usize,
+        reassembly_bytes: usize,
     ) -> SessionStatsSnapshot {
         SessionStatsSnapshot {
             packets_sent: self.packets_sent,
@@ -208,6 +229,12 @@ impl SessionMetrics {
             receive_window,
             ack_delayed: self.ack_delayed,
             piggybacked_acks: self.piggybacked_acks,
+            reassembly_messages,
+            reassembly_bytes,
+            completed_messages: self.completed_messages,
+            duplicate_fragments: self.duplicate_fragments,
+            message_ack_retries: self.message_ack_retries,
+            reassembly_timeouts: self.reassembly_timeouts,
         }
     }
 }

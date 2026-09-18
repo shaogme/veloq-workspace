@@ -8,7 +8,7 @@ use veloq::{
 use crate::{
     connection::Connection,
     error::{Error, Result},
-    packet::MessageSequence,
+    packet::FrameSequence,
     session::{Role, SessionEvent, SessionState},
     timer::TimerCommand,
 };
@@ -20,7 +20,14 @@ use super::state::ProtocolState;
 
 struct QueuedDatagram {
     datagram: FixedBuf,
-    retain_for_retransmit: Option<MessageSequence>,
+    frame_sequence: Option<FrameSequence>,
+}
+
+pub(super) struct SendCompletion {
+    pub(super) key: ConnectionKey,
+    pub(super) ticket: SendTicket,
+    pub(super) result: Result<()>,
+    pub(super) datagram: Option<FixedBuf>,
 }
 
 #[derive(Default)]
@@ -140,17 +147,19 @@ impl EventRouter {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn handle_send_completion<'rt>(
         state: &mut ProtocolState<'rt>,
-        key: ConnectionKey,
-        ticket: SendTicket,
-        result: Result<()>,
-        datagram: Option<FixedBuf>,
+        completion: SendCompletion,
         command: &CommandSender,
         outbound: &OutboundSender,
         pump_events: &PumpSender,
     ) -> Result<()> {
+        let SendCompletion {
+            key,
+            ticket,
+            result,
+            datagram,
+        } = completion;
         match ticket {
             SendTicket::CompleteConnect => {
                 drop(datagram);
@@ -246,16 +255,16 @@ impl EventRouter {
         events: Vec<SessionEvent>,
         command: &CommandSender,
     ) -> Result<EventBatch> {
-        let max_payload = state.config().max_payload();
+        let max_message_size = state.config().max_message_size.get();
         let mut batch = EventBatch::default();
         for event in events {
             match event {
                 SessionEvent::Outbound {
                     datagram,
-                    retain_for_retransmit,
+                    frame_sequence,
                 } => batch.datagrams.push_back(QueuedDatagram {
                     datagram,
-                    retain_for_retransmit,
+                    frame_sequence,
                 }),
                 SessionEvent::ArmTimer(command) | SessionEvent::CancelTimer(command) => {
                     trace!(
@@ -272,7 +281,7 @@ impl EventRouter {
                         peer = ?key.peer(),
                         connection_id = key.connection_id().get(),
                         token = receipt.token.get(),
-                        sequence = receipt.sequence.get(),
+                        message_id = receipt.message_id.get(),
                         retransmissions = receipt.retransmissions,
                         rtt = ?receipt.rtt,
                         "protocol loop received SendAcked"
@@ -306,7 +315,7 @@ impl EventRouter {
                             entry.mark_connect_send_pending();
                         }
                     } else if !accepted {
-                        let connection = Connection::new(command.clone(), key, max_payload);
+                        let connection = Connection::new(command.clone(), key, max_message_size);
                         match state.try_accept(connection) {
                             Ok(()) => {
                                 if let Some(entry) = state.entry_mut(&key) {
@@ -356,7 +365,7 @@ impl EventRouter {
     ) -> bool {
         let mut queue_full = false;
         while let Some(queued) = datagrams.pop_front() {
-            let ticket = if let Some(sequence) = queued.retain_for_retransmit {
+            let ticket = if let Some(sequence) = queued.frame_sequence {
                 SendTicket::ReturnToSession(sequence)
             } else if state
                 .entry(&key)

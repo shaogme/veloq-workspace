@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::{
     collections::VecDeque,
     sync::{
@@ -34,7 +32,7 @@ use veloq::{
     time::sleep,
 };
 
-use veloq_reliable_udp::{Flags, MessageSequence, PacketRef};
+use veloq_reliable_udp::{Flags, FrameSequence, PacketRef};
 
 const CHANNEL_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 32;
@@ -67,12 +65,9 @@ impl ProxyDirection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketMatcher {
-    Any,
-    Syn,
-    SynAck,
-    AckOnly,
-    Data { sequence: Option<MessageSequence> },
-    Fin,
+    Data {
+        frame_sequence: Option<FrameSequence>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,8 +101,6 @@ pub struct ProxyStatsSnapshot {
     pub send_completed: u64,
     pub send_failed: u64,
     pub outbound_queue_full: u64,
-    // Compatibility alias for the original test-only proxy API.
-    pub seen: u64,
 }
 
 pub struct ProxyStats {
@@ -182,7 +175,6 @@ impl ProxyStats {
             send_completed: self.send_completed.load(Ordering::Relaxed),
             send_failed: self.send_failed.load(Ordering::Relaxed),
             outbound_queue_full: self.outbound_queue_full.load(Ordering::Relaxed),
-            seen: actions_seen,
         }
     }
 }
@@ -276,10 +268,6 @@ impl<'rt> SocketProxy<'rt> {
         self.client_side.local_addr().map_err(|_| ProxyError::Io)
     }
 
-    pub fn server_side_addr(&self) -> Result<SocketAddr, ProxyError> {
-        self.server_side.local_addr().map_err(|_| ProxyError::Io)
-    }
-
     /// 返回客户端到服务端方向的统计，保留原有测试代理 API。
     pub fn stats(&self) -> Arc<ProxyStats> {
         self.stats_for(ProxyDirection::ClientToServer)
@@ -360,101 +348,102 @@ impl ProxyDriver<'_> {
             let (server_completions, server_completion_receiver) = owned_bounded(CHANNEL_CAPACITY);
 
             let scoped = scope!(ctx, async |scope| {
-                let mut client_receive = scope.spawn_boxed(receive_pump(
-                    ctx,
-                    client_side.clone(),
-                    max_datagram_size,
-                    client_addr,
-                    client_inbound,
-                    driver_events.clone(),
-                    stats[ProxyDirection::ClientToServer.index()].clone(),
-                    ProxyDirection::ClientToServer,
-                ));
-                let mut client_send = scope.spawn_boxed(send_pump(
-                    ctx,
-                    server_side.clone(),
-                    max_datagram_size,
-                    server_addr,
-                    client_outbound_receiver,
-                    client_completions.clone(),
-                    driver_events.clone(),
-                    stats[ProxyDirection::ClientToServer.index()].clone(),
-                    ProxyDirection::ClientToServer,
-                ));
-                let mut client_coordinator = scope.spawn_boxed(coordinator(
-                    ctx,
-                    max_datagram_size,
-                    client_to_server,
-                    client_inbound_receiver,
-                    client_outbound,
-                    client_completion_receiver,
-                    client_completions,
-                    driver_events.clone(),
-                    action_observed.clone(),
-                    stats[ProxyDirection::ClientToServer.index()].clone(),
-                    ProxyDirection::ClientToServer,
-                ));
-
-                let mut server_receive = scope.spawn_boxed(receive_pump(
-                    ctx,
-                    server_side.clone(),
-                    max_datagram_size,
-                    server_addr,
-                    server_inbound,
-                    driver_events.clone(),
-                    stats[ProxyDirection::ServerToClient.index()].clone(),
-                    ProxyDirection::ServerToClient,
-                ));
-                let mut server_send = scope.spawn_boxed(send_pump(
-                    ctx,
-                    client_side.clone(),
-                    max_datagram_size,
-                    client_addr,
-                    server_outbound_receiver,
-                    server_completions.clone(),
-                    driver_events.clone(),
-                    stats[ProxyDirection::ServerToClient.index()].clone(),
-                    ProxyDirection::ServerToClient,
-                ));
-                let mut server_coordinator = scope.spawn_boxed(coordinator(
-                    ctx,
-                    max_datagram_size,
-                    server_to_client,
-                    server_inbound_receiver,
-                    server_outbound,
-                    server_completion_receiver,
-                    server_completions,
-                    driver_events.clone(),
-                    action_observed.clone(),
-                    stats[ProxyDirection::ServerToClient.index()].clone(),
-                    ProxyDirection::ServerToClient,
-                ));
+                let mut tasks = ProxyTasks {
+                    client_receive: scope.spawn_boxed(receive_pump(ReceivePump {
+                        ctx,
+                        socket: client_side.clone(),
+                        max_datagram_size,
+                        expected_peer: client_addr,
+                        inbound: client_inbound,
+                        events: driver_events.clone(),
+                        stats: stats[ProxyDirection::ClientToServer.index()].clone(),
+                        direction: ProxyDirection::ClientToServer,
+                    })),
+                    client_send: scope.spawn_boxed(send_pump(SendPump {
+                        ctx,
+                        socket: server_side.clone(),
+                        max_datagram_size,
+                        target: server_addr,
+                        outbound: client_outbound_receiver,
+                        completions: client_completions.clone(),
+                        events: driver_events.clone(),
+                        stats: stats[ProxyDirection::ClientToServer.index()].clone(),
+                        direction: ProxyDirection::ClientToServer,
+                    })),
+                    client_coordinator: scope.spawn_boxed(
+                        Coordinator {
+                            ctx,
+                            rules: client_to_server,
+                            pending: Vec::new(),
+                            reorder: None,
+                            next_order: 0,
+                            next_event_id: 0,
+                            events: driver_events.clone(),
+                            action_observed: action_observed.clone(),
+                            stats: stats[ProxyDirection::ClientToServer.index()].clone(),
+                            direction: ProxyDirection::ClientToServer,
+                        }
+                        .run(
+                            client_inbound_receiver,
+                            client_outbound,
+                            client_completion_receiver,
+                        ),
+                    ),
+                    server_receive: scope.spawn_boxed(receive_pump(ReceivePump {
+                        ctx,
+                        socket: server_side.clone(),
+                        max_datagram_size,
+                        expected_peer: server_addr,
+                        inbound: server_inbound,
+                        events: driver_events.clone(),
+                        stats: stats[ProxyDirection::ServerToClient.index()].clone(),
+                        direction: ProxyDirection::ServerToClient,
+                    })),
+                    server_send: scope.spawn_boxed(send_pump(SendPump {
+                        ctx,
+                        socket: client_side.clone(),
+                        max_datagram_size,
+                        target: client_addr,
+                        outbound: server_outbound_receiver,
+                        completions: server_completions.clone(),
+                        events: driver_events.clone(),
+                        stats: stats[ProxyDirection::ServerToClient.index()].clone(),
+                        direction: ProxyDirection::ServerToClient,
+                    })),
+                    server_coordinator: scope.spawn_boxed(
+                        Coordinator {
+                            ctx,
+                            rules: server_to_client,
+                            pending: Vec::new(),
+                            reorder: None,
+                            next_order: 0,
+                            next_event_id: 0,
+                            events: driver_events.clone(),
+                            action_observed: action_observed.clone(),
+                            stats: stats[ProxyDirection::ServerToClient.index()].clone(),
+                            direction: ProxyDirection::ServerToClient,
+                        }
+                        .run(
+                            server_inbound_receiver,
+                            server_outbound,
+                            server_completion_receiver,
+                        ),
+                    ),
+                };
+                drop(client_completions);
+                drop(server_completions);
                 drop(driver_events);
 
                 let startup =
                     wait_for_startup(ctx, &mut driver_event_receiver, &mut shutdown).await;
                 if let Err(error) = startup {
                     let _ = ready.send(Err(error));
-                    cancel_proxy_tasks(
-                        &mut client_receive,
-                        &mut client_send,
-                        &mut client_coordinator,
-                        &mut server_receive,
-                        &mut server_send,
-                        &mut server_coordinator,
-                    );
+                    tasks.cancel();
                     let _ = scope.wait_all().await;
                     return Err(error);
                 }
                 if ready.send(Ok(())).is_err() {
-                    cancel_proxy_tasks(
-                        &mut client_receive,
-                        &mut client_send,
-                        &mut client_coordinator,
-                        &mut server_receive,
-                        &mut server_send,
-                        &mut server_coordinator,
-                    );
+                    tasks.cancel();
                     let _ = scope.wait_all().await;
                     return Ok(());
                 }
@@ -494,14 +483,7 @@ impl ProxyDriver<'_> {
                         Ok(())
                     },
                 };
-                cancel_proxy_tasks(
-                    &mut client_receive,
-                    &mut client_send,
-                    &mut client_coordinator,
-                    &mut server_receive,
-                    &mut server_send,
-                    &mut server_coordinator,
-                );
+                tasks.cancel();
                 let _ = scope.wait_all().await;
                 result
             })
@@ -519,14 +501,17 @@ impl ProxyDriver<'_> {
     }
 }
 
-fn cancel_proxy_tasks<CR, CS, CC, SR, SS, SC>(
-    client_receive: &mut CR,
-    client_send: &mut CS,
-    client_coordinator: &mut CC,
-    server_receive: &mut SR,
-    server_send: &mut SS,
-    server_coordinator: &mut SC,
-) where
+struct ProxyTasks<CR, CS, CC, SR, SS, SC> {
+    client_receive: CR,
+    client_send: CS,
+    client_coordinator: CC,
+    server_receive: SR,
+    server_send: SS,
+    server_coordinator: SC,
+}
+
+impl<CR, CS, CC, SR, SS, SC> ProxyTasks<CR, CS, CC, SR, SS, SC>
+where
     CR: ProxyCancel,
     CS: ProxyCancel,
     CC: ProxyCancel,
@@ -534,12 +519,14 @@ fn cancel_proxy_tasks<CR, CS, CC, SR, SS, SC>(
     SS: ProxyCancel,
     SC: ProxyCancel,
 {
-    client_receive.cancel_task();
-    client_send.cancel_task();
-    client_coordinator.cancel_task();
-    server_receive.cancel_task();
-    server_send.cancel_task();
-    server_coordinator.cancel_task();
+    fn cancel(&mut self) {
+        self.client_receive.cancel_task();
+        self.client_send.cancel_task();
+        self.client_coordinator.cancel_task();
+        self.server_receive.cancel_task();
+        self.server_send.cancel_task();
+        self.server_coordinator.cancel_task();
+    }
 }
 
 trait ProxyCancel {
@@ -628,8 +615,7 @@ struct SendCompleted {
     result: Result<(), ProxyError>,
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn receive_pump<'rt>(
+struct ReceivePump<'rt> {
     ctx: Ctx<'rt>,
     socket: UdpSocket<'rt>,
     max_datagram_size: NonZeroUsize,
@@ -638,7 +624,19 @@ async fn receive_pump<'rt>(
     events: DriverEventSender,
     stats: Arc<ProxyStats>,
     direction: ProxyDirection,
-) {
+}
+
+async fn receive_pump(pump: ReceivePump<'_>) {
+    let ReceivePump {
+        ctx,
+        socket,
+        max_datagram_size,
+        expected_peer,
+        inbound,
+        events,
+        stats,
+        direction,
+    } = pump;
     stats.receive_started.fetch_add(1, Ordering::Relaxed);
     let mut operation_id: u64 = 0;
     let mut recv = match prepare_recv(ctx, &socket, max_datagram_size) {
@@ -724,8 +722,7 @@ async fn report_receive_failure(events: &DriverEventSender, stats: &ProxyStats, 
     let _ = report_event(events, DriverEvent::Failure(error)).await;
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn send_pump<'rt>(
+struct SendPump<'rt> {
     ctx: Ctx<'rt>,
     socket: UdpSocket<'rt>,
     max_datagram_size: NonZeroUsize,
@@ -735,7 +732,20 @@ async fn send_pump<'rt>(
     events: DriverEventSender,
     stats: Arc<ProxyStats>,
     direction: ProxyDirection,
-) {
+}
+
+async fn send_pump(pump: SendPump<'_>) {
+    let SendPump {
+        ctx,
+        socket,
+        max_datagram_size,
+        target,
+        outbound,
+        completions,
+        events,
+        stats,
+        direction,
+    } = pump;
     if report_event(&events, DriverEvent::Ready(StartupKind::Send(direction)))
         .await
         .is_err()
@@ -807,7 +817,6 @@ struct ReorderBuffer {
 
 struct Coordinator<'rt> {
     ctx: Ctx<'rt>,
-    max_datagram_size: NonZeroUsize,
     rules: VecDeque<ProxyRule>,
     pending: Vec<PendingDatagram>,
     reorder: Option<ReorderBuffer>,
@@ -819,57 +828,37 @@ struct Coordinator<'rt> {
     direction: ProxyDirection,
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn coordinator<'rt>(
-    ctx: Ctx<'rt>,
-    max_datagram_size: NonZeroUsize,
-    rules: VecDeque<ProxyRule>,
-    inbound: DatagramReceiver,
-    outbound: ForwardSender,
-    completions: CompletionReceiver,
-    _completion_sender: CompletionSender,
-    events: DriverEventSender,
-    action_observed: BoundedOwnedSender<()>,
-    stats: Arc<ProxyStats>,
-    direction: ProxyDirection,
-) {
-    let mut coordinator = Coordinator {
-        ctx,
-        max_datagram_size,
-        rules,
-        pending: Vec::new(),
-        reorder: None,
-        next_order: 0,
-        next_event_id: 0,
-        events: events.clone(),
-        action_observed,
-        stats,
-        direction,
-    };
-    if report_event(
-        &events,
-        DriverEvent::Ready(StartupKind::Coordinator(direction)),
-    )
-    .await
-    .is_err()
-    {
-        return;
-    }
-    let result = coordinator.run_inner(inbound, outbound, completions).await;
-    if let Err(error) = result {
-        warn!(
-            target: "veloq_reliable_udp::socket_proxy",
-            direction = ?direction,
-            error = ?error,
-            "proxy coordinator failed"
-        );
-        let _ = report_event(&events, DriverEvent::Failure(error)).await;
-    } else {
-        let _ = report_event(&events, DriverEvent::CoordinatorStopped).await;
-    }
-}
-
 impl Coordinator<'_> {
+    async fn run(
+        mut self,
+        inbound: DatagramReceiver,
+        outbound: ForwardSender,
+        completions: CompletionReceiver,
+    ) {
+        let events = self.events.clone();
+        if report_event(
+            &events,
+            DriverEvent::Ready(StartupKind::Coordinator(self.direction)),
+        )
+        .await
+        .is_err()
+        {
+            return;
+        }
+        let result = self.run_inner(inbound, outbound, completions).await;
+        if let Err(error) = result {
+            warn!(
+                target: "veloq_reliable_udp::socket_proxy",
+                direction = ?self.direction,
+                error = ?error,
+                "proxy coordinator failed"
+            );
+            let _ = report_event(&events, DriverEvent::Failure(error)).await;
+        } else {
+            let _ = report_event(&events, DriverEvent::CoordinatorStopped).await;
+        }
+    }
+
     async fn run_inner(
         &mut self,
         inbound: DatagramReceiver,
@@ -1213,7 +1202,7 @@ fn trace_datagram(
             event_id,
             connection_id = packet.connection_id.get(),
             flags = packet.flags.bits(),
-            sequence = packet.sequence,
+            frame_sequence = packet.frame_sequence,
             ack_largest = packet.ack_largest,
             payload_len = packet.payload.len(),
             "proxy received datagram"
@@ -1233,19 +1222,12 @@ fn trace_datagram(
 
 impl PacketMatcher {
     fn matches(self, packet: Option<&PacketRef<'_>>) -> bool {
-        let Some(packet) = packet else {
-            return matches!(self, Self::Any);
-        };
+        let Some(packet) = packet else { return false };
         match self {
-            Self::Any => true,
-            Self::Syn => packet.flags == Flags::SYN,
-            Self::SynAck => packet.flags == Flags::SYN_ACK,
-            Self::AckOnly => packet.flags == Flags::ACK,
-            Self::Data { sequence } => {
+            Self::Data { frame_sequence } => {
                 packet.flags.contains(Flags::DATA)
-                    && sequence.is_none_or(|sequence| packet.sequence == sequence.get())
+                    && frame_sequence.is_none_or(|sequence| packet.frame_sequence == sequence.get())
             }
-            Self::Fin => packet.flags.contains(Flags::FIN),
         }
     }
 }

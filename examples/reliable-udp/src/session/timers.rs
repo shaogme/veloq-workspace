@@ -34,7 +34,14 @@ impl TimerState {
     pub(super) fn cancel(&mut self, kind: TimerKind, generation: u64) -> Option<TimerCommand> {
         let was_armed = self.is_armed(kind);
         self.set_armed(kind, false);
-        if was_armed || matches!(kind, TimerKind::Retransmit { .. }) {
+        if was_armed
+            || matches!(
+                kind,
+                TimerKind::Retransmit { .. }
+                    | TimerKind::MessageAckRetry { .. }
+                    | TimerKind::ReassemblyTimeout { .. }
+            )
+        {
             Some(TimerCommand::Cancel { kind, generation })
         } else {
             None
@@ -58,7 +65,9 @@ impl TimerState {
             TimerKind::HandshakeRetry => self.handshake_armed,
             TimerKind::AckDelay => self.ack_armed,
             TimerKind::FinRetry => self.fin_armed,
-            TimerKind::Retransmit { .. } => false,
+            TimerKind::Retransmit { .. }
+            | TimerKind::MessageAckRetry { .. }
+            | TimerKind::ReassemblyTimeout { .. } => false,
         }
     }
 
@@ -67,7 +76,9 @@ impl TimerState {
             TimerKind::HandshakeRetry => self.handshake_armed = armed,
             TimerKind::AckDelay => self.ack_armed = armed,
             TimerKind::FinRetry => self.fin_armed = armed,
-            TimerKind::Retransmit { .. } => {}
+            TimerKind::Retransmit { .. }
+            | TimerKind::MessageAckRetry { .. }
+            | TimerKind::ReassemblyTimeout { .. } => {}
         }
     }
 }

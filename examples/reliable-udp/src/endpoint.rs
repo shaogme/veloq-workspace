@@ -35,7 +35,7 @@ use crate::{
 
 use self::{io::CommandSender, state::ProtocolState, stats::EndpointStats};
 
-static NEXT_CONNECTION_ID: NativeAtomicU64 = NativeAtomicU64::new(1);
+static NEXT_CONNECTION_ID: NativeAtomicU64 = NativeAtomicU64::new(0x9e37_79b9_7f4a_7c15);
 
 pub(crate) type ConnectionCommandSender = CommandSender;
 pub(crate) type Reply<T> = oneshot::OwnedSender<Result<T>>;
@@ -91,6 +91,12 @@ pub struct EndpointStatsSnapshot {
     pub receive_window: u64,
     pub ack_delayed: u64,
     pub piggybacked_acks: u64,
+    pub reassembly_messages: u64,
+    pub reassembly_bytes: u64,
+    pub completed_messages: u64,
+    pub duplicate_fragments: u64,
+    pub message_ack_retries: u64,
+    pub reassembly_timeouts: u64,
     pub timer_expirations: u64,
     pub timer_delay_samples: u64,
     pub timer_delay_total: Duration,
@@ -103,7 +109,7 @@ pub struct Endpoint<'rt> {
     command: ConnectionCommandSender,
     accept: BoundedOwnedReceiver<Connection<'rt>>,
     local_addr: SocketAddr,
-    max_payload: usize,
+    max_message_size: usize,
     stats: Arc<EndpointStats>,
     marker: PhantomData<&'rt ()>,
 }
@@ -114,7 +120,7 @@ impl<'rt> Clone for Endpoint<'rt> {
             command: self.command.clone(),
             accept: self.accept.clone(),
             local_addr: self.local_addr,
-            max_payload: self.max_payload,
+            max_message_size: self.max_message_size,
             stats: self.stats.clone(),
             marker: PhantomData,
         }
@@ -138,7 +144,7 @@ impl<'rt> Endpoint<'rt> {
             command: command.clone(),
             accept: accept_rx.clone(),
             local_addr,
-            max_payload: config.max_payload(),
+            max_message_size: config.max_message_size.get(),
             stats: stats.clone(),
             marker: PhantomData,
         };
@@ -187,7 +193,11 @@ impl<'rt> Endpoint<'rt> {
             .await
             .map_err(|_| Error::EndpointClosed)?;
         response.await.map_err(|_| Error::EndpointClosed)??;
-        Ok(Connection::new(self.command.clone(), key, self.max_payload))
+        Ok(Connection::new(
+            self.command.clone(),
+            key,
+            self.max_message_size,
+        ))
     }
 
     pub async fn accept(&self) -> Result<Connection<'rt>> {
@@ -227,7 +237,14 @@ impl EndpointReady {
 
 fn next_connection_id() -> ConnectionId {
     loop {
-        let value = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+        let counter = NEXT_CONNECTION_ID.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed);
+        // SplitMix64 removes the observable monotonic counter pattern. This is
+        // still not authentication; authenticated connection establishment
+        // remains a separate protocol feature.
+        let mut value = counter.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        let value = value ^ (value >> 31);
         if let Some(connection_id) = ConnectionId::new(value) {
             return connection_id;
         }

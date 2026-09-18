@@ -1,7 +1,7 @@
 use tracing::trace;
 use veloq::{
     runtime::context::Ctx,
-    std::vec::Vec,
+    std::{num::NonZeroUsize, vec::Vec},
     sync::mpmc::{BoundedOwnedReceiver, BoundedOwnedSender},
 };
 
@@ -181,7 +181,10 @@ impl CommandService {
             SendPayload::Bytes(bytes) => {
                 let length = bytes.len();
                 let mut payload = ctx
-                    .try_alloc(state.config().max_datagram_size, length)
+                    .try_alloc(
+                        NonZeroUsize::new(length.max(1)).expect("message capacity is non-zero"),
+                        length,
+                    )
                     .map_err(|_| Error::Io)?;
                 payload.spare_capacity_mut()[..length].copy_from_slice(&bytes);
                 payload.set_len(length);
@@ -342,7 +345,12 @@ impl CommandService {
             return Ok(());
         }
         let peer = datagram.peer();
-        let (connection_id, flags) = match PacketRef::decode(datagram.bytes()) {
+        let (connection_id, flags) = match PacketRef::decode_with_constraints(
+            datagram.bytes(),
+            state.config().max_fragment_payload(),
+            state.config().max_message_size.get() as u64,
+            state.config().max_fragments_per_message.get(),
+        ) {
             Ok(packet) => (packet.connection_id, packet.flags),
             Err(error) => {
                 state.stats().record_malformed();

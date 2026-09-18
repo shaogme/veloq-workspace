@@ -316,7 +316,7 @@ impl<'rt> ProtocolState<'rt> {
 
 pub(super) fn message_from_session(message: SessionMessage) -> Message {
     Message {
-        sequence: message.sequence,
+        message_id: message.message_id,
         payload: message.into_fixed_buf(),
     }
 }

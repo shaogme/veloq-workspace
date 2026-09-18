@@ -34,6 +34,12 @@ pub(super) struct EndpointStats {
     receive_window: NativeAtomicU64,
     ack_delayed: NativeAtomicU64,
     piggybacked_acks: NativeAtomicU64,
+    reassembly_messages: NativeAtomicU64,
+    reassembly_bytes: NativeAtomicU64,
+    completed_messages: NativeAtomicU64,
+    duplicate_fragments: NativeAtomicU64,
+    message_ack_retries: NativeAtomicU64,
+    reassembly_timeouts: NativeAtomicU64,
     timer_expirations: NativeAtomicU64,
     timer_delay_samples: NativeAtomicU64,
     timer_delay_total_nanos: NativeAtomicU64,
@@ -71,6 +77,12 @@ impl EndpointStats {
             receive_window: NativeAtomicU64::new(0),
             ack_delayed: NativeAtomicU64::new(0),
             piggybacked_acks: NativeAtomicU64::new(0),
+            reassembly_messages: NativeAtomicU64::new(0),
+            reassembly_bytes: NativeAtomicU64::new(0),
+            completed_messages: NativeAtomicU64::new(0),
+            duplicate_fragments: NativeAtomicU64::new(0),
+            message_ack_retries: NativeAtomicU64::new(0),
+            reassembly_timeouts: NativeAtomicU64::new(0),
             timer_expirations: NativeAtomicU64::new(0),
             timer_delay_samples: NativeAtomicU64::new(0),
             timer_delay_total_nanos: NativeAtomicU64::new(0),
@@ -112,6 +124,12 @@ impl EndpointStats {
             receive_window: self.receive_window.load(Ordering::Relaxed),
             ack_delayed: self.ack_delayed.load(Ordering::Relaxed),
             piggybacked_acks: self.piggybacked_acks.load(Ordering::Relaxed),
+            reassembly_messages: self.reassembly_messages.load(Ordering::Relaxed),
+            reassembly_bytes: self.reassembly_bytes.load(Ordering::Relaxed),
+            completed_messages: self.completed_messages.load(Ordering::Relaxed),
+            duplicate_fragments: self.duplicate_fragments.load(Ordering::Relaxed),
+            message_ack_retries: self.message_ack_retries.load(Ordering::Relaxed),
+            reassembly_timeouts: self.reassembly_timeouts.load(Ordering::Relaxed),
             timer_expirations: self.timer_expirations.load(Ordering::Relaxed),
             timer_delay_samples: self.timer_delay_samples.load(Ordering::Relaxed),
             timer_delay_total: duration_from_nanos(
@@ -238,6 +256,26 @@ impl EndpointStats {
             previous.piggybacked_acks,
             current.piggybacked_acks,
         );
+        add_delta(
+            &self.completed_messages,
+            previous.completed_messages,
+            current.completed_messages,
+        );
+        add_delta(
+            &self.duplicate_fragments,
+            previous.duplicate_fragments,
+            current.duplicate_fragments,
+        );
+        add_delta(
+            &self.message_ack_retries,
+            previous.message_ack_retries,
+            current.message_ack_retries,
+        );
+        add_delta(
+            &self.reassembly_timeouts,
+            previous.reassembly_timeouts,
+            current.reassembly_timeouts,
+        );
         if current.latest_rtt != previous.latest_rtt
             && let Some(rtt) = current.latest_rtt
         {
@@ -277,6 +315,16 @@ impl EndpointStats {
             previous.receive_window as u64,
             current.receive_window as u64,
         );
+        adjust_gauge(
+            &self.reassembly_messages,
+            previous.reassembly_messages as u64,
+            current.reassembly_messages as u64,
+        );
+        adjust_gauge(
+            &self.reassembly_bytes,
+            previous.reassembly_bytes as u64,
+            current.reassembly_bytes as u64,
+        );
     }
 
     pub(super) fn remove_session_gauges(&self, snapshot: SessionStatsSnapshot) {
@@ -293,6 +341,12 @@ impl EndpointStats {
             0,
         );
         adjust_gauge(&self.receive_window, snapshot.receive_window as u64, 0);
+        adjust_gauge(
+            &self.reassembly_messages,
+            snapshot.reassembly_messages as u64,
+            0,
+        );
+        adjust_gauge(&self.reassembly_bytes, snapshot.reassembly_bytes as u64, 0);
     }
 }
 

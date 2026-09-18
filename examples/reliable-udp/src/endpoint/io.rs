@@ -13,7 +13,7 @@ use veloq::{
 use crate::{
     Config,
     error::{Error, Result},
-    packet::{MessageSequence, PacketRef},
+    packet::{FrameSequence, PacketRef},
 };
 
 use super::{Command, ConnectionKey, stats::EndpointStats};
@@ -62,7 +62,7 @@ impl InboundDatagram {
 pub(super) enum SendTicket {
     DropAfterSend,
     CompleteConnect,
-    ReturnToSession(MessageSequence),
+    ReturnToSession(FrameSequence),
 }
 
 pub(super) struct OutboundDatagram {
@@ -256,7 +256,7 @@ fn trace_submitted(item: &OutboundDatagram) {
             peer = ?item.key().peer(),
             connection_id = packet.connection_id.get(),
             flags = packet.flags.bits(),
-            sequence = packet.sequence,
+            frame_sequence = packet.frame_sequence,
             ack_largest = packet.ack_largest,
             payload_len = packet.payload.len(),
             completion = item.has_completion(),

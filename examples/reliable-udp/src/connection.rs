@@ -7,7 +7,7 @@ use veloq::{
 use crate::{
     endpoint::{Command, ConnectionKey},
     error::{Error, Result},
-    packet::{ConnectionId, MessageSequence},
+    packet::{ConnectionId, MessageId},
     session::SendReceipt,
 };
 
@@ -22,7 +22,7 @@ pub enum Shutdown {
 }
 
 pub struct Message {
-    pub sequence: MessageSequence,
+    pub message_id: MessageId,
     pub payload: FixedBuf,
 }
 
@@ -44,17 +44,17 @@ pub(crate) enum SendPayload {
 pub struct Connection<'rt> {
     pub(crate) command: CommandSender,
     pub(crate) key: ConnectionKey,
-    pub(crate) max_payload: usize,
+    pub(crate) max_message_size: usize,
     pub(crate) drop_command: bool,
     marker: PhantomData<&'rt ()>,
 }
 
 impl<'rt> Connection<'rt> {
-    pub(crate) fn new(command: CommandSender, key: ConnectionKey, max_payload: usize) -> Self {
+    pub(crate) fn new(command: CommandSender, key: ConnectionKey, max_message_size: usize) -> Self {
         Self {
             command,
             key,
-            max_payload,
+            max_message_size,
             drop_command: true,
             marker: PhantomData,
         }
@@ -69,7 +69,7 @@ impl<'rt> Connection<'rt> {
     }
 
     pub async fn send(&self, payload: FixedBuf) -> Result<SendReceipt> {
-        if payload.len() > self.max_payload {
+        if payload.len() > self.max_message_size {
             return Err(Error::MessageTooLarge);
         }
         let (reply, response) = oneshot::owned_channel();
@@ -85,7 +85,7 @@ impl<'rt> Connection<'rt> {
     }
 
     pub async fn send_bytes(&self, payload: &[u8]) -> Result<SendReceipt> {
-        if payload.len() > self.max_payload {
+        if payload.len() > self.max_message_size {
             return Err(Error::MessageTooLarge);
         }
         let (reply, response) = oneshot::owned_channel();

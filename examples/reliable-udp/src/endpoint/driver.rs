@@ -9,7 +9,7 @@ use veloq::{
 
 use crate::error::{Error, Result};
 
-use super::event::EventRouter;
+use super::event::{EventRouter, SendCompletion};
 use super::io::{
     InboundDatagram, InboundReceiver, OutboundSender, PumpEvent, PumpReceiver, PumpSender,
     receive_pump, send_pump,
@@ -233,10 +233,12 @@ impl<'rt> Driver<'rt> {
                     let command = self.command_sender();
                     EventRouter::handle_send_completion(
                         &mut self.state,
-                        key,
-                        ticket,
-                        result,
-                        datagram,
+                        SendCompletion {
+                            key,
+                            ticket,
+                            result,
+                            datagram,
+                        },
                         &command,
                         outbound,
                         pump_sender,
