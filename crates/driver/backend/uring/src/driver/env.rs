@@ -1,53 +1,37 @@
 //! Field-level borrow splits for the uring submission path.
 //!
 //! A submission has to hold two things at once: the slot that owns the op/payload (a `&mut`
-//! borrow into [`UringDriver::ops`]) and the driver state needed to turn that op into an SQE
-//! and hand it to the kernel. Handing the whole `&mut UringDriver` to the second half while
+//! borrow into the operation registry) and the driver state needed to turn that op into an SQE
+//! and hand it to the kernel. Handing the whole driver to the second half while
 //! the first is live is an aliasing violation, so the non-`ops` fields are projected into the
 //! views below and the borrow checker verifies the split.
 
 use crate::{
-    config::{BufferRegistrationMode, IoFd},
+    config::IoFd,
     diagnostics::UringCompletionDiagnostics,
-    driver::lifecycle::{CancellationPhase, SubmissionPhase},
+    driver::lifecycle::{CancellationPhase, SubmissionPhase, UringOpState},
     driver::{
-        FileTable, MAX_CHUNKS, PendingCancel, ProvidedBufGroup, UringDriver,
-        UringRegistrationStats,
         control::{
-            ControlPlaneEvent, ControlPlaneObserver, StagedEntry, StagedLedger,
+            ControlPlaneEvent, ControlPlaneObserver, PendingCancel, StagedEntry, StagedLedger,
             UringControlEffectKind, UringControlPlane, UringPostCompletionEffects, UringTimerWheel,
-            transition_submission_phase,
         },
         registration::{
-            BufferRegistrationQuarantine, ChunkRegistrationRecord, ChunkRegistrationState,
-            KernelUpdateOutcome, REGISTER_FAILURE_RETRY_COOLDOWN, UpdateEvidence,
+            buffer::{ChunkRegistrationRecord, ChunkRegistrationState, FixedBufferSubmitPort},
+            file_table::{FileTable, OwnedFdOwnershipTicket},
+            provided_buf::ProvidedBufPort,
         },
     },
     error::{UringError, UringResult},
-    op::{CompletionCleanupHintFn, UringOpRegistry},
+    op::CompletionCleanupHintFn,
 };
 use diagweave::prelude::*;
 use tracing::{debug, trace};
 use veloq_buf::{BufferRegistrar, FixedBuf, heap::ChunkId};
-use veloq_driver_core::driver::{
-    BufferRegistrationStatus, CancelTicket, CompletionToken, OpToken, RawCompletion,
-};
+use veloq_driver_core::driver::{CancelTicket, CompletionToken, OpToken, RawCompletion};
 use veloq_driver_core::slot::Generation;
-use veloq_io_uring::{ResourceRegistration, SubmissionQueue, Submitter, cqueue, squeue};
-use veloq_std::{
-    collections::{BitSet, HashMap},
-    format, ptr,
-};
+use veloq_io_uring::{SubmissionQueue, Submitter, cqueue, squeue};
+use veloq_std::{collections::HashMap, format};
 use veloq_wheel::{TimerError, TimerId};
-
-#[cfg(feature = "test-hooks")]
-use crate::driver::registration::buffer::BufferUpdateInjection;
-
-#[cfg(feature = "test-hooks")]
-use veloq_std::collections::VecDeque;
-
-#[cfg(feature = "test-hooks")]
-use veloq_std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChunkRegistrationDecision {
@@ -75,17 +59,220 @@ impl ProvidedBufSqeInfo {
 /// The driver state a `make_sqe` implementation is allowed to consult.
 ///
 /// `make_sqe` runs with the slot's op and payload borrowed mutably out of
-/// [`UringDriver::ops`], so it must not be able to reach `ops` itself. These fields are
+/// the operation registry, so it must not be able to reach that registry itself. These fields are
 /// disjoint from it and are handed out by value or immutably: lazy chunk registration happens
 /// *after* `make_sqe` returns, so nothing here needs to be mutated during SQE construction.
 pub(crate) struct SqeEnv<'d> {
-    pub(crate) file_table: &'d FileTable,
+    file_table: &'d FileTable,
     chunk_records: &'d [Option<ChunkRegistrationRecord>],
     registrar: &'d (dyn BufferRegistrar + 'd),
     provided: Option<ProvidedBufSqeInfo>,
 }
 
+pub(crate) struct SubmissionLedgerParts<'d> {
+    staged_entries: &'d mut StagedLedger,
+    timers: &'d mut UringTimerWheel,
+    control_observer: &'d mut ControlPlaneObserver,
+    completion_cleanup_hints: &'d mut HashMap<CompletionToken, Option<CompletionCleanupHintFn>>,
+}
+
+impl<'d> SubmissionLedgerParts<'d> {
+    pub(crate) fn new(
+        staged_entries: &'d mut StagedLedger,
+        timers: &'d mut UringTimerWheel,
+        control_observer: &'d mut ControlPlaneObserver,
+        completion_cleanup_hints: &'d mut HashMap<CompletionToken, Option<CompletionCleanupHintFn>>,
+    ) -> Self {
+        Self {
+            staged_entries,
+            timers,
+            control_observer,
+            completion_cleanup_hints,
+        }
+    }
+}
+
+#[cfg(not(feature = "test-hooks"))]
+pub(crate) struct SubmissionSidecarParts<'d> {
+    completion_cleanup_capacity: usize,
+    pending_cancel_cqes: &'d mut HashMap<CancelTicket, PendingCancel>,
+    cancel_capacity: usize,
+}
+
+#[cfg(not(feature = "test-hooks"))]
+impl<'d> SubmissionSidecarParts<'d> {
+    pub(crate) fn new(
+        completion_cleanup_capacity: usize,
+        pending_cancel_cqes: &'d mut HashMap<CancelTicket, PendingCancel>,
+        cancel_capacity: usize,
+    ) -> Self {
+        Self {
+            completion_cleanup_capacity,
+            pending_cancel_cqes,
+            cancel_capacity,
+        }
+    }
+}
+
+#[cfg(feature = "test-hooks")]
+pub(crate) struct SubmissionSidecarParts<'d> {
+    completion_cleanup_capacity: usize,
+    pending_cancel_cqes: &'d mut HashMap<CancelTicket, PendingCancel>,
+    cancel_capacity: usize,
+    push_entry_failure: &'d mut bool,
+}
+
+#[cfg(feature = "test-hooks")]
+impl<'d> SubmissionSidecarParts<'d> {
+    pub(crate) fn new(
+        completion_cleanup_capacity: usize,
+        pending_cancel_cqes: &'d mut HashMap<CancelTicket, PendingCancel>,
+        cancel_capacity: usize,
+        push_entry_failure: &'d mut bool,
+    ) -> Self {
+        Self {
+            completion_cleanup_capacity,
+            pending_cancel_cqes,
+            cancel_capacity,
+            push_entry_failure,
+        }
+    }
+}
+
+pub(crate) struct SubmissionControlParts<'d> {
+    ledger: SubmissionLedgerParts<'d>,
+    sidecar: SubmissionSidecarParts<'d>,
+}
+
+impl<'d> SubmissionControlParts<'d> {
+    pub(crate) fn new(
+        ledger: SubmissionLedgerParts<'d>,
+        sidecar: SubmissionSidecarParts<'d>,
+    ) -> Self {
+        Self { ledger, sidecar }
+    }
+
+    pub(crate) fn into_view(self, submission_queue: SubmissionQueue<'d>) -> SubmitControlView<'d> {
+        let Self { ledger, sidecar } = self;
+        let SubmissionLedgerParts {
+            staged_entries,
+            timers,
+            control_observer,
+            completion_cleanup_hints,
+        } = ledger;
+        #[cfg(not(feature = "test-hooks"))]
+        let SubmissionSidecarParts {
+            completion_cleanup_capacity,
+            pending_cancel_cqes,
+            cancel_capacity,
+        } = sidecar;
+        #[cfg(feature = "test-hooks")]
+        let SubmissionSidecarParts {
+            completion_cleanup_capacity,
+            pending_cancel_cqes,
+            cancel_capacity,
+            push_entry_failure,
+        } = sidecar;
+        SubmitControlView {
+            submission_queue,
+            staged_entries,
+            timers,
+            control_observer,
+            completion_cleanup_hints,
+            completion_cleanup_capacity,
+            pending_cancel_cqes,
+            cancel_capacity,
+            #[cfg(feature = "test-hooks")]
+            push_entry_failure,
+        }
+    }
+}
+pub(crate) struct CompletionLedgerParts<'d> {
+    pending_cancel_cqes: &'d mut HashMap<CancelTicket, PendingCancel>,
+    completion_cleanup_hints: &'d mut HashMap<CompletionToken, Option<CompletionCleanupHintFn>>,
+    observer: &'d mut ControlPlaneObserver,
+    post: &'d mut UringPostCompletionEffects,
+}
+
+impl<'d> CompletionLedgerParts<'d> {
+    pub(crate) fn new(
+        pending_cancel_cqes: &'d mut HashMap<CancelTicket, PendingCancel>,
+        completion_cleanup_hints: &'d mut HashMap<CompletionToken, Option<CompletionCleanupHintFn>>,
+        observer: &'d mut ControlPlaneObserver,
+        post: &'d mut UringPostCompletionEffects,
+    ) -> Self {
+        Self {
+            pending_cancel_cqes,
+            completion_cleanup_hints,
+            observer,
+            post,
+        }
+    }
+}
+
+pub(crate) struct CompletionMetadata {
+    waker_buf_len: usize,
+    waker_generation: u64,
+}
+
+impl CompletionMetadata {
+    pub(crate) const fn new(waker_buf_len: usize, waker_generation: u64) -> Self {
+        Self {
+            waker_buf_len,
+            waker_generation,
+        }
+    }
+}
+
+pub(crate) struct CompletionControlParts<'d> {
+    ledger: CompletionLedgerParts<'d>,
+    metadata: CompletionMetadata,
+}
+
+impl<'d> CompletionControlParts<'d> {
+    pub(crate) fn new(ledger: CompletionLedgerParts<'d>, metadata: CompletionMetadata) -> Self {
+        Self { ledger, metadata }
+    }
+
+    pub(crate) fn into_view(self) -> CompletionControlView<'d> {
+        let Self { ledger, metadata } = self;
+        let CompletionLedgerParts {
+            pending_cancel_cqes,
+            completion_cleanup_hints,
+            observer,
+            post,
+        } = ledger;
+        CompletionControlView::new(
+            pending_cancel_cqes,
+            completion_cleanup_hints,
+            metadata.waker_buf_len,
+            metadata.waker_generation,
+            observer,
+            post,
+        )
+    }
+}
+
 impl SqeEnv<'_> {
+    pub(crate) fn from_parts<'d>(
+        file_table: &'d FileTable,
+        chunk_records: &'d [Option<ChunkRegistrationRecord>],
+        registrar: &'d (dyn BufferRegistrar + 'd),
+        provided: Option<ProvidedBufSqeInfo>,
+    ) -> SqeEnv<'d> {
+        SqeEnv {
+            file_table,
+            chunk_records,
+            registrar,
+            provided,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn file_table(&self) -> &FileTable {
+        self.file_table
+    }
+
     /// The buffer group an `IOSQE_BUFFER_SELECT` submission should draw from, together with the
     /// size every buffer in it has.
     #[inline]
@@ -115,7 +302,7 @@ impl SqeEnv<'_> {
         let Some(info) = self.registrar.resolve_chunk_info(chunk) else {
             return false;
         };
-        record.state == ChunkRegistrationState::Registered
+        record.state() == ChunkRegistrationState::Registered
             && info.id == chunk
             && record.matches(chunk, info.ptr.as_ptr(), info.len.get())
     }
@@ -154,21 +341,21 @@ impl<'d> SqeEnv<'d> {
 /// The driver state a completion is allowed to reach.
 ///
 /// Mirrors [`SqeEnv`] on the other end of an operation. The completion path holds a slot
-/// borrowed out of [`UringDriver::ops`] while it builds the record, so it cannot be handed the
+/// borrowed out of the operation registry while it builds the record, so it cannot be handed the
 /// whole driver either — but unlike submission it does need to *mutate* something: a CQE that
 /// carries a buffer id has consumed a ring entry, and that entry has to be settled before the
 /// record leaves this function.
-pub(crate) struct CqeEnv<'d> {
-    provided: Option<&'d mut ProvidedBufGroup>,
-    diagnostics: &'d UringCompletionDiagnostics,
+pub(crate) struct CqeEnv<'provided, 'diagnostics> {
+    provided: Option<ProvidedBufPort<'provided>>,
+    diagnostics: &'diagnostics UringCompletionDiagnostics,
     selected_buffer_settled: bool,
 }
 
-impl<'d> CqeEnv<'d> {
+impl<'provided, 'diagnostics> CqeEnv<'provided, 'diagnostics> {
     #[inline]
     pub(crate) fn new(
-        provided: Option<&'d mut ProvidedBufGroup>,
-        diagnostics: &'d UringCompletionDiagnostics,
+        provided: Option<ProvidedBufPort<'provided>>,
+        diagnostics: &'diagnostics UringCompletionDiagnostics,
     ) -> Self {
         Self {
             provided,
@@ -189,7 +376,7 @@ impl<'d> CqeEnv<'d> {
         res: i32,
     ) -> UringResult<Option<FixedBuf>> {
         let selected = cqueue::buffer_select(flags).is_some();
-        match self.provided.as_deref_mut() {
+        match self.provided.as_mut() {
             Some(group) => {
                 let buffer = group.take_selected(flags, res);
                 if selected {
@@ -218,7 +405,7 @@ impl<'d> CqeEnv<'d> {
         if self.selected_buffer_settled || cqueue::buffer_select(flags).is_none() {
             return;
         }
-        if let Some(group) = self.provided.as_deref_mut() {
+        if let Some(group) = self.provided.as_mut() {
             if group.return_selected(flags) {
                 self.diagnostics.inc_provided_unknown_bid();
             }
@@ -228,9 +415,13 @@ impl<'d> CqeEnv<'d> {
 
     /// Records that the kernel found the ring empty.
     pub(crate) fn note_exhausted(&mut self) {
-        if let Some(group) = self.provided.as_deref_mut() {
+        if let Some(group) = self.provided.as_mut() {
             group.note_exhausted();
         }
+    }
+
+    pub(crate) fn take_provided(&mut self) -> Option<ProvidedBufPort<'provided>> {
+        self.provided.take()
     }
 }
 
@@ -301,7 +492,7 @@ impl<'d> CompletionControlView<'d> {
         self.observer
             .record(ControlPlaneEvent::CancelInFlightRemove {
                 ticket,
-                target: request.target,
+                target: request.target(),
             });
         Some(request)
     }
@@ -341,8 +532,8 @@ impl<'d> CompletionControlView<'d> {
         raw: RawCompletion,
     ) {
         self.append_effect(
-            Some(request.target),
-            Some(request.target.generation()),
+            Some(request.target()),
+            Some(request.target().generation()),
             UringControlEffectKind::CancelReconcile {
                 cancel_ticket,
                 request,
@@ -373,7 +564,9 @@ impl<'d> CompletionControlView<'d> {
         self.append_effect(
             Some(token),
             Some(token.generation()),
-            UringControlEffectKind::CloseUnregister { fd },
+            UringControlEffectKind::CloseUnregister {
+                ticket: OwnedFdOwnershipTicket::new(token, fd),
+            },
         );
     }
 
@@ -468,7 +661,7 @@ impl<'view, 'd> StageTxn<'view, 'd> {
             }
             StagedEntry::Cancel { ticket, target } => {
                 let request = self.cancel_request.expect("cancel stage requires request");
-                debug_assert_eq!(request.target, target);
+                debug_assert_eq!(request.target(), target);
                 let previous = self.control.pending_cancel_cqes.insert(ticket, request);
                 debug_assert!(
                     previous.is_none(),
@@ -548,27 +741,85 @@ impl Drop for StageTxn<'_, '_> {
 pub(crate) struct SubmitResourceView<'d, 'r> {
     submitter: Submitter<'d>,
     file_table: &'d FileTable,
-    registered_chunks_cache: &'d mut BitSet,
-    chunk_records: &'d mut [Option<ChunkRegistrationRecord>],
     registration_diagnostics: &'d UringCompletionDiagnostics,
-    registrar: &'r (dyn BufferRegistrar + 'r),
-    registration_stats: &'d mut UringRegistrationStats,
-    registration_mode: BufferRegistrationMode,
-    fixed_buffers_available: bool,
-    fixed_buffers_failure_errno: Option<i32>,
-    fixed_buffer_registration: Option<&'d ResourceRegistration>,
-    registration_quarantine: &'d mut Option<BufferRegistrationQuarantine>,
-    #[cfg(feature = "test-hooks")]
-    register_buffers_update_outcomes: &'d mut VecDeque<BufferUpdateInjection>,
-    #[cfg(feature = "test-hooks")]
-    bitset_set_failure: &'d mut bool,
-    provided: Option<ProvidedBufSqeInfo>,
+    buffers: FixedBufferSubmitPort<'d, 'r>,
 }
 
 /// The two narrow submission projections kept together for the transaction API.
 pub(crate) struct SubmitEnv<'d, 'r> {
     control: SubmitControlView<'d>,
     resources: SubmitResourceView<'d, 'r>,
+}
+
+impl<'d, 'r> SubmitResourceView<'d, 'r> {
+    pub(crate) fn from_registration_parts(
+        submitter: Submitter<'d>,
+        file_table: &'d FileTable,
+        registration_diagnostics: &'d UringCompletionDiagnostics,
+        buffers: FixedBufferSubmitPort<'d, 'r>,
+    ) -> Self {
+        Self {
+            submitter,
+            file_table,
+            registration_diagnostics,
+            buffers,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn sqe_env(&self) -> SqeEnv<'_> {
+        self.buffers.sqe_env(self.file_table)
+    }
+
+    #[inline]
+    pub(crate) fn ensure_chunk_registered(
+        &mut self,
+        chunk_id: ChunkId,
+        user_data: usize,
+        scope: &'static str,
+    ) -> UringResult<ChunkRegistrationDecision> {
+        self.buffers.ensure_chunk_registered(
+            &self.submitter,
+            self.registration_diagnostics,
+            chunk_id,
+            user_data,
+            scope,
+        )
+    }
+}
+
+pub(crate) struct SubmitParts<'d, 'r> {
+    control: SubmitControlView<'d>,
+    resources: SubmitResourceView<'d, 'r>,
+}
+
+impl<'d, 'r> SubmitParts<'d, 'r> {
+    pub(crate) fn new(
+        control: SubmitControlView<'d>,
+        resources: SubmitResourceView<'d, 'r>,
+    ) -> Self {
+        Self { control, resources }
+    }
+}
+
+pub(crate) struct SubmitEnvironmentFactory;
+
+impl SubmitEnvironmentFactory {
+    pub(crate) fn resource_view<'d, 'r>(
+        submitter: Submitter<'d>,
+        file_table: &'d FileTable,
+        diagnostics: &'d UringCompletionDiagnostics,
+        buffers: FixedBufferSubmitPort<'d, 'r>,
+    ) -> SubmitResourceView<'d, 'r> {
+        SubmitResourceView::from_registration_parts(submitter, file_table, diagnostics, buffers)
+    }
+
+    pub(crate) fn build<'d, 'r>(parts: SubmitParts<'d, 'r>) -> SubmitEnv<'d, 'r> {
+        SubmitEnv {
+            control: parts.control,
+            resources: parts.resources,
+        }
+    }
 }
 
 impl SubmitControlView<'_> {
@@ -616,11 +867,11 @@ impl SubmitControlView<'_> {
                     "cancel SQE is missing its target request",
                 )
             })?;
-            if request.target != target {
+            if request.target() != target {
                 return Err(UringError::InvalidState
                     .report("uring.stage_txn.cancel", "cancel request target mismatch")
                     .with_ctx("entry_target", target.index())
-                    .with_ctx("request_target", request.target.index()));
+                    .with_ctx("request_target", request.target().index()));
             }
             if self.pending_cancel_cqes.len() >= self.cancel_capacity
                 && !self.pending_cancel_cqes.contains_key(&ticket)
@@ -648,11 +899,11 @@ impl SubmitControlView<'_> {
     pub(crate) fn transition_submission_state(
         &mut self,
         token: OpToken,
-        phase: &mut SubmissionPhase,
+        state: &mut UringOpState,
         next: SubmissionPhase,
         reason: &'static str,
     ) {
-        transition_submission_phase(phase, token, next, reason, self.control_observer);
+        state.transition_submission_phase(token, next, reason, self.control_observer);
     }
 
     #[inline]
@@ -711,7 +962,7 @@ impl SubmitControlView<'_> {
             self,
             StagedEntry::Cancel {
                 ticket,
-                target: request.target,
+                target: request.target(),
             },
             None,
             Some(request),
@@ -729,12 +980,12 @@ impl SubmitEnv<'_, '_> {
     pub(crate) fn transition_submission_state(
         &mut self,
         token: OpToken,
-        phase: &mut SubmissionPhase,
+        state: &mut UringOpState,
         next: SubmissionPhase,
         reason: &'static str,
     ) {
         self.control
-            .transition_submission_state(token, phase, next, reason);
+            .transition_submission_state(token, state, next, reason);
     }
 
     #[inline]
@@ -796,679 +1047,6 @@ impl SubmitEnv<'_, '_> {
         self.resources
             .ensure_chunk_registered(chunk_id, user_data, scope)
     }
-
-    #[inline]
-    pub(crate) fn register_buffer_backend(
-        &mut self,
-        id: ChunkId,
-        ptr: *const u8,
-        len: usize,
-    ) -> UringResult<BufferRegistrationStatus> {
-        self.resources.register_buffer_backend(id, ptr, len)
-    }
-}
-
-impl SubmitResourceView<'_, '_> {
-    /// Narrows this view down to what a `make_sqe` implementation may see.
-    #[inline]
-    pub(crate) fn sqe_env(&self) -> SqeEnv<'_> {
-        SqeEnv {
-            file_table: self.file_table,
-            chunk_records: self.chunk_records,
-            registrar: self.registrar,
-            provided: self.provided,
-        }
-    }
-
-    /// Registers `[ptr, ptr + len)` as the kernel's fixed buffer number `id`.
-    pub(crate) fn register_buffer_backend(
-        &mut self,
-        id: ChunkId,
-        ptr: *const u8,
-        len: usize,
-    ) -> UringResult<BufferRegistrationStatus> {
-        let scope = "driver.register_buffer_internal";
-        let index = self.prepare_chunk_registration(id, ptr, len, scope)?;
-        self.ensure_registration_healthy(scope, id, None)?;
-
-        if let Some(record) = self.chunk_records[index]
-            && record.state == ChunkRegistrationState::Registered
-        {
-            if record.matches(id, ptr, len) {
-                debug_assert!(self.cache_is_registered(index));
-                return Ok(BufferRegistrationStatus::Registered);
-            }
-            return self.identity_mismatch_status(id, ptr, len, scope, None, record);
-        }
-
-        if !self.fixed_buffers_available {
-            self.set_chunk_record(id, ptr, len, ChunkRegistrationState::Fallback);
-            if self.registration_mode.is_strict() {
-                return Err(self.fixed_buffers_unavailable_report(scope, id, None));
-            }
-            return self.registration_unavailable(
-                id,
-                self.fixed_buffers_failure_errno,
-                "sparse fixed-buffer registration unavailable",
-            );
-        }
-
-        if let Some(last_fail) = self.chunk_records[index].and_then(|record| record.last_failure) {
-            if last_fail.elapsed() < REGISTER_FAILURE_RETRY_COOLDOWN {
-                self.registration_stats
-                    .chunk_register_skipped_recent_failure = self
-                    .registration_stats
-                    .chunk_register_skipped_recent_failure
-                    .saturating_add(1);
-                self.set_chunk_record(id, ptr, len, ChunkRegistrationState::Fallback);
-                if self.registration_mode.is_strict() {
-                    return UringError::Registration
-                        .push_ctx("scope", scope)
-                        .with_ctx("chunk_id", id.raw())
-                        .attach_note("recent chunk registration failure cooldown");
-                }
-                return self.registration_unavailable(
-                    id,
-                    None,
-                    "recent chunk registration failure cooldown",
-                );
-            }
-            self.clear_chunk_failure(index);
-        }
-
-        let iovecs = [libc::iovec {
-            iov_base: ptr as *mut _,
-            iov_len: len,
-        }];
-        self.set_chunk_record(id, ptr, len, ChunkRegistrationState::Registering);
-        self.registration_stats.chunk_register_attempts = self
-            .registration_stats
-            .chunk_register_attempts
-            .saturating_add(1);
-        let register = self.issue_chunk_update(index as u32, &iovecs);
-
-        match register.outcome {
-            KernelUpdateOutcome::Applied(updated) if updated == register.requested => {
-                if let Err(set_report) = self.commit_chunk_registration(index, id, ptr, len) {
-                    return self.recover_failed_commit(id, ptr, len, set_report);
-                }
-                self.registration_stats.chunk_register_success = self
-                    .registration_stats
-                    .chunk_register_success
-                    .saturating_add(1);
-                debug_assert!(self.chunk_ledger_is_consistent());
-                Ok(BufferRegistrationStatus::Registered)
-            }
-            #[cfg(feature = "test-hooks")]
-            KernelUpdateOutcome::Rejected(errno) => {
-                self.note_chunk_registration_failure(id, ptr, len);
-                let report = self.chunk_update_report(
-                    "driver.register_buffer_internal.register_buffers_update",
-                    register,
-                    "fixed-buffer registration was rejected before reaching the kernel",
-                );
-                if self.registration_mode.is_strict() {
-                    Err(report)
-                } else {
-                    self.registration_unavailable(
-                        id,
-                        Some(errno),
-                        "fixed-buffer registration was explicitly rejected",
-                    )
-                }
-            }
-            KernelUpdateOutcome::Unknown(_, _) => {
-                self.registration_stats.chunk_register_failures = self
-                    .registration_stats
-                    .chunk_register_failures
-                    .saturating_add(1);
-                self.quarantine_chunk(id, ptr, len, register, None);
-                Err(self.chunk_update_report(
-                    "driver.register_buffer_internal.register_buffers_update",
-                    register,
-                    "fixed-buffer registration result is unknown; ring is quarantined",
-                ))
-            }
-            KernelUpdateOutcome::Applied(_) => {
-                self.registration_stats.chunk_register_failures = self
-                    .registration_stats
-                    .chunk_register_failures
-                    .saturating_add(1);
-                self.quarantine_chunk(id, ptr, len, register, None);
-                Err(self.chunk_update_report(
-                    "driver.register_buffer_internal.register_buffers_update",
-                    register,
-                    "fixed-buffer registration applied an unexpected update count",
-                ))
-            }
-        }
-    }
-
-    fn prepare_chunk_registration(
-        &self,
-        id: ChunkId,
-        ptr: *const u8,
-        len: usize,
-        scope: &'static str,
-    ) -> UringResult<usize> {
-        let index = id.as_usize();
-        if index >= MAX_CHUNKS {
-            return UringError::InvalidInput
-                .push_ctx("scope", scope)
-                .with_ctx("chunk_id", index)
-                .with_ctx("max_chunks", MAX_CHUNKS)
-                .attach_note("chunk id exceeds maximum registered chunk count");
-        }
-
-        if ptr.is_null() || len == 0 {
-            return UringError::InvalidInput
-                .push_ctx("scope", scope)
-                .with_ctx("chunk_id", index)
-                .with_ctx("buffer_len", len)
-                .attach_note("fixed-buffer registration requires a non-null pointer and length");
-        }
-        Ok(index)
-    }
-
-    fn set_chunk_record(
-        &mut self,
-        id: ChunkId,
-        ptr: *const u8,
-        len: usize,
-        state: ChunkRegistrationState,
-    ) {
-        let last_failure = (state == ChunkRegistrationState::Fallback)
-            .then(|| self.chunk_records[id.as_usize()].and_then(|record| record.last_failure))
-            .flatten();
-        self.chunk_records[id.as_usize()] =
-            Some(ChunkRegistrationRecord::new(id, ptr, len, state).with_last_failure(last_failure));
-    }
-
-    fn clear_chunk_failure(&mut self, index: usize) {
-        if let Some(record) = self.chunk_records[index].as_mut() {
-            record.last_failure = None;
-        }
-    }
-
-    #[cfg(feature = "test-hooks")]
-    fn note_chunk_registration_failure(&mut self, id: ChunkId, ptr: *const u8, len: usize) {
-        self.registration_stats.chunk_register_failures = self
-            .registration_stats
-            .chunk_register_failures
-            .saturating_add(1);
-        self.set_chunk_record(id, ptr, len, ChunkRegistrationState::Fallback);
-        if let Some(record) = self.chunk_records[id.as_usize()].as_mut() {
-            record.last_failure = Some(Instant::now());
-        }
-    }
-
-    fn cache_is_registered(&self, index: usize) -> bool {
-        self.registered_chunks_cache.get(index).unwrap_or(false)
-    }
-
-    #[inline]
-    fn is_record_registered(&self, id: ChunkId) -> bool {
-        let index = id.as_usize();
-        self.chunk_records
-            .get(index)
-            .and_then(Option::as_ref)
-            .is_some_and(|record| record.state == ChunkRegistrationState::Registered)
-    }
-
-    fn commit_chunk_registration(
-        &mut self,
-        index: usize,
-        id: ChunkId,
-        ptr: *const u8,
-        len: usize,
-    ) -> UringResult<()> {
-        // The record is authoritative. The bitset is updated afterwards and is only a derived
-        // cache used to diagnose an incomplete commit.
-        self.set_chunk_record(id, ptr, len, ChunkRegistrationState::Registered);
-        self.mark_registered_cache(index)
-    }
-
-    fn recover_failed_commit(
-        &mut self,
-        id: ChunkId,
-        ptr: *const u8,
-        len: usize,
-        set_report: Report<UringError>,
-    ) -> UringResult<BufferRegistrationStatus> {
-        let index = id.as_usize();
-        let zero_iovec = [libc::iovec {
-            iov_base: ptr::null_mut(),
-            iov_len: 0,
-        }];
-        let cleanup = self.issue_chunk_update(index as u32, &zero_iovec);
-        match cleanup.outcome {
-            KernelUpdateOutcome::Applied(updated) if updated == cleanup.requested => {
-                self.set_chunk_record(id, ptr, len, ChunkRegistrationState::Fallback);
-                self.clear_registered_cache(index)?;
-                if self.registration_mode.is_strict() {
-                    Err(set_report.attach_note(
-                        "fixed-buffer registration was cleared after ledger cache update failed",
-                    ))
-                } else {
-                    self.registration_unavailable(
-                        id,
-                        None,
-                        "fixed-buffer ledger commit failed; using raw buffer I/O",
-                    )
-                }
-            }
-            _ => {
-                self.quarantine_chunk(
-                    id,
-                    ptr,
-                    len,
-                    UpdateEvidence {
-                        requested: 1,
-                        outcome: KernelUpdateOutcome::Applied(1),
-                    },
-                    Some(cleanup),
-                );
-                let report = set_report
-                    .with_ctx("cleanup_evidence", format!("{:?}", cleanup.outcome))
-                    .attach_note(
-                        "fixed-buffer cleanup result is not fully applied; registry is quarantined",
-                    );
-                Err(report)
-            }
-        }
-    }
-
-    fn fixed_identity_mismatch_report(
-        &self,
-        id: ChunkId,
-        ptr: *const u8,
-        len: usize,
-        scope: &'static str,
-        user_data: Option<usize>,
-        record: ChunkRegistrationRecord,
-    ) -> Report<UringError> {
-        let report = UringError::InvalidState
-            .to_report()
-            .push_ctx("scope", scope)
-            .with_ctx("chunk_id", id.raw())
-            .with_ctx("buffer_ptr", ptr as usize)
-            .with_ctx("buffer_len", len)
-            .with_ctx("registered_ptr", record.ptr)
-            .with_ctx("registered_len", record.len)
-            .attach_note("fixed-buffer ledger identity does not match the registered kernel entry");
-        if let Some(user_data) = user_data {
-            report.with_ctx("user_data", user_data)
-        } else {
-            report
-        }
-    }
-
-    fn identity_mismatch_status(
-        &mut self,
-        id: ChunkId,
-        ptr: *const u8,
-        len: usize,
-        scope: &'static str,
-        user_data: Option<usize>,
-        record: ChunkRegistrationRecord,
-    ) -> UringResult<BufferRegistrationStatus> {
-        self.registration_diagnostics
-            .inc_fixed_chunk_identity_mismatch();
-        let report = self.fixed_identity_mismatch_report(id, ptr, len, scope, user_data, record);
-        if self.registration_mode.is_strict() {
-            Err(report)
-        } else {
-            self.registration_unavailable(
-                id,
-                None,
-                "fixed-buffer identity mismatch; using raw buffer I/O",
-            )
-        }
-    }
-
-    fn chunk_ledger_is_consistent(&self) -> bool {
-        (0..MAX_CHUNKS).all(|index| {
-            let registered = self.registered_chunks_cache.get(index).unwrap_or(false);
-            let ledger_registered = self.chunk_records[index]
-                .is_some_and(|record| record.state == ChunkRegistrationState::Registered);
-            registered == ledger_registered
-        })
-    }
-
-    /// Registers `chunk_id` on demand so the kernel can reach the buffer this SQE points at.
-    ///
-    /// Runs after `make_sqe`, which means the very first submission touching a chunk uses the
-    /// non-fixed opcode and only later ones get `ReadFixed`/`WriteFixed`.
-    pub(crate) fn ensure_chunk_registered(
-        &mut self,
-        chunk_id: ChunkId,
-        user_data: usize,
-        scope: &'static str,
-    ) -> UringResult<ChunkRegistrationDecision> {
-        let index = chunk_id.as_usize();
-        if index >= MAX_CHUNKS {
-            return UringError::InvalidInput
-                .push_ctx("scope", scope)
-                .with_ctx("chunk_id", index)
-                .with_ctx("max_chunks", MAX_CHUNKS)
-                .with_ctx("user_data", user_data)
-                .attach_note("chunk id exceeds maximum registered chunk count");
-        }
-        self.ensure_registration_healthy(scope, chunk_id, Some(user_data))?;
-        let record = self.chunk_records[index];
-        let Some(info) = self.registrar.resolve_chunk_info(chunk_id) else {
-            self.registration_stats.submission_missing_chunk_info = self
-                .registration_stats
-                .submission_missing_chunk_info
-                .saturating_add(1);
-            if record.is_some_and(|record| record.state == ChunkRegistrationState::Registered)
-                || self.registration_mode.is_strict()
-            {
-                return UringError::InvalidState
-                    .push_ctx("scope", scope)
-                    .with_ctx("chunk_id", chunk_id.raw())
-                    .with_ctx("user_data", user_data)
-                    .attach_note("fixed-buffer identity cannot be verified without chunk info");
-            }
-            return Ok(self.raw_fallback(
-                chunk_id,
-                user_data,
-                None,
-                "missing chunk info for lazy registration",
-            ));
-        };
-
-        if info.id != chunk_id {
-            return UringError::InvalidState
-                .push_ctx("scope", scope)
-                .with_ctx("chunk_id", chunk_id.raw())
-                .with_ctx("resolved_chunk_id", info.id.raw())
-                .with_ctx("user_data", user_data)
-                .attach_note("chunk registrar returned mismatched chunk info");
-        }
-
-        if let Some(record) = record
-            && record.state == ChunkRegistrationState::Registered
-        {
-            if record.matches(info.id, info.ptr.as_ptr(), info.len.get()) {
-                return Ok(ChunkRegistrationDecision::Fixed);
-            }
-            return match self.identity_mismatch_status(
-                chunk_id,
-                info.ptr.as_ptr(),
-                info.len.get(),
-                scope,
-                Some(user_data),
-                record,
-            )? {
-                BufferRegistrationStatus::Registered => Ok(ChunkRegistrationDecision::Fixed),
-                BufferRegistrationStatus::Unavailable => Ok(self.raw_fallback(
-                    chunk_id,
-                    user_data,
-                    None,
-                    "fixed-buffer identity mismatch",
-                )),
-            };
-        }
-
-        if !self.fixed_buffers_available {
-            if self.registration_mode.is_strict() {
-                return Err(self.fixed_buffers_unavailable_report(
-                    scope,
-                    chunk_id,
-                    Some(user_data),
-                ));
-            }
-            return Ok(self.raw_fallback(
-                chunk_id,
-                user_data,
-                self.fixed_buffers_failure_errno,
-                "sparse fixed-buffer registration unavailable",
-            ));
-        }
-
-        // Resolving a missing local snapshot may have drained the worker's chunk message queue;
-        // the backend may have registered the chunk through another path in the meantime.
-        if self.is_record_registered(info.id) {
-            return Ok(ChunkRegistrationDecision::Fixed);
-        }
-
-        match self.register_buffer_backend(info.id, info.ptr.as_ptr(), info.len.get())? {
-            BufferRegistrationStatus::Registered => Ok(ChunkRegistrationDecision::Fixed),
-            BufferRegistrationStatus::Unavailable => Ok(self.raw_fallback(
-                chunk_id,
-                user_data,
-                self.fixed_buffers_failure_errno,
-                "chunk fixed-buffer registration unavailable",
-            )),
-        }
-    }
-
-    fn registration_unavailable(
-        &mut self,
-        chunk_id: ChunkId,
-        errno: Option<i32>,
-        reason: &'static str,
-    ) -> UringResult<BufferRegistrationStatus> {
-        debug!(
-            chunk_id = chunk_id.raw(),
-            errno = ?errno,
-            registration_mode = self.registration_mode.as_str(),
-            fallback = true,
-            reason,
-            "fixed-buffer registration unavailable; using raw buffer I/O"
-        );
-        Ok(BufferRegistrationStatus::Unavailable)
-    }
-
-    fn fixed_buffers_unavailable_report(
-        &self,
-        scope: &'static str,
-        chunk_id: ChunkId,
-        user_data: Option<usize>,
-    ) -> Report<UringError> {
-        let report = UringError::Registration
-            .to_report()
-            .push_ctx("scope", scope)
-            .with_ctx("chunk_id", chunk_id.raw())
-            .with_ctx("registration_mode", self.registration_mode.as_str())
-            .with_ctx("fallback", false)
-            .attach_note("sparse fixed-buffer registration is unavailable");
-        let report = if let Some(user_data) = user_data {
-            report.with_ctx("user_data", user_data)
-        } else {
-            report
-        };
-        if let Some(errno) = self.fixed_buffers_failure_errno {
-            report.with_ctx("errno", errno)
-        } else {
-            report
-        }
-    }
-
-    fn raw_fallback(
-        &mut self,
-        chunk_id: ChunkId,
-        user_data: usize,
-        errno: Option<i32>,
-        reason: &'static str,
-    ) -> ChunkRegistrationDecision {
-        self.registration_stats.raw_buffer_fallbacks = self
-            .registration_stats
-            .raw_buffer_fallbacks
-            .saturating_add(1);
-        debug!(
-            chunk_id = chunk_id.raw(),
-            user_data,
-            errno = ?errno,
-            registration_mode = self.registration_mode.as_str(),
-            fallback = true,
-            reason,
-            "using raw buffer I/O"
-        );
-        ChunkRegistrationDecision::RawFallback
-    }
-
-    fn issue_chunk_update(&mut self, index: u32, iovecs: &[libc::iovec]) -> UpdateEvidence {
-        #[cfg(feature = "test-hooks")]
-        if let Some(injection) = self.register_buffers_update_outcomes.pop_front() {
-            let outcome = match injection {
-                BufferUpdateInjection::Applied => KernelUpdateOutcome::Applied(iovecs.len()),
-                BufferUpdateInjection::Rejected(errno) => KernelUpdateOutcome::Rejected(errno),
-                BufferUpdateInjection::Unknown(errno) => {
-                    KernelUpdateOutcome::Unknown(Some(errno), "test-injected unknown buffer update")
-                }
-            };
-            return UpdateEvidence {
-                requested: iovecs.len(),
-                outcome,
-            };
-        }
-
-        let Some(registration) = self.fixed_buffer_registration else {
-            return UpdateEvidence {
-                requested: iovecs.len(),
-                outcome: KernelUpdateOutcome::Unknown(
-                    None,
-                    "fixed-buffer registration token is missing",
-                ),
-            };
-        };
-
-        // SAFETY: `iovecs` points at live chunk memory for the duration of this syscall, and the
-        // caller retains ownership of that memory until every in-flight operation completes.
-        let outcome = match unsafe {
-            self.submitter
-                .register_buffers_update(registration, index, iovecs)
-        } {
-            Ok(updated) => KernelUpdateOutcome::Applied(updated),
-            Err(error) => KernelUpdateOutcome::Unknown(
-                error.raw_os_error(),
-                "kernel fixed-buffer update returned an error",
-            ),
-        };
-        UpdateEvidence {
-            requested: iovecs.len(),
-            outcome,
-        }
-    }
-
-    fn chunk_update_report(
-        &self,
-        scope: &'static str,
-        evidence: UpdateEvidence,
-        note: &'static str,
-    ) -> Report<UringError> {
-        let report = UringError::Registration
-            .to_report()
-            .push_ctx("scope", scope)
-            .with_ctx("requested_buffers", evidence.requested)
-            .with_ctx("update_evidence", format!("{:?}", evidence.outcome))
-            .attach_note(note);
-        match evidence.outcome {
-            KernelUpdateOutcome::Applied(_) => report,
-            #[cfg(feature = "test-hooks")]
-            KernelUpdateOutcome::Rejected(errno) => report.with_ctx("errno", errno),
-            KernelUpdateOutcome::Unknown(errno, _) => {
-                if let Some(errno) = errno {
-                    report.with_ctx("errno", errno)
-                } else {
-                    report
-                }
-            }
-        }
-    }
-
-    fn quarantine_chunk(
-        &mut self,
-        id: ChunkId,
-        ptr: *const u8,
-        len: usize,
-        register: UpdateEvidence,
-        cleanup: Option<UpdateEvidence>,
-    ) {
-        if let Some(quarantine) = self.registration_quarantine.as_mut() {
-            quarantine.note_anomaly();
-        } else {
-            *self.registration_quarantine = Some(BufferRegistrationQuarantine::new(
-                id,
-                register,
-                cleanup,
-                "driver.register_buffer_internal",
-            ));
-        }
-        self.set_chunk_record(id, ptr, len, ChunkRegistrationState::Quarantined);
-    }
-
-    fn clear_registered_cache(&mut self, index: usize) -> UringResult<()> {
-        self.registered_chunks_cache.clear(index).map_err(|error| {
-            UringError::InvalidState
-                .to_report()
-                .push_ctx("scope", "driver.register_buffer_internal.bitset_clear")
-                .with_ctx("chunk_index", index)
-                .with_ctx("bitset_error", format!("{error:?}"))
-                .attach_note("failed to clear derived fixed-buffer registration cache")
-        })
-    }
-
-    fn mark_registered_cache(&mut self, index: usize) -> UringResult<()> {
-        #[cfg(feature = "test-hooks")]
-        if *self.bitset_set_failure {
-            *self.bitset_set_failure = false;
-            return UringError::InvalidState
-                .push_ctx("scope", "driver.register_buffer_internal.bitset_set")
-                .with_ctx("chunk_index", index)
-                .attach_note("injected registered chunk bitset failure");
-        }
-
-        self.registered_chunks_cache.set(index).map_err(|e| {
-            UringError::InvalidState
-                .to_report()
-                .push_ctx("scope", "driver.register_buffer_internal.bitset_set")
-                .with_ctx("chunk_index", index)
-                .with_ctx("bitset_error", format!("{e:?}"))
-                .attach_note("BitSet set failed after kernel registration")
-        })
-    }
-
-    fn ensure_registration_healthy(
-        &self,
-        scope: &'static str,
-        chunk_id: ChunkId,
-        user_data: Option<usize>,
-    ) -> UringResult<()> {
-        let Some(quarantine) = self.registration_quarantine.as_ref() else {
-            return Ok(());
-        };
-
-        let mut report = UringError::InvalidState
-            .to_report()
-            .push_ctx("scope", scope)
-            .with_ctx("chunk_id", chunk_id.raw())
-            .with_ctx("quarantine_chunk_id", quarantine.chunk_id.raw())
-            .with_ctx("quarantine_scope", quarantine.scope)
-            .with_ctx("quarantine_anomalies", quarantine.anomaly_count)
-            .with_ctx(
-                "registration_evidence",
-                format!("{:?}", quarantine.register_outcome),
-            )
-            .with_ctx(
-                "cleanup_evidence",
-                format!("{:?}", quarantine.cleanup_outcome),
-            )
-            .attach_note("fixed-buffer registry is quarantined and requires ring rebuild");
-        if let Some(errno) = quarantine.register_errno {
-            report = report.with_ctx("registration_errno", errno);
-        }
-        if let Some(errno) = quarantine.cleanup_errno {
-            report = report.with_ctx("cleanup_errno", errno);
-        }
-        if let Some(user_data) = user_data {
-            Err(report.with_ctx("user_data", user_data))
-        } else {
-            Err(report)
-        }
-    }
 }
 
 impl UringControlPlane {
@@ -1477,71 +1055,11 @@ impl UringControlPlane {
         &'d mut self,
         submission_queue: SubmissionQueue<'d>,
     ) -> SubmitControlView<'d> {
-        let cancel_capacity = self.cancellations.capacity();
-        let pending_cancel_cqes = self.cancellations.in_flight_mut();
-        SubmitControlView {
-            submission_queue,
-            staged_entries: &mut self.staged_entries,
-            timers: &mut self.timers,
-            control_observer: &mut self.observer,
-            completion_cleanup_hints: &mut self.completion_cleanup_hints,
-            completion_cleanup_capacity: self.completion_cleanup_capacity,
-            pending_cancel_cqes,
-            cancel_capacity,
-            #[cfg(feature = "test-hooks")]
-            push_entry_failure: &mut self.push_entry_failure,
-        }
+        self.submission_parts().into_view(submission_queue)
     }
 
     /// Projects only completion-owned control state.
     pub(crate) fn with_completion_view(&mut self) -> CompletionControlView<'_> {
-        let waker_view = self.waker.hooks_view();
-        CompletionControlView::new(
-            self.cancellations.in_flight_mut(),
-            &mut self.completion_cleanup_hints,
-            waker_view.buf_len,
-            waker_view.generation,
-            &mut self.observer,
-            &mut self.post,
-        )
-    }
-}
-
-impl<'a> UringDriver<'a> {
-    /// Splits off the op registry from the rest of the driver so a slot borrow and the ring
-    /// can be held at the same time. Both halves are plain field projections, so the compiler
-    /// — not a raw pointer — is what guarantees they do not alias.
-    pub(crate) fn split_for_submit(&mut self) -> (&mut UringOpRegistry, SubmitEnv<'_, 'a>) {
-        let view = self.buffer_registry.split_for_submit();
-        let (submitter, submission_queue, completion_queue) = self.ring.split();
-        drop(completion_queue);
-        let control = self.control.with_submit_view(submission_queue);
-        let resources = SubmitResourceView {
-            submitter,
-            file_table: &self.file_table,
-            registered_chunks_cache: view.registered_chunks_cache,
-            chunk_records: view.chunk_records,
-            registration_diagnostics: self.completion_diagnostics.backend(),
-            registrar: view.registrar,
-            registration_stats: view.registration_stats,
-            registration_mode: view.registration_mode,
-            fixed_buffers_available: view.fixed_buffers_available,
-            fixed_buffers_failure_errno: view.fixed_buffers_failure_errno,
-            fixed_buffer_registration: view.fixed_buffer_registration,
-            registration_quarantine: view.registration_quarantine,
-            #[cfg(feature = "test-hooks")]
-            register_buffers_update_outcomes: view.register_buffers_update_outcomes,
-            #[cfg(feature = "test-hooks")]
-            bitset_set_failure: view.bitset_set_failure,
-            provided: view.provided,
-        };
-
-        (&mut self.ops, SubmitEnv { control, resources })
-    }
-
-    /// The submission half of [`Self::split_for_submit`], for callers that hold no slot.
-    #[inline]
-    pub(crate) fn submit_env(&mut self) -> SubmitEnv<'_, 'a> {
-        self.split_for_submit().1
+        self.completion_parts().into_view()
     }
 }

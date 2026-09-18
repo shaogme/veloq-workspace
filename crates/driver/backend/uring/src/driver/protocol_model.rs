@@ -1,19 +1,109 @@
-#![allow(dead_code)]
-
 use veloq_driver_core::{
     driver::{CancelMode, CancelTicket, OpToken},
     slot::Generation,
 };
 use veloq_std::{vec, vec::Vec};
 
-/// 提交边界的协议回执。长度只描述 SQE 已写入用户态 SQ 的数量，不能代替内核消费回执。
+/// 提交边界的协议回执。每种回执都携带完整的消费证据。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmissionScope {
+    Enter,
+    ExtendedWait,
+    SqPoll,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubmissionReceipt {
-    NoEntries,
-    Consumed { requested: usize, consumed: usize },
-    PublishedToSqpoll { published: usize },
-    Rejected { error: SubmissionError },
-    Unknown { error: SubmissionError },
+    NoEntries {
+        requested: usize,
+        published: usize,
+        consumed: usize,
+        scope: SubmissionScope,
+    },
+    ConsumedPrefix {
+        requested: usize,
+        published: usize,
+        consumed: usize,
+        scope: SubmissionScope,
+    },
+    PublishedToSqPoll {
+        requested: usize,
+        published: usize,
+        consumed: usize,
+        scope: SubmissionScope,
+    },
+    Rejected {
+        requested: usize,
+        published: usize,
+        consumed: usize,
+        scope: SubmissionScope,
+        error: SubmissionError,
+    },
+    Unknown {
+        requested: usize,
+        published: usize,
+        consumed: usize,
+        scope: SubmissionScope,
+        error: SubmissionError,
+    },
+}
+
+impl SubmissionReceipt {
+    fn no_entries(requested: usize) -> Self {
+        Self::NoEntries {
+            requested,
+            published: requested,
+            consumed: 0,
+            scope: SubmissionScope::Enter,
+        }
+    }
+
+    fn no_entries_wait(requested: usize) -> Self {
+        Self::NoEntries {
+            requested,
+            published: requested,
+            consumed: 0,
+            scope: SubmissionScope::ExtendedWait,
+        }
+    }
+
+    fn consumed(requested: usize, consumed: usize) -> Self {
+        Self::ConsumedPrefix {
+            requested,
+            published: requested,
+            consumed,
+            scope: SubmissionScope::Enter,
+        }
+    }
+
+    fn published(requested: usize, published: usize) -> Self {
+        Self::PublishedToSqPoll {
+            requested,
+            published,
+            consumed: 0,
+            scope: SubmissionScope::SqPoll,
+        }
+    }
+
+    fn rejected(requested: usize, error: SubmissionError) -> Self {
+        Self::Rejected {
+            requested,
+            published: requested,
+            consumed: 0,
+            scope: SubmissionScope::Enter,
+            error,
+        }
+    }
+
+    fn unknown(requested: usize, error: SubmissionError) -> Self {
+        Self::Unknown {
+            requested,
+            published: requested,
+            consumed: 0,
+            scope: SubmissionScope::Enter,
+            error,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,30 +213,61 @@ impl StagedLedger {
 
     fn apply_receipt(&mut self, receipt: SubmissionReceipt) -> Result<(), LedgerError> {
         match receipt {
-            SubmissionReceipt::NoEntries
-            | SubmissionReceipt::Rejected {
-                error: SubmissionError::KernelRejected,
-            } => Ok(()),
-            SubmissionReceipt::Consumed {
+            SubmissionReceipt::NoEntries {
                 requested,
+                published,
                 consumed,
+                ..
+            } if published <= requested && consumed == 0 => Ok(()),
+            SubmissionReceipt::Rejected {
+                requested,
+                published,
+                consumed,
+                ..
             } => {
-                if consumed > requested {
+                if published <= requested && consumed == 0 {
+                    Ok(())
+                } else {
+                    Err(LedgerError::InvalidReceipt)
+                }
+            }
+            SubmissionReceipt::ConsumedPrefix {
+                requested,
+                published,
+                consumed,
+                ..
+            } => {
+                if published > requested || consumed > published {
                     return Err(LedgerError::InvalidReceipt);
                 }
                 self.apply_prefix(requested, consumed, StagePhase::KernelOutstanding)
             }
-            SubmissionReceipt::PublishedToSqpoll { published } => {
+            SubmissionReceipt::PublishedToSqPoll {
+                requested,
+                published,
+                consumed,
+                ..
+            } => {
+                if published > requested || consumed != 0 {
+                    return Err(LedgerError::InvalidReceipt);
+                }
                 self.apply_prefix(published, published, StagePhase::Published)
             }
-            SubmissionReceipt::Rejected { .. } => Ok(()),
-            SubmissionReceipt::Unknown { .. } => {
+            SubmissionReceipt::Unknown {
+                requested,
+                published,
+                consumed,
+                ..
+            } if published <= requested && consumed == 0 => {
                 for record in &mut self.records {
                     if record.phase == StagePhase::Staged {
                         record.phase = StagePhase::Quarantined;
                     }
                 }
                 Ok(())
+            }
+            SubmissionReceipt::NoEntries { .. } | SubmissionReceipt::Unknown { .. } => {
+                Err(LedgerError::InvalidReceipt)
             }
         }
     }
@@ -540,10 +661,7 @@ mod tests {
             .expect("stage batch");
 
         ledger
-            .apply_receipt(SubmissionReceipt::Consumed {
-                requested: 3,
-                consumed: 2,
-            })
+            .apply_receipt(SubmissionReceipt::consumed(3, 2))
             .expect("partial receipt");
 
         assert_eq!(ledger.phase_of(first), Some(StagePhase::KernelOutstanding));
@@ -558,12 +676,16 @@ mod tests {
         let second = token(1, 1);
         ledger.stage(user(0, 1)).expect("stage first");
         ledger
-            .apply_receipt(SubmissionReceipt::NoEntries)
+            .apply_receipt(SubmissionReceipt::no_entries(1))
             .expect("zero receipt");
         ledger
-            .apply_receipt(SubmissionReceipt::Rejected {
-                error: SubmissionError::KernelRejected,
-            })
+            .apply_receipt(SubmissionReceipt::no_entries_wait(1))
+            .expect("timed wait receipt");
+        ledger
+            .apply_receipt(SubmissionReceipt::rejected(
+                1,
+                SubmissionError::KernelRejected,
+            ))
             .expect("rejected receipt");
         assert_eq!(ledger.phase_of(first), Some(StagePhase::Staged));
 
@@ -578,9 +700,10 @@ mod tests {
         ledger.stage(user(0, 1)).expect("stage first");
 
         ledger
-            .apply_receipt(SubmissionReceipt::Unknown {
-                error: SubmissionError::ReceiptUnavailable,
-            })
+            .apply_receipt(SubmissionReceipt::unknown(
+                1,
+                SubmissionError::ReceiptUnavailable,
+            ))
             .expect("unknown receipt");
 
         assert_eq!(ledger.phase_of(first), Some(StagePhase::Quarantined));
@@ -598,7 +721,7 @@ mod tests {
         ledger.stage(user(0, 1)).expect("stage first");
 
         ledger
-            .apply_receipt(SubmissionReceipt::PublishedToSqpoll { published: 1 })
+            .apply_receipt(SubmissionReceipt::published(1, 1))
             .expect("published receipt");
 
         assert_eq!(ledger.phase_of(first), Some(StagePhase::Published));
@@ -623,6 +746,24 @@ mod tests {
             Err(LedgerError::DuplicateToken(first))
         );
         assert_eq!(duplicate_ledger.snapshot().len(), 1);
+    }
+
+    #[test]
+    fn staged_control_entries_share_the_same_receipt_boundary() {
+        let target = token(0, 1);
+        let ticket = CancelTicket::try_new(1).expect("cancel ticket");
+        let mut ledger = StagedLedger::new(2);
+
+        ledger
+            .stage_batch(&[
+                StageEntry::Cancel { ticket, target },
+                StageEntry::Waker { generation: 1 },
+            ])
+            .expect("control entries should stage atomically");
+        ledger
+            .apply_receipt(SubmissionReceipt::consumed(2, 2))
+            .expect("control receipt");
+        assert_eq!(ledger.snapshot().len(), 2);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Bookkeeping for the descriptors a [`UringDriver`](crate::driver::UringDriver) hands out.
+//! Bookkeeping for the descriptors the backend hands out.
 //!
 //! The kernel's registered file table is a fixed-size allocation sized by
 //! [`UringConfig::file_table_capacity`](crate::config::UringConfig::file_table_capacity). This
@@ -22,7 +22,7 @@ use crate::{
 };
 use diagweave::prelude::*;
 use tracing::warn;
-use veloq_driver_core::{DirectOwnerId, RawHandleMeta};
+use veloq_driver_core::{DirectOwnerId, RawHandleMeta, driver::OpToken};
 use veloq_std::{collections::HashMap, format, mem, string::ToString, vec, vec::Vec};
 
 const INITIAL_FILE_GENERATION: u64 = 1;
@@ -34,6 +34,31 @@ pub(crate) enum SqeFd {
     Fixed(u32),
     /// A raw descriptor, submitted without the registered-file fast path.
     Direct(i32),
+}
+
+/// Generation-safe proof that a completed `Close` may consume one backend-owned descriptor.
+///
+/// The operation token prevents a late completion from being reused with another close, while
+/// the embedded `IoFd` keeps fixed-slot generation or direct-owner identity attached to the same
+/// effect. Executors must pass this ticket through unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OwnedFdOwnershipTicket {
+    operation: OpToken,
+    fd: IoFd,
+}
+
+impl OwnedFdOwnershipTicket {
+    pub(crate) const fn new(operation: OpToken, fd: IoFd) -> Self {
+        Self { operation, fd }
+    }
+
+    pub(crate) const fn operation(self) -> OpToken {
+        self.operation
+    }
+
+    pub(crate) const fn fd(self) -> IoFd {
+        self.fd
+    }
 }
 
 #[derive(Debug)]
@@ -76,11 +101,53 @@ enum FileSlotState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FileTablePoisonContext {
-    pub(crate) scope: &'static str,
-    pub(crate) failed_index: Option<u32>,
-    pub(crate) start_index: u32,
-    pub(crate) requested_files: usize,
-    pub(crate) updated_files: Option<usize>,
+    scope: &'static str,
+    failed_index: Option<u32>,
+    start_index: u32,
+    requested_files: usize,
+    updated_files: Option<usize>,
+}
+
+impl FileTablePoisonContext {
+    pub(crate) const fn new(
+        scope: &'static str,
+        failed_index: Option<u32>,
+        start_index: u32,
+        requested_files: usize,
+    ) -> Self {
+        Self {
+            scope,
+            failed_index,
+            start_index,
+            requested_files,
+            updated_files: None,
+        }
+    }
+
+    pub(crate) const fn with_updated_files(mut self, updated_files: Option<usize>) -> Self {
+        self.updated_files = updated_files;
+        self
+    }
+
+    pub(crate) const fn failed_index(self) -> Option<u32> {
+        self.failed_index
+    }
+
+    pub(crate) const fn scope(self) -> &'static str {
+        self.scope
+    }
+
+    pub(crate) const fn start_index(self) -> u32 {
+        self.start_index
+    }
+
+    pub(crate) const fn requested_files(self) -> usize {
+        self.requested_files
+    }
+
+    pub(crate) const fn updated_files(self) -> Option<usize> {
+        self.updated_files
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -587,6 +587,9 @@ mod tests {
             next_timeout_hint,
             ready_completion,
             in_flight,
+            pending_work: Default::default(),
+            budget_exhausted: false,
+            needs_next_round: false,
         }
     }
 

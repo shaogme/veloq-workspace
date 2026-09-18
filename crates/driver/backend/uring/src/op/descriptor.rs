@@ -1,5 +1,5 @@
 use crate::{
-    driver::{CqeEnv, SqeEnv},
+    driver::env::{CqeEnv, SqeEnv},
     error::UringResult,
 };
 use veloq_buf::heap::ChunkId;
@@ -61,7 +61,7 @@ pub(crate) type RecordItemFn = unsafe fn(
     token: OpToken,
     result: i32,
     flags: u32,
-    env: &mut CqeEnv<'_>,
+    env: &mut CqeEnv<'_, '_>,
 ) -> UringResult<UringRecordItem>;
 
 /// slot runtime 使用的类型擦除视图。

@@ -6,7 +6,10 @@ pub(super) use net::*;
 
 use crate::{
     config::{IoFd, RawHandleKind},
-    driver::{FileTable, SqeEnv, SqeFd},
+    driver::{
+        env::SqeEnv,
+        registration::file_table::{FileTable, SqeFd},
+    },
     error::{UringError, UringResult},
     op::{
         Timeout, Wakeup,
@@ -145,7 +148,7 @@ pub(crate) unsafe fn make_sqe_wakeup(
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let kernel = kernel.as_mut().get_mut();
-    let fd = resolve_file_fd(env.file_table, user.fd, "uring.op.submit.make_sqe_wakeup")?;
+    let fd = resolve_file_fd(env.file_table(), user.fd, "uring.op.submit.make_sqe_wakeup")?;
     opcode_build(
         "uring.op.submit.wakeup_opcode",
         sqe_with_fd!(fd, |f| unsafe {

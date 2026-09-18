@@ -1,13 +1,18 @@
 use crate::{
-    config::{IoFd, RawHandle, UringRawHandle},
-    driver::UringDriver,
+    config::{
+        BufferRegistrationMode, FileTableExhaustion, IoFd, ProvidedBufConfig, RawHandle,
+        RawHandleKind, UringRawHandle,
+    },
+    diagnostics::UringCompletionDiagnostics,
+    driver::env::{SubmitEnvironmentFactory, SubmitResourceView},
     error::{UringError, UringResult},
+    op::{CheckedSlotView, SlotView, UringOpRegistry, UringOpRegistryExt},
 };
 use diagweave::prelude::*;
 use tracing::error;
-use veloq_buf::heap::ChunkId;
-use veloq_driver_core::driver::{BufferRegistrationStatus, RegisterFd};
-use veloq_io_uring::ResourceLayout;
+use veloq_buf::{AnyBufPool, BufferRegistrar, heap::ChunkId};
+use veloq_driver_core::driver::{BufferRegistrationStatus, OpToken, RegisterFd};
+use veloq_io_uring::{KernelCapabilities, ResourceLayout, ResourceRegistration, Submitter};
 use veloq_std::{
     collections::HashMap,
     format, io,
@@ -21,22 +26,418 @@ use veloq_std::{
 #[cfg(feature = "test-hooks")]
 use veloq_driver_core::driver::test_hooks::RegisterFilesUpdateOutcome;
 
+#[cfg(feature = "test-hooks")]
+use veloq_std::collections::VecDeque;
+
+pub(crate) struct RegistrationEngine<'a> {
+    fixed_buffers: FixedBufferOwner<'a>,
+    provided_buffers: ProvidedBufferOwner,
+    files: FixedFileOwner,
+}
+
+/// Owns the userspace file ledger and the kernel fixed-file registration.
+///
+/// Keeping the registration handle beside its ledger prevents callers from updating one without
+/// the other. `RegistrationEngine` only delegates file commands to this owner.
+struct FixedFileOwner {
+    table: FileTable,
+    registration: Option<ResourceRegistration>,
+    #[cfg(feature = "test-hooks")]
+    update_outcomes: VecDeque<RegisterFilesUpdateOutcome>,
+}
+
+/// Owns the optional provided-buffer ring independently from fixed-buffer bookkeeping.
+///
+/// The owner is the only place that can replace or release the group. Submission receives an
+/// immutable SQE descriptor and completion receives a command port, so neither path can move the
+/// group out of the owner accidentally.
+pub(crate) struct ProvidedBufferOwner {
+    config: Option<ProvidedBufConfig>,
+    group: Option<ProvidedBufGroup>,
+    failure_errno: Option<i32>,
+}
+
+impl ProvidedBufferOwner {
+    fn new(config: Option<ProvidedBufConfig>) -> Self {
+        Self {
+            config,
+            group: None,
+            failure_errno: None,
+        }
+    }
+
+    fn sqe_info(&self) -> Option<crate::driver::env::ProvidedBufSqeInfo> {
+        self.group.as_ref().and_then(ProvidedBufGroup::sqe_info)
+    }
+
+    fn has_group(&self) -> bool {
+        self.group.is_some()
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.group.as_ref().is_some_and(ProvidedBufGroup::is_usable)
+    }
+
+    fn has_selected_bids(&self) -> bool {
+        self.group
+            .as_ref()
+            .is_some_and(ProvidedBufGroup::has_selected_bids)
+    }
+
+    fn stats(&self) -> Option<ProvidedBufferSnapshot> {
+        self.group.as_ref().map(ProvidedBufGroup::stats)
+    }
+
+    fn failure_errno(&self) -> Option<i32> {
+        self.failure_errno
+    }
+
+    fn command_port(&mut self) -> Option<ProvidedBufPort<'_>> {
+        self.group.as_mut().map(ProvidedBufPort::new)
+    }
+
+    fn attach(
+        &mut self,
+        submitter: &Submitter<'_>,
+        pool: AnyBufPool,
+        ring_lifetime_token: RingLifetimeToken,
+    ) -> UringResult<bool> {
+        let Some(config) = self.config else {
+            return Ok(false);
+        };
+        if self.group.is_some() {
+            return Ok(true);
+        }
+
+        match ProvidedBufGroup::new(submitter, config, pool, ring_lifetime_token) {
+            Ok(group) => {
+                self.group = Some(group);
+                self.failure_errno = None;
+                Ok(true)
+            }
+            Err(failure) => {
+                let (report, group) = (*failure).into_parts();
+                if let Some(group) = group
+                    && group.is_kernel_registered()
+                {
+                    self.group = Some(group);
+                }
+                self.failure_errno = report
+                    .error_code()
+                    .and_then(|code| i32::try_from(code).ok());
+                tracing::debug!(
+                    report = ?report,
+                    "provided buffer ring unavailable; continuing without it"
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    fn release(&mut self, submitter: &Submitter<'_>) -> UringResult<()> {
+        self.release_with(|group| group.try_unregister(submitter))
+    }
+
+    fn release_with<F>(&mut self, unregister: F) -> UringResult<()>
+    where
+        F: FnOnce(ProvidedBufGroup) -> ProvidedBufUnregisterResult,
+    {
+        let Some(group) = self.group.take() else {
+            return Ok(());
+        };
+        match unregister(group) {
+            Ok(()) => Ok(()),
+            Err(failure) => {
+                let (report, group) = (*failure).into_parts();
+                self.group = Some(group);
+                Err(report)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OperationProbe {
+    active_operations: usize,
+    armed_provided_multishot: bool,
+    pending_completions: bool,
+}
+
+impl OperationProbe {
+    pub(crate) fn from_registry(ops: &mut UringOpRegistry, pending_completions: bool) -> Self {
+        let active_operations = ops.active_count();
+        let active_tokens: Vec<OpToken> = ops.active_tokens().collect();
+        let armed_provided_multishot = active_tokens.into_iter().any(|token| {
+            let Ok(view) = ops.checked_slot_view(token) else {
+                return true;
+            };
+            match view {
+                CheckedSlotView::Valid(SlotView::Reserved(mut slot)) => slot
+                    .with_access_mut(|access| access.operation().get_ref().is_provided_multishot())
+                    .unwrap_or(true),
+                CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => slot
+                    .with_access_mut(|access| access.operation().get_ref().is_provided_multishot())
+                    .unwrap_or(true),
+                CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot)) => slot
+                    .with_access_mut(|access| access.operation().get_ref().is_provided_multishot())
+                    .unwrap_or(true),
+                CheckedSlotView::Empty(_)
+                | CheckedSlotView::Missing { .. }
+                | CheckedSlotView::Stale(_) => true,
+            }
+        });
+        Self {
+            active_operations,
+            armed_provided_multishot,
+            pending_completions,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProvidedBufQuiesce {
+    active_operations: usize,
+    armed_provided_multishot: bool,
+    pending_completions: bool,
+    selected_bids: bool,
+}
+
+impl ProvidedBufQuiesce {
+    #[inline]
+    pub(crate) const fn is_quiescent(self) -> bool {
+        self.active_operations == 0
+            && !self.armed_provided_multishot
+            && !self.pending_completions
+            && !self.selected_bids
+    }
+
+    pub(crate) const fn active_operations(self) -> usize {
+        self.active_operations
+    }
+
+    pub(crate) const fn armed_provided_multishot(self) -> bool {
+        self.armed_provided_multishot
+    }
+
+    pub(crate) const fn pending_completions(self) -> bool {
+        self.pending_completions
+    }
+
+    pub(crate) const fn selected_bids(self) -> bool {
+        self.selected_bids
+    }
+}
+
+impl<'a> RegistrationEngine<'a> {
+    pub(crate) fn new(
+        registration_mode: BufferRegistrationMode,
+        provided_buffers: Option<ProvidedBufConfig>,
+        registrar: &'a (dyn BufferRegistrar + 'a),
+        file_table_capacity: u32,
+        file_table_exhaustion: FileTableExhaustion,
+    ) -> Self {
+        Self {
+            fixed_buffers: FixedBufferOwner::new(registration_mode, registrar),
+            provided_buffers: ProvidedBufferOwner::new(provided_buffers),
+            files: FixedFileOwner {
+                table: FileTable::new(file_table_capacity, file_table_exhaustion),
+                registration: None,
+                #[cfg(feature = "test-hooks")]
+                update_outcomes: VecDeque::new(),
+            },
+        }
+    }
+
+    pub(crate) fn build_submit_view<'d>(
+        &'d mut self,
+        submitter: Submitter<'d>,
+        diagnostics: &'d UringCompletionDiagnostics,
+    ) -> SubmitResourceView<'d, 'a> {
+        SubmitEnvironmentFactory::resource_view(
+            submitter,
+            &self.files.table,
+            diagnostics,
+            self.fixed_buffers
+                .split_for_submit(self.provided_buffers.sqe_info()),
+        )
+    }
+
+    pub(crate) fn quiescence(&self, probe: OperationProbe) -> ProvidedBufQuiesce {
+        let state = ProvidedBufQuiesce {
+            active_operations: probe.active_operations,
+            armed_provided_multishot: probe.armed_provided_multishot,
+            pending_completions: probe.pending_completions,
+            selected_bids: self.provided_buffers.has_selected_bids(),
+        };
+        if !state.is_quiescent() {
+            tracing::debug!(
+                active_operations = state.active_operations(),
+                armed_provided_multishot = state.armed_provided_multishot(),
+                pending_completions = state.pending_completions(),
+                selected_bids = state.selected_bids(),
+                "provided buffer ring is not quiescent"
+            );
+        }
+        state
+    }
+
+    #[inline]
+    pub(crate) fn has_provided_buffers(&self) -> bool {
+        self.provided_buffers.has_group()
+    }
+
+    #[inline]
+    pub(crate) fn provided_buf_stats(&self) -> Option<ProvidedBufferSnapshot> {
+        self.provided_buffers.stats()
+    }
+
+    #[inline]
+    pub(crate) fn fixed_buffers_available(&self) -> bool {
+        self.fixed_buffers.fixed_buffers_available()
+    }
+
+    #[inline]
+    pub(crate) fn fixed_buffers_failure_errno(&self) -> Option<i32> {
+        self.fixed_buffers.fixed_buffers_failure_errno()
+    }
+
+    #[inline]
+    pub(crate) fn provided_buffers_enabled(&self) -> bool {
+        self.provided_buffers.is_enabled()
+    }
+
+    #[inline]
+    pub(crate) fn provided_buffers_failure_errno(&self) -> Option<i32> {
+        self.provided_buffers.failure_errno()
+    }
+
+    pub(crate) fn release_provided_buffers(
+        &mut self,
+        submitter: &Submitter<'_>,
+    ) -> UringResult<()> {
+        self.provided_buffers.release(submitter)
+    }
+
+    #[inline]
+    pub(crate) fn set_fixed_buffers_available(&mut self, registration: ResourceRegistration) {
+        self.fixed_buffers.set_fixed_buffers_available(registration);
+    }
+
+    #[inline]
+    pub(crate) fn set_fixed_buffers_unavailable(&mut self, errno: Option<i32>) {
+        self.fixed_buffers.set_fixed_buffers_unavailable(errno);
+    }
+
+    #[inline]
+    pub(crate) fn attach_buffer_pool(
+        &mut self,
+        submitter: &Submitter<'_>,
+        pool: AnyBufPool,
+        ring_lifetime_token: RingLifetimeToken,
+    ) -> UringResult<bool> {
+        self.provided_buffers
+            .attach(submitter, pool, ring_lifetime_token)
+    }
+
+    #[inline]
+    pub(crate) fn provided_buffer_port(&mut self) -> Option<ProvidedBufPort<'_>> {
+        self.provided_buffers.command_port()
+    }
+
+    #[inline]
+    pub(crate) fn resolve_file(
+        &self,
+        fd: IoFd,
+        expected_kind: Option<RawHandleKind>,
+        scope: &'static str,
+    ) -> UringResult<SqeFd> {
+        self.files.table.resolve(fd, expected_kind, scope)
+    }
+
+    #[inline]
+    pub(crate) fn file_table_is_poisoned(&self) -> bool {
+        self.files.table.is_poisoned()
+    }
+
+    #[inline]
+    pub(crate) fn file_table_poisoned_report(
+        &self,
+        scope: &'static str,
+        fd: Option<IoFd>,
+    ) -> Report<UringError> {
+        self.files.table.poisoned_report(scope, fd)
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn registration_stats(&self) -> &UringRegistrationStats {
+        self.fixed_buffers.stats()
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn is_chunk_registered(&self, chunk_id: ChunkId) -> bool {
+        self.fixed_buffers.is_chunk_registered(chunk_id)
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn inject_register_buffers_update_failure(&mut self, errno: i32) {
+        self.fixed_buffers
+            .inject_register_buffers_update_failure(errno);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn inject_register_buffers_update_unknown(&mut self, errno: i32) {
+        self.fixed_buffers
+            .inject_register_buffers_update_unknown(errno);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn inject_register_buffers_update_sequence(&mut self, outcomes: &[Option<i32>]) {
+        self.fixed_buffers
+            .inject_register_buffers_update_sequence(outcomes);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn inject_bitset_set_failure(&mut self) {
+        self.fixed_buffers.inject_bitset_set_failure();
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn inject_register_files_update_failure(&mut self, errno: i32) {
+        self.files
+            .update_outcomes
+            .push_back(RegisterFilesUpdateOutcome::Error(errno));
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn inject_register_files_update_sequence(
+        &mut self,
+        outcomes: &[RegisterFilesUpdateOutcome],
+    ) {
+        self.files.update_outcomes.clear();
+        self.files.update_outcomes.extend(outcomes.iter().copied());
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn file_table_poisoned(&self) -> bool {
+        self.files.table.is_poisoned()
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn register_files_update_outcomes_pending(&self) -> usize {
+        self.files.update_outcomes.len()
+    }
+}
+
 pub(crate) mod buffer;
 pub(crate) mod file_table;
 pub(crate) mod provided_buf;
 
-pub(crate) use buffer::{
-    BufferRegistrationQuarantine, ChunkRegistrationRecord, ChunkRegistrationState,
-    UringBufferRegistry,
+use buffer::FixedBufferOwner;
+use file_table::{FileTable, FileTablePoisonContext, OwnedLocation, RegisteredFileEntry, SqeFd};
+pub use provided_buf::ProvidedBufferSnapshot;
+use provided_buf::{
+    ProvidedBufGroup, ProvidedBufPort, ProvidedBufUnregisterResult, RingLifetimeToken,
 };
-pub(crate) use file_table::{
-    FileTable, FileTablePoisonContext, OwnedLocation, RegisteredFileEntry, SqeFd,
-};
-pub use provided_buf::ProvidedBufStats;
-pub(crate) use provided_buf::{PROVIDED_BUF_GROUP_ID, ProvidedBufGroup, RingLifetimeOwner};
-
-#[cfg(test)]
-pub(crate) use provided_buf::test_group;
 
 pub(crate) const MAX_CHUNKS: usize = 1024;
 pub(crate) const REGISTER_FAILURE_RETRY_COOLDOWN: Duration = Duration::from_millis(250);
@@ -50,14 +451,61 @@ const MAX_FILE_TABLE_CAPACITY: usize = 1 << 20;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct UringRegistrationStats {
-    pub(crate) chunk_register_attempts: u64,
-    pub(crate) chunk_register_success: u64,
-    pub(crate) chunk_register_failures: u64,
-    pub(crate) chunk_register_skipped_recent_failure: u64,
-    pub(crate) submission_missing_chunk_info: u64,
-    pub(crate) raw_buffer_fallbacks: u64,
+    chunk_register_attempts: u64,
+    chunk_register_success: u64,
+    chunk_register_failures: u64,
+    chunk_register_skipped_recent_failure: u64,
+    submission_missing_chunk_info: u64,
+    raw_buffer_fallbacks: u64,
     /// Descriptors handed out without a kernel table entry because the table was full.
-    pub(crate) file_table_fallback_registrations: u64,
+    file_table_fallback_registrations: u64,
+}
+
+impl UringRegistrationStats {
+    pub(crate) fn inc_chunk_register_attempts(&mut self) {
+        self.chunk_register_attempts = self.chunk_register_attempts.saturating_add(1);
+    }
+
+    pub(crate) fn inc_chunk_register_success(&mut self) {
+        self.chunk_register_success = self.chunk_register_success.saturating_add(1);
+    }
+
+    pub(crate) fn inc_chunk_register_failures(&mut self) {
+        self.chunk_register_failures = self.chunk_register_failures.saturating_add(1);
+    }
+
+    pub(crate) fn inc_chunk_register_skipped_recent_failure(&mut self) {
+        self.chunk_register_skipped_recent_failure =
+            self.chunk_register_skipped_recent_failure.saturating_add(1);
+    }
+
+    pub(crate) fn inc_submission_missing_chunk_info(&mut self) {
+        self.submission_missing_chunk_info = self.submission_missing_chunk_info.saturating_add(1);
+    }
+
+    pub(crate) fn inc_raw_buffer_fallbacks(&mut self) {
+        self.raw_buffer_fallbacks = self.raw_buffer_fallbacks.saturating_add(1);
+    }
+
+    pub(crate) const fn chunk_register_attempts(&self) -> u64 {
+        self.chunk_register_attempts
+    }
+
+    pub(crate) const fn chunk_register_failures(&self) -> u64 {
+        self.chunk_register_failures
+    }
+
+    pub(crate) const fn chunk_register_skipped_recent_failure(&self) -> u64 {
+        self.chunk_register_skipped_recent_failure
+    }
+
+    pub(crate) const fn submission_missing_chunk_info(&self) -> u64 {
+        self.submission_missing_chunk_info
+    }
+
+    pub(crate) const fn raw_buffer_fallbacks(&self) -> u64 {
+        self.raw_buffer_fallbacks
+    }
 }
 
 /// The kernel-side fact established by one resource update syscall.
@@ -75,8 +523,22 @@ pub(crate) enum KernelUpdateOutcome {
 /// Evidence recorded independently from the diagnostic report produced for an update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct UpdateEvidence {
-    pub(crate) requested: usize,
-    pub(crate) outcome: KernelUpdateOutcome,
+    requested: usize,
+    outcome: KernelUpdateOutcome,
+}
+
+impl UpdateEvidence {
+    pub(crate) const fn new(requested: usize, outcome: KernelUpdateOutcome) -> Self {
+        Self { requested, outcome }
+    }
+
+    pub(crate) const fn requested(self) -> usize {
+        self.requested
+    }
+
+    pub(crate) const fn outcome(self) -> KernelUpdateOutcome {
+        self.outcome
+    }
 }
 
 impl UpdateEvidence {
@@ -106,13 +568,13 @@ struct FileTableUpdateFailure {
 
 impl FileTableUpdateFailure {
     fn poison_context(&self, failed_index: Option<u32>) -> FileTablePoisonContext {
-        FileTablePoisonContext {
-            scope: self.report.scope,
+        FileTablePoisonContext::new(
+            self.report.scope,
             failed_index,
-            start_index: self.report.start_index,
-            requested_files: self.report.requested_files,
-            updated_files: self.evidence.updated(),
-        }
+            self.report.start_index,
+            self.report.requested_files,
+        )
+        .with_updated_files(self.evidence.updated())
     }
 }
 
@@ -484,34 +946,57 @@ struct FileTableRollbackFailure {
     remaining_indices: Vec<u32>,
 }
 
-impl<'a> UringDriver<'a> {
+pub(crate) struct RegistrationPorts<'ring, 'borrow> {
+    submitter: &'borrow Submitter<'ring>,
+    diagnostics: &'borrow UringCompletionDiagnostics,
+}
+
+impl<'ring, 'borrow> RegistrationPorts<'ring, 'borrow> {
+    pub(crate) const fn new(
+        submitter: &'borrow Submitter<'ring>,
+        diagnostics: &'borrow UringCompletionDiagnostics,
+    ) -> Self {
+        Self {
+            submitter,
+            diagnostics,
+        }
+    }
+}
+
+impl<'a> RegistrationEngine<'a> {
     #[inline]
     pub(crate) fn register_buffer_internal(
         &mut self,
+        submitter: &Submitter<'_>,
+        diagnostics: &UringCompletionDiagnostics,
         id: ChunkId,
         ptr: *const u8,
         len: usize,
     ) -> UringResult<BufferRegistrationStatus> {
-        self.submit_env().register_buffer_backend(id, ptr, len)
+        self.fixed_buffers
+            .split_for_submit(None)
+            .register_buffer_backend(submitter, diagnostics, id, ptr, len)
     }
 
     /// Runs one `register_files_update` call and retains the evidence needed by rollback.
     fn register_files_update(
         &mut self,
+        ports: &RegistrationPorts<'_, '_>,
         start: u32,
         files: &[i32],
     ) -> (io::Result<usize>, KernelUpdateOutcome) {
         #[cfg(feature = "test-hooks")]
-        if let Some(outcome) = self.register_files_update_outcomes.pop_front() {
+        if let Some(outcome) = self.files.update_outcomes.pop_front() {
             return match outcome {
                 RegisterFilesUpdateOutcome::Actual => {
                     let result = self
-                        .file_registration
+                        .files
+                        .registration
                         .as_ref()
                         .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))
                         .and_then(|registration| {
-                            self.ring
-                                .submitter()
+                            ports
+                                .submitter
                                 .register_files_update(registration, start, files)
                         });
                     let evidence = match &result {
@@ -534,12 +1019,13 @@ impl<'a> UringDriver<'a> {
         }
 
         let result = self
-            .file_registration
+            .files
+            .registration
             .as_ref()
             .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))
             .and_then(|registration| {
-                self.ring
-                    .submitter()
+                ports
+                    .submitter
                     .register_files_update(registration, start, files)
             });
         let evidence = match &result {
@@ -554,25 +1040,17 @@ impl<'a> UringDriver<'a> {
 
     fn record_file_update_outcome(
         &self,
+        ports: &RegistrationPorts<'_, '_>,
         evidence: UpdateEvidence,
         direction: FileUpdateDirection,
         scope: &'static str,
         start: u32,
     ) {
         match evidence.outcome {
-            KernelUpdateOutcome::Applied(_) => self
-                .completion_diagnostics
-                .backend()
-                .inc_file_table_update_applied(),
+            KernelUpdateOutcome::Applied(_) => ports.diagnostics.inc_file_table_update_applied(),
             #[cfg(feature = "test-hooks")]
-            KernelUpdateOutcome::Rejected(_) => self
-                .completion_diagnostics
-                .backend()
-                .inc_file_table_update_rejected(),
-            KernelUpdateOutcome::Unknown(_, _) => self
-                .completion_diagnostics
-                .backend()
-                .inc_file_table_update_unknown(),
+            KernelUpdateOutcome::Rejected(_) => ports.diagnostics.inc_file_table_update_rejected(),
+            KernelUpdateOutcome::Unknown(_, _) => ports.diagnostics.inc_file_table_update_unknown(),
         }
         tracing::debug!(
             scope,
@@ -587,15 +1065,16 @@ impl<'a> UringDriver<'a> {
 
     fn update_kernel_file_entries(
         &mut self,
+        ports: &RegistrationPorts<'_, '_>,
         txn: &FileUpdateTxn,
     ) -> Result<(), FileTableUpdateFailure> {
         let requested_files = txn.fds.len();
-        let (result, outcome) = self.register_files_update(txn.start, &txn.fds);
+        let (result, outcome) = self.register_files_update(ports, txn.start, &txn.fds);
         let evidence = UpdateEvidence {
             requested: requested_files,
             outcome,
         };
-        self.record_file_update_outcome(evidence, txn.direction, txn.scope, txn.start);
+        self.record_file_update_outcome(ports, evidence, txn.direction, txn.scope, txn.start);
         let updated_files = result.map_err(|error| {
             let cleanup_errno = error.raw_os_error();
             let report = UringError::Registration
@@ -642,50 +1121,49 @@ impl<'a> UringDriver<'a> {
     /// not fit are handed out as [`IoFd::Direct`] and never reach this path.
     fn clear_kernel_file_entry(
         &mut self,
+        ports: &RegistrationPorts<'_, '_>,
         idx: u32,
         scope: &'static str,
     ) -> Result<(), FileTableUpdateFailure> {
         let txn = FileUpdateTxn::clear(idx, 1, scope);
-        self.update_kernel_file_entries(&txn)
+        self.update_kernel_file_entries(ports, &txn)
     }
 
     fn clear_kernel_file_entries(
         &mut self,
+        ports: &RegistrationPorts<'_, '_>,
         start: u32,
         count: usize,
         scope: &'static str,
     ) -> Result<(), FileTableUpdateFailure> {
         let txn = FileUpdateTxn::clear(start, count, scope);
-        self.update_kernel_file_entries(&txn)
+        self.update_kernel_file_entries(ports, &txn)
     }
 
     fn poison_file_table(
         &mut self,
-        scope: &'static str,
+        ports: &RegistrationPorts<'_, '_>,
         context: FileTablePoisonContext,
         primary: Report<UringError>,
         secondary: Option<Report<UringError>>,
         rollback_failure: bool,
         remaining_slots: usize,
     ) -> Report<UringError> {
-        let transitioned = self.file_table.poison(context);
+        let scope = context.scope();
+        let transitioned = self.files.table.poison(context);
         if rollback_failure {
-            self.completion_diagnostics
-                .backend()
-                .inc_file_table_rollback_failure();
+            ports.diagnostics.inc_file_table_rollback_failure();
         }
         if transitioned {
-            self.completion_diagnostics
-                .backend()
-                .inc_file_table_poisoning();
+            ports.diagnostics.inc_file_table_poisoning();
         }
 
         error!(
             scope,
-            file_index = ?context.failed_index,
-            start_index = context.start_index,
-            requested_files = context.requested_files,
-            updated_files = ?context.updated_files,
+            file_index = ?context.failed_index(),
+            start_index = context.start_index(),
+            requested_files = context.requested_files(),
+            updated_files = ?context.updated_files(),
             remaining_slots,
             original_error = ?primary,
             rollback_error = ?secondary,
@@ -693,7 +1171,8 @@ impl<'a> UringDriver<'a> {
         );
 
         let mut report = self
-            .file_table
+            .files
+            .table
             .poisoned_report(scope, None)
             .with_ctx("rollback_remaining_slots", remaining_slots);
         report = report.with_diag_src_err(primary);
@@ -705,34 +1184,39 @@ impl<'a> UringDriver<'a> {
 
     fn unregister_file_slot(
         &mut self,
+        ports: &RegistrationPorts<'_, '_>,
         idx: u32,
         advance_generation: bool,
         scope: &'static str,
     ) -> Result<(), FileTableUpdateFailure> {
-        let Some(entry) = self.file_table.take_entry(idx) else {
+        let Some(entry) = self.files.table.take_entry(idx) else {
             return Ok(());
         };
 
-        if let Err(failure) = self.clear_kernel_file_entry(idx, scope) {
-            self.file_table.install_entry(idx, entry);
+        if let Err(failure) = self.clear_kernel_file_entry(ports, idx, scope) {
+            self.files.table.install_entry(idx, entry);
             return Err(failure);
         }
 
-        self.file_table.release(idx);
+        self.files.table.release(idx);
         if advance_generation {
-            self.file_table.advance_generation(idx);
+            self.files.table.advance_generation(idx);
         }
         Ok(())
     }
 
     fn rollback_file_slots(
         &mut self,
+        ports: &RegistrationPorts<'_, '_>,
         registered: &mut Vec<u32>,
     ) -> Result<(), FileTableRollbackFailure> {
         while let Some(idx) = registered.pop() {
-            if let Err(failure) =
-                self.unregister_file_slot(idx, false, "driver.register_files_internal.rollback")
-            {
+            if let Err(failure) = self.unregister_file_slot(
+                ports,
+                idx,
+                false,
+                "driver.register_files_internal.rollback",
+            ) {
                 return Err(FileTableRollbackFailure {
                     failed_index: idx,
                     failure,
@@ -751,10 +1235,11 @@ impl<'a> UringDriver<'a> {
 
     fn rollback_committed_batch(
         &mut self,
+        ports: &RegistrationPorts<'_, '_>,
         batch: &mut FileRegistrationBatch<'_>,
     ) -> Result<(), FileTableRollbackFailure> {
         let mut registered = batch.committed_indices();
-        let result = self.rollback_file_slots(&mut registered);
+        let result = self.rollback_file_slots(ports, &mut registered);
         match &result {
             Ok(()) => batch.mark_rolled_back(&[]),
             Err(rollback) => batch.mark_rolled_back(&rollback.remaining_indices),
@@ -764,24 +1249,25 @@ impl<'a> UringDriver<'a> {
 
     fn abort_file_batch(
         &mut self,
+        ports: &RegistrationPorts<'_, '_>,
         batch: &mut FileRegistrationBatch<'_>,
         primary: Report<UringError>,
         note: &'static str,
     ) -> Report<UringError> {
-        batch.release_reserved(&mut self.file_table);
+        batch.release_reserved(&mut self.files.table);
         for descriptor in mem::take(&mut batch.direct_descriptors) {
             if matches!(descriptor, IoFd::OwnedDirect { .. }) {
-                drop(self.file_table.release_direct(descriptor));
+                drop(self.files.table.release_direct(descriptor));
             }
         }
 
-        match self.rollback_committed_batch(batch) {
+        match self.rollback_committed_batch(ports, batch) {
             Ok(()) => primary,
             Err(rollback) => {
                 let context = rollback.failure.poison_context(Some(rollback.failed_index));
                 let remaining_slots = batch.retained_slot_count();
                 self.poison_file_table(
-                    "driver.register_files_internal.rollback",
+                    ports,
                     context,
                     primary,
                     Some(rollback.failure.report.report),
@@ -795,6 +1281,7 @@ impl<'a> UringDriver<'a> {
 
     fn abort_file_batch_after_update_failure(
         &mut self,
+        ports: &RegistrationPorts<'_, '_>,
         batch: &mut FileRegistrationBatch<'_>,
         cursor: usize,
         run_end: usize,
@@ -810,8 +1297,9 @@ impl<'a> UringDriver<'a> {
             KernelUpdateOutcome::Applied(updated) => {
                 let touched = updated.min(run_len);
                 if touched == 0 {
-                    batch.release_range(&mut self.file_table, cursor, run_end);
+                    batch.release_range(&mut self.files.table, cursor, run_end);
                     return self.abort_file_batch(
+                        ports,
                         batch,
                         primary,
                         "registration update applied no entries before abort",
@@ -819,14 +1307,16 @@ impl<'a> UringDriver<'a> {
                 }
 
                 match self.clear_kernel_file_entries(
+                    ports,
                     failed_index,
                     touched,
                     "driver.register_files_internal.abort.clear_prefix",
                 ) {
                     Ok(()) => {
-                        batch.release_range(&mut self.file_table, cursor, cursor + touched);
-                        batch.release_range(&mut self.file_table, cursor + touched, run_end);
+                        batch.release_range(&mut self.files.table, cursor, cursor + touched);
+                        batch.release_range(&mut self.files.table, cursor + touched, run_end);
                         self.abort_file_batch(
+                            ports,
                             batch,
                             primary,
                             "registration update was rolled back after a partial apply",
@@ -840,17 +1330,17 @@ impl<'a> UringDriver<'a> {
                             KernelUpdateOutcome::Rejected(_) => 0,
                             KernelUpdateOutcome::Unknown(_, _) => 0,
                         };
-                        batch.release_range(&mut self.file_table, cursor, cursor + cleared);
+                        batch.release_range(&mut self.files.table, cursor, cursor + cleared);
                         batch.retain_range(
-                            &mut self.file_table,
+                            &mut self.files.table,
                             cursor + cleared,
                             cursor + touched,
                         );
-                        batch.release_range(&mut self.file_table, cursor + touched, run_end);
-                        batch.release_reserved(&mut self.file_table);
+                        batch.release_range(&mut self.files.table, cursor + touched, run_end);
+                        batch.release_reserved(&mut self.files.table);
 
                         self.poison_file_table(
-                            "driver.register_files_internal.rollback",
+                            ports,
                             context,
                             primary,
                             Some(clear_failure.report.report),
@@ -863,19 +1353,20 @@ impl<'a> UringDriver<'a> {
             }
             #[cfg(feature = "test-hooks")]
             KernelUpdateOutcome::Rejected(_) => {
-                batch.release_range(&mut self.file_table, cursor, run_end);
+                batch.release_range(&mut self.files.table, cursor, run_end);
                 self.abort_file_batch(
+                    ports,
                     batch,
                     primary,
                     "registration update was rejected before kernel state changed",
                 )
             }
             KernelUpdateOutcome::Unknown(_, _) => {
-                batch.retain_range(&mut self.file_table, cursor, run_end);
-                batch.release_range(&mut self.file_table, run_end, batch.fixed_len());
-                batch.release_reserved(&mut self.file_table);
+                batch.retain_range(&mut self.files.table, cursor, run_end);
+                batch.release_range(&mut self.files.table, run_end, batch.fixed_len());
+                batch.release_reserved(&mut self.files.table);
                 self.poison_file_table(
-                    "driver.register_files_internal",
+                    ports,
                     context,
                     primary,
                     None,
@@ -889,31 +1380,36 @@ impl<'a> UringDriver<'a> {
         }
     }
 
-    pub(crate) fn unregister_fixed_fd(&mut self, fd: IoFd) -> UringResult<()> {
+    pub(crate) fn unregister_fixed_fd(
+        &mut self,
+        ports: &RegistrationPorts<'_, '_>,
+        fd: IoFd,
+    ) -> UringResult<()> {
         match fd {
             // Borrowed direct descriptors have no backend ownership to release.
             IoFd::Direct(_) => Ok(()),
             IoFd::OwnedDirect { .. } => {
-                drop(self.file_table.release_direct(fd));
+                drop(self.files.table.release_direct(fd));
                 Ok(())
             }
             IoFd::Registered { index, generation } => {
-                if self.file_table.is_poisoned() {
+                if self.files.table.is_poisoned() {
                     return Err(self
-                        .file_table
+                        .files
+                        .table
                         .poisoned_report("driver.unregister_fixed_fd", Some(fd)));
                 }
-                if !self.file_table.is_initialized()
-                    || !self.file_table.matches_generation(index, generation)
+                if !self.files.table.is_initialized()
+                    || !self.files.table.matches_generation(index, generation)
                 {
                     return Ok(());
                 }
-                match self.unregister_file_slot(index, true, "driver.unregister_fixed_fd") {
+                match self.unregister_file_slot(ports, index, true, "driver.unregister_fixed_fd") {
                     Ok(()) => Ok(()),
                     Err(failure) => {
                         let context = failure.poison_context(Some(index));
                         Err(self.poison_file_table(
-                            "driver.unregister_fixed_fd",
+                            ports,
                             context,
                             failure.report.report,
                             None,
@@ -930,13 +1426,17 @@ impl<'a> UringDriver<'a> {
     ///
     /// Either way the owned handle must be forgotten rather than dropped: dropping it would
     /// close a number the kernel may have already handed to someone else.
-    pub(crate) fn unregister_close_owned_fd(&mut self, fd: IoFd) -> UringResult<()> {
+    pub(crate) fn unregister_close_owned_fd(
+        &mut self,
+        ports: &RegistrationPorts<'_, '_>,
+        fd: IoFd,
+    ) -> UringResult<()> {
         let (index, generation) = match fd {
             IoFd::Direct(_) => {
                 return Ok(());
             }
             IoFd::OwnedDirect { .. } => {
-                if let Some(handle) = self.file_table.release_direct(fd) {
+                if let Some(handle) = self.files.table.release_direct(fd) {
                     let _ = ManuallyDrop::new(handle);
                 }
                 return Ok(());
@@ -944,39 +1444,34 @@ impl<'a> UringDriver<'a> {
             IoFd::Registered { index, generation } => (index, generation),
         };
 
-        if !self.file_table.is_initialized()
-            || !self.file_table.matches_generation(index, generation)
+        if !self.files.table.is_initialized()
+            || !self.files.table.matches_generation(index, generation)
         {
             return Ok(());
         }
-        let Some(entry) = self.file_table.take_entry(index) else {
+        let Some(entry) = self.files.table.take_entry(index) else {
             return Ok(());
         };
         // The kernel has already consumed this descriptor. Keep the Rust ownership object
         // unreachable from every drop path regardless of whether clearing the fixed slot works.
         let _entry = ManuallyDrop::new(entry);
-        if self.file_table.is_poisoned() {
-            self.file_table.advance_generation(index);
+        if self.files.table.is_poisoned() {
+            self.files.table.advance_generation(index);
             return Err(self
-                .file_table
+                .files
+                .table
                 .poisoned_report("driver.unregister_close_owned_fd", Some(fd))
                 .attach_note("closed owned fd was forgotten; poisoned table skipped clear"));
         }
         if let Err(failure) =
-            self.clear_kernel_file_entry(index, "driver.unregister_close_owned_fd")
+            self.clear_kernel_file_entry(ports, index, "driver.unregister_close_owned_fd")
         {
-            self.file_table.quarantine(index);
-            self.file_table.advance_generation(index);
-            self.completion_diagnostics
-                .backend()
-                .inc_file_table_cleanup_failure();
-            self.completion_diagnostics
-                .backend()
-                .inc_file_table_quarantine();
+            self.files.table.quarantine(index);
+            self.files.table.advance_generation(index);
+            ports.diagnostics.inc_file_table_cleanup_failure();
+            ports.diagnostics.inc_file_table_quarantine();
             if failure.evidence.updated().is_some() {
-                self.completion_diagnostics
-                    .backend()
-                    .inc_file_table_cleanup_short_update();
+                ports.diagnostics.inc_file_table_cleanup_short_update();
             }
 
             let mut report = UringError::FileTableQuarantined
@@ -994,8 +1489,8 @@ impl<'a> UringDriver<'a> {
             }
             return Err(report.with_diag_src_err(failure.report.report));
         }
-        self.file_table.release(index);
-        self.file_table.advance_generation(index);
+        self.files.table.release(index);
+        self.files.table.advance_generation(index);
         Ok(())
     }
 
@@ -1006,12 +1501,13 @@ impl<'a> UringDriver<'a> {
     /// the fd *is* the descriptor — so its caller mints a new one instead.
     pub(crate) fn replace_registered_fixed_fd(
         &mut self,
+        ports: &RegistrationPorts<'_, '_>,
         fixed_fd: IoFd,
         raw: RawHandle,
     ) -> UringResult<()> {
         let scope = "driver.replace_registered_fixed_fd";
-        if self.file_table.is_poisoned() {
-            return Err(self.file_table.poisoned_report(scope, Some(fixed_fd)));
+        if self.files.table.is_poisoned() {
+            return Err(self.files.table.poisoned_report(scope, Some(fixed_fd)));
         }
         let invalid = |note: &'static str| {
             UringError::InvalidState
@@ -1024,16 +1520,16 @@ impl<'a> UringDriver<'a> {
             return invalid("direct descriptors cannot be replaced in place");
         };
 
-        if !self.file_table.is_initialized() {
+        if !self.files.table.is_initialized() {
             return invalid("registered file table is not initialized");
         }
-        if self.file_table.generation(index).is_none() {
+        if self.files.table.generation(index).is_none() {
             return invalid("registered file index out of bounds");
         }
-        if !self.file_table.matches_generation(index, generation) {
+        if !self.files.table.matches_generation(index, generation) {
             return invalid("registered file generation mismatch while replacing fd");
         }
-        if self.file_table.entry(index).is_none() {
+        if self.files.table.entry(index).is_none() {
             return invalid("registered file slot is empty while replacing fd");
         }
 
@@ -1047,11 +1543,11 @@ impl<'a> UringDriver<'a> {
             vec![fd],
             "driver.replace_registered_fixed_fd.register_files_update",
         );
-        let update = self.update_kernel_file_entries(&txn);
+        let update = self.update_kernel_file_entries(ports, &txn);
         if let Err(failure) = update {
             let context = failure.poison_context(Some(index));
             return Err(self.poison_file_table(
-                scope,
+                ports,
                 context,
                 failure.report.report,
                 None,
@@ -1059,22 +1555,27 @@ impl<'a> UringDriver<'a> {
                 0,
             ));
         }
-        let old_entry = self.file_table.replace_entry(index, new_entry);
+        let old_entry = self.files.table.replace_entry(index, new_entry);
         drop(old_entry);
         Ok(())
     }
 
-    pub(crate) fn ensure_file_table_initialized(&mut self) -> UringResult<()> {
-        if self.file_table.is_poisoned() {
+    pub(crate) fn ensure_file_table_initialized(
+        &mut self,
+        submitter: &Submitter<'_>,
+        kernel_capabilities: &mut KernelCapabilities,
+    ) -> UringResult<()> {
+        if self.files.table.is_poisoned() {
             return Err(self
-                .file_table
+                .files
+                .table
                 .poisoned_report("driver.ensure_file_table_initialized", None));
         }
-        if self.file_table.is_initialized() {
+        if self.files.table.is_initialized() {
             return Ok(());
         }
 
-        let capacity = self.file_table.fixed_capacity();
+        let capacity = self.files.table.fixed_capacity();
         if capacity > MAX_FILE_TABLE_CAPACITY {
             return UringError::InvalidInput
                 .push_ctx("scope", "driver.ensure_file_table_initialized")
@@ -1083,23 +1584,21 @@ impl<'a> UringDriver<'a> {
                 .attach_note("configured registered file table capacity is too large");
         }
         if capacity > 0 {
-            match self.ring.submitter().register_files_sparse(capacity) {
+            match submitter.register_files_sparse(capacity) {
                 Ok(registration) => {
-                    self.kernel_capabilities = self
-                        .kernel_capabilities
-                        .with_file_registration(&registration);
-                    self.file_registration = Some(registration);
+                    *kernel_capabilities =
+                        kernel_capabilities.with_file_registration(&registration);
+                    self.files.registration = Some(registration);
                 }
                 Err(error) => {
-                    self.kernel_capabilities =
-                        self.kernel_capabilities.with_file_registration_error(
-                            capacity as u32,
-                            ResourceLayout::Sparse,
-                            false,
-                            error.raw_os_error(),
-                        );
-                    if self.file_table.falls_back_when_unavailable() {
-                        self.file_table.disable_fixed_table();
+                    *kernel_capabilities = kernel_capabilities.with_file_registration_error(
+                        capacity as u32,
+                        ResourceLayout::Sparse,
+                        false,
+                        error.raw_os_error(),
+                    );
+                    if self.files.table.falls_back_when_unavailable() {
+                        self.files.table.disable_fixed_table();
                         tracing::warn!(
                             requested_slots = capacity,
                             errno = ?error.raw_os_error(),
@@ -1114,7 +1613,7 @@ impl<'a> UringDriver<'a> {
             }
         }
 
-        self.file_table.mark_initialized();
+        self.files.table.mark_initialized();
         Ok(())
     }
 
@@ -1125,33 +1624,40 @@ impl<'a> UringDriver<'a> {
     /// raw fd travels in the SQE. The returned vector is in input order either way.
     pub(crate) fn register_files_internal<'h>(
         &mut self,
+        submitter: &Submitter<'_>,
+        diagnostics: &UringCompletionDiagnostics,
+        kernel_capabilities: &mut KernelCapabilities,
         files: Vec<RegisterFd<'h, UringRawHandle>>,
     ) -> UringResult<Vec<IoFd>> {
         if files.is_empty() {
             return Ok(Vec::new());
         }
 
-        let (owned_inputs, conflict) = preflight_owned_files(&self.file_table, &files);
+        let (owned_inputs, conflict) = preflight_owned_files(&self.files.table, &files);
         if let Some(conflict) = conflict {
             let report = duplicate_owned_fd_report(conflict);
             cleanup_rejected_owned_inputs(files, &owned_inputs);
             return Err(report);
         }
 
-        if self.file_table.is_poisoned() {
+        if self.files.table.is_poisoned() {
             return Err(self
-                .file_table
+                .files
+                .table
                 .poisoned_report("driver.register_files_internal", None));
         }
 
-        self.ensure_file_table_initialized()?;
+        self.ensure_file_table_initialized(submitter, kernel_capabilities)?;
+
+        let ports = RegistrationPorts::new(submitter, diagnostics);
 
         let claimed = self
-            .file_table
+            .files
+            .table
             .claim(files.len())
             .push_ctx("scope", "driver.register_files_internal")?;
         let fallback = files.len() - claimed.len();
-        let stats = self.buffer_registry.stats_mut();
+        let stats = self.fixed_buffers.stats_mut();
         stats.file_table_fallback_registrations = stats
             .file_table_fallback_registrations
             .saturating_add(fallback as u64);
@@ -1162,11 +1668,12 @@ impl<'a> UringDriver<'a> {
         while cursor < batch.fixed_len() {
             let run_end = consecutive_run_end(&fixed_indices, cursor);
             let txn = batch.registration_txn(cursor, run_end);
-            if let Err(failure) = self.update_kernel_file_entries(&txn) {
-                return Err(self
-                    .abort_file_batch_after_update_failure(&mut batch, cursor, run_end, failure));
+            if let Err(failure) = self.update_kernel_file_entries(&ports, &txn) {
+                return Err(self.abort_file_batch_after_update_failure(
+                    &ports, &mut batch, cursor, run_end, failure,
+                ));
             }
-            batch.commit_range(&mut self.file_table, cursor, run_end);
+            batch.commit_range(&mut self.files.table, cursor, run_end);
             cursor = run_end;
         }
 
@@ -1175,10 +1682,11 @@ impl<'a> UringDriver<'a> {
                 RegisterFd::Borrowed(b) => IoFd::direct(b.raw()),
                 // A direct descriptor is only a handle value, so the driver has to keep the
                 // owned handle alive itself until the descriptor is unregistered.
-                RegisterFd::Owned(o) => match self.file_table.adopt_direct(o) {
+                RegisterFd::Owned(o) => match self.files.table.adopt_direct(o) {
                     Ok(fd) => fd,
                     Err(report) => {
                         return Err(self.abort_file_batch(
+                            &ports,
                             &mut batch,
                             report,
                             "rollback failed after owned direct adoption failure",
@@ -1188,7 +1696,7 @@ impl<'a> UringDriver<'a> {
             };
             batch.push_direct_descriptor(descriptor);
         }
-        Ok(batch.descriptors(&self.file_table))
+        Ok(batch.descriptors(&self.files.table))
     }
 }
 

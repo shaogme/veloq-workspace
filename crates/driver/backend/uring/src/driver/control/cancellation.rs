@@ -8,17 +8,31 @@ use veloq_std::collections::hash_map::Entry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PendingCancel {
-    pub(crate) target: OpToken,
-    pub(crate) mode: CancelMode,
+    target: OpToken,
+    mode: CancelMode,
 }
 
 impl PendingCancel {
+    #[cfg(test)]
+    #[inline]
+    pub(crate) const fn from_parts(target: OpToken, mode: CancelMode) -> Self {
+        Self { target, mode }
+    }
+
     #[inline]
     pub(crate) const fn new(request: CancelRequest) -> Self {
         Self {
             target: request.target,
             mode: request.mode,
         }
+    }
+
+    pub(crate) const fn target(self) -> OpToken {
+        self.target
+    }
+
+    pub(crate) const fn mode(self) -> CancelMode {
+        self.mode
     }
 
     #[inline]

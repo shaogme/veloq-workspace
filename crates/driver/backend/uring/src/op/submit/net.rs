@@ -1,7 +1,7 @@
 use crate::{
     OwnedRawHandle, RawHandle,
     config::UringRawHandle,
-    driver::{SqeEnv, SqeFd},
+    driver::{env::SqeEnv, registration::file_table::SqeFd},
     error::{UringError, UringResult},
     net::{bounded_sockaddr_bytes, to_socket_addr},
     op::{
@@ -28,7 +28,7 @@ pub(crate) unsafe fn make_sqe_recv(
         .buf
         .checked_read_range(val.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_recv", err))?;
-    let fd = resolve_socket_fd(env.file_table, val.fd, "uring.op.submit.make_sqe_recv")?;
+    let fd = resolve_socket_fd(env.file_table(), val.fd, "uring.op.submit.make_sqe_recv")?;
     opcode_build(
         "uring.op.submit.recv_opcode",
         sqe_with_fd!(fd, |f| unsafe { opcode::Recv::new(f, ptr, len) }.build()),
@@ -49,7 +49,7 @@ pub(crate) unsafe fn make_sqe_recv_provided(
 ) -> UringResult<squeue::Entry> {
     const SCOPE: &str = "uring.op.submit.make_sqe_recv_provided";
     let (bgid, len) = env.provided_buf_info(SCOPE)?;
-    let fd = resolve_socket_fd(env.file_table, val.fd, SCOPE)?;
+    let fd = resolve_socket_fd(env.file_table(), val.fd, SCOPE)?;
     opcode_build(
         SCOPE,
         sqe_with_fd!(fd, |f| unsafe {
@@ -78,7 +78,7 @@ pub(crate) unsafe fn make_sqe_recv_multi(
 ) -> UringResult<squeue::Entry> {
     const SCOPE: &str = "uring.op.submit.make_sqe_recv_multi";
     let (bgid, _buf_size) = env.provided_buf_info(SCOPE)?;
-    let fd = resolve_socket_fd_direct(env.file_table, val.fd, SCOPE)?;
+    let fd = resolve_socket_fd_direct(env.file_table(), val.fd, SCOPE)?;
     opcode_build(
         SCOPE,
         sqe_with_fd!(fd, |f| opcode::RecvMulti::new(f, bgid).build()),
@@ -95,7 +95,7 @@ pub(crate) unsafe fn make_sqe_send(
         .buf
         .checked_write_range(val.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_send", err))?;
-    let fd = resolve_socket_fd(env.file_table, val.fd, "uring.op.submit.make_sqe_send")?;
+    let fd = resolve_socket_fd(env.file_table(), val.fd, "uring.op.submit.make_sqe_send")?;
     opcode_build(
         "uring.op.submit.send_opcode",
         sqe_with_fd!(fd, |f| unsafe { opcode::Send::new(f, ptr, len) }.build()),
@@ -112,7 +112,11 @@ pub(crate) unsafe fn make_sqe_udp_recv(
         .buf
         .checked_read_range(val.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_udp_recv", err))?;
-    let fd = resolve_socket_fd(env.file_table, val.fd, "uring.op.submit.make_sqe_udp_recv")?;
+    let fd = resolve_socket_fd(
+        env.file_table(),
+        val.fd,
+        "uring.op.submit.make_sqe_udp_recv",
+    )?;
     opcode_build(
         "uring.op.submit.udp_recv_opcode",
         sqe_with_fd!(fd, |f| unsafe { opcode::Recv::new(f, ptr, len) }.build()),
@@ -129,7 +133,11 @@ pub(crate) unsafe fn make_sqe_udp_send(
         .buf
         .checked_write_range(val.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_udp_send", err))?;
-    let fd = resolve_socket_fd(env.file_table, val.fd, "uring.op.submit.make_sqe_udp_send")?;
+    let fd = resolve_socket_fd(
+        env.file_table(),
+        val.fd,
+        "uring.op.submit.make_sqe_udp_send",
+    )?;
     opcode_build(
         "uring.op.submit.udp_send_opcode",
         sqe_with_fd!(fd, |f| unsafe { opcode::Send::new(f, ptr, len) }.build()),
@@ -142,7 +150,7 @@ pub(crate) unsafe fn make_sqe_connect(
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
-    let fd = resolve_socket_fd(env.file_table, val.fd, "uring.op.submit.make_sqe_connect")?;
+    let fd = resolve_socket_fd(env.file_table(), val.fd, "uring.op.submit.make_sqe_connect")?;
     let addr = &val.addr.0 as *const _ as *const _;
     opcode_build(
         "uring.op.submit.connect_opcode",
@@ -160,7 +168,7 @@ pub(crate) unsafe fn make_sqe_udp_connect(
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let fd = resolve_socket_fd(
-        env.file_table,
+        env.file_table(),
         val.fd,
         "uring.op.submit.make_sqe_udp_connect",
     )?;
@@ -180,7 +188,7 @@ pub(crate) unsafe fn make_sqe_accept(
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
-    let fd = resolve_socket_fd(env.file_table, val.fd, "uring.op.submit.make_sqe_accept")?;
+    let fd = resolve_socket_fd(env.file_table(), val.fd, "uring.op.submit.make_sqe_accept")?;
     let addr = &mut val.addr.0 as *mut _ as *mut _;
     let addr_len = &mut val.addr_len as *mut _;
     opcode_build(
@@ -206,7 +214,7 @@ pub(crate) unsafe fn make_sqe_accept_multi(
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let fd = resolve_socket_fd_direct(
-        env.file_table,
+        env.file_table(),
         val.fd,
         "uring.op.submit.make_sqe_accept_multi",
     )?;
@@ -252,7 +260,11 @@ pub(crate) unsafe fn make_sqe_send_to(
     let msg = unsafe { kernel.init_send_to(user) }
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_send_to", err))?;
 
-    let fd = resolve_socket_fd(env.file_table, user.fd, "uring.op.submit.make_sqe_send_to")?;
+    let fd = resolve_socket_fd(
+        env.file_table(),
+        user.fd,
+        "uring.op.submit.make_sqe_send_to",
+    )?;
     opcode_build(
         "uring.op.submit.sendmsg_opcode",
         sqe_with_fd!(fd, |f| unsafe { opcode::SendMsg::new(f, msg.as_ptr()) }
@@ -270,7 +282,7 @@ pub(crate) unsafe fn make_sqe_udp_recv_from(
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_udp_recv_from", err))?;
 
     let sqe_fd = resolve_socket_fd(
-        env.file_table,
+        env.file_table(),
         user.fd,
         "uring.op.submit.make_sqe_udp_recv_from",
     )?;

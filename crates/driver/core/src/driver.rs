@@ -280,7 +280,7 @@ pub trait DriverRaw: sealed::Sealed {
     /// [`Self::try_recv_remote_cancel_request`] 取走。
     fn remote_cancel_sender_raw(&self) -> RemoteCancelSender;
 
-    /// 推进后端一次，并返回当前可消费状态以及下次超时提示。
+    /// 推进后端一次，并返回当前可消费状态、预算状态以及下次超时提示。
     ///
     /// `Poll` 必须只做一次非阻塞推进。`Wait` 必须先复查取消、控制事件和 ready
     /// completion；没有可立即消费的状态后，应等待用户 I/O completion、后端 waker、
@@ -289,9 +289,12 @@ pub trait DriverRaw: sealed::Sealed {
     /// 时间，驱动内部 timer 或有限的故障探测周期更早时必须取三者的最小值；超时返回
     /// 属于正常结果。
     ///
-    /// 返回前必须重新计算 [`DriveOutcome`] 的三个字段：`ready_completion` 只能表示
+    /// 返回前必须重新计算 [`DriveOutcome`] 的字段：`ready_completion` 只能表示
     /// 完成表中已有可由 future 消费的记录，`in_flight` 只表示当前仍在途的用户操作，
     /// 两者都不能由 deferred cleanup 或“将来可能完成”推导出来。
+    /// `pending_work` 描述本轮结束时仍需后续 round 处理的各类工作；
+    /// `budget_exhausted` 表示至少一个有 pending work 的预算已耗尽，
+    /// `needs_next_round` 表示调用方应继续调度 driver。
     fn drive_raw(
         &mut self,
         mode: DriveMode,
@@ -692,6 +695,37 @@ pub enum DriveMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DrivePendingWork {
+    /// 仍待接收并转为本地取消意图的远端取消请求数量或保守下界。
+    pub remote_cancels: usize,
+    /// 仍待执行的 lifecycle action 数量。
+    pub lifecycle_actions: usize,
+    /// 仍待处理的 submission backlog action 数量。
+    pub backlog_actions: usize,
+    /// 仍需执行的 kernel enter 数量或保守下界。
+    pub sqe_enters: usize,
+    /// completion queue 中仍待收集的 CQE 数量。
+    pub cqes: usize,
+    /// timer wheel 中仍待结算的到期 timer 数量。
+    pub timers: usize,
+    /// 仍待执行的 completion effect 数量。
+    pub effects: usize,
+}
+
+impl DrivePendingWork {
+    /// Returns whether any source still requires another drive round.
+    pub const fn is_empty(self) -> bool {
+        self.remote_cancels == 0
+            && self.lifecycle_actions == 0
+            && self.backlog_actions == 0
+            && self.sqe_enters == 0
+            && self.cqes == 0
+            && self.timers == 0
+            && self.effects == 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DriveOutcome {
     /// 从本次调用返回时刻起，到驱动内部下一个 timer 到期的相对时长。
     pub next_timeout_hint: Option<Duration>,
@@ -701,6 +735,12 @@ pub struct DriveOutcome {
     ///
     /// 该字段只用于观测和测试，不决定 idle 是否可以 Continue。
     pub in_flight: bool,
+    /// 本轮结束时各类仍待处理工作的可观测计数。
+    pub pending_work: DrivePendingWork,
+    /// 至少一个仍有 pending work 的预算在本轮耗尽。
+    pub budget_exhausted: bool,
+    /// 调用方应继续调度至少一个非阻塞 round。
+    pub needs_next_round: bool,
 }
 
 pub trait RemoteWaker<E>: Send + Sync

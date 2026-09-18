@@ -1,16 +1,23 @@
+use crate::driver::registration::file_table::OwnedFdOwnershipTicket;
 use crate::{
-    config::IoFd,
     driver::{
-        PendingCancel, UringCancelManager, UringTimerWheel, UringWakerManager,
+        control::{
+            CancelIntentError, CancelRequestDisposition, PendingCancel, UringCancelManager,
+            UringTimerWheel, UringWakerManager,
+        },
         control::{ControlPlaneEvent, ControlPlaneObserver},
+        env::{
+            CompletionControlParts, CompletionLedgerParts, CompletionMetadata,
+            SubmissionControlParts, SubmissionLedgerParts, SubmissionSidecarParts,
+        },
         lifecycle::CancellationPhase,
     },
     op::CompletionCleanupHintFn,
 };
 use veloq_driver_core::{
     driver::{
-        CancelTicket, CompletionControlKind, CompletionToken, CompletionTokenClass, OpToken,
-        RawCompletion,
+        CancelRequest, CancelTicket, CompletionControlKind, CompletionToken, CompletionTokenClass,
+        OpToken, RawCompletion,
     },
     slot::Generation,
 };
@@ -20,10 +27,17 @@ use veloq_std::{
     vec,
     vec::Vec,
 };
+use veloq_wheel::TimerId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BacklogEntry {
-    pub(crate) token: OpToken,
+    token: OpToken,
+}
+
+impl BacklogEntry {
+    pub(crate) const fn token(self) -> OpToken {
+        self.token
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,12 +141,6 @@ impl SubmissionBacklog {
             .is_some_and(|entry| entry.token == token)
     }
 
-    #[inline]
-    pub(crate) fn contains_any(&self) -> bool {
-        self.len != 0
-    }
-
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.len
     }
@@ -562,10 +570,20 @@ impl StagedRecord {
 /// tests a deterministic sequence to assert against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct UringControlEffect {
-    pub(crate) sequence: u64,
-    pub(crate) token: Option<OpToken>,
-    pub(crate) generation: Option<Generation>,
-    pub(crate) kind: UringControlEffectKind,
+    sequence: u64,
+    token: Option<OpToken>,
+    generation: Option<Generation>,
+    kind: UringControlEffectKind,
+}
+
+impl UringControlEffect {
+    pub(crate) const fn kind(self) -> UringControlEffectKind {
+        self.kind
+    }
+
+    pub(crate) const fn token(self) -> Option<OpToken> {
+        self.token
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -580,7 +598,7 @@ pub(crate) enum UringControlEffectKind {
         raw: RawCompletion,
     },
     CloseUnregister {
-        fd: IoFd,
+        ticket: OwnedFdOwnershipTicket,
     },
     WakerRebuild {
         generation: u64,
@@ -593,10 +611,28 @@ pub(crate) enum UringControlEffectKind {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DeferredCancelReconcile {
-    pub(crate) cancel_ticket: CancelTicket,
-    pub(crate) request: PendingCancel,
-    pub(crate) raw: RawCompletion,
-    pub(crate) since: Instant,
+    cancel_ticket: CancelTicket,
+    request: PendingCancel,
+    raw: RawCompletion,
+    since: Instant,
+}
+
+impl DeferredCancelReconcile {
+    pub(crate) const fn cancel_ticket(self) -> CancelTicket {
+        self.cancel_ticket
+    }
+
+    pub(crate) const fn request(self) -> PendingCancel {
+        self.request
+    }
+
+    pub(crate) const fn raw(self) -> RawCompletion {
+        self.raw
+    }
+
+    pub(crate) const fn since(self) -> Instant {
+        self.since
+    }
 }
 
 /// Deferred effects produced while routing one completion or one CQ batch.
@@ -746,6 +782,11 @@ impl UringPostCompletionEffects {
     }
 
     #[inline]
+    pub(crate) fn len(&self) -> usize {
+        self.effects.len()
+    }
+
+    #[inline]
     pub(crate) fn is_overflowed(&self) -> bool {
         self.overflowed
     }
@@ -781,21 +822,21 @@ impl Default for UringPostCompletionEffects {
 
 /// The single owner of uring's backend control-plane state.
 pub(crate) struct UringControlPlane {
-    pub(crate) backlog: SubmissionBacklog,
-    pub(crate) staged_entries: StagedLedger,
-    pub(crate) cancellations: UringCancelManager,
-    pub(crate) waker: UringWakerManager,
-    pub(crate) timers: UringTimerWheel,
-    pub(crate) completion_cleanup_hints: HashMap<CompletionToken, Option<CompletionCleanupHintFn>>,
-    pub(crate) completion_cleanup_capacity: usize,
-    pub(crate) observer: ControlPlaneObserver,
-    pub(crate) post: UringPostCompletionEffects,
-    pub(crate) deferred_cancel_reconciles: Vec<DeferredCancelReconcile>,
-    pub(crate) quarantined_timers: HashSet<OpToken>,
-    pub(crate) quarantined_tokens: HashSet<OpToken>,
-    pub(crate) waker_stage_pending: bool,
+    backlog: SubmissionBacklog,
+    staged_entries: StagedLedger,
+    cancellations: UringCancelManager,
+    waker: UringWakerManager,
+    timers: UringTimerWheel,
+    completion_cleanup_hints: HashMap<CompletionToken, Option<CompletionCleanupHintFn>>,
+    completion_cleanup_capacity: usize,
+    observer: ControlPlaneObserver,
+    post: UringPostCompletionEffects,
+    deferred_cancel_reconciles: Vec<DeferredCancelReconcile>,
+    quarantined_timers: HashSet<OpToken>,
+    quarantined_tokens: HashSet<OpToken>,
+    waker_stage_pending: bool,
     #[cfg(feature = "test-hooks")]
-    pub(crate) push_entry_failure: bool,
+    push_entry_failure: bool,
 }
 
 impl UringControlPlane {
@@ -827,6 +868,224 @@ impl UringControlPlane {
             #[cfg(feature = "test-hooks")]
             push_entry_failure: false,
         }
+    }
+
+    pub(crate) fn waker(&self) -> &UringWakerManager {
+        &self.waker
+    }
+
+    pub(crate) fn waker_mut(&mut self) -> &mut UringWakerManager {
+        &mut self.waker
+    }
+
+    pub(crate) fn timers(&self) -> &UringTimerWheel {
+        &self.timers
+    }
+
+    pub(crate) fn timers_mut(&mut self) -> &mut UringTimerWheel {
+        &mut self.timers
+    }
+
+    pub(crate) fn cancel_timer(&mut self, task_id: TimerId, token: OpToken) {
+        self.timers.cancel(task_id);
+        self.observer
+            .record(ControlPlaneEvent::TimerCancel { task_id, token });
+    }
+
+    // Backlog commands are deliberately generation-aware and record their observer event at the
+    // mutation site. Callers cannot remove an entry without keeping the control-plane observer in
+    // sync.
+    pub(crate) fn backlog_contains(&self, token: OpToken) -> bool {
+        self.backlog.contains(token)
+    }
+
+    pub(crate) fn backlog_front(&self) -> Option<BacklogEntry> {
+        self.backlog.front()
+    }
+
+    pub(crate) fn backlog_len(&self) -> usize {
+        self.backlog.len()
+    }
+
+    pub(crate) fn push_backlog(&mut self, token: OpToken) -> Result<(), BacklogError> {
+        let result = self.backlog.push(token);
+        if result.is_ok() {
+            self.observer.record(ControlPlaneEvent::BacklogPush(token));
+        }
+        result
+    }
+
+    pub(crate) fn pop_backlog(&mut self) -> Option<BacklogEntry> {
+        let entry = self.backlog.pop_front();
+        if let Some(entry) = entry {
+            self.observer
+                .record(ControlPlaneEvent::BacklogPop(entry.token()));
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn remove_backlog(&mut self, token: OpToken) -> Result<BacklogEntry, BacklogError> {
+        let result = self.backlog.remove(token);
+        if result.is_ok() {
+            self.observer
+                .record(ControlPlaneEvent::BacklogRemove(token));
+        }
+        result
+    }
+
+    pub(crate) fn try_recv_cancel(&mut self) -> Option<CancelRequest> {
+        self.cancellations.try_recv_remote()
+    }
+
+    pub(crate) fn remote_cancel_sender(&self) -> veloq_driver_core::driver::RemoteCancelSender {
+        self.cancellations.remote_sender()
+    }
+
+    pub(crate) fn pending_cancel_len(&self) -> usize {
+        self.cancellations.pending_len()
+    }
+
+    pub(crate) fn front_pending_cancel(&self) -> Option<PendingCancel> {
+        self.cancellations.front_pending().copied()
+    }
+
+    pub(crate) fn cancel_ticket_for(&self, token: OpToken) -> Option<CancelTicket> {
+        self.cancellations.ticket_for(token)
+    }
+
+    pub(crate) fn request_cancel(
+        &mut self,
+        request: PendingCancel,
+    ) -> Result<CancelRequestDisposition, CancelIntentError> {
+        self.cancellations.request(request)
+    }
+
+    pub(crate) fn mark_cancel_staged(
+        &mut self,
+        ticket: CancelTicket,
+        target: OpToken,
+    ) -> Result<(), CancelIntentError> {
+        self.cancellations.mark_staged(ticket, target)
+    }
+
+    pub(crate) fn fail_cancel_request(&mut self, ticket: CancelTicket, target: OpToken) {
+        self.cancellations.cancel_request_failed(ticket, target);
+    }
+
+    pub(crate) fn remove_pending_cancel(&mut self, target: OpToken) -> Option<PendingCancel> {
+        self.cancellations.remove_pending_target(target)
+    }
+
+    pub(crate) fn cancel_ticket_for_completion(
+        &mut self,
+        ticket: CancelTicket,
+        target: OpToken,
+    ) -> Option<PendingCancel> {
+        self.cancellations.finish_ticket(ticket, target)
+    }
+
+    pub(crate) fn cancel_in_flight_len(&self) -> usize {
+        self.cancellations.in_flight_len()
+    }
+
+    pub(crate) fn clear_cancel_in_flight(&mut self) {
+        self.cancellations.clear_in_flight();
+    }
+
+    pub(crate) fn for_each_kernel_cancel(&self, operation: impl FnMut(CancelTicket, OpToken)) {
+        self.staged_entries.for_each_kernel_cancel(operation);
+    }
+
+    pub(crate) fn for_each_kernel_user(&self, operation: impl FnMut(OpToken)) {
+        self.staged_entries.for_each_kernel_user(operation);
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn backlog_entries(&self) -> Vec<BacklogEntry> {
+        self.backlog.entries()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn pending_cancel_targets(&self) -> Vec<OpToken> {
+        self.cancellations.pending_targets().collect()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn in_flight_cancel_targets(&self) -> Vec<(CancelTicket, OpToken)> {
+        self.cancellations.in_flight_targets().collect()
+    }
+
+    pub(crate) fn completion_cleanup_hints_mut(
+        &mut self,
+    ) -> &mut HashMap<CompletionToken, Option<CompletionCleanupHintFn>> {
+        &mut self.completion_cleanup_hints
+    }
+
+    pub(crate) fn completion_cleanup_hints(
+        &self,
+    ) -> &HashMap<CompletionToken, Option<CompletionCleanupHintFn>> {
+        &self.completion_cleanup_hints
+    }
+
+    pub(crate) fn observer_mut(&mut self) -> &mut ControlPlaneObserver {
+        &mut self.observer
+    }
+
+    pub(crate) fn set_waker_stage_pending(&mut self, pending: bool) {
+        self.waker_stage_pending = pending;
+    }
+
+    pub(crate) const fn waker_stage_pending(&self) -> bool {
+        self.waker_stage_pending
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn inject_push_entry_failure(&mut self) {
+        self.push_entry_failure = true;
+    }
+
+    pub(crate) fn submission_parts<'d>(&'d mut self) -> SubmissionControlParts<'d> {
+        let staged_entries = &mut self.staged_entries;
+        let timers = &mut self.timers;
+        let observer = &mut self.observer;
+        let completion_cleanup_hints = &mut self.completion_cleanup_hints;
+        let completion_cleanup_capacity = self.completion_cleanup_capacity;
+        let cancel_capacity = self.cancellations.capacity();
+        let pending_cancel_cqes = self.cancellations.in_flight_mut();
+        let ledger =
+            SubmissionLedgerParts::new(staged_entries, timers, observer, completion_cleanup_hints);
+        #[cfg(not(feature = "test-hooks"))]
+        let sidecar = SubmissionSidecarParts::new(
+            completion_cleanup_capacity,
+            pending_cancel_cqes,
+            cancel_capacity,
+        );
+        #[cfg(feature = "test-hooks")]
+        let sidecar = SubmissionSidecarParts::new(
+            completion_cleanup_capacity,
+            pending_cancel_cqes,
+            cancel_capacity,
+            &mut self.push_entry_failure,
+        );
+        SubmissionControlParts::new(ledger, sidecar)
+    }
+
+    pub(crate) fn completion_parts<'d>(&'d mut self) -> CompletionControlParts<'d> {
+        let waker_view = self.waker.hooks_view();
+        let metadata = CompletionMetadata::new(waker_view.buf_len(), waker_view.generation());
+        let pending_cancel_cqes = self.cancellations.in_flight_mut();
+        let completion_cleanup_hints = &mut self.completion_cleanup_hints;
+        let observer = &mut self.observer;
+        let post = &mut self.post;
+        let ledger = CompletionLedgerParts::new(
+            pending_cancel_cqes,
+            completion_cleanup_hints,
+            observer,
+            post,
+        );
+        CompletionControlParts::new(ledger, metadata)
     }
 
     #[inline]
@@ -918,7 +1177,7 @@ impl UringControlPlane {
             .staged_entries
             .validate(StagedEntry::Cancel {
                 ticket,
-                target: request.target,
+                target: request.target(),
             })
             .is_err()
         {
@@ -929,7 +1188,7 @@ impl UringControlPlane {
             .staged_entries
             .push(StagedEntry::Cancel {
                 ticket,
-                target: request.target,
+                target: request.target(),
             })
             .is_err()
         {
@@ -939,7 +1198,7 @@ impl UringControlPlane {
         self.observer
             .record(ControlPlaneEvent::CancelInFlightInsert {
                 ticket,
-                target: request.target,
+                target: request.target(),
             });
         Ok(())
     }
@@ -1046,6 +1305,7 @@ impl UringControlPlane {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::IoFd;
     use veloq_driver_core::driver::CancelMode;
     use veloq_driver_core::slot::Generation;
 
@@ -1263,10 +1523,7 @@ mod tests {
     fn stage_cancel_records_one_sidecar_entry_and_one_staged_entry() {
         let target = token(8, 5);
         let ticket = CancelTicket::try_new(11).expect("test ticket");
-        let request = PendingCancel {
-            target,
-            mode: CancelMode::Abandon,
-        };
+        let request = PendingCancel::from_parts(target, CancelMode::Abandon);
         let mut plane = UringControlPlane::new(UringWakerManager::new().expect("test eventfd"));
 
         plane
@@ -1287,14 +1544,8 @@ mod tests {
         let target = token(9, 5);
         let replacement = token(10, 6);
         let ticket = CancelTicket::try_new(12).expect("test ticket");
-        let first = PendingCancel {
-            target,
-            mode: CancelMode::UserVisible,
-        };
-        let second = PendingCancel {
-            target: replacement,
-            mode: CancelMode::Abandon,
-        };
+        let first = PendingCancel::from_parts(target, CancelMode::UserVisible);
+        let second = PendingCancel::from_parts(replacement, CancelMode::Abandon);
         let mut plane = UringControlPlane::new(UringWakerManager::new().expect("test eventfd"));
 
         plane.stage_cancel(ticket, first).expect("first stage");
@@ -1381,7 +1632,7 @@ mod tests {
             Some(token),
             Some(token.generation()),
             UringControlEffectKind::CloseUnregister {
-                fd: IoFd::fixed(12),
+                ticket: OwnedFdOwnershipTicket::new(token, IoFd::fixed(12)),
             },
         );
 

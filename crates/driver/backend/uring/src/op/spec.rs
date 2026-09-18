@@ -1,6 +1,6 @@
 use crate::{
     OwnedRawHandle,
-    driver::{CqeEnv, SqeEnv},
+    driver::env::{CqeEnv, SqeEnv},
     error::{UringError, UringResult},
     op::{
         Accept, AcceptMulti, AcceptedSocket, Close, CompletionCardinality, Connect,
@@ -84,7 +84,7 @@ pub(crate) trait UringOpSpec: Sized + Send + 'static {
         _token: OpToken,
         _result: i32,
         _flags: u32,
-        _env: &mut CqeEnv<'_>,
+        _env: &mut CqeEnv<'_, '_>,
     ) -> UringResult<UringRecordItem> {
         Ok(UringRecordItem::UseSubmitPayload)
     }
@@ -143,7 +143,7 @@ pub(crate) trait UringOperationDescriptor: UringOpSpec {
         token: OpToken,
         result: i32,
         flags: u32,
-        env: &mut CqeEnv<'_>,
+        env: &mut CqeEnv<'_, '_>,
     ) -> UringResult<UringRecordItem>;
 }
 
@@ -225,7 +225,7 @@ fn descriptor_record_item_submit<S>(
     _token: OpToken,
     _result: i32,
     _flags: u32,
-    _env: &mut CqeEnv<'_>,
+    _env: &mut CqeEnv<'_, '_>,
 ) -> UringResult<UringRecordItem>
 where
     S: UringOpSpec,
@@ -239,7 +239,7 @@ fn descriptor_record_item_provided<S>(
     _token: OpToken,
     result: i32,
     flags: u32,
-    env: &mut CqeEnv<'_>,
+    env: &mut CqeEnv<'_, '_>,
 ) -> UringResult<UringRecordItem>
 where
     S: UringOpSpec,
@@ -256,7 +256,7 @@ fn descriptor_record_item_accepted<S>(
     _token: OpToken,
     _result: i32,
     _flags: u32,
-    _env: &mut CqeEnv<'_>,
+    _env: &mut CqeEnv<'_, '_>,
 ) -> UringResult<UringRecordItem>
 where
     S: UringOpSpec,
@@ -471,7 +471,7 @@ macro_rules! impl_uring_op_spec {
                 token: OpToken,
                 result: i32,
                 flags: u32,
-                env: &mut CqeEnv<'_>,
+                env: &mut CqeEnv<'_, '_>,
             ) -> UringResult<UringRecordItem> {
                 descriptor_record_factory!($record_factory)(
                     kernel, payload, token, result, flags, env,
@@ -674,7 +674,7 @@ macro_rules! impl_uring_operation_descriptor {
                 token: OpToken,
                 result: i32,
                 flags: u32,
-                env: &mut CqeEnv<'_>,
+                env: &mut CqeEnv<'_, '_>,
             ) -> UringResult<UringRecordItem> {
                 unsafe {
                     Self::with_projected_access(
@@ -2001,7 +2001,11 @@ mod tests {
     use crate::{
         config::{FileTableExhaustion, IoFd, SockAddrStorage, UringRawHandle},
         diagnostics::UringCompletionDiagnostics,
-        driver::{CqeEnv, FileTable, SqeEnv, UringOpState},
+        driver::{
+            env::{CqeEnv, SqeEnv},
+            lifecycle::UringOpState,
+            registration::file_table::FileTable,
+        },
         net::socket_addr_to_storage,
         op::{UringOp, UringOpRegistry, UringOperationDescriptor},
         test_alloc::{AllocationCounts, measure},

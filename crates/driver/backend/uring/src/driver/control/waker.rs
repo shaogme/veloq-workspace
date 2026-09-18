@@ -21,7 +21,13 @@ pub(crate) const WAKER_REARM: u8 = 3;
 pub(crate) const WAKER_RENOTIFIED: u8 = 4;
 
 pub(crate) struct EventFd {
-    pub(crate) fd: OwnedRawHandle,
+    fd: OwnedRawHandle,
+}
+
+impl EventFd {
+    pub(crate) const fn raw(&self) -> UringRawHandle {
+        self.fd.raw()
+    }
 }
 
 pub(crate) struct WakerFdState {
@@ -56,8 +62,8 @@ impl WakerFdState {
 }
 
 pub(crate) struct UringWaker {
-    pub(crate) state: Arc<WakerFdState>,
-    pub(crate) notification_state: Arc<AtomicU8>,
+    state: Arc<WakerFdState>,
+    notification_state: Arc<AtomicU8>,
 }
 
 impl RemoteWaker<UringError> for UringWaker {
@@ -118,7 +124,7 @@ impl UringWaker {
 
     pub(crate) fn write_event_fd(fd: &EventFd) -> UringResult<()> {
         let buf = 1u64.to_ne_bytes();
-        let ret = unsafe { libc::write(fd.fd.raw().as_fd(), buf.as_ptr() as *const _, 8) };
+        let ret = unsafe { libc::write(fd.raw().as_fd(), buf.as_ptr() as *const _, 8) };
         if ret < 0 {
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EAGAIN) {
@@ -178,8 +184,18 @@ impl UringWaker {
 }
 
 pub(crate) struct WakerHooksView {
-    pub(crate) buf_len: usize,
-    pub(crate) generation: u64,
+    buf_len: usize,
+    generation: u64,
+}
+
+impl WakerHooksView {
+    pub(crate) const fn buf_len(&self) -> usize {
+        self.buf_len
+    }
+
+    pub(crate) const fn generation(&self) -> u64 {
+        self.generation
+    }
 }
 
 pub(crate) struct UringWakerManager {
@@ -346,7 +362,7 @@ mod tests {
         let mut value = 0u64;
         let ret = unsafe {
             libc::read(
-                fd.fd.raw().as_fd(),
+                fd.raw().as_fd(),
                 (&mut value as *mut u64).cast(),
                 mem::size_of::<u64>(),
             )
@@ -381,8 +397,8 @@ mod tests {
             .expect("notification after replacement should succeed");
         assert_eq!(read_event_fd(&new_fd), 2);
         assert_eq!(read_event_fd(&old_fd), 1);
-        assert_eq!(manager.state.current().fd.raw(), new_fd.fd.raw());
-        assert_ne!(old_fd.fd.raw(), new_fd.fd.raw());
+        assert_eq!(manager.state.current().raw(), new_fd.raw());
+        assert_ne!(old_fd.raw(), new_fd.raw());
     }
 
     #[test]

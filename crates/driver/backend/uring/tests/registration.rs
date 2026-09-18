@@ -11,15 +11,15 @@ use veloq_std::{
 
 use veloq_buf::NoopRegistrar;
 use veloq_driver_core::driver::{
-    CompletionRecord, CompletionValue, DriveMode, Driver, DriverSubmitResult, PollRecordResult,
-    RegisterFd, SubmitStatus,
+    CancelRequest, CompletionRecord, CompletionValue, DriveMode, Driver, DriverCapability,
+    DriverSubmitResult, PollRecordResult, RegisterFd, SubmitStatus,
 };
 
 #[cfg(feature = "test-hooks")]
 use veloq_driver_core::driver::test_hooks::{DriverTestHooks, RegisterFilesUpdateOutcome};
 use veloq_driver_core::op::{
     IntoPlatformOp,
-    types::{Close as CoreClose, Fsync as CoreFsync},
+    types::{Close as CoreClose, Fsync as CoreFsync, Timeout as CoreTimeout},
 };
 use veloq_driver_uring::{
     FileTableExhaustion, IoFd, OwnedRawHandle, RawHandle, UringConfig, UringDriveLimits,
@@ -28,6 +28,7 @@ use veloq_driver_uring::{
 
 type Close = CoreClose<UringRawHandle>;
 type Fsync = CoreFsync<UringRawHandle>;
+type Timeout = CoreTimeout;
 
 fn new_driver_or_skip() -> Option<UringDriver<'static>> {
     static REGISTRAR: NoopRegistrar = NoopRegistrar;
@@ -38,6 +39,92 @@ fn new_driver_or_skip() -> Option<UringDriver<'static>> {
             None
         }
     }
+}
+
+#[test]
+fn software_timer_stays_out_of_sq_backlog_when_sq_is_full_and_cancelled() {
+    static REGISTRAR: NoopRegistrar = NoopRegistrar;
+    let config = UringConfig {
+        entries: NonZeroU32::new(1).expect("non-zero SQ capacity"),
+        drive_limits: UringDriveLimits::for_entries(1),
+        ..UringConfig::default()
+    };
+    let Ok(mut driver) = UringDriver::new(config, &REGISTRAR) else {
+        eprintln!("skipping timer/SQ-full test: io_uring setup unavailable");
+        return;
+    };
+
+    // Driver construction arms the eventfd waker, so the one-entry SQ is already full. A
+    // software timer must still be accepted without creating a backlog entry or touching SQ.
+    let token = submit_test_op(
+        &mut driver,
+        Timeout {
+            duration: Duration::from_secs(1),
+        },
+    );
+    assert_eq!(
+        driver
+            .cancel_op(CancelRequest::user_visible(token))
+            .expect("timer cancellation should succeed"),
+        veloq_driver_core::driver::CancelSubmitOutcome::CompletedLocally
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let record = match driver.completion_table().try_take_record(token).unwrap() {
+            PollRecordResult::Ready(record) => Some(record),
+            PollRecordResult::Pending => None,
+            PollRecordResult::Unavailable { kind, .. } => {
+                panic!("timer cancellation record unavailable: {kind:?}")
+            }
+        };
+        if let Some(mut record) = record {
+            assert_eq!(record.event.res(), -libc::ECANCELED);
+            record.cleanup.disarm();
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timer cancellation did not settle"
+        );
+        driver.drive(DriveMode::Poll).expect("drive failed");
+    }
+}
+
+#[test]
+fn capability_snapshot_preserves_baseline_after_rejection() {
+    let Some(mut driver) = new_driver_or_skip() else {
+        return;
+    };
+
+    let before = driver.capability_state_snapshot();
+    let capability = if before.effective.accept_multi {
+        DriverCapability::AcceptMulti
+    } else if before.effective.recv_multi {
+        DriverCapability::RecvMulti
+    } else {
+        eprintln!("skipping capability rejection assertion: no rejectable capability");
+        return;
+    };
+
+    driver.note_capability_rejected(capability);
+    let after = driver.capability_state_snapshot();
+
+    assert_eq!(after.baseline, before.baseline);
+    assert_eq!(after.negotiated, before.negotiated);
+    match capability {
+        DriverCapability::AcceptMulti => assert!(!after.effective.accept_multi),
+        DriverCapability::RecvMulti => assert!(!after.effective.recv_multi),
+        DriverCapability::ProvidedBuffers => unreachable!(),
+    }
+    let reason = after
+        .disabled_reasons
+        .iter()
+        .flatten()
+        .find(|reason| reason.capability == capability)
+        .copied()
+        .expect("rejected capability should have a disable reason");
+    assert_eq!(reason.source, "kernel_rejected");
 }
 
 /// A driver whose kernel file table holds `capacity` entries, one of which the eventfd waker

@@ -137,7 +137,7 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                     })?;
                 self.env.transition_submission_state(
                     self.token,
-                    &mut slot.platform_mut().control.submission,
+                    slot.platform_mut(),
                     next_phase,
                     if pushed {
                         "submit transaction staged SQE"
@@ -191,10 +191,10 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                         )
                     })?;
                 let platform = slot.platform_mut();
-                platform.timer_id = Some(task_id);
+                platform.arm_timer(task_id);
                 self.env.transition_submission_state(
                     self.token,
-                    &mut platform.control.submission,
+                    platform,
                     SubmissionPhase::TimerArmed,
                     "submit transaction armed software timer",
                 );

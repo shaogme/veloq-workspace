@@ -96,4 +96,9 @@ impl UringTimerWheel {
     pub(crate) fn has_pending_expired(&self) -> bool {
         !self.timer_buffer.is_empty()
     }
+
+    #[inline]
+    pub(crate) fn pending_expired_len(&self) -> usize {
+        self.timer_buffer.len()
+    }
 }

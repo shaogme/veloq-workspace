@@ -284,6 +284,9 @@ impl<'a> DriverRaw for IocpDriver<'a> {
             next_timeout_hint,
             ready_completion: self.ops.shared.has_ready_completion(),
             in_flight: self.has_active_ops_internal(),
+            pending_work: Default::default(),
+            budget_exhausted: false,
+            needs_next_round: false,
         })
     }
 

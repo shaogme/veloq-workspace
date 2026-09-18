@@ -2,26 +2,34 @@ use diagweave::prelude::*;
 use tracing::{debug, trace};
 use veloq_buf::{AnyBufPool, BufferRegistrar, heap::ChunkId};
 use veloq_io_uring::{
-    IoUring, KernelCapabilities, Probe, ResourceLayout, ResourceRegistration, RingConfig,
-    SetupFlags, SetupPolicy, opcode, types,
+    IoUring, KernelCapabilities, Probe, ResourceLayout, RingConfig, SetupFlags, SetupPolicy,
+    opcode, types,
 };
 use veloq_std::{format, io, sync::Arc, vec::Vec};
 
 #[cfg(feature = "test-hooks")]
-use veloq_std::{collections::VecDeque, string::String};
+use veloq_std::string::String;
 
 use crate::{
-    config::{IoFd, IoMode, RawHandle, UringConfig, UringDriveLimits, UringRawHandle},
+    config::{IoFd, IoMode, UringConfig, UringRawHandle},
     diagnostics::{
         UringCapabilitySnapshot, UringCompletionDiagnostics, UringCompletionDiagnosticsSnapshot,
         UringSetupSnapshot,
     },
-    driver::control::ControlPlaneEvent,
-    error::{UringError, UringResult},
-    op::{
-        CheckedSlotView, SlotView, UringOp, UringOpRegistry, UringOpRegistryExt, UringSlotSpec,
-        UringUserPayload,
+    driver::{
+        capability::{CapabilityState, CapabilityStateSnapshot},
+        completion::CompletionEngine,
+        context::{DriveContext, SubmitPort},
+        control::{ControlPlaneEvent, UringControlPlane, UringWakerManager},
+        drive::DriveCoordinator,
+        lifecycle::LifecycleEngine,
+        operation::OperationLedger,
+        registration::provided_buf::{PROVIDED_BUF_GROUP_ID, RingLifetimeOwner},
+        registration::{MAX_CHUNKS, OperationProbe, RegistrationEngine, RegistrationPorts},
+        submission::SubmissionEngine,
     },
+    error::{UringError, UringResult},
+    op::{UringOp, UringSlotSpec, UringUserPayload},
 };
 use veloq_driver_core::driver::{
     BufferRegistrationStatus, CancelRequest, CancelSubmitOutcome, CompletionToken, DriveMode,
@@ -32,37 +40,22 @@ use veloq_driver_core::driver::{
     sealed,
 };
 
-#[cfg(any(test, feature = "test-hooks"))]
-use crate::{
-    driver::control::{ControlInvariantError, ControlPlaneSnapshot, ControlTokenSnapshot},
-    driver::lifecycle::SubmissionPhase,
-};
-
-#[cfg(any(test, feature = "test-hooks"))]
-use veloq_driver_core::driver::CancelTicket;
-
-mod completion;
-mod control;
-mod env;
-mod lifecycle;
-mod registration;
-mod submission;
+pub(crate) mod capability;
+pub(crate) mod completion;
+pub(crate) mod context;
+pub(crate) mod control;
+pub(crate) mod drive;
+pub(crate) mod env;
+pub(crate) mod lifecycle;
+pub(crate) mod operation;
+pub(crate) mod registration;
+pub(crate) mod submission;
 
 #[cfg(test)]
 mod protocol_model;
 
-pub(crate) use completion::DriveCycle;
-pub(crate) use control::{
-    PendingCancel, UringCancelManager, UringControlPlane, UringPostCompletionEffects,
-    UringTimerWheel, UringWakerManager,
-};
-pub(crate) use env::{CompletionControlView, CqeEnv, SqeEnv};
 pub use lifecycle::UringOpState;
-pub use registration::ProvidedBufStats;
-pub(crate) use registration::{
-    FileTable, MAX_CHUNKS, PROVIDED_BUF_GROUP_ID, ProvidedBufGroup, RegisteredFileEntry,
-    RingLifetimeOwner, SqeFd, UringBufferRegistry, UringRegistrationStats,
-};
+pub use registration::ProvidedBufferSnapshot;
 
 /// 从 opcode 探测结果得出乐观的能力集合。
 ///
@@ -238,51 +231,29 @@ fn build_negotiated_ring(config: &UringConfig) -> UringResult<(IoUring, SetupNeg
     ))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ProvidedBufQuiesce {
-    active_operations: usize,
-    armed_provided_multishot: bool,
-    pending_completions: bool,
-    selected_bids: bool,
-}
-
-impl ProvidedBufQuiesce {
-    #[inline]
-    const fn is_quiescent(self) -> bool {
-        self.active_operations == 0
-            && !self.armed_provided_multishot
-            && !self.pending_completions
-            && !self.selected_bids
-    }
-}
-
 pub struct UringDriver<'a> {
     // Rust 按声明顺序从上到下析构字段。`ring`、`ring_lifetime` 必须在
-    // `buffer_registry` 之前声明：Drop 函数体只尝试显式反注册；如果 syscall 失败或 driver
+    // `registration` 之前声明：Drop 函数体只尝试显式反注册；如果 syscall 失败或 driver
     // 尚未 quiescent，group 会留在 registry 中。函数体返回后，`IoUring` 先析构并关闭 ring
-    // fd，随后 `ring_lifetime` 把 owner token 标记为 dead，最后 registry 才释放 mapping 和
+    // fd，随后 `ring_lifetime` 把 owner token 标记为 dead，最后 registration 才释放 mapping 和
     // `FixedBuf`。这把原来仅靠字段顺序的兜底变成了可断言的生命周期协议。
-    pub(crate) ring: IoUring,
+    ring: IoUring,
     ring_lifetime: RingLifetimeOwner,
-    pub(crate) ops: UringOpRegistry,
-    pub(crate) completion_diagnostics: DriverCompletionDiagnostics<UringCompletionDiagnostics>,
-    pub(crate) completion_table: SharedCompletionTable<UringSlotSpec>,
+    operations: OperationLedger,
+    completion_diagnostics: DriverCompletionDiagnostics<UringCompletionDiagnostics>,
+    completion_table: SharedCompletionTable<UringSlotSpec>,
 
-    pub(crate) control: UringControlPlane,
-    pub(crate) buffer_registry: UringBufferRegistry<'a>,
-
-    /// Reused across completion batches so draining the CQ never allocates.
-    pub(crate) cqe_buffer: Vec<(u64, i32, u32)>,
-    pub(crate) effect_accumulator: Option<UringPostCompletionEffects>,
-    pub(crate) drive_limits: UringDriveLimits,
-    pub(crate) file_table: FileTable,
-    pub(crate) file_registration: Option<ResourceRegistration>,
+    control: UringControlPlane,
     setup_negotiation: SetupNegotiation,
-    #[cfg(feature = "test-hooks")]
-    pub(crate) register_files_update_outcomes: VecDeque<RegisterFilesUpdateOutcome>,
-    pub(crate) kernel_capabilities: KernelCapabilities,
-    pub(crate) capabilities: DriverCapabilities,
-    pub(crate) submission_fail_stop: bool,
+    kernel_capabilities: KernelCapabilities,
+    capability_state: CapabilityState,
+    // Component owners keep submission, lifecycle, completion scratch and drive budgets out of
+    // the public facade while preserving the existing protocol implementation.
+    registration: RegistrationEngine<'a>,
+    submission: SubmissionEngine,
+    lifecycle: LifecycleEngine,
+    completion: CompletionEngine,
+    drive: DriveCoordinator,
 }
 
 impl<'a> UringDriver<'a> {
@@ -302,9 +273,9 @@ impl<'a> UringDriver<'a> {
             })?;
         let (mut ring, setup_negotiation) = build_negotiated_ring(config)?;
 
-        let ops = UringOpRegistry::new(entries as usize);
-        let completion_table: SharedCompletionTable<UringSlotSpec> = ops.shared.clone();
-        let completion_diagnostics = ops.shared.completion_diagnostics();
+        let operations = OperationLedger::new(entries as usize);
+        let completion_table: SharedCompletionTable<UringSlotSpec> = operations.shared_table();
+        let completion_diagnostics = operations.shared.completion_diagnostics();
 
         let waker = UringWakerManager::new()?;
         let ring_lifetime = RingLifetimeOwner::new();
@@ -334,44 +305,45 @@ impl<'a> UringDriver<'a> {
         let mut driver = Self {
             ring,
             ring_lifetime,
-            ops,
+            operations,
             completion_diagnostics,
             completion_table,
             control: UringControlPlane::with_capacity(
                 waker,
                 (entries as usize).saturating_mul(2).saturating_add(1),
             ),
-            buffer_registry: UringBufferRegistry::new(
+            setup_negotiation,
+            kernel_capabilities,
+            capability_state: CapabilityState::new(probe_capabilities(&ring_probe)),
+            registration: RegistrationEngine::new(
                 config.registration_mode,
                 config.provided_buffers,
                 registrar,
+                config.file_table_capacity,
+                config.file_table_exhaustion,
             ),
-            cqe_buffer: Vec::with_capacity(
+            submission: SubmissionEngine::new(),
+            lifecycle: LifecycleEngine::new(),
+            completion: CompletionEngine::with_capacity(
                 config
                     .drive_limits
                     .max_cqe_batch
                     .max(config.drive_limits.emergency_drain_limit),
-            ),
-            effect_accumulator: Some(UringPostCompletionEffects::with_capacity(
                 config
                     .drive_limits
                     .max_cqe_batch
                     .max(config.drive_limits.emergency_drain_limit)
                     .saturating_mul(4)
                     .saturating_add(8),
-            )),
-            drive_limits: config.drive_limits,
-            file_table: FileTable::new(config.file_table_capacity, config.file_table_exhaustion),
-            file_registration: None,
-            setup_negotiation,
-            #[cfg(feature = "test-hooks")]
-            register_files_update_outcomes: VecDeque::new(),
-            kernel_capabilities,
-            capabilities: probe_capabilities(&ring_probe),
-            submission_fail_stop: false,
+                config.drive_limits,
+            ),
+            drive: DriveCoordinator::new(config.drive_limits),
         };
 
-        driver.ensure_file_table_initialized()?;
+        let submitter = driver.ring.submitter();
+        driver
+            .registration
+            .ensure_file_table_initialized(&submitter, &mut driver.kernel_capabilities)?;
 
         match driver.ring.submitter().register_buffers_sparse(MAX_CHUNKS) {
             Ok(registration) => {
@@ -379,7 +351,7 @@ impl<'a> UringDriver<'a> {
                     .kernel_capabilities
                     .with_buffer_registration(&registration);
                 driver
-                    .buffer_registry
+                    .registration
                     .set_fixed_buffers_available(registration);
                 debug!(
                     registration_mode = config.registration_mode.as_str(),
@@ -398,7 +370,7 @@ impl<'a> UringDriver<'a> {
                         false,
                         errno,
                     );
-                driver.buffer_registry.set_fixed_buffers_unavailable(errno);
+                driver.registration.set_fixed_buffers_unavailable(errno);
                 tracing::warn!(
                     registration_mode = config.registration_mode.as_str(),
                     errno = ?errno,
@@ -417,10 +389,30 @@ impl<'a> UringDriver<'a> {
             }
         }
 
-        driver.submit_waker()?;
+        {
+            let Self {
+                operations,
+                control,
+                registration,
+                completion_diagnostics,
+                ring,
+                kernel_capabilities,
+                submission,
+                ..
+            } = &mut driver;
+            let mut context = SubmitPort::from_parts(
+                operations,
+                control,
+                registration,
+                completion_diagnostics,
+                ring,
+                kernel_capabilities,
+            );
+            submission.submit_waker(&mut context)?;
+        }
 
         debug!(
-            capabilities = ?driver.capability_snapshot(),
+            capabilities = ?driver.capability_state_snapshot(),
             "recorded io_uring capability snapshot"
         );
 
@@ -434,300 +426,14 @@ impl<'a> UringDriver<'a> {
         Self::new_internal(config, registrar).attach_note("create uring driver")
     }
 
-    fn has_active_ops_internal(&self) -> bool {
-        self.ops.has_active_ops()
-    }
-
-    fn has_armed_provided_multishot(&mut self) -> bool {
-        let active_tokens: Vec<OpToken> = self.ops.active_tokens().collect();
-        active_tokens.into_iter().any(|token| {
-            let Ok(view) = self.ops.checked_slot_view(token) else {
-                return true;
-            };
-            match view {
-                CheckedSlotView::Valid(SlotView::Reserved(mut slot)) => slot
-                    .with_access_mut(|access| access.operation().get_ref().is_provided_multishot())
-                    .unwrap_or(true),
-                CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => slot
-                    .with_access_mut(|access| access.operation().get_ref().is_provided_multishot())
-                    .unwrap_or(true),
-                CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot)) => slot
-                    .with_access_mut(|access| access.operation().get_ref().is_provided_multishot())
-                    .unwrap_or(true),
-                CheckedSlotView::Empty(_)
-                | CheckedSlotView::Missing { .. }
-                | CheckedSlotView::Stale(_) => true,
-            }
-        })
-    }
-
-    fn has_pending_completion_work(&mut self) -> bool {
-        if !self.cqe_buffer.is_empty() || self.ops.shared.has_ready_completion() {
-            return true;
-        }
-        let mut completion = self.ring.completion();
-        completion.sync();
-        !completion.is_empty()
-    }
-
-    fn quiesce_provided_buffers(&mut self) -> ProvidedBufQuiesce {
-        let state = ProvidedBufQuiesce {
-            active_operations: self.ops.active_count(),
-            armed_provided_multishot: self.has_armed_provided_multishot(),
-            pending_completions: self.has_pending_completion_work(),
-            selected_bids: self.buffer_registry.provided_buffers_have_selected_bids(),
-        };
-        if !state.is_quiescent() {
-            tracing::debug!(
-                active_operations = state.active_operations,
-                armed_provided_multishot = state.armed_provided_multishot,
-                pending_completions = state.pending_completions,
-                selected_bids = state.selected_bids,
-                "provided buffer ring is not quiescent"
-            );
-        }
-        state
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn control_plane_snapshot(&mut self) -> UringResult<ControlPlaneSnapshot> {
-        let active_tokens: Vec<OpToken> = self.ops.local_active_tokens().collect();
-        let mut active = Vec::with_capacity(self.ops.active_count());
-        for token in active_tokens {
-            let (slot, submission_phase, timer_id) = match self.ops.checked_slot_view(token)? {
-                CheckedSlotView::Valid(SlotView::Reserved(slot)) => (
-                    slot.snapshot(),
-                    slot.platform().control.submission,
-                    slot.platform().timer_id,
-                ),
-                CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) => (
-                    slot.snapshot(),
-                    slot.platform().control.submission,
-                    slot.platform().timer_id,
-                ),
-                CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot)) => (
-                    slot.snapshot(),
-                    slot.platform().control.submission,
-                    slot.platform().timer_id,
-                ),
-                CheckedSlotView::Empty(_) => {
-                    return Err(UringError::InvalidState.report(
-                        "uring.control_plane.snapshot",
-                        "local active token has an idle slot view",
-                    ));
-                }
-                CheckedSlotView::Missing { .. } | CheckedSlotView::Stale(_) => {
-                    return Err(UringError::InvalidState.report(
-                        "uring.control_plane.snapshot",
-                        "active token disappeared while taking a control-plane snapshot",
-                    ));
-                }
-            };
-            active.push(ControlTokenSnapshot {
-                token,
-                slot,
-                submission_phase,
-                timer_id,
-                has_cleanup_hint: self
-                    .control
-                    .completion_cleanup_hints
-                    .contains_key(&CompletionToken::user(token)),
-            });
-        }
-
-        let mut backlog_tokens: Vec<OpToken> = self
-            .control
-            .backlog
-            .entries()
-            .into_iter()
-            .map(|entry| entry.token)
-            .collect();
-        backlog_tokens.sort_by_key(|token| (token.index(), token.generation().get()));
-        let mut pending_cancel_targets: Vec<OpToken> =
-            self.control.cancellations.pending_targets().collect();
-        pending_cancel_targets.sort_by_key(|token| (token.index(), token.generation().get()));
-        let mut in_flight_cancel_targets: Vec<(CancelTicket, OpToken)> =
-            self.control.cancellations.in_flight_targets().collect();
-        in_flight_cancel_targets.sort_by_key(|(ticket, _)| ticket.raw());
-        let mut timer_tokens = self.control.timer_entries();
-        timer_tokens.sort_by_key(|(task_id, _)| task_id.raw());
-        let mut cleanup_hint_tokens: Vec<CompletionToken> = self
-            .control
-            .completion_cleanup_hints
-            .keys()
-            .copied()
-            .collect();
-        cleanup_hint_tokens.sort_by_key(|token| token.raw());
-        let mut quarantined_tokens = self.control.quarantined_tokens();
-        quarantined_tokens.sort_by_key(|token| (token.index(), token.generation().get()));
-
-        Ok(ControlPlaneSnapshot {
-            active_tokens: active,
-            backlog_tokens,
-            pending_cancel_targets,
-            in_flight_cancel_targets,
-            timer_tokens,
-            cleanup_hint_tokens,
-            quarantined_tokens,
-        })
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    fn control_invariant_failure(&mut self, error: ControlInvariantError) -> UringResult<()> {
-        self.control
-            .record(ControlPlaneEvent::InvariantViolation(error));
-        Err(UringError::InvalidState
-            .report("uring.control_plane.invariant", format!("{error:?}"))
-            .attach_note("control-plane batch invariant check failed"))
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn check_control_plane_invariants(&mut self) -> UringResult<()> {
-        let snapshot = self.control_plane_snapshot()?;
-        if snapshot.active_tokens.len() != self.ops.active_count() {
-            return self.control_invariant_failure(ControlInvariantError::ActiveCountMismatch {
-                registry: self.ops.active_count(),
-                observed: snapshot.active_tokens.len(),
-            });
-        }
-
-        let mut seen_backlog = veloq_std::collections::HashSet::default();
-        for token in &snapshot.backlog_tokens {
-            if !seen_backlog.insert(*token) {
-                return self.control_invariant_failure(ControlInvariantError::BacklogDuplicate {
-                    token: *token,
-                });
-            }
-            if !self.ops.is_current_active(*token) {
-                return self.control_invariant_failure(ControlInvariantError::BacklogInactive {
-                    token: *token,
-                });
-            }
-        }
-
-        for active in &snapshot.active_tokens {
-            if self.control.is_timer_quarantined(active.token) {
-                continue;
-            }
-            if let Some(task_id) = active.timer_id {
-                if active.submission_phase != SubmissionPhase::TimerArmed {
-                    return self.control_invariant_failure(
-                        ControlInvariantError::TimerStateMismatch {
-                            token: active.token,
-                            state: active.submission_phase,
-                        },
-                    );
-                }
-                if self.control.timer_for(active.token) != Some(task_id) {
-                    return self.control_invariant_failure(
-                        ControlInvariantError::TimerSlotMismatch {
-                            task_id,
-                            expected: active.token,
-                            actual: self.control.timer_for(active.token).and_then(|id| {
-                                self.control
-                                    .timer_entries()
-                                    .into_iter()
-                                    .find_map(|(entry_id, token)| (entry_id == id).then_some(token))
-                            }),
-                        },
-                    );
-                }
-            } else if active.submission_phase == SubmissionPhase::TimerArmed {
-                return self.control_invariant_failure(ControlInvariantError::TimerStateMismatch {
-                    token: active.token,
-                    state: active.submission_phase,
-                });
-            }
-
-            if active.has_cleanup_hint {
-                if !matches!(
-                    active.submission_phase,
-                    SubmissionPhase::SqeStaged | SubmissionPhase::KernelOutstanding
-                ) {
-                    return self.control_invariant_failure(
-                        ControlInvariantError::CleanupHintNotKernelSubmitted {
-                            token: active.token,
-                            state: active.submission_phase,
-                        },
-                    );
-                }
-                if !self.control.has_staged_kernel_token(active.token) {
-                    return self.control_invariant_failure(
-                        ControlInvariantError::CleanupHintNotStaged {
-                            token: active.token,
-                        },
-                    );
-                }
-            }
-        }
-
-        for cleanup_token in &snapshot.cleanup_hint_tokens {
-            let Some(token) = cleanup_token.op_token() else {
-                continue;
-            };
-            let Some(active) = snapshot
-                .active_tokens
-                .iter()
-                .find(|active| active.token == token)
-            else {
-                return self.control_invariant_failure(
-                    ControlInvariantError::CleanupHintInactive { token },
-                );
-            };
-            if !active.has_cleanup_hint {
-                return self.control_invariant_failure(
-                    ControlInvariantError::CleanupHintInactive { token },
-                );
-            }
-        }
-
-        for (task_id, token) in &snapshot.timer_tokens {
-            let Some(active) = snapshot
-                .active_tokens
-                .iter()
-                .find(|active| active.token == *token)
-            else {
-                return self.control_invariant_failure(ControlInvariantError::TimerSlotMismatch {
-                    task_id: *task_id,
-                    expected: *token,
-                    actual: None,
-                });
-            };
-            if active.timer_id != Some(*task_id) {
-                return self.control_invariant_failure(ControlInvariantError::TimerSlotMismatch {
-                    task_id: *task_id,
-                    expected: *token,
-                    actual: active.timer_id.and_then(|id| {
-                        snapshot
-                            .timer_tokens
-                            .iter()
-                            .find_map(|(entry_id, entry_token)| {
-                                (*entry_id == id).then_some(*entry_token)
-                            })
-                    }),
-                });
-            }
-        }
-
-        for target in &snapshot.pending_cancel_targets {
-            if !self.ops.is_current_active(*target) {
-                return self.control_invariant_failure(ControlInvariantError::BacklogInactive {
-                    token: *target,
-                });
-            }
-        }
-        Ok(())
-    }
-
-    #[cfg(not(any(test, feature = "test-hooks")))]
-    #[inline]
-    pub(crate) fn check_control_plane_invariants(&mut self) -> UringResult<()> {
-        Ok(())
-    }
-
     /// provided buffer 环的运行期统计，`None` 表示这个 driver 没有环。
-    pub fn provided_buf_stats(&self) -> Option<ProvidedBufStats> {
-        self.buffer_registry.provided_buf_stats()
+    pub fn provided_buf_stats(&self) -> Option<ProvidedBufferSnapshot> {
+        self.provided_buffer_snapshot()
+    }
+
+    /// Returns the point-in-time provided-buffer snapshot captured while harvesting CQEs.
+    pub fn provided_buffer_snapshot(&self) -> Option<ProvidedBufferSnapshot> {
+        self.registration.provided_buf_stats()
     }
 
     /// Returns a point-in-time snapshot of completion and backend cleanup diagnostics.
@@ -737,89 +443,82 @@ impl<'a> UringDriver<'a> {
         self.completion_diagnostics.snapshot()
     }
 
-    /// Returns the immutable baseline capability snapshot captured for this ring.
+    /// Returns the effective capability snapshot currently used by new operations.
     pub fn capability_snapshot(&self) -> UringCapabilitySnapshot {
+        self.capability_snapshot_for(self.capability_state.effective())
+    }
+
+    /// Returns the immutable capability baseline observed during ring setup and probing.
+    pub fn capability_baseline(&self) -> UringCapabilitySnapshot {
+        self.capability_snapshot_for(self.capability_state.baseline())
+    }
+
+    /// Returns the capability set accepted by setup and resource negotiation.
+    pub fn negotiated_capabilities(&self) -> DriverCapabilities {
+        self.capability_state.negotiated()
+    }
+
+    /// Returns the capability set that is safe for new operations now.
+    pub fn effective_capabilities(&self) -> DriverCapabilities {
+        self.capability_state.effective()
+    }
+
+    /// Returns baseline, negotiated, effective capabilities and disable reasons together.
+    pub fn capability_state_snapshot(&self) -> CapabilityStateSnapshot {
+        self.capability_state.snapshot()
+    }
+
+    fn capability_snapshot_for(&self, capabilities: DriverCapabilities) -> UringCapabilitySnapshot {
         UringCapabilitySnapshot::new(
             self.kernel_capabilities,
-            self.capabilities,
+            capabilities,
             UringSetupSnapshot {
                 requested_flags: self.setup_negotiation.requested_flags,
                 rejected_flags: self.setup_negotiation.rejected_flags,
                 failure_errno: self.setup_negotiation.failure_errno,
             },
-            self.buffer_registry.fixed_buffers_available(),
-            self.buffer_registry.fixed_buffers_failure_errno(),
-            self.capabilities.provided_buffers,
-            self.buffer_registry.provided_buffers_failure_errno(),
+            self.registration.fixed_buffers_available(),
+            self.registration.fixed_buffers_failure_errno(),
+            capabilities.provided_buffers,
+            self.registration.provided_buffers_failure_errno(),
         )
-    }
-
-    pub(crate) fn rebuild_waker_fd(&mut self) -> UringResult<()> {
-        if self.file_table.is_poisoned() {
-            return Err(self.file_table.poisoned_report(
-                "driver.rebuild_waker_fd",
-                self.control.waker.registered_fd(),
-            ));
-        }
-        let new_fd = UringWakerManager::create_event_fd("driver.rebuild_waker_fd.eventfd")?;
-        let raw = RawHandle::new(UringRawHandle::for_file(new_fd.fd.raw().as_fd()));
-        let registered_fd = self.control.waker.registered_fd();
-        let state = self.control.waker.state();
-
-        state.with_lock(|current_fd| {
-            // Keep fd replacement and remote wake writes under the same mutex. A pending
-            // notification is copied to the new eventfd before the shared fd is swapped, so a
-            // failed copy leaves both the old fd and the notification state intact.
-            if self.control.waker.has_pending_notification() {
-                UringWakerManager::write_event_fd(&new_fd)?;
-            }
-
-            match registered_fd {
-                // A registered waker keeps its slot: only the kernel table entry changes, so the
-                // descriptor stays valid across the rebuild.
-                Some(fd @ IoFd::Registered { .. }) => self.replace_registered_fixed_fd(fd, raw)?,
-                // A direct descriptor *is* the fd, so a rebuilt eventfd needs a new one. Only the
-                // driver holds this descriptor, so replacing it invalidates nothing.
-                Some(IoFd::Direct(_)) => {
-                    self.control
-                        .waker
-                        .set_registered_fd(Some(IoFd::direct(raw.raw())));
-                }
-                Some(IoFd::OwnedDirect { .. }) => {
-                    return Err(UringError::InvalidState
-                        .report(
-                            "driver.rebuild_waker_fd",
-                            "owned direct waker descriptors are unsupported",
-                        )
-                        .with_ctx("fd", format!("{:?}", registered_fd.unwrap())));
-                }
-                None => {}
-            }
-
-            *current_fd = new_fd.clone();
-            Ok(())
-        })
     }
 }
 
-impl<'a> Drop for UringDriver<'a> {
-    fn drop(&mut self) {
-        let has_provided_buffers = self.buffer_registry.has_provided_buffers();
-        if self.ops.has_active_ops() {
+/// The single shutdown protocol for normal drop and every initialization failure after the
+/// driver value has been constructed. The field order below then provides the final fallback:
+/// ring fd, lifetime token, registration-owned resources, and remaining control resources.
+struct RingShutdown;
+
+impl RingShutdown {
+    fn run<'a>(driver: &mut UringDriver<'a>) {
+        let has_provided_buffers = driver.registration.has_provided_buffers();
+        if driver.operations.has_active_ops() {
             tracing::warn!("UringDriver dropped with active in-flight operations");
         }
         if !has_provided_buffers {
-            self.completion_diagnostics
+            driver
+                .completion_diagnostics
                 .backend()
                 .inc_provided_drop_skipped_unregister();
         } else {
-            let quiesce = self.quiesce_provided_buffers();
+            let pending_completions = if driver.completion.has_pending_cqes()
+                || driver.operations.shared.has_ready_completion()
+            {
+                true
+            } else {
+                let mut completion = driver.ring.completion();
+                completion.sync();
+                !completion.is_empty()
+            };
+            let probe = OperationProbe::from_registry(&mut driver.operations, pending_completions);
+            let quiesce = driver.registration.quiescence(probe);
             if quiesce.is_quiescent() {
                 // 正常关闭优先显式反注册。失败时 release_provided_buffers 会恢复 group 的所有权，
                 // 不在仍存活的 IoUring 前释放映射；随后依靠 owner token 和字段顺序完成最终兜底。
-                if let Err(report) = self
-                    .buffer_registry
-                    .release_provided_buffers(&self.ring.submitter())
+                if let Err(report) = driver
+                    .registration
+                    .release_provided_buffers(&driver.ring.submitter())
                 {
                     tracing::warn!(
                         bgid = PROVIDED_BUF_GROUP_ID,
@@ -828,26 +527,33 @@ impl<'a> Drop for UringDriver<'a> {
                     );
                 }
             } else {
-                self.completion_diagnostics
+                driver
+                    .completion_diagnostics
                     .backend()
                     .inc_provided_drop_deferred_unregister();
                 tracing::warn!(
-                    active_operations = quiesce.active_operations,
-                    armed_provided_multishot = quiesce.armed_provided_multishot,
-                    pending_completions = quiesce.pending_completions,
-                    selected_bids = quiesce.selected_bids,
+                    active_operations = quiesce.active_operations(),
+                    armed_provided_multishot = quiesce.armed_provided_multishot(),
+                    pending_completions = quiesce.pending_completions(),
+                    selected_bids = quiesce.selected_bids(),
                     "deferring provided buffer ring unregister until io_uring drops"
                 );
             }
         }
-        let outstanding_cancel_tickets = self.control.cancellations.in_flight_len();
+        let outstanding_cancel_tickets = driver.control.cancel_in_flight_len();
         if outstanding_cancel_tickets != 0 {
             tracing::warn!(
                 count = outstanding_cancel_tickets,
                 "UringDriver dropped with outstanding cancel tickets"
             );
         }
-        self.control.cancellations.clear_in_flight();
+        driver.control.clear_cancel_in_flight();
+    }
+}
+
+impl<'a> Drop for UringDriver<'a> {
+    fn drop(&mut self) {
+        RingShutdown::run(self);
     }
 }
 
@@ -858,7 +564,7 @@ impl<'a> DriverRaw for UringDriver<'a> {
     type Raw = UringRawHandle;
 
     fn reserve_op_raw(&mut self) -> UringResult<OpToken> {
-        match self.ops.insert(OpEntry::new(UringOpState::new())) {
+        match self.operations.insert(OpEntry::new(UringOpState::new())) {
             Ok(OpHandle {
                 index: id,
                 generation,
@@ -881,27 +587,27 @@ impl<'a> DriverRaw for UringDriver<'a> {
     }
 
     fn slot_table_raw(&self) -> SharedSlotTable<Self::SlotSpec> {
-        self.ops.shared.clone()
+        self.operations.shared.clone()
     }
 
     fn remote_cancel_sender_raw(&self) -> RemoteCancelSender {
-        self.control.cancellations.remote_sender()
+        self.control.remote_cancel_sender()
     }
 
     fn try_recv_remote_cancel_request(&mut self) -> Option<CancelRequest> {
-        self.control.cancellations.try_recv_remote()
+        self.control.try_recv_cancel()
     }
 
     fn slot_set_payload_raw(&mut self, token: OpToken, payload: UringUserPayload) {
         let _ = self
-            .ops
+            .operations
             .with_slot_storage_mut(token, |_result, payload_cell, _sidecar| {
                 *payload_cell = Some(payload);
             });
     }
 
     fn slot_take_payload_raw(&mut self, token: OpToken) -> Option<UringUserPayload> {
-        self.ops
+        self.operations
             .with_slot_storage_mut(token, |_result, payload_cell, _sidecar| payload_cell.take())
             .flatten()
     }
@@ -910,14 +616,14 @@ impl<'a> DriverRaw for UringDriver<'a> {
         let cleanup_token = CompletionToken::user(token);
         if self
             .control
-            .completion_cleanup_hints
+            .completion_cleanup_hints_mut()
             .remove(&cleanup_token)
             .is_some()
         {
             self.control
                 .record(ControlPlaneEvent::CleanupHintRemove(cleanup_token));
         }
-        let _ = self.ops.remove(token);
+        let _ = self.operations.remove(token);
     }
 
     fn submit_op_raw(
@@ -937,16 +643,62 @@ impl<'a> DriverRaw for UringDriver<'a> {
         let op: UringOp = op;
         let strategy = op.descriptor().strategy;
 
-        self.submit_operation_internal(token, op, op_in, strategy)
+        let Self {
+            operations,
+            control,
+            registration,
+            completion_diagnostics,
+            ring,
+            kernel_capabilities,
+            submission,
+            ..
+        } = self;
+        let mut context = SubmitPort::from_parts(
+            operations,
+            control,
+            registration,
+            completion_diagnostics,
+            ring,
+            kernel_capabilities,
+        );
+        submission.submit_operation_internal(&mut context, token, op, op_in, strategy)
     }
 
     fn drive_raw(&mut self, mode: DriveMode) -> UringResult<DriveOutcome> {
-        DriveCycle::new(mode)
-            .run(self)
-            .push_ctx("scope", "uring.driver.drive")
-            .attach_note("advance unified uring drive cycle")?;
+        let report = {
+            let Self {
+                operations,
+                control,
+                registration,
+                completion_table,
+                completion_diagnostics,
+                capability_state,
+                ring,
+                kernel_capabilities,
+                submission,
+                lifecycle,
+                completion,
+                drive,
+                ..
+            } = self;
+            let mut context = DriveContext::from_parts(
+                operations,
+                control,
+                registration,
+                completion_table,
+                completion_diagnostics,
+                capability_state,
+                ring,
+                kernel_capabilities,
+            );
+            drive
+                .run(&mut context, submission, lifecycle, completion, mode)
+                .push_ctx("scope", "uring.driver.drive")
+                .attach_note("advance unified uring drive cycle")?
+        };
+        context::check_control_plane_invariants(&mut self.operations, &mut self.control)?;
 
-        let next_timeout_hint = self.control.timers.next_deadline().map_err(|error| {
+        let next_timeout_hint = self.control.timers().next_deadline().map_err(|error| {
             UringError::InvalidState
                 .report(
                     "uring.timer.deadline",
@@ -957,8 +709,11 @@ impl<'a> DriverRaw for UringDriver<'a> {
 
         Ok(DriveOutcome {
             next_timeout_hint,
-            ready_completion: self.ops.shared.has_ready_completion(),
-            in_flight: self.has_active_ops_internal(),
+            ready_completion: self.operations.shared.has_ready_completion(),
+            in_flight: self.operations.has_active_ops(),
+            pending_work: report.pending_work,
+            budget_exhausted: report.budget_exhausted,
+            needs_next_round: report.needs_next_round,
         })
     }
 
@@ -967,7 +722,31 @@ impl<'a> DriverRaw for UringDriver<'a> {
     }
 
     fn cancel_op_raw(&mut self, request: CancelRequest) -> UringResult<CancelSubmitOutcome> {
-        self.cancel_op_internal(request)
+        let Self {
+            operations,
+            control,
+            registration,
+            completion_table,
+            completion_diagnostics,
+            capability_state,
+            ring,
+            kernel_capabilities,
+            submission,
+            lifecycle,
+            completion,
+            ..
+        } = self;
+        let mut context = DriveContext::from_parts(
+            operations,
+            control,
+            registration,
+            completion_table,
+            completion_diagnostics,
+            capability_state,
+            ring,
+            kernel_capabilities,
+        );
+        context.cancel_operation(lifecycle, completion, submission, request)
     }
 
     fn register_buffer_raw(
@@ -976,7 +755,15 @@ impl<'a> DriverRaw for UringDriver<'a> {
         ptr: *const u8,
         len: usize,
     ) -> UringResult<BufferRegistrationStatus> {
-        self.register_buffer_internal(id, ptr, len)
+        let submitter = self.ring.submitter();
+        self.registration
+            .register_buffer_internal(
+                &submitter,
+                self.completion_diagnostics.backend(),
+                id,
+                ptr,
+                len,
+            )
             .push_ctx("scope", "uring.driver.register_buffer")
             .attach_note("register buffer")
     }
@@ -985,14 +772,24 @@ impl<'a> DriverRaw for UringDriver<'a> {
         &mut self,
         files: Vec<RegisterFd<'f, UringRawHandle>>,
     ) -> UringResult<Vec<IoFd>> {
-        self.register_files_internal(files)
+        let submitter = self.ring.submitter();
+        self.registration
+            .register_files_internal(
+                &submitter,
+                self.completion_diagnostics.backend(),
+                &mut self.kernel_capabilities,
+                files,
+            )
             .push_ctx("scope", "uring.driver.register_files")
             .attach_note("register files")
     }
 
     fn unregister_files_raw(&mut self, files: Vec<IoFd>) -> UringResult<()> {
+        let submitter = self.ring.submitter();
+        let ports = RegistrationPorts::new(&submitter, self.completion_diagnostics.backend());
         for fd in files {
-            self.unregister_fixed_fd(fd)
+            self.registration
+                .unregister_fixed_fd(&ports, fd)
                 .push_ctx("scope", "uring.driver.unregister_files")
                 .attach_note("unregister fixed fd")?;
         }
@@ -1000,7 +797,7 @@ impl<'a> DriverRaw for UringDriver<'a> {
     }
 
     fn create_waker_raw(&self) -> Arc<dyn RemoteWaker<UringError>> {
-        self.control.waker.create_waker()
+        self.control.waker().create_waker()
     }
 
     /// 用刚建好的 worker 池注册 provided buffer 环。
@@ -1009,32 +806,38 @@ impl<'a> DriverRaw for UringDriver<'a> {
     /// 最低内核是 5.6。失败就把能力留在 `false`，门面层据此拒绝那些需要它的操作，其余一切
     /// 照旧。
     fn attach_buffer_pool_raw(&mut self, pool: AnyBufPool) -> UringResult<()> {
-        if self.buffer_registry.attach_buffer_pool(
+        if self.registration.attach_buffer_pool(
             &self.ring.submitter(),
             pool,
             self.ring_lifetime.token(),
         )? {
-            self.capabilities.provided_buffers = self.buffer_registry.provided_buffers_enabled();
+            let mut negotiated = self.capability_state.negotiated();
+            negotiated.provided_buffers = self.registration.provided_buffers_enabled();
+            self.capability_state.set_negotiated(negotiated);
+            self.capability_state
+                .enable_negotiated(DriverCapability::ProvidedBuffers);
         }
         Ok(())
     }
 
     fn capabilities_raw(&self) -> DriverCapabilities {
-        self.capabilities
+        self.capability_state.effective()
     }
 
     fn note_capability_rejected_raw(&mut self, capability: DriverCapability) {
-        let slot = match capability {
-            DriverCapability::AcceptMulti => &mut self.capabilities.accept_multi,
-            DriverCapability::RecvMulti => &mut self.capabilities.recv_multi,
-            DriverCapability::ProvidedBuffers => &mut self.capabilities.provided_buffers,
+        let effective = self.capability_state.effective();
+        let enabled = match capability {
+            DriverCapability::AcceptMulti => effective.accept_multi,
+            DriverCapability::RecvMulti => effective.recv_multi,
+            DriverCapability::ProvidedBuffers => effective.provided_buffers,
         };
-        if *slot {
+        if enabled {
             debug!(
                 ?capability,
                 "kernel rejected an optional capability; disabling it"
             );
-            *slot = false;
+            self.capability_state
+                .disable(capability, "kernel_rejected", None);
         }
     }
 }
@@ -1045,86 +848,96 @@ use veloq_driver_core::driver::test_hooks::{DriverTestHooks, RegisterFilesUpdate
 #[cfg(feature = "test-hooks")]
 impl DriverTestHooks for UringDriver<'_> {
     fn debug_chunk_register_attempts(&self) -> u64 {
-        self.buffer_registry.stats().chunk_register_attempts
+        self.registration
+            .registration_stats()
+            .chunk_register_attempts()
     }
 
     fn debug_chunk_register_failures(&self) -> u64 {
-        self.buffer_registry.stats().chunk_register_failures
+        self.registration
+            .registration_stats()
+            .chunk_register_failures()
     }
 
     fn debug_chunk_register_skipped_recent_failure(&self) -> u64 {
-        self.buffer_registry
-            .stats()
-            .chunk_register_skipped_recent_failure
+        self.registration
+            .registration_stats()
+            .chunk_register_skipped_recent_failure()
     }
 
     fn debug_submission_missing_chunk_info(&self) -> u64 {
-        self.buffer_registry.stats().submission_missing_chunk_info
+        self.registration
+            .registration_stats()
+            .submission_missing_chunk_info()
     }
 
     fn debug_raw_buffer_fallbacks(&self) -> u64 {
-        self.buffer_registry.stats().raw_buffer_fallbacks
+        self.registration
+            .registration_stats()
+            .raw_buffer_fallbacks()
     }
 
     fn debug_fixed_buffers_available(&self) -> bool {
-        self.buffer_registry.fixed_buffers_available()
+        self.registration.fixed_buffers_available()
     }
 
     fn debug_inject_register_buffers_update_failure(&mut self, errno: i32) {
-        self.buffer_registry
+        self.registration
             .inject_register_buffers_update_failure(errno);
     }
 
     fn debug_inject_register_buffers_update_unknown(&mut self, errno: i32) {
-        self.buffer_registry
+        self.registration
             .inject_register_buffers_update_unknown(errno);
     }
 
     fn debug_inject_register_buffers_update_sequence(&mut self, outcomes: &[Option<i32>]) {
-        self.buffer_registry
+        self.registration
             .inject_register_buffers_update_sequence(outcomes);
     }
 
     fn debug_inject_register_files_update_failure(&mut self, errno: i32) {
-        self.register_files_update_outcomes
-            .push_back(RegisterFilesUpdateOutcome::Error(errno));
+        self.registration
+            .inject_register_files_update_failure(errno);
     }
 
     fn debug_inject_register_files_update_sequence(
         &mut self,
         outcomes: &[RegisterFilesUpdateOutcome],
     ) {
-        self.register_files_update_outcomes.clear();
-        self.register_files_update_outcomes
-            .extend(outcomes.iter().copied());
+        self.registration
+            .inject_register_files_update_sequence(outcomes);
     }
 
     fn debug_file_table_poisoned(&self) -> bool {
-        self.file_table.is_poisoned()
+        self.registration.file_table_poisoned()
     }
 
     fn debug_register_files_update_outcomes_pending(&self) -> usize {
-        self.register_files_update_outcomes.len()
+        self.registration.register_files_update_outcomes_pending()
     }
 
     fn debug_inject_bitset_set_failure(&mut self) {
-        self.buffer_registry.inject_bitset_set_failure();
+        self.registration.inject_bitset_set_failure();
     }
 
     fn debug_chunk_registered(&self, chunk_id: usize) -> bool {
         let Ok(raw) = u16::try_from(chunk_id) else {
             return false;
         };
-        self.buffer_registry
+        self.registration
             .is_chunk_registered(ChunkId::from_raw(raw))
     }
 
     fn debug_inject_push_entry_failure(&mut self) {
-        self.control.push_entry_failure = true;
+        self.control.inject_push_entry_failure();
     }
 
     fn debug_control_plane_snapshot(&mut self) -> String {
-        format!("{:?}", self.control_plane_snapshot())
+        format!(
+            "{:?}",
+            context::control_plane_snapshot(&mut self.operations, &mut self.control)
+        )
     }
 
     fn debug_control_plane_events(&mut self) -> Vec<String> {

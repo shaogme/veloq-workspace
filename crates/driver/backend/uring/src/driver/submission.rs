@@ -2,13 +2,12 @@ pub(crate) mod txn;
 
 use self::txn::{UringSubmitTxn, slot_access_report};
 use crate::{
-    config::{RawHandle, UringRawHandle},
     driver::{
-        SqeFd, UringDriver,
-        control::{ControlPlaneEvent, StagedLedgerError, transition_submission_phase},
-        env::StageResult,
-        env::SubmitEnv,
-        lifecycle::{CancellationPhase, SubmissionPhase},
+        context::SubmitPort,
+        control::StagedLedgerError,
+        env::{StageResult, SubmitEnv},
+        lifecycle::SubmissionPhase,
+        registration::file_table::SqeFd,
     },
     error::{UringError, UringResult},
     op::{
@@ -20,9 +19,7 @@ use diagweave::prelude::*;
 use tracing::{debug, trace};
 use veloq_buf::heap::ChunkId;
 use veloq_driver_core::{
-    driver::{
-        CompletionToken, DriverSubmitResult, OpToken, RegisterFd, SubmitStatus, SubmitTokenContext,
-    },
+    driver::{CompletionToken, DriverSubmitResult, OpToken, SubmitStatus, SubmitTokenContext},
     slot::{CheckedSlotView, InFlightWaiting},
 };
 use veloq_io_uring::{
@@ -30,7 +27,21 @@ use veloq_io_uring::{
     opcode,
     types::{self, SubmitArgs, Timespec},
 };
-use veloq_std::{format, task::Poll, time::Duration, vec};
+use veloq_std::{format, task::Poll, time::Duration};
+
+pub(crate) struct SubmissionEngine {
+    fail_stop: bool,
+}
+
+impl SubmissionEngine {
+    pub(crate) const fn new() -> Self {
+        Self { fail_stop: false }
+    }
+
+    pub(crate) fn enter_fail_stop(&mut self) {
+        self.fail_stop = true;
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum SubmissionError {
@@ -45,34 +56,156 @@ pub(crate) enum WaitBudgetSource {
     Probe,
 }
 
+/// 内核 enter 的证据范围。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubmissionScope {
+    Enter,
+    ExtendedWait,
+    SqPoll,
+}
+
+/// 不可绕过的 submission 回执。
+///
+/// `requested` 是本次 enter 看到的 SQE 总数，`published` 是已经写入用户态 SQ
+/// 并作为本次 enter 输入的数量，`consumed` 是已经得到内核确认消费的前缀长度。
+/// `Unknown` 即使携带了错误也不能重试：对应的 staged metadata 会被隔离，保留
+/// cleanup hint 以便迟到 CQE 仍能完成清理。
 #[derive(Debug)]
 pub(crate) enum SubmissionReceipt {
-    NoEntries,
-    Consumed { requested: usize, consumed: usize },
-    PublishedToSqpoll { published: usize },
-    Rejected { error: SubmissionError },
-    Unknown { error: SubmissionError },
+    NoEntries {
+        requested: usize,
+        published: usize,
+        consumed: usize,
+        scope: SubmissionScope,
+    },
+    ConsumedPrefix {
+        requested: usize,
+        published: usize,
+        consumed: usize,
+        scope: SubmissionScope,
+    },
+    PublishedToSqPoll {
+        requested: usize,
+        published: usize,
+        consumed: usize,
+        scope: SubmissionScope,
+    },
+    Rejected {
+        requested: usize,
+        published: usize,
+        consumed: usize,
+        scope: SubmissionScope,
+        error: SubmissionError,
+    },
+    Unknown {
+        requested: usize,
+        published: usize,
+        consumed: usize,
+        scope: SubmissionScope,
+        error: SubmissionError,
+    },
+}
+
+impl SubmissionReceipt {
+    fn requested(&self) -> usize {
+        match self {
+            Self::NoEntries { requested, .. }
+            | Self::ConsumedPrefix { requested, .. }
+            | Self::PublishedToSqPoll { requested, .. }
+            | Self::Rejected { requested, .. }
+            | Self::Unknown { requested, .. } => *requested,
+        }
+    }
+
+    fn published(&self) -> usize {
+        match self {
+            Self::NoEntries { published, .. }
+            | Self::ConsumedPrefix { published, .. }
+            | Self::PublishedToSqPoll { published, .. }
+            | Self::Rejected { published, .. }
+            | Self::Unknown { published, .. } => *published,
+        }
+    }
+
+    fn consumed(&self) -> usize {
+        match self {
+            Self::NoEntries { consumed, .. }
+            | Self::ConsumedPrefix { consumed, .. }
+            | Self::PublishedToSqPoll { consumed, .. }
+            | Self::Rejected { consumed, .. }
+            | Self::Unknown { consumed, .. } => *consumed,
+        }
+    }
+
+    fn scope(&self) -> SubmissionScope {
+        match self {
+            Self::NoEntries { scope, .. }
+            | Self::ConsumedPrefix { scope, .. }
+            | Self::PublishedToSqPoll { scope, .. }
+            | Self::Rejected { scope, .. }
+            | Self::Unknown { scope, .. } => *scope,
+        }
+    }
+
+    fn validate(&self, queue_len: usize) -> bool {
+        let evidence_valid =
+            self.published() <= self.requested() && self.consumed() <= self.published();
+        let kind_valid = match self {
+            Self::NoEntries { .. }
+            | Self::PublishedToSqPoll { .. }
+            | Self::Rejected { .. }
+            | Self::Unknown { .. } => self.consumed() == 0,
+            Self::ConsumedPrefix { .. } => true,
+        };
+        self.requested() == queue_len && evidence_valid && kind_valid
+    }
 }
 
 #[derive(Debug)]
 pub(crate) struct SubmitProgress {
-    pub(crate) receipt: SubmissionReceipt,
-    pub(crate) staged: usize,
-    pub(crate) kernel_outstanding: usize,
-    pub(crate) pending_submit: bool,
-    pub(crate) timed_out: bool,
+    receipt: SubmissionReceipt,
+    staged: usize,
+    kernel_outstanding: usize,
+    pending_submit: bool,
+    timed_out: bool,
+}
+
+impl SubmitProgress {
+    pub(crate) fn receipt(&self) -> &SubmissionReceipt {
+        &self.receipt
+    }
+
+    pub(crate) const fn staged(&self) -> usize {
+        self.staged
+    }
+
+    pub(crate) const fn kernel_outstanding(&self) -> usize {
+        self.kernel_outstanding
+    }
+
+    pub(crate) const fn pending_submit(&self) -> bool {
+        self.pending_submit
+    }
+
+    pub(crate) const fn timed_out(&self) -> bool {
+        self.timed_out
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct KernelEnterPlan {
-    pub(crate) to_submit: usize,
-    pub(crate) wait: Option<Duration>,
-    pub(crate) wait_source: Option<WaitBudgetSource>,
-    pub(crate) ready_preflight: bool,
-    pub(crate) zero_timeout: bool,
+    to_submit: usize,
+    wait: Option<Duration>,
+    wait_source: Option<WaitBudgetSource>,
+    ready_preflight: bool,
+    zero_timeout: bool,
 }
 
 impl KernelEnterPlan {
+    pub(crate) const fn wait_source(self) -> Option<WaitBudgetSource> {
+        self.wait_source
+    }
+
     pub(crate) const fn poll(to_submit: usize) -> Self {
         Self {
             to_submit,
@@ -130,11 +263,11 @@ pub(super) fn validate_resolved_chunk_count(
 
 /// Turns a reserved slot's op into an SQE (or a wheel entry) and hands it to the kernel.
 ///
-/// Takes the driver split in two: `slot` borrows out of `UringDriver::ops`, `env` covers every
+/// Takes the registry split in two: `slot` borrows out of the operation registry, `env` covers every
 /// other field the path needs. Both halves stay live at once — `make_sqe` reads the registered
 /// file table while holding the op, and the SQE push happens while the slot's platform data is
 /// still being updated — which is exactly why the split is a borrow-checked projection rather
-/// than a `&mut UringDriver` reconstructed from a raw pointer.
+/// than a mutable parent object reconstructed from a raw pointer.
 pub(crate) fn submit_from_slot(
     env: &mut SubmitEnv<'_, '_>,
     token: OpToken,
@@ -150,7 +283,7 @@ pub(crate) fn submit_queued_from_slot(
     mut slot: Slot<'_, InFlightWaiting>,
 ) -> UringResult<bool> {
     let user_data = token.index();
-    if slot.platform().control.submission != SubmissionPhase::Reserved {
+    if slot.platform().submission_phase() != SubmissionPhase::Reserved {
         return Ok(true);
     }
 
@@ -202,7 +335,7 @@ pub(crate) fn submit_queued_from_slot(
     if env.stage_user_entry(token, sqe, cleanup_hint)? == StageResult::Staged {
         env.transition_submission_state(
             token,
-            &mut slot.platform_mut().control.submission,
+            slot.platform_mut(),
             SubmissionPhase::SqeStaged,
             "queued submission staged SQE",
         );
@@ -211,7 +344,7 @@ pub(crate) fn submit_queued_from_slot(
     } else {
         env.transition_submission_state(
             token,
-            &mut slot.platform_mut().control.submission,
+            slot.platform_mut(),
             SubmissionPhase::Reserved,
             "queued submission remains queued after SQ full",
         );
@@ -220,9 +353,13 @@ pub(crate) fn submit_queued_from_slot(
     }
 }
 
-impl<'a> UringDriver<'a> {
-    pub(crate) fn submit_from_slot_token(&mut self, token: OpToken) -> UringResult<bool> {
-        let (ops, mut env) = self.split_for_submit();
+impl SubmissionEngine {
+    pub(crate) fn submit_from_slot_token(
+        &mut self,
+        context: &mut SubmitPort<'_, '_, '_, '_>,
+        token: OpToken,
+    ) -> UringResult<bool> {
+        let (ops, mut env) = context.split_for_submit();
         let slot = match ops.checked_slot_view(token)? {
             CheckedSlotView::Valid(SlotView::Reserved(slot)) => slot,
             _ => {
@@ -230,37 +367,62 @@ impl<'a> UringDriver<'a> {
                     .report("driver.submit_from_slot_index", "op missing in slot"));
             }
         };
-        submit_from_slot(&mut env, token, slot)
+        let result = submit_from_slot(&mut env, token, slot);
+        if matches!(result, Ok(true)) {
+            let timer = match ops.checked_slot_view(token)? {
+                CheckedSlotView::Valid(SlotView::InFlightWaiting(slot))
+                    if slot.platform().submission_phase() == SubmissionPhase::TimerArmed =>
+                {
+                    slot.platform().timer_id()
+                }
+                _ => None,
+            };
+            if let Some(timer) = timer {
+                ops.arm_timer(token, timer)?;
+            }
+        }
+        result
     }
 
-    pub(crate) fn submit_waker(&mut self) -> UringResult<()> {
-        if self.control.waker.is_armed() {
+    pub(crate) fn submit_queued_from_slot_token(
+        &mut self,
+        context: &mut SubmitPort<'_, '_, '_, '_>,
+        token: OpToken,
+    ) -> UringResult<bool> {
+        let (ops, mut env) = context.split_for_submit();
+        match ops.checked_slot_view(token)? {
+            CheckedSlotView::Valid(SlotView::InFlightWaiting(slot)) => {
+                submit_queued_from_slot(&mut env, token, slot)
+            }
+            _ => Ok(true),
+        }
+    }
+
+    pub(crate) fn submit_waker(
+        &mut self,
+        context: &mut SubmitPort<'_, '_, '_, '_>,
+    ) -> UringResult<()> {
+        if context.waker_is_armed() {
             return Ok(());
         }
 
-        let waker_fd = match self.control.waker.registered_fd() {
+        let waker_fd = match context.waker_registered_fd() {
             Some(fd) => fd,
             None => {
-                let event_fd = self.control.waker.state().current();
-                let fd = event_fd.fd.raw().as_fd();
-                let raw = RawHandle::new(UringRawHandle::for_file(fd));
-                let mut fds =
-                    self.register_files_internal(vec![RegisterFd::Borrowed(raw.borrow())])?;
+                let raw = context.waker_current_raw();
+                let mut fds = context.register_waker_file(raw)?;
                 let waker_fd = fds.pop().ok_or_else(|| {
                     UringError::InvalidState
                         .report("driver.submit_waker", "register_files returned empty")
                 })?;
-                self.control.waker.set_registered_fd(Some(waker_fd));
+                context.set_waker_registered_fd(Some(waker_fd));
                 waker_fd
             }
         };
         // The eventfd is registered like any other descriptor, so it lands in the fallback area
         // once the kernel table is full (or configured away entirely).
-        let sqe_fd = self
-            .file_table
-            .resolve(waker_fd, None, "driver.submit_waker.resolve")?;
-        let buf = self.control.waker.buf_mut_ptr();
-        let len = self.control.waker.buf_len() as u32;
+        let sqe_fd = context.resolve_waker_file(waker_fd)?;
+        let (buf, len) = context.waker_buffer();
         let sqe = opcode_build(
             "driver.submit_waker.opcode",
             sqe_with_fd!(sqe_fd, |f| unsafe { opcode::Read::new(f, buf, len) }
@@ -268,22 +430,23 @@ impl<'a> UringDriver<'a> {
         )?
         .user_data(CompletionToken::waker(0).raw());
 
-        if self.submit_env().stage_waker_entry(sqe)? == StageResult::Staged {
-            self.control.waker_stage_pending = false;
-            self.control.waker.arm();
-            self.control
-                .record(ControlPlaneEvent::WakerArm { armed: true });
-            self.control.waker.finish_rearm();
-            self.control.record(ControlPlaneEvent::WakerRearmed);
+        let staged = {
+            let (_, mut env) = context.split_for_submit();
+            env.stage_waker_entry(sqe)? == StageResult::Staged
+        };
+        if staged {
+            context.set_waker_stage_pending(false);
+            context.commit_waker_stage();
             Ok(())
         } else {
-            self.control.waker_stage_pending = true;
+            context.set_waker_stage_pending(true);
             Ok(())
         }
     }
 
     pub(crate) fn submit_to_kernel(
         &mut self,
+        context: &mut SubmitPort<'_, '_, '_, '_>,
         plan: KernelEnterPlan,
     ) -> UringResult<SubmitProgress> {
         trace!(
@@ -293,7 +456,7 @@ impl<'a> UringDriver<'a> {
             zero_timeout = plan.zero_timeout,
             "submit_to_kernel entered"
         );
-        if self.submission_fail_stop {
+        if self.fail_stop {
             return Err(UringError::Submission
                 .report(
                     "uring.submit_to_kernel.fail_stop",
@@ -302,8 +465,10 @@ impl<'a> UringDriver<'a> {
                 .attach_note("driver cannot safely reuse an SQE after an unknown receipt"));
         }
 
-        let to_submit = self.ring.submission().len();
+        let to_submit = context.submission_len();
         if to_submit != plan.to_submit {
+            context.quarantine_unpublished_staged();
+            self.fail_stop = true;
             return Err(UringError::InvalidState
                 .report(
                     "uring.submit_to_kernel.plan",
@@ -313,8 +478,10 @@ impl<'a> UringDriver<'a> {
                 .with_ctx("actual", to_submit));
         }
 
-        let unpublished = self.control.unpublished_staged_entry_count();
+        let unpublished = context.unpublished_staged_entry_count();
         if unpublished > to_submit {
+            context.quarantine_unpublished_staged();
+            self.fail_stop = true;
             return Err(UringError::InvalidState
                 .report(
                     "uring.submit_to_kernel.ledger",
@@ -324,46 +491,81 @@ impl<'a> UringDriver<'a> {
                 .with_ctx("queue_entries", to_submit));
         }
         let published_in_queue = to_submit - unpublished;
-        let (receipt, timed_out) = self.submit_staged_batch(plan, to_submit, unpublished)?;
+        let (receipt, timed_out) =
+            self.submit_staged_batch(context, plan, to_submit, unpublished)?;
+        if !receipt.validate(to_submit) {
+            context.quarantine_unpublished_staged();
+            self.fail_stop = true;
+            return Err(UringError::InvalidState
+                .report(
+                    "uring.submit.receipt.evidence",
+                    "submission receipt evidence does not describe the planned SQ",
+                )
+                .with_ctx("requested", receipt.requested())
+                .with_ctx("published", receipt.published())
+                .with_ctx("consumed", receipt.consumed())
+                .with_ctx("queue_len", to_submit)
+                .with_ctx("scope", format!("{:?}", receipt.scope()))
+                .attach_note("ambiguous staged metadata was quarantined"));
+        }
         let receipt = match receipt {
-            SubmissionReceipt::Unknown { error } => {
-                self.control.quarantine_unpublished_staged();
-                self.submission_fail_stop = true;
+            SubmissionReceipt::Unknown { error, .. } => {
+                context.quarantine_unpublished_staged();
+                self.fail_stop = true;
                 return Err(submission_error_report(error));
             }
             receipt => receipt,
         };
         let kernel_outstanding = match &receipt {
-            SubmissionReceipt::NoEntries => 0,
-            SubmissionReceipt::Rejected { error } => {
+            SubmissionReceipt::NoEntries { .. } => 0,
+            SubmissionReceipt::Rejected { error, .. } => {
                 let _ = error;
                 0
             }
-            SubmissionReceipt::Consumed {
+            SubmissionReceipt::ConsumedPrefix {
                 requested,
+                published: _,
                 consumed,
-            } => self
-                .control
-                .mark_staged_consumed(*requested, *consumed, published_in_queue)
-                .map_err(|error| staged_ledger_report("uring.submit.receipt", error))?,
-            SubmissionReceipt::PublishedToSqpoll { published } => {
-                if *published != unpublished {
+                ..
+            } => match context.mark_staged_consumed(*requested, *consumed, published_in_queue) {
+                Ok(consumed) => consumed,
+                Err(error) => {
+                    context.quarantine_unpublished_staged();
+                    self.fail_stop = true;
+                    return Err(staged_ledger_report("uring.submit.receipt", error));
+                }
+            },
+            SubmissionReceipt::PublishedToSqPoll { published, .. } => {
+                if *published < unpublished {
+                    context.quarantine_unpublished_staged();
+                    self.fail_stop = true;
                     return Err(UringError::InvalidState
                         .report(
                             "uring.submit.receipt.sqpoll",
-                            "published receipt does not match unpublished ledger entries",
+                            "published receipt is shorter than unpublished ledger entries",
                         )
                         .with_ctx("published", *published)
                         .with_ctx("unpublished", unpublished));
                 }
-                self.control.mark_staged_published();
+                let marked = context.mark_staged_published();
+                if marked != unpublished {
+                    context.quarantine_unpublished_staged();
+                    self.fail_stop = true;
+                    return Err(UringError::InvalidState
+                        .report(
+                            "uring.submit.receipt.sqpoll.ledger",
+                            "SQPOLL publication did not settle the staged ledger prefix",
+                        )
+                        .with_ctx("marked", marked)
+                        .with_ctx("unpublished", unpublished));
+                }
                 0
             }
             SubmissionReceipt::Unknown { .. } => unreachable!("unknown receipt was returned"),
         };
-        self.settle_kernel_submission_phases();
+        context.settle_kernel_submission_phases();
 
-        let pending_submit = self.control.unpublished_staged_entry_count() > 0;
+        let pending_submit = context.unpublished_staged_entry_count() > 0;
         Ok(SubmitProgress {
             receipt,
             staged: unpublished,
@@ -373,62 +575,9 @@ impl<'a> UringDriver<'a> {
         })
     }
 
-    fn settle_kernel_submission_phases(&mut self) {
-        self.control.mark_kernel_cancel_intents();
-        let (ops, control) = (&mut self.ops, &mut self.control);
-        control.staged_entries.for_each_kernel_cancel(|_, target| {
-            let Ok(view) = ops.checked_slot_view(target) else {
-                return;
-            };
-            match view {
-                CheckedSlotView::Valid(SlotView::Reserved(mut slot)) => {
-                    slot.platform_mut().control.cancellation = CancellationPhase::CancelOutstanding;
-                }
-                CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
-                    slot.platform_mut().control.cancellation = CancellationPhase::CancelOutstanding;
-                }
-                CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot)) => {
-                    slot.platform_mut().control.cancellation = CancellationPhase::CancelOutstanding;
-                }
-                CheckedSlotView::Empty(_)
-                | CheckedSlotView::Missing { .. }
-                | CheckedSlotView::Stale(_) => {}
-            }
-        });
-        control.staged_entries.for_each_kernel_user(|token| {
-            let Ok(view) = ops.checked_slot_view(token) else {
-                return;
-            };
-            match view {
-                CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot))
-                    if slot.platform().control.submission == SubmissionPhase::SqeStaged =>
-                {
-                    transition_submission_phase(
-                        &mut slot.platform_mut().control.submission,
-                        token,
-                        SubmissionPhase::KernelOutstanding,
-                        "submit receipt handed SQE to kernel",
-                        &mut control.observer,
-                    );
-                }
-                CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut slot))
-                    if slot.platform().control.submission == SubmissionPhase::SqeStaged =>
-                {
-                    transition_submission_phase(
-                        &mut slot.platform_mut().control.submission,
-                        token,
-                        SubmissionPhase::KernelOutstanding,
-                        "submit receipt handed orphaned SQE to kernel",
-                        &mut control.observer,
-                    );
-                }
-                _ => {}
-            }
-        });
-    }
-
     fn submit_staged_batch(
         &mut self,
+        context: &mut SubmitPort<'_, '_, '_, '_>,
         plan: KernelEnterPlan,
         to_submit: usize,
         unpublished: usize,
@@ -436,30 +585,50 @@ impl<'a> UringDriver<'a> {
         if to_submit > u32::MAX as usize {
             return Ok((
                 SubmissionReceipt::Rejected {
+                    requested: to_submit,
+                    published: to_submit,
+                    consumed: 0,
+                    scope: SubmissionScope::Enter,
                     error: SubmissionError::ReceiptUnavailable,
                 },
                 false,
             ));
         }
 
-        if self.ring.params().is_setup_sqpoll() && plan.wait.is_none() {
-            if to_submit == 0 || !self.ring.submission().need_wakeup() {
+        if context.submission_is_sqpoll() && plan.wait.is_none() {
+            if to_submit == 0 || !context.submission_need_wakeup() {
                 if unpublished == 0 {
-                    return Ok((SubmissionReceipt::NoEntries, false));
+                    return Ok((
+                        SubmissionReceipt::NoEntries {
+                            requested: to_submit,
+                            published: to_submit,
+                            consumed: 0,
+                            scope: SubmissionScope::SqPoll,
+                        },
+                        false,
+                    ));
                 }
                 return Ok((
-                    SubmissionReceipt::PublishedToSqpoll {
-                        published: unpublished,
+                    SubmissionReceipt::PublishedToSqPoll {
+                        requested: to_submit,
+                        published: to_submit,
+                        consumed: 0,
+                        scope: SubmissionScope::SqPoll,
                     },
                     false,
                 ));
             }
 
-            let consumed = self.ring.submit();
+            let consumed = context.kernel_submit();
             return Ok((
                 match consumed {
-                    Ok(receipt) => map_kernel_receipt(receipt),
-                    Err(error) => map_kernel_error(error, "driver.submit_to_kernel.submit.sqpoll"),
+                    Ok(receipt) => map_kernel_receipt(receipt, to_submit, SubmissionScope::SqPoll),
+                    Err(error) => map_kernel_error(
+                        error,
+                        to_submit,
+                        SubmissionScope::SqPoll,
+                        "driver.submit_to_kernel.submit.sqpoll",
+                    ),
                 },
                 false,
             ));
@@ -470,24 +639,48 @@ impl<'a> UringDriver<'a> {
                 UringError::InvalidInput.io_report("driver.submit_to_kernel.timespec", error)
             })?;
             let args = SubmitArgs::new().timespec(&timespec);
-            match self.ring.submitter().submit_with_args(1, &args) {
-                Ok(receipt) => Ok((map_kernel_receipt(receipt), false)),
+            match context.kernel_submit_with_args(1, &args) {
+                Ok(receipt) => Ok((
+                    map_kernel_receipt(receipt, to_submit, SubmissionScope::ExtendedWait),
+                    false,
+                )),
                 Err(error)
                     if error.error().raw_os_error() == Some(libc::ETIME) && to_submit == 0 =>
                 {
-                    Ok((SubmissionReceipt::NoEntries, true))
+                    Ok((
+                        SubmissionReceipt::NoEntries {
+                            requested: to_submit,
+                            published: to_submit,
+                            consumed: 0,
+                            scope: SubmissionScope::ExtendedWait,
+                        },
+                        true,
+                    ))
                 }
                 Err(error) => Ok((
-                    map_kernel_error(error, "driver.submit_to_kernel.wait"),
+                    map_kernel_error(
+                        error,
+                        to_submit,
+                        SubmissionScope::ExtendedWait,
+                        "driver.submit_to_kernel.wait",
+                    ),
                     false,
                 )),
             }
         } else {
             let args = EnterArgs::new(to_submit as u32, 0).flags(EnterFlags::GETEVENTS);
-            match self.ring.submitter().enter(args) {
-                Ok(receipt) => Ok((map_kernel_receipt(receipt), false)),
+            match context.kernel_enter(args) {
+                Ok(receipt) => Ok((
+                    map_kernel_receipt(receipt, to_submit, SubmissionScope::Enter),
+                    false,
+                )),
                 Err(error) => Ok((
-                    map_kernel_error(error, "driver.submit_to_kernel.enter"),
+                    map_kernel_error(
+                        error,
+                        to_submit,
+                        SubmissionScope::Enter,
+                        "driver.submit_to_kernel.enter",
+                    ),
                     false,
                 )),
             }
@@ -497,6 +690,7 @@ impl<'a> UringDriver<'a> {
     #[inline]
     pub(crate) fn submit_operation_internal(
         &mut self,
+        context: &mut SubmitPort<'_, '_, '_, '_>,
         token: OpToken,
         op: UringOp,
         op_in: &mut Option<UringOp>,
@@ -504,7 +698,7 @@ impl<'a> UringDriver<'a> {
     ) -> DriverSubmitResult<UringError> {
         let user_data = token.index();
         let outcome = {
-            let (ops, mut env) = self.split_for_submit();
+            let (ops, mut env) = context.split_for_submit();
             let slot = match ops.checked_slot_view(token) {
                 Ok(CheckedSlotView::Valid(SlotView::Reserved(slot))) => {
                     if slot.has_op() {
@@ -557,11 +751,7 @@ impl<'a> UringDriver<'a> {
             Ok(true) => DriverSubmitResult::submitted(Poll::Ready(())),
             Ok(false) => {
                 if strategy != SubmissionStrategy::SubmitSqe {
-                    if let Some(op) = self
-                        .ops
-                        .active_slot_bundle_mut(token)
-                        .and_then(|(_, _, op, _)| op.take())
-                    {
+                    if let Some(op) = context.take_operation_from_slot(token) {
                         *op_in = Some(op);
                     }
                     return DriverSubmitResult::failed(
@@ -575,14 +765,10 @@ impl<'a> UringDriver<'a> {
                     );
                 }
                 debug!(user_data, "SQ full, pushing to backlog");
-                match self.push_backlog(token) {
+                match Self::push_backlog(context, token) {
                     Ok(()) => DriverSubmitResult::submitted(Poll::Pending),
                     Err(report) => {
-                        if let Some(op) = self
-                            .ops
-                            .active_slot_bundle_mut(token)
-                            .and_then(|(_, _, op, _)| op.take())
-                        {
+                        if let Some(op) = context.take_operation_from_slot(token) {
                             *op_in = Some(op);
                         }
                         DriverSubmitResult::failed(report, SubmitStatus::Void)
@@ -590,11 +776,7 @@ impl<'a> UringDriver<'a> {
                 }
             }
             Err(e) => {
-                if let Some(op) = self
-                    .ops
-                    .active_slot_bundle_mut(token)
-                    .and_then(|(_, _, op, _)| op.take())
-                {
+                if let Some(op) = context.take_operation_from_slot(token) {
                     *op_in = Some(op);
                 }
                 DriverSubmitResult::failed(
@@ -605,40 +787,88 @@ impl<'a> UringDriver<'a> {
             }
         }
     }
+
+    pub(crate) fn push_backlog(
+        context: &mut SubmitPort<'_, '_, '_, '_>,
+        token: OpToken,
+    ) -> UringResult<()> {
+        if let Err(error) = context.push_backlog(token) {
+            return Err(UringError::InvalidState
+                .report(
+                    "uring.backlog.push",
+                    format!("backlog rejected token: {error:?}"),
+                )
+                .with_ctx("token", token.index())
+                .with_ctx("generation", token.generation().get()));
+        }
+        Ok(())
+    }
 }
 
-fn map_kernel_receipt(receipt: KernelSubmitReceipt) -> SubmissionReceipt {
+fn map_kernel_receipt(
+    receipt: KernelSubmitReceipt,
+    requested: usize,
+    scope: SubmissionScope,
+) -> SubmissionReceipt {
     match receipt {
-        KernelSubmitReceipt::NoEntries { .. } => SubmissionReceipt::NoEntries,
+        KernelSubmitReceipt::NoEntries { .. } => SubmissionReceipt::NoEntries {
+            requested,
+            published: requested,
+            consumed: 0,
+            scope,
+        },
         KernelSubmitReceipt::PublishedToSqpoll { published, .. } => {
-            SubmissionReceipt::PublishedToSqpoll {
+            SubmissionReceipt::PublishedToSqPoll {
+                requested,
                 published: published as usize,
+                consumed: 0,
+                scope,
             }
         }
         KernelSubmitReceipt::Submitted {
-            requested,
+            requested: kernel_requested,
             submitted,
             ..
         } => {
-            if requested == 0 {
-                SubmissionReceipt::NoEntries
+            if kernel_requested == 0 {
+                SubmissionReceipt::NoEntries {
+                    requested: kernel_requested as usize,
+                    published: kernel_requested as usize,
+                    consumed: 0,
+                    scope,
+                }
             } else {
-                SubmissionReceipt::Consumed {
-                    requested: requested as usize,
+                SubmissionReceipt::ConsumedPrefix {
+                    requested: kernel_requested as usize,
+                    published: kernel_requested as usize,
                     consumed: submitted as usize,
+                    scope,
                 }
             }
         }
     }
 }
 
-fn map_kernel_error(error: KernelSubmitError, scope: &'static str) -> SubmissionReceipt {
+fn map_kernel_error(
+    error: KernelSubmitError,
+    requested: usize,
+    scope: SubmissionScope,
+    report_scope: &'static str,
+) -> SubmissionReceipt {
     match error {
         KernelSubmitError::Rejected { error, .. } => SubmissionReceipt::Rejected {
-            error: SubmissionError::Kernel(UringError::Submission.io_report(scope, error)),
+            requested,
+            published: requested,
+            consumed: 0,
+            scope,
+            error: SubmissionError::Kernel(UringError::Submission.io_report(report_scope, error)),
         },
         KernelSubmitError::Unknown { error, .. } => SubmissionReceipt::Unknown {
-            error: SubmissionError::Kernel(UringError::Submission.io_report(scope, error)),
+            requested,
+            published: requested,
+            consumed: 0,
+            scope,
+            error: SubmissionError::Kernel(UringError::Submission.io_report(report_scope, error)),
         },
     }
 }

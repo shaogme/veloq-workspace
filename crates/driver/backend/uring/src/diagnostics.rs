@@ -21,11 +21,11 @@ pub struct UringSetupSnapshot {
     pub failure_errno: Option<i32>,
 }
 
-/// Immutable diagnostics for the capabilities observed while creating a ring.
+/// Point-in-time diagnostics for one capability view of a ring.
 ///
-/// This is intentionally a baseline snapshot, not the final capability model. It records the
-/// accepted setup/features bits, the probe result, and the backend paths that are currently
-/// enabled without changing any setup or fallback decisions.
+/// The backend exposes this type through separate baseline and effective accessors. It records
+/// the accepted setup/features bits, the probe result, and the resource state associated with the
+/// selected capability view; it no longer conflates those views with the capability state owner.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct UringCapabilitySnapshot {
     /// Operating system target used to build the backend.
@@ -575,6 +575,11 @@ impl UringCompletionDiagnostics {
     #[inline]
     pub(crate) fn inc_corrupt_cleanup_hint_missing(&self) {
         Self::inc(&self.corrupt_cleanup_hint_missing);
+    }
+
+    #[inline]
+    pub(crate) fn corrupt_cleanup_hint_missing_count(&self) -> u64 {
+        Self::load(&self.corrupt_cleanup_hint_missing)
     }
 }
 

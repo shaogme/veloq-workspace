@@ -49,6 +49,7 @@ pub(crate) const PROVIDED_BUF_GROUP_ID: u16 = 0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProvidedBufRegistrationState {
     Unregistered,
+    RegisteredButNotPublished,
     Registered,
     UnregisterUnknown,
     Released,
@@ -66,9 +67,9 @@ pub(crate) enum ProvidedBufBidState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProvidedBufBidAnomaly {
-    pub(crate) bid: u16,
-    pub(crate) cqe_flags: Option<u32>,
-    pub(crate) last_publish_sequence: Option<u64>,
+    bid: u16,
+    cqe_flags: Option<u32>,
+    last_publish_sequence: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,7 +118,7 @@ impl RingLifetimeOwner {
 
 impl Drop for RingLifetimeOwner {
     fn drop(&mut self) {
-        // This field is declared immediately after `IoUring` in `UringDriver`. Its drop is the
+        // This field is declared immediately after `IoUring` in the driver. Its drop is the
         // explicit proof that the kernel-side ring fd is gone before a retained mapping owner is
         // dropped by the later `buffer_registry` field.
         self.token.close();
@@ -129,21 +130,58 @@ impl Drop for RingLifetimeOwner {
 /// [`Self::available`] 是「环里还剩几个 buffer 供内核挑」，但它只在处理 CQE 时才更新——
 /// 内核消费与我们收割之间它偏高。作为诊断量足够，别拿它当实时水位。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ProvidedBufStats {
+pub struct ProvidedBufferSnapshot {
     /// 交给用户的 buffer 条数。
-    pub handed_out: u64,
+    handed_out: u64,
     /// 完成被丢弃、buffer 原样还回环的次数（取消 / orphan / 陈旧 token）。
-    pub returned: u64,
+    returned: u64,
     /// 从池里补进环的次数。
-    pub refilled: u64,
+    refilled: u64,
     /// 补充失败的次数。每一次都让环少一个 buffer，直到后续某次补充把它捡回来。
-    pub refill_failed: u64,
+    refill_failed: u64,
     /// 内核报 `-ENOBUFS`（环空了）的完成条数。
-    pub exhausted: u64,
+    exhausted: u64,
     /// 环里当前可供内核挑选的 buffer 数。
-    pub available: u16,
+    available: u16,
     /// `available` 的历史最低值——它才是「消费方跟不上」的证据。
-    pub available_low_water: u16,
+    available_low_water: u16,
+}
+
+impl ProvidedBufferSnapshot {
+    /// Returns the number of buffers handed to users.
+    pub const fn handed_out(self) -> u64 {
+        self.handed_out
+    }
+
+    /// Returns the number of selected buffers returned to the ring without user delivery.
+    pub const fn returned(self) -> u64 {
+        self.returned
+    }
+
+    /// Returns the number of buffers refilled into the ring.
+    pub const fn refilled(self) -> u64 {
+        self.refilled
+    }
+
+    /// Returns the number of refill attempts that failed.
+    pub const fn refill_failed(self) -> u64 {
+        self.refill_failed
+    }
+
+    /// Returns the number of completions reported with `-ENOBUFS`.
+    pub const fn exhausted(self) -> u64 {
+        self.exhausted
+    }
+
+    /// Returns the current number of buffers available to the kernel.
+    pub const fn available(self) -> u16 {
+        self.available
+    }
+
+    /// Returns the lowest observed number of buffers available to the kernel.
+    pub const fn available_low_water(self) -> u16 {
+        self.available_low_water
+    }
 }
 
 /// 注册给内核的那一段环内存。
@@ -222,6 +260,7 @@ impl Drop for RingMapping {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RingMappingOwnerState {
     Unregistered,
+    RegisteredButNotPublished { bgid: u16, entries: u16 },
     Registered { bgid: u16, entries: u16 },
     UnregisterUnknown,
     Released,
@@ -233,7 +272,9 @@ pub(crate) enum RingMappingOwnerState {
 /// a normal drop is possible only after successful unregister; the unknown-result fallback is
 /// allowed only after [`RingLifetimeOwner`] has proved that the io_uring fd is already gone.
 struct RingMappingOwner {
-    mapping: RingMapping,
+    /// The mapping must be intentionally leaked if the kernel may still reference it. Keeping it
+    /// in `ManuallyDrop` makes the release-build behavior independent of `debug_assert!`.
+    mapping: mem::ManuallyDrop<RingMapping>,
     ring: ProvidedBufRing,
     state: RingMappingOwnerState,
     lifetime_token: RingLifetimeToken,
@@ -247,7 +288,7 @@ impl RingMappingOwner {
                 UringError::InvalidInput.io_report("uring.provided_buf.bind", error)
             })?;
         Ok(Self {
-            mapping,
+            mapping: mem::ManuallyDrop::new(mapping),
             ring,
             state: RingMappingOwnerState::Unregistered,
             lifetime_token,
@@ -262,7 +303,7 @@ impl RingMappingOwner {
                 ProvidedBufRing::from_raw_parts(mapping.ptr.as_ptr(), entries)
                     .expect("test ring mapping must bind")
             },
-            mapping,
+            mapping: mem::ManuallyDrop::new(mapping),
             state: RingMappingOwnerState::Registered {
                 bgid: PROVIDED_BUF_GROUP_ID,
                 entries,
@@ -272,14 +313,21 @@ impl RingMappingOwner {
     }
 
     fn register(&mut self, submitter: &Submitter<'_>, bgid: u16, entries: u16) -> UringResult<()> {
-        debug_assert_eq!(self.state, RingMappingOwnerState::Unregistered);
+        if self.state != RingMappingOwnerState::Unregistered {
+            return Err(UringError::InvalidState
+                .report(
+                    "uring.provided_buf.register.state",
+                    "provided buffer ring was registered more than once",
+                )
+                .with_ctx("state", "not_unregistered"));
+        }
         // SAFETY: the mapping is page-aligned and remains owned by this wrapper for the entire
         // registration syscall. It is kept alive until a successful unregister or ring teardown.
         unsafe { submitter.register_buf_ring_with_flags(self.mapping.addr(), entries, bgid, 0) }
             .map_err(|err| {
                 UringError::Registration.io_report("uring.provided_buf.register", err)
             })?;
-        self.state = RingMappingOwnerState::Registered { bgid, entries };
+        self.state = RingMappingOwnerState::RegisteredButNotPublished { bgid, entries };
         Ok(())
     }
 
@@ -291,10 +339,14 @@ impl RingMappingOwner {
 
     #[inline]
     fn publish(&mut self, items: &[BufRingItem]) -> io::Result<()> {
-        debug_assert!(matches!(
+        if !matches!(
             self.state,
-            RingMappingOwnerState::Registered { .. } | RingMappingOwnerState::UnregisterUnknown
-        ));
+            RingMappingOwnerState::RegisteredButNotPublished { .. }
+                | RingMappingOwnerState::Registered { .. }
+                | RingMappingOwnerState::UnregisterUnknown
+        ) {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
         self.ring.publish(items)
     }
 
@@ -302,20 +354,31 @@ impl RingMappingOwner {
     fn is_registered(&self) -> bool {
         matches!(
             self.state,
-            RingMappingOwnerState::Registered { .. } | RingMappingOwnerState::UnregisterUnknown
+            RingMappingOwnerState::RegisteredButNotPublished { .. }
+                | RingMappingOwnerState::Registered { .. }
+                | RingMappingOwnerState::UnregisterUnknown
         )
     }
 
     #[inline]
+    fn mark_published(&mut self) {
+        if let RingMappingOwnerState::RegisteredButNotPublished { bgid, entries } = self.state {
+            self.state = RingMappingOwnerState::Registered { bgid, entries };
+        }
+    }
+
+    #[inline]
     fn mark_unregister_unknown(&mut self) {
-        debug_assert!(self.is_registered());
-        self.state = RingMappingOwnerState::UnregisterUnknown;
+        if self.is_registered() {
+            self.state = RingMappingOwnerState::UnregisterUnknown;
+        }
     }
 
     #[inline]
     fn mark_released(&mut self) {
-        debug_assert!(self.is_registered());
-        self.state = RingMappingOwnerState::Released;
+        if self.is_registered() {
+            self.state = RingMappingOwnerState::Released;
+        }
     }
 }
 
@@ -323,14 +386,20 @@ impl Drop for RingMappingOwner {
     fn drop(&mut self) {
         let safe_to_unmap = match self.state {
             RingMappingOwnerState::Unregistered | RingMappingOwnerState::Released => true,
-            RingMappingOwnerState::Registered { .. } | RingMappingOwnerState::UnregisterUnknown => {
-                !self.lifetime_token.is_alive()
-            }
+            RingMappingOwnerState::RegisteredButNotPublished { .. }
+            | RingMappingOwnerState::Registered { .. }
+            | RingMappingOwnerState::UnregisterUnknown => !self.lifetime_token.is_alive(),
         };
-        debug_assert!(
-            safe_to_unmap,
-            "provided ring mapping dropped while io_uring may still reference it"
-        );
+        if safe_to_unmap {
+            // SAFETY: the state machine or the ring lifetime token proves the kernel no longer
+            // references this mapping.
+            unsafe { mem::ManuallyDrop::drop(&mut self.mapping) };
+        } else {
+            tracing::error!(
+                state = ?self.state,
+                "provided ring mapping may still be referenced; leaking mapping as a safety fallback"
+            );
+        }
     }
 }
 
@@ -344,28 +413,63 @@ pub(crate) struct ProvidedBufGroup {
     health: ProvidedBufGroupHealth,
     /// `bufs` 保存实际的 `FixedBuf` owner；`bid_states` 才说明这个 owner 是否已发布、被
     /// kernel 选中、交给用户或暂时空缺。两者必须通过状态方法一起变更。
-    bufs: Box<[Option<FixedBuf>]>,
+    /// Published `FixedBuf` owners are leaked together with the mapping if ring teardown is not
+    /// proven complete. This prevents the kernel from observing freed buffer addresses.
+    bufs: mem::ManuallyDrop<Box<[Option<FixedBuf>]>>,
     bid_states: Box<[ProvidedBufBidState]>,
     /// 每个 bid 最近一次成功发布的序号；即使 bid 已经转为 vacant/user-owned，异常记录仍
     /// 能保留它最后一次进入内核可见状态的上下文。
     last_publish_sequences: Box<[Option<u64>]>,
     /// 补充失败留下的空洞，等后续任一次完成顺手重试。
     vacant: Vec<u16>,
+    /// `retry_vacant` 的消费 scratch，避免每次重试都通过 `mem::take` 丢失容量。
+    vacant_retry: Vec<u16>,
     vacant_bids: BitSet,
     /// 待批量发布的 bid，membership 由位图保证，避免重复 CQE/取消路径重复入队。
     pending_publish: Vec<u16>,
     pending_publish_bids: BitSet,
     /// 其中哪些待发布 bid 是新分配的 buffer，用于在一次 tail 发布后更新统计。
     pending_refill_bids: BitSet,
+    /// Reusable ABI descriptors for one publication batch.
+    publish_items: Vec<BufRingItem>,
     /// 处于 `KernelSelected` 短暂状态的 bid 数量，避免析构/取消检查扫描整张表。
     selected_bids: BitSet,
     selected_bid_count: usize,
     buf_size: NonZeroUsize,
     pool: AnyBufPool,
-    stats: ProvidedBufStats,
+    stats: ProvidedBufferSnapshot,
     bid_anomalies: u64,
     last_bid_anomaly: Option<ProvidedBufBidAnomaly>,
     next_publish_sequence: u64,
+}
+
+/// Completion-side command port for the provided-buffer owner.
+///
+/// The port intentionally exposes only buffer settlement commands. It does not expose the group,
+/// bid table, scratch storage, or registration state to completion code.
+pub(crate) struct ProvidedBufPort<'a> {
+    group: &'a mut ProvidedBufGroup,
+}
+
+impl<'a> ProvidedBufPort<'a> {
+    pub(crate) fn new(group: &'a mut ProvidedBufGroup) -> Self {
+        Self { group }
+    }
+
+    #[inline]
+    pub(crate) fn take_selected(&mut self, flags: u32, res: i32) -> Option<FixedBuf> {
+        self.group.take_selected(flags, res)
+    }
+
+    #[inline]
+    pub(crate) fn return_selected(&mut self, flags: u32) -> bool {
+        self.group.return_selected(flags)
+    }
+
+    #[inline]
+    pub(crate) fn note_exhausted(&mut self) {
+        self.group.note_exhausted();
+    }
 }
 
 /// 反注册失败时的错误和所有权载体。
@@ -374,11 +478,36 @@ pub(crate) struct ProvidedBufGroup {
 /// 使用 ring。因此失败结果必须把 group 一起交还给调用方，避免 `RingMapping` 和仍发布
 /// 给内核的 `FixedBuf` 提前析构。
 pub(crate) struct ProvidedBufUnregisterFailure {
-    pub(crate) report: Report<UringError>,
-    pub(crate) group: ProvidedBufGroup,
+    report: Report<UringError>,
+    group: ProvidedBufGroup,
+}
+
+impl ProvidedBufUnregisterFailure {
+    pub(crate) fn into_parts(self) -> (Report<UringError>, ProvidedBufGroup) {
+        (self.report, self.group)
+    }
 }
 
 pub(crate) type ProvidedBufUnregisterResult = Result<(), Box<ProvidedBufUnregisterFailure>>;
+
+/// Initialization failed after the group may have reached kernel-visible registration.
+///
+/// The optional group is the ownership handoff for a failed unregister. Callers must retain it
+/// whenever present; dropping it while the ring lifetime is still alive deliberately leaks the
+/// mapping and published buffer owners instead of risking use-after-unmap/use-after-free.
+pub(crate) struct ProvidedBufInitializationFailure {
+    report: Report<UringError>,
+    group: Option<ProvidedBufGroup>,
+}
+
+impl ProvidedBufInitializationFailure {
+    pub(crate) fn into_parts(self) -> (Report<UringError>, Option<ProvidedBufGroup>) {
+        (self.report, self.group)
+    }
+}
+
+pub(crate) type ProvidedBufInitializationResult =
+    Result<ProvidedBufGroup, Box<ProvidedBufInitializationFailure>>;
 
 impl ProvidedBufGroup {
     /// 注册一组 provided buffer 并把它填满。
@@ -390,52 +519,80 @@ impl ProvidedBufGroup {
         config: ProvidedBufConfig,
         pool: AnyBufPool,
         ring_lifetime_token: RingLifetimeToken,
-    ) -> UringResult<Self> {
-        Self::new_with_allocator(submitter, config, pool, ring_lifetime_token, |group| {
-            group.alloc_buf()
-        })
+    ) -> ProvidedBufInitializationResult {
+        Self::new_with_allocator(
+            submitter,
+            config,
+            pool,
+            ring_lifetime_token,
+            |group| group.alloc_buf(),
+            |ring, items| ring.publish(items),
+            |bgid| {
+                submitter
+                    .unregister_buf_ring(bgid)
+                    .map_err(|err| err.raw_os_error().unwrap_or(libc::EIO))
+            },
+        )
     }
 
-    fn new_with_allocator<F>(
+    fn new_with_allocator<F, P, U>(
         submitter: &Submitter<'_>,
         config: ProvidedBufConfig,
         pool: AnyBufPool,
         ring_lifetime_token: RingLifetimeToken,
         allocate: F,
-    ) -> UringResult<Self>
+        mut publish: P,
+        unregister: U,
+    ) -> ProvidedBufInitializationResult
     where
         F: Fn(&Self) -> Option<FixedBuf>,
+        P: FnMut(&mut RingMappingOwner, &[BufRingItem]) -> io::Result<()>,
+        U: FnOnce(u16) -> Result<(), i32>,
     {
         let entries = config.entries.get();
         if !entries.is_power_of_two() || entries > MAX_PROVIDED_BUF_ENTRIES {
-            return UringError::InvalidInput
-                .push_ctx("scope", "uring.provided_buf.new")
-                .with_ctx("entries", entries)
-                .with_ctx("max_entries", MAX_PROVIDED_BUF_ENTRIES)
-                .attach_note(
-                    "provided buffer ring entries must be a power of two within the kernel limit",
-                );
+            return Err(Box::new(ProvidedBufInitializationFailure {
+                report: UringError::InvalidInput
+                    .report(
+                        "uring.provided_buf.new",
+                        "provided buffer ring entries are invalid",
+                    )
+                    .with_ctx("entries", entries)
+                    .with_ctx("max_entries", MAX_PROVIDED_BUF_ENTRIES),
+                group: None,
+            }));
         }
 
+        let ring = match RingMappingOwner::new(entries, ring_lifetime_token.clone()) {
+            Ok(ring) => ring,
+            Err(report) => {
+                return Err(Box::new(ProvidedBufInitializationFailure {
+                    report,
+                    group: None,
+                }));
+            }
+        };
         let mut group = Self {
             bgid: PROVIDED_BUF_GROUP_ID,
-            ring: RingMappingOwner::new(entries, ring_lifetime_token.clone())?,
+            ring,
             ring_lifetime_token,
             registration_state: ProvidedBufRegistrationState::Unregistered,
             health: ProvidedBufGroupHealth::Healthy,
-            bufs: (0..entries).map(|_| None).collect(),
+            bufs: mem::ManuallyDrop::new((0..entries).map(|_| None).collect()),
             bid_states: (0..entries).map(|_| ProvidedBufBidState::Vacant).collect(),
             last_publish_sequences: (0..entries).map(|_| None).collect(),
             vacant: Vec::new(),
+            vacant_retry: Vec::new(),
             vacant_bids: BitSet::new(entries as usize),
             pending_publish: Vec::new(),
             pending_publish_bids: BitSet::new(entries as usize),
             pending_refill_bids: BitSet::new(entries as usize),
+            publish_items: Vec::with_capacity(entries as usize),
             selected_bids: BitSet::new(entries as usize),
             selected_bid_count: 0,
             buf_size: config.buf_size,
             pool,
-            stats: ProvidedBufStats::default(),
+            stats: ProvidedBufferSnapshot::default(),
             bid_anomalies: 0,
             last_bid_anomaly: None,
             next_publish_sequence: 0,
@@ -454,17 +611,28 @@ impl ProvidedBufGroup {
         }
 
         if !(0..entries).any(|bid| group.has_unpublished_buf(bid)) {
-            return UringError::Registration
-                .push_ctx("scope", "uring.provided_buf.new")
-                .with_ctx("entries", entries)
-                .with_ctx("buf_size", config.buf_size.get())
-                .attach_note("buffer pool could not fill a single provided buffer");
+            return Err(Box::new(ProvidedBufInitializationFailure {
+                report: UringError::Registration
+                    .report(
+                        "uring.provided_buf.new",
+                        "buffer pool could not fill a single provided buffer",
+                    )
+                    .with_ctx("entries", entries)
+                    .with_ctx("buf_size", config.buf_size.get()),
+                group: Some(group),
+            }));
         }
 
-        group
+        if let Err(report) = group
             .ring
-            .register(submitter, PROVIDED_BUF_GROUP_ID, entries)?;
-        group.registration_state = ProvidedBufRegistrationState::Registered;
+            .register(submitter, PROVIDED_BUF_GROUP_ID, entries)
+        {
+            return Err(Box::new(ProvidedBufInitializationFailure {
+                report,
+                group: Some(group),
+            }));
+        }
+        group.registration_state = ProvidedBufRegistrationState::RegisteredButNotPublished;
 
         // 只有注册成功后才发布 entry。保持 entry 的 reserved 字段不变，并保留原有的
         // tail、available 和 refilled 统计语义。
@@ -473,12 +641,38 @@ impl ProvidedBufGroup {
                 group.stage_driver_owned(bid, true);
             }
         }
-        if !group.flush_pending_publish() {
-            return UringError::Registration
-                .push_ctx("scope", "uring.provided_buf.new")
+        if !group.flush_pending_publish_with(&mut publish) {
+            let report = UringError::Registration
+                .report(
+                    "uring.provided_buf.new",
+                    "provided buffer ring batch publication failed",
+                )
                 .with_ctx("entries", entries)
-                .attach_note("provided buffer ring batch publication failed");
+                .with_ctx("publication_failed", true);
+            let publication_errno = report
+                .error_code()
+                .and_then(|code| i32::try_from(code).ok());
+            return match group.try_unregister_with(unregister) {
+                Ok(()) => Err(Box::new(ProvidedBufInitializationFailure {
+                    report,
+                    group: None,
+                })),
+                Err(failure) => {
+                    let (unregister_report, group) = (*failure).into_parts();
+                    let unregister_report = match publication_errno {
+                        Some(errno) => unregister_report
+                            .with_ctx("publication_errno", errno)
+                            .with_ctx("publication_failed", true),
+                        None => unregister_report,
+                    };
+                    Err(Box::new(ProvidedBufInitializationFailure {
+                        report: unregister_report,
+                        group: Some(group),
+                    }))
+                }
+            };
         }
+        group.mark_published();
 
         // 起始水位是「填满之后」的那个数，否则低水位线永远停在 0 而不说明任何事。
         group.stats.available_low_water = group.stats.available;
@@ -500,7 +694,7 @@ impl ProvidedBufGroup {
     }
 
     #[inline]
-    pub(crate) const fn stats(&self) -> ProvidedBufStats {
+    pub(crate) const fn stats(&self) -> ProvidedBufferSnapshot {
         self.stats
     }
 
@@ -588,6 +782,15 @@ impl ProvidedBufGroup {
     where
         F: FnOnce(u16) -> Result<(), i32>,
     {
+        if !self.ring.is_registered() {
+            return Err(Box::new(ProvidedBufUnregisterFailure {
+                report: UringError::InvalidState.report(
+                    "uring.provided_buf.unregister.state",
+                    "provided buffer ring was not kernel-registered",
+                ),
+                group: self,
+            }));
+        }
         let bgid = self.bgid;
         match unregister(bgid) {
             Ok(()) => {
@@ -677,8 +880,9 @@ impl ProvidedBufGroup {
         if self.vacant.is_empty() {
             return;
         }
-        let mut pending = mem::take(&mut self.vacant);
-        for bid in pending.drain(..) {
+        self.vacant_retry.clear();
+        mem::swap(&mut self.vacant, &mut self.vacant_retry);
+        while let Some(bid) = self.vacant_retry.pop() {
             self.clear_vacant(bid);
             if !self.refill(bid) {
                 self.queue_vacant(bid);
@@ -824,12 +1028,14 @@ impl ProvidedBufGroup {
 
     /// Stage a buffer that is still owned by this group for the next batch publication.
     fn stage_driver_owned(&mut self, bid: u16, is_refill: bool) -> bool {
-        debug_assert_eq!(
+        let can_stage = matches!(
             self.registration_state,
-            ProvidedBufRegistrationState::Registered,
-            "provided buffer published before ring registration"
-        );
-        if !self.is_usable()
+            ProvidedBufRegistrationState::RegisteredButNotPublished
+                | ProvidedBufRegistrationState::Registered
+        ) && self.health == ProvidedBufGroupHealth::Healthy
+            && self.ring.is_registered()
+            && self.ring_lifetime_token.is_alive();
+        if !can_stage
             || self.bid_states.get(bid as usize)
                 != Some(&ProvidedBufBidState::DriverOwnedUnpublished)
         {
@@ -852,30 +1058,41 @@ impl ProvidedBufGroup {
 
     /// Write every staged entry and perform one release tail publication.
     fn flush_pending_publish(&mut self) -> bool {
+        self.flush_pending_publish_with(|ring, items| ring.publish(items))
+    }
+
+    fn flush_pending_publish_with<P>(&mut self, mut publish: P) -> bool
+    where
+        P: FnMut(&mut RingMappingOwner, &[BufRingItem]) -> io::Result<()>,
+    {
         if self.pending_publish.is_empty() {
             return true;
         }
 
-        let mut items = Vec::with_capacity(self.pending_publish.len());
-        for &bid in &self.pending_publish {
-            let Some(Some(buf)) = self.bufs.get(bid as usize) else {
-                self.note_bid_anomaly(bid, "published a provided bid without a buffer owner");
-                return false;
+        self.publish_items.clear();
+        for index in 0..self.pending_publish.len() {
+            let bid = self.pending_publish[index];
+            let item = {
+                let Some(Some(buf)) = self.bufs.get(bid as usize) else {
+                    self.note_bid_anomaly(bid, "published a provided bid without a buffer owner");
+                    return false;
+                };
+                let Ok(len) = u32::try_from(buf.capacity()) else {
+                    self.note_bid_anomaly(bid, "provided buffer capacity exceeds the ring ABI");
+                    return false;
+                };
+                // SAFETY: `buf` remains owned by this group until the kernel consumes the published
+                // entry; its allocation is writable for the complete capacity.
+                let Ok(item) = (unsafe { BufRingItem::new(buf.as_ptr() as u64, len, bid) }) else {
+                    self.note_bid_anomaly(bid, "provided buffer descriptor is invalid");
+                    return false;
+                };
+                item
             };
-            let Ok(len) = u32::try_from(buf.capacity()) else {
-                self.note_bid_anomaly(bid, "provided buffer capacity exceeds the ring ABI");
-                return false;
-            };
-            // SAFETY: `buf` remains owned by this group until the kernel consumes the published
-            // entry; its allocation is writable for the complete capacity.
-            let Ok(item) = (unsafe { BufRingItem::new(buf.as_ptr() as u64, len, bid) }) else {
-                self.note_bid_anomaly(bid, "provided buffer descriptor is invalid");
-                return false;
-            };
-            items.push(item);
+            self.publish_items.push(item);
         }
 
-        if self.ring.publish(&items).is_err() {
+        if publish(&mut self.ring, &self.publish_items).is_err() {
             self.note_bid_anomaly(0, "provided buffer batch publication was rejected");
             return false;
         }
@@ -902,6 +1119,13 @@ impl ProvidedBufGroup {
         self.stats.refilled = self.stats.refilled.saturating_add(refilled);
         debug_assert!(self.bid_ledger_is_consistent());
         true
+    }
+
+    fn mark_published(&mut self) {
+        if self.registration_state == ProvidedBufRegistrationState::RegisteredButNotPublished {
+            self.registration_state = ProvidedBufRegistrationState::Registered;
+            self.ring.mark_published();
+        }
     }
 
     fn note_consumed(&mut self) {
@@ -965,6 +1189,11 @@ impl ProvidedBufGroup {
             && self.ring_lifetime_token.is_alive()
     }
 
+    #[inline]
+    pub(crate) fn is_kernel_registered(&self) -> bool {
+        self.ring.is_registered()
+    }
+
     pub(crate) fn has_selected_bids(&self) -> bool {
         self.selected_bid_count != 0
     }
@@ -975,13 +1204,25 @@ impl ProvidedBufGroup {
     }
 }
 
-#[cfg(test)]
 impl Drop for ProvidedBufGroup {
     fn drop(&mut self) {
+        #[cfg(test)]
         // Unit-test groups emulate a registered ring without owning an `IoUring`. Mark the
-        // standalone token closed before `RingMappingOwner` drops so the fixture models the same
+        // standalone token closed before the resource owners drop so the fixture models the same
         // post-ring teardown ordering as the production driver.
         self.ring_lifetime_token.close();
+
+        let safe_to_release = !self.ring.is_registered() || !self.ring_lifetime_token.is_alive();
+        if safe_to_release {
+            // SAFETY: either unregister succeeded or the owning io_uring fd has already gone
+            // away, so the kernel cannot dereference these buffer owners anymore.
+            unsafe { mem::ManuallyDrop::drop(&mut self.bufs) };
+        } else {
+            tracing::error!(
+                state = ?self.registration_state,
+                "provided buffer owners may still be referenced; leaking owners as a safety fallback"
+            );
+        }
     }
 }
 
@@ -1005,19 +1246,21 @@ pub(crate) fn test_group(entries: u16) -> ProvidedBufGroup {
         ring_lifetime_token,
         registration_state: ProvidedBufRegistrationState::Registered,
         health: ProvidedBufGroupHealth::Healthy,
-        bufs: (0..entries).map(|_| None).collect(),
+        bufs: mem::ManuallyDrop::new((0..entries).map(|_| None).collect()),
         bid_states: (0..entries).map(|_| ProvidedBufBidState::Vacant).collect(),
         last_publish_sequences: (0..entries).map(|_| None).collect(),
         vacant: Vec::new(),
+        vacant_retry: Vec::new(),
         vacant_bids: BitSet::new(entries as usize),
         pending_publish: Vec::new(),
         pending_publish_bids: BitSet::new(entries as usize),
         pending_refill_bids: BitSet::new(entries as usize),
+        publish_items: Vec::with_capacity(entries as usize),
         selected_bids: BitSet::new(entries as usize),
         selected_bid_count: 0,
         buf_size: NonZeroUsize::new(64).expect("test buffer size is non-zero"),
         pool: AnyBufPool::new(TestPool),
-        stats: ProvidedBufStats::default(),
+        stats: ProvidedBufferSnapshot::default(),
         bid_anomalies: 0,
         last_bid_anomaly: None,
         next_publish_sequence: 0,
@@ -1036,7 +1279,7 @@ pub(crate) fn test_group(entries: u16) -> ProvidedBufGroup {
     group
 }
 
-impl Default for ProvidedBufStats {
+impl Default for ProvidedBufferSnapshot {
     fn default() -> Self {
         Self {
             handed_out: 0,
@@ -1058,7 +1301,10 @@ mod tests {
         AnyBufPool, PROVIDED_BUF_GROUP_ID, ProvidedBufConfig, ProvidedBufGroup, TestPool,
         test_group,
     };
-    use veloq_std::num::{NonZeroU16, NonZeroUsize};
+    use veloq_std::{
+        io,
+        num::{NonZeroU16, NonZeroUsize},
+    };
 
     #[test]
     fn failed_unregister_returns_the_group_and_keeps_resources_alive() {
@@ -1126,12 +1372,68 @@ mod tests {
             AnyBufPool::new(TestPool),
             super::RingLifetimeToken::standalone(),
             |_| None,
+            |ring, items| ring.publish(items),
+            |_| Ok(()),
         );
 
         assert!(
             result.is_err(),
             "an allocator that always fails must reject the group"
         );
+        drop(ring);
+    }
+
+    #[test]
+    fn publication_failure_retains_registered_group_until_unregister_succeeds() {
+        let mut ring = match IoUring::new(8) {
+            Ok(ring) => ring,
+            Err(_) => return,
+        };
+        let submitter = ring.submitter();
+        let config = ProvidedBufConfig {
+            entries: NonZeroU16::new(2).expect("test entries are non-zero"),
+            buf_size: NonZeroUsize::new(64).expect("test buffer size is non-zero"),
+        };
+        let result = ProvidedBufGroup::new_with_allocator(
+            &submitter,
+            config,
+            AnyBufPool::new(TestPool),
+            super::RingLifetimeToken::standalone(),
+            |group| group.alloc_buf(),
+            |_, _| Err(io::Error::from_raw_os_error(libc::EIO)),
+            |_| Err(libc::EIO),
+        );
+
+        let failure = match result {
+            Ok(_) => panic!("injected publication must fail"),
+            Err(failure) => failure,
+        };
+        let (report, group) = failure.into_parts();
+        assert_eq!(
+            report
+                .error_code()
+                .and_then(|code| i32::try_from(code).ok()),
+            Some(libc::EIO)
+        );
+        let mut group = group.expect("failed unregister must retain the registered group");
+        assert_eq!(
+            group.registration_state,
+            super::ProvidedBufRegistrationState::UnregisterUnknown
+        );
+        let original_ptr = group.bufs[0]
+            .as_ref()
+            .expect("publication failure must retain the buffer owner")
+            .as_ptr();
+        group.bufs[0]
+            .as_mut()
+            .expect("publication failure must retain the buffer owner")
+            .spare_capacity_mut()[0] = 0xC3;
+        assert_eq!(group.bufs[0].as_ref().unwrap().as_ptr(), original_ptr);
+
+        match group.try_unregister(&submitter) {
+            Ok(()) => {}
+            Err(_) => panic!("the registered group must be unregisterable after retry"),
+        }
         drop(ring);
     }
 

@@ -283,13 +283,18 @@ fn provided_buffers_are_recycled_after_each_completion() {
     }
 
     let stats = driver.provided_buf_stats().expect("the ring is registered");
-    assert_eq!(stats.handed_out, ROUNDS as u64);
+    assert_eq!(stats.handed_out(), ROUNDS as u64);
     // 初始填满 ENTRIES 个，之后每交出一个补一个。
-    assert_eq!(stats.refilled, ENTRIES as u64 + ROUNDS as u64);
-    assert_eq!(stats.refill_failed, 0);
+    assert_eq!(stats.refilled(), ENTRIES as u64 + ROUNDS as u64);
+    assert_eq!(stats.refill_failed(), 0);
     assert_eq!(
-        stats.available, ENTRIES,
+        stats.available(),
+        ENTRIES,
         "every consumed entry must have been replaced"
+    );
+    assert!(
+        stats.available_low_water() <= stats.available(),
+        "the low-water mark cannot exceed the current availability"
     );
 
     driver.unregister_files(vec![fd]).unwrap();
@@ -345,9 +350,10 @@ fn an_exhausted_ring_completes_with_enobufs() {
     );
 
     let stats = driver.provided_buf_stats().expect("the ring is registered");
-    assert_eq!(stats.exhausted, enobufs as u64);
+    assert_eq!(stats.exhausted(), enobufs as u64);
     assert_eq!(
-        stats.available, ENTRIES,
+        stats.available(),
+        ENTRIES,
         "the ring must be full again once every completion has been processed"
     );
 
@@ -380,14 +386,15 @@ fn a_discarded_completion_returns_its_buffer_to_the_ring() {
     loop {
         driver.drive(DriveMode::Poll).expect("drive failed");
         let stats = driver.provided_buf_stats().expect("the ring is registered");
-        if stats.returned > 0 {
-            assert_eq!(stats.handed_out, 0, "nobody consumed this completion");
+        if stats.returned() > 0 {
+            assert_eq!(stats.handed_out(), 0, "nobody consumed this completion");
             assert_eq!(
-                stats.available, ENTRIES,
+                stats.available(),
+                ENTRIES,
                 "a discarded completion must leave the ring full"
             );
             // 还回环用的是原来那个 buffer，不是新从池里取的。
-            assert_eq!(stats.refilled, ENTRIES as u64);
+            assert_eq!(stats.refilled(), ENTRIES as u64);
             break;
         }
         assert!(
@@ -444,10 +451,11 @@ fn recv_multi_delivers_every_chunk_from_one_submission() {
     }
 
     let stats = driver.provided_buf_stats().expect("the ring is registered");
-    assert_eq!(stats.handed_out, ROUNDS as u64);
-    assert_eq!(stats.refilled, ENTRIES as u64 + ROUNDS as u64);
+    assert_eq!(stats.handed_out(), ROUNDS as u64);
+    assert_eq!(stats.refilled(), ENTRIES as u64 + ROUNDS as u64);
     assert_eq!(
-        stats.available, ENTRIES,
+        stats.available(),
+        ENTRIES,
         "every consumed entry must have been replaced"
     );
 
@@ -488,14 +496,15 @@ fn a_cancelled_recv_multi_returns_its_buffer_to_the_ring() {
         loop {
             driver.drive(DriveMode::Poll).expect("drive failed");
             let stats = driver.provided_buf_stats().expect("the ring is registered");
-            if stats.returned >= expected_returns {
-                assert_eq!(stats.handed_out, 0, "nobody consumed these completions");
+            if stats.returned() >= expected_returns {
+                assert_eq!(stats.handed_out(), 0, "nobody consumed these completions");
                 assert_eq!(
-                    stats.available, ENTRIES,
+                    stats.available(),
+                    ENTRIES,
                     "a discarded completion must leave the ring full"
                 );
                 // 还回环用的是原来那个 buffer，不是新从池里取的。
-                assert_eq!(stats.refilled, ENTRIES as u64);
+                assert_eq!(stats.refilled(), ENTRIES as u64);
                 break;
             }
             assert!(

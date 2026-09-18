@@ -8,8 +8,8 @@ pub(crate) use cancellation::{
 };
 pub(crate) use plane::DeferredCancelReconcile;
 pub(crate) use plane::{
-    StagedEntry, StagedLedger, StagedLedgerError, UringControlEffectKind, UringControlPlane,
-    UringPostCompletionEffects,
+    BacklogError, StagedEntry, StagedLedger, StagedLedgerError, UringControlEffect,
+    UringControlEffectKind, UringControlPlane, UringPostCompletionEffects,
 };
 pub(crate) use timer::{ExpiredBatch, UringTimerWheel};
 pub(crate) use waker::UringWakerManager;
@@ -28,10 +28,26 @@ use veloq_wheel::TimerId;
 ///
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ControlTransition {
-    pub(crate) token: OpToken,
-    pub(crate) from: SubmissionPhase,
-    pub(crate) to: SubmissionPhase,
-    pub(crate) reason: &'static str,
+    token: OpToken,
+    from: SubmissionPhase,
+    to: SubmissionPhase,
+    reason: &'static str,
+}
+
+impl ControlTransition {
+    pub(crate) const fn new(
+        token: OpToken,
+        from: SubmissionPhase,
+        to: SubmissionPhase,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            token,
+            from,
+            to,
+            reason,
+        }
+    }
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -149,24 +165,105 @@ pub(crate) enum ControlPlaneEvent {
 #[cfg(any(test, feature = "test-hooks"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ControlTokenSnapshot {
-    pub(crate) token: OpToken,
-    pub(crate) slot: SlotSnapshot,
-    pub(crate) submission_phase: SubmissionPhase,
-    pub(crate) timer_id: Option<TimerId>,
-    pub(crate) has_cleanup_hint: bool,
+    token: OpToken,
+    slot: SlotSnapshot,
+    submission_phase: SubmissionPhase,
+    timer_id: Option<TimerId>,
+    has_cleanup_hint: bool,
 }
 
 /// Point-in-time state used by invariant checks and test hooks.
 #[cfg(any(test, feature = "test-hooks"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ControlPlaneSnapshot {
-    pub(crate) active_tokens: Vec<ControlTokenSnapshot>,
-    pub(crate) backlog_tokens: Vec<OpToken>,
-    pub(crate) pending_cancel_targets: Vec<OpToken>,
-    pub(crate) in_flight_cancel_targets: Vec<(CancelTicket, OpToken)>,
-    pub(crate) timer_tokens: Vec<(TimerId, OpToken)>,
-    pub(crate) cleanup_hint_tokens: Vec<CompletionToken>,
-    pub(crate) quarantined_tokens: Vec<OpToken>,
+    active_tokens: Vec<ControlTokenSnapshot>,
+    backlog_tokens: Vec<OpToken>,
+    pending_cancel_targets: Vec<OpToken>,
+    in_flight_cancel_targets: Vec<(CancelTicket, OpToken)>,
+    timer_tokens: Vec<(TimerId, OpToken)>,
+    cleanup_hint_tokens: Vec<CompletionToken>,
+    quarantined_tokens: Vec<OpToken>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl ControlPlaneSnapshot {
+    pub(crate) fn active_tokens(&self) -> &[ControlTokenSnapshot] {
+        &self.active_tokens
+    }
+
+    pub(crate) fn backlog_tokens(&self) -> &[OpToken] {
+        &self.backlog_tokens
+    }
+
+    pub(crate) fn pending_cancel_targets(&self) -> &[OpToken] {
+        &self.pending_cancel_targets
+    }
+
+    pub(crate) fn timer_tokens(&self) -> &[(TimerId, OpToken)] {
+        &self.timer_tokens
+    }
+
+    pub(crate) fn cleanup_hint_tokens(&self) -> &[CompletionToken] {
+        &self.cleanup_hint_tokens
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl ControlTokenSnapshot {
+    pub(crate) const fn new(
+        token: OpToken,
+        slot: SlotSnapshot,
+        submission_phase: SubmissionPhase,
+        timer_id: Option<TimerId>,
+        has_cleanup_hint: bool,
+    ) -> Self {
+        Self {
+            token,
+            slot,
+            submission_phase,
+            timer_id,
+            has_cleanup_hint,
+        }
+    }
+
+    pub(crate) const fn token(&self) -> OpToken {
+        self.token
+    }
+
+    pub(crate) const fn submission_phase(&self) -> SubmissionPhase {
+        self.submission_phase
+    }
+
+    pub(crate) const fn timer_id(&self) -> Option<TimerId> {
+        self.timer_id
+    }
+
+    pub(crate) const fn has_cleanup_hint(&self) -> bool {
+        self.has_cleanup_hint
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl ControlPlaneSnapshot {
+    pub(crate) fn new(
+        active_tokens: Vec<ControlTokenSnapshot>,
+        backlog_tokens: Vec<OpToken>,
+        pending_cancel_targets: Vec<OpToken>,
+        in_flight_cancel_targets: Vec<(CancelTicket, OpToken)>,
+        timer_tokens: Vec<(TimerId, OpToken)>,
+        cleanup_hint_tokens: Vec<CompletionToken>,
+        quarantined_tokens: Vec<OpToken>,
+    ) -> Self {
+        Self {
+            active_tokens,
+            backlog_tokens,
+            pending_cancel_targets,
+            in_flight_cancel_targets,
+            timer_tokens,
+            cleanup_hint_tokens,
+            quarantined_tokens,
+        }
+    }
 }
 
 /// Records protocol events only in test/debug builds.
@@ -329,6 +426,7 @@ impl ControlPlaneObserver {
 }
 
 /// Writes a backend submission phase and records the exact write site in the observer.
+#[cfg(test)]
 #[inline]
 pub(crate) fn transition_submission_phase(
     phase: &mut SubmissionPhase,

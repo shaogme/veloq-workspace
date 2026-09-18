@@ -1,7 +1,10 @@
 use crate::{
     OwnedRawHandle, RawHandle,
     config::{IoFd, UringRawHandle},
-    driver::{RegisteredFileEntry, SqeEnv, SqeFd},
+    driver::{
+        env::SqeEnv,
+        registration::file_table::{RegisteredFileEntry, SqeFd},
+    },
     error::{UringError, UringResult},
     op::{
         Close, Fallocate, FallocateRaw, Fsync, FsyncRaw, Open, ReadFixed, ReadRaw, SyncFileRange,
@@ -30,7 +33,7 @@ pub(crate) unsafe fn make_sqe_read_fixed(
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_read_fixed", err))?;
     let offset = rw_op.offset;
     let fd = resolve_file_fd(
-        env.file_table,
+        env.file_table(),
         rw_op.fd,
         "uring.op.submit.make_sqe_read_fixed",
     )?;
@@ -105,7 +108,7 @@ pub(crate) unsafe fn make_sqe_write_fixed(
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_write_fixed", err))?;
     let offset = rw_op.offset;
     let fd = resolve_file_fd(
-        env.file_table,
+        env.file_table(),
         rw_op.fd,
         "uring.op.submit.make_sqe_write_fixed",
     )?;
@@ -179,11 +182,11 @@ pub(crate) unsafe fn make_sqe_close(
     // a registered one has a slot entry, a direct one is tracked by handle.
     let owned = match close_op.fd {
         IoFd::Registered { index, .. } => !matches!(
-            env.file_table.entry(index),
+            env.file_table().entry(index),
             Some(RegisteredFileEntry::BorrowedFd { .. })
         ),
         IoFd::Direct(_) => false,
-        IoFd::OwnedDirect { .. } => env.file_table.owns_direct(close_op.fd),
+        IoFd::OwnedDirect { .. } => env.file_table().owns_direct(close_op.fd),
     };
     if !owned {
         return Err(UringError::InvalidInput
@@ -195,7 +198,7 @@ pub(crate) unsafe fn make_sqe_close(
             .with_ctx("fd", close_op.fd.to_string())
             .attach_note("borrowed fd Close rejected"));
     }
-    let fd = resolve_any_fd(env.file_table, close_op.fd, scope)?;
+    let fd = resolve_any_fd(env.file_table(), close_op.fd, scope)?;
     opcode_build(scope, sqe_with_fd!(fd, |f| opcode::Close::new(f).build()))
 }
 
@@ -212,7 +215,7 @@ pub(crate) unsafe fn make_sqe_fsync(
     };
 
     let fd = resolve_file_fd(
-        env.file_table,
+        env.file_table(),
         fsync_op.fd,
         "uring.op.submit.make_sqe_fsync",
     )?;
@@ -262,7 +265,7 @@ pub(crate) unsafe fn make_sqe_sync_range(
     };
 
     let fd = resolve_file_fd(
-        env.file_table,
+        env.file_table(),
         sync_op.fd,
         "uring.op.submit.make_sqe_sync_range",
     )?;
@@ -312,7 +315,7 @@ pub(crate) unsafe fn make_sqe_fallocate(
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let fd = resolve_file_fd(
-        env.file_table,
+        env.file_table(),
         fallocate_op.fd,
         "uring.op.submit.make_sqe_fallocate",
     )?;

@@ -1,3 +1,9 @@
+//! Linux `io_uring` 驱动后端。
+//!
+//! [`UringDriver`] 暴露分离的 capability baseline/effective 视图、完成诊断和
+//! provided-buffer 统计快照；快照类型的字段保持不可变且私有，调用方应通过其访问器读取
+//! 值，以避免依赖内部 bookkeeping 布局。
+
 #![cfg(any(target_os = "linux", target_os = "android"))]
 #![no_std]
 #![deny(warnings)]
@@ -21,7 +27,8 @@ pub use diagnostics::{
     KERNEL_BASELINE, UringCapabilitySnapshot, UringCompletionDiagnostics,
     UringCompletionDiagnosticsSnapshot, UringSetupSnapshot,
 };
-pub use driver::{ProvidedBufStats, UringDriver, UringOpState};
+pub use driver::capability::{CapabilityDisableReason, CapabilityStateSnapshot};
+pub use driver::{ProvidedBufferSnapshot, UringDriver, UringOpState};
 pub use error::{UringError, UringResult};
 pub use net::{Socket, peer_addr_of_handle, socket_addr_to_storage, to_socket_addr};
 pub use op::{UringOp, UringSlotSpec, UringUserPayload};
