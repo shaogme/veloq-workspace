@@ -2,7 +2,7 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use veloq::std::time::Duration;
-use veloq_reliable_udp::{Ack, Config, ConnectionId, Flags, Session, SessionEvent};
+use veloq_reliable_udp::{Ack, Config, ConnectionId, Flags, PacketRef, Session, SessionEvent};
 
 fn outbound(events: Vec<SessionEvent>) -> Vec<Vec<u8>> {
     events
@@ -14,15 +14,25 @@ fn outbound(events: Vec<SessionEvent>) -> Vec<Vec<u8>> {
         .collect()
 }
 
+fn packet(datagram: &[u8]) -> PacketRef<'_> {
+    PacketRef::decode(datagram).expect("validated benchmark packet")
+}
+
 fn establish(client: &mut Session, server: &mut Session) {
     let syn = outbound(client.start(Duration::ZERO).expect("client start"));
-    let syn_ack = outbound(server.receive(Duration::ZERO, &syn[0]).expect("server SYN"));
+    let syn_ack = outbound(
+        server
+            .receive(Duration::ZERO, packet(&syn[0]))
+            .expect("server SYN"),
+    );
     let ack = outbound(
         client
-            .receive(Duration::ZERO, &syn_ack[0])
+            .receive(Duration::ZERO, packet(&syn_ack[0]))
             .expect("client SYN-ACK"),
     );
-    let _ = server.receive(Duration::ZERO, &ack[0]).expect("server ACK");
+    let _ = server
+        .receive(Duration::ZERO, packet(&ack[0]))
+        .expect("server ACK");
 }
 
 fn bench_high_concurrency_handshake(c: &mut Criterion) {
@@ -72,9 +82,11 @@ fn bench_batch_ack(c: &mut Criterion) {
             )
             .encode()
             .expect("second packet");
-            let _ = server.receive(Duration::ZERO, &first).expect("first data");
+            let _ = server
+                .receive(Duration::ZERO, packet(&first))
+                .expect("first data");
             let events = server
-                .receive(Duration::ZERO, &second)
+                .receive(Duration::ZERO, packet(&second))
                 .expect("second data");
             black_box(outbound(events).len());
         });

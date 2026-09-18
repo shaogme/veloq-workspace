@@ -40,7 +40,7 @@ fn endpoint_round_trip_and_explicit_connection_close() {
             Endpoint::bind(ctx, "127.0.0.1:0", Config::default()).expect("bind server");
         let (client, client_driver, mut client_ready) =
             Endpoint::bind(ctx, "127.0.0.1:0", Config::default()).expect("bind client");
-        let server_addr = server.local_addr().expect("server address");
+        let server_addr = server.local_addr();
         let started = Instant::now();
         let deadline = started + ROUND_TRIP_BUDGET;
 
@@ -57,10 +57,7 @@ fn endpoint_round_trip_and_explicit_connection_close() {
                 phase = "accept";
                 let mut server_connection = server.accept().await.expect("accept");
                 assert_eq!(client_connection.peer_addr(), server_addr);
-                assert_eq!(
-                    server_connection.peer_addr(),
-                    client.local_addr().expect("client address")
-                );
+                assert_eq!(server_connection.peer_addr(), client.local_addr());
 
                 phase = "client-to-server send";
                 let receipt = client_connection
@@ -136,7 +133,7 @@ fn endpoint_routes_commands_and_buffers_across_workers() {
             Endpoint::bind(ctx, "127.0.0.1:0", Config::default()).expect("bind server");
         let (client, client_driver, mut client_ready) =
             Endpoint::bind(ctx, "127.0.0.1:0", Config::default()).expect("bind client");
-        let server_addr = server.local_addr().expect("server address");
+        let server_addr = server.local_addr();
 
         scope!(ctx, async |scope| {
             let server_task = scope.spawn_boxed(server_driver.run());
@@ -177,7 +174,7 @@ fn endpoint_rejects_message_larger_than_configured_payload() {
             .expect("small datagram config");
         let (endpoint, driver, mut endpoint_ready) =
             Endpoint::bind(ctx, "127.0.0.1:0", config).expect("bind");
-        let endpoint_addr = endpoint.local_addr().expect("endpoint address");
+        let endpoint_addr = endpoint.local_addr();
 
         scope!(ctx, async |scope| {
             let driver_task = scope.spawn_boxed(driver.run());
@@ -221,8 +218,8 @@ fn endpoint_proxy_retransmits_dropped_data_once() {
             Endpoint::bind(ctx, "127.0.0.1:0", config.clone()).expect("bind server");
         let (client, client_driver, mut client_ready) =
             Endpoint::bind(ctx, "127.0.0.1:0", config).expect("bind client");
-        let server_addr = server.local_addr().expect("server address");
-        let client_addr = client.local_addr().expect("client address");
+        let server_addr = server.local_addr();
+        let client_addr = client.local_addr();
         let mut proxy = SocketProxy::bind(ctx, nz!(1_200)).expect("bind proxy");
         let proxy_addr = proxy.client_side_addr().expect("client proxy address");
         proxy.push_action(
@@ -331,8 +328,8 @@ fn endpoint_proxy_deduplicates_duplicated_data() {
             Endpoint::bind(ctx, "127.0.0.1:0", config.clone()).expect("bind server");
         let (client, client_driver, mut client_ready) =
             Endpoint::bind(ctx, "127.0.0.1:0", config).expect("bind client");
-        let server_addr = server.local_addr().expect("server address");
-        let client_addr = client.local_addr().expect("client address");
+        let server_addr = server.local_addr();
+        let client_addr = client.local_addr();
         let mut proxy = SocketProxy::bind(ctx, nz!(1_200)).expect("bind proxy");
         let proxy_addr = proxy.client_side_addr().expect("client proxy address");
         proxy.push_action(
@@ -455,8 +452,8 @@ fn endpoint_proxy_delays_data_without_duplicate_delivery() {
             Endpoint::bind(ctx, "127.0.0.1:0", config.clone()).expect("bind server");
         let (client, client_driver, mut client_ready) =
             Endpoint::bind(ctx, "127.0.0.1:0", config).expect("bind client");
-        let server_addr = server.local_addr().expect("server address");
-        let client_addr = client.local_addr().expect("client address");
+        let server_addr = server.local_addr();
+        let client_addr = client.local_addr();
         let mut proxy = SocketProxy::bind(ctx, nz!(1_200)).expect("bind proxy");
         let proxy_addr = proxy.client_side_addr().expect("client proxy address");
         proxy.push_action(
@@ -565,8 +562,8 @@ fn endpoint_proxy_reorders_data_and_delivers_in_order() {
             Endpoint::bind(ctx, "127.0.0.1:0", config.clone()).expect("bind server");
         let (client, client_driver, mut client_ready) =
             Endpoint::bind(ctx, "127.0.0.1:0", config).expect("bind client");
-        let server_addr = server.local_addr().expect("server address");
-        let client_addr = client.local_addr().expect("client address");
+        let server_addr = server.local_addr();
+        let client_addr = client.local_addr();
         let mut proxy = SocketProxy::bind(ctx, nz!(1_200)).expect("bind proxy");
         let proxy_addr = proxy.client_side_addr().expect("client proxy address");
         proxy.push_action(
@@ -694,8 +691,8 @@ fn endpoint_proxy_timer_isolation_between_connections() {
             Endpoint::bind(ctx, "127.0.0.1:0", config.clone()).expect("bind server");
         let (client, client_driver, mut client_ready) =
             Endpoint::bind(ctx, "127.0.0.1:0", config).expect("bind client");
-        let server_addr = server.local_addr().expect("server address");
-        let client_addr = client.local_addr().expect("client address");
+        let server_addr = server.local_addr();
+        let client_addr = client.local_addr();
         let mut proxy = SocketProxy::bind(ctx, nz!(1_200)).expect("bind proxy");
         let proxy_addr = proxy.client_side_addr().expect("client proxy address");
         proxy.push_action(
@@ -861,7 +858,7 @@ fn endpoint_proxy_delivers_single_data_packet_within_15s() {
         let config = proxy_config();
         let (server, server_driver, mut server_ready) =
             Endpoint::bind(ctx, "127.0.0.1:0", config).expect("bind server");
-        let server_addr = server.local_addr().expect("server address");
+        let server_addr = server.local_addr();
         let raw_client = UdpSocket::bind(ctx, "127.0.0.1:0").expect("bind raw client");
         let raw_client_addr = raw_client.local_addr().expect("raw client address");
         let proxy = SocketProxy::bind(ctx, nz!(1_200)).expect("bind proxy");

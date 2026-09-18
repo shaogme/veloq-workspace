@@ -12,8 +12,6 @@ pub enum TimerKind {
     HandshakeRetry,
     AckDelay,
     FinRetry,
-    IdleTimeout,
-    KeepAlive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

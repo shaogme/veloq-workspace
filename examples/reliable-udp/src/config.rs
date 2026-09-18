@@ -77,8 +77,6 @@ pub struct Config {
     pub inbound_capacity: NonZeroUsize,
     pub outbound_capacity: NonZeroUsize,
     pub close_timeout: Duration,
-    pub keepalive_interval: Option<Duration>,
-    pub idle_timeout: Option<Duration>,
     pub wheel: WheelConfig,
 }
 
@@ -134,8 +132,6 @@ impl Default for ConfigBuilder {
                 inbound_capacity: non_zero(256),
                 outbound_capacity: non_zero(256),
                 close_timeout: Duration::from_secs(5),
-                keepalive_interval: None,
-                idle_timeout: None,
                 wheel,
             },
         }
@@ -243,16 +239,6 @@ impl ConfigBuilder {
         self
     }
 
-    pub fn keepalive_interval(mut self, value: Option<Duration>) -> Self {
-        self.config.keepalive_interval = value;
-        self
-    }
-
-    pub fn idle_timeout(mut self, value: Option<Duration>) -> Self {
-        self.config.idle_timeout = value;
-        self
-    }
-
     pub fn wheel(mut self, value: WheelConfig) -> Self {
         self.config.wheel = value;
         self
@@ -340,17 +326,7 @@ fn validate_values(config: &Config) -> Result<(), ConfigError> {
         return Err(ConfigError::HandshakeRetryBudgetOverflow);
     }
 
-    for (name, timeout) in [
-        ("ack_delay", config.ack_delay),
-        (
-            "keepalive_interval",
-            config.keepalive_interval.unwrap_or(Duration::ZERO),
-        ),
-        (
-            "idle_timeout",
-            config.idle_timeout.unwrap_or(Duration::ZERO),
-        ),
-    ] {
+    for (name, timeout) in [("ack_delay", config.ack_delay)] {
         if !timeout.is_zero() && timeout.as_nanos().div_ceil(tick.as_nanos()) > u128::from(u64::MAX)
         {
             return Err(ConfigError::TimeoutRangeOverflow { name });

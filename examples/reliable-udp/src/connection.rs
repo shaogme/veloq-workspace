@@ -61,11 +61,11 @@ impl<'rt> Connection<'rt> {
     }
 
     pub fn peer_addr(&self) -> SocketAddr {
-        self.key.peer
+        self.key.peer()
     }
 
     pub fn connection_id(&self) -> ConnectionId {
-        self.key.connection_id
+        self.key.connection_id()
     }
 
     pub async fn send(&self, payload: &[u8]) -> Result<SendReceipt> {

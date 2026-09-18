@@ -50,6 +50,10 @@ mod tests {
             .collect()
     }
 
+    fn packet(datagram: &[u8]) -> PacketRef<'_> {
+        PacketRef::decode(datagram).expect("validated test packet")
+    }
+
     fn establish_pair() -> (Session, Session) {
         let config = Config::default();
         let mut client = Session::new_client(connection_id(), config.clone()).expect("client");
@@ -57,16 +61,20 @@ mod tests {
 
         let syn = outbound(client.start(Duration::ZERO).expect("client start"));
         assert_eq!(syn.len(), 1);
-        let syn_ack = outbound(server.receive(Duration::ZERO, &syn[0]).expect("server SYN"));
+        let syn_ack = outbound(
+            server
+                .receive(Duration::ZERO, packet(&syn[0]))
+                .expect("server SYN"),
+        );
         assert_eq!(syn_ack.len(), 1);
         let ack = outbound(
             client
-                .receive(Duration::ZERO, &syn_ack[0])
+                .receive(Duration::ZERO, packet(&syn_ack[0]))
                 .expect("client SYN-ACK"),
         );
         assert_eq!(ack.len(), 1);
         let server_events = server
-            .receive(Duration::ZERO, &ack[0])
+            .receive(Duration::ZERO, packet(&ack[0]))
             .expect("server final ACK");
         assert!(server_events.contains(&SessionEvent::StateChanged(SessionState::Established)));
         assert_eq!(client.state(), SessionState::Established);
@@ -113,14 +121,16 @@ mod tests {
         )
         .encode()
         .expect("second packet");
-        let first_events = server.receive(Duration::ZERO, &first).expect("first data");
+        let first_events = server
+            .receive(Duration::ZERO, packet(&first))
+            .expect("first data");
         assert!(first_events.contains(&SessionEvent::MessageAvailable));
         let second_events = server
-            .receive(Duration::ZERO, &second)
+            .receive(Duration::ZERO, packet(&second))
             .expect("second data");
         assert_eq!(outbound(second_events).len(), 1);
         assert_eq!(server.stats().ack_delayed, 1);
-        let _ = client.drain_events();
+        let _ = client.take_events();
     }
 
     #[test]
@@ -130,8 +140,10 @@ mod tests {
         let token = client
             .queue_send(Duration::ZERO, b"cwnd".to_vec())
             .expect("queue message");
-        let data = outbound(client.drain_events());
-        let server_events = server.receive(Duration::ZERO, &data[0]).expect("data");
+        let data = outbound(client.take_events());
+        let server_events = server
+            .receive(Duration::ZERO, packet(&data[0]))
+            .expect("data");
         let generation = server_events
             .iter()
             .find_map(|event| match event {
@@ -149,7 +161,7 @@ mod tests {
                 .expect("ACK timer"),
         );
         let client_events = client
-            .receive(Duration::from_millis(5), &ack[0])
+            .receive(Duration::from_millis(5), packet(&ack[0]))
             .expect("ACK");
         assert!(client_events.iter().any(|event| {
             matches!(event, SessionEvent::SendAcked(receipt) if receipt.token == token)
@@ -259,7 +271,7 @@ mod tests {
         let token = client
             .queue_send(Duration::ZERO, b"reliable".to_vec())
             .expect("queue message");
-        let data = outbound(client.drain_events());
+        let data = outbound(client.take_events());
         assert_eq!(data.len(), 1);
 
         let mut link = VecDeque::from(data);
@@ -280,7 +292,7 @@ mod tests {
         );
         assert_eq!(retransmission.len(), 1);
         let server_events = server
-            .receive(Config::default().initial_rto, &retransmission[0])
+            .receive(Config::default().initial_rto, packet(&retransmission[0]))
             .expect("retransmitted data");
         assert!(server_events.contains(&SessionEvent::MessageAvailable));
         let server_generation = server_events
@@ -307,7 +319,7 @@ mod tests {
         let client_events = client
             .receive(
                 Config::default().initial_rto + Config::default().wheel.base_tick(),
-                &ack[0],
+                packet(&ack[0]),
             )
             .expect("ACK");
         assert!(client_events.iter().any(|event| {
@@ -331,26 +343,26 @@ mod tests {
         let token = client
             .queue_send(Duration::ZERO, b"stable-duplicate".to_vec())
             .expect("queue message");
-        let data = outbound(client.drain_events());
+        let data = outbound(client.take_events());
         assert_eq!(data.len(), 1);
 
         let events = server
-            .receive(Duration::ZERO, &data[0])
+            .receive(Duration::ZERO, packet(&data[0]))
             .expect("first data");
         assert!(events.contains(&SessionEvent::MessageAvailable));
         let message = server.recv(Duration::ZERO).expect("first message");
         assert_eq!(message.as_slice(), b"stable-duplicate");
-        let ack = outbound(server.drain_events());
+        let ack = outbound(server.take_events());
         assert_eq!(ack.len(), 1);
 
         let duplicate_events = server
-            .receive(Duration::ZERO, &data[0])
+            .receive(Duration::ZERO, packet(&data[0]))
             .expect("duplicate data");
         assert!(!duplicate_events.contains(&SessionEvent::MessageAvailable));
         assert!(server.recv(Duration::ZERO).is_none());
 
         let client_events = client
-            .receive(Duration::ZERO, &ack[0])
+            .receive(Duration::ZERO, packet(&ack[0]))
             .expect("same-time ACK");
         assert!(client_events.iter().any(|event| {
             matches!(
