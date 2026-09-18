@@ -1,9 +1,12 @@
-use veloq::std::{
-    error::Error as StdError,
-    fmt,
-    num::NonZeroU64,
-    ops::{BitOr, BitOrAssign},
-    vec::Vec,
+use veloq::{
+    buf::FixedBuf,
+    runtime::context::Ctx,
+    std::{
+        error::Error as StdError,
+        fmt,
+        num::{NonZeroU64, NonZeroUsize},
+        ops::{BitOr, BitOrAssign, Range},
+    },
 };
 
 pub const MAGIC: [u8; 2] = *b"VQ";
@@ -25,6 +28,7 @@ pub enum PacketErrorKind {
     InvalidPayloadLength,
     PayloadTooLarge,
     DatagramTooLarge,
+    BufferAllocationFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +56,7 @@ impl fmt::Display for PacketError {
             PacketErrorKind::InvalidPayloadLength => "payload length does not match datagram size",
             PacketErrorKind::PayloadTooLarge => "payload cannot be represented by the wire format",
             PacketErrorKind::DatagramTooLarge => "encoded datagram exceeds the configured limit",
+            PacketErrorKind::BufferAllocationFailed => "packet buffer allocation failed",
         };
         f.write_str(message)
     }
@@ -333,22 +338,63 @@ impl AckWindow {
     }
 }
 
+pub trait PacketBufAllocator {
+    fn alloc_packet_buf(&self, capacity: NonZeroUsize, len: usize)
+    -> Result<FixedBuf, PacketError>;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HeapPacketBufAllocator;
+
+impl PacketBufAllocator for HeapPacketBufAllocator {
+    fn alloc_packet_buf(
+        &self,
+        capacity: NonZeroUsize,
+        len: usize,
+    ) -> Result<FixedBuf, PacketError> {
+        FixedBuf::alloc_heap(capacity, len)
+            .map_err(|_| PacketError::new(PacketErrorKind::BufferAllocationFailed))
+    }
+}
+
+impl<'rt> PacketBufAllocator for Ctx<'rt> {
+    fn alloc_packet_buf(
+        &self,
+        capacity: NonZeroUsize,
+        len: usize,
+    ) -> Result<FixedBuf, PacketError> {
+        self.try_alloc(capacity, len)
+            .map_err(|_| PacketError::new(PacketErrorKind::BufferAllocationFailed))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Packet {
+pub struct PacketMeta {
     pub flags: Flags,
     pub connection_id: ConnectionId,
     pub sequence: u64,
     pub ack_largest: u64,
     pub ack_bitmap: u64,
     pub receive_window: u16,
-    pub payload: Vec<u8>,
+    pub payload_range: Range<usize>,
+}
+
+impl PacketMeta {
+    pub fn ack(&self) -> Result<Ack, PacketError> {
+        ack_from_wire(self.ack_largest, self.ack_bitmap)
+    }
+}
+
+#[derive(Debug)]
+pub struct Packet {
+    meta: PacketMeta,
+    datagram: FixedBuf,
 }
 
 /// 借用式数据报视图。
 ///
 /// 该视图只解析固定头部，不复制 payload。端点接收泵可以保留底层
-/// `FixedBuf` 的所有权，协议层只在确认接纳消息后复制 payload；这避免了先把
-/// 整个 UDP 数据报复制到 `Vec` 再进行头部解析。
+/// `FixedBuf` 的所有权，协议层只在确认接纳消息后转移 payload 子缓冲区。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PacketRef<'a> {
     pub flags: Flags,
@@ -361,81 +407,112 @@ pub struct PacketRef<'a> {
 }
 
 impl Packet {
-    pub fn new(
+    pub fn encode_into<A: PacketBufAllocator + ?Sized>(
+        allocator: &A,
         flags: Flags,
         connection_id: ConnectionId,
         sequence: u64,
         ack: Ack,
         receive_window: u16,
-        payload: Vec<u8>,
-    ) -> Self {
-        Self {
+        payload: &[u8],
+    ) -> Result<Self, PacketError> {
+        let capacity = HEADER_LEN
+            .checked_add(payload.len())
+            .and_then(NonZeroUsize::new)
+            .ok_or(PacketError::new(PacketErrorKind::DatagramTooLarge))?;
+        Self::encode_into_with_limit(
+            allocator,
+            capacity,
+            flags,
+            connection_id,
+            sequence,
+            ack,
+            receive_window,
+            payload,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_into_with_limit<A: PacketBufAllocator + ?Sized>(
+        allocator: &A,
+        max_datagram_size: NonZeroUsize,
+        flags: Flags,
+        connection_id: ConnectionId,
+        sequence: u64,
+        ack: Ack,
+        receive_window: u16,
+        payload: &[u8],
+    ) -> Result<Self, PacketError> {
+        let payload_len = u16::try_from(payload.len())
+            .map_err(|_| PacketError::new(PacketErrorKind::PayloadTooLarge))?;
+        let total_len = HEADER_LEN
+            .checked_add(usize::from(payload_len))
+            .ok_or(PacketError::new(PacketErrorKind::PayloadTooLarge))?;
+        if total_len > max_datagram_size.get() {
+            return Err(PacketError::new(PacketErrorKind::DatagramTooLarge));
+        }
+
+        let meta = PacketMeta {
             flags,
             connection_id,
             sequence,
             ack_largest: ack.largest.map_or(0, MessageSequence::get),
             ack_bitmap: ack.bitmap,
             receive_window,
-            payload,
+            payload_range: HEADER_LEN..total_len,
+        };
+        validate_meta(&meta)?;
+        let mut datagram = allocator.alloc_packet_buf(max_datagram_size, total_len)?;
+        if datagram.capacity() < total_len {
+            return Err(PacketError::new(PacketErrorKind::DatagramTooLarge));
         }
+        let bytes = datagram.spare_capacity_mut();
+        bytes[..2].copy_from_slice(&MAGIC);
+        bytes[2] = VERSION;
+        bytes[3] = flags.bits();
+        bytes[4..6].copy_from_slice(&(HEADER_LEN as u16).to_le_bytes());
+        bytes[6..14].copy_from_slice(&connection_id.get().to_le_bytes());
+        bytes[14..22].copy_from_slice(&sequence.to_le_bytes());
+        bytes[22..30].copy_from_slice(&meta.ack_largest.to_le_bytes());
+        bytes[30..38].copy_from_slice(&meta.ack_bitmap.to_le_bytes());
+        bytes[38..40].copy_from_slice(&receive_window.to_le_bytes());
+        bytes[40..42].copy_from_slice(&payload_len.to_le_bytes());
+        bytes[HEADER_LEN..total_len].copy_from_slice(payload);
+        datagram.set_len(total_len);
+        Ok(Self { meta, datagram })
+    }
+
+    pub fn from_fixed_buf(datagram: FixedBuf) -> Result<Self, PacketError> {
+        let meta = PacketRef::decode(datagram.as_slice())?.meta();
+        Ok(Self { meta, datagram })
+    }
+
+    pub fn as_ref(&self) -> PacketRef<'_> {
+        PacketRef {
+            flags: self.meta.flags,
+            connection_id: self.meta.connection_id,
+            sequence: self.meta.sequence,
+            ack_largest: self.meta.ack_largest,
+            ack_bitmap: self.meta.ack_bitmap,
+            receive_window: self.meta.receive_window,
+            payload: &self.datagram.as_slice()[self.meta.payload_range.clone()],
+        }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        self.datagram.as_slice()
+    }
+
+    pub fn into_fixed_buf(self) -> FixedBuf {
+        self.datagram
+    }
+
+    pub fn meta(&self) -> &PacketMeta {
+        &self.meta
     }
 
     pub fn ack(&self) -> Result<Ack, PacketError> {
-        ack_from_wire(self.ack_largest, self.ack_bitmap)
-    }
-
-    pub fn encode(&self) -> Result<Vec<u8>, PacketError> {
-        self.encode_with_limit(usize::MAX)
-    }
-
-    pub fn encode_with_limit(&self, max_datagram_size: usize) -> Result<Vec<u8>, PacketError> {
-        self.validate()?;
-        let payload_len = u16::try_from(self.payload.len())
-            .map_err(|_| PacketError::new(PacketErrorKind::PayloadTooLarge))?;
-        let total_len = HEADER_LEN
-            .checked_add(usize::from(payload_len))
-            .ok_or(PacketError::new(PacketErrorKind::PayloadTooLarge))?;
-        if total_len > max_datagram_size {
-            return Err(PacketError::new(PacketErrorKind::DatagramTooLarge));
-        }
-
-        let mut datagram = Vec::with_capacity(total_len);
-        datagram.extend_from_slice(&MAGIC);
-        datagram.push(VERSION);
-        datagram.push(self.flags.bits());
-        datagram.extend_from_slice(&(HEADER_LEN as u16).to_le_bytes());
-        datagram.extend_from_slice(&self.connection_id.get().to_le_bytes());
-        datagram.extend_from_slice(&self.sequence.to_le_bytes());
-        datagram.extend_from_slice(&self.ack_largest.to_le_bytes());
-        datagram.extend_from_slice(&self.ack_bitmap.to_le_bytes());
-        datagram.extend_from_slice(&self.receive_window.to_le_bytes());
-        datagram.extend_from_slice(&payload_len.to_le_bytes());
-        datagram.extend_from_slice(&self.payload);
-        Ok(datagram)
-    }
-
-    pub fn decode(datagram: &[u8]) -> Result<Self, PacketError> {
-        PacketRef::decode(datagram).map(PacketRef::to_owned)
-    }
-
-    fn validate(&self) -> Result<(), PacketError> {
-        if !self.flags.is_valid() {
-            return Err(PacketError::new(PacketErrorKind::InvalidFlags));
-        }
-        if self.connection_id.get() == 0 {
-            return Err(PacketError::new(PacketErrorKind::InvalidConnectionId));
-        }
-        if self.flags.contains(Flags::DATA) && self.sequence == 0 {
-            return Err(PacketError::new(PacketErrorKind::InvalidSequence));
-        }
-        ack_from_wire(self.ack_largest, self.ack_bitmap)?;
-        if self.ack_largest != 0 && !self.flags.contains(Flags::ACK) {
-            return Err(PacketError::new(PacketErrorKind::InvalidAck));
-        }
-        if self.payload.len() > usize::from(u16::MAX) {
-            return Err(PacketError::new(PacketErrorKind::PayloadTooLarge));
-        }
-        Ok(())
+        self.meta.ack()
     }
 }
 
@@ -493,17 +570,37 @@ impl<'a> PacketRef<'a> {
         ack_from_wire(self.ack_largest, self.ack_bitmap)
     }
 
-    pub fn to_owned(self) -> Packet {
-        Packet {
+    pub fn meta(&self) -> PacketMeta {
+        PacketMeta {
             flags: self.flags,
             connection_id: self.connection_id,
             sequence: self.sequence,
             ack_largest: self.ack_largest,
             ack_bitmap: self.ack_bitmap,
             receive_window: self.receive_window,
-            payload: self.payload.to_vec(),
+            payload_range: HEADER_LEN..HEADER_LEN + self.payload.len(),
         }
     }
+}
+
+fn validate_meta(meta: &PacketMeta) -> Result<(), PacketError> {
+    if !meta.flags.is_valid() {
+        return Err(PacketError::new(PacketErrorKind::InvalidFlags));
+    }
+    if meta.connection_id.get() == 0 {
+        return Err(PacketError::new(PacketErrorKind::InvalidConnectionId));
+    }
+    if meta.flags.contains(Flags::DATA) && meta.sequence == 0 {
+        return Err(PacketError::new(PacketErrorKind::InvalidSequence));
+    }
+    ack_from_wire(meta.ack_largest, meta.ack_bitmap)?;
+    if meta.ack_largest != 0 && !meta.flags.contains(Flags::ACK) {
+        return Err(PacketError::new(PacketErrorKind::InvalidAck));
+    }
+    if meta.payload_range.len() > usize::from(u16::MAX) {
+        return Err(PacketError::new(PacketErrorKind::PayloadTooLarge));
+    }
+    Ok(())
 }
 
 fn ack_from_wire(largest: u64, bitmap: u64) -> Result<Ack, PacketError> {

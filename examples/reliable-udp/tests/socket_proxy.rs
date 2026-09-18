@@ -34,7 +34,7 @@ use veloq::{
     time::sleep,
 };
 
-use veloq_reliable_udp::{Flags, MessageSequence, Packet};
+use veloq_reliable_udp::{Flags, MessageSequence, PacketRef};
 
 const CHANNEL_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 32;
@@ -999,7 +999,7 @@ impl Coordinator<'_> {
             return Ok(());
         }
 
-        let packet = Packet::decode(&datagram).ok();
+        let packet = PacketRef::decode(&datagram).ok();
         let selected = self
             .rules
             .iter()
@@ -1204,7 +1204,7 @@ fn trace_datagram(
     operation_id: u64,
     event_id: u64,
 ) {
-    if let Ok(packet) = Packet::decode(datagram) {
+    if let Ok(packet) = PacketRef::decode(datagram) {
         trace!(
             target: "veloq_reliable_udp::socket_proxy",
             direction = ?direction,
@@ -1232,7 +1232,7 @@ fn trace_datagram(
 }
 
 impl PacketMatcher {
-    fn matches(self, packet: Option<&Packet>) -> bool {
+    fn matches(self, packet: Option<&PacketRef<'_>>) -> bool {
         let Some(packet) = packet else {
             return matches!(self, Self::Any);
         };

@@ -3,7 +3,7 @@ use veloq::{
     buf::FixedBuf,
     net::{PreparedUdpRecv, UdpSocket},
     runtime::context::Ctx,
-    std::{net::SocketAddr, num::NonZeroUsize, sync::Arc, vec::Vec},
+    std::{net::SocketAddr, sync::Arc},
     sync::{
         TrySendError,
         mpmc::{BoundedOwnedReceiver, BoundedOwnedSender, owned_bounded},
@@ -13,7 +13,7 @@ use veloq::{
 use crate::{
     Config,
     error::{Error, Result},
-    packet::Packet,
+    packet::{MessageSequence, PacketRef},
 };
 
 use super::{Command, ConnectionKey, stats::EndpointStats};
@@ -52,24 +52,31 @@ impl InboundDatagram {
     pub(super) fn bytes(&self) -> &[u8] {
         self.datagram.as_slice()
     }
+
+    pub(super) fn into_datagram(self) -> FixedBuf {
+        self.datagram
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SendTicket {
+    DropAfterSend,
+    CompleteConnect,
+    ReturnToSession(MessageSequence),
 }
 
 pub(super) struct OutboundDatagram {
     key: ConnectionKey,
-    datagram: Vec<u8>,
-    completion: Option<PumpSender>,
+    datagram: FixedBuf,
+    ticket: SendTicket,
 }
 
 impl OutboundDatagram {
-    pub(super) fn new(
-        key: ConnectionKey,
-        datagram: Vec<u8>,
-        completion: Option<PumpSender>,
-    ) -> Self {
+    pub(super) fn new(key: ConnectionKey, datagram: FixedBuf, ticket: SendTicket) -> Self {
         Self {
             key,
             datagram,
-            completion,
+            ticket,
         }
     }
 
@@ -78,15 +85,15 @@ impl OutboundDatagram {
     }
 
     pub(super) fn datagram(&self) -> &[u8] {
-        &self.datagram
+        self.datagram.as_slice()
     }
 
     pub(super) fn has_completion(&self) -> bool {
-        self.completion.is_some()
+        !matches!(self.ticket, SendTicket::DropAfterSend)
     }
 
-    pub(super) fn into_parts(self) -> (ConnectionKey, Vec<u8>, Option<PumpSender>) {
-        (self.key, self.datagram, self.completion)
+    pub(super) fn into_parts(self) -> (ConnectionKey, FixedBuf, SendTicket) {
+        (self.key, self.datagram, self.ticket)
     }
 }
 
@@ -96,7 +103,9 @@ pub(super) enum PumpEvent {
     ReceiveFailed(Error),
     SendCompleted {
         key: ConnectionKey,
+        ticket: SendTicket,
         result: Result<()>,
+        datagram: Option<FixedBuf>,
     },
     SendFailed {
         key: ConnectionKey,
@@ -178,9 +187,7 @@ pub(super) async fn receive_pump<'rt>(
 }
 
 pub(super) async fn send_pump<'rt>(
-    ctx: Ctx<'rt>,
     socket: UdpSocket<'rt>,
-    config: Config,
     outbound: OutboundReceiver,
     pump_events: PumpSender,
 ) -> Result<()> {
@@ -190,25 +197,36 @@ pub(super) async fn send_pump<'rt>(
     }
     while let Ok(item) = outbound.recv().await {
         trace_submitted(&item);
-        let (key, datagram, completion) = item.into_parts();
-        let result =
-            send_datagram(ctx, &socket, config.max_datagram_size, key.peer(), datagram).await;
-        match completion {
-            Some(completion) => {
-                if completion
-                    .send(PumpEvent::SendCompleted { key, result })
-                    .await
-                    .is_err()
-                {
-                    return Err(Error::Io);
-                }
+        let (key, datagram, ticket) = item.into_parts();
+        let (result, returned) = match socket.send_to(datagram, key.peer()).await {
+            Ok((sent, returned)) if sent == returned.len() => (Ok(()), Some(returned)),
+            Ok((_, returned)) => {
+                drop(returned);
+                (Err(Error::Io), None)
             }
-            None => {
+            Err(_) => (Err(Error::Io), None),
+        };
+        match ticket {
+            SendTicket::DropAfterSend => {
                 if let Err(error) = result
                     && pump_events
                         .send(PumpEvent::SendFailed { key, error })
                         .await
                         .is_err()
+                {
+                    return Err(Error::Io);
+                }
+            }
+            SendTicket::CompleteConnect | SendTicket::ReturnToSession(_) => {
+                if pump_events
+                    .send(PumpEvent::SendCompleted {
+                        key,
+                        ticket,
+                        result,
+                        datagram: returned,
+                    })
+                    .await
+                    .is_err()
                 {
                     return Err(Error::Io);
                 }
@@ -232,7 +250,7 @@ fn trace_received(peer: SocketAddr, datagram: &FixedBuf) {
 }
 
 fn trace_submitted(item: &OutboundDatagram) {
-    if let Ok(packet) = Packet::decode(item.datagram()) {
+    if let Ok(packet) = PacketRef::decode(item.datagram()) {
         trace!(
             target: "veloq_reliable_udp::endpoint",
             peer = ?item.key().peer(),
@@ -256,21 +274,4 @@ fn prepare_recv<'rt>(
         .try_alloc_full(config.max_datagram_size)
         .map_err(|_| Error::Io)?;
     Ok(socket.prepare_recv_from(buffer))
-}
-
-async fn send_datagram<'rt>(
-    ctx: Ctx<'rt>,
-    socket: &UdpSocket<'rt>,
-    max_datagram_size: NonZeroUsize,
-    peer: SocketAddr,
-    datagram: Vec<u8>,
-) -> Result<()> {
-    let length = datagram.len();
-    let mut buffer = ctx
-        .try_alloc(max_datagram_size, length)
-        .map_err(|_| Error::Io)?;
-    buffer.spare_capacity_mut()[..length].copy_from_slice(&datagram);
-    buffer.set_len(length);
-    socket.send_to(buffer, peer).await.map_err(|_| Error::Io)?;
-    Ok(())
 }

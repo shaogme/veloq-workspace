@@ -1,9 +1,6 @@
 use veloq::{
     runtime::context::Ctx,
-    std::{
-        collections::HashMap, net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration,
-        vec::Vec,
-    },
+    std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration, vec::Vec},
     sync::{
         TrySendError,
         mpmc::{BoundedOwnedReceiver, BoundedOwnedSender},
@@ -191,6 +188,7 @@ impl SessionEntry {
 }
 
 pub(super) struct ProtocolState<'rt> {
+    ctx: Ctx<'rt>,
     config: Config,
     sessions: HashMap<ConnectionKey, SessionEntry>,
     clock: EndpointClock,
@@ -202,6 +200,7 @@ pub(super) struct ProtocolState<'rt> {
 
 impl<'rt> ProtocolState<'rt> {
     pub(super) fn new(
+        ctx: Ctx<'rt>,
         config: Config,
         stats: Arc<EndpointStats>,
         command: CommandSender,
@@ -209,6 +208,7 @@ impl<'rt> ProtocolState<'rt> {
         accept: BoundedOwnedReceiver<Connection<'rt>>,
     ) -> Self {
         Self {
+            ctx,
             clock: EndpointClock::new(&config),
             config,
             sessions: HashMap::default(),
@@ -221,6 +221,10 @@ impl<'rt> ProtocolState<'rt> {
 
     pub(super) fn config(&self) -> &Config {
         &self.config
+    }
+
+    pub(super) fn ctx(&self) -> Ctx<'rt> {
+        self.ctx
     }
 
     pub(super) fn now(&self) -> Duration {
@@ -310,21 +314,11 @@ impl<'rt> ProtocolState<'rt> {
     }
 }
 
-pub(super) fn message_from_session<'rt>(
-    ctx: Ctx<'rt>,
-    max_datagram_size: NonZeroUsize,
-    message: SessionMessage,
-) -> Result<Message> {
-    let length = message.payload.len();
-    let mut payload = ctx
-        .try_alloc(max_datagram_size, length)
-        .map_err(|_| Error::Io)?;
-    payload.spare_capacity_mut()[..length].copy_from_slice(&message.payload);
-    payload.set_len(length);
-    Ok(Message {
+pub(super) fn message_from_session(message: SessionMessage) -> Message {
+    Message {
         sequence: message.sequence,
-        payload,
-    })
+        payload: message.into_fixed_buf(),
+    }
 }
 
 pub(super) fn key_from_packet(peer: SocketAddr, connection_id: ConnectionId) -> ConnectionKey {

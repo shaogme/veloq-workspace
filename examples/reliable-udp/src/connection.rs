@@ -68,23 +68,7 @@ impl<'rt> Connection<'rt> {
         self.key.connection_id()
     }
 
-    pub async fn send(&self, payload: &[u8]) -> Result<SendReceipt> {
-        if payload.len() > self.max_payload {
-            return Err(Error::MessageTooLarge);
-        }
-        let (reply, response) = oneshot::owned_channel();
-        self.command
-            .send(Command::Send {
-                key: self.key,
-                payload: SendPayload::Bytes(payload.to_vec()),
-                reply,
-            })
-            .await
-            .map_err(|_| Error::EndpointClosed)?;
-        response.await.map_err(|_| Error::EndpointClosed)?
-    }
-
-    pub async fn send_buf(&self, payload: FixedBuf) -> Result<SendReceipt> {
+    pub async fn send(&self, payload: FixedBuf) -> Result<SendReceipt> {
         if payload.len() > self.max_payload {
             return Err(Error::MessageTooLarge);
         }
@@ -93,6 +77,22 @@ impl<'rt> Connection<'rt> {
             .send(Command::Send {
                 key: self.key,
                 payload: SendPayload::Buffer(payload),
+                reply,
+            })
+            .await
+            .map_err(|_| Error::EndpointClosed)?;
+        response.await.map_err(|_| Error::EndpointClosed)?
+    }
+
+    pub async fn send_bytes(&self, payload: &[u8]) -> Result<SendReceipt> {
+        if payload.len() > self.max_payload {
+            return Err(Error::MessageTooLarge);
+        }
+        let (reply, response) = oneshot::owned_channel();
+        self.command
+            .send(Command::Send {
+                key: self.key,
+                payload: SendPayload::Bytes(payload.to_vec()),
                 reply,
             })
             .await

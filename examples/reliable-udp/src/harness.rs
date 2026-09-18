@@ -1,4 +1,7 @@
-use veloq::std::{collections::VecDeque, time::Duration, vec::Vec};
+use veloq::{
+    buf::FixedBuf,
+    std::{collections::VecDeque, num::NonZeroUsize, time::Duration},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DatagramAction {
@@ -8,11 +11,11 @@ pub enum DatagramAction {
     Delay(Duration),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct VirtualDatagram {
     pub from: usize,
     pub to: usize,
-    pub payload: Vec<u8>,
+    pub payload: FixedBuf,
 }
 
 #[derive(Debug)]
@@ -50,13 +53,14 @@ impl VirtualDatagramHarness {
         self.actions.push_back(action);
     }
 
-    pub fn send(&mut self, from: usize, to: usize, payload: Vec<u8>) {
+    pub fn send(&mut self, from: usize, to: usize, payload: FixedBuf) {
         let action = self.actions.pop_front().unwrap_or(DatagramAction::Deliver);
         match action {
             DatagramAction::Deliver => self.enqueue(from, to, payload, Duration::ZERO),
             DatagramAction::Drop => {}
             DatagramAction::Duplicate => {
-                self.enqueue(from, to, payload.clone(), Duration::ZERO);
+                let duplicate = duplicate_for_test(&payload);
+                self.enqueue(from, to, duplicate, Duration::ZERO);
                 self.enqueue(from, to, payload, Duration::ZERO);
             }
             DatagramAction::Delay(delay) => self.enqueue(from, to, payload, delay),
@@ -92,10 +96,18 @@ impl VirtualDatagramHarness {
         self.pending.remove(index).map(|entry| entry.datagram)
     }
 
-    fn enqueue(&mut self, from: usize, to: usize, payload: Vec<u8>, delay: Duration) {
+    fn enqueue(&mut self, from: usize, to: usize, payload: FixedBuf, delay: Duration) {
         self.pending.push_back(ScheduledDatagram {
             datagram: VirtualDatagram { from, to, payload },
             deliver_at: self.now.saturating_add(delay),
         });
     }
+}
+
+fn duplicate_for_test(payload: &FixedBuf) -> FixedBuf {
+    let capacity = NonZeroUsize::new(payload.len().max(1)).expect("non-zero test capacity");
+    let mut duplicate =
+        FixedBuf::alloc_heap(capacity, payload.len()).expect("test datagram allocation failed");
+    duplicate.as_slice_mut().copy_from_slice(payload.as_slice());
+    duplicate
 }

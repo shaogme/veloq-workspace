@@ -155,7 +155,8 @@ impl CommandService {
             return Ok(());
         }
         let mut session = Session::new_client(key.connection_id(), state.config().clone())?;
-        let events = session.start(state.now())?;
+        let ctx = ports.ctx();
+        let events = session.start(state.now(), &ctx)?;
         state.insert(key, SessionEntry::new(session, Some(reply)));
         state.stats().connection_started();
         EventRouter::record_events(
@@ -175,16 +176,25 @@ impl CommandService {
         state: &mut ProtocolState<'rt>,
         ports: &CommandPorts<'a, 'rt>,
     ) -> Result<()> {
+        let ctx = ports.ctx();
         let payload = match payload {
-            SendPayload::Bytes(payload) => payload,
-            SendPayload::Buffer(payload) => payload.as_slice().to_vec(),
+            SendPayload::Bytes(bytes) => {
+                let length = bytes.len();
+                let mut payload = ctx
+                    .try_alloc(state.config().max_datagram_size, length)
+                    .map_err(|_| Error::Io)?;
+                payload.spare_capacity_mut()[..length].copy_from_slice(&bytes);
+                payload.set_len(length);
+                payload
+            }
+            SendPayload::Buffer(payload) => payload,
         };
         let now = state.now();
         let Some(entry) = state.entry_mut(&key) else {
             let _ = reply.send(Err(Error::ConnectionClosed));
             return Ok(());
         };
-        let token = match entry.session_mut().queue_send(now, payload) {
+        let token = match entry.session_mut().queue_send(now, payload, &ctx) {
             Ok(token) => token,
             Err(error) => {
                 let _ = reply.send(Err(error));
@@ -211,7 +221,6 @@ impl CommandService {
     ) -> Result<()> {
         let now = state.now();
         let ctx = ports.ctx();
-        let max_datagram_size = state.config().max_datagram_size;
         let Some(entry) = state.entry_mut(&key) else {
             let _ = reply.send(Err(Error::ConnectionClosed));
             return Ok(());
@@ -224,10 +233,9 @@ impl CommandService {
             let _ = reply.send(Err(Error::InvalidState));
             return Ok(());
         }
-        let message = entry.session_mut().recv(now);
+        let message = entry.session_mut().recv(now, &ctx);
         if let Some(message) = message {
-            let response = message_from_session(ctx, max_datagram_size, message);
-            let _ = reply.send(response);
+            let _ = reply.send(Ok(message_from_session(message)));
             let events = entry.session_mut().take_events();
             EventRouter::record_events(
                 state,
@@ -280,7 +288,8 @@ impl CommandService {
             let _ = reply.send(Err(Error::InvalidState));
             return Ok(());
         }
-        match entry.session_mut().close(now) {
+        let ctx = ports.ctx();
+        match entry.session_mut().close(now, &ctx) {
             Ok(events) => {
                 entry.set_pending_close(reply);
                 EventRouter::record_events(
@@ -311,7 +320,8 @@ impl CommandService {
         if entry.has_pending_close() {
             return Ok(());
         }
-        let events = entry.session_mut().close(now).unwrap_or_default();
+        let ctx = ports.ctx();
+        let events = entry.session_mut().close(now, &ctx).unwrap_or_default();
         EventRouter::record_events(
             state,
             key,
@@ -332,8 +342,8 @@ impl CommandService {
             return Ok(());
         }
         let peer = datagram.peer();
-        let packet = match PacketRef::decode(datagram.bytes()) {
-            Ok(packet) => packet,
+        let (connection_id, flags) = match PacketRef::decode(datagram.bytes()) {
+            Ok(packet) => (packet.connection_id, packet.flags),
             Err(error) => {
                 state.stats().record_malformed();
                 trace!(
@@ -345,9 +355,9 @@ impl CommandService {
                 return Ok(());
             }
         };
-        let key = key_from_packet(peer, packet.connection_id);
+        let key = key_from_packet(peer, connection_id);
         if !state.contains(&key) {
-            if !packet.flags.contains(Flags::SYN) || !state.can_accept_new_session() {
+            if !flags.contains(Flags::SYN) || !state.can_accept_new_session() {
                 state.stats().record_unknown();
                 return Ok(());
             }
@@ -355,11 +365,13 @@ impl CommandService {
         }
 
         let now = state.now();
+        let ctx = ports.ctx();
+        let datagram = datagram.into_datagram();
         let events = {
             let Some(entry) = state.entry_mut(&key) else {
                 return Ok(());
             };
-            match entry.session_mut().receive(now, packet) {
+            match entry.session_mut().receive(now, datagram, &ctx) {
                 Ok(events) => events,
                 Err(error) => {
                     if error == Error::UnknownConnection {
@@ -372,7 +384,7 @@ impl CommandService {
             }
         };
         let mut events = events;
-        events.extend(Self::complete_pending_recv(key, state, ports.ctx())?);
+        events.extend(Self::complete_pending_recv(key, state, ctx)?);
         EventRouter::record_events(
             state,
             key,
@@ -395,7 +407,6 @@ impl CommandService {
         state: &mut ProtocolState<'_>,
         ctx: Ctx<'_>,
     ) -> Result<Vec<SessionEvent>> {
-        let max_datagram_size = state.config().max_datagram_size;
         let now = state.now();
         let Some(entry) = state.entry_mut(&key) else {
             return Ok(Vec::new());
@@ -406,12 +417,11 @@ impl CommandService {
         if reply.is_closed() {
             return Ok(Vec::new());
         }
-        let Some(message) = entry.session_mut().recv(now) else {
+        let Some(message) = entry.session_mut().recv(now, &ctx) else {
             entry.put_pending_recv(reply);
             return Ok(Vec::new());
         };
-        let response = message_from_session(ctx, max_datagram_size, message);
-        let _ = reply.send(response);
+        let _ = reply.send(Ok(message_from_session(message)));
         Ok(entry.session_mut().take_events())
     }
 }

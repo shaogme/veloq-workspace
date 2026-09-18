@@ -1,37 +1,42 @@
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use veloq::std::time::Duration;
-use veloq_reliable_udp::{Ack, Config, ConnectionId, Flags, PacketRef, Session, SessionEvent};
+use veloq::std::{time::Duration, vec::Vec};
+use veloq_reliable_udp::{
+    Ack, Config, ConnectionId, FixedBuf, Flags, HeapPacketBufAllocator, Packet, Session,
+    SessionEvent,
+};
 
-fn outbound(events: Vec<SessionEvent>) -> Vec<Vec<u8>> {
+static ALLOCATOR: HeapPacketBufAllocator = HeapPacketBufAllocator;
+
+fn outbound(events: Vec<SessionEvent>) -> Vec<FixedBuf> {
     events
         .into_iter()
         .filter_map(|event| match event {
-            SessionEvent::Outbound(datagram) => Some(datagram),
+            SessionEvent::Outbound { datagram, .. } => Some(datagram),
             _ => None,
         })
         .collect()
 }
 
-fn packet(datagram: &[u8]) -> PacketRef<'_> {
-    PacketRef::decode(datagram).expect("validated benchmark packet")
-}
-
 fn establish(client: &mut Session, server: &mut Session) {
-    let syn = outbound(client.start(Duration::ZERO).expect("client start"));
-    let syn_ack = outbound(
+    let mut syn = outbound(
+        client
+            .start(Duration::ZERO, &ALLOCATOR)
+            .expect("client start"),
+    );
+    let mut syn_ack = outbound(
         server
-            .receive(Duration::ZERO, packet(&syn[0]))
+            .receive(Duration::ZERO, syn.remove(0), &ALLOCATOR)
             .expect("server SYN"),
     );
-    let ack = outbound(
+    let mut ack = outbound(
         client
-            .receive(Duration::ZERO, packet(&syn_ack[0]))
+            .receive(Duration::ZERO, syn_ack.remove(0), &ALLOCATOR)
             .expect("client SYN-ACK"),
     );
     let _ = server
-        .receive(Duration::ZERO, packet(&ack[0]))
+        .receive(Duration::ZERO, ack.remove(0), &ALLOCATOR)
         .expect("server ACK");
 }
 
@@ -62,31 +67,33 @@ fn bench_batch_ack(c: &mut Criterion) {
             let mut client = Session::new_client(connection_id, config.clone()).expect("client");
             let mut server = Session::new_server(connection_id, config).expect("server");
             establish(&mut client, &mut server);
-            let first = veloq_reliable_udp::Packet::new(
+            let first = Packet::encode_into(
+                &ALLOCATOR,
                 Flags::DATA,
                 connection_id,
                 1,
                 Ack::empty(),
                 32,
-                b"first".to_vec(),
+                b"first",
             )
-            .encode()
-            .expect("first packet");
-            let second = veloq_reliable_udp::Packet::new(
+            .expect("first packet")
+            .into_fixed_buf();
+            let second = Packet::encode_into(
+                &ALLOCATOR,
                 Flags::DATA,
                 connection_id,
                 2,
                 Ack::empty(),
                 32,
-                b"second".to_vec(),
+                b"second",
             )
-            .encode()
-            .expect("second packet");
+            .expect("second packet")
+            .into_fixed_buf();
             let _ = server
-                .receive(Duration::ZERO, packet(&first))
+                .receive(Duration::ZERO, first, &ALLOCATOR)
                 .expect("first data");
             let events = server
-                .receive(Duration::ZERO, packet(&second))
+                .receive(Duration::ZERO, second, &ALLOCATOR)
                 .expect("second data");
             black_box(outbound(events).len());
         });

@@ -1,5 +1,6 @@
 use tracing::{debug, trace, warn};
 use veloq::{
+    buf::FixedBuf,
     std::{collections::VecDeque, vec::Vec},
     sync::TrySendError,
 };
@@ -7,18 +8,24 @@ use veloq::{
 use crate::{
     connection::Connection,
     error::{Error, Result},
+    packet::MessageSequence,
     session::{Role, SessionEvent, SessionState},
     timer::TimerCommand,
 };
 
 use super::ConnectionKey;
 use super::command::CommandSender;
-use super::io::{OutboundDatagram, OutboundSender, PumpSender};
+use super::io::{OutboundDatagram, OutboundSender, PumpSender, SendTicket};
 use super::state::ProtocolState;
+
+struct QueuedDatagram {
+    datagram: FixedBuf,
+    retain_for_retransmit: Option<MessageSequence>,
+}
 
 #[derive(Default)]
 pub(super) struct EventBatch {
-    datagrams: VecDeque<Vec<u8>>,
+    datagrams: VecDeque<QueuedDatagram>,
     timer_commands: Vec<TimerCommand>,
     terminal_error: Option<Error>,
     reject_accept: bool,
@@ -50,11 +57,12 @@ impl EventRouter {
         let mut batch = Self::collect_events(state, key, events, command)?;
         if batch.reject_accept {
             let now = state.now();
+            let ctx = state.ctx();
             let abort_events = state
                 .entry_mut(&key)
                 .ok_or(Error::ConnectionClosed)?
                 .session_mut()
-                .abort(now, Error::TooManyConnections)?;
+                .abort(now, Error::TooManyConnections, &ctx)?;
             let abort_batch = Self::collect_events(state, key, abort_events, command)?;
             batch.extend(abort_batch);
             batch.terminal_error = Some(Error::TooManyConnections);
@@ -83,11 +91,12 @@ impl EventRouter {
         if Self::enqueue_datagrams(state, key, batch.datagrams, outbound, pump_events) {
             terminal = Some(Error::OutboundQueueFull);
             let now = state.now();
+            let ctx = state.ctx();
             let reset_events = state
                 .entry_mut(&key)
                 .ok_or(Error::ConnectionClosed)?
                 .session_mut()
-                .abort(now, Error::OutboundQueueFull)?;
+                .abort(now, Error::OutboundQueueFull, &ctx)?;
             Self::enqueue_reset(key, reset_events, outbound);
         }
 
@@ -115,8 +124,12 @@ impl EventRouter {
         let keys = state.keys();
         for key in keys {
             let now = state.now();
+            let ctx = state.ctx();
             let events = match state.entry_mut(&key) {
-                Some(entry) => entry.session_mut().abort(now, error).unwrap_or_default(),
+                Some(entry) => entry
+                    .session_mut()
+                    .abort(now, error, &ctx)
+                    .unwrap_or_default(),
                 None => continue,
             };
             Self::record_events(state, key, events, command, outbound, pump_events)?;
@@ -127,36 +140,74 @@ impl EventRouter {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn handle_send_completion<'rt>(
         state: &mut ProtocolState<'rt>,
         key: ConnectionKey,
+        ticket: SendTicket,
         result: Result<()>,
+        datagram: Option<FixedBuf>,
         command: &CommandSender,
         outbound: &OutboundSender,
         pump_events: &PumpSender,
     ) -> Result<()> {
-        let should_handle = state
-            .entry_mut(&key)
-            .is_some_and(|entry| entry.take_connect_completion_pending());
-        if !should_handle {
-            return Ok(());
-        }
-        match result {
-            Ok(()) => {
-                if let Some(entry) = state.entry_mut(&key)
-                    && let Some(reply) = entry.take_connect_reply()
-                {
-                    let _ = reply.send(Ok(()));
+        match ticket {
+            SendTicket::CompleteConnect => {
+                drop(datagram);
+                let should_handle = state
+                    .entry_mut(&key)
+                    .is_some_and(|entry| entry.take_connect_completion_pending());
+                if !should_handle {
+                    return Ok(());
+                }
+                match result {
+                    Ok(()) => {
+                        if let Some(entry) = state.entry_mut(&key)
+                            && let Some(reply) = entry.take_connect_reply()
+                        {
+                            let _ = reply.send(Ok(()));
+                        }
+                    }
+                    Err(error) => {
+                        let now = state.now();
+                        let ctx = state.ctx();
+                        let events = match state.entry_mut(&key) {
+                            Some(entry) => entry.session_mut().abort(now, error, &ctx)?,
+                            None => return Ok(()),
+                        };
+                        Self::record_events(state, key, events, command, outbound, pump_events)?;
+                    }
                 }
             }
-            Err(error) => {
-                let now = state.now();
-                let events = match state.entry_mut(&key) {
-                    Some(entry) => entry.session_mut().abort(now, error)?,
-                    None => return Ok(()),
-                };
-                Self::record_events(state, key, events, command, outbound, pump_events)?;
-            }
+            SendTicket::ReturnToSession(sequence) => match result {
+                Ok(()) => {
+                    let Some(datagram) = datagram else {
+                        return Self::handle_send_error(
+                            state,
+                            key,
+                            Error::Io,
+                            command,
+                            outbound,
+                            pump_events,
+                        );
+                    };
+                    let now = state.now();
+                    let events = {
+                        let Some(entry) = state.entry_mut(&key) else {
+                            return Ok(());
+                        };
+                        entry
+                            .session_mut()
+                            .on_send_completed(now, sequence, datagram)?
+                    };
+                    Self::record_events(state, key, events, command, outbound, pump_events)?;
+                }
+                Err(error) => {
+                    drop(datagram);
+                    Self::handle_send_error(state, key, error, command, outbound, pump_events)?;
+                }
+            },
+            SendTicket::DropAfterSend => drop(datagram),
         }
         Ok(())
     }
@@ -170,8 +221,9 @@ impl EventRouter {
         pump_events: &PumpSender,
     ) -> Result<()> {
         let now = state.now();
+        let ctx = state.ctx();
         let events = match state.entry_mut(&key) {
-            Some(entry) => entry.session_mut().abort(now, error)?,
+            Some(entry) => entry.session_mut().abort(now, error, &ctx)?,
             None => return Ok(()),
         };
         Self::record_events(state, key, events, command, outbound, pump_events)
@@ -198,7 +250,13 @@ impl EventRouter {
         let mut batch = EventBatch::default();
         for event in events {
             match event {
-                SessionEvent::Outbound(datagram) => batch.datagrams.push_back(datagram),
+                SessionEvent::Outbound {
+                    datagram,
+                    retain_for_retransmit,
+                } => batch.datagrams.push_back(QueuedDatagram {
+                    datagram,
+                    retain_for_retransmit,
+                }),
                 SessionEvent::ArmTimer(command) | SessionEvent::CancelTimer(command) => {
                     trace!(
                         target: "veloq_reliable_udp::endpoint",
@@ -292,20 +350,27 @@ impl EventRouter {
     fn enqueue_datagrams(
         state: &mut ProtocolState<'_>,
         key: ConnectionKey,
-        mut datagrams: VecDeque<Vec<u8>>,
+        mut datagrams: VecDeque<QueuedDatagram>,
         outbound: &OutboundSender,
-        pump_events: &PumpSender,
+        _pump_events: &PumpSender,
     ) -> bool {
         let mut queue_full = false;
-        while let Some(datagram) = datagrams.pop_front() {
-            let completion = state
+        while let Some(queued) = datagrams.pop_front() {
+            let ticket = if let Some(sequence) = queued.retain_for_retransmit {
+                SendTicket::ReturnToSession(sequence)
+            } else if state
                 .entry(&key)
                 .is_some_and(|entry| entry.connect_send_pending())
-                .then(|| pump_events.clone());
-            let item = OutboundDatagram::new(key, datagram, completion);
+            {
+                SendTicket::CompleteConnect
+            } else {
+                SendTicket::DropAfterSend
+            };
+            let item = OutboundDatagram::new(key, queued.datagram, ticket);
             match outbound.try_send(item) {
                 Ok(()) => {
-                    if let Some(entry) = state.entry_mut(&key)
+                    if matches!(ticket, SendTicket::CompleteConnect)
+                        && let Some(entry) = state.entry_mut(&key)
                         && entry.take_connect_send_pending()
                     {
                         entry.mark_connect_completion_pending();
@@ -328,8 +393,12 @@ impl EventRouter {
 
     fn enqueue_reset(key: ConnectionKey, events: Vec<SessionEvent>, outbound: &OutboundSender) {
         for event in events {
-            if let SessionEvent::Outbound(datagram) = event {
-                let _ = outbound.try_send(OutboundDatagram::new(key, datagram, None));
+            if let SessionEvent::Outbound { datagram, .. } = event {
+                let _ = outbound.try_send(OutboundDatagram::new(
+                    key,
+                    datagram,
+                    SendTicket::DropAfterSend,
+                ));
             }
         }
     }

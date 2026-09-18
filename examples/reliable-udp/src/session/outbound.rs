@@ -1,14 +1,20 @@
 use tracing::debug;
-use veloq::std::{
-    collections::{HashMap, VecDeque},
-    time::Duration,
-    vec::Vec,
+use veloq::{
+    buf::FixedBuf,
+    std::{
+        collections::{HashMap, VecDeque},
+        time::Duration,
+        vec::Vec,
+    },
 };
 
 use crate::{
     config::Config,
     error::{Error, Result},
-    packet::{Ack, AckWindow, ConnectionId, Flags, HEADER_LEN, MessageSequence, Packet, PacketRef},
+    packet::{
+        Ack, AckWindow, ConnectionId, Flags, HEADER_LEN, MessageSequence, Packet,
+        PacketBufAllocator, PacketMeta,
+    },
     timer::TimerKind,
 };
 
@@ -17,12 +23,12 @@ use super::{SendReceipt, SendToken};
 
 pub(super) struct PendingSend {
     token: SendToken,
-    payload: Vec<u8>,
+    payload: FixedBuf,
 }
 
 struct TxEntry {
     token: SendToken,
-    datagram: Vec<u8>,
+    datagram: Option<FixedBuf>,
     sent_at: Duration,
     rto: Duration,
     retransmitted: bool,
@@ -30,7 +36,10 @@ struct TxEntry {
 }
 
 pub(super) enum OutboundAction {
-    Datagram(Vec<u8>),
+    Datagram {
+        datagram: FixedBuf,
+        sequence: Option<MessageSequence>,
+    },
     ArmTimer {
         kind: TimerKind,
         delay: Duration,
@@ -72,18 +81,20 @@ impl OutboundOutput {
     }
 }
 
-pub(super) struct FlushContext<'a> {
+pub(super) struct FlushContext<'a, A: PacketBufAllocator + ?Sized> {
     connection_id: ConnectionId,
     config: &'a Config,
+    allocator: &'a A,
     now: Duration,
     ack: AckWindow,
     receive_window: usize,
 }
 
-impl<'a> FlushContext<'a> {
+impl<'a, A: PacketBufAllocator + ?Sized> FlushContext<'a, A> {
     pub(super) fn new(
         connection_id: ConnectionId,
         config: &'a Config,
+        allocator: &'a A,
         now: Duration,
         ack: AckWindow,
         receive_window: usize,
@@ -91,6 +102,7 @@ impl<'a> FlushContext<'a> {
         Self {
             connection_id,
             config,
+            allocator,
             now,
             ack,
             receive_window,
@@ -125,7 +137,7 @@ impl OutboundState {
 
     pub(super) fn queue_send(
         &mut self,
-        payload: Vec<u8>,
+        payload: FixedBuf,
         max_payload: usize,
         capacity: usize,
     ) -> Result<SendToken> {
@@ -150,7 +162,7 @@ impl OutboundState {
 
     pub(super) fn apply_ack(
         &mut self,
-        packet: &PacketRef<'_>,
+        packet: &PacketMeta,
         now: Duration,
         config: &Config,
         metrics: &mut SessionMetrics,
@@ -220,10 +232,13 @@ impl OutboundState {
                 .send_unacked
                 .get_mut(&sequence)
                 .expect("entry was checked above");
+            let Some(datagram) = entry.datagram.take() else {
+                return Ok(output);
+            };
             entry.retries = entry.retries.saturating_add(1);
             entry.retransmitted = true;
             entry.rto = entry.rto.saturating_mul(2).min(config.max_rto);
-            (entry.datagram.clone(), entry.rto)
+            (datagram, entry.rto)
         };
         metrics.record_retransmission();
         self.on_congestion_timeout();
@@ -234,17 +249,39 @@ impl OutboundState {
             next_rto = ?rto,
             "session retransmitting data"
         );
-        output.actions.push(OutboundAction::ArmTimer {
-            kind: TimerKind::Retransmit { sequence },
-            delay: rto,
+        output.actions.push(OutboundAction::Datagram {
+            datagram,
+            sequence: Some(sequence),
         });
-        output.actions.push(OutboundAction::Datagram(datagram));
         Ok(output)
     }
 
-    pub(super) fn flush_pending(
+    pub(super) fn on_send_completed(
         &mut self,
-        context: FlushContext<'_>,
+        sequence: MessageSequence,
+        sent_at: Duration,
+        datagram: FixedBuf,
+    ) -> OutboundOutput {
+        let mut output = OutboundOutput::new();
+        let Some(entry) = self.send_unacked.get_mut(&sequence) else {
+            return output;
+        };
+        if entry.datagram.is_some() {
+            return output;
+        }
+        entry.sent_at = sent_at;
+        let delay = entry.rto;
+        entry.datagram = Some(datagram);
+        output.actions.push(OutboundAction::ArmTimer {
+            kind: TimerKind::Retransmit { sequence },
+            delay,
+        });
+        output
+    }
+
+    pub(super) fn flush_pending<A: PacketBufAllocator + ?Sized>(
+        &mut self,
+        context: FlushContext<'_, A>,
         metrics: &mut SessionMetrics,
     ) -> Result<OutboundOutput> {
         let mut output = OutboundOutput::new();
@@ -265,53 +302,61 @@ impl OutboundState {
         Ok(output)
     }
 
-    pub(super) fn emit_control(
+    pub(super) fn emit_control<A: PacketBufAllocator + ?Sized>(
         &mut self,
         connection_id: ConnectionId,
         config: &Config,
+        allocator: &A,
         flags: Flags,
         receive_window: usize,
         metrics: &mut SessionMetrics,
     ) -> Result<OutboundOutput> {
         let mut output = OutboundOutput::new();
-        let packet = Packet::new(
+        let packet = Packet::encode_into_with_limit(
+            allocator,
+            config.max_datagram_size,
             flags,
             connection_id,
             0,
             Ack::empty(),
             receive_window as u16,
-            Vec::new(),
+            &[],
         );
-        output.actions.push(OutboundAction::Datagram(
-            packet.encode_with_limit(config.max_datagram_size.get())?,
-        ));
+        output.actions.push(OutboundAction::Datagram {
+            datagram: packet?.into_fixed_buf(),
+            sequence: None,
+        });
         metrics.record_sent();
         Ok(output)
     }
 
-    pub(super) fn emit_ack(
+    pub(super) fn emit_ack<A: PacketBufAllocator + ?Sized>(
         &mut self,
         connection_id: ConnectionId,
         config: &Config,
+        allocator: &A,
         ack: AckWindow,
         receive_window: usize,
         metrics: &mut SessionMetrics,
     ) -> Result<OutboundOutput> {
         let mut output = OutboundOutput::new();
-        let packet = Packet::new(
+        let packet = Packet::encode_into_with_limit(
+            allocator,
+            config.max_datagram_size,
             Flags::ACK,
             connection_id,
             0,
             ack.ack(),
             receive_window as u16,
-            Vec::new(),
+            &[],
         );
         output
             .actions
             .push(OutboundAction::CancelTimer(TimerKind::AckDelay));
-        output.actions.push(OutboundAction::Datagram(
-            packet.encode_with_limit(config.max_datagram_size.get())?,
-        ));
+        output.actions.push(OutboundAction::Datagram {
+            datagram: packet?.into_fixed_buf(),
+            sequence: None,
+        });
         metrics.record_ack_sent();
         Ok(output)
     }
@@ -369,10 +414,10 @@ impl OutboundState {
         )
     }
 
-    fn emit_data(
+    fn emit_data<A: PacketBufAllocator + ?Sized>(
         &mut self,
         pending: PendingSend,
-        context: &FlushContext<'_>,
+        context: &FlushContext<'_, A>,
         ack: Ack,
         rto: Duration,
         metrics: &mut SessionMetrics,
@@ -386,24 +431,22 @@ impl OutboundState {
         } else {
             Flags::DATA
         };
-        let packet = Packet::new(
+        let packet = Packet::encode_into_with_limit(
+            context.allocator,
+            context.config.max_datagram_size,
             flags,
             context.connection_id,
             sequence.get(),
             ack,
             context.receive_window as u16,
-            pending.payload,
+            pending.payload.as_slice(),
         );
-        let datagram = packet.encode_with_limit(context.config.max_datagram_size.get())?;
-        output.actions.push(OutboundAction::ArmTimer {
-            kind: TimerKind::Retransmit { sequence },
-            delay: rto,
-        });
+        let datagram = packet?.into_fixed_buf();
         self.send_unacked.insert(
             sequence,
             TxEntry {
                 token: pending.token,
-                datagram: datagram.clone(),
+                datagram: None,
                 sent_at: context.now,
                 rto,
                 retransmitted: false,
@@ -419,7 +462,10 @@ impl OutboundState {
             rto = ?rto,
             "session emitted data"
         );
-        output.actions.push(OutboundAction::Datagram(datagram));
+        output.actions.push(OutboundAction::Datagram {
+            datagram,
+            sequence: Some(sequence),
+        });
         Ok(())
     }
 

@@ -86,13 +86,8 @@ impl<'rt> Driver<'rt> {
                 pump_tx.clone(),
                 stats,
             ));
-            let mut send_task = scope.spawn_boxed(send_pump(
-                ctx,
-                send_socket,
-                config,
-                outbound_rx,
-                pump_tx.clone(),
-            ));
+            let mut send_task =
+                scope.spawn_boxed(send_pump(send_socket, outbound_rx, pump_tx.clone()));
             let result = self
                 .run_protocol(inbound_rx, outbound_tx, pump_tx, pump_rx)
                 .await;
@@ -156,7 +151,12 @@ impl<'rt> Driver<'rt> {
                 Ok(PumpEvent::SendReady) => send_ready = true,
                 Ok(PumpEvent::ReceiveFailed(error)) => return Err(error),
                 Ok(PumpEvent::SendFailed { error, .. }) => return Err(error),
-                Ok(PumpEvent::SendCompleted { result, .. }) => result?,
+                Ok(PumpEvent::SendCompleted {
+                    result, datagram, ..
+                }) => {
+                    drop(datagram);
+                    result?
+                }
                 Err(_) => return Err(Error::EndpointClosed),
             }
         }
@@ -224,12 +224,19 @@ impl<'rt> Driver<'rt> {
                     return Err(error);
                 }
                 DriverEvent::Pump(Ok(PumpEvent::ReceiveReady | PumpEvent::SendReady)) => {}
-                DriverEvent::Pump(Ok(PumpEvent::SendCompleted { key, result })) => {
+                DriverEvent::Pump(Ok(PumpEvent::SendCompleted {
+                    key,
+                    ticket,
+                    result,
+                    datagram,
+                })) => {
                     let command = self.command_sender();
                     EventRouter::handle_send_completion(
                         &mut self.state,
                         key,
+                        ticket,
                         result,
+                        datagram,
                         &command,
                         outbound,
                         pump_sender,
@@ -280,7 +287,7 @@ impl<'rt> Driver<'rt> {
                 };
                 entry
                     .session_mut()
-                    .on_timer(now, slot.kind(), slot.generation())?
+                    .on_timer(now, slot.kind(), slot.generation(), &self.ctx)?
             };
             if !events.is_empty() {
                 let command = self.command_sender();
@@ -306,7 +313,11 @@ impl<'rt> Driver<'rt> {
             if connect_closed {
                 let now = self.state.now();
                 let events = match self.state.entry_mut(&key) {
-                    Some(entry) => entry.session_mut().abort(now, Error::ConnectionClosed)?,
+                    Some(entry) => {
+                        entry
+                            .session_mut()
+                            .abort(now, Error::ConnectionClosed, &self.ctx)?
+                    }
                     None => continue,
                 };
                 let command = self.command_sender();

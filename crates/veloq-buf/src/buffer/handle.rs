@@ -197,6 +197,34 @@ impl FixedBuf {
         FixedBufView::new(self, range)
     }
 
+    /// Consume this handle and return an owned handle for a sub-range.
+    ///
+    /// The returned handle keeps the original allocation's release metadata, so it
+    /// remains the single owner of the allocation. The original handle is consumed
+    /// and must not be dropped separately.
+    pub fn into_subbuf(self, range: Range<usize>) -> Self {
+        let start = range.start;
+        let end = range.end;
+        assert!(start <= end, "sub-buffer start must be <= end");
+        assert!(end <= self.len(), "sub-buffer end must be <= buffer len");
+
+        let len = end - start;
+        let this = veloq_std::mem::ManuallyDrop::new(self);
+        // SAFETY: `start..end` is within the initialized length, therefore the
+        // derived pointer and range are within the allocation owned by `this`.
+        // `this` is wrapped in `ManuallyDrop`, so only the returned handle runs
+        // the pool deallocation path.
+        unsafe {
+            Self::from_parts(
+                NonNull::new_unchecked(this.ptr.as_ptr().add(start)),
+                this.pool_data,
+                this.context,
+                len,
+                len,
+            )
+        }
+    }
+
     #[inline]
     pub fn checked_read_range(
         &mut self,

@@ -4,12 +4,15 @@ mod metrics;
 mod outbound;
 mod timers;
 
-use veloq::std::{collections::VecDeque, time::Duration, vec::Vec};
+use veloq::{
+    buf::FixedBuf,
+    std::{collections::VecDeque, time::Duration, vec::Vec},
+};
 
 use crate::{
     config::Config,
     error::{Error, Result},
-    packet::{ConnectionId, Flags, MessageSequence, PacketRef},
+    packet::{ConnectionId, Flags, MessageSequence, PacketBufAllocator, PacketRef},
     timer::{TimerCommand, TimerKind},
 };
 
@@ -40,18 +43,18 @@ pub enum SessionState {
     Reset,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Message {
     pub sequence: MessageSequence,
-    pub payload: Vec<u8>,
+    pub payload: FixedBuf,
 }
 
 impl Message {
     pub fn as_slice(&self) -> &[u8] {
-        &self.payload
+        self.payload.as_slice()
     }
 
-    pub fn into_payload(self) -> Vec<u8> {
+    pub fn into_fixed_buf(self) -> FixedBuf {
         self.payload
     }
 }
@@ -101,9 +104,12 @@ pub struct SessionStatsSnapshot {
     pub piggybacked_acks: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum SessionEvent {
-    Outbound(Vec<u8>),
+    Outbound {
+        datagram: FixedBuf,
+        retain_for_retransmit: Option<MessageSequence>,
+    },
     ArmTimer(TimerCommand),
     CancelTimer(TimerCommand),
     MessageAvailable,
@@ -116,6 +122,48 @@ pub enum SessionEvent {
     StateChanged(SessionState),
     Failed(Error),
 }
+
+impl PartialEq for SessionEvent {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Outbound {
+                    retain_for_retransmit: left,
+                    ..
+                },
+                Self::Outbound {
+                    retain_for_retransmit: right,
+                    ..
+                },
+            ) => left == right,
+            (Self::ArmTimer(left), Self::ArmTimer(right))
+            | (Self::CancelTimer(left), Self::CancelTimer(right)) => left == right,
+            (Self::MessageAvailable, Self::MessageAvailable) => true,
+            (Self::SendAcked(left), Self::SendAcked(right)) => left == right,
+            (
+                Self::SendFailed {
+                    token: left_token,
+                    sequence: left_sequence,
+                    error: left_error,
+                },
+                Self::SendFailed {
+                    token: right_token,
+                    sequence: right_sequence,
+                    error: right_error,
+                },
+            ) => {
+                left_token == right_token
+                    && left_sequence == right_sequence
+                    && left_error == right_error
+            }
+            (Self::StateChanged(left), Self::StateChanged(right)) => left == right,
+            (Self::Failed(left), Self::Failed(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for SessionEvent {}
 
 /// 单连接可靠 UDP 协议状态机。
 ///
@@ -216,67 +264,79 @@ impl Session {
         self.events.drain(..).collect()
     }
 
-    pub fn start(&mut self, now: Duration) -> Result<Vec<SessionEvent>> {
+    pub fn start<A: PacketBufAllocator + ?Sized>(
+        &mut self,
+        now: Duration,
+        allocator: &A,
+    ) -> Result<Vec<SessionEvent>> {
         self.sync_now(now);
         let actions = self.lifecycle.start(self.now, &self.config)?;
-        self.apply_lifecycle(actions)?;
+        self.apply_lifecycle(actions, allocator)?;
         Ok(self.take_events())
     }
 
-    pub fn receive(&mut self, now: Duration, packet: PacketRef<'_>) -> Result<Vec<SessionEvent>> {
+    pub fn receive<A: PacketBufAllocator + ?Sized>(
+        &mut self,
+        now: Duration,
+        datagram: FixedBuf,
+        allocator: &A,
+    ) -> Result<Vec<SessionEvent>> {
         self.sync_now(now);
-        self.ensure_receivable(packet.connection_id)?;
+        let packet = PacketRef::decode(datagram.as_slice())?;
+        let meta = packet.meta();
+        self.ensure_receivable(meta.connection_id)?;
         self.metrics.record_received(
-            packet.flags.contains(Flags::DATA),
-            packet.flags.contains(Flags::ACK),
+            meta.flags.contains(Flags::DATA),
+            meta.flags.contains(Flags::ACK),
         );
-        self.outbound.set_peer_receive_window(packet.receive_window);
+        self.outbound.set_peer_receive_window(meta.receive_window);
 
-        let outbound =
-            self.outbound
-                .apply_ack(&packet, self.now, &self.config, &mut self.metrics)?;
-        self.apply_outbound(outbound)?;
+        let outbound = self
+            .outbound
+            .apply_ack(&meta, self.now, &self.config, &mut self.metrics)?;
+        self.apply_outbound(outbound);
 
-        if packet.flags.contains(Flags::RST) {
+        if meta.flags.contains(Flags::RST) {
             let actions = self
                 .lifecycle
                 .request_terminate(Error::ConnectionReset, SessionState::Reset);
-            self.apply_lifecycle(actions)?;
+            self.apply_lifecycle(actions, allocator)?;
             return Ok(self.take_events());
         }
-        if packet.flags.contains(Flags::SYN) {
+        if meta.flags.contains(Flags::SYN) {
             let actions = self
                 .lifecycle
-                .on_syn(self.now, packet.receive_window, &self.config);
-            self.apply_lifecycle(actions)?;
+                .on_syn(self.now, meta.receive_window, &self.config);
+            self.apply_lifecycle(actions, allocator)?;
         }
-        if packet.flags.contains(Flags::SYN_ACK) {
-            let actions = self.lifecycle.on_syn_ack(packet.receive_window);
-            self.apply_lifecycle(actions)?;
+        if meta.flags.contains(Flags::SYN_ACK) {
+            let actions = self.lifecycle.on_syn_ack(meta.receive_window);
+            self.apply_lifecycle(actions, allocator)?;
         }
-        if packet.flags.contains(Flags::ACK)
+        if meta.flags.contains(Flags::ACK)
             && self.role() == Role::Server
             && self.state() == SessionState::SynReceived
-            && !packet.flags.contains(Flags::DATA)
+            && !meta.flags.contains(Flags::DATA)
         {
             let actions = self.lifecycle.establish();
-            self.apply_lifecycle(actions)?;
+            self.apply_lifecycle(actions, allocator)?;
         }
-        if packet.flags.contains(Flags::FIN) {
+        if meta.flags.contains(Flags::FIN) {
             let actions = self.lifecycle.on_fin();
-            self.apply_lifecycle(actions)?;
+            self.apply_lifecycle(actions, allocator)?;
         }
         if packet.flags.contains(Flags::FIN_ACK) && self.state() == SessionState::FinWait {
             let actions = self.lifecycle.on_fin_ack();
-            self.apply_lifecycle(actions)?;
+            self.apply_lifecycle(actions, allocator)?;
         }
-        if packet.flags.contains(Flags::DATA) {
+        if meta.flags.contains(Flags::DATA) {
             if self.role() == Role::Server && self.state() == SessionState::SynReceived {
                 let actions = self.lifecycle.establish();
-                self.apply_lifecycle(actions)?;
+                self.apply_lifecycle(actions, allocator)?;
             }
             let output = self.inbound.on_data(
-                packet,
+                datagram,
+                meta,
                 &self.config,
                 self.connection_id(),
                 &mut self.metrics,
@@ -284,14 +344,19 @@ impl Session {
             for _ in 0..output.delivered() {
                 self.events.push_back(SessionEvent::MessageAvailable);
             }
-            self.apply_inbound_ack(output.ack())?;
+            self.apply_inbound_ack(output.ack(), allocator)?;
         }
 
-        self.flush_pending()?;
+        self.flush_pending(allocator)?;
         Ok(self.take_events())
     }
 
-    pub fn queue_send(&mut self, now: Duration, payload: Vec<u8>) -> Result<SendToken> {
+    pub fn queue_send<A: PacketBufAllocator + ?Sized>(
+        &mut self,
+        now: Duration,
+        payload: FixedBuf,
+        allocator: &A,
+    ) -> Result<SendToken> {
         self.sync_now(now);
         self.ensure_open_for_send()?;
         let token = self.outbound.queue_send(
@@ -299,41 +364,55 @@ impl Session {
             self.config.max_payload(),
             self.config.pending_send_capacity.get(),
         )?;
-        let _ = self.flush_pending()?;
+        let _ = self.flush_pending(allocator)?;
         Ok(token)
     }
 
-    pub fn recv(&mut self, now: Duration) -> Option<Message> {
+    pub fn recv<A: PacketBufAllocator + ?Sized>(
+        &mut self,
+        now: Duration,
+        allocator: &A,
+    ) -> Option<Message> {
         self.sync_now(now);
         let message = self.inbound.pop_message();
         if message.is_some() {
-            let _ = self.emit_ack();
+            let _ = self.emit_ack(allocator);
         }
         message
     }
 
-    pub fn close(&mut self, now: Duration) -> Result<Vec<SessionEvent>> {
+    pub fn close<A: PacketBufAllocator + ?Sized>(
+        &mut self,
+        now: Duration,
+        allocator: &A,
+    ) -> Result<Vec<SessionEvent>> {
         self.sync_now(now);
         let actions = self.lifecycle.request_close(self.now, &self.config)?;
-        self.apply_lifecycle(actions)?;
+        self.apply_lifecycle(actions, allocator)?;
         if self.state() == SessionState::Closed {
             self.cancel_timer(TimerKind::AckDelay);
         }
         Ok(self.take_events())
     }
 
-    pub fn abort(&mut self, now: Duration, error: Error) -> Result<Vec<SessionEvent>> {
+    pub fn abort<A: PacketBufAllocator + ?Sized>(
+        &mut self,
+        now: Duration,
+        error: Error,
+        allocator: &A,
+    ) -> Result<Vec<SessionEvent>> {
         self.sync_now(now);
         let actions = self.lifecycle.request_abort(error)?;
-        self.apply_lifecycle(actions)?;
+        self.apply_lifecycle(actions, allocator)?;
         Ok(self.take_events())
     }
 
-    pub fn on_timer(
+    pub fn on_timer<A: PacketBufAllocator + ?Sized>(
         &mut self,
         now: Duration,
         kind: TimerKind,
         generation: u64,
+        allocator: &A,
     ) -> Result<Vec<SessionEvent>> {
         self.sync_now(now);
         if self.is_terminal() || generation != self.lifecycle.generation() {
@@ -346,34 +425,48 @@ impl Session {
                     self.outbound
                         .on_retransmit(sequence, &self.config, &mut self.metrics)?;
                 let terminal = output.terminal_error();
-                self.apply_outbound(output)?;
+                self.apply_outbound(output);
                 if let Some(error) = terminal {
                     let actions = self
                         .lifecycle
                         .request_terminate(error, SessionState::Failed);
-                    self.apply_lifecycle(actions)?;
+                    self.apply_lifecycle(actions, allocator)?;
                 }
             }
             TimerKind::HandshakeRetry => {
                 let actions = self
                     .lifecycle
                     .on_handshake_timeout(self.now, &self.config)?;
-                self.apply_lifecycle(actions)?;
+                self.apply_lifecycle(actions, allocator)?;
             }
             TimerKind::AckDelay => {
                 if !self.inbound.ack_is_empty() {
-                    self.emit_ack()?;
+                    self.emit_ack(allocator)?;
                 }
             }
             TimerKind::FinRetry => {
                 let actions = self.lifecycle.on_fin_timeout(&self.config)?;
-                self.apply_lifecycle(actions)?;
+                self.apply_lifecycle(actions, allocator)?;
             }
         }
         Ok(self.take_events())
     }
 
-    fn flush_pending(&mut self) -> Result<bool> {
+    pub fn on_send_completed(
+        &mut self,
+        now: Duration,
+        sequence: MessageSequence,
+        datagram: FixedBuf,
+    ) -> Result<Vec<SessionEvent>> {
+        self.sync_now(now);
+        let output = self
+            .outbound
+            .on_send_completed(sequence, self.now, datagram);
+        self.apply_outbound(output);
+        Ok(self.take_events())
+    }
+
+    fn flush_pending<A: PacketBufAllocator + ?Sized>(&mut self, allocator: &A) -> Result<bool> {
         if self.state() != SessionState::Established {
             return Ok(false);
         }
@@ -381,6 +474,7 @@ impl Session {
             FlushContext::new(
                 self.connection_id(),
                 &self.config,
+                allocator,
                 self.now,
                 self.inbound.ack_snapshot(),
                 self.inbound.available_window(&self.config),
@@ -388,30 +482,35 @@ impl Session {
             &mut self.metrics,
         )?;
         let ack_consumed = output.ack_consumed();
-        self.apply_outbound(output)?;
+        self.apply_outbound(output);
         if ack_consumed {
             self.inbound.mark_ack_sent();
         }
         Ok(true)
     }
 
-    fn emit_ack(&mut self) -> Result<()> {
+    fn emit_ack<A: PacketBufAllocator + ?Sized>(&mut self, allocator: &A) -> Result<()> {
         let output = self.outbound.emit_ack(
             self.connection_id(),
             &self.config,
+            allocator,
             self.inbound.ack_snapshot(),
             self.inbound.available_window(&self.config),
             &mut self.metrics,
         )?;
-        self.apply_outbound(output)?;
+        self.apply_outbound(output);
         self.inbound.mark_ack_sent();
         Ok(())
     }
 
-    fn apply_inbound_ack(&mut self, ack: inbound::AckDecision) -> Result<()> {
+    fn apply_inbound_ack<A: PacketBufAllocator + ?Sized>(
+        &mut self,
+        ack: inbound::AckDecision,
+        allocator: &A,
+    ) -> Result<()> {
         match ack {
             inbound::AckDecision::None => {}
-            inbound::AckDecision::Immediate => self.emit_ack()?,
+            inbound::AckDecision::Immediate => self.emit_ack(allocator)?,
             inbound::AckDecision::Delayed => {
                 self.metrics.record_ack_delayed();
                 self.arm_timer(TimerKind::AckDelay, self.config.ack_delay);
@@ -420,18 +519,23 @@ impl Session {
         Ok(())
     }
 
-    fn apply_lifecycle(&mut self, actions: Vec<LifecycleAction>) -> Result<()> {
+    fn apply_lifecycle<A: PacketBufAllocator + ?Sized>(
+        &mut self,
+        actions: Vec<LifecycleAction>,
+        allocator: &A,
+    ) -> Result<()> {
         for action in actions {
             match action {
                 LifecycleAction::EmitControl(flags) => {
                     let output = self.outbound.emit_control(
                         self.connection_id(),
                         &self.config,
+                        allocator,
                         flags,
                         self.inbound.available_window(&self.config),
                         &mut self.metrics,
                     )?;
-                    self.apply_outbound(output)?;
+                    self.apply_outbound(output);
                 }
                 LifecycleAction::StateChanged(state) => {
                     self.events.push_back(SessionEvent::StateChanged(state));
@@ -447,7 +551,7 @@ impl Session {
                         self.events.push_back(SessionEvent::CancelTimer(command));
                     }
                     let output = self.outbound.fail_all(error, generation);
-                    self.apply_outbound(output)?;
+                    self.apply_outbound(output);
                     self.events.push_back(SessionEvent::StateChanged(state));
                     self.events.push_back(SessionEvent::Failed(error));
                 }
@@ -456,11 +560,14 @@ impl Session {
         Ok(())
     }
 
-    fn apply_outbound(&mut self, output: outbound::OutboundOutput) -> Result<()> {
+    fn apply_outbound(&mut self, output: outbound::OutboundOutput) {
         for action in output.into_actions() {
             match action {
-                OutboundAction::Datagram(datagram) => {
-                    self.events.push_back(SessionEvent::Outbound(datagram));
+                OutboundAction::Datagram { datagram, sequence } => {
+                    self.events.push_back(SessionEvent::Outbound {
+                        datagram,
+                        retain_for_retransmit: sequence,
+                    });
                 }
                 OutboundAction::ArmTimer { kind, delay } => self.arm_timer(kind, delay),
                 OutboundAction::CancelTimer(kind) => self.cancel_timer(kind),
@@ -478,7 +585,6 @@ impl Session {
                 }),
             }
         }
-        Ok(())
     }
 
     fn arm_timer(&mut self, kind: TimerKind, delay: Duration) {

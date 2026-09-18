@@ -142,8 +142,14 @@ impl<'rt> Endpoint<'rt> {
             stats: stats.clone(),
             marker: PhantomData,
         };
-        let state =
-            ProtocolState::new(config.clone(), stats, command.clone(), accept_tx, accept_rx);
+        let state = ProtocolState::new(
+            ctx,
+            config.clone(),
+            stats,
+            command.clone(),
+            accept_tx,
+            accept_rx,
+        );
         let driver = EndpointDriver {
             inner: driver::Driver::new(ctx, socket, command_rx, state, ready),
         };

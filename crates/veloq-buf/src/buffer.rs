@@ -94,6 +94,27 @@ mod tests {
     }
 
     #[test]
+    fn heap_into_subbuf_transfers_the_only_release_owner() {
+        let mut buf = FixedBuf::alloc_heap(NonZeroUsize::new(16).expect("non-zero length"), 16)
+            .expect("heap allocation failed");
+        for (idx, byte) in buf.as_slice_mut().iter_mut().enumerate() {
+            *byte = idx as u8;
+        }
+        let original_ptr = buf.as_ptr();
+        let original_region = buf.resolve_region_info();
+        let subbuf = buf.into_subbuf(4..12);
+
+        assert_eq!(subbuf.as_slice(), &[4, 5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(subbuf.len(), 8);
+        assert_eq!(subbuf.capacity(), 8);
+        assert_eq!(subbuf.as_ptr(), unsafe { original_ptr.add(4) });
+        assert_eq!(
+            subbuf.resolve_region_info().offset,
+            original_region.offset + 4
+        );
+    }
+
+    #[test]
     #[cfg(feature = "std")]
     fn heap_view_rejects_invalid_range_without_retaining() {
         let buf = FixedBuf::alloc_heap(NonZeroUsize::new(8).expect("non-zero length"), 8)

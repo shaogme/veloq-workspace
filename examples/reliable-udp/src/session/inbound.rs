@@ -1,13 +1,13 @@
 use tracing::{debug, trace};
-use veloq::std::{
-    collections::{HashMap, VecDeque},
-    vec::Vec,
+use veloq::{
+    buf::FixedBuf,
+    std::collections::{HashMap, VecDeque},
 };
 
 use crate::{
     config::Config,
     error::Result,
-    packet::{AckObserve, AckWindow, ConnectionId, MessageSequence, PacketRef, non_zero_sequence},
+    packet::{AckObserve, AckWindow, ConnectionId, MessageSequence, PacketMeta, non_zero_sequence},
 };
 
 use super::Message;
@@ -37,7 +37,7 @@ impl InboundOutput {
 
 pub(super) struct InboundState {
     recv_ack: AckWindow,
-    recv_reorder: HashMap<MessageSequence, Vec<u8>>,
+    recv_reorder: HashMap<MessageSequence, FixedBuf>,
     recv_ready: VecDeque<Message>,
     next_deliver_seq: MessageSequence,
     pending_ack_packets: usize,
@@ -56,12 +56,13 @@ impl InboundState {
 
     pub(super) fn on_data(
         &mut self,
-        packet: PacketRef<'_>,
+        datagram: FixedBuf,
+        packet: PacketMeta,
         config: &Config,
         connection_id: ConnectionId,
         metrics: &mut SessionMetrics,
     ) -> Result<InboundOutput> {
-        if packet.payload.is_empty() && packet.sequence == 0 {
+        if packet.payload_range.is_empty() && packet.sequence == 0 {
             return Ok(InboundOutput {
                 decision: AckDecision::None,
                 delivered: 0,
@@ -133,7 +134,8 @@ impl InboundState {
             });
         }
 
-        self.recv_reorder.insert(sequence, packet.payload.to_vec());
+        let payload = datagram.into_subbuf(packet.payload_range);
+        self.recv_reorder.insert(sequence, payload);
         let delivered = self.deliver_ready(config);
         trace!(
             target: "veloq_reliable_udp::session",

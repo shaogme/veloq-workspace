@@ -14,7 +14,7 @@ use veloq::{
     time::timeout_at,
 };
 
-use veloq_reliable_udp::{Ack, Config, ConnectionId, Endpoint, Error, Flags, Packet};
+use veloq_reliable_udp::{Ack, Config, ConnectionId, Endpoint, Error, Flags, Packet, PacketRef};
 
 #[path = "socket_proxy.rs"]
 mod socket_proxy;
@@ -61,7 +61,7 @@ fn endpoint_round_trip_and_explicit_connection_close() {
 
                 phase = "client-to-server send";
                 let receipt = client_connection
-                    .send(b"client-to-server")
+                    .send_bytes(b"client-to-server")
                     .await
                     .expect("send");
                 phase = "client-to-server receive";
@@ -74,10 +74,7 @@ fn endpoint_round_trip_and_explicit_connection_close() {
                 let payload = b"server-to-client";
                 let mut buffer = ctx.alloc(nz!(256), payload.len());
                 buffer.as_slice_mut().copy_from_slice(payload);
-                let receipt = server_connection
-                    .send_buf(buffer)
-                    .await
-                    .expect("send buffer");
+                let receipt = server_connection.send(buffer).await.expect("send buffer");
                 phase = "server-to-client receive";
                 let message = client_connection.recv().await.expect("receive buffer");
                 assert_eq!(message.as_slice(), payload);
@@ -143,7 +140,10 @@ fn endpoint_routes_commands_and_buffers_across_workers() {
             let client_connection = client.connect(server_addr).await.expect("connect");
             let mut server_connection = server.accept().await.expect("accept");
 
-            let receipt = client_connection.send(b"cross-worker").await.expect("send");
+            let receipt = client_connection
+                .send_bytes(b"cross-worker")
+                .await
+                .expect("send");
             let message = server_connection.recv().await.expect("receive");
             assert_eq!(message.as_slice(), b"cross-worker");
             assert_eq!(receipt.sequence, message.sequence);
@@ -192,7 +192,7 @@ fn endpoint_rejects_message_larger_than_configured_payload() {
             peer_ready.wait().await.expect("peer ready");
             let connection = peer.connect(endpoint_addr).await.expect("connect");
             let error = connection
-                .send(&[0; 23])
+                .send_bytes(&[0; 23])
                 .await
                 .expect_err("payload must be rejected");
             assert_eq!(error, Error::MessageTooLarge);
@@ -254,7 +254,10 @@ fn endpoint_proxy_retransmits_dropped_data_once() {
                 phase = "accept";
                 let mut server_connection = server.accept().await.expect("accept");
                 phase = "send";
-                let receipt = client_connection.send(b"dropped-once").await.expect("send");
+                let receipt = client_connection
+                    .send_bytes(b"dropped-once")
+                    .await
+                    .expect("send");
                 phase = "receive";
                 let message = server_connection.recv().await.expect("receive");
                 assert_eq!(message.as_slice(), b"dropped-once");
@@ -365,7 +368,7 @@ fn endpoint_proxy_deduplicates_duplicated_data() {
                 let mut server_connection = server.accept().await.expect("accept");
                 phase = "send";
                 let receipt = client_connection
-                    .send(b"duplicated-once")
+                    .send_bytes(b"duplicated-once")
                     .await
                     .expect("send");
                 phase = "receive";
@@ -488,7 +491,10 @@ fn endpoint_proxy_delays_data_without_duplicate_delivery() {
                 phase = "accept";
                 let mut server_connection = server.accept().await.expect("accept");
                 phase = "send";
-                let receipt = client_connection.send(b"delayed-once").await.expect("send");
+                let receipt = client_connection
+                    .send_bytes(b"delayed-once")
+                    .await
+                    .expect("send");
                 phase = "receive";
                 let message = server_connection.recv().await.expect("receive");
                 assert_eq!(message.as_slice(), b"delayed-once");
@@ -600,9 +606,9 @@ fn endpoint_proxy_reorders_data_and_delivers_in_order() {
                 let first_connection = client_connection.clone();
                 let second_connection = client_connection.clone();
                 let first_send =
-                    scope.spawn_boxed(async move { first_connection.send(b"first").await });
+                    scope.spawn_boxed(async move { first_connection.send_bytes(b"first").await });
                 let second_send =
-                    scope.spawn_boxed(async move { second_connection.send(b"second").await });
+                    scope.spawn_boxed(async move { second_connection.send_bytes(b"second").await });
                 let first_receipt = first_send
                     .await
                     .expect("first send task")
@@ -733,8 +739,8 @@ fn endpoint_proxy_timer_isolation_between_connections() {
 
                 phase = "drop first data";
                 let first_sender = first_client.clone();
-                let first_send =
-                    scope.spawn_boxed(async move { first_sender.send(b"connection-a").await });
+                let first_send = scope
+                    .spawn_boxed(async move { first_sender.send_bytes(b"connection-a").await });
                 proxy_handle
                     .as_mut()
                     .expect("proxy handle")
@@ -744,8 +750,8 @@ fn endpoint_proxy_timer_isolation_between_connections() {
 
                 phase = "send second data";
                 let second_sender = second_client.clone();
-                let second_send =
-                    scope.spawn_boxed(async move { second_sender.send(b"connection-b").await });
+                let second_send = scope
+                    .spawn_boxed(async move { second_sender.send_bytes(b"connection-b").await });
                 let second_receipt = second_send
                     .await
                     .expect("second send task")
@@ -890,20 +896,16 @@ fn endpoint_proxy_delivers_single_data_packet_within_15s() {
                     armed = receive.is_armed(),
                     "raw client handshake receive armed"
                 );
-                let syn = Packet::new(Flags::SYN, connection_id, 0, Ack::empty(), 32, Vec::new())
-                    .encode()
-                    .expect("encode SYN");
-                let mut buffer = ctx.alloc(nz!(1_200), syn.len());
-                buffer.as_slice_mut().copy_from_slice(&syn);
+                let syn =
+                    Packet::encode_into(&ctx, Flags::SYN, connection_id, 0, Ack::empty(), 32, &[])
+                        .expect("encode SYN")
+                        .into_fixed_buf();
                 trace!(
                     target: "veloq_reliable_udp::endpoint_test",
                     bytes = syn.len(),
                     "raw client sending SYN"
                 );
-                let (sent, _) = raw_client
-                    .send_to(buffer, proxy_addr)
-                    .await
-                    .expect("send SYN");
+                let (sent, _) = raw_client.send_to(syn, proxy_addr).await.expect("send SYN");
                 trace!(
                     target: "veloq_reliable_udp::endpoint_test",
                     sent,
@@ -911,41 +913,32 @@ fn endpoint_proxy_delivers_single_data_packet_within_15s() {
                 );
 
                 phase = "receive SYN-ACK";
-                let syn_ack = receive
-                    .await
-                    .expect("receive SYN-ACK")
-                    .buf
-                    .as_slice()
-                    .to_vec();
-                let syn_ack_packet = Packet::decode(&syn_ack).expect("decode SYN-ACK");
+                let syn_ack = receive.await.expect("receive SYN-ACK");
+                let syn_ack_packet =
+                    PacketRef::decode(syn_ack.buf.as_slice()).expect("decode SYN-ACK");
                 assert_eq!(syn_ack_packet.flags, Flags::SYN_ACK);
 
-                let ack = Packet::new(Flags::ACK, connection_id, 0, Ack::empty(), 32, Vec::new())
-                    .encode()
-                    .expect("encode ACK");
-                let mut buffer = ctx.alloc(nz!(1_200), ack.len());
-                buffer.as_slice_mut().copy_from_slice(&ack);
-                raw_client
-                    .send_to(buffer, proxy_addr)
-                    .await
-                    .expect("send ACK");
+                let ack =
+                    Packet::encode_into(&ctx, Flags::ACK, connection_id, 0, Ack::empty(), 32, &[])
+                        .expect("encode ACK")
+                        .into_fixed_buf();
+                raw_client.send_to(ack, proxy_addr).await.expect("send ACK");
 
                 phase = "accept raw connection";
                 let mut server_connection = server.accept().await.expect("accept");
-                let data = Packet::new(
+                let data = Packet::encode_into(
+                    &ctx,
                     Flags::DATA,
                     connection_id,
                     1,
                     Ack::empty(),
                     32,
-                    b"single-shot".to_vec(),
+                    b"single-shot",
                 )
-                .encode()
-                .expect("encode single DATA");
-                let mut buffer = ctx.alloc(nz!(1_200), data.len());
-                buffer.as_slice_mut().copy_from_slice(&data);
+                .expect("encode single DATA")
+                .into_fixed_buf();
                 raw_client
-                    .send_to(buffer, proxy_addr)
+                    .send_to(data, proxy_addr)
                     .await
                     .expect("send single DATA");
 
