@@ -10,8 +10,9 @@ use veloq::{
 };
 
 pub const MAGIC: [u8; 2] = *b"VQ";
-pub const VERSION: u8 = 2;
+pub const VERSION: u8 = 3;
 pub const HEADER_LEN: usize = 66;
+pub const COOKIE_LEN: usize = 32;
 
 const HALF_SEQUENCE_SPACE: u64 = 1 << 63;
 const FRAME_SEQUENCE_OFFSET: usize = 14;
@@ -35,6 +36,8 @@ pub enum PacketErrorKind {
     InvalidSequence,
     InvalidAck,
     InvalidPayloadLength,
+    InvalidCookiePayload,
+    CookiePayloadTooLarge,
     PayloadTooLarge,
     DatagramTooLarge,
     InvalidFragment,
@@ -66,6 +69,8 @@ impl fmt::Display for PacketError {
             PacketErrorKind::InvalidSequence => "data frame sequence must be non-zero",
             PacketErrorKind::InvalidAck => "acknowledgement fields are invalid",
             PacketErrorKind::InvalidPayloadLength => "payload length does not match datagram size",
+            PacketErrorKind::InvalidCookiePayload => "handshake cookie payload is invalid",
+            PacketErrorKind::CookiePayloadTooLarge => "handshake cookie payload is too large",
             PacketErrorKind::PayloadTooLarge => "payload cannot be represented by the wire format",
             PacketErrorKind::DatagramTooLarge => "encoded datagram exceeds the configured limit",
             PacketErrorKind::InvalidFragment => "fragment metadata or payload length is invalid",
@@ -523,6 +528,33 @@ impl Packet {
         )
     }
 
+    pub fn encode_handshake_cookie_into_with_limit<A: PacketBufAllocator + ?Sized>(
+        allocator: &A,
+        max_datagram_size: NonZeroUsize,
+        flags: Flags,
+        connection_id: ConnectionId,
+        receive_window: u16,
+        cookie: &[u8; COOKIE_LEN],
+    ) -> Result<Self, PacketError> {
+        Self::encode_fields(
+            allocator,
+            max_datagram_size,
+            PacketFields {
+                flags,
+                connection_id,
+                frame_sequence: 0,
+                ack: Ack::empty(),
+                receive_window,
+                message_id: 0,
+                fragment_index: 0,
+                fragment_count: 0,
+                message_len: 0,
+                payload: cookie,
+                max_fragment_payload: None,
+            },
+        )
+    }
+
     pub fn encode_data_into_with_limit<A: PacketBufAllocator + ?Sized>(
         allocator: &A,
         max_datagram_size: NonZeroUsize,
@@ -758,6 +790,19 @@ impl<'a> PacketRef<'a> {
         ack_from_wire(self.ack_largest, self.ack_bitmap)
     }
 
+    pub fn handshake_cookie(&self) -> Result<&'a [u8; COOKIE_LEN], PacketError> {
+        if !(self.flags == Flags::SYN_ACK || self.flags == Flags::ACK)
+            || self.payload.len() != COOKIE_LEN
+            || self.ack_largest != 0
+            || self.ack_bitmap != 0
+        {
+            return Err(PacketError::new(PacketErrorKind::InvalidCookiePayload));
+        }
+        self.payload
+            .try_into()
+            .map_err(|_| PacketError::new(PacketErrorKind::InvalidCookiePayload))
+    }
+
     pub fn meta(&self) -> PacketMeta {
         PacketMeta {
             flags: self.flags,
@@ -810,6 +855,28 @@ fn validate_meta(
             || !meta.payload_range.is_empty()
         {
             return Err(PacketError::new(PacketErrorKind::InvalidFragment));
+        }
+    } else if meta.flags == Flags::SYN_ACK {
+        if meta.frame_sequence != 0
+            || meta.message_id != 0
+            || meta.fragment_index != 0
+            || meta.fragment_count != 0
+            || meta.message_len != 0
+            || meta.payload_range.len() != COOKIE_LEN
+        {
+            return Err(PacketError::new(PacketErrorKind::InvalidCookiePayload));
+        }
+    } else if meta.flags == Flags::ACK && !meta.payload_range.is_empty() {
+        if meta.payload_range.len() != COOKIE_LEN {
+            return Err(PacketError::new(PacketErrorKind::CookiePayloadTooLarge));
+        }
+        if meta.frame_sequence != 0
+            || meta.message_id != 0
+            || meta.fragment_index != 0
+            || meta.fragment_count != 0
+            || meta.message_len != 0
+        {
+            return Err(PacketError::new(PacketErrorKind::InvalidCookiePayload));
         }
     } else if meta.frame_sequence != 0
         || meta.message_id != 0

@@ -12,8 +12,8 @@ use crate::{
     config::Config,
     error::{Error, Result},
     packet::{
-        Ack, AckWindow, ConnectionId, DataPacket, Flags, FrameSequence, HEADER_LEN, MessageId,
-        Packet, PacketBufAllocator, PacketMeta,
+        Ack, AckWindow, COOKIE_LEN, ConnectionId, DataPacket, Flags, FrameSequence, HEADER_LEN,
+        MessageId, Packet, PacketBufAllocator, PacketMeta,
     },
     timer::TimerKind,
 };
@@ -447,6 +447,32 @@ impl OutboundState {
             sequence: None,
         });
         metrics.record_sent();
+        Ok(output)
+    }
+
+    pub(super) fn emit_handshake_cookie<A: PacketBufAllocator + ?Sized>(
+        &mut self,
+        connection_id: ConnectionId,
+        config: &Config,
+        allocator: &A,
+        cookie: &[u8; COOKIE_LEN],
+        receive_window: usize,
+        metrics: &mut SessionMetrics,
+    ) -> Result<OutboundOutput> {
+        let packet = Packet::encode_handshake_cookie_into_with_limit(
+            allocator,
+            config.max_datagram_size,
+            Flags::ACK,
+            connection_id,
+            receive_window as u16,
+            cookie,
+        )?;
+        let mut output = OutboundOutput::new();
+        output.actions.push(OutboundAction::Datagram {
+            datagram: packet.into_fixed_buf(),
+            sequence: None,
+        });
+        metrics.record_ack_sent();
         Ok(output)
     }
 

@@ -161,33 +161,6 @@ impl EventRouter {
             datagram,
         } = completion;
         match ticket {
-            SendTicket::CompleteConnect => {
-                drop(datagram);
-                let should_handle = state
-                    .entry_mut(&key)
-                    .is_some_and(|entry| entry.take_connect_completion_pending());
-                if !should_handle {
-                    return Ok(());
-                }
-                match result {
-                    Ok(()) => {
-                        if let Some(entry) = state.entry_mut(&key)
-                            && let Some(reply) = entry.take_connect_reply()
-                        {
-                            let _ = reply.send(Ok(()));
-                        }
-                    }
-                    Err(error) => {
-                        let now = state.now();
-                        let ctx = state.ctx();
-                        let events = match state.entry_mut(&key) {
-                            Some(entry) => entry.session_mut().abort(now, error, &ctx)?,
-                            None => return Ok(()),
-                        };
-                        Self::record_events(state, key, events, command, outbound, pump_events)?;
-                    }
-                }
-            }
             SendTicket::ReturnToSession(sequence) => match result {
                 Ok(()) => {
                     let Some(datagram) = datagram else {
@@ -311,8 +284,10 @@ impl EventRouter {
                         })
                         .ok_or(Error::ConnectionClosed)?;
                     if role == Role::Client && connecting {
-                        if let Some(entry) = state.entry_mut(&key) {
-                            entry.mark_connect_send_pending();
+                        if let Some(entry) = state.entry_mut(&key)
+                            && let Some(reply) = entry.take_connect_reply()
+                        {
+                            let _ = reply.send(Ok(()));
                         }
                     } else if !accepted {
                         let connection = Connection::new(command.clone(), key, max_message_size);
@@ -367,24 +342,12 @@ impl EventRouter {
         while let Some(queued) = datagrams.pop_front() {
             let ticket = if let Some(sequence) = queued.frame_sequence {
                 SendTicket::ReturnToSession(sequence)
-            } else if state
-                .entry(&key)
-                .is_some_and(|entry| entry.connect_send_pending())
-            {
-                SendTicket::CompleteConnect
             } else {
                 SendTicket::DropAfterSend
             };
             let item = OutboundDatagram::new(key, queued.datagram, ticket);
             match outbound.try_send(item) {
-                Ok(()) => {
-                    if matches!(ticket, SendTicket::CompleteConnect)
-                        && let Some(entry) = state.entry_mut(&key)
-                        && entry.take_connect_send_pending()
-                    {
-                        entry.mark_connect_completion_pending();
-                    }
-                }
+                Ok(()) => {}
                 Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
                     state.stats().record_outbound_drop();
                     queue_full = true;

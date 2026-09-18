@@ -3,8 +3,8 @@ use std::hint::black_box;
 use criterion::{Criterion, criterion_group, criterion_main};
 use veloq::std::{time::Duration, vec::Vec};
 use veloq_reliable_udp::{
-    Ack, Config, ConnectionId, DataPacket, FixedBuf, Flags, FrameSequence, HeapPacketBufAllocator,
-    MessageId, Packet, Session, SessionEvent,
+    Ack, Config, ConnectionId, CookieInput, CookieKey, CookieKeyRing, DataPacket, FixedBuf, Flags,
+    FrameSequence, HeapPacketBufAllocator, MessageId, Packet, Session, SessionEvent, issue_cookie,
 };
 
 static ALLOCATOR: HeapPacketBufAllocator = HeapPacketBufAllocator;
@@ -19,25 +19,56 @@ fn outbound(events: Vec<SessionEvent>) -> Vec<FixedBuf> {
         .collect()
 }
 
-fn establish(client: &mut Session, server: &mut Session) {
-    let mut syn = outbound(
+fn establish(client: &mut Session, _server: &mut Session) {
+    let syn = outbound(
         client
             .start(Duration::ZERO, &ALLOCATOR)
             .expect("client start"),
     );
-    let mut syn_ack = outbound(
-        server
-            .receive(Duration::ZERO, syn.remove(0), &ALLOCATOR)
-            .expect("server SYN"),
+    let ring = CookieKeyRing::new(
+        CookieKey::new(1, [7; veloq_reliable_udp::COOKIE_KEY_LEN]).expect("cookie key"),
+        None,
+    )
+    .expect("cookie key ring");
+    let cookie = issue_cookie(
+        &ring,
+        CookieInput {
+            source: "127.0.0.1:1".parse().expect("source address"),
+            connection_id: client.connection_id(),
+            client_receive_window: 32,
+        },
+        Duration::ZERO,
     );
-    let mut ack = outbound(
+    let syn_ack = Packet::encode_handshake_cookie_into_with_limit(
+        &ALLOCATOR,
+        Config::default().max_datagram_size,
+        Flags::SYN_ACK,
+        client.connection_id(),
+        32,
+        cookie.as_bytes(),
+    )
+    .expect("server challenge")
+    .into_fixed_buf();
+    let proof = outbound(
         client
-            .receive(Duration::ZERO, syn_ack.remove(0), &ALLOCATOR)
-            .expect("client SYN-ACK"),
+            .receive(Duration::ZERO, syn_ack, &ALLOCATOR)
+            .expect("client challenge"),
     );
-    let _ = server
-        .receive(Duration::ZERO, ack.remove(0), &ALLOCATOR)
-        .expect("server ACK");
+    assert_eq!(syn.len(), 1);
+    assert_eq!(proof.len(), 1);
+    let confirmation = Packet::encode_control_into_with_limit(
+        &ALLOCATOR,
+        Config::default().max_datagram_size,
+        Flags::ACK,
+        client.connection_id(),
+        Ack::empty(),
+        32,
+    )
+    .expect("server confirmation")
+    .into_fixed_buf();
+    let _ = client
+        .receive(Duration::ZERO, confirmation, &ALLOCATOR)
+        .expect("client confirmation");
 }
 
 fn bench_high_concurrency_handshake(c: &mut Criterion) {
@@ -49,8 +80,8 @@ fn bench_high_concurrency_handshake(c: &mut Criterion) {
                 let connection_id = ConnectionId::new(value).expect("connection ID");
                 let mut client =
                     Session::new_client(connection_id, config.clone()).expect("client");
-                let mut server =
-                    Session::new_server(connection_id, config.clone()).expect("server");
+                let mut server = Session::new_server_established(connection_id, config.clone(), 32)
+                    .expect("server");
                 establish(&mut client, &mut server);
                 pairs.push((client, server));
             }
@@ -67,7 +98,8 @@ fn bench_batch_ack(c: &mut Criterion) {
             let max_datagram_size = config.max_datagram_size;
             let max_fragment_payload = config.max_fragment_payload();
             let mut client = Session::new_client(connection_id, config.clone()).expect("client");
-            let mut server = Session::new_server(connection_id, config).expect("server");
+            let mut server =
+                Session::new_server_established(connection_id, config, 32).expect("server");
             establish(&mut client, &mut server);
             let first = Packet::encode_data_into_with_limit(
                 &ALLOCATOR,

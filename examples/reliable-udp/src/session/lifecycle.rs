@@ -3,7 +3,7 @@ use veloq::std::{time::Duration, vec, vec::Vec};
 use crate::{
     config::Config,
     error::{Error, Result},
-    packet::{ConnectionId, Flags},
+    packet::{COOKIE_LEN, ConnectionId, Flags},
     timer::TimerKind,
 };
 
@@ -11,6 +11,7 @@ use super::{Role, SessionState};
 
 pub(super) enum LifecycleAction {
     EmitControl(Flags),
+    EmitCookieProof([u8; COOKIE_LEN]),
     StateChanged(SessionState),
     ArmTimer {
         kind: TimerKind,
@@ -33,6 +34,7 @@ pub(super) struct LifecycleState {
     handshake_rto: Duration,
     handshake_retries: u8,
     fin_retries: u8,
+    cookie: Option<[u8; COOKIE_LEN]>,
 }
 
 impl LifecycleState {
@@ -51,6 +53,7 @@ impl LifecycleState {
             handshake_rto: config.handshake_initial_rto,
             handshake_retries: 0,
             fin_retries: 0,
+            cookie: None,
         }
     }
 
@@ -84,53 +87,35 @@ impl LifecycleState {
         ])
     }
 
-    pub(super) fn on_syn(
-        &mut self,
-        now: Duration,
-        _receive_window: u16,
-        config: &Config,
-    ) -> Vec<LifecycleAction> {
-        if self.role != Role::Server {
-            return Vec::new();
-        }
-        match self.state {
-            SessionState::Listen => {
-                let mut actions = self.transition(SessionState::SynReceived);
-                self.begin_handshake(now, config);
-                actions.push(LifecycleAction::EmitControl(Flags::SYN_ACK));
-                actions.push(LifecycleAction::ArmTimer {
-                    kind: TimerKind::HandshakeRetry,
-                    delay: self.handshake_delay(now, config),
-                });
-                actions
-            }
-            SessionState::SynReceived | SessionState::Established => {
-                vec![LifecycleAction::EmitControl(Flags::SYN_ACK)]
-            }
-            _ => Vec::new(),
-        }
-    }
-
-    pub(super) fn on_syn_ack(&mut self, _receive_window: u16) -> Vec<LifecycleAction> {
+    pub(super) fn on_syn_ack(&mut self, cookie: &[u8; COOKIE_LEN]) -> Vec<LifecycleAction> {
         if self.role != Role::Client {
             return Vec::new();
         }
         match self.state {
-            SessionState::SynSent => {
-                let mut actions = self.establish();
-                actions.push(LifecycleAction::EmitControl(Flags::ACK));
+            SessionState::SynSent | SessionState::CookieSent => {
+                self.cookie = Some(*cookie);
+                let mut actions = if self.state == SessionState::SynSent {
+                    self.transition(SessionState::CookieSent)
+                } else {
+                    Vec::new()
+                };
+                actions.push(LifecycleAction::EmitCookieProof(*cookie));
                 actions
             }
-            SessionState::Established => vec![LifecycleAction::EmitControl(Flags::ACK)],
             _ => Vec::new(),
         }
     }
 
+    pub(super) fn on_handshake_confirmation(&mut self) -> Vec<LifecycleAction> {
+        if self.role == Role::Client && self.state == SessionState::CookieSent {
+            self.establish()
+        } else {
+            Vec::new()
+        }
+    }
+
     pub(super) fn on_fin(&mut self) -> Vec<LifecycleAction> {
-        if !matches!(
-            self.state,
-            SessionState::Established | SessionState::SynReceived
-        ) {
+        if !matches!(self.state, SessionState::Established) {
             return Vec::new();
         }
         let mut actions = vec![LifecycleAction::CancelTimer(TimerKind::HandshakeRetry)];
@@ -231,10 +216,7 @@ impl LifecycleState {
         now: Duration,
         config: &Config,
     ) -> Result<Vec<LifecycleAction>> {
-        if !matches!(
-            self.state,
-            SessionState::SynSent | SessionState::SynReceived
-        ) {
+        if !matches!(self.state, SessionState::SynSent | SessionState::CookieSent) {
             return Ok(Vec::new());
         }
         let elapsed = self
@@ -252,17 +234,18 @@ impl LifecycleState {
             .handshake_rto
             .saturating_mul(2)
             .min(config.handshake_max_rto);
-        let flags = match self.role {
-            Role::Client => Flags::SYN,
-            Role::Server => Flags::SYN_ACK,
+        let mut actions = match self.state {
+            SessionState::SynSent => vec![LifecycleAction::EmitControl(Flags::SYN)],
+            SessionState::CookieSent => vec![LifecycleAction::EmitCookieProof(
+                self.cookie.expect("cookie sent state has a cookie"),
+            )],
+            _ => Vec::new(),
         };
-        Ok(vec![
-            LifecycleAction::EmitControl(flags),
-            LifecycleAction::ArmTimer {
-                kind: TimerKind::HandshakeRetry,
-                delay: self.handshake_delay(now, config),
-            },
-        ])
+        actions.push(LifecycleAction::ArmTimer {
+            kind: TimerKind::HandshakeRetry,
+            delay: self.handshake_delay(now, config),
+        });
+        Ok(actions)
     }
 
     pub(super) fn on_fin_timeout(&mut self, config: &Config) -> Result<Vec<LifecycleAction>> {

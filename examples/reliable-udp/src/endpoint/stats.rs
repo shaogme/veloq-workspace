@@ -46,6 +46,16 @@ pub(super) struct EndpointStats {
     timer_delay_max_nanos: NativeAtomicU64,
     inbound_dropped: NativeAtomicU64,
     outbound_dropped: NativeAtomicU64,
+    cookie_challenges_issued: NativeAtomicU64,
+    cookie_proofs_received: NativeAtomicU64,
+    cookie_proofs_accepted: NativeAtomicU64,
+    cookie_invalid_mac: NativeAtomicU64,
+    cookie_expired: NativeAtomicU64,
+    cookie_wrong_source: NativeAtomicU64,
+    cookie_wrong_parameters: NativeAtomicU64,
+    cookie_admission_drops: NativeAtomicU64,
+    cookie_duplicate_proofs: NativeAtomicU64,
+    cookie_challenge_send_drops: NativeAtomicU64,
 }
 
 impl EndpointStats {
@@ -89,6 +99,16 @@ impl EndpointStats {
             timer_delay_max_nanos: NativeAtomicU64::new(0),
             inbound_dropped: NativeAtomicU64::new(0),
             outbound_dropped: NativeAtomicU64::new(0),
+            cookie_challenges_issued: NativeAtomicU64::new(0),
+            cookie_proofs_received: NativeAtomicU64::new(0),
+            cookie_proofs_accepted: NativeAtomicU64::new(0),
+            cookie_invalid_mac: NativeAtomicU64::new(0),
+            cookie_expired: NativeAtomicU64::new(0),
+            cookie_wrong_source: NativeAtomicU64::new(0),
+            cookie_wrong_parameters: NativeAtomicU64::new(0),
+            cookie_admission_drops: NativeAtomicU64::new(0),
+            cookie_duplicate_proofs: NativeAtomicU64::new(0),
+            cookie_challenge_send_drops: NativeAtomicU64::new(0),
         }
     }
 
@@ -140,6 +160,16 @@ impl EndpointStats {
             ),
             inbound_queue_drops: self.inbound_dropped.load(Ordering::Relaxed),
             outbound_queue_drops: self.outbound_dropped.load(Ordering::Relaxed),
+            cookie_challenges_issued: self.cookie_challenges_issued.load(Ordering::Relaxed),
+            cookie_proofs_received: self.cookie_proofs_received.load(Ordering::Relaxed),
+            cookie_proofs_accepted: self.cookie_proofs_accepted.load(Ordering::Relaxed),
+            cookie_invalid_mac: self.cookie_invalid_mac.load(Ordering::Relaxed),
+            cookie_expired: self.cookie_expired.load(Ordering::Relaxed),
+            cookie_wrong_source: self.cookie_wrong_source.load(Ordering::Relaxed),
+            cookie_wrong_parameters: self.cookie_wrong_parameters.load(Ordering::Relaxed),
+            cookie_admission_drops: self.cookie_admission_drops.load(Ordering::Relaxed),
+            cookie_duplicate_proofs: self.cookie_duplicate_proofs.load(Ordering::Relaxed),
+            cookie_challenge_send_drops: self.cookie_challenge_send_drops.load(Ordering::Relaxed),
         }
     }
 
@@ -187,6 +217,44 @@ impl EndpointStats {
     pub(super) fn record_unknown(&self) {
         self.dropped_packets.fetch_add(1, Ordering::Relaxed);
         self.unknown_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_cookie_challenge(&self) {
+        self.cookie_challenges_issued
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_cookie_proof_received(&self) {
+        self.cookie_proofs_received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_cookie_proof_accepted(&self) {
+        self.cookie_proofs_accepted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_cookie_invalid_mac(&self) {
+        self.cookie_invalid_mac.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_cookie_expired(&self) {
+        self.cookie_expired.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_cookie_wrong_parameters(&self) {
+        self.cookie_wrong_parameters.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_cookie_admission_drop(&self) {
+        self.cookie_admission_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_cookie_duplicate(&self) {
+        self.cookie_duplicate_proofs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_cookie_challenge_send_drop(&self) {
+        self.cookie_challenge_send_drops
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(super) fn record_timer_expiration(&self, delay: Duration) {

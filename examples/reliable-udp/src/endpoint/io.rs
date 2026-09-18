@@ -61,7 +61,6 @@ impl InboundDatagram {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SendTicket {
     DropAfterSend,
-    CompleteConnect,
     ReturnToSession(FrameSequence),
 }
 
@@ -217,7 +216,7 @@ pub(super) async fn send_pump<'rt>(
                     return Err(Error::Io);
                 }
             }
-            SendTicket::CompleteConnect | SendTicket::ReturnToSession(_) => {
+            SendTicket::ReturnToSession(_) => {
                 if pump_events
                     .send(PumpEvent::SendCompleted {
                         key,

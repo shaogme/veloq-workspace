@@ -15,8 +15,8 @@ use veloq::{
 };
 
 use veloq_reliable_udp::{
-    Ack, Config, ConnectionId, DataPacket, Endpoint, Error, Flags, FrameSequence, MessageId,
-    Packet, PacketRef,
+    Ack, Config, ConnectionId, CookieKey, CookieKeyRing, DataPacket, Endpoint, Error, Flags,
+    FrameSequence, MessageId, Packet, PacketRef,
 };
 
 #[path = "socket_proxy.rs"]
@@ -25,6 +25,14 @@ mod socket_proxy;
 use socket_proxy::{PacketMatcher, ProxyAction, ProxyDirection, SocketProxy};
 
 const ROUND_TRIP_BUDGET: Duration = Duration::from_millis(1_500);
+
+fn cookie_keys() -> CookieKeyRing {
+    CookieKeyRing::new(
+        CookieKey::new(1, [0x42; veloq_reliable_udp::COOKIE_KEY_LEN]).expect("cookie key"),
+        None,
+    )
+    .expect("cookie key ring")
+}
 
 fn run_test<F, R>(workers: NonZeroUsize, f: F) -> R
 where
@@ -40,9 +48,11 @@ where
 fn endpoint_round_trip_and_explicit_connection_close() {
     run_test(nz!(1), async |ctx| {
         let (server, server_driver, mut server_ready) =
-            Endpoint::bind(ctx, "127.0.0.1:0", Config::default()).expect("bind server");
+            Endpoint::bind(ctx, "127.0.0.1:0", Config::default(), cookie_keys())
+                .expect("bind server");
         let (client, client_driver, mut client_ready) =
-            Endpoint::bind(ctx, "127.0.0.1:0", Config::default()).expect("bind client");
+            Endpoint::bind(ctx, "127.0.0.1:0", Config::default(), cookie_keys())
+                .expect("bind client");
         let server_addr = server.local_addr();
         let started = Instant::now();
         let deadline = started + ROUND_TRIP_BUDGET;
@@ -130,9 +140,11 @@ fn endpoint_round_trip_and_explicit_connection_close() {
 fn endpoint_routes_commands_and_buffers_across_workers() {
     run_test(nz!(2), async |ctx| {
         let (server, server_driver, mut server_ready) =
-            Endpoint::bind(ctx, "127.0.0.1:0", Config::default()).expect("bind server");
+            Endpoint::bind(ctx, "127.0.0.1:0", Config::default(), cookie_keys())
+                .expect("bind server");
         let (client, client_driver, mut client_ready) =
-            Endpoint::bind(ctx, "127.0.0.1:0", Config::default()).expect("bind client");
+            Endpoint::bind(ctx, "127.0.0.1:0", Config::default(), cookie_keys())
+                .expect("bind client");
         let server_addr = server.local_addr();
 
         scope!(ctx, async |scope| {
@@ -172,12 +184,12 @@ fn endpoint_routes_commands_and_buffers_across_workers() {
 fn endpoint_rejects_message_larger_than_configured_payload() {
     run_test(nz!(1), async |ctx| {
         let config = Config::builder()
-            .max_datagram_size(nz!(80))
+            .max_datagram_size(nz!(128))
             .max_message_size(nz!(22))
             .build()
             .expect("small datagram config");
         let (endpoint, driver, mut endpoint_ready) =
-            Endpoint::bind(ctx, "127.0.0.1:0", config).expect("bind");
+            Endpoint::bind(ctx, "127.0.0.1:0", config, cookie_keys()).expect("bind");
         let endpoint_addr = endpoint.local_addr();
 
         scope!(ctx, async |scope| {
@@ -186,10 +198,11 @@ fn endpoint_rejects_message_larger_than_configured_payload() {
                 ctx,
                 "127.0.0.1:0",
                 Config::builder()
-                    .max_datagram_size(nz!(80))
+                    .max_datagram_size(nz!(128))
                     .max_message_size(nz!(22))
                     .build()
                     .expect("small peer config"),
+                cookie_keys(),
             )
             .expect("bind peer");
             let peer_task = scope.spawn_boxed(peer_driver.run());
@@ -220,9 +233,9 @@ fn endpoint_proxy_retransmits_dropped_data_once() {
     run_test(nz!(1), async |ctx| {
         let config = proxy_config();
         let (server, server_driver, mut server_ready) =
-            Endpoint::bind(ctx, "127.0.0.1:0", config.clone()).expect("bind server");
+            Endpoint::bind(ctx, "127.0.0.1:0", config.clone(), cookie_keys()).expect("bind server");
         let (client, client_driver, mut client_ready) =
-            Endpoint::bind(ctx, "127.0.0.1:0", config).expect("bind client");
+            Endpoint::bind(ctx, "127.0.0.1:0", config, cookie_keys()).expect("bind client");
         let server_addr = server.local_addr();
         let client_addr = client.local_addr();
         let mut proxy = SocketProxy::bind(ctx, nz!(1_200)).expect("bind proxy");
@@ -333,9 +346,9 @@ fn endpoint_proxy_deduplicates_duplicated_data() {
     run_test(nz!(1), async |ctx| {
         let config = proxy_config();
         let (server, server_driver, mut server_ready) =
-            Endpoint::bind(ctx, "127.0.0.1:0", config.clone()).expect("bind server");
+            Endpoint::bind(ctx, "127.0.0.1:0", config.clone(), cookie_keys()).expect("bind server");
         let (client, client_driver, mut client_ready) =
-            Endpoint::bind(ctx, "127.0.0.1:0", config).expect("bind client");
+            Endpoint::bind(ctx, "127.0.0.1:0", config, cookie_keys()).expect("bind client");
         let server_addr = server.local_addr();
         let client_addr = client.local_addr();
         let mut proxy = SocketProxy::bind(ctx, nz!(1_200)).expect("bind proxy");
@@ -457,9 +470,9 @@ fn endpoint_proxy_delays_data_without_duplicate_delivery() {
     run_test(nz!(1), async |ctx| {
         let config = proxy_config();
         let (server, server_driver, mut server_ready) =
-            Endpoint::bind(ctx, "127.0.0.1:0", config.clone()).expect("bind server");
+            Endpoint::bind(ctx, "127.0.0.1:0", config.clone(), cookie_keys()).expect("bind server");
         let (client, client_driver, mut client_ready) =
-            Endpoint::bind(ctx, "127.0.0.1:0", config).expect("bind client");
+            Endpoint::bind(ctx, "127.0.0.1:0", config, cookie_keys()).expect("bind client");
         let server_addr = server.local_addr();
         let client_addr = client.local_addr();
         let mut proxy = SocketProxy::bind(ctx, nz!(1_200)).expect("bind proxy");
@@ -570,9 +583,9 @@ fn endpoint_proxy_reorders_data_and_delivers_in_order() {
     run_test(nz!(1), async |ctx| {
         let config = proxy_config();
         let (server, server_driver, mut server_ready) =
-            Endpoint::bind(ctx, "127.0.0.1:0", config.clone()).expect("bind server");
+            Endpoint::bind(ctx, "127.0.0.1:0", config.clone(), cookie_keys()).expect("bind server");
         let (client, client_driver, mut client_ready) =
-            Endpoint::bind(ctx, "127.0.0.1:0", config).expect("bind client");
+            Endpoint::bind(ctx, "127.0.0.1:0", config, cookie_keys()).expect("bind client");
         let server_addr = server.local_addr();
         let client_addr = client.local_addr();
         let mut proxy = SocketProxy::bind(ctx, nz!(1_200)).expect("bind proxy");
@@ -701,9 +714,9 @@ fn endpoint_proxy_timer_isolation_between_connections() {
     run_test(nz!(2), async |ctx| {
         let config = proxy_config();
         let (server, server_driver, mut server_ready) =
-            Endpoint::bind(ctx, "127.0.0.1:0", config.clone()).expect("bind server");
+            Endpoint::bind(ctx, "127.0.0.1:0", config.clone(), cookie_keys()).expect("bind server");
         let (client, client_driver, mut client_ready) =
-            Endpoint::bind(ctx, "127.0.0.1:0", config).expect("bind client");
+            Endpoint::bind(ctx, "127.0.0.1:0", config, cookie_keys()).expect("bind client");
         let server_addr = server.local_addr();
         let client_addr = client.local_addr();
         let mut proxy = SocketProxy::bind(ctx, nz!(1_200)).expect("bind proxy");
@@ -870,7 +883,7 @@ fn endpoint_proxy_delivers_single_data_packet_within_15s() {
     run_test(nz!(1), async |ctx| {
         let config = proxy_config();
         let (server, server_driver, mut server_ready) =
-            Endpoint::bind(ctx, "127.0.0.1:0", config).expect("bind server");
+            Endpoint::bind(ctx, "127.0.0.1:0", config, cookie_keys()).expect("bind server");
         let server_addr = server.local_addr();
         let raw_client = UdpSocket::bind(ctx, "127.0.0.1:0").expect("bind raw client");
         let raw_client_addr = raw_client.local_addr().expect("raw client address");
@@ -930,16 +943,17 @@ fn endpoint_proxy_delivers_single_data_packet_within_15s() {
                 let syn_ack_packet =
                     PacketRef::decode(syn_ack.buf.as_slice()).expect("decode SYN-ACK");
                 assert_eq!(syn_ack_packet.flags, Flags::SYN_ACK);
+                let cookie = *syn_ack_packet.handshake_cookie().expect("handshake cookie");
 
-                let ack = Packet::encode_control_into_with_limit(
+                let ack = Packet::encode_handshake_cookie_into_with_limit(
                     &ctx,
                     nz!(1_200),
                     Flags::ACK,
                     connection_id,
-                    Ack::empty(),
                     32,
+                    &cookie,
                 )
-                .expect("encode ACK")
+                .expect("encode cookie proof")
                 .into_fixed_buf();
                 raw_client.send_to(ack, proxy_addr).await.expect("send ACK");
 

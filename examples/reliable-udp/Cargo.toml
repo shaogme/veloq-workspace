@@ -15,6 +15,8 @@ readme.workspace = true
 veloq.workspace = true
 veloq-wheel.workspace = true
 tracing.workspace = true
+hmac.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

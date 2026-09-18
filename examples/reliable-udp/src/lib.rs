@@ -3,6 +3,7 @@
 
 mod config;
 mod connection;
+mod cookie;
 mod endpoint;
 mod error;
 mod harness;
@@ -12,12 +13,16 @@ mod timer;
 
 pub use config::{Config, ConfigBuilder, ConfigError};
 pub use connection::{Connection, Message, Shutdown};
+pub use cookie::{
+    COOKIE_KEY_LEN, CookieConfig, CookieError, CookieInput, CookieInvalidReason, CookieKey,
+    CookieKeyRing, CookieToken, CookieValidation, issue_cookie, validate_cookie,
+};
 pub use endpoint::{Endpoint, EndpointDriver, EndpointReady, EndpointStatsSnapshot};
 pub use error::{Error, Result};
 pub use harness::{DatagramAction, VirtualDatagram, VirtualDatagramHarness};
 pub use packet::{
-    Ack, AckObserve, AckWindow, ConnectionId, DataPacket, Flags, FrameSequence, HEADER_LEN,
-    HeapPacketBufAllocator, MAGIC, MessageId, Packet, PacketBufAllocator, PacketError,
+    Ack, AckObserve, AckWindow, COOKIE_LEN, ConnectionId, DataPacket, Flags, FrameSequence,
+    HEADER_LEN, HeapPacketBufAllocator, MAGIC, MessageId, Packet, PacketBufAllocator, PacketError,
     PacketErrorKind, PacketMeta, PacketRef, VERSION,
 };
 pub use session::{
@@ -100,27 +105,56 @@ mod tests {
     fn establish_pair() -> (Session, Session) {
         let config = Config::default();
         let mut client = Session::new_client(connection_id(), config.clone()).expect("client");
-        let mut server = Session::new_server(connection_id(), config).expect("server");
+        let server =
+            Session::new_server_established(connection_id(), config.clone(), 32).expect("server");
 
-        let mut syn = outbound(
+        let syn = outbound(
             client
                 .start(Duration::ZERO, &ALLOCATOR)
                 .expect("client start"),
         );
-        let mut syn_ack = outbound(
-            server
-                .receive(Duration::ZERO, syn.remove(0), &ALLOCATOR)
-                .expect("server SYN"),
-        );
-        let mut ack = outbound(
+        assert_eq!(syn.len(), 1);
+        let ring = CookieKeyRing::new(
+            CookieKey::new(1, [7; COOKIE_KEY_LEN]).expect("cookie key"),
+            None,
+        )
+        .expect("cookie key ring");
+        let input = CookieInput {
+            source: "127.0.0.1:1234".parse().expect("source address"),
+            connection_id: connection_id(),
+            client_receive_window: 32,
+        };
+        let cookie = issue_cookie(&ring, input, Duration::ZERO);
+        let syn_ack = Packet::encode_handshake_cookie_into_with_limit(
+            &ALLOCATOR,
+            NonZeroUsize::new(1_280).expect("datagram size"),
+            Flags::SYN_ACK,
+            connection_id(),
+            32,
+            cookie.as_bytes(),
+        )
+        .expect("server challenge")
+        .into_fixed_buf();
+        let proof = outbound(
             client
-                .receive(Duration::ZERO, syn_ack.remove(0), &ALLOCATOR)
-                .expect("client SYN-ACK"),
+                .receive(Duration::ZERO, syn_ack, &ALLOCATOR)
+                .expect("client challenge"),
         );
-        let server_events = server
-            .receive(Duration::ZERO, ack.remove(0), &ALLOCATOR)
-            .expect("server final ACK");
-        assert!(server_events.contains(&SessionEvent::StateChanged(SessionState::Established,)));
+        assert_eq!(proof.len(), 1);
+        let confirmation = Packet::encode_control_into_with_limit(
+            &ALLOCATOR,
+            NonZeroUsize::new(1_280).expect("datagram size"),
+            Flags::ACK,
+            connection_id(),
+            Ack::empty(),
+            32,
+        )
+        .expect("server confirmation")
+        .into_fixed_buf();
+        let client_events = client
+            .receive(Duration::ZERO, confirmation, &ALLOCATOR)
+            .expect("client confirmation");
+        assert!(client_events.contains(&SessionEvent::StateChanged(SessionState::Established)));
         assert_eq!(client.state(), SessionState::Established);
         assert_eq!(server.state(), SessionState::Established);
         (client, server)
@@ -173,6 +207,48 @@ mod tests {
                 .expect_err("invalid flags")
                 .kind,
             PacketErrorKind::InvalidFlags
+        );
+    }
+
+    #[test]
+    fn handshake_cookie_payload_has_dedicated_wire_rules() {
+        let cookie = [0x5a; COOKIE_LEN];
+        let challenge = Packet::encode_handshake_cookie_into_with_limit(
+            &ALLOCATOR,
+            NonZeroUsize::new(1_280).expect("datagram size"),
+            Flags::SYN_ACK,
+            connection_id(),
+            32,
+            &cookie,
+        )
+        .expect("encode challenge")
+        .into_fixed_buf();
+        let decoded = PacketRef::decode(challenge.as_slice()).expect("decode challenge");
+        assert_eq!(decoded.handshake_cookie().expect("cookie"), &cookie);
+
+        let mut invalid = duplicate(&challenge);
+        invalid.as_slice_mut()[3] = Flags::ACK.bits();
+        invalid.as_slice_mut()[22..30].copy_from_slice(&1u64.to_le_bytes());
+        assert_eq!(
+            PacketRef::decode(invalid.as_slice())
+                .expect("wire parser accepts ACK fields")
+                .handshake_cookie()
+                .expect_err("cookie must not carry ACK fields")
+                .kind,
+            PacketErrorKind::InvalidCookiePayload
+        );
+        assert_eq!(
+            Packet::encode_control_into_with_limit(
+                &ALLOCATOR,
+                NonZeroUsize::new(1_280).expect("datagram size"),
+                Flags::SYN_ACK,
+                connection_id(),
+                Ack::empty(),
+                32,
+            )
+            .expect_err("SYN-ACK without a cookie")
+            .kind,
+            PacketErrorKind::InvalidCookiePayload
         );
     }
 

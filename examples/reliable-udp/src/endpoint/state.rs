@@ -11,12 +11,10 @@ use veloq::{
 use crate::{
     Config,
     connection::{Connection, ConnectionReply, Message},
+    cookie::{CookieConfig, CookieKeyRing},
     error::{Error, Result},
     packet::ConnectionId,
-    session::{
-        Message as SessionMessage, SendReceipt, SendToken, Session, SessionState,
-        SessionStatsSnapshot,
-    },
+    session::{Message as SessionMessage, SendReceipt, SendToken, Session, SessionStatsSnapshot},
 };
 
 use super::io::CommandSender;
@@ -27,8 +25,6 @@ pub(super) struct SessionEntry {
     session: Session,
     observed_stats: SessionStatsSnapshot,
     connect_reply: Option<ConnectionReply>,
-    connect_send_pending: bool,
-    connect_completion_pending: bool,
     pending_send: HashMap<SendToken, Reply<SendReceipt>>,
     pending_recv: Option<Reply<Message>>,
     pending_close: Option<Reply<()>>,
@@ -42,8 +38,6 @@ impl SessionEntry {
             session,
             observed_stats: SessionStatsSnapshot::default(),
             connect_reply,
-            connect_send_pending: false,
-            connect_completion_pending: false,
             pending_send: HashMap::default(),
             pending_recv: None,
             pending_close: None,
@@ -127,30 +121,6 @@ impl SessionEntry {
         self.connect_reply.is_some()
     }
 
-    pub(super) fn mark_connect_send_pending(&mut self) {
-        self.connect_send_pending = true;
-    }
-
-    pub(super) fn connect_send_pending(&self) -> bool {
-        self.connect_send_pending
-    }
-
-    pub(super) fn take_connect_send_pending(&mut self) -> bool {
-        let pending = self.connect_send_pending;
-        self.connect_send_pending = false;
-        pending
-    }
-
-    pub(super) fn mark_connect_completion_pending(&mut self) {
-        self.connect_completion_pending = true;
-    }
-
-    pub(super) fn take_connect_completion_pending(&mut self) -> bool {
-        let pending = self.connect_completion_pending;
-        self.connect_completion_pending = false;
-        pending
-    }
-
     pub(super) fn is_accepted(&self) -> bool {
         self.accepted
     }
@@ -196,6 +166,8 @@ pub(super) struct ProtocolState<'rt> {
     command: CommandSender,
     accept_tx: BoundedOwnedSender<Connection<'rt>>,
     accept: BoundedOwnedReceiver<Connection<'rt>>,
+    cookie_keys: CookieKeyRing,
+    accept_reservations: usize,
 }
 
 impl<'rt> ProtocolState<'rt> {
@@ -206,6 +178,7 @@ impl<'rt> ProtocolState<'rt> {
         command: CommandSender,
         accept_tx: BoundedOwnedSender<Connection<'rt>>,
         accept: BoundedOwnedReceiver<Connection<'rt>>,
+        cookie_keys: CookieKeyRing,
     ) -> Self {
         Self {
             ctx,
@@ -216,6 +189,8 @@ impl<'rt> ProtocolState<'rt> {
             command,
             accept_tx,
             accept,
+            cookie_keys,
+            accept_reservations: 0,
         }
     }
 
@@ -287,17 +262,31 @@ impl<'rt> ProtocolState<'rt> {
         if self.sessions_len() >= self.config.max_connections.get() {
             return false;
         }
-        let half_open = self
-            .sessions
-            .values()
-            .filter(|entry| {
-                matches!(
-                    entry.session().state(),
-                    SessionState::Listen | SessionState::SynReceived | SessionState::SynSent
-                )
-            })
-            .count();
-        half_open < self.config.accept_capacity.get()
+        self.accept_reservations < self.config.accept_capacity.get()
+    }
+
+    pub(super) fn cookie_config(&self) -> CookieConfig {
+        self.config.cookie
+    }
+
+    pub(super) fn cookie_keys(&self) -> &CookieKeyRing {
+        &self.cookie_keys
+    }
+
+    pub(super) fn rotate_cookie_keys(&mut self, keys: CookieKeyRing) {
+        self.cookie_keys = keys;
+    }
+
+    pub(super) fn reserve_accept(&mut self) -> bool {
+        if !self.can_accept_new_session() {
+            return false;
+        }
+        self.accept_reservations += 1;
+        true
+    }
+
+    pub(super) fn release_accept(&mut self) {
+        self.accept_reservations = self.accept_reservations.saturating_sub(1);
     }
 
     pub(super) fn try_accept(

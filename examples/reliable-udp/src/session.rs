@@ -32,9 +32,8 @@ pub enum Role {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
-    Listen,
     SynSent,
-    SynReceived,
+    CookieSent,
     Established,
     FinWait,
     CloseWait,
@@ -192,8 +191,21 @@ impl Session {
         Self::new(Role::Client, SessionState::SynSent, connection_id, config)
     }
 
-    pub fn new_server(connection_id: ConnectionId, config: Config) -> Result<Self> {
-        Self::new(Role::Server, SessionState::Listen, connection_id, config)
+    pub fn new_server_established(
+        connection_id: ConnectionId,
+        config: Config,
+        peer_receive_window: u16,
+    ) -> Result<Self> {
+        let mut session = Self::new(
+            Role::Server,
+            SessionState::Established,
+            connection_id,
+            config,
+        )?;
+        session
+            .outbound
+            .set_peer_receive_window(peer_receive_window);
+        Ok(session)
     }
 
     fn new(
@@ -299,6 +311,51 @@ impl Session {
         )?;
         let meta = packet.meta();
         self.ensure_receivable(meta.connection_id)?;
+        if meta.flags.contains(Flags::RST) {
+            let actions = self
+                .lifecycle
+                .request_terminate(Error::ConnectionReset, SessionState::Reset);
+            self.apply_lifecycle(actions, allocator)?;
+            return Ok(self.take_events());
+        }
+        if meta.flags == Flags::SYN_ACK {
+            if self.role() != Role::Client
+                || !matches!(
+                    self.state(),
+                    SessionState::SynSent | SessionState::CookieSent
+                )
+            {
+                return Err(Error::InvalidState);
+            }
+            let cookie = packet.handshake_cookie()?;
+            self.outbound.set_peer_receive_window(meta.receive_window);
+            let actions = self.lifecycle.on_syn_ack(cookie);
+            self.apply_lifecycle(actions, allocator)?;
+            return Ok(self.take_events());
+        }
+        if meta.flags == Flags::ACK && !packet.payload.is_empty() {
+            return Err(Error::InvalidState);
+        }
+        if self.role() == Role::Client
+            && self.state() == SessionState::CookieSent
+            && meta.flags == Flags::ACK
+            && packet.payload.is_empty()
+        {
+            if meta.ack_largest != 0 || meta.ack_bitmap != 0 {
+                return Err(Error::InvalidState);
+            }
+            let actions = self.lifecycle.on_handshake_confirmation();
+            self.apply_lifecycle(actions, allocator)?;
+            return Ok(self.take_events());
+        }
+        if self.state() == SessionState::FinWait && meta.flags == Flags::FIN_ACK {
+            let actions = self.lifecycle.on_fin_ack();
+            self.apply_lifecycle(actions, allocator)?;
+            return Ok(self.take_events());
+        }
+        if self.state() != SessionState::Established {
+            return Err(Error::InvalidState);
+        }
         self.metrics.record_received(
             meta.flags.contains(Flags::DATA),
             meta.flags.contains(Flags::ACK),
@@ -318,31 +375,6 @@ impl Session {
             self.apply_outbound(output);
         }
 
-        if meta.flags.contains(Flags::RST) {
-            let actions = self
-                .lifecycle
-                .request_terminate(Error::ConnectionReset, SessionState::Reset);
-            self.apply_lifecycle(actions, allocator)?;
-            return Ok(self.take_events());
-        }
-        if meta.flags.contains(Flags::SYN) {
-            let actions = self
-                .lifecycle
-                .on_syn(self.now, meta.receive_window, &self.config);
-            self.apply_lifecycle(actions, allocator)?;
-        }
-        if meta.flags.contains(Flags::SYN_ACK) {
-            let actions = self.lifecycle.on_syn_ack(meta.receive_window);
-            self.apply_lifecycle(actions, allocator)?;
-        }
-        if meta.flags.contains(Flags::ACK)
-            && self.role() == Role::Server
-            && self.state() == SessionState::SynReceived
-            && !meta.flags.contains(Flags::DATA)
-        {
-            let actions = self.lifecycle.establish();
-            self.apply_lifecycle(actions, allocator)?;
-        }
         if meta.flags.contains(Flags::FIN) {
             let actions = self.lifecycle.on_fin();
             self.apply_lifecycle(actions, allocator)?;
@@ -352,9 +384,8 @@ impl Session {
             self.apply_lifecycle(actions, allocator)?;
         }
         if meta.flags.contains(Flags::DATA) {
-            if self.role() == Role::Server && self.state() == SessionState::SynReceived {
-                let actions = self.lifecycle.establish();
-                self.apply_lifecycle(actions, allocator)?;
+            if self.state() != SessionState::Established {
+                return Err(Error::InvalidState);
             }
             let output = self.inbound.on_data(
                 datagram,
@@ -623,6 +654,17 @@ impl Session {
                         &self.config,
                         allocator,
                         flags,
+                        self.inbound.available_window(&self.config),
+                        &mut self.metrics,
+                    )?;
+                    self.apply_outbound(output);
+                }
+                LifecycleAction::EmitCookieProof(cookie) => {
+                    let output = self.outbound.emit_handshake_cookie(
+                        self.connection_id(),
+                        &self.config,
+                        allocator,
+                        &cookie,
                         self.inbound.available_window(&self.config),
                         &mut self.metrics,
                     )?;

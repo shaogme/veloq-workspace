@@ -7,7 +7,10 @@ use veloq::std::{
 
 use veloq_wheel::WheelConfig;
 
-use crate::packet::HEADER_LEN;
+use crate::{
+    cookie::CookieConfig,
+    packet::{COOKIE_LEN, HEADER_LEN},
+};
 
 const MAX_SAFE_DATAGRAM_SIZE: usize = 65_507;
 const MAX_SEND_WINDOW: usize = 64;
@@ -30,6 +33,7 @@ pub enum ConfigError {
     TimeoutRangeOverflow { name: &'static str },
     HandshakeRetryBudgetOverflow,
     MemoryBudgetOverflow,
+    CookieConfiguration,
 }
 
 impl fmt::Display for ConfigError {
@@ -83,6 +87,7 @@ impl fmt::Display for ConfigError {
                 f.write_str("handshake retry schedule exceeds the handshake deadline")
             }
             Self::MemoryBudgetOverflow => f.write_str("configured memory budget overflows usize"),
+            Self::CookieConfiguration => f.write_str("cookie configuration is invalid"),
         }
     }
 }
@@ -120,6 +125,7 @@ pub struct Config {
     pub outbound_capacity: NonZeroUsize,
     pub close_timeout: Duration,
     pub wheel: WheelConfig,
+    pub cookie: CookieConfig,
 }
 
 impl Default for Config {
@@ -183,6 +189,7 @@ impl Default for ConfigBuilder {
                 outbound_capacity: non_zero(256),
                 close_timeout: Duration::from_secs(5),
                 wheel,
+                cookie: CookieConfig::default(),
             },
         }
     }
@@ -334,6 +341,21 @@ impl ConfigBuilder {
         self
     }
 
+    pub fn cookie_config(mut self, value: CookieConfig) -> Self {
+        self.config.cookie = value;
+        self
+    }
+
+    pub fn cookie_ttl(mut self, value: Duration) -> Self {
+        self.config.cookie.ttl = value;
+        self
+    }
+
+    pub fn cookie_clock_skew(mut self, value: Duration) -> Self {
+        self.config.cookie.clock_skew = value;
+        self
+    }
+
     pub fn build(self) -> Result<Config, ConfigError> {
         validate_values(&self.config)?;
         Ok(self.config)
@@ -413,6 +435,15 @@ fn validate_values(config: &Config) -> Result<(), ConfigError> {
     }
 
     let tick = config.wheel.base_tick();
+    if config.cookie.validate(tick).is_err() {
+        return Err(ConfigError::CookieConfiguration);
+    }
+    if datagram_size < HEADER_LEN + COOKIE_LEN {
+        return Err(ConfigError::DatagramTooSmall {
+            size: datagram_size,
+            header_len: HEADER_LEN + COOKIE_LEN,
+        });
+    }
     for (name, timeout) in [
         ("min_rto", config.min_rto),
         ("initial_rto", config.initial_rto),

@@ -29,6 +29,7 @@ use veloq::{
 use crate::{
     Config,
     connection::Connection,
+    cookie::CookieKeyRing,
     error::{Error, Result},
     packet::ConnectionId,
 };
@@ -103,6 +104,16 @@ pub struct EndpointStatsSnapshot {
     pub timer_delay_max: Duration,
     pub inbound_queue_drops: u64,
     pub outbound_queue_drops: u64,
+    pub cookie_challenges_issued: u64,
+    pub cookie_proofs_received: u64,
+    pub cookie_proofs_accepted: u64,
+    pub cookie_invalid_mac: u64,
+    pub cookie_expired: u64,
+    pub cookie_wrong_source: u64,
+    pub cookie_wrong_parameters: u64,
+    pub cookie_admission_drops: u64,
+    pub cookie_duplicate_proofs: u64,
+    pub cookie_challenge_send_drops: u64,
 }
 
 pub struct Endpoint<'rt> {
@@ -132,6 +143,7 @@ impl<'rt> Endpoint<'rt> {
         ctx: Ctx<'rt>,
         addr: impl ToSocketAddrs,
         config: Config,
+        cookie_keys: CookieKeyRing,
     ) -> Result<(Self, EndpointDriver<'rt>, EndpointReady)> {
         config.validate()?;
         let socket = UdpSocket::bind(ctx, addr).map_err(|_| Error::Io)?;
@@ -155,6 +167,7 @@ impl<'rt> Endpoint<'rt> {
             command.clone(),
             accept_tx,
             accept_rx,
+            cookie_keys,
         );
         let driver = EndpointDriver {
             inner: driver::Driver::new(ctx, socket, command_rx, state, ready),
@@ -208,6 +221,15 @@ impl<'rt> Endpoint<'rt> {
         let (reply, response) = oneshot::owned_channel();
         self.command
             .send(Command::CloseEndpoint { reply })
+            .await
+            .map_err(|_| Error::EndpointClosed)?;
+        response.await.map_err(|_| Error::EndpointClosed)?
+    }
+
+    pub async fn rotate_cookie_keys(&self, cookie_keys: CookieKeyRing) -> Result<()> {
+        let (reply, response) = oneshot::owned_channel();
+        self.command
+            .send(Command::RotateCookieKeys { cookie_keys, reply })
             .await
             .map_err(|_| Error::EndpointClosed)?;
         response.await.map_err(|_| Error::EndpointClosed)?

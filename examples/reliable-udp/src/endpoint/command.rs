@@ -1,19 +1,27 @@
 use tracing::trace;
 use veloq::{
+    buf::FixedBuf,
     runtime::context::Ctx,
     std::{num::NonZeroUsize, vec::Vec},
-    sync::mpmc::{BoundedOwnedReceiver, BoundedOwnedSender},
+    sync::{
+        TrySendError,
+        mpmc::{BoundedOwnedReceiver, BoundedOwnedSender},
+    },
 };
 
 use crate::{
-    connection::{ConnectionReply, Message, SendPayload, Shutdown},
+    connection::{Connection, ConnectionReply, Message, SendPayload, Shutdown},
+    cookie::{
+        CookieInput, CookieInvalidReason, CookieKeyRing, CookieToken, CookieValidation,
+        issue_cookie, validate_cookie,
+    },
     error::{Error, Result},
-    packet::{Flags, PacketRef},
-    session::{SendReceipt, Session, SessionEvent},
+    packet::{Ack, COOKIE_LEN, Flags, Packet, PacketRef},
+    session::{Role, SendReceipt, Session, SessionEvent, SessionState},
 };
 
 use super::event::EventRouter;
-use super::io::{InboundDatagram, OutboundSender, PumpSender};
+use super::io::{InboundDatagram, OutboundDatagram, OutboundSender, PumpSender, SendTicket};
 use super::state::{ProtocolState, SessionEntry, key_from_packet, message_from_session};
 use super::{ConnectionKey, Reply};
 
@@ -47,6 +55,10 @@ pub(crate) enum Command {
         key: ConnectionKey,
     },
     CloseEndpoint {
+        reply: Reply<()>,
+    },
+    RotateCookieKeys {
+        cookie_keys: CookieKeyRing,
         reply: Reply<()>,
     },
 }
@@ -135,6 +147,10 @@ impl CommandService {
                     ports.pump_events(),
                 )?;
                 return Ok(CommandOutcome::Close(reply));
+            }
+            Command::RotateCookieKeys { cookie_keys, reply } => {
+                state.rotate_cookie_keys(cookie_keys);
+                let _ = reply.send(Ok(()));
             }
         }
         Ok(CommandOutcome::Continue)
@@ -345,13 +361,13 @@ impl CommandService {
             return Ok(());
         }
         let peer = datagram.peer();
-        let (connection_id, flags) = match PacketRef::decode_with_constraints(
+        let packet = match PacketRef::decode_with_constraints(
             datagram.bytes(),
             state.config().max_fragment_payload(),
             state.config().max_message_size.get() as u64,
             state.config().max_fragments_per_message.get(),
         ) {
-            Ok(packet) => (packet.connection_id, packet.flags),
+            Ok(packet) => packet,
             Err(error) => {
                 state.stats().record_malformed();
                 trace!(
@@ -363,13 +379,39 @@ impl CommandService {
                 return Ok(());
             }
         };
-        let key = key_from_packet(peer, connection_id);
+        let key = key_from_packet(peer, packet.connection_id);
         if !state.contains(&key) {
-            if !flags.contains(Flags::SYN) || !state.can_accept_new_session() {
-                state.stats().record_unknown();
+            if packet.flags == Flags::SYN {
+                Self::issue_challenge(key, packet.receive_window, state, ports)?;
                 return Ok(());
             }
-            Self::start_server(key, state)?;
+            if packet.flags == Flags::ACK && packet.payload.len() == COOKIE_LEN {
+                return Self::admit_proof(key, packet, state, ports);
+            }
+            state.stats().record_unknown();
+            return Ok(());
+        }
+
+        if packet.flags == Flags::ACK && packet.payload.len() == COOKIE_LEN {
+            if state.entry(&key).is_some_and(|entry| {
+                entry.session().role() == Role::Server
+                    && entry.session().state() == SessionState::Established
+            }) {
+                state.stats().record_cookie_duplicate();
+                return Self::send_confirmation(key, state, ports);
+            }
+            state.stats().record_unknown();
+            return Ok(());
+        }
+
+        if packet.flags == Flags::SYN {
+            state.stats().record_unknown();
+            return Ok(());
+        }
+
+        if packet.flags == Flags::ACK && !packet.payload.is_empty() {
+            state.stats().record_unknown();
+            return Ok(());
         }
 
         let now = state.now();
@@ -403,11 +445,162 @@ impl CommandService {
         )
     }
 
-    fn start_server(key: ConnectionKey, state: &mut ProtocolState<'_>) -> Result<()> {
-        let session = Session::new_server(key.connection_id(), state.config().clone())?;
-        state.insert(key, SessionEntry::new(session, None));
-        state.stats().connection_started();
+    fn issue_challenge<'a, 'rt>(
+        key: ConnectionKey,
+        receive_window: u16,
+        state: &mut ProtocolState<'rt>,
+        ports: &CommandPorts<'a, 'rt>,
+    ) -> Result<()> {
+        let input = CookieInput {
+            source: key.peer(),
+            connection_id: key.connection_id(),
+            client_receive_window: receive_window,
+        };
+        let cookie = issue_cookie(state.cookie_keys(), input, state.now());
+        let packet = Packet::encode_handshake_cookie_into_with_limit(
+            &ports.ctx(),
+            state.config().max_datagram_size,
+            Flags::SYN_ACK,
+            key.connection_id(),
+            state.config().receive_window.get() as u16,
+            cookie.as_bytes(),
+        )?;
+        state.stats().record_cookie_challenge();
+        Self::enqueue_stateless(key, packet.into_fixed_buf(), state, ports, true);
         Ok(())
+    }
+
+    fn admit_proof<'a, 'rt>(
+        key: ConnectionKey,
+        packet: PacketRef<'_>,
+        state: &mut ProtocolState<'rt>,
+        ports: &CommandPorts<'a, 'rt>,
+    ) -> Result<()> {
+        state.stats().record_cookie_proof_received();
+        let token = match packet
+            .handshake_cookie()
+            .ok()
+            .and_then(|payload| CookieToken::parse(payload).ok())
+        {
+            Some(token) => token,
+            None => {
+                state.stats().record_cookie_wrong_parameters();
+                return Ok(());
+            }
+        };
+        let input = CookieInput {
+            source: key.peer(),
+            connection_id: key.connection_id(),
+            client_receive_window: packet.receive_window,
+        };
+        match validate_cookie(
+            state.cookie_keys(),
+            state.cookie_config(),
+            input,
+            token,
+            state.now(),
+        ) {
+            CookieValidation::Valid {
+                client_receive_window,
+                ..
+            } => {
+                if !state.reserve_accept() {
+                    state.stats().record_cookie_admission_drop();
+                    return Ok(());
+                }
+                let session = match Session::new_server_established(
+                    key.connection_id(),
+                    state.config().clone(),
+                    client_receive_window,
+                ) {
+                    Ok(session) => session,
+                    Err(error) => {
+                        state.release_accept();
+                        return Err(error);
+                    }
+                };
+                state.insert(key, SessionEntry::new(session, None));
+                state.stats().connection_started();
+                let connection = Connection::new(
+                    ports.command().clone(),
+                    key,
+                    state.config().max_message_size.get(),
+                );
+                match state.try_accept(connection) {
+                    Ok(()) => {
+                        state.release_accept();
+                        if let Some(entry) = state.entry_mut(&key) {
+                            entry.mark_accepted();
+                        }
+                        state.stats().record_cookie_proof_accepted();
+                        Self::send_confirmation(key, state, ports)
+                    }
+                    Err(TrySendError::Full(mut returned))
+                    | Err(TrySendError::Closed(mut returned)) => {
+                        returned.suppress_drop();
+                        drop(returned);
+                        state.release_accept();
+                        state.remove(&key);
+                        state.stats().connection_finished();
+                        state.stats().record_cookie_admission_drop();
+                        Ok(())
+                    }
+                }
+            }
+            CookieValidation::Invalid(reason) => {
+                Self::record_cookie_failure(state, reason);
+                Ok(())
+            }
+        }
+    }
+
+    fn send_confirmation<'a, 'rt>(
+        key: ConnectionKey,
+        state: &mut ProtocolState<'rt>,
+        ports: &CommandPorts<'a, 'rt>,
+    ) -> Result<()> {
+        let packet = Packet::encode_control_into_with_limit(
+            &ports.ctx(),
+            state.config().max_datagram_size,
+            Flags::ACK,
+            key.connection_id(),
+            Ack::empty(),
+            state.config().receive_window.get() as u16,
+        )?;
+        Self::enqueue_stateless(key, packet.into_fixed_buf(), state, ports, false);
+        Ok(())
+    }
+
+    fn enqueue_stateless<'a, 'rt>(
+        key: ConnectionKey,
+        datagram: FixedBuf,
+        state: &mut ProtocolState<'rt>,
+        ports: &CommandPorts<'a, 'rt>,
+        challenge: bool,
+    ) {
+        let item = OutboundDatagram::new(key, datagram, SendTicket::DropAfterSend);
+        if matches!(
+            ports.outbound().try_send(item),
+            Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_))
+        ) {
+            state.stats().record_outbound_drop();
+            if challenge {
+                state.stats().record_cookie_challenge_send_drop();
+            }
+        }
+    }
+
+    fn record_cookie_failure(state: &ProtocolState<'_>, reason: CookieInvalidReason) {
+        match reason {
+            CookieInvalidReason::Expired | CookieInvalidReason::Future => {
+                state.stats().record_cookie_expired()
+            }
+            CookieInvalidReason::WrongParameters => state.stats().record_cookie_wrong_parameters(),
+            CookieInvalidReason::InvalidMac | CookieInvalidReason::KeyUnavailable => {
+                state.stats().record_cookie_invalid_mac()
+            }
+            CookieInvalidReason::Malformed => state.stats().record_cookie_wrong_parameters(),
+        }
     }
 
     fn complete_pending_recv(

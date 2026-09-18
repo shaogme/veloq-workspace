@@ -10,7 +10,15 @@ use veloq::{
     },
     time::timeout_at,
 };
-use veloq_reliable_udp::{Config, Endpoint};
+use veloq_reliable_udp::{COOKIE_KEY_LEN, Config, CookieKey, CookieKeyRing, Endpoint};
+
+fn cookie_keys() -> CookieKeyRing {
+    CookieKeyRing::new(
+        CookieKey::new(1, [0x42; COOKIE_KEY_LEN]).expect("cookie key"),
+        None,
+    )
+    .expect("cookie key ring")
+}
 
 fn run_test<F, R>(workers: NonZeroUsize, f: F) -> R
 where
@@ -34,9 +42,9 @@ fn endpoint_round_trips_a_fragmented_message() {
             .build()
             .expect("fragmentation config");
         let (server, server_driver, mut server_ready) =
-            Endpoint::bind(ctx, "127.0.0.1:0", config.clone()).expect("bind server");
+            Endpoint::bind(ctx, "127.0.0.1:0", config.clone(), cookie_keys()).expect("bind server");
         let (client, client_driver, mut client_ready) =
-            Endpoint::bind(ctx, "127.0.0.1:0", config).expect("bind client");
+            Endpoint::bind(ctx, "127.0.0.1:0", config, cookie_keys()).expect("bind client");
         let server_addr = server.local_addr();
         let payload: Vec<u8> = (0..2_048).map(|value| (value % 251) as u8).collect();
         let deadline = Instant::now() + Duration::from_secs(5);

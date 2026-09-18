@@ -2,7 +2,7 @@ use veloq::std::{error::Error as StdError, fmt, result::Result as StdResult};
 
 use veloq_wheel::TimerError;
 
-use crate::{config::ConfigError, packet::PacketError};
+use crate::{config::ConfigError, cookie::CookieError, packet::PacketError};
 
 pub type Result<T> = StdResult<T, Error>;
 
@@ -30,6 +30,9 @@ pub enum Error {
     SendWindowClosed,
     ReceiveWindowClosed,
     OutboundQueueFull,
+    CookieConfiguration,
+    CookieExpired,
+    CookieKeyUnavailable,
 }
 
 impl fmt::Display for Error {
@@ -57,6 +60,9 @@ impl fmt::Display for Error {
             Self::SendWindowClosed => f.write_str("send window or pending queue is full"),
             Self::ReceiveWindowClosed => f.write_str("receive window is full"),
             Self::OutboundQueueFull => f.write_str("endpoint outbound queue is full"),
+            Self::CookieConfiguration => f.write_str("invalid cookie key or configuration"),
+            Self::CookieExpired => f.write_str("handshake cookie expired"),
+            Self::CookieKeyUnavailable => f.write_str("handshake cookie key is unavailable"),
         }
     }
 }
@@ -72,6 +78,12 @@ impl From<ConfigError> for Error {
 impl From<PacketError> for Error {
     fn from(error: PacketError) -> Self {
         Self::Packet(error)
+    }
+}
+
+impl From<CookieError> for Error {
+    fn from(_: CookieError) -> Self {
+        Self::CookieConfiguration
     }
 }
 
