@@ -1004,6 +1004,8 @@ fn unregister_resource(
 
 #[cfg(test)]
 mod tests {
+    use crate::types::Timespec;
+
     use super::*;
 
     fn parameters(flags: u32, features: u32) -> Parameters {
@@ -1096,7 +1098,7 @@ mod tests {
     #[test]
     fn extended_arguments_validate_pointer_fields_and_abi_size() {
         let params = parameters(0, 0);
-        let timespec = crate::types::Timespec::new();
+        let timespec = Timespec::new();
         let submit_args = SubmitArgs::new().timespec(&timespec);
         let enter_args = EnterArgs::new(0, 0)
             .flags(EnterFlags::EXT_ARG)

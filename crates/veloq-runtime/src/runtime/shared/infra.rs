@@ -751,6 +751,7 @@ mod tests {
     use veloq_std::vec::Vec;
 
     use super::{AtomicBitset, EventCount, IdleController, IdleSlots, IdleStack, WakeResult};
+    use crate::runtime::shared::init_runtime_components;
     use crate::{error::RuntimeWakeError, runtime::primitives::RuntimeWaker};
     use veloq_std::result::Result as StdResult;
 
@@ -775,8 +776,7 @@ mod tests {
         let worker_count = 4;
         let worker_count_nz = veloq_std::num::NonZeroUsize::new(worker_count).expect("workers");
         let queue_capacity = veloq_std::num::NonZeroUsize::new(1).expect("queue capacity");
-        let (registry, _, _) =
-            crate::runtime::shared::init_runtime_components(worker_count_nz, queue_capacity);
+        let (registry, _, _) = init_runtime_components(worker_count_nz, queue_capacity);
         let calls: Arc<[AtomicUsize]> = (0..worker_count)
             .map(|_| AtomicUsize::new(0))
             .collect::<Vec<_>>()

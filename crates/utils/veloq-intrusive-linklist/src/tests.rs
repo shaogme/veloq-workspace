@@ -1,4 +1,4 @@
-use crate::{Link, LinkedList};
+use crate::{Link, LinkedList, intrusive_adapter};
 use veloq_std::boxed::Box;
 
 #[cfg(feature = "std")]
@@ -12,7 +12,7 @@ struct TestNode {
     link: Link,
 }
 
-crate::intrusive_adapter!(TestAdapter = TestNode { link: Link });
+intrusive_adapter!(TestAdapter = TestNode { link: Link });
 
 #[test]
 fn test_push_pop() {

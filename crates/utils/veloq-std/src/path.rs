@@ -26,6 +26,7 @@ use crate::{
         vec::Vec,
     },
     ffi::{Display as OsStrDisplay, OsStr, OsString},
+    fs::path_exists,
 };
 
 use self::sys::{HAS_PREFIXES, is_absolute, is_sep_byte, is_verbatim_sep, parse_prefix};
@@ -1044,7 +1045,7 @@ impl Path {
     #[must_use]
     #[inline]
     pub fn exists(&self) -> bool {
-        crate::fs::path_exists(self)
+        path_exists(self)
     }
 
     /// Copies `self` into a new `PathBuf`.

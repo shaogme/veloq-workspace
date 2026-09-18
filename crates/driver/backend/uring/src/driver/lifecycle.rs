@@ -3,6 +3,7 @@ use crate::{
         PendingCancel, UringDriver,
         completion::{COMP_BACKEND_URING, UringSyntheticCompletion},
         control::{CancelIntentError, CancelRequestDisposition, ControlPlaneEvent},
+        env::StageResult,
         submission::{submit_queued_from_slot, txn::slot_access_report},
     },
     error::{UringError, UringResult, uring_report_to_event_res},
@@ -84,7 +85,7 @@ impl<'a> UringDriver<'a> {
         if self
             .submit_env()
             .stage_cancel_entry(cancel_ticket, request, cancel_sqe)?
-            == crate::driver::env::StageResult::Staged
+            == StageResult::Staged
         {
             self.control
                 .cancellations
