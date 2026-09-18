@@ -76,6 +76,9 @@ impl<'a> UringDriver<'a> {
         let (user_data, generation) = request.user_parts();
         let cancel_sqe = opcode::AsyncCancel::new(CompletionToken::user(request.target).raw())
             .build()
+            .map_err(|error| {
+                UringError::InvalidInput.io_report("uring.cancel.build_opcode", error)
+            })?
             .user_data(CompletionToken::cancel(cancel_ticket).raw());
 
         if self

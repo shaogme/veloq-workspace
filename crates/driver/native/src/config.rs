@@ -51,8 +51,8 @@ impl Default for UringDriveLimits {
 
 #[cfg(not(windows))]
 pub use veloq_driver_uring::{
-    BufferRegistrationMode, FileTableExhaustion, IoMode, ProvidedBufConfig, UringConfig,
-    UringDriveLimits,
+    BufferRegistrationMode, FileTableExhaustion, IoMode, ProvidedBufConfig, SetupFlags,
+    SetupPolicy, UringConfig, UringDriveLimits,
 };
 
 /// I/O submission mode.

@@ -55,6 +55,19 @@ fn new_driver_with_file_table_or_skip(
     };
     static REGISTRAR: NoopRegistrar = NoopRegistrar;
     match UringDriver::new(config, &REGISTRAR) {
+        Ok(driver)
+            if capacity > 0
+                && !driver
+                    .capability_snapshot()
+                    .file_registration
+                    .is_registered() =>
+        {
+            eprintln!(
+                "skipping uring test with unsupported sparse file registration: {:?}",
+                driver.capability_snapshot()
+            );
+            None
+        }
         Ok(driver) => Some(driver),
         Err(report) => {
             eprintln!("skipping uring test with file table capacity {capacity}: {report}");
@@ -103,6 +116,13 @@ fn stale_registered_fd_generation_rejected_on_submit() {
         .into_iter()
         .next()
         .unwrap();
+    let Some(stale_generation) = stale_fd.generation() else {
+        eprintln!(
+            "skipping fixed-file generation assertion: {:?}",
+            driver.capability_snapshot()
+        );
+        return;
+    };
     driver.unregister_files(vec![stale_fd]).unwrap();
 
     let second = File::open("Cargo.toml").unwrap();
@@ -115,7 +135,7 @@ fn stale_registered_fd_generation_rejected_on_submit() {
         .unwrap();
 
     assert_eq!(stale_fd.fixed_index(), fresh_fd.fixed_index());
-    assert_ne!(stale_fd.generation(), fresh_fd.generation());
+    assert_ne!(Some(stale_generation), fresh_fd.generation());
 
     assert_stale_fsync_is_rejected(&mut driver, stale_fd);
 
@@ -622,9 +642,13 @@ fn close_owned_registered_file() {
         .into_iter()
         .next()
         .unwrap();
-    let index = fd
-        .fixed_index()
-        .expect("a default file table registers descriptors");
+    let Some(index) = fd.fixed_index() else {
+        eprintln!(
+            "skipping fixed-file generation assertion: {:?}",
+            driver.capability_snapshot()
+        );
+        return;
+    };
 
     let token = submit_test_op(&mut driver, Close { fd });
     let closed = wait_completion(&mut driver, token, Duration::from_secs(5));

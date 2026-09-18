@@ -1,15 +1,21 @@
 use diagweave::prelude::*;
 use tracing::{debug, trace};
 use veloq_buf::{AnyBufPool, BufferRegistrar, heap::ChunkId};
-use veloq_io_uring::{IoUring, Probe, opcode, types};
-use veloq_std::{format, ptr, sync::Arc, vec, vec::Vec};
+use veloq_io_uring::{
+    IoUring, KernelCapabilities, Probe, ResourceLayout, ResourceRegistration, RingConfig,
+    SetupFlags, SetupPolicy, opcode, types,
+};
+use veloq_std::{format, io, sync::Arc, vec::Vec};
 
 #[cfg(feature = "test-hooks")]
 use veloq_std::{collections::VecDeque, string::String};
 
 use crate::{
     config::{IoFd, IoMode, RawHandle, UringConfig, UringDriveLimits, UringRawHandle},
-    diagnostics::{UringCompletionDiagnostics, UringCompletionDiagnosticsSnapshot},
+    diagnostics::{
+        UringCapabilitySnapshot, UringCompletionDiagnostics, UringCompletionDiagnosticsSnapshot,
+        UringSetupSnapshot,
+    },
     driver::control::ControlPlaneEvent,
     error::{UringError, UringResult},
     op::{
@@ -72,6 +78,166 @@ fn probe_capabilities(probe: &Probe) -> DriverCapabilities {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct SetupNegotiation {
+    requested_flags: u32,
+    rejected_flags: u32,
+    failure_errno: Option<i32>,
+}
+
+fn setup_report(
+    kind: UringError,
+    scope: &'static str,
+    error: io::Error,
+    policy: SetupPolicy,
+    mode: IoMode,
+) -> Report<UringError> {
+    kind.io_report(scope, error)
+        .with_ctx("setup_required_flags", policy.required().bits())
+        .with_ctx("setup_best_effort_flags", policy.best_effort().bits())
+        .with_ctx("setup_disabled_flags", policy.disabled().bits())
+        .with_ctx("setup_mode", format!("{mode:?}"))
+}
+
+fn build_negotiated_ring(config: &UringConfig) -> UringResult<(IoUring, SetupNegotiation)> {
+    let mut policy = config.setup_policy;
+    if let IoMode::Polling(_) = config.mode {
+        policy = policy.with_required(SetupFlags::SQPOLL);
+    }
+    policy.validate().map_err(|error| {
+        setup_report(
+            UringError::InvalidInput,
+            "driver.new.setup_policy",
+            error,
+            policy,
+            config.mode,
+        )
+    })?;
+
+    let entries = config.entries.get();
+    let base = IoUring::from_config(RingConfig::new(entries)).map_err(|error| {
+        setup_report(
+            UringError::DriverInit,
+            "driver.new.build_base_ring",
+            error,
+            policy,
+            config.mode,
+        )
+    })?;
+    let baseline_capabilities = base.params().capabilities();
+    let requested = policy.requested();
+    if requested.is_empty() {
+        debug!(
+            baseline_setup_flags = baseline_capabilities.setup_flags,
+            "created io_uring base setup profile"
+        );
+        return Ok((base, SetupNegotiation::default()));
+    }
+
+    let profile = RingConfig::new(entries)
+        .with_setup_policy(policy)
+        .with_sq_thread_idle(match config.mode {
+            IoMode::Polling(idle_ms) => idle_ms.get(),
+            IoMode::Interrupt => 0,
+        });
+    let full_error = match IoUring::from_config(profile) {
+        Ok(ring) => {
+            drop(base);
+            return Ok((
+                ring,
+                SetupNegotiation {
+                    requested_flags: requested.bits(),
+                    ..SetupNegotiation::default()
+                },
+            ));
+        }
+        Err(error) => error,
+    };
+    let full_errno = full_error.raw_os_error();
+
+    let negotiable = [
+        SetupFlags::COOP_TASKRUN,
+        SetupFlags::SINGLE_ISSUER,
+        SetupFlags::DEFER_TASKRUN,
+    ];
+    let mut selected_ring = None;
+    let mut selected_count = 0;
+    for subset in 0_u32..(1_u32 << negotiable.len()) {
+        let mut best_effort = SetupFlags::EMPTY;
+        for (index, flag) in negotiable.iter().enumerate() {
+            if subset & (1_u32 << index) != 0 && policy.best_effort().contains(*flag) {
+                best_effort = best_effort.union(*flag);
+            }
+        }
+        if best_effort == policy.best_effort() {
+            continue;
+        }
+        let candidate_policy = SetupPolicy::new(policy.required(), best_effort, policy.disabled());
+        let candidate = RingConfig::new(entries)
+            .with_setup_policy(candidate_policy)
+            .with_sq_thread_idle(match config.mode {
+                IoMode::Polling(idle_ms) => idle_ms.get(),
+                IoMode::Interrupt => 0,
+            });
+        if let Ok(ring) = IoUring::from_config(candidate) {
+            let count = best_effort.bits().count_ones();
+            if count > selected_count {
+                selected_ring = Some(ring);
+                selected_count = count;
+            }
+        }
+    }
+
+    if let Some(ring) = selected_ring {
+        let accepted = SetupFlags::from_bits_retain(ring.params().setup_flags());
+        let rejected = requested.difference(accepted);
+        drop(base);
+        return Ok((
+            ring,
+            SetupNegotiation {
+                requested_flags: requested.bits(),
+                rejected_flags: rejected.bits(),
+                failure_errno: full_errno,
+            },
+        ));
+    }
+
+    if policy.required().is_empty() {
+        let rejected = requested.difference(SetupFlags::from_bits_retain(
+            baseline_capabilities.setup_flags,
+        ));
+        debug!(
+            requested_setup_flags = requested.bits(),
+            rejected_setup_flags = rejected.bits(),
+            errno = ?full_errno,
+            "falling back to the io_uring base setup profile"
+        );
+        return Ok((
+            base,
+            SetupNegotiation {
+                requested_flags: requested.bits(),
+                rejected_flags: rejected.bits(),
+                failure_errno: full_errno,
+            },
+        ));
+    }
+
+    let kind = if matches!(config.mode, IoMode::Polling(_))
+        && policy.required().contains(SetupFlags::SQPOLL)
+    {
+        UringError::PollingUnavailable
+    } else {
+        UringError::DriverInit
+    };
+    Err(setup_report(
+        kind,
+        "driver.new.build_setup_profile",
+        full_error,
+        policy,
+        config.mode,
+    ))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ProvidedBufQuiesce {
     active_operations: usize,
@@ -110,8 +276,11 @@ pub struct UringDriver<'a> {
     pub(crate) effect_accumulator: Option<UringPostCompletionEffects>,
     pub(crate) drive_limits: UringDriveLimits,
     pub(crate) file_table: FileTable,
+    pub(crate) file_registration: Option<ResourceRegistration>,
+    setup_negotiation: SetupNegotiation,
     #[cfg(feature = "test-hooks")]
     pub(crate) register_files_update_outcomes: VecDeque<RegisterFilesUpdateOutcome>,
+    pub(crate) kernel_capabilities: KernelCapabilities,
     pub(crate) capabilities: DriverCapabilities,
     pub(crate) submission_fail_stop: bool,
 }
@@ -131,31 +300,7 @@ impl<'a> UringDriver<'a> {
                     .report("driver.new.drive_limits", message)
                     .attach_note("all io_uring drive budgets must be bounded and non-zero")
             })?;
-        let mut builder = IoUring::builder();
-
-        builder
-            .setup_coop_taskrun()
-            .setup_single_issuer()
-            .setup_defer_taskrun();
-
-        if let IoMode::Polling(idle_ms) = config.mode {
-            builder.setup_sqpoll(idle_ms.get());
-        }
-
-        let ring = match builder.build(entries) {
-            Ok(ring) => ring,
-            Err(error)
-                if matches!(config.mode, IoMode::Polling(_))
-                    && error.raw_os_error() == Some(libc::EINVAL) =>
-            {
-                return Err(UringError::PollingUnavailable
-                    .io_report("driver.new.build_polling_ring", error)
-                    .attach_note("the requested SQPOLL mode is unavailable on this kernel"));
-            }
-            Err(error) => {
-                return Err(UringError::DriverInit.io_report("driver.new.build_ring", error));
-            }
-        };
+        let (mut ring, setup_negotiation) = build_negotiated_ring(config)?;
 
         let ops = UringOpRegistry::new(entries as usize);
         let completion_table: SharedCompletionTable<UringSlotSpec> = ops.shared.clone();
@@ -168,11 +313,22 @@ impl<'a> UringDriver<'a> {
         // 吗」——那是同一个 opcode 上后加的标志位。所以这里只排除掉真正缺 opcode 的内核，
         // 剩下的由第一次提交去问（`note_capability_rejected`）。
         let mut ring_probe = Probe::new();
-        if ring.submitter().register_probe(&mut ring_probe).is_err() {
+        let mut kernel_capabilities = ring.params().capabilities();
+        let probe_error = match ring.submitter().register_probe(&mut ring_probe) {
+            Ok(()) => {
+                kernel_capabilities = kernel_capabilities.with_probe(&ring_probe);
+                None
+            }
+            Err(error) => {
+                let errno = error.raw_os_error().unwrap_or(libc::EIO);
+                kernel_capabilities = kernel_capabilities.with_probe_error(errno);
+                Some(errno)
+            }
+        };
+        if probe_error.is_some() {
             debug!("IORING_REGISTER_PROBE unavailable; assuming no optional opcodes");
             ring_probe = Probe::new();
         }
-
         debug!("Initalized UringDriver with {} entries", entries);
 
         let mut driver = Self {
@@ -206,40 +362,43 @@ impl<'a> UringDriver<'a> {
             )),
             drive_limits: config.drive_limits,
             file_table: FileTable::new(config.file_table_capacity, config.file_table_exhaustion),
+            file_registration: None,
+            setup_negotiation,
             #[cfg(feature = "test-hooks")]
             register_files_update_outcomes: VecDeque::new(),
+            kernel_capabilities,
             capabilities: probe_capabilities(&ring_probe),
             submission_fail_stop: false,
         };
 
-        driver.submit_waker()?;
+        driver.ensure_file_table_initialized()?;
 
-        // Sparse registration
-        let iovecs = vec![
-            libc::iovec {
-                iov_base: ptr::null_mut(),
-                iov_len: 0
-            };
-            MAX_CHUNKS
-        ];
-
-        match unsafe { driver.ring.submitter().register_buffers(&iovecs) } {
-            Ok(_) => {
+        match driver.ring.submitter().register_buffers_sparse(MAX_CHUNKS) {
+            Ok(registration) => {
+                driver.kernel_capabilities = driver
+                    .kernel_capabilities
+                    .with_buffer_registration(&registration);
                 driver
                     .buffer_registry
-                    .set_fixed_buffers_available(true, None);
+                    .set_fixed_buffers_available(registration);
                 debug!(
                     registration_mode = config.registration_mode.as_str(),
                     fixed_buffers_available = true,
+                    fixed_buffer_slots = MAX_CHUNKS,
                     fallback = false,
                     "registered sparse fixed-buffer table"
                 );
             }
             Err(e) => {
                 let errno = e.raw_os_error();
-                driver
-                    .buffer_registry
-                    .set_fixed_buffers_available(false, errno);
+                driver.kernel_capabilities =
+                    driver.kernel_capabilities.with_buffer_registration_error(
+                        MAX_CHUNKS as u32,
+                        ResourceLayout::Sparse,
+                        false,
+                        errno,
+                    );
+                driver.buffer_registry.set_fixed_buffers_unavailable(errno);
                 tracing::warn!(
                     registration_mode = config.registration_mode.as_str(),
                     errno = ?errno,
@@ -248,8 +407,22 @@ impl<'a> UringDriver<'a> {
                     error = %e,
                     "sparse fixed-buffer registration unavailable"
                 );
+                if config.registration_mode.is_strict() {
+                    return Err(UringError::Registration
+                        .io_report("driver.new.register_fixed_buffers", e)
+                        .attach_note(
+                            "strict buffer registration mode does not permit a raw-buffer fallback",
+                        ));
+                }
             }
         }
+
+        driver.submit_waker()?;
+
+        debug!(
+            capabilities = ?driver.capability_snapshot(),
+            "recorded io_uring capability snapshot"
+        );
 
         Ok(driver)
     }
@@ -562,6 +735,23 @@ impl<'a> UringDriver<'a> {
         &self,
     ) -> DriverCompletionDiagnosticsSnapshot<UringCompletionDiagnosticsSnapshot> {
         self.completion_diagnostics.snapshot()
+    }
+
+    /// Returns the immutable baseline capability snapshot captured for this ring.
+    pub fn capability_snapshot(&self) -> UringCapabilitySnapshot {
+        UringCapabilitySnapshot::new(
+            self.kernel_capabilities,
+            self.capabilities,
+            UringSetupSnapshot {
+                requested_flags: self.setup_negotiation.requested_flags,
+                rejected_flags: self.setup_negotiation.rejected_flags,
+                failure_errno: self.setup_negotiation.failure_errno,
+            },
+            self.buffer_registry.fixed_buffers_available(),
+            self.buffer_registry.fixed_buffers_failure_errno(),
+            self.capabilities.provided_buffers,
+            self.buffer_registry.provided_buffers_failure_errno(),
+        )
     }
 
     pub(crate) fn rebuild_waker_fd(&mut self) -> UringResult<()> {

@@ -11,7 +11,10 @@ use crate::{
         lifecycle::{CancellationPhase, SubmissionPhase},
     },
     error::{UringError, UringResult},
-    op::{Reserved, Slot, SlotView, SubmissionStrategy, UringOp, UringOpRegistryExt, sqe_with_fd},
+    op::{
+        Reserved, Slot, SlotView, SubmissionStrategy, UringOp, UringOpRegistryExt, opcode_build,
+        sqe_with_fd,
+    },
 };
 use diagweave::prelude::*;
 use tracing::{debug, trace};
@@ -23,6 +26,7 @@ use veloq_driver_core::{
     slot::{CheckedSlotView, InFlightWaiting},
 };
 use veloq_io_uring::{
+    EnterArgs, EnterFlags, SubmitError as KernelSubmitError, SubmitReceipt as KernelSubmitReceipt,
     opcode,
     types::{self, SubmitArgs, Timespec},
 };
@@ -257,8 +261,12 @@ impl<'a> UringDriver<'a> {
             .resolve(waker_fd, None, "driver.submit_waker.resolve")?;
         let buf = self.control.waker.buf_mut_ptr();
         let len = self.control.waker.buf_len() as u32;
-        let sqe = sqe_with_fd!(sqe_fd, |f| opcode::Read::new(f, buf, len).build())
-            .user_data(CompletionToken::waker(0).raw());
+        let sqe = opcode_build(
+            "driver.submit_waker.opcode",
+            sqe_with_fd!(sqe_fd, |f| unsafe { opcode::Read::new(f, buf, len) }
+                .build()),
+        )?
+        .user_data(CompletionToken::waker(0).raw());
 
         if self.submit_env().stage_waker_entry(sqe)? == StageResult::Staged {
             self.control.waker_stage_pending = false;
@@ -450,79 +458,36 @@ impl<'a> UringDriver<'a> {
             let consumed = self.ring.submit();
             return Ok((
                 match consumed {
-                    Ok(consumed) => SubmissionReceipt::Consumed {
-                        requested: to_submit,
-                        consumed,
-                    },
-                    Err(error) => SubmissionReceipt::Unknown {
-                        error: SubmissionError::Kernel(
-                            UringError::Submission
-                                .io_report("driver.submit_to_kernel.submit.sqpoll", error),
-                        ),
-                    },
+                    Ok(receipt) => map_kernel_receipt(receipt),
+                    Err(error) => map_kernel_error(error, "driver.submit_to_kernel.submit.sqpoll"),
                 },
                 false,
             ));
         }
 
         if let Some(timeout) = plan.wait {
-            let timespec = Timespec::new()
-                .sec(timeout.as_secs())
-                .nsec(timeout.subsec_nanos());
+            let timespec = Timespec::try_from(timeout).map_err(|error| {
+                UringError::InvalidInput.io_report("driver.submit_to_kernel.timespec", error)
+            })?;
             let args = SubmitArgs::new().timespec(&timespec);
             match self.ring.submitter().submit_with_args(1, &args) {
-                Ok(consumed) => Ok((
-                    if to_submit == 0 {
-                        SubmissionReceipt::NoEntries
-                    } else {
-                        SubmissionReceipt::Consumed {
-                            requested: to_submit,
-                            consumed,
-                        }
-                    },
-                    false,
-                )),
-                Err(error) if error.raw_os_error() == Some(libc::ETIME) && to_submit == 0 => {
+                Ok(receipt) => Ok((map_kernel_receipt(receipt), false)),
+                Err(error)
+                    if error.error().raw_os_error() == Some(libc::ETIME) && to_submit == 0 =>
+                {
                     Ok((SubmissionReceipt::NoEntries, true))
                 }
                 Err(error) => Ok((
-                    SubmissionReceipt::Unknown {
-                        error: SubmissionError::Kernel(
-                            UringError::CompletionWait
-                                .io_report("driver.submit_to_kernel.wait", error),
-                        ),
-                    },
+                    map_kernel_error(error, "driver.submit_to_kernel.wait"),
                     false,
                 )),
             }
         } else {
-            let consumed = unsafe {
-                self.ring.submitter().enter::<()>(
-                    to_submit as u32,
-                    0,
-                    1, /* IORING_ENTER_GETEVENTS */
-                    None,
-                )
-            };
-            match consumed {
-                Ok(consumed) => Ok((
-                    if to_submit == 0 {
-                        SubmissionReceipt::NoEntries
-                    } else {
-                        SubmissionReceipt::Consumed {
-                            requested: to_submit,
-                            consumed,
-                        }
-                    },
-                    false,
-                )),
+            let args = EnterArgs::new(to_submit as u32, 0).flags(EnterFlags::GETEVENTS);
+            match self.ring.submitter().enter(args) {
+                Ok(receipt) => Ok((map_kernel_receipt(receipt), false)),
                 Err(error) => Ok((
-                    SubmissionReceipt::Unknown {
-                        error: SubmissionError::Kernel(
-                            UringError::Submission
-                                .io_report("driver.submit_to_kernel.enter", error),
-                        ),
-                    },
+                    map_kernel_error(error, "driver.submit_to_kernel.enter"),
                     false,
                 )),
             }
@@ -639,6 +604,42 @@ impl<'a> UringDriver<'a> {
                 )
             }
         }
+    }
+}
+
+fn map_kernel_receipt(receipt: KernelSubmitReceipt) -> SubmissionReceipt {
+    match receipt {
+        KernelSubmitReceipt::NoEntries { .. } => SubmissionReceipt::NoEntries,
+        KernelSubmitReceipt::PublishedToSqpoll { published, .. } => {
+            SubmissionReceipt::PublishedToSqpoll {
+                published: published as usize,
+            }
+        }
+        KernelSubmitReceipt::Submitted {
+            requested,
+            submitted,
+            ..
+        } => {
+            if requested == 0 {
+                SubmissionReceipt::NoEntries
+            } else {
+                SubmissionReceipt::Consumed {
+                    requested: requested as usize,
+                    consumed: submitted as usize,
+                }
+            }
+        }
+    }
+}
+
+fn map_kernel_error(error: KernelSubmitError, scope: &'static str) -> SubmissionReceipt {
+    match error {
+        KernelSubmitError::Rejected { error, .. } => SubmissionReceipt::Rejected {
+            error: SubmissionError::Kernel(UringError::Submission.io_report(scope, error)),
+        },
+        KernelSubmitError::Unknown { error, .. } => SubmissionReceipt::Unknown {
+            error: SubmissionError::Kernel(UringError::Submission.io_report(scope, error)),
+        },
     }
 }
 

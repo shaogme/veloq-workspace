@@ -3,6 +3,7 @@ use veloq_driver_core::{
     OwnedRawHandle as CoreOwnedRawHandle, RawHandle as CoreRawHandle, RawHandleMeta,
 };
 pub use veloq_driver_core::{DirectOwnerId, RawHandleKind};
+pub use veloq_io_uring::{SetupFlags, SetupPolicy};
 use veloq_std::{
     mem,
     num::{NonZeroU16, NonZeroU32, NonZeroUsize},
@@ -229,6 +230,8 @@ impl ProvidedBufConfig {
 pub struct UringConfig {
     pub mode: IoMode,
     pub entries: NonZeroU32,
+    /// Setup flags required or negotiated while creating the ring.
+    pub setup_policy: SetupPolicy,
     pub drive_limits: UringDriveLimits,
     pub registration_mode: BufferRegistrationMode,
     /// Provided-buffer ring to register, or `None` to run without one.
@@ -241,8 +244,8 @@ pub struct UringConfig {
     ///
     /// Independent of [`Self::entries`]: submission queue depth bounds how many operations are
     /// in flight, this bounds how many descriptors are registered at once. `0` disables the
-    /// table entirely and submits every descriptor as a raw fd; driver construction fails if
-    /// the value is larger than the driver — or the kernel — is willing to allocate.
+    /// table entirely and submits every descriptor as a raw fd. With [`FileTableExhaustion::Fail`],
+    /// driver construction also fails when the kernel cannot provide the requested table.
     pub file_table_capacity: u32,
     /// Behaviour once `file_table_capacity` entries are in use.
     pub file_table_exhaustion: FileTableExhaustion,
@@ -260,6 +263,7 @@ impl Default for UringConfig {
             mode: IoMode::Interrupt,
             // SAFETY: 1024 is non-zero.
             entries: unsafe { NonZeroU32::new_unchecked(1024) },
+            setup_policy: SetupPolicy::default(),
             drive_limits: UringDriveLimits::default(),
             registration_mode: BufferRegistrationMode::Strict,
             provided_buffers: None,
@@ -273,6 +277,12 @@ impl Default for UringConfig {
 const DEFAULT_FILE_TABLE_CAPACITY: u32 = 1024;
 
 impl UringConfig {
+    /// Sets the required/best-effort/disabled setup flag policy.
+    pub fn setup_policy(mut self, setup_policy: SetupPolicy) -> Self {
+        self.setup_policy = setup_policy;
+        self
+    }
+
     pub fn drive_limits(mut self, limits: UringDriveLimits) -> Self {
         self.drive_limits = limits;
         self

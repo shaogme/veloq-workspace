@@ -16,9 +16,16 @@ categories.workspace = true
 default = []
 std = ["veloq-std/std"]
 
-[dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 veloq-std.workspace = true
 libc.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "io_uring"
+harness = false
 
 [lints]
 workspace = true

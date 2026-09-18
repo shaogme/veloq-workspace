@@ -160,6 +160,19 @@ impl FileTable {
         self.fixed_capacity
     }
 
+    /// Disable fixed-file slots before initialization when the kernel does not support the
+    /// sparse resource ABI and the configured policy allows raw-fd fallback.
+    pub(crate) fn disable_fixed_table(&mut self) {
+        debug_assert!(!self.initialized);
+        debug_assert!(self.slots.is_empty());
+        self.fixed_capacity = 0;
+    }
+
+    #[inline]
+    pub(crate) const fn falls_back_when_unavailable(&self) -> bool {
+        self.exhaustion.falls_back()
+    }
+
     #[inline]
     pub(crate) const fn is_poisoned(&self) -> bool {
         matches!(self.health, FileTableHealth::Poisoned(_))

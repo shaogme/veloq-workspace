@@ -11,7 +11,7 @@ use crate::{
     error::UringResult,
 };
 use veloq_buf::{AnyBufPool, BufferRegistrar, heap::ChunkId};
-use veloq_io_uring::Submitter;
+use veloq_io_uring::{ResourceKind, ResourceRegistration, ResourceRegistrationState, Submitter};
 use veloq_std::{boxed::Box, collections::BitSet, time::Instant, vec};
 
 #[cfg(feature = "test-hooks")]
@@ -135,6 +135,7 @@ pub(crate) struct BufferRegistrySubmitView<'r, 'a> {
     pub(crate) registration_mode: BufferRegistrationMode,
     pub(crate) fixed_buffers_available: bool,
     pub(crate) fixed_buffers_failure_errno: Option<i32>,
+    pub(crate) fixed_buffer_registration: Option<&'r ResourceRegistration>,
     pub(crate) registration_quarantine: &'r mut Option<BufferRegistrationQuarantine>,
     #[cfg(feature = "test-hooks")]
     pub(crate) register_buffers_update_outcomes: &'r mut VecDeque<BufferUpdateInjection>,
@@ -160,6 +161,7 @@ pub(crate) struct UringBufferRegistry<'a> {
     mode: BufferRegistrationMode,
     fixed_buffers_available: bool,
     fixed_buffers_failure_errno: Option<i32>,
+    fixed_buffer_registration: Option<ResourceRegistration>,
     registration_quarantine: Option<BufferRegistrationQuarantine>,
     #[cfg(feature = "test-hooks")]
     register_buffers_update_outcomes: VecDeque<BufferUpdateInjection>,
@@ -167,6 +169,7 @@ pub(crate) struct UringBufferRegistry<'a> {
     bitset_set_failure: bool,
     provided_buf_config: Option<ProvidedBufConfig>,
     provided_buffers: Option<ProvidedBufGroup>,
+    provided_buffers_failure_errno: Option<i32>,
 }
 
 impl<'a> UringBufferRegistry<'a> {
@@ -183,6 +186,7 @@ impl<'a> UringBufferRegistry<'a> {
             mode,
             fixed_buffers_available: false,
             fixed_buffers_failure_errno: None,
+            fixed_buffer_registration: None,
             registration_quarantine: None,
             #[cfg(feature = "test-hooks")]
             register_buffers_update_outcomes: VecDeque::new(),
@@ -190,6 +194,7 @@ impl<'a> UringBufferRegistry<'a> {
             bitset_set_failure: false,
             provided_buf_config,
             provided_buffers: None,
+            provided_buffers_failure_errno: None,
         }
     }
 
@@ -207,6 +212,7 @@ impl<'a> UringBufferRegistry<'a> {
             registration_mode: self.mode,
             fixed_buffers_available: self.fixed_buffers_available,
             fixed_buffers_failure_errno: self.fixed_buffers_failure_errno,
+            fixed_buffer_registration: self.fixed_buffer_registration.as_ref(),
             registration_quarantine: &mut self.registration_quarantine,
             #[cfg(feature = "test-hooks")]
             register_buffers_update_outcomes: &mut self.register_buffers_update_outcomes,
@@ -216,15 +222,28 @@ impl<'a> UringBufferRegistry<'a> {
         }
     }
 
-    pub(crate) fn set_fixed_buffers_available(&mut self, available: bool, errno: Option<i32>) {
-        self.fixed_buffers_available = available;
-        self.fixed_buffers_failure_errno = (!available).then_some(errno).flatten();
+    pub(crate) fn set_fixed_buffers_available(&mut self, registration: ResourceRegistration) {
+        debug_assert!(registration.kind() == ResourceKind::Buffers);
+        debug_assert!(registration.state() == ResourceRegistrationState::Registered);
+        self.fixed_buffers_available = true;
+        self.fixed_buffers_failure_errno = None;
+        self.fixed_buffer_registration = Some(registration);
     }
 
-    #[cfg(feature = "test-hooks")]
+    pub(crate) fn set_fixed_buffers_unavailable(&mut self, errno: Option<i32>) {
+        self.fixed_buffers_available = false;
+        self.fixed_buffers_failure_errno = errno;
+        self.fixed_buffer_registration = None;
+    }
+
     #[inline]
     pub(crate) fn fixed_buffers_available(&self) -> bool {
         self.fixed_buffers_available
+    }
+
+    #[inline]
+    pub(crate) fn fixed_buffers_failure_errno(&self) -> Option<i32> {
+        self.fixed_buffers_failure_errno
     }
 
     #[cfg(feature = "test-hooks")]
@@ -339,9 +358,13 @@ impl<'a> UringBufferRegistry<'a> {
         match ProvidedBufGroup::new(submitter, config, pool, ring_lifetime_token) {
             Ok(group) => {
                 self.provided_buffers = Some(group);
+                self.provided_buffers_failure_errno = None;
                 Ok(true)
             }
             Err(report) => {
+                self.provided_buffers_failure_errno = report
+                    .error_code()
+                    .and_then(|code| i32::try_from(code).ok());
                 tracing::debug!(
                     report = ?report,
                     "provided buffer ring unavailable; continuing without it"
@@ -349,6 +372,11 @@ impl<'a> UringBufferRegistry<'a> {
                 Ok(false)
             }
         }
+    }
+
+    #[inline]
+    pub(crate) fn provided_buffers_failure_errno(&self) -> Option<i32> {
+        self.provided_buffers_failure_errno
     }
 
     pub(crate) fn release_provided_buffers(

@@ -14,7 +14,9 @@ use veloq_driver_core::driver::SubmitTokenContext;
 use veloq_io_uring::{opcode, squeue, types};
 use veloq_std::{pin::Pin, ptr};
 
-use super::{invalid_buf_io_range, resolve_socket_fd, resolve_socket_fd_direct, sqe_with_fd};
+use super::{
+    invalid_buf_io_range, opcode_build, resolve_socket_fd, resolve_socket_fd_direct, sqe_with_fd,
+};
 
 pub(crate) unsafe fn make_sqe_recv(
     _kernel: Pin<&mut KernelRef<Recv>>,
@@ -27,7 +29,10 @@ pub(crate) unsafe fn make_sqe_recv(
         .checked_read_range(val.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_recv", err))?;
     let fd = resolve_socket_fd(env.file_table, val.fd, "uring.op.submit.make_sqe_recv")?;
-    Ok(sqe_with_fd!(fd, |f| opcode::Recv::new(f, ptr, len).build()))
+    opcode_build(
+        "uring.op.submit.recv_opcode",
+        sqe_with_fd!(fd, |f| unsafe { opcode::Recv::new(f, ptr, len) }.build()),
+    )
 }
 
 /// A recv whose buffer the kernel picks out of the provided-buffer ring.
@@ -45,14 +50,15 @@ pub(crate) unsafe fn make_sqe_recv_provided(
     const SCOPE: &str = "uring.op.submit.make_sqe_recv_provided";
     let (bgid, len) = env.provided_buf_info(SCOPE)?;
     let fd = resolve_socket_fd(env.file_table, val.fd, SCOPE)?;
-    Ok(sqe_with_fd!(fd, |f| opcode::Recv::new(
-        f,
-        ptr::null_mut(),
-        len
+    opcode_build(
+        SCOPE,
+        sqe_with_fd!(fd, |f| unsafe {
+            opcode::Recv::new(f, ptr::null_mut(), len)
+        }
+        .buf_group(bgid)
+        .build()
+        .map(|entry| entry.flags(squeue::Flags::BUFFER_SELECT))),
     )
-    .buf_group(bgid)
-    .build()
-    .flags(squeue::Flags::BUFFER_SELECT)))
 }
 
 /// A recv that stays armed, each completion drawing its own buffer from the ring.
@@ -73,7 +79,10 @@ pub(crate) unsafe fn make_sqe_recv_multi(
     const SCOPE: &str = "uring.op.submit.make_sqe_recv_multi";
     let (bgid, _buf_size) = env.provided_buf_info(SCOPE)?;
     let fd = resolve_socket_fd_direct(env.file_table, val.fd, SCOPE)?;
-    Ok(sqe_with_fd!(fd, |f| opcode::RecvMulti::new(f, bgid).build()))
+    opcode_build(
+        SCOPE,
+        sqe_with_fd!(fd, |f| opcode::RecvMulti::new(f, bgid).build()),
+    )
 }
 
 pub(crate) unsafe fn make_sqe_send(
@@ -87,7 +96,10 @@ pub(crate) unsafe fn make_sqe_send(
         .checked_write_range(val.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_send", err))?;
     let fd = resolve_socket_fd(env.file_table, val.fd, "uring.op.submit.make_sqe_send")?;
-    Ok(sqe_with_fd!(fd, |f| opcode::Send::new(f, ptr, len).build()))
+    opcode_build(
+        "uring.op.submit.send_opcode",
+        sqe_with_fd!(fd, |f| unsafe { opcode::Send::new(f, ptr, len) }.build()),
+    )
 }
 
 pub(crate) unsafe fn make_sqe_udp_recv(
@@ -101,7 +113,10 @@ pub(crate) unsafe fn make_sqe_udp_recv(
         .checked_read_range(val.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_udp_recv", err))?;
     let fd = resolve_socket_fd(env.file_table, val.fd, "uring.op.submit.make_sqe_udp_recv")?;
-    Ok(sqe_with_fd!(fd, |f| opcode::Recv::new(f, ptr, len).build()))
+    opcode_build(
+        "uring.op.submit.udp_recv_opcode",
+        sqe_with_fd!(fd, |f| unsafe { opcode::Recv::new(f, ptr, len) }.build()),
+    )
 }
 
 pub(crate) unsafe fn make_sqe_udp_send(
@@ -115,7 +130,10 @@ pub(crate) unsafe fn make_sqe_udp_send(
         .checked_write_range(val.buf_offset)
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_udp_send", err))?;
     let fd = resolve_socket_fd(env.file_table, val.fd, "uring.op.submit.make_sqe_udp_send")?;
-    Ok(sqe_with_fd!(fd, |f| opcode::Send::new(f, ptr, len).build()))
+    opcode_build(
+        "uring.op.submit.udp_send_opcode",
+        sqe_with_fd!(fd, |f| unsafe { opcode::Send::new(f, ptr, len) }.build()),
+    )
 }
 
 pub(crate) unsafe fn make_sqe_connect(
@@ -126,12 +144,13 @@ pub(crate) unsafe fn make_sqe_connect(
 ) -> UringResult<squeue::Entry> {
     let fd = resolve_socket_fd(env.file_table, val.fd, "uring.op.submit.make_sqe_connect")?;
     let addr = &val.addr.0 as *const _ as *const _;
-    Ok(sqe_with_fd!(fd, |f| opcode::Connect::new(
-        f,
-        addr,
-        val.addr_len
+    opcode_build(
+        "uring.op.submit.connect_opcode",
+        sqe_with_fd!(fd, |f| unsafe {
+            opcode::Connect::new(f, addr, val.addr_len)
+        }
+        .build()),
     )
-    .build()))
 }
 
 pub(crate) unsafe fn make_sqe_udp_connect(
@@ -146,12 +165,13 @@ pub(crate) unsafe fn make_sqe_udp_connect(
         "uring.op.submit.make_sqe_udp_connect",
     )?;
     let addr = &val.addr.0 as *const _ as *const _;
-    Ok(sqe_with_fd!(fd, |f| opcode::Connect::new(
-        f,
-        addr,
-        val.addr_len
+    opcode_build(
+        "uring.op.submit.udp_connect_opcode",
+        sqe_with_fd!(fd, |f| unsafe {
+            opcode::Connect::new(f, addr, val.addr_len)
+        }
+        .build()),
     )
-    .build()))
 }
 
 pub(crate) unsafe fn make_sqe_accept(
@@ -163,7 +183,11 @@ pub(crate) unsafe fn make_sqe_accept(
     let fd = resolve_socket_fd(env.file_table, val.fd, "uring.op.submit.make_sqe_accept")?;
     let addr = &mut val.addr.0 as *mut _ as *mut _;
     let addr_len = &mut val.addr_len as *mut _;
-    Ok(sqe_with_fd!(fd, |f| opcode::Accept::new(f, addr, addr_len).build()))
+    opcode_build(
+        "uring.op.submit.accept_opcode",
+        sqe_with_fd!(fd, |f| unsafe { opcode::Accept::new(f, addr, addr_len) }
+            .build()),
+    )
 }
 
 /// 把 accept 完成的结果（一个裸 fd）变成一个拥有所有权的句柄。
@@ -188,7 +212,10 @@ pub(crate) unsafe fn make_sqe_accept_multi(
     )?;
     // `AcceptMulti` 没有 addr/addrlen 字段：内核不回填对端地址，因为多条完成共享一个
     // 地址缓冲会互相覆盖。地址由门面层在拿到 fd 之后用 `getpeername` 补。
-    Ok(sqe_with_fd!(fd, |f| opcode::AcceptMulti::new(f).build()))
+    opcode_build(
+        "uring.op.submit.accept_multi_opcode",
+        sqe_with_fd!(fd, |f| opcode::AcceptMulti::new(f).build()),
+    )
 }
 
 pub(crate) unsafe fn on_complete_accept(
@@ -226,7 +253,11 @@ pub(crate) unsafe fn make_sqe_send_to(
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_send_to", err))?;
 
     let fd = resolve_socket_fd(env.file_table, user.fd, "uring.op.submit.make_sqe_send_to")?;
-    Ok(sqe_with_fd!(fd, |f| opcode::SendMsg::new(f, msg.as_ptr()).build()))
+    opcode_build(
+        "uring.op.submit.sendmsg_opcode",
+        sqe_with_fd!(fd, |f| unsafe { opcode::SendMsg::new(f, msg.as_ptr()) }
+            .build()),
+    )
 }
 
 pub(crate) unsafe fn make_sqe_udp_recv_from(
@@ -243,9 +274,13 @@ pub(crate) unsafe fn make_sqe_udp_recv_from(
         user.fd,
         "uring.op.submit.make_sqe_udp_recv_from",
     )?;
-    Ok(sqe_with_fd!(sqe_fd, |f| {
-        opcode::RecvMsg::new(f, msg.into_ptr()).build()
-    }))
+    opcode_build(
+        "uring.op.submit.recvmsg_opcode",
+        sqe_with_fd!(sqe_fd, |f| unsafe {
+            opcode::RecvMsg::new(f, msg.into_ptr())
+        }
+        .build()),
+    )
 }
 
 pub(crate) unsafe fn on_complete_udp_recv_from(

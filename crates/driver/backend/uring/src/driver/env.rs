@@ -33,7 +33,7 @@ use veloq_driver_core::driver::{
     BufferRegistrationStatus, CancelTicket, CompletionToken, OpToken, RawCompletion,
 };
 use veloq_driver_core::slot::Generation;
-use veloq_io_uring::{SubmissionQueue, Submitter, cqueue, squeue};
+use veloq_io_uring::{ResourceRegistration, SubmissionQueue, Submitter, cqueue, squeue};
 use veloq_std::{
     collections::{BitSet, HashMap},
     format, ptr,
@@ -556,6 +556,7 @@ pub(crate) struct SubmitResourceView<'d, 'r> {
     registration_mode: BufferRegistrationMode,
     fixed_buffers_available: bool,
     fixed_buffers_failure_errno: Option<i32>,
+    fixed_buffer_registration: Option<&'d ResourceRegistration>,
     registration_quarantine: &'d mut Option<BufferRegistrationQuarantine>,
     #[cfg(feature = "test-hooks")]
     register_buffers_update_outcomes: &'d mut VecDeque<BufferUpdateInjection>,
@@ -1324,10 +1325,23 @@ impl SubmitResourceView<'_, '_> {
             };
         }
 
+        let Some(registration) = self.fixed_buffer_registration else {
+            return UpdateEvidence {
+                requested: iovecs.len(),
+                outcome: KernelUpdateOutcome::Unknown(
+                    None,
+                    "fixed-buffer registration token is missing",
+                ),
+            };
+        };
+
         // SAFETY: `iovecs` points at live chunk memory for the duration of this syscall, and the
         // caller retains ownership of that memory until every in-flight operation completes.
-        let outcome = match unsafe { self.submitter.register_buffers_update(index, iovecs, None) } {
-            Ok(()) => KernelUpdateOutcome::Applied(iovecs.len()),
+        let outcome = match unsafe {
+            self.submitter
+                .register_buffers_update(registration, index, iovecs)
+        } {
+            Ok(updated) => KernelUpdateOutcome::Applied(updated),
             Err(error) => KernelUpdateOutcome::Unknown(
                 error.raw_os_error(),
                 "kernel fixed-buffer update returned an error",
@@ -1513,6 +1527,7 @@ impl<'a> UringDriver<'a> {
             registration_mode: view.registration_mode,
             fixed_buffers_available: view.fixed_buffers_available,
             fixed_buffers_failure_errno: view.fixed_buffers_failure_errno,
+            fixed_buffer_registration: view.fixed_buffer_registration,
             registration_quarantine: view.registration_quarantine,
             #[cfg(feature = "test-hooks")]
             register_buffers_update_outcomes: view.register_buffers_update_outcomes,

@@ -26,7 +26,7 @@ pub(crate) use payload::{
 };
 pub(crate) use spec::{UringKernelPayloadStorage, UringOperationDescriptor};
 
-pub(crate) use submit::sqe_with_fd;
+pub(crate) use submit::{opcode_build, sqe_with_fd};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SubmissionStrategy {

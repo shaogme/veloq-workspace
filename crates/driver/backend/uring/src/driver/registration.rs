@@ -7,6 +7,7 @@ use diagweave::prelude::*;
 use tracing::error;
 use veloq_buf::heap::ChunkId;
 use veloq_driver_core::driver::{BufferRegistrationStatus, RegisterFd};
+use veloq_io_uring::ResourceLayout;
 use veloq_std::{
     collections::HashMap,
     format, io,
@@ -504,7 +505,15 @@ impl<'a> UringDriver<'a> {
         if let Some(outcome) = self.register_files_update_outcomes.pop_front() {
             return match outcome {
                 RegisterFilesUpdateOutcome::Actual => {
-                    let result = self.ring.submitter().register_files_update(start, files);
+                    let result = self
+                        .file_registration
+                        .as_ref()
+                        .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))
+                        .and_then(|registration| {
+                            self.ring
+                                .submitter()
+                                .register_files_update(registration, start, files)
+                        });
                     let evidence = match &result {
                         Ok(updated) => KernelUpdateOutcome::Applied(*updated),
                         Err(error) => KernelUpdateOutcome::Unknown(
@@ -524,7 +533,15 @@ impl<'a> UringDriver<'a> {
             };
         }
 
-        let result = self.ring.submitter().register_files_update(start, files);
+        let result = self
+            .file_registration
+            .as_ref()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))
+            .and_then(|registration| {
+                self.ring
+                    .submitter()
+                    .register_files_update(registration, start, files)
+            });
         let evidence = match &result {
             Ok(updated) => KernelUpdateOutcome::Applied(*updated),
             Err(error) => KernelUpdateOutcome::Unknown(
@@ -1066,10 +1083,35 @@ impl<'a> UringDriver<'a> {
                 .attach_note("configured registered file table capacity is too large");
         }
         if capacity > 0 {
-            let sparse = vec![-1; capacity];
-            self.ring.submitter().register_files(&sparse).map_err(|e| {
-                UringError::Registration.io_report("driver.ensure_file_table_initialized", e)
-            })?;
+            match self.ring.submitter().register_files_sparse(capacity) {
+                Ok(registration) => {
+                    self.kernel_capabilities = self
+                        .kernel_capabilities
+                        .with_file_registration(&registration);
+                    self.file_registration = Some(registration);
+                }
+                Err(error) => {
+                    self.kernel_capabilities =
+                        self.kernel_capabilities.with_file_registration_error(
+                            capacity as u32,
+                            ResourceLayout::Sparse,
+                            false,
+                            error.raw_os_error(),
+                        );
+                    if self.file_table.falls_back_when_unavailable() {
+                        self.file_table.disable_fixed_table();
+                        tracing::warn!(
+                            requested_slots = capacity,
+                            errno = ?error.raw_os_error(),
+                            "sparse fixed-file registration unavailable; using raw file descriptors"
+                        );
+                    } else {
+                        return Err(UringError::Registration
+                            .io_report("driver.ensure_file_table_initialized", error)
+                            .attach_note("sparse fixed-file registration is unavailable"));
+                    }
+                }
+            }
         }
 
         self.file_table.mark_initialized();

@@ -23,6 +23,20 @@ use veloq_driver_core::{
 use veloq_io_uring::{opcode, squeue, types};
 use veloq_std::{io, pin::Pin, string::ToString};
 
+/// Convert a low-level opcode validation error into the backend's diagnostic error while keeping
+/// Unsupported distinct from malformed input.
+#[inline]
+pub(crate) fn opcode_build<T>(scope: &'static str, result: io::Result<T>) -> UringResult<T> {
+    result.map_err(|error| {
+        let kind = if error.kind() == io::ErrorKind::Unsupported {
+            UringError::Unsupported
+        } else {
+            UringError::InvalidInput
+        };
+        kind.io_report(scope, error)
+    })
+}
+
 #[inline]
 fn invalid_buf_io_range(scope: &'static str, err: BufIoRangeError) -> Report<UringError> {
     UringError::InvalidInput
@@ -113,12 +127,15 @@ pub(crate) unsafe fn make_sqe_timeout(
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let kernel = kernel.as_mut().get_mut();
-    kernel.ts = types::Timespec::new()
-        .sec(user.duration.as_secs())
-        .nsec(user.duration.subsec_nanos());
+    kernel.ts = types::Timespec::try_from(user.duration).map_err(|error| {
+        UringError::InvalidInput.io_report("uring.op.submit.timeout_timespec", error)
+    })?;
     let ts_ptr = &kernel.ts as *const types::Timespec;
 
-    Ok(opcode::Timeout::new(ts_ptr).build())
+    opcode_build(
+        "uring.op.submit.timeout_opcode",
+        unsafe { opcode::Timeout::new(ts_ptr) }.build(),
+    )
 }
 
 pub(crate) unsafe fn make_sqe_wakeup(
@@ -129,10 +146,11 @@ pub(crate) unsafe fn make_sqe_wakeup(
 ) -> UringResult<squeue::Entry> {
     let kernel = kernel.as_mut().get_mut();
     let fd = resolve_file_fd(env.file_table, user.fd, "uring.op.submit.make_sqe_wakeup")?;
-    Ok(sqe_with_fd!(fd, |f| opcode::Read::new(
-        f,
-        kernel.buf.as_mut_ptr(),
-        8
+    opcode_build(
+        "uring.op.submit.wakeup_opcode",
+        sqe_with_fd!(fd, |f| unsafe {
+            opcode::Read::new(f, kernel.buf.as_mut_ptr(), 8)
+        }
+        .build()),
     )
-    .build()))
 }

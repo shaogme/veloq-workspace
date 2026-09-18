@@ -14,10 +14,11 @@
 //! 收益不在「省掉分配」，而在「**buffer 只在数据到达时才与连接绑定**」：一万个空闲连接不
 //! 再各自压着一个 recv buffer。移交 + 补充完整保留了这一点。
 
-use core::sync::atomic::{AtomicBool, AtomicU16, Ordering as CoreOrdering};
+use core::sync::atomic::{AtomicBool, Ordering as CoreOrdering};
 
 use veloq_std::{
     boxed::Box,
+    collections::BitSet,
     io, mem,
     num::NonZeroUsize,
     ptr::{self, NonNull},
@@ -28,7 +29,10 @@ use veloq_std::{
 use diagweave::prelude::*;
 use tracing::{debug, warn};
 use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
-use veloq_io_uring::{Submitter, cqueue, types::BufRingEntry};
+use veloq_io_uring::{
+    Submitter, cqueue,
+    types::{BufRingEntry, BufRingItem, ProvidedBufRing},
+};
 
 use crate::{
     config::{MAX_PROVIDED_BUF_ENTRIES, ProvidedBufConfig},
@@ -154,7 +158,18 @@ struct RingMapping {
 
 impl RingMapping {
     fn new(entries: u16) -> UringResult<Self> {
-        let bytes = entries as usize * size_of::<BufRingEntry>();
+        let bytes = match (entries as usize)
+            .checked_mul(size_of::<BufRingEntry>())
+            .filter(|length| *length != 0)
+        {
+            Some(bytes) => bytes,
+            None => {
+                return UringError::InvalidInput
+                    .push_ctx("scope", "uring.provided_buf.mmap")
+                    .with_ctx("entries", entries)
+                    .attach_note("provided buffer ring mapping length overflowed");
+            }
+        };
         // 内核要求环基址页对齐，mmap 天然满足；MAP_ANONYMOUS 还保证清零，于是 entry 0 的
         // `resv`（也就是环的 tail 字段）从 0 开始，与本地 `tail` 一致。
         let raw = unsafe {
@@ -170,6 +185,17 @@ impl RingMapping {
         if raw == libc::MAP_FAILED {
             return Err(UringError::Registration
                 .io_report("uring.provided_buf.mmap", io::Error::last_os_error()));
+        }
+        // No errno is downgraded here: without this policy the mapping could be inherited by a
+        // forked child while the parent still owns the kernel registration.
+        if unsafe { libc::madvise(raw, bytes, libc::MADV_DONTFORK) } != 0 {
+            let error = io::Error::last_os_error();
+            unsafe {
+                let _ = libc::munmap(raw, bytes);
+            }
+            return Err(
+                UringError::Registration.io_report("uring.provided_buf.madvise_dontfork", error)
+            );
         }
         Ok(Self {
             // SAFETY: `mmap` 只在返回 `MAP_FAILED` 时不给出有效指针，上面刚排除掉。
@@ -208,14 +234,21 @@ pub(crate) enum RingMappingOwnerState {
 /// allowed only after [`RingLifetimeOwner`] has proved that the io_uring fd is already gone.
 struct RingMappingOwner {
     mapping: RingMapping,
+    ring: ProvidedBufRing,
     state: RingMappingOwnerState,
     lifetime_token: RingLifetimeToken,
 }
 
 impl RingMappingOwner {
     fn new(entries: u16, lifetime_token: RingLifetimeToken) -> UringResult<Self> {
+        let mapping = RingMapping::new(entries)?;
+        let ring = unsafe { ProvidedBufRing::from_raw_parts(mapping.ptr.as_ptr(), entries) }
+            .map_err(|error| {
+                UringError::InvalidInput.io_report("uring.provided_buf.bind", error)
+            })?;
         Ok(Self {
-            mapping: RingMapping::new(entries)?,
+            mapping,
+            ring,
             state: RingMappingOwnerState::Unregistered,
             lifetime_token,
         })
@@ -223,8 +256,13 @@ impl RingMappingOwner {
 
     #[cfg(test)]
     fn new_registered_for_test(entries: u16, lifetime_token: RingLifetimeToken) -> Self {
+        let mapping = RingMapping::new(entries).expect("test ring mapping must be created");
         Self {
-            mapping: RingMapping::new(entries).expect("test ring mapping must be created"),
+            ring: unsafe {
+                ProvidedBufRing::from_raw_parts(mapping.ptr.as_ptr(), entries)
+                    .expect("test ring mapping must bind")
+            },
+            mapping,
             state: RingMappingOwnerState::Registered {
                 bgid: PROVIDED_BUF_GROUP_ID,
                 entries,
@@ -252,12 +290,12 @@ impl RingMappingOwner {
     }
 
     #[inline]
-    fn ptr(&self) -> NonNull<BufRingEntry> {
+    fn publish(&mut self, items: &[BufRingItem]) -> io::Result<()> {
         debug_assert!(matches!(
             self.state,
             RingMappingOwnerState::Registered { .. } | RingMappingOwnerState::UnregisterUnknown
         ));
-        self.mapping.ptr
+        self.ring.publish(items)
     }
 
     #[inline]
@@ -304,9 +342,6 @@ pub(crate) struct ProvidedBufGroup {
     ring_lifetime_token: RingLifetimeToken,
     registration_state: ProvidedBufRegistrationState,
     health: ProvidedBufGroupHealth,
-    mask: u16,
-    /// 本地 tail，写入环条目后以 release 语义同步到环的 tail 字段。
-    tail: u16,
     /// `bufs` 保存实际的 `FixedBuf` owner；`bid_states` 才说明这个 owner 是否已发布、被
     /// kernel 选中、交给用户或暂时空缺。两者必须通过状态方法一起变更。
     bufs: Box<[Option<FixedBuf>]>,
@@ -316,6 +351,15 @@ pub(crate) struct ProvidedBufGroup {
     last_publish_sequences: Box<[Option<u64>]>,
     /// 补充失败留下的空洞，等后续任一次完成顺手重试。
     vacant: Vec<u16>,
+    vacant_bids: BitSet,
+    /// 待批量发布的 bid，membership 由位图保证，避免重复 CQE/取消路径重复入队。
+    pending_publish: Vec<u16>,
+    pending_publish_bids: BitSet,
+    /// 其中哪些待发布 bid 是新分配的 buffer，用于在一次 tail 发布后更新统计。
+    pending_refill_bids: BitSet,
+    /// 处于 `KernelSelected` 短暂状态的 bid 数量，避免析构/取消检查扫描整张表。
+    selected_bids: BitSet,
+    selected_bid_count: usize,
     buf_size: NonZeroUsize,
     pool: AnyBufPool,
     stats: ProvidedBufStats,
@@ -379,12 +423,16 @@ impl ProvidedBufGroup {
             ring_lifetime_token,
             registration_state: ProvidedBufRegistrationState::Unregistered,
             health: ProvidedBufGroupHealth::Healthy,
-            mask: entries - 1,
-            tail: 0,
             bufs: (0..entries).map(|_| None).collect(),
             bid_states: (0..entries).map(|_| ProvidedBufBidState::Vacant).collect(),
             last_publish_sequences: (0..entries).map(|_| None).collect(),
             vacant: Vec::new(),
+            vacant_bids: BitSet::new(entries as usize),
+            pending_publish: Vec::new(),
+            pending_publish_bids: BitSet::new(entries as usize),
+            pending_refill_bids: BitSet::new(entries as usize),
+            selected_bids: BitSet::new(entries as usize),
+            selected_bid_count: 0,
             buf_size: config.buf_size,
             pool,
             stats: ProvidedBufStats::default(),
@@ -400,7 +448,7 @@ impl ProvidedBufGroup {
                 Some(buf) => group.store_driver_owned(bid, buf),
                 None => {
                     group.stats.refill_failed = group.stats.refill_failed.saturating_add(1);
-                    group.vacant.push(bid);
+                    group.queue_vacant(bid);
                 }
             }
         }
@@ -422,9 +470,14 @@ impl ProvidedBufGroup {
         // tail、available 和 refilled 统计语义。
         for bid in 0..entries {
             if group.has_unpublished_buf(bid) {
-                group.publish_driver_owned(bid);
-                group.stats.refilled = group.stats.refilled.saturating_add(1);
+                group.stage_driver_owned(bid, true);
             }
+        }
+        if !group.flush_pending_publish() {
+            return UringError::Registration
+                .push_ctx("scope", "uring.provided_buf.new")
+                .with_ctx("entries", entries)
+                .attach_note("provided buffer ring batch publication failed");
         }
 
         // 起始水位是「填满之后」的那个数，否则低水位线永远停在 0 而不说明任何事。
@@ -484,6 +537,9 @@ impl ProvidedBufGroup {
             self.queue_vacant(bid);
         }
         self.retry_vacant();
+        if !self.flush_pending_publish() {
+            self.quarantine();
+        }
         Some(buf)
     }
 
@@ -501,9 +557,17 @@ impl ProvidedBufGroup {
         }
         self.note_consumed();
         self.set_bid_state(bid, ProvidedBufBidState::DriverOwnedUnpublished);
-        self.publish_driver_owned(bid);
+        self.clear_selected(bid);
+        if !self.stage_driver_owned(bid, false) {
+            self.quarantine();
+            return true;
+        }
         self.stats.returned = self.stats.returned.saturating_add(1);
         self.retry_vacant();
+        if !self.flush_pending_publish() {
+            self.quarantine();
+            return true;
+        }
         false
     }
 
@@ -577,6 +641,7 @@ impl ProvidedBufGroup {
             return None;
         };
         self.set_bid_state(bid, ProvidedBufBidState::KernelSelected);
+        self.mark_selected(bid);
         self.note_consumed();
         Some(buf)
     }
@@ -600,12 +665,11 @@ impl ProvidedBufGroup {
         };
         *slot = Some(buf);
         self.set_bid_state(bid, ProvidedBufBidState::DriverOwnedUnpublished);
-        if !self.publish_driver_owned(bid) {
+        if !self.stage_driver_owned(bid, true) {
             self.bufs[bid as usize] = None;
             self.set_bid_state(bid, ProvidedBufBidState::Vacant);
             return false;
         }
-        self.stats.refilled = self.stats.refilled.saturating_add(1);
         true
     }
 
@@ -614,8 +678,12 @@ impl ProvidedBufGroup {
             return;
         }
         let mut pending = mem::take(&mut self.vacant);
-        pending.retain(|&bid| !self.refill(bid));
-        self.vacant = pending;
+        for bid in pending.drain(..) {
+            self.clear_vacant(bid);
+            if !self.refill(bid) {
+                self.queue_vacant(bid);
+            }
+        }
     }
 
     fn alloc_buf(&self) -> Option<FixedBuf> {
@@ -667,6 +735,7 @@ impl ProvidedBufGroup {
     fn mark_user_owned(&mut self, bid: u16) {
         if self.bid_states.get(bid as usize) == Some(&ProvidedBufBidState::KernelSelected) {
             self.set_bid_state(bid, ProvidedBufBidState::UserOwned);
+            self.clear_selected(bid);
         } else {
             self.note_bid_anomaly(bid, "handed out a provided bid that was not selected");
         }
@@ -674,9 +743,17 @@ impl ProvidedBufGroup {
 
     #[inline]
     fn queue_vacant(&mut self, bid: u16) {
-        if !self.vacant.contains(&bid) {
+        let index = bid as usize;
+        let is_queued = self.vacant_bids.get(index).unwrap_or(false);
+        if !is_queued {
+            debug_assert!(self.vacant_bids.set(index).is_ok());
             self.vacant.push(bid);
         }
+    }
+
+    #[inline]
+    fn clear_vacant(&mut self, bid: u16) {
+        debug_assert!(self.vacant_bids.clear(bid as usize).is_ok());
     }
 
     fn prepare_kernel_return(&mut self, bid: u16, flags: u32) -> bool {
@@ -702,6 +779,7 @@ impl ProvidedBufGroup {
             return false;
         }
         self.set_bid_state(bid, ProvidedBufBidState::KernelSelected);
+        self.mark_selected(bid);
         true
     }
 
@@ -744,8 +822,8 @@ impl ProvidedBufGroup {
         self.health = ProvidedBufGroupHealth::Quarantined;
     }
 
-    /// Publishes a buffer that is still owned by this group.
-    fn publish_driver_owned(&mut self, bid: u16) -> bool {
+    /// Stage a buffer that is still owned by this group for the next batch publication.
+    fn stage_driver_owned(&mut self, bid: u16, is_refill: bool) -> bool {
         debug_assert_eq!(
             self.registration_state,
             ProvidedBufRegistrationState::Registered,
@@ -758,45 +836,70 @@ impl ProvidedBufGroup {
             self.note_bid_anomaly(bid, "published a provided bid from an invalid state");
             return false;
         }
-        self.publish(bid)
+        let index = bid as usize;
+        if !self.pending_publish_bids.get(index).unwrap_or(false) {
+            if self.pending_publish_bids.set(index).is_err() {
+                self.note_bid_anomaly(bid, "staged a provided bid outside the publication ledger");
+                return false;
+            }
+            self.pending_publish.push(bid);
+        }
+        if is_refill {
+            debug_assert!(self.pending_refill_bids.set(index).is_ok());
+        }
+        true
     }
 
-    /// 把 `bid` 的 buffer 写进环并推进 tail。
-    fn publish(&mut self, bid: u16) -> bool {
-        let index = (self.tail & self.mask) as usize;
-        let (addr, len) = {
-            let Some(Some(buf)) = self.bufs.get_mut(bid as usize) else {
+    /// Write every staged entry and perform one release tail publication.
+    fn flush_pending_publish(&mut self) -> bool {
+        if self.pending_publish.is_empty() {
+            return true;
+        }
+
+        let mut items = Vec::with_capacity(self.pending_publish.len());
+        for &bid in &self.pending_publish {
+            let Some(Some(buf)) = self.bufs.get(bid as usize) else {
                 self.note_bid_anomaly(bid, "published a provided bid without a buffer owner");
                 return false;
             };
-            (buf.as_mut_ptr() as u64, buf.capacity() as u32)
-        };
-        let publish_seq = self.next_publish_sequence;
-        self.next_publish_sequence = self.next_publish_sequence.saturating_add(1);
-        if let Some(last_publish_sequence) = self.last_publish_sequences.get_mut(bid as usize) {
-            *last_publish_sequence = Some(publish_seq);
-        }
-        self.set_bid_state(bid, ProvidedBufBidState::KernelPublished { publish_seq });
-
-        // SAFETY: `index <= mask`，而映射里正好有 `mask + 1` 个条目。只写 addr/len/bid，
-        // 不碰 `resv`——entry 0 的 `resv` 就是环的 tail 字段（见 `BufRingEntry::tail`）。
-        unsafe {
-            let entry = &mut *self.ring.ptr().as_ptr().add(index);
-            entry.set_addr(addr);
-            entry.set_len(len);
-            entry.set_bid(bid);
+            let Ok(len) = u32::try_from(buf.capacity()) else {
+                self.note_bid_anomaly(bid, "provided buffer capacity exceeds the ring ABI");
+                return false;
+            };
+            // SAFETY: `buf` remains owned by this group until the kernel consumes the published
+            // entry; its allocation is writable for the complete capacity.
+            let Ok(item) = (unsafe { BufRingItem::new(buf.as_ptr() as u64, len, bid) }) else {
+                self.note_bid_anomaly(bid, "provided buffer descriptor is invalid");
+                return false;
+            };
+            items.push(item);
         }
 
-        self.tail = self.tail.wrapping_add(1);
-        // SAFETY: `ring.ptr` 指向环的第一个条目，正是 `BufRingEntry::tail` 要求的形参；
-        // 该字段 2 字节对齐且在映射范围内。release 保证条目内容先于 tail 对内核可见。
-        unsafe {
-            let tail_ptr = BufRingEntry::tail(self.ring.ptr().as_ptr()).cast_mut();
-            // `veloq_std` 尚未暴露 `AtomicU16::from_ptr`；这里是内核共享映射的原子 FFI 边界。
-            AtomicU16::from_ptr(tail_ptr).store(self.tail, CoreOrdering::Release);
+        if self.ring.publish(&items).is_err() {
+            self.note_bid_anomaly(0, "provided buffer batch publication was rejected");
+            return false;
         }
 
-        self.stats.available = self.stats.available.saturating_add(1);
+        let mut refilled = 0_u64;
+        for publish_index in 0..self.pending_publish.len() {
+            let bid = self.pending_publish[publish_index];
+            let index = bid as usize;
+            let publish_seq = self.next_publish_sequence;
+            self.next_publish_sequence = self.next_publish_sequence.saturating_add(1);
+            if let Some(last_publish_sequence) = self.last_publish_sequences.get_mut(index) {
+                *last_publish_sequence = Some(publish_seq);
+            }
+            self.set_bid_state(bid, ProvidedBufBidState::KernelPublished { publish_seq });
+            if self.pending_refill_bids.get(index).unwrap_or(false) {
+                refilled = refilled.saturating_add(1);
+            }
+            debug_assert!(self.pending_publish_bids.clear(index).is_ok());
+            debug_assert!(self.pending_refill_bids.clear(index).is_ok());
+        }
+        let published = self.pending_publish.len();
+        self.pending_publish.clear();
+        self.stats.available = self.stats.available.saturating_add(published as u16);
+        self.stats.refilled = self.stats.refilled.saturating_add(refilled);
         debug_assert!(self.bid_ledger_is_consistent());
         true
     }
@@ -812,6 +915,28 @@ impl ProvidedBufGroup {
     fn set_bid_state(&mut self, bid: u16, state: ProvidedBufBidState) {
         if let Some(current) = self.bid_states.get_mut(bid as usize) {
             *current = state;
+        }
+    }
+
+    #[inline]
+    fn mark_selected(&mut self, bid: u16) {
+        let index = bid as usize;
+        if self.bid_states.get(index).is_some() && !self.selected_bids.get(index).unwrap_or(false) {
+            debug_assert!(self.selected_bids.set(index).is_ok());
+            self.selected_bid_count = self.selected_bid_count.saturating_add(1);
+        } else {
+            self.note_bid_anomaly(bid, "selected a provided bid outside the state ledger");
+        }
+    }
+
+    #[inline]
+    fn clear_selected(&mut self, bid: u16) {
+        let index = bid as usize;
+        if self.selected_bid_count != 0 && self.selected_bids.get(index).unwrap_or(false) {
+            debug_assert!(self.selected_bids.clear(index).is_ok());
+            self.selected_bid_count -= 1;
+        } else {
+            self.note_bid_anomaly(bid, "cleared a provided bid without a selected owner");
         }
     }
 
@@ -841,8 +966,7 @@ impl ProvidedBufGroup {
     }
 
     pub(crate) fn has_selected_bids(&self) -> bool {
-        self.bid_states
-            .contains(&ProvidedBufBidState::KernelSelected)
+        self.selected_bid_count != 0
     }
 
     #[cfg(test)]
@@ -881,12 +1005,16 @@ pub(crate) fn test_group(entries: u16) -> ProvidedBufGroup {
         ring_lifetime_token,
         registration_state: ProvidedBufRegistrationState::Registered,
         health: ProvidedBufGroupHealth::Healthy,
-        mask: entries - 1,
-        tail: 0,
         bufs: (0..entries).map(|_| None).collect(),
         bid_states: (0..entries).map(|_| ProvidedBufBidState::Vacant).collect(),
         last_publish_sequences: (0..entries).map(|_| None).collect(),
         vacant: Vec::new(),
+        vacant_bids: BitSet::new(entries as usize),
+        pending_publish: Vec::new(),
+        pending_publish_bids: BitSet::new(entries as usize),
+        pending_refill_bids: BitSet::new(entries as usize),
+        selected_bids: BitSet::new(entries as usize),
+        selected_bid_count: 0,
         buf_size: NonZeroUsize::new(64).expect("test buffer size is non-zero"),
         pool: AnyBufPool::new(TestPool),
         stats: ProvidedBufStats::default(),
@@ -897,11 +1025,14 @@ pub(crate) fn test_group(entries: u16) -> ProvidedBufGroup {
     for bid in 0..entries {
         if let Some(buf) = group.alloc_buf() {
             group.store_driver_owned(bid, buf);
-            group.publish_driver_owned(bid);
+            group.stage_driver_owned(bid, true);
         }
     }
-    group.stats.available_low_water = entries;
-    group.stats.refilled = entries as u64;
+    assert!(
+        group.flush_pending_publish(),
+        "test publication must succeed"
+    );
+    group.stats.available_low_water = group.stats.available;
     group
 }
 
@@ -962,10 +1093,6 @@ mod tests {
             group.ring.state,
             super::RingMappingOwnerState::UnregisterUnknown
         );
-        let entry = unsafe { &mut *group.ring.ptr().as_ptr() };
-        entry.set_addr(original_ptr as u64);
-        entry.set_len(64);
-        entry.set_bid(0);
         group.bufs[0]
             .as_mut()
             .expect("failed unregister must retain the buffer")
@@ -983,7 +1110,7 @@ mod tests {
 
     #[test]
     fn allocation_failure_happens_before_registration() {
-        let ring = match IoUring::new(8) {
+        let mut ring = match IoUring::new(8) {
             Ok(ring) => ring,
             Err(_) => return,
         };
@@ -1010,7 +1137,7 @@ mod tests {
 
     #[test]
     fn registered_group_can_be_cleaned_after_an_injected_failure() {
-        let ring = match IoUring::new(8) {
+        let mut ring = match IoUring::new(8) {
             Ok(ring) => ring,
             Err(_) => return,
         };
@@ -1032,8 +1159,6 @@ mod tests {
             Err(failure) => failure,
         };
         let mut group = failure.group;
-        let entry = unsafe { &mut *group.ring.ptr().as_ptr() };
-        entry.set_bid(0);
         group.bufs[0]
             .as_mut()
             .expect("registered group retains its buffer")
@@ -1105,5 +1230,51 @@ mod tests {
         ));
         assert_eq!(group.stats.available, 2);
         assert_eq!(group.bid_anomalies, 0);
+    }
+
+    #[test]
+    fn vacancy_membership_is_constant_time_and_refills_as_one_batch() {
+        let mut group = test_group(4);
+        for bid in [0, 1] {
+            drop(group.bufs[bid].take());
+            group.set_bid_state(bid as u16, super::ProvidedBufBidState::Vacant);
+            group.note_consumed();
+            group.queue_vacant(bid as u16);
+            group.queue_vacant(bid as u16);
+        }
+
+        let before = group.stats;
+        group.retry_vacant();
+
+        assert!(group.flush_pending_publish());
+        assert_eq!(group.stats.available, 4);
+        assert_eq!(group.stats.refilled, before.refilled + 2);
+        assert_eq!(group.vacant.len(), 0);
+        assert!(group.vacant_bids.get(0).is_ok_and(|set| !set));
+        assert!(group.vacant_bids.get(1).is_ok_and(|set| !set));
+        assert!(matches!(
+            group.bid_state(0),
+            Some(super::ProvidedBufBidState::KernelPublished { .. })
+        ));
+        assert!(matches!(
+            group.bid_state(1),
+            Some(super::ProvidedBufBidState::KernelPublished { .. })
+        ));
+        assert_eq!(group.bid_anomalies, 0);
+    }
+
+    #[test]
+    fn repeated_cancel_returns_never_duplicates_a_bid() {
+        let mut group = test_group(8);
+        for round in 0..1024_u32 {
+            let bid = round % 8;
+            let flags = 1 | (bid << 16);
+            assert!(!group.return_selected(flags));
+            assert_eq!(group.stats.available, 8);
+            assert_eq!(group.selected_bid_count, 0);
+        }
+        assert_eq!(group.stats.returned, 1024);
+        assert_eq!(group.bid_anomalies, 0);
+        assert!(group.bid_ledger_is_consistent());
     }
 }

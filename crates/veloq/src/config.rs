@@ -6,6 +6,9 @@ pub use veloq_driver_native::config::{
     UringDriveLimits,
 };
 
+#[cfg(not(windows))]
+pub use veloq_driver_native::config::{SetupFlags, SetupPolicy};
+
 #[derive(Debug, Clone)]
 pub struct Config {
     #[cfg(not(windows))]

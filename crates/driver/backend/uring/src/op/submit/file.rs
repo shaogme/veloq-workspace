@@ -15,7 +15,7 @@ use veloq_driver_core::driver::SubmitTokenContext;
 use veloq_io_uring::{opcode, squeue, types};
 use veloq_std::{pin::Pin, string::ToString};
 
-use super::{invalid_buf_io_range, resolve_any_fd, resolve_file_fd, sqe_with_fd};
+use super::{invalid_buf_io_range, opcode_build, resolve_any_fd, resolve_file_fd, sqe_with_fd};
 
 pub(crate) unsafe fn make_sqe_read_fixed(
     _kernel: Pin<&mut KernelRef<ReadFixed>>,
@@ -40,15 +40,21 @@ pub(crate) unsafe fn make_sqe_read_fixed(
 
     if is_registered {
         let fixed_idx = region_info.id.raw();
-        Ok(sqe_with_fd!(fd, |f| opcode::ReadFixed::new(
-            f, ptr, len, fixed_idx
-        )
-        .offset(offset)
-        .build()))
-    } else {
-        Ok(sqe_with_fd!(fd, |f| opcode::Read::new(f, ptr, len)
+        opcode_build(
+            "uring.op.submit.read_fixed_opcode",
+            sqe_with_fd!(fd, |f| unsafe {
+                opcode::ReadFixed::new(f, ptr, len, fixed_idx)
+            }
             .offset(offset)
-            .build()))
+            .build()),
+        )
+    } else {
+        opcode_build(
+            "uring.op.submit.read_opcode",
+            sqe_with_fd!(fd, |f| unsafe { opcode::Read::new(f, ptr, len) }
+                .offset(offset)
+                .build()),
+        )
     }
 }
 
@@ -70,13 +76,19 @@ pub(crate) unsafe fn make_sqe_read_raw(
 
     if is_registered {
         let fixed_idx = region_info.id.raw();
-        Ok(opcode::ReadFixed::new(types::Fd(fd), ptr, len, fixed_idx)
-            .offset(rw_op.offset)
-            .build())
+        opcode_build(
+            "uring.op.submit.read_raw_fixed_opcode",
+            unsafe { opcode::ReadFixed::new(types::Fd(fd), ptr, len, fixed_idx) }
+                .offset(rw_op.offset)
+                .build(),
+        )
     } else {
-        Ok(opcode::Read::new(types::Fd(fd), ptr, len)
-            .offset(rw_op.offset)
-            .build())
+        opcode_build(
+            "uring.op.submit.read_raw_opcode",
+            unsafe { opcode::Read::new(types::Fd(fd), ptr, len) }
+                .offset(rw_op.offset)
+                .build(),
+        )
     }
 }
 
@@ -103,15 +115,21 @@ pub(crate) unsafe fn make_sqe_write_fixed(
 
     if is_registered {
         let fixed_idx = region_info.id.raw();
-        Ok(sqe_with_fd!(fd, |f| opcode::WriteFixed::new(
-            f, ptr, len, fixed_idx
-        )
-        .offset(offset)
-        .build()))
-    } else {
-        Ok(sqe_with_fd!(fd, |f| opcode::Write::new(f, ptr, len)
+        opcode_build(
+            "uring.op.submit.write_fixed_opcode",
+            sqe_with_fd!(fd, |f| unsafe {
+                opcode::WriteFixed::new(f, ptr, len, fixed_idx)
+            }
             .offset(offset)
-            .build()))
+            .build()),
+        )
+    } else {
+        opcode_build(
+            "uring.op.submit.write_opcode",
+            sqe_with_fd!(fd, |f| unsafe { opcode::Write::new(f, ptr, len) }
+                .offset(offset)
+                .build()),
+        )
     }
 }
 
@@ -133,13 +151,19 @@ pub(crate) unsafe fn make_sqe_write_raw(
 
     if is_registered {
         let fixed_idx = region_info.id.raw();
-        Ok(opcode::WriteFixed::new(types::Fd(fd), ptr, len, fixed_idx)
-            .offset(rw_op.offset)
-            .build())
+        opcode_build(
+            "uring.op.submit.write_raw_fixed_opcode",
+            unsafe { opcode::WriteFixed::new(types::Fd(fd), ptr, len, fixed_idx) }
+                .offset(rw_op.offset)
+                .build(),
+        )
     } else {
-        Ok(opcode::Write::new(types::Fd(fd), ptr, len)
-            .offset(rw_op.offset)
-            .build())
+        opcode_build(
+            "uring.op.submit.write_raw_opcode",
+            unsafe { opcode::Write::new(types::Fd(fd), ptr, len) }
+                .offset(rw_op.offset)
+                .build(),
+        )
     }
 }
 
@@ -172,7 +196,7 @@ pub(crate) unsafe fn make_sqe_close(
             .attach_note("borrowed fd Close rejected"));
     }
     let fd = resolve_any_fd(env.file_table, close_op.fd, scope)?;
-    Ok(sqe_with_fd!(fd, |f| opcode::Close::new(f).build()))
+    opcode_build(scope, sqe_with_fd!(fd, |f| opcode::Close::new(f).build()))
 }
 
 pub(crate) unsafe fn make_sqe_fsync(
@@ -192,9 +216,10 @@ pub(crate) unsafe fn make_sqe_fsync(
         fsync_op.fd,
         "uring.op.submit.make_sqe_fsync",
     )?;
-    Ok(sqe_with_fd!(fd, |f| opcode::Fsync::new(f)
-        .flags(flags)
-        .build()))
+    opcode_build(
+        "uring.op.submit.fsync_opcode",
+        sqe_with_fd!(fd, |f| opcode::Fsync::new(f).flags(flags).build()),
+    )
 }
 
 pub(crate) unsafe fn make_sqe_fsync_raw(
@@ -210,7 +235,10 @@ pub(crate) unsafe fn make_sqe_fsync_raw(
     };
 
     let fd = fsync_op.fd.as_fd();
-    Ok(opcode::Fsync::new(types::Fd(fd)).flags(flags).build())
+    opcode_build(
+        "uring.op.submit.fsync_raw_opcode",
+        opcode::Fsync::new(types::Fd(fd)).flags(flags).build(),
+    )
 }
 
 pub(crate) unsafe fn make_sqe_sync_range(
@@ -238,10 +266,13 @@ pub(crate) unsafe fn make_sqe_sync_range(
         sync_op.fd,
         "uring.op.submit.make_sqe_sync_range",
     )?;
-    Ok(sqe_with_fd!(fd, |f| opcode::SyncFileRange::new(f, nbytes)
-        .offset(sync_op.offset)
-        .flags(sync_op.flags)
-        .build()))
+    opcode_build(
+        "uring.op.submit.sync_range_opcode",
+        sqe_with_fd!(fd, |f| opcode::SyncFileRange::new(f, nbytes)
+            .offset(sync_op.offset)
+            .flags(sync_op.flags)
+            .build()),
+    )
 }
 
 pub(crate) unsafe fn make_sqe_sync_range_raw(
@@ -265,10 +296,13 @@ pub(crate) unsafe fn make_sqe_sync_range_raw(
     };
 
     let fd = sync_op.fd.as_fd();
-    Ok(opcode::SyncFileRange::new(types::Fd(fd), nbytes)
-        .offset(sync_op.offset)
-        .flags(sync_op.flags)
-        .build())
+    opcode_build(
+        "uring.op.submit.sync_range_raw_opcode",
+        opcode::SyncFileRange::new(types::Fd(fd), nbytes)
+            .offset(sync_op.offset)
+            .flags(sync_op.flags)
+            .build(),
+    )
 }
 
 pub(crate) unsafe fn make_sqe_fallocate(
@@ -282,13 +316,13 @@ pub(crate) unsafe fn make_sqe_fallocate(
         fallocate_op.fd,
         "uring.op.submit.make_sqe_fallocate",
     )?;
-    Ok(sqe_with_fd!(fd, |f| opcode::Fallocate::new(
-        f,
-        fallocate_op.len
+    opcode_build(
+        "uring.op.submit.fallocate_opcode",
+        sqe_with_fd!(fd, |f| opcode::Fallocate::new(f, fallocate_op.len)
+            .offset(fallocate_op.offset)
+            .mode(fallocate_op.mode)
+            .build()),
     )
-    .offset(fallocate_op.offset)
-    .mode(fallocate_op.mode)
-    .build()))
 }
 
 pub(crate) unsafe fn make_sqe_fallocate_raw(
@@ -298,10 +332,13 @@ pub(crate) unsafe fn make_sqe_fallocate_raw(
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let fd = fallocate_op.fd.as_fd();
-    Ok(opcode::Fallocate::new(types::Fd(fd), fallocate_op.len)
-        .offset(fallocate_op.offset)
-        .mode(fallocate_op.mode)
-        .build())
+    opcode_build(
+        "uring.op.submit.fallocate_raw_opcode",
+        opcode::Fallocate::new(types::Fd(fd), fallocate_op.len)
+            .offset(fallocate_op.offset)
+            .mode(fallocate_op.mode)
+            .build(),
+    )
 }
 
 pub(crate) unsafe fn make_sqe_open(
@@ -311,10 +348,13 @@ pub(crate) unsafe fn make_sqe_open(
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
     let path_ptr = user.path.as_slice().as_ptr() as *const _;
-    Ok(opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path_ptr)
-        .flags(user.flags)
-        .mode(user.mode)
-        .build())
+    opcode_build(
+        "uring.op.submit.openat_opcode",
+        unsafe { opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path_ptr) }
+            .flags(user.flags)
+            .mode(user.mode)
+            .build(),
+    )
 }
 
 pub(crate) fn opened_handle_from_res(res: UringResult<usize>) -> UringResult<OwnedRawHandle> {

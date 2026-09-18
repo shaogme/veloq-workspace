@@ -365,15 +365,10 @@ fn linux_native_command(
         args.push(f.into());
     }
 
-    append_packages(&mut args, package);
+    append_workspace_packages(&mut args, Target::Linux, package);
 
     match task {
         Task::Test => {
-            if package.is_none() {
-                args.push("--workspace".into());
-                args.push("--exclude".into());
-                args.push("veloq-driver-iocp".into());
-            }
             args.extend(vec![
                 "--test-threads".into(),
                 "1".into(),
@@ -415,6 +410,23 @@ fn append_packages(args: &mut Vec<String>, packages: Option<&str>) {
     }
 }
 
+fn append_workspace_packages(args: &mut Vec<String>, target: Target, package: Option<&str>) {
+    append_packages(args, package);
+    if package.is_some() {
+        return;
+    }
+
+    args.push("--workspace".into());
+    let excluded = match target {
+        Target::Linux => ["veloq-driver-iocp"].as_slice(),
+        Target::Windows => ["veloq-driver-uring", "veloq-io-uring"].as_slice(),
+    };
+    for package in excluded {
+        args.push("--exclude".into());
+        args.push((*package).into());
+    }
+}
+
 fn windows_native_command(
     task: Task,
     features: Option<&str>,
@@ -438,15 +450,10 @@ fn windows_native_command(
         args.push(f.into());
     }
 
-    append_packages(&mut args, package);
+    append_workspace_packages(&mut args, Target::Windows, package);
 
     match task {
         Task::Test => {
-            if package.is_none() {
-                args.push("--workspace".into());
-                args.push("--exclude".into());
-                args.push("veloq-driver-uring".into());
-            }
             args.extend(vec![
                 "--test-threads".into(),
                 "1".into(),
@@ -506,4 +513,41 @@ fn determine_mode(target: Target, workspace_root: &Path) -> Result<RunMode, Runn
     }
 
     Ok(RunMode::Native)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_routes_exclude_only_incompatible_backend_packages() {
+        for task in [Task::Test, Task::Clippy, Task::Check] {
+            let linux = linux_native_command(task, None, false, None, None, None);
+            assert!(linux.args.contains(&"--workspace".into()));
+            assert!(linux.args.contains(&"veloq-driver-iocp".into()));
+            assert!(!linux.args.contains(&"veloq-driver-uring".into()));
+
+            let windows = windows_native_command(task, None, false, None, None, None);
+            assert!(windows.args.contains(&"--workspace".into()));
+            assert!(windows.args.contains(&"veloq-driver-uring".into()));
+            assert!(windows.args.contains(&"veloq-io-uring".into()));
+            assert!(!windows.args.contains(&"veloq-driver-iocp".into()));
+        }
+    }
+
+    #[test]
+    fn explicit_packages_do_not_change_workspace_scope() {
+        let command = windows_native_command(
+            Task::Check,
+            None,
+            false,
+            None,
+            Some("veloq-driver-iocp"),
+            None,
+        );
+
+        assert!(command.args.contains(&"--package".into()));
+        assert!(!command.args.contains(&"--workspace".into()));
+        assert!(!command.args.contains(&"--exclude".into()));
+    }
 }

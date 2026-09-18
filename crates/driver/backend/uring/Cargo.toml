@@ -28,7 +28,7 @@ loom = [
     "veloq-wheel/loom",
 ]
 
-[dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 veloq-std.workspace = true
 veloq-io-uring.workspace = true
 veloq-driver-core.workspace = true

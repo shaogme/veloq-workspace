@@ -1,14 +1,49 @@
 //! Completion queue access for the Linux shared ring.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::{marker::PhantomData, mem::size_of, sync::atomic::Ordering};
 
-use crate::{mmap::Mmap, sys};
+use veloq_std::io::{Error, Result};
+
+use crate::{mmap::Mmap, squeue::SharedAtomicU32, sys};
 
 /// The 16-byte completion queue entry defined by the Linux ABI.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Entry {
     pub(crate) inner: sys::IoUringCqe,
+}
+
+/// Flags returned in a completion queue entry.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Flags(u32);
+
+impl Flags {
+    /// The completion selected a buffer from a provided-buffer ring.
+    pub const BUFFER: Self = Self(sys::IORING_CQE_F_BUFFER);
+    /// The originating request remains active after this completion.
+    pub const MORE: Self = Self(sys::IORING_CQE_F_MORE);
+    /// The socket still has data available.
+    pub const SOCK_NONEMPTY: Self = Self(sys::IORING_CQE_F_SOCK_NONEMPTY);
+    /// The completion is a zerocopy notification.
+    pub const NOTIF: Self = Self(sys::IORING_CQE_F_NOTIF);
+    /// More buffers remain in the selected buffer bundle.
+    pub const BUF_MORE: Self = Self(sys::IORING_CQE_F_BUF_MORE);
+
+    #[inline]
+    pub const fn from_bits_retain(bits: u32) -> Self {
+        Self(bits)
+    }
+
+    #[inline]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
 }
 
 impl Entry {
@@ -31,7 +66,7 @@ impl Entry {
 /// Return the buffer id encoded in CQE flags, if a buffer was selected.
 #[inline]
 pub fn buffer_select(flags: u32) -> Option<u16> {
-    if flags & sys::IORING_CQE_F_BUFFER == 0 {
+    if !Flags::from_bits_retain(flags).contains(Flags::BUFFER) {
         None
     } else {
         Some((flags >> sys::IORING_CQE_BUFFER_SHIFT) as u16)
@@ -41,36 +76,63 @@ pub fn buffer_select(flags: u32) -> Option<u16> {
 /// Whether a CQE belongs to a multishot request that remains active.
 #[inline]
 pub fn more(flags: u32) -> bool {
-    flags & sys::IORING_CQE_F_MORE != 0
+    Flags::from_bits_retain(flags).contains(Flags::MORE)
 }
 
 pub(crate) struct Inner {
-    head: *const AtomicU32,
-    tail: *const AtomicU32,
+    head: SharedAtomicU32,
+    tail: SharedAtomicU32,
     ring_mask: u32,
     ring_entries: u32,
-    overflow: *const AtomicU32,
+    overflow: SharedAtomicU32,
     cqes: *const Entry,
-    flags: *const AtomicU32,
+    flags: SharedAtomicU32,
 }
 
 impl Inner {
     /// Bind queue pointers to kernel-provided offsets in the mapped ring.
-    pub(crate) unsafe fn new(cq_mmap: &Mmap, params: &sys::IoUringParams) -> Self {
-        let head = unsafe { cq_mmap.offset(params.cq_off.head).cast() };
-        let tail = unsafe { cq_mmap.offset(params.cq_off.tail).cast() };
-        let ring_mask = unsafe { cq_mmap.offset(params.cq_off.ring_mask).cast::<u32>().read() };
+    pub(crate) unsafe fn new(cq_mmap: &Mmap, params: &sys::IoUringParams) -> Result<Self> {
+        let head = unsafe {
+            SharedAtomicU32::from_ptr(cq_mmap.range(params.cq_off.head, size_of::<u32>())?.cast())
+        };
+        let tail = unsafe {
+            SharedAtomicU32::from_ptr(cq_mmap.range(params.cq_off.tail, size_of::<u32>())?.cast())
+        };
+        let ring_mask = unsafe {
+            cq_mmap
+                .range(params.cq_off.ring_mask, size_of::<u32>())?
+                .cast::<u32>()
+                .read_volatile()
+        };
         let ring_entries = unsafe {
             cq_mmap
-                .offset(params.cq_off.ring_entries)
+                .range(params.cq_off.ring_entries, size_of::<u32>())?
                 .cast::<u32>()
-                .read()
+                .read_volatile()
         };
-        let overflow = unsafe { cq_mmap.offset(params.cq_off.overflow).cast() };
-        let cqes = unsafe { cq_mmap.offset(params.cq_off.cqes).cast() };
-        let flags = unsafe { cq_mmap.offset(params.cq_off.flags).cast() };
+        if ring_entries == 0
+            || !ring_entries.is_power_of_two()
+            || ring_entries != params.cq_entries
+            || ring_mask != ring_entries - 1
+        {
+            return Err(Error::from_raw_os_error(libc::EINVAL));
+        }
+        let overflow = unsafe {
+            SharedAtomicU32::from_ptr(
+                cq_mmap
+                    .range(params.cq_off.overflow, size_of::<u32>())?
+                    .cast(),
+            )
+        };
+        let cqes_len = (ring_entries as usize)
+            .checked_mul(size_of::<Entry>())
+            .ok_or_else(|| Error::from_raw_os_error(libc::EOVERFLOW))?;
+        let cqes = cq_mmap.range(params.cq_off.cqes, cqes_len)?.cast();
+        let flags = unsafe {
+            SharedAtomicU32::from_ptr(cq_mmap.range(params.cq_off.flags, size_of::<u32>())?.cast())
+        };
 
-        Self {
+        Ok(Self {
             head,
             tail,
             ring_mask,
@@ -78,15 +140,16 @@ impl Inner {
             overflow,
             cqes,
             flags,
-        }
+        })
     }
 
     #[inline]
-    pub(crate) unsafe fn borrow(&self) -> CompletionQueue<'_> {
+    pub(crate) fn borrow(&mut self) -> CompletionQueue<'_> {
         CompletionQueue {
-            head: unsafe { self.head.cast::<u32>().read_volatile() },
-            tail: unsafe { (*self.tail).load(Ordering::Acquire) },
+            head: self.head.load_volatile(),
+            tail: self.tail.load(Ordering::Acquire),
             queue: self,
+            _owner: PhantomData,
         }
     }
 }
@@ -96,21 +159,20 @@ pub struct CompletionQueue<'ring> {
     head: u32,
     tail: u32,
     queue: &'ring Inner,
+    _owner: PhantomData<&'ring mut Inner>,
 }
 
 impl CompletionQueue<'_> {
     /// Publish consumed CQEs and refresh the kernel-owned tail.
     #[inline]
     pub fn sync(&mut self) {
-        unsafe {
-            (*self.queue.head).store(self.head, Ordering::Release);
-            self.tail = (*self.queue.tail).load(Ordering::Acquire);
-        }
+        self.queue.head.store(self.head, Ordering::Release);
+        self.tail = self.queue.tail.load(Ordering::Acquire);
     }
 
     #[inline]
     pub fn overflow(&self) -> u32 {
-        unsafe { (*self.queue.overflow).load(Ordering::Acquire) }
+        self.queue.overflow.load(Ordering::Acquire)
     }
 
     #[inline]
@@ -150,9 +212,7 @@ impl CompletionQueue<'_> {
     /// Whether CQ eventfd notifications are disabled for this ring.
     #[inline]
     pub fn eventfd_disabled(&self) -> bool {
-        unsafe {
-            (*self.queue.flags).load(Ordering::Acquire) & sys::IORING_CQ_EVENTFD_DISABLED != 0
-        }
+        self.queue.flags.load(Ordering::Acquire) & sys::IORING_CQ_EVENTFD_DISABLED != 0
     }
 }
 
@@ -175,9 +235,7 @@ impl ExactSizeIterator for CompletionQueue<'_> {
 impl Drop for CompletionQueue<'_> {
     #[inline]
     fn drop(&mut self) {
-        unsafe {
-            (*self.queue.head).store(self.head, Ordering::Release);
-        }
+        self.queue.head.store(self.head, Ordering::Release);
     }
 }
 
@@ -204,16 +262,17 @@ mod tests {
             },
         }];
         let inner = Inner {
-            head: &head,
-            tail: &tail,
+            head: unsafe { SharedAtomicU32::from_ptr(&head) },
+            tail: unsafe { SharedAtomicU32::from_ptr(&tail) },
             ring_mask: 0,
             ring_entries: 1,
-            overflow: &overflow,
+            overflow: unsafe { SharedAtomicU32::from_ptr(&overflow) },
             cqes: entries.as_mut_ptr(),
-            flags: &flags,
+            flags: unsafe { SharedAtomicU32::from_ptr(&flags) },
         };
 
-        let mut queue = unsafe { inner.borrow() };
+        let mut inner = inner;
+        let mut queue = inner.borrow();
         let entry = queue.next().expect("one CQE");
         assert_eq!(entry.user_data(), 42);
         assert_eq!(entry.result(), -libc::EAGAIN);
@@ -229,5 +288,33 @@ mod tests {
     fn buffer_helpers_ignore_unrelated_flags() {
         assert_eq!(buffer_select(0), None);
         assert!(!more(0));
+    }
+
+    #[test]
+    fn wraparound_and_overflow_are_visible_without_losing_cqes() {
+        let head = AtomicU32::new(u32::MAX);
+        let tail = AtomicU32::new(1);
+        let overflow = AtomicU32::new(12);
+        let flags = AtomicU32::new(0);
+        let mut entries = [Entry::default(); 2];
+        entries[1].inner.user_data = 99;
+        let mut inner = Inner {
+            head: unsafe { SharedAtomicU32::from_ptr(&head) },
+            tail: unsafe { SharedAtomicU32::from_ptr(&tail) },
+            ring_mask: 1,
+            ring_entries: 2,
+            overflow: unsafe { SharedAtomicU32::from_ptr(&overflow) },
+            cqes: entries.as_mut_ptr(),
+            flags: unsafe { SharedAtomicU32::from_ptr(&flags) },
+        };
+
+        let mut queue = inner.borrow();
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.next().expect("wrapped CQE").user_data(), 99);
+        assert_eq!(queue.next().expect("second CQE").user_data(), 0);
+        assert_eq!(queue.overflow(), 12);
+        assert!(queue.is_empty());
+        drop(queue);
+        assert_eq!(head.load(Ordering::Acquire), 1);
     }
 }

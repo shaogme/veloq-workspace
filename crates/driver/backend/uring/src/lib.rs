@@ -1,3 +1,4 @@
+#![cfg(any(target_os = "linux", target_os = "android"))]
 #![no_std]
 #![deny(warnings)]
 
@@ -14,9 +15,12 @@ mod test_alloc;
 pub use config::{
     BorrowedRawHandle, BufferRegistrationMode, DirectOwnerId, FileTableExhaustion, IoFd, IoMode,
     MAX_PROVIDED_BUF_ENTRIES, OwnedRawHandle, ProvidedBufConfig, RawHandle, RawHandleKind,
-    SockAddrStorage, UringConfig, UringDriveLimits, UringRawHandle,
+    SetupFlags, SetupPolicy, SockAddrStorage, UringConfig, UringDriveLimits, UringRawHandle,
 };
-pub use diagnostics::{UringCompletionDiagnostics, UringCompletionDiagnosticsSnapshot};
+pub use diagnostics::{
+    KERNEL_BASELINE, UringCapabilitySnapshot, UringCompletionDiagnostics,
+    UringCompletionDiagnosticsSnapshot, UringSetupSnapshot,
+};
 pub use driver::{ProvidedBufStats, UringDriver, UringOpState};
 pub use error::{UringError, UringResult};
 pub use net::{Socket, peer_addr_of_handle, socket_addr_to_storage, to_socket_addr};
