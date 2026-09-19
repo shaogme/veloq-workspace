@@ -1,7 +1,7 @@
 //! provided buffer ring 的驱动级测试。
 //!
-//! 每个用例都会在缺 `IORING_REGISTER_PBUF_RING` 的内核（< 5.19）上自行跳过——那是仓库声明
-//! 支持的区间的一部分，不是失败。
+//! 每个用例都要求 driver 实际建立 provided buffer ring；是否可用由真实注册结果决定，
+//! 不通过能力快照提前判断。
 
 use veloq_std::{
     any, io,
@@ -46,10 +46,10 @@ fn new_driver_or_skip(entries: u16, buf_size: usize) -> Option<UringDriver<'stat
     let config = UringConfig {
         entries: NonZeroU32::new(64).unwrap(),
         drive_limits: UringDriveLimits::for_entries(64),
-        provided_buffers: Some(ProvidedBufConfig {
+        provided_buffers: ProvidedBufConfig {
             entries: NonZeroU16::new(entries).unwrap(),
             buf_size: NonZeroUsize::new(buf_size).unwrap(),
-        }),
+        },
         ..UringConfig::default()
     };
     static REGISTRAR: NoopRegistrar = NoopRegistrar;
@@ -65,8 +65,8 @@ fn new_driver_or_skip(entries: u16, buf_size: usize) -> Option<UringDriver<'stat
         .attach_buffer_pool(AnyBufPool::new(HeapPool))
         .expect("attaching a buffer pool must not fail");
 
-    if !driver.capabilities().provided_buffers {
-        eprintln!("skipping provided-buffer test: kernel has no IORING_REGISTER_PBUF_RING");
+    if driver.provided_buf_stats().is_none() {
+        eprintln!("skipping provided-buffer test: provided buffer ring registration unavailable");
         return None;
     }
     Some(driver)
@@ -153,8 +153,7 @@ fn submit_recv_provided(driver: &mut UringDriver<'static>, fd: IoFd) -> OpToken 
 
 /// 提交一条 multishot recv。
 ///
-/// 返回 `None` 表示内核不认识它——`IORING_OP_RECV` 从 5.6 就在，它的 multishot 变体要 6.0，
-/// 而仓库声明的最低内核是 5.6，所以那是支持区间的一部分而不是失败。
+/// 返回 `None` 表示真实提交返回了不支持错误。
 ///
 /// 判据是「提交之后立刻有没有一条完成」：被接受的 multishot 在数据到来之前什么都不产出，
 /// 被拒绝的那条 `-EINVAL` 由 `io_uring_enter` 同步产生，第一次 drive 就在队列里。
@@ -230,7 +229,7 @@ fn take_completion(driver: &mut UringDriver<'static>, token: OpToken) -> (i32, O
                 cleanup.disarm();
                 let provided =
                     <RecvProvided as IntoPlatformOp<UringSlotSpec>>::try_record_from_erased(
-                        payload,
+                        payload.expect("provided-buffer completion payload"),
                     )
                     .expect("a RecvProvided completion must carry a ProvidedBuf");
                 let buf = provided.buf;

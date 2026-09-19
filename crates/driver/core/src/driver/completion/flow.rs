@@ -153,11 +153,38 @@ where
         effect: Effect,
     },
 
+    /// Publish one successful record and then a payload-free terminal error.
+    ///
+    /// This is the core settlement for a multishot replacement failure. The first record is
+    /// admitted before the terminal error, so an accepted handle or receive buffer can never be
+    /// lost merely because the next request could not be armed.
+    UserThenTerminal {
+        event: UserCompletionEvent,
+        payload: SlotPayload<Spec>,
+        detail: Option<DriverResult<SlotCompletion<Spec>, SlotError<Spec>>>,
+        cleanup: CompletionCleanupGuard,
+        effect: Effect,
+        terminal_event: UserCompletionEvent,
+        terminal_error: Report<SlotError<Spec>>,
+        terminal_cleanup: CompletionCleanupGuard,
+        terminal_effect: Effect,
+    },
+
     Cleanup {
         cleanup: CompletionCleanupGuard,
         /// 同 [`CompletionSettlement::User`]：一个**已放弃**的 multishot 仍然会一条条
         /// 投递完成，每一条都要跑 cleanup，但只有最后一条才能归还 slot。
         continuation: CompletionContinuation,
+        effect: Effect,
+    },
+    /// The kernel arm ended, but the logical operation remains owned and will be rearmed.
+    ///
+    /// This is intentionally separate from [`CompletionSettlement::Cleanup`].  A retained
+    /// completion has no user record at all, so publishing an empty record would wake the
+    /// consumer and make it observe a fake datagram.  The slot stays addressable and its
+    /// operation payload remains pinned while the backend effect queues the rearm.
+    Retained {
+        cleanup: CompletionCleanupGuard,
         effect: Effect,
     },
     Anomaly {
@@ -530,6 +557,58 @@ where
             }
             Ok(completion_progress_from_record(record))
         }
+        CompletionSettlement::UserThenTerminal {
+            event,
+            payload,
+            detail,
+            cleanup,
+            effect,
+            terminal_event,
+            terminal_error,
+            terminal_cleanup,
+            terminal_effect,
+        } => {
+            let mut error = hooks.finish_backend_effect(effect).err();
+            let user_record = record_user_completion::<Spec>(
+                table,
+                diagnostics,
+                CompletionPacket::<Spec>::user_with_cleanup(event, payload, detail, cleanup)
+                    .with_continuation(CompletionContinuation::More),
+            );
+
+            error = merge_settlement_error::<Spec>(
+                error,
+                hooks.finish_backend_effect(terminal_effect).err(),
+            );
+            let terminal_record = record_terminal_completion::<Spec>(
+                table,
+                diagnostics,
+                CompletionPacket::<Spec>::terminal_with_cleanup(
+                    terminal_event,
+                    Err(terminal_error),
+                    terminal_cleanup,
+                ),
+            );
+            if terminal_event.token() == event.token() {
+                error = merge_settlement_error::<Spec>(
+                    error,
+                    finish_waiting_if_needed(registry, finalize, terminal_event).err(),
+                );
+            } else {
+                error = merge_settlement_error::<Spec>(
+                    error,
+                    Some(invalid_failure_disposition::<Spec>(
+                        "terminal completion token differs from successful record",
+                    )),
+                );
+            }
+            if let Some(error) = error {
+                return Err(error);
+            }
+            let mut progress = completion_progress_from_record(user_record);
+            progress.merge(completion_progress_from_record(terminal_record));
+            Ok(progress)
+        }
         CompletionSettlement::Cleanup {
             mut cleanup,
             continuation,
@@ -563,6 +642,22 @@ where
                 return Err(error);
             }
             Ok(CompletionFlowOutcome::orphan_cleaned())
+        }
+        CompletionSettlement::Retained {
+            mut cleanup,
+            effect,
+        } => {
+            let mut error = hooks.finish_backend_effect(effect).err();
+            error = merge_settlement_error::<Spec>(
+                error,
+                run_settlement_cleanup::<Spec>(diagnostics, &mut cleanup),
+            );
+            if let Some(error) = error {
+                return Err(error);
+            }
+            // No record was published and no finalization is attempted.  The waiting/orphaned
+            // slot remains addressable for the rearmed logical operation.
+            Ok(CompletionFlowOutcome::internal())
         }
         CompletionSettlement::Anomaly {
             kind,
@@ -751,6 +846,21 @@ where
             outcome
         }
     }
+}
+
+fn record_terminal_completion<Spec>(
+    table: &SharedCompletionTable<Spec>,
+    diagnostics: &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
+    packet: CompletionPacket<Spec>,
+) -> RecordCompletionOutcome
+where
+    Spec: SlotSpec,
+    SlotPayload<Spec>: Send,
+    SlotError<Spec>: Send,
+    SlotCompletion<Spec>: Send,
+    SlotCompletionDiagnostics<Spec>: DriverCompletionDiagnosticsBackend,
+{
+    record_user_completion(table, diagnostics, packet)
 }
 
 fn finish_waiting_if_needed<Spec>(

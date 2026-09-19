@@ -22,7 +22,6 @@ use diagweave::{prelude::*, report::Report};
 use veloq_buf::FixedBuf;
 use veloq_driver_native::{
     SockAddrStorage, Socket,
-    driver::Driver,
     op::{
         Accept, Connect, DetachedSubmitter, LocalSubmitter, Op, OpSubmitter, Recv, RecvProvided,
         Send as OpSend,
@@ -140,9 +139,8 @@ impl<'rt, S: OpSubmitter<'rt, Ctx<'rt>> + Copy, P: SocketTokenPtr<'rt>>
 
     /// 把这个 listener 变成一条连接流。
     ///
-    /// 与反复 `accept()` 语义相同，但在支持 multishot accept 的内核上只提交一次 SQE、
-    /// 只占一个 slot。不支持时自动退回「每次重新提交一次单发 accept」——两个平台共用
-    /// 那条路径，见 [`AcceptStream`]。
+    /// 与反复 `accept()` 语义相同，但由 driver 以一个逻辑 multishot operation 持续产出
+    /// 连接，见 [`AcceptStream`]。
     ///
     /// 注意 `accept()` 与本方法**不要同时用在同一个 listener 上**：两者都会从同一个内核
     /// accept 队列取连接，谁拿到哪一个不确定。
@@ -200,45 +198,30 @@ impl<'rt, S: OpSubmitter<'rt, Ctx<'rt>> + Copy, P: SocketTokenPtr<'rt>>
         Ok((res.trans()?, buf))
     }
 
-    /// 接收一段数据，buffer 由内核在数据到达时才从 provided buffer 环里挑。
-    ///
-    /// 若当前 Runtime 或 OS 不支持 provided buffer，该方法将自动降级为由 Runtime 动态分配 Buffer
-    /// 并执行单发 recv，保持透明可控。
+    /// 接收一段数据，buffer 由 backend 在数据到达时创建并交付。
     async fn recv_provided_direct(&self) -> Result<FixedBuf> {
-        if self
+        let op = RecvProvided {
+            fd: self.inner.fd(),
+        };
+        let (res, op_back) = self
             .ctx
-            .driver(|driver| driver.capabilities().provided_buffers)
-        {
-            let op = RecvProvided {
-                fd: self.inner.fd(),
-            };
-            let (res, op_back) = self
-                .ctx
-                .submit(&self.submitter, Op::new(op))
-                .await
-                .into_inner();
-            if let Ok(received) = res
-                && let Some(buf) = op_back.and_then(|provided| provided.buf)
-            {
-                debug_assert_eq!(buf.len(), received);
-                return Ok(buf);
-            }
-        }
-
-        let buf = self.ctx.try_alloc_full(veloq_std::nz!(8192)).trans()?;
-        let (n, mut buf) = self.recv_subset_direct(buf, 0).await?;
-        buf.set_len(n);
+            .submit(&self.submitter, Op::new(op))
+            .await
+            .into_inner();
+        let received = res.trans()?;
+        let buf = op_back
+            .and_then(|provided| provided.buf)
+            .ok_or(NetError::ProvidedBufferMissing)
+            .trans()?;
+        debug_assert_eq!(buf.len(), received);
         Ok(buf)
     }
 
     /// 把这条连接变成一条数据流，每一项的 buffer 由内核在数据到达时才从 provided buffer
     /// 环里挑。
     ///
-    /// 与反复 `recv_provided()` 语义相同，但在支持 multishot recv 的内核（6.0+）上只提交
-    /// 一次 SQE、只占一个 slot；不支持时退回「每次重新提交一次单发 recv」。两条路径都要求
-    /// 运行时开了 provided buffers（[`crate::config::Config::uring_provided_buffers`]），
-    /// 否则返回 [`NetError::ProvidedBuffersUnavailable`]——**这是内核语义不是设计选择**，
-    /// 见 [`RecvStream`]。
+    /// 与反复 `recv_provided()` 语义相同，但由 driver 以一个逻辑 multishot operation 持续
+    /// 产出数据，见 [`RecvStream`]。
     ///
     /// 对端关闭时流正常结束。流在当前 worker 上提交，与这个 socket 上的其它操作一样。
     pub fn recv_multi(&self) -> Result<RecvStream<'rt, S, P>> {
@@ -345,8 +328,7 @@ impl<'rt> LocalTcpStream<'rt> {
         self.send_subset_direct(buf, buf_offset).await
     }
 
-    /// 接收一段数据，buffer 由内核从 provided buffer 环里挑（见
-    /// [`crate::config::Config::uring_provided_buffers`]）。
+    /// 接收一段由 backend 创建并交付的 buffer。
     pub async fn recv_provided(&self) -> Result<FixedBuf> {
         self.recv_provided_direct().await
     }
@@ -396,33 +378,23 @@ impl<'rt> TcpStream<'rt> {
         Ok((res.trans()?, op.buf))
     }
 
-    /// 接收一段数据，buffer 由内核从 provided buffer 环里挑（见
-    /// [`crate::config::Config::uring_provided_buffers`]）。
+    /// 接收一段由 backend 创建并交付的 buffer。
     ///
     /// 环是 per-worker 的，所以操作照例路由到持有这个 socket 的 worker 上——用户拿到的
     /// `FixedBuf` 属于**那个** worker 的池，跨 worker drop 走池自己的归还路径，与其它任何
     /// `FixedBuf` 没有区别。
     pub async fn recv_provided(&self) -> Result<FixedBuf> {
-        if self
-            .ctx
-            .driver(|driver| driver.capabilities().provided_buffers)
-        {
-            let owner = self.inner.owner_worker_id();
-            let op = RecvProvided {
-                fd: self.inner.fd(),
-            };
-            let (res, provided) = self.ctx.submit_to(owner, Op::new(op)).await?;
-            if let Ok(received) = res
-                && let Some(buf) = provided.buf
-            {
-                debug_assert_eq!(buf.len(), received);
-                return Ok(buf);
-            }
-        }
-
-        let buf = self.ctx.try_alloc_full(veloq_std::nz!(8192)).trans()?;
-        let (n, mut buf) = self.recv_subset(buf, 0).await?;
-        buf.set_len(n);
+        let owner = self.inner.owner_worker_id();
+        let op = RecvProvided {
+            fd: self.inner.fd(),
+        };
+        let (res, provided) = self.ctx.submit_to(owner, Op::new(op)).await?;
+        let received = res.trans()?;
+        let buf = provided
+            .buf
+            .ok_or(NetError::ProvidedBufferMissing)
+            .trans()?;
+        debug_assert_eq!(buf.len(), received);
         Ok(buf)
     }
 

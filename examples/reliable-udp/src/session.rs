@@ -2,6 +2,7 @@ mod inbound;
 mod lifecycle;
 mod metrics;
 mod outbound;
+mod stream_state;
 mod timers;
 
 use veloq::{
@@ -12,7 +13,10 @@ use veloq::{
 use crate::{
     config::Config,
     error::{Error, Result},
-    packet::{ConnectionId, Flags, FrameSequence, MessageId, PacketBufAllocator, PacketRef},
+    packet::{
+        ConnectionId, FrameSequence, FrameType, MessageId, PacketBufAllocator, PacketRef, StreamId,
+        StreamOpenPayload, StreamSequence,
+    },
     timer::{TimerCommand, TimerKind},
 };
 
@@ -21,6 +25,7 @@ use self::{
     lifecycle::{LifecycleAction, LifecycleState},
     metrics::SessionMetrics,
     outbound::{FlushContext, MessageAckContext, OutboundAction, OutboundState},
+    stream_state::{StreamLifecycle, StreamRegistry},
     timers::TimerState,
 };
 
@@ -43,12 +48,14 @@ pub enum SessionState {
 }
 
 #[derive(Debug)]
-pub struct Message {
+pub struct StreamMessage {
+    pub stream_id: StreamId,
+    pub stream_sequence: StreamSequence,
     pub message_id: MessageId,
     pub payload: FixedBuf,
 }
 
-impl Message {
+impl StreamMessage {
     pub fn as_slice(&self) -> &[u8] {
         self.payload.as_slice()
     }
@@ -70,6 +77,7 @@ impl SendToken {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SendReceipt {
     pub token: SendToken,
+    pub stream_id: StreamId,
     pub message_id: MessageId,
     pub fragment_count: u32,
     pub rtt: Option<Duration>,
@@ -118,7 +126,12 @@ pub enum SessionEvent {
     },
     ArmTimer(TimerCommand),
     CancelTimer(TimerCommand),
-    MessageAvailable,
+    StreamMessageAvailable(StreamId),
+    StreamAvailable(StreamId),
+    StreamOpened(StreamId),
+    StreamOpenFailed(StreamId, Error),
+    StreamClosed(StreamId),
+    StreamReset(StreamId),
     SendAcked(SendReceipt),
     SendFailed {
         token: SendToken,
@@ -144,7 +157,15 @@ impl PartialEq for SessionEvent {
             ) => left == right,
             (Self::ArmTimer(left), Self::ArmTimer(right))
             | (Self::CancelTimer(left), Self::CancelTimer(right)) => left == right,
-            (Self::MessageAvailable, Self::MessageAvailable) => true,
+            (Self::StreamMessageAvailable(left), Self::StreamMessageAvailable(right))
+            | (Self::StreamAvailable(left), Self::StreamAvailable(right))
+            | (Self::StreamOpened(left), Self::StreamOpened(right))
+            | (Self::StreamClosed(left), Self::StreamClosed(right))
+            | (Self::StreamReset(left), Self::StreamReset(right)) => left == right,
+            (
+                Self::StreamOpenFailed(left_id, left_error),
+                Self::StreamOpenFailed(right_id, right_error),
+            ) => left_id == right_id && left_error == right_error,
             (Self::SendAcked(left), Self::SendAcked(right)) => left == right,
             (
                 Self::SendFailed {
@@ -181,6 +202,7 @@ pub struct Session {
     lifecycle: LifecycleState,
     inbound: InboundState,
     outbound: OutboundState,
+    streams: StreamRegistry,
     metrics: SessionMetrics,
     timers: TimerState,
     events: VecDeque<SessionEvent>,
@@ -219,6 +241,7 @@ impl Session {
             lifecycle: LifecycleState::new(role, state, connection_id, &config),
             inbound: InboundState::new(),
             outbound: OutboundState::new(&config),
+            streams: StreamRegistry::new(role == Role::Client, &config),
             metrics: SessionMetrics::new(&config),
             timers: TimerState::new(),
             config,
@@ -281,7 +304,7 @@ impl Session {
         )
     }
 
-    pub(crate) fn take_events(&mut self) -> Vec<SessionEvent> {
+    pub fn take_events(&mut self) -> Vec<SessionEvent> {
         self.events.drain(..).collect()
     }
 
@@ -311,14 +334,14 @@ impl Session {
         )?;
         let meta = packet.meta();
         self.ensure_receivable(meta.connection_id)?;
-        if meta.flags.contains(Flags::RST) {
+        if meta.frame_type == FrameType::Rst {
             let actions = self
                 .lifecycle
                 .request_terminate(Error::ConnectionReset, SessionState::Reset);
             self.apply_lifecycle(actions, allocator)?;
             return Ok(self.take_events());
         }
-        if meta.flags == Flags::SYN_ACK {
+        if meta.frame_type == FrameType::SynAck {
             if self.role() != Role::Client
                 || !matches!(
                     self.state(),
@@ -333,12 +356,12 @@ impl Session {
             self.apply_lifecycle(actions, allocator)?;
             return Ok(self.take_events());
         }
-        if meta.flags == Flags::ACK && !packet.payload.is_empty() {
+        if meta.frame_type == FrameType::Ack && !packet.payload.is_empty() {
             return Err(Error::InvalidState);
         }
         if self.role() == Role::Client
             && self.state() == SessionState::CookieSent
-            && meta.flags == Flags::ACK
+            && meta.frame_type == FrameType::Ack
             && packet.payload.is_empty()
         {
             if meta.ack_largest != 0 || meta.ack_bitmap != 0 {
@@ -348,7 +371,7 @@ impl Session {
             self.apply_lifecycle(actions, allocator)?;
             return Ok(self.take_events());
         }
-        if self.state() == SessionState::FinWait && meta.flags == Flags::FIN_ACK {
+        if self.state() == SessionState::FinWait && meta.frame_type == FrameType::FinAck {
             let actions = self.lifecycle.on_fin_ack();
             self.apply_lifecycle(actions, allocator)?;
             return Ok(self.take_events());
@@ -356,10 +379,8 @@ impl Session {
         if self.state() != SessionState::Established {
             return Err(Error::InvalidState);
         }
-        self.metrics.record_received(
-            meta.flags.contains(Flags::DATA),
-            meta.flags.contains(Flags::ACK),
-        );
+        self.metrics
+            .record_received(meta.frame_type == FrameType::Data, meta.has_ack);
         self.outbound.set_peer_receive_window(meta.receive_window);
 
         let outbound = self
@@ -367,25 +388,123 @@ impl Session {
             .apply_ack(&meta, self.now, &self.config, &mut self.metrics)?;
         self.apply_outbound(outbound);
 
-        if meta.flags.contains(Flags::MESSAGE_ACK) {
+        if meta.frame_type == FrameType::MessageAck {
+            let stream_id = StreamId::new(meta.stream_id).ok_or(Error::InvalidStreamId)?;
             let message_id = MessageId::new(meta.message_id).ok_or(Error::InvalidFragment)?;
-            let output = self
-                .outbound
-                .apply_message_ack(message_id, self.now, &self.config);
+            let output =
+                self.outbound
+                    .apply_message_ack(stream_id, message_id, self.now, &self.config);
             self.apply_outbound(output);
         }
+        if meta.frame_type.is_reliable()
+            && meta.frame_type != FrameType::Data
+            && let Some(sequence) = FrameSequence::new(meta.frame_sequence)
+        {
+            let _ = self.inbound.observe_reliable_frame(sequence);
+            self.emit_ack(allocator)?;
+        }
 
-        if meta.flags.contains(Flags::FIN) {
+        match meta.frame_type {
+            FrameType::StreamOpen => {
+                let stream_id = StreamId::new(meta.stream_id).ok_or(Error::InvalidStreamId)?;
+                let remote_is_client = self.role() == Role::Server;
+                if stream_id.is_client_initiated() != remote_is_client {
+                    return Err(Error::InvalidStreamId);
+                }
+                let open = StreamOpenPayload::decode(packet.payload)?;
+                let open_ack = StreamOpenPayload {
+                    frame_window: self.config.stream_receive_window_frames.get() as u16,
+                    byte_credit: self.config.max_stream_receive_bytes.get() as u64,
+                }
+                .encode();
+                if self.streams.create_remote(stream_id, &self.config).is_err() {
+                    if self.streams.contains(stream_id) {
+                        self.outbound.set_peer_stream_window(
+                            stream_id,
+                            open.frame_window,
+                            open.byte_credit,
+                        );
+                        let output = self.outbound.emit_stream_control(
+                            self.connection_id(),
+                            &self.config,
+                            allocator,
+                            FrameType::StreamOpenAck,
+                            stream_id,
+                            &open_ack,
+                            self.inbound.available_window(&self.config),
+                            &mut self.metrics,
+                        )?;
+                        self.apply_outbound(output);
+                    }
+                } else {
+                    self.outbound.set_peer_stream_window(
+                        stream_id,
+                        open.frame_window,
+                        open.byte_credit,
+                    );
+                    let output = self.outbound.emit_stream_control(
+                        self.connection_id(),
+                        &self.config,
+                        allocator,
+                        FrameType::StreamOpenAck,
+                        stream_id,
+                        &open_ack,
+                        self.inbound.available_window(&self.config),
+                        &mut self.metrics,
+                    )?;
+                    self.apply_outbound(output);
+                    self.events
+                        .push_back(SessionEvent::StreamAvailable(stream_id));
+                }
+            }
+            FrameType::StreamOpenAck => {
+                let stream_id = StreamId::new(meta.stream_id).ok_or(Error::InvalidStreamId)?;
+                let open_ack = StreamOpenPayload::decode(packet.payload)?;
+                self.outbound.set_peer_stream_window(
+                    stream_id,
+                    open_ack.frame_window,
+                    open_ack.byte_credit,
+                );
+                if self.streams.mark_open(stream_id).is_ok() {
+                    self.cancel_timer(TimerKind::StreamOpenRetry { stream_id });
+                    self.events.push_back(SessionEvent::StreamOpened(stream_id));
+                }
+            }
+            FrameType::StreamFin => {
+                let stream_id = StreamId::new(meta.stream_id).ok_or(Error::InvalidStreamId)?;
+                if let Some(stream) = self.streams.get_mut(stream_id) {
+                    stream.close_remote();
+                    self.events.push_back(SessionEvent::StreamClosed(stream_id));
+                }
+            }
+            FrameType::StreamReset => {
+                let stream_id = StreamId::new(meta.stream_id).ok_or(Error::InvalidStreamId)?;
+                if self.streams.mark_reset(stream_id).is_ok() {
+                    self.cancel_stream_reassembly(stream_id);
+                    let output = self.outbound.fail_stream(stream_id, Error::StreamReset);
+                    self.apply_outbound(output);
+                    self.events.push_back(SessionEvent::StreamReset(stream_id));
+                }
+            }
+            _ => {}
+        }
+
+        if meta.frame_type == FrameType::Fin {
             let actions = self.lifecycle.on_fin();
             self.apply_lifecycle(actions, allocator)?;
         }
-        if packet.flags.contains(Flags::FIN_ACK) && self.state() == SessionState::FinWait {
+        if packet.frame_type == FrameType::FinAck && self.state() == SessionState::FinWait {
             let actions = self.lifecycle.on_fin_ack();
             self.apply_lifecycle(actions, allocator)?;
         }
-        if meta.flags.contains(Flags::DATA) {
+        if meta.frame_type == FrameType::Data {
             if self.state() != SessionState::Established {
                 return Err(Error::InvalidState);
+            }
+            let stream_id = StreamId::new(meta.stream_id).ok_or(Error::InvalidStreamId)?;
+            if !self.streams.contains(stream_id) {
+                self.flush_pending(allocator)?;
+                return Ok(self.take_events());
             }
             let output = self.inbound.on_data(
                 datagram,
@@ -395,19 +514,22 @@ impl Session {
                 allocator,
                 &mut self.metrics,
             )?;
-            for _ in 0..output.delivered() {
-                self.events.push_back(SessionEvent::MessageAvailable);
+            for (stream_id, _) in output.message_acks().iter().take(output.delivered()) {
+                self.events
+                    .push_back(SessionEvent::StreamMessageAvailable(*stream_id));
             }
-            for message_id in output.arm_reassembly() {
+            for (stream_id, message_id) in output.arm_reassembly() {
                 self.arm_timer(
                     TimerKind::ReassemblyTimeout {
+                        stream_id: *stream_id,
                         message_id: *message_id,
                     },
                     self.config.reassembly_timeout,
                 );
             }
-            for message_id in output.cancel_reassembly() {
+            for (stream_id, message_id) in output.cancel_reassembly() {
                 self.cancel_timer(TimerKind::ReassemblyTimeout {
+                    stream_id: *stream_id,
                     message_id: *message_id,
                 });
             }
@@ -419,35 +541,144 @@ impl Session {
         Ok(self.take_events())
     }
 
-    pub fn queue_send<A: PacketBufAllocator + ?Sized>(
+    pub fn open_stream<A: PacketBufAllocator + ?Sized>(
         &mut self,
         now: Duration,
+        allocator: &A,
+    ) -> Result<StreamId> {
+        self.sync_now(now);
+        if self.state() != SessionState::Established {
+            return Err(Error::ConnectionClosing);
+        }
+        let stream_id = self.streams.create_local(&self.config)?;
+        let payload = StreamOpenPayload {
+            frame_window: self.config.stream_receive_window_frames.get() as u16,
+            byte_credit: self.config.max_stream_receive_bytes.get() as u64,
+        }
+        .encode();
+        let output = self.outbound.emit_stream_control(
+            self.connection_id(),
+            &self.config,
+            allocator,
+            FrameType::StreamOpen,
+            stream_id,
+            &payload,
+            self.inbound.available_window(&self.config),
+            &mut self.metrics,
+        )?;
+        self.apply_outbound(output);
+        self.arm_timer(
+            TimerKind::StreamOpenRetry { stream_id },
+            self.config.stream_open_deadline,
+        );
+        Ok(stream_id)
+    }
+
+    pub fn accept_stream(&mut self) -> Option<StreamId> {
+        self.streams.pop_accept()
+    }
+
+    pub fn stream_is_open(&self, stream_id: StreamId) -> bool {
+        self.streams
+            .get(stream_id)
+            .is_some_and(|stream| matches!(stream.lifecycle, StreamLifecycle::Open))
+    }
+
+    pub fn queue_stream_send<A: PacketBufAllocator + ?Sized>(
+        &mut self,
+        now: Duration,
+        stream_id: StreamId,
         payload: FixedBuf,
         allocator: &A,
     ) -> Result<SendToken> {
         self.sync_now(now);
-        self.ensure_open_for_send()?;
-        let token = self.outbound.queue_send(payload, &self.config)?;
+        if let Some(stream) = self.streams.get(stream_id) {
+            stream.ensure_sendable()?;
+        } else {
+            return Err(Error::InvalidStreamId);
+        }
+        let token = self
+            .outbound
+            .queue_stream_send(stream_id, payload, &self.config)?;
         let _ = self.flush_pending(allocator)?;
         Ok(token)
     }
 
-    pub fn recv<A: PacketBufAllocator + ?Sized>(
+    pub fn recv_stream<A: PacketBufAllocator + ?Sized>(
         &mut self,
         now: Duration,
+        stream_id: StreamId,
         allocator: &A,
-    ) -> Option<Message> {
+    ) -> Option<StreamMessage> {
         self.sync_now(now);
         let (message, message_acks, cancel_reassembly) =
-            self.inbound.pop_message(&self.config, &mut self.metrics);
-        for message_id in cancel_reassembly {
-            self.cancel_timer(TimerKind::ReassemblyTimeout { message_id });
+            self.inbound
+                .pop_message(stream_id, &self.config, &mut self.metrics);
+        for (stream_id, message_id) in cancel_reassembly {
+            self.cancel_timer(TimerKind::ReassemblyTimeout {
+                stream_id,
+                message_id,
+            });
         }
         let _ = self.emit_message_acks(&message_acks, allocator);
         if message.is_some() {
             let _ = self.emit_ack(allocator);
         }
         message
+    }
+
+    pub fn close_stream<A: PacketBufAllocator + ?Sized>(
+        &mut self,
+        now: Duration,
+        stream_id: StreamId,
+        allocator: &A,
+    ) -> Result<Vec<SessionEvent>> {
+        self.sync_now(now);
+        let state = self
+            .streams
+            .get_mut(stream_id)
+            .ok_or(Error::InvalidStreamId)?;
+        state.ensure_sendable()?;
+        state.close_local();
+        let output = self.outbound.emit_stream_control(
+            self.connection_id(),
+            &self.config,
+            allocator,
+            FrameType::StreamFin,
+            stream_id,
+            &[],
+            self.inbound.available_window(&self.config),
+            &mut self.metrics,
+        )?;
+        self.apply_outbound(output);
+        self.events.push_back(SessionEvent::StreamClosed(stream_id));
+        Ok(self.take_events())
+    }
+
+    pub fn reset_stream<A: PacketBufAllocator + ?Sized>(
+        &mut self,
+        now: Duration,
+        stream_id: StreamId,
+        allocator: &A,
+    ) -> Result<Vec<SessionEvent>> {
+        self.sync_now(now);
+        self.streams.mark_reset(stream_id)?;
+        self.cancel_stream_reassembly(stream_id);
+        let failed = self.outbound.fail_stream(stream_id, Error::StreamReset);
+        self.apply_outbound(failed);
+        let output = self.outbound.emit_stream_control(
+            self.connection_id(),
+            &self.config,
+            allocator,
+            FrameType::StreamReset,
+            stream_id,
+            &[],
+            self.inbound.available_window(&self.config),
+            &mut self.metrics,
+        )?;
+        self.apply_outbound(output);
+        self.events.push_back(SessionEvent::StreamReset(stream_id));
+        Ok(self.take_events())
     }
 
     pub fn close<A: PacketBufAllocator + ?Sized>(
@@ -494,6 +725,7 @@ impl Session {
                     self.outbound
                         .on_retransmit(sequence, &self.config, &mut self.metrics)?;
                 let terminal = output.terminal_error();
+                let stream_failure = output.stream_failure();
                 self.apply_outbound(output);
                 if let Some(error) = terminal {
                     let actions = self
@@ -501,15 +733,24 @@ impl Session {
                         .request_terminate(error, SessionState::Failed);
                     self.apply_lifecycle(actions, allocator)?;
                 }
+                if let Some((stream_id, _error)) = stream_failure {
+                    let events = self.reset_stream(self.now, stream_id, allocator)?;
+                    self.events.extend(events);
+                }
             }
-            TimerKind::MessageAckRetry { message_id } => {
+            TimerKind::MessageAckRetry {
+                stream_id,
+                message_id,
+            } => {
                 let output = self.outbound.on_message_ack_retry(
+                    stream_id,
                     message_id,
                     &self.config,
                     allocator,
                     &mut self.metrics,
                 );
                 let terminal = output.terminal_error();
+                let stream_failure = output.stream_failure();
                 self.apply_outbound(output);
                 if let Some(error) = terminal {
                     let actions = self
@@ -517,16 +758,54 @@ impl Session {
                         .request_terminate(error, SessionState::Failed);
                     self.apply_lifecycle(actions, allocator)?;
                 }
+                if let Some((stream_id, _error)) = stream_failure {
+                    let events = self.reset_stream(self.now, stream_id, allocator)?;
+                    self.events.extend(events);
+                }
             }
-            TimerKind::ReassemblyTimeout { message_id } => {
+            TimerKind::ReassemblyTimeout {
+                stream_id,
+                message_id,
+            } => {
                 if self
                     .inbound
-                    .on_reassembly_timeout(message_id, &mut self.metrics)
+                    .on_reassembly_timeout(stream_id, message_id, &mut self.metrics)
                 {
-                    let actions = self
-                        .lifecycle
-                        .request_terminate(Error::ReassemblyTimeout, SessionState::Failed);
-                    self.apply_lifecycle(actions, allocator)?;
+                    let events = self.reset_stream(self.now, stream_id, allocator)?;
+                    self.events.extend(events);
+                }
+            }
+            TimerKind::StreamOpenRetry { stream_id } => {
+                let retry = self
+                    .streams
+                    .get_mut(stream_id)
+                    .is_some_and(|stream| stream.retry_open(self.config.max_retries));
+                if retry {
+                    let payload = StreamOpenPayload {
+                        frame_window: self.config.stream_receive_window_frames.get() as u16,
+                        byte_credit: self.config.max_stream_receive_bytes.get() as u64,
+                    }
+                    .encode();
+                    let output = self.outbound.emit_stream_control(
+                        self.connection_id(),
+                        &self.config,
+                        allocator,
+                        FrameType::StreamOpen,
+                        stream_id,
+                        &payload,
+                        self.inbound.available_window(&self.config),
+                        &mut self.metrics,
+                    )?;
+                    self.apply_outbound(output);
+                    self.arm_timer(
+                        TimerKind::StreamOpenRetry { stream_id },
+                        self.config.stream_open_deadline,
+                    );
+                } else if self.streams.mark_reset(stream_id).is_ok() {
+                    self.events.push_back(SessionEvent::StreamOpenFailed(
+                        stream_id,
+                        Error::StreamOpenTimeout,
+                    ));
                 }
             }
             TimerKind::HandshakeRetry => {
@@ -605,14 +884,15 @@ impl Session {
 
     fn emit_message_acks<A: PacketBufAllocator + ?Sized>(
         &mut self,
-        message_ids: &[MessageId],
+        message_ids: &[(StreamId, MessageId)],
         allocator: &A,
     ) -> Result<()> {
-        for message_id in message_ids {
+        for (stream_id, message_id) in message_ids {
             let output = self.outbound.emit_message_ack(MessageAckContext {
                 connection_id: self.connection_id(),
                 config: &self.config,
                 allocator,
+                stream_id: *stream_id,
                 message_id: *message_id,
                 ack: self.inbound.ack_snapshot(),
                 receive_window: self.inbound.available_window(&self.config),
@@ -680,11 +960,14 @@ impl Session {
                     state,
                     generation,
                 } => {
-                    for message_id in self.inbound.clear() {
-                        if let Some(command) = self
-                            .timers
-                            .cancel(TimerKind::ReassemblyTimeout { message_id }, generation)
-                        {
+                    for (stream_id, message_id) in self.inbound.clear() {
+                        if let Some(command) = self.timers.cancel(
+                            TimerKind::ReassemblyTimeout {
+                                stream_id,
+                                message_id,
+                            },
+                            generation,
+                        ) {
                             self.events.push_back(SessionEvent::CancelTimer(command));
                         }
                     }
@@ -739,6 +1022,15 @@ impl Session {
         }
     }
 
+    fn cancel_stream_reassembly(&mut self, stream_id: StreamId) {
+        for message_id in self.inbound.reset_stream(stream_id) {
+            self.cancel_timer(TimerKind::ReassemblyTimeout {
+                stream_id,
+                message_id,
+            });
+        }
+    }
+
     fn sync_now(&mut self, now: Duration) {
         self.now = self.now.max(now);
     }
@@ -752,16 +1044,6 @@ impl Session {
         }
         if connection_id != self.connection_id() {
             return Err(Error::UnknownConnection);
-        }
-        Ok(())
-    }
-
-    fn ensure_open_for_send(&self) -> Result<()> {
-        if self.is_terminal() {
-            return Err(match self.state() {
-                SessionState::Reset => Error::ConnectionReset,
-                _ => Error::ConnectionClosed,
-            });
         }
         Ok(())
     }

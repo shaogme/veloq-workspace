@@ -13,17 +13,21 @@ use veloq_driver_core::{
         ReadRaw as CoreReadRaw, Recv as CoreRecv, RecvMulti as CoreRecvMulti,
         RecvProvided as CoreRecvProvided, Send as CoreSend, SendTo as CoreSendTo,
         SyncFileRange as CoreSyncFileRange, SyncFileRangeRaw as CoreSyncFileRangeRaw,
-        UdpConnect as CoreUdpConnect, UdpRecv as CoreUdpRecv, UdpRecvFrom as CoreUdpRecvFrom,
-        UdpSend as CoreUdpSend, Wakeup as CoreWakeup, WriteFixed as CoreWriteFixed,
-        WriteRaw as CoreWriteRaw,
+        UdpConnect as CoreUdpConnect, UdpRecvMulti as CoreUdpRecvMulti, UdpSend as CoreUdpSend,
+        Wakeup as CoreWakeup, WriteFixed as CoreWriteFixed, WriteRaw as CoreWriteRaw,
     },
 };
 pub use veloq_driver_core::{
+    driver::UdpReceiveOperationBuilder,
     op::{
         DetachedOp, DetachedSubmitter, DriverProvider, IntoPlatformOp, LocalOp, LocalSubmitter, Op,
         OpItem, OpKind, OpResult, OpSubmitter as CoreOpSubmitter, SingleShotOp,
-        types::{AcceptedSocket, Open, ProvidedBuf, Timeout, UdpRecvPacket, UdpRecvPacketBuf},
+        types::{
+            AcceptedSocket as CoreAcceptedSocket, Open, ProvidedBuf as CoreProvidedBuf, Timeout,
+            UdpRecvPacket as CoreUdpRecvPacket, UdpRecvPacketBuf,
+        },
     },
+    platform::receive_pump::{UdpReceiveBuildError, UdpReceiveConfig},
     slot::{SlotCompletion, SlotError, SlotOp, SlotPayload},
 };
 
@@ -53,7 +57,6 @@ pub type RecvProvided = CoreRecvProvided<PlatformRawHandle>;
 /// `capabilities().recv_multi`, which is `false` everywhere else.
 pub type RecvMulti = CoreRecvMulti<PlatformRawHandle>;
 pub type Send = CoreSend<PlatformRawHandle>;
-pub type UdpRecv = CoreUdpRecv<PlatformRawHandle>;
 pub type UdpSend = CoreUdpSend<PlatformRawHandle>;
 pub type Close = CoreClose<PlatformRawHandle>;
 pub type Fsync = CoreFsync<PlatformRawHandle>;
@@ -63,7 +66,7 @@ pub type SyncFileRange = CoreSyncFileRange<PlatformRawHandle>;
 pub type SyncFileRangeRaw = CoreSyncFileRangeRaw<PlatformRawHandle>;
 pub type Fallocate = CoreFallocate<PlatformRawHandle>;
 pub type FallocateRaw = CoreFallocateRaw<PlatformRawHandle>;
-pub type UdpRecvFrom = CoreUdpRecvFrom<PlatformRawHandle>;
+pub type UdpRecvMulti = CoreUdpRecvMulti<PlatformRawHandle>;
 pub type Wakeup = CoreWakeup<PlatformRawHandle>;
 
 pub type FileSyncFileRangeRaw = CoreSyncFileRangeRaw<PlatformRawHandle>;
@@ -71,6 +74,9 @@ pub type UdpConnect = CoreUdpConnect<PlatformRawHandle, SockAddrStorage>;
 pub type Connect = CoreConnect<PlatformRawHandle, SockAddrStorage>;
 pub type Accept = CoreAccept<PlatformRawHandle, SockAddrStorage>;
 pub type AcceptMulti = CoreAcceptMulti<PlatformRawHandle>;
+pub type AcceptedSocket = CoreAcceptedSocket;
+pub type ProvidedBuf = CoreProvidedBuf;
+pub type UdpRecvPacket = CoreUdpRecvPacket;
 
 pub trait OpSubmitter<'a, P: DriverProvider>: Clone + StdSend + Sync {
     /// 单发提交：`await` 得到唯一的那条完成。

@@ -16,9 +16,10 @@ use crate::{
     error::{IocpError, IocpResult},
     ext::{LpfnAcceptEx, LpfnConnectEx},
     op::{
-        AcceptPayload, Close, Connect, Fallocate, Fsync, KernelRef, OpSend, OverlappedEntry,
-        ReadFixed, Recv, SendToPayload, SubmitContext, SyncFileRange, Timeout, UdpConnect, UdpRecv,
-        UdpRecvFromPayload, UdpSend, Wakeup, WriteFixed,
+        AcceptMultiPayload, AcceptPayload, Close, Connect, Fallocate, Fsync, KernelRef, OpSend,
+        OverlappedEntry, ReadFixed, Recv, RecvMultiPayload, RecvProvidedPayload, SendToPayload,
+        SubmitContext, SyncFileRange, Timeout, UdpConnect, UdpRecvMultiPayload, UdpSend, Wakeup,
+        WriteFixed,
     },
     win32::{IoCompletionPort, Overlapped},
 };
@@ -29,10 +30,11 @@ pub(crate) use file::{
     submit_sync_range, submit_sync_range_raw, submit_write_fixed, submit_write_raw,
 };
 pub(crate) use net::{
-    completion_cleanup_close_socket, on_complete_accept, on_complete_connect,
-    on_complete_udp_connect, on_complete_udp_recv_from, submit_accept, submit_connect, submit_recv,
-    submit_send, submit_send_to, submit_udp_connect, submit_udp_recv, submit_udp_recv_from,
-    submit_udp_send,
+    completion_cleanup_close_socket, on_complete_accept, on_complete_accept_multi,
+    on_complete_connect, on_complete_recv_provided, on_complete_udp_connect,
+    orphan_cleanup_accept_multi, submit_accept, submit_accept_multi, submit_connect, submit_recv,
+    submit_recv_multi, submit_recv_provided, submit_send, submit_send_to, submit_udp_connect,
+    submit_udp_recv_multi, submit_udp_send,
 };
 
 pub(crate) enum SubmissionResult {
@@ -390,13 +392,15 @@ impl_get_fd!(get_fd_read_fixed, KernelRef<ReadFixed>, direct_fd);
 impl_get_fd!(get_fd_write_fixed, KernelRef<WriteFixed>, direct_fd);
 impl_get_fd!(get_fd_recv, KernelRef<Recv>, direct_fd);
 impl_get_fd!(get_fd_send, KernelRef<OpSend>, direct_fd);
-impl_get_fd!(get_fd_udp_recv, KernelRef<UdpRecv>, direct_fd);
 impl_get_fd!(get_fd_udp_send, KernelRef<UdpSend>, direct_fd);
 impl_get_fd!(get_fd_connect, KernelRef<Connect>, direct_fd);
 impl_get_fd!(get_fd_udp_connect, KernelRef<UdpConnect>, direct_fd);
 impl_get_fd!(get_fd_accept, AcceptPayload, direct_fd);
+impl_get_fd!(get_fd_accept_multi, AcceptMultiPayload, direct_fd);
 impl_get_fd!(get_fd_send_to, SendToPayload, direct_fd);
-impl_get_fd!(get_fd_udp_recv_from, UdpRecvFromPayload, direct_fd);
+impl_get_fd!(get_fd_recv_provided, RecvProvidedPayload, direct_fd);
+impl_get_fd!(get_fd_recv_multi, RecvMultiPayload, direct_fd);
+impl_get_fd!(get_fd_udp_recv_multi, UdpRecvMultiPayload, direct_fd);
 
 impl_get_fd!(get_fd_close, KernelRef<Close>, direct_fd);
 impl_get_fd!(get_fd_fsync, KernelRef<Fsync>, direct_fd);

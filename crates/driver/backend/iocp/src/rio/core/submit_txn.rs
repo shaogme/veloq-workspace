@@ -16,8 +16,7 @@ use crate::{
 };
 use diagweave::prelude::*;
 use veloq_buf::BufferRegistrar;
-use veloq_std::{mem::size_of, string::ToString};
-use windows_sys::Win32::Networking::WinSock::SOCKADDR_INET;
+use veloq_std::string::ToString;
 
 struct RioSubmitTxn<'a> {
     state: &'a mut RioState,
@@ -33,13 +32,18 @@ struct RioSubmitTxn<'a> {
     outstanding_snapshot: usize,
 }
 
+pub(crate) struct RioSubmittedRequest {
+    pub(crate) request_id: u64,
+    pub(crate) result: SubmissionResult,
+}
+
 impl<'a> RioSubmitTxn<'a> {
     fn new(
         state: &'a mut RioState,
         plan: RioSubmitPlan<'a>,
         registrar: &'a dyn BufferRegistrar,
     ) -> Self {
-        let outstanding_snapshot = state.outstanding_count;
+        let outstanding_snapshot = state.rio_outstanding_count;
         Self {
             state,
             plan,
@@ -61,7 +65,7 @@ impl<'a> RioSubmitTxn<'a> {
             let error = RioError::InvalidInput
                 .to_report()
                 .with_ctx("socket_raw", socket_key.as_handle() as usize)
-                .with_ctx("outstanding_count", self.state.outstanding_count)
+                .with_ctx("rio_outstanding_count", self.state.rio_outstanding_count)
                 .attach_note("RIO runtime is shutting down; rejecting socket submission");
             return Err(self.attach_stage_error(
                 error,
@@ -196,7 +200,7 @@ impl<'a> RioSubmitTxn<'a> {
                 "RIO submit transaction missing actor RQ",
             )
         })?;
-        let socket_inflight = self.socket_inflight.ok_or_else(|| {
+        let socket_inflight = self.socket_inflight.as_ref().ok_or_else(|| {
             self.attach_stage_error(
                 RioError::Internal.to_report(),
                 "rio.core.submit_txn.encode_context",
@@ -211,17 +215,32 @@ impl<'a> RioSubmitTxn<'a> {
             )
         })?;
         let addr = self.addr;
-        let diagnostics = RioRequestDiagnostics::new(rq, &data_buf.rio_buf, addr.as_ref());
-        let request_id = self.state.next_request_id();
+        let diagnostics = RioRequestDiagnostics::with_receive_slot(
+            rq,
+            &data_buf.rio_buf,
+            addr.as_ref(),
+            self.plan.receive_slot_id,
+            self.plan.receive_slot_generation,
+        );
+        let request_id = socket_inflight.request_id();
         let socket_key = socket_inflight.socket_key();
         let addr_slot = addr.map(|addr| addr.slot);
+        let addr_generation = addr.map(|addr| addr.generation);
+        let socket_inflight = self
+            .socket_inflight
+            .take()
+            .expect("RIO submit transaction socket inflight token disappeared");
         let context = self.state.encode_req_ctx(RioOpRequestInit {
             token: self.plan.token,
             socket_inflight,
             op_kind: self.plan.op_kind,
             request_id,
             addr_slot,
+            addr_generation,
+            addr,
             buffer_lease: data_buf.lease,
+            receive_slot_id: self.plan.receive_slot_id,
+            receive_slot_generation: self.plan.receive_slot_generation,
             diagnostics,
         });
         self.request = Some(RioPreparedRequest {
@@ -232,8 +251,11 @@ impl<'a> RioSubmitTxn<'a> {
             token: self.plan.token,
             socket_key,
             addr_slot,
+            addr_generation,
             data_buf,
             addr,
+            receive_slot_id: self.plan.receive_slot_id,
+            receive_slot_generation: self.plan.receive_slot_generation,
             diagnostics,
             outstanding_snapshot: self.outstanding_snapshot,
         });
@@ -266,7 +288,7 @@ impl<'a> RioSubmitTxn<'a> {
         }
     }
 
-    fn commit(mut self) -> RioResult<SubmissionResult> {
+    fn commit(mut self) -> RioResult<RioSubmittedRequest> {
         let request = if let Some(ref mut request) = self.request {
             request
         } else {
@@ -276,17 +298,29 @@ impl<'a> RioSubmitTxn<'a> {
                 "RIO submit transaction missing committed request",
             ));
         };
-        let submitted_context = request.mark_submitted();
-        if submitted_context.as_request_context().is_null() {
+        if request.as_request_context().is_null() {
             return Err(self.attach_stage_error(
                 RioError::Internal.to_report(),
                 "rio.core.submit_txn.commit",
                 "RIO submitted request context is null",
             ));
         }
-        self.state.outstanding_count += 1;
+        let Some(next_outstanding) = self.state.rio_outstanding_count.checked_add(1) else {
+            return Err(self.attach_stage_error(
+                RioError::ResourceExhaustion.to_report(),
+                "rio.core.submit_txn.commit",
+                "RIO outstanding request count overflow",
+            ));
+        };
+        self.state
+            .record_request_submitted(request.op_kind, request.socket_key)?;
+        let _submitted_context = request.mark_submitted();
+        self.state.rio_outstanding_count = next_outstanding;
         self.submitted = true;
-        Ok(SubmissionResult::Pending)
+        Ok(RioSubmittedRequest {
+            request_id: request.request_id,
+            result: SubmissionResult::Pending,
+        })
     }
 
     fn acquire_buffer_ref(&mut self) -> RioResult<()> {
@@ -363,21 +397,22 @@ impl<'a> RioSubmitTxn<'a> {
         let Some(request) = self.request.as_mut() else {
             return Ok(());
         };
-        let init = request.take_init(&mut self.state.registry);
-        if init.is_none() {
+        let Some(init) = request.take_init(&mut self.state.registry) else {
             return Err(self.attach_stage_error(
                 RioError::Internal.to_report(),
                 "rio.core.submit_txn.rollback_context",
                 "unsubmitted RIO request missing prepared request context during rollback",
             ));
-        }
+        };
+        self.state
+            .release_socket_inflight_token(init.socket_inflight)?;
         Ok(())
     }
 
     fn rollback_address(&mut self) {
-        self.state
-            .registry
-            .free_addr_slot(self.addr.take().map(|addr| addr.slot));
+        if let Err(error) = self.state.registry.free_addr_reservation(self.addr.take()) {
+            tracing::error!(report = ?error, "failed to roll back RIO address lease");
+        }
     }
 
     fn rollback_socket(&mut self) -> RioResult<()> {
@@ -439,7 +474,7 @@ impl<'a> RioSubmitTxn<'a> {
             .with_ctx("rio_op_kind", self.plan.op_kind.as_str())
             .with_ctx("rio_operation", self.plan.operation)
             .with_ctx("addr_slot", self.addr.map_or(usize::MAX, |addr| addr.slot))
-            .with_ctx("outstanding_count", self.outstanding_snapshot)
+            .with_ctx("rio_outstanding_count", self.outstanding_snapshot)
             .attach_note(note);
 
         if let Some(rq) = self.rq {
@@ -521,6 +556,16 @@ impl RioState {
         registrar: &dyn BufferRegistrar,
         submit: impl FnOnce(&RioKernel, &RioPreparedRequest) -> RioResult<()>,
     ) -> RioResult<SubmissionResult> {
+        self.submit_rio_with_request(plan, registrar, submit)
+            .map(|submitted| submitted.result)
+    }
+
+    pub(crate) fn submit_rio_with_request(
+        &mut self,
+        plan: RioSubmitPlan<'_>,
+        registrar: &dyn BufferRegistrar,
+        submit: impl FnOnce(&RioKernel, &RioPreparedRequest) -> RioResult<()>,
+    ) -> RioResult<RioSubmittedRequest> {
         RioSubmitTxn::new(self, plan, registrar)
             .check_socket_accepting()?
             .ensure_actor()?
@@ -543,25 +588,8 @@ impl RioState {
                 .registry
                 .prepare_send_addr(addr_ptr, addr_len, env)
                 .map(Some),
-            RioAddressPolicy::RecvFrom { addr_ptr } => {
-                if addr_ptr.is_null() {
-                    return RioError::Internal
-                        .attach_note("RIO recv_from received null address buffer");
-                }
-                let mut addr = self.registry.prepare_recv_addr(env)?;
-                addr.rio_buf.Length = size_of::<SOCKADDR_INET>() as u32;
-                Ok(Some(addr))
-            }
+            RioAddressPolicy::RecvMulti => self.registry.prepare_recv_addr(env).map(Some),
         }
-    }
-
-    #[inline]
-    fn next_request_id(&mut self) -> u64 {
-        self.next_request_id = self.next_request_id.wrapping_add(1);
-        if self.next_request_id == 0 {
-            self.next_request_id = 1;
-        }
-        self.next_request_id
     }
 }
 
@@ -578,8 +606,7 @@ mod tests {
         BufferRegistrationMode,
         config::{BorrowedRawHandle, IoFd, IocpHandle, RawHandle},
         driver::IocpDriverCompletionDiagnostics,
-        net::addr::SockAddrStorage,
-        rio::core::RioOpKind,
+        rio::core::{RioCompletionKind, RioOpKind, RioRequestContextDecode},
     };
     use slotmap::SlotMap;
     use veloq_buf::{FixedBuf, NoopRegistrar};
@@ -597,8 +624,9 @@ mod tests {
             actors: SlotMap::with_key(),
             actor_by_handle: FastHashMap::default(),
             socket_runtime: FastHashMap::default(),
-            outstanding_count: 0,
+            rio_outstanding_count: 0,
             next_request_id: 0,
+            deferred_kernel_ops: Vec::new(),
             deferred_payloads: Vec::new(),
             diagnostics: IocpDriverCompletionDiagnostics::default(),
             cq_armed: true,
@@ -615,17 +643,133 @@ mod tests {
             handle,
             token: OpToken::from_registry_parts(11, Generation::new(17))
                 .expect("test token should be encodable"),
-            op_kind: RioOpKind::RecvFrom,
+            op_kind: RioOpKind::UdpRecvMulti,
             buffer_kind: RioSubmissionKind::Recv,
             buffer,
             buffer_offset: 0,
-            operation: "test_recv_from",
+            operation: "test_recv_multi",
             address,
             dispatch_error: RioError::Internal,
             dispatch_note: "test dispatch missing",
             submit_scope: "rio.core.tests.submit",
             submit_note: "test submit failed",
+            receive_slot_id: None,
+            receive_slot_generation: None,
         }
+    }
+
+    fn multi_plan<'a>(
+        handle: BorrowedRawHandle<'a>,
+        buffer: &'a FixedBuf,
+        slot_id: u32,
+        slot_generation: u32,
+    ) -> RioSubmitPlan<'a> {
+        let mut plan = test_plan(handle, buffer, RioAddressPolicy::RecvMulti);
+        plan.op_kind = RioOpKind::UdpRecvMulti;
+        plan.operation = "test_recv_multi";
+        plan.receive_slot_id = Some(slot_id);
+        plan.receive_slot_generation = Some(slot_generation);
+        plan
+    }
+
+    fn release_request_init(state: &mut RioState, init: RioOpRequestInit) {
+        let dispatch = test_helpers::test_dispatch();
+        let env = test_helpers::test_env(&dispatch);
+        state
+            .registry
+            .free_addr_reservation(init.addr)
+            .expect("address lease should release");
+        state
+            .registry
+            .release_buffer_lease(init.buffer_lease, env)
+            .expect("buffer lease should release");
+        state
+            .release_request_inflight(init.op_kind, init.socket_inflight)
+            .expect("socket inflight token should release");
+        state.rio_outstanding_count -= 1;
+    }
+
+    #[test]
+    fn multishot_submit_keeps_request_identity_and_rio_receive_ex_shape() {
+        let _guard = test_helpers::lock_dispatch_state();
+        test_helpers::reset_dispatch_state();
+        let mut state = test_state_with_dispatch(2);
+        let socket = IocpHandle::for_socket(3 as _);
+        state.mark_socket_registered(socket);
+        let raw = RawHandle::new(socket);
+        let first_buf = test_helpers::fixed_buf(64, 0);
+        let second_buf = test_helpers::fixed_buf(64, 0);
+        let first_context = Cell::new(0_u64);
+        let second_context = Cell::new(0_u64);
+
+        let first = state
+            .submit_rio_with_request(
+                multi_plan(raw.borrow(), &first_buf, 7, 11),
+                &NoopRegistrar,
+                |kernel, request| {
+                    first_context.set(request.as_request_context() as usize as u64);
+                    let addr = request.addr.as_ref().expect("multishot address lease");
+                    kernel.submit_receive_multi(
+                        request.rq,
+                        &request.data_buf.rio_buf,
+                        &addr.rio_buf,
+                        request.as_request_context(),
+                    )
+                },
+            )
+            .expect("first multishot submit should succeed");
+        let second = state
+            .submit_rio_with_request(
+                multi_plan(raw.borrow(), &second_buf, 8, 3),
+                &NoopRegistrar,
+                |kernel, request| {
+                    second_context.set(request.as_request_context() as usize as u64);
+                    let addr = request.addr.as_ref().expect("multishot address lease");
+                    kernel.submit_receive_multi(
+                        request.rq,
+                        &request.data_buf.rio_buf,
+                        &addr.rio_buf,
+                        request.as_request_context(),
+                    )
+                },
+            )
+            .expect("second multishot submit should succeed");
+
+        assert_ne!(first.request_id, second.request_id);
+        assert_eq!(state.rio_outstanding_count, 2);
+        assert_eq!(state.registry.addr_free_slots.len(), 0);
+        assert_eq!(test_helpers::RECEIVE_EX_CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            test_helpers::RECEIVE_EX_DATA_COUNT.load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            test_helpers::RECEIVE_EX_REMOTE_ADDR.load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(test_helpers::RECEIVE_EX_FLAGS.load(Ordering::SeqCst), 0);
+
+        for (raw_context, slot_id, generation) in [
+            (first_context.get(), 7_u32, 11_u32),
+            (second_context.get(), 8_u32, 3_u32),
+        ] {
+            let init = match state.decode_req_ctx_checked(raw_context) {
+                RioRequestContextDecode::Valid(kind) => {
+                    let RioCompletionKind::Op { init, .. } = *kind;
+                    init
+                }
+                _ => panic!("multishot request context should decode"),
+            };
+            assert_eq!(init.token.index(), 11);
+            assert_eq!(init.op_kind, RioOpKind::UdpRecvMulti);
+            assert_eq!(init.receive_slot_id, Some(slot_id));
+            assert_eq!(init.receive_slot_generation, Some(generation));
+            assert_eq!(init.diagnostics.receive_slot_id, Some(slot_id));
+            assert_eq!(init.diagnostics.receive_slot_generation, Some(generation));
+            release_request_init(&mut state, init);
+        }
+        assert_eq!(state.rio_outstanding_count, 0);
+        assert_eq!(state.registry.addr_free_slots.len(), 2);
     }
 
     #[test]
@@ -635,18 +779,11 @@ mod tests {
         let mut state = test_state_with_dispatch(4);
         let socket = IocpHandle::for_socket(1 as _);
         state.mark_socket_registered(socket);
-        assert!(state.begin_socket_cleanup(socket));
+        assert!(state.begin_socket_cleanup(socket).unwrap());
 
         let raw = RawHandle::new(socket);
         let buf = test_helpers::fixed_buf(64, 16);
-        let mut addr = SockAddrStorage::default();
-        let plan = test_plan(
-            raw.borrow(),
-            &buf,
-            RioAddressPolicy::RecvFrom {
-                addr_ptr: (&mut addr as *mut SockAddrStorage).cast(),
-            },
-        );
+        let plan = test_plan(raw.borrow(), &buf, RioAddressPolicy::RecvMulti);
 
         let err = match state.submit_rio(plan, &NoopRegistrar, |_kernel, _request| {
             panic!("closing socket should fail before kernel submit")
@@ -656,7 +793,7 @@ mod tests {
         };
 
         assert_eq!(*err.inner(), RioError::InvalidInput);
-        assert_eq!(state.outstanding_count, 0);
+        assert_eq!(state.rio_outstanding_count, 0);
         assert_eq!(state.socket_runtime.get(&socket).unwrap().inflight, 0);
         assert!(state.actors.is_empty());
         assert!(state.actor_by_handle.is_empty());
@@ -682,15 +819,8 @@ mod tests {
 
         let raw = RawHandle::new(socket);
         let buf = test_helpers::fixed_buf(64, 16);
-        let mut addr = SockAddrStorage::default();
         let request_context = Cell::new(0_u64);
-        let plan = test_plan(
-            raw.borrow(),
-            &buf,
-            RioAddressPolicy::RecvFrom {
-                addr_ptr: (&mut addr as *mut SockAddrStorage).cast(),
-            },
-        );
+        let plan = test_plan(raw.borrow(), &buf, RioAddressPolicy::RecvMulti);
 
         let err = match state.submit_rio(plan, &NoopRegistrar, |_kernel, request| {
             request_context.set(request.as_request_context() as usize as u64);
@@ -710,7 +840,7 @@ mod tests {
                 .decode_request_context(request_context.get())
                 .is_none()
         );
-        assert_eq!(state.outstanding_count, 0);
+        assert_eq!(state.rio_outstanding_count, 0);
         assert_eq!(state.socket_runtime.get(&socket).unwrap().inflight, 0);
         assert_eq!(state.registry.addr_free_slots.len(), 4);
         assert!(

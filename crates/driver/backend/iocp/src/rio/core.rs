@@ -5,12 +5,17 @@ mod request;
 mod submit_ops;
 mod submit_txn;
 
-pub(crate) use registry::{RioBufferLeaseToken, RioRegistry, RioSubmissionKind};
+pub(crate) use registry::{
+    RioAddrReservation, RioBufferLeaseToken, RioRegistry, RioSubmissionKind,
+};
+#[cfg(test)]
+pub(crate) use request::RioRequestDiagnostics;
 pub(crate) use request::{
     RioAddressPolicy, RioCompletedRequestContext, RioCompletionKind, RioOpKind, RioOpRequestInit,
     RioPreparedRequestContext, RioRequestContextDecode, RioRequestContextId, RioSubmitPlan,
 };
 pub(crate) use submit_ops::{RioBufferId, RioCq, RioDispatch, RioKernel, RioProvider, RioRq};
+pub(crate) use submit_txn::RioSubmittedRequest;
 
 use crate::{
     error::{IocpError, IocpResult, iocp_report_to_event_res},

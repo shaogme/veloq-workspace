@@ -713,7 +713,7 @@ mod tests {
             }
         };
         assert_eq!(record.event.completion_token(), completion_token);
-        assert_eq!(record.payload, ());
+        assert_eq!(record.payload, Some(()));
     }
 
     #[test]

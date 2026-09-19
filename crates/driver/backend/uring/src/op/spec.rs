@@ -1,30 +1,32 @@
 use crate::{
     OwnedRawHandle,
     driver::env::{CqeEnv, SqeEnv},
+    driver::registration::provided_buf::ProvidedBufLeaseAction,
     error::{UringError, UringResult},
     op::{
         Accept, AcceptMulti, AcceptedSocket, Close, CompletionCardinality, Connect,
         ErasedOperationDescriptor, Fallocate, FallocateRaw, Fsync, FsyncRaw, OpSend, Open,
         OperationDescriptor, ProvidedBuf, ReadFixed, ReadRaw, RecordPolicy, Recv, RecvMulti,
         RecvProvided, SendTo, SubmissionStrategy, SyncFileRange, SyncFileRangeRaw, Timeout,
-        UdpConnect, UdpRecv, UdpRecvFrom, UdpSend, UringKernelOp, UringRecordItem, UringSlotSpec,
-        UringUserPayload, Wakeup, WriteFixed, WriteRaw, payload, submit,
+        UdpConnect, UdpRecvMulti, UdpRecvPacket, UdpSend, UringKernelOp, UringRecordItem,
+        UringSlotSpec, UringUserPayload, Wakeup, WriteFixed, WriteRaw, payload, submit,
     },
 };
 use diagweave::prelude::*;
-use veloq_buf::heap::ChunkId;
+use veloq_buf::{FixedBuf, heap::ChunkId};
 use veloq_driver_core::{
     driver::{CompletionCleanupGuard, OpToken, SubmitTokenContext},
+    op::types::UdpRecvMultiBackend,
     op::{IntoPlatformOp, LostReason, OpCompletion, OpError, OpKind, OpResult, SingleShotOp},
+    platform::receive_pump::{ReceivePumpError, ReceivePumpEvent},
     slot::{SlotAccess, SlotAccessError},
 };
-use veloq_io_uring::squeue;
-use veloq_std::{convert::identity, format, pin::Pin, time::Duration};
+use veloq_io_uring::{cqueue, squeue};
+use veloq_std::{convert::identity, format, num::NonZeroUsize, pin::Pin, time::Duration};
 
 use submit::{
     completion_cleanup_close_raw_fd as cleanup_close_raw_fd,
     on_complete_accept as on_complete_accept_descriptor,
-    on_complete_udp_recv_from as on_complete_udp_recv_from_descriptor,
     resolve_chunks_read_fixed as resolve_chunks_read_fixed_descriptor,
     resolve_chunks_read_raw as resolve_chunks_read_raw_descriptor,
     resolve_chunks_write_fixed as resolve_chunks_write_fixed_descriptor,
@@ -88,6 +90,23 @@ pub(crate) trait UringOpSpec: Sized + Send + 'static {
     ) -> UringResult<UringRecordItem> {
         Ok(UringRecordItem::UseSubmitPayload)
     }
+
+    fn resume_item(
+        _kernel: Pin<&mut Self::KernelPayload>,
+        _payload: &mut Self,
+        _token: OpToken,
+        _logical_receiver_generation: u32,
+        _env: &mut CqeEnv<'_, '_>,
+    ) -> UringResult<UringRecordItem> {
+        Err(UringError::InvalidState.report(
+            "uring.op.spec.resume_item",
+            "operation does not support backend resume ingress",
+        ))
+    }
+
+    fn receive_generation(_payload: &Self) -> Option<u32> {
+        None
+    }
 }
 
 pub(crate) trait UringOperationDescriptor: UringOpSpec {
@@ -145,6 +164,15 @@ pub(crate) trait UringOperationDescriptor: UringOpSpec {
         flags: u32,
         env: &mut CqeEnv<'_, '_>,
     ) -> UringResult<UringRecordItem>;
+    unsafe fn resume_item_dispatch(
+        access: &mut SlotAccess<'_, UringSlotSpec>,
+        token: OpToken,
+        logical_receiver_generation: u32,
+        env: &mut CqeEnv<'_, '_>,
+    ) -> UringResult<UringRecordItem>;
+    unsafe fn receive_generation_dispatch(
+        access: &mut SlotAccess<'_, UringSlotSpec>,
+    ) -> Option<u32>;
 }
 
 fn new_accept_kernel(_user: &Accept) -> payload::AcceptPayload {
@@ -159,8 +187,8 @@ fn new_send_to_kernel(_user: &SendTo) -> payload::SendToPayload {
     payload::SendToPayload::new()
 }
 
-fn new_udp_recv_from_kernel(_user: &UdpRecvFrom) -> payload::UdpRecvFromPayload {
-    payload::UdpRecvFromPayload::new()
+fn new_udp_recv_multi_kernel(_user: &UdpRecvMulti) -> payload::UdpRecvMultiPayload {
+    payload::UdpRecvMultiPayload::new()
 }
 
 fn new_wakeup_kernel(_user: &Wakeup) -> payload::WakeupPayload {
@@ -233,6 +261,33 @@ where
     Ok(UringRecordItem::UseSubmitPayload)
 }
 
+fn descriptor_resume_item_none<S>(
+    _kernel: Pin<&mut S::KernelPayload>,
+    _payload: &mut S,
+    _token: OpToken,
+    _logical_receiver_generation: u32,
+    _env: &mut CqeEnv<'_, '_>,
+) -> UringResult<UringRecordItem>
+where
+    S: UringOpSpec,
+{
+    Err(UringError::InvalidState.report(
+        "uring.op.spec.resume_item",
+        "operation does not support backend resume ingress",
+    ))
+}
+
+fn descriptor_receive_generation_none<S>(_payload: &S) -> Option<u32>
+where
+    S: UringOpSpec,
+{
+    None
+}
+
+fn descriptor_receive_generation_udp(user: &UdpRecvMulti) -> Option<u32> {
+    Some(user.receive_pump().logical_receiver_generation())
+}
+
 fn descriptor_record_item_provided<S>(
     _kernel: Pin<&mut S::KernelPayload>,
     _payload: &mut S,
@@ -244,7 +299,17 @@ fn descriptor_record_item_provided<S>(
 where
     S: UringOpSpec,
 {
-    let buf = env.take_provided_buf(flags, result)?;
+    let Some(mut lease) = env.take_selected_lease(flags, result)? else {
+        return Ok(UringRecordItem::New(UringUserPayload::from_storage(
+            UringUserPayloadStorage::ProvidedBuf(ProvidedBuf { buf: None }),
+        )));
+    };
+    env.handoff_selected_lease(&mut lease)?;
+    env.begin_selected_delivery(&mut lease)?;
+    let lease_len = lease.len();
+    let buf = lease.take_buffer_for_delivery();
+    env.settle_selected_lease(&mut lease, ProvidedBufLeaseAction::Republish)?;
+    debug_assert_eq!(buf.as_ref().map(FixedBuf::len), Some(lease_len));
     Ok(UringRecordItem::New(UringUserPayload::from_storage(
         UringUserPayloadStorage::ProvidedBuf(ProvidedBuf { buf }),
     )))
@@ -264,6 +329,231 @@ where
     Ok(UringRecordItem::New(UringUserPayload::from_storage(
         UringUserPayloadStorage::AcceptedSocket(AcceptedSocket),
     )))
+}
+
+fn udp_receive_pump_report(scope: &'static str, error: ReceivePumpError) -> Report<UringError> {
+    UringError::InvalidState
+        .report(scope, "UDP receive pump rejected a multishot transition")
+        .with_ctx("pump_error", format!("{error:?}"))
+}
+
+fn descriptor_finish_udp_packet(
+    kernel: Pin<&mut payload::UdpRecvMultiPayload>,
+    user: &mut UdpRecvMulti,
+    env: &mut CqeEnv<'_, '_>,
+    rearm_generation: Option<u32>,
+) -> UringResult<UringRecordItem> {
+    const SCOPE: &str = "uring.op.spec.finish_udp_recv_multi";
+    let kernel = unsafe { kernel.get_unchecked_mut() };
+    let Some(delivery) = user.receive_pump_mut().next_datagram_delivery() else {
+        if let Some(generation) = rearm_generation
+            && user.receive_pump().pending_datagrams() == 0
+            && user.receive_pump().permits_available() > 0
+        {
+            return Ok(UringRecordItem::Retained {
+                logical_receiver_generation: Some(generation),
+            });
+        }
+        return Ok(UringRecordItem::Retained {
+            logical_receiver_generation: None,
+        });
+    };
+    let key = delivery.key();
+    let Some(mut pending) = kernel.take_pending_by_key(key) else {
+        drop(delivery);
+        return Err(UringError::InvalidState.report(
+            SCOPE,
+            "UDP delivery permit had no matching provided-buffer lease",
+        ));
+    };
+
+    if let Err(report) = env.begin_selected_delivery(&mut pending.lease) {
+        let _ = env.settle_selected_lease(&mut pending.lease, ProvidedBufLeaseAction::Quarantine);
+        drop(delivery);
+        return Err(report);
+    }
+    let datagram_capacity = user.receive_pump().config().datagram_capacity.get();
+    let parsed = match pending.lease.as_slice() {
+        Some(bytes) => payload::parse_udp_recvmsg(bytes, kernel.message(), datagram_capacity),
+        None => Err(UringError::InvalidState.report(SCOPE, "pending UDP lease has no buffer")),
+    };
+    let parsed = match parsed {
+        Ok(parsed) if parsed.flags & libc::MSG_TRUNC as u32 == 0 => parsed,
+        Ok(parsed) => {
+            let report = UringError::InvalidInput
+                .report(SCOPE, "UDP datagram was truncated by the selected buffer")
+                .with_ctx("payload_length", parsed.payload.len())
+                .with_ctx("datagram_capacity", datagram_capacity);
+            let _ =
+                env.settle_selected_lease(&mut pending.lease, ProvidedBufLeaseAction::Quarantine);
+            drop(delivery);
+            return Err(report);
+        }
+        Err(report) => {
+            let _ =
+                env.settle_selected_lease(&mut pending.lease, ProvidedBufLeaseAction::Quarantine);
+            drop(delivery);
+            return Err(report);
+        }
+    };
+    if parsed.payload.len() != pending.len || parsed.addr != pending.addr {
+        let report = UringError::InvalidState
+            .report(
+                SCOPE,
+                "pending UDP lease metadata no longer matches recvmsg payload",
+            )
+            .with_ctx("metadata_length", pending.len)
+            .with_ctx("payload_length", parsed.payload.len());
+        let _ = env.settle_selected_lease(&mut pending.lease, ProvidedBufLeaseAction::Quarantine);
+        drop(delivery);
+        return Err(report);
+    }
+
+    let mut output = FixedBuf::alloc_heap(
+        NonZeroUsize::new(datagram_capacity).expect("validated datagram capacity is non-zero"),
+        0,
+    )
+    .map_err(|_| UringError::Internal.report(SCOPE, "UDP output buffer allocation failed"))?;
+    output.spare_capacity_mut()[..parsed.payload.len()].copy_from_slice(parsed.payload);
+    output.set_len(parsed.payload.len());
+    if let Err(report) =
+        env.settle_selected_lease(&mut pending.lease, ProvidedBufLeaseAction::Republish)
+    {
+        drop(delivery);
+        return Err(report);
+    }
+    let packet = user
+        .receive_pump_mut()
+        .finish_datagram_delivery(delivery, output)
+        .map_err(|error| udp_receive_pump_report(SCOPE, error))?;
+    let item = UringUserPayload::from_storage(UringUserPayloadStorage::UdpRecvPacket(packet));
+    if let Some(generation) = rearm_generation
+        && user.receive_pump().pending_datagrams() == 0
+        && user.receive_pump().permits_available() > 0
+    {
+        return Ok(UringRecordItem::NewWithRearm {
+            item,
+            logical_receiver_generation: generation,
+        });
+    }
+    Ok(UringRecordItem::New(item))
+}
+
+fn descriptor_record_item_udp_packet(
+    mut kernel: Pin<&mut payload::UdpRecvMultiPayload>,
+    user: &mut UdpRecvMulti,
+    _token: OpToken,
+    result: i32,
+    flags: u32,
+    env: &mut CqeEnv<'_, '_>,
+) -> UringResult<UringRecordItem> {
+    const SCOPE: &str = "uring.op.spec.record_item_udp_recv_multi";
+    let rearm_generation = if result == -libc::ENOBUFS {
+        let event = user
+            .receive_pump_mut()
+            .retain_for_rearm()
+            .map_err(|error| udp_receive_pump_report(SCOPE, error))?;
+        match event {
+            ReceivePumpEvent::Retained {
+                logical_receiver_generation,
+            } => Some(logical_receiver_generation),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if result == -libc::ENOBUFS {
+        return descriptor_finish_udp_packet(kernel, user, env, rearm_generation);
+    }
+    let Some(mut lease) = env.take_selected_lease(flags, result)? else {
+        let report = if result < 0 {
+            UringError::CompletionWait
+                .report(SCOPE, "UDP recvmsg completion selected no provided buffer")
+                .set_error_code(-result)
+        } else {
+            UringError::InvalidInput.report(SCOPE, "UDP recvmsg completion selected no buffer")
+        };
+        return Err(report);
+    };
+
+    if let Err(report) = env.handoff_selected_lease(&mut lease) {
+        let _ = env.settle_selected_lease(&mut lease, ProvidedBufLeaseAction::Quarantine);
+        return Err(report);
+    }
+    if result < 0 {
+        let report = UringError::CompletionWait
+            .report(SCOPE, "UDP recvmsg completion returned an error")
+            .set_error_code(-result);
+        let _ = env.settle_selected_lease(&mut lease, ProvidedBufLeaseAction::Quarantine);
+        return Err(report);
+    }
+
+    let datagram_capacity = user.receive_pump().config().datagram_capacity.get();
+    let parsed = match lease.as_slice() {
+        Some(bytes) => payload::parse_udp_recvmsg(
+            bytes,
+            kernel.as_ref().get_ref().message(),
+            datagram_capacity,
+        ),
+        None => Err(UringError::InvalidState.report(SCOPE, "selected lease has no buffer")),
+    }?;
+    if parsed.flags & libc::MSG_TRUNC as u32 != 0 {
+        let report = UringError::InvalidInput
+            .report(SCOPE, "UDP datagram was truncated by the selected buffer")
+            .with_ctx("payload_length", parsed.payload.len())
+            .with_ctx("datagram_capacity", datagram_capacity);
+        let _ = env.settle_selected_lease(&mut lease, ProvidedBufLeaseAction::Quarantine);
+        return Err(report);
+    }
+    let admission = match user
+        .receive_pump_mut()
+        .admit_datagram(parsed.payload.len(), parsed.addr)
+    {
+        Ok(admission) => admission,
+        Err(error) => {
+            let _ = env.settle_selected_lease(&mut lease, ProvidedBufLeaseAction::Quarantine);
+            return Err(udp_receive_pump_report(SCOPE, error));
+        }
+    };
+    unsafe { kernel.as_mut().get_unchecked_mut() }.push_pending(payload::UdpPendingLease {
+        key: admission.key(),
+        addr: parsed.addr,
+        len: parsed.payload.len(),
+        lease,
+    });
+
+    let rearm_generation = if !cqueue::more(flags) {
+        let event = user
+            .receive_pump_mut()
+            .retain_for_rearm()
+            .map_err(|error| udp_receive_pump_report(SCOPE, error))?;
+        match event {
+            ReceivePumpEvent::Retained {
+                logical_receiver_generation,
+            } => Some(logical_receiver_generation),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    descriptor_finish_udp_packet(kernel, user, env, rearm_generation)
+}
+
+fn descriptor_resume_item_udp_packet(
+    kernel: Pin<&mut payload::UdpRecvMultiPayload>,
+    user: &mut UdpRecvMulti,
+    _token: OpToken,
+    logical_receiver_generation: u32,
+    env: &mut CqeEnv<'_, '_>,
+) -> UringResult<UringRecordItem> {
+    if user.receive_pump().logical_receiver_generation() != logical_receiver_generation {
+        return Ok(UringRecordItem::Ignored);
+    }
+    let rearm_generation = user
+        .receive_pump()
+        .rearm_pending()
+        .then(|| user.receive_pump().logical_receiver_generation());
+    descriptor_finish_udp_packet(kernel, user, env, rearm_generation)
 }
 
 fn descriptor_cleanup_none(_result: i32) -> CompletionCleanupGuard {
@@ -373,6 +663,27 @@ macro_rules! descriptor_record_factory {
     (accepted_socket) => {
         descriptor_record_item_accepted
     };
+    (udp_packet) => {
+        descriptor_record_item_udp_packet
+    };
+}
+
+macro_rules! descriptor_resume_factory {
+    (udp_packet) => {
+        descriptor_resume_item_udp_packet
+    };
+    ($other:ident) => {
+        descriptor_resume_item_none
+    };
+}
+
+macro_rules! descriptor_generation_factory {
+    (udp_packet) => {
+        descriptor_receive_generation_udp
+    };
+    ($other:ident) => {
+        descriptor_receive_generation_none
+    };
 }
 
 macro_rules! descriptor_cleanup {
@@ -476,6 +787,26 @@ macro_rules! impl_uring_op_spec {
                 descriptor_record_factory!($record_factory)(
                     kernel, payload, token, result, flags, env,
                 )
+            }
+
+            fn resume_item(
+                kernel: Pin<&mut Self::KernelPayload>,
+                payload: &mut Self,
+                token: OpToken,
+                logical_receiver_generation: u32,
+                env: &mut CqeEnv<'_, '_>,
+            ) -> UringResult<UringRecordItem> {
+                descriptor_resume_factory!($record_factory)(
+                    kernel,
+                    payload,
+                    token,
+                    logical_receiver_generation,
+                    env,
+                )
+            }
+
+            fn receive_generation(payload: &Self) -> Option<u32> {
+                descriptor_generation_factory!($record_factory)(payload)
             }
         }
     };
@@ -686,6 +1017,45 @@ macro_rules! impl_uring_operation_descriptor {
                 }?
             }
 
+            unsafe fn resume_item_dispatch(
+                access: &mut SlotAccess<'_, UringSlotSpec>,
+                token: OpToken,
+                logical_receiver_generation: u32,
+                env: &mut CqeEnv<'_, '_>,
+            ) -> UringResult<UringRecordItem> {
+                unsafe {
+                    Self::with_projected_access(
+                        access,
+                        Some(token),
+                        "uring.op.spec.resume_item",
+                        |kernel, user| {
+                            Self::resume_item(
+                                kernel,
+                                user,
+                                token,
+                                logical_receiver_generation,
+                                env,
+                            )
+                        },
+                    )
+                }?
+            }
+
+            unsafe fn receive_generation_dispatch(
+                access: &mut SlotAccess<'_, UringSlotSpec>,
+            ) -> Option<u32> {
+                unsafe {
+                    Self::with_projected_access(
+                        access,
+                        None,
+                        "uring.op.spec.receive_generation",
+                        |_, user| Self::receive_generation(user),
+                    )
+                }
+                .ok()
+                .flatten()
+            }
+
             fn descriptor() -> &'static OperationDescriptor<Self> {
                 static DESCRIPTOR: OperationDescriptor<$OpType> = OperationDescriptor {
                     new_kernel: $new_kernel,
@@ -707,6 +1077,9 @@ macro_rules! impl_uring_operation_descriptor {
                         resolve_chunks:
                             <$OpType as UringOperationDescriptor>::resolve_chunks_dispatch,
                         record_item: <$OpType as UringOperationDescriptor>::record_item_dispatch,
+                        resume_item: <$OpType as UringOperationDescriptor>::resume_item_dispatch,
+                        receive_generation:
+                            <$OpType as UringOperationDescriptor>::receive_generation_dispatch,
                     },
                 };
                 &DESCRIPTOR
@@ -803,6 +1176,9 @@ macro_rules! descriptor_record_policy {
     };
     (AcceptedSocket) => {
         RecordPolicy::NewAcceptedSocket
+    };
+    (UdpRecvPacket) => {
+        RecordPolicy::UdpMultishot
     };
 }
 
@@ -1225,6 +1601,28 @@ macro_rules! generated_user_ids {
         generated_user_ids!(@collect
             [$provided $accepted]
             [$($arms)* Self::$user_variant(_) => PayloadId::User(stringify!($user_variant)),]
+            $($tail)*
+        );
+    };
+    (
+        @collect [$provided:ident $accepted:ident] [$($arms:tt)*]
+        $OpType:ty {
+            user: $user_variant:ident,
+            kernel: $kernel_variant:ident,
+            kernel_type: $kernel_type:ty,
+            kind: $kind:path,
+            completion: $completion:ty,
+            record: UdpRecvPacket($record:ty),
+            $($rest:tt)*
+        };
+        $($tail:tt)*
+    ) => {
+        generated_user_ids!(@collect
+            [$provided $accepted]
+            [$($arms)*
+                Self::$user_variant(_) => PayloadId::User(stringify!($user_variant)),
+                Self::UdpRecvPacket(_) => PayloadId::Record("UdpRecvPacket"),
+            ]
             $($tail)*
         );
     };
@@ -1669,24 +2067,6 @@ declare_uring_operations! {
         cleanup: none,
         map: identity,
     };
-    UdpRecv {
-        user: UdpRecv,
-        kernel: UdpRecv,
-        kernel_type: payload::KernelRef<UdpRecv>,
-        kind: OpKind::UdpRecv,
-        completion: usize,
-        record: submit,
-        strategy: SubmissionStrategy::SubmitSqe,
-        cardinality: single,
-        new_kernel: payload::kernel_ref,
-        make_sqe: submit::make_sqe_udp_recv,
-        resolve_chunks: none,
-        on_complete: default,
-        get_timeout: default,
-        record_factory: use_submit,
-        cleanup: none,
-        map: identity,
-    };
     UdpSend {
         user: UdpSend,
         kernel: UdpSend,
@@ -1921,21 +2301,21 @@ declare_uring_operations! {
         cleanup: none,
         map: identity,
     };
-    UdpRecvFrom {
-        user: UdpRecvFrom,
-        kernel: UdpRecvFrom,
-        kernel_type: payload::UdpRecvFromPayload,
-        kind: OpKind::UdpRecvFrom,
+    UdpRecvMulti {
+        user: UdpRecvMulti,
+        kernel: UdpRecvMulti,
+        kernel_type: payload::UdpRecvMultiPayload,
+        kind: OpKind::UdpRecvMulti,
         completion: usize,
-        record: submit,
+        record: UdpRecvPacket(UdpRecvPacket),
         strategy: SubmissionStrategy::SubmitSqe,
-        cardinality: single,
-        new_kernel: new_udp_recv_from_kernel,
-        make_sqe: submit::make_sqe_udp_recv_from,
+        cardinality: multi,
+        new_kernel: new_udp_recv_multi_kernel,
+        make_sqe: submit::make_sqe_udp_recv_multi,
         resolve_chunks: none,
-        on_complete: on_complete_udp_recv_from_descriptor,
+        on_complete: default,
         get_timeout: default,
-        record_factory: use_submit,
+        record_factory: udp_packet,
         cleanup: none,
         map: identity,
     };
@@ -2014,6 +2394,7 @@ mod tests {
     use veloq_driver_core::{
         driver::{OpToken, SubmitTokenContext, registry::OpEntry},
         op::IntoPlatformOp,
+        platform::receive_pump::{ReceivePumpConfig, ReceivePumpState, ReceiveSlot},
         slot::{
             CheckedSlotView, Reserved, Slot, SlotAccess, SlotAccessOutcome, SlotRegistryExt,
             SlotView,
@@ -2044,6 +2425,17 @@ mod tests {
 
     fn socket_addr() -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 12345))
+    }
+
+    fn udp_pump() -> ReceivePumpState {
+        let config = ReceivePumpConfig {
+            kernel_capacity: NonZeroUsize::new(1).expect("depth is non-zero"),
+            queue_capacity: NonZeroUsize::new(1).expect("queue is non-zero"),
+            datagram_capacity: NonZeroUsize::new(16).expect("datagram capacity is non-zero"),
+            close_timeout: Duration::from_secs(1),
+        };
+        let slots = veloq_std::vec![ReceiveSlot::new(0, buffer(4))].into_boxed_slice();
+        ReceivePumpState::try_new(config, slots).expect("test UDP pump should be valid")
     }
 
     fn storage_addr() -> (SockAddrStorage, u32) {
@@ -2156,49 +2548,6 @@ mod tests {
         })
     }
 
-    fn measure_udp_recv_from_dispatch(
-        operation: UdpRecvFrom,
-        env: &SqeEnv<'_>,
-    ) -> AllocationCounts {
-        let diagnostics = UringCompletionDiagnostics::default();
-        let mut cqe_env = CqeEnv::new(None, &diagnostics);
-        let (storage, storage_len) = storage_addr();
-        with_test_slot(operation, |token, slot| {
-            let (_, counts) = measure(|| {
-                with_test_access(slot, |access| {
-                    let descriptor = access.operation().get_ref().descriptor();
-                    let _entry = unsafe {
-                        (descriptor.make_sqe)(access, env, SubmitTokenContext::user(token))
-                    }
-                    .expect("baseline UDP recv-from SQE dispatch should succeed");
-                    unsafe {
-                        <UdpRecvFrom as UringOperationDescriptor>::with_projected_access(
-                            access,
-                            Some(token),
-                            "uring.op.spec.test.measure_udp_recv_from",
-                            |kernel, _| {
-                                kernel
-                                    .get_unchecked_mut()
-                                    .test_set_received_address(storage.0, storage_len as usize);
-                            },
-                        )
-                    }
-                    .expect("UDP kernel payload projection should succeed");
-                    let completion =
-                        unsafe { (descriptor.on_complete)(access, token, storage_len as i32) }
-                            .expect("baseline UDP recv-from completion dispatch should succeed");
-                    assert_eq!(completion, storage_len as usize);
-                    let _record = unsafe {
-                        (descriptor.record_item)(access, token, storage_len as i32, 0, &mut cqe_env)
-                    }
-                    .expect("baseline UDP recv-from record dispatch should succeed");
-                })
-                .expect("test operation access should succeed");
-            });
-            counts
-        })
-    }
-
     fn measure_timer_dispatch(operation: Timeout) -> AllocationCounts {
         let diagnostics = UringCompletionDiagnostics::default();
         let mut cqe_env = CqeEnv::new(None, &diagnostics);
@@ -2224,8 +2573,8 @@ mod tests {
     }
 
     #[test]
-    fn operation_descriptor_coverage_has_all_26_rows() {
-        const EXPECTED_NAMES: [&str; 26] = [
+    fn operation_descriptor_coverage_has_all_25_rows() {
+        const EXPECTED_NAMES: [&str; 25] = [
             "ReadFixed",
             "ReadRaw",
             "WriteFixed",
@@ -2234,7 +2583,6 @@ mod tests {
             "RecvProvided",
             "RecvMulti",
             "OpSend",
-            "UdpRecv",
             "UdpSend",
             "Connect",
             "UdpConnect",
@@ -2248,7 +2596,7 @@ mod tests {
             "Accept",
             "AcceptMulti",
             "SendTo",
-            "UdpRecvFrom",
+            "UdpRecvMulti",
             "Open",
             "Wakeup",
             "Timeout",
@@ -2278,17 +2626,26 @@ mod tests {
             OPERATION_COVERAGE[6].cardinality,
             CompletionCardinality::Multi
         );
-        assert_eq!(OPERATION_COVERAGE[20].record_payload, "AcceptedSocket");
+        assert_eq!(OPERATION_COVERAGE[19].record_payload, "AcceptedSocket");
         assert_eq!(
-            OPERATION_COVERAGE[20].record_policy,
+            OPERATION_COVERAGE[19].record_policy,
             RecordPolicy::NewAcceptedSocket
         );
         assert_eq!(
-            OPERATION_COVERAGE[20].cardinality,
+            OPERATION_COVERAGE[19].cardinality,
+            CompletionCardinality::Multi
+        );
+        assert_eq!(OPERATION_COVERAGE[21].record_payload, "UdpRecvPacket");
+        assert_eq!(
+            OPERATION_COVERAGE[21].record_policy,
+            RecordPolicy::UdpMultishot
+        );
+        assert_eq!(
+            OPERATION_COVERAGE[21].cardinality,
             CompletionCardinality::Multi
         );
         assert_eq!(
-            OPERATION_COVERAGE[25].strategy,
+            OPERATION_COVERAGE[24].strategy,
             SubmissionStrategy::SoftwareTimer
         );
     }
@@ -2303,7 +2660,7 @@ mod tests {
             size_of::<UringKernelPayloadStorage>(),
             align_of::<UringKernelPayloadStorage>(),
         );
-        assert_eq!(layout, (224, 8, 192, 32, 216, 8));
+        assert_eq!(layout, (224, 8, 352, 32, 216, 8));
     }
 
     #[test]
@@ -2347,15 +2704,6 @@ mod tests {
             &sqe_env,
             4,
         );
-        let udp_recv_from_counts = measure_udp_recv_from_dispatch(
-            UdpRecvFrom {
-                fd: socket_fd(),
-                buf: buffer(4),
-                buf_offset: 0,
-                addr: None,
-            },
-            &sqe_env,
-        );
         let timer_counts = measure_timer_dispatch(Timeout {
             duration: Duration::from_secs(1),
         });
@@ -2366,7 +2714,6 @@ mod tests {
             ("RecvProvided", provided_counts),
             ("RecvMulti", multishot_counts),
             ("SendTo", send_to_counts),
-            ("UdpRecvFrom", udp_recv_from_counts),
             ("Timeout", timer_counts),
         ] {
             assert_no_fast_path_allocations(name, counts);
@@ -2537,18 +2884,6 @@ mod tests {
             OpSend
         );
         assert_mapping!(
-            "UdpRecv",
-            UdpRecv,
-            UdpRecv {
-                fd: socket_fd(),
-                buf: buffer(4),
-                buf_offset: 0,
-            },
-            OpKind::UdpRecv,
-            UdpRecv,
-            UdpRecv
-        );
-        assert_mapping!(
             "UdpSend",
             UdpSend,
             UdpSend {
@@ -2701,17 +3036,12 @@ mod tests {
             SendTo
         );
         assert_mapping!(
-            "UdpRecvFrom",
-            UdpRecvFrom,
-            UdpRecvFrom {
-                fd: socket_fd(),
-                buf: buffer(4),
-                buf_offset: 0,
-                addr: None,
-            },
-            OpKind::UdpRecvFrom,
-            UdpRecvFrom,
-            UdpRecvFrom
+            "UdpRecvMulti",
+            UdpRecvMulti,
+            UdpRecvMulti::from_backend(socket_fd(), udp_pump()),
+            OpKind::UdpRecvMulti,
+            UdpRecvMulti,
+            UdpRecvMulti
         );
         assert_mapping!(
             "Open",
@@ -2977,115 +3307,6 @@ mod tests {
             assert_eq!(unsafe { (*msghdr).msg_name }, msg_name);
             assert_eq!(unsafe { (*msghdr).msg_iov }, iovec);
             assert_eq!(sqe_addr(&entry), msghdr as usize);
-        });
-    }
-
-    #[test]
-    fn udp_recv_from_payload_keeps_self_references_and_decodes_address() {
-        let user = UdpRecvFrom {
-            fd: socket_fd(),
-            buf: buffer(4),
-            buf_offset: 0,
-            addr: None,
-        };
-        // As above, the operation is moved before the kernel pointers are initialized.
-        let file_table = FileTable::new(0, FileTableExhaustion::Fallback);
-        let registrar = NoopRegistrar;
-        let env = test_sqe_env(&file_table, &registrar);
-        let expected_addr = socket_addr();
-        let (storage, len) = storage_addr();
-        with_test_slot(user, |token, slot| {
-            let entry = with_test_access(slot, |access| {
-                let descriptor = access.operation().get_ref().descriptor();
-                unsafe { (descriptor.make_sqe)(access, &env, SubmitTokenContext::user(token)) }
-            })
-            .expect("test operation access should succeed")
-            .expect("udp_recv_from SQE should be built with a direct socket descriptor");
-
-            let (msg_name, iovec, msghdr) = with_test_access(slot, |access| unsafe {
-                <UdpRecvFrom as UringOperationDescriptor>::with_projected_access(
-                    access,
-                    Some(token),
-                    "uring.op.spec.test.udp_recv_from_pointers",
-                    |kernel, _| kernel.get_unchecked_mut().test_pointers(),
-                )
-            })
-            .expect("test operation access should succeed")
-            .expect("UdpRecvFrom kernel payload projection should succeed");
-            assert_eq!(unsafe { (*msghdr).msg_name }, msg_name);
-            assert_eq!(unsafe { (*msghdr).msg_iov }, iovec);
-            assert_eq!(sqe_addr(&entry), msghdr as usize);
-
-            // Writing the storage field in place does not move the payload; it models the
-            // kernel's address write before the existing completion callback reads it.
-            with_test_access(slot, |access| unsafe {
-                <UdpRecvFrom as UringOperationDescriptor>::with_projected_access(
-                    access,
-                    Some(token),
-                    "uring.op.spec.test.udp_recv_from_address",
-                    |kernel, _| {
-                        kernel
-                            .get_unchecked_mut()
-                            .test_set_received_address(storage.0, len as usize);
-                    },
-                )
-            })
-            .expect("test operation access should succeed")
-            .expect("UdpRecvFrom kernel payload projection should succeed");
-            let result = with_test_access(slot, |access| unsafe {
-                let descriptor = access.operation().get_ref().descriptor();
-                (descriptor.on_complete)(access, token, 4)
-            })
-            .expect("test operation access should succeed");
-            assert_eq!(result.expect("valid UDP completion"), 4);
-            let actual_addr = with_test_access(slot, |access| {
-                let (_, payload) = access
-                    .operation_and_payload_mut()
-                    .expect("test payload should remain bound");
-                <UdpRecvFrom as UringOperationDescriptor>::user_payload_ref(payload)
-                    .map(|user| user.addr)
-            })
-            .expect("test operation access should succeed")
-            .expect("test payload should contain UdpRecvFrom");
-            assert_eq!(actual_addr, Some(expected_addr));
-        });
-    }
-
-    #[test]
-    fn udp_recv_from_rejects_an_address_length_beyond_storage() {
-        let user = UdpRecvFrom {
-            fd: socket_fd(),
-            buf: buffer(4),
-            buf_offset: 0,
-            addr: None,
-        };
-        let (storage, _) = storage_addr();
-        with_test_slot(user, |token, slot| {
-            with_test_access(slot, |access| unsafe {
-                <UdpRecvFrom as UringOperationDescriptor>::with_projected_access(
-                    access,
-                    Some(token),
-                    "uring.op.spec.test.udp_recv_from_oversized_address",
-                    |kernel, _| {
-                        kernel.get_unchecked_mut().test_set_received_address(
-                            storage.0,
-                            size_of::<libc::sockaddr_storage>() + 1,
-                        );
-                    },
-                )
-            })
-            .expect("test operation access should succeed")
-            .expect("UdpRecvFrom kernel payload projection should succeed");
-
-            let result = with_test_access(slot, |access| unsafe {
-                let descriptor = access.operation().get_ref().descriptor();
-                (descriptor.on_complete)(access, token, 4)
-            })
-            .expect("test operation access should succeed");
-            let Err(report) = result else {
-                panic!("an oversized sockaddr length must be rejected");
-            };
-            assert_eq!(*report.inner(), UringError::InvalidState);
         });
     }
 }

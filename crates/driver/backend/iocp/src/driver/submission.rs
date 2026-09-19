@@ -25,7 +25,7 @@ use crate::{
     config::{IoFd, RawHandle},
     driver::{
         IocpDriver, IocpDriverCompletionDiagnostics, IocpOpRegistry,
-        registration::close_registered_owned_fd,
+        completion::IocpSubmissionFailurePhase, registration::close_registered_owned_fd,
     },
     error::{IocpError, IocpResult, iocp_fallback_event_res},
     op::{
@@ -60,6 +60,7 @@ impl<'a> SubmitContextInternal<'a> {
 
 struct SubmissionFailureHooks {
     report: Option<Report<IocpError>>,
+    phase: IocpSubmissionFailurePhase,
 }
 
 impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
@@ -80,6 +81,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
         _source: CompletionSource<'_, Self::BackendIngress>,
     ) -> CompletionSettlement<IocpSlotSpec, Self::BackendEffect> {
         let event_res = event.res();
+        let phase = self.phase;
         let mut guard = slot.complete();
         let cleanup = guard
             .with_access_mut(|access| {
@@ -116,6 +118,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
                         .push_ctx("scope", "iocp.driver.SubmissionFailureHooks")
                         .with_ctx("user_data", event.token().index())
                         .with_ctx("generation", event.token().generation())
+                        .with_ctx("submission_phase", format!("{phase:?}"))
                         .attach_note(
                             "payload missing in active slot during submission failure completion",
                         ),
@@ -198,7 +201,7 @@ impl<'a> IocpDriver<'a> {
             }
         };
         guard.platform_mut().generation = generation;
-        guard.platform_mut().rio_cancel_requested = false;
+        guard.platform_mut().rio_user_cancel_requested = false;
         let mut guard = guard
             .init_op_with(op, |sidecar| {
                 sidecar.reset_for_token(token);
@@ -232,6 +235,7 @@ impl<'a> IocpDriver<'a> {
             let event = UserCompletionEvent::from_parts(COMP_BACKEND_IOCP, token, event_res, 0);
             let mut hooks = SubmissionFailureHooks {
                 report: Some(report),
+                phase: IocpSubmissionFailurePhase::Initial,
             };
             let _ = ops.accept_completion(
                 ctx.completion_table,
@@ -354,7 +358,9 @@ impl<'a> IocpDriver<'a> {
         token: OpToken,
         op: IocpOp,
     ) -> IocpResult<IocpResult<SubmissionResult>> {
-        let mut guard = Self::prep_op_slot(&mut self.ops, token, op)
+        let registrar = self.registrar;
+        let state = self.state_mut();
+        let mut guard = Self::prep_op_slot(&mut state.ops, token, op)
             .push_ctx("scope", "iocp/driver")
             .attach_note("failed to prepare op slot")?;
 
@@ -374,11 +380,11 @@ impl<'a> IocpDriver<'a> {
 
         let result = if let Some(fd) = close_fd {
             let close_result =
-                close_registered_owned_fd(&mut self.handles, self.rio.state_mut(), fd);
+                close_registered_owned_fd(&mut state.handles, state.rio.state_mut(), fd);
 
             close_result.and_then(|(raw_handle, io_result)| {
                 let completion = BlockingCompletion::new(
-                    self.completion.port_arc(),
+                    state.completion.port_arc(),
                     CompletionToken::user(token),
                     None,
                 );
@@ -398,14 +404,14 @@ impl<'a> IocpDriver<'a> {
                 Ok(SubmissionResult::PostToQueue)
             })
         } else {
-            let (rio, registrar) = self.rio.state_and_registrar_mut();
-            let registered_slots = self.handles.submission_slots();
+            let (rio, registrar) = state.rio.state_and_registrar_mut(registrar);
+            let registered_slots = state.handles.submission_slots();
             let mut ctx = SubmitContext {
-                port: self.completion.port_arc(),
+                port: state.completion.port_arc(),
                 overlapped,
                 op_token: token,
                 completion_token: CompletionToken::user(token),
-                ext: &self.extensions,
+                ext: &state.extensions,
                 registered_slots,
                 registrar,
                 rio,

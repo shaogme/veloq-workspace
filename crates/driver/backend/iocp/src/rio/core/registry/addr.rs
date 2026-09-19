@@ -20,6 +20,7 @@ use windows_sys::Win32::Networking::WinSock::{
 #[derive(Clone, Copy)]
 pub(crate) struct RioAddrReservation {
     pub(crate) slot: usize,
+    pub(crate) generation: u64,
     pub(crate) rio_buf: RIO_BUF,
 }
 
@@ -61,16 +62,20 @@ impl RioRegistry {
 
     pub(crate) fn copy_addr_slot_to(
         &self,
-        slot: usize,
+        reservation: RioAddrReservation,
         dst: *mut SockAddrStorage,
     ) -> RioResult<()> {
         if dst.is_null() {
-            return RioError::Internal
-                .attach_note("RIO recv_from completion missing output address");
+            return RioError::Internal.attach_note("RIO receive completion missing output address");
         }
-        let Some(src) = self.addr_slots.get(slot) else {
+        if !self.addr_reservation_is_active(reservation) {
+            return Err(
+                self.addr_lease_error(reservation, "copy from inactive or stale address lease")
+            );
+        }
+        let Some(src) = self.addr_slots.get(reservation.slot) else {
             return RioError::Internal
-                .with_ctx("addr_slot", slot)
+                .with_ctx("addr_slot", reservation.slot)
                 .attach_note("RIO address slot out of bounds");
         };
         // SAFETY: `src` is a live scratch slot and `dst` points at the op payload.
@@ -80,29 +85,66 @@ impl RioRegistry {
         Ok(())
     }
 
-    pub(crate) fn free_addr_slot(&mut self, slot: Option<usize>) {
-        let Some(slot) = slot else {
-            return;
+    pub(crate) fn free_addr_reservation(
+        &mut self,
+        reservation: Option<RioAddrReservation>,
+    ) -> RioResult<()> {
+        let Some(reservation) = reservation else {
+            return Ok(());
         };
-        if let Some(in_use) = self.addr_slot_in_use.get_mut(slot)
-            && *in_use
-        {
-            *in_use = false;
-            self.addr_free_slots.push(slot);
+        let Some(in_use) = self.addr_slot_in_use.get_mut(reservation.slot) else {
+            return Err(self.addr_lease_error(reservation, "address lease slot is out of bounds"));
+        };
+        if !*in_use {
+            return Err(self.addr_lease_error(reservation, "address lease was already released"));
         }
+        if self.addr_slot_generations[reservation.slot] != reservation.generation {
+            return Err(self.addr_lease_error(reservation, "address lease generation is stale"));
+        }
+        *in_use = false;
+        self.addr_free_slots.push(reservation.slot);
+        Ok(())
+    }
+
+    fn addr_reservation_is_active(&self, reservation: RioAddrReservation) -> bool {
+        self.addr_slot_in_use
+            .get(reservation.slot)
+            .is_some_and(|in_use| {
+                *in_use && self.addr_slot_generations[reservation.slot] == reservation.generation
+            })
+    }
+
+    fn addr_lease_error(
+        &self,
+        reservation: RioAddrReservation,
+        note: &'static str,
+    ) -> Report<RioError> {
+        RioError::Internal
+            .to_report()
+            .with_ctx("addr_slot", reservation.slot)
+            .with_ctx("addr_generation", reservation.generation)
+            .attach_note(note)
     }
 
     pub(crate) fn allocate_addr_slot(&mut self, env: RioEnv<'_>) -> RioResult<RioAddrReservation> {
-        let buffer_id = self.ensure_addr_buffer_registered(env)?;
-        let Some(slot) = self.addr_free_slots.pop() else {
+        let Some(&slot) = self.addr_free_slots.last() else {
             return RioError::ResourceExhaustion
                 .with_ctx("addr_capacity", self.addr_slots.len())
                 .attach_note("RIO address scratch buffer exhausted");
         };
-        self.addr_slot_in_use[slot] = true;
         let offset = Self::addr_slot_offset(slot)?;
+        let buffer_id = self.ensure_addr_buffer_registered(env)?;
+        let slot = self.addr_free_slots.pop().ok_or_else(|| {
+            RioError::Internal
+                .to_report()
+                .attach_note("RIO address free-list changed during allocation")
+        })?;
+        let generation = self.addr_slot_generations[slot].wrapping_add(1).max(1);
+        self.addr_slot_generations[slot] = generation;
+        self.addr_slot_in_use[slot] = true;
         Ok(RioAddrReservation {
             slot,
+            generation,
             rio_buf: RIO_BUF {
                 BufferId: buffer_id.0,
                 Offset: offset,
@@ -198,8 +240,12 @@ impl RioRegistry {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_helpers::{
+        REGISTER_FAILS, deregistered_ids, lock_dispatch_state, reset_dispatch_state, test_dispatch,
+        test_env,
+    };
     use super::*;
-    use veloq_std::mem::zeroed;
+    use veloq_std::{mem::zeroed, sync::atomic::Ordering::SeqCst};
 
     #[test]
     fn rio_send_addr_validation_rejects_short_sockaddr_before_family_read() {
@@ -256,5 +302,49 @@ mod tests {
         )
         .expect("valid IPv6 sockaddr should pass");
         assert_eq!(rio_len, size_of::<SOCKADDR_INET>() as u32);
+    }
+
+    #[test]
+    fn address_slots_use_exclusive_generation_checked_leases() {
+        let _guard = lock_dispatch_state();
+        reset_dispatch_state();
+        let dispatch = test_dispatch();
+        let env = test_env(&dispatch);
+        let mut registry = RioRegistry::new(32, 1);
+
+        let first = registry
+            .prepare_recv_addr(env)
+            .expect("first address lease should succeed");
+        assert!(registry.prepare_recv_addr(env).is_err());
+        registry
+            .free_addr_reservation(Some(first))
+            .expect("first address lease should release");
+        assert!(registry.free_addr_reservation(Some(first)).is_err());
+
+        let second = registry
+            .prepare_recv_addr(env)
+            .expect("slot should be reusable after release");
+        assert_ne!(first.generation, second.generation);
+        assert!(registry.free_addr_reservation(Some(first)).is_err());
+        registry
+            .free_addr_reservation(Some(second))
+            .expect("second address lease should release");
+        assert_eq!(registry.addr_free_slots.len(), 1);
+        assert!(deregistered_ids().is_empty());
+    }
+
+    #[test]
+    fn address_registration_failure_does_not_consume_a_slot() {
+        let _guard = lock_dispatch_state();
+        reset_dispatch_state();
+        let dispatch = test_dispatch();
+        let env = test_env(&dispatch);
+        let mut registry = RioRegistry::new(32, 1);
+        REGISTER_FAILS.store(true, SeqCst);
+
+        assert!(registry.prepare_recv_addr(env).is_err());
+        assert_eq!(registry.addr_free_slots.len(), 1);
+        assert!(!registry.addr_slot_in_use[0]);
+        assert!(registry.addr_buffer_id.is_invalid());
     }
 }

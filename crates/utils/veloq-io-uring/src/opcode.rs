@@ -887,6 +887,65 @@ impl<T: UseFixed> RecvMsg<T> {
     pub const CODE: u8 = sys::IORING_OP_RECVMSG;
 }
 
+/// Receive datagrams repeatedly with `recvmsg`, selecting one provided buffer per completion.
+#[derive(Debug)]
+pub struct RecvMsgMulti<T: UseFixed = Fd> {
+    fd: T,
+    msg: *mut libc::msghdr,
+    flags: u32,
+    buf_group: u16,
+}
+
+impl<T: UseFixed> RecvMsgMulti<T> {
+    /// Create a multishot `recvmsg` request.
+    ///
+    /// # Safety
+    ///
+    /// `msg` and every writable buffer reachable through the message must remain initialized,
+    /// valid, and at the same addresses until the kernel has finished the request.
+    #[inline]
+    pub unsafe fn new(fd: T, msg: *mut libc::msghdr) -> Self {
+        Self {
+            fd,
+            msg,
+            flags: 0,
+            buf_group: 0,
+        }
+    }
+
+    #[inline]
+    pub const fn flags(mut self, flags: u32) -> Self {
+        self.flags = flags;
+        self
+    }
+
+    #[inline]
+    pub const fn buf_group(mut self, group: u16) -> Self {
+        self.buf_group = group;
+        self
+    }
+
+    #[inline]
+    pub fn build(self) -> Result<Entry> {
+        if self.flags > i32::MAX as u32 {
+            return Err(overflow());
+        }
+        if self.flags & libc::MSG_WAITALL as u32 != 0 {
+            return Err(invalid_input());
+        }
+        let mut sqe = entry_with_fd(Self::CODE, self.fd)?;
+        sqe.addr_or_splice_off_in = self.msg as usize as u64;
+        sqe.len = 1;
+        sqe.op_flags = self.flags;
+        set_buffer_group(&mut sqe, self.buf_group);
+        sqe.flags |= squeue::Flags::BUFFER_SELECT.bits();
+        sqe.ioprio = sys::IORING_RECV_MULTISHOT as u16;
+        Ok(Entry { inner: sqe })
+    }
+
+    pub const CODE: u8 = sys::IORING_OP_RECVMSG;
+}
+
 /// Register a timeout operation.
 #[derive(Debug)]
 pub struct Timeout {
@@ -1101,6 +1160,43 @@ mod tests {
     }
 
     #[test]
+    fn multishot_recvmsg_selects_provided_buffers_and_preserves_message_pointer() {
+        let mut message: libc::msghdr = unsafe { core::mem::zeroed() };
+        let entry = unsafe { RecvMsgMulti::new(Fd(4), ptr::addr_of_mut!(message)) }
+            .flags(libc::MSG_TRUNC as u32)
+            .buf_group(19)
+            .build()
+            .expect("valid multishot recvmsg request");
+        let sqe = raw(&entry);
+        assert_eq!(sqe.opcode, RecvMsgMulti::<types::Fd>::CODE);
+        assert_eq!(sqe.ioprio, sys::IORING_RECV_MULTISHOT as u16);
+        assert_eq!(sqe.flags, squeue::Flags::BUFFER_SELECT.bits());
+        assert_eq!(sqe.buf_index_group, 19_u16.to_ne_bytes());
+        assert_eq!(
+            sqe.addr_or_splice_off_in,
+            ptr::addr_of_mut!(message) as usize as u64
+        );
+        assert_eq!(sqe.len, 1);
+        assert_eq!(sqe.op_flags, libc::MSG_TRUNC as u32);
+    }
+
+    #[test]
+    fn multishot_recvmsg_rejects_msg_waitall_and_flag_overflow() {
+        let mut message: libc::msghdr = unsafe { core::mem::zeroed() };
+        let waitall = unsafe { RecvMsgMulti::new(Fd(4), ptr::addr_of_mut!(message)) }
+            .flags(libc::MSG_WAITALL as u32)
+            .build()
+            .expect_err("MSG_WAITALL is incompatible with multishot recvmsg");
+        assert_eq!(waitall.kind(), ErrorKind::InvalidInput);
+
+        let overflow = unsafe { RecvMsgMulti::new(Fd(4), ptr::addr_of_mut!(message)) }
+            .flags(i32::MAX as u32 + 1)
+            .build()
+            .expect_err("recvmsg flags must fit the kernel signed field");
+        assert_eq!(overflow.raw_os_error(), Some(libc::EOVERFLOW));
+    }
+
+    #[test]
     fn timeout_rejects_unknown_and_conflicting_flags() {
         let timespec = Timespec::new();
         let unknown = unsafe { Timeout::new(&timespec) }
@@ -1176,6 +1272,9 @@ mod tests {
                 .build()
                 .unwrap(),
             unsafe { RecvMsg::new(Fd(1), ptr::addr_of_mut!(message)) }
+                .build()
+                .unwrap(),
+            unsafe { RecvMsgMulti::new(Fd(1), ptr::addr_of_mut!(message)) }
                 .build()
                 .unwrap(),
             unsafe { Timeout::new(&timespec) }.build().unwrap(),

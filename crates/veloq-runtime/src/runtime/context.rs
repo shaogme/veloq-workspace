@@ -558,6 +558,14 @@ impl<F> RoutedFuture<F> {
     pub async fn wait_ready(&mut self) -> Result<()> {
         poll_fn(|cx| self.poll_ready(cx)).await
     }
+
+    /// 取出已经在目标 worker 上提交完成的操作。
+    ///
+    /// 该方法只在 [`Self::wait_ready`] 成功后返回 `Some`，用于把多完成操作的句柄
+    /// 从路由阶段移交给调用方；多完成句柄本身不能通过 `Future` 直接消费。
+    pub fn take_ready(&mut self) -> Option<F> {
+        self.inner.take()
+    }
 }
 
 impl<F> Future for RoutedFuture<F>

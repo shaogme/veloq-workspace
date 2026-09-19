@@ -1,23 +1,28 @@
-use veloq_std::{format, io, mem, num::NonZeroU8, vec::Vec};
+use veloq_std::{format, io, mem, num::NonZeroU8, sync::Arc, vec::Vec};
 
 use diagweave::prelude::*;
+use veloq_buf::BufferRegistrar;
 use veloq_driver_core::{
     driver::{
         AnomalyAttach, CancelMode, CompletionAnomalyKind, CompletionBackend,
         CompletionBackendHooks, CompletionCleanupGuard, CompletionContinuation, CompletionControl,
         CompletionEnvelope, CompletionFailure, CompletionFlowExt, CompletionFlowOutcome,
-        CompletionIngress, CompletionSettlement, CompletionSource, PlatformOp,
-        SyntheticCompletionSource, UserCompletionEvent,
+        CompletionIngress, CompletionSettlement, CompletionSource, CompletionToken, OpToken,
+        PlatformOp, SyntheticCompletionSource, UserCompletionEvent,
     },
+    op::OpKind,
     slot::{CheckedSlotView, InFlightOrphaned, InFlightWaiting, SlotRegistryExt, SlotView},
 };
+use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 
 use crate::{
+    config::RegisteredSlot,
     driver::{IocpDriver, IocpDriverCompletionDiagnostics, polling::CompletionPump},
     error::{IocpError, IocpResult, iocp_report_to_event_res},
     ext::Extensions,
-    op::{IocpOp, IocpOpPayload, IocpSlotSpec, Slot},
+    op::{IocpOp, IocpOpPayload, IocpSlotSpec, Slot, SubmissionResult, SubmitContext},
     rio::{RioState, SocketInflightToken},
+    win32::{IoCompletionPort, Overlapped},
 };
 
 pub(crate) const COMP_BACKEND_IOCP: CompletionBackend =
@@ -31,6 +36,12 @@ pub(crate) const COMP_BACKEND_RIO: CompletionBackend =
         Some(val) => val,
         None => unreachable!(),
     });
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IocpSubmissionFailurePhase {
+    Initial,
+    Replacement,
+}
 
 pub(crate) enum IocpSyntheticCompletion {
     None,
@@ -74,16 +85,25 @@ struct IocpCompletionHooks<'a> {
     diagnostics: &'a IocpDriverCompletionDiagnostics,
     rio: &'a mut RioState,
     completion: &'a CompletionPump,
+    port: Arc<IoCompletionPort>,
+    registered_slots: &'a mut [RegisteredSlot],
+    registrar: &'a dyn BufferRegistrar,
+    shutting_down: bool,
     synthetic: IocpSyntheticCompletion,
     post: IocpPostCompletionEffects,
 }
 
 impl<'a> IocpCompletionHooks<'a> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         ext: &'a Extensions,
         diagnostics: &'a IocpDriverCompletionDiagnostics,
         rio: &'a mut RioState,
         completion: &'a CompletionPump,
+        port: Arc<IoCompletionPort>,
+        registered_slots: &'a mut [RegisteredSlot],
+        registrar: &'a dyn BufferRegistrar,
+        shutting_down: bool,
         synthetic: IocpSyntheticCompletion,
     ) -> Self {
         Self {
@@ -91,6 +111,10 @@ impl<'a> IocpCompletionHooks<'a> {
             diagnostics,
             rio,
             completion,
+            port,
+            registered_slots,
+            registrar,
+            shutting_down,
             synthetic,
             post: IocpPostCompletionEffects::default(),
         }
@@ -98,6 +122,102 @@ impl<'a> IocpCompletionHooks<'a> {
 
     fn into_post_effects(self) -> IocpPostCompletionEffects {
         self.post
+    }
+
+    fn rearm_accept_multi(
+        &mut self,
+        slot: &mut Slot<'_, InFlightWaiting>,
+        token: OpToken,
+    ) -> IocpResult<()> {
+        // Keep the completed request's token alive while the replacement is submitted. This
+        // prevents a synchronous replacement failure from making the old request look settled
+        // before its accepted socket record has been handed to the completion table.
+        let previous = take_socket_inflight_from_slot(slot).ok_or_else(|| {
+            IocpError::InvalidState
+                .to_report()
+                .with_ctx("operation", "AcceptMulti")
+                .attach_note("completed AcceptMulti request has no socket inflight token")
+        })?;
+
+        let overlapped = slot.with_sidecar_mut(|sidecar| &mut sidecar.inner as *mut Overlapped);
+        let result = slot.with_access_mut(|access| -> IocpResult<()> {
+            let op = access.operation_mut().get_mut();
+            if op.kind() != OpKind::AcceptMulti {
+                return Err(IocpError::InvalidState
+                    .to_report()
+                    .with_ctx("operation", op.kind() as u16)
+                    .attach_note("AcceptMulti rearm reached a non-AcceptMulti operation"));
+            }
+            let Some(vtable) = op.multishot_vtable() else {
+                return Err(IocpError::InvalidState
+                    .to_report()
+                    .attach_note("AcceptMulti operation has no multishot vtable"));
+            };
+            let mut context = SubmitContext {
+                port: self.port.clone(),
+                overlapped,
+                op_token: token,
+                completion_token: CompletionToken::user(token),
+                ext: self.ext,
+                registered_slots: self.registered_slots,
+                registrar: self.registrar,
+                rio: self.rio,
+            };
+            let submitted = (vtable.rearm)(op, &mut context)?;
+            match submitted {
+                SubmissionResult::Pending => Ok(()),
+                _ => Err(IocpError::InvalidState
+                    .to_report()
+                    .with_ctx("operation", "AcceptMulti")
+                    .attach_note("AcceptEx replacement returned a non-pending state")),
+            }
+        });
+        let replacement = match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(IocpError::InvalidState
+                .to_report()
+                .with_ctx("operation", "AcceptMulti")
+                .attach_note("failed to access AcceptMulti slot during replacement")),
+        };
+
+        let previous_identity = previous.identity();
+        let release = self.rio.release_socket_inflight_token(previous);
+        if release.is_ok() {
+            self.post.drain_socket_cleanup = true;
+        }
+        match (replacement, release) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => Err(error.trans()),
+            (Err(replacement), Err(release)) => {
+                let release: Report<IocpError> = release.trans();
+                let restored = slot
+                    .with_access_mut(|access| {
+                        let header = &mut access.operation_mut().get_mut().header;
+                        if header.socket_inflight.is_none() {
+                            header.socket_inflight = Some(SocketInflightToken::new(
+                                previous_identity.socket_key(),
+                                previous_identity.request_id(),
+                            ));
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                let error = replacement
+                    .with_diag_src_err(release)
+                    .attach_note("failed to release completed AcceptMulti request token");
+                if restored {
+                    Err(error)
+                } else {
+                    Err(error.attach_note(
+                        "failed to restore completed AcceptMulti request token after replacement failure",
+                    ))
+                }
+            }
+        }
     }
 }
 
@@ -178,10 +298,99 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
                 )
             }
             CompletionSource::Kernel | CompletionSource::User | CompletionSource::Backend(_) => {
+                let is_accept_multi = slot
+                    .with_access_mut(|access| {
+                        access.operation().get_ref().kind() == OpKind::AcceptMulti
+                    })
+                    .unwrap_or(false);
+                if is_accept_multi {
+                    let validation = slot
+                        .with_access_mut(|access| {
+                            access
+                                .operation()
+                                .get_ref()
+                                .validate_accept_multi_completion(event.token())
+                        })
+                        .map_err(|_| {
+                            IocpError::InvalidState
+                                .to_report()
+                                .attach_note("failed to access AcceptMulti completion state")
+                        })
+                        .and_then(|result| result);
+                    if let Err(error) = validation {
+                        let socket_inflight = take_socket_inflight_from_slot(&mut slot);
+                        return complete_iocp_failure_slot(
+                            slot,
+                            error,
+                            socket_inflight
+                                .map(IocpBackendEffect::SocketInflight)
+                                .unwrap_or_default(),
+                        );
+                    }
+                }
                 match calculate_io_result_from_slot(self.ext, &mut slot, event.res()) {
                     Ok(io_result) => {
-                        let socket_inflight = take_socket_inflight_from_slot(&mut slot);
-                        complete_iocp_waiting_slot(slot, event, io_result, socket_inflight)
+                        if is_accept_multi && io_result.is_ok() {
+                            let cancel_requested = slot.platform().iocp_user_cancel_requested;
+                            if self.shutting_down {
+                                let socket_inflight = take_socket_inflight_from_slot(&mut slot);
+                                return complete_iocp_abandoned_waiting_slot(
+                                    slot,
+                                    io_result,
+                                    socket_inflight
+                                        .map(IocpBackendEffect::SocketInflight)
+                                        .unwrap_or_default(),
+                                );
+                            }
+                            if cancel_requested {
+                                let socket_inflight = take_socket_inflight_from_slot(&mut slot);
+                                return complete_iocp_cancelled_accept_multi_slot(
+                                    slot,
+                                    io_result,
+                                    socket_inflight
+                                        .map(IocpBackendEffect::SocketInflight)
+                                        .unwrap_or_default(),
+                                );
+                            }
+                            match self.rearm_accept_multi(&mut slot, event.token()) {
+                                Ok(()) => {
+                                    complete_iocp_waiting_slot(slot, event, io_result, None, true)
+                                }
+                                Err(error) => {
+                                    let socket_inflight = take_socket_inflight_from_slot(&mut slot);
+                                    complete_iocp_replacement_failure_slot(
+                                        slot,
+                                        event,
+                                        io_result,
+                                        error,
+                                        socket_inflight
+                                            .map(IocpBackendEffect::SocketInflight)
+                                            .unwrap_or_default(),
+                                    )
+                                }
+                            }
+                        } else {
+                            let socket_inflight = take_socket_inflight_from_slot(&mut slot);
+                            if is_accept_multi {
+                                complete_iocp_failure_slot(
+                                    slot,
+                                    io_result
+                                        .err()
+                                        .unwrap_or_else(|| IocpError::InvalidState.to_report()),
+                                    socket_inflight
+                                        .map(IocpBackendEffect::SocketInflight)
+                                        .unwrap_or_default(),
+                                )
+                            } else {
+                                complete_iocp_waiting_slot(
+                                    slot,
+                                    event,
+                                    io_result,
+                                    socket_inflight,
+                                    false,
+                                )
+                            }
+                        }
                     }
                     Err(error) => {
                         let socket_inflight = take_socket_inflight_from_slot(&mut slot);
@@ -228,11 +437,11 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
 
 impl<'a> IocpDriver<'a> {
     pub(super) fn process_timers(&mut self) -> IocpResult<usize> {
-        let timer_buffer = self.timer.take_buffer();
+        let timer_buffer = self.state_mut().timer.take_buffer();
         let mut expired = Vec::new();
         for entry in &timer_buffer {
             let token = entry.item;
-            match self.ops.checked_slot_view(token) {
+            match self.state_mut().ops.checked_slot_view(token) {
                 Ok(CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot))) => {
                     slot.platform_mut().timer_id = None;
                     expired.push(token);
@@ -254,7 +463,7 @@ impl<'a> IocpDriver<'a> {
                 IocpSyntheticCompletion::None,
             )?;
         }
-        self.timer.restore_cleared_buffer(timer_buffer);
+        self.state_mut().timer.restore_cleared_buffer(timer_buffer);
         Ok(expired_count)
     }
 
@@ -311,16 +520,25 @@ impl<'a> IocpDriver<'a> {
         ingress: CompletionIngress<()>,
         synthetic: IocpSyntheticCompletion,
     ) -> IocpResult<CompletionFlowOutcome> {
+        let registrar = self.registrar;
+        let state = self.state_mut();
+        let port = state.completion.port_arc();
+        let (rio, registrar) = state.rio.state_and_registrar_mut(registrar);
+        let registered_slots = state.handles.submission_slots();
         let mut hooks = IocpCompletionHooks::new(
-            &self.extensions,
-            &self.completion_diagnostics,
-            self.rio.state_mut(),
-            &self.completion,
+            &state.extensions,
+            &state.completion_diagnostics,
+            rio,
+            &state.completion,
+            port,
+            registered_slots,
+            registrar,
+            state.shutting_down,
             synthetic,
         );
-        let outcome = self.ops.accept_completion(
-            self.completion.table(),
-            &self.completion_diagnostics,
+        let outcome = state.ops.accept_completion(
+            state.completion.table(),
+            &state.completion_diagnostics,
             &mut hooks,
             ingress,
         )?;
@@ -393,6 +611,7 @@ fn complete_iocp_waiting_slot(
     event: UserCompletionEvent,
     io_result: IocpResult<usize>,
     socket_inflight: Option<SocketInflightToken>,
+    accept_multi: bool,
 ) -> CompletionSettlement<IocpSlotSpec, IocpBackendEffect> {
     let mut io_detail = Some(io_result);
     let effect = socket_inflight
@@ -419,7 +638,9 @@ fn complete_iocp_waiting_slot(
         guard
             .with_access_mut(|access| {
                 let cleanup = PlatformOp::completion_cleanup(access.operation_mut(), io_result);
-                access.operation_mut().get_mut().unbind_user_payload();
+                if !accept_multi {
+                    access.operation_mut().get_mut().unbind_user_payload();
+                }
                 cleanup
             })
             .unwrap_or_default()
@@ -429,9 +650,58 @@ fn complete_iocp_waiting_slot(
         });
         CompletionCleanupGuard::default()
     };
-    let (payload, detail) = guard.take_completion_data();
     let event =
         UserCompletionEvent::from_parts(COMP_BACKEND_IOCP, event.token(), completion_res, 0);
+
+    if accept_multi {
+        let record_payload = guard
+            .with_access_mut(|access| access.operation().get_ref().accepted_socket_record())
+            .ok()
+            .flatten();
+        if let Some(payload) = record_payload {
+            let detail = io_detail.take();
+            let continuation = guard
+                .with_access_mut(|access| {
+                    access.operation().get_ref().multishot_vtable().map_or(
+                        CompletionContinuation::Final,
+                        |vtable| {
+                            (vtable.continuation)(
+                                detail
+                                    .as_ref()
+                                    .expect("IOCP completion detail must remain available"),
+                            )
+                        },
+                    )
+                })
+                .unwrap_or(CompletionContinuation::Final);
+            return CompletionSettlement::User {
+                event,
+                payload,
+                detail,
+                cleanup,
+                continuation,
+                effect,
+            };
+        }
+
+        let _ = guard.with_access_mut(|access| {
+            access.operation_mut().get_mut().unbind_user_payload();
+        });
+        let _ = guard.take_op();
+        let _ = guard.take_completion_data();
+        return CompletionSettlement::TerminalFailure {
+            failure: CompletionFailure::terminal(
+                IocpError::InvalidState
+                    .to_report()
+                    .push_ctx("scope", "iocp.complete_iocp_waiting_slot")
+                    .attach_note("AcceptMulti record payload encoder is missing"),
+                cleanup,
+                effect,
+            ),
+        };
+    }
+
+    let (payload, detail) = guard.take_completion_data();
     if let Some(payload) = payload {
         let _ = guard.take_op();
         let _data = mem::take(guard.platform_mut());
@@ -440,7 +710,6 @@ fn complete_iocp_waiting_slot(
             payload,
             detail: detail.or_else(|| io_detail.take()),
             cleanup,
-            // IOCP 没有 multishot：一次提交恰好对应一条完成。
             continuation: CompletionContinuation::Final,
             effect,
         }
@@ -458,6 +727,77 @@ fn complete_iocp_waiting_slot(
                 effect,
             ),
         }
+    }
+}
+
+fn complete_iocp_replacement_failure_slot(
+    slot: Slot<'_, InFlightWaiting>,
+    event: UserCompletionEvent,
+    io_result: IocpResult<usize>,
+    replacement_error: Report<IocpError>,
+    effect: IocpBackendEffect,
+) -> CompletionSettlement<IocpSlotSpec, IocpBackendEffect> {
+    let replacement_error = replacement_error
+        .with_ctx(
+            "submission_phase",
+            format!("{:?}", IocpSubmissionFailurePhase::Replacement),
+        )
+        .attach_note("multishot replacement submission failed after a record completed");
+    let terminal_res = iocp_report_to_event_res(&replacement_error);
+    let mut guard = slot.complete();
+    let record_payload = guard
+        .with_access_mut(|access| {
+            access
+                .operation()
+                .get_ref()
+                .multishot_vtable()
+                .map(|vtable| (vtable.encode_accepted_socket)())
+        })
+        .ok()
+        .flatten();
+    let cleanup = guard
+        .with_access_mut(|access| {
+            let cleanup = PlatformOp::completion_cleanup(access.operation_mut(), &io_result);
+            access.operation_mut().get_mut().unbind_user_payload();
+            cleanup
+        })
+        .unwrap_or_default();
+
+    let Some(payload) = record_payload else {
+        let _ = guard.take_op();
+        let _ = guard.take_completion_data();
+        return CompletionSettlement::TerminalFailure {
+            failure: CompletionFailure::terminal(
+                IocpError::InvalidState
+                    .to_report()
+                    .push_ctx("scope", "iocp.complete_iocp_replacement_failure")
+                    .attach_note("AcceptMulti record payload encoder is missing"),
+                cleanup,
+                effect,
+            ),
+        };
+    };
+
+    CompletionSettlement::UserThenTerminal {
+        event: UserCompletionEvent::from_parts(
+            COMP_BACKEND_IOCP,
+            event.token(),
+            io_result_to_event_res(&io_result),
+            0,
+        ),
+        payload,
+        detail: Some(io_result),
+        cleanup,
+        effect,
+        terminal_event: UserCompletionEvent::from_parts(
+            COMP_BACKEND_IOCP,
+            event.token(),
+            terminal_res,
+            0,
+        ),
+        terminal_error: replacement_error,
+        terminal_cleanup: CompletionCleanupGuard::default(),
+        terminal_effect: IocpBackendEffect::None,
     }
 }
 
@@ -488,12 +828,58 @@ fn complete_iocp_failure_slot(
     }
 }
 
+fn complete_iocp_abandoned_waiting_slot(
+    mut slot: Slot<'_, InFlightWaiting>,
+    io_result: IocpResult<usize>,
+    effect: IocpBackendEffect,
+) -> CompletionSettlement<IocpSlotSpec, IocpBackendEffect> {
+    let cleanup = slot
+        .with_access_mut(|access| {
+            let cleanup = PlatformOp::completion_cleanup(access.operation_mut(), &io_result);
+            access.operation_mut().get_mut().unbind_user_payload();
+            cleanup
+        })
+        .unwrap_or_default();
+    let mut completed = slot.complete();
+    let _ = completed.take_op();
+    let _ = completed.take_completion_data();
+    CompletionSettlement::Cleanup {
+        cleanup,
+        continuation: CompletionContinuation::Final,
+        effect,
+    }
+}
+
+fn complete_iocp_cancelled_accept_multi_slot(
+    mut slot: Slot<'_, InFlightWaiting>,
+    io_result: IocpResult<usize>,
+    effect: IocpBackendEffect,
+) -> CompletionSettlement<IocpSlotSpec, IocpBackendEffect> {
+    let cleanup = slot
+        .with_access_mut(|access| {
+            let cleanup = PlatformOp::completion_cleanup(access.operation_mut(), &io_result);
+            access.operation_mut().get_mut().unbind_user_payload();
+            cleanup
+        })
+        .unwrap_or_default();
+    let mut completed = slot.complete();
+    let _ = completed.take_op();
+    let _ = completed.take_completion_data();
+    let error = IocpError::CompletionWait.io_report(
+        "iocp.driver.accept_multi.cancel",
+        io::Error::from_raw_os_error(ERROR_OPERATION_ABORTED as i32),
+    );
+    CompletionSettlement::TerminalFailure {
+        failure: CompletionFailure::terminal(error, cleanup, effect),
+    }
+}
+
 fn complete_timer_waiting_slot(
     slot: Slot<'_, InFlightWaiting>,
     event: UserCompletionEvent,
 ) -> CompletionSettlement<IocpSlotSpec, IocpBackendEffect> {
     let io_result: IocpResult<usize> = Ok(0);
-    complete_iocp_waiting_slot(slot, event, io_result, None)
+    complete_iocp_waiting_slot(slot, event, io_result, None, false)
 }
 
 fn complete_submission_failure_slot(
@@ -508,7 +894,7 @@ fn complete_submission_failure_slot(
             .set_error_code((-event.res()).max(1))
             .attach_note("IOCP submission failed")
     });
-    complete_iocp_waiting_slot(slot, event, Err(io_result), None)
+    complete_iocp_waiting_slot(slot, event, Err(io_result), None, false)
 }
 
 fn complete_cancel_waiting_slot(
@@ -521,7 +907,7 @@ fn complete_cancel_waiting_slot(
         .set_error_code((-event.res()).max(1))
         .attach_note("operation aborted locally");
     if mode == CancelMode::UserVisible {
-        complete_iocp_waiting_slot(slot, event, abort_result, None)
+        complete_iocp_waiting_slot(slot, event, abort_result, None, false)
     } else {
         let mut completed = slot.complete();
         let cleanup = completed

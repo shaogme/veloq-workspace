@@ -606,6 +606,9 @@ pub(crate) enum UringControlEffectKind {
     WakerRearm {
         generation: u64,
     },
+    UdpRearm {
+        logical_receiver_generation: u32,
+    },
     BacklogKick,
 }
 
@@ -691,7 +694,8 @@ impl UringPostCompletionEffects {
             }
             UringControlEffectKind::CancelAck { .. }
             | UringControlEffectKind::CancelReconcile { .. }
-            | UringControlEffectKind::CloseUnregister { .. } => None,
+            | UringControlEffectKind::CloseUnregister { .. }
+            | UringControlEffectKind::UdpRearm { .. } => None,
         };
         if let Some(index) = replace_index {
             self.effects[index] = effect;
@@ -705,7 +709,8 @@ impl UringPostCompletionEffects {
                 UringControlEffectKind::BacklogKick
                 | UringControlEffectKind::CancelAck { .. }
                 | UringControlEffectKind::CancelReconcile { .. }
-                | UringControlEffectKind::CloseUnregister { .. } => {}
+                | UringControlEffectKind::CloseUnregister { .. }
+                | UringControlEffectKind::UdpRearm { .. } => {}
             }
             return;
         }
@@ -726,7 +731,8 @@ impl UringPostCompletionEffects {
             UringControlEffectKind::BacklogKick => self.backlog_kick = true,
             UringControlEffectKind::CancelAck { .. }
             | UringControlEffectKind::CancelReconcile { .. }
-            | UringControlEffectKind::CloseUnregister { .. } => {}
+            | UringControlEffectKind::CloseUnregister { .. }
+            | UringControlEffectKind::UdpRearm { .. } => {}
         }
         self.effects.push(effect);
     }
@@ -1023,6 +1029,7 @@ impl UringControlPlane {
         &mut self.completion_cleanup_hints
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn completion_cleanup_hints(
         &self,
     ) -> &HashMap<CompletionToken, Option<CompletionCleanupHintFn>> {

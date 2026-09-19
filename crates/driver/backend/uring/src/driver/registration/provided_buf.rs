@@ -1,18 +1,12 @@
 //! provided buffer ring（`IORING_REGISTER_PBUF_RING`，Linux 5.19+）。
 //!
-//! 环里的每个条目是 `(addr, len, bid)`。所有权模型是**移交 + 补充**，不是借出 + 归还：
+//! 环里的每个条目是 `(addr, len, bid)`。CQE 选中条目后，buffer 先进入显式
+//! [`ProvidedBufLease`]。lease settle 以前，原 bid 不得重新发布；这条规则对 UDP 的
+//! bounded pending 尤其重要，因为 datagram 可能暂时没有 packet permit。
 //!
-//! - 启动时从 worker 的池里 alloc 一批 [`FixedBuf`]，driver 持有它们，把地址与 bid 写进环；
-//! - 完成时按 CQE 的 bid 把对应的 `FixedBuf` 取出来，`set_len` 之后**移交给用户**；
-//! - 紧接着从池里再 alloc 一个填回同一个 bid。
-//!
-//! 用户拿到的就是一个普通 `FixedBuf`，drop 时走现有路径回它自己的池。**没有新类型、没有
-//! 跨线程归还通道、也没有「用户不能长期持有」的隐式约束**——被否决的「环保留所有权、交给
-//! 用户一个借用视图」方案要求一条跨线程归还通道（`FixedBuf: Send`，用户完全可能在别的
-//! worker 上 drop），而它买到的只是省掉一次 order-0 池分配。
-//!
-//! 收益不在「省掉分配」，而在「**buffer 只在数据到达时才与连接绑定**」：一万个空闲连接不
-//! 再各自压着一个 recv buffer。移交 + 补充完整保留了这一点。
+//! TCP 的兼容路径仍然可以把 lease 中的 buffer 移交给 record，但也必须在同一个显式
+//! settlement transaction 中为原 bid 准备 replacement。UDP 则可以把 lease 保留在
+//! pending ledger 中，直到 output buffer 和 permit 都可用。
 
 use core::sync::atomic::{AtomicBool, Ordering as CoreOrdering};
 
@@ -59,10 +53,83 @@ pub(crate) enum ProvidedBufRegistrationState {
 pub(crate) enum ProvidedBufBidState {
     DriverOwnedUnpublished,
     KernelPublished { publish_seq: u64 },
-    KernelSelected,
-    UserOwned,
+    SelectedLease { publish_seq: u64 },
+    PendingLease { publish_seq: u64 },
+    DeliveryLease { publish_seq: u64 },
     Vacant,
+    Quarantined,
     Retired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProvidedBufLeasePhase {
+    Selected,
+    Pending,
+    Delivery,
+    Settled,
+    Quarantined,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProvidedBufLeaseError {
+    GroupMismatch,
+    BidMismatch,
+    PublishSequenceMismatch,
+    InvalidState,
+    AlreadySettled,
+    NoReplacementBuffer,
+    PublicationFailed,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProvidedBufLeaseAction {
+    Republish,
+    Quarantine,
+}
+
+/// The exclusive owner of a CQE-selected provided buffer.
+///
+/// The lease deliberately owns the [`FixedBuf`] instead of retaining only a bid. A bid is not
+/// enough to reconstruct a datagram after the kernel has removed it from the ring.
+pub(crate) struct ProvidedBufLease {
+    group_id: u16,
+    bid: u16,
+    publish_seq: u64,
+    buf: Option<FixedBuf>,
+    len: usize,
+    phase: ProvidedBufLeasePhase,
+    user_buffer_taken: bool,
+}
+
+impl ProvidedBufLease {
+    pub(crate) fn bid(&self) -> u16 {
+        self.bid
+    }
+
+    pub(crate) fn publish_seq(&self) -> u64 {
+        self.publish_seq
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn phase(&self) -> ProvidedBufLeasePhase {
+        self.phase
+    }
+
+    /// Borrow the bytes selected by the CQE without transferring buffer ownership.
+    pub(crate) fn as_slice(&self) -> Option<&[u8]> {
+        self.buf.as_ref().map(FixedBuf::as_slice)
+    }
+
+    /// Move the selected buffer to a TCP record. UDP copy mode must not call this method.
+    pub(crate) fn take_buffer_for_delivery(&mut self) -> Option<FixedBuf> {
+        let buf = self.buf.take()?;
+        self.user_buffer_taken = true;
+        Some(buf)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +212,16 @@ pub struct ProvidedBufferSnapshot {
     available: u16,
     /// `available` 的历史最低值——它才是「消费方跟不上」的证据。
     available_low_water: u16,
+    /// 已经从 ring claim、但尚未完成 settlement 的 lease 数量。
+    selected_leases: u16,
+    /// selected lease 中当前由 UDP pending ledger 持有的数量。
+    pending_udp_leases: u16,
+    /// selected lease 中当前正在 delivery transaction 的数量。
+    delivery_leases: u16,
+    /// 已经有 owner、但尚未重新发布的 buffer 数量。
+    driver_owned_unpublished: u16,
+    /// 因 bid/generation 或 publication 异常而隔离的数量。
+    quarantined: u16,
 }
 
 impl ProvidedBufferSnapshot {
@@ -181,6 +258,26 @@ impl ProvidedBufferSnapshot {
     /// Returns the lowest observed number of buffers available to the kernel.
     pub const fn available_low_water(self) -> u16 {
         self.available_low_water
+    }
+
+    pub const fn selected_leases(self) -> u16 {
+        self.selected_leases
+    }
+
+    pub const fn pending_udp_leases(self) -> u16 {
+        self.pending_udp_leases
+    }
+
+    pub const fn delivery_leases(self) -> u16 {
+        self.delivery_leases
+    }
+
+    pub const fn driver_owned_unpublished(self) -> u16 {
+        self.driver_owned_unpublished
+    }
+
+    pub const fn quarantined(self) -> u16 {
+        self.quarantined
     }
 }
 
@@ -432,7 +529,7 @@ pub(crate) struct ProvidedBufGroup {
     pending_refill_bids: BitSet,
     /// Reusable ABI descriptors for one publication batch.
     publish_items: Vec<BufRingItem>,
-    /// 处于 `KernelSelected` 短暂状态的 bid 数量，避免析构/取消检查扫描整张表。
+    /// 处于 selected lease 状态的 bid 数量，避免析构/取消检查扫描整张表。
     selected_bids: BitSet,
     selected_bid_count: usize,
     buf_size: NonZeroUsize,
@@ -457,13 +554,47 @@ impl<'a> ProvidedBufPort<'a> {
     }
 
     #[inline]
-    pub(crate) fn take_selected(&mut self, flags: u32, res: i32) -> Option<FixedBuf> {
-        self.group.take_selected(flags, res)
+    pub(crate) fn claim_selected_lease(
+        &mut self,
+        flags: u32,
+        res: i32,
+    ) -> Result<Option<ProvidedBufLease>, ProvidedBufLeaseError> {
+        self.group.claim_selected_lease(flags, res)
     }
 
     #[inline]
-    pub(crate) fn return_selected(&mut self, flags: u32) -> bool {
-        self.group.return_selected(flags)
+    pub(crate) fn handoff_selected_lease(
+        &mut self,
+        lease: &mut ProvidedBufLease,
+    ) -> Result<(), ProvidedBufLeaseError> {
+        self.group.handoff_selected_lease(lease)
+    }
+
+    #[inline]
+    pub(crate) fn begin_delivery(
+        &mut self,
+        lease: &mut ProvidedBufLease,
+    ) -> Result<(), ProvidedBufLeaseError> {
+        self.group.begin_delivery(lease)
+    }
+
+    #[inline]
+    pub(crate) fn settle_selected_lease(
+        &mut self,
+        lease: &mut ProvidedBufLease,
+        action: ProvidedBufLeaseAction,
+    ) -> Result<(), ProvidedBufLeaseError> {
+        self.group.settle_selected_lease(lease, action)
+    }
+
+    #[inline]
+    pub(crate) fn discard_selected(&mut self, flags: u32) -> bool {
+        self.group.discard_selected(flags)
+    }
+
+    #[inline]
+    pub(crate) fn quarantine_claimed(&mut self, bid: u16, publish_seq: u64) -> bool {
+        self.group.quarantine_claimed(bid, publish_seq)
     }
 
     #[inline]
@@ -704,65 +835,78 @@ impl ProvidedBufGroup {
         self.stats.exhausted = self.stats.exhausted.saturating_add(1);
     }
 
-    /// 把这条 CQE 选中的 buffer 取出来交给用户，并立刻补一个回同一个 bid。
+    /// Claim the buffer selected by this CQE without publishing a replacement.
     ///
-    /// `res` 是 CQE 的结果：非负时它就是内核写进去的字节数。负数（出错）时内核仍可能带回
-    /// bid——buffer 是在提交时选中的，失败路径照样要把它还回来——此时长度置 0。
-    pub(crate) fn take_selected(&mut self, flags: u32, res: i32) -> Option<FixedBuf> {
-        let bid = cqueue::buffer_select(flags)?;
-        if !self.is_usable() {
-            return None;
-        }
-        let mut buf = match self.claim_kernel_selected(bid, flags) {
-            Some(buf) => buf,
-            None => {
-                self.quarantine();
-                return None;
-            }
+    /// `res` is the kernel-written length. Negative results still carry a selected bid on some
+    /// error paths, so their lease length is zero and the lease must still be settled.
+    pub(crate) fn claim_selected_lease(
+        &mut self,
+        flags: u32,
+        res: i32,
+    ) -> Result<Option<ProvidedBufLease>, ProvidedBufLeaseError> {
+        let Some(bid) = cqueue::buffer_select(flags) else {
+            return Ok(None);
         };
-
+        if !self.is_usable() {
+            return Err(ProvidedBufLeaseError::InvalidState);
+        }
+        let Some((publish_seq, mut buf)) = self.claim_kernel_selected(bid, flags) else {
+            self.quarantine();
+            return Err(ProvidedBufLeaseError::InvalidState);
+        };
         let filled = usize::try_from(res).unwrap_or(0).min(buf.capacity());
         buf.set_len(filled);
-        self.stats.handed_out = self.stats.handed_out.saturating_add(1);
+        Ok(Some(ProvidedBufLease {
+            group_id: self.bgid,
+            bid,
+            publish_seq,
+            buf: Some(buf),
+            len: filled,
+            phase: ProvidedBufLeasePhase::Selected,
+            user_buffer_taken: false,
+        }))
+    }
 
-        self.mark_user_owned(bid);
-        self.mark_vacant(bid);
-        if !self.refill(bid) {
-            self.queue_vacant(bid);
-        }
-        self.retry_vacant();
-        if !self.flush_pending_publish() {
-            self.quarantine();
-        }
+    /// Claim and hand a selected buffer to the TCP compatibility record path.
+    ///
+    /// This is intentionally a wrapper around the explicit lease API. UDP must retain the lease
+    /// until its copy/delivery transaction has settled.
+    #[cfg(test)]
+    pub(crate) fn take_selected_for_test(&mut self, flags: u32, res: i32) -> Option<FixedBuf> {
+        let mut lease = self.claim_selected_lease(flags, res).ok().flatten()?;
+        self.begin_delivery(&mut lease).ok()?;
+        let buf = lease.take_buffer_for_delivery()?;
+        self.settle_selected_lease(&mut lease, ProvidedBufLeaseAction::Republish)
+            .ok()?;
         Some(buf)
     }
 
-    /// 这条完成要被丢弃：把它选中的 buffer 原样还回环。
-    ///
-    /// 与 [`Self::take_selected`] 的差别在于**不碰池**——buffer 从没离开过 `bufs`，被内核
-    /// 消费掉的只是那个环条目，重新发布一次就行。漏掉这一步的代价是每次取消泄漏一个 bid。
-    pub(crate) fn return_selected(&mut self, flags: u32) -> bool {
+    /// This completion must be discarded without taking ownership of its payload. The selected
+    /// buffer remains in the group and is republished by the same settlement transaction.
+    pub(crate) fn discard_selected(&mut self, flags: u32) -> bool {
         let Some(bid) = cqueue::buffer_select(flags) else {
             return false;
         };
-        if !self.is_usable() || !self.prepare_kernel_return(bid, flags) {
-            self.quarantine();
+        if !self.is_usable() {
+            self.note_cqe_bid_anomaly(
+                bid,
+                flags,
+                "discarded completion arrived after provided group quarantine",
+            );
             return true;
         }
-        self.note_consumed();
-        self.set_bid_state(bid, ProvidedBufBidState::DriverOwnedUnpublished);
-        self.clear_selected(bid);
-        if !self.stage_driver_owned(bid, false) {
+        let Some(publish_seq) = self.prepare_kernel_return(bid, flags) else {
             self.quarantine();
             return true;
-        }
-        self.stats.returned = self.stats.returned.saturating_add(1);
-        self.retry_vacant();
-        if !self.flush_pending_publish() {
+        };
+        let result = self.republish_claimed(bid, publish_seq, None);
+        if result.is_ok() {
+            self.stats.returned = self.stats.returned.saturating_add(1);
+            false
+        } else {
             self.quarantine();
-            return true;
+            true
         }
-        false
     }
 
     /// 尝试反注册。**顺序不能反**：内核在反注册之前仍可能往环里读写。
@@ -782,6 +926,15 @@ impl ProvidedBufGroup {
     where
         F: FnOnce(u16) -> Result<(), i32>,
     {
+        if self.selected_bid_count != 0 {
+            return Err(Box::new(ProvidedBufUnregisterFailure {
+                report: UringError::InvalidState.report(
+                    "uring.provided_buf.unregister.leases",
+                    "provided buffer group still has unsettled leases",
+                ),
+                group: self,
+            }));
+        }
         if !self.ring.is_registered() {
             return Err(Box::new(ProvidedBufUnregisterFailure {
                 report: UringError::InvalidState.report(
@@ -818,8 +971,210 @@ impl ProvidedBufGroup {
         }
     }
 
-    /// 把 `bid` 的 buffer 拿出来，同时记账「内核消费了一个环条目」。
-    fn claim_kernel_selected(&mut self, bid: u16, flags: u32) -> Option<FixedBuf> {
+    /// Put a selected lease into the backend pending ledger.
+    pub(crate) fn handoff_selected_lease(
+        &mut self,
+        lease: &mut ProvidedBufLease,
+    ) -> Result<(), ProvidedBufLeaseError> {
+        self.validate_lease(lease)?;
+        if lease.phase != ProvidedBufLeasePhase::Selected {
+            return Err(ProvidedBufLeaseError::InvalidState);
+        }
+        self.set_bid_state(
+            lease.bid,
+            ProvidedBufBidState::PendingLease {
+                publish_seq: lease.publish_seq,
+            },
+        );
+        lease.phase = ProvidedBufLeasePhase::Pending;
+        self.refresh_ownership_snapshot();
+        Ok(())
+    }
+
+    /// Mark a selected or pending lease as being copied to an independent output buffer.
+    pub(crate) fn begin_delivery(
+        &mut self,
+        lease: &mut ProvidedBufLease,
+    ) -> Result<(), ProvidedBufLeaseError> {
+        self.validate_lease(lease)?;
+        if !matches!(
+            lease.phase,
+            ProvidedBufLeasePhase::Selected | ProvidedBufLeasePhase::Pending
+        ) {
+            return Err(ProvidedBufLeaseError::InvalidState);
+        }
+        self.set_bid_state(
+            lease.bid,
+            ProvidedBufBidState::DeliveryLease {
+                publish_seq: lease.publish_seq,
+            },
+        );
+        lease.phase = ProvidedBufLeasePhase::Delivery;
+        self.refresh_ownership_snapshot();
+        Ok(())
+    }
+
+    /// Settle a lease exactly once. Republish may reuse the selected buffer or allocate a
+    /// replacement after a TCP delivery took the original buffer.
+    pub(crate) fn settle_selected_lease(
+        &mut self,
+        lease: &mut ProvidedBufLease,
+        action: ProvidedBufLeaseAction,
+    ) -> Result<(), ProvidedBufLeaseError> {
+        self.validate_lease(lease)?;
+        if matches!(
+            lease.phase,
+            ProvidedBufLeasePhase::Settled | ProvidedBufLeasePhase::Quarantined
+        ) {
+            return Err(ProvidedBufLeaseError::AlreadySettled);
+        }
+
+        match action {
+            ProvidedBufLeaseAction::Quarantine => {
+                self.quarantine_lease(lease);
+                Ok(())
+            }
+            ProvidedBufLeaseAction::Republish => {
+                let Some(buf) = lease.buf.take().or_else(|| self.alloc_buf()) else {
+                    self.quarantine_lease(lease);
+                    return Err(ProvidedBufLeaseError::NoReplacementBuffer);
+                };
+                let bid = lease.bid;
+                let Some(slot) = self.bufs.get_mut(bid as usize) else {
+                    self.quarantine_lease(lease);
+                    return Err(ProvidedBufLeaseError::BidMismatch);
+                };
+                if slot.is_some() {
+                    self.quarantine_lease(lease);
+                    return Err(ProvidedBufLeaseError::InvalidState);
+                }
+                *slot = Some(buf);
+                self.set_bid_state(bid, ProvidedBufBidState::DriverOwnedUnpublished);
+                self.clear_selected(bid);
+                if !self.stage_driver_owned(bid, true) || !self.flush_pending_publish() {
+                    self.quarantine_bid_after_failed_publish(bid);
+                    lease.phase = ProvidedBufLeasePhase::Quarantined;
+                    self.refresh_ownership_snapshot();
+                    return Err(ProvidedBufLeaseError::PublicationFailed);
+                }
+                self.retry_vacant();
+                if !self.flush_pending_publish() {
+                    self.quarantine();
+                    lease.phase = ProvidedBufLeasePhase::Quarantined;
+                    self.refresh_ownership_snapshot();
+                    return Err(ProvidedBufLeaseError::PublicationFailed);
+                }
+                if lease.user_buffer_taken {
+                    self.stats.handed_out = self.stats.handed_out.saturating_add(1);
+                }
+                lease.phase = ProvidedBufLeasePhase::Settled;
+                self.refresh_ownership_snapshot();
+                Ok(())
+            }
+        }
+    }
+
+    fn validate_lease(&self, lease: &ProvidedBufLease) -> Result<(), ProvidedBufLeaseError> {
+        if lease.group_id != self.bgid {
+            return Err(ProvidedBufLeaseError::GroupMismatch);
+        }
+        let Some(state) = self.bid_states.get(lease.bid as usize) else {
+            return Err(ProvidedBufLeaseError::BidMismatch);
+        };
+        let expected = match lease.phase {
+            ProvidedBufLeasePhase::Selected => ProvidedBufBidState::SelectedLease {
+                publish_seq: lease.publish_seq,
+            },
+            ProvidedBufLeasePhase::Pending => ProvidedBufBidState::PendingLease {
+                publish_seq: lease.publish_seq,
+            },
+            ProvidedBufLeasePhase::Delivery => ProvidedBufBidState::DeliveryLease {
+                publish_seq: lease.publish_seq,
+            },
+            ProvidedBufLeasePhase::Settled | ProvidedBufLeasePhase::Quarantined => {
+                return Err(ProvidedBufLeaseError::AlreadySettled);
+            }
+        };
+        if *state != expected {
+            return Err(ProvidedBufLeaseError::PublishSequenceMismatch);
+        }
+        Ok(())
+    }
+
+    fn quarantine_lease(&mut self, lease: &mut ProvidedBufLease) {
+        let bid = lease.bid;
+        if let Some(slot) = self.bufs.get_mut(bid as usize)
+            && slot.is_none()
+        {
+            *slot = lease.buf.take();
+        }
+        self.set_bid_state(bid, ProvidedBufBidState::Quarantined);
+        self.clear_selected(bid);
+        self.health = ProvidedBufGroupHealth::Quarantined;
+        lease.phase = ProvidedBufLeasePhase::Quarantined;
+        self.refresh_ownership_snapshot();
+    }
+
+    fn quarantine_bid_after_failed_publish(&mut self, bid: u16) {
+        self.set_bid_state(bid, ProvidedBufBidState::Quarantined);
+        self.health = ProvidedBufGroupHealth::Quarantined;
+    }
+
+    /// Quarantine a claimed lease when completion cleanup lost the lease owner before settlement.
+    pub(crate) fn quarantine_claimed(&mut self, bid: u16, publish_seq: u64) -> bool {
+        if self.bid_states.get(bid as usize)
+            != Some(&ProvidedBufBidState::SelectedLease { publish_seq })
+        {
+            self.note_bid_anomaly(bid, "quarantined a provided bid without its selected lease");
+            self.quarantine();
+            return true;
+        }
+        self.set_bid_state(bid, ProvidedBufBidState::Quarantined);
+        self.clear_selected(bid);
+        self.health = ProvidedBufGroupHealth::Quarantined;
+        self.refresh_ownership_snapshot();
+        true
+    }
+
+    fn republish_claimed(
+        &mut self,
+        bid: u16,
+        publish_seq: u64,
+        buf: Option<FixedBuf>,
+    ) -> Result<(), ProvidedBufLeaseError> {
+        if self.bid_states.get(bid as usize)
+            != Some(&ProvidedBufBidState::SelectedLease { publish_seq })
+        {
+            return Err(ProvidedBufLeaseError::PublishSequenceMismatch);
+        }
+        let Some(slot) = self.bufs.get_mut(bid as usize) else {
+            return Err(ProvidedBufLeaseError::BidMismatch);
+        };
+        if slot.is_none() {
+            return Err(ProvidedBufLeaseError::InvalidState);
+        }
+        if let Some(buf) = buf {
+            *slot = Some(buf);
+        }
+        self.set_bid_state(bid, ProvidedBufBidState::DriverOwnedUnpublished);
+        self.clear_selected(bid);
+        if !self.stage_driver_owned(bid, false) || !self.flush_pending_publish() {
+            self.quarantine_bid_after_failed_publish(bid);
+            self.refresh_ownership_snapshot();
+            return Err(ProvidedBufLeaseError::PublicationFailed);
+        }
+        self.retry_vacant();
+        if !self.flush_pending_publish() {
+            self.quarantine();
+            self.refresh_ownership_snapshot();
+            return Err(ProvidedBufLeaseError::PublicationFailed);
+        }
+        self.refresh_ownership_snapshot();
+        Ok(())
+    }
+
+    /// Take the buffer owner out while retaining the publish sequence for lease validation.
+    fn claim_kernel_selected(&mut self, bid: u16, flags: u32) -> Option<(u64, FixedBuf)> {
         let Some(slot) = self.bufs.get_mut(bid as usize) else {
             self.note_cqe_bid_anomaly(
                 bid,
@@ -828,13 +1183,12 @@ impl ProvidedBufGroup {
             );
             return None;
         };
-        if !matches!(
-            self.bid_states.get(bid as usize),
-            Some(ProvidedBufBidState::KernelPublished { .. })
-        ) {
+        let Some(ProvidedBufBidState::KernelPublished { publish_seq }) =
+            self.bid_states.get(bid as usize).copied()
+        else {
             self.note_cqe_bid_anomaly(bid, flags, "kernel selected a bid that was not published");
             return None;
-        }
+        };
         let Some(buf) = slot.take() else {
             self.note_cqe_bid_anomaly(
                 bid,
@@ -843,10 +1197,11 @@ impl ProvidedBufGroup {
             );
             return None;
         };
-        self.set_bid_state(bid, ProvidedBufBidState::KernelSelected);
+        self.set_bid_state(bid, ProvidedBufBidState::SelectedLease { publish_seq });
         self.mark_selected(bid);
         self.note_consumed();
-        Some(buf)
+        self.refresh_ownership_snapshot();
+        Some((publish_seq, buf))
     }
 
     /// 从池里取一个新 buffer 填进 `bid` 并发布。失败时 `bid` 留空，由 [`Self::retry_vacant`]
@@ -924,28 +1279,6 @@ impl ProvidedBufGroup {
     }
 
     #[inline]
-    fn mark_vacant(&mut self, bid: u16) {
-        if matches!(
-            self.bid_states.get(bid as usize),
-            Some(ProvidedBufBidState::UserOwned | ProvidedBufBidState::KernelSelected)
-        ) {
-            self.set_bid_state(bid, ProvidedBufBidState::Vacant);
-        } else {
-            self.note_bid_anomaly(bid, "marked a provided bid vacant from an invalid state");
-        }
-    }
-
-    #[inline]
-    fn mark_user_owned(&mut self, bid: u16) {
-        if self.bid_states.get(bid as usize) == Some(&ProvidedBufBidState::KernelSelected) {
-            self.set_bid_state(bid, ProvidedBufBidState::UserOwned);
-            self.clear_selected(bid);
-        } else {
-            self.note_bid_anomaly(bid, "handed out a provided bid that was not selected");
-        }
-    }
-
-    #[inline]
     fn queue_vacant(&mut self, bid: u16) {
         let index = bid as usize;
         let is_queued = self.vacant_bids.get(index).unwrap_or(false);
@@ -960,31 +1293,38 @@ impl ProvidedBufGroup {
         debug_assert!(self.vacant_bids.clear(bid as usize).is_ok());
     }
 
-    fn prepare_kernel_return(&mut self, bid: u16, flags: u32) -> bool {
+    fn prepare_kernel_return(&mut self, bid: u16, flags: u32) -> Option<u64> {
         let Some(slot) = self.bufs.get(bid as usize) else {
             self.note_cqe_bid_anomaly(
                 bid,
                 flags,
                 "discarded completion selected an out-of-range bid",
             );
-            return false;
+            return None;
         };
-        if slot.is_none()
-            || !matches!(
-                self.bid_states.get(bid as usize),
-                Some(ProvidedBufBidState::KernelPublished { .. })
-            )
-        {
+        let Some(ProvidedBufBidState::KernelPublished { publish_seq }) =
+            self.bid_states.get(bid as usize).copied()
+        else {
             self.note_cqe_bid_anomaly(
                 bid,
                 flags,
                 "discarded completion selected a bid that was not kernel-published",
             );
-            return false;
+            return None;
+        };
+        if slot.is_none() {
+            self.note_cqe_bid_anomaly(
+                bid,
+                flags,
+                "discarded completion selected a bid without a buffer owner",
+            );
+            return None;
         }
-        self.set_bid_state(bid, ProvidedBufBidState::KernelSelected);
+        self.set_bid_state(bid, ProvidedBufBidState::SelectedLease { publish_seq });
         self.mark_selected(bid);
-        true
+        self.note_consumed();
+        self.refresh_ownership_snapshot();
+        Some(publish_seq)
     }
 
     #[inline]
@@ -1140,6 +1480,38 @@ impl ProvidedBufGroup {
         if let Some(current) = self.bid_states.get_mut(bid as usize) {
             *current = state;
         }
+        self.refresh_ownership_snapshot();
+    }
+
+    fn refresh_ownership_snapshot(&mut self) {
+        let mut selected = 0_u16;
+        let mut pending = 0_u16;
+        let mut delivery = 0_u16;
+        let mut unpublished = 0_u16;
+        let mut quarantined = 0_u16;
+        for state in &self.bid_states {
+            match state {
+                ProvidedBufBidState::SelectedLease { .. } => selected = selected.saturating_add(1),
+                ProvidedBufBidState::PendingLease { .. } => {
+                    selected = selected.saturating_add(1);
+                    pending = pending.saturating_add(1);
+                }
+                ProvidedBufBidState::DeliveryLease { .. } => {
+                    selected = selected.saturating_add(1);
+                    delivery = delivery.saturating_add(1);
+                }
+                ProvidedBufBidState::DriverOwnedUnpublished | ProvidedBufBidState::Vacant => {
+                    unpublished = unpublished.saturating_add(1)
+                }
+                ProvidedBufBidState::Quarantined => quarantined = quarantined.saturating_add(1),
+                ProvidedBufBidState::KernelPublished { .. } | ProvidedBufBidState::Retired => {}
+            }
+        }
+        self.stats.selected_leases = selected;
+        self.stats.pending_udp_leases = pending;
+        self.stats.delivery_leases = delivery;
+        self.stats.driver_owned_unpublished = unpublished;
+        self.stats.quarantined = quarantined;
     }
 
     #[inline]
@@ -1170,13 +1542,13 @@ impl ProvidedBufGroup {
             match state {
                 ProvidedBufBidState::DriverOwnedUnpublished
                 | ProvidedBufBidState::KernelPublished { .. } => has_buf,
-                // `KernelSelected` is a short transition. A return path keeps the owner while a
-                // handoff path has already taken it out, so both forms are intentionally allowed
-                // only inside the settling method.
-                ProvidedBufBidState::KernelSelected => true,
-                ProvidedBufBidState::UserOwned
-                | ProvidedBufBidState::Vacant
-                | ProvidedBufBidState::Retired => !has_buf,
+                // Selected leases own the buffer outside the group. A discarded selected CQE
+                // keeps it in the group until the same settlement transaction republishes it.
+                ProvidedBufBidState::SelectedLease { .. }
+                | ProvidedBufBidState::PendingLease { .. }
+                | ProvidedBufBidState::DeliveryLease { .. } => true,
+                ProvidedBufBidState::Vacant | ProvidedBufBidState::Retired => !has_buf,
+                ProvidedBufBidState::Quarantined => true,
             }
         })
     }
@@ -1289,6 +1661,11 @@ impl Default for ProvidedBufferSnapshot {
             exhausted: 0,
             available: 0,
             available_low_water: u16::MAX,
+            selected_leases: 0,
+            pending_udp_leases: 0,
+            delivery_leases: 0,
+            driver_owned_unpublished: 0,
+            quarantined: 0,
         }
     }
 }
@@ -1478,7 +1855,7 @@ mod tests {
         let mut group = test_group(2);
         let flags = 1 | (7_u32 << 16);
 
-        assert!(group.return_selected(flags));
+        assert!(group.discard_selected(flags));
         assert_eq!(group.bid_anomalies, 1);
         assert_eq!(group.stats.available, 2);
         assert_eq!(
@@ -1500,9 +1877,11 @@ mod tests {
         let selected = group
             .claim_kernel_selected(0, flags)
             .expect("the first selection must claim the published bid");
+        let (publish_seq, selected) = selected;
         drop(selected);
+        assert!(group.quarantine_claimed(0, publish_seq));
 
-        assert!(group.return_selected(flags));
+        assert!(group.discard_selected(flags));
         assert_eq!(
             group.last_bid_anomaly,
             Some(super::ProvidedBufBidAnomaly {
@@ -1523,7 +1902,7 @@ mod tests {
 
         let flags = 1;
         let buffer = group
-            .take_selected(flags, 7)
+            .take_selected_for_test(flags, 7)
             .expect("published bid must produce a buffer");
         assert_eq!(buffer.len(), 7);
         assert!(matches!(
@@ -1532,6 +1911,80 @@ mod tests {
         ));
         assert_eq!(group.stats.available, 2);
         assert_eq!(group.bid_anomalies, 0);
+    }
+
+    #[test]
+    fn selected_lease_defers_refill_until_explicit_settlement() {
+        let mut group = test_group(2);
+        let before = group.stats();
+        let mut lease = group
+            .claim_selected_lease(1, 7)
+            .expect("claim must succeed")
+            .expect("the CQE selected a bid");
+
+        assert_eq!(lease.bid(), 0);
+        assert_eq!(lease.publish_seq(), 0);
+        assert_eq!(lease.len(), 7);
+        assert_eq!(group.stats().available(), before.available() - 1);
+        assert_eq!(group.stats().refilled(), before.refilled());
+        assert_eq!(group.stats().selected_leases(), 1);
+        assert_eq!(
+            group.bid_state(0),
+            Some(super::ProvidedBufBidState::SelectedLease { publish_seq: 0 })
+        );
+
+        let unregister = group.try_unregister_with(|_| Ok(()));
+        assert!(
+            unregister.is_err(),
+            "an unsettled lease must block unregister"
+        );
+        let mut group = unregister.expect_err("failure owns the group").group;
+
+        group
+            .settle_selected_lease(&mut lease, super::ProvidedBufLeaseAction::Republish)
+            .expect("republish settlement must succeed");
+        assert_eq!(lease.phase(), super::ProvidedBufLeasePhase::Settled);
+        assert_eq!(group.stats().available(), before.available());
+        assert_eq!(group.stats().refilled(), before.refilled() + 1);
+        assert_eq!(group.stats().selected_leases(), 0);
+        assert!(matches!(
+            group.bid_state(0),
+            Some(super::ProvidedBufBidState::KernelPublished { .. })
+        ));
+        assert_eq!(
+            group.settle_selected_lease(&mut lease, super::ProvidedBufLeaseAction::Republish),
+            Err(super::ProvidedBufLeaseError::AlreadySettled)
+        );
+
+        assert!(group.try_unregister_with(|_| Ok(())).is_ok());
+    }
+
+    #[test]
+    fn pending_lease_tracks_delivery_and_quarantine_without_republish() {
+        let mut group = test_group(2);
+        let mut lease = group
+            .claim_selected_lease(1, 3)
+            .expect("claim must succeed")
+            .expect("the CQE selected a bid");
+        group
+            .handoff_selected_lease(&mut lease)
+            .expect("handoff must retain the lease");
+        assert_eq!(lease.phase(), super::ProvidedBufLeasePhase::Pending);
+        assert_eq!(group.stats().pending_udp_leases(), 1);
+        assert_eq!(group.stats().refilled(), 2);
+
+        group
+            .begin_delivery(&mut lease)
+            .expect("delivery transition must retain the lease");
+        assert_eq!(group.stats().pending_udp_leases(), 0);
+        assert_eq!(group.stats().delivery_leases(), 1);
+        group
+            .settle_selected_lease(&mut lease, super::ProvidedBufLeaseAction::Quarantine)
+            .expect("quarantine settlement must be single-shot");
+        assert_eq!(lease.phase(), super::ProvidedBufLeasePhase::Quarantined);
+        assert_eq!(group.stats().selected_leases(), 0);
+        assert_eq!(group.stats().quarantined(), 1);
+        assert_eq!(group.stats().refilled(), 2);
     }
 
     #[test]
@@ -1571,7 +2024,7 @@ mod tests {
         for round in 0..1024_u32 {
             let bid = round % 8;
             let flags = 1 | (bid << 16);
-            assert!(!group.return_selected(flags));
+            assert!(!group.discard_selected(flags));
             assert_eq!(group.stats.available, 8);
             assert_eq!(group.selected_bid_count, 0);
         }

@@ -498,7 +498,7 @@ impl RioKernel {
         })
     }
 
-    pub(crate) fn submit_receive_ex(
+    pub(crate) fn submit_receive_multi(
         &self,
         rq: RioRq,
         data_buf: &RIO_BUF,
@@ -510,6 +510,9 @@ impl RioKernel {
             .as_ref()
             .ok_or(RioError::Internal)
             .attach_note("RIO dispatch context lost")?;
+        // A receive pump uses one data buffer and one private remote-address scratch buffer per
+        // request.  Keep flags at zero until a provider-specific deferred-submit capability has
+        // been validated; zero is the explicit commit form for the final request in a batch.
         dispatch.receive_ex(RioExConfig {
             rq,
             data_buf,

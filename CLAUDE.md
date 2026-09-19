@@ -136,7 +136,7 @@ veloq (面向用户的门面：fs / net / time / io / runtime)
 - `crates/veloq/tests/`：端到端集成测试（`fs.rs` / `tcp.rs` / `udp.rs` / `time.rs` / `buffer_test.rs` / `runtime_context.rs`，以及 `sync.rs`+`sync/`、`local.rs`+`local/` 的通道测试）。典型写法是包一个 `run_with_runtime(async |ctx| ..)` helper。
 - `crates/veloq-runtime/tests/`：scope/任务/panic/取消/`select!` 行为，`compile_tests.rs` + `tests/ui/` 是 trybuild 编译期断言。
 - `crates/veloq-sync/tests/`、`crates/driver/core/tests/loom_completion.rs`、`crates/utils/veloq-std/tests/`：`loom_*.rs` 只在 `--features loom` 下有意义。
-- 平台内核要求见 `README.md`（最低 Linux 5.6，推荐 6.1+ 以启用 `DEFER_TASKRUN` 等优化；旧内核自动回退）。
+- 平台内核要求见 `README.md`（最低 Linux 6.1；`COOP_TASKRUN`、`SINGLE_ISSUER` 和 `DEFER_TASKRUN` 默认强制开启，可通过 `SetupPolicy::with_disabled` 显式关闭；不支持时初始化直接失败）。Windows IOCP/RIO 使用原生路径，不受该 Linux 版本要求约束。
 
 ## 提交信息
 

@@ -7,14 +7,16 @@ use crate::{
     error::{IocpError, IocpResult},
     net::addr::SockAddrStorage,
     op::{
-        Accept, AcceptMulti, Close, Connect, Fallocate, FallocateRaw, Fsync, FsyncRaw, OpSend,
-        Open, ReadFixed, ReadRaw, Recv, RecvMulti, RecvProvided, SendTo, SyncFileRange,
-        SyncFileRangeRaw, Timeout, UdpConnect, UdpRecv, UdpRecvFrom, UdpSend, Wakeup, WriteFixed,
-        WriteRaw, spec::PayloadBinding,
+        Accept, AcceptMulti, AcceptedSocket, Close, Connect, Fallocate, FallocateRaw, Fsync,
+        FsyncRaw, OpSend, Open, ProvidedBuf, ReadFixed, ReadRaw, Recv, RecvMulti, RecvProvided,
+        SendTo, SyncFileRange, SyncFileRangeRaw, Timeout, UdpConnect, UdpRecvMulti, UdpRecvPacket,
+        UdpSend, Wakeup, WriteFixed, WriteRaw, spec::PayloadBinding,
     },
 };
 
 use diagweave::prelude::*;
+use veloq_buf::FixedBuf;
+use veloq_driver_core::{platform::receive_pump::ReceivePumpState, slot::Generation};
 
 pub enum IocpUserPayload {
     ReadFixed(ReadFixed),
@@ -23,7 +25,6 @@ pub enum IocpUserPayload {
     WriteRaw(WriteRaw),
     Recv(Recv),
     OpSend(OpSend),
-    UdpRecv(UdpRecv),
     UdpSend(UdpSend),
     Close(Close),
     Fsync(Fsync),
@@ -37,12 +38,16 @@ pub enum IocpUserPayload {
     UdpConnect(UdpConnect),
     Accept(Accept),
     SendTo(SendTo),
-    UdpRecvFrom(UdpRecvFrom),
+    /// The persistent submit payload for the internal UDP receive pump.
+    UdpRecvMulti(UdpRecvMulti),
+    /// One datagram produced by the UDP receive pump.
+    UdpRecvPacket(UdpRecvPacket),
+    /// An accepted socket produced by an accept multishot operation.
+    AcceptedSocket(AcceptedSocket),
+    /// A provided receive buffer produced by a receive multishot operation.
+    ProvidedBuf(ProvidedBuf),
     Open(Open),
     Wakeup(Wakeup),
-    /// 下面三个操作 IOCP 提交不了（见 `op.rs` 的 `impl_iocp_unsupported_op!`）。变体仍然
-    /// 要在：提交路径先把 payload 擦除进 slot、再由 `submit` 同步失败把它原样取回，所以
-    /// 即使一条完成都不会产生，这一趟往返也是走完整的。
     AcceptMulti(AcceptMulti),
     RecvProvided(RecvProvided),
     RecvMulti(RecvMulti),
@@ -55,7 +60,6 @@ pub(crate) enum IocpOpPayload {
     WriteRaw(KernelRef<WriteRaw>),
     Recv(KernelRef<Recv>),
     Send(KernelRef<OpSend>),
-    UdpRecv(KernelRef<UdpRecv>),
     UdpSend(KernelRef<UdpSend>),
     Close(KernelRef<Close>),
     Fsync(KernelRef<Fsync>),
@@ -68,16 +72,13 @@ pub(crate) enum IocpOpPayload {
     Connect(KernelRef<Connect>),
     UdpConnect(KernelRef<UdpConnect>),
     Accept(AcceptPayload),
+    AcceptMulti(AcceptMultiPayload),
     SendTo(SendToPayload),
-    UdpRecvFrom(UdpRecvFromPayload),
+    RecvProvided(RecvProvidedPayload),
+    RecvMulti(RecvMultiPayload),
+    UdpRecvMulti(UdpRecvMultiPayload),
     Open(OpenPayload),
     Wakeup(KernelRef<Wakeup>),
-    /// 一个 IOCP 提交不了的操作的内核 payload。
-    ///
-    /// 没有字段，因为没有内核请求可以描述：它唯一的用途是让 `IocpKernelOp` 有个能被构造出
-    /// 来的形状，好让提交路径走到 `submit` 那一步同步失败。三个不支持的操作共用它，也共用
-    /// 同一张 vtable。
-    Unsupported,
 }
 
 /// Reference to a kernel operation.
@@ -140,6 +141,69 @@ pub(crate) struct AcceptPayload {
     pub(crate) accept_socket: Option<OwnedRawHandle>,
 }
 
+/// Persistent kernel state for an `AcceptMulti` operation.
+///
+/// The accepted socket is kept separate from the listening socket and is never reused for the
+/// next request.  Later stages add the request-generation and inflight transitions around these
+/// fields; keeping them in a dedicated payload now prevents the multishot path from falling back
+/// to the one-shot `AcceptPayload` shape.
+pub(crate) struct AcceptMultiPayload {
+    pub(crate) user: PayloadRef<AcceptMulti>,
+    pub(crate) accept_buffer: [u8; ACCEPT_EX_OUTPUT_BUFFER_LEN],
+    pub(crate) accept_socket: Option<OwnedRawHandle>,
+    pub(crate) request_generation: Generation,
+}
+
+impl AcceptMultiPayload {
+    pub(crate) fn new() -> Self {
+        Self {
+            user: PayloadRef::unbound(),
+            accept_buffer: [0; ACCEPT_EX_OUTPUT_BUFFER_LEN],
+            accept_socket: None,
+            request_generation: Generation::ZERO,
+        }
+    }
+}
+
+/// Persistent state for a one-record provided receive request.
+///
+/// The buffer is backend-owned.  It is intentionally optional until the receive submission
+/// stage allocates and binds it, so construction cannot accidentally claim a buffer that the
+/// kernel has not been given.
+pub(crate) struct RecvProvidedPayload {
+    pub(crate) user: PayloadRef<RecvProvided>,
+    pub(crate) buffer: Option<FixedBuf>,
+    pub(crate) request_generation: Generation,
+}
+
+impl RecvProvidedPayload {
+    pub(crate) fn new() -> Self {
+        Self {
+            user: PayloadRef::unbound(),
+            buffer: None,
+            request_generation: Generation::ZERO,
+        }
+    }
+}
+
+/// Persistent state for the TCP receive pump behind `RecvMulti`.
+///
+/// Request depth, leases and terminal state are deliberately owned by this payload rather than
+/// by the facade.  The concrete pump transitions are added by the receive implementation stage.
+pub(crate) struct RecvMultiPayload {
+    pub(crate) user: PayloadRef<RecvMulti>,
+    pub(crate) pump: Option<ReceivePumpState>,
+}
+
+impl RecvMultiPayload {
+    pub(crate) fn new() -> Self {
+        Self {
+            user: PayloadRef::unbound(),
+            pump: None,
+        }
+    }
+}
+
 /// Payload for the socket send-to operation.
 pub(crate) struct SendToPayload {
     pub(crate) user: PayloadRef<SendTo>,
@@ -147,10 +211,13 @@ pub(crate) struct SendToPayload {
     pub(crate) addr_len: i32,
 }
 
-/// Payload for the socket recv-from operation.
-pub(crate) struct UdpRecvFromPayload {
-    pub(crate) user: PayloadRef<UdpRecvFrom>,
-    pub(crate) addr: SockAddrStorage,
+/// Kernel-side binding for the persistent UDP receive pump.
+///
+/// The receive pump is kept in the slot's submit payload for the complete lifetime of the
+/// logical operation.  Individual datagrams are represented by [`IocpUserPayload::UdpRecvPacket`]
+/// and never borrow this binding.
+pub(crate) struct UdpRecvMultiPayload {
+    pub(crate) user: PayloadRef<UdpRecvMulti>,
 }
 
 /// Payload for the file open operation.
@@ -184,6 +251,16 @@ impl PayloadBinding<Accept> for AcceptPayload {
     }
 }
 
+impl PayloadBinding<AcceptMulti> for AcceptMultiPayload {
+    fn bind(&mut self, user: NonNull<AcceptMulti>) {
+        self.user.bind(user);
+    }
+
+    fn clear(&mut self) {
+        self.user.clear();
+    }
+}
+
 impl PayloadBinding<SendTo> for SendToPayload {
     fn bind(&mut self, user: NonNull<SendTo>) {
         self.user.bind(user);
@@ -194,8 +271,28 @@ impl PayloadBinding<SendTo> for SendToPayload {
     }
 }
 
-impl PayloadBinding<UdpRecvFrom> for UdpRecvFromPayload {
-    fn bind(&mut self, user: NonNull<UdpRecvFrom>) {
+impl PayloadBinding<RecvProvided> for RecvProvidedPayload {
+    fn bind(&mut self, user: NonNull<RecvProvided>) {
+        self.user.bind(user);
+    }
+
+    fn clear(&mut self) {
+        self.user.clear();
+    }
+}
+
+impl PayloadBinding<RecvMulti> for RecvMultiPayload {
+    fn bind(&mut self, user: NonNull<RecvMulti>) {
+        self.user.bind(user);
+    }
+
+    fn clear(&mut self) {
+        self.user.clear();
+    }
+}
+
+impl PayloadBinding<UdpRecvMulti> for UdpRecvMultiPayload {
+    fn bind(&mut self, user: NonNull<UdpRecvMulti>) {
         self.user.bind(user);
     }
 

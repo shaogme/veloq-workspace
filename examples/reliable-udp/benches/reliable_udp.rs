@@ -3,8 +3,9 @@ use std::hint::black_box;
 use criterion::{Criterion, criterion_group, criterion_main};
 use veloq::std::{time::Duration, vec::Vec};
 use veloq_reliable_udp::{
-    Ack, Config, ConnectionId, CookieInput, CookieKey, CookieKeyRing, DataPacket, FixedBuf, Flags,
-    FrameSequence, HeapPacketBufAllocator, MessageId, Packet, Session, SessionEvent, issue_cookie,
+    Ack, Config, ConnectionId, CookieInput, CookieKey, CookieKeyRing, FixedBuf, FrameSequence,
+    FrameType, HeapPacketBufAllocator, MessageId, Packet, Session, SessionEvent, StreamDataPacket,
+    StreamId, StreamSequence, issue_cookie,
 };
 
 static ALLOCATOR: HeapPacketBufAllocator = HeapPacketBufAllocator;
@@ -19,7 +20,7 @@ fn outbound(events: Vec<SessionEvent>) -> Vec<FixedBuf> {
         .collect()
 }
 
-fn establish(client: &mut Session, _server: &mut Session) {
+fn establish(client: &mut Session, server: &mut Session) -> StreamId {
     let syn = outbound(
         client
             .start(Duration::ZERO, &ALLOCATOR)
@@ -39,11 +40,15 @@ fn establish(client: &mut Session, _server: &mut Session) {
         },
         Duration::ZERO,
     );
-    let syn_ack = Packet::encode_handshake_cookie_into_with_limit(
+    let syn_ack = Packet::encode_frame(
         &ALLOCATOR,
         Config::default().max_datagram_size,
-        Flags::SYN_ACK,
+        FrameType::SynAck,
+        false,
         client.connection_id(),
+        None,
+        None,
+        Ack::empty(),
         32,
         cookie.as_bytes(),
     )
@@ -56,19 +61,42 @@ fn establish(client: &mut Session, _server: &mut Session) {
     );
     assert_eq!(syn.len(), 1);
     assert_eq!(proof.len(), 1);
-    let confirmation = Packet::encode_control_into_with_limit(
+    let confirmation = Packet::encode_frame(
         &ALLOCATOR,
         Config::default().max_datagram_size,
-        Flags::ACK,
+        FrameType::Ack,
+        true,
         client.connection_id(),
+        None,
+        None,
         Ack::empty(),
         32,
+        &[],
     )
     .expect("server confirmation")
     .into_fixed_buf();
     let _ = client
         .receive(Duration::ZERO, confirmation, &ALLOCATOR)
         .expect("client confirmation");
+    let stream_id = client
+        .open_stream(Duration::ZERO, &ALLOCATOR)
+        .expect("open stream");
+    let open = outbound(client.take_events());
+    assert_eq!(open.len(), 1);
+    let server_events = server
+        .receive(
+            Duration::ZERO,
+            open.into_iter().next().expect("stream open"),
+            &ALLOCATOR,
+        )
+        .expect("server stream open");
+    assert_eq!(server.accept_stream(), Some(stream_id));
+    for datagram in outbound(server_events) {
+        client
+            .receive(Duration::ZERO, datagram, &ALLOCATOR)
+            .expect("client stream open ack");
+    }
+    stream_id
 }
 
 fn bench_high_concurrency_handshake(c: &mut Criterion) {
@@ -82,7 +110,7 @@ fn bench_high_concurrency_handshake(c: &mut Criterion) {
                     Session::new_client(connection_id, config.clone()).expect("client");
                 let mut server = Session::new_server_established(connection_id, config.clone(), 32)
                     .expect("server");
-                establish(&mut client, &mut server);
+                let _ = establish(&mut client, &mut server);
                 pairs.push((client, server));
             }
             black_box(pairs.len());
@@ -100,14 +128,15 @@ fn bench_batch_ack(c: &mut Criterion) {
             let mut client = Session::new_client(connection_id, config.clone()).expect("client");
             let mut server =
                 Session::new_server_established(connection_id, config, 32).expect("server");
-            establish(&mut client, &mut server);
-            let first = Packet::encode_data_into_with_limit(
+            let stream_id = establish(&mut client, &mut server);
+            let first = Packet::encode_stream_data_into_with_limit(
                 &ALLOCATOR,
                 max_datagram_size,
-                DataPacket {
-                    flags: Flags::DATA,
+                StreamDataPacket {
                     connection_id,
-                    frame_sequence: FrameSequence::new(1).expect("frame sequence"),
+                    frame_sequence: FrameSequence::new(2).expect("frame sequence"),
+                    stream_id,
+                    stream_sequence: StreamSequence::new(1).expect("stream sequence"),
                     ack: Ack::empty(),
                     receive_window: 32,
                     message_id: MessageId::new(1).expect("message ID"),
@@ -120,13 +149,14 @@ fn bench_batch_ack(c: &mut Criterion) {
             )
             .expect("first packet")
             .into_fixed_buf();
-            let second = Packet::encode_data_into_with_limit(
+            let second = Packet::encode_stream_data_into_with_limit(
                 &ALLOCATOR,
                 max_datagram_size,
-                DataPacket {
-                    flags: Flags::DATA,
+                StreamDataPacket {
                     connection_id,
-                    frame_sequence: FrameSequence::new(2).expect("frame sequence"),
+                    frame_sequence: FrameSequence::new(3).expect("frame sequence"),
+                    stream_id,
+                    stream_sequence: StreamSequence::new(2).expect("stream sequence"),
                     ack: Ack::empty(),
                     receive_window: 32,
                     message_id: MessageId::new(2).expect("message ID"),

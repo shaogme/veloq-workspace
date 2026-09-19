@@ -16,7 +16,7 @@ use crate::{
 use super::ConnectionKey;
 use super::command::CommandSender;
 use super::io::{OutboundDatagram, OutboundSender, PumpSender, SendTicket};
-use super::state::ProtocolState;
+use super::state::{ProtocolState, SessionEntry, stream_message_from_session};
 
 struct QueuedDatagram {
     datagram: FixedBuf,
@@ -272,6 +272,79 @@ impl EventRouter {
                         let _ = reply.send(Err(error));
                     }
                 }
+                SessionEvent::StreamOpened(stream_id) => {
+                    trace!(
+                        target: "veloq_reliable_udp::endpoint",
+                        connection_id = key.connection_id().get(),
+                        stream_id = stream_id.get(),
+                        pending = state
+                            .entry(&key)
+                            .is_some_and(|entry| entry.pending_stream_open(stream_id)),
+                        "protocol loop observed StreamOpened"
+                    );
+                    if let Some(entry) = state.entry_mut(&key)
+                        && let Some(reply) = entry.take_pending_stream_open(stream_id)
+                    {
+                        let _ = reply.send(Ok(stream_id));
+                    }
+                }
+                SessionEvent::StreamOpenFailed(stream_id, error) => {
+                    if let Some(entry) = state.entry_mut(&key)
+                        && let Some(reply) = entry.take_pending_stream_open(stream_id)
+                    {
+                        let _ = reply.send(Err(error));
+                    }
+                }
+                SessionEvent::StreamAvailable(stream_id) => {
+                    trace!(
+                        target: "veloq_reliable_udp::endpoint",
+                        connection_id = key.connection_id().get(),
+                        stream_id = stream_id.get(),
+                        pending = state
+                            .entry(&key)
+                            .is_some_and(SessionEntry::has_pending_stream_accept),
+                        "protocol loop observed StreamAvailable"
+                    );
+                    if let Some(entry) = state.entry_mut(&key)
+                        && let Some(reply) = entry.take_pending_stream_accept()
+                    {
+                        let _ = reply.send(Ok(stream_id));
+                    }
+                }
+                SessionEvent::StreamMessageAvailable(stream_id) => {
+                    let ctx = state.ctx();
+                    let now = state.now();
+                    if let Some(entry) = state.entry_mut(&key)
+                        && let Some(reply) = entry.take_pending_stream_recv(stream_id)
+                    {
+                        if let Some(message) = entry.session_mut().recv_stream(now, stream_id, &ctx)
+                        {
+                            let _ = reply.send(Ok(stream_message_from_session(message)));
+                        } else {
+                            entry.put_pending_stream_recv(stream_id, reply);
+                        }
+                    }
+                }
+                SessionEvent::StreamClosed(stream_id) => {
+                    if let Some(entry) = state.entry_mut(&key) {
+                        if let Some(reply) = entry.take_pending_stream_recv(stream_id) {
+                            let _ = reply.send(Err(Error::StreamClosed));
+                        }
+                        if let Some(reply) = entry.take_pending_stream_open(stream_id) {
+                            let _ = reply.send(Err(Error::StreamClosed));
+                        }
+                    }
+                }
+                SessionEvent::StreamReset(stream_id) => {
+                    if let Some(entry) = state.entry_mut(&key) {
+                        if let Some(reply) = entry.take_pending_stream_recv(stream_id) {
+                            let _ = reply.send(Err(Error::StreamReset));
+                        }
+                        if let Some(reply) = entry.take_pending_stream_open(stream_id) {
+                            let _ = reply.send(Err(Error::StreamReset));
+                        }
+                    }
+                }
                 SessionEvent::StateChanged(SessionState::Established) => {
                     let (role, connecting, accepted) = state
                         .entry(&key)
@@ -314,7 +387,7 @@ impl EventRouter {
                     batch.terminal_error = Some(Error::ConnectionReset);
                 }
                 SessionEvent::Failed(error) => batch.terminal_error = Some(error),
-                SessionEvent::MessageAvailable | SessionEvent::StateChanged(_) => {}
+                SessionEvent::StateChanged(_) => {}
             }
         }
         Ok(batch)

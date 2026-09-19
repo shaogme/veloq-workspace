@@ -2,7 +2,7 @@ use tracing::trace;
 use veloq::{
     buf::FixedBuf,
     runtime::context::Ctx,
-    std::{num::NonZeroUsize, vec::Vec},
+    std::num::NonZeroUsize,
     sync::{
         TrySendError,
         mpmc::{BoundedOwnedReceiver, BoundedOwnedSender},
@@ -10,19 +10,21 @@ use veloq::{
 };
 
 use crate::{
-    connection::{Connection, ConnectionReply, Message, SendPayload, Shutdown},
+    connection::{
+        Connection, ConnectionErrorCode, ConnectionReply, SendPayload, Shutdown, StreamMessage,
+    },
     cookie::{
         CookieInput, CookieInvalidReason, CookieKeyRing, CookieToken, CookieValidation,
         issue_cookie, validate_cookie,
     },
     error::{Error, Result},
-    packet::{Ack, COOKIE_LEN, Flags, Packet, PacketRef},
-    session::{Role, SendReceipt, Session, SessionEvent, SessionState},
+    packet::{Ack, COOKIE_LEN, FrameSequence, FrameType, Packet, PacketRef, StreamId},
+    session::{Role, SendReceipt, Session, SessionState},
 };
 
 use super::event::EventRouter;
 use super::io::{InboundDatagram, OutboundDatagram, OutboundSender, PumpSender, SendTicket};
-use super::state::{ProtocolState, SessionEntry, key_from_packet, message_from_session};
+use super::state::{ProtocolState, SessionEntry, key_from_packet, stream_message_from_session};
 use super::{ConnectionKey, Reply};
 
 pub(super) type CommandSender = BoundedOwnedSender<Command>;
@@ -33,18 +35,43 @@ pub(crate) enum Command {
         key: ConnectionKey,
         reply: ConnectionReply,
     },
-    Send {
+    OpenStream {
         key: ConnectionKey,
+        reply: Reply<StreamId>,
+    },
+    AcceptStream {
+        key: ConnectionKey,
+        reply: Reply<StreamId>,
+    },
+    StreamSend {
+        key: ConnectionKey,
+        stream_id: StreamId,
         payload: SendPayload,
         reply: Reply<SendReceipt>,
     },
-    Recv {
+    StreamRecv {
         key: ConnectionKey,
-        reply: Reply<Message>,
+        stream_id: StreamId,
+        reply: Reply<StreamMessage>,
     },
-    Shutdown {
+    StreamShutdown {
         key: ConnectionKey,
+        stream_id: StreamId,
         how: Shutdown,
+        reply: Reply<()>,
+    },
+    StreamClose {
+        key: ConnectionKey,
+        stream_id: StreamId,
+        reply: Reply<()>,
+    },
+    StreamDrop {
+        key: ConnectionKey,
+        stream_id: StreamId,
+    },
+    Abort {
+        key: ConnectionKey,
+        code: ConnectionErrorCode,
         reply: Reply<()>,
     },
     Close {
@@ -119,18 +146,47 @@ impl CommandService {
             Command::Connect { key, reply } => {
                 Self::start_client(key, reply, state, ports)?;
             }
-            Command::Send {
+            Command::OpenStream { key, reply } => {
+                Self::handle_open_stream(key, reply, state, ports)?;
+            }
+            Command::AcceptStream { key, reply } => {
+                Self::handle_accept_stream(key, reply, state, ports)?;
+            }
+            Command::StreamSend {
                 key,
+                stream_id,
                 payload,
                 reply,
             } => {
-                Self::handle_send(key, payload, reply, state, ports)?;
+                Self::handle_stream_send(key, stream_id, payload, reply, state, ports)?;
             }
-            Command::Recv { key, reply } => {
-                Self::handle_recv(key, reply, state, ports)?;
+            Command::StreamRecv {
+                key,
+                stream_id,
+                reply,
+            } => {
+                Self::handle_stream_recv(key, stream_id, reply, state, ports)?;
             }
-            Command::Shutdown { key, how, reply } => {
-                Self::handle_shutdown(key, how, reply, state, ports)?;
+            Command::StreamShutdown {
+                key,
+                stream_id,
+                how,
+                reply,
+            } => {
+                Self::handle_stream_shutdown(key, stream_id, how, reply, state, ports)?;
+            }
+            Command::StreamClose {
+                key,
+                stream_id,
+                reply,
+            } => {
+                Self::handle_stream_close(key, stream_id, reply, state, ports)?;
+            }
+            Command::StreamDrop { key, stream_id } => {
+                Self::handle_stream_drop(key, stream_id, state, ports)?;
+            }
+            Command::Abort { key, code, reply } => {
+                Self::handle_abort(key, code, reply, state, ports)?;
             }
             Command::Close { key, reply } => {
                 Self::begin_close(key, reply, state, ports)?;
@@ -185,8 +241,60 @@ impl CommandService {
         )
     }
 
-    fn handle_send<'a, 'rt>(
+    fn handle_open_stream<'a, 'rt>(
         key: ConnectionKey,
+        reply: Reply<StreamId>,
+        state: &mut ProtocolState<'rt>,
+        ports: &CommandPorts<'a, 'rt>,
+    ) -> Result<()> {
+        let now = state.now();
+        let ctx = ports.ctx();
+        let Some(entry) = state.entry_mut(&key) else {
+            let _ = reply.send(Err(Error::ConnectionClosed));
+            return Ok(());
+        };
+        let stream_id = match entry.session_mut().open_stream(now, &ctx) {
+            Ok(stream_id) => stream_id,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return Ok(());
+            }
+        };
+        entry.put_pending_stream_open(stream_id, reply);
+        let events = entry.session_mut().take_events();
+        EventRouter::record_events(
+            state,
+            key,
+            events,
+            ports.command(),
+            ports.outbound(),
+            ports.pump_events(),
+        )
+    }
+
+    fn handle_accept_stream<'a, 'rt>(
+        key: ConnectionKey,
+        reply: Reply<StreamId>,
+        state: &mut ProtocolState<'rt>,
+        _ports: &CommandPorts<'a, 'rt>,
+    ) -> Result<()> {
+        let Some(entry) = state.entry_mut(&key) else {
+            let _ = reply.send(Err(Error::ConnectionClosed));
+            return Ok(());
+        };
+        if let Some(stream_id) = entry.session_mut().accept_stream() {
+            let _ = reply.send(Ok(stream_id));
+        } else if !entry.has_pending_stream_accept() {
+            entry.put_pending_stream_accept(reply);
+        } else {
+            let _ = reply.send(Err(Error::InvalidState));
+        }
+        Ok(())
+    }
+
+    fn handle_stream_send<'a, 'rt>(
+        key: ConnectionKey,
+        stream_id: StreamId,
         payload: SendPayload,
         reply: Reply<SendReceipt>,
         state: &mut ProtocolState<'rt>,
@@ -213,7 +321,10 @@ impl CommandService {
             let _ = reply.send(Err(Error::ConnectionClosed));
             return Ok(());
         };
-        let token = match entry.session_mut().queue_send(now, payload, &ctx) {
+        let token = match entry
+            .session_mut()
+            .queue_stream_send(now, stream_id, payload, &ctx)
+        {
             Ok(token) => token,
             Err(error) => {
                 let _ = reply.send(Err(error));
@@ -232,9 +343,10 @@ impl CommandService {
         )
     }
 
-    fn handle_recv<'a, 'rt>(
+    fn handle_stream_recv<'a, 'rt>(
         key: ConnectionKey,
-        reply: Reply<Message>,
+        stream_id: StreamId,
+        reply: Reply<StreamMessage>,
         state: &mut ProtocolState<'rt>,
         ports: &CommandPorts<'a, 'rt>,
     ) -> Result<()> {
@@ -244,17 +356,12 @@ impl CommandService {
             let _ = reply.send(Err(Error::ConnectionClosed));
             return Ok(());
         };
-        if entry.read_shutdown() {
-            let _ = reply.send(Err(Error::ConnectionClosed));
-            return Ok(());
-        }
-        if entry.has_pending_recv() {
+        if entry.has_pending_stream_recv(stream_id) {
             let _ = reply.send(Err(Error::InvalidState));
             return Ok(());
         }
-        let message = entry.session_mut().recv(now, &ctx);
-        if let Some(message) = message {
-            let _ = reply.send(Ok(message_from_session(message)));
+        if let Some(message) = entry.session_mut().recv_stream(now, stream_id, &ctx) {
+            let _ = reply.send(Ok(stream_message_from_session(message)));
             let events = entry.session_mut().take_events();
             EventRouter::record_events(
                 state,
@@ -265,31 +372,133 @@ impl CommandService {
                 ports.pump_events(),
             )
         } else {
-            entry.put_pending_recv(reply);
+            entry.put_pending_stream_recv(stream_id, reply);
             Ok(())
         }
     }
 
-    fn handle_shutdown<'a, 'rt>(
+    fn handle_stream_shutdown<'a, 'rt>(
         key: ConnectionKey,
+        stream_id: StreamId,
         how: Shutdown,
         reply: Reply<()>,
         state: &mut ProtocolState<'rt>,
         ports: &CommandPorts<'a, 'rt>,
     ) -> Result<()> {
-        if matches!(how, Shutdown::Read) {
-            let Some(entry) = state.entry_mut(&key) else {
-                let _ = reply.send(Err(Error::ConnectionClosed));
-                return Ok(());
-            };
-            entry.mark_read_shutdown();
-            if let Some(pending) = entry.take_pending_recv() {
-                let _ = pending.send(Err(Error::ConnectionClosed));
-            }
-            let _ = reply.send(Ok(()));
-            return Ok(());
+        if matches!(how, Shutdown::Write) {
+            return Self::handle_stream_close(key, stream_id, reply, state, ports);
         }
-        Self::begin_close(key, reply, state, ports)
+        let now = state.now();
+        let ctx = ports.ctx();
+        let Some(entry) = state.entry_mut(&key) else {
+            let _ = reply.send(Err(Error::ConnectionClosed));
+            return Ok(());
+        };
+        if let Some(pending) = entry.take_pending_stream_recv(stream_id) {
+            let _ = pending.send(Err(Error::StreamClosed));
+        }
+        match entry.session_mut().reset_stream(now, stream_id, &ctx) {
+            Ok(events) => {
+                let _ = reply.send(Ok(()));
+                EventRouter::record_events(
+                    state,
+                    key,
+                    events,
+                    ports.command(),
+                    ports.outbound(),
+                    ports.pump_events(),
+                )
+            }
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                Ok(())
+            }
+        }
+    }
+
+    fn handle_stream_close<'a, 'rt>(
+        key: ConnectionKey,
+        stream_id: StreamId,
+        reply: Reply<()>,
+        state: &mut ProtocolState<'rt>,
+        ports: &CommandPorts<'a, 'rt>,
+    ) -> Result<()> {
+        let now = state.now();
+        let ctx = ports.ctx();
+        let Some(entry) = state.entry_mut(&key) else {
+            let _ = reply.send(Err(Error::ConnectionClosed));
+            return Ok(());
+        };
+        match entry.session_mut().close_stream(now, stream_id, &ctx) {
+            Ok(events) => {
+                let _ = reply.send(Ok(()));
+                EventRouter::record_events(
+                    state,
+                    key,
+                    events,
+                    ports.command(),
+                    ports.outbound(),
+                    ports.pump_events(),
+                )
+            }
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                Ok(())
+            }
+        }
+    }
+
+    fn handle_stream_drop<'a, 'rt>(
+        key: ConnectionKey,
+        stream_id: StreamId,
+        state: &mut ProtocolState<'rt>,
+        ports: &CommandPorts<'a, 'rt>,
+    ) -> Result<()> {
+        let now = state.now();
+        let ctx = ports.ctx();
+        let Some(entry) = state.entry_mut(&key) else {
+            return Ok(());
+        };
+        let events = entry
+            .session_mut()
+            .reset_stream(now, stream_id, &ctx)
+            .unwrap_or_default();
+        EventRouter::record_events(
+            state,
+            key,
+            events,
+            ports.command(),
+            ports.outbound(),
+            ports.pump_events(),
+        )
+    }
+
+    fn handle_abort<'a, 'rt>(
+        key: ConnectionKey,
+        code: ConnectionErrorCode,
+        reply: Reply<()>,
+        state: &mut ProtocolState<'rt>,
+        ports: &CommandPorts<'a, 'rt>,
+    ) -> Result<()> {
+        let now = state.now();
+        let Some(entry) = state.entry_mut(&key) else {
+            let _ = reply.send(Err(Error::ConnectionClosed));
+            return Ok(());
+        };
+        let error = match code {
+            ConnectionErrorCode::Protocol => Error::InvalidState,
+            ConnectionErrorCode::Application(_) => Error::ConnectionReset,
+        };
+        let events = entry.session_mut().abort(now, error, &ports.ctx())?;
+        let _ = reply.send(Ok(()));
+        EventRouter::record_events(
+            state,
+            key,
+            events,
+            ports.command(),
+            ports.outbound(),
+            ports.pump_events(),
+        )
     }
 
     fn begin_close<'a, 'rt>(
@@ -380,19 +589,31 @@ impl CommandService {
             }
         };
         let key = key_from_packet(peer, packet.connection_id);
+        trace!(
+            target: "veloq_reliable_udp::endpoint",
+            peer = ?peer,
+            connection_id = packet.connection_id.get(),
+            frame_type = ?packet.frame_type,
+            frame_sequence = packet.frame_sequence,
+            stream_id = packet.stream_id,
+            "protocol loop dispatching datagram"
+        );
         if !state.contains(&key) {
-            if packet.flags == Flags::SYN {
+            if packet.frame_type == FrameType::Syn {
                 Self::issue_challenge(key, packet.receive_window, state, ports)?;
                 return Ok(());
             }
-            if packet.flags == Flags::ACK && packet.payload.len() == COOKIE_LEN {
+            if packet.frame_type == FrameType::Fin {
+                return Self::send_fin_ack(key, packet.frame_sequence, state, ports);
+            }
+            if packet.frame_type == FrameType::HandshakeAck && packet.payload.len() == COOKIE_LEN {
                 return Self::admit_proof(key, packet, state, ports);
             }
             state.stats().record_unknown();
             return Ok(());
         }
 
-        if packet.flags == Flags::ACK && packet.payload.len() == COOKIE_LEN {
+        if packet.frame_type == FrameType::HandshakeAck && packet.payload.len() == COOKIE_LEN {
             if state.entry(&key).is_some_and(|entry| {
                 entry.session().role() == Role::Server
                     && entry.session().state() == SessionState::Established
@@ -404,12 +625,12 @@ impl CommandService {
             return Ok(());
         }
 
-        if packet.flags == Flags::SYN {
+        if packet.frame_type == FrameType::Syn {
             state.stats().record_unknown();
             return Ok(());
         }
 
-        if packet.flags == Flags::ACK && !packet.payload.is_empty() {
+        if packet.frame_type == FrameType::Ack && !packet.payload.is_empty() {
             state.stats().record_unknown();
             return Ok(());
         }
@@ -422,8 +643,25 @@ impl CommandService {
                 return Ok(());
             };
             match entry.session_mut().receive(now, datagram, &ctx) {
-                Ok(events) => events,
+                Ok(events) => {
+                    trace!(
+                        target: "veloq_reliable_udp::endpoint",
+                        peer = ?peer,
+                        connection_id = key.connection_id().get(),
+                        event_count = events.len(),
+                        "session processed datagram"
+                    );
+                    events
+                }
                 Err(error) => {
+                    trace!(
+                        target: "veloq_reliable_udp::endpoint",
+                        peer = ?peer,
+                        connection_id = key.connection_id().get(),
+                        state = ?entry.session().state(),
+                        error = ?error,
+                        "session rejected datagram"
+                    );
                     if error == Error::UnknownConnection {
                         state.stats().record_unknown();
                     } else {
@@ -433,8 +671,6 @@ impl CommandService {
                 }
             }
         };
-        let mut events = events;
-        events.extend(Self::complete_pending_recv(key, state, ctx)?);
         EventRouter::record_events(
             state,
             key,
@@ -457,11 +693,15 @@ impl CommandService {
             client_receive_window: receive_window,
         };
         let cookie = issue_cookie(state.cookie_keys(), input, state.now());
-        let packet = Packet::encode_handshake_cookie_into_with_limit(
+        let packet = Packet::encode_frame(
             &ports.ctx(),
             state.config().max_datagram_size,
-            Flags::SYN_ACK,
+            FrameType::SynAck,
+            false,
             key.connection_id(),
+            None,
+            None,
+            Ack::empty(),
             state.config().receive_window.get() as u16,
             cookie.as_bytes(),
         )?;
@@ -559,13 +799,40 @@ impl CommandService {
         state: &mut ProtocolState<'rt>,
         ports: &CommandPorts<'a, 'rt>,
     ) -> Result<()> {
-        let packet = Packet::encode_control_into_with_limit(
+        let packet = Packet::encode_frame(
             &ports.ctx(),
             state.config().max_datagram_size,
-            Flags::ACK,
+            FrameType::Ack,
+            true,
             key.connection_id(),
+            None,
+            None,
             Ack::empty(),
             state.config().receive_window.get() as u16,
+            &[],
+        )?;
+        Self::enqueue_stateless(key, packet.into_fixed_buf(), state, ports, false);
+        Ok(())
+    }
+
+    fn send_fin_ack<'a, 'rt>(
+        key: ConnectionKey,
+        frame_sequence: u64,
+        state: &mut ProtocolState<'rt>,
+        ports: &CommandPorts<'a, 'rt>,
+    ) -> Result<()> {
+        let frame_sequence = FrameSequence::new(frame_sequence).ok_or(Error::InvalidState)?;
+        let packet = Packet::encode_frame(
+            &ports.ctx(),
+            state.config().max_datagram_size,
+            FrameType::FinAck,
+            false,
+            key.connection_id(),
+            Some(frame_sequence),
+            None,
+            Ack::empty(),
+            state.config().receive_window.get() as u16,
+            &[],
         )?;
         Self::enqueue_stateless(key, packet.into_fixed_buf(), state, ports, false);
         Ok(())
@@ -601,28 +868,5 @@ impl CommandService {
             }
             CookieInvalidReason::Malformed => state.stats().record_cookie_wrong_parameters(),
         }
-    }
-
-    fn complete_pending_recv(
-        key: ConnectionKey,
-        state: &mut ProtocolState<'_>,
-        ctx: Ctx<'_>,
-    ) -> Result<Vec<SessionEvent>> {
-        let now = state.now();
-        let Some(entry) = state.entry_mut(&key) else {
-            return Ok(Vec::new());
-        };
-        let Some(reply) = entry.take_pending_recv() else {
-            return Ok(Vec::new());
-        };
-        if reply.is_closed() {
-            return Ok(Vec::new());
-        }
-        let Some(message) = entry.session_mut().recv(now, &ctx) else {
-            entry.put_pending_recv(reply);
-            return Ok(Vec::new());
-        };
-        let _ = reply.send(Ok(message_from_session(message)));
-        Ok(entry.session_mut().take_events())
     }
 }

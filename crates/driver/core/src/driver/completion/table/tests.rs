@@ -309,6 +309,32 @@ fn terminal_hook_failure_finalizes_the_slot_and_runs_cleanup_once() {
 }
 
 #[test]
+fn retained_settlement_keeps_the_logical_operation_addressable() {
+    let (mut registry, token) = active_registry();
+    let table = registry.shared.clone();
+    let cleanup_count = Arc::new(AtomicUsize::new(0));
+    let retained = CompletionSettlement::Retained {
+        cleanup: counting_cleanup(&cleanup_count),
+        effect: (),
+    };
+    let mut hooks = TestHooks::with_waiting_failure(retained);
+
+    let outcome = accept_ingress_result(
+        &mut registry,
+        CompletionIngress::User(test_event(token, 0)),
+        &mut hooks,
+    )
+    .expect("retained completion should not be a user-visible error");
+
+    assert_eq!(outcome.internal, 1);
+    assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
+    assert_eq!(registry.active_count(), 1);
+    let status = table.slots[token.index()].status(Ordering::Acquire);
+    assert_eq!(status.state, SlotState::InFlightWaiting);
+    assert!(!status.ready);
+}
+
+#[test]
 fn more_hook_failure_quarantines_until_a_later_final_completion() {
     let (mut registry, token) = active_registry();
     let table = registry.shared.clone();

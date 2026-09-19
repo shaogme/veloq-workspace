@@ -6,7 +6,7 @@ use crate::{
     },
     driver::IocpDriver,
     ext::Extensions,
-    op::{AcceptMulti, Close, Fsync, IocpSlotSpec, RecvMulti, RecvProvided},
+    op::{Close, Fsync, IocpSlotSpec, RecvMulti},
     tests::{submit_test_op, wait_completion},
 };
 use veloq_buf::NoopRegistrar;
@@ -203,25 +203,11 @@ fn test_close_owned_registered_file_unregisters_and_rejects_stale_fd() {
     );
 }
 
-/// 三个 IOCP 做不了的操作提交时同步失败，而不是被内核收下之后永远等下去。
-///
-/// 它们的 `IntoPlatformOp` 实现只为一件事存在：让 `AcceptMulti` / `RecvMulti` /
-/// `RecvProvided` 在两个平台上都是可命名、可满足 bound 的类型，于是门面层的
-/// `AcceptStream` / `RecvStream` 靠运行期的 `capabilities()` 选路径，而不是靠 `#[cfg]`。
-///
-/// 正常情况下这条路走不到——能力位恒为 `false`，谁都不会提交这三个。这条用例锁的是**安全
-/// 网**：万一哪天能力探测出错，得到的是一个立刻失败的操作，而不是一个挂死的 slot。
+/// TCP receive multishot 不支持文件句柄时应同步失败，而不是被内核收下后永远挂起。
 #[test]
-fn unsupported_ops_fail_to_submit_instead_of_hanging() {
+fn recv_multi_rejects_non_socket_without_hanging() {
     let registrar = NoopRegistrar;
     let mut driver = IocpDriver::new(IocpConfig::default(), &registrar).unwrap();
-
-    assert!(
-        !driver.capabilities().accept_multi
-            && !driver.capabilities().recv_multi
-            && !driver.capabilities().provided_buffers,
-        "IOCP must not advertise any multishot or provided-buffer capability"
-    );
 
     let handle = File::open("Cargo.toml").unwrap();
     let raw = RawHandle::new(IocpHandle::for_file(handle.as_raw_handle() as _));
@@ -232,9 +218,11 @@ fn unsupported_ops_fail_to_submit_instead_of_hanging() {
         .next()
         .unwrap();
 
-    submit_expect_void_failure(&mut driver, AcceptMulti { fd }, "AcceptMulti on IOCP");
-    submit_expect_void_failure(&mut driver, RecvProvided { fd }, "RecvProvided on IOCP");
-    submit_expect_void_failure(&mut driver, RecvMulti { fd }, "RecvMulti on IOCP");
+    submit_expect_void_failure(
+        &mut driver,
+        RecvMulti { fd },
+        "RecvMulti on a non-socket handle",
+    );
 }
 
 #[test]

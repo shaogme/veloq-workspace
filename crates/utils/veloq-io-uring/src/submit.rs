@@ -26,7 +26,7 @@ use crate::{
 ///
 /// `Parameters` is an initialization result and must not be reinterpreted on every
 /// `io_uring_enter` call. This copy is created once when a [`Submitter`] is built;
-/// feature negotiation and diagnostics keep using the full capability snapshot.
+/// submission validation and diagnostics keep using the full parameter snapshot.
 #[derive(Clone, Copy)]
 struct SubmitterCapabilities {
     sq_entries: u32,

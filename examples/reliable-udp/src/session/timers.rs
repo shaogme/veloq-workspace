@@ -40,6 +40,7 @@ impl TimerState {
                 TimerKind::Retransmit { .. }
                     | TimerKind::MessageAckRetry { .. }
                     | TimerKind::ReassemblyTimeout { .. }
+                    | TimerKind::StreamOpenRetry { .. }
             )
         {
             Some(TimerCommand::Cancel { kind, generation })
@@ -67,7 +68,8 @@ impl TimerState {
             TimerKind::FinRetry => self.fin_armed,
             TimerKind::Retransmit { .. }
             | TimerKind::MessageAckRetry { .. }
-            | TimerKind::ReassemblyTimeout { .. } => false,
+            | TimerKind::ReassemblyTimeout { .. }
+            | TimerKind::StreamOpenRetry { .. } => false,
         }
     }
 
@@ -78,7 +80,8 @@ impl TimerState {
             TimerKind::FinRetry => self.fin_armed = armed,
             TimerKind::Retransmit { .. }
             | TimerKind::MessageAckRetry { .. }
-            | TimerKind::ReassemblyTimeout { .. } => {}
+            | TimerKind::ReassemblyTimeout { .. }
+            | TimerKind::StreamOpenRetry { .. } => {}
         }
     }
 }

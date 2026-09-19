@@ -148,6 +148,13 @@ impl RioRegistry {
 
         let (ptr, len) = mem;
         let id_idx = id.as_usize();
+        let len_u32 = u32::try_from(len).map_err(|_| {
+            RioError::ResourceExhaustion
+                .to_report()
+                .with_ctx("chunk_id", id.raw())
+                .with_ctx("buffer_length", len)
+                .attach_note("RIO chunk registration length exceeds u32")
+        })?;
 
         if id_idx >= self.chunk_registry.len() {
             self.chunk_registry.resize(id_idx + 1, None);
@@ -158,7 +165,7 @@ impl RioRegistry {
             .chunk_register_attempts
             .saturating_add(1);
 
-        let buf_id = match env.dispatch.register_buffer(ptr, len as u32) {
+        let buf_id = match env.dispatch.register_buffer(ptr, len_u32) {
             Ok(id) => id,
             Err(e) => {
                 self.registration_stats.chunk_register_failures = self
@@ -276,10 +283,13 @@ impl RioRegistry {
             .heap_register_attempts
             .saturating_add(1);
 
-        let id = match env
-            .dispatch
-            .register_buffer(buf.as_ptr(), buf.capacity() as u32)
-        {
+        let capacity = u32::try_from(buf.capacity()).map_err(|_| {
+            RioError::ResourceExhaustion
+                .to_report()
+                .with_ctx("buffer_capacity", buf.capacity())
+                .attach_note("RIO heap registration capacity exceeds u32")
+        })?;
+        let id = match env.dispatch.register_buffer(buf.as_ptr(), capacity) {
             Ok(id) => id,
             Err(e) => {
                 self.registration_stats.heap_register_failures = self
@@ -685,6 +695,23 @@ mod tests {
             .expect("existing chunk registration should remain current");
         assert_eq!(current.registration.id, RioBufferId(55 as _));
         assert!(registry.pending_deregistrations.is_empty());
+        assert!(deregistered_ids().is_empty());
+    }
+
+    #[test]
+    fn rio_heap_register_failure_does_not_leave_a_lease_or_registration() {
+        let _guard = lock_dispatch_state();
+        reset_dispatch_state();
+        let dispatch = test_dispatch();
+        let env = test_env(&dispatch);
+        let mut registry = RioRegistry::new(32, 1);
+        let buf = fixed_buf(8, 0);
+        REGISTER_FAILS.store(true, SeqCst);
+
+        registry
+            .resolve_buffer_id(&buf, env)
+            .expect_err("heap registration failure should be observable");
+        assert!(registry.heap_rio_bufs.is_empty());
         assert!(deregistered_ids().is_empty());
     }
 }

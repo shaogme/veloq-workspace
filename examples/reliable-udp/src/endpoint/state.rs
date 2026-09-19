@@ -10,11 +10,11 @@ use veloq::{
 
 use crate::{
     Config,
-    connection::{Connection, ConnectionReply, Message},
+    connection::{Connection, ConnectionReply, StreamMessage as ConnectionStreamMessage},
     cookie::{CookieConfig, CookieKeyRing},
     error::{Error, Result},
-    packet::ConnectionId,
-    session::{Message as SessionMessage, SendReceipt, SendToken, Session, SessionStatsSnapshot},
+    packet::{ConnectionId, StreamId},
+    session::{SendReceipt, SendToken, Session, SessionStatsSnapshot, StreamMessage},
 };
 
 use super::io::CommandSender;
@@ -26,10 +26,11 @@ pub(super) struct SessionEntry {
     observed_stats: SessionStatsSnapshot,
     connect_reply: Option<ConnectionReply>,
     pending_send: HashMap<SendToken, Reply<SendReceipt>>,
-    pending_recv: Option<Reply<Message>>,
+    pending_stream_recv: HashMap<StreamId, Reply<ConnectionStreamMessage>>,
+    pending_stream_open: HashMap<StreamId, Reply<StreamId>>,
+    pending_stream_accept: Option<Reply<StreamId>>,
     pending_close: Option<Reply<()>>,
     accepted: bool,
-    read_shutdown: bool,
 }
 
 impl SessionEntry {
@@ -39,10 +40,11 @@ impl SessionEntry {
             observed_stats: SessionStatsSnapshot::default(),
             connect_reply,
             pending_send: HashMap::default(),
-            pending_recv: None,
+            pending_stream_recv: HashMap::default(),
+            pending_stream_open: HashMap::default(),
+            pending_stream_accept: None,
             pending_close: None,
             accepted: false,
-            read_shutdown: false,
         }
     }
 
@@ -70,26 +72,53 @@ impl SessionEntry {
         self.pending_send.remove(&token)
     }
 
-    pub(super) fn take_pending_recv(&mut self) -> Option<Reply<Message>> {
-        self.pending_recv.take()
+    pub(super) fn take_pending_stream_recv(
+        &mut self,
+        stream_id: StreamId,
+    ) -> Option<Reply<ConnectionStreamMessage>> {
+        self.pending_stream_recv.remove(&stream_id)
     }
 
-    pub(super) fn put_pending_recv(&mut self, reply: Reply<Message>) {
-        self.pending_recv = Some(reply);
+    pub(super) fn put_pending_stream_recv(
+        &mut self,
+        stream_id: StreamId,
+        reply: Reply<ConnectionStreamMessage>,
+    ) {
+        self.pending_stream_recv.insert(stream_id, reply);
     }
 
-    pub(super) fn has_pending_recv(&self) -> bool {
-        self.pending_recv.is_some()
+    pub(super) fn has_pending_stream_recv(&self, stream_id: StreamId) -> bool {
+        self.pending_stream_recv.contains_key(&stream_id)
+    }
+
+    pub(super) fn put_pending_stream_open(&mut self, stream_id: StreamId, reply: Reply<StreamId>) {
+        self.pending_stream_open.insert(stream_id, reply);
+    }
+
+    pub(super) fn take_pending_stream_open(
+        &mut self,
+        stream_id: StreamId,
+    ) -> Option<Reply<StreamId>> {
+        self.pending_stream_open.remove(&stream_id)
+    }
+
+    pub(super) fn pending_stream_open(&self, stream_id: StreamId) -> bool {
+        self.pending_stream_open.contains_key(&stream_id)
+    }
+
+    pub(super) fn put_pending_stream_accept(&mut self, reply: Reply<StreamId>) {
+        self.pending_stream_accept = Some(reply);
+    }
+
+    pub(super) fn has_pending_stream_accept(&self) -> bool {
+        self.pending_stream_accept.is_some()
+    }
+
+    pub(super) fn take_pending_stream_accept(&mut self) -> Option<Reply<StreamId>> {
+        self.pending_stream_accept.take()
     }
 
     pub(super) fn clear_closed_waiters(&mut self) {
-        if self
-            .pending_recv
-            .as_ref()
-            .is_some_and(|reply| reply.is_closed())
-        {
-            self.pending_recv = None;
-        }
         if self
             .pending_close
             .as_ref()
@@ -129,19 +158,17 @@ impl SessionEntry {
         self.accepted = true;
     }
 
-    pub(super) fn read_shutdown(&self) -> bool {
-        self.read_shutdown
-    }
-
-    pub(super) fn mark_read_shutdown(&mut self) {
-        self.read_shutdown = true;
-    }
-
     pub(super) fn finish(&mut self, error: Error) {
         if let Some(reply) = self.connect_reply.take() {
             let _ = reply.send(Err(error));
         }
-        if let Some(reply) = self.pending_recv.take() {
+        for (_, reply) in self.pending_stream_recv.drain() {
+            let _ = reply.send(Err(error));
+        }
+        for (_, reply) in self.pending_stream_open.drain() {
+            let _ = reply.send(Err(error));
+        }
+        if let Some(reply) = self.pending_stream_accept.take() {
             let _ = reply.send(Err(error));
         }
         if let Some(reply) = self.pending_close.take() {
@@ -303,8 +330,10 @@ impl<'rt> ProtocolState<'rt> {
     }
 }
 
-pub(super) fn message_from_session(message: SessionMessage) -> Message {
-    Message {
+pub(super) fn stream_message_from_session(message: StreamMessage) -> ConnectionStreamMessage {
+    ConnectionStreamMessage {
+        stream_id: message.stream_id,
+        stream_sequence: message.stream_sequence,
         message_id: message.message_id,
         payload: message.into_fixed_buf(),
     }

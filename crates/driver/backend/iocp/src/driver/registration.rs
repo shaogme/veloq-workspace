@@ -262,9 +262,21 @@ pub(super) fn close_registered_owned_fd(
 
     let result = if raw.kind() == RawHandleKind::Socket {
         let key = raw.actor_key();
-        if rio.begin_socket_cleanup(key) {
+        let ready = match rio.begin_socket_cleanup(key).trans() {
+            Ok(ready) => ready,
+            Err(error) => {
+                // Keep the owned handle alive if cleanup setup fails while RIO may still hold
+                // references to the socket. The deferred queue retains it until a later drain.
+                handles.defer_socket_cleanup(key, entry);
+                return Err(error);
+            }
+        };
+        if ready {
             rio.shutdown_actor(key);
-            rio.forget_socket_runtime(key);
+            if let Err(error) = rio.forget_socket_runtime(key).trans() {
+                handles.defer_socket_cleanup(key, entry);
+                return Err(error);
+            }
             close_owned_entry_now(entry)
         } else {
             handles.defer_socket_cleanup(key, entry);
@@ -312,22 +324,30 @@ impl<'a> IocpDriver<'a> {
     }
 
     pub(super) fn drain_deferred_socket_cleanup(&mut self) {
-        let mut rounds = self.handles.deferred_cleanup_len();
+        let state = self.state_mut();
+        let mut rounds = state.handles.deferred_cleanup_len();
         while rounds > 0 {
             rounds -= 1;
-            let Some(pending) = self.handles.pop_deferred_cleanup() else {
+            let Some(pending) = state.handles.pop_deferred_cleanup() else {
                 break;
             };
 
             let key = pending.handle();
-            let ready = self.rio.state().socket_ready_for_cleanup(key);
+            let ready = state.rio.state().socket_ready_for_cleanup(key);
 
             if ready {
-                self.rio.state_mut().shutdown_actor(key);
-                self.rio.state_mut().forget_socket_runtime(key);
-                drop(pending.into_entry());
+                state.rio.state_mut().shutdown_actor(key);
+                let cleanup_result: IocpResult<()> =
+                    state.rio.state_mut().forget_socket_runtime(key).trans();
+                match cleanup_result {
+                    Ok(()) => drop(pending.into_entry()),
+                    Err(error) => {
+                        tracing::error!(report = ?error, "failed to forget deferred socket runtime");
+                        state.handles.push_deferred_cleanup(pending);
+                    }
+                }
             } else {
-                self.handles.push_deferred_cleanup(pending);
+                state.handles.push_deferred_cleanup(pending);
             }
         }
     }
@@ -339,7 +359,8 @@ impl<'a> IocpDriver<'a> {
         ptr: *const u8,
         len: usize,
     ) -> IocpResult<BufferRegistrationStatus> {
-        self.rio
+        self.state_mut()
+            .rio
             .state_mut()
             .register_buffer_backend(id, ptr, len)
             .push_ctx("scope", "iocp/driver")
@@ -410,7 +431,7 @@ impl<'a> IocpDriver<'a> {
                 if let IocpHandle::Socket { generation: g, .. } = &mut raw
                     && *g == 0
                 {
-                    *g = self.handles.next_socket_generation();
+                    *g = self.state_mut().handles.next_socket_generation();
                 }
                 canonical = RawHandle::new(raw);
             }
@@ -425,7 +446,7 @@ impl<'a> IocpDriver<'a> {
         let mut registered = Vec::with_capacity(prepared.len());
         let mut socket_keys = Vec::new();
         for (entry, socket_key) in prepared {
-            match self.handles.insert_registered(entry) {
+            match self.state_mut().handles.insert_registered(entry) {
                 Ok(fd) => {
                     if let Some(key) = socket_key {
                         socket_keys.push(key);
@@ -434,8 +455,10 @@ impl<'a> IocpDriver<'a> {
                 }
                 Err(report) => {
                     for fd in registered.drain(..) {
-                        if let Some((idx, _entry)) = self.handles.take_for_unregister(fd) {
-                            self.handles.release_slot(idx);
+                        if let Some((idx, _entry)) =
+                            self.state_mut().handles.take_for_unregister(fd)
+                        {
+                            self.state_mut().handles.release_slot(idx);
                         }
                     }
                     return Err(report);
@@ -444,7 +467,7 @@ impl<'a> IocpDriver<'a> {
         }
 
         for key in socket_keys {
-            self.rio.state_mut().mark_socket_registered(key);
+            self.state_mut().rio.state_mut().mark_socket_registered(key);
         }
         Ok(registered)
     }
@@ -452,17 +475,43 @@ impl<'a> IocpDriver<'a> {
     /// Unregisters a set of previously registered files.
     pub(crate) fn unregister_files(&mut self, files: Vec<IoFd>) -> IocpResult<()> {
         for fd in files {
-            if let Some((idx, entry)) = self.handles.take_for_unregister(fd) {
+            if let Some((idx, entry)) = self.state_mut().handles.take_for_unregister(fd) {
                 if entry.as_raw().kind() == RawHandleKind::Socket {
                     let key = entry.as_raw().raw().actor_key();
-                    if self.rio.state_mut().begin_socket_cleanup(key) {
-                        self.rio.state_mut().shutdown_actor(key);
-                        self.rio.state_mut().forget_socket_runtime(key);
+                    let ready = match self
+                        .state_mut()
+                        .rio
+                        .state_mut()
+                        .begin_socket_cleanup(key)
+                        .trans()
+                    {
+                        Ok(ready) => ready,
+                        Err(error) => {
+                            // Do not drop an owned socket while a failed cleanup request may
+                            // still leave RIO requests holding the socket alive.
+                            self.state_mut().handles.defer_socket_cleanup(key, entry);
+                            self.state_mut().handles.release_slot(idx);
+                            return Err(error);
+                        }
+                    };
+                    if ready {
+                        self.state_mut().rio.state_mut().shutdown_actor(key);
+                        if let Err(error) = self
+                            .state_mut()
+                            .rio
+                            .state_mut()
+                            .forget_socket_runtime(key)
+                            .trans()
+                        {
+                            self.state_mut().handles.defer_socket_cleanup(key, entry);
+                            self.state_mut().handles.release_slot(idx);
+                            return Err(error);
+                        }
                     } else {
-                        self.handles.defer_socket_cleanup(key, entry);
+                        self.state_mut().handles.defer_socket_cleanup(key, entry);
                     }
                 }
-                self.handles.release_slot(idx);
+                self.state_mut().handles.release_slot(idx);
             }
         }
         Ok(())

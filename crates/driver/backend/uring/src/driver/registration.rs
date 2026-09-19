@@ -74,10 +74,6 @@ impl ProvidedBufferOwner {
         self.group.is_some()
     }
 
-    fn is_enabled(&self) -> bool {
-        self.group.as_ref().is_some_and(ProvidedBufGroup::is_usable)
-    }
-
     fn has_selected_bids(&self) -> bool {
         self.group
             .as_ref()
@@ -86,10 +82,6 @@ impl ProvidedBufferOwner {
 
     fn stats(&self) -> Option<ProvidedBufferSnapshot> {
         self.group.as_ref().map(ProvidedBufGroup::stats)
-    }
-
-    fn failure_errno(&self) -> Option<i32> {
-        self.failure_errno
     }
 
     fn command_port(&mut self) -> Option<ProvidedBufPort<'_>> {
@@ -291,26 +283,6 @@ impl<'a> RegistrationEngine<'a> {
         self.provided_buffers.stats()
     }
 
-    #[inline]
-    pub(crate) fn fixed_buffers_available(&self) -> bool {
-        self.fixed_buffers.fixed_buffers_available()
-    }
-
-    #[inline]
-    pub(crate) fn fixed_buffers_failure_errno(&self) -> Option<i32> {
-        self.fixed_buffers.fixed_buffers_failure_errno()
-    }
-
-    #[inline]
-    pub(crate) fn provided_buffers_enabled(&self) -> bool {
-        self.provided_buffers.is_enabled()
-    }
-
-    #[inline]
-    pub(crate) fn provided_buffers_failure_errno(&self) -> Option<i32> {
-        self.provided_buffers.failure_errno()
-    }
-
     pub(crate) fn release_provided_buffers(
         &mut self,
         submitter: &Submitter<'_>,
@@ -321,6 +293,12 @@ impl<'a> RegistrationEngine<'a> {
     #[inline]
     pub(crate) fn set_fixed_buffers_available(&mut self, registration: ResourceRegistration) {
         self.fixed_buffers.set_fixed_buffers_available(registration);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[inline]
+    pub(crate) fn fixed_buffers_available(&self) -> bool {
+        self.fixed_buffers.fixed_buffers_available()
     }
 
     #[inline]
@@ -487,22 +465,27 @@ impl UringRegistrationStats {
         self.raw_buffer_fallbacks = self.raw_buffer_fallbacks.saturating_add(1);
     }
 
+    #[cfg(feature = "test-hooks")]
     pub(crate) const fn chunk_register_attempts(&self) -> u64 {
         self.chunk_register_attempts
     }
 
+    #[cfg(feature = "test-hooks")]
     pub(crate) const fn chunk_register_failures(&self) -> u64 {
         self.chunk_register_failures
     }
 
+    #[cfg(feature = "test-hooks")]
     pub(crate) const fn chunk_register_skipped_recent_failure(&self) -> u64 {
         self.chunk_register_skipped_recent_failure
     }
 
+    #[cfg(feature = "test-hooks")]
     pub(crate) const fn submission_missing_chunk_info(&self) -> u64 {
         self.submission_missing_chunk_info
     }
 
+    #[cfg(feature = "test-hooks")]
     pub(crate) const fn raw_buffer_fallbacks(&self) -> u64 {
         self.raw_buffer_fallbacks
     }

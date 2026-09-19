@@ -22,6 +22,7 @@ pub enum ConfigError {
     DatagramTooLarge { size: usize, max: usize },
     SendWindowTooLarge { size: usize, max: usize },
     ReceiveWindowTooLarge { size: usize, max: usize },
+    StreamCountTooLarge { size: usize, max: usize },
     MessageSizeTooLarge { size: usize, max: usize },
     MessageSizeWireOverflow,
     FragmentCountTooLarge { size: u32, max: u32 },
@@ -53,6 +54,9 @@ impl fmt::Display for ConfigError {
             }
             Self::ReceiveWindowTooLarge { size, max } => {
                 write!(f, "receive window {size} exceeds wire limit {max}")
+            }
+            Self::StreamCountTooLarge { size, max } => {
+                write!(f, "stream count {size} exceeds protocol limit {max}")
             }
             Self::MessageSizeTooLarge { size, max } => {
                 write!(f, "message size {size} exceeds wire limit {max}")
@@ -104,6 +108,20 @@ pub struct Config {
     pub max_inbound_bytes: NonZeroUsize,
     pub send_window: NonZeroUsize,
     pub receive_window: NonZeroUsize,
+    pub max_streams: NonZeroUsize,
+    pub max_pending_streams: NonZeroUsize,
+    pub stream_send_window_frames: NonZeroUsize,
+    pub stream_receive_window_frames: NonZeroUsize,
+    pub connection_receive_window_frames: NonZeroUsize,
+    pub max_stream_send_bytes: NonZeroUsize,
+    pub max_stream_receive_bytes: NonZeroUsize,
+    pub max_connection_send_bytes: NonZeroUsize,
+    pub max_connection_receive_bytes: NonZeroUsize,
+    pub stream_pending_send_capacity: NonZeroUsize,
+    pub stream_inbound_capacity: NonZeroUsize,
+    pub stream_accept_capacity: NonZeroUsize,
+    pub stream_open_deadline: Duration,
+    pub scheduler_quantum: NonZeroUsize,
     pub command_capacity: NonZeroUsize,
     pub accept_capacity: NonZeroUsize,
     pub max_connections: NonZeroUsize,
@@ -168,6 +186,20 @@ impl Default for ConfigBuilder {
                 max_inbound_bytes: non_zero(8 * 1024 * 1024),
                 send_window: non_zero(32),
                 receive_window: non_zero(32),
+                max_streams: non_zero(64),
+                max_pending_streams: non_zero(64),
+                stream_send_window_frames: non_zero(32),
+                stream_receive_window_frames: non_zero(32),
+                connection_receive_window_frames: non_zero(256),
+                max_stream_send_bytes: non_zero(8 * 1024 * 1024),
+                max_stream_receive_bytes: non_zero(8 * 1024 * 1024),
+                max_connection_send_bytes: non_zero(64 * 1024 * 1024),
+                max_connection_receive_bytes: non_zero(64 * 1024 * 1024),
+                stream_pending_send_capacity: non_zero(64),
+                stream_inbound_capacity: non_zero(256),
+                stream_accept_capacity: non_zero(64),
+                stream_open_deadline: Duration::from_secs(1),
+                scheduler_quantum: non_zero(8),
                 command_capacity: non_zero(64),
                 accept_capacity: non_zero(64),
                 max_connections: non_zero(256),
@@ -233,6 +265,76 @@ impl ConfigBuilder {
 
     pub fn receive_window(mut self, value: NonZeroUsize) -> Self {
         self.config.receive_window = value;
+        self
+    }
+
+    pub fn max_streams(mut self, value: NonZeroUsize) -> Self {
+        self.config.max_streams = value;
+        self
+    }
+
+    pub fn max_pending_streams(mut self, value: NonZeroUsize) -> Self {
+        self.config.max_pending_streams = value;
+        self
+    }
+
+    pub fn stream_send_window_frames(mut self, value: NonZeroUsize) -> Self {
+        self.config.stream_send_window_frames = value;
+        self
+    }
+
+    pub fn stream_receive_window_frames(mut self, value: NonZeroUsize) -> Self {
+        self.config.stream_receive_window_frames = value;
+        self
+    }
+
+    pub fn connection_receive_window_frames(mut self, value: NonZeroUsize) -> Self {
+        self.config.connection_receive_window_frames = value;
+        self
+    }
+
+    pub fn max_stream_send_bytes(mut self, value: NonZeroUsize) -> Self {
+        self.config.max_stream_send_bytes = value;
+        self
+    }
+
+    pub fn max_stream_receive_bytes(mut self, value: NonZeroUsize) -> Self {
+        self.config.max_stream_receive_bytes = value;
+        self
+    }
+
+    pub fn max_connection_send_bytes(mut self, value: NonZeroUsize) -> Self {
+        self.config.max_connection_send_bytes = value;
+        self
+    }
+
+    pub fn max_connection_receive_bytes(mut self, value: NonZeroUsize) -> Self {
+        self.config.max_connection_receive_bytes = value;
+        self
+    }
+
+    pub fn stream_pending_send_capacity(mut self, value: NonZeroUsize) -> Self {
+        self.config.stream_pending_send_capacity = value;
+        self
+    }
+
+    pub fn stream_inbound_capacity(mut self, value: NonZeroUsize) -> Self {
+        self.config.stream_inbound_capacity = value;
+        self
+    }
+
+    pub fn stream_accept_capacity(mut self, value: NonZeroUsize) -> Self {
+        self.config.stream_accept_capacity = value;
+        self
+    }
+
+    pub fn stream_open_deadline(mut self, value: Duration) -> Self {
+        self.config.stream_open_deadline = value;
+        self
+    }
+
+    pub fn scheduler_quantum(mut self, value: NonZeroUsize) -> Self {
+        self.config.scheduler_quantum = value;
         self
     }
 
@@ -391,6 +493,24 @@ fn validate_values(config: &Config) -> Result<(), ConfigError> {
             max: MAX_RECEIVE_WINDOW,
         });
     }
+    for window in [
+        config.stream_send_window_frames.get(),
+        config.stream_receive_window_frames.get(),
+        config.connection_receive_window_frames.get(),
+    ] {
+        if window > usize::from(u16::MAX) {
+            return Err(ConfigError::ReceiveWindowTooLarge {
+                size: window,
+                max: usize::from(u16::MAX),
+            });
+        }
+    }
+    if config.max_streams.get() > u32::MAX as usize {
+        return Err(ConfigError::StreamCountTooLarge {
+            size: config.max_streams.get(),
+            max: u32::MAX as usize,
+        });
+    }
 
     let max_fragment_payload =
         datagram_size
@@ -430,6 +550,19 @@ fn validate_values(config: &Config) -> Result<(), ConfigError> {
             message: max_message_size,
         });
     }
+    for budget in [
+        config.max_stream_send_bytes.get(),
+        config.max_stream_receive_bytes.get(),
+        config.max_connection_send_bytes.get(),
+        config.max_connection_receive_bytes.get(),
+    ] {
+        if budget < max_message_size {
+            return Err(ConfigError::InboundBudgetTooSmall {
+                budget,
+                message: max_message_size,
+            });
+        }
+    }
     if !(config.min_rto <= config.initial_rto && config.initial_rto <= config.max_rto) {
         return Err(ConfigError::TimeoutOrder);
     }
@@ -454,6 +587,7 @@ fn validate_values(config: &Config) -> Result<(), ConfigError> {
         ("close_timeout", config.close_timeout),
         ("reassembly_timeout", config.reassembly_timeout),
         ("message_ack_timeout", config.message_ack_timeout),
+        ("stream_open_deadline", config.stream_open_deadline),
     ] {
         if timeout <= tick {
             return Err(ConfigError::TimeoutTooShort { name });
@@ -501,6 +635,8 @@ fn validate_values(config: &Config) -> Result<(), ConfigError> {
         .and_then(|value| value.checked_add(config.pending_send_capacity.get()))
         .and_then(|value| value.checked_add(config.inbound_capacity.get()))
         .and_then(|value| value.checked_add(config.outbound_capacity.get()))
+        .and_then(|value| value.checked_add(config.max_pending_streams.get()))
+        .and_then(|value| value.checked_add(config.stream_accept_capacity.get()))
         .ok_or(ConfigError::MemoryBudgetOverflow)?;
     let frame_budget = datagram_size
         .checked_mul(queued)
@@ -511,12 +647,21 @@ fn validate_values(config: &Config) -> Result<(), ConfigError> {
         .checked_mul(max_message_size)
         .and_then(|value| value.checked_add(config.max_reassembly_bytes.get()))
         .and_then(|value| value.checked_add(config.max_inbound_bytes.get()))
+        .and_then(|value| value.checked_add(config.max_stream_send_bytes.get()))
+        .and_then(|value| value.checked_add(config.max_stream_receive_bytes.get()))
         .ok_or(ConfigError::MemoryBudgetOverflow)?;
     let per_connection = frame_budget
         .checked_add(message_budget)
         .ok_or(ConfigError::MemoryBudgetOverflow)?;
     per_connection
         .checked_mul(config.max_connections.get())
+        .ok_or(ConfigError::MemoryBudgetOverflow)?;
+    config
+        .max_streams
+        .get()
+        .checked_mul(config.stream_pending_send_capacity.get())
+        .and_then(|value| value.checked_add(config.stream_inbound_capacity.get()))
+        .and_then(|value| value.checked_mul(max_message_size))
         .ok_or(ConfigError::MemoryBudgetOverflow)?;
     Ok(())
 }

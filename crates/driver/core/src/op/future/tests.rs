@@ -160,7 +160,7 @@ impl CompletionAccess<DummySlotSpec> for MockTable {
         self.ready.fetch_sub(1, Ordering::Relaxed);
         Ok(PollRecordResult::Ready(CompletionRecord {
             event: UserCompletionEvent::from_parts(CompletionBackend::Core, token, 0, 0),
-            payload: (),
+            payload: Some(()),
             detail: None,
             cleanup: CompletionCleanupGuard::none(),
             continuation: self.next_continuation(),

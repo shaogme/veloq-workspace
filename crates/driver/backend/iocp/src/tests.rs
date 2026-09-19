@@ -4,6 +4,7 @@ pub(crate) mod net;
 pub(crate) mod net_udp;
 
 use diagweave::prelude::*;
+use tracing_subscriber::fmt::TestWriter;
 use veloq_driver_core::{
     driver::{
         CompletionRecord, CompletionValue, DriveMode, Driver, DriverSubmitResult, OpToken,
@@ -16,6 +17,16 @@ use veloq_std::{
     format, io, thread,
     time::{Duration, Instant},
 };
+
+pub(crate) fn init_test_logger() {
+    static INIT: veloq_std::sync::OnceLock<()> = veloq_std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_writer(TestWriter::new())
+            .with_max_level(tracing::Level::TRACE)
+            .try_init();
+    });
+}
 
 use crate::{
     driver::IocpDriver,
@@ -57,7 +68,9 @@ where
         // IOCP 恒为 `Final`。
         continuation: _,
     } = record;
-    let payload = T::try_record_from_erased(payload_erased).expect("completion payload type");
+    let payload =
+        T::try_record_from_erased(payload_erased.expect("completion record payload type"))
+            .expect("completion payload type");
     let res = detail
         .take()
         .unwrap_or_else(|| usize::from_event_res::<IocpError>(event.res()));

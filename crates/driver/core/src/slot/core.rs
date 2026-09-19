@@ -250,7 +250,7 @@ pub struct SlotData<Spec: SlotSpec> {
 /// 一条已发布、等待被消费的完成。
 pub(crate) struct MailboxRecord<Spec: SlotSpec> {
     pub(crate) event: UserCompletionEvent,
-    pub(crate) payload: SlotPayload<Spec>,
+    pub(crate) payload: Option<SlotPayload<Spec>>,
     pub(crate) detail: Option<DriverResult<SlotCompletion<Spec>, SlotError<Spec>>>,
     pub(crate) cleanup: CompletionCleanupGuard,
     /// 取走这条之后该操作是否还会再产出完成。消费方（`LocalOp` / `DetachedOp` 的流）靠

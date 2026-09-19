@@ -3,7 +3,7 @@
 use std::{env, fs::File, os::fd::AsRawFd, thread};
 
 use veloq_io_uring::{
-    IoUring, SetupPolicy, SubmitReceipt, cqueue, opcode,
+    IoUring, SetupFlags, SetupPolicy, SubmitReceipt, cqueue, opcode,
     types::{AsyncCancelFlags, Fd, Timespec},
 };
 
@@ -224,23 +224,24 @@ fn short_io_and_async_cancel_complete_under_pressure() {
 }
 
 #[test]
-fn optional_setup_profile_has_a_basic_fallback() {
+fn default_setup_profile_requires_task_run_flags() {
     if !enabled() {
         eprintln!("skip io_uring stress test: set VELOQ_IO_URING_STRESS=1 to enable");
         return;
     }
-    let profile =
-        veloq_io_uring::RingConfig::new(8).with_setup_policy(SetupPolicy::latency_best_effort());
-    let ring = match IoUring::from_config(profile) {
-        Ok(ring) => ring,
-        Err(profile_error) => {
-            eprintln!(
-                "optional setup profile rejected; exercising basic fallback: {profile_error}"
-            );
-            IoUring::new(8).expect("basic io_uring profile must remain available")
-        }
-    };
-    assert!(ring.params().sq_entries() >= 1);
+    let required = SetupFlags::COOP_TASKRUN.bits()
+        | SetupFlags::SINGLE_ISSUER.bits()
+        | SetupFlags::DEFER_TASKRUN.bits();
+    let ring = IoUring::new(8).expect("default io_uring setup profile must be supported");
+    assert_eq!(ring.params().setup_flags() & required, required);
+
+    let profile = veloq_io_uring::RingConfig::new(8)
+        .with_setup_policy(SetupPolicy::default().with_disabled(SetupFlags::DEFER_TASKRUN));
+    let ring = IoUring::from_config(profile).expect("explicitly disabled setup flag is valid");
+    assert_eq!(
+        ring.params().setup_flags() & SetupFlags::DEFER_TASKRUN.bits(),
+        0
+    );
 }
 
 #[test]

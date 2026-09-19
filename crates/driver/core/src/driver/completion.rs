@@ -28,8 +28,8 @@ pub use flow::{
     SyntheticCompletionSource,
 };
 pub use packet::{
-    CompletionContinuation, CompletionInput, CompletionPacket, CompletionRecord, UserCompletion,
-    run_completion_cleanup,
+    CompletionContinuation, CompletionInput, CompletionPacket, CompletionRecord,
+    TerminalCompletion, UserCompletion, run_completion_cleanup,
 };
 pub use routing::{FinalizeOutcome, RoutedSlotCompletion, SlotLookupFailure};
 pub use table::{

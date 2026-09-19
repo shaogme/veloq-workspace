@@ -1,8 +1,8 @@
 use tracing::{trace, warn};
 use veloq::{
     buf::FixedBuf,
-    net::{PreparedUdpRecv, UdpSocket},
-    runtime::context::Ctx,
+    net::{UdpReceiveConfig, UdpSocket},
+    nz,
     std::{net::SocketAddr, sync::Arc},
     sync::{
         TrySendError,
@@ -113,7 +113,6 @@ pub(super) enum PumpEvent {
 }
 
 pub(super) async fn receive_pump<'rt>(
-    ctx: Ctx<'rt>,
     socket: UdpSocket<'rt>,
     config: Config,
     inbound: InboundSender,
@@ -121,15 +120,21 @@ pub(super) async fn receive_pump<'rt>(
     stats: Arc<EndpointStats>,
 ) -> Result<()> {
     trace!(target: "veloq_reliable_udp::endpoint", "receive pump started");
-    let mut recv = match prepare_recv(ctx, &socket, &config) {
+    let mut recv = match socket.receiver(UdpReceiveConfig {
+        kernel_capacity: nz!(1),
+        queue_capacity: config.inbound_capacity,
+        datagram_capacity: config.max_datagram_size,
+        close_timeout: config.close_timeout,
+    }) {
         Ok(recv) => recv,
-        Err(error) => {
-            report_pump_failure(&pump_events, PumpEvent::ReceiveFailed(error)).await;
+        Err(_) => {
+            report_pump_failure(&pump_events, PumpEvent::ReceiveFailed(Error::Io)).await;
             return Ok(());
         }
     };
-    if let Err(error) = recv.arm().await.map_err(|_| Error::Io) {
-        report_pump_failure(&pump_events, PumpEvent::ReceiveFailed(error)).await;
+    if let Err(error) = recv.ready().await {
+        warn!(target: "veloq_reliable_udp::endpoint", ?error, "receive receiver failed to become ready");
+        report_pump_failure(&pump_events, PumpEvent::ReceiveFailed(Error::Io)).await;
         return Ok(());
     }
     if pump_events.send(PumpEvent::ReceiveReady).await.is_err() {
@@ -137,7 +142,7 @@ pub(super) async fn receive_pump<'rt>(
     }
 
     loop {
-        let packet = match recv.await {
+        let packet = match recv.recv().await {
             Ok(packet) => packet,
             Err(_) => {
                 report_pump_failure(&pump_events, PumpEvent::ReceiveFailed(Error::Io)).await;
@@ -153,20 +158,6 @@ pub(super) async fn receive_pump<'rt>(
             }
         };
         trace_received(peer, &datagram);
-
-        // Arm the next receive before handing the current datagram to the
-        // bounded protocol queue, keeping one receive future continuously live.
-        recv = match prepare_recv(ctx, &socket, &config) {
-            Ok(recv) => recv,
-            Err(error) => {
-                report_pump_failure(&pump_events, PumpEvent::ReceiveFailed(error)).await;
-                return Ok(());
-            }
-        };
-        if let Err(error) = recv.arm().await.map_err(|_| Error::Io) {
-            report_pump_failure(&pump_events, PumpEvent::ReceiveFailed(error)).await;
-            return Ok(());
-        }
 
         let item = InboundDatagram::new(peer, datagram);
         match inbound.try_send(item) {
@@ -254,7 +245,8 @@ fn trace_submitted(item: &OutboundDatagram) {
             target: "veloq_reliable_udp::endpoint",
             peer = ?item.key().peer(),
             connection_id = packet.connection_id.get(),
-            flags = packet.flags.bits(),
+            frame_type = ?packet.frame_type,
+            has_ack = packet.has_ack,
             frame_sequence = packet.frame_sequence,
             ack_largest = packet.ack_largest,
             payload_len = packet.payload.len(),
@@ -262,15 +254,4 @@ fn trace_submitted(item: &OutboundDatagram) {
             "send pump submitting datagram"
         );
     }
-}
-
-fn prepare_recv<'rt>(
-    ctx: Ctx<'rt>,
-    socket: &UdpSocket<'rt>,
-    config: &Config,
-) -> Result<PreparedUdpRecv<'rt>> {
-    let buffer = ctx
-        .try_alloc_full(config.max_datagram_size)
-        .map_err(|_| Error::Io)?;
-    Ok(socket.prepare_recv_from(buffer))
 }

@@ -75,6 +75,7 @@ pub(crate) struct RioRegistry {
         FastHashMap<RioChunkRegistrationKey, RioBufferRegistration>,
     pub(crate) addr_slots: Box<[SockAddrStorage]>,
     pub(crate) addr_slot_in_use: Vec<bool>,
+    pub(crate) addr_slot_generations: Vec<u64>,
     pub(crate) addr_free_slots: Vec<usize>,
     pub(crate) addr_buffer_id: RioBufferId,
     /// Heap-buffer lazy registrations: (ptr, cap, cookie) -> RIO buffer registration.
@@ -169,6 +170,7 @@ impl RioRegistry {
             retired_chunk_registrations: FastHashMap::default(),
             addr_slots: vec![SockAddrStorage::default(); addr_capacity].into_boxed_slice(),
             addr_slot_in_use: vec![false; addr_capacity],
+            addr_slot_generations: vec![0; addr_capacity],
             addr_free_slots,
             addr_buffer_id: RioBufferId::INVALID,
             heap_rio_bufs: FastHashMap::default(),
@@ -214,7 +216,7 @@ impl RioRegistry {
     #[cfg(test)]
     pub(crate) fn decode_request_context(&mut self, raw: u64) -> Option<RioCompletionKind> {
         match self.decode_request_context_checked(raw) {
-            RioRequestContextDecode::Valid(kind) => Some(kind),
+            RioRequestContextDecode::Valid(kind) => Some(*kind),
             RioRequestContextDecode::Malformed { .. }
             | RioRequestContextDecode::Missing { .. }
             | RioRequestContextDecode::Stale { .. } => None,
@@ -244,10 +246,10 @@ impl RioRegistry {
         };
         slot.in_use = false;
         self.request_context_free.push(id.index());
-        RioRequestContextDecode::Valid(RioCompletionKind::Op {
+        RioRequestContextDecode::Valid(Box::new(RioCompletionKind::Op {
             init,
             context: RioCompletedRequestContext::new(),
-        })
+        }))
     }
 
     fn take_request_context_init(&mut self, id: RioRequestContextId) -> Option<RioOpRequestInit> {
@@ -356,6 +358,25 @@ impl RioRegistry {
     }
 
     pub(crate) fn cleanup_deregister(&mut self, env: RioEnv<'_>) {
+        if self.addr_slot_in_use.iter().any(|in_use| *in_use)
+            || self.request_contexts.iter().any(|slot| slot.in_use)
+            || self.has_active_buffer_leases()
+        {
+            tracing::error!(
+                active_addr_slots = self
+                    .addr_slot_in_use
+                    .iter()
+                    .filter(|in_use| **in_use)
+                    .count(),
+                active_request_contexts = self
+                    .request_contexts
+                    .iter()
+                    .filter(|slot| slot.in_use)
+                    .count(),
+                "refusing to deregister RIO buffers while leases or request contexts are active"
+            );
+            return;
+        }
         let mut deregistered = HashSet::default();
 
         for id in self
@@ -398,6 +419,21 @@ impl RioRegistry {
         self.chunk_register_failures_recent.clear();
         self.heap_register_failures_recent.clear();
     }
+
+    fn has_active_buffer_leases(&self) -> bool {
+        self.chunk_registry
+            .iter()
+            .flatten()
+            .any(|entry| entry.registration.active_refs > 0)
+            || self
+                .retired_chunk_registrations
+                .values()
+                .any(|entry| entry.active_refs > 0)
+            || self
+                .heap_rio_bufs
+                .values()
+                .any(|entry| entry.active_refs > 0)
+    }
 }
 
 #[cfg(test)]
@@ -422,6 +458,10 @@ pub(crate) mod test_helpers {
 
     pub(crate) static NEXT_REGISTER_ID: AtomicUsize = AtomicUsize::new(100);
     pub(crate) static REGISTER_FAILS: AtomicBool = AtomicBool::new(false);
+    pub(crate) static RECEIVE_EX_CALLS: AtomicUsize = AtomicUsize::new(0);
+    pub(crate) static RECEIVE_EX_DATA_COUNT: AtomicUsize = AtomicUsize::new(0);
+    pub(crate) static RECEIVE_EX_REMOTE_ADDR: AtomicUsize = AtomicUsize::new(0);
+    pub(crate) static RECEIVE_EX_FLAGS: AtomicUsize = AtomicUsize::new(0);
     pub(crate) static DISPATCH_TEST_LOCK: UnpoisonedMutex<()> = UnpoisonedMutex::new(());
     pub(crate) static DEREGISTERED_IDS: UnpoisonedMutex<Vec<usize>> =
         UnpoisonedMutex::new(Vec::new());
@@ -434,6 +474,10 @@ pub(crate) mod test_helpers {
     pub(crate) fn reset_dispatch_state() {
         NEXT_REGISTER_ID.store(100, SeqCst);
         REGISTER_FAILS.store(false, SeqCst);
+        RECEIVE_EX_CALLS.store(0, SeqCst);
+        RECEIVE_EX_DATA_COUNT.store(0, SeqCst);
+        RECEIVE_EX_REMOTE_ADDR.store(0, SeqCst);
+        RECEIVE_EX_FLAGS.store(0, SeqCst);
         DEREGISTERED_IDS.lock().clear();
     }
 
@@ -538,7 +582,11 @@ pub(crate) mod test_helpers {
         _flags: u32,
         _context: *const c_void,
     ) -> i32 {
-        0
+        RECEIVE_EX_CALLS.fetch_add(1, SeqCst);
+        RECEIVE_EX_DATA_COUNT.store(_data_buf_count as usize, SeqCst);
+        RECEIVE_EX_REMOTE_ADDR.store((!_remote_addr.is_null()) as usize, SeqCst);
+        RECEIVE_EX_FLAGS.store(_flags as usize, SeqCst);
+        1
     }
 
     pub(crate) fn test_dispatch() -> RioDispatch {
@@ -595,10 +643,13 @@ mod tests {
         let cases = [
             (RioSubmissionKind::Recv, "recv", buf.capacity() + 1),
             (RioSubmissionKind::Send, "send", buf.len() + 1),
-            (RioSubmissionKind::Recv, "udp_recv", buf.capacity() + 1),
             (RioSubmissionKind::Send, "udp_send", buf.len() + 1),
             (RioSubmissionKind::Send, "send_to", buf.len() + 1),
-            (RioSubmissionKind::Recv, "udp_recv_from", buf.capacity() + 1),
+            (
+                RioSubmissionKind::Recv,
+                "udp_recv_multi",
+                buf.capacity() + 1,
+            ),
         ];
 
         for (kind, operation, offset) in cases {

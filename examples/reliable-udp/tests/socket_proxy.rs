@@ -8,7 +8,8 @@ use std::{
 
 use tracing::{debug, trace, warn};
 use veloq::{
-    net::{PreparedUdpRecv, UdpSocket},
+    net::{UdpReceiveConfig, UdpSocket},
+    nz,
     runtime::{
         Outcome,
         context::Ctx,
@@ -32,7 +33,7 @@ use veloq::{
     time::sleep,
 };
 
-use veloq_reliable_udp::{Flags, FrameSequence, PacketRef};
+use veloq_reliable_udp::{FrameSequence, FrameType, PacketRef};
 
 const CHANNEL_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 32;
@@ -66,6 +67,10 @@ impl ProxyDirection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketMatcher {
     Data {
+        frame_sequence: Option<FrameSequence>,
+    },
+    Frame {
+        frame_type: FrameType,
         frame_sequence: Option<FrameSequence>,
     },
 }
@@ -350,7 +355,6 @@ impl ProxyDriver<'_> {
             let scoped = scope!(ctx, async |scope| {
                 let mut tasks = ProxyTasks {
                     client_receive: scope.spawn_boxed(receive_pump(ReceivePump {
-                        ctx,
                         socket: client_side.clone(),
                         max_datagram_size,
                         expected_peer: client_addr,
@@ -390,7 +394,6 @@ impl ProxyDriver<'_> {
                         ),
                     ),
                     server_receive: scope.spawn_boxed(receive_pump(ReceivePump {
-                        ctx,
                         socket: server_side.clone(),
                         max_datagram_size,
                         expected_peer: server_addr,
@@ -616,7 +619,6 @@ struct SendCompleted {
 }
 
 struct ReceivePump<'rt> {
-    ctx: Ctx<'rt>,
     socket: UdpSocket<'rt>,
     max_datagram_size: NonZeroUsize,
     expected_peer: SocketAddr,
@@ -628,7 +630,6 @@ struct ReceivePump<'rt> {
 
 async fn receive_pump(pump: ReceivePump<'_>) {
     let ReceivePump {
-        ctx,
         socket,
         max_datagram_size,
         expected_peer,
@@ -639,14 +640,20 @@ async fn receive_pump(pump: ReceivePump<'_>) {
     } = pump;
     stats.receive_started.fetch_add(1, Ordering::Relaxed);
     let mut operation_id: u64 = 0;
-    let mut recv = match prepare_recv(ctx, &socket, max_datagram_size) {
+    let mut recv = match socket.receiver(UdpReceiveConfig {
+        kernel_capacity: nz!(1),
+        queue_capacity: nz!(MAX_PENDING_DATAGRAMS),
+        datagram_capacity: max_datagram_size,
+        close_timeout: Duration::from_secs(1),
+    }) {
         Ok(recv) => recv,
-        Err(error) => {
-            report_receive_failure(&events, &stats, error).await;
+        Err(_) => {
+            report_receive_failure(&events, &stats, ProxyError::Io).await;
             return;
         }
     };
-    if recv.arm().await.is_err() {
+    if let Err(error) = recv.ready().await {
+        warn!(target: "veloq_reliable_udp::socket_proxy", ?error, "receive receiver failed to become ready");
         report_receive_failure(&events, &stats, ProxyError::Io).await;
         return;
     }
@@ -659,7 +666,7 @@ async fn receive_pump(pump: ReceivePump<'_>) {
     }
 
     loop {
-        let packet = match recv.await {
+        let packet = match recv.recv().await {
             Ok(packet) => packet,
             Err(_) => {
                 report_receive_failure(&events, &stats, ProxyError::Io).await;
@@ -670,21 +677,6 @@ async fn receive_pump(pump: ReceivePump<'_>) {
         operation_id = operation_id.wrapping_add(1);
         let peer = packet.addr;
         let datagram = packet.buf.as_slice().to_vec();
-
-        // Re-arm before validating the source or touching the coordinator. This is the
-        // invariant that prevents delayed forwarding from stealing the receive slot.
-        recv = match prepare_recv(ctx, &socket, max_datagram_size) {
-            Ok(recv) => recv,
-            Err(error) => {
-                report_receive_failure(&events, &stats, error).await;
-                return;
-            }
-        };
-        if recv.arm().await.is_err() {
-            report_receive_failure(&events, &stats, ProxyError::Io).await;
-            return;
-        }
-        stats.receive_rearmed.fetch_add(1, Ordering::Relaxed);
 
         if peer != expected_peer {
             stats.unexpected_source.fetch_add(1, Ordering::Relaxed);
@@ -1175,17 +1167,6 @@ async fn send_datagram<'rt>(
     Ok(())
 }
 
-fn prepare_recv<'rt>(
-    ctx: Ctx<'rt>,
-    socket: &UdpSocket<'rt>,
-    max_datagram_size: NonZeroUsize,
-) -> Result<PreparedUdpRecv<'rt>, ProxyError> {
-    let buffer = ctx
-        .try_alloc_full(max_datagram_size)
-        .map_err(|_| ProxyError::Io)?;
-    Ok(socket.prepare_recv_from(buffer))
-}
-
 fn trace_datagram(
     direction: ProxyDirection,
     source: SocketAddr,
@@ -1201,7 +1182,8 @@ fn trace_datagram(
             operation_id,
             event_id,
             connection_id = packet.connection_id.get(),
-            flags = packet.flags.bits(),
+            frame_type = ?packet.frame_type,
+            has_ack = packet.has_ack,
             frame_sequence = packet.frame_sequence,
             ack_largest = packet.ack_largest,
             payload_len = packet.payload.len(),
@@ -1225,7 +1207,14 @@ impl PacketMatcher {
         let Some(packet) = packet else { return false };
         match self {
             Self::Data { frame_sequence } => {
-                packet.flags.contains(Flags::DATA)
+                packet.frame_type == FrameType::Data
+                    && frame_sequence.is_none_or(|sequence| packet.frame_sequence == sequence.get())
+            }
+            Self::Frame {
+                frame_type,
+                frame_sequence,
+            } => {
+                packet.frame_type == frame_type
                     && frame_sequence.is_none_or(|sequence| packet.frame_sequence == sequence.get())
             }
         }

@@ -230,16 +230,12 @@ impl ProvidedBufConfig {
 pub struct UringConfig {
     pub mode: IoMode,
     pub entries: NonZeroU32,
-    /// Setup flags required or negotiated while creating the ring.
+    /// Setup flags required or explicitly disabled while creating the ring.
     pub setup_policy: SetupPolicy,
     pub drive_limits: UringDriveLimits,
     pub registration_mode: BufferRegistrationMode,
-    /// Provided-buffer ring to register, or `None` to run without one.
-    ///
-    /// Off by default: the ring costs `entries * buf_size` of pool memory per worker whether or
-    /// not anything ever selects a buffer from it, and only operations that explicitly ask for
-    /// buffer selection can use it.
-    pub provided_buffers: Option<ProvidedBufConfig>,
+    /// Provided-buffer ring to register for every driver worker.
+    pub provided_buffers: ProvidedBufConfig,
     /// Size of the kernel's registered (fixed) file table.
     ///
     /// Independent of [`Self::entries`]: submission queue depth bounds how many operations are
@@ -266,7 +262,7 @@ impl Default for UringConfig {
             setup_policy: SetupPolicy::default(),
             drive_limits: UringDriveLimits::default(),
             registration_mode: BufferRegistrationMode::Strict,
-            provided_buffers: None,
+            provided_buffers: ProvidedBufConfig::default(),
             file_table_capacity: DEFAULT_FILE_TABLE_CAPACITY,
             file_table_exhaustion: FileTableExhaustion::Fallback,
         }
@@ -277,7 +273,7 @@ impl Default for UringConfig {
 const DEFAULT_FILE_TABLE_CAPACITY: u32 = 1024;
 
 impl UringConfig {
-    /// Sets the required/best-effort/disabled setup flag policy.
+    /// Sets the required/disabled setup flag policy.
     pub fn setup_policy(mut self, setup_policy: SetupPolicy) -> Self {
         self.setup_policy = setup_policy;
         self
@@ -293,7 +289,7 @@ impl UringConfig {
         self
     }
 
-    pub fn provided_buffers(mut self, provided_buffers: Option<ProvidedBufConfig>) -> Self {
+    pub fn provided_buffers(mut self, provided_buffers: ProvidedBufConfig) -> Self {
         self.provided_buffers = provided_buffers;
         self
     }

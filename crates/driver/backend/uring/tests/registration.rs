@@ -11,8 +11,8 @@ use veloq_std::{
 
 use veloq_buf::NoopRegistrar;
 use veloq_driver_core::driver::{
-    CancelRequest, CompletionRecord, CompletionValue, DriveMode, Driver, DriverCapability,
-    DriverSubmitResult, PollRecordResult, RegisterFd, SubmitStatus,
+    CancelRequest, CompletionRecord, CompletionValue, DriveMode, Driver, DriverSubmitResult,
+    PollRecordResult, RegisterFd, SubmitStatus,
 };
 
 #[cfg(feature = "test-hooks")]
@@ -91,42 +91,6 @@ fn software_timer_stays_out_of_sq_backlog_when_sq_is_full_and_cancelled() {
     }
 }
 
-#[test]
-fn capability_snapshot_preserves_baseline_after_rejection() {
-    let Some(mut driver) = new_driver_or_skip() else {
-        return;
-    };
-
-    let before = driver.capability_state_snapshot();
-    let capability = if before.effective.accept_multi {
-        DriverCapability::AcceptMulti
-    } else if before.effective.recv_multi {
-        DriverCapability::RecvMulti
-    } else {
-        eprintln!("skipping capability rejection assertion: no rejectable capability");
-        return;
-    };
-
-    driver.note_capability_rejected(capability);
-    let after = driver.capability_state_snapshot();
-
-    assert_eq!(after.baseline, before.baseline);
-    assert_eq!(after.negotiated, before.negotiated);
-    match capability {
-        DriverCapability::AcceptMulti => assert!(!after.effective.accept_multi),
-        DriverCapability::RecvMulti => assert!(!after.effective.recv_multi),
-        DriverCapability::ProvidedBuffers => unreachable!(),
-    }
-    let reason = after
-        .disabled_reasons
-        .iter()
-        .flatten()
-        .find(|reason| reason.capability == capability)
-        .copied()
-        .expect("rejected capability should have a disable reason");
-    assert_eq!(reason.source, "kernel_rejected");
-}
-
 /// A driver whose kernel file table holds `capacity` entries, one of which the eventfd waker
 /// claims during construction.
 fn new_driver_with_file_table_or_skip(
@@ -142,18 +106,20 @@ fn new_driver_with_file_table_or_skip(
     };
     static REGISTRAR: NoopRegistrar = NoopRegistrar;
     match UringDriver::new(config, &REGISTRAR) {
-        Ok(driver)
-            if capacity > 0
-                && !driver
-                    .capability_snapshot()
-                    .file_registration
-                    .is_registered() =>
-        {
-            eprintln!(
-                "skipping uring test with unsupported sparse file registration: {:?}",
-                driver.capability_snapshot()
-            );
-            None
+        Ok(mut driver) if capacity > 0 => {
+            let file = File::open("Cargo.toml").ok()?;
+            let raw = raw_file(&file);
+            let registered = driver
+                .register_files(vec![RegisterFd::Borrowed(raw.borrow())])
+                .ok()?;
+            let is_registered = registered.first().is_some_and(|fd| fd.is_registered());
+            driver.unregister_files(registered).ok()?;
+            if !is_registered {
+                eprintln!("skipping uring test with unavailable sparse file registration");
+                None
+            } else {
+                Some(driver)
+            }
         }
         Ok(driver) => Some(driver),
         Err(report) => {
@@ -204,10 +170,7 @@ fn stale_registered_fd_generation_rejected_on_submit() {
         .next()
         .unwrap();
     let Some(stale_generation) = stale_fd.generation() else {
-        eprintln!(
-            "skipping fixed-file generation assertion: {:?}",
-            driver.capability_snapshot()
-        );
+        eprintln!("skipping fixed-file generation assertion: backend returned a direct fd");
         return;
     };
     driver.unregister_files(vec![stale_fd]).unwrap();
@@ -730,10 +693,7 @@ fn close_owned_registered_file() {
         .next()
         .unwrap();
     let Some(index) = fd.fixed_index() else {
-        eprintln!(
-            "skipping fixed-file generation assertion: {:?}",
-            driver.capability_snapshot()
-        );
+        eprintln!("skipping fixed-file generation assertion: backend returned a direct fd");
         return;
     };
 

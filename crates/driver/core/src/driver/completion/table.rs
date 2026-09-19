@@ -88,7 +88,9 @@ fn recorded_outcome<Spec: slot::SlotSpec>(
     input: &CompletionInput<Spec>,
 ) -> RecordCompletionOutcome {
     match input {
-        CompletionInput::User(_) => RecordCompletionOutcome::RecordedUser,
+        CompletionInput::User(_) | CompletionInput::Terminal(_) => {
+            RecordCompletionOutcome::RecordedUser
+        }
     }
 }
 
@@ -421,8 +423,15 @@ where
             let record = match input {
                 CompletionInput::User(completion) => slot::MailboxRecord {
                     event,
-                    payload: completion.payload,
+                    payload: Some(completion.payload),
                     detail: completion.detail,
+                    cleanup: completion.cleanup,
+                    continuation,
+                },
+                CompletionInput::Terminal(completion) => slot::MailboxRecord {
+                    event,
+                    payload: None,
+                    detail: Some(completion.detail),
                     cleanup: completion.cleanup,
                     continuation,
                 },

@@ -91,6 +91,12 @@ pub struct OverlappedEntry {
     pub(crate) inner: Overlapped,
     /// Token associated with the operation.
     pub(crate) token: OpToken,
+    /// Generation of the request currently represented by this overlapped entry.
+    ///
+    /// A multishot operation reuses the same `OVERLAPPED` allocation for each replacement
+    /// request.  Keeping the request generation beside the slot token makes the replacement
+    /// boundary explicit and gives completion hooks one more ownership invariant to validate.
+    pub(crate) request_generation: Generation,
     /// Whether the operation is currently in-flight in the kernel.
     pub(crate) in_flight: bool,
     /// Result of an offloaded blocking operation.
@@ -107,6 +113,7 @@ impl OverlappedEntry {
         let mut entry = Self {
             inner: Overlapped::zeroed(),
             token,
+            request_generation: Generation::ZERO,
             in_flight: false,
             blocking_completion: None,
             resolved_handle: None,
@@ -119,6 +126,7 @@ impl OverlappedEntry {
     pub(crate) fn reset_for_token(&mut self, token: OpToken) {
         self.inner = Overlapped::zeroed();
         self.token = token;
+        self.request_generation = Generation::ZERO;
         self.in_flight = false;
         self.blocking_completion = None;
         self.resolved_handle = None;
@@ -156,7 +164,16 @@ pub struct IocpOpState {
     pub(crate) timer_id: Option<veloq_wheel::TimerId>,
     pub(crate) timer_deadline: Option<Instant>,
     pub(crate) is_background: bool,
-    pub(crate) rio_cancel_requested: bool,
+    /// Whether user-visible cancellation was accepted for this IOCP operation.
+    ///
+    /// This is a logical operation state only. It does not mean that `CancelIoEx` was accepted,
+    /// and it must not be used for orphan cleanup.
+    pub(crate) iocp_user_cancel_requested: bool,
+    /// Whether user-visible cancellation was accepted for this RIO operation.
+    ///
+    /// This is a logical operation state only. It does not mean that a cancellation request was
+    /// submitted to the RIO kernel, and it must not be used for orphan cleanup.
+    pub(crate) rio_user_cancel_requested: bool,
 }
 
 pub enum IocpSlotSpec {}

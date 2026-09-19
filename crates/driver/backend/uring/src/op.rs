@@ -23,8 +23,8 @@ pub use payload::UringUserPayload;
 pub(crate) use payload::{
     Accept, AcceptMulti, AcceptedSocket, Close, Connect, Fallocate, FallocateRaw, Fsync, FsyncRaw,
     OpSend, Open, ProvidedBuf, ReadFixed, ReadRaw, Recv, RecvMulti, RecvProvided, SendTo,
-    SyncFileRange, SyncFileRangeRaw, Timeout, UdpConnect, UdpRecv, UdpRecvFrom, UdpSend, Wakeup,
-    WriteFixed, WriteRaw,
+    SyncFileRange, SyncFileRangeRaw, Timeout, UdpConnect, UdpRecvMulti, UdpRecvPacket, UdpSend,
+    Wakeup, WriteFixed, WriteRaw,
 };
 pub(crate) use spec::{UringKernelPayloadStorage, UringOperationDescriptor};
 
@@ -102,7 +102,10 @@ impl UringKernelOp {
     #[inline]
     pub(crate) fn is_provided_multishot(&self) -> bool {
         self.descriptor.cardinality == CompletionCardinality::Multi
-            && self.descriptor.record_policy == RecordPolicy::NewProvidedBuffer
+            && matches!(
+                self.descriptor.record_policy,
+                RecordPolicy::NewProvidedBuffer | RecordPolicy::UdpMultishot
+            )
     }
 }
 

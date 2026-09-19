@@ -102,7 +102,7 @@ const KNOWN_SETUP_FLAGS: SetupFlags = SetupFlags(
         | sys::IORING_SETUP_HYBRID_IOPOLL,
 );
 
-const BEST_EFFORT_SETUP_FLAGS: SetupFlags = SetupFlags(
+const DEFAULT_SETUP_FLAGS: SetupFlags = SetupFlags(
     sys::IORING_SETUP_COOP_TASKRUN
         | sys::IORING_SETUP_SINGLE_ISSUER
         | sys::IORING_SETUP_DEFER_TASKRUN,
@@ -110,45 +110,26 @@ const BEST_EFFORT_SETUP_FLAGS: SetupFlags = SetupFlags(
 
 /// Policy for setup flags that cannot be enabled after `io_uring_setup`.
 ///
-/// Required flags make ring construction fail when the kernel rejects them. Best-effort flags are
-/// negotiated by the backend and may be removed one profile at a time. Disabled flags are never
-/// passed to the kernel; overlapping sets are rejected instead of silently changing semantics.
+/// Required flags make ring construction fail when the kernel rejects them. Disabled flags are
+/// never passed to the kernel; overlapping sets are rejected instead of silently changing
+/// semantics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SetupPolicy {
     required: SetupFlags,
-    best_effort: SetupFlags,
     disabled: SetupFlags,
 }
 
 impl SetupPolicy {
-    /// Create a policy from disjoint required, best-effort, and disabled sets.
+    /// Create a policy from disjoint required and disabled sets.
     #[inline]
-    pub const fn new(required: SetupFlags, best_effort: SetupFlags, disabled: SetupFlags) -> Self {
-        Self {
-            required,
-            best_effort,
-            disabled,
-        }
+    pub const fn new(required: SetupFlags, disabled: SetupFlags) -> Self {
+        Self { required, disabled }
     }
 
-    /// Create a policy that does not request optional setup behavior.
+    /// Create a policy that explicitly disables the default task-run flags.
     #[inline]
     pub const fn basic() -> Self {
-        Self::new(
-            SetupFlags::EMPTY,
-            SetupFlags::EMPTY,
-            SetupFlags::from_bits_retain(BEST_EFFORT_SETUP_FLAGS.bits()),
-        )
-    }
-
-    /// Create the default interrupt-mode latency policy.
-    #[inline]
-    pub const fn latency_best_effort() -> Self {
-        Self::new(
-            SetupFlags::EMPTY,
-            BEST_EFFORT_SETUP_FLAGS,
-            SetupFlags::EMPTY,
-        )
+        Self::new(SetupFlags::EMPTY, DEFAULT_SETUP_FLAGS)
     }
 
     #[inline]
@@ -157,34 +138,14 @@ impl SetupPolicy {
     }
 
     #[inline]
-    pub const fn best_effort(self) -> SetupFlags {
-        self.best_effort
-    }
-
-    #[inline]
     pub const fn disabled(self) -> SetupFlags {
         self.disabled
-    }
-
-    #[inline]
-    pub const fn requested(self) -> SetupFlags {
-        self.required.union(self.best_effort)
     }
 
     #[inline]
     pub const fn with_required(self, flags: SetupFlags) -> Self {
         Self {
             required: self.required.union(flags),
-            best_effort: self.best_effort.difference(flags),
-            disabled: self.disabled.difference(flags),
-        }
-    }
-
-    #[inline]
-    pub const fn with_best_effort(self, flags: SetupFlags) -> Self {
-        Self {
-            required: self.required.difference(flags),
-            best_effort: self.best_effort.union(flags),
             disabled: self.disabled.difference(flags),
         }
     }
@@ -193,18 +154,14 @@ impl SetupPolicy {
     pub const fn with_disabled(self, flags: SetupFlags) -> Self {
         Self {
             required: self.required.difference(flags),
-            best_effort: self.best_effort.difference(flags),
             disabled: self.disabled.union(flags),
         }
     }
 
     /// Validate that the policy cannot accidentally hide a requested setup flag.
     pub fn validate(self) -> Result<()> {
-        if self.required.intersects(self.best_effort)
-            || self.required.intersects(self.disabled)
-            || self.best_effort.intersects(self.disabled)
+        if self.required.intersects(self.disabled)
             || self.required.difference(KNOWN_SETUP_FLAGS).bits() != 0
-            || self.best_effort.difference(BEST_EFFORT_SETUP_FLAGS).bits() != 0
             || self.disabled.difference(KNOWN_SETUP_FLAGS).bits() != 0
         {
             return Err(Error::from_raw_os_error(libc::EINVAL));
@@ -216,7 +173,7 @@ impl SetupPolicy {
 impl Default for SetupPolicy {
     #[inline]
     fn default() -> Self {
-        Self::latency_best_effort()
+        Self::new(DEFAULT_SETUP_FLAGS, SetupFlags::EMPTY)
     }
 }
 
@@ -235,7 +192,7 @@ impl RingConfig {
     pub const fn new(entries: u32) -> Self {
         Self {
             entries,
-            setup_policy: SetupPolicy::basic(),
+            setup_policy: SetupPolicy::new(DEFAULT_SETUP_FLAGS, SetupFlags::EMPTY),
             sq_thread_idle: 0,
             cq_entries: 0,
             mmap_populate: true,
@@ -656,7 +613,7 @@ impl IoUring {
         }
 
         let mut params = sys::IoUringParams {
-            flags: config.setup_policy.requested().bits(),
+            flags: config.setup_policy.required().bits(),
             sq_thread_idle: config.sq_thread_idle,
             ..Default::default()
         };
@@ -943,10 +900,10 @@ mod tests {
     }
 
     #[test]
-    fn setup_policy_keeps_required_best_effort_and_disabled_flags_distinct() {
-        let policy = SetupPolicy::latency_best_effort();
+    fn setup_policy_defaults_to_required_task_run_flags() {
+        let policy = SetupPolicy::default();
         assert_eq!(
-            policy.requested().bits(),
+            policy.required().bits(),
             SetupFlags::COOP_TASKRUN.bits()
                 | SetupFlags::SINGLE_ISSUER.bits()
                 | SetupFlags::DEFER_TASKRUN.bits()
@@ -958,20 +915,20 @@ mod tests {
         assert!(polling.validate().is_ok());
 
         let basic = SetupPolicy::basic();
-        assert!(basic.requested().is_empty());
+        assert!(basic.required().is_empty());
         assert!(basic.disabled().contains(SetupFlags::DEFER_TASKRUN));
+        assert!(basic.validate().is_ok());
     }
 
     #[test]
-    fn setup_policy_rejects_overlapping_or_unknown_best_effort_flags() {
-        let overlapping =
-            SetupPolicy::new(SetupFlags::SQPOLL, SetupFlags::SQPOLL, SetupFlags::EMPTY);
+    fn setup_policy_rejects_overlapping_or_unknown_flags() {
+        let overlapping = SetupPolicy::new(SetupFlags::SQPOLL, SetupFlags::SQPOLL);
         assert_eq!(
             overlapping.validate().unwrap_err().raw_os_error(),
             Some(libc::EINVAL)
         );
 
-        let unknown = SetupPolicy::new(SetupFlags::EMPTY, SetupFlags::CQSIZE, SetupFlags::EMPTY);
+        let unknown = SetupPolicy::new(SetupFlags::EMPTY, SetupFlags::from_bits_retain(1 << 31));
         assert_eq!(
             unknown.validate().unwrap_err().raw_os_error(),
             Some(libc::EINVAL)

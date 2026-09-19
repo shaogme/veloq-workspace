@@ -1,6 +1,6 @@
 use veloq::std::time::Duration;
 
-use crate::packet::{FrameSequence, MessageId};
+use crate::packet::{FrameSequence, MessageId, StreamId};
 
 /// The logical timers understood by a reliable UDP session.
 ///
@@ -8,9 +8,20 @@ use crate::packet::{FrameSequence, MessageId};
 /// timing wheel and must never become part of the protocol state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TimerKind {
-    Retransmit { sequence: FrameSequence },
-    MessageAckRetry { message_id: MessageId },
-    ReassemblyTimeout { message_id: MessageId },
+    Retransmit {
+        sequence: FrameSequence,
+    },
+    MessageAckRetry {
+        stream_id: StreamId,
+        message_id: MessageId,
+    },
+    ReassemblyTimeout {
+        stream_id: StreamId,
+        message_id: MessageId,
+    },
+    StreamOpenRetry {
+        stream_id: StreamId,
+    },
     HandshakeRetry,
     AckDelay,
     FinRetry,

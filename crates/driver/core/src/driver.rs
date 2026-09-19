@@ -1,5 +1,8 @@
 use crate::{
-    BorrowedRawHandle, DriverReport, DriverResult, IoFd, OwnedRawHandle, RawHandleMeta,
+    BorrowedRawHandle, DriverError, DriverReport, DriverResult, IoFd, OwnedRawHandle,
+    RawHandleMeta,
+    op::types::UdpRecvMulti,
+    platform::receive_pump::{UdpReceiveBuildError, UdpReceiveConfig},
     slot::{self, SlotError, SlotOp, SlotPayload, SlotSpec as CoreSlotSpec},
 };
 use veloq_buf::{AnyBufPool, heap::ChunkId};
@@ -309,8 +312,9 @@ pub trait DriverRaw: sealed::Sealed {
     /// 接受一个取消请求。
     ///
     /// 请求目标已经消失时应返回对应的 `TargetGone`/等价结果，而不是破坏其它 slot。对仍
-    /// 在途的操作，后端必须继续完成其收尾路径；对可本地完成的操作，可以直接向完成表
-    /// 发布取消结果。
+    /// 在途的操作，后端必须继续完成其收尾路径；如果后端无法再提交取消但目标仍然活跃，
+    /// 应返回 [`CancelSubmitOutcome::CompletionPending`]，等待真实 completion，而不是
+    /// 发布合成终态；对可本地完成的操作，可以直接向完成表发布取消结果。
     fn cancel_op_raw(
         &mut self,
         request: CancelRequest,
@@ -360,14 +364,6 @@ pub trait DriverRaw: sealed::Sealed {
     ) -> DriverResult<(), SlotError<Self::SlotSpec>> {
         Ok(())
     }
-
-    /// 返回本 driver 当前可用的可选能力。后端不支持可保持默认的全否结果。
-    fn capabilities_raw(&self) -> DriverCapabilities {
-        DriverCapabilities::default()
-    }
-
-    /// 记录一个能力在运行期被内核拒绝，后续不再尝试。
-    fn note_capability_rejected_raw(&mut self, _capability: DriverCapability) {}
 }
 
 /// 使用者面向的 driver 接口。
@@ -455,14 +451,6 @@ pub trait Driver: DriverRaw {
         self.attach_buffer_pool_raw(pool)
     }
 
-    fn capabilities(&self) -> DriverCapabilities {
-        self.capabilities_raw()
-    }
-
-    fn note_capability_rejected(&mut self, capability: DriverCapability) {
-        self.note_capability_rejected_raw(capability)
-    }
-
     fn drain_cancel_requests(
         &mut self,
     ) -> DriverResult<CancelDrainOutcome, SlotError<<Self as DriverRaw>::SlotSpec>> {
@@ -476,6 +464,30 @@ pub trait Driver: DriverRaw {
 }
 
 impl<D: DriverRaw + ?Sized> Driver for D {}
+
+/// Backend contract for constructing the unified UDP receive operation.
+///
+/// The facade supplies only an `IoFd`, the platform-neutral receive configuration, and the
+/// worker's opaque buffer pool.  The backend owns notifier creation, pump initialization and any
+/// native receive resources.  `BuildError` remains the backend's driver error so allocation and
+/// registration failures retain their original diagnostics instead of being reported as an
+/// invalid user configuration.
+pub trait UdpReceiveOperationBuilder: DriverRaw {
+    type BuildError: DriverError;
+
+    fn build_udp_recv_multi(
+        &mut self,
+        fd: IoFd<Self::Raw>,
+        config: UdpReceiveConfig,
+        buffer_pool: AnyBufPool,
+    ) -> DriverResult<UdpRecvMulti<Self::Raw>, Self::BuildError>;
+
+    fn validate_udp_receive_config(
+        config: UdpReceiveConfig,
+    ) -> Result<UdpReceiveConfig, UdpReceiveBuildError> {
+        config.validate()
+    }
+}
 
 pub trait ContextDriverProvider<D: Driver + ?Sized> {
     fn with_driver_mut<R>(&self, f: impl FnOnce(&mut D) -> R) -> R;
@@ -601,14 +613,23 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> DriverRaw
         self.provider
             .with_driver_mut(|d| d.attach_buffer_pool(pool))
     }
+}
 
-    fn capabilities_raw(&self) -> DriverCapabilities {
-        self.provider.with_driver_ref(|d| d.capabilities())
-    }
+impl<'a, D, P> UdpReceiveOperationBuilder for RuntimeContextDriver<'a, D, P>
+where
+    D: UdpReceiveOperationBuilder,
+    P: ContextDriverProvider<D> + ?Sized,
+{
+    type BuildError = D::BuildError;
 
-    fn note_capability_rejected_raw(&mut self, capability: DriverCapability) {
+    fn build_udp_recv_multi(
+        &mut self,
+        fd: IoFd<Self::Raw>,
+        config: UdpReceiveConfig,
+        buffer_pool: AnyBufPool,
+    ) -> DriverResult<UdpRecvMulti<Self::Raw>, Self::BuildError> {
         self.provider
-            .with_driver_mut(|d| d.note_capability_rejected(capability))
+            .with_driver_mut(|driver| driver.build_udp_recv_multi(fd, config, buffer_pool))
     }
 }
 
@@ -616,6 +637,7 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> DriverRaw
 pub struct CancelDrainOutcome {
     pub requests: u64,
     pub submitted: u64,
+    pub completion_pending: u64,
     pub queued: u64,
     pub already_pending: u64,
     pub merged: u64,
@@ -632,6 +654,9 @@ impl CancelDrainOutcome {
         match outcome {
             CancelSubmitOutcome::Submitted => {
                 self.submitted = self.submitted.saturating_add(1);
+            }
+            CancelSubmitOutcome::CompletionPending => {
+                self.completion_pending = self.completion_pending.saturating_add(1);
             }
             CancelSubmitOutcome::Queued => {
                 self.queued = self.queued.saturating_add(1);
@@ -661,26 +686,6 @@ impl CancelDrainOutcome {
             }
         }
     }
-}
-
-/// 后端可选能力的集合。
-///
-/// 全 `false` 是**合法且必须能工作**的配置：IOCP 一个都没有，Linux 5.6–5.18 也没有
-/// （multishot accept / buf ring 要 5.19，multishot recv 要 6.0，而仓库声明的最低内核是
-/// 5.6）。所以「不支持时怎么办」是一条会被真实测试覆盖的主路径，不是兼容层。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct DriverCapabilities {
-    pub accept_multi: bool,
-    pub recv_multi: bool,
-    pub provided_buffers: bool,
-}
-
-/// [`DriverCapabilities`] 里的单个条目，供运行期降级使用。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DriverCapability {
-    AcceptMulti,
-    RecvMulti,
-    ProvidedBuffers,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

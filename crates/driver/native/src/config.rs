@@ -145,8 +145,8 @@ pub struct UringConfig {
     pub drive_limits: UringDriveLimits,
     /// Mode for buffer registration.
     pub registration_mode: BufferRegistrationMode,
-    /// Provided-buffer ring to register, or `None` to run without one.
-    pub provided_buffers: Option<ProvidedBufConfig>,
+    /// Provided-buffer ring to register for every driver worker.
+    pub provided_buffers: ProvidedBufConfig,
     /// Size of the kernel's registered file table, independent of `entries`.
     pub file_table_capacity: u32,
     /// Behaviour once `file_table_capacity` entries are in use.
@@ -168,7 +168,7 @@ impl UringConfig {
     }
 
     /// Sets the provided-buffer ring.
-    pub fn provided_buffers(mut self, provided_buffers: Option<ProvidedBufConfig>) -> Self {
+    pub fn provided_buffers(mut self, provided_buffers: ProvidedBufConfig) -> Self {
         self.provided_buffers = provided_buffers;
         self
     }
@@ -194,7 +194,7 @@ impl Default for UringConfig {
             entries: nz!(1024),
             drive_limits: UringDriveLimits::default(),
             registration_mode: BufferRegistrationMode::Strict,
-            provided_buffers: None,
+            provided_buffers: ProvidedBufConfig::default(),
             file_table_capacity: 1024,
             file_table_exhaustion: FileTableExhaustion::Fallback,
         }

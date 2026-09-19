@@ -32,6 +32,9 @@ impl CancelRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelSubmitOutcome {
     Submitted,
+    /// The backend could not accept a new cancel request, but the target slot is still active.
+    /// The real completion must be observed before the operation can be finalized.
+    CompletionPending,
     Queued,
     /// A cancel intent for this target already exists and has the same visibility mode.
     AlreadyPending {

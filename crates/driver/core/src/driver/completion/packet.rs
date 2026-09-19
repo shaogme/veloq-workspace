@@ -42,14 +42,26 @@ pub struct UserCompletion<Spec: SlotSpec> {
     pub cleanup: CompletionCleanupGuard,
 }
 
+/// 一条不携带可拥有 record payload 的终态完成。
+///
+/// multishot 的 replacement 可能在当前 socket/buffer 已经成功交付后失败。此时终态
+/// 错误必须排在成功 record 后面，但不能伪造一个 socket 或 buffer 作为错误 record 的
+/// payload；否则消费方可能把同一个资源误认为第二次所有权转移。
+pub struct TerminalCompletion<Spec: SlotSpec> {
+    pub detail: DriverResult<Spec::Completion, Spec::Error>,
+    pub cleanup: CompletionCleanupGuard,
+}
+
 pub enum CompletionInput<Spec: SlotSpec> {
     User(UserCompletion<Spec>),
+    Terminal(TerminalCompletion<Spec>),
 }
 
 impl<Spec: SlotSpec> CompletionInput<Spec> {
     pub fn cleanup_mut(&mut self) -> &mut CompletionCleanupGuard {
         match self {
             Self::User(completion) => &mut completion.cleanup,
+            Self::Terminal(completion) => &mut completion.cleanup,
         }
     }
 
@@ -91,6 +103,27 @@ impl<Spec: SlotSpec> CompletionPacket<Spec> {
         Self::user_event(event, payload, detail, CompletionCleanupGuard::default())
     }
 
+    /// Build a terminal completion that carries no record payload.
+    pub fn terminal(
+        event: UserCompletionEvent,
+        detail: DriverResult<Spec::Completion, Spec::Error>,
+    ) -> Self {
+        Self::terminal_with_cleanup(event, detail, CompletionCleanupGuard::default())
+    }
+
+    /// Build a terminal completion with backend-owned cleanup.
+    pub fn terminal_with_cleanup(
+        event: UserCompletionEvent,
+        detail: DriverResult<Spec::Completion, Spec::Error>,
+        cleanup: CompletionCleanupGuard,
+    ) -> Self {
+        Self {
+            event,
+            input: CompletionInput::Terminal(TerminalCompletion { detail, cleanup }),
+            continuation: CompletionContinuation::Final,
+        }
+    }
+
     pub fn user_with_cleanup(
         event: UserCompletionEvent,
         payload: Spec::UserPayload,
@@ -111,7 +144,8 @@ impl<Spec: SlotSpec> CompletionPacket<Spec> {
 
 pub struct CompletionRecord<Spec: SlotSpec> {
     pub event: UserCompletionEvent,
-    pub payload: Spec::UserPayload,
+    /// `None` 只用于没有可交付资源的终态错误 record。
+    pub payload: Option<Spec::UserPayload>,
     pub detail: Option<DriverResult<Spec::Completion, Spec::Error>>,
     pub cleanup: CompletionCleanupGuard,
     /// 取走这条记录之后，该操作是否还会再产出完成。

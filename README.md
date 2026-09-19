@@ -29,16 +29,16 @@ Veloq Runtime 基于 `io_uring` 构建高性能异步运行时。由于使用了
 
 | 特性 (Feature) | 机制/标志 | 最低内核版本 | 必须性 |
 | :--- | :--- | :--- | :--- |
-| **协作式调度** | `IORING_SETUP_COOP_TASKRUN` | **5.19** | 可选 (性能优化) |
-| **单提交者模式** | `IORING_SETUP_SINGLE_ISSUER` | **6.0** | 可选 (性能优化) |
-| **延迟任务运行** | `IORING_SETUP_DEFER_TASKRUN` | **6.1** | 可选 (性能优化) |
+| **协作式调度** | `IORING_SETUP_COOP_TASKRUN` | **5.19** | 默认强制开启（可显式关闭） |
+| **单提交者模式** | `IORING_SETUP_SINGLE_ISSUER` | **6.0** | 默认强制开启（可显式关闭） |
+| **延迟任务运行** | `IORING_SETUP_DEFER_TASKRUN` | **6.1** | 默认强制开启（可显式关闭） |
 
 ## 3. 版本建议 (Recommendation)
 
-*   **最低运行版本 (Minimum)**: **Linux 5.6**
-    *   需要支持 `IORING_OP_SEND` / `IORING_OP_RECV` 等基础网络操作。
+*   **最低运行版本 (Minimum)**: **Linux 6.1**
+    *   需要支持运行时默认启用的 `IORING_SETUP_DEFER_TASKRUN` 等 setup 标志。
 
 *   **推荐生产版本 (Recommended)**: **Linux 6.1+**
-    *   为了获得最佳的吞吐量和最低的延迟，建议使用 6.1 或更高版本，以启用 `DEFER_TASKRUN` 等关键优化。
+    *   6.1 或更高版本可使用完整的默认 setup 配置。
 
-> **注意**: 在不支持可选优化标志的旧内核上，运行时会自动回退到兼容模式，但性能会有所下降。
+> **注意**: 三个 setup 标志默认作为必需项传给 `io_uring_setup`。内核不支持时运行时初始化会直接失败，不会自动回退；如确需关闭某项，可通过 `SetupPolicy::with_disabled` 显式配置。Windows IOCP/RIO 使用 Windows 原生路径，不受 Linux 内核最低版本约束。

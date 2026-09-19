@@ -33,6 +33,18 @@ pub enum Error {
     CookieConfiguration,
     CookieExpired,
     CookieKeyUnavailable,
+    TooManyStreams,
+    StreamOpenTimeout,
+    StreamOpenRejected,
+    StreamClosed,
+    StreamReset,
+    StreamSendWindowClosed,
+    StreamReceiveWindowClosed,
+    StreamFlowControlExceeded,
+    ConnectionFlowControlExceeded,
+    ConnectionClosing,
+    InvalidStreamId,
+    DuplicateStreamOpen,
 }
 
 impl fmt::Display for Error {
@@ -63,6 +75,20 @@ impl fmt::Display for Error {
             Self::CookieConfiguration => f.write_str("invalid cookie key or configuration"),
             Self::CookieExpired => f.write_str("handshake cookie expired"),
             Self::CookieKeyUnavailable => f.write_str("handshake cookie key is unavailable"),
+            Self::TooManyStreams => f.write_str("stream limit reached"),
+            Self::StreamOpenTimeout => f.write_str("stream open timed out"),
+            Self::StreamOpenRejected => f.write_str("stream open was rejected"),
+            Self::StreamClosed => f.write_str("stream is closed"),
+            Self::StreamReset => f.write_str("stream was reset by the peer"),
+            Self::StreamSendWindowClosed => f.write_str("stream send window is closed"),
+            Self::StreamReceiveWindowClosed => f.write_str("stream receive window is closed"),
+            Self::StreamFlowControlExceeded => f.write_str("stream flow control was exceeded"),
+            Self::ConnectionFlowControlExceeded => {
+                f.write_str("connection flow control was exceeded")
+            }
+            Self::ConnectionClosing => f.write_str("connection is closing"),
+            Self::InvalidStreamId => f.write_str("stream ID is invalid"),
+            Self::DuplicateStreamOpen => f.write_str("stream open was duplicated"),
         }
     }
 }

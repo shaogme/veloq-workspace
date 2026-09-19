@@ -24,10 +24,8 @@ pub use config::{
     SetupFlags, SetupPolicy, SockAddrStorage, UringConfig, UringDriveLimits, UringRawHandle,
 };
 pub use diagnostics::{
-    KERNEL_BASELINE, UringCapabilitySnapshot, UringCompletionDiagnostics,
-    UringCompletionDiagnosticsSnapshot, UringSetupSnapshot,
+    KERNEL_BASELINE, UringCompletionDiagnostics, UringCompletionDiagnosticsSnapshot,
 };
-pub use driver::capability::{CapabilityDisableReason, CapabilityStateSnapshot};
 pub use driver::{ProvidedBufferSnapshot, UringDriver, UringOpState};
 pub use error::{UringError, UringResult};
 pub use net::{Socket, peer_addr_of_handle, socket_addr_to_storage, to_socket_addr};

@@ -126,20 +126,19 @@ impl Config {
         self
     }
 
-    /// 为每个 worker 注册一组 provided buffer（io_uring 5.19+），`None` 表示不开。
+    /// 为每个 worker 配置并注册一组 provided buffer（io_uring 5.19+）。
     ///
-    /// 开启之后 [`crate::net::TcpStream::recv_provided`] 与 [`crate::net::TcpStream::recv_multi`]
-    /// 会使用底层 zero-allocation 接收优化。未开启或内核不支持时，系统会自动平滑降级为 Single-shot Buffer 模式，
-    /// 无需上层显式分支适配。
+    /// provided buffer 默认使用 [`ProvidedBufConfig::default`]，此方法仅用于自定义环的
+    /// entries 和单个 buffer 容量；provided buffer 始终开启。
     #[cfg(not(windows))]
-    pub fn uring_provided_buffers(mut self, provided_buffers: Option<ProvidedBufConfig>) -> Self {
+    pub fn uring_provided_buffers(mut self, provided_buffers: ProvidedBufConfig) -> Self {
         self.uring.provided_buffers = provided_buffers;
         self
     }
 
-    /// IOCP 没有 provided buffer，这里恒为空操作。
+    /// IOCP 没有 provided buffer，这里保留跨平台配置 API。
     #[cfg(windows)]
-    pub fn uring_provided_buffers(self, _provided_buffers: Option<ProvidedBufConfig>) -> Self {
+    pub fn uring_provided_buffers(self, _provided_buffers: ProvidedBufConfig) -> Self {
         self
     }
 

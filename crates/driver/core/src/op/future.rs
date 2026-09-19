@@ -232,6 +232,22 @@ where
         continuation,
     } = record;
 
+    let Some(erased) = erased else {
+        let error = match detail {
+            Some(Err(report)) => report,
+            Some(Ok(_)) | None => Spec::Error::from_core_report(
+                DriverCoreError::Internal
+                    .to_report()
+                    .push_ctx("scope", "driver-core/op/terminal_completion")
+                    .attach_note("terminal completion did not carry an IO error"),
+            ),
+        };
+        return (
+            OpResult::ResourceLost(OpError::new(LostReason::Other, error)),
+            continuation,
+        );
+    };
+
     let payload = match T::try_record_from_erased(erased) {
         Ok(payload) => payload,
         Err(report) => {

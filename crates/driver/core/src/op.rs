@@ -42,7 +42,9 @@ pub trait IntoPlatformOp<Spec: SlotSpec>: Sized + Send {
     /// 提交进 slot 的 payload。
     type SubmitPayload: Send;
     /// 每条完成记录里携带的 payload。单发操作里它就是 [`Self::SubmitPayload`]。
-    type RecordPayload;
+    /// 每条完成记录携带的 payload。multishot 的 record 必须独立拥有它，因为提交
+    /// payload 会继续留在 slot 中直到逻辑操作终止。
+    type RecordPayload: Send;
     type Output: Send;
     type Completion: Send;
     const PAYLOAD_KIND: types::OpKind;

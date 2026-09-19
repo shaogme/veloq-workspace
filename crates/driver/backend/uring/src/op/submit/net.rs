@@ -6,13 +6,14 @@ use crate::{
     net::{bounded_sockaddr_bytes, to_socket_addr},
     op::{
         Accept, AcceptMulti, Connect, OpSend, Recv, RecvMulti, RecvProvided, SendTo, UdpConnect,
-        UdpRecv, UdpRecvFrom, UdpSend,
-        payload::{AcceptPayload, KernelRef, SendToPayload, UdpRecvFromPayload},
+        UdpSend,
+        payload::{AcceptPayload, KernelRef, SendToPayload, UdpRecvMulti, UdpRecvMultiPayload},
     },
 };
 use veloq_driver_core::driver::SubmitTokenContext;
+use veloq_driver_core::{op::types::UdpRecvMultiBackend, platform::receive_pump::ReceivePumpPhase};
 use veloq_io_uring::{opcode, squeue, types};
-use veloq_std::{pin::Pin, ptr};
+use veloq_std::{format, pin::Pin, ptr};
 
 use super::{
     invalid_buf_io_range, opcode_build, resolve_socket_fd, resolve_socket_fd_direct, sqe_with_fd,
@@ -99,27 +100,6 @@ pub(crate) unsafe fn make_sqe_send(
     opcode_build(
         "uring.op.submit.send_opcode",
         sqe_with_fd!(fd, |f| unsafe { opcode::Send::new(f, ptr, len) }.build()),
-    )
-}
-
-pub(crate) unsafe fn make_sqe_udp_recv(
-    _kernel: Pin<&mut KernelRef<UdpRecv>>,
-    val: &mut UdpRecv,
-    env: &SqeEnv<'_>,
-    _token: SubmitTokenContext,
-) -> UringResult<squeue::Entry> {
-    let (ptr, len) = val
-        .buf
-        .checked_read_range(val.buf_offset)
-        .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_udp_recv", err))?;
-    let fd = resolve_socket_fd(
-        env.file_table(),
-        val.fd,
-        "uring.op.submit.make_sqe_udp_recv",
-    )?;
-    opcode_build(
-        "uring.op.submit.udp_recv_opcode",
-        sqe_with_fd!(fd, |f| unsafe { opcode::Recv::new(f, ptr, len) }.build()),
     )
 }
 
@@ -272,43 +252,47 @@ pub(crate) unsafe fn make_sqe_send_to(
     )
 }
 
-pub(crate) unsafe fn make_sqe_udp_recv_from(
-    kernel: Pin<&mut UdpRecvFromPayload>,
-    user: &mut UdpRecvFrom,
+pub(crate) unsafe fn make_sqe_udp_recv_multi(
+    kernel: Pin<&mut UdpRecvMultiPayload>,
+    user: &mut UdpRecvMulti,
     env: &SqeEnv<'_>,
     _token: SubmitTokenContext,
 ) -> UringResult<squeue::Entry> {
-    let msg = unsafe { kernel.init_recv_from(user) }
-        .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_udp_recv_from", err))?;
-
-    let sqe_fd = resolve_socket_fd(
-        env.file_table(),
-        user.fd,
-        "uring.op.submit.make_sqe_udp_recv_from",
+    const SCOPE: &str = "uring.op.submit.make_sqe_udp_recv_multi";
+    let phase = user.receive_pump().phase();
+    let (bgid, buf_size) = env.provided_buf_info(SCOPE)?;
+    let required_size = UdpRecvMultiPayload::required_buffer_size(
+        user.receive_pump().config().datagram_capacity.get(),
     )?;
-    opcode_build(
-        "uring.op.submit.recvmsg_opcode",
-        sqe_with_fd!(sqe_fd, |f| unsafe {
-            opcode::RecvMsg::new(f, msg.into_ptr())
-        }
-        .build()),
-    )
-}
-
-pub(crate) unsafe fn on_complete_udp_recv_from(
-    kernel: Pin<&mut UdpRecvFromPayload>,
-    user: &mut UdpRecvFrom,
-    result: i32,
-) -> UringResult<usize> {
-    if result < 0 {
-        return Err(UringError::CompletionWait
+    if required_size > buf_size as usize {
+        return Err(UringError::InvalidInput
             .report(
-                "uring.op.submit.on_complete_udp_recv_from",
-                "kernel completion returned error",
+                SCOPE,
+                "provided buffer is too small for UDP recvmsg metadata",
             )
-            .set_error_code(-result));
+            .with_ctx("required_size", required_size)
+            .with_ctx("provided_buffer_size", buf_size));
     }
-
-    user.addr = Some(kernel.as_ref().get_ref().finish_recv_from()?);
-    Ok(result as usize)
+    let msg = unsafe { kernel.init_recv_multi() };
+    let fd = resolve_socket_fd_direct(env.file_table(), user.fd, SCOPE)?;
+    let sqe = opcode_build(
+        SCOPE,
+        sqe_with_fd!(fd, |f| unsafe {
+            opcode::RecvMsgMulti::new(f, msg.into_ptr())
+        }
+        .flags(libc::MSG_TRUNC as u32)
+        .buf_group(bgid)
+        .build()),
+    )?;
+    match phase {
+        ReceivePumpPhase::Created => user.receive_pump_mut().arm_multishot().map(|_| ()),
+        ReceivePumpPhase::RearmPending => user.receive_pump_mut().submit_rearm(),
+        _ => Ok(()),
+    }
+    .map_err(|error| {
+        UringError::InvalidState
+            .report(SCOPE, "failed to advance UDP multishot receive pump")
+            .with_ctx("receive_pump_error", format!("{error:?}"))
+    })?;
+    Ok(sqe)
 }

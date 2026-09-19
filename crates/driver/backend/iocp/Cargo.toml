@@ -48,5 +48,8 @@ veloq-pod.workspace = true
 slotmap.workspace = true
 diagweave.workspace = true
 
+[dev-dependencies]
+tracing-subscriber.workspace = true
+
 [lints]
 workspace = true

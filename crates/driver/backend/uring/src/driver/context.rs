@@ -7,7 +7,6 @@ use crate::{
     config::{IoFd, RawHandle, UringRawHandle},
     diagnostics::UringCompletionDiagnostics,
     driver::{
-        capability::CapabilityState,
         completion::{
             CompletionBatchProgress, CompletionEngine, UringSyntheticCompletion,
             effects::{self, CompletionEffectBatch, CompletionEffectKind},
@@ -26,16 +25,18 @@ use crate::{
         submission::{KernelEnterPlan, SubmissionEngine, SubmitProgress},
     },
     error::{UringError, UringResult},
-    op::{CheckedSlotView, SlotView, UringOp, UringOpRegistryExt, UringSlotSpec},
+    op::{CheckedSlotView, RecordPolicy, SlotView, UringOp, UringOpRegistryExt, UringSlotSpec},
 };
 use diagweave::prelude::*;
 use tracing::trace;
 use veloq_driver_core::driver::{
-    AnomalyAttach, CancelRequest, CancelSubmitOutcome, CancelTicket, CompletionAnomalyKind,
-    CompletionFlowOutcome, CompletionToken, DriveMode, DrivePendingWork, DriverCapability,
-    DriverCompletionDiagnostics, OpToken, RegisterFd, SharedCompletionTable,
-    SyntheticCompletionSource, UserCompletionEvent,
+    AnomalyAttach, CancelRequest, CancelSubmitOutcome, CompletionAnomalyKind,
+    CompletionFlowOutcome, DriveMode, DrivePendingWork, DriverCompletionDiagnostics, OpToken,
+    RegisterFd, SharedCompletionTable, SyntheticCompletionSource, UserCompletionEvent,
 };
+
+#[cfg(any(test, feature = "test-hooks"))]
+use veloq_driver_core::driver::{CancelTicket, CompletionToken};
 use veloq_io_uring::{
     EnterArgs, IoUring, KernelCapabilities, SubmitError as KernelSubmitError,
     SubmitReceipt as KernelSubmitReceipt, types::SubmitArgs,
@@ -457,7 +458,6 @@ pub(crate) struct DriveContext<'ops, 'registration, 'ring, 'a> {
     registration: &'registration mut RegistrationEngine<'a>,
     completion_table: &'ops SharedCompletionTable<UringSlotSpec>,
     diagnostics: &'ops DriverCompletionDiagnostics<UringCompletionDiagnostics>,
-    capabilities: &'ops mut CapabilityState,
     ring: &'ring mut IoUring,
     kernel_capabilities: &'ops mut KernelCapabilities,
 }
@@ -470,7 +470,6 @@ impl<'ops, 'registration, 'ring, 'a> DriveContext<'ops, 'registration, 'ring, 'a
         registration: &'registration mut RegistrationEngine<'a>,
         completion_table: &'ops SharedCompletionTable<UringSlotSpec>,
         diagnostics: &'ops DriverCompletionDiagnostics<UringCompletionDiagnostics>,
-        capabilities: &'ops mut CapabilityState,
         ring: &'ring mut IoUring,
         kernel_capabilities: &'ops mut KernelCapabilities,
     ) -> Self {
@@ -480,7 +479,6 @@ impl<'ops, 'registration, 'ring, 'a> DriveContext<'ops, 'registration, 'ring, 'a
             registration,
             completion_table,
             diagnostics,
-            capabilities,
             ring,
             kernel_capabilities,
         }
@@ -665,7 +663,6 @@ impl<'ops, 'registration, 'ring, 'a> DriveContext<'ops, 'registration, 'ring, 'a
         budget.consume_effects(effects.len());
         let effect_result =
             EffectExecutor.execute(self, lifecycle, completion, &effects, collector_exhausted);
-        self.sync_provided_buffer_capability();
         completion.recycle_effects(effects);
         match (flow_result, effect_result) {
             (Ok(progress), Ok(())) => Ok(progress),
@@ -706,7 +703,6 @@ impl<'ops, 'registration, 'ring, 'a> DriveContext<'ops, 'registration, 'ring, 'a
         let (effects, collector_exhausted) = completion.take_effects();
         let effect_result =
             EffectExecutor.execute(self, lifecycle, completion, &effects, collector_exhausted);
-        self.sync_provided_buffer_capability();
         completion.recycle_effects(effects);
         match (flow_result, effect_result) {
             (Ok(outcome), Ok(())) => Ok(outcome),
@@ -746,7 +742,6 @@ impl<'ops, 'registration, 'ring, 'a> DriveContext<'ops, 'registration, 'ring, 'a
         let (effects, collector_exhausted) = completion.take_effects();
         let effect_result =
             EffectExecutor.execute(self, lifecycle, completion, &effects, collector_exhausted);
-        self.sync_provided_buffer_capability();
         completion.recycle_effects(effects);
         match (flow_result, effect_result) {
             (Ok(outcome), Ok(())) => Ok(outcome),
@@ -800,16 +795,6 @@ impl<'ops, 'registration, 'ring, 'a> DriveContext<'ops, 'registration, 'ring, 'a
             Err(error)
         } else {
             Ok(())
-        }
-    }
-
-    fn sync_provided_buffer_capability(&mut self) {
-        let mut negotiated = self.capabilities.negotiated();
-        negotiated.provided_buffers = self.registration.provided_buffers_enabled();
-        self.capabilities.set_negotiated(negotiated);
-        if negotiated.provided_buffers {
-            self.capabilities
-                .enable_negotiated(DriverCapability::ProvidedBuffers);
         }
     }
 
@@ -872,12 +857,67 @@ impl<'ops, 'registration, 'ring, 'a> DriveContext<'ops, 'registration, 'ring, 'a
 
     fn execute_resource_effects(
         &mut self,
-        _effects: &CompletionEffectBatch,
-        _first_error: &mut Option<Report<UringError>>,
+        effects: &CompletionEffectBatch,
+        first_error: &mut Option<Report<UringError>>,
     ) {
-        // Provided BID settlement is the only resource mutation allowed during ingress.  The
-        // current effect vocabulary has no deferred resource update, but this phase is kept as a
-        // distinct step so future fixed-file/buffer effects cannot silently run out of order.
+        for effect in effects::iter(effects) {
+            let CompletionEffectKind::UdpRearm {
+                logical_receiver_generation,
+            } = effect.kind()
+            else {
+                continue;
+            };
+            let Some(token) = effect.token() else {
+                remember_first_error(
+                    first_error,
+                    UringError::InvalidState.report(
+                        "uring.drive.udp_rearm",
+                        "UDP rearm effect has no operation token",
+                    ),
+                );
+                continue;
+            };
+            let valid = match self.ops.checked_slot_view(token) {
+                Ok(CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot))) => {
+                    let generation_matches = slot
+                        .with_access_mut(|access| {
+                            let descriptor = access.operation().get_ref().descriptor();
+                            descriptor.record_policy == RecordPolicy::UdpMultishot
+                                && unsafe { (descriptor.receive_generation)(access) }
+                                    == Some(logical_receiver_generation)
+                        })
+                        .unwrap_or(false);
+                    generation_matches
+                        && slot.platform().submission_phase() == SubmissionPhase::KernelOutstanding
+                }
+                Ok(CheckedSlotView::Valid(SlotView::Reserved(_)))
+                | Ok(CheckedSlotView::Valid(SlotView::InFlightOrphaned(_)))
+                | Ok(CheckedSlotView::Empty(_))
+                | Ok(CheckedSlotView::Missing { .. })
+                | Ok(CheckedSlotView::Stale(_))
+                | Err(_) => false,
+            };
+            if !valid {
+                continue;
+            }
+            if let Err(report) = self.ops.transition_submission(
+                token,
+                SubmissionPhase::Reserved,
+                "UDP receive permit became available",
+                self.control.observer_mut(),
+            ) {
+                remember_first_error(first_error, report);
+                continue;
+            }
+            if let Err(error) = self.control.push_backlog(token) {
+                remember_first_error(
+                    first_error,
+                    UringError::InvalidState
+                        .report("uring.drive.udp_rearm", "failed to queue UDP rearm")
+                        .with_ctx("backlog_error", format!("{error:?}")),
+                );
+            }
+        }
     }
 
     fn execute_close_effects(
@@ -1308,6 +1348,7 @@ impl<'ops, 'registration, 'ring, 'a> DriveContext<'ops, 'registration, 'ring, 'a
                     })? {
                         CancelSubmitOutcome::Submitted => progress.submitted(),
                         CancelSubmitOutcome::CompletedLocally => progress.synthetic(),
+                        CancelSubmitOutcome::CompletionPending => progress.mark_still_full(),
                         CancelSubmitOutcome::Queued
                         | CancelSubmitOutcome::AlreadyPending { .. }
                         | CancelSubmitOutcome::Merged { .. } => progress.mark_still_full(),

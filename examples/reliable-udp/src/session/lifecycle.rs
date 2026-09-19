@@ -3,14 +3,14 @@ use veloq::std::{time::Duration, vec, vec::Vec};
 use crate::{
     config::Config,
     error::{Error, Result},
-    packet::{COOKIE_LEN, ConnectionId, Flags},
+    packet::{COOKIE_LEN, ConnectionId, FrameType},
     timer::TimerKind,
 };
 
 use super::{Role, SessionState};
 
 pub(super) enum LifecycleAction {
-    EmitControl(Flags),
+    EmitControl(FrameType),
     EmitCookieProof([u8; COOKIE_LEN]),
     StateChanged(SessionState),
     ArmTimer {
@@ -79,7 +79,7 @@ impl LifecycleState {
         }
         self.begin_handshake(now, config);
         Ok(vec![
-            LifecycleAction::EmitControl(Flags::SYN),
+            LifecycleAction::EmitControl(FrameType::Syn),
             LifecycleAction::ArmTimer {
                 kind: TimerKind::HandshakeRetry,
                 delay: self.handshake_delay(now, config),
@@ -120,7 +120,7 @@ impl LifecycleState {
         }
         let mut actions = vec![LifecycleAction::CancelTimer(TimerKind::HandshakeRetry)];
         actions.extend(self.transition(SessionState::CloseWait));
-        actions.push(LifecycleAction::EmitControl(Flags::FIN_ACK));
+        actions.push(LifecycleAction::EmitControl(FrameType::FinAck));
         actions.extend(self.transition(SessionState::Closed));
         actions
     }
@@ -153,7 +153,7 @@ impl LifecycleState {
         match self.state {
             SessionState::Established | SessionState::CloseWait => {
                 self.fin_retries = 0;
-                let mut actions = vec![LifecycleAction::EmitControl(Flags::FIN)];
+                let mut actions = vec![LifecycleAction::EmitControl(FrameType::Fin)];
                 actions.extend(self.transition(SessionState::FinWait));
                 actions.push(LifecycleAction::ArmTimer {
                     kind: TimerKind::FinRetry,
@@ -184,7 +184,7 @@ impl LifecycleState {
         ) {
             return Ok(Vec::new());
         }
-        let mut actions = vec![LifecycleAction::EmitControl(Flags::RST)];
+        let mut actions = vec![LifecycleAction::EmitControl(FrameType::Rst)];
         actions.extend(self.request_terminate(error, SessionState::Failed));
         Ok(actions)
     }
@@ -235,7 +235,7 @@ impl LifecycleState {
             .saturating_mul(2)
             .min(config.handshake_max_rto);
         let mut actions = match self.state {
-            SessionState::SynSent => vec![LifecycleAction::EmitControl(Flags::SYN)],
+            SessionState::SynSent => vec![LifecycleAction::EmitControl(FrameType::Syn)],
             SessionState::CookieSent => vec![LifecycleAction::EmitCookieProof(
                 self.cookie.expect("cookie sent state has a cookie"),
             )],
@@ -253,13 +253,13 @@ impl LifecycleState {
             return Ok(Vec::new());
         }
         if self.fin_retries >= config.max_retries {
-            let mut actions = vec![LifecycleAction::EmitControl(Flags::RST)];
+            let mut actions = vec![LifecycleAction::EmitControl(FrameType::Rst)];
             actions.extend(self.request_terminate(Error::CloseTimeout, SessionState::Failed));
             return Ok(actions);
         }
         self.fin_retries = self.fin_retries.saturating_add(1);
         Ok(vec![
-            LifecycleAction::EmitControl(Flags::FIN),
+            LifecycleAction::EmitControl(FrameType::Fin),
             LifecycleAction::ArmTimer {
                 kind: TimerKind::FinRetry,
                 delay: config.close_timeout,

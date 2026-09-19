@@ -79,7 +79,6 @@ impl<'rt> Driver<'rt> {
 
         let scoped = scope!(ctx, async |scope| {
             let mut receive_task = scope.spawn_boxed(receive_pump(
-                ctx,
                 receive_socket,
                 config.clone(),
                 inbound_tx,

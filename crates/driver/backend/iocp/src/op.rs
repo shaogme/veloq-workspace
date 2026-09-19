@@ -14,10 +14,13 @@ mod submit;
 
 pub use payload::IocpUserPayload;
 pub(crate) use payload::{
-    ACCEPT_EX_ADDR_SECTION_LEN, ACCEPT_EX_OUTPUT_BUFFER_LEN, AcceptPayload, IocpOpPayload,
-    KernelRef, OpenPayload, PayloadRef, SendToPayload, UdpRecvFromPayload, kernel_ref,
+    ACCEPT_EX_ADDR_SECTION_LEN, ACCEPT_EX_OUTPUT_BUFFER_LEN, AcceptMultiPayload, AcceptPayload,
+    IocpOpPayload, KernelRef, OpenPayload, PayloadRef, RecvMultiPayload, RecvProvidedPayload,
+    SendToPayload, UdpRecvMultiPayload, kernel_ref,
 };
-use spec::{IocpOpErasure, IocpOpSpec};
+use spec::{
+    IocpMultiShotErasure, IocpMultiShotSpec, IocpMultiShotVTable, IocpOpErasure, IocpOpSpec,
+};
 pub(crate) use state::{BlockingCompletion, BlockingSuccessCleanup, IocpOpRegistry, Slot};
 pub use state::{IocpOpState, IocpSlotSpec, OverlappedEntry};
 pub(crate) use submit::{SubmissionResult, locate_registered_slot, resolve_fd_handle};
@@ -41,18 +44,20 @@ use veloq_driver_core::{
         IntoPlatformOp, LostReason, OpCompletion, OpError, OpResult, SingleShotOp,
         payload_projection_mismatch_report,
         types::{
-            Accept as AcceptBase, AcceptMulti as AcceptMultiBase, AcceptedSocket,
-            Close as CloseBase, Connect as ConnectBase, Fallocate as FallocateBase,
-            FallocateRaw as FallocateRawBase, Fsync as FsyncBase, FsyncRaw as FsyncRawBase, OpKind,
-            Open as OpenBase, ProvidedBuf, ReadFixed as ReadFixedBase, ReadRaw as ReadRawBase,
-            Recv as RecvBase, RecvMulti as RecvMultiBase, RecvProvided as RecvProvidedBase,
-            Send as OpSendBase, SendTo as SendToBase, SyncFileRange as SyncFileRangeBase,
+            Accept as AcceptBase, AcceptMulti as AcceptMultiBase,
+            AcceptedSocket as AcceptedSocketBase, Close as CloseBase, Connect as ConnectBase,
+            Fallocate as FallocateBase, FallocateRaw as FallocateRawBase, Fsync as FsyncBase,
+            FsyncRaw as FsyncRawBase, OpKind, Open as OpenBase, ProvidedBuf,
+            ReadFixed as ReadFixedBase, ReadRaw as ReadRawBase, Recv as RecvBase,
+            RecvMulti as RecvMultiBase, RecvProvided as RecvProvidedBase, Send as OpSendBase,
+            SendTo as SendToBase, SyncFileRange as SyncFileRangeBase,
             SyncFileRangeRaw as SyncFileRangeRawBase, Timeout as TimeoutBase,
-            UdpConnect as UdpConnectBase, UdpRecv as UdpRecvBase, UdpRecvFrom as UdpRecvFromBase,
-            UdpSend as UdpSendBase, Wakeup as WakeupBase, WriteFixed as WriteFixedBase,
-            WriteRaw as WriteRawBase,
+            UdpConnect as UdpConnectBase, UdpRecvMulti as UdpRecvMultiBase,
+            UdpRecvPacket as UdpRecvPacketBase, UdpSend as UdpSendBase, Wakeup as WakeupBase,
+            WriteFixed as WriteFixedBase, WriteRaw as WriteRawBase,
         },
     },
+    platform::receive_pump::ReceivePumpState,
     slot::Generation,
 };
 
@@ -66,7 +71,6 @@ pub(crate) type WriteFixed = WriteFixedBase<IocpHandle>;
 pub(crate) type WriteRaw = WriteRawBase<IocpHandle>;
 pub(crate) type Recv = RecvBase<IocpHandle>;
 pub(crate) type OpSend = OpSendBase<IocpHandle>;
-pub(crate) type UdpRecv = UdpRecvBase<IocpHandle>;
 pub(crate) type UdpSend = UdpSendBase<IocpHandle>;
 pub(crate) type Close = CloseBase<IocpHandle>;
 pub(crate) type Fsync = FsyncBase<IocpHandle>;
@@ -74,17 +78,18 @@ pub(crate) type FsyncRaw = FsyncRawBase<IocpHandle>;
 pub(crate) type Connect = ConnectBase<IocpHandle, SockAddrStorage>;
 pub(crate) type UdpConnect = UdpConnectBase<IocpHandle, SockAddrStorage>;
 pub(crate) type Accept = AcceptBase<IocpHandle, SockAddrStorage>;
+pub(crate) type AcceptedSocket = AcceptedSocketBase;
 pub(crate) type SendTo = SendToBase<IocpHandle>;
 pub(crate) type SyncFileRange = SyncFileRangeBase<IocpHandle>;
 pub(crate) type SyncFileRangeRaw = SyncFileRangeRawBase<IocpHandle>;
 pub(crate) type Fallocate = FallocateBase<IocpHandle>;
 pub(crate) type FallocateRaw = FallocateRawBase<IocpHandle>;
-pub(crate) type UdpRecvFrom = UdpRecvFromBase<IocpHandle>;
+pub(crate) type UdpRecvMulti = UdpRecvMultiBase<IocpHandle>;
+pub(crate) type UdpRecvPacket = UdpRecvPacketBase;
 pub(crate) type Open = OpenBase;
 pub(crate) type Timeout = TimeoutBase;
 pub(crate) type Wakeup = WakeupBase<IocpHandle>;
 
-// 下面三个 IOCP 提交不了，见 [`impl_iocp_unsupported_op!`]。
 pub(crate) type AcceptMulti = AcceptMultiBase<IocpHandle>;
 pub(crate) type RecvProvided = RecvProvidedBase<IocpHandle>;
 pub(crate) type RecvMulti = RecvMultiBase<IocpHandle>;
@@ -112,6 +117,9 @@ pub(crate) struct SubmitContext<'a> {
 // ============================================================================
 
 pub(crate) struct OpVTable {
+    pub(crate) kind: OpKind,
+    pub(crate) multishot: bool,
+    pub(crate) multishot_ops: Option<&'static IocpMultiShotVTable>,
     pub(crate) submit: fn(&mut IocpKernelOp, &mut SubmitContext) -> IocpResult<SubmissionResult>,
     pub(crate) on_complete:
         unsafe fn(&mut IocpKernelOp, result: usize, ext: &Extensions) -> IocpResult<usize>,
@@ -165,12 +173,93 @@ impl IocpKernelOp {
         unsafe { (self.vtable.get_fd)(self) }
     }
 
+    pub(crate) const fn kind(&self) -> OpKind {
+        self.vtable.kind
+    }
+
+    pub(crate) const fn is_multishot(&self) -> bool {
+        self.vtable.multishot
+    }
+
+    pub(crate) const fn multishot_vtable(&self) -> Option<&'static IocpMultiShotVTable> {
+        self.vtable.multishot_ops
+    }
+
+    pub(crate) fn accepted_socket_record(&self) -> Option<IocpUserPayload> {
+        let vtable = self.multishot_vtable()?;
+        (vtable.record_kind == spec::IocpRecordKind::AcceptedSocket)
+            .then(|| (vtable.encode_accepted_socket)())
+    }
+
+    pub(crate) fn validate_accept_multi_completion(&self, token: OpToken) -> IocpResult<()> {
+        if self.kind() != OpKind::AcceptMulti {
+            return IocpError::InvalidState
+                .with_ctx("operation", self.kind() as u16)
+                .attach_note("AcceptMulti completion validation reached a different operation");
+        }
+        if self.header.token != token {
+            return IocpError::InvalidState
+                .with_ctx("expected_index", token.index())
+                .with_ctx("expected_generation", token.generation())
+                .with_ctx("actual_index", self.header.token.index())
+                .with_ctx("actual_generation", self.header.token.generation())
+                .attach_note("AcceptMulti completion token does not match its slot");
+        }
+        if !self.header.in_flight {
+            return IocpError::InvalidState
+                .with_ctx("user_data", token.index())
+                .with_ctx("generation", token.generation())
+                .attach_note("AcceptMulti completion was observed after request settlement");
+        }
+        let IocpOpPayload::AcceptMulti(payload) = &self.payload else {
+            return IocpError::InvalidState
+                .attach_note("AcceptMulti completion payload variant is missing");
+        };
+        if payload.request_generation != self.header.request_generation {
+            return IocpError::InvalidState
+                .with_ctx("payload_request_generation", payload.request_generation)
+                .with_ctx("header_request_generation", self.header.request_generation)
+                .attach_note("AcceptMulti completion request generation does not match");
+        }
+        if payload.accept_socket.is_none() {
+            return IocpError::InvalidState
+                .attach_note("AcceptMulti completion has no pending accepted socket");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn recv_multi_pump_mut(&mut self) -> Option<&mut ReceivePumpState> {
+        let IocpOpPayload::RecvMulti(payload) = &mut self.payload else {
+            return None;
+        };
+        payload.pump.as_mut()
+    }
+
     pub(crate) fn submit(&mut self, ctx: &mut SubmitContext) -> IocpResult<SubmissionResult> {
         (self.vtable.submit)(self, ctx)
     }
 
     pub(crate) fn on_complete(&mut self, result: usize, ext: &Extensions) -> IocpResult<usize> {
         unsafe { (self.vtable.on_complete)(self, result, ext) }
+    }
+
+    pub(crate) fn take_recv_provided_record(
+        &mut self,
+        deliver_buffer: bool,
+    ) -> IocpResult<IocpUserPayload> {
+        let IocpOpPayload::RecvProvided(payload) = &mut self.payload else {
+            return IocpError::InvalidState
+                .with_ctx("operation", self.kind() as u16)
+                .attach_note("RecvProvided record requested from a different IOCP payload");
+        };
+        let buffer = payload.buffer.take();
+        let buffer = if deliver_buffer {
+            buffer
+        } else {
+            drop(buffer);
+            None
+        };
+        Ok(IocpUserPayload::ProvidedBuf(ProvidedBuf { buf: buffer }))
     }
 }
 
@@ -217,6 +306,9 @@ macro_rules! impl_iocp_op_erasure {
 
             fn vtable() -> &'static OpVTable {
                 static TABLE: OpVTable = OpVTable {
+                    kind: <$OpType as IocpOpSpec>::PAYLOAD_KIND,
+                    multishot: false,
+                    multishot_ops: None,
                     submit: spec::submit_shim::<$OpType>,
                     on_complete: spec::on_complete_shim::<$OpType>,
                     completion_cleanup: spec::completion_cleanup_shim::<$OpType>,
@@ -229,8 +321,8 @@ macro_rules! impl_iocp_op_erasure {
             }
         }
 
-        /// IOCP 后端一个 multishot 操作都没有（`capabilities()` 恒为全 `false`），所以
-        /// 这里每个 op 的提交 payload 与记录 payload 都是它自己。
+        /// IOCP 后端的 multishot 操作由 facade 的既有 fallback 避开；这里保留统一
+        /// operation bound 所需的 payload 形状。
         impl IntoPlatformOp<IocpSlotSpec> for $OpType {
             type SubmitPayload = $OpType;
             type RecordPayload = $OpType;
@@ -273,130 +365,123 @@ macro_rules! impl_iocp_op_erasure {
     };
 }
 
-/// 「这个操作 IOCP 做不了」。
-///
-/// 带上 `ERROR_NOT_SUPPORTED` 的 errno，好让上层想解读的时候解读得了——虽然门面层判断能力
-/// 靠的是 [`DriverCapabilities`](veloq_driver_core::driver::DriverCapabilities)，不是 errno。
-fn unsupported_op_report(op_type: &'static str) -> Report<IocpError> {
-    IocpError::Unsupported
-        .to_report()
-        .push_ctx("scope", "iocp/op/unsupported")
-        .with_ctx("op_type", op_type)
-        .attach_note("this operation has no IOCP equivalent")
-}
+/// Erase an IOCP operation whose submit payload must stay in the slot while each completion gets
+/// its own record payload.
+macro_rules! impl_iocp_multishot_op_erasure {
+    (
+        $OpType:ty,
+        $user_variant:ident,
+        $kernel_variant:ident,
+        $record_variant:ident,
+        $record:ty,
+        $record_kind:ident,
+        $completion:ty,
+        $multishot:expr,
+        $continuation:path
+    ) => {
+        impl IocpMultiShotErasure for $OpType {
+            fn erase_kernel_payload(payload: Self::KernelPayload) -> IocpOpPayload {
+                IocpOpPayload::$kernel_variant(payload)
+            }
 
-/// 三个不支持的操作共用的 vtable。
-///
-/// `submit` 同步失败，于是 driver 侧回 [`SubmitStatus::Void`]，core 侧走
-/// [`IntoPlatformOp::submit_failed`]——一条完成都不会产生，其余钩子因此都到不了。它们仍然
-/// 是安全的空实现而不是 `unreachable!`：vtable 是运行期分发，用崩溃去表达一个不变式不值得。
-///
-/// [`SubmitStatus::Void`]: veloq_driver_core::driver::SubmitStatus
-static UNSUPPORTED_VTABLE: OpVTable = OpVTable {
-    submit: unsupported_submit,
-    on_complete: unsupported_on_complete,
-    completion_cleanup: unsupported_cleanup,
-    orphan_cleanup: unsupported_cleanup,
-    get_fd: unsupported_get_fd,
-    bind_user_payload: unsupported_bind,
-    unbind_user_payload: unsupported_unbind,
-};
+            fn kernel_payload_ref(payload: &IocpOpPayload) -> Option<&Self::KernelPayload> {
+                match payload {
+                    IocpOpPayload::$kernel_variant(payload) => Some(payload),
+                    _ => None,
+                }
+            }
 
-fn unsupported_submit(
-    _op: &mut IocpKernelOp,
-    _ctx: &mut SubmitContext,
-) -> IocpResult<SubmissionResult> {
-    Err(unsupported_op_report("unsupported"))
-}
+            fn kernel_payload_mut(payload: &mut IocpOpPayload) -> Option<&mut Self::KernelPayload> {
+                match payload {
+                    IocpOpPayload::$kernel_variant(payload) => Some(payload),
+                    _ => None,
+                }
+            }
 
-unsafe fn unsupported_on_complete(
-    _op: &mut IocpKernelOp,
-    _result: usize,
-    _ext: &Extensions,
-) -> IocpResult<usize> {
-    Err(unsupported_op_report("unsupported"))
-}
+            fn erase_user_payload(payload: Self) -> IocpUserPayload {
+                IocpUserPayload::$user_variant(payload)
+            }
 
-unsafe fn unsupported_cleanup(
-    _op: &mut IocpKernelOp,
-    _result: &IocpResult<usize>,
-) -> CompletionCleanupGuard {
-    CompletionCleanupGuard::default()
-}
+            fn user_payload_mut(payload: &mut IocpUserPayload) -> Option<&mut Self> {
+                match payload {
+                    IocpUserPayload::$user_variant(payload) => Some(payload),
+                    _ => None,
+                }
+            }
 
-unsafe fn unsupported_get_fd(_op: &IocpKernelOp) -> Option<IoFd> {
-    None
-}
+            fn try_record_payload(payload: IocpUserPayload) -> IocpResult<Self::RecordPayload> {
+                match payload {
+                    IocpUserPayload::$record_variant(payload) => Ok(payload),
+                    _ => Err(payload_projection_mismatch_report::<IocpError>(
+                        stringify!($record),
+                        "IocpUserPayload",
+                    )),
+                }
+            }
 
-/// 没有内核 payload 可以绑，也不需要绑：`submit` 之前唯一会碰它的就是这里。
-fn unsupported_bind(_op: &mut IocpKernelOp, _erased: &mut IocpUserPayload) -> IocpResult<()> {
-    Ok(())
-}
+            fn vtable() -> &'static OpVTable {
+                static MULTI_SHOT: IocpMultiShotVTable = IocpMultiShotVTable {
+                    operation: <$OpType as IocpMultiShotSpec>::PAYLOAD_KIND,
+                    record_kind: spec::IocpRecordKind::$record_kind,
+                    encode_accepted_socket: spec::encode_accepted_socket,
+                    rearm: spec::submit_multishot_shim::<$OpType>,
+                    continuation: $continuation,
+                };
+                static TABLE: OpVTable = OpVTable {
+                    kind: <$OpType as IocpMultiShotSpec>::PAYLOAD_KIND,
+                    multishot: $multishot,
+                    multishot_ops: Some(&MULTI_SHOT),
+                    submit: spec::submit_multishot_shim::<$OpType>,
+                    on_complete: spec::on_complete_multishot_shim::<$OpType>,
+                    completion_cleanup: spec::completion_cleanup_multishot_shim::<$OpType>,
+                    orphan_cleanup: spec::orphan_cleanup_multishot_shim::<$OpType>,
+                    get_fd: spec::get_fd_multishot_shim::<$OpType>,
+                    bind_user_payload: spec::bind_multishot_user_payload_shim::<$OpType>,
+                    unbind_user_payload: spec::unbind_multishot_user_payload_shim::<$OpType>,
+                };
+                &TABLE
+            }
+        }
 
-fn unsupported_unbind(_op: &mut IocpKernelOp) {}
-
-/// IOCP 没有的操作的 [`IntoPlatformOp`]：类型在，提交不了。
-///
-/// 存在的理由是**分层**，不是补齐功能。这三个操作的可用性是运行期事实（
-/// `capabilities().accept_multi` / `.recv_multi` / `.provided_buffers` 在 IOCP 上恒为
-/// `false`），门面层照着能力位选路径就够了。如果这里不给出实现，那个运行期事实就会变成
-/// 一个编译期事实——`S::Stream<AcceptMulti>` 的 bound 在 Windows 上不成立，于是
-/// `AcceptStream` / `RecvStream` 里每一个碰到它的地方都得写 `#[cfg]`，平台差异从 driver
-/// 层一路渗到用户 API 的实现里。
-///
-/// 代价是 Windows 上会编译出一段永远走不到的 `Native` 分支。那段代码在 Linux 上是真跑
-/// 的，不存在「只在一个平台上腐烂」的风险，而它换掉的是门面层四十处 `#[cfg]`。
-///
-/// 每个操作走完的路是：提交 payload 擦除进 slot → [`unsupported_submit`] 同步失败 →
-/// `SubmitStatus::Void` → [`IntoPlatformOp::submit_failed`] 把 payload 丢掉并交出
-/// `ResourceLost`。`try_record_from_erased` / `complete` 因此都到不了。
-macro_rules! impl_iocp_unsupported_op {
-    ($OpType:ty, $user_variant:ident, $record:ty, $completion:ty, $kind:ident) => {
         impl IntoPlatformOp<IocpSlotSpec> for $OpType {
             type SubmitPayload = $OpType;
             type RecordPayload = $record;
             type Output = $record;
             type Completion = $completion;
 
-            const PAYLOAD_KIND: OpKind = OpKind::$kind;
+            const PAYLOAD_KIND: OpKind = <$OpType as IocpMultiShotSpec>::PAYLOAD_KIND;
 
             fn into_kernel_and_payload(self) -> (IocpKernelOp, Self::SubmitPayload) {
+                let kernel_payload = <$OpType as IocpMultiShotSpec>::new_kernel_payload(&self);
                 let op = IocpKernelOp {
-                    vtable: &UNSUPPORTED_VTABLE,
+                    vtable: <$OpType as IocpMultiShotErasure>::vtable(),
                     header: OverlappedEntry::new(
                         OpToken::from_registry_parts(0, Generation::ZERO)
                             .expect("zero token should be encodable"),
                     ),
-                    payload: IocpOpPayload::Unsupported,
+                    payload: <$OpType as IocpMultiShotErasure>::erase_kernel_payload(
+                        kernel_payload,
+                    ),
                 };
                 (op, self)
             }
 
             fn payload_into_erased(payload: Self::SubmitPayload) -> IocpUserPayload {
-                IocpUserPayload::$user_variant(payload)
+                <$OpType as IocpMultiShotErasure>::erase_user_payload(payload)
             }
 
-            /// 记录 payload 在 IOCP 上不存在：这个操作一条完成都产生不了，所以也就没有
-            /// 「每条完成的产物」可以从 slot 里投影出来。
             fn try_record_from_erased(payload: IocpUserPayload) -> IocpResult<Self::RecordPayload> {
-                drop(payload);
-                Err(payload_projection_mismatch_report::<IocpError>(
-                    stringify!($record),
-                    "IocpUserPayload",
-                ))
+                <$OpType as IocpMultiShotErasure>::try_record_payload(payload)
             }
 
             fn complete(
                 payload: Self::RecordPayload,
-                _res: IocpResult<usize>,
+                res: IocpResult<usize>,
             ) -> OpCompletion<Self::Output, IocpError, Self::Completion> {
-                OpCompletion::new(Err(unsupported_op_report(stringify!($OpType))), payload)
+                let completion = <$OpType as IocpMultiShotSpec>::map_completion(&payload, res);
+                OpCompletion::new(completion, payload)
             }
 
-            /// slot 里躺着的是**提交** payload，不是任何一条完成的产物——没有 item 可以交
-            /// 给用户，也没有用户交出来的资源要还。与 uring 侧
-            /// `impl_uring_record_payload_op!` 同理：默认实现会把它当记录 payload 去投影，
-            /// 那必然失败并给出一个含义完全错误的 `PayloadTypeMismatch`。
             fn submit_failed(
                 erased: IocpUserPayload,
                 report: Report<IocpError>,
@@ -467,7 +552,6 @@ impl_iocp_op_erasure!(WriteFixed, WriteFixed, Write, usize);
 impl_iocp_op_erasure!(WriteRaw, WriteRaw, WriteRaw, usize);
 impl_iocp_op_erasure!(Recv, Recv, Recv, usize);
 impl_iocp_op_erasure!(OpSend, OpSend, Send, usize);
-impl_iocp_op_erasure!(UdpRecv, UdpRecv, UdpRecv, usize);
 impl_iocp_op_erasure!(UdpSend, UdpSend, UdpSend, usize);
 impl_iocp_op_erasure!(Close, Close, Close, usize);
 impl_iocp_op_erasure!(Fsync, Fsync, Fsync, usize);
@@ -481,30 +565,108 @@ impl_iocp_op_erasure!(Connect, Connect, Connect, usize);
 impl_iocp_op_erasure!(UdpConnect, UdpConnect, UdpConnect, usize);
 impl_iocp_op_erasure!(Accept, Accept, Accept, OwnedRawHandle);
 impl_iocp_op_erasure!(SendTo, SendTo, SendTo, usize);
-impl_iocp_op_erasure!(UdpRecvFrom, UdpRecvFrom, UdpRecvFrom, usize);
-impl_iocp_op_erasure!(Open, Open, Open, OwnedRawHandle);
-impl_iocp_op_erasure!(Wakeup, Wakeup, Wakeup, usize);
-
-// multishot accept 要 io_uring 5.19，IOCP 一个对应物都没有。`AcceptStream` 在这里恒走
-// `Emulated`（每取一条重新提交一次单发 `Accept`），所以这个 op 永远不会被提交。
-//
-// 与 uring 侧一样不实现 `SingleShotOp`：`await` 一个 multishot 操作等于「取第一条完成然后
-// 取消」，那在哪个平台上都是陷阱。
-impl_iocp_unsupported_op!(
+impl_iocp_multishot_op_erasure!(
+    AcceptMulti,
     AcceptMulti,
     AcceptMulti,
     AcceptedSocket,
+    AcceptedSocket,
+    AcceptedSocket,
     OwnedRawHandle,
-    AcceptMulti
+    true,
+    spec::more_on_success
 );
-
-// provided buffer 环是 `IORING_REGISTER_PBUF_RING`（5.19），IOCP 没有等价物：Winsock 收
-// 数据时 buffer 必须由调用方在提交时交出来，而这个操作的全部意义就是不交。
-//
-// 它**是** `SingleShotOp`——一次提交一条完成，只是那一条在 IOCP 上永远不会来。
-impl_iocp_unsupported_op!(RecvProvided, RecvProvided, ProvidedBuf, usize, RecvProvided);
-
+impl_iocp_multishot_op_erasure!(
+    RecvProvided,
+    RecvProvided,
+    RecvProvided,
+    ProvidedBuf,
+    ProvidedBuf,
+    ProvidedBuf,
+    usize,
+    false,
+    spec::final_continuation
+);
 impl SingleShotOp<IocpSlotSpec> for RecvProvided {}
+impl_iocp_multishot_op_erasure!(
+    RecvMulti,
+    RecvMulti,
+    RecvMulti,
+    ProvidedBuf,
+    ProvidedBuf,
+    ProvidedBuf,
+    usize,
+    true,
+    spec::more_on_success
+);
+impl_iocp_multishot_op_erasure!(
+    UdpRecvMulti,
+    UdpRecvMulti,
+    UdpRecvMulti,
+    UdpRecvPacket,
+    UdpRecvPacket,
+    UdpRecvPacket,
+    usize,
+    true,
+    spec::more_on_success
+);
+impl_iocp_op_erasure!(Open, Open, Open, OwnedRawHandle);
+impl_iocp_op_erasure!(Wakeup, Wakeup, Wakeup, usize);
 
-// 上面两个的交集：既要 multishot 又要 provided buffer。
-impl_iocp_unsupported_op!(RecvMulti, RecvMulti, ProvidedBuf, usize, RecvMulti);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use veloq_buf::FixedBuf;
+    use veloq_driver_core::op::types::UdpRecvPacketBuf;
+    use veloq_driver_core::platform::receive_pump::{ReceivePumpConfig, ReceiveSlot};
+    use veloq_std::{net::SocketAddr, num::NonZeroUsize, time::Duration, vec};
+
+    fn receive_pump() -> veloq_driver_core::platform::receive_pump::ReceivePumpState {
+        let config = ReceivePumpConfig {
+            kernel_capacity: NonZeroUsize::new(1).expect("non-zero depth"),
+            queue_capacity: NonZeroUsize::new(1).expect("non-zero queue"),
+            datagram_capacity: NonZeroUsize::new(64).expect("non-zero datagram capacity"),
+            close_timeout: Duration::from_secs(1),
+        };
+        let slots = vec![ReceiveSlot::new(
+            0,
+            FixedBuf::alloc_heap(NonZeroUsize::new(64).expect("non-zero buffer"), 0)
+                .expect("receive slot allocation"),
+        )]
+        .into_boxed_slice();
+        veloq_driver_core::platform::receive_pump::ReceivePumpState::try_new(config, slots)
+            .expect("valid receive pump")
+    }
+
+    #[test]
+    fn udp_receive_multishot_keeps_submit_and_record_payloads_separate() {
+        let fd = IoFd::Direct(IocpHandle::for_socket(core::ptr::null_mut()));
+        let operation = UdpRecvMulti::from_backend(fd, receive_pump());
+        let (mut kernel, submit_payload) = operation.into_kernel_and_payload();
+        let mut erased = IocpUserPayload::UdpRecvMulti(submit_payload);
+
+        kernel
+            .bind_user_payload(&mut erased)
+            .expect("persistent submit payload should bind");
+        assert_eq!(kernel.kind(), OpKind::UdpRecvMulti);
+        assert!(kernel.is_multishot());
+        assert!(kernel.multishot_vtable().is_some());
+
+        let packet = UdpRecvPacket {
+            buf: UdpRecvPacketBuf::from_fixed_buf(
+                FixedBuf::alloc_heap(NonZeroUsize::new(8).expect("non-zero buffer"), 2)
+                    .expect("record allocation"),
+            ),
+            addr: "127.0.0.1:9000"
+                .parse::<SocketAddr>()
+                .expect("valid source address"),
+        };
+        let record_erased = IocpUserPayload::UdpRecvPacket(packet);
+        assert!(matches!(record_erased, IocpUserPayload::UdpRecvPacket(_)));
+        let record = UdpRecvMulti::try_record_from_erased(record_erased)
+            .expect("record payload should project independently");
+        assert_eq!(record.buf.len(), 2);
+
+        kernel.unbind_user_payload();
+    }
+}

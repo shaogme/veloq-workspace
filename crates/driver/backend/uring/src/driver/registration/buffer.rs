@@ -183,6 +183,7 @@ impl ChunkRegistrationRecord {
     }
 
     #[inline]
+    #[cfg(feature = "test-hooks")]
     pub(crate) fn set_last_failure(&mut self, failure: Instant) {
         self.last_failure = Some(failure);
     }
@@ -283,20 +284,15 @@ impl<'a> FixedBufferOwner<'a> {
         self.fixed_buffer_registration = Some(registration);
     }
 
-    pub(crate) fn set_fixed_buffers_unavailable(&mut self, errno: Option<i32>) {
-        self.fixed_buffers_available = false;
-        self.fixed_buffers_failure_errno = errno;
-        self.fixed_buffer_registration = None;
-    }
-
-    #[inline]
+    #[cfg(feature = "test-hooks")]
     pub(crate) fn fixed_buffers_available(&self) -> bool {
         self.fixed_buffers_available
     }
 
-    #[inline]
-    pub(crate) fn fixed_buffers_failure_errno(&self) -> Option<i32> {
-        self.fixed_buffers_failure_errno
+    pub(crate) fn set_fixed_buffers_unavailable(&mut self, errno: Option<i32>) {
+        self.fixed_buffers_available = false;
+        self.fixed_buffers_failure_errno = errno;
+        self.fixed_buffer_registration = None;
     }
 
     #[cfg(feature = "test-hooks")]

@@ -15,9 +15,20 @@ use super::{
     spec::{UringOpSpec, UringOperationDescriptor},
 };
 
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum UringRecordItem {
     UseSubmitPayload,
+    Ignored,
     New(UringUserPayload),
+    NewWithRearm {
+        item: UringUserPayload,
+        logical_receiver_generation: u32,
+    },
+    /// The CQE was consumed, but the logical UDP receiver remains addressable and owns its
+    /// pending provided-buffer lease. No user record is published for this CQE.
+    Retained {
+        logical_receiver_generation: Option<u32>,
+    },
 }
 
 /// 描述一次完成是单发还是会继续产生完成。
@@ -33,6 +44,7 @@ pub(crate) enum RecordPolicy {
     UseSubmitPayload,
     NewProvidedBuffer,
     NewAcceptedSocket,
+    UdpMultishot,
 }
 
 pub(crate) type MakeSqeFn = unsafe fn(
@@ -63,6 +75,14 @@ pub(crate) type RecordItemFn = unsafe fn(
     flags: u32,
     env: &mut CqeEnv<'_, '_>,
 ) -> UringResult<UringRecordItem>;
+pub(crate) type ResumeItemFn = unsafe fn(
+    access: &mut SlotAccess<'_, UringSlotSpec>,
+    token: OpToken,
+    logical_receiver_generation: u32,
+    env: &mut CqeEnv<'_, '_>,
+) -> UringResult<UringRecordItem>;
+pub(crate) type ReceiveGenerationFn =
+    unsafe fn(access: &mut SlotAccess<'_, UringSlotSpec>) -> Option<u32>;
 
 /// slot runtime 使用的类型擦除视图。
 ///
@@ -81,6 +101,8 @@ pub(crate) struct ErasedOperationDescriptor {
     pub(crate) get_timeout: GetTimeoutFn,
     pub(crate) resolve_chunks: ResolveChunksFn,
     pub(crate) record_item: RecordItemFn,
+    pub(crate) resume_item: ResumeItemFn,
+    pub(crate) receive_generation: ReceiveGenerationFn,
 }
 
 pub(crate) type NewKernelFn<S> = fn(&S) -> <S as UringOpSpec>::KernelPayload;

@@ -56,10 +56,15 @@ fn endpoint_round_trips_a_fragmented_message() {
                 server_ready.wait().await.expect("server ready");
                 client_ready.wait().await.expect("client ready");
                 let client_connection = client.connect(server_addr).await.expect("connect");
-                let mut server_connection = server.accept().await.expect("accept");
-                let receipt = client_connection.send_bytes(&payload).await.expect("send");
+                let server_connection = server.accept().await.expect("accept");
+                let client_stream = client_connection.open_stream().await.expect("open stream");
+                let mut server_stream = server_connection
+                    .accept_stream()
+                    .await
+                    .expect("accept stream");
+                let receipt = client_stream.send_bytes(&payload).await.expect("send");
                 assert!(receipt.fragment_count > 1);
-                let message = server_connection.recv().await.expect("receive");
+                let message = server_stream.recv().await.expect("receive");
                 assert_eq!(message.as_slice(), payload.as_slice());
                 assert_eq!(message.message_id, receipt.message_id);
                 client_connection.close().await.expect("close connection");

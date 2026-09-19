@@ -2,11 +2,14 @@ use crate::{
     config::{IoFd, IocpHandle, OwnedRawHandle, RawHandle},
     error::IocpResult,
     ext::Extensions,
-    net::addr::{SockAddrStorage, socket_addr_to_storage},
+    net::addr::socket_addr_to_storage,
     op::{
-        ACCEPT_EX_OUTPUT_BUFFER_LEN, Accept, AcceptPayload, Connect, KernelRef, OpSend,
-        OverlappedEntry, PayloadRef, Recv, SendTo, SendToPayload, SubmitContext, UdpConnect,
-        UdpRecv, UdpRecvFrom, UdpRecvFromPayload, UdpSend, kernel_ref, spec::IocpOpSpec, submit,
+        ACCEPT_EX_OUTPUT_BUFFER_LEN, Accept, AcceptMulti, AcceptMultiPayload, AcceptPayload,
+        Connect, KernelRef, OpSend, OverlappedEntry, PayloadRef, ProvidedBuf, Recv, RecvMulti,
+        RecvMultiPayload, RecvProvided, RecvProvidedPayload, SendTo, SendToPayload, SubmitContext,
+        UdpConnect, UdpRecvMulti, UdpRecvMultiPayload, UdpRecvPacket, UdpSend, kernel_ref,
+        spec::{IocpMultiShotSpec, IocpOpSpec},
+        submit,
     },
 };
 
@@ -61,33 +64,6 @@ impl IocpOpSpec for OpSend {
 
     unsafe fn get_fd(payload: &Self::KernelPayload) -> Option<IoFd> {
         unsafe { submit::get_fd_send(payload) }
-    }
-
-    fn map_completion(_payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion> {
-        res
-    }
-}
-
-impl IocpOpSpec for UdpRecv {
-    type KernelPayload = KernelRef<Self>;
-    type Completion = usize;
-
-    const PAYLOAD_KIND: OpKind = OpKind::UdpRecv;
-
-    fn new_kernel_payload(user: &Self) -> Self::KernelPayload {
-        kernel_ref(user)
-    }
-
-    fn submit(
-        header: &mut OverlappedEntry,
-        payload: &mut Self::KernelPayload,
-        ctx: &mut SubmitContext,
-    ) -> IocpResult<submit::SubmissionResult> {
-        submit::submit_udp_recv(header, payload, ctx)
-    }
-
-    unsafe fn get_fd(payload: &Self::KernelPayload) -> Option<IoFd> {
-        unsafe { submit::get_fd_udp_recv(payload) }
     }
 
     fn map_completion(_payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion> {
@@ -243,6 +219,133 @@ impl IocpOpSpec for Accept {
     }
 }
 
+impl IocpMultiShotSpec for AcceptMulti {
+    type KernelPayload = AcceptMultiPayload;
+    type RecordPayload = crate::op::AcceptedSocket;
+    type Completion = OwnedRawHandle;
+
+    const PAYLOAD_KIND: OpKind = OpKind::AcceptMulti;
+
+    fn new_kernel_payload(_user: &Self) -> Self::KernelPayload {
+        AcceptMultiPayload::new()
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<submit::SubmissionResult> {
+        submit::submit_accept_multi(header, payload, ctx)
+    }
+
+    unsafe fn on_complete(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        result: usize,
+        ext: &Extensions,
+    ) -> IocpResult<usize> {
+        unsafe { submit::on_complete_accept_multi(header, payload, result, ext) }
+    }
+
+    fn completion_cleanup(
+        _payload: &mut Self::KernelPayload,
+        result: &IocpResult<usize>,
+    ) -> CompletionCleanupGuard {
+        submit::completion_cleanup_close_socket(result)
+    }
+
+    fn orphan_cleanup(
+        payload: &mut Self::KernelPayload,
+        result: &IocpResult<usize>,
+    ) -> CompletionCleanupGuard {
+        submit::orphan_cleanup_accept_multi(payload, result)
+    }
+
+    unsafe fn get_fd(payload: &Self::KernelPayload) -> Option<IoFd> {
+        unsafe { submit::get_fd_accept_multi(payload) }
+    }
+
+    fn map_completion(
+        _payload: &Self::RecordPayload,
+        res: IocpResult<usize>,
+    ) -> IocpResult<Self::Completion> {
+        res.map(|raw| unsafe {
+            OwnedRawHandle::from_raw_owned(RawHandle::new(IocpHandle::for_socket(raw as _)))
+        })
+    }
+}
+
+impl IocpMultiShotSpec for RecvProvided {
+    type KernelPayload = RecvProvidedPayload;
+    type RecordPayload = ProvidedBuf;
+    type Completion = usize;
+
+    const PAYLOAD_KIND: OpKind = OpKind::RecvProvided;
+
+    fn new_kernel_payload(_user: &Self) -> Self::KernelPayload {
+        RecvProvidedPayload::new()
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<submit::SubmissionResult> {
+        submit::submit_recv_provided(header, payload, ctx)
+    }
+
+    unsafe fn on_complete(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        result: usize,
+        ext: &Extensions,
+    ) -> IocpResult<usize> {
+        unsafe { submit::on_complete_recv_provided(header, payload, result, ext) }
+    }
+
+    unsafe fn get_fd(payload: &Self::KernelPayload) -> Option<IoFd> {
+        unsafe { submit::get_fd_recv_provided(payload) }
+    }
+
+    fn map_completion(
+        _payload: &Self::RecordPayload,
+        res: IocpResult<usize>,
+    ) -> IocpResult<Self::Completion> {
+        res
+    }
+}
+
+impl IocpMultiShotSpec for RecvMulti {
+    type KernelPayload = RecvMultiPayload;
+    type RecordPayload = ProvidedBuf;
+    type Completion = usize;
+
+    const PAYLOAD_KIND: OpKind = OpKind::RecvMulti;
+
+    fn new_kernel_payload(_user: &Self) -> Self::KernelPayload {
+        RecvMultiPayload::new()
+    }
+
+    fn submit(
+        header: &mut OverlappedEntry,
+        payload: &mut Self::KernelPayload,
+        ctx: &mut SubmitContext,
+    ) -> IocpResult<submit::SubmissionResult> {
+        submit::submit_recv_multi(header, payload, ctx)
+    }
+
+    unsafe fn get_fd(payload: &Self::KernelPayload) -> Option<IoFd> {
+        unsafe { submit::get_fd_recv_multi(payload) }
+    }
+
+    fn map_completion(
+        _payload: &Self::RecordPayload,
+        res: IocpResult<usize>,
+    ) -> IocpResult<Self::Completion> {
+        res
+    }
+}
+
 impl IocpOpSpec for SendTo {
     type KernelPayload = SendToPayload;
     type Completion = usize;
@@ -279,16 +382,16 @@ impl IocpOpSpec for SendTo {
     }
 }
 
-impl IocpOpSpec for UdpRecvFrom {
-    type KernelPayload = UdpRecvFromPayload;
+impl IocpMultiShotSpec for UdpRecvMulti {
+    type KernelPayload = UdpRecvMultiPayload;
+    type RecordPayload = UdpRecvPacket;
     type Completion = usize;
 
-    const PAYLOAD_KIND: OpKind = OpKind::UdpRecvFrom;
+    const PAYLOAD_KIND: OpKind = OpKind::UdpRecvMulti;
 
     fn new_kernel_payload(_user: &Self) -> Self::KernelPayload {
-        UdpRecvFromPayload {
+        UdpRecvMultiPayload {
             user: PayloadRef::unbound(),
-            addr: SockAddrStorage::default(),
         }
     }
 
@@ -297,23 +400,14 @@ impl IocpOpSpec for UdpRecvFrom {
         payload: &mut Self::KernelPayload,
         ctx: &mut SubmitContext,
     ) -> IocpResult<submit::SubmissionResult> {
-        submit::submit_udp_recv_from(header, payload, ctx)
-    }
-
-    unsafe fn on_complete(
-        header: &mut OverlappedEntry,
-        payload: &mut Self::KernelPayload,
-        result: usize,
-        ext: &Extensions,
-    ) -> IocpResult<usize> {
-        unsafe { submit::on_complete_udp_recv_from(header, payload, result, ext) }
+        submit::submit_udp_recv_multi(header, payload, ctx)
     }
 
     unsafe fn get_fd(payload: &Self::KernelPayload) -> Option<IoFd> {
-        unsafe { submit::get_fd_udp_recv_from(payload) }
+        unsafe { submit::get_fd_udp_recv_multi(payload) }
     }
 
-    fn map_completion(_payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion> {
+    fn map_completion(_payload: &Self::RecordPayload, res: IocpResult<usize>) -> IocpResult<usize> {
         res
     }
 }

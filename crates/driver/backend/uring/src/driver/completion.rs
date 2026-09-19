@@ -15,7 +15,7 @@ use crate::{
     config::IoFd,
     diagnostics::UringCompletionDiagnostics,
     driver::completion::effects::CompletionEffectBatch,
-    driver::control::{ControlPlaneEvent, ExpiredBatch},
+    driver::control::ExpiredBatch,
     driver::{
         context::{CompletionContext, check_control_plane_invariants},
         control::{PendingCancel, UringControlPlane},
@@ -24,10 +24,13 @@ use crate::{
     },
     error::{UringError, UringResult, uring_report_to_event_res},
     op::{
-        Close, CompletionCleanupHintFn, Slot, UringOperationDescriptor, UringRecordItem,
-        UringSlotSpec,
+        CheckedSlotView, Close, CompletionCleanupHintFn, RecordPolicy, Slot, SlotView,
+        UringOpRegistryExt, UringOperationDescriptor, UringRecordItem, UringSlotSpec,
     },
 };
+
+#[cfg(any(test, feature = "test-hooks"))]
+use crate::driver::control::ControlPlaneEvent;
 
 use crate::driver::drive::RoundBudget;
 use crate::driver::lifecycle::{CancellationPhase, SubmissionPhase};
@@ -95,11 +98,12 @@ use crate::driver::control::waker::{WAKER_NOTIFIED, WAKER_PROCESSING};
 use veloq_driver_core::{
     driver::{
         AnomalyAttach, CancelMode, CancelTicket, CompletionAnomalyKind, CompletionBackend,
-        CompletionBackendHooks, CompletionCleanupGuard, CompletionContinuation, CompletionControl,
-        CompletionEnvelope, CompletionFailure, CompletionFlowExt, CompletionFlowOutcome,
-        CompletionIngress, CompletionSettlement, CompletionSource, CompletionToken,
-        DriverCompletionDiagnostics, OpToken, PlatformOp, RawCompletion, SharedCompletionTable,
-        SyntheticCompletionSource, UserCompletionEvent, run_completion_cleanup,
+        CompletionBackendHooks, CompletionBackendIngressAction, CompletionCleanupGuard,
+        CompletionContinuation, CompletionControl, CompletionEnvelope, CompletionFailure,
+        CompletionFlowExt, CompletionFlowOutcome, CompletionIngress, CompletionSettlement,
+        CompletionSource, CompletionToken, DriverCompletionDiagnostics, OpToken, PlatformOp,
+        RawCompletion, SharedCompletionTable, SyntheticCompletionSource, UserCompletionEvent,
+        run_completion_cleanup,
     },
     slot::{InFlightOrphaned, InFlightWaiting},
 };
@@ -110,6 +114,13 @@ pub(crate) const COMP_BACKEND_URING: CompletionBackend =
         Some(val) => val,
         None => unreachable!(),
     });
+
+enum UringBackendIngress {
+    ResumeUdpRecvMulti {
+        token: OpToken,
+        logical_receiver_generation: u32,
+    },
+}
 
 enum CompletionCleanupHintState {
     Missing,
@@ -159,6 +170,10 @@ enum UringBackendEffect {
     CloseCompleted {
         token: OpToken,
         fd: IoFd,
+    },
+    UdpRearm {
+        token: OpToken,
+        logical_receiver_generation: u32,
     },
 }
 
@@ -238,7 +253,7 @@ impl<'control, 'provided> UringCompletionHooks<'control, 'provided> {
         &mut self,
         event: UserCompletionEvent,
         kind: CompletionAnomalyKind,
-        source: CompletionSource<'_, ()>,
+        source: CompletionSource<'_, UringBackendIngress>,
     ) -> CompletionCleanupGuard {
         let raw = event.raw();
         self.with_cqe_env(|env| env.return_provided_buf(raw.flags));
@@ -424,7 +439,7 @@ impl<'control, 'provided> UringCompletionHooks<'control, 'provided> {
 }
 
 impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_, '_> {
-    type BackendIngress = ();
+    type BackendIngress = UringBackendIngress;
     type BackendEffect = UringBackendEffect;
 
     fn handle_control(
@@ -434,6 +449,22 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_, '_> {
         match control {
             CompletionControl::Waker { raw, .. } => self.handle_waker_control(raw),
             CompletionControl::Cancel { ticket, raw } => self.handle_cancel_control(ticket, raw),
+        }
+    }
+
+    fn complete_backend_ingress(
+        &mut self,
+        ingress: &Self::BackendIngress,
+    ) -> CompletionBackendIngressAction<UringSlotSpec, Self::BackendEffect> {
+        match ingress {
+            UringBackendIngress::ResumeUdpRecvMulti { token, .. } => {
+                CompletionBackendIngressAction::RouteUser(UserCompletionEvent::from_parts(
+                    COMP_BACKEND_URING,
+                    *token,
+                    0,
+                    cqueue::Flags::MORE.bits(),
+                ))
+            }
         }
     }
 
@@ -457,7 +488,22 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_, '_> {
                     self.synthetic.take_submission_failure(),
                 )
             }
-            CompletionSource::Kernel | CompletionSource::User | CompletionSource::Backend(_) => {
+            CompletionSource::Backend(UringBackendIngress::ResumeUdpRecvMulti {
+                logical_receiver_generation,
+                ..
+            }) => match self.with_cqe_env(|env| {
+                complete_udp_resume_waiting_slot(slot, event, *logical_receiver_generation, env)
+            }) {
+                Ok(outcome) => outcome,
+                Err(error) => CompletionSettlement::Quarantined {
+                    failure: CompletionFailure::quarantined(
+                        error.report,
+                        error.cleanup,
+                        UringBackendEffect::None,
+                    ),
+                },
+            },
+            CompletionSource::Kernel | CompletionSource::User => {
                 let raw = event.raw();
                 if raw.res == -libc::ENOBUFS {
                     self.with_cqe_env(|env| env.note_exhausted());
@@ -652,11 +698,21 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_, '_> {
                 self.control.append_close_unregister(token, fd);
                 Ok(())
             }
+            UringBackendEffect::UdpRearm {
+                token,
+                logical_receiver_generation,
+            } => {
+                self.control
+                    .append_udp_rearm(token, logical_receiver_generation);
+                Ok(())
+            }
         }
     }
 }
 
-fn completion_observation(ingress: &CompletionIngress<()>) -> Option<(OpToken, bool)> {
+fn completion_observation(
+    ingress: &CompletionIngress<UringBackendIngress>,
+) -> Option<(OpToken, bool)> {
     let (token, flags) = match ingress {
         CompletionIngress::Kernel(envelope) => (envelope.raw.token.op_token()?, envelope.raw.flags),
         CompletionIngress::User(event) | CompletionIngress::Synthetic { event, .. } => {
@@ -875,6 +931,30 @@ impl<'engine, 'context> CompletionPorts<'engine, 'context> {
         collection
     }
 
+    fn collect_udp_resume_tokens(&mut self, limit: usize) -> Vec<(OpToken, u32)> {
+        let tokens: Vec<_> = self.ops.active_tokens().collect();
+        tokens
+            .into_iter()
+            .filter_map(|token| {
+                let view = self.ops.checked_slot_view(token).ok()?;
+                let CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) = view else {
+                    return None;
+                };
+                slot.with_access_mut(|access| {
+                    let descriptor = access.operation().get_ref().descriptor();
+                    if descriptor.record_policy != RecordPolicy::UdpMultishot {
+                        return None;
+                    }
+                    unsafe { (descriptor.receive_generation)(access) }
+                        .map(|generation| (token, generation))
+                })
+                .ok()
+                .flatten()
+            })
+            .take(limit)
+            .collect()
+    }
+
     fn process_completion_batch(
         &mut self,
         budget: &mut RoundBudget,
@@ -983,6 +1063,33 @@ impl<'engine, 'context> CompletionPorts<'engine, 'context> {
             .timers_mut()
             .recycle_expired(expired, timer_count);
 
+        for (token, logical_receiver_generation) in self.collect_udp_resume_tokens(32) {
+            for _ in 0..16 {
+                let ingress = CompletionIngress::Backend(UringBackendIngress::ResumeUdpRecvMulti {
+                    token,
+                    logical_receiver_generation,
+                });
+                let (_observation, outcome) = self.accept_completion_transaction_into(
+                    ingress,
+                    UringSyntheticCompletion::None,
+                    &mut batch_effects,
+                );
+                match outcome {
+                    Ok(outcome) => {
+                        let user_completed = outcome.user_completed;
+                        progress.merge(outcome);
+                        if user_completed == 0 {
+                            break;
+                        }
+                    }
+                    Err(report) => {
+                        remember_first_error(&mut first_error, report);
+                        break;
+                    }
+                }
+            }
+        }
+
         self.completion.pending_collector_exhausted = collection.collector_exhausted;
         self.completion.pending_effects = Some(batch_effects);
         self.completion.cqe_buffer.clear();
@@ -1007,7 +1114,7 @@ impl<'engine, 'context> CompletionPorts<'engine, 'context> {
 
     fn accept_completion_ingress(
         &mut self,
-        ingress: CompletionIngress<()>,
+        ingress: CompletionIngress<UringBackendIngress>,
         synthetic: UringSyntheticCompletion,
     ) -> UringResult<CompletionFlowOutcome> {
         let mut effects = self
@@ -1027,7 +1134,7 @@ impl<'engine, 'context> CompletionPorts<'engine, 'context> {
 
     fn accept_completion_transaction_into(
         &mut self,
-        ingress: CompletionIngress<()>,
+        ingress: CompletionIngress<UringBackendIngress>,
         synthetic: UringSyntheticCompletion,
         effects: &mut CompletionEffectBatch,
     ) -> (Option<(OpToken, bool)>, UringResult<CompletionFlowOutcome>) {
@@ -1080,6 +1187,100 @@ fn record_item_policy_report(operation: &'static str, token: OpToken) -> Report<
         .with_ctx("token_generation", token.generation())
 }
 
+fn complete_udp_resume_waiting_slot(
+    mut slot: Slot<'_, InFlightWaiting>,
+    event: UserCompletionEvent,
+    logical_receiver_generation: u32,
+    cqe_env: &mut CqeEnv<'_, '_>,
+) -> Result<CompletionSettlement<UringSlotSpec, UringBackendEffect>, KernelCompletionError> {
+    let (record_item, operation_name) = match slot.with_access_mut(|access| {
+        let descriptor = access.operation().get_ref().descriptor();
+        if descriptor.record_policy != RecordPolicy::UdpMultishot {
+            return Err(record_item_policy_report(descriptor.name, event.token()));
+        }
+        let record_item = unsafe {
+            (descriptor.resume_item)(access, event.token(), logical_receiver_generation, cqe_env)
+        };
+        Ok((record_item, descriptor.name))
+    }) {
+        Ok(Ok((record_item, operation_name))) => (record_item, operation_name),
+        Ok(Err(report)) => {
+            return Err(KernelCompletionError {
+                report,
+                fallback_cleanup: false,
+                cleanup: CompletionCleanupGuard::default(),
+            });
+        }
+        Err(err) => {
+            return Err(KernelCompletionError {
+                report: UringError::InvalidState.report(
+                    "uring.complete_udp_resume_waiting_slot",
+                    format!("slot corruption detected during UDP resume: {:?}", err),
+                ),
+                fallback_cleanup: false,
+                cleanup: CompletionCleanupGuard::default(),
+            });
+        }
+    };
+    let record_item = match record_item {
+        Ok(record_item) => record_item,
+        Err(report) => {
+            return Err(KernelCompletionError {
+                report,
+                fallback_cleanup: false,
+                cleanup: CompletionCleanupGuard::default(),
+            });
+        }
+    };
+    match record_item {
+        UringRecordItem::Ignored => Ok(CompletionSettlement::Ignore {
+            effect: UringBackendEffect::None,
+        }),
+        UringRecordItem::Retained {
+            logical_receiver_generation,
+        } => {
+            let effect =
+                logical_receiver_generation.map_or(UringBackendEffect::None, |generation| {
+                    UringBackendEffect::UdpRearm {
+                        token: event.token(),
+                        logical_receiver_generation: generation,
+                    }
+                });
+            Ok(CompletionSettlement::Retained {
+                cleanup: CompletionCleanupGuard::default(),
+                effect,
+            })
+        }
+        UringRecordItem::NewWithRearm {
+            item,
+            logical_receiver_generation,
+        } => Ok(CompletionSettlement::User {
+            event,
+            payload: item,
+            detail: None,
+            cleanup: CompletionCleanupGuard::default(),
+            continuation: CompletionContinuation::More,
+            effect: UringBackendEffect::UdpRearm {
+                token: event.token(),
+                logical_receiver_generation,
+            },
+        }),
+        UringRecordItem::New(item) => Ok(CompletionSettlement::User {
+            event,
+            payload: item,
+            detail: None,
+            cleanup: CompletionCleanupGuard::default(),
+            continuation: CompletionContinuation::More,
+            effect: UringBackendEffect::None,
+        }),
+        UringRecordItem::UseSubmitPayload => Err(KernelCompletionError {
+            report: record_item_policy_report(operation_name, event.token()),
+            fallback_cleanup: false,
+            cleanup: CompletionCleanupGuard::default(),
+        }),
+    }
+}
+
 fn complete_kernel_waiting_slot(
     mut slot: Slot<'_, InFlightWaiting>,
     token: OpToken,
@@ -1130,15 +1331,52 @@ fn complete_kernel_waiting_slot(
     // 完成本身的错误在没有更具体的 `detail` 时充当 detail，与队列化之前逐条等价。
     let mut res_error = final_res.err();
 
+    if let UringRecordItem::Retained {
+        logical_receiver_generation,
+    } = record_item
+    {
+        let effect = logical_receiver_generation.map_or(UringBackendEffect::None, |generation| {
+            UringBackendEffect::UdpRearm {
+                token,
+                logical_receiver_generation: generation,
+            }
+        });
+        return Ok(CompletionSettlement::Retained { cleanup, effect });
+    }
+
+    if let UringRecordItem::NewWithRearm {
+        item,
+        logical_receiver_generation,
+    } = record_item
+    {
+        return Ok(CompletionSettlement::User {
+            event,
+            payload: item,
+            detail: res_error.take().map(Err),
+            cleanup,
+            continuation: CompletionContinuation::More,
+            effect: UringBackendEffect::UdpRearm {
+                token,
+                logical_receiver_generation,
+            },
+        });
+    }
+
     if continuation.is_more() {
         // slot 原地不动：op 与提交 payload 还要给内核后续的完成用，cell 也必须停在
         // `InFlightWaiting` 才能继续路由。
-        let UringRecordItem::New(item) = record_item else {
-            return Err(KernelCompletionError {
-                report: record_item_policy_report(operation_name, token),
-                fallback_cleanup: false,
-                cleanup,
-            });
+        let item = match record_item {
+            UringRecordItem::New(item) => item,
+            UringRecordItem::NewWithRearm { item, .. } => item,
+            UringRecordItem::UseSubmitPayload
+            | UringRecordItem::Ignored
+            | UringRecordItem::Retained { .. } => {
+                return Err(KernelCompletionError {
+                    report: record_item_policy_report(operation_name, token),
+                    fallback_cleanup: false,
+                    cleanup,
+                });
+            }
         };
         return Ok(CompletionSettlement::User {
             event,
@@ -1173,6 +1411,17 @@ fn complete_kernel_waiting_slot(
                 });
             };
             payload
+        }
+        UringRecordItem::Ignored
+        | UringRecordItem::NewWithRearm { .. }
+        | UringRecordItem::Retained { .. } => {
+            drop(submit_payload);
+            drop(detail);
+            return Err(KernelCompletionError {
+                report: record_item_policy_report(operation_name, token),
+                fallback_cleanup: false,
+                cleanup,
+            });
         }
     };
 

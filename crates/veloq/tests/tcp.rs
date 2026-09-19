@@ -1,9 +1,7 @@
 use veloq_std::{
-    future::poll_fn,
     net::{SocketAddr, TcpStream as StdTcpStream},
     num::NonZeroUsize,
     ops::AsyncFnOnce,
-    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -568,41 +566,15 @@ fn a_local_listener_streams_connections_without_a_detached_op() {
     });
 }
 
-/// 用一个开了 provided buffer 的运行时跑 `f`。
-///
-/// 默认是关的：环按 worker 占住 `entries * buf_size` 的池内存，不该让没用到它的程序白付。
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn run_test_with_provided_buffers<F, R>(f: F) -> R
-where
-    F: for<'s> AsyncFnOnce(Ctx<'s>) -> R,
-{
-    use veloq::config::ProvidedBufConfig;
-
-    Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(4))))
-        .worker_count(Some(nz!(1)))
-        .with_config(|config| config.uring_provided_buffers(Some(ProvidedBufConfig::default())))
-        .scope(f)
-        .expect("failed to run scope")
-}
-
 /// `recv_provided` 收到的是内核挑的 buffer，调用方一个字节都不用先交出去。
 ///
 /// 这正是 provided buffer 的收益所在：连接空闲时不占接收缓冲，数据到了才绑一个。所以这条
 /// 用例特意在**连接建立之后、数据发出之前**就把 recv 挂上去。
-#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn tcp_recv_provided_delivers_a_kernel_picked_buffer() {
     const ROUNDS: usize = 8;
 
-    run_test_with_provided_buffers(async |ctx| {
-        use veloq_driver_native::driver::Driver;
-
-        // `IORING_REGISTER_PBUF_RING` 要 5.19，而仓库声明的最低内核是 5.6。
-        if !ctx.driver(|driver| driver.capabilities().provided_buffers) {
-            eprintln!("skipping: kernel has no provided buffer ring");
-            return;
-        }
-
+    run_test(async |ctx| {
         let listener = TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
         let listen_addr = listener.local_addr().expect("Failed to get local address");
 
@@ -644,28 +616,18 @@ fn tcp_recv_provided_delivers_a_kernel_picked_buffer() {
 
 /// 一条 `RecvStream` 连续产出每一段数据，对端关闭时正常结束。
 ///
-/// 在 6.0+ 的内核上这只对应**一次** SQE 提交；5.19–5.x 上自动走每次重新提交单发
-/// `RecvProvided` 的路径。两条路径的可观测行为必须一致，所以这个测试对两者都跑得通——那正
-/// 是它的价值。
+/// 这只对应一次逻辑 `RecvMulti` 提交；具体的 buffer 分配、重发和回收由 driver 负责。
 ///
 /// 「对端关闭 → 流结束」是这里最容易写错的一条：`recv` 读到 0 字节在流的语义里只有一种意
 /// 思，所以它是 `None` 而不是一个空 buffer。
 ///
 /// 客户端使用库自带的 [`TcpStream`]：驱动在反注册/关闭套接字时会确保发出 TCP FIN 报文，
 /// 即使同一 ring 的固定文件表上有在途 multishot，对端也能立即收到 FIN 并正常优雅关闭。
-#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn recv_multi_streams_every_chunk_until_the_peer_closes() {
     const ROUNDS: usize = 8;
 
-    run_test_with_provided_buffers(async |ctx| {
-        use veloq_driver_native::driver::Driver;
-
-        if !ctx.driver(|driver| driver.capabilities().provided_buffers) {
-            eprintln!("skipping: kernel has no provided buffer ring");
-            return;
-        }
-
+    run_test(async |ctx| {
         let listener = TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
         let listen_addr = listener.local_addr().expect("Failed to get local address");
 
@@ -706,7 +668,6 @@ fn recv_multi_streams_every_chunk_until_the_peer_closes() {
                     chunks.next().await.is_none(),
                     "the stream must end when the peer closes"
                 );
-                assert_eq!(chunks.rearms(), 0, "a 256-deep ring must not run dry here");
             });
         })
         .await
@@ -719,17 +680,9 @@ fn recv_multi_streams_every_chunk_until_the_peer_closes() {
 /// 覆盖的是取消路径：句柄的 `Drop` 把 slot 收进 `InFlightOrphaned`，内核随后的完成才找得到
 /// slot 去跑 `orphan_cleanup`——而 multishot recv 的 orphan cleanup 要把内核挑走的 buffer
 /// 还回环。漏掉的话环会一次比一次短，最后所有 recv 都 `-ENOBUFS`。
-#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn dropping_a_recv_stream_leaves_the_connection_usable() {
-    run_test_with_provided_buffers(async |ctx| {
-        use veloq_driver_native::driver::Driver;
-
-        if !ctx.driver(|driver| driver.capabilities().provided_buffers) {
-            eprintln!("skipping: kernel has no provided buffer ring");
-            return;
-        }
-
+    run_test(async |ctx| {
         let listener = TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
         let listen_addr = listener.local_addr().expect("Failed to get local address");
 
@@ -759,81 +712,6 @@ fn dropping_a_recv_stream_leaves_the_connection_usable() {
                 let mut buf = ctx.alloc(nz!(64), 16);
                 buf.as_slice_mut()[..16].copy_from_slice(b"first_chunk_data");
                 stream.send(buf).await.expect("Failed to send first chunk");
-            });
-        })
-        .await
-        .unwrap();
-    });
-}
-
-/// 没开这项能力时 `recv_multi` 自动透明降级为 Single-shot Recv 模式。
-#[test]
-fn recv_multi_falls_back_when_provided_buffers_unavailable() {
-    run_test(async |ctx| {
-        let listener = TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
-        let listen_addr = listener.local_addr().expect("Failed to get local address");
-
-        scope!(ctx, async |s| {
-            s.spawn_boxed(async move {
-                let (stream, _peer) = listener.accept().await.expect("Accept failed");
-                let mut chunks = stream
-                    .recv_multi()
-                    .expect("recv_multi must fallback and succeed");
-                let polled = poll_fn(|cx| {
-                    use futures_core::Stream;
-                    unsafe { Pin::new_unchecked(&mut chunks) }.poll_next(cx)
-                })
-                .await;
-                let buf = polled
-                    .expect("stream item")
-                    .expect("recv_multi fallback chunk failed");
-                assert_eq!(buf.as_slice(), b"fallback_multi_data");
-            });
-
-            s.spawn_boxed(async move {
-                let stream = TcpStream::connect(ctx, listen_addr)
-                    .await
-                    .expect("Failed to connect");
-                let payload = b"fallback_multi_data";
-                let mut buf = ctx.alloc(nz!(64), payload.len());
-                buf.as_slice_mut()[..payload.len()].copy_from_slice(payload);
-                stream.send(buf).await.expect("Failed to send data");
-                yield_now().await;
-                drop(stream);
-            });
-        })
-        .await
-        .unwrap();
-    });
-}
-
-/// 没开这项能力时 `recv_provided` 自动透明降级为 Single-shot Recv 模式。
-#[test]
-fn recv_provided_falls_back_when_provided_buffers_unavailable() {
-    run_test(async |ctx| {
-        let listener = TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
-        let listen_addr = listener.local_addr().expect("Failed to get local address");
-
-        scope!(ctx, async |s| {
-            s.spawn_boxed(async move {
-                let (stream, _peer) = listener.accept().await.expect("Accept failed");
-                let buf = stream
-                    .recv_provided()
-                    .await
-                    .expect("recv_provided must fallback and succeed");
-                assert_eq!(buf.as_slice(), b"fallback_provided_data");
-            });
-
-            s.spawn_boxed(async move {
-                let stream = TcpStream::connect(ctx, listen_addr)
-                    .await
-                    .expect("Failed to connect");
-                let payload = b"fallback_provided_data";
-                let mut buf = ctx.alloc(nz!(64), payload.len());
-                buf.as_slice_mut()[..payload.len()].copy_from_slice(payload);
-                stream.send(buf).await.expect("Failed to send data");
-                yield_now().await;
-                drop(stream);
             });
         })
         .await

@@ -218,7 +218,8 @@ where
         ..
     } = record;
     cleanup.disarm();
-    let payload = T::try_record_from_erased(payload).expect("unexpected read payload type");
+    let payload = T::try_record_from_erased(payload.expect("read completion payload"))
+        .expect("unexpected read payload type");
     let buf = take_buffer(payload);
     let result = usize::from_event_res::<UringError>(event.res()).expect("read completion");
     (result, buf)
@@ -236,7 +237,8 @@ where
         ..
     } = record;
     cleanup.disarm();
-    let _payload = T::try_record_from_erased(payload).expect("unexpected write payload type");
+    let _payload = T::try_record_from_erased(payload.expect("write completion payload"))
+        .expect("unexpected write payload type");
     usize::from_event_res::<UringError>(event.res()).expect("write completion")
 }
 

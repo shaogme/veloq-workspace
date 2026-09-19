@@ -4,9 +4,8 @@
 //! errno，也不该为了认识它而按平台去挑依赖（`libc` 只在 Linux 上有）——那正是平台差异往上
 //! 渗的形态之一。
 //!
-//! IOCP 一个 multishot 能力都没有（`capabilities()` 恒为全 `false`），门面层的
-//! `AcceptStream` / `RecvStream` 在那里恒走 `Emulated`，从来不会问「内核是不是拒绝了这个
-//! 能力」。所以非 Linux 的实现恒为 `false` 不是敷衍：那条路根本走不到。
+//! IOCP 的 multishot 能力由对应后端直接报告，门面层在能力缺少时返回错误，不再回退到
+//! 单发操作。
 
 use diagweave::report::Report;
 

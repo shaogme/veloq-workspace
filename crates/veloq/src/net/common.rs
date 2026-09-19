@@ -5,6 +5,7 @@ use veloq_std::{
     ops::Deref,
     ptr::null_mut,
     rc::Rc,
+    sync::atomic::{AtomicUsize, Ordering},
     sync::{Arc, UnpoisonedMutex},
     vec,
 };
@@ -49,6 +50,14 @@ pub struct SocketToken<'rt> {
     ctx: Ctx<'rt>,
     accept_stash: UnpoisonedMutex<Option<StashedBox>>,
     recv_stash: UnpoisonedMutex<Option<StashedBox>>,
+    receive_claim: UnpoisonedMutex<Option<ReceiveClaim>>,
+    next_receive_claim: AtomicUsize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReceiveClaim {
+    id: usize,
+    generation: usize,
 }
 
 impl<'rt> SocketToken<'rt> {
@@ -71,6 +80,8 @@ impl<'rt> SocketToken<'rt> {
             ctx,
             accept_stash: UnpoisonedMutex::new(None),
             recv_stash: UnpoisonedMutex::new(None),
+            receive_claim: UnpoisonedMutex::new(None),
+            next_receive_claim: AtomicUsize::new(1),
         })
     }
 
@@ -107,6 +118,24 @@ impl<'rt> SocketToken<'rt> {
 
     pub(crate) fn has_stashed_accept(&self) -> bool {
         self.accept_stash.lock().is_some()
+    }
+
+    pub(crate) fn claim_receive(&self) -> Result<ReceiveClaim> {
+        let mut claim = self.receive_claim.lock();
+        if claim.is_some() {
+            return NetError::ReceiveAlreadyOwned.trans();
+        }
+        let id = self.next_receive_claim.fetch_add(1, Ordering::Relaxed);
+        let new_claim = ReceiveClaim { id, generation: id };
+        *claim = Some(new_claim);
+        Ok(new_claim)
+    }
+
+    pub(crate) fn release_receive(&self, expected: ReceiveClaim) {
+        let mut claim = self.receive_claim.lock();
+        if *claim == Some(expected) {
+            *claim = None;
+        }
     }
 
     pub(crate) fn stash_recv<T>(&self, val: T) {

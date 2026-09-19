@@ -1,9 +1,10 @@
 use std::sync::{Arc, Once};
 
 use tracing::trace;
+use tracing_subscriber::{Layer, filter::Targets, layer::SubscriberExt, util::SubscriberInitExt};
 use veloq::{
     buf::{UniformSlot, heap::ThreadMemoryMultiplier},
-    net::UdpSocket,
+    net::{UdpReceiveConfig, UdpSocket},
     nz,
     runtime::{Runtime, context::Ctx, scope},
     std::{
@@ -15,8 +16,8 @@ use veloq::{
 };
 
 use veloq_reliable_udp::{
-    Ack, Config, ConnectionId, CookieKey, CookieKeyRing, DataPacket, Endpoint, Error, Flags,
-    FrameSequence, MessageId, Packet, PacketRef,
+    Ack, Config, ConnectionId, CookieKey, CookieKeyRing, Endpoint, Error, FrameSequence, FrameType,
+    MessageId, Packet, PacketRef, StreamDataPacket, StreamId, StreamOpenPayload, StreamSequence,
 };
 
 #[path = "socket_proxy.rs"]
@@ -66,19 +67,24 @@ fn endpoint_round_trip_and_explicit_connection_close() {
                 server_ready.wait().await.expect("server ready");
                 client_ready.wait().await.expect("client ready");
                 phase = "connect";
-                let mut client_connection = client.connect(server_addr).await.expect("connect");
+                let client_connection = client.connect(server_addr).await.expect("connect");
                 phase = "accept";
-                let mut server_connection = server.accept().await.expect("accept");
+                let server_connection = server.accept().await.expect("accept");
                 assert_eq!(client_connection.peer_addr(), server_addr);
                 assert_eq!(server_connection.peer_addr(), client.local_addr());
+                let mut client_stream = client_connection.open_stream().await.expect("open stream");
+                let mut server_stream = server_connection
+                    .accept_stream()
+                    .await
+                    .expect("accept stream");
 
                 phase = "client-to-server send";
-                let receipt = client_connection
+                let receipt = client_stream
                     .send_bytes(b"client-to-server")
                     .await
                     .expect("send");
                 phase = "client-to-server receive";
-                let message = server_connection.recv().await.expect("receive");
+                let message = server_stream.recv().await.expect("receive");
                 assert_eq!(message.as_slice(), b"client-to-server");
                 assert_eq!(receipt.message_id, message.message_id);
                 assert!(receipt.rtt.is_some());
@@ -87,9 +93,9 @@ fn endpoint_round_trip_and_explicit_connection_close() {
                 let payload = b"server-to-client";
                 let mut buffer = ctx.alloc(nz!(256), payload.len());
                 buffer.as_slice_mut().copy_from_slice(payload);
-                let receipt = server_connection.send(buffer).await.expect("send buffer");
+                let receipt = server_stream.send(buffer).await.expect("send buffer");
                 phase = "server-to-client receive";
-                let message = client_connection.recv().await.expect("receive buffer");
+                let message = client_stream.recv().await.expect("receive buffer");
                 assert_eq!(message.as_slice(), payload);
                 assert_eq!(receipt.message_id, message.message_id);
 
@@ -153,13 +159,18 @@ fn endpoint_routes_commands_and_buffers_across_workers() {
             server_ready.wait().await.expect("server ready");
             client_ready.wait().await.expect("client ready");
             let client_connection = client.connect(server_addr).await.expect("connect");
-            let mut server_connection = server.accept().await.expect("accept");
+            let server_connection = server.accept().await.expect("accept");
+            let client_stream = client_connection.open_stream().await.expect("open stream");
+            let mut server_stream = server_connection
+                .accept_stream()
+                .await
+                .expect("accept stream");
 
-            let receipt = client_connection
+            let receipt = client_stream
                 .send_bytes(b"cross-worker")
                 .await
                 .expect("send");
-            let message = server_connection.recv().await.expect("receive");
+            let message = server_stream.recv().await.expect("receive");
             assert_eq!(message.as_slice(), b"cross-worker");
             assert_eq!(receipt.message_id, message.message_id);
 
@@ -209,7 +220,13 @@ fn endpoint_rejects_message_larger_than_configured_payload() {
             endpoint_ready.wait().await.expect("endpoint ready");
             peer_ready.wait().await.expect("peer ready");
             let connection = peer.connect(endpoint_addr).await.expect("connect");
-            let error = connection
+            let endpoint_connection = endpoint.accept().await.expect("accept");
+            let stream = connection.open_stream().await.expect("open stream");
+            let _endpoint_stream = endpoint_connection
+                .accept_stream()
+                .await
+                .expect("accept stream");
+            let error = stream
                 .send_bytes(&[0; 23])
                 .await
                 .expect_err("payload must be rejected");
@@ -243,7 +260,7 @@ fn endpoint_proxy_retransmits_dropped_data_once() {
         proxy.push_action(
             ProxyDirection::ClientToServer,
             PacketMatcher::Data {
-                frame_sequence: Some(veloq_reliable_udp::FrameSequence::new(1).expect("sequence")),
+                frame_sequence: Some(veloq_reliable_udp::FrameSequence::new(2).expect("sequence")),
             },
             ProxyAction::Drop,
         );
@@ -270,14 +287,19 @@ fn endpoint_proxy_retransmits_dropped_data_once() {
                     .expect("proxy ready");
                 let client_connection = client.connect(proxy_addr).await.expect("connect");
                 phase = "accept";
-                let mut server_connection = server.accept().await.expect("accept");
+                let server_connection = server.accept().await.expect("accept");
+                let client_stream = client_connection.open_stream().await.expect("open stream");
+                let mut server_stream = server_connection
+                    .accept_stream()
+                    .await
+                    .expect("accept stream");
                 phase = "send";
-                let receipt = client_connection
+                let receipt = client_stream
                     .send_bytes(b"dropped-once")
                     .await
                     .expect("send");
                 phase = "receive";
-                let message = server_connection.recv().await.expect("receive");
+                let message = server_stream.recv().await.expect("receive");
                 assert_eq!(message.as_slice(), b"dropped-once");
                 assert_eq!(receipt.message_id, message.message_id);
                 assert!(receipt.retransmissions >= 1);
@@ -356,7 +378,7 @@ fn endpoint_proxy_deduplicates_duplicated_data() {
         proxy.push_action(
             ProxyDirection::ClientToServer,
             PacketMatcher::Data {
-                frame_sequence: Some(veloq_reliable_udp::FrameSequence::new(1).expect("sequence")),
+                frame_sequence: Some(veloq_reliable_udp::FrameSequence::new(2).expect("sequence")),
             },
             ProxyAction::Duplicate,
         );
@@ -383,20 +405,25 @@ fn endpoint_proxy_deduplicates_duplicated_data() {
                     .expect("proxy ready");
                 let client_connection = client.connect(proxy_addr).await.expect("connect");
                 phase = "accept";
-                let mut server_connection = server.accept().await.expect("accept");
+                let server_connection = server.accept().await.expect("accept");
+                let client_stream = client_connection.open_stream().await.expect("open stream");
+                let mut server_stream = server_connection
+                    .accept_stream()
+                    .await
+                    .expect("accept stream");
                 phase = "send";
-                let receipt = client_connection
+                let receipt = client_stream
                     .send_bytes(b"duplicated-once")
                     .await
                     .expect("send");
                 phase = "receive";
-                let message = server_connection.recv().await.expect("receive");
+                let message = server_stream.recv().await.expect("receive");
                 assert_eq!(message.as_slice(), b"duplicated-once");
                 assert_eq!(receipt.message_id, message.message_id);
                 let second = timeout_at(
                     ctx,
                     Instant::now() + Duration::from_millis(100),
-                    server_connection.recv(),
+                    server_stream.recv(),
                 )
                 .await;
                 assert!(second.is_err(), "duplicate became application-visible");
@@ -480,7 +507,7 @@ fn endpoint_proxy_delays_data_without_duplicate_delivery() {
         proxy.push_action(
             ProxyDirection::ClientToServer,
             PacketMatcher::Data {
-                frame_sequence: Some(veloq_reliable_udp::FrameSequence::new(1).expect("sequence")),
+                frame_sequence: Some(veloq_reliable_udp::FrameSequence::new(2).expect("sequence")),
             },
             ProxyAction::Delay(Duration::from_millis(20)),
         );
@@ -507,14 +534,19 @@ fn endpoint_proxy_delays_data_without_duplicate_delivery() {
                     .expect("proxy ready");
                 let client_connection = client.connect(proxy_addr).await.expect("connect");
                 phase = "accept";
-                let mut server_connection = server.accept().await.expect("accept");
+                let server_connection = server.accept().await.expect("accept");
+                let client_stream = client_connection.open_stream().await.expect("open stream");
+                let mut server_stream = server_connection
+                    .accept_stream()
+                    .await
+                    .expect("accept stream");
                 phase = "send";
-                let receipt = client_connection
+                let receipt = client_stream
                     .send_bytes(b"delayed-once")
                     .await
                     .expect("send");
                 phase = "receive";
-                let message = server_connection.recv().await.expect("receive");
+                let message = server_stream.recv().await.expect("receive");
                 assert_eq!(message.as_slice(), b"delayed-once");
                 assert_eq!(receipt.message_id, message.message_id);
                 assert_eq!(receipt.retransmissions, 0);
@@ -621,10 +653,16 @@ fn endpoint_proxy_reorders_data_and_delivers_in_order() {
                 let client_connection =
                     Arc::new(client.connect(proxy_addr).await.expect("connect"));
                 phase = "accept";
-                let mut server_connection = server.accept().await.expect("accept");
+                let server_connection = server.accept().await.expect("accept");
+                let client_stream = client_connection.open_stream().await.expect("open stream");
+                let (client_sender, _client_receiver) = client_stream.split();
+                let mut server_stream = server_connection
+                    .accept_stream()
+                    .await
+                    .expect("accept stream");
                 phase = "send two frames";
-                let first_connection = client_connection.clone();
-                let second_connection = client_connection.clone();
+                let first_connection = client_sender.clone();
+                let second_connection = client_sender;
                 let first_send =
                     scope.spawn_boxed(async move { first_connection.send_bytes(b"first").await });
                 let second_send =
@@ -638,8 +676,8 @@ fn endpoint_proxy_reorders_data_and_delivers_in_order() {
                     .expect("second send task")
                     .expect("second send");
                 phase = "receive two frames";
-                let first = server_connection.recv().await.expect("first receive");
-                let second = server_connection.recv().await.expect("second receive");
+                let first = server_stream.recv().await.expect("first receive");
+                let second = server_stream.recv().await.expect("second receive");
                 assert_eq!(first.as_slice(), b"first");
                 assert_eq!(second.as_slice(), b"second");
                 assert_eq!(first.message_id, first_receipt.message_id);
@@ -711,6 +749,7 @@ fn endpoint_proxy_reorders_data_and_delivers_in_order() {
 
 #[test]
 fn endpoint_proxy_timer_isolation_between_connections() {
+    init_diagnostic_logging();
     run_test(nz!(2), async |ctx| {
         let config = proxy_config();
         let (server, server_driver, mut server_ready) =
@@ -724,7 +763,15 @@ fn endpoint_proxy_timer_isolation_between_connections() {
         proxy.push_action(
             ProxyDirection::ClientToServer,
             PacketMatcher::Data {
-                frame_sequence: Some(veloq_reliable_udp::FrameSequence::new(1).expect("sequence")),
+                frame_sequence: Some(veloq_reliable_udp::FrameSequence::new(2).expect("sequence")),
+            },
+            ProxyAction::Drop,
+        );
+        proxy.push_action(
+            ProxyDirection::ServerToClient,
+            PacketMatcher::Frame {
+                frame_type: FrameType::FinAck,
+                frame_sequence: None,
             },
             ProxyAction::Drop,
         );
@@ -739,6 +786,11 @@ fn endpoint_proxy_timer_isolation_between_connections() {
             let started = Instant::now();
             let deadline = started + ROUND_TRIP_BUDGET;
             let mut phase = "connect first";
+            trace!(
+                target: "veloq_reliable_udp::endpoint_test",
+                budget = ?ROUND_TRIP_BUDGET,
+                "starting proxy timer isolation test"
+            );
 
             let completed = timeout_at(ctx, deadline, async {
                 server_ready.wait().await.expect("server ready");
@@ -749,16 +801,50 @@ fn endpoint_proxy_timer_isolation_between_connections() {
                     .wait_ready()
                     .await
                     .expect("proxy ready");
+                trace!(
+                    target: "veloq_reliable_udp::endpoint_test",
+                    elapsed = ?Instant::now().saturating_duration_since(started),
+                    "endpoint and proxy drivers are ready"
+                );
                 let first_client =
                     Arc::new(client.connect(proxy_addr).await.expect("first connect"));
-                let mut first_server = server.accept().await.expect("first accept");
+                let first_server = server.accept().await.expect("first accept");
+                let first_stream = first_client.open_stream().await.expect("first open stream");
+                let (first_sender, _first_receiver) = first_stream.split();
+                let mut first_server_stream = first_server
+                    .accept_stream()
+                    .await
+                    .expect("first accept stream");
+                trace!(
+                    target: "veloq_reliable_udp::endpoint_test",
+                    elapsed = ?Instant::now().saturating_duration_since(started),
+                    "first connection and stream are ready"
+                );
                 phase = "connect second";
                 let second_client =
                     Arc::new(client.connect(proxy_addr).await.expect("second connect"));
-                let mut second_server = server.accept().await.expect("second accept");
+                let second_server = server.accept().await.expect("second accept");
+                let second_stream = second_client
+                    .open_stream()
+                    .await
+                    .expect("second open stream");
+                let (second_sender, _second_receiver) = second_stream.split();
+                let mut second_server_stream = second_server
+                    .accept_stream()
+                    .await
+                    .expect("second accept stream");
+                trace!(
+                    target: "veloq_reliable_udp::endpoint_test",
+                    elapsed = ?Instant::now().saturating_duration_since(started),
+                    "second connection and stream are ready"
+                );
 
                 phase = "drop first data";
-                let first_sender = first_client.clone();
+                trace!(
+                    target: "veloq_reliable_udp::endpoint_test",
+                    elapsed = ?Instant::now().saturating_duration_since(started),
+                    "sending first data packet expected to be dropped"
+                );
                 let first_send = scope
                     .spawn_boxed(async move { first_sender.send_bytes(b"connection-a").await });
                 proxy_handle
@@ -767,16 +853,20 @@ fn endpoint_proxy_timer_isolation_between_connections() {
                     .wait_action_observed()
                     .await
                     .expect("drop action observed");
+                trace!(
+                    target: "veloq_reliable_udp::endpoint_test",
+                    elapsed = ?Instant::now().saturating_duration_since(started),
+                    "proxy observed the first data drop"
+                );
 
                 phase = "send second data";
-                let second_sender = second_client.clone();
                 let second_send = scope
                     .spawn_boxed(async move { second_sender.send_bytes(b"connection-b").await });
                 let second_receipt = second_send
                     .await
                     .expect("second send task")
                     .expect("second send");
-                let second_message = second_server.recv().await.expect("second receive");
+                let second_message = second_server_stream.recv().await.expect("second receive");
                 assert_eq!(second_message.as_slice(), b"connection-b");
                 assert_eq!(second_receipt.message_id, second_message.message_id);
                 assert_eq!(second_receipt.retransmissions, 0);
@@ -786,7 +876,7 @@ fn endpoint_proxy_timer_isolation_between_connections() {
                     .await
                     .expect("first send task")
                     .expect("first send");
-                let first_message = first_server.recv().await.expect("first receive");
+                let first_message = first_server_stream.recv().await.expect("first receive");
                 assert_eq!(first_message.as_slice(), b"connection-a");
                 assert_eq!(first_receipt.message_id, first_message.message_id);
                 assert!(first_receipt.retransmissions >= 1);
@@ -909,20 +999,31 @@ fn endpoint_proxy_delivers_single_data_packet_within_15s() {
                     .wait_ready()
                     .await
                     .expect("proxy ready");
-                let mut receive = raw_client.prepare_recv_from(ctx.alloc_full(nz!(1_200)));
-                receive.arm().await.expect("arm handshake receive");
+                let mut receive = raw_client
+                    .receiver(UdpReceiveConfig {
+                        kernel_capacity: nz!(1),
+                        queue_capacity: nz!(2),
+                        datagram_capacity: nz!(1_200),
+                        close_timeout: Duration::from_secs(1),
+                    })
+                    .expect("create handshake receiver");
+                receive.ready().await.expect("arm handshake receive");
                 trace!(
                     target: "veloq_reliable_udp::endpoint_test",
-                    armed = receive.is_armed(),
+                    armed = true,
                     "raw client handshake receive armed"
                 );
-                let syn = Packet::encode_control_into_with_limit(
+                let syn = Packet::encode_frame(
                     &ctx,
                     nz!(1_200),
-                    Flags::SYN,
+                    FrameType::Syn,
+                    false,
                     connection_id,
+                    None,
+                    None,
                     Ack::empty(),
                     32,
+                    &[],
                 )
                 .expect("encode SYN")
                 .into_fixed_buf();
@@ -939,17 +1040,21 @@ fn endpoint_proxy_delivers_single_data_packet_within_15s() {
                 );
 
                 phase = "receive SYN-ACK";
-                let syn_ack = receive.await.expect("receive SYN-ACK");
+                let syn_ack = receive.recv().await.expect("receive SYN-ACK");
                 let syn_ack_packet =
                     PacketRef::decode(syn_ack.buf.as_slice()).expect("decode SYN-ACK");
-                assert_eq!(syn_ack_packet.flags, Flags::SYN_ACK);
+                assert_eq!(syn_ack_packet.frame_type, FrameType::SynAck);
                 let cookie = *syn_ack_packet.handshake_cookie().expect("handshake cookie");
 
-                let ack = Packet::encode_handshake_cookie_into_with_limit(
+                let ack = Packet::encode_frame(
                     &ctx,
                     nz!(1_200),
-                    Flags::ACK,
+                    FrameType::HandshakeAck,
+                    false,
                     connection_id,
+                    None,
+                    None,
+                    Ack::empty(),
                     32,
                     &cookie,
                 )
@@ -958,14 +1063,42 @@ fn endpoint_proxy_delivers_single_data_packet_within_15s() {
                 raw_client.send_to(ack, proxy_addr).await.expect("send ACK");
 
                 phase = "accept raw connection";
-                let mut server_connection = server.accept().await.expect("accept");
-                let data = Packet::encode_data_into_with_limit(
+                let server_connection = server.accept().await.expect("accept");
+                let open_payload = StreamOpenPayload {
+                    frame_window: 32,
+                    byte_credit: 64 * 1024,
+                }
+                .encode();
+                let open = Packet::encode_frame(
                     &ctx,
                     nz!(1_200),
-                    DataPacket {
-                        flags: Flags::DATA,
+                    FrameType::StreamOpen,
+                    false,
+                    connection_id,
+                    Some(FrameSequence::new(1).expect("frame sequence")),
+                    Some(StreamId::new(1).expect("stream ID")),
+                    Ack::empty(),
+                    32,
+                    &open_payload,
+                )
+                .expect("encode stream open")
+                .into_fixed_buf();
+                raw_client
+                    .send_to(open, proxy_addr)
+                    .await
+                    .expect("send stream open");
+                let mut server_stream = server_connection
+                    .accept_stream()
+                    .await
+                    .expect("accept stream");
+                let data = Packet::encode_stream_data_into_with_limit(
+                    &ctx,
+                    nz!(1_200),
+                    StreamDataPacket {
                         connection_id,
-                        frame_sequence: FrameSequence::new(1).expect("frame sequence"),
+                        frame_sequence: FrameSequence::new(2).expect("frame sequence"),
+                        stream_id: StreamId::new(1).expect("stream ID"),
+                        stream_sequence: StreamSequence::new(1).expect("stream sequence"),
                         ack: Ack::empty(),
                         receive_window: 32,
                         message_id: MessageId::new(1).expect("message ID"),
@@ -984,7 +1117,7 @@ fn endpoint_proxy_delivers_single_data_packet_within_15s() {
                     .expect("send single DATA");
 
                 phase = "receive single DATA";
-                let message = server_connection.recv().await.expect("receive single DATA");
+                let message = server_stream.recv().await.expect("receive single DATA");
                 assert_eq!(message.as_slice(), b"single-shot");
                 assert_eq!(message.message_id.get(), 1);
                 let snapshot = stats.snapshot();
@@ -1040,10 +1173,18 @@ fn endpoint_proxy_delivers_single_data_packet_within_15s() {
 fn init_diagnostic_logging() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
-        let _ = tracing_subscriber::fmt()
-            .with_test_writer()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::TRACE)
+        let filter = Targets::new()
+            .with_target("veloq_reliable_udp::endpoint", tracing::Level::TRACE)
+            .with_target("veloq_reliable_udp::endpoint_test", tracing::Level::TRACE)
+            .with_target("veloq_reliable_udp::session", tracing::Level::TRACE)
+            .with_target("veloq_reliable_udp::socket_proxy", tracing::Level::TRACE);
+        let _ = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_test_writer()
+                    .with_ansi(false)
+                    .with_filter(filter),
+            )
             .try_init();
     });
 }

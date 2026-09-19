@@ -12,6 +12,7 @@ use veloq_std::{
 
 pub mod driver;
 pub mod op;
+pub mod platform;
 pub mod slot;
 
 // ============================================================================

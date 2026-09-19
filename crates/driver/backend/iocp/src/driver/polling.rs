@@ -282,13 +282,105 @@ impl TimerEngine {
 }
 
 impl<'a> IocpDriver<'a> {
+    /// Drains state that has already been orphaned by fast close without publishing any user
+    /// completion. This path deliberately does not use the normal RIO completion route: RIO slots
+    /// and payloads are moved to the RIO deferred owner before the boxed IOCP state is handed to
+    /// this reaper.
+    pub(super) fn drain_orphaned(&mut self, timeout: Duration) -> IocpResult<()> {
+        let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
+            IocpError::CompletionWait
+                .to_report()
+                .push_ctx("scope", "iocp/reaper")
+                .attach_note("deferred IOCP drain timeout is too large")
+        })?;
+        let mut first_error = None;
+
+        loop {
+            self.drain_deferred_socket_cleanup();
+            if !self.state().ops.has_active_ops()
+                && self.state().rio.state().rio_outstanding_count == 0
+                && !self.state().rio.state().has_socket_inflight()
+                && self.state().handles.deferred_cleanup_len() == 0
+            {
+                return first_error.map_or(Ok(()), Err);
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(first_error.unwrap_or_else(|| {
+                    IocpError::CompletionWait.report("iocp/reaper", "deferred IOCP drain timed out")
+                }));
+            }
+
+            let count = self
+                .state_mut()
+                .completion
+                .fill_batch(duration_to_wait_ms(deadline.saturating_duration_since(now)))
+                .push_ctx("scope", "iocp/reaper")
+                .attach_note("failed to poll deferred IOCP completion")?;
+            for index in 0..count {
+                if let Err(error) = self.handle_orphaned_batch_entry(index)
+                    && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
+            }
+
+            if self.state().rio.state().rio_outstanding_count > 0 {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if let Err(error) = self
+                    .state_mut()
+                    .rio
+                    .state_mut()
+                    .drain_outstanding(remaining)
+                    .trans()
+                    && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
+            }
+        }
+    }
+
+    fn handle_orphaned_batch_entry(&mut self, index: usize) -> IocpResult<usize> {
+        let Some(CompletionStatus {
+            bytes,
+            key,
+            overlapped,
+            success,
+            error_code,
+        }) = self.state().completion.status(index)
+        else {
+            return Ok(0);
+        };
+        let res = iocp_status_res(success, error_code, bytes);
+        let flags = iocp_status_flags(success, error_code);
+        match classify_completion_status(key, overlapped, success) {
+            IocpCompletionStatusKind::RioWake => Ok(0),
+            IocpCompletionStatusKind::OverlappedUser { queue_key } => {
+                let envelope =
+                    self.resolve_overlapped_user_envelope(queue_key, overlapped, res, flags)?;
+                self.process_completion_envelope(envelope)
+            }
+            IocpCompletionStatusKind::ControlKey | IocpCompletionStatusKind::PostedToken => Ok(0),
+            IocpCompletionStatusKind::NullFailure => Err(iocp_msg(
+                IocpErrorContext::CompletionWait,
+                "deferred IOCP completion reported a failure with null overlapped",
+            )
+            .with_ctx("os_error_code", error_code.unwrap_or(0))
+            .with_ctx("completion_key", key)),
+            IocpCompletionStatusKind::Unknown => Ok(0),
+        }
+    }
+
     pub(super) fn poll_completion(&mut self, timeout: Duration) -> IocpResult<usize> {
         let count = self
+            .state_mut()
             .completion
             .fill_batch(duration_to_wait_ms(timeout))
             .push_ctx("scope", "iocp/driver")
             .attach_note("failed to poll IOCP status")?;
-        self.completion.mark_waker_notifications(count);
+        self.state().completion.mark_waker_notifications(count);
 
         let mut drained = 0usize;
         let mut first_error = None;
@@ -309,14 +401,17 @@ impl<'a> IocpDriver<'a> {
     /// Retrieves completion events from the I/O completion port.
     pub(crate) fn get_completion(&mut self, timeout: Option<Duration>) -> IocpResult<()> {
         let _ = self.drain_cancel_requests()?;
-        self.timer.advance_to(Instant::now()).map_err(|error| {
-            IocpError::InvalidState
-                .report("iocp.timer.advance", "timer wheel could not advance")
-                .with_ctx("timer_error", format!("{error:?}"))
-        })?;
+        self.state_mut()
+            .timer
+            .advance_to(Instant::now())
+            .map_err(|error| {
+                IocpError::InvalidState
+                    .report("iocp.timer.advance", "timer wheel could not advance")
+                    .with_ctx("timer_error", format!("{error:?}"))
+            })?;
         self.process_timers()?;
-        let ready_completion = self.ops.shared.has_ready_completion();
-        let timer_deadline = self.timer.next_deadline().map_err(|error| {
+        let ready_completion = self.state().ops.shared.has_ready_completion();
+        let timer_deadline = self.state().timer.next_deadline().map_err(|error| {
             IocpError::InvalidState
                 .report(
                     "iocp.timer.deadline",
@@ -326,7 +421,8 @@ impl<'a> IocpDriver<'a> {
         })?;
         let budget = wait_budget(timeout, timer_deadline, WAKE_FAILURE_PROBE_INTERVAL);
         let wait_ms = if ready_completion {
-            self.completion_diagnostics
+            self.state()
+                .completion_diagnostics
                 .backend()
                 .inc_wait_ready_preflight();
             0
@@ -334,35 +430,47 @@ impl<'a> IocpDriver<'a> {
             duration_to_wait_ms(budget.duration)
         };
         if wait_ms == 0 {
-            self.completion_diagnostics.backend().inc_wait_zero();
+            self.state()
+                .completion_diagnostics
+                .backend()
+                .inc_wait_zero();
         } else {
-            self.completion_diagnostics.backend().inc_wait_block();
+            self.state()
+                .completion_diagnostics
+                .backend()
+                .inc_wait_block();
         }
 
-        let batched = self.completion.fill_batch(wait_ms);
+        let batched = self.state_mut().completion.fill_batch(wait_ms);
         let count = batched
             .attach_note("failed to get IOCP completion status")
             .trans()?;
         let mut timed_out_source = None;
         if count == 0 && wait_ms != 0 {
-            self.completion_diagnostics.backend().inc_wait_timeout();
+            self.state()
+                .completion_diagnostics
+                .backend()
+                .inc_wait_timeout();
             timed_out_source = Some(budget.source);
             match budget.source {
                 WaitBudgetSource::External => self
+                    .state()
                     .completion_diagnostics
                     .backend()
                     .inc_wait_external_timeout(),
                 WaitBudgetSource::Timer => self
+                    .state()
                     .completion_diagnostics
                     .backend()
                     .inc_wait_timer_return(),
                 WaitBudgetSource::Probe => self
+                    .state()
                     .completion_diagnostics
                     .backend()
                     .inc_wait_probe_return(),
             }
         }
-        self.completion.mark_waker_notifications(count);
+        self.state().completion.mark_waker_notifications(count);
 
         // Every entry is routed even if one of them fails, so a single corrupt completion
         // cannot drop the rest of the batch on the floor; the first error is reported.
@@ -379,19 +487,24 @@ impl<'a> IocpDriver<'a> {
             }
         }
 
-        self.timer.advance_to(Instant::now()).map_err(|error| {
-            IocpError::InvalidState
-                .report("iocp.timer.advance", "timer wheel could not advance")
-                .with_ctx("timer_error", format!("{error:?}"))
-        })?;
+        self.state_mut()
+            .timer
+            .advance_to(Instant::now())
+            .map_err(|error| {
+                IocpError::InvalidState
+                    .report("iocp.timer.advance", "timer wheel could not advance")
+                    .with_ctx("timer_error", format!("{error:?}"))
+            })?;
         let timer_count = self.process_timers()?;
         if handled > 0 {
-            self.completion_diagnostics
+            self.state()
+                .completion_diagnostics
                 .backend()
                 .inc_wait_completion_return();
         }
         if timer_count > 0 && timed_out_source != Some(WaitBudgetSource::Timer) {
-            self.completion_diagnostics
+            self.state()
+                .completion_diagnostics
                 .backend()
                 .inc_wait_timer_return();
         }
@@ -406,7 +519,7 @@ impl<'a> IocpDriver<'a> {
             overlapped,
             success,
             error_code,
-        }) = self.completion.status(index)
+        }) = self.state().completion.status(index)
         else {
             return Ok(0);
         };
@@ -425,14 +538,16 @@ impl<'a> IocpDriver<'a> {
         let flags = iocp_status_flags(success, error_code);
         match classify_completion_status(key, overlapped, success) {
             IocpCompletionStatusKind::RioWake => {
+                let registrar = self.registrar;
+                let state = self.state_mut();
                 {
-                    let (rio_state, registrar) = self.rio.state_and_registrar_mut();
+                    let (rio_state, registrar) = state.rio.state_and_registrar_mut(registrar);
                     rio_state.process_completions(
-                        &mut self.ops,
-                        &self.extensions,
+                        &mut state.ops,
+                        &state.extensions,
                         registrar,
-                        self.completion.table(),
-                        &mut self.completion_diagnostics,
+                        state.completion.table(),
+                        &mut state.completion_diagnostics,
                     )
                 }
                 .inspect(|_| {
@@ -483,13 +598,13 @@ impl<'a> IocpDriver<'a> {
     ) -> IocpResult<CompletionEnvelope> {
         let entry = unsafe { &*(overlapped as *const OverlappedEntry) };
         let idx = entry.token.index();
-        if idx >= self.ops.capacity() {
+        if idx >= self.state().ops.capacity() {
             return Err(IocpError::InvalidState.report(
                 "resolve_overlapped_user_envelope",
                 format!(
                     "completed index out of bounds: index {}, capacity {}",
                     idx,
-                    self.ops.capacity()
+                    self.state().ops.capacity()
                 ),
             ));
         }

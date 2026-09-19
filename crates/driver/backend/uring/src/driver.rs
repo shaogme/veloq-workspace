@@ -2,8 +2,7 @@ use diagweave::prelude::*;
 use tracing::{debug, trace};
 use veloq_buf::{AnyBufPool, BufferRegistrar, heap::ChunkId};
 use veloq_io_uring::{
-    IoUring, KernelCapabilities, Probe, ResourceLayout, RingConfig, SetupFlags, SetupPolicy,
-    opcode, types,
+    IoUring, KernelCapabilities, ResourceLayout, RingConfig, SetupFlags, SetupPolicy,
 };
 use veloq_std::{format, io, sync::Arc, vec::Vec};
 
@@ -12,12 +11,8 @@ use veloq_std::string::String;
 
 use crate::{
     config::{IoFd, IoMode, UringConfig, UringRawHandle},
-    diagnostics::{
-        UringCapabilitySnapshot, UringCompletionDiagnostics, UringCompletionDiagnosticsSnapshot,
-        UringSetupSnapshot,
-    },
+    diagnostics::{UringCompletionDiagnostics, UringCompletionDiagnosticsSnapshot},
     driver::{
-        capability::{CapabilityState, CapabilityStateSnapshot},
         completion::CompletionEngine,
         context::{DriveContext, SubmitPort},
         control::{ControlPlaneEvent, UringControlPlane, UringWakerManager},
@@ -33,14 +28,17 @@ use crate::{
 };
 use veloq_driver_core::driver::{
     BufferRegistrationStatus, CancelRequest, CancelSubmitOutcome, CompletionToken, DriveMode,
-    DriveOutcome, DriverCapabilities, DriverCapability, DriverCompletionDiagnostics,
-    DriverCompletionDiagnosticsSnapshot, DriverRaw, DriverSubmitResult, OpToken, RegisterFd,
-    RemoteCancelSender, RemoteWaker, SharedCompletionTable, SharedSlotTable, SubmitStatus,
+    DriveOutcome, DriverCompletionDiagnostics, DriverCompletionDiagnosticsSnapshot, DriverRaw,
+    DriverSubmitResult, OpToken, RegisterFd, RemoteCancelSender, RemoteWaker,
+    SharedCompletionTable, SharedSlotTable, SubmitStatus, UdpReceiveOperationBuilder,
     registry::{OpEntry, OpHandle},
     sealed,
 };
+use veloq_driver_core::{
+    op::types::UdpRecvMulti,
+    platform::receive_pump::{ReceivePermitNotifier, ReceivePumpState, UdpReceiveConfig},
+};
 
-pub(crate) mod capability;
 pub(crate) mod completion;
 pub(crate) mod context;
 pub(crate) mod control;
@@ -57,27 +55,6 @@ mod protocol_model;
 pub use lifecycle::UringOpState;
 pub use registration::ProvidedBufferSnapshot;
 
-/// 从 opcode 探测结果得出乐观的能力集合。
-///
-/// 「乐观」是关键：opcode 在场只说明**可能**支持 multishot 变体，真正的判定推迟到第一次
-/// 提交（见 [`Driver::note_capability_rejected`]）。`provided_buffers` 不在此列——它不靠
-/// 猜：`register_buf_ring` 成功与否就是答案，而那要等池到位（见
-/// [`Driver::attach_buffer_pool`]），所以这里先记 `false`。
-fn probe_capabilities(probe: &Probe) -> DriverCapabilities {
-    DriverCapabilities {
-        accept_multi: probe.is_supported(opcode::Accept::<types::Fd>::CODE),
-        recv_multi: probe.is_supported(opcode::Recv::<types::Fd>::CODE),
-        provided_buffers: false,
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct SetupNegotiation {
-    requested_flags: u32,
-    rejected_flags: u32,
-    failure_errno: Option<i32>,
-}
-
 fn setup_report(
     kind: UringError,
     scope: &'static str,
@@ -87,12 +64,11 @@ fn setup_report(
 ) -> Report<UringError> {
     kind.io_report(scope, error)
         .with_ctx("setup_required_flags", policy.required().bits())
-        .with_ctx("setup_best_effort_flags", policy.best_effort().bits())
         .with_ctx("setup_disabled_flags", policy.disabled().bits())
         .with_ctx("setup_mode", format!("{mode:?}"))
 }
 
-fn build_negotiated_ring(config: &UringConfig) -> UringResult<(IoUring, SetupNegotiation)> {
+fn build_ring(config: &UringConfig) -> UringResult<IoUring> {
     let mut policy = config.setup_policy;
     if let IoMode::Polling(_) = config.mode {
         policy = policy.with_required(SetupFlags::SQPOLL);
@@ -107,128 +83,22 @@ fn build_negotiated_ring(config: &UringConfig) -> UringResult<(IoUring, SetupNeg
         )
     })?;
 
-    let entries = config.entries.get();
-    let base = IoUring::from_config(RingConfig::new(entries)).map_err(|error| {
-        setup_report(
-            UringError::DriverInit,
-            "driver.new.build_base_ring",
-            error,
-            policy,
-            config.mode,
-        )
-    })?;
-    let baseline_capabilities = base.params().capabilities();
-    let requested = policy.requested();
-    if requested.is_empty() {
-        debug!(
-            baseline_setup_flags = baseline_capabilities.setup_flags,
-            "created io_uring base setup profile"
-        );
-        return Ok((base, SetupNegotiation::default()));
-    }
-
-    let profile = RingConfig::new(entries)
+    let profile = RingConfig::new(config.entries.get())
         .with_setup_policy(policy)
         .with_sq_thread_idle(match config.mode {
             IoMode::Polling(idle_ms) => idle_ms.get(),
             IoMode::Interrupt => 0,
         });
-    let full_error = match IoUring::from_config(profile) {
-        Ok(ring) => {
-            drop(base);
-            return Ok((
-                ring,
-                SetupNegotiation {
-                    requested_flags: requested.bits(),
-                    ..SetupNegotiation::default()
-                },
-            ));
-        }
-        Err(error) => error,
-    };
-    let full_errno = full_error.raw_os_error();
-
-    let negotiable = [
-        SetupFlags::COOP_TASKRUN,
-        SetupFlags::SINGLE_ISSUER,
-        SetupFlags::DEFER_TASKRUN,
-    ];
-    let mut selected_ring = None;
-    let mut selected_count = 0;
-    for subset in 0_u32..(1_u32 << negotiable.len()) {
-        let mut best_effort = SetupFlags::EMPTY;
-        for (index, flag) in negotiable.iter().enumerate() {
-            if subset & (1_u32 << index) != 0 && policy.best_effort().contains(*flag) {
-                best_effort = best_effort.union(*flag);
-            }
-        }
-        if best_effort == policy.best_effort() {
-            continue;
-        }
-        let candidate_policy = SetupPolicy::new(policy.required(), best_effort, policy.disabled());
-        let candidate = RingConfig::new(entries)
-            .with_setup_policy(candidate_policy)
-            .with_sq_thread_idle(match config.mode {
-                IoMode::Polling(idle_ms) => idle_ms.get(),
-                IoMode::Interrupt => 0,
-            });
-        if let Ok(ring) = IoUring::from_config(candidate) {
-            let count = best_effort.bits().count_ones();
-            if count > selected_count {
-                selected_ring = Some(ring);
-                selected_count = count;
-            }
-        }
-    }
-
-    if let Some(ring) = selected_ring {
-        let accepted = SetupFlags::from_bits_retain(ring.params().setup_flags());
-        let rejected = requested.difference(accepted);
-        drop(base);
-        return Ok((
-            ring,
-            SetupNegotiation {
-                requested_flags: requested.bits(),
-                rejected_flags: rejected.bits(),
-                failure_errno: full_errno,
-            },
-        ));
-    }
-
-    if policy.required().is_empty() {
-        let rejected = requested.difference(SetupFlags::from_bits_retain(
-            baseline_capabilities.setup_flags,
-        ));
-        debug!(
-            requested_setup_flags = requested.bits(),
-            rejected_setup_flags = rejected.bits(),
-            errno = ?full_errno,
-            "falling back to the io_uring base setup profile"
-        );
-        return Ok((
-            base,
-            SetupNegotiation {
-                requested_flags: requested.bits(),
-                rejected_flags: rejected.bits(),
-                failure_errno: full_errno,
-            },
-        ));
-    }
-
-    let kind = if matches!(config.mode, IoMode::Polling(_))
-        && policy.required().contains(SetupFlags::SQPOLL)
-    {
-        UringError::PollingUnavailable
-    } else {
-        UringError::DriverInit
-    };
-    Err(setup_report(
-        kind,
-        "driver.new.build_setup_profile",
-        full_error,
-        policy,
-        config.mode,
-    ))
+    IoUring::from_config(profile).map_err(|error| {
+        let kind = if matches!(config.mode, IoMode::Polling(_))
+            && policy.required().contains(SetupFlags::SQPOLL)
+        {
+            UringError::PollingUnavailable
+        } else {
+            UringError::DriverInit
+        };
+        setup_report(kind, "driver.new.build_ring", error, policy, config.mode)
+    })
 }
 
 pub struct UringDriver<'a> {
@@ -244,9 +114,7 @@ pub struct UringDriver<'a> {
     completion_table: SharedCompletionTable<UringSlotSpec>,
 
     control: UringControlPlane,
-    setup_negotiation: SetupNegotiation,
     kernel_capabilities: KernelCapabilities,
-    capability_state: CapabilityState,
     // Component owners keep submission, lifecycle, completion scratch and drive budgets out of
     // the public facade while preserving the existing protocol implementation.
     registration: RegistrationEngine<'a>,
@@ -271,7 +139,7 @@ impl<'a> UringDriver<'a> {
                     .report("driver.new.drive_limits", message)
                     .attach_note("all io_uring drive budgets must be bounded and non-zero")
             })?;
-        let (mut ring, setup_negotiation) = build_negotiated_ring(config)?;
+        let ring = build_ring(config)?;
 
         let operations = OperationLedger::new(entries as usize);
         let completion_table: SharedCompletionTable<UringSlotSpec> = operations.shared_table();
@@ -280,26 +148,7 @@ impl<'a> UringDriver<'a> {
         let waker = UringWakerManager::new()?;
         let ring_lifetime = RingLifetimeOwner::new();
 
-        // opcode 探测只能回答「这个 opcode 存在吗」，回答不了「它的 multishot 变体存在
-        // 吗」——那是同一个 opcode 上后加的标志位。所以这里只排除掉真正缺 opcode 的内核，
-        // 剩下的由第一次提交去问（`note_capability_rejected`）。
-        let mut ring_probe = Probe::new();
-        let mut kernel_capabilities = ring.params().capabilities();
-        let probe_error = match ring.submitter().register_probe(&mut ring_probe) {
-            Ok(()) => {
-                kernel_capabilities = kernel_capabilities.with_probe(&ring_probe);
-                None
-            }
-            Err(error) => {
-                let errno = error.raw_os_error().unwrap_or(libc::EIO);
-                kernel_capabilities = kernel_capabilities.with_probe_error(errno);
-                Some(errno)
-            }
-        };
-        if probe_error.is_some() {
-            debug!("IORING_REGISTER_PROBE unavailable; assuming no optional opcodes");
-            ring_probe = Probe::new();
-        }
+        let kernel_capabilities = ring.params().capabilities();
         debug!("Initalized UringDriver with {} entries", entries);
 
         let mut driver = Self {
@@ -312,12 +161,10 @@ impl<'a> UringDriver<'a> {
                 waker,
                 (entries as usize).saturating_mul(2).saturating_add(1),
             ),
-            setup_negotiation,
             kernel_capabilities,
-            capability_state: CapabilityState::new(probe_capabilities(&ring_probe)),
             registration: RegistrationEngine::new(
                 config.registration_mode,
-                config.provided_buffers,
+                Some(config.provided_buffers),
                 registrar,
                 config.file_table_capacity,
                 config.file_table_exhaustion,
@@ -411,11 +258,6 @@ impl<'a> UringDriver<'a> {
             submission.submit_waker(&mut context)?;
         }
 
-        debug!(
-            capabilities = ?driver.capability_state_snapshot(),
-            "recorded io_uring capability snapshot"
-        );
-
         Ok(driver)
     }
 
@@ -441,47 +283,6 @@ impl<'a> UringDriver<'a> {
         &self,
     ) -> DriverCompletionDiagnosticsSnapshot<UringCompletionDiagnosticsSnapshot> {
         self.completion_diagnostics.snapshot()
-    }
-
-    /// Returns the effective capability snapshot currently used by new operations.
-    pub fn capability_snapshot(&self) -> UringCapabilitySnapshot {
-        self.capability_snapshot_for(self.capability_state.effective())
-    }
-
-    /// Returns the immutable capability baseline observed during ring setup and probing.
-    pub fn capability_baseline(&self) -> UringCapabilitySnapshot {
-        self.capability_snapshot_for(self.capability_state.baseline())
-    }
-
-    /// Returns the capability set accepted by setup and resource negotiation.
-    pub fn negotiated_capabilities(&self) -> DriverCapabilities {
-        self.capability_state.negotiated()
-    }
-
-    /// Returns the capability set that is safe for new operations now.
-    pub fn effective_capabilities(&self) -> DriverCapabilities {
-        self.capability_state.effective()
-    }
-
-    /// Returns baseline, negotiated, effective capabilities and disable reasons together.
-    pub fn capability_state_snapshot(&self) -> CapabilityStateSnapshot {
-        self.capability_state.snapshot()
-    }
-
-    fn capability_snapshot_for(&self, capabilities: DriverCapabilities) -> UringCapabilitySnapshot {
-        UringCapabilitySnapshot::new(
-            self.kernel_capabilities,
-            capabilities,
-            UringSetupSnapshot {
-                requested_flags: self.setup_negotiation.requested_flags,
-                rejected_flags: self.setup_negotiation.rejected_flags,
-                failure_errno: self.setup_negotiation.failure_errno,
-            },
-            self.registration.fixed_buffers_available(),
-            self.registration.fixed_buffers_failure_errno(),
-            capabilities.provided_buffers,
-            self.registration.provided_buffers_failure_errno(),
-        )
     }
 }
 
@@ -558,6 +359,40 @@ impl<'a> Drop for UringDriver<'a> {
 }
 
 impl<'a> sealed::Sealed for UringDriver<'a> {}
+
+impl<'a> UdpReceiveOperationBuilder for UringDriver<'a> {
+    type BuildError = UringError;
+
+    fn build_udp_recv_multi(
+        &mut self,
+        fd: IoFd,
+        config: UdpReceiveConfig,
+        _buffer_pool: AnyBufPool,
+    ) -> UringResult<UdpRecvMulti<Self::Raw>> {
+        let config = config.validate().map_err(|error| {
+            UringError::InvalidInput
+                .report(
+                    "uring.udp_recv_multi.build",
+                    "invalid UDP receive configuration",
+                )
+                .with_ctx("build_error", format!("{error:?}"))
+        })?;
+        let waker = self.create_waker_raw();
+        let notifier: Arc<dyn ReceivePermitNotifier> = Arc::new(move || {
+            let _ = waker.wake();
+        });
+        let pump = ReceivePumpState::try_new_multishot(config.into_pump_config(), Some(notifier))
+            .map_err(|error| {
+            UringError::InvalidInput
+                .report(
+                    "uring.udp_recv_multi.build",
+                    "failed to create receive pump",
+                )
+                .with_ctx("receive_pump_error", format!("{error:?}"))
+        })?;
+        Ok(UdpRecvMulti::from_backend(fd, pump))
+    }
+}
 
 impl<'a> DriverRaw for UringDriver<'a> {
     type SlotSpec = UringSlotSpec;
@@ -672,7 +507,6 @@ impl<'a> DriverRaw for UringDriver<'a> {
                 registration,
                 completion_table,
                 completion_diagnostics,
-                capability_state,
                 ring,
                 kernel_capabilities,
                 submission,
@@ -687,7 +521,6 @@ impl<'a> DriverRaw for UringDriver<'a> {
                 registration,
                 completion_table,
                 completion_diagnostics,
-                capability_state,
                 ring,
                 kernel_capabilities,
             );
@@ -728,7 +561,6 @@ impl<'a> DriverRaw for UringDriver<'a> {
             registration,
             completion_table,
             completion_diagnostics,
-            capability_state,
             ring,
             kernel_capabilities,
             submission,
@@ -742,7 +574,6 @@ impl<'a> DriverRaw for UringDriver<'a> {
             registration,
             completion_table,
             completion_diagnostics,
-            capability_state,
             ring,
             kernel_capabilities,
         );
@@ -802,43 +633,15 @@ impl<'a> DriverRaw for UringDriver<'a> {
 
     /// 用刚建好的 worker 池注册 provided buffer 环。
     ///
-    /// 注册失败**不是**驱动初始化失败：`IORING_REGISTER_PBUF_RING` 要 5.19，而仓库声明的
-    /// 最低内核是 5.6。失败就把能力留在 `false`，门面层据此拒绝那些需要它的操作，其余一切
-    /// 照旧。
+    /// 注册失败会保留真实资源错误；需要 provided buffer 的具体操作在提交时返回该错误，
+    /// 不会回退到普通 buffer 接收。
     fn attach_buffer_pool_raw(&mut self, pool: AnyBufPool) -> UringResult<()> {
-        if self.registration.attach_buffer_pool(
+        self.registration.attach_buffer_pool(
             &self.ring.submitter(),
             pool,
             self.ring_lifetime.token(),
-        )? {
-            let mut negotiated = self.capability_state.negotiated();
-            negotiated.provided_buffers = self.registration.provided_buffers_enabled();
-            self.capability_state.set_negotiated(negotiated);
-            self.capability_state
-                .enable_negotiated(DriverCapability::ProvidedBuffers);
-        }
+        )?;
         Ok(())
-    }
-
-    fn capabilities_raw(&self) -> DriverCapabilities {
-        self.capability_state.effective()
-    }
-
-    fn note_capability_rejected_raw(&mut self, capability: DriverCapability) {
-        let effective = self.capability_state.effective();
-        let enabled = match capability {
-            DriverCapability::AcceptMulti => effective.accept_multi,
-            DriverCapability::RecvMulti => effective.recv_multi,
-            DriverCapability::ProvidedBuffers => effective.provided_buffers,
-        };
-        if enabled {
-            debug!(
-                ?capability,
-                "kernel rejected an optional capability; disabling it"
-            );
-            self.capability_state
-                .disable(capability, "kernel_rejected", None);
-        }
     }
 }
 
