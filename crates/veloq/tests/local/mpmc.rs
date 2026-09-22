@@ -21,7 +21,7 @@ where
 #[test]
 fn test_unbounded_basic() {
     run_test(async |ctx| {
-        let state = mpmc::unbounded();
+        let state = mpmc::borrowed_unbounded();
         let (tx, rx) = state.split();
 
         scope_local!(ctx, async |s| {
@@ -48,7 +48,7 @@ fn test_unbounded_basic() {
 #[test]
 fn test_bounded_basic() {
     run_test(async |ctx| {
-        let state = mpmc::bounded(5);
+        let state = mpmc::borrowed_bounded(5);
         let (tx, rx) = state.split();
 
         scope_local!(ctx, async |s| {
@@ -71,7 +71,7 @@ fn test_bounded_basic() {
 #[test]
 fn test_multiple_producers_consumers() {
     run_test(async |ctx| {
-        let state = mpmc::bounded(2);
+        let state = mpmc::borrowed_bounded(2);
         let (tx, rx) = state.split();
 
         use veloq_std::{cell::RefCell, rc::Rc};
@@ -128,7 +128,7 @@ fn test_multiple_producers_consumers() {
 #[test]
 fn test_sender_drop_closes_channel() {
     run_test(async |ctx| {
-        let state = mpmc::unbounded::<()>();
+        let state = mpmc::borrowed_unbounded::<()>();
         let (tx, rx) = state.split();
         scope_local!(ctx, async |s| {
             s.spawn_boxed_local(async move {
@@ -145,7 +145,7 @@ fn test_sender_drop_closes_channel() {
 #[test]
 fn test_receiver_drop_errors_sender() {
     run_test(async |ctx| {
-        let state = mpmc::bounded::<i32>(1);
+        let state = mpmc::borrowed_bounded::<i32>(1);
         let (tx, rx) = state.split();
 
         tx.send(1).await.unwrap();
@@ -170,7 +170,7 @@ fn test_receiver_drop_errors_sender() {
 #[test]
 fn test_bounded_backpressure() {
     run_test(async |ctx| {
-        let state = mpmc::bounded(1);
+        let state = mpmc::borrowed_bounded(1);
         let (tx, rx) = state.split();
 
         scope_local!(ctx, async |s| {
@@ -199,7 +199,7 @@ fn test_stream_conversion() {
     use veloq_std::pin::Pin;
 
     run_test(async |ctx| {
-        let state = mpmc::unbounded();
+        let state = mpmc::borrowed_unbounded();
         let (tx, rx) = state.split();
 
         scope_local!(ctx, async |s| {
@@ -227,7 +227,7 @@ fn test_stream_conversion() {
 #[test]
 fn test_try_recv() {
     run_test(async |_ctx| {
-        let state = mpmc::unbounded();
+        let state = mpmc::borrowed_unbounded();
         let (tx, rx) = state.split();
 
         assert_eq!(rx.try_recv(), Err(mpmc::TryRecvError::Empty));
@@ -245,7 +245,7 @@ fn test_try_recv() {
 #[test]
 fn test_owned_mpmc() {
     run_test(async |ctx| {
-        let (tx, rx) = mpmc::owned_bounded(5);
+        let (tx, rx) = mpmc::bounded(5);
 
         scope_local!(ctx, async |s| {
             // Clone sender and receiver

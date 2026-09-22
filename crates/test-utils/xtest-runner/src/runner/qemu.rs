@@ -136,6 +136,11 @@ impl WindowsVmConfig {
             }
 
             if !quiet {
+                eprintln!("[xtest-runner] 正在清理虚拟机内工作区代码以准备保存差分镜像...");
+            }
+            vm.clean_workspace(quiet)?;
+
+            if !quiet {
                 eprintln!("[xtest-runner] 正在关闭虚拟机以保存差分镜像...");
             }
             vm.shutdown_and_wait(Duration::from_secs(120))?;
@@ -202,7 +207,8 @@ impl QemuInstance {
             cmd.args(["-accel", "tcg"]);
         }
 
-        cmd.args(["-smp", "4"]);
+        let cpus = num_cpus::get().max(1);
+        cmd.args(["-smp", &cpus.to_string()]);
         cmd.args(["-m", "4096"]);
         cmd.args([
             "-drive",
@@ -233,30 +239,35 @@ impl QemuInstance {
         })
     }
 
+    fn base_ssh_command(&self, connect_timeout_secs: u64) -> Command {
+        let mut cmd = Command::new("sshpass");
+        cmd.args([
+            "-p",
+            &self.config.password,
+            "ssh",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            &format!("ConnectTimeout={connect_timeout_secs}"),
+            "-o",
+            "LogLevel=ERROR",
+            "-p",
+            &self.host_port.to_string(),
+            &format!("{}@127.0.0.1", self.config.username),
+        ]);
+        cmd
+    }
+
     pub fn wait_for_ssh(&self) -> Result<(), RunnerError> {
         let start = Instant::now();
         let timeout = Duration::from_secs(60);
         let poll_interval = Duration::from_millis(500);
 
         while start.elapsed() < timeout {
-            let mut cmd = Command::new("sshpass");
-            cmd.args([
-                "-p",
-                &self.config.password,
-                "ssh",
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                "UserKnownHostsFile=/dev/null",
-                "-o",
-                "ConnectTimeout=2",
-                "-o",
-                "LogLevel=ERROR",
-                "-p",
-                &self.host_port.to_string(),
-                &format!("{}@127.0.0.1", self.config.username),
-                "echo ready",
-            ]);
+            let mut cmd = self.base_ssh_command(2);
+            cmd.arg("echo ready");
             cmd.stdout(Stdio::null());
             cmd.stderr(Stdio::null());
 
@@ -271,6 +282,24 @@ impl QemuInstance {
         Err(RunnerError::VmSshTimeout)
     }
 
+    pub fn clean_workspace(&self, quiet: bool) -> Result<(), RunnerError> {
+        let clean_cmd = "powershell -Command \"Set-Location C:\\; if (Test-Path 'C:\\workspace') { cmd.exe /c rd /s /q C:\\workspace; if (Test-Path 'C:\\workspace') { Remove-Item -Path 'C:\\workspace' -Recurse -Force } }; if (Test-Path 'C:\\workspace') { exit 1 }\"";
+        let mut cmd = self.base_ssh_command(2);
+        cmd.arg(clean_cmd);
+
+        let output = cmd.output()?;
+        if !output.status.success() {
+            if !quiet {
+                print_output(&output);
+            }
+            return Err(RunnerError::VmCleanWorkspaceFailed {
+                code: output.status.code(),
+            });
+        }
+
+        Ok(())
+    }
+
     pub fn sync_workspace(&self, workspace_root: &Path) -> Result<(), RunnerError> {
         let mut tar_child = Command::new("tar")
             .args(["--exclude=image", "--exclude=target", "-cf", "-", "."])
@@ -283,22 +312,9 @@ impl QemuInstance {
             .take()
             .ok_or_else(|| Error::new(ErrorKind::BrokenPipe, "无法获取 tar stdout"))?;
 
-        let mut ssh_child = Command::new("sshpass")
-            .args([
-                "-p",
-                &self.config.password,
-                "ssh",
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                "UserKnownHostsFile=/dev/null",
-                "-o",
-                "LogLevel=ERROR",
-                "-p",
-                &self.host_port.to_string(),
-                &format!("{}@127.0.0.1", self.config.username),
-                "powershell -Command \"if (-not (Test-Path 'C:\\workspace')) { New-Item -ItemType Directory -Path 'C:\\workspace' | Out-Null }; tar -xf - -C C:\\workspace\"",
-            ])
+        let mut ssh_cmd = self.base_ssh_command(2);
+        let mut ssh_child = ssh_cmd
+            .arg("powershell -Command \"Set-Location C:\\; if (Test-Path 'C:\\workspace') { cmd.exe /c rd /s /q C:\\workspace; if (Test-Path 'C:\\workspace') { Remove-Item -Path 'C:\\workspace' -Recurse -Force } }; if (-not (Test-Path 'C:\\workspace')) { New-Item -ItemType Directory -Path 'C:\\workspace' | Out-Null }; tar -xf - -C C:\\workspace\"")
             .stdin(tar_stdout)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -326,24 +342,8 @@ impl QemuInstance {
             "powershell -Command \"Set-Location C:\\workspace; {command}; exit $LASTEXITCODE\""
         );
 
-        let mut cmd = Command::new("sshpass");
-        cmd.args([
-            "-p",
-            &self.config.password,
-            "ssh",
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-o",
-            "ConnectTimeout=2",
-            "-o",
-            "LogLevel=ERROR",
-            "-p",
-            &self.host_port.to_string(),
-            &format!("{}@127.0.0.1", self.config.username),
-            &vm_cmd,
-        ]);
+        let mut cmd = self.base_ssh_command(2);
+        cmd.arg(&vm_cmd);
 
         if quiet {
             Ok(cmd.output()?)
@@ -369,24 +369,8 @@ impl QemuInstance {
     }
 
     pub fn shutdown_and_wait(mut self, timeout: Duration) -> Result<(), RunnerError> {
-        let mut cmd = Command::new("sshpass");
-        cmd.args([
-            "-p",
-            &self.config.password,
-            "ssh",
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-o",
-            "ConnectTimeout=5",
-            "-o",
-            "LogLevel=ERROR",
-            "-p",
-            &self.host_port.to_string(),
-            &format!("{}@127.0.0.1", self.config.username),
-            "shutdown /s /t 0",
-        ]);
+        let mut cmd = self.base_ssh_command(5);
+        cmd.arg("shutdown /s /t 0");
         let _ = cmd.status();
 
         let start = Instant::now();

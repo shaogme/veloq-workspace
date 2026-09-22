@@ -38,13 +38,13 @@ impl<T> State<T> {
     }
 
     /// Splits the state into a borrowed sender and a borrowed receiver.
-    pub fn split(&self) -> (Sender<'_, T>, Receiver<'_, T>) {
+    pub fn split(&self) -> (BorrowedSender<'_, T>, BorrowedReceiver<'_, T>) {
         self.receiver_count.store(1, Ordering::Release);
         self.is_closed.store(false, Ordering::Release);
         let version = self.version.load(Ordering::Acquire);
         (
-            Sender { state: self },
-            Receiver {
+            BorrowedSender { state: self },
+            BorrowedReceiver {
                 state: self,
                 version,
             },
@@ -199,14 +199,14 @@ impl<T: fmt::Display> fmt::Display for Ref<'_, T> {
 }
 
 /// The sender half of a borrowed watch channel.
-pub struct Sender<'a, T> {
+pub struct BorrowedSender<'a, T> {
     state: &'a State<T>,
 }
 
-unsafe impl<T: Send + Sync> Send for Sender<'_, T> {}
-unsafe impl<T: Send + Sync> Sync for Sender<'_, T> {}
+unsafe impl<T: Send + Sync> Send for BorrowedSender<'_, T> {}
+unsafe impl<T: Send + Sync> Sync for BorrowedSender<'_, T> {}
 
-impl<'a, T> Sender<'a, T> {
+impl<'a, T> BorrowedSender<'a, T> {
     /// Sends a new value over the channel.
     pub fn send(&self, value: T) -> Result<(), SendError<T>> {
         self.state.send(value)
@@ -228,10 +228,10 @@ impl<'a, T> Sender<'a, T> {
     }
 
     /// Creates a new receiver subscribed to this channel.
-    pub fn subscribe(&self) -> Receiver<'a, T> {
+    pub fn subscribe(&self) -> BorrowedReceiver<'a, T> {
         self.state.receiver_count.fetch_add(1, Ordering::AcqRel);
         let version = self.state.version.load(Ordering::Acquire);
-        Receiver {
+        BorrowedReceiver {
             state: self.state,
             version,
         }
@@ -253,16 +253,16 @@ impl<'a, T> Sender<'a, T> {
     }
 }
 
-impl<T> Drop for Sender<'_, T> {
+impl<T> Drop for BorrowedSender<'_, T> {
     fn drop(&mut self) {
         self.state.is_closed.store(true, Ordering::Release);
         self.state.rx_notify.notify_waiters();
     }
 }
 
-impl<T> fmt::Debug for Sender<'_, T> {
+impl<T> fmt::Debug for BorrowedSender<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Sender")
+        f.debug_struct("BorrowedSender")
             .field("receiver_count", &self.receiver_count())
             .field("is_closed", &self.is_closed())
             .finish()
@@ -270,15 +270,15 @@ impl<T> fmt::Debug for Sender<'_, T> {
 }
 
 /// The receiver half of a borrowed watch channel.
-pub struct Receiver<'a, T> {
+pub struct BorrowedReceiver<'a, T> {
     state: &'a State<T>,
     version: usize,
 }
 
-unsafe impl<T: Send + Sync> Send for Receiver<'_, T> {}
-unsafe impl<T: Send + Sync> Sync for Receiver<'_, T> {}
+unsafe impl<T: Send + Sync> Send for BorrowedReceiver<'_, T> {}
+unsafe impl<T: Send + Sync> Sync for BorrowedReceiver<'_, T> {}
 
-impl<'a, T> Receiver<'a, T> {
+impl<'a, T> BorrowedReceiver<'a, T> {
     /// Borrows the current value without updating the seen version.
     pub fn borrow(&self) -> Ref<'_, T> {
         self.state.borrow()
@@ -315,7 +315,7 @@ impl<'a, T> Receiver<'a, T> {
     }
 }
 
-impl<'a, T> Clone for Receiver<'a, T> {
+impl<'a, T> Clone for BorrowedReceiver<'a, T> {
     fn clone(&self) -> Self {
         self.state.receiver_count.fetch_add(1, Ordering::AcqRel);
         Self {
@@ -325,7 +325,7 @@ impl<'a, T> Clone for Receiver<'a, T> {
     }
 }
 
-impl<T> Drop for Receiver<'_, T> {
+impl<T> Drop for BorrowedReceiver<'_, T> {
     fn drop(&mut self) {
         let prev = self.state.receiver_count.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
@@ -334,23 +334,23 @@ impl<T> Drop for Receiver<'_, T> {
     }
 }
 
-impl<T> fmt::Debug for Receiver<'_, T> {
+impl<T> fmt::Debug for BorrowedReceiver<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Receiver")
+        f.debug_struct("BorrowedReceiver")
             .field("version", &self.version)
             .finish()
     }
 }
 
-/// An owned sender for a watch channel.
-pub struct OwnedSender<T> {
+/// A sender for a watch channel.
+pub struct Sender<T> {
     state: Arc<State<T>>,
 }
 
-unsafe impl<T: Send + Sync> Send for OwnedSender<T> {}
-unsafe impl<T: Send + Sync> Sync for OwnedSender<T> {}
+unsafe impl<T: Send + Sync> Send for Sender<T> {}
+unsafe impl<T: Send + Sync> Sync for Sender<T> {}
 
-impl<T> OwnedSender<T> {
+impl<T> Sender<T> {
     /// Sends a new value over the channel.
     pub fn send(&self, value: T) -> Result<(), SendError<T>> {
         self.state.send(value)
@@ -372,10 +372,10 @@ impl<T> OwnedSender<T> {
     }
 
     /// Creates a new subscribed receiver.
-    pub fn subscribe(&self) -> OwnedReceiver<T> {
+    pub fn subscribe(&self) -> Receiver<T> {
         self.state.receiver_count.fetch_add(1, Ordering::AcqRel);
         let version = self.state.version.load(Ordering::Acquire);
-        OwnedReceiver {
+        Receiver {
             state: self.state.clone(),
             version,
         }
@@ -397,32 +397,32 @@ impl<T> OwnedSender<T> {
     }
 }
 
-impl<T> Drop for OwnedSender<T> {
+impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         self.state.is_closed.store(true, Ordering::Release);
         self.state.rx_notify.notify_waiters();
     }
 }
 
-impl<T> fmt::Debug for OwnedSender<T> {
+impl<T> fmt::Debug for Sender<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OwnedSender")
+        f.debug_struct("Sender")
             .field("receiver_count", &self.receiver_count())
             .field("is_closed", &self.is_closed())
             .finish()
     }
 }
 
-/// An owned receiver for a watch channel.
-pub struct OwnedReceiver<T> {
+/// A receiver for a watch channel.
+pub struct Receiver<T> {
     state: Arc<State<T>>,
     version: usize,
 }
 
-unsafe impl<T: Send + Sync> Send for OwnedReceiver<T> {}
-unsafe impl<T: Send + Sync> Sync for OwnedReceiver<T> {}
+unsafe impl<T: Send + Sync> Send for Receiver<T> {}
+unsafe impl<T: Send + Sync> Sync for Receiver<T> {}
 
-impl<T> OwnedReceiver<T> {
+impl<T> Receiver<T> {
     /// Borrows the current value without updating the seen version.
     pub fn borrow(&self) -> Ref<'_, T> {
         self.state.borrow()
@@ -459,7 +459,7 @@ impl<T> OwnedReceiver<T> {
     }
 }
 
-impl<T> Clone for OwnedReceiver<T> {
+impl<T> Clone for Receiver<T> {
     fn clone(&self) -> Self {
         self.state.receiver_count.fetch_add(1, Ordering::AcqRel);
         Self {
@@ -469,7 +469,7 @@ impl<T> Clone for OwnedReceiver<T> {
     }
 }
 
-impl<T> Drop for OwnedReceiver<T> {
+impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         let prev = self.state.receiver_count.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
@@ -478,28 +478,28 @@ impl<T> Drop for OwnedReceiver<T> {
     }
 }
 
-impl<T> fmt::Debug for OwnedReceiver<T> {
+impl<T> fmt::Debug for Receiver<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OwnedReceiver")
+        f.debug_struct("Receiver")
             .field("version", &self.version)
             .finish()
     }
 }
 
-/// Creates a new watch channel returning an owned sender and receiver pair.
-pub fn channel<T>(init: T) -> (OwnedSender<T>, OwnedReceiver<T>) {
+/// Creates a new watch channel returning a sender and receiver pair.
+pub fn channel<T>(init: T) -> (Sender<T>, Receiver<T>) {
     let state = Arc::new(State::new(init));
     state.receiver_count.store(1, Ordering::Release);
     let version = state.version.load(Ordering::Acquire);
     (
-        OwnedSender {
+        Sender {
             state: state.clone(),
         },
-        OwnedReceiver { state, version },
+        Receiver { state, version },
     )
 }
 
-/// Creates a new owned watch channel returning an owned sender and receiver pair.
-pub fn owned_channel<T>(init: T) -> (OwnedSender<T>, OwnedReceiver<T>) {
-    channel(init)
+/// Creates a new borrowed watch channel state.
+pub fn borrowed_channel<T>(init: T) -> State<T> {
+    State::new(init)
 }

@@ -9,7 +9,7 @@ fn loom_mpsc_unbounded_recv_async() {
     let mut builder = loom::model::Builder::new();
     builder.preemption_bound = Some(3);
     builder.check(|| {
-        let (tx, mut rx) = mpsc::owned_unbounded();
+        let (tx, mut rx) = mpsc::unbounded();
 
         // Thread 1: Sends data
         let h1 = thread::spawn(move || {
@@ -34,7 +34,7 @@ fn loom_mpsc_bounded_async_send() {
     let mut builder = loom::model::Builder::new();
     builder.preemption_bound = Some(3);
     builder.check(|| {
-        let (tx, mut rx) = mpsc::owned_bounded::<usize>(1);
+        let (tx, mut rx) = mpsc::bounded::<usize>(1);
 
         let h1 = thread::spawn(move || {
             block_on(async move {

@@ -3,7 +3,7 @@ use veloq::{
     net::UdpSocket,
     runtime::{Outcome, context::Ctx, scope, select},
     std::result::Result as StdResult,
-    sync::{TryRecvError, mpmc::owned_bounded},
+    sync::{TryRecvError, mpmc::bounded},
     time::sleep,
 };
 
@@ -64,14 +64,14 @@ impl<'rt> Driver<'rt> {
         };
         trace!(target: "veloq_reliable_udp::endpoint", "endpoint driver started");
         let config = self.state.config().clone();
-        let (inbound_tx, inbound_rx) = owned_bounded(config.inbound_capacity.get());
-        let (outbound_tx, outbound_rx) = owned_bounded(config.outbound_capacity.get());
+        let (inbound_tx, inbound_rx) = bounded(config.inbound_capacity.get());
+        let (outbound_tx, outbound_rx) = bounded(config.outbound_capacity.get());
         let event_capacity = config
             .outbound_capacity
             .get()
             .checked_add(config.max_connections.get())
             .ok_or(Error::Io)?;
-        let (pump_tx, pump_rx) = owned_bounded(event_capacity);
+        let (pump_tx, pump_rx) = bounded(event_capacity);
         let ctx = self.ctx;
         let receive_socket = socket.clone();
         let send_socket = socket.clone();

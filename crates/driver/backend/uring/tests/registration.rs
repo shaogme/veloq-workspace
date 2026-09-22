@@ -1,4 +1,5 @@
 #![cfg(not(feature = "loom"))]
+#![cfg(any(target_os = "linux", target_os = "android"))]
 
 use veloq_std::{
     array,

@@ -27,7 +27,7 @@ where
 #[test]
 fn test_sync_mpmc_unbounded_simple() {
     run_test(async |_ctx| {
-        let state = mpmc::unbounded();
+        let state = mpmc::borrowed_unbounded();
         let (tx, rx) = state.split();
 
         tx.send(1).await.unwrap();
@@ -43,7 +43,7 @@ fn test_sync_mpmc_unbounded_simple() {
 #[test]
 fn test_sync_mpmc_unbounded_concurrent() {
     run_test(async |ctx| {
-        let state = mpmc::unbounded();
+        let state = mpmc::borrowed_unbounded();
         let (tx, rx) = state.split();
         let count = 100;
 
@@ -78,7 +78,7 @@ fn test_sync_mpmc_unbounded_concurrent() {
 #[test]
 fn test_sync_mpmc_bounded_capacity() {
     run_test(async |ctx| {
-        let state = mpmc::bounded(1);
+        let state = mpmc::borrowed_bounded(1);
         let (tx, rx) = state.split();
 
         tx.send(1).await.unwrap();
@@ -102,7 +102,7 @@ fn test_sync_mpmc_bounded_capacity() {
 #[test]
 fn test_sync_mpmc_bounded_multi_consumer() {
     run_test(async |ctx| {
-        let state = mpmc::bounded(5);
+        let state = mpmc::borrowed_bounded(5);
         let (tx, rx) = state.split();
 
         for i in 0..5 {
@@ -131,7 +131,7 @@ fn test_sync_mpmc_bounded_multi_consumer() {
 #[test]
 fn test_sync_mpmc_try_send_recv() {
     run_test(async |_ctx| {
-        let state = mpmc::bounded(1);
+        let state = mpmc::borrowed_bounded(1);
         let (tx, rx) = state.split();
 
         tx.try_send(1).unwrap();

@@ -35,12 +35,12 @@ pub struct State<T> {
 }
 
 /// Oneshot 通道发送端
-pub struct Sender<'a, T> {
+pub struct BorrowedSender<'a, T> {
     state: &'a State<T>,
 }
 
 /// Oneshot 通道接收端
-pub struct Receiver<'a, T> {
+pub struct BorrowedReceiver<'a, T> {
     state: &'a State<T>,
 }
 
@@ -62,17 +62,20 @@ impl<T> State<T> {
     }
 
     /// 分离为发送端和接收端
-    pub fn split(&self) -> (Sender<'_, T>, Receiver<'_, T>) {
-        (Sender { state: self }, Receiver { state: self })
+    pub fn split(&self) -> (BorrowedSender<'_, T>, BorrowedReceiver<'_, T>) {
+        (
+            BorrowedSender { state: self },
+            BorrowedReceiver { state: self },
+        )
     }
 }
 
 /// 创建一个新的 oneshot 通道状态
-pub const fn channel<T>() -> State<T> {
+pub const fn borrowed_channel<T>() -> State<T> {
     State::new()
 }
 
-impl<'a, T> Sender<'a, T> {
+impl<'a, T> BorrowedSender<'a, T> {
     /// 发送消息
     ///
     /// 成功时返回 `Ok(())`，如果接收端已关闭则返回 `Err(t)`。
@@ -100,7 +103,7 @@ impl<'a, T> Sender<'a, T> {
     }
 }
 
-impl<'a, T> Drop for Sender<'a, T> {
+impl<'a, T> Drop for BorrowedSender<'a, T> {
     fn drop(&mut self) {
         let waker;
         {
@@ -121,7 +124,7 @@ impl<'a, T> Drop for Sender<'a, T> {
     }
 }
 
-impl<'a, T> Future for Receiver<'a, T> {
+impl<'a, T> Future for BorrowedReceiver<'a, T> {
     type Output = Result<T, RecvError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -142,7 +145,7 @@ impl<'a, T> Future for Receiver<'a, T> {
     }
 }
 
-impl<'a, T> Receiver<'a, T> {
+impl<'a, T> BorrowedReceiver<'a, T> {
     /// 尝试非阻塞接收
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
         let state = self.state;
@@ -165,107 +168,107 @@ impl<'a, T> Receiver<'a, T> {
     }
 }
 
-impl<'a, T> Drop for Receiver<'a, T> {
+impl<'a, T> Drop for BorrowedReceiver<'a, T> {
     fn drop(&mut self) {
         self.state.is_rx_closed.set(true);
     }
 }
 
-impl<'a, T> fmt::Debug for Sender<'a, T> {
+impl<'a, T> fmt::Debug for BorrowedSender<'a, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Sender").finish()
+        f.debug_struct("BorrowedSender").finish()
     }
 }
 
-impl<'a, T> fmt::Debug for Receiver<'a, T> {
+impl<'a, T> fmt::Debug for BorrowedReceiver<'a, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Receiver").finish()
+        f.debug_struct("BorrowedReceiver").finish()
     }
 }
 
-/// Owned oneshot channel sender.
-pub struct OwnedSender<T> {
+/// Oneshot channel sender.
+pub struct Sender<T> {
     state: ManuallyDrop<Rc<State<T>>>,
 }
 
-/// Owned oneshot channel receiver.
-pub struct OwnedReceiver<T> {
+/// Oneshot channel receiver.
+pub struct Receiver<T> {
     state: Rc<State<T>>,
 }
 
-/// Creates a new owned oneshot channel.
-pub fn owned_channel<T>() -> (OwnedSender<T>, OwnedReceiver<T>) {
+/// Creates a new oneshot channel.
+pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let state = Rc::new(State::new());
     (
-        OwnedSender {
+        Sender {
             state: ManuallyDrop::new(state.clone()),
         },
-        OwnedReceiver { state },
+        Receiver { state },
     )
 }
 
-impl<T> OwnedSender<T> {
+impl<T> Sender<T> {
     /// Sends a value on the channel.
     pub fn send(self, t: T) -> Result<(), T> {
         let this = ManuallyDrop::new(self);
         let state = unsafe { ptr::read(&*this.state) };
-        let sender = Sender { state: &state };
+        let sender = BorrowedSender { state: &state };
         sender.send(t)
     }
 
     /// Checks if the receiver has been dropped.
     pub fn is_closed(&self) -> bool {
-        let sender = ManuallyDrop::new(Sender { state: &self.state });
+        let sender = ManuallyDrop::new(BorrowedSender { state: &self.state });
         sender.is_closed()
     }
 }
 
-impl<T> Drop for OwnedSender<T> {
+impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        drop(Sender { state: &self.state });
+        drop(BorrowedSender { state: &self.state });
         unsafe {
             ManuallyDrop::drop(&mut self.state);
         }
     }
 }
 
-impl<T> fmt::Debug for OwnedSender<T> {
+impl<T> fmt::Debug for Sender<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OwnedSender").finish()
+        f.debug_struct("Sender").finish()
     }
 }
 
-impl<T> OwnedReceiver<T> {
+impl<T> Receiver<T> {
     /// Attempts to receive a value without blocking.
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        let receiver = ManuallyDrop::new(Receiver { state: &self.state });
+        let receiver = ManuallyDrop::new(BorrowedReceiver { state: &self.state });
         receiver.try_recv()
     }
 
     /// Closes the receiver.
     pub fn close(&mut self) {
-        let mut receiver = ManuallyDrop::new(Receiver { state: &self.state });
+        let mut receiver = ManuallyDrop::new(BorrowedReceiver { state: &self.state });
         receiver.close();
     }
 }
 
-impl<T> Future for OwnedReceiver<T> {
+impl<T> Future for Receiver<T> {
     type Output = Result<T, RecvError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut receiver = ManuallyDrop::new(Receiver { state: &self.state });
+        let mut receiver = ManuallyDrop::new(BorrowedReceiver { state: &self.state });
         Pin::new(&mut *receiver).poll(cx)
     }
 }
 
-impl<T> Drop for OwnedReceiver<T> {
+impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        drop(Receiver { state: &self.state });
+        drop(BorrowedReceiver { state: &self.state });
     }
 }
 
-impl<T> fmt::Debug for OwnedReceiver<T> {
+impl<T> fmt::Debug for Receiver<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OwnedReceiver").finish()
+        f.debug_struct("Receiver").finish()
     }
 }

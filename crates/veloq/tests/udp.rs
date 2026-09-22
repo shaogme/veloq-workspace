@@ -88,7 +88,7 @@ fn udp_send_receive() {
 
         let addr1 = socket1.local_addr().expect("Failed to get addr1");
         let addr2 = socket2.local_addr().expect("Failed to get addr2");
-        let state = mpsc::unbounded::<()>();
+        let state = mpsc::borrowed_unbounded::<()>();
         let (tx, mut rx) = state.split();
         let mut receiver = socket1
             .receiver(udp_receive_config(1024))
@@ -140,7 +140,7 @@ fn udp_single_send_reaches_receiver_with_multiple_armed_receives_within_15s() {
 
         let completed = timeout_at(ctx, deadline, async {
             scope!(ctx, async |scope| {
-                let (ready_tx, mut ready_rx) = mpsc::owned_unbounded::<()>();
+                let (ready_tx, mut ready_rx) = mpsc::unbounded::<()>();
                 let relay_ready = ready_tx.clone();
                 let relay_task = scope.spawn_boxed(async move {
                     let mut receiver = relay
@@ -230,8 +230,8 @@ fn udp_echo() {
         let client = bind_udp_socket(ctx, "127.0.0.1:0");
 
         let server_addr = server.local_addr().expect("Failed to get server address");
-        let (server_tx, mut server_rx) = mpsc::owned_unbounded::<()>();
-        let (client_tx, mut client_rx) = mpsc::owned_unbounded::<()>();
+        let (server_tx, mut server_rx) = mpsc::unbounded::<()>();
+        let (client_tx, mut client_rx) = mpsc::unbounded::<()>();
 
         scope!(ctx, async |s| {
             s.spawn_boxed(async move {
@@ -297,9 +297,9 @@ fn udp_multiple_messages() {
         let socket2 = UdpSocket::bind(ctx, "127.0.0.1:0").expect("Failed to bind socket 2");
         let addr1 = socket1.local_addr().expect("Failed to get addr1");
         const NUM_MESSAGES: usize = 5;
-        let state = mpsc::unbounded::<String>();
+        let state = mpsc::borrowed_unbounded::<String>();
         let (msg_tx, mut msg_rx) = state.split();
-        let (ready_tx, mut ready_rx) = mpsc::owned_unbounded::<()>();
+        let (ready_tx, mut ready_rx) = mpsc::unbounded::<()>();
         let mut receiver = socket1
             .receiver(udp_receive_config_with_capacity(5, 5, 1024))
             .expect("create UDP receiver");
@@ -351,7 +351,7 @@ fn udp_large_data() {
         let socket2 = UdpSocket::bind(ctx, "127.0.0.1:0").expect("Failed to bind socket 2");
         let addr1 = socket1.local_addr().expect("Failed to get addr1");
         const DATA_SIZE: usize = 1024;
-        let (tx, mut rx) = mpsc::owned_unbounded::<()>();
+        let (tx, mut rx) = mpsc::unbounded::<()>();
         let mut receiver = socket1
             .receiver(udp_receive_config(2048))
             .expect("create UDP receiver");
@@ -390,7 +390,7 @@ fn udp_heap_buffer() {
         let socket1 = bind_udp_socket(ctx, "127.0.0.1:0");
         let socket2 = UdpSocket::bind(ctx, "127.0.0.1:0").expect("Failed to bind socket 2");
         let addr1 = socket1.local_addr().expect("Failed to get addr1");
-        let (tx, mut rx) = mpsc::owned_unbounded::<()>();
+        let (tx, mut rx) = mpsc::unbounded::<()>();
         let mut receiver = socket1
             .receiver(udp_receive_config(1024))
             .expect("create UDP receiver");
@@ -465,7 +465,7 @@ fn udp_receive_write_all() {
             .local_addr()
             .expect("Failed to get server address");
         let socket_client = UdpSocket::bind(ctx, "127.0.0.1:0").expect("Failed to bind client");
-        let (tx, mut rx) = mpsc::owned_unbounded::<()>();
+        let (tx, mut rx) = mpsc::unbounded::<()>();
         let mut receiver = socket_server
             .receiver(udp_receive_config(16))
             .expect("create UDP receiver");
@@ -515,7 +515,7 @@ fn multithread_udp_no_echo() {
                 let addr2 = socket2.local_addr().expect("Failed to get addr2");
                 let data = format!("Hello from worker {}", worker_id);
                 let data_for_recv = data.clone();
-                let (ready_tx, mut ready_rx) = mpsc::owned_unbounded::<()>();
+                let (ready_tx, mut ready_rx) = mpsc::unbounded::<()>();
                 let mut receiver = socket1
                     .receiver(udp_receive_config(1024))
                     .expect("create UDP receiver");
@@ -557,9 +557,9 @@ fn multithread_udp_no_echo() {
 #[test]
 fn multithread_udp_echo() {
     run_test_with_workers(nz!(2), async |ctx| {
-        let state = mpsc::unbounded::<SocketAddr>();
+        let state = mpsc::borrowed_unbounded::<SocketAddr>();
         let (addr_tx, mut addr_rx) = state.split();
-        let state = mpsc::unbounded::<()>();
+        let state = mpsc::borrowed_unbounded::<()>();
         let (done_tx, mut done_rx) = state.split();
 
         scope!(ctx, async |s| {
@@ -591,7 +591,7 @@ fn multithread_udp_echo() {
                 let server_addr = addr_rx.recv().await.expect("Channel closed");
                 let client = bind_udp_socket(ctx, "127.0.0.1:0");
                 let recv_client = client.clone();
-                let (client_tx, mut client_rx) = mpsc::owned_unbounded::<()>();
+                let (client_tx, mut client_rx) = mpsc::unbounded::<()>();
 
                 scope!(ctx, async |client_scope| {
                     let data = b"Hello from worker 2!";
@@ -634,7 +634,7 @@ fn multithread_udp_echo() {
 #[test]
 fn multithread_udp_cross_worker_drop_is_routed() {
     run_test_with_workers(nz!(2), async |ctx| {
-        let state = mpsc::unbounded::<UdpSocket<'_>>();
+        let state = mpsc::borrowed_unbounded::<UdpSocket<'_>>();
         let (clone_tx, mut clone_rx) = state.split();
 
         scope!(ctx, async |s| {
@@ -650,7 +650,7 @@ fn multithread_udp_cross_worker_drop_is_routed() {
                 let probe_addr = probe_server
                     .local_addr()
                     .expect("Failed to get probe server address");
-                let (probe_ready_tx, mut probe_ready_rx) = mpsc::owned_unbounded::<()>();
+                let (probe_ready_tx, mut probe_ready_rx) = mpsc::unbounded::<()>();
 
                 scope!(ctx, async |probe_scope| {
                     let probe_server_task = probe_server.clone();
@@ -706,7 +706,7 @@ fn multithread_concurrent_udp_clients() {
         let mut addr_channels = Vec::with_capacity(NUM_CLIENTS);
 
         for _ in 0..NUM_CLIENTS {
-            addr_channels.push(mpsc::owned_unbounded::<SocketAddr>());
+            addr_channels.push(mpsc::unbounded::<SocketAddr>());
         }
 
         let server_senders = addr_channels
@@ -715,7 +715,7 @@ fn multithread_concurrent_udp_clients() {
             .collect::<Vec<_>>();
         let server = bind_udp_socket(ctx, "127.0.0.1:0");
         let server_addr = server.local_addr().expect("Failed to get server address");
-        let state = mpsc::unbounded::<SocketAddr>();
+        let state = mpsc::borrowed_unbounded::<SocketAddr>();
         let (peer_tx, mut peer_rx) = state.split();
         let mut receiver = server
             .receiver(udp_receive_config_with_capacity(
@@ -731,7 +731,7 @@ fn multithread_concurrent_udp_clients() {
 
         let mut ready_pairs = Vec::with_capacity(NUM_CLIENTS);
         for _ in 0..NUM_CLIENTS {
-            ready_pairs.push(mpsc::owned_unbounded::<()>());
+            ready_pairs.push(mpsc::unbounded::<()>());
         }
 
         let ready_txs = ready_pairs

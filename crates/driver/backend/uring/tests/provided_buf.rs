@@ -1,4 +1,5 @@
 #![cfg(not(feature = "loom"))]
+#![cfg(any(target_os = "linux", target_os = "android"))]
 
 //! provided buffer ring 的驱动级测试。
 //!

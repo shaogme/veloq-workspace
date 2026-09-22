@@ -20,7 +20,7 @@ where
 #[test]
 fn test_sync_unbounded_simple() {
     run_test(async |_ctx| {
-        let state = mpsc::unbounded();
+        let state = mpsc::borrowed_unbounded();
         let (tx, mut rx) = state.split();
 
         tx.send(1).unwrap();
@@ -34,7 +34,7 @@ fn test_sync_unbounded_simple() {
 #[test]
 fn test_sync_unbounded_multi_thread() {
     run_test(async |ctx| {
-        let state = mpsc::unbounded();
+        let state = mpsc::borrowed_unbounded();
         let (tx, mut rx) = state.split();
 
         scope!(ctx, async |s| {
@@ -65,7 +65,7 @@ fn test_sync_unbounded_stream() {
     use veloq_std::pin::Pin;
 
     run_test(async |ctx| {
-        let state = mpsc::unbounded();
+        let state = mpsc::borrowed_unbounded();
         let (tx, rx) = state.split();
 
         scope!(ctx, async |s| {
@@ -95,7 +95,7 @@ fn test_sync_unbounded_stream() {
 #[test]
 fn test_sync_bounded_capacity() {
     run_test(async |ctx| {
-        let state = mpsc::bounded(1);
+        let state = mpsc::borrowed_bounded(1);
         let (tx, mut rx) = state.split();
 
         tx.send(1).await.unwrap();
@@ -119,7 +119,7 @@ fn test_sync_bounded_capacity() {
 #[test]
 fn test_sync_bounded_drop_receiver() {
     run_test(async |ctx| {
-        let state = mpsc::bounded(1);
+        let state = mpsc::borrowed_bounded(1);
         let (tx, rx) = state.split();
         tx.send(1).await.unwrap();
 
@@ -140,7 +140,7 @@ fn test_sync_bounded_drop_receiver() {
 #[test]
 fn test_sync_owned_mpsc() {
     run_test(async |ctx| {
-        let (tx, rx) = mpsc::owned_bounded(5);
+        let (tx, rx) = mpsc::bounded(5);
 
         scope!(ctx, async |s| {
             s.spawn_boxed(async move {

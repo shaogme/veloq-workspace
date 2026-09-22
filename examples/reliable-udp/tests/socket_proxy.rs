@@ -27,7 +27,7 @@ use veloq::{
     },
     sync::{
         TryRecvError, TrySendError,
-        mpmc::{BoundedOwnedReceiver, BoundedOwnedSender, owned_bounded},
+        mpmc::{BoundedReceiver, BoundedSender, bounded},
         oneshot,
     },
     time::sleep,
@@ -40,14 +40,14 @@ const EVENT_CAPACITY: usize = 32;
 const MAX_PENDING_DATAGRAMS: usize = 64;
 const MAX_COORDINATOR_BATCH: usize = 16;
 
-type DatagramSender = BoundedOwnedSender<ReceivedDatagram>;
-type DatagramReceiver = BoundedOwnedReceiver<ReceivedDatagram>;
-type ForwardSender = BoundedOwnedSender<ForwardDatagram>;
-type ForwardReceiver = BoundedOwnedReceiver<ForwardDatagram>;
-type CompletionSender = BoundedOwnedSender<SendCompleted>;
-type CompletionReceiver = BoundedOwnedReceiver<SendCompleted>;
-type DriverEventSender = BoundedOwnedSender<DriverEvent>;
-type DriverEventReceiver = BoundedOwnedReceiver<DriverEvent>;
+type DatagramSender = BoundedSender<ReceivedDatagram>;
+type DatagramReceiver = BoundedReceiver<ReceivedDatagram>;
+type ForwardSender = BoundedSender<ForwardDatagram>;
+type ForwardReceiver = BoundedReceiver<ForwardDatagram>;
+type CompletionSender = BoundedSender<SendCompleted>;
+type CompletionReceiver = BoundedReceiver<SendCompleted>;
+type DriverEventSender = BoundedSender<DriverEvent>;
+type DriverEventReceiver = BoundedReceiver<DriverEvent>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyDirection {
@@ -204,8 +204,8 @@ pub struct SocketProxy<'rt> {
     client_to_server: VecDeque<ProxyRule>,
     server_to_client: VecDeque<ProxyRule>,
     stats: [Arc<ProxyStats>; 2],
-    action_observed: BoundedOwnedSender<()>,
-    action_receiver: Option<BoundedOwnedReceiver<()>>,
+    action_observed: BoundedSender<()>,
+    action_receiver: Option<BoundedReceiver<()>>,
 }
 
 pub struct ProxyDriver<'rt> {
@@ -218,15 +218,15 @@ pub struct ProxyDriver<'rt> {
     client_to_server: VecDeque<ProxyRule>,
     server_to_client: VecDeque<ProxyRule>,
     stats: [Arc<ProxyStats>; 2],
-    action_observed: BoundedOwnedSender<()>,
-    ready: oneshot::OwnedSender<Result<(), ProxyError>>,
-    shutdown: oneshot::OwnedReceiver<()>,
+    action_observed: BoundedSender<()>,
+    ready: oneshot::Sender<Result<(), ProxyError>>,
+    shutdown: oneshot::Receiver<()>,
 }
 
 pub struct ProxyHandle {
-    ready: Option<oneshot::OwnedReceiver<Result<(), ProxyError>>>,
-    action_observed: Option<BoundedOwnedReceiver<()>>,
-    shutdown: Option<oneshot::OwnedSender<()>>,
+    ready: Option<oneshot::Receiver<Result<(), ProxyError>>>,
+    action_observed: Option<BoundedReceiver<()>>,
+    shutdown: Option<oneshot::Sender<()>>,
 }
 
 impl ProxyHandle {
@@ -255,7 +255,7 @@ impl<'rt> SocketProxy<'rt> {
     pub fn bind(ctx: Ctx<'rt>, max_datagram_size: NonZeroUsize) -> Result<Self, ProxyError> {
         let client_side = UdpSocket::bind(ctx, "127.0.0.1:0").map_err(|_| ProxyError::Io)?;
         let server_side = UdpSocket::bind(ctx, "127.0.0.1:0").map_err(|_| ProxyError::Io)?;
-        let (action_observed, action_receiver) = owned_bounded(1);
+        let (action_observed, action_receiver) = bounded(1);
         Ok(Self {
             ctx,
             max_datagram_size,
@@ -300,8 +300,8 @@ impl<'rt> SocketProxy<'rt> {
         server_addr: SocketAddr,
         client_addr: SocketAddr,
     ) -> (ProxyDriver<'rt>, ProxyHandle) {
-        let (shutdown, shutdown_receiver) = oneshot::owned_channel();
-        let (ready, ready_receiver) = oneshot::owned_channel();
+        let (shutdown, shutdown_receiver) = oneshot::channel();
+        let (ready, ready_receiver) = oneshot::channel();
         (
             ProxyDriver {
                 ctx: self.ctx,
@@ -344,13 +344,13 @@ impl ProxyDriver<'_> {
         } = self;
 
         let result = {
-            let (driver_events, mut driver_event_receiver) = owned_bounded(EVENT_CAPACITY);
-            let (client_inbound, client_inbound_receiver) = owned_bounded(CHANNEL_CAPACITY);
-            let (client_outbound, client_outbound_receiver) = owned_bounded(CHANNEL_CAPACITY);
-            let (client_completions, client_completion_receiver) = owned_bounded(CHANNEL_CAPACITY);
-            let (server_inbound, server_inbound_receiver) = owned_bounded(CHANNEL_CAPACITY);
-            let (server_outbound, server_outbound_receiver) = owned_bounded(CHANNEL_CAPACITY);
-            let (server_completions, server_completion_receiver) = owned_bounded(CHANNEL_CAPACITY);
+            let (driver_events, mut driver_event_receiver) = bounded(EVENT_CAPACITY);
+            let (client_inbound, client_inbound_receiver) = bounded(CHANNEL_CAPACITY);
+            let (client_outbound, client_outbound_receiver) = bounded(CHANNEL_CAPACITY);
+            let (client_completions, client_completion_receiver) = bounded(CHANNEL_CAPACITY);
+            let (server_inbound, server_inbound_receiver) = bounded(CHANNEL_CAPACITY);
+            let (server_outbound, server_outbound_receiver) = bounded(CHANNEL_CAPACITY);
+            let (server_completions, server_completion_receiver) = bounded(CHANNEL_CAPACITY);
 
             let scoped = scope!(ctx, async |scope| {
                 let mut tasks = ProxyTasks {
@@ -564,7 +564,7 @@ enum DriverEvent {
 async fn wait_for_startup(
     ctx: Ctx<'_>,
     events: &mut DriverEventReceiver,
-    shutdown: &mut oneshot::OwnedReceiver<()>,
+    shutdown: &mut oneshot::Receiver<()>,
 ) -> Result<(), ProxyError> {
     let mut ready = [[false; 3]; 2];
     while !(ready[0].iter().all(|value| *value) && ready[1].iter().all(|value| *value)) {
@@ -815,7 +815,7 @@ struct Coordinator<'rt> {
     next_order: u64,
     next_event_id: u64,
     events: DriverEventSender,
-    action_observed: BoundedOwnedSender<()>,
+    action_observed: BoundedSender<()>,
     stats: Arc<ProxyStats>,
     direction: ProxyDirection,
 }

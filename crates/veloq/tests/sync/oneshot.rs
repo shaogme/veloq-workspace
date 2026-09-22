@@ -19,7 +19,7 @@ where
 #[test]
 fn test_sync_oneshot_send_recv() {
     run_test(async |ctx| {
-        let state = oneshot::channel();
+        let state = oneshot::borrowed_channel();
         let (tx, rx) = state.split();
 
         scope!(ctx, async |s| {
@@ -37,7 +37,7 @@ fn test_sync_oneshot_send_recv() {
 #[test]
 fn test_sync_oneshot_drop_sender() {
     run_test(async |ctx| {
-        let state = oneshot::channel::<i32>();
+        let state = oneshot::borrowed_channel::<i32>();
         let (tx, rx) = state.split();
 
         scope!(ctx, async |s| {
@@ -56,7 +56,7 @@ fn test_sync_oneshot_drop_sender() {
 #[test]
 fn test_sync_oneshot_try_recv() {
     run_test(async |_ctx| {
-        let state = oneshot::channel();
+        let state = oneshot::borrowed_channel();
         let (tx, mut rx) = state.split();
 
         assert_eq!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty));
@@ -71,7 +71,7 @@ fn test_sync_oneshot_try_recv() {
 #[test]
 fn test_sync_oneshot_drop_receiver_notify() {
     run_test(async |ctx| {
-        let state = oneshot::channel::<i32>();
+        let state = oneshot::borrowed_channel::<i32>();
         let (tx, rx) = state.split();
 
         scope!(ctx, async |s| {
@@ -90,7 +90,7 @@ fn test_sync_oneshot_drop_receiver_notify() {
 #[test]
 fn test_sync_oneshot_poll_closed() {
     run_test(async |ctx| {
-        let state = oneshot::channel::<()>();
+        let state = oneshot::borrowed_channel::<()>();
         let (mut tx, rx) = state.split();
 
         scope!(ctx, async |s| {
@@ -109,7 +109,7 @@ fn test_sync_oneshot_poll_closed() {
 #[test]
 fn test_sync_owned_oneshot() {
     run_test(async |ctx| {
-        let (tx, rx) = oneshot::owned_channel();
+        let (tx, rx) = oneshot::channel();
 
         scope!(ctx, async |s| {
             s.spawn_boxed(async move {

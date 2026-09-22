@@ -1,5 +1,6 @@
 #![cfg(feature = "test-hooks")]
 #![cfg(not(feature = "loom"))]
+#![cfg(any(target_os = "linux", target_os = "android"))]
 
 //! 固定缓冲区注册失败时的严格/兼容模式回归测试。
 

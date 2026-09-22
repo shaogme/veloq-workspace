@@ -3,7 +3,6 @@ use diagweave::prelude::*;
 use std::{
     env,
     path::{Path, PathBuf},
-    process::exit,
 };
 
 mod cmd;
@@ -101,7 +100,12 @@ impl Runner {
             if status.success() {
                 return Ok(());
             } else {
-                exit(status.code().unwrap_or(1));
+                let code = status.code();
+                let mut report: Report<RunnerError> = RunnerError::CommandFailed { code }.trans();
+                if let Some(c) = code {
+                    report = report.set_error_code(c);
+                }
+                return Err(report.with_ctx("command", command.display()));
             }
         }
 
@@ -127,10 +131,21 @@ impl Runner {
             return Ok(());
         }
 
-        let steps = [
-            ("预构建 nextest 测试二进制", self.nextest_prebuild_command()),
-            ("预热 trybuild 编译测试", trybuild_warmup_command()),
-        ];
+        let mut steps = vec![("预构建 nextest 测试二进制", self.nextest_prebuild_command())];
+
+        if package_matches(self.config.package.as_deref(), "veloq-runtime") {
+            steps.push((
+                "预热 trybuild 编译测试 (veloq-runtime)",
+                veloq_runtime_trybuild_warmup_command(),
+            ));
+        }
+
+        if package_matches(self.config.package.as_deref(), "veloq-std") {
+            steps.push((
+                "预热 trybuild 编译测试 (veloq-std)",
+                veloq_std_trybuild_warmup_command(),
+            ));
+        }
 
         for (step, command) in steps {
             self.run_prebuild_step(step, command)?;
@@ -177,11 +192,16 @@ impl Runner {
                 return Ok(());
             }
 
-            return RunnerError::PrebuildFailed {
+            let code = status.code();
+            let mut report: Report<RunnerError> = RunnerError::PrebuildFailed {
                 step: step.to_string(),
-                code: status.code(),
+                code,
             }
-            .with_ctx("command", command.display());
+            .trans();
+            if let Some(c) = code {
+                report = report.set_error_code(c);
+            }
+            return Err(report.with_ctx("command", command.display()));
         }
 
         let output =
@@ -192,11 +212,16 @@ impl Runner {
 
         eprintln!("{step} 失败（退出码: {:?}）", output.status.code());
         print_output(&output);
-        RunnerError::PrebuildFailed {
+        let code = output.status.code();
+        let mut report: Report<RunnerError> = RunnerError::PrebuildFailed {
             step: step.to_string(),
-            code: output.status.code(),
+            code,
         }
-        .with_ctx("command", command.display())
+        .trans();
+        if let Some(c) = code {
+            report = report.set_error_code(c);
+        }
+        Err(report.with_ctx("command", command.display()))
     }
 
     fn run_round(&self, command: &CommandSpec, round: usize) -> Result<(), Report<RunnerError>> {
@@ -207,14 +232,19 @@ impl Runner {
                 return Ok(());
             }
 
-            return RunnerError::RoundFailed {
+            let code = status.code();
+            let mut report: Report<RunnerError> = RunnerError::RoundFailed {
                 task: self.config.task.name(),
                 target: self.config.target.name(),
                 round,
                 total: self.config.count,
-                code: status.code(),
+                code,
             }
-            .with_ctx("command", command.display());
+            .trans();
+            if let Some(c) = code {
+                report = report.set_error_code(c);
+            }
+            return Err(report.with_ctx("command", command.display()));
         }
 
         let output =
@@ -231,7 +261,12 @@ impl Runner {
             output.status.code()
         );
         print_output(&output);
-        Err(RunnerError::CommandFailed.trans())
+        let code = output.status.code();
+        let mut report: Report<RunnerError> = RunnerError::CommandFailed { code }.trans();
+        if let Some(c) = code {
+            report = report.set_error_code(c);
+        }
+        Err(report)
     }
 
     fn prepare_environment(&self) -> Result<(), Report<RunnerError>> {
@@ -290,7 +325,12 @@ impl Runner {
             if self.config.quiet {
                 print_output(&output);
             }
-            exit(output.status.code().unwrap_or(1));
+            let code = output.status.code();
+            let mut report: Report<RunnerError> = RunnerError::CommandFailed { code }.trans();
+            if let Some(c) = code {
+                report = report.set_error_code(c);
+            }
+            Err(report)
         }
     }
 
@@ -379,8 +419,6 @@ fn linux_native_command(
     match task {
         Task::Test => {
             args.extend(vec![
-                "--test-threads".into(),
-                "1".into(),
                 "--run-ignored".into(),
                 "all".into(),
             ]);
@@ -461,8 +499,6 @@ fn windows_native_command(
     match task {
         Task::Test => {
             args.extend(vec![
-                "--test-threads".into(),
-                "1".into(),
                 "--run-ignored".into(),
                 "all".into(),
             ]);
@@ -489,7 +525,7 @@ fn windows_native_command(
     CommandSpec::new("cargo", args)
 }
 
-fn trybuild_warmup_command() -> CommandSpec {
+fn veloq_runtime_trybuild_warmup_command() -> CommandSpec {
     CommandSpec::new(
         "cargo",
         vec![
@@ -503,6 +539,29 @@ fn trybuild_warmup_command() -> CommandSpec {
             "--exact".into(),
         ],
     )
+}
+
+fn veloq_std_trybuild_warmup_command() -> CommandSpec {
+    CommandSpec::new(
+        "cargo",
+        vec![
+            "test".into(),
+            "-p".into(),
+            "veloq-std".into(),
+            "--test".into(),
+            "compile_tests".into(),
+            "receiver_is_not_sync".into(),
+            "--".into(),
+            "--exact".into(),
+        ],
+    )
+}
+
+fn package_matches(package: Option<&str>, target: &str) -> bool {
+    match package {
+        Some(packages) => packages.split(',').any(|p| p.trim() == target),
+        None => true,
+    }
 }
 
 fn determine_mode(target: Target, workspace_root: &Path) -> Result<RunMode, RunnerError> {
@@ -550,5 +609,27 @@ mod tests {
             let windows = windows_native_command(task, None, false, true, None, None, None);
             assert!(windows.args.contains(&"--all-targets".into()));
         }
+    }
+
+    #[test]
+    fn trybuild_warmup_commands_configuration() {
+        let runtime_warmup = veloq_runtime_trybuild_warmup_command();
+        assert_eq!(runtime_warmup.program, "cargo");
+        assert!(runtime_warmup.args.contains(&"veloq-runtime".into()));
+        assert!(runtime_warmup.args.contains(&"compile_tests".into()));
+
+        let std_warmup = veloq_std_trybuild_warmup_command();
+        assert_eq!(std_warmup.program, "cargo");
+        assert!(std_warmup.args.contains(&"veloq-std".into()));
+        assert!(std_warmup.args.contains(&"receiver_is_not_sync".into()));
+    }
+
+    #[test]
+    fn package_matches_filter() {
+        assert!(package_matches(None, "veloq-std"));
+        assert!(package_matches(None, "veloq-runtime"));
+        assert!(package_matches(Some("veloq-std"), "veloq-std"));
+        assert!(!package_matches(Some("veloq-std"), "veloq-runtime"));
+        assert!(package_matches(Some("veloq-runtime,veloq-std"), "veloq-std"));
     }
 }

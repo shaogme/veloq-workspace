@@ -41,6 +41,11 @@ union! {
                 code: Option<i32>,
             },
 
+            #[display("清理 Windows 虚拟机工作区失败（退出码: {code:?}）")]
+            VmCleanWorkspaceFailed {
+                code: Option<i32>,
+            },
+
             #[display("等待 Windows 虚拟机关机超时")]
             VmShutdownTimeout,
 
@@ -67,9 +72,26 @@ union! {
                 code: Option<i32>,
             },
 
-            #[display("命令执行失败")]
-            CommandFailed,
+            #[display("命令执行失败（退出码: {code:?}）")]
+            CommandFailed {
+                code: Option<i32>,
+            },
         }
+}
+
+impl RunnerError {
+    pub(crate) fn exit_code(&self) -> Option<i32> {
+        match self {
+            Self::CreateOverlayFailed { code }
+            | Self::CargoFetchFailed { code }
+            | Self::VmCleanWorkspaceFailed { code }
+            | Self::VmSyncFailed { code }
+            | Self::PrebuildFailed { code, .. }
+            | Self::RoundFailed { code, .. }
+            | Self::CommandFailed { code } => *code,
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -263,8 +285,13 @@ fn main() -> ExitCode {
     match run_app(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(report) => {
+            let code = report
+                .error_code()
+                .and_then(|c| i32::try_from(c).ok())
+                .or_else(|| report.inner().exit_code())
+                .unwrap_or(1);
             eprintln!("{}", report.compact());
-            ExitCode::FAILURE
+            ExitCode::from(code as u8)
         }
     }
 }

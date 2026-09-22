@@ -267,7 +267,7 @@ fn multithread_tcp_connections() {
         scope!(ctx, async |s| {
             for worker_id in 0..NUM_WORKERS {
                 let counter = connection_count.clone();
-                let (addr_tx, mut addr_rx) = mpsc::owned_unbounded::<SocketAddr>();
+                let (addr_tx, mut addr_rx) = mpsc::unbounded::<SocketAddr>();
 
                 s.spawn_boxed(async move {
                     let listener =
@@ -300,9 +300,9 @@ fn multithread_tcp_connections() {
 #[test]
 fn multithread_tcp_echo() {
     run_test_with_workers(nz!(2), async |ctx| {
-        let state = mpsc::unbounded::<SocketAddr>();
+        let state = mpsc::borrowed_unbounded::<SocketAddr>();
         let (addr_tx, mut addr_rx) = state.split();
-        let state = mpsc::unbounded::<()>();
+        let state = mpsc::borrowed_unbounded::<()>();
         let (done_tx, mut done_rx) = state.split();
 
         scope!(ctx, async |s| {

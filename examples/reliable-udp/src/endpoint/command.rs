@@ -5,7 +5,7 @@ use veloq::{
     std::num::NonZeroUsize,
     sync::{
         TrySendError,
-        mpmc::{BoundedOwnedReceiver, BoundedOwnedSender},
+        mpmc::{BoundedReceiver, BoundedSender},
     },
 };
 
@@ -27,8 +27,8 @@ use super::io::{InboundDatagram, OutboundDatagram, OutboundSender, PumpSender, S
 use super::state::{ProtocolState, SessionEntry, key_from_packet, stream_message_from_session};
 use super::{ConnectionKey, Reply};
 
-pub(super) type CommandSender = BoundedOwnedSender<Command>;
-pub(super) type CommandReceiver = BoundedOwnedReceiver<Command>;
+pub(super) type CommandSender = BoundedSender<Command>;
+pub(super) type CommandReceiver = BoundedReceiver<Command>;
 
 pub(crate) enum Command {
     Connect {

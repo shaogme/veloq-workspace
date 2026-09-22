@@ -6,7 +6,7 @@ use veloq::{
     std::{net::SocketAddr, sync::Arc},
     sync::{
         TrySendError,
-        mpmc::{BoundedOwnedReceiver, BoundedOwnedSender, owned_bounded},
+        mpmc::{BoundedReceiver, BoundedSender, bounded},
     },
 };
 
@@ -18,17 +18,17 @@ use crate::{
 
 use super::{Command, ConnectionKey, stats::EndpointStats};
 
-pub(super) type CommandSender = BoundedOwnedSender<Command>;
-pub(super) type CommandReceiver = BoundedOwnedReceiver<Command>;
-pub(super) type PumpSender = BoundedOwnedSender<PumpEvent>;
-pub(super) type PumpReceiver = BoundedOwnedReceiver<PumpEvent>;
-pub(super) type InboundSender = BoundedOwnedSender<InboundDatagram>;
-pub(super) type InboundReceiver = BoundedOwnedReceiver<InboundDatagram>;
-pub(super) type OutboundSender = BoundedOwnedSender<OutboundDatagram>;
-pub(super) type OutboundReceiver = BoundedOwnedReceiver<OutboundDatagram>;
+pub(super) type CommandSender = BoundedSender<Command>;
+pub(super) type CommandReceiver = BoundedReceiver<Command>;
+pub(super) type PumpSender = BoundedSender<PumpEvent>;
+pub(super) type PumpReceiver = BoundedReceiver<PumpEvent>;
+pub(super) type InboundSender = BoundedSender<InboundDatagram>;
+pub(super) type InboundReceiver = BoundedReceiver<InboundDatagram>;
+pub(super) type OutboundSender = BoundedSender<OutboundDatagram>;
+pub(super) type OutboundReceiver = BoundedReceiver<OutboundDatagram>;
 
 pub(super) fn channel(capacity: usize) -> (CommandSender, CommandReceiver) {
-    owned_bounded(capacity)
+    bounded(capacity)
 }
 
 pub(super) struct InboundDatagram {

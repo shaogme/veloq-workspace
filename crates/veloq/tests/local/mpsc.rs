@@ -21,7 +21,7 @@ where
 #[test]
 fn test_unbounded_basic() {
     run_test(async |ctx| {
-        let state = mpsc::unbounded();
+        let state = mpsc::borrowed_unbounded();
         let (tx, rx) = state.split();
 
         scope_local!(ctx, async |s| {
@@ -48,7 +48,7 @@ fn test_unbounded_basic() {
 #[test]
 fn test_bounded_basic() {
     run_test(async |ctx| {
-        let state = mpsc::bounded(5);
+        let state = mpsc::borrowed_bounded(5);
         let (tx, rx) = state.split();
 
         scope_local!(ctx, async |s| {
@@ -71,7 +71,7 @@ fn test_bounded_basic() {
 #[test]
 fn test_multiple_senders() {
     run_test(async |ctx| {
-        let state = mpsc::unbounded();
+        let state = mpsc::borrowed_unbounded();
         let (tx, rx) = state.split();
 
         scope_local!(ctx, async |s| {
@@ -97,7 +97,7 @@ fn test_multiple_senders() {
 #[test]
 fn test_sender_drop_closes_channel() {
     run_test(async |ctx| {
-        let state = mpsc::unbounded::<()>();
+        let state = mpsc::borrowed_unbounded::<()>();
         let (tx, rx) = state.split();
         scope_local!(ctx, async |s| {
             s.spawn_boxed_local(async move {
@@ -114,7 +114,7 @@ fn test_sender_drop_closes_channel() {
 #[test]
 fn test_receiver_drop_errors_sender() {
     run_test(async |ctx| {
-        let state = mpsc::bounded::<i32>(1);
+        let state = mpsc::borrowed_bounded::<i32>(1);
         let (tx, rx) = state.split();
 
         // Fill the channel first to make sure next send might block or wait
@@ -140,7 +140,7 @@ fn test_receiver_drop_errors_sender() {
 #[test]
 fn test_bounded_backpressure() {
     run_test(async |ctx| {
-        let state = mpsc::bounded(1);
+        let state = mpsc::borrowed_bounded(1);
         let (tx, rx) = state.split();
 
         scope_local!(ctx, async |s| {
@@ -174,7 +174,7 @@ fn test_stream_conversion() {
     use veloq_std::pin::Pin;
 
     run_test(async |ctx| {
-        let state = mpsc::unbounded();
+        let state = mpsc::borrowed_unbounded();
         let (tx, rx) = state.split();
 
         scope_local!(ctx, async |s| {
@@ -204,7 +204,7 @@ fn test_stream_conversion() {
 #[test]
 fn test_try_recv() {
     run_test(async |_ctx| {
-        let state = mpsc::unbounded();
+        let state = mpsc::borrowed_unbounded();
         let (tx, rx) = state.split();
 
         assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Empty));
@@ -225,7 +225,7 @@ fn test_try_recv() {
 #[test]
 fn test_owned_mpsc() {
     run_test(async |ctx| {
-        let (tx, rx) = mpsc::owned_bounded(5);
+        let (tx, rx) = mpsc::bounded(5);
 
         scope_local!(ctx, async |s| {
             s.spawn_boxed_local(async move {

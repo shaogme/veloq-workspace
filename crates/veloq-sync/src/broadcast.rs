@@ -13,7 +13,7 @@ use veloq_std::{
 pub use crate::SendError;
 use crate::notify::Notify;
 
-/// Error returned from [`Receiver::recv`] or [`OwnedReceiver::recv`].
+/// Error returned from [`Receiver::recv`] or [`BorrowedReceiver::recv`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecvError {
     /// The channel is closed and all queued messages have been received.
@@ -33,7 +33,7 @@ impl fmt::Display for RecvError {
 
 impl Error for RecvError {}
 
-/// Error returned from [`Receiver::try_recv`] or [`OwnedReceiver::try_recv`].
+/// Error returned from [`Receiver::try_recv`] or [`BorrowedReceiver::try_recv`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TryRecvError {
     /// The channel currently has no new messages.
@@ -101,13 +101,13 @@ impl<T> State<T> {
     }
 
     /// Splits the state into a borrowed sender and receiver pair.
-    pub fn split(&self) -> (Sender<'_, T>, Receiver<'_, T>) {
+    pub fn split(&self) -> (BorrowedSender<'_, T>, BorrowedReceiver<'_, T>) {
         self.sender_count.store(1, Ordering::Release);
         self.receiver_count.store(1, Ordering::Release);
         let next_seq = self.buffer.lock().tail;
         (
-            Sender { state: self },
-            Receiver {
+            BorrowedSender { state: self },
+            BorrowedReceiver {
                 state: self,
                 next_seq,
             },
@@ -231,24 +231,24 @@ impl<T> State<T> {
 }
 
 /// The sender half of a borrowed broadcast channel.
-pub struct Sender<'a, T> {
+pub struct BorrowedSender<'a, T> {
     state: &'a State<T>,
 }
 
-unsafe impl<T: Send> Send for Sender<'_, T> {}
-unsafe impl<T: Send> Sync for Sender<'_, T> {}
+unsafe impl<T: Send> Send for BorrowedSender<'_, T> {}
+unsafe impl<T: Send> Sync for BorrowedSender<'_, T> {}
 
-impl<'a, T> Sender<'a, T> {
+impl<'a, T> BorrowedSender<'a, T> {
     /// Sends a value to all active receivers.
     pub fn send(&self, value: T) -> Result<usize, SendError<T>> {
         self.state.send(value)
     }
 
     /// Creates a new receiver subscribed to this channel.
-    pub fn subscribe(&self) -> Receiver<'a, T> {
+    pub fn subscribe(&self) -> BorrowedReceiver<'a, T> {
         self.state.receiver_count.fetch_add(1, Ordering::AcqRel);
         let next_seq = self.state.buffer.lock().tail;
-        Receiver {
+        BorrowedReceiver {
             state: self.state,
             next_seq,
         }
@@ -296,14 +296,14 @@ impl<'a, T> Sender<'a, T> {
     }
 }
 
-impl<T> Clone for Sender<'_, T> {
+impl<T> Clone for BorrowedSender<'_, T> {
     fn clone(&self) -> Self {
         self.state.sender_count.fetch_add(1, Ordering::AcqRel);
         Self { state: self.state }
     }
 }
 
-impl<T> Drop for Sender<'_, T> {
+impl<T> Drop for BorrowedSender<'_, T> {
     fn drop(&mut self) {
         let prev = self.state.sender_count.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
@@ -312,9 +312,9 @@ impl<T> Drop for Sender<'_, T> {
     }
 }
 
-impl<T> fmt::Debug for Sender<'_, T> {
+impl<T> fmt::Debug for BorrowedSender<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Sender")
+        f.debug_struct("BorrowedSender")
             .field("capacity", &self.capacity())
             .field("receiver_count", &self.receiver_count())
             .field("sender_count", &self.sender_count())
@@ -323,15 +323,15 @@ impl<T> fmt::Debug for Sender<'_, T> {
 }
 
 /// The receiver half of a borrowed broadcast channel.
-pub struct Receiver<'a, T> {
+pub struct BorrowedReceiver<'a, T> {
     state: &'a State<T>,
     next_seq: u64,
 }
 
-unsafe impl<T: Send> Send for Receiver<'_, T> {}
-unsafe impl<T: Send> Sync for Receiver<'_, T> {}
+unsafe impl<T: Send> Send for BorrowedReceiver<'_, T> {}
+unsafe impl<T: Send> Sync for BorrowedReceiver<'_, T> {}
 
-impl<'a, T> Receiver<'a, T> {
+impl<'a, T> BorrowedReceiver<'a, T> {
     /// Asynchronously receives the next value for this receiver.
     pub async fn recv(&mut self) -> Result<T, RecvError>
     where
@@ -349,10 +349,10 @@ impl<'a, T> Receiver<'a, T> {
     }
 
     /// Creates a new receiver subscribed to this channel starting from the latest message.
-    pub fn resubscribe(&self) -> Receiver<'a, T> {
+    pub fn resubscribe(&self) -> BorrowedReceiver<'a, T> {
         self.state.receiver_count.fetch_add(1, Ordering::AcqRel);
         let next_seq = self.state.buffer.lock().tail;
-        Receiver {
+        BorrowedReceiver {
             state: self.state,
             next_seq,
         }
@@ -382,7 +382,7 @@ impl<'a, T> Receiver<'a, T> {
     }
 }
 
-impl<T> Clone for Receiver<'_, T> {
+impl<T> Clone for BorrowedReceiver<'_, T> {
     fn clone(&self) -> Self {
         self.state.receiver_count.fetch_add(1, Ordering::AcqRel);
         Self {
@@ -392,40 +392,40 @@ impl<T> Clone for Receiver<'_, T> {
     }
 }
 
-impl<T> Drop for Receiver<'_, T> {
+impl<T> Drop for BorrowedReceiver<'_, T> {
     fn drop(&mut self) {
         self.state.receiver_count.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
-impl<T> fmt::Debug for Receiver<'_, T> {
+impl<T> fmt::Debug for BorrowedReceiver<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Receiver")
+        f.debug_struct("BorrowedReceiver")
             .field("next_seq", &self.next_seq)
             .field("len", &self.len())
             .finish()
     }
 }
 
-/// An owned sender for a broadcast channel.
-pub struct OwnedSender<T> {
+/// A sender for a broadcast channel.
+pub struct Sender<T> {
     state: Arc<State<T>>,
 }
 
-unsafe impl<T: Send> Send for OwnedSender<T> {}
-unsafe impl<T: Send> Sync for OwnedSender<T> {}
+unsafe impl<T: Send> Send for Sender<T> {}
+unsafe impl<T: Send> Sync for Sender<T> {}
 
-impl<T> OwnedSender<T> {
+impl<T> Sender<T> {
     /// Sends a value to all active receivers.
     pub fn send(&self, value: T) -> Result<usize, SendError<T>> {
         self.state.send(value)
     }
 
-    /// Creates a new owned receiver subscribed to this channel.
-    pub fn subscribe(&self) -> OwnedReceiver<T> {
+    /// Creates a new receiver subscribed to this channel.
+    pub fn subscribe(&self) -> Receiver<T> {
         self.state.receiver_count.fetch_add(1, Ordering::AcqRel);
         let next_seq = self.state.buffer.lock().tail;
-        OwnedReceiver {
+        Receiver {
             state: self.state.clone(),
             next_seq,
         }
@@ -473,7 +473,7 @@ impl<T> OwnedSender<T> {
     }
 }
 
-impl<T> Clone for OwnedSender<T> {
+impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
         self.state.sender_count.fetch_add(1, Ordering::AcqRel);
         Self {
@@ -482,7 +482,7 @@ impl<T> Clone for OwnedSender<T> {
     }
 }
 
-impl<T> Drop for OwnedSender<T> {
+impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         let prev = self.state.sender_count.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
@@ -491,9 +491,9 @@ impl<T> Drop for OwnedSender<T> {
     }
 }
 
-impl<T> fmt::Debug for OwnedSender<T> {
+impl<T> fmt::Debug for Sender<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OwnedSender")
+        f.debug_struct("Sender")
             .field("capacity", &self.capacity())
             .field("receiver_count", &self.receiver_count())
             .field("sender_count", &self.sender_count())
@@ -501,16 +501,16 @@ impl<T> fmt::Debug for OwnedSender<T> {
     }
 }
 
-/// An owned receiver for a broadcast channel.
-pub struct OwnedReceiver<T> {
+/// A receiver for a broadcast channel.
+pub struct Receiver<T> {
     state: Arc<State<T>>,
     next_seq: u64,
 }
 
-unsafe impl<T: Send> Send for OwnedReceiver<T> {}
-unsafe impl<T: Send> Sync for OwnedReceiver<T> {}
+unsafe impl<T: Send> Send for Receiver<T> {}
+unsafe impl<T: Send> Sync for Receiver<T> {}
 
-impl<T> OwnedReceiver<T> {
+impl<T> Receiver<T> {
     /// Asynchronously receives the next value for this receiver.
     pub async fn recv(&mut self) -> Result<T, RecvError>
     where
@@ -527,11 +527,11 @@ impl<T> OwnedReceiver<T> {
         self.state.try_recv(&mut self.next_seq)
     }
 
-    /// Creates a new owned receiver subscribed to this channel starting from the latest message.
-    pub fn resubscribe(&self) -> OwnedReceiver<T> {
+    /// Creates a new receiver subscribed to this channel starting from the latest message.
+    pub fn resubscribe(&self) -> Receiver<T> {
         self.state.receiver_count.fetch_add(1, Ordering::AcqRel);
         let next_seq = self.state.buffer.lock().tail;
-        OwnedReceiver {
+        Receiver {
             state: self.state.clone(),
             next_seq,
         }
@@ -561,7 +561,7 @@ impl<T> OwnedReceiver<T> {
     }
 }
 
-impl<T> Clone for OwnedReceiver<T> {
+impl<T> Clone for Receiver<T> {
     fn clone(&self) -> Self {
         self.state.receiver_count.fetch_add(1, Ordering::AcqRel);
         Self {
@@ -571,36 +571,36 @@ impl<T> Clone for OwnedReceiver<T> {
     }
 }
 
-impl<T> Drop for OwnedReceiver<T> {
+impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         self.state.receiver_count.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
-impl<T> fmt::Debug for OwnedReceiver<T> {
+impl<T> fmt::Debug for Receiver<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OwnedReceiver")
+        f.debug_struct("Receiver")
             .field("next_seq", &self.next_seq)
             .field("len", &self.len())
             .finish()
     }
 }
 
-/// Creates a new broadcast channel returning an owned sender and receiver pair.
-pub fn channel<T>(capacity: usize) -> (OwnedSender<T>, OwnedReceiver<T>) {
+/// Creates a new broadcast channel returning a sender and receiver pair.
+pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     let state = Arc::new(State::new(capacity));
     state.sender_count.store(1, Ordering::Release);
     state.receiver_count.store(1, Ordering::Release);
     let next_seq = state.buffer.lock().tail;
     (
-        OwnedSender {
+        Sender {
             state: state.clone(),
         },
-        OwnedReceiver { state, next_seq },
+        Receiver { state, next_seq },
     )
 }
 
-/// Creates a new owned broadcast channel returning an owned sender and receiver pair.
-pub fn owned_channel<T>(capacity: usize) -> (OwnedSender<T>, OwnedReceiver<T>) {
-    channel(capacity)
+/// Creates a new borrowed broadcast channel state.
+pub fn borrowed_channel<T>(capacity: usize) -> State<T> {
+    State::new(capacity)
 }

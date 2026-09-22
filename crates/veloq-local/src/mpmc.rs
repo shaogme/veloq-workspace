@@ -51,34 +51,37 @@ impl<T> State<T> {
     }
 
     /// Splits the state into a sender and a receiver.
-    pub fn split<'a>(&'a self) -> (Sender<'a, T>, Receiver<'a, T>) {
+    pub fn split<'a>(&'a self) -> (BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) {
         let mut inner = self.inner.borrow_mut();
         inner.tx_count = 1;
         inner.rx_count = 1;
         inner.is_closed = false;
-        (Sender { state: self }, Receiver { state: self })
+        (
+            BorrowedSender { state: self },
+            BorrowedReceiver { state: self },
+        )
     }
 }
 
 /// Creates a new bounded MPMC channel state.
-pub fn bounded<T>(size: usize) -> State<T> {
+pub fn borrowed_bounded<T>(size: usize) -> State<T> {
     State::bounded(size)
 }
 
 /// Creates a new unbounded MPMC channel state.
-pub fn unbounded<T>() -> State<T> {
+pub fn borrowed_unbounded<T>() -> State<T> {
     State::unbounded()
 }
 
-/// 本地通道的发送端
+/// 本地通道的发送端（借用）
 #[derive(Debug)]
-pub struct Sender<'a, T> {
+pub struct BorrowedSender<'a, T> {
     state: &'a State<T>,
 }
 
-/// 本地通道的接收端
+/// 本地通道的接收端（借用）
 #[derive(Debug)]
-pub struct Receiver<'a, T> {
+pub struct BorrowedReceiver<'a, T> {
     state: &'a State<T>,
 }
 
@@ -100,14 +103,14 @@ impl<T> StateInner<T> {
     }
 }
 
-impl<'a, T> Clone for Sender<'a, T> {
+impl<'a, T> Clone for BorrowedSender<'a, T> {
     fn clone(&self) -> Self {
         self.state.inner.borrow_mut().tx_count += 1;
         Self { state: self.state }
     }
 }
 
-impl<'a, T> Sender<'a, T> {
+impl<'a, T> BorrowedSender<'a, T> {
     /// 尝试发送数据，如果通道已满或接收端关闭则返回错误
     pub fn try_send(&self, item: T) -> Result<(), SendError<T>> {
         let mut inner = self.state.inner.borrow_mut();
@@ -172,7 +175,7 @@ impl<'a, T> Sender<'a, T> {
     }
 }
 
-impl<'a, T> Drop for Sender<'a, T> {
+impl<'a, T> Drop for BorrowedSender<'a, T> {
     fn drop(&mut self) {
         let mut inner = self.state.inner.borrow_mut();
         inner.tx_count -= 1;
@@ -185,14 +188,14 @@ impl<'a, T> Drop for Sender<'a, T> {
     }
 }
 
-impl<'a, T> Clone for Receiver<'a, T> {
+impl<'a, T> Clone for BorrowedReceiver<'a, T> {
     fn clone(&self) -> Self {
         self.state.inner.borrow_mut().rx_count += 1;
         Self { state: self.state }
     }
 }
 
-impl<'a, T> Drop for Receiver<'a, T> {
+impl<'a, T> Drop for BorrowedReceiver<'a, T> {
     fn drop(&mut self) {
         let mut inner = self.state.inner.borrow_mut();
         inner.rx_count -= 1;
@@ -206,21 +209,21 @@ impl<'a, T> Drop for Receiver<'a, T> {
     }
 }
 
-pub struct ChannelStream<'a, T> {
+pub struct BorrowedChannelStream<'a, T> {
     state: &'a State<T>,
     notified: Option<Notified<'a>>,
 }
 
-impl<'a, T> ChannelStream<'a, T> {
+impl<'a, T> BorrowedChannelStream<'a, T> {
     fn new(state: &'a State<T>) -> Self {
-        ChannelStream {
+        BorrowedChannelStream {
             state,
             notified: None,
         }
     }
 }
 
-impl<T> Stream for ChannelStream<'_, T> {
+impl<T> Stream for BorrowedChannelStream<'_, T> {
     type Item = T;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -257,7 +260,7 @@ impl<T> Stream for ChannelStream<'_, T> {
     }
 }
 
-impl<'a, T> Receiver<'a, T> {
+impl<'a, T> BorrowedReceiver<'a, T> {
     /// 尝试非阻塞接收
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
         let mut inner = self.state.inner.borrow_mut();
@@ -305,140 +308,140 @@ impl<'a, T> Receiver<'a, T> {
 
     /// 转换为 Stream
     pub fn stream(&self) -> impl Stream<Item = T> + '_ {
-        ChannelStream::new(self.state)
+        BorrowedChannelStream::new(self.state)
     }
 }
 
-/// Owned MPMC channel sender.
-pub struct OwnedSender<T> {
+/// MPMC channel sender.
+pub struct Sender<T> {
     state: Rc<State<T>>,
 }
 
-/// Owned MPMC channel receiver.
-pub struct OwnedReceiver<T> {
+/// MPMC channel receiver.
+pub struct Receiver<T> {
     state: Rc<State<T>>,
 }
 
-/// Creates a new owned MPMC channel.
-pub fn owned_channel<T>(capacity: ChannelCapacity) -> (OwnedSender<T>, OwnedReceiver<T>) {
+/// Creates a new MPMC channel.
+pub fn channel<T>(capacity: ChannelCapacity) -> (Sender<T>, Receiver<T>) {
     let state = Rc::new(State::new(capacity));
     (
-        OwnedSender {
+        Sender {
             state: state.clone(),
         },
-        OwnedReceiver { state },
+        Receiver { state },
     )
 }
 
-/// Creates a new bounded owned MPMC channel.
-pub fn owned_bounded<T>(size: usize) -> (OwnedSender<T>, OwnedReceiver<T>) {
-    owned_channel(ChannelCapacity::Bounded(size))
+/// Creates a new bounded MPMC channel.
+pub fn bounded<T>(size: usize) -> (Sender<T>, Receiver<T>) {
+    channel(ChannelCapacity::Bounded(size))
 }
 
-/// Creates a new unbounded owned MPMC channel.
-pub fn owned_unbounded<T>() -> (OwnedSender<T>, OwnedReceiver<T>) {
-    owned_channel(ChannelCapacity::Unbounded)
+/// Creates a new unbounded MPMC channel.
+pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
+    channel(ChannelCapacity::Unbounded)
 }
 
-impl<T> Clone for OwnedSender<T> {
+impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
-        let sender = ManuallyDrop::new(Sender { state: &self.state });
+        let sender = ManuallyDrop::new(BorrowedSender { state: &self.state });
         let _cloned = ManuallyDrop::new(sender.clone());
-        OwnedSender {
+        Sender {
             state: self.state.clone(),
         }
     }
 }
 
-impl<T> OwnedSender<T> {
+impl<T> Sender<T> {
     /// Attempts to send a message without blocking.
     pub fn try_send(&self, item: T) -> Result<(), SendError<T>> {
-        let sender = ManuallyDrop::new(Sender { state: &self.state });
+        let sender = ManuallyDrop::new(BorrowedSender { state: &self.state });
         sender.try_send(item)
     }
 
     /// Asynchronously sends a message.
     pub async fn send(&self, item: T) -> Result<(), SendError<T>> {
-        let sender = ManuallyDrop::new(Sender { state: &self.state });
+        let sender = ManuallyDrop::new(BorrowedSender { state: &self.state });
         sender.send(item).await
     }
 
     /// Checks if the channel is full.
     pub fn is_full(&self) -> bool {
-        let sender = ManuallyDrop::new(Sender { state: &self.state });
+        let sender = ManuallyDrop::new(BorrowedSender { state: &self.state });
         sender.is_full()
     }
 
     /// Returns the number of messages in the channel.
     pub fn len(&self) -> usize {
-        let sender = ManuallyDrop::new(Sender { state: &self.state });
+        let sender = ManuallyDrop::new(BorrowedSender { state: &self.state });
         sender.len()
     }
 
     /// Checks if the channel is empty.
     pub fn is_empty(&self) -> bool {
-        let sender = ManuallyDrop::new(Sender { state: &self.state });
+        let sender = ManuallyDrop::new(BorrowedSender { state: &self.state });
         sender.is_empty()
     }
 }
 
-impl<T> Drop for OwnedSender<T> {
+impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        drop(Sender { state: &self.state });
+        drop(BorrowedSender { state: &self.state });
     }
 }
 
-impl<T> Clone for OwnedReceiver<T> {
+impl<T> Clone for Receiver<T> {
     fn clone(&self) -> Self {
-        let receiver = ManuallyDrop::new(Receiver { state: &self.state });
+        let receiver = ManuallyDrop::new(BorrowedReceiver { state: &self.state });
         let _cloned = ManuallyDrop::new(receiver.clone());
-        OwnedReceiver {
+        Receiver {
             state: self.state.clone(),
         }
     }
 }
 
-impl<T> OwnedReceiver<T> {
+impl<T> Receiver<T> {
     /// Attempts to receive a message without blocking.
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        let receiver = ManuallyDrop::new(Receiver { state: &self.state });
+        let receiver = ManuallyDrop::new(BorrowedReceiver { state: &self.state });
         receiver.try_recv()
     }
 
     /// Asynchronously receives a message.
     pub async fn recv(&self) -> Option<T> {
-        let receiver = ManuallyDrop::new(Receiver { state: &self.state });
+        let receiver = ManuallyDrop::new(BorrowedReceiver { state: &self.state });
         receiver.recv().await
     }
 
     /// Converts the receiver into a stream.
-    pub fn stream(&self) -> OwnedChannelStream<T> {
-        OwnedChannelStream::new(self.state.clone())
+    pub fn stream(&self) -> ChannelStream<T> {
+        ChannelStream::new(self.state.clone())
     }
 }
 
-impl<T> Drop for OwnedReceiver<T> {
+impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        drop(Receiver { state: &self.state });
+        drop(BorrowedReceiver { state: &self.state });
     }
 }
 
-/// A stream of messages from an owned MPMC channel.
-pub struct OwnedChannelStream<T> {
+/// A stream of messages from an MPMC channel.
+pub struct ChannelStream<T> {
     state: Rc<State<T>>,
     notified: Option<Notified<'static>>,
 }
 
-impl<T> OwnedChannelStream<T> {
+impl<T> ChannelStream<T> {
     fn new(state: Rc<State<T>>) -> Self {
-        OwnedChannelStream {
+        ChannelStream {
             state,
             notified: None,
         }
     }
 }
 
-impl<T> Stream for OwnedChannelStream<T> {
+impl<T> Stream for ChannelStream<T> {
     type Item = T;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -477,7 +480,7 @@ impl<T> Stream for OwnedChannelStream<T> {
     }
 }
 
-impl<T> Drop for OwnedChannelStream<T> {
+impl<T> Drop for ChannelStream<T> {
     fn drop(&mut self) {
         self.notified = None;
     }

@@ -26,7 +26,7 @@ fn noop_waker() -> Waker {
 #[test]
 fn loom_oneshot_send_recv() {
     loom::model(|| {
-        let (tx, rx) = oneshot::owned_channel();
+        let (tx, rx) = oneshot::channel();
 
         let t1 = thread::spawn(move || {
             let _ = tx.send(1);
@@ -58,7 +58,7 @@ fn loom_oneshot_send_recv() {
 #[test]
 fn loom_oneshot_drop_sender() {
     loom::model(|| {
-        let (tx, rx) = oneshot::owned_channel::<i32>();
+        let (tx, rx) = oneshot::channel::<i32>();
 
         let t1 = thread::spawn(move || {
             drop(tx);
@@ -90,7 +90,7 @@ fn loom_oneshot_drop_sender() {
 #[test]
 fn loom_oneshot_try_recv() {
     loom::model(|| {
-        let (tx, mut rx) = oneshot::owned_channel();
+        let (tx, mut rx) = oneshot::channel();
 
         // Thread 1: sends
         thread::spawn(move || {
@@ -119,7 +119,7 @@ fn loom_oneshot_try_recv() {
 #[test]
 fn loom_oneshot_close_receiver() {
     loom::model(|| {
-        let (mut tx, rx) = oneshot::owned_channel::<()>();
+        let (mut tx, rx) = oneshot::channel::<()>();
 
         thread::spawn(move || {
             drop(rx);

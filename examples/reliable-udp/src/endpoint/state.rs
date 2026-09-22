@@ -3,7 +3,7 @@ use veloq::{
     std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration, vec::Vec},
     sync::{
         TrySendError,
-        mpmc::{BoundedOwnedReceiver, BoundedOwnedSender},
+        mpmc::{BoundedReceiver, BoundedSender},
         oneshot,
     },
 };
@@ -191,8 +191,8 @@ pub(super) struct ProtocolState<'rt> {
     clock: EndpointClock,
     stats: Arc<EndpointStats>,
     command: CommandSender,
-    accept_tx: BoundedOwnedSender<Connection<'rt>>,
-    accept: BoundedOwnedReceiver<Connection<'rt>>,
+    accept_tx: BoundedSender<Connection<'rt>>,
+    accept: BoundedReceiver<Connection<'rt>>,
     cookie_keys: CookieKeyRing,
     accept_reservations: usize,
 }
@@ -203,8 +203,8 @@ impl<'rt> ProtocolState<'rt> {
         config: Config,
         stats: Arc<EndpointStats>,
         command: CommandSender,
-        accept_tx: BoundedOwnedSender<Connection<'rt>>,
-        accept: BoundedOwnedReceiver<Connection<'rt>>,
+        accept_tx: BoundedSender<Connection<'rt>>,
+        accept: BoundedReceiver<Connection<'rt>>,
         cookie_keys: CookieKeyRing,
     ) -> Self {
         Self {
@@ -343,4 +343,4 @@ pub(super) fn key_from_packet(peer: SocketAddr, connection_id: ConnectionId) -> 
     ConnectionKey::new(peer, connection_id)
 }
 
-pub(super) type ReadySender = oneshot::OwnedSender<Result<()>>;
+pub(super) type ReadySender = oneshot::Sender<Result<()>>;

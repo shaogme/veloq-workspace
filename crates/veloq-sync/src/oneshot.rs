@@ -16,7 +16,7 @@ use veloq_std::{
 };
 
 /// Creates a new one-shot channel state.
-pub fn channel<T>() -> State<T> {
+pub fn borrowed_channel<T>() -> State<T> {
     State::new()
 }
 
@@ -68,13 +68,13 @@ impl<T> State<T> {
     }
 
     /// Splits the state into a sender and a receiver.
-    pub fn split(&self) -> (Sender<'_, T>, Receiver<'_, T>) {
+    pub fn split(&self) -> (BorrowedSender<'_, T>, BorrowedReceiver<'_, T>) {
         (
-            Sender {
+            BorrowedSender {
                 state: self,
                 closed_notified: None,
             },
-            Receiver { state: Some(self) },
+            BorrowedReceiver { state: Some(self) },
         )
     }
 
@@ -141,12 +141,12 @@ impl<T: fmt::Debug> fmt::Debug for State<T> {
     }
 }
 
-pub struct Sender<'a, T> {
+pub struct BorrowedSender<'a, T> {
     state: &'a State<T>,
     closed_notified: Option<Notified<'a>>,
 }
 
-pub struct Receiver<'a, T> {
+pub struct BorrowedReceiver<'a, T> {
     state: Option<&'a State<T>>,
 }
 
@@ -188,9 +188,9 @@ pub mod error {
 
 use self::error::*;
 
-// ===== impl Sender =====
+// ===== impl BorrowedSender =====
 
-impl<'a, T> Sender<'a, T> {
+impl<'a, T> BorrowedSender<'a, T> {
     /// Sends a value.
     ///
     /// This method consumes the sender, ensuring that it is only called once.
@@ -270,7 +270,7 @@ impl<'a, T> Sender<'a, T> {
     }
 }
 
-impl<'a, T> Drop for Sender<'a, T> {
+impl<'a, T> Drop for BorrowedSender<'a, T> {
     fn drop(&mut self) {
         let state = StateVal::load(&self.state.state, Ordering::Acquire);
         if !state.is_complete() {
@@ -279,9 +279,9 @@ impl<'a, T> Drop for Sender<'a, T> {
     }
 }
 
-// ===== impl Receiver =====
+// ===== impl BorrowedReceiver =====
 
-impl<'a, T> Receiver<'a, T> {
+impl<'a, T> BorrowedReceiver<'a, T> {
     /// Prevents the channel from ever delivering a message.
     pub fn close(&mut self) {
         if let Some(state) = self.state {
@@ -344,7 +344,7 @@ impl<'a, T> Receiver<'a, T> {
     }
 }
 
-impl<'a, T> Drop for Receiver<'a, T> {
+impl<'a, T> Drop for BorrowedReceiver<'a, T> {
     fn drop(&mut self) {
         if let Some(state) = self.state.take() {
             // Mark as closed to notify Sender.
@@ -359,7 +359,7 @@ impl<'a, T> Drop for Receiver<'a, T> {
     }
 }
 
-impl<'a, T> Future for Receiver<'a, T> {
+impl<'a, T> Future for BorrowedReceiver<'a, T> {
     type Output = Result<T, RecvError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -373,7 +373,6 @@ impl<'a, T> Future for Receiver<'a, T> {
         // Fast path: check if ready without registering waker.
         let state_val = StateVal::load(&state.state, Ordering::Acquire);
         if state_val.is_complete() {
-            // SAFETY: standard consume logic
             return match unsafe { state.consume_value() } {
                 Some(v) => {
                     self.state = None;
@@ -418,45 +417,45 @@ impl<'a, T> Future for Receiver<'a, T> {
     }
 }
 
-impl<'a, T> fmt::Debug for Sender<'a, T> {
+impl<'a, T> fmt::Debug for BorrowedSender<'a, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Sender").finish()
+        f.debug_struct("BorrowedSender").finish()
     }
 }
 
-impl<'a, T> fmt::Debug for Receiver<'a, T> {
+impl<'a, T> fmt::Debug for BorrowedReceiver<'a, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Receiver").finish()
+        f.debug_struct("BorrowedReceiver").finish()
     }
 }
 
-pub struct OwnedSender<T> {
+pub struct Sender<T> {
     state: ManuallyDrop<Arc<State<T>>>,
     closed_notified: Option<Notified<'static>>,
 }
 
-pub struct OwnedReceiver<T> {
+pub struct Receiver<T> {
     state: Option<Arc<State<T>>>,
 }
 
-pub fn owned_channel<T>() -> (OwnedSender<T>, OwnedReceiver<T>) {
+pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let state = Arc::new(State::new());
     (
-        OwnedSender {
+        Sender {
             state: ManuallyDrop::new(state.clone()),
             closed_notified: None,
         },
-        OwnedReceiver { state: Some(state) },
+        Receiver { state: Some(state) },
     )
 }
 
-impl<T> OwnedSender<T> {
+impl<T> Sender<T> {
     /// Sends a value.
     pub fn send(mut self, t: T) -> Result<(), T> {
         self.closed_notified = None;
         let this = ManuallyDrop::new(self);
         let state = unsafe { veloq_std::ptr::read(&*this.state) };
-        let sender = Sender {
+        let sender = BorrowedSender {
             state: &state,
             closed_notified: None,
         };
@@ -481,7 +480,7 @@ impl<T> OwnedSender<T> {
 
     /// Returns `true` if the receiver has closed the channel.
     pub fn is_closed(&self) -> bool {
-        let sender = ManuallyDrop::new(Sender {
+        let sender = ManuallyDrop::new(BorrowedSender {
             state: &self.state,
             closed_notified: None,
         });
@@ -528,10 +527,10 @@ impl<T> OwnedSender<T> {
     }
 }
 
-impl<T> Drop for OwnedSender<T> {
+impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         self.closed_notified = None;
-        drop(Sender {
+        drop(BorrowedSender {
             state: &self.state,
             closed_notified: None,
         });
@@ -541,17 +540,17 @@ impl<T> Drop for OwnedSender<T> {
     }
 }
 
-impl<T> fmt::Debug for OwnedSender<T> {
+impl<T> fmt::Debug for Sender<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OwnedSender").finish()
+        f.debug_struct("Sender").finish()
     }
 }
 
-impl<T> OwnedReceiver<T> {
+impl<T> Receiver<T> {
     /// Prevents the channel from ever delivering a message.
     pub fn close(&mut self) {
         if let Some(state) = &self.state {
-            let mut receiver = ManuallyDrop::new(Receiver { state: Some(state) });
+            let mut receiver = ManuallyDrop::new(BorrowedReceiver { state: Some(state) });
             receiver.close();
         }
     }
@@ -565,7 +564,7 @@ impl<T> OwnedReceiver<T> {
     pub fn is_empty(&self) -> bool {
         match &self.state {
             Some(state) => {
-                let receiver = ManuallyDrop::new(Receiver { state: Some(state) });
+                let receiver = ManuallyDrop::new(BorrowedReceiver { state: Some(state) });
                 receiver.is_empty()
             }
             None => true,
@@ -578,7 +577,7 @@ impl<T> OwnedReceiver<T> {
             Some(state) => state,
             None => return Err(TryRecvError::Closed),
         };
-        let mut receiver = ManuallyDrop::new(Receiver { state: Some(state) });
+        let mut receiver = ManuallyDrop::new(BorrowedReceiver { state: Some(state) });
         let res = receiver.try_recv();
         if res.is_ok() || matches!(res, Err(TryRecvError::Closed)) {
             self.state = None;
@@ -587,7 +586,7 @@ impl<T> OwnedReceiver<T> {
     }
 }
 
-impl<T> Future for OwnedReceiver<T> {
+impl<T> Future for Receiver<T> {
     type Output = Result<T, RecvError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -595,7 +594,7 @@ impl<T> Future for OwnedReceiver<T> {
             .state
             .as_ref()
             .expect("Receiver polled after completion");
-        let mut receiver = ManuallyDrop::new(Receiver { state: Some(state) });
+        let mut receiver = ManuallyDrop::new(BorrowedReceiver { state: Some(state) });
         let res = Pin::new(&mut *receiver).poll(cx);
         if res.is_ready() {
             self.state = None;
@@ -604,19 +603,19 @@ impl<T> Future for OwnedReceiver<T> {
     }
 }
 
-impl<T> Drop for OwnedReceiver<T> {
+impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         if let Some(state) = self.state.take() {
-            drop(Receiver {
+            drop(BorrowedReceiver {
                 state: Some(&state),
             });
         }
     }
 }
 
-impl<T> fmt::Debug for OwnedReceiver<T> {
+impl<T> fmt::Debug for Receiver<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OwnedReceiver").finish()
+        f.debug_struct("Receiver").finish()
     }
 }
 

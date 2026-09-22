@@ -3,7 +3,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use veloq::{
     buf::FixedBuf,
     std::{marker::PhantomData, net::SocketAddr, sync::Arc, vec::Vec},
-    sync::{mpmc::BoundedOwnedSender, oneshot},
+    sync::{mpmc::BoundedSender, oneshot},
 };
 
 use crate::{
@@ -13,8 +13,8 @@ use crate::{
     session::SendReceipt,
 };
 
-type CommandSender = BoundedOwnedSender<Command>;
-type Reply<T> = oneshot::OwnedSender<Result<T>>;
+type CommandSender = BoundedSender<Command>;
+type Reply<T> = oneshot::Sender<Result<T>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shutdown {
@@ -79,7 +79,7 @@ impl<'rt> Connection<'rt> {
     }
 
     pub async fn open_stream(&self) -> Result<Stream<'rt>> {
-        let (reply, response) = oneshot::owned_channel();
+        let (reply, response) = oneshot::channel();
         self.command
             .send(Command::OpenStream {
                 key: self.key,
@@ -97,7 +97,7 @@ impl<'rt> Connection<'rt> {
     }
 
     pub async fn accept_stream(&self) -> Result<Stream<'rt>> {
-        let (reply, response) = oneshot::owned_channel();
+        let (reply, response) = oneshot::channel();
         self.command
             .send(Command::AcceptStream {
                 key: self.key,
@@ -115,7 +115,7 @@ impl<'rt> Connection<'rt> {
     }
 
     pub async fn abort(&self, code: ConnectionErrorCode) -> Result<()> {
-        let (reply, response) = oneshot::owned_channel();
+        let (reply, response) = oneshot::channel();
         self.command
             .send(Command::Abort {
                 key: self.key,
@@ -129,7 +129,7 @@ impl<'rt> Connection<'rt> {
 
     pub async fn close(mut self) -> Result<()> {
         self.drop_command = false;
-        let (reply, response) = oneshot::owned_channel();
+        let (reply, response) = oneshot::channel();
         self.command
             .send(Command::Close {
                 key: self.key,
@@ -189,7 +189,7 @@ impl<'rt> Stream<'rt> {
         if payload.len() > self.max_message_size {
             return Err(Error::MessageTooLarge);
         }
-        let (reply, response) = oneshot::owned_channel();
+        let (reply, response) = oneshot::channel();
         self.command
             .send(Command::StreamSend {
                 key: self.key,
@@ -206,7 +206,7 @@ impl<'rt> Stream<'rt> {
         if payload.len() > self.max_message_size {
             return Err(Error::MessageTooLarge);
         }
-        let (reply, response) = oneshot::owned_channel();
+        let (reply, response) = oneshot::channel();
         self.command
             .send(Command::StreamSend {
                 key: self.key,
@@ -220,7 +220,7 @@ impl<'rt> Stream<'rt> {
     }
 
     pub async fn recv(&mut self) -> Result<StreamMessage> {
-        let (reply, response) = oneshot::owned_channel();
+        let (reply, response) = oneshot::channel();
         self.command
             .send(Command::StreamRecv {
                 key: self.key,
@@ -233,7 +233,7 @@ impl<'rt> Stream<'rt> {
     }
 
     pub async fn shutdown(&self, how: Shutdown) -> Result<()> {
-        let (reply, response) = oneshot::owned_channel();
+        let (reply, response) = oneshot::channel();
         self.command
             .send(Command::StreamShutdown {
                 key: self.key,
@@ -248,7 +248,7 @@ impl<'rt> Stream<'rt> {
 
     pub async fn close(mut self) -> Result<()> {
         self.drop_command = false;
-        let (reply, response) = oneshot::owned_channel();
+        let (reply, response) = oneshot::channel();
         self.command
             .send(Command::StreamClose {
                 key: self.key,
@@ -336,7 +336,7 @@ impl SendStream<'_> {
         if payload.len() > self.max_message_size {
             return Err(Error::MessageTooLarge);
         }
-        let (reply, response) = oneshot::owned_channel();
+        let (reply, response) = oneshot::channel();
         self.command
             .send(Command::StreamSend {
                 key: self.key,
@@ -353,7 +353,7 @@ impl SendStream<'_> {
         if payload.len() > self.max_message_size {
             return Err(Error::MessageTooLarge);
         }
-        let (reply, response) = oneshot::owned_channel();
+        let (reply, response) = oneshot::channel();
         self.command
             .send(Command::StreamSend {
                 key: self.key,
@@ -398,7 +398,7 @@ impl RecvStream<'_> {
     }
 
     pub async fn recv(&mut self) -> Result<StreamMessage> {
-        let (reply, response) = oneshot::owned_channel();
+        let (reply, response) = oneshot::channel();
         self.command
             .send(Command::StreamRecv {
                 key: self.key,

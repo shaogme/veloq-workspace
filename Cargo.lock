@@ -1558,6 +1558,7 @@ dependencies = [
  "criterion",
  "futures-core",
  "tokio",
+ "trybuild",
  "veloq-intrusive-linklist",
  "veloq-std",
 ]
@@ -1633,6 +1634,7 @@ dependencies = [
  "futures-core",
  "loom",
  "tokio",
+ "trybuild",
  "veloq-intrusive-linklist",
  "veloq-std",
  "veloq-waker",
@@ -1810,6 +1812,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "diagweave",
+ "num_cpus",
 ]
 
 [[package]]

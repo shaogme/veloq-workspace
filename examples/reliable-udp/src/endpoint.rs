@@ -21,7 +21,7 @@ use veloq::{
         time::Duration,
     },
     sync::{
-        mpmc::{BoundedOwnedReceiver, owned_bounded},
+        mpmc::{BoundedReceiver, bounded},
         oneshot,
     },
 };
@@ -39,7 +39,7 @@ use self::{io::CommandSender, state::ProtocolState, stats::EndpointStats};
 static NEXT_CONNECTION_ID: NativeAtomicU64 = NativeAtomicU64::new(0x9e37_79b9_7f4a_7c15);
 
 pub(crate) type ConnectionCommandSender = CommandSender;
-pub(crate) type Reply<T> = oneshot::OwnedSender<Result<T>>;
+pub(crate) type Reply<T> = oneshot::Sender<Result<T>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ConnectionKey {
@@ -118,7 +118,7 @@ pub struct EndpointStatsSnapshot {
 
 pub struct Endpoint<'rt> {
     command: ConnectionCommandSender,
-    accept: BoundedOwnedReceiver<Connection<'rt>>,
+    accept: BoundedReceiver<Connection<'rt>>,
     local_addr: SocketAddr,
     max_message_size: usize,
     stats: Arc<EndpointStats>,
@@ -149,8 +149,8 @@ impl<'rt> Endpoint<'rt> {
         let socket = UdpSocket::bind(ctx, addr).map_err(|_| Error::Io)?;
         let local_addr = socket.local_addr().map_err(|_| Error::Io)?;
         let (command, command_rx) = io::channel(config.command_capacity.get());
-        let (accept_tx, accept_rx) = owned_bounded(config.accept_capacity.get());
-        let (ready, ready_receiver) = oneshot::owned_channel();
+        let (accept_tx, accept_rx) = bounded(config.accept_capacity.get());
+        let (ready, ready_receiver) = oneshot::channel();
         let stats = Arc::new(EndpointStats::new());
         let endpoint = Self {
             command: command.clone(),
@@ -200,7 +200,7 @@ impl<'rt> Endpoint<'rt> {
     pub async fn connect(&self, peer: SocketAddr) -> Result<Connection<'rt>> {
         let connection_id = next_connection_id();
         let key = ConnectionKey::new(peer, connection_id);
-        let (reply, response) = oneshot::owned_channel();
+        let (reply, response) = oneshot::channel();
         self.command
             .send(Command::Connect { key, reply })
             .await
@@ -218,7 +218,7 @@ impl<'rt> Endpoint<'rt> {
     }
 
     pub async fn close(&self) -> Result<()> {
-        let (reply, response) = oneshot::owned_channel();
+        let (reply, response) = oneshot::channel();
         self.command
             .send(Command::CloseEndpoint { reply })
             .await
@@ -227,7 +227,7 @@ impl<'rt> Endpoint<'rt> {
     }
 
     pub async fn rotate_cookie_keys(&self, cookie_keys: CookieKeyRing) -> Result<()> {
-        let (reply, response) = oneshot::owned_channel();
+        let (reply, response) = oneshot::channel();
         self.command
             .send(Command::RotateCookieKeys { cookie_keys, reply })
             .await
@@ -247,7 +247,7 @@ impl<'rt> EndpointDriver<'rt> {
 }
 
 pub struct EndpointReady {
-    receiver: Option<oneshot::OwnedReceiver<Result<()>>>,
+    receiver: Option<oneshot::Receiver<Result<()>>>,
 }
 
 impl EndpointReady {

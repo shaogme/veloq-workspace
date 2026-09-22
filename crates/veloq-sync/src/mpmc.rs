@@ -76,22 +76,30 @@ use flavor::{Bounded, ChannelFlavor, Unbounded};
 
 // --- API ---
 
-pub type Sender<'a, T> = GenericSender<'a, T, Unbounded, SegQueue<T>>;
-pub type Receiver<'a, T> = GenericReceiver<'a, T, Unbounded, SegQueue<T>>;
+// Type Aliases to maintain API compatibility
+pub type BorrowedSender<'a, T> = GenericBorrowedSender<'a, T, Unbounded, SegQueue<T>>;
+pub type BorrowedReceiver<'a, T> = GenericBorrowedReceiver<'a, T, Unbounded, SegQueue<T>>;
+pub type BorrowedBoundedSender<'a, T> = GenericBorrowedSender<'a, T, Bounded, ArrayQueue<T>>;
+pub type BorrowedBoundedReceiver<'a, T> = GenericBorrowedReceiver<'a, T, Bounded, ArrayQueue<T>>;
 
-pub type BoundedSender<'a, T> = GenericSender<'a, T, Bounded, ArrayQueue<T>>;
-pub type BoundedReceiver<'a, T> = GenericReceiver<'a, T, Bounded, ArrayQueue<T>>;
+pub type BoundedBorrowedSender<'a, T> = BorrowedBoundedSender<'a, T>;
+pub type BoundedBorrowedReceiver<'a, T> = BorrowedBoundedReceiver<'a, T>;
 
-pub type OwnedSender<T> = GenericOwnedSender<T, Unbounded, SegQueue<T>>;
-pub type OwnedReceiver<T> = GenericOwnedReceiver<T, Unbounded, SegQueue<T>>;
-pub type BoundedOwnedSender<T> = GenericOwnedSender<T, Bounded, ArrayQueue<T>>;
-pub type BoundedOwnedReceiver<T> = GenericOwnedReceiver<T, Bounded, ArrayQueue<T>>;
+pub type BorrowedGenericSender<'a, T, F, Q> = GenericBorrowedSender<'a, T, F, Q>;
+pub type BorrowedGenericReceiver<'a, T, F, Q> = GenericBorrowedReceiver<'a, T, F, Q>;
 
-pub fn unbounded<T: Send>() -> State<T, Unbounded, SegQueue<T>> {
+pub type Sender<T> = GenericSender<T, Unbounded, SegQueue<T>>;
+pub type Receiver<T> = GenericReceiver<T, Unbounded, SegQueue<T>>;
+pub type BoundedSender<T> = GenericSender<T, Bounded, ArrayQueue<T>>;
+pub type BoundedReceiver<T> = GenericReceiver<T, Bounded, ArrayQueue<T>>;
+
+/// Creates a new unbounded MPMC channel state.
+pub fn borrowed_unbounded<T: Send>() -> State<T, Unbounded, SegQueue<T>> {
     State::new(0)
 }
 
-pub fn bounded<T: Send>(capacity: usize) -> State<T, Bounded, ArrayQueue<T>> {
+/// Creates a new bounded MPMC channel state.
+pub fn borrowed_bounded<T: Send>(capacity: usize) -> State<T, Bounded, ArrayQueue<T>> {
     assert!(capacity > 0);
     State::new(capacity)
 }
@@ -130,13 +138,18 @@ impl<T, F: ChannelFlavor, Q: Queue<T>> State<T, F, Q> {
         }
     }
 
-    pub fn split(&self) -> (GenericSender<'_, T, F, Q>, GenericReceiver<'_, T, F, Q>) {
+    pub fn split(
+        &self,
+    ) -> (
+        GenericBorrowedSender<'_, T, F, Q>,
+        GenericBorrowedReceiver<'_, T, F, Q>,
+    ) {
         self.sender_count.store(1, Ordering::SeqCst);
         self.receiver_count.store(1, Ordering::SeqCst);
         self.is_closed.store(false, Ordering::SeqCst);
         (
-            GenericSender { state: self },
-            GenericReceiver { state: self },
+            GenericBorrowedSender { state: self },
+            GenericBorrowedReceiver { state: self },
         )
     }
 
@@ -174,18 +187,18 @@ impl<T, F: ChannelFlavor, Q: Queue<T>> State<T, F, Q> {
 
 // --- Borrowed Structs ---
 
-pub struct GenericSender<'a, T, F: ChannelFlavor, Q: Queue<T>> {
+pub struct GenericBorrowedSender<'a, T, F: ChannelFlavor, Q: Queue<T>> {
     state: &'a State<T, F, Q>,
 }
 
-impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Clone for GenericSender<'a, T, F, Q> {
+impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Clone for GenericBorrowedSender<'a, T, F, Q> {
     fn clone(&self) -> Self {
         self.state.sender_count.fetch_add(1, Ordering::Relaxed);
         Self { state: self.state }
     }
 }
 
-impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Drop for GenericSender<'a, T, F, Q> {
+impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Drop for GenericBorrowedSender<'a, T, F, Q> {
     fn drop(&mut self) {
         if self.state.sender_count.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.state.close();
@@ -193,18 +206,18 @@ impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Drop for GenericSender<'a, T, F, Q> {
     }
 }
 
-pub struct GenericReceiver<'a, T, F: ChannelFlavor, Q: Queue<T>> {
+pub struct GenericBorrowedReceiver<'a, T, F: ChannelFlavor, Q: Queue<T>> {
     state: &'a State<T, F, Q>,
 }
 
-impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Clone for GenericReceiver<'a, T, F, Q> {
+impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Clone for GenericBorrowedReceiver<'a, T, F, Q> {
     fn clone(&self) -> Self {
         self.state.receiver_count.fetch_add(1, Ordering::Relaxed);
         Self { state: self.state }
     }
 }
 
-impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Drop for GenericReceiver<'a, T, F, Q> {
+impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Drop for GenericBorrowedReceiver<'a, T, F, Q> {
     fn drop(&mut self) {
         self.state.receiver_count.fetch_sub(1, Ordering::Relaxed);
         if self.state.receiver_count.load(Ordering::Acquire) == 0 {
@@ -215,7 +228,7 @@ impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Drop for GenericReceiver<'a, T, F, Q>
 
 // --- Implementations ---
 
-impl<'a, T: Send, F: ChannelFlavor, Q: Queue<T>> GenericSender<'a, T, F, Q> {
+impl<'a, T: Send, F: ChannelFlavor, Q: Queue<T>> GenericBorrowedSender<'a, T, F, Q> {
     pub fn try_send(&self, msg: T) -> Result<(), TrySendError<T>> {
         if self.state.is_closed.load(Ordering::Relaxed) {
             return Err(TrySendError::Closed(msg));
@@ -256,7 +269,7 @@ impl<'a, T: Send, F: ChannelFlavor, Q: Queue<T>> GenericSender<'a, T, F, Q> {
     }
 }
 
-impl<'a, T, F: ChannelFlavor, Q: Queue<T>> GenericReceiver<'a, T, F, Q> {
+impl<'a, T, F: ChannelFlavor, Q: Queue<T>> GenericBorrowedReceiver<'a, T, F, Q> {
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
         if let Some(msg) = self.state.queue.pop() {
             self.state.flavor.release();
@@ -286,8 +299,8 @@ impl<'a, T, F: ChannelFlavor, Q: Queue<T>> GenericReceiver<'a, T, F, Q> {
         .await
     }
 
-    pub fn stream(&self) -> ReceiverStream<'_, 'a, T, F, Q> {
-        ReceiverStream {
+    pub fn stream(&self) -> BorrowedReceiverStream<'_, 'a, T, F, Q> {
+        BorrowedReceiverStream {
             receiver: self,
             node: ConcurrentWaiterNode::new(),
             queued: false,
@@ -298,7 +311,7 @@ impl<'a, T, F: ChannelFlavor, Q: Queue<T>> GenericReceiver<'a, T, F, Q> {
 // --- Futures ---
 
 struct RecvFuture<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> {
-    receiver: &'b GenericReceiver<'a, T, F, Q>,
+    receiver: &'b GenericBorrowedReceiver<'a, T, F, Q>,
     node: ConcurrentWaiterNode,
     queued: bool,
 }
@@ -387,13 +400,13 @@ fn remove_recv_waiter<T, F: ChannelFlavor, Q: Queue<T>>(
     }
 }
 
-pub struct ReceiverStream<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> {
-    receiver: &'b GenericReceiver<'a, T, F, Q>,
+pub struct BorrowedReceiverStream<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> {
+    receiver: &'b GenericBorrowedReceiver<'a, T, F, Q>,
     node: ConcurrentWaiterNode,
     queued: bool,
 }
 
-impl<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> Stream for ReceiverStream<'a, 'b, T, F, Q> {
+impl<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> Stream for BorrowedReceiverStream<'a, 'b, T, F, Q> {
     type Item = T;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -452,7 +465,7 @@ impl<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> Stream for ReceiverStream<'a, 'b,
     }
 }
 
-impl<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> Drop for ReceiverStream<'a, 'b, T, F, Q> {
+impl<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> Drop for BorrowedReceiverStream<'a, 'b, T, F, Q> {
     fn drop(&mut self) {
         if self.queued {
             let node_pin = unsafe { Pin::new_unchecked(&mut self.node) };
@@ -463,17 +476,17 @@ impl<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> Drop for ReceiverStream<'a, 'b, T
 
 // --- Owned Structs ---
 
-pub struct GenericOwnedSender<T, F: ChannelFlavor, Q: Queue<T>> {
+pub struct GenericSender<T, F: ChannelFlavor, Q: Queue<T>> {
     state: Arc<State<T, F, Q>>,
 }
 
-pub struct GenericOwnedReceiver<T, F: ChannelFlavor, Q: Queue<T>> {
+pub struct GenericReceiver<T, F: ChannelFlavor, Q: Queue<T>> {
     state: Arc<State<T, F, Q>>,
 }
 
-impl<T, F: ChannelFlavor, Q: Queue<T>> Clone for GenericOwnedSender<T, F, Q> {
+impl<T, F: ChannelFlavor, Q: Queue<T>> Clone for GenericSender<T, F, Q> {
     fn clone(&self) -> Self {
-        let sender = ManuallyDrop::new(GenericSender { state: &self.state });
+        let sender = ManuallyDrop::new(GenericBorrowedSender { state: &self.state });
         let _cloned = ManuallyDrop::new(sender.clone());
         Self {
             state: self.state.clone(),
@@ -481,15 +494,15 @@ impl<T, F: ChannelFlavor, Q: Queue<T>> Clone for GenericOwnedSender<T, F, Q> {
     }
 }
 
-impl<T, F: ChannelFlavor, Q: Queue<T>> Drop for GenericOwnedSender<T, F, Q> {
+impl<T, F: ChannelFlavor, Q: Queue<T>> Drop for GenericSender<T, F, Q> {
     fn drop(&mut self) {
-        drop(GenericSender { state: &self.state });
+        drop(GenericBorrowedSender { state: &self.state });
     }
 }
 
-impl<T, F: ChannelFlavor, Q: Queue<T>> Clone for GenericOwnedReceiver<T, F, Q> {
+impl<T, F: ChannelFlavor, Q: Queue<T>> Clone for GenericReceiver<T, F, Q> {
     fn clone(&self) -> Self {
-        let receiver = ManuallyDrop::new(GenericReceiver { state: &self.state });
+        let receiver = ManuallyDrop::new(GenericBorrowedReceiver { state: &self.state });
         let _cloned = ManuallyDrop::new(receiver.clone());
         Self {
             state: self.state.clone(),
@@ -497,42 +510,42 @@ impl<T, F: ChannelFlavor, Q: Queue<T>> Clone for GenericOwnedReceiver<T, F, Q> {
     }
 }
 
-impl<T, F: ChannelFlavor, Q: Queue<T>> Drop for GenericOwnedReceiver<T, F, Q> {
+impl<T, F: ChannelFlavor, Q: Queue<T>> Drop for GenericReceiver<T, F, Q> {
     fn drop(&mut self) {
-        drop(GenericReceiver { state: &self.state });
+        drop(GenericBorrowedReceiver { state: &self.state });
     }
 }
 
-impl<T: Send, F: ChannelFlavor, Q: Queue<T>> GenericOwnedSender<T, F, Q> {
+impl<T: Send, F: ChannelFlavor, Q: Queue<T>> GenericSender<T, F, Q> {
     pub fn try_send(&self, msg: T) -> Result<(), TrySendError<T>> {
-        let sender = ManuallyDrop::new(GenericSender { state: &self.state });
+        let sender = ManuallyDrop::new(GenericBorrowedSender { state: &self.state });
         sender.try_send(msg)
     }
 
     pub async fn send(&self, msg: T) -> Result<(), SendError<T>> {
-        let sender = ManuallyDrop::new(GenericSender { state: &self.state });
+        let sender = ManuallyDrop::new(GenericBorrowedSender { state: &self.state });
         sender.send(msg).await
     }
 
     pub fn is_closed(&self) -> bool {
-        let sender = ManuallyDrop::new(GenericSender { state: &self.state });
+        let sender = ManuallyDrop::new(GenericBorrowedSender { state: &self.state });
         sender.is_closed()
     }
 }
 
-impl<T, F: ChannelFlavor, Q: Queue<T>> GenericOwnedReceiver<T, F, Q> {
+impl<T, F: ChannelFlavor, Q: Queue<T>> GenericReceiver<T, F, Q> {
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        let receiver = ManuallyDrop::new(GenericReceiver { state: &self.state });
+        let receiver = ManuallyDrop::new(GenericBorrowedReceiver { state: &self.state });
         receiver.try_recv()
     }
 
     pub async fn recv(&self) -> Result<T, TryRecvError> {
-        let receiver = ManuallyDrop::new(GenericReceiver { state: &self.state });
+        let receiver = ManuallyDrop::new(GenericBorrowedReceiver { state: &self.state });
         receiver.recv().await
     }
 
-    pub fn stream(&self) -> OwnedReceiverStream<'_, T, F, Q> {
-        OwnedReceiverStream {
+    pub fn stream(&self) -> ReceiverStream<'_, T, F, Q> {
+        ReceiverStream {
             state: &self.state,
             node: ConcurrentWaiterNode::new(),
             queued: false,
@@ -540,13 +553,13 @@ impl<T, F: ChannelFlavor, Q: Queue<T>> GenericOwnedReceiver<T, F, Q> {
     }
 }
 
-pub struct OwnedReceiverStream<'a, T, F: ChannelFlavor, Q: Queue<T>> {
+pub struct ReceiverStream<'a, T, F: ChannelFlavor, Q: Queue<T>> {
     state: &'a State<T, F, Q>,
     node: ConcurrentWaiterNode,
     queued: bool,
 }
 
-impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Stream for OwnedReceiverStream<'a, T, F, Q> {
+impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Stream for ReceiverStream<'a, T, F, Q> {
     type Item = T;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -604,7 +617,7 @@ impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Stream for OwnedReceiverStream<'a, T,
     }
 }
 
-impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Drop for OwnedReceiverStream<'a, T, F, Q> {
+impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Drop for ReceiverStream<'a, T, F, Q> {
     fn drop(&mut self) {
         if self.queued {
             let node_pin = unsafe { Pin::new_unchecked(&mut self.node) };
@@ -613,22 +626,22 @@ impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Drop for OwnedReceiverStream<'a, T, F
     }
 }
 
-pub fn owned_unbounded<T: Send>() -> (OwnedSender<T>, OwnedReceiver<T>) {
-    let state = Arc::new(unbounded());
+pub fn unbounded<T: Send>() -> (Sender<T>, Receiver<T>) {
+    let state = Arc::new(borrowed_unbounded());
     (
-        GenericOwnedSender {
+        GenericSender {
             state: state.clone(),
         },
-        GenericOwnedReceiver { state },
+        GenericReceiver { state },
     )
 }
 
-pub fn owned_bounded<T: Send>(capacity: usize) -> (BoundedOwnedSender<T>, BoundedOwnedReceiver<T>) {
-    let state = Arc::new(bounded(capacity));
+pub fn bounded<T: Send>(capacity: usize) -> (BoundedSender<T>, BoundedReceiver<T>) {
+    let state = Arc::new(borrowed_bounded(capacity));
     (
-        GenericOwnedSender {
+        GenericSender {
             state: state.clone(),
         },
-        GenericOwnedReceiver { state },
+        GenericReceiver { state },
     )
 }

@@ -10,7 +10,7 @@ fn loom_mpmc_unbounded_send_recv_async() {
     let mut builder = loom::model::Builder::new();
     builder.preemption_bound = Some(3);
     builder.check(|| {
-        let (tx, rx) = mpmc::owned_unbounded();
+        let (tx, rx) = mpmc::unbounded();
 
         let tx = Arc::new(tx);
         let rx = Arc::new(rx);

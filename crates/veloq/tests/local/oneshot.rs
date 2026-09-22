@@ -20,7 +20,7 @@ where
 #[test]
 fn test_send_recv() {
     run_test(async |ctx| {
-        let state = oneshot::channel();
+        let state = oneshot::borrowed_channel();
         let (tx, rx) = state.split();
 
         scope_local!(ctx, async |s| {
@@ -38,7 +38,7 @@ fn test_send_recv() {
 #[test]
 fn test_tx_closed() {
     run_test(async |_ctx| {
-        let state = oneshot::channel::<i32>();
+        let state = oneshot::borrowed_channel::<i32>();
         let (tx, rx) = state.split();
         drop(tx);
         assert!(rx.await.is_err());
@@ -48,7 +48,7 @@ fn test_tx_closed() {
 #[test]
 fn test_rx_closed() {
     run_test(async |_ctx| {
-        let state = oneshot::channel::<i32>();
+        let state = oneshot::borrowed_channel::<i32>();
         let (tx, rx) = state.split();
 
         assert!(!tx.is_closed());
@@ -63,7 +63,7 @@ fn test_rx_closed() {
 #[test]
 fn test_try_recv() {
     run_test(async |_ctx| {
-        let state = oneshot::channel();
+        let state = oneshot::borrowed_channel();
         let (tx, rx) = state.split();
 
         assert_eq!(rx.try_recv(), Err(oneshot::TryRecvError::Empty));
@@ -79,7 +79,7 @@ fn test_try_recv() {
 #[test]
 fn test_drop_tx_notify() {
     run_test(async |ctx| {
-        let state = oneshot::channel::<i32>();
+        let state = oneshot::borrowed_channel::<i32>();
         let (tx, rx) = state.split();
 
         scope_local!(ctx, async |s| {
@@ -99,7 +99,7 @@ fn test_drop_tx_notify() {
 #[test]
 fn test_send_before_recv() {
     run_test(async |_ctx| {
-        let state = oneshot::channel();
+        let state = oneshot::borrowed_channel();
         let (tx, rx) = state.split();
         tx.send("hello").unwrap();
         assert_eq!(rx.await.unwrap(), "hello");
@@ -109,7 +109,7 @@ fn test_send_before_recv() {
 #[test]
 fn test_owned_oneshot() {
     run_test(async |ctx| {
-        let (tx, rx) = oneshot::owned_channel();
+        let (tx, rx) = oneshot::channel();
 
         scope_local!(ctx, async |s| {
             s.spawn_boxed_local(async move {
