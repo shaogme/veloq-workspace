@@ -1,5 +1,6 @@
 #![no_std]
 
+pub mod broadcast;
 pub mod condvar;
 pub mod mpmc;
 pub mod mpsc;
