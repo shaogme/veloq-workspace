@@ -19,7 +19,6 @@ std = [
     "veloq-std/std",
     "veloq-driver-core/std",
     "veloq-buf/std",
-    "veloq-wheel/std",
     "veloq-blocking/std",
     "veloq-storage/std",
 ]
@@ -27,7 +26,6 @@ loom = [
     "veloq-std/loom",
     "veloq-driver-core/loom",
     "veloq-buf/loom",
-    "veloq-wheel/loom",
     "veloq-blocking/loom",
     "veloq-storage/loom",
 ]

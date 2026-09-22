@@ -13,15 +13,13 @@ readme.workspace = true
 
 [dependencies]
 slotmap.workspace = true
-veloq-std.workspace = true
 
 [dev-dependencies]
+veloq-std.workspace = true
 criterion.workspace = true
 
 [features]
 default = []
-std = ["veloq-std/std"]
-loom = ["veloq-std/loom"]
 
 [lints]
 workspace = true

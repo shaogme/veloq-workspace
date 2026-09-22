@@ -54,8 +54,7 @@ pub mod queue {
     #[cfg(feature = "loom")]
     mod loom_queues {
         use super::Queue;
-        use loom::sync::Mutex;
-        use veloq_std::collections::VecDeque;
+        use veloq_std::{collections::VecDeque, sync::Mutex};
 
         pub struct SegQueue<T> {
             inner: Mutex<VecDeque<T>>,

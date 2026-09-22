@@ -7,7 +7,7 @@ use veloq_std::{
     marker::{PhantomData, Send, Sync},
     mem,
     net::SocketAddr,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{NativeAtomicU64, Ordering},
 };
 
 pub mod driver;
@@ -38,7 +38,7 @@ impl<T> SlotSidecar for T where T: Default + Send {}
 // IoFd
 // ============================================================================
 
-static NEXT_DIRECT_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_DIRECT_OWNER_ID: NativeAtomicU64 = NativeAtomicU64::new(1);
 
 /// Opaque identity for a direct descriptor whose lifetime is owned by a backend.
 ///

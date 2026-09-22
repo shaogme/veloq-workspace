@@ -1669,6 +1669,7 @@ dependencies = [
  "criterion",
  "crossbeam-queue",
  "futures-core",
+ "loom",
  "tokio",
  "veloq-intrusive-linklist",
  "veloq-std",

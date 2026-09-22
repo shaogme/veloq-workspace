@@ -1,6 +1,6 @@
 #![cfg(feature = "std")]
 
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{NativeAtomicUsize, Ordering};
 
 use veloq_std::{
     ffi::OsStr,
@@ -30,7 +30,7 @@ use veloq_std::os::windows::{
 #[cfg(feature = "std")]
 use std::{env, process::id};
 
-static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+static TEST_COUNTER: NativeAtomicUsize = NativeAtomicUsize::new(0);
 
 struct TempFileGuard {
     path: PathBuf,

@@ -8,7 +8,7 @@ use veloq_std::{
     mem::transmute,
     num::NonZeroUsize,
     ops::AsyncFnOnce,
-    sync::{Arc, mpsc},
+    sync::{Arc, NativeArc, mpsc},
     thread,
     vec::Vec,
 };
@@ -210,7 +210,7 @@ impl<T: PoolTopology> Runtime<T> {
                     }
                 }
                 shared.base.unparkers()[worker_id]
-                    .bind(Arc::new(DriverWakerWrapper {
+                    .bind(NativeArc::new(DriverWakerWrapper {
                         waker: remote_waker,
                         worker_id,
                     }))

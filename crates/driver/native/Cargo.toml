@@ -26,7 +26,6 @@ std = [
     "veloq-driver-core/std",
     "veloq-waker/std",
     "veloq-buf/std",
-    "veloq-wheel/std",
     "veloq-blocking/std",
 ]
 loom = [
@@ -36,7 +35,6 @@ loom = [
     "veloq-driver-core/loom",
     "veloq-waker/loom",
     "veloq-buf/loom",
-    "veloq-wheel/loom",
     "veloq-blocking/loom",
 ]
 

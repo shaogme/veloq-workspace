@@ -5,10 +5,12 @@ use crate::{
 use diagweave::prelude::*;
 use veloq_std::{
     boxed::Box,
-    hint::spin_loop,
     sync::{Arc, atomic::Ordering},
     task::Waker,
 };
+
+#[cfg(not(feature = "loom"))]
+use veloq_std::hint::spin_loop;
 
 #[cfg(any(test, feature = "loom"))]
 use veloq_std::string::String;
@@ -452,11 +454,6 @@ where
                 .with_streaming(continuation.is_more())
                 .with_generation(generation),
             Ordering::Release,
-        );
-        #[cfg(feature = "loom")]
-        eprintln!(
-            "TRACE record_completion store {:?}",
-            cell.load_core_state(Ordering::Acquire).status()
         );
 
         cell.completion_waker.wake();

@@ -1,3 +1,5 @@
+#![cfg(not(feature = "loom"))]
+
 //! provided buffer ring 的驱动级测试。
 //!
 //! 每个用例都要求 driver 实际建立 provided buffer ring；是否可用由真实注册结果决定，

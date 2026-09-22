@@ -1,3 +1,5 @@
+#![cfg(not(feature = "loom"))]
+
 use veloq_std::{
     env,
     fs::remove_file,

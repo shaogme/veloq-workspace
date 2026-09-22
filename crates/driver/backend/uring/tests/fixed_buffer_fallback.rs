@@ -1,4 +1,5 @@
 #![cfg(feature = "test-hooks")]
+#![cfg(not(feature = "loom"))]
 
 //! 固定缓冲区注册失败时的严格/兼容模式回归测试。
 
@@ -11,7 +12,7 @@ use veloq_std::{
     process,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{NativeAtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -43,7 +44,7 @@ type ReadRaw = CoreReadRaw<UringRawHandle>;
 type WriteFixed = CoreWriteFixed<UringRawHandle>;
 type WriteRaw = CoreWriteRaw<UringRawHandle>;
 
-static TEMP_FILE_ID: AtomicUsize = AtomicUsize::new(0);
+static TEMP_FILE_ID: NativeAtomicUsize = NativeAtomicUsize::new(0);
 
 struct CleanupFile(PathBuf);
 

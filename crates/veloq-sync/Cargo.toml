@@ -22,6 +22,7 @@ crossbeam-queue.workspace = true
 [dev-dependencies]
 tokio.workspace = true
 criterion.workspace = true
+loom.workspace = true
 
 [lints]
 workspace = true

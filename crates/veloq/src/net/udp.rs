@@ -52,7 +52,7 @@ type UdpRecvDetachedStream<'rt> =
 enum UdpReceiverState<'rt> {
     Created,
     Local(Box<UdpRecvLocalStream<'rt>>),
-    Detached(UdpRecvDetachedStream<'rt>),
+    Detached(Box<UdpRecvDetachedStream<'rt>>),
     Closed,
 }
 
@@ -167,7 +167,7 @@ where
             let stream = self
                 .ctx
                 .driver(|mut driver| Op::new(operation).submit_detached(&mut driver));
-            self.state = UdpReceiverState::Detached(stream);
+            self.state = UdpReceiverState::Detached(Box::new(stream));
             return Ok(());
         }
 
@@ -185,7 +185,7 @@ where
             })
             .trans()?;
         let stream = routed.await.trans()??;
-        self.state = UdpReceiverState::Detached(stream);
+        self.state = UdpReceiverState::Detached(Box::new(stream));
         Ok(())
     }
 
@@ -205,7 +205,7 @@ where
             }
             UdpReceiverState::Detached(stream) => {
                 // SAFETY: see the local stream branch above.
-                unsafe { Pin::new_unchecked(stream) }.poll_next(cx)
+                unsafe { Pin::new_unchecked(&mut **stream) }.poll_next(cx)
             }
             UdpReceiverState::Created | UdpReceiverState::Closed => Poll::Ready(None),
         })

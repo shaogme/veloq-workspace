@@ -1612,7 +1612,7 @@ pub struct ReceivePumpSnapshot {
     pub logical_receiver_generation: u32,
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
     use crate::driver::CompletionContinuation;

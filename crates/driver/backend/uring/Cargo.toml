@@ -19,13 +19,11 @@ std = [
     "veloq-std/std",
     "veloq-driver-core/std",
     "veloq-buf/std",
-    "veloq-wheel/std",
 ]
 loom = [
     "veloq-std/loom",
     "veloq-driver-core/loom",
     "veloq-buf/loom",
-    "veloq-wheel/loom",
 ]
 
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]

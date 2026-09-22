@@ -2,10 +2,10 @@
 use diagweave::Report;
 use veloq_driver_core::{
     DriverCoreError, DriverError,
-    driver::{registry::OpRegistry, *},
+    driver::{CompletionAccess, registry::OpRegistry, *},
     slot::{
         CheckedSlotView, InFlightOrphaned, InFlightWaiting, Slot, SlotRegistryExt, SlotSpec,
-        SlotView,
+        SlotTable, SlotView,
     },
 };
 use veloq_std::{
@@ -152,8 +152,16 @@ fn active_registry() -> (
         .start_submission_with(None)
         .expect("reserved slot should start submission")
         .persist();
-    let table: SharedCompletionTable<DummySlotSpec> = registry.shared.clone();
+    let table = to_shared_table(registry.shared.clone());
     (Arc::new(Mutex::new(registry)), table, token)
+}
+
+fn to_shared_table<Spec: SlotSpec + 'static>(
+    table: Arc<SlotTable<Spec>>,
+) -> SharedCompletionTable<Spec> {
+    let ptr = Arc::into_raw(table);
+    let trait_ptr: *const dyn CompletionAccess<Spec> = ptr;
+    unsafe { Arc::from_raw(trait_ptr) }
 }
 
 fn accept_completion(registry: &Mutex<OpRegistry<DummySlotSpec>>, token: OpToken, res: i32) {
@@ -166,9 +174,9 @@ fn accept_completion_with(
     res: i32,
     continuation: CompletionContinuation,
 ) {
-    let mut registry = registry.lock();
+    let mut registry = registry.lock().unwrap();
     let diagnostics = registry.shared.completion_diagnostics();
-    let table: SharedCompletionTable<DummySlotSpec> = registry.shared.clone();
+    let table = to_shared_table(registry.shared.clone());
     let mut hooks = TestHooks::with_continuation(continuation);
     registry
         .accept_completion(

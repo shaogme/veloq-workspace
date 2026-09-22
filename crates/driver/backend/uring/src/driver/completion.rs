@@ -1,11 +1,5 @@
 use veloq_std::{format, num::NonZeroU8, time::Instant};
 
-#[cfg(test)]
-use veloq_std::sync::atomic::Ordering;
-
-#[cfg(test)]
-use veloq_std::{collections::HashMap, sync::atomic::AtomicU8};
-
 use diagweave::prelude::*;
 use tracing::{debug, trace, warn};
 use veloq_io_uring::cqueue;
@@ -91,10 +85,6 @@ impl CompletionEngine {
     }
 }
 
-#[cfg(test)]
-use crate::driver::control::ControlPlaneObserver;
-#[cfg(test)]
-use crate::driver::control::waker::{WAKER_NOTIFIED, WAKER_PROCESSING};
 use veloq_driver_core::{
     driver::{
         AnomalyAttach, CancelMode, CancelTicket, CompletionAnomalyKind, CompletionBackend,
@@ -1649,10 +1639,13 @@ pub(crate) fn driver_result_to_event_res(res: &UringResult<usize>) -> i32 {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
-    use crate::driver::control::{UringControlEffectKind, UringPostCompletionEffects};
+    use crate::driver::control::{
+        ControlPlaneObserver, UringControlEffectKind, UringPostCompletionEffects,
+        waker::{WAKER_NOTIFIED, WAKER_PROCESSING},
+    };
     use crate::driver::{
         drive::{WaitBudget, wait_budget},
         registration::provided_buf::{ProvidedBufGroup, ProvidedBufPort, test_group},
@@ -1665,7 +1658,11 @@ mod tests {
     use crate::test_alloc::measure;
     use veloq_driver_core::driver::{CompletionToken, SharedCompletionTable};
     use veloq_driver_core::slot::Generation;
-    use veloq_std::time::Duration;
+    use veloq_std::{
+        collections::HashMap,
+        sync::atomic::{AtomicU8, Ordering},
+        time::Duration,
+    };
 
     #[test]
     fn completion_effect_scratch_recycles_without_allocating() {
