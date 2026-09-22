@@ -1,18 +1,13 @@
-use veloq_intrusive_linklist::LinkedList;
+use crate::{wait_queue::WaitQueue, waker::WaiterNode};
 use veloq_std::{
     fmt,
     future::Future,
     marker::PhantomPinned,
     pin::Pin,
     ptr::NonNull,
-    sync::{
-        SpinLock,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::atomic::{AtomicUsize, Ordering},
     task::{Context, Poll},
 };
-
-use crate::waker::{WaiterAdapter, WaiterNode};
 
 const EMPTY: usize = 0;
 const PERMIT: usize = 1;
@@ -28,7 +23,7 @@ const NOTIFIED_ALL: usize = 2;
 /// or all waiting tasks via `notify_waiters`.
 pub struct Notify {
     state: AtomicUsize,
-    waiters: SpinLock<LinkedList<WaiterAdapter>>,
+    waiters: WaitQueue,
 }
 
 unsafe impl Send for Notify {}
@@ -40,7 +35,7 @@ impl Notify {
     pub const fn new() -> Self {
         Self {
             state: AtomicUsize::new(EMPTY),
-            waiters: SpinLock::new(LinkedList::new(WaiterAdapter::NEW)),
+            waiters: WaitQueue::new(),
         }
     }
 
@@ -49,7 +44,7 @@ impl Notify {
     pub fn new() -> Self {
         Self {
             state: AtomicUsize::new(EMPTY),
-            waiters: SpinLock::new(LinkedList::new(WaiterAdapter::NEW)),
+            waiters: WaitQueue::new(),
         }
     }
 
@@ -63,9 +58,8 @@ impl Notify {
             return;
         }
 
-        let mut waiters = self.waiters.lock();
-        let mut unparked = false;
-        waiters.with_mut(|w| {
+        self.waiters.with_lock(|w| {
+            let mut unparked = false;
             if let Some(mut node) = w.pop_front() {
                 unsafe {
                     node.as_mut().get_unchecked_mut().kind = NOTIFIED_ONE;
@@ -73,29 +67,28 @@ impl Notify {
                 node.as_ref().waker.wake();
                 unparked = true;
             }
-        });
 
-        if unparked {
-            let is_empty = waiters.with(|w| w.is_empty());
-            self.state
-                .store(if is_empty { EMPTY } else { WAITING }, Ordering::Release);
-        } else {
-            self.state.store(PERMIT, Ordering::Release);
-        }
+            if unparked {
+                let is_empty = w.is_empty();
+                self.state
+                    .store(if is_empty { EMPTY } else { WAITING }, Ordering::Release);
+            } else {
+                self.state.store(PERMIT, Ordering::Release);
+            }
+        });
     }
 
     /// Notifies all waiting tasks.
     ///
     /// If there are no waiting tasks, no permit is saved.
     pub fn notify_waiters(&self) {
-        let mut waiters = self.waiters.lock();
-        if waiters.with(|w| w.is_empty()) {
-            return;
-        }
+        self.waiters.with_lock(|w| {
+            if w.is_empty() {
+                return;
+            }
 
-        self.state.store(EMPTY, Ordering::Release);
+            self.state.store(EMPTY, Ordering::Release);
 
-        waiters.with_mut(|w| {
             while let Some(mut node) = w.pop_front() {
                 unsafe {
                     node.as_mut().get_unchecked_mut().kind = NOTIFIED_ALL;
@@ -160,20 +153,21 @@ impl<'a> Notified<'a> {
             return;
         }
 
-        let mut waiters = this.notify.waiters.lock();
-        if this.notify.state.load(Ordering::Acquire) == PERMIT {
-            this.notify.state.store(EMPTY, Ordering::Release);
-            this.completed = true;
-            return;
-        }
+        this.notify.waiters.with_lock(|w| {
+            if this.notify.state.load(Ordering::Acquire) == PERMIT {
+                this.notify.state.store(EMPTY, Ordering::Release);
+                this.completed = true;
+                return;
+            }
 
-        this.node.kind = NOT_NOTIFIED;
-        unsafe {
-            let node_pin = Pin::new_unchecked(&mut this.node);
-            waiters.with_mut(|w| w.push_back(node_pin));
-        }
-        this.notify.state.store(WAITING, Ordering::Release);
-        this.queued = true;
+            this.node.kind = NOT_NOTIFIED;
+            unsafe {
+                let node_pin = Pin::new_unchecked(&mut this.node);
+                w.push_back(node_pin);
+            }
+            this.notify.state.store(WAITING, Ordering::Release);
+            this.queued = true;
+        });
     }
 }
 
@@ -189,16 +183,14 @@ impl<'a> Future for Notified<'a> {
 
         loop {
             if this.queued {
-                let waiters = this.notify.waiters.lock();
-                let is_linked = waiters.with(|_| this.node.link.is_linked());
-                if !is_linked {
+                if !this
+                    .notify
+                    .waiters
+                    .update_waker_if_linked(&mut this.node, cx)
+                {
                     this.queued = false;
                     this.completed = true;
                     return Poll::Ready(());
-                }
-
-                unsafe {
-                    this.node.waker.register(cx.waker());
                 }
                 return Poll::Pending;
             }
@@ -219,21 +211,27 @@ impl<'a> Future for Notified<'a> {
             }
 
             // 2. Lock waiters
-            let mut waiters = this.notify.waiters.lock();
-            if this.notify.state.load(Ordering::Acquire) == PERMIT {
-                this.notify.state.store(EMPTY, Ordering::Release);
-                this.completed = true;
+            let mut immediate = false;
+            this.notify.waiters.with_lock(|w| {
+                if this.notify.state.load(Ordering::Acquire) == PERMIT {
+                    this.notify.state.store(EMPTY, Ordering::Release);
+                    this.completed = true;
+                    immediate = true;
+                    return;
+                }
+
+                this.node.kind = NOT_NOTIFIED;
+                unsafe {
+                    this.node.waker.register(cx.waker());
+                    let node_pin = Pin::new_unchecked(&mut this.node);
+                    w.push_back(node_pin);
+                }
+                this.notify.state.store(WAITING, Ordering::Release);
+                this.queued = true;
+            });
+            if immediate {
                 return Poll::Ready(());
             }
-
-            this.node.kind = NOT_NOTIFIED;
-            unsafe {
-                this.node.waker.register(cx.waker());
-                let node_pin = Pin::new_unchecked(&mut this.node);
-                waiters.with_mut(|w| w.push_back(node_pin));
-            }
-            this.notify.state.store(WAITING, Ordering::Release);
-            this.queued = true;
             return Poll::Pending;
         }
     }
@@ -246,24 +244,20 @@ impl<'a> Drop for Notified<'a> {
         }
 
         if self.queued {
-            let mut waiters = self.notify.waiters.lock();
-            let is_linked = waiters.with(|_| self.node.link.is_linked());
-            if is_linked {
-                unsafe {
-                    let ptr = NonNull::from(&self.node);
-                    waiters.with_mut(|w| {
+            self.notify.waiters.with_lock(|w| {
+                if self.node.link.is_linked() {
+                    unsafe {
+                        let ptr = NonNull::from(&self.node);
                         let mut cursor = w.cursor_mut_from_ptr(ptr);
                         cursor.remove();
-                    });
-                }
-                if waiters.with(|w| w.is_empty()) {
-                    self.notify.state.store(EMPTY, Ordering::Release);
-                }
-            } else if self.node.kind == NOTIFIED_ONE {
-                // Was popped by notify_one, but dropped before poll completion.
-                // Transfer notification to next waiter or restore permit.
-                let mut unparked = false;
-                waiters.with_mut(|w| {
+                    }
+                    if w.is_empty() {
+                        self.notify.state.store(EMPTY, Ordering::Release);
+                    }
+                } else if self.node.kind == NOTIFIED_ONE {
+                    // Was popped by notify_one, but dropped before poll completion.
+                    // Transfer notification to next waiter or restore permit.
+                    let mut unparked = false;
                     if let Some(mut next) = w.pop_front() {
                         unsafe {
                             next.as_mut().get_unchecked_mut().kind = NOTIFIED_ONE;
@@ -271,17 +265,17 @@ impl<'a> Drop for Notified<'a> {
                         next.as_ref().waker.wake();
                         unparked = true;
                     }
-                });
 
-                if unparked {
-                    let is_empty = waiters.with(|w| w.is_empty());
-                    self.notify
-                        .state
-                        .store(if is_empty { EMPTY } else { WAITING }, Ordering::Release);
-                } else {
-                    self.notify.state.store(PERMIT, Ordering::Release);
+                    if unparked {
+                        let is_empty = w.is_empty();
+                        self.notify
+                            .state
+                            .store(if is_empty { EMPTY } else { WAITING }, Ordering::Release);
+                    } else {
+                        self.notify.state.store(PERMIT, Ordering::Release);
+                    }
                 }
-            }
+            });
         }
     }
 }

@@ -1,59 +1,33 @@
 use crate::{
-    common::update_waker,
     mutex::{Mutex, MutexGuard, MutexLockFuture},
+    wait_queue::WaitQueue,
+    waker::WaiterNode,
 };
 use futures_core::Future;
-use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 use veloq_std::{
-    cell::{Cell, RefCell},
     fmt,
     marker::PhantomPinned,
     pin::Pin,
-    ptr::NonNull,
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
 };
 
 const NOT_NOTIFIED: usize = 0;
 const NOTIFIED_ONE: usize = 1;
 const NOTIFIED_ALL: usize = 2;
 
-struct WaiterNode {
-    waker: RefCell<Option<Waker>>,
-    link: Link,
-    kind: Cell<usize>,
-    _p: PhantomPinned,
-}
-
-impl WaiterNode {
-    fn new() -> Self {
-        Self {
-            waker: RefCell::new(None),
-            link: Link::new(),
-            kind: Cell::new(NOT_NOTIFIED),
-            _p: PhantomPinned,
-        }
-    }
-}
-
-intrusive_adapter!(WaiterAdapter = WaiterNode { link: Link });
-
-impl WaiterAdapter {
-    const NEW: Self = Self;
-}
-
 /// An asynchronous condition variable for local/single-threaded contexts.
 ///
 /// A condition variable enables tasks to wait for an event or a condition to be met
 /// in conjunction with a local [`Mutex`].
 pub struct Condvar {
-    waiters: RefCell<LinkedList<WaiterAdapter>>,
+    waiters: WaitQueue,
 }
 
 impl Condvar {
     /// Creates a new condition variable.
     pub const fn new() -> Self {
         Self {
-            waiters: RefCell::new(LinkedList::new(WaiterAdapter::NEW)),
+            waiters: WaitQueue::new(),
         }
     }
 
@@ -61,28 +35,18 @@ impl Condvar {
     ///
     /// If there are no waiting tasks, this call has no effect.
     pub fn notify_one(&self) {
-        let mut waiters = self.waiters.borrow_mut();
-        if let Some(node) = waiters.pop_front() {
-            node.kind.set(NOTIFIED_ONE);
-            let waker = node.waker.borrow_mut().take();
-            drop(waiters);
-            if let Some(waker) = waker {
-                waker.wake();
-            }
-        }
+        self.waiters.wake_one_with(|node| {
+            node.kind = NOTIFIED_ONE;
+        });
     }
 
     /// Wakes up all tasks that are waiting on this condition variable.
     ///
     /// If there are no waiting tasks, this call has no effect.
     pub fn notify_all(&self) {
-        let mut waiters = self.waiters.borrow_mut();
-        while let Some(node) = waiters.pop_front() {
-            node.kind.set(NOTIFIED_ALL);
-            if let Some(waker) = node.waker.borrow_mut().take() {
-                waker.wake();
-            }
-        }
+        self.waiters.wake_all_with(|node| {
+            node.kind = NOTIFIED_ALL;
+        });
     }
 
     /// Waits on this condition variable, releasing the mutex guard and re-acquiring it before returning.
@@ -149,7 +113,7 @@ impl<'c, 'a, T: ?Sized> Future for Wait<'c, 'a, T> {
             let res = unsafe { Pin::new_unchecked(lock_fut) }.poll(cx);
             if let Poll::Ready(new_guard) = res {
                 this.lock_fut = None;
-                this.node.kind.set(NOT_NOTIFIED);
+                this.node.kind = NOT_NOTIFIED;
                 return Poll::Ready(new_guard);
             }
             return Poll::Pending;
@@ -157,12 +121,10 @@ impl<'c, 'a, T: ?Sized> Future for Wait<'c, 'a, T> {
 
         // 2. Initial poll: register waker, enqueue into cvar, and release mutex
         if !this.queued {
-            update_waker(&mut this.node.waker.borrow_mut(), cx.waker());
-            this.node.kind.set(NOT_NOTIFIED);
-
+            this.node.kind = NOT_NOTIFIED;
             unsafe {
                 let node_pin = Pin::new_unchecked(&mut this.node);
-                this.cvar.waiters.borrow_mut().push_back(node_pin);
+                this.cvar.waiters.register_and_push(node_pin, cx);
             }
             this.queued = true;
 
@@ -172,10 +134,8 @@ impl<'c, 'a, T: ?Sized> Future for Wait<'c, 'a, T> {
             return Poll::Pending;
         }
 
-        // 3. We were queued in cvar. Check if we were dequeued (notified).
-        let is_linked = this.node.link.is_linked();
-
-        if !is_linked {
+        // 3. We are queued in cvar. Check if we were dequeued (notified).
+        if !this.cvar.waiters.update_waker_if_linked(&mut this.node, cx) {
             this.queued = false;
 
             // Start re-acquiring the mutex lock. Place in this.lock_fut before polling
@@ -184,13 +144,11 @@ impl<'c, 'a, T: ?Sized> Future for Wait<'c, 'a, T> {
             let res = unsafe { Pin::new_unchecked(lock_fut) }.poll(cx);
             if let Poll::Ready(new_guard) = res {
                 this.lock_fut = None;
-                this.node.kind.set(NOT_NOTIFIED);
+                this.node.kind = NOT_NOTIFIED;
                 return Poll::Ready(new_guard);
             }
             Poll::Pending
         } else {
-            // Still in queue, refresh waker.
-            update_waker(&mut this.node.waker.borrow_mut(), cx.waker());
             Poll::Pending
         }
     }
@@ -204,37 +162,18 @@ impl<'c, 'a, T: ?Sized> Drop for Wait<'c, 'a, T> {
         }
 
         if self.queued {
-            let is_linked = self.node.link.is_linked();
-            if is_linked {
-                unsafe {
-                    let ptr = NonNull::from(&self.node);
-                    let mut waiters = self.cvar.waiters.borrow_mut();
-                    let mut cursor = waiters.cursor_mut_from_ptr(ptr);
-                    cursor.remove();
-                }
-            } else if self.node.kind.get() == NOTIFIED_ONE {
-                self.node.kind.set(NOT_NOTIFIED);
-                let mut waiters = self.cvar.waiters.borrow_mut();
-                if let Some(next) = waiters.pop_front() {
-                    next.kind.set(NOTIFIED_ONE);
-                    let waker = next.waker.borrow_mut().take();
-                    drop(waiters);
-                    if let Some(waker) = waker {
-                        waker.wake();
-                    }
-                }
+            if !self.cvar.waiters.remove(&self.node) && self.node.kind == NOTIFIED_ONE {
+                self.node.kind = NOT_NOTIFIED;
+                self.cvar.waiters.wake_one_with(|next| {
+                    next.kind = NOTIFIED_ONE;
+                });
             }
-        } else if self.node.kind.get() == NOTIFIED_ONE {
-            self.node.kind.set(NOT_NOTIFIED);
-            let mut waiters = self.cvar.waiters.borrow_mut();
-            if let Some(next) = waiters.pop_front() {
-                next.kind.set(NOTIFIED_ONE);
-                let waker = next.waker.borrow_mut().take();
-                drop(waiters);
-                if let Some(waker) = waker {
-                    waker.wake();
-                }
-            }
+            self.queued = false;
+        } else if self.node.kind == NOTIFIED_ONE {
+            self.node.kind = NOT_NOTIFIED;
+            self.cvar.waiters.wake_one_with(|next| {
+                next.kind = NOTIFIED_ONE;
+            });
         }
     }
 }

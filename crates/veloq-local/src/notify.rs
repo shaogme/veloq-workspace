@@ -1,44 +1,17 @@
+use crate::{wait_queue::WaitQueue, waker::WaiterNode};
 use futures_core::Future;
-use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 use veloq_std::{
-    cell::{Cell, RefCell},
+    cell::Cell,
     fmt,
     marker::PhantomPinned,
     pin::Pin,
-    ptr::NonNull,
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
 };
-
-use crate::common::update_waker;
 
 const NOT_NOTIFIED: usize = 0;
 const NOTIFIED_ONE: usize = 1;
 const NOTIFIED_ALL: usize = 2;
 const NOTIFIED_CONSUMED: usize = 3;
-
-struct WaiterNode {
-    waker: RefCell<Option<Waker>>,
-    link: Link,
-    kind: Cell<usize>,
-    _p: PhantomPinned,
-}
-
-impl WaiterNode {
-    fn new() -> Self {
-        Self {
-            waker: RefCell::new(None),
-            link: Link::new(),
-            kind: Cell::new(NOT_NOTIFIED),
-            _p: PhantomPinned,
-        }
-    }
-}
-
-intrusive_adapter!(WaiterAdapter = WaiterNode { link: Link });
-
-impl WaiterAdapter {
-    const NEW: Self = Self;
-}
 
 /// An asynchronous event notification primitive for local/single-threaded contexts.
 ///
@@ -46,7 +19,7 @@ impl WaiterAdapter {
 /// or all waiting tasks via `notify_waiters`.
 pub struct Notify {
     has_permit: Cell<bool>,
-    waiters: RefCell<LinkedList<WaiterAdapter>>,
+    waiters: WaitQueue,
 }
 
 impl Notify {
@@ -54,7 +27,7 @@ impl Notify {
     pub const fn new() -> Self {
         Self {
             has_permit: Cell::new(false),
-            waiters: RefCell::new(LinkedList::new(WaiterAdapter::NEW)),
+            waiters: WaitQueue::new(),
         }
     }
 
@@ -68,15 +41,10 @@ impl Notify {
             return;
         }
 
-        let mut waiters = self.waiters.borrow_mut();
-        if let Some(node) = waiters.pop_front() {
-            node.kind.set(NOTIFIED_ONE);
-            let waker = node.waker.borrow_mut().take();
-            drop(waiters);
-            if let Some(waker) = waker {
-                waker.wake();
-            }
-        } else {
+        let woken = self.waiters.wake_one_with(|node| {
+            node.kind = NOTIFIED_ONE;
+        });
+        if !woken {
             self.has_permit.set(true);
         }
     }
@@ -85,13 +53,9 @@ impl Notify {
     ///
     /// If there are no waiting tasks, no permit is saved.
     pub fn notify_waiters(&self) {
-        let mut waiters = self.waiters.borrow_mut();
-        while let Some(node) = waiters.pop_front() {
-            node.kind.set(NOTIFIED_ALL);
-            if let Some(waker) = node.waker.borrow_mut().take() {
-                waker.wake();
-            }
-        }
+        self.waiters.wake_all_with(|node| {
+            node.kind = NOTIFIED_ALL;
+        });
     }
 
     /// Returns a future that completes once notified.
@@ -131,20 +95,20 @@ impl<'a> Notified<'a> {
     /// Pre-registers this waiter in the notification queue.
     pub fn enable(self: Pin<&mut Self>) {
         let this = unsafe { self.get_unchecked_mut() };
-        if this.queued || this.node.kind.get() == NOTIFIED_CONSUMED {
+        if this.queued || this.node.kind == NOTIFIED_CONSUMED {
             return;
         }
 
         if this.notify.has_permit.get() {
             this.notify.has_permit.set(false);
-            this.node.kind.set(NOTIFIED_CONSUMED);
+            this.node.kind = NOTIFIED_CONSUMED;
             return;
         }
 
-        this.node.kind.set(NOT_NOTIFIED);
+        this.node.kind = NOT_NOTIFIED;
         unsafe {
             let node_pin = Pin::new_unchecked(&mut this.node);
-            this.notify.waiters.borrow_mut().push_back(node_pin);
+            this.notify.waiters.push_back(node_pin);
         }
         this.queued = true;
     }
@@ -156,32 +120,33 @@ impl<'a> Future for Notified<'a> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if this.node.kind.get() == NOTIFIED_CONSUMED {
+        if this.node.kind == NOTIFIED_CONSUMED {
             return Poll::Ready(());
         }
 
         if this.queued {
-            let is_linked = this.node.link.is_linked();
+            let is_linked = this
+                .notify
+                .waiters
+                .update_waker_if_linked(&mut this.node, cx);
             if !is_linked {
                 this.queued = false;
-                this.node.kind.set(NOTIFIED_CONSUMED);
+                this.node.kind = NOTIFIED_CONSUMED;
                 return Poll::Ready(());
             }
-            update_waker(&mut this.node.waker.borrow_mut(), cx.waker());
             return Poll::Pending;
         }
 
         if this.notify.has_permit.get() {
             this.notify.has_permit.set(false);
-            this.node.kind.set(NOTIFIED_CONSUMED);
+            this.node.kind = NOTIFIED_CONSUMED;
             return Poll::Ready(());
         }
 
-        this.node.kind.set(NOT_NOTIFIED);
-        update_waker(&mut this.node.waker.borrow_mut(), cx.waker());
+        this.node.kind = NOT_NOTIFIED;
         unsafe {
             let node_pin = Pin::new_unchecked(&mut this.node);
-            this.notify.waiters.borrow_mut().push_back(node_pin);
+            this.notify.waiters.register_and_push(node_pin, cx);
         }
         this.queued = true;
         Poll::Pending
@@ -190,31 +155,17 @@ impl<'a> Future for Notified<'a> {
 
 impl<'a> Drop for Notified<'a> {
     fn drop(&mut self) {
-        if self.node.kind.get() == NOTIFIED_CONSUMED {
+        if self.node.kind == NOTIFIED_CONSUMED {
             return;
         }
 
-        if self.queued {
-            let is_linked = self.node.link.is_linked();
-            if is_linked {
-                unsafe {
-                    let ptr = NonNull::from(&self.node);
-                    let mut waiters = self.notify.waiters.borrow_mut();
-                    let mut cursor = waiters.cursor_mut_from_ptr(ptr);
-                    cursor.remove();
-                }
-            } else if self.node.kind.get() == NOTIFIED_ONE {
-                let mut waiters = self.notify.waiters.borrow_mut();
-                if let Some(next) = waiters.pop_front() {
-                    next.kind.set(NOTIFIED_ONE);
-                    let waker = next.waker.borrow_mut().take();
-                    drop(waiters);
-                    if let Some(waker) = waker {
-                        waker.wake();
-                    }
-                } else {
-                    self.notify.has_permit.set(true);
-                }
+        if self.queued && !self.notify.waiters.remove(&self.node) && self.node.kind == NOTIFIED_ONE
+        {
+            let woken = self.notify.waiters.wake_one_with(|next| {
+                next.kind = NOTIFIED_ONE;
+            });
+            if !woken {
+                self.notify.has_permit.set(true);
             }
         }
     }

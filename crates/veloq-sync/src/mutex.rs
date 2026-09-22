@@ -1,5 +1,4 @@
-use crate::waker::{WaiterAdapter, WaiterNode};
-use veloq_intrusive_linklist::LinkedList;
+use crate::{wait_queue::WaitQueue, waker::WaiterNode};
 use veloq_std::{
     cell::UnsafeCell,
     future::Future,
@@ -7,17 +6,14 @@ use veloq_std::{
     ops::{Deref, DerefMut},
     pin::Pin,
     ptr::NonNull,
-    sync::{
-        SpinLock,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::atomic::{AtomicUsize, Ordering},
     task::{Context, Poll},
 };
 
 /// An asynchronous mutual exclusion primitive.
 pub struct Mutex<T: ?Sized> {
     state: AtomicUsize,
-    waiters: SpinLock<LinkedList<WaiterAdapter>>,
+    waiters: WaitQueue,
     data: UnsafeCell<T>,
 }
 
@@ -30,7 +26,7 @@ impl<T> Mutex<T> {
     pub const fn new(data: T) -> Self {
         Self {
             state: AtomicUsize::new(0),
-            waiters: SpinLock::new(LinkedList::new(WaiterAdapter::NEW)),
+            waiters: WaitQueue::new(),
             data: UnsafeCell::new(data),
         }
     }
@@ -40,7 +36,7 @@ impl<T> Mutex<T> {
     pub fn new(data: T) -> Self {
         Self {
             state: AtomicUsize::new(0),
-            waiters: SpinLock::new(LinkedList::new(WaiterAdapter::NEW)),
+            waiters: WaitQueue::new(),
             data: UnsafeCell::new(data),
         }
     }
@@ -78,8 +74,7 @@ impl<T: ?Sized> Mutex<T> {
     /// Attempts to acquire the lock immediately.
     #[inline]
     pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
-        let waiters = self.waiters.lock();
-        if waiters.with(|w| w.is_empty())
+        if self.waiters.is_empty()
             && self
                 .state
                 .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
@@ -137,8 +132,7 @@ impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
 
 impl<T: ?Sized> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
-        let mut waiters = self.lock.waiters.lock();
-        waiters.with_mut(|w| {
+        self.lock.waiters.with_lock(|w| {
             if let Some(mut node) = w.pop_front() {
                 // 1. 持锁者在释放且队列非空时，直接向队头节点授予锁（STATE_GRANTED），并将状态维持为锁定，外部不能插队。
                 // SAFETY: We do not move the node out of Pin.
@@ -170,11 +164,12 @@ impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
 
         // 2. 被唤醒者无需重新参与非公平抢锁，直接接收锁所有权，从源头杜绝唤醒丢失。
         if this.queued {
-            let waiters = this.lock.waiters.lock();
-            let is_granted = waiters.with(|_| this.node.kind == STATE_GRANTED);
+            let is_granted = this
+                .lock
+                .waiters
+                .with_lock_ref(|_| this.node.kind == STATE_GRANTED);
             if is_granted {
                 this.queued = false;
-                drop(waiters);
                 return Poll::Ready(MutexGuard { lock: this.lock });
             }
 
@@ -182,7 +177,6 @@ impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
             unsafe {
                 this.node.waker.register(cx.waker());
             }
-            drop(waiters);
             return Poll::Pending;
         }
 
@@ -215,28 +209,32 @@ impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
                 this.node.waker.register(cx.waker());
             }
 
-            let mut waiters = this.lock.waiters.lock();
+            let mut acquired = false;
+            this.lock.waiters.with_lock(|w| {
+                // Double check: if it became unlocked while acquiring waiters lock
+                let is_empty = w.is_empty();
+                if is_empty
+                    && this
+                        .lock
+                        .state
+                        .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+                        .is_ok()
+                {
+                    acquired = true;
+                    return;
+                }
 
-            // Double check: if it became unlocked while acquiring waiters lock
-            let is_empty = waiters.with(|w| w.is_empty());
-            if is_empty
-                && this
-                    .lock
-                    .state
-                    .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-            {
-                drop(waiters);
+                this.node.kind = STATE_WAITING;
+                unsafe {
+                    let node_pin = Pin::new_unchecked(&mut this.node);
+                    w.push_back(node_pin);
+                }
+                this.queued = true;
+            });
+
+            if acquired {
                 return Poll::Ready(MutexGuard { lock: this.lock });
             }
-
-            this.node.kind = STATE_WAITING;
-            unsafe {
-                let node_pin = Pin::new_unchecked(&mut this.node);
-                waiters.with_mut(|w| w.push_back(node_pin));
-            }
-            this.queued = true;
-            drop(waiters);
             return Poll::Pending;
         }
     }
@@ -245,8 +243,7 @@ impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
 impl<'a, T: ?Sized> Drop for MutexLockFuture<'a, T> {
     fn drop(&mut self) {
         if self.queued {
-            let mut waiters = self.lock.waiters.lock();
-            waiters.with_mut(|w| {
+            self.lock.waiters.with_lock(|w| {
                 if self.node.kind == STATE_GRANTED {
                     // 3. 若等待者在持有 STATE_GRANTED 时被取消（Drop），安全地将所有权级联顺延给下一等待者或重置为 UNLOCKED。
                     if let Some(mut next_node) = w.pop_front() {

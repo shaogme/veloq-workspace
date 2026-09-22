@@ -1,37 +1,12 @@
-use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
+use crate::{wait_queue::WaitQueue, waker::WaiterNode};
 use veloq_std::{
-    cell::{Cell, RefCell, UnsafeCell},
+    cell::{Cell, UnsafeCell},
     fmt,
     future::Future,
     marker::PhantomPinned,
     pin::Pin,
-    ptr::NonNull,
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
 };
-
-use crate::common::update_waker;
-
-struct WaiterNode {
-    waker: RefCell<Option<Waker>>,
-    link: Link,
-    _p: PhantomPinned,
-}
-
-impl WaiterNode {
-    fn new() -> Self {
-        Self {
-            waker: RefCell::new(None),
-            link: Link::new(),
-            _p: PhantomPinned,
-        }
-    }
-}
-
-intrusive_adapter!(WaiterAdapter = WaiterNode { link: Link });
-
-impl WaiterAdapter {
-    const NEW: Self = Self;
-}
 
 /// Error returned when setting a value on an already initialized `SetOnce`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -62,7 +37,7 @@ impl<T> veloq_std::error::Error for SetOnceError<T> {}
 /// and awaited asynchronously by multiple readers.
 pub struct SetOnce<T> {
     initialized: Cell<bool>,
-    waiters: RefCell<LinkedList<WaiterAdapter>>,
+    waiters: WaitQueue,
     value: UnsafeCell<Option<T>>,
 }
 
@@ -72,7 +47,7 @@ impl<T> SetOnce<T> {
     pub const fn new() -> Self {
         Self {
             initialized: Cell::new(false),
-            waiters: RefCell::new(LinkedList::new(WaiterAdapter::NEW)),
+            waiters: WaitQueue::new(),
             value: UnsafeCell::new(None),
         }
     }
@@ -82,7 +57,7 @@ impl<T> SetOnce<T> {
     pub fn new() -> Self {
         Self {
             initialized: Cell::new(false),
-            waiters: RefCell::new(LinkedList::new(WaiterAdapter::NEW)),
+            waiters: WaitQueue::new(),
             value: UnsafeCell::new(None),
         }
     }
@@ -100,7 +75,7 @@ impl<T> SetOnce<T> {
     pub const fn with_value(value: T) -> Self {
         Self {
             initialized: Cell::new(true),
-            waiters: RefCell::new(LinkedList::new(WaiterAdapter::NEW)),
+            waiters: WaitQueue::new(),
             value: UnsafeCell::new(Some(value)),
         }
     }
@@ -110,7 +85,7 @@ impl<T> SetOnce<T> {
     pub fn with_value(value: T) -> Self {
         Self {
             initialized: Cell::new(true),
-            waiters: RefCell::new(LinkedList::new(WaiterAdapter::NEW)),
+            waiters: WaitQueue::new(),
             value: UnsafeCell::new(Some(value)),
         }
     }
@@ -141,12 +116,7 @@ impl<T> SetOnce<T> {
         }
         self.initialized.set(true);
 
-        let mut waiters = self.waiters.borrow_mut();
-        while let Some(node) = waiters.pop_front() {
-            if let Some(waker) = node.waker.borrow_mut().take() {
-                waker.wake();
-            }
-        }
+        self.waiters.wake_all();
 
         Ok(())
     }
@@ -223,14 +193,15 @@ impl<'a, T> Future for Wait<'a, T> {
         }
 
         if this.queued {
-            update_waker(&mut this.node.waker.borrow_mut(), cx.waker());
+            this.set_once
+                .waiters
+                .update_waker_if_linked(&mut this.node, cx);
             return Poll::Pending;
         }
 
-        update_waker(&mut this.node.waker.borrow_mut(), cx.waker());
         unsafe {
             let node_pin = Pin::new_unchecked(&mut this.node);
-            this.set_once.waiters.borrow_mut().push_back(node_pin);
+            this.set_once.waiters.register_and_push(node_pin, cx);
         }
         this.queued = true;
         Poll::Pending
@@ -239,13 +210,8 @@ impl<'a, T> Future for Wait<'a, T> {
 
 impl<T> Drop for Wait<'_, T> {
     fn drop(&mut self) {
-        if self.queued && self.node.link.is_linked() {
-            unsafe {
-                let ptr = NonNull::from(&self.node);
-                let mut waiters = self.set_once.waiters.borrow_mut();
-                let mut cursor = waiters.cursor_mut_from_ptr(ptr);
-                cursor.remove();
-            }
+        if self.queued {
+            self.set_once.waiters.remove(&self.node);
             self.queued = false;
         }
     }

@@ -1,6 +1,6 @@
-use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
+use crate::{wait_queue::WaitQueue, waker::WaiterNode};
 use veloq_std::{
-    cell::{Cell, RefCell, UnsafeCell},
+    cell::{Cell, UnsafeCell},
     fmt,
     future::Future,
     marker::PhantomPinned,
@@ -8,10 +8,8 @@ use veloq_std::{
     ops::{Deref, DerefMut},
     pin::Pin,
     ptr::NonNull,
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
 };
-
-use crate::common::update_waker;
 
 const KIND_READER: usize = 0;
 const KIND_WRITER: usize = 1;
@@ -20,37 +18,11 @@ const STATE_WAITING: usize = 0;
 const STATE_GRANTED: usize = 1;
 const STATE_CONSUMED: usize = 2;
 
-struct WaiterNode {
-    waker: RefCell<Option<Waker>>,
-    link: Link,
-    kind: usize,
-    state: Cell<usize>,
-    _p: PhantomPinned,
-}
-
-impl WaiterNode {
-    fn new(kind: usize) -> Self {
-        Self {
-            waker: RefCell::new(None),
-            link: Link::new(),
-            kind,
-            state: Cell::new(STATE_WAITING),
-            _p: PhantomPinned,
-        }
-    }
-}
-
-intrusive_adapter!(WaiterAdapter = WaiterNode { link: Link });
-
-impl WaiterAdapter {
-    const NEW: Self = Self;
-}
-
 /// An asynchronous reader-writer lock for local/single-threaded contexts.
 pub struct RwLock<T: ?Sized> {
     writer_locked: Cell<bool>,
     reader_count: Cell<usize>,
-    waiters: RefCell<LinkedList<WaiterAdapter>>,
+    waiters: WaitQueue,
     data: UnsafeCell<T>,
 }
 
@@ -61,7 +33,7 @@ impl<T> RwLock<T> {
         Self {
             writer_locked: Cell::new(false),
             reader_count: Cell::new(0),
-            waiters: RefCell::new(LinkedList::new(WaiterAdapter::NEW)),
+            waiters: WaitQueue::new(),
             data: UnsafeCell::new(data),
         }
     }
@@ -72,7 +44,7 @@ impl<T> RwLock<T> {
         Self {
             writer_locked: Cell::new(false),
             reader_count: Cell::new(0),
-            waiters: RefCell::new(LinkedList::new(WaiterAdapter::NEW)),
+            waiters: WaitQueue::new(),
             data: UnsafeCell::new(data),
         }
     }
@@ -111,7 +83,7 @@ impl<T: ?Sized> RwLock<T> {
     /// Returns `Some(RwLockReadGuard)` if successful, or `None` if the lock is held by a writer
     /// or if there are pending waiters.
     pub fn try_read(&self) -> Option<RwLockReadGuard<'_, T>> {
-        if self.writer_locked.get() || !self.waiters.borrow().is_empty() {
+        if self.writer_locked.get() || !self.waiters.is_empty() {
             return None;
         }
 
@@ -128,7 +100,7 @@ impl<T: ?Sized> RwLock<T> {
     pub fn read(&self) -> RwLockReadFuture<'_, T> {
         RwLockReadFuture {
             lock: self,
-            node: WaiterNode::new(KIND_READER),
+            node: WaiterNode::new_with_kind(KIND_READER),
             queued: false,
             _pin: PhantomPinned,
         }
@@ -139,10 +111,7 @@ impl<T: ?Sized> RwLock<T> {
     /// Returns `Some(RwLockWriteGuard)` if successful, or `None` if the lock is currently
     /// held by any reader or writer, or if there are pending waiters.
     pub fn try_write(&self) -> Option<RwLockWriteGuard<'_, T>> {
-        if !self.writer_locked.get()
-            && self.reader_count.get() == 0
-            && self.waiters.borrow().is_empty()
-        {
+        if !self.writer_locked.get() && self.reader_count.get() == 0 && self.waiters.is_empty() {
             self.writer_locked.set(true);
             Some(RwLockWriteGuard { lock: self })
         } else {
@@ -154,7 +123,7 @@ impl<T: ?Sized> RwLock<T> {
     pub fn write(&self) -> RwLockWriteFuture<'_, T> {
         RwLockWriteFuture {
             lock: self,
-            node: WaiterNode::new(KIND_WRITER),
+            node: WaiterNode::new_with_kind(KIND_WRITER),
             queued: false,
             _pin: PhantomPinned,
         }
@@ -192,73 +161,77 @@ impl<T> From<T> for RwLock<T> {
 }
 
 fn release_write_lock<T: ?Sized>(lock: &RwLock<T>) {
-    let mut waiters = lock.waiters.borrow_mut();
-    if let Some(front) = waiters.front().get()
-        && front.kind == KIND_WRITER
-    {
-        let writer = waiters.pop_front().unwrap();
-        lock.writer_locked.set(true);
-        writer.state.set(STATE_GRANTED);
-        let waker = writer.waker.borrow_mut().take();
-        drop(waiters);
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-        return;
-    }
-
-    lock.writer_locked.set(false);
-    while let Some(front) = waiters.front().get() {
-        if front.kind == KIND_READER {
-            let reader = waiters.pop_front().unwrap();
-            lock.reader_count.set(lock.reader_count.get() + 1);
-            reader.state.set(STATE_GRANTED);
-            let waker = reader.waker.borrow_mut().take();
-            drop(waiters);
-            if let Some(waker) = waker {
-                waker.wake();
+    lock.waiters.with_lock(|w| {
+        if let Some(front) = w.front().get()
+            && front.kind == KIND_WRITER
+        {
+            let mut writer = w.pop_front().unwrap();
+            lock.writer_locked.set(true);
+            unsafe {
+                let node_mut = writer.as_mut().get_unchecked_mut();
+                node_mut.state = STATE_GRANTED;
+                if let Some(waker) = node_mut.waker.take() {
+                    waker.wake();
+                }
             }
-            waiters = lock.waiters.borrow_mut();
-        } else {
-            break;
+            return;
         }
-    }
+
+        lock.writer_locked.set(false);
+        while let Some(front) = w.front().get() {
+            if front.kind == KIND_READER {
+                let mut reader = w.pop_front().unwrap();
+                lock.reader_count.set(lock.reader_count.get() + 1);
+                unsafe {
+                    let node_mut = reader.as_mut().get_unchecked_mut();
+                    node_mut.state = STATE_GRANTED;
+                    if let Some(waker) = node_mut.waker.take() {
+                        waker.wake();
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+    });
 }
 
 fn release_read_lock<T: ?Sized>(lock: &RwLock<T>) {
     let readers = lock.reader_count.get() - 1;
     lock.reader_count.set(readers);
     if readers == 0 {
-        let mut waiters = lock.waiters.borrow_mut();
-        if let Some(front) = waiters.front().get()
-            && front.kind == KIND_WRITER
-        {
-            let writer = waiters.pop_front().unwrap();
-            lock.writer_locked.set(true);
-            writer.state.set(STATE_GRANTED);
-            let waker = writer.waker.borrow_mut().take();
-            drop(waiters);
-            if let Some(waker) = waker {
-                waker.wake();
-            }
-            return;
-        }
-
-        while let Some(front) = waiters.front().get() {
-            if front.kind == KIND_READER {
-                let reader = waiters.pop_front().unwrap();
-                lock.reader_count.set(lock.reader_count.get() + 1);
-                reader.state.set(STATE_GRANTED);
-                let waker = reader.waker.borrow_mut().take();
-                drop(waiters);
-                if let Some(waker) = waker {
-                    waker.wake();
+        lock.waiters.with_lock(|w| {
+            if let Some(front) = w.front().get()
+                && front.kind == KIND_WRITER
+            {
+                let mut writer = w.pop_front().unwrap();
+                lock.writer_locked.set(true);
+                unsafe {
+                    let node_mut = writer.as_mut().get_unchecked_mut();
+                    node_mut.state = STATE_GRANTED;
+                    if let Some(waker) = node_mut.waker.take() {
+                        waker.wake();
+                    }
                 }
-                waiters = lock.waiters.borrow_mut();
-            } else {
-                break;
+                return;
             }
-        }
+
+            while let Some(front) = w.front().get() {
+                if front.kind == KIND_READER {
+                    let mut reader = w.pop_front().unwrap();
+                    lock.reader_count.set(lock.reader_count.get() + 1);
+                    unsafe {
+                        let node_mut = reader.as_mut().get_unchecked_mut();
+                        node_mut.state = STATE_GRANTED;
+                        if let Some(waker) = node_mut.waker.take() {
+                            waker.wake();
+                        }
+                    }
+                } else {
+                    break;
+                }
+            }
+        });
     }
 }
 
@@ -321,22 +294,23 @@ impl<'a, T: ?Sized> RwLockWriteGuard<'a, T> {
         lock.writer_locked.set(false);
         lock.reader_count.set(1);
 
-        let mut waiters = lock.waiters.borrow_mut();
-        while let Some(front) = waiters.front().get() {
-            if front.kind == KIND_READER {
-                let reader = waiters.pop_front().unwrap();
-                lock.reader_count.set(lock.reader_count.get() + 1);
-                reader.state.set(STATE_GRANTED);
-                let waker = reader.waker.borrow_mut().take();
-                drop(waiters);
-                if let Some(waker) = waker {
-                    waker.wake();
+        lock.waiters.with_lock(|w| {
+            while let Some(front) = w.front().get() {
+                if front.kind == KIND_READER {
+                    let mut reader = w.pop_front().unwrap();
+                    lock.reader_count.set(lock.reader_count.get() + 1);
+                    unsafe {
+                        let node_mut = reader.as_mut().get_unchecked_mut();
+                        node_mut.state = STATE_GRANTED;
+                        if let Some(waker) = node_mut.waker.take() {
+                            waker.wake();
+                        }
+                    }
+                } else {
+                    break;
                 }
-                waiters = lock.waiters.borrow_mut();
-            } else {
-                break;
             }
-        }
+        });
 
         RwLockReadGuard { lock }
     }
@@ -374,32 +348,31 @@ impl<'a, T: ?Sized> Future for RwLockReadFuture<'a, T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if this.node.state.get() == STATE_GRANTED {
+        if this.node.state == STATE_GRANTED {
             this.queued = false;
-            this.node.state.set(STATE_CONSUMED);
+            this.node.state = STATE_CONSUMED;
             return Poll::Ready(RwLockReadGuard { lock: this.lock });
         }
 
         if this.queued {
-            update_waker(&mut this.node.waker.borrow_mut(), cx.waker());
+            this.lock.waiters.update_waker_if_linked(&mut this.node, cx);
             return Poll::Pending;
         }
 
-        if !this.lock.writer_locked.get() && this.lock.waiters.borrow().is_empty() {
+        if !this.lock.writer_locked.get() && this.lock.waiters.is_empty() {
             let readers = this.lock.reader_count.get();
             if readers == usize::MAX {
                 panic!("RwLock reader count overflow");
             }
             this.lock.reader_count.set(readers + 1);
-            this.node.state.set(STATE_CONSUMED);
+            this.node.state = STATE_CONSUMED;
             return Poll::Ready(RwLockReadGuard { lock: this.lock });
         }
 
-        this.node.state.set(STATE_WAITING);
-        update_waker(&mut this.node.waker.borrow_mut(), cx.waker());
+        this.node.state = STATE_WAITING;
         unsafe {
             let node_pin = Pin::new_unchecked(&mut this.node);
-            this.lock.waiters.borrow_mut().push_back(node_pin);
+            this.lock.waiters.register_and_push(node_pin, cx);
         }
         this.queued = true;
         Poll::Pending
@@ -408,36 +381,40 @@ impl<'a, T: ?Sized> Future for RwLockReadFuture<'a, T> {
 
 impl<'a, T: ?Sized> Drop for RwLockReadFuture<'a, T> {
     fn drop(&mut self) {
-        if self.node.state.get() == STATE_CONSUMED {
+        if self.node.state == STATE_CONSUMED {
             return;
         }
 
-        if self.node.state.get() == STATE_GRANTED {
+        if self.node.state == STATE_GRANTED {
             release_read_lock(self.lock);
             return;
         }
 
-        if self.queued && self.node.link.is_linked() {
-            let mut waiters = self.lock.waiters.borrow_mut();
-            unsafe {
-                let ptr = NonNull::from(&self.node);
-                let mut cursor = waiters.cursor_mut_from_ptr(ptr);
-                cursor.remove();
-            }
-            if !self.lock.writer_locked.get()
-                && self.lock.reader_count.get() == 0
-                && let Some(front) = waiters.front().get()
-                && front.kind == KIND_WRITER
-            {
-                let writer = waiters.pop_front().unwrap();
-                self.lock.writer_locked.set(true);
-                writer.state.set(STATE_GRANTED);
-                let waker = writer.waker.borrow_mut().take();
-                drop(waiters);
-                if let Some(waker) = waker {
-                    waker.wake();
+        if self.queued {
+            self.lock.waiters.with_lock(|w| {
+                if self.node.link.is_linked() {
+                    unsafe {
+                        let ptr = NonNull::from(&self.node);
+                        let mut cursor = w.cursor_mut_from_ptr(ptr);
+                        cursor.remove();
+                    }
+                    if !self.lock.writer_locked.get()
+                        && self.lock.reader_count.get() == 0
+                        && let Some(front) = w.front().get()
+                        && front.kind == KIND_WRITER
+                    {
+                        let mut writer = w.pop_front().unwrap();
+                        self.lock.writer_locked.set(true);
+                        unsafe {
+                            let node_mut = writer.as_mut().get_unchecked_mut();
+                            node_mut.state = STATE_GRANTED;
+                            if let Some(waker) = node_mut.waker.take() {
+                                waker.wake();
+                            }
+                        }
+                    }
                 }
-            }
+            });
         }
     }
 }
@@ -464,31 +441,30 @@ impl<'a, T: ?Sized> Future for RwLockWriteFuture<'a, T> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if this.node.state.get() == STATE_GRANTED {
+        if this.node.state == STATE_GRANTED {
             this.queued = false;
-            this.node.state.set(STATE_CONSUMED);
+            this.node.state = STATE_CONSUMED;
             return Poll::Ready(RwLockWriteGuard { lock: this.lock });
         }
 
         if this.queued {
-            update_waker(&mut this.node.waker.borrow_mut(), cx.waker());
+            this.lock.waiters.update_waker_if_linked(&mut this.node, cx);
             return Poll::Pending;
         }
 
         if !this.lock.writer_locked.get()
             && this.lock.reader_count.get() == 0
-            && this.lock.waiters.borrow().is_empty()
+            && this.lock.waiters.is_empty()
         {
             this.lock.writer_locked.set(true);
-            this.node.state.set(STATE_CONSUMED);
+            this.node.state = STATE_CONSUMED;
             return Poll::Ready(RwLockWriteGuard { lock: this.lock });
         }
 
-        this.node.state.set(STATE_WAITING);
-        update_waker(&mut this.node.waker.borrow_mut(), cx.waker());
+        this.node.state = STATE_WAITING;
         unsafe {
             let node_pin = Pin::new_unchecked(&mut this.node);
-            this.lock.waiters.borrow_mut().push_back(node_pin);
+            this.lock.waiters.register_and_push(node_pin, cx);
         }
         this.queued = true;
         Poll::Pending
@@ -497,39 +473,42 @@ impl<'a, T: ?Sized> Future for RwLockWriteFuture<'a, T> {
 
 impl<'a, T: ?Sized> Drop for RwLockWriteFuture<'a, T> {
     fn drop(&mut self) {
-        if self.node.state.get() == STATE_CONSUMED {
+        if self.node.state == STATE_CONSUMED {
             return;
         }
 
-        if self.node.state.get() == STATE_GRANTED {
+        if self.node.state == STATE_GRANTED {
             release_write_lock(self.lock);
             return;
         }
 
-        if self.queued && self.node.link.is_linked() {
-            let mut waiters = self.lock.waiters.borrow_mut();
-            unsafe {
-                let ptr = NonNull::from(&self.node);
-                let mut cursor = waiters.cursor_mut_from_ptr(ptr);
-                cursor.remove();
-            }
-            if !self.lock.writer_locked.get() {
-                while let Some(front) = waiters.front().get() {
-                    if front.kind == KIND_READER {
-                        let reader = waiters.pop_front().unwrap();
-                        self.lock.reader_count.set(self.lock.reader_count.get() + 1);
-                        reader.state.set(STATE_GRANTED);
-                        let waker = reader.waker.borrow_mut().take();
-                        drop(waiters);
-                        if let Some(waker) = waker {
-                            waker.wake();
+        if self.queued {
+            self.lock.waiters.with_lock(|w| {
+                if self.node.link.is_linked() {
+                    unsafe {
+                        let ptr = NonNull::from(&self.node);
+                        let mut cursor = w.cursor_mut_from_ptr(ptr);
+                        cursor.remove();
+                    }
+                    if !self.lock.writer_locked.get() {
+                        while let Some(front) = w.front().get() {
+                            if front.kind == KIND_READER {
+                                let mut reader = w.pop_front().unwrap();
+                                self.lock.reader_count.set(self.lock.reader_count.get() + 1);
+                                unsafe {
+                                    let node_mut = reader.as_mut().get_unchecked_mut();
+                                    node_mut.state = STATE_GRANTED;
+                                    if let Some(waker) = node_mut.waker.take() {
+                                        waker.wake();
+                                    }
+                                }
+                            } else {
+                                break;
+                            }
                         }
-                        waiters = self.lock.waiters.borrow_mut();
-                    } else {
-                        break;
                     }
                 }
-            }
+            });
         }
     }
 }

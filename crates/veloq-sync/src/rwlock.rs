@@ -1,22 +1,18 @@
-use crate::waker::{WaiterAdapter, WaiterNode};
-use veloq_intrusive_linklist::LinkedList;
+use crate::{wait_queue::WaitQueue, waker::WaiterNode};
 use veloq_std::{
     cell::UnsafeCell,
     future::Future,
     ops::{Deref, DerefMut},
     pin::Pin,
     ptr::NonNull,
-    sync::{
-        SpinLock,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::atomic::{AtomicUsize, Ordering},
     task::{Context, Poll},
 };
 
 /// An asynchronous reader-writer lock.
 pub struct RwLock<T: ?Sized> {
     state: AtomicUsize,
-    waiters: SpinLock<LinkedList<WaiterAdapter>>,
+    waiters: WaitQueue,
     data: UnsafeCell<T>,
 }
 
@@ -37,7 +33,7 @@ impl<T> RwLock<T> {
     pub const fn new(data: T) -> Self {
         Self {
             state: AtomicUsize::new(0),
-            waiters: SpinLock::new(LinkedList::new(WaiterAdapter::NEW)),
+            waiters: WaitQueue::new(),
             data: UnsafeCell::new(data),
         }
     }
@@ -47,7 +43,7 @@ impl<T> RwLock<T> {
     pub fn new(data: T) -> Self {
         Self {
             state: AtomicUsize::new(0),
-            waiters: SpinLock::new(LinkedList::new(WaiterAdapter::NEW)),
+            waiters: WaitQueue::new(),
             data: UnsafeCell::new(data),
         }
     }
@@ -151,12 +147,7 @@ impl<T: ?Sized> Drop for RwLockReadGuard<'_, T> {
 
         // If we were the last reader and there are waiters, wake one.
         if (prev & READER_MASK) == READER_UNIT && (prev & CONTENDED) != 0 {
-            let mut waiters = self.lock.waiters.lock();
-            waiters.with_mut(|w| {
-                if let Some(node) = w.pop_front() {
-                    node.as_ref().waker.wake();
-                }
-            });
+            self.lock.waiters.wake_one();
         }
     }
 }
@@ -211,16 +202,13 @@ impl<'a, T: ?Sized> RwLockWriteGuard<'a, T> {
 
         // If there are waiters, and the first one is a reader, wake it up.
         // It will then likely wake subsequent readers (cascade).
-        {
-            let mut waiters = lock.waiters.lock();
-            waiters.with_mut(|w| {
-                if let Some(node) = w.front_mut().get()
-                    && node.kind == KIND_READER
-                {
-                    node.waker.wake();
-                }
-            });
-        }
+        lock.waiters.with_lock(|w| {
+            if let Some(node) = w.front_mut().get()
+                && node.kind == KIND_READER
+            {
+                node.waker.wake();
+            }
+        });
 
         RwLockReadGuard { lock }
     }
@@ -242,12 +230,7 @@ impl<T: ?Sized> Drop for RwLockWriteGuard<'_, T> {
         self.lock.state.store(0, Ordering::Release);
 
         // Wake the next waiter
-        let mut waiters = self.lock.waiters.lock();
-        waiters.with_mut(|w| {
-            if let Some(node) = w.pop_front() {
-                node.as_ref().waker.wake();
-            }
-        });
+        self.lock.waiters.wake_one();
     }
 }
 
@@ -290,29 +273,26 @@ impl<'a, T: ?Sized> Future for RwLockReadFuture<'a, T> {
                     {
                         // Success
                         if this.queued || this.woken {
-                            let mut waiters = this.lock.waiters.lock();
-                            let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
-                            // Remove ourselves if still linked
-                            let is_linked = waiters.with(|_| node_pin.as_ref().link.is_linked());
-                            if is_linked {
-                                unsafe {
-                                    let ptr = NonNull::from(&*node_pin);
-                                    waiters.with_mut(|w| {
+                            this.lock.waiters.with_lock(|w| {
+                                let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
+                                // Remove ourselves if still linked
+                                let is_linked = node_pin.as_ref().link.is_linked();
+                                if is_linked {
+                                    unsafe {
+                                        let ptr = NonNull::from(&*node_pin);
                                         let mut cursor = w.cursor_mut_from_ptr(ptr);
                                         cursor.remove();
-                                    });
+                                    }
                                 }
-                            }
 
-                            // Update CONTENDED bit based on remaining waiters
-                            if waiters.with(|w| w.is_empty()) {
-                                this.lock.state.fetch_and(!CONTENDED, Ordering::Release);
-                            } else {
-                                this.lock.state.fetch_or(CONTENDED, Ordering::Relaxed);
-                            }
+                                // Update CONTENDED bit based on remaining waiters
+                                if w.is_empty() {
+                                    this.lock.state.fetch_and(!CONTENDED, Ordering::Release);
+                                } else {
+                                    this.lock.state.fetch_or(CONTENDED, Ordering::Relaxed);
+                                }
 
-                            // Cascade wake: if next is reader, wake it
-                            waiters.with_mut(|w| {
+                                // Cascade wake: if next is reader, wake it
                                 if let Some(next) = w.front_mut().get()
                                     && next.kind == KIND_READER
                                 {
@@ -345,38 +325,38 @@ impl<'a, T: ?Sized> Future for RwLockReadFuture<'a, T> {
             if !this.queued {
                 this.node.kind = KIND_READER;
 
-                let mut waiters = this.lock.waiters.lock();
+                let mut retry = false;
+                this.lock.waiters.with_lock(|w| {
+                    let current = this.lock.state.load(Ordering::Relaxed);
 
-                // Double check state
-                let current = this.lock.state.load(Ordering::Relaxed);
+                    // If writer lock is NOT held and there are no other waiters, we can just continue and try to acquire.
+                    // We rely on waiters.is_empty() for fairness check instead of just the CONTENDED bit,
+                    // because the CONTENDED bit might not be perfectly synchronized with the queue state yet,
+                    // or we might have raced.
+                    if (current & WRITER_LOCKED) == 0 && w.is_empty() {
+                        retry = true;
+                        return;
+                    }
 
-                // If writer lock is NOT held and there are no other waiters, we can just continue and try to acquire.
-                // We rely on waiters.is_empty() for fairness check instead of just the CONTENDED bit,
-                // because the CONTENDED bit might not be perfectly synchronized with the queue state yet,
-                // or we might have raced.
-                if (current & WRITER_LOCKED) == 0 && waiters.with(|w| w.is_empty()) {
-                    drop(waiters);
+                    // We are going to queue. Ensure CONTENDED bit is set.
+                    // We do this inside the lock to avoid race with the releaser.
+                    if (current & CONTENDED) == 0 {
+                        this.lock.state.fetch_or(CONTENDED, Ordering::Relaxed);
+                    }
+
+                    unsafe {
+                        let node_pin = Pin::new_unchecked(&mut this.node);
+                        w.push_back(node_pin);
+                    }
+                    this.queued = true;
+                });
+
+                if retry {
                     continue;
                 }
-
-                // We are going to queue. Ensure CONTENDED bit is set.
-                // We do this inside the lock to avoid race with the releaser.
-                if (current & CONTENDED) == 0 {
-                    this.lock.state.fetch_or(CONTENDED, Ordering::Relaxed);
-                }
-
-                unsafe {
-                    let node_pin = Pin::new_unchecked(&mut this.node);
-                    waiters.with_mut(|w| w.push_back(node_pin));
-                }
-                this.queued = true;
             } else {
                 // Check if woken
-                let is_linked = {
-                    let waiters = this.lock.waiters.lock();
-                    waiters.with(|_| this.node.link.is_linked())
-                };
-                if !is_linked {
+                if !this.lock.waiters.is_linked(&this.node) {
                     this.woken = true;
                     this.queued = false;
                     continue;
@@ -391,17 +371,7 @@ impl<'a, T: ?Sized> Future for RwLockReadFuture<'a, T> {
 impl<'a, T: ?Sized> Drop for RwLockReadFuture<'a, T> {
     fn drop(&mut self) {
         if self.queued {
-            let mut waiters = self.lock.waiters.lock();
-            let is_linked = waiters.with(|_| self.node.link.is_linked());
-            if is_linked {
-                unsafe {
-                    let ptr = NonNull::from(&self.node);
-                    waiters.with_mut(|w| {
-                        let mut cursor = w.cursor_mut_from_ptr(ptr);
-                        cursor.remove();
-                    });
-                }
-            }
+            self.lock.waiters.remove(&self.node);
         }
     }
 }
@@ -452,25 +422,24 @@ impl<'a, T: ?Sized> Future for RwLockWriteFuture<'a, T> {
                     .is_ok()
                 {
                     if this.queued || this.woken {
-                        let mut waiters = this.lock.waiters.lock();
-                        let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
-                        let is_linked = waiters.with(|_| node_pin.as_ref().link.is_linked());
-                        if is_linked {
-                            unsafe {
-                                let ptr = NonNull::from(&*node_pin);
-                                waiters.with_mut(|w| {
+                        this.lock.waiters.with_lock(|w| {
+                            let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
+                            let is_linked = node_pin.as_ref().link.is_linked();
+                            if is_linked {
+                                unsafe {
+                                    let ptr = NonNull::from(&*node_pin);
                                     let mut cursor = w.cursor_mut_from_ptr(ptr);
                                     cursor.remove();
-                                });
+                                }
                             }
-                        }
-                        if waiters.with(|w| w.is_empty()) {
-                            // Clear CONTENDED if no one else
-                            this.lock.state.fetch_and(!CONTENDED, Ordering::Release);
-                        } else {
-                            // Ensure CONTENDED bit is set if there are other waiters
-                            this.lock.state.fetch_or(CONTENDED, Ordering::Relaxed);
-                        }
+                            if w.is_empty() {
+                                // Clear CONTENDED if no one else
+                                this.lock.state.fetch_and(!CONTENDED, Ordering::Release);
+                            } else {
+                                // Ensure CONTENDED bit is set if there are other waiters
+                                this.lock.state.fetch_or(CONTENDED, Ordering::Relaxed);
+                            }
+                        });
                         this.queued = false;
                         this.woken = false;
                     }
@@ -493,34 +462,34 @@ impl<'a, T: ?Sized> Future for RwLockWriteFuture<'a, T> {
 
             if !this.queued {
                 this.node.kind = KIND_WRITER;
-                let mut waiters = this.lock.waiters.lock();
 
-                // Double check
-                let current = this.lock.state.load(Ordering::Relaxed);
-                // If completely unlocked (no writer, no readers) and no waiters,
-                // we can retry to acquire.
-                if (current & (WRITER_LOCKED | READER_MASK)) == 0 && waiters.with(|w| w.is_empty())
-                {
-                    drop(waiters);
+                let mut retry = false;
+                this.lock.waiters.with_lock(|w| {
+                    let current = this.lock.state.load(Ordering::Relaxed);
+                    // If completely unlocked (no writer, no readers) and no waiters,
+                    // we can retry to acquire.
+                    if (current & (WRITER_LOCKED | READER_MASK)) == 0 && w.is_empty() {
+                        retry = true;
+                        return;
+                    }
+
+                    // We are going to queue. Ensure CONTENDED bit is set.
+                    if (current & CONTENDED) == 0 {
+                        this.lock.state.fetch_or(CONTENDED, Ordering::Relaxed);
+                    }
+
+                    unsafe {
+                        let node_pin = Pin::new_unchecked(&mut this.node);
+                        w.push_back(node_pin);
+                    }
+                    this.queued = true;
+                });
+
+                if retry {
                     continue;
                 }
-
-                // We are going to queue. Ensure CONTENDED bit is set.
-                if (current & CONTENDED) == 0 {
-                    this.lock.state.fetch_or(CONTENDED, Ordering::Relaxed);
-                }
-
-                unsafe {
-                    let node_pin = Pin::new_unchecked(&mut this.node);
-                    waiters.with_mut(|w| w.push_back(node_pin));
-                }
-                this.queued = true;
             } else {
-                let is_linked = {
-                    let waiters = this.lock.waiters.lock();
-                    waiters.with(|_| this.node.link.is_linked())
-                };
-                if !is_linked {
+                if !this.lock.waiters.is_linked(&this.node) {
                     this.woken = true;
                     this.queued = false;
                     continue;
@@ -535,17 +504,7 @@ impl<'a, T: ?Sized> Future for RwLockWriteFuture<'a, T> {
 impl<'a, T: ?Sized> Drop for RwLockWriteFuture<'a, T> {
     fn drop(&mut self) {
         if self.queued {
-            let mut waiters = self.lock.waiters.lock();
-            let is_linked = waiters.with(|_| self.node.link.is_linked());
-            if is_linked {
-                unsafe {
-                    let ptr = NonNull::from(&self.node);
-                    waiters.with_mut(|w| {
-                        let mut cursor = w.cursor_mut_from_ptr(ptr);
-                        cursor.remove();
-                    });
-                }
-            }
+            self.lock.waiters.remove(&self.node);
         }
     }
 }

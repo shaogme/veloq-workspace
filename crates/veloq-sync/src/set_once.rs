@@ -1,19 +1,13 @@
-use veloq_intrusive_linklist::LinkedList;
+use crate::{wait_queue::WaitQueue, waker::WaiterNode};
 use veloq_std::{
     cell::UnsafeCell,
     fmt,
     future::Future,
     marker::PhantomPinned,
     pin::Pin,
-    ptr::NonNull,
-    sync::{
-        SpinLock,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::atomic::{AtomicUsize, Ordering},
     task::{Context, Poll},
 };
-
-use crate::waker::{WaiterAdapter, WaiterNode};
 
 const UNINIT: usize = 0;
 const INITIALIZED: usize = 1;
@@ -47,7 +41,7 @@ impl<T> veloq_std::error::Error for SetOnceError<T> {}
 /// and awaited asynchronously by multiple readers.
 pub struct SetOnce<T> {
     state: AtomicUsize,
-    waiters: SpinLock<LinkedList<WaiterAdapter>>,
+    waiters: WaitQueue,
     value: UnsafeCell<Option<T>>,
 }
 
@@ -60,7 +54,7 @@ impl<T> SetOnce<T> {
     pub const fn new() -> Self {
         Self {
             state: AtomicUsize::new(UNINIT),
-            waiters: SpinLock::new(LinkedList::new(WaiterAdapter::NEW)),
+            waiters: WaitQueue::new(),
             value: UnsafeCell::new(None),
         }
     }
@@ -70,7 +64,7 @@ impl<T> SetOnce<T> {
     pub fn new() -> Self {
         Self {
             state: AtomicUsize::new(UNINIT),
-            waiters: SpinLock::new(LinkedList::new(WaiterAdapter::NEW)),
+            waiters: WaitQueue::new(),
             value: UnsafeCell::new(None),
         }
     }
@@ -88,7 +82,7 @@ impl<T> SetOnce<T> {
     pub const fn with_value(value: T) -> Self {
         Self {
             state: AtomicUsize::new(INITIALIZED),
-            waiters: SpinLock::new(LinkedList::new(WaiterAdapter::NEW)),
+            waiters: WaitQueue::new(),
             value: UnsafeCell::new(Some(value)),
         }
     }
@@ -98,7 +92,7 @@ impl<T> SetOnce<T> {
     pub fn with_value(value: T) -> Self {
         Self {
             state: AtomicUsize::new(INITIALIZED),
-            waiters: SpinLock::new(LinkedList::new(WaiterAdapter::NEW)),
+            waiters: WaitQueue::new(),
             value: UnsafeCell::new(Some(value)),
         }
     }
@@ -124,23 +118,20 @@ impl<T> SetOnce<T> {
             return Err(SetOnceError(value));
         }
 
-        let mut waiters = self.waiters.lock();
-        if self.state.load(Ordering::Relaxed) == INITIALIZED {
-            return Err(SetOnceError(value));
-        }
-
-        // SAFETY: Under the lock, no other thread can concurrently write to `value`.
-        unsafe {
-            *self.value.with_mut(|p| p as *mut Option<T>) = Some(value);
-        }
-        self.state.store(INITIALIZED, Ordering::Release);
-
-        waiters.with_mut(|w| {
-            while let Some(node) = w.pop_front() {
-                node.as_ref().waker.wake();
+        self.waiters.with_lock(|_| {
+            if self.state.load(Ordering::Relaxed) == INITIALIZED {
+                return Err(SetOnceError(value));
             }
-        });
 
+            // SAFETY: Under the lock, no other thread can concurrently write to `value`.
+            unsafe {
+                *self.value.with_mut(|p| p as *mut Option<T>) = Some(value);
+            }
+            self.state.store(INITIALIZED, Ordering::Release);
+            Ok(())
+        })?;
+
+        self.waiters.wake_all();
         Ok(())
     }
 
@@ -222,27 +213,32 @@ impl<'a, T> Future for Wait<'a, T> {
             return Poll::Ready(val);
         }
 
-        let mut waiters = this.set_once.waiters.lock();
-        // Double check
-        if this.set_once.state.load(Ordering::Acquire) == INITIALIZED {
+        let is_init = this.set_once.waiters.with_lock(|w| {
+            if this.set_once.state.load(Ordering::Acquire) == INITIALIZED {
+                return true;
+            }
+
+            unsafe {
+                this.node.waker.register(cx.waker());
+            }
+
+            if !this.queued {
+                unsafe {
+                    let node_pin = Pin::new_unchecked(&mut this.node);
+                    w.push_back(node_pin);
+                }
+                this.queued = true;
+            }
+            false
+        });
+
+        if is_init {
             let val = unsafe {
                 (*this.set_once.value.with(|p| p as *const Option<T>))
                     .as_ref()
                     .unwrap_unchecked()
             };
             return Poll::Ready(val);
-        }
-
-        unsafe {
-            this.node.waker.register(cx.waker());
-        }
-
-        if !this.queued {
-            unsafe {
-                let node_pin = Pin::new_unchecked(&mut this.node);
-                waiters.with_mut(|w| w.push_back(node_pin));
-            }
-            this.queued = true;
         }
 
         Poll::Pending
@@ -252,17 +248,7 @@ impl<'a, T> Future for Wait<'a, T> {
 impl<T> Drop for Wait<'_, T> {
     fn drop(&mut self) {
         if self.queued {
-            let mut waiters = self.set_once.waiters.lock();
-            waiters.with_mut(|w| {
-                let is_linked = self.node.link.is_linked();
-                if is_linked {
-                    unsafe {
-                        let ptr = NonNull::from(&self.node);
-                        let mut cursor = w.cursor_mut_from_ptr(ptr);
-                        cursor.remove();
-                    }
-                }
-            });
+            self.set_once.waiters.remove(&self.node);
             self.queued = false;
         }
     }

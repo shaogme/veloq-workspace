@@ -12,6 +12,8 @@ pub mod rwlock;
 pub mod semaphore;
 pub mod set_once;
 pub mod spsc;
+pub(crate) mod wait_queue;
+pub(crate) mod waker;
 pub mod watch;
 
 pub use condvar::{Condvar, Wait};
