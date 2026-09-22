@@ -7,6 +7,7 @@ pub mod mutex;
 pub mod notify;
 pub mod oneshot;
 pub mod rwlock;
+pub mod semaphore;
 pub mod set_once;
 pub(crate) mod shim;
 pub(crate) mod waker;
@@ -14,6 +15,9 @@ pub(crate) mod waker;
 pub use condvar::{Condvar, Wait};
 pub use mutex::{Mutex, MutexGuard};
 pub use notify::{Notified, Notify};
+pub use semaphore::{
+    AcquireError, Semaphore, SemaphoreAcquireFuture, SemaphorePermit, TryAcquireError,
+};
 pub use set_once::{SetOnce, SetOnceError, SetOnceWait};
 
 use veloq_std::fmt;

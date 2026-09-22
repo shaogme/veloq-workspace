@@ -141,11 +141,12 @@ fn loom_set_once_cancel() {
 
         let h2 = thread::spawn(move || {
             block_on(async move {
-                let mut fut = pin!(c2.wait());
-                let waker = noop_waker();
-                let mut cx = Context::from_waker(&waker);
-                let _ = fut.as_mut().poll(&mut cx);
-                drop(fut);
+                {
+                    let mut fut = pin!(c2.wait());
+                    let waker = noop_waker();
+                    let mut cx = Context::from_waker(&waker);
+                    let _ = fut.as_mut().poll(&mut cx);
+                }
             });
         });
 

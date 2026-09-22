@@ -189,6 +189,7 @@ impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
         #[cfg(not(feature = "loom"))]
         let mut spin_count = 0;
 
+        #[cfg_attr(feature = "loom", allow(clippy::never_loop))]
         loop {
             // Fast path: try to acquire if unlocked (queue is empty when UNLOCKED).
             if this
