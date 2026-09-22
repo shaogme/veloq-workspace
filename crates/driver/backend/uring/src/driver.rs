@@ -381,14 +381,8 @@ impl<'a> UdpReceiveOperationBuilder for UringDriver<'a> {
         let notifier = Arc::new(move || {
             let _ = waker.wake();
         });
-        #[cfg(not(feature = "loom"))]
-        let notifier: Arc<dyn ReceivePermitNotifier> = notifier;
-        #[cfg(feature = "loom")]
-        let notifier: Arc<dyn ReceivePermitNotifier> = {
-            let ptr = Arc::into_raw(notifier);
-            let trait_ptr: *const dyn ReceivePermitNotifier = ptr;
-            unsafe { Arc::from_raw(trait_ptr) }
-        };
+        let notifier: Arc<dyn ReceivePermitNotifier> =
+            unsafe { Arc::cast_unsized(notifier, |ptr| ptr as *const dyn ReceivePermitNotifier) };
         let pump = ReceivePumpState::try_new_multishot(config.into_pump_config(), Some(notifier))
             .map_err(|error| {
             UringError::InvalidInput

@@ -214,10 +214,15 @@ impl CompletionPump {
     }
 
     pub(super) fn create_waker(&self) -> Arc<dyn RemoteWaker<IocpError>> {
-        Arc::new(IocpWaker {
-            port: self.port.clone(),
-            notification_state: self.notification_state.clone(),
-        })
+        unsafe {
+            Arc::new_unsized(
+                IocpWaker {
+                    port: self.port.clone(),
+                    notification_state: self.notification_state.clone(),
+                },
+                |p| p as *const dyn RemoteWaker<IocpError>,
+            )
+        }
     }
 
     fn mark_waker_notifications(&self, count: usize) {

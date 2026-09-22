@@ -687,7 +687,7 @@ mod tests {
         }
 
         let diagnostics = registry.shared.completion_diagnostics();
-        let table: SharedCompletionTable<DummySlotSpec> = registry.shared.clone();
+        let table: SharedCompletionTable<DummySlotSpec> = registry.shared_table();
         let mut hooks = TestHooks;
         let _ = registry.accept_completion(
             &table,
@@ -782,7 +782,7 @@ mod tests {
             .persist();
 
         let diagnostics = registry.shared.completion_diagnostics();
-        let table: SharedCompletionTable<DummySlotSpec> = registry.shared.clone();
+        let table: SharedCompletionTable<DummySlotSpec> = registry.shared_table();
         let mut hooks = TestHooks;
         let _ = registry.accept_completion(
             &table,

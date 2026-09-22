@@ -1,3 +1,5 @@
+#[path = "sync_test/arc_test.rs"]
+mod arc_test;
 #[path = "sync_test/barrier_test.rs"]
 mod barrier_test;
 #[path = "sync_test/condvar_test.rs"]
@@ -20,3 +22,5 @@ mod reentrant_mutex_test;
 mod rwlock_test;
 #[path = "sync_test/spin_lock_test.rs"]
 mod spin_lock_test;
+#[path = "sync_test/weak_test.rs"]
+mod weak_test;

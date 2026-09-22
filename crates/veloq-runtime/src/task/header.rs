@@ -868,11 +868,11 @@ pub static LOCAL_INTRUSIVE_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
     },
     |data| unsafe {
         let token = Arc::from_raw(data as *const TaskWakeToken<LocalStorage>);
-        token.request_local_wake();
+        TaskWakeToken::request_local_wake(&token);
     },
     |data| unsafe {
         let token = ManuallyDrop::new(Arc::from_raw(data as *const TaskWakeToken<LocalStorage>));
-        (*token).request_local_wake();
+        TaskWakeToken::request_local_wake(&token);
     },
     |data| unsafe {
         drop(Arc::from_raw(data as *const TaskWakeToken<LocalStorage>));

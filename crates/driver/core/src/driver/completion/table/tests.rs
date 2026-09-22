@@ -218,7 +218,7 @@ fn accept_kernel_control(
     hooks: &mut TestHooks,
 ) -> Result<CompletionFlowOutcome, Report<DummyError>> {
     let diagnostics = registry.shared.completion_diagnostics();
-    let table: SharedCompletionTable<DummySlotSpec> = registry.shared.clone();
+    let table: SharedCompletionTable<DummySlotSpec> = registry.shared_table();
     let envelope = CompletionEnvelope::from_raw_parts(
         CompletionBackend::Core,
         CompletionToken::waker(0).raw(),
@@ -518,7 +518,7 @@ fn accept_ingress_result(
     hooks: &mut TestHooks,
 ) -> Result<CompletionFlowOutcome, Report<DummyError>> {
     let diagnostics = registry.shared.completion_diagnostics();
-    let table: SharedCompletionTable<DummySlotSpec> = registry.shared.clone();
+    let table: SharedCompletionTable<DummySlotSpec> = registry.shared_table();
     registry.accept_completion(&table, &diagnostics, hooks, ingress)
 }
 

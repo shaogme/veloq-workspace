@@ -246,16 +246,7 @@ impl UringWakerManager {
             state: self.state.clone(),
             notification_state: self.notification_state.clone(),
         });
-        #[cfg(not(feature = "loom"))]
-        {
-            waker
-        }
-        #[cfg(feature = "loom")]
-        {
-            let ptr = Arc::into_raw(waker);
-            let trait_ptr: *const dyn RemoteWaker<UringError> = ptr;
-            unsafe { Arc::from_raw(trait_ptr) }
-        }
+        unsafe { Arc::cast_unsized(waker, |ptr| ptr as *const dyn RemoteWaker<UringError>) }
     }
 
     #[inline]

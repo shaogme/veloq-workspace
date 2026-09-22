@@ -15,11 +15,6 @@ use crate::{
 use veloq_driver_core::driver::{OpToken, SharedCompletionTable};
 use veloq_wheel::TimerId;
 
-#[cfg(feature = "loom")]
-use veloq_driver_core::driver::CompletionAccess;
-#[cfg(feature = "loom")]
-use veloq_std::sync::Arc;
-
 /// operation registry 的唯一 owner。
 pub(crate) struct OperationLedger {
     registry: UringOpRegistry,
@@ -123,16 +118,6 @@ impl core::ops::DerefMut for OperationLedger {
 
 impl OperationLedger {
     pub(crate) fn shared_table(&self) -> SharedCompletionTable<UringSlotSpec> {
-        let table = self.registry.shared.clone();
-        #[cfg(not(feature = "loom"))]
-        {
-            table
-        }
-        #[cfg(feature = "loom")]
-        {
-            let ptr = Arc::into_raw(table);
-            let trait_ptr: *const dyn CompletionAccess<UringSlotSpec> = ptr;
-            unsafe { Arc::from_raw(trait_ptr) }
-        }
+        self.registry.shared_table()
     }
 }

@@ -182,7 +182,11 @@ where
     });
 
     let receiver = ThreadResultReceiver {
-        state: state.clone(),
+        state: unsafe {
+            Arc::cast_unsized(state.clone(), |p| {
+                p as *const (dyn super::ThreadSharedStateTrait<T> + 'a)
+            })
+        },
     };
 
     let param = Arc::into_raw(state) as *mut c_void;

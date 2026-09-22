@@ -325,10 +325,15 @@ fn global_fallback_wakes_an_idle_worker_in_another_group() {
         .with_park_hook(hold_other_group_workers)
         .with_worker_factory(move |worker_id: usize, shared: &RuntimeShared<TestExtra>| {
             shared.unparkers()[worker_id]
-                .bind(Arc::new(RecordingWaker {
-                    state: factory_fixture.clone(),
-                    worker_id,
-                }))
+                .bind(unsafe {
+                    Arc::new_unsized(
+                        RecordingWaker {
+                            state: factory_fixture.clone(),
+                            worker_id,
+                        },
+                        |p| p as *const dyn RuntimeWaker,
+                    )
+                })
                 .expect("worker waker must bind once");
             factory_fixture.clone()
         })

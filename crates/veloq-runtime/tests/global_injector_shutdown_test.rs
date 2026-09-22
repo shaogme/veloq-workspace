@@ -52,7 +52,11 @@ fn wake_failure_drains_pending_scope_without_hanging() {
             let fail = fail.clone();
             move |worker_id: usize, shared: &RuntimeShared<()>| {
                 shared.unparkers()[worker_id]
-                    .bind(Arc::new(ControlledWaker { fail: fail.clone() }))
+                    .bind(unsafe {
+                        Arc::new_unsized(ControlledWaker { fail: fail.clone() }, |p| {
+                            p as *const dyn RuntimeWaker
+                        })
+                    })
                     .expect("worker waker must be bound once");
             }
         })

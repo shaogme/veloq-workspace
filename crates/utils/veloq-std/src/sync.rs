@@ -1,3 +1,4 @@
+pub mod arc;
 mod barrier;
 mod condvar;
 mod lazy_lock;
@@ -11,6 +12,7 @@ mod spin_lock;
 pub(crate) mod sys;
 pub mod unpoisoned_mutex;
 pub mod unpoisoned_rwlock;
+pub mod weak;
 
 pub mod atomic;
 pub mod mpsc;
@@ -29,8 +31,8 @@ pub use reentrant_mutex::{
 };
 pub use spin_lock::{NativeSpinLock, NativeSpinLockGuard, const_native_spin_lock};
 
-#[cfg(not(feature = "loom"))]
-pub use alloc_crate::sync::{Arc, Arc as NativeArc, Weak, Weak as NativeWeak};
+pub use arc::NativeArc;
+pub use weak::NativeWeak;
 
 pub use mutex::raw::NativeRawMutex;
 pub use mutex::{NativeMutex, NativeMutexGuard, const_native_mutex};
@@ -86,11 +88,17 @@ pub use unpoisoned_mutex::const_unpoisoned_mutex;
 #[cfg(not(feature = "loom"))]
 pub use unpoisoned_rwlock::const_unpoisoned_rwlock;
 
-#[cfg(feature = "loom")]
-pub use loom::sync::Arc;
+#[cfg(not(feature = "loom"))]
+pub use arc::Arc;
+
+#[cfg(not(feature = "loom"))]
+pub use weak::Weak;
 
 #[cfg(feature = "loom")]
-pub use alloc_crate::sync::{Arc as NativeArc, Weak, Weak as NativeWeak};
+pub use arc::{Arc, LoomArc};
+
+#[cfg(feature = "loom")]
+pub use weak::{LoomWeak, Weak};
 
 #[cfg(feature = "loom")]
 pub use mutex::{LoomMutex, LoomMutexGuard, raw::LoomRawMutex};

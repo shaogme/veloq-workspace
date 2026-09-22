@@ -1723,9 +1723,14 @@ mod tests {
     fn multishot_permit_release_notifies_without_touching_pump_state() {
         let notifications = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&notifications);
-        let notifier: Arc<dyn ReceivePermitNotifier> = Arc::new(move || {
-            observed.fetch_add(1, Ordering::Relaxed);
-        });
+        let notifier: Arc<dyn ReceivePermitNotifier> = unsafe {
+            Arc::new_unsized(
+                move || {
+                    observed.fetch_add(1, Ordering::Relaxed);
+                },
+                |p| p as *const dyn ReceivePermitNotifier,
+            )
+        };
         let mut pump = ReceivePumpState::try_new_multishot(config(1, 1), Some(notifier))
             .expect("multishot pump should be valid");
         pump.arm_multishot().expect("multishot should arm");

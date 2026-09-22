@@ -190,7 +190,7 @@ impl<'a> IocpDriver<'a> {
             .with_ctx("port_raw", port_handle as usize)
             .attach_note("failed to load IOCP extensions")?;
         let ops = IocpOpRegistry::new(entries as usize);
-        let completion_table: SharedCompletionTable<IocpSlotSpec> = ops.shared.clone();
+        let completion_table: SharedCompletionTable<IocpSlotSpec> = ops.shared_table();
         let completion_diagnostics = ops.shared.completion_diagnostics();
         let rio = IocpRioRuntime::new(
             RawHandle::new(IocpHandle::for_file(port_handle)).borrow(),

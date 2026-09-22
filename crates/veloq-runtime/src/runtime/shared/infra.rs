@@ -783,10 +783,15 @@ mod tests {
             .into();
         for (worker_id, unparker) in registry.unparkers.iter().enumerate() {
             unparker
-                .bind(Arc::new(RecordingWaker {
-                    worker_id,
-                    calls: calls.clone(),
-                }))
+                .bind(unsafe {
+                    Arc::new_unsized(
+                        RecordingWaker {
+                            worker_id,
+                            calls: calls.clone(),
+                        },
+                        |p| p as *const dyn RuntimeWaker,
+                    )
+                })
                 .expect("recording waker must bind once");
         }
         let topo = super::TopologyContext::from_worker_to_group(&[0, 0, 1, 1]);

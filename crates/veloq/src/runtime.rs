@@ -210,10 +210,15 @@ impl<T: PoolTopology> Runtime<T> {
                     }
                 }
                 shared.base.unparkers()[worker_id]
-                    .bind(NativeArc::new(DriverWakerWrapper {
-                        waker: remote_waker,
-                        worker_id,
-                    }))
+                    .bind(unsafe {
+                        NativeArc::new_unsized(
+                            DriverWakerWrapper {
+                                waker: remote_waker,
+                                worker_id,
+                            },
+                            |p| p as *const dyn RuntimeWaker,
+                        )
+                    })
                     .expect("worker remote waker is already bound");
 
                 let driver_cell = RefCell::new(driver);

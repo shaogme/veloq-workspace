@@ -1243,10 +1243,15 @@ mod tests {
             .collect::<Vec<_>>()
             .into();
         shared.base.registry.unparkers[2]
-            .bind(Arc::new(RecordingWaker {
-                calls: calls.clone(),
-                worker_id: 2,
-            }))
+            .bind(unsafe {
+                Arc::new_unsized(
+                    RecordingWaker {
+                        calls: calls.clone(),
+                        worker_id: 2,
+                    },
+                    |p| p as *const dyn RuntimeWaker,
+                )
+            })
             .expect("recording waker must bind once");
         shared.base.idle.enter_idle(2, &shared.base.topo);
 

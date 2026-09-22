@@ -255,9 +255,15 @@ where
         let waker = Arc::new(CountingWaker::default());
         let (tx, cancels) = mpsc::channel();
         let op = DetachedOp::armed(
-            table.clone() as SharedCompletionTable<DummySlotSpec>,
+            unsafe {
+                Arc::cast_unsized(table.clone(), |p| {
+                    p as *const dyn CompletionAccess<DummySlotSpec>
+                })
+            },
             tx,
-            waker.clone() as Arc<dyn RemoteWaker<DummyError>>,
+            unsafe {
+                Arc::cast_unsized(waker.clone(), |p| p as *const dyn RemoteWaker<DummyError>)
+            },
             token,
         );
         Self {

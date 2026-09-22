@@ -1,6 +1,6 @@
 #[cfg(not(feature = "loom"))]
 mod normal_tests {
-    use veloq_std::alloc_crate::task::Wake;
+    use veloq_std::alloc_crate::{sync::Arc as StdArc, task::Wake};
     use veloq_std::{
         sync::{
             Arc,
@@ -23,7 +23,7 @@ mod normal_tests {
     }
 
     impl Wake for TestWaker {
-        fn wake(self: Arc<Self>) {
+        fn wake(self: StdArc<Self>) {
             self.woken.store(true, Ordering::Release);
             self.wake_count.fetch_add(1, Ordering::SeqCst);
         }
@@ -161,8 +161,8 @@ mod loom_tests {
         },
         thread,
     };
-    use veloq_std::alloc_crate::task::Wake;
-    use veloq_std::{sync::NativeArc as StdArc, task::Waker};
+    use veloq_std::alloc_crate::{sync::Arc as StdArc, task::Wake};
+    use veloq_std::task::Waker;
     use veloq_waker::MwsrWaker;
 
     struct TestWaker(Arc<AtomicBool>);

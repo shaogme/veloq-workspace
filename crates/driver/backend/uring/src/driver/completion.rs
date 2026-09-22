@@ -1735,7 +1735,7 @@ mod tests {
         flags: u32,
     ) -> CompletionFlowOutcome {
         let diagnostics = registry.shared.completion_diagnostics();
-        let table: SharedCompletionTable<UringSlotSpec> = registry.shared.clone();
+        let table: SharedCompletionTable<UringSlotSpec> = registry.shared_table();
         let mut pending_cancel_cqes = HashMap::default();
         let mut waker_armed = true;
         let notification_state = AtomicU8::new(WAKER_NOTIFIED);
@@ -2112,7 +2112,7 @@ mod tests {
         let mut post = UringPostCompletionEffects::default();
         let mut provided_buffers = test_group(2);
         let before = provided_buffers.stats();
-        let table: SharedCompletionTable<UringSlotSpec> = registry.shared.clone();
+        let table: SharedCompletionTable<UringSlotSpec> = registry.shared_table();
         let mut hooks = test_hooks_with_buffers(
             &diagnostics,
             &mut pending_cancel_cqes,

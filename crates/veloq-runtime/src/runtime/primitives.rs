@@ -830,7 +830,9 @@ mod tests {
         let waker = Arc::new(FailingWaker {
             calls: AtomicUsize::new(0),
         });
-        unparker.bind(waker.clone()).expect("bind failed");
+        unparker
+            .bind(unsafe { Arc::cast_unsized(waker.clone(), |p| p as *const dyn RuntimeWaker) })
+            .expect("bind failed");
 
         let first = unparker.unpark().expect_err("wake should fail");
         let second = unparker.unpark().expect_err("wake should fail");
@@ -920,9 +922,14 @@ mod tests {
     fn raw_waker_records_wake_failure_without_return_channel() {
         let unparker = Unparker::new();
         unparker
-            .bind(Arc::new(FailingWaker {
-                calls: AtomicUsize::new(0),
-            }))
+            .bind(unsafe {
+                Arc::new_unsized(
+                    FailingWaker {
+                        calls: AtomicUsize::new(0),
+                    },
+                    |p| p as *const dyn RuntimeWaker,
+                )
+            })
             .expect("bind failed");
         let waker = create_unpark_waker(unparker.clone());
 

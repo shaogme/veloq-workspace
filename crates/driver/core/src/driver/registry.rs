@@ -1,6 +1,6 @@
 use crate::{
     DriverResult,
-    driver::OpToken,
+    driver::{CompletionAccess, OpToken, SharedCompletionTable},
     slot::{
         Generation, SlotCompletion, SlotEntry, SlotError, SlotOp, SlotPayload, SlotPlatformData,
         SlotSidecarData, SlotSnapshot, SlotSpec, SlotState, SlotStorage, SlotTable,
@@ -103,6 +103,18 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
             local: local.into_boxed_slice(),
             local_free_head: SlotTableOf::<Spec>::NULL_INDEX,
             active_count: 0,
+        }
+    }
+
+    #[inline]
+    pub fn shared_table(&self) -> SharedCompletionTable<Spec>
+    where
+        Spec: 'static,
+    {
+        unsafe {
+            Arc::cast_unsized(self.shared.clone(), |p| {
+                p as *const dyn CompletionAccess<Spec>
+            })
         }
     }
 

@@ -244,12 +244,12 @@ impl<S: Storage> TaskWakeToken<S> {
 impl TaskWakeToken<LocalStorage> {
     /// local raw-waker 的 foreign-safe 路径：只触碰 token 状态和 owner mailbox。
     #[inline]
-    pub(crate) fn request_local_wake(self: &Arc<Self>) {
-        let Some(_guard) = self.try_acquire() else {
+    pub(crate) fn request_local_wake(this: &Arc<Self>) {
+        let Some(_guard) = this.try_acquire() else {
             return;
         };
 
-        let mut state = self.state.load(Ordering::Acquire);
+        let mut state = this.state.load(Ordering::Acquire);
         loop {
             if state & WAKE_TOKEN_ALIVE == 0 {
                 return;
@@ -258,7 +258,7 @@ impl TaskWakeToken<LocalStorage> {
                 return;
             }
 
-            match self.state.compare_exchange_weak(
+            match this.state.compare_exchange_weak(
                 state,
                 state | WAKE_TOKEN_PENDING,
                 Ordering::AcqRel,
@@ -269,17 +269,17 @@ impl TaskWakeToken<LocalStorage> {
             }
         }
 
-        let Some(target) = self.local_target.get().and_then(Weak::upgrade) else {
+        let Some(target) = this.local_target.get().and_then(Weak::upgrade) else {
             // runtime 已经释放；不能为了补救而读取 header。
-            self.state.fetch_and(!WAKE_TOKEN_PENDING, Ordering::AcqRel);
+            this.state.fetch_and(!WAKE_TOKEN_PENDING, Ordering::AcqRel);
             return;
         };
 
-        target.push(Arc::clone(self));
+        target.push(Arc::clone(this));
     }
 
     /// 在 owner worker 上消费一个 mailbox entry。
-    pub(crate) fn dispatch_on_owner(self: &Arc<Self>) {
+    pub(crate) fn dispatch_on_owner(&self) {
         let Some(owner) = self.owner_thread.get().copied() else {
             return;
         };
@@ -378,7 +378,7 @@ mod tests {
         token.bind_local_target(&target);
 
         for _ in 0..32 {
-            token.request_local_wake();
+            TaskWakeToken::request_local_wake(&token);
         }
 
         assert!(target.pop().is_some());
@@ -397,7 +397,7 @@ mod tests {
         ));
         let token = Arc::new(TaskWakeToken::<LocalStorage>::new());
         token.bind_local_target(&target);
-        token.request_local_wake();
+        TaskWakeToken::request_local_wake(&token);
 
         let queued = target.pop().expect("wake request");
         token.deactivate_and_wait();
