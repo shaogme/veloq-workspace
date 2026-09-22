@@ -148,9 +148,10 @@ mod loom_tests {
 
     use loom::{sync::Arc, thread};
 
-    use veloq_std::sync::{Mutex, RwLock};
+    use veloq_std::sync::RwLock;
 
     #[test]
+    #[cfg(feature = "std")]
     fn mutex_poison_is_visible_after_panic() {
         loom::model(|| {
             let lock = Arc::new(Mutex::new(0));

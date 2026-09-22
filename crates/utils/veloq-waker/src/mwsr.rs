@@ -1,5 +1,5 @@
 use veloq_std::{
-    fmt,
+    fmt, hint,
     mem::ManuallyDrop,
     ptr,
     sync::atomic::{
@@ -78,14 +78,8 @@ impl MwsrWaker {
         loop {
             let tag = vtable.tag();
 
-            // If currently waking, to avoid losing the wakeup, we must wake the new waker immediately and return
-            if tag == WAKING {
-                waker.wake_by_ref();
-                return;
-            }
-
-            if tag == REGISTERING {
-                core::hint::spin_loop();
+            if tag == WAKING || tag == REGISTERING {
+                hint::spin_loop();
                 vtable = self.vtable.load(Acquire);
                 continue;
             }
@@ -164,7 +158,7 @@ impl MwsrWaker {
                 }
             }
 
-            core::hint::spin_loop();
+            hint::spin_loop();
             vtable = self.vtable.load(Acquire);
         }
     }

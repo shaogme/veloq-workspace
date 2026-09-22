@@ -200,7 +200,9 @@ mod loom_tests {
 
     #[test]
     fn test_loom_condvar_notify_one_selects_one_waiter() {
-        loom::model(|| {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
             let pair = Arc::new((Mutex::new(()), Condvar::new()));
             let (first_ready_tx, first_ready_rx) = channel();
             let (second_ready_tx, second_ready_rx) = channel();

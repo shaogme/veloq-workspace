@@ -1,5 +1,5 @@
 use veloq_std::{
-    fmt,
+    fmt, hint,
     mem::ManuallyDrop,
     ptr,
     sync::atomic::{
@@ -106,8 +106,9 @@ impl AtomicWaker {
             let tag = vtable.tag();
 
             if tag == WAKING {
-                waker.wake_by_ref();
-                return;
+                hint::spin_loop();
+                vtable = self.vtable.load(Acquire);
+                continue;
             }
 
             if tag == REGISTERING {
@@ -217,7 +218,7 @@ impl AtomicWaker {
                 }
             }
 
-            core::hint::spin_loop();
+            hint::spin_loop();
             vtable = self.vtable.load(Acquire);
         }
     }
