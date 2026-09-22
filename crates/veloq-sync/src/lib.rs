@@ -3,10 +3,13 @@
 pub mod mpmc;
 pub mod mpsc;
 pub mod mutex;
+pub mod notify;
 pub mod oneshot;
 pub mod rwlock;
 pub(crate) mod shim;
 pub(crate) mod waker;
+
+pub use notify::{Notified, Notify};
 
 use veloq_std::fmt;
 
