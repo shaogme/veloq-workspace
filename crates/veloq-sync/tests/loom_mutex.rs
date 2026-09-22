@@ -1,11 +1,12 @@
 #![cfg(feature = "loom")]
 
-use loom::sync::Arc;
-use loom::thread;
-use veloq_std::future::Future;
-use veloq_std::pin::Pin;
-use veloq_std::ptr;
-use veloq_std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use loom::{future::block_on, sync::Arc, thread};
+use veloq_std::{
+    future::Future,
+    pin::Pin,
+    ptr,
+    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+};
 use veloq_sync::mutex::Mutex;
 
 fn dummy_waker() -> Waker {
@@ -80,5 +81,47 @@ fn test_loom_mutex_exclusion() {
                 Poll::Pending => loom::thread::yield_now(),
             }
         }
+    });
+}
+
+#[test]
+fn test_loom_mutex_contended() {
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(2);
+    builder.check(|| {
+        let m = Arc::new(Mutex::new(0usize));
+        let m1 = m.clone();
+        let m2 = m.clone();
+        let m3 = m.clone();
+
+        let t1 = thread::spawn(move || {
+            block_on(async move {
+                let mut g = m1.lock().await;
+                *g += 1;
+            });
+        });
+
+        let t2 = thread::spawn(move || {
+            block_on(async move {
+                let mut g = m2.lock().await;
+                *g += 1;
+            });
+        });
+
+        let t3 = thread::spawn(move || {
+            block_on(async move {
+                let mut g = m3.lock().await;
+                *g += 1;
+            });
+        });
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+        t3.join().unwrap();
+
+        block_on(async move {
+            let g = m.lock().await;
+            assert_eq!(*g, 3);
+        });
     });
 }

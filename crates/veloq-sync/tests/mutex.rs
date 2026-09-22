@@ -50,3 +50,76 @@ async fn test_mutex_try_lock() {
     drop(guard);
     assert!(m.try_lock().is_some());
 }
+
+#[tokio::test]
+async fn test_mutex_cancel_cascading() {
+    let m = Arc::new(Mutex::new(0));
+    let guard = m.lock().await;
+
+    let m1 = m.clone();
+    let m2 = m.clone();
+
+    let (tx1, rx1) = tokio::sync::oneshot::channel();
+    let t1 = tokio::spawn(async move {
+        let fut = m1.lock();
+        let _ = tx1.send(());
+        fut.await;
+    });
+
+    rx1.await.unwrap();
+    tokio::task::yield_now().await;
+
+    let (tx2, rx2) = tokio::sync::oneshot::channel();
+    let t2 = tokio::spawn(async move {
+        let fut = m2.lock();
+        let _ = tx2.send(());
+        let mut g = fut.await;
+        *g += 42;
+    });
+
+    rx2.await.unwrap();
+    tokio::task::yield_now().await;
+
+    // Drop guard, granting lock to t1
+    drop(guard);
+
+    // Abort t1 while holding STATE_GRANTED
+    t1.abort();
+    let _ = t1.await;
+
+    // t2 should receive the lock cascading from t1
+    t2.await.unwrap();
+
+    assert_eq!(*m.lock().await, 42);
+}
+
+#[tokio::test]
+async fn test_mutex_cancel_reset_unlocked() {
+    let m = Arc::new(Mutex::new(0));
+    let guard = m.lock().await;
+
+    let m1 = m.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let t1 = tokio::spawn(async move {
+        let fut = m1.lock();
+        let _ = tx.send(());
+        fut.await;
+    });
+
+    rx.await.unwrap();
+    tokio::task::yield_now().await;
+
+    // Drop guard, granting lock to t1
+    drop(guard);
+
+    // Cancel t1 while holding STATE_GRANTED
+    t1.abort();
+    let _ = t1.await;
+
+    // The lock should be safely reset to UNLOCKED
+    assert!(!m.is_locked());
+    let mut g = m.try_lock().expect("mutex should be unlocked");
+    *g = 100;
+    drop(g);
+    assert_eq!(*m.lock().await, 100);
+}

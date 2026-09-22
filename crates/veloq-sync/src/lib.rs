@@ -1,5 +1,6 @@
 #![no_std]
 
+pub mod condvar;
 pub mod mpmc;
 pub mod mpsc;
 pub mod mutex;
@@ -9,6 +10,8 @@ pub mod rwlock;
 pub(crate) mod shim;
 pub(crate) mod waker;
 
+pub use condvar::{Condvar, Wait};
+pub use mutex::{Mutex, MutexGuard};
 pub use notify::{Notified, Notify};
 
 use veloq_std::fmt;

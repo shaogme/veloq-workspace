@@ -144,6 +144,13 @@ pub struct MutexGuard<'a, T: ?Sized> {
     lock: &'a Mutex<T>,
 }
 
+impl<'a, T: ?Sized> MutexGuard<'a, T> {
+    /// Returns a reference to the [`Mutex`] that this guard was acquired from.
+    pub fn mutex(guard: &Self) -> &'a Mutex<T> {
+        guard.lock
+    }
+}
+
 impl<T: ?Sized> Deref for MutexGuard<'_, T> {
     type Target = T;
 
