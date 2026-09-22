@@ -1,6 +1,8 @@
 use core::pin::pin;
 
-use veloq_std::{cell::RefCell, collections::VecDeque, error::Error, fmt, ptr, rc::Rc};
+use veloq_std::{
+    cell::RefCell, collections::VecDeque, error::Error, fmt, ops::AsyncFnOnce, ptr, rc::Rc,
+};
 
 use crate::notify::Notify;
 
@@ -600,7 +602,12 @@ pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     )
 }
 
-/// Creates a new borrowed broadcast channel state.
-pub fn borrowed_channel<T>(capacity: usize) -> State<T> {
-    State::new(capacity)
+/// Creates a new borrowed broadcast channel and runs the provided asynchronous closure with it.
+pub async fn with_borrowed_channel<T, F, R>(capacity: usize, f: F) -> R
+where
+    F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
+{
+    let state = State::new(capacity);
+    let (tx, rx) = state.split();
+    f(tx, rx).await
 }

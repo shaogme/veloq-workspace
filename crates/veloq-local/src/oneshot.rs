@@ -6,6 +6,7 @@ use veloq_std::{
     fmt,
     future::Future,
     mem::ManuallyDrop,
+    ops::AsyncFnOnce,
     pin::Pin,
     ptr,
     rc::Rc,
@@ -70,9 +71,14 @@ impl<T> State<T> {
     }
 }
 
-/// 创建一个新的 oneshot 通道状态
-pub const fn borrowed_channel<T>() -> State<T> {
-    State::new()
+/// 创建一个新的借用 oneshot 通道并运行异步闭包
+pub async fn with_borrowed_channel<T, F, R>(f: F) -> R
+where
+    F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
+{
+    let state = State::new();
+    let (tx, rx) = state.split();
+    f(tx, rx).await
 }
 
 impl<'a, T> BorrowedSender<'a, T> {

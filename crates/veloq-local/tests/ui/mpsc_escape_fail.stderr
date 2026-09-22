@@ -1,0 +1,35 @@
+error: lifetime may not live long enough
+ --> tests/ui/mpsc_escape_fail.rs:6:79
+  |
+6 |     let _escaped = mpsc::with_borrowed_unbounded::<i32, _, _>(async |tx, _rx| tx).await;
+  |                                                                      --     - ^^ returning this value requires that `'1` must outlive `'2`
+  |                                                                      |      |
+  |                                                                      |      return type of async closure `{async closure body@$DIR/tests/ui/mpsc_escape_fail.rs:6:79: 6:81}` contains a lifetime `'2`
+  |                                                                      has type `veloq_local::mpsc::BorrowedSender<'1, i32>`
+
+error: lifetime may not live long enough
+  --> tests/ui/mpsc_escape_fail.rs:10:79
+   |
+10 |     let _escaped = mpsc::with_borrowed_unbounded::<i32, _, _>(async |_tx, rx| rx).await;
+   |                                                                      ---    - ^^ returning this value requires that `'1` must outlive `'2`
+   |                                                                      |      |
+   |                                                                      |      return type of async closure `{async closure body@$DIR/tests/ui/mpsc_escape_fail.rs:10:79: 10:81}` contains a lifetime `'2`
+   |                                                                      has type `veloq_local::mpsc::BorrowedSender<'1, i32>`
+
+error: lifetime may not live long enough
+  --> tests/ui/mpsc_escape_fail.rs:14:80
+   |
+14 |     let _escaped = mpsc::with_borrowed_bounded::<i32, _, _>(1, async |tx, _rx| tx).await;
+   |                                                                       --     - ^^ returning this value requires that `'1` must outlive `'2`
+   |                                                                       |      |
+   |                                                                       |      return type of async closure `{async closure body@$DIR/tests/ui/mpsc_escape_fail.rs:14:80: 14:82}` contains a lifetime `'2`
+   |                                                                       has type `veloq_local::mpsc::BorrowedSender<'1, i32>`
+
+error: lifetime may not live long enough
+  --> tests/ui/mpsc_escape_fail.rs:18:80
+   |
+18 |     let _escaped = mpsc::with_borrowed_bounded::<i32, _, _>(1, async |_tx, rx| rx).await;
+   |                                                                       ---    - ^^ returning this value requires that `'1` must outlive `'2`
+   |                                                                       |      |
+   |                                                                       |      return type of async closure `{async closure body@$DIR/tests/ui/mpsc_escape_fail.rs:18:80: 18:82}` contains a lifetime `'2`
+   |                                                                       has type `veloq_local::mpsc::BorrowedSender<'1, i32>`

@@ -88,40 +88,41 @@ fn udp_send_receive() {
 
         let addr1 = socket1.local_addr().expect("Failed to get addr1");
         let addr2 = socket2.local_addr().expect("Failed to get addr2");
-        let state = mpsc::borrowed_unbounded::<()>();
-        let (tx, mut rx) = state.split();
         let mut receiver = socket1
             .receiver(udp_receive_config(1024))
             .expect("create UDP receiver");
 
-        scope!(ctx, async |s| {
-            s.spawn_boxed(async move {
-                receiver.ready().await.expect("receiver ready failed");
-                tx.send(()).unwrap();
+        mpsc::with_borrowed_unbounded::<(), _, _>(async |tx, mut rx| {
+            scope!(ctx, async |s| {
+                s.spawn_boxed(async move {
+                    receiver.ready().await.expect("receiver ready failed");
+                    tx.send(()).unwrap();
 
-                let datagram = receiver.recv().await.expect("UDP receive failed");
-                assert_eq!(datagram.addr, addr2);
-                assert_eq!(
-                    &datagram.buf.as_slice()[..b"Hello, UDP!".len()],
-                    b"Hello, UDP!"
-                );
-            });
+                    let datagram = receiver.recv().await.expect("UDP receive failed");
+                    assert_eq!(datagram.addr, addr2);
+                    assert_eq!(
+                        &datagram.buf.as_slice()[..b"Hello, UDP!".len()],
+                        b"Hello, UDP!"
+                    );
+                });
 
-            s.spawn_boxed(async move {
-                rx.recv().await.expect("armed rx closed");
-                let data = b"Hello, UDP!";
-                let mut send_buf = ctx.alloc(nz!(1024), data.len());
-                send_buf.spare_capacity_mut()[..data.len()].copy_from_slice(data);
+                s.spawn_boxed(async move {
+                    rx.recv().await.expect("armed rx closed");
+                    let data = b"Hello, UDP!";
+                    let mut send_buf = ctx.alloc(nz!(1024), data.len());
+                    send_buf.spare_capacity_mut()[..data.len()].copy_from_slice(data);
 
-                let (sent, _) = socket2
-                    .send_to(send_buf, addr1)
-                    .await
-                    .expect("send_to failed");
-                assert_eq!(sent, data.len());
-            });
+                    let (sent, _) = socket2
+                        .send_to(send_buf, addr1)
+                        .await
+                        .expect("send_to failed");
+                    assert_eq!(sent, data.len());
+                });
+            })
+            .await
+            .unwrap();
         })
-        .await
-        .unwrap();
+        .await;
     });
 }
 
@@ -297,44 +298,48 @@ fn udp_multiple_messages() {
         let socket2 = UdpSocket::bind(ctx, "127.0.0.1:0").expect("Failed to bind socket 2");
         let addr1 = socket1.local_addr().expect("Failed to get addr1");
         const NUM_MESSAGES: usize = 5;
-        let state = mpsc::borrowed_unbounded::<String>();
-        let (msg_tx, mut msg_rx) = state.split();
         let (ready_tx, mut ready_rx) = mpsc::unbounded::<()>();
         let mut receiver = socket1
             .receiver(udp_receive_config_with_capacity(5, 5, 1024))
             .expect("create UDP receiver");
 
-        scope!(ctx, async |s| {
-            s.spawn_boxed(async move {
-                receiver.ready().await.expect("receiver ready failed");
-                ready_tx.send(()).expect("receiver ready channel closed");
+        let mut received =
+            mpsc::with_borrowed_unbounded::<String, _, _>(async |msg_tx, mut msg_rx| {
+                scope!(ctx, async |s| {
+                    s.spawn_boxed(async move {
+                        receiver.ready().await.expect("receiver ready failed");
+                        ready_tx.send(()).expect("receiver ready channel closed");
 
+                        for _ in 0..NUM_MESSAGES {
+                            let datagram = receiver.recv().await.expect("UDP receive failed");
+                            let msg = str::from_utf8(datagram.buf.as_slice())
+                                .expect("udp payload must be utf-8")
+                                .to_string();
+                            msg_tx.send(msg).expect("message channel closed");
+                        }
+                    });
+
+                    s.spawn_boxed(async move {
+                        ready_rx.recv().await.expect("ready channel closed");
+                        for i in 0..NUM_MESSAGES {
+                            let msg = format!("Message {i}");
+                            let mut buf = ctx.alloc(nz!(1024), msg.len());
+                            buf.spare_capacity_mut()[..msg.len()].copy_from_slice(msg.as_bytes());
+                            socket2.send_to(buf, addr1).await.expect("send_to failed");
+                        }
+                    });
+                })
+                .await
+                .unwrap();
+
+                let mut received = Vec::with_capacity(NUM_MESSAGES);
                 for _ in 0..NUM_MESSAGES {
-                    let datagram = receiver.recv().await.expect("UDP receive failed");
-                    let msg = str::from_utf8(datagram.buf.as_slice())
-                        .expect("udp payload must be utf-8")
-                        .to_string();
-                    msg_tx.send(msg).expect("message channel closed");
+                    received.push(msg_rx.recv().await.expect("message channel closed"));
                 }
-            });
+                received
+            })
+            .await;
 
-            s.spawn_boxed(async move {
-                ready_rx.recv().await.expect("ready channel closed");
-                for i in 0..NUM_MESSAGES {
-                    let msg = format!("Message {i}");
-                    let mut buf = ctx.alloc(nz!(1024), msg.len());
-                    buf.spare_capacity_mut()[..msg.len()].copy_from_slice(msg.as_bytes());
-                    socket2.send_to(buf, addr1).await.expect("send_to failed");
-                }
-            });
-        })
-        .await
-        .unwrap();
-
-        let mut received = Vec::with_capacity(NUM_MESSAGES);
-        for _ in 0..NUM_MESSAGES {
-            received.push(msg_rx.recv().await.expect("message channel closed"));
-        }
         received.sort();
         let mut expected = (0..NUM_MESSAGES)
             .map(|i| format!("Message {i}"))
@@ -557,144 +562,147 @@ fn multithread_udp_no_echo() {
 #[test]
 fn multithread_udp_echo() {
     run_test_with_workers(nz!(2), async |ctx| {
-        let state = mpsc::borrowed_unbounded::<SocketAddr>();
-        let (addr_tx, mut addr_rx) = state.split();
-        let state = mpsc::borrowed_unbounded::<()>();
-        let (done_tx, mut done_rx) = state.split();
-
-        scope!(ctx, async |s| {
-            s.spawn_boxed(async move {
-                let socket = bind_udp_socket(ctx, "127.0.0.1:0");
-                let server_addr = socket.local_addr().expect("Failed to get server address");
-                let mut receiver = socket
-                    .receiver(udp_receive_config(1024))
-                    .expect("create server receiver");
-                receiver.ready().await.expect("ready server receiver");
-
-                addr_tx.send(server_addr).unwrap();
-                let datagram = receiver.recv().await.expect("server receive failed");
-                let from_addr = datagram.addr;
-                let bytes = datagram.buf.len();
-                let mut echo_buf = ctx.alloc(nz!(1024), bytes);
-                echo_buf.spare_capacity_mut()[..bytes]
-                    .copy_from_slice(&datagram.buf.as_slice()[..bytes]);
-
-                socket
-                    .send_to(echo_buf, from_addr)
-                    .await
-                    .expect("Server send_to failed");
-
-                done_rx.recv().await.expect("Client done channel closed");
-            });
-
-            s.spawn_boxed(async move {
-                let server_addr = addr_rx.recv().await.expect("Channel closed");
-                let client = bind_udp_socket(ctx, "127.0.0.1:0");
-                let recv_client = client.clone();
-                let (client_tx, mut client_rx) = mpsc::unbounded::<()>();
-
-                scope!(ctx, async |client_scope| {
-                    let data = b"Hello from worker 2!";
-                    client_scope.spawn_boxed(async move {
-                        let mut receiver = recv_client
+        mpsc::with_borrowed_unbounded::<SocketAddr, _, _>(async |addr_tx, mut addr_rx| {
+            mpsc::with_borrowed_unbounded::<(), _, _>(async |done_tx, mut done_rx| {
+                scope!(ctx, async |s| {
+                    s.spawn_boxed(async move {
+                        let socket = bind_udp_socket(ctx, "127.0.0.1:0");
+                        let server_addr =
+                            socket.local_addr().expect("Failed to get server address");
+                        let mut receiver = socket
                             .receiver(udp_receive_config(1024))
-                            .expect("create client receiver");
-                        receiver.ready().await.expect("ready client receiver");
-                        client_tx.send(()).unwrap();
+                            .expect("create server receiver");
+                        receiver.ready().await.expect("ready server receiver");
 
-                        let datagram = receiver.recv().await.expect("client receive failed");
-                        assert_eq!(datagram.addr, server_addr);
-                        assert_eq!(&datagram.buf.as_slice()[..data.len()], data);
+                        addr_tx.send(server_addr).unwrap();
+                        let datagram = receiver.recv().await.expect("server receive failed");
+                        let from_addr = datagram.addr;
+                        let bytes = datagram.buf.len();
+                        let mut echo_buf = ctx.alloc(nz!(1024), bytes);
+                        echo_buf.spare_capacity_mut()[..bytes]
+                            .copy_from_slice(&datagram.buf.as_slice()[..bytes]);
+
+                        socket
+                            .send_to(echo_buf, from_addr)
+                            .await
+                            .expect("Server send_to failed");
+
+                        done_rx.recv().await.expect("Client done channel closed");
                     });
 
-                    client_scope.spawn_boxed(async move {
-                        client_rx
-                            .recv()
-                            .await
-                            .expect("client readiness channel closed");
-                        let mut send_buf = ctx.alloc(nz!(1024), data.len());
-                        send_buf.spare_capacity_mut()[..data.len()].copy_from_slice(data);
-                        client
-                            .send_to(send_buf, server_addr)
-                            .await
-                            .expect("Client send_to failed");
+                    s.spawn_boxed(async move {
+                        let server_addr = addr_rx.recv().await.expect("Channel closed");
+                        let client = bind_udp_socket(ctx, "127.0.0.1:0");
+                        let recv_client = client.clone();
+                        let (client_tx, mut client_rx) = mpsc::unbounded::<()>();
+
+                        scope!(ctx, async |client_scope| {
+                            let data = b"Hello from worker 2!";
+                            client_scope.spawn_boxed(async move {
+                                let mut receiver = recv_client
+                                    .receiver(udp_receive_config(1024))
+                                    .expect("create client receiver");
+                                receiver.ready().await.expect("ready client receiver");
+                                client_tx.send(()).unwrap();
+
+                                let datagram =
+                                    receiver.recv().await.expect("client receive failed");
+                                assert_eq!(datagram.addr, server_addr);
+                                assert_eq!(&datagram.buf.as_slice()[..data.len()], data);
+                            });
+
+                            client_scope.spawn_boxed(async move {
+                                client_rx
+                                    .recv()
+                                    .await
+                                    .expect("client readiness channel closed");
+                                let mut send_buf = ctx.alloc(nz!(1024), data.len());
+                                send_buf.spare_capacity_mut()[..data.len()].copy_from_slice(data);
+                                client
+                                    .send_to(send_buf, server_addr)
+                                    .await
+                                    .expect("Client send_to failed");
+                            });
+                        })
+                        .await
+                        .unwrap();
+
+                        done_tx.send(()).unwrap();
                     });
                 })
                 .await
                 .unwrap();
-
-                done_tx.send(()).unwrap();
-            });
+            })
+            .await;
         })
-        .await
-        .unwrap();
+        .await;
     });
 }
 
 #[test]
 fn multithread_udp_cross_worker_drop_is_routed() {
     run_test_with_workers(nz!(2), async |ctx| {
-        let state = mpsc::borrowed_unbounded::<UdpSocket<'_>>();
-        let (clone_tx, mut clone_rx) = state.split();
+        mpsc::with_borrowed_unbounded::<UdpSocket<'_>, _, _>(async |clone_tx, mut clone_rx| {
+            scope!(ctx, async |s| {
+                s.spawn_boxed(async move {
+                    let socket = bind_udp_socket(ctx, "127.0.0.1:0");
+                    clone_tx.send(socket.clone()).unwrap();
+                    // 显式关闭本端的 socket 引用，底层 Token 在跨 Worker 端关闭后将回收解绑
+                    socket.close().await.expect("socket close failed");
 
-        scope!(ctx, async |s| {
-            s.spawn_boxed(async move {
-                let socket = bind_udp_socket(ctx, "127.0.0.1:0");
-                clone_tx.send(socket.clone()).unwrap();
-                // 显式关闭本端的 socket 引用，底层 Token 在跨 Worker 端关闭后将回收解绑
-                socket.close().await.expect("socket close failed");
+                    let probe_server = bind_udp_socket(ctx, "127.0.0.1:0");
+                    let probe_client =
+                        UdpSocket::bind(ctx, "127.0.0.1:0").expect("probe client dummy bind");
+                    let probe_addr = probe_server
+                        .local_addr()
+                        .expect("Failed to get probe server address");
+                    let (probe_ready_tx, mut probe_ready_rx) = mpsc::unbounded::<()>();
 
-                let probe_server = bind_udp_socket(ctx, "127.0.0.1:0");
-                let probe_client =
-                    UdpSocket::bind(ctx, "127.0.0.1:0").expect("probe client dummy bind");
-                let probe_addr = probe_server
-                    .local_addr()
-                    .expect("Failed to get probe server address");
-                let (probe_ready_tx, mut probe_ready_rx) = mpsc::unbounded::<()>();
+                    scope!(ctx, async |probe_scope| {
+                        let probe_server_task = probe_server.clone();
+                        let data = b"probe";
+                        probe_scope.spawn_boxed(async move {
+                            let mut receiver = probe_server_task
+                                .receiver(udp_receive_config(1024))
+                                .expect("create probe receiver");
+                            receiver.ready().await.expect("ready probe receiver");
+                            probe_ready_tx.send(()).unwrap();
 
-                scope!(ctx, async |probe_scope| {
-                    let probe_server_task = probe_server.clone();
-                    let data = b"probe";
-                    probe_scope.spawn_boxed(async move {
-                        let mut receiver = probe_server_task
-                            .receiver(udp_receive_config(1024))
-                            .expect("create probe receiver");
-                        receiver.ready().await.expect("ready probe receiver");
-                        probe_ready_tx.send(()).unwrap();
+                            let datagram = receiver.recv().await.expect("probe receive failed");
+                            assert_eq!(&datagram.buf.as_slice()[..data.len()], data);
+                        });
 
-                        let datagram = receiver.recv().await.expect("probe receive failed");
-                        assert_eq!(&datagram.buf.as_slice()[..data.len()], data);
-                    });
+                        probe_scope.spawn_boxed(async move {
+                            probe_ready_rx
+                                .recv()
+                                .await
+                                .expect("probe ready channel closed");
+                            let mut send_buf = ctx.alloc(nz!(1024), data.len());
+                            send_buf.spare_capacity_mut()[..data.len()].copy_from_slice(data);
 
-                    probe_scope.spawn_boxed(async move {
-                        probe_ready_rx
-                            .recv()
-                            .await
-                            .expect("probe ready channel closed");
-                        let mut send_buf = ctx.alloc(nz!(1024), data.len());
-                        send_buf.spare_capacity_mut()[..data.len()].copy_from_slice(data);
-
-                        probe_client
-                            .send_to(send_buf, probe_addr)
-                            .await
-                            .expect("probe send_to failed");
-                    });
-                })
-                .await
-                .unwrap();
-            });
-
-            s.spawn_boxed(async move {
-                let socket = clone_rx.recv().await.expect("clone channel closed");
-                // 在跨 Worker 线程上直接显式 close().await 彻底完成解绑
-                socket
-                    .close()
+                            probe_client
+                                .send_to(send_buf, probe_addr)
+                                .await
+                                .expect("probe send_to failed");
+                        });
+                    })
                     .await
-                    .expect("cross worker socket close failed");
-            });
+                    .unwrap();
+                });
+
+                s.spawn_boxed(async move {
+                    let socket = clone_rx.recv().await.expect("clone channel closed");
+                    // 在跨 Worker 线程上直接显式 close().await 彻底完成解绑
+                    socket
+                        .close()
+                        .await
+                        .expect("cross worker socket close failed");
+                });
+            })
+            .await
+            .unwrap();
         })
-        .await
-        .unwrap();
+        .await;
     });
 }
 
@@ -715,78 +723,79 @@ fn multithread_concurrent_udp_clients() {
             .collect::<Vec<_>>();
         let server = bind_udp_socket(ctx, "127.0.0.1:0");
         let server_addr = server.local_addr().expect("Failed to get server address");
-        let state = mpsc::borrowed_unbounded::<SocketAddr>();
-        let (peer_tx, mut peer_rx) = state.split();
-        let mut receiver = server
-            .receiver(udp_receive_config_with_capacity(
-                NUM_CLIENTS,
-                NUM_CLIENTS,
-                1024,
-            ))
-            .expect("create server receiver");
+        mpsc::with_borrowed_unbounded::<SocketAddr, _, _>(async |peer_tx, mut peer_rx| {
+            let mut receiver = server
+                .receiver(udp_receive_config_with_capacity(
+                    NUM_CLIENTS,
+                    NUM_CLIENTS,
+                    1024,
+                ))
+                .expect("create server receiver");
 
-        for tx in server_senders {
-            tx.send(server_addr).unwrap();
-        }
-
-        let mut ready_pairs = Vec::with_capacity(NUM_CLIENTS);
-        for _ in 0..NUM_CLIENTS {
-            ready_pairs.push(mpsc::unbounded::<()>());
-        }
-
-        let ready_txs = ready_pairs
-            .iter()
-            .map(|(tx, _)| tx.clone())
-            .collect::<Vec<_>>();
-
-        scope!(ctx, async |s| {
-            s.spawn_boxed(async move {
-                receiver
-                    .ready()
-                    .await
-                    .expect("server receiver ready failed");
-                for ready_tx in ready_txs {
-                    ready_tx.send(()).expect("server ready channel closed");
-                }
-
-                for _ in 0..NUM_CLIENTS {
-                    let datagram = receiver.recv().await.expect("server receive failed");
-                    peer_tx
-                        .send(datagram.addr)
-                        .expect("peer channel unexpectedly closed");
-                }
-            });
-
-            for (client_id, ((_tx, mut rx), (_, mut ready_rx))) in
-                addr_channels.into_iter().zip(ready_pairs).enumerate()
-            {
-                s.spawn_boxed(async move {
-                    ready_rx.recv().await.expect("server ready channel closed");
-                    let server_addr = rx.recv().await.expect("Channel closed");
-                    let client = bind_udp_socket(ctx, "127.0.0.1:0");
-                    let msg = format!("Hello from client {}", client_id);
-                    let mut buf = ctx.alloc(nz!(1024), msg.len());
-                    buf.spare_capacity_mut()[..msg.len()].copy_from_slice(msg.as_bytes());
-
-                    let (sent, _) = client
-                        .send_to(buf, server_addr)
-                        .await
-                        .expect("Client send_to failed");
-                    assert_eq!(sent, msg.len());
-                });
+            for tx in server_senders {
+                tx.send(server_addr).unwrap();
             }
 
-            // 4. 汇总验证
-            let mut unique_peers = HashSet::default();
+            let mut ready_pairs = Vec::with_capacity(NUM_CLIENTS);
             for _ in 0..NUM_CLIENTS {
-                let peer_addr = peer_rx.recv().await.expect("peer channel closed");
-                unique_peers.insert(peer_addr);
-                completed.fetch_add(1, Ordering::SeqCst);
+                ready_pairs.push(mpsc::unbounded::<()>());
             }
-            assert_eq!(unique_peers.len(), NUM_CLIENTS);
+
+            let ready_txs = ready_pairs
+                .iter()
+                .map(|(tx, _)| tx.clone())
+                .collect::<Vec<_>>();
+
+            scope!(ctx, async |s| {
+                s.spawn_boxed(async move {
+                    receiver
+                        .ready()
+                        .await
+                        .expect("server receiver ready failed");
+                    for ready_tx in ready_txs {
+                        ready_tx.send(()).expect("server ready channel closed");
+                    }
+
+                    for _ in 0..NUM_CLIENTS {
+                        let datagram = receiver.recv().await.expect("server receive failed");
+                        peer_tx
+                            .send(datagram.addr)
+                            .expect("peer channel unexpectedly closed");
+                    }
+                });
+
+                for (client_id, ((_tx, mut rx), (_, mut ready_rx))) in
+                    addr_channels.into_iter().zip(ready_pairs).enumerate()
+                {
+                    s.spawn_boxed(async move {
+                        ready_rx.recv().await.expect("server ready channel closed");
+                        let server_addr = rx.recv().await.expect("Channel closed");
+                        let client = bind_udp_socket(ctx, "127.0.0.1:0");
+                        let msg = format!("Hello from client {}", client_id);
+                        let mut buf = ctx.alloc(nz!(1024), msg.len());
+                        buf.spare_capacity_mut()[..msg.len()].copy_from_slice(msg.as_bytes());
+
+                        let (sent, _) = client
+                            .send_to(buf, server_addr)
+                            .await
+                            .expect("Client send_to failed");
+                        assert_eq!(sent, msg.len());
+                    });
+                }
+
+                // 4. 汇总验证
+                let mut unique_peers = HashSet::default();
+                for _ in 0..NUM_CLIENTS {
+                    let peer_addr = peer_rx.recv().await.expect("peer channel closed");
+                    unique_peers.insert(peer_addr);
+                    completed.fetch_add(1, Ordering::SeqCst);
+                }
+                assert_eq!(unique_peers.len(), NUM_CLIENTS);
+            })
+            .await
+            .unwrap();
         })
-        .await
-        .unwrap();
+        .await;
 
         assert_eq!(completed.load(Ordering::SeqCst), NUM_CLIENTS);
     });

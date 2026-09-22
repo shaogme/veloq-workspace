@@ -27,117 +27,118 @@ where
 #[test]
 fn test_sync_mpmc_unbounded_simple() {
     run_test(async |_ctx| {
-        let state = mpmc::borrowed_unbounded();
-        let (tx, rx) = state.split();
+        mpmc::with_borrowed_unbounded(async |tx, rx| {
+            tx.send(1).await.unwrap();
+            tx.send(2).await.unwrap();
 
-        tx.send(1).await.unwrap();
-        tx.send(2).await.unwrap();
+            let rx2 = rx.clone();
 
-        let rx2 = rx.clone();
-
-        assert_eq!(rx.recv().await.unwrap(), 1);
-        assert_eq!(rx2.recv().await.unwrap(), 2);
+            assert_eq!(rx.recv().await.unwrap(), 1);
+            assert_eq!(rx2.recv().await.unwrap(), 2);
+        })
+        .await;
     });
 }
 
 #[test]
 fn test_sync_mpmc_unbounded_concurrent() {
     run_test(async |ctx| {
-        let state = mpmc::borrowed_unbounded();
-        let (tx, rx) = state.split();
-        let count = 100;
+        mpmc::with_borrowed_unbounded(async |tx, rx| {
+            let count = 100;
 
-        scope!(ctx, async |s| {
-            for _ in 0..5 {
-                let tx = tx.clone();
-                s.spawn_boxed(async move {
-                    for i in 0..count {
-                        tx.send(i).await.unwrap();
-                    }
-                });
-            }
-            drop(tx);
+            scope!(ctx, async |s| {
+                for _ in 0..5 {
+                    let tx = tx.clone();
+                    s.spawn_boxed(async move {
+                        for i in 0..count {
+                            tx.send(i).await.unwrap();
+                        }
+                    });
+                }
+                drop(tx);
 
-            let total_received = Arc::new(AtomicUsize::new(0));
-            for _ in 0..5 {
-                let rx = rx.clone();
-                let total = total_received.clone();
-                s.spawn_boxed(async move {
-                    while rx.recv().await.is_ok() {
-                        total.fetch_add(1, Ordering::Relaxed);
-                    }
-                });
-            }
-            drop(rx);
+                let total_received = Arc::new(AtomicUsize::new(0));
+                for _ in 0..5 {
+                    let rx = rx.clone();
+                    let total = total_received.clone();
+                    s.spawn_boxed(async move {
+                        while rx.recv().await.is_ok() {
+                            total.fetch_add(1, Ordering::Relaxed);
+                        }
+                    });
+                }
+                drop(rx);
+            })
+            .await
+            .unwrap();
         })
-        .await
-        .unwrap();
+        .await;
     });
 }
 
 #[test]
 fn test_sync_mpmc_bounded_capacity() {
     run_test(async |ctx| {
-        let state = mpmc::borrowed_bounded(1);
-        let (tx, rx) = state.split();
+        mpmc::with_borrowed_bounded(1, async |tx, rx| {
+            tx.send(1).await.unwrap();
 
-        tx.send(1).await.unwrap();
+            scope!(ctx, async |s| {
+                let tx_clone = tx.clone();
+                s.spawn_boxed(async move {
+                    tx_clone.send(2).await.unwrap();
+                });
 
-        scope!(ctx, async |s| {
-            let tx_clone = tx.clone();
-            s.spawn_boxed(async move {
-                tx_clone.send(2).await.unwrap();
-            });
+                yield_now().await;
 
-            yield_now().await;
-
-            assert_eq!(rx.recv().await.unwrap(), 1);
-            assert_eq!(rx.recv().await.unwrap(), 2);
+                assert_eq!(rx.recv().await.unwrap(), 1);
+                assert_eq!(rx.recv().await.unwrap(), 2);
+            })
+            .await
+            .unwrap();
         })
-        .await
-        .unwrap();
+        .await;
     });
 }
 
 #[test]
 fn test_sync_mpmc_bounded_multi_consumer() {
     run_test(async |ctx| {
-        let state = mpmc::borrowed_bounded(5);
-        let (tx, rx) = state.split();
+        mpmc::with_borrowed_bounded(5, async |tx, rx| {
+            for i in 0..5 {
+                tx.send(i).await.unwrap();
+            }
 
-        for i in 0..5 {
-            tx.send(i).await.unwrap();
-        }
+            scope!(ctx, async |s| {
+                let c1 = rx.clone();
+                let c2 = rx.clone();
 
-        scope!(ctx, async |s| {
-            let c1 = rx.clone();
-            let c2 = rx.clone();
+                let h1 = s.spawn_boxed(async move { c1.recv().await.unwrap() });
+                let h2 = s.spawn_boxed(async move { c2.recv().await.unwrap() });
 
-            let h1 = s.spawn_boxed(async move { c1.recv().await.unwrap() });
-            let h2 = s.spawn_boxed(async move { c2.recv().await.unwrap() });
+                let r1 = h1.await.unwrap();
+                let r2 = h2.await.unwrap();
 
-            let r1 = h1.await.unwrap();
-            let r2 = h2.await.unwrap();
-
-            assert!(r1 < 5);
-            assert!(r2 < 5);
-            assert_ne!(r1, r2);
+                assert!(r1 < 5);
+                assert!(r2 < 5);
+                assert_ne!(r1, r2);
+            })
+            .await
+            .unwrap();
         })
-        .await
-        .unwrap();
+        .await;
     });
 }
 
 #[test]
 fn test_sync_mpmc_try_send_recv() {
     run_test(async |_ctx| {
-        let state = mpmc::borrowed_bounded(1);
-        let (tx, rx) = state.split();
+        mpmc::with_borrowed_bounded(1, async |tx, rx| {
+            tx.try_send(1).unwrap();
+            assert!(tx.try_send(2).is_err());
 
-        tx.try_send(1).unwrap();
-        assert!(tx.try_send(2).is_err());
-
-        assert_eq!(rx.try_recv().unwrap(), 1);
-        assert!(rx.try_recv().is_err());
+            assert_eq!(rx.try_recv().unwrap(), 1);
+            assert!(rx.try_recv().is_err());
+        })
+        .await;
     });
 }

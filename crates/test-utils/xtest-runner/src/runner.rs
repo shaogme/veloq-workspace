@@ -147,6 +147,20 @@ impl Runner {
             ));
         }
 
+        if package_matches(self.config.package.as_deref(), "veloq-sync") {
+            steps.push((
+                "预热 trybuild 编译测试 (veloq-sync)",
+                veloq_sync_trybuild_warmup_command(),
+            ));
+        }
+
+        if package_matches(self.config.package.as_deref(), "veloq-local") {
+            steps.push((
+                "预热 trybuild 编译测试 (veloq-local)",
+                veloq_local_trybuild_warmup_command(),
+            ));
+        }
+
         for (step, command) in steps {
             self.run_prebuild_step(step, command)?;
         }
@@ -418,10 +432,7 @@ fn linux_native_command(
 
     match task {
         Task::Test => {
-            args.extend(vec![
-                "--run-ignored".into(),
-                "all".into(),
-            ]);
+            args.extend(vec!["--run-ignored".into(), "all".into()]);
             if let Some(filter) = filter {
                 args.push("-E".into());
                 args.push(filter.into());
@@ -498,10 +509,7 @@ fn windows_native_command(
 
     match task {
         Task::Test => {
-            args.extend(vec![
-                "--run-ignored".into(),
-                "all".into(),
-            ]);
+            args.extend(vec!["--run-ignored".into(), "all".into()]);
             if let Some(filter) = filter {
                 args.push("-E".into());
                 args.push(filter.into());
@@ -551,6 +559,38 @@ fn veloq_std_trybuild_warmup_command() -> CommandSpec {
             "--test".into(),
             "compile_tests".into(),
             "receiver_is_not_sync".into(),
+            "--".into(),
+            "--exact".into(),
+        ],
+    )
+}
+
+fn veloq_sync_trybuild_warmup_command() -> CommandSpec {
+    CommandSpec::new(
+        "cargo",
+        vec![
+            "test".into(),
+            "-p".into(),
+            "veloq-sync".into(),
+            "--test".into(),
+            "compile_tests".into(),
+            "compile_tests".into(),
+            "--".into(),
+            "--exact".into(),
+        ],
+    )
+}
+
+fn veloq_local_trybuild_warmup_command() -> CommandSpec {
+    CommandSpec::new(
+        "cargo",
+        vec![
+            "test".into(),
+            "-p".into(),
+            "veloq-local".into(),
+            "--test".into(),
+            "compile_tests".into(),
+            "compile_tests".into(),
             "--".into(),
             "--exact".into(),
         ],
@@ -622,6 +662,16 @@ mod tests {
         assert_eq!(std_warmup.program, "cargo");
         assert!(std_warmup.args.contains(&"veloq-std".into()));
         assert!(std_warmup.args.contains(&"receiver_is_not_sync".into()));
+
+        let sync_warmup = veloq_sync_trybuild_warmup_command();
+        assert_eq!(sync_warmup.program, "cargo");
+        assert!(sync_warmup.args.contains(&"veloq-sync".into()));
+        assert!(sync_warmup.args.contains(&"compile_tests".into()));
+
+        let local_warmup = veloq_local_trybuild_warmup_command();
+        assert_eq!(local_warmup.program, "cargo");
+        assert!(local_warmup.args.contains(&"veloq-local".into()));
+        assert!(local_warmup.args.contains(&"compile_tests".into()));
     }
 
     #[test]
@@ -630,6 +680,9 @@ mod tests {
         assert!(package_matches(None, "veloq-runtime"));
         assert!(package_matches(Some("veloq-std"), "veloq-std"));
         assert!(!package_matches(Some("veloq-std"), "veloq-runtime"));
-        assert!(package_matches(Some("veloq-runtime,veloq-std"), "veloq-std"));
+        assert!(package_matches(
+            Some("veloq-runtime,veloq-std"),
+            "veloq-std"
+        ));
     }
 }

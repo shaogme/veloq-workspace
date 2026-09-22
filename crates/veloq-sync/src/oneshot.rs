@@ -6,6 +6,7 @@ use veloq_std::{
     fmt,
     future::Future,
     mem::ManuallyDrop,
+    ops::AsyncFnOnce,
     pin::{Pin, pin},
     sync::atomic::Ordering,
     sync::{Arc, atomic::AtomicUsize},
@@ -15,9 +16,14 @@ use veloq_std::{
     },
 };
 
-/// Creates a new one-shot channel state.
-pub fn borrowed_channel<T>() -> State<T> {
-    State::new()
+/// Creates a new borrowed one-shot channel and runs the provided asynchronous closure with it.
+pub async fn with_borrowed_channel<T, F, R>(f: F) -> R
+where
+    F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
+{
+    let state = State::new();
+    let (tx, rx) = state.split();
+    f(tx, rx).await
 }
 
 pub struct State<T> {

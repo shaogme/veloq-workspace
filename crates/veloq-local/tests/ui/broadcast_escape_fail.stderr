@@ -1,0 +1,17 @@
+error: lifetime may not live long enough
+ --> tests/ui/broadcast_escape_fail.rs:6:86
+  |
+6 |     let _escaped = broadcast::with_borrowed_channel::<i32, _, _>(16, async |tx, _rx| tx).await;
+  |                                                                             --     - ^^ returning this value requires that `'1` must outlive `'2`
+  |                                                                             |      |
+  |                                                                             |      return type of async closure `{async closure body@$DIR/tests/ui/broadcast_escape_fail.rs:6:86: 6:88}` contains a lifetime `'2`
+  |                                                                             has type `veloq_local::broadcast::BorrowedSender<'1, i32>`
+
+error: lifetime may not live long enough
+  --> tests/ui/broadcast_escape_fail.rs:10:86
+   |
+10 |     let _escaped = broadcast::with_borrowed_channel::<i32, _, _>(16, async |_tx, rx| rx).await;
+   |                                                                             ---    - ^^ returning this value requires that `'1` must outlive `'2`
+   |                                                                             |      |
+   |                                                                             |      return type of async closure `{async closure body@$DIR/tests/ui/broadcast_escape_fail.rs:10:86: 10:88}` contains a lifetime `'2`
+   |                                                                             has type `veloq_local::broadcast::BorrowedSender<'1, i32>`

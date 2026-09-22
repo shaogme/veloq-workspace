@@ -300,74 +300,77 @@ fn multithread_tcp_connections() {
 #[test]
 fn multithread_tcp_echo() {
     run_test_with_workers(nz!(2), async |ctx| {
-        let state = mpsc::borrowed_unbounded::<SocketAddr>();
-        let (addr_tx, mut addr_rx) = state.split();
-        let state = mpsc::borrowed_unbounded::<()>();
-        let (done_tx, mut done_rx) = state.split();
+        mpsc::with_borrowed_unbounded(async |addr_tx, mut addr_rx| {
+            mpsc::with_borrowed_unbounded(async |done_tx, mut done_rx| {
+                scope!(ctx, async |s| {
+                    let data = b"Hello from worker 1!";
+                    s.spawn_boxed(async move {
+                        let listener =
+                            TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
+                        let listen_addr =
+                            listener.local_addr().expect("Failed to get local address");
+                        addr_tx.send(listen_addr).unwrap();
 
-        scope!(ctx, async |s| {
-            let data = b"Hello from worker 1!";
-            s.spawn_boxed(async move {
-                let listener =
-                    TcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
-                let listen_addr = listener.local_addr().expect("Failed to get local address");
-                addr_tx.send(listen_addr).unwrap();
+                        let (stream, _) = listener.accept().await.expect("Accept failed");
+                        let mut recv_buf = ctx.alloc_full(nz!(1024));
+                        let mut received = Vec::with_capacity(data.len());
+                        while received.len() < data.len() {
+                            let (n, buf) = stream.recv(recv_buf).await.expect("Recv failed");
+                            recv_buf = buf;
+                            assert!(n > 0, "Peer closed before sending full request");
+                            let remain = data.len() - received.len();
+                            received.extend_from_slice(&recv_buf.as_slice()[..n.min(remain)]);
+                        }
+                        assert_eq!(received.as_slice(), data);
 
-                let (stream, _) = listener.accept().await.expect("Accept failed");
-                let mut recv_buf = ctx.alloc_full(nz!(1024));
-                let mut received = Vec::with_capacity(data.len());
-                while received.len() < data.len() {
-                    let (n, buf) = stream.recv(recv_buf).await.expect("Recv failed");
-                    recv_buf = buf;
-                    assert!(n > 0, "Peer closed before sending full request");
-                    let remain = data.len() - received.len();
-                    received.extend_from_slice(&recv_buf.as_slice()[..n.min(remain)]);
-                }
-                assert_eq!(received.as_slice(), data);
+                        let mut sent = 0usize;
+                        while sent < data.len() {
+                            let remain = &data[sent..];
+                            let chunk = remain.len().min(1024);
+                            let mut echo_buf = ctx.alloc(nz!(1024), chunk);
+                            echo_buf.spare_capacity_mut()[..chunk]
+                                .copy_from_slice(&remain[..chunk]);
 
-                let mut sent = 0usize;
-                while sent < data.len() {
-                    let remain = &data[sent..];
-                    let chunk = remain.len().min(1024);
-                    let mut echo_buf = ctx.alloc(nz!(1024), chunk);
-                    echo_buf.spare_capacity_mut()[..chunk].copy_from_slice(&remain[..chunk]);
+                            let (n, _) = stream.send(echo_buf).await.expect("Send failed");
+                            assert!(n > 0, "Send returned 0 before echo completed");
+                            sent += n;
+                        }
 
-                    let (n, _) = stream.send(echo_buf).await.expect("Send failed");
-                    assert!(n > 0, "Send returned 0 before echo completed");
-                    sent += n;
-                }
+                        done_rx.recv().await.expect("Client done channel closed");
+                    });
 
-                done_rx.recv().await.expect("Client done channel closed");
-            });
+                    s.spawn_boxed(async move {
+                        let listen_addr = addr_rx.recv().await.expect("Channel closed");
 
-            s.spawn_boxed(async move {
-                let listen_addr = addr_rx.recv().await.expect("Channel closed");
+                        let stream = TcpStream::connect(ctx, listen_addr)
+                            .await
+                            .expect("Failed to connect");
+                        let mut send_buf = ctx.alloc(nz!(1024), data.len());
+                        send_buf.spare_capacity_mut()[..data.len()].copy_from_slice(data);
 
-                let stream = TcpStream::connect(ctx, listen_addr)
-                    .await
-                    .expect("Failed to connect");
-                let mut send_buf = ctx.alloc(nz!(1024), data.len());
-                send_buf.spare_capacity_mut()[..data.len()].copy_from_slice(data);
+                        let (sent, _) = stream.send(send_buf).await.expect("Send failed");
+                        assert_eq!(sent, data.len());
 
-                let (sent, _) = stream.send(send_buf).await.expect("Send failed");
-                assert_eq!(sent, data.len());
+                        let mut recv_buf = ctx.alloc_full(nz!(1024));
+                        let mut echoed = Vec::with_capacity(data.len());
+                        while echoed.len() < data.len() {
+                            let (n, buf) = stream.recv(recv_buf).await.expect("Recv failed");
+                            recv_buf = buf;
+                            assert!(n > 0, "Peer closed before echo completed");
+                            let remain = data.len() - echoed.len();
+                            echoed.extend_from_slice(&recv_buf.as_slice()[..n.min(remain)]);
+                        }
+                        assert_eq!(echoed.as_slice(), data);
 
-                let mut recv_buf = ctx.alloc_full(nz!(1024));
-                let mut echoed = Vec::with_capacity(data.len());
-                while echoed.len() < data.len() {
-                    let (n, buf) = stream.recv(recv_buf).await.expect("Recv failed");
-                    recv_buf = buf;
-                    assert!(n > 0, "Peer closed before echo completed");
-                    let remain = data.len() - echoed.len();
-                    echoed.extend_from_slice(&recv_buf.as_slice()[..n.min(remain)]);
-                }
-                assert_eq!(echoed.as_slice(), data);
-
-                done_tx.send(()).unwrap();
-            });
+                        done_tx.send(()).unwrap();
+                    });
+                })
+                .await
+                .unwrap();
+            })
+            .await;
         })
-        .await
-        .unwrap();
+        .await;
     });
 }
 

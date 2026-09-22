@@ -23,6 +23,7 @@ crossbeam-queue.workspace = true
 tokio.workspace = true
 criterion.workspace = true
 loom.workspace = true
+trybuild = "1.0"
 
 [lints]
 workspace = true

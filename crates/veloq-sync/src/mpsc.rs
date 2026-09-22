@@ -7,6 +7,7 @@ use futures_core::stream::Stream;
 use veloq_std::{
     future::Future,
     mem::ManuallyDrop,
+    ops::AsyncFnOnce,
     pin::{Pin, pin},
     sync::{
         Arc,
@@ -69,14 +70,24 @@ impl<T, S: ChannelStrategy, Q> State<T, S, Q> {
     }
 }
 
-/// Creates a new unbounded channel state.
-pub fn borrowed_unbounded<T>() -> State<T, UnboundedStrategy, SegQueue<T>> {
-    State::unbounded()
+/// Creates a new borrowed unbounded channel and runs the provided asynchronous closure with it.
+pub async fn with_borrowed_unbounded<T, F, R>(f: F) -> R
+where
+    F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
+{
+    let state = State::unbounded();
+    let (tx, rx) = state.split();
+    f(tx, rx).await
 }
 
-/// Creates a new bounded channel state.
-pub fn borrowed_bounded<T>(capacity: usize) -> State<T, BoundedStrategy, ArrayQueue<T>> {
-    State::bounded(capacity)
+/// Creates a new borrowed bounded channel and runs the provided asynchronous closure with it.
+pub async fn with_borrowed_bounded<T, F, R>(capacity: usize, f: F) -> R
+where
+    F: for<'a> AsyncFnOnce(BorrowedBoundedSender<'a, T>, BorrowedBoundedReceiver<'a, T>) -> R,
+{
+    let state = State::bounded(capacity);
+    let (tx, rx) = state.split();
+    f(tx, rx).await
 }
 
 // Type Aliases to maintain API compatibility

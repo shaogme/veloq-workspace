@@ -9,6 +9,7 @@ use veloq_intrusive_linklist::ConcurrentLinkedList;
 use veloq_std::{
     future::Future,
     mem::ManuallyDrop,
+    ops::AsyncFnOnce,
     pin::{Pin, pin},
     ptr::NonNull,
     sync::{
@@ -93,15 +94,25 @@ pub type Receiver<T> = GenericReceiver<T, Unbounded, SegQueue<T>>;
 pub type BoundedSender<T> = GenericSender<T, Bounded, ArrayQueue<T>>;
 pub type BoundedReceiver<T> = GenericReceiver<T, Bounded, ArrayQueue<T>>;
 
-/// Creates a new unbounded MPMC channel state.
-pub fn borrowed_unbounded<T: Send>() -> State<T, Unbounded, SegQueue<T>> {
-    State::new(0)
+/// Creates a new borrowed unbounded MPMC channel and runs the provided asynchronous closure with it.
+pub async fn with_borrowed_unbounded<T: Send, F, R>(f: F) -> R
+where
+    F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
+{
+    let state = State::new(0);
+    let (tx, rx) = state.split();
+    f(tx, rx).await
 }
 
-/// Creates a new bounded MPMC channel state.
-pub fn borrowed_bounded<T: Send>(capacity: usize) -> State<T, Bounded, ArrayQueue<T>> {
+/// Creates a new borrowed bounded MPMC channel and runs the provided asynchronous closure with it.
+pub async fn with_borrowed_bounded<T: Send, F, R>(capacity: usize, f: F) -> R
+where
+    F: for<'a> AsyncFnOnce(BorrowedBoundedSender<'a, T>, BorrowedBoundedReceiver<'a, T>) -> R,
+{
     assert!(capacity > 0);
-    State::new(capacity)
+    let state = State::new(capacity);
+    let (tx, rx) = state.split();
+    f(tx, rx).await
 }
 
 // --- State ---
@@ -627,7 +638,7 @@ impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Drop for ReceiverStream<'a, T, F, Q> 
 }
 
 pub fn unbounded<T: Send>() -> (Sender<T>, Receiver<T>) {
-    let state = Arc::new(borrowed_unbounded());
+    let state = Arc::new(State::new(0));
     (
         GenericSender {
             state: state.clone(),
@@ -637,7 +648,8 @@ pub fn unbounded<T: Send>() -> (Sender<T>, Receiver<T>) {
 }
 
 pub fn bounded<T: Send>(capacity: usize) -> (BoundedSender<T>, BoundedReceiver<T>) {
-    let state = Arc::new(borrowed_bounded(capacity));
+    assert!(capacity > 0);
+    let state = Arc::new(State::new(capacity));
     (
         GenericSender {
             state: state.clone(),

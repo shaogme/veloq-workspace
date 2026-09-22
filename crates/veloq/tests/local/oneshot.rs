@@ -20,89 +20,91 @@ where
 #[test]
 fn test_send_recv() {
     run_test(async |ctx| {
-        let state = oneshot::borrowed_channel();
-        let (tx, rx) = state.split();
+        oneshot::with_borrowed_channel(async |tx, rx| {
+            scope_local!(ctx, async |s| {
+                s.spawn_boxed_local(async move {
+                    tx.send(42).unwrap();
+                });
 
-        scope_local!(ctx, async |s| {
-            s.spawn_boxed_local(async move {
-                tx.send(42).unwrap();
-            });
-
-            assert_eq!(rx.await.unwrap(), 42);
+                assert_eq!(rx.await.unwrap(), 42);
+            })
+            .await
+            .unwrap();
         })
-        .await
-        .unwrap();
+        .await;
     });
 }
 
 #[test]
 fn test_tx_closed() {
     run_test(async |_ctx| {
-        let state = oneshot::borrowed_channel::<i32>();
-        let (tx, rx) = state.split();
-        drop(tx);
-        assert!(rx.await.is_err());
+        oneshot::with_borrowed_channel::<i32, _, _>(async |tx, rx| {
+            drop(tx);
+            assert!(rx.await.is_err());
+        })
+        .await;
     });
 }
 
 #[test]
 fn test_rx_closed() {
     run_test(async |_ctx| {
-        let state = oneshot::borrowed_channel::<i32>();
-        let (tx, rx) = state.split();
+        oneshot::with_borrowed_channel::<i32, _, _>(async |tx, rx| {
+            assert!(!tx.is_closed());
+            drop(rx);
+            assert!(tx.is_closed());
 
-        assert!(!tx.is_closed());
-        drop(rx);
-        assert!(tx.is_closed());
-
-        // Attempt to send should fail
-        assert_eq!(tx.send(10), Err(10));
+            // Attempt to send should fail
+            assert_eq!(tx.send(10), Err(10));
+        })
+        .await;
     });
 }
 
 #[test]
 fn test_try_recv() {
     run_test(async |_ctx| {
-        let state = oneshot::borrowed_channel();
-        let (tx, rx) = state.split();
+        oneshot::with_borrowed_channel(async |tx, rx| {
+            assert_eq!(rx.try_recv(), Err(oneshot::TryRecvError::Empty));
 
-        assert_eq!(rx.try_recv(), Err(oneshot::TryRecvError::Empty));
+            tx.send(100).unwrap();
 
-        tx.send(100).unwrap();
+            assert_eq!(rx.try_recv(), Ok(100));
 
-        assert_eq!(rx.try_recv(), Ok(100));
-
-        assert_eq!(rx.try_recv(), Err(oneshot::TryRecvError::Closed));
+            assert_eq!(rx.try_recv(), Err(oneshot::TryRecvError::Closed));
+        })
+        .await;
     });
 }
 
 #[test]
 fn test_drop_tx_notify() {
     run_test(async |ctx| {
-        let state = oneshot::borrowed_channel::<i32>();
-        let (tx, rx) = state.split();
+        oneshot::with_borrowed_channel::<i32, _, _>(async |tx, rx| {
+            scope_local!(ctx, async |s| {
+                let handle = s.spawn_boxed_local(rx);
 
-        scope_local!(ctx, async |s| {
-            let handle = s.spawn_boxed_local(rx);
+                // Drop tx without sending
+                drop(tx);
 
-            // Drop tx without sending
-            drop(tx);
-
-            let res = handle.await.unwrap();
-            assert!(res.is_err());
+                let res = handle.await.unwrap();
+                assert!(res.is_err());
+            })
+            .await
+            .unwrap();
         })
-        .await
-        .unwrap();
+        .await;
     });
 }
 
 #[test]
 fn test_send_before_recv() {
     run_test(async |_ctx| {
-        let state = oneshot::borrowed_channel();
-        let (tx, rx) = state.split();
-        tx.send("hello").unwrap();
-        assert_eq!(rx.await.unwrap(), "hello");
+        oneshot::with_borrowed_channel(async |tx, rx| {
+            tx.send("hello").unwrap();
+            assert_eq!(rx.await.unwrap(), "hello");
+        })
+        .await;
     });
 }
 

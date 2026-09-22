@@ -11,10 +11,11 @@ fn bench_oneshot_send_recv(c: &mut Criterion) {
 
     group.bench_function("send_recv", |b| {
         b.to_async(&rt).iter(|| async {
-            let state = oneshot::borrowed_channel();
-            let (tx, rx) = state.split();
-            tx.send(1).unwrap();
-            rx.await.unwrap();
+            oneshot::with_borrowed_channel(async |tx, rx| {
+                tx.send(1).unwrap();
+                rx.await.unwrap();
+            })
+            .await;
         });
     });
 

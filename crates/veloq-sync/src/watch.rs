@@ -2,6 +2,7 @@ use core::ops::Deref;
 
 use veloq_std::{
     fmt,
+    ops::AsyncFnOnce,
     pin::pin,
     sync::{
         Arc, UnpoisonedRwLock, UnpoisonedRwLockReadGuard,
@@ -499,7 +500,12 @@ pub fn channel<T>(init: T) -> (Sender<T>, Receiver<T>) {
     )
 }
 
-/// Creates a new borrowed watch channel state.
-pub fn borrowed_channel<T>(init: T) -> State<T> {
-    State::new(init)
+/// Creates a new borrowed watch channel and runs the provided asynchronous closure with it.
+pub async fn with_borrowed_channel<T, F, R>(init: T, f: F) -> R
+where
+    F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
+{
+    let state = State::new(init);
+    let (tx, rx) = state.split();
+    f(tx, rx).await
 }

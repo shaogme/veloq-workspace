@@ -4,6 +4,7 @@ use veloq_std::{
     collections::VecDeque,
     future::Future,
     mem::ManuallyDrop,
+    ops::AsyncFnOnce,
     pin::{Pin, pin},
     rc::Rc,
     task::{Context, Poll},
@@ -63,14 +64,24 @@ impl<T> State<T> {
     }
 }
 
-/// Creates a new bounded MPMC channel state.
-pub fn borrowed_bounded<T>(size: usize) -> State<T> {
-    State::bounded(size)
+/// Creates a new borrowed bounded MPMC channel and runs the provided asynchronous closure with it.
+pub async fn with_borrowed_bounded<T, F, R>(size: usize, f: F) -> R
+where
+    F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
+{
+    let state = State::bounded(size);
+    let (tx, rx) = state.split();
+    f(tx, rx).await
 }
 
-/// Creates a new unbounded MPMC channel state.
-pub fn borrowed_unbounded<T>() -> State<T> {
-    State::unbounded()
+/// Creates a new borrowed unbounded MPMC channel and runs the provided asynchronous closure with it.
+pub async fn with_borrowed_unbounded<T, F, R>(f: F) -> R
+where
+    F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
+{
+    let state = State::unbounded();
+    let (tx, rx) = state.split();
+    f(tx, rx).await
 }
 
 /// 本地通道的发送端（借用）

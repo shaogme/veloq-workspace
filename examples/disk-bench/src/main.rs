@@ -261,7 +261,7 @@ async fn run_iteration_measured<'rt>(
     let total_ops = ops.len();
     let mut current_op_idx = 0;
     let mut written_bytes = 0u64;
-    let state = mpsc::borrowed_unbounded();
+    let state = mpsc::State::unbounded();
     let (tx, mut rx) = state.split();
 
     scope!(ctx, async |s| {

@@ -12,16 +12,17 @@ fn bench_stream_creation(c: &mut Criterion) {
 
     c.bench_function("stream_creation_and_poll", |b| {
         b.to_async(&rt).iter(|| async {
-            let state = mpsc::borrowed_unbounded();
-            let (tx, rx) = state.split();
-            tx.send(1).await.unwrap();
+            mpsc::with_borrowed_unbounded(async |tx, rx| {
+                tx.send(1).await.unwrap();
 
-            let stream = rx.stream();
-            pin!(stream);
+                let stream = rx.stream();
+                pin!(stream);
 
-            // Poll once to ensure node is registered/used
-            let item = poll_fn(|cx| stream.as_mut().poll_next(cx)).await;
-            assert_eq!(item, Some(1));
+                // Poll once to ensure node is registered/used
+                let item = poll_fn(|cx| stream.as_mut().poll_next(cx)).await;
+                assert_eq!(item, Some(1));
+            })
+            .await;
         });
     });
 }

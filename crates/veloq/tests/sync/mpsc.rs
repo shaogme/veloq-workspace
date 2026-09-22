@@ -20,42 +20,42 @@ where
 #[test]
 fn test_sync_unbounded_simple() {
     run_test(async |_ctx| {
-        let state = mpsc::borrowed_unbounded();
-        let (tx, mut rx) = state.split();
+        mpsc::with_borrowed_unbounded(async |tx, mut rx| {
+            tx.send(1).unwrap();
+            tx.send(2).unwrap();
 
-        tx.send(1).unwrap();
-        tx.send(2).unwrap();
-
-        assert_eq!(rx.recv().await, Some(1));
-        assert_eq!(rx.recv().await, Some(2));
+            assert_eq!(rx.recv().await, Some(1));
+            assert_eq!(rx.recv().await, Some(2));
+        })
+        .await;
     });
 }
 
 #[test]
 fn test_sync_unbounded_multi_thread() {
     run_test(async |ctx| {
-        let state = mpsc::borrowed_unbounded();
-        let (tx, mut rx) = state.split();
-
-        scope!(ctx, async |s| {
-            for i in 0..10 {
-                let tx = tx.clone();
-                s.spawn_boxed(async move {
-                    tx.send(i).unwrap();
-                });
-            }
-            drop(tx);
-
-            let mut sum = 0;
-            for _ in 0..10 {
-                if let Some(val) = rx.recv().await {
-                    sum += val;
+        mpsc::with_borrowed_unbounded(async |tx, mut rx| {
+            scope!(ctx, async |s| {
+                for i in 0..10 {
+                    let tx = tx.clone();
+                    s.spawn_boxed(async move {
+                        tx.send(i).unwrap();
+                    });
                 }
-            }
-            assert_eq!(sum, 45);
+                drop(tx);
+
+                let mut sum = 0;
+                for _ in 0..10 {
+                    if let Some(val) = rx.recv().await {
+                        sum += val;
+                    }
+                }
+                assert_eq!(sum, 45);
+            })
+            .await
+            .unwrap();
         })
-        .await
-        .unwrap();
+        .await;
     });
 }
 
@@ -65,75 +65,76 @@ fn test_sync_unbounded_stream() {
     use veloq_std::pin::Pin;
 
     run_test(async |ctx| {
-        let state = mpsc::borrowed_unbounded();
-        let (tx, rx) = state.split();
+        mpsc::with_borrowed_unbounded(async |tx, rx| {
+            scope!(ctx, async |s| {
+                s.spawn_boxed(async move {
+                    for i in 0..5 {
+                        tx.send(i).unwrap();
+                    }
+                });
 
-        scope!(ctx, async |s| {
-            s.spawn_boxed(async move {
-                for i in 0..5 {
-                    tx.send(i).unwrap();
+                let mut stream = Box::pin(rx);
+                async fn next_item<S: Stream<Item = i32> + Unpin>(s: &mut S) -> Option<i32> {
+                    use veloq_std::future::poll_fn;
+                    poll_fn(|cx| Pin::new(&mut *s).poll_next(cx)).await
                 }
-            });
 
-            let mut stream = Box::pin(rx);
-            async fn next_item<S: Stream<Item = i32> + Unpin>(s: &mut S) -> Option<i32> {
-                use veloq_std::future::poll_fn;
-                poll_fn(|cx| Pin::new(&mut *s).poll_next(cx)).await
-            }
-
-            assert_eq!(next_item(&mut stream).await, Some(0));
-            assert_eq!(next_item(&mut stream).await, Some(1));
-            assert_eq!(next_item(&mut stream).await, Some(2));
-            assert_eq!(next_item(&mut stream).await, Some(3));
-            assert_eq!(next_item(&mut stream).await, Some(4));
+                assert_eq!(next_item(&mut stream).await, Some(0));
+                assert_eq!(next_item(&mut stream).await, Some(1));
+                assert_eq!(next_item(&mut stream).await, Some(2));
+                assert_eq!(next_item(&mut stream).await, Some(3));
+                assert_eq!(next_item(&mut stream).await, Some(4));
+            })
+            .await
+            .unwrap();
         })
-        .await
-        .unwrap();
+        .await;
     });
 }
 
 #[test]
 fn test_sync_bounded_capacity() {
     run_test(async |ctx| {
-        let state = mpsc::borrowed_bounded(1);
-        let (tx, mut rx) = state.split();
+        mpsc::with_borrowed_bounded(1, async |tx, mut rx| {
+            tx.send(1).await.unwrap();
 
-        tx.send(1).await.unwrap();
+            scope!(ctx, async |s| {
+                let tx_clone = tx.clone();
+                s.spawn_boxed(async move {
+                    tx_clone.send(2).await.unwrap();
+                });
 
-        scope!(ctx, async |s| {
-            let tx_clone = tx.clone();
-            s.spawn_boxed(async move {
-                tx_clone.send(2).await.unwrap();
-            });
+                yield_now().await;
 
-            yield_now().await;
-
-            assert_eq!(rx.recv().await, Some(1));
-            assert_eq!(rx.recv().await, Some(2));
+                assert_eq!(rx.recv().await, Some(1));
+                assert_eq!(rx.recv().await, Some(2));
+            })
+            .await
+            .unwrap();
         })
-        .await
-        .unwrap();
+        .await;
     });
 }
 
 #[test]
 fn test_sync_bounded_drop_receiver() {
     run_test(async |ctx| {
-        let state = mpsc::borrowed_bounded(1);
-        let (tx, rx) = state.split();
-        tx.send(1).await.unwrap();
+        mpsc::with_borrowed_bounded(1, async |tx, rx| {
+            tx.send(1).await.unwrap();
 
-        scope!(ctx, async |s| {
-            s.spawn_boxed(async move {
-                let result = tx.send(2).await;
-                assert!(result.is_err());
-            });
+            scope!(ctx, async |s| {
+                s.spawn_boxed(async move {
+                    let result = tx.send(2).await;
+                    assert!(result.is_err());
+                });
 
-            yield_now().await;
-            drop(rx);
+                yield_now().await;
+                drop(rx);
+            })
+            .await
+            .unwrap();
         })
-        .await
-        .unwrap();
+        .await;
     });
 }
 
