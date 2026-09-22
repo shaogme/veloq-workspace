@@ -1,12 +1,13 @@
 use crate::{
     SendError, TryRecvError,
+    notify::Notify,
     shim::queue::{ArrayQueue, Queue, SegQueue},
 };
 use futures_core::stream::Stream;
 use veloq_std::{
     future::Future,
     mem::ManuallyDrop,
-    pin::Pin,
+    pin::{Pin, pin},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -140,40 +141,24 @@ impl ChannelStrategy for UnboundedStrategy {
 }
 
 pub struct BoundedStrategy {
-    send_waiters: SegQueue<Arc<WakerState>>,
-}
-
-struct WakerState {
-    waker: MwsrWaker,
-    waiting: AtomicBool,
+    notify: Notify,
 }
 
 impl BoundedStrategy {
     fn new(_capacity: usize) -> Self {
         Self {
-            send_waiters: SegQueue::new(),
-        }
-    }
-
-    fn wake_one_sender(&self) {
-        while let Some(ws) = self.send_waiters.pop() {
-            if ws.waiting.swap(false, Ordering::AcqRel) {
-                ws.waker.wake();
-                break;
-            }
+            notify: Notify::new(),
         }
     }
 }
 
 impl ChannelStrategy for BoundedStrategy {
     fn on_rx_drop(&self) {
-        while let Some(ws) = self.send_waiters.pop() {
-            ws.waker.wake();
-        }
+        self.notify.notify_waiters();
     }
 
     fn on_msg_recv(&self) {
-        self.wake_one_sender();
+        self.notify.notify_one();
     }
 }
 
@@ -243,80 +228,34 @@ impl<'a, T> GenericSender<'a, T, UnboundedStrategy, SegQueue<T>> {
 // Bounded Specifics
 impl<'a, T> GenericSender<'a, T, BoundedStrategy, ArrayQueue<T>> {
     /// Sends a value to the channel.
-    pub async fn send(&self, val: T) -> Result<(), SendError<T>> {
-        BoundedSendFuture {
-            sender: self,
-            val: Some(val),
-            waker_state: None,
-        }
-        .await
-    }
-}
-
-struct BoundedSendFuture<'a, 'b, T> {
-    sender: &'b GenericSender<'a, T, BoundedStrategy, ArrayQueue<T>>,
-    val: Option<T>,
-    waker_state: Option<Arc<WakerState>>,
-}
-
-impl<'a, 'b, T> Drop for BoundedSendFuture<'a, 'b, T> {
-    fn drop(&mut self) {
-        if let Some(ws) = &self.waker_state {
-            ws.waiting.store(false, Ordering::Release);
-        }
-    }
-}
-
-impl<'a, 'b, T> Future for BoundedSendFuture<'a, 'b, T> {
-    type Output = Result<(), SendError<T>>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
-        let state = this.sender.state;
-        let strategy = &state.strategy;
-
-        // Check Rx active
-        if !state.state.is_rx_active() {
-            return Poll::Ready(Err(SendError(this.val.take().unwrap())));
-        }
-
-        // Try acquire capacity
-        let val = this.val.take().unwrap();
-        match state.queue.push(val) {
-            Ok(_) => {
-                state.state.wake_rx();
-                return Poll::Ready(Ok(()));
+    pub async fn send(&self, mut val: T) -> Result<(), SendError<T>> {
+        loop {
+            if !self.state.state.is_rx_active() {
+                return Err(SendError(val));
             }
-            Err(returned_val) => {
-                this.val = Some(returned_val);
+
+            match self.state.queue.push(val) {
+                Ok(_) => {
+                    self.state.state.wake_rx();
+                    return Ok(());
+                }
+                Err(returned_val) => {
+                    val = returned_val;
+                }
             }
-        }
 
-        // Register waiter
-        if this.waker_state.is_none() {
-            this.waker_state = Some(Arc::new(WakerState {
-                waker: MwsrWaker::new(),
-                waiting: AtomicBool::new(false),
-            }));
-        }
-        let ws = this.waker_state.as_ref().unwrap();
-        unsafe {
-            ws.waker.register(cx.waker());
-        }
+            let mut notified = pin!(self.state.strategy.notify.notified());
+            notified.as_mut().enable();
 
-        if !ws.waiting.swap(true, Ordering::AcqRel) {
-            strategy.send_waiters.push(ws.clone());
-        }
+            if !self.state.state.is_rx_active() {
+                return Err(SendError(val));
+            }
+            if !self.state.queue.is_full() {
+                continue;
+            }
 
-        // Re-check
-        if !state.state.is_rx_active() {
-            return Poll::Ready(Err(SendError(this.val.take().unwrap())));
+            notified.await;
         }
-        if !state.queue.is_full() {
-            ws.waker.wake();
-        }
-
-        Poll::Pending
     }
 }
 

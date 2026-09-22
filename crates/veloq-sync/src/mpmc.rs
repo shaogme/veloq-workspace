@@ -1,5 +1,6 @@
 use crate::{
     SendError, TryRecvError, TrySendError,
+    notify::Notify,
     shim::queue::{ArrayQueue, Queue, SegQueue},
     waker::{ConcurrentWaiterAdapter, ConcurrentWaiterNode},
 };
@@ -8,7 +9,7 @@ use veloq_intrusive_linklist::ConcurrentLinkedList;
 use veloq_std::{
     future::Future,
     mem::ManuallyDrop,
-    pin::Pin,
+    pin::{Pin, pin},
     ptr::NonNull,
     sync::{
         Arc, SpinLock,
@@ -23,14 +24,8 @@ pub mod flavor {
     pub trait ChannelFlavor: Send + Sync {
         fn new() -> Self;
         fn release(&self);
-        fn register_send_wait(
-            &self,
-            node: Pin<&mut ConcurrentWaiterNode>,
-            cx: &Context<'_>,
-            is_full: impl Fn() -> bool,
-        ) -> bool;
-        fn remove_send_wait(&self, node: Pin<&mut ConcurrentWaiterNode>);
         fn notify_all_senders(&self);
+        fn wait_send(&self, is_full: impl Fn() -> bool + Send) -> impl Future<Output = ()> + Send;
     }
 
     pub struct Unbounded;
@@ -40,98 +35,39 @@ pub mod flavor {
             Unbounded
         }
         fn release(&self) {}
-        fn register_send_wait(
-            &self,
-            _node: Pin<&mut ConcurrentWaiterNode>,
-            _cx: &Context<'_>,
-            _is_full: impl Fn() -> bool,
-        ) -> bool {
-            false
-        }
-        fn remove_send_wait(&self, _node: Pin<&mut ConcurrentWaiterNode>) {}
         fn notify_all_senders(&self) {}
+        async fn wait_send(&self, _is_full: impl Fn() -> bool + Send) {}
     }
 
     pub struct Bounded {
-        waiters: SpinLock<ConcurrentLinkedList<ConcurrentWaiterAdapter>>,
-        waiter_count: AtomicUsize,
+        notify: Notify,
     }
 
-    // Safety: The LinkedList holds NonNull pointers which are !Send/!Sync.
-    // However, the nodes they point to are pinned Futures or Tasks which remain valid
-    // while linked. Access is synchronized via Mutex.
     unsafe impl Send for Bounded {}
     unsafe impl Sync for Bounded {}
 
     impl ChannelFlavor for Bounded {
         fn new() -> Self {
             Self {
-                waiters: SpinLock::new(ConcurrentLinkedList::new(ConcurrentWaiterAdapter::NEW)),
-                waiter_count: AtomicUsize::new(0),
+                notify: Notify::new(),
             }
         }
 
         fn release(&self) {
-            // 优化：只有当有等待者时才尝试锁
-            if self.waiter_count.load(Ordering::Relaxed) > 0 {
-                let mut lock = self.waiters.lock();
-                lock.with_mut(|l| {
-                    if let Some(node) = l.pop_front() {
-                        self.waiter_count.fetch_sub(1, Ordering::Relaxed);
-                        node.as_ref().waker.wake();
-                    }
-                });
-            }
-        }
-
-        fn register_send_wait(
-            &self,
-            node: Pin<&mut ConcurrentWaiterNode>,
-            cx: &Context<'_>,
-            is_full: impl Fn() -> bool,
-        ) -> bool {
-            unsafe {
-                node.as_ref().waker.register(cx.waker());
-            }
-            let mut lock = self.waiters.lock();
-            // Double check
-            if !is_full() {
-                return false; // Retry acquire
-            }
-            let is_linked = lock.with(|_| node.as_ref().link.is_linked());
-            unsafe {
-                if !is_linked {
-                    lock.with_mut(|l| l.push_back(node));
-                    self.waiter_count.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-            true
-        }
-
-        fn remove_send_wait(&self, node: Pin<&mut ConcurrentWaiterNode>) {
-            // Must acquire lock to check linkage safely to avoid race with notify
-            let mut lock = self.waiters.lock();
-            let is_linked = lock.with(|_| node.link.is_linked());
-            if is_linked {
-                unsafe {
-                    let ptr = NonNull::from(&*node);
-                    lock.with_mut(|l| {
-                        let mut cursor = l.cursor_mut_from_ptr(ptr);
-                        cursor.remove();
-                    });
-                    self.waiter_count.fetch_sub(1, Ordering::Relaxed);
-                }
-            }
+            self.notify.notify_one();
         }
 
         fn notify_all_senders(&self) {
-            let mut lock = self.waiters.lock();
-            lock.with_mut(|l| {
-                while let Some(node) = l.pop_front() {
-                    node.as_ref().waker.wake();
-                }
-            });
-            self.waiter_count.store(0, Ordering::Relaxed);
+            self.notify.notify_waiters();
+        }
+
+        async fn wait_send(&self, is_full: impl Fn() -> bool + Send) {
+            let mut notified = pin!(self.notify.notified());
+            notified.as_mut().enable();
+            if !is_full() {
+                return;
+            }
+            notified.await;
         }
     }
 }
@@ -279,7 +215,7 @@ impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Drop for GenericReceiver<'a, T, F, Q>
 
 // --- Implementations ---
 
-impl<'a, T, F: ChannelFlavor, Q: Queue<T>> GenericSender<'a, T, F, Q> {
+impl<'a, T: Send, F: ChannelFlavor, Q: Queue<T>> GenericSender<'a, T, F, Q> {
     pub fn try_send(&self, msg: T) -> Result<(), TrySendError<T>> {
         if self.state.is_closed.load(Ordering::Relaxed) {
             return Err(TrySendError::Closed(msg));
@@ -294,19 +230,24 @@ impl<'a, T, F: ChannelFlavor, Q: Queue<T>> GenericSender<'a, T, F, Q> {
         }
     }
 
-    pub async fn send(&self, msg: T) -> Result<(), SendError<T>> {
-        match self.try_send(msg) {
-            Ok(_) => Ok(()),
-            Err(TrySendError::Closed(m)) => Err(SendError(m)),
-            Err(TrySendError::Full(m)) => {
-                SendFuture {
-                    sender: self,
-                    msg: Some(m),
-                    node: ConcurrentWaiterNode::new(),
-                    queued: false,
-                }
-                .await
+    pub async fn send(&self, mut msg: T) -> Result<(), SendError<T>> {
+        loop {
+            if self.state.is_closed.load(Ordering::Relaxed) {
+                return Err(SendError(msg));
             }
+
+            match self.try_send(msg) {
+                Ok(_) => return Ok(()),
+                Err(TrySendError::Closed(m)) => return Err(SendError(m)),
+                Err(TrySendError::Full(m)) => {
+                    msg = m;
+                }
+            }
+
+            self.state
+                .flavor
+                .wait_send(|| self.state.queue.is_full())
+                .await;
         }
     }
 
@@ -355,74 +296,6 @@ impl<'a, T, F: ChannelFlavor, Q: Queue<T>> GenericReceiver<'a, T, F, Q> {
 }
 
 // --- Futures ---
-
-struct SendFuture<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> {
-    sender: &'b GenericSender<'a, T, F, Q>,
-    msg: Option<T>,
-    node: ConcurrentWaiterNode,
-    queued: bool,
-}
-
-impl<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> Future for SendFuture<'a, 'b, T, F, Q> {
-    type Output = Result<(), SendError<T>>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = unsafe { self.get_unchecked_mut() };
-        let state = this.sender.state;
-
-        loop {
-            match state.queue.push(this.msg.take().unwrap()) {
-                Ok(_) => {
-                    if this.queued {
-                        let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
-                        state.flavor.remove_send_wait(node_pin);
-                        this.queued = false;
-                    }
-                    state.notify_recv_one();
-                    return Poll::Ready(Ok(()));
-                }
-                Err(m) => {
-                    this.msg = Some(m);
-                }
-            }
-
-            if state.is_closed.load(Ordering::Relaxed) {
-                if this.queued {
-                    let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
-                    state.flavor.remove_send_wait(node_pin);
-                }
-                return Poll::Ready(Err(SendError(this.msg.take().unwrap())));
-            }
-
-            if !this.queued || !this.node.link.is_linked() {
-                let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
-                if state
-                    .flavor
-                    .register_send_wait(node_pin, cx, || state.queue.is_full())
-                {
-                    this.queued = true;
-                    return Poll::Pending;
-                } else {
-                    continue;
-                }
-            } else {
-                unsafe {
-                    this.node.waker.register(cx.waker());
-                }
-                return Poll::Pending;
-            }
-        }
-    }
-}
-
-impl<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> Drop for SendFuture<'a, 'b, T, F, Q> {
-    fn drop(&mut self) {
-        if self.queued {
-            let node_pin = unsafe { Pin::new_unchecked(&mut self.node) };
-            self.sender.state.flavor.remove_send_wait(node_pin);
-        }
-    }
-}
 
 struct RecvFuture<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> {
     receiver: &'b GenericReceiver<'a, T, F, Q>,
@@ -630,7 +503,7 @@ impl<T, F: ChannelFlavor, Q: Queue<T>> Drop for GenericOwnedReceiver<T, F, Q> {
     }
 }
 
-impl<T, F: ChannelFlavor, Q: Queue<T>> GenericOwnedSender<T, F, Q> {
+impl<T: Send, F: ChannelFlavor, Q: Queue<T>> GenericOwnedSender<T, F, Q> {
     pub fn try_send(&self, msg: T) -> Result<(), TrySendError<T>> {
         let sender = ManuallyDrop::new(GenericSender { state: &self.state });
         sender.try_send(msg)

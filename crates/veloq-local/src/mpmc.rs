@@ -1,24 +1,22 @@
-use futures_core::Future;
 use futures_core::stream::Stream;
-use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
-
-use crate::common::update_waker;
-pub use crate::common::{ChannelCapacity, SendError, TryRecvError};
-
 use veloq_std::{
     cell::RefCell,
     collections::VecDeque,
-    marker::{PhantomData, PhantomPinned},
+    future::Future,
     mem::ManuallyDrop,
-    pin::Pin,
-    ptr::NonNull,
+    pin::{Pin, pin},
     rc::Rc,
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
 };
+
+pub use crate::common::{ChannelCapacity, SendError, TryRecvError};
+use crate::notify::{Notified, Notify};
 
 #[derive(Debug)]
 pub struct State<T> {
-    state: RefCell<StateInner<T>>,
+    inner: RefCell<StateInner<T>>,
+    send_notify: Notify,
+    recv_notify: Notify,
 }
 
 impl<T> State<T> {
@@ -30,15 +28,15 @@ impl<T> State<T> {
         };
 
         State {
-            state: RefCell::new(StateInner {
+            inner: RefCell::new(StateInner {
                 capacity,
                 channel: channel_buffer,
                 tx_count: 1,
                 rx_count: 1,
                 is_closed: false,
-                send_waiters: LinkedList::new(WaiterAdapter::NEW),
-                recv_waiters: LinkedList::new(WaiterAdapter::NEW),
             }),
+            send_notify: Notify::new(),
+            recv_notify: Notify::new(),
         }
     }
 
@@ -54,7 +52,7 @@ impl<T> State<T> {
 
     /// Splits the state into a sender and a receiver.
     pub fn split<'a>(&'a self) -> (Sender<'a, T>, Receiver<'a, T>) {
-        let mut inner = self.state.borrow_mut();
+        let mut inner = self.inner.borrow_mut();
         inner.tx_count = 1;
         inner.rx_count = 1;
         inner.is_closed = false;
@@ -84,151 +82,6 @@ pub struct Receiver<'a, T> {
     state: &'a State<T>,
 }
 
-trait WaiterAction {
-    fn get_list<T>(state: &mut StateInner<T>) -> &mut LinkedList<WaiterAdapter>;
-}
-
-struct SenderAction;
-
-impl WaiterAction for SenderAction {
-    fn get_list<T>(state: &mut StateInner<T>) -> &mut LinkedList<WaiterAdapter> {
-        &mut state.send_waiters
-    }
-}
-
-struct ReceiverAction;
-
-impl WaiterAction for ReceiverAction {
-    fn get_list<T>(state: &mut StateInner<T>) -> &mut LinkedList<WaiterAdapter> {
-        &mut state.recv_waiters
-    }
-}
-
-#[derive(Debug)]
-struct Waiter<'a, T, A, F>
-where
-    A: WaiterAction,
-{
-    node: WaiterNode,
-    state: &'a State<T>,
-    poll_fn: F,
-    _action: PhantomData<A>,
-}
-
-#[derive(Debug)]
-enum PollResult<T> {
-    Pending,
-    Ready(T),
-}
-
-impl<'a, T, A, F, R> Waiter<'a, T, A, F>
-where
-    F: FnMut() -> PollResult<R>,
-    A: WaiterAction,
-{
-    fn new(poll_fn: F, state: &'a State<T>) -> Self {
-        Waiter {
-            poll_fn,
-            state,
-            node: WaiterNode {
-                waker: RefCell::new(None),
-                link: Link::new(),
-                _p: PhantomPinned,
-            },
-            _action: PhantomData,
-        }
-    }
-}
-
-impl<T, A, F, R> Future for Waiter<'_, T, A, F>
-where
-    F: FnMut() -> PollResult<R>,
-    A: WaiterAction,
-{
-    type Output = R;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let future_mut = unsafe { self.get_unchecked_mut() };
-        let pinned_node = unsafe { Pin::new_unchecked(&mut future_mut.node) };
-
-        let result = (future_mut.poll_fn)();
-        match result {
-            PollResult::Pending => {
-                let mut waker = pinned_node.waker.borrow_mut();
-                update_waker(&mut waker, cx.waker());
-                drop(waker);
-
-                if !pinned_node.link.is_linked() {
-                    register_into_waiting_queue::<T, A>(
-                        pinned_node,
-                        &mut future_mut.state.state.borrow_mut(),
-                    );
-                }
-                Poll::Pending
-            }
-            PollResult::Ready(result) => {
-                remove_from_the_waiting_queue::<T, A>(
-                    pinned_node,
-                    &mut future_mut.state.state.borrow_mut(),
-                );
-                Poll::Ready(result)
-            }
-        }
-    }
-}
-
-fn register_into_waiting_queue<T, A: WaiterAction>(
-    node: Pin<&mut WaiterNode>,
-    state: &mut StateInner<T>,
-) {
-    if node.link.is_linked() {
-        return;
-    }
-
-    unsafe { A::get_list(state).push_back(node) };
-}
-
-fn remove_from_the_waiting_queue<T, A: WaiterAction>(
-    node: Pin<&mut WaiterNode>,
-    state: &mut StateInner<T>,
-) {
-    if !node.link.is_linked() {
-        return;
-    }
-
-    let ptr = unsafe { NonNull::new_unchecked(node.get_unchecked_mut()) };
-    let mut cursor = unsafe { A::get_list(state).cursor_mut_from_ptr(ptr) };
-
-    cursor.remove();
-}
-
-impl<T, A, F> Drop for Waiter<'_, T, A, F>
-where
-    A: WaiterAction,
-{
-    fn drop(&mut self) {
-        if self.node.link.is_linked() {
-            let pinned_node = unsafe { Pin::new_unchecked(&mut self.node) };
-
-            let mut state = self.state.state.borrow_mut();
-            remove_from_the_waiting_queue::<T, A>(pinned_node, &mut state);
-        }
-    }
-}
-
-#[derive(Debug)]
-struct WaiterNode {
-    waker: RefCell<Option<Waker>>,
-    link: Link,
-    _p: PhantomPinned,
-}
-
-intrusive_adapter!(WaiterAdapter = WaiterNode { link: Link });
-
-impl WaiterAdapter {
-    pub const NEW: Self = WaiterAdapter;
-}
-
 #[derive(Debug)]
 struct StateInner<T> {
     capacity: ChannelCapacity,
@@ -236,78 +89,20 @@ struct StateInner<T> {
     tx_count: usize,
     rx_count: usize,
     is_closed: bool,
-    recv_waiters: LinkedList<WaiterAdapter>,
-    send_waiters: LinkedList<WaiterAdapter>,
 }
 
 impl<T> StateInner<T> {
-    fn push(&mut self, item: T) -> Result<Option<Waker>, SendError<T>> {
-        if self.is_closed {
-            Err(SendError::Closed(item))
-        } else if self.is_full() {
-            Err(SendError::Full(item))
-        } else {
-            self.channel.push_back(item);
-
-            Ok(self.recv_waiters.pop_front().map(|n| {
-                n.as_ref()
-                    .waker
-                    .borrow_mut()
-                    .take()
-                    .expect("Future was added to the waiting queue without a waker")
-            }))
-        }
-    }
-
     fn is_full(&self) -> bool {
         match self.capacity {
             ChannelCapacity::Unbounded => false,
             ChannelCapacity::Bounded(x) => self.channel.len() >= x,
         }
     }
-
-    fn wait_for_room(&mut self) -> PollResult<()> {
-        if self.is_closed || !self.is_full() {
-            PollResult::Ready(())
-        } else {
-            PollResult::Pending
-        }
-    }
-
-    fn recv_one(&mut self) -> PollResult<Option<(T, Option<Waker>)>> {
-        match self.channel.pop_front() {
-            Some(item) => PollResult::Ready(Some((
-                item,
-                self.send_waiters
-                    .pop_front()
-                    .and_then(|node| node.as_ref().waker.borrow_mut().take()),
-            ))),
-            None => {
-                if self.tx_count > 0 && !self.is_closed {
-                    PollResult::Pending
-                } else {
-                    PollResult::Ready(None)
-                }
-            }
-        }
-    }
-}
-
-impl<T> Drop for State<T> {
-    fn drop(&mut self) {
-        #[cfg(debug_assertions)]
-        {
-            if let Ok(state) = self.state.try_borrow() {
-                assert!(state.recv_waiters.is_empty(), "Receiver waiters mismatch");
-                assert!(state.send_waiters.is_empty(), "Sender waiters mismatch");
-            }
-        }
-    }
 }
 
 impl<'a, T> Clone for Sender<'a, T> {
     fn clone(&self) -> Self {
-        self.state.state.borrow_mut().tx_count += 1;
+        self.state.inner.borrow_mut().tx_count += 1;
         Self { state: self.state }
     }
 }
@@ -315,97 +110,112 @@ impl<'a, T> Clone for Sender<'a, T> {
 impl<'a, T> Sender<'a, T> {
     /// 尝试发送数据，如果通道已满或接收端关闭则返回错误
     pub fn try_send(&self, item: T) -> Result<(), SendError<T>> {
-        if let Some(w) = self.state.state.borrow_mut().push(item)? {
-            w.wake();
+        let mut inner = self.state.inner.borrow_mut();
+        if inner.is_closed {
+            return Err(SendError::Closed(item));
         }
+        if inner.is_full() {
+            return Err(SendError::Full(item));
+        }
+        inner.channel.push_back(item);
+        drop(inner);
+        self.state.recv_notify.notify_one();
         Ok(())
     }
 
     /// 异步发送数据，如果通道已满则等待
     pub async fn send(&self, item: T) -> Result<(), SendError<T>> {
-        Waiter::<T, SenderAction, _>::new(|| self.wait_for_room(), self.state).await;
-        self.try_send(item)
+        loop {
+            {
+                let mut inner = self.state.inner.borrow_mut();
+                if inner.is_closed {
+                    return Err(SendError::Closed(item));
+                }
+                if !inner.is_full() {
+                    inner.channel.push_back(item);
+                    drop(inner);
+                    self.state.recv_notify.notify_one();
+                    return Ok(());
+                }
+            }
+
+            let mut notified = pin!(self.state.send_notify.notified());
+            notified.as_mut().enable();
+
+            {
+                let inner = self.state.inner.borrow();
+                if inner.is_closed {
+                    return Err(SendError::Closed(item));
+                }
+                if !inner.is_full() {
+                    continue;
+                }
+            }
+
+            notified.await;
+        }
     }
 
     /// 检查通道是否已满
     pub fn is_full(&self) -> bool {
-        self.state.state.borrow().is_full()
+        self.state.inner.borrow().is_full()
     }
 
     /// 获取当前通道中的消息数量
     pub fn len(&self) -> usize {
-        self.state.state.borrow().channel.len()
+        self.state.inner.borrow().channel.len()
     }
 
     /// 检查通道是否为空
     pub fn is_empty(&self) -> bool {
-        self.state.state.borrow().channel.is_empty()
-    }
-
-    fn wait_for_room(&self) -> PollResult<()> {
-        self.state.state.borrow_mut().wait_for_room()
-    }
-}
-
-fn wake_up_all(waiters: &mut LinkedList<WaiterAdapter>) {
-    let mut cursor = waiters.front_mut();
-    while !cursor.is_null() {
-        {
-            let node = cursor.get().expect("Waiter queue check");
-            if let Some(waker) = node.waker.borrow_mut().take() {
-                waker.wake();
-            }
-        }
-        cursor.remove();
+        self.state.inner.borrow().channel.is_empty()
     }
 }
 
 impl<'a, T> Drop for Sender<'a, T> {
     fn drop(&mut self) {
-        let mut state = self.state.state.borrow_mut();
-        state.tx_count -= 1;
+        let mut inner = self.state.inner.borrow_mut();
+        inner.tx_count -= 1;
 
-        if state.tx_count == 0 {
-            wake_up_all(&mut state.send_waiters);
-            wake_up_all(&mut state.recv_waiters);
+        if inner.tx_count == 0 {
+            drop(inner);
+            self.state.send_notify.notify_waiters();
+            self.state.recv_notify.notify_waiters();
         }
     }
 }
 
 impl<'a, T> Clone for Receiver<'a, T> {
     fn clone(&self) -> Self {
-        self.state.state.borrow_mut().rx_count += 1;
+        self.state.inner.borrow_mut().rx_count += 1;
         Self { state: self.state }
     }
 }
 
 impl<'a, T> Drop for Receiver<'a, T> {
     fn drop(&mut self) {
-        let mut state = self.state.state.borrow_mut();
-        state.rx_count -= 1;
+        let mut inner = self.state.inner.borrow_mut();
+        inner.rx_count -= 1;
 
-        if state.rx_count == 0 {
-            state.is_closed = true;
-            wake_up_all(&mut state.recv_waiters);
-            wake_up_all(&mut state.send_waiters);
+        if inner.rx_count == 0 {
+            inner.is_closed = true;
+            drop(inner);
+            self.state.recv_notify.notify_waiters();
+            self.state.send_notify.notify_waiters();
         }
     }
 }
 
-struct ChannelStream<'a, T> {
+pub struct ChannelStream<'a, T> {
     state: &'a State<T>,
-    node: WaiterNode,
+    notified: Option<Notified<'a>>,
 }
 
 impl<'a, T> ChannelStream<'a, T> {
     fn new(state: &'a State<T>) -> Self {
         ChannelStream {
             state,
-            node: WaiterNode {
-                waker: RefCell::new(None),
-                link: Link::new(),
-                _p: PhantomPinned,
-            },
+            notified: None,
         }
     }
 }
@@ -414,89 +224,88 @@ impl<T> Stream for ChannelStream<'_, T> {
     type Item = T;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let result = self.state.state.borrow_mut().recv_one();
         let this = unsafe { self.get_unchecked_mut() };
-        let node = unsafe { Pin::new_unchecked(&mut this.node) };
-
-        match result {
-            PollResult::Pending => {
-                let mut waker = node.waker.borrow_mut();
-                update_waker(&mut waker, cx.waker());
-                drop(waker);
-
-                if !node.link.is_linked() {
-                    register_into_waiting_queue::<T, ReceiverAction>(
-                        node,
-                        &mut this.state.state.borrow_mut(),
-                    );
+        loop {
+            {
+                let mut inner = this.state.inner.borrow_mut();
+                if let Some(item) = inner.channel.pop_front() {
+                    drop(inner);
+                    this.state.send_notify.notify_one();
+                    this.notified = None;
+                    return Poll::Ready(Some(item));
                 }
-
-                Poll::Pending
+                if (inner.tx_count == 0 || inner.is_closed) && inner.channel.is_empty() {
+                    this.notified = None;
+                    return Poll::Ready(None);
+                }
             }
-            PollResult::Ready(result) => {
-                remove_from_the_waiting_queue::<T, ReceiverAction>(
-                    node,
-                    &mut this.state.state.borrow_mut(),
-                );
 
-                Poll::Ready(result.map(|(ret, mw)| {
-                    if let Some(waker) = mw {
-                        waker.wake();
-                    }
-                    ret
-                }))
+            if this.notified.is_none() {
+                this.notified = Some(this.state.recv_notify.notified());
+            }
+
+            let notified = this.notified.as_mut().unwrap();
+            let notified_pin = unsafe { Pin::new_unchecked(notified) };
+            match Future::poll(notified_pin, cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(()) => {
+                    this.notified = None;
+                    continue;
+                }
             }
         }
-    }
-}
-
-impl<T> Drop for ChannelStream<'_, T> {
-    fn drop(&mut self) {
-        let mut state = self.state.state.borrow_mut();
-        let node = unsafe { Pin::new_unchecked(&mut self.node) };
-        remove_from_the_waiting_queue::<T, ReceiverAction>(node, &mut state);
     }
 }
 
 impl<'a, T> Receiver<'a, T> {
     /// 尝试非阻塞接收
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        let result = self.state.state.borrow_mut().recv_one();
-        match result {
-            PollResult::Pending => Err(TryRecvError::Empty),
-            PollResult::Ready(opt) => match opt {
-                Some((ret, mw)) => {
-                    if let Some(w) = mw {
-                        w.wake();
-                    }
-                    Ok(ret)
-                }
-                None => Err(TryRecvError::Closed),
-            },
+        let mut inner = self.state.inner.borrow_mut();
+        if let Some(item) = inner.channel.pop_front() {
+            drop(inner);
+            self.state.send_notify.notify_one();
+            Ok(item)
+        } else if (inner.tx_count == 0 || inner.is_closed) && inner.channel.is_empty() {
+            Err(TryRecvError::Closed)
+        } else {
+            Err(TryRecvError::Empty)
         }
     }
 
     /// 接收下一条消息
     pub async fn recv(&self) -> Option<T> {
-        Waiter::<T, ReceiverAction, _>::new(|| self.recv_one(), self.state).await
+        loop {
+            {
+                let mut inner = self.state.inner.borrow_mut();
+                if let Some(item) = inner.channel.pop_front() {
+                    drop(inner);
+                    self.state.send_notify.notify_one();
+                    return Some(item);
+                }
+                if (inner.tx_count == 0 || inner.is_closed) && inner.channel.is_empty() {
+                    return None;
+                }
+            }
+
+            let mut notified = pin!(self.state.recv_notify.notified());
+            notified.as_mut().enable();
+
+            {
+                let inner = self.state.inner.borrow();
+                if !inner.channel.is_empty()
+                    || ((inner.tx_count == 0 || inner.is_closed) && inner.channel.is_empty())
+                {
+                    continue;
+                }
+            }
+
+            notified.await;
+        }
     }
 
     /// 转换为 Stream
     pub fn stream(&self) -> impl Stream<Item = T> + '_ {
         ChannelStream::new(self.state)
-    }
-
-    fn recv_one(&self) -> PollResult<Option<T>> {
-        let result = self.state.state.borrow_mut().recv_one();
-        match result {
-            PollResult::Pending => PollResult::Pending,
-            PollResult::Ready(opt) => PollResult::Ready(opt.map(|(ret, mw)| {
-                if let Some(w) = mw {
-                    w.wake();
-                }
-                ret
-            })),
-        }
     }
 }
 
@@ -617,18 +426,14 @@ impl<T> Drop for OwnedReceiver<T> {
 /// A stream of messages from an owned MPMC channel.
 pub struct OwnedChannelStream<T> {
     state: Rc<State<T>>,
-    node: WaiterNode,
+    notified: Option<Notified<'static>>,
 }
 
 impl<T> OwnedChannelStream<T> {
     fn new(state: Rc<State<T>>) -> Self {
         OwnedChannelStream {
             state,
-            node: WaiterNode {
-                waker: RefCell::new(None),
-                link: Link::new(),
-                _p: PhantomPinned,
-            },
+            notified: None,
         }
     }
 }
@@ -637,37 +442,36 @@ impl<T> Stream for OwnedChannelStream<T> {
     type Item = T;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let result = self.state.state.borrow_mut().recv_one();
         let this = unsafe { self.get_unchecked_mut() };
-        let node = unsafe { Pin::new_unchecked(&mut this.node) };
-
-        match result {
-            PollResult::Pending => {
-                let mut waker = node.waker.borrow_mut();
-                update_waker(&mut waker, cx.waker());
-                drop(waker);
-
-                if !node.link.is_linked() {
-                    register_into_waiting_queue::<T, ReceiverAction>(
-                        node,
-                        &mut this.state.state.borrow_mut(),
-                    );
+        loop {
+            {
+                let mut inner = this.state.inner.borrow_mut();
+                if let Some(item) = inner.channel.pop_front() {
+                    drop(inner);
+                    this.state.send_notify.notify_one();
+                    this.notified = None;
+                    return Poll::Ready(Some(item));
                 }
-
-                Poll::Pending
+                if (inner.tx_count == 0 || inner.is_closed) && inner.channel.is_empty() {
+                    this.notified = None;
+                    return Poll::Ready(None);
+                }
             }
-            PollResult::Ready(result) => {
-                remove_from_the_waiting_queue::<T, ReceiverAction>(
-                    node,
-                    &mut this.state.state.borrow_mut(),
-                );
 
-                Poll::Ready(result.map(|(ret, mw)| {
-                    if let Some(waker) = mw {
-                        waker.wake();
-                    }
-                    ret
-                }))
+            if this.notified.is_none() {
+                let notify_ptr = &this.state.recv_notify as *const Notify;
+                let notify_ref: &'static Notify = unsafe { &*notify_ptr };
+                this.notified = Some(notify_ref.notified());
+            }
+
+            let notified = this.notified.as_mut().unwrap();
+            let notified_pin = unsafe { Pin::new_unchecked(notified) };
+            match Future::poll(notified_pin, cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(()) => {
+                    this.notified = None;
+                    continue;
+                }
             }
         }
     }
@@ -675,8 +479,6 @@ impl<T> Stream for OwnedChannelStream<T> {
 
 impl<T> Drop for OwnedChannelStream<T> {
     fn drop(&mut self) {
-        let mut state = self.state.state.borrow_mut();
-        let node = unsafe { Pin::new_unchecked(&mut self.node) };
-        remove_from_the_waiting_queue::<T, ReceiverAction>(node, &mut state);
+        self.notified = None;
     }
 }

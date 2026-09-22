@@ -9,11 +9,11 @@ use veloq_std::{
     pin::Pin,
     ptr::{self, NonNull},
     rc::Rc,
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
 };
 
-use crate::common::update_waker;
 pub use crate::common::{ChannelCapacity, SendError, TryRecvError};
+use crate::notify::{Notified, Notify};
 
 struct StateInner<T> {
     buffer: NonNull<T>,
@@ -22,8 +22,6 @@ struct StateInner<T> {
     head: usize,
     tail: usize,
     is_closed: bool,
-    producer_waker: Option<Waker>,
-    consumer_waker: Option<Waker>,
     is_bounded: bool,
 }
 
@@ -57,8 +55,6 @@ impl<T> StateInner<T> {
             head: 0,
             tail: 0,
             is_closed: false,
-            producer_waker: None,
-            consumer_waker: None,
             is_bounded,
         }
     }
@@ -153,8 +149,6 @@ impl<T> StateInner<T> {
         self.mask = new_cap - 1;
 
         // When growing, we realign the buffer (if it was wrapped) to start at 0.
-        // This applies to both normal types (where we physically moved memory)
-        // and ZSTs (where we conceptually reset the window).
         self.head = 0;
         self.tail = self.len(); // old length
     }
@@ -179,6 +173,8 @@ impl<T> Drop for StateInner<T> {
 
 pub struct State<T> {
     inner: UnsafeCell<StateInner<T>>,
+    not_empty: Notify,
+    not_full: Notify,
 }
 
 impl<T> fmt::Debug for State<T> {
@@ -192,6 +188,8 @@ impl<T> State<T> {
     pub fn new(capacity: ChannelCapacity) -> Self {
         Self {
             inner: UnsafeCell::new(StateInner::new(capacity)),
+            not_empty: Notify::new(),
+            not_full: Notify::new(),
         }
     }
 
@@ -235,53 +233,38 @@ pub struct Receiver<'a, T> {
 
 impl<'a, T> Drop for Sender<'a, T> {
     fn drop(&mut self) {
-        let waker = unsafe {
+        unsafe {
             let inner = &mut *self.inner.inner.get();
             inner.is_closed = true;
-            inner.consumer_waker.take()
-        };
-
-        if let Some(waker) = waker {
-            waker.wake();
         }
+        self.inner.not_empty.notify_waiters();
     }
 }
 
 impl<'a, T> Drop for Receiver<'a, T> {
     fn drop(&mut self) {
-        let waker = unsafe {
+        unsafe {
             let inner = &mut *self.inner.inner.get();
             inner.is_closed = true;
-            inner.producer_waker.take()
-        };
-
-        if let Some(waker) = waker {
-            waker.wake();
         }
+        self.inner.not_full.notify_waiters();
     }
 }
 
 impl<'a, T> Sender<'a, T> {
     /// Attempts to send a message.
     pub fn try_send(&self, item: T) -> Result<(), SendError<T>> {
-        let waker = unsafe {
-            let inner = &mut *self.inner.inner.get();
+        let inner = unsafe { &mut *self.inner.inner.get() };
 
-            if inner.is_closed {
-                return Err(SendError::Closed(item));
-            }
-
-            if let Err(item) = inner.push(item) {
-                return Err(SendError::Full(item));
-            }
-
-            inner.consumer_waker.take()
-        };
-
-        if let Some(waker) = waker {
-            waker.wake();
+        if inner.is_closed {
+            return Err(SendError::Closed(item));
         }
 
+        if let Err(item) = inner.push(item) {
+            return Err(SendError::Full(item));
+        }
+
+        self.inner.not_empty.notify_one();
         Ok(())
     }
 
@@ -290,6 +273,7 @@ impl<'a, T> Sender<'a, T> {
         SendFuture {
             sender: self,
             item: Some(item),
+            notified: None,
         }
         .await
     }
@@ -316,6 +300,7 @@ impl<'a, T> Sender<'a, T> {
 pub struct SendFuture<'a, 'b, T> {
     sender: &'b Sender<'a, T>,
     item: Option<T>,
+    notified: Option<Notified<'a>>,
 }
 
 impl<T> Unpin for SendFuture<'_, '_, T> {}
@@ -323,131 +308,189 @@ impl<T> Unpin for SendFuture<'_, '_, T> {}
 impl<'a, 'b, T> Future for SendFuture<'a, 'b, T> {
     type Output = Result<(), SendError<T>>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let waker_to_wake = unsafe {
-            let inner = &mut *self.sender.inner.inner.get();
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+        loop {
+            let inner = unsafe { &mut *this.sender.inner.inner.get() };
 
             if inner.is_closed {
-                let item = self
+                this.notified = None;
+                let item = this
                     .item
                     .take()
                     .expect("Polled SendFuture after completion");
                 return Poll::Ready(Err(SendError::Closed(item)));
             }
 
-            let item = self
+            let item = this
                 .item
                 .take()
                 .expect("Polled SendFuture after completion");
             match inner.push(item) {
-                Ok(()) => inner.consumer_waker.take(),
+                Ok(()) => {
+                    this.sender.inner.not_empty.notify_one();
+                    this.notified = None;
+                    return Poll::Ready(Ok(()));
+                }
                 Err(item) => {
-                    self.item = Some(item);
-
-                    update_waker(&mut inner.producer_waker, cx.waker());
-                    return Poll::Pending;
+                    this.item = Some(item);
                 }
             }
-        };
 
-        // If we reached here, push succeeded
-        if let Some(waker) = waker_to_wake {
-            waker.wake();
+            if this.notified.is_none() {
+                this.notified = Some(this.sender.inner.not_full.notified());
+                let notified = this.notified.as_mut().unwrap();
+                let notified_pin = unsafe { Pin::new_unchecked(notified) };
+                notified_pin.enable();
+            }
+
+            let inner = unsafe { &*this.sender.inner.inner.get() };
+            if inner.is_closed || !inner.is_full() {
+                this.notified = None;
+                continue;
+            }
+
+            let notified = this.notified.as_mut().unwrap();
+            let notified_pin = unsafe { Pin::new_unchecked(notified) };
+            match Future::poll(notified_pin, cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(()) => {
+                    this.notified = None;
+                    continue;
+                }
+            }
         }
-        Poll::Ready(Ok(()))
     }
 }
 
 impl<'a, T> Receiver<'a, T> {
     /// Attempts to receive a message.
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        let (item, waker) = unsafe {
-            let inner = &mut *self.inner.inner.get();
+        let inner = unsafe { &mut *self.inner.inner.get() };
 
-            if let Some(item) = inner.pop() {
-                (Some(item), inner.producer_waker.take())
-            } else if inner.is_closed {
-                (None, None)
-            } else {
-                return Err(TryRecvError::Empty);
-            }
-        };
-
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-
-        if let Some(item) = item {
+        if let Some(item) = inner.pop() {
+            self.inner.not_full.notify_one();
             Ok(item)
-        } else {
+        } else if inner.is_closed {
             Err(TryRecvError::Closed)
+        } else {
+            Err(TryRecvError::Empty)
         }
     }
 
     /// Asynchronously receives a message.
     pub async fn recv(&self) -> Option<T> {
-        RecvFuture { receiver: self }.await
+        RecvFuture {
+            receiver: self,
+            notified: None,
+        }
+        .await
     }
 
     /// Converts the receiver into a `Stream`.
     pub fn stream(&self) -> impl Stream<Item = T> + '_ {
-        ChannelStream { receiver: self }
+        ChannelStream {
+            receiver: self,
+            notified: None,
+        }
     }
 }
 
 pub struct RecvFuture<'a, 'b, T> {
     receiver: &'b Receiver<'a, T>,
+    notified: Option<Notified<'a>>,
 }
 
 impl<'a, 'b, T> Future for RecvFuture<'a, 'b, T> {
     type Output = Option<T>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let (item, waker) = unsafe {
-            let inner = &mut *self.receiver.inner.inner.get();
+        let this = unsafe { self.get_unchecked_mut() };
+        loop {
+            let inner = unsafe { &mut *this.receiver.inner.inner.get() };
 
             if let Some(item) = inner.pop() {
-                (Some(item), inner.producer_waker.take())
-            } else if inner.is_closed {
-                return Poll::Ready(None);
-            } else {
-                update_waker(&mut inner.consumer_waker, cx.waker());
-                return Poll::Pending;
+                this.receiver.inner.not_full.notify_one();
+                this.notified = None;
+                return Poll::Ready(Some(item));
             }
-        };
+            if inner.is_closed {
+                this.notified = None;
+                return Poll::Ready(None);
+            }
 
-        if let Some(w) = waker {
-            w.wake();
+            if this.notified.is_none() {
+                this.notified = Some(this.receiver.inner.not_empty.notified());
+                let notified = this.notified.as_mut().unwrap();
+                let notified_pin = unsafe { Pin::new_unchecked(notified) };
+                notified_pin.enable();
+            }
+
+            let inner = unsafe { &*this.receiver.inner.inner.get() };
+            if inner.is_closed || !inner.is_empty() {
+                this.notified = None;
+                continue;
+            }
+
+            let notified = this.notified.as_mut().unwrap();
+            let notified_pin = unsafe { Pin::new_unchecked(notified) };
+            match Future::poll(notified_pin, cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(()) => {
+                    this.notified = None;
+                    continue;
+                }
+            }
         }
-        Poll::Ready(item)
     }
 }
 
 pub struct ChannelStream<'a, 'b, T> {
     receiver: &'b Receiver<'a, T>,
+    notified: Option<Notified<'a>>,
 }
 
 impl<'a, 'b, T> Stream for ChannelStream<'a, 'b, T> {
     type Item = T;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let (item, waker) = unsafe {
-            let inner = &mut *self.receiver.inner.inner.get();
+        let this = unsafe { self.get_unchecked_mut() };
+        loop {
+            let inner = unsafe { &mut *this.receiver.inner.inner.get() };
 
             if let Some(item) = inner.pop() {
-                (Some(item), inner.producer_waker.take())
-            } else if inner.is_closed {
-                return Poll::Ready(None);
-            } else {
-                update_waker(&mut inner.consumer_waker, cx.waker());
-                return Poll::Pending;
+                this.receiver.inner.not_full.notify_one();
+                this.notified = None;
+                return Poll::Ready(Some(item));
             }
-        };
+            if inner.is_closed {
+                this.notified = None;
+                return Poll::Ready(None);
+            }
 
-        if let Some(w) = waker {
-            w.wake();
+            if this.notified.is_none() {
+                this.notified = Some(this.receiver.inner.not_empty.notified());
+                let notified = this.notified.as_mut().unwrap();
+                let notified_pin = unsafe { Pin::new_unchecked(notified) };
+                notified_pin.enable();
+            }
+
+            let inner = unsafe { &*this.receiver.inner.inner.get() };
+            if inner.is_closed || !inner.is_empty() {
+                this.notified = None;
+                continue;
+            }
+
+            let notified = this.notified.as_mut().unwrap();
+            let notified_pin = unsafe { Pin::new_unchecked(notified) };
+            match Future::poll(notified_pin, cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(()) => {
+                    this.notified = None;
+                    continue;
+                }
+            }
         }
-        Poll::Ready(item)
     }
 }
 
@@ -539,6 +582,7 @@ impl<T> OwnedReceiver<T> {
             receiver: OwnedReceiver {
                 inner: self.inner.clone(),
             },
+            notified: None,
         }
     }
 }
@@ -552,28 +596,57 @@ impl<T> Drop for OwnedReceiver<T> {
 /// A stream of messages from an owned SPSC channel.
 pub struct OwnedChannelStream<T> {
     receiver: OwnedReceiver<T>,
+    notified: Option<Notified<'static>>,
 }
 
 impl<T> Stream for OwnedChannelStream<T> {
     type Item = T;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let (item, waker) = unsafe {
-            let inner = &mut *self.receiver.inner.inner.get();
+        let this = unsafe { self.get_unchecked_mut() };
+        loop {
+            let inner = unsafe { &mut *this.receiver.inner.inner.get() };
 
             if let Some(item) = inner.pop() {
-                (Some(item), inner.producer_waker.take())
-            } else if inner.is_closed {
-                return Poll::Ready(None);
-            } else {
-                update_waker(&mut inner.consumer_waker, cx.waker());
-                return Poll::Pending;
+                this.receiver.inner.not_full.notify_one();
+                this.notified = None;
+                return Poll::Ready(Some(item));
             }
-        };
+            if inner.is_closed {
+                this.notified = None;
+                return Poll::Ready(None);
+            }
 
-        if let Some(w) = waker {
-            w.wake();
+            if this.notified.is_none() {
+                let notify_ptr = &this.receiver.inner.not_empty as *const Notify;
+                let notify_ref: &'static Notify = unsafe { &*notify_ptr };
+                this.notified = Some(notify_ref.notified());
+                let notified = this.notified.as_mut().unwrap();
+                let notified_pin = unsafe { Pin::new_unchecked(notified) };
+                notified_pin.enable();
+            }
+
+            let inner = unsafe { &*this.receiver.inner.inner.get() };
+            if inner.is_closed || !inner.is_empty() {
+                this.notified = None;
+                continue;
+            }
+
+            let notified = this.notified.as_mut().unwrap();
+            let notified_pin = unsafe { Pin::new_unchecked(notified) };
+            match Future::poll(notified_pin, cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(()) => {
+                    this.notified = None;
+                    continue;
+                }
+            }
         }
-        Poll::Ready(item)
+    }
+}
+
+impl<T> Drop for OwnedChannelStream<T> {
+    fn drop(&mut self) {
+        self.notified = None;
     }
 }

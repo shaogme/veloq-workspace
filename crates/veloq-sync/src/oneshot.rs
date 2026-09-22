@@ -1,11 +1,12 @@
 use veloq_waker::MwsrWaker;
 
+use crate::notify::{Notified, Notify};
 use veloq_std::{
     cell::UnsafeCell,
     fmt,
     future::Future,
     mem::ManuallyDrop,
-    pin::Pin,
+    pin::{Pin, pin},
     sync::atomic::Ordering,
     sync::{Arc, atomic::AtomicUsize},
     task::{
@@ -27,8 +28,8 @@ pub struct State<T> {
     /// The state of the cell is tracked by `state`.
     value: UnsafeCell<Option<T>>,
 
-    /// The task to notify when the receiver drops without consuming the value.
-    tx_task: MwsrWaker,
+    /// The notification primitive when the receiver drops without consuming the value.
+    tx_notify: Notify,
 
     /// The task to notify when the value is sent.
     rx_task: MwsrWaker,
@@ -50,7 +51,7 @@ impl<T> State<T> {
         State {
             state: AtomicUsize::new(StateVal::new().as_usize()),
             value: UnsafeCell::new(None),
-            tx_task: MwsrWaker::new(),
+            tx_notify: Notify::new(),
             rx_task: MwsrWaker::new(),
         }
     }
@@ -61,14 +62,20 @@ impl<T> State<T> {
         State {
             state: AtomicUsize::new(StateVal::new().as_usize()),
             value: UnsafeCell::new(None),
-            tx_task: MwsrWaker::new(),
+            tx_notify: Notify::new(),
             rx_task: MwsrWaker::new(),
         }
     }
 
     /// Splits the state into a sender and a receiver.
     pub fn split(&self) -> (Sender<'_, T>, Receiver<'_, T>) {
-        (Sender { state: self }, Receiver { state: Some(self) })
+        (
+            Sender {
+                state: self,
+                closed_notified: None,
+            },
+            Receiver { state: Some(self) },
+        )
     }
 
     /// Try to set the state to complete. Returns `true` if successful, `false` if closed.
@@ -88,7 +95,7 @@ impl<T> State<T> {
     fn close(&self) -> StateVal {
         let prev = StateVal::set_closed(&self.state);
         // Notify the sender task (waiting in `closed()`).
-        self.tx_task.wake();
+        self.tx_notify.notify_waiters();
         prev
     }
 
@@ -136,6 +143,7 @@ impl<T: fmt::Debug> fmt::Debug for State<T> {
 
 pub struct Sender<'a, T> {
     state: &'a State<T>,
+    closed_notified: Option<Notified<'a>>,
 }
 
 pub struct Receiver<'a, T> {
@@ -204,8 +212,18 @@ impl<'a, T> Sender<'a, T> {
 
     /// Waits for the channel to be closed.
     pub async fn closed(&mut self) {
-        use veloq_std::future::poll_fn;
-        poll_fn(|cx| self.poll_closed(cx)).await;
+        if self.is_closed() {
+            return;
+        }
+
+        let mut notified = pin!(self.state.tx_notify.notified());
+        notified.as_mut().enable();
+
+        if self.is_closed() {
+            return;
+        }
+
+        notified.await;
     }
 
     /// Returns `true` if the receiver has closed the channel.
@@ -216,21 +234,39 @@ impl<'a, T> Sender<'a, T> {
 
     /// Polls to check if the receiver has closed the channel.
     pub fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        // Fast path check
-        if StateVal::load(&self.state.state, Ordering::Acquire).is_closed() {
+        if self.is_closed() {
+            self.closed_notified = None;
             return Ready(());
         }
 
-        unsafe {
-            self.state.tx_task.register(cx.waker());
+        if self.closed_notified.is_none() {
+            self.closed_notified = Some(self.state.tx_notify.notified());
+            let notified = self.closed_notified.as_mut().unwrap();
+            let notified_pin = unsafe { Pin::new_unchecked(notified) };
+            notified_pin.enable();
         }
 
-        // Double check after registration to avoid races
-        if StateVal::load(&self.state.state, Ordering::Acquire).is_closed() {
+        if self.is_closed() {
+            self.closed_notified = None;
             return Ready(());
         }
 
-        Pending
+        let notified = self.closed_notified.as_mut().unwrap();
+        let notified_pin = unsafe { Pin::new_unchecked(notified) };
+        match Future::poll(notified_pin, cx) {
+            Ready(()) => {
+                self.closed_notified = None;
+                Ready(())
+            }
+            Pending => {
+                if self.is_closed() {
+                    self.closed_notified = None;
+                    Ready(())
+                } else {
+                    Pending
+                }
+            }
+        }
     }
 }
 
@@ -396,6 +432,7 @@ impl<'a, T> fmt::Debug for Receiver<'a, T> {
 
 pub struct OwnedSender<T> {
     state: ManuallyDrop<Arc<State<T>>>,
+    closed_notified: Option<Notified<'static>>,
 }
 
 pub struct OwnedReceiver<T> {
@@ -407,6 +444,7 @@ pub fn owned_channel<T>() -> (OwnedSender<T>, OwnedReceiver<T>) {
     (
         OwnedSender {
             state: ManuallyDrop::new(state.clone()),
+            closed_notified: None,
         },
         OwnedReceiver { state: Some(state) },
     )
@@ -414,35 +452,89 @@ pub fn owned_channel<T>() -> (OwnedSender<T>, OwnedReceiver<T>) {
 
 impl<T> OwnedSender<T> {
     /// Sends a value.
-    pub fn send(self, t: T) -> Result<(), T> {
+    pub fn send(mut self, t: T) -> Result<(), T> {
+        self.closed_notified = None;
         let this = ManuallyDrop::new(self);
         let state = unsafe { veloq_std::ptr::read(&*this.state) };
-        let sender = Sender { state: &state };
+        let sender = Sender {
+            state: &state,
+            closed_notified: None,
+        };
         sender.send(t)
     }
 
     /// Waits for the channel to be closed.
     pub async fn closed(&mut self) {
-        let mut sender = ManuallyDrop::new(Sender { state: &self.state });
-        sender.closed().await;
+        if self.is_closed() {
+            return;
+        }
+
+        let mut notified = pin!(self.state.tx_notify.notified());
+        notified.as_mut().enable();
+
+        if self.is_closed() {
+            return;
+        }
+
+        notified.await;
     }
 
     /// Returns `true` if the receiver has closed the channel.
     pub fn is_closed(&self) -> bool {
-        let sender = ManuallyDrop::new(Sender { state: &self.state });
+        let sender = ManuallyDrop::new(Sender {
+            state: &self.state,
+            closed_notified: None,
+        });
         sender.is_closed()
     }
 
     /// Polls to check if the receiver has closed the channel.
     pub fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        let mut sender = ManuallyDrop::new(Sender { state: &self.state });
-        sender.poll_closed(cx)
+        if self.is_closed() {
+            self.closed_notified = None;
+            return Ready(());
+        }
+
+        if self.closed_notified.is_none() {
+            let notify_ptr = &self.state.tx_notify as *const Notify;
+            let notify_ref: &'static Notify = unsafe { &*notify_ptr };
+            self.closed_notified = Some(notify_ref.notified());
+            let notified = self.closed_notified.as_mut().unwrap();
+            let notified_pin = unsafe { Pin::new_unchecked(notified) };
+            notified_pin.enable();
+        }
+
+        if self.is_closed() {
+            self.closed_notified = None;
+            return Ready(());
+        }
+
+        let notified = self.closed_notified.as_mut().unwrap();
+        let notified_pin = unsafe { Pin::new_unchecked(notified) };
+        match Future::poll(notified_pin, cx) {
+            Ready(()) => {
+                self.closed_notified = None;
+                Ready(())
+            }
+            Pending => {
+                if self.is_closed() {
+                    self.closed_notified = None;
+                    Ready(())
+                } else {
+                    Pending
+                }
+            }
+        }
     }
 }
 
 impl<T> Drop for OwnedSender<T> {
     fn drop(&mut self) {
-        drop(Sender { state: &self.state });
+        self.closed_notified = None;
+        drop(Sender {
+            state: &self.state,
+            closed_notified: None,
+        });
         unsafe {
             ManuallyDrop::drop(&mut self.state);
         }
