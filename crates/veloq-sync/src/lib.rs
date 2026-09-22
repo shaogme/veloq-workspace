@@ -11,6 +11,7 @@ pub mod semaphore;
 pub mod set_once;
 pub(crate) mod shim;
 pub(crate) mod waker;
+pub mod watch;
 
 pub use condvar::{Condvar, Wait};
 pub use mutex::{Mutex, MutexGuard};

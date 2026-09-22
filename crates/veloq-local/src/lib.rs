@@ -11,6 +11,7 @@ pub mod rwlock;
 pub mod semaphore;
 pub mod set_once;
 pub mod spsc;
+pub mod watch;
 
 pub use condvar::{Condvar, Wait};
 pub use mutex::{Mutex, MutexGuard, MutexLockFuture};
