@@ -145,6 +145,7 @@ impl Runner {
                 Task::Test,
                 self.config.features.as_deref(),
                 self.config.no_default_features,
+                self.config.all_targets,
                 self.config.package.as_deref(),
                 self.config.filter.as_deref(),
                 self.config.linux_target.map(LinuxTarget::name),
@@ -153,6 +154,7 @@ impl Runner {
                 Task::Test,
                 self.config.features.as_deref(),
                 self.config.no_default_features,
+                self.config.all_targets,
                 self.windows_target.as_deref(),
                 self.config.package.as_deref(),
                 self.config.filter.as_deref(),
@@ -326,6 +328,7 @@ impl Runner {
                 self.config.task,
                 self.config.features.as_deref(),
                 self.config.no_default_features,
+                self.config.all_targets,
                 self.config.package.as_deref(),
                 self.config.filter.as_deref(),
                 self.config.linux_target.map(LinuxTarget::name),
@@ -334,6 +337,7 @@ impl Runner {
                 self.config.task,
                 self.config.features.as_deref(),
                 self.config.no_default_features,
+                self.config.all_targets,
                 self.windows_target.as_deref(),
                 self.config.package.as_deref(),
                 self.config.filter.as_deref(),
@@ -346,6 +350,7 @@ fn linux_native_command(
     task: Task,
     features: Option<&str>,
     no_default_features: bool,
+    all_targets: bool,
     package: Option<&str>,
     filter: Option<&str>,
     target: Option<&str>,
@@ -365,7 +370,11 @@ fn linux_native_command(
         args.push(f.into());
     }
 
-    append_workspace_packages(&mut args, Target::Linux, package);
+    if all_targets {
+        args.push("--all-targets".into());
+    }
+
+    append_workspace_packages(&mut args, package);
 
     match task {
         Task::Test => {
@@ -384,9 +393,9 @@ fn linux_native_command(
             if let Some(target) = target {
                 args.push("--target".into());
                 args.push(target.into());
-                args.push("--lib".into());
-            } else {
-                args.push("--all-targets".into());
+                if !all_targets {
+                    args.push("--lib".into());
+                }
             }
             args.extend(vec!["--".into(), "-D".into(), "warnings".into()]);
         }
@@ -410,27 +419,20 @@ fn append_packages(args: &mut Vec<String>, packages: Option<&str>) {
     }
 }
 
-fn append_workspace_packages(args: &mut Vec<String>, target: Target, package: Option<&str>) {
+fn append_workspace_packages(args: &mut Vec<String>, package: Option<&str>) {
     append_packages(args, package);
     if package.is_some() {
         return;
     }
 
     args.push("--workspace".into());
-    let excluded = match target {
-        Target::Linux => ["veloq-driver-iocp"].as_slice(),
-        Target::Windows => ["veloq-driver-uring", "veloq-io-uring"].as_slice(),
-    };
-    for package in excluded {
-        args.push("--exclude".into());
-        args.push((*package).into());
-    }
 }
 
 fn windows_native_command(
     task: Task,
     features: Option<&str>,
     no_default_features: bool,
+    all_targets: bool,
     target: Option<&str>,
     package: Option<&str>,
     filter: Option<&str>,
@@ -450,7 +452,11 @@ fn windows_native_command(
         args.push(f.into());
     }
 
-    append_workspace_packages(&mut args, Target::Windows, package);
+    if all_targets {
+        args.push("--all-targets".into());
+    }
+
+    append_workspace_packages(&mut args, package);
 
     match task {
         Task::Test => {
@@ -466,7 +472,6 @@ fn windows_native_command(
             }
         }
         Task::Clippy => {
-            args.extend(vec!["--all-targets".into()]);
             if let Some(t) = target {
                 args.push("--target".into());
                 args.push(t.into());
@@ -520,26 +525,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn workspace_routes_exclude_only_incompatible_backend_packages() {
-        for task in [Task::Test, Task::Clippy, Task::Check] {
-            let linux = linux_native_command(task, None, false, None, None, None);
-            assert!(linux.args.contains(&"--workspace".into()));
-            assert!(linux.args.contains(&"veloq-driver-iocp".into()));
-            assert!(!linux.args.contains(&"veloq-driver-uring".into()));
-
-            let windows = windows_native_command(task, None, false, None, None, None);
-            assert!(windows.args.contains(&"--workspace".into()));
-            assert!(windows.args.contains(&"veloq-driver-uring".into()));
-            assert!(windows.args.contains(&"veloq-io-uring".into()));
-            assert!(!windows.args.contains(&"veloq-driver-iocp".into()));
-        }
-    }
-
-    #[test]
     fn explicit_packages_do_not_change_workspace_scope() {
         let command = windows_native_command(
             Task::Check,
             None,
+            false,
             false,
             None,
             Some("veloq-driver-iocp"),
@@ -549,5 +539,16 @@ mod tests {
         assert!(command.args.contains(&"--package".into()));
         assert!(!command.args.contains(&"--workspace".into()));
         assert!(!command.args.contains(&"--exclude".into()));
+    }
+
+    #[test]
+    fn all_targets_flag_is_propagated() {
+        for task in [Task::Test, Task::Clippy, Task::Check] {
+            let linux = linux_native_command(task, None, false, true, None, None, None);
+            assert!(linux.args.contains(&"--all-targets".into()));
+
+            let windows = windows_native_command(task, None, false, true, None, None, None);
+            assert!(windows.args.contains(&"--all-targets".into()));
+        }
     }
 }

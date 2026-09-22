@@ -172,8 +172,11 @@ struct Cli {
     #[arg(long, help = "禁用 package 的默认 features")]
     no_default_features: bool,
 
-    #[arg(long, help = "仅执行指定 package")]
+    #[arg(long, short = 'p', help = "仅执行指定 package")]
     package: Option<String>,
+
+    #[arg(long, help = "包含所有目标（lib, bin, test, example, bench）")]
+    all_targets: bool,
 
     #[arg(long, help = "仅执行指定 nextest 过滤表达式")]
     filter: Option<String>,
@@ -190,6 +193,7 @@ pub(crate) struct Config {
     pub(crate) quiet: bool,
     pub(crate) features: Option<String>,
     pub(crate) no_default_features: bool,
+    pub(crate) all_targets: bool,
     pub(crate) package: Option<String>,
     pub(crate) filter: Option<String>,
     pub(crate) linux_target: Option<LinuxTarget>,
@@ -234,6 +238,7 @@ impl TryFrom<Cli> for Config {
             quiet: cli.quiet,
             features: cli.features,
             no_default_features: cli.no_default_features,
+            all_targets: cli.all_targets,
             package: cli.package,
             filter: cli.filter,
             linux_target: cli.linux_target,
@@ -269,4 +274,25 @@ fn run_app(cli: Cli) -> Result<(), Report<RunnerError>> {
     let runner = Runner::new(config)?;
     runner.run()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_package_short_alias() {
+        let cli = Cli::try_parse_from(["xtest-runner", "--target", "linux", "-p", "veloq-sync"])
+            .expect("parse should succeed");
+        assert_eq!(cli.package.as_deref(), Some("veloq-sync"));
+    }
+
+    #[test]
+    fn test_cli_all_targets() {
+        let cli = Cli::try_parse_from(["xtest-runner", "--target", "linux", "--all-targets"])
+            .expect("parse should succeed");
+        assert!(cli.all_targets);
+        let config = Config::try_from(cli).expect("config conversion should succeed");
+        assert!(config.all_targets);
+    }
 }

@@ -24,28 +24,6 @@ members = [
     "crates/utils/veloq-std",
     "crates/test-utils/xtest-runner"
 ]
-default-members = [
-    "crates/veloq",
-    "crates/veloq-runtime",
-    "crates/veloq-sync",
-    "crates/veloq-buf",
-    "crates/veloq-local",
-    "crates/driver/core",
-    "crates/driver/native",
-    "examples/disk-bench",
-    "examples/reliable-udp",
-    "crates/utils/veloq-waker",
-    "crates/utils/veloq-intrusive-linklist",
-    "crates/utils/veloq-wheel",
-    "crates/utils/veloq-blocking",
-    "crates/utils/veloq-pod",
-    "crates/utils/veloq-tls",
-    "crates/utils/veloq-storage",
-    "crates/utils/veloq-hash",
-    "crates/utils/veloq-futex",
-    "crates/utils/veloq-std",
-    "crates/test-utils/xtest-runner"
-]
 resolver = "3"
 
 [workspace.package]
