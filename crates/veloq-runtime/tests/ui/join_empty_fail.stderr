@@ -1,0 +1,11 @@
+error: unexpected end of macro invocation
+ --> tests/ui/join_empty_fail.rs:4:13
+  |
+4 |     let _ = join!();
+  |             ^^^^^^^ missing tokens in macro arguments
+  |
+note: while trying to match meta-variable `$a:expr`
+ --> src/macros.rs
+  |
+  |     ($a:expr $(,)?) => {
+  |      ^^^^^^^

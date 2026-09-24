@@ -1,5 +1,200 @@
 pub mod helpers;
 
+/// Polls multiple futures concurrently until every branch completes.
+///
+/// Each argument is converted with [`IntoFuture`](core::future::IntoFuture) exactly once and
+/// the macro returns a tuple in the same order as the arguments. A single branch still returns
+/// a one-element tuple, and a trailing comma is accepted:
+///
+/// ```ignore
+/// let (left, right) = join!(left_future, right_future);
+/// let (only,) = join!(single_future,);
+/// ```
+///
+/// Branches are polled in declaration order on every round. A branch that is ready is not polled
+/// again, and an error value such as `Result::Err` does not stop the remaining branches. The
+/// macro supports one through sixteen branches. If the current task is cancelled, it yields
+/// `Pending` so the task machinery can finish the task with `TaskError::Cancelled`; unfinished
+/// branches are dropped with the enclosing task future.
+#[macro_export]
+macro_rules! join {
+    ($a:expr $(,)?) => {
+        $crate::join!(@join_impl $a)
+    };
+    ($a:expr, $b:expr $(,)?) => {
+        $crate::join!(@join_impl $a, $b)
+    };
+    ($a:expr, $b:expr, $c:expr $(,)?) => {
+        $crate::join!(@join_impl $a, $b, $c)
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr $(,)?) => {
+        $crate::join!(@join_impl $a, $b, $c, $d)
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr $(,)?) => {
+        $crate::join!(@join_impl $a, $b, $c, $d, $e)
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr $(,)?) => {
+        $crate::join!(@join_impl $a, $b, $c, $d, $e, $f)
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr, $g:expr $(,)?) => {
+        $crate::join!(@join_impl $a, $b, $c, $d, $e, $f, $g)
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr, $g:expr, $h:expr $(,)?) => {
+        $crate::join!(@join_impl $a, $b, $c, $d, $e, $f, $g, $h)
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr, $g:expr, $h:expr, $i:expr $(,)?) => {
+        $crate::join!(@join_impl $a, $b, $c, $d, $e, $f, $g, $h, $i)
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr, $g:expr, $h:expr, $i:expr, $j:expr $(,)?) => {
+        $crate::join!(@join_impl $a, $b, $c, $d, $e, $f, $g, $h, $i, $j)
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr, $g:expr, $h:expr, $i:expr, $j:expr, $k:expr $(,)?) => {
+        $crate::join!(@join_impl $a, $b, $c, $d, $e, $f, $g, $h, $i, $j, $k)
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr, $g:expr, $h:expr, $i:expr, $j:expr, $k:expr, $l:expr $(,)?) => {
+        $crate::join!(@join_impl $a, $b, $c, $d, $e, $f, $g, $h, $i, $j, $k, $l)
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr, $g:expr, $h:expr, $i:expr, $j:expr, $k:expr, $l:expr, $m:expr $(,)?) => {
+        $crate::join!(@join_impl $a, $b, $c, $d, $e, $f, $g, $h, $i, $j, $k, $l, $m)
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr, $g:expr, $h:expr, $i:expr, $j:expr, $k:expr, $l:expr, $m:expr, $n:expr $(,)?) => {
+        $crate::join!(@join_impl $a, $b, $c, $d, $e, $f, $g, $h, $i, $j, $k, $l, $m, $n)
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr, $g:expr, $h:expr, $i:expr, $j:expr, $k:expr, $l:expr, $m:expr, $n:expr, $o:expr $(,)?) => {
+        $crate::join!(@join_impl $a, $b, $c, $d, $e, $f, $g, $h, $i, $j, $k, $l, $m, $n, $o)
+    };
+    ($a:expr, $b:expr, $c:expr, $d:expr, $e:expr, $f:expr, $g:expr, $h:expr, $i:expr, $j:expr, $k:expr, $l:expr, $m:expr, $n:expr, $o:expr, $p:expr $(,)?) => {
+        $crate::join!(@join_impl $a, $b, $c, $d, $e, $f, $g, $h, $i, $j, $k, $l, $m, $n, $o, $p)
+    };
+    ($($fut:expr),+ $(,)?) => {
+        compile_error!("join! supports at most 16 branches")
+    };
+
+    (@join_impl $($fut:expr),+) => {{
+        use $crate::__veloq_std::future::{poll_fn, Future, IntoFuture};
+        use $crate::__veloq_std::pin::Pin;
+        use $crate::__veloq_std::task::Poll;
+        use $crate::task::RuntimeContextExt;
+
+        let mut __futures = ($($crate::join!(@into_future $fut),)+);
+        let mut __futures = &mut __futures;
+        let mut __outputs = ($($crate::join!(@none $fut),)+);
+        let mut __outputs = &mut __outputs;
+
+        poll_fn(move |cx| {
+            if cx.is_cancelled() {
+                return Poll::Pending;
+            }
+
+            $crate::join!(@poll_all cx, __futures, __outputs; [] $($fut),+);
+
+            let mut __all_ready = true;
+            $crate::join!(@check_ready __outputs, __all_ready; [] $($fut),+);
+            if __all_ready {
+                Poll::Ready($crate::join!(@take_outputs __outputs; []; [] $($fut),+))
+            } else {
+                Poll::Pending
+            }
+        })
+        .await
+    }};
+
+    (@into_future $fut:expr) => {{
+        IntoFuture::into_future($fut)
+    }};
+
+    (@none $fut:expr) => {
+        None
+    };
+
+    (@poll_all $cx:ident, $futures:ident, $outputs:ident; [$($idx:tt)*] $fut:expr) => {
+        $crate::join!(@poll_one $cx, $futures, $outputs; [$($idx)*]);
+    };
+
+    (@poll_all $cx:ident, $futures:ident, $outputs:ident; [$($idx:tt)*] $fut:expr, $($rest:expr),+) => {
+        $crate::join!(@poll_one $cx, $futures, $outputs; [$($idx)*]);
+        $crate::join!(@poll_all $cx, $futures, $outputs; [~ $($idx)*] $($rest),+);
+    };
+
+    (@poll_one $cx:ident, $futures:ident, $outputs:ident; [$($idx:tt)*]) => {
+        if $crate::join!(@slot_empty $outputs, $($idx)*) {
+            let __f = unsafe {
+                // The future tuple is borrowed for the whole poll_fn future and is never moved
+                // after its first poll, so each field has a stable address for this Pin.
+                Pin::new_unchecked($crate::join!(@tuple_field $futures, $($idx)*))
+            };
+            if let Poll::Ready(__out) = __f.poll($cx) {
+                *$crate::join!(@tuple_field $outputs, $($idx)*) = Some(__out);
+            }
+        }
+    };
+
+    (@check_ready $outputs:ident, $all_ready:ident; [$($idx:tt)*] $fut:expr) => {
+        if $crate::join!(@slot_empty $outputs, $($idx)*) {
+            $all_ready = false;
+        }
+    };
+
+    (@check_ready $outputs:ident, $all_ready:ident; [$($idx:tt)*] $fut:expr, $($rest:expr),+) => {
+        if $crate::join!(@slot_empty $outputs, $($idx)*) {
+            $all_ready = false;
+        }
+        $crate::join!(@check_ready $outputs, $all_ready; [~ $($idx)*] $($rest),+);
+    };
+
+    (@take_outputs $outputs:ident; [$($idx:tt)*]; [$($taken:tt)*] $fut:expr) => {
+        ($($taken)* $crate::join!(@take_one $outputs, $($idx)*),)
+    };
+
+    (@take_outputs $outputs:ident; [$($idx:tt)*]; [$($taken:tt)*] $fut:expr, $($rest:expr),+) => {
+        $crate::join!(@take_outputs
+            $outputs;
+            [~ $($idx)*];
+            [$($taken)* $crate::join!(@take_one $outputs, $($idx)*),]
+            $($rest),+
+        )
+    };
+
+    (@take_one $outputs:ident, $($idx:tt)*) => {
+        $crate::join!(@tuple_field $outputs, $($idx)*).take().unwrap()
+    };
+
+    (@slot_empty $tuple:ident, ) => { $tuple.0.is_none() };
+    (@slot_empty $tuple:ident, ~) => { $tuple.1.is_none() };
+    (@slot_empty $tuple:ident, ~ ~) => { $tuple.2.is_none() };
+    (@slot_empty $tuple:ident, ~ ~ ~) => { $tuple.3.is_none() };
+    (@slot_empty $tuple:ident, ~ ~ ~ ~) => { $tuple.4.is_none() };
+    (@slot_empty $tuple:ident, ~ ~ ~ ~ ~) => { $tuple.5.is_none() };
+    (@slot_empty $tuple:ident, ~ ~ ~ ~ ~ ~) => { $tuple.6.is_none() };
+    (@slot_empty $tuple:ident, ~ ~ ~ ~ ~ ~ ~) => { $tuple.7.is_none() };
+    (@slot_empty $tuple:ident, ~ ~ ~ ~ ~ ~ ~ ~) => { $tuple.8.is_none() };
+    (@slot_empty $tuple:ident, ~ ~ ~ ~ ~ ~ ~ ~ ~) => { $tuple.9.is_none() };
+    (@slot_empty $tuple:ident, ~ ~ ~ ~ ~ ~ ~ ~ ~ ~) => { $tuple.10.is_none() };
+    (@slot_empty $tuple:ident, ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~) => { $tuple.11.is_none() };
+    (@slot_empty $tuple:ident, ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~) => { $tuple.12.is_none() };
+    (@slot_empty $tuple:ident, ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~) => { $tuple.13.is_none() };
+    (@slot_empty $tuple:ident, ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~) => { $tuple.14.is_none() };
+    (@slot_empty $tuple:ident, ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~) => { $tuple.15.is_none() };
+
+    (@tuple_field $tuple:ident, ) => { &mut $tuple.0 };
+    (@tuple_field $tuple:ident, ~) => { &mut $tuple.1 };
+    (@tuple_field $tuple:ident, ~ ~) => { &mut $tuple.2 };
+    (@tuple_field $tuple:ident, ~ ~ ~) => { &mut $tuple.3 };
+    (@tuple_field $tuple:ident, ~ ~ ~ ~) => { &mut $tuple.4 };
+    (@tuple_field $tuple:ident, ~ ~ ~ ~ ~) => { &mut $tuple.5 };
+    (@tuple_field $tuple:ident, ~ ~ ~ ~ ~ ~) => { &mut $tuple.6 };
+    (@tuple_field $tuple:ident, ~ ~ ~ ~ ~ ~ ~) => { &mut $tuple.7 };
+    (@tuple_field $tuple:ident, ~ ~ ~ ~ ~ ~ ~ ~) => { &mut $tuple.8 };
+    (@tuple_field $tuple:ident, ~ ~ ~ ~ ~ ~ ~ ~ ~) => { &mut $tuple.9 };
+    (@tuple_field $tuple:ident, ~ ~ ~ ~ ~ ~ ~ ~ ~ ~) => { &mut $tuple.10 };
+    (@tuple_field $tuple:ident, ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~) => { &mut $tuple.11 };
+    (@tuple_field $tuple:ident, ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~) => { &mut $tuple.12 };
+    (@tuple_field $tuple:ident, ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~) => { &mut $tuple.13 };
+    (@tuple_field $tuple:ident, ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~) => { &mut $tuple.14 };
+    (@tuple_field $tuple:ident, ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~) => { &mut $tuple.15 };
+
+}
+
 /// A macro to wait on multiple futures simultaneously, returning the output of the first one that completes.
 ///
 /// The first argument must be a [`RuntimeCtx`](crate::runtime::RuntimeCtx).

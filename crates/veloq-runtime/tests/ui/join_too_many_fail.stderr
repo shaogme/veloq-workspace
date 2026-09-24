@@ -1,0 +1,14 @@
+error: join! supports at most 16 branches
+  --> tests/ui/join_too_many_fail.rs:4:13
+   |
+ 4 |       let _ = join!(
+   |  _____________^
+ 5 | |         async { 0usize },
+ 6 | |         async { 1usize },
+ 7 | |         async { 2usize },
+...  |
+21 | |         async { 16usize },
+22 | |     );
+   | |_____^
+   |
+   = note: this error originates in the macro `join` (in Nightly builds, run with -Z macro-backtrace for more info)

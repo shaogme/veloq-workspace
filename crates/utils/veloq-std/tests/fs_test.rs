@@ -1,12 +1,11 @@
 #![cfg(feature = "std")]
 
-use core::sync::atomic::{NativeAtomicUsize, Ordering};
-
 use veloq_std::{
     ffi::OsStr,
     fs::{File, FileTimes, OpenOptions, read, read_to_string, remove_file, write},
     io::{ErrorKind, IoSlice, IoSliceMut, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::atomic::{NativeAtomicUsize, Ordering},
     time::Duration,
 };
 
