@@ -1,15 +1,13 @@
 use veloq_std::{
-    alloc_crate::{
-        borrow::Cow,
-        boxed::Box,
-        collections::{BTreeMap, BTreeSet},
-        format,
-        rc::Rc,
-        sync::Arc,
-        vec,
-        vec::Vec,
-    },
+    borrow::Cow,
+    boxed::Box,
+    collections::{BTreeMap, BTreeSet},
     ffi::{Display, OsStr, OsStrJoin, OsString},
+    format,
+    rc::Rc,
+    sync::Arc,
+    vec,
+    vec::Vec,
 };
 
 #[test]
@@ -95,12 +93,12 @@ fn test_boxed_and_shared_pointers() {
     let from_owned: Box<OsStr> = unboxed.into_boxed_os_str();
     assert_eq!(&*from_owned, os_str);
 
-    let arc: Arc<OsStr> = Arc::from(os_str);
+    let arc: Arc<OsStr> = Arc::from(os_str.to_os_string().into_boxed_os_str());
     let rc: Rc<OsStr> = Rc::from(os_str);
     assert_eq!(&*arc, os_str);
     assert_eq!(&*rc, os_str);
 
-    let arc2: Arc<OsStr> = Arc::from(os_str.to_os_string());
+    let arc2: Arc<OsStr> = Arc::from(os_str.to_os_string().into_boxed_os_str());
     let rc2: Rc<OsStr> = Rc::from(os_str.to_os_string());
     assert_eq!(&*arc2, os_str);
     assert_eq!(&*rc2, os_str);

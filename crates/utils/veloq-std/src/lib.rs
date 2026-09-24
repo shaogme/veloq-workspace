@@ -2,7 +2,30 @@
 #![deny(warnings)]
 
 #[doc(hidden)]
-pub extern crate alloc as alloc_crate;
+pub(crate) extern crate alloc as alloc_crate;
+
+#[doc(hidden)]
+pub mod __private {
+    use crate::{string::String, vec::Vec};
+
+    pub use core::{concat, format_args};
+
+    pub fn format(args: core::fmt::Arguments<'_>) -> String {
+        alloc_crate::fmt::format(args)
+    }
+
+    pub fn vec_from_array<T, const N: usize>(items: [T; N]) -> Vec<T> {
+        items.into_iter().collect()
+    }
+
+    pub fn vec_repeat<T: Clone>(item: T, count: usize) -> Vec<T> {
+        let mut items = Vec::with_capacity(count);
+        for _ in 0..count {
+            items.push(item.clone());
+        }
+        items
+    }
+}
 
 pub mod cell;
 pub mod collections;
@@ -61,9 +84,7 @@ pub mod result {
     pub use core::result::*;
 }
 
-pub mod task {
-    pub use core::task::*;
-}
+pub mod task;
 
 pub mod error {
     pub use core::error::*;

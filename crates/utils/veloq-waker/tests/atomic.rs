@@ -1,12 +1,11 @@
 #[cfg(not(feature = "loom"))]
 mod normal_tests {
-    use veloq_std::alloc_crate::{sync::Arc as StdArc, task::Wake};
     use veloq_std::{
         sync::{
-            Arc,
+            Arc, Barrier, Weak,
             atomic::{AtomicBool, AtomicUsize, Ordering},
         },
-        task::Waker,
+        task::{Wake, Waker},
         thread,
     };
     use veloq_waker::AtomicWaker;
@@ -23,9 +22,42 @@ mod normal_tests {
     }
 
     impl Wake for TestWaker {
-        fn wake(self: StdArc<Self>) {
+        fn wake(&self) {
             self.woken.store(true, Ordering::Release);
             self.wake_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ReentrantWaker {
+        target: Arc<AtomicWaker>,
+        replacement: Waker,
+        reentered: Arc<AtomicBool>,
+    }
+
+    impl Wake for ReentrantWaker {
+        fn wake(&self) {
+            self.reentered.store(true, Ordering::Release);
+            self.target.register(&self.replacement);
+        }
+    }
+
+    struct DropReentrantWaker {
+        target: Weak<AtomicWaker>,
+        drop_count: Arc<AtomicUsize>,
+        reentered: Arc<AtomicBool>,
+    }
+
+    impl Wake for DropReentrantWaker {
+        fn wake(&self) {}
+    }
+
+    impl Drop for DropReentrantWaker {
+        fn drop(&mut self) {
+            self.drop_count.fetch_add(1, Ordering::SeqCst);
+            if let Some(target) = self.target.upgrade() {
+                let _ = target.take();
+                self.reentered.store(true, Ordering::Release);
+            }
         }
     }
 
@@ -156,26 +188,175 @@ mod normal_tests {
         assert!(woken.load(Ordering::Acquire));
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
+
+    #[test]
+    fn test_replacement_register_and_multiple_take_concurrent() {
+        let atomic_waker = Arc::new(AtomicWaker::new());
+        let first_count = Arc::new(AtomicUsize::new(0));
+        let first_waker = Waker::from(Arc::new(TestWaker::new(
+            Arc::new(AtomicBool::new(false)),
+            first_count.clone(),
+        )));
+        atomic_waker.register(&first_waker);
+
+        let replacement_count = Arc::new(AtomicUsize::new(0));
+        let replacement_waker = Waker::from(Arc::new(TestWaker::new(
+            Arc::new(AtomicBool::new(false)),
+            replacement_count.clone(),
+        )));
+        let barrier = Arc::new(Barrier::new(4));
+
+        let register_slot = atomic_waker.clone();
+        let register_barrier = barrier.clone();
+        let register_handle = thread::spawn(move || {
+            register_barrier.wait();
+            register_slot.register(&replacement_waker);
+        })
+        .expect("thread spawn failed");
+
+        let take_slot = atomic_waker.clone();
+        let take_barrier = barrier.clone();
+        let take_handle = thread::spawn(move || {
+            take_barrier.wait();
+            if let Some(waker) = take_slot.take() {
+                waker.wake();
+            }
+        })
+        .expect("thread spawn failed");
+
+        let second_take_slot = atomic_waker.clone();
+        let second_take_barrier = barrier.clone();
+        let second_take_handle = thread::spawn(move || {
+            second_take_barrier.wait();
+            if let Some(waker) = second_take_slot.take() {
+                waker.wake();
+            }
+        })
+        .expect("thread spawn failed");
+
+        barrier.wait();
+        register_handle.join().unwrap();
+        take_handle.join().unwrap();
+        second_take_handle.join().unwrap();
+
+        if let Some(waker) = atomic_waker.take() {
+            waker.wake();
+        }
+
+        let first_wakes = first_count.load(Ordering::SeqCst);
+        let replacement_wakes = replacement_count.load(Ordering::SeqCst);
+        assert!(first_wakes <= 1);
+        assert!(replacement_wakes <= 1);
+        assert!((1..=2).contains(&(first_wakes + replacement_wakes)));
+    }
+
+    #[test]
+    fn test_waker_wake_can_reenter_and_register() {
+        let atomic_waker = Arc::new(AtomicWaker::new());
+        let replacement_count = Arc::new(AtomicUsize::new(0));
+        let replacement = Waker::from(Arc::new(TestWaker::new(
+            Arc::new(AtomicBool::new(false)),
+            replacement_count.clone(),
+        )));
+        let reentered = Arc::new(AtomicBool::new(false));
+        let reentrant = Waker::from(Arc::new(ReentrantWaker {
+            target: atomic_waker.clone(),
+            replacement,
+            reentered: reentered.clone(),
+        }));
+
+        atomic_waker.register(&reentrant);
+        atomic_waker.take().unwrap().wake();
+
+        assert!(reentered.load(Ordering::Acquire));
+        atomic_waker.take().unwrap().wake();
+        assert_eq!(replacement_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_replacement_drop_can_reenter_take() {
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let reentered = Arc::new(AtomicBool::new(false));
+        let atomic_waker = Arc::new(AtomicWaker::new());
+        let first = Waker::from(Arc::new(DropReentrantWaker {
+            target: Arc::downgrade(&atomic_waker),
+            drop_count: drop_count.clone(),
+            reentered: reentered.clone(),
+        }));
+        atomic_waker.register(&first);
+        drop(first);
+
+        let replacement = Waker::noop().clone();
+        atomic_waker.register(&replacement);
+        drop(replacement);
+        if let Some(waker) = atomic_waker.take() {
+            waker.wake();
+        }
+        drop(atomic_waker);
+
+        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
+        assert!(reentered.load(Ordering::Acquire));
+    }
 }
 
 #[cfg(feature = "loom")]
 mod loom_tests {
-    use loom::{
+    use veloq_std::{
         sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
+            Arc, NativeArc as StdArc, Weak,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
+        task::{Wake, Waker},
         thread,
     };
-    use veloq_std::alloc_crate::{sync::Arc as StdArc, task::Wake};
-    use veloq_std::task::Waker;
     use veloq_waker::AtomicWaker;
 
     struct TestWaker(Arc<AtomicBool>);
 
     impl Wake for TestWaker {
-        fn wake(self: StdArc<Self>) {
+        fn wake(&self) {
             self.0.store(true, Ordering::Release);
+        }
+    }
+
+    struct CountWaker(Arc<AtomicUsize>);
+
+    impl Wake for CountWaker {
+        fn wake(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ReentrantWaker {
+        target: Arc<AtomicWaker>,
+        replacement: Waker,
+        reentered: Arc<AtomicBool>,
+    }
+
+    impl Wake for ReentrantWaker {
+        fn wake(&self) {
+            self.reentered.store(true, Ordering::Release);
+            self.target.register(&self.replacement);
+        }
+    }
+
+    struct DropReentrantWaker {
+        target: Weak<AtomicWaker>,
+        drop_count: Arc<AtomicUsize>,
+        reentered: Arc<AtomicBool>,
+    }
+
+    impl Wake for DropReentrantWaker {
+        fn wake(&self) {}
+    }
+
+    impl Drop for DropReentrantWaker {
+        fn drop(&mut self) {
+            self.drop_count.fetch_add(1, Ordering::SeqCst);
+            if let Some(target) = self.target.upgrade() {
+                let _ = target.take();
+                self.reentered.store(true, Ordering::Release);
+            }
         }
     }
 
@@ -196,13 +377,15 @@ mod loom_tests {
             let waker1_clone = waker1.clone();
             let t1 = thread::spawn(move || {
                 aw1.register(&waker1_clone);
-            });
+            })
+            .expect("thread spawn failed");
 
             let aw2 = atomic_waker.clone();
             let waker2_clone = waker2.clone();
             let t2 = thread::spawn(move || {
                 aw2.register(&waker2_clone);
-            });
+            })
+            .expect("thread spawn failed");
 
             t1.join().unwrap();
             t2.join().unwrap();
@@ -228,13 +411,112 @@ mod loom_tests {
             let waker_clone = atomic_waker.clone();
             let handle = thread::spawn(move || {
                 waker_clone.wake();
-            });
+            })
+            .expect("thread spawn failed");
 
             atomic_waker.register(&custom_waker);
             handle.join().unwrap();
 
             atomic_waker.wake();
             assert!(woken.load(Ordering::Acquire));
+        });
+    }
+
+    #[test]
+    fn test_atomic_waker_loom_replacement_register_and_multiple_take() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let atomic_waker = Arc::new(AtomicWaker::new());
+            let first_count = Arc::new(AtomicUsize::new(0));
+            let first_waker = Waker::from(StdArc::new(CountWaker(first_count.clone())));
+            atomic_waker.register(&first_waker);
+
+            let replacement_count = Arc::new(AtomicUsize::new(0));
+            let replacement_waker = Waker::from(StdArc::new(CountWaker(replacement_count.clone())));
+
+            let take_slot = atomic_waker.clone();
+            let take_handle = thread::spawn(move || {
+                if let Some(waker) = take_slot.take() {
+                    waker.wake();
+                }
+            })
+            .expect("thread spawn failed");
+
+            let second_take_slot = atomic_waker.clone();
+            let second_take_handle = thread::spawn(move || {
+                if let Some(waker) = second_take_slot.take() {
+                    waker.wake();
+                }
+            })
+            .expect("thread spawn failed");
+
+            thread::yield_now().unwrap();
+            atomic_waker.register(&replacement_waker);
+            take_handle.join().unwrap();
+            second_take_handle.join().unwrap();
+            if let Some(waker) = atomic_waker.take() {
+                waker.wake();
+            }
+
+            let first_wakes = first_count.load(Ordering::SeqCst);
+            let replacement_wakes = replacement_count.load(Ordering::SeqCst);
+            assert!(first_wakes <= 1);
+            assert!(replacement_wakes <= 1);
+            assert!((1..=2).contains(&(first_wakes + replacement_wakes)));
+        });
+    }
+
+    #[test]
+    fn test_atomic_waker_loom_wake_can_reenter_and_register() {
+        loom::model(|| {
+            let atomic_waker = Arc::new(AtomicWaker::new());
+            let replacement_count = Arc::new(AtomicUsize::new(0));
+            let replacement = Waker::from(StdArc::new(CountWaker(replacement_count.clone())));
+            let reentered = Arc::new(AtomicBool::new(false));
+            let reentrant = Waker::from(StdArc::new(ReentrantWaker {
+                target: atomic_waker.clone(),
+                replacement,
+                reentered: reentered.clone(),
+            }));
+
+            atomic_waker.register(&reentrant);
+            atomic_waker.take().unwrap().wake();
+
+            assert!(reentered.load(Ordering::Acquire));
+            atomic_waker.take().unwrap().wake();
+            assert_eq!(replacement_count.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn test_atomic_waker_loom_replacement_drop_can_reenter_take() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(3);
+        builder.check(|| {
+            let atomic_waker = Arc::new(AtomicWaker::new());
+            let drop_count = Arc::new(AtomicUsize::new(0));
+            let first = Waker::from(StdArc::new(DropReentrantWaker {
+                target: Arc::downgrade(&atomic_waker),
+                drop_count: drop_count.clone(),
+                reentered: Arc::new(AtomicBool::new(false)),
+            }));
+            atomic_waker.register(&first);
+            drop(first);
+
+            let replacement = Waker::noop().clone();
+            let take_slot = atomic_waker.clone();
+            let take_handle = thread::spawn(move || {
+                let _ = take_slot.take();
+            })
+            .expect("thread spawn failed");
+            atomic_waker.register(&replacement);
+            take_handle.join().unwrap();
+            drop(replacement);
+            if let Some(waker) = atomic_waker.take() {
+                waker.wake();
+            }
+            assert_eq!(drop_count.load(Ordering::SeqCst), 1);
         });
     }
 }

@@ -105,3 +105,23 @@ fn test_loom_rwlock_reader_parallel() {
         t2.join().unwrap();
     });
 }
+
+#[test]
+fn test_loom_rwlock_granted_reader_cancellation() {
+    loom::model(|| {
+        let lock = RwLock::new(0);
+        let writer = block_on(lock.write());
+        let mut reader = Box::pin(lock.read());
+        let waker = dummy_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(reader.as_mut().poll(&mut cx), Poll::Pending));
+        drop(writer);
+        drop(reader);
+
+        let reader = block_on(lock.read());
+        drop(reader);
+        let writer = block_on(lock.write());
+        drop(writer);
+    });
+}

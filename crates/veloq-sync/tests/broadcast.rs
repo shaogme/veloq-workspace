@@ -1,9 +1,13 @@
 #![cfg(not(feature = "loom"))]
 
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use tokio::time::sleep;
-use veloq_sync::broadcast::{self, RecvError, SendError, State, TryRecvError};
+use veloq_sync::broadcast::{self, RecvError, SendError, TryRecvError};
 
 #[tokio::test]
 async fn test_broadcast_basic() {
@@ -144,8 +148,7 @@ async fn test_broadcast_resubscribe_and_clone() {
 
 #[tokio::test]
 async fn test_broadcast_borrowed_state() {
-    let state = State::new(16);
-    let (tx, mut rx) = state.split();
+    let (tx, mut rx) = broadcast::channel(16);
 
     let mut rx2 = tx.subscribe();
     let mut rx3 = rx.clone();
@@ -215,4 +218,87 @@ async fn test_broadcast_cancellation() {
 
     tx.send(777).unwrap();
     assert_eq!(rx.recv().await.unwrap(), 777);
+}
+
+#[tokio::test]
+async fn test_broadcast_send_count_linearization_order() {
+    let (tx, mut rx) = broadcast::channel(8);
+
+    assert_eq!(tx.send(1).unwrap(), 1);
+    let mut late = tx.subscribe();
+    assert_eq!(late.try_recv(), Err(TryRecvError::Empty));
+    assert_eq!(rx.recv().await.unwrap(), 1);
+
+    assert_eq!(tx.send(2).unwrap(), 2);
+    assert_eq!(rx.recv().await.unwrap(), 2);
+    assert_eq!(late.recv().await.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn test_broadcast_send_count_after_receiver_drop() {
+    let (tx, rx) = broadcast::channel::<i32>(8);
+    drop(rx);
+
+    assert_eq!(tx.send(1), Err(SendError(1)));
+    assert_eq!(tx.len(), 0);
+
+    let mut rx = tx.subscribe();
+    assert_eq!(tx.send(2).unwrap(), 1);
+    assert_eq!(rx.recv().await.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn test_broadcast_borrowed_send_count() {
+    broadcast::with_borrowed_channel(8, async |tx, mut rx| {
+        let mut cloned = rx.clone();
+        let mut resubscribed = rx.resubscribe();
+        assert_eq!(tx.receiver_count(), 3);
+        assert_eq!(tx.send(7).unwrap(), 3);
+        assert_eq!(rx.recv().await.unwrap(), 7);
+        assert_eq!(cloned.recv().await.unwrap(), 7);
+        assert_eq!(resubscribed.recv().await.unwrap(), 7);
+    })
+    .await;
+}
+
+#[derive(Clone)]
+struct ReentrantDrop {
+    sender: Arc<Mutex<Option<broadcast::Sender<ReentrantDrop>>>>,
+    fired: Arc<AtomicBool>,
+}
+
+impl Drop for ReentrantDrop {
+    fn drop(&mut self) {
+        if self.fired.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if let Some(sender) = self.sender.lock().unwrap().as_ref().cloned() {
+            let _ = sender.send(Self {
+                sender: Arc::clone(&self.sender),
+                fired: Arc::clone(&self.fired),
+            });
+        }
+    }
+}
+
+#[test]
+fn test_broadcast_evicted_drop_reenters_after_state_unlock() {
+    let (tx, _rx) = broadcast::channel(1);
+    let sender = Arc::new(Mutex::new(None));
+    let fired = Arc::new(AtomicBool::new(false));
+    *sender.lock().unwrap() = Some(tx.clone());
+
+    tx.send(ReentrantDrop {
+        sender: Arc::clone(&sender),
+        fired: Arc::clone(&fired),
+    })
+    .unwrap();
+    tx.send(ReentrantDrop {
+        sender: Arc::clone(&sender),
+        fired: Arc::clone(&fired),
+    })
+    .unwrap();
+
+    assert!(fired.load(Ordering::SeqCst));
+    assert_eq!(tx.len(), 1);
 }

@@ -163,15 +163,6 @@ impl MwsrWaker {
         }
     }
 
-    /// Calls `wake` on the last `Waker` passed to `register`.
-    ///
-    /// If `register` has not been called yet, then this does nothing.
-    pub fn wake(&self) {
-        if let Some(waker) = self.take() {
-            waker.wake();
-        }
-    }
-
     /// Returns the last `Waker` passed to `register`, so that the user can wake it.
     ///
     /// If a waker has not been registered, this returns `None`.

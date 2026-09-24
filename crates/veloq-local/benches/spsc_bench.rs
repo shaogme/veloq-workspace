@@ -13,8 +13,7 @@ fn bench_spsc_bounded(c: &mut Criterion) {
         group.throughput(Throughput::Elements(size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
             b.to_async(&rt).iter(|| async {
-                let state = spsc::bounded(size);
-                let (tx, rx) = state.split();
+                let (tx, rx) = spsc::bounded(size);
 
                 let rx_fut = async move {
                     let mut count = 0;
@@ -53,8 +52,7 @@ fn bench_spsc_unbounded(c: &mut Criterion) {
 
     group.bench_function("send_recv_10k", |b| {
         b.to_async(&rt).iter(|| async {
-            let state = spsc::unbounded();
-            let (tx, rx) = state.split();
+            let (tx, rx) = spsc::unbounded();
 
             let rx_fut = async move {
                 let mut c = 0;

@@ -1,10 +1,11 @@
 use std::time::Duration;
+use std::{cell::RefCell, rc::Rc};
 
 use tokio::{
     task::{LocalSet, spawn_local},
     time::sleep,
 };
-use veloq_local::broadcast::{self, RecvError, SendError, State, TryRecvError};
+use veloq_local::broadcast::{self, RecvError, SendError, TryRecvError};
 
 #[tokio::test]
 async fn test_local_broadcast_basic() {
@@ -138,8 +139,7 @@ async fn test_local_broadcast_resubscribe_and_clone() {
 
 #[tokio::test]
 async fn test_local_broadcast_borrowed_state() {
-    let state = State::new(16);
-    let (tx, mut rx) = state.split();
+    let (tx, mut rx) = broadcast::channel(16);
 
     let mut rx2 = tx.subscribe();
     let mut rx3 = rx.clone();
@@ -221,4 +221,93 @@ async fn test_local_broadcast_cancellation() {
             assert_eq!(rx.recv().await.unwrap(), 777);
         })
         .await;
+}
+
+#[tokio::test]
+async fn test_local_broadcast_send_count_linearization_order() {
+    let (tx, mut rx) = broadcast::channel(8);
+
+    assert_eq!(tx.send(1).unwrap(), 1);
+    let mut late = tx.subscribe();
+    assert_eq!(late.try_recv(), Err(TryRecvError::Empty));
+    assert_eq!(rx.recv().await.unwrap(), 1);
+
+    assert_eq!(tx.send(2).unwrap(), 2);
+    assert_eq!(rx.recv().await.unwrap(), 2);
+    assert_eq!(late.recv().await.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn test_local_broadcast_send_count_after_receiver_drop() {
+    let (tx, rx) = broadcast::channel::<i32>(8);
+    drop(rx);
+
+    assert_eq!(tx.send(1), Err(SendError(1)));
+    assert_eq!(tx.len(), 0);
+
+    let mut rx = tx.subscribe();
+    assert_eq!(tx.send(2).unwrap(), 1);
+    assert_eq!(rx.recv().await.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn test_local_broadcast_borrowed_send_count() {
+    broadcast::with_borrowed_channel(8, async |tx, mut rx| {
+        let mut cloned = rx.clone();
+        let mut resubscribed = rx.resubscribe();
+        assert_eq!(tx.receiver_count(), 3);
+        assert_eq!(tx.send(7).unwrap(), 3);
+        assert_eq!(rx.recv().await.unwrap(), 7);
+        assert_eq!(cloned.recv().await.unwrap(), 7);
+        assert_eq!(resubscribed.recv().await.unwrap(), 7);
+    })
+    .await;
+}
+
+#[derive(Clone)]
+struct ReentrantDrop {
+    sender: Rc<RefCell<Option<broadcast::Sender<ReentrantDrop>>>>,
+    fired: Rc<RefCell<bool>>,
+}
+
+impl Drop for ReentrantDrop {
+    fn drop(&mut self) {
+        let already_fired = {
+            let mut fired = self.fired.borrow_mut();
+            let already_fired = *fired;
+            *fired = true;
+            already_fired
+        };
+        if already_fired {
+            return;
+        }
+        if let Some(sender) = self.sender.borrow().as_ref().cloned() {
+            let _ = sender.send(Self {
+                sender: Rc::clone(&self.sender),
+                fired: Rc::clone(&self.fired),
+            });
+        }
+    }
+}
+
+#[test]
+fn test_local_broadcast_evicted_drop_reenters_after_state_unlock() {
+    let (tx, _rx) = broadcast::channel(1);
+    let sender = Rc::new(RefCell::new(None));
+    let fired = Rc::new(RefCell::new(false));
+    *sender.borrow_mut() = Some(tx.clone());
+
+    tx.send(ReentrantDrop {
+        sender: Rc::clone(&sender),
+        fired: Rc::clone(&fired),
+    })
+    .unwrap();
+    tx.send(ReentrantDrop {
+        sender: Rc::clone(&sender),
+        fired: Rc::clone(&fired),
+    })
+    .unwrap();
+
+    assert!(*fired.borrow());
+    assert_eq!(tx.len(), 1);
 }

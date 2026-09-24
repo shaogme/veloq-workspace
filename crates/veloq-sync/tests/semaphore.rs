@@ -1,10 +1,59 @@
 #![cfg(not(feature = "loom"))]
 
+use std::sync::Arc as StdArc;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Duration;
 use tokio::time::sleep;
 use veloq_std::sync::Arc;
-use veloq_sync::semaphore::{AcquireError, Semaphore, TryAcquireError};
+use veloq_std::task::{Context, RawWaker, RawWakerVTable, Waker};
+use veloq_sync::semaphore::{AcquireError, AddPermitsError, Semaphore, TryAcquireError};
+
+struct ReentrantWakeData {
+    semaphore: StdArc<Semaphore>,
+    wakes: AtomicUsize,
+    close: bool,
+}
+
+fn reentrant_waker(data: StdArc<ReentrantWakeData>) -> Waker {
+    unsafe fn clone(data: *const ()) -> RawWaker {
+        unsafe { StdArc::increment_strong_count(data.cast::<ReentrantWakeData>()) };
+        RawWaker::new(data, &VTABLE)
+    }
+
+    unsafe fn wake(data: *const ()) {
+        let data = unsafe { StdArc::from_raw(data.cast::<ReentrantWakeData>()) };
+        data.wakes.fetch_add(1, AtomicOrdering::SeqCst);
+        if data.close {
+            data.semaphore.close();
+        } else {
+            let _ = data.semaphore.try_acquire_many(0);
+        }
+    }
+
+    unsafe fn wake_by_ref(data: *const ()) {
+        unsafe { StdArc::increment_strong_count(data.cast::<ReentrantWakeData>()) };
+        unsafe { wake(data) };
+    }
+
+    unsafe fn drop(data: *const ()) {
+        unsafe { StdArc::decrement_strong_count(data.cast::<ReentrantWakeData>()) };
+    }
+
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+    let data = StdArc::into_raw(data).cast::<()>();
+    unsafe { Waker::from_raw(RawWaker::new(data, &VTABLE)) }
+}
+
+fn poll_pending<'a>(
+    future: &mut std::pin::Pin<Box<veloq_sync::semaphore::SemaphoreAcquireFuture<'a>>>,
+    waker: &Waker,
+) {
+    let mut cx = Context::from_waker(waker);
+    assert!(matches!(
+        future.as_mut().poll(&mut cx),
+        std::task::Poll::Pending
+    ));
+}
 
 #[tokio::test]
 async fn test_semaphore_basic() {
@@ -33,6 +82,51 @@ async fn test_semaphore_basic() {
     assert_eq!(sem.available_permits(), 1);
     drop(p2);
     assert_eq!(sem.available_permits(), 3);
+}
+
+#[test]
+fn test_semaphore_permit_wake_reenters_after_unlock() {
+    let semaphore = StdArc::new(Semaphore::new(0));
+    let data = StdArc::new(ReentrantWakeData {
+        semaphore: semaphore.clone(),
+        wakes: AtomicUsize::new(0),
+        close: false,
+    });
+    let waker = reentrant_waker(data.clone());
+    let mut future = Box::pin(semaphore.acquire());
+
+    poll_pending(&mut future, &waker);
+    semaphore.add_permits(1).unwrap();
+
+    assert_eq!(data.wakes.load(AtomicOrdering::SeqCst), 1);
+    let mut cx = Context::from_waker(&waker);
+    let permit = match future.as_mut().poll(&mut cx) {
+        std::task::Poll::Ready(Ok(permit)) => permit,
+        other => panic!("unexpected poll result: {other:?}"),
+    };
+    assert_eq!(permit.num_permits(), 1);
+}
+
+#[test]
+fn test_semaphore_close_wake_reenters_after_unlock() {
+    let semaphore = StdArc::new(Semaphore::new(0));
+    let data = StdArc::new(ReentrantWakeData {
+        semaphore: semaphore.clone(),
+        wakes: AtomicUsize::new(0),
+        close: true,
+    });
+    let waker = reentrant_waker(data.clone());
+    let mut future = Box::pin(semaphore.acquire());
+
+    poll_pending(&mut future, &waker);
+    semaphore.close();
+
+    assert_eq!(data.wakes.load(AtomicOrdering::SeqCst), 1);
+    let mut cx = Context::from_waker(&waker);
+    assert!(matches!(
+        future.as_mut().poll(&mut cx),
+        std::task::Poll::Ready(Err(AcquireError::Closed))
+    ));
 }
 
 #[tokio::test]
@@ -114,11 +208,11 @@ async fn test_semaphore_fifo_order() {
     }
 
     // Sequentially release permits
-    sem.add_permits(1);
+    sem.add_permits(1).unwrap();
     sleep(Duration::from_millis(10)).await;
-    sem.add_permits(1);
+    sem.add_permits(1).unwrap();
     sleep(Duration::from_millis(10)).await;
-    sem.add_permits(1);
+    sem.add_permits(1).unwrap();
 
     for h in handles {
         h.await.unwrap();
@@ -235,7 +329,7 @@ async fn test_semaphore_cancellation_head_unblocks_tail() {
     tokio::task::yield_now().await;
 
     // Add 3 permits: not enough for t1 (needs 5), but enough for t2 (needs 2)
-    sem.add_permits(3);
+    sem.add_permits(3).unwrap();
     sleep(Duration::from_millis(10)).await;
 
     // t1 is canceled, freeing up the front of the queue
@@ -275,7 +369,7 @@ async fn test_semaphore_close() {
     assert!(rx_res.await.unwrap());
 
     // New acquires should fail immediately
-    assert_eq!(sem.acquire().await.unwrap_err(), AcquireError);
+    assert_eq!(sem.acquire().await.unwrap_err(), AcquireError::Closed);
     assert_eq!(sem.try_acquire().unwrap_err(), TryAcquireError::Closed);
 
     // Dropping existing permit releases permit back, but semaphore remains closed
@@ -308,8 +402,75 @@ async fn test_semaphore_add_permits() {
     });
 
     sleep(Duration::from_millis(10)).await;
-    sem.add_permits(3);
+    assert_eq!(sem.add_permits(0), Ok(()));
+    sem.add_permits(3).unwrap();
 
     handle.await.unwrap();
     assert_eq!(sem.available_permits(), 3);
+}
+
+#[tokio::test]
+async fn test_semaphore_capacity_and_overflow_boundaries() {
+    let sem = Semaphore::with_capacity(3);
+    assert_eq!(sem.capacity(), 3);
+    assert_eq!(sem.available_permits(), 0);
+    assert_eq!(sem.add_permits(3), Ok(()));
+    assert_eq!(
+        sem.add_permits(1),
+        Err(AddPermitsError {
+            requested: 1,
+            remaining: 0,
+        })
+    );
+    assert_eq!(sem.available_permits(), 3);
+
+    let max = Semaphore::new(usize::MAX);
+    assert_eq!(
+        max.add_permits(1),
+        Err(AddPermitsError {
+            requested: 1,
+            remaining: 0,
+        })
+    );
+
+    let near_max = Semaphore::with_capacity_and_permits(usize::MAX, usize::MAX - 1).unwrap();
+    let permit = near_max.try_acquire().unwrap();
+    near_max.add_permits(1).unwrap();
+    drop(permit);
+    assert_eq!(near_max.available_permits(), usize::MAX);
+}
+
+#[tokio::test]
+async fn test_semaphore_forget_reuses_capacity() {
+    let sem = Semaphore::new(5);
+    let permit = sem.acquire_many(2).await.unwrap();
+    permit.forget();
+    assert_eq!(sem.add_permits(2), Ok(()));
+    assert_eq!(sem.available_permits(), 5);
+
+    sem.forget_permits(2);
+    assert_eq!(sem.available_permits(), 3);
+    assert_eq!(sem.add_permits(2), Ok(()));
+    assert_eq!(sem.available_permits(), 5);
+}
+
+#[tokio::test]
+async fn test_semaphore_too_many_permits_and_closed_priority() {
+    let sem = Semaphore::with_capacity(3);
+    assert_eq!(
+        sem.try_acquire_many(4).unwrap_err(),
+        TryAcquireError::TooManyPermits
+    );
+    assert_eq!(
+        sem.acquire_many(4).await.unwrap_err(),
+        AcquireError::TooManyPermits
+    );
+
+    sem.close();
+    assert_eq!(sem.add_permits(0), Ok(()));
+    assert_eq!(
+        sem.try_acquire_many(4).unwrap_err(),
+        TryAcquireError::Closed
+    );
+    assert_eq!(sem.acquire_many(4).await.unwrap_err(), AcquireError::Closed);
 }

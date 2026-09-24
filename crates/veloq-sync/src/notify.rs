@@ -15,7 +15,6 @@ const WAITING: usize = 2;
 
 const NOT_NOTIFIED: usize = 0;
 const NOTIFIED_ONE: usize = 1;
-const NOTIFIED_ALL: usize = 2;
 
 /// An asynchronous event notification primitive.
 ///
@@ -58,44 +57,34 @@ impl Notify {
             return;
         }
 
-        self.waiters.with_lock(|w| {
-            let mut unparked = false;
+        let detached = self.waiters.with_lock(|w| {
             if let Some(mut node) = w.pop_front() {
                 unsafe {
-                    node.as_mut().get_unchecked_mut().kind = NOTIFIED_ONE;
+                    node.as_mut().get_unchecked_mut().state = NOTIFIED_ONE;
                 }
-                node.as_ref().waker.wake();
-                unparked = true;
-            }
-
-            if unparked {
+                let waker = node.as_ref().waker.take();
                 let is_empty = w.is_empty();
                 self.state
                     .store(if is_empty { EMPTY } else { WAITING }, Ordering::Release);
+                Some(waker)
             } else {
                 self.state.store(PERMIT, Ordering::Release);
+                None
             }
         });
+        if let Some(Some(waker)) = detached {
+            waker.wake();
+        }
     }
 
     /// Notifies all waiting tasks.
     ///
     /// If there are no waiting tasks, no permit is saved.
     pub fn notify_waiters(&self) {
-        self.waiters.with_lock(|w| {
-            if w.is_empty() {
-                return;
-            }
-
-            self.state.store(EMPTY, Ordering::Release);
-
-            while let Some(mut node) = w.pop_front() {
-                unsafe {
-                    node.as_mut().get_unchecked_mut().kind = NOTIFIED_ALL;
-                }
-                node.as_ref().waker.wake();
-            }
-        });
+        self.state.store(EMPTY, Ordering::Release);
+        while let Some(detached) = self.waiters.take_front() {
+            detached.wake();
+        }
     }
 
     /// Returns a future that completes once notified.
@@ -160,7 +149,7 @@ impl<'a> Notified<'a> {
                 return;
             }
 
-            this.node.kind = NOT_NOTIFIED;
+            this.node.state = NOT_NOTIFIED;
             unsafe {
                 let node_pin = Pin::new_unchecked(&mut this.node);
                 w.push_back(node_pin);
@@ -183,10 +172,11 @@ impl<'a> Future for Notified<'a> {
 
         loop {
             if this.queued {
-                if !this
+                if this
                     .notify
                     .waiters
-                    .update_waker_if_linked(&mut this.node, cx)
+                    .refresh_waker(&mut this.node, cx)
+                    .detached()
                 {
                     this.queued = false;
                     this.completed = true;
@@ -212,23 +202,28 @@ impl<'a> Future for Notified<'a> {
 
             // 2. Lock waiters
             let mut immediate = false;
+            let mut stale_waker = None;
+            unsafe {
+                this.node.waker.register(cx.waker());
+            }
             this.notify.waiters.with_lock(|w| {
                 if this.notify.state.load(Ordering::Acquire) == PERMIT {
                     this.notify.state.store(EMPTY, Ordering::Release);
                     this.completed = true;
                     immediate = true;
+                    stale_waker = this.node.waker.take();
                     return;
                 }
 
-                this.node.kind = NOT_NOTIFIED;
+                this.node.state = NOT_NOTIFIED;
                 unsafe {
-                    this.node.waker.register(cx.waker());
                     let node_pin = Pin::new_unchecked(&mut this.node);
                     w.push_back(node_pin);
                 }
                 this.notify.state.store(WAITING, Ordering::Release);
                 this.queued = true;
             });
+            drop(stale_waker);
             if immediate {
                 return Poll::Ready(());
             }
@@ -244,7 +239,7 @@ impl<'a> Drop for Notified<'a> {
         }
 
         if self.queued {
-            self.notify.waiters.with_lock(|w| {
+            let waker = self.notify.waiters.with_lock(|w| {
                 if self.node.link.is_linked() {
                     unsafe {
                         let ptr = NonNull::from(&self.node);
@@ -254,28 +249,31 @@ impl<'a> Drop for Notified<'a> {
                     if w.is_empty() {
                         self.notify.state.store(EMPTY, Ordering::Release);
                     }
-                } else if self.node.kind == NOTIFIED_ONE {
+                    None
+                } else if self.node.state == NOTIFIED_ONE {
                     // Was popped by notify_one, but dropped before poll completion.
                     // Transfer notification to next waiter or restore permit.
-                    let mut unparked = false;
                     if let Some(mut next) = w.pop_front() {
                         unsafe {
-                            next.as_mut().get_unchecked_mut().kind = NOTIFIED_ONE;
+                            next.as_mut().get_unchecked_mut().state = NOTIFIED_ONE;
                         }
-                        next.as_ref().waker.wake();
-                        unparked = true;
-                    }
-
-                    if unparked {
+                        let waker = next.as_ref().waker.take();
                         let is_empty = w.is_empty();
                         self.notify
                             .state
                             .store(if is_empty { EMPTY } else { WAITING }, Ordering::Release);
+                        waker
                     } else {
                         self.notify.state.store(PERMIT, Ordering::Release);
+                        None
                     }
+                } else {
+                    None
                 }
             });
+            if let Some(waker) = waker {
+                waker.wake();
+            }
         }
     }
 }

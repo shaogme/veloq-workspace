@@ -21,12 +21,12 @@ pub async fn with_borrowed_channel<T, F, R>(f: F) -> R
 where
     F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
 {
-    let state = State::new();
-    let (tx, rx) = state.split();
+    let state = Inner::new();
+    let (tx, rx) = state.borrowed_parts();
     f(tx, rx).await
 }
 
-pub struct State<T> {
+struct Inner<T> {
     /// Manages the state of the inner cell.
     state: AtomicUsize,
 
@@ -44,17 +44,17 @@ pub struct State<T> {
 #[derive(Clone, Copy)]
 struct StateVal(usize);
 
-impl<T> Default for State<T> {
+impl<T> Default for Inner<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T> State<T> {
+impl<T> Inner<T> {
     /// Creates a new oneshot channel state.
     #[cfg(not(feature = "loom"))]
     pub const fn new() -> Self {
-        State {
+        Inner {
             state: AtomicUsize::new(StateVal::new().as_usize()),
             value: UnsafeCell::new(None),
             tx_notify: Notify::new(),
@@ -65,7 +65,7 @@ impl<T> State<T> {
     /// Creates a new oneshot channel state.
     #[cfg(feature = "loom")]
     pub fn new() -> Self {
-        State {
+        Inner {
             state: AtomicUsize::new(StateVal::new().as_usize()),
             value: UnsafeCell::new(None),
             tx_notify: Notify::new(),
@@ -73,8 +73,7 @@ impl<T> State<T> {
         }
     }
 
-    /// Splits the state into a sender and a receiver.
-    pub fn split(&self) -> (BorrowedSender<'_, T>, BorrowedReceiver<'_, T>) {
+    fn borrowed_parts(&self) -> (BorrowedSender<'_, T>, BorrowedReceiver<'_, T>) {
         (
             BorrowedSender {
                 state: self,
@@ -84,17 +83,82 @@ impl<T> State<T> {
         )
     }
 
-    /// Try to set the state to complete. Returns `true` if successful, `false` if closed.
-    fn complete(&self) -> bool {
-        let prev = StateVal::set_complete(&self.state);
+    fn claim_send(&self) -> bool {
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            let state_val = StateVal(state);
+            if state_val.is_closed()
+                || state_val.is_send_claimed()
+                || state_val.is_complete()
+                || state_val.is_sender_done()
+            {
+                return false;
+            }
 
-        if prev.is_closed() {
-            return false;
+            match self.state.compare_exchange_weak(
+                state,
+                state | SEND_CLAIMED,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => state = actual,
+            }
         }
+    }
 
-        // Notify the receiver task.
-        self.rx_task.wake();
-        true
+    fn publish_send(&self) -> bool {
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            let state_val = StateVal(state);
+            if state_val.is_closed() {
+                self.state.fetch_or(SENDER_DONE, Ordering::AcqRel);
+                return false;
+            }
+
+            debug_assert!(state_val.is_send_claimed());
+            let next = (state & !SEND_CLAIMED) | VALUE_SENT | SENDER_DONE;
+            match self.state.compare_exchange_weak(
+                state,
+                next,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if let Some(waker) = self.rx_task.take() {
+                        waker.wake();
+                    }
+                    return true;
+                }
+                Err(actual) => state = actual,
+            }
+        }
+    }
+
+    fn drop_sender(&self) {
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            let state_val = StateVal(state);
+            if state_val.is_complete() || state_val.is_sender_done() || state_val.is_send_claimed()
+            {
+                return;
+            }
+
+            match self.state.compare_exchange_weak(
+                state,
+                state | SENDER_DONE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if let Some(waker) = self.rx_task.take() {
+                        waker.wake();
+                    }
+                    return;
+                }
+                Err(actual) => state = actual,
+            }
+        }
     }
 
     /// Set the state to closed and notify the sender logic.
@@ -123,12 +187,12 @@ impl<T> State<T> {
     }
 }
 
-unsafe impl<T: Send> Send for State<T> {}
-unsafe impl<T: Send> Sync for State<T> {}
+unsafe impl<T: Send> Send for Inner<T> {}
+unsafe impl<T: Send> Sync for Inner<T> {}
 
-impl<T> Drop for State<T> {
+impl<T> Drop for Inner<T> {
     fn drop(&mut self) {
-        // SAFETY: `State` is dropping, meaning the refcount is 0 or it is owned.
+        // SAFETY: `Inner` is dropping, meaning the refcount is 0 or it is owned.
         // We have exclusive access to the `UnsafeCell`.
         // We must ensure the contained value is dropped to avoid memory leaks.
         unsafe {
@@ -139,21 +203,21 @@ impl<T> Drop for State<T> {
     }
 }
 
-impl<T: fmt::Debug> fmt::Debug for State<T> {
+impl<T: fmt::Debug> fmt::Debug for Inner<T> {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt.debug_struct("State")
+        fmt.debug_struct("Inner")
             .field("state", &StateVal::load(&self.state, Ordering::Relaxed))
             .finish()
     }
 }
 
 pub struct BorrowedSender<'a, T> {
-    state: &'a State<T>,
+    state: &'a Inner<T>,
     closed_notified: Option<Notified<'a>>,
 }
 
 pub struct BorrowedReceiver<'a, T> {
-    state: Option<&'a State<T>>,
+    state: Option<&'a Inner<T>>,
 }
 
 pub mod error {
@@ -203,11 +267,14 @@ impl<'a, T> BorrowedSender<'a, T> {
     ///
     /// If the receiver has already hung up, this method returns the error `Err(T)`.
     pub fn send(self, t: T) -> Result<(), T> {
-        // Write the value to the unsafe cell.
+        if !self.state.claim_send() {
+            return Err(t);
+        }
+
+        // The claim above establishes the sole writer before touching the cell.
         unsafe { self.state.value.with_mut(|ptr| *ptr = Some(t)) };
 
-        // Attempt to transition the state to complete.
-        if !self.state.complete() {
+        if !self.state.publish_send() {
             unsafe {
                 return Err(self.state.consume_value().unwrap());
             }
@@ -278,10 +345,7 @@ impl<'a, T> BorrowedSender<'a, T> {
 
 impl<'a, T> Drop for BorrowedSender<'a, T> {
     fn drop(&mut self) {
-        let state = StateVal::load(&self.state.state, Ordering::Acquire);
-        if !state.is_complete() {
-            self.state.complete();
-        }
+        self.state.drop_sender();
     }
 }
 
@@ -341,7 +405,7 @@ impl<'a, T> BorrowedReceiver<'a, T> {
                     Err(TryRecvError::Closed)
                 }
             }
-        } else if state_val.is_closed() {
+        } else if state_val.is_closed() || state_val.is_sender_done() {
             self.state = None;
             Err(TryRecvError::Closed)
         } else {
@@ -391,7 +455,7 @@ impl<'a, T> Future for BorrowedReceiver<'a, T> {
             };
         }
 
-        if state_val.is_closed() {
+        if state_val.is_closed() || state_val.is_sender_done() {
             self.state = None;
             return Ready(Err(RecvError(())));
         }
@@ -414,7 +478,7 @@ impl<'a, T> Future for BorrowedReceiver<'a, T> {
                     Ready(Err(RecvError(())))
                 }
             }
-        } else if state_val.is_closed() {
+        } else if state_val.is_closed() || state_val.is_sender_done() {
             self.state = None;
             Ready(Err(RecvError(())))
         } else {
@@ -436,16 +500,16 @@ impl<'a, T> fmt::Debug for BorrowedReceiver<'a, T> {
 }
 
 pub struct Sender<T> {
-    state: ManuallyDrop<Arc<State<T>>>,
+    state: ManuallyDrop<Arc<Inner<T>>>,
     closed_notified: Option<Notified<'static>>,
 }
 
 pub struct Receiver<T> {
-    state: Option<Arc<State<T>>>,
+    state: Option<Arc<Inner<T>>>,
 }
 
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
-    let state = Arc::new(State::new());
+    let state = Arc::new(Inner::new());
     (
         Sender {
             state: ManuallyDrop::new(state.clone()),
@@ -627,8 +691,10 @@ impl<T> fmt::Debug for Receiver<T> {
 
 // ===== StateVal Management =====
 
+const SEND_CLAIMED: usize = 0b00001;
 const VALUE_SENT: usize = 0b00010;
 const CLOSED: usize = 0b00100;
+const SENDER_DONE: usize = 0b01000;
 
 impl StateVal {
     const fn new() -> StateVal {
@@ -639,28 +705,16 @@ impl StateVal {
         self.0 & VALUE_SENT == VALUE_SENT
     }
 
-    fn is_closed(self) -> bool {
-        self.0 & CLOSED == CLOSED
+    fn is_send_claimed(self) -> bool {
+        self.0 & SEND_CLAIMED == SEND_CLAIMED
     }
 
-    fn set_complete(cell: &AtomicUsize) -> StateVal {
-        let mut state = cell.load(Ordering::Relaxed);
-        loop {
-            if StateVal(state).is_closed() {
-                break;
-            }
+    fn is_sender_done(self) -> bool {
+        self.0 & SENDER_DONE == SENDER_DONE
+    }
 
-            match cell.compare_exchange_weak(
-                state,
-                state | VALUE_SENT,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => state = actual,
-            }
-        }
-        StateVal(state)
+    fn is_closed(self) -> bool {
+        self.0 & CLOSED == CLOSED
     }
 
     fn set_closed(cell: &AtomicUsize) -> StateVal {
@@ -681,7 +735,33 @@ impl fmt::Debug for StateVal {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt.debug_struct("StateVal")
             .field("is_complete", &self.is_complete())
+            .field("is_send_claimed", &self.is_send_claimed())
             .field("is_closed", &self.is_closed())
+            .field("is_sender_done", &self.is_sender_done())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Inner;
+
+    #[test]
+    fn duplicate_senders_cannot_write_twice() {
+        #[cfg(feature = "loom")]
+        loom::model(duplicate_senders_cannot_write_twice_inner);
+
+        #[cfg(not(feature = "loom"))]
+        duplicate_senders_cannot_write_twice_inner();
+    }
+
+    fn duplicate_senders_cannot_write_twice_inner() {
+        let state = Inner::<usize>::new();
+        let (tx1, mut rx1) = state.borrowed_parts();
+        let (tx2, _rx2) = state.borrowed_parts();
+
+        assert_eq!(tx1.send(1), Ok(()));
+        assert_eq!(tx2.send(2), Err(2));
+        assert_eq!(rx1.try_recv(), Ok(1));
     }
 }

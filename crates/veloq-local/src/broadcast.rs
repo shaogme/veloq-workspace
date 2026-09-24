@@ -68,7 +68,7 @@ impl fmt::Display for TryRecvError {
 impl Error for TryRecvError {}
 
 #[derive(Debug)]
-struct StateInner<T> {
+struct ChannelState<T> {
     capacity: usize,
     queue: VecDeque<T>,
     tail: u64,
@@ -76,7 +76,7 @@ struct StateInner<T> {
     receiver_count: usize,
 }
 
-impl<T> StateInner<T> {
+impl<T> ChannelState<T> {
     #[inline]
     fn oldest_seq(&self) -> u64 {
         self.tail.saturating_sub(self.queue.len() as u64)
@@ -85,96 +85,89 @@ impl<T> StateInner<T> {
 
 /// A single-threaded, multi-producer, multi-consumer broadcast channel state.
 #[derive(Debug)]
-pub struct State<T> {
-    inner: RefCell<StateInner<T>>,
+struct Inner<T> {
+    inner: RefCell<ChannelState<T>>,
     rx_notify: Notify,
 }
 
-impl<T> State<T> {
+impl<T> Inner<T> {
     /// Creates a new broadcast channel state with the given capacity.
-    pub fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, sender_count: usize, receiver_count: usize) -> Self {
         assert!(capacity > 0, "capacity must be greater than 0");
         Self {
-            inner: RefCell::new(StateInner {
+            inner: RefCell::new(ChannelState {
                 capacity,
                 queue: VecDeque::with_capacity(capacity),
                 tail: 0,
-                sender_count: 0,
-                receiver_count: 0,
+                sender_count,
+                receiver_count,
             }),
             rx_notify: Notify::new(),
         }
     }
 
-    /// Splits the state into a borrowed sender and receiver pair.
-    pub fn split(&self) -> (BorrowedSender<'_, T>, BorrowedReceiver<'_, T>) {
-        let mut inner = self.inner.borrow_mut();
-        inner.sender_count = 1;
-        inner.receiver_count = 1;
-        let next_seq = inner.tail;
-        drop(inner);
-        (
-            BorrowedSender { state: self },
-            BorrowedReceiver {
-                state: self,
-                next_seq,
-            },
-        )
-    }
-
     /// Returns the capacity of the channel.
     #[inline]
-    pub fn capacity(&self) -> usize {
+    fn capacity(&self) -> usize {
         self.inner.borrow().capacity
     }
 
     /// Returns the number of active senders.
     #[inline]
-    pub fn sender_count(&self) -> usize {
+    fn sender_count(&self) -> usize {
         self.inner.borrow().sender_count
     }
 
     /// Returns the number of active receivers.
     #[inline]
-    pub fn receiver_count(&self) -> usize {
+    fn receiver_count(&self) -> usize {
         self.inner.borrow().receiver_count
     }
 
     /// Returns the number of buffered messages.
     #[inline]
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.inner.borrow().queue.len()
     }
 
     /// Returns `true` if no messages are currently buffered.
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// Returns `true` if all receivers have been dropped.
     #[inline]
-    pub fn is_closed(&self) -> bool {
+    fn is_closed(&self) -> bool {
         self.receiver_count() == 0
+    }
+
+    /// Commits a value and returns the receiver count at the commit point.
+    fn commit_send(&self, value: T) -> Result<usize, SendError<T>> {
+        let (rx_count, evicted) = {
+            let mut inner = self.inner.borrow_mut();
+            if inner.receiver_count == 0 {
+                return Err(SendError(value));
+            }
+
+            let evicted = if inner.queue.len() == inner.capacity {
+                inner.queue.pop_front()
+            } else {
+                None
+            };
+            inner.queue.push_back(value);
+            inner.tail += 1;
+            (inner.receiver_count, evicted)
+        };
+
+        drop(evicted);
+        self.rx_notify.notify_waiters();
+        Ok(rx_count)
     }
 
     /// Sends a value over the channel to all active receivers.
     pub fn send(&self, value: T) -> Result<usize, SendError<T>> {
-        let mut inner = self.inner.borrow_mut();
-        if inner.receiver_count == 0 {
-            return Err(SendError(value));
-        }
-
-        if inner.queue.len() == inner.capacity {
-            inner.queue.pop_front();
-        }
-        inner.queue.push_back(value);
-        inner.tail += 1;
-        let rx_count = inner.receiver_count;
-        drop(inner);
-
-        self.rx_notify.notify_waiters();
-        Ok(rx_count)
+        self.commit_send(value)
     }
 
     /// Attempts to receive a message for a given receiver cursor.
@@ -235,11 +228,14 @@ impl<T> State<T> {
 
 /// The sender half of a borrowed local broadcast channel.
 pub struct BorrowedSender<'a, T> {
-    state: &'a State<T>,
+    state: &'a Inner<T>,
 }
 
 impl<'a, T> BorrowedSender<'a, T> {
     /// Sends a value to all active receivers.
+    ///
+    /// On success, the returned count is the receiver snapshot at the send
+    /// linearization point.
     pub fn send(&self, value: T) -> Result<usize, SendError<T>> {
         self.state.send(value)
     }
@@ -327,7 +323,7 @@ impl<T> fmt::Debug for BorrowedSender<'_, T> {
 
 /// The receiver half of a borrowed local broadcast channel.
 pub struct BorrowedReceiver<'a, T> {
-    state: &'a State<T>,
+    state: &'a Inner<T>,
     next_seq: u64,
 }
 
@@ -410,11 +406,14 @@ impl<T> fmt::Debug for BorrowedReceiver<'_, T> {
 
 /// A sender for a local broadcast channel.
 pub struct Sender<T> {
-    state: Rc<State<T>>,
+    state: Rc<Inner<T>>,
 }
 
 impl<T> Sender<T> {
     /// Sends a value to all active receivers.
+    ///
+    /// On success, the returned count is the receiver snapshot at the send
+    /// linearization point.
     pub fn send(&self, value: T) -> Result<usize, SendError<T>> {
         self.state.send(value)
     }
@@ -504,7 +503,7 @@ impl<T> fmt::Debug for Sender<T> {
 
 /// A receiver for a local broadcast channel.
 pub struct Receiver<T> {
-    state: Rc<State<T>>,
+    state: Rc<Inner<T>>,
     next_seq: u64,
 }
 
@@ -587,12 +586,7 @@ impl<T> fmt::Debug for Receiver<T> {
 
 /// Creates a new broadcast channel returning a sender and receiver pair.
 pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
-    let state = Rc::new(State::new(capacity));
-    {
-        let mut inner = state.inner.borrow_mut();
-        inner.sender_count = 1;
-        inner.receiver_count = 1;
-    }
+    let state = Rc::new(Inner::new(capacity, 1, 1));
     let next_seq = state.inner.borrow().tail;
     (
         Sender {
@@ -607,7 +601,12 @@ pub async fn with_borrowed_channel<T, F, R>(capacity: usize, f: F) -> R
 where
     F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
 {
-    let state = State::new(capacity);
-    let (tx, rx) = state.split();
+    let state = Inner::new(capacity, 1, 1);
+    let next_seq = state.inner.borrow().tail;
+    let tx = BorrowedSender { state: &state };
+    let rx = BorrowedReceiver {
+        state: &state,
+        next_seq,
+    };
     f(tx, rx).await
 }

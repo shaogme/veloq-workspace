@@ -131,7 +131,9 @@ impl<T> SetOnce<T> {
             Ok(())
         })?;
 
-        self.waiters.wake_all();
+        while let Some(detached) = self.waiters.take_front() {
+            detached.wake();
+        }
         Ok(())
     }
 
@@ -213,13 +215,14 @@ impl<'a, T> Future for Wait<'a, T> {
             return Poll::Ready(val);
         }
 
+        unsafe {
+            this.node.waker.register(cx.waker());
+        }
+        let mut stale_waker = None;
         let is_init = this.set_once.waiters.with_lock(|w| {
             if this.set_once.state.load(Ordering::Acquire) == INITIALIZED {
+                stale_waker = this.node.waker.take();
                 return true;
-            }
-
-            unsafe {
-                this.node.waker.register(cx.waker());
             }
 
             if !this.queued {
@@ -231,6 +234,7 @@ impl<'a, T> Future for Wait<'a, T> {
             }
             false
         });
+        drop(stale_waker);
 
         if is_init {
             let val = unsafe {

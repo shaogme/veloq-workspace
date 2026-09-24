@@ -14,22 +14,22 @@ pub use crate::common::{ChannelCapacity, SendError, TryRecvError};
 use crate::notify::{Notified, Notify};
 
 #[derive(Debug)]
-pub struct State<T> {
-    inner: RefCell<StateInner<T>>,
+struct Inner<T> {
+    inner: RefCell<ChannelState<T>>,
     send_notify: Notify,
     recv_notify: Notify,
 }
 
-impl<T> State<T> {
+impl<T> Inner<T> {
     /// Creates a new MPMC channel state.
-    pub fn new(capacity: ChannelCapacity) -> Self {
+    fn new(capacity: ChannelCapacity) -> Self {
         let channel_buffer = match capacity {
             ChannelCapacity::Unbounded => VecDeque::new(),
             ChannelCapacity::Bounded(x) => VecDeque::with_capacity(x),
         };
 
-        State {
-            inner: RefCell::new(StateInner {
+        Inner {
+            inner: RefCell::new(ChannelState {
                 capacity,
                 channel: channel_buffer,
                 tx_count: 1,
@@ -42,17 +42,17 @@ impl<T> State<T> {
     }
 
     /// Creates a new unbounded MPMC channel state.
-    pub fn unbounded() -> Self {
+    fn unbounded() -> Self {
         Self::new(ChannelCapacity::Unbounded)
     }
 
     /// Creates a new bounded MPMC channel state.
-    pub fn bounded(size: usize) -> Self {
+    fn bounded(size: usize) -> Self {
         Self::new(ChannelCapacity::Bounded(size))
     }
 
     /// Splits the state into a sender and a receiver.
-    pub fn split<'a>(&'a self) -> (BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) {
+    fn split<'a>(&'a self) -> (BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) {
         let mut inner = self.inner.borrow_mut();
         inner.tx_count = 1;
         inner.rx_count = 1;
@@ -69,7 +69,7 @@ pub async fn with_borrowed_bounded<T, F, R>(size: usize, f: F) -> R
 where
     F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
 {
-    let state = State::bounded(size);
+    let state = Inner::bounded(size);
     let (tx, rx) = state.split();
     f(tx, rx).await
 }
@@ -79,7 +79,7 @@ pub async fn with_borrowed_unbounded<T, F, R>(f: F) -> R
 where
     F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
 {
-    let state = State::unbounded();
+    let state = Inner::unbounded();
     let (tx, rx) = state.split();
     f(tx, rx).await
 }
@@ -87,17 +87,17 @@ where
 /// 本地通道的发送端（借用）
 #[derive(Debug)]
 pub struct BorrowedSender<'a, T> {
-    state: &'a State<T>,
+    state: &'a Inner<T>,
 }
 
 /// 本地通道的接收端（借用）
 #[derive(Debug)]
 pub struct BorrowedReceiver<'a, T> {
-    state: &'a State<T>,
+    state: &'a Inner<T>,
 }
 
 #[derive(Debug)]
-struct StateInner<T> {
+struct ChannelState<T> {
     capacity: ChannelCapacity,
     channel: VecDeque<T>,
     tx_count: usize,
@@ -105,11 +105,60 @@ struct StateInner<T> {
     is_closed: bool,
 }
 
-impl<T> StateInner<T> {
+impl<T> ChannelState<T> {
     fn is_full(&self) -> bool {
         match self.capacity {
             ChannelCapacity::Unbounded => false,
             ChannelCapacity::Bounded(x) => self.channel.len() >= x,
+        }
+    }
+}
+
+fn poll_recv<'a, T>(
+    state: &Inner<T>,
+    notified: &mut Option<Notified<'a>>,
+    cx: &mut Context<'_>,
+) -> Poll<Option<T>> {
+    loop {
+        {
+            let mut inner = state.inner.borrow_mut();
+            if let Some(item) = inner.channel.pop_front() {
+                drop(inner);
+                state.send_notify.notify_one();
+                *notified = None;
+                return Poll::Ready(Some(item));
+            }
+            if (inner.tx_count == 0 || inner.is_closed) && inner.channel.is_empty() {
+                *notified = None;
+                return Poll::Ready(None);
+            }
+        }
+
+        if notified.is_none() {
+            // The owned stream keeps the Rc state alive while this waiter exists.
+            let notify_ptr = &state.recv_notify as *const Notify;
+            let notify_ref: &'a Notify = unsafe { &*notify_ptr };
+            *notified = Some(notify_ref.notified());
+            let notified_pin = unsafe { Pin::new_unchecked(notified.as_mut().unwrap()) };
+            notified_pin.enable();
+
+            let ready = {
+                let inner = state.inner.borrow();
+                !inner.channel.is_empty()
+                    || ((inner.tx_count == 0 || inner.is_closed) && inner.channel.is_empty())
+            };
+            if ready {
+                *notified = None;
+                continue;
+            }
+        }
+
+        let notified_pin = unsafe { Pin::new_unchecked(notified.as_mut().unwrap()) };
+        match Future::poll(notified_pin, cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(()) => {
+                *notified = None;
+            }
         }
     }
 }
@@ -221,12 +270,12 @@ impl<'a, T> Drop for BorrowedReceiver<'a, T> {
 }
 
 pub struct BorrowedChannelStream<'a, T> {
-    state: &'a State<T>,
+    state: &'a Inner<T>,
     notified: Option<Notified<'a>>,
 }
 
 impl<'a, T> BorrowedChannelStream<'a, T> {
-    fn new(state: &'a State<T>) -> Self {
+    fn new(state: &'a Inner<T>) -> Self {
         BorrowedChannelStream {
             state,
             notified: None,
@@ -239,35 +288,7 @@ impl<T> Stream for BorrowedChannelStream<'_, T> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = unsafe { self.get_unchecked_mut() };
-        loop {
-            {
-                let mut inner = this.state.inner.borrow_mut();
-                if let Some(item) = inner.channel.pop_front() {
-                    drop(inner);
-                    this.state.send_notify.notify_one();
-                    this.notified = None;
-                    return Poll::Ready(Some(item));
-                }
-                if (inner.tx_count == 0 || inner.is_closed) && inner.channel.is_empty() {
-                    this.notified = None;
-                    return Poll::Ready(None);
-                }
-            }
-
-            if this.notified.is_none() {
-                this.notified = Some(this.state.recv_notify.notified());
-            }
-
-            let notified = this.notified.as_mut().unwrap();
-            let notified_pin = unsafe { Pin::new_unchecked(notified) };
-            match Future::poll(notified_pin, cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(()) => {
-                    this.notified = None;
-                    continue;
-                }
-            }
-        }
+        poll_recv(this.state, &mut this.notified, cx)
     }
 }
 
@@ -287,33 +308,10 @@ impl<'a, T> BorrowedReceiver<'a, T> {
     }
 
     /// 接收下一条消息
-    pub async fn recv(&self) -> Option<T> {
-        loop {
-            {
-                let mut inner = self.state.inner.borrow_mut();
-                if let Some(item) = inner.channel.pop_front() {
-                    drop(inner);
-                    self.state.send_notify.notify_one();
-                    return Some(item);
-                }
-                if (inner.tx_count == 0 || inner.is_closed) && inner.channel.is_empty() {
-                    return None;
-                }
-            }
-
-            let mut notified = pin!(self.state.recv_notify.notified());
-            notified.as_mut().enable();
-
-            {
-                let inner = self.state.inner.borrow();
-                if !inner.channel.is_empty()
-                    || ((inner.tx_count == 0 || inner.is_closed) && inner.channel.is_empty())
-                {
-                    continue;
-                }
-            }
-
-            notified.await;
+    pub fn recv(&self) -> impl Future<Output = Option<T>> + '_ {
+        RecvFuture {
+            state: self.state,
+            notified: None,
         }
     }
 
@@ -323,19 +321,33 @@ impl<'a, T> BorrowedReceiver<'a, T> {
     }
 }
 
+struct RecvFuture<'a, T> {
+    state: &'a Inner<T>,
+    notified: Option<Notified<'a>>,
+}
+
+impl<T> Future for RecvFuture<'_, T> {
+    type Output = Option<T>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { self.get_unchecked_mut() };
+        poll_recv(this.state, &mut this.notified, cx)
+    }
+}
+
 /// MPMC channel sender.
 pub struct Sender<T> {
-    state: Rc<State<T>>,
+    state: Rc<Inner<T>>,
 }
 
 /// MPMC channel receiver.
 pub struct Receiver<T> {
-    state: Rc<State<T>>,
+    state: Rc<Inner<T>>,
 }
 
 /// Creates a new MPMC channel.
 pub fn channel<T>(capacity: ChannelCapacity) -> (Sender<T>, Receiver<T>) {
-    let state = Rc::new(State::new(capacity));
+    let state = Rc::new(Inner::new(capacity));
     (
         Sender {
             state: state.clone(),
@@ -439,12 +451,12 @@ impl<T> Drop for Receiver<T> {
 
 /// A stream of messages from an MPMC channel.
 pub struct ChannelStream<T> {
-    state: Rc<State<T>>,
+    state: Rc<Inner<T>>,
     notified: Option<Notified<'static>>,
 }
 
 impl<T> ChannelStream<T> {
-    fn new(state: Rc<State<T>>) -> Self {
+    fn new(state: Rc<Inner<T>>) -> Self {
         ChannelStream {
             state,
             notified: None,
@@ -457,37 +469,7 @@ impl<T> Stream for ChannelStream<T> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = unsafe { self.get_unchecked_mut() };
-        loop {
-            {
-                let mut inner = this.state.inner.borrow_mut();
-                if let Some(item) = inner.channel.pop_front() {
-                    drop(inner);
-                    this.state.send_notify.notify_one();
-                    this.notified = None;
-                    return Poll::Ready(Some(item));
-                }
-                if (inner.tx_count == 0 || inner.is_closed) && inner.channel.is_empty() {
-                    this.notified = None;
-                    return Poll::Ready(None);
-                }
-            }
-
-            if this.notified.is_none() {
-                let notify_ptr = &this.state.recv_notify as *const Notify;
-                let notify_ref: &'static Notify = unsafe { &*notify_ptr };
-                this.notified = Some(notify_ref.notified());
-            }
-
-            let notified = this.notified.as_mut().unwrap();
-            let notified_pin = unsafe { Pin::new_unchecked(notified) };
-            match Future::poll(notified_pin, cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(()) => {
-                    this.notified = None;
-                    continue;
-                }
-            }
-        }
+        poll_recv(this.state.as_ref(), &mut this.notified, cx)
     }
 }
 

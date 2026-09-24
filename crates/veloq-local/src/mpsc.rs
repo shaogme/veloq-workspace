@@ -14,22 +14,22 @@ pub use crate::common::{ChannelCapacity, SendError, TryRecvError};
 use crate::notify::{Notified, Notify};
 
 #[derive(Debug)]
-pub struct State<T> {
-    inner: RefCell<StateInner<T>>,
+struct Inner<T> {
+    inner: RefCell<ChannelState<T>>,
     send_notify: Notify,
     recv_notify: Notify,
 }
 
-impl<T> State<T> {
+impl<T> Inner<T> {
     /// Creates a new MPSC channel state.
-    pub fn new(capacity: ChannelCapacity) -> Self {
+    fn new(capacity: ChannelCapacity) -> Self {
         let channel_buffer = match capacity {
             ChannelCapacity::Unbounded => VecDeque::new(),
             ChannelCapacity::Bounded(x) => VecDeque::with_capacity(x),
         };
 
-        State {
-            inner: RefCell::new(StateInner {
+        Inner {
+            inner: RefCell::new(ChannelState {
                 capacity,
                 channel: channel_buffer,
                 tx_count: 1,
@@ -41,17 +41,17 @@ impl<T> State<T> {
     }
 
     /// Creates a new unbounded MPSC channel state.
-    pub fn unbounded() -> Self {
+    fn unbounded() -> Self {
         Self::new(ChannelCapacity::Unbounded)
     }
 
     /// Creates a new bounded MPSC channel state.
-    pub fn bounded(size: usize) -> Self {
+    fn bounded(size: usize) -> Self {
         Self::new(ChannelCapacity::Bounded(size))
     }
 
     /// Splits the state into a sender and a receiver.
-    pub fn split<'a>(&'a self) -> (BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) {
+    fn split<'a>(&'a self) -> (BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) {
         // Reset tx_count to 1 on split
         self.inner.borrow_mut().tx_count = 1;
         (
@@ -66,7 +66,7 @@ pub async fn with_borrowed_bounded<T, F, R>(size: usize, f: F) -> R
 where
     F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
 {
-    let state = State::bounded(size);
+    let state = Inner::bounded(size);
     let (tx, rx) = state.split();
     f(tx, rx).await
 }
@@ -76,7 +76,7 @@ pub async fn with_borrowed_unbounded<T, F, R>(f: F) -> R
 where
     F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
 {
-    let state = State::unbounded();
+    let state = Inner::unbounded();
     let (tx, rx) = state.split();
     f(tx, rx).await
 }
@@ -84,24 +84,24 @@ where
 /// 本地通道的发送端（借用）
 #[derive(Debug)]
 pub struct BorrowedSender<'a, T> {
-    state: &'a State<T>,
+    state: &'a Inner<T>,
 }
 
 /// 本地通道的接收端（借用）
 #[derive(Debug)]
 pub struct BorrowedReceiver<'a, T> {
-    state: &'a State<T>,
+    state: &'a Inner<T>,
 }
 
 #[derive(Debug)]
-struct StateInner<T> {
+struct ChannelState<T> {
     capacity: ChannelCapacity,
     channel: VecDeque<T>,
     tx_count: usize,
     is_closed: bool,
 }
 
-impl<T> StateInner<T> {
+impl<T> ChannelState<T> {
     fn is_full(&self) -> bool {
         match self.capacity {
             ChannelCapacity::Unbounded => false,
@@ -206,12 +206,12 @@ impl<'a, T> Drop for BorrowedReceiver<'a, T> {
 }
 
 pub struct BorrowedChannelStream<'a, T> {
-    state: &'a State<T>,
+    state: &'a Inner<T>,
     notified: Option<Notified<'a>>,
 }
 
 impl<'a, T> BorrowedChannelStream<'a, T> {
-    fn new(state: &'a State<T>) -> Self {
+    fn new(state: &'a Inner<T>) -> Self {
         BorrowedChannelStream {
             state,
             notified: None,
@@ -308,17 +308,17 @@ impl<'a, T> BorrowedReceiver<'a, T> {
 
 /// MPSC channel sender.
 pub struct Sender<T> {
-    state: Rc<State<T>>,
+    state: Rc<Inner<T>>,
 }
 
 /// MPSC channel receiver.
 pub struct Receiver<T> {
-    state: Rc<State<T>>,
+    state: Rc<Inner<T>>,
 }
 
 /// Creates a new MPSC channel.
 pub fn channel<T>(capacity: ChannelCapacity) -> (Sender<T>, Receiver<T>) {
-    let state = Rc::new(State::new(capacity));
+    let state = Rc::new(Inner::new(capacity));
     (
         Sender {
             state: state.clone(),
@@ -412,12 +412,12 @@ impl<T> Drop for Receiver<T> {
 
 /// A stream of messages from an MPSC channel.
 pub struct ChannelStream<T> {
-    state: Rc<State<T>>,
+    state: Rc<Inner<T>>,
     notified: Option<Notified<'static>>,
 }
 
 impl<T> ChannelStream<T> {
-    fn new(state: Rc<State<T>>) -> Self {
+    fn new(state: Rc<Inner<T>>) -> Self {
         ChannelStream {
             state,
             notified: None,

@@ -1,6 +1,54 @@
 #![cfg(not(feature = "loom"))]
+use std::sync::{
+    Arc as StdArc,
+    atomic::{AtomicUsize, Ordering},
+};
+
 use veloq_std::sync::Arc;
+use veloq_std::{
+    future::Future,
+    task::{Context, RawWaker, RawWakerVTable, Waker},
+};
 use veloq_sync::mutex::Mutex;
+
+struct WakeData {
+    wakes: AtomicUsize,
+    reentrant_lock: Option<StdArc<Mutex<()>>>,
+}
+
+fn counting_waker(data: StdArc<WakeData>) -> Waker {
+    unsafe fn clone(data: *const ()) -> RawWaker {
+        // SAFETY: `data` is an `Arc<WakeData>` pointer created below.
+        unsafe { StdArc::increment_strong_count(data.cast::<WakeData>()) };
+        RawWaker::new(data, &VTABLE)
+    }
+
+    unsafe fn wake(data: *const ()) {
+        // SAFETY: `data` owns one strong reference transferred to this callback.
+        let data = unsafe { StdArc::from_raw(data.cast::<WakeData>()) };
+        data.wakes.fetch_add(1, Ordering::SeqCst);
+        if let Some(lock) = &data.reentrant_lock {
+            let _ = lock.try_lock();
+            let _ = lock.is_locked();
+        }
+    }
+
+    unsafe fn wake_by_ref(data: *const ()) {
+        // SAFETY: Keep the original reference alive after forwarding the wake.
+        unsafe { StdArc::increment_strong_count(data.cast::<WakeData>()) };
+        unsafe { wake(data) };
+    }
+
+    unsafe fn drop(data: *const ()) {
+        // SAFETY: Drop the strong reference owned by this raw waker.
+        unsafe { StdArc::decrement_strong_count(data.cast::<WakeData>()) };
+    }
+
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+    let data = StdArc::into_raw(data).cast::<()>();
+    // SAFETY: The vtable retains and releases the `Arc` reference correctly.
+    unsafe { Waker::from_raw(RawWaker::new(data, &VTABLE)) }
+}
 
 #[tokio::test]
 async fn test_mutex_simple() {
@@ -49,6 +97,89 @@ async fn test_mutex_try_lock() {
 
     drop(guard);
     assert!(m.try_lock().is_some());
+}
+
+#[test]
+fn test_mutex_grant_is_ready_before_wake_callback_returns() {
+    let mutex = Mutex::new(());
+    let guard = mutex.try_lock().unwrap();
+    let mut future = Box::pin(mutex.lock());
+    let data = StdArc::new(WakeData {
+        wakes: AtomicUsize::new(0),
+        reentrant_lock: None,
+    });
+    let waker = counting_waker(data.clone());
+    let mut cx = Context::from_waker(&waker);
+
+    assert!(matches!(
+        future.as_mut().poll(&mut cx),
+        core::task::Poll::Pending
+    ));
+    drop(guard);
+    assert_eq!(data.wakes.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        future.as_mut().poll(&mut cx),
+        core::task::Poll::Ready(_)
+    ));
+}
+
+#[test]
+fn test_mutex_waker_replacement_only_wakes_latest() {
+    let mutex = Mutex::new(());
+    let guard = mutex.try_lock().unwrap();
+    let mut future = Box::pin(mutex.lock());
+    let first = StdArc::new(WakeData {
+        wakes: AtomicUsize::new(0),
+        reentrant_lock: None,
+    });
+    let second = StdArc::new(WakeData {
+        wakes: AtomicUsize::new(0),
+        reentrant_lock: None,
+    });
+    let first_waker = counting_waker(first.clone());
+    let second_waker = counting_waker(second.clone());
+    let mut first_cx = Context::from_waker(&first_waker);
+    let mut second_cx = Context::from_waker(&second_waker);
+
+    assert!(matches!(
+        future.as_mut().poll(&mut first_cx),
+        core::task::Poll::Pending
+    ));
+    assert!(matches!(
+        future.as_mut().poll(&mut second_cx),
+        core::task::Poll::Pending
+    ));
+    drop(guard);
+    assert_eq!(first.wakes.load(Ordering::SeqCst), 0);
+    assert_eq!(second.wakes.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        future.as_mut().poll(&mut second_cx),
+        core::task::Poll::Ready(_)
+    ));
+}
+
+#[test]
+fn test_mutex_waker_can_reenter_after_detach() {
+    let mutex = StdArc::new(Mutex::new(()));
+    let guard = mutex.try_lock().unwrap();
+    let mut future = Box::pin(mutex.lock());
+    let data = StdArc::new(WakeData {
+        wakes: AtomicUsize::new(0),
+        reentrant_lock: Some(mutex.clone()),
+    });
+    let waker = counting_waker(data.clone());
+    let mut cx = Context::from_waker(&waker);
+
+    assert!(matches!(
+        future.as_mut().poll(&mut cx),
+        core::task::Poll::Pending
+    ));
+    drop(guard);
+    assert_eq!(data.wakes.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        future.as_mut().poll(&mut cx),
+        core::task::Poll::Ready(_)
+    ));
 }
 
 #[tokio::test]

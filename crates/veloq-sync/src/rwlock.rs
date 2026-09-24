@@ -1,7 +1,12 @@
-use crate::{wait_queue::WaitQueue, waker::WaiterNode};
+use crate::{
+    wait_queue::{DetachedWaiter, WaitQueue},
+    waker::{WaiterAdapter, WaiterNode},
+};
+use veloq_intrusive_linklist::LinkedList;
 use veloq_std::{
     cell::UnsafeCell,
     future::Future,
+    mem,
     ops::{Deref, DerefMut},
     pin::Pin,
     ptr::NonNull,
@@ -26,6 +31,9 @@ const READER_MASK: usize = !(WRITER_LOCKED | CONTENDED);
 
 const KIND_READER: usize = 0;
 const KIND_WRITER: usize = 1;
+
+const NODE_WAITING: usize = 0;
+const NODE_GRANTED: usize = 1;
 
 impl<T> RwLock<T> {
     /// Creates a new `RwLock` with the given data.
@@ -69,14 +77,9 @@ impl<T: ?Sized> RwLock<T> {
     pub fn try_read(&self) -> Option<RwLockReadGuard<'_, T>> {
         let mut state = self.state.load(Ordering::Relaxed);
         loop {
-            if state & WRITER_LOCKED != 0 {
+            if state & (WRITER_LOCKED | CONTENDED) != 0 {
                 return None;
             }
-            // Fairness: fail if there are waiters
-            if state & CONTENDED != 0 {
-                return None;
-            }
-            // Check for reader overflow
             if state & READER_MASK == READER_MASK {
                 return None;
             }
@@ -87,18 +90,17 @@ impl<T: ?Sized> RwLock<T> {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => return Some(RwLockReadGuard { lock: self }),
-                Err(ex) => state = ex,
+                Err(next) => state = next,
             }
         }
     }
 
     /// Acquires the lock for reading asynchronously.
-    pub fn read(&self) -> RwLockReadFuture<'_, T> {
+    pub fn read(&self) -> impl Future<Output = RwLockReadGuard<'_, T>> + '_ {
         RwLockReadFuture {
             lock: self,
             node: WaiterNode::new(),
-            queued: false,
-            woken: false,
+            phase: Phase::Initial,
         }
     }
 
@@ -116,17 +118,16 @@ impl<T: ?Sized> RwLock<T> {
     }
 
     /// Acquires the lock for writing asynchronously.
-    pub fn write(&self) -> RwLockWriteFuture<'_, T> {
+    pub fn write(&self) -> impl Future<Output = RwLockWriteGuard<'_, T>> + '_ {
         RwLockWriteFuture {
             lock: self,
             node: WaiterNode::new(),
-            queued: false,
-            woken: false,
+            phase: Phase::Initial,
         }
     }
 }
 
-/// A RAII guard returned by `RwLock::read`.
+/// A RAII guard returned by [`RwLock::read`].
 pub struct RwLockReadGuard<'a, T: ?Sized> {
     lock: &'a RwLock<T>,
 }
@@ -136,6 +137,7 @@ unsafe impl<T: ?Sized + Send> Send for RwLockReadGuard<'_, T> {}
 
 impl<T: ?Sized> Deref for RwLockReadGuard<'_, T> {
     type Target = T;
+
     fn deref(&self) -> &Self::Target {
         unsafe { &*self.lock.data.with(|p| p as *const T) }
     }
@@ -143,16 +145,26 @@ impl<T: ?Sized> Deref for RwLockReadGuard<'_, T> {
 
 impl<T: ?Sized> Drop for RwLockReadGuard<'_, T> {
     fn drop(&mut self) {
-        let prev = self.lock.state.fetch_sub(READER_UNIT, Ordering::Release);
-
-        // If we were the last reader and there are waiters, wake one.
-        if (prev & READER_MASK) == READER_UNIT && (prev & CONTENDED) != 0 {
-            self.lock.waiters.wake_one();
+        let detached = self.lock.waiters.with_lock(|waiters| {
+            let state = self.lock.state.load(Ordering::Relaxed);
+            let readers = state & READER_MASK;
+            assert!(readers >= READER_UNIT, "RwLock reader count underflow");
+            let state = state - READER_UNIT;
+            if readers == READER_UNIT {
+                self.lock.state.store(state, Ordering::Release);
+                grant_front_locked(self.lock, waiters, false)
+            } else {
+                store_state_for_queue(self.lock, waiters, state);
+                None
+            }
+        });
+        if let Some(detached) = detached {
+            detached.wake();
         }
     }
 }
 
-/// A RAII guard returned by `RwLock::write`.
+/// A RAII guard returned by [`RwLock::write`].
 pub struct RwLockWriteGuard<'a, T: ?Sized> {
     lock: &'a RwLock<T>,
 }
@@ -162,6 +174,7 @@ unsafe impl<T: ?Sized + Send> Send for RwLockWriteGuard<'_, T> {}
 
 impl<T: ?Sized> Deref for RwLockWriteGuard<'_, T> {
     type Target = T;
+
     fn deref(&self) -> &Self::Target {
         unsafe { &*self.lock.data.with(|p| p as *const T) }
     }
@@ -177,68 +190,49 @@ impl<'a, T: ?Sized> RwLockWriteGuard<'a, T> {
     /// Downgrades the write guard to a read guard.
     pub fn downgrade(self) -> RwLockReadGuard<'a, T> {
         let lock = self.lock;
-        let mut state = lock.state.load(Ordering::Relaxed);
-
-        loop {
-            // Replace WRITER_LOCKED with READER_UNIT
-            // We assume WRITER_LOCKED is set because we have the guard.
-            // We preserve CONTENDED bit if it is set.
-            let new_state = (state & !WRITER_LOCKED) + READER_UNIT;
-
-            match lock.state.compare_exchange_weak(
-                state,
-                new_state,
-                Ordering::Release,
-                Ordering::Relaxed, // Failure load ordering
-            ) {
-                Ok(_) => break,
-                Err(ex) => state = ex,
-            }
-        }
-
-        // Forget self ensures that `Drop` for RwLockWriteGuard is not called,
-        // which would otherwise release the lock completely.
-        veloq_std::mem::forget(self);
-
-        // If there are waiters, and the first one is a reader, wake it up.
-        // It will then likely wake subsequent readers (cascade).
-        lock.waiters.with_lock(|w| {
-            if let Some(node) = w.front_mut().get()
-                && node.kind == KIND_READER
-            {
-                node.waker.wake();
-            }
+        let detached = lock.waiters.with_lock(|waiters| {
+            let state = lock.state.load(Ordering::Relaxed);
+            assert!(state & WRITER_LOCKED != 0, "RwLock writer bit is not set");
+            let state = (state & !WRITER_LOCKED) + READER_UNIT;
+            lock.state.store(state, Ordering::Release);
+            grant_front_locked(lock, waiters, true)
         });
-
+        mem::forget(self);
+        if let Some(detached) = detached {
+            detached.wake();
+        }
         RwLockReadGuard { lock }
     }
 }
 
 impl<T: ?Sized> Drop for RwLockWriteGuard<'_, T> {
     fn drop(&mut self) {
-        // Optimistic release
-        if self
-            .lock
-            .state
-            .compare_exchange(WRITER_LOCKED, 0, Ordering::Release, Ordering::Relaxed)
-            .is_ok()
-        {
-            return;
+        let detached = self.lock.waiters.with_lock(|waiters| {
+            let state = self.lock.state.load(Ordering::Relaxed);
+            assert!(state & WRITER_LOCKED != 0, "RwLock writer bit is not set");
+            self.lock
+                .state
+                .store(state & !WRITER_LOCKED, Ordering::Release);
+            grant_front_locked(self.lock, waiters, false)
+        });
+        if let Some(detached) = detached {
+            detached.wake();
         }
-
-        // Slow path
-        self.lock.state.store(0, Ordering::Release);
-
-        // Wake the next waiter
-        self.lock.waiters.wake_one();
     }
 }
 
-pub struct RwLockReadFuture<'a, T: ?Sized> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    Initial,
+    Waiting,
+    Granted,
+    Completed,
+}
+
+struct RwLockReadFuture<'a, T: ?Sized> {
     lock: &'a RwLock<T>,
     node: WaiterNode,
-    queued: bool,
-    woken: bool,
+    phase: Phase,
 }
 
 impl<'a, T: ?Sized> Future for RwLockReadFuture<'a, T> {
@@ -246,141 +240,111 @@ impl<'a, T: ?Sized> Future for RwLockReadFuture<'a, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
+        if this.phase == Phase::Completed {
+            panic!("polled RwLockReadFuture after completion");
+        }
 
-        #[cfg(not(feature = "loom"))]
-        let mut spin_count = 0;
+        if this.phase == Phase::Waiting {
+            if this.lock.waiters.refresh_waker(&mut this.node, cx).linked() {
+                return Poll::Pending;
+            }
+            assert_eq!(this.node.state, NODE_GRANTED);
+            this.phase = Phase::Granted;
+        }
+
+        if this.phase == Phase::Granted {
+            let detached = this
+                .lock
+                .waiters
+                .with_lock(|waiters| grant_front_locked(this.lock, waiters, true));
+            this.phase = Phase::Completed;
+            if let Some(detached) = detached {
+                detached.wake();
+            }
+            return Poll::Ready(RwLockReadGuard { lock: this.lock });
+        }
 
         loop {
-            let state = this.lock.state.load(Ordering::Relaxed);
-
-            // Try to acquire read lock if no writer
-            if state & WRITER_LOCKED == 0 {
-                // Fairness: if contended, don't barge in unless we are already queued or woken
-                if this.queued || this.woken || (state & CONTENDED) == 0 {
-                    if state & READER_MASK == READER_MASK {
-                        panic!("RwLock reader count overflow");
-                    }
-                    if this
-                        .lock
-                        .state
-                        .compare_exchange(
-                            state,
-                            state + READER_UNIT,
-                            Ordering::Acquire,
-                            Ordering::Relaxed,
-                        )
-                        .is_ok()
-                    {
-                        // Success
-                        if this.queued || this.woken {
-                            this.lock.waiters.with_lock(|w| {
-                                let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
-                                // Remove ourselves if still linked
-                                let is_linked = node_pin.as_ref().link.is_linked();
-                                if is_linked {
-                                    unsafe {
-                                        let ptr = NonNull::from(&*node_pin);
-                                        let mut cursor = w.cursor_mut_from_ptr(ptr);
-                                        cursor.remove();
-                                    }
-                                }
-
-                                // Update CONTENDED bit based on remaining waiters
-                                if w.is_empty() {
-                                    this.lock.state.fetch_and(!CONTENDED, Ordering::Release);
-                                } else {
-                                    this.lock.state.fetch_or(CONTENDED, Ordering::Relaxed);
-                                }
-
-                                // Cascade wake: if next is reader, wake it
-                                if let Some(next) = w.front_mut().get()
-                                    && next.kind == KIND_READER
-                                {
-                                    next.waker.wake();
-                                }
-                            });
-
-                            this.queued = false;
-                            this.woken = false;
-                        }
-                        return Poll::Ready(RwLockReadGuard { lock: this.lock });
-                    }
-                    continue;
-                }
-            }
-
-            // Lock held by writer or contended
-            // Optimization: spinning
-            #[cfg(not(feature = "loom"))]
-            if !this.queued && spin_count < 100 {
-                spin_count += 1;
-                veloq_std::hint::spin_loop();
-                continue;
-            }
-
+            let mut acquired = false;
+            let mut retry = false;
             unsafe {
                 this.node.waker.register(cx.waker());
             }
+            this.lock.waiters.with_lock(|waiters| {
+                let state = this.lock.state.load(Ordering::Relaxed);
+                if waiters.is_empty() && state & (WRITER_LOCKED | CONTENDED) == 0 {
+                    if state & READER_MASK == READER_MASK {
+                        panic!("RwLock reader count overflow");
+                    }
+                    match this.lock.state.compare_exchange(
+                        state,
+                        state + READER_UNIT,
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => {
+                            acquired = true;
+                            return;
+                        }
+                        Err(_) => {
+                            retry = true;
+                            return;
+                        }
+                    }
+                }
 
-            if !this.queued {
                 this.node.kind = KIND_READER;
-
-                let mut retry = false;
-                this.lock.waiters.with_lock(|w| {
-                    let current = this.lock.state.load(Ordering::Relaxed);
-
-                    // If writer lock is NOT held and there are no other waiters, we can just continue and try to acquire.
-                    // We rely on waiters.is_empty() for fairness check instead of just the CONTENDED bit,
-                    // because the CONTENDED bit might not be perfectly synchronized with the queue state yet,
-                    // or we might have raced.
-                    if (current & WRITER_LOCKED) == 0 && w.is_empty() {
-                        retry = true;
-                        return;
-                    }
-
-                    // We are going to queue. Ensure CONTENDED bit is set.
-                    // We do this inside the lock to avoid race with the releaser.
-                    if (current & CONTENDED) == 0 {
-                        this.lock.state.fetch_or(CONTENDED, Ordering::Relaxed);
-                    }
-
-                    unsafe {
-                        let node_pin = Pin::new_unchecked(&mut this.node);
-                        w.push_back(node_pin);
-                    }
-                    this.queued = true;
-                });
-
-                if retry {
-                    continue;
+                this.node.state = NODE_WAITING;
+                unsafe {
+                    let node_pin = Pin::new_unchecked(&mut this.node);
+                    waiters.push_back(node_pin);
                 }
-            } else {
-                // Check if woken
-                if !this.lock.waiters.is_linked(&this.node) {
-                    this.woken = true;
-                    this.queued = false;
-                    continue;
-                }
+                store_state_for_queue(this.lock, waiters, state | CONTENDED);
+                this.phase = Phase::Waiting;
+            });
+
+            if retry {
+                let stale_waker = this.node.waker.take();
+                drop(stale_waker);
+                continue;
             }
 
+            if acquired {
+                let stale_waker = this.node.waker.take();
+                drop(stale_waker);
+                this.phase = Phase::Completed;
+                return Poll::Ready(RwLockReadGuard { lock: this.lock });
+            }
             return Poll::Pending;
         }
     }
 }
 
-impl<'a, T: ?Sized> Drop for RwLockReadFuture<'a, T> {
+impl<T: ?Sized> Drop for RwLockReadFuture<'_, T> {
     fn drop(&mut self) {
-        if self.queued {
-            self.lock.waiters.remove(&self.node);
+        let detached = match self.phase {
+            Phase::Initial | Phase::Completed => None,
+            Phase::Granted => cancel_granted(self.lock, &mut self.node),
+            Phase::Waiting => self.lock.waiters.with_lock(|waiters| {
+                if self.node.state == NODE_GRANTED {
+                    cancel_granted_locked(self.lock, waiters, &self.node)
+                } else if self.node.state == NODE_WAITING && self.node.link.is_linked() {
+                    remove_waiting_locked(self.lock, waiters, &self.node)
+                } else {
+                    None
+                }
+            }),
+        };
+        if let Some(detached) = detached {
+            detached.wake();
         }
     }
 }
 
-pub struct RwLockWriteFuture<'a, T: ?Sized> {
+struct RwLockWriteFuture<'a, T: ?Sized> {
     lock: &'a RwLock<T>,
     node: WaiterNode,
-    queued: bool,
-    woken: bool,
+    phase: Phase,
 }
 
 impl<'a, T: ?Sized> Future for RwLockWriteFuture<'a, T> {
@@ -388,123 +352,187 @@ impl<'a, T: ?Sized> Future for RwLockWriteFuture<'a, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
+        if this.phase == Phase::Completed {
+            panic!("polled RwLockWriteFuture after completion");
+        }
 
-        #[cfg(not(feature = "loom"))]
-        let mut spin_count = 0;
+        if this.phase == Phase::Waiting {
+            if this.lock.waiters.refresh_waker(&mut this.node, cx).linked() {
+                return Poll::Pending;
+            }
+            assert_eq!(this.node.state, NODE_GRANTED);
+            this.phase = Phase::Granted;
+        }
+
+        if this.phase == Phase::Granted {
+            this.phase = Phase::Completed;
+            return Poll::Ready(RwLockWriteGuard { lock: this.lock });
+        }
 
         loop {
-            let state = this.lock.state.load(Ordering::Relaxed);
-
-            // Try to acquire if unlocked (0) or only contended (CONTENDED)
-            // But if we are queued or woken, we have priority.
-            let can_acquire = if this.queued || this.woken {
-                (state & !CONTENDED) == 0
-            } else {
-                state == 0 // Only barge in if strictly 0
-            };
-
-            if can_acquire {
-                // If we acquire, do we need to set CONTENDED?
-                // If we are queued, we check waiters.
-
-                // Let's take global approach: try to swap state to WRITER_LOCKED | (existing CONTENDED)
-                // Actually if we success, we are WRITER.
-
-                // If state is UNLOCKED (0), try CAS to WRITER_LOCKED.
-                // If state is CONTENDED, try CAS to WRITER_LOCKED | CONTENDED.
-
-                let target = WRITER_LOCKED | (state & CONTENDED);
-
-                if this
-                    .lock
-                    .state
-                    .compare_exchange(state, target, Ordering::Acquire, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    if this.queued || this.woken {
-                        this.lock.waiters.with_lock(|w| {
-                            let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
-                            let is_linked = node_pin.as_ref().link.is_linked();
-                            if is_linked {
-                                unsafe {
-                                    let ptr = NonNull::from(&*node_pin);
-                                    let mut cursor = w.cursor_mut_from_ptr(ptr);
-                                    cursor.remove();
-                                }
-                            }
-                            if w.is_empty() {
-                                // Clear CONTENDED if no one else
-                                this.lock.state.fetch_and(!CONTENDED, Ordering::Release);
-                            } else {
-                                // Ensure CONTENDED bit is set if there are other waiters
-                                this.lock.state.fetch_or(CONTENDED, Ordering::Relaxed);
-                            }
-                        });
-                        this.queued = false;
-                        this.woken = false;
-                    }
-                    return Poll::Ready(RwLockWriteGuard { lock: this.lock });
-                }
-                continue;
-            }
-
-            // LOCKED, spin?
-            #[cfg(not(feature = "loom"))]
-            if !this.queued && spin_count < 100 {
-                spin_count += 1;
-                veloq_std::hint::spin_loop();
-                continue;
-            }
-
+            let mut acquired = false;
+            let mut retry = false;
             unsafe {
                 this.node.waker.register(cx.waker());
             }
+            this.lock.waiters.with_lock(|waiters| {
+                let state = this.lock.state.load(Ordering::Relaxed);
+                if waiters.is_empty() && state == 0 {
+                    match this.lock.state.compare_exchange(
+                        0,
+                        WRITER_LOCKED,
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => {
+                            acquired = true;
+                            return;
+                        }
+                        Err(_) => {
+                            retry = true;
+                            return;
+                        }
+                    }
+                }
 
-            if !this.queued {
                 this.node.kind = KIND_WRITER;
-
-                let mut retry = false;
-                this.lock.waiters.with_lock(|w| {
-                    let current = this.lock.state.load(Ordering::Relaxed);
-                    // If completely unlocked (no writer, no readers) and no waiters,
-                    // we can retry to acquire.
-                    if (current & (WRITER_LOCKED | READER_MASK)) == 0 && w.is_empty() {
-                        retry = true;
-                        return;
-                    }
-
-                    // We are going to queue. Ensure CONTENDED bit is set.
-                    if (current & CONTENDED) == 0 {
-                        this.lock.state.fetch_or(CONTENDED, Ordering::Relaxed);
-                    }
-
-                    unsafe {
-                        let node_pin = Pin::new_unchecked(&mut this.node);
-                        w.push_back(node_pin);
-                    }
-                    this.queued = true;
-                });
-
-                if retry {
-                    continue;
+                this.node.state = NODE_WAITING;
+                unsafe {
+                    let node_pin = Pin::new_unchecked(&mut this.node);
+                    waiters.push_back(node_pin);
                 }
-            } else {
-                if !this.lock.waiters.is_linked(&this.node) {
-                    this.woken = true;
-                    this.queued = false;
-                    continue;
-                }
+                store_state_for_queue(this.lock, waiters, state | CONTENDED);
+                this.phase = Phase::Waiting;
+            });
+
+            if retry {
+                let stale_waker = this.node.waker.take();
+                drop(stale_waker);
+                continue;
             }
 
+            if acquired {
+                let stale_waker = this.node.waker.take();
+                drop(stale_waker);
+                this.phase = Phase::Completed;
+                return Poll::Ready(RwLockWriteGuard { lock: this.lock });
+            }
             return Poll::Pending;
         }
     }
 }
 
-impl<'a, T: ?Sized> Drop for RwLockWriteFuture<'a, T> {
+impl<T: ?Sized> Drop for RwLockWriteFuture<'_, T> {
     fn drop(&mut self) {
-        if self.queued {
-            self.lock.waiters.remove(&self.node);
+        let detached = match self.phase {
+            Phase::Initial | Phase::Completed => None,
+            Phase::Granted => cancel_granted(self.lock, &mut self.node),
+            Phase::Waiting => self.lock.waiters.with_lock(|waiters| {
+                if self.node.state == NODE_GRANTED {
+                    cancel_granted_locked(self.lock, waiters, &self.node)
+                } else if self.node.state == NODE_WAITING && self.node.link.is_linked() {
+                    remove_waiting_locked(self.lock, waiters, &self.node)
+                } else {
+                    None
+                }
+            }),
+        };
+        if let Some(detached) = detached {
+            detached.wake();
         }
+    }
+}
+
+fn cancel_granted<T: ?Sized>(lock: &RwLock<T>, node: &mut WaiterNode) -> Option<DetachedWaiter> {
+    lock.waiters
+        .with_lock(|waiters| cancel_granted_locked(lock, waiters, node))
+}
+
+fn cancel_granted_locked<T: ?Sized>(
+    lock: &RwLock<T>,
+    waiters: &mut LinkedList<WaiterAdapter>,
+    node: &WaiterNode,
+) -> Option<DetachedWaiter> {
+    let state = lock.state.load(Ordering::Relaxed);
+    let state = if node.kind == KIND_READER {
+        let readers = state & READER_MASK;
+        assert!(readers >= READER_UNIT, "RwLock reader count underflow");
+        state - READER_UNIT
+    } else {
+        assert!(state & WRITER_LOCKED != 0, "RwLock writer bit is not set");
+        state & !WRITER_LOCKED
+    };
+    lock.state.store(state, Ordering::Release);
+    let allow_reader = node.kind == KIND_READER && state & READER_MASK != 0;
+    grant_front_locked(lock, waiters, allow_reader)
+}
+
+fn remove_waiting_locked<T: ?Sized>(
+    lock: &RwLock<T>,
+    waiters: &mut LinkedList<WaiterAdapter>,
+    node: &WaiterNode,
+) -> Option<DetachedWaiter> {
+    let kind = node.kind;
+    unsafe {
+        let ptr = NonNull::from(node);
+        let mut cursor = waiters.cursor_mut_from_ptr(ptr);
+        cursor.remove();
+    }
+    let state = lock.state.load(Ordering::Relaxed);
+    if kind == KIND_WRITER && state & READER_MASK != 0 {
+        grant_front_locked(lock, waiters, true)
+    } else {
+        store_state_for_queue(lock, waiters, state);
+        None
+    }
+}
+
+fn store_state_for_queue<T: ?Sized>(
+    lock: &RwLock<T>,
+    waiters: &LinkedList<WaiterAdapter>,
+    mut state: usize,
+) {
+    state &= !CONTENDED;
+    if !waiters.is_empty() {
+        state |= CONTENDED;
+    }
+    lock.state.store(state, Ordering::Release);
+}
+
+fn grant_front_locked<T: ?Sized>(
+    lock: &RwLock<T>,
+    waiters: &mut LinkedList<WaiterAdapter>,
+    allow_reader_with_active_readers: bool,
+) -> Option<DetachedWaiter> {
+    let mut state = lock.state.load(Ordering::Relaxed);
+    let readers = state & READER_MASK;
+    let writer_locked = state & WRITER_LOCKED != 0;
+    let kind = waiters.front_mut().get().map(|node| node.kind);
+    let can_grant = match kind {
+        Some(KIND_WRITER) => !writer_locked && readers == 0,
+        Some(KIND_READER) => !writer_locked && (readers == 0 || allow_reader_with_active_readers),
+        _ => false,
+    };
+
+    if can_grant {
+        let mut node = waiters.pop_front().expect("wait queue front disappeared");
+        let node_mut = unsafe { node.as_mut().get_unchecked_mut() };
+        node_mut.state = NODE_GRANTED;
+        match kind {
+            Some(KIND_WRITER) => state |= WRITER_LOCKED,
+            Some(KIND_READER) => {
+                if readers == READER_MASK {
+                    panic!("RwLock reader count overflow");
+                }
+                state += READER_UNIT;
+            }
+            _ => unreachable!(),
+        }
+        let waker = node_mut.waker.take();
+        store_state_for_queue(lock, waiters, state);
+        Some(DetachedWaiter { waker })
+    } else {
+        store_state_for_queue(lock, waiters, state);
+        None
     }
 }

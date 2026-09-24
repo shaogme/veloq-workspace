@@ -8,6 +8,7 @@ use veloq_std::{
     pin::Pin,
     ptr::NonNull,
     task::{Context, Poll, Waker},
+    vec::Vec,
 };
 
 use crate::common::update_waker;
@@ -16,13 +17,21 @@ const STATE_WAITING: usize = 0;
 const STATE_GRANTED: usize = 1;
 const STATE_CLOSED: usize = 2;
 
-/// Error returned when acquiring a permit from a closed semaphore.
+/// Error returned when acquiring permits fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AcquireError;
+pub enum AcquireError {
+    /// The semaphore is closed.
+    Closed,
+    /// The requested number exceeds the semaphore capacity.
+    TooManyPermits,
+}
 
 impl fmt::Display for AcquireError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "semaphore closed")
+        match self {
+            AcquireError::Closed => write!(f, "semaphore closed"),
+            AcquireError::TooManyPermits => write!(f, "requested permits exceed capacity"),
+        }
     }
 }
 
@@ -35,6 +44,8 @@ pub enum TryAcquireError {
     Closed,
     /// No permits are currently available.
     NoPermits,
+    /// The requested number exceeds the semaphore capacity.
+    TooManyPermits,
 }
 
 impl fmt::Display for TryAcquireError {
@@ -42,11 +53,46 @@ impl fmt::Display for TryAcquireError {
         match self {
             TryAcquireError::Closed => write!(f, "semaphore closed"),
             TryAcquireError::NoPermits => write!(f, "no permits available"),
+            TryAcquireError::TooManyPermits => write!(f, "requested permits exceed capacity"),
         }
     }
 }
 
 impl Error for TryAcquireError {}
+
+/// Error returned when initial permits exceed a semaphore's capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapacityError {
+    /// The configured capacity.
+    pub capacity: usize,
+    /// The requested initial number of permits.
+    pub initial: usize,
+}
+
+impl fmt::Display for CapacityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "initial permits exceed semaphore capacity")
+    }
+}
+
+impl Error for CapacityError {}
+
+/// Error returned when adding permits would exceed a semaphore's capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AddPermitsError {
+    /// The requested number of new permits.
+    pub requested: usize,
+    /// The remaining capacity at the time of the request.
+    pub remaining: usize,
+}
+
+impl fmt::Display for AddPermitsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "adding permits exceeds semaphore capacity")
+    }
+}
+
+impl Error for AddPermitsError {}
 
 struct WaiterNode {
     waker: RefCell<Option<Waker>>,
@@ -74,37 +120,115 @@ impl WaiterAdapter {
     const NEW: Self = Self;
 }
 
+struct WakeBatch {
+    wakers: Vec<Waker>,
+}
+
+impl WakeBatch {
+    fn new() -> Self {
+        Self { wakers: Vec::new() }
+    }
+
+    fn push(&mut self, waker: Option<Waker>) {
+        if let Some(waker) = waker {
+            self.wakers.push(waker);
+        }
+    }
+
+    fn wake_all(self) {
+        for waker in self.wakers {
+            waker.wake();
+        }
+    }
+}
+
 /// An asynchronous counting semaphore for local/single-threaded contexts.
+///
+/// `capacity` bounds the total number of permits created by this semaphore.
+/// `total_permits` includes available permits and permits held by guards or
+/// already granted futures; it decreases only when permits are forgotten.
 pub struct Semaphore {
     permits: Cell<usize>,
+    total_permits: Cell<usize>,
+    capacity: usize,
     closed: Cell<bool>,
     waiters: RefCell<LinkedList<WaiterAdapter>>,
 }
 
 impl Semaphore {
-    /// Creates a new `Semaphore` with the given initial number of permits.
+    /// Creates a semaphore with `permits` available and a `usize::MAX` capacity.
     #[cfg(not(feature = "loom"))]
     pub const fn new(permits: usize) -> Self {
         Self {
             permits: Cell::new(permits),
+            total_permits: Cell::new(permits),
+            capacity: usize::MAX,
             closed: Cell::new(false),
             waiters: RefCell::new(LinkedList::new(WaiterAdapter::NEW)),
         }
     }
 
-    /// Creates a new `Semaphore` with the given initial number of permits.
+    /// Creates a semaphore with `permits` available and a `usize::MAX` capacity.
     #[cfg(feature = "loom")]
     pub fn new(permits: usize) -> Self {
         Self {
             permits: Cell::new(permits),
+            total_permits: Cell::new(permits),
+            capacity: usize::MAX,
             closed: Cell::new(false),
             waiters: RefCell::new(LinkedList::new(WaiterAdapter::NEW)),
         }
+    }
+
+    /// Creates an empty semaphore with the given maximum capacity.
+    #[cfg(not(feature = "loom"))]
+    pub const fn with_capacity(capacity: usize) -> Self {
+        Self {
+            permits: Cell::new(0),
+            total_permits: Cell::new(0),
+            capacity,
+            closed: Cell::new(false),
+            waiters: RefCell::new(LinkedList::new(WaiterAdapter::NEW)),
+        }
+    }
+
+    /// Creates an empty semaphore with the given maximum capacity.
+    #[cfg(feature = "loom")]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            permits: Cell::new(0),
+            total_permits: Cell::new(0),
+            capacity,
+            closed: Cell::new(false),
+            waiters: RefCell::new(LinkedList::new(WaiterAdapter::NEW)),
+        }
+    }
+
+    /// Creates a semaphore with an explicit capacity and initial permit count.
+    pub fn with_capacity_and_permits(
+        capacity: usize,
+        initial: usize,
+    ) -> Result<Self, CapacityError> {
+        if initial > capacity {
+            return Err(CapacityError { capacity, initial });
+        }
+        Ok(Self {
+            permits: Cell::new(initial),
+            total_permits: Cell::new(initial),
+            capacity,
+            closed: Cell::new(false),
+            waiters: RefCell::new(LinkedList::new(WaiterAdapter::NEW)),
+        })
     }
 
     /// Returns the current number of available permits.
     pub fn available_permits(&self) -> usize {
         self.permits.get()
+    }
+
+    /// Returns the maximum number of permits this semaphore can create.
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 
     /// Returns true if the semaphore has been closed.
@@ -119,24 +243,73 @@ impl Semaphore {
         }
         self.closed.set(true);
 
-        let mut waiters = self.waiters.borrow_mut();
-        while let Some(node) = waiters.pop_front() {
-            node.state.set(STATE_CLOSED);
-            if let Some(waker) = node.waker.borrow_mut().take() {
-                waker.wake();
+        let batch = {
+            let mut waiters = self.waiters.borrow_mut();
+            let mut batch = WakeBatch::new();
+            while let Some(node) = waiters.pop_front() {
+                node.state.set(STATE_CLOSED);
+                batch.push(node.waker.borrow_mut().take());
             }
-        }
+            batch
+        };
+        batch.wake_all();
     }
 
-    /// Adds `n` permits to the semaphore, waking pending waiters in FIFO order.
-    pub fn add_permits(&self, n: usize) {
-        self.release_permits(n);
+    /// Adds `n` permits, waking pending waiters in FIFO order.
+    ///
+    /// If the capacity would be exceeded, this returns an error without
+    /// changing the permit count or wait queue.
+    pub fn add_permits(&self, n: usize) -> Result<(), AddPermitsError> {
+        if n == 0 {
+            return Ok(());
+        }
+
+        let batch = {
+            let mut waiters = self.waiters.borrow_mut();
+            let total = self.total_permits.get();
+            let remaining = self
+                .capacity
+                .checked_sub(total)
+                .expect("semaphore total permits exceed capacity");
+            if n > remaining {
+                return Err(AddPermitsError {
+                    requested: n,
+                    remaining,
+                });
+            }
+
+            let new_total = total
+                .checked_add(n)
+                .expect("semaphore total permit count overflow");
+            let available = self.permits.get();
+            let new_available = available
+                .checked_add(n)
+                .expect("semaphore available permit count overflow");
+            self.total_permits.set(new_total);
+            self.permits.set(new_available);
+
+            if self.closed.get() {
+                WakeBatch::new()
+            } else {
+                Self::wake_pending_waiters(&mut waiters, &self.permits)
+            }
+        };
+        batch.wake_all();
+        Ok(())
     }
 
     /// Reduces the number of available permits by `n` without returning them.
+    ///
+    /// Forgotten permits reduce the total capacity available for future adds.
     pub fn forget_permits(&self, n: usize) {
         let current = self.permits.get();
-        self.permits.set(current.saturating_sub(n));
+        let removed = core::cmp::min(n, current);
+        let total = self.total_permits.get();
+        let new_total = total
+            .checked_sub(removed)
+            .expect("semaphore total permits below available permits");
+        self.total_permits.set(new_total);
+        self.permits.set(current - removed);
     }
 
     /// Attempts to acquire a single permit immediately without waiting.
@@ -148,6 +321,9 @@ impl Semaphore {
     pub fn try_acquire_many(&self, n: usize) -> Result<SemaphorePermit<'_>, TryAcquireError> {
         if self.closed.get() {
             return Err(TryAcquireError::Closed);
+        }
+        if n > self.capacity {
+            return Err(TryAcquireError::TooManyPermits);
         }
         if n == 0 {
             return Ok(SemaphorePermit {
@@ -187,10 +363,14 @@ impl Semaphore {
         }
     }
 
-    fn wake_pending_waiters(waiters: &mut LinkedList<WaiterAdapter>, permits: &Cell<usize>) {
+    fn wake_pending_waiters(
+        waiters: &mut LinkedList<WaiterAdapter>,
+        permits: &Cell<usize>,
+    ) -> WakeBatch {
+        let mut batch = WakeBatch::new();
         let mut current = permits.get();
         if current == 0 {
-            return;
+            return batch;
         }
 
         while let Some(front) = waiters.front().get() {
@@ -199,14 +379,13 @@ impl Semaphore {
                 current -= needed;
                 let node = waiters.pop_front().unwrap();
                 node.state.set(STATE_GRANTED);
-                if let Some(waker) = node.waker.borrow_mut().take() {
-                    waker.wake();
-                }
+                batch.push(node.waker.borrow_mut().take());
             } else {
                 break;
             }
         }
         permits.set(current);
+        batch
     }
 
     fn release_permits(&self, num: usize) {
@@ -214,16 +393,39 @@ impl Semaphore {
             return;
         }
 
-        if self.closed.get() {
-            self.permits.set(self.permits.get() + num);
+        let batch = {
+            let mut waiters = self.waiters.borrow_mut();
+            let available = self.permits.get();
+            let total = self.total_permits.get();
+            let outstanding = total
+                .checked_sub(available)
+                .expect("semaphore available permits exceed total permits");
+            if num > outstanding {
+                panic!("semaphore permit release exceeds outstanding permits");
+            }
+            let new_available = available
+                .checked_add(num)
+                .expect("semaphore available permit count overflow");
+            self.permits.set(new_available);
+
+            if self.closed.get() {
+                WakeBatch::new()
+            } else {
+                Self::wake_pending_waiters(&mut waiters, &self.permits)
+            }
+        };
+        batch.wake_all();
+    }
+
+    fn forget_held_permits(&self, num: usize) {
+        if num == 0 {
             return;
         }
-
-        let current = self.permits.get() + num;
-        self.permits.set(current);
-
-        let mut waiters = self.waiters.borrow_mut();
-        Self::wake_pending_waiters(&mut waiters, &self.permits);
+        let total = self.total_permits.get();
+        let new_total = total
+            .checked_sub(num)
+            .expect("semaphore permit forget exceeds total permits");
+        self.total_permits.set(new_total);
     }
 }
 
@@ -231,6 +433,7 @@ impl fmt::Debug for Semaphore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Semaphore")
             .field("permits", &self.available_permits())
+            .field("capacity", &self.capacity)
             .field("closed", &self.is_closed())
             .finish_non_exhaustive()
     }
@@ -255,6 +458,7 @@ impl<'a> SemaphorePermit<'a> {
 
     /// Forgets the permit, preventing its permits from being returned to the semaphore.
     pub fn forget(mut self) {
+        self.semaphore.forget_held_permits(self.permits);
         self.permits = 0;
     }
 }
@@ -290,7 +494,7 @@ impl<'a> Future for SemaphoreAcquireFuture<'a> {
 
         if this.permits == 0 {
             if this.semaphore.is_closed() {
-                return Poll::Ready(Err(AcquireError));
+                return Poll::Ready(Err(AcquireError::Closed));
             }
             return Poll::Ready(Ok(SemaphorePermit {
                 semaphore: this.semaphore,
@@ -308,7 +512,7 @@ impl<'a> Future for SemaphoreAcquireFuture<'a> {
         }
         if state == STATE_CLOSED {
             this.queued = false;
-            return Poll::Ready(Err(AcquireError));
+            return Poll::Ready(Err(AcquireError::Closed));
         }
 
         if this.queued {
@@ -317,7 +521,10 @@ impl<'a> Future for SemaphoreAcquireFuture<'a> {
         }
 
         if this.semaphore.closed.get() {
-            return Poll::Ready(Err(AcquireError));
+            return Poll::Ready(Err(AcquireError::Closed));
+        }
+        if this.permits > this.semaphore.capacity {
+            return Poll::Ready(Err(AcquireError::TooManyPermits));
         }
 
         if this.semaphore.waiters.borrow().is_empty() {
@@ -357,17 +564,25 @@ impl<'a> Drop for SemaphoreAcquireFuture<'a> {
         }
 
         if self.node.link.is_linked() {
-            let mut waiters = self.semaphore.waiters.borrow_mut();
-            if self.node.state.get() == STATE_GRANTED {
-                drop(waiters);
+            let mut return_permits = false;
+            let batch = {
+                let mut waiters = self.semaphore.waiters.borrow_mut();
+                if self.node.state.get() == STATE_GRANTED {
+                    return_permits = true;
+                    WakeBatch::new()
+                } else {
+                    unsafe {
+                        let ptr = NonNull::from(&self.node);
+                        let mut cursor = waiters.cursor_mut_from_ptr(ptr);
+                        cursor.remove();
+                    }
+                    Semaphore::wake_pending_waiters(&mut waiters, &self.semaphore.permits)
+                }
+            };
+            if return_permits {
                 self.semaphore.release_permits(self.permits);
             } else {
-                unsafe {
-                    let ptr = NonNull::from(&self.node);
-                    let mut cursor = waiters.cursor_mut_from_ptr(ptr);
-                    cursor.remove();
-                }
-                Semaphore::wake_pending_waiters(&mut waiters, &self.semaphore.permits);
+                batch.wake_all();
             }
         }
         self.queued = false;

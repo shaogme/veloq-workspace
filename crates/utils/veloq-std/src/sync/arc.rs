@@ -6,10 +6,9 @@ use core::{
     ops::Deref,
     panic::{RefUnwindSafe, UnwindSafe},
     pin::Pin,
-    task::Waker,
 };
 
-use crate::alloc_crate::{boxed::Box, string::String, sync::Arc as AllocArc, task::Wake, vec::Vec};
+use crate::alloc_crate::{boxed::Box, string::String, sync::Arc as AllocArc, vec::Vec};
 use crate::sync::weak::NativeWeak;
 
 #[cfg(feature = "loom")]
@@ -334,13 +333,6 @@ unsafe impl<T: ?Sized + Sync + Send> Sync for NativeArc<T> {}
 impl<T: ?Sized + RefUnwindSafe> RefUnwindSafe for NativeArc<T> {}
 impl<T: ?Sized + RefUnwindSafe> UnwindSafe for NativeArc<T> {}
 impl<T: ?Sized> Unpin for NativeArc<T> {}
-
-impl<W: Wake + Send + Sync + 'static> From<NativeArc<W>> for Waker {
-    #[inline]
-    fn from(arc: NativeArc<W>) -> Self {
-        Waker::from(NativeArc::into_inner(arc))
-    }
-}
 
 #[cfg(feature = "loom")]
 pub(crate) struct ArcControlBlock {

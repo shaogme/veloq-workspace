@@ -19,7 +19,8 @@ pub use condvar::{Condvar, Wait};
 pub use mutex::{Mutex, MutexGuard};
 pub use notify::{Notified, Notify};
 pub use semaphore::{
-    AcquireError, Semaphore, SemaphoreAcquireFuture, SemaphorePermit, TryAcquireError,
+    AcquireError, AddPermitsError, CapacityError, Semaphore, SemaphoreAcquireFuture,
+    SemaphorePermit, TryAcquireError,
 };
 pub use set_once::{SetOnce, SetOnceError, SetOnceWait};
 

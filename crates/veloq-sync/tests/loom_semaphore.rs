@@ -1,7 +1,7 @@
 #![cfg(feature = "loom")]
 
 use loom::{future::block_on, sync::Arc, thread};
-use veloq_sync::semaphore::{AcquireError, Semaphore, TryAcquireError};
+use veloq_sync::semaphore::{AcquireError, AddPermitsError, Semaphore, TryAcquireError};
 
 #[test]
 fn test_loom_semaphore_exclusion() {
@@ -46,7 +46,7 @@ fn test_loom_semaphore_add_permits() {
         });
 
         let t2 = thread::spawn(move || {
-            s2.add_permits(1);
+            s2.add_permits(1).unwrap();
         });
 
         t1.join().unwrap();
@@ -66,7 +66,7 @@ fn test_loom_semaphore_close() {
         let t1 = thread::spawn(move || {
             block_on(async move {
                 let res = s1.acquire().await;
-                assert_eq!(res.unwrap_err(), AcquireError);
+                assert_eq!(res.unwrap_err(), AcquireError::Closed);
             });
         });
 
@@ -170,6 +170,53 @@ fn test_loom_semaphore_try_acquire() {
         t1.join().unwrap();
         t2.join().unwrap();
 
+        assert_eq!(sem.available_permits(), 1);
+    });
+}
+
+#[test]
+fn test_loom_semaphore_near_capacity() {
+    loom::model(|| {
+        let sem =
+            Arc::new(Semaphore::with_capacity_and_permits(usize::MAX, usize::MAX - 1).unwrap());
+        let s1 = sem.clone();
+        let s2 = sem.clone();
+
+        let t1 = thread::spawn(move || {
+            let permit = s1.try_acquire().unwrap();
+            drop(permit);
+        });
+
+        let t2 = thread::spawn(move || {
+            s2.add_permits(1).unwrap();
+        });
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+        assert_eq!(sem.available_permits(), usize::MAX);
+    });
+}
+
+#[test]
+fn test_loom_semaphore_failed_add_and_release() {
+    loom::model(|| {
+        let sem = Arc::new(Semaphore::new(1));
+        let s0 = sem.clone();
+        let guard = block_on(async { s0.acquire().await.unwrap() });
+        let s1 = sem.clone();
+
+        let t1 = thread::spawn(move || {
+            assert_eq!(
+                s1.add_permits(usize::MAX),
+                Err(AddPermitsError {
+                    requested: usize::MAX,
+                    remaining: usize::MAX - 1,
+                })
+            );
+        });
+
+        t1.join().unwrap();
+        drop(guard);
         assert_eq!(sem.available_permits(), 1);
     });
 }

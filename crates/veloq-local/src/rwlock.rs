@@ -1,9 +1,12 @@
-use crate::{wait_queue::WaitQueue, waker::WaiterNode};
+use crate::{
+    wait_queue::{DetachedWaiter, WaitQueue},
+    waker::{WaiterAdapter, WaiterNode},
+};
+use veloq_intrusive_linklist::LinkedList;
 use veloq_std::{
     cell::{Cell, UnsafeCell},
     fmt,
     future::Future,
-    marker::PhantomPinned,
     mem,
     ops::{Deref, DerefMut},
     pin::Pin,
@@ -14,9 +17,8 @@ use veloq_std::{
 const KIND_READER: usize = 0;
 const KIND_WRITER: usize = 1;
 
-const STATE_WAITING: usize = 0;
-const STATE_GRANTED: usize = 1;
-const STATE_CONSUMED: usize = 2;
+const NODE_WAITING: usize = 0;
+const NODE_GRANTED: usize = 1;
 
 /// An asynchronous reader-writer lock for local/single-threaded contexts.
 pub struct RwLock<T: ?Sized> {
@@ -72,44 +74,33 @@ impl<T: ?Sized> RwLock<T> {
     }
 
     /// Returns a mutable reference to the underlying data.
-    ///
-    /// Since this call borrows the `RwLock` mutably, no actual locking needs to take place.
     pub fn get_mut(&mut self) -> &mut T {
         unsafe { &mut *self.data.with_mut(|ptr| ptr as *mut T) }
     }
 
     /// Attempts to acquire the lock for reading immediately.
-    ///
-    /// Returns `Some(RwLockReadGuard)` if successful, or `None` if the lock is held by a writer
-    /// or if there are pending waiters.
     pub fn try_read(&self) -> Option<RwLockReadGuard<'_, T>> {
         if self.writer_locked.get() || !self.waiters.is_empty() {
             return None;
         }
-
         let readers = self.reader_count.get();
         if readers == usize::MAX {
             return None;
         }
-
         self.reader_count.set(readers + 1);
         Some(RwLockReadGuard { lock: self })
     }
 
     /// Acquires the lock for reading asynchronously.
-    pub fn read(&self) -> RwLockReadFuture<'_, T> {
+    pub fn read(&self) -> impl Future<Output = RwLockReadGuard<'_, T>> + '_ {
         RwLockReadFuture {
             lock: self,
             node: WaiterNode::new_with_kind(KIND_READER),
-            queued: false,
-            _pin: PhantomPinned,
+            phase: Phase::Initial,
         }
     }
 
     /// Attempts to acquire the lock for writing immediately.
-    ///
-    /// Returns `Some(RwLockWriteGuard)` if successful, or `None` if the lock is currently
-    /// held by any reader or writer, or if there are pending waiters.
     pub fn try_write(&self) -> Option<RwLockWriteGuard<'_, T>> {
         if !self.writer_locked.get() && self.reader_count.get() == 0 && self.waiters.is_empty() {
             self.writer_locked.set(true);
@@ -120,31 +111,30 @@ impl<T: ?Sized> RwLock<T> {
     }
 
     /// Acquires the lock for writing asynchronously.
-    pub fn write(&self) -> RwLockWriteFuture<'_, T> {
+    pub fn write(&self) -> impl Future<Output = RwLockWriteGuard<'_, T>> + '_ {
         RwLockWriteFuture {
             lock: self,
             node: WaiterNode::new_with_kind(KIND_WRITER),
-            queued: false,
-            _pin: PhantomPinned,
+            phase: Phase::Initial,
         }
     }
 }
 
 impl<T: ?Sized + fmt::Debug> fmt::Debug for RwLock<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut d = f.debug_struct("RwLock");
-        d.field("writer_locked", &self.writer_locked.get());
-        d.field("reader_count", &self.reader_count.get());
+        let mut debug = f.debug_struct("RwLock");
+        debug.field("writer_locked", &self.writer_locked.get());
+        debug.field("reader_count", &self.reader_count.get());
         if !self.writer_locked.get() {
             unsafe {
                 self.data.with(|data| {
-                    d.field("data", &data);
+                    debug.field("data", &data);
                 });
             }
         } else {
-            d.field("data", &format_args!("<locked>"));
+            debug.field("data", &format_args!("<locked>"));
         }
-        d.finish_non_exhaustive()
+        debug.finish_non_exhaustive()
     }
 }
 
@@ -160,82 +150,7 @@ impl<T> From<T> for RwLock<T> {
     }
 }
 
-fn release_write_lock<T: ?Sized>(lock: &RwLock<T>) {
-    lock.waiters.with_lock(|w| {
-        if let Some(front) = w.front().get()
-            && front.kind == KIND_WRITER
-        {
-            let mut writer = w.pop_front().unwrap();
-            lock.writer_locked.set(true);
-            unsafe {
-                let node_mut = writer.as_mut().get_unchecked_mut();
-                node_mut.state = STATE_GRANTED;
-                if let Some(waker) = node_mut.waker.take() {
-                    waker.wake();
-                }
-            }
-            return;
-        }
-
-        lock.writer_locked.set(false);
-        while let Some(front) = w.front().get() {
-            if front.kind == KIND_READER {
-                let mut reader = w.pop_front().unwrap();
-                lock.reader_count.set(lock.reader_count.get() + 1);
-                unsafe {
-                    let node_mut = reader.as_mut().get_unchecked_mut();
-                    node_mut.state = STATE_GRANTED;
-                    if let Some(waker) = node_mut.waker.take() {
-                        waker.wake();
-                    }
-                }
-            } else {
-                break;
-            }
-        }
-    });
-}
-
-fn release_read_lock<T: ?Sized>(lock: &RwLock<T>) {
-    let readers = lock.reader_count.get() - 1;
-    lock.reader_count.set(readers);
-    if readers == 0 {
-        lock.waiters.with_lock(|w| {
-            if let Some(front) = w.front().get()
-                && front.kind == KIND_WRITER
-            {
-                let mut writer = w.pop_front().unwrap();
-                lock.writer_locked.set(true);
-                unsafe {
-                    let node_mut = writer.as_mut().get_unchecked_mut();
-                    node_mut.state = STATE_GRANTED;
-                    if let Some(waker) = node_mut.waker.take() {
-                        waker.wake();
-                    }
-                }
-                return;
-            }
-
-            while let Some(front) = w.front().get() {
-                if front.kind == KIND_READER {
-                    let mut reader = w.pop_front().unwrap();
-                    lock.reader_count.set(lock.reader_count.get() + 1);
-                    unsafe {
-                        let node_mut = reader.as_mut().get_unchecked_mut();
-                        node_mut.state = STATE_GRANTED;
-                        if let Some(waker) = node_mut.waker.take() {
-                            waker.wake();
-                        }
-                    }
-                } else {
-                    break;
-                }
-            }
-        });
-    }
-}
-
-/// A RAII guard returned by `RwLock::read`.
+/// A RAII guard returned by [`RwLock::read`].
 pub struct RwLockReadGuard<'a, T: ?Sized> {
     lock: &'a RwLock<T>,
 }
@@ -250,7 +165,19 @@ impl<T: ?Sized> Deref for RwLockReadGuard<'_, T> {
 
 impl<T: ?Sized> Drop for RwLockReadGuard<'_, T> {
     fn drop(&mut self) {
-        release_read_lock(self.lock);
+        let readers = self.lock.reader_count.get();
+        assert!(readers > 0, "RwLock reader count underflow");
+        self.lock.reader_count.set(readers - 1);
+        let detached = if readers == 1 {
+            self.lock
+                .waiters
+                .with_lock(|waiters| grant_front_locked(self.lock, waiters, false))
+        } else {
+            None
+        };
+        if let Some(detached) = detached {
+            detached.wake();
+        }
     }
 }
 
@@ -266,7 +193,7 @@ impl<T: ?Sized + fmt::Display> fmt::Display for RwLockReadGuard<'_, T> {
     }
 }
 
-/// A RAII guard returned by `RwLock::write` and `RwLock::try_write`.
+/// A RAII guard returned by [`RwLock::write`].
 pub struct RwLockWriteGuard<'a, T: ?Sized> {
     lock: &'a RwLock<T>,
 }
@@ -290,35 +217,33 @@ impl<'a, T: ?Sized> RwLockWriteGuard<'a, T> {
     pub fn downgrade(self) -> RwLockReadGuard<'a, T> {
         let lock = self.lock;
         mem::forget(self);
-
+        assert!(lock.writer_locked.get(), "RwLock writer bit is not set");
         lock.writer_locked.set(false);
         lock.reader_count.set(1);
-
-        lock.waiters.with_lock(|w| {
-            while let Some(front) = w.front().get() {
-                if front.kind == KIND_READER {
-                    let mut reader = w.pop_front().unwrap();
-                    lock.reader_count.set(lock.reader_count.get() + 1);
-                    unsafe {
-                        let node_mut = reader.as_mut().get_unchecked_mut();
-                        node_mut.state = STATE_GRANTED;
-                        if let Some(waker) = node_mut.waker.take() {
-                            waker.wake();
-                        }
-                    }
-                } else {
-                    break;
-                }
-            }
-        });
-
+        let detached = lock
+            .waiters
+            .with_lock(|waiters| grant_front_locked(lock, waiters, true));
+        if let Some(detached) = detached {
+            detached.wake();
+        }
         RwLockReadGuard { lock }
     }
 }
 
 impl<T: ?Sized> Drop for RwLockWriteGuard<'_, T> {
     fn drop(&mut self) {
-        release_write_lock(self.lock);
+        assert!(
+            self.lock.writer_locked.get(),
+            "RwLock writer bit is not set"
+        );
+        self.lock.writer_locked.set(false);
+        let detached = self
+            .lock
+            .waiters
+            .with_lock(|waiters| grant_front_locked(self.lock, waiters, false));
+        if let Some(detached) = detached {
+            detached.wake();
+        }
     }
 }
 
@@ -334,12 +259,18 @@ impl<T: ?Sized + fmt::Display> fmt::Display for RwLockWriteGuard<'_, T> {
     }
 }
 
-/// A future that resolves to a `RwLockReadGuard`.
-pub struct RwLockReadFuture<'a, T: ?Sized> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    Initial,
+    Waiting,
+    Granted,
+    Completed,
+}
+
+struct RwLockReadFuture<'a, T: ?Sized> {
     lock: &'a RwLock<T>,
     node: WaiterNode,
-    queued: bool,
-    _pin: PhantomPinned,
+    phase: Phase,
 }
 
 impl<'a, T: ?Sized> Future for RwLockReadFuture<'a, T> {
@@ -347,92 +278,84 @@ impl<'a, T: ?Sized> Future for RwLockReadFuture<'a, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-
-        if this.node.state == STATE_GRANTED {
-            this.queued = false;
-            this.node.state = STATE_CONSUMED;
+        if this.phase == Phase::Completed {
+            panic!("polled RwLockReadFuture after completion");
+        }
+        if this.phase == Phase::Waiting {
+            if this.lock.waiters.refresh_waker(&mut this.node, cx).linked() {
+                return Poll::Pending;
+            }
+            assert_eq!(this.node.state, NODE_GRANTED);
+            this.phase = Phase::Granted;
+        }
+        if this.phase == Phase::Granted {
+            let detached = this
+                .lock
+                .waiters
+                .with_lock(|waiters| grant_front_locked(this.lock, waiters, true));
+            this.phase = Phase::Completed;
+            if let Some(detached) = detached {
+                detached.wake();
+            }
             return Poll::Ready(RwLockReadGuard { lock: this.lock });
         }
 
-        if this.queued {
-            this.lock.waiters.update_waker_if_linked(&mut this.node, cx);
-            return Poll::Pending;
-        }
-
+        let mut acquired = false;
         if !this.lock.writer_locked.get() && this.lock.waiters.is_empty() {
             let readers = this.lock.reader_count.get();
             if readers == usize::MAX {
                 panic!("RwLock reader count overflow");
             }
             this.lock.reader_count.set(readers + 1);
-            this.node.state = STATE_CONSUMED;
-            return Poll::Ready(RwLockReadGuard { lock: this.lock });
-        }
-
-        this.node.state = STATE_WAITING;
-        unsafe {
-            let node_pin = Pin::new_unchecked(&mut this.node);
-            this.lock.waiters.register_and_push(node_pin, cx);
-        }
-        this.queued = true;
-        Poll::Pending
-    }
-}
-
-impl<'a, T: ?Sized> Drop for RwLockReadFuture<'a, T> {
-    fn drop(&mut self) {
-        if self.node.state == STATE_CONSUMED {
-            return;
-        }
-
-        if self.node.state == STATE_GRANTED {
-            release_read_lock(self.lock);
-            return;
-        }
-
-        if self.queued {
-            self.lock.waiters.with_lock(|w| {
-                if self.node.link.is_linked() {
-                    unsafe {
-                        let ptr = NonNull::from(&self.node);
-                        let mut cursor = w.cursor_mut_from_ptr(ptr);
-                        cursor.remove();
-                    }
-                    if !self.lock.writer_locked.get()
-                        && self.lock.reader_count.get() == 0
-                        && let Some(front) = w.front().get()
-                        && front.kind == KIND_WRITER
-                    {
-                        let mut writer = w.pop_front().unwrap();
-                        self.lock.writer_locked.set(true);
-                        unsafe {
-                            let node_mut = writer.as_mut().get_unchecked_mut();
-                            node_mut.state = STATE_GRANTED;
-                            if let Some(waker) = node_mut.waker.take() {
-                                waker.wake();
-                            }
-                        }
-                    }
+            acquired = true;
+        } else {
+            let new_waker = cx.waker().clone();
+            let old_waker = this.node.waker.replace(new_waker);
+            drop(old_waker);
+            this.lock.waiters.with_lock(|waiters| {
+                unsafe {
+                    this.node.state = NODE_WAITING;
+                    let node_pin = Pin::new_unchecked(&mut this.node);
+                    waiters.push_back(node_pin);
                 }
+                this.phase = Phase::Waiting;
             });
         }
+
+        if acquired {
+            this.phase = Phase::Completed;
+            Poll::Ready(RwLockReadGuard { lock: this.lock })
+        } else {
+            Poll::Pending
+        }
     }
 }
 
-impl<'a, T: ?Sized> fmt::Debug for RwLockReadFuture<'a, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RwLockReadFuture")
-            .field("queued", &self.queued)
-            .finish_non_exhaustive()
+impl<T: ?Sized> Drop for RwLockReadFuture<'_, T> {
+    fn drop(&mut self) {
+        let detached = match self.phase {
+            Phase::Initial | Phase::Completed => None,
+            Phase::Granted => cancel_granted(self.lock, &self.node),
+            Phase::Waiting => self.lock.waiters.with_lock(|waiters| {
+                if self.node.state == NODE_GRANTED {
+                    cancel_granted_locked(self.lock, waiters, &self.node)
+                } else if self.node.state == NODE_WAITING && self.node.link.is_linked() {
+                    remove_waiting_locked(self.lock, waiters, &self.node)
+                } else {
+                    None
+                }
+            }),
+        };
+        if let Some(detached) = detached {
+            detached.wake();
+        }
     }
 }
 
-/// A future that resolves to a `RwLockWriteGuard`.
-pub struct RwLockWriteFuture<'a, T: ?Sized> {
+struct RwLockWriteFuture<'a, T: ?Sized> {
     lock: &'a RwLock<T>,
     node: WaiterNode,
-    queued: bool,
-    _pin: PhantomPinned,
+    phase: Phase,
 }
 
 impl<'a, T: ?Sized> Future for RwLockWriteFuture<'a, T> {
@@ -440,83 +363,142 @@ impl<'a, T: ?Sized> Future for RwLockWriteFuture<'a, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-
-        if this.node.state == STATE_GRANTED {
-            this.queued = false;
-            this.node.state = STATE_CONSUMED;
+        if this.phase == Phase::Completed {
+            panic!("polled RwLockWriteFuture after completion");
+        }
+        if this.phase == Phase::Waiting {
+            if this.lock.waiters.refresh_waker(&mut this.node, cx).linked() {
+                return Poll::Pending;
+            }
+            assert_eq!(this.node.state, NODE_GRANTED);
+            this.phase = Phase::Granted;
+        }
+        if this.phase == Phase::Granted {
+            this.phase = Phase::Completed;
             return Poll::Ready(RwLockWriteGuard { lock: this.lock });
         }
 
-        if this.queued {
-            this.lock.waiters.update_waker_if_linked(&mut this.node, cx);
-            return Poll::Pending;
-        }
-
+        let mut acquired = false;
         if !this.lock.writer_locked.get()
             && this.lock.reader_count.get() == 0
             && this.lock.waiters.is_empty()
         {
             this.lock.writer_locked.set(true);
-            this.node.state = STATE_CONSUMED;
-            return Poll::Ready(RwLockWriteGuard { lock: this.lock });
-        }
-
-        this.node.state = STATE_WAITING;
-        unsafe {
-            let node_pin = Pin::new_unchecked(&mut this.node);
-            this.lock.waiters.register_and_push(node_pin, cx);
-        }
-        this.queued = true;
-        Poll::Pending
-    }
-}
-
-impl<'a, T: ?Sized> Drop for RwLockWriteFuture<'a, T> {
-    fn drop(&mut self) {
-        if self.node.state == STATE_CONSUMED {
-            return;
-        }
-
-        if self.node.state == STATE_GRANTED {
-            release_write_lock(self.lock);
-            return;
-        }
-
-        if self.queued {
-            self.lock.waiters.with_lock(|w| {
-                if self.node.link.is_linked() {
-                    unsafe {
-                        let ptr = NonNull::from(&self.node);
-                        let mut cursor = w.cursor_mut_from_ptr(ptr);
-                        cursor.remove();
-                    }
-                    if !self.lock.writer_locked.get() {
-                        while let Some(front) = w.front().get() {
-                            if front.kind == KIND_READER {
-                                let mut reader = w.pop_front().unwrap();
-                                self.lock.reader_count.set(self.lock.reader_count.get() + 1);
-                                unsafe {
-                                    let node_mut = reader.as_mut().get_unchecked_mut();
-                                    node_mut.state = STATE_GRANTED;
-                                    if let Some(waker) = node_mut.waker.take() {
-                                        waker.wake();
-                                    }
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-                    }
+            acquired = true;
+        } else {
+            let new_waker = cx.waker().clone();
+            let old_waker = this.node.waker.replace(new_waker);
+            drop(old_waker);
+            this.lock.waiters.with_lock(|waiters| {
+                unsafe {
+                    this.node.state = NODE_WAITING;
+                    let node_pin = Pin::new_unchecked(&mut this.node);
+                    waiters.push_back(node_pin);
                 }
+                this.phase = Phase::Waiting;
             });
         }
+
+        if acquired {
+            this.phase = Phase::Completed;
+            Poll::Ready(RwLockWriteGuard { lock: this.lock })
+        } else {
+            Poll::Pending
+        }
     }
 }
 
-impl<'a, T: ?Sized> fmt::Debug for RwLockWriteFuture<'a, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RwLockWriteFuture")
-            .field("queued", &self.queued)
-            .finish_non_exhaustive()
+impl<T: ?Sized> Drop for RwLockWriteFuture<'_, T> {
+    fn drop(&mut self) {
+        let detached = match self.phase {
+            Phase::Initial | Phase::Completed => None,
+            Phase::Granted => cancel_granted(self.lock, &self.node),
+            Phase::Waiting => self.lock.waiters.with_lock(|waiters| {
+                if self.node.state == NODE_GRANTED {
+                    cancel_granted_locked(self.lock, waiters, &self.node)
+                } else if self.node.state == NODE_WAITING && self.node.link.is_linked() {
+                    remove_waiting_locked(self.lock, waiters, &self.node)
+                } else {
+                    None
+                }
+            }),
+        };
+        if let Some(detached) = detached {
+            detached.wake();
+        }
     }
+}
+
+fn cancel_granted<T: ?Sized>(lock: &RwLock<T>, node: &WaiterNode) -> Option<DetachedWaiter> {
+    lock.waiters
+        .with_lock(|waiters| cancel_granted_locked(lock, waiters, node))
+}
+
+fn cancel_granted_locked<T: ?Sized>(
+    lock: &RwLock<T>,
+    waiters: &mut LinkedList<WaiterAdapter>,
+    node: &WaiterNode,
+) -> Option<DetachedWaiter> {
+    if node.kind == KIND_READER {
+        let readers = lock.reader_count.get();
+        assert!(readers > 0, "RwLock reader count underflow");
+        lock.reader_count.set(readers - 1);
+        grant_front_locked(lock, waiters, readers > 1)
+    } else {
+        assert!(lock.writer_locked.get(), "RwLock writer bit is not set");
+        lock.writer_locked.set(false);
+        grant_front_locked(lock, waiters, false)
+    }
+}
+
+fn remove_waiting_locked<T: ?Sized>(
+    lock: &RwLock<T>,
+    waiters: &mut LinkedList<WaiterAdapter>,
+    node: &WaiterNode,
+) -> Option<DetachedWaiter> {
+    let kind = node.kind;
+    unsafe {
+        let ptr = NonNull::from(node);
+        let mut cursor = waiters.cursor_mut_from_ptr(ptr);
+        cursor.remove();
+    }
+    if kind == KIND_WRITER && lock.reader_count.get() > 0 {
+        grant_front_locked(lock, waiters, true)
+    } else {
+        None
+    }
+}
+
+fn grant_front_locked<T: ?Sized>(
+    lock: &RwLock<T>,
+    waiters: &mut LinkedList<WaiterAdapter>,
+    allow_reader_with_active_readers: bool,
+) -> Option<DetachedWaiter> {
+    let readers = lock.reader_count.get();
+    let writer_locked = lock.writer_locked.get();
+    let kind = waiters.front_mut().get().map(|node| node.kind);
+    let can_grant = match kind {
+        Some(KIND_WRITER) => !writer_locked && readers == 0,
+        Some(KIND_READER) => !writer_locked && (readers == 0 || allow_reader_with_active_readers),
+        _ => false,
+    };
+    if !can_grant {
+        return None;
+    }
+
+    let mut node = waiters.pop_front().expect("wait queue front disappeared");
+    let node_mut = unsafe { node.as_mut().get_unchecked_mut() };
+    node_mut.state = NODE_GRANTED;
+    match kind {
+        Some(KIND_WRITER) => lock.writer_locked.set(true),
+        Some(KIND_READER) => {
+            if readers == usize::MAX {
+                panic!("RwLock reader count overflow");
+            }
+            lock.reader_count.set(readers + 1);
+        }
+        _ => unreachable!(),
+    }
+    let waker = node_mut.waker.take();
+    Some(DetachedWaiter { waker })
 }

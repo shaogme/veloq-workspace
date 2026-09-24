@@ -462,8 +462,8 @@ impl<T> RouteCell<T> {
                 false
             }
         };
-        if published {
-            self.waker.wake();
+        if published && let Some(waker) = self.waker.take() {
+            waker.wake();
         }
         published
     }
@@ -478,8 +478,8 @@ impl<T> RouteCell<T> {
                 false
             }
         };
-        if published {
-            self.waker.wake();
+        if published && let Some(waker) = self.waker.take() {
+            waker.wake();
         }
         published
     }

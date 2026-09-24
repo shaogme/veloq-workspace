@@ -1,4 +1,7 @@
-use crate::{wait_queue::WaitQueue, waker::WaiterNode};
+use crate::{
+    wait_queue::{DetachedWaiter, WaitQueue},
+    waker::WaiterNode,
+};
 use veloq_std::{
     cell::UnsafeCell,
     future::Future,
@@ -87,13 +90,17 @@ impl<T: ?Sized> Mutex<T> {
     }
 
     /// Acquires the lock asynchronously.
-    pub fn lock(&self) -> MutexLockFuture<'_, T> {
+    pub fn lock(&self) -> impl Future<Output = MutexGuard<'_, T>> + '_ {
+        self.lock_future()
+    }
+
+    pub(crate) fn lock_future(&self) -> MutexLockFuture<'_, T> {
         let mut node = WaiterNode::new();
-        node.kind = STATE_WAITING;
+        node.state = STATE_WAITING;
         MutexLockFuture {
             lock: self,
             node,
-            queued: false,
+            phase: Phase::Initial,
             _pin: PhantomPinned,
         }
     }
@@ -132,26 +139,38 @@ impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
 
 impl<T: ?Sized> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
-        self.lock.waiters.with_lock(|w| {
+        let detached = self.lock.waiters.with_lock(|w| {
             if let Some(mut node) = w.pop_front() {
-                // 1. 持锁者在释放且队列非空时，直接向队头节点授予锁（STATE_GRANTED），并将状态维持为锁定，外部不能插队。
-                // SAFETY: We do not move the node out of Pin.
+                // SAFETY: The node remains pinned while it is detached.
                 unsafe {
-                    node.as_mut().get_unchecked_mut().kind = STATE_GRANTED;
+                    node.as_mut().get_unchecked_mut().state = STATE_GRANTED;
                 }
-                node.as_ref().waker.wake();
+                Some(DetachedWaiter {
+                    waker: node.as_ref().waker.take(),
+                })
             } else {
                 self.lock.state.store(UNLOCKED, Ordering::Release);
+                None
             }
         });
+        if let Some(detached) = detached {
+            detached.wake();
+        }
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    Initial,
+    Waiting,
+    Completed,
+}
+
 /// A future that resolves to a `MutexGuard`.
-pub struct MutexLockFuture<'a, T: ?Sized> {
+pub(crate) struct MutexLockFuture<'a, T: ?Sized> {
     lock: &'a Mutex<T>,
     node: WaiterNode,
-    queued: bool,
+    phase: Phase,
     _pin: PhantomPinned,
 }
 
@@ -162,22 +181,17 @@ impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
         // SAFETY: We do not move `node`.
         let this = unsafe { self.get_unchecked_mut() };
 
-        // 2. 被唤醒者无需重新参与非公平抢锁，直接接收锁所有权，从源头杜绝唤醒丢失。
-        if this.queued {
-            let is_granted = this
-                .lock
-                .waiters
-                .with_lock_ref(|_| this.node.kind == STATE_GRANTED);
-            if is_granted {
-                this.queued = false;
-                return Poll::Ready(MutexGuard { lock: this.lock });
+        if this.phase == Phase::Completed {
+            panic!("polled MutexLockFuture after completion");
+        }
+
+        if this.phase == Phase::Waiting {
+            if this.lock.waiters.refresh_waker(&mut this.node, cx).linked() {
+                return Poll::Pending;
             }
 
-            // Still waiting in queue, refresh waker.
-            unsafe {
-                this.node.waker.register(cx.waker());
-            }
-            return Poll::Pending;
+            this.phase = Phase::Completed;
+            return Poll::Ready(MutexGuard { lock: this.lock });
         }
 
         #[cfg(not(feature = "loom"))]
@@ -192,6 +206,7 @@ impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
                 .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
+                this.phase = Phase::Completed;
                 return Poll::Ready(MutexGuard { lock: this.lock });
             }
 
@@ -205,11 +220,11 @@ impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
                 }
             }
 
+            let mut acquired = false;
+            let mut stale_waker = None;
             unsafe {
                 this.node.waker.register(cx.waker());
             }
-
-            let mut acquired = false;
             this.lock.waiters.with_lock(|w| {
                 // Double check: if it became unlocked while acquiring waiters lock
                 let is_empty = w.is_empty();
@@ -224,15 +239,20 @@ impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
                     return;
                 }
 
-                this.node.kind = STATE_WAITING;
+                this.node.state = STATE_WAITING;
                 unsafe {
                     let node_pin = Pin::new_unchecked(&mut this.node);
                     w.push_back(node_pin);
                 }
-                this.queued = true;
+                this.phase = Phase::Waiting;
             });
+            if acquired {
+                stale_waker = this.node.waker.take();
+            }
+            drop(stale_waker);
 
             if acquired {
+                this.phase = Phase::Completed;
                 return Poll::Ready(MutexGuard { lock: this.lock });
             }
             return Poll::Pending;
@@ -242,31 +262,38 @@ impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
 
 impl<'a, T: ?Sized> Drop for MutexLockFuture<'a, T> {
     fn drop(&mut self) {
-        if self.queued {
-            self.lock.waiters.with_lock(|w| {
-                if self.node.kind == STATE_GRANTED {
-                    // 3. 若等待者在持有 STATE_GRANTED 时被取消（Drop），安全地将所有权级联顺延给下一等待者或重置为 UNLOCKED。
-                    if let Some(mut next_node) = w.pop_front() {
-                        // SAFETY: We do not move the node out of Pin.
-                        unsafe {
-                            next_node.as_mut().get_unchecked_mut().kind = STATE_GRANTED;
-                        }
-                        next_node.as_ref().waker.wake();
-                    } else {
-                        self.lock.state.store(UNLOCKED, Ordering::Release);
+        if self.phase != Phase::Waiting {
+            return;
+        }
+
+        let detached = self.lock.waiters.with_lock(|w| {
+            if self.node.state == STATE_GRANTED {
+                if let Some(mut next_node) = w.pop_front() {
+                    // SAFETY: The node remains pinned while it is detached.
+                    unsafe {
+                        next_node.as_mut().get_unchecked_mut().state = STATE_GRANTED;
                     }
+                    Some(DetachedWaiter {
+                        waker: next_node.as_ref().waker.take(),
+                    })
                 } else {
-                    let is_linked = self.node.link.is_linked();
-                    if is_linked {
-                        unsafe {
-                            let ptr = NonNull::from(&self.node);
-                            let mut cursor = w.cursor_mut_from_ptr(ptr);
-                            cursor.remove();
-                        }
-                    }
+                    self.lock.state.store(UNLOCKED, Ordering::Release);
+                    None
                 }
-            });
-            self.queued = false;
+            } else if self.node.link.is_linked() {
+                // SAFETY: The node is pinned in this future and linked in this list.
+                unsafe {
+                    let ptr = NonNull::from(&self.node);
+                    let mut cursor = w.cursor_mut_from_ptr(ptr);
+                    cursor.remove();
+                }
+                None
+            } else {
+                None
+            }
+        });
+        if let Some(detached) = detached {
+            detached.wake();
         }
     }
 }

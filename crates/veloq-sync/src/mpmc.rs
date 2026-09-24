@@ -99,7 +99,7 @@ pub async fn with_borrowed_unbounded<T: Send, F, R>(f: F) -> R
 where
     F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
 {
-    let state = State::new(0);
+    let state = Inner::new(0);
     let (tx, rx) = state.split();
     f(tx, rx).await
 }
@@ -110,19 +110,18 @@ where
     F: for<'a> AsyncFnOnce(BorrowedBoundedSender<'a, T>, BorrowedBoundedReceiver<'a, T>) -> R,
 {
     assert!(capacity > 0);
-    let state = State::new(capacity);
+    let state = Inner::new(capacity);
     let (tx, rx) = state.split();
     f(tx, rx).await
 }
 
-// --- State ---
+// --- Inner ---
 
-pub struct State<T, F: ChannelFlavor, Q: Queue<T>> {
+struct Inner<T, F: ChannelFlavor, Q: Queue<T>> {
     pub(crate) queue: Q,
 
-    // 接收等待队列 (通用)
-    pub(crate) recv_waiters: SpinLock<ConcurrentLinkedList<ConcurrentWaiterAdapter>>,
-    pub(crate) recv_waiter_count: AtomicUsize,
+    // 接收协调锁同时保护队列检查、等待节点注册和节点摘除。
+    pub(crate) recv_coord: SpinLock<ConcurrentLinkedList<ConcurrentWaiterAdapter>>,
 
     pub(crate) is_closed: AtomicBool,
     pub(crate) sender_count: AtomicUsize,
@@ -132,15 +131,14 @@ pub struct State<T, F: ChannelFlavor, Q: Queue<T>> {
     _marker: veloq_std::marker::PhantomData<T>,
 }
 
-unsafe impl<T: Send, F: ChannelFlavor, Q: Queue<T>> Send for State<T, F, Q> {}
-unsafe impl<T: Send, F: ChannelFlavor, Q: Queue<T>> Sync for State<T, F, Q> {}
+unsafe impl<T: Send, F: ChannelFlavor, Q: Queue<T>> Send for Inner<T, F, Q> {}
+unsafe impl<T: Send, F: ChannelFlavor, Q: Queue<T>> Sync for Inner<T, F, Q> {}
 
-impl<T, F: ChannelFlavor, Q: Queue<T>> State<T, F, Q> {
-    pub fn new(capacity: usize) -> Self {
+impl<T, F: ChannelFlavor, Q: Queue<T>> Inner<T, F, Q> {
+    fn new(capacity: usize) -> Self {
         Self {
             queue: Q::new(capacity),
-            recv_waiters: SpinLock::new(ConcurrentLinkedList::new(ConcurrentWaiterAdapter::NEW)),
-            recv_waiter_count: AtomicUsize::new(0),
+            recv_coord: SpinLock::new(ConcurrentLinkedList::new(ConcurrentWaiterAdapter::NEW)),
             is_closed: AtomicBool::new(false),
             sender_count: AtomicUsize::new(1),
             receiver_count: AtomicUsize::new(1),
@@ -149,7 +147,7 @@ impl<T, F: ChannelFlavor, Q: Queue<T>> State<T, F, Q> {
         }
     }
 
-    pub fn split(
+    fn split(
         &self,
     ) -> (
         GenericBorrowedSender<'_, T, F, Q>,
@@ -165,33 +163,56 @@ impl<T, F: ChannelFlavor, Q: Queue<T>> State<T, F, Q> {
     }
 
     fn close(&self) {
-        if !self.is_closed.swap(true, Ordering::SeqCst) {
-            // Wake all receivers
-            let mut lock = self.recv_waiters.lock();
-            lock.with_mut(|l| {
-                while let Some(node) = l.pop_front() {
-                    node.as_ref().waker.wake();
-                }
-            });
+        if self.close_receivers() {
+            self.wake_all_receivers();
         }
     }
 
     fn close_recv(&self) {
-        if !self.is_closed.swap(true, Ordering::SeqCst) {
-            // Wake all senders
+        if self.close_receivers() {
+            self.wake_all_receivers();
+            // Wake all senders after closing under the receive coordination lock.
             self.flavor.notify_all_senders();
         }
     }
 
     fn notify_recv_one(&self) {
-        if self.recv_waiter_count.load(Ordering::Relaxed) > 0 {
-            let mut lock = self.recv_waiters.lock();
-            lock.with_mut(|l| {
-                if let Some(node) = l.pop_front() {
-                    self.recv_waiter_count.fetch_sub(1, Ordering::Relaxed);
-                    node.as_ref().waker.wake();
+        let waker = {
+            let mut lock = self.recv_coord.lock();
+            lock.with_mut(|waiters| {
+                let node = unsafe { waiters.pop_front_ptr() }?;
+                unsafe { node.as_ref().waker.take() }
+            })
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn close_receivers(&self) -> bool {
+        let mut lock = self.recv_coord.lock();
+        lock.with_mut(|_| !self.is_closed.swap(true, Ordering::SeqCst))
+    }
+
+    fn wake_all_receivers(&self) {
+        loop {
+            let waker = {
+                let mut lock = self.recv_coord.lock();
+                lock.with_mut(|waiters| {
+                    let node = unsafe { waiters.pop_front_ptr() }?;
+                    unsafe { node.as_ref().waker.take() }
+                })
+            };
+            let Some(waker) = waker else {
+                let lock = self.recv_coord.lock();
+                let empty = lock.with(|waiters| waiters.is_empty());
+                drop(lock);
+                if empty {
+                    return;
                 }
-            });
+                continue;
+            };
+            waker.wake();
         }
     }
 }
@@ -199,7 +220,7 @@ impl<T, F: ChannelFlavor, Q: Queue<T>> State<T, F, Q> {
 // --- Borrowed Structs ---
 
 pub struct GenericBorrowedSender<'a, T, F: ChannelFlavor, Q: Queue<T>> {
-    state: &'a State<T, F, Q>,
+    state: &'a Inner<T, F, Q>,
 }
 
 impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Clone for GenericBorrowedSender<'a, T, F, Q> {
@@ -218,7 +239,7 @@ impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Drop for GenericBorrowedSender<'a, T,
 }
 
 pub struct GenericBorrowedReceiver<'a, T, F: ChannelFlavor, Q: Queue<T>> {
-    state: &'a State<T, F, Q>,
+    state: &'a Inner<T, F, Q>,
 }
 
 impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Clone for GenericBorrowedReceiver<'a, T, F, Q> {
@@ -282,19 +303,7 @@ impl<'a, T: Send, F: ChannelFlavor, Q: Queue<T>> GenericBorrowedSender<'a, T, F,
 
 impl<'a, T, F: ChannelFlavor, Q: Queue<T>> GenericBorrowedReceiver<'a, T, F, Q> {
     pub fn try_recv(&self) -> Result<T, TryRecvError> {
-        if let Some(msg) = self.state.queue.pop() {
-            self.state.flavor.release();
-            Ok(msg)
-        } else if self.state.is_closed.load(Ordering::Relaxed) {
-            if let Some(msg) = self.state.queue.pop() {
-                self.state.flavor.release();
-                Ok(msg)
-            } else {
-                Err(TryRecvError::Disconnected)
-            }
-        } else {
-            Err(TryRecvError::Empty)
-        }
+        try_recv(self.state)
     }
 
     pub async fn recv(&self) -> Result<T, TryRecvError> {
@@ -305,7 +314,6 @@ impl<'a, T, F: ChannelFlavor, Q: Queue<T>> GenericBorrowedReceiver<'a, T, F, Q> 
         RecvFuture {
             receiver: self,
             node: ConcurrentWaiterNode::new(),
-            queued: false,
         }
         .await
     }
@@ -314,7 +322,6 @@ impl<'a, T, F: ChannelFlavor, Q: Queue<T>> GenericBorrowedReceiver<'a, T, F, Q> 
         BorrowedReceiverStream {
             receiver: self,
             node: ConcurrentWaiterNode::new(),
-            queued: false,
         }
     }
 }
@@ -324,7 +331,6 @@ impl<'a, T, F: ChannelFlavor, Q: Queue<T>> GenericBorrowedReceiver<'a, T, F, Q> 
 struct RecvFuture<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> {
     receiver: &'b GenericBorrowedReceiver<'a, T, F, Q>,
     node: ConcurrentWaiterNode,
-    queued: bool,
 }
 
 impl<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> Future for RecvFuture<'a, 'b, T, F, Q> {
@@ -332,89 +338,112 @@ impl<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> Future for RecvFuture<'a, 'b, T, 
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
-        let state = this.receiver.state;
-
-        loop {
-            if let Some(msg) = state.queue.pop() {
-                if this.queued {
-                    let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
-                    remove_recv_waiter(state, node_pin);
-                    this.queued = false;
-                }
-                state.flavor.release();
-                return Poll::Ready(Ok(msg));
-            }
-
-            if state.is_closed.load(Ordering::Relaxed) {
-                if let Some(msg) = state.queue.pop() {
-                    if this.queued {
-                        let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
-                        remove_recv_waiter(state, node_pin);
-                        this.queued = false;
-                    }
-                    state.flavor.release();
-                    return Poll::Ready(Ok(msg));
-                }
-
-                if this.queued {
-                    let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
-                    remove_recv_waiter(state, node_pin);
-                }
-                return Poll::Ready(Err(TryRecvError::Disconnected));
-            }
-
-            unsafe {
-                this.node.waker.register(cx.waker());
-            }
-
-            if !this.queued || !this.node.link.is_linked() {
-                let mut lock = state.recv_waiters.lock();
-                if !lock.with(|_| this.node.link.is_linked()) {
-                    unsafe {
-                        let node_pin = Pin::new_unchecked(&mut this.node);
-                        lock.with_mut(|l| l.push_back(node_pin));
-                    }
-                    state.recv_waiter_count.fetch_add(1, Ordering::Relaxed);
-                }
-                this.queued = true;
-            } else {
-                return Poll::Pending;
-            }
-        }
+        poll_recv(
+            this.receiver.state,
+            unsafe { Pin::new_unchecked(&mut this.node) },
+            cx,
+        )
     }
 }
 
 impl<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> Drop for RecvFuture<'a, 'b, T, F, Q> {
     fn drop(&mut self) {
-        if self.queued {
-            let node_pin = unsafe { Pin::new_unchecked(&mut self.node) };
-            remove_recv_waiter(self.receiver.state, node_pin);
+        remove_recv_waiter(self.receiver.state, &self.node);
+    }
+}
+
+fn try_recv<T, F: ChannelFlavor, Q: Queue<T>>(state: &Inner<T, F, Q>) -> Result<T, TryRecvError> {
+    let result = {
+        let mut lock = state.recv_coord.lock();
+        lock.with_mut(|_| {
+            if let Some(msg) = state.queue.pop() {
+                Ok(msg)
+            } else if state.is_closed.load(Ordering::Acquire) {
+                Err(TryRecvError::Disconnected)
+            } else {
+                Err(TryRecvError::Empty)
+            }
+        })
+    };
+    if result.is_ok() {
+        state.flavor.release();
+    }
+    result
+}
+
+fn poll_recv<T, F: ChannelFlavor, Q: Queue<T>>(
+    state: &Inner<T, F, Q>,
+    node: Pin<&mut ConcurrentWaiterNode>,
+    cx: &mut Context<'_>,
+) -> Poll<Result<T, TryRecvError>> {
+    let mut pending_waker = None;
+    unsafe {
+        node.as_ref().get_ref().waker.register(cx.waker());
+    }
+    let result = {
+        let mut lock = state.recv_coord.lock();
+        lock.with_mut(|waiters| {
+            let node_ref = node.as_ref().get_ref();
+            if let Some(msg) = state.queue.pop() {
+                unlink_waiter_locked(waiters, node_ref);
+                pending_waker = node_ref.waker.take();
+                return Poll::Ready(Ok(msg));
+            }
+
+            if state.is_closed.load(Ordering::Acquire) {
+                unlink_waiter_locked(waiters, node_ref);
+                pending_waker = node_ref.waker.take();
+                return Poll::Ready(Err(TryRecvError::Disconnected));
+            }
+
+            if !node_ref.link.is_linked() {
+                unsafe {
+                    waiters.push_back_ptr(NonNull::from(node_ref));
+                }
+            }
+            Poll::Pending
+        })
+    };
+    drop(pending_waker);
+    if matches!(&result, Poll::Ready(Ok(_))) {
+        state.flavor.release();
+    }
+    result
+}
+
+fn unlink_waiter_locked(
+    waiters: &mut ConcurrentLinkedList<ConcurrentWaiterAdapter>,
+    node: &ConcurrentWaiterNode,
+) {
+    if node.link.is_linked() {
+        unsafe {
+            let ptr = NonNull::from(node);
+            let mut cursor = waiters.cursor_mut_from_ptr(ptr);
+            cursor.remove();
         }
     }
 }
 
 fn remove_recv_waiter<T, F: ChannelFlavor, Q: Queue<T>>(
-    state: &State<T, F, Q>,
-    node: Pin<&mut ConcurrentWaiterNode>,
+    state: &Inner<T, F, Q>,
+    node: &ConcurrentWaiterNode,
 ) {
-    let mut lock = state.recv_waiters.lock();
-    let is_linked = lock.with(|_| node.link.is_linked());
-    if is_linked {
-        unsafe {
-            let ptr = NonNull::from(&*node);
-            lock.with_mut(|l| {
-                let mut cursor = l.cursor_mut_from_ptr(ptr);
-                cursor.remove();
-            });
-            state.recv_waiter_count.fetch_sub(1, Ordering::Relaxed);
-        }
+    let mut pending_waker = None;
+    {
+        let mut lock = state.recv_coord.lock();
+        lock.with_mut(|waiters| {
+            if node.link.is_linked() {
+                unlink_waiter_locked(waiters, node);
+                pending_waker = node.waker.take();
+            }
+        });
     }
+    drop(pending_waker);
 }
 
 pub struct BorrowedReceiverStream<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> {
     receiver: &'b GenericBorrowedReceiver<'a, T, F, Q>,
     node: ConcurrentWaiterNode,
-    queued: bool,
 }
 
 impl<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> Stream for BorrowedReceiverStream<'a, 'b, T, F, Q> {
@@ -422,77 +451,29 @@ impl<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> Stream for BorrowedReceiverStream
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = unsafe { self.get_unchecked_mut() };
-        let state = this.receiver.state;
-
-        loop {
-            if let Some(msg) = state.queue.pop() {
-                if this.queued {
-                    let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
-                    remove_recv_waiter(state, node_pin);
-                    this.queued = false;
-                }
-                state.flavor.release();
-                return Poll::Ready(Some(msg));
-            }
-
-            if state.is_closed.load(Ordering::Relaxed) {
-                if let Some(msg) = state.queue.pop() {
-                    if this.queued {
-                        let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
-                        remove_recv_waiter(state, node_pin);
-                        this.queued = false;
-                    }
-                    state.flavor.release();
-                    return Poll::Ready(Some(msg));
-                }
-
-                if this.queued {
-                    let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
-                    remove_recv_waiter(state, node_pin);
-                }
-                return Poll::Ready(None);
-            }
-
-            unsafe {
-                this.node.waker.register(cx.waker());
-            }
-
-            let is_linked = this.node.link.is_linked();
-            if !this.queued || !is_linked {
-                let mut lock = state.recv_waiters.lock();
-                let is_linked_under_lock = lock.with(|_| this.node.link.is_linked());
-                if !is_linked_under_lock {
-                    unsafe {
-                        let node_pin = Pin::new_unchecked(&mut this.node);
-                        lock.with_mut(|l| l.push_back(node_pin));
-                    }
-                    state.recv_waiter_count.fetch_add(1, Ordering::Relaxed);
-                }
-                this.queued = true;
-            } else {
-                return Poll::Pending;
-            }
-        }
+        poll_recv(
+            this.receiver.state,
+            unsafe { Pin::new_unchecked(&mut this.node) },
+            cx,
+        )
+        .map(|result| result.ok())
     }
 }
 
 impl<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> Drop for BorrowedReceiverStream<'a, 'b, T, F, Q> {
     fn drop(&mut self) {
-        if self.queued {
-            let node_pin = unsafe { Pin::new_unchecked(&mut self.node) };
-            remove_recv_waiter(self.receiver.state, node_pin);
-        }
+        remove_recv_waiter(self.receiver.state, &self.node);
     }
 }
 
 // --- Owned Structs ---
 
 pub struct GenericSender<T, F: ChannelFlavor, Q: Queue<T>> {
-    state: Arc<State<T, F, Q>>,
+    state: Arc<Inner<T, F, Q>>,
 }
 
 pub struct GenericReceiver<T, F: ChannelFlavor, Q: Queue<T>> {
-    state: Arc<State<T, F, Q>>,
+    state: Arc<Inner<T, F, Q>>,
 }
 
 impl<T, F: ChannelFlavor, Q: Queue<T>> Clone for GenericSender<T, F, Q> {
@@ -559,15 +540,13 @@ impl<T, F: ChannelFlavor, Q: Queue<T>> GenericReceiver<T, F, Q> {
         ReceiverStream {
             state: &self.state,
             node: ConcurrentWaiterNode::new(),
-            queued: false,
         }
     }
 }
 
 pub struct ReceiverStream<'a, T, F: ChannelFlavor, Q: Queue<T>> {
-    state: &'a State<T, F, Q>,
+    state: &'a Inner<T, F, Q>,
     node: ConcurrentWaiterNode,
-    queued: bool,
 }
 
 impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Stream for ReceiverStream<'a, T, F, Q> {
@@ -575,70 +554,23 @@ impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Stream for ReceiverStream<'a, T, F, Q
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = unsafe { self.get_unchecked_mut() };
-
-        loop {
-            if let Some(msg) = this.state.queue.pop() {
-                if this.queued {
-                    let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
-                    remove_recv_waiter(this.state, node_pin);
-                    this.queued = false;
-                }
-                this.state.flavor.release();
-                return Poll::Ready(Some(msg));
-            }
-
-            if this.state.is_closed.load(Ordering::Relaxed) {
-                if let Some(msg) = this.state.queue.pop() {
-                    if this.queued {
-                        let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
-                        remove_recv_waiter(this.state, node_pin);
-                        this.queued = false;
-                    }
-                    this.state.flavor.release();
-                    return Poll::Ready(Some(msg));
-                }
-
-                if this.queued {
-                    let node_pin = unsafe { Pin::new_unchecked(&mut this.node) };
-                    remove_recv_waiter(this.state, node_pin);
-                }
-                return Poll::Ready(None);
-            }
-
-            unsafe {
-                this.node.waker.register(cx.waker());
-            }
-
-            let is_linked = this.node.link.is_linked();
-            if !this.queued || !is_linked {
-                let mut lock = this.state.recv_waiters.lock();
-                let is_linked_under_lock = lock.with(|_| this.node.link.is_linked());
-                if !is_linked_under_lock {
-                    unsafe {
-                        let node_pin = Pin::new_unchecked(&mut this.node);
-                        lock.with_mut(|l| l.push_back(node_pin));
-                    }
-                    this.state.recv_waiter_count.fetch_add(1, Ordering::Relaxed);
-                }
-                this.queued = true;
-            } else {
-                return Poll::Pending;
-            }
-        }
+        poll_recv(
+            this.state,
+            unsafe { Pin::new_unchecked(&mut this.node) },
+            cx,
+        )
+        .map(|result| result.ok())
     }
 }
 
 impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Drop for ReceiverStream<'a, T, F, Q> {
     fn drop(&mut self) {
-        if self.queued {
-            let node_pin = unsafe { Pin::new_unchecked(&mut self.node) };
-            remove_recv_waiter(self.state, node_pin);
-        }
+        remove_recv_waiter(self.state, &self.node);
     }
 }
 
 pub fn unbounded<T: Send>() -> (Sender<T>, Receiver<T>) {
-    let state = Arc::new(State::new(0));
+    let state = Arc::new(Inner::new(0));
     (
         GenericSender {
             state: state.clone(),
@@ -649,7 +581,7 @@ pub fn unbounded<T: Send>() -> (Sender<T>, Receiver<T>) {
 
 pub fn bounded<T: Send>(capacity: usize) -> (BoundedSender<T>, BoundedReceiver<T>) {
     assert!(capacity > 0);
-    let state = Arc::new(State::new(capacity));
+    let state = Arc::new(Inner::new(capacity));
     (
         GenericSender {
             state: state.clone(),

@@ -1,0 +1,5 @@
+error[E0433]: cannot find `State` in `mpmc`
+ --> tests/ui/mpmc_state_fail.rs:6:23
+  |
+6 |     let state = mpmc::State::<i32>::unbounded();
+  |                       ^^^^^ could not find `State` in `mpmc`

@@ -13,7 +13,6 @@ use veloq_std::{
 
 const NOT_NOTIFIED: usize = 0;
 const NOTIFIED_ONE: usize = 1;
-const NOTIFIED_ALL: usize = 2;
 
 /// An asynchronous condition variable for local/single-threaded contexts.
 ///
@@ -25,7 +24,15 @@ pub struct Condvar {
 
 impl Condvar {
     /// Creates a new condition variable.
+    #[cfg(not(feature = "loom"))]
     pub const fn new() -> Self {
+        Self {
+            waiters: WaitQueue::new(),
+        }
+    }
+
+    #[cfg(feature = "loom")]
+    pub fn new() -> Self {
         Self {
             waiters: WaitQueue::new(),
         }
@@ -35,18 +42,21 @@ impl Condvar {
     ///
     /// If there are no waiting tasks, this call has no effect.
     pub fn notify_one(&self) {
-        self.waiters.wake_one_with(|node| {
-            node.kind = NOTIFIED_ONE;
+        let detached = self.waiters.take_front_with(|node| {
+            node.state = NOTIFIED_ONE;
         });
+        if let Some(detached) = detached {
+            detached.wake();
+        }
     }
 
     /// Wakes up all tasks that are waiting on this condition variable.
     ///
     /// If there are no waiting tasks, this call has no effect.
     pub fn notify_all(&self) {
-        self.waiters.wake_all_with(|node| {
-            node.kind = NOTIFIED_ALL;
-        });
+        while let Some(detached) = self.waiters.take_front() {
+            detached.wake();
+        }
     }
 
     /// Waits on this condition variable, releasing the mutex guard and re-acquiring it before returning.
@@ -113,7 +123,7 @@ impl<'c, 'a, T: ?Sized> Future for Wait<'c, 'a, T> {
             let res = unsafe { Pin::new_unchecked(lock_fut) }.poll(cx);
             if let Poll::Ready(new_guard) = res {
                 this.lock_fut = None;
-                this.node.kind = NOT_NOTIFIED;
+                this.node.state = NOT_NOTIFIED;
                 return Poll::Ready(new_guard);
             }
             return Poll::Pending;
@@ -121,7 +131,7 @@ impl<'c, 'a, T: ?Sized> Future for Wait<'c, 'a, T> {
 
         // 2. Initial poll: register waker, enqueue into cvar, and release mutex
         if !this.queued {
-            this.node.kind = NOT_NOTIFIED;
+            this.node.state = NOT_NOTIFIED;
             unsafe {
                 let node_pin = Pin::new_unchecked(&mut this.node);
                 this.cvar.waiters.register_and_push(node_pin, cx);
@@ -135,16 +145,21 @@ impl<'c, 'a, T: ?Sized> Future for Wait<'c, 'a, T> {
         }
 
         // 3. We are queued in cvar. Check if we were dequeued (notified).
-        if !this.cvar.waiters.update_waker_if_linked(&mut this.node, cx) {
+        if this
+            .cvar
+            .waiters
+            .refresh_waker(&mut this.node, cx)
+            .detached()
+        {
             this.queued = false;
 
             // Start re-acquiring the mutex lock. Place in this.lock_fut before polling
             // to ensure its pinned address never moves.
-            let lock_fut = this.lock_fut.insert(this.lock.lock());
+            let lock_fut = this.lock_fut.insert(this.lock.lock_future());
             let res = unsafe { Pin::new_unchecked(lock_fut) }.poll(cx);
             if let Poll::Ready(new_guard) = res {
                 this.lock_fut = None;
-                this.node.kind = NOT_NOTIFIED;
+                this.node.state = NOT_NOTIFIED;
                 return Poll::Ready(new_guard);
             }
             Poll::Pending
@@ -162,18 +177,24 @@ impl<'c, 'a, T: ?Sized> Drop for Wait<'c, 'a, T> {
         }
 
         if self.queued {
-            if !self.cvar.waiters.remove(&self.node) && self.node.kind == NOTIFIED_ONE {
-                self.node.kind = NOT_NOTIFIED;
-                self.cvar.waiters.wake_one_with(|next| {
-                    next.kind = NOTIFIED_ONE;
+            if !self.cvar.waiters.remove(&self.node) && self.node.state == NOTIFIED_ONE {
+                self.node.state = NOT_NOTIFIED;
+                let detached = self.cvar.waiters.take_front_with(|next| {
+                    next.state = NOTIFIED_ONE;
                 });
+                if let Some(detached) = detached {
+                    detached.wake();
+                }
             }
             self.queued = false;
-        } else if self.node.kind == NOTIFIED_ONE {
-            self.node.kind = NOT_NOTIFIED;
-            self.cvar.waiters.wake_one_with(|next| {
-                next.kind = NOTIFIED_ONE;
+        } else if self.node.state == NOTIFIED_ONE {
+            self.node.state = NOT_NOTIFIED;
+            let detached = self.cvar.waiters.take_front_with(|next| {
+                next.state = NOTIFIED_ONE;
             });
+            if let Some(detached) = detached {
+                detached.wake();
+            }
         }
     }
 }

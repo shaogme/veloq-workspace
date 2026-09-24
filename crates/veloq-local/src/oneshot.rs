@@ -28,42 +28,43 @@ impl fmt::Display for RecvError {
 
 impl Error for RecvError {}
 
-pub struct State<T> {
+struct Inner<T> {
     value: UnsafeCell<Option<T>>,
     waker: UnsafeCell<Option<Waker>>,
     is_tx_closed: Cell<bool>,
     is_rx_closed: Cell<bool>,
+    send_claimed: Cell<bool>,
 }
 
 /// Oneshot 通道发送端
 pub struct BorrowedSender<'a, T> {
-    state: &'a State<T>,
+    state: &'a Inner<T>,
 }
 
 /// Oneshot 通道接收端
 pub struct BorrowedReceiver<'a, T> {
-    state: &'a State<T>,
+    state: &'a Inner<T>,
 }
 
-impl<T> Default for State<T> {
+impl<T> Default for Inner<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T> State<T> {
+impl<T> Inner<T> {
     /// 创建一个新的 oneshot 通道状态
     pub const fn new() -> Self {
-        State {
+        Inner {
             value: UnsafeCell::new(None),
             waker: UnsafeCell::new(None),
             is_tx_closed: Cell::new(false),
             is_rx_closed: Cell::new(false),
+            send_claimed: Cell::new(false),
         }
     }
 
-    /// 分离为发送端和接收端
-    pub fn split(&self) -> (BorrowedSender<'_, T>, BorrowedReceiver<'_, T>) {
+    fn borrowed_parts(&self) -> (BorrowedSender<'_, T>, BorrowedReceiver<'_, T>) {
         (
             BorrowedSender { state: self },
             BorrowedReceiver { state: self },
@@ -76,8 +77,8 @@ pub async fn with_borrowed_channel<T, F, R>(f: F) -> R
 where
     F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
 {
-    let state = State::new();
-    let (tx, rx) = state.split();
+    let state = Inner::new();
+    let (tx, rx) = state.borrowed_parts();
     f(tx, rx).await
 }
 
@@ -88,7 +89,10 @@ impl<'a, T> BorrowedSender<'a, T> {
     pub fn send(self, t: T) -> Result<(), T> {
         let waker;
         {
-            if self.state.is_rx_closed.get() {
+            if self.state.is_rx_closed.get()
+                || self.state.is_tx_closed.get()
+                || self.state.send_claimed.replace(true)
+            {
                 return Err(t);
             }
             let value = unsafe { &mut *self.state.value.get() };
@@ -194,17 +198,17 @@ impl<'a, T> fmt::Debug for BorrowedReceiver<'a, T> {
 
 /// Oneshot channel sender.
 pub struct Sender<T> {
-    state: ManuallyDrop<Rc<State<T>>>,
+    state: ManuallyDrop<Rc<Inner<T>>>,
 }
 
 /// Oneshot channel receiver.
 pub struct Receiver<T> {
-    state: Rc<State<T>>,
+    state: Rc<Inner<T>>,
 }
 
 /// Creates a new oneshot channel.
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
-    let state = Rc::new(State::new());
+    let state = Rc::new(Inner::new());
     (
         Sender {
             state: ManuallyDrop::new(state.clone()),
@@ -276,5 +280,21 @@ impl<T> Drop for Receiver<T> {
 impl<T> fmt::Debug for Receiver<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Receiver").finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Inner;
+
+    #[test]
+    fn duplicate_senders_cannot_write_twice() {
+        let state = Inner::<usize>::new();
+        let (tx1, rx1) = state.borrowed_parts();
+        let (tx2, _rx2) = state.borrowed_parts();
+
+        assert_eq!(tx1.send(1), Ok(()));
+        assert_eq!(tx2.send(2), Err(2));
+        assert_eq!(rx1.try_recv(), Ok(1));
     }
 }

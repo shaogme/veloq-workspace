@@ -9,7 +9,7 @@ pub mod generic;
 
 use core::fmt;
 
-use crate::io::{Error, IoSlice, IoSliceMut, Read, Result, Write};
+use crate::io::{IoSlice, IoSliceMut, Read, Result, Write};
 use crate::sync::{NativeReentrantMutex, NativeReentrantMutexGuard};
 
 #[cfg(unix)]
@@ -43,6 +43,7 @@ pub struct Stdin {
 }
 
 /// A locked reference to the [`Stdin`] handle.
+#[must_use = "if unused stdin will immediately unlock"]
 pub struct StdinLock<'a> {
     _guard: NativeReentrantMutexGuard<'a, ()>,
 }
@@ -65,37 +66,36 @@ impl Stdin {
 }
 
 impl Read for Stdin {
+    #[inline]
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        let _guard = stdin_mutex().lock();
-        sys::read_stdin(buf)
+        self.lock().read(buf)
     }
 
+    #[inline]
     fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> Result<usize> {
-        let _guard = stdin_mutex().lock();
-        let Some(buf) = bufs.iter_mut().find(|b| !b.is_empty()) else {
-            return Ok(0);
-        };
-        sys::read_stdin(buf)
+        self.lock().read_vectored(bufs)
     }
 
-    fn read_exact(&mut self, mut buf: &mut [u8]) -> Result<()> {
-        let _guard = stdin_mutex().lock();
-        while !buf.is_empty() {
-            match sys::read_stdin(buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let (_, rest) = buf.split_at_mut(n);
-                    buf = rest;
-                }
-                Err(ref e) if e.is_interrupted() => continue,
-                Err(e) => return Err(e),
-            }
-        }
-        if !buf.is_empty() {
-            Err(Error::READ_EXACT_EOF)
-        } else {
-            Ok(())
-        }
+    #[inline]
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
+        self.lock().read_exact(buf)
+    }
+}
+
+impl Read for &Stdin {
+    #[inline]
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        (*self).lock().read(buf)
+    }
+
+    #[inline]
+    fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> Result<usize> {
+        (*self).lock().read_vectored(bufs)
+    }
+
+    #[inline]
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
+        (*self).lock().read_exact(buf)
     }
 }
 
@@ -107,29 +107,10 @@ impl Read for StdinLock<'_> {
 
     #[inline]
     fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> Result<usize> {
-        let Some(buf) = bufs.iter_mut().find(|b| !b.is_empty()) else {
+        let Some(buf) = bufs.iter_mut().find(|buf| !buf.is_empty()) else {
             return Ok(0);
         };
         sys::read_stdin(buf)
-    }
-
-    fn read_exact(&mut self, mut buf: &mut [u8]) -> Result<()> {
-        while !buf.is_empty() {
-            match sys::read_stdin(buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let (_, rest) = buf.split_at_mut(n);
-                    buf = rest;
-                }
-                Err(ref e) if e.is_interrupted() => continue,
-                Err(e) => return Err(e),
-            }
-        }
-        if !buf.is_empty() {
-            Err(Error::READ_EXACT_EOF)
-        } else {
-            Ok(())
-        }
     }
 }
 
@@ -152,6 +133,7 @@ pub struct Stdout {
 }
 
 /// A locked reference to the [`Stdout`] handle.
+#[must_use = "if unused stdout will immediately unlock"]
 pub struct StdoutLock<'a> {
     _guard: NativeReentrantMutexGuard<'a, ()>,
 }
@@ -174,39 +156,56 @@ impl Stdout {
 }
 
 impl Write for Stdout {
+    #[inline]
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        let _guard = stdout_mutex().lock();
-        sys::write_stdout(buf)
+        self.lock().write(buf)
     }
 
+    #[inline]
     fn flush(&mut self) -> Result<()> {
-        let _guard = stdout_mutex().lock();
-        sys::flush_stdout()
+        self.lock().flush()
     }
 
+    #[inline]
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> Result<usize> {
-        let _guard = stdout_mutex().lock();
-        let Some(buf) = bufs.iter().find(|b| !b.is_empty()) else {
-            return Ok(0);
-        };
-        sys::write_stdout(buf)
+        self.lock().write_vectored(bufs)
     }
 
-    fn write_all(&mut self, mut buf: &[u8]) -> Result<()> {
-        let _guard = stdout_mutex().lock();
-        while !buf.is_empty() {
-            let n = sys::write_stdout(buf)?;
-            if n == 0 {
-                return Err(Error::WRITE_ZERO);
-            }
-            buf = &buf[n..];
-        }
-        Ok(())
+    #[inline]
+    fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+        self.lock().write_all(buf)
     }
 
-    fn write_fmt(&mut self, fmt: fmt::Arguments<'_>) -> Result<()> {
-        let mut lock = self.lock();
-        lock.write_fmt(fmt)
+    #[inline]
+    fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> Result<()> {
+        self.lock().write_fmt(args)
+    }
+}
+
+impl Write for &Stdout {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        (*self).lock().write(buf)
+    }
+
+    #[inline]
+    fn flush(&mut self) -> Result<()> {
+        (*self).lock().flush()
+    }
+
+    #[inline]
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> Result<usize> {
+        (*self).lock().write_vectored(bufs)
+    }
+
+    #[inline]
+    fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+        (*self).lock().write_all(buf)
+    }
+
+    #[inline]
+    fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> Result<()> {
+        (*self).lock().write_fmt(args)
     }
 }
 
@@ -223,21 +222,10 @@ impl Write for StdoutLock<'_> {
 
     #[inline]
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> Result<usize> {
-        let Some(buf) = bufs.iter().find(|b| !b.is_empty()) else {
+        let Some(buf) = bufs.iter().find(|buf| !buf.is_empty()) else {
             return Ok(0);
         };
         sys::write_stdout(buf)
-    }
-
-    fn write_all(&mut self, mut buf: &[u8]) -> Result<()> {
-        while !buf.is_empty() {
-            let n = sys::write_stdout(buf)?;
-            if n == 0 {
-                return Err(Error::WRITE_ZERO);
-            }
-            buf = &buf[n..];
-        }
-        Ok(())
     }
 }
 
@@ -260,6 +248,7 @@ pub struct Stderr {
 }
 
 /// A locked reference to the [`Stderr`] handle.
+#[must_use = "if unused stderr will immediately unlock"]
 pub struct StderrLock<'a> {
     _guard: NativeReentrantMutexGuard<'a, ()>,
 }
@@ -282,39 +271,56 @@ impl Stderr {
 }
 
 impl Write for Stderr {
+    #[inline]
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        let _guard = stderr_mutex().lock();
-        sys::write_stderr(buf)
+        self.lock().write(buf)
     }
 
+    #[inline]
     fn flush(&mut self) -> Result<()> {
-        let _guard = stderr_mutex().lock();
-        sys::flush_stderr()
+        self.lock().flush()
     }
 
+    #[inline]
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> Result<usize> {
-        let _guard = stderr_mutex().lock();
-        let Some(buf) = bufs.iter().find(|b| !b.is_empty()) else {
-            return Ok(0);
-        };
-        sys::write_stderr(buf)
+        self.lock().write_vectored(bufs)
     }
 
-    fn write_all(&mut self, mut buf: &[u8]) -> Result<()> {
-        let _guard = stderr_mutex().lock();
-        while !buf.is_empty() {
-            let n = sys::write_stderr(buf)?;
-            if n == 0 {
-                return Err(Error::WRITE_ZERO);
-            }
-            buf = &buf[n..];
-        }
-        Ok(())
+    #[inline]
+    fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+        self.lock().write_all(buf)
     }
 
-    fn write_fmt(&mut self, fmt: fmt::Arguments<'_>) -> Result<()> {
-        let mut lock = self.lock();
-        lock.write_fmt(fmt)
+    #[inline]
+    fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> Result<()> {
+        self.lock().write_fmt(args)
+    }
+}
+
+impl Write for &Stderr {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        (*self).lock().write(buf)
+    }
+
+    #[inline]
+    fn flush(&mut self) -> Result<()> {
+        (*self).lock().flush()
+    }
+
+    #[inline]
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> Result<usize> {
+        (*self).lock().write_vectored(bufs)
+    }
+
+    #[inline]
+    fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+        (*self).lock().write_all(buf)
+    }
+
+    #[inline]
+    fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> Result<()> {
+        (*self).lock().write_fmt(args)
     }
 }
 
@@ -331,21 +337,10 @@ impl Write for StderrLock<'_> {
 
     #[inline]
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> Result<usize> {
-        let Some(buf) = bufs.iter().find(|b| !b.is_empty()) else {
+        let Some(buf) = bufs.iter().find(|buf| !buf.is_empty()) else {
             return Ok(0);
         };
         sys::write_stderr(buf)
-    }
-
-    fn write_all(&mut self, mut buf: &[u8]) -> Result<()> {
-        while !buf.is_empty() {
-            let n = sys::write_stderr(buf)?;
-            if n == 0 {
-                return Err(Error::WRITE_ZERO);
-            }
-            buf = &buf[n..];
-        }
-        Ok(())
     }
 }
 
@@ -362,13 +357,17 @@ impl fmt::Debug for StderrLock<'_> {
 }
 
 #[doc(hidden)]
+#[inline]
 pub fn _print(args: fmt::Arguments<'_>) {
-    let mut out = stdout().lock();
-    let _ = out.write_fmt(args);
+    if let Err(error) = stdout().write_fmt(args) {
+        panic!("failed printing to stdout: {error}");
+    }
 }
 
 #[doc(hidden)]
+#[inline]
 pub fn _eprint(args: fmt::Arguments<'_>) {
-    let mut err = stderr().lock();
-    let _ = err.write_fmt(args);
+    if let Err(error) = stderr().write_fmt(args) {
+        panic!("failed printing to stderr: {error}");
+    }
 }

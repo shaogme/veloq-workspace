@@ -1,21 +1,21 @@
 #[macro_export]
 macro_rules! vec {
     () => {
-        $crate::alloc_crate::vec![]
+        $crate::__private::vec_from_array([])
     };
     ($elem:expr; $n:expr) => {
-        $crate::alloc_crate::vec![$elem; $n]
+        $crate::__private::vec_repeat($elem, $n)
     };
     ($($x:expr),+ $(,)?) => {
-        $crate::alloc_crate::vec![$($x),+]
+        $crate::__private::vec_from_array([$($x),+])
     };
 }
 
 #[macro_export]
 macro_rules! format {
-    ($($arg:tt)*) => {
-        $crate::alloc_crate::format!($($arg)*)
-    };
+    ($($arg:tt)*) => {{
+        $crate::__private::format($crate::__private::format_args!($($arg)*))
+    }};
 }
 
 /// 创建 NonZero<T> 的宏
@@ -36,40 +36,40 @@ macro_rules! nz {
 
 #[macro_export]
 macro_rules! print {
-    ($($arg:tt)*) => {
-        $crate::io::_print(core::format_args!($($arg)*))
-    };
+    ($($arg:tt)*) => {{
+        $crate::io::_print($crate::__private::format_args!($($arg)*));
+    }};
 }
 
 #[macro_export]
 macro_rules! println {
-    () => {
-        $crate::print!("\n")
-    };
-    ($fmt:expr) => {
-        $crate::print!(core::concat!($fmt, "\n"))
-    };
-    ($fmt:expr, $($arg:tt)*) => {
-        $crate::print!(core::concat!($fmt, "\n"), $($arg)*)
-    };
+    () => {{
+        $crate::print!("\n");
+    }};
+    ($fmt:expr) => {{
+        $crate::print!($crate::__private::concat!($fmt, "\n"));
+    }};
+    ($fmt:expr, $($arg:tt)*) => {{
+        $crate::print!($crate::__private::concat!($fmt, "\n"), $($arg)*);
+    }};
 }
 
 #[macro_export]
 macro_rules! eprint {
-    ($($arg:tt)*) => {
-        $crate::io::_eprint(core::format_args!($($arg)*))
-    };
+    ($($arg:tt)*) => {{
+        $crate::io::_eprint($crate::__private::format_args!($($arg)*));
+    }};
 }
 
 #[macro_export]
 macro_rules! eprintln {
-    () => {
-        $crate::eprint!("\n")
-    };
-    ($fmt:expr) => {
-        $crate::eprint!(core::concat!($fmt, "\n"))
-    };
-    ($fmt:expr, $($arg:tt)*) => {
-        $crate::eprint!(core::concat!($fmt, "\n"), $($arg)*)
-    };
+    () => {{
+        $crate::eprint!("\n");
+    }};
+    ($fmt:expr) => {{
+        $crate::eprint!($crate::__private::concat!($fmt, "\n"));
+    }};
+    ($fmt:expr, $($arg:tt)*) => {{
+        $crate::eprint!($crate::__private::concat!($fmt, "\n"), $($arg)*);
+    }};
 }

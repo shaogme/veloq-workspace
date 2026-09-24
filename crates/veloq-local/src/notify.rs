@@ -10,7 +10,6 @@ use veloq_std::{
 
 const NOT_NOTIFIED: usize = 0;
 const NOTIFIED_ONE: usize = 1;
-const NOTIFIED_ALL: usize = 2;
 const NOTIFIED_CONSUMED: usize = 3;
 
 /// An asynchronous event notification primitive for local/single-threaded contexts.
@@ -24,7 +23,16 @@ pub struct Notify {
 
 impl Notify {
     /// Creates a new `Notify` in the empty state.
+    #[cfg(not(feature = "loom"))]
     pub const fn new() -> Self {
+        Self {
+            has_permit: Cell::new(false),
+            waiters: WaitQueue::new(),
+        }
+    }
+
+    #[cfg(feature = "loom")]
+    pub fn new() -> Self {
         Self {
             has_permit: Cell::new(false),
             waiters: WaitQueue::new(),
@@ -41,10 +49,12 @@ impl Notify {
             return;
         }
 
-        let woken = self.waiters.wake_one_with(|node| {
-            node.kind = NOTIFIED_ONE;
+        let detached = self.waiters.take_front_with(|node| {
+            node.state = NOTIFIED_ONE;
         });
-        if !woken {
+        if let Some(detached) = detached {
+            detached.wake();
+        } else {
             self.has_permit.set(true);
         }
     }
@@ -53,9 +63,9 @@ impl Notify {
     ///
     /// If there are no waiting tasks, no permit is saved.
     pub fn notify_waiters(&self) {
-        self.waiters.wake_all_with(|node| {
-            node.kind = NOTIFIED_ALL;
-        });
+        while let Some(detached) = self.waiters.take_front() {
+            detached.wake();
+        }
     }
 
     /// Returns a future that completes once notified.
@@ -95,17 +105,17 @@ impl<'a> Notified<'a> {
     /// Pre-registers this waiter in the notification queue.
     pub fn enable(self: Pin<&mut Self>) {
         let this = unsafe { self.get_unchecked_mut() };
-        if this.queued || this.node.kind == NOTIFIED_CONSUMED {
+        if this.queued || this.node.state == NOTIFIED_CONSUMED {
             return;
         }
 
         if this.notify.has_permit.get() {
             this.notify.has_permit.set(false);
-            this.node.kind = NOTIFIED_CONSUMED;
+            this.node.state = NOTIFIED_CONSUMED;
             return;
         }
 
-        this.node.kind = NOT_NOTIFIED;
+        this.node.state = NOT_NOTIFIED;
         unsafe {
             let node_pin = Pin::new_unchecked(&mut this.node);
             this.notify.waiters.push_back(node_pin);
@@ -120,18 +130,19 @@ impl<'a> Future for Notified<'a> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if this.node.kind == NOTIFIED_CONSUMED {
+        if this.node.state == NOTIFIED_CONSUMED {
             return Poll::Ready(());
         }
 
         if this.queued {
-            let is_linked = this
+            if this
                 .notify
                 .waiters
-                .update_waker_if_linked(&mut this.node, cx);
-            if !is_linked {
+                .refresh_waker(&mut this.node, cx)
+                .detached()
+            {
                 this.queued = false;
-                this.node.kind = NOTIFIED_CONSUMED;
+                this.node.state = NOTIFIED_CONSUMED;
                 return Poll::Ready(());
             }
             return Poll::Pending;
@@ -139,11 +150,11 @@ impl<'a> Future for Notified<'a> {
 
         if this.notify.has_permit.get() {
             this.notify.has_permit.set(false);
-            this.node.kind = NOTIFIED_CONSUMED;
+            this.node.state = NOTIFIED_CONSUMED;
             return Poll::Ready(());
         }
 
-        this.node.kind = NOT_NOTIFIED;
+        this.node.state = NOT_NOTIFIED;
         unsafe {
             let node_pin = Pin::new_unchecked(&mut this.node);
             this.notify.waiters.register_and_push(node_pin, cx);
@@ -155,16 +166,18 @@ impl<'a> Future for Notified<'a> {
 
 impl<'a> Drop for Notified<'a> {
     fn drop(&mut self) {
-        if self.node.kind == NOTIFIED_CONSUMED {
+        if self.node.state == NOTIFIED_CONSUMED {
             return;
         }
 
-        if self.queued && !self.notify.waiters.remove(&self.node) && self.node.kind == NOTIFIED_ONE
+        if self.queued && !self.notify.waiters.remove(&self.node) && self.node.state == NOTIFIED_ONE
         {
-            let woken = self.notify.waiters.wake_one_with(|next| {
-                next.kind = NOTIFIED_ONE;
+            let detached = self.notify.waiters.take_front_with(|next| {
+                next.state = NOTIFIED_ONE;
             });
-            if !woken {
+            if let Some(detached) = detached {
+                detached.wake();
+            } else {
                 self.notify.has_permit.set(true);
             }
         }

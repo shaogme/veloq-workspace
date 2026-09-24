@@ -35,7 +35,9 @@ fn bench_wake(c: &mut Criterion) {
         let mw = MwsrWaker::new();
         unsafe { mw.register(waker) };
         b.iter(|| {
-            mw.wake();
+            if let Some(waker) = mw.take() {
+                waker.wake();
+            }
         });
     });
 }
@@ -55,7 +57,9 @@ fn bench_register_and_wake(c: &mut Criterion) {
         let mw = MwsrWaker::new();
         b.iter(|| {
             unsafe { mw.register(waker) };
-            mw.wake();
+            if let Some(waker) = mw.take() {
+                waker.wake();
+            }
         });
     });
 }

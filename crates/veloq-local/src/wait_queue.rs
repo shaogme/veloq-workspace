@@ -1,9 +1,41 @@
-use crate::{
-    common::update_waker,
-    waker::{WaiterAdapter, WaiterNode},
-};
+use crate::waker::{WaiterAdapter, WaiterNode};
 use veloq_intrusive_linklist::LinkedList;
-use veloq_std::{cell::RefCell, fmt, pin::Pin, ptr::NonNull, task::Context};
+use veloq_std::{
+    cell::RefCell,
+    fmt,
+    pin::Pin,
+    ptr::NonNull,
+    task::{Context, Waker},
+};
+
+pub(crate) enum RefreshResult {
+    Linked,
+    Detached,
+}
+
+impl RefreshResult {
+    pub(crate) fn linked(self) -> bool {
+        matches!(self, Self::Linked)
+    }
+
+    pub(crate) fn detached(self) -> bool {
+        matches!(self, Self::Detached)
+    }
+}
+
+/// A waiter removed from the queue, with ownership of its registered waker.
+pub(crate) struct DetachedWaiter {
+    pub(crate) waker: Option<Waker>,
+}
+
+impl DetachedWaiter {
+    /// Wakes the detached waiter after the queue borrow has ended.
+    pub(crate) fn wake(self) {
+        if let Some(waker) = self.waker {
+            waker.wake();
+        }
+    }
+}
 
 /// A FIFO wait queue for intrusive [`WaiterNode`] elements in local/single-threaded contexts.
 pub(crate) struct WaitQueue {
@@ -43,14 +75,23 @@ impl WaitQueue {
     /// Checks if the node is linked in the wait queue, and if so, registers the waker from `cx`
     /// while checking linked status to prevent lost wakeups.
     ///
-    /// Returns `true` if the node is still linked (waiting), or `false` if it was already dequeued (notified).
+    /// Returns [`RefreshResult::Linked`] while waiting, or
+    /// [`RefreshResult::Detached`] after another operation dequeued the node.
     #[inline]
-    pub fn update_waker_if_linked(&self, node: &mut WaiterNode, cx: &mut Context<'_>) -> bool {
+    pub fn refresh_waker(&self, node: &mut WaiterNode, cx: &mut Context<'_>) -> RefreshResult {
+        if !node.link.is_linked() {
+            return RefreshResult::Detached;
+        }
+
+        let new_waker = cx.waker().clone();
+        let old_waker = node.waker.replace(new_waker);
+        drop(old_waker);
+
+        let _list = self.inner.borrow_mut();
         if node.link.is_linked() {
-            update_waker(&mut node.waker, cx.waker());
-            true
+            RefreshResult::Linked
         } else {
-            false
+            RefreshResult::Detached
         }
     }
 
@@ -65,10 +106,12 @@ impl WaitQueue {
     /// Registers the waker from `cx` into `node` and pushes it into the queue.
     #[inline]
     pub fn register_and_push(&self, mut node: Pin<&mut WaiterNode>, cx: &mut Context<'_>) {
+        let new_waker = cx.waker().clone();
+        let old_waker = unsafe { node.as_mut().get_unchecked_mut().waker.replace(new_waker) };
+        drop(old_waker);
+        let mut list = self.inner.borrow_mut();
         unsafe {
-            let node_mut = node.as_mut().get_unchecked_mut();
-            update_waker(&mut node_mut.waker, cx.waker());
-            self.inner.borrow_mut().push_back(node);
+            list.push_back(node);
         }
     }
 
@@ -89,66 +132,26 @@ impl WaitQueue {
         }
     }
 
-    /// Pops the front node, invokes `f` to modify it, and then wakes it up.
-    ///
-    /// Returns `true` if a waiter was popped and woken, or `false` if empty.
-    pub fn wake_one_with<F>(&self, f: F) -> bool
+    /// Detaches the first waiting node in the queue, if any.
+    pub fn take_front(&self) -> Option<DetachedWaiter> {
+        let mut list = self.inner.borrow_mut();
+        let mut node = list.pop_front()?;
+        let waker = unsafe { node.as_mut().get_unchecked_mut().waker.take() };
+        Some(DetachedWaiter { waker })
+    }
+
+    /// Detaches the first waiting node after applying a node state transition.
+    pub fn take_front_with<F>(&self, f: F) -> Option<DetachedWaiter>
     where
         F: FnOnce(&mut WaiterNode),
     {
-        let waker = {
-            let mut list = self.inner.borrow_mut();
-            if let Some(mut node) = list.pop_front() {
-                let node_mut = unsafe { node.as_mut().get_unchecked_mut() };
-                f(node_mut);
-                node_mut.waker.take()
-            } else {
-                return false;
-            }
-        };
-        if let Some(waker) = waker {
-            waker.wake();
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Wakes up all waiting nodes currently in the queue.
-    ///
-    /// Returns the number of nodes that were woken.
-    pub fn wake_all(&self) -> usize {
-        let mut count = 0;
         let mut list = self.inner.borrow_mut();
-        while let Some(mut node) = list.pop_front() {
-            let waker = unsafe { node.as_mut().get_unchecked_mut().waker.take() };
-            if let Some(waker) = waker {
-                waker.wake();
-            }
-            count += 1;
-        }
-        count
-    }
-
-    /// Pops each waiting node, invokes `f` on it, and wakes it up.
-    ///
-    /// Returns the number of nodes that were woken.
-    pub fn wake_all_with<F>(&self, mut f: F) -> usize
-    where
-        F: FnMut(&mut WaiterNode),
-    {
-        let mut count = 0;
-        let mut list = self.inner.borrow_mut();
-        while let Some(mut node) = list.pop_front() {
-            let node_mut = unsafe { node.as_mut().get_unchecked_mut() };
-            f(node_mut);
-            let waker = node_mut.waker.take();
-            if let Some(waker) = waker {
-                waker.wake();
-            }
-            count += 1;
-        }
-        count
+        let mut node = list.pop_front()?;
+        let node_mut = unsafe { node.as_mut().get_unchecked_mut() };
+        f(node_mut);
+        Some(DetachedWaiter {
+            waker: node_mut.waker.take(),
+        })
     }
 
     /// Executes a closure with exclusive access to the underlying [`LinkedList`].

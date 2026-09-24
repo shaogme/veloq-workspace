@@ -134,3 +134,68 @@ fn loom_broadcast_two_receivers() {
         h3.join().unwrap();
     });
 }
+
+#[test]
+fn loom_broadcast_send_subscribe_uses_one_snapshot() {
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(3);
+    builder.check(|| {
+        let (tx, mut rx) = broadcast::channel(2);
+        let tx_send = tx.clone();
+        let tx_subscribe = tx.clone();
+
+        let send_handle = thread::spawn(move || tx_send.send(42));
+        let subscribe_handle = thread::spawn(move || tx_subscribe.subscribe());
+
+        let result = send_handle.join().unwrap();
+        let mut late = subscribe_handle.join().unwrap();
+        if result == Ok(1) {
+            assert_eq!(late.try_recv().unwrap_err().to_string(), "channel empty");
+        }
+        if result == Ok(2) {
+            let _ = late.try_recv();
+        }
+        assert!(rx.try_recv().is_ok() || result == Ok(1));
+    });
+}
+
+#[test]
+fn loom_broadcast_send_clone_uses_one_snapshot() {
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(3);
+    builder.check(|| {
+        let (tx, rx) = broadcast::channel(2);
+        let tx_send = tx.clone();
+        let rx_clone = rx.clone();
+
+        let send_handle = thread::spawn(move || tx_send.send(7));
+        let clone_handle = thread::spawn(move || rx_clone);
+
+        let result = send_handle.join().unwrap();
+        let mut cloned = clone_handle.join().unwrap();
+        if result == Ok(1) {
+            assert_eq!(cloned.try_recv().unwrap_err().to_string(), "channel empty");
+        }
+    });
+}
+
+#[test]
+fn loom_broadcast_send_drop_receiver_has_no_phantom_message() {
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(3);
+    builder.check(|| {
+        let (tx, rx) = broadcast::channel::<i32>(2);
+        let tx_send = tx.clone();
+
+        let send_handle = thread::spawn(move || tx_send.send(9));
+        let drop_handle = thread::spawn(move || drop(rx));
+
+        let result = send_handle.join().unwrap();
+        drop_handle.join().unwrap();
+        match result {
+            Ok(1) => assert_eq!(tx.len(), 1),
+            Err(_) => assert_eq!(tx.len(), 0),
+            Ok(count) => panic!("unexpected receiver count: {count}"),
+        }
+    });
+}

@@ -8,6 +8,7 @@ pub struct GenericWaiterNode<L> {
     pub(crate) waker: MwsrWaker,
     pub(crate) link: L,
     pub(crate) kind: usize,
+    pub(crate) state: usize,
     _p: PhantomPinned,
 }
 
@@ -17,6 +18,7 @@ impl<L> GenericWaiterNode<L> {
             waker: MwsrWaker::new(),
             link,
             kind: 0,
+            state: 0,
             _p: PhantomPinned,
         }
     }

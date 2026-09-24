@@ -116,7 +116,9 @@ impl<T> SetOnce<T> {
         }
         self.initialized.set(true);
 
-        self.waiters.wake_all();
+        while let Some(detached) = self.waiters.take_front() {
+            detached.wake();
+        }
 
         Ok(())
     }
@@ -193,10 +195,20 @@ impl<'a, T> Future for Wait<'a, T> {
         }
 
         if this.queued {
-            this.set_once
+            if this
+                .set_once
                 .waiters
-                .update_waker_if_linked(&mut this.node, cx);
-            return Poll::Pending;
+                .refresh_waker(&mut this.node, cx)
+                .linked()
+            {
+                return Poll::Pending;
+            }
+            this.queued = false;
+            return Poll::Ready(unsafe {
+                (*this.set_once.value.with(|p| p as *const Option<T>))
+                    .as_ref()
+                    .unwrap_unchecked()
+            });
         }
 
         unsafe {

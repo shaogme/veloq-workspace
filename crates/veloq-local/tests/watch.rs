@@ -4,7 +4,7 @@ use tokio::{
     task::{LocalSet, spawn_local},
     time::sleep,
 };
-use veloq_local::watch::{self, RecvError, SendError, State};
+use veloq_local::watch::{self, RecvError, SendError};
 
 #[tokio::test]
 async fn test_local_watch_basic() {
@@ -177,8 +177,7 @@ async fn test_local_watch_concurrent() {
 
 #[tokio::test]
 async fn test_local_watch_borrowed_state() {
-    let state = State::new(100);
-    let (tx, mut rx) = state.split();
+    let (tx, mut rx) = watch::channel(100);
     assert_eq!(*rx.borrow(), 100);
 
     let mut rx2 = rx.clone();
@@ -217,4 +216,52 @@ async fn test_local_watch_cancellation() {
             assert_eq!(*rx.borrow(), 2);
         })
         .await;
+}
+
+#[test]
+fn test_local_watch_send_without_receivers_preserves_value() {
+    let (tx, rx) = watch::channel(1);
+    drop(rx);
+
+    assert_eq!(tx.send(2), Err(SendError(2)));
+    assert_eq!(*tx.borrow(), 1);
+}
+
+#[test]
+fn test_local_watch_modify_without_receivers_preserves_value_without_version() {
+    let (tx, rx) = watch::channel(1);
+    drop(rx);
+
+    assert_eq!(
+        tx.send_modify(|value| {
+            *value = 2;
+            7
+        }),
+        7
+    );
+    assert!(!tx.send_if_modified(|value| {
+        *value = 3;
+        false
+    }));
+    assert_eq!(*tx.borrow(), 3);
+
+    let rx = tx.subscribe();
+    assert!(!rx.has_changed().unwrap());
+}
+
+#[tokio::test]
+async fn test_local_watch_borrowed_channel_initializes_once() {
+    let result = watch::with_borrowed_channel(1, async |tx, rx| {
+        assert_eq!(tx.receiver_count(), 1);
+        let rx2 = tx.subscribe();
+        assert_eq!(tx.receiver_count(), 2);
+        drop(rx);
+        drop(rx2);
+        assert!(tx.is_closed());
+        assert_eq!(tx.send(2), Err(SendError(2)));
+        *tx.borrow()
+    })
+    .await;
+
+    assert_eq!(result, 1);
 }

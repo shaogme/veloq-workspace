@@ -18,16 +18,16 @@ use veloq_std::{
 use veloq_waker::MwsrWaker;
 
 /// A multi-producer, single-consumer channel state.
-pub struct State<T, S, Q> {
+struct Inner<T, S, Q> {
     pub(crate) queue: Q,
     pub(crate) state: ChannelState,
     pub(crate) strategy: S,
     _marker: veloq_std::marker::PhantomData<fn() -> T>,
 }
 
-impl<T> State<T, UnboundedStrategy, SegQueue<T>> {
-    pub fn unbounded() -> Self {
-        State {
+impl<T> Inner<T, UnboundedStrategy, SegQueue<T>> {
+    fn unbounded() -> Self {
+        Inner {
             queue: SegQueue::new(),
             state: ChannelState::new(),
             strategy: UnboundedStrategy,
@@ -36,10 +36,10 @@ impl<T> State<T, UnboundedStrategy, SegQueue<T>> {
     }
 }
 
-impl<T> State<T, BoundedStrategy, ArrayQueue<T>> {
-    pub fn bounded(capacity: usize) -> Self {
+impl<T> Inner<T, BoundedStrategy, ArrayQueue<T>> {
+    fn bounded(capacity: usize) -> Self {
         assert!(capacity > 0, "capacity must be > 0");
-        State {
+        Inner {
             queue: ArrayQueue::new(capacity),
             state: ChannelState::new(),
             strategy: BoundedStrategy::new(capacity),
@@ -48,8 +48,8 @@ impl<T> State<T, BoundedStrategy, ArrayQueue<T>> {
     }
 }
 
-impl<T, S: ChannelStrategy, Q> State<T, S, Q> {
-    pub fn split(
+impl<T, S: ChannelStrategy, Q> Inner<T, S, Q> {
+    fn split(
         &self,
     ) -> (
         GenericBorrowedSender<'_, T, S, Q>,
@@ -75,7 +75,7 @@ pub async fn with_borrowed_unbounded<T, F, R>(f: F) -> R
 where
     F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
 {
-    let state = State::unbounded();
+    let state = Inner::unbounded();
     let (tx, rx) = state.split();
     f(tx, rx).await
 }
@@ -85,7 +85,7 @@ pub async fn with_borrowed_bounded<T, F, R>(capacity: usize, f: F) -> R
 where
     F: for<'a> AsyncFnOnce(BorrowedBoundedSender<'a, T>, BorrowedBoundedReceiver<'a, T>) -> R,
 {
-    let state = State::bounded(capacity);
+    let state = Inner::bounded(capacity);
     let (tx, rx) = state.split();
     f(tx, rx).await
 }
@@ -106,7 +106,7 @@ pub type Receiver<T> = GenericReceiver<T, UnboundedStrategy, SegQueue<T>>;
 pub type BoundedSender<T> = GenericSender<T, BoundedStrategy, ArrayQueue<T>>;
 pub type BoundedReceiver<T> = GenericReceiver<T, BoundedStrategy, ArrayQueue<T>>;
 
-// --- Core State Logic ---
+// --- Core Inner Logic ---
 
 pub(crate) struct ChannelState {
     rx_waker: MwsrWaker,
@@ -143,7 +143,9 @@ impl ChannelState {
     }
 
     fn wake_rx(&self) {
-        self.rx_waker.wake();
+        if let Some(waker) = self.rx_waker.take() {
+            waker.wake();
+        }
     }
 }
 
@@ -186,26 +188,26 @@ impl ChannelStrategy for BoundedStrategy {
 // --- Generic Structures ---
 
 pub struct GenericBorrowedSender<'a, T, S: ChannelStrategy, Q> {
-    state: &'a State<T, S, Q>,
+    state: &'a Inner<T, S, Q>,
     _marker: veloq_std::marker::PhantomData<fn() -> T>,
 }
 
 pub type BorrowedGenericSender<'a, T, S, Q> = GenericBorrowedSender<'a, T, S, Q>;
 
 pub struct GenericBorrowedReceiver<'a, T, S: ChannelStrategy, Q> {
-    state: &'a State<T, S, Q>,
+    state: &'a Inner<T, S, Q>,
     _marker: veloq_std::marker::PhantomData<fn() -> T>,
 }
 
 pub type BorrowedGenericReceiver<'a, T, S, Q> = GenericBorrowedReceiver<'a, T, S, Q>;
 
 pub struct GenericSender<T, S: ChannelStrategy, Q> {
-    state: Arc<State<T, S, Q>>,
+    state: Arc<Inner<T, S, Q>>,
     _marker: veloq_std::marker::PhantomData<fn() -> T>,
 }
 
 pub struct GenericReceiver<T, S: ChannelStrategy, Q> {
-    state: Arc<State<T, S, Q>>,
+    state: Arc<Inner<T, S, Q>>,
     _marker: veloq_std::marker::PhantomData<fn() -> T>,
 }
 
@@ -353,7 +355,7 @@ impl<'a, T, S: ChannelStrategy, Q: Queue<T>> Stream for GenericBorrowedReceiver<
 // --- Channel Implementations ---
 
 pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
-    let state = Arc::new(State::unbounded());
+    let state = Arc::new(Inner::unbounded());
     (
         GenericSender {
             state: state.clone(),
@@ -367,7 +369,7 @@ pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
 }
 
 pub fn bounded<T>(capacity: usize) -> (BoundedSender<T>, BoundedReceiver<T>) {
-    let state = Arc::new(State::bounded(capacity));
+    let state = Arc::new(Inner::bounded(capacity));
     (
         GenericSender {
             state: state.clone(),

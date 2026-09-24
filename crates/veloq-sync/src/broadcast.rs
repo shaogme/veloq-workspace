@@ -6,10 +6,7 @@ use veloq_std::{
     fmt,
     ops::AsyncFnOnce,
     ptr,
-    sync::{
-        Arc, UnpoisonedMutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, UnpoisonedMutex},
 };
 
 pub use crate::SendError;
@@ -58,16 +55,22 @@ impl fmt::Display for TryRecvError {
 
 impl Error for TryRecvError {}
 
-struct ChannelBuffer<T> {
+struct ChannelState<T> {
+    capacity: usize,
     queue: VecDeque<T>,
     tail: u64,
+    sender_count: usize,
+    receiver_count: usize,
 }
 
-impl<T> ChannelBuffer<T> {
-    fn new(capacity: usize) -> Self {
+impl<T> ChannelState<T> {
+    fn new(capacity: usize, sender_count: usize, receiver_count: usize) -> Self {
         Self {
+            capacity,
             queue: VecDeque::with_capacity(capacity),
             tail: 0,
+            sender_count,
+            receiver_count,
         }
     }
 
@@ -78,102 +81,86 @@ impl<T> ChannelBuffer<T> {
 }
 
 /// A multi-producer, multi-consumer broadcast channel state.
-pub struct State<T> {
-    capacity: usize,
-    buffer: UnpoisonedMutex<ChannelBuffer<T>>,
-    sender_count: AtomicUsize,
-    receiver_count: AtomicUsize,
+struct Inner<T> {
+    state: UnpoisonedMutex<ChannelState<T>>,
     rx_notify: Notify,
 }
 
-unsafe impl<T: Send> Send for State<T> {}
-unsafe impl<T: Send> Sync for State<T> {}
+unsafe impl<T: Send> Send for Inner<T> {}
+unsafe impl<T: Send> Sync for Inner<T> {}
 
-impl<T> State<T> {
+impl<T> Inner<T> {
     /// Creates a new broadcast channel state with the given capacity.
-    pub fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, sender_count: usize, receiver_count: usize) -> Self {
         assert!(capacity > 0, "capacity must be greater than 0");
         Self {
-            capacity,
-            buffer: UnpoisonedMutex::new(ChannelBuffer::new(capacity)),
-            sender_count: AtomicUsize::new(0),
-            receiver_count: AtomicUsize::new(0),
+            state: UnpoisonedMutex::new(ChannelState::new(capacity, sender_count, receiver_count)),
             rx_notify: Notify::new(),
         }
     }
 
-    /// Splits the state into a borrowed sender and receiver pair.
-    pub fn split(&self) -> (BorrowedSender<'_, T>, BorrowedReceiver<'_, T>) {
-        self.sender_count.store(1, Ordering::Release);
-        self.receiver_count.store(1, Ordering::Release);
-        let next_seq = self.buffer.lock().tail;
-        (
-            BorrowedSender { state: self },
-            BorrowedReceiver {
-                state: self,
-                next_seq,
-            },
-        )
-    }
-
     /// Returns the capacity of the channel.
     #[inline]
-    pub fn capacity(&self) -> usize {
-        self.capacity
+    fn capacity(&self) -> usize {
+        self.state.lock().capacity
     }
 
     /// Returns the number of active senders.
     #[inline]
-    pub fn sender_count(&self) -> usize {
-        self.sender_count.load(Ordering::Acquire)
+    fn sender_count(&self) -> usize {
+        self.state.lock().sender_count
     }
 
     /// Returns the number of active receivers.
     #[inline]
-    pub fn receiver_count(&self) -> usize {
-        self.receiver_count.load(Ordering::Acquire)
+    fn receiver_count(&self) -> usize {
+        self.state.lock().receiver_count
     }
 
     /// Returns the number of buffered messages.
     #[inline]
-    pub fn len(&self) -> usize {
-        self.buffer.lock().queue.len()
+    fn len(&self) -> usize {
+        self.state.lock().queue.len()
     }
 
     /// Returns `true` if no messages are currently buffered.
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// Returns `true` if all receivers have been dropped.
     #[inline]
-    pub fn is_closed(&self) -> bool {
+    fn is_closed(&self) -> bool {
         self.receiver_count() == 0
+    }
+
+    /// Commits a value and returns the receiver count at the commit point.
+    fn commit_send(&self, value: T) -> Result<usize, SendError<T>> {
+        let (rx_count, evicted) = {
+            let mut state = self.state.lock();
+            if state.receiver_count == 0 {
+                return Err(SendError(value));
+            }
+
+            let evicted = if state.queue.len() == state.capacity {
+                state.queue.pop_front()
+            } else {
+                None
+            };
+            state.queue.push_back(value);
+            state.tail += 1;
+            (state.receiver_count, evicted)
+        };
+
+        drop(evicted);
+        self.rx_notify.notify_waiters();
+        Ok(rx_count)
     }
 
     /// Sends a value over the channel to all active receivers.
     pub fn send(&self, value: T) -> Result<usize, SendError<T>> {
-        let rx_count = self.receiver_count.load(Ordering::Acquire);
-        if rx_count == 0 {
-            return Err(SendError(value));
-        }
-
-        {
-            let mut buf = self.buffer.lock();
-            if self.receiver_count.load(Ordering::Acquire) == 0 {
-                return Err(SendError(value));
-            }
-
-            if buf.queue.len() == self.capacity {
-                buf.queue.pop_front();
-            }
-            buf.queue.push_back(value);
-            buf.tail += 1;
-        }
-
-        self.rx_notify.notify_waiters();
-        Ok(rx_count)
+        self.commit_send(value)
     }
 
     /// Attempts to receive a message for a given receiver cursor.
@@ -181,8 +168,8 @@ impl<T> State<T> {
     where
         T: Clone,
     {
-        let buf = self.buffer.lock();
-        let oldest_seq = buf.oldest_seq();
+        let state = self.state.lock();
+        let oldest_seq = state.oldest_seq();
 
         if *next_seq < oldest_seq {
             let missed = oldest_seq - *next_seq;
@@ -190,14 +177,14 @@ impl<T> State<T> {
             return Err(TryRecvError::Lagged(missed));
         }
 
-        if *next_seq < buf.tail {
+        if *next_seq < state.tail {
             let idx = (*next_seq - oldest_seq) as usize;
-            let val = buf.queue[idx].clone();
+            let val = state.queue[idx].clone();
             *next_seq += 1;
             return Ok(val);
         }
 
-        if self.sender_count.load(Ordering::Acquire) == 0 {
+        if state.sender_count == 0 {
             Err(TryRecvError::Closed)
         } else {
             Err(TryRecvError::Empty)
@@ -234,7 +221,7 @@ impl<T> State<T> {
 
 /// The sender half of a borrowed broadcast channel.
 pub struct BorrowedSender<'a, T> {
-    state: &'a State<T>,
+    state: &'a Inner<T>,
 }
 
 unsafe impl<T: Send> Send for BorrowedSender<'_, T> {}
@@ -242,14 +229,18 @@ unsafe impl<T: Send> Sync for BorrowedSender<'_, T> {}
 
 impl<'a, T> BorrowedSender<'a, T> {
     /// Sends a value to all active receivers.
+    ///
+    /// On success, the returned count is the receiver snapshot at the send
+    /// linearization point.
     pub fn send(&self, value: T) -> Result<usize, SendError<T>> {
         self.state.send(value)
     }
 
     /// Creates a new receiver subscribed to this channel.
     pub fn subscribe(&self) -> BorrowedReceiver<'a, T> {
-        self.state.receiver_count.fetch_add(1, Ordering::AcqRel);
-        let next_seq = self.state.buffer.lock().tail;
+        let mut state = self.state.state.lock();
+        state.receiver_count += 1;
+        let next_seq = state.tail;
         BorrowedReceiver {
             state: self.state,
             next_seq,
@@ -300,15 +291,19 @@ impl<'a, T> BorrowedSender<'a, T> {
 
 impl<T> Clone for BorrowedSender<'_, T> {
     fn clone(&self) -> Self {
-        self.state.sender_count.fetch_add(1, Ordering::AcqRel);
+        self.state.state.lock().sender_count += 1;
         Self { state: self.state }
     }
 }
 
 impl<T> Drop for BorrowedSender<'_, T> {
     fn drop(&mut self) {
-        let prev = self.state.sender_count.fetch_sub(1, Ordering::AcqRel);
-        if prev == 1 {
+        let notify = {
+            let mut state = self.state.state.lock();
+            state.sender_count -= 1;
+            state.sender_count == 0
+        };
+        if notify {
             self.state.rx_notify.notify_waiters();
         }
     }
@@ -326,7 +321,7 @@ impl<T> fmt::Debug for BorrowedSender<'_, T> {
 
 /// The receiver half of a borrowed broadcast channel.
 pub struct BorrowedReceiver<'a, T> {
-    state: &'a State<T>,
+    state: &'a Inner<T>,
     next_seq: u64,
 }
 
@@ -352,8 +347,9 @@ impl<'a, T> BorrowedReceiver<'a, T> {
 
     /// Creates a new receiver subscribed to this channel starting from the latest message.
     pub fn resubscribe(&self) -> BorrowedReceiver<'a, T> {
-        self.state.receiver_count.fetch_add(1, Ordering::AcqRel);
-        let next_seq = self.state.buffer.lock().tail;
+        let mut state = self.state.state.lock();
+        state.receiver_count += 1;
+        let next_seq = state.tail;
         BorrowedReceiver {
             state: self.state,
             next_seq,
@@ -362,10 +358,10 @@ impl<'a, T> BorrowedReceiver<'a, T> {
 
     /// Returns the number of messages currently available to this receiver.
     pub fn len(&self) -> usize {
-        let buf = self.state.buffer.lock();
-        let oldest_seq = buf.oldest_seq();
+        let state = self.state.state.lock();
+        let oldest_seq = state.oldest_seq();
         let eff_seq = self.next_seq.max(oldest_seq);
-        buf.tail.saturating_sub(eff_seq) as usize
+        state.tail.saturating_sub(eff_seq) as usize
     }
 
     /// Returns `true` if there are no messages available to this receiver.
@@ -386,7 +382,7 @@ impl<'a, T> BorrowedReceiver<'a, T> {
 
 impl<T> Clone for BorrowedReceiver<'_, T> {
     fn clone(&self) -> Self {
-        self.state.receiver_count.fetch_add(1, Ordering::AcqRel);
+        self.state.state.lock().receiver_count += 1;
         Self {
             state: self.state,
             next_seq: self.next_seq,
@@ -396,7 +392,7 @@ impl<T> Clone for BorrowedReceiver<'_, T> {
 
 impl<T> Drop for BorrowedReceiver<'_, T> {
     fn drop(&mut self) {
-        self.state.receiver_count.fetch_sub(1, Ordering::AcqRel);
+        self.state.state.lock().receiver_count -= 1;
     }
 }
 
@@ -411,7 +407,7 @@ impl<T> fmt::Debug for BorrowedReceiver<'_, T> {
 
 /// A sender for a broadcast channel.
 pub struct Sender<T> {
-    state: Arc<State<T>>,
+    state: Arc<Inner<T>>,
 }
 
 unsafe impl<T: Send> Send for Sender<T> {}
@@ -419,14 +415,18 @@ unsafe impl<T: Send> Sync for Sender<T> {}
 
 impl<T> Sender<T> {
     /// Sends a value to all active receivers.
+    ///
+    /// On success, the returned count is the receiver snapshot at the send
+    /// linearization point.
     pub fn send(&self, value: T) -> Result<usize, SendError<T>> {
         self.state.send(value)
     }
 
     /// Creates a new receiver subscribed to this channel.
     pub fn subscribe(&self) -> Receiver<T> {
-        self.state.receiver_count.fetch_add(1, Ordering::AcqRel);
-        let next_seq = self.state.buffer.lock().tail;
+        let mut state = self.state.state.lock();
+        state.receiver_count += 1;
+        let next_seq = state.tail;
         Receiver {
             state: self.state.clone(),
             next_seq,
@@ -477,7 +477,7 @@ impl<T> Sender<T> {
 
 impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
-        self.state.sender_count.fetch_add(1, Ordering::AcqRel);
+        self.state.state.lock().sender_count += 1;
         Self {
             state: self.state.clone(),
         }
@@ -486,8 +486,12 @@ impl<T> Clone for Sender<T> {
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        let prev = self.state.sender_count.fetch_sub(1, Ordering::AcqRel);
-        if prev == 1 {
+        let notify = {
+            let mut state = self.state.state.lock();
+            state.sender_count -= 1;
+            state.sender_count == 0
+        };
+        if notify {
             self.state.rx_notify.notify_waiters();
         }
     }
@@ -505,7 +509,7 @@ impl<T> fmt::Debug for Sender<T> {
 
 /// A receiver for a broadcast channel.
 pub struct Receiver<T> {
-    state: Arc<State<T>>,
+    state: Arc<Inner<T>>,
     next_seq: u64,
 }
 
@@ -531,8 +535,9 @@ impl<T> Receiver<T> {
 
     /// Creates a new receiver subscribed to this channel starting from the latest message.
     pub fn resubscribe(&self) -> Receiver<T> {
-        self.state.receiver_count.fetch_add(1, Ordering::AcqRel);
-        let next_seq = self.state.buffer.lock().tail;
+        let mut state = self.state.state.lock();
+        state.receiver_count += 1;
+        let next_seq = state.tail;
         Receiver {
             state: self.state.clone(),
             next_seq,
@@ -541,10 +546,10 @@ impl<T> Receiver<T> {
 
     /// Returns the number of messages currently available to this receiver.
     pub fn len(&self) -> usize {
-        let buf = self.state.buffer.lock();
-        let oldest_seq = buf.oldest_seq();
+        let state = self.state.state.lock();
+        let oldest_seq = state.oldest_seq();
         let eff_seq = self.next_seq.max(oldest_seq);
-        buf.tail.saturating_sub(eff_seq) as usize
+        state.tail.saturating_sub(eff_seq) as usize
     }
 
     /// Returns `true` if there are no messages available to this receiver.
@@ -565,7 +570,7 @@ impl<T> Receiver<T> {
 
 impl<T> Clone for Receiver<T> {
     fn clone(&self) -> Self {
-        self.state.receiver_count.fetch_add(1, Ordering::AcqRel);
+        self.state.state.lock().receiver_count += 1;
         Self {
             state: self.state.clone(),
             next_seq: self.next_seq,
@@ -575,7 +580,7 @@ impl<T> Clone for Receiver<T> {
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        self.state.receiver_count.fetch_sub(1, Ordering::AcqRel);
+        self.state.state.lock().receiver_count -= 1;
     }
 }
 
@@ -590,10 +595,8 @@ impl<T> fmt::Debug for Receiver<T> {
 
 /// Creates a new broadcast channel returning a sender and receiver pair.
 pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
-    let state = Arc::new(State::new(capacity));
-    state.sender_count.store(1, Ordering::Release);
-    state.receiver_count.store(1, Ordering::Release);
-    let next_seq = state.buffer.lock().tail;
+    let state = Arc::new(Inner::new(capacity, 1, 1));
+    let next_seq = state.state.lock().tail;
     (
         Sender {
             state: state.clone(),
@@ -607,7 +610,12 @@ pub async fn with_borrowed_channel<T, F, R>(capacity: usize, f: F) -> R
 where
     F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
 {
-    let state = State::new(capacity);
-    let (tx, rx) = state.split();
+    let state = Inner::new(capacity, 1, 1);
+    let next_seq = state.state.lock().tail;
+    let tx = BorrowedSender { state: &state };
+    let rx = BorrowedReceiver {
+        state: &state,
+        next_seq,
+    };
     f(tx, rx).await
 }
