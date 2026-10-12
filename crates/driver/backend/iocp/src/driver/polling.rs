@@ -7,9 +7,10 @@ use veloq_std::{
 };
 
 use diagweave::prelude::*;
+use veloq_buf::BufferRegistrar;
 use veloq_driver_core::driver::{
     AnomalyAttach, CompletionAnomalyKind, CompletionEnvelope, CompletionIdentity, CompletionToken,
-    Driver, OpToken, RawCompletion, RemoteWaker, SharedCompletionTable,
+    OpToken, RawCompletion, RemoteWaker, SharedCompletionTable,
 };
 use veloq_wheel::{Expired, TimerError, TimerId, Wheel, WheelConfig};
 
@@ -18,15 +19,22 @@ use crate::{
         IocpErrorContext, IocpWaker, WAKER_IDLE, WAKER_NOTIFIED, WAKER_PROCESSING, WAKER_REARM,
         iocp_msg,
     },
+    driver::{
+        cancellation::CancellationService,
+        completion::{COMP_BACKEND_IOCP, CompletionService},
+        registration::RegistrationService,
+        state::{IocpDriverState, PollingStateView},
+    },
     error::{IocpError, IocpResult},
     op::{IocpSlotSpec, OverlappedEntry},
     rio::CompletionPollArgs,
     win32::{CompletionBatch, CompletionStatus, IoCompletionPort, Overlapped},
 };
 
-use super::{IocpDriver, RIO_EVENT_KEY, RIO_EVENT_TOKEN, completion::COMP_BACKEND_IOCP};
+use super::{RIO_EVENT_KEY, RIO_EVENT_TOKEN};
 
-/// Completions dequeued per `GetQueuedCompletionStatusEx` call, matching `MAX_RIO_RESULTS`.
+/// 每次 `GetQueuedCompletionStatusEx` 出队的完成数，与 `MAX_RIO_RESULTS` 一致。
+/// Number of completions dequeued per `GetQueuedCompletionStatusEx`, matching `MAX_RIO_RESULTS`.
 const MAX_IOCP_BATCH: usize = 128;
 const WAKE_FAILURE_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -89,10 +97,11 @@ impl CompletionPump {
         }
     }
 
-    /// Dequeues a batch of completions, returning how many are available via [`Self::status`].
+    /// 批量取出完成项，并返回可通过 [`Self::status`] 读取的数量。
+    /// Dequeues completions in a batch and returns the count available through [`Self::status`].
     ///
-    /// The batch buffer is owned by the pump so that draining never allocates. Callers must
-    /// finish reading the batch before requesting the next one.
+    /// 批次缓冲区由 pump 持有，排空时无需分配；读取完当前批次后才能请求下一批。
+    /// The pump owns the batch buffer to avoid allocations while draining; callers must finish reading before requesting another batch.
     pub(super) fn fill_batch(&mut self, wait_ms: u32) -> IocpResult<usize> {
         self.port.get_status_batch(&mut self.batch, wait_ms)
     }
@@ -287,11 +296,29 @@ impl TimerEngine {
     }
 }
 
-impl<'a> IocpDriver<'a> {
-    /// Drains state that has already been orphaned by fast close without publishing any user
-    /// completion. This path deliberately does not use the normal RIO completion route: RIO slots
-    /// and payloads are moved to the RIO deferred owner before the boxed IOCP state is handed to
-    /// this reaper.
+pub(super) struct PollingService<'view, 'state, 'registrar> {
+    state: &'view mut PollingStateView<'state>,
+    registrar: &'registrar dyn BufferRegistrar,
+}
+
+impl<'view, 'state, 'registrar> PollingService<'view, 'state, 'registrar> {
+    pub(super) fn new(
+        state: &'view mut PollingStateView<'state>,
+        registrar: &'registrar dyn BufferRegistrar,
+    ) -> Self {
+        Self { state, registrar }
+    }
+
+    fn state(&self) -> &PollingStateView<'state> {
+        self.state
+    }
+
+    fn state_mut(&mut self) -> &mut PollingStateView<'state> {
+        self.state
+    }
+
+    /// 排空 fast close 已孤儿化的状态，不发布用户完成事件。RIO slot 和 payload 在 boxed IOCP 状态交给此 reaper 前已转交 RIO 延迟所有者。
+    /// Drains state orphaned by fast close without publishing user completions. RIO slots and payloads move to the RIO deferred owner before this reaper receives the boxed IOCP state.
     pub(super) fn drain_orphaned(&mut self, timeout: Duration) -> IocpResult<()> {
         let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
             IocpError::CompletionWait
@@ -404,9 +431,10 @@ impl<'a> IocpDriver<'a> {
         first_error.map_or(Ok(drained), Err)
     }
 
+    /// 从 I/O completion port 获取完成事件。
     /// Retrieves completion events from the I/O completion port.
-    pub(crate) fn get_completion(&mut self, timeout: Option<Duration>) -> IocpResult<()> {
-        let _ = self.drain_cancel_requests()?;
+    pub(super) fn get_completion(&mut self, timeout: Option<Duration>) -> IocpResult<()> {
+        self.drain_cancel_requests()?;
         self.state_mut()
             .timer
             .advance_to(Instant::now())
@@ -478,8 +506,8 @@ impl<'a> IocpDriver<'a> {
         }
         self.state().completion.mark_waker_notifications(count);
 
-        // Every entry is routed even if one of them fails, so a single corrupt completion
-        // cannot drop the rest of the batch on the floor; the first error is reported.
+        // 即使某个条目处理失败也继续路由整批，避免丢弃其余完成项；最后报告首个错误。
+        // Route the whole batch despite individual failures so other completions are not dropped, then report the first error.
         let mut first_error = None;
         let mut handled = 0;
         for index in 0..count {
@@ -517,7 +545,8 @@ impl<'a> IocpDriver<'a> {
         first_error.map_or(Ok(()), Err)
     }
 
-    /// Routes the `index`-th entry of the batch currently held by the completion pump.
+    /// 路由 completion pump 当前批次中的第 `index` 个条目。
+    /// Routes entry `index` in the batch currently held by the completion pump.
     fn handle_batch_entry(&mut self, index: usize) -> IocpResult<usize> {
         let Some(CompletionStatus {
             bytes,
@@ -549,11 +578,11 @@ impl<'a> IocpDriver<'a> {
                 {
                     let (rio_state, registrar) = state.rio.state_and_registrar_mut(registrar);
                     rio_state.process_completions(CompletionPollArgs {
-                        ops: &mut state.ops,
-                        ext: &state.extensions,
+                        ops: state.ops,
+                        ext: state.extensions,
                         registrar,
                         completion_table: state.completion.table(),
-                        diagnostics: &mut state.completion_diagnostics,
+                        diagnostics: state.completion_diagnostics,
                     })
                 }
                 .inspect(|_| {
@@ -644,6 +673,54 @@ impl<'a> IocpDriver<'a> {
                 ));
         }
         Ok(envelope)
+    }
+
+    fn drain_deferred_socket_cleanup(&mut self) {
+        let mut view = IocpDriverState::registration_view_from_polling(self.state_mut());
+        RegistrationService::new(&mut view).drain_deferred_socket_cleanup();
+    }
+
+    fn drain_cancel_requests(&mut self) -> IocpResult<()> {
+        loop {
+            let request = self.state_mut().remote_cancel_receiver.try_recv().ok();
+            let Some(request) = request else {
+                return Ok(());
+            };
+            let registrar = self.registrar;
+            let mut view = IocpDriverState::cancellation_view_from_polling(self.state_mut());
+            let _ = CancellationService::new(&mut view, registrar).cancel_op_internal(request)?;
+        }
+    }
+
+    fn process_timers(&mut self) -> IocpResult<usize> {
+        let registrar = self.registrar;
+        let mut view = IocpDriverState::completion_view_from_polling(self.state_mut());
+        CompletionService::new(&mut view, registrar).process_timers()
+    }
+
+    fn process_completion_envelope(&mut self, envelope: CompletionEnvelope) -> IocpResult<usize> {
+        let registrar = self.registrar;
+        let mut view = IocpDriverState::completion_view_from_polling(self.state_mut());
+        CompletionService::new(&mut view, registrar).process_completion_envelope(envelope)
+    }
+
+    fn accept_raw_completion(&mut self, raw_token: u64, res: i32, flags: u32) -> IocpResult<()> {
+        let registrar = self.registrar;
+        let mut view = IocpDriverState::completion_view_from_polling(self.state_mut());
+        CompletionService::new(&mut view, registrar)
+            .accept_raw_completion(raw_token, res, flags)?;
+        Ok(())
+    }
+
+    fn accept_completion_anomaly(
+        &mut self,
+        kind: CompletionAnomalyKind,
+        attach: AnomalyAttach,
+    ) -> IocpResult<()> {
+        let registrar = self.registrar;
+        let mut view = IocpDriverState::completion_view_from_polling(self.state_mut());
+        CompletionService::new(&mut view, registrar).accept_completion_anomaly(kind, attach)?;
+        Ok(())
     }
 }
 

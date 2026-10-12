@@ -1,4 +1,5 @@
 use diagweave::prelude::*;
+use veloq_buf::BufferRegistrar;
 use veloq_driver_core::{
     driver::{
         AnomalyAttach, CancelMode, CancelRequest, CancelSubmitOutcome, CancelTargetGoneReason,
@@ -14,12 +15,12 @@ use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 use crate::{
     config::RegisteredSlot,
     driver::{
-        IocpDriver, IocpOpRegistry,
-        completion::{COMP_BACKEND_IOCP, IocpSyntheticCompletion},
+        completion::{COMP_BACKEND_IOCP, CompletionService, IocpSyntheticCompletion},
+        state::{CancellationStateView, IocpDriverState},
     },
     error::{IocpError, IocpResult},
     op,
-    op::IocpUserPayload,
+    op::{IocpOpRegistry, IocpSlotSpec, IocpUserPayload},
     win32::{CancelRequestResult, IoCompletionPort, Overlapped},
 };
 
@@ -36,7 +37,7 @@ enum CancelPerformStatus {
 }
 
 fn mark_receive_pump_cancelled<S: SlotMarker>(
-    slot: &mut Slot<'_, S, crate::op::IocpSlotSpec>,
+    slot: &mut Slot<'_, S, IocpSlotSpec>,
 ) -> IocpResult<()> {
     slot.with_access_mut(|access| {
         let (operation, payload) = access
@@ -62,7 +63,7 @@ fn mark_receive_pump_cancelled<S: SlotMarker>(
 }
 
 fn mark_rio_user_cancel<S: SlotMarker>(
-    slot: &mut Slot<'_, S, crate::op::IocpSlotSpec>,
+    slot: &mut Slot<'_, S, IocpSlotSpec>,
     op_kind: OpKind,
 ) -> IocpResult<()> {
     if matches!(op_kind, OpKind::RecvMulti | OpKind::UdpRecvMulti) {
@@ -72,7 +73,27 @@ fn mark_rio_user_cancel<S: SlotMarker>(
     Ok(())
 }
 
-impl<'a> IocpDriver<'a> {
+pub(super) struct CancellationService<'view, 'state, 'registrar> {
+    state: &'view mut CancellationStateView<'state>,
+    registrar: &'registrar dyn BufferRegistrar,
+}
+
+impl<'view, 'state, 'registrar> CancellationService<'view, 'state, 'registrar> {
+    pub(super) fn new(
+        state: &'view mut CancellationStateView<'state>,
+        registrar: &'registrar dyn BufferRegistrar,
+    ) -> Self {
+        Self { state, registrar }
+    }
+
+    fn state(&self) -> &CancellationStateView<'state> {
+        self.state
+    }
+
+    fn state_mut(&mut self) -> &mut CancellationStateView<'state> {
+        self.state
+    }
+
     pub(super) fn cancel_op_internal(
         &mut self,
         request: CancelRequest,
@@ -106,7 +127,7 @@ impl<'a> IocpDriver<'a> {
                 let ctx = CancelContext {
                     registered_slots: state.handles.registered_slots(),
                 };
-                let status = Self::perform_cancel(ctx, token, request.mode, &mut state.ops);
+                let status = Self::perform_cancel(ctx, token, request.mode, state.ops);
                 self.record_cancel_status(token, status)
             }
             CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
@@ -142,7 +163,10 @@ impl<'a> IocpDriver<'a> {
                     -(ERROR_OPERATION_ABORTED as i32),
                     0,
                 ));
-                let _ = self.accept_completion_anomaly(kind, attach)?;
+                let registrar = self.registrar;
+                let mut view = IocpDriverState::completion_view_from_cancellation(self.state_mut());
+                let _ = CompletionService::new(&mut view, registrar)
+                    .accept_completion_anomaly(kind, attach)?;
                 Ok(CancelSubmitOutcome::TargetGone { reason })
             }
         }
@@ -155,7 +179,9 @@ impl<'a> IocpDriver<'a> {
             -(ERROR_OPERATION_ABORTED as i32),
             0,
         );
-        self.accept_synthetic_completion(
+        let registrar = self.registrar;
+        let mut view = IocpDriverState::completion_view_from_cancellation(self.state_mut());
+        CompletionService::new(&mut view, registrar).accept_synthetic_completion(
             event,
             SyntheticCompletionSource::Cancel,
             IocpSyntheticCompletion::Cancel { mode },
@@ -268,7 +294,7 @@ impl<'a> IocpDriver<'a> {
                 let (is_rio, op_kind) = guard
                     .with_access_mut(|access| {
                         let op = access.operation().get_ref();
-                        (Self::is_rio_op(op), op.kind())
+                        (op.uses_rio_backend(), op.kind())
                     })
                     .unwrap_or((false, OpKind::Wakeup));
 
@@ -306,12 +332,12 @@ impl<'a> IocpDriver<'a> {
             }
             CheckedSlotView::Valid(SlotView::InFlightOrphaned(mut guard)) => {
                 let is_rio = guard
-                    .with_access_mut(|access| Self::is_rio_op(access.operation().get_ref()))
+                    .with_access_mut(|access| access.operation().get_ref().uses_rio_backend())
                     .unwrap_or(false);
 
                 if is_rio {
-                    // An orphaned slot is already outside user-visible cancellation. Its core
-                    // slot state, not the user-cancel flag, owns the cleanup semantics.
+                    // orphaned slot 已脱离用户取消流程，清理语义由 slot 状态决定。
+                    // An orphaned slot is outside user-visible cancellation; its slot state controls cleanup semantics.
                     CancelPerformStatus::RioRequested
                 } else {
                     let raw_handle = guard

@@ -1,9 +1,9 @@
-//! IOCP Platform-Specific Operation Definitions
+//! IOCP 平台特定操作定义 / IOCP platform-specific operation definitions
 //!
-//! This module defines:
-//! - `IocpKernelOp`: The Type-Erased kernel operation struct using Unions and VTables
-//! - `OpVTable`: The virtual table for dynamic dispatch without enums
-//! - `IntoPlatformOp` implementations split into `(KernelOp, SubmitPayload)`
+//! 本模块定义：/ This module defines:
+//! - `IocpKernelOp`：通过 union 和 vtable 实现类型擦除的内核操作结构。 / A type-erased kernel operation using unions and vtables.
+//! - `OpVTable`：无需枚举即可动态分派的虚表。 / A virtual table for dynamic dispatch without enums.
+//! - `IntoPlatformOp`：将实现拆分为 `(KernelOp, SubmitPayload)`。 / Implementations split into `(KernelOp, SubmitPayload)`.
 
 mod file;
 mod net;
@@ -62,7 +62,7 @@ use veloq_driver_core::{
 };
 
 // ============================================================================
-// Type Aliases for Core Ops
+// 核心操作类型别名 / Type aliases for core operations
 // ============================================================================
 
 pub(crate) type ReadFixed = ReadFixedBase<IocpHandle>;
@@ -95,9 +95,10 @@ pub(crate) type RecvProvided = RecvProvidedBase<IocpHandle>;
 pub(crate) type RecvMulti = RecvMultiBase<IocpHandle>;
 
 // ============================================================================
-// SubmitContext Definition
+// SubmitContext 定义 / SubmitContext definition
 // ============================================================================
 
+/// 提交 IOCP 操作时使用的上下文。
 /// Context for submitting IOCP operations.
 pub(crate) struct SubmitContext<'a> {
     pub(crate) port: Arc<IoCompletionPort>,
@@ -108,12 +109,12 @@ pub(crate) struct SubmitContext<'a> {
     pub(crate) registered_slots: &'a mut [RegisteredSlot],
     pub(crate) registrar: &'a dyn veloq_buf::BufferRegistrar,
 
-    // RIO Support
+    // RIO 支持 / RIO support
     pub(crate) rio: &'a mut RioState,
 }
 
 // ============================================================================
-// Type-Erased VTable
+// 类型擦除虚表 / Type-erased vtable
 // ============================================================================
 
 pub(crate) struct OpVTable {
@@ -179,6 +180,24 @@ impl IocpKernelOp {
 
     pub(crate) const fn is_multishot(&self) -> bool {
         self.vtable.multishot
+    }
+
+    /// 返回此操作是否使用 RIO 后端。 / Returns whether this operation uses the RIO backend.
+    pub(crate) fn uses_rio_backend(&self) -> bool {
+        match self.kind() {
+            OpKind::Recv | OpKind::Send | OpKind::UdpSend | OpKind::SendTo => true,
+            OpKind::RecvProvided | OpKind::RecvMulti | OpKind::UdpRecvMulti => {
+                self.multishot_vtable().is_some_and(|vtable| {
+                    let cardinality_ok = match self.kind() {
+                        OpKind::RecvProvided => !self.is_multishot(),
+                        _ => self.is_multishot(),
+                    };
+                    cardinality_ok && vtable.operation == self.kind()
+                })
+            }
+            OpKind::AcceptMulti => false,
+            _ => false,
+        }
     }
 
     pub(crate) const fn multishot_vtable(&self) -> Option<&'static IocpMultiShotVTable> {
@@ -291,9 +310,10 @@ macro_rules! impl_iocp_op_erasure {
             fn try_user_payload(payload: IocpUserPayload) -> IocpResult<Self> {
                 match payload {
                     IocpUserPayload::$user_variant(payload) => Ok(payload),
-                    _ => Err(veloq_driver_core::op::payload_projection_mismatch_report::<
-                        IocpError,
-                    >(stringify!($OpType), "IocpUserPayload")),
+                    _ => Err(payload_projection_mismatch_report::<IocpError>(
+                        stringify!($OpType),
+                        "IocpUserPayload",
+                    )),
                 }
             }
 
@@ -321,8 +341,8 @@ macro_rules! impl_iocp_op_erasure {
             }
         }
 
-        /// IOCP 后端的 multishot 操作由 facade 的既有 fallback 避开；这里保留统一
-        /// operation bound 所需的 payload 形状。
+        /// facade 的既有回退路径会避开 IOCP multishot 操作；这里仍保留统一 operation bound 所需的 payload 形状。
+        /// The facade's existing fallback avoids IOCP multishot operations; this keeps the payload shape required by the shared operation bound.
         impl IntoPlatformOp<IocpSlotSpec> for $OpType {
             type SubmitPayload = $OpType;
             type RecordPayload = $OpType;
@@ -365,8 +385,8 @@ macro_rules! impl_iocp_op_erasure {
     };
 }
 
-/// Erase an IOCP operation whose submit payload must stay in the slot while each completion gets
-/// its own record payload.
+/// 擦除 IOCP 操作类型；提交 payload 保留在 slot 中，每次完成使用独立的记录 payload。
+/// Erases an IOCP operation whose submit payload stays in the slot while each completion gets its own record payload.
 macro_rules! impl_iocp_multishot_op_erasure {
     (
         $OpType:ty,
@@ -493,11 +513,12 @@ macro_rules! impl_iocp_multishot_op_erasure {
     };
 }
 
+/// 平台特定 IOCP 内核操作的别名。
 /// Alias for the platform-specific IOCP kernel operation.
 pub type IocpOp = IocpKernelOp;
 
 // ============================================================================
-// Op Definitions
+// 操作定义 / Operation definitions
 // ============================================================================
 
 impl IocpOpSpec for Timeout {
@@ -617,11 +638,13 @@ impl_iocp_op_erasure!(Wakeup, Wakeup, Wakeup, usize);
 mod tests {
     use super::*;
     use veloq_buf::FixedBuf;
-    use veloq_driver_core::op::types::UdpRecvPacketBuf;
-    use veloq_driver_core::platform::receive_pump::{ReceivePumpConfig, ReceiveSlot};
+    use veloq_driver_core::{
+        op::types::UdpRecvPacketBuf,
+        platform::receive_pump::{ReceivePumpConfig, ReceivePumpState, ReceiveSlot},
+    };
     use veloq_std::{net::SocketAddr, num::NonZeroUsize, time::Duration, vec};
 
-    fn receive_pump() -> veloq_driver_core::platform::receive_pump::ReceivePumpState {
+    fn receive_pump() -> ReceivePumpState {
         let config = ReceivePumpConfig {
             kernel_capacity: NonZeroUsize::new(1).expect("non-zero depth"),
             queue_capacity: NonZeroUsize::new(1).expect("non-zero queue"),
@@ -634,8 +657,7 @@ mod tests {
                 .expect("receive slot allocation"),
         )]
         .into_boxed_slice();
-        veloq_driver_core::platform::receive_pump::ReceivePumpState::try_new(config, slots)
-            .expect("valid receive pump")
+        ReceivePumpState::try_new(config, slots).expect("valid receive pump")
     }
 
     #[test]

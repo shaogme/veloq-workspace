@@ -67,10 +67,12 @@ pub(crate) struct AcceptExArgs {
     pub(crate) lp_overlapped: *mut Overlapped,
 }
 
-/// Safe wrapper for ReadFile.
+/// `ReadFile` 的安全封装。
+/// Safe wrapper for `ReadFile`.
 ///
 /// # Safety
 ///
+/// 调用方必须保证 handle、buf 和 overlapped 指针均有效。
 /// The caller must ensure that the handle, buf, and overlapped pointers are valid.
 pub(crate) unsafe fn iocp_submit_read(
     handle: BorrowedRawHandle<'_>,
@@ -79,6 +81,7 @@ pub(crate) unsafe fn iocp_submit_read(
     overlapped: *mut Overlapped,
 ) -> IocpResult<SubmissionResult> {
     let mut bytes = 0;
+    // SAFETY: 调用 ReadFile 时所有参数均有效。
     // SAFETY: ReadFile is called with valid parameters.
     let ret = unsafe {
         ReadFile(
@@ -90,7 +93,8 @@ pub(crate) unsafe fn iocp_submit_read(
         )
     };
     if ret == 0 {
-        // SAFETY: GetLastError is safe to call.
+        // SAFETY: 可安全调用 GetLastError 获取系统错误。
+        // SAFETY: GetLastError is safe to call to retrieve the system error.
         let err = unsafe { GetLastError() };
         if err != ERROR_IO_PENDING {
             return Err(IocpError::Submission
@@ -100,10 +104,12 @@ pub(crate) unsafe fn iocp_submit_read(
     Ok(SubmissionResult::Pending)
 }
 
-/// Safe wrapper for WriteFile.
+/// `WriteFile` 的安全封装。
+/// Safe wrapper for `WriteFile`.
 ///
 /// # Safety
 ///
+/// 调用方必须保证 handle、buf 和 overlapped 指针均有效。
 /// The caller must ensure that the handle, buf, and overlapped pointers are valid.
 pub(crate) unsafe fn iocp_submit_write(
     handle: BorrowedRawHandle<'_>,
@@ -112,6 +118,7 @@ pub(crate) unsafe fn iocp_submit_write(
     overlapped: *mut Overlapped,
 ) -> IocpResult<SubmissionResult> {
     let mut bytes = 0;
+    // SAFETY: 调用 WriteFile 时所有参数均有效。
     // SAFETY: WriteFile is called with valid parameters.
     let ret = unsafe {
         WriteFile(
@@ -123,7 +130,8 @@ pub(crate) unsafe fn iocp_submit_write(
         )
     };
     if ret == 0 {
-        // SAFETY: GetLastError is safe to call.
+        // SAFETY: 可安全调用 GetLastError 获取系统错误。
+        // SAFETY: GetLastError is safe to call to retrieve the system error.
         let err = unsafe { GetLastError() };
         if err != ERROR_IO_PENDING {
             return Err(IocpError::Submission
@@ -133,12 +141,15 @@ pub(crate) unsafe fn iocp_submit_write(
     Ok(SubmissionResult::Pending)
 }
 
-/// Safe wrapper for ConnectEx.
+/// `ConnectEx` 的安全封装。
+/// Safe wrapper for `ConnectEx`.
 ///
 /// # Safety
 ///
+/// 调用方必须保证所有指针和 socket 句柄均有效。
 /// The caller must ensure that all pointers and the socket handle are valid.
 pub(crate) unsafe fn iocp_submit_connect_ex(args: ConnectExArgs) -> IocpResult<SubmissionResult> {
+    // SAFETY: 调用 connect_ex 时所有参数均有效。
     // SAFETY: connect_ex is called with valid parameters.
     let ret = unsafe {
         (args.connect_ex)(
@@ -152,7 +163,8 @@ pub(crate) unsafe fn iocp_submit_connect_ex(args: ConnectExArgs) -> IocpResult<S
         )
     };
     if ret == 0 {
-        // SAFETY: GetLastError is safe to call.
+        // SAFETY: 可安全调用 GetLastError 获取系统错误。
+        // SAFETY: GetLastError is safe to call to retrieve the system error.
         let err = unsafe { GetLastError() };
         if err != ERROR_IO_PENDING {
             return Err(IocpError::Submission
@@ -162,12 +174,15 @@ pub(crate) unsafe fn iocp_submit_connect_ex(args: ConnectExArgs) -> IocpResult<S
     Ok(SubmissionResult::Pending)
 }
 
-/// Safe wrapper for AcceptEx.
+/// `AcceptEx` 的安全封装。
+/// Safe wrapper for `AcceptEx`.
 ///
 /// # Safety
 ///
-/// The caller must ensure that all pointers and the socket handles are valid.
+/// 调用方必须保证所有指针和 socket 句柄均有效。
+/// The caller must ensure that all pointers and socket handles are valid.
 pub(crate) unsafe fn iocp_submit_accept_ex(args: AcceptExArgs) -> IocpResult<SubmissionResult> {
+    // SAFETY: 调用 accept_ex 时所有参数均有效。
     // SAFETY: accept_ex is called with valid parameters.
     let ret = unsafe {
         (args.accept_ex)(
@@ -182,7 +197,8 @@ pub(crate) unsafe fn iocp_submit_accept_ex(args: AcceptExArgs) -> IocpResult<Sub
         )
     };
     if ret == 0 {
-        // SAFETY: GetLastError is safe to call.
+        // SAFETY: 可安全调用 GetLastError 获取系统错误。
+        // SAFETY: GetLastError is safe to call to retrieve the system error.
         let err = unsafe { GetLastError() };
         if err != ERROR_IO_PENDING {
             return Err(IocpError::Submission
@@ -192,6 +208,7 @@ pub(crate) unsafe fn iocp_submit_accept_ex(args: AcceptExArgs) -> IocpResult<Sub
     Ok(SubmissionResult::Pending)
 }
 
+/// 持有 `raw` 的已占用注册槽索引。
 /// Index of the occupied registry slot holding `raw`.
 fn find_slot_by_handle(raw: IocpHandle, registered_slots: &[RegisteredSlot]) -> Option<usize> {
     registered_slots.iter().position(|slot| {
@@ -201,17 +218,14 @@ fn find_slot_by_handle(raw: IocpHandle, registered_slots: &[RegisteredSlot]) -> 
     })
 }
 
-/// Index of the registry slot a descriptor names.
+/// 描述符所指注册槽的索引。
+/// Index of the registry slot named by a descriptor.
 ///
-/// [`IoFd::Registered`] resolves by index, with the generation check that makes a stale
-/// descriptor an error rather than a silent hit on whoever took the slot's place.
+/// [`IoFd::Registered`] 按索引解析，并校验 generation，使过期描述符报错而非误指向复用该槽的新句柄。
+/// [`IoFd::Registered`] resolves by index and checks its generation so stale descriptors fail instead of silently naming a replacement handle.
 ///
-/// [`IoFd::Direct`] carries no index, so it is matched by handle identity — O(n) in the
-/// registry size. This backend never *hands out* a direct descriptor: its registry is a
-/// `Vec` that grows on demand, so there is no exhaustion to fall back from. The scan exists
-/// because a slot is still where per-handle state lives (notably the completion-port
-/// association, which must be established exactly once per handle), so a direct descriptor a
-/// caller built itself has to be mapped back onto its slot rather than rejected.
+/// [`IoFd::Direct`] 没有索引，因此按句柄身份匹配，复杂度为 O(n)。注册表按需增长，不会耗尽；扫描用于找到保存句柄状态及 completion-port 关联的槽，确保每个句柄只关联一次。
+/// [`IoFd::Direct`] has no index and is matched by handle identity in O(n). The registry grows on demand, so the scan maps caller-created direct descriptors to slots holding per-handle state and the one-time completion-port association.
 pub(crate) fn locate_registered_slot(
     fd: IoFd,
     registered_slots: &[RegisteredSlot],
@@ -298,23 +312,27 @@ pub(crate) fn resolve_registered_raw_file(
     ))
 }
 
-/// Unpacks a [`KernelRef<T>`] and slot overlapped pointer from submit context.
+/// 从提交上下文中解包 [`KernelRef<T>`] 和 slot 的 overlapped 指针。
+/// Unpacks a [`KernelRef<T>`] and slot overlapped pointer from the submit context.
 ///
 /// # Safety
 ///
-/// The caller must ensure `payload.user` and `ctx.overlapped` are both valid for
-/// mutable access during the call.
+/// 调用期间，调用方必须保证 `payload.user` 和 `ctx.overlapped` 均可有效地进行可变访问。
+/// The caller must ensure `payload.user` and `ctx.overlapped` both permit valid mutable access during the call.
 pub(crate) unsafe fn unpack_kernel_ref<T>(
     payload: &mut KernelRef<T>,
     overlapped: *mut Overlapped,
 ) -> IocpResult<(&mut T, &mut Overlapped)> {
-    // SAFETY: guaranteed by the caller.
+    // SAFETY: 此有效性由调用方保证。
+    // SAFETY: validity is guaranteed by the caller.
     let val = unsafe { payload.user.as_mut()? };
-    // SAFETY: guaranteed by the caller.
+    // SAFETY: 此有效性由调用方保证。
+    // SAFETY: validity is guaranteed by the caller.
     let overlapped = unsafe { &mut *overlapped };
     Ok((val, overlapped))
 }
 
+/// 将句柄关联到 IOCP。
 /// Associates a handle with an IOCP.
 pub(crate) fn ensure_iocp_association(
     fd: &IoFd,
@@ -350,13 +368,14 @@ fn ensure_handle_iocp_association(
                 .with_ctx("port_raw", port_raw_value)
                 .with_ctx("completion_key", completion_key)
                 .with_ctx("existing_port_raw", existing.port_raw())
-                .with_ctx("existing_completion_key", existing.completion_key)
+                .with_ctx("existing_completion_key", existing.completion_key())
                 .attach_note("handle already associated with a different IOCP context");
         }
         None => {}
     }
 
-    // SAFETY: the handle is checked for validity by the caller or by resolve_fd.
+    // SAFETY: 调用方或 resolve_fd 已校验句柄有效性。
+    // SAFETY: the caller or resolve_fd has validated the handle.
     unsafe { port.associate(handle.as_handle(), 0) }
         .attach_note("CreateIoCompletionPort association failed")?;
     *association = Some(requested);
@@ -377,7 +396,8 @@ pub(crate) fn mark_header_in_flight(
 macro_rules! impl_get_fd {
     ($fn_name:ident, $payload:ty, direct_fd) => {
         pub(crate) unsafe fn $fn_name(payload: &$payload) -> Option<IoFd> {
-            // SAFETY: the caller guarantees the payload pointer is valid.
+            // SAFETY: 调用方保证 payload 指针有效。
+            // SAFETY: the caller guarantees that the payload pointer is valid.
             unsafe { payload.user.as_ref().ok().map(|user| user.fd) }
         }
     };
@@ -408,11 +428,12 @@ impl_get_fd!(get_fd_sync_range, KernelRef<SyncFileRange>, direct_fd);
 impl_get_fd!(get_fd_fallocate, KernelRef<Fallocate>, direct_fd);
 
 // ============================================================================
-// Other Operations
+// 其他操作 / Other operations
 // ============================================================================
 
 /// # Safety
 ///
+/// 调用方必须保证 header、payload 和 ctx 均有效。
 /// The caller must ensure that header, payload, and ctx are valid.
 pub(crate) fn submit_wakeup(
     _header: &mut OverlappedEntry,
@@ -424,13 +445,15 @@ pub(crate) fn submit_wakeup(
 
 /// # Safety
 ///
+/// 调用方必须保证 header、payload 和 ctx 均有效。
 /// The caller must ensure that header, payload, and ctx are valid.
 pub(crate) fn submit_timeout(
     _header: &mut OverlappedEntry,
     payload: &mut KernelRef<Timeout>,
     _ctx: &mut SubmitContext,
 ) -> IocpResult<SubmissionResult> {
-    // SAFETY: Dereferencing the user pointer in KernelRef.
+    // SAFETY: 解引用 KernelRef 中的用户指针。
+    // SAFETY: Dereferences the user pointer in KernelRef.
     let u = unsafe { payload.user.as_ref()? };
     Ok(SubmissionResult::Timer(u.duration))
 }

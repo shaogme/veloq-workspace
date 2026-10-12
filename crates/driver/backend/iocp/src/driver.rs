@@ -3,24 +3,18 @@ mod completion;
 mod lifecycle;
 mod polling;
 mod registration;
+mod state;
 mod submission;
 
-use veloq_blocking::ThreadPool;
-use veloq_std::{
-    boxed::Box,
-    format,
-    sync::{Arc, mpsc},
-    time::Duration,
-    vec::Vec,
-};
+use veloq_std::{boxed::Box, format, sync::Arc, time::Duration, vec::Vec};
 
 use diagweave::prelude::*;
-use veloq_buf::{AnyBufPool, BufPool, BufferRegistrar, FixedBuf};
+use veloq_buf::{AnyBufPool, BufPool, BufferRegistrar, FixedBuf, heap::ChunkId};
 
-use lifecycle::{IocpRioRuntime, WinsockGuard};
-use polling::{CompletionPump, TimerEngine};
-use registration::HandleRegistry;
-use submission::SubmitContextInternal;
+use lifecycle::LifecycleService;
+use registration::RegistrationService;
+use submission::{SubmissionService, SubmitContextInternal, SubmitResolution};
+use tracing::debug;
 
 pub(crate) use completion::COMP_BACKEND_RIO;
 
@@ -28,23 +22,19 @@ pub(crate) use completion::COMP_BACKEND_RIO;
 use crate::RegisteredHandle;
 use crate::{
     IocpResult,
-    config::{IoFd, IocpHandle},
-    diagnostics::IocpCompletionDiagnostics,
+    config::{IoFd, IocpConfig, IocpHandle},
     error::IocpError,
-    ext::Extensions,
-    op::{IocpOp, IocpOpRegistry, IocpSlotSpec, IocpUserPayload},
+    op::{IocpOp, IocpSlotSpec, IocpUserPayload},
     win32::IoCompletionPort,
 };
 
-use veloq_buf::heap::ChunkId;
-use veloq_driver_core::driver::{
-    BufferRegistrationStatus, CancelRequest, CancelSubmitOutcome, CompletionToken, DriveMode,
-    DriveOutcome, DriverCompletionDiagnostics, DriverRaw, DriverSubmitResult, OpToken, RegisterFd,
-    RemoteCancelSender, RemoteWaker, SharedCompletionTable, SharedSlotTable, SubmitStatus,
-    UdpReceiveOperationBuilder, registry::OpEntry, sealed,
-};
-use veloq_driver_core::op::OpKind;
 use veloq_driver_core::{
+    driver::{
+        BufferRegistrationStatus, CancelRequest, CancelSubmitOutcome, CompletionToken, DriveMode,
+        DriveOutcome, DriverRaw, DriverSubmitResult, OpToken, RegisterFd, RemoteCancelSender,
+        RemoteWaker, SharedCompletionTable, SharedSlotTable, SubmitStatus,
+        UdpReceiveOperationBuilder, registry::OpEntry, sealed,
+    },
     op::types::UdpRecvMulti,
     platform::receive_pump::{ReceivePumpState, ReceiveSlot, UdpReceiveConfig},
 };
@@ -62,54 +52,91 @@ pub(crate) const RIO_EVENT_TOKEN: CompletionToken = match CompletionToken::encod
 pub(crate) const RIO_EVENT_KEY: usize = RIO_EVENT_TOKEN.raw() as usize;
 pub(crate) type PreInit = IoCompletionPort;
 
-pub(crate) type IocpDriverCompletionDiagnostics =
-    DriverCompletionDiagnostics<IocpCompletionDiagnostics>;
 pub use crate::op::IocpOpState;
+pub(crate) use state::IocpDriverCompletionDiagnostics;
+use state::IocpDriverState;
 
 // ============================================================================
-// State & Lifecycle Types
+// 状态与生命周期类型 / State and lifecycle types
 // ============================================================================
 
-/// The IOCP driver implementation that manages I/O completion ports and operations.
+/// 管理 I/O completion port 和操作的 IOCP driver 实现。
+/// Implements the IOCP driver that manages I/O completion ports and operations.
 pub struct IocpDriver<'a> {
-    /// The registrar is borrowed by the live driver only. Deferred cleanup must not retain this
-    /// borrow because it can outlive the caller that owns the registrar.
+    /// registrar 仅由活动中的 driver 借用；延迟清理可能晚于 registrar 所有者，因此不得保留此借用。
+    /// The registrar is borrowed only by the live driver; deferred cleanup may outlive its owner and must not retain the borrow.
     registrar: &'a (dyn BufferRegistrar + 'a),
     state: Option<Box<IocpDriverState>>,
 }
 
-/// Address-stable state that owns every resource which may be referenced by a pending request.
-///
-/// An active `OVERLAPPED` points into an operation registry slot, so transferring this state to
-/// the reaper must move only the box pointer and must never move individual operations into a
-/// relocating collection.
-pub(crate) struct IocpDriverState {
-    completion: CompletionPump,
-    ops: IocpOpRegistry,
-    extensions: Extensions,
-    timer: TimerEngine,
-    remote_cancel_sender: RemoteCancelSender,
-    remote_cancel_receiver: mpsc::Receiver<CancelRequest>,
-    completion_diagnostics: IocpDriverCompletionDiagnostics,
-
-    // RIO Support (required)
-    rio: IocpRioRuntime,
-    handles: HandleRegistry,
-    shutting_down: bool,
-    closed: bool,
-
-    blocking_pool: ThreadPool,
-
-    // Rust drops fields in declaration order; keep this last so WSACleanup runs
-    // after socket/RIO-backed state has been torn down.
-    _winsock: WinsockGuard,
-}
-
-// SAFETY: the reaper receives the complete state through one channel and is the only thread that
-// polls or drops it afterwards. Active OVERLAPPED values remain in their original registry slots.
-unsafe impl Send for IocpDriverState {}
-
 impl<'a> IocpDriver<'a> {
+    /// 使用给定配置创建 IOCP driver。 / Creates an IOCP driver with the given configuration.
+    pub fn new(
+        config: impl AsRef<IocpConfig>,
+        registrar: &'a (dyn BufferRegistrar + 'a),
+    ) -> IocpResult<Self> {
+        let state = LifecycleService::build(config, registrar)?;
+        Ok(Self {
+            registrar,
+            state: Some(Box::new(state)),
+        })
+    }
+
+    fn close_impl(&mut self, mode: CloseMode) -> IocpResult<()> {
+        if self.state.is_none() {
+            return Ok(());
+        }
+        let registrar = self.registrar;
+        let schedule_reaper = {
+            let mut view = self.state_mut().lifecycle_view();
+            LifecycleService::new(&mut view, registrar).close_impl(mode)?
+        };
+        if schedule_reaper {
+            LifecycleService::schedule_deferred_cleanup(self.take_state());
+        }
+        Ok(())
+    }
+
+    fn drain_deferred_socket_cleanup(&mut self) {
+        let mut view = self.state_mut().registration_view();
+        RegistrationService::new(&mut view).drain_deferred_socket_cleanup();
+    }
+
+    fn cancel_op_internal(&mut self, request: CancelRequest) -> IocpResult<CancelSubmitOutcome> {
+        let registrar = self.registrar;
+        let mut view = self.state_mut().cancellation_view();
+        cancellation::CancellationService::new(&mut view, registrar).cancel_op_internal(request)
+    }
+
+    fn get_completion(&mut self, timeout: Option<Duration>) -> IocpResult<()> {
+        let registrar = self.registrar;
+        let mut view = self.state_mut().polling_view();
+        polling::PollingService::new(&mut view, registrar).get_completion(timeout)
+    }
+
+    fn register_buffer_backend(
+        &mut self,
+        id: ChunkId,
+        ptr: *const u8,
+        len: usize,
+    ) -> IocpResult<BufferRegistrationStatus> {
+        let mut view = self.state_mut().registration_view();
+        RegistrationService::new(&mut view).register_buffer_backend(id, ptr, len)
+    }
+
+    fn register_files<'h>(
+        &mut self,
+        files: Vec<RegisterFd<'h, IocpHandle>>,
+    ) -> IocpResult<Vec<IoFd>> {
+        let mut view = self.state_mut().registration_view();
+        RegistrationService::new(&mut view).register_files(files)
+    }
+
+    fn unregister_files(&mut self, files: Vec<IoFd>) -> IocpResult<()> {
+        let mut view = self.state_mut().registration_view();
+        RegistrationService::new(&mut view).unregister_files(files)
+    }
+
     fn state(&self) -> &IocpDriverState {
         self.state
             .as_deref()
@@ -122,68 +149,54 @@ impl<'a> IocpDriver<'a> {
             .expect("IocpDriver state was transferred to the deferred reaper")
     }
 
-    pub(super) fn take_state(&mut self) -> Box<IocpDriverState> {
+    fn take_state(&mut self) -> Box<IocpDriverState> {
         self.state
             .take()
             .expect("IocpDriver state was already transferred")
     }
 }
 
+impl Drop for IocpDriver<'_> {
+    fn drop(&mut self) {
+        if self.state.is_none() {
+            return;
+        }
+        debug!("Dropping IocpDriver");
+        if let Err(error) = self.close_impl(CloseMode::Fast) {
+            tracing::error!(report = ?error, "iocp close_impl fast failed during drop");
+        }
+    }
+}
+
+/// driver 或操作的关闭模式。
 /// Closing mode for the driver or operations.
 #[derive(Clone, Copy, Debug)]
 pub enum CloseMode {
+    /// 立即关闭，不等待未完成操作。
     /// Closes quickly without waiting for pending operations.
     Fast,
+    /// 等待指定时长以允许未完成操作结束，然后关闭。
     /// Closes after a specified timeout, allowing pending operations to finish.
     Strict { timeout: Duration },
 }
 
 impl<'a> IocpDriver<'a> {
-    /// Checks if the provided operation is a RIO-based operation.
-    pub(crate) fn is_rio_op(op: &IocpOp) -> bool {
-        match op.kind() {
-            OpKind::Recv | OpKind::Send | OpKind::UdpSend | OpKind::SendTo => true,
-            OpKind::RecvProvided | OpKind::RecvMulti | OpKind::UdpRecvMulti => {
-                op.multishot_vtable().is_some_and(|vtable| {
-                    let cardinality_ok = match op.kind() {
-                        OpKind::RecvProvided => !op.is_multishot(),
-                        _ => op.is_multishot(),
-                    };
-                    cardinality_ok && vtable.operation == op.kind()
-                })
-            }
-            OpKind::AcceptMulti => false,
-            _ => false,
-        }
-    }
-
     pub(crate) fn has_active_ops_internal(&self) -> bool {
-        self.state().ops.has_active_ops()
+        self.state().has_active_ops()
     }
 
     pub(crate) fn create_waker(&self) -> Arc<dyn RemoteWaker<IocpError>> {
-        self.state().completion.create_waker()
+        self.state().create_waker()
     }
 
     #[cfg(test)]
     pub(crate) fn debug_registered_file(&self, idx: usize) -> Option<&RegisteredHandle> {
-        self.state().handles.registered_file(idx)
+        self.state().debug_registered_file(idx)
     }
 
     #[cfg(test)]
     pub(crate) fn debug_remote_free_contains(&self, needle: usize) -> bool {
-        use veloq_driver_core::slot::SlotTable;
-        use veloq_std::sync::atomic::Ordering;
-
-        let ops = &self.state().ops;
-        let mut cur = ops.shared.remote_free_head.load(Ordering::Acquire);
-        while cur != SlotTable::<IocpSlotSpec>::NULL_INDEX {
-            if cur == needle {
-                return true;
-            }
-            cur = ops.shared.slots[cur].next_free.load(Ordering::Relaxed);
-        }
-        false
+        self.state().debug_remote_free_contains(needle)
     }
 }
 
@@ -239,12 +252,13 @@ impl<'a> DriverRaw for IocpDriver<'a> {
 
     fn reserve_op_raw(&mut self) -> IocpResult<OpToken> {
         let state = self.state_mut();
-        let (user_data, generation) = match state.ops.insert(OpEntry::new(IocpOpState::default())) {
-            Ok(handle) => (handle.index, handle.generation),
-            Err(_) => {
-                return Err(IocpError::Registration.report("iocp/driver", "OpRegistry is full"));
-            }
-        };
+        let (user_data, generation) =
+            match state.ops_mut().insert(OpEntry::new(IocpOpState::default())) {
+                Ok(handle) => (handle.index, handle.generation),
+                Err(_) => {
+                    return Err(IocpError::Registration.report("iocp/driver", "OpRegistry is full"));
+                }
+            };
         OpToken::from_registry_parts(user_data, generation).map_err(|err| {
             IocpError::Registration
                 .to_report()
@@ -257,35 +271,38 @@ impl<'a> DriverRaw for IocpDriver<'a> {
     }
 
     fn slot_table_raw(&self) -> SharedSlotTable<Self::SlotSpec> {
-        self.state().ops.shared.clone()
+        self.state().ops().shared.clone()
     }
 
     fn remote_cancel_sender_raw(&self) -> RemoteCancelSender {
-        self.state().remote_cancel_sender.clone()
+        self.state().remote_cancel_sender().clone()
     }
 
     fn try_recv_remote_cancel_request(&mut self) -> Option<CancelRequest> {
-        self.state_mut().remote_cancel_receiver.try_recv().ok()
+        self.state_mut()
+            .remote_cancel_receiver_mut()
+            .try_recv()
+            .ok()
     }
 
     fn slot_set_payload_raw(&mut self, token: OpToken, payload: IocpUserPayload) {
-        let _ =
-            self.state_mut()
-                .ops
-                .with_slot_storage_mut(token, |_result, payload_cell, _sidecar| {
-                    *payload_cell = Some(payload);
-                });
+        let _ = self.state_mut().ops_mut().with_slot_storage_mut(
+            token,
+            |_result, payload_cell, _sidecar| {
+                *payload_cell = Some(payload);
+            },
+        );
     }
 
     fn slot_take_payload_raw(&mut self, token: OpToken) -> Option<IocpUserPayload> {
         self.state_mut()
-            .ops
+            .ops_mut()
             .with_slot_storage_mut(token, |_result, payload_cell, _sidecar| payload_cell.take())
             .flatten()
     }
 
     fn release_op_slot_raw(&mut self, token: OpToken) {
-        let _ = self.state_mut().ops.remove(token);
+        let _ = self.state_mut().ops_mut().remove(token);
     }
 
     fn submit_op_raw(
@@ -293,7 +310,7 @@ impl<'a> DriverRaw for IocpDriver<'a> {
         token: OpToken,
         op_in: &mut Option<IocpOp>,
     ) -> DriverSubmitResult<IocpError> {
-        if self.state().shutting_down {
+        if self.state().is_shutting_down() {
             return DriverSubmitResult::failed(
                 IocpError::Internal
                     .to_report()
@@ -314,7 +331,9 @@ impl<'a> DriverRaw for IocpDriver<'a> {
             }
         };
 
-        let result = match self.call_op_submit(token, op) {
+        let registrar = self.registrar;
+        let mut view = self.state_mut().submission_view();
+        let result = match SubmissionService::new(&mut view, registrar).call_op_submit(token, op) {
             Ok(res) => res,
             Err(e) => {
                 return DriverSubmitResult::failed(
@@ -325,25 +344,23 @@ impl<'a> DriverRaw for IocpDriver<'a> {
             }
         };
 
-        let state = self.state_mut();
-        let completion = &state.completion;
-        let timer = &mut state.timer;
-        let diagnostics = &mut state.completion_diagnostics;
+        let state = self.state_mut().submission_view();
+        let port = state.completion.port_arc();
+        let completion_table = state.completion.table();
         let ctx = SubmitContextInternal::new(
-            completion.port_arc(),
-            timer,
-            completion.table(),
-            diagnostics,
+            port,
+            state.timer,
+            completion_table,
+            state.completion_diagnostics,
         );
-
-        Self::on_submit_res(
-            &mut state.ops,
+        SubmissionService::on_submit_res(SubmitResolution {
+            ops: state.ops,
             ctx,
             result,
             token,
             op_in,
-            &state.blocking_pool,
-        )
+            blocking_pool: state.blocking_pool,
+        })
     }
 
     fn drive_raw(&mut self, mode: DriveMode) -> IocpResult<DriveOutcome> {
@@ -357,10 +374,10 @@ impl<'a> DriverRaw for IocpDriver<'a> {
             }
             DriveMode::Wait { timeout } => {
                 self.state()
-                    .completion_diagnostics
+                    .completion_diagnostics()
                     .backend()
                     .inc_wait_enter();
-                let wait_timeout = if self.state().ops.shared.has_ready_completion() {
+                let wait_timeout = if self.state().ops().shared.has_ready_completion() {
                     Some(Duration::ZERO)
                 } else {
                     timeout
@@ -373,7 +390,7 @@ impl<'a> DriverRaw for IocpDriver<'a> {
 
         self.drain_deferred_socket_cleanup();
 
-        let next_timeout_hint = self.state().timer.next_deadline().map_err(|error| {
+        let next_timeout_hint = self.state().timer().next_deadline().map_err(|error| {
             IocpError::InvalidState
                 .report(
                     "iocp.timer.deadline",
@@ -384,7 +401,7 @@ impl<'a> DriverRaw for IocpDriver<'a> {
 
         Ok(DriveOutcome {
             next_timeout_hint,
-            ready_completion: self.state().ops.shared.has_ready_completion(),
+            ready_completion: self.state().ops().shared.has_ready_completion(),
             in_flight: self.has_active_ops_internal(),
             pending_work: Default::default(),
             budget_exhausted: false,
@@ -393,7 +410,7 @@ impl<'a> DriverRaw for IocpDriver<'a> {
     }
 
     fn completion_table_raw(&self) -> SharedCompletionTable<Self::SlotSpec> {
-        self.state().completion.completion_table()
+        self.state().completion().completion_table()
     }
 
     fn cancel_op_raw(&mut self, request: CancelRequest) -> IocpResult<CancelSubmitOutcome> {
@@ -430,6 +447,6 @@ impl<'a> DriverRaw for IocpDriver<'a> {
 #[cfg(feature = "test-hooks")]
 impl DriverTestHooks for IocpDriver<'_> {
     fn debug_chunk_register_attempts(&self) -> u64 {
-        self.state().rio.debug_chunk_register_attempts()
+        self.state().debug_chunk_register_attempts()
     }
 }

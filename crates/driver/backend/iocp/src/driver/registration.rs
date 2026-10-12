@@ -16,7 +16,7 @@ use crate::{
     config::{
         IoFd, IocpHandle, RawHandle, RawHandleKind, RegisteredHandle, RegisteredSlot, SocketKey,
     },
-    driver::IocpDriver,
+    driver::state::RegistrationStateView,
     error::{IocpError, IocpResult},
     op::locate_registered_slot,
     rio::RioState,
@@ -35,6 +35,20 @@ pub(super) struct HandleRegistry {
     deferred_socket_cleanup: VecDeque<DeferredSocketCleanup>,
     file_generation_counter: u64,
     socket_generation_counter: u64,
+}
+
+pub(super) struct RegistrationService<'view, 'state> {
+    state: &'view mut RegistrationStateView<'state>,
+}
+
+impl<'view, 'state> RegistrationService<'view, 'state> {
+    pub(super) fn new(state: &'view mut RegistrationStateView<'state>) -> Self {
+        Self { state }
+    }
+
+    fn state_mut(&mut self) -> &mut RegistrationStateView<'state> {
+        self.state
+    }
 }
 
 impl DeferredSocketCleanup {
@@ -115,7 +129,11 @@ impl HandleRegistry {
                     .attach_note("registered file table index exceeds IoFd range")
             })?;
             let generation = self.next_file_generation();
-            self.slots.push(RegisteredSlot::occupied(entry, generation));
+            self.slots.push(RegisteredSlot {
+                handle: Some(entry),
+                generation,
+                association: None,
+            });
             (fixed_index as usize, fixed_index)
         };
         Ok(IoFd::fixed_with_generation(
@@ -150,7 +168,8 @@ impl HandleRegistry {
             Some(RegisteredHandle::Weak(_)) => IocpError::InvalidInput
                 .with_ctx("fd", fd.to_string())
                 .attach_note("Close is only valid for owned registered file descriptors"),
-            // `locate_registered_slot` only returns occupied slots.
+            // `locate_registered_slot` 仅返回已占用的 slot。
+            // `locate_registered_slot` returns only occupied slots.
             None => IocpError::ResolveFd
                 .with_ctx("fd", fd.to_string())
                 .attach_note("invalid registered file descriptor"),
@@ -251,54 +270,18 @@ fn close_owned_entry_now(entry: RegisteredHandle) -> IocpResult<usize> {
     }
 }
 
-pub(super) fn close_registered_owned_fd(
-    handles: &mut HandleRegistry,
-    rio: &mut RioState,
-    fd: IoFd,
-) -> IocpResult<(IocpHandle, IocpResult<usize>)> {
-    let (idx, entry) = handles.take_owned_for_close(fd)?;
-    let raw = entry.as_raw().raw();
-    handles.release_slot(idx);
-
-    let result = if raw.kind() == RawHandleKind::Socket {
-        let key = raw.actor_key();
-        let ready = match rio.begin_socket_cleanup(key).trans() {
-            Ok(ready) => ready,
-            Err(error) => {
-                // Keep the owned handle alive if cleanup setup fails while RIO may still hold
-                // references to the socket. The deferred queue retains it until a later drain.
-                handles.defer_socket_cleanup(key, entry);
-                return Err(error);
-            }
-        };
-        if ready {
-            rio.shutdown_actor(key);
-            if let Err(error) = rio.forget_socket_runtime(key).trans() {
-                handles.defer_socket_cleanup(key, entry);
-                return Err(error);
-            }
-            close_owned_entry_now(entry)
-        } else {
-            handles.defer_socket_cleanup(key, entry);
-            Ok(0)
-        }
-    } else {
-        close_owned_entry_now(entry)
-    };
-
-    Ok((raw, result))
-}
-
-impl<'a> IocpDriver<'a> {
+impl RegistrationService<'_, '_> {
+    /// 探测可能不可信的原始句柄，以便执行回退判断。
     /// Fallback probe for potentially untrusted raw handles.
     ///
-    /// We trust `RawHandle` enum semantics by default. Probe is only used when a
-    /// `File`-tagged handle may actually be a socket.
-    pub(crate) fn detect_socket_from_file_handle(handle: RawHandle) -> IocpResult<bool> {
+    /// 默认信任 `RawHandle` 枚举标记；仅当标记为 `File` 的句柄可能实际是 socket 时探测。
+    /// Trust `RawHandle` enum tags by default; probe only when a `File`-tagged handle may be a socket.
+    pub(super) fn detect_socket_from_file_handle(handle: RawHandle) -> IocpResult<bool> {
         let socket = handle.raw().as_socket();
         let mut ty = 0i32;
         let mut len = mem::size_of::<i32>() as i32;
-        // SAFETY: buffer pointers are valid for getsockopt call.
+        // SAFETY: 缓冲区指针在 getsockopt 调用期间有效。
+        // SAFETY: buffer pointers remain valid for the getsockopt call.
         let ret = unsafe {
             getsockopt(
                 socket as SOCKET,
@@ -311,7 +294,8 @@ impl<'a> IocpDriver<'a> {
         if ret == 0 {
             return Ok(true);
         }
-        // SAFETY: reads last winsock error after getsockopt failure.
+        // SAFETY: getsockopt 失败后读取最近一次 Winsock 错误。
+        // SAFETY: reads the last Winsock error after getsockopt fails.
         let err = unsafe { WSAGetLastError() };
         if err == WSAENOTSOCK {
             Ok(false)
@@ -321,6 +305,44 @@ impl<'a> IocpDriver<'a> {
                 io::Error::from_raw_os_error(err),
             ))
         }
+    }
+
+    pub(super) fn close_registered_owned_fd(
+        handles: &mut HandleRegistry,
+        rio: &mut RioState,
+        fd: IoFd,
+    ) -> IocpResult<(IocpHandle, IocpResult<usize>)> {
+        let (idx, entry) = handles.take_owned_for_close(fd)?;
+        let raw = entry.as_raw().raw();
+        handles.release_slot(idx);
+
+        let result = if raw.kind() == RawHandleKind::Socket {
+            let key = raw.actor_key();
+            let ready = match rio.begin_socket_cleanup(key).trans() {
+                Ok(ready) => ready,
+                Err(error) => {
+                    // cleanup 尚未安全完成时保留所有权，避免关闭 RIO 仍引用的 socket。
+                    // Retain ownership if cleanup setup fails while RIO may still reference the socket.
+                    handles.defer_socket_cleanup(key, entry);
+                    return Err(error);
+                }
+            };
+            if ready {
+                rio.shutdown_actor(key);
+                if let Err(error) = rio.forget_socket_runtime(key).trans() {
+                    handles.defer_socket_cleanup(key, entry);
+                    return Err(error);
+                }
+                close_owned_entry_now(entry)
+            } else {
+                handles.defer_socket_cleanup(key, entry);
+                Ok(0)
+            }
+        } else {
+            close_owned_entry_now(entry)
+        };
+
+        Ok((raw, result))
     }
 
     pub(super) fn drain_deferred_socket_cleanup(&mut self) {
@@ -352,8 +374,9 @@ impl<'a> IocpDriver<'a> {
         }
     }
 
+    /// 为 RIO 操作注册一个缓冲区块。
     /// Registers a buffer chunk for RIO operations.
-    pub(crate) fn register_buffer_backend(
+    pub(super) fn register_buffer_backend(
         &mut self,
         id: ChunkId,
         ptr: *const u8,
@@ -368,8 +391,9 @@ impl<'a> IocpDriver<'a> {
             .trans()
     }
 
-    /// Registers a set of file/socket handles for use with the driver.
-    pub(crate) fn register_files<'h>(
+    /// 为 driver 注册一组文件或 socket 句柄。
+    /// Registers a set of file and socket handles for use with the driver.
+    pub(super) fn register_files<'h>(
         &mut self,
         files: Vec<RegisterFd<'h, IocpHandle>>,
     ) -> IocpResult<Vec<IoFd>> {
@@ -389,13 +413,14 @@ impl<'a> IocpDriver<'a> {
             fn into_entry(self, canonical: RawHandle) -> RegisteredHandle {
                 match self {
                     Self::Borrowed(_) => {
-                        // Borrowed handles must remain non-owning to avoid accidental close/double-close.
+                        // 借用句柄不得转为所有权，以免意外关闭或重复关闭。
+                        // Borrowed handles must remain non-owning to prevent accidental or duplicate closes.
                         RegisteredHandle::Weak(canonical)
                     }
                     Self::Owned(handle) => {
                         let _ = handle.into_raw();
-                        // SAFETY: ownership comes from RegisterFd::Owned and is transferred
-                        // into the registered slot for deterministic lifecycle management.
+                        // SAFETY: 所有权来自 RegisterFd::Owned，并转移到注册 slot 统一管理生命周期。
+                        // SAFETY: ownership comes from RegisterFd::Owned and transfers to the registered slot for lifecycle management.
                         RegisteredHandle::Owned(unsafe {
                             OwnedRawHandle::from_raw_owned(canonical)
                         })
@@ -411,11 +436,12 @@ impl<'a> IocpDriver<'a> {
                 RegisterFd::Owned(h) => InputHandle::Owned(h),
             };
             let handle = input.raw();
-            // Trust enum semantics first; only probe file-tagged handles as fallback.
+            // 优先信任枚举标记；仅对标记为文件的句柄执行探测回退。
+            // Trust enum tags first; probe file-tagged handles only as a fallback.
             let mut canonical = match handle.kind() {
                 RawHandleKind::Socket => handle,
                 RawHandleKind::File => {
-                    if Self::detect_socket_from_file_handle(handle)
+                    if RegistrationService::detect_socket_from_file_handle(handle)
                         .push_ctx("scope", "iocp/driver")
                         .attach_note("detect socket from file handle failed")?
                     {
@@ -472,8 +498,9 @@ impl<'a> IocpDriver<'a> {
         Ok(registered)
     }
 
+    /// 取消注册一组已注册文件。
     /// Unregisters a set of previously registered files.
-    pub(crate) fn unregister_files(&mut self, files: Vec<IoFd>) -> IocpResult<()> {
+    pub(super) fn unregister_files(&mut self, files: Vec<IoFd>) -> IocpResult<()> {
         for fd in files {
             if let Some((idx, entry)) = self.state_mut().handles.take_for_unregister(fd) {
                 if entry.as_raw().kind() == RawHandleKind::Socket {
@@ -487,8 +514,8 @@ impl<'a> IocpDriver<'a> {
                     {
                         Ok(ready) => ready,
                         Err(error) => {
-                            // Do not drop an owned socket while a failed cleanup request may
-                            // still leave RIO requests holding the socket alive.
+                            // 清理请求失败后 RIO 仍可能持有 socket，因此保留其所有权。
+                            // Keep ownership because RIO requests may still hold the socket after cleanup fails.
                             self.state_mut().handles.defer_socket_cleanup(key, entry);
                             self.state_mut().handles.release_slot(idx);
                             return Err(error);

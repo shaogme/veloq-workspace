@@ -8,6 +8,7 @@ use veloq_std::{
 use super::{completion::COMP_BACKEND_IOCP, polling::TimerEngine};
 use diagweave::prelude::*;
 use veloq_blocking::{BlockingTask, ThreadPool};
+use veloq_buf::BufferRegistrar;
 use veloq_driver_core::{
     driver::{
         CompletionBackendHooks, CompletionContinuation, CompletionControl, CompletionFailure,
@@ -24,13 +25,14 @@ use veloq_driver_core::{
 use crate::{
     config::{IoFd, RawHandle},
     driver::{
-        IocpDriver, IocpDriverCompletionDiagnostics, IocpOpRegistry,
-        completion::IocpSubmissionFailurePhase, registration::close_registered_owned_fd,
+        completion::IocpSubmissionFailurePhase,
+        registration::RegistrationService,
+        state::{IocpDriverCompletionDiagnostics, SubmissionStateView},
     },
     error::{IocpError, IocpResult, iocp_fallback_event_res},
     op::{
-        BlockingCompletion, IocpOp, IocpOpPayload, IocpSlotSpec, Slot, SubmissionResult,
-        SubmitContext,
+        BlockingCompletion, IocpOp, IocpOpPayload, IocpOpRegistry, IocpSlotSpec, Slot,
+        SubmissionResult, SubmitContext,
     },
     win32::{IoCompletionPort, Overlapped},
 };
@@ -42,8 +44,35 @@ pub(crate) struct SubmitContextInternal<'a> {
     diagnostics: &'a mut IocpDriverCompletionDiagnostics,
 }
 
+pub(super) struct SubmitResolution<'a> {
+    pub(super) ops: &'a mut IocpOpRegistry,
+    pub(super) ctx: SubmitContextInternal<'a>,
+    pub(super) result: IocpResult<SubmissionResult>,
+    pub(super) token: OpToken,
+    pub(super) op_in: &'a mut Option<IocpOp>,
+    pub(super) blocking_pool: &'a ThreadPool,
+}
+
+pub(super) struct SubmissionService<'view, 'state, 'registrar> {
+    state: &'view mut SubmissionStateView<'state>,
+    registrar: &'registrar dyn BufferRegistrar,
+}
+
+impl<'view, 'state, 'registrar> SubmissionService<'view, 'state, 'registrar> {
+    pub(super) fn new(
+        state: &'view mut SubmissionStateView<'state>,
+        registrar: &'registrar dyn BufferRegistrar,
+    ) -> Self {
+        Self { state, registrar }
+    }
+
+    fn state_mut(&mut self) -> &mut SubmissionStateView<'state> {
+        self.state
+    }
+}
+
 impl<'a> SubmitContextInternal<'a> {
-    pub(crate) fn new(
+    pub(super) fn new(
         port: Arc<IoCompletionPort>,
         timer: &'a mut TimerEngine,
         completion_table: &'a SharedCompletionTable<IocpSlotSpec>,
@@ -105,7 +134,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
                 payload,
                 detail,
                 cleanup,
-                // IOCP 没有 multishot：一次提交恰好对应一条完成。
+                // IOCP 不支持 multishot：每次提交对应一条完成事件。 / IOCP does not support multishot; each submission produces one completion.
                 continuation: CompletionContinuation::Final,
                 effect: (),
             }
@@ -118,7 +147,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
                         .push_ctx("scope", "iocp.driver.SubmissionFailureHooks")
                         .with_ctx("user_data", event.token().index())
                         .with_ctx("generation", event.token().generation())
-                        .with_ctx("submission_phase", format!("{phase:?}"))
+                        .with_ctx("submission_phase", phase.as_str())
                         .attach_note(
                             "payload missing in active slot during submission failure completion",
                         ),
@@ -161,7 +190,8 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
 fn close_fd_from_op(op: &IocpOp) -> IocpResult<Option<IoFd>> {
     match &op.payload {
         IocpOpPayload::Close(payload) => {
-            // SAFETY: the slot payload is bound before submission starts.
+            // SAFETY: 提交开始前已将 payload 绑定到 slot。
+            // SAFETY: the payload is bound to the slot before submission starts.
             Ok(Some(unsafe { payload.user.as_ref()? }.fd))
         }
         _ => Ok(None),
@@ -182,9 +212,9 @@ fn slot_access_report(scope: &'static str, err: SlotAccessError) -> Report<IocpE
         .attach_note("slot access failed during IOCP submission")
 }
 
-impl<'a> IocpDriver<'a> {
+impl SubmissionService<'_, '_, '_> {
     #[inline]
-    pub(crate) fn prep_op_slot(
+    pub(super) fn prep_op_slot(
         ops: &mut IocpOpRegistry,
         token: OpToken,
         op: IocpOp,
@@ -222,7 +252,7 @@ impl<'a> IocpDriver<'a> {
         Ok(guard)
     }
 
-    pub(crate) fn handle_offload(
+    pub(super) fn handle_offload(
         ops: &mut IocpOpRegistry,
         ctx: SubmitContextInternal<'_>,
         token: OpToken,
@@ -251,14 +281,15 @@ impl<'a> IocpDriver<'a> {
         Ok(Poll::Pending)
     }
 
-    pub(crate) fn on_submit_res(
-        ops: &mut IocpOpRegistry,
-        ctx: SubmitContextInternal<'_>,
-        result: IocpResult<SubmissionResult>,
-        token: OpToken,
-        op_in: &mut Option<IocpOp>,
-        blocking_pool: &ThreadPool,
-    ) -> DriverSubmitResult<IocpError> {
+    pub(super) fn on_submit_res(resolution: SubmitResolution<'_>) -> DriverSubmitResult<IocpError> {
+        let SubmitResolution {
+            ops,
+            ctx,
+            result,
+            token,
+            op_in,
+            blocking_pool,
+        } = resolution;
         match result {
             Ok(SubmissionResult::Pending) => DriverSubmitResult::submitted(Poll::Pending),
             Ok(SubmissionResult::PostToQueue) => Self::handle_post_to_queue(ops, ctx, token, op_in),
@@ -290,7 +321,7 @@ impl<'a> IocpDriver<'a> {
         }
     }
 
-    pub(crate) fn handle_post_to_queue(
+    pub(super) fn handle_post_to_queue(
         ops: &mut IocpOpRegistry,
         ctx: SubmitContextInternal<'_>,
         token: OpToken,
@@ -315,7 +346,7 @@ impl<'a> IocpDriver<'a> {
         }
     }
 
-    pub(crate) fn handle_timer_sub(
+    pub(super) fn handle_timer_sub(
         ops: &mut IocpOpRegistry,
         ctx: SubmitContextInternal<'_>,
         token: OpToken,
@@ -353,14 +384,14 @@ impl<'a> IocpDriver<'a> {
         DriverSubmitResult::submitted(Poll::Pending)
     }
 
-    pub(crate) fn call_op_submit(
+    pub(super) fn call_op_submit(
         &mut self,
         token: OpToken,
         op: IocpOp,
     ) -> IocpResult<IocpResult<SubmissionResult>> {
         let registrar = self.registrar;
         let state = self.state_mut();
-        let mut guard = Self::prep_op_slot(&mut state.ops, token, op)
+        let mut guard = Self::prep_op_slot(state.ops, token, op)
             .push_ctx("scope", "iocp/driver")
             .attach_note("failed to prepare op slot")?;
 
@@ -379,8 +410,11 @@ impl<'a> IocpDriver<'a> {
         };
 
         let result = if let Some(fd) = close_fd {
-            let close_result =
-                close_registered_owned_fd(&mut state.handles, state.rio.state_mut(), fd);
+            let close_result = RegistrationService::close_registered_owned_fd(
+                state.handles,
+                state.rio.state_mut(),
+                fd,
+            );
 
             close_result.and_then(|(raw_handle, io_result)| {
                 let completion = BlockingCompletion::new(
@@ -411,7 +445,7 @@ impl<'a> IocpDriver<'a> {
                 overlapped,
                 op_token: token,
                 completion_token: CompletionToken::user(token),
-                ext: &state.extensions,
+                ext: state.extensions,
                 registered_slots,
                 registrar,
                 rio,
@@ -436,7 +470,7 @@ impl<'a> IocpDriver<'a> {
                 .and_then(|slot| {
                     slot.with_access_mut(|access| {
                         let op = access.operation().get_ref();
-                        !Self::is_rio_op(op)
+                        !op.uses_rio_backend()
                             && op.header.in_flight
                             && op.header.resolved_handle.is_some_and(|h| h.is_socket())
                             && op.header.socket_inflight.is_none()

@@ -94,7 +94,7 @@ impl Config {
         #[cfg(windows)]
         {
             let mut this = self;
-            this.iocp.blocking_pool = blocking_pool;
+            this.iocp = this.iocp.with_blocking_pool(blocking_pool);
             this
         }
         #[cfg(not(windows))]
@@ -106,7 +106,7 @@ impl Config {
 
     #[cfg(windows)]
     pub fn iocp_registration_mode(mut self, mode: BufferRegistrationMode) -> Self {
-        self.iocp.registration_mode = mode;
+        self.iocp = self.iocp.registration_mode(mode);
         self
     }
 
@@ -126,23 +126,24 @@ impl Config {
         self
     }
 
-    /// 为每个 worker 配置并注册一组 provided buffer（io_uring 5.19+）。
+    /// 为每个 worker 配置并注册一组 provided buffer（io_uring 5.19+）。 / Configures and registers provided buffers per worker (io_uring 5.19+).
     ///
-    /// provided buffer 默认使用 [`ProvidedBufConfig::default`]，此方法仅用于自定义环的
-    /// entries 和单个 buffer 容量；provided buffer 始终开启。
+    /// 默认使用 [`ProvidedBufConfig::default`]；此方法只自定义环 entries 和单个 buffer 容量，provided buffer 始终开启。
+    /// Uses [`ProvidedBufConfig::default`] by default; this customizes ring entries and per-buffer capacity while provided buffers stay enabled.
     #[cfg(not(windows))]
     pub fn uring_provided_buffers(mut self, provided_buffers: ProvidedBufConfig) -> Self {
         self.uring.provided_buffers = provided_buffers;
         self
     }
 
-    /// IOCP 没有 provided buffer，这里保留跨平台配置 API。
+    /// IOCP 不使用 provided buffer；此方法用于保留跨平台配置 API。
+    /// IOCP does not use provided buffers; this method preserves the cross-platform configuration API.
     #[cfg(windows)]
     pub fn uring_provided_buffers(self, _provided_buffers: ProvidedBufConfig) -> Self {
         self
     }
 
-    // ============ Internal Getters ============
+    // ============ 内部读取器 / Internal getters ============
 
     pub(crate) fn get_worker_threads_opt(&self) -> Option<NonZeroUsize> {
         self.worker_threads
@@ -155,7 +156,7 @@ impl Config {
     pub fn registration_mode(&self) -> BufferRegistrationMode {
         #[cfg(windows)]
         {
-            self.iocp.registration_mode
+            self.iocp.get_registration_mode()
         }
         #[cfg(not(windows))]
         {
