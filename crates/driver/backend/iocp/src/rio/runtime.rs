@@ -1,65 +1,143 @@
-pub(crate) mod control_flow;
+mod completion;
 
 use crate::{
-    IoFd,
-    config::{BorrowedRawHandle, SocketKey},
-    op::SubmissionResult,
+    config::SocketKey,
     rio::{
-        RioState, SocketInflightGuard, SocketInflightIdentity, SocketInflightToken,
-        SocketLifecycleState, SocketRuntimeState,
-        core::{RioAddressPolicy, RioOpKind, RioSubmissionKind, RioSubmitPlan},
+        core::{RioKernel, RioOpKind, RioRq},
         error::{RioError, RioResult},
     },
 };
 
-#[cfg(test)]
-use crate::driver::IocpDriverCompletionDiagnostics;
-
 use diagweave::prelude::*;
-use veloq_buf::{BufferRegistrar, FixedBuf};
+use slotmap::{SlotMap, new_key_type};
 use veloq_driver_core::driver::OpToken;
-use veloq_std::{collections::FastHashMap, ffi::c_void};
+use veloq_std::collections::{FastHashMap, FastHashSet};
 use windows_sys::Win32::Networking::WinSock::{SD_RECEIVE, SOCKET_ERROR, shutdown};
 
-pub(crate) use control_flow::RioSocketActor;
+pub(crate) use completion::{CompletionPollArgs, RioCompletionAnomaly, RioCompletionService};
 
-pub(crate) struct RioTarget<'a> {
-    pub(crate) fd: IoFd,
-    pub(crate) handle: BorrowedRawHandle<'a>,
-    pub(crate) token: OpToken,
-    pub(crate) buf_offset: usize,
-    pub(crate) operation: &'static str,
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SocketInflightToken {
+    socket_key: SocketKey,
+    request_id: u64,
 }
 
-pub(crate) struct RioSendToArgs<'a> {
-    pub(crate) fd: IoFd,
-    pub(crate) handle: BorrowedRawHandle<'a>,
-    pub(crate) buf: &'a FixedBuf,
-    pub(crate) addr_ptr: *const c_void,
-    pub(crate) addr_len: i32,
-    pub(crate) token: OpToken,
-    pub(crate) buf_offset: usize,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SocketInflightIdentity {
+    socket_key: SocketKey,
+    request_id: u64,
 }
 
-impl RioState {
-    #[inline]
+#[must_use = "dropping a SocketInflightGuard releases the acquired socket inflight slot"]
+pub(crate) struct SocketInflightGuard<'a> {
+    runtime: &'a mut RioRuntime,
+    token: Option<SocketInflightToken>,
+}
+
+new_key_type! {
+    pub(crate) struct ActorKey;
+}
+
+pub(crate) struct RioSocketActor {
+    rq: RioRq,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SocketLifecycleState {
+    Open,
+    Closing,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SocketRuntimeState {
+    lifecycle: SocketLifecycleState,
+    inflight: u32,
+    active_tokens: FastHashSet<u64>,
+    send_inflight: u32,
+    receive_inflight: u32,
+    receive_pump_inflight: u32,
+    receive_pump_token: Option<OpToken>,
+    socket_receive_shutdown_requested: bool,
+    socket_receive_shutdown_pending: bool,
+}
+
+impl Default for SocketRuntimeState {
+    fn default() -> Self {
+        Self {
+            lifecycle: SocketLifecycleState::Open,
+            inflight: 0,
+            active_tokens: FastHashSet::default(),
+            send_inflight: 0,
+            receive_inflight: 0,
+            receive_pump_inflight: 0,
+            receive_pump_token: None,
+            socket_receive_shutdown_requested: false,
+            socket_receive_shutdown_pending: false,
+        }
+    }
+}
+
+pub(crate) struct RioRuntime {
+    submissions_closed: bool,
+    actors: SlotMap<ActorKey, RioSocketActor>,
+    actor_by_handle: FastHashMap<SocketKey, ActorKey>,
+    socket_runtime: FastHashMap<SocketKey, SocketRuntimeState>,
+    next_request_id: u64,
+}
+
+impl RioRuntime {
+    pub(super) fn new() -> Self {
+        Self {
+            submissions_closed: false,
+            actors: SlotMap::with_key(),
+            actor_by_handle: FastHashMap::default(),
+            socket_runtime: FastHashMap::default(),
+            next_request_id: 0,
+        }
+    }
+
+    pub(super) fn closed_empty() -> Self {
+        Self {
+            submissions_closed: true,
+            ..Self::new()
+        }
+    }
+
     fn socket_runtime_mut(&mut self, actor_key: SocketKey) -> &mut SocketRuntimeState {
         self.socket_runtime.entry(actor_key).or_default()
     }
 
-    #[inline]
-    pub(crate) fn mark_socket_registered(&mut self, actor_key: SocketKey) {
-        let submissions_closed = self.submissions_closed;
-        let state = self.socket_runtime_mut(actor_key);
-        state.lifecycle = if submissions_closed {
+    pub(super) fn mark_socket_registered(&mut self, actor_key: SocketKey) {
+        let lifecycle = if self.submissions_closed {
             SocketLifecycleState::Closing
         } else {
             SocketLifecycleState::Open
         };
+        self.socket_runtime_mut(actor_key).lifecycle = lifecycle;
     }
 
-    #[inline]
-    pub(crate) fn begin_socket_cleanup(&mut self, actor_key: SocketKey) -> RioResult<bool> {
+    pub(super) fn stop_accepting_new_submissions(&mut self) {
+        self.submissions_closed = true;
+        self.actor_by_handle.clear();
+        for socket_state in self.socket_runtime.values_mut() {
+            socket_state.lifecycle = SocketLifecycleState::Closing;
+        }
+    }
+
+    pub(super) fn forget_after_drain(&mut self, rio_outstanding_count: usize) -> RioResult<()> {
+        if !self.runtime_ready_for_forget(rio_outstanding_count) {
+            return RioError::InvalidInput
+                .with_ctx("rio_outstanding_count", rio_outstanding_count)
+                .with_ctx("socket_inflight", self.socket_inflight_count())
+                .attach_note("forgetting RIO runtime before all requests drained");
+        }
+        self.actors.clear();
+        self.actor_by_handle.clear();
+        self.socket_runtime.clear();
+        Ok(())
+    }
+
+    pub(super) fn begin_socket_cleanup(&mut self, actor_key: SocketKey) -> RioResult<bool> {
         self.socket_runtime_mut(actor_key).lifecycle = SocketLifecycleState::Closing;
         let has_receive_inflight = self
             .socket_runtime
@@ -74,7 +152,7 @@ impl RioState {
             .is_some_and(|state| state.inflight == 0))
     }
 
-    pub(crate) fn request_socket_receive_shutdown_for_cleanup(
+    pub(super) fn request_socket_receive_shutdown_for_cleanup(
         &mut self,
         actor_key: SocketKey,
     ) -> RioResult<()> {
@@ -94,15 +172,10 @@ impl RioState {
             }
         }
 
-        // This is a socket-lifecycle cleanup action, not a user cancellation mechanism. User
-        // cancellation only changes the logical slot or receive-pump state and never reaches
-        // this helper; the request context, leases, and socket token remain until RIO dequeue.
-        // SAFETY: the actor key is the live socket handle retained by the registered socket
-        // runtime. Shutting down only the receive direction leaves the connected socket open for
-        // its send side while the pending RIO receive is completed by Winsock.
+        // SAFETY: The registered runtime retains this handle; receive shutdown leaves sends open. / 安全性：已注册 runtime 持有此句柄；关闭接收方向不会关闭发送方向。
         let result = unsafe { shutdown(actor_key.as_socket(), SD_RECEIVE) };
         if result == SOCKET_ERROR {
-            return Err(RioState::last_wsa_report(
+            return Err(RioKernel::last_wsa_report(
                 RioError::InvalidInput,
                 "rio.runtime.shutdown_receive_for_cleanup",
             ));
@@ -113,12 +186,11 @@ impl RioState {
         Ok(())
     }
 
-    pub(crate) fn activate_receive_pump(&mut self, actor_key: SocketKey, token: OpToken) {
-        let state = self.socket_runtime_mut(actor_key);
-        state.receive_pump_token = Some(token);
+    pub(super) fn activate_receive_pump(&mut self, actor_key: SocketKey, token: OpToken) {
+        self.socket_runtime_mut(actor_key).receive_pump_token = Some(token);
     }
 
-    pub(crate) fn finish_receive_pump(&mut self, actor_key: SocketKey, token: OpToken) {
+    pub(super) fn finish_receive_pump(&mut self, actor_key: SocketKey, token: OpToken) {
         if let Some(state) = self.socket_runtime.get_mut(&actor_key)
             && state.receive_pump_token == Some(token)
         {
@@ -126,7 +198,7 @@ impl RioState {
         }
     }
 
-    pub(crate) fn record_request_submitted(
+    pub(super) fn record_request_submitted(
         &mut self,
         op_kind: RioOpKind,
         actor_key: SocketKey,
@@ -158,7 +230,7 @@ impl RioState {
         Ok(())
     }
 
-    pub(crate) fn release_request_inflight(
+    pub(super) fn release_request_inflight(
         &mut self,
         op_kind: RioOpKind,
         token: SocketInflightToken,
@@ -166,7 +238,7 @@ impl RioState {
         self.release_request_inflight_identity(op_kind, token.identity())
     }
 
-    pub(crate) fn release_request_inflight_identity(
+    pub(super) fn release_request_inflight_identity(
         &mut self,
         op_kind: RioOpKind,
         identity: SocketInflightIdentity,
@@ -232,22 +304,22 @@ impl RioState {
             }
             state.receive_pump_inflight -= 1;
         }
-        release_socket_inflight_identity_from(&mut self.socket_runtime, identity)?;
+        identity.release_from(&mut self.socket_runtime)?;
         if retry_receive_shutdown {
             self.request_socket_receive_shutdown_for_cleanup(actor_key)?;
         }
         Ok(())
     }
 
-    #[inline]
-    pub(crate) fn try_acquire_socket_inflight_token(
+    pub(super) fn try_acquire_socket_inflight_token(
         &mut self,
         actor_key: SocketKey,
+        rio_outstanding_count: usize,
     ) -> RioResult<SocketInflightToken> {
         if self.submissions_closed {
             return RioError::InvalidInput
                 .with_ctx("socket_raw", actor_key.as_handle() as usize)
-                .with_ctx("rio_outstanding_count", self.rio_outstanding_count)
+                .with_ctx("rio_outstanding_count", rio_outstanding_count)
                 .attach_note("RIO runtime is shutting down; rejecting socket submission");
         }
 
@@ -285,28 +357,26 @@ impl RioState {
         Ok(SocketInflightToken::new(actor_key, request_id))
     }
 
-    #[inline]
-    pub(crate) fn try_acquire_socket_inflight_guard(
+    pub(super) fn try_acquire_socket_inflight_guard(
         &mut self,
         actor_key: SocketKey,
+        rio_outstanding_count: usize,
     ) -> RioResult<SocketInflightGuard<'_>> {
-        let token = self.try_acquire_socket_inflight_token(actor_key)?;
+        let token = self.try_acquire_socket_inflight_token(actor_key, rio_outstanding_count)?;
         Ok(SocketInflightGuard {
-            state: self,
+            runtime: self,
             token: Some(token),
         })
     }
 
-    #[inline]
-    pub(crate) fn release_socket_inflight_token(
+    pub(super) fn release_socket_inflight_token(
         &mut self,
         token: SocketInflightToken,
     ) -> RioResult<()> {
-        release_socket_inflight_token_from(&mut self.socket_runtime, token)
+        token.release_from(&mut self.socket_runtime)
     }
 
-    #[inline]
-    pub(crate) fn socket_ready_for_cleanup(&self, actor_key: SocketKey) -> bool {
+    pub(super) fn socket_ready_for_cleanup(&self, actor_key: SocketKey) -> bool {
         self.socket_runtime.get(&actor_key).is_some_and(|state| {
             state.lifecycle == SocketLifecycleState::Closing
                 && state.inflight == 0
@@ -314,8 +384,7 @@ impl RioState {
         })
     }
 
-    #[inline]
-    pub(crate) fn forget_socket_runtime(&mut self, actor_key: SocketKey) -> RioResult<()> {
+    pub(super) fn forget_socket_runtime(&mut self, actor_key: SocketKey) -> RioResult<()> {
         if !self.socket_ready_for_cleanup(actor_key) {
             return RioError::InvalidInput
                 .with_ctx("socket_raw", actor_key.as_handle() as usize)
@@ -325,24 +394,78 @@ impl RioState {
         Ok(())
     }
 
-    #[inline]
-    pub(crate) fn socket_inflight_count(&self) -> u64 {
+    pub(super) fn socket_inflight_count(&self) -> u64 {
         self.socket_runtime
             .values()
             .map(|state| u64::from(state.inflight))
             .sum()
     }
 
-    #[inline]
-    pub(crate) fn has_socket_inflight(&self) -> bool {
+    pub(super) fn has_socket_inflight(&self) -> bool {
         self.socket_runtime
             .values()
             .any(|state| state.inflight != 0 || !state.active_tokens.is_empty())
     }
 
-    #[inline]
-    pub(crate) fn runtime_ready_for_forget(&self) -> bool {
-        self.rio_outstanding_count == 0 && !self.has_socket_inflight()
+    pub(super) fn runtime_ready_for_forget(&self, rio_outstanding_count: usize) -> bool {
+        rio_outstanding_count == 0 && !self.has_socket_inflight()
+    }
+
+    pub(super) fn is_submissions_closed(&self) -> bool {
+        self.submissions_closed
+    }
+
+    pub(super) fn actor_mut_for_handle(
+        &mut self,
+        socket_key: SocketKey,
+    ) -> Option<&mut RioSocketActor> {
+        let actor_key = self.actor_by_handle.get(&socket_key).copied()?;
+        self.actors.get_mut(actor_key)
+    }
+
+    pub(super) fn actor_index_contains(&self, socket_key: SocketKey) -> bool {
+        self.actor_by_handle.contains_key(&socket_key)
+    }
+
+    pub(super) fn actor_count(&self) -> usize {
+        self.actors.len()
+    }
+
+    pub(super) fn has_actors(&self) -> bool {
+        !self.actor_by_handle.is_empty()
+    }
+
+    pub(super) fn insert_actor(&mut self, socket_key: SocketKey, actor: RioSocketActor) -> bool {
+        let is_first = self.actor_by_handle.is_empty();
+        let actor_key = self.actors.insert(actor);
+        self.actor_by_handle.insert(socket_key, actor_key);
+        self.socket_runtime.entry(socket_key).or_default();
+        is_first
+    }
+
+    pub(super) fn remove_actor(&mut self, socket_key: SocketKey) {
+        if let Some(actor_key) = self.actor_by_handle.remove(&socket_key) {
+            let _ = self.actors.remove(actor_key);
+        }
+    }
+
+    pub(super) fn socket_closing_inflight(&self, actor_key: SocketKey) -> Option<u32> {
+        self.socket_runtime
+            .get(&actor_key)
+            .filter(|state| state.lifecycle == SocketLifecycleState::Closing)
+            .map(|state| state.inflight)
+    }
+
+    #[cfg(test)]
+    pub(super) fn actor_index_is_empty(&self) -> bool {
+        self.actor_by_handle.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(super) fn socket_inflight_for(&self, actor_key: SocketKey) -> Option<u32> {
+        self.socket_runtime
+            .get(&actor_key)
+            .map(|state| state.inflight)
     }
 
     fn next_request_id_checked(&mut self) -> RioResult<u64> {
@@ -354,61 +477,91 @@ impl RioState {
         self.next_request_id = next;
         Ok(next)
     }
+}
 
-    pub(crate) fn try_submit_send_to(
-        &mut self,
-        args: RioSendToArgs<'_>,
-        registrar: &dyn BufferRegistrar,
-    ) -> RioResult<SubmissionResult> {
-        self.try_submit_send_to_internal(args, registrar)
+impl RioSocketActor {
+    pub(crate) fn new(rq: RioRq) -> Self {
+        Self { rq }
     }
 
-    fn try_submit_send_to_internal(
-        &mut self,
-        args: RioSendToArgs<'_>,
-        registrar: &dyn BufferRegistrar,
-    ) -> RioResult<SubmissionResult> {
-        let RioSendToArgs {
-            fd,
-            handle,
-            buf,
-            addr_ptr,
-            addr_len,
-            token,
-            buf_offset,
-            ..
-        } = args;
-        self.submit_rio(
-            RioSubmitPlan {
-                fd,
-                handle,
-                token,
-                op_kind: RioOpKind::SendTo,
-                buffer_kind: RioSubmissionKind::Send,
-                buffer: buf,
-                buffer_offset: buf_offset,
-                operation: "send_to",
-                address: RioAddressPolicy::SendTo { addr_ptr, addr_len },
-                dispatch_error: RioError::Internal,
-                dispatch_note: "lost RIO context",
-                submit_scope: "rio.runtime.try_submit_send_to_internal",
-                submit_note: "RIOSendEx submit failed",
-                receive_slot_id: None,
-                receive_slot_generation: None,
-            },
-            registrar,
-            |kernel, request| {
-                let Some(addr) = request.addr.as_ref() else {
-                    return RioError::Internal.attach_note("RIO send_to missing prepared address");
-                };
-                kernel.submit_send_ex(
-                    request.rq,
-                    &request.data_buf.rio_buf,
-                    &addr.rio_buf,
-                    request.as_request_context(),
-                )
-            },
-        )
+    pub(crate) const fn rq(&self) -> RioRq {
+        self.rq
+    }
+}
+
+impl SocketInflightToken {
+    #[inline]
+    pub(crate) const fn new(socket_key: SocketKey, request_id: u64) -> Self {
+        Self {
+            socket_key,
+            request_id,
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn socket_key(&self) -> SocketKey {
+        self.socket_key
+    }
+
+    #[inline]
+    pub(crate) const fn request_id(&self) -> u64 {
+        self.request_id
+    }
+
+    #[inline]
+    pub(crate) const fn identity(&self) -> SocketInflightIdentity {
+        SocketInflightIdentity {
+            socket_key: self.socket_key,
+            request_id: self.request_id,
+        }
+    }
+
+    fn release_from(
+        self,
+        socket_runtime: &mut FastHashMap<SocketKey, SocketRuntimeState>,
+    ) -> RioResult<()> {
+        self.identity().release_from(socket_runtime)
+    }
+}
+
+impl SocketInflightIdentity {
+    #[inline]
+    pub(crate) const fn socket_key(self) -> SocketKey {
+        self.socket_key
+    }
+
+    #[inline]
+    pub(crate) const fn request_id(self) -> u64 {
+        self.request_id
+    }
+
+    fn release_from(
+        self,
+        socket_runtime: &mut FastHashMap<SocketKey, SocketRuntimeState>,
+    ) -> RioResult<()> {
+        let socket_key = self.socket_key();
+        let state = socket_runtime.get_mut(&socket_key).ok_or_else(|| {
+            RioError::InvalidInput
+                .to_report()
+                .with_ctx("socket_raw", socket_key.as_handle() as usize)
+                .attach_note("socket inflight release without registered runtime state")
+        })?;
+
+        if !state.active_tokens.contains(&self.request_id()) {
+            return RioError::Internal
+                .with_ctx("socket_raw", socket_key.as_handle() as usize)
+                .with_ctx("request_id", self.request_id())
+                .attach_note("socket inflight token is stale, duplicated, or already released");
+        }
+        if state.inflight == 0 {
+            return RioError::Internal
+                .with_ctx("socket_raw", socket_key.as_handle() as usize)
+                .with_ctx("request_id", self.request_id())
+                .attach_note("socket inflight counter underflow");
+        }
+        state.active_tokens.remove(&self.request_id());
+        state.inflight -= 1;
+        Ok(())
     }
 }
 
@@ -424,76 +577,26 @@ impl SocketInflightGuard<'_> {
 impl Drop for SocketInflightGuard<'_> {
     fn drop(&mut self) {
         if let Some(token) = self.token.take()
-            && let Err(e) = self.state.release_socket_inflight_token(token)
+            && let Err(e) = self.runtime.release_socket_inflight_token(token)
         {
             tracing::error!(error = ?e, "failed to release socket inflight token in guard drop");
         }
     }
 }
 
-pub(crate) fn release_socket_inflight_token_from(
-    socket_runtime: &mut FastHashMap<SocketKey, SocketRuntimeState>,
-    token: SocketInflightToken,
-) -> RioResult<()> {
-    release_socket_inflight_identity_from(socket_runtime, token.identity())
-}
-
-pub(crate) fn release_socket_inflight_identity_from(
-    socket_runtime: &mut FastHashMap<SocketKey, SocketRuntimeState>,
-    identity: SocketInflightIdentity,
-) -> RioResult<()> {
-    let socket_key = identity.socket_key();
-    let state = socket_runtime.get_mut(&socket_key).ok_or_else(|| {
-        RioError::InvalidInput
-            .to_report()
-            .with_ctx("socket_raw", socket_key.as_handle() as usize)
-            .attach_note("socket inflight release without registered runtime state")
-    })?;
-
-    if !state.active_tokens.contains(&identity.request_id()) {
-        return RioError::Internal
-            .with_ctx("socket_raw", socket_key.as_handle() as usize)
-            .with_ctx("request_id", identity.request_id())
-            .attach_note("socket inflight token is stale, duplicated, or already released");
-    }
-    if state.inflight == 0 {
-        return RioError::Internal
-            .with_ctx("socket_raw", socket_key.as_handle() as usize)
-            .with_ctx("request_id", identity.request_id())
-            .attach_note("socket inflight counter underflow");
-    }
-    state.active_tokens.remove(&identity.request_id());
-    state.inflight -= 1;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{RioRuntime, RioSocketActor, SocketInflightToken, SocketLifecycleState};
     use crate::{
-        BufferRegistrationMode,
-        config::IocpHandle,
-        rio::core::{RioKernel, RioRegistry, RioRq},
+        config::{IocpHandle, SocketKey},
+        rio::core::{RioOpKind, RioRq},
     };
+    use veloq_driver_core::driver::OpToken;
     use veloq_driver_core::slot::Generation;
-    use veloq_std::{collections::FastHashMap, ptr::null_mut, vec::Vec};
+    use veloq_std::ptr::null_mut;
 
-    fn test_state() -> RioState {
-        RioState {
-            kernel: RioKernel::noop(),
-            registry: RioRegistry::new(32, 1),
-            registration_mode: BufferRegistrationMode::default(),
-            submissions_closed: false,
-            actors: slotmap::SlotMap::with_key(),
-            actor_by_handle: FastHashMap::default(),
-            socket_runtime: FastHashMap::default(),
-            rio_outstanding_count: 0,
-            next_request_id: 0,
-            deferred_kernel_ops: Vec::new(),
-            deferred_payloads: Vec::new(),
-            diagnostics: IocpDriverCompletionDiagnostics::default(),
-            cq_armed: true,
-        }
+    fn test_runtime() -> RioRuntime {
+        RioRuntime::new()
     }
 
     fn test_socket_key() -> SocketKey {
@@ -502,12 +605,12 @@ mod tests {
 
     #[test]
     fn socket_inflight_token_acquire_and_release_balances_count() {
-        let mut state = test_state();
+        let mut state = test_runtime();
         let key = test_socket_key();
         state.mark_socket_registered(key);
 
         let token = state
-            .try_acquire_socket_inflight_token(key)
+            .try_acquire_socket_inflight_token(key, 0)
             .expect("registered open socket should acquire inflight token");
         assert_eq!(state.socket_runtime.get(&key).unwrap().inflight, 1);
 
@@ -519,19 +622,19 @@ mod tests {
 
     #[test]
     fn duplicate_token_release_does_not_decrement_new_request() {
-        let mut state = test_state();
+        let mut state = test_runtime();
         let key = test_socket_key();
         state.mark_socket_registered(key);
 
         let first = state
-            .try_acquire_socket_inflight_token(key)
+            .try_acquire_socket_inflight_token(key, 0)
             .expect("first request should acquire an inflight token");
         let first_id = first.request_id();
         state
             .release_socket_inflight_token(first)
             .expect("first request should release its token");
         let second = state
-            .try_acquire_socket_inflight_token(key)
+            .try_acquire_socket_inflight_token(key, 0)
             .expect("second request should acquire an inflight token");
 
         let stale = SocketInflightToken::new(key, first_id);
@@ -553,32 +656,32 @@ mod tests {
 
     #[test]
     fn runtime_is_not_ready_while_socket_token_is_active() {
-        let mut state = test_state();
+        let mut state = test_runtime();
         let key = test_socket_key();
         state.mark_socket_registered(key);
         let token = state
-            .try_acquire_socket_inflight_token(key)
+            .try_acquire_socket_inflight_token(key, 0)
             .expect("request should acquire an inflight token");
 
-        assert!(!state.runtime_ready_for_forget());
-        assert!(state.forget_runtime_after_drain().is_err());
+        assert!(!state.runtime_ready_for_forget(0));
+        assert!(state.forget_after_drain(0).is_err());
         assert!(state.socket_runtime.contains_key(&key));
 
         state
             .release_socket_inflight_token(token)
             .expect("request should release its token");
-        assert!(state.runtime_ready_for_forget());
+        assert!(state.runtime_ready_for_forget(0));
     }
 
     #[test]
     fn socket_inflight_guard_drop_rolls_back_count() {
-        let mut state = test_state();
+        let mut state = test_runtime();
         let key = test_socket_key();
         state.mark_socket_registered(key);
 
         {
             let _guard = state
-                .try_acquire_socket_inflight_guard(key)
+                .try_acquire_socket_inflight_guard(key, 0)
                 .expect("registered open socket should acquire inflight guard");
         }
 
@@ -587,24 +690,24 @@ mod tests {
 
     #[test]
     fn closing_socket_rejects_new_inflight_acquire() {
-        let mut state = test_state();
+        let mut state = test_runtime();
         let key = test_socket_key();
         state.mark_socket_registered(key);
 
         assert!(state.begin_socket_cleanup(key).unwrap());
-        assert!(state.try_acquire_socket_inflight_token(key).is_err());
+        assert!(state.try_acquire_socket_inflight_token(key, 0).is_err());
     }
 
     #[test]
     fn stop_accepting_new_submissions_preserves_socket_runtime_until_drain() {
-        let mut state = test_state();
+        let mut state = test_runtime();
         let key = test_socket_key();
         state.mark_socket_registered(key);
         let actor = state.actors.insert(RioSocketActor::new(RioRq(1 as _)));
         state.actor_by_handle.insert(key, actor);
 
         let token = state
-            .try_acquire_socket_inflight_token(key)
+            .try_acquire_socket_inflight_token(key, 0)
             .expect("registered open socket should acquire inflight token");
         state.stop_accepting_new_submissions();
 
@@ -616,7 +719,7 @@ mod tests {
         assert_eq!(socket_state.inflight, 1);
         assert!(state.actor_by_handle.is_empty());
         assert_eq!(state.actors.len(), 1);
-        assert!(state.try_acquire_socket_inflight_token(key).is_err());
+        assert!(state.try_acquire_socket_inflight_token(key, 0).is_err());
 
         state.release_socket_inflight_token(token).unwrap();
         assert_eq!(state.socket_runtime.get(&key).unwrap().inflight, 0);
@@ -624,7 +727,7 @@ mod tests {
 
     #[test]
     fn forget_runtime_after_drain_clears_runtime_state() {
-        let mut state = test_state();
+        let mut state = test_runtime();
         let key = test_socket_key();
         state.mark_socket_registered(key);
         let actor = state.actors.insert(RioSocketActor::new(RioRq(1 as _)));
@@ -632,7 +735,7 @@ mod tests {
         state.stop_accepting_new_submissions();
 
         state
-            .forget_runtime_after_drain()
+            .forget_after_drain(0)
             .expect("empty test runtime should be ready for cleanup");
 
         assert!(state.actors.is_empty());
@@ -642,7 +745,7 @@ mod tests {
 
     #[test]
     fn missing_socket_runtime_is_not_ready_for_cleanup() {
-        let mut state = test_state();
+        let mut state = test_runtime();
         let key = test_socket_key();
 
         assert!(!state.socket_ready_for_cleanup(key));
@@ -654,18 +757,18 @@ mod tests {
 
     #[test]
     fn socket_cleanup_retries_receive_shutdown_after_send_drains() {
-        let mut state = test_state();
+        let mut state = test_runtime();
         let key = test_socket_key();
         state.mark_socket_registered(key);
 
         let receive_token = state
-            .try_acquire_socket_inflight_token(key)
+            .try_acquire_socket_inflight_token(key, 0)
             .expect("receive request should acquire an inflight token");
         state
             .record_request_submitted(RioOpKind::Recv, key)
             .expect("receive request should be tracked");
         let send_token = state
-            .try_acquire_socket_inflight_token(key)
+            .try_acquire_socket_inflight_token(key, 0)
             .expect("send request should acquire an inflight token");
         state
             .record_request_submitted(RioOpKind::Send, key)
@@ -694,7 +797,7 @@ mod tests {
 
     #[test]
     fn finish_receive_pump_preserves_socket_shutdown_state() {
-        let mut state = test_state();
+        let mut state = test_runtime();
         let key = test_socket_key();
         let token = OpToken::from_registry_parts(0, Generation::new(1)).unwrap();
         state.mark_socket_registered(key);

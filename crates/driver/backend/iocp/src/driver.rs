@@ -1,5 +1,5 @@
 mod cancellation;
-pub(crate) mod completion;
+mod completion;
 mod lifecycle;
 mod polling;
 mod registration;
@@ -21,6 +21,8 @@ use lifecycle::{IocpRioRuntime, WinsockGuard};
 use polling::{CompletionPump, TimerEngine};
 use registration::HandleRegistry;
 use submission::SubmitContextInternal;
+
+pub(crate) use completion::COMP_BACKEND_RIO;
 
 #[cfg(test)]
 use crate::RegisteredHandle;
@@ -428,11 +430,6 @@ impl<'a> DriverRaw for IocpDriver<'a> {
 #[cfg(feature = "test-hooks")]
 impl DriverTestHooks for IocpDriver<'_> {
     fn debug_chunk_register_attempts(&self) -> u64 {
-        self.state()
-            .rio
-            .state()
-            .registry
-            .registration_stats
-            .chunk_register_attempts
+        self.state().rio.debug_chunk_register_attempts()
     }
 }

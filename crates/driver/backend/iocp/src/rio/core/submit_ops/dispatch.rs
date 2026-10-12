@@ -2,9 +2,10 @@ use crate::{
     BufferRegistrationMode,
     config::BorrowedRawHandle,
     driver::RIO_EVENT_KEY,
+    error::IocpError,
     ext::Extensions,
     rio::{
-        RioEnv, RioState,
+        core::RioEnv,
         error::{RioError, RioResult},
     },
     win32::Overlapped,
@@ -15,15 +16,24 @@ use veloq_std::{boxed::Box, ffi::c_void, ptr};
 use windows_sys::Win32::Networking::WinSock::{
     RIO_BUF, RIO_BUFFERID, RIO_CQ, RIO_IOCP_COMPLETION, RIO_NOTIFICATION_COMPLETION,
     RIO_NOTIFICATION_COMPLETION_0, RIO_NOTIFICATION_COMPLETION_0_1, RIO_RQ, RIORESULT,
-    SOCKET_ERROR,
+    SOCKET_ERROR, WSAGetLastError,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
-pub(crate) struct RioBufferId(pub(crate) RIO_BUFFERID);
+pub(crate) struct RioBufferId(RIO_BUFFERID);
 
 impl RioBufferId {
     pub(crate) const INVALID: Self = Self(0 as RIO_BUFFERID);
+
+    #[cfg(test)]
+    pub(crate) const fn from_raw(raw: RIO_BUFFERID) -> Self {
+        Self(raw)
+    }
+
+    pub(crate) const fn raw(self) -> RIO_BUFFERID {
+        self.0
+    }
 
     #[inline]
     pub(crate) fn is_invalid(&self) -> bool {
@@ -33,10 +43,14 @@ impl RioBufferId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
-pub(crate) struct RioCq(pub(crate) RIO_CQ);
+pub(crate) struct RioCq(RIO_CQ);
 
 impl RioCq {
     pub(crate) const INVALID: Self = Self(0);
+
+    pub(crate) const fn raw(self) -> RIO_CQ {
+        self.0
+    }
 
     #[inline]
     pub(crate) fn is_invalid(&self) -> bool {
@@ -113,8 +127,9 @@ pub(crate) trait RioProvider: Send + Sync {
     fn receive_ex(&self, config: RioExConfig<'_>) -> RioResult<()>;
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
-pub(crate) struct RioDispatch {
+pub(crate) struct RioDispatchFunctions {
     pub(crate) create_cq:
         unsafe extern "system" fn(u32, *const RIO_NOTIFICATION_COMPLETION) -> RIO_CQ,
     pub(crate) create_rq: unsafe extern "system" fn(
@@ -160,6 +175,69 @@ pub(crate) struct RioDispatch {
     ) -> i32,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct RioDispatch {
+    create_cq: unsafe extern "system" fn(u32, *const RIO_NOTIFICATION_COMPLETION) -> RIO_CQ,
+    create_rq: unsafe extern "system" fn(
+        usize,
+        u32,
+        u32,
+        u32,
+        u32,
+        RIO_CQ,
+        RIO_CQ,
+        *const c_void,
+    ) -> RIO_RQ,
+    register_buffer: unsafe extern "system" fn(*const u8, u32) -> RIO_BUFFERID,
+    deregister_buffer: unsafe extern "system" fn(RIO_BUFFERID),
+    dequeue: unsafe extern "system" fn(RIO_CQ, *mut RIORESULT, u32) -> u32,
+    notify: unsafe extern "system" fn(RIO_CQ) -> i32,
+    close_cq: unsafe extern "system" fn(RIO_CQ),
+    receive: unsafe extern "system" fn(RIO_RQ, *const RIO_BUF, u32, u32, *const c_void) -> i32,
+    send: unsafe extern "system" fn(RIO_RQ, *const RIO_BUF, u32, u32, *const c_void) -> i32,
+    send_ex: unsafe extern "system" fn(
+        RIO_RQ,
+        *const RIO_BUF,
+        u32,
+        *const RIO_BUF,
+        *const RIO_BUF,
+        *const RIO_BUF,
+        *const RIO_BUF,
+        u32,
+        *const c_void,
+    ) -> i32,
+    receive_ex: unsafe extern "system" fn(
+        RIO_RQ,
+        *const RIO_BUF,
+        u32,
+        *const RIO_BUF,
+        *const RIO_BUF,
+        *const RIO_BUF,
+        *const RIO_BUF,
+        u32,
+        *const c_void,
+    ) -> i32,
+}
+
+impl RioDispatch {
+    #[cfg(test)]
+    pub(crate) fn from_functions(functions: RioDispatchFunctions) -> Self {
+        Self {
+            create_cq: functions.create_cq,
+            create_rq: functions.create_rq,
+            register_buffer: functions.register_buffer,
+            deregister_buffer: functions.deregister_buffer,
+            dequeue: functions.dequeue,
+            notify: functions.notify,
+            close_cq: functions.close_cq,
+            receive: functions.receive,
+            send: functions.send,
+            send_ex: functions.send_ex,
+            receive_ex: functions.receive_ex,
+        }
+    }
+}
+
 impl RioProvider for RioDispatch {
     #[inline]
     fn create_cq(
@@ -167,10 +245,10 @@ impl RioProvider for RioDispatch {
         entries: u32,
         notification: &RIO_NOTIFICATION_COMPLETION,
     ) -> RioResult<RioCq> {
-        // SAFETY: Function pointer is verified at startup.
+        // SAFETY: Startup verifies this function pointer. / 安全性：启动阶段已验证此函数指针。
         let cq = unsafe { (self.create_cq)(entries, notification as *const _) };
         if cq == 0 {
-            return Err(RioState::last_wsa_report(
+            return Err(RioKernel::last_wsa_report(
                 RioError::CqCreation,
                 "RIOCreateCompletionQueue",
             ));
@@ -180,7 +258,7 @@ impl RioProvider for RioDispatch {
 
     #[inline]
     fn create_rq(&self, cfg: RioRqConfig) -> RioResult<RioRq> {
-        // SAFETY: Function pointer is verified at startup.
+        // SAFETY: Startup verifies this function pointer. / 安全性：启动阶段已验证此函数指针。
         let rq = unsafe {
             (self.create_rq)(
                 cfg.socket,
@@ -188,13 +266,13 @@ impl RioProvider for RioDispatch {
                 cfg.max_receive_data_buffers,
                 cfg.max_outstanding_sends,
                 cfg.max_send_data_buffers,
-                cfg.recv_cq.0,
-                cfg.send_cq.0,
+                cfg.recv_cq.raw(),
+                cfg.send_cq.raw(),
                 cfg.context,
             )
         };
         if rq == 0 {
-            return Err(RioState::last_wsa_report(
+            return Err(RioKernel::last_wsa_report(
                 RioError::RqCreation,
                 "RIOCreateRequestQueue",
             ));
@@ -204,10 +282,10 @@ impl RioProvider for RioDispatch {
 
     #[inline]
     fn register_buffer(&self, ptr: *const u8, len: u32) -> RioResult<RioBufferId> {
-        // SAFETY: Function pointer is verified at startup.
+        // SAFETY: Startup verifies this function pointer. / 安全性：启动阶段已验证此函数指针。
         let id = unsafe { (self.register_buffer)(ptr, len) };
         if id == 0 {
-            return Err(RioState::last_wsa_report(
+            return Err(RioKernel::last_wsa_report(
                 RioError::BufferRegistration,
                 "RIORegisterBuffer",
             ));
@@ -218,23 +296,23 @@ impl RioProvider for RioDispatch {
     #[inline]
     fn deregister_buffer(&self, id: RioBufferId) {
         if !id.is_invalid() {
-            // SAFETY: Function pointer is verified at startup.
+            // SAFETY: Startup verifies this function pointer. / 安全性：启动阶段已验证此函数指针。
             unsafe { (self.deregister_buffer)(id.0) };
         }
     }
 
     #[inline]
     fn dequeue(&self, cq: RioCq, results: &mut [RIORESULT]) -> u32 {
-        // SAFETY: Function pointer is verified at startup.
-        unsafe { (self.dequeue)(cq.0, results.as_mut_ptr(), results.len() as u32) }
+        // SAFETY: Startup verifies this function pointer. / 安全性：启动阶段已验证此函数指针。
+        unsafe { (self.dequeue)(cq.raw(), results.as_mut_ptr(), results.len() as u32) }
     }
 
     #[inline]
     fn notify(&self, cq: RioCq) -> RioResult<()> {
-        // SAFETY: Function pointer is verified at startup.
-        let ret = unsafe { (self.notify)(cq.0) };
+        // SAFETY: Startup verifies this function pointer. / 安全性：启动阶段已验证此函数指针。
+        let ret = unsafe { (self.notify)(cq.raw()) };
         if ret == SOCKET_ERROR {
-            return Err(RioState::last_wsa_report(RioError::Internal, "RIONotify"));
+            return Err(RioKernel::last_wsa_report(RioError::Internal, "RIONotify"));
         }
         Ok(())
     }
@@ -242,8 +320,8 @@ impl RioProvider for RioDispatch {
     #[inline]
     fn close_cq(&self, cq: RioCq) {
         if !cq.is_invalid() {
-            // SAFETY: Function pointer is verified at startup.
-            unsafe { (self.close_cq)(cq.0) };
+            // SAFETY: Startup verifies this function pointer. / 安全性：启动阶段已验证此函数指针。
+            unsafe { (self.close_cq)(cq.raw()) };
         }
     }
 
@@ -256,10 +334,10 @@ impl RioProvider for RioDispatch {
         flags: u32,
         context: *const c_void,
     ) -> RioResult<()> {
-        // SAFETY: Function pointer is verified at startup.
+        // SAFETY: Startup verifies this function pointer. / 安全性：启动阶段已验证此函数指针。
         let ret = unsafe { (self.receive)(rq.0, buf as *const _, num_bufs, flags, context) };
         if ret == 0 {
-            return Err(RioState::last_wsa_report(RioError::Datapath, "RIOReceive"));
+            return Err(RioKernel::last_wsa_report(RioError::Datapath, "RIOReceive"));
         }
         Ok(())
     }
@@ -273,17 +351,17 @@ impl RioProvider for RioDispatch {
         flags: u32,
         context: *const c_void,
     ) -> RioResult<()> {
-        // SAFETY: Function pointer is verified at startup.
+        // SAFETY: Startup verifies this function pointer. / 安全性：启动阶段已验证此函数指针。
         let ret = unsafe { (self.send)(rq.0, buf as *const _, num_bufs, flags, context) };
         if ret == 0 {
-            return Err(RioState::last_wsa_report(RioError::Datapath, "RIOSend"));
+            return Err(RioKernel::last_wsa_report(RioError::Datapath, "RIOSend"));
         }
         Ok(())
     }
 
     #[inline]
     fn send_ex(&self, cfg: RioExConfig<'_>) -> RioResult<()> {
-        // SAFETY: Function pointer is verified at startup.
+        // SAFETY: Startup verifies this function pointer. / 安全性：启动阶段已验证此函数指针。
         let ret = unsafe {
             (self.send_ex)(
                 cfg.rq.0,
@@ -298,14 +376,14 @@ impl RioProvider for RioDispatch {
             )
         };
         if ret == 0 {
-            return Err(RioState::last_wsa_report(RioError::Datapath, "RIOSendEx"));
+            return Err(RioKernel::last_wsa_report(RioError::Datapath, "RIOSendEx"));
         }
         Ok(())
     }
 
     #[inline]
     fn receive_ex(&self, cfg: RioExConfig<'_>) -> RioResult<()> {
-        // SAFETY: Function pointer is verified at startup.
+        // SAFETY: Startup verifies this function pointer. / 安全性：启动阶段已验证此函数指针。
         let ret = unsafe {
             (self.receive_ex)(
                 cfg.rq.0,
@@ -320,7 +398,7 @@ impl RioProvider for RioDispatch {
             )
         };
         if ret == 0 {
-            return Err(RioState::last_wsa_report(
+            return Err(RioKernel::last_wsa_report(
                 RioError::Datapath,
                 "RIOReceiveEx",
             ));
@@ -330,13 +408,46 @@ impl RioProvider for RioDispatch {
 }
 
 pub(crate) struct RioKernel {
-    pub(crate) cq: RioCq,
+    cq: RioCq,
     _notify_overlapped: Box<Overlapped>,
-    pub(crate) dispatch: Option<RioDispatch>,
+    dispatch: Option<RioDispatch>,
 }
 
 impl RioKernel {
-    pub(super) fn from_extensions(
+    pub(crate) const fn cq(&self) -> RioCq {
+        self.cq
+    }
+
+    pub(crate) const fn dispatch_table(&self) -> Option<RioDispatch> {
+        self.dispatch
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_dispatch_table(&mut self, dispatch: Option<RioDispatch>) {
+        self.dispatch = dispatch;
+    }
+
+    pub(crate) fn last_wsa_error_code() -> i32 {
+        // SAFETY: Winsock exposes this thread-local error accessor without preconditions. / 安全性：Winsock 的线程本地错误读取函数没有额外前置条件。
+        unsafe { WSAGetLastError() }
+    }
+
+    pub(crate) fn last_wsa_report(context: RioError, scope: &'static str) -> Report<RioError> {
+        let code = Self::last_wsa_error_code() as u32;
+        context
+            .to_report()
+            .push_ctx("scope", scope)
+            .set_error_code(code)
+            .attach_note(
+                IocpError::Internal
+                    .to_report()
+                    .push_ctx("scope", scope)
+                    .set_error_code(code as i32)
+                    .attach_note("winsock error"),
+            )
+    }
+
+    pub(crate) fn from_extensions(
         port: BorrowedRawHandle<'_>,
         entries: u32,
         ext: &Extensions,
@@ -510,9 +621,7 @@ impl RioKernel {
             .as_ref()
             .ok_or(RioError::Internal)
             .attach_note("RIO dispatch context lost")?;
-        // A receive pump uses one data buffer and one private remote-address scratch buffer per
-        // request.  Keep flags at zero until a provider-specific deferred-submit capability has
-        // been validated; zero is the explicit commit form for the final request in a batch.
+        // Keep flags at zero until deferred submission is verified; zero commits the batch's last request. / 延迟提交能力经验证前保持 flags 为 0；0 表示提交批次中的最后一个请求。
         dispatch.receive_ex(RioExConfig {
             rq,
             data_buf,

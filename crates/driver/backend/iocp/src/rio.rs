@@ -1,164 +1,269 @@
-//! RIO backend orchestration for the IOCP driver.
+//! RIO backend orchestration for IOCP. / IOCP 的 RIO 后端编排入口。
 //!
-//! This module intentionally keeps only the cross-cutting state and type glue
-//! (`RioState`, `RioEnv`, and shared context structs). Concrete behavior is
-//! organized into layered submodules to keep high-level ownership boundaries
-//! explicit:
-//! - `core`: low-level primitives and kernel-facing helpers.
-//! - `runtime`: steady-state operation split into datapath and control-flow.
-//! - `lifecycle`: shutdown sequencing and deferred cleanup semantics.
+//! `RioState` keeps shared state while core, runtime, and lifecycle own their operations.
+//! `RioState` 聚合共享状态，具体操作分别由 core、runtime 和 lifecycle 管理。
 
 mod core;
-mod error;
 mod lifecycle;
-pub(crate) mod runtime;
+mod runtime;
+
+mod error {
+    pub(crate) use super::core::{RioError, RioResult};
+}
 
 use crate::{
-    BufferRegistrationMode,
-    config::SocketKey,
+    BufferRegistrationMode, IocpResult,
+    config::{BorrowedRawHandle, SocketKey},
     driver::IocpDriverCompletionDiagnostics,
-    op::{IocpKernelOp, IocpUserPayload},
+    ext::Extensions,
+    op::{IocpKernelOp, IocpUserPayload, SubmissionResult},
 };
-use slotmap::{SlotMap, new_key_type};
-use veloq_driver_core::driver::OpToken;
-use veloq_std::{
-    collections::{FastHashMap, FastHashSet},
-    vec::Vec,
+use diagweave::prelude::*;
+use veloq_buf::{BufferRegistrar, FixedBuf, NoopRegistrar, heap::ChunkId};
+use veloq_driver_core::{
+    driver::BufferRegistrationStatus, platform::receive_pump::ReceivePumpState,
 };
+use veloq_std::{time::Duration, vec::Vec};
 
-use self::{
-    core::{RioCq, RioDispatch, RioKernel, RioRegistry},
-    runtime::RioSocketActor,
-};
+use self::core::{RioKernel, RioRegistry, RioSubmitOperations};
+use self::lifecycle::{DeferredRioCleanup, RioLifecycle, RioLifecycleResources};
 
 pub(crate) use self::{
-    core::RioOpKind,
-    error::RioError,
-    runtime::{RioSendToArgs, RioTarget},
+    core::{RioCore, RioEnv, RioError, RioOpKind, RioResult, RioSendToArgs, RioTarget},
+    runtime::{
+        CompletionPollArgs, RioCompletionAnomaly, RioCompletionService, RioRuntime, RioSocketActor,
+        SocketInflightGuard, SocketInflightIdentity, SocketInflightToken,
+    },
 };
 
-new_key_type! {
-    pub(crate) struct ActorKey;
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SocketLifecycleState {
-    Open,
-    Closing,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct SocketRuntimeState {
-    pub(crate) lifecycle: SocketLifecycleState,
-    pub(crate) inflight: u32,
-    pub(crate) active_tokens: FastHashSet<u64>,
-    pub(crate) send_inflight: u32,
-    pub(crate) receive_inflight: u32,
-    pub(crate) receive_pump_inflight: u32,
-    pub(crate) receive_pump_token: Option<OpToken>,
-    pub(crate) socket_receive_shutdown_requested: bool,
-    pub(crate) socket_receive_shutdown_pending: bool,
-}
-
-impl Default for SocketRuntimeState {
-    fn default() -> Self {
-        Self {
-            lifecycle: SocketLifecycleState::Open,
-            inflight: 0,
-            active_tokens: FastHashSet::default(),
-            send_inflight: 0,
-            receive_inflight: 0,
-            receive_pump_inflight: 0,
-            receive_pump_token: None,
-            socket_receive_shutdown_requested: false,
-            socket_receive_shutdown_pending: false,
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct SocketInflightToken {
-    socket_key: SocketKey,
-    request_id: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct SocketInflightIdentity {
-    socket_key: SocketKey,
-    request_id: u64,
-}
-
-impl SocketInflightToken {
-    #[inline]
-    pub(crate) const fn new(socket_key: SocketKey, request_id: u64) -> Self {
-        Self {
-            socket_key,
-            request_id,
-        }
-    }
-
-    #[inline]
-    pub(crate) const fn socket_key(&self) -> SocketKey {
-        self.socket_key
-    }
-
-    #[inline]
-    pub(crate) const fn request_id(&self) -> u64 {
-        self.request_id
-    }
-
-    #[inline]
-    pub(crate) const fn identity(&self) -> SocketInflightIdentity {
-        SocketInflightIdentity {
-            socket_key: self.socket_key,
-            request_id: self.request_id,
-        }
-    }
-}
-
-impl SocketInflightIdentity {
-    #[inline]
-    pub(crate) const fn socket_key(self) -> SocketKey {
-        self.socket_key
-    }
-
-    #[inline]
-    pub(crate) const fn request_id(self) -> u64 {
-        self.request_id
-    }
-}
-
-#[must_use = "dropping a SocketInflightGuard releases the acquired socket inflight slot"]
-pub(crate) struct SocketInflightGuard<'a> {
-    pub(crate) state: &'a mut RioState,
-    pub(crate) token: Option<SocketInflightToken>,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct RioEnv<'a> {
-    pub(crate) registrar: &'a dyn veloq_buf::BufferRegistrar,
-    pub(crate) dispatch: &'a RioDispatch,
-    pub(crate) cq: RioCq,
-    pub(crate) registration_mode: BufferRegistrationMode,
-}
-
 pub(crate) struct RioState {
-    pub(crate) kernel: RioKernel,
-    pub(crate) registry: RioRegistry,
-    pub(crate) registration_mode: BufferRegistrationMode,
-    pub(crate) submissions_closed: bool,
-    pub(crate) actors: SlotMap<ActorKey, RioSocketActor>,
-    pub(crate) actor_by_handle: FastHashMap<SocketKey, ActorKey>,
-    pub(crate) socket_runtime: FastHashMap<SocketKey, SocketRuntimeState>,
-    pub(crate) rio_outstanding_count: usize,
-    pub(crate) next_request_id: u64,
-    /// Kernel operations retained by fast close until the RIO reaper observes every completion.
-    ///
-    /// These operations may own backend buffers or receive-pump storage that the kernel still
-    /// references after the driver has been dropped. They must outlive the RIO request, just like
-    /// the deferred user payloads below.
-    pub(crate) deferred_kernel_ops: Vec<IocpKernelOp>,
-    pub(crate) deferred_payloads: Vec<IocpUserPayload>,
-    pub(crate) diagnostics: IocpDriverCompletionDiagnostics,
-    pub(crate) cq_armed: bool,
+    core: RioCore,
+    runtime: RioRuntime,
+    lifecycle: RioLifecycleResources,
+    diagnostics: IocpDriverCompletionDiagnostics,
+}
+
+impl RioState {
+    pub(crate) fn shutdown_actor(&mut self, socket_key: SocketKey) {
+        RioCompletionService::shutdown_actor(&mut self.runtime, socket_key);
+    }
+
+    pub(crate) fn stop_accepting_new_submissions(&mut self) {
+        self.runtime.stop_accepting_new_submissions();
+    }
+
+    pub(crate) fn forget_runtime_after_drain(&mut self) -> RioResult<()> {
+        self.runtime
+            .forget_after_drain(self.core.outstanding_count())
+    }
+
+    pub(crate) fn process_completions(
+        &mut self,
+        args: CompletionPollArgs<'_>,
+    ) -> IocpResult<usize> {
+        RioCompletionService::process_completions(&mut self.core, &mut self.runtime, args)
+    }
+
+    pub(crate) fn new(
+        port: BorrowedRawHandle<'_>,
+        entries: u32,
+        ext: &Extensions,
+        registration_mode: BufferRegistrationMode,
+        diagnostics: IocpDriverCompletionDiagnostics,
+    ) -> RioResult<Self> {
+        let kernel = RioKernel::from_extensions(port, entries, ext)?;
+        let rq_depth = entries.clamp(32, 64);
+
+        Ok(Self {
+            core: RioCore::new(
+                kernel,
+                RioRegistry::new(rq_depth, entries as usize),
+                registration_mode,
+            ),
+            runtime: RioRuntime::new(),
+            lifecycle: RioLifecycleResources {
+                deferred_kernel_ops: Vec::new(),
+                deferred_payloads: Vec::new(),
+            },
+            diagnostics,
+        })
+    }
+
+    pub(crate) fn rio_outstanding_count(&self) -> usize {
+        self.core.outstanding_count()
+    }
+
+    pub(crate) fn close_kernel(&mut self) {
+        self.core.kernel_mut().close();
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn debug_chunk_register_attempts(&self) -> u64 {
+        self.core.chunk_register_attempts()
+    }
+}
+
+impl RioState {
+    pub(crate) fn mark_socket_registered(&mut self, actor_key: SocketKey) {
+        self.runtime.mark_socket_registered(actor_key);
+    }
+
+    pub(crate) fn begin_socket_cleanup(&mut self, actor_key: SocketKey) -> RioResult<bool> {
+        self.runtime.begin_socket_cleanup(actor_key)
+    }
+
+    pub(crate) fn try_acquire_socket_inflight_guard(
+        &mut self,
+        actor_key: SocketKey,
+    ) -> RioResult<SocketInflightGuard<'_>> {
+        self.runtime
+            .try_acquire_socket_inflight_guard(actor_key, self.core.outstanding_count())
+    }
+
+    pub(crate) fn release_socket_inflight_token(
+        &mut self,
+        token: SocketInflightToken,
+    ) -> RioResult<()> {
+        self.runtime.release_socket_inflight_token(token)
+    }
+
+    pub(crate) fn socket_ready_for_cleanup(&self, actor_key: SocketKey) -> bool {
+        self.runtime.socket_ready_for_cleanup(actor_key)
+    }
+
+    pub(crate) fn forget_socket_runtime(&mut self, actor_key: SocketKey) -> RioResult<()> {
+        self.runtime.forget_socket_runtime(actor_key)
+    }
+
+    pub(crate) fn has_socket_inflight(&self) -> bool {
+        self.runtime.has_socket_inflight()
+    }
+
+    pub(crate) fn runtime_ready_for_forget(&self) -> bool {
+        self.runtime
+            .runtime_ready_for_forget(self.core.outstanding_count())
+    }
+}
+
+impl RioState {
+    pub(crate) fn drain_outstanding(&mut self, timeout: Duration) -> RioResult<()> {
+        RioLifecycle::drain(
+            &mut self.core,
+            &mut self.runtime,
+            &mut self.diagnostics,
+            timeout,
+        )
+    }
+
+    fn finalize_cleanup(&mut self) -> RioResult<()> {
+        RioLifecycle::finalize(&mut self.core, &mut self.runtime)
+    }
+
+    pub(crate) fn take_deferred(&mut self) -> Option<DeferredRioCleanup> {
+        RioLifecycle::take_deferred(
+            &mut self.core,
+            &mut self.runtime,
+            &mut self.lifecycle,
+            &self.diagnostics,
+        )
+    }
+
+    pub(crate) fn defer_payloads(&mut self, payloads: Vec<IocpUserPayload>) {
+        self.lifecycle.deferred_payloads.extend(payloads);
+    }
+
+    pub(crate) fn defer_kernel_ops(&mut self, ops: Vec<IocpKernelOp>) {
+        self.lifecycle.deferred_kernel_ops.extend(ops);
+    }
+}
+
+impl RioState {
+    pub(crate) fn register_buffer_backend(
+        &mut self,
+        id: ChunkId,
+        ptr: *const u8,
+        len: usize,
+    ) -> RioResult<BufferRegistrationStatus> {
+        let registrar = NoopRegistrar;
+        let (registry, env) = self.core.registry_with_env(&registrar).into_parts();
+        let Some(env) = env else {
+            return Err(RioError::NotSupported
+                .to_report()
+                .attach_note("RIO buffer registration is unavailable without a dispatch table"));
+        };
+        registry
+            .register_buffer_backend(id, (ptr, len), env)
+            .map(|_| BufferRegistrationStatus::Registered)
+    }
+
+    pub(crate) fn try_submit_send_to(
+        &mut self,
+        args: RioSendToArgs<'_>,
+        registrar: &dyn BufferRegistrar,
+    ) -> RioResult<SubmissionResult> {
+        RioSubmitOperations::new(&mut self.core, &mut self.runtime)
+            .try_submit_send_to(args, registrar)
+    }
+
+    pub(crate) fn try_submit_recv(
+        &mut self,
+        target: RioTarget<'_>,
+        buf: &mut FixedBuf,
+        registrar: &dyn BufferRegistrar,
+    ) -> RioResult<SubmissionResult> {
+        RioSubmitOperations::new(&mut self.core, &mut self.runtime)
+            .try_submit_recv(target, buf, registrar)
+    }
+
+    pub(crate) fn try_submit_recv_provided(
+        &mut self,
+        target: RioTarget<'_>,
+        buf: &mut FixedBuf,
+        registrar: &dyn BufferRegistrar,
+    ) -> RioResult<SubmissionResult> {
+        RioSubmitOperations::new(&mut self.core, &mut self.runtime)
+            .try_submit_recv_provided(target, buf, registrar)
+    }
+
+    pub(crate) fn try_submit_send(
+        &mut self,
+        target: RioTarget<'_>,
+        buf: &FixedBuf,
+        registrar: &dyn BufferRegistrar,
+    ) -> RioResult<SubmissionResult> {
+        RioSubmitOperations::new(&mut self.core, &mut self.runtime)
+            .try_submit_send(target, buf, registrar)
+    }
+
+    pub(crate) fn try_submit_recv_multi_initial(
+        &mut self,
+        target: RioTarget<'_>,
+        op_kind: RioOpKind,
+        pump: &mut ReceivePumpState,
+        registrar: &dyn BufferRegistrar,
+    ) -> RioResult<()> {
+        RioSubmitOperations::new(&mut self.core, &mut self.runtime)
+            .try_submit_recv_multi_initial(target, op_kind, pump, registrar)
+    }
+}
+
+impl Drop for RioState {
+    fn drop(&mut self) {
+        self.stop_accepting_new_submissions();
+        if self.runtime_ready_for_forget() {
+            if let Err(error) = self.finalize_cleanup() {
+                tracing::error!(report = ?error, "failed to finalize drained RIO state");
+            }
+            return;
+        }
+
+        if let Some(task) = self.take_deferred() {
+            RioLifecycle::submit_deferred(task);
+            return;
+        }
+
+        if let Err(error) = self.finalize_cleanup() {
+            tracing::error!(report = ?error, "failed to finalize RIO state during drop");
+        }
+    }
 }

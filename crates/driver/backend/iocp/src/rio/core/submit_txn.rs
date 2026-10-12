@@ -1,8 +1,9 @@
 use super::{
+    RioCore,
     registry::{RioAddrReservation, RioPreparedBuffer},
     request::{
-        RioAddressPolicy, RioOpRequestInit, RioPreparedRequest, RioRequestDiagnostics,
-        RioSubmitPlan,
+        RioAddressPolicy, RioOpRequestInit, RioPreparedRequest, RioPreparedRequestParts,
+        RioRequestDiagnostics, RioSubmitErrorContext, RioSubmitPlan,
     },
     submit_ops::{RioDispatch, RioKernel, RioRq},
 };
@@ -10,7 +11,7 @@ use crate::{
     config::SocketKey,
     op::SubmissionResult,
     rio::{
-        RioEnv, RioState, SocketInflightToken, SocketLifecycleState,
+        RioCompletionService, RioEnv, RioRuntime, SocketInflightToken,
         error::{RioError, RioResult},
     },
 };
@@ -18,8 +19,9 @@ use diagweave::prelude::*;
 use veloq_buf::BufferRegistrar;
 use veloq_std::string::ToString;
 
-struct RioSubmitTxn<'a> {
-    state: &'a mut RioState,
+pub(crate) struct RioSubmitTxn<'a> {
+    core: &'a mut RioCore,
+    runtime: &'a mut RioRuntime,
     plan: RioSubmitPlan<'a>,
     registrar: &'a dyn BufferRegistrar,
     rq: Option<RioRq>,
@@ -38,14 +40,34 @@ pub(crate) struct RioSubmittedRequest {
 }
 
 impl<'a> RioSubmitTxn<'a> {
+    pub(crate) fn execute(
+        core: &'a mut RioCore,
+        runtime: &'a mut RioRuntime,
+        plan: RioSubmitPlan<'a>,
+        registrar: &'a dyn BufferRegistrar,
+        submit: impl FnOnce(&RioKernel, &RioPreparedRequest) -> RioResult<()>,
+    ) -> RioResult<RioSubmittedRequest> {
+        Self::new(core, runtime, plan, registrar)
+            .check_socket_accepting()?
+            .ensure_actor()?
+            .acquire_socket()?
+            .prepare_buffer()?
+            .prepare_address()?
+            .encode_context()?
+            .submit_kernel(submit)?
+            .commit()
+    }
+
     fn new(
-        state: &'a mut RioState,
+        core: &'a mut RioCore,
+        runtime: &'a mut RioRuntime,
         plan: RioSubmitPlan<'a>,
         registrar: &'a dyn BufferRegistrar,
     ) -> Self {
-        let outstanding_snapshot = state.rio_outstanding_count;
+        let outstanding_snapshot = core.outstanding_count();
         Self {
-            state,
+            core,
+            runtime,
             plan,
             registrar,
             rq: None,
@@ -61,11 +83,11 @@ impl<'a> RioSubmitTxn<'a> {
 
     fn check_socket_accepting(self) -> RioResult<Self> {
         let socket_key = self.socket_key();
-        if self.state.submissions_closed {
+        if self.runtime.is_submissions_closed() {
             let error = RioError::InvalidInput
                 .to_report()
                 .with_ctx("socket_raw", socket_key.as_handle() as usize)
-                .with_ctx("rio_outstanding_count", self.state.rio_outstanding_count)
+                .with_ctx("rio_outstanding_count", self.core.outstanding_count())
                 .attach_note("RIO runtime is shutting down; rejecting socket submission");
             return Err(self.attach_stage_error(
                 error,
@@ -74,14 +96,12 @@ impl<'a> RioSubmitTxn<'a> {
             ));
         }
 
-        if let Some(runtime) = self.state.socket_runtime.get(&socket_key)
-            && runtime.lifecycle == SocketLifecycleState::Closing
-        {
+        if let Some(inflight) = self.runtime.socket_closing_inflight(socket_key) {
             let error = RioError::InvalidInput
                 .to_report()
                 .with_ctx("socket_raw", socket_key.as_handle() as usize)
                 .with_ctx("socket_lifecycle", "closing")
-                .with_ctx("socket_inflight", runtime.inflight)
+                .with_ctx("socket_inflight", inflight)
                 .attach_note("socket is closing; rejecting new socket submission");
             return Err(self.attach_stage_error(
                 error,
@@ -99,10 +119,12 @@ impl<'a> RioSubmitTxn<'a> {
             "failed to load RIO dispatch while ensuring actor",
         )?;
         let env = self.env(&dispatch);
-        let actor = match self
-            .state
-            .ensure_actor((self.plan.fd, self.plan.handle), env)
-        {
+        let actor = match RioCompletionService::ensure_actor(
+            self.core,
+            self.runtime,
+            (self.plan.fd, self.plan.handle),
+            env,
+        ) {
             Ok(actor) => actor,
             Err(error) => {
                 return Err(self.attach_stage_error(
@@ -112,13 +134,16 @@ impl<'a> RioSubmitTxn<'a> {
                 ));
             }
         };
-        self.rq = Some(actor.rq);
+        self.rq = Some(actor.rq());
         Ok(self)
     }
 
     fn acquire_socket(mut self) -> RioResult<Self> {
         let socket_key = self.socket_key();
-        let socket_inflight = match self.state.try_acquire_socket_inflight_token(socket_key) {
+        let socket_inflight = match self
+            .runtime
+            .try_acquire_socket_inflight_token(socket_key, self.core.outstanding_count())
+        {
             Ok(token) => token,
             Err(error) => {
                 return Err(self.attach_stage_error(
@@ -153,7 +178,7 @@ impl<'a> RioSubmitTxn<'a> {
             "failed to load RIO dispatch while preparing buffer",
         )?;
         let env = self.env(&dispatch);
-        let data_buf = match self.state.registry.prepare_submission(
+        let data_buf = match self.core.registry_mut().prepare_submission(
             self.plan.buffer,
             self.plan.buffer_offset,
             buf_len,
@@ -178,7 +203,18 @@ impl<'a> RioSubmitTxn<'a> {
             "failed to load RIO dispatch while preparing address",
         )?;
         let env = self.env(&dispatch);
-        let addr = match self.state.prepare_submit_address(self.plan.address, env) {
+        let addr_result = match self.plan.address {
+            RioAddressPolicy::None => Ok(None),
+            RioAddressPolicy::SendTo { addr, addr_len } => self
+                .core
+                .registry_mut()
+                .prepare_send_addr(addr, addr_len, env)
+                .map(Some),
+            RioAddressPolicy::RecvMulti => {
+                self.core.registry_mut().prepare_recv_addr(env).map(Some)
+            }
+        };
+        let addr = match addr_result {
             Ok(addr) => addr,
             Err(error) => {
                 return Err(self.attach_stage_error(
@@ -230,20 +266,23 @@ impl<'a> RioSubmitTxn<'a> {
             .socket_inflight
             .take()
             .expect("RIO submit transaction socket inflight token disappeared");
-        let context = self.state.encode_req_ctx(RioOpRequestInit {
-            token: self.plan.token,
-            socket_inflight,
-            op_kind: self.plan.op_kind,
-            request_id,
-            addr_slot,
-            addr_generation,
-            addr,
-            buffer_lease: data_buf.lease,
-            receive_slot_id: self.plan.receive_slot_id,
-            receive_slot_generation: self.plan.receive_slot_generation,
-            diagnostics,
-        });
-        self.request = Some(RioPreparedRequest {
+        let context = self
+            .core
+            .registry_mut()
+            .alloc_request_context(RioOpRequestInit {
+                token: self.plan.token,
+                socket_inflight,
+                op_kind: self.plan.op_kind,
+                request_id,
+                addr_slot,
+                addr_generation,
+                addr,
+                buffer_lease: data_buf.lease,
+                receive_slot_id: self.plan.receive_slot_id,
+                receive_slot_generation: self.plan.receive_slot_generation,
+                diagnostics,
+            });
+        self.request = Some(RioPreparedRequest::new(RioPreparedRequestParts {
             op_kind: self.plan.op_kind,
             request_id,
             rq,
@@ -258,7 +297,7 @@ impl<'a> RioSubmitTxn<'a> {
             receive_slot_generation: self.plan.receive_slot_generation,
             diagnostics,
             outstanding_snapshot: self.outstanding_snapshot,
-        });
+        }));
         Ok(self)
     }
 
@@ -267,7 +306,12 @@ impl<'a> RioSubmitTxn<'a> {
         submit: impl FnOnce(&RioKernel, &RioPreparedRequest) -> RioResult<()>,
     ) -> RioResult<Self> {
         self.acquire_buffer_ref()?;
-        let error_context = self.plan.submit_error_context();
+        let error_context = RioSubmitErrorContext {
+            scope: self.plan.submit_scope,
+            fd: self.plan.fd,
+            handle: self.plan.handle,
+            note: self.plan.submit_note,
+        };
         let request = if let Some(ref request) = self.request {
             request
         } else {
@@ -278,7 +322,7 @@ impl<'a> RioSubmitTxn<'a> {
             ));
         };
 
-        match submit(&self.state.kernel, request) {
+        match submit(self.core.kernel(), request) {
             Ok(()) => Ok(self),
             Err(error) => Err(self.attach_stage_error(
                 request.attach_submit_error(error, error_context),
@@ -305,20 +349,20 @@ impl<'a> RioSubmitTxn<'a> {
                 "RIO submitted request context is null",
             ));
         }
-        let Some(next_outstanding) = self.state.rio_outstanding_count.checked_add(1) else {
+        let Some(next_outstanding) = self.core.next_outstanding_count() else {
             return Err(self.attach_stage_error(
                 RioError::ResourceExhaustion.to_report(),
                 "rio.core.submit_txn.commit",
                 "RIO outstanding request count overflow",
             ));
         };
-        self.state
-            .record_request_submitted(request.op_kind, request.socket_key)?;
+        self.runtime
+            .record_request_submitted(request.op_kind(), request.socket_key())?;
         let _submitted_context = request.mark_submitted();
-        self.state.rio_outstanding_count = next_outstanding;
+        self.core.set_outstanding_count(next_outstanding);
         self.submitted = true;
         Ok(RioSubmittedRequest {
-            request_id: request.request_id,
+            request_id: request.request_id(),
             result: SubmissionResult::Pending,
         })
     }
@@ -337,9 +381,9 @@ impl<'a> RioSubmitTxn<'a> {
             ));
         };
         match self
-            .state
-            .registry
-            .acquire_buffer_lease(request.data_buf.lease)
+            .core
+            .registry_mut()
+            .acquire_buffer_lease(request.data_buf().lease)
         {
             Ok(()) => {
                 self.buffer_ref_acquired = true;
@@ -347,9 +391,15 @@ impl<'a> RioSubmitTxn<'a> {
             }
             Err(error) => Err(self.attach_stage_error(
                 error
-                    .with_ctx("data_buffer_id", request.diagnostics.data_buffer_id)
-                    .with_ctx("data_buffer_offset", request.diagnostics.data_buffer_offset)
-                    .with_ctx("data_buffer_length", request.diagnostics.data_buffer_length),
+                    .with_ctx("data_buffer_id", request.diagnostics().data_buffer_id())
+                    .with_ctx(
+                        "data_buffer_offset",
+                        request.diagnostics().data_buffer_offset(),
+                    )
+                    .with_ctx(
+                        "data_buffer_length",
+                        request.diagnostics().data_buffer_length(),
+                    ),
                 "rio.core.submit_txn.acquire_buffer_ref",
                 "failed to acquire RIO buffer lease before kernel submit",
             )),
@@ -369,14 +419,14 @@ impl<'a> RioSubmitTxn<'a> {
             )
         })?;
 
-        let release = if let Some(dispatch) = self.state.kernel.dispatch {
+        let release = if let Some(dispatch) = self.core.kernel().dispatch_table() {
             let env = self.env(&dispatch);
-            self.state
-                .registry
+            self.core
+                .registry_mut()
                 .release_buffer_lease(data_buf.lease, env)
         } else {
-            self.state
-                .registry
+            self.core
+                .registry_mut()
                 .release_buffer_lease_deferred(data_buf.lease)
         };
 
@@ -397,27 +447,32 @@ impl<'a> RioSubmitTxn<'a> {
         let Some(request) = self.request.as_mut() else {
             return Ok(());
         };
-        let Some(init) = request.take_init(&mut self.state.registry) else {
+        let Some(init) = request.take_init(self.core.registry_mut()) else {
             return Err(self.attach_stage_error(
                 RioError::Internal.to_report(),
                 "rio.core.submit_txn.rollback_context",
                 "unsubmitted RIO request missing prepared request context during rollback",
             ));
         };
-        self.state
+        self.runtime
             .release_socket_inflight_token(init.socket_inflight)?;
         Ok(())
     }
 
     fn rollback_address(&mut self) {
-        if let Err(error) = self.state.registry.free_addr_reservation(self.addr.take()) {
+        if let Err(error) = self
+            .core
+            .registry_mut()
+            .free_addr_reservation(self.addr.take())
+        {
             tracing::error!(report = ?error, "failed to roll back RIO address lease");
         }
     }
 
     fn rollback_socket(&mut self) -> RioResult<()> {
         if let Some(socket_inflight) = self.socket_inflight.take() {
-            self.state.release_socket_inflight_token(socket_inflight)?;
+            self.runtime
+                .release_socket_inflight_token(socket_inflight)?;
         }
         Ok(())
     }
@@ -435,8 +490,8 @@ impl<'a> RioSubmitTxn<'a> {
         RioEnv {
             registrar: self.registrar,
             dispatch,
-            cq: self.state.kernel.cq,
-            registration_mode: self.state.registration_mode,
+            cq: self.core.kernel().cq(),
+            registration_mode: self.core.registration_mode(),
         }
     }
 
@@ -446,9 +501,9 @@ impl<'a> RioSubmitTxn<'a> {
         note: &'static str,
     ) -> RioResult<RioDispatch> {
         match self
-            .state
-            .kernel
-            .dispatch
+            .core
+            .kernel()
+            .dispatch_table()
             .ok_or(self.plan.dispatch_error)
             .attach_note(self.plan.dispatch_note)
         {
@@ -481,16 +536,16 @@ impl<'a> RioSubmitTxn<'a> {
             report = report.with_ctx("rq_raw", rq.0 as usize);
         }
         if let Some(request) = self.request.as_ref() {
-            report = report.with_ctx("rio_request_id", request.request_id);
+            report = report.with_ctx("rio_request_id", request.request_id());
         }
         if let Some(diagnostics) = self.diagnostics_snapshot() {
             report = report
-                .with_ctx("data_buffer_id", diagnostics.data_buffer_id)
-                .with_ctx("data_buffer_offset", diagnostics.data_buffer_offset)
-                .with_ctx("data_buffer_length", diagnostics.data_buffer_length)
-                .with_ctx("addr_buffer_id", diagnostics.addr_buffer_id)
-                .with_ctx("addr_buffer_offset", diagnostics.addr_buffer_offset)
-                .with_ctx("addr_buffer_length", diagnostics.addr_buffer_length);
+                .with_ctx("data_buffer_id", diagnostics.data_buffer_id())
+                .with_ctx("data_buffer_offset", diagnostics.data_buffer_offset())
+                .with_ctx("data_buffer_length", diagnostics.data_buffer_length())
+                .with_ctx("addr_buffer_id", diagnostics.addr_buffer_id())
+                .with_ctx("addr_buffer_offset", diagnostics.addr_buffer_offset())
+                .with_ctx("addr_buffer_length", diagnostics.addr_buffer_length());
         }
 
         report
@@ -519,7 +574,7 @@ impl Drop for RioSubmitTxn<'_> {
                 rio_request_id = self
                     .request
                     .as_ref()
-                    .map(|request| request.request_id),
+                    .map(RioPreparedRequest::request_id),
                 "failed to roll back unsubmitted RIO buffer reference"
             );
         }
@@ -530,7 +585,7 @@ impl Drop for RioSubmitTxn<'_> {
                 rio_request_id = self
                     .request
                     .as_ref()
-                    .map(|request| request.request_id),
+                    .map(RioPreparedRequest::request_id),
                 "failed to roll back unsubmitted RIO request context"
             );
         }
@@ -542,101 +597,54 @@ impl Drop for RioSubmitTxn<'_> {
                 rio_request_id = self
                     .request
                     .as_ref()
-                    .map(|request| request.request_id),
+                    .map(RioPreparedRequest::request_id),
                 "failed to roll back unsubmitted RIO socket inflight token"
             );
         }
     }
 }
 
-impl RioState {
-    pub(crate) fn submit_rio(
-        &mut self,
-        plan: RioSubmitPlan<'_>,
-        registrar: &dyn BufferRegistrar,
-        submit: impl FnOnce(&RioKernel, &RioPreparedRequest) -> RioResult<()>,
-    ) -> RioResult<SubmissionResult> {
-        self.submit_rio_with_request(plan, registrar, submit)
-            .map(|submitted| submitted.result)
-    }
-
-    pub(crate) fn submit_rio_with_request(
-        &mut self,
-        plan: RioSubmitPlan<'_>,
-        registrar: &dyn BufferRegistrar,
-        submit: impl FnOnce(&RioKernel, &RioPreparedRequest) -> RioResult<()>,
-    ) -> RioResult<RioSubmittedRequest> {
-        RioSubmitTxn::new(self, plan, registrar)
-            .check_socket_accepting()?
-            .ensure_actor()?
-            .acquire_socket()?
-            .prepare_buffer()?
-            .prepare_address()?
-            .encode_context()?
-            .submit_kernel(submit)?
-            .commit()
-    }
-
-    fn prepare_submit_address(
-        &mut self,
-        policy: RioAddressPolicy,
-        env: RioEnv<'_>,
-    ) -> RioResult<Option<RioAddrReservation>> {
-        match policy {
-            RioAddressPolicy::None => Ok(None),
-            RioAddressPolicy::SendTo { addr_ptr, addr_len } => self
-                .registry
-                .prepare_send_addr(addr_ptr, addr_len, env)
-                .map(Some),
-            RioAddressPolicy::RecvMulti => self.registry.prepare_recv_addr(env).map(Some),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        super::{
-            RioRegistry, RioSubmissionKind,
-            registry::test_helpers::{self, NEXT_REGISTER_ID},
-        },
-        *,
+    use super::super::{
+        RioCore, RioKernel, RioRegistry, RioSubmitTxn, registry::RioRegistryTestSupport,
+        submit_ops::RioSubmissionKind,
     };
+    use super::{RioAddressPolicy, RioError, RioOpRequestInit, RioSubmitPlan};
     use crate::{
         BufferRegistrationMode,
         config::{BorrowedRawHandle, IoFd, IocpHandle, RawHandle},
-        driver::IocpDriverCompletionDiagnostics,
-        rio::core::{RioCompletionKind, RioOpKind, RioRequestContextDecode},
+        rio::{
+            RioOpKind, RioRuntime,
+            core::{RioCompletionKind, RioRequestContextDecode},
+        },
     };
-    use slotmap::SlotMap;
+    use diagweave::prelude::*;
     use veloq_buf::{FixedBuf, NoopRegistrar};
     use veloq_driver_core::{driver::OpToken, slot::Generation};
-    use veloq_std::{cell::Cell, collections::FastHashMap, sync::atomic::Ordering, vec::Vec};
+    use veloq_std::cell::Cell;
 
-    fn test_state_with_dispatch(addr_capacity: usize) -> RioState {
-        let mut kernel = RioKernel::noop();
-        kernel.dispatch = Some(test_helpers::test_dispatch());
-        RioState {
-            kernel,
-            registry: RioRegistry::new(32, addr_capacity),
-            registration_mode: BufferRegistrationMode::Strict,
-            submissions_closed: false,
-            actors: SlotMap::with_key(),
-            actor_by_handle: FastHashMap::default(),
-            socket_runtime: FastHashMap::default(),
-            rio_outstanding_count: 0,
-            next_request_id: 0,
-            deferred_kernel_ops: Vec::new(),
-            deferred_payloads: Vec::new(),
-            diagnostics: IocpDriverCompletionDiagnostics::default(),
-            cq_armed: true,
-        }
+    struct RequestContextCase {
+        raw_context: u64,
+        slot_id: u32,
+        generation: u32,
+    }
+
+    fn test_context_with_dispatch(addr_capacity: usize) -> (RioCore, RioRuntime) {
+        let dispatch = RioRegistryTestSupport::test_dispatch();
+        let mut core = RioCore::new(
+            RioKernel::noop(),
+            RioRegistry::new(32, addr_capacity),
+            BufferRegistrationMode::Strict,
+        );
+        core.kernel_mut().set_dispatch_table(Some(dispatch));
+        (core, RioRuntime::new())
     }
 
     fn test_plan<'a>(
         handle: BorrowedRawHandle<'a>,
         buffer: &'a FixedBuf,
-        address: RioAddressPolicy,
+        address: RioAddressPolicy<'a>,
     ) -> RioSubmitPlan<'a> {
         RioSubmitPlan {
             fd: IoFd::fixed_with_generation(7, 9),
@@ -672,88 +680,97 @@ mod tests {
         plan
     }
 
-    fn release_request_init(state: &mut RioState, init: RioOpRequestInit) {
-        let dispatch = test_helpers::test_dispatch();
-        let env = test_helpers::test_env(&dispatch);
-        state
-            .registry
+    fn release_request_init(core: &mut RioCore, runtime: &mut RioRuntime, init: RioOpRequestInit) {
+        let dispatch = RioRegistryTestSupport::test_dispatch();
+        let env = RioRegistryTestSupport::test_env(&dispatch);
+        core.registry_mut()
             .free_addr_reservation(init.addr)
             .expect("address lease should release");
-        state
-            .registry
+        core.registry_mut()
             .release_buffer_lease(init.buffer_lease, env)
             .expect("buffer lease should release");
-        state
+        runtime
             .release_request_inflight(init.op_kind, init.socket_inflight)
             .expect("socket inflight token should release");
-        state.rio_outstanding_count -= 1;
+        core.decrement_outstanding();
     }
 
     #[test]
     fn multishot_submit_keeps_request_identity_and_rio_receive_ex_shape() {
-        let _guard = test_helpers::lock_dispatch_state();
-        test_helpers::reset_dispatch_state();
-        let mut state = test_state_with_dispatch(2);
+        let _guard = RioRegistryTestSupport::lock_dispatch_state();
+        RioRegistryTestSupport::reset_dispatch_state();
+        let (mut core, mut runtime) = test_context_with_dispatch(2);
         let socket = IocpHandle::for_socket(3 as _);
-        state.mark_socket_registered(socket);
+        runtime.mark_socket_registered(socket);
         let raw = RawHandle::new(socket);
-        let first_buf = test_helpers::fixed_buf(64, 0);
-        let second_buf = test_helpers::fixed_buf(64, 0);
+        let first_buf = RioRegistryTestSupport::fixed_buf(64, 0);
+        let second_buf = RioRegistryTestSupport::fixed_buf(64, 0);
         let first_context = Cell::new(0_u64);
         let second_context = Cell::new(0_u64);
 
-        let first = state
-            .submit_rio_with_request(
-                multi_plan(raw.borrow(), &first_buf, 7, 11),
-                &NoopRegistrar,
-                |kernel, request| {
-                    first_context.set(request.as_request_context() as usize as u64);
-                    let addr = request.addr.as_ref().expect("multishot address lease");
-                    kernel.submit_receive_multi(
-                        request.rq,
-                        &request.data_buf.rio_buf,
-                        &addr.rio_buf,
-                        request.as_request_context(),
-                    )
-                },
-            )
-            .expect("first multishot submit should succeed");
-        let second = state
-            .submit_rio_with_request(
-                multi_plan(raw.borrow(), &second_buf, 8, 3),
-                &NoopRegistrar,
-                |kernel, request| {
-                    second_context.set(request.as_request_context() as usize as u64);
-                    let addr = request.addr.as_ref().expect("multishot address lease");
-                    kernel.submit_receive_multi(
-                        request.rq,
-                        &request.data_buf.rio_buf,
-                        &addr.rio_buf,
-                        request.as_request_context(),
-                    )
-                },
-            )
-            .expect("second multishot submit should succeed");
+        let first = RioSubmitTxn::execute(
+            &mut core,
+            &mut runtime,
+            multi_plan(raw.borrow(), &first_buf, 7, 11),
+            &NoopRegistrar,
+            |kernel, request| {
+                first_context.set(request.as_request_context() as usize as u64);
+                let addr = request.addr().expect("multishot address lease");
+                kernel.submit_receive_multi(
+                    request.rq(),
+                    &request.data_buf().rio_buf,
+                    &addr.rio_buf,
+                    request.as_request_context(),
+                )
+            },
+        )
+        .expect("first multishot submit should succeed");
+        let second = RioSubmitTxn::execute(
+            &mut core,
+            &mut runtime,
+            multi_plan(raw.borrow(), &second_buf, 8, 3),
+            &NoopRegistrar,
+            |kernel, request| {
+                second_context.set(request.as_request_context() as usize as u64);
+                let addr = request.addr().expect("multishot address lease");
+                kernel.submit_receive_multi(
+                    request.rq(),
+                    &request.data_buf().rio_buf,
+                    &addr.rio_buf,
+                    request.as_request_context(),
+                )
+            },
+        )
+        .expect("second multishot submit should succeed");
 
         assert_ne!(first.request_id, second.request_id);
-        assert_eq!(state.rio_outstanding_count, 2);
-        assert_eq!(state.registry.addr_free_slots.len(), 0);
-        assert_eq!(test_helpers::RECEIVE_EX_CALLS.load(Ordering::SeqCst), 2);
-        assert_eq!(
-            test_helpers::RECEIVE_EX_DATA_COUNT.load(Ordering::SeqCst),
-            1
-        );
-        assert_eq!(
-            test_helpers::RECEIVE_EX_REMOTE_ADDR.load(Ordering::SeqCst),
-            1
-        );
-        assert_eq!(test_helpers::RECEIVE_EX_FLAGS.load(Ordering::SeqCst), 0);
+        assert_eq!(core.outstanding_count(), 2);
+        assert_eq!(core.registry().addr_free_slot_count(), 0);
+        assert_eq!(RioRegistryTestSupport::receive_ex_calls(), 2);
+        assert_eq!(RioRegistryTestSupport::receive_ex_data_count(), 1);
+        assert_eq!(RioRegistryTestSupport::receive_ex_remote_addr(), 1);
+        assert_eq!(RioRegistryTestSupport::receive_ex_flags(), 0);
 
-        for (raw_context, slot_id, generation) in [
-            (first_context.get(), 7_u32, 11_u32),
-            (second_context.get(), 8_u32, 3_u32),
+        for RequestContextCase {
+            raw_context,
+            slot_id,
+            generation,
+        } in [
+            RequestContextCase {
+                raw_context: first_context.get(),
+                slot_id: 7,
+                generation: 11,
+            },
+            RequestContextCase {
+                raw_context: second_context.get(),
+                slot_id: 8,
+                generation: 3,
+            },
         ] {
-            let init = match state.decode_req_ctx_checked(raw_context) {
+            let init = match core
+                .registry_mut()
+                .decode_request_context_checked(raw_context)
+            {
                 RioRequestContextDecode::Valid(kind) => {
                     let RioCompletionKind::Op { init, .. } = *kind;
                     init
@@ -764,70 +781,74 @@ mod tests {
             assert_eq!(init.op_kind, RioOpKind::UdpRecvMulti);
             assert_eq!(init.receive_slot_id, Some(slot_id));
             assert_eq!(init.receive_slot_generation, Some(generation));
-            assert_eq!(init.diagnostics.receive_slot_id, Some(slot_id));
-            assert_eq!(init.diagnostics.receive_slot_generation, Some(generation));
-            release_request_init(&mut state, init);
+            assert_eq!(init.diagnostics.receive_slot_id(), Some(slot_id));
+            assert_eq!(init.diagnostics.receive_slot_generation(), Some(generation));
+            release_request_init(&mut core, &mut runtime, init);
         }
-        assert_eq!(state.rio_outstanding_count, 0);
-        assert_eq!(state.registry.addr_free_slots.len(), 2);
+        assert_eq!(core.outstanding_count(), 0);
+        assert_eq!(core.registry().addr_free_slot_count(), 2);
     }
 
     #[test]
     fn submit_txn_rejects_closing_socket_before_buffer_or_address_prepare() {
-        let _guard = test_helpers::lock_dispatch_state();
-        test_helpers::reset_dispatch_state();
-        let mut state = test_state_with_dispatch(4);
+        let _guard = RioRegistryTestSupport::lock_dispatch_state();
+        RioRegistryTestSupport::reset_dispatch_state();
+        let (mut core, mut runtime) = test_context_with_dispatch(4);
         let socket = IocpHandle::for_socket(1 as _);
-        state.mark_socket_registered(socket);
-        assert!(state.begin_socket_cleanup(socket).unwrap());
+        runtime.mark_socket_registered(socket);
+        assert!(runtime.begin_socket_cleanup(socket).unwrap());
 
         let raw = RawHandle::new(socket);
-        let buf = test_helpers::fixed_buf(64, 16);
+        let buf = RioRegistryTestSupport::fixed_buf(64, 16);
         let plan = test_plan(raw.borrow(), &buf, RioAddressPolicy::RecvMulti);
 
-        let err = match state.submit_rio(plan, &NoopRegistrar, |_kernel, _request| {
-            panic!("closing socket should fail before kernel submit")
-        }) {
+        let err = match RioSubmitTxn::execute(
+            &mut core,
+            &mut runtime,
+            plan,
+            &NoopRegistrar,
+            |_kernel, _request| panic!("closing socket should fail before kernel submit"),
+        ) {
             Ok(_) => panic!("closing socket should reject submission transaction"),
             Err(error) => error,
         };
 
         assert_eq!(*err.inner(), RioError::InvalidInput);
-        assert_eq!(state.rio_outstanding_count, 0);
-        assert_eq!(state.socket_runtime.get(&socket).unwrap().inflight, 0);
-        assert!(state.actors.is_empty());
-        assert!(state.actor_by_handle.is_empty());
-        assert_eq!(state.registry.addr_free_slots.len(), 4);
-        assert!(
-            state
-                .registry
-                .addr_slot_in_use
-                .iter()
-                .all(|in_use| !*in_use)
-        );
-        assert!(state.registry.heap_rio_bufs.is_empty());
-        assert_eq!(NEXT_REGISTER_ID.load(Ordering::SeqCst), 100);
+        assert_eq!(core.outstanding_count(), 0);
+        assert_eq!(runtime.socket_inflight_for(socket), Some(0));
+        assert_eq!(runtime.actor_count(), 0);
+        assert!(runtime.actor_index_is_empty());
+        assert_eq!(core.registry().addr_free_slot_count(), 4);
+        assert!((0..4).all(|slot| !core.registry().addr_slot_in_use(slot)));
+        assert_eq!(core.registry().heap_registration_count(), 0);
+        assert_eq!(RioRegistryTestSupport::next_register_id(), 100);
     }
 
     #[test]
     fn submit_txn_rolls_back_resources_after_kernel_submit_failure() {
-        let _guard = test_helpers::lock_dispatch_state();
-        test_helpers::reset_dispatch_state();
-        let mut state = test_state_with_dispatch(4);
+        let _guard = RioRegistryTestSupport::lock_dispatch_state();
+        RioRegistryTestSupport::reset_dispatch_state();
+        let (mut core, mut runtime) = test_context_with_dispatch(4);
         let socket = IocpHandle::for_socket(2 as _);
-        state.mark_socket_registered(socket);
+        runtime.mark_socket_registered(socket);
 
         let raw = RawHandle::new(socket);
-        let buf = test_helpers::fixed_buf(64, 16);
+        let buf = RioRegistryTestSupport::fixed_buf(64, 16);
         let request_context = Cell::new(0_u64);
         let plan = test_plan(raw.borrow(), &buf, RioAddressPolicy::RecvMulti);
 
-        let err = match state.submit_rio(plan, &NoopRegistrar, |_kernel, request| {
-            request_context.set(request.as_request_context() as usize as u64);
-            Err(RioError::Datapath
-                .to_report()
-                .attach_note("synthetic submit failure"))
-        }) {
+        let err = match RioSubmitTxn::execute(
+            &mut core,
+            &mut runtime,
+            plan,
+            &NoopRegistrar,
+            |_kernel, request| {
+                request_context.set(request.as_request_context() as usize as u64);
+                Err(RioError::Datapath
+                    .to_report()
+                    .attach_note("synthetic submit failure"))
+            },
+        ) {
             Ok(_) => panic!("kernel submit failure should roll back transaction"),
             Err(error) => error,
         };
@@ -835,27 +856,13 @@ mod tests {
         assert_eq!(*err.inner(), RioError::Datapath);
         assert_ne!(request_context.get(), 0);
         assert!(
-            state
-                .registry
+            core.registry_mut()
                 .decode_request_context(request_context.get())
                 .is_none()
         );
-        assert_eq!(state.rio_outstanding_count, 0);
-        assert_eq!(state.socket_runtime.get(&socket).unwrap().inflight, 0);
-        assert_eq!(state.registry.addr_free_slots.len(), 4);
-        assert!(
-            state
-                .registry
-                .addr_slot_in_use
-                .iter()
-                .all(|in_use| !*in_use)
-        );
-        assert!(
-            state
-                .registry
-                .heap_rio_bufs
-                .values()
-                .all(|entry| entry.active_refs == 0)
-        );
+        assert_eq!(core.outstanding_count(), 0);
+        assert_eq!(runtime.socket_inflight_for(socket), Some(0));
+        assert_eq!(core.registry().addr_free_slot_count(), 4);
+        assert!((0..4).all(|slot| !core.registry().addr_slot_in_use(slot)));
     }
 }

@@ -135,6 +135,11 @@ impl IocpRioRuntime {
         &mut self.state
     }
 
+    #[cfg(feature = "test-hooks")]
+    pub(super) fn debug_chunk_register_attempts(&self) -> u64 {
+        self.state.debug_chunk_register_attempts()
+    }
+
     pub(super) fn state_and_registrar_mut<'state, 'registrar>(
         &'state mut self,
         registrar: &'registrar (dyn BufferRegistrar + 'registrar),
@@ -318,7 +323,7 @@ impl<'a> IocpDriver<'a> {
         })?;
 
         while drained_iocp < pending_iocp_count
-            || self.state().rio.state().rio_outstanding_count > 0
+            || self.state().rio.state().rio_outstanding_count() > 0
         {
             let now = Instant::now();
             if now >= deadline {
@@ -408,7 +413,7 @@ impl<'a> IocpDriver<'a> {
                 .state_mut()
                 .forget_runtime_after_drain()
                 .trans()?;
-            self.state_mut().rio.state_mut().kernel.close();
+            self.state_mut().rio.state_mut().close_kernel();
             self.state_mut().closed = true;
             return Ok(());
         }
@@ -418,7 +423,7 @@ impl<'a> IocpDriver<'a> {
         let needs_deferred_cleanup = pending.iocp_pending > 0
             || pending.rio_pending > 0
             || self.state().ops.has_active_ops()
-            || self.state().rio.state().rio_outstanding_count > 0
+            || self.state().rio.state().rio_outstanding_count() > 0
             || self.state().rio.state().has_socket_inflight()
             || self.state().handles.deferred_cleanup_len() > 0;
         self.state_mut().closed = true;

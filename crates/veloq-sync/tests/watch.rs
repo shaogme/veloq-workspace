@@ -231,12 +231,10 @@ fn test_watch_modify_without_receivers_preserves_value_without_version() {
         }),
         7
     );
-    assert!(
-        tx.send_if_modified(|value| {
-            *value = 3;
-            false
-        }) == false
-    );
+    assert!(!tx.send_if_modified(|value| {
+        *value = 3;
+        false
+    }));
     assert_eq!(*tx.borrow(), 3);
 
     let rx = tx.subscribe();

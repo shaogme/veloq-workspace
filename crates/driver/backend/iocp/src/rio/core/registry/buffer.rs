@@ -1,4 +1,4 @@
-use super::{HEAP_REGISTRATION_CACHE_LIMIT, REGISTER_FAILURE_RETRY_COOLDOWN, RioRegistry};
+use super::{HEAP_REGISTRATION_CACHE_LIMIT, REGISTER_FAILURE_RETRY_COOLDOWN, RioRegistrationStats};
 use crate::rio::{
     RioEnv,
     core::{RioBufferId, RioProvider},
@@ -6,7 +6,11 @@ use crate::rio::{
 };
 use diagweave::prelude::*;
 use veloq_buf::{FixedBuf, PoolKind, heap::ChunkId};
-use veloq_std::{time::Instant, vec::Vec};
+use veloq_std::{
+    collections::{FastHashMap, HashSet},
+    time::Instant,
+    vec::Vec,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct RioHeapBufferKey {
@@ -39,11 +43,18 @@ pub(crate) enum RioBufferLeaseToken {
     Heap(RioHeapLeaseToken),
 }
 
+#[derive(Debug)]
+pub(crate) struct ResolvedRioBuffer {
+    pub(crate) id: RioBufferId,
+    pub(crate) offset: usize,
+    pub(crate) lease: Option<RioBufferLeaseToken>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RioBufferRegistration {
-    pub(crate) id: RioBufferId,
-    pub(crate) active_refs: usize,
-    pub(crate) retired: bool,
+    id: RioBufferId,
+    active_refs: usize,
+    retired: bool,
 }
 
 impl RioBufferRegistration {
@@ -59,7 +70,7 @@ impl RioBufferRegistration {
         self.active_refs = self.active_refs.checked_add(1).ok_or_else(|| {
             RioError::ResourceExhaustion
                 .to_report()
-                .with_ctx("rio_buffer_id", self.id.0 as usize)
+                .with_ctx("rio_buffer_id", self.id.raw() as usize)
                 .with_ctx("active_refs", self.active_refs)
                 .attach_note("RIO buffer registration active refcount overflow")
         })?;
@@ -87,12 +98,41 @@ enum RioChunkRegistrationLocation {
     Retired,
 }
 
-impl RioRegistry {
+pub(super) struct RioBufferRegistry {
+    chunk_registry: Vec<Option<RioChunkRegistration>>,
+    retired_chunk_registrations: FastHashMap<RioChunkRegistrationKey, RioBufferRegistration>,
+    heap_rio_bufs: FastHashMap<RioHeapBufferKey, RioBufferRegistration>,
+    pending_deregistrations: Vec<RioBufferId>,
+    registration_stats: RioRegistrationStats,
+    chunk_register_failures_recent: FastHashMap<ChunkId, Instant>,
+    heap_register_failures_recent: FastHashMap<RioHeapBufferKey, Instant>,
+    next_registration_generation: u64,
+}
+
+impl RioBufferRegistry {
+    pub(super) fn new() -> Self {
+        Self {
+            chunk_registry: Vec::new(),
+            retired_chunk_registrations: FastHashMap::default(),
+            heap_rio_bufs: FastHashMap::default(),
+            pending_deregistrations: Vec::new(),
+            registration_stats: RioRegistrationStats::default(),
+            chunk_register_failures_recent: FastHashMap::default(),
+            heap_register_failures_recent: FastHashMap::default(),
+            next_registration_generation: 0,
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(super) fn chunk_register_attempts(&self) -> u64 {
+        self.registration_stats.chunk_register_attempts
+    }
+
     pub(crate) fn resolve_buffer_id(
         &mut self,
         buf: &FixedBuf,
         env: RioEnv<'_>,
-    ) -> RioResult<(RioBufferId, usize, Option<RioBufferLeaseToken>)> {
+    ) -> RioResult<ResolvedRioBuffer> {
         let info = buf.resolve_region_info();
 
         if info.pool_kind == PoolKind::Heap {
@@ -113,11 +153,11 @@ impl RioRegistry {
         }
 
         match lease {
-            Some(lease) => Ok((
-                lease.id,
-                info.offset,
-                Some(RioBufferLeaseToken::Chunk(lease)),
-            )),
+            Some(lease) => Ok(ResolvedRioBuffer {
+                id: lease.id,
+                offset: info.offset,
+                lease: Some(RioBufferLeaseToken::Chunk(lease)),
+            }),
             None => RioError::Internal
                 .with_ctx("chunk_id", info.id.raw())
                 .attach_note("RIO chunk not registered"),
@@ -141,8 +181,7 @@ impl RioRegistry {
                     .with_ctx("chunk_id", id.raw())
                     .attach_note("RIO chunk registration skipped due to recent failure");
             }
-            // The cooldown expired: drop the record now instead of keeping it until this chunk
-            // happens to register successfully again.
+            // Expired cooldowns release records without waiting for a later registration. / 冷却期过后立即释放记录，不必等到后续注册成功。
             self.chunk_register_failures_recent.remove(&id);
         }
 
@@ -239,7 +278,7 @@ impl RioRegistry {
         buf: &FixedBuf,
         offset: usize,
         env: RioEnv<'_>,
-    ) -> RioResult<(RioBufferId, usize, Option<RioBufferLeaseToken>)> {
+    ) -> RioResult<ResolvedRioBuffer> {
         let key = RioHeapBufferKey {
             ptr: buf.as_ptr() as usize,
             cap: buf.capacity(),
@@ -247,7 +286,11 @@ impl RioRegistry {
         };
         if let Some(entry) = self.heap_rio_bufs.get(&key) {
             let lease = RioHeapLeaseToken { key, id: entry.id };
-            return Ok((entry.id, offset, Some(RioBufferLeaseToken::Heap(lease))));
+            return Ok(ResolvedRioBuffer {
+                id: entry.id,
+                offset,
+                lease: Some(RioBufferLeaseToken::Heap(lease)),
+            });
         }
 
         if let Some(last_fail) = self.heap_register_failures_recent.get(&key)
@@ -269,7 +312,11 @@ impl RioRegistry {
 
         let id = self.register_heap_raw(buf, key, env)?;
         let lease = RioHeapLeaseToken { key, id };
-        Ok((id, offset, Some(RioBufferLeaseToken::Heap(lease))))
+        Ok(ResolvedRioBuffer {
+            id,
+            offset,
+            lease: Some(RioBufferLeaseToken::Heap(lease)),
+        })
     }
 
     pub(crate) fn register_heap_raw(
@@ -546,7 +593,7 @@ impl RioRegistry {
             .with_ctx("rio_buffer_lease_action", action)
             .with_ctx("chunk_id", lease.key.id.as_usize())
             .with_ctx("chunk_generation", lease.key.generation)
-            .with_ctx("rio_buffer_id", lease.id.0 as usize)
+            .with_ctx("rio_buffer_id", lease.id.raw() as usize)
             .attach_note(note)
     }
 
@@ -561,7 +608,7 @@ impl RioRegistry {
             .with_ctx("buffer_ptr", lease.key.ptr)
             .with_ctx("buffer_capacity", lease.key.cap)
             .with_ctx("buffer_cookie", lease.key.cookie)
-            .with_ctx("rio_buffer_id", lease.id.0 as usize)
+            .with_ctx("rio_buffer_id", lease.id.raw() as usize)
             .attach_note(note)
     }
 
@@ -585,20 +632,73 @@ impl RioRegistry {
             }
         }
     }
+
+    pub(super) fn flush_deregs(&mut self, env: RioEnv<'_>) {
+        for id in self.pending_deregistrations.drain(..) {
+            env.dispatch.deregister_buffer(id);
+        }
+    }
+
+    pub(super) fn has_active_leases(&self) -> bool {
+        self.chunk_registry
+            .iter()
+            .flatten()
+            .any(|entry| entry.registration.active_refs > 0)
+            || self
+                .retired_chunk_registrations
+                .values()
+                .any(|entry| entry.active_refs > 0)
+            || self
+                .heap_rio_bufs
+                .values()
+                .any(|entry| entry.active_refs > 0)
+    }
+
+    #[cfg(test)]
+    pub(super) fn heap_registration_count(&self) -> usize {
+        self.heap_rio_bufs.len()
+    }
+
+    pub(super) fn deregister_all(&mut self, env: RioEnv<'_>, deregistered: &mut HashSet<usize>) {
+        let ids = self
+            .chunk_registry
+            .iter()
+            .filter_map(|entry| entry.as_ref().map(|entry| entry.registration.id))
+            .chain(
+                self.retired_chunk_registrations
+                    .values()
+                    .map(|entry| entry.id),
+            )
+            .chain(self.pending_deregistrations.drain(..))
+            .chain(self.heap_rio_bufs.values().map(|entry| entry.id));
+        for id in ids {
+            if !id.is_invalid() && deregistered.insert(id.raw() as usize) {
+                env.dispatch.deregister_buffer(id);
+            }
+        }
+        self.chunk_registry.clear();
+        self.retired_chunk_registrations.clear();
+        self.heap_rio_bufs.clear();
+        self.chunk_register_failures_recent.clear();
+        self.heap_register_failures_recent.clear();
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_helpers::*;
-    use super::*;
-    use veloq_std::{sync::atomic::Ordering::SeqCst, vec};
+    use super::super::{RioRegistry, RioRegistryTestSupport};
+    use super::{
+        ChunkId, RioBufferId, RioBufferLeaseToken, RioBufferRegistration, RioChunkRegistration,
+        RioChunkRegistrationKey, RioHeapBufferKey, RioHeapLeaseToken,
+    };
+    use veloq_std::vec;
 
     #[test]
     fn rio_chunk_retired_registration_waits_for_last_lease() {
-        let _guard = lock_dispatch_state();
-        reset_dispatch_state();
-        let dispatch = test_dispatch();
-        let env = test_env(&dispatch);
+        let _guard = RioRegistryTestSupport::lock_dispatch_state();
+        RioRegistryTestSupport::reset_dispatch_state();
+        let dispatch = RioRegistryTestSupport::test_dispatch();
+        let env = RioRegistryTestSupport::test_env(&dispatch);
         let mut registry = RioRegistry::new(32, 1);
         let chunk_id = ChunkId::from_raw(3);
         let chunk_index = chunk_id.as_usize();
@@ -606,40 +706,56 @@ mod tests {
             id: chunk_id,
             generation: 1,
         };
-        registry.chunk_registry.resize(chunk_index + 1, None);
-        registry.chunk_registry[chunk_index] = Some(RioChunkRegistration {
+        registry
+            .buffers
+            .chunk_registry
+            .resize(chunk_index + 1, None);
+        registry.buffers.chunk_registry[chunk_index] = Some(RioChunkRegistration {
             generation: key.generation,
-            registration: RioBufferRegistration::new(RioBufferId(41 as _)),
+            registration: RioBufferRegistration::new(RioBufferId::from_raw(41 as _)),
         });
         let lease = registry
+            .buffers
             .current_chunk_lease(chunk_id)
             .map(RioBufferLeaseToken::Chunk);
 
         registry
             .acquire_buffer_lease(lease)
             .expect("chunk lease acquire should succeed");
-        let previous = registry.chunk_registry[chunk_index]
+        let previous = registry.buffers.chunk_registry[chunk_index]
             .take()
             .expect("chunk registration");
-        registry.retire_chunk_registration(key, previous.registration, env);
+        registry
+            .buffers
+            .retire_chunk_registration(key, previous.registration, env);
 
-        assert!(deregistered_ids().is_empty());
-        assert!(registry.retired_chunk_registrations.contains_key(&key));
+        assert!(RioRegistryTestSupport::deregistered_ids().is_empty());
+        assert!(
+            registry
+                .buffers
+                .retired_chunk_registrations
+                .contains_key(&key)
+        );
 
         registry
             .release_buffer_lease(lease, env)
             .expect("chunk lease release should succeed");
 
-        assert_eq!(deregistered_ids(), vec![41]);
-        assert!(!registry.retired_chunk_registrations.contains_key(&key));
+        assert_eq!(RioRegistryTestSupport::deregistered_ids(), vec![41]);
+        assert!(
+            !registry
+                .buffers
+                .retired_chunk_registrations
+                .contains_key(&key)
+        );
     }
 
     #[test]
     fn rio_heap_retired_registration_deregisters_on_release() {
-        let _guard = lock_dispatch_state();
-        reset_dispatch_state();
-        let dispatch = test_dispatch();
-        let env = test_env(&dispatch);
+        let _guard = RioRegistryTestSupport::lock_dispatch_state();
+        RioRegistryTestSupport::reset_dispatch_state();
+        let dispatch = RioRegistryTestSupport::test_dispatch();
+        let env = RioRegistryTestSupport::test_env(&dispatch);
         let mut registry = RioRegistry::new(32, 1);
         let key = RioHeapBufferKey {
             ptr: 1,
@@ -648,16 +764,18 @@ mod tests {
         };
         let lease = Some(RioBufferLeaseToken::Heap(RioHeapLeaseToken {
             key,
-            id: RioBufferId(77 as _),
+            id: RioBufferId::from_raw(77 as _),
         }));
-        registry
-            .heap_rio_bufs
-            .insert(key, RioBufferRegistration::new(RioBufferId(77 as _)));
+        registry.buffers.heap_rio_bufs.insert(
+            key,
+            RioBufferRegistration::new(RioBufferId::from_raw(77 as _)),
+        );
 
         registry
             .acquire_buffer_lease(lease)
             .expect("heap lease acquire should succeed");
         registry
+            .buffers
             .heap_rio_bufs
             .get_mut(&key)
             .expect("heap registration")
@@ -666,52 +784,55 @@ mod tests {
             .release_buffer_lease(lease, env)
             .expect("heap lease release should succeed");
 
-        assert_eq!(deregistered_ids(), vec![77]);
-        assert!(!registry.heap_rio_bufs.contains_key(&key));
+        assert_eq!(RioRegistryTestSupport::deregistered_ids(), vec![77]);
+        assert!(!registry.buffers.heap_rio_bufs.contains_key(&key));
     }
 
     #[test]
     fn rio_chunk_register_failure_keeps_existing_registration_current() {
-        let _guard = lock_dispatch_state();
-        reset_dispatch_state();
-        let dispatch = test_dispatch();
-        let env = test_env(&dispatch);
+        let _guard = RioRegistryTestSupport::lock_dispatch_state();
+        RioRegistryTestSupport::reset_dispatch_state();
+        let dispatch = RioRegistryTestSupport::test_dispatch();
+        let env = RioRegistryTestSupport::test_env(&dispatch);
         let mut registry = RioRegistry::new(32, 1);
         let chunk_id = ChunkId::from_raw(2);
         let chunk_index = chunk_id.as_usize();
-        registry.chunk_registry.resize(chunk_index + 1, None);
-        registry.chunk_registry[chunk_index] = Some(RioChunkRegistration {
+        registry
+            .buffers
+            .chunk_registry
+            .resize(chunk_index + 1, None);
+        registry.buffers.chunk_registry[chunk_index] = Some(RioChunkRegistration {
             generation: 1,
-            registration: RioBufferRegistration::new(RioBufferId(55 as _)),
+            registration: RioBufferRegistration::new(RioBufferId::from_raw(55 as _)),
         });
         let byte = 0_u8;
-        REGISTER_FAILS.store(true, SeqCst);
+        RioRegistryTestSupport::fail_next_register();
 
         registry
             .register_buffer_backend(chunk_id, (&byte as *const u8, 1), env)
             .expect_err("failed registration should be reported");
 
-        let current = registry.chunk_registry[chunk_index]
+        let current = registry.buffers.chunk_registry[chunk_index]
             .expect("existing chunk registration should remain current");
-        assert_eq!(current.registration.id, RioBufferId(55 as _));
-        assert!(registry.pending_deregistrations.is_empty());
-        assert!(deregistered_ids().is_empty());
+        assert_eq!(current.registration.id, RioBufferId::from_raw(55 as _));
+        assert!(registry.buffers.pending_deregistrations.is_empty());
+        assert!(RioRegistryTestSupport::deregistered_ids().is_empty());
     }
 
     #[test]
     fn rio_heap_register_failure_does_not_leave_a_lease_or_registration() {
-        let _guard = lock_dispatch_state();
-        reset_dispatch_state();
-        let dispatch = test_dispatch();
-        let env = test_env(&dispatch);
+        let _guard = RioRegistryTestSupport::lock_dispatch_state();
+        RioRegistryTestSupport::reset_dispatch_state();
+        let dispatch = RioRegistryTestSupport::test_dispatch();
+        let env = RioRegistryTestSupport::test_env(&dispatch);
         let mut registry = RioRegistry::new(32, 1);
-        let buf = fixed_buf(8, 0);
-        REGISTER_FAILS.store(true, SeqCst);
+        let buf = RioRegistryTestSupport::fixed_buf(8, 0);
+        RioRegistryTestSupport::fail_next_register();
 
         registry
             .resolve_buffer_id(&buf, env)
             .expect_err("heap registration failure should be observable");
-        assert!(registry.heap_rio_bufs.is_empty());
-        assert!(deregistered_ids().is_empty());
+        assert!(registry.buffers.heap_rio_bufs.is_empty());
+        assert!(RioRegistryTestSupport::deregistered_ids().is_empty());
     }
 }

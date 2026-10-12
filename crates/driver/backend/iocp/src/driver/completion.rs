@@ -93,29 +93,30 @@ struct IocpCompletionHooks<'a> {
     post: IocpPostCompletionEffects,
 }
 
+struct IocpCompletionHooksArgs<'a> {
+    ext: &'a Extensions,
+    diagnostics: &'a IocpDriverCompletionDiagnostics,
+    rio: &'a mut RioState,
+    completion: &'a CompletionPump,
+    port: Arc<IoCompletionPort>,
+    registered_slots: &'a mut [RegisteredSlot],
+    registrar: &'a dyn BufferRegistrar,
+    shutting_down: bool,
+    synthetic: IocpSyntheticCompletion,
+}
+
 impl<'a> IocpCompletionHooks<'a> {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        ext: &'a Extensions,
-        diagnostics: &'a IocpDriverCompletionDiagnostics,
-        rio: &'a mut RioState,
-        completion: &'a CompletionPump,
-        port: Arc<IoCompletionPort>,
-        registered_slots: &'a mut [RegisteredSlot],
-        registrar: &'a dyn BufferRegistrar,
-        shutting_down: bool,
-        synthetic: IocpSyntheticCompletion,
-    ) -> Self {
+    fn new(args: IocpCompletionHooksArgs<'a>) -> Self {
         Self {
-            ext,
-            diagnostics,
-            rio,
-            completion,
-            port,
-            registered_slots,
-            registrar,
-            shutting_down,
-            synthetic,
+            ext: args.ext,
+            diagnostics: args.diagnostics,
+            rio: args.rio,
+            completion: args.completion,
+            port: args.port,
+            registered_slots: args.registered_slots,
+            registrar: args.registrar,
+            shutting_down: args.shutting_down,
+            synthetic: args.synthetic,
             post: IocpPostCompletionEffects::default(),
         }
     }
@@ -525,17 +526,17 @@ impl<'a> IocpDriver<'a> {
         let port = state.completion.port_arc();
         let (rio, registrar) = state.rio.state_and_registrar_mut(registrar);
         let registered_slots = state.handles.submission_slots();
-        let mut hooks = IocpCompletionHooks::new(
-            &state.extensions,
-            &state.completion_diagnostics,
+        let mut hooks = IocpCompletionHooks::new(IocpCompletionHooksArgs {
+            ext: &state.extensions,
+            diagnostics: &state.completion_diagnostics,
             rio,
-            &state.completion,
+            completion: &state.completion,
             port,
             registered_slots,
             registrar,
-            state.shutting_down,
+            shutting_down: state.shutting_down,
             synthetic,
-        );
+        });
         let outcome = state.ops.accept_completion(
             state.completion.table(),
             &state.completion_diagnostics,

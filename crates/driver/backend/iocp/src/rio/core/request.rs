@@ -1,16 +1,17 @@
 use super::{
-    registry::{
-        RioAddrReservation, RioBufferLeaseToken, RioPreparedBuffer, RioRegistry, RioSubmissionKind,
-    },
-    submit_ops::RioRq,
+    registry::{RioAddrReservation, RioBufferLeaseToken, RioPreparedBuffer, RioRegistry},
+    submit_ops::{RioRq, RioSubmissionKind},
 };
 use crate::{
     config::{BorrowedRawHandle, IoFd, SocketKey},
+    net::addr::SockAddrStorage,
     rio::{SocketInflightToken, error::RioError},
 };
+use core::ffi::c_void;
 use diagweave::prelude::*;
+use veloq_buf::FixedBuf;
 use veloq_driver_core::{driver::OpToken, slot::Generation};
-use veloq_std::{boxed::Box, ffi::c_void, string::ToString};
+use veloq_std::{boxed::Box, string::ToString};
 use windows_sys::Win32::Networking::WinSock::RIO_BUF;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,15 +39,22 @@ impl RioOpKind {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RioRequestDiagnostics {
-    pub(crate) rq_raw: usize,
-    pub(crate) data_buffer_id: usize,
-    pub(crate) data_buffer_offset: u32,
-    pub(crate) data_buffer_length: u32,
-    pub(crate) addr_buffer_id: usize,
-    pub(crate) addr_buffer_offset: u32,
-    pub(crate) addr_buffer_length: u32,
-    pub(crate) receive_slot_id: Option<u32>,
-    pub(crate) receive_slot_generation: Option<u32>,
+    rq_raw: usize,
+    data_buffer_id: usize,
+    data_buffer_offset: u32,
+    data_buffer_length: u32,
+    addr_buffer_id: usize,
+    addr_buffer_offset: u32,
+    addr_buffer_length: u32,
+    receive_slot_id: Option<u32>,
+    receive_slot_generation: Option<u32>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct RioAddressBufferDiagnostic {
+    id: usize,
+    offset: u32,
+    length: u32,
 }
 
 impl RioRequestDiagnostics {
@@ -61,26 +69,62 @@ impl RioRequestDiagnostics {
         receive_slot_id: Option<u32>,
         receive_slot_generation: Option<u32>,
     ) -> Self {
-        let (addr_buffer_id, addr_buffer_offset, addr_buffer_length) = addr
-            .map(|addr| {
-                (
-                    addr.rio_buf.BufferId as usize,
-                    addr.rio_buf.Offset,
-                    addr.rio_buf.Length,
-                )
+        let addr_diagnostic = addr
+            .map(|addr| RioAddressBufferDiagnostic {
+                id: addr.rio_buf.BufferId as usize,
+                offset: addr.rio_buf.Offset,
+                length: addr.rio_buf.Length,
             })
-            .unwrap_or((0, 0, 0));
+            .unwrap_or_default();
         Self {
             rq_raw: rq.0 as usize,
             data_buffer_id: data_buf.BufferId as usize,
             data_buffer_offset: data_buf.Offset,
             data_buffer_length: data_buf.Length,
-            addr_buffer_id,
-            addr_buffer_offset,
-            addr_buffer_length,
+            addr_buffer_id: addr_diagnostic.id,
+            addr_buffer_offset: addr_diagnostic.offset,
+            addr_buffer_length: addr_diagnostic.length,
             receive_slot_id,
             receive_slot_generation,
         }
+    }
+
+    pub(crate) const fn rq_raw(self) -> usize {
+        self.rq_raw
+    }
+
+    pub(crate) const fn data_buffer_id(self) -> usize {
+        self.data_buffer_id
+    }
+
+    pub(crate) const fn data_buffer_offset(self) -> u32 {
+        self.data_buffer_offset
+    }
+
+    pub(crate) const fn data_buffer_length(self) -> u32 {
+        self.data_buffer_length
+    }
+
+    pub(crate) const fn addr_buffer_id(self) -> usize {
+        self.addr_buffer_id
+    }
+
+    pub(crate) const fn addr_buffer_offset(self) -> u32 {
+        self.addr_buffer_offset
+    }
+
+    pub(crate) const fn addr_buffer_length(self) -> u32 {
+        self.addr_buffer_length
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn receive_slot_id(self) -> Option<u32> {
+        self.receive_slot_id
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn receive_slot_generation(self) -> Option<u32> {
+        self.receive_slot_generation
     }
 }
 
@@ -213,20 +257,37 @@ impl RioCompletedRequestContext {
 }
 
 pub(crate) struct RioPreparedRequest {
-    pub(crate) op_kind: RioOpKind,
-    pub(crate) request_id: u64,
-    pub(crate) rq: RioRq,
+    op_kind: RioOpKind,
+    request_id: u64,
+    rq: RioRq,
+    context: Option<RioPreparedRequestContext>,
+    token: OpToken,
+    socket_key: SocketKey,
+    addr_slot: Option<usize>,
+    addr_generation: Option<u64>,
+    data_buf: RioPreparedBuffer,
+    addr: Option<RioAddrReservation>,
+    receive_slot_id: Option<u32>,
+    receive_slot_generation: Option<u32>,
+    diagnostics: RioRequestDiagnostics,
+    outstanding_snapshot: usize,
+}
+
+pub(super) struct RioPreparedRequestParts {
+    pub(super) op_kind: RioOpKind,
+    pub(super) request_id: u64,
+    pub(super) rq: RioRq,
     pub(super) context: Option<RioPreparedRequestContext>,
-    pub(crate) token: OpToken,
-    pub(crate) socket_key: SocketKey,
-    pub(crate) addr_slot: Option<usize>,
-    pub(crate) addr_generation: Option<u64>,
-    pub(crate) data_buf: RioPreparedBuffer,
-    pub(crate) addr: Option<RioAddrReservation>,
-    pub(crate) receive_slot_id: Option<u32>,
-    pub(crate) receive_slot_generation: Option<u32>,
-    pub(crate) diagnostics: RioRequestDiagnostics,
-    pub(crate) outstanding_snapshot: usize,
+    pub(super) token: OpToken,
+    pub(super) socket_key: SocketKey,
+    pub(super) addr_slot: Option<usize>,
+    pub(super) addr_generation: Option<u64>,
+    pub(super) data_buf: RioPreparedBuffer,
+    pub(super) addr: Option<RioAddrReservation>,
+    pub(super) receive_slot_id: Option<u32>,
+    pub(super) receive_slot_generation: Option<u32>,
+    pub(super) diagnostics: RioRequestDiagnostics,
+    pub(super) outstanding_snapshot: usize,
 }
 
 pub(crate) struct RioSubmitErrorContext<'a> {
@@ -237,10 +298,10 @@ pub(crate) struct RioSubmitErrorContext<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) enum RioAddressPolicy {
+pub(crate) enum RioAddressPolicy<'a> {
     None,
     SendTo {
-        addr_ptr: *const c_void,
+        addr: &'a SockAddrStorage,
         addr_len: i32,
     },
     RecvMulti,
@@ -253,10 +314,10 @@ pub(crate) struct RioSubmitPlan<'a> {
     pub(crate) token: OpToken,
     pub(crate) op_kind: RioOpKind,
     pub(crate) buffer_kind: RioSubmissionKind,
-    pub(crate) buffer: &'a veloq_buf::FixedBuf,
+    pub(crate) buffer: &'a FixedBuf,
     pub(crate) buffer_offset: usize,
     pub(crate) operation: &'static str,
-    pub(crate) address: RioAddressPolicy,
+    pub(crate) address: RioAddressPolicy<'a>,
     pub(crate) dispatch_error: RioError,
     pub(crate) dispatch_note: &'static str,
     pub(crate) submit_scope: &'static str,
@@ -266,6 +327,25 @@ pub(crate) struct RioSubmitPlan<'a> {
 }
 
 impl RioPreparedRequest {
+    pub(super) fn new(parts: RioPreparedRequestParts) -> Self {
+        Self {
+            op_kind: parts.op_kind,
+            request_id: parts.request_id,
+            rq: parts.rq,
+            context: parts.context,
+            token: parts.token,
+            socket_key: parts.socket_key,
+            addr_slot: parts.addr_slot,
+            addr_generation: parts.addr_generation,
+            data_buf: parts.data_buf,
+            addr: parts.addr,
+            receive_slot_id: parts.receive_slot_id,
+            receive_slot_generation: parts.receive_slot_generation,
+            diagnostics: parts.diagnostics,
+            outstanding_snapshot: parts.outstanding_snapshot,
+        }
+    }
+
     #[inline]
     pub(super) fn take_init(&mut self, registry: &mut RioRegistry) -> Option<RioOpRequestInit> {
         let context = self.context.take()?;
@@ -275,6 +355,30 @@ impl RioPreparedRequest {
     #[inline]
     pub(crate) fn socket_key(&self) -> SocketKey {
         self.socket_key
+    }
+
+    pub(crate) const fn op_kind(&self) -> RioOpKind {
+        self.op_kind
+    }
+
+    pub(crate) const fn request_id(&self) -> u64 {
+        self.request_id
+    }
+
+    pub(crate) const fn rq(&self) -> RioRq {
+        self.rq
+    }
+
+    pub(crate) const fn data_buf(&self) -> &RioPreparedBuffer {
+        &self.data_buf
+    }
+
+    pub(crate) const fn addr(&self) -> Option<&RioAddrReservation> {
+        self.addr.as_ref()
+    }
+
+    pub(crate) const fn diagnostics(&self) -> RioRequestDiagnostics {
+        self.diagnostics
     }
 
     #[inline]
@@ -328,23 +432,12 @@ impl RioPreparedRequest {
     }
 }
 
-impl<'a> RioSubmitPlan<'a> {
-    #[inline]
-    pub(super) fn submit_error_context(&self) -> RioSubmitErrorContext<'a> {
-        RioSubmitErrorContext {
-            scope: self.submit_scope,
-            fd: self.fd,
-            handle: self.handle,
-            note: self.submit_note,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::registry::RioRegistry;
-    use super::*;
-    use crate::config::IocpHandle;
+    use super::{RioCompletionKind, RioOpKind, RioOpRequestInit, RioRequestDiagnostics};
+    use crate::{config::IocpHandle, rio::SocketInflightToken};
+    use veloq_driver_core::{driver::OpToken, slot::Generation};
     use veloq_std::ptr;
 
     fn test_req_init(addr_slot: Option<usize>) -> RioOpRequestInit {

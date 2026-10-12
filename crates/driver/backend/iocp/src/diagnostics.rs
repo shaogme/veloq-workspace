@@ -1,11 +1,7 @@
 use veloq_std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::rio::runtime::control_flow::{
-    RIO_ANOMALY_MALFORMED, RIO_ANOMALY_MISSING, RIO_ANOMALY_STALE,
-};
+use crate::rio::RioCompletionAnomaly;
 
-#[cfg(test)]
-use crate::driver::RIO_EVENT_TOKEN;
 use veloq_driver_core::driver::{
     CompletionAnomaly, CompletionAnomalyReason, DriverCompletionDiagnosticsBackend,
 };
@@ -241,15 +237,15 @@ impl DriverCompletionDiagnosticsBackend for IocpCompletionDiagnostics {
     fn record_backend_anomaly(&self, anomaly: &CompletionAnomaly) -> bool {
         match anomaly.reason() {
             CompletionAnomalyReason::BackendSpecific(code) => match code {
-                RIO_ANOMALY_MALFORMED => {
+                RioCompletionAnomaly::MALFORMED => {
                     Self::inc(&self.rio_malformed_context);
                     false
                 }
-                RIO_ANOMALY_MISSING => {
+                RioCompletionAnomaly::MISSING => {
                     Self::inc(&self.rio_missing_context);
                     false
                 }
-                RIO_ANOMALY_STALE => {
+                RioCompletionAnomaly::STALE => {
                     Self::inc(&self.rio_stale_context);
                     false
                 }
@@ -262,14 +258,14 @@ impl DriverCompletionDiagnosticsBackend for IocpCompletionDiagnostics {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::rio::runtime::control_flow::rio_malformed_context_kind;
-    use veloq_driver_core::driver::AnomalyAttach;
+    use super::IocpCompletionDiagnostics;
+    use crate::{driver::RIO_EVENT_TOKEN, rio::RioCompletionAnomaly};
+    use veloq_driver_core::driver::{AnomalyAttach, DriverCompletionDiagnosticsBackend};
 
     #[test]
     fn rio_backend_anomaly_keeps_core_counting_enabled() {
         let diagnostics = IocpCompletionDiagnostics::default();
-        let kind = rio_malformed_context_kind(0xa700_0001);
+        let kind = RioCompletionAnomaly::malformed(0xa700_0001);
         let attach = AnomalyAttach::token_only(RIO_EVENT_TOKEN);
 
         assert!(!diagnostics.record_backend_anomaly(&kind.materialize(attach)));

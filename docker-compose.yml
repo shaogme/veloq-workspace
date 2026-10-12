@@ -1,62 +1,88 @@
-# Base configuration for the application
+x-podman-engine: &podman-engine
+  image: ghcr.io/shaogme/nixos-dockers/podman:${NIXOS_DOCKERS_VERSION:-latest}
+  command: ["podman", "system", "service", "--time=0", "unix:///run/podman/podman.sock"]
+  environment:
+    - PODMAN_SOCKET_GID=${PODMAN_SOCKET_GID:-1000}
+    - PODMAN_SOCKET_MODE=${PODMAN_SOCKET_MODE:-0660}
+  volumes:
+    - podman-socket:/run/podman
+    - podman-data:/var/lib/containers
+    - .:/workspace
+  cgroup: private
+  cap_add:
+    - NET_ADMIN
+    - SYS_ADMIN
+    - SYS_CHROOT
+    - SYS_PTRACE
+    - SYS_RESOURCE
+    - DAC_READ_SEARCH
+    - AUDIT_WRITE
+  security_opt:
+    - seccomp:unconfined
+    - systempaths:unconfined
+  group_add:
+    - "${PODMAN_SOCKET_GID:-1000}"
+  devices:
+    - /dev/fuse:/dev/fuse
+    - /dev/net/tun:/dev/net/tun
+  healthcheck:
+    test: ["CMD-SHELL", "podman --remote --url unix:///run/podman/podman.sock info >/dev/null 2>&1"]
+    interval: 2s
+    timeout: 3s
+    retries: 30
+
 x-app-base: &app-base
   image: ghcr.io/shaogme/coding-images/qemu-rust-cross:latest
   environment:
-    - DEVBOX_AUTO_INIT=${DEVBOX_AUTO_INIT:-0} # Auto-initialize devbox.json if not present
-    - HOST_UID # Set HOST_UID=host_uid[:host_gid] explicitly; otherwise infer the mounted workspace owner
-    - CONTAINER_HOME=${CONTAINER_HOME:-/home/user} # Unified container home path for root and non-root users
-    - CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-0} # Disabled by default for sccache caching compatibility
-    - CARGO_TARGET_DIR=/data/.cargo/target # Isolate Rust target directory to persistent data volume
-    - SCCACHE_DIR=/data/cache/sccache # Directory for sccache compiler cache storage
-    - SCCACHE_DISABLE=${SCCACHE_DISABLE:-0} # Set to 1 to explicitly disable sccache (also supports ENABLE_SCCACHE=0)
-    - CROSS_CONTAINER_ENGINE=podman # Direct cross to use containerized Podman engine
-  security_opt:
-    - seccomp:unconfined
-    - apparmor:unconfined
-    - systempaths:unconfined
-  cap_add:
-    - SYS_ADMIN
-    - NET_ADMIN
-    - SYS_PTRACE
+    - DEVBOX_AUTO_INIT=${DEVBOX_AUTO_INIT:-0}
+    - HOST_UID
+    - HOST_GID
+    - PODMAN_SOCKET_GID=${PODMAN_SOCKET_GID:-1000}
+    - CONTAINER_HOST=unix:///run/podman/podman.sock
+    - DOCKER_HOST=unix:///run/podman/podman.sock
+    - CARGO_INCREMENTAL=${CARGO_INCREMENTAL:-0}
+    - CARGO_TARGET_DIR=/data/.cargo/target
+    - SCCACHE_DIR=/data/cache/sccache
+    - SCCACHE_DISABLE=${SCCACHE_DISABLE:-0}
+  # NET_ADMIN and the TAP device are QEMU networking requirements; SYS_PTRACE
+  # is retained for the Rust debugger.
+  cap_add: [NET_ADMIN, SYS_ADMIN, SYS_PTRACE]
+  group_add:
+    - "${PODMAN_SOCKET_GID:-1000}"
+  security_opt: ["seccomp:unconfined", "apparmor:unconfined"]
   devices:
-    - /dev/kvm:/dev/kvm # Hardware acceleration for KVM virtualization
-    - /dev/net/tun:/dev/net/tun # Allow TUN/TAP devices for QEMU & Podman to create network interfaces
-    - /dev/fuse:/dev/fuse # Allow fuse-overlayfs inside container
+    - /dev/kvm:/dev/kvm # QEMU KVM acceleration
+    - /dev/net/tun:/dev/net/tun # QEMU TAP networking
   tty: true
 
 services:
-  # Develop mode: Mounts local directory for hot-reloading (Default)
+  podman:
+    <<: *podman-engine
   dev:
     <<: *app-base
     container_name: veloq-dev
+    depends_on:
+      podman:
+        condition: service_healthy
     volumes:
-      # Mount host source code
       - .:/workspace
       - /workspace/.git
       - ./image/win2025-core-rust-gnu.qcow2:/workspace/image/win2025-core-rust-gnu.qcow2:ro
       - ./image/win2025-core-rust-gnu.json:/workspace/image/win2025-core-rust-gnu.json:ro
-      # Persist VM images, cloud-init seeds, and QEMU disks
+      - podman-socket:/run/podman
       - qemu-data:/data/qemu
-      # Isolate Rust build artifacts inside a dedicated named Docker volume (high-performance Linux ext4)
       - rust-target:/data/.cargo/target
-      # Persist Cargo dependencies, crate index, and git checkouts
-      - cargo-registry:${CONTAINER_HOME:-/home/user}/.cargo/registry
-      - cargo-git:${CONTAINER_HOME:-/home/user}/.cargo/git
-      # Persist cache
+      - cargo:/data/cargo
       - cache:/data/cache
-      # Persist Podman containers and cached cross-compilation toolchain images
-      - podman-containers:/var/lib/containers
-      # Persist devbox data
       - devbox-data:/data/devbox
-      # Persist unified AI credentials and tool configurations
       - coding-config:/data/coding-config
 
 volumes:
+  podman-socket:
+  podman-data:
   qemu-data:
   rust-target:
-  cargo-registry:
-  cargo-git:
+  cargo:
   cache:
-  podman-containers:
   devbox-data:
   coding-config:

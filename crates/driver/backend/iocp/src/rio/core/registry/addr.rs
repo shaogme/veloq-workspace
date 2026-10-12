@@ -1,4 +1,3 @@
-use super::RioRegistry;
 use crate::{
     net::addr::SockAddrStorage,
     rio::{
@@ -8,10 +7,13 @@ use crate::{
     },
 };
 use diagweave::prelude::*;
+use veloq_pod::{bytes_of, bytes_of_mut};
 use veloq_std::{
-    ffi::c_void,
-    mem::{size_of, size_of_val},
-    ptr::{addr_of, copy_nonoverlapping, write_bytes},
+    boxed::Box,
+    collections::HashSet,
+    mem::{replace, size_of, size_of_val},
+    vec,
+    vec::Vec,
 };
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, RIO_BUF, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
@@ -24,23 +26,43 @@ pub(crate) struct RioAddrReservation {
     pub(crate) rio_buf: RIO_BUF,
 }
 
-impl RioRegistry {
+pub(super) struct RioAddressRegistry {
+    addr_slots: Box<[SockAddrStorage]>,
+    addr_slot_in_use: Vec<bool>,
+    addr_slot_generations: Vec<u64>,
+    addr_free_slots: Vec<usize>,
+    addr_buffer_id: RioBufferId,
+}
+
+impl RioAddressRegistry {
+    pub(super) fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        let mut addr_free_slots = Vec::with_capacity(capacity);
+        for slot in (0..capacity).rev() {
+            addr_free_slots.push(slot);
+        }
+
+        Self {
+            addr_slots: vec![SockAddrStorage::default(); capacity].into_boxed_slice(),
+            addr_slot_in_use: vec![false; capacity],
+            addr_slot_generations: vec![0; capacity],
+            addr_free_slots,
+            addr_buffer_id: RioBufferId::INVALID,
+        }
+    }
+
     pub(crate) fn prepare_send_addr(
         &mut self,
-        addr_ptr: *const c_void,
+        addr: &SockAddrStorage,
         addr_len: i32,
         env: RioEnv<'_>,
     ) -> RioResult<RioAddrReservation> {
-        let rio_addr_len = Self::validate_send_addr(addr_ptr, addr_len)?;
+        let rio_addr_len = Self::validate_send_addr(addr, addr_len)?;
         let reservation = self.allocate_addr_slot(env)?;
-        let dst = (&mut self.addr_slots[reservation.slot] as *mut SockAddrStorage).cast::<u8>();
         let copy_len = (addr_len as usize).min(rio_addr_len as usize);
-        // SAFETY: `dst` points at an owned scratch slot, and `addr_ptr` was
-        // validated as non-null with at least `copy_len` readable bytes.
-        unsafe {
-            write_bytes(dst, 0, size_of::<SockAddrStorage>());
-            copy_nonoverlapping(addr_ptr.cast::<u8>(), dst, copy_len);
-        }
+        let destination = &mut self.addr_slots[reservation.slot];
+        *destination = SockAddrStorage::default();
+        bytes_of_mut(destination)[..copy_len].copy_from_slice(&bytes_of(addr)[..copy_len]);
         Ok(RioAddrReservation {
             rio_buf: RIO_BUF {
                 Length: rio_addr_len,
@@ -52,22 +74,15 @@ impl RioRegistry {
 
     pub(crate) fn prepare_recv_addr(&mut self, env: RioEnv<'_>) -> RioResult<RioAddrReservation> {
         let reservation = self.allocate_addr_slot(env)?;
-        let dst = (&mut self.addr_slots[reservation.slot] as *mut SockAddrStorage).cast::<u8>();
-        // SAFETY: `dst` points at an owned scratch slot.
-        unsafe {
-            write_bytes(dst, 0, size_of::<SockAddrStorage>());
-        }
+        self.addr_slots[reservation.slot] = SockAddrStorage::default();
         Ok(reservation)
     }
 
     pub(crate) fn copy_addr_slot_to(
         &self,
         reservation: RioAddrReservation,
-        dst: *mut SockAddrStorage,
+        dst: &mut SockAddrStorage,
     ) -> RioResult<()> {
-        if dst.is_null() {
-            return RioError::Internal.attach_note("RIO receive completion missing output address");
-        }
         if !self.addr_reservation_is_active(reservation) {
             return Err(
                 self.addr_lease_error(reservation, "copy from inactive or stale address lease")
@@ -78,10 +93,7 @@ impl RioRegistry {
                 .with_ctx("addr_slot", reservation.slot)
                 .attach_note("RIO address slot out of bounds");
         };
-        // SAFETY: `src` is a live scratch slot and `dst` points at the op payload.
-        unsafe {
-            copy_nonoverlapping(src as *const SockAddrStorage, dst, 1);
-        }
+        *dst = *src;
         Ok(())
     }
 
@@ -146,7 +158,7 @@ impl RioRegistry {
             slot,
             generation,
             rio_buf: RIO_BUF {
-                BufferId: buffer_id.0,
+                BufferId: buffer_id.raw(),
                 Offset: offset,
                 Length: size_of::<SOCKADDR_INET>() as u32,
             },
@@ -177,10 +189,7 @@ impl RioRegistry {
         Ok(id)
     }
 
-    pub(crate) fn validate_send_addr(addr_ptr: *const c_void, addr_len: i32) -> RioResult<u32> {
-        if addr_ptr.is_null() {
-            return RioError::InvalidInput.attach_note("RIO send_to received null address");
-        }
+    pub(crate) fn validate_send_addr(addr: &SockAddrStorage, addr_len: i32) -> RioResult<u32> {
         if addr_len < 0 {
             return RioError::InvalidInput
                 .with_ctx("address_len", addr_len)
@@ -192,10 +201,7 @@ impl RioRegistry {
                 .with_ctx("min_address_len", size_of::<SOCKADDR>())
                 .attach_note("RIO send_to address too short for SOCKADDR");
         }
-        // SAFETY: addr_ptr is non-null and at least SOCKADDR-sized; read_unaligned avoids
-        // imposing alignment requirements on future raw-pointer callers.
-        let family =
-            unsafe { addr_of!((*(addr_ptr as *const SOCKADDR)).sa_family).read_unaligned() };
+        let family = addr.family();
         let min_len = match family {
             AF_INET => size_of::<SOCKADDR_IN>(),
             AF_INET6 => size_of::<SOCKADDR_IN6>(),
@@ -236,21 +242,45 @@ impl RioRegistry {
             self.addr_free_slots.push(slot);
         }
     }
+
+    pub(super) fn active_slot_count(&self) -> usize {
+        self.addr_slot_in_use
+            .iter()
+            .filter(|in_use| **in_use)
+            .count()
+    }
+
+    #[cfg(test)]
+    pub(super) fn free_slot_count(&self) -> usize {
+        self.addr_free_slots.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn slot_in_use(&self, slot: usize) -> bool {
+        self.addr_slot_in_use.get(slot).copied().unwrap_or(false)
+    }
+
+    pub(super) fn deregister_buffer(&mut self, env: RioEnv<'_>, deregistered: &mut HashSet<usize>) {
+        let id = replace(&mut self.addr_buffer_id, RioBufferId::INVALID);
+        if !id.is_invalid() && deregistered.insert(id.raw() as usize) {
+            env.dispatch.deregister_buffer(id);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_helpers::{
-        REGISTER_FAILS, deregistered_ids, lock_dispatch_state, reset_dispatch_state, test_dispatch,
-        test_env,
+    use super::super::{RioRegistry, RioRegistryTestSupport};
+    use super::{
+        AF_INET, AF_INET6, RioError, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
+        SockAddrStorage,
     };
-    use super::*;
-    use veloq_std::{mem::zeroed, sync::atomic::Ordering::SeqCst};
+    use veloq_std::mem::{size_of, zeroed};
 
     #[test]
     fn rio_send_addr_validation_rejects_short_sockaddr_before_family_read() {
-        let bytes = [0_u8; 1];
-        let err = RioRegistry::validate_send_addr(bytes.as_ptr().cast(), bytes.len() as i32)
+        let address = SockAddrStorage::default();
+        let err = RioRegistry::validate_send_addr(&address, 1)
             .expect_err("short sockaddr should fail before reading sa_family");
 
         assert_eq!(*err.inner(), RioError::InvalidInput);
@@ -258,58 +288,46 @@ mod tests {
 
     #[test]
     fn rio_send_addr_validation_rejects_invalid_lengths_and_families() {
-        // SAFETY: SOCKADDR is a plain WinSock address header and all-zero bytes are valid here.
-        let mut sockaddr: SOCKADDR = unsafe { zeroed() };
-        let err = RioRegistry::validate_send_addr((&sockaddr as *const SOCKADDR).cast(), -1)
+        // SAFETY: SOCKADDR is a plain WinSock header and zero bytes are valid here. / 安全性：SOCKADDR 是普通 WinSock 头部，全零内容在此有效。
+        let mut sockaddr: SockAddrStorage = unsafe { zeroed() };
+        let err = RioRegistry::validate_send_addr(&sockaddr, -1)
             .expect_err("negative sockaddr length should fail");
         assert_eq!(*err.inner(), RioError::InvalidInput);
 
-        sockaddr.sa_family = AF_INET6;
-        let err = RioRegistry::validate_send_addr(
-            (&sockaddr as *const SOCKADDR).cast(),
-            size_of::<SOCKADDR>() as i32,
-        )
-        .expect_err("IPv6 sockaddr shorter than SOCKADDR_IN6 should fail");
+        sockaddr.0.ss_family = AF_INET6;
+        let err = RioRegistry::validate_send_addr(&sockaddr, size_of::<SOCKADDR>() as i32)
+            .expect_err("IPv6 sockaddr shorter than SOCKADDR_IN6 should fail");
         assert_eq!(*err.inner(), RioError::InvalidInput);
 
-        sockaddr.sa_family = 0x7fff;
-        let err = RioRegistry::validate_send_addr(
-            (&sockaddr as *const SOCKADDR).cast(),
-            size_of::<SOCKADDR>() as i32,
-        )
-        .expect_err("unsupported sockaddr family should fail");
+        sockaddr.0.ss_family = 0x7fff;
+        let err = RioRegistry::validate_send_addr(&sockaddr, size_of::<SOCKADDR>() as i32)
+            .expect_err("unsupported sockaddr family should fail");
         assert_eq!(*err.inner(), RioError::InvalidInput);
     }
 
     #[test]
     fn rio_send_addr_validation_accepts_ipv4_and_ipv6_lengths() {
-        // SAFETY: SOCKADDR_IN is POD; the test fills the family field explicitly.
-        let mut ipv4: SOCKADDR_IN = unsafe { zeroed() };
-        ipv4.sin_family = AF_INET;
-        let rio_len = RioRegistry::validate_send_addr(
-            (&ipv4 as *const SOCKADDR_IN).cast(),
-            size_of::<SOCKADDR_IN>() as i32,
-        )
-        .expect("valid IPv4 sockaddr should pass");
+        // SAFETY: SOCKADDR_IN is POD and the test sets its family. / 安全性：SOCKADDR_IN 是 POD，测试显式设置了地址族。
+        let mut ipv4: SockAddrStorage = unsafe { zeroed() };
+        ipv4.0.ss_family = AF_INET;
+        let rio_len = RioRegistry::validate_send_addr(&ipv4, size_of::<SOCKADDR_IN>() as i32)
+            .expect("valid IPv4 sockaddr should pass");
         assert_eq!(rio_len, size_of::<SOCKADDR_INET>() as u32);
 
-        // SAFETY: SOCKADDR_IN6 is POD; the test fills the family field explicitly.
-        let mut ipv6: SOCKADDR_IN6 = unsafe { zeroed() };
-        ipv6.sin6_family = AF_INET6;
-        let rio_len = RioRegistry::validate_send_addr(
-            (&ipv6 as *const SOCKADDR_IN6).cast(),
-            size_of::<SOCKADDR_IN6>() as i32,
-        )
-        .expect("valid IPv6 sockaddr should pass");
+        // SAFETY: SOCKADDR_IN6 is POD and the test sets its family. / 安全性：SOCKADDR_IN6 是 POD，测试显式设置了地址族。
+        let mut ipv6: SockAddrStorage = unsafe { zeroed() };
+        ipv6.0.ss_family = AF_INET6;
+        let rio_len = RioRegistry::validate_send_addr(&ipv6, size_of::<SOCKADDR_IN6>() as i32)
+            .expect("valid IPv6 sockaddr should pass");
         assert_eq!(rio_len, size_of::<SOCKADDR_INET>() as u32);
     }
 
     #[test]
     fn address_slots_use_exclusive_generation_checked_leases() {
-        let _guard = lock_dispatch_state();
-        reset_dispatch_state();
-        let dispatch = test_dispatch();
-        let env = test_env(&dispatch);
+        let _guard = RioRegistryTestSupport::lock_dispatch_state();
+        RioRegistryTestSupport::reset_dispatch_state();
+        let dispatch = RioRegistryTestSupport::test_dispatch();
+        let env = RioRegistryTestSupport::test_env(&dispatch);
         let mut registry = RioRegistry::new(32, 1);
 
         let first = registry
@@ -329,22 +347,22 @@ mod tests {
         registry
             .free_addr_reservation(Some(second))
             .expect("second address lease should release");
-        assert_eq!(registry.addr_free_slots.len(), 1);
-        assert!(deregistered_ids().is_empty());
+        assert_eq!(registry.addresses.addr_free_slots.len(), 1);
+        assert!(RioRegistryTestSupport::deregistered_ids().is_empty());
     }
 
     #[test]
     fn address_registration_failure_does_not_consume_a_slot() {
-        let _guard = lock_dispatch_state();
-        reset_dispatch_state();
-        let dispatch = test_dispatch();
-        let env = test_env(&dispatch);
+        let _guard = RioRegistryTestSupport::lock_dispatch_state();
+        RioRegistryTestSupport::reset_dispatch_state();
+        let dispatch = RioRegistryTestSupport::test_dispatch();
+        let env = RioRegistryTestSupport::test_env(&dispatch);
         let mut registry = RioRegistry::new(32, 1);
-        REGISTER_FAILS.store(true, SeqCst);
+        RioRegistryTestSupport::fail_next_register();
 
         assert!(registry.prepare_recv_addr(env).is_err());
-        assert_eq!(registry.addr_free_slots.len(), 1);
-        assert!(!registry.addr_slot_in_use[0]);
-        assert!(registry.addr_buffer_id.is_invalid());
+        assert_eq!(registry.addresses.addr_free_slots.len(), 1);
+        assert!(!registry.addresses.addr_slot_in_use[0]);
+        assert!(registry.addresses.addr_buffer_id.is_invalid());
     }
 }

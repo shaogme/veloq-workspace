@@ -20,6 +20,7 @@ use crate::{
     },
     error::{IocpError, IocpResult},
     op::{IocpSlotSpec, OverlappedEntry},
+    rio::CompletionPollArgs,
     win32::{CompletionBatch, CompletionStatus, IoCompletionPort, Overlapped},
 };
 
@@ -303,7 +304,7 @@ impl<'a> IocpDriver<'a> {
         loop {
             self.drain_deferred_socket_cleanup();
             if !self.state().ops.has_active_ops()
-                && self.state().rio.state().rio_outstanding_count == 0
+                && self.state().rio.state().rio_outstanding_count() == 0
                 && !self.state().rio.state().has_socket_inflight()
                 && self.state().handles.deferred_cleanup_len() == 0
             {
@@ -331,7 +332,7 @@ impl<'a> IocpDriver<'a> {
                 }
             }
 
-            if self.state().rio.state().rio_outstanding_count > 0 {
+            if self.state().rio.state().rio_outstanding_count() > 0 {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if let Err(error) = self
                     .state_mut()
@@ -547,13 +548,13 @@ impl<'a> IocpDriver<'a> {
                 let state = self.state_mut();
                 {
                     let (rio_state, registrar) = state.rio.state_and_registrar_mut(registrar);
-                    rio_state.process_completions(
-                        &mut state.ops,
-                        &state.extensions,
+                    rio_state.process_completions(CompletionPollArgs {
+                        ops: &mut state.ops,
+                        ext: &state.extensions,
                         registrar,
-                        state.completion.table(),
-                        &mut state.completion_diagnostics,
-                    )
+                        completion_table: state.completion.table(),
+                        diagnostics: &mut state.completion_diagnostics,
+                    })
                 }
                 .inspect(|_| {
                     self.drain_deferred_socket_cleanup();
@@ -710,9 +711,12 @@ fn iocp_status_flags(success: bool, error_code: Option<u32>) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        IocpCompletionStatusKind, RIO_EVENT_KEY, WaitBudget, WaitBudgetSource,
+        classify_completion_status, duration_to_wait_ms, wait_budget,
+    };
     use veloq_driver_core::driver::CompletionToken;
-    use veloq_std::ptr;
+    use veloq_std::{ptr, time::Duration};
 
     #[test]
     fn null_overlapped_key_zero_failure_is_not_posted_token() {

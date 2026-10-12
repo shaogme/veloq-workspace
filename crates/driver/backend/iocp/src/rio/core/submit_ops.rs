@@ -1,84 +1,202 @@
-//! Kernel-facing RIO dispatch table and submission primitives.
+//! Kernel-facing RIO submission primitives. / RIO 内核提交基础类型与调用入口。
 //!
-//! This module encapsulates:
-//! - CQ creation/notification lifecycle,
-//! - minimal wrappers for `RIOReceive`, `RIOSend`, and `RIOSendEx`,
-//! - `RioState` constructors and basic registration entry points.
-//!
-//! It forms the low-level boundary between high-level runtime orchestration and
-//! Windows RIO APIs, keeping unsafe calls and pointer setup in one place.
+//! This module defines operation inputs and delegates Windows calls to `dispatch`.
+//! 本模块定义操作输入，并将 Windows 调用委托给 `dispatch`。
 
-mod dispatch;
-pub(crate) use dispatch::*;
-
+use super::{
+    RioAddressPolicy, RioCore, RioError, RioOpKind, RioPreparedRequest, RioResult, RioSubmitPlan,
+    RioSubmitTxn, RioSubmittedRequest,
+};
 use crate::{
-    BufferRegistrationMode,
-    config::BorrowedRawHandle,
-    driver::IocpDriverCompletionDiagnostics,
-    ext::Extensions,
-    op::SubmissionResult,
-    rio::{
-        RioState, RioTarget,
-        core::{
-            RioAddressPolicy, RioOpKind, RioRegistry, RioSubmissionKind, RioSubmitPlan,
-            RioSubmittedRequest,
-        },
-        error::{RioError, RioResult},
-    },
+    IoFd, config::BorrowedRawHandle, net::addr::SockAddrStorage, op::SubmissionResult,
+    rio::RioRuntime,
 };
 use diagweave::prelude::*;
-use veloq_buf::{BufferRegistrar, FixedBuf, NoopRegistrar, heap::ChunkId};
-use veloq_driver_core::driver::BufferRegistrationStatus;
+use veloq_buf::{BufferRegistrar, FixedBuf};
+use veloq_driver_core::driver::OpToken;
 use veloq_driver_core::platform::receive_pump::{
     ReceivePumpError, ReceivePumpState, ReceiveReplacementReservation,
 };
-use veloq_std::{collections::FastHashMap, string::ToString, vec::Vec};
+use veloq_std::string::ToString;
 
-impl RioState {
-    pub(crate) fn new(
-        port: BorrowedRawHandle<'_>,
-        entries: u32,
-        ext: &Extensions,
-        registration_mode: BufferRegistrationMode,
-        diagnostics: IocpDriverCompletionDiagnostics,
-    ) -> RioResult<Self> {
-        let kernel = RioKernel::from_extensions(port, entries, ext)?;
+mod dispatch;
+pub(crate) use dispatch::{
+    RioBufferId, RioCq, RioDispatch, RioKernel, RioProvider, RioRq, RioRqConfig,
+};
 
-        // Keep per-socket RQ depth conservative so that multi-socket warmup
-        // does not exhaust RIO request-queue resources too early.
-        let rq_depth = entries.clamp(32, 64);
+#[cfg(test)]
+pub(crate) use dispatch::RioDispatchFunctions;
 
-        Ok(Self {
-            kernel,
-            registry: RioRegistry::new(rq_depth, entries as usize),
-            registration_mode,
-            submissions_closed: false,
-            actors: slotmap::SlotMap::with_key(),
-            actor_by_handle: FastHashMap::default(),
-            socket_runtime: FastHashMap::default(),
-            rio_outstanding_count: 0,
-            next_request_id: 0,
-            deferred_kernel_ops: Vec::new(),
-            deferred_payloads: Vec::new(),
-            diagnostics,
-            cq_armed: true,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RioSubmissionKind {
+    Recv,
+    Send,
+}
+
+impl RioSubmissionKind {
+    pub(crate) fn data_len(
+        self,
+        buf: &FixedBuf,
+        buf_offset: usize,
+        operation: &'static str,
+    ) -> RioResult<u32> {
+        let bound = self.bound(buf);
+        if buf_offset > bound {
+            return RioError::InvalidInput
+                .with_ctx("rio_operation", operation)
+                .with_ctx("buffer_offset", buf_offset)
+                .with_ctx("buffer_length", buf.len())
+                .with_ctx("buffer_capacity", buf.capacity())
+                .with_ctx("buffer_bound", bound)
+                .with_ctx("buffer_bound_kind", self.bound_name())
+                .attach_note(self.offset_exceeded_note());
+        }
+
+        let len = bound - buf_offset;
+        u32::try_from(len).map_err(|_| {
+            RioError::ResourceExhaustion
+                .to_report()
+                .with_ctx("rio_operation", operation)
+                .with_ctx("buffer_offset", buf_offset)
+                .with_ctx("buffer_length", buf.len())
+                .with_ctx("buffer_capacity", buf.capacity())
+                .with_ctx("submission_length", len)
+                .attach_note("RIO data buffer length exceeds u32")
         })
     }
 
-    pub(crate) fn register_buffer_backend(
+    fn bound(self, buf: &FixedBuf) -> usize {
+        match self {
+            Self::Recv => buf.capacity(),
+            Self::Send => buf.len(),
+        }
+    }
+
+    fn bound_name(self) -> &'static str {
+        match self {
+            Self::Recv => "capacity",
+            Self::Send => "length",
+        }
+    }
+
+    fn offset_exceeded_note(self) -> &'static str {
+        match self {
+            Self::Recv => "RIO recv buffer offset exceeds buffer capacity",
+            Self::Send => "RIO send buffer offset exceeds buffer length",
+        }
+    }
+}
+
+pub(crate) struct RioTarget<'a> {
+    pub(crate) fd: IoFd,
+    pub(crate) handle: BorrowedRawHandle<'a>,
+    pub(crate) token: OpToken,
+    pub(crate) buf_offset: usize,
+    pub(crate) operation: &'static str,
+}
+
+pub(crate) struct RioSendToArgs<'a> {
+    pub(crate) fd: IoFd,
+    pub(crate) handle: BorrowedRawHandle<'a>,
+    pub(crate) buf: &'a FixedBuf,
+    pub(crate) addr: &'a SockAddrStorage,
+    pub(crate) addr_len: i32,
+    pub(crate) token: OpToken,
+    pub(crate) buf_offset: usize,
+}
+
+pub(crate) struct RioReceiveSlotSubmit<'a> {
+    pub(crate) target: RioTarget<'a>,
+    pub(crate) op_kind: RioOpKind,
+    pub(crate) buf: &'a FixedBuf,
+    pub(crate) slot_id: u32,
+    pub(crate) slot_generation: u32,
+    pub(crate) registrar: &'a dyn BufferRegistrar,
+}
+
+pub(crate) struct RioReceiveReplacementArgs<'a> {
+    pub(crate) target: RioTarget<'a>,
+    pub(crate) op_kind: RioOpKind,
+    pub(crate) pump: &'a mut ReceivePumpState,
+    pub(crate) reservation: ReceiveReplacementReservation,
+    pub(crate) registrar: &'a dyn BufferRegistrar,
+}
+
+pub(crate) struct RioSubmitOperations<'a> {
+    core: &'a mut RioCore,
+    runtime: &'a mut RioRuntime,
+}
+
+impl<'a> RioSubmitOperations<'a> {
+    pub(crate) fn new(core: &'a mut RioCore, runtime: &'a mut RioRuntime) -> Self {
+        Self { core, runtime }
+    }
+
+    fn submit_rio(
         &mut self,
-        id: ChunkId,
-        ptr: *const u8,
-        len: usize,
-    ) -> RioResult<BufferRegistrationStatus> {
-        let Some(env) = self.kernel.env(&NoopRegistrar, self.registration_mode) else {
-            return Err(RioError::NotSupported
-                .to_report()
-                .attach_note("RIO buffer registration is unavailable without a dispatch table"));
-        };
-        self.registry
-            .register_buffer_backend(id, (ptr, len), env)
-            .map(|_| BufferRegistrationStatus::Registered)
+        plan: RioSubmitPlan<'_>,
+        registrar: &dyn BufferRegistrar,
+        submit: impl FnOnce(&RioKernel, &RioPreparedRequest) -> RioResult<()>,
+    ) -> RioResult<SubmissionResult> {
+        self.submit_rio_with_request(plan, registrar, submit)
+            .map(|submitted| submitted.result)
+    }
+
+    fn submit_rio_with_request(
+        &mut self,
+        plan: RioSubmitPlan<'_>,
+        registrar: &dyn BufferRegistrar,
+        submit: impl FnOnce(&RioKernel, &RioPreparedRequest) -> RioResult<()>,
+    ) -> RioResult<RioSubmittedRequest> {
+        RioSubmitTxn::execute(self.core, self.runtime, plan, registrar, submit)
+    }
+
+    pub(crate) fn try_submit_send_to(
+        &mut self,
+        args: RioSendToArgs<'_>,
+        registrar: &dyn BufferRegistrar,
+    ) -> RioResult<SubmissionResult> {
+        let RioSendToArgs {
+            fd,
+            handle,
+            buf,
+            addr,
+            addr_len,
+            token,
+            buf_offset,
+            ..
+        } = args;
+        self.submit_rio(
+            RioSubmitPlan {
+                fd,
+                handle,
+                token,
+                op_kind: RioOpKind::SendTo,
+                buffer_kind: RioSubmissionKind::Send,
+                buffer: buf,
+                buffer_offset: buf_offset,
+                operation: "send_to",
+                address: RioAddressPolicy::SendTo { addr, addr_len },
+                dispatch_error: RioError::Internal,
+                dispatch_note: "lost RIO context",
+                submit_scope: "rio.runtime.try_submit_send_to_internal",
+                submit_note: "RIOSendEx submit failed",
+                receive_slot_id: None,
+                receive_slot_generation: None,
+            },
+            registrar,
+            |kernel, request| {
+                let Some(addr) = request.addr() else {
+                    return RioError::Internal.attach_note("RIO send_to missing prepared address");
+                };
+                kernel.submit_send_ex(
+                    request.rq(),
+                    &request.data_buf().rio_buf,
+                    &addr.rio_buf,
+                    request.as_request_context(),
+                )
+            },
+        )
     }
 
     pub(crate) fn try_submit_recv(
@@ -134,8 +252,8 @@ impl RioState {
             registrar,
             |kernel, request| {
                 kernel.submit_receive(
-                    request.rq,
-                    &request.data_buf.rio_buf,
+                    request.rq(),
+                    &request.data_buf().rio_buf,
                     request.as_request_context(),
                 )
             },
@@ -176,8 +294,8 @@ impl RioState {
             registrar,
             |kernel, request| {
                 kernel.submit_send(
-                    request.rq,
-                    &request.data_buf.rio_buf,
+                    request.rq(),
+                    &request.data_buf().rio_buf,
                     request.as_request_context(),
                 )
             },
@@ -186,13 +304,16 @@ impl RioState {
 
     pub(crate) fn try_submit_recv_multi_slot(
         &mut self,
-        target: RioTarget<'_>,
-        op_kind: RioOpKind,
-        buf: &FixedBuf,
-        slot_id: u32,
-        slot_generation: u32,
-        registrar: &dyn BufferRegistrar,
+        input: RioReceiveSlotSubmit<'_>,
     ) -> RioResult<RioSubmittedRequest> {
+        let RioReceiveSlotSubmit {
+            target,
+            op_kind,
+            buf,
+            slot_id,
+            slot_generation,
+            registrar,
+        } = input;
         let RioTarget {
             fd,
             handle,
@@ -200,15 +321,7 @@ impl RioState {
             buf_offset,
             operation,
         } = target;
-        let address = match op_kind {
-            RioOpKind::TcpRecvMulti => RioAddressPolicy::None,
-            RioOpKind::UdpRecvMulti => RioAddressPolicy::RecvMulti,
-            _ => {
-                return Err(RioError::InvalidInput
-                    .to_report()
-                    .attach_note("invalid RIO receive multishot operation kind"));
-            }
-        };
+        let address = Self::receive_address_policy(op_kind)?;
         self.submit_rio_with_request(
             RioSubmitPlan {
                 fd,
@@ -228,50 +341,34 @@ impl RioState {
                 receive_slot_generation: Some(slot_generation),
             },
             registrar,
-            |kernel, request| match op_kind {
-                RioOpKind::TcpRecvMulti => kernel.submit_receive(
-                    request.rq,
-                    &request.data_buf.rio_buf,
-                    request.as_request_context(),
-                ),
-                RioOpKind::UdpRecvMulti => {
-                    let Some(addr) = request.addr.as_ref() else {
-                        return RioError::Internal
-                            .attach_note("RIO UDP recv_multi missing prepared address");
-                    };
-                    kernel.submit_receive_multi(
-                        request.rq,
-                        &request.data_buf.rio_buf,
-                        &addr.rio_buf,
-                        request.as_request_context(),
-                    )
-                }
-                _ => Err(RioError::InvalidInput
-                    .to_report()
-                    .attach_note("invalid RIO receive multishot operation kind")),
-            },
+            |kernel, request| Self::submit_receive_multi(kernel, op_kind, request),
         )
     }
 
     pub(crate) fn try_submit_recv_multi_replacement(
         &mut self,
-        target: RioTarget<'_>,
-        op_kind: RioOpKind,
-        pump: &mut ReceivePumpState,
-        reservation: ReceiveReplacementReservation,
-        registrar: &dyn BufferRegistrar,
+        args: RioReceiveReplacementArgs<'_>,
     ) -> RioResult<RioSubmittedRequest> {
-        let Some(slot) = pump.slot(reservation.slot_id()) else {
-            return Err(receive_pump_error(ReceivePumpError::ReceiveContextCorrupt));
-        };
-        self.try_submit_recv_multi_slot(
+        let RioReceiveReplacementArgs {
             target,
             op_kind,
-            slot.data_buf(),
-            reservation.slot_id(),
-            reservation.slot_generation(),
+            pump,
+            reservation,
             registrar,
-        )
+        } = args;
+        let Some(slot) = pump.slot(reservation.slot_id()) else {
+            return Err(Self::receive_pump_error(
+                ReceivePumpError::ReceiveContextCorrupt,
+            ));
+        };
+        self.try_submit_recv_multi_slot(RioReceiveSlotSubmit {
+            target,
+            op_kind,
+            buf: slot.data_buf(),
+            slot_id: reservation.slot_id(),
+            slot_generation: reservation.slot_generation(),
+            registrar,
+        })
     }
 
     pub(crate) fn try_submit_recv_multi_initial(
@@ -281,7 +378,7 @@ impl RioState {
         pump: &mut ReceivePumpState,
         registrar: &dyn BufferRegistrar,
     ) -> RioResult<()> {
-        pump.start().map_err(receive_pump_error)?;
+        pump.start().map_err(Self::receive_pump_error)?;
         let RioTarget {
             fd,
             handle,
@@ -291,10 +388,12 @@ impl RioState {
         } = target;
         while let Some(submission) = pump.next_submission() {
             let Some(slot) = pump.slot(submission.slot_id) else {
-                return Err(receive_pump_error(ReceivePumpError::ReceiveContextCorrupt));
+                return Err(Self::receive_pump_error(
+                    ReceivePumpError::ReceiveContextCorrupt,
+                ));
             };
-            let result = self.try_submit_recv_multi_slot(
-                RioTarget {
+            let result = self.try_submit_recv_multi_slot(RioReceiveSlotSubmit {
+                target: RioTarget {
                     fd,
                     handle,
                     token,
@@ -302,15 +401,15 @@ impl RioState {
                     operation,
                 },
                 op_kind,
-                slot.data_buf(),
-                submission.slot_id,
-                submission.slot_generation,
+                buf: slot.data_buf(),
+                slot_id: submission.slot_id,
+                slot_generation: submission.slot_generation,
                 registrar,
-            );
+            });
             match result {
                 Ok(submitted) => {
                     pump.submit_initial(submission, submitted.request_id)
-                        .map_err(receive_pump_error)?;
+                        .map_err(Self::receive_pump_error)?;
                 }
                 Err(error) => {
                     let _ = pump.fail_initial_submit(submission);
@@ -318,13 +417,12 @@ impl RioState {
                         return Err(error);
                     }
 
-                    // The logical operation owns every request submitted before this failure.
-                    // Keep the driver slot in flight and let the normal RIO completion/reaper
-                    // path cancel and drain those requests before releasing the persistent pump.
+                    // Earlier requests retain their slots until completion-driven drain. / 先前已提交的请求仍持有槽位，直到完成队列驱动 drain。
                     let socket_key = handle.raw().actor_key();
-                    self.activate_receive_pump(socket_key, token);
-                    if let Err(cancel_error) =
-                        self.request_socket_receive_shutdown_for_cleanup(socket_key)
+                    self.runtime.activate_receive_pump(socket_key, token);
+                    if let Err(cancel_error) = self
+                        .runtime
+                        .request_socket_receive_shutdown_for_cleanup(socket_key)
                     {
                         tracing::error!(
                             report = ?cancel_error,
@@ -341,14 +439,54 @@ impl RioState {
                 .to_report()
                 .attach_note("RIO receive pump initial arm did not reach target depth"));
         }
-        self.activate_receive_pump(handle.raw().actor_key(), token);
+        self.runtime
+            .activate_receive_pump(handle.raw().actor_key(), token);
         Ok(())
     }
-}
 
-fn receive_pump_error(error: ReceivePumpError) -> diagweave::Report<RioError> {
-    RioError::InvalidInput
-        .to_report()
-        .with_ctx("receive_pump_error", error.to_string())
-        .attach_note("RIO receive pump state transition failed")
+    fn receive_address_policy(op_kind: RioOpKind) -> RioResult<RioAddressPolicy<'static>> {
+        match op_kind {
+            RioOpKind::TcpRecvMulti => Ok(RioAddressPolicy::None),
+            RioOpKind::UdpRecvMulti => Ok(RioAddressPolicy::RecvMulti),
+            _ => Err(RioError::InvalidInput
+                .to_report()
+                .attach_note("invalid RIO receive multishot operation kind")),
+        }
+    }
+
+    fn submit_receive_multi(
+        kernel: &RioKernel,
+        op_kind: RioOpKind,
+        request: &RioPreparedRequest,
+    ) -> RioResult<()> {
+        match op_kind {
+            RioOpKind::TcpRecvMulti => kernel.submit_receive(
+                request.rq(),
+                &request.data_buf().rio_buf,
+                request.as_request_context(),
+            ),
+            RioOpKind::UdpRecvMulti => {
+                let Some(addr) = request.addr() else {
+                    return RioError::Internal
+                        .attach_note("RIO UDP recv_multi missing prepared address");
+                };
+                kernel.submit_receive_multi(
+                    request.rq(),
+                    &request.data_buf().rio_buf,
+                    &addr.rio_buf,
+                    request.as_request_context(),
+                )
+            }
+            _ => Err(RioError::InvalidInput
+                .to_report()
+                .attach_note("invalid RIO receive multishot operation kind")),
+        }
+    }
+
+    fn receive_pump_error(error: ReceivePumpError) -> Report<RioError> {
+        RioError::InvalidInput
+            .to_report()
+            .with_ctx("receive_pump_error", error.to_string())
+            .attach_note("RIO receive pump state transition failed")
+    }
 }

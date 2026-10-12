@@ -16,8 +16,7 @@ use veloq_driver_core::{
     platform::receive_pump::{ReceivePumpConfig, ReceivePumpState, ReceiveSlot},
 };
 use veloq_std::{
-    ffi::c_void, format, mem::ManuallyDrop, num::NonZeroUsize, string::ToString, time::Duration,
-    vec::Vec,
+    format, mem::ManuallyDrop, num::NonZeroUsize, string::ToString, time::Duration, vec::Vec,
 };
 use windows_sys::Win32::Networking::WinSock::SOCKET;
 
@@ -361,7 +360,7 @@ pub(crate) fn submit_send_to(
         fd: user.fd,
         handle,
         buf: &user.buf,
-        addr_ptr: &payload.addr as *const _ as *const c_void,
+        addr: &payload.addr,
         addr_len: payload.addr_len,
         token: ctx.op_token,
         buf_offset: user.buf_offset,
