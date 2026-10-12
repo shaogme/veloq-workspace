@@ -1,5 +1,5 @@
 use crate::{
-    driver::env::{CqeEnv, SqeEnv},
+    driver::{CqeEnv, SqeEnv},
     error::UringResult,
 };
 use veloq_buf::heap::ChunkId;

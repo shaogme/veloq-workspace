@@ -1,832 +1,41 @@
-use crate::driver::registration::file_table::OwnedFdOwnershipTicket;
 use crate::{
     driver::{
         control::{
-            CancelIntentError, CancelRequestDisposition, PendingCancel, UringCancelManager,
-            UringTimerWheel, UringWakerManager,
+            BacklogEntry, BacklogError, CancelIntentError, CancelRequestDisposition,
+            DeferredCancelReconcile, PendingCancel, StagedLedger, StagedLedgerError,
+            SubmissionBacklog, UringCancelManager, UringPostCompletionEffects, UringTimerWheel,
+            UringWakerManager,
         },
         control::{ControlPlaneEvent, ControlPlaneObserver},
         env::{
-            CompletionControlParts, CompletionLedgerParts, CompletionMetadata,
-            SubmissionControlParts, SubmissionLedgerParts, SubmissionSidecarParts,
+            CompletionControlParts, CompletionControlView, CompletionLedgerParts,
+            CompletionMetadata, SubmissionControlParts, SubmitControlView,
+            SubmissionLedgerParts, SubmissionSidecarParts,
         },
-        lifecycle::CancellationPhase,
     },
     op::CompletionCleanupHintFn,
 };
 use veloq_driver_core::{
     driver::{
-        CancelRequest, CancelTicket, CompletionControlKind, CompletionToken, CompletionTokenClass,
-        OpToken, RawCompletion,
+        CancelRequest, CancelTicket, CompletionToken, OpToken, RawCompletion, RemoteCancelSender,
     },
-    slot::Generation,
 };
+use veloq_io_uring::SubmissionQueue;
 use veloq_std::{
     collections::{HashMap, HashSet},
     time::Instant,
-    vec,
     vec::Vec,
 };
 use veloq_wheel::TimerId;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BacklogEntry {
-    token: OpToken,
-}
-
-impl BacklogEntry {
-    pub(crate) const fn token(self) -> OpToken {
-        self.token
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BacklogError {
-    Capacity,
-    Duplicate,
-    GenerationMismatch,
-    Missing,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct BacklogLink {
-    entry: Option<BacklogEntry>,
-    prev: Option<usize>,
-    next: Option<usize>,
-}
-
-/// Fixed-capacity, generation-aware FIFO backlog.
-///
-/// The slot index is the node address.  A node can only contain one generation, so removing a
-/// stale token can never remove a newer operation that reused the same registry slot.  Unlinking
-/// updates both neighbours directly; there are no stale queue nodes and no membership map to
-/// maintain in the hot path.
-pub(crate) struct SubmissionBacklog {
-    links: Vec<BacklogLink>,
-    head: Option<usize>,
-    tail: Option<usize>,
-    len: usize,
-    peak_len: usize,
-}
-
-impl SubmissionBacklog {
-    pub(crate) fn new(capacity: usize) -> Self {
-        Self {
-            links: vec![BacklogLink::default(); capacity],
-            head: None,
-            tail: None,
-            len: 0,
-            peak_len: 0,
-        }
-    }
-
-    pub(crate) fn push(&mut self, token: OpToken) -> Result<(), BacklogError> {
-        let index = token.index();
-        let Some(link) = self.links.get(index) else {
-            return Err(BacklogError::Capacity);
-        };
-        if let Some(existing) = link.entry {
-            return if existing.token == token {
-                Err(BacklogError::Duplicate)
-            } else {
-                Err(BacklogError::GenerationMismatch)
-            };
-        }
-        if self.len == self.links.len() {
-            return Err(BacklogError::Capacity);
-        }
-
-        let previous_tail = self.tail;
-        self.links[index] = BacklogLink {
-            entry: Some(BacklogEntry { token }),
-            prev: previous_tail,
-            next: None,
-        };
-        if let Some(previous_tail) = previous_tail {
-            self.links[previous_tail].next = Some(index);
-        } else {
-            self.head = Some(index);
-        }
-        self.tail = Some(index);
-        self.len += 1;
-        self.peak_len = self.peak_len.max(self.len);
-        Ok(())
-    }
-
-    pub(crate) fn front(&self) -> Option<BacklogEntry> {
-        self.head.and_then(|index| self.links[index].entry)
-    }
-
-    pub(crate) fn pop_front(&mut self) -> Option<BacklogEntry> {
-        self.head.map(|index| self.unlink(index))
-    }
-
-    pub(crate) fn remove(&mut self, token: OpToken) -> Result<BacklogEntry, BacklogError> {
-        let Some(link) = self.links.get(token.index()) else {
-            return Err(BacklogError::Capacity);
-        };
-        let Some(entry) = link.entry else {
-            return Err(BacklogError::Missing);
-        };
-        if entry.token != token {
-            return Err(BacklogError::GenerationMismatch);
-        }
-        Ok(self.unlink(token.index()))
-    }
-
-    pub(crate) fn contains(&self, token: OpToken) -> bool {
-        self.links
-            .get(token.index())
-            .and_then(|link| link.entry)
-            .is_some_and(|entry| entry.token == token)
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.len
-    }
-
-    #[cfg(test)]
-    pub(crate) fn peak_len(&self) -> usize {
-        self.peak_len
-    }
-
-    fn unlink(&mut self, index: usize) -> BacklogEntry {
-        let link = self.links[index];
-        let entry = link
-            .entry
-            .expect("linked backlog node must contain an entry");
-        if let Some(previous) = link.prev {
-            self.links[previous].next = link.next;
-        } else {
-            self.head = link.next;
-        }
-        if let Some(next) = link.next {
-            self.links[next].prev = link.prev;
-        } else {
-            self.tail = link.prev;
-        }
-        self.links[index] = BacklogLink::default();
-        self.len -= 1;
-        entry
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn entries(&self) -> Vec<BacklogEntry> {
-        let mut entries = Vec::with_capacity(self.len);
-        let mut current = self.head;
-        while let Some(index) = current {
-            let link = self.links[index];
-            if let Some(entry) = link.entry {
-                entries.push(entry);
-            }
-            current = link.next;
-        }
-        entries
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StagedEntry {
-    User(OpToken),
-    Cancel {
-        ticket: CancelTicket,
-        target: OpToken,
-    },
-    Waker,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StagedLedgerError {
-    Capacity,
-    DuplicateUser(OpToken),
-    DuplicateCancel(CancelTicket),
-    InvalidReceipt,
-    InvalidTransition,
-    GenerationMismatch {
-        existing: OpToken,
-        candidate: OpToken,
-    },
-}
-
-/// Fixed-capacity FIFO ledger for SQEs written to the user-space SQ.
-///
-/// The ledger uses an intrusive free-list and an intrusive FIFO.  A completion may remove any
-/// token without shifting or allocating metadata, while staging rollback can still remove the
-/// most recently allocated node in O(1).  The token-indexed user table is only a uniqueness
-/// index; phase transitions are stored with the complete entry and never inferred from a queue
-/// prefix.
-pub(crate) struct StagedLedger {
-    links: Vec<StagedLink>,
-    free_head: Option<usize>,
-    head: Option<usize>,
-    tail: Option<usize>,
-    len: usize,
-    user_entries: Vec<Option<OpToken>>,
-    capacity: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StagedPhase {
-    Staged,
-    Published,
-    KernelOutstanding,
-    Quarantined,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct StagedRecord {
-    entry: StagedEntry,
-    phase: StagedPhase,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct StagedLink {
-    record: Option<StagedRecord>,
-    prev: Option<usize>,
-    next: Option<usize>,
-    free_next: Option<usize>,
-}
-
-impl StagedLedger {
-    pub(crate) fn new(capacity: usize) -> Self {
-        let mut links = vec![StagedLink::default(); capacity];
-        for (index, link) in links.iter_mut().enumerate() {
-            link.free_next = index.checked_add(1).filter(|next| *next < capacity);
-        }
-        Self {
-            free_head: (capacity != 0).then_some(0),
-            links,
-            head: None,
-            tail: None,
-            len: 0,
-            user_entries: vec![None; capacity],
-            capacity,
-        }
-    }
-
-    pub(crate) fn validate(&self, entry: StagedEntry) -> Result<(), StagedLedgerError> {
-        if self.len >= self.capacity {
-            return Err(StagedLedgerError::Capacity);
-        }
-        if let StagedEntry::User(candidate) = entry {
-            let Some(active) = self.user_entries.get(candidate.index()).copied() else {
-                return Err(StagedLedgerError::Capacity);
-            };
-            if let Some(active) = active {
-                if active == candidate {
-                    return Err(StagedLedgerError::DuplicateUser(candidate));
-                }
-                return Err(StagedLedgerError::GenerationMismatch {
-                    existing: active,
-                    candidate,
-                });
-            }
-        }
-
-        if let StagedEntry::Cancel {
-            ticket: candidate,
-            target: candidate_target,
-        } = entry
-        {
-            let mut current = self.head;
-            while let Some(index) = current {
-                let link = self.links[index];
-                if let Some(StagedRecord {
-                    entry:
-                        StagedEntry::Cancel {
-                            ticket: active,
-                            target: active_target,
-                        },
-                    ..
-                }) = link.record
-                    && active == candidate
-                {
-                    if active_target == candidate_target {
-                        return Err(StagedLedgerError::DuplicateCancel(candidate));
-                    }
-                    return Err(StagedLedgerError::GenerationMismatch {
-                        existing: active_target,
-                        candidate: candidate_target,
-                    });
-                }
-                current = link.next;
-            }
-        }
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn push(&mut self, entry: StagedEntry) -> Result<(), StagedLedgerError> {
-        self.validate(entry)?;
-        self.push_validated(entry);
-        Ok(())
-    }
-
-    pub(crate) fn push_validated(&mut self, entry: StagedEntry) {
-        debug_assert!(self.len < self.capacity);
-        let index = self
-            .free_head
-            .expect("validated staged entry must have a free ledger node");
-        let previous_tail = self.tail;
-        self.free_head = self.links[index].free_next;
-        self.links[index] = StagedLink {
-            record: Some(StagedRecord {
-                entry,
-                phase: StagedPhase::Staged,
-            }),
-            prev: previous_tail,
-            next: None,
-            free_next: None,
-        };
-        if let StagedEntry::User(token) = entry {
-            self.user_entries[token.index()] = Some(token);
-        }
-        if let Some(previous_tail) = previous_tail {
-            self.links[previous_tail].next = Some(index);
-        } else {
-            self.head = Some(index);
-        }
-        self.tail = Some(index);
-        self.len += 1;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pop_front(&mut self) -> Option<StagedEntry> {
-        self.head.map(|index| self.unlink(index))
-    }
-
-    pub(crate) fn pop_back(&mut self) -> Option<StagedEntry> {
-        self.tail.map(|index| self.unlink(index))
-    }
-
-    fn clear_index(&mut self, entry: StagedEntry) {
-        if let StagedEntry::User(token) = entry
-            && self.user_entries.get(token.index()).copied().flatten() == Some(token)
-        {
-            self.user_entries[token.index()] = None;
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.len
-    }
-
-    pub(crate) fn unpublished_len(&self) -> usize {
-        let mut count = 0;
-        let mut current = self.head;
-        while let Some(index) = current {
-            let link = self.links[index];
-            if link
-                .record
-                .is_some_and(|record| record.phase == StagedPhase::Staged)
-            {
-                count += 1;
-            }
-            current = link.next;
-        }
-        count
-    }
-
-    pub(crate) fn mark_published(&mut self) -> usize {
-        let mut count = 0;
-        let mut current = self.head;
-        while let Some(index) = current {
-            let next = self.links[index].next;
-            if let Some(record) = self.links[index].record.as_mut()
-                && record.phase == StagedPhase::Staged
-            {
-                record.phase = StagedPhase::Published;
-                count += 1;
-            }
-            current = next;
-        }
-        count
-    }
-
-    pub(crate) fn mark_consumed(
-        &mut self,
-        requested: usize,
-        consumed: usize,
-        published_in_queue: usize,
-    ) -> Result<usize, StagedLedgerError> {
-        if consumed > requested || published_in_queue > requested {
-            return Err(StagedLedgerError::InvalidReceipt);
-        }
-
-        let consumed_unpublished = consumed.saturating_sub(published_in_queue);
-        let unpublished = self.unpublished_len();
-        if consumed_unpublished > unpublished {
-            return Err(StagedLedgerError::InvalidReceipt);
-        }
-
-        let mut marked = 0;
-        let mut current = self.head;
-        while let Some(index) = current {
-            let next = self.links[index].next;
-            if let Some(record) = self.links[index].record.as_mut()
-                && record.phase == StagedPhase::Staged
-                && marked < consumed_unpublished
-            {
-                record.phase = StagedPhase::KernelOutstanding;
-                marked += 1;
-            }
-            current = next;
-        }
-        Ok(marked)
-    }
-
-    pub(crate) fn quarantine_unpublished(&mut self) -> usize {
-        let mut count = 0;
-        let mut current = self.head;
-        while let Some(index) = current {
-            let next = self.links[index].next;
-            if let Some(record) = self.links[index].record.as_mut()
-                && record.phase == StagedPhase::Staged
-            {
-                record.phase = StagedPhase::Quarantined;
-                count += 1;
-            }
-            current = next;
-        }
-        count
-    }
-
-    pub(crate) fn settle_completion(
-        &mut self,
-        token: CompletionToken,
-        final_completion: bool,
-    ) -> Result<bool, StagedLedgerError> {
-        let mut current = self.head;
-        let index = loop {
-            let Some(index) = current else {
-                return Ok(false);
-            };
-            let link = self.links[index];
-            if link.record.is_some_and(|record| record.matches(token)) {
-                break index;
-            }
-            current = link.next;
-        };
-
-        let record = self.links[index]
-            .record
-            .expect("matched staged ledger node must contain a record");
-        if record.phase == StagedPhase::Staged {
-            return Err(StagedLedgerError::InvalidTransition);
-        }
-        if final_completion {
-            self.unlink(index);
-        }
-        Ok(true)
-    }
-
-    pub(crate) fn for_each_kernel_user(&self, mut visit: impl FnMut(OpToken)) {
-        let mut current = self.head;
-        while let Some(index) = current {
-            let link = self.links[index];
-            if let Some(record) = link.record
-                && record.phase == StagedPhase::KernelOutstanding
-                && let StagedEntry::User(token) = record.entry
-            {
-                visit(token);
-            }
-            current = link.next;
-        }
-    }
-
-    pub(crate) fn for_each_kernel_cancel(&self, mut visit: impl FnMut(CancelTicket, OpToken)) {
-        let mut current = self.head;
-        while let Some(index) = current {
-            let link = self.links[index];
-            if let Some(record) = link.record
-                && record.phase == StagedPhase::KernelOutstanding
-                && let StagedEntry::Cancel { ticket, target } = record.entry
-            {
-                visit(ticket, target);
-            }
-            current = link.next;
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    fn unlink(&mut self, index: usize) -> StagedEntry {
-        let link = self.links[index];
-        let record = link
-            .record
-            .expect("linked staged ledger node must contain a record");
-        if let Some(previous) = link.prev {
-            self.links[previous].next = link.next;
-        } else {
-            self.head = link.next;
-        }
-        if let Some(next) = link.next {
-            self.links[next].prev = link.prev;
-        } else {
-            self.tail = link.prev;
-        }
-        self.clear_index(record.entry);
-        self.links[index] = StagedLink {
-            free_next: self.free_head,
-            ..StagedLink::default()
-        };
-        self.free_head = Some(index);
-        self.len -= 1;
-        record.entry
-    }
-}
-
-impl StagedRecord {
-    fn matches(self, token: CompletionToken) -> bool {
-        match (self.entry, token.classify()) {
-            (StagedEntry::User(expected), CompletionTokenClass::User(actual)) => expected == actual,
-            (
-                StagedEntry::Cancel { ticket, .. },
-                CompletionTokenClass::Control {
-                    kind: CompletionControlKind::Cancel,
-                    payload,
-                },
-            ) => CancelTicket::try_new(payload).ok() == Some(ticket),
-            (
-                StagedEntry::Waker,
-                CompletionTokenClass::Control {
-                    kind: CompletionControlKind::Waker,
-                    payload: 0,
-                },
-            ) => true,
-            _ => false,
-        }
-    }
-}
-
-/// A typed post-completion action owned by the uring control plane.
-///
-/// The identity is deliberately carried with the action instead of being reconstructed by the
-/// executor. This makes a stale completion unable to apply an effect to a recycled slot and gives
-/// tests a deterministic sequence to assert against.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct UringControlEffect {
-    sequence: u64,
-    token: Option<OpToken>,
-    generation: Option<Generation>,
-    kind: UringControlEffectKind,
-}
-
-impl UringControlEffect {
-    pub(crate) const fn kind(self) -> UringControlEffectKind {
-        self.kind
-    }
-
-    pub(crate) const fn token(self) -> Option<OpToken> {
-        self.token
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UringControlEffectKind {
-    CancelAck {
-        cancel_ticket: CancelTicket,
-        phase: CancellationPhase,
-    },
-    CancelReconcile {
-        cancel_ticket: CancelTicket,
-        request: PendingCancel,
-        raw: RawCompletion,
-    },
-    CloseUnregister {
-        ticket: OwnedFdOwnershipTicket,
-    },
-    WakerRebuild {
-        generation: u64,
-    },
-    WakerRearm {
-        generation: u64,
-    },
-    UdpRearm {
-        logical_receiver_generation: u32,
-    },
-    BacklogKick,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct DeferredCancelReconcile {
-    cancel_ticket: CancelTicket,
-    request: PendingCancel,
-    raw: RawCompletion,
-    since: Instant,
-}
-
-impl DeferredCancelReconcile {
-    pub(crate) const fn cancel_ticket(self) -> CancelTicket {
-        self.cancel_ticket
-    }
-
-    pub(crate) const fn request(self) -> PendingCancel {
-        self.request
-    }
-
-    pub(crate) const fn raw(self) -> RawCompletion {
-        self.raw
-    }
-
-    pub(crate) const fn since(self) -> Instant {
-        self.since
-    }
-}
-
-/// Deferred effects produced while routing one completion or one CQ batch.
-///
-/// Completion routing only appends to this queue. The driver drains it after the core has
-/// finished routing the current completion or the complete CQ batch, which keeps control-plane
-/// side effects out of the slot borrow and lets cancel ENOENT be reconciled against all user CQEs
-/// in the batch.
-pub(crate) struct UringPostCompletionEffects {
-    effects: Vec<UringControlEffect>,
-    capacity: usize,
-    next_sequence: u64,
-    waker_rebuild_generation: Option<u64>,
-    waker_rebuild_index: Option<usize>,
-    waker_rearm_generation: Option<u64>,
-    waker_rearm_index: Option<usize>,
-    backlog_kick: bool,
-    overflowed: bool,
-}
-
-impl UringPostCompletionEffects {
-    pub(crate) fn with_capacity(capacity: usize) -> Self {
-        Self {
-            effects: Vec::with_capacity(capacity),
-            capacity,
-            next_sequence: 0,
-            waker_rebuild_generation: None,
-            waker_rebuild_index: None,
-            waker_rearm_generation: None,
-            waker_rearm_index: None,
-            backlog_kick: false,
-            overflowed: false,
-        }
-    }
-
-    #[inline]
-    pub(crate) fn push(&mut self, effect: UringControlEffect) {
-        let replace_index = match effect.kind {
-            UringControlEffectKind::WakerRearm { generation } => {
-                if self.waker_rearm_generation == Some(generation) {
-                    return;
-                }
-                self.waker_rearm_index
-            }
-            UringControlEffectKind::WakerRebuild { generation } => {
-                if self.waker_rebuild_generation == Some(generation) {
-                    return;
-                }
-                self.waker_rebuild_index
-            }
-            UringControlEffectKind::BacklogKick => {
-                if self.backlog_kick {
-                    return;
-                }
-                None
-            }
-            UringControlEffectKind::CancelAck { .. }
-            | UringControlEffectKind::CancelReconcile { .. }
-            | UringControlEffectKind::CloseUnregister { .. }
-            | UringControlEffectKind::UdpRearm { .. } => None,
-        };
-        if let Some(index) = replace_index {
-            self.effects[index] = effect;
-            match effect.kind {
-                UringControlEffectKind::WakerRearm { generation } => {
-                    self.waker_rearm_generation = Some(generation);
-                }
-                UringControlEffectKind::WakerRebuild { generation } => {
-                    self.waker_rebuild_generation = Some(generation);
-                }
-                UringControlEffectKind::BacklogKick
-                | UringControlEffectKind::CancelAck { .. }
-                | UringControlEffectKind::CancelReconcile { .. }
-                | UringControlEffectKind::CloseUnregister { .. }
-                | UringControlEffectKind::UdpRearm { .. } => {}
-            }
-            return;
-        }
-        if self.effects.len() >= self.capacity {
-            self.overflowed = true;
-            return;
-        }
-        let index = self.effects.len();
-        match effect.kind {
-            UringControlEffectKind::WakerRearm { generation } => {
-                self.waker_rearm_generation = Some(generation);
-                self.waker_rearm_index = Some(index);
-            }
-            UringControlEffectKind::WakerRebuild { generation } => {
-                self.waker_rebuild_generation = Some(generation);
-                self.waker_rebuild_index = Some(index);
-            }
-            UringControlEffectKind::BacklogKick => self.backlog_kick = true,
-            UringControlEffectKind::CancelAck { .. }
-            | UringControlEffectKind::CancelReconcile { .. }
-            | UringControlEffectKind::CloseUnregister { .. }
-            | UringControlEffectKind::UdpRearm { .. } => {}
-        }
-        self.effects.push(effect);
-    }
-
-    #[inline]
-    pub(crate) fn append(
-        &mut self,
-        token: Option<OpToken>,
-        generation: Option<Generation>,
-        kind: UringControlEffectKind,
-    ) {
-        let sequence = self.next_sequence;
-        self.next_sequence = self.next_sequence.wrapping_add(1);
-        self.push(UringControlEffect {
-            sequence,
-            token,
-            generation,
-            kind,
-        });
-    }
-
-    #[cfg(test)]
-    #[inline]
-    pub(crate) fn extend(&mut self, other: Self) {
-        for mut effect in other.effects {
-            effect.sequence = self.next_sequence;
-            self.next_sequence = self.next_sequence.wrapping_add(1);
-            self.push(effect);
-        }
-        self.overflowed |= other.overflowed;
-    }
-
-    #[inline]
-    pub(crate) fn drain_into(&mut self, destination: &mut Self) {
-        for mut effect in self.effects.drain(..) {
-            effect.sequence = destination.next_sequence;
-            destination.next_sequence = destination.next_sequence.wrapping_add(1);
-            destination.push(effect);
-        }
-        destination.overflowed |= self.overflowed;
-        self.waker_rebuild_generation = None;
-        self.waker_rebuild_index = None;
-        self.waker_rearm_generation = None;
-        self.waker_rearm_index = None;
-        self.backlog_kick = false;
-        self.overflowed = false;
-        self.next_sequence = 0;
-    }
-
-    #[inline]
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &UringControlEffect> {
-        self.effects.iter()
-    }
-
-    #[inline]
-    pub(crate) fn len(&self) -> usize {
-        self.effects.len()
-    }
-
-    #[inline]
-    pub(crate) fn is_overflowed(&self) -> bool {
-        self.overflowed
-    }
-
-    #[inline]
-    pub(crate) fn clear(&mut self) {
-        self.effects.clear();
-        self.waker_rebuild_generation = None;
-        self.waker_rebuild_index = None;
-        self.waker_rearm_generation = None;
-        self.waker_rearm_index = None;
-        self.backlog_kick = false;
-        self.overflowed = false;
-        self.next_sequence = 0;
-    }
-
-    #[inline]
-    pub(crate) fn has_backlog_kick(&self) -> bool {
-        self.backlog_kick
-    }
-
-    #[cfg(test)]
-    pub(crate) fn effects(&self) -> &[UringControlEffect] {
-        &self.effects
-    }
-}
-
-impl Default for UringPostCompletionEffects {
-    fn default() -> Self {
-        Self::with_capacity(64)
-    }
-}
+#[cfg(test)]
+use crate::driver::control::StagedEntry;
+
+#[cfg(test)]
+use crate::driver::control::{UringControlEffect, UringControlEffectKind};
 
 /// The single owner of uring's backend control-plane state.
+/// 该类型集中拥有 uring 后端控制面状态。
 pub(crate) struct UringControlPlane {
     backlog: SubmissionBacklog,
     staged_entries: StagedLedger,
@@ -846,6 +55,21 @@ pub(crate) struct UringControlPlane {
 }
 
 impl UringControlPlane {
+    /// Projects only submission-owned control state.
+    /// 仅投影提交路径拥有的控制状态。
+    pub(crate) fn with_submit_view<'d>(
+        &'d mut self,
+        submission_queue: SubmissionQueue<'d>,
+    ) -> SubmitControlView<'d> {
+        self.submission_parts().into_view(submission_queue)
+    }
+
+    /// Projects only completion-owned control state.
+    /// 仅投影完成路径拥有的控制状态。
+    pub(crate) fn with_completion_view(&mut self) -> CompletionControlView<'_> {
+        self.completion_parts().into_view()
+    }
+
     #[cfg(test)]
     pub(crate) fn new(waker: UringWakerManager) -> Self {
         Self::with_capacity(waker, 1024)
@@ -901,6 +125,7 @@ impl UringControlPlane {
     // Backlog commands are deliberately generation-aware and record their observer event at the
     // mutation site. Callers cannot remove an entry without keeping the control-plane observer in
     // sync.
+    // backlog 命令按 generation 校验，并在修改处记录观察事件；调用方不能在不更新观察器的情况下移除条目。
     pub(crate) fn backlog_contains(&self, token: OpToken) -> bool {
         self.backlog.contains(token)
     }
@@ -945,7 +170,7 @@ impl UringControlPlane {
         self.cancellations.try_recv_remote()
     }
 
-    pub(crate) fn remote_cancel_sender(&self) -> veloq_driver_core::driver::RemoteCancelSender {
+    pub(crate) fn remote_cancel_sender(&self) -> RemoteCancelSender {
         self.cancellations.remote_sender()
     }
 
@@ -1102,7 +327,7 @@ impl UringControlPlane {
 
     #[cfg(feature = "test-hooks")]
     #[inline]
-    pub(crate) fn take_events(&mut self) -> veloq_std::vec::Vec<ControlPlaneEvent> {
+    pub(crate) fn take_events(&mut self) -> Vec<ControlPlaneEvent> {
         self.observer.take_events()
     }
 
@@ -1132,7 +357,7 @@ impl UringControlPlane {
         if self
             .deferred_cancel_reconciles
             .iter()
-            .any(|entry| entry.cancel_ticket == cancel_ticket)
+            .any(|entry| entry.cancel_ticket() == cancel_ticket)
         {
             return Ok(());
         }
@@ -1140,12 +365,12 @@ impl UringControlPlane {
             return Err(());
         }
         self.deferred_cancel_reconciles
-            .push(DeferredCancelReconcile {
+            .push(DeferredCancelReconcile::new(
                 cancel_ticket,
                 request,
                 raw,
-                since: Instant::now(),
-            });
+                Instant::now(),
+            ));
         Ok(())
     }
 
@@ -1174,6 +399,7 @@ impl UringControlPlane {
     /// The caller invokes this only after the SQE has entered the user-space submission queue.
     /// A full queue therefore never creates an in-flight sidecar entry, while an allocator bug
     /// cannot overwrite an existing request.
+    /// 仅在 SQE 已进入用户态提交队列后记录；队列满时不留下 sidecar，分配异常也不会覆盖已有请求。
     #[cfg(test)]
     pub(crate) fn stage_cancel(
         &mut self,
@@ -1292,13 +518,13 @@ impl UringControlPlane {
 
     #[cfg(any(test, feature = "test-hooks"))]
     #[inline]
-    pub(crate) fn timer_for(&self, token: OpToken) -> Option<veloq_wheel::TimerId> {
+    pub(crate) fn timer_for(&self, token: OpToken) -> Option<TimerId> {
         self.observer.timer_for(token)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     #[inline]
-    pub(crate) fn timer_entries(&self) -> veloq_std::vec::Vec<(veloq_wheel::TimerId, OpToken)> {
+    pub(crate) fn timer_entries(&self) -> Vec<(TimerId, OpToken)> {
         self.observer.timer_entries()
     }
 
@@ -1311,10 +537,22 @@ impl UringControlPlane {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        BacklogEntry, BacklogError, StagedEntry, StagedLedger, StagedLedgerError,
+        SubmissionBacklog, UringControlEffect, UringControlEffectKind, UringControlPlane,
+        UringPostCompletionEffects, UringWakerManager,
+    };
     use crate::config::IoFd;
-    use veloq_driver_core::driver::CancelMode;
-    use veloq_driver_core::slot::Generation;
+    use crate::driver::{
+        control::{ControlPlaneEvent, PendingCancel},
+        lifecycle::CancellationPhase,
+        registration::OwnedFdOwnershipTicket,
+    };
+    use veloq_driver_core::{
+        driver::{CancelMode, CancelTicket, CompletionToken, OpToken},
+        slot::Generation,
+    };
+    use veloq_std::{vec, vec::Vec};
 
     fn token(index: usize, generation: u32) -> OpToken {
         OpToken::from_registry_parts(index, Generation::new(generation)).expect("test token")
@@ -1333,10 +571,10 @@ mod tests {
         assert_eq!(backlog.peak_len(), 2);
         assert_eq!(backlog.push(first), Err(BacklogError::Duplicate));
         assert_eq!(backlog.remove(stale), Err(BacklogError::GenerationMismatch));
-        assert_eq!(backlog.remove(first).map(|entry| entry.token), Ok(first));
+        assert_eq!(backlog.remove(first).map(BacklogEntry::token), Ok(first));
         assert_eq!(backlog.remove(first), Err(BacklogError::Missing));
-        assert_eq!(backlog.front(), Some(BacklogEntry { token: second }));
-        assert_eq!(backlog.pop_front().map(|entry| entry.token), Some(second));
+        assert_eq!(backlog.front().map(BacklogEntry::token), Some(second));
+        assert_eq!(backlog.pop_front().map(BacklogEntry::token), Some(second));
         assert!(backlog.front().is_none());
     }
 
@@ -1542,7 +780,7 @@ mod tests {
         assert_eq!(plane.cancellations.in_flight_targets().count(), 1);
         assert_eq!(
             plane.observer.take_events(),
-            veloq_std::vec![ControlPlaneEvent::CancelInFlightInsert { ticket, target }]
+            vec![ControlPlaneEvent::CancelInFlightInsert { ticket, target }]
         );
     }
 
@@ -1560,11 +798,8 @@ mod tests {
 
         assert_eq!(plane.staged_entry_count(), 1);
         assert_eq!(
-            plane
-                .cancellations
-                .in_flight_targets()
-                .collect::<veloq_std::vec::Vec<_>>(),
-            veloq_std::vec![(ticket, target)]
+            plane.cancellations.in_flight_targets().collect::<Vec<_>>(),
+            vec![(ticket, target)]
         );
         assert_eq!(plane.observer.take_events().len(), 1);
     }
@@ -1573,54 +808,54 @@ mod tests {
     fn post_effects_are_typed_and_waker_generation_is_deduplicated() {
         let token = token(5, 3);
         let mut effects = UringPostCompletionEffects::default();
-        effects.push(UringControlEffect {
-            sequence: 1,
-            token: Some(token),
-            generation: Some(token.generation()),
-            kind: UringControlEffectKind::WakerRearm { generation: 9 },
-        });
-        effects.push(UringControlEffect {
-            sequence: 2,
-            token: Some(token),
-            generation: Some(token.generation()),
-            kind: UringControlEffectKind::WakerRearm { generation: 9 },
-        });
-        effects.push(UringControlEffect {
-            sequence: 3,
-            token: Some(token),
-            generation: Some(token.generation()),
-            kind: UringControlEffectKind::WakerRebuild { generation: 9 },
-        });
+        effects.push(UringControlEffect::new(
+            1,
+            Some(token),
+            Some(token.generation()),
+            UringControlEffectKind::WakerRearm { generation: 9 },
+        ));
+        effects.push(UringControlEffect::new(
+            2,
+            Some(token),
+            Some(token.generation()),
+            UringControlEffectKind::WakerRearm { generation: 9 },
+        ));
+        effects.push(UringControlEffect::new(
+            3,
+            Some(token),
+            Some(token.generation()),
+            UringControlEffectKind::WakerRebuild { generation: 9 },
+        ));
 
         assert_eq!(effects.effects().len(), 2);
         assert!(matches!(
-            effects.effects()[0].kind,
+            effects.effects()[0].kind(),
             UringControlEffectKind::WakerRearm { generation: 9 }
         ));
-        assert_eq!(effects.effects()[0].sequence, 1);
-        assert_eq!(effects.effects()[0].generation, Some(token.generation()));
+        assert_eq!(effects.effects()[0].sequence(), 1);
+        assert_eq!(effects.effects()[0].generation(), Some(token.generation()));
     }
 
     #[test]
     fn post_effects_keep_only_the_latest_waker_generation() {
         let token = token(7, 2);
         let mut effects = UringPostCompletionEffects::with_capacity(1);
-        effects.push(UringControlEffect {
-            sequence: 1,
-            token: Some(token),
-            generation: Some(token.generation()),
-            kind: UringControlEffectKind::WakerRearm { generation: 3 },
-        });
-        effects.push(UringControlEffect {
-            sequence: 2,
-            token: Some(token),
-            generation: Some(token.generation()),
-            kind: UringControlEffectKind::WakerRearm { generation: 4 },
-        });
+        effects.push(UringControlEffect::new(
+            1,
+            Some(token),
+            Some(token.generation()),
+            UringControlEffectKind::WakerRearm { generation: 3 },
+        ));
+        effects.push(UringControlEffect::new(
+            2,
+            Some(token),
+            Some(token.generation()),
+            UringControlEffectKind::WakerRearm { generation: 4 },
+        ));
 
         assert_eq!(effects.effects().len(), 1);
         assert!(matches!(
-            effects.effects()[0].kind,
+            effects.effects()[0].kind(),
             UringControlEffectKind::WakerRearm { generation: 4 }
         ));
         assert!(!effects.is_overflowed());
@@ -1668,7 +903,7 @@ mod tests {
 
         first.extend(second);
 
-        assert_eq!(first.effects()[0].sequence, 0);
-        assert_eq!(first.effects()[1].sequence, 1);
+        assert_eq!(first.effects()[0].sequence(), 0);
+        assert_eq!(first.effects()[1].sequence(), 1);
     }
 }

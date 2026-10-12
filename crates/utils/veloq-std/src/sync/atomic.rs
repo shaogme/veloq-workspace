@@ -82,7 +82,7 @@ mod native_impl {
                 where
                     F: FnMut($inner) -> Option<$inner>,
                 {
-                    self.inner.fetch_update(set_order, fetch_order, f)
+                    self.inner.try_update(set_order, fetch_order, f)
                 }
 
                 pub fn as_ptr(&self) -> *mut $inner {
@@ -225,7 +225,7 @@ mod native_impl {
         where
             F: FnMut(*mut T) -> Option<*mut T>,
         {
-            self.inner.fetch_update(set_order, fetch_order, f)
+            self.inner.try_update(set_order, fetch_order, f)
         }
         pub fn as_ptr(&self) -> *mut *mut T {
             self.inner.as_ptr()
@@ -319,7 +319,7 @@ mod loom_impl {
                 where
                     F: FnMut($inner) -> Option<$inner>,
                 {
-                    self.inner.fetch_update(set_order, fetch_order, f)
+                    self.inner.try_update(set_order, fetch_order, f)
                 }
             }
         };
@@ -484,7 +484,7 @@ mod loom_impl {
         where
             F: FnMut(*mut T) -> Option<*mut T>,
         {
-            self.inner.fetch_update(set_order, fetch_order, f)
+            self.inner.try_update(set_order, fetch_order, f)
         }
         #[track_caller]
         pub fn with_mut<R, F: FnOnce(&mut *mut T) -> R>(&mut self, f: F) -> R {

@@ -3,6 +3,9 @@
 //! registry 仍然负责 slot storage 和 completion mailbox，但 operation 的 phase、timer
 //! 与 generation 校验只能从这个 owner 进入。其它组件拿到的是短生命周期的 slot view，
 //! 不再拥有生命周期状态的公开写入口。
+//! This owner centralizes operation phases, timers, and generation checks; other components receive only short-lived slot views.
+
+use core::ops::{Deref, DerefMut};
 
 use crate::{
     driver::{
@@ -16,6 +19,7 @@ use veloq_driver_core::driver::{OpToken, SharedCompletionTable};
 use veloq_wheel::TimerId;
 
 /// operation registry 的唯一 owner。
+/// The sole owner of the operation registry.
 pub(crate) struct OperationLedger {
     registry: UringOpRegistry,
 }
@@ -28,6 +32,7 @@ impl OperationLedger {
     }
 
     /// 在 generation 校验后的 operation state 上执行一个生命周期命令。
+    /// Applies one lifecycle command after validating the operation generation.
     fn with_state<R>(
         &mut self,
         token: OpToken,
@@ -99,10 +104,7 @@ impl OperationLedger {
     }
 }
 
-// The registry API is intentionally available only through the owner while the migration is in
-// progress. No method returns the registry; this keeps the owner responsible for its lifetime and
-// lets the remaining slot APIs be migrated one command at a time.
-impl core::ops::Deref for OperationLedger {
+impl Deref for OperationLedger {
     type Target = UringOpRegistry;
 
     fn deref(&self) -> &Self::Target {
@@ -110,7 +112,7 @@ impl core::ops::Deref for OperationLedger {
     }
 }
 
-impl core::ops::DerefMut for OperationLedger {
+impl DerefMut for OperationLedger {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.registry
     }

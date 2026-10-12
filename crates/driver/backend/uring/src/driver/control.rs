@@ -1,16 +1,22 @@
-pub(crate) mod cancellation;
-pub(crate) mod plane;
-pub(crate) mod timer;
-pub(crate) mod waker;
+mod cancellation;
+mod backlog;
+mod effects;
+mod plane;
+mod staged_ledger;
+mod timer;
+mod waker;
 
+pub(crate) use backlog::{BacklogEntry, BacklogError, SubmissionBacklog};
 pub(crate) use cancellation::{
     CancelIntentError, CancelRequestDisposition, PendingCancel, UringCancelManager,
 };
-pub(crate) use plane::DeferredCancelReconcile;
-pub(crate) use plane::{
-    BacklogError, StagedEntry, StagedLedger, StagedLedgerError, UringControlEffect,
-    UringControlEffectKind, UringControlPlane, UringPostCompletionEffects,
+pub(crate) use effects::{
+    DeferredCancelReconcile, UringControlEffectKind, UringPostCompletionEffects,
 };
+#[cfg(test)]
+pub(crate) use effects::UringControlEffect;
+pub(crate) use plane::UringControlPlane;
+pub(crate) use staged_ledger::{StagedEntry, StagedLedger, StagedLedgerError};
 pub(crate) use timer::{ExpiredBatch, UringTimerWheel};
 pub(crate) use waker::UringWakerManager;
 
@@ -21,11 +27,16 @@ use veloq_driver_core::driver::{CancelTicket, CompletionToken, OpToken};
 use veloq_driver_core::slot::SlotSnapshot;
 
 #[cfg(any(test, feature = "test-hooks"))]
-use veloq_std::vec::Vec;
+use veloq_std::{
+    collections::{HashMap, HashSet, hash_map::Entry},
+    mem,
+    vec::Vec,
+};
 use veloq_wheel::TimerId;
 
 /// A single observed control-plane transition.
 ///
+/// 记录一次控制面状态转换及其来源与原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ControlTransition {
     token: OpToken,
@@ -173,6 +184,7 @@ pub(crate) struct ControlTokenSnapshot {
 }
 
 /// Point-in-time state used by invariant checks and test hooks.
+/// 为不变量检查和测试钩子保存某一时刻的控制面状态。
 #[cfg(any(test, feature = "test-hooks"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ControlPlaneSnapshot {
@@ -183,6 +195,17 @@ pub(crate) struct ControlPlaneSnapshot {
     timer_tokens: Vec<(TimerId, OpToken)>,
     cleanup_hint_tokens: Vec<CompletionToken>,
     quarantined_tokens: Vec<OpToken>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) struct ControlPlaneSnapshotParts {
+    pub(crate) active_tokens: Vec<ControlTokenSnapshot>,
+    pub(crate) backlog_tokens: Vec<OpToken>,
+    pub(crate) pending_cancel_targets: Vec<OpToken>,
+    pub(crate) in_flight_cancel_targets: Vec<(CancelTicket, OpToken)>,
+    pub(crate) timer_tokens: Vec<(TimerId, OpToken)>,
+    pub(crate) cleanup_hint_tokens: Vec<CompletionToken>,
+    pub(crate) quarantined_tokens: Vec<OpToken>,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -245,23 +268,15 @@ impl ControlTokenSnapshot {
 
 #[cfg(any(test, feature = "test-hooks"))]
 impl ControlPlaneSnapshot {
-    pub(crate) fn new(
-        active_tokens: Vec<ControlTokenSnapshot>,
-        backlog_tokens: Vec<OpToken>,
-        pending_cancel_targets: Vec<OpToken>,
-        in_flight_cancel_targets: Vec<(CancelTicket, OpToken)>,
-        timer_tokens: Vec<(TimerId, OpToken)>,
-        cleanup_hint_tokens: Vec<CompletionToken>,
-        quarantined_tokens: Vec<OpToken>,
-    ) -> Self {
+    pub(crate) fn new(parts: ControlPlaneSnapshotParts) -> Self {
         Self {
-            active_tokens,
-            backlog_tokens,
-            pending_cancel_targets,
-            in_flight_cancel_targets,
-            timer_tokens,
-            cleanup_hint_tokens,
-            quarantined_tokens,
+            active_tokens: parts.active_tokens,
+            backlog_tokens: parts.backlog_tokens,
+            pending_cancel_targets: parts.pending_cancel_targets,
+            in_flight_cancel_targets: parts.in_flight_cancel_targets,
+            timer_tokens: parts.timer_tokens,
+            cleanup_hint_tokens: parts.cleanup_hint_tokens,
+            quarantined_tokens: parts.quarantined_tokens,
         }
     }
 }
@@ -270,21 +285,37 @@ impl ControlPlaneSnapshot {
 ///
 /// The type remains present in release builds so the instrumentation call sites stay identical,
 /// but the release representation is zero-sized and `record` is a no-op after optimization.
+/// 发布构建仍保留调用点，但 observer 为零大小类型，优化后 record 不执行任何操作。
 #[derive(Default)]
 pub(crate) struct ControlPlaneObserver {
     #[cfg(any(test, feature = "test-hooks"))]
     events: Vec<ControlPlaneEvent>,
     #[cfg(any(test, feature = "test-hooks"))]
-    backlog: veloq_std::collections::HashSet<OpToken>,
+    backlog: HashSet<OpToken>,
     #[cfg(any(test, feature = "test-hooks"))]
-    timers: veloq_std::collections::HashMap<TimerId, OpToken>,
+    timers: HashMap<TimerId, OpToken>,
     #[cfg(any(test, feature = "test-hooks"))]
-    staged_kernel_tokens: veloq_std::collections::HashSet<OpToken>,
+    staged_kernel_tokens: HashSet<OpToken>,
     #[cfg(any(test, feature = "test-hooks"))]
-    cancel_in_flight: veloq_std::collections::HashMap<CancelTicket, OpToken>,
+    cancel_in_flight: HashMap<CancelTicket, OpToken>,
 }
 
 impl ControlPlaneObserver {
+    #[cfg(test)]
+    fn transition_submission_phase(
+        &mut self,
+        phase: &mut SubmissionPhase,
+        token: OpToken,
+        next: SubmissionPhase,
+        reason: &'static str,
+    ) {
+        let from = *phase;
+        *phase = next;
+        self.record(ControlPlaneEvent::SubmissionTransition(
+            ControlTransition::new(token, from, next, reason),
+        ));
+    }
+
     #[inline]
     pub(crate) fn record(&mut self, event: ControlPlaneEvent) {
         #[cfg(not(any(test, feature = "test-hooks")))]
@@ -351,11 +382,11 @@ impl ControlPlaneObserver {
             }
             ControlPlaneEvent::CancelInFlightInsert { ticket, target } => {
                 match self.cancel_in_flight.entry(ticket) {
-                    veloq_std::collections::hash_map::Entry::Vacant(entry) => {
+                    Entry::Vacant(entry) => {
                         entry.insert(target);
                         None
                     }
-                    veloq_std::collections::hash_map::Entry::Occupied(_) => {
+                    Entry::Occupied(_) => {
                         Some(ControlInvariantError::CancelTicketDuplicate { ticket, target })
                     }
                 }
@@ -401,7 +432,7 @@ impl ControlPlaneObserver {
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn take_events(&mut self) -> Vec<ControlPlaneEvent> {
-        veloq_std::mem::take(&mut self.events)
+        mem::take(&mut self.events)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -425,30 +456,14 @@ impl ControlPlaneObserver {
     }
 }
 
-/// Writes a backend submission phase and records the exact write site in the observer.
-#[cfg(test)]
-#[inline]
-pub(crate) fn transition_submission_phase(
-    phase: &mut SubmissionPhase,
-    token: OpToken,
-    next: SubmissionPhase,
-    reason: &'static str,
-    observer: &mut ControlPlaneObserver,
-) {
-    let from = *phase;
-    *phase = next;
-    observer.record(ControlPlaneEvent::SubmissionTransition(ControlTransition {
-        token,
-        from,
-        to: next,
-        reason,
-    }));
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use veloq_driver_core::slot::Generation;
+    use super::{ControlPlaneEvent, ControlPlaneObserver, ControlTransition};
+    use crate::driver::lifecycle::SubmissionPhase;
+    use veloq_driver_core::{
+        driver::{CancelTicket, CompletionToken, OpToken},
+        slot::Generation,
+    };
     use veloq_std::time::Duration;
     use veloq_wheel::{Wheel, WheelConfig};
 
@@ -466,19 +481,17 @@ mod tests {
         let mut observer = ControlPlaneObserver::default();
         let mut state = SubmissionPhase::Reserved;
 
-        transition_submission_phase(
+        observer.transition_submission_phase(
             &mut state,
             token,
             SubmissionPhase::SqeStaged,
             "test staged",
-            &mut observer,
         );
-        transition_submission_phase(
+        observer.transition_submission_phase(
             &mut state,
             token,
             SubmissionPhase::KernelOutstanding,
             "test submit boundary",
-            &mut observer,
         );
         observer.record(ControlPlaneEvent::BacklogPush(token));
         observer.record(ControlPlaneEvent::BacklogPop(token));
@@ -545,32 +558,29 @@ mod tests {
         let mut observer = ControlPlaneObserver::default();
         let mut state = SubmissionPhase::Reserved;
 
-        // Normal submission and SQ-full retry.
-        transition_submission_phase(
+        // Normal submission and SQ-full retry. 正常提交以及 SQ 队列满后的重试。
+        observer.transition_submission_phase(
             &mut state,
             token,
             SubmissionPhase::SqeStaged,
             "test staged SQE",
-            &mut observer,
         );
-        transition_submission_phase(
+        observer.transition_submission_phase(
             &mut state,
             token,
             SubmissionPhase::Reserved,
             "test SQ full",
-            &mut observer,
         );
         observer.record(ControlPlaneEvent::BacklogPush(token));
         observer.record(ControlPlaneEvent::BacklogPop(token));
-        transition_submission_phase(
+        observer.transition_submission_phase(
             &mut state,
             token,
             SubmissionPhase::KernelOutstanding,
             "test queued retry",
-            &mut observer,
         );
 
-        // Queued cancellation and timer cancellation.
+        // Queued cancellation and timer cancellation. 排队取消请求及其定时器取消。
         observer.record(ControlPlaneEvent::TimerInsert { task_id, token });
         observer.record(ControlPlaneEvent::TimerCancel { task_id, token });
         observer.record(ControlPlaneEvent::TimerInsert {
@@ -582,7 +592,7 @@ mod tests {
             token: expire_token,
         });
 
-        // A multishot orphan produces one non-final record and one finalization.
+        // A multishot orphan produces one non-final record and one finalization. multishot 孤儿操作会产生一条非最终记录和一次最终清理。
         observer.record(ControlPlaneEvent::CompletionRecord {
             token,
             final_completion: false,
@@ -593,13 +603,13 @@ mod tests {
         });
         observer.record(ControlPlaneEvent::CompletionFinalize(token));
 
-        // Waker processing leaves REARM and then arms a single replacement read.
+        // Waker processing leaves REARM and then arms a single replacement read. waker 处理退出 REARM 后只提交一个替代读操作。
         observer.record(ControlPlaneEvent::WakerArm { armed: false });
         observer.record(ControlPlaneEvent::WakerRearmRequested);
         observer.record(ControlPlaneEvent::WakerArm { armed: true });
         observer.record(ControlPlaneEvent::WakerRearmed);
 
-        // Async cancel bookkeeping is paired around the cancel CQE.
+        // Async cancel bookkeeping is paired around the cancel CQE. 异步取消账本在取消 CQE 前后成对更新。
         observer.record(ControlPlaneEvent::CancelInFlightInsert {
             ticket: cancel_ticket,
             target: token,

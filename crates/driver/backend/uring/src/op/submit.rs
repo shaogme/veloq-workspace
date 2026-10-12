@@ -7,8 +7,7 @@ pub(super) use net::*;
 use crate::{
     config::{IoFd, RawHandleKind},
     driver::{
-        env::SqeEnv,
-        registration::file_table::{FileTable, SqeFd},
+        FileTable, SqeEnv, SqeFd,
     },
     error::{UringError, UringResult},
     op::{

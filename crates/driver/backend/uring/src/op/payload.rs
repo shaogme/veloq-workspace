@@ -12,7 +12,7 @@ pub(crate) use veloq_driver_core::op::types::{
 
 use crate::{
     config::{SockAddrStorage, UringRawHandle},
-    driver::registration::provided_buf::ProvidedBufLease,
+    driver::ProvidedBufLease,
     error::{UringError, UringResult},
     net::{socket_addr_to_storage, to_socket_addr},
 };

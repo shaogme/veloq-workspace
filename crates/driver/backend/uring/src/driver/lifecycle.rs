@@ -4,7 +4,7 @@ use crate::{
         control::{CancelIntentError, CancelRequestDisposition, PendingCancel},
         control::{ControlPlaneEvent, ControlPlaneObserver, ControlTransition},
         env::StageResult,
-        submission::txn::slot_access_report,
+        submission::SlotAccessReporter,
     },
     error::{UringError, UringResult, uring_report_to_event_res},
     op::{CheckedSlotView, Slot, SlotState, SlotView, UringOpRegistryExt},
@@ -17,11 +17,11 @@ use veloq_driver_core::driver::{
     UserCompletionEvent, cancel_target_kind,
 };
 use veloq_io_uring::opcode;
-use veloq_std::{format, mem, vec::Vec};
+use veloq_std::{format, mem, num::NonZeroU8, vec::Vec};
 use veloq_wheel::TimerId;
 
 pub(crate) const COMP_BACKEND_URING: CompletionBackend =
-    CompletionBackend::Backend(match veloq_std::num::NonZeroU8::new(2) {
+    CompletionBackend::Backend(match NonZeroU8::new(2) {
         Some(value) => value,
         None => unreachable!(),
     });
@@ -110,6 +110,7 @@ pub(crate) struct UringOpControl {
 ///
 /// The phase and timer data intentionally remain private. They are protocol state owned by the
 /// operation ledger, not a construction or mutation API for callers of the driver.
+/// 阶段与定时器属于操作账本维护的协议状态，驱动调用方不能直接构造或修改。
 #[derive(Clone, Default)]
 pub struct UringOpState {
     timer_id: Option<TimerId>,
@@ -618,7 +619,7 @@ impl LifecycleEngine {
         let prepared = match context.ops().checked_slot_view(token)? {
             CheckedSlotView::Valid(SlotView::Reserved(slot)) if slot.has_op() => {
                 let guard = slot.start_submission_with(None).map_err(|err| {
-                    slot_access_report("uring.complete_reserved_submission_error", err)
+                    SlotAccessReporter::report("uring.complete_reserved_submission_error", err)
                 })?;
                 let _ = guard.persist();
                 true

@@ -1,5 +1,8 @@
-use veloq_driver_core::driver::{
-    CancelMode, CancelRequest, CancelTicket, CancelTicketError, OpToken, RemoteCancelSender,
+use veloq_driver_core::{
+    driver::{
+        CancelMode, CancelRequest, CancelTicket, CancelTicketError, OpToken, RemoteCancelSender,
+    },
+    slot::Generation,
 };
 use veloq_std::{collections::HashMap, sync::mpsc, vec, vec::Vec};
 
@@ -36,7 +39,7 @@ impl PendingCancel {
     }
 
     #[inline]
-    pub(crate) const fn user_parts(self) -> (usize, veloq_driver_core::slot::Generation) {
+    pub(crate) const fn user_parts(self) -> (usize, Generation) {
         self.target.parts()
     }
 }
@@ -75,6 +78,7 @@ struct CancelIntent {
 pub(crate) struct UringCancelManager {
     /// One intent per target slot. The token generation prevents an old intent from matching a
     /// replacement operation in the same slot.
+    /// 每个目标 slot 只保留一个意图；token generation 可阻止旧意图匹配复用该 slot 的新操作。
     intents: Vec<Option<CancelIntent>>,
     pending_head: Option<usize>,
     pending_tail: Option<usize>,
@@ -278,6 +282,7 @@ impl UringCancelManager {
 
     /// Ends the control-plane lifetime of a cancel intent. The CQE sidecar may already have been
     /// removed by completion routing, so this method is intentionally idempotent.
+    /// 结束取消意图的控制面生命周期；完成路由可能已移除 CQE sidecar，因此此操作必须可重复调用。
     pub(crate) fn finish_ticket(
         &mut self,
         ticket: CancelTicket,
@@ -360,8 +365,12 @@ impl UringCancelManager {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use veloq_driver_core::slot::Generation;
+    use super::{CancelIntentError, CancelRequestDisposition, PendingCancel, UringCancelManager};
+    use veloq_driver_core::{
+        driver::{CancelMode, CancelTicket, CancelTicketError, OpToken},
+        slot::Generation,
+    };
+    use veloq_std::{vec, vec::Vec};
 
     fn pending() -> PendingCancel {
         PendingCancel {

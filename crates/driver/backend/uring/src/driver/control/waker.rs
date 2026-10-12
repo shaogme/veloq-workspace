@@ -3,6 +3,7 @@ use crate::{
     error::{UringError, UringResult},
 };
 use diagweave::prelude::*;
+use libc::{eventfd, write};
 use veloq_driver_core::driver::RemoteWaker;
 use veloq_std::{
     boxed::Box,
@@ -124,7 +125,7 @@ impl UringWaker {
 
     pub(crate) fn write_event_fd(fd: &EventFd) -> UringResult<()> {
         let buf = 1u64.to_ne_bytes();
-        let ret = unsafe { libc::write(fd.raw().as_fd(), buf.as_ptr() as *const _, 8) };
+        let ret = unsafe { write(fd.raw().as_fd(), buf.as_ptr() as *const _, 8) };
         if ret < 0 {
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EAGAIN) {
@@ -223,12 +224,12 @@ impl UringWakerManager {
     }
 
     pub(crate) fn create_event_fd(scope: &'static str) -> UringResult<Arc<EventFd>> {
-        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        let fd = unsafe { eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if fd < 0 {
             return Err(UringError::DriverInit.io_report(scope, io::Error::last_os_error()));
         }
         Ok(Arc::new(EventFd {
-            // SAFETY: `eventfd` returns a freshly created fd owned by this driver.
+            // SAFETY: `eventfd` returns a freshly created fd owned by this driver. 安全性：eventfd 返回新建的 fd，其所有权归本驱动。
             fd: unsafe {
                 OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_file(fd)))
             },
@@ -356,13 +357,15 @@ fn begin_processing(state: &AtomicU8) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use libc::read;
+
+    use super::{EventFd, UringWakerManager};
     use veloq_std::mem;
 
     fn read_event_fd(fd: &EventFd) -> u64 {
         let mut value = 0u64;
         let ret = unsafe {
-            libc::read(
+            read(
                 fd.raw().as_fd(),
                 (&mut value as *mut u64).cast(),
                 mem::size_of::<u64>(),

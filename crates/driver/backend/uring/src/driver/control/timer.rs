@@ -85,6 +85,7 @@ impl UringTimerWheel {
 
     /// Returns the expired scratch buffer while retaining entries that were over the current
     /// drive's timer budget for the next drive.
+    /// 返回已到期的 scratch 缓冲区，并将超出本轮预算的条目留到下一轮处理。
     pub(crate) fn recycle_expired(&mut self, mut batch: ExpiredBatch, processed: usize) {
         if processed != 0 {
             batch.entries.drain(..processed.min(batch.entries.len()));

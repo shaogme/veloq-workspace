@@ -1,7 +1,9 @@
+use super::SubmissionEngine;
 use crate::{
     driver::{
         env::{StageResult, SubmitEnv},
         lifecycle::SubmissionPhase,
+        submission::ResolvedSqe,
     },
     error::{UringError, UringResult},
     op::{Reserved, Slot, SubmissionStrategy, UringSlotSpec},
@@ -16,18 +18,22 @@ use veloq_driver_core::{
 use veloq_std::format;
 use veloq_wheel::TimerId;
 
-pub(crate) fn slot_access_report(scope: &'static str, err: SlotAccessError) -> Report<UringError> {
-    UringError::InvalidState
-        .to_report()
-        .push_ctx("scope", scope)
-        .with_ctx("slot_index", err.snapshot.index)
-        .with_ctx("slot_generation", err.snapshot.generation)
-        .with_ctx("slot_status", format!("{:?}", err.snapshot.status))
-        .with_ctx("slot_has_op", err.snapshot.has_op)
-        .with_ctx("slot_has_payload", err.snapshot.has_payload)
-        .with_ctx("slot_access_action", format!("{:?}", err.action))
-        .with_ctx("slot_access_reason", format!("{:?}", err.reason))
-        .attach_note("slot access failed during uring submission transaction")
+pub(crate) struct SlotAccessReporter;
+
+impl SlotAccessReporter {
+    pub(crate) fn report(scope: &'static str, err: SlotAccessError) -> Report<UringError> {
+        UringError::InvalidState
+            .to_report()
+            .push_ctx("scope", scope)
+            .with_ctx("slot_index", err.snapshot.index)
+            .with_ctx("slot_generation", err.snapshot.generation)
+            .with_ctx("slot_status", format!("{:?}", err.snapshot.status))
+            .with_ctx("slot_has_op", err.snapshot.has_op)
+            .with_ctx("slot_has_payload", err.snapshot.has_payload)
+            .with_ctx("slot_access_action", format!("{:?}", err.action))
+            .with_ctx("slot_access_reason", format!("{:?}", err.reason))
+            .attach_note("slot access failed during uring submission transaction")
+    }
 }
 
 pub(crate) struct UringSubmitTxn<'a, 'b, 'e, 's> {
@@ -46,7 +52,7 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
     ) -> UringResult<Self> {
         let slot_guard = slot
             .start_submission_with(None)
-            .map_err(|err| slot_access_report("driver.submit_txn.start", err))?;
+            .map_err(|err| SlotAccessReporter::report("driver.submit_txn.start", err))?;
 
         Ok(Self {
             env,
@@ -67,12 +73,12 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                     .report("driver.submit_txn.submit", "submission guard missing")
             })?
             .with_access_mut(|access| access.operation().get_ref().descriptor().strategy)
-            .map_err(|err| slot_access_report("driver.submit_txn.strategy", err))?;
+            .map_err(|err| SlotAccessReporter::report("driver.submit_txn.strategy", err))?;
 
         match strategy {
             SubmissionStrategy::SubmitSqe => {
                 let mut chunks = [ChunkId::ZERO; 4];
-                let (count, sqe, cleanup_hint) = {
+                let resolved = {
                     let sqe_env = self.env.sqe_env();
                     let token = self.token;
                     let guard = self.slot_guard.as_mut().ok_or_else(|| {
@@ -86,7 +92,7 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                             let descriptor = access.operation().get_ref().descriptor();
                             let count =
                                 unsafe { (descriptor.resolve_chunks)(access, token, &mut chunks) }?;
-                            super::validate_resolved_chunk_count(
+                            SubmissionEngine::validate_resolved_chunk_count(
                                 count,
                                 chunks.len(),
                                 "driver.submit_txn.resolve_chunks",
@@ -101,16 +107,18 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                                 .attach_note("driver.submit_txn.make_sqe")?
                                 .user_data(completion_token.raw())
                             };
-                            Ok::<_, Report<UringError>>((
-                                count,
-                                sqe,
-                                descriptor.completion_cleanup_hint,
-                            ))
+                            Ok::<_, Report<UringError>>(ResolvedSqe {
+                                chunk_count: count,
+                                entry: sqe,
+                                cleanup_hint: descriptor.completion_cleanup_hint,
+                            })
                         })
-                        .map_err(|err| slot_access_report("driver.submit_txn.op_payload", err))??
+                        .map_err(|err| {
+                            SlotAccessReporter::report("driver.submit_txn.op_payload", err)
+                        })??
                 };
 
-                for &chunk_id in chunks.iter().take(count) {
+                for &chunk_id in chunks.iter().take(resolved.chunk_count) {
                     let _decision = self.env.ensure_chunk_registered(
                         chunk_id,
                         user_data,
@@ -118,7 +126,9 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                     )?;
                 }
 
-                let staged = self.env.stage_user_entry(self.token, sqe, cleanup_hint)?;
+                let staged =
+                    self.env
+                        .stage_user_entry(self.token, resolved.entry, resolved.cleanup_hint)?;
                 let pushed = staged == StageResult::Staged;
                 let next_phase = if pushed {
                     SubmissionPhase::SqeStaged
@@ -169,7 +179,7 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                         (descriptor.get_timeout)(access, self.token)
                     })
                     .map_err(|err| {
-                        slot_access_report("driver.submit_txn.timer.op_payload", err)
+                        SlotAccessReporter::report("driver.submit_txn.timer.op_payload", err)
                     })??;
                 let Some(duration) = duration_opt else {
                     return Err(UringError::InvalidInput
@@ -228,5 +238,6 @@ impl Drop for UringSubmitTxn<'_, '_, '_, '_> {
         // Fixed-buffer registration is a persistent registry resource. It is deliberately not
         // rolled back here: Drop cannot report a cleanup syscall failure, and clearing only the
         // user-space bitset would diverge from the kernel table.
+        // 固定 buffer 注册是持久资源，不能在此回滚：Drop 无法报告清理系统调用失败，只清位图会造成用户态与内核表失配。
     }
 }

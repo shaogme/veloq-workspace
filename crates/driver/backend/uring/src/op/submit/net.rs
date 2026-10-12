@@ -1,7 +1,7 @@
 use crate::{
     OwnedRawHandle, RawHandle,
     config::UringRawHandle,
-    driver::{env::SqeEnv, registration::file_table::SqeFd},
+    driver::{SqeEnv, SqeFd},
     error::{UringError, UringResult},
     net::{bounded_sockaddr_bytes, to_socket_addr},
     op::{

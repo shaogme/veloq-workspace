@@ -2,8 +2,7 @@ use crate::{
     OwnedRawHandle, RawHandle,
     config::{IoFd, UringRawHandle},
     driver::{
-        env::SqeEnv,
-        registration::file_table::{RegisteredFileEntry, SqeFd},
+        RegisteredFileEntry, SqeEnv, SqeFd,
     },
     error::{UringError, UringResult},
     op::{

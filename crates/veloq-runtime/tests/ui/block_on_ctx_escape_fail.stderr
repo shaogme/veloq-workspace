@@ -4,5 +4,5 @@ error: lifetime may not live long enough
 8 |         .scope(async |ctx| ctx)
   |                       ---- ^^^ returning this value requires that `'1` must outlive `'2`
   |                       |  |
-  |                       |  return type of async closure `{async closure body@$DIR/tests/ui/block_on_ctx_escape_fail.rs:8:28: 8:31}` contains a lifetime `'2`
+  |                       |  return type of async closure is RuntimeCtx<'2, ()>
   |                       has type `RuntimeCtx<'1, ()>`

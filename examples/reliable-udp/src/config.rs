@@ -621,11 +621,11 @@ fn validate_values(config: &Config) -> Result<(), ConfigError> {
         return Err(ConfigError::HandshakeRetryBudgetOverflow);
     }
 
-    for (name, timeout) in [("ack_delay", config.ack_delay)] {
-        if !timeout.is_zero() && timeout.as_nanos().div_ceil(tick.as_nanos()) > u128::from(u64::MAX)
-        {
-            return Err(ConfigError::TimeoutRangeOverflow { name });
-        }
+    let name = "ack_delay";
+    let timeout = config.ack_delay;
+    if !timeout.is_zero() && timeout.as_nanos().div_ceil(tick.as_nanos()) > u128::from(u64::MAX)
+    {
+        return Err(ConfigError::TimeoutRangeOverflow { name });
     }
 
     let queued = config

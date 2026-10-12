@@ -6,54 +6,63 @@ use veloq_io_uring::{
 };
 use veloq_std::{format, io, sync::Arc, vec::Vec};
 
-#[cfg(feature = "test-hooks")]
-use veloq_std::string::String;
-
 use crate::{
     config::{IoFd, IoMode, UringConfig, UringRawHandle},
     diagnostics::{UringCompletionDiagnostics, UringCompletionDiagnosticsSnapshot},
     driver::{
         completion::CompletionEngine,
-        context::{DriveContext, SubmitPort},
+        context::{DriveContext, DriveContextParts, SubmitPort, SubmitPortParts},
         control::{ControlPlaneEvent, UringControlPlane, UringWakerManager},
-        drive::DriveCoordinator,
+        drive::{DriveCoordinator, DriveRoundPorts},
         lifecycle::LifecycleEngine,
         operation::OperationLedger,
-        registration::provided_buf::{PROVIDED_BUF_GROUP_ID, RingLifetimeOwner},
-        registration::{MAX_CHUNKS, OperationProbe, RegistrationEngine, RegistrationPorts},
-        submission::SubmissionEngine,
+        registration::{
+            MAX_CHUNKS, OperationProbe, PROVIDED_BUF_GROUP_ID, RegistrationEngine,
+            RegistrationPorts, RingLifetimeOwner,
+        },
+        submission::{OperationSubmitRequest, SubmissionEngine},
     },
     error::{UringError, UringResult},
     op::{UringOp, UringSlotSpec, UringUserPayload},
 };
-use veloq_driver_core::driver::{
-    BufferRegistrationStatus, CancelRequest, CancelSubmitOutcome, CompletionToken, DriveMode,
-    DriveOutcome, DriverCompletionDiagnostics, DriverCompletionDiagnosticsSnapshot, DriverRaw,
-    DriverSubmitResult, OpToken, RegisterFd, RemoteCancelSender, RemoteWaker,
-    SharedCompletionTable, SharedSlotTable, SubmitStatus, UdpReceiveOperationBuilder,
-    registry::{OpEntry, OpHandle},
-    sealed,
-};
 use veloq_driver_core::{
+    driver::{
+        BufferRegistrationStatus, CancelRequest, CancelSubmitOutcome, CompletionToken, DriveMode,
+        DriveOutcome, DriverCompletionDiagnostics, DriverCompletionDiagnosticsSnapshot, DriverRaw,
+        DriverSubmitResult, OpToken, RegisterFd, RemoteCancelSender, RemoteWaker,
+        SharedCompletionTable, SharedSlotTable, SubmitStatus, UdpReceiveOperationBuilder,
+        registry::{OpEntry, OpHandle},
+        sealed,
+    },
     op::types::UdpRecvMulti,
     platform::receive_pump::{ReceivePermitNotifier, ReceivePumpState, UdpReceiveConfig},
 };
 
-pub(crate) mod completion;
-pub(crate) mod context;
-pub(crate) mod control;
-pub(crate) mod drive;
-pub(crate) mod env;
-pub(crate) mod lifecycle;
-pub(crate) mod operation;
-pub(crate) mod registration;
-pub(crate) mod submission;
+#[cfg(feature = "test-hooks")]
+use veloq_std::string::String;
+
+#[cfg(feature = "test-hooks")]
+use veloq_driver_core::driver::test_hooks::{DriverTestHooks, RegisterFilesUpdateOutcome};
+
+mod completion;
+mod context;
+mod control;
+mod drive;
+mod env;
+mod lifecycle;
+mod operation;
+mod registration;
+mod submission;
 
 #[cfg(test)]
-mod protocol_model;
+mod tests;
 
 pub use lifecycle::UringOpState;
 pub use registration::ProvidedBufferSnapshot;
+pub(crate) use env::{CqeEnv, SqeEnv};
+pub(crate) use registration::{
+    FileTable, ProvidedBufLease, ProvidedBufLeaseAction, RegisteredFileEntry, SqeFd,
+};
 
 fn setup_report(
     kind: UringError,
@@ -107,6 +116,11 @@ pub struct UringDriver<'a> {
     // 尚未 quiescent，group 会留在 registry 中。函数体返回后，`IoUring` 先析构并关闭 ring
     // fd，随后 `ring_lifetime` 把 owner token 标记为 dead，最后 registration 才释放 mapping 和
     // `FixedBuf`。这把原来仅靠字段顺序的兜底变成了可断言的生命周期协议。
+    // Rust drops fields in declaration order. Keep `ring` and `ring_lifetime` before
+    // `registration`: the Drop body only attempts explicit unregister, while a failed syscall or
+    // non-quiescent driver leaves the group registered. After the body returns, `IoUring` closes
+    // the ring fd, `ring_lifetime` marks its token dead, and registration finally releases the
+    // mapping and `FixedBuf` owners. This makes the fallback ordering an explicit lifetime rule.
     ring: IoUring,
     ring_lifetime: RingLifetimeOwner,
     operations: OperationLedger,
@@ -117,6 +131,7 @@ pub struct UringDriver<'a> {
     kernel_capabilities: KernelCapabilities,
     // Component owners keep submission, lifecycle, completion scratch and drive budgets out of
     // the public facade while preserving the existing protocol implementation.
+    // 组件 owner 将提交、生命周期、完成 scratch 和 drive 预算保留在 facade 外，同时维持当前协议实现。
     registration: RegistrationEngine<'a>,
     submission: SubmissionEngine,
     lifecycle: LifecycleEngine,
@@ -247,14 +262,14 @@ impl<'a> UringDriver<'a> {
                 submission,
                 ..
             } = &mut driver;
-            let mut context = SubmitPort::from_parts(
-                operations,
+            let mut context = SubmitPort::from_parts(SubmitPortParts {
+                ops: operations,
                 control,
                 registration,
-                completion_diagnostics,
+                diagnostics: completion_diagnostics,
                 ring,
                 kernel_capabilities,
-            );
+            });
             submission.submit_waker(&mut context)?;
         }
 
@@ -268,17 +283,14 @@ impl<'a> UringDriver<'a> {
         Self::new_internal(config, registrar).attach_note("create uring driver")
     }
 
-    /// provided buffer 环的运行期统计，`None` 表示这个 driver 没有环。
-    pub fn provided_buf_stats(&self) -> Option<ProvidedBufferSnapshot> {
-        self.provided_buffer_snapshot()
-    }
-
     /// Returns the point-in-time provided-buffer snapshot captured while harvesting CQEs.
+    /// 返回收割 CQE 时采集的 provided-buffer 瞬时快照。
     pub fn provided_buffer_snapshot(&self) -> Option<ProvidedBufferSnapshot> {
-        self.registration.provided_buf_stats()
+        self.registration.provided_buffer_snapshot()
     }
 
     /// Returns a point-in-time snapshot of completion and backend cleanup diagnostics.
+    /// 返回完成处理与后端清理诊断的瞬时快照。
     pub fn completion_diagnostics_snapshot(
         &self,
     ) -> DriverCompletionDiagnosticsSnapshot<UringCompletionDiagnosticsSnapshot> {
@@ -289,6 +301,7 @@ impl<'a> UringDriver<'a> {
 /// The single shutdown protocol for normal drop and every initialization failure after the
 /// driver value has been constructed. The field order below then provides the final fallback:
 /// ring fd, lifetime token, registration-owned resources, and remaining control resources.
+/// 正常 drop 与构造完成后的初始化失败共用此关闭协议；随后字段顺序依次兜底关闭 ring fd、失效 lifetime token、释放注册资源和其他控制资源。
 struct RingShutdown;
 
 impl RingShutdown {
@@ -317,6 +330,7 @@ impl RingShutdown {
             if quiesce.is_quiescent() {
                 // 正常关闭优先显式反注册。失败时 release_provided_buffers 会恢复 group 的所有权，
                 // 不在仍存活的 IoUring 前释放映射；随后依靠 owner token 和字段顺序完成最终兜底。
+                // Prefer explicit unregister on shutdown. On failure, restore group ownership and keep the mapping alive until `IoUring` closes; the token and field order provide the final fallback.
                 if let Err(report) = driver
                     .registration
                     .release_provided_buffers(&driver.ring.submitter())
@@ -490,15 +504,23 @@ impl<'a> DriverRaw for UringDriver<'a> {
             submission,
             ..
         } = self;
-        let mut context = SubmitPort::from_parts(
-            operations,
+        let mut context = SubmitPort::from_parts(SubmitPortParts {
+            ops: operations,
             control,
             registration,
-            completion_diagnostics,
+            diagnostics: completion_diagnostics,
             ring,
             kernel_capabilities,
-        );
-        submission.submit_operation_internal(&mut context, token, op, op_in, strategy)
+        });
+        submission.submit_operation_internal(
+            &mut context,
+            OperationSubmitRequest {
+                token,
+                op,
+                op_in,
+                strategy,
+            },
+        )
     }
 
     fn drive_raw(&mut self, mode: DriveMode) -> UringResult<DriveOutcome> {
@@ -517,21 +539,24 @@ impl<'a> DriverRaw for UringDriver<'a> {
                 drive,
                 ..
             } = self;
-            let mut context = DriveContext::from_parts(
-                operations,
+            let mut context = DriveContext::from_parts(DriveContextParts {
+                ops: operations,
                 control,
                 registration,
                 completion_table,
-                completion_diagnostics,
+                diagnostics: completion_diagnostics,
                 ring,
                 kernel_capabilities,
-            );
+            });
             drive
-                .run(&mut context, submission, lifecycle, completion, mode)
+                .run(
+                    DriveRoundPorts::new(&mut context, submission, lifecycle, completion),
+                    mode,
+                )
                 .push_ctx("scope", "uring.driver.drive")
                 .attach_note("advance unified uring drive cycle")?
         };
-        context::check_control_plane_invariants(&mut self.operations, &mut self.control)?;
+        context::ControlPlaneInvariantAuditor::check(&mut self.operations, &mut self.control)?;
 
         let next_timeout_hint = self.control.timers().next_deadline().map_err(|error| {
             UringError::InvalidState
@@ -570,15 +595,15 @@ impl<'a> DriverRaw for UringDriver<'a> {
             completion,
             ..
         } = self;
-        let mut context = DriveContext::from_parts(
-            operations,
+        let mut context = DriveContext::from_parts(DriveContextParts {
+            ops: operations,
             control,
             registration,
             completion_table,
-            completion_diagnostics,
+            diagnostics: completion_diagnostics,
             ring,
             kernel_capabilities,
-        );
+        });
         context.cancel_operation(lifecycle, completion, submission, request)
     }
 
@@ -637,6 +662,7 @@ impl<'a> DriverRaw for UringDriver<'a> {
     ///
     /// 注册失败会保留真实资源错误；需要 provided buffer 的具体操作在提交时返回该错误，
     /// 不会回退到普通 buffer 接收。
+    /// Registers a provided-buffer ring from the newly created worker pool; failures remain available to operations that require this feature instead of silently falling back to ordinary buffers.
     fn attach_buffer_pool_raw(&mut self, pool: AnyBufPool) -> UringResult<()> {
         self.registration.attach_buffer_pool(
             &self.ring.submitter(),
@@ -646,9 +672,6 @@ impl<'a> DriverRaw for UringDriver<'a> {
         Ok(())
     }
 }
-
-#[cfg(feature = "test-hooks")]
-use veloq_driver_core::driver::test_hooks::{DriverTestHooks, RegisterFilesUpdateOutcome};
 
 #[cfg(feature = "test-hooks")]
 impl DriverTestHooks for UringDriver<'_> {
@@ -741,7 +764,10 @@ impl DriverTestHooks for UringDriver<'_> {
     fn debug_control_plane_snapshot(&mut self) -> String {
         format!(
             "{:?}",
-            context::control_plane_snapshot(&mut self.operations, &mut self.control)
+            context::ControlPlaneInvariantAuditor::snapshot(
+                &mut self.operations,
+                &mut self.control
+            )
         )
     }
 

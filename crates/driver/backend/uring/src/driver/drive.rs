@@ -3,7 +3,7 @@ use diagweave::prelude::*;
 use crate::{
     config::UringDriveLimits,
     driver::{
-        completion::{CompletionBatchProgress, CompletionEngine, effects::CompletionEffectBatch},
+        completion::{CompletionBatchProgress, CompletionEngine},
         context::DriveContext,
         lifecycle::LifecycleEngine,
         submission::{KernelEnterPlan, SubmissionEngine, SubmitProgress, WaitBudgetSource},
@@ -14,6 +14,7 @@ use veloq_driver_core::driver::{DriveMode, DrivePendingWork};
 use veloq_std::time::Duration;
 
 /// A source that consumes a bounded portion of one drive round.
+/// 表示一次 drive 轮次中受预算限制的工作来源。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RoundBudgetKind {
     RemoteCancel,
@@ -62,6 +63,7 @@ impl BudgetCounter {
 /// not by itself reported as exhaustion: the coordinator only reports exhaustion when the same
 /// source still has pending work. This prevents a normally completed round from looking like it
 /// needs another round merely because it used its entire budget.
+/// 所有有界工作共享本轮预算；只有同一来源仍有待处理工作时，耗尽预算才表示需要下一轮。
 pub(crate) struct RoundBudget {
     remote_cancels: BudgetCounter,
     lifecycle_actions: BudgetCounter,
@@ -189,6 +191,37 @@ pub(crate) struct DriveRoundReport {
     pub(crate) needs_next_round: bool,
 }
 
+pub(crate) struct DriveRoundPorts<'borrow, 'ops, 'registration, 'ring, 'driver> {
+    context: &'borrow mut DriveContext<'ops, 'registration, 'ring, 'driver>,
+    submission: &'borrow mut SubmissionEngine,
+    lifecycle: &'borrow mut LifecycleEngine,
+    completion: &'borrow mut CompletionEngine,
+}
+
+impl<'borrow, 'ops, 'registration, 'ring, 'driver>
+    DriveRoundPorts<'borrow, 'ops, 'registration, 'ring, 'driver>
+{
+    pub(crate) fn new(
+        context: &'borrow mut DriveContext<'ops, 'registration, 'ring, 'driver>,
+        submission: &'borrow mut SubmissionEngine,
+        lifecycle: &'borrow mut LifecycleEngine,
+        completion: &'borrow mut CompletionEngine,
+    ) -> Self {
+        Self {
+            context,
+            submission,
+            lifecycle,
+            completion,
+        }
+    }
+}
+
+struct DriveRoundProgress<'round> {
+    plan: KernelEnterPlan,
+    submission: &'round SubmitProgress,
+    completion: &'round CompletionBatchProgress,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WaitPriority {
     UserCompletion,
@@ -201,25 +234,28 @@ pub(crate) enum WaitPriority {
 
 /// Resolves wait inputs in one place so timeout and completion precedence cannot drift between
 /// the real driver and table-driven tests.
-pub(crate) const fn wait_priority(
-    user_completion: bool,
-    waker_completion: bool,
-    timer_deadline: bool,
-    zero_timeout: bool,
-    external_timeout: bool,
-) -> WaitPriority {
-    if user_completion {
-        WaitPriority::UserCompletion
-    } else if waker_completion {
-        WaitPriority::WakerCompletion
-    } else if timer_deadline {
-        WaitPriority::TimerDeadline
-    } else if zero_timeout {
-        WaitPriority::ZeroTimeout
-    } else if external_timeout {
-        WaitPriority::ExternalWait
-    } else {
-        WaitPriority::ProbeWait
+/// 统一解析等待输入，避免真实驱动和表驱动测试对超时与完成优先级采用不同规则。
+impl WaitPriority {
+    pub(crate) const fn resolve(
+        user_completion: bool,
+        waker_completion: bool,
+        timer_deadline: bool,
+        zero_timeout: bool,
+        external_timeout: bool,
+    ) -> Self {
+        if user_completion {
+            Self::UserCompletion
+        } else if waker_completion {
+            Self::WakerCompletion
+        } else if timer_deadline {
+            Self::TimerDeadline
+        } else if zero_timeout {
+            Self::ZeroTimeout
+        } else if external_timeout {
+            Self::ExternalWait
+        } else {
+            Self::ProbeWait
+        }
     }
 }
 
@@ -241,51 +277,32 @@ impl WaitBudget {
     pub(crate) const fn source(self) -> WaitBudgetSource {
         self.source
     }
-}
 
-pub(crate) fn wait_budget(
-    external_timeout: Option<Duration>,
-    internal_timeout: Option<Duration>,
-    probe: Duration,
-) -> WaitBudget {
-    let mut budget = WaitBudget::new(probe, WaitBudgetSource::Probe);
+    pub(crate) fn resolve(
+        external_timeout: Option<Duration>,
+        internal_timeout: Option<Duration>,
+        probe: Duration,
+    ) -> Self {
+        let mut budget = Self::new(probe, WaitBudgetSource::Probe);
 
-    if let Some(internal) = internal_timeout
-        && internal <= budget.duration
-    {
-        budget = WaitBudget::new(internal, WaitBudgetSource::Timer);
+        if let Some(internal) = internal_timeout
+            && internal <= budget.duration
+        {
+            budget = Self::new(internal, WaitBudgetSource::Timer);
+        }
+        if let Some(external) = external_timeout
+            && external <= budget.duration
+        {
+            budget = Self::new(external, WaitBudgetSource::External);
+        }
+        budget
     }
-    if let Some(external) = external_timeout
-        && external <= budget.duration
-    {
-        budget = WaitBudget::new(external, WaitBudgetSource::External);
-    }
-    budget
 }
 
 /// Drives one bounded round and coordinates lifecycle, submission and completion in a fixed order.
+/// 按固定顺序协调生命周期、提交和完成处理，驱动一轮有界工作。
 pub(crate) struct DriveCoordinator {
     limits: UringDriveLimits,
-}
-
-/// Executes completion effects after ingress settlement has released its slot/CQE borrows.
-///
-/// The executor is intentionally stateless. Its position in the drive layer, rather than in
-/// `CompletionEngine`, is the ownership boundary that prevents completion routing from closing
-/// descriptors, rebuilding the waker, or re-entering submission.
-pub(crate) struct EffectExecutor;
-
-impl EffectExecutor {
-    pub(crate) fn execute(
-        &mut self,
-        context: &mut DriveContext<'_, '_, '_, '_>,
-        lifecycle: &mut LifecycleEngine,
-        completion: &mut CompletionEngine,
-        effects: &CompletionEffectBatch,
-        collector_exhausted: bool,
-    ) -> UringResult<()> {
-        context.execute_completion_effects(lifecycle, completion, effects, collector_exhausted)
-    }
 }
 
 impl DriveCoordinator {
@@ -295,36 +312,28 @@ impl DriveCoordinator {
 
     pub(crate) fn run(
         &mut self,
-        context: &mut DriveContext<'_, '_, '_, '_>,
-        submission: &mut SubmissionEngine,
-        lifecycle: &mut LifecycleEngine,
-        completion: &mut CompletionEngine,
+        mut ports: DriveRoundPorts<'_, '_, '_, '_, '_>,
         mode: DriveMode,
     ) -> UringResult<DriveRoundReport> {
         let mut budget = RoundBudget::new(self.limits);
         if matches!(mode, DriveMode::Wait { .. }) {
-            context.diagnostics().backend().inc_wait_enter();
+            ports.context.diagnostics().backend().inc_wait_enter();
         }
 
-        let (remote_cancel_pending, mut first_error) =
-            self.prepare_round(context, lifecycle, submission, completion, &mut budget);
+        let (remote_cancel_pending, mut first_error) = self.prepare_round(&mut ports, &mut budget);
         if first_error.is_none()
-            && let Some(error) = self.run_kernel_rounds(
-                context,
-                submission,
-                lifecycle,
-                completion,
-                mode,
-                &mut budget,
-            )
+            && let Some(error) = self.run_kernel_rounds(&mut ports, mode, &mut budget)
         {
             remember_first_error(&mut first_error, error);
         }
 
         if first_error.is_some() {
-            context.enter_submission_fail_stop(submission);
+            ports.context.enter_submission_fail_stop(ports.submission);
         }
-        let pending_work = context.pending_work(remote_cancel_pending, lifecycle, completion);
+        let pending_work =
+            ports
+                .context
+                .pending_work(remote_cancel_pending, ports.lifecycle, ports.completion);
         let budget_exhausted = budget.exhausted_for(pending_work);
         let needs_next_round = !pending_work.is_empty();
         let report = DriveRoundReport {
@@ -340,30 +349,32 @@ impl DriveCoordinator {
 
     fn prepare_round(
         &self,
-        context: &mut DriveContext<'_, '_, '_, '_>,
-        lifecycle: &mut LifecycleEngine,
-        submission: &mut SubmissionEngine,
-        completion: &mut CompletionEngine,
+        ports: &mut DriveRoundPorts<'_, '_, '_, '_, '_>,
         budget: &mut RoundBudget,
     ) -> (usize, Option<Report<UringError>>) {
         let mut first_error = None;
         let remote_cancel_limit = budget.remote_cancels();
         let mut remote_cancel_pending = 0;
-        match context.drain_cancel_requests_bounded(lifecycle, completion, remote_cancel_limit) {
+        match ports.context.drain_cancel_requests_bounded(
+            ports.lifecycle,
+            ports.completion,
+            remote_cancel_limit,
+        ) {
             Ok(drained) => {
                 budget.consume_remote_cancels(drained);
                 if drained == remote_cancel_limit && drained != 0 {
                     // mpsc does not expose a non-destructive length query. Equal-to-limit is a
                     // conservative lower bound: the next round is guaranteed to re-check it.
+                    // mpsc 没有无副作用的长度查询；达到上限时按保守下界处理，确保下一轮重新检查。
                     remote_cancel_pending = 1;
                 }
             }
             Err(error) => remember_first_error(&mut first_error, error),
         }
         if first_error.is_none() {
-            match context.stage_pending_cancellations(
-                lifecycle,
-                completion,
+            match ports.context.stage_pending_cancellations(
+                ports.lifecycle,
+                ports.completion,
                 budget.lifecycle_actions(),
             ) {
                 Ok(count) => budget.consume_lifecycle_actions(count),
@@ -371,10 +382,10 @@ impl DriveCoordinator {
             }
         }
         if first_error.is_none() {
-            match context.stage_backlog_entries(
-                lifecycle,
-                submission,
-                completion,
+            match ports.context.stage_backlog_entries(
+                ports.lifecycle,
+                ports.submission,
+                ports.completion,
                 budget.backlog_actions(),
             ) {
                 Ok(progress) => budget.consume_backlog_actions(progress.actions()),
@@ -382,7 +393,7 @@ impl DriveCoordinator {
             }
         }
         if first_error.is_none()
-            && let Err(error) = context.submit_waker(submission)
+            && let Err(error) = ports.context.submit_waker(ports.submission)
         {
             remember_first_error(&mut first_error, error);
         }
@@ -391,28 +402,25 @@ impl DriveCoordinator {
 
     fn run_kernel_rounds(
         &self,
-        context: &mut DriveContext<'_, '_, '_, '_>,
-        submission: &mut SubmissionEngine,
-        lifecycle: &mut LifecycleEngine,
-        completion: &mut CompletionEngine,
+        ports: &mut DriveRoundPorts<'_, '_, '_, '_, '_>,
         mode: DriveMode,
         budget: &mut RoundBudget,
     ) -> Option<Report<UringError>> {
         let mut first_error = None;
         let mut next_enter_mode = mode;
         while first_error.is_none() && budget.try_sqe_enter() {
-            if let Err(error) = context.submit_waker(submission) {
+            if let Err(error) = ports.context.submit_waker(ports.submission) {
                 remember_first_error(&mut first_error, error);
                 break;
             }
-            let plan = match context.build_kernel_enter_plan(next_enter_mode) {
+            let plan = match ports.context.build_kernel_enter_plan(next_enter_mode) {
                 Ok(plan) => plan,
                 Err(error) => {
                     remember_first_error(&mut first_error, error);
                     break;
                 }
             };
-            let submit_progress = match context.submit_to_kernel(submission, plan) {
+            let submit_progress = match ports.context.submit_to_kernel(ports.submission, plan) {
                 Ok(progress) => progress,
                 Err(error) => {
                     remember_first_error(&mut first_error, error);
@@ -426,29 +434,32 @@ impl DriveCoordinator {
                 receipt = ?submit_progress.receipt(),
                 "completed kernel enter round"
             );
-            let completion_progress =
-                match context.process_completion_batch(lifecycle, completion, budget) {
-                    Ok(progress) => progress,
-                    Err(error) => {
-                        remember_first_error(&mut first_error, error);
-                        break;
-                    }
-                };
+            let completion_progress = match ports.context.process_completion_batch(
+                ports.lifecycle,
+                ports.completion,
+                budget,
+            ) {
+                Ok(progress) => progress,
+                Err(error) => {
+                    remember_first_error(&mut first_error, error);
+                    break;
+                }
+            };
             self.record_wait_diagnostics(
-                context,
+                ports,
                 mode,
-                plan,
-                &submit_progress,
-                &completion_progress,
+                DriveRoundProgress {
+                    plan,
+                    submission: &submit_progress,
+                    completion: &completion_progress,
+                },
             );
-            if let Err(error) =
-                self.stage_follow_up(context, submission, lifecycle, completion, budget)
-            {
+            if let Err(error) = self.stage_follow_up(ports, budget) {
                 remember_first_error(&mut first_error, error);
                 break;
             }
             let pending_submit = submit_progress.pending_submit()
-                || context.control_has_pending_work()
+                || ports.context.control_has_pending_work()
                 || completion_progress.pending_work();
             if !pending_submit {
                 break;
@@ -460,22 +471,19 @@ impl DriveCoordinator {
 
     fn stage_follow_up(
         &self,
-        context: &mut DriveContext<'_, '_, '_, '_>,
-        submission: &mut SubmissionEngine,
-        lifecycle: &mut LifecycleEngine,
-        completion: &mut CompletionEngine,
+        ports: &mut DriveRoundPorts<'_, '_, '_, '_, '_>,
         budget: &mut RoundBudget,
     ) -> UringResult<()> {
-        let count = context.stage_pending_cancellations(
-            lifecycle,
-            completion,
+        let count = ports.context.stage_pending_cancellations(
+            ports.lifecycle,
+            ports.completion,
             budget.lifecycle_actions(),
         )?;
         budget.consume_lifecycle_actions(count);
-        let progress = context.stage_backlog_entries(
-            lifecycle,
-            submission,
-            completion,
+        let progress = ports.context.stage_backlog_entries(
+            ports.lifecycle,
+            ports.submission,
+            ports.completion,
             budget.backlog_actions(),
         )?;
         budget.consume_backlog_actions(progress.actions());
@@ -484,34 +492,50 @@ impl DriveCoordinator {
 
     fn record_wait_diagnostics(
         &self,
-        context: &DriveContext<'_, '_, '_, '_>,
+        ports: &DriveRoundPorts<'_, '_, '_, '_, '_>,
         mode: DriveMode,
-        plan: KernelEnterPlan,
-        submit_progress: &SubmitProgress,
-        completion: &CompletionBatchProgress,
+        progress: DriveRoundProgress<'_>,
     ) {
-        record_completion_diagnostics(context, completion);
-        if matches!(mode, DriveMode::Wait { .. }) && completion.user_completed() > 0 {
-            context.diagnostics().backend().inc_wait_completion_return();
+        record_completion_diagnostics(ports.context, progress.completion);
+        if matches!(mode, DriveMode::Wait { .. }) && progress.completion.user_completed() > 0 {
+            ports
+                .context
+                .diagnostics()
+                .backend()
+                .inc_wait_completion_return();
         }
         if matches!(mode, DriveMode::Wait { .. })
-            && completion.timer_count() > 0
-            && !submit_progress.timed_out()
+            && progress.completion.timer_count() > 0
+            && !progress.submission.timed_out()
         {
-            context.diagnostics().backend().inc_wait_timer_return();
+            ports
+                .context
+                .diagnostics()
+                .backend()
+                .inc_wait_timer_return();
         }
-        if submit_progress.timed_out() {
-            context.diagnostics().backend().inc_wait_timeout();
-            if let Some(source) = plan.wait_source() {
+        if progress.submission.timed_out() {
+            ports.context.diagnostics().backend().inc_wait_timeout();
+            if let Some(source) = progress.plan.wait_source() {
                 match source {
-                    WaitBudgetSource::External => {
-                        context.diagnostics().backend().inc_wait_external_timeout()
-                    }
+                    WaitBudgetSource::External => ports
+                        .context
+                        .diagnostics()
+                        .backend()
+                        .inc_wait_external_timeout(),
                     WaitBudgetSource::Timer => {
-                        context.diagnostics().backend().inc_wait_timer_return();
+                        ports
+                            .context
+                            .diagnostics()
+                            .backend()
+                            .inc_wait_timer_return();
                     }
                     WaitBudgetSource::Probe => {
-                        context.diagnostics().backend().inc_wait_probe_return();
+                        ports
+                            .context
+                            .diagnostics()
+                            .backend()
+                            .inc_wait_probe_return();
                     }
                 }
             }
@@ -548,7 +572,7 @@ fn record_completion_diagnostics(
 
 #[cfg(test)]
 mod tests {
-    use super::{RoundBudget, WaitPriority, wait_priority};
+    use super::{RoundBudget, WaitPriority};
     use crate::config::UringDriveLimits;
     use veloq_driver_core::driver::DrivePendingWork;
 
@@ -564,14 +588,17 @@ mod tests {
         ];
 
         for (user, waker, timer, zero, external, expected) in cases {
-            assert_eq!(wait_priority(user, waker, timer, zero, external), expected);
+            assert_eq!(
+                WaitPriority::resolve(user, waker, timer, zero, external),
+                expected
+            );
         }
     }
 
     #[test]
     fn user_completion_wins_over_every_wait_source() {
         assert_eq!(
-            wait_priority(true, false, false, false, false),
+            WaitPriority::resolve(true, false, false, false, false),
             WaitPriority::UserCompletion
         );
     }
@@ -596,7 +623,10 @@ mod tests {
                             } else {
                                 WaitPriority::ProbeWait
                             };
-                            assert_eq!(wait_priority(user, waker, timer, zero, external), expected);
+                            assert_eq!(
+                                WaitPriority::resolve(user, waker, timer, zero, external),
+                                expected
+                            );
                         }
                     }
                 }

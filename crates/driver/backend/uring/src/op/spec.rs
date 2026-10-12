@@ -1,7 +1,6 @@
 use crate::{
     OwnedRawHandle,
-    driver::env::{CqeEnv, SqeEnv},
-    driver::registration::provided_buf::ProvidedBufLeaseAction,
+    driver::{CqeEnv, ProvidedBufLeaseAction, SqeEnv},
     error::{UringError, UringResult},
     op::{
         Accept, AcceptMulti, AcceptedSocket, Close, CompletionCardinality, Connect,
@@ -80,6 +79,7 @@ pub(crate) trait UringOpSpec: Sized + Send + 'static {
     ///
     /// 需要覆盖它的是两类操作：提交 payload 必须留在 slot 里的（multishot），以及产物在
     /// 提交时还不存在的（provided buffer）。见 [`RecordItemFn`]。
+    /// Creates a record payload per completion. Most operations reuse their submission payload; multishot and provided-buffer operations need a distinct payload lifetime.
     fn record_item(
         _kernel: Pin<&mut Self::KernelPayload>,
         _payload: &mut Self,
@@ -746,6 +746,7 @@ macro_rules! impl_uring_op_spec {
             ) -> UringResult<squeue::Entry> {
                 // SAFETY: the operation row selects the callback for this exact kernel and user
                 // payload pair. The callback's pointer validity is upheld by the pinned slot.
+                // 安全性：操作表行将此回调与精确的 kernel/user payload 配对；固定 slot 保证回调使用的指针有效。
                 unsafe { $make_sqe(kernel, payload, env, token) }
             }
 
@@ -756,6 +757,7 @@ macro_rules! impl_uring_op_spec {
             ) -> UringResult<usize> {
                 // SAFETY: the operation row selects the callback for this exact kernel and user
                 // payload pair.
+                // 安全性：操作表行将此回调与精确的 kernel/user payload 配对。
                 unsafe { descriptor_on_complete!($on_complete)(kernel, payload, result) }
             }
 
@@ -910,6 +912,7 @@ macro_rules! impl_uring_operation_descriptor {
                     UringKernelPayloadStorage::$kernel_variant(kernel) => {
                         // SAFETY: `op` is borrowed through `SlotAccess`, so this variant
                         // remains at its stable slot address for the duration of the callback.
+                        // 安全性：`op` 通过 `SlotAccess` 借用，因此回调期间该变体始终位于稳定的 slot 地址。
                         unsafe { Pin::new_unchecked(kernel) }
                     }
                     _ => {
@@ -1193,6 +1196,7 @@ macro_rules! descriptor_record_policy {
 ///
 /// descriptor row 中的 completion mapper 把 CQE 的结果变成这个操作的 `Completion`。它
 /// 拿不到 payload——记录 payload 里没有提交时的信息，这正是两者分家的意思。
+/// Used when submit and record payload types differ: multishot operations retain the submit payload, while provided buffers exist only after the kernel selects one; the completion mapper receives only the result.
 macro_rules! impl_uring_record_payload_op {
     ($OpType:ty, $record_variant:ident, $record:ty, $completion:ty) => {
         impl IntoPlatformOp<UringSlotSpec> for $OpType {
@@ -1233,6 +1237,7 @@ macro_rules! impl_uring_record_payload_op {
             /// 提交同步失败时 slot 里躺着的是**提交** payload，不是任何一条完成的产物——
             /// 没有 item 可以交给用户，也没有用户交出来的资源要还。默认实现会把它当记录
             /// payload 去投影，那必然失败并给出一个含义完全错误的 `PayloadTypeMismatch`。
+            /// On synchronous submission failure there is no completion item or user resource to return; projecting the submit payload as a record payload would report a misleading type mismatch.
             fn submit_failed(
                 erased: UringUserPayload,
                 report: Report<UringError>,
@@ -1245,6 +1250,7 @@ macro_rules! impl_uring_record_payload_op {
 }
 
 /// 单发操作的 [`IntoPlatformOp`]：提交 payload 就是记录 payload，就是操作自己。
+/// `IntoPlatformOp` implementation for single-shot operations, where the operation itself serves as both submit and record payload.
 macro_rules! impl_uring_single_shot_op {
     ($OpType:ty, $completion:ty) => {
         impl IntoPlatformOp<UringSlotSpec> for $OpType {
@@ -1396,6 +1402,7 @@ macro_rules! operation_coverage_entries {
 ///
 /// The operation rows provide the names for each storage arm.  The domain is part of the id so
 /// that a user payload and a kernel payload with the same Rust variant name remain distinct.
+/// 该身份不分配内存；operation rows 提供 storage 名称，domain 区分同名的 user 与 kernel payload。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PayloadId {
     User(&'static str),
@@ -2377,23 +2384,30 @@ declare_uring_operations! {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{OPERATION_COVERAGE, UringKernelPayloadStorage, UringUserPayloadStorage};
     use crate::{
         config::{FileTableExhaustion, IoFd, SockAddrStorage, UringRawHandle},
         diagnostics::UringCompletionDiagnostics,
         driver::{
-            env::{CqeEnv, SqeEnv},
-            lifecycle::UringOpState,
-            registration::file_table::FileTable,
+            CqeEnv, FileTable, SqeEnv, UringOpState,
         },
+        error::{UringError, UringResult},
         net::socket_addr_to_storage,
-        op::{UringOp, UringOpRegistry, UringOperationDescriptor},
+        op::{
+            Accept, AcceptMulti, AcceptedSocket, Close, CompletionCardinality, Connect, Fallocate,
+            FallocateRaw, Fsync, FsyncRaw, OpSend, Open, ProvidedBuf, ReadFixed, ReadRaw,
+            RecordPolicy, Recv, RecvMulti, RecvProvided, SendTo, SubmissionStrategy, SyncFileRange,
+            SyncFileRangeRaw, Timeout, UdpConnect, UdpRecvMulti, UdpSend, UringOp,
+            UringOpRegistry, UringOperationDescriptor, UringSlotSpec, UringUserPayload, Wakeup,
+            WriteFixed, WriteRaw,
+        },
         test_alloc::{AllocationCounts, measure},
     };
+    use core::ptr::{eq, read_unaligned};
     use veloq_buf::{FixedBuf, NoopRegistrar, heap::ChunkId};
     use veloq_driver_core::{
         driver::{OpToken, SubmitTokenContext, registry::OpEntry},
-        op::IntoPlatformOp,
+        op::{IntoPlatformOp, OpKind},
         platform::receive_pump::{ReceivePumpConfig, ReceivePumpState, ReceiveSlot},
         slot::{
             CheckedSlotView, Reserved, Slot, SlotAccess, SlotAccessOutcome, SlotRegistryExt,
@@ -2405,6 +2419,8 @@ mod tests {
         mem::{align_of, size_of},
         net::{Ipv4Addr, SocketAddr, SocketAddrV4},
         num::NonZeroUsize,
+        time::Duration,
+        vec,
     };
 
     fn buffer(len: usize) -> FixedBuf {
@@ -2434,7 +2450,7 @@ mod tests {
             datagram_capacity: NonZeroUsize::new(16).expect("datagram capacity is non-zero"),
             close_timeout: Duration::from_secs(1),
         };
-        let slots = veloq_std::vec![ReceiveSlot::new(0, buffer(4))].into_boxed_slice();
+        let slots = vec![ReceiveSlot::new(0, buffer(4))].into_boxed_slice();
         ReceivePumpState::try_new(config, slots).expect("test UDP pump should be valid")
     }
 
@@ -2755,7 +2771,7 @@ mod tests {
         );
         assert_eq!(descriptor.erased.name, name, "{name}: descriptor name");
         assert!(
-            core::ptr::eq(op.descriptor(), &descriptor.erased),
+            eq(op.descriptor(), &descriptor.erased),
             "{name}: descriptor erased view"
         );
         assert!(
@@ -3143,7 +3159,7 @@ mod tests {
         let registrar = NoopRegistrar;
         let env = test_sqe_env(&file_table, &registrar);
 
-        // SQE construction and completion report the same internal mismatch class.
+        // SQE construction and completion report the same internal mismatch class. SQE 构造与完成路径报告相同的内部不匹配类别。
         let (read_op, _) = read_raw_parts();
         let result = with_test_slot_pair(read_op, write_raw_payload(), |token, slot| {
             with_test_access(slot, |access| unsafe {
@@ -3166,7 +3182,7 @@ mod tests {
         .expect("test operation access should succeed");
         assert_internal_error(result);
 
-        // Cleanup is result-only and deliberately does not project either payload.
+        // Cleanup is result-only and deliberately does not project either payload. cleanup 只依赖结果值，不投影任一 payload。
         let wrong_op = wrong_kernel_op();
         let _cleanup = (wrong_op.descriptor().completion_cleanup)(0);
 
@@ -3257,14 +3273,16 @@ mod tests {
     /// Reads `io_uring_sqe.addr`, which is the second 64-bit union field in the C ABI SQE.
     /// The offset and size are asserted here so this test fails if the dependency changes the
     /// layout it exposes to the opcode builders.
+    /// 读取 `io_uring_sqe.addr`（C ABI SQE 中第二个 64 位 union 字段）；偏移和大小断言可发现依赖布局变化。
     fn sqe_addr(entry: &squeue::Entry) -> usize {
         const ADDR_OFFSET: usize = 16;
         assert_eq!(size_of::<squeue::Entry>(), 64);
         // SAFETY: `Entry` is `#[repr(C)]` around the dependency's 64-byte `io_uring_sqe`, and
         // the binding places its `addr` union at byte offset 16. `read_unaligned` permits the
         // byte-level inspection without imposing an alignment assumption on the test mirror.
+        // 安全性：`Entry` 以 `repr(C)` 包装 64 字节 SQE，绑定将 `addr` 放在偏移 16；`read_unaligned` 不假设测试镜像对齐。
         unsafe {
-            core::ptr::read_unaligned(
+            read_unaligned(
                 (entry as *const squeue::Entry)
                     .cast::<u8>()
                     .add(ADDR_OFFSET)
@@ -3283,6 +3301,7 @@ mod tests {
         };
         // Moving this operation through the descriptor layer is valid before make_sqe establishes
         // any self-reference.
+        // 在 `make_sqe` 建立自引用之前，通过 descriptor 层移动该 operation 是安全的。
         let file_table = FileTable::new(0, FileTableExhaustion::Fallback);
         let registrar = NoopRegistrar;
         let env = test_sqe_env(&file_table, &registrar);

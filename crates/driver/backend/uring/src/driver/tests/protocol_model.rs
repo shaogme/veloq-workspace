@@ -1,10 +1,10 @@
-use veloq_driver_core::{
-    driver::{CancelMode, CancelTicket, OpToken},
-    slot::Generation,
-};
+use core::slice;
+
+use veloq_driver_core::driver::{CancelMode, CancelTicket, OpToken};
 use veloq_std::{vec, vec::Vec};
 
 /// 提交边界的协议回执。每种回执都携带完整的消费证据。
+/// Protocol receipts at the submission boundary; each variant carries complete consumption evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SubmissionScope {
     Enter,
@@ -149,9 +149,11 @@ struct StagedRecord {
 }
 
 /// 无内核依赖的 staged ledger 模型。
+/// Kernel-independent model of the staged submission ledger.
 ///
 /// 模型刻意保留记录直到显式 CQE 结算，因此 Published 不能被误认为
 /// KernelOutstanding，Unknown 也不会留下可重试的 SQE。
+/// The model retains records until CQE settlement, keeping Published distinct from KernelOutstanding and preventing retries after Unknown.
 struct StagedLedger {
     capacity: usize,
     records: Vec<StagedRecord>,
@@ -166,10 +168,11 @@ impl StagedLedger {
     }
 
     fn stage(&mut self, entry: StageEntry) -> Result<(), LedgerError> {
-        self.stage_batch(core::slice::from_ref(&entry))
+        self.stage_batch(slice::from_ref(&entry))
     }
 
     /// 预检整个批次后再写入，模拟 SQ 写入 Full 时事务整体回滚。
+    /// Validates the whole batch before staging so an SQ-full result rolls back atomically.
     fn stage_batch(&mut self, entries: &[StageEntry]) -> Result<(), LedgerError> {
         if self.records.len() + entries.len() > self.capacity {
             return Err(LedgerError::Capacity);
@@ -362,6 +365,7 @@ struct BacklogLink {
 }
 
 /// 固定容量的双向 backlog 链表模型。
+/// Fixed-capacity doubly linked backlog model.
 struct BacklogLedger {
     links: Vec<BacklogLink>,
     head: Option<usize>,
@@ -487,6 +491,7 @@ struct CancelIntent {
 }
 
 /// 取消目标账本模型：重复 target 只产生一个 ticket，并将 ENOENT 延迟到收割同步点。
+/// Models cancellation intents: duplicate targets share one ticket, and ENOENT is reconciled at the harvest synchronization point.
 struct CancelReconcileLedger {
     capacity: usize,
     intents: Vec<CancelIntent>,
@@ -636,7 +641,15 @@ impl CancelReconcileLedger {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        BacklogEntry, BacklogError, BacklogLedger, CancelReconcileLedger, CancelReconcileOutcome,
+        CancelSubmitOutcome, LedgerError, StageEntry, StagePhase, StagedLedger, SubmissionError,
+        SubmissionReceipt,
+    };
+    use veloq_driver_core::{
+        driver::{CancelMode, CancelTicket, OpToken},
+        slot::Generation,
+    };
 
     fn token(index: usize, generation: u32) -> OpToken {
         OpToken::from_registry_parts(index, Generation::new(generation)).expect("test token")

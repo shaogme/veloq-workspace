@@ -15,6 +15,7 @@
 //! unregister, and close operations. See [`FileTable::resolve`].
 //!
 //! [`RegisterFd::Owned`]: veloq_driver_core::driver::RegisterFd::Owned
+//! 此表镜像内核固定文件表，并以 generation 或 owner identity 校验描述符；只有 owned direct 描述符由驱动持有。
 
 use crate::{
     config::{FileTableExhaustion, IoFd, OwnedRawHandle, RawHandleKind, UringRawHandle},
@@ -28,11 +29,14 @@ use veloq_std::{collections::HashMap, format, mem, string::ToString, vec, vec::V
 const INITIAL_FILE_GENERATION: u64 = 1;
 
 /// How a resolved descriptor is spelled in an SQE.
+/// 描述已解析文件描述符在 SQE 中采用的形式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SqeFd {
     /// An index into the kernel's registered file table; the SQE sets `IOSQE_FIXED_FILE`.
+    /// 内核注册文件表中的索引；SQE 会设置 `IOSQE_FIXED_FILE`。
     Fixed(u32),
     /// A raw descriptor, submitted without the registered-file fast path.
+    /// 直接提交 raw descriptor，不走注册文件表快速路径。
     Direct(i32),
 }
 
@@ -41,6 +45,7 @@ pub(crate) enum SqeFd {
 /// The operation token prevents a late completion from being reused with another close, while
 /// the embedded `IoFd` keeps fixed-slot generation or direct-owner identity attached to the same
 /// effect. Executors must pass this ticket through unchanged.
+/// ticket 将完成 token 与描述符身份绑定，避免迟到的完成作用于其他关闭操作；执行方必须原样传递。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OwnedFdOwnershipTicket {
     operation: OpToken,
@@ -92,10 +97,12 @@ enum FileSlotState {
     ///
     /// This covers both a fresh claim before the kernel update and the short interval where a
     /// live entry is held by a cleanup transaction. `descriptor` intentionally ignores it.
+    /// 此状态包括内核更新前的新占用，以及清理事务暂存 live entry 的阶段；解析描述符时会忽略该槽位。
     Reserved,
     Occupied,
     Quarantined,
     /// The generation counter is exhausted; this slot is never reusable.
+    /// generation 计数耗尽后，此槽位永久不可复用。
     Retired,
 }
 
@@ -182,6 +189,7 @@ impl FileSlot {
 
 pub(crate) struct FileTable {
     /// One slot per kernel table entry; `slots.len() == fixed_capacity` once initialized.
+    /// 初始化后每个内核表项对应一个槽位。
     slots: Vec<FileSlot>,
     fixed_capacity: usize,
     free_fixed: Vec<u32>,
@@ -190,11 +198,13 @@ pub(crate) struct FileTable {
     /// Only [`RegisterFd::Owned`](veloq_driver_core::driver::RegisterFd::Owned) registrations
     /// that fall back to direct descriptors land here. A borrowed fallback descriptor is
     /// nothing but the number in the `IoFd`.
+    /// 仅回退为 direct 的 owned 注册存放于此；借用型回退描述符只在 `IoFd` 中携带 fd 数值。
     direct_owned: HashMap<DirectOwnerId, OwnedRawHandle>,
     /// Raw descriptor numbers currently held by an owned fixed or direct registration.
     ///
     /// This is a duplicate-detection index only. It must never be used to release an owned
     /// handle because raw descriptor numbers can be reused by the operating system.
+    /// 该索引只用于检测重复项，不能用来释放句柄，因为操作系统可能复用 raw fd 数值。
     owned_raw_index: HashMap<i32, OwnedLocation>,
     exhaustion: FileTableExhaustion,
     initialized: bool,
@@ -229,6 +239,7 @@ impl FileTable {
 
     /// Disable fixed-file slots before initialization when the kernel does not support the
     /// sparse resource ABI and the configured policy allows raw-fd fallback.
+    /// 当内核不支持 sparse resource ABI 且策略允许 raw fd 回退时，可在初始化前禁用固定槽位。
     pub(crate) fn disable_fixed_table(&mut self) {
         debug_assert!(!self.initialized);
         debug_assert!(self.slots.is_empty());
@@ -249,6 +260,7 @@ impl FileTable {
     ///
     /// Existing entries are deliberately retained. The ring must be destroyed before those
     /// entries are dropped, because the kernel may still refer to an unknown table value.
+    /// 已有条目会继续保留；必须先销毁 ring 再释放条目，因为内核可能仍引用未知表值。
     pub(crate) fn poison(&mut self, context: FileTablePoisonContext) -> bool {
         if self.is_poisoned() {
             return false;
@@ -301,6 +313,7 @@ impl FileTable {
     ///
     /// Callers must have registered a sparse table of `fixed_capacity` entries first (or have
     /// nothing to register, when the capacity is zero).
+    /// 调用方须先注册容量匹配的 sparse table；容量为零时无需注册。
     pub(crate) fn mark_initialized(&mut self) {
         debug_assert!(!self.initialized, "file table initialized twice");
         self.slots = (0..self.fixed_capacity)
@@ -322,6 +335,7 @@ impl FileTable {
     }
 
     /// Whether a registered descriptor still names the registration it was handed out for.
+    /// 判断注册描述符是否仍指向发放时对应的注册项。
     #[inline]
     pub(crate) fn matches_generation(&self, index: u32, generation: u64) -> bool {
         self.generation(index) == Some(generation)
@@ -336,6 +350,7 @@ impl FileTable {
     /// carries its handle, so the kind check reads straight off it and no lookup happens at all.
     /// An owned direct descriptor performs an owner identity lookup before it is accepted,
     /// preventing a stale descriptor from naming a reused raw fd.
+    /// 按描述符种类分别检查固定槽位 generation、借用句柄类型或 owned direct 的 owner identity。
     pub(crate) fn resolve(
         &self,
         fd: IoFd,
@@ -414,6 +429,7 @@ impl FileTable {
     }
 
     /// Resolves an `IoFd` into `SqeFd::Direct`, bypassing `IOSQE_FIXED_FILE` for multishot operations.
+    /// 为 multishot 操作解析为 `SqeFd::Direct`，绕过 `IOSQE_FIXED_FILE`。
     pub(crate) fn resolve_direct(
         &self,
         fd: IoFd,
@@ -499,6 +515,7 @@ impl FileTable {
     ///
     /// With [`FileTableExhaustion::Fail`] a short claim is an error instead, and nothing is
     /// consumed.
+    /// 按升序预留固定槽位；容量不足时返回短批次供 direct 回退。`Fail` 策略下短批次报错且不消耗槽位。
     pub(crate) fn claim(&mut self, count: usize) -> UringResult<Vec<u32>> {
         if self.is_poisoned() {
             return Err(self.poisoned_report("driver.file_table.claim", None));
@@ -533,6 +550,7 @@ impl FileTable {
         }
         // The free list is seeded in reverse, so a fresh table hands out consecutive indices;
         // sorting keeps that property visible to the batching in `register_files_internal`.
+        // 空闲链表逆序初始化以便连续分配；排序后批处理仍可利用连续索引。
         fixed.sort_unstable();
 
         if overflow > 0 {
@@ -600,6 +618,7 @@ impl FileTable {
     }
 
     /// Returns the current owned registration for `raw`, if any.
+    /// 若存在，返回 `raw` 当前对应的 owned 注册。
     #[inline]
     pub(crate) fn owned_location(&self, raw: UringRawHandle) -> Option<OwnedLocation> {
         self.owned_raw_index.get(&raw.as_fd()).copied()
@@ -610,6 +629,7 @@ impl FileTable {
     /// The handle stays parked here until [`Self::release_direct`] retires it, which is what
     /// keeps a `RegisterFd::Owned` fallback registration open for as long as its descriptor
     /// is valid.
+    /// 接管 owned direct descriptor 对应的句柄，并在 descriptor 注销前持续持有该句柄。
     pub(crate) fn adopt_direct(&mut self, handle: OwnedRawHandle) -> UringResult<IoFd> {
         let raw = handle.raw();
         if let Some(location) = self.owned_location(raw) {
@@ -622,6 +642,7 @@ impl FileTable {
                 .with_ctx("existing_location", format!("{location:?}"));
             // This is an internal invariant failure after registration preflight. Do not let
             // the duplicate wrapper close the descriptor held by the existing registration.
+            // 注册预检后的内部不变量失败；禁止重复封装关闭现有注册持有的描述符。
             mem::forget(handle);
             return Err(report);
         }
@@ -644,6 +665,7 @@ impl FileTable {
     }
 
     /// Whether the driver holds the handle behind this owned direct descriptor.
+    /// 判断驱动是否持有该 owned direct descriptor 对应的句柄。
     #[inline]
     pub(crate) fn owns_direct(&self, fd: IoFd) -> bool {
         let IoFd::OwnedDirect { handle: raw, owner } = fd else {
@@ -662,6 +684,7 @@ impl FileTable {
     ///
     /// Dropping the returned handle closes the fd; callers whose descriptor was already closed
     /// by the kernel must forget it instead.
+    /// owner identity 匹配时退役 direct descriptor 并返回句柄；若内核已关闭 descriptor，调用方须遗忘句柄以免重复关闭。
     pub(crate) fn release_direct(&mut self, fd: IoFd) -> Option<OwnedRawHandle> {
         let IoFd::OwnedDirect { handle: raw, owner } = fd else {
             return None;
@@ -681,6 +704,7 @@ impl FileTable {
     }
 
     /// Stores the handle backing `index`. The slot must have been claimed first.
+    /// 保存 `index` 对应的句柄；调用前必须先占用槽位。
     #[inline]
     pub(crate) fn install_entry(&mut self, index: u32, entry: RegisteredFileEntry) {
         debug_assert_eq!(
@@ -724,6 +748,7 @@ impl FileTable {
     }
 
     /// Replaces the entry in a live fixed slot while maintaining the owned indexes.
+    /// 替换 live 固定槽位中的条目，并同步维护 owned 索引。
     pub(crate) fn replace_entry(
         &mut self,
         index: u32,
@@ -756,6 +781,7 @@ impl FileTable {
     }
 
     /// Returns `index` to the free list. The entry must already be gone.
+    /// 将 `index` 放回空闲链表前，槽位条目必须已移除。
     pub(crate) fn release(&mut self, index: u32) {
         if self.is_poisoned() {
             return;
@@ -779,6 +805,7 @@ impl FileTable {
     /// The caller must have taken the entry first. A quarantined slot deliberately remains out
     /// of `free_fixed` until the driver is destroyed, because the kernel may still contain an
     /// unknown value after a failed cleanup update.
+    /// 隔离槽位不会回到 `free_fixed`，直到驱动销毁；清理更新失败后内核表值可能未知。
     pub(crate) fn quarantine(&mut self, index: u32) {
         let slot = &mut self.slots[index as usize];
         debug_assert!(
@@ -805,6 +832,7 @@ impl FileTable {
     }
 
     /// Invalidates every [`IoFd`] previously handed out for `index`.
+    /// 使此前为 `index` 发放的所有 `IoFd` 失效。
     pub(crate) fn advance_generation(&mut self, index: u32) {
         let Some(slot) = self.slots.get_mut(index as usize) else {
             return;
@@ -824,6 +852,7 @@ impl FileTable {
     /// existing free list and maps remain the operational data structures; this check makes
     /// their relationship with the explicit slot state observable while the commit/abort model
     /// is still being introduced.
+    /// 该调试检查不查询内核，而是核对 Rust 资源账本、空闲链表和显式槽位状态的一致性。
     fn ledger_is_consistent(&self) -> bool {
         let mut free_seen = vec![false; self.slots.len()];
         for &index in &self.free_fixed {
@@ -856,6 +885,7 @@ impl FileTable {
     }
 
     /// The descriptor for `index`, valid until the slot is released.
+    /// 返回 `index` 对应的描述符，其有效期持续到槽位释放。
     #[inline]
     pub(crate) fn descriptor(&self, index: u32) -> Option<IoFd> {
         if self.is_poisoned() {
@@ -869,6 +899,8 @@ impl FileTable {
 
 #[cfg(test)]
 mod tests {
+    use libc::{close, dup2, eventfd};
+
     use super::{FileSlotState, FileTable, FileTablePoisonContext, RegisteredFileEntry, SqeFd};
     use crate::config::{
         FileTableExhaustion, IoFd, OwnedRawHandle, RawHandle, RawHandleKind, UringRawHandle,
@@ -890,14 +922,16 @@ mod tests {
     }
 
     fn owned_eventfd() -> OwnedRawHandle {
-        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        let fd = unsafe { eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         assert!(fd >= 0, "eventfd creation failed");
         // SAFETY: eventfd returns a freshly created descriptor owned by this value.
+        // 安全性：eventfd 返回新建描述符，其所有权归当前值。
         unsafe { OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_file(fd))) }
     }
 
     /// Registers `fds` the way `register_files_internal` does: kernel slots first, the rest as
     /// direct descriptors.
+    /// 按 `register_files_internal` 的规则注册 `fds`：优先使用内核槽位，其余作为 direct descriptor。
     fn register(table: &mut FileTable, fds: &[i32]) -> Vec<IoFd> {
         let claimed = table.claim(fds.len()).expect("claim failed");
         let mut descriptors = Vec::with_capacity(fds.len());
@@ -987,17 +1021,13 @@ mod tests {
         let mut table = table(0, FileTableExhaustion::Fallback);
         let first_handle = owned_eventfd();
         let first_fd = first_handle.raw().as_fd();
-        let replacement_source =
-            unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        let replacement_source = unsafe { eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         assert!(replacement_source >= 0);
         let first = table.adopt_direct(first_handle).unwrap();
 
         drop(table.release_direct(first));
-        assert_eq!(
-            unsafe { libc::dup2(replacement_source, first_fd) },
-            first_fd
-        );
-        assert_eq!(unsafe { libc::close(replacement_source) }, 0);
+        assert_eq!(unsafe { dup2(replacement_source, first_fd) }, first_fd);
+        assert_eq!(unsafe { close(replacement_source) }, 0);
 
         let replacement_handle = unsafe {
             OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_file(first_fd)))
@@ -1054,6 +1084,7 @@ mod tests {
     #[test]
     fn a_direct_descriptor_resolves_without_consulting_the_table() {
         // Nothing was ever registered, yet the descriptor still submits: the fd is in it.
+        // 未执行注册仍可提交，因为 descriptor 自身携带 fd。
         let table = table(4, FileTableExhaustion::Fallback);
         let fd = IoFd::direct(UringRawHandle::for_file(9));
 
@@ -1080,6 +1111,7 @@ mod tests {
 
         assert!(table.claim(1).is_err());
         // The rejected claim must not have consumed anything.
+        // 被拒绝的占用请求不得消耗任何槽位。
         assert!(table.claim(0).is_ok());
     }
 
