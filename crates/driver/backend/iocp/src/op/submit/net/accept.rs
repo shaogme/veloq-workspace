@@ -24,12 +24,12 @@ use veloq_driver_core::{
     driver::{CompletionCleanup, CompletionCleanupGuard},
 };
 
-use super::{mark_socket_header_in_flight, with_borrowed_socket};
+use super::socket::SocketSubmission;
 
 fn socket_family_from_handle(handle: BorrowedRawHandle<'_>) -> IocpResult<u16> {
     let mut storage = SockAddrStorage::default();
     let mut namelen = size_of::<SOCKADDR_STORAGE>() as i32;
-    with_borrowed_socket(handle.raw().as_socket(), |socket| {
+    SocketSubmission::with_borrowed_socket(handle.raw().as_socket(), |socket| {
         // SAFETY: storage and namelen are valid output pointers.
         unsafe { socket.getsockname(&mut storage.0 as *mut _ as *mut SOCKADDR, &mut namelen) }
     })?;
@@ -43,10 +43,10 @@ fn socket_family_from_handle(handle: BorrowedRawHandle<'_>) -> IocpResult<u16> {
 
 fn new_accept_socket(handle: BorrowedRawHandle<'_>) -> IocpResult<OwnedRawHandle> {
     let family = socket_family_from_handle(handle)?;
-    let socket = if family == AF_INET {
-        Socket::new_tcp_v4()
-    } else {
-        Socket::new_tcp_v6()
+    let socket = match family {
+        AF_INET => Socket::new_tcp_v4(),
+        AF_INET6 => Socket::new_tcp_v6(),
+        _ => unreachable!("socket_family_from_handle validates the address family"),
     }
     .map(|socket| socket.into_owned_raw())
     .push_ctx("scope", "submit_accept.create_accept_socket")
@@ -99,7 +99,7 @@ fn submit_accept_ex(
     .with_ctx("user_data", header.token.index())
     .with_ctx("generation", header.token.generation())
     .attach_note("AcceptEx submit failed");
-    mark_socket_header_in_flight(header, inflight, submit_res)
+    SocketSubmission::mark_socket_header_in_flight(header, inflight, submit_res)
 }
 
 pub(crate) fn submit_accept(
@@ -113,18 +113,7 @@ pub(crate) fn submit_accept(
     header.resolved_handle = Some(raw);
     let handle = raw.borrow();
     if payload.accept_socket.is_none() {
-        let family = socket_family_from_handle(handle)?;
-        let accept_socket = if family == AF_INET {
-            Socket::new_tcp_v4()
-        } else {
-            Socket::new_tcp_v6()
-        }
-        .map(|s| s.into_owned_raw())
-        .push_ctx("scope", "submit_accept.create_accept_socket")
-        .with_ctx("listen_handle_raw", handle.raw().as_handle() as usize)
-        .with_ctx("address_family", family)
-        .attach_note("create accept socket failed")?;
-        payload.accept_socket = Some(accept_socket);
+        payload.accept_socket = Some(new_accept_socket(handle)?);
     }
     let accept_socket = payload
         .accept_socket
@@ -176,7 +165,7 @@ pub(crate) fn submit_accept(
     .with_ctx("user_data", header.token.index())
     .with_ctx("generation", header.token.generation())
     .attach_note("AcceptEx submit failed");
-    mark_socket_header_in_flight(header, inflight, submit_res)
+    SocketSubmission::mark_socket_header_in_flight(header, inflight, submit_res)
 }
 
 pub(crate) fn submit_accept_multi(
@@ -257,7 +246,7 @@ pub(crate) unsafe fn on_complete_accept(
     let listen_socket = listen_handle.raw().as_socket();
     let accept_socket_raw = accept_socket.raw().as_socket();
 
-    if let Err(e) = with_borrowed_socket(accept_socket_raw, |socket| {
+    if let Err(e) = SocketSubmission::with_borrowed_socket(accept_socket_raw, |socket| {
         socket.setsockopt(SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, &listen_socket)
     }) {
         return Err(e
@@ -330,7 +319,7 @@ pub(crate) unsafe fn on_complete_accept_multi(
     let listen_socket = listen_handle.raw().as_socket();
     let accept_socket_raw = accept_socket.raw().as_socket();
 
-    if let Err(error) = with_borrowed_socket(accept_socket_raw, |socket| {
+    if let Err(error) = SocketSubmission::with_borrowed_socket(accept_socket_raw, |socket| {
         socket.setsockopt(SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, &listen_socket)
     }) {
         return Err(error

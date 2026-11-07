@@ -13,11 +13,11 @@ mod hooks;
 mod ports;
 mod slot;
 
+#[cfg(test)]
+pub(crate) use hooks::WakerRecovery;
 pub(super) use hooks::{
     COMP_BACKEND_URING, CompletionProgress, UringBackendEffect, UringBackendIngress,
 };
-#[cfg(test)]
-pub(crate) use hooks::WakerRecovery;
 pub(crate) use hooks::{UringCompletionHooks, UringSyntheticCompletion};
 pub(crate) use ports::CompletionBatchProgress;
 pub(super) use ports::CompletionScratch;
@@ -127,18 +127,14 @@ mod tests {
         },
         error::UringError,
     };
+    use libc::{close, fcntl, pipe};
     use veloq_driver_core::driver::{
         CancelTicket, CompletionBackendHooks, CompletionEnvelope, CompletionFlowExt,
-        CompletionFlowOutcome,
-        CompletionIngress, CompletionSettlement, CompletionToken, DriverCompletionDiagnostics,
-        OpToken, RawCompletion, SharedCompletionTable,
+        CompletionFlowOutcome, CompletionIngress, CompletionSettlement, CompletionToken,
+        DriverCompletionDiagnostics, OpToken, RawCompletion, SharedCompletionTable,
     };
     use veloq_driver_core::slot::Generation;
-    use veloq_std::{
-        collections::HashMap,
-        time::Duration,
-    };
-    use libc::{close, fcntl, pipe};
+    use veloq_std::{collections::HashMap, time::Duration};
 
     #[test]
     fn completion_effect_scratch_recycles_without_allocating() {
@@ -349,7 +345,6 @@ mod tests {
                 .finish_backend_effect(effect)
                 .expect("waker rearm effect should be recorded");
             drop(hooks);
-
         }
 
         let snapshot = diagnostics.snapshot().backend;

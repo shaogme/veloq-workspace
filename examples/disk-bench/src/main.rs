@@ -1,7 +1,7 @@
 use clap::{Parser, ValueEnum};
 use rand::prelude::*;
 use veloq::{
-    buf::{UniformSlot, heap::ThreadMemoryMultiplier},
+    buf::UniformSlot,
     fs::{BufferingMode, File, OpenOptions},
     io::buffer::FixedBuf,
     nz,
@@ -446,17 +446,16 @@ fn main() {
 
     // Initialize Runtime
     let worker_count = NonZeroUsize::new(args.threads);
-    let buffer_multiplier_bytes = args
+    let per_thread_buffer_bytes = args
         .qdepth
         .saturating_mul(block_size_bytes.get())
         .saturating_mul(2);
-    let multiplier_units =
-        (buffer_multiplier_bytes.saturating_add(4 * 1024 * 1024 - 1)) / (4 * 1024 * 1024);
-    let multiplier =
-        NonZeroUsize::new(multiplier_units.max(1)).expect("multiplier must be non-zero");
+    let pool_capacity_bytes = per_thread_buffer_bytes
+        .saturating_mul(args.threads)
+        .max(4 * 1024);
 
     // Execute
-    Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(multiplier)))
+    Runtime::builder(UniformSlot::new(pool_capacity_bytes))
         .worker_count(worker_count)
         .scope(async |ctx| {
             scope!(ctx, async |s| {

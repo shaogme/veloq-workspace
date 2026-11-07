@@ -20,7 +20,6 @@ use crate::{
     },
 };
 use diagweave::prelude::*;
-use veloq_buf::BufferRegistrar;
 use veloq_driver_core::{
     driver::{
         AnomalyAttach, CompletionAnomalyKind, CompletionFlowExt, CompletionIngress, RawCompletion,
@@ -87,7 +86,6 @@ pub(crate) struct RioCompletionService;
 pub(crate) struct CompletionPollArgs<'a> {
     pub(crate) ops: &'a mut IocpOpRegistry,
     pub(crate) ext: &'a Extensions,
-    pub(crate) registrar: &'a dyn BufferRegistrar,
     pub(crate) completion_table: &'a SharedCompletionTable<IocpSlotSpec>,
     pub(crate) diagnostics: &'a mut IocpDriverCompletionDiagnostics,
 }
@@ -164,22 +162,17 @@ impl RioCompletionService {
         let CompletionPollArgs {
             ops,
             ext,
-            registrar,
             completion_table,
             diagnostics,
         } = args;
         const MAX_RIO_RESULTS: usize = 128;
         let mut results: [RIORESULT; MAX_RIO_RESULTS] = unsafe { zeroed() };
-        if core
-            .kernel()
-            .env(registrar, core.registration_mode())
-            .is_none()
-        {
+        if core.kernel().env().is_none() {
             return Ok(0);
         }
         let outcome = {
             let mut completions_found = false;
-            let mut hooks = RioCompletionHooks::new(core, runtime, registrar, ext);
+            let mut hooks = RioCompletionHooks::new(core, runtime, ext);
 
             loop {
                 let count = hooks.core_mut().kernel_mut().dequeue(&mut results);
@@ -282,7 +275,7 @@ impl RioCompletionService {
         }
 
         if outcome.outstanding_count == 0 {
-            let (registry, env) = core.registry_with_env(registrar).into_parts();
+            let (registry, env) = core.registry_with_env().into_parts();
             if let Some(env) = env {
                 registry.flush_deregs(env);
             }

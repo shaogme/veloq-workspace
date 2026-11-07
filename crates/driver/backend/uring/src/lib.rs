@@ -19,9 +19,9 @@ mod op;
 mod test_alloc;
 
 pub use config::{
-    BorrowedRawHandle, BufferRegistrationMode, DirectOwnerId, FileTableExhaustion, IoFd, IoMode,
-    MAX_PROVIDED_BUF_ENTRIES, OwnedRawHandle, ProvidedBufConfig, RawHandle, RawHandleKind,
-    SetupFlags, SetupPolicy, SockAddrStorage, UringConfig, UringDriveLimits, UringRawHandle,
+    BorrowedRawHandle, DirectOwnerId, FileTableExhaustion, IoFd, IoMode, MAX_PROVIDED_BUF_ENTRIES,
+    OwnedRawHandle, ProvidedBufConfig, RawHandle, RawHandleKind, SetupFlags, SetupPolicy,
+    SockAddrStorage, UringConfig, UringDriveLimits, UringRawHandle,
 };
 pub use diagnostics::{
     KERNEL_BASELINE, UringCompletionDiagnostics, UringCompletionDiagnosticsSnapshot,

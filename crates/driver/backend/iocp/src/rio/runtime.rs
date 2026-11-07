@@ -205,10 +205,9 @@ impl RioRuntime {
     ) -> RioResult<()> {
         let state = self.socket_runtime_mut(actor_key);
         let counter = match op_kind {
-            RioOpKind::Recv
-            | RioOpKind::RecvProvided
-            | RioOpKind::TcpRecvMulti
-            | RioOpKind::UdpRecvMulti => &mut state.receive_inflight,
+            RioOpKind::Recv | RioOpKind::TcpRecvMulti | RioOpKind::UdpRecvMulti => {
+                &mut state.receive_inflight
+            }
             RioOpKind::Send | RioOpKind::SendTo => &mut state.send_inflight,
         };
         *counter = counter.checked_add(1).ok_or_else(|| {
@@ -265,10 +264,7 @@ impl RioRuntime {
                     .attach_note("RIO request release without socket runtime")
             })?;
             match op_kind {
-                RioOpKind::Recv
-                | RioOpKind::RecvProvided
-                | RioOpKind::TcpRecvMulti
-                | RioOpKind::UdpRecvMulti => {
+                RioOpKind::Recv | RioOpKind::TcpRecvMulti | RioOpKind::UdpRecvMulti => {
                     if state.receive_inflight == 0 {
                         return RioError::Internal
                             .with_ctx("socket_raw", actor_key.as_handle() as usize)

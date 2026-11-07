@@ -1,5 +1,7 @@
 use diagweave::{Report, set};
-use veloq_std::{borrow::Cow, error::Error, fmt, result::Result as StdResult, string::String};
+use veloq_std::{
+    borrow::Cow, boxed::Box, error::Error, fmt, result::Result as StdResult, string::String,
+};
 
 /// 本地任务无法发布到 owner worker 队列时的结构化原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +84,27 @@ impl fmt::Display for RuntimeDriverError {
 
 impl Error for RuntimeDriverError {}
 
+#[derive(Debug)]
+pub struct WorkerFactorySource(Box<dyn Error + Send + Sync>);
+
+impl WorkerFactorySource {
+    pub(crate) fn new(source: Box<dyn Error + Send + Sync>) -> Self {
+        Self(source)
+    }
+}
+
+impl fmt::Display for WorkerFactorySource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl Error for WorkerFactorySource {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
 set! {
     pub RuntimeError = {
         #[display("worker id {worker_id} is out of bounds (worker count: {worker_count})")]
@@ -113,6 +136,13 @@ set! {
 
         #[display("worker thread {worker_id} observed cooperative abort")]
         ThreadAborted { worker_id: usize },
+
+        #[display("worker factory failed for worker {worker_id}: {source}")]
+        WorkerFactoryFailed {
+            worker_id: usize,
+            #[source]
+            source: WorkerFactorySource,
+        },
 
         #[display("runtime wait failed on worker {worker_id}: {detail}")]
         WaitFailed {

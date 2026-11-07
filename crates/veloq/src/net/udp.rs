@@ -116,8 +116,7 @@ fn build_receive_operation(
         .validate()
         .map_err(|_| NetError::ReceiveConfigInvalid)
         .trans()?;
-    let buffer_pool = ctx.buf_pool();
-    ctx.driver(|mut driver| driver.build_udp_recv_multi(fd, config, buffer_pool).trans())
+    ctx.driver(|mut driver| driver.build_udp_recv_multi(fd, config).trans())
 }
 
 fn parse_receive_item<'rt>(

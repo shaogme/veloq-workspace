@@ -26,13 +26,10 @@ use crate::{
     op::{CheckedSlotView, RecordPolicy, SlotView, UringOpRegistryExt, UringSlotSpec},
 };
 
-use veloq_driver_core::{
-    driver::{
-        AnomalyAttach, CompletionAnomalyKind, CompletionEnvelope, CompletionFlowOutcome,
-        CompletionFlowExt, CompletionIngress, CompletionToken, DriverCompletionDiagnostics,
-        OpToken, SharedCompletionTable,
-        SyntheticCompletionSource, UserCompletionEvent,
-    },
+use veloq_driver_core::driver::{
+    AnomalyAttach, CompletionAnomalyKind, CompletionEnvelope, CompletionFlowExt,
+    CompletionFlowOutcome, CompletionIngress, CompletionToken, DriverCompletionDiagnostics,
+    OpToken, SharedCompletionTable, SyntheticCompletionSource, UserCompletionEvent,
 };
 
 #[derive(Clone, Copy)]

@@ -20,7 +20,7 @@ use veloq::{
     runtime::Runtime,
     runtime::context::Ctx,
 };
-use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier};
+use veloq_buf::UniformSlot;
 
 static TEMP_FILE_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -48,7 +48,7 @@ fn run_with_runtime<F, R>(f: F) -> R
 where
     F: for<'s> AsyncFnOnce(Ctx<'s>) -> R,
 {
-    Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(4))))
+    Runtime::builder(UniformSlot::new(4 * 4 * 1024 * 1024))
         .worker_count(Some(nz!(1)))
         .scope(f)
         .expect("failed to run scope")

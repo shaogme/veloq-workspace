@@ -1,17 +1,22 @@
 mod cancellation;
 mod completion;
 mod lifecycle;
+mod overlapped;
 mod polling;
 mod registration;
 mod state;
 mod submission;
 
-use veloq_std::{boxed::Box, format, sync::Arc, time::Duration, vec::Vec};
+use veloq_std::{
+    boxed::Box, format, marker::PhantomData, mem::size_of, num::NonZeroUsize, sync::Arc,
+    time::Duration, vec::Vec,
+};
 
 use diagweave::prelude::*;
-use veloq_buf::{AnyBufPool, BufPool, BufferRegistrar, FixedBuf, heap::ChunkId};
+use veloq_buf::{AnyBufPool, BufPool, BufferRegistrationRequest, FixedBuf};
 
 use lifecycle::LifecycleService;
+pub(crate) use overlapped::OverlappedRegistry;
 use registration::RegistrationService;
 use submission::{SubmissionService, SubmitContextInternal, SubmitResolution};
 use tracing::debug;
@@ -24,6 +29,7 @@ use crate::{
     IocpResult,
     config::{IoFd, IocpConfig, IocpHandle},
     error::IocpError,
+    net::addr::SockAddrStorage,
     op::{IocpOp, IocpSlotSpec, IocpUserPayload},
     win32::IoCompletionPort,
 };
@@ -31,9 +37,10 @@ use crate::{
 use veloq_driver_core::{
     driver::{
         BufferRegistrationStatus, CancelRequest, CancelSubmitOutcome, CompletionToken, DriveMode,
-        DriveOutcome, DriverRaw, DriverSubmitResult, OpToken, RegisterFd, RemoteCancelSender,
-        RemoteWaker, SharedCompletionTable, SharedSlotTable, SubmitStatus,
-        UdpReceiveOperationBuilder, registry::OpEntry, sealed,
+        DriveOutcome, DriverRaw, DriverStartup, DriverStartupRequirements, DriverStartupResources,
+        DriverSubmitResult, OpToken, RegisterFd, RemoteCancelSender, RemoteWaker,
+        SharedCompletionTable, SharedSlotTable, SubmitStatus, UdpReceiveOperationBuilder,
+        registry::OpEntry, sealed,
     },
     op::types::UdpRecvMulti,
     platform::receive_pump::{ReceivePumpState, ReceiveSlot, UdpReceiveConfig},
@@ -63,33 +70,39 @@ use state::IocpDriverState;
 /// 管理 I/O completion port 和操作的 IOCP driver 实现。
 /// Implements the IOCP driver that manages I/O completion ports and operations.
 pub struct IocpDriver<'a> {
-    /// registrar 仅由活动中的 driver 借用；延迟清理可能晚于 registrar 所有者，因此不得保留此借用。
-    /// The registrar is borrowed only by the live driver; deferred cleanup may outlive its owner and must not retain the borrow.
-    registrar: &'a (dyn BufferRegistrar + 'a),
+    _lifetime: PhantomData<&'a ()>,
     state: Option<Box<IocpDriverState>>,
 }
 
 impl<'a> IocpDriver<'a> {
     /// 使用给定配置创建 IOCP driver。 / Creates an IOCP driver with the given configuration.
-    pub fn new(
-        config: impl AsRef<IocpConfig>,
-        registrar: &'a (dyn BufferRegistrar + 'a),
-    ) -> IocpResult<Self> {
-        let state = LifecycleService::build(config, registrar)?;
-        Ok(Self {
-            registrar,
-            state: Some(Box::new(state)),
-        })
+    pub fn new(config: impl AsRef<IocpConfig>) -> IocpResult<Self> {
+        let config_ref = config.as_ref();
+        let requirements = <Self as DriverStartup>::startup_requirements(config_ref, &[0])?;
+        let address_permit = if let Some(bytes) = requirements.locked_memory_bytes_per_worker() {
+            config_ref
+                .get_locked_memory_budget()
+                .try_reserve_repeated_unaligned(bytes.get(), 1)
+                .map_err(|error| {
+                    IocpError::InvalidInput
+                        .to_report()
+                        .with_ctx("charge_error", format!("{error:?}"))
+                        .attach_note("failed to reserve RIO address scratch budget")
+                })?
+                .and_then(|mut permits| permits.pop())
+        } else {
+            None
+        };
+        Self::new_with_startup_resources(config, DriverStartupResources::new(address_permit))
     }
 
     fn close_impl(&mut self, mode: CloseMode) -> IocpResult<()> {
         if self.state.is_none() {
             return Ok(());
         }
-        let registrar = self.registrar;
         let schedule_reaper = {
             let mut view = self.state_mut().lifecycle_view();
-            LifecycleService::new(&mut view, registrar).close_impl(mode)?
+            LifecycleService::new(&mut view).close_impl(mode)?
         };
         if schedule_reaper {
             LifecycleService::schedule_deferred_cleanup(self.take_state());
@@ -103,25 +116,21 @@ impl<'a> IocpDriver<'a> {
     }
 
     fn cancel_op_internal(&mut self, request: CancelRequest) -> IocpResult<CancelSubmitOutcome> {
-        let registrar = self.registrar;
         let mut view = self.state_mut().cancellation_view();
-        cancellation::CancellationService::new(&mut view, registrar).cancel_op_internal(request)
+        cancellation::CancellationService::new(&mut view).cancel_op_internal(request)
     }
 
     fn get_completion(&mut self, timeout: Option<Duration>) -> IocpResult<()> {
-        let registrar = self.registrar;
         let mut view = self.state_mut().polling_view();
-        polling::PollingService::new(&mut view, registrar).get_completion(timeout)
+        polling::PollingService::new(&mut view).get_completion(timeout)
     }
 
     fn register_buffer_backend(
         &mut self,
-        id: ChunkId,
-        ptr: *const u8,
-        len: usize,
+        request: BufferRegistrationRequest,
     ) -> IocpResult<BufferRegistrationStatus> {
         let mut view = self.state_mut().registration_view();
-        RegistrationService::new(&mut view).register_buffer_backend(id, ptr, len)
+        RegistrationService::new(&mut view).register_buffer_backend(request)
     }
 
     fn register_files<'h>(
@@ -202,6 +211,40 @@ impl<'a> IocpDriver<'a> {
 
 impl<'a> sealed::Sealed for IocpDriver<'a> {}
 
+impl DriverStartup for IocpDriver<'_> {
+    type Config = IocpConfig;
+    type StartupError = IocpError;
+
+    fn startup_requirements(
+        config: &Self::Config,
+        workers: &[usize],
+    ) -> IocpResult<DriverStartupRequirements> {
+        if workers.is_empty() {
+            return Ok(DriverStartupRequirements::none());
+        }
+        let bytes = (config.entries().get() as usize)
+            .checked_mul(size_of::<SockAddrStorage>())
+            .and_then(NonZeroUsize::new)
+            .ok_or_else(|| {
+                IocpError::InvalidInput
+                    .to_report()
+                    .attach_note("RIO address scratch size overflow")
+            })?;
+        Ok(DriverStartupRequirements::locked_memory_per_worker(bytes))
+    }
+
+    fn new_with_startup_resources(
+        config: impl AsRef<Self::Config>,
+        mut resources: DriverStartupResources,
+    ) -> IocpResult<Self> {
+        let state = LifecycleService::build(config, resources.take_locked_memory_permit())?;
+        Ok(Self {
+            _lifetime: PhantomData,
+            state: Some(Box::new(state)),
+        })
+    }
+}
+
 impl<'a> UdpReceiveOperationBuilder for IocpDriver<'a> {
     type BuildError = IocpError;
 
@@ -209,7 +252,6 @@ impl<'a> UdpReceiveOperationBuilder for IocpDriver<'a> {
         &mut self,
         fd: IoFd,
         config: UdpReceiveConfig,
-        buffer_pool: AnyBufPool,
     ) -> IocpResult<UdpRecvMulti<Self::Raw>> {
         let config = config.validate().map_err(|error| {
             IocpError::InvalidInput
@@ -220,10 +262,23 @@ impl<'a> UdpReceiveOperationBuilder for IocpDriver<'a> {
                 .with_ctx("build_error", format!("{error:?}"))
         })?;
         let pump_config = config.into_pump_config();
-        let mut slots = Vec::with_capacity(pump_config.kernel_capacity.get());
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(pump_config.kernel_capacity.get())
+            .map_err(|error| {
+                IocpError::Submission
+                    .report(
+                        "iocp.udp_recv_multi.build",
+                        "failed to reserve backend receive slots",
+                    )
+                    .with_ctx("slot_count", pump_config.kernel_capacity.get())
+                    .attach_note(format!("receive slot allocation failed: {error}"))
+            })?;
         for slot_id in 0..pump_config.kernel_capacity.get() {
-            let buffer = buffer_pool
-                .alloc(pump_config.datagram_capacity, 0)
+            let buffer = self
+                .state()
+                .buffer_pool()
+                .and_then(|pool| pool.alloc(pump_config.datagram_capacity, 0))
                 .or_else(|| FixedBuf::alloc_heap(pump_config.datagram_capacity, 0).ok())
                 .ok_or_else(|| {
                     IocpError::Submission
@@ -249,6 +304,7 @@ impl<'a> UdpReceiveOperationBuilder for IocpDriver<'a> {
 impl<'a> DriverRaw for IocpDriver<'a> {
     type SlotSpec = IocpSlotSpec;
     type Raw = IocpHandle;
+    const BACKEND_NAME: &'static str = "iocp";
 
     fn reserve_op_raw(&mut self) -> IocpResult<OpToken> {
         let state = self.state_mut();
@@ -331,9 +387,8 @@ impl<'a> DriverRaw for IocpDriver<'a> {
             }
         };
 
-        let registrar = self.registrar;
         let mut view = self.state_mut().submission_view();
-        let result = match SubmissionService::new(&mut view, registrar).call_op_submit(token, op) {
+        let result = match SubmissionService::new(&mut view).call_op_submit(token, op) {
             Ok(res) => res,
             Err(e) => {
                 return DriverSubmitResult::failed(
@@ -419,11 +474,9 @@ impl<'a> DriverRaw for IocpDriver<'a> {
 
     fn register_buffer_raw(
         &mut self,
-        id: ChunkId,
-        ptr: *const u8,
-        len: usize,
+        request: BufferRegistrationRequest,
     ) -> IocpResult<BufferRegistrationStatus> {
-        IocpDriver::register_buffer_backend(self, id, ptr, len)
+        IocpDriver::register_buffer_backend(self, request)
             .push_ctx("scope", "iocp/driver")
             .attach_note("register buffer failed")
     }
@@ -441,6 +494,10 @@ impl<'a> DriverRaw for IocpDriver<'a> {
 
     fn create_waker_raw(&self) -> Arc<dyn RemoteWaker<IocpError>> {
         IocpDriver::create_waker(self)
+    }
+
+    fn attach_buffer_pool_raw(&mut self, pool: AnyBufPool) -> IocpResult<()> {
+        self.state_mut().retain_buffer_pool(pool)
     }
 }
 

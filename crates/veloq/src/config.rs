@@ -1,9 +1,9 @@
+pub use veloq_buf::LockedMemoryBudget;
 use veloq_std::{num::NonZeroUsize, nz};
 
 pub use veloq_blocking::BlockingPoolConfig;
 pub use veloq_driver_native::config::{
-    BufferRegistrationMode, FileTableExhaustion, IocpConfig, ProvidedBufConfig, UringConfig,
-    UringDriveLimits,
+    FileTableExhaustion, IocpConfig, ProvidedBufConfig, UringConfig, UringDriveLimits,
 };
 
 #[cfg(not(windows))]
@@ -104,26 +104,39 @@ impl Config {
         }
     }
 
-    #[cfg(windows)]
-    pub fn iocp_registration_mode(mut self, mode: BufferRegistrationMode) -> Self {
-        self.iocp = self.iocp.registration_mode(mode);
+    pub fn locked_memory_limit(mut self, limit_bytes: usize) -> Self {
+        #[cfg(windows)]
+        {
+            self.iocp = self.iocp.locked_memory_limit(limit_bytes);
+        }
+        #[cfg(not(windows))]
+        {
+            self.uring = self.uring.locked_memory_limit(limit_bytes);
+        }
         self
     }
 
-    #[cfg(not(windows))]
-    pub fn iocp_registration_mode(self, _mode: BufferRegistrationMode) -> Self {
+    pub fn locked_memory_budget(mut self, budget: LockedMemoryBudget) -> Self {
+        #[cfg(windows)]
+        {
+            self.iocp = self.iocp.locked_memory_budget(budget);
+        }
+        #[cfg(not(windows))]
+        {
+            self.uring = self.uring.locked_memory_budget(budget);
+        }
         self
     }
 
-    #[cfg(not(windows))]
-    pub fn uring_registration_mode(mut self, mode: BufferRegistrationMode) -> Self {
-        self.uring.registration_mode = mode;
-        self
-    }
-
-    #[cfg(windows)]
-    pub fn uring_registration_mode(self, _mode: BufferRegistrationMode) -> Self {
-        self
+    pub fn get_locked_memory_budget(&self) -> LockedMemoryBudget {
+        #[cfg(windows)]
+        {
+            self.iocp.get_locked_memory_budget()
+        }
+        #[cfg(not(windows))]
+        {
+            self.uring.get_locked_memory_budget()
+        }
     }
 
     /// 为每个 worker 配置并注册一组 provided buffer（io_uring 5.19+）。 / Configures and registers provided buffers per worker (io_uring 5.19+).
@@ -132,7 +145,7 @@ impl Config {
     /// Uses [`ProvidedBufConfig::default`] by default; this customizes ring entries and per-buffer capacity while provided buffers stay enabled.
     #[cfg(not(windows))]
     pub fn uring_provided_buffers(mut self, provided_buffers: ProvidedBufConfig) -> Self {
-        self.uring.provided_buffers = provided_buffers;
+        self.uring = self.uring.provided_buffers(provided_buffers);
         self
     }
 
@@ -151,16 +164,5 @@ impl Config {
 
     pub(crate) fn get_queue_capacity(&self) -> NonZeroUsize {
         self.queue_capacity
-    }
-
-    pub fn registration_mode(&self) -> BufferRegistrationMode {
-        #[cfg(windows)]
-        {
-            self.iocp.get_registration_mode()
-        }
-        #[cfg(not(windows))]
-        {
-            self.uring.registration_mode
-        }
     }
 }

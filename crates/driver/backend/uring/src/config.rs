@@ -1,3 +1,4 @@
+use veloq_buf::LockedMemoryBudget;
 use veloq_driver_core::{
     BorrowedRawHandle as CoreBorrowedRawHandle, IoFd as CoreIoFd,
     OwnedRawHandle as CoreOwnedRawHandle, RawHandle as CoreRawHandle, RawHandleMeta,
@@ -70,31 +71,6 @@ pub struct SockAddrStorage(pub libc::sockaddr_storage);
 impl Default for SockAddrStorage {
     fn default() -> Self {
         Self(unsafe { mem::zeroed() })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum BufferRegistrationMode {
-    /// Fixed-buffer registration is required before a submission can proceed.
-    #[default]
-    Strict,
-    /// Fixed-buffer registration is an optimization; valid operations use raw I/O when it is
-    /// unavailable.
-    Compatible,
-}
-
-impl BufferRegistrationMode {
-    #[inline]
-    pub const fn is_strict(self) -> bool {
-        matches!(self, Self::Strict)
-    }
-
-    #[inline]
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Strict => "strict",
-            Self::Compatible => "compatible",
-        }
     }
 }
 
@@ -228,23 +204,23 @@ impl ProvidedBufConfig {
 
 #[derive(Debug, Clone)]
 pub struct UringConfig {
-    pub mode: IoMode,
-    pub entries: NonZeroU32,
+    mode: IoMode,
+    entries: NonZeroU32,
     /// Setup flags required or explicitly disabled while creating the ring.
-    pub setup_policy: SetupPolicy,
-    pub drive_limits: UringDriveLimits,
-    pub registration_mode: BufferRegistrationMode,
+    setup_policy: SetupPolicy,
+    drive_limits: UringDriveLimits,
+    locked_memory_budget: LockedMemoryBudget,
     /// Provided-buffer ring to register for every driver worker.
-    pub provided_buffers: ProvidedBufConfig,
+    provided_buffers: ProvidedBufConfig,
     /// Size of the kernel's registered (fixed) file table.
     ///
     /// Independent of [`Self::entries`]: submission queue depth bounds how many operations are
     /// in flight, this bounds how many descriptors are registered at once. `0` disables the
     /// table entirely and submits every descriptor as a raw fd. With [`FileTableExhaustion::Fail`],
     /// driver construction also fails when the kernel cannot provide the requested table.
-    pub file_table_capacity: u32,
+    file_table_capacity: u32,
     /// Behaviour once `file_table_capacity` entries are in use.
-    pub file_table_exhaustion: FileTableExhaustion,
+    file_table_exhaustion: FileTableExhaustion,
 }
 
 impl AsRef<UringConfig> for UringConfig {
@@ -261,7 +237,7 @@ impl Default for UringConfig {
             entries: unsafe { NonZeroU32::new_unchecked(1024) },
             setup_policy: SetupPolicy::default(),
             drive_limits: UringDriveLimits::default(),
-            registration_mode: BufferRegistrationMode::Strict,
+            locked_memory_budget: LockedMemoryBudget::default(),
             provided_buffers: ProvidedBufConfig::default(),
             file_table_capacity: DEFAULT_FILE_TABLE_CAPACITY,
             file_table_exhaustion: FileTableExhaustion::Fallback,
@@ -273,6 +249,44 @@ impl Default for UringConfig {
 const DEFAULT_FILE_TABLE_CAPACITY: u32 = 1024;
 
 impl UringConfig {
+    pub const fn mode(&self) -> IoMode {
+        self.mode
+    }
+
+    pub const fn entries(&self) -> NonZeroU32 {
+        self.entries
+    }
+
+    pub const fn get_setup_policy(&self) -> SetupPolicy {
+        self.setup_policy
+    }
+
+    pub const fn get_drive_limits(&self) -> UringDriveLimits {
+        self.drive_limits
+    }
+
+    pub const fn provided_buffer_config(&self) -> ProvidedBufConfig {
+        self.provided_buffers
+    }
+
+    pub const fn get_file_table_capacity(&self) -> u32 {
+        self.file_table_capacity
+    }
+
+    pub const fn get_file_table_exhaustion(&self) -> FileTableExhaustion {
+        self.file_table_exhaustion
+    }
+
+    pub fn with_mode(mut self, mode: IoMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    pub fn with_entries(mut self, entries: NonZeroU32) -> Self {
+        self.entries = entries;
+        self
+    }
+
     /// Sets the required/disabled setup flag policy.
     pub fn setup_policy(mut self, setup_policy: SetupPolicy) -> Self {
         self.setup_policy = setup_policy;
@@ -284,9 +298,18 @@ impl UringConfig {
         self
     }
 
-    pub fn registration_mode(mut self, mode: BufferRegistrationMode) -> Self {
-        self.registration_mode = mode;
+    pub fn locked_memory_limit(mut self, limit_bytes: usize) -> Self {
+        self.locked_memory_budget = LockedMemoryBudget::new(limit_bytes);
         self
+    }
+
+    pub fn locked_memory_budget(mut self, budget: LockedMemoryBudget) -> Self {
+        self.locked_memory_budget = budget;
+        self
+    }
+
+    pub fn get_locked_memory_budget(&self) -> LockedMemoryBudget {
+        self.locked_memory_budget.clone()
     }
 
     pub fn provided_buffers(mut self, provided_buffers: ProvidedBufConfig) -> Self {

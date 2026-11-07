@@ -1,8 +1,13 @@
+use diagweave::DiagnosticResult;
 use veloq_blocking::ThreadPool;
+use veloq_buf::AnyBufPool;
 use veloq_std::sync::{Arc, mpsc};
 
 use crate::{
-    diagnostics::IocpCompletionDiagnostics, error::IocpError, ext::Extensions, op::IocpOpRegistry,
+    diagnostics::IocpCompletionDiagnostics,
+    error::{IocpError, IocpResult},
+    ext::Extensions,
+    op::IocpOpRegistry,
 };
 use veloq_driver_core::driver::{
     CancelRequest, DriverCompletionDiagnostics, RemoteCancelSender, RemoteWaker,
@@ -10,6 +15,7 @@ use veloq_driver_core::driver::{
 
 use super::{
     lifecycle::{IocpRioRuntime, WinsockGuard},
+    overlapped::OverlappedRegistry,
     polling::{CompletionPump, TimerEngine},
     registration::HandleRegistry,
 };
@@ -28,12 +34,14 @@ pub(crate) type IocpDriverCompletionDiagnostics =
 pub(super) struct IocpDriverState {
     completion: CompletionPump,
     ops: IocpOpRegistry,
+    overlapped_registry: OverlappedRegistry,
     extensions: Extensions,
     timer: TimerEngine,
     remote_cancel_sender: RemoteCancelSender,
     remote_cancel_receiver: mpsc::Receiver<CancelRequest>,
     completion_diagnostics: IocpDriverCompletionDiagnostics,
     rio: IocpRioRuntime,
+    buffer_pool_owner: Option<AnyBufPool>,
     handles: HandleRegistry,
     shutting_down: bool,
     closed: bool,
@@ -56,6 +64,7 @@ pub(super) struct IocpDriverStateParts {
     pub(super) remote_cancel_receiver: mpsc::Receiver<CancelRequest>,
     pub(super) completion_diagnostics: IocpDriverCompletionDiagnostics,
     pub(super) rio: IocpRioRuntime,
+    pub(super) buffer_pool_owner: Option<AnyBufPool>,
     pub(super) handles: HandleRegistry,
     pub(super) shutting_down: bool,
     pub(super) closed: bool,
@@ -66,6 +75,7 @@ pub(super) struct IocpDriverStateParts {
 pub(super) struct CancellationStateView<'a> {
     pub(super) completion: &'a mut CompletionPump,
     pub(super) ops: &'a mut IocpOpRegistry,
+    pub(super) overlapped_registry: &'a mut OverlappedRegistry,
     pub(super) timer: &'a mut TimerEngine,
     pub(super) completion_diagnostics: &'a mut IocpDriverCompletionDiagnostics,
     pub(super) rio: &'a mut IocpRioRuntime,
@@ -77,6 +87,7 @@ pub(super) struct CancellationStateView<'a> {
 pub(super) struct CompletionStateView<'a> {
     pub(super) completion: &'a mut CompletionPump,
     pub(super) ops: &'a mut IocpOpRegistry,
+    pub(super) overlapped_registry: &'a mut OverlappedRegistry,
     pub(super) timer: &'a mut TimerEngine,
     pub(super) completion_diagnostics: &'a mut IocpDriverCompletionDiagnostics,
     pub(super) rio: &'a mut IocpRioRuntime,
@@ -88,6 +99,7 @@ pub(super) struct CompletionStateView<'a> {
 pub(super) struct PollingStateView<'a> {
     pub(super) completion: &'a mut CompletionPump,
     pub(super) ops: &'a mut IocpOpRegistry,
+    pub(super) overlapped_registry: &'a mut OverlappedRegistry,
     pub(super) timer: &'a mut TimerEngine,
     pub(super) completion_diagnostics: &'a mut IocpDriverCompletionDiagnostics,
     pub(super) rio: &'a mut IocpRioRuntime,
@@ -105,9 +117,11 @@ pub(super) struct RegistrationStateView<'a> {
 pub(super) struct SubmissionStateView<'a> {
     pub(super) completion: &'a mut CompletionPump,
     pub(super) ops: &'a mut IocpOpRegistry,
+    pub(super) overlapped_registry: &'a mut OverlappedRegistry,
     pub(super) timer: &'a mut TimerEngine,
     pub(super) completion_diagnostics: &'a mut IocpDriverCompletionDiagnostics,
     pub(super) rio: &'a mut IocpRioRuntime,
+    pub(super) buffer_pool: Option<&'a AnyBufPool>,
     pub(super) handles: &'a mut HandleRegistry,
     pub(super) extensions: &'a Extensions,
     pub(super) blocking_pool: &'a ThreadPool,
@@ -116,6 +130,7 @@ pub(super) struct SubmissionStateView<'a> {
 pub(super) struct LifecycleStateView<'a> {
     pub(super) completion: &'a mut CompletionPump,
     pub(super) ops: &'a mut IocpOpRegistry,
+    pub(super) overlapped_registry: &'a mut OverlappedRegistry,
     pub(super) timer: &'a mut TimerEngine,
     pub(super) completion_diagnostics: &'a mut IocpDriverCompletionDiagnostics,
     pub(super) rio: &'a mut IocpRioRuntime,
@@ -127,28 +142,40 @@ pub(super) struct LifecycleStateView<'a> {
 }
 
 impl IocpDriverState {
-    pub(super) fn new(parts: IocpDriverStateParts) -> Self {
-        Self {
+    pub(super) fn new(mut parts: IocpDriverStateParts) -> IocpResult<Self> {
+        let overlapped_registry = OverlappedRegistry::new(&mut parts.ops)?;
+        Ok(Self {
             completion: parts.completion,
             ops: parts.ops,
+            overlapped_registry,
             extensions: parts.extensions,
             timer: parts.timer,
             remote_cancel_sender: parts.remote_cancel_sender,
             remote_cancel_receiver: parts.remote_cancel_receiver,
             completion_diagnostics: parts.completion_diagnostics,
             rio: parts.rio,
+            buffer_pool_owner: parts.buffer_pool_owner,
             handles: parts.handles,
             shutting_down: parts.shutting_down,
             closed: parts.closed,
             blocking_pool: parts.blocking_pool,
             _winsock: parts.winsock,
+        })
+    }
+
+    pub(super) fn retain_buffer_pool(&mut self, pool: AnyBufPool) -> IocpResult<()> {
+        if self.buffer_pool_owner.is_some() {
+            return IocpError::InvalidState.attach_note("IOCP driver already owns a buffer pool");
         }
+        self.buffer_pool_owner = Some(pool);
+        Ok(())
     }
 
     pub(super) fn cancellation_view(&mut self) -> CancellationStateView<'_> {
         CancellationStateView {
             completion: &mut self.completion,
             ops: &mut self.ops,
+            overlapped_registry: &mut self.overlapped_registry,
             timer: &mut self.timer,
             completion_diagnostics: &mut self.completion_diagnostics,
             rio: &mut self.rio,
@@ -162,6 +189,7 @@ impl IocpDriverState {
         PollingStateView {
             completion: &mut self.completion,
             ops: &mut self.ops,
+            overlapped_registry: &mut self.overlapped_registry,
             timer: &mut self.timer,
             completion_diagnostics: &mut self.completion_diagnostics,
             rio: &mut self.rio,
@@ -183,9 +211,11 @@ impl IocpDriverState {
         SubmissionStateView {
             completion: &mut self.completion,
             ops: &mut self.ops,
+            overlapped_registry: &mut self.overlapped_registry,
             timer: &mut self.timer,
             completion_diagnostics: &mut self.completion_diagnostics,
             rio: &mut self.rio,
+            buffer_pool: self.buffer_pool_owner.as_ref(),
             handles: &mut self.handles,
             extensions: &self.extensions,
             blocking_pool: &self.blocking_pool,
@@ -196,6 +226,7 @@ impl IocpDriverState {
         LifecycleStateView {
             completion: &mut self.completion,
             ops: &mut self.ops,
+            overlapped_registry: &mut self.overlapped_registry,
             timer: &mut self.timer,
             completion_diagnostics: &mut self.completion_diagnostics,
             rio: &mut self.rio,
@@ -243,6 +274,10 @@ impl IocpDriverState {
         self.ops.has_active_ops()
     }
 
+    pub(super) fn buffer_pool(&self) -> Option<&AnyBufPool> {
+        self.buffer_pool_owner.as_ref()
+    }
+
     pub(super) fn create_waker(&self) -> Arc<dyn RemoteWaker<IocpError>> {
         self.completion.create_waker()
     }
@@ -277,6 +312,7 @@ impl IocpDriverState {
         CompletionStateView {
             completion: view.completion,
             ops: view.ops,
+            overlapped_registry: view.overlapped_registry,
             timer: view.timer,
             completion_diagnostics: view.completion_diagnostics,
             rio: view.rio,
@@ -301,6 +337,7 @@ impl IocpDriverState {
         CompletionStateView {
             completion: view.completion,
             ops: view.ops,
+            overlapped_registry: view.overlapped_registry,
             timer: view.timer,
             completion_diagnostics: view.completion_diagnostics,
             rio: view.rio,
@@ -316,6 +353,7 @@ impl IocpDriverState {
         CancellationStateView {
             completion: view.completion,
             ops: view.ops,
+            overlapped_registry: view.overlapped_registry,
             timer: view.timer,
             completion_diagnostics: view.completion_diagnostics,
             rio: view.rio,
@@ -340,6 +378,7 @@ impl IocpDriverState {
         CancellationStateView {
             completion: view.completion,
             ops: view.ops,
+            overlapped_registry: view.overlapped_registry,
             timer: view.timer,
             completion_diagnostics: view.completion_diagnostics,
             rio: view.rio,
@@ -355,6 +394,7 @@ impl IocpDriverState {
         PollingStateView {
             completion: view.completion,
             ops: view.ops,
+            overlapped_registry: view.overlapped_registry,
             timer: view.timer,
             completion_diagnostics: view.completion_diagnostics,
             rio: view.rio,

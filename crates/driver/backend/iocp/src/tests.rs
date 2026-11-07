@@ -7,15 +7,23 @@ use diagweave::prelude::*;
 use tracing_subscriber::fmt::TestWriter;
 use veloq_driver_core::{
     driver::{
-        CompletionRecord, CompletionValue, DriveMode, Driver, DriverSubmitResult, OpToken,
-        PollRecordResult,
+        BufferRegistrationStatus, CompletionRecord, CompletionValue, DriveMode, Driver,
+        DriverSubmitResult, OpToken, PollRecordResult,
     },
     op::{IntoPlatformOp, OpCompletion},
 };
 use veloq_std::{
+    cell::RefCell,
     convert::TryFrom,
     format, io, thread,
     time::{Duration, Instant},
+    vec,
+    vec::Vec,
+};
+
+use veloq_buf::{
+    AnyBufPool, BufError, BufResult, BufferRegion, BufferRegistrar, LockedMemoryBudget,
+    PoolInitContext, PoolTopology, UniformSlot, heap::ChunkId,
 };
 
 pub(crate) fn init_test_logger() {
@@ -26,6 +34,53 @@ pub(crate) fn init_test_logger() {
             .with_max_level(tracing::Level::TRACE)
             .try_init();
     });
+}
+
+struct DriverBufferRegistrar<'driver, 'runtime> {
+    driver: RefCell<&'driver mut IocpDriver<'runtime>>,
+}
+
+impl BufferRegistrar for DriverBufferRegistrar<'_, '_> {
+    fn register(&self, regions: &mut [BufferRegion]) -> BufResult<Vec<ChunkId>> {
+        let mut registered = Vec::with_capacity(regions.len());
+        let mut driver = self.driver.borrow_mut();
+        for region in regions {
+            let id = region.id();
+            let request = region.registration_request();
+            let status = driver
+                .register_buffer(request)
+                .map_err(|report| BufError::Other(format!("{report:#}")))?;
+            if matches!(status, BufferRegistrationStatus::Registered) {
+                registered.push(id);
+            }
+        }
+        Ok(registered)
+    }
+}
+
+pub(crate) fn build_registered_pool<'driver, 'runtime>(
+    driver: &'driver mut IocpDriver<'runtime>,
+    topology: &UniformSlot,
+    budget: LockedMemoryBudget,
+    worker_id: usize,
+) -> AnyBufPool {
+    let pool_state = topology
+        .init(
+            PoolInitContext::new(1, vec![worker_id], budget).expect("pool initialization context"),
+        )
+        .expect("initialize test buffer pool");
+    let pool = {
+        let registrar = DriverBufferRegistrar {
+            driver: RefCell::new(driver),
+        };
+        topology
+            .build(&pool_state, worker_id, &registrar)
+            .expect("build buffer pool with registered chunks")
+    };
+    driver
+        .attach_buffer_pool(pool.clone())
+        .expect("attach buffer pool to driver");
+    pool
 }
 
 use crate::{

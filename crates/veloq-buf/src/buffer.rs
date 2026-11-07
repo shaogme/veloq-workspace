@@ -49,12 +49,14 @@ mod any;
 mod common;
 mod error;
 mod handle;
+mod locked_memory;
 mod slot_pool;
 
 pub use any::*;
 pub use common::*;
 pub use error::*;
 pub use handle::*;
+pub use locked_memory::*;
 pub use slot_pool::*;
 
 #[cfg(test)]

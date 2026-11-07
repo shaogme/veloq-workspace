@@ -1,10 +1,16 @@
 #[test]
 fn compile_tests() {
     let t = trybuild::TestCases::new();
+    #[cfg(not(windows))]
     t.compile_fail("tests/ui/block_on_ctx_escape_fail.rs");
+    #[cfg(windows)]
+    t.compile_fail("tests/ui/windows/block_on_ctx_escape_fail.rs");
     t.compile_fail("tests/ui/scope_spawn_boxed_lifetime_fail.rs");
     t.compile_fail("tests/ui/task_lifetime_fail.rs");
+    #[cfg(not(windows))]
     t.compile_fail("tests/ui/runtime_builder_hook_order_fail.rs");
+    #[cfg(windows)]
+    t.compile_fail("tests/ui/windows/runtime_builder_hook_order_fail.rs");
     t.pass("tests/ui/runtime_builder_hook_order.rs");
     t.compile_fail("tests/ui/join_empty_fail.rs");
     t.compile_fail("tests/ui/join_too_many_fail.rs");

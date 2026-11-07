@@ -14,7 +14,6 @@ use crate::{
     },
 };
 use diagweave::prelude::*;
-use veloq_buf::BufferRegistrar;
 use veloq_driver_core::platform::receive_pump::{ReceivePumpState, ReceiveReplacementReservation};
 use veloq_driver_core::{
     driver::{
@@ -176,7 +175,6 @@ impl RioBackendEffect {
 pub(super) struct RioCompletionHooks<'a> {
     core: &'a mut RioCore,
     runtime: &'a mut RioRuntime,
-    registrar: &'a dyn BufferRegistrar,
     ext: &'a Extensions,
     completed_count: usize,
 }
@@ -185,13 +183,11 @@ impl<'a> RioCompletionHooks<'a> {
     pub(super) fn new(
         core: &'a mut RioCore,
         runtime: &'a mut RioRuntime,
-        registrar: &'a dyn BufferRegistrar,
         ext: &'a Extensions,
     ) -> Self {
         Self {
             core,
             runtime,
-            registrar,
             ext,
             completed_count: 0,
         }
@@ -323,7 +319,7 @@ impl RioCompletionHooks<'_> {
         let Some(release) = effect.release else {
             return Ok(());
         };
-        let (registry, env) = self.core.registry_with_env(self.registrar).into_parts();
+        let (registry, env) = self.core.registry_with_env().into_parts();
         let env = env.ok_or_else(|| {
             IocpError::Unsupported
                 .to_report()
@@ -356,7 +352,6 @@ impl RioCompletionHooks<'_> {
                 op_kind,
                 pump,
                 reservation,
-                registrar: self.registrar,
             },
         )
     }

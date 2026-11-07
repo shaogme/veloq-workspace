@@ -25,7 +25,6 @@ pub(crate) enum IocpRecordKind {
 }
 
 pub(crate) struct IocpMultiShotVTable {
-    pub(crate) operation: OpKind,
     pub(crate) record_kind: IocpRecordKind,
     pub(crate) encode_accepted_socket: fn() -> IocpUserPayload,
     pub(crate) rearm: fn(&mut IocpKernelOp, &mut SubmitContext) -> IocpResult<SubmissionResult>,

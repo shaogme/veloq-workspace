@@ -1,7 +1,7 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use futures_util::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use veloq::{
-    buf::{UniformSlot, heap::ThreadMemoryMultiplier},
+    buf::UniformSlot,
     error,
     fs::{BufferingMode, File},
     nz,
@@ -317,19 +317,13 @@ fn benchmark_1gb_write(c: &mut Criterion) {
                 b.iter_custom(|iters| {
                     let mut total_elapsed = Duration::ZERO;
                     for _ in 0..iters {
-                        let elapsed =
-                            Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(128))))
-                                .worker_count(Some(nz!(1)))
-                                .scope(async |ctx| {
-                                    run_1gb_iteration(
-                                        ctx,
-                                        BenchPhase::Total,
-                                        buffering_mode,
-                                        sync_mode,
-                                    )
+                        let elapsed = Runtime::builder(UniformSlot::new(128 * 4 * 1024 * 1024))
+                            .worker_count(Some(nz!(1)))
+                            .scope(async |ctx| {
+                                run_1gb_iteration(ctx, BenchPhase::Total, buffering_mode, sync_mode)
                                     .await
-                                })
-                                .unwrap();
+                            })
+                            .unwrap();
                         total_elapsed += elapsed;
                     }
                     total_elapsed
@@ -341,19 +335,13 @@ fn benchmark_1gb_write(c: &mut Criterion) {
                 b.iter_custom(|iters| {
                     let mut total_elapsed = Duration::ZERO;
                     for _ in 0..iters {
-                        let elapsed =
-                            Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(128))))
-                                .worker_count(Some(nz!(1)))
-                                .scope(async |ctx| {
-                                    run_1gb_iteration(
-                                        ctx,
-                                        BenchPhase::Write,
-                                        buffering_mode,
-                                        sync_mode,
-                                    )
+                        let elapsed = Runtime::builder(UniformSlot::new(128 * 4 * 1024 * 1024))
+                            .worker_count(Some(nz!(1)))
+                            .scope(async |ctx| {
+                                run_1gb_iteration(ctx, BenchPhase::Write, buffering_mode, sync_mode)
                                     .await
-                                })
-                                .unwrap();
+                            })
+                            .unwrap();
                         total_elapsed += elapsed;
                     }
                     total_elapsed
@@ -365,19 +353,13 @@ fn benchmark_1gb_write(c: &mut Criterion) {
                 b.iter_custom(|iters| {
                     let mut total_elapsed = Duration::ZERO;
                     for _ in 0..iters {
-                        let elapsed =
-                            Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(128))))
-                                .worker_count(Some(nz!(1)))
-                                .scope(async |ctx| {
-                                    run_1gb_iteration(
-                                        ctx,
-                                        BenchPhase::Flush,
-                                        buffering_mode,
-                                        sync_mode,
-                                    )
+                        let elapsed = Runtime::builder(UniformSlot::new(128 * 4 * 1024 * 1024))
+                            .worker_count(Some(nz!(1)))
+                            .scope(async |ctx| {
+                                run_1gb_iteration(ctx, BenchPhase::Flush, buffering_mode, sync_mode)
                                     .await
-                                })
-                                .unwrap();
+                            })
+                            .unwrap();
                         total_elapsed += elapsed;
                     }
                     total_elapsed
@@ -416,7 +398,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut total_elapsed = Duration::ZERO;
             for _ in 0..iters {
-                let elapsed = Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(128))))
+                let elapsed = Runtime::builder(UniformSlot::new(128 * 4 * 1024 * 1024))
                     .worker_count(Some(WORKER_COUNT))
                     .scope(async |ctx| {
                         let start = Instant::now();

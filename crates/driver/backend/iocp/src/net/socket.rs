@@ -22,6 +22,7 @@ use windows_sys::Win32::Networking::WinSock::{
 /// A socket handle wrapper.
 pub struct Socket {
     inner: SafeSocket,
+    rio: bool,
 }
 
 impl Socket {
@@ -33,10 +34,15 @@ impl Socket {
         }
         Ok(Self {
             inner: SafeSocket(s),
+            rio: flags & WSA_FLAG_REGISTERED_IO != 0,
         })
     }
 
     fn new_inner(af: u16, ty: i32, protocol: i32) -> IocpResult<Self> {
+        Self::new_with_flags_inner(af, ty, protocol, WSA_FLAG_OVERLAPPED)
+    }
+
+    fn new_rio_inner(af: u16, ty: i32, protocol: i32) -> IocpResult<Self> {
         Self::new_with_flags_inner(
             af,
             ty,
@@ -63,6 +69,46 @@ impl Socket {
     /// Creates a new UDP v6 socket.
     pub fn new_udp_v6() -> IocpResult<Self> {
         Self::new_inner(AF_INET6, SOCK_DGRAM, IPPROTO_UDP).attach_note("socket new_udp_v6 failed")
+    }
+
+    /// 创建一个用于注册 I/O 的 TCP v4 套接字。
+    /// Creates a new TCP v4 socket for registered I/O.
+    ///
+    /// 该套接字不能提交普通 Winsock overlapped I/O。
+    /// This socket cannot submit ordinary Winsock overlapped I/O.
+    pub fn new_rio_tcp_v4() -> IocpResult<Self> {
+        Self::new_rio_inner(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+            .attach_note("socket new_rio_tcp_v4 failed")
+    }
+
+    /// 创建一个用于注册 I/O 的 TCP v6 套接字。
+    /// Creates a new TCP v6 socket for registered I/O.
+    ///
+    /// 该套接字不能提交普通 Winsock overlapped I/O。
+    /// This socket cannot submit ordinary Winsock overlapped I/O.
+    pub fn new_rio_tcp_v6() -> IocpResult<Self> {
+        Self::new_rio_inner(AF_INET6, SOCK_STREAM, IPPROTO_TCP)
+            .attach_note("socket new_rio_tcp_v6 failed")
+    }
+
+    /// 创建一个用于注册 I/O 的 UDP v4 套接字。
+    /// Creates a new UDP v4 socket for registered I/O.
+    ///
+    /// 该套接字不能提交普通 Winsock overlapped I/O。
+    /// This socket cannot submit ordinary Winsock overlapped I/O.
+    pub fn new_rio_udp_v4() -> IocpResult<Self> {
+        Self::new_rio_inner(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+            .attach_note("socket new_rio_udp_v4 failed")
+    }
+
+    /// 创建一个用于注册 I/O 的 UDP v6 套接字。
+    /// Creates a new UDP v6 socket for registered I/O.
+    ///
+    /// 该套接字不能提交普通 Winsock overlapped I/O。
+    /// This socket cannot submit ordinary Winsock overlapped I/O.
+    pub fn new_rio_udp_v6() -> IocpResult<Self> {
+        Self::new_rio_inner(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)
+            .attach_note("socket new_rio_udp_v6 failed")
     }
 
     /// Binds the socket to the given address.
@@ -97,8 +143,14 @@ impl Socket {
     /// Consumes the Socket and returns an owned handle.
     pub fn into_owned_raw(self) -> OwnedRawHandle {
         let h = self.inner.0;
+        let rio = self.rio;
         mem::forget(self);
-        let raw = RawHandle::new(IocpHandle::for_socket(h as _));
+        let handle = if rio {
+            IocpHandle::for_rio_socket(h as _)
+        } else {
+            IocpHandle::for_socket(h as _)
+        };
+        let raw = RawHandle::new(handle);
         // SAFETY: this socket originates from `self` and ownership is uniquely transferred.
         unsafe { OwnedRawHandle::from_raw_owned(raw) }
     }
@@ -109,6 +161,7 @@ impl Socket {
     pub unsafe fn from_raw(handle: IocpHandle) -> Self {
         Self {
             inner: SafeSocket(handle.as_socket()),
+            rio: handle.uses_rio(),
         }
     }
 

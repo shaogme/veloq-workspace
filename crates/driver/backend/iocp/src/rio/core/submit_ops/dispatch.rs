@@ -1,5 +1,4 @@
 use crate::{
-    BufferRegistrationMode,
     config::BorrowedRawHandle,
     driver::RIO_EVENT_KEY,
     error::IocpError,
@@ -11,7 +10,6 @@ use crate::{
     win32::Overlapped,
 };
 use diagweave::prelude::*;
-use veloq_buf::BufferRegistrar;
 use veloq_std::{boxed::Box, ffi::c_void, ptr};
 use windows_sys::Win32::Networking::WinSock::{
     RIO_BUF, RIO_BUFFERID, RIO_CQ, RIO_IOCP_COMPLETION, RIO_NOTIFICATION_COMPLETION,
@@ -534,17 +532,11 @@ impl RioKernel {
     }
 
     #[inline]
-    pub(crate) fn env<'a>(
-        &'a self,
-        registrar: &'a dyn BufferRegistrar,
-        registration_mode: BufferRegistrationMode,
-    ) -> Option<RioEnv<'a>> {
+    pub(crate) fn env<'a>(&'a self) -> Option<RioEnv<'a>> {
         let dispatch = self.dispatch.as_ref()?;
         Some(RioEnv {
-            registrar,
             dispatch,
             cq: self.cq,
-            registration_mode,
         })
     }
 

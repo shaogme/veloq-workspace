@@ -2388,23 +2388,21 @@ mod tests {
     use crate::{
         config::{FileTableExhaustion, IoFd, SockAddrStorage, UringRawHandle},
         diagnostics::UringCompletionDiagnostics,
-        driver::{
-            CqeEnv, FileTable, SqeEnv, UringOpState,
-        },
+        driver::{CqeEnv, FileTable, SqeEnv, UringOpState},
         error::{UringError, UringResult},
         net::socket_addr_to_storage,
         op::{
             Accept, AcceptMulti, AcceptedSocket, Close, CompletionCardinality, Connect, Fallocate,
             FallocateRaw, Fsync, FsyncRaw, OpSend, Open, ProvidedBuf, ReadFixed, ReadRaw,
             RecordPolicy, Recv, RecvMulti, RecvProvided, SendTo, SubmissionStrategy, SyncFileRange,
-            SyncFileRangeRaw, Timeout, UdpConnect, UdpRecvMulti, UdpSend, UringOp,
-            UringOpRegistry, UringOperationDescriptor, UringSlotSpec, UringUserPayload, Wakeup,
-            WriteFixed, WriteRaw,
+            SyncFileRangeRaw, Timeout, UdpConnect, UdpRecvMulti, UdpSend, UringOp, UringOpRegistry,
+            UringOperationDescriptor, UringSlotSpec, UringUserPayload, Wakeup, WriteFixed,
+            WriteRaw,
         },
         test_alloc::{AllocationCounts, measure},
     };
     use core::ptr::{eq, read_unaligned};
-    use veloq_buf::{FixedBuf, NoopRegistrar, heap::ChunkId};
+    use veloq_buf::{FixedBuf, heap::ChunkId};
     use veloq_driver_core::{
         driver::{OpToken, SubmitTokenContext, registry::OpEntry},
         op::{IntoPlatformOp, OpKind},
@@ -2458,15 +2456,12 @@ mod tests {
         socket_addr_to_storage(socket_addr())
     }
 
-    fn test_sqe_env<'a>(file_table: &'a FileTable, registrar: &'a NoopRegistrar) -> SqeEnv<'a> {
-        SqeEnv::for_test(file_table, registrar)
+    fn test_sqe_env<'a>(file_table: &'a FileTable) -> SqeEnv<'a> {
+        SqeEnv::for_test(file_table)
     }
 
-    fn test_provided_sqe_env<'a>(
-        file_table: &'a FileTable,
-        registrar: &'a NoopRegistrar,
-    ) -> SqeEnv<'a> {
-        SqeEnv::for_test_with_provided(file_table, registrar, 7, 16)
+    fn test_provided_sqe_env<'a>(file_table: &'a FileTable) -> SqeEnv<'a> {
+        SqeEnv::for_test_with_provided(file_table, 7, 16)
     }
 
     fn with_test_slot_pair<F, R>(op: UringOp, payload: UringUserPayload, f: F) -> R
@@ -2676,15 +2671,15 @@ mod tests {
             size_of::<UringKernelPayloadStorage>(),
             align_of::<UringKernelPayloadStorage>(),
         );
-        assert_eq!(layout, (224, 8, 352, 32, 216, 8));
+        let user_payload_size = if cfg!(target_os = "linux") { 352 } else { 384 };
+        assert_eq!(layout, (224, 8, user_payload_size, 32, 216, 8));
     }
 
     #[test]
     fn operation_dispatch_allocation_baseline() {
         let file_table = FileTable::new(0, FileTableExhaustion::Fallback);
-        let registrar = NoopRegistrar;
-        let sqe_env = test_sqe_env(&file_table, &registrar);
-        let provided_sqe_env = test_provided_sqe_env(&file_table, &registrar);
+        let sqe_env = test_sqe_env(&file_table);
+        let provided_sqe_env = test_provided_sqe_env(&file_table);
 
         let read_counts = measure_sqe_and_completion(
             ReadRaw {
@@ -3156,8 +3151,7 @@ mod tests {
     #[test]
     fn descriptor_dispatch_returns_explicit_internal_errors() {
         let file_table = FileTable::new(0, FileTableExhaustion::Fallback);
-        let registrar = NoopRegistrar;
-        let env = test_sqe_env(&file_table, &registrar);
+        let env = test_sqe_env(&file_table);
 
         // SQE construction and completion report the same internal mismatch class. SQE 构造与完成路径报告相同的内部不匹配类别。
         let (read_op, _) = read_raw_parts();
@@ -3303,8 +3297,7 @@ mod tests {
         // any self-reference.
         // 在 `make_sqe` 建立自引用之前，通过 descriptor 层移动该 operation 是安全的。
         let file_table = FileTable::new(0, FileTableExhaustion::Fallback);
-        let registrar = NoopRegistrar;
-        let env = test_sqe_env(&file_table, &registrar);
+        let env = test_sqe_env(&file_table);
         with_test_slot(user, |token, slot| {
             let entry = with_test_access(slot, |access| {
                 let descriptor = access.operation().get_ref().descriptor();

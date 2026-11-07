@@ -51,8 +51,6 @@ pub(crate) struct UringRegistrationStats {
     chunk_register_success: u64,
     chunk_register_failures: u64,
     chunk_register_skipped_recent_failure: u64,
-    submission_missing_chunk_info: u64,
-    raw_buffer_fallbacks: u64,
     /// Descriptors handed out without a kernel table entry because the table was full.
     /// 固定表已满时发放的 direct descriptor，不对应内核表项。
     file_table_fallback_registrations: u64,
@@ -76,14 +74,6 @@ impl UringRegistrationStats {
             self.chunk_register_skipped_recent_failure.saturating_add(1);
     }
 
-    pub(crate) fn inc_submission_missing_chunk_info(&mut self) {
-        self.submission_missing_chunk_info = self.submission_missing_chunk_info.saturating_add(1);
-    }
-
-    pub(crate) fn inc_raw_buffer_fallbacks(&mut self) {
-        self.raw_buffer_fallbacks = self.raw_buffer_fallbacks.saturating_add(1);
-    }
-
     pub(super) fn inc_file_table_fallback_registrations(&mut self, count: usize) {
         self.file_table_fallback_registrations = self
             .file_table_fallback_registrations
@@ -103,15 +93,5 @@ impl UringRegistrationStats {
     #[cfg(feature = "test-hooks")]
     pub(crate) const fn chunk_register_skipped_recent_failure(&self) -> u64 {
         self.chunk_register_skipped_recent_failure
-    }
-
-    #[cfg(feature = "test-hooks")]
-    pub(crate) const fn submission_missing_chunk_info(&self) -> u64 {
-        self.submission_missing_chunk_info
-    }
-
-    #[cfg(feature = "test-hooks")]
-    pub(crate) const fn raw_buffer_fallbacks(&self) -> u64 {
-        self.raw_buffer_fallbacks
     }
 }

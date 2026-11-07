@@ -1,16 +1,71 @@
 #[cfg(feature = "test-hooks")]
 use veloq::runtime::context::Ctx;
 
-use veloq::{config::BufferRegistrationMode, nz, runtime::Runtime};
+use std::sync::Mutex;
+use veloq::std::sync::Arc;
+use veloq::{nz, runtime::Runtime, runtime::scope};
 use veloq_buf::{
-    BufPool, PoolKind, RegionInfo, UniformSlot, heap::ChunkId, heap::ThreadMemoryMultiplier,
+    AnyBufPool, BufPool, BufResult, BufferRegistrar, PoolInitContext, PoolKind, PoolTopology,
+    RegionInfo, RegistrationCapability, UniformPoolState, UniformSlot,
 };
 
 #[cfg(feature = "test-hooks")]
 use veloq_driver_native::driver::test_hooks::DriverTestHooks;
 
-fn assert_slot_based(info: RegionInfo, message: &str) {
+fn assert_registered_slot(info: RegionInfo, message: &str) {
     assert_eq!(info.pool_kind, PoolKind::SlotBased, "{message}");
+    assert!(matches!(
+        info.registration,
+        RegistrationCapability::RegisteredChunk(_)
+    ));
+}
+
+fn assert_unregistered_heap(info: RegionInfo, message: &str) {
+    assert_eq!(info.pool_kind, PoolKind::Heap, "{message}");
+    assert_eq!(
+        info.registration,
+        RegistrationCapability::Unregistered,
+        "{message}"
+    );
+}
+
+#[derive(Clone)]
+struct RegistrationWorkerRecorder {
+    workers: Arc<Mutex<Vec<usize>>>,
+}
+
+impl PoolTopology for RegistrationWorkerRecorder {
+    type State = Arc<UniformPoolState>;
+
+    fn init(&self, context: PoolInitContext) -> BufResult<Self::State> {
+        *self.workers.lock().expect("worker recorder lock") =
+            context.registration_workers().to_vec();
+        UniformSlot::new(0).init(context)
+    }
+
+    fn build(
+        &self,
+        state: &Self::State,
+        worker_idx: usize,
+        registrar: &dyn BufferRegistrar,
+    ) -> BufResult<AnyBufPool> {
+        UniformSlot::new(0).build(state, worker_idx, registrar)
+    }
+}
+
+fn recorded_registration_workers(selection: Option<Vec<usize>>) -> Vec<usize> {
+    let workers = Arc::new(Mutex::new(Vec::new()));
+    let topology = RegistrationWorkerRecorder {
+        workers: workers.clone(),
+    };
+    let mut builder = Runtime::builder(topology).worker_count(Some(nz!(3)));
+    if let Some(selection) = selection {
+        builder = builder.buffer_registration_workers(selection);
+    }
+    builder
+        .scope(async |_| {})
+        .expect("runtime should initialize with the requested registration workers");
+    workers.lock().expect("worker recorder lock").clone()
 }
 
 #[cfg(feature = "test-hooks")]
@@ -21,81 +76,71 @@ fn current_chunk_register_attempts(ctx: Ctx<'_>) -> u64 {
     })
 }
 
-fn run_auto_expansion_single_worker(mode: BufferRegistrationMode) {
-    Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(1))))
+fn run_fixed_capacity_fallback() {
+    let builder = Runtime::builder(UniformSlot::new(4 * 1024 * 1024))
         .worker_count(Some(nz!(1)))
-        .with_config(|c| c.iocp_registration_mode(mode).uring_registration_mode(mode))
+        .buffer_registration_workers(vec![0]);
+    builder
         .scope(async |ctx| {
             let pool = ctx.buf_pool();
-            let alloc_size = nz!(1024 * 1024);
-
-            let mut bufs = Vec::new();
-            let mut expanded_chunk_id = None;
-            for i in 0..16 {
-                let buf = pool.alloc_full(alloc_size).unwrap_or_else(|| {
-                    panic!("allocation failed before expansion validation, i={i}")
-                });
+            let mut registered = Vec::new();
+            let mut fallback = None;
+            for _ in 0..16 {
+                let buf = pool
+                    .alloc_full(nz!(1024 * 1024))
+                    .expect("pool or heap allocation should succeed");
                 let info = buf.resolve_region_info();
-                assert_slot_based(info, "auto expansion should not fallback to heap buffer");
-                if info.id != ChunkId::ZERO {
-                    expanded_chunk_id = Some(info.id);
-                }
-                bufs.push(buf);
-                if expanded_chunk_id.is_some() {
+                if info.pool_kind == PoolKind::Heap {
+                    assert_unregistered_heap(
+                        info,
+                        "pool exhaustion should not create or register another chunk",
+                    );
+                    fallback = Some(buf);
                     break;
                 }
-            }
-
-            let expanded_id =
-                expanded_chunk_id.expect("auto expansion did not produce a new chunk");
-
-            // Ensure expanded chunk is actually usable.
-            let mut post_expansion_count = 0usize;
-            for _ in 0..8 {
-                let buf = pool.alloc_full(alloc_size).expect("allocation failed");
-                if buf.resolve_region_info().id == expanded_id {
-                    post_expansion_count += 1;
-                }
-                bufs.push(buf);
+                assert_registered_slot(info, "slot allocation must come from a registered chunk");
+                registered.push(buf);
             }
             assert!(
-                post_expansion_count > 0,
-                "expanded chunk should be reusable for subsequent allocations"
+                fallback.is_some(),
+                "fixed capacity should eventually be exhausted"
             );
         })
         .unwrap();
 }
 
-fn run_expansion_metadata_sync_check(mode: BufferRegistrationMode) {
-    Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(1))))
+fn run_no_lazy_registration_check() {
+    let builder = Runtime::builder(UniformSlot::new(4 * 1024 * 1024))
         .worker_count(Some(nz!(1)))
-        .with_config(|c| c.iocp_registration_mode(mode).uring_registration_mode(mode))
+        .buffer_registration_workers(vec![0]);
+    builder
         .scope(async |ctx| {
-            let pool = ctx.buf_pool();
-            let alloc_size = nz!(1024 * 1024);
-
             #[cfg(feature = "test-hooks")]
             let before = current_chunk_register_attempts(ctx);
-
-            let mut bufs = Vec::new();
-            let mut expanded = false;
-            for i in 0..16 {
+            let pool = ctx.buf_pool();
+            let mut registered = Vec::new();
+            let mut fallback = None;
+            for _ in 0..16 {
                 let buf = pool
-                    .alloc_full(alloc_size)
-                    .unwrap_or_else(|| panic!("allocation failed while triggering expansion, i={i}"));
+                    .alloc_full(nz!(1024 * 1024))
+                    .expect("pool or heap allocation should succeed");
                 let info = buf.resolve_region_info();
-                assert_slot_based(info, "expansion should not fallback to heap");
-                if info.id != ChunkId::ZERO {
-                    expanded = true;
-                }
-                bufs.push(buf);
-                if expanded {
+                if info.pool_kind == PoolKind::Heap {
+                    assert_unregistered_heap(
+                        info,
+                        "heap fallback must carry explicit unregistered capability",
+                    );
+                    fallback = Some(buf);
                     break;
                 }
+                assert_registered_slot(info, "slot allocation must come from a registered chunk");
+                registered.push(buf);
             }
-            assert!(expanded, "failed to trigger expansion");
+            assert!(
+                fallback.is_some(),
+                "fixed capacity should eventually be exhausted"
+            );
 
-            // Cross at least one executor budget boundary so check_for_memory_updates runs again.
             for _ in 0..128 {
                 ctx.yield_now().await;
             }
@@ -105,61 +150,68 @@ fn run_expansion_metadata_sync_check(mode: BufferRegistrationMode) {
                 let after = current_chunk_register_attempts(ctx);
                 assert_eq!(
                     after, before,
-                    "chunk metadata sync must not eagerly register after expansion: before={before}, after={after}"
+                    "pool exhaustion must not register a new chunk: before={before}, after={after}"
                 );
             }
-        }).unwrap();
+        })
+        .unwrap();
 }
 
-fn run_auto_expansion_multithread(mode: BufferRegistrationMode) {
-    Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(1))))
+fn run_multithreaded_fixed_capacity_fallback() {
+    let builder = Runtime::builder(UniformSlot::new(4 * 1024 * 1024))
         .worker_count(Some(nz!(2)))
-        .with_config(|c| c.iocp_registration_mode(mode).uring_registration_mode(mode))
+        .buffer_registration_workers(vec![0, 1]);
+    builder
         .scope(async |ctx| {
             let pool = ctx.buf_pool();
-            let alloc_size = nz!(1024 * 1024);
-
-            let mut holding = Vec::new();
-            let mut expanded_chunk_id = None;
-            for i in 0..16 {
+            let mut registered = Vec::new();
+            let mut fallback = None;
+            for _ in 0..16 {
                 let buf = pool
-                    .alloc_full(alloc_size)
-                    .unwrap_or_else(|| panic!("worker0 allocation failed, i={i}"));
+                    .alloc_full(nz!(1024 * 1024))
+                    .expect("pool or heap allocation should succeed");
                 let info = buf.resolve_region_info();
-                assert_slot_based(info, "expansion path should not fallback to heap");
-                if info.id != ChunkId::ZERO {
-                    expanded_chunk_id = Some(info.id);
-                    holding.push(buf);
+                if info.pool_kind == PoolKind::Heap {
+                    assert_unregistered_heap(
+                        info,
+                        "shared pool exhaustion should use unregistered heap memory",
+                    );
+                    fallback = Some(buf);
                     break;
                 }
-                holding.push(buf);
+                assert_registered_slot(info, "slot allocation must come from a registered chunk");
+                registered.push(buf);
             }
-            let expanded_id =
-                expanded_chunk_id.expect("worker0 did not trigger pool auto expansion");
+            assert!(
+                fallback.is_some(),
+                "fixed shared capacity should be exhausted"
+            );
 
-            use veloq::runtime::scope;
-            scope!(ctx, async |s| {
+            scope!(ctx, async |scope| {
                 let mut handles = Vec::new();
                 for _ in 0..4 {
-                    handles.push(s.spawn_boxed(async move {
+                    handles.push(scope.spawn_boxed(async move {
                         ctx.yield_now().await;
-                        let pool = ctx.buf_pool();
-                        let buf = pool
-                            .alloc_full(alloc_size)
-                            .expect("worker allocation failed");
-                        buf.resolve_region_info()
+                        let buf = ctx
+                            .buf_pool()
+                            .alloc_full(nz!(4096))
+                            .expect("worker heap fallback allocation");
+                        let info = buf.resolve_region_info();
+                        (info.pool_kind, info.registration)
                     }));
                 }
 
-                for h in handles {
-                    let info = h.await.expect("task failed");
-                    assert_slot_based(info, "worker should not fallback to heap");
-                    let chunk_id = info.id;
-                    assert_ne!(chunk_id, ChunkId::ZERO, "worker should see expanded chunk");
-                    assert!(
-                        chunk_id >= expanded_id,
-                        "worker chunk_id should be on or after expanded chunk"
-                    );
+                for handle in handles {
+                    let (pool_kind, registration) = handle.await.expect("worker task failed");
+                    match pool_kind {
+                        PoolKind::SlotBased => assert!(matches!(
+                            registration,
+                            RegistrationCapability::RegisteredChunk(_)
+                        )),
+                        PoolKind::Heap => {
+                            assert_eq!(registration, RegistrationCapability::Unregistered)
+                        }
+                    }
                 }
             })
             .await
@@ -169,31 +221,31 @@ fn run_auto_expansion_multithread(mode: BufferRegistrationMode) {
 }
 
 #[test]
-fn test_memory_auto_expansion_strict_mode() {
-    run_auto_expansion_single_worker(BufferRegistrationMode::Strict);
+fn test_fixed_capacity_falls_back_to_heap() {
+    run_fixed_capacity_fallback();
 }
 
 #[test]
-fn test_memory_auto_expansion_compatible_mode() {
-    run_auto_expansion_single_worker(BufferRegistrationMode::Compatible);
+fn test_pool_exhaustion_does_not_register_lazily() {
+    run_no_lazy_registration_check();
 }
 
 #[test]
-fn test_expansion_metadata_sync_does_not_register_in_strict_mode() {
-    run_expansion_metadata_sync_check(BufferRegistrationMode::Strict);
+fn test_multithreaded_fixed_capacity_fallback() {
+    run_multithreaded_fixed_capacity_fallback();
 }
 
 #[test]
-fn test_expansion_metadata_sync_does_not_register_in_compatible_mode() {
-    run_expansion_metadata_sync_check(BufferRegistrationMode::Compatible);
+fn runtime_defaults_to_all_buffer_registration_workers() {
+    assert_eq!(recorded_registration_workers(None), vec![0, 1, 2]);
 }
 
 #[test]
-fn test_multithreaded_auto_expansion_strict_mode() {
-    run_auto_expansion_multithread(BufferRegistrationMode::Strict);
+fn runtime_accepts_no_buffer_registration_workers() {
+    assert!(recorded_registration_workers(Some(Vec::new())).is_empty());
 }
 
 #[test]
-fn test_multithreaded_auto_expansion_compatible_mode() {
-    run_auto_expansion_multithread(BufferRegistrationMode::Compatible);
+fn runtime_accepts_a_buffer_registration_worker_subset() {
+    assert_eq!(recorded_registration_workers(Some(vec![2])), vec![2]);
 }

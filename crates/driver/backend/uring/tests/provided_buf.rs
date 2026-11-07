@@ -16,7 +16,7 @@ use veloq_std::{
 };
 
 use libc::{AF_UNIX, EINVAL, ENOBUFS, SHUT_WR, SOCK_STREAM, close, shutdown, socketpair, write};
-use veloq_buf::{AnyBufPool, BufPool, FixedBuf, NoopRegistrar};
+use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
 use veloq_driver_core::{
     driver::{
         CancelRequest, CompletionRecord, DriveMode, Driver, DriverSubmitResult, OpToken,
@@ -49,18 +49,14 @@ impl BufPool for HeapPool {
 }
 
 fn new_driver_or_skip(entries: u16, buf_size: usize) -> Option<UringDriver<'static>> {
-    let config = UringConfig {
-        entries: NonZeroU32::new(64).unwrap(),
-        drive_limits: UringDriveLimits::for_entries(64),
-        provided_buffers: ProvidedBufConfig {
+    let config = UringConfig::default()
+        .with_entries(NonZeroU32::new(64).unwrap())
+        .drive_limits(UringDriveLimits::for_entries(64))
+        .provided_buffers(ProvidedBufConfig {
             entries: NonZeroU16::new(entries).unwrap(),
             buf_size: NonZeroUsize::new(buf_size).unwrap(),
-        },
-        ..UringConfig::default()
-    };
-    static REGISTRAR: NoopRegistrar = NoopRegistrar;
-
-    let mut driver = match UringDriver::new(config, &REGISTRAR) {
+        });
+    let mut driver = match UringDriver::new(config) {
         Ok(driver) => driver,
         Err(report) => {
             eprintln!("skipping provided-buffer test: {report}");

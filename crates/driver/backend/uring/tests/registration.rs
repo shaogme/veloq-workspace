@@ -12,7 +12,6 @@ use veloq_std::{
     vec::Vec,
 };
 
-use veloq_buf::NoopRegistrar;
 use veloq_driver_core::driver::{
     CancelRequest, CompletionRecord, CompletionValue, DriveMode, Driver, DriverSubmitResult,
     PollRecordResult, RegisterFd, SubmitStatus,
@@ -34,8 +33,7 @@ type Fsync = CoreFsync<UringRawHandle>;
 type Timeout = CoreTimeout;
 
 fn new_driver_or_skip() -> Option<UringDriver<'static>> {
-    static REGISTRAR: NoopRegistrar = NoopRegistrar;
-    match UringDriver::new(UringConfig::default(), &REGISTRAR) {
+    match UringDriver::new(UringConfig::default()) {
         Ok(driver) => Some(driver),
         Err(report) => {
             eprintln!("skipping uring test: {report}");
@@ -46,13 +44,10 @@ fn new_driver_or_skip() -> Option<UringDriver<'static>> {
 
 #[test]
 fn software_timer_stays_out_of_sq_backlog_when_sq_is_full_and_cancelled() {
-    static REGISTRAR: NoopRegistrar = NoopRegistrar;
-    let config = UringConfig {
-        entries: NonZeroU32::new(1).expect("non-zero SQ capacity"),
-        drive_limits: UringDriveLimits::for_entries(1),
-        ..UringConfig::default()
-    };
-    let Ok(mut driver) = UringDriver::new(config, &REGISTRAR) else {
+    let config = UringConfig::default()
+        .with_entries(NonZeroU32::new(1).expect("non-zero SQ capacity"))
+        .drive_limits(UringDriveLimits::for_entries(1));
+    let Ok(mut driver) = UringDriver::new(config) else {
         eprintln!("skipping timer/SQ-full test: io_uring setup unavailable");
         return;
     };
@@ -100,15 +95,12 @@ fn new_driver_with_file_table_or_skip(
     capacity: u32,
     exhaustion: FileTableExhaustion,
 ) -> Option<UringDriver<'static>> {
-    let config = UringConfig {
-        entries: NonZeroU32::new(64).unwrap(),
-        drive_limits: UringDriveLimits::for_entries(64),
-        file_table_capacity: capacity,
-        file_table_exhaustion: exhaustion,
-        ..UringConfig::default()
-    };
-    static REGISTRAR: NoopRegistrar = NoopRegistrar;
-    match UringDriver::new(config, &REGISTRAR) {
+    let config = UringConfig::default()
+        .with_entries(NonZeroU32::new(64).unwrap())
+        .drive_limits(UringDriveLimits::for_entries(64))
+        .file_table_capacity(capacity)
+        .file_table_exhaustion(exhaustion);
+    match UringDriver::new(config) {
         Ok(mut driver) if capacity > 0 => {
             let file = File::open("Cargo.toml").ok()?;
             let raw = raw_file(&file);

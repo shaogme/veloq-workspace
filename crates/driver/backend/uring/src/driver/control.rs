@@ -1,5 +1,5 @@
-mod cancellation;
 mod backlog;
+mod cancellation;
 mod effects;
 mod plane;
 mod staged_ledger;
@@ -10,11 +10,11 @@ pub(crate) use backlog::{BacklogEntry, BacklogError, SubmissionBacklog};
 pub(crate) use cancellation::{
     CancelIntentError, CancelRequestDisposition, PendingCancel, UringCancelManager,
 };
+#[cfg(test)]
+pub(crate) use effects::UringControlEffect;
 pub(crate) use effects::{
     DeferredCancelReconcile, UringControlEffectKind, UringPostCompletionEffects,
 };
-#[cfg(test)]
-pub(crate) use effects::UringControlEffect;
 pub(crate) use plane::UringControlPlane;
 pub(crate) use staged_ledger::{StagedEntry, StagedLedger, StagedLedgerError};
 pub(crate) use timer::{ExpiredBatch, UringTimerWheel};

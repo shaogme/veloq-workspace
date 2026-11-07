@@ -13,7 +13,7 @@ use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 use crate::{
     error::{IocpError, IocpResult, iocp_report_to_event_res},
     ext::Extensions,
-    op::{IocpOp, IocpOpPayload, IocpSlotSpec, Slot},
+    op::{IocpOp, IocpOpPayload, IocpSlotSpec, IocpUserPayload, Slot},
     rio::SocketInflightToken,
 };
 
@@ -202,6 +202,41 @@ impl SettlementService {
         }
     }
 
+    pub(super) fn complete_iocp_recv_provided_slot(
+        slot: Slot<'_, InFlightWaiting>,
+        event: UserCompletionEvent,
+        io_result: IocpResult<usize>,
+        payload: IocpUserPayload,
+        effect: IocpBackendEffect,
+    ) -> CompletionSettlement<IocpSlotSpec, IocpBackendEffect> {
+        let completion_res = Self::io_result_to_event_res(&io_result);
+        let mut guard = slot.complete();
+        let cleanup = guard
+            .with_access_mut(|access| {
+                let cleanup = PlatformOp::completion_cleanup(access.operation_mut(), &io_result);
+                access.operation_mut().get_mut().unbind_user_payload();
+                cleanup
+            })
+            .unwrap_or_default();
+        let _ = guard.take_op();
+        let (_, detail) = guard.take_completion_data();
+        drop(detail);
+        let _data = mem::take(guard.platform_mut());
+        CompletionSettlement::User {
+            event: UserCompletionEvent::from_parts(
+                COMP_BACKEND_IOCP,
+                event.token(),
+                completion_res,
+                0,
+            ),
+            payload,
+            detail: Some(io_result),
+            cleanup,
+            continuation: CompletionContinuation::Final,
+            effect,
+        }
+    }
+
     pub(super) fn complete_iocp_replacement_failure_slot(
         slot: Slot<'_, InFlightWaiting>,
         event: UserCompletionEvent,
@@ -250,6 +285,52 @@ impl SettlementService {
             };
         };
 
+        CompletionSettlement::UserThenTerminal {
+            event: UserCompletionEvent::from_parts(
+                COMP_BACKEND_IOCP,
+                event.token(),
+                Self::io_result_to_event_res(&io_result),
+                0,
+            ),
+            payload,
+            detail: Some(io_result),
+            cleanup,
+            effect,
+            terminal_event: UserCompletionEvent::from_parts(
+                COMP_BACKEND_IOCP,
+                event.token(),
+                terminal_res,
+                0,
+            ),
+            terminal_error: replacement_error,
+            terminal_cleanup: CompletionCleanupGuard::default(),
+            terminal_effect: IocpBackendEffect::None,
+        }
+    }
+
+    pub(super) fn complete_iocp_multishot_replacement_failure_slot(
+        slot: Slot<'_, InFlightWaiting>,
+        event: UserCompletionEvent,
+        io_result: IocpResult<usize>,
+        payload: IocpUserPayload,
+        replacement_error: Report<IocpError>,
+        effect: IocpBackendEffect,
+    ) -> CompletionSettlement<IocpSlotSpec, IocpBackendEffect> {
+        let replacement_error = replacement_error
+            .with_ctx(
+                "submission_phase",
+                IocpSubmissionFailurePhase::Replacement.as_str(),
+            )
+            .attach_note("multishot replacement submission failed after a record completed");
+        let terminal_res = iocp_report_to_event_res(&replacement_error);
+        let mut guard = slot.complete();
+        let cleanup = guard
+            .with_access_mut(|access| {
+                let cleanup = PlatformOp::completion_cleanup(access.operation_mut(), &io_result);
+                access.operation_mut().get_mut().unbind_user_payload();
+                cleanup
+            })
+            .unwrap_or_default();
         CompletionSettlement::UserThenTerminal {
             event: UserCompletionEvent::from_parts(
                 COMP_BACKEND_IOCP,

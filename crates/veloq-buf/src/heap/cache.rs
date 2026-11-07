@@ -90,15 +90,23 @@ impl HotSegment {
 pub(crate) struct LocalCache {
     pub(crate) hot: HotSegment,
     // Fallback for multi-pool scenarios (rare)
-    pub(crate) others: RefCell<HashMap<PoolId, LocalCacheEntry>>,
+    pub(crate) others: RefCell<HashMap<(PoolId, ChunkId), LocalCacheEntry>>,
 }
 
 impl LocalCache {
-    pub(crate) fn try_alloc(&self, pool_id: PoolId) -> Option<(ChunkId, SlotIndex, NonNull<u8>)> {
+    pub(crate) fn try_alloc(
+        &self,
+        pool_id: PoolId,
+        allowed_chunks: &[ChunkId],
+    ) -> Option<(ChunkId, SlotIndex, NonNull<u8>)> {
         let sb_ptr = self.hot.sb_state.get();
+        let hot_chunk = self.hot.chunk_id.get();
 
         // One-check fast path: identity match and non-null state
-        if self.hot.pool_id.get() == pool_id && !sb_ptr.is_null() {
+        if self.hot.pool_id.get() == pool_id
+            && allowed_chunks.contains(&hot_chunk)
+            && !sb_ptr.is_null()
+        {
             // Safety: hot.owner guarantees that Chunk and its SuperblockState remain valid.
             let sb = unsafe { &*sb_ptr };
 
@@ -119,16 +127,26 @@ impl LocalCache {
             // Superblock Full! Clear hot segment to retire it and trigger global dealloc if empty.
             self.hot.clear();
         }
-        self.try_alloc_slow(pool_id)
+        self.try_alloc_slow(pool_id, allowed_chunks)
     }
 
     #[inline(never)]
-    fn try_alloc_slow(&self, pool_id: PoolId) -> Option<(ChunkId, SlotIndex, NonNull<u8>)> {
+    fn try_alloc_slow(
+        &self,
+        pool_id: PoolId,
+        allowed_chunks: &[ChunkId],
+    ) -> Option<(ChunkId, SlotIndex, NonNull<u8>)> {
         let mut others = self.others.borrow_mut();
-        if let Some(entry) = others.remove(&pool_id) {
+        let entry = allowed_chunks
+            .iter()
+            .find_map(|chunk_id| others.remove(&(pool_id, *chunk_id)));
+        if let Some(entry) = entry {
             // 1. Move current hot entry to others
             if let Some(old_hot_entry) = self.hot.take_owner() {
-                others.insert(self.hot.pool_id.get(), old_hot_entry);
+                others.insert(
+                    (self.hot.pool_id.get(), old_hot_entry.chunk_id),
+                    old_hot_entry,
+                );
             }
 
             // 2. Promote this entry to hot
@@ -136,7 +154,7 @@ impl LocalCache {
 
             // 3. Re-try (will now hit the fast path)
             drop(others);
-            return self.try_alloc(pool_id);
+            return self.try_alloc(pool_id, allowed_chunks);
         }
         None
     }
@@ -145,7 +163,10 @@ impl LocalCache {
         let mut others = self.others.borrow_mut();
         // Retire current hot if any
         if let Some(old_hot_entry) = self.hot.take_owner() {
-            others.insert(self.hot.pool_id.get(), old_hot_entry);
+            others.insert(
+                (self.hot.pool_id.get(), old_hot_entry.chunk_id),
+                old_hot_entry,
+            );
         }
 
         // Apply new hot

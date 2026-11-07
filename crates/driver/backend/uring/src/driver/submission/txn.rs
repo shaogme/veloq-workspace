@@ -119,10 +119,10 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                 };
 
                 for &chunk_id in chunks.iter().take(resolved.chunk_count) {
-                    let _decision = self.env.ensure_chunk_registered(
+                    self.env.validate_registered_chunk(
                         chunk_id,
                         user_data,
-                        "driver.submit_txn.ensure_chunk_registered",
+                        "driver.submit_txn.validate_registered_chunk",
                     )?;
                 }
 

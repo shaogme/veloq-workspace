@@ -68,14 +68,13 @@ impl<'ops, 'registration, 'ring, 'a> SubmitPort<'ops, 'registration, 'ring, 'a> 
             ops,
             control,
             registration,
-            diagnostics,
             ring,
             ..
         } = self;
-        let (submitter, submission_queue, completion_queue) = ring.split();
+        let (_, submission_queue, completion_queue) = ring.split();
         drop(completion_queue);
         let control = control.with_submit_view(submission_queue);
-        let resources = registration.build_submit_view(submitter, diagnostics.backend());
+        let resources = registration.build_submit_view();
         let env = SubmitEnvironmentFactory::build(SubmitParts::new(control, resources));
         (ops, env)
     }

@@ -84,19 +84,20 @@ fn neg_code(code: i32) -> Option<i32> {
 #[inline]
 pub(crate) fn iocp_fallback_errno(kind: IocpError) -> i32 {
     match kind {
-        IocpError::DriverInit => 5,                   // EIO
-        IocpError::CompletionWait => 110,             // ETIMEDOUT
-        IocpError::Submission => 11,                  // EAGAIN
-        IocpError::Registration => 12,                // ENOMEM
-        IocpError::Rio(RioError::InvalidInput) => 22, // EINVAL
-        IocpError::Rio(_) => 5,                       // EIO
-        IocpError::ResolveFd => 9,                    // EBADF
-        IocpError::Socket => 5,                       // EIO
-        IocpError::Win32 => 5,                        // EIO
-        IocpError::InvalidInput => 22,                // EINVAL
-        IocpError::InvalidState => 5,                 // EIO
-        IocpError::Unsupported => 95,                 // EOPNOTSUPP
-        IocpError::Internal => 5,                     // EIO
+        IocpError::DriverInit => 5,                                 // EIO
+        IocpError::CompletionWait => 110,                           // ETIMEDOUT
+        IocpError::Submission => 11,                                // EAGAIN
+        IocpError::Registration => 12,                              // ENOMEM
+        IocpError::Rio(RioError::InvalidInput) => 22,               // EINVAL
+        IocpError::Rio(RioError::BufferRegistrationRequired) => 22, // EINVAL
+        IocpError::Rio(_) => 5,                                     // EIO
+        IocpError::ResolveFd => 9,                                  // EBADF
+        IocpError::Socket => 5,                                     // EIO
+        IocpError::Win32 => 5,                                      // EIO
+        IocpError::InvalidInput => 22,                              // EINVAL
+        IocpError::InvalidState => 5,                               // EIO
+        IocpError::Unsupported => 95,                               // EOPNOTSUPP
+        IocpError::Internal => 5,                                   // EIO
     }
 }
 
@@ -125,6 +126,14 @@ mod tests {
     fn rio_invalid_input_falls_back_to_einval() {
         assert_eq!(
             iocp_fallback_errno(IocpError::Rio(RioError::InvalidInput)),
+            22
+        );
+    }
+
+    #[test]
+    fn rio_buffer_registration_required_falls_back_to_einval() {
+        assert_eq!(
+            iocp_fallback_errno(IocpError::Rio(RioError::BufferRegistrationRequired)),
             22
         );
     }

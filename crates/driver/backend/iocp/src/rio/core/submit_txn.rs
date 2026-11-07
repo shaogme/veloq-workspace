@@ -16,14 +16,12 @@ use crate::{
     },
 };
 use diagweave::prelude::*;
-use veloq_buf::BufferRegistrar;
 use veloq_std::string::ToString;
 
 pub(crate) struct RioSubmitTxn<'a> {
     core: &'a mut RioCore,
     runtime: &'a mut RioRuntime,
     plan: RioSubmitPlan<'a>,
-    registrar: &'a dyn BufferRegistrar,
     rq: Option<RioRq>,
     socket_inflight: Option<SocketInflightToken>,
     data_buf: Option<RioPreparedBuffer>,
@@ -44,10 +42,9 @@ impl<'a> RioSubmitTxn<'a> {
         core: &'a mut RioCore,
         runtime: &'a mut RioRuntime,
         plan: RioSubmitPlan<'a>,
-        registrar: &'a dyn BufferRegistrar,
         submit: impl FnOnce(&RioKernel, &RioPreparedRequest) -> RioResult<()>,
     ) -> RioResult<RioSubmittedRequest> {
-        Self::new(core, runtime, plan, registrar)
+        Self::new(core, runtime, plan)
             .check_socket_accepting()?
             .ensure_actor()?
             .acquire_socket()?
@@ -58,18 +55,12 @@ impl<'a> RioSubmitTxn<'a> {
             .commit()
     }
 
-    fn new(
-        core: &'a mut RioCore,
-        runtime: &'a mut RioRuntime,
-        plan: RioSubmitPlan<'a>,
-        registrar: &'a dyn BufferRegistrar,
-    ) -> Self {
+    fn new(core: &'a mut RioCore, runtime: &'a mut RioRuntime, plan: RioSubmitPlan<'a>) -> Self {
         let outstanding_snapshot = core.outstanding_count();
         Self {
             core,
             runtime,
             plan,
-            registrar,
             rq: None,
             socket_inflight: None,
             data_buf: None,
@@ -173,16 +164,10 @@ impl<'a> RioSubmitTxn<'a> {
                     "failed to compute RIO submission buffer length",
                 )
             })?;
-        let dispatch = self.dispatch_for_stage(
-            "rio.core.submit_txn.prepare_buffer",
-            "failed to load RIO dispatch while preparing buffer",
-        )?;
-        let env = self.env(&dispatch);
         let data_buf = match self.core.registry_mut().prepare_submission(
             self.plan.buffer,
             self.plan.buffer_offset,
             buf_len,
-            env,
         ) {
             Ok(data_buf) => data_buf,
             Err(error) => {
@@ -483,15 +468,10 @@ impl<'a> RioSubmitTxn<'a> {
     }
 
     #[inline]
-    fn env<'d>(&self, dispatch: &'d RioDispatch) -> RioEnv<'d>
-    where
-        'a: 'd,
-    {
+    fn env<'d>(&self, dispatch: &'d RioDispatch) -> RioEnv<'d> {
         RioEnv {
-            registrar: self.registrar,
             dispatch,
             cq: self.core.kernel().cq(),
-            registration_mode: self.core.registration_mode(),
         }
     }
 
@@ -612,7 +592,6 @@ mod tests {
     };
     use super::{RioAddressPolicy, RioError, RioOpRequestInit, RioSubmitPlan};
     use crate::{
-        BufferRegistrationMode,
         config::{BorrowedRawHandle, IoFd, IocpHandle, RawHandle},
         rio::{
             RioOpKind, RioRuntime,
@@ -620,7 +599,7 @@ mod tests {
         },
     };
     use diagweave::prelude::*;
-    use veloq_buf::{FixedBuf, NoopRegistrar};
+    use veloq_buf::{BufferRegion, FixedBuf};
     use veloq_driver_core::{driver::OpToken, slot::Generation};
     use veloq_std::cell::Cell;
 
@@ -632,12 +611,24 @@ mod tests {
 
     fn test_context_with_dispatch(addr_capacity: usize) -> (RioCore, RioRuntime) {
         let dispatch = RioRegistryTestSupport::test_dispatch();
-        let mut core = RioCore::new(
-            RioKernel::noop(),
-            RioRegistry::new(32, addr_capacity),
-            BufferRegistrationMode::Strict,
-        );
+        let mut core = RioCore::new(RioKernel::noop(), RioRegistry::new(32, addr_capacity));
         core.kernel_mut().set_dispatch_table(Some(dispatch));
+        let chunk = RioRegistryTestSupport::chunk_info();
+        let dispatch = RioRegistryTestSupport::test_dispatch();
+        let env = RioRegistryTestSupport::test_env(&dispatch);
+        // SAFETY: the shared test pool owns this exact chunk for the full registry lifetime. / 安全性：共享测试池拥有该 chunk，并覆盖注册表的完整生命周期。
+        let mut region = unsafe {
+            BufferRegion::new(
+                chunk.id,
+                chunk.ptr,
+                chunk.len,
+                RioRegistryTestSupport::chunk_owner(),
+                chunk.allocation_strategy,
+            )
+        };
+        core.registry_mut()
+            .register_buffer_backend(region.registration_request(), env)
+            .expect("test RIO chunk registration should succeed");
         (core, RioRuntime::new())
     }
 
@@ -712,7 +703,6 @@ mod tests {
             &mut core,
             &mut runtime,
             multi_plan(raw.borrow(), &first_buf, 7, 11),
-            &NoopRegistrar,
             |kernel, request| {
                 first_context.set(request.as_request_context() as usize as u64);
                 let addr = request.addr().expect("multishot address lease");
@@ -729,7 +719,6 @@ mod tests {
             &mut core,
             &mut runtime,
             multi_plan(raw.borrow(), &second_buf, 8, 3),
-            &NoopRegistrar,
             |kernel, request| {
                 second_context.set(request.as_request_context() as usize as u64);
                 let addr = request.addr().expect("multishot address lease");
@@ -802,13 +791,9 @@ mod tests {
         let buf = RioRegistryTestSupport::fixed_buf(64, 16);
         let plan = test_plan(raw.borrow(), &buf, RioAddressPolicy::RecvMulti);
 
-        let err = match RioSubmitTxn::execute(
-            &mut core,
-            &mut runtime,
-            plan,
-            &NoopRegistrar,
-            |_kernel, _request| panic!("closing socket should fail before kernel submit"),
-        ) {
+        let err = match RioSubmitTxn::execute(&mut core, &mut runtime, plan, |_kernel, _request| {
+            panic!("closing socket should fail before kernel submit")
+        }) {
             Ok(_) => panic!("closing socket should reject submission transaction"),
             Err(error) => error,
         };
@@ -820,8 +805,7 @@ mod tests {
         assert!(runtime.actor_index_is_empty());
         assert_eq!(core.registry().addr_free_slot_count(), 4);
         assert!((0..4).all(|slot| !core.registry().addr_slot_in_use(slot)));
-        assert_eq!(core.registry().heap_registration_count(), 0);
-        assert_eq!(RioRegistryTestSupport::next_register_id(), 100);
+        assert_eq!(RioRegistryTestSupport::next_register_id(), 101);
     }
 
     #[test]
@@ -837,18 +821,12 @@ mod tests {
         let request_context = Cell::new(0_u64);
         let plan = test_plan(raw.borrow(), &buf, RioAddressPolicy::RecvMulti);
 
-        let err = match RioSubmitTxn::execute(
-            &mut core,
-            &mut runtime,
-            plan,
-            &NoopRegistrar,
-            |_kernel, request| {
-                request_context.set(request.as_request_context() as usize as u64);
-                Err(RioError::Datapath
-                    .to_report()
-                    .attach_note("synthetic submit failure"))
-            },
-        ) {
+        let err = match RioSubmitTxn::execute(&mut core, &mut runtime, plan, |_kernel, request| {
+            request_context.set(request.as_request_context() as usize as u64);
+            Err(RioError::Datapath
+                .to_report()
+                .attach_note("synthetic submit failure"))
+        }) {
             Ok(_) => panic!("kernel submit failure should roll back transaction"),
             Err(error) => error,
         };

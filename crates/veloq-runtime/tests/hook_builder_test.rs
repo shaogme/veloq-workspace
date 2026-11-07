@@ -48,7 +48,13 @@ fn wake_after_park(shared: &RuntimeShared<Extra>, _: IdleWaitStrategy) -> Result
 
 fn run_until_park<F, H>(builder: RuntimeBuilder<Extra, F, H>, state: Arc<HookState>) -> usize
 where
-    F: for<'rt> Fn(usize, &'rt RuntimeShared<Extra>) -> Extra + Send + Sync + 'static,
+    F: for<'rt> Fn(
+            usize,
+            &'rt RuntimeShared<Extra>,
+        ) -> veloq_runtime::runtime::WorkerFactoryResult<Extra>
+        + Send
+        + Sync
+        + 'static,
 {
     builder
         .scope(async move |_| {
@@ -74,8 +80,10 @@ where
         .expect("runtime with recording park hook should complete")
 }
 
-fn worker_factory(state: Arc<HookState>) -> impl Fn(usize, &RuntimeShared<Extra>) -> Extra {
-    move |_, _| state.clone()
+fn worker_factory(
+    state: Arc<HookState>,
+) -> impl Fn(usize, &RuntimeShared<Extra>) -> veloq_runtime::runtime::WorkerFactoryResult<Extra> {
+    move |_, _| Ok(state.clone())
 }
 
 #[test]

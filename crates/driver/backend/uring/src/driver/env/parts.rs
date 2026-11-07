@@ -1,4 +1,4 @@
-use veloq_buf::{BufferRegistrar, heap::ChunkId};
+use veloq_buf::{RegionInfo, RegistrationCapability};
 
 use crate::{
     driver::{
@@ -8,12 +8,6 @@ use crate::{
     error::{UringError, UringResult},
 };
 use diagweave::prelude::*;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ChunkRegistrationDecision {
-    Fixed,
-    RawFallback,
-}
 
 /// What a `IOSQE_BUFFER_SELECT` submission needs to know about the provided-buffer ring.
 ///
@@ -37,13 +31,12 @@ impl ProvidedBufSqeInfo {
 ///
 /// `make_sqe` runs with the slot's op and payload borrowed mutably out of
 /// the operation registry, so it must not be able to reach that registry itself. These fields are
-/// disjoint from it and are handed out by value or immutably: lazy chunk registration happens
-/// *after* `make_sqe` returns, so nothing here needs to be mutated during SQE construction.
-/// `make_sqe` 持有操作 slot 的可变借用，因此只能读取彼此独立的状态；惰性 chunk 注册在构造 SQE 后进行。
+/// disjoint from it and are handed out by value or immutably: fixed-buffer registration is
+/// completed during pool startup, so SQE construction only validates the worker ledger.
+/// `make_sqe` 持有操作 slot 的可变借用，因此只能读取彼此独立的状态；固定 buffer 注册在 pool 启动时完成，构造 SQE 时只校验 worker 账本。
 pub(crate) struct SqeEnv<'d> {
     file_table: &'d FileTable,
     chunk_records: &'d [Option<ChunkRegistrationRecord>],
-    registrar: &'d (dyn BufferRegistrar + 'd),
     provided: Option<ProvidedBufSqeInfo>,
 }
 
@@ -89,13 +82,11 @@ impl SqeEnv<'_> {
     pub(crate) fn from_parts<'d>(
         file_table: &'d FileTable,
         chunk_records: &'d [Option<ChunkRegistrationRecord>],
-        registrar: &'d (dyn BufferRegistrar + 'd),
         provided: Option<ProvidedBufSqeInfo>,
     ) -> SqeEnv<'d> {
         SqeEnv {
             file_table,
             chunk_records,
-            registrar,
             provided,
         }
     }
@@ -119,26 +110,41 @@ impl SqeEnv<'_> {
         Ok((info.bgid, info.buf_size))
     }
 
-    /// Whether `chunk` is already in the kernel's fixed-buffer table.
-    ///
-    /// An out-of-range id answers `false`, which simply selects the non-fixed opcode — the
-    /// same outcome as a chunk that has not been registered yet.
-    /// 越界 chunk id 返回 `false`，与尚未注册的 chunk 一样选择非 fixed opcode。
+    /// Validate explicit registration metadata against the worker ledger.
+    /// 根据 worker 账本校验 buffer 显式携带的注册区域。
     #[inline]
-    pub(crate) fn is_chunk_registered(&self, chunk: ChunkId) -> bool {
+    pub(crate) fn fixed_buffer_index(&self, info: RegionInfo) -> UringResult<Option<u16>> {
+        let RegistrationCapability::RegisteredChunk(chunk) = info.registration else {
+            return Ok(None);
+        };
+        if chunk != info.id {
+            return UringError::InvalidState
+                .push_ctx("scope", "uring.sqe_env.fixed_buffer_index")
+                .with_ctx("declared_chunk_id", chunk.raw())
+                .with_ctx("resolved_chunk_id", info.id.raw())
+                .attach_note("registered buffer capability does not match its backing region");
+        }
         let Some(record) = self
             .chunk_records
             .get(chunk.as_usize())
             .and_then(Option::as_ref)
         else {
-            return false;
+            return UringError::InvalidState
+                .push_ctx("scope", "uring.sqe_env.fixed_buffer_index")
+                .with_ctx("chunk_id", chunk.raw())
+                .attach_note("registered buffer has no worker registration record");
         };
-        let Some(info) = self.registrar.resolve_chunk_info(chunk) else {
-            return false;
-        };
-        record.state() == ChunkRegistrationState::Registered
-            && info.id == chunk
-            && record.matches(chunk, info.ptr.as_ptr(), info.len.get())
+        if record.state() != ChunkRegistrationState::Registered
+            || !record.matches(chunk, info.base_ptr.as_ptr(), info.region_len.get())
+        {
+            return UringError::InvalidState
+                .push_ctx("scope", "uring.sqe_env.fixed_buffer_index")
+                .with_ctx("chunk_id", chunk.raw())
+                .with_ctx("region_ptr", info.base_ptr.as_ptr() as usize)
+                .with_ctx("region_len", info.region_len.get())
+                .attach_note("registered buffer identity does not match the worker ledger");
+        }
+        Ok(Some(chunk.raw()))
     }
 }
 
@@ -146,28 +152,22 @@ impl SqeEnv<'_> {
 impl<'d> SqeEnv<'d> {
     /// Creates the smallest submission environment needed by projection tests.
     /// 为视图投影测试创建所需的最小提交环境。
-    pub(crate) fn for_test(
-        file_table: &'d FileTable,
-        registrar: &'d (dyn BufferRegistrar + 'd),
-    ) -> Self {
+    pub(crate) fn for_test(file_table: &'d FileTable) -> Self {
         Self {
             file_table,
             chunk_records: &[],
-            registrar,
             provided: None,
         }
     }
 
     pub(crate) fn for_test_with_provided(
         file_table: &'d FileTable,
-        registrar: &'d (dyn BufferRegistrar + 'd),
         bgid: u16,
         buf_size: u32,
     ) -> Self {
         Self {
             file_table,
             chunk_records: &[],
-            registrar,
             provided: Some(ProvidedBufSqeInfo::new(bgid, buf_size)),
         }
     }

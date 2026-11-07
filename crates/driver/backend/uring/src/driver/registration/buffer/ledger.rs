@@ -84,7 +84,7 @@ fn update_errno(outcome: KernelUpdateOutcome) -> Option<i32> {
 pub(crate) enum ChunkRegistrationState {
     Registering,
     Registered,
-    Fallback,
+    Rejected,
     Quarantined,
 }
 

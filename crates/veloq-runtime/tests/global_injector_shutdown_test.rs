@@ -58,6 +58,7 @@ fn wake_failure_drains_pending_scope_without_hanging() {
                         })
                     })
                     .expect("worker waker must be bound once");
+                Ok(())
             }
         })
         .scope(async |ctx| {
@@ -95,6 +96,7 @@ fn worker_initialization_panic_closes_runtime_without_waiting_for_missing_worker
         .with_worker_count(NonZeroUsize::new(2))
         .with_worker_factory(|worker_id: usize, _shared: &RuntimeShared<()>| {
             assert_eq!(worker_id, 0, "only worker 0 should finish initialization");
+            Ok(())
         })
         .scope(async |_ctx| ());
 
@@ -128,6 +130,7 @@ fn main_worker_initialization_panic_runs_shutdown_completion() {
                 }
 
                 assert_eq!(worker_id, 1, "only worker 1 should finish initialization");
+                Ok(())
             }
         })
         .scope(async |_ctx| ());

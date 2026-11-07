@@ -9,16 +9,14 @@ use crate::{
         control::{ControlPlaneEvent, ControlPlaneObserver},
         env::{
             CompletionControlParts, CompletionControlView, CompletionLedgerParts,
-            CompletionMetadata, SubmissionControlParts, SubmitControlView,
-            SubmissionLedgerParts, SubmissionSidecarParts,
+            CompletionMetadata, SubmissionControlParts, SubmissionLedgerParts,
+            SubmissionSidecarParts, SubmitControlView,
         },
     },
     op::CompletionCleanupHintFn,
 };
-use veloq_driver_core::{
-    driver::{
-        CancelRequest, CancelTicket, CompletionToken, OpToken, RawCompletion, RemoteCancelSender,
-    },
+use veloq_driver_core::driver::{
+    CancelRequest, CancelTicket, CompletionToken, OpToken, RawCompletion, RemoteCancelSender,
 };
 use veloq_io_uring::SubmissionQueue;
 use veloq_std::{

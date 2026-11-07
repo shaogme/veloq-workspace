@@ -599,7 +599,7 @@ impl LifecycleEngine {
         if reserved {
             self.complete_reserved_submission_error(context, token, report)
         } else {
-            self.complete_queued_submission_error(context, token, report)
+            self.complete_queued_submission_error(token, report)
         }
     }
 
@@ -627,7 +627,7 @@ impl LifecycleEngine {
             _ => false,
         };
         if prepared {
-            self.complete_queued_submission_error(context, token, report)
+            self.complete_queued_submission_error(token, report)
         } else {
             Err(report)
         }
@@ -635,7 +635,6 @@ impl LifecycleEngine {
 
     fn complete_queued_submission_error(
         &mut self,
-        _context: &mut LifecycleContext<'_, '_, '_, '_>,
         token: OpToken,
         report: Report<UringError>,
     ) -> UringResult<()> {

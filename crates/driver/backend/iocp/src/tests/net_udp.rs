@@ -3,17 +3,18 @@ use crate::{
     driver::IocpDriver,
     net::socket::Socket,
     op::{SendTo, UdpRecvMulti},
-    tests::{complete_from_record, submit_test_op, wait_completion, wait_completion_record},
+    tests::{
+        complete_from_record, completion_os_error_code, submit_test_op, wait_completion,
+        wait_completion_record,
+    },
 };
-use veloq_buf::{
-    BufPool, FixedBuf, NoopRegistrar, PoolTopology, UniformSlot,
-    heap::{GlobalSlotPool, ThreadMemoryMultiplier},
-};
+use veloq_buf::{BufPool, FixedBuf, LockedMemoryBudget, UniformSlot};
 use veloq_driver_core::{
-    driver::{CancelRequest, Driver, RegisterFd},
+    driver::{CancelRequest, CompletionContinuation, Driver, RegisterFd},
     platform::receive_pump::{ReceivePumpConfig, ReceivePumpState, ReceiveSlot},
 };
-use veloq_std::{num::NonZeroUsize, nz, sync::Arc, time::Duration, vec};
+use veloq_std::{num::NonZeroUsize, nz, time::Duration, vec, vec::Vec};
+use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 
 fn register_owned_socket(driver: &mut IocpDriver, socket: Socket) -> IoFd {
     let handle = socket.into_owned_raw();
@@ -25,40 +26,36 @@ fn register_owned_socket(driver: &mut IocpDriver, socket: Socket) -> IoFd {
         .expect("register_files returned empty")
 }
 
-fn register_buf_chunk(
-    driver: &mut IocpDriver,
-    global_pool: &Arc<GlobalSlotPool>,
-    buf: &FixedBuf,
-    label: &'static str,
-) {
-    let region = buf.resolve_region_info();
-    let chunk = global_pool
-        .chunk_info(region.id)
-        .unwrap_or_else(|| panic!("{label} chunk not found"));
-    driver
-        .register_buffer(region.id, chunk.ptr.as_ptr(), chunk.len.get())
-        .unwrap_or_else(|_| panic!("register {label} chunk failed"));
+fn receive_pump(buffer: FixedBuf) -> ReceivePumpState {
+    receive_pump_with_buffers(vec![buffer], 1)
 }
 
-fn receive_pump(buffer: FixedBuf) -> ReceivePumpState {
+fn receive_pump_with_buffers(buffers: Vec<FixedBuf>, depth: usize) -> ReceivePumpState {
     let config = ReceivePumpConfig {
-        kernel_capacity: NonZeroUsize::new(1).expect("non-zero receive depth"),
+        kernel_capacity: NonZeroUsize::new(depth).expect("non-zero receive depth"),
         queue_capacity: NonZeroUsize::new(1).expect("non-zero queue capacity"),
         datagram_capacity: NonZeroUsize::new(8192).expect("non-zero datagram capacity"),
         close_timeout: Duration::from_secs(5),
     };
-    ReceivePumpState::try_new(config, vec![ReceiveSlot::new(0, buffer)].into_boxed_slice())
-        .expect("valid receive pump")
+    let slots = buffers
+        .into_iter()
+        .enumerate()
+        .map(|(slot_id, buffer)| {
+            ReceiveSlot::new(u32::try_from(slot_id).expect("slot id fits u32"), buffer)
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    ReceivePumpState::try_new(config, slots).expect("valid receive pump")
 }
 
 #[test]
 fn test_rio_udp_recv_multi_delivers_datagram_and_arms_replacement() {
-    let registrar = NoopRegistrar;
-    let mut driver =
-        IocpDriver::new(IocpConfig::default(), &registrar).expect("Driver creation failed");
+    let budget = LockedMemoryBudget::new(64 * 1024 * 1024);
+    let mut driver = IocpDriver::new(IocpConfig::default().locked_memory_budget(budget.clone()))
+        .expect("Driver creation failed");
 
-    let source = Socket::new_udp_v4().expect("source socket create failed");
-    let receiver = Socket::new_udp_v4().expect("receiver socket create failed");
+    let source = Socket::new_rio_udp_v4().expect("source socket create failed");
+    let receiver = Socket::new_rio_udp_v4().expect("receiver socket create failed");
     source
         .bind("127.0.0.1:0".parse().unwrap())
         .expect("source bind failed");
@@ -71,12 +68,9 @@ fn test_rio_udp_recv_multi_delivers_datagram_and_arms_replacement() {
     let source_fd = register_owned_socket(&mut driver, source);
     let receiver_fd = register_owned_socket(&mut driver, receiver);
 
-    let multiplier = ThreadMemoryMultiplier(NonZeroUsize::new(10).unwrap());
-    let topology = UniformSlot::new(multiplier);
-    let global_pool = topology.create_pool(1).expect("create pool failed");
-    let reg_pool = topology
-        .build(&global_pool, 0, &veloq_buf::NoopRegistrar)
-        .expect("build buffer pool failed");
+    let pool_capacity_bytes = 10 * 4 * 1024 * 1024;
+    let topology = UniformSlot::new(pool_capacity_bytes);
+    let reg_pool = super::build_registered_pool(&mut driver, &topology, budget, 0);
 
     let test_data = b"rio-udp-recv-multi";
     let mut send_buf = reg_pool
@@ -86,9 +80,6 @@ fn test_rio_udp_recv_multi_delivers_datagram_and_arms_replacement() {
     let recv_buf = reg_pool
         .alloc_full(nz!(8192))
         .expect("receive allocation failed");
-    register_buf_chunk(&mut driver, &global_pool, &send_buf, "send");
-    register_buf_chunk(&mut driver, &global_pool, &recv_buf, "receive");
-
     let recv_token = submit_test_op(
         &mut driver,
         UdpRecvMulti::from_backend(receiver_fd, receive_pump(recv_buf)),
@@ -119,4 +110,72 @@ fn test_rio_udp_recv_multi_delivers_datagram_and_arms_replacement() {
     assert_eq!(packet.addr, source_addr);
 
     let _ = driver.cancel_op(CancelRequest::user_visible(recv_token));
+}
+
+#[test]
+fn test_raw_udp_recv_multi_runs_with_multiple_overlapped_requests() {
+    let mut driver = IocpDriver::new(IocpConfig::default()).expect("Driver creation failed");
+    let source = Socket::new_udp_v4().expect("source socket create failed");
+    let receiver = Socket::new_udp_v4().expect("receiver socket create failed");
+    source
+        .bind("127.0.0.1:0".parse().unwrap())
+        .expect("source bind failed");
+    receiver
+        .bind("127.0.0.1:0".parse().unwrap())
+        .expect("receiver bind failed");
+    let source_addr = source.local_addr().expect("source local_addr failed");
+    let receiver_addr = receiver.local_addr().expect("receiver local_addr failed");
+    let source_fd = register_owned_socket(&mut driver, source);
+    let receiver_fd = register_owned_socket(&mut driver, receiver);
+
+    let first_receive_buffer =
+        FixedBuf::alloc_heap(nz!(8192), 0).expect("first receive buffer allocation failed");
+    let second_receive_buffer =
+        FixedBuf::alloc_heap(nz!(8192), 0).expect("second receive buffer allocation failed");
+    let recv_token = submit_test_op(
+        &mut driver,
+        UdpRecvMulti::from_backend(
+            receiver_fd,
+            receive_pump_with_buffers(vec![first_receive_buffer, second_receive_buffer], 2),
+        ),
+    );
+
+    for test_data in [b"raw-udp-first".as_slice(), b"raw-udp-second".as_slice()] {
+        let mut send_buf =
+            FixedBuf::alloc_heap(nz!(128), test_data.len()).expect("send buffer allocation failed");
+        send_buf.spare_capacity_mut()[..test_data.len()].copy_from_slice(test_data);
+        let send_token = submit_test_op(
+            &mut driver,
+            SendTo {
+                fd: source_fd,
+                buf: send_buf,
+                buf_offset: 0,
+                addr: receiver_addr,
+            },
+        );
+        assert_eq!(
+            wait_completion(&mut driver, send_token, Duration::from_secs(5))
+                .expect("send_to completion failed"),
+            test_data.len()
+        );
+
+        let record = wait_completion_record(&mut driver, recv_token, Duration::from_secs(5))
+            .expect("raw udp_recv_multi completion missing");
+        assert_eq!(record.continuation, CompletionContinuation::More);
+        let completion = complete_from_record::<UdpRecvMulti>(record);
+        let (recv_result, packet) = completion.into_parts();
+        let bytes = recv_result.expect("raw udp_recv_multi completion failed");
+        assert_eq!(&packet.buf.as_slice()[..bytes], test_data);
+        assert_eq!(packet.addr, source_addr);
+    }
+
+    driver
+        .cancel_op(CancelRequest::user_visible(recv_token))
+        .expect("raw udp_recv_multi cancellation failed");
+    let error = wait_completion(&mut driver, recv_token, Duration::from_secs(5))
+        .expect_err("cancelled raw udp_recv_multi should return an error");
+    assert_eq!(
+        completion_os_error_code(&error),
+        Some(ERROR_OPERATION_ABORTED as i32)
+    );
 }

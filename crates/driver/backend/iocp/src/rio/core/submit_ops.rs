@@ -12,7 +12,7 @@ use crate::{
     rio::RioRuntime,
 };
 use diagweave::prelude::*;
-use veloq_buf::{BufferRegistrar, FixedBuf};
+use veloq_buf::FixedBuf;
 use veloq_driver_core::driver::OpToken;
 use veloq_driver_core::platform::receive_pump::{
     ReceivePumpError, ReceivePumpState, ReceiveReplacementReservation,
@@ -111,7 +111,6 @@ pub(crate) struct RioReceiveSlotSubmit<'a> {
     pub(crate) buf: &'a FixedBuf,
     pub(crate) slot_id: u32,
     pub(crate) slot_generation: u32,
-    pub(crate) registrar: &'a dyn BufferRegistrar,
 }
 
 pub(crate) struct RioReceiveReplacementArgs<'a> {
@@ -119,7 +118,6 @@ pub(crate) struct RioReceiveReplacementArgs<'a> {
     pub(crate) op_kind: RioOpKind,
     pub(crate) pump: &'a mut ReceivePumpState,
     pub(crate) reservation: ReceiveReplacementReservation,
-    pub(crate) registrar: &'a dyn BufferRegistrar,
 }
 
 pub(crate) struct RioSubmitOperations<'a> {
@@ -135,26 +133,23 @@ impl<'a> RioSubmitOperations<'a> {
     fn submit_rio(
         &mut self,
         plan: RioSubmitPlan<'_>,
-        registrar: &dyn BufferRegistrar,
         submit: impl FnOnce(&RioKernel, &RioPreparedRequest) -> RioResult<()>,
     ) -> RioResult<SubmissionResult> {
-        self.submit_rio_with_request(plan, registrar, submit)
+        self.submit_rio_with_request(plan, submit)
             .map(|submitted| submitted.result)
     }
 
     fn submit_rio_with_request(
         &mut self,
         plan: RioSubmitPlan<'_>,
-        registrar: &dyn BufferRegistrar,
         submit: impl FnOnce(&RioKernel, &RioPreparedRequest) -> RioResult<()>,
     ) -> RioResult<RioSubmittedRequest> {
-        RioSubmitTxn::execute(self.core, self.runtime, plan, registrar, submit)
+        RioSubmitTxn::execute(self.core, self.runtime, plan, submit)
     }
 
     pub(crate) fn try_submit_send_to(
         &mut self,
         args: RioSendToArgs<'_>,
-        registrar: &dyn BufferRegistrar,
     ) -> RioResult<SubmissionResult> {
         let RioSendToArgs {
             fd,
@@ -184,7 +179,6 @@ impl<'a> RioSubmitOperations<'a> {
                 receive_slot_id: None,
                 receive_slot_generation: None,
             },
-            registrar,
             |kernel, request| {
                 let Some(addr) = request.addr() else {
                     return RioError::Internal.attach_note("RIO send_to missing prepared address");
@@ -203,18 +197,8 @@ impl<'a> RioSubmitOperations<'a> {
         &mut self,
         target: RioTarget<'_>,
         buf: &mut FixedBuf,
-        registrar: &dyn BufferRegistrar,
     ) -> RioResult<SubmissionResult> {
-        self.try_submit_recv_internal(RioOpKind::Recv, target, buf, registrar)
-    }
-
-    pub(crate) fn try_submit_recv_provided(
-        &mut self,
-        target: RioTarget<'_>,
-        buf: &mut FixedBuf,
-        registrar: &dyn BufferRegistrar,
-    ) -> RioResult<SubmissionResult> {
-        self.try_submit_recv_internal(RioOpKind::RecvProvided, target, buf, registrar)
+        self.try_submit_recv_internal(RioOpKind::Recv, target, buf)
     }
 
     fn try_submit_recv_internal(
@@ -222,7 +206,6 @@ impl<'a> RioSubmitOperations<'a> {
         op_kind: RioOpKind,
         target: RioTarget<'_>,
         buf: &mut FixedBuf,
-        registrar: &dyn BufferRegistrar,
     ) -> RioResult<SubmissionResult> {
         let RioTarget {
             fd,
@@ -249,7 +232,6 @@ impl<'a> RioSubmitOperations<'a> {
                 receive_slot_id: None,
                 receive_slot_generation: None,
             },
-            registrar,
             |kernel, request| {
                 kernel.submit_receive(
                     request.rq(),
@@ -264,7 +246,6 @@ impl<'a> RioSubmitOperations<'a> {
         &mut self,
         target: RioTarget<'_>,
         buf: &FixedBuf,
-        registrar: &dyn BufferRegistrar,
     ) -> RioResult<SubmissionResult> {
         let RioTarget {
             fd,
@@ -291,7 +272,6 @@ impl<'a> RioSubmitOperations<'a> {
                 receive_slot_id: None,
                 receive_slot_generation: None,
             },
-            registrar,
             |kernel, request| {
                 kernel.submit_send(
                     request.rq(),
@@ -312,7 +292,6 @@ impl<'a> RioSubmitOperations<'a> {
             buf,
             slot_id,
             slot_generation,
-            registrar,
         } = input;
         let RioTarget {
             fd,
@@ -340,7 +319,6 @@ impl<'a> RioSubmitOperations<'a> {
                 receive_slot_id: Some(slot_id),
                 receive_slot_generation: Some(slot_generation),
             },
-            registrar,
             |kernel, request| Self::submit_receive_multi(kernel, op_kind, request),
         )
     }
@@ -354,7 +332,6 @@ impl<'a> RioSubmitOperations<'a> {
             op_kind,
             pump,
             reservation,
-            registrar,
         } = args;
         let Some(slot) = pump.slot(reservation.slot_id()) else {
             return Err(Self::receive_pump_error(
@@ -367,7 +344,6 @@ impl<'a> RioSubmitOperations<'a> {
             buf: slot.data_buf(),
             slot_id: reservation.slot_id(),
             slot_generation: reservation.slot_generation(),
-            registrar,
         })
     }
 
@@ -376,7 +352,6 @@ impl<'a> RioSubmitOperations<'a> {
         target: RioTarget<'_>,
         op_kind: RioOpKind,
         pump: &mut ReceivePumpState,
-        registrar: &dyn BufferRegistrar,
     ) -> RioResult<()> {
         pump.start().map_err(Self::receive_pump_error)?;
         let RioTarget {
@@ -404,7 +379,6 @@ impl<'a> RioSubmitOperations<'a> {
                 buf: slot.data_buf(),
                 slot_id: submission.slot_id,
                 slot_generation: submission.slot_generation,
-                registrar,
             });
             match result {
                 Ok(submitted) => {

@@ -1,5 +1,5 @@
 use veloq::{
-    buf::{UniformSlot, heap::ThreadMemoryMultiplier},
+    buf::UniformSlot,
     nz,
     runtime::{Runtime, context::Ctx, scope},
     std::{
@@ -24,7 +24,7 @@ fn run_test<F, R>(workers: NonZeroUsize, f: F) -> R
 where
     F: for<'rt> AsyncFnOnce(Ctx<'rt>) -> R,
 {
-    Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(4))))
+    Runtime::builder(UniformSlot::new(16 * 1024 * 1024))
         .worker_count(Some(workers))
         .scope(f)
         .expect("runtime scope failed")

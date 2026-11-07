@@ -5,13 +5,13 @@ use veloq::{
     nz,
     runtime::{Runtime, context::Ctx, scope_local},
 };
-use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier};
+use veloq_buf::UniformSlot;
 
 fn run_test<F, R>(f: F) -> R
 where
     F: for<'s> AsyncFnOnce(Ctx<'s>) -> R,
 {
-    Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(4))))
+    Runtime::builder(UniformSlot::new(4 * 4 * 1024 * 1024))
         .worker_count(Some(nz!(1)))
         .scope(f)
         .expect("failed to run scope")

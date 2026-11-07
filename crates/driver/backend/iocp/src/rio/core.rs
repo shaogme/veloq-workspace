@@ -1,8 +1,6 @@
 //! Core context encoding, registry ownership, and kernel dispatch wrappers. / 核心上下文编码、注册表所有权和内核分发表封装。
 
-use crate::BufferRegistrationMode;
 use diagweave::prelude::*;
-use veloq_buf::BufferRegistrar;
 
 mod registry;
 mod request;
@@ -27,10 +25,8 @@ pub(crate) use submit_txn::{RioSubmitTxn, RioSubmittedRequest};
 
 #[derive(Clone, Copy)]
 pub(crate) struct RioEnv<'a> {
-    pub(crate) registrar: &'a dyn BufferRegistrar,
     pub(crate) dispatch: &'a RioDispatch,
     pub(crate) cq: RioCq,
-    pub(crate) registration_mode: BufferRegistrationMode,
 }
 
 set! {
@@ -40,6 +36,8 @@ set! {
         LibraryLoad,
         #[display("failed to register memory buffer for RIO")]
         BufferRegistration,
+        #[display("RIO requires a registered buffer")]
+        BufferRegistrationRequired,
         #[display("failed to create RIO completion queue")]
         CqCreation,
         #[display("failed to create RIO request queue")]
@@ -62,7 +60,6 @@ pub(crate) type RioResult<T> = Result<T, Report<RioError>>;
 pub(crate) struct RioCore {
     kernel: RioKernel,
     registry: RioRegistry,
-    registration_mode: BufferRegistrationMode,
     rio_outstanding_count: usize,
     cq_armed: bool,
 }
@@ -73,26 +70,17 @@ pub(super) struct RioCoreRegistryEnv<'a> {
 }
 
 impl RioCore {
-    pub(super) fn new(
-        kernel: RioKernel,
-        registry: RioRegistry,
-        registration_mode: BufferRegistrationMode,
-    ) -> Self {
+    pub(super) fn new(kernel: RioKernel, registry: RioRegistry) -> Self {
         Self {
             kernel,
             registry,
-            registration_mode,
             rio_outstanding_count: 0,
             cq_armed: true,
         }
     }
 
-    pub(super) fn empty(registration_mode: BufferRegistrationMode) -> Self {
-        Self::new(
-            RioKernel::noop(),
-            RioRegistry::new(32, 1),
-            registration_mode,
-        )
+    pub(super) fn empty() -> Self {
+        Self::new(RioKernel::noop(), RioRegistry::empty())
     }
 
     pub(super) fn kernel(&self) -> &RioKernel {
@@ -111,19 +99,12 @@ impl RioCore {
         &mut self.registry
     }
 
-    pub(super) fn registry_with_env<'a>(
-        &'a mut self,
-        registrar: &'a dyn BufferRegistrar,
-    ) -> RioCoreRegistryEnv<'a> {
-        let env = self.kernel.env(registrar, self.registration_mode);
+    pub(super) fn registry_with_env<'a>(&'a mut self) -> RioCoreRegistryEnv<'a> {
+        let env = self.kernel.env();
         RioCoreRegistryEnv {
             registry: &mut self.registry,
             env,
         }
-    }
-
-    pub(super) const fn registration_mode(&self) -> BufferRegistrationMode {
-        self.registration_mode
     }
 
     pub(super) const fn outstanding_count(&self) -> usize {

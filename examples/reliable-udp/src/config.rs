@@ -623,8 +623,7 @@ fn validate_values(config: &Config) -> Result<(), ConfigError> {
 
     let name = "ack_delay";
     let timeout = config.ack_delay;
-    if !timeout.is_zero() && timeout.as_nanos().div_ceil(tick.as_nanos()) > u128::from(u64::MAX)
-    {
+    if !timeout.is_zero() && timeout.as_nanos().div_ceil(tick.as_nanos()) > u128::from(u64::MAX) {
         return Err(ConfigError::TimeoutRangeOverflow { name });
     }
 

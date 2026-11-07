@@ -17,7 +17,6 @@ use windows_sys::Win32::Networking::WinSock::RIO_BUF;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RioOpKind {
     Recv,
-    RecvProvided,
     Send,
     SendTo,
     TcpRecvMulti,
@@ -28,7 +27,6 @@ impl RioOpKind {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Recv => "recv",
-            Self::RecvProvided => "recv_provided",
             Self::Send => "send",
             Self::SendTo => "send_to",
             Self::TcpRecvMulti => "recv_multi",

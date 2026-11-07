@@ -6,7 +6,7 @@
 //! 超时兜底：只要 join 或取消唤醒任何一环缺失，它们就会挂住或断言失败。**
 
 use veloq_runtime::{
-    runtime::{RuntimeBuilder, RuntimeShared},
+    runtime::{DefaultWorkerFactoryFor, RuntimeBuilder},
     scope, select, task,
     task::{RawTask, Task, TaskError},
 };
@@ -24,7 +24,7 @@ use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
 #[cfg(feature = "std")]
 use veloq_std::string::String;
 
-fn with_workers(count: usize) -> RuntimeBuilder<(), fn(usize, &RuntimeShared<()>)> {
+fn with_workers(count: usize) -> RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
     RuntimeBuilder::new().with_worker_count(NonZeroUsize::new(count))
 }
 

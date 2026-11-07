@@ -1,7 +1,10 @@
 use veloq_std::num::NonZeroU8;
 
 use diagweave::prelude::*;
-use veloq_driver_core::driver::{CancelMode, CompletionBackend};
+use veloq_driver_core::{
+    driver::{CancelMode, CompletionBackend, UserCompletionEvent},
+    platform::receive_pump::ReceiveRequest,
+};
 
 use crate::{
     error::{IocpError, IocpResult},
@@ -19,6 +22,14 @@ pub(crate) const COMP_BACKEND_RIO: CompletionBackend =
         Some(val) => val,
         None => unreachable!(),
     });
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum IocpBackendIngress {
+    UdpReceive {
+        event: UserCompletionEvent,
+        request: ReceiveRequest,
+    },
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IocpSubmissionFailurePhase {

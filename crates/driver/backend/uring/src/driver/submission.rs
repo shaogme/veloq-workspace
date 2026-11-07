@@ -132,10 +132,10 @@ fn submit_queued_from_slot(
     };
 
     for &chunk_id in chunks.iter().take(resolved.chunk_count) {
-        let _decision = env.ensure_chunk_registered(
+        env.validate_registered_chunk(
             chunk_id,
             user_data,
-            "driver.submit_queued_from_slot.ensure_chunk_registered",
+            "driver.submit_queued_from_slot.validate_registered_chunk",
         )?;
     }
 

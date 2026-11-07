@@ -5,17 +5,16 @@ use crate::{
     net::{addr::socket_addr_to_storage, socket::Socket},
     op::{Accept, AcceptMulti, Connect, Recv, RecvMulti, RecvProvided},
     tests::{
-        complete_from_record, completion_os_error_code, remote_free_contains, submit_test_op,
-        wait_completion, wait_completion_record,
+        build_registered_pool, complete_from_record, completion_os_error_code,
+        remote_free_contains, submit_test_op, wait_completion, wait_completion_record,
     },
 };
-use veloq_buf::{BufPool, NoopRegistrar, PoolTopology, UniformSlot, heap::ThreadMemoryMultiplier};
+use veloq_buf::{BufPool, LockedMemoryBudget, UniformSlot};
 use veloq_driver_core::driver::{CancelRequest, DriveMode, Driver, RegisterFd};
 use veloq_std::{
     io::Write,
     mem,
     net::{TcpListener, TcpStream},
-    num::NonZeroUsize,
     nz,
     sync::mpsc,
     thread,
@@ -36,9 +35,7 @@ fn register_owned_socket(driver: &mut IocpDriver, socket: Socket) -> IoFd {
 
 #[test]
 fn test_iocp_accept() {
-    let registrar = NoopRegistrar;
-    let mut driver =
-        IocpDriver::new(IocpConfig::default(), &registrar).expect("Driver creation failed");
+    let mut driver = IocpDriver::new(IocpConfig::default()).expect("Driver creation failed");
 
     // Listener (Bind to random port)
     let std_listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -83,9 +80,7 @@ fn test_iocp_accept() {
 
 #[test]
 fn test_iocp_accept_multi_rearms_after_each_connection() {
-    let registrar = NoopRegistrar;
-    let mut driver =
-        IocpDriver::new(IocpConfig::default(), &registrar).expect("Driver creation failed");
+    let mut driver = IocpDriver::new(IocpConfig::default()).expect("Driver creation failed");
 
     let std_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = std_listener.local_addr().unwrap();
@@ -147,9 +142,7 @@ fn test_iocp_accept_multi_rearms_after_each_connection() {
 
 #[test]
 fn test_iocp_accept_multi_cancel_does_not_rearm_after_completion_race() {
-    let registrar = NoopRegistrar;
-    let mut driver =
-        IocpDriver::new(IocpConfig::default(), &registrar).expect("Driver creation failed");
+    let mut driver = IocpDriver::new(IocpConfig::default()).expect("Driver creation failed");
 
     let std_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = std_listener.local_addr().unwrap();
@@ -190,8 +183,7 @@ fn test_iocp_accept_multi_cancel_does_not_rearm_after_completion_race() {
 
 #[test]
 fn test_iocp_connect() {
-    let registrar = NoopRegistrar;
-    let mut driver = IocpDriver::new(IocpConfig::default(), &registrar).unwrap();
+    let mut driver = IocpDriver::new(IocpConfig::default()).unwrap();
 
     // Listener
     let std_listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -220,26 +212,23 @@ fn test_iocp_connect() {
 
 #[test]
 fn test_iocp_recv_with_buffer_pool() {
-    let registrar = NoopRegistrar;
-    let mut driver = IocpDriver::new(IocpConfig::default(), &registrar).unwrap();
+    let budget = LockedMemoryBudget::new(64 * 1024 * 1024);
+    let mut driver =
+        IocpDriver::new(IocpConfig::default().locked_memory_budget(budget.clone())).unwrap();
 
     // Setup GlobalAlloc
-    let multiplier = ThreadMemoryMultiplier(NonZeroUsize::new(10).unwrap());
-    let topology = UniformSlot::new(multiplier);
+    let pool_capacity_bytes = 10 * 4 * 1024 * 1024;
+    let topology = UniformSlot::new(pool_capacity_bytes);
 
-    let global_pool = topology.create_pool(1).expect("Create pool failed");
-
-    // Build pool with noop registrar; chunk registration is explicitly controlled below.
-    let reg_pool = topology
-        .build(&global_pool, 0, &veloq_buf::NoopRegistrar)
-        .expect("build buffer pool failed");
+    // Build a pool whose chunks are registered before allocation.
+    let reg_pool = build_registered_pool(&mut driver, &topology, budget, 0);
 
     // Setup server listener
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
 
     // Create RIO-capable client socket and connect via driver op.
-    let client = Socket::new_tcp_v4().expect("client socket create failed");
+    let client = Socket::new_rio_tcp_v4().expect("client socket create failed");
     let client_fd = register_owned_socket(&mut driver, client);
     let (addr_storage, addr_len) = socket_addr_to_storage(addr);
     let connect_op = Connect {
@@ -259,15 +248,6 @@ fn test_iocp_recv_with_buffer_pool() {
     let buf = reg_pool
         .alloc_full(nz!(8192))
         .expect("Failed to alloc buffer");
-
-    // Strict RIO path: ensure the exact chunk backing this buffer is registered in the driver.
-    let region = buf.resolve_region_info();
-    let chunk = global_pool
-        .chunk_info(region.id)
-        .expect("Chunk info for buffer not found");
-    driver
-        .register_buffer(region.id, chunk.ptr.as_ptr(), chunk.len.get())
-        .expect("register chunk failed");
 
     // Poll connect completion before issuing recv.
     let connect_res = wait_completion(&mut driver, connect_token, Duration::from_secs(5));
@@ -301,8 +281,7 @@ fn test_iocp_recv_with_buffer_pool() {
 
 #[test]
 fn test_iocp_recv_provided_uses_backend_owned_buffer() {
-    let registrar = NoopRegistrar;
-    let mut driver = IocpDriver::new(IocpConfig::default(), &registrar).unwrap();
+    let mut driver = IocpDriver::new(IocpConfig::default()).unwrap();
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -344,8 +323,7 @@ fn test_iocp_recv_provided_uses_backend_owned_buffer() {
 
 #[test]
 fn test_iocp_recv_multi_delivers_data_and_eof() {
-    let registrar = NoopRegistrar;
-    let mut driver = IocpDriver::new(IocpConfig::default(), &registrar).unwrap();
+    let mut driver = IocpDriver::new(IocpConfig::default()).unwrap();
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -407,8 +385,7 @@ fn test_iocp_recv_multi_delivers_data_and_eof() {
 
 #[test]
 fn test_iocp_recv_multi_cancel_returns_aborted() {
-    let registrar = NoopRegistrar;
-    let mut driver = IocpDriver::new(IocpConfig::default(), &registrar).unwrap();
+    let mut driver = IocpDriver::new(IocpConfig::default()).unwrap();
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -452,15 +429,13 @@ fn test_iocp_recv_multi_cancel_returns_aborted() {
 #[test]
 fn test_unregister_owned_socket_waits_for_inflight_recv() {
     super::init_test_logger();
-    let registrar = NoopRegistrar;
-    let mut driver = IocpDriver::new(IocpConfig::default(), &registrar).unwrap();
+    let budget = LockedMemoryBudget::new(64 * 1024 * 1024);
+    let mut driver =
+        IocpDriver::new(IocpConfig::default().locked_memory_budget(budget.clone())).unwrap();
 
-    let multiplier = ThreadMemoryMultiplier(NonZeroUsize::new(10).unwrap());
-    let topology = UniformSlot::new(multiplier);
-    let global_pool = topology.create_pool(1).expect("Create pool failed");
-    let reg_pool = topology
-        .build(&global_pool, 0, &veloq_buf::NoopRegistrar)
-        .expect("build buffer pool failed");
+    let pool_capacity_bytes = 10 * 4 * 1024 * 1024;
+    let topology = UniformSlot::new(pool_capacity_bytes);
+    let reg_pool = build_registered_pool(&mut driver, &topology, budget, 0);
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -473,7 +448,7 @@ fn test_unregister_owned_socket_waits_for_inflight_recv() {
     })
     .unwrap();
 
-    let client = Socket::new_tcp_v4().expect("client socket create failed");
+    let client = Socket::new_rio_tcp_v4().expect("client socket create failed");
     let client_fd = register_owned_socket(&mut driver, client);
     let (addr_storage, addr_len) = socket_addr_to_storage(addr);
     let connect_op = Connect {
@@ -487,14 +462,6 @@ fn test_unregister_owned_socket_waits_for_inflight_recv() {
     let buf = reg_pool
         .alloc_full(nz!(8192))
         .expect("Failed to alloc buffer");
-    let region = buf.resolve_region_info();
-    let chunk = global_pool
-        .chunk_info(region.id)
-        .expect("Chunk info for buffer not found");
-    driver
-        .register_buffer(region.id, chunk.ptr.as_ptr(), chunk.len.get())
-        .expect("register chunk failed");
-
     let recv_op = Recv {
         fd: client_fd,
         buf,
@@ -520,15 +487,13 @@ fn test_unregister_owned_socket_waits_for_inflight_recv() {
 
 #[test]
 fn test_rio_cancel_poll_returns_aborted_without_hang() {
-    let registrar = NoopRegistrar;
-    let mut driver = IocpDriver::new(IocpConfig::default(), &registrar).unwrap();
+    let budget = LockedMemoryBudget::new(64 * 1024 * 1024);
+    let mut driver =
+        IocpDriver::new(IocpConfig::default().locked_memory_budget(budget.clone())).unwrap();
 
-    let multiplier = ThreadMemoryMultiplier(NonZeroUsize::new(10).unwrap());
-    let topology = UniformSlot::new(multiplier);
-    let global_pool = topology.create_pool(1).expect("Create pool failed");
-    let reg_pool = topology
-        .build(&global_pool, 0, &veloq_buf::NoopRegistrar)
-        .expect("build buffer pool failed");
+    let pool_capacity_bytes = 10 * 4 * 1024 * 1024;
+    let topology = UniformSlot::new(pool_capacity_bytes);
+    let reg_pool = build_registered_pool(&mut driver, &topology, budget, 0);
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -541,7 +506,7 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
     })
     .unwrap();
 
-    let client = Socket::new_tcp_v4().expect("client socket create failed");
+    let client = Socket::new_rio_tcp_v4().expect("client socket create failed");
     let client_fd = register_owned_socket(&mut driver, client);
     let (addr_storage, addr_len) = socket_addr_to_storage(addr);
     let connect_op = Connect {
@@ -561,14 +526,6 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
     let buf = reg_pool
         .alloc_full(nz!(8192))
         .expect("Failed to alloc buffer");
-    let region = buf.resolve_region_info();
-    let chunk = global_pool
-        .chunk_info(region.id)
-        .expect("Chunk info for buffer not found");
-    driver
-        .register_buffer(region.id, chunk.ptr.as_ptr(), chunk.len.get())
-        .expect("register chunk failed");
-
     let recv_op = Recv {
         fd: client_fd,
         buf,
@@ -592,15 +549,13 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
 
 #[test]
 fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
-    let registrar = NoopRegistrar;
-    let mut driver = IocpDriver::new(IocpConfig::default(), &registrar).unwrap();
+    let budget = LockedMemoryBudget::new(64 * 1024 * 1024);
+    let mut driver =
+        IocpDriver::new(IocpConfig::default().locked_memory_budget(budget.clone())).unwrap();
 
-    let multiplier = ThreadMemoryMultiplier(NonZeroUsize::new(10).unwrap());
-    let topology = UniformSlot::new(multiplier);
-    let global_pool = topology.create_pool(1).expect("Create pool failed");
-    let reg_pool = topology
-        .build(&global_pool, 0, &veloq_buf::NoopRegistrar)
-        .expect("build buffer pool failed");
+    let pool_capacity_bytes = 10 * 4 * 1024 * 1024;
+    let topology = UniformSlot::new(pool_capacity_bytes);
+    let reg_pool = build_registered_pool(&mut driver, &topology, budget, 0);
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -613,7 +568,7 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
     })
     .unwrap();
 
-    let client = Socket::new_tcp_v4().expect("client socket create failed");
+    let client = Socket::new_rio_tcp_v4().expect("client socket create failed");
     let client_fd = register_owned_socket(&mut driver, client);
     let (addr_storage, addr_len) = socket_addr_to_storage(addr);
     let connect_op = Connect {
@@ -633,14 +588,6 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
     let buf = reg_pool
         .alloc_full(nz!(8192))
         .expect("Failed to alloc buffer");
-    let region = buf.resolve_region_info();
-    let chunk = global_pool
-        .chunk_info(region.id)
-        .expect("Chunk info for buffer not found");
-    driver
-        .register_buffer(region.id, chunk.ptr.as_ptr(), chunk.len.get())
-        .expect("register chunk failed");
-
     let recv_op = Recv {
         fd: client_fd,
         buf,

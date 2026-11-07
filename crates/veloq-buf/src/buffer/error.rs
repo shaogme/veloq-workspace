@@ -39,6 +39,9 @@ set! {
 
         #[display("GlobalSlotPool ID overflow")]
         IdOverflow,
+
+        #[display("Buffer pool size calculation overflow")]
+        SizeOverflow,
     }
 }
 

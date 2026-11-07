@@ -9,7 +9,6 @@ use crate::{
     op::{Close, Fsync, IocpSlotSpec, RecvMulti},
     tests::{submit_test_op, wait_completion},
 };
-use veloq_buf::NoopRegistrar;
 use veloq_driver_core::{
     driver::{Driver, DriverSubmitResult, RegisterFd, SubmitStatus},
     op::IntoPlatformOp,
@@ -74,15 +73,13 @@ fn test_extensions_load() {
 
 #[test]
 fn test_driver_creation() {
-    let registrar = NoopRegistrar;
-    let _driver = IocpDriver::new(IocpConfig::default(), &registrar);
+    let _driver = IocpDriver::new(IocpConfig::default());
     assert!(_driver.is_ok(), "Driver should be created");
 }
 
 #[test]
 fn test_register_files() {
-    let registrar = NoopRegistrar;
-    let mut driver = IocpDriver::new(IocpConfig::default(), &registrar).unwrap();
+    let mut driver = IocpDriver::new(IocpConfig::default()).unwrap();
     let handle = File::open("Cargo.toml").unwrap();
     let raw = ConfigRawHandle::new(ConfigIocpHandle::for_file(handle.as_raw_handle() as _));
     let fds = driver
@@ -94,8 +91,7 @@ fn test_register_files() {
 
 #[test]
 fn test_register_borrowed_file_keeps_weak_ownership() {
-    let registrar = NoopRegistrar;
-    let mut driver = IocpDriver::new(IocpConfig::default(), &registrar).unwrap();
+    let mut driver = IocpDriver::new(IocpConfig::default()).unwrap();
     let handle = File::open("Cargo.toml").unwrap();
     let raw = ConfigRawHandle::new(ConfigIocpHandle::for_file(handle.as_raw_handle() as _));
     let fd = driver
@@ -118,8 +114,7 @@ fn test_register_borrowed_file_keeps_weak_ownership() {
 
 #[test]
 fn test_stale_registered_fd_generation_rejected_on_submit() {
-    let registrar = NoopRegistrar;
-    let mut driver = IocpDriver::new(IocpConfig::default(), &registrar).unwrap();
+    let mut driver = IocpDriver::new(IocpConfig::default()).unwrap();
     let first = File::open("Cargo.toml").unwrap();
     let first_raw = ConfigRawHandle::new(ConfigIocpHandle::for_file(first.as_raw_handle() as _));
     let stale_fd = driver
@@ -171,8 +166,7 @@ fn test_stale_registered_fd_generation_rejected_on_submit() {
 
 #[test]
 fn test_close_owned_registered_file_unregisters_and_rejects_stale_fd() {
-    let registrar = NoopRegistrar;
-    let mut driver = IocpDriver::new(IocpConfig::default(), &registrar).unwrap();
+    let mut driver = IocpDriver::new(IocpConfig::default()).unwrap();
     let handle = File::open("Cargo.toml").unwrap();
     let raw = RawHandle::new(IocpHandle::for_file(handle.into_raw_handle() as _));
     let owned = unsafe { OwnedRawHandle::from_raw_owned(raw) };
@@ -206,8 +200,7 @@ fn test_close_owned_registered_file_unregisters_and_rejects_stale_fd() {
 /// TCP receive multishot 不支持文件句柄时应同步失败，而不是被内核收下后永远挂起。
 #[test]
 fn recv_multi_rejects_non_socket_without_hanging() {
-    let registrar = NoopRegistrar;
-    let mut driver = IocpDriver::new(IocpConfig::default(), &registrar).unwrap();
+    let mut driver = IocpDriver::new(IocpConfig::default()).unwrap();
 
     let handle = File::open("Cargo.toml").unwrap();
     let raw = RawHandle::new(IocpHandle::for_file(handle.as_raw_handle() as _));
@@ -227,8 +220,7 @@ fn recv_multi_rejects_non_socket_without_hanging() {
 
 #[test]
 fn test_close_borrowed_registered_file_is_rejected_without_unregistering() {
-    let registrar = NoopRegistrar;
-    let mut driver = IocpDriver::new(IocpConfig::default(), &registrar).unwrap();
+    let mut driver = IocpDriver::new(IocpConfig::default()).unwrap();
     let handle = File::open("Cargo.toml").unwrap();
     let raw = RawHandle::new(IocpHandle::for_file(handle.as_raw_handle() as _));
     let fd = driver

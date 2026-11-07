@@ -1,16 +1,16 @@
 use veloq_std::vec;
 use veloq_std::{
-    boxed::Box, marker::PhantomData, num::NonZeroUsize, ops::AsyncFnOnce, pin::pin, ptr, thread,
-    vec::Vec,
+    boxed::Box, error::Error, format, marker::PhantomData, num::NonZeroUsize, ops::AsyncFnOnce,
+    pin::pin, ptr, thread, vec::Vec,
 };
 
 use crate::{
-    error::{Result, RuntimeError},
+    error::{Result, RuntimeError, WorkerFactorySource},
     utils::FastRand,
 };
 use diagweave::prelude::*;
 use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
-use veloq_std::sync::Mutex;
+use veloq_std::sync::{Mutex, mpsc};
 
 pub mod cancellation;
 pub mod context;
@@ -34,9 +34,11 @@ pub struct Runtime<'rt, 'env: 'rt, T, WF: 'rt> {
     _marker: PhantomData<fn(&'rt ()) -> &'env ()>,
 }
 
-pub type DefaultWorkerFactory = fn(usize, &RuntimeShared<()>) -> ();
+pub type WorkerFactoryResult<T> = veloq_std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
-pub type DefaultWorkerFactoryFor<T> = fn(usize, &RuntimeShared<T>) -> T;
+pub type DefaultWorkerFactory = fn(usize, &RuntimeShared<()>) -> WorkerFactoryResult<()>;
+
+pub type DefaultWorkerFactoryFor<T> = fn(usize, &RuntimeShared<T>) -> WorkerFactoryResult<T>;
 
 impl<'rt, 'env: 'rt> Runtime<'rt, 'env, (), DefaultWorkerFactoryFor<()>> {
     pub fn scope<F, R>(f: F) -> Result<R>
@@ -65,7 +67,7 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
     pub fn block_on<R, F>(mut self, f: F) -> Result<R>
     where
         T: 'rt,
-        WF: Fn(usize, &'rt RuntimeShared<T>) -> T + Send + Sync,
+        WF: Fn(usize, &'rt RuntimeShared<T>) -> WorkerFactoryResult<T> + Send + Sync,
         F: for<'a> AsyncFnOnce(RuntimeCtx<'a, T>) -> R,
     {
         struct TlsCleanupGuard<'a, T>(&'a veloq_tls::Tls<T>);
@@ -110,8 +112,10 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
         let mut deques = receivers.deques;
 
         let thread_errors = Mutex::new(None);
+        let (ready_sender, ready_receiver) = mpsc::channel::<(usize, bool)>();
         // 主线程的唤醒信号必须在 worker 线程启动**之前**建好：worker 初始化失败时要靠
         // 它把主线程从 park 里叫回来，否则错误永远不会被报告。
+        // Build the main-thread wake signal before spawning workers so initialization failures can wake a parked main thread.
         let signal = BlockOnSignal::new(shared_ref.base.unparker(0).clone());
 
         let res: Result<R> = veloq_std::thread::scope(|scope| {
@@ -123,8 +127,9 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
             }
             let shutdown_guard = ShutdownGuard(shared_ref);
             let mut started_workers = vec![false; worker_count.get()];
-            // The calling thread is the worker-0 completion participant even before its TLS is
-            // installed; it can perform the final barrier and global drain on setup failures.
+            let mut start_senders = Vec::with_capacity(worker_count.get().saturating_sub(1));
+            // 调用线程即使尚未安装 TLS，也是 worker 0 的完成屏障参与者；初始化失败时由它执行最终屏障和全局排空。
+            // The calling thread participates as worker 0 before TLS setup and performs the final barrier and global drain on failure.
             started_workers[0] = true;
 
             for worker_id in (1..worker_count.get()).rev() {
@@ -142,6 +147,8 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                 let worker_factory_ref = &worker_factory;
                 let thread_errors_ref = &thread_errors;
                 let signal_ref = &signal;
+                let ready_sender = ready_sender.clone();
+                let (start_sender, start_receiver) = mpsc::channel::<bool>();
 
                 let context = RuntimeTlsInner {
                     worker_id,
@@ -159,9 +166,17 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                                 source: source.kind(),
                             }
                         })?;
+                        let worker_extra =
+                            worker_factory_ref(worker_id, shared_ref).map_err(|source| {
+                                RuntimeError::WorkerFactoryFailed {
+                                    worker_id,
+                                    source: WorkerFactorySource::new(source),
+                                }
+                                .to_report()
+                            })?;
                         shared_ref
                             .extra_tls
-                            .set_owned(worker_factory_ref(worker_id, shared_ref))
+                            .set_owned(worker_extra)
                             .map_err(|source| RuntimeError::TlsSetOwnedFailed {
                                 worker_id,
                                 source: source.kind(),
@@ -194,6 +209,18 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
 
                     if let Err(err) = init_res {
                         report_fatal(err);
+                        let _ = ready_sender.send((worker_id, false));
+                        return;
+                    }
+
+                    if ready_sender.send((worker_id, true)).is_err() {
+                        shared_ref.shutdown();
+                        shared_ref.base.complete_shutdown(worker_id);
+                        return;
+                    }
+                    if !matches!(start_receiver.recv(), Ok(true)) {
+                        shared_ref.shutdown();
+                        shared_ref.base.complete_shutdown(worker_id);
                         return;
                     }
 
@@ -216,6 +243,7 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                     shared_ref.base.complete_shutdown(0);
                     return RuntimeError::ThreadSpawnFailed { source: e }.trans();
                 }
+                start_senders.push(start_sender);
                 started_workers[worker_id] = true;
             }
 
@@ -253,7 +281,14 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
             }
             let main_extra =
                 match catch_unwind(AssertUnwindSafe::new(|| worker_factory(0, shared_ref))) {
-                    Ok(extra) => extra,
+                    Ok(Ok(extra)) => extra,
+                    Ok(Err(source)) => {
+                        return RuntimeError::WorkerFactoryFailed {
+                            worker_id: 0,
+                            source: WorkerFactorySource::new(source),
+                        }
+                        .trans();
+                    }
                     Err(_) => {
                         return RuntimeError::InvariantViolation {
                             site: "worker-initialization",
@@ -270,6 +305,37 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                 .trans();
             }
 
+            for _ in 1..worker_count.get() {
+                let (worker_id, initialized) = match ready_receiver.recv() {
+                    Ok(result) => result,
+                    Err(_) => {
+                        return RuntimeError::InvariantViolation {
+                            site: "worker-startup-barrier",
+                            detail: "worker readiness channel closed before all workers reported"
+                                .into(),
+                        }
+                        .trans();
+                    }
+                };
+                if !initialized {
+                    let init_error = thread_errors
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .take()
+                        .unwrap_or_else(|| {
+                            RuntimeError::InvariantViolation {
+                                site: "worker-startup-barrier",
+                                detail: format!(
+                                    "worker {worker_id} failed without an error report"
+                                )
+                                .into(),
+                            }
+                            .to_report()
+                        });
+                    return Err(init_error);
+                }
+            }
+
             if let Some(err) = thread_errors
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -278,20 +344,32 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                 return Err(err);
             }
 
+            for sender in start_senders {
+                if sender.send(true).is_err() {
+                    return RuntimeError::InvariantViolation {
+                        site: "worker-startup-barrier",
+                        detail: "worker exited before startup release".into(),
+                    }
+                    .trans();
+                }
+            }
+
             // 主线程就是 0 号 worker：外层 future 作为循环的「退出条件」交给统一调度循环
             // 驱动，不再手写第二份 pop 链。
+            // Worker 0 passes the outer future to the shared scheduler loop as its exit condition instead of duplicating the pop chain.
             let mut fut = pin!(f(ctx));
             let mut controller = BlockOnController::new(fut.as_mut(), signal.clone());
             let loop_res = run_worker_loop(shared_ref, &mut controller);
 
-            // The main worker owns the final barrier and global drain whether
-            // the outer future completed normally or shutdown interrupted it.
+            // 主 worker 无论外层 future 正常结束还是被 shutdown 中断，都会负责最终屏障和全局排空。
+            // The main worker owns the final barrier and global drain whether the outer future completed normally or shutdown interrupted it.
             shared_ref.shutdown();
             shared_ref.base.complete_shutdown(0);
             main_cleanup.mark_completed();
 
             // worker 线程的致命错误优先于循环自身的退出原因：循环正是被它触发的 shutdown
             // 叫停的。
+            // A fatal worker error takes precedence over the loop result because that error caused shutdown.
             if let Some(err) = thread_errors
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -352,7 +430,7 @@ impl RuntimeBuilder<(), DefaultWorkerFactoryFor<()>, HooksUnconfigured> {
             worker_count: None,
             queue_capacity: NonZeroUsize::new(1024).unwrap(),
             topology_override: None,
-            worker_factory: Some(|_, _| ()),
+            worker_factory: Some(|_, _| Ok(())),
             idle_hook: None,
             park_hook: None,
             worker_tick_hook: None,
@@ -462,7 +540,7 @@ impl<T, WF, H> RuntimeBuilder<T, WF, H> {
     pub fn scope<'rt, 'env: 'rt, F, R>(self, f: F) -> Result<R>
     where
         T: 'rt,
-        WF: Fn(usize, &'rt RuntimeShared<T>) -> T + Send + Sync + 'rt,
+        WF: Fn(usize, &'rt RuntimeShared<T>) -> WorkerFactoryResult<T> + Send + Sync + 'rt,
         F: for<'a> AsyncFnOnce(RuntimeCtx<'a, T>) -> R,
     {
         let worker_count = self

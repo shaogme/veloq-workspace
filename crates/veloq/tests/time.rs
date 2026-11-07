@@ -9,14 +9,14 @@ use veloq::{
     runtime::{Runtime, context::Ctx, scope, scope_local},
     time::{MissedTickBehavior, interval, sleep, sleep_local, sleep_until, timeout, timeout_at},
 };
-use veloq_buf::{UniformSlot, heap::ThreadMemoryMultiplier};
+use veloq_buf::UniformSlot;
 use veloq_runtime::select;
 
 fn run_test<F, R>(worker_threads: NonZeroUsize, f: F) -> R
 where
     F: for<'s> AsyncFnOnce(Ctx<'s>) -> R,
 {
-    Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(4))))
+    Runtime::builder(UniformSlot::new(4 * 4 * 1024 * 1024))
         .worker_count(Some(worker_threads))
         .scope(f)
         .expect("failed to run scope")

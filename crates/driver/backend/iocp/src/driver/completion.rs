@@ -4,7 +4,6 @@ mod settlement;
 
 use veloq_std::vec::Vec;
 
-use veloq_buf::BufferRegistrar;
 use veloq_driver_core::{
     driver::{
         AnomalyAttach, CompletionAnomalyKind, CompletionEnvelope, CompletionFlowExt,
@@ -22,19 +21,17 @@ use super::{
 use hooks::{IocpCompletionHooks, IocpCompletionHooksArgs};
 
 pub(crate) use protocol::COMP_BACKEND_RIO;
-pub(super) use protocol::{COMP_BACKEND_IOCP, IocpSubmissionFailurePhase, IocpSyntheticCompletion};
+pub(super) use protocol::{
+    COMP_BACKEND_IOCP, IocpBackendIngress, IocpSubmissionFailurePhase, IocpSyntheticCompletion,
+};
 
-pub(super) struct CompletionService<'view, 'state, 'registrar> {
+pub(super) struct CompletionService<'view, 'state> {
     state: &'view mut CompletionStateView<'state>,
-    registrar: &'registrar dyn BufferRegistrar,
 }
 
-impl<'view, 'state, 'registrar> CompletionService<'view, 'state, 'registrar> {
-    pub(super) fn new(
-        state: &'view mut CompletionStateView<'state>,
-        registrar: &'registrar dyn BufferRegistrar,
-    ) -> Self {
-        Self { state, registrar }
+impl<'view, 'state> CompletionService<'view, 'state> {
+    pub(super) fn new(state: &'view mut CompletionStateView<'state>) -> Self {
+        Self { state }
     }
 
     fn state_mut(&mut self) -> &mut CompletionStateView<'state> {
@@ -83,6 +80,17 @@ impl<'view, 'state, 'registrar> CompletionService<'view, 'state, 'registrar> {
         Ok(1)
     }
 
+    pub(super) fn process_backend_ingress(
+        &mut self,
+        ingress: IocpBackendIngress,
+    ) -> IocpResult<usize> {
+        self.accept_completion_ingress(
+            CompletionIngress::Backend(ingress),
+            IocpSyntheticCompletion::None,
+        )?;
+        Ok(1)
+    }
+
     pub(super) fn accept_synthetic_completion(
         &mut self,
         event: UserCompletionEvent,
@@ -122,13 +130,12 @@ impl<'view, 'state, 'registrar> CompletionService<'view, 'state, 'registrar> {
 
     fn accept_completion_ingress(
         &mut self,
-        ingress: CompletionIngress<()>,
+        ingress: CompletionIngress<IocpBackendIngress>,
         synthetic: IocpSyntheticCompletion,
     ) -> IocpResult<CompletionFlowOutcome> {
-        let registrar = self.registrar;
         let state = self.state_mut();
         let port = state.completion.port_arc();
-        let (rio, registrar) = state.rio.state_and_registrar_mut(registrar);
+        let rio = state.rio.state_mut();
         let registered_slots = state.handles.submission_slots();
         let mut hooks = IocpCompletionHooks::new(IocpCompletionHooksArgs {
             ext: state.extensions,
@@ -137,7 +144,7 @@ impl<'view, 'state, 'registrar> CompletionService<'view, 'state, 'registrar> {
             completion: state.completion,
             port,
             registered_slots,
-            registrar,
+            overlapped_registry: state.overlapped_registry,
             shutting_down: state.shutting_down,
             synthetic,
         });

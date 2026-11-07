@@ -93,6 +93,9 @@ impl From<UdpReceiveConfig> for ReceivePumpConfig {
 /// pending datagram。
 pub trait ReceivePermitNotifier: Send + Sync {
     fn notify(&self);
+
+    /// Bind the backend identity used to resume this pump. / 绑定恢复此接收泵所需的后端标识。
+    fn bind_resume_token(&self, _token: u64) {}
 }
 
 impl<F> ReceivePermitNotifier for F
@@ -493,6 +496,22 @@ impl ReceivePermitPool {
         }
     }
 
+    fn set_notifier(
+        &mut self,
+        notifier: Arc<dyn ReceivePermitNotifier>,
+    ) -> Result<(), ReceivePumpError> {
+        if self.available() != self.capacity() {
+            return Err(ReceivePumpError::InvalidTransition);
+        }
+        let capacity = self.capacity();
+        self.inner = Arc::new(PermitState {
+            capacity,
+            available: AtomicUsize::new(capacity),
+            notifier: Some(notifier),
+        });
+        Ok(())
+    }
+
     pub fn capacity(&self) -> usize {
         self.inner.capacity
     }
@@ -524,6 +543,12 @@ impl ReceivePermitPool {
                 }
                 Err(observed) => available = observed,
             }
+        }
+    }
+
+    fn bind_resume_token(&self, token: u64) {
+        if let Some(notifier) = &self.inner.notifier {
+            notifier.bind_resume_token(token);
         }
     }
 }
@@ -619,7 +644,16 @@ impl ReceivePumpState {
         config: ReceivePumpConfig,
         slots: Box<[ReceiveSlot]>,
     ) -> Result<Self, ReceivePumpError> {
-        Self::try_new_with_eof(config, slots, false)
+        Self::try_new_with_eof(config, slots, false, None)
+    }
+
+    /// Construct a fixed-slot pump with an optional permit-release notifier. / 构造带可选许可释放通知器的固定槽位接收泵。
+    pub fn try_new_with_notifier(
+        config: ReceivePumpConfig,
+        slots: Box<[ReceiveSlot]>,
+        notifier: Option<Arc<dyn ReceivePermitNotifier>>,
+    ) -> Result<Self, ReceivePumpError> {
+        Self::try_new_with_eof(config, slots, false, notifier)
     }
 
     /// Construct a pump for a stream receive operation where an empty successful completion is
@@ -628,7 +662,7 @@ impl ReceivePumpState {
         config: ReceivePumpConfig,
         slots: Box<[ReceiveSlot]>,
     ) -> Result<Self, ReceivePumpError> {
-        Self::try_new_with_eof(config, slots, true)
+        Self::try_new_with_eof(config, slots, true, None)
     }
 
     /// Construct the platform-independent state for one io_uring multishot datagram operation.
@@ -648,8 +682,9 @@ impl ReceivePumpState {
         config: ReceivePumpConfig,
         slots: Box<[ReceiveSlot]>,
         eof_on_empty: bool,
+        notifier: Option<Arc<dyn ReceivePermitNotifier>>,
     ) -> Result<Self, ReceivePumpError> {
-        Self::try_new_with_options(config, slots, eof_on_empty, false, None)
+        Self::try_new_with_options(config, slots, eof_on_empty, false, notifier)
     }
 
     fn try_new_with_options(
@@ -683,13 +718,24 @@ impl ReceivePumpState {
         }
 
         let pending_capacity = config.kernel_capacity.get();
+        let mut pending = VecDeque::new();
+        pending
+            .try_reserve_exact(pending_capacity)
+            .map_err(|_| ReceivePumpError::ReceiveConfigInvalid)?;
+        let mut held = VecDeque::new();
+        held.try_reserve_exact(pending_capacity)
+            .map_err(|_| ReceivePumpError::ReceiveConfigInvalid)?;
+        let mut multishot_pending = VecDeque::new();
+        multishot_pending
+            .try_reserve_exact(pending_capacity)
+            .map_err(|_| ReceivePumpError::ReceiveConfigInvalid)?;
         Ok(Self {
             config,
             phase: ReceivePumpPhase::Created,
             slots,
             permits: ReceivePermitPool::new_with_notifier(config.queue_capacity, notifier),
-            pending: VecDeque::with_capacity(pending_capacity),
-            held: VecDeque::with_capacity(pending_capacity),
+            pending,
+            held,
             prepared: None,
             actual_in_flight: 0,
             ready_packets: 0,
@@ -701,12 +747,28 @@ impl ReceivePumpState {
             stats: ReceivePumpStats::default(),
             completion_diagnostics: ReceiveCompletionDiagnostics::default(),
             multishot,
-            multishot_pending: VecDeque::with_capacity(pending_capacity),
+            multishot_pending,
         })
     }
 
     pub fn config(&self) -> ReceivePumpConfig {
         self.config
+    }
+
+    /// Install the backend wakeup used when a packet permit becomes available. / 安装 packet permit 可用时使用的后端唤醒器。
+    pub fn set_permit_notifier(
+        &mut self,
+        notifier: Arc<dyn ReceivePermitNotifier>,
+    ) -> Result<(), ReceivePumpError> {
+        if self.phase != ReceivePumpPhase::Created {
+            return Err(ReceivePumpError::InvalidTransition);
+        }
+        self.permits.set_notifier(notifier)
+    }
+
+    /// Update the opaque identity sent to the notifier when a permit is released. / 更新许可释放时通知器投递的不透明标识。
+    pub fn bind_resume_token(&self, token: u64) {
+        self.permits.bind_resume_token(token);
     }
 
     pub fn phase(&self) -> ReceivePumpPhase {
@@ -740,6 +802,7 @@ impl ReceivePumpState {
     }
 
     pub fn actual_in_flight(&self) -> usize {
+        self.debug_assert_invariants();
         self.actual_in_flight
     }
 
@@ -964,6 +1027,7 @@ impl ReceivePumpState {
     }
 
     pub fn snapshot(&self) -> ReceivePumpSnapshot {
+        self.debug_assert_invariants();
         ReceivePumpSnapshot {
             phase: self.phase,
             target_depth: self.config.kernel_capacity.get(),
@@ -980,6 +1044,11 @@ impl ReceivePumpState {
 
     pub fn slot(&self, slot_id: u32) -> Option<&ReceiveSlot> {
         self.slot_index(slot_id).map(|index| &self.slots[index])
+    }
+
+    pub fn slot_mut(&mut self, slot_id: u32) -> Option<&mut ReceiveSlot> {
+        let index = self.slot_index(slot_id)?;
+        self.slots.get_mut(index)
     }
 
     pub fn is_ready(&self) -> bool {
@@ -1001,7 +1070,9 @@ impl ReceivePumpState {
 
     /// Select the next fixed slot for an initial submit.
     pub fn next_submission(&mut self) -> Option<ReceiveSubmission> {
-        if self.phase != ReceivePumpPhase::Starting {
+        if self.phase != ReceivePumpPhase::Starting
+            || self.actual_in_flight >= self.config.kernel_capacity.get()
+        {
             return None;
         }
         let index = self
@@ -1594,6 +1665,18 @@ impl ReceivePumpState {
                     slot.state = ReceiveSlotState::Retiring;
                 }
             }
+        }
+    }
+
+    fn debug_assert_invariants(&self) {
+        if !self.multishot {
+            let in_flight_slots = self
+                .slots
+                .iter()
+                .filter(|slot| slot.state == ReceiveSlotState::InFlight)
+                .count();
+            debug_assert_eq!(self.actual_in_flight, in_flight_slots);
+            debug_assert!(self.actual_in_flight <= self.config.kernel_capacity.get());
         }
     }
 }

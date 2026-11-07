@@ -2,7 +2,8 @@
 #![cfg(not(feature = "loom"))]
 #![cfg(any(target_os = "linux", target_os = "android"))]
 
-//! 固定缓冲区注册失败时的严格/兼容模式回归测试。
+//! 固定缓冲区启动注册与未注册 I/O 回退测试。
+//! Startup registration and unregistered-I/O fallback tests for fixed buffers.
 
 use veloq_std::{
     env,
@@ -19,13 +20,14 @@ use veloq_std::{
 };
 
 use veloq_buf::{
-    BufPool, BufResult, BufferRegion, BufferRegistrar, FixedBuf, SlotBasedPool,
-    heap::{ChunkId, ChunkInfo, GlobalAllocatorConfig, GlobalSlotPool},
+    BufPool, BufferRegion, FixedBuf, LockedMemoryBudget, SlotBasedPool,
+    heap::{GlobalAllocatorConfig, GlobalSlotPool},
 };
+use veloq_driver_core::DriverResult;
 use veloq_driver_core::{
     driver::{
-        CompletionRecord, CompletionValue, DriveMode, Driver, DriverSubmitResult, OpToken,
-        PollRecordResult, RegisterFd, SubmitStatus, test_hooks::DriverTestHooks,
+        BufferRegistrationStatus, CompletionRecord, CompletionValue, DriveMode, Driver,
+        DriverSubmitResult, OpToken, PollRecordResult, RegisterFd, test_hooks::DriverTestHooks,
     },
     op::{
         IntoPlatformOp,
@@ -34,10 +36,11 @@ use veloq_driver_core::{
             WriteRaw as CoreWriteRaw,
         },
     },
+    slot::SlotError,
 };
 use veloq_driver_uring::{
     IoFd, RawHandle, UringConfig, UringDriveLimits, UringDriver, UringError, UringOp,
-    UringRawHandle, UringSlotSpec, UringUserPayload,
+    UringRawHandle, UringSlotSpec,
 };
 
 type ReadFixed = CoreReadFixed<UringRawHandle>;
@@ -71,59 +74,44 @@ impl Drop for CleanupFile {
     }
 }
 
-#[derive(Clone, Copy)]
-struct ChunkRegistrar {
-    info: ChunkInfo,
-}
-
-impl BufferRegistrar for ChunkRegistrar {
-    fn register(&self, regions: &[BufferRegion]) -> BufResult<Vec<ChunkId>> {
-        Ok(regions.iter().map(BufferRegion::id).collect())
-    }
-
-    fn resolve_chunk_info(&self, chunk_id: ChunkId) -> Option<ChunkInfo> {
-        (chunk_id == self.info.id).then_some(self.info)
-    }
-}
-
-fn new_driver_or_skip(
-    mode: veloq_driver_uring::BufferRegistrationMode,
-    registrar: &'static ChunkRegistrar,
-) -> Option<UringDriver<'static>> {
-    let config = UringConfig {
-        entries: NonZeroU32::new(64).expect("non-zero ring entries"),
-        drive_limits: UringDriveLimits::for_entries(64),
-        registration_mode: mode,
-        ..UringConfig::default()
-    };
-    match UringDriver::new(config, registrar) {
+fn new_driver_or_skip(budget: LockedMemoryBudget) -> Option<UringDriver<'static>> {
+    let config = UringConfig::default()
+        .with_entries(NonZeroU32::new(64).expect("non-zero ring entries"))
+        .drive_limits(UringDriveLimits::for_entries(64))
+        .locked_memory_budget(budget);
+    match UringDriver::new(config) {
         Ok(driver) => Some(driver),
         Err(report) => {
-            eprintln!("skipping fixed-buffer fallback test: {report}");
+            eprintln!("skipping fixed-buffer registration test: {report}");
             None
         }
     }
 }
 
-fn slot_buffers(count: usize, len: usize) -> (Vec<FixedBuf>, &'static ChunkRegistrar) {
-    let pool = Arc::new(
-        GlobalSlotPool::new(GlobalAllocatorConfig {
-            total_memory: 4 * 1024 * 1024,
-        })
-        .expect("create slot pool"),
-    );
-    let registrar = Box::leak(Box::new(ChunkRegistrar {
-        info: pool.global_info(),
-    }));
-    let slot_pool = SlotBasedPool::new(pool);
-    let buffers = (0..count)
+fn slot_backing_pool() -> &'static Arc<GlobalSlotPool> {
+    static POOL: veloq_std::sync::OnceLock<Arc<GlobalSlotPool>> = veloq_std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        Arc::new(
+            GlobalSlotPool::new(GlobalAllocatorConfig {
+                total_memory: 4 * 1024 * 1024,
+            })
+            .expect("create slot pool"),
+        )
+    })
+}
+
+fn slot_buffers(count: usize, len: usize) -> Vec<FixedBuf> {
+    let pool = slot_backing_pool().clone();
+    let registered_chunks = pool.chunk_infos().into_iter().map(|info| info.id).collect();
+    let slot_pool = SlotBasedPool::with_registered_chunks(pool, 0, registered_chunks)
+        .expect("registered chunks belong to the pool");
+    (0..count)
         .map(|_| {
             slot_pool
                 .alloc(NonZeroUsize::new(4096).expect("non-zero buffer size"), len)
                 .expect("allocate slot buffer")
         })
-        .collect();
-    (buffers, registrar)
+        .collect()
 }
 
 fn open_file(label: &str, initial: &[u8]) -> (CleanupFile, File) {
@@ -147,6 +135,20 @@ fn register_file(driver: &mut UringDriver<'static>, file: &File) -> IoFd {
         .into_iter()
         .next()
         .expect("registered file handle")
+}
+
+fn register_chunk(
+    driver: &mut UringDriver<'static>,
+    buffer: &FixedBuf,
+) -> DriverResult<BufferRegistrationStatus, SlotError<UringSlotSpec>> {
+    let info = buffer.resolve_region_info();
+    let pool = slot_backing_pool();
+    let chunk_info = pool
+        .chunk_info(info.id)
+        .expect("slot chunk belongs to pool");
+    // SAFETY: `chunk_info` comes from `pool`, which is retained by the registration region. / 安全性：`chunk_info` 来自 `pool`，注册区域会保留该 pool。
+    let mut region = unsafe { BufferRegion::from_chunk_info(chunk_info, pool.clone()) };
+    driver.register_buffer(region.registration_request())
 }
 
 fn submit<T>(driver: &mut UringDriver<'static>, op: T) -> OpToken
@@ -187,23 +189,6 @@ fn wait_completion(
     }
 }
 
-fn payload_is<T>(payload: UringUserPayload) -> bool
-where
-    T: IntoPlatformOp<UringSlotSpec>,
-{
-    T::try_record_from_erased(payload).is_ok()
-}
-
-fn assert_payload<T>(payload: Option<UringUserPayload>)
-where
-    T: IntoPlatformOp<UringSlotSpec>,
-{
-    let Some(payload) = payload else {
-        panic!("payload should be recoverable after void failure");
-    };
-    assert!(payload_is::<T>(payload));
-}
-
 fn take_read_completion<T>(
     driver: &mut UringDriver<'static>,
     token: OpToken,
@@ -222,9 +207,9 @@ where
     cleanup.disarm();
     let payload = T::try_record_from_erased(payload.expect("read completion payload"))
         .expect("unexpected read payload type");
-    let buf = take_buffer(payload);
+    let buffer = take_buffer(payload);
     let result = usize::from_event_res::<UringError>(event.res()).expect("read completion");
-    (result, buf)
+    (result, buffer)
 }
 
 fn take_write_completion<T>(driver: &mut UringDriver<'static>, token: OpToken) -> usize
@@ -263,55 +248,30 @@ fn fixed_write(buf: FixedBuf, fd: IoFd) -> WriteFixed {
 }
 
 #[test]
-fn strict_mode_rejects_registration_failure_and_recovers_payload() {
-    let (mut buffers, registrar) = slot_buffers(1, 4096);
-    let (_file_path, file) = open_file("strict", b"strict-mode");
-    let Some(mut driver) = new_driver_or_skip(
-        veloq_driver_uring::BufferRegistrationMode::Strict,
-        registrar,
-    ) else {
+fn fixed_buffer_registration_failure_propagates() {
+    let mut buffers = slot_buffers(1, 4096);
+    let Some(mut driver) = new_driver_or_skip(LockedMemoryBudget::default()) else {
         return;
     };
-    let fd = register_file(&mut driver, &file);
     {
         let hooks = &mut driver as &mut dyn DriverTestHooks;
-        if hooks.debug_fixed_buffers_available() {
-            hooks.debug_inject_register_buffers_update_failure(libc::EIO);
+        if !hooks.debug_fixed_buffers_available() {
+            return;
         }
+        hooks.debug_inject_register_buffers_update_failure(libc::EIO);
     }
 
-    let (kernel, payload) = <ReadFixed as IntoPlatformOp<UringSlotSpec>>::into_kernel_and_payload(
-        fixed_read(buffers.pop().expect("read buffer"), fd),
-    );
-    let mut kernel_op: Option<UringOp> = Some(kernel);
-    let mut slot = driver.reserve_op().expect("reserve operation");
-    slot.set_payload(<ReadFixed as IntoPlatformOp<UringSlotSpec>>::payload_into_erased(payload));
-
-    match slot.submit(&mut kernel_op) {
-        DriverSubmitResult::Failed {
-            report,
-            status: SubmitStatus::Void,
-        } => assert_eq!(*report.inner(), UringError::Registration),
-        DriverSubmitResult::Failed { status, .. } => {
-            panic!("strict registration failure must be void, got {status:?}")
-        }
-        DriverSubmitResult::Submitted(_) => panic!("strict registration failure was submitted"),
-    }
-
-    assert_payload::<ReadFixed>(slot.recover_payload());
+    let buffer = buffers.pop().expect("registration buffer");
+    let report = register_chunk(&mut driver, &buffer).expect_err("buffer registration must fail");
+    assert_eq!(*report.inner(), UringError::Registration);
 }
 
 #[test]
-fn compatible_mode_rejects_unknown_update_instead_of_falling_back() {
-    let (mut buffers, registrar) = slot_buffers(1, 4096);
-    let (_file_path, file) = open_file("unknown-update", b"unknown-update");
-    let Some(mut driver) = new_driver_or_skip(
-        veloq_driver_uring::BufferRegistrationMode::Compatible,
-        registrar,
-    ) else {
+fn unknown_startup_registration_quarantines_the_ledger() {
+    let mut buffers = slot_buffers(1, 4096);
+    let Some(mut driver) = new_driver_or_skip(LockedMemoryBudget::default()) else {
         return;
     };
-    let fd = register_file(&mut driver, &file);
     {
         let hooks = &mut driver as &mut dyn DriverTestHooks;
         if !hooks.debug_fixed_buffers_available() {
@@ -320,73 +280,36 @@ fn compatible_mode_rejects_unknown_update_instead_of_falling_back() {
         hooks.debug_inject_register_buffers_update_unknown(libc::EIO);
     }
 
-    let (kernel, payload) = <ReadFixed as IntoPlatformOp<UringSlotSpec>>::into_kernel_and_payload(
-        fixed_read(buffers.pop().expect("unknown-update buffer"), fd),
-    );
-    let mut kernel_op: Option<UringOp> = Some(kernel);
-    let mut slot = driver
-        .reserve_op()
-        .expect("reserve unknown-update operation");
-    slot.set_payload(<ReadFixed as IntoPlatformOp<UringSlotSpec>>::payload_into_erased(payload));
+    let buffer = buffers.pop().expect("registration buffer");
+    let report = register_chunk(&mut driver, &buffer).expect_err("unknown result must fail");
+    assert_eq!(*report.inner(), UringError::Registration);
 
-    match slot.submit(&mut kernel_op) {
-        DriverSubmitResult::Failed {
-            report,
-            status: SubmitStatus::Void,
-        } => assert_eq!(*report.inner(), UringError::Registration),
-        DriverSubmitResult::Failed { status, .. } => {
-            panic!("unknown update must be void, got {status:?}")
-        }
-        DriverSubmitResult::Submitted(_) => panic!("unknown update must not be submitted"),
-    }
-
-    assert_payload::<ReadFixed>(slot.recover_payload());
+    let report = register_chunk(&mut driver, &buffer)
+        .expect_err("quarantined registration must reject another update");
+    assert_eq!(*report.inner(), UringError::InvalidState);
     let hooks = &driver as &dyn DriverTestHooks;
     assert_eq!(hooks.debug_chunk_register_attempts(), 1);
     assert_eq!(hooks.debug_chunk_register_failures(), 1);
-    assert_eq!(hooks.debug_raw_buffer_fallbacks(), 0);
 }
 
 #[test]
-fn bitset_failure_clears_kernel_slot_before_returning_error() {
-    let (mut buffers, registrar) = slot_buffers(1, 4096);
-    let (_file_path, file) = open_file("bitset-cleanup", b"bitset-cleanup");
-    let Some(mut driver) = new_driver_or_skip(
-        veloq_driver_uring::BufferRegistrationMode::Strict,
-        registrar,
-    ) else {
+fn bitset_failure_clears_kernel_slot_during_startup_registration() {
+    let mut buffers = slot_buffers(1, 4096);
+    let Some(mut driver) = new_driver_or_skip(LockedMemoryBudget::default()) else {
         return;
     };
-    let fd = register_file(&mut driver, &file);
     {
         let hooks = &mut driver as &mut dyn DriverTestHooks;
         if !hooks.debug_fixed_buffers_available() {
             return;
         }
-        // The first outcome is the registration syscall and the second is the cleanup syscall.
         hooks.debug_inject_register_buffers_update_sequence(&[None, None]);
         hooks.debug_inject_bitset_set_failure();
     }
 
-    let (kernel, payload) = <ReadFixed as IntoPlatformOp<UringSlotSpec>>::into_kernel_and_payload(
-        fixed_read(buffers.pop().expect("bitset test buffer"), fd),
-    );
-    let mut kernel_op: Option<UringOp> = Some(kernel);
-    let mut slot = driver.reserve_op().expect("reserve operation");
-    slot.set_payload(<ReadFixed as IntoPlatformOp<UringSlotSpec>>::payload_into_erased(payload));
-
-    match slot.submit(&mut kernel_op) {
-        DriverSubmitResult::Failed {
-            report,
-            status: SubmitStatus::Void,
-        } => assert_eq!(*report.inner(), UringError::InvalidState),
-        DriverSubmitResult::Failed { status, .. } => {
-            panic!("bitset failure must be void, got {status:?}")
-        }
-        DriverSubmitResult::Submitted(_) => panic!("bitset failure was submitted"),
-    }
-
-    assert_payload::<ReadFixed>(slot.recover_payload());
+    let buffer = buffers.pop().expect("registration buffer");
+    let report = register_chunk(&mut driver, &buffer).expect_err("injected bitset error");
+    assert_eq!(*report.inner(), UringError::InvalidState);
     let hooks = &driver as &dyn DriverTestHooks;
     assert!(!hooks.debug_chunk_registered(0));
     assert_eq!(hooks.debug_chunk_register_attempts(), 1);
@@ -394,63 +317,29 @@ fn bitset_failure_clears_kernel_slot_before_returning_error() {
 }
 
 #[test]
-fn failed_bitset_cleanup_quarantines_the_fixed_buffer_registry() {
-    let (mut buffers, registrar) = slot_buffers(2, 4096);
-    let (_file_path, file) = open_file("bitset-quarantine", b"bitset-quarantine");
-    let Some(mut driver) = new_driver_or_skip(
-        veloq_driver_uring::BufferRegistrationMode::Strict,
-        registrar,
-    ) else {
+fn failed_startup_cleanup_quarantines_the_fixed_buffer_registry() {
+    let mut buffers = slot_buffers(2, 4096);
+    let Some(mut driver) = new_driver_or_skip(LockedMemoryBudget::default()) else {
         return;
     };
-    let fd = register_file(&mut driver, &file);
     {
         let hooks = &mut driver as &mut dyn DriverTestHooks;
         if !hooks.debug_fixed_buffers_available() {
             return;
         }
-        // The cleanup failure leaves the kernel slot unknown, so all later buffer submissions must
-        // fail until this ring is rebuilt.
         hooks.debug_inject_register_buffers_update_sequence(&[None]);
         hooks.debug_inject_register_buffers_update_unknown(libc::EIO);
         hooks.debug_inject_bitset_set_failure();
     }
 
-    let (kernel, payload) = <ReadFixed as IntoPlatformOp<UringSlotSpec>>::into_kernel_and_payload(
-        fixed_read(buffers.pop().expect("first quarantine buffer"), fd),
-    );
-    let mut kernel_op: Option<UringOp> = Some(kernel);
-    let mut slot = driver.reserve_op().expect("reserve first operation");
-    slot.set_payload(<ReadFixed as IntoPlatformOp<UringSlotSpec>>::payload_into_erased(payload));
-    match slot.submit(&mut kernel_op) {
-        DriverSubmitResult::Failed {
-            report,
-            status: SubmitStatus::Void,
-        } => assert_eq!(*report.inner(), UringError::InvalidState),
-        DriverSubmitResult::Failed { status, .. } => {
-            panic!("quarantine trigger must be void, got {status:?}")
-        }
-        DriverSubmitResult::Submitted(_) => panic!("quarantine trigger was submitted"),
-    }
-    assert_payload::<ReadFixed>(slot.recover_payload());
+    let first = buffers.pop().expect("first registration buffer");
+    let report = register_chunk(&mut driver, &first).expect_err("cleanup failure must fail");
+    assert_eq!(*report.inner(), UringError::InvalidState);
 
-    let (kernel, payload) = <ReadFixed as IntoPlatformOp<UringSlotSpec>>::into_kernel_and_payload(
-        fixed_read(buffers.pop().expect("second quarantine buffer"), fd),
-    );
-    let mut kernel_op: Option<UringOp> = Some(kernel);
-    let mut slot = driver.reserve_op().expect("reserve second operation");
-    slot.set_payload(<ReadFixed as IntoPlatformOp<UringSlotSpec>>::payload_into_erased(payload));
-    match slot.submit(&mut kernel_op) {
-        DriverSubmitResult::Failed {
-            report,
-            status: SubmitStatus::Void,
-        } => assert_eq!(*report.inner(), UringError::InvalidState),
-        DriverSubmitResult::Failed { status, .. } => {
-            panic!("quarantined registry must be void, got {status:?}")
-        }
-        DriverSubmitResult::Submitted(_) => panic!("quarantined registry submitted I/O"),
-    }
-    assert_payload::<ReadFixed>(slot.recover_payload());
+    let second = buffers.pop().expect("second registration buffer");
+    let report = register_chunk(&mut driver, &second)
+        .expect_err("quarantined registry must reject later registration");
+    assert_eq!(*report.inner(), UringError::InvalidState);
     let hooks = &driver as &dyn DriverTestHooks;
     assert!(!hooks.debug_chunk_registered(0));
     assert_eq!(hooks.debug_chunk_register_attempts(), 1);
@@ -458,120 +347,71 @@ fn failed_bitset_cleanup_quarantines_the_fixed_buffer_registry() {
 }
 
 #[test]
-fn compatible_mode_falls_back_for_fixed_read_and_respects_cooldown() {
-    let (mut buffers, registrar) = slot_buffers(2, 4096);
-    let (_file_path, file) = open_file("compatible-read", b"compatible-read");
-    let Some(mut driver) = new_driver_or_skip(
-        veloq_driver_uring::BufferRegistrationMode::Compatible,
-        registrar,
-    ) else {
+fn budget_exhaustion_keeps_fixed_read_on_raw_io() {
+    let mut buffers = slot_buffers(1, 4096);
+    let (_file_path, file) = open_file("budget-read", b"budget-read");
+    let Some(mut driver) = new_driver_or_skip(LockedMemoryBudget::new(0)) else {
         return;
     };
     let fd = register_file(&mut driver, &file);
-    let fixed_available = {
-        let hooks = &mut driver as &mut dyn DriverTestHooks;
-        let _ = hooks.debug_control_plane_events();
-        let fixed_available = hooks.debug_fixed_buffers_available();
-        if fixed_available {
-            hooks.debug_inject_register_buffers_update_failure(libc::EIO);
-        }
-        fixed_available
-    };
+    let buffer = buffers.pop().expect("registration buffer");
+    let status =
+        register_chunk(&mut driver, &buffer).expect("budget exhaustion must skip registration");
+    assert!(matches!(status, BufferRegistrationStatus::BudgetExceeded));
+    let attempts_after_startup = (&driver as &dyn DriverTestHooks).debug_chunk_register_attempts();
 
-    let first = submit(&mut driver, fixed_read(buffers.pop().unwrap(), fd));
+    let raw_buf = FixedBuf::alloc_heap_full(NonZeroUsize::new(4096).unwrap())
+        .expect("allocate unregistered fallback buffer");
+    let token = submit(&mut driver, fixed_read(raw_buf, fd));
     let (read, read_buf) =
-        take_read_completion::<ReadFixed>(&mut driver, first, |payload| payload.buf);
-    assert_eq!(read, b"compatible-read".len());
-    assert_eq!(&read_buf.as_slice()[..read], b"compatible-read");
-
-    let (attempts_after_first, failures_after_first, fallbacks_after_first, skipped_before_second) = {
-        let hooks = &driver as &dyn DriverTestHooks;
-        (
-            hooks.debug_chunk_register_attempts(),
-            hooks.debug_chunk_register_failures(),
-            hooks.debug_raw_buffer_fallbacks(),
-            hooks.debug_chunk_register_skipped_recent_failure(),
-        )
-    };
-
-    let second = submit(&mut driver, fixed_read(buffers.pop().unwrap(), fd));
-    let (read, read_buf) =
-        take_read_completion::<ReadFixed>(&mut driver, second, |payload| payload.buf);
-    assert_eq!(read, b"compatible-read".len());
-    assert_eq!(&read_buf.as_slice()[..read], b"compatible-read");
-
-    let hooks = &driver as &dyn DriverTestHooks;
-    if fixed_available {
-        assert_eq!(attempts_after_first, 1);
-        assert_eq!(failures_after_first, 1);
-        assert_eq!(hooks.debug_chunk_register_attempts(), attempts_after_first);
-        assert_eq!(hooks.debug_chunk_register_failures(), failures_after_first);
-        assert!(
-            hooks.debug_chunk_register_skipped_recent_failure() > skipped_before_second,
-            "the second submission must use the registration cooldown"
-        );
-    } else {
-        assert_eq!(attempts_after_first, 0);
-        assert_eq!(failures_after_first, 0);
-        assert_eq!(hooks.debug_chunk_register_attempts(), attempts_after_first);
-    }
-    assert!(hooks.debug_raw_buffer_fallbacks() > fallbacks_after_first);
+        take_read_completion::<ReadFixed>(&mut driver, token, |payload| payload.buf);
+    assert_eq!(read, b"budget-read".len());
+    assert_eq!(&read_buf.as_slice()[..read], b"budget-read");
+    assert_eq!(
+        (&driver as &dyn DriverTestHooks).debug_chunk_register_attempts(),
+        attempts_after_startup,
+        "submission must not register a buffer lazily"
+    );
 }
 
 #[test]
-fn compatible_mode_falls_back_for_fixed_write() {
-    let (mut buffers, registrar) = slot_buffers(1, b"compatible-write".len());
-    let (_file_path, file) = open_file("compatible-write", &[]);
-    buffers[0].as_slice_mut()[..b"compatible-write".len()].copy_from_slice(b"compatible-write");
-    let Some(mut driver) = new_driver_or_skip(
-        veloq_driver_uring::BufferRegistrationMode::Compatible,
-        registrar,
-    ) else {
+fn budget_exhaustion_keeps_fixed_write_on_raw_io() {
+    let mut buffers = slot_buffers(1, 4096);
+    let (_file_path, file) = open_file("budget-write", &[]);
+    let Some(mut driver) = new_driver_or_skip(LockedMemoryBudget::new(0)) else {
         return;
     };
     let fd = register_file(&mut driver, &file);
-    let hooks = &mut driver as &mut dyn DriverTestHooks;
-    if hooks.debug_fixed_buffers_available() {
-        hooks.debug_inject_register_buffers_update_failure(libc::EIO);
-    }
+    let buffer = buffers.pop().expect("registration buffer");
+    let status =
+        register_chunk(&mut driver, &buffer).expect("budget exhaustion must skip registration");
+    assert!(matches!(status, BufferRegistrationStatus::BudgetExceeded));
 
-    let token = submit(&mut driver, fixed_write(buffers.pop().unwrap(), fd));
+    let mut raw_buf = FixedBuf::alloc_heap(NonZeroUsize::new(4096).unwrap(), b"budget-write".len())
+        .expect("allocate raw write buffer");
+    raw_buf.spare_capacity_mut()[..b"budget-write".len()].copy_from_slice(b"budget-write");
+    let token = submit(&mut driver, fixed_write(raw_buf, fd));
     let written = take_write_completion::<WriteFixed>(&mut driver, token);
-    assert_eq!(written, b"compatible-write".len());
+    assert_eq!(written, b"budget-write".len());
 
     let mut check = File::open(_file_path.path()).expect("reopen written file");
     let mut content = Vec::new();
     check.read_to_end(&mut content).expect("read written file");
-    assert_eq!(content, b"compatible-write");
-    let hooks = &driver as &dyn DriverTestHooks;
-    assert_eq!(hooks.debug_raw_buffer_fallbacks(), 1);
+    assert_eq!(content, b"budget-write");
 }
 
 #[test]
-fn compatible_mode_backlog_retry_preserves_raw_fallback() {
-    let (mut buffers, registrar) = slot_buffers(1, 4096);
-    let (_file_path, file) = open_file("compatible-backlog", b"compatible-backlog");
-    let Some(mut driver) = new_driver_or_skip(
-        veloq_driver_uring::BufferRegistrationMode::Compatible,
-        registrar,
-    ) else {
+fn unregistered_fixed_read_survives_backlog_retry() {
+    let (_file_path, file) = open_file("budget-backlog", b"budget-backlog");
+    let Some(mut driver) = new_driver_or_skip(LockedMemoryBudget::new(0)) else {
         return;
     };
     let fd = register_file(&mut driver, &file);
-    let fixed_available = {
-        let hooks = &mut driver as &mut dyn DriverTestHooks;
-        let fixed_available = hooks.debug_fixed_buffers_available();
-        if fixed_available {
-            hooks.debug_inject_register_buffers_update_failure(libc::EIO);
-        }
-        hooks.debug_inject_push_entry_failure();
-        fixed_available
-    };
+    (&mut driver as &mut dyn DriverTestHooks).debug_inject_push_entry_failure();
 
-    let token = submit(
-        &mut driver,
-        fixed_read(buffers.pop().expect("backlog read buffer"), fd),
-    );
+    let raw_buf = FixedBuf::alloc_heap_full(NonZeroUsize::new(4096).unwrap())
+        .expect("allocate raw read buffer");
+    let token = submit(&mut driver, fixed_read(raw_buf, fd));
     let events = (&mut driver as &mut dyn DriverTestHooks).debug_control_plane_events();
     assert!(
         !events
@@ -581,58 +421,45 @@ fn compatible_mode_backlog_retry_preserves_raw_fallback() {
     );
     let (read, read_buf) =
         take_read_completion::<ReadFixed>(&mut driver, token, |payload| payload.buf);
-    assert_eq!(read, b"compatible-backlog".len());
-    assert_eq!(&read_buf.as_slice()[..read], b"compatible-backlog");
-
-    let hooks = &driver as &dyn DriverTestHooks;
-    assert!(
-        hooks.debug_raw_buffer_fallbacks() >= 2,
-        "initial submission and backlog retry must both preserve raw fallback"
-    );
-    if fixed_available {
-        assert_eq!(hooks.debug_chunk_register_attempts(), 1);
-        assert_eq!(hooks.debug_chunk_register_failures(), 1);
-        assert!(hooks.debug_chunk_register_skipped_recent_failure() >= 1);
-    } else {
-        assert_eq!(hooks.debug_chunk_register_attempts(), 0);
-    }
+    assert_eq!(read, b"budget-backlog".len());
+    assert_eq!(&read_buf.as_slice()[..read], b"budget-backlog");
 }
 
 #[test]
-fn compatible_mode_accepts_raw_read_and_write_entries() {
-    let (mut buffers, registrar) = slot_buffers(2, b"raw-write".len());
+fn budget_exhaustion_accepts_unregistered_raw_read_and_write_entries() {
     let (_file_path, file) = open_file("raw-entries", b"raw-read");
-    buffers[0].as_slice_mut()[..b"raw-write".len()].copy_from_slice(b"raw-write");
-    let Some(mut driver) = new_driver_or_skip(
-        veloq_driver_uring::BufferRegistrationMode::Compatible,
-        registrar,
-    ) else {
+    let Some(mut driver) = new_driver_or_skip(LockedMemoryBudget::new(0)) else {
         return;
     };
     let raw = UringRawHandle::for_file(file.as_raw_fd());
-    let read = submit(
+    let read_buf = FixedBuf::alloc_heap_full(NonZeroUsize::new(4096).unwrap())
+        .expect("allocate raw read buffer");
+    let token = submit(
         &mut driver,
         ReadRaw {
             fd: raw,
-            buf: buffers.pop().unwrap(),
+            buf: read_buf,
             offset: 0,
             buf_offset: 0,
         },
     );
     let (read, read_buf) =
-        take_read_completion::<ReadRaw>(&mut driver, read, |payload| payload.buf);
+        take_read_completion::<ReadRaw>(&mut driver, token, |payload| payload.buf);
     assert_eq!(read, b"raw-read".len());
     assert_eq!(&read_buf.as_slice()[..read], b"raw-read");
 
-    let write = submit(
+    let mut write_buf = FixedBuf::alloc_heap(NonZeroUsize::new(4096).unwrap(), b"raw-write".len())
+        .expect("allocate raw write buffer");
+    write_buf.spare_capacity_mut()[..b"raw-write".len()].copy_from_slice(b"raw-write");
+    let token = submit(
         &mut driver,
         WriteRaw {
             fd: raw,
-            buf: buffers.pop().unwrap(),
+            buf: write_buf,
             offset: 0,
             buf_offset: 0,
         },
     );
-    let written = take_write_completion::<WriteRaw>(&mut driver, write);
+    let written = take_write_completion::<WriteRaw>(&mut driver, token);
     assert_eq!(written, b"raw-write".len());
 }

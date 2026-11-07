@@ -15,16 +15,19 @@ mod submit;
 pub use payload::IocpUserPayload;
 pub(crate) use payload::{
     ACCEPT_EX_ADDR_SECTION_LEN, ACCEPT_EX_OUTPUT_BUFFER_LEN, AcceptMultiPayload, AcceptPayload,
-    IocpOpPayload, KernelRef, OpenPayload, PayloadRef, RecvMultiPayload, RecvProvidedPayload,
-    SendToPayload, UdpRecvMultiPayload, kernel_ref,
+    IocpOpPayload, KernelRef, OpenPayload, PayloadRef, RawUdpReceiveRequest, RecvMultiPayload,
+    RecvProvidedPayload, SendToPayload, UdpRecvMultiPayload, kernel_ref,
 };
 use spec::{
     IocpMultiShotErasure, IocpMultiShotSpec, IocpMultiShotVTable, IocpOpErasure, IocpOpSpec,
 };
 pub(crate) use state::{BlockingCompletion, BlockingSuccessCleanup, IocpOpRegistry, Slot};
 pub use state::{IocpOpState, IocpSlotSpec, OverlappedEntry};
-pub(crate) use submit::{SubmissionResult, locate_registered_slot, resolve_fd_handle};
+pub(crate) use submit::{
+    SubmissionResult, UdpReceiveSubmit, locate_registered_slot, resolve_fd_handle,
+};
 
+use veloq_buf::{FixedBuf, RegistrationCapability};
 use veloq_std::{pin::Pin, sync::Arc};
 
 use diagweave::{prelude::*, report::Report};
@@ -52,7 +55,7 @@ use veloq_driver_core::{
             RecvMulti as RecvMultiBase, RecvProvided as RecvProvidedBase, Send as OpSendBase,
             SendTo as SendToBase, SyncFileRange as SyncFileRangeBase,
             SyncFileRangeRaw as SyncFileRangeRawBase, Timeout as TimeoutBase,
-            UdpConnect as UdpConnectBase, UdpRecvMulti as UdpRecvMultiBase,
+            UdpConnect as UdpConnectBase, UdpRecvMulti as UdpRecvMultiBase, UdpRecvMultiBackend,
             UdpRecvPacket as UdpRecvPacketBase, UdpSend as UdpSendBase, Wakeup as WakeupBase,
             WriteFixed as WriteFixedBase, WriteRaw as WriteRawBase,
         },
@@ -94,6 +97,8 @@ pub(crate) type AcceptMulti = AcceptMultiBase<IocpHandle>;
 pub(crate) type RecvProvided = RecvProvidedBase<IocpHandle>;
 pub(crate) type RecvMulti = RecvMultiBase<IocpHandle>;
 
+pub(crate) const RAW_UDP_RECV_MULTI_RESUME_BYTES: u32 = i32::MAX as u32;
+
 // ============================================================================
 // SubmitContext 定义 / SubmitContext definition
 // ============================================================================
@@ -107,7 +112,8 @@ pub(crate) struct SubmitContext<'a> {
     pub(crate) completion_token: CompletionToken,
     pub(crate) ext: &'a Extensions,
     pub(crate) registered_slots: &'a mut [RegisteredSlot],
-    pub(crate) registrar: &'a dyn veloq_buf::BufferRegistrar,
+    pub(crate) overlapped_registry: Option<&'a mut crate::driver::OverlappedRegistry>,
+    pub(crate) buffer_pool: Option<&'a veloq_buf::AnyBufPool>,
 
     // RIO 支持 / RIO support
     pub(crate) rio: &'a mut RioState,
@@ -119,7 +125,6 @@ pub(crate) struct SubmitContext<'a> {
 
 pub(crate) struct OpVTable {
     pub(crate) kind: OpKind,
-    pub(crate) multishot: bool,
     pub(crate) multishot_ops: Option<&'static IocpMultiShotVTable>,
     pub(crate) submit: fn(&mut IocpKernelOp, &mut SubmitContext) -> IocpResult<SubmissionResult>,
     pub(crate) on_complete:
@@ -178,23 +183,65 @@ impl IocpKernelOp {
         self.vtable.kind
     }
 
-    pub(crate) const fn is_multishot(&self) -> bool {
-        self.vtable.multishot
-    }
-
     /// 返回此操作是否使用 RIO 后端。 / Returns whether this operation uses the RIO backend.
     pub(crate) fn uses_rio_backend(&self) -> bool {
+        let Some(handle) = self.header.resolved_handle else {
+            return false;
+        };
+        if !handle.raw().uses_rio() {
+            return false;
+        }
+
+        let is_registered = |buffer: &FixedBuf| {
+            matches!(
+                buffer.resolve_region_info().registration,
+                RegistrationCapability::RegisteredChunk(_)
+            )
+        };
         match self.kind() {
-            OpKind::Recv | OpKind::Send | OpKind::UdpSend | OpKind::SendTo => true,
-            OpKind::RecvProvided | OpKind::RecvMulti | OpKind::UdpRecvMulti => {
-                self.multishot_vtable().is_some_and(|vtable| {
-                    let cardinality_ok = match self.kind() {
-                        OpKind::RecvProvided => !self.is_multishot(),
-                        _ => self.is_multishot(),
-                    };
-                    cardinality_ok && vtable.operation == self.kind()
-                })
-            }
+            OpKind::Recv => match &self.payload {
+                IocpOpPayload::Recv(payload) => unsafe { payload.user.as_ref() }
+                    .map(|user| is_registered(&user.buf))
+                    .unwrap_or(false),
+                _ => false,
+            },
+            OpKind::Send => match &self.payload {
+                IocpOpPayload::Send(payload) => unsafe { payload.user.as_ref() }
+                    .map(|user| is_registered(&user.buf))
+                    .unwrap_or(false),
+                _ => false,
+            },
+            OpKind::UdpSend => match &self.payload {
+                IocpOpPayload::UdpSend(payload) => unsafe { payload.user.as_ref() }
+                    .map(|user| is_registered(&user.buf))
+                    .unwrap_or(false),
+                _ => false,
+            },
+            OpKind::SendTo => match &self.payload {
+                IocpOpPayload::SendTo(payload) => unsafe { payload.user.as_ref() }
+                    .map(|user| is_registered(&user.buf))
+                    .unwrap_or(false),
+                _ => false,
+            },
+            OpKind::RecvProvided => false,
+            OpKind::RecvMulti => match &self.payload {
+                IocpOpPayload::RecvMulti(payload) => payload.pump.is_some(),
+                _ => false,
+            },
+            OpKind::UdpRecvMulti => match &self.payload {
+                IocpOpPayload::UdpRecvMulti(payload) => unsafe { payload.user.as_ref() }
+                    .map(|user| {
+                        let pump = user.receive_pump();
+                        let target_depth = pump.snapshot().target_depth as u32;
+                        target_depth > 0
+                            && (0..target_depth).all(|slot_id| {
+                                pump.slot(slot_id)
+                                    .is_some_and(|slot| is_registered(slot.data_buf()))
+                            })
+                    })
+                    .unwrap_or(false),
+                _ => false,
+            },
             OpKind::AcceptMulti => false,
             _ => false,
         }
@@ -327,7 +374,6 @@ macro_rules! impl_iocp_op_erasure {
             fn vtable() -> &'static OpVTable {
                 static TABLE: OpVTable = OpVTable {
                     kind: <$OpType as IocpOpSpec>::PAYLOAD_KIND,
-                    multishot: false,
                     multishot_ops: None,
                     submit: spec::submit_shim::<$OpType>,
                     on_complete: spec::on_complete_shim::<$OpType>,
@@ -396,7 +442,6 @@ macro_rules! impl_iocp_multishot_op_erasure {
         $record:ty,
         $record_kind:ident,
         $completion:ty,
-        $multishot:expr,
         $continuation:path
     ) => {
         impl IocpMultiShotErasure for $OpType {
@@ -441,7 +486,6 @@ macro_rules! impl_iocp_multishot_op_erasure {
 
             fn vtable() -> &'static OpVTable {
                 static MULTI_SHOT: IocpMultiShotVTable = IocpMultiShotVTable {
-                    operation: <$OpType as IocpMultiShotSpec>::PAYLOAD_KIND,
                     record_kind: spec::IocpRecordKind::$record_kind,
                     encode_accepted_socket: spec::encode_accepted_socket,
                     rearm: spec::submit_multishot_shim::<$OpType>,
@@ -449,7 +493,6 @@ macro_rules! impl_iocp_multishot_op_erasure {
                 };
                 static TABLE: OpVTable = OpVTable {
                     kind: <$OpType as IocpMultiShotSpec>::PAYLOAD_KIND,
-                    multishot: $multishot,
                     multishot_ops: Some(&MULTI_SHOT),
                     submit: spec::submit_multishot_shim::<$OpType>,
                     on_complete: spec::on_complete_multishot_shim::<$OpType>,
@@ -594,7 +637,6 @@ impl_iocp_multishot_op_erasure!(
     AcceptedSocket,
     AcceptedSocket,
     OwnedRawHandle,
-    true,
     spec::more_on_success
 );
 impl_iocp_multishot_op_erasure!(
@@ -605,7 +647,6 @@ impl_iocp_multishot_op_erasure!(
     ProvidedBuf,
     ProvidedBuf,
     usize,
-    false,
     spec::final_continuation
 );
 impl SingleShotOp<IocpSlotSpec> for RecvProvided {}
@@ -617,7 +658,6 @@ impl_iocp_multishot_op_erasure!(
     ProvidedBuf,
     ProvidedBuf,
     usize,
-    true,
     spec::more_on_success
 );
 impl_iocp_multishot_op_erasure!(
@@ -628,7 +668,6 @@ impl_iocp_multishot_op_erasure!(
     UdpRecvPacket,
     UdpRecvPacket,
     usize,
-    true,
     spec::more_on_success
 );
 impl_iocp_op_erasure!(Open, Open, Open, OwnedRawHandle);
@@ -671,7 +710,6 @@ mod tests {
             .bind_user_payload(&mut erased)
             .expect("persistent submit payload should bind");
         assert_eq!(kernel.kind(), OpKind::UdpRecvMulti);
-        assert!(kernel.is_multishot());
         assert!(kernel.multishot_vtable().is_some());
 
         let packet = UdpRecvPacket {

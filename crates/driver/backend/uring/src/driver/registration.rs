@@ -6,8 +6,7 @@ pub(crate) use self::files::RegistrationPorts;
 
 use crate::{
     config::{
-        BufferRegistrationMode, FileTableExhaustion, IoFd, ProvidedBufConfig, RawHandle,
-        RawHandleKind, UringRawHandle,
+        FileTableExhaustion, IoFd, ProvidedBufConfig, RawHandle, RawHandleKind, UringRawHandle,
     },
     diagnostics::UringCompletionDiagnostics,
     driver::env::{ProvidedBufSqeInfo, SubmitEnvironmentFactory, SubmitResourceView},
@@ -15,7 +14,7 @@ use crate::{
     op::{CheckedSlotView, SlotView, UringOpRegistry, UringOpRegistryExt},
 };
 use diagweave::prelude::*;
-use veloq_buf::{AnyBufPool, BufferRegistrar, heap::ChunkId};
+use veloq_buf::{AnyBufPool, BufferRegistrationRequest, LockedMemoryBudget, heap::ChunkId};
 use veloq_driver_core::driver::{BufferRegistrationStatus, OpToken, RegisterFd};
 use veloq_io_uring::{KernelCapabilities, ResourceRegistration, Submitter};
 use veloq_std::{time::Duration, vec::Vec};
@@ -31,8 +30,7 @@ mod provided_buf;
 mod update;
 
 pub(crate) use buffer::{
-    ChunkRegistrationRecord, ChunkRegistrationRequest, ChunkRegistrationState, FixedBufferOwner,
-    FixedBufferSubmitPort,
+    ChunkRegistrationRecord, ChunkRegistrationState, FixedBufferOwner, FixedBufferSubmitPort,
 };
 pub(crate) use file_table::{
     FileTable, FileTablePoisonContext, OwnedFdOwnershipTicket, OwnedLocation, RegisteredFileEntry,
@@ -229,28 +227,21 @@ impl ProvidedBufQuiesce {
 
 impl<'a> RegistrationEngine<'a> {
     pub(crate) fn new(
-        registration_mode: BufferRegistrationMode,
+        budget: LockedMemoryBudget,
         provided_buffers: Option<ProvidedBufConfig>,
-        registrar: &'a (dyn BufferRegistrar + 'a),
         file_table_capacity: u32,
         file_table_exhaustion: FileTableExhaustion,
     ) -> Self {
         Self {
-            fixed_buffers: FixedBufferOwner::new(registration_mode, registrar),
+            fixed_buffers: FixedBufferOwner::new(budget),
             provided_buffers: ProvidedBufferOwner::new(provided_buffers),
             files: FixedFileOwner::new(file_table_capacity, file_table_exhaustion),
         }
     }
 
-    pub(crate) fn build_submit_view<'d>(
-        &'d mut self,
-        submitter: Submitter<'d>,
-        diagnostics: &'d UringCompletionDiagnostics,
-    ) -> SubmitResourceView<'d, 'a> {
+    pub(crate) fn build_submit_view<'d>(&'d mut self) -> SubmitResourceView<'d, 'a> {
         SubmitEnvironmentFactory::resource_view(
-            submitter,
             self.files.table(),
-            diagnostics,
             self.fixed_buffers
                 .split_for_submit(self.provided_buffers.sqe_info()),
         )
@@ -315,6 +306,7 @@ impl<'a> RegistrationEngine<'a> {
         pool: AnyBufPool,
         ring_lifetime_token: RingLifetimeToken,
     ) -> UringResult<bool> {
+        self.fixed_buffers.retain_pool(pool.clone())?;
         self.provided_buffers
             .attach(submitter, pool, ring_lifetime_token)
     }
@@ -386,12 +378,10 @@ impl<'a> RegistrationEngine<'a> {
         &mut self,
         submitter: &Submitter<'_>,
         diagnostics: &UringCompletionDiagnostics,
-        id: ChunkId,
-        ptr: *const u8,
-        len: usize,
+        request: BufferRegistrationRequest,
     ) -> UringResult<BufferRegistrationStatus> {
         self.fixed_buffers
-            .register_buffer_internal(submitter, diagnostics, id, ptr, len)
+            .register_buffer_internal(submitter, diagnostics, request)
     }
 
     pub(crate) fn register_files_internal<'h>(

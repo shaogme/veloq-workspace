@@ -1,12 +1,11 @@
 use veloq_std::{
-    boxed::Box, cell::RefCell, fmt::Display, format, num::NonZeroUsize, ptr::NonNull, sync::mpsc,
-    vec, vec::Vec,
+    boxed::Box, cell::RefCell, fmt::Display, format, num::NonZeroUsize, vec, vec::Vec,
 };
 
 use diagweave::prelude::*;
 use veloq_buf::{
     AnyBufPool, BufError, BufPool, BufResult, BufferRegion, BufferRegistrar, FixedBuf,
-    heap::{ChunkId, ChunkInfo},
+    heap::ChunkId,
 };
 use veloq_driver_native::{
     driver::{
@@ -31,24 +30,9 @@ use veloq_runtime::{
 
 use crate::error::Result as VeloqResult;
 
-/// 驱动注册中心的消息类型
-#[derive(Debug, Clone)]
-pub enum RegistrarMessage {
-    /// 发现了新的内存块，需要通知驱动注册
-    NewChunk(ChunkInfo),
-}
-
-pub struct WorkerRegistrarState {
-    /// 接收来自分发器的广播消息
-    pub receiver: mpsc::Receiver<RegistrarMessage>,
-    /// 本地已知的内存块快照
-    pub chunks: Vec<ChunkInfo>,
-}
-
 pub struct WorkerState<'rt> {
     pub driver: RefCell<PlatformDriver<'rt>>,
     pub buf_pool: AnyBufPool,
-    pub registrar_state: RefCell<WorkerRegistrarState>,
 }
 
 #[derive(Clone)]
@@ -67,145 +51,39 @@ impl<'rt> DriverRegistrar<'rt> {
             .try_with(|extra| f(extra))
             .expect("Ctx accessed outside of a worker thread")
     }
-
-    pub fn sync_chunk_metadata(&self) {
-        self.extra(|extra| {
-            sync_chunk_metadata_internal(&extra.registrar_state);
-        })
-    }
 }
 
 impl<'rt> BufferRegistrar for DriverRegistrar<'rt> {
-    fn register(&self, regions: &[BufferRegion]) -> BufResult<Vec<ChunkId>> {
-        self.extra(|extra| register_internal(&extra.driver, &extra.registrar_state, regions))
-    }
-
-    fn resolve_chunk_info(&self, chunk_id: ChunkId) -> Option<ChunkInfo> {
-        self.extra(|extra| resolve_chunk_info_internal(&extra.registrar_state, chunk_id))
-    }
-}
-
-#[repr(transparent)]
-pub struct SharedRegistrar<'rt> {
-    _shared: RuntimeShared<WorkerState<'rt>>,
-}
-
-impl<'rt> SharedRegistrar<'rt> {
-    /// # Safety
-    /// The memory layout of `SharedRegistrar` is identical to `RuntimeShared<WorkerState<'rt>>`.
-    #[inline]
-    pub unsafe fn from_shared(shared: &'rt RuntimeShared<WorkerState<'rt>>) -> &'rt Self {
-        unsafe { &*(shared as *const RuntimeShared<WorkerState<'rt>> as *const Self) }
-    }
-}
-
-impl<'rt> BufferRegistrar for SharedRegistrar<'rt> {
-    fn register(&self, regions: &[BufferRegion]) -> BufResult<Vec<ChunkId>> {
-        let shared = unsafe { &*(self as *const Self as *const RuntimeShared<WorkerState<'rt>>) };
-        shared
-            .extra_tls
-            .try_with(|extra| register_internal(&extra.driver, &extra.registrar_state, regions))
-            .expect("Ctx accessed outside of a worker thread")
-    }
-
-    fn resolve_chunk_info(&self, chunk_id: ChunkId) -> Option<ChunkInfo> {
-        let shared = unsafe { &*(self as *const Self as *const RuntimeShared<WorkerState<'rt>>) };
-        shared
-            .extra_tls
-            .try_with(|extra| resolve_chunk_info_internal(&extra.registrar_state, chunk_id))
-            .expect("Ctx accessed outside of a worker thread")
+    fn register(&self, regions: &mut [BufferRegion]) -> BufResult<Vec<ChunkId>> {
+        self.extra(|extra| register_internal(&extra.driver, regions))
     }
 }
 
 pub(crate) struct BorrowedRegistrar<'a, 'rt> {
     pub driver: &'a RefCell<PlatformDriver<'rt>>,
-    pub state: &'a RefCell<WorkerRegistrarState>,
 }
 
 impl<'a, 'rt> BufferRegistrar for BorrowedRegistrar<'a, 'rt> {
-    fn register(&self, regions: &[BufferRegion]) -> BufResult<Vec<ChunkId>> {
-        register_internal(self.driver, self.state, regions)
-    }
-
-    fn resolve_chunk_info(&self, chunk_id: ChunkId) -> Option<ChunkInfo> {
-        resolve_chunk_info_internal(self.state, chunk_id)
+    fn register(&self, regions: &mut [BufferRegion]) -> BufResult<Vec<ChunkId>> {
+        register_internal(self.driver, regions)
     }
 }
 
 fn register_internal(
     driver: &RefCell<PlatformDriver<'_>>,
-    state: &RefCell<WorkerRegistrarState>,
-    regions: &[BufferRegion],
+    regions: &mut [BufferRegion],
 ) -> BufResult<Vec<ChunkId>> {
     let mut driver = driver.borrow_mut();
-    register_regions_with(state, regions, |region| {
-        let status = driver
-            .register_buffer(region.id(), region.as_ptr(), region.len())
-            .map_err(|err| BufError::Other(format!("{err:#}")))?;
-        Ok(status)
-    })
-}
-
-fn register_regions_with<F>(
-    state: &RefCell<WorkerRegistrarState>,
-    regions: &[BufferRegion],
-    mut register: F,
-) -> BufResult<Vec<ChunkId>>
-where
-    F: FnMut(&BufferRegion) -> BufResult<BufferRegistrationStatus>,
-{
-    let mut indices = Vec::with_capacity(regions.len());
+    let mut registered_ids = Vec::with_capacity(regions.len());
     for region in regions {
-        let status = register(region)?;
-        // Commit each prefix entry immediately. If a later region fails, the backend may already
-        // own a persistent registration for the earlier regions; resolve must expose exactly the
-        // same prefix so subsequent raw fallback can still use its buffers.
-        state.borrow_mut().chunks.push(ChunkInfo {
-            id: region.id(),
-            ptr: unsafe { NonNull::new_unchecked(region.as_ptr() as *mut u8) },
-            len: unsafe { NonZeroUsize::new_unchecked(region.len()) },
-        });
+        let status = driver
+            .register_buffer(region.registration_request())
+            .map_err(|err| BufError::Other(format!("{err:#}")))?;
         if matches!(status, BufferRegistrationStatus::Registered) {
-            indices.push(region.id());
+            registered_ids.push(region.id());
         }
     }
-    Ok(indices)
-}
-
-fn resolve_chunk_info_internal(
-    state: &RefCell<WorkerRegistrarState>,
-    chunk_id: ChunkId,
-) -> Option<ChunkInfo> {
-    // 首先在本地快照中查找
-    let found = {
-        let state = state.borrow();
-        state.chunks.iter().find(|c| c.id == chunk_id).copied()
-    };
-
-    if let Some(chunk) = found {
-        return Some(chunk);
-    }
-
-    // 如果没找到，尝试同步一次消息队列后再查找
-    sync_chunk_metadata_internal(state);
-
-    let state = state.borrow();
-    state.chunks.iter().find(|c| c.id == chunk_id).copied()
-}
-
-fn sync_chunk_metadata_internal(state: &RefCell<WorkerRegistrarState>) {
-    let mut state = state.borrow_mut();
-
-    let mut new_chunks = Vec::new();
-    while let Ok(msg) = state.receiver.try_recv() {
-        match msg {
-            RegistrarMessage::NewChunk(chunk) => {
-                new_chunks.push(chunk);
-            }
-        }
-    }
-
-    state.chunks.extend(new_chunks);
+    Ok(registered_ids)
 }
 
 #[derive(Clone, Copy)]
@@ -284,11 +162,6 @@ impl<'rt> Ctx<'rt> {
         f(RuntimeContextDriver::new(self))
     }
 
-    #[inline]
-    pub fn sync_chunk_metadata(&self) {
-        self.registrar().sync_chunk_metadata();
-    }
-
     pub fn try_alloc_from_pool(&self, cap: NonZeroUsize, len: usize) -> Option<FixedBuf> {
         self.buf_pool().alloc(cap, len)
     }
@@ -315,7 +188,6 @@ impl<'rt> Ctx<'rt> {
     }
 
     pub fn drive_wait(&self) -> VeloqResult<IdleDecision> {
-        self.sync_chunk_metadata();
         self.driver(|mut driver| {
             let outcome = driver
                 .drive(DriveMode::Wait { timeout: None })
@@ -331,7 +203,6 @@ impl<'rt> Ctx<'rt> {
         S: OpSubmitter<'rt, Ctx<'rt>> + Copy + 'd,
         T: SingleShotOp<<PlatformDriver<'rt> as DriverRaw>::SlotSpec> + Send,
     {
-        self.sync_chunk_metadata();
         submitter.submit(op, *self)
     }
 
@@ -344,12 +215,10 @@ impl<'rt> Ctx<'rt> {
         S: OpSubmitter<'rt, Ctx<'rt>> + Copy + 'd,
         T: IntoPlatformOp<<PlatformDriver<'rt> as DriverRaw>::SlotSpec> + Send,
     {
-        self.sync_chunk_metadata();
         submitter.submit_stream(op, *self)
     }
 
     pub async fn yield_now(&self) {
-        self.sync_chunk_metadata();
         yield_now().await;
     }
 
@@ -398,9 +267,6 @@ pub fn poll_current_driver<'rt>(
     shared
         .extra_tls
         .try_with(|extra| {
-            // sync registrar
-            sync_chunk_metadata_internal(&extra.registrar_state);
-
             let mut driver = extra.driver.borrow_mut();
 
             let outcome = driver
@@ -504,9 +370,6 @@ pub fn park_current_driver<'rt>(
     wait_strategy: IdleWaitStrategy,
 ) -> RuntimeResult<()> {
     let res = shared.extra_tls.try_with(|extra| {
-        // sync registrar
-        sync_chunk_metadata_internal(&extra.registrar_state);
-
         let mut driver = extra.driver.borrow_mut();
 
         // Block on the OS event driver
@@ -572,8 +435,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use veloq_buf::{BufferRegion, heap::ChunkInfo};
-    use veloq_driver_native::driver::BufferRegistrationStatus;
     use veloq_std::time::Duration;
 
     use super::*;
@@ -629,51 +490,5 @@ mod tests {
                 timeout: Some(Duration::from_millis(7))
             }
         );
-    }
-
-    #[test]
-    fn registrar_commits_only_the_processed_prefix() {
-        let (sender, receiver) = mpsc::channel();
-        drop(sender);
-        let state = RefCell::new(WorkerRegistrarState {
-            receiver,
-            chunks: Vec::new(),
-        });
-        let first = ChunkInfo {
-            id: ChunkId::from_raw(1),
-            ptr: NonNull::new(Box::leak(Box::new([0_u8; 4096])).as_mut_ptr())
-                .expect("first chunk pointer"),
-            len: NonZeroUsize::new(4096).expect("first chunk length"),
-        };
-        let second = ChunkInfo {
-            id: ChunkId::from_raw(2),
-            ptr: NonNull::new(Box::leak(Box::new([0_u8; 4096])).as_mut_ptr())
-                .expect("second chunk pointer"),
-            len: NonZeroUsize::new(4096).expect("second chunk length"),
-        };
-        let regions = [
-            BufferRegion::from_chunk_info(first).expect("first region"),
-            BufferRegion::from_chunk_info(second).expect("second region"),
-        ];
-
-        let result = register_regions_with(&state, &regions, |region| {
-            if region.id() == first.id {
-                Ok(BufferRegistrationStatus::Registered)
-            } else {
-                Err(BufError::Other("injected second-region failure".into()).into())
-            }
-        });
-
-        assert!(result.is_err());
-        {
-            let chunks = &state.borrow().chunks;
-            assert_eq!(chunks.len(), 1);
-            assert_eq!(chunks[0].id, first.id);
-        }
-        let resolved = resolve_chunk_info_internal(&state, first.id).expect("first metadata");
-        assert_eq!(resolved.id, first.id);
-        assert_eq!(resolved.ptr, first.ptr);
-        assert_eq!(resolved.len, first.len);
-        assert!(resolve_chunk_info_internal(&state, second.id).is_none());
     }
 }

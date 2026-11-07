@@ -1,4 +1,4 @@
-use veloq_std::{any::type_name, mem::size_of, ptr::NonNull};
+use veloq_std::{any::type_name, format, mem::size_of, ptr::NonNull, vec::Vec};
 
 use windows_sys::Win32::Networking::WinSock::SOCKADDR_STORAGE;
 
@@ -16,7 +16,9 @@ use crate::{
 
 use diagweave::prelude::*;
 use veloq_buf::FixedBuf;
-use veloq_driver_core::{platform::receive_pump::ReceivePumpState, slot::Generation};
+use veloq_driver_core::{
+    driver::OpToken, platform::receive_pump::ReceivePumpState, slot::Generation,
+};
 
 pub enum IocpUserPayload {
     ReadFixed(ReadFixed),
@@ -193,6 +195,7 @@ impl RecvProvidedPayload {
 pub(crate) struct RecvMultiPayload {
     pub(crate) user: PayloadRef<RecvMulti>,
     pub(crate) pump: Option<ReceivePumpState>,
+    pub(crate) raw_buffer: Option<FixedBuf>,
 }
 
 impl RecvMultiPayload {
@@ -200,6 +203,7 @@ impl RecvMultiPayload {
         Self {
             user: PayloadRef::unbound(),
             pump: None,
+            raw_buffer: None,
         }
     }
 }
@@ -218,6 +222,142 @@ pub(crate) struct SendToPayload {
 /// and never borrow this binding.
 pub(crate) struct UdpRecvMultiPayload {
     pub(crate) user: PayloadRef<UdpRecvMulti>,
+    pub(crate) request_id: u64,
+    raw_requests: Option<Vec<RawUdpReceiveRequest>>,
+    terminal_error: Option<Report<IocpError>>,
+}
+
+pub(crate) struct RawUdpReceiveRequest {
+    slot_id: u32,
+    header: crate::op::OverlappedEntry,
+    address: SockAddrStorage,
+    address_len: i32,
+}
+
+impl RawUdpReceiveRequest {
+    pub(crate) fn new(slot_id: u32, token: OpToken) -> Self {
+        Self {
+            slot_id,
+            header: crate::op::OverlappedEntry::new(token),
+            address: SockAddrStorage::default(),
+            address_len: 0,
+        }
+    }
+
+    pub(crate) const fn slot_id(&self) -> u32 {
+        self.slot_id
+    }
+
+    pub(crate) fn header_mut(&mut self) -> &mut crate::op::OverlappedEntry {
+        &mut self.header
+    }
+
+    pub(crate) fn header(&self) -> &crate::op::OverlappedEntry {
+        &self.header
+    }
+
+    pub(crate) fn address(&self) -> &SockAddrStorage {
+        &self.address
+    }
+
+    pub(crate) fn address_len(&self) -> i32 {
+        self.address_len
+    }
+
+    pub(crate) fn with_submit_fields<T>(
+        &mut self,
+        submit: impl FnOnce(&mut crate::op::OverlappedEntry, &mut SockAddrStorage, &mut i32) -> T,
+    ) -> T {
+        submit(&mut self.header, &mut self.address, &mut self.address_len)
+    }
+}
+
+impl UdpRecvMultiPayload {
+    pub(crate) fn new() -> Self {
+        Self {
+            user: PayloadRef::unbound(),
+            request_id: 0,
+            raw_requests: None,
+            terminal_error: None,
+        }
+    }
+
+    pub(crate) fn try_allocate_raw_requests(
+        &mut self,
+        token: OpToken,
+        depth: usize,
+    ) -> IocpResult<()> {
+        if let Some(requests) = &self.raw_requests {
+            if requests.len() == depth {
+                return Ok(());
+            }
+            return IocpError::InvalidState
+                .with_ctx("existing_depth", requests.len())
+                .with_ctx("requested_depth", depth)
+                .attach_note("raw UDP receive request owner depth changed after allocation");
+        }
+
+        let mut requests = Vec::new();
+        requests.try_reserve_exact(depth).map_err(|error| {
+            IocpError::Submission
+                .to_report()
+                .with_ctx("request_depth", depth)
+                .attach_note(format!(
+                    "failed to reserve raw UDP request contexts: {error}"
+                ))
+        })?;
+        for slot_id in 0..depth {
+            let slot_id = u32::try_from(slot_id).map_err(|_| {
+                IocpError::InvalidInput
+                    .to_report()
+                    .with_ctx("request_depth", depth)
+                    .attach_note("raw UDP receive slot id exceeds u32")
+            })?;
+            requests.push(RawUdpReceiveRequest::new(slot_id, token));
+        }
+        self.raw_requests = Some(requests);
+        Ok(())
+    }
+
+    pub(crate) fn raw_requests(&self) -> Option<&[RawUdpReceiveRequest]> {
+        self.raw_requests.as_deref()
+    }
+
+    pub(crate) fn raw_requests_mut(&mut self) -> Option<&mut [RawUdpReceiveRequest]> {
+        self.raw_requests.as_deref_mut()
+    }
+
+    pub(crate) fn raw_request_mut(&mut self, slot_id: u32) -> Option<&mut RawUdpReceiveRequest> {
+        self.raw_requests_mut()?.get_mut(slot_id as usize)
+    }
+
+    pub(crate) fn with_bound_parts_mut<T>(
+        &mut self,
+        access: impl FnOnce(
+            &mut UdpRecvMulti,
+            &mut [RawUdpReceiveRequest],
+            &mut u64,
+            &mut Option<Report<IocpError>>,
+        ) -> IocpResult<T>,
+    ) -> IocpResult<T> {
+        let Self {
+            user,
+            request_id,
+            raw_requests,
+            terminal_error,
+        } = self;
+        let user = unsafe { user.as_mut()? };
+        let requests = raw_requests.as_deref_mut().ok_or_else(|| {
+            IocpError::InvalidState
+                .to_report()
+                .attach_note("raw UDP child request owners have not been allocated")
+        })?;
+        access(user, requests, request_id, terminal_error)
+    }
+
+    pub(crate) fn take_terminal_error(&mut self) -> Option<Report<IocpError>> {
+        self.terminal_error.take()
+    }
 }
 
 /// Payload for the file open operation.
@@ -308,5 +448,48 @@ impl PayloadBinding<Open> for OpenPayload {
 
     fn clear(&mut self) {
         self.user.clear();
+    }
+}
+
+#[cfg(test)]
+mod raw_udp_receive_request_tests {
+    use super::UdpRecvMultiPayload;
+    use veloq_driver_core::{driver::OpToken, slot::Generation};
+    use veloq_std::vec::Vec;
+
+    #[test]
+    fn child_request_overlapped_and_address_storage_are_independent() {
+        let token = OpToken::from_registry_parts(0, Generation::ZERO).expect("valid test token");
+        let mut payload = UdpRecvMultiPayload::new();
+        payload
+            .try_allocate_raw_requests(token, 3)
+            .expect("child request allocation should succeed");
+        let requests = payload.raw_requests().expect("child owners should exist");
+
+        let overlapped_addresses = requests
+            .iter()
+            .map(|request| &request.header.inner as *const _ as usize)
+            .collect::<Vec<_>>();
+        let peer_address_addresses = requests
+            .iter()
+            .map(|request| &request.address as *const _ as usize)
+            .collect::<Vec<_>>();
+        assert_eq!(overlapped_addresses.len(), 3);
+        assert_ne!(overlapped_addresses[0], overlapped_addresses[1]);
+        assert_ne!(overlapped_addresses[1], overlapped_addresses[2]);
+        assert_ne!(peer_address_addresses[0], peer_address_addresses[1]);
+        assert_ne!(peer_address_addresses[1], peer_address_addresses[2]);
+    }
+
+    #[test]
+    fn child_request_capacity_overflow_returns_an_error() {
+        let token = OpToken::from_registry_parts(0, Generation::ZERO).expect("valid test token");
+        let mut payload = UdpRecvMultiPayload::new();
+
+        assert!(
+            payload
+                .try_allocate_raw_requests(token, usize::MAX)
+                .is_err()
+        );
     }
 }

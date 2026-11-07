@@ -12,14 +12,14 @@ mod error {
 }
 
 use crate::{
-    BufferRegistrationMode, IocpResult,
+    IocpResult,
     config::{BorrowedRawHandle, SocketKey},
     driver::IocpDriverCompletionDiagnostics,
     ext::Extensions,
     op::{IocpKernelOp, IocpUserPayload, SubmissionResult},
 };
 use diagweave::prelude::*;
-use veloq_buf::{BufferRegistrar, FixedBuf, NoopRegistrar, heap::ChunkId};
+use veloq_buf::{BufferRegistrationRequest, FixedBuf, LockedMemoryBudget, LockedMemoryPermit};
 use veloq_driver_core::{
     driver::BufferRegistrationStatus, platform::receive_pump::ReceivePumpState,
 };
@@ -68,8 +68,9 @@ impl RioState {
         port: BorrowedRawHandle<'_>,
         entries: u32,
         ext: &Extensions,
-        registration_mode: BufferRegistrationMode,
         diagnostics: IocpDriverCompletionDiagnostics,
+        budget: LockedMemoryBudget,
+        address_permit: Option<LockedMemoryPermit>,
     ) -> RioResult<Self> {
         let kernel = RioKernel::from_extensions(port, entries, ext)?;
         let rq_depth = entries.clamp(32, 64);
@@ -77,8 +78,7 @@ impl RioState {
         Ok(Self {
             core: RioCore::new(
                 kernel,
-                RioRegistry::new(rq_depth, entries as usize),
-                registration_mode,
+                RioRegistry::with_budget(rq_depth, entries as usize, budget, address_permit),
             ),
             runtime: RioRuntime::new(),
             lifecycle: RioLifecycleResources {
@@ -180,59 +180,46 @@ impl RioState {
 impl RioState {
     pub(crate) fn register_buffer_backend(
         &mut self,
-        id: ChunkId,
-        ptr: *const u8,
-        len: usize,
+        request: BufferRegistrationRequest,
     ) -> RioResult<BufferRegistrationStatus> {
-        let registrar = NoopRegistrar;
-        let (registry, env) = self.core.registry_with_env(&registrar).into_parts();
+        let (registry, env) = self.core.registry_with_env().into_parts();
         let Some(env) = env else {
             return Err(RioError::NotSupported
                 .to_report()
                 .attach_note("RIO buffer registration is unavailable without a dispatch table"));
         };
         registry
-            .register_buffer_backend(id, (ptr, len), env)
-            .map(|_| BufferRegistrationStatus::Registered)
+            .register_buffer_backend(request, env)
+            .map(|registered| {
+                if registered {
+                    BufferRegistrationStatus::Registered
+                } else {
+                    BufferRegistrationStatus::BudgetExceeded
+                }
+            })
     }
 
     pub(crate) fn try_submit_send_to(
         &mut self,
         args: RioSendToArgs<'_>,
-        registrar: &dyn BufferRegistrar,
     ) -> RioResult<SubmissionResult> {
-        RioSubmitOperations::new(&mut self.core, &mut self.runtime)
-            .try_submit_send_to(args, registrar)
+        RioSubmitOperations::new(&mut self.core, &mut self.runtime).try_submit_send_to(args)
     }
 
     pub(crate) fn try_submit_recv(
         &mut self,
         target: RioTarget<'_>,
         buf: &mut FixedBuf,
-        registrar: &dyn BufferRegistrar,
     ) -> RioResult<SubmissionResult> {
-        RioSubmitOperations::new(&mut self.core, &mut self.runtime)
-            .try_submit_recv(target, buf, registrar)
-    }
-
-    pub(crate) fn try_submit_recv_provided(
-        &mut self,
-        target: RioTarget<'_>,
-        buf: &mut FixedBuf,
-        registrar: &dyn BufferRegistrar,
-    ) -> RioResult<SubmissionResult> {
-        RioSubmitOperations::new(&mut self.core, &mut self.runtime)
-            .try_submit_recv_provided(target, buf, registrar)
+        RioSubmitOperations::new(&mut self.core, &mut self.runtime).try_submit_recv(target, buf)
     }
 
     pub(crate) fn try_submit_send(
         &mut self,
         target: RioTarget<'_>,
         buf: &FixedBuf,
-        registrar: &dyn BufferRegistrar,
     ) -> RioResult<SubmissionResult> {
-        RioSubmitOperations::new(&mut self.core, &mut self.runtime)
-            .try_submit_send(target, buf, registrar)
+        RioSubmitOperations::new(&mut self.core, &mut self.runtime).try_submit_send(target, buf)
     }
 
     pub(crate) fn try_submit_recv_multi_initial(
@@ -240,10 +227,9 @@ impl RioState {
         target: RioTarget<'_>,
         op_kind: RioOpKind,
         pump: &mut ReceivePumpState,
-        registrar: &dyn BufferRegistrar,
     ) -> RioResult<()> {
         RioSubmitOperations::new(&mut self.core, &mut self.runtime)
-            .try_submit_recv_multi_initial(target, op_kind, pump, registrar)
+            .try_submit_recv_multi_initial(target, op_kind, pump)
     }
 }
 

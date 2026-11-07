@@ -3,24 +3,21 @@
 use veloq_std::{
     fmt,
     num::NonZeroUsize,
-    nz,
     ptr::NonNull,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
-
-/// 2MB minimum memory per thread (Huge Page aligned)
-pub(crate) const MIN_THREAD_MEMORY: NonZeroUsize = nz!(2 * 1024 * 1024);
-
-/// Multiplier for thread memory scaling.
-/// Each unit represents `MIN_THREAD_MEMORY` (2MB).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ThreadMemoryMultiplier(pub NonZeroUsize);
 
 /// Configuration for GlobalSlotPool
 #[derive(Debug, Clone)]
 pub struct GlobalAllocatorConfig {
     /// Total memory size in bytes to allocate for the global pool.
     pub total_memory: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageAllocationStrategy {
+    Standard,
+    Huge,
 }
 
 /// Chunk identifier within a [`GlobalSlotPool`](crate::heap::GlobalSlotPool).
@@ -34,11 +31,6 @@ impl ChunkId {
     #[cfg(not(debug_assertions))]
     pub(crate) const fn from_raw(value: u16) -> Self {
         Self(value)
-    }
-
-    #[inline]
-    pub(crate) fn from_index(index: usize) -> Option<Self> {
-        u16::try_from(index).map(Self).ok()
     }
 
     #[cfg(debug_assertions)]
@@ -75,6 +67,7 @@ pub struct ChunkInfo {
     pub id: ChunkId,
     pub ptr: NonNull<u8>,
     pub len: NonZeroUsize,
+    pub allocation_strategy: PageAllocationStrategy,
 }
 
 // Guarantee thread safety for the info pointing to shared memory
@@ -136,6 +129,11 @@ pub struct SlotCount(usize);
 
 impl SlotCount {
     #[inline]
+    pub(crate) const fn from_slots(slots: usize) -> Self {
+        Self(slots)
+    }
+
+    #[inline]
     pub(crate) const fn get(self) -> usize {
         self.0
     }
@@ -148,11 +146,6 @@ impl SlotCount {
     #[inline]
     pub(crate) const fn superblock_count(self) -> usize {
         self.0 / SUPERBLOCK_SIZE
-    }
-
-    #[inline]
-    pub(crate) const fn per_shard(self, shard_count: usize) -> Self {
-        Self(self.0 / shard_count)
     }
 }
 
@@ -299,6 +292,9 @@ pub struct SuperblockState {
     /// Indicates if a thread is currently holding this superblock as its active allocation buffer.
     /// If true, the superblock cannot be returned to the global buddy system even if empty.
     pub is_active: AtomicBool,
+    /// Prevents a retired superblock from being returned to the buddy allocator more than once.
+    /// 防止已退休的 superblock 被重复归还给 buddy allocator。
+    pub is_released: AtomicBool,
 }
 
 impl Default for SuperblockState {
@@ -317,6 +313,7 @@ impl SuperblockState {
             // The actual state is set to "All Free" in `init()` when acquired from Buddy.
             free_mask: AtomicU64::new(0),
             is_active: AtomicBool::new(false),
+            is_released: AtomicBool::new(true),
         }
     }
 
@@ -329,13 +326,21 @@ impl SuperblockState {
             // The actual state is set to "All Free" in `init()` when acquired from Buddy.
             free_mask: AtomicU64::new(0),
             is_active: AtomicBool::new(false),
+            is_released: AtomicBool::new(true),
         }
     }
 
     /// Reset state for reuse (Called when acquiring from Buddy)
     pub(crate) fn init(&self) {
         self.free_mask.store(u64::MAX, Ordering::Release);
+        self.is_released.store(false, Ordering::Release);
         self.is_active.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn try_mark_released(&self) -> bool {
+        self.is_released
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     /// Try to allocate one slot `(0..63)`.

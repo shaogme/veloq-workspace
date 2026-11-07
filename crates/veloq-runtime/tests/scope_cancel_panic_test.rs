@@ -1,6 +1,6 @@
 use veloq_runtime::{
     Outcome,
-    runtime::{RuntimeBuilder, RuntimeShared},
+    runtime::{DefaultWorkerFactoryFor, RuntimeBuilder},
     scope, scope_local,
 };
 use veloq_std::{
@@ -14,7 +14,7 @@ use veloq_std::{
 #[cfg(feature = "std")]
 use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
 
-fn with_workers(count: usize) -> RuntimeBuilder<(), fn(usize, &RuntimeShared<()>)> {
+fn with_workers(count: usize) -> RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
     RuntimeBuilder::new().with_worker_count(NonZeroUsize::new(count))
 }
 

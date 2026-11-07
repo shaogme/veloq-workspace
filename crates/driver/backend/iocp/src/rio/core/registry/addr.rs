@@ -7,10 +7,12 @@ use crate::{
     },
 };
 use diagweave::prelude::*;
+use veloq_buf::{LockedMemoryBudget, LockedMemoryPermit};
 use veloq_pod::{bytes_of, bytes_of_mut};
 use veloq_std::{
     boxed::Box,
     collections::HashSet,
+    format,
     mem::{replace, size_of, size_of_val},
     vec,
     vec::Vec,
@@ -32,10 +34,17 @@ pub(super) struct RioAddressRegistry {
     addr_slot_generations: Vec<u64>,
     addr_free_slots: Vec<usize>,
     addr_buffer_id: RioBufferId,
+    addr_startup_permit: Option<LockedMemoryPermit>,
+    addr_permit: Option<LockedMemoryPermit>,
+    budget: LockedMemoryBudget,
 }
 
 impl RioAddressRegistry {
-    pub(super) fn new(capacity: usize) -> Self {
+    pub(super) fn new(
+        capacity: usize,
+        budget: LockedMemoryBudget,
+        address_permit: Option<LockedMemoryPermit>,
+    ) -> Self {
         let capacity = capacity.max(1);
         let mut addr_free_slots = Vec::with_capacity(capacity);
         for slot in (0..capacity).rev() {
@@ -48,6 +57,9 @@ impl RioAddressRegistry {
             addr_slot_generations: vec![0; capacity],
             addr_free_slots,
             addr_buffer_id: RioBufferId::INVALID,
+            addr_startup_permit: address_permit,
+            addr_permit: None,
+            budget,
         }
     }
 
@@ -170,6 +182,7 @@ impl RioAddressRegistry {
         env: RioEnv<'_>,
     ) -> RioResult<RioBufferId> {
         if !self.addr_buffer_id.is_invalid() {
+            debug_assert!(self.addr_permit.is_some());
             return Ok(self.addr_buffer_id);
         }
 
@@ -180,12 +193,40 @@ impl RioAddressRegistry {
                 .with_ctx("addr_buffer_length", len)
                 .attach_note("RIO address scratch buffer too large")
         })?;
+        let permit = self.addr_startup_permit.take().ok_or_else(|| {
+            RioError::BufferRegistrationRequired
+                .to_report()
+                .with_ctx("addr_buffer_length", len)
+                .attach_note("RIO address scratch has no startup budget reservation")
+        })?;
+        if !permit.belongs_to(&self.budget) {
+            return RioError::InvalidInput.attach_note(
+                "RIO address reservation belongs to a different locked-memory budget",
+            );
+        }
+        let required_charge = self
+            .budget
+            .required_charge(self.addr_slots.as_ptr().cast(), len)
+            .map_err(|error| {
+                RioError::InvalidInput
+                    .to_report()
+                    .with_ctx("addr_buffer_length", len)
+                    .with_ctx("charge_error", format!("{error:?}"))
+                    .attach_note("RIO address scratch range cannot be charged safely")
+            })?;
+        if permit.charge_bytes() < required_charge {
+            return RioError::InvalidInput
+                .with_ctx("permit_charge", permit.charge_bytes())
+                .with_ctx("required_charge", required_charge)
+                .attach_note("RIO address reservation does not cover the scratch page footprint");
+        }
         let id = env
             .dispatch
             .register_buffer(self.addr_slots.as_ptr().cast::<u8>(), len_u32)
             .with_ctx("buffer_length", len)
             .attach_note("RIORegisterBuffer failed for address scratch buffer")?;
         self.addr_buffer_id = id;
+        self.addr_permit = Some(permit);
         Ok(id)
     }
 
@@ -265,6 +306,8 @@ impl RioAddressRegistry {
         if !id.is_invalid() && deregistered.insert(id.raw() as usize) {
             env.dispatch.deregister_buffer(id);
         }
+        self.addr_permit = None;
+        self.addr_startup_permit = None;
     }
 }
 

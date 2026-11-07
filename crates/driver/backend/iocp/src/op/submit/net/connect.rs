@@ -15,7 +15,6 @@ use windows_sys::Win32::Networking::WinSock::{
 use crate::{
     config::BorrowedRawHandle,
     error::{IocpError, IocpResult},
-    ext::Extensions,
     net::addr::{self, SockAddrIn, SockAddrIn6, SockAddrStorage},
     op::{
         Connect, KernelRef, OverlappedEntry, SubmitContext, UdpConnect,
@@ -26,7 +25,7 @@ use crate::{
     },
 };
 
-use super::{mark_socket_header_in_flight, with_borrowed_socket};
+use super::socket::SocketSubmission;
 
 pub(crate) fn submit_connect(
     header: &mut OverlappedEntry,
@@ -65,7 +64,7 @@ pub(crate) fn submit_connect(
 
     let mut bytes_sent = 0;
     // SAFETY: iocp_submit_connect_ex is a safe wrapper for the WinSock extension.
-    mark_socket_header_in_flight(header, inflight, unsafe {
+    SocketSubmission::mark_socket_header_in_flight(header, inflight, unsafe {
         iocp_submit_connect_ex(ConnectExArgs {
             connect_ex,
             s: handle.raw().as_socket(),
@@ -83,7 +82,7 @@ fn ensure_socket_bound(handle: BorrowedRawHandle<'_>, connect_op: &Connect) -> I
     let mut storage = SockAddrStorage::default();
     let mut namelen = size_of::<SOCKADDR_STORAGE>() as i32;
 
-    if with_borrowed_socket(handle.raw().as_socket(), |socket| {
+    if SocketSubmission::with_borrowed_socket(handle.raw().as_socket(), |socket| {
         // SAFETY: storage and namelen are valid for this call.
         unsafe { socket.getsockname(&mut storage.0 as *mut _ as *mut SOCKADDR, &mut namelen) }
     })
@@ -131,7 +130,7 @@ fn ensure_socket_bound(handle: BorrowedRawHandle<'_>, connect_op: &Connect) -> I
         *sin6_ref = s;
         (storage, size_of::<SOCKADDR_IN6>() as i32)
     };
-    with_borrowed_socket(handle.raw().as_socket(), |socket| {
+    SocketSubmission::with_borrowed_socket(handle.raw().as_socket(), |socket| {
         // SAFETY: storage is a valid SOCKADDR_STORAGE for this call.
         unsafe { socket.bind(&storage.0 as *const _ as *const SOCKADDR, len) }
     })
@@ -142,15 +141,13 @@ fn ensure_socket_bound(handle: BorrowedRawHandle<'_>, connect_op: &Connect) -> I
 /// The caller must ensure that header and payload are valid.
 pub(crate) unsafe fn on_complete_connect(
     header: &mut OverlappedEntry,
-    _payload: &mut KernelRef<Connect>,
     result: usize,
-    _ext: &Extensions,
 ) -> IocpResult<usize> {
     let raw_handle = header
         .resolved_handle
         .ok_or(IocpError::InvalidState)
         .attach_note("resolved handle missing for connect completion")?;
-    with_borrowed_socket(raw_handle.raw().as_socket(), |socket| {
+    SocketSubmission::with_borrowed_socket(raw_handle.raw().as_socket(), |socket| {
         socket.setsockopt_empty(SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT)
     })?;
     Ok(result)
@@ -165,7 +162,7 @@ pub(crate) fn submit_udp_connect(
     let (connect_op, _overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) }?;
     let raw = resolve_fd_handle(&connect_op.fd, &*ctx.registered_slots)?;
     header.resolved_handle = Some(raw);
-    with_borrowed_socket(raw.raw().as_socket(), |socket| {
+    SocketSubmission::with_borrowed_socket(raw.raw().as_socket(), |socket| {
         // SAFETY: address pointer/length are validated by caller and come from op payload.
         unsafe {
             socket.connect(
@@ -175,16 +172,4 @@ pub(crate) fn submit_udp_connect(
         }
     })?;
     Ok(SubmissionResult::PostToQueue)
-}
-
-/// # Safety
-///
-/// The caller must ensure that header and payload are valid.
-pub(crate) unsafe fn on_complete_udp_connect(
-    _header: &mut OverlappedEntry,
-    _payload: &mut KernelRef<UdpConnect>,
-    result: usize,
-    _ext: &Extensions,
-) -> IocpResult<usize> {
-    Ok(result)
 }

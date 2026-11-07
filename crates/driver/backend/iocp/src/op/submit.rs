@@ -30,11 +30,11 @@ pub(crate) use file::{
     submit_sync_range, submit_sync_range_raw, submit_write_fixed, submit_write_raw,
 };
 pub(crate) use net::{
-    completion_cleanup_close_socket, on_complete_accept, on_complete_accept_multi,
-    on_complete_connect, on_complete_recv_provided, on_complete_udp_connect,
+    UdpReceiveSubmit, completion_cleanup_close_socket, on_complete_accept,
+    on_complete_accept_multi, on_complete_connect, on_complete_recv_provided,
     orphan_cleanup_accept_multi, submit_accept, submit_accept_multi, submit_connect, submit_recv,
     submit_recv_multi, submit_recv_provided, submit_send, submit_send_to, submit_udp_connect,
-    submit_udp_recv_multi, submit_udp_send,
+    submit_udp_send,
 };
 
 pub(crate) enum SubmissionResult {

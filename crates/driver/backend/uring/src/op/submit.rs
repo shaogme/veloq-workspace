@@ -6,9 +6,7 @@ pub(super) use net::*;
 
 use crate::{
     config::{IoFd, RawHandleKind},
-    driver::{
-        FileTable, SqeEnv, SqeFd,
-    },
+    driver::{FileTable, SqeEnv, SqeFd},
     error::{UringError, UringResult},
     op::{
         Timeout, Wakeup,

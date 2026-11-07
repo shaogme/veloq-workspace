@@ -1,36 +1,32 @@
 mod accept;
 mod connect;
+mod socket;
+mod udp_receive;
 
 pub(crate) use accept::{
     completion_cleanup_close_socket, on_complete_accept, on_complete_accept_multi,
     orphan_cleanup_accept_multi, submit_accept, submit_accept_multi,
 };
-pub(crate) use connect::{
-    on_complete_connect, on_complete_udp_connect, submit_connect, submit_udp_connect,
-};
+pub(crate) use connect::{on_complete_connect, submit_connect, submit_udp_connect};
+pub(crate) use udp_receive::UdpReceiveSubmit;
 
 use diagweave::prelude::*;
-use veloq_buf::FixedBuf;
-use veloq_driver_core::{
-    op::types::UdpRecvMultiBackend,
-    platform::receive_pump::{ReceivePumpConfig, ReceivePumpState, ReceiveSlot},
-};
-use veloq_std::{
-    format, mem::ManuallyDrop, num::NonZeroUsize, string::ToString, time::Duration, vec::Vec,
-};
-use windows_sys::Win32::Networking::WinSock::SOCKET;
+use veloq_buf::{BufPool, FixedBuf};
+use veloq_driver_core::platform::receive_pump::{ReceivePumpConfig, ReceivePumpState, ReceiveSlot};
+use veloq_std::{format, num::NonZeroUsize, string::ToString, time::Duration, vec::Vec};
+use windows_sys::Win32::Networking::WinSock::{SOCKADDR, WSABUF, WSASendTo};
 
 use crate::{
     error::{IocpError, IocpResult},
-    ext::Extensions,
     op::{
         KernelRef, OpSend, OverlappedEntry, Recv, RecvMultiPayload, RecvProvidedPayload,
-        SendToPayload, SubmitContext, UdpRecvMultiPayload, UdpSend,
+        SendToPayload, SubmitContext, UdpSend,
         submit::{SubmissionResult, mark_header_in_flight, resolve_fd_handle, unpack_kernel_ref},
     },
-    rio::{RioOpKind, RioSendToArgs, RioTarget, SocketInflightGuard},
-    win32::SafeSocket,
+    rio::{RioOpKind, RioSendToArgs, RioTarget},
 };
+
+use self::socket::{RawSocketRequest, SocketSubmission, invalid_buffer_range};
 
 pub(crate) const RECV_PROVIDED_BUFFER_CAPACITY: usize = 8192;
 const RECV_MULTI_BUFFER_CAPACITY: usize = 8192;
@@ -40,30 +36,6 @@ const RECV_MULTI_QUEUE_CAPACITY: usize = 4;
 // ============================================================================
 // Network Operations
 // ============================================================================
-
-fn with_borrowed_socket<T>(
-    raw: SOCKET,
-    f: impl FnOnce(&SafeSocket) -> IocpResult<T>,
-) -> IocpResult<T> {
-    let socket = ManuallyDrop::new(SafeSocket(raw));
-    f(&socket)
-}
-
-fn mark_socket_header_in_flight(
-    header: &mut OverlappedEntry,
-    inflight: SocketInflightGuard<'_>,
-    res: IocpResult<SubmissionResult>,
-) -> IocpResult<SubmissionResult> {
-    let res = mark_header_in_flight(header, res);
-    if matches!(res, Ok(SubmissionResult::Pending)) {
-        debug_assert!(
-            header.socket_inflight.is_none(),
-            "socket inflight token already attached to op header"
-        );
-        header.socket_inflight = Some(inflight.commit());
-    }
-    res
-}
 
 pub(crate) fn submit_recv_provided(
     header: &mut OverlappedEntry,
@@ -78,11 +50,6 @@ pub(crate) fn submit_recv_provided(
             .attach_note("RecvProvided payload still owns a previous receive buffer");
     }
 
-    let fd = user.fd;
-    let raw = resolve_fd_handle(&fd, &*ctx.registered_slots)?;
-    header.resolved_handle = Some(raw);
-    let handle = raw.borrow();
-    let token = ctx.op_token;
     let mut buffer = FixedBuf::alloc_heap(
         NonZeroUsize::new(RECV_PROVIDED_BUFFER_CAPACITY)
             .expect("RecvProvided buffer capacity must be non-zero"),
@@ -97,33 +64,20 @@ pub(crate) fn submit_recv_provided(
                 "failed to allocate backend receive buffer: {error}"
             ))
     })?;
-
-    let (user_data, generation) = token.parts();
-    let submit_result = ctx
-        .rio
-        .try_submit_recv_provided(
-            RioTarget {
-                fd,
-                handle,
-                token,
-                buf_offset: 0,
-                operation: "recv_provided",
-            },
-            &mut buffer,
-            ctx.registrar,
-        )
-        .with_ctx("outer_scope", "submit_recv_provided")
-        .with_ctx("fd", fd.to_string())
-        .with_ctx("user_data", user_data)
-        .with_ctx("generation", generation)
-        .with_ctx("buffer_capacity", RECV_PROVIDED_BUFFER_CAPACITY)
-        .attach_note("RIO recv_provided submit failed")
-        .trans();
-    let result = mark_header_in_flight(header, submit_result);
+    let fd = user.fd;
+    let raw = resolve_fd_handle(&fd, &*ctx.registered_slots)?;
+    header.resolved_handle = Some(raw);
+    let result = SocketSubmission::submit_wsa_recv(
+        RawSocketRequest::new(header, fd, raw, ctx),
+        &mut buffer,
+        0,
+        "recv_provided",
+    );
+    let result = result.with_ctx("operation", "recv_provided").trans();
     if matches!(result, Ok(SubmissionResult::Pending)) {
         let request_generation = payload.request_generation.next();
-        header.request_generation = request_generation;
         payload.request_generation = request_generation;
+        header.request_generation = request_generation;
         payload.buffer = Some(buffer);
     }
     result
@@ -144,6 +98,19 @@ pub(crate) fn submit_recv_multi(
     let fd = user.fd;
     let raw = resolve_fd_handle(&fd, &*ctx.registered_slots)?;
     header.resolved_handle = Some(raw);
+    if let Some(buffer) = payload.raw_buffer.as_mut() {
+        let result = SocketSubmission::submit_wsa_recv(
+            RawSocketRequest::new(&mut *header, fd, raw, &mut *ctx),
+            buffer,
+            0,
+            "recv_multi",
+        );
+        if matches!(result, Ok(SubmissionResult::Pending)) {
+            header.request_generation = header.request_generation.next();
+        }
+        return result;
+    }
+
     let handle = raw.borrow();
     let config = ReceivePumpConfig {
         kernel_capacity: NonZeroUsize::new(RECV_MULTI_INFLIGHT)
@@ -154,20 +121,36 @@ pub(crate) fn submit_recv_multi(
             .expect("recv_multi buffer capacity is non-zero"),
         close_timeout: Duration::from_secs(5),
     };
-    let mut slots = Vec::with_capacity(RECV_MULTI_INFLIGHT);
-    for slot_id in 0..RECV_MULTI_INFLIGHT {
-        let buffer = FixedBuf::alloc_heap(
-            NonZeroUsize::new(RECV_MULTI_BUFFER_CAPACITY)
-                .expect("recv_multi buffer capacity is non-zero"),
-            0,
-        )
-        .map_err(|_| {
-            IocpError::InvalidState
+    let capacity = NonZeroUsize::new(RECV_MULTI_BUFFER_CAPACITY)
+        .expect("recv_multi buffer capacity is non-zero");
+    let mut buffer = ctx
+        .buffer_pool
+        .and_then(|pool| pool.alloc(capacity, 0))
+        .or_else(|| FixedBuf::alloc_heap(capacity, 0).ok())
+        .ok_or_else(|| {
+            IocpError::Submission
                 .to_report()
-                .attach_note("RIO recv_multi receive buffer allocation failed")
+                .with_ctx("operation", "recv_multi")
+                .with_ctx("buffer_capacity", capacity.get())
+                .attach_note("failed to allocate backend receive buffer")
         })?;
-        slots.push(ReceiveSlot::new(slot_id as u32, buffer));
+    if !SocketSubmission::uses_rio(raw, &buffer) {
+        let result = SocketSubmission::submit_wsa_recv(
+            RawSocketRequest::new(&mut *header, fd, raw, &mut *ctx),
+            &mut buffer,
+            0,
+            "recv_multi",
+        );
+        if matches!(result, Ok(SubmissionResult::Pending)) {
+            header.request_generation = header.request_generation.next();
+            payload.raw_buffer = Some(buffer);
+        }
+        return result;
     }
+
+    let mut slots = Vec::with_capacity(RECV_MULTI_INFLIGHT);
+    slots.push(ReceiveSlot::new(0, buffer));
+
     let mut pump =
         ReceivePumpState::try_new_tcp(config, slots.into_boxed_slice()).map_err(|_| {
             IocpError::InvalidState
@@ -186,7 +169,6 @@ pub(crate) fn submit_recv_multi(
             },
             RioOpKind::TcpRecvMulti,
             &mut pump,
-            ctx.registrar,
         )
         .with_ctx("outer_scope", "submit_recv_multi")
         .with_ctx("fd", fd.to_string())
@@ -209,13 +191,12 @@ pub(crate) unsafe fn on_complete_recv_provided(
     header: &mut OverlappedEntry,
     payload: &mut RecvProvidedPayload,
     result: usize,
-    _ext: &Extensions,
 ) -> IocpResult<usize> {
     if payload.request_generation != header.request_generation {
         return IocpError::InvalidState
             .with_ctx("payload_request_generation", payload.request_generation)
             .with_ctx("header_request_generation", header.request_generation)
-            .attach_note("stale RIO RecvProvided completion generation");
+            .attach_note("stale overlapped RecvProvided completion generation");
     }
 
     let buffer = payload
@@ -227,7 +208,7 @@ pub(crate) unsafe fn on_complete_recv_provided(
         return IocpError::CompletionWait
             .with_ctx("received", result)
             .with_ctx("buffer_capacity", buffer.capacity())
-            .attach_note("RIO RecvProvided completion exceeds buffer capacity");
+            .attach_note("overlapped RecvProvided completion exceeds buffer capacity");
     }
     buffer.set_len(result);
     Ok(result)
@@ -245,6 +226,14 @@ pub(crate) fn submit_recv(
     let fd = val.fd;
     let raw = resolve_fd_handle(&fd, &*ctx.registered_slots)?;
     header.resolved_handle = Some(raw);
+    if !SocketSubmission::uses_rio(raw, &val.buf) {
+        return SocketSubmission::submit_wsa_recv(
+            RawSocketRequest::new(header, fd, raw, ctx),
+            &mut val.buf,
+            val.buf_offset,
+            "recv",
+        );
+    }
     let handle = raw.borrow();
     let token = ctx.op_token;
     let (user_data, generation) = token.parts();
@@ -260,7 +249,6 @@ pub(crate) fn submit_recv(
                     operation: "recv",
                 },
                 &mut val.buf,
-                ctx.registrar,
             )
             .with_ctx("outer_scope", "submit_recv")
             .with_ctx("fd", val.fd.to_string())
@@ -282,6 +270,14 @@ pub(crate) fn submit_send(
 
     let raw = resolve_fd_handle(&val.fd, &*ctx.registered_slots)?;
     header.resolved_handle = Some(raw);
+    if !SocketSubmission::uses_rio(raw, &val.buf) {
+        return SocketSubmission::submit_wsa_send(
+            RawSocketRequest::new(header, val.fd, raw, ctx),
+            &val.buf,
+            val.buf_offset,
+            "send",
+        );
+    }
     let handle = raw.borrow();
     let token = ctx.op_token;
     let (user_data, generation) = token.parts();
@@ -297,7 +293,6 @@ pub(crate) fn submit_send(
                     operation: "send",
                 },
                 &val.buf,
-                ctx.registrar,
             )
             .with_ctx("outer_scope", "submit_send")
             .with_ctx("fd", val.fd.to_string())
@@ -319,6 +314,14 @@ pub(crate) fn submit_udp_send(
 
     let raw = resolve_fd_handle(&val.fd, &*ctx.registered_slots)?;
     header.resolved_handle = Some(raw);
+    if !SocketSubmission::uses_rio(raw, &val.buf) {
+        return SocketSubmission::submit_wsa_send(
+            RawSocketRequest::new(header, val.fd, raw, ctx),
+            &val.buf,
+            val.buf_offset,
+            "udp_send",
+        );
+    }
     let handle = raw.borrow();
     let token = ctx.op_token;
     let (user_data, generation) = token.parts();
@@ -334,7 +337,6 @@ pub(crate) fn submit_udp_send(
                     operation: "udp_send",
                 },
                 &val.buf,
-                ctx.registrar,
             )
             .with_ctx("outer_scope", "submit_udp_send")
             .with_ctx("fd", val.fd.to_string())
@@ -354,6 +356,33 @@ pub(crate) fn submit_send_to(
     let user = unsafe { payload.user.as_ref()? };
     let raw = resolve_fd_handle(&user.fd, &*ctx.registered_slots)?;
     header.resolved_handle = Some(raw);
+    if !SocketSubmission::uses_rio(raw, &user.buf) {
+        let (ptr, len) = user
+            .buf
+            .checked_write_range(user.buf_offset)
+            .map_err(|error| invalid_buffer_range("send_to", error))?;
+        let wsabuf = WSABUF {
+            len,
+            buf: ptr.cast_mut(),
+        };
+        return RawSocketRequest::new(header, user.fd, raw, ctx).submit(|socket, overlapped| {
+            let mut bytes_sent = 0;
+            let result = unsafe {
+                WSASendTo(
+                    socket,
+                    &wsabuf,
+                    1,
+                    &mut bytes_sent,
+                    0,
+                    &payload.addr.0 as *const _ as *const SOCKADDR,
+                    payload.addr_len,
+                    overlapped.cast(),
+                    None,
+                )
+            };
+            SocketSubmission::wsa_submit_result(result, "send_to")
+        });
+    }
     let handle = raw.borrow();
 
     let args = RioSendToArgs {
@@ -368,48 +397,12 @@ pub(crate) fn submit_send_to(
     mark_header_in_flight(
         header,
         ctx.rio
-            .try_submit_send_to(args, ctx.registrar)
+            .try_submit_send_to(args)
             .with_ctx("outer_scope", "submit_send_to")
             .with_ctx("fd", user.fd.to_string())
             .with_ctx("user_data", header.token.index())
             .with_ctx("generation", header.token.generation())
             .attach_note("RIO send_to submit failed")
             .trans(),
-    )
-}
-
-pub(crate) fn submit_udp_recv_multi(
-    header: &mut OverlappedEntry,
-    payload: &mut UdpRecvMultiPayload,
-    ctx: &mut SubmitContext,
-) -> IocpResult<SubmissionResult> {
-    // SAFETY: payload.user and the receive pump are bound to the live slot before submission.
-    let user = unsafe { payload.user.as_mut()? };
-    let fd = user.fd;
-    let raw = resolve_fd_handle(&fd, &*ctx.registered_slots)?;
-    header.resolved_handle = Some(raw);
-    let handle = raw.borrow();
-    mark_header_in_flight(
-        header,
-        ctx.rio
-            .try_submit_recv_multi_initial(
-                RioTarget {
-                    fd,
-                    handle,
-                    token: ctx.op_token,
-                    buf_offset: 0,
-                    operation: "udp_recv_multi",
-                },
-                RioOpKind::UdpRecvMulti,
-                user.receive_pump_mut(),
-                ctx.registrar,
-            )
-            .with_ctx("outer_scope", "submit_udp_recv_multi")
-            .with_ctx("fd", fd.to_string())
-            .with_ctx("user_data", ctx.op_token.index())
-            .with_ctx("generation", ctx.op_token.generation())
-            .attach_note("RIO udp_recv_multi initial arm failed")
-            .trans()
-            .map(|()| SubmissionResult::Pending),
     )
 }

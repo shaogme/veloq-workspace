@@ -18,7 +18,7 @@ use veloq::{
     sync::mpsc,
     time::timeout_at,
 };
-use veloq_buf::{FixedBuf, UniformSlot, heap::ThreadMemoryMultiplier};
+use veloq_buf::{FixedBuf, UniformSlot};
 use veloq_runtime::{select, task::yield_now};
 use veloq_std::time::{Duration, Instant};
 
@@ -33,7 +33,7 @@ fn run_test_with_workers<F, R>(worker_threads: NonZeroUsize, f: F) -> R
 where
     F: for<'s> AsyncFnOnce(Ctx<'s>) -> R,
 {
-    Runtime::builder(UniformSlot::new(ThreadMemoryMultiplier(nz!(4))))
+    Runtime::builder(UniformSlot::new(4 * 4 * 1024 * 1024))
         .worker_count(Some(worker_threads))
         .scope(f)
         .expect("failed to run scope")

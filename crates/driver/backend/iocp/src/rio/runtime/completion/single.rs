@@ -17,7 +17,6 @@ use veloq_driver_core::{
         CompletionCleanupGuard, CompletionContinuation, CompletionFailure, CompletionSettlement,
         PlatformOp, UserCompletionEvent,
     },
-    op::types::OpKind,
     platform::receive_pump::{ReceiveCompletionResult, ReceivePumpError},
     slot::{InFlightOrphaned, InFlightWaiting},
 };
@@ -40,9 +39,6 @@ impl RioSingleCompletion {
         let token = init.token;
         let (user_data, generation) = token.parts();
         let effect = RioBackendEffect::from_init(init);
-        let is_recv_provided = slot
-            .with_access_mut(|access| access.operation().get_ref().kind() == OpKind::RecvProvided)
-            .unwrap_or(false);
         if slot.platform().generation != generation {
             let report = IocpError::Internal
                 .to_report()
@@ -111,50 +107,9 @@ impl RioSingleCompletion {
                 PlatformOp::completion_cleanup(access.operation_mut(), &completion)
             })
             .unwrap_or_default();
-        let record_result = if is_recv_provided {
-            Some(
-                guard
-                    .with_access_mut(|access| {
-                        access
-                            .operation_mut()
-                            .get_mut()
-                            .take_recv_provided_record(completion.is_ok())
-                    })
-                    .map_err(|_| {
-                        IocpError::InvalidState
-                            .to_report()
-                            .with_ctx("rio_request_id", init.request_id)
-                            .attach_note("failed to access RecvProvided completion record")
-                    })
-                    .and_then(|result| result),
-            )
-        } else {
-            None
-        };
         let _ = guard.take_op();
         let (payload, detail) = guard.take_completion_data();
         let event = UserCompletionEvent::from_parts(COMP_BACKEND_RIO, token, res_code, 0);
-        if let Some(record_result) = record_result {
-            let record_payload = match record_result {
-                Ok(record_payload) => record_payload,
-                Err(error) => {
-                    drop(payload);
-                    drop(detail);
-                    return CompletionSettlement::TerminalFailure {
-                        failure: CompletionFailure::terminal(error, cleanup, effect),
-                    };
-                }
-            };
-            drop(payload);
-            return CompletionSettlement::User {
-                event,
-                payload: record_payload,
-                detail: detail.or(Some(completion)),
-                cleanup,
-                continuation: CompletionContinuation::Final,
-                effect,
-            };
-        }
         if let Some(payload) = payload {
             CompletionSettlement::User {
                 event,

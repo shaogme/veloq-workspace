@@ -118,11 +118,11 @@ impl IocpOpSpec for Connect {
 
     unsafe fn on_complete(
         header: &mut OverlappedEntry,
-        payload: &mut Self::KernelPayload,
+        _payload: &mut Self::KernelPayload,
         result: usize,
-        ext: &Extensions,
+        _ext: &Extensions,
     ) -> IocpResult<usize> {
-        unsafe { submit::on_complete_connect(header, payload, result, ext) }
+        unsafe { submit::on_complete_connect(header, result) }
     }
 
     unsafe fn get_fd(payload: &Self::KernelPayload) -> Option<IoFd> {
@@ -153,12 +153,12 @@ impl IocpOpSpec for UdpConnect {
     }
 
     unsafe fn on_complete(
-        header: &mut OverlappedEntry,
-        payload: &mut Self::KernelPayload,
+        _header: &mut OverlappedEntry,
+        _payload: &mut Self::KernelPayload,
         result: usize,
-        ext: &Extensions,
+        _ext: &Extensions,
     ) -> IocpResult<usize> {
-        unsafe { submit::on_complete_udp_connect(header, payload, result, ext) }
+        Ok(result)
     }
 
     unsafe fn get_fd(payload: &Self::KernelPayload) -> Option<IoFd> {
@@ -298,9 +298,9 @@ impl IocpMultiShotSpec for RecvProvided {
         header: &mut OverlappedEntry,
         payload: &mut Self::KernelPayload,
         result: usize,
-        ext: &Extensions,
+        _ext: &Extensions,
     ) -> IocpResult<usize> {
-        unsafe { submit::on_complete_recv_provided(header, payload, result, ext) }
+        unsafe { submit::on_complete_recv_provided(header, payload, result) }
     }
 
     unsafe fn get_fd(payload: &Self::KernelPayload) -> Option<IoFd> {
@@ -390,9 +390,7 @@ impl IocpMultiShotSpec for UdpRecvMulti {
     const PAYLOAD_KIND: OpKind = OpKind::UdpRecvMulti;
 
     fn new_kernel_payload(_user: &Self) -> Self::KernelPayload {
-        UdpRecvMultiPayload {
-            user: PayloadRef::unbound(),
-        }
+        UdpRecvMultiPayload::new()
     }
 
     fn submit(
@@ -400,7 +398,7 @@ impl IocpMultiShotSpec for UdpRecvMulti {
         payload: &mut Self::KernelPayload,
         ctx: &mut SubmitContext,
     ) -> IocpResult<submit::SubmissionResult> {
-        submit::submit_udp_recv_multi(header, payload, ctx)
+        submit::UdpReceiveSubmit::submit_initial(header, payload, ctx)
     }
 
     unsafe fn get_fd(payload: &Self::KernelPayload) -> Option<IoFd> {

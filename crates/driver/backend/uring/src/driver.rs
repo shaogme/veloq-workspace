@@ -1,6 +1,6 @@
 use diagweave::prelude::*;
 use tracing::{debug, trace};
-use veloq_buf::{AnyBufPool, BufferRegistrar, heap::ChunkId};
+use veloq_buf::{AnyBufPool, BufferRegistrationRequest, heap::ChunkId};
 use veloq_io_uring::{
     IoUring, KernelCapabilities, ResourceLayout, RingConfig, SetupFlags, SetupPolicy,
 };
@@ -29,8 +29,9 @@ use veloq_driver_core::{
     driver::{
         BufferRegistrationStatus, CancelRequest, CancelSubmitOutcome, CompletionToken, DriveMode,
         DriveOutcome, DriverCompletionDiagnostics, DriverCompletionDiagnosticsSnapshot, DriverRaw,
-        DriverSubmitResult, OpToken, RegisterFd, RemoteCancelSender, RemoteWaker,
-        SharedCompletionTable, SharedSlotTable, SubmitStatus, UdpReceiveOperationBuilder,
+        DriverStartup, DriverStartupRequirements, DriverStartupResources, DriverSubmitResult,
+        OpToken, RegisterFd, RemoteCancelSender, RemoteWaker, SharedCompletionTable,
+        SharedSlotTable, SubmitStatus, UdpReceiveOperationBuilder,
         registry::{OpEntry, OpHandle},
         sealed,
     },
@@ -57,9 +58,9 @@ mod submission;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use env::{CqeEnv, SqeEnv};
 pub use lifecycle::UringOpState;
 pub use registration::ProvidedBufferSnapshot;
-pub(crate) use env::{CqeEnv, SqeEnv};
 pub(crate) use registration::{
     FileTable, ProvidedBufLease, ProvidedBufLeaseAction, RegisteredFileEntry, SqeFd,
 };
@@ -78,8 +79,9 @@ fn setup_report(
 }
 
 fn build_ring(config: &UringConfig) -> UringResult<IoUring> {
-    let mut policy = config.setup_policy;
-    if let IoMode::Polling(_) = config.mode {
+    let mode = config.mode();
+    let mut policy = config.get_setup_policy();
+    if let IoMode::Polling(_) = mode {
         policy = policy.with_required(SetupFlags::SQPOLL);
     }
     policy.validate().map_err(|error| {
@@ -88,25 +90,25 @@ fn build_ring(config: &UringConfig) -> UringResult<IoUring> {
             "driver.new.setup_policy",
             error,
             policy,
-            config.mode,
+            mode,
         )
     })?;
 
-    let profile = RingConfig::new(config.entries.get())
+    let profile = RingConfig::new(config.entries().get())
         .with_setup_policy(policy)
-        .with_sq_thread_idle(match config.mode {
+        .with_sq_thread_idle(match mode {
             IoMode::Polling(idle_ms) => idle_ms.get(),
             IoMode::Interrupt => 0,
         });
     IoUring::from_config(profile).map_err(|error| {
-        let kind = if matches!(config.mode, IoMode::Polling(_))
+        let kind = if matches!(mode, IoMode::Polling(_))
             && policy.required().contains(SetupFlags::SQPOLL)
         {
             UringError::PollingUnavailable
         } else {
             UringError::DriverInit
         };
-        setup_report(kind, "driver.new.build_ring", error, policy, config.mode)
+        setup_report(kind, "driver.new.build_ring", error, policy, mode)
     })
 }
 
@@ -140,20 +142,15 @@ pub struct UringDriver<'a> {
 }
 
 impl<'a> UringDriver<'a> {
-    fn new_internal(
-        config: impl AsRef<UringConfig>,
-        registrar: &'a (dyn BufferRegistrar + 'a),
-    ) -> UringResult<Self> {
+    fn new_internal(config: impl AsRef<UringConfig>) -> UringResult<Self> {
         let config = config.as_ref();
-        let entries = config.entries.get();
-        config
-            .drive_limits
-            .validate(entries as usize)
-            .map_err(|message| {
-                UringError::DriverInit
-                    .report("driver.new.drive_limits", message)
-                    .attach_note("all io_uring drive budgets must be bounded and non-zero")
-            })?;
+        let entries = config.entries().get();
+        let drive_limits = config.get_drive_limits();
+        drive_limits.validate(entries as usize).map_err(|message| {
+            UringError::DriverInit
+                .report("driver.new.drive_limits", message)
+                .attach_note("all io_uring drive budgets must be bounded and non-zero")
+        })?;
         let ring = build_ring(config)?;
 
         let operations = OperationLedger::new(entries as usize);
@@ -178,28 +175,25 @@ impl<'a> UringDriver<'a> {
             ),
             kernel_capabilities,
             registration: RegistrationEngine::new(
-                config.registration_mode,
-                Some(config.provided_buffers),
-                registrar,
-                config.file_table_capacity,
-                config.file_table_exhaustion,
+                config.get_locked_memory_budget(),
+                Some(config.provided_buffer_config()),
+                config.get_file_table_capacity(),
+                config.get_file_table_exhaustion(),
             ),
             submission: SubmissionEngine::new(),
             lifecycle: LifecycleEngine::new(),
             completion: CompletionEngine::with_capacity(
-                config
-                    .drive_limits
+                drive_limits
                     .max_cqe_batch
-                    .max(config.drive_limits.emergency_drain_limit),
-                config
-                    .drive_limits
+                    .max(drive_limits.emergency_drain_limit),
+                drive_limits
                     .max_cqe_batch
-                    .max(config.drive_limits.emergency_drain_limit)
+                    .max(drive_limits.emergency_drain_limit)
                     .saturating_mul(4)
                     .saturating_add(8),
-                config.drive_limits,
+                drive_limits,
             ),
-            drive: DriveCoordinator::new(config.drive_limits),
+            drive: DriveCoordinator::new(drive_limits),
         };
 
         let submitter = driver.ring.submitter();
@@ -216,7 +210,6 @@ impl<'a> UringDriver<'a> {
                     .registration
                     .set_fixed_buffers_available(registration);
                 debug!(
-                    registration_mode = config.registration_mode.as_str(),
                     fixed_buffers_available = true,
                     fixed_buffer_slots = MAX_CHUNKS,
                     fallback = false,
@@ -234,20 +227,11 @@ impl<'a> UringDriver<'a> {
                     );
                 driver.registration.set_fixed_buffers_unavailable(errno);
                 tracing::warn!(
-                    registration_mode = config.registration_mode.as_str(),
                     errno = ?errno,
                     fixed_buffers_available = false,
-                    fallback = !config.registration_mode.is_strict(),
                     error = %e,
                     "sparse fixed-buffer registration unavailable"
                 );
-                if config.registration_mode.is_strict() {
-                    return Err(UringError::Registration
-                        .io_report("driver.new.register_fixed_buffers", e)
-                        .attach_note(
-                            "strict buffer registration mode does not permit a raw-buffer fallback",
-                        ));
-                }
             }
         }
 
@@ -276,11 +260,8 @@ impl<'a> UringDriver<'a> {
         Ok(driver)
     }
 
-    pub fn new(
-        config: impl AsRef<UringConfig>,
-        registrar: &'a (dyn BufferRegistrar + 'a),
-    ) -> UringResult<Self> {
-        Self::new_internal(config, registrar).attach_note("create uring driver")
+    pub fn new(config: impl AsRef<UringConfig>) -> UringResult<Self> {
+        Self::new_internal(config).attach_note("create uring driver")
     }
 
     /// Returns the point-in-time provided-buffer snapshot captured while harvesting CQEs.
@@ -374,6 +355,25 @@ impl<'a> Drop for UringDriver<'a> {
 
 impl<'a> sealed::Sealed for UringDriver<'a> {}
 
+impl DriverStartup for UringDriver<'_> {
+    type Config = UringConfig;
+    type StartupError = UringError;
+
+    fn startup_requirements(
+        _config: &Self::Config,
+        _workers: &[usize],
+    ) -> UringResult<DriverStartupRequirements> {
+        Ok(DriverStartupRequirements::none())
+    }
+
+    fn new_with_startup_resources(
+        config: impl AsRef<Self::Config>,
+        _resources: DriverStartupResources,
+    ) -> UringResult<Self> {
+        Self::new(config)
+    }
+}
+
 impl<'a> UdpReceiveOperationBuilder for UringDriver<'a> {
     type BuildError = UringError;
 
@@ -381,7 +381,6 @@ impl<'a> UdpReceiveOperationBuilder for UringDriver<'a> {
         &mut self,
         fd: IoFd,
         config: UdpReceiveConfig,
-        _buffer_pool: AnyBufPool,
     ) -> UringResult<UdpRecvMulti<Self::Raw>> {
         let config = config.validate().map_err(|error| {
             UringError::InvalidInput
@@ -413,6 +412,7 @@ impl<'a> UdpReceiveOperationBuilder for UringDriver<'a> {
 impl<'a> DriverRaw for UringDriver<'a> {
     type SlotSpec = UringSlotSpec;
     type Raw = UringRawHandle;
+    const BACKEND_NAME: &'static str = "io_uring";
 
     fn reserve_op_raw(&mut self) -> UringResult<OpToken> {
         match self.operations.insert(OpEntry::new(UringOpState::new())) {
@@ -609,19 +609,11 @@ impl<'a> DriverRaw for UringDriver<'a> {
 
     fn register_buffer_raw(
         &mut self,
-        id: ChunkId,
-        ptr: *const u8,
-        len: usize,
+        request: BufferRegistrationRequest,
     ) -> UringResult<BufferRegistrationStatus> {
         let submitter = self.ring.submitter();
         self.registration
-            .register_buffer_internal(
-                &submitter,
-                self.completion_diagnostics.backend(),
-                id,
-                ptr,
-                len,
-            )
+            .register_buffer_internal(&submitter, self.completion_diagnostics.backend(), request)
             .push_ctx("scope", "uring.driver.register_buffer")
             .attach_note("register buffer")
     }
@@ -691,18 +683,6 @@ impl DriverTestHooks for UringDriver<'_> {
         self.registration
             .registration_stats()
             .chunk_register_skipped_recent_failure()
-    }
-
-    fn debug_submission_missing_chunk_info(&self) -> u64 {
-        self.registration
-            .registration_stats()
-            .submission_missing_chunk_info()
-    }
-
-    fn debug_raw_buffer_fallbacks(&self) -> u64 {
-        self.registration
-            .registration_stats()
-            .raw_buffer_fallbacks()
     }
 
     fn debug_fixed_buffers_available(&self) -> bool {

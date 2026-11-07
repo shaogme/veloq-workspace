@@ -8,7 +8,6 @@ use veloq_std::{
 use super::{completion::COMP_BACKEND_IOCP, polling::TimerEngine};
 use diagweave::prelude::*;
 use veloq_blocking::{BlockingTask, ThreadPool};
-use veloq_buf::BufferRegistrar;
 use veloq_driver_core::{
     driver::{
         CompletionBackendHooks, CompletionContinuation, CompletionControl, CompletionFailure,
@@ -16,6 +15,7 @@ use veloq_driver_core::{
         CompletionToken, DriverSubmitResult, OpToken, PlatformOp, SharedCompletionTable,
         SubmitStatus, SyntheticCompletionSource, UserCompletionEvent,
     },
+    op::types::{OpKind, UdpRecvMultiBackend},
     slot::{
         CheckedSlotView, InFlightOrphaned, InFlightWaiting, Reserved, SlotAccessError,
         SlotRegistryExt, SlotView,
@@ -53,17 +53,13 @@ pub(super) struct SubmitResolution<'a> {
     pub(super) blocking_pool: &'a ThreadPool,
 }
 
-pub(super) struct SubmissionService<'view, 'state, 'registrar> {
+pub(super) struct SubmissionService<'view, 'state> {
     state: &'view mut SubmissionStateView<'state>,
-    registrar: &'registrar dyn BufferRegistrar,
 }
 
-impl<'view, 'state, 'registrar> SubmissionService<'view, 'state, 'registrar> {
-    pub(super) fn new(
-        state: &'view mut SubmissionStateView<'state>,
-        registrar: &'registrar dyn BufferRegistrar,
-    ) -> Self {
-        Self { state, registrar }
+impl<'view, 'state> SubmissionService<'view, 'state> {
+    pub(super) fn new(state: &'view mut SubmissionStateView<'state>) -> Self {
+        Self { state }
     }
 
     fn state_mut(&mut self) -> &mut SubmissionStateView<'state> {
@@ -198,6 +194,36 @@ fn close_fd_from_op(op: &IocpOp) -> IocpResult<Option<IoFd>> {
     }
 }
 
+fn socket_pending_without_inflight_token(op: &IocpOp) -> bool {
+    if op.uses_rio_backend()
+        || !op.header.in_flight
+        || !op
+            .header
+            .resolved_handle
+            .is_some_and(|handle| handle.is_socket())
+    {
+        return false;
+    }
+    if op.kind() != OpKind::UdpRecvMulti {
+        return op.header.socket_inflight.is_none();
+    }
+
+    let IocpOpPayload::UdpRecvMulti(payload) = &op.payload else {
+        return true;
+    };
+    // SAFETY: The payload is bound to the reserved operation slot during submission. / 提交期间该 payload 已绑定到操作槽位。
+    let Ok(user) = (unsafe { payload.user.as_ref() }) else {
+        return true;
+    };
+    let expected = user.receive_pump().actual_in_flight();
+    let Some(requests) = payload.raw_requests() else {
+        return true;
+    };
+    let mut active = requests.iter().filter(|request| request.header().in_flight);
+    let active_count = active.clone().count();
+    active_count != expected || active.any(|request| request.header().socket_inflight.is_none())
+}
+
 fn slot_access_report(scope: &'static str, err: SlotAccessError) -> Report<IocpError> {
     IocpError::InvalidState
         .to_report()
@@ -212,7 +238,7 @@ fn slot_access_report(scope: &'static str, err: SlotAccessError) -> Report<IocpE
         .attach_note("slot access failed during IOCP submission")
 }
 
-impl SubmissionService<'_, '_, '_> {
+impl SubmissionService<'_, '_> {
     #[inline]
     pub(super) fn prep_op_slot(
         ops: &mut IocpOpRegistry,
@@ -389,7 +415,6 @@ impl SubmissionService<'_, '_, '_> {
         token: OpToken,
         op: IocpOp,
     ) -> IocpResult<IocpResult<SubmissionResult>> {
-        let registrar = self.registrar;
         let state = self.state_mut();
         let mut guard = Self::prep_op_slot(state.ops, token, op)
             .push_ctx("scope", "iocp/driver")
@@ -438,7 +463,7 @@ impl SubmissionService<'_, '_, '_> {
                 Ok(SubmissionResult::PostToQueue)
             })
         } else {
-            let (rio, registrar) = state.rio.state_and_registrar_mut(registrar);
+            let rio = state.rio.state_mut();
             let registered_slots = state.handles.submission_slots();
             let mut ctx = SubmitContext {
                 port: state.completion.port_arc(),
@@ -447,7 +472,8 @@ impl SubmissionService<'_, '_, '_> {
                 completion_token: CompletionToken::user(token),
                 ext: state.extensions,
                 registered_slots,
-                registrar,
+                overlapped_registry: Some(state.overlapped_registry),
+                buffer_pool: state.buffer_pool,
                 rio,
             };
 
@@ -469,11 +495,7 @@ impl SubmissionService<'_, '_, '_> {
                 .as_mut()
                 .and_then(|slot| {
                     slot.with_access_mut(|access| {
-                        let op = access.operation().get_ref();
-                        !op.uses_rio_backend()
-                            && op.header.in_flight
-                            && op.header.resolved_handle.is_some_and(|h| h.is_socket())
-                            && op.header.socket_inflight.is_none()
+                        socket_pending_without_inflight_token(access.operation().get_ref())
                     })
                     .ok()
                 })

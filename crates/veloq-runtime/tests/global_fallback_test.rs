@@ -335,7 +335,7 @@ fn global_fallback_wakes_an_idle_worker_in_another_group() {
                     )
                 })
                 .expect("worker waker must bind once");
-            factory_fixture.clone()
+            Ok(factory_fixture.clone())
         })
         .scope(async move |ctx| {
             let _release_guard = OtherGroupReleaseGuard::new(scope_fixture.clone());

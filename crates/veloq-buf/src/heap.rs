@@ -7,8 +7,9 @@
 //! To avoid global lock contention, the pool is partitioned into multiple **Shards**.
 //! Each shard manages a distinct slice of the global memory.
 //!
-//! # Dynamic Extension (Phase 1)
-//! The pool now supports multiple `Chunk`s. Startups with one chunk, but can grow.
+//! # Fixed Startup Capacity / 启动时固定容量
+//! Runtime pools create their chunks during initialization and do not grow on exhaustion.
+//! 运行时 pool 在初始化期间创建全部 chunk，耗尽后不会扩容。
 
 pub mod buddy;
 mod cache;

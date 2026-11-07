@@ -5,7 +5,7 @@ use crate::{
     op::{IocpSlotSpec, ReadFixed, ReadRaw, Timeout, WriteFixed, WriteRaw},
     tests::{complete_from_record, submit_test_op, wait_completion, wait_completion_record},
 };
-use veloq_buf::{FixedBuf, NoopRegistrar};
+use veloq_buf::FixedBuf;
 use veloq_driver_core::{
     driver::{Driver, DriverSubmitResult, RegisterFd, SubmitStatus},
     op::IntoPlatformOp,
@@ -27,8 +27,7 @@ use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
 static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 fn new_driver() -> IocpDriver<'static> {
-    static REGISTRAR: NoopRegistrar = NoopRegistrar;
-    IocpDriver::new(IocpConfig::default(), &REGISTRAR).unwrap()
+    IocpDriver::new(IocpConfig::default()).unwrap()
 }
 
 fn temp_file_path(label: &str) -> PathBuf {

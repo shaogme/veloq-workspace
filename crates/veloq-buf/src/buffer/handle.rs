@@ -15,7 +15,7 @@ mod range;
 pub use range::{BufIoRangeBound, BufIoRangeError, BufIoRangeErrorKind};
 
 use super::{
-    common::{PoolKind, RegionInfo},
+    common::{PoolKind, RegionInfo, RegistrationCapability},
     error::{BufError, BufResult},
     slot_pool::{slot_based_dealloc, slot_based_resolve_region_info},
 };
@@ -31,7 +31,8 @@ pub(crate) struct PackedContext {
     pub slot_idx: u32,
     pub order: u8,
     pub chunk_id: u16,
-    pub reserved: u7,
+    pub registered: bool,
+    pub reserved: u6,
     pub pool_kind: PoolKind,
 }
 
@@ -50,8 +51,9 @@ impl PackedContext {
         order: u8,
         chunk_id: ChunkId,
         pool_kind: PoolKind,
+        registered: bool,
     ) -> Self {
-        Self::new(slot_idx, order, chunk_id.0, pool_kind)
+        Self::new(slot_idx, order, chunk_id.0, registered, pool_kind)
     }
 
     pub(crate) fn slot_chunk_id(&self) -> ChunkId {
@@ -65,7 +67,7 @@ pub struct FixedBuf {
     pub(crate) ptr: NonNull<u8>,
     // Metadata moved from Heap Header to Handle
     pub(crate) pool_data: NonNull<()>,
-    pub(crate) context: PackedContext, // [pool_kind:1 | reserved:7 | context_payload:56]
+    pub(crate) context: PackedContext, // [pool_kind:1 | reserved:6 | registered:1 | context_payload:56]
     pub(crate) len: u32,
     /// The actual capacity of this specific handle/view.
     pub(crate) cap: u32,
@@ -124,6 +126,28 @@ impl FixedBuf {
         pool_kind: PoolKind,
         context: u64,
     ) -> Self {
+        unsafe {
+            Self::new_with_registration(
+                ptr,
+                cap,
+                len,
+                pool_data,
+                pool_kind,
+                context,
+                RegistrationCapability::Unregistered,
+            )
+        }
+    }
+
+    pub(crate) unsafe fn new_with_registration(
+        ptr: NonNull<u8>,
+        cap: NonZeroUsize,
+        len: usize,
+        pool_data: NonNull<()>,
+        pool_kind: PoolKind,
+        context: u64,
+        registration: RegistrationCapability,
+    ) -> Self {
         assert!(len <= cap.get(), "len must be <= capacity");
         assert!(
             cap.get() <= u32::MAX as usize,
@@ -132,6 +156,11 @@ impl FixedBuf {
 
         let mut context = PackedContext::from(context);
         context.set_pool_kind(pool_kind);
+        let registered = matches!(registration, RegistrationCapability::RegisteredChunk(_));
+        context.set_registered(registered);
+        if let RegistrationCapability::RegisteredChunk(chunk_id) = registration {
+            assert_eq!(context.chunk_id(), chunk_id.raw());
+        }
 
         unsafe { Self::from_parts(ptr, pool_data, context, len, cap.get()) }
     }
@@ -141,10 +170,16 @@ impl FixedBuf {
     ///
     /// The interpretation of the region index is pool-dependent.
     pub fn resolve_region_info(&self) -> RegionInfo {
-        match self.pool_kind() {
+        let mut info = match self.pool_kind() {
             PoolKind::SlotBased => unsafe { slot_based_resolve_region_info(self.pool_data, self) },
             PoolKind::Heap => heap_resolve_region_info(self),
-        }
+        };
+        info.registration = if self.context.registered() {
+            RegistrationCapability::RegisteredChunk(info.id)
+        } else {
+            RegistrationCapability::Unregistered
+        };
+        info
     }
 
     pub fn as_slice(&self) -> &[u8] {
@@ -411,7 +446,17 @@ pub(crate) fn heap_resolve_region_info(buf: &FixedBuf) -> RegionInfo {
 
     RegionInfo {
         pool_kind: PoolKind::Heap,
+        registration: RegistrationCapability::Unregistered,
         id: ChunkId::ZERO,
+        base_ptr: unsafe { NonNull::new_unchecked(base as *mut u8) },
+        region_len: unsafe {
+            NonZeroUsize::new_unchecked(
+                (*((buf.pool_data.as_ptr()) as *const HeapControlBlock))
+                    .total_size
+                    .get()
+                    - 4096,
+            )
+        },
         offset: ptr.saturating_sub(base),
         cookie: buf.context_raw(),
     }

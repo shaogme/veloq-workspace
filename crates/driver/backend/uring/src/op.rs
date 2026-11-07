@@ -1,8 +1,6 @@
 //! io_uring Platform-Specific Operation Definitions
 
-use crate::{
-    diagnostics::UringCompletionDiagnostics, driver::UringOpState, error::UringError,
-};
+use crate::{diagnostics::UringCompletionDiagnostics, driver::UringOpState, error::UringError};
 use veloq_driver_core::{
     driver::{CompletionCleanupGuard, PlatformOp, registry::OpRegistry as CoreOpRegistry},
     slot::{Slot as CoreSlot, SlotSpec as CoreSlotSpec},

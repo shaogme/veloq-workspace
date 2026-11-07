@@ -1226,9 +1226,7 @@ mod tests {
             unregister.is_err(),
             "an unsettled lease must block unregister"
         );
-        let (_, group) = unregister
-            .expect_err("failure owns the group")
-            .into_parts();
+        let (_, group) = unregister.expect_err("failure owns the group").into_parts();
         let mut group = group;
 
         group

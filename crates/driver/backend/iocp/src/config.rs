@@ -1,4 +1,5 @@
 use veloq_blocking::BlockingPoolConfig;
+use veloq_buf::LockedMemoryBudget;
 use veloq_driver_core::{
     BorrowedRawHandle as CoreBorrowedRawHandle, IoFd as CoreIoFd,
     OwnedRawHandle as CoreOwnedRawHandle, RawHandle as CoreRawHandle, RawHandleMeta,
@@ -12,36 +13,6 @@ use windows_sys::Win32::Networking::WinSock::{INVALID_SOCKET, SOCKET, closesocke
 
 pub use veloq_driver_core::{DirectOwnerId, RawHandleKind};
 
-/// 指定缓冲区的注册与校验方式。
-/// Specifies how buffers are registered and validated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum BufferRegistrationMode {
-    /// 严格注册并执行校验。
-    /// Strict registration with validation.
-    #[default]
-    Strict,
-    /// 兼容式注册，用于回退路径。
-    /// Compatible registration for fallback.
-    Compatible,
-}
-
-impl BufferRegistrationMode {
-    /// 返回当前模式是否为严格模式。
-    /// Returns true if the mode is strict.
-    #[inline]
-    pub const fn is_strict(self) -> bool {
-        matches!(self, Self::Strict)
-    }
-
-    #[inline]
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Strict => "strict",
-            Self::Compatible => "compatible",
-        }
-    }
-}
-
 /// IOCP driver 的配置。
 /// Configuration for the IOCP driver.
 #[derive(Debug, Clone)]
@@ -49,9 +20,7 @@ pub struct IocpConfig {
     /// completion port 的条目容量。
     /// Number of entries in the completion port.
     entries: NonZeroU32,
-    /// 缓冲区注册模式。
-    /// Mode for buffer registration.
-    registration_mode: BufferRegistrationMode,
+    locked_memory_budget: LockedMemoryBudget,
     /// 阻塞线程池配置。
     /// Configuration for the blocking thread pool.
     blocking_pool: BlockingPoolConfig,
@@ -67,7 +36,7 @@ impl Default for IocpConfig {
     fn default() -> Self {
         Self {
             entries: nz!(1024),
-            registration_mode: BufferRegistrationMode::Strict,
+            locked_memory_budget: LockedMemoryBudget::default(),
             blocking_pool: BlockingPoolConfig::default(),
         }
     }
@@ -79,9 +48,8 @@ impl IocpConfig {
         self.entries
     }
 
-    /// 返回缓冲区注册模式。 / Returns the buffer registration mode.
-    pub const fn get_registration_mode(&self) -> BufferRegistrationMode {
-        self.registration_mode
+    pub fn get_locked_memory_budget(&self) -> LockedMemoryBudget {
+        self.locked_memory_budget.clone()
     }
 
     /// 返回阻塞线程池配置。 / Returns the blocking-pool configuration.
@@ -95,9 +63,13 @@ impl IocpConfig {
         self
     }
 
-    /// 设置缓冲区注册模式。 / Sets the buffer registration mode.
-    pub fn registration_mode(mut self, mode: BufferRegistrationMode) -> Self {
-        self.registration_mode = mode;
+    pub fn locked_memory_limit(mut self, limit_bytes: usize) -> Self {
+        self.locked_memory_budget = LockedMemoryBudget::new(limit_bytes);
+        self
+    }
+
+    pub fn locked_memory_budget(mut self, budget: LockedMemoryBudget) -> Self {
+        self.locked_memory_budget = budget;
         self
     }
 
@@ -115,6 +87,7 @@ pub enum IocpHandle {
     },
     Socket {
         handle: HANDLE,
+        rio: bool,
         // 线程分配的 socket generation 用于避免 RIO actor 映射因 HANDLE 重用而混淆。
         // Per-thread socket generation prevents HANDLE reuse from aliasing RIO actor mappings.
         generation: u64,
@@ -138,6 +111,16 @@ impl IocpHandle {
     pub const fn for_socket(handle: HANDLE) -> Self {
         Self::Socket {
             handle,
+            rio: false,
+            generation: 0,
+        }
+    }
+
+    #[inline]
+    pub const fn for_rio_socket(handle: HANDLE) -> Self {
+        Self::Socket {
+            handle,
+            rio: true,
             generation: 0,
         }
     }
@@ -157,6 +140,11 @@ impl IocpHandle {
     #[inline]
     pub fn as_socket(self) -> SOCKET {
         self.as_handle() as SOCKET
+    }
+
+    #[inline]
+    pub const fn uses_rio(self) -> bool {
+        matches!(self, Self::Socket { rio: true, .. })
     }
 
     #[inline]

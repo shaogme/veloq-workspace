@@ -10,7 +10,6 @@ use crate::{
     },
 };
 use diagweave::prelude::*;
-use veloq_buf::NoopRegistrar;
 use veloq_driver_core::driver::{AnomalyAttach, RawCompletion};
 use veloq_std::{
     mem::{self, zeroed},
@@ -123,8 +122,7 @@ impl RioLifecycle {
         if core.kernel().cq().is_invalid() {
             return None;
         }
-        let registration_mode = core.registration_mode();
-        let core = mem::replace(core, RioCore::empty(registration_mode));
+        let core = mem::replace(core, RioCore::empty());
         let runtime = mem::replace(runtime, RioRuntime::closed_empty());
         let resources = mem::replace(
             resources,
@@ -280,8 +278,7 @@ impl RioLifecycle {
     pub(super) fn finalize(core: &mut RioCore, runtime: &mut RioRuntime) -> RioResult<()> {
         runtime.stop_accepting_new_submissions();
         runtime.forget_after_drain(core.outstanding_count())?;
-        let registrar = NoopRegistrar;
-        let (registry, env) = core.registry_with_env(&registrar).into_parts();
+        let (registry, env) = core.registry_with_env().into_parts();
         if let Some(env) = env {
             registry.cleanup_deregister(env);
         }
@@ -306,7 +303,6 @@ impl RioLifecycle {
 mod tests {
     use super::{RIO_REAPER_DRAIN_TIMEOUT, RioLifecycle};
     use crate::{
-        BufferRegistrationMode,
         config::IocpHandle,
         driver::IocpDriverCompletionDiagnostics,
         rio::{
@@ -330,11 +326,7 @@ mod tests {
     impl RioLifecycleTestContext {
         fn new() -> Self {
             Self {
-                core: RioCore::new(
-                    RioKernel::noop(),
-                    RioRegistry::new(32, 1),
-                    BufferRegistrationMode::default(),
-                ),
+                core: RioCore::new(RioKernel::noop(), RioRegistry::new(32, 1)),
                 runtime: RioRuntime::new(),
                 diagnostics: IocpDriverCompletionDiagnostics::default(),
             }

@@ -7,10 +7,9 @@ use veloq_std::{
 };
 
 use diagweave::prelude::*;
-use veloq_buf::BufferRegistrar;
 use veloq_driver_core::driver::{
     AnomalyAttach, CompletionAnomalyKind, CompletionEnvelope, CompletionIdentity, CompletionToken,
-    OpToken, RawCompletion, RemoteWaker, SharedCompletionTable,
+    OpToken, RawCompletion, RemoteWaker, SharedCompletionTable, UserCompletionEvent,
 };
 use veloq_wheel::{Expired, TimerError, TimerId, Wheel, WheelConfig};
 
@@ -21,12 +20,12 @@ use crate::{
     },
     driver::{
         cancellation::CancellationService,
-        completion::{COMP_BACKEND_IOCP, CompletionService},
+        completion::{COMP_BACKEND_IOCP, CompletionService, IocpBackendIngress},
         registration::RegistrationService,
         state::{IocpDriverState, PollingStateView},
     },
     error::{IocpError, IocpResult},
-    op::{IocpSlotSpec, OverlappedEntry},
+    op::{IocpOpPayload, IocpSlotSpec},
     rio::CompletionPollArgs,
     win32::{CompletionBatch, CompletionStatus, IoCompletionPort, Overlapped},
 };
@@ -296,17 +295,13 @@ impl TimerEngine {
     }
 }
 
-pub(super) struct PollingService<'view, 'state, 'registrar> {
+pub(super) struct PollingService<'view, 'state> {
     state: &'view mut PollingStateView<'state>,
-    registrar: &'registrar dyn BufferRegistrar,
 }
 
-impl<'view, 'state, 'registrar> PollingService<'view, 'state, 'registrar> {
-    pub(super) fn new(
-        state: &'view mut PollingStateView<'state>,
-        registrar: &'registrar dyn BufferRegistrar,
-    ) -> Self {
-        Self { state, registrar }
+impl<'view, 'state> PollingService<'view, 'state> {
+    pub(super) fn new(state: &'view mut PollingStateView<'state>) -> Self {
+        Self { state }
     }
 
     fn state(&self) -> &PollingStateView<'state> {
@@ -391,9 +386,9 @@ impl<'view, 'state, 'registrar> PollingService<'view, 'state, 'registrar> {
         match classify_completion_status(key, overlapped, success) {
             IocpCompletionStatusKind::RioWake => Ok(0),
             IocpCompletionStatusKind::OverlappedUser { queue_key } => {
-                let envelope =
-                    self.resolve_overlapped_user_envelope(queue_key, overlapped, res, flags)?;
-                self.process_completion_envelope(envelope)
+                let ingress =
+                    self.resolve_overlapped_user_ingress(queue_key, overlapped, res, flags)?;
+                self.process_overlapped_ingress(ingress)
             }
             IocpCompletionStatusKind::ControlKey | IocpCompletionStatusKind::PostedToken => Ok(0),
             IocpCompletionStatusKind::NullFailure => Err(iocp_msg(
@@ -573,29 +568,27 @@ impl<'view, 'state, 'registrar> PollingService<'view, 'state, 'registrar> {
         let flags = iocp_status_flags(success, error_code);
         match classify_completion_status(key, overlapped, success) {
             IocpCompletionStatusKind::RioWake => {
-                let registrar = self.registrar;
                 let state = self.state_mut();
-                {
-                    let (rio_state, registrar) = state.rio.state_and_registrar_mut(registrar);
-                    rio_state.process_completions(CompletionPollArgs {
+                state
+                    .rio
+                    .state_mut()
+                    .process_completions(CompletionPollArgs {
                         ops: state.ops,
                         ext: state.extensions,
-                        registrar,
                         completion_table: state.completion.table(),
                         diagnostics: state.completion_diagnostics,
                     })
-                }
-                .inspect(|_| {
-                    self.drain_deferred_socket_cleanup();
-                })
-                .push_ctx("scope", "iocp/driver")
-                .attach_note("failed to process rio completions")?;
+                    .inspect(|_| {
+                        self.drain_deferred_socket_cleanup();
+                    })
+                    .push_ctx("scope", "iocp/driver")
+                    .attach_note("failed to process rio completions")?;
                 Ok(0)
             }
             IocpCompletionStatusKind::OverlappedUser { queue_key } => {
-                let envelope =
-                    self.resolve_overlapped_user_envelope(queue_key, overlapped, res, flags)?;
-                self.process_completion_envelope(envelope)
+                let ingress =
+                    self.resolve_overlapped_user_ingress(queue_key, overlapped, res, flags)?;
+                self.process_overlapped_ingress(ingress)
             }
             IocpCompletionStatusKind::ControlKey | IocpCompletionStatusKind::PostedToken => {
                 self.accept_raw_completion(key as u64, res, flags)?;
@@ -624,15 +617,103 @@ impl<'view, 'state, 'registrar> PollingService<'view, 'state, 'registrar> {
         }
     }
 
-    fn resolve_overlapped_user_envelope(
+    fn resolve_overlapped_user_ingress(
         &mut self,
         completion_key: usize,
         overlapped: *mut Overlapped,
         res: i32,
         flags: u32,
-    ) -> IocpResult<CompletionEnvelope> {
-        let entry = unsafe { &*(overlapped as *const OverlappedEntry) };
-        let idx = entry.token.index();
+    ) -> IocpResult<IocpOverlappedIngress> {
+        let address = overlapped as usize;
+        let (token, request, in_flight, has_socket_inflight) = {
+            let state = self.state_mut();
+            if let Some(owner) = state.overlapped_registry.take_child(address) {
+                if !state.ops.is_current_active(owner.token) {
+                    return IocpError::InvalidState
+                        .with_ctx("overlapped_ptr", address)
+                        .with_ctx("slot_index", owner.token.index())
+                        .with_ctx("slot_generation", owner.token.generation())
+                        .attach_note(
+                            "completed UDP child owner refers to an inactive parent slot",
+                        );
+                }
+                let Some((_, _, op, _)) = state.ops.slot_bundle_by_index_mut(owner.token.index())
+                else {
+                    return IocpError::InvalidState
+                        .with_ctx("overlapped_ptr", address)
+                        .with_ctx("slot_index", owner.token.index())
+                        .attach_note("completed UDP child parent slot is missing");
+                };
+                let Some(op) = op.as_ref() else {
+                    return IocpError::InvalidState
+                        .with_ctx("overlapped_ptr", address)
+                        .with_ctx("slot_index", owner.token.index())
+                        .attach_note("completed UDP child parent operation is missing");
+                };
+                let IocpOpPayload::UdpRecvMulti(payload) = &op.payload else {
+                    return IocpError::InvalidState
+                        .with_ctx("overlapped_ptr", address)
+                        .with_ctx("slot_index", owner.token.index())
+                        .attach_note("completed UDP child parent has the wrong payload kind");
+                };
+                let Some(child) = payload
+                    .raw_requests()
+                    .and_then(|requests| requests.get(owner.request.slot_id as usize))
+                else {
+                    return IocpError::InvalidState
+                        .with_ctx("overlapped_ptr", address)
+                        .with_ctx("slot_index", owner.token.index())
+                        .with_ctx("child_slot_id", owner.request.slot_id)
+                        .attach_note("completed UDP child owner is missing from its parent");
+                };
+                let header = child.header();
+                if child.slot_id() != owner.request.slot_id
+                    || &header.inner as *const Overlapped as usize != address
+                    || header.token != owner.token
+                    || header.receive_request != Some(owner.request)
+                    || !header.in_flight
+                    || header.socket_inflight.is_none()
+                {
+                    return IocpError::InvalidState
+                        .with_ctx("overlapped_ptr", address)
+                        .with_ctx("slot_index", owner.token.index())
+                        .with_ctx("request_id", owner.request.request_id)
+                        .with_ctx("child_slot_id", owner.request.slot_id)
+                        .attach_note("completed UDP child owner identity is stale");
+                }
+                (
+                    header.token,
+                    header.receive_request,
+                    header.in_flight,
+                    header.socket_inflight.is_some(),
+                )
+            } else if let Some(index) = state.overlapped_registry.root_index(address) {
+                let Some((_, _, _, storage)) = state.ops.slot_bundle_by_index_mut(index) else {
+                    return IocpError::InvalidState
+                        .with_ctx("overlapped_ptr", address)
+                        .with_ctx("slot_index", index)
+                        .attach_note("completed root OVERLAPPED sidecar is missing");
+                };
+                let entry = &storage.sidecar;
+                (
+                    entry.token,
+                    entry.receive_request,
+                    entry.in_flight,
+                    entry.socket_inflight.is_some(),
+                )
+            } else {
+                return Err(IocpError::InvalidState
+                    .report(
+                        "resolve_overlapped_user_envelope",
+                        "IOCP completion has no registered OVERLAPPED owner",
+                    )
+                    .with_ctx("overlapped_ptr", address)
+                    .with_ctx("completion_key", completion_key)
+                    .with_ctx("raw_res", res)
+                    .with_ctx("raw_flags", flags));
+            }
+        };
+        let idx = token.index();
         if idx >= self.state().ops.capacity() {
             return Err(IocpError::InvalidState.report(
                 "resolve_overlapped_user_envelope",
@@ -644,26 +725,18 @@ impl<'view, 'state, 'registrar> PollingService<'view, 'state, 'registrar> {
             ));
         }
 
-        let envelope = CompletionEnvelope::from_sidecar_user_token(
-            COMP_BACKEND_IOCP,
-            entry.token,
-            completion_key as u64,
-            res,
-            flags,
-        );
-        let raw = envelope.raw;
-        let expected_key = raw.token.raw() as usize;
+        let expected_key = CompletionToken::user(token).raw() as usize;
         if completion_key != 0 && completion_key != expected_key {
             return Err(IocpError::InvalidState
                 .report(
                     "resolve_overlapped_user_envelope",
                     "Completion Key Mismatch occurred during IOCP status polling",
                 )
-                .with_ctx("slot_index", entry.token.index())
-                .with_ctx("expected_generation", entry.token.generation())
+                .with_ctx("slot_index", token.index())
+                .with_ctx("expected_generation", token.generation())
                 .with_ctx("expected_key", expected_key as u64)
                 .with_ctx("received_completion_key", completion_key as u64)
-                .with_ctx("overlapped_ptr", overlapped as usize)
+                .with_ctx("overlapped_ptr", address)
                 .with_ctx("raw_res", res)
                 .with_ctx("raw_flags", flags)
                 .attach_note(
@@ -672,7 +745,42 @@ impl<'view, 'state, 'registrar> PollingService<'view, 'state, 'registrar> {
                      bug or memory corruption during Socket/File registration to the completion port."
                 ));
         }
-        Ok(envelope)
+        if let Some(request) = request {
+            if !in_flight || !has_socket_inflight {
+                return Err(IocpError::InvalidState
+                    .report(
+                        "resolve_overlapped_user_ingress",
+                        "UDP child completion does not reference an active request",
+                    )
+                    .with_ctx("slot_index", token.index())
+                    .with_ctx("slot_generation", request.slot_generation)
+                    .with_ctx("request_id", request.request_id)
+                    .with_ctx("overlapped_ptr", address));
+            }
+            let event = UserCompletionEvent::from_parts(COMP_BACKEND_IOCP, token, res, flags);
+            return Ok(IocpOverlappedIngress::Backend(
+                IocpBackendIngress::UdpReceive { event, request },
+            ));
+        }
+        Ok(IocpOverlappedIngress::Kernel(
+            CompletionEnvelope::from_sidecar_user_token(
+                COMP_BACKEND_IOCP,
+                token,
+                completion_key as u64,
+                res,
+                flags,
+            ),
+        ))
+    }
+
+    fn process_overlapped_ingress(&mut self, ingress: IocpOverlappedIngress) -> IocpResult<usize> {
+        match ingress {
+            IocpOverlappedIngress::Kernel(envelope) => self.process_completion_envelope(envelope),
+            IocpOverlappedIngress::Backend(ingress) => {
+                let mut view = IocpDriverState::completion_view_from_polling(self.state_mut());
+                CompletionService::new(&mut view).process_backend_ingress(ingress)
+            }
+        }
     }
 
     fn drain_deferred_socket_cleanup(&mut self) {
@@ -686,29 +794,24 @@ impl<'view, 'state, 'registrar> PollingService<'view, 'state, 'registrar> {
             let Some(request) = request else {
                 return Ok(());
             };
-            let registrar = self.registrar;
             let mut view = IocpDriverState::cancellation_view_from_polling(self.state_mut());
-            let _ = CancellationService::new(&mut view, registrar).cancel_op_internal(request)?;
+            let _ = CancellationService::new(&mut view).cancel_op_internal(request)?;
         }
     }
 
     fn process_timers(&mut self) -> IocpResult<usize> {
-        let registrar = self.registrar;
         let mut view = IocpDriverState::completion_view_from_polling(self.state_mut());
-        CompletionService::new(&mut view, registrar).process_timers()
+        CompletionService::new(&mut view).process_timers()
     }
 
     fn process_completion_envelope(&mut self, envelope: CompletionEnvelope) -> IocpResult<usize> {
-        let registrar = self.registrar;
         let mut view = IocpDriverState::completion_view_from_polling(self.state_mut());
-        CompletionService::new(&mut view, registrar).process_completion_envelope(envelope)
+        CompletionService::new(&mut view).process_completion_envelope(envelope)
     }
 
     fn accept_raw_completion(&mut self, raw_token: u64, res: i32, flags: u32) -> IocpResult<()> {
-        let registrar = self.registrar;
         let mut view = IocpDriverState::completion_view_from_polling(self.state_mut());
-        CompletionService::new(&mut view, registrar)
-            .accept_raw_completion(raw_token, res, flags)?;
+        CompletionService::new(&mut view).accept_raw_completion(raw_token, res, flags)?;
         Ok(())
     }
 
@@ -717,9 +820,8 @@ impl<'view, 'state, 'registrar> PollingService<'view, 'state, 'registrar> {
         kind: CompletionAnomalyKind,
         attach: AnomalyAttach,
     ) -> IocpResult<()> {
-        let registrar = self.registrar;
         let mut view = IocpDriverState::completion_view_from_polling(self.state_mut());
-        CompletionService::new(&mut view, registrar).accept_completion_anomaly(kind, attach)?;
+        CompletionService::new(&mut view).accept_completion_anomaly(kind, attach)?;
         Ok(())
     }
 }
@@ -732,6 +834,11 @@ enum IocpCompletionStatusKind {
     PostedToken,
     NullFailure,
     Unknown,
+}
+
+enum IocpOverlappedIngress {
+    Kernel(CompletionEnvelope),
+    Backend(IocpBackendIngress),
 }
 
 #[inline]

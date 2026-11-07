@@ -9,6 +9,7 @@ use crate::{
 };
 use veloq_driver_core::{
     driver::{CompletionToken, OpToken, registry::OpRegistry as CoreOpRegistry},
+    platform::receive_pump::ReceiveRequest,
     slot::{Generation, Slot as CoreSlot, SlotSpec as CoreSlotSpec},
 };
 use veloq_std::{
@@ -105,6 +106,7 @@ pub struct OverlappedEntry {
     pub(crate) resolved_handle: Option<RawHandle>,
     /// Socket inflight ownership acquired before a kernel-pending socket submit.
     pub(crate) socket_inflight: Option<SocketInflightToken>,
+    pub(crate) receive_request: Option<ReceiveRequest>,
 }
 
 impl OverlappedEntry {
@@ -118,6 +120,7 @@ impl OverlappedEntry {
             blocking_completion: None,
             resolved_handle: None,
             socket_inflight: None,
+            receive_request: None,
         };
         entry.reset_for_token(token);
         entry
@@ -131,6 +134,7 @@ impl OverlappedEntry {
         self.blocking_completion = None;
         self.resolved_handle = None;
         self.socket_inflight = None;
+        self.receive_request = None;
     }
 }
 

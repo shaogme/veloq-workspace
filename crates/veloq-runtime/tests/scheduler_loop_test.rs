@@ -22,12 +22,12 @@ use veloq_std::{
 
 use veloq_runtime::{
     Outcome,
-    runtime::{RuntimeBuilder, RuntimeCtx, RuntimeShared},
+    runtime::{DefaultWorkerFactoryFor, RuntimeBuilder, RuntimeCtx},
     scope, select,
     task::yield_now,
 };
 
-fn with_workers(count: usize) -> RuntimeBuilder<(), fn(usize, &RuntimeShared<()>)> {
+fn with_workers(count: usize) -> RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
     RuntimeBuilder::new().with_worker_count(NonZeroUsize::new(count))
 }
 

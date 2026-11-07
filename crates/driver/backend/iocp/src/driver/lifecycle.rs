@@ -10,7 +10,7 @@ use veloq_std::{
 
 use diagweave::prelude::*;
 use tracing::debug;
-use veloq_buf::{BufferRegistrar, NoopRegistrar};
+use veloq_buf::{LockedMemoryBudget, LockedMemoryPermit};
 use veloq_driver_core::{
     driver::{CancelRequest, CompletionAccess, OpToken, SharedCompletionTable},
     slot::{CheckedSlotView, SlotRegistryExt, SlotState, SlotView},
@@ -18,7 +18,7 @@ use veloq_driver_core::{
 use windows_sys::Win32::Networking::WinSock::{WSACleanup, WSADATA, WSAGetLastError, WSAStartup};
 
 use crate::{
-    config::{BorrowedRawHandle, BufferRegistrationMode, IocpConfig, IocpHandle, RawHandle},
+    config::{BorrowedRawHandle, IocpConfig, IocpHandle, RawHandle},
     error::{IocpError, IocpResult},
     ext::Extensions,
     op::{IocpOpRegistry, IocpSlotSpec},
@@ -59,17 +59,13 @@ pub(super) struct IocpRioRuntime {
 /// Winsock uses a process-wide reference count; each driver acquires one reference so failures and drops release only its own startup.
 pub(super) struct WinsockGuard;
 
-pub(super) struct LifecycleService<'view, 'state, 'registrar> {
+pub(super) struct LifecycleService<'view, 'state> {
     state: &'view mut LifecycleStateView<'state>,
-    registrar: &'registrar dyn BufferRegistrar,
 }
 
-impl<'view, 'state, 'registrar> LifecycleService<'view, 'state, 'registrar> {
-    pub(super) fn new(
-        state: &'view mut LifecycleStateView<'state>,
-        registrar: &'registrar dyn BufferRegistrar,
-    ) -> Self {
-        Self { state, registrar }
+impl<'view, 'state> LifecycleService<'view, 'state> {
+    pub(super) fn new(state: &'view mut LifecycleStateView<'state>) -> Self {
+        Self { state }
     }
 
     fn state(&self) -> &LifecycleStateView<'state> {
@@ -87,20 +83,17 @@ struct DeferredIocpCleanup {
     state: Box<IocpDriverState>,
 }
 
-// SAFETY: boxed state 只移交给一个 reaper 线程，之后由它独占轮询和销毁；状态不包含调用方借用的 registrar。
-// SAFETY: the boxed state moves to one reaper thread for exclusive polling and destruction; it contains no caller-borrowed registrar.
+// SAFETY: boxed state 只移交给一个 reaper 线程，之后由它独占轮询和销毁。
+// SAFETY: the boxed state moves to one reaper thread for exclusive polling and destruction.
 unsafe impl Send for DeferredIocpCleanup {}
 
 impl DeferredIocpCleanup {
     fn run(self) {
-        static NOOP_REGISTRAR: NoopRegistrar = NoopRegistrar;
-
         let mut state = self.state;
         let result = {
             let mut view = state.lifecycle_view();
             *view.shutting_down = true;
-            let result = LifecycleService::new(&mut view, &NOOP_REGISTRAR)
-                .drain_orphaned(IOCP_REAPER_DRAIN_TIMEOUT);
+            let result = LifecycleService::new(&mut view).drain_orphaned(IOCP_REAPER_DRAIN_TIMEOUT);
             if result.is_ok() {
                 *view.closed = true;
             }
@@ -143,10 +136,11 @@ impl IocpRioRuntime {
         port: BorrowedRawHandle<'_>,
         entries: u32,
         ext: &Extensions,
-        registration_mode: BufferRegistrationMode,
         diagnostics: IocpDriverCompletionDiagnostics,
+        budget: LockedMemoryBudget,
+        address_permit: Option<LockedMemoryPermit>,
     ) -> IocpResult<Self> {
-        let state = RioState::new(port, entries, ext, registration_mode, diagnostics)
+        let state = RioState::new(port, entries, ext, diagnostics, budget, address_permit)
             .with_ctx("entries", entries)
             .with_ctx("port_raw", port.raw().as_handle() as usize)
             .attach_note("failed to initialize RIO state")
@@ -166,19 +160,9 @@ impl IocpRioRuntime {
     pub(super) fn debug_chunk_register_attempts(&self) -> u64 {
         self.state.debug_chunk_register_attempts()
     }
-
-    pub(super) fn state_and_registrar_mut<'state, 'registrar>(
-        &'state mut self,
-        registrar: &'registrar (dyn BufferRegistrar + 'registrar),
-    ) -> (
-        &'state mut RioState,
-        &'registrar (dyn BufferRegistrar + 'registrar),
-    ) {
-        (&mut self.state, registrar)
-    }
 }
 
-impl LifecycleService<'_, '_, '_> {
+impl LifecycleService<'_, '_> {
     /// 创建初始化前使用的 completion port 句柄。
     /// Creates a completion-port handle for pre-initialization use.
     pub(super) fn create_pre_init() -> IocpResult<PreInit> {
@@ -189,7 +173,7 @@ impl LifecycleService<'_, '_, '_> {
     /// Creates a new IOCP driver instance.
     pub(super) fn build(
         config: impl AsRef<IocpConfig>,
-        registrar: &dyn BufferRegistrar,
+        address_permit: Option<LockedMemoryPermit>,
     ) -> IocpResult<IocpDriverState> {
         let cfg = config.as_ref();
         let pre = Self::create_pre_init()?;
@@ -203,9 +187,9 @@ impl LifecycleService<'_, '_, '_> {
         Self::build_from_pre_init(
             cfg.entries().get(),
             pre,
-            cfg.get_registration_mode(),
-            registrar,
             blocking_pool,
+            cfg.get_locked_memory_budget(),
+            address_permit,
         )
     }
 
@@ -214,9 +198,9 @@ impl LifecycleService<'_, '_, '_> {
     pub(super) fn build_from_pre_init(
         entries: u32,
         port_val: PreInit,
-        registration_mode: BufferRegistrationMode,
-        _registrar: &dyn BufferRegistrar,
         blocking_pool: ThreadPool,
+        budget: LockedMemoryBudget,
+        address_permit: Option<LockedMemoryPermit>,
     ) -> IocpResult<IocpDriverState> {
         let winsock = Self::start_winsock()?;
 
@@ -232,12 +216,13 @@ impl LifecycleService<'_, '_, '_> {
             RawHandle::new(IocpHandle::for_file(port_handle)).borrow(),
             entries,
             &extensions,
-            registration_mode,
             completion_diagnostics.clone(),
+            budget,
+            address_permit,
         )
         .attach_note("failed to initialize RIO runtime")?;
         let (remote_cancel_sender, remote_cancel_receiver) = mpsc::channel();
-        Ok(IocpDriverState::new(IocpDriverStateParts {
+        IocpDriverState::new(IocpDriverStateParts {
             completion: CompletionPump::new(port_val, completion_table),
             ops,
             extensions,
@@ -246,12 +231,13 @@ impl LifecycleService<'_, '_, '_> {
             remote_cancel_receiver,
             completion_diagnostics,
             rio,
+            buffer_pool_owner: None,
             handles: HandleRegistry::new(),
             shutting_down: false,
             closed: false,
             blocking_pool,
             winsock,
-        }))
+        })
     }
 
     fn start_winsock() -> IocpResult<WinsockGuard> {
@@ -490,16 +476,14 @@ impl LifecycleService<'_, '_, '_> {
     }
 
     fn cancel_op_internal(&mut self, request: CancelRequest) -> IocpResult<()> {
-        let registrar = self.registrar;
         let mut view = IocpDriverState::cancellation_view_from_lifecycle(self.state_mut());
-        let _ = CancellationService::new(&mut view, registrar).cancel_op_internal(request)?;
+        let _ = CancellationService::new(&mut view).cancel_op_internal(request)?;
         Ok(())
     }
 
     fn poll_completion(&mut self, timeout: Duration) -> IocpResult<usize> {
-        let registrar = self.registrar;
         let mut view = IocpDriverState::polling_view_from_lifecycle(self.state_mut());
-        PollingService::new(&mut view, registrar).poll_completion(timeout)
+        PollingService::new(&mut view).poll_completion(timeout)
     }
 
     fn drain_deferred_socket_cleanup(&mut self) {
@@ -508,9 +492,8 @@ impl LifecycleService<'_, '_, '_> {
     }
 
     pub(super) fn drain_orphaned(&mut self, timeout: Duration) -> IocpResult<()> {
-        let registrar = self.registrar;
         let mut view = IocpDriverState::polling_view_from_lifecycle(self.state_mut());
-        PollingService::new(&mut view, registrar).drain_orphaned(timeout)
+        PollingService::new(&mut view).drain_orphaned(timeout)
     }
 
     pub(super) fn schedule_deferred_cleanup(state: Box<IocpDriverState>) {

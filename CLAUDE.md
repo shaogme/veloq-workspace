@@ -121,7 +121,7 @@ veloq (面向用户的门面：fs / net / time / io / runtime)
 
 ### 缓冲区所有权
 
-完成式 I/O 要求 buffer 在内核操作期间保持有效且地址稳定，因此 API 是**所有权转移式**的：`AsyncBufRead::read(&self, buf: FixedBuf) -> Result<(usize, FixedBuf), _>`。`FixedBuf` 自带池上下文（`PoolKind + context`），不用侵入式前置 header，以满足 Direct I/O 的 512B/4096B 对齐要求。内存池按 worker 由 `PoolTopology`（如 `UniformSlot::new(ThreadMemoryMultiplier(nz!(4)))`）构建，新 chunk 通过 `RegistrarDispatcher` 广播给各 worker 驱动去注册（`BufferRegistrar`）。
+完成式 I/O 要求 buffer 在内核操作期间保持有效且地址稳定，因此 API 是**所有权转移式**的：`AsyncBufRead::read(&self, buf: FixedBuf) -> Result<(usize, FixedBuf), _>`。`FixedBuf` 自带池上下文（`PoolKind + context`），不用侵入式前置 header，以满足 Direct I/O 的 512B/4096B 对齐要求。内存池按 worker 由 `PoolTopology`（如 `UniformSlot::new(capacity_bytes)`）构建，新 chunk 通过 `BufferRegistrar` 注册到对应 worker 驱动。
 
 ### no_std 与 Loom
 

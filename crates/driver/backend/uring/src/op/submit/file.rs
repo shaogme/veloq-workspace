@@ -1,9 +1,7 @@
 use crate::{
     OwnedRawHandle, RawHandle,
     config::{IoFd, UringRawHandle},
-    driver::{
-        RegisteredFileEntry, SqeEnv, SqeFd,
-    },
+    driver::{RegisteredFileEntry, SqeEnv, SqeFd},
     error::{UringError, UringResult},
     op::{
         Close, Fallocate, FallocateRaw, Fsync, FsyncRaw, Open, ReadFixed, ReadRaw, SyncFileRange,
@@ -12,7 +10,7 @@ use crate::{
     },
 };
 use diagweave::prelude::*;
-use veloq_buf::{PoolKind, heap::ChunkId};
+use veloq_buf::{RegistrationCapability, heap::ChunkId};
 use veloq_driver_core::driver::SubmitTokenContext;
 use veloq_io_uring::{opcode, squeue, types};
 use veloq_std::{pin::Pin, string::ToString};
@@ -37,11 +35,9 @@ pub(crate) unsafe fn make_sqe_read_fixed(
         "uring.op.submit.make_sqe_read_fixed",
     )?;
 
-    let is_registered =
-        region_info.pool_kind == PoolKind::SlotBased && env.is_chunk_registered(region_info.id);
+    let fixed_idx = env.fixed_buffer_index(region_info)?;
 
-    if is_registered {
-        let fixed_idx = region_info.id.raw();
+    if let Some(fixed_idx) = fixed_idx {
         opcode_build(
             "uring.op.submit.read_fixed_opcode",
             sqe_with_fd!(fd, |f| unsafe {
@@ -73,11 +69,9 @@ pub(crate) unsafe fn make_sqe_read_raw(
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_read_raw", err))?;
     let fd = rw_op.fd.as_fd();
 
-    let is_registered =
-        region_info.pool_kind == PoolKind::SlotBased && env.is_chunk_registered(region_info.id);
+    let fixed_idx = env.fixed_buffer_index(region_info)?;
 
-    if is_registered {
-        let fixed_idx = region_info.id.raw();
+    if let Some(fixed_idx) = fixed_idx {
         opcode_build(
             "uring.op.submit.read_raw_fixed_opcode",
             unsafe { opcode::ReadFixed::new(types::Fd(fd), ptr, len, fixed_idx) }
@@ -112,11 +106,9 @@ pub(crate) unsafe fn make_sqe_write_fixed(
         "uring.op.submit.make_sqe_write_fixed",
     )?;
 
-    let is_registered =
-        region_info.pool_kind == PoolKind::SlotBased && env.is_chunk_registered(region_info.id);
+    let fixed_idx = env.fixed_buffer_index(region_info)?;
 
-    if is_registered {
-        let fixed_idx = region_info.id.raw();
+    if let Some(fixed_idx) = fixed_idx {
         opcode_build(
             "uring.op.submit.write_fixed_opcode",
             sqe_with_fd!(fd, |f| unsafe {
@@ -148,11 +140,9 @@ pub(crate) unsafe fn make_sqe_write_raw(
         .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_write_raw", err))?;
     let fd = rw_op.fd.as_fd();
 
-    let is_registered =
-        region_info.pool_kind == PoolKind::SlotBased && env.is_chunk_registered(region_info.id);
+    let fixed_idx = env.fixed_buffer_index(region_info)?;
 
-    if is_registered {
-        let fixed_idx = region_info.id.raw();
+    if let Some(fixed_idx) = fixed_idx {
         opcode_build(
             "uring.op.submit.write_raw_fixed_opcode",
             unsafe { opcode::WriteFixed::new(types::Fd(fd), ptr, len, fixed_idx) }
@@ -371,8 +361,8 @@ pub(crate) fn resolve_chunks_read_fixed(
     chunks: &mut [ChunkId],
 ) -> usize {
     let info = rw_op.buf.resolve_region_info();
-    if info.pool_kind == PoolKind::SlotBased {
-        chunks[0] = info.id;
+    if let RegistrationCapability::RegisteredChunk(chunk_id) = info.registration {
+        chunks[0] = chunk_id;
         1
     } else {
         0
@@ -385,8 +375,8 @@ pub(crate) fn resolve_chunks_read_raw(
     chunks: &mut [ChunkId],
 ) -> usize {
     let info = rw_op.buf.resolve_region_info();
-    if info.pool_kind == PoolKind::SlotBased {
-        chunks[0] = info.id;
+    if let RegistrationCapability::RegisteredChunk(chunk_id) = info.registration {
+        chunks[0] = chunk_id;
         1
     } else {
         0
@@ -399,8 +389,8 @@ pub(crate) fn resolve_chunks_write_fixed(
     chunks: &mut [ChunkId],
 ) -> usize {
     let info = rw_op.buf.resolve_region_info();
-    if info.pool_kind == PoolKind::SlotBased {
-        chunks[0] = info.id;
+    if let RegistrationCapability::RegisteredChunk(chunk_id) = info.registration {
+        chunks[0] = chunk_id;
         1
     } else {
         0
@@ -413,8 +403,8 @@ pub(crate) fn resolve_chunks_write_raw(
     chunks: &mut [ChunkId],
 ) -> usize {
     let info = rw_op.buf.resolve_region_info();
-    if info.pool_kind == PoolKind::SlotBased {
-        chunks[0] = info.id;
+    if let RegistrationCapability::RegisteredChunk(chunk_id) = info.registration {
+        chunks[0] = chunk_id;
         1
     } else {
         0

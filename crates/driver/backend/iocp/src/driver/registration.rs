@@ -1,7 +1,7 @@
 use veloq_std::{collections::VecDeque, io, mem, string::ToString, vec::Vec};
 
 use diagweave::prelude::*;
-use veloq_buf::heap::ChunkId;
+use veloq_buf::BufferRegistrationRequest;
 use veloq_driver_core::driver::{BufferRegistrationStatus, RegisterFd};
 use windows_sys::Win32::{
     Foundation::CloseHandle,
@@ -378,14 +378,12 @@ impl RegistrationService<'_, '_> {
     /// Registers a buffer chunk for RIO operations.
     pub(super) fn register_buffer_backend(
         &mut self,
-        id: ChunkId,
-        ptr: *const u8,
-        len: usize,
+        request: BufferRegistrationRequest,
     ) -> IocpResult<BufferRegistrationStatus> {
         self.state_mut()
             .rio
             .state_mut()
-            .register_buffer_backend(id, ptr, len)
+            .register_buffer_backend(request)
             .push_ctx("scope", "iocp/driver")
             .attach_note("failed to register RIO buffer")
             .trans()

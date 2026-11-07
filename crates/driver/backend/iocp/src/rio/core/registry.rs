@@ -26,12 +26,15 @@ use crate::{
     },
 };
 use diagweave::prelude::*;
-use veloq_buf::{FixedBuf, heap::ChunkId};
+use veloq_buf::{BufferRegistrationRequest, FixedBuf, LockedMemoryBudget, LockedMemoryPermit};
 use veloq_driver_core::slot::Generation;
 use veloq_std::{
     boxed::Box, collections::HashSet, ptr, string::ToString, time::Duration, vec::Vec,
 };
 use windows_sys::Win32::Networking::WinSock::RIO_BUF;
+
+#[cfg(test)]
+use veloq_std::mem::size_of;
 
 use super::{
     RioCompletedRequestContext, RioCompletionKind, RioOpRequestInit, RioPreparedRequestContext,
@@ -40,7 +43,6 @@ use super::{
 };
 
 pub(crate) const REGISTER_FAILURE_RETRY_COOLDOWN: Duration = Duration::from_millis(250);
-pub(crate) const HEAP_REGISTRATION_CACHE_LIMIT: usize = 1024;
 
 #[derive(Clone, Copy)]
 pub(crate) struct RioPreparedBuffer {
@@ -54,10 +56,6 @@ pub(crate) struct RioRegistrationStats {
     pub(crate) chunk_register_success: u64,
     pub(crate) chunk_register_failures: u64,
     pub(crate) chunk_register_skipped_recent_failure: u64,
-    pub(crate) heap_register_attempts: u64,
-    pub(crate) heap_register_success: u64,
-    pub(crate) heap_register_failures: u64,
-    pub(crate) heap_register_skipped_recent_failure: u64,
 }
 
 pub(crate) struct RioRegistry {
@@ -76,10 +74,31 @@ struct RioRequestContextSlot {
 }
 
 impl RioRegistry {
+    pub(crate) fn empty() -> Self {
+        Self::with_budget(32, 1, LockedMemoryBudget::default(), None)
+    }
+
+    #[cfg(test)]
     pub(crate) fn new(rq_depth: u32, addr_capacity: usize) -> Self {
+        let budget = LockedMemoryBudget::default();
+        let scratch_len = addr_capacity
+            .max(1)
+            .checked_mul(size_of::<SockAddrStorage>());
+        let address_permit = scratch_len
+            .and_then(|len| budget.try_reserve_repeated_unaligned(len, 1).ok().flatten())
+            .and_then(|mut permits| permits.pop());
+        Self::with_budget(rq_depth, addr_capacity, budget, address_permit)
+    }
+
+    pub(crate) fn with_budget(
+        rq_depth: u32,
+        addr_capacity: usize,
+        budget: LockedMemoryBudget,
+        address_permit: Option<LockedMemoryPermit>,
+    ) -> Self {
         Self {
-            addresses: RioAddressRegistry::new(addr_capacity),
-            buffers: RioBufferRegistry::new(),
+            addresses: RioAddressRegistry::new(addr_capacity, budget.clone(), address_permit),
+            buffers: RioBufferRegistry::new(budget),
             rq_depth,
             request_contexts: Vec::new(),
             request_context_free: Vec::new(),
@@ -119,21 +138,16 @@ impl RioRegistry {
         RioAddressRegistry::validate_send_addr(addr, addr_len)
     }
 
-    pub(crate) fn resolve_buffer_id(
-        &mut self,
-        buf: &FixedBuf,
-        env: RioEnv<'_>,
-    ) -> RioResult<ResolvedRioBuffer> {
-        self.buffers.resolve_buffer_id(buf, env)
+    pub(crate) fn resolve_buffer_id(&mut self, buf: &FixedBuf) -> RioResult<ResolvedRioBuffer> {
+        self.buffers.resolve_buffer_id(buf)
     }
 
     pub(crate) fn register_buffer_backend(
         &mut self,
-        id: ChunkId,
-        mem: (*const u8, usize),
+        request: BufferRegistrationRequest,
         env: RioEnv<'_>,
-    ) -> RioResult<()> {
-        self.buffers.register_buffer_backend(id, mem, env)
+    ) -> RioResult<bool> {
+        self.buffers.register_buffer_backend(request, env)
     }
 
     pub(crate) fn acquire_buffer_lease(
@@ -250,7 +264,6 @@ impl RioRegistry {
         buf: &FixedBuf,
         buf_offset: usize,
         len: u32,
-        env: RioEnv<'_>,
     ) -> RioResult<RioPreparedBuffer> {
         let buf_offset_u32 = u32::try_from(buf_offset).map_err(|_| {
             RioError::InvalidInput
@@ -261,7 +274,7 @@ impl RioRegistry {
                 .with_ctx("submission_length", len)
                 .attach_note("RIO buffer offset exceeds u32")
         })?;
-        let resolved = self.resolve_buffer_id(buf, env)?;
+        let resolved = self.resolve_buffer_id(buf)?;
         let offset = Self::checked_rio_buffer_offset(resolved.offset, buf_offset_u32, len, buf)?;
         let rio_buf = RIO_BUF {
             BufferId: resolved.id.raw(),
@@ -373,26 +386,24 @@ impl RioRegistry {
     pub(super) fn addr_slot_in_use(&self, slot: usize) -> bool {
         self.addresses.slot_in_use(slot)
     }
-
-    #[cfg(test)]
-    pub(super) fn heap_registration_count(&self) -> usize {
-        self.buffers.heap_registration_count()
-    }
 }
 
 #[cfg(test)]
 mod test_helpers {
     use super::super::submit_ops::{RioCq, RioDispatch, RioDispatchFunctions};
-    use crate::BufferRegistrationMode;
     use crate::rio::RioEnv;
-    use veloq_buf::{FixedBuf, NoopRegistrar};
+    use veloq_buf::{
+        BufPool, FixedBuf, SlotBasedPool,
+        heap::{ChunkId, ChunkInfo, GlobalAllocatorConfig, GlobalSlotPool},
+    };
     use veloq_std::{
         ffi::c_void,
         num::NonZeroUsize,
         sync::{
-            UnpoisonedMutex, UnpoisonedMutexGuard,
+            Arc, OnceLock, UnpoisonedMutex, UnpoisonedMutexGuard,
             atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
         },
+        vec,
         vec::Vec,
     };
     use windows_sys::Win32::Networking::WinSock::{
@@ -407,13 +418,46 @@ mod test_helpers {
     static RECEIVE_EX_FLAGS: AtomicUsize = AtomicUsize::new(0);
     static DISPATCH_TEST_LOCK: UnpoisonedMutex<()> = UnpoisonedMutex::new(());
     static DEREGISTERED_IDS: UnpoisonedMutex<Vec<usize>> = UnpoisonedMutex::new(Vec::new());
+    static SLOT_BACKING_POOL: OnceLock<Arc<GlobalSlotPool>> = OnceLock::new();
+    static SLOT_POOL: OnceLock<SlotBasedPool> = OnceLock::new();
 
     pub(crate) struct RioRegistryTestSupport;
 
     impl RioRegistryTestSupport {
         pub(crate) fn fixed_buf(capacity: usize, len: usize) -> FixedBuf {
-            FixedBuf::alloc_heap(NonZeroUsize::new(capacity).expect("non-zero capacity"), len)
-                .expect("heap buffer allocation failed")
+            Self::slot_pool()
+                .alloc(NonZeroUsize::new(capacity).expect("non-zero capacity"), len)
+                .expect("registered slot buffer allocation failed")
+        }
+
+        pub(crate) fn chunk_info() -> ChunkInfo {
+            Self::slot_backing_pool().global_info()
+        }
+
+        pub(crate) fn chunk_owner() -> Arc<GlobalSlotPool> {
+            Self::slot_backing_pool().clone()
+        }
+
+        fn slot_backing_pool() -> &'static Arc<GlobalSlotPool> {
+            SLOT_BACKING_POOL.get_or_init(|| {
+                Arc::new(
+                    GlobalSlotPool::new(GlobalAllocatorConfig {
+                        total_memory: 4 * 1024 * 1024,
+                    })
+                    .expect("test slot pool allocation should succeed"),
+                )
+            })
+        }
+
+        fn slot_pool() -> &'static SlotBasedPool {
+            SLOT_POOL.get_or_init(|| {
+                SlotBasedPool::with_registered_chunks(
+                    Self::slot_backing_pool().clone(),
+                    0,
+                    vec![ChunkId::ZERO],
+                )
+                .expect("test slot chunk should be registered")
+            })
         }
 
         pub(crate) fn reset_dispatch_state() {
@@ -576,10 +620,8 @@ mod test_helpers {
 
         pub(crate) fn test_env(dispatch: &RioDispatch) -> RioEnv<'_> {
             RioEnv {
-                registrar: &NoopRegistrar,
                 dispatch,
                 cq: RioCq::INVALID,
-                registration_mode: BufferRegistrationMode::Strict,
             }
         }
     }

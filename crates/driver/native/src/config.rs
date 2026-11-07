@@ -1,14 +1,20 @@
-use veloq_std::num::NonZeroU32;
+use veloq_buf::LockedMemoryBudget;
+use veloq_std::{num::NonZeroU32, nz};
 
 #[cfg(windows)]
-use veloq_std::time::Duration;
+use veloq_std::{
+    num::{NonZeroU16, NonZeroUsize},
+    time::Duration,
+};
 
 #[cfg(windows)]
-use veloq_std::num::{NonZeroU16, NonZeroUsize};
+pub use veloq_driver_iocp::IocpConfig;
 
-#[cfg(windows)]
-pub use veloq_driver_iocp::{BufferRegistrationMode, IocpConfig};
-use veloq_std::nz;
+#[cfg(not(windows))]
+pub use veloq_driver_uring::{
+    FileTableExhaustion, IoMode, ProvidedBufConfig, SetupFlags, SetupPolicy, UringConfig,
+    UringDriveLimits,
+};
 
 /// Windows-side configuration shim for the Linux io_uring drive budgets.
 #[cfg(windows)]
@@ -49,12 +55,6 @@ impl Default for UringDriveLimits {
     }
 }
 
-#[cfg(not(windows))]
-pub use veloq_driver_uring::{
-    BufferRegistrationMode, FileTableExhaustion, IoMode, ProvidedBufConfig, SetupFlags,
-    SetupPolicy, UringConfig, UringDriveLimits,
-};
-
 /// I/O submission mode.
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -71,17 +71,33 @@ pub enum IoMode {
 #[derive(Debug, Clone)]
 pub struct IocpConfig {
     /// Number of entries in the completion port.
-    pub entries: NonZeroU32,
-    /// Mode for buffer registration.
-    pub registration_mode: BufferRegistrationMode,
+    entries: NonZeroU32,
+    locked_memory_budget: LockedMemoryBudget,
 }
 
 #[cfg(not(windows))]
 impl IocpConfig {
-    /// Sets the registration mode.
-    pub fn registration_mode(mut self, mode: BufferRegistrationMode) -> Self {
-        self.registration_mode = mode;
+    pub const fn entries(&self) -> NonZeroU32 {
+        self.entries
+    }
+
+    pub fn with_entries(mut self, entries: NonZeroU32) -> Self {
+        self.entries = entries;
         self
+    }
+
+    pub fn locked_memory_limit(mut self, limit_bytes: usize) -> Self {
+        self.locked_memory_budget = LockedMemoryBudget::new(limit_bytes);
+        self
+    }
+
+    pub fn locked_memory_budget(mut self, budget: LockedMemoryBudget) -> Self {
+        self.locked_memory_budget = budget;
+        self
+    }
+
+    pub fn get_locked_memory_budget(&self) -> LockedMemoryBudget {
+        self.locked_memory_budget.clone()
     }
 }
 
@@ -90,7 +106,7 @@ impl Default for IocpConfig {
     fn default() -> Self {
         Self {
             entries: nz!(1024),
-            registration_mode: BufferRegistrationMode::Strict,
+            locked_memory_budget: LockedMemoryBudget::default(),
         }
     }
 }
@@ -138,33 +154,58 @@ impl Default for ProvidedBufConfig {
 #[derive(Debug, Clone)]
 pub struct UringConfig {
     /// I/O mode (Interrupt or Polling).
-    pub mode: IoMode,
+    mode: IoMode,
     /// Number of entries in the ring.
-    pub entries: NonZeroU32,
+    entries: NonZeroU32,
     /// Per-drive fairness and safety budgets.
-    pub drive_limits: UringDriveLimits,
-    /// Mode for buffer registration.
-    pub registration_mode: BufferRegistrationMode,
+    drive_limits: UringDriveLimits,
+    locked_memory_budget: LockedMemoryBudget,
     /// Provided-buffer ring to register for every driver worker.
-    pub provided_buffers: ProvidedBufConfig,
+    provided_buffers: ProvidedBufConfig,
     /// Size of the kernel's registered file table, independent of `entries`.
-    pub file_table_capacity: u32,
+    file_table_capacity: u32,
     /// Behaviour once `file_table_capacity` entries are in use.
-    pub file_table_exhaustion: FileTableExhaustion,
+    file_table_exhaustion: FileTableExhaustion,
 }
 
 #[cfg(windows)]
 impl UringConfig {
+    pub const fn mode(&self) -> IoMode {
+        self.mode
+    }
+
+    pub const fn entries(&self) -> NonZeroU32 {
+        self.entries
+    }
+
+    pub fn with_mode(mut self, mode: IoMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    pub fn with_entries(mut self, entries: NonZeroU32) -> Self {
+        self.entries = entries;
+        self
+    }
+
     /// Sets the Linux-side drive budget shim.
     pub fn drive_limits(mut self, limits: UringDriveLimits) -> Self {
         self.drive_limits = limits;
         self
     }
 
-    /// Sets the registration mode.
-    pub fn registration_mode(mut self, mode: BufferRegistrationMode) -> Self {
-        self.registration_mode = mode;
+    pub fn locked_memory_limit(mut self, limit_bytes: usize) -> Self {
+        self.locked_memory_budget = LockedMemoryBudget::new(limit_bytes);
         self
+    }
+
+    pub fn locked_memory_budget(mut self, budget: LockedMemoryBudget) -> Self {
+        self.locked_memory_budget = budget;
+        self
+    }
+
+    pub fn get_locked_memory_budget(&self) -> LockedMemoryBudget {
+        self.locked_memory_budget.clone()
     }
 
     /// Sets the provided-buffer ring.
@@ -193,7 +234,7 @@ impl Default for UringConfig {
             mode: IoMode::Interrupt,
             entries: nz!(1024),
             drive_limits: UringDriveLimits::default(),
-            registration_mode: BufferRegistrationMode::Strict,
+            locked_memory_budget: LockedMemoryBudget::default(),
             provided_buffers: ProvidedBufConfig::default(),
             file_table_capacity: 1024,
             file_table_exhaustion: FileTableExhaustion::Fallback,

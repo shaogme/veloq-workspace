@@ -5,10 +5,11 @@ use crate::{
     platform::receive_pump::{UdpReceiveBuildError, UdpReceiveConfig},
     slot::{self, SlotError, SlotOp, SlotPayload, SlotSpec as CoreSlotSpec},
 };
-use veloq_buf::{AnyBufPool, heap::ChunkId};
+use veloq_buf::{AnyBufPool, BufferRegistrationRequest, LockedMemoryPermit};
 use veloq_std::{
     error::Error,
     marker::PhantomData,
+    num::NonZeroUsize,
     pin::Pin,
     sync::{Arc, mpsc},
     task::{Poll, Waker},
@@ -53,16 +54,57 @@ pub type SharedSlotTable<Spec> = Arc<slot::SlotTable<Spec>>;
 pub type SharedDriverSlotTable<D> = SharedSlotTable<<D as DriverRaw>::SlotSpec>;
 pub type RemoteCancelSender = mpsc::Sender<CancelRequest>;
 
-/// 说明 buffer registration 优化是否可用于指定 chunk。
-///
-/// `Unavailable` 只表示 backend 已确认 registration 优化不可用且 raw buffer I/O
-/// 仍然安全。其它错误必须继续通过 driver 的错误类型返回。
+/// 说明预算是否允许指定 chunk 使用固定注册。 / Describes whether the budget admits fixed registration for a chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BufferRegistrationStatus {
-    /// Backend 已完成 preferred registration path；该登记在 ring 生命周期内持续有效。
+    /// 固定注册已完成，并在后端 owner 生命周期内保持有效。 / Fixed registration succeeded and remains valid for the backend owner's lifetime.
     Registered,
-    /// Registration 优化不可用，但调用方可以继续使用 raw buffer I/O。
-    Unavailable,
+    /// 预算未准入，调用方只能使用未注册 buffer 路径。 / The budget denied admission, so callers must use an unregistered buffer path.
+    BudgetExceeded,
+}
+
+/// Describes platform-neutral resources required to start each selected worker.
+/// 描述所选 worker 启动时需要的平台无关资源。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DriverStartupRequirements {
+    locked_memory_bytes_per_worker: Option<NonZeroUsize>,
+}
+
+impl DriverStartupRequirements {
+    pub const fn none() -> Self {
+        Self {
+            locked_memory_bytes_per_worker: None,
+        }
+    }
+
+    pub const fn locked_memory_per_worker(bytes: NonZeroUsize) -> Self {
+        Self {
+            locked_memory_bytes_per_worker: Some(bytes),
+        }
+    }
+
+    pub const fn locked_memory_bytes_per_worker(self) -> Option<NonZeroUsize> {
+        self.locked_memory_bytes_per_worker
+    }
+}
+
+/// Owns resources prepared by Runtime for one worker's driver startup.
+/// 持有 Runtime 为单个 worker 的驱动启动准备的资源。
+#[derive(Default)]
+pub struct DriverStartupResources {
+    locked_memory_permit: Option<LockedMemoryPermit>,
+}
+
+impl DriverStartupResources {
+    pub fn new(locked_memory_permit: Option<LockedMemoryPermit>) -> Self {
+        Self {
+            locked_memory_permit,
+        }
+    }
+
+    pub fn take_locked_memory_permit(&mut self) -> Option<LockedMemoryPermit> {
+        self.locked_memory_permit.take()
+    }
 }
 
 #[must_use]
@@ -212,6 +254,8 @@ pub trait DriverRaw: sealed::Sealed {
     type SlotSpec: CoreSlotSpec;
     type Raw: RawHandleMeta;
 
+    const BACKEND_NAME: &'static str;
+
     /// 预留一个新的操作 slot，并返回带有当前 generation 的 token。
     ///
     /// 成功时 slot 必须进入 `Reserved` 生命周期，且只由随后创建的 [`ReservedOpSlot`]
@@ -322,13 +366,11 @@ pub trait DriverRaw: sealed::Sealed {
 
     /// 注册一段可供后端定位的 buffer chunk，并返回 registration 能力状态。
     ///
-    /// `Registered` 只允许在真实注册完成后返回；`Unavailable` 只允许在 backend 确认
-    /// raw buffer I/O 仍然安全时返回。其它失败不得留下半个注册项。
+    /// `Registered` 只允许在真实注册完成后返回；预算拒绝返回 `BudgetExceeded`，OS 注册错误必须传播。
+    /// `Registered` requires a completed OS registration; budget denial returns `BudgetExceeded`, and OS errors must propagate.
     fn register_buffer_raw(
         &mut self,
-        id: ChunkId,
-        ptr: *const u8,
-        len: usize,
+        request: BufferRegistrationRequest,
     ) -> DriverResult<BufferRegistrationStatus, SlotError<Self::SlotSpec>>;
 
     /// 注册文件或 socket，并返回带 generation 的后端 descriptor。
@@ -364,6 +406,29 @@ pub trait DriverRaw: sealed::Sealed {
     ) -> DriverResult<(), SlotError<Self::SlotSpec>> {
         Ok(())
     }
+}
+
+/// Reports backend startup needs and constructs a driver from Runtime-prepared resources.
+/// 报告后端启动需求，并使用 Runtime 准备的资源构造驱动。
+pub trait DriverStartup: DriverRaw {
+    type Config: ?Sized;
+    type StartupError: DriverError;
+
+    /// Reports a uniform locked-memory requirement for the selected workers, if any.
+    /// 报告所选 worker 是否需要相同额度的锁定内存。
+    fn startup_requirements(
+        config: &Self::Config,
+        workers: &[usize],
+    ) -> DriverResult<DriverStartupRequirements, Self::StartupError>;
+
+    /// Constructs a driver using resources prepared before pool topology initialization.
+    /// 使用缓冲池 topology 初始化前准备的资源构造驱动。
+    fn new_with_startup_resources(
+        config: impl AsRef<Self::Config>,
+        resources: DriverStartupResources,
+    ) -> DriverResult<Self, Self::StartupError>
+    where
+        Self: Sized;
 }
 
 /// 使用者面向的 driver 接口。
@@ -418,11 +483,9 @@ pub trait Driver: DriverRaw {
 
     fn register_buffer(
         &mut self,
-        id: ChunkId,
-        ptr: *const u8,
-        len: usize,
+        request: BufferRegistrationRequest,
     ) -> DriverResult<BufferRegistrationStatus, SlotError<<Self as DriverRaw>::SlotSpec>> {
-        self.register_buffer_raw(id, ptr, len)
+        self.register_buffer_raw(request)
     }
 
     fn register_files<'f>(
@@ -479,7 +542,6 @@ pub trait UdpReceiveOperationBuilder: DriverRaw {
         &mut self,
         fd: IoFd<Self::Raw>,
         config: UdpReceiveConfig,
-        buffer_pool: AnyBufPool,
     ) -> DriverResult<UdpRecvMulti<Self::Raw>, Self::BuildError>;
 
     fn validate_udp_receive_config(
@@ -518,6 +580,7 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> DriverRaw
 {
     type SlotSpec = <D as DriverRaw>::SlotSpec;
     type Raw = <D as DriverRaw>::Raw;
+    const BACKEND_NAME: &'static str = D::BACKEND_NAME;
 
     fn reserve_op_raw(&mut self) -> DriverResult<OpToken, SlotError<Self::SlotSpec>> {
         self.provider.with_driver_mut(|d| d.reserve_op_raw())
@@ -580,12 +643,10 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> DriverRaw
 
     fn register_buffer_raw(
         &mut self,
-        id: ChunkId,
-        ptr: *const u8,
-        len: usize,
+        request: BufferRegistrationRequest,
     ) -> DriverResult<BufferRegistrationStatus, SlotError<Self::SlotSpec>> {
         self.provider
-            .with_driver_mut(|d| d.register_buffer(id, ptr, len))
+            .with_driver_mut(|d| d.register_buffer(request))
     }
 
     fn register_files_raw<'f>(
@@ -626,10 +687,9 @@ where
         &mut self,
         fd: IoFd<Self::Raw>,
         config: UdpReceiveConfig,
-        buffer_pool: AnyBufPool,
     ) -> DriverResult<UdpRecvMulti<Self::Raw>, Self::BuildError> {
         self.provider
-            .with_driver_mut(|driver| driver.build_udp_recv_multi(fd, config, buffer_pool))
+            .with_driver_mut(|driver| driver.build_udp_recv_multi(fd, config))
     }
 }
 
@@ -786,14 +846,6 @@ pub mod test_hooks {
             0
         }
 
-        fn debug_submission_missing_chunk_info(&self) -> u64 {
-            0
-        }
-
-        fn debug_raw_buffer_fallbacks(&self) -> u64 {
-            0
-        }
-
         fn debug_fixed_buffers_available(&self) -> bool {
             false
         }
@@ -861,16 +913,6 @@ impl<'a, D: Driver + ?Sized + DriverTestHooks, P: ContextDriverProvider<D> + ?Si
     fn debug_chunk_register_skipped_recent_failure(&self) -> u64 {
         self.provider
             .with_driver_ref(|d| d.debug_chunk_register_skipped_recent_failure())
-    }
-
-    fn debug_submission_missing_chunk_info(&self) -> u64 {
-        self.provider
-            .with_driver_ref(|d| d.debug_submission_missing_chunk_info())
-    }
-
-    fn debug_raw_buffer_fallbacks(&self) -> u64 {
-        self.provider
-            .with_driver_ref(|d| d.debug_raw_buffer_fallbacks())
     }
 
     fn debug_fixed_buffers_available(&self) -> bool {
