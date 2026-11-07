@@ -182,10 +182,10 @@ use crate::sibling::SiblingService;
 
 ### 3.2 Submodule Line Count Bounds
 
-After applying `cargo fmt`, any individual submodule source file must satisfy the following **effective lines of code (ELOC)** threshold: **70 lines ≤ ELOC ≤ 800 lines**.
+After applying `cargo fmt`, any individual submodule source file must contain at most **800 effective lines of code (ELOC)**. A file without any direct out-of-line child module must also contain at least **70 ELOC**.
 
 * **Measurement Rules**: Blank lines, single/multi-line comment blocks, and test scopes (annotated via `#[cfg(test)]`) are excluded from this count.
-* **Remediation**: Files below 70 lines should be merged into related modules; files exceeding 800 lines must be split into dedicated submodules following the Single Responsibility Principle.
+* **Remediation**: Files below 70 ELOC with no direct out-of-line child modules should be merged into related modules; files exceeding 800 ELOC must be split into dedicated submodules following the Single Responsibility Principle.
 
 ### 3.3 Module Implementation (`impl`) Scope Isolation
 

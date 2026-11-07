@@ -319,7 +319,7 @@ mod loom_impl {
                 where
                     F: FnMut($inner) -> Option<$inner>,
                 {
-                    self.inner.try_update(set_order, fetch_order, f)
+                    self.inner.fetch_update(set_order, fetch_order, f)
                 }
             }
         };
@@ -484,7 +484,7 @@ mod loom_impl {
         where
             F: FnMut(*mut T) -> Option<*mut T>,
         {
-            self.inner.try_update(set_order, fetch_order, f)
+            self.inner.fetch_update(set_order, fetch_order, f)
         }
         #[track_caller]
         pub fn with_mut<R, F: FnOnce(&mut *mut T) -> R>(&mut self, f: F) -> R {
