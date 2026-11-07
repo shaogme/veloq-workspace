@@ -1,3 +1,5 @@
 //! Platform-independent implementations shared by all driver backends.
 
-pub mod receive_pump;
+mod receive_pump;
+
+pub use receive_pump::*;

@@ -10,8 +10,8 @@ use crate::{
         payload::{AcceptPayload, KernelRef, SendToPayload, UdpRecvMulti, UdpRecvMultiPayload},
     },
 };
-use veloq_driver_core::driver::SubmitTokenContext;
-use veloq_driver_core::{op::types::UdpRecvMultiBackend, platform::receive_pump::ReceivePumpPhase};
+use veloq_driver_core::SubmitTokenContext;
+use veloq_driver_core::{ReceivePumpPhase, UdpRecvMultiBackend};
 use veloq_io_uring::{opcode, squeue, types};
 use veloq_std::{format, pin::Pin, ptr};
 
@@ -262,7 +262,7 @@ pub(crate) unsafe fn make_sqe_udp_recv_multi(
     let phase = user.receive_pump().phase();
     let (bgid, buf_size) = env.provided_buf_info(SCOPE)?;
     let required_size = UdpRecvMultiPayload::required_buffer_size(
-        user.receive_pump().config().datagram_capacity.get(),
+        user.receive_pump().config().datagram_capacity().get(),
     )?;
     if required_size > buf_size as usize {
         return Err(UringError::InvalidInput
@@ -274,7 +274,7 @@ pub(crate) unsafe fn make_sqe_udp_recv_multi(
             .with_ctx("provided_buffer_size", buf_size));
     }
     let msg = unsafe { kernel.init_recv_multi() };
-    let fd = resolve_socket_fd_direct(env.file_table(), user.fd, SCOPE)?;
+    let fd = resolve_socket_fd_direct(env.file_table(), user.fd(), SCOPE)?;
     let sqe = opcode_build(
         SCOPE,
         sqe_with_fd!(fd, |f| unsafe {

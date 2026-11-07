@@ -12,7 +12,7 @@ pub(crate) use udp_receive::UdpReceiveSubmit;
 
 use diagweave::prelude::*;
 use veloq_buf::{BufPool, FixedBuf};
-use veloq_driver_core::platform::receive_pump::{ReceivePumpConfig, ReceivePumpState, ReceiveSlot};
+use veloq_driver_core::{ReceivePumpConfig, ReceivePumpState, ReceiveSlot};
 use veloq_std::{format, num::NonZeroUsize, string::ToString, time::Duration, vec::Vec};
 use windows_sys::Win32::Networking::WinSock::{SOCKADDR, WSABUF, WSASendTo};
 
@@ -112,15 +112,14 @@ pub(crate) fn submit_recv_multi(
     }
 
     let handle = raw.borrow();
-    let config = ReceivePumpConfig {
-        kernel_capacity: NonZeroUsize::new(RECV_MULTI_INFLIGHT)
-            .expect("recv_multi inflight capacity is non-zero"),
-        queue_capacity: NonZeroUsize::new(RECV_MULTI_QUEUE_CAPACITY)
+    let config = ReceivePumpConfig::new(
+        NonZeroUsize::new(RECV_MULTI_INFLIGHT).expect("recv_multi inflight capacity is non-zero"),
+        NonZeroUsize::new(RECV_MULTI_QUEUE_CAPACITY)
             .expect("recv_multi queue capacity is non-zero"),
-        datagram_capacity: NonZeroUsize::new(RECV_MULTI_BUFFER_CAPACITY)
+        NonZeroUsize::new(RECV_MULTI_BUFFER_CAPACITY)
             .expect("recv_multi buffer capacity is non-zero"),
-        close_timeout: Duration::from_secs(5),
-    };
+        Duration::from_secs(5),
+    );
     let capacity = NonZeroUsize::new(RECV_MULTI_BUFFER_CAPACITY)
         .expect("recv_multi buffer capacity is non-zero");
     let mut buffer = ctx

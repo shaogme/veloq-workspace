@@ -1,4 +1,4 @@
-use veloq_driver_core::driver::{CancelRequest, CancelSubmitOutcome, OpToken};
+use veloq_driver_core::{CancelRequest, CancelSubmitOutcome, OpToken};
 use veloq_std::{format, vec::Vec};
 
 use crate::{

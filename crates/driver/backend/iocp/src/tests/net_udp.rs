@@ -10,8 +10,8 @@ use crate::{
 };
 use veloq_buf::{BufPool, FixedBuf, LockedMemoryBudget, UniformSlot};
 use veloq_driver_core::{
-    driver::{CancelRequest, CompletionContinuation, Driver, RegisterFd},
-    platform::receive_pump::{ReceivePumpConfig, ReceivePumpState, ReceiveSlot},
+    CancelRequest, CompletionContinuation, Driver, ReceivePumpConfig, ReceivePumpState,
+    ReceiveSlot, RegisterFd,
 };
 use veloq_std::{num::NonZeroUsize, nz, time::Duration, vec, vec::Vec};
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
@@ -31,12 +31,12 @@ fn receive_pump(buffer: FixedBuf) -> ReceivePumpState {
 }
 
 fn receive_pump_with_buffers(buffers: Vec<FixedBuf>, depth: usize) -> ReceivePumpState {
-    let config = ReceivePumpConfig {
-        kernel_capacity: NonZeroUsize::new(depth).expect("non-zero receive depth"),
-        queue_capacity: NonZeroUsize::new(1).expect("non-zero queue capacity"),
-        datagram_capacity: NonZeroUsize::new(8192).expect("non-zero datagram capacity"),
-        close_timeout: Duration::from_secs(5),
-    };
+    let config = ReceivePumpConfig::new(
+        NonZeroUsize::new(depth).expect("non-zero receive depth"),
+        NonZeroUsize::new(1).expect("non-zero queue capacity"),
+        NonZeroUsize::new(8192).expect("non-zero datagram capacity"),
+        Duration::from_secs(5),
+    );
     let slots = buffers
         .into_iter()
         .enumerate()
@@ -161,7 +161,7 @@ fn test_raw_udp_recv_multi_runs_with_multiple_overlapped_requests() {
 
         let record = wait_completion_record(&mut driver, recv_token, Duration::from_secs(5))
             .expect("raw udp_recv_multi completion missing");
-        assert_eq!(record.continuation, CompletionContinuation::More);
+        assert_eq!(record.continuation(), CompletionContinuation::More);
         let completion = complete_from_record::<UdpRecvMulti>(record);
         let (recv_result, packet) = completion.into_parts();
         let bytes = recv_result.expect("raw udp_recv_multi completion failed");

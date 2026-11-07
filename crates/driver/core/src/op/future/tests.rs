@@ -158,13 +158,13 @@ impl CompletionAccess<DummySlotSpec> for MockTable {
             return Ok(PollRecordResult::Pending);
         }
         self.ready.fetch_sub(1, Ordering::Relaxed);
-        Ok(PollRecordResult::Ready(CompletionRecord {
-            event: UserCompletionEvent::from_parts(CompletionBackend::Core, token, 0, 0),
-            payload: Some(()),
-            detail: None,
-            cleanup: CompletionCleanupGuard::none(),
-            continuation: self.next_continuation(),
-        }))
+        Ok(PollRecordResult::Ready(CompletionRecord::new(
+            UserCompletionEvent::from_parts(CompletionBackend::Core, token, 0, 0),
+            Some(()),
+            None,
+            CompletionCleanupGuard::none(),
+            self.next_continuation(),
+        )))
     }
 
     fn register_waker(&self, _token: OpToken, _waker: &Waker) -> CompletionMutationOutcome {
@@ -342,7 +342,7 @@ fn an_unfinished_detached_op_still_orphans_and_cancels_on_drop() {
         .cancels
         .try_recv()
         .expect("在途操作必须投出取消请求");
-    assert_eq!(cancel.target, test_token());
+    assert_eq!(cancel.target(), test_token());
 }
 
 /// 提交就失败的句柄从来没有过 token，drop 时同样什么都不做。
@@ -411,5 +411,5 @@ fn dropping_a_streaming_op_orphans_and_cancels() {
         .cancels
         .try_recv()
         .expect("在途的 multishot 必须投出取消请求");
-    assert_eq!(cancel.target, test_token());
+    assert_eq!(cancel.target(), test_token());
 }

@@ -1,4 +1,4 @@
-use veloq_driver_core::driver::{
+use veloq_driver_core::{
     CancelTicket, CompletionControlKind, CompletionToken, CompletionTokenClass, OpToken,
 };
 use veloq_std::{vec, vec::Vec};

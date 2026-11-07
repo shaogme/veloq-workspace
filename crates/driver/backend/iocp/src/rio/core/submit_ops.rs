@@ -13,10 +13,8 @@ use crate::{
 };
 use diagweave::prelude::*;
 use veloq_buf::FixedBuf;
-use veloq_driver_core::driver::OpToken;
-use veloq_driver_core::platform::receive_pump::{
-    ReceivePumpError, ReceivePumpState, ReceiveReplacementReservation,
-};
+use veloq_driver_core::OpToken;
+use veloq_driver_core::{ReceivePumpError, ReceivePumpState, ReceiveReplacementReservation};
 use veloq_std::string::ToString;
 
 mod dispatch;

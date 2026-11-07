@@ -1,5 +1,5 @@
 use diagweave::prelude::*;
-use veloq_driver_core::{driver::OpToken, platform::receive_pump::ReceiveRequest};
+use veloq_driver_core::{OpToken, ReceiveRequest};
 use veloq_std::{collections::HashMap, format};
 
 use crate::{
@@ -29,12 +29,14 @@ impl OverlappedRegistry {
                 .attach_note(format!("failed to reserve IOCP root owner map: {error}"))
         })?;
         for index in 0..ops.capacity() {
-            let Some((_, _, _, storage)) = ops.slot_bundle_by_index_mut(index) else {
+            let Some(bundle) = ops.slot_bundle_by_index_mut(index) else {
                 return IocpError::InvalidState
                     .with_ctx("slot_index", index)
                     .attach_note("IOCP slot registry is missing a root sidecar");
             };
-            let address = &storage.sidecar.inner as *const Overlapped as usize;
+            let address = bundle
+                .storage
+                .with_mut(|_, _, sidecar| &sidecar.inner as *const Overlapped as usize);
             roots.insert(address, index);
         }
         Ok(Self {

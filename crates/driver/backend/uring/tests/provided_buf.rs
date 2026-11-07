@@ -18,14 +18,9 @@ use veloq_std::{
 use libc::{AF_UNIX, EINVAL, ENOBUFS, SHUT_WR, SOCK_STREAM, close, shutdown, socketpair, write};
 use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
 use veloq_driver_core::{
-    driver::{
-        CancelRequest, CompletionRecord, DriveMode, Driver, DriverSubmitResult, OpToken,
-        PollRecordResult, RegisterFd,
-    },
-    op::{
-        IntoPlatformOp,
-        types::{RecvMulti as CoreRecvMulti, RecvProvided as CoreRecvProvided},
-    },
+    CancelRequest, CompletionRecordParts, DriveMode, Driver, DriverSubmitResult, IntoPlatformOp,
+    OpToken, PollRecordResult, RecvMulti as CoreRecvMulti, RecvProvided as CoreRecvProvided,
+    RegisterFd,
 };
 use veloq_driver_uring::{
     IoFd, ProvidedBufConfig, RawHandle, UringConfig, UringDriveLimits, UringDriver, UringOp,
@@ -172,7 +167,7 @@ fn arm_recv_multi(driver: &mut UringDriver<'static>, fd: IoFd) -> Option<OpToken
             }
             PollRecordResult::Ready(record) => {
                 assert_eq!(
-                    record.event.res(),
+                    record.event().res(),
                     -EINVAL,
                     "a multishot recv must not complete before any data arrives"
                 );
@@ -227,12 +222,12 @@ fn take_completion(driver: &mut UringDriver<'static>, token: OpToken) -> (i32, O
         let table = driver.completion_table();
         match table.try_take_record(token).unwrap() {
             PollRecordResult::Ready(record) => {
-                let CompletionRecord {
+                let CompletionRecordParts {
                     event,
                     payload,
                     mut cleanup,
                     ..
-                } = record;
+                } = record.into_parts();
                 cleanup.disarm();
                 let provided =
                     <RecvProvided as IntoPlatformOp<UringSlotSpec>>::try_record_from_erased(

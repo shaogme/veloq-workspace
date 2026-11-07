@@ -1,8 +1,6 @@
 use veloq_driver_core::{
-    driver::{
-        CancelMode, CancelRequest, CancelTicket, CancelTicketError, OpToken, RemoteCancelSender,
-    },
-    slot::Generation,
+    CancelMode, CancelRequest, CancelTicket, CancelTicketError, Generation, OpToken,
+    RemoteCancelSender,
 };
 use veloq_std::{collections::HashMap, sync::mpsc, vec, vec::Vec};
 
@@ -25,8 +23,8 @@ impl PendingCancel {
     #[inline]
     pub(crate) const fn new(request: CancelRequest) -> Self {
         Self {
-            target: request.target,
-            mode: request.mode,
+            target: request.target(),
+            mode: request.mode(),
         }
     }
 
@@ -366,10 +364,7 @@ impl UringCancelManager {
 #[cfg(test)]
 mod tests {
     use super::{CancelIntentError, CancelRequestDisposition, PendingCancel, UringCancelManager};
-    use veloq_driver_core::{
-        driver::{CancelMode, CancelTicket, CancelTicketError, OpToken},
-        slot::Generation,
-    };
+    use veloq_driver_core::{CancelMode, CancelTicket, CancelTicketError, Generation, OpToken};
     use veloq_std::{vec, vec::Vec};
 
     fn pending() -> PendingCancel {

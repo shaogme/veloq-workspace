@@ -15,10 +15,8 @@ use crate::{
 use diagweave::prelude::*;
 use veloq_buf::FixedBuf;
 use veloq_driver_core::{
-    driver::{CompletionCleanupGuard, CompletionSettlement, UserCompletionEvent},
-    op::types::{ProvidedBuf, UdpRecvMultiBackend},
-    platform::receive_pump::{ReceiveDelivery, ReceivePumpError, ReplacementSubmit},
-    slot::InFlightWaiting,
+    CompletionCleanupGuard, CompletionSettlement, InFlightWaiting, ProvidedBuf, ReceiveDelivery,
+    ReceivePumpError, ReplacementSubmit, UdpRecvMultiBackend, UserCompletionEvent,
 };
 use veloq_std::string::ToString;
 
@@ -266,7 +264,7 @@ impl RioReceiveReplacement {
             let raw = RawHandle::new(init.socket_inflight.socket_key());
             let submitted = hooks.try_submit_recv_multi_replacement(
                 RioTarget {
-                    fd: user.fd,
+                    fd: user.fd(),
                     handle: raw.borrow(),
                     token: init.token,
                     buf_offset: 0,

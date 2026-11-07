@@ -10,7 +10,7 @@ use crate::{
 use core::ffi::c_void;
 use diagweave::prelude::*;
 use veloq_buf::FixedBuf;
-use veloq_driver_core::{driver::OpToken, slot::Generation};
+use veloq_driver_core::{Generation, OpToken};
 use veloq_std::{boxed::Box, string::ToString};
 use windows_sys::Win32::Networking::WinSock::RIO_BUF;
 
@@ -435,7 +435,7 @@ mod tests {
     use super::super::registry::RioRegistry;
     use super::{RioCompletionKind, RioOpKind, RioOpRequestInit, RioRequestDiagnostics};
     use crate::{config::IocpHandle, rio::SocketInflightToken};
-    use veloq_driver_core::{driver::OpToken, slot::Generation};
+    use veloq_driver_core::{Generation, OpToken};
     use veloq_std::ptr;
 
     fn test_req_init(addr_slot: Option<usize>) -> RioOpRequestInit {

@@ -12,17 +12,16 @@ use veloq_std::{
     vec::Vec,
 };
 
-use veloq_driver_core::driver::{
-    CancelRequest, CompletionRecord, CompletionValue, DriveMode, Driver, DriverSubmitResult,
+use veloq_driver_core::{
+    CancelRequest, CompletionRecordParts, CompletionValue, DriveMode, Driver, DriverSubmitResult,
     PollRecordResult, RegisterFd, SubmitStatus,
 };
 
-#[cfg(feature = "test-hooks")]
-use veloq_driver_core::driver::test_hooks::{DriverTestHooks, RegisterFilesUpdateOutcome};
-use veloq_driver_core::op::{
-    IntoPlatformOp,
-    types::{Close as CoreClose, Fsync as CoreFsync, Timeout as CoreTimeout},
+use veloq_driver_core::{
+    Close as CoreClose, Fsync as CoreFsync, IntoPlatformOp, Timeout as CoreTimeout,
 };
+#[cfg(feature = "test-hooks")]
+use veloq_driver_core::{test_hooks::DriverTestHooks, test_hooks::RegisterFilesUpdateOutcome};
 use veloq_driver_uring::{
     FileTableExhaustion, IoFd, OwnedRawHandle, RawHandle, UringConfig, UringDriveLimits,
     UringDriver, UringError, UringOp, UringRawHandle, UringResult, UringSlotSpec,
@@ -64,7 +63,7 @@ fn software_timer_stays_out_of_sq_backlog_when_sq_is_full_and_cancelled() {
         driver
             .cancel_op(CancelRequest::user_visible(token))
             .expect("timer cancellation should succeed"),
-        veloq_driver_core::driver::CancelSubmitOutcome::CompletedLocally
+        veloq_driver_core::CancelSubmitOutcome::CompletedLocally
     );
 
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -77,8 +76,8 @@ fn software_timer_stays_out_of_sq_backlog_when_sq_is_full_and_cancelled() {
             }
         };
         if let Some(mut record) = record {
-            assert_eq!(record.event.res(), -libc::ECANCELED);
-            record.cleanup.disarm();
+            assert_eq!(record.event().res(), -libc::ECANCELED);
+            record.cleanup_mut().disarm();
             break;
         }
         assert!(
@@ -575,7 +574,7 @@ fn register_borrowed_files_result(
 
 fn wait_completion(
     driver: &mut UringDriver<'static>,
-    token: veloq_driver_core::driver::OpToken,
+    token: veloq_driver_core::OpToken,
     timeout: Duration,
 ) -> usize {
     let start = Instant::now();
@@ -587,14 +586,14 @@ fn wait_completion(
         let table = driver.completion_table();
         match table.try_take_record(token).unwrap() {
             PollRecordResult::Ready(record) => {
-                let CompletionRecord {
+                let CompletionRecordParts {
                     event,
                     payload: _,
                     mut detail,
                     mut cleanup,
                     // 这些测试提交的都是单发操作。
                     continuation: _,
-                } = record;
+                } = record.into_parts();
                 cleanup.disarm();
                 return detail
                     .take()
@@ -613,7 +612,7 @@ fn wait_completion(
 #[cfg(feature = "test-hooks")]
 fn wait_completion_with_driver_error(
     driver: &mut UringDriver<'static>,
-    token: veloq_driver_core::driver::OpToken,
+    token: veloq_driver_core::OpToken,
     timeout: Duration,
 ) -> (usize, Option<UringError>) {
     let start = Instant::now();
@@ -628,13 +627,13 @@ fn wait_completion_with_driver_error(
         let table = driver.completion_table();
         match table.try_take_record(token).unwrap() {
             PollRecordResult::Ready(record) => {
-                let CompletionRecord {
+                let CompletionRecordParts {
                     event,
                     payload: _,
                     mut detail,
                     mut cleanup,
                     continuation: _,
-                } = record;
+                } = record.into_parts();
                 cleanup.disarm();
                 let result = detail
                     .take()
@@ -651,10 +650,7 @@ fn wait_completion_with_driver_error(
     }
 }
 
-fn submit_test_op<T>(
-    driver: &mut UringDriver<'static>,
-    data: T,
-) -> veloq_driver_core::driver::OpToken
+fn submit_test_op<T>(driver: &mut UringDriver<'static>, data: T) -> veloq_driver_core::OpToken
 where
     T: IntoPlatformOp<UringSlotSpec>,
 {

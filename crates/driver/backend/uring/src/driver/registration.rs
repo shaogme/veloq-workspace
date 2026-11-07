@@ -14,13 +14,16 @@ use crate::{
     op::{CheckedSlotView, SlotView, UringOpRegistry, UringOpRegistryExt},
 };
 use diagweave::prelude::*;
-use veloq_buf::{AnyBufPool, BufferRegistrationRequest, LockedMemoryBudget, heap::ChunkId};
-use veloq_driver_core::driver::{BufferRegistrationStatus, OpToken, RegisterFd};
+use veloq_buf::{AnyBufPool, BufferRegistrationRequest, LockedMemoryBudget};
+use veloq_driver_core::{BufferRegistrationStatus, OpToken, RegisterFd};
 use veloq_io_uring::{KernelCapabilities, ResourceRegistration, Submitter};
 use veloq_std::{time::Duration, vec::Vec};
 
 #[cfg(feature = "test-hooks")]
-use veloq_driver_core::driver::test_hooks::RegisterFilesUpdateOutcome;
+use veloq_buf::heap::ChunkId;
+
+#[cfg(feature = "test-hooks")]
+use veloq_driver_core::test_hooks::RegisterFilesUpdateOutcome;
 
 mod buffer;
 mod file_registration;

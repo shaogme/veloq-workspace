@@ -10,7 +10,7 @@ use crate::{
     },
     error::{UringError, UringResult},
 };
-use veloq_driver_core::driver::{
+use veloq_driver_core::{
     CancelRequest, CancelSubmitOutcome, CompletionFlowOutcome, SyntheticCompletionSource,
 };
 

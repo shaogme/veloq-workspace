@@ -17,8 +17,7 @@ use diagweave::prelude::*;
 use tracing::warn;
 use veloq_buf::BufIoRangeError;
 use veloq_driver_core::{
-    DriverCoreError,
-    driver::{CompletionCleanup, CompletionCleanupGuard, SubmitTokenContext},
+    CompletionCleanup, CompletionCleanupGuard, DriverCoreError, SubmitTokenContext,
 };
 use veloq_io_uring::{opcode, squeue, types};
 use veloq_std::{io, pin::Pin, string::ToString};

@@ -24,21 +24,29 @@ pub type SlotStorageOf<T> = SlotStorage<T>;
 pub type SlotTableOf<T> = SlotTable<T>;
 
 pub struct OpEntry<P> {
-    pub platform_data: P,
+    platform_data: P,
 }
 
 impl<P> OpEntry<P> {
     pub fn new(platform_data: P) -> Self {
         Self { platform_data }
     }
+
+    pub fn platform_data(&self) -> &P {
+        &self.platform_data
+    }
+
+    pub fn platform_data_mut(&mut self) -> &mut P {
+        &mut self.platform_data
+    }
 }
 
 pub struct LocalSlot<Spec: SlotSpec> {
-    pub(crate) op: Option<RegistryOp<Spec>>,
-    pub entry: OpEntry<RegistryPlatformData<Spec>>,
-    pub storage: SlotStorageOf<Spec>,
-    pub(crate) active: bool,
-    pub(crate) generation: Generation,
+    op: Option<RegistryOp<Spec>>,
+    entry: OpEntry<RegistryPlatformData<Spec>>,
+    storage: SlotStorageOf<Spec>,
+    active: bool,
+    generation: Generation,
 }
 
 impl<Spec: SlotSpec> LocalSlot<Spec> {
@@ -58,8 +66,8 @@ impl<Spec: SlotSpec> LocalSlot<Spec> {
 pub type LocalSlots<Spec> = Box<[LocalSlot<Spec>]>;
 
 pub struct OpRegistry<Spec: SlotSpec> {
-    pub shared: Arc<SlotTableOf<Spec>>,
-    pub(crate) local: LocalSlots<Spec>,
+    shared: Arc<SlotTableOf<Spec>>,
+    local: LocalSlots<Spec>,
     local_free_head: usize,
     active_count: usize,
 }
@@ -74,12 +82,12 @@ pub struct AllocResult {
     pub handle: OpHandle,
 }
 
-pub type SlotEntryOpBundle<'a, Spec> = (
-    &'a SlotEntryOf<Spec>,
-    &'a mut OpEntry<RegistryPlatformData<Spec>>,
-    &'a mut Option<RegistryOp<Spec>>,
-    &'a mut SlotStorageOf<Spec>,
-);
+pub struct SlotEntryOpBundle<'a, Spec: SlotSpec> {
+    pub entry: &'a SlotEntryOf<Spec>,
+    pub op_entry: &'a mut OpEntry<RegistryPlatformData<Spec>>,
+    pub op: &'a mut Option<RegistryOp<Spec>>,
+    pub storage: &'a mut SlotStorageOf<Spec>,
+}
 
 pub type SlotEntryAndOpEntry<'a, Spec> = (
     &'a SlotEntryOf<Spec>,
@@ -118,6 +126,10 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         }
     }
 
+    pub fn shared_slots(&self) -> &Arc<SlotTableOf<Spec>> {
+        &self.shared
+    }
+
     pub fn alloc(
         &mut self,
         data: RegistryPlatformData<Spec>,
@@ -129,9 +141,9 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         let mut deferred_non_idle = Vec::new();
         while self.local_free_head != SlotTableOf::<Spec>::NULL_INDEX {
             let idx = self.local_free_head;
-            self.local_free_head = self.shared.slots[idx].next_free.load(Ordering::Relaxed);
+            self.local_free_head = self.shared.slots()[idx].next_free().load(Ordering::Relaxed);
 
-            let slot = &self.shared.slots[idx];
+            let slot = &self.shared.slots()[idx];
             if !slot.status(Ordering::Acquire).is_idle() {
                 // 仍在途、或信箱里压着一条未被消费的完成（detached future 随时可能来
                 // 取），两种情况都还不能复用这个 slot。
@@ -183,7 +195,7 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
 
     pub fn platform_mut(&mut self, token: OpToken) -> Option<&mut RegistryPlatformData<Spec>> {
         self.active_slot_bundle_mut(token)
-            .map(|(_, entry, _, _)| &mut entry.platform_data)
+            .map(|bundle| bundle.op_entry.platform_data_mut())
     }
 
     pub fn active_slot_and_entry_mut(
@@ -195,7 +207,7 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         }
 
         let index = token.index();
-        let slot = self.shared.slots.get(index)?;
+        let slot = self.shared.slots().get(index)?;
         let local = self.local.get_mut(index)?;
         Some((slot, &mut local.entry))
     }
@@ -204,9 +216,14 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         &mut self,
         index: usize,
     ) -> Option<SlotEntryOpBundle<'_, Spec>> {
-        let slot = self.shared.slots.get(index)?;
+        let slot = self.shared.slots().get(index)?;
         let local = self.local.get_mut(index)?;
-        Some((slot, &mut local.entry, &mut local.op, &mut local.storage))
+        Some(SlotEntryOpBundle {
+            entry: slot,
+            op_entry: &mut local.entry,
+            op: &mut local.op,
+            storage: &mut local.storage,
+        })
     }
 
     pub fn active_slot_bundle_mut(
@@ -247,7 +264,7 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
 
     pub fn is_current_active(&self, token: OpToken) -> bool {
         let (user_data, generation) = token.parts();
-        let Some(slot) = self.shared.slots.get(user_data) else {
+        let Some(slot) = self.shared.slots().get(user_data) else {
             return false;
         };
         let core = slot.load_core_state(Ordering::Acquire);
@@ -256,7 +273,7 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
 
     pub fn active_tokens(&self) -> impl Iterator<Item = OpToken> + '_ {
         self.shared
-            .slots
+            .slots()
             .iter()
             .enumerate()
             .filter_map(|(index, slot)| {
@@ -287,7 +304,7 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         let _ = local.op.take();
         let data = mem::take(&mut local.entry.platform_data);
         local.storage.reset();
-        self.shared.slots[user_data].free();
+        self.shared.slots()[user_data].free();
         self.shared.push_free(user_data);
         self.active_count = self.active_count.saturating_sub(1);
 
@@ -313,15 +330,15 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         let _ = mem::take(&mut local.entry.platform_data);
         local.storage.reset();
 
-        let cell = &self.shared.slots[user_data];
-        if cell.status(Ordering::Acquire).ready {
+        let cell = &self.shared.slots()[user_data];
+        if cell.status(Ordering::Acquire).ready() {
             // `reset` 会清掉 `ready` 标志位，但不动信箱本身。已就绪的完成必须在这里
             // 取出并清理，否则其 payload（含 `FixedBuf`）会一直压在 slot 里，直到该
             // slot 下一次被 `record_completion` 覆盖才释放——slot 若不再被复用就是
             // 永久泄漏。multishot 可能压着不止一条，所以是排空而不是取一条。
             self.shared.drain_mailbox_cleanup(cell);
         }
-        self.shared.slots[user_data].reset(generation);
+        self.shared.slots()[user_data].reset(generation);
         self.shared.push_free(user_data);
         self.active_count = self.active_count.saturating_sub(1);
     }
@@ -366,7 +383,7 @@ impl<Spec: SlotSpec> OpRegistry<Spec> {
         &mut self,
         snapshot: SlotSnapshot,
     ) -> Option<OpEntry<RegistryPlatformData<Spec>>> {
-        self.remove(OpToken::from_registry_parts(snapshot.index, snapshot.generation).ok()?)
+        self.remove(OpToken::from_registry_parts(snapshot.index(), snapshot.generation()).ok()?)
     }
 
     pub fn has_active_ops(&self) -> bool {

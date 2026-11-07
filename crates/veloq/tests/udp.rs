@@ -44,13 +44,12 @@ fn bind_udp_socket<'rt>(ctx: Ctx<'rt>, bind_addr: &str) -> UdpSocket<'rt> {
 }
 
 fn udp_receive_config(datagram_capacity: usize) -> UdpReceiveConfig {
-    UdpReceiveConfig {
-        kernel_capacity: nz!(1),
-        queue_capacity: nz!(1),
-        datagram_capacity: NonZeroUsize::new(datagram_capacity)
-            .expect("UDP datagram capacity must be non-zero"),
-        close_timeout: Duration::from_secs(1),
-    }
+    UdpReceiveConfig::new(
+        nz!(1),
+        nz!(1),
+        NonZeroUsize::new(datagram_capacity).expect("UDP datagram capacity must be non-zero"),
+        Duration::from_secs(1),
+    )
 }
 
 fn udp_receive_config_with_capacity(
@@ -58,15 +57,12 @@ fn udp_receive_config_with_capacity(
     queue_capacity: usize,
     datagram_capacity: usize,
 ) -> UdpReceiveConfig {
-    UdpReceiveConfig {
-        kernel_capacity: NonZeroUsize::new(kernel_capacity)
-            .expect("UDP kernel capacity must be non-zero"),
-        queue_capacity: NonZeroUsize::new(queue_capacity)
-            .expect("UDP queue capacity must be non-zero"),
-        datagram_capacity: NonZeroUsize::new(datagram_capacity)
-            .expect("UDP datagram capacity must be non-zero"),
-        close_timeout: Duration::from_secs(1),
-    }
+    UdpReceiveConfig::new(
+        NonZeroUsize::new(kernel_capacity).expect("UDP kernel capacity must be non-zero"),
+        NonZeroUsize::new(queue_capacity).expect("UDP queue capacity must be non-zero"),
+        NonZeroUsize::new(datagram_capacity).expect("UDP datagram capacity must be non-zero"),
+        Duration::from_secs(1),
+    )
 }
 
 #[test]

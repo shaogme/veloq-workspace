@@ -1,18 +1,17 @@
 mod future;
-pub mod types;
+mod types;
 
 pub use future::*;
-pub use types::OpKind;
+pub use types::*;
 
 use tracing::trace;
-use veloq_std::marker::Send;
+use veloq_std::marker::Send as SendBound;
 
 use crate::{
-    DriverCoreError, DriverError, DriverReport, DriverResult,
+    DriverReport, DriverResult,
     driver::{Driver, DriverRaw, DriverSubmitResult, SubmitStatus},
     slot::{SlotCompletion, SlotError, SlotOp, SlotPayload, SlotSpec},
 };
-use diagweave::prelude::*;
 
 pub trait DriverProvider: Clone + Unpin {
     type SlotSpec: SlotSpec;
@@ -38,15 +37,16 @@ pub trait DriverProvider: Clone + Unpin {
 /// 早期设计只有一个 `UserPayload`，于是 multishot 要么塞一个「空壳 item」（此后每一处
 /// payload 访问都要处理一个永远不该出现的 `None`），要么另开一个平行的 trait。拆成这两个
 /// 名字之后，两条路径都没有空状态，也不需要第二个 trait。
-pub trait IntoPlatformOp<Spec: SlotSpec>: Sized + Send {
+pub trait IntoPlatformOp<Spec: SlotSpec>: Sized + SendBound {
     /// 提交进 slot 的 payload。
-    type SubmitPayload: Send;
+    type SubmitPayload: SendBound;
     /// 每条完成记录里携带的 payload。单发操作里它就是 [`Self::SubmitPayload`]。
     /// 每条完成记录携带的 payload。multishot 的 record 必须独立拥有它，因为提交
     /// payload 会继续留在 slot 中直到逻辑操作终止。
-    type RecordPayload: Send;
-    type Output: Send;
-    type Completion: Send;
+    type RecordPayload: SendBound;
+    type Output: SendBound;
+    type Completion: SendBound;
+
     const PAYLOAD_KIND: types::OpKind;
 
     fn into_kernel_and_payload(self) -> (SlotOp<Spec>, Self::SubmitPayload);
@@ -74,7 +74,8 @@ pub trait IntoPlatformOp<Spec: SlotSpec>: Sized + Send {
         match Self::try_record_from_erased(erased) {
             Ok(payload) => {
                 let completion = Self::complete(payload, Err(report));
-                OpResult::Completed(completion.result, completion.output)
+                let (result, output) = completion.into_parts();
+                OpResult::Completed(result, output)
             }
             // 投影都失败了说明 slot 里根本不是这个操作的 payload，那比「提交失败」严重得
             // 多，报它而不是报 `report`。
@@ -93,32 +94,22 @@ pub trait IntoPlatformOp<Spec: SlotSpec>: Sized + Send {
 /// 后端为每个单发 op 实现它（宏里一行）；multishot op 不实现。
 pub trait SingleShotOp<Spec: SlotSpec>: IntoPlatformOp<Spec> {}
 
-#[inline]
-pub fn payload_projection_mismatch_report<E>(
-    expected_payload: &'static str,
-    erased_payload: &'static str,
-) -> DriverReport<E>
-where
-    E: DriverError,
-{
-    E::from_core_report(
-        DriverCoreError::Internal
-            .to_report()
-            .push_ctx("scope", "driver-core/op/payload_projection")
-            .with_ctx("expected_payload", expected_payload)
-            .with_ctx("erased_payload", erased_payload)
-            .attach_note("operation payload variant mismatch"),
-    )
-}
-
 /// A generic wrapper for IO operation data.
 pub struct Op<T> {
-    pub data: T,
+    data: T,
 }
 
 impl<T> Op<T> {
     pub fn new(data: T) -> Self {
         Self { data }
+    }
+
+    pub fn data(&self) -> &T {
+        &self.data
+    }
+
+    pub fn into_inner(self) -> T {
+        self.data
     }
 
     /// 提交一个操作，得到一个不借用驱动的句柄。
@@ -129,7 +120,7 @@ impl<T> Op<T> {
     /// 对两者完全相同。
     pub fn submit_detached<D>(self, driver: &mut D) -> DetachedOp<T, <D as DriverRaw>::SlotSpec>
     where
-        T: IntoPlatformOp<<D as DriverRaw>::SlotSpec> + Send,
+        T: IntoPlatformOp<<D as DriverRaw>::SlotSpec> + SendBound,
         D: Driver,
     {
         let data = self.data;

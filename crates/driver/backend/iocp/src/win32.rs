@@ -1,7 +1,7 @@
 use veloq_std::{boxed::Box, io::Error as IoError, mem::size_of, ptr};
 
 use crate::error::{IocpError, IocpResult};
-use veloq_driver_core::driver::CompletionToken;
+use veloq_driver_core::CompletionToken;
 use veloq_pod::{Pod, Zeroable, zeroed};
 use windows_sys::Win32::{
     Foundation::{

@@ -5,12 +5,17 @@ use crate::{
 use diagweave::prelude::*;
 use veloq_std::{
     boxed::Box,
+    format,
     sync::{Arc, atomic::Ordering},
     task::Waker,
 };
 
-#[cfg(not(feature = "loom"))]
-use veloq_std::hint::spin_loop;
+use super::{
+    AnomalyAttach, AnomalyOutcome, CompletionAnomalyKind, CompletionInput, CompletionPacket,
+    CompletionRecord, CompletionWritePermit, DriverCompletionDiagnosticsBackend, OpToken,
+    RecordCompletionOutcome, RecordCompletionResult, UserCompletionEvent,
+    types::CompletionMutationOutcome,
+};
 
 #[cfg(any(test, feature = "loom"))]
 use veloq_std::string::String;
@@ -18,14 +23,8 @@ use veloq_std::string::String;
 #[cfg(feature = "loom")]
 use veloq_std::thread::yield_now;
 
-use super::{
-    AnomalyAttach, AnomalyOutcome, CompletionAnomalyKind, CompletionInput, CompletionPacket,
-    CompletionRecord, CompletionWritePermit, DriverCompletionDiagnosticsBackend, OpToken,
-    RecordCompletionOutcome, RecordCompletionResult, UserCompletionEvent, run_completion_cleanup,
-    types::CompletionMutationOutcome,
-};
-
-pub type SharedCompletionTable<Spec> = Arc<dyn CompletionAccess<Spec>>;
+#[cfg(not(feature = "loom"))]
+use veloq_std::hint::spin_loop;
 
 /// Result of a completion poll, enabling detection of recycled slots.
 pub enum PollRecordResult<Spec: slot::SlotSpec> {
@@ -71,11 +70,22 @@ pub trait CompletionAccess<Spec: slot::SlotSpec>: Send + Sync {
     fn debug_status_string(&self, idx: usize) -> String;
 }
 
+pub type SharedCompletionTable<Spec> = Arc<dyn CompletionAccess<Spec>>;
+
 pub const CELL_STATE_IDLE: u8 = 0;
 pub const CELL_STATE_WAITING: u8 = 1;
 pub const CELL_STATE_READY: u8 = 2;
 pub const CELL_STATE_ORPHANED: u8 = 3;
 pub const CELL_STATE_BUSY: u8 = 4;
+
+/// 排空信箱之后，slot 该往哪去。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettleTarget {
+    /// 归还 slot（操作已终止时）。
+    Release,
+    /// 标记为已放弃：用户不再消费，但内核可能还会投递完成。
+    Orphan,
+}
 
 #[inline(always)]
 fn spin_yield() {
@@ -149,7 +159,7 @@ where
         &self,
         outcome: RecordCompletionOutcome,
     ) -> RecordCompletionResult<Spec> {
-        self.diagnostics.record_completion_outcome(&outcome);
+        self.diagnostics().record_completion_outcome(&outcome);
         RecordCompletionResult::Recorded(outcome)
     }
 
@@ -161,12 +171,12 @@ where
         packet: CompletionPacket<Spec>,
     ) -> RecordCompletionResult<Spec> {
         if let RecordCompletionOutcome::Rejected(anomaly_outcome) = outcome {
-            self.diagnostics.record_anomaly_outcome(
+            self.diagnostics().record_anomaly_outcome(
                 anomaly_outcome,
                 AnomalyAttach::from_raw_completion(event.raw()),
             );
         }
-        self.diagnostics.record_completion_outcome(&outcome);
+        self.diagnostics().record_completion_outcome(&outcome);
         RecordCompletionResult::Rejected {
             outcome,
             packet: Box::new(packet),
@@ -180,7 +190,7 @@ where
         outcome: CompletionMutationOutcome,
     ) -> CompletionMutationOutcome {
         if let Some(anomaly_outcome) = outcome.anomaly_outcome() {
-            self.diagnostics
+            self.diagnostics()
                 .record_anomaly_outcome(anomaly_outcome, AnomalyAttach::from_op_token(token));
         }
         outcome
@@ -190,16 +200,11 @@ where
     /// `cleanup`（完成式 I/O 下内核可能仍持有其中的资源）。
     #[inline]
     fn run_discarded_record_cleanup(&self, record: slot::MailboxRecord<Spec>) {
-        let slot::MailboxRecord {
-            event: _,
-            payload,
-            detail,
-            mut cleanup,
-            continuation: _,
-        } = record;
-        drop(payload);
-        drop(detail);
-        let _ = run_completion_cleanup(&self.diagnostics, &mut cleanup);
+        let record = record.into_parts();
+        drop(record.payload);
+        drop(record.detail);
+        let mut cleanup = record.cleanup;
+        let _ = CompletionPacket::<Spec>::run_completion_cleanup(self.diagnostics(), &mut cleanup);
     }
 
     /// 排空一个 slot 的整个信箱，逐条跑 cleanup，并把全局就绪计数扣回去。
@@ -223,17 +228,17 @@ where
     /// 其中的 fd 与 provided buffer 直接泄漏。
     fn drain_and_settle(&self, token: OpToken, target: SettleTarget) -> CompletionMutationOutcome {
         let (idx, generation) = token.parts();
-        if idx >= self.slots.len() {
+        if idx >= self.slots().len() {
             return self.recorded_mutation(token, mutation_missing(token));
         }
-        let cell = &self.slots[idx];
+        let cell = &self.slots()[idx];
 
         let claimed = loop {
             let current = cell.load_core_state(Ordering::Acquire);
             let status = current.status();
             let cell_gen = current.generation();
 
-            if status.finalizing {
+            if status.finalizing() {
                 spin_yield();
                 continue;
             }
@@ -243,11 +248,11 @@ where
                     mutation_generation_mismatch(idx, generation, cell_gen, status),
                 );
             }
-            if !status.ready {
+            if !status.ready() {
                 return self.recorded_mutation(token, mutation_non_active(idx, generation, status));
             }
 
-            match cell.core_state.compare_exchange(
+            match cell.compare_exchange_core_state(
                 current,
                 current.with_finalizing(true),
                 Ordering::AcqRel,
@@ -262,7 +267,7 @@ where
 
         publish_mailbox_release(cell, claimed, |current| {
             let next = current.with_finalizing(false).with_ready(false);
-            match (current.streaming(), target) {
+            match (current.is_streaming(), target) {
                 (true, SettleTarget::Orphan) => next.with_state(slot::SlotState::InFlightOrphaned),
                 // 仍在途但只是丢弃已发布的记录：生命周期不动，等操作自己终止。
                 (true, SettleTarget::Release) => next,
@@ -296,7 +301,7 @@ fn publish_mailbox_release(
     let mut current = claimed;
     loop {
         let next = compute(current);
-        match cell.core_state.compare_exchange_weak(
+        match cell.compare_exchange_core_state_weak(
             current,
             next,
             Ordering::AcqRel,
@@ -306,15 +311,6 @@ fn publish_mailbox_release(
             Err(actual) => current = actual,
         }
     }
-}
-
-/// 排空信箱之后，slot 该往哪去。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SettleTarget {
-    /// 归还 slot（操作已终止时）。
-    Release,
-    /// 标记为已放弃：用户不再消费，但内核可能还会投递完成。
-    Orphan,
 }
 
 impl<Spec> CompletionAccess<Spec> for slot::SlotTable<Spec>
@@ -330,10 +326,10 @@ where
         packet: CompletionPacket<Spec>,
     ) -> RecordCompletionResult<Spec> {
         let op_token = packet.token();
-        let event = packet.event;
+        let event = packet.event();
         let (idx, generation) = op_token.parts();
-        let success_outcome = recorded_outcome(&packet.input);
-        if idx >= self.slots.len() {
+        let success_outcome = recorded_outcome(packet.input());
+        if idx >= self.slots().len() {
             return self.rejected_completion(
                 RecordCompletionOutcome::Rejected(AnomalyOutcome::Missing(
                     CompletionAnomalyKind::unknown_slot(idx, generation),
@@ -342,7 +338,7 @@ where
                 packet,
             );
         }
-        let cell = &self.slots[idx];
+        let cell = &self.slots()[idx];
 
         // 判定顺序统一为 generation → finalizing → ready → state：前两项是「这条完成
         // 该不该由我处理」，`ready` 是信箱维度，最后才轮到 slot 的生命周期。
@@ -373,14 +369,14 @@ where
                 return self.rejected_completion(outcome, event, packet);
             }
 
-            if status.finalizing {
+            if status.finalizing() {
                 spin_yield();
                 continue;
             }
             // 信箱里已经压着未消费的记录时，只有 multishot 允许再追加一条。单发操作
             // 走到这里说明同一个 slot 收到了第二条完成——那是损坏，仍旧拒绝，不能因为
             // 信箱变成队列就把这道防御一起放开。
-            if status.ready && !status.streaming {
+            if status.ready() && !status.streaming() {
                 return self.rejected_completion(
                     RecordCompletionOutcome::Rejected(AnomalyOutcome::NonActive(
                         CompletionAnomalyKind::non_active(idx, generation, status),
@@ -390,8 +386,8 @@ where
                 );
             }
 
-            match status.state {
-                slot::SlotState::InFlightWaiting => match cell.core_state.compare_exchange(
+            match status.state() {
+                slot::SlotState::InFlightWaiting => match cell.compare_exchange_core_state(
                     current,
                     current.with_finalizing(true).with_generation(generation),
                     Ordering::AcqRel,
@@ -419,35 +415,34 @@ where
             }
         };
 
-        let input = packet.input;
-        let continuation = packet.continuation;
+        let packet_parts = packet.into_parts();
+        let input = packet_parts.input;
+        let continuation = packet_parts.continuation;
         cell.with_mailbox(|mailbox| {
             let record = match input {
-                CompletionInput::User(completion) => slot::MailboxRecord {
+                CompletionInput::User(completion) => slot::MailboxRecord::new(
                     event,
-                    payload: Some(completion.payload),
-                    detail: completion.detail,
-                    cleanup: completion.cleanup,
+                    Some(completion.payload),
+                    completion.detail,
+                    completion.cleanup,
                     continuation,
-                },
-                CompletionInput::Terminal(completion) => slot::MailboxRecord {
+                ),
+                CompletionInput::Terminal(completion) => slot::MailboxRecord::new(
                     event,
-                    payload: None,
-                    detail: Some(completion.detail),
-                    cleanup: completion.cleanup,
+                    None,
+                    Some(completion.detail),
+                    completion.cleanup,
                     continuation,
-                },
+                ),
             };
             mailbox.push(record);
         });
-        cell.completion_res.store(event.res(), Ordering::Release);
-        cell.completion_flags
-            .store(event.flags(), Ordering::Release);
+        cell.store_completion_event(event.res(), event.flags());
         self.note_ready_completion();
         // 发布：清掉 finalizing、立起 ready，并按这条完成的 continuation 更新 streaming。
         // 生命周期状态**保持不变**——slot 的归还由 driver 线程随后的 `finalize_*` →
         // `free()` 负责（multishot 的 `More` 完成不触发它），两件事互不依赖。
-        cell.core_state.store(
+        cell.store_core_state(
             claimed
                 .with_finalizing(false)
                 .with_ready(true)
@@ -456,7 +451,7 @@ where
             Ordering::Release,
         );
 
-        cell.completion_waker.wake();
+        cell.wake_completion();
         self.recorded_completion(success_outcome)
     }
 
@@ -466,12 +461,12 @@ where
     ) -> Result<PollRecordResult<Spec>, Report<Spec::Error>> {
         let attach = AnomalyAttach::from_op_token(token);
         let (idx, generation) = token.parts();
-        if idx >= self.slots.len() {
+        if idx >= self.slots().len() {
             let kind = CompletionAnomalyKind::unknown_slot(idx, generation);
-            self.diagnostics.record_anomaly_kind(kind, attach);
+            self.diagnostics().record_anomaly_kind(kind, attach);
             return Ok(PollRecordResult::Unavailable { kind, attach });
         }
-        let cell = &self.slots[idx];
+        let cell = &self.slots()[idx];
 
         // 消费方也要抢 `finalizing`：能否终态收尾取决于「pop 之后信箱是否还非空」，
         // 而这件事只有锁住信箱才知道，没法像单槽时代那样先用一次 CAS 把结论定死。
@@ -484,34 +479,34 @@ where
 
             if cell_gen.is_newer_than(generation) {
                 let kind = CompletionAnomalyKind::stale(idx, generation, cell_gen, status);
-                self.diagnostics.record_anomaly_kind(kind, attach);
+                self.diagnostics().record_anomaly_kind(kind, attach);
                 return Ok(PollRecordResult::Unavailable { kind, attach });
             }
 
             if cell_gen.is_older_than(generation) {
                 let kind = CompletionAnomalyKind::non_active(idx, generation, status);
-                self.diagnostics.record_anomaly_kind(kind, attach);
+                self.diagnostics().record_anomaly_kind(kind, attach);
                 return Ok(PollRecordResult::Unavailable { kind, attach });
             }
 
-            if status.finalizing {
+            if status.finalizing() {
                 spin_yield();
                 continue;
             }
 
-            if !status.ready {
+            if !status.ready() {
                 // 信箱空：仍在途（含未终止的 multishot）就是 Pending，发布完成后
                 // `record_completion` 会唤醒已注册的 waker。
-                return if status.streaming || status.state == slot::SlotState::InFlightWaiting {
+                return if status.streaming() || status.state() == slot::SlotState::InFlightWaiting {
                     Ok(PollRecordResult::Pending)
                 } else {
                     let kind = CompletionAnomalyKind::non_active(idx, generation, status);
-                    self.diagnostics.record_anomaly_kind(kind, attach);
+                    self.diagnostics().record_anomaly_kind(kind, attach);
                     Ok(PollRecordResult::Unavailable { kind, attach })
                 };
             }
 
-            match cell.core_state.compare_exchange(
+            match cell.compare_exchange_core_state(
                 current,
                 current.with_finalizing(true),
                 Ordering::AcqRel,
@@ -529,7 +524,7 @@ where
         // 发布时清掉了），只看 streaming 会推进 generation 把第二条永久锁死。
         publish_mailbox_release(cell, claimed, |current| {
             let next = current.with_finalizing(false).with_ready(remaining);
-            if !remaining && !current.streaming() {
+            if !remaining && !current.is_streaming() {
                 next.with_state(slot::SlotState::Idle)
                     .with_generation(generation.next())
             } else {
@@ -540,26 +535,20 @@ where
         match record {
             Some(record) => {
                 self.clear_ready_completion();
-                let slot::MailboxRecord {
-                    event,
-                    payload,
-                    detail,
-                    cleanup,
-                    continuation,
-                } = record;
-                Ok(PollRecordResult::Ready(CompletionRecord {
-                    event,
-                    payload,
-                    detail,
-                    cleanup,
-                    continuation,
-                }))
+                let record = record.into_parts();
+                Ok(PollRecordResult::Ready(CompletionRecord::new(
+                    record.event,
+                    record.payload,
+                    record.detail,
+                    record.cleanup,
+                    record.continuation,
+                )))
             }
             None => {
                 let report = DriverCoreError::Internal
                     .to_report()
                     .push_ctx("scope", "try_take_record")
-                    .attach_note(veloq_std::format!(
+                    .attach_note(format!(
                         "corrupt slot state: mailbox marked ready but holds no record. index: {}, generation: {}",
                         idx, generation
                     ));
@@ -570,10 +559,10 @@ where
 
     fn register_waker(&self, token: OpToken, waker: &Waker) -> CompletionMutationOutcome {
         let (idx, generation) = token.parts();
-        if idx >= self.slots.len() {
+        if idx >= self.slots().len() {
             return self.recorded_mutation(token, mutation_missing(token));
         }
-        let cell = &self.slots[idx];
+        let cell = &self.slots()[idx];
 
         let current = cell.load_core_state(Ordering::Acquire);
         let status = current.status();
@@ -586,7 +575,7 @@ where
             );
         }
 
-        cell.completion_waker.register(waker);
+        cell.register_completion_waker(waker);
 
         let current_after = cell.load_core_state(Ordering::Acquire);
         let status_after = current_after.status();
@@ -597,27 +586,28 @@ where
                 mutation_generation_mismatch(idx, generation, generation_after, status_after),
             );
         }
-        if status_after.ready {
+        if status_after.ready() {
             // 注册与发布竞速：记录已就绪，自己唤醒自己，避免丢唤醒。
             waker.wake_by_ref();
             return self.recorded_mutation(token, CompletionMutationOutcome::Applied);
         }
 
-        let outcome =
-            if status_after.finalizing || status_after.state == slot::SlotState::InFlightWaiting {
-                CompletionMutationOutcome::Applied
-            } else {
-                mutation_non_active(idx, generation, status_after)
-            };
+        let outcome = if status_after.finalizing()
+            || status_after.state() == slot::SlotState::InFlightWaiting
+        {
+            CompletionMutationOutcome::Applied
+        } else {
+            mutation_non_active(idx, generation, status_after)
+        };
         self.recorded_mutation(token, outcome)
     }
 
     fn mark_waiting(&self, token: OpToken) -> CompletionMutationOutcome {
         let (idx, generation) = token.parts();
-        if idx >= self.slots.len() {
+        if idx >= self.slots().len() {
             return self.recorded_mutation(token, mutation_missing(token));
         }
-        let cell = &self.slots[idx];
+        let cell = &self.slots()[idx];
 
         loop {
             let current = cell.load_core_state(Ordering::Acquire);
@@ -631,15 +621,15 @@ where
                 );
             }
 
-            if status.finalizing {
+            if status.finalizing() {
                 spin_yield();
                 continue;
             }
-            if status.ready {
+            if status.ready() {
                 return self.recorded_mutation(token, CompletionMutationOutcome::Applied);
             }
 
-            return match status.state {
+            return match status.state() {
                 slot::SlotState::InFlightWaiting => {
                     self.recorded_mutation(token, CompletionMutationOutcome::Applied)
                 }
@@ -658,17 +648,17 @@ where
 
     fn mark_orphaned(&self, token: OpToken) -> CompletionMutationOutcome {
         let (idx, generation) = token.parts();
-        if idx >= self.slots.len() {
+        if idx >= self.slots().len() {
             return self.recorded_mutation(token, mutation_missing(token));
         }
-        let cell = &self.slots[idx];
+        let cell = &self.slots()[idx];
 
         loop {
             let current = cell.load_core_state(Ordering::Acquire);
             let status = current.status();
             let cell_gen = current.generation();
 
-            if status.finalizing {
+            if status.finalizing() {
                 spin_yield();
                 continue;
             }
@@ -681,15 +671,14 @@ where
             // 完成已经发布：放弃它等于丢弃信箱里的记录，走 drain 才能跑 cleanup。仍在
             // 途的 multishot 由 `SettleTarget::Orphan` 收进 `InFlightOrphaned`，内核后续
             // 的完成才有 slot 可落、`orphan_cleanup` 才跑得到。
-            if status.ready {
+            if status.ready() {
                 return self.drain_and_settle(token, SettleTarget::Orphan);
             }
 
-            match status.state {
+            match status.state() {
                 slot::SlotState::InFlightWaiting => {
                     if cell
-                        .core_state
-                        .compare_exchange(
+                        .compare_exchange_core_state(
                             current,
                             current
                                 .with_state(slot::SlotState::InFlightOrphaned)
@@ -714,22 +703,26 @@ where
 
     #[cfg(any(test, feature = "loom"))]
     fn debug_status_string(&self, idx: usize) -> String {
-        veloq_std::format!(
+        format!(
             "{:?}",
-            self.slots[idx].load_core_state(Ordering::Acquire).status()
+            self.slots()[idx]
+                .load_core_state(Ordering::Acquire)
+                .status()
         )
     }
 
     #[cfg(any(test, feature = "loom"))]
     fn debug_get_state(&self, idx: usize) -> u8 {
-        let status = self.slots[idx].load_core_state(Ordering::Acquire).status();
-        if status.finalizing {
+        let status = self.slots()[idx]
+            .load_core_state(Ordering::Acquire)
+            .status();
+        if status.finalizing() {
             return CELL_STATE_BUSY;
         }
-        if status.ready {
+        if status.ready() {
             return CELL_STATE_READY;
         }
-        match status.state {
+        match status.state() {
             slot::SlotState::InFlightWaiting => CELL_STATE_WAITING,
             slot::SlotState::InFlightOrphaned => CELL_STATE_ORPHANED,
             slot::SlotState::Idle | slot::SlotState::Reserved => CELL_STATE_IDLE,

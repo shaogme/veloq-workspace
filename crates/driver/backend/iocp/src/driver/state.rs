@@ -9,9 +9,12 @@ use crate::{
     ext::Extensions,
     op::IocpOpRegistry,
 };
-use veloq_driver_core::driver::{
+use veloq_driver_core::{
     CancelRequest, DriverCompletionDiagnostics, RemoteCancelSender, RemoteWaker,
 };
+
+#[cfg(test)]
+use veloq_driver_core::{CheckedSlotView, OpToken, SlotRegistryExt};
 
 use super::{
     lifecycle::{IocpRioRuntime, WinsockGuard},
@@ -21,9 +24,7 @@ use super::{
 };
 
 #[cfg(test)]
-use crate::{config::RegisteredHandle, op::IocpSlotSpec};
-#[cfg(test)]
-use veloq_driver_core::slot::SlotTable;
+use crate::config::RegisteredHandle;
 #[cfg(test)]
 use veloq_std::sync::atomic::Ordering;
 
@@ -288,15 +289,18 @@ impl IocpDriverState {
     }
 
     #[cfg(test)]
-    pub(super) fn debug_remote_free_contains(&self, needle: usize) -> bool {
-        let mut cur = self.ops.shared.remote_free_head.load(Ordering::Acquire);
-        while cur != SlotTable::<IocpSlotSpec>::NULL_INDEX {
-            if cur == needle {
-                return true;
-            }
-            cur = self.ops.shared.slots[cur].next_free.load(Ordering::Relaxed);
-        }
-        false
+    pub(super) fn debug_slot_is_idle(&mut self, index: usize) -> bool {
+        let Some(slot) = self.ops.shared_slots().slots().get(index) else {
+            return false;
+        };
+        let Ok(token) = OpToken::from_registry_parts(index, slot.generation(Ordering::Acquire))
+        else {
+            return false;
+        };
+        matches!(
+            self.ops.checked_slot_view(token),
+            Ok(CheckedSlotView::Empty(_))
+        )
     }
 
     #[cfg(feature = "test-hooks")]

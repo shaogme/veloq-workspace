@@ -12,8 +12,8 @@ use diagweave::prelude::*;
 use tracing::debug;
 use veloq_buf::{LockedMemoryBudget, LockedMemoryPermit};
 use veloq_driver_core::{
-    driver::{CancelRequest, CompletionAccess, OpToken, SharedCompletionTable},
-    slot::{CheckedSlotView, SlotRegistryExt, SlotState, SlotView},
+    CancelRequest, CheckedSlotView, OpToken, SharedCompletionTable, SlotRegistryExt, SlotState,
+    SlotView,
 };
 use windows_sys::Win32::Networking::WinSock::{WSACleanup, WSADATA, WSAGetLastError, WSAStartup};
 
@@ -211,7 +211,7 @@ impl LifecycleService<'_, '_> {
             .attach_note("failed to load IOCP extensions")?;
         let ops = IocpOpRegistry::new(entries as usize);
         let completion_table: SharedCompletionTable<IocpSlotSpec> = ops.shared_table();
-        let completion_diagnostics = ops.shared.completion_diagnostics();
+        let completion_diagnostics = ops.shared_slots().completion_diagnostics();
         let rio = IocpRioRuntime::new(
             RawHandle::new(IocpHandle::for_file(port_handle)).borrow(),
             entries,
@@ -310,7 +310,7 @@ impl LifecycleService<'_, '_> {
             }
             // shutdown 先放弃用户可见操作再请求后端清理；生命周期标记与 RIO 用户取消标志分开，避免把最终完成误报为用户取消。
             // Shutdown abandons the user-visible operation before backend cleanup; keep this marker separate from RIO user cancellation.
-            self.state().ops.shared.mark_orphaned(token);
+            let _ = self.state().ops.shared_table().mark_orphaned(token);
             in_flight.push(token);
         }
         for token in in_flight {
@@ -357,12 +357,12 @@ impl LifecycleService<'_, '_> {
         for token in targets {
             match self.state_mut().ops.checked_slot_view(*token)? {
                 CheckedSlotView::Valid(SlotView::InFlightWaiting(slot))
-                    if Self::is_pending_iocp_target_state(slot.snapshot().status.state) =>
+                    if Self::is_pending_iocp_target_state(slot.snapshot().status().state()) =>
                 {
                     return Ok(true);
                 }
                 CheckedSlotView::Valid(SlotView::InFlightOrphaned(slot))
-                    if Self::is_pending_iocp_target_state(slot.snapshot().status.state) =>
+                    if Self::is_pending_iocp_target_state(slot.snapshot().status().state()) =>
                 {
                     return Ok(true);
                 }
@@ -527,7 +527,7 @@ impl Drop for WinsockGuard {
 #[cfg(test)]
 mod tests {
     use super::LifecycleService;
-    use veloq_driver_core::slot::SlotState;
+    use veloq_driver_core::SlotState;
 
     #[test]
     fn unrelated_control_completion_cannot_finish_strict_iocp_drain() {

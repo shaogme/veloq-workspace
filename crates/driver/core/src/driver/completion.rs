@@ -1,7 +1,3 @@
-use crate::{DriverCoreError, DriverError, DriverResult};
-
-use diagweave::prelude::*;
-
 mod cancel;
 mod event;
 mod flow;
@@ -14,9 +10,10 @@ mod types;
 #[cfg(test)]
 mod settlement_model;
 
-pub use cancel::{
-    CancelMode, CancelRequest, CancelSubmitOutcome, CancelTargetGoneReason, cancel_target_kind,
-};
+use crate::{DriverCoreError, DriverError, DriverResult};
+use diagweave::prelude::*;
+
+pub use cancel::{CancelMode, CancelRequest, CancelSubmitOutcome, CancelTargetGoneReason};
 pub use event::{
     CompletionDispatch, CompletionEnvelope, CompletionEvent, CompletionIdentity,
     CompletionIdentitySource, RawCompletion, UserCompletionEvent, UserCompletionEventMismatch,
@@ -28,8 +25,8 @@ pub use flow::{
     SyntheticCompletionSource,
 };
 pub use packet::{
-    CompletionContinuation, CompletionInput, CompletionPacket, CompletionRecord,
-    TerminalCompletion, UserCompletion, run_completion_cleanup,
+    CompletionContinuation, CompletionInput, CompletionPacket, CompletionPacketParts,
+    CompletionRecord, CompletionRecordParts, TerminalCompletion, UserCompletion,
 };
 pub use routing::{FinalizeOutcome, RoutedSlotCompletion, SlotLookupFailure};
 pub use table::{
@@ -73,7 +70,3 @@ impl CompletionValue for usize {
         }
     }
 }
-
-use event::dispatch_envelope;
-use packet::run_rejected_cleanup;
-use routing::{finalize_orphaned_checked, finalize_waiting_checked, route_user_completion};

@@ -11,10 +11,10 @@ use crate::{
 };
 use diagweave::prelude::*;
 use tracing::{debug, trace};
-use veloq_driver_core::driver::{
+use veloq_driver_core::{
     AnomalyAttach, CancelMode, CancelRequest, CancelSubmitOutcome, CancelTargetGoneReason,
     CancelTicket, CompletionAnomalyKind, CompletionBackend, CompletionToken, OpToken,
-    UserCompletionEvent, cancel_target_kind,
+    UserCompletionEvent,
 };
 use veloq_io_uring::opcode;
 use veloq_std::{format, mem, num::NonZeroU8, vec::Vec};
@@ -355,7 +355,7 @@ impl LifecycleEngine {
                             debug!(
                                 user_data,
                                 generation = generation.get(),
-                                snapshot = ?err.snapshot,
+                                snapshot = ?err.snapshot(),
                                 "reserved uring cancel could not prepare synthetic completion"
                             );
                             false
@@ -442,7 +442,7 @@ impl LifecycleEngine {
             view @ (CheckedSlotView::Missing { .. }
             | CheckedSlotView::Empty(_)
             | CheckedSlotView::Stale(_)) => {
-                let (reason, kind) = cancel_target_kind(token, view);
+                let (reason, kind) = CancelRequest::target_kind(token, view);
                 self.record_cancel_target_gone(context, reason);
                 let attach = AnomalyAttach::from_op_token(token);
                 self.completion_actions
@@ -491,7 +491,7 @@ impl LifecycleEngine {
                         CheckedSlotView::Missing { .. }
                         | CheckedSlotView::Empty(_)
                         | CheckedSlotView::Stale(_) => {
-                            Some(cancel_target_kind(request.target(), view))
+                            Some(CancelRequest::target_kind(request.target(), view))
                         }
                     }
                 };
@@ -665,5 +665,5 @@ impl LifecycleEngine {
 }
 
 fn slot_has_op<'a, S: SlotState>(slot: Slot<'a, S>) -> bool {
-    slot.snapshot().has_op
+    slot.snapshot().has_op()
 }

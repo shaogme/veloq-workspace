@@ -14,11 +14,9 @@ use crate::{
     op::{Close, RecordPolicy, Slot, UringOperationDescriptor, UringRecordItem, UringSlotSpec},
 };
 use veloq_driver_core::{
-    driver::{
-        CancelMode, CompletionCleanupGuard, CompletionContinuation, CompletionFailure,
-        CompletionSettlement, OpToken, PlatformOp, RawCompletion, UserCompletionEvent,
-    },
-    slot::{InFlightOrphaned, InFlightWaiting},
+    CancelMode, CompletionCleanupGuard, CompletionContinuation, CompletionFailure,
+    CompletionSettlement, InFlightOrphaned, InFlightWaiting, OpToken, PlatformOp, RawCompletion,
+    UserCompletionEvent,
 };
 
 pub(super) struct KernelCompletionError {
@@ -161,7 +159,7 @@ impl CompletionSlotRouter {
         // `IORING_CQE_F_MORE`：内核声明这个操作还会继续投递完成。flags 的解读到此为止，
         // core 只见 `CompletionContinuation`。
         // `IORING_CQE_F_MORE` means the kernel will continue this operation; only `CompletionContinuation` crosses into core.
-        let continuation = if cqueue::more(raw.flags) {
+        let continuation = if cqueue::more(raw.flags()) {
             CompletionContinuation::More
         } else {
             CompletionContinuation::Final
@@ -169,10 +167,10 @@ impl CompletionSlotRouter {
 
         let parts = match slot.with_access_mut(|access| {
             let descriptor = access.operation().get_ref().descriptor();
-            let final_result = unsafe { (descriptor.on_complete)(access, token, raw.res) };
-            let cleanup = (descriptor.completion_cleanup)(raw.res);
+            let final_result = unsafe { (descriptor.on_complete)(access, token, raw.res()) };
+            let cleanup = (descriptor.completion_cleanup)(raw.res());
             let record_item =
-                unsafe { (descriptor.record_item)(access, token, raw.res, raw.flags, cqe_env) };
+                unsafe { (descriptor.record_item)(access, token, raw.res(), raw.flags(), cqe_env) };
             KernelWaitingCompletionParts {
                 final_result,
                 cleanup,
@@ -209,7 +207,8 @@ impl CompletionSlotRouter {
             }
         };
         let res_code = CompletionEngine::driver_result_to_event_res(&final_result);
-        let event = UserCompletionEvent::from_parts(COMP_BACKEND_URING, token, res_code, raw.flags);
+        let event =
+            UserCompletionEvent::from_parts(COMP_BACKEND_URING, token, res_code, raw.flags());
         let res_is_ok = final_result.is_ok();
         // 没有更具体的 detail 时，用完成错误作为 detail，保持逐条路由语义。
         // When no specific detail exists, preserve per-CQE routing semantics by using the completion error as detail.

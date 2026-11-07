@@ -1,8 +1,11 @@
+mod completion;
+mod registry;
+
 use crate::{
     BorrowedRawHandle, DriverError, DriverReport, DriverResult, IoFd, OwnedRawHandle,
     RawHandleMeta,
-    op::types::UdpRecvMulti,
-    platform::receive_pump::{UdpReceiveBuildError, UdpReceiveConfig},
+    op::UdpRecvMulti,
+    platform::{UdpReceiveBuildError, UdpReceiveConfig},
     slot::{self, SlotError, SlotOp, SlotPayload, SlotSpec as CoreSlotSpec},
 };
 use veloq_buf::{AnyBufPool, BufferRegistrationRequest, LockedMemoryPermit};
@@ -17,13 +20,15 @@ use veloq_std::{
     vec::Vec,
 };
 
+pub use completion::*;
+
+pub use registry::*;
+
+#[cfg(feature = "test-hooks")]
+use test_hooks::{DriverTestHooks, RegisterFilesUpdateOutcome};
+
 #[cfg(feature = "test-hooks")]
 use veloq_std::string::String;
-
-mod completion;
-pub mod registry;
-
-pub use completion::*;
 
 pub trait PlatformOp {
     type CleanupContext<'a>
@@ -51,8 +56,189 @@ pub enum RegisterFd<'a, H: RawHandleMeta> {
 }
 
 pub type SharedSlotTable<Spec> = Arc<slot::SlotTable<Spec>>;
-pub type SharedDriverSlotTable<D> = SharedSlotTable<<D as DriverRaw>::SlotSpec>;
 pub type RemoteCancelSender = mpsc::Sender<CancelRequest>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitStatus {
+    /// Operation successfully submitted or queued. It *will* eventually produce
+    /// a completion result in the `CompletionTable`.
+    InFlight,
+    /// Operation failed synchronously and no completion result will be produced.
+    Void,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveMode {
+    /// 执行一次非阻塞的后端推进。
+    Poll,
+    /// 等待一个后端事件、内部 timer 或远端唤醒。
+    ///
+    /// `Some` 是本次调用允许的最长等待时间；`None` 表示没有外部 deadline，后端仍可
+    /// 使用内部 timer 或有限的故障探测周期决定等待上限。
+    Wait { timeout: Option<Duration> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DrivePendingWork {
+    remote_cancels: usize,
+    lifecycle_actions: usize,
+    backlog_actions: usize,
+    sqe_enters: usize,
+    cqes: usize,
+    timers: usize,
+    effects: usize,
+}
+
+impl DrivePendingWork {
+    pub const fn with_remote_cancels(mut self, count: usize) -> Self {
+        self.remote_cancels = count;
+        self
+    }
+
+    pub const fn with_lifecycle_actions(mut self, count: usize) -> Self {
+        self.lifecycle_actions = count;
+        self
+    }
+
+    pub const fn with_backlog_actions(mut self, count: usize) -> Self {
+        self.backlog_actions = count;
+        self
+    }
+
+    pub const fn with_sqe_enters(mut self, count: usize) -> Self {
+        self.sqe_enters = count;
+        self
+    }
+
+    pub const fn with_cqes(mut self, count: usize) -> Self {
+        self.cqes = count;
+        self
+    }
+
+    pub const fn with_timers(mut self, count: usize) -> Self {
+        self.timers = count;
+        self
+    }
+
+    pub const fn with_effects(mut self, count: usize) -> Self {
+        self.effects = count;
+        self
+    }
+
+    pub const fn remote_cancels(self) -> usize {
+        self.remote_cancels
+    }
+
+    pub const fn lifecycle_actions(self) -> usize {
+        self.lifecycle_actions
+    }
+
+    pub const fn backlog_actions(self) -> usize {
+        self.backlog_actions
+    }
+
+    pub const fn sqe_enters(self) -> usize {
+        self.sqe_enters
+    }
+
+    pub const fn cqes(self) -> usize {
+        self.cqes
+    }
+
+    pub const fn timers(self) -> usize {
+        self.timers
+    }
+
+    pub const fn effects(self) -> usize {
+        self.effects
+    }
+
+    /// Returns whether any source still requires another drive round.
+    pub const fn is_empty(self) -> bool {
+        self.remote_cancels == 0
+            && self.lifecycle_actions == 0
+            && self.backlog_actions == 0
+            && self.sqe_enters == 0
+            && self.cqes == 0
+            && self.timers == 0
+            && self.effects == 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DriveOutcome {
+    /// 从本次调用返回时刻起，到驱动内部下一个 timer 到期的相对时长。
+    pub next_timeout_hint: Option<Duration>,
+    /// 完成表中是否存在可以被 future 立即消费的 completion。
+    pub ready_completion: bool,
+    /// 当前是否仍有用户 I/O operation 处于 in-flight 状态。
+    ///
+    /// 该字段只用于观测和测试，不决定 idle 是否可以 Continue。
+    pub in_flight: bool,
+    /// 本轮结束时各类仍待处理工作的可观测计数。
+    pub pending_work: DrivePendingWork,
+    /// 至少一个仍有 pending work 的预算在本轮耗尽。
+    pub budget_exhausted: bool,
+    /// 调用方应继续调度至少一个非阻塞 round。
+    pub needs_next_round: bool,
+}
+
+pub trait RemoteWaker<E>: Send + Sync
+where
+    E: Error + Send + Sync + 'static,
+{
+    fn wake(&self) -> DriverResult<(), E>;
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CancelDrainOutcome {
+    pub requests: u64,
+    pub submitted: u64,
+    pub completion_pending: u64,
+    pub queued: u64,
+    pub already_pending: u64,
+    pub merged: u64,
+    pub completed_locally: u64,
+    pub target_missing: u64,
+    pub target_stale: u64,
+    pub target_corrupt: u64,
+    pub no_backend_handle: u64,
+}
+
+fn record_cancel_drain_outcome(
+    outcome: &mut CancelDrainOutcome,
+    submit_outcome: CancelSubmitOutcome,
+) {
+    outcome.requests = outcome.requests.saturating_add(1);
+    match submit_outcome {
+        CancelSubmitOutcome::Submitted => outcome.submitted = outcome.submitted.saturating_add(1),
+        CancelSubmitOutcome::CompletionPending => {
+            outcome.completion_pending = outcome.completion_pending.saturating_add(1)
+        }
+        CancelSubmitOutcome::Queued => outcome.queued = outcome.queued.saturating_add(1),
+        CancelSubmitOutcome::AlreadyPending { .. } => {
+            outcome.already_pending = outcome.already_pending.saturating_add(1)
+        }
+        CancelSubmitOutcome::Merged { .. } => outcome.merged = outcome.merged.saturating_add(1),
+        CancelSubmitOutcome::CompletedLocally => {
+            outcome.completed_locally = outcome.completed_locally.saturating_add(1)
+        }
+        CancelSubmitOutcome::TargetGone { reason } => match reason {
+            CancelTargetGoneReason::Missing => {
+                outcome.target_missing = outcome.target_missing.saturating_add(1)
+            }
+            CancelTargetGoneReason::Stale => {
+                outcome.target_stale = outcome.target_stale.saturating_add(1)
+            }
+            CancelTargetGoneReason::Corrupt => {
+                outcome.target_corrupt = outcome.target_corrupt.saturating_add(1)
+            }
+        },
+        CancelSubmitOutcome::NoBackendHandle => {
+            outcome.no_backend_handle = outcome.no_backend_handle.saturating_add(1)
+        }
+    }
+}
 
 /// 说明预算是否允许指定 chunk 使用固定注册。 / Describes whether the budget admits fixed registration for a chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,105 +327,6 @@ impl SubmittedOpSlot {
     }
 }
 
-pub struct ReservedOpSlot<'a, D: Driver + ?Sized> {
-    driver: &'a mut D,
-    token: OpToken,
-    release_on_drop: bool,
-}
-
-impl<'a, D: Driver + ?Sized> ReservedOpSlot<'a, D> {
-    fn new(driver: &'a mut D, token: OpToken) -> Self {
-        Self {
-            driver,
-            token,
-            release_on_drop: true,
-        }
-    }
-
-    pub fn token(&self) -> OpToken {
-        self.token
-    }
-
-    pub fn completion_token(&self) -> CompletionToken {
-        CompletionToken::user(self.token)
-    }
-
-    pub fn completion_table(&self) -> SharedCompletionTable<<D as DriverRaw>::SlotSpec> {
-        self.driver.completion_table()
-    }
-
-    pub fn remote_cancel_sender(&self) -> RemoteCancelSender {
-        self.driver.remote_cancel_sender()
-    }
-
-    pub fn create_waker(&self) -> Arc<dyn RemoteWaker<SlotError<<D as DriverRaw>::SlotSpec>>> {
-        self.driver.create_waker()
-    }
-
-    /// 将用户 payload 的所有权交给预留 slot。
-    ///
-    /// 必须在 [`Self::submit`] 前调用一次。提交成功或进入途中的失败都由 slot 持有
-    /// payload，直到完成记录被消费；同步失败则由 [`Self::recover_payload`] 取回。
-    pub fn set_payload(&mut self, payload: SlotPayload<<D as DriverRaw>::SlotSpec>) {
-        self.driver.slot_set_payload_raw(self.token, payload);
-    }
-
-    /// 提交预留 slot 中的操作。
-    ///
-    /// `DriverRaw::submit_op_raw` 返回 [`DriverSubmitResult::Submitted`] 或带有
-    /// [`SubmitStatus::InFlight`] 的失败时，slot 已经进入在途生命周期，本包装会自动关闭
-    /// drop 回收路径。调用者仍可调用 [`Self::persist`] 取出提交 token，但不再需要依靠它
-    /// 才能避免错误地释放在途 slot。
-    ///
-    /// 返回带有 [`SubmitStatus::Void`] 的失败时，不会产生完成记录，slot 仍由本包装持有；
-    /// 调用者应丢弃 `op_in` 中被回填的操作，并调用 [`Self::recover_payload`] 取回 payload。
-    pub fn submit(
-        &mut self,
-        op_in: &mut Option<SlotOp<<D as DriverRaw>::SlotSpec>>,
-    ) -> DriverSubmitResult<SlotError<<D as DriverRaw>::SlotSpec>> {
-        let result = self.driver.submit_op_raw(self.token, op_in);
-        if matches!(
-            &result,
-            DriverSubmitResult::Submitted(_)
-                | DriverSubmitResult::Failed {
-                    status: SubmitStatus::InFlight,
-                    ..
-                }
-        ) {
-            self.release_on_drop = false;
-        }
-        result
-    }
-
-    /// 标记在途 slot 不再由此包装释放，并返回其 token。
-    ///
-    /// [`Self::submit`] 在确认操作进入途中的结果后已经自动完成标记；此方法保留用于显式
-    /// 取出 token 的调用点，并使生命周期意图清晰。
-    pub fn persist(mut self) -> SubmittedOpSlot {
-        self.release_on_drop = false;
-        SubmittedOpSlot { token: self.token }
-    }
-
-    /// 取回同步失败操作的 payload，并释放预留 slot。
-    ///
-    /// 只允许在提交结果为 [`SubmitStatus::Void`] 时调用。释放操作必须保留 slot 信箱里已经
-    /// 发布的完成记录；同步失败按契约不会发布完成，因此 payload 是唯一需要取回的所有权。
-    pub fn recover_payload(mut self) -> Option<SlotPayload<<D as DriverRaw>::SlotSpec>> {
-        let payload = self.driver.slot_take_payload_raw(self.token);
-        self.driver.release_op_slot_raw(self.token);
-        self.release_on_drop = false;
-        payload
-    }
-}
-
-impl<D: Driver + ?Sized> Drop for ReservedOpSlot<'_, D> {
-    fn drop(&mut self) {
-        if self.release_on_drop {
-            self.driver.release_op_slot_raw(self.token);
-        }
-    }
-}
-
 #[doc(hidden)]
 pub mod sealed {
     pub trait Sealed {}
@@ -290,7 +377,7 @@ pub trait DriverRaw: sealed::Sealed {
     ///
     /// 这个方法由 [`ReservedOpSlot`] 的 drop 路径调用，也由同步失败路径在取回 payload 后
     /// 调用。实现必须令 slot 的生命周期归还 free list、减少活跃计数，并对 stale/重复
-    /// token 幂等。实现必须使用等价于 [`crate::driver::registry::OpRegistry::remove`] 的
+    /// token 幂等。实现必须使用等价于 [`crate::driver::OpRegistry::remove`] 的
     /// 释放语义：保留该 slot 信箱里已经发布的完成和 generation，不得使用会清空 ready
     /// 信箱或强制推进 generation 的 `recycle` 语义。这样即使释放与完成发布竞速，detached
     /// future 仍能消费已经到达的完成。
@@ -408,6 +495,107 @@ pub trait DriverRaw: sealed::Sealed {
     }
 }
 
+pub type SharedDriverSlotTable<D> = SharedSlotTable<<D as DriverRaw>::SlotSpec>;
+
+pub struct ReservedOpSlot<'a, D: DriverRaw + ?Sized> {
+    driver: &'a mut D,
+    token: OpToken,
+    release_on_drop: bool,
+}
+
+impl<'a, D: DriverRaw + ?Sized> ReservedOpSlot<'a, D> {
+    fn new(driver: &'a mut D, token: OpToken) -> Self {
+        Self {
+            driver,
+            token,
+            release_on_drop: true,
+        }
+    }
+
+    pub fn token(&self) -> OpToken {
+        self.token
+    }
+
+    pub fn completion_token(&self) -> CompletionToken {
+        CompletionToken::user(self.token)
+    }
+
+    pub fn completion_table(&self) -> SharedCompletionTable<<D as DriverRaw>::SlotSpec> {
+        self.driver.completion_table_raw()
+    }
+
+    pub fn remote_cancel_sender(&self) -> RemoteCancelSender {
+        self.driver.remote_cancel_sender_raw()
+    }
+
+    pub fn create_waker(&self) -> Arc<dyn RemoteWaker<SlotError<<D as DriverRaw>::SlotSpec>>> {
+        self.driver.create_waker_raw()
+    }
+
+    /// 将用户 payload 的所有权交给预留 slot。
+    ///
+    /// 必须在 [`Self::submit`] 前调用一次。提交成功或进入途中的失败都由 slot 持有
+    /// payload，直到完成记录被消费；同步失败则由 [`Self::recover_payload`] 取回。
+    pub fn set_payload(&mut self, payload: SlotPayload<<D as DriverRaw>::SlotSpec>) {
+        self.driver.slot_set_payload_raw(self.token, payload);
+    }
+
+    /// 提交预留 slot 中的操作。
+    ///
+    /// `DriverRaw::submit_op_raw` 返回 [`DriverSubmitResult::Submitted`] 或带有
+    /// [`SubmitStatus::InFlight`] 的失败时，slot 已经进入在途生命周期，本包装会自动关闭
+    /// drop 回收路径。调用者仍可调用 [`Self::persist`] 取出提交 token，但不再需要依靠它
+    /// 才能避免错误地释放在途 slot。
+    ///
+    /// 返回带有 [`SubmitStatus::Void`] 的失败时，不会产生完成记录，slot 仍由本包装持有；
+    /// 调用者应丢弃 `op_in` 中被回填的操作，并调用 [`Self::recover_payload`] 取回 payload。
+    pub fn submit(
+        &mut self,
+        op_in: &mut Option<SlotOp<<D as DriverRaw>::SlotSpec>>,
+    ) -> DriverSubmitResult<SlotError<<D as DriverRaw>::SlotSpec>> {
+        let result = self.driver.submit_op_raw(self.token, op_in);
+        if matches!(
+            &result,
+            DriverSubmitResult::Submitted(_)
+                | DriverSubmitResult::Failed {
+                    status: SubmitStatus::InFlight,
+                    ..
+                }
+        ) {
+            self.release_on_drop = false;
+        }
+        result
+    }
+
+    /// 标记在途 slot 不再由此包装释放，并返回其 token。
+    ///
+    /// [`Self::submit`] 在确认操作进入途中的结果后已经自动完成标记；此方法保留用于显式
+    /// 取出 token 的调用点，并使生命周期意图清晰。
+    pub fn persist(mut self) -> SubmittedOpSlot {
+        self.release_on_drop = false;
+        SubmittedOpSlot { token: self.token }
+    }
+
+    /// 取回同步失败操作的 payload，并释放预留 slot。
+    ///
+    /// 只允许在提交结果为 [`SubmitStatus::Void`] 时调用。释放操作必须保留 slot 信箱里已经
+    /// 发布的完成记录；同步失败按契约不会发布完成，因此 payload 是唯一需要取回的所有权。
+    pub fn recover_payload(mut self) -> Option<SlotPayload<<D as DriverRaw>::SlotSpec>> {
+        let payload = self.driver.slot_take_payload_raw(self.token);
+        self.driver.release_op_slot_raw(self.token);
+        self.release_on_drop = false;
+        payload
+    }
+}
+
+impl<D: DriverRaw + ?Sized> Drop for ReservedOpSlot<'_, D> {
+    fn drop(&mut self) {
+        if self.release_on_drop {
+            self.driver.release_op_slot_raw(self.token);
+        }
+    }
+}
+
 /// Reports backend startup needs and constructs a driver from Runtime-prepared resources.
 /// 报告后端启动需求，并使用 Runtime 准备的资源构造驱动。
 pub trait DriverStartup: DriverRaw {
@@ -520,7 +708,7 @@ pub trait Driver: DriverRaw {
         let mut outcome = CancelDrainOutcome::default();
         while let Some(request) = self.try_recv_remote_cancel_request() {
             let submit_outcome = self.cancel_op(request)?;
-            outcome.record(submit_outcome);
+            record_cancel_drain_outcome(&mut outcome, submit_outcome);
         }
         Ok(outcome)
     }
@@ -553,6 +741,7 @@ pub trait UdpReceiveOperationBuilder: DriverRaw {
 
 pub trait ContextDriverProvider<D: Driver + ?Sized> {
     fn with_driver_mut<R>(&self, f: impl FnOnce(&mut D) -> R) -> R;
+
     fn with_driver_ref<R>(&self, f: impl FnOnce(&D) -> R) -> R;
 }
 
@@ -580,6 +769,7 @@ impl<'a, D: Driver + ?Sized, P: ContextDriverProvider<D> + ?Sized> DriverRaw
 {
     type SlotSpec = <D as DriverRaw>::SlotSpec;
     type Raw = <D as DriverRaw>::Raw;
+
     const BACKEND_NAME: &'static str = D::BACKEND_NAME;
 
     fn reserve_op_raw(&mut self) -> DriverResult<OpToken, SlotError<Self::SlotSpec>> {
@@ -693,137 +883,6 @@ where
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct CancelDrainOutcome {
-    pub requests: u64,
-    pub submitted: u64,
-    pub completion_pending: u64,
-    pub queued: u64,
-    pub already_pending: u64,
-    pub merged: u64,
-    pub completed_locally: u64,
-    pub target_missing: u64,
-    pub target_stale: u64,
-    pub target_corrupt: u64,
-    pub no_backend_handle: u64,
-}
-
-impl CancelDrainOutcome {
-    fn record(&mut self, outcome: CancelSubmitOutcome) {
-        self.requests = self.requests.saturating_add(1);
-        match outcome {
-            CancelSubmitOutcome::Submitted => {
-                self.submitted = self.submitted.saturating_add(1);
-            }
-            CancelSubmitOutcome::CompletionPending => {
-                self.completion_pending = self.completion_pending.saturating_add(1);
-            }
-            CancelSubmitOutcome::Queued => {
-                self.queued = self.queued.saturating_add(1);
-            }
-            CancelSubmitOutcome::AlreadyPending { .. } => {
-                self.already_pending = self.already_pending.saturating_add(1);
-            }
-            CancelSubmitOutcome::Merged { .. } => {
-                self.merged = self.merged.saturating_add(1);
-            }
-            CancelSubmitOutcome::CompletedLocally => {
-                self.completed_locally = self.completed_locally.saturating_add(1);
-            }
-            CancelSubmitOutcome::TargetGone { reason } => match reason {
-                CancelTargetGoneReason::Missing => {
-                    self.target_missing = self.target_missing.saturating_add(1);
-                }
-                CancelTargetGoneReason::Stale => {
-                    self.target_stale = self.target_stale.saturating_add(1);
-                }
-                CancelTargetGoneReason::Corrupt => {
-                    self.target_corrupt = self.target_corrupt.saturating_add(1);
-                }
-            },
-            CancelSubmitOutcome::NoBackendHandle => {
-                self.no_backend_handle = self.no_backend_handle.saturating_add(1);
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DriveMode {
-    /// 执行一次非阻塞的后端推进。
-    Poll,
-    /// 等待一个后端事件、内部 timer 或远端唤醒。
-    ///
-    /// `Some` 是本次调用允许的最长等待时间；`None` 表示没有外部 deadline，后端仍可
-    /// 使用内部 timer 或有限的故障探测周期决定等待上限。
-    Wait { timeout: Option<Duration> },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct DrivePendingWork {
-    /// 仍待接收并转为本地取消意图的远端取消请求数量或保守下界。
-    pub remote_cancels: usize,
-    /// 仍待执行的 lifecycle action 数量。
-    pub lifecycle_actions: usize,
-    /// 仍待处理的 submission backlog action 数量。
-    pub backlog_actions: usize,
-    /// 仍需执行的 kernel enter 数量或保守下界。
-    pub sqe_enters: usize,
-    /// completion queue 中仍待收集的 CQE 数量。
-    pub cqes: usize,
-    /// timer wheel 中仍待结算的到期 timer 数量。
-    pub timers: usize,
-    /// 仍待执行的 completion effect 数量。
-    pub effects: usize,
-}
-
-impl DrivePendingWork {
-    /// Returns whether any source still requires another drive round.
-    pub const fn is_empty(self) -> bool {
-        self.remote_cancels == 0
-            && self.lifecycle_actions == 0
-            && self.backlog_actions == 0
-            && self.sqe_enters == 0
-            && self.cqes == 0
-            && self.timers == 0
-            && self.effects == 0
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct DriveOutcome {
-    /// 从本次调用返回时刻起，到驱动内部下一个 timer 到期的相对时长。
-    pub next_timeout_hint: Option<Duration>,
-    /// 完成表中是否存在可以被 future 立即消费的 completion。
-    pub ready_completion: bool,
-    /// 当前是否仍有用户 I/O operation 处于 in-flight 状态。
-    ///
-    /// 该字段只用于观测和测试，不决定 idle 是否可以 Continue。
-    pub in_flight: bool,
-    /// 本轮结束时各类仍待处理工作的可观测计数。
-    pub pending_work: DrivePendingWork,
-    /// 至少一个仍有 pending work 的预算在本轮耗尽。
-    pub budget_exhausted: bool,
-    /// 调用方应继续调度至少一个非阻塞 round。
-    pub needs_next_round: bool,
-}
-
-pub trait RemoteWaker<E>: Send + Sync
-where
-    E: Error + Send + Sync + 'static,
-{
-    fn wake(&self) -> DriverResult<(), E>;
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubmitStatus {
-    /// Operation successfully submitted or queued. It *will* eventually produce
-    /// a completion result in the `CompletionTable`.
-    InFlight,
-    /// Operation failed synchronously and no completion result will be produced.
-    Void,
-}
-
 #[cfg(feature = "test-hooks")]
 pub mod test_hooks {
     use veloq_std::{string::String, vec::Vec};
@@ -892,9 +951,6 @@ pub mod test_hooks {
         }
     }
 }
-
-#[cfg(feature = "test-hooks")]
-use test_hooks::{DriverTestHooks, RegisterFilesUpdateOutcome};
 
 #[cfg(feature = "test-hooks")]
 impl<'a, D: Driver + ?Sized + DriverTestHooks, P: ContextDriverProvider<D> + ?Sized> DriverTestHooks

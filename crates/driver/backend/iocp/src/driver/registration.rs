@@ -2,7 +2,7 @@ use veloq_std::{collections::VecDeque, io, mem, string::ToString, vec::Vec};
 
 use diagweave::prelude::*;
 use veloq_buf::BufferRegistrationRequest;
-use veloq_driver_core::driver::{BufferRegistrationStatus, RegisterFd};
+use veloq_driver_core::{BufferRegistrationStatus, RegisterFd};
 use windows_sys::Win32::{
     Foundation::CloseHandle,
     Networking::WinSock::{

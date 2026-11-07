@@ -18,7 +18,7 @@ use crate::{
     error::{UringError, UringResult},
     op::UringSlotSpec,
 };
-use veloq_driver_core::driver::{
+use veloq_driver_core::{
     CancelRequest, CancelSubmitOutcome, DriveMode, DrivePendingWork, DriverCompletionDiagnostics,
     SharedCompletionTable,
 };
@@ -105,22 +105,23 @@ impl<'ops, 'registration, 'ring, 'a> DriveContext<'ops, 'registration, 'ring, 'a
             completion.len()
         };
         let control_pending = self.control_has_pending_work();
-        DrivePendingWork {
-            remote_cancels,
-            lifecycle_actions: lifecycle.pending_action_count(),
-            backlog_actions: self.control.backlog_len(),
-            sqe_enters: if control_pending
-                || !self.ring.submission().is_empty()
-                || self.control.waker_stage_pending()
-            {
-                1
-            } else {
-                0
-            },
-            cqes,
-            timers: self.control.timers().pending_expired_len(),
-            effects: completion.pending_effects_len(),
-        }
+        DrivePendingWork::default()
+            .with_remote_cancels(remote_cancels)
+            .with_lifecycle_actions(lifecycle.pending_action_count())
+            .with_backlog_actions(self.control.backlog_len())
+            .with_sqe_enters(
+                if control_pending
+                    || !self.ring.submission().is_empty()
+                    || self.control.waker_stage_pending()
+                {
+                    1
+                } else {
+                    0
+                },
+            )
+            .with_cqes(cqes)
+            .with_timers(self.control.timers().pending_expired_len())
+            .with_effects(completion.pending_effects_len())
     }
 
     pub(crate) fn build_kernel_enter_plan(
@@ -136,7 +137,7 @@ impl<'ops, 'registration, 'ring, 'a> DriveContext<'ops, 'registration, 'ring, 'a
                     completion.sync();
                     !completion.is_empty()
                 };
-                let user_ready = self.ops.shared.has_ready_completion();
+                let user_ready = self.ops.shared_slots().has_ready_completion();
                 let waker_ready = cq_ready && !user_ready;
                 let timer_deadline = self.next_timeout_hint()?;
                 let priority = WaitPriority::resolve(

@@ -1,4 +1,4 @@
-use veloq_driver_core::driver::OpToken;
+use veloq_driver_core::OpToken;
 use veloq_std::{vec, vec::Vec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

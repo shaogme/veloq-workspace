@@ -20,9 +20,7 @@ use crate::{
 };
 use diagweave::prelude::*;
 use veloq_buf::{BufferRegistrationRequest, FixedBuf, LockedMemoryBudget, LockedMemoryPermit};
-use veloq_driver_core::{
-    driver::BufferRegistrationStatus, platform::receive_pump::ReceivePumpState,
-};
+use veloq_driver_core::{BufferRegistrationStatus, ReceivePumpState};
 use veloq_std::{time::Duration, vec::Vec};
 
 use self::core::{RioKernel, RioRegistry, RioSubmitOperations};

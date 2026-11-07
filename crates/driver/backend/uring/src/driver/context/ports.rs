@@ -14,9 +14,7 @@ use crate::{
     error::UringResult,
     op::{CheckedSlotView, SlotView, UringOp, UringOpRegistryExt, UringSlotSpec},
 };
-use veloq_driver_core::driver::{
-    DriverCompletionDiagnostics, OpToken, RegisterFd, SharedCompletionTable,
-};
+use veloq_driver_core::{DriverCompletionDiagnostics, OpToken, RegisterFd, SharedCompletionTable};
 use veloq_io_uring::{
     EnterArgs, IoUring, KernelCapabilities, SubmitError as KernelSubmitError,
     SubmitReceipt as KernelSubmitReceipt, types::SubmitArgs,
@@ -82,7 +80,7 @@ impl<'ops, 'registration, 'ring, 'a> SubmitPort<'ops, 'registration, 'ring, 'a> 
     pub(crate) fn take_operation_from_slot(&mut self, token: OpToken) -> Option<UringOp> {
         self.ops
             .active_slot_bundle_mut(token)
-            .and_then(|(_, _, operation, _)| operation.take())
+            .and_then(|bundle| bundle.op.take())
     }
 
     pub(crate) fn submission_len(&mut self) -> usize {

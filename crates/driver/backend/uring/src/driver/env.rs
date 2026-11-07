@@ -14,7 +14,7 @@ use crate::{
     op::CompletionCleanupHintFn,
 };
 use veloq_buf::heap::ChunkId;
-use veloq_driver_core::driver::{CancelTicket, OpToken};
+use veloq_driver_core::{CancelTicket, OpToken};
 use veloq_io_uring::squeue;
 use veloq_std::time::Duration;
 use veloq_wheel::TimerId;

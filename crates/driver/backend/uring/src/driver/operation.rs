@@ -15,7 +15,7 @@ use crate::{
     error::{UringError, UringResult},
     op::{CheckedSlotView, SlotView, UringOpRegistry, UringOpRegistryExt, UringSlotSpec},
 };
-use veloq_driver_core::driver::{OpToken, SharedCompletionTable};
+use veloq_driver_core::{OpToken, SharedCompletionTable};
 use veloq_wheel::TimerId;
 
 /// operation registry 的唯一 owner。

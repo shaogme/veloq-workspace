@@ -14,13 +14,9 @@ use crate::{
 use diagweave::prelude::*;
 use veloq_buf::FixedBuf;
 use veloq_driver_core::{
-    driver::{CompletionCleanupGuard, CompletionContinuation, CompletionSettlement},
-    op::types::UdpRecvMultiBackend,
-    platform::receive_pump::{
-        ReceiveCompletion, ReceiveCompletionDiagnostics, ReceivePumpError, ReceivePumpEvent,
-        ReceiveRequest,
-    },
-    slot::InFlightWaiting,
+    CompletionCleanupGuard, CompletionContinuation, CompletionSettlement, InFlightWaiting,
+    ReceiveCompletion, ReceiveCompletionDiagnostics, ReceivePumpError, ReceivePumpEvent,
+    ReceiveRequest, UdpRecvMultiBackend,
 };
 use veloq_pod::bytes_of;
 use veloq_std::{

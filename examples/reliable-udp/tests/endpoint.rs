@@ -1000,12 +1000,12 @@ fn endpoint_proxy_delivers_single_data_packet_within_15s() {
                     .await
                     .expect("proxy ready");
                 let mut receive = raw_client
-                    .receiver(UdpReceiveConfig {
-                        kernel_capacity: nz!(1),
-                        queue_capacity: nz!(2),
-                        datagram_capacity: nz!(1_200),
-                        close_timeout: Duration::from_secs(1),
-                    })
+                    .receiver(UdpReceiveConfig::new(
+                        nz!(1),
+                        nz!(2),
+                        nz!(1_200),
+                        Duration::from_secs(1),
+                    ))
                     .expect("create handshake receiver");
                 receive.ready().await.expect("arm handshake receive");
                 trace!(

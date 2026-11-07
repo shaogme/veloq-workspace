@@ -15,7 +15,7 @@ use crate::{
     },
     op::CompletionCleanupHintFn,
 };
-use veloq_driver_core::driver::{
+use veloq_driver_core::{
     CancelRequest, CancelTicket, CompletionToken, OpToken, RawCompletion, RemoteCancelSender,
 };
 use veloq_io_uring::SubmissionQueue;
@@ -546,10 +546,7 @@ mod tests {
         lifecycle::CancellationPhase,
         registration::OwnedFdOwnershipTicket,
     };
-    use veloq_driver_core::{
-        driver::{CancelMode, CancelTicket, CompletionToken, OpToken},
-        slot::Generation,
-    };
+    use veloq_driver_core::{CancelMode, CancelTicket, CompletionToken, Generation, OpToken};
     use veloq_std::{vec, vec::Vec};
 
     fn token(index: usize, generation: u32) -> OpToken {

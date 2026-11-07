@@ -24,10 +24,7 @@ use crate::{
     },
     win32::OwnedHandle,
 };
-use veloq_driver_core::{
-    RawHandleMeta,
-    driver::{CompletionCleanup, CompletionCleanupGuard},
-};
+use veloq_driver_core::{CompletionCleanup, CompletionCleanupGuard, RawHandleMeta};
 
 fn make_blocking_completion(
     header: &mut OverlappedEntry,

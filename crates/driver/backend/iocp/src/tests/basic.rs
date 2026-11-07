@@ -9,10 +9,7 @@ use crate::{
     op::{Close, Fsync, IocpSlotSpec, RecvMulti},
     tests::{submit_test_op, wait_completion},
 };
-use veloq_driver_core::{
-    driver::{Driver, DriverSubmitResult, RegisterFd, SubmitStatus},
-    op::IntoPlatformOp,
-};
+use veloq_driver_core::{Driver, DriverSubmitResult, IntoPlatformOp, RegisterFd, SubmitStatus};
 use veloq_std::{fs::File, mem, time::Duration, vec};
 use windows_sys::Win32::Networking::WinSock::{WSACleanup, WSADATA, WSAStartup};
 

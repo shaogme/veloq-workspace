@@ -13,7 +13,7 @@ use crate::{
     },
 };
 
-use veloq_driver_core::{driver::CompletionCleanupGuard, op::OpKind};
+use veloq_driver_core::{CompletionCleanupGuard, OpKind};
 use veloq_std::{mem::size_of, net::SocketAddr};
 use windows_sys::Win32::Networking::WinSock::{SOCKADDR_IN, SOCKADDR_IN6};
 

@@ -412,7 +412,7 @@ fn errno_result() -> i32 {
 mod tests {
     use super::*;
     use core::sync::atomic::AtomicU32;
-    use veloq_std::{string::ToString, sync::Arc, thread, time::Duration as StdDuration};
+    use veloq_std::{string::ToString, sync::Arc, thread};
 
     #[test]
     fn expected_mismatch_returns_woken() {
@@ -452,10 +452,15 @@ mod tests {
             )
         })
         .expect("thread spawn failed");
-        thread::sleep(StdDuration::from_millis(5)).expect("thread sleep failed");
-        let woken = unsafe { wake(value.as_ref() as *const AtomicU32 as *const u32, 1) }
-            .expect("wake failed");
-        assert!(woken <= 1);
+        let woken = loop {
+            let woken = unsafe { wake(value.as_ref() as *const AtomicU32 as *const u32, 1) }
+                .expect("wake failed");
+            if woken > 0 {
+                break woken;
+            }
+            thread::yield_now().expect("thread yield failed");
+        };
+        assert_eq!(woken, 1);
         assert_eq!(
             waiter.join().expect("waiter panicked"),
             Ok(WaitOutcome::Woken)

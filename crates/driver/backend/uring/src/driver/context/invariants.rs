@@ -17,10 +17,7 @@ use crate::{
 };
 
 #[cfg(any(test, feature = "test-hooks"))]
-use veloq_driver_core::{
-    driver::{CancelTicket, CompletionToken, OpToken},
-    slot::SlotSnapshot,
-};
+use veloq_driver_core::{CancelTicket, CompletionToken, OpToken, SlotSnapshot};
 
 #[cfg(any(test, feature = "test-hooks"))]
 use veloq_std::{collections::HashSet, vec::Vec};

@@ -600,7 +600,7 @@ mod tests {
     };
     use diagweave::prelude::*;
     use veloq_buf::{BufferRegion, FixedBuf};
-    use veloq_driver_core::{driver::OpToken, slot::Generation};
+    use veloq_driver_core::{Generation, OpToken};
     use veloq_std::cell::Cell;
 
     struct RequestContextCase {

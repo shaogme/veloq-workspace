@@ -14,16 +14,10 @@ use windows_sys::Win32::{
 
 use diagweave::prelude::*;
 use veloq_driver_core::{
-    driver::{
-        AnomalyAttach, CompletionAnomalyKind, CompletionCleanupGuard, CompletionContinuation,
-        CompletionSettlement, CompletionToken, OpToken, UserCompletionEvent,
-    },
-    op::types::UdpRecvMultiBackend,
-    platform::receive_pump::{
-        ReceiveCompletion, ReceiveDelivery, ReceivePumpError, ReceivePumpEvent,
-        ReceiveReplacementReservation, ReceiveRequest, ReplacementSubmit,
-    },
-    slot::InFlightWaiting,
+    AnomalyAttach, CompletionAnomalyKind, CompletionCleanupGuard, CompletionContinuation,
+    CompletionSettlement, CompletionToken, InFlightWaiting, OpToken, ReceiveCompletion,
+    ReceiveDelivery, ReceivePumpError, ReceivePumpEvent, ReceiveReplacementReservation,
+    ReceiveRequest, ReplacementSubmit, UdpRecvMultiBackend, UserCompletionEvent,
 };
 
 use crate::{
@@ -447,9 +441,7 @@ impl<'a> RawUdpCompletion<'a> {
         Self::poll_final_work(pump)
     }
 
-    fn poll_final_work(
-        pump: &mut veloq_driver_core::platform::receive_pump::ReceivePumpState,
-    ) -> IocpResult<RawUdpWork> {
+    fn poll_final_work(pump: &mut veloq_driver_core::ReceivePumpState) -> IocpResult<RawUdpWork> {
         let event = pump.poll_final().map_err(Self::receive_pump_report)?;
         match event {
             ReceivePumpEvent::Final { error } => Ok(RawUdpWork::Final(error)),

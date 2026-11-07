@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use super::CompletionContinuation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,111 +117,113 @@ fn settle_completion(input: ConsumedCompletion) -> CompletionSettlement {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+#[test]
+fn final_on_complete_failure_is_a_terminal_settlement() {
+    let settlement = settle_completion(ConsumedCompletion {
+        continuation: CompletionContinuation::Final,
+        failure: Some(HookFailure::OnComplete),
+        has_payload: true,
+        has_provided_buffer: true,
+    });
 
-    #[test]
-    fn final_on_complete_failure_is_a_terminal_settlement() {
+    assert_eq!(settlement.outcome, SettlementOutcome::TerminalFailure);
+    assert_eq!(settlement.slot, SlotDisposition::Released);
+    assert_eq!(settlement.operation, ResourceDisposition::Released);
+    assert_eq!(settlement.completion_payload, ResourceDisposition::Released);
+    assert_eq!(settlement.cleanup_runs, 1);
+    assert_eq!(settlement.provided_buffer_returns, 1);
+    assert_eq!(settlement.error, Some(HookFailure::OnComplete));
+}
+
+#[cfg(test)]
+#[test]
+fn more_failure_quarantines_the_operation_but_settles_this_cqe() {
+    let settlement = settle_completion(ConsumedCompletion {
+        continuation: CompletionContinuation::More,
+        failure: Some(HookFailure::RecordItem),
+        has_payload: true,
+        has_provided_buffer: true,
+    });
+
+    assert_eq!(settlement.outcome, SettlementOutcome::Quarantined);
+    assert_eq!(settlement.slot, SlotDisposition::Quarantined);
+    assert_eq!(settlement.operation, ResourceDisposition::Retained);
+    assert_eq!(settlement.completion_payload, ResourceDisposition::Released);
+    assert_eq!(settlement.cleanup_runs, 1);
+    assert_eq!(settlement.provided_buffer_returns, 1);
+    assert_eq!(settlement.error, Some(HookFailure::RecordItem));
+}
+
+#[cfg(test)]
+#[test]
+fn final_success_and_failure_each_return_a_provided_buffer_once() {
+    for failure in [None, Some(HookFailure::OnComplete)] {
         let settlement = settle_completion(ConsumedCompletion {
             continuation: CompletionContinuation::Final,
-            failure: Some(HookFailure::OnComplete),
+            failure,
             has_payload: true,
             has_provided_buffer: true,
         });
-
-        assert_eq!(settlement.outcome, SettlementOutcome::TerminalFailure);
-        assert_eq!(settlement.slot, SlotDisposition::Released);
-        assert_eq!(settlement.operation, ResourceDisposition::Released);
-        assert_eq!(settlement.completion_payload, ResourceDisposition::Released);
-        assert_eq!(settlement.cleanup_runs, 1);
         assert_eq!(settlement.provided_buffer_returns, 1);
-        assert_eq!(settlement.error, Some(HookFailure::OnComplete));
-    }
-
-    #[test]
-    fn more_failure_quarantines_the_operation_but_settles_this_cqe() {
-        let settlement = settle_completion(ConsumedCompletion {
-            continuation: CompletionContinuation::More,
-            failure: Some(HookFailure::RecordItem),
-            has_payload: true,
-            has_provided_buffer: true,
-        });
-
-        assert_eq!(settlement.outcome, SettlementOutcome::Quarantined);
-        assert_eq!(settlement.slot, SlotDisposition::Quarantined);
-        assert_eq!(settlement.operation, ResourceDisposition::Retained);
-        assert_eq!(settlement.completion_payload, ResourceDisposition::Released);
         assert_eq!(settlement.cleanup_runs, 1);
-        assert_eq!(settlement.provided_buffer_returns, 1);
-        assert_eq!(settlement.error, Some(HookFailure::RecordItem));
     }
+}
 
-    #[test]
-    fn final_success_and_failure_each_return_a_provided_buffer_once() {
-        for failure in [None, Some(HookFailure::OnComplete)] {
-            let settlement = settle_completion(ConsumedCompletion {
-                continuation: CompletionContinuation::Final,
-                failure,
-                has_payload: true,
-                has_provided_buffer: true,
-            });
-            assert_eq!(settlement.provided_buffer_returns, 1);
-            assert_eq!(settlement.cleanup_runs, 1);
-        }
-    }
+#[cfg(test)]
+#[test]
+fn provided_buffer_guard_rejects_a_second_return() {
+    let mut guard = ProvidedBufferGuard::claim();
+    assert!(guard.return_once());
+    assert!(!guard.return_once());
+}
 
-    #[test]
-    fn provided_buffer_guard_rejects_a_second_return() {
-        let mut guard = ProvidedBufferGuard::claim();
-        assert!(guard.return_once());
-        assert!(!guard.return_once());
-    }
+#[cfg(test)]
+#[test]
+fn missing_payload_is_a_terminal_failure_with_no_payload_to_release() {
+    let settlement = settle_completion(ConsumedCompletion {
+        continuation: CompletionContinuation::Final,
+        failure: Some(HookFailure::PayloadMissing),
+        has_payload: false,
+        has_provided_buffer: false,
+    });
 
-    #[test]
-    fn missing_payload_is_a_terminal_failure_with_no_payload_to_release() {
-        let settlement = settle_completion(ConsumedCompletion {
-            continuation: CompletionContinuation::Final,
-            failure: Some(HookFailure::PayloadMissing),
-            has_payload: false,
-            has_provided_buffer: false,
-        });
+    assert_eq!(settlement.outcome, SettlementOutcome::TerminalFailure);
+    assert_eq!(settlement.slot, SlotDisposition::Released);
+    assert_eq!(settlement.operation, ResourceDisposition::Released);
+    assert_eq!(settlement.completion_payload, ResourceDisposition::Absent);
+    assert_eq!(settlement.cleanup_runs, 1);
+    assert_eq!(settlement.provided_buffer_returns, 0);
+    assert_eq!(settlement.error, Some(HookFailure::PayloadMissing));
+}
 
-        assert_eq!(settlement.outcome, SettlementOutcome::TerminalFailure);
-        assert_eq!(settlement.slot, SlotDisposition::Released);
-        assert_eq!(settlement.operation, ResourceDisposition::Released);
-        assert_eq!(settlement.completion_payload, ResourceDisposition::Absent);
-        assert_eq!(settlement.cleanup_runs, 1);
-        assert_eq!(settlement.provided_buffer_returns, 0);
-        assert_eq!(settlement.error, Some(HookFailure::PayloadMissing));
-    }
+#[cfg(test)]
+#[test]
+fn record_hook_failure_does_not_leave_a_final_slot_active() {
+    let settlement = settle_completion(ConsumedCompletion {
+        continuation: CompletionContinuation::Final,
+        failure: Some(HookFailure::RecordItem),
+        has_payload: true,
+        has_provided_buffer: false,
+    });
 
-    #[test]
-    fn record_hook_failure_does_not_leave_a_final_slot_active() {
-        let settlement = settle_completion(ConsumedCompletion {
-            continuation: CompletionContinuation::Final,
-            failure: Some(HookFailure::RecordItem),
-            has_payload: true,
-            has_provided_buffer: false,
-        });
+    assert_eq!(settlement.outcome, SettlementOutcome::TerminalFailure);
+    assert_eq!(settlement.slot, SlotDisposition::Released);
+    assert_eq!(settlement.error, Some(HookFailure::RecordItem));
+}
 
-        assert_eq!(settlement.outcome, SettlementOutcome::TerminalFailure);
-        assert_eq!(settlement.slot, SlotDisposition::Released);
-        assert_eq!(settlement.error, Some(HookFailure::RecordItem));
-    }
+#[cfg(test)]
+#[test]
+fn more_record_mismatch_is_isolated_without_releasing_kernel_resources() {
+    let settlement = settle_completion(ConsumedCompletion {
+        continuation: CompletionContinuation::More,
+        failure: Some(HookFailure::MoreRecordMismatch),
+        has_payload: false,
+        has_provided_buffer: true,
+    });
 
-    #[test]
-    fn more_record_mismatch_is_isolated_without_releasing_kernel_resources() {
-        let settlement = settle_completion(ConsumedCompletion {
-            continuation: CompletionContinuation::More,
-            failure: Some(HookFailure::MoreRecordMismatch),
-            has_payload: false,
-            has_provided_buffer: true,
-        });
-
-        assert_eq!(settlement.outcome, SettlementOutcome::Quarantined);
-        assert_eq!(settlement.slot, SlotDisposition::Quarantined);
-        assert_eq!(settlement.operation, ResourceDisposition::Retained);
-        assert_eq!(settlement.completion_payload, ResourceDisposition::Absent);
-        assert_eq!(settlement.provided_buffer_returns, 1);
-    }
+    assert_eq!(settlement.outcome, SettlementOutcome::Quarantined);
+    assert_eq!(settlement.slot, SlotDisposition::Quarantined);
+    assert_eq!(settlement.operation, ResourceDisposition::Retained);
+    assert_eq!(settlement.completion_payload, ResourceDisposition::Absent);
+    assert_eq!(settlement.provided_buffer_returns, 1);
 }

@@ -5,11 +5,9 @@ mod settlement;
 use veloq_std::vec::Vec;
 
 use veloq_driver_core::{
-    driver::{
-        AnomalyAttach, CompletionAnomalyKind, CompletionEnvelope, CompletionFlowExt,
-        CompletionFlowOutcome, CompletionIngress, SyntheticCompletionSource, UserCompletionEvent,
-    },
-    slot::{CheckedSlotView, SlotRegistryExt, SlotView},
+    AnomalyAttach, CheckedSlotView, CompletionAnomalyKind, CompletionEnvelope, CompletionFlowExt,
+    CompletionFlowOutcome, CompletionIngress, SlotRegistryExt, SlotView, SyntheticCompletionSource,
+    UserCompletionEvent,
 };
 
 use crate::error::IocpResult;

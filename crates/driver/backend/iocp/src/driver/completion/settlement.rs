@@ -2,11 +2,8 @@ use veloq_std::{format, io, mem};
 
 use diagweave::prelude::*;
 use veloq_driver_core::{
-    driver::{
-        CancelMode, CompletionCleanupGuard, CompletionContinuation, CompletionFailure,
-        CompletionSettlement, PlatformOp, UserCompletionEvent,
-    },
-    slot::{InFlightOrphaned, InFlightWaiting},
+    CancelMode, CompletionCleanupGuard, CompletionContinuation, CompletionFailure,
+    CompletionSettlement, InFlightOrphaned, InFlightWaiting, PlatformOp, UserCompletionEvent,
 };
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 
@@ -27,7 +24,7 @@ impl SettlementService {
         guard: &mut Slot<'_, InFlightWaiting>,
         event_res: i32,
     ) -> IocpResult<IocpResult<usize>> {
-        let user_data = guard.snapshot().index;
+        let user_data = guard.snapshot().index();
         let mut io_result = if event_res < 0 {
             Err(IocpError::CompletionWait.io_report(
                 "iocp.driver.calculate_io_result_from_slot",

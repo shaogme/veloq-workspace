@@ -217,7 +217,7 @@ fn accept_kernel_control(
     registry: &mut OpRegistry<DummySlotSpec>,
     hooks: &mut TestHooks,
 ) -> Result<CompletionFlowOutcome, Report<DummyError>> {
-    let diagnostics = registry.shared.completion_diagnostics();
+    let diagnostics = registry.shared_slots().completion_diagnostics();
     let table: SharedCompletionTable<DummySlotSpec> = registry.shared_table();
     let envelope = CompletionEnvelope::from_raw_parts(
         CompletionBackend::Core,
@@ -275,7 +275,7 @@ fn failed_effect_takes_priority_and_keeps_control_error_as_source() {
 #[test]
 fn terminal_hook_failure_finalizes_the_slot_and_runs_cleanup_once() {
     let (mut registry, token) = active_registry();
-    let table = registry.shared.clone();
+    let table = registry.shared_slots().clone();
     let cleanup_count = Arc::new(AtomicUsize::new(0));
     let failure = CompletionSettlement::TerminalFailure {
         failure: CompletionFailure::terminal(
@@ -301,7 +301,7 @@ fn terminal_hook_failure_finalizes_the_slot_and_runs_cleanup_once() {
     );
     assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
     assert!(
-        table.slots[token.index()]
+        table.slots()[token.index()]
             .status(Ordering::Acquire)
             .is_idle()
     );
@@ -311,7 +311,7 @@ fn terminal_hook_failure_finalizes_the_slot_and_runs_cleanup_once() {
 #[test]
 fn retained_settlement_keeps_the_logical_operation_addressable() {
     let (mut registry, token) = active_registry();
-    let table = registry.shared.clone();
+    let table = registry.shared_slots().clone();
     let cleanup_count = Arc::new(AtomicUsize::new(0));
     let retained = CompletionSettlement::Retained {
         cleanup: counting_cleanup(&cleanup_count),
@@ -326,18 +326,18 @@ fn retained_settlement_keeps_the_logical_operation_addressable() {
     )
     .expect("retained completion should not be a user-visible error");
 
-    assert_eq!(outcome.internal, 1);
+    assert_eq!(outcome.internal_count(), 1);
     assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
     assert_eq!(registry.active_count(), 1);
-    let status = table.slots[token.index()].status(Ordering::Acquire);
-    assert_eq!(status.state, SlotState::InFlightWaiting);
-    assert!(!status.ready);
+    let status = table.slots()[token.index()].status(Ordering::Acquire);
+    assert_eq!(status.state(), SlotState::InFlightWaiting);
+    assert!(!status.ready());
 }
 
 #[test]
 fn more_hook_failure_quarantines_until_a_later_final_completion() {
     let (mut registry, token) = active_registry();
-    let table = registry.shared.clone();
+    let table = registry.shared_slots().clone();
     let cleanup_count = Arc::new(AtomicUsize::new(0));
     let failure = CompletionSettlement::Quarantined {
         failure: CompletionFailure::quarantined(
@@ -363,16 +363,18 @@ fn more_hook_failure_quarantines_until_a_later_final_completion() {
     );
     assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
     assert_eq!(
-        table.slots[token.index()].status(Ordering::Acquire).state,
+        table.slots()[token.index()]
+            .status(Ordering::Acquire)
+            .state(),
         SlotState::InFlightOrphaned
     );
     assert_eq!(registry.active_count(), 1);
 
     let final_outcome = accept_with_hooks(&mut registry, test_event(token, 1), &mut hooks);
-    assert_eq!(final_outcome.orphan_cleaned, 1);
+    assert_eq!(final_outcome.orphan_cleaned_count(), 1);
     assert_eq!(cleanup_count.load(Ordering::Acquire), 1);
     assert!(
-        table.slots[token.index()]
+        table.slots()[token.index()]
             .status(Ordering::Acquire)
             .is_idle()
     );
@@ -382,7 +384,7 @@ fn more_hook_failure_quarantines_until_a_later_final_completion() {
 #[test]
 fn backend_effect_failure_still_finalizes_a_successful_completion() {
     let (mut registry, token) = active_registry();
-    let table = registry.shared.clone();
+    let table = registry.shared_slots().clone();
     let mut hooks = TestHooks {
         finish_failure: true,
         ..TestHooks::default()
@@ -399,10 +401,10 @@ fn backend_effect_failure_still_finalizes_a_successful_completion() {
         error.error_code().map(ToString::to_string).as_deref(),
         Some("202")
     );
-    let status = table.slots[token.index()].status(Ordering::Acquire);
-    assert_eq!(status.state, SlotState::Idle);
+    let status = table.slots()[token.index()].status(Ordering::Acquire);
+    assert_eq!(status.state(), SlotState::Idle);
     assert!(
-        status.ready,
+        status.ready(),
         "the completed record remains available to the consumer"
     );
     assert_eq!(registry.active_count(), 0);
@@ -411,7 +413,7 @@ fn backend_effect_failure_still_finalizes_a_successful_completion() {
 #[test]
 fn cleanup_failure_still_finalizes_a_terminal_hook_failure() {
     let (mut registry, token) = active_registry();
-    let table = registry.shared.clone();
+    let table = registry.shared_slots().clone();
     let failure = CompletionSettlement::TerminalFailure {
         failure: CompletionFailure::terminal(
             Report::new(DummyError)
@@ -437,7 +439,7 @@ fn cleanup_failure_still_finalizes_a_terminal_hook_failure() {
         Some("305")
     );
     assert!(
-        table.slots[token.index()]
+        table.slots()[token.index()]
             .status(Ordering::Acquire)
             .is_idle()
     );
@@ -517,7 +519,7 @@ fn accept_ingress_result(
     ingress: CompletionIngress,
     hooks: &mut TestHooks,
 ) -> Result<CompletionFlowOutcome, Report<DummyError>> {
-    let diagnostics = registry.shared.completion_diagnostics();
+    let diagnostics = registry.shared_slots().completion_diagnostics();
     let table: SharedCompletionTable<DummySlotSpec> = registry.shared_table();
     registry.accept_completion(&table, &diagnostics, hooks, ingress)
 }
@@ -530,13 +532,13 @@ fn accept_user(registry: &mut OpRegistry<DummySlotSpec>, token: OpToken, res: i3
 #[test]
 fn record_completion_rejects_idle_future_generation() {
     let mut registry = OpRegistry::<DummySlotSpec>::new(1);
-    let table = registry.shared.clone();
+    let table = registry.shared_slots().clone();
     let token = test_token(0, 1);
 
     let mut hooks = TestHooks::default();
     let outcome = accept_with_hooks(&mut registry, test_event(token, 0), &mut hooks);
 
-    assert_eq!(outcome.anomaly, 1);
+    assert_eq!(outcome.anomaly_count(), 1);
     assert_eq!(table.debug_get_state(0), CELL_STATE_IDLE);
 }
 
@@ -579,8 +581,8 @@ fn mark_waiting_does_not_activate_idle_future_generation() {
 #[test]
 fn mark_waiting_does_not_revive_orphaned_slot() {
     let table = slot::SlotTable::<DummySlotSpec>::new(1);
-    table.slots[0].reset(Generation::new(1));
-    table.slots[0].set_state(SlotState::InFlightOrphaned, Ordering::Release);
+    table.slots()[0].reset(Generation::new(1));
+    table.slots()[0].set_state(SlotState::InFlightOrphaned, Ordering::Release);
     let token = test_token(0, 1);
 
     let outcome = table.mark_waiting(token);
@@ -595,8 +597,8 @@ fn mark_waiting_does_not_revive_orphaned_slot() {
 #[test]
 fn mark_orphaned_reports_stale_generation() {
     let table = slot::SlotTable::<DummySlotSpec>::new(1);
-    table.slots[0].reset(Generation::new(2));
-    table.slots[0].set_state(SlotState::InFlightWaiting, Ordering::Release);
+    table.slots()[0].reset(Generation::new(2));
+    table.slots()[0].set_state(SlotState::InFlightWaiting, Ordering::Release);
     let token = test_token(0, 1);
 
     let outcome = table.mark_orphaned(token);
@@ -629,14 +631,14 @@ fn register_waker_reports_missing_slot() {
 #[test]
 fn duplicate_completion_does_not_clear_ready_data() {
     let (mut registry, token) = active_registry();
-    let table = registry.shared.clone();
+    let table = registry.shared_slots().clone();
 
     let mut hooks = TestHooks::default();
     let first = accept_with_hooks(&mut registry, test_event(token, 11), &mut hooks);
     let duplicate = accept_with_hooks(&mut registry, test_event(token, 22), &mut hooks);
 
-    assert_eq!(first.user_completed, 1);
-    assert_eq!(duplicate.anomaly, 1);
+    assert_eq!(first.user_completed_count(), 1);
+    assert_eq!(duplicate.anomaly_count(), 1);
     let record = match table.try_take_record(token).unwrap() {
         PollRecordResult::Ready(record) => record,
         PollRecordResult::Pending => panic!("first completion should be ready"),
@@ -644,7 +646,7 @@ fn duplicate_completion_does_not_clear_ready_data() {
             panic!("first completion should remain available: {kind:?}")
         }
     };
-    assert_eq!(record.event.res(), 11);
+    assert_eq!(record.event().res(), 11);
 }
 
 /// 一轮 alloc/complete/consume 让 slot generation 推进 2。旧的 15 位 token 布局会在
@@ -656,7 +658,7 @@ fn completion_routing_survives_the_legacy_15_bit_generation_boundary() {
     const ROUNDS: u32 = 0x8000 / 2 + 16;
 
     let mut registry = OpRegistry::<DummySlotSpec>::new(1);
-    let table = registry.shared.clone();
+    let table = registry.shared_slots().clone();
 
     for round in 0..ROUNDS {
         let token = arm_slot(&mut registry);
@@ -665,13 +667,13 @@ fn completion_routing_survives_the_legacy_15_bit_generation_boundary() {
         let outcome = accept_kernel_raw(&mut registry, token, res, &mut hooks);
 
         assert_eq!(
-            outcome.user_completed,
+            outcome.user_completed_count(),
             1,
             "round {round}: completion for generation {:#x} was not routed to its slot",
             token.generation()
         );
         match table.try_take_record(token).unwrap() {
-            PollRecordResult::Ready(record) => assert_eq!(record.event.res(), res),
+            PollRecordResult::Ready(record) => assert_eq!(record.event().res(), res),
             PollRecordResult::Pending => {
                 panic!("round {round}: recorded completion should be ready")
             }
@@ -684,7 +686,7 @@ fn completion_routing_survives_the_legacy_15_bit_generation_boundary() {
     let snapshot = table.completion_diagnostics().snapshot();
     assert_eq!(snapshot.stale_completion, 0);
     assert!(
-        table.slots[0]
+        table.slots()[0]
             .generation(Ordering::Acquire)
             .is_newer_than(Generation::new(0x8000)),
         "the test must actually cross the 15-bit boundary"
@@ -697,31 +699,31 @@ fn completion_routing_survives_the_legacy_15_bit_generation_boundary() {
 #[test]
 fn a_published_completion_is_orthogonal_to_the_slot_lifecycle() {
     let (mut registry, token) = active_registry();
-    let table = registry.shared.clone();
+    let table = registry.shared_slots().clone();
 
     accept_user(&mut registry, token, 5);
 
-    let status = table.slots[token.index()].status(Ordering::Acquire);
+    let status = table.slots()[token.index()].status(Ordering::Acquire);
     assert_eq!(
-        status.state,
+        status.state(),
         SlotState::Idle,
         "the slot itself must already be released"
     );
-    assert!(status.ready, "the record must stay in the mailbox");
-    assert!(!status.finalizing);
+    assert!(status.ready(), "the record must stay in the mailbox");
+    assert!(!status.finalizing());
     assert!(!status.is_idle(), "a ready slot is not reusable");
     assert_eq!(table.debug_get_state(token.index()), CELL_STATE_READY);
     assert!(table.has_ready_completion());
 
     match table.try_take_record(token).unwrap() {
-        PollRecordResult::Ready(record) => assert_eq!(record.event.res(), 5),
+        PollRecordResult::Ready(record) => assert_eq!(record.event().res(), 5),
         PollRecordResult::Pending => panic!("published completion should not be pending"),
         PollRecordResult::Unavailable { kind, .. } => {
             panic!("published completion should be takeable: {kind:?}")
         }
     }
 
-    let status = table.slots[token.index()].status(Ordering::Acquire);
+    let status = table.slots()[token.index()].status(Ordering::Acquire);
     assert!(status.is_idle(), "consumption must fully release the slot");
     assert!(!table.has_ready_completion());
 }
@@ -731,11 +733,13 @@ fn a_published_completion_is_orthogonal_to_the_slot_lifecycle() {
 #[test]
 fn mailbox_checks_take_priority_over_the_slot_lifecycle() {
     let (mut registry, token) = active_registry();
-    let table = registry.shared.clone();
+    let table = registry.shared_slots().clone();
 
     accept_user(&mut registry, token, 1);
     assert_eq!(
-        table.slots[token.index()].status(Ordering::Acquire).state,
+        table.slots()[token.index()]
+            .status(Ordering::Acquire)
+            .state(),
         SlotState::Idle
     );
 
@@ -759,10 +763,10 @@ fn mailbox_checks_take_priority_over_the_slot_lifecycle() {
 #[test]
 fn an_empty_mailbox_on_an_idle_slot_still_rejects_every_mutation() {
     let table = slot::SlotTable::<DummySlotSpec>::new(1);
-    table.slots[0].reset(Generation::new(1));
+    table.slots()[0].reset(Generation::new(1));
     let token = test_token(0, 1);
 
-    let status = table.slots[0].status(Ordering::Acquire);
+    let status = table.slots()[0].status(Ordering::Acquire);
     assert!(status.is_idle());
 
     assert!(matches!(
@@ -788,22 +792,22 @@ fn an_empty_mailbox_on_an_idle_slot_still_rejects_every_mutation() {
 #[test]
 fn anomaly_diagnostics_keep_the_mailbox_bit() {
     let (mut registry, token) = active_registry();
-    let table = registry.shared.clone();
+    let table = registry.shared_slots().clone();
 
     accept_user(&mut registry, token, 0);
     // 重复完成：slot 生命周期已是 Idle，但信箱里压着记录。
     let mut hooks = TestHooks::default();
     let outcome = accept_with_hooks(&mut registry, test_event(token, 0), &mut hooks);
-    assert_eq!(outcome.anomaly, 1);
+    assert_eq!(outcome.anomaly_count(), 1);
 
-    let status = table.slots[token.index()].status(Ordering::Acquire);
+    let status = table.slots()[token.index()].status(Ordering::Acquire);
     assert_eq!(format!("{status:?}"), "Idle+ready");
 }
 
 #[test]
 fn ready_mark_orphaned_cleanup_leaves_diagnostic_stale_result() {
     let (mut registry, token) = active_registry();
-    let table = registry.shared.clone();
+    let table = registry.shared_slots().clone();
 
     accept_user(&mut registry, token, 0);
     assert_eq!(
@@ -849,32 +853,32 @@ fn take_ready(
 #[test]
 fn a_multishot_slot_keeps_its_token_across_completions() {
     let (mut registry, token) = active_registry();
-    let table = registry.shared.clone();
+    let table = registry.shared_slots().clone();
     let mut hooks = TestHooks::multishot(2);
 
     // 第一条 More。
     let outcome = accept_kernel_raw(&mut registry, token, 1, &mut hooks);
-    assert_eq!(outcome.user_completed, 1);
+    assert_eq!(outcome.user_completed_count(), 1);
 
-    let status = table.slots[token.index()].status(Ordering::Acquire);
-    assert_eq!(status.state, SlotState::InFlightWaiting);
-    assert!(status.ready, "the record must be published");
-    assert!(status.streaming, "the operation is still in flight");
+    let status = table.slots()[token.index()].status(Ordering::Acquire);
+    assert_eq!(status.state(), SlotState::InFlightWaiting);
+    assert!(status.ready(), "the record must be published");
+    assert!(status.streaming(), "the operation is still in flight");
     assert_eq!(
-        table.slots[token.index()].generation(Ordering::Acquire),
+        table.slots()[token.index()].generation(Ordering::Acquire),
         token.generation(),
         "a `More` completion must not invalidate the token"
     );
 
     // 取走它：信箱空了，但 slot 仍在途，所以既不归还也不推进 generation。
     let record = take_ready(&table, token);
-    assert_eq!(record.event.res(), 1);
-    let status = table.slots[token.index()].status(Ordering::Acquire);
-    assert_eq!(status.state, SlotState::InFlightWaiting);
-    assert!(!status.ready);
-    assert!(status.streaming);
+    assert_eq!(record.event().res(), 1);
+    let status = table.slots()[token.index()].status(Ordering::Acquire);
+    assert_eq!(status.state(), SlotState::InFlightWaiting);
+    assert!(!status.ready());
+    assert!(status.streaming());
     assert_eq!(
-        table.slots[token.index()].generation(Ordering::Acquire),
+        table.slots()[token.index()].generation(Ordering::Acquire),
         token.generation()
     );
     assert!(matches!(
@@ -884,20 +888,20 @@ fn a_multishot_slot_keeps_its_token_across_completions() {
 
     // 第二条 More，同一个 token 照常路由。
     let outcome = accept_kernel_raw(&mut registry, token, 2, &mut hooks);
-    assert_eq!(outcome.user_completed, 1);
-    assert_eq!(take_ready(&table, token).event.res(), 2);
+    assert_eq!(outcome.user_completed_count(), 1);
+    assert_eq!(take_ready(&table, token).event().res(), 2);
 
     // 第三条是 Final：这次才归还 slot 并让 token 失效。
     let outcome = accept_kernel_raw(&mut registry, token, 3, &mut hooks);
-    assert_eq!(outcome.user_completed, 1);
+    assert_eq!(outcome.user_completed_count(), 1);
     assert!(
-        !table.slots[token.index()]
+        !table.slots()[token.index()]
             .status(Ordering::Acquire)
-            .streaming
+            .streaming()
     );
-    assert_eq!(take_ready(&table, token).event.res(), 3);
+    assert_eq!(take_ready(&table, token).event().res(), 3);
 
-    let status = table.slots[token.index()].status(Ordering::Acquire);
+    let status = table.slots()[token.index()].status(Ordering::Acquire);
     assert!(status.is_idle(), "a final completion must recycle the slot");
     assert!(registry.alloc(()).is_ok());
 }
@@ -910,34 +914,34 @@ fn a_multishot_slot_keeps_its_token_across_completions() {
 #[test]
 fn queued_completions_are_taken_in_arrival_order() {
     let (mut registry, token) = active_registry();
-    let table = registry.shared.clone();
+    let table = registry.shared_slots().clone();
     let mut hooks = TestHooks::multishot(1);
 
     let _ = accept_kernel_raw(&mut registry, token, 10, &mut hooks); // More
     let _ = accept_kernel_raw(&mut registry, token, 20, &mut hooks); // Final
 
-    let status = table.slots[token.index()].status(Ordering::Acquire);
-    assert!(status.ready);
+    let status = table.slots()[token.index()].status(Ordering::Acquire);
+    assert!(status.ready());
     assert!(
-        !status.streaming,
+        !status.streaming(),
         "the final completion cleared `streaming`"
     );
 
-    assert_eq!(take_ready(&table, token).event.res(), 10);
-    let status = table.slots[token.index()].status(Ordering::Acquire);
+    assert_eq!(take_ready(&table, token).event().res(), 10);
+    let status = table.slots()[token.index()].status(Ordering::Acquire);
     assert!(
-        status.ready,
+        status.ready(),
         "the queued second record must keep the mailbox non-empty"
     );
     assert_eq!(
-        table.slots[token.index()].generation(Ordering::Acquire),
+        table.slots()[token.index()].generation(Ordering::Acquire),
         token.generation(),
         "taking a record with another one queued must not invalidate the token"
     );
 
-    assert_eq!(take_ready(&table, token).event.res(), 20);
+    assert_eq!(take_ready(&table, token).event().res(), 20);
     assert!(
-        table.slots[token.index()]
+        table.slots()[token.index()]
             .status(Ordering::Acquire)
             .is_idle()
     );
@@ -949,7 +953,7 @@ fn queued_completions_are_taken_in_arrival_order() {
 #[test]
 fn orphaning_a_streaming_slot_keeps_it_in_flight() {
     let (mut registry, token) = active_registry();
-    let table = registry.shared.clone();
+    let table = registry.shared_slots().clone();
     let cleanups = Arc::new(AtomicUsize::new(0));
 
     let mut hooks = TestHooks::multishot(2);
@@ -969,15 +973,15 @@ fn orphaning_a_streaming_slot_keeps_it_in_flight() {
         2,
         "every queued record's cleanup must run"
     );
-    let status = table.slots[token.index()].status(Ordering::Acquire);
-    assert_eq!(status.state, SlotState::InFlightOrphaned);
-    assert!(!status.ready);
+    let status = table.slots()[token.index()].status(Ordering::Acquire);
+    assert_eq!(status.state(), SlotState::InFlightOrphaned);
+    assert!(!status.ready());
     assert!(
-        status.streaming,
+        status.streaming(),
         "the kernel is still going to complete this"
     );
     assert_eq!(
-        table.slots[token.index()].generation(Ordering::Acquire),
+        table.slots()[token.index()].generation(Ordering::Acquire),
         token.generation(),
         "an in-flight multishot must keep its token valid for orphan cleanup"
     );
@@ -985,9 +989,9 @@ fn orphaning_a_streaming_slot_keeps_it_in_flight() {
 
     // 内核的收尾完成仍然找得到这个 slot，走 orphan 路径。
     let outcome = accept_kernel_raw(&mut registry, token, 0, &mut hooks);
-    assert_eq!(outcome.orphan_cleaned, 1);
+    assert_eq!(outcome.orphan_cleaned_count(), 1);
     assert!(
-        table.slots[token.index()]
+        table.slots()[token.index()]
             .status(Ordering::Acquire)
             .is_idle()
     );
@@ -997,25 +1001,25 @@ fn orphaning_a_streaming_slot_keeps_it_in_flight() {
 #[test]
 fn a_final_completion_still_recycles_the_slot() {
     let (mut registry, token) = active_registry();
-    let table = registry.shared.clone();
+    let table = registry.shared_slots().clone();
 
     let mut hooks = TestHooks::default();
     let outcome = accept_kernel_raw(&mut registry, token, 7, &mut hooks);
-    assert_eq!(outcome.user_completed, 1);
+    assert_eq!(outcome.user_completed_count(), 1);
 
     // 发布之后 slot 已被 finalize 归还，信箱里压着唯一一条记录。
-    let status = table.slots[token.index()].status(Ordering::Acquire);
-    assert_eq!(status.state, SlotState::Idle);
-    assert!(status.ready);
-    assert!(!status.streaming);
+    let status = table.slots()[token.index()].status(Ordering::Acquire);
+    assert_eq!(status.state(), SlotState::Idle);
+    assert!(status.ready());
+    assert!(!status.streaming());
     assert!(!status.is_idle());
 
-    assert_eq!(take_ready(&table, token).event.res(), 7);
+    assert_eq!(take_ready(&table, token).event().res(), 7);
 
-    let status = table.slots[token.index()].status(Ordering::Acquire);
+    let status = table.slots()[token.index()].status(Ordering::Acquire);
     assert!(status.is_idle());
     assert_eq!(
-        table.slots[token.index()].generation(Ordering::Acquire),
+        table.slots()[token.index()].generation(Ordering::Acquire),
         token.generation().next(),
         "consuming a final record must invalidate the token"
     );
@@ -1025,15 +1029,15 @@ fn a_final_completion_still_recycles_the_slot() {
 #[test]
 fn a_second_completion_on_a_single_shot_slot_is_still_rejected() {
     let (mut registry, token) = active_registry();
-    let table = registry.shared.clone();
+    let table = registry.shared_slots().clone();
 
     let mut hooks = TestHooks::default();
     let _ = accept_kernel_raw(&mut registry, token, 1, &mut hooks);
     let outcome = accept_with_hooks(&mut registry, test_event(token, 2), &mut hooks);
-    assert_eq!(outcome.anomaly, 1);
+    assert_eq!(outcome.anomaly_count(), 1);
 
     // 信箱里仍旧只有第一条。
-    assert_eq!(take_ready(&table, token).event.res(), 1);
+    assert_eq!(take_ready(&table, token).event().res(), 1);
     assert!(matches!(
         table.try_take_record(token).unwrap(),
         PollRecordResult::Unavailable { .. }
@@ -1051,11 +1055,11 @@ fn corrupt_completion_cleanup_runs_once_after_anomaly_is_recorded() {
 
     let outcome = accept_with_hooks(&mut registry, test_event(test_token(0, 1), 0), &mut hooks);
 
-    assert_eq!(outcome.anomaly, 1);
+    assert_eq!(outcome.anomaly_count(), 1);
     assert_eq!(counter.load(Ordering::Acquire), 1);
     assert_eq!(
         registry
-            .shared
+            .shared_slots()
             .completion_diagnostics()
             .snapshot()
             .stale_completion,

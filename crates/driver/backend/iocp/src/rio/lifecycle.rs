@@ -10,7 +10,7 @@ use crate::{
     },
 };
 use diagweave::prelude::*;
-use veloq_driver_core::driver::{AnomalyAttach, RawCompletion};
+use veloq_driver_core::{AnomalyAttach, RawCompletion};
 use veloq_std::{
     mem::{self, zeroed},
     string::ToString,
@@ -313,7 +313,7 @@ mod tests {
             },
         },
     };
-    use veloq_driver_core::{driver::OpToken, slot::Generation};
+    use veloq_driver_core::{Generation, OpToken};
     use veloq_std::{mem::zeroed, ptr::null_mut, time::Duration};
     use windows_sys::Win32::Networking::WinSock::RIORESULT;
 

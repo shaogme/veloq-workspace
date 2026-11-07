@@ -4,7 +4,7 @@ use crate::{
 };
 use diagweave::prelude::*;
 use libc::{eventfd, write};
-use veloq_driver_core::driver::RemoteWaker;
+use veloq_driver_core::RemoteWaker;
 use veloq_std::{
     boxed::Box,
     io,

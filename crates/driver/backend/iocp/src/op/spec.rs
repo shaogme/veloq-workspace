@@ -10,10 +10,7 @@ use crate::{
     },
 };
 use diagweave::prelude::*;
-use veloq_driver_core::{
-    driver::{CompletionCleanupGuard, CompletionContinuation},
-    op::OpKind,
-};
+use veloq_driver_core::{CompletionCleanupGuard, CompletionContinuation, OpKind};
 
 /// Type-erased helpers needed by a backend completion path to create a record without moving the
 /// persistent submit payload out of the slot.

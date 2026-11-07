@@ -6,11 +6,8 @@ pub(crate) mod net_udp;
 use diagweave::prelude::*;
 use tracing_subscriber::fmt::TestWriter;
 use veloq_driver_core::{
-    driver::{
-        BufferRegistrationStatus, CompletionRecord, CompletionValue, DriveMode, Driver,
-        DriverSubmitResult, OpToken, PollRecordResult,
-    },
-    op::{IntoPlatformOp, OpCompletion},
+    BufferRegistrationStatus, CompletionRecord, CompletionValue, DriveMode, Driver,
+    DriverSubmitResult, IntoPlatformOp, OpCompletion, OpToken, PollRecordResult,
 };
 use veloq_std::{
     cell::RefCell,
@@ -89,8 +86,8 @@ use crate::{
     op::IocpSlotSpec,
 };
 
-pub(crate) fn remote_free_contains(driver: &IocpDriver, needle: usize) -> bool {
-    driver.debug_remote_free_contains(needle)
+pub(crate) fn slot_is_idle(driver: &mut IocpDriver, index: usize) -> bool {
+    driver.debug_slot_is_idle(index)
 }
 
 pub(crate) fn submit_test_op<T>(driver: &mut IocpDriver, data: T) -> OpToken
@@ -115,14 +112,11 @@ pub(crate) fn complete_from_record<T>(
 where
     T: IntoPlatformOp<IocpSlotSpec>,
 {
-    let CompletionRecord {
-        event,
-        payload: payload_erased,
-        mut detail,
-        mut cleanup,
-        // IOCP 恒为 `Final`。
-        continuation: _,
-    } = record;
+    let parts = record.into_parts();
+    let event = parts.event;
+    let payload_erased = parts.payload;
+    let mut detail = parts.detail;
+    let mut cleanup = parts.cleanup;
     let payload =
         T::try_record_from_erased(payload_erased.expect("completion record payload type"))
             .expect("completion payload type");
@@ -153,7 +147,7 @@ pub(crate) fn wait_completion_record(
             PollRecordResult::Ready(record) => return Ok(record),
             PollRecordResult::Unavailable { kind, attach } => {
                 return IocpError::CompletionWait
-                    .with_ctx("completion_token", attach.token.raw())
+                    .with_ctx("completion_token", attach.token().raw())
                     .with_ctx("completion_anomaly", format!("{:?}", kind.reason()))
                     .attach_note("completion record unavailable");
             }
@@ -169,7 +163,7 @@ pub(crate) fn wait_completion(
     timeout: Duration,
 ) -> IocpResult<usize> {
     let record = wait_completion_record(driver, token, timeout)?;
-    usize::from_event_res::<IocpError>(record.event.res()).map_err(|e| {
+    usize::from_event_res::<IocpError>(record.event().res()).map_err(|e| {
         let code = iocp_report_to_event_res(&e);
         let io_error = io::Error::from_raw_os_error(-code);
         IocpError::CompletionWait.io_report("iocp.tests.wait_completion", io_error)

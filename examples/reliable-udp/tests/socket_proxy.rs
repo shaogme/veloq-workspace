@@ -640,12 +640,12 @@ async fn receive_pump(pump: ReceivePump<'_>) {
     } = pump;
     stats.receive_started.fetch_add(1, Ordering::Relaxed);
     let mut operation_id: u64 = 0;
-    let mut recv = match socket.receiver(UdpReceiveConfig {
-        kernel_capacity: nz!(1),
-        queue_capacity: nz!(MAX_PENDING_DATAGRAMS),
-        datagram_capacity: max_datagram_size,
-        close_timeout: Duration::from_secs(1),
-    }) {
+    let mut recv = match socket.receiver(UdpReceiveConfig::new(
+        nz!(1),
+        nz!(MAX_PENDING_DATAGRAMS),
+        max_datagram_size,
+        Duration::from_secs(1),
+    )) {
         Ok(recv) => recv,
         Err(_) => {
             report_receive_failure(&events, &stats, ProxyError::Io).await;

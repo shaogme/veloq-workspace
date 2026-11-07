@@ -21,10 +21,10 @@ pub(crate) use timer::{ExpiredBatch, UringTimerWheel};
 pub(crate) use waker::UringWakerManager;
 
 use crate::driver::lifecycle::SubmissionPhase;
-use veloq_driver_core::driver::{CancelTicket, CompletionToken, OpToken};
+use veloq_driver_core::{CancelTicket, CompletionToken, OpToken};
 
 #[cfg(any(test, feature = "test-hooks"))]
-use veloq_driver_core::slot::SlotSnapshot;
+use veloq_driver_core::SlotSnapshot;
 
 #[cfg(any(test, feature = "test-hooks"))]
 use veloq_std::{
@@ -460,10 +460,7 @@ impl ControlPlaneObserver {
 mod tests {
     use super::{ControlPlaneEvent, ControlPlaneObserver, ControlTransition};
     use crate::driver::lifecycle::SubmissionPhase;
-    use veloq_driver_core::{
-        driver::{CancelTicket, CompletionToken, OpToken},
-        slot::Generation,
-    };
+    use veloq_driver_core::{CancelTicket, CompletionToken, Generation, OpToken};
     use veloq_std::time::Duration;
     use veloq_wheel::{Wheel, WheelConfig};
 

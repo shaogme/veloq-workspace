@@ -1,39 +1,43 @@
 #![no_std]
 
+mod driver;
+mod op;
+pub mod platform;
+mod slot;
+
 use diagweave::prelude::*;
 use veloq_std::{
     error::Error,
     fmt,
-    marker::{PhantomData, Send, Sync},
+    marker::{PhantomData, Send as SendBound, Sync},
     mem,
     net::SocketAddr,
     sync::atomic::{NativeAtomicU64, Ordering},
 };
 
-pub mod driver;
-pub mod op;
-pub mod platform;
-pub mod slot;
+pub use driver::*;
+pub use op::*;
+pub use platform::*;
+pub use slot::*;
 
 // ============================================================================
 // Core Traits
 // ============================================================================
 
 /// Platform-neutral handle trait implemented by driver-defined handle types.
-pub trait Handle: Copy + Send + Sync {}
+pub trait Handle: Copy + SendBound + Sync {}
 
-impl<T> Handle for T where T: Copy + Send + Sync {}
+impl<T> Handle for T where T: Copy + SendBound + Sync {}
 
 /// Platform-neutral socket address storage trait implemented by driver-defined types.
-pub trait SockAddr: Default + Send {}
+pub trait SockAddr: Default + SendBound {}
 
-impl<T> SockAddr for T where T: Default + Send {}
+impl<T> SockAddr for T where T: Default + SendBound {}
 
 /// Platform-neutral per-slot sidecar trait implemented by driver-defined types.
-pub trait SlotSidecar: Default + Send {}
+pub trait SlotSidecar: Default + SendBound {}
 
-impl<T> SlotSidecar for T where T: Default + Send {}
-
+impl<T> SlotSidecar for T where T: Default + SendBound {}
 // ============================================================================
 // IoFd
 // ============================================================================
@@ -99,6 +103,18 @@ pub enum IoFd<H: Handle> {
         /// Opaque identity minted by [`Self::owned_direct`].
         owner: DirectOwnerId,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RawHandleKind {
+    File,
+    Socket,
+}
+
+pub trait RawHandleMeta: Handle {
+    fn kind(self) -> RawHandleKind;
+
+    fn close(self);
 }
 
 impl<H: Handle> IoFd<H> {
@@ -225,24 +241,12 @@ set! {
 pub type DriverResult<T, E> = Result<T, Report<E>>;
 pub type DriverReport<E> = Report<E>;
 
-pub trait DriverError: Error + Send + Sync + 'static + Sized {
+pub trait DriverError: Error + SendBound + Sync + 'static + Sized {
     fn from_core_report(report: Report<DriverCoreError>) -> Report<Self>;
 }
-
 // ============================================================================
 // Raw Handles (formerly raw_handle.rs)
 // ============================================================================
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RawHandleKind {
-    File,
-    Socket,
-}
-
-pub trait RawHandleMeta: Handle {
-    fn kind(self) -> RawHandleKind;
-    fn close(self);
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RawHandle<H: Handle> {
@@ -348,23 +352,27 @@ impl<H: RawHandleMeta> Drop for OwnedRawHandle<H> {
         self.raw.raw().close();
     }
 }
-
 // ============================================================================
 // Network Abstractions (formerly net.rs)
 // ============================================================================
 
 /// 平台套接字抽象，由各 driver 后端提供具体实现。
-pub trait PlatformSocket: Sized + Send {
+pub trait PlatformSocket: Sized + SendBound {
     type Handle: RawHandleMeta;
-    type Error: Error + Send + Sync;
+    type Error: Error + SendBound + Sync;
 
     fn new_tcp_v4() -> Result<Self, Report<Self::Error>>;
+
     fn new_tcp_v6() -> Result<Self, Report<Self::Error>>;
+
     fn new_udp_v4() -> Result<Self, Report<Self::Error>>;
+
     fn new_udp_v6() -> Result<Self, Report<Self::Error>>;
 
     fn bind(&self, addr: SocketAddr) -> Result<(), Report<Self::Error>>;
+
     fn listen(&self, backlog: i32) -> Result<(), Report<Self::Error>>;
+
     fn connect(&self, addr: SocketAddr) -> Result<(), Report<Self::Error>>;
 
     fn into_owned_raw(self) -> OwnedRawHandle<Self::Handle>;
@@ -377,20 +385,27 @@ pub trait PlatformSocket: Sized + Send {
     fn local_addr(&self) -> Result<SocketAddr, Report<Self::Error>>;
 
     fn set_nodelay(&self, nodelay: bool) -> Result<(), Report<Self::Error>>;
+
     fn set_recv_buffer_size(&self, size: usize) -> Result<(), Report<Self::Error>>;
+
     fn set_send_buffer_size(&self, size: usize) -> Result<(), Report<Self::Error>>;
+
     fn set_reuse_address(&self, reuse: bool) -> Result<(), Report<Self::Error>>;
+
     fn set_keepalive(&self, keepalive: bool) -> Result<(), Report<Self::Error>>;
+
     fn set_ttl(&self, ttl: u32) -> Result<(), Report<Self::Error>>;
+
     fn set_broadcast(&self, broadcast: bool) -> Result<(), Report<Self::Error>>;
 }
 
 /// 平台地址存储编解码抽象。
 pub trait SocketAddrCodec: SockAddr {
-    type Len: Copy + Send;
-    type Error: Error + Send + Sync;
+    type Len: Copy + SendBound;
+    type Error: Error + SendBound + Sync;
 
     fn to_socket_addr(buf: &[u8]) -> Result<SocketAddr, Report<Self::Error>>;
+
     fn socket_addr_to_storage(addr: SocketAddr) -> (Self, Self::Len);
 }
 

@@ -9,10 +9,10 @@ use crate::{
 };
 use diagweave::prelude::*;
 use tracing::error;
-use veloq_driver_core::driver::RegisterFd;
+use veloq_driver_core::RegisterFd;
 
 #[cfg(feature = "test-hooks")]
-use veloq_driver_core::driver::test_hooks::RegisterFilesUpdateOutcome;
+use veloq_driver_core::test_hooks::RegisterFilesUpdateOutcome;
 use veloq_io_uring::{KernelCapabilities, ResourceLayout, ResourceRegistration, Submitter};
 use veloq_std::{
     io,

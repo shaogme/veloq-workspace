@@ -1,4 +1,4 @@
-pub(crate) use veloq_driver_core::op::types::{
+pub(crate) use veloq_driver_core::{
     Accept as CoreAccept, AcceptMulti as CoreAcceptMulti, AcceptedSocket, Close as CoreClose,
     Connect as CoreConnect, Fallocate as CoreFallocate, FallocateRaw as CoreFallocateRaw,
     Fsync as CoreFsync, FsyncRaw as CoreFsyncRaw, Open, ProvidedBuf, ReadFixed as CoreReadFixed,
@@ -18,7 +18,7 @@ use crate::{
 };
 use diagweave::prelude::Report;
 use veloq_buf::BufIoRangeError;
-use veloq_driver_core::platform::receive_pump::ReceivePendingKey;
+use veloq_driver_core::ReceivePendingKey;
 use veloq_io_uring::types::Timespec;
 use veloq_std::{
     collections::VecDeque,

@@ -39,6 +39,28 @@ impl CompletionControlKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OpToken {
+    index: usize,
+    generation: Generation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpTokenError {
+    /// slot index 超出 `CompletionToken` 的 index 位宽，编码后会侵占 generation 位。
+    IndexOverflow { index: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CompletionToken(u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionTokenError {
+    ReservedControlKind { kind: u16 },
+    ControlKindOverflow { kind: u16 },
+    ControlPayloadOverflow { payload: u64 },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionTokenClass {
     User(OpToken),
@@ -54,8 +76,8 @@ pub enum CompletionTokenClass {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubmitTokenContext {
-    pub op_token: OpToken,
-    pub completion_token: CompletionToken,
+    op_token: OpToken,
+    completion_token: CompletionToken,
 }
 
 impl SubmitTokenContext {
@@ -72,18 +94,14 @@ impl SubmitTokenContext {
             completion_token,
         }
     }
-}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct OpToken {
-    index: usize,
-    generation: Generation,
-}
+    pub const fn op_token(self) -> OpToken {
+        self.op_token
+    }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OpTokenError {
-    /// slot index 超出 `CompletionToken` 的 index 位宽，编码后会侵占 generation 位。
-    IndexOverflow { index: usize },
+    pub const fn completion_token(self) -> CompletionToken {
+        self.completion_token
+    }
 }
 
 impl OpToken {
@@ -165,16 +183,6 @@ impl CancelTicket {
     pub const fn raw(self) -> u64 {
         self.0.get()
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CompletionToken(u64);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompletionTokenError {
-    ReservedControlKind { kind: u16 },
-    ControlKindOverflow { kind: u16 },
-    ControlPayloadOverflow { payload: u64 },
 }
 
 impl fmt::Display for CompletionTokenError {
@@ -385,7 +393,7 @@ mod tests {
                     0,
                     0,
                 )
-                .identity,
+                .identity(),
                 super::super::event::CompletionIdentity::Cancel(ticket)
             );
         }
@@ -412,7 +420,7 @@ mod tests {
             0,
         );
         assert_eq!(
-            envelope.identity,
+            envelope.identity(),
             super::super::event::CompletionIdentity::UnknownControl {
                 kind: CompletionControlKind::Cancel as u16,
                 payload: 0,

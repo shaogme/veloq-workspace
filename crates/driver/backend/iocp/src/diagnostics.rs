@@ -2,7 +2,7 @@ use veloq_std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::rio::RioCompletionAnomaly;
 
-use veloq_driver_core::driver::{
+use veloq_driver_core::{
     CompletionAnomaly, CompletionAnomalyReason, DriverCompletionDiagnosticsBackend,
 };
 
@@ -260,7 +260,7 @@ impl DriverCompletionDiagnosticsBackend for IocpCompletionDiagnostics {
 mod tests {
     use super::IocpCompletionDiagnostics;
     use crate::{driver::RIO_EVENT_TOKEN, rio::RioCompletionAnomaly};
-    use veloq_driver_core::driver::{AnomalyAttach, DriverCompletionDiagnosticsBackend};
+    use veloq_driver_core::{AnomalyAttach, DriverCompletionDiagnosticsBackend};
 
     #[test]
     fn rio_backend_anomaly_keeps_core_counting_enabled() {

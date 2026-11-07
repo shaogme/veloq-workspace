@@ -12,6 +12,7 @@ use veloq_std::{
         UnpoisonedMutex,
         atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
+    task::Waker,
 };
 use veloq_waker::AtomicWaker;
 
@@ -40,19 +41,19 @@ pub enum SlotState {
 /// 「Idle 且信箱里压着一条未消费的完成」会被记成一个信息量为零的 `Idle`。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct SlotStatus {
-    pub state: SlotState,
+    state: SlotState,
     /// 信箱**非空**：至少有一条已发布、尚未被消费的完成记录。
     ///
     /// 是「非空」而不是「有一条」——multishot 操作可以在消费方来取之前压进多条。
     /// 条数只在信箱锁内有意义，原子字上只需要这个谓词。
-    pub ready: bool,
+    ready: bool,
     /// 有人正在改信箱（driver 线程发布，或消费方取走），其它修改必须自旋等待。
-    pub finalizing: bool,
+    finalizing: bool,
     /// 这个 slot 上有一个**尚未终止**的 multishot 操作：内核还会继续投递完成。
     ///
     /// 它与 `ready` 是两回事：`ready` 说的是「信箱里有没有货」，`streaming` 说的是
     /// 「还会不会再有货」。终态收尾（归还 slot、推进 generation）要求两者同时为假。
-    pub streaming: bool,
+    streaming: bool,
 }
 
 impl SlotStatus {
@@ -69,13 +70,29 @@ impl SlotStatus {
         Self::new(state, false, false, false)
     }
 
-    /// slot 可被 [`crate::driver::registry::OpRegistry::alloc`] 重新分配的充要条件。
+    /// slot 可被 [`crate::driver::OpRegistry::alloc`] 重新分配的充要条件。
     ///
     /// 注意 `ready` 也会让 slot 保持不可分配：detached future 仍可能来消费信箱里的
     /// 那条完成。`streaming` 不必单独判断——未终止的 multishot 操作必然让生命周期停在
     /// `InFlightWaiting` 或 `InFlightOrphaned`，`state` 这一项已经挡住了。
     pub const fn is_idle(self) -> bool {
         matches!(self.state, SlotState::Idle) && !self.ready
+    }
+
+    pub const fn state(self) -> SlotState {
+        self.state
+    }
+
+    pub const fn ready(self) -> bool {
+        self.ready
+    }
+
+    pub const fn finalizing(self) -> bool {
+        self.finalizing
+    }
+
+    pub const fn streaming(self) -> bool {
+        self.streaming
     }
 }
 
@@ -101,11 +118,11 @@ impl Debug for SlotStatus {
 #[bitsize(64)]
 #[derive(FromBits, DebugBits, Clone, Copy, PartialEq, Eq)]
 pub struct PackedCoreState {
-    pub(crate) generation_bits: u32,
-    pub state: SlotState,
-    pub ready: bool,
-    pub finalizing: bool,
-    pub streaming: bool,
+    generation_bits: u32,
+    state: SlotState,
+    ready: bool,
+    finalizing: bool,
+    streaming: bool,
     reserved_bits: u27,
 }
 
@@ -148,6 +165,10 @@ impl PackedCoreState {
     pub fn with_streaming(mut self, streaming: bool) -> Self {
         self.set_streaming(streaming);
         self
+    }
+
+    pub fn is_streaming(self) -> bool {
+        self.streaming()
     }
 
     pub fn with_generation(mut self, generation: Generation) -> Self {
@@ -199,9 +220,9 @@ impl AtomicPackedCoreState {
 }
 
 pub struct SlotStorage<Spec: SlotSpec> {
-    pub result: Option<DriverResult<SlotCompletion<Spec>, SlotError<Spec>>>,
-    pub payload: Option<SlotPayload<Spec>>,
-    pub sidecar: SlotSidecarData<Spec>,
+    result: Option<DriverResult<SlotCompletion<Spec>, SlotError<Spec>>>,
+    payload: Option<SlotPayload<Spec>>,
+    sidecar: SlotSidecarData<Spec>,
 }
 
 impl<Spec: SlotSpec> SlotStorage<Spec> {
@@ -215,6 +236,14 @@ impl<Spec: SlotSpec> SlotStorage<Spec> {
 
     pub fn reset(&mut self) {
         *self = Self::new();
+    }
+
+    pub fn payload(&self) -> Option<&SlotPayload<Spec>> {
+        self.payload.as_ref()
+    }
+
+    pub fn payload_mut(&mut self) -> Option<&mut SlotPayload<Spec>> {
+        self.payload.as_mut()
     }
 
     pub fn with_mut<F, X>(&mut self, f: F) -> X
@@ -237,26 +266,16 @@ impl<Spec: SlotSpec> Default for SlotStorage<Spec> {
 
 type SlotMarker<Spec> = PhantomData<fn() -> Spec>;
 
-pub struct SlotData<Spec: SlotSpec> {
-    pub(crate) core_state: AtomicPackedCoreState,
-    pub next_free: AtomicUsize,
-    pub(crate) completion_res: AtomicI32,
-    pub(crate) completion_flags: AtomicU32,
-    pub(crate) completion_mailbox: UnpoisonedMutex<CompletionMailbox<Spec>>,
-    pub(crate) completion_waker: AtomicWaker,
-    marker: SlotMarker<Spec>,
-}
-
 /// 一条已发布、等待被消费的完成。
 pub(crate) struct MailboxRecord<Spec: SlotSpec> {
-    pub(crate) event: UserCompletionEvent,
-    pub(crate) payload: Option<SlotPayload<Spec>>,
-    pub(crate) detail: Option<DriverResult<SlotCompletion<Spec>, SlotError<Spec>>>,
-    pub(crate) cleanup: CompletionCleanupGuard,
+    event: UserCompletionEvent,
+    payload: Option<SlotPayload<Spec>>,
+    detail: Option<DriverResult<SlotCompletion<Spec>, SlotError<Spec>>>,
+    cleanup: CompletionCleanupGuard,
     /// 取走这条之后该操作是否还会再产出完成。消费方（`LocalOp` / `DetachedOp` 的流）靠
     /// 它判断流的终点；cell 上的 `streaming` 位负责的是状态机的收尾，两者来源相同但用途
     /// 不同。
-    pub(crate) continuation: CompletionContinuation,
+    continuation: CompletionContinuation,
 }
 
 /// slot 的完成信箱。
@@ -264,6 +283,42 @@ pub(crate) struct MailboxRecord<Spec: SlotSpec> {
 /// 单发操作最多只会压进一条记录，所以第一条**内联**在 `head` 里，`rest` 永远是空的
 /// `VecDeque`（不分配）。只有 multishot 在消费方跟不上时才会用到 `rest`——把队列做成
 /// 无条件的 `VecDeque` 会让每一个普通 read/write 都付一次堆分配。
+pub(crate) struct MailboxRecordParts<Spec: SlotSpec> {
+    pub(crate) event: UserCompletionEvent,
+    pub(crate) payload: Option<SlotPayload<Spec>>,
+    pub(crate) detail: Option<DriverResult<SlotCompletion<Spec>, SlotError<Spec>>>,
+    pub(crate) cleanup: CompletionCleanupGuard,
+    pub(crate) continuation: CompletionContinuation,
+}
+
+impl<Spec: SlotSpec> MailboxRecord<Spec> {
+    pub(crate) fn new(
+        event: UserCompletionEvent,
+        payload: Option<SlotPayload<Spec>>,
+        detail: Option<DriverResult<SlotCompletion<Spec>, SlotError<Spec>>>,
+        cleanup: CompletionCleanupGuard,
+        continuation: CompletionContinuation,
+    ) -> Self {
+        Self {
+            event,
+            payload,
+            detail,
+            cleanup,
+            continuation,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> MailboxRecordParts<Spec> {
+        MailboxRecordParts {
+            event: self.event,
+            payload: self.payload,
+            detail: self.detail,
+            cleanup: self.cleanup,
+            continuation: self.continuation,
+        }
+    }
+}
+
 pub(crate) struct CompletionMailbox<Spec: SlotSpec> {
     head: Option<MailboxRecord<Spec>>,
     rest: VecDeque<MailboxRecord<Spec>>,
@@ -301,6 +356,16 @@ impl<Spec: SlotSpec> Default for CompletionMailbox<Spec> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+pub struct SlotData<Spec: SlotSpec> {
+    core_state: AtomicPackedCoreState,
+    next_free: AtomicUsize,
+    completion_res: AtomicI32,
+    completion_flags: AtomicU32,
+    completion_mailbox: UnpoisonedMutex<CompletionMailbox<Spec>>,
+    completion_waker: AtomicWaker,
+    marker: SlotMarker<Spec>,
 }
 
 impl<Spec: SlotSpec> fmt::Debug for MailboxRecord<Spec>
@@ -363,6 +428,49 @@ impl<Spec: SlotSpec> SlotData<Spec> {
 
     pub(crate) fn load_core_state(&self, ordering: Ordering) -> PackedCoreState {
         self.core_state.load(ordering)
+    }
+
+    pub(crate) fn compare_exchange_core_state(
+        &self,
+        current: PackedCoreState,
+        next: PackedCoreState,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<PackedCoreState, PackedCoreState> {
+        self.core_state
+            .compare_exchange(current, next, success, failure)
+    }
+
+    pub(crate) fn compare_exchange_core_state_weak(
+        &self,
+        current: PackedCoreState,
+        next: PackedCoreState,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<PackedCoreState, PackedCoreState> {
+        self.core_state
+            .compare_exchange_weak(current, next, success, failure)
+    }
+
+    pub(crate) fn store_core_state(&self, state: PackedCoreState, ordering: Ordering) {
+        self.core_state.store(state, ordering);
+    }
+
+    pub(crate) fn next_free(&self) -> &AtomicUsize {
+        &self.next_free
+    }
+
+    pub(crate) fn store_completion_event(&self, res: i32, flags: u32) {
+        self.completion_res.store(res, Ordering::Release);
+        self.completion_flags.store(flags, Ordering::Release);
+    }
+
+    pub(crate) fn wake_completion(&self) {
+        self.completion_waker.wake();
+    }
+
+    pub(crate) fn register_completion_waker(&self, waker: &Waker) {
+        self.completion_waker.register(waker);
     }
 
     pub(crate) fn set_state(&self, state: SlotState, ordering: Ordering) {

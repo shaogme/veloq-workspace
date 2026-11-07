@@ -10,7 +10,7 @@ use crate::{
     },
     error::{UringError, UringResult},
 };
-use veloq_driver_core::driver::{DriveMode, DrivePendingWork};
+use veloq_driver_core::{DriveMode, DrivePendingWork};
 use veloq_std::time::Duration;
 
 /// A source that consumes a bounded portion of one drive round.
@@ -174,13 +174,16 @@ impl RoundBudget {
     }
 
     fn exhausted_for(&self, pending: DrivePendingWork) -> bool {
-        self.is_exhausted_for(RoundBudgetKind::RemoteCancel, pending.remote_cancels)
-            || self.is_exhausted_for(RoundBudgetKind::LifecycleAction, pending.lifecycle_actions)
-            || self.is_exhausted_for(RoundBudgetKind::BacklogAction, pending.backlog_actions)
-            || self.is_exhausted_for(RoundBudgetKind::SqeEnter, pending.sqe_enters)
-            || self.is_exhausted_for(RoundBudgetKind::Cqe, pending.cqes)
-            || self.is_exhausted_for(RoundBudgetKind::Timer, pending.timers)
-            || self.is_exhausted_for(RoundBudgetKind::Effect, pending.effects)
+        self.is_exhausted_for(RoundBudgetKind::RemoteCancel, pending.remote_cancels())
+            || self.is_exhausted_for(
+                RoundBudgetKind::LifecycleAction,
+                pending.lifecycle_actions(),
+            )
+            || self.is_exhausted_for(RoundBudgetKind::BacklogAction, pending.backlog_actions())
+            || self.is_exhausted_for(RoundBudgetKind::SqeEnter, pending.sqe_enters())
+            || self.is_exhausted_for(RoundBudgetKind::Cqe, pending.cqes())
+            || self.is_exhausted_for(RoundBudgetKind::Timer, pending.timers())
+            || self.is_exhausted_for(RoundBudgetKind::Effect, pending.effects())
     }
 }
 
@@ -574,7 +577,7 @@ fn record_completion_diagnostics(
 mod tests {
     use super::{RoundBudget, WaitPriority};
     use crate::config::UringDriveLimits;
-    use veloq_driver_core::driver::DrivePendingWork;
+    use veloq_driver_core::DrivePendingWork;
 
     #[test]
     fn completion_priority_is_deterministic() {
@@ -639,9 +642,6 @@ mod tests {
         let mut budget = RoundBudget::new(UringDriveLimits::for_entries(1));
         budget.consume_remote_cancels(1);
         assert!(!budget.exhausted_for(DrivePendingWork::default()));
-        assert!(budget.exhausted_for(DrivePendingWork {
-            remote_cancels: 1,
-            ..DrivePendingWork::default()
-        }));
+        assert!(budget.exhausted_for(DrivePendingWork::default().with_remote_cancels(1)));
     }
 }

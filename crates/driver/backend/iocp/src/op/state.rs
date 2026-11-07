@@ -8,9 +8,8 @@ use crate::{
     win32::{IoCompletionPort, Overlapped},
 };
 use veloq_driver_core::{
-    driver::{CompletionToken, OpToken, registry::OpRegistry as CoreOpRegistry},
-    platform::receive_pump::ReceiveRequest,
-    slot::{Generation, Slot as CoreSlot, SlotSpec as CoreSlotSpec},
+    CompletionToken, Generation, OpRegistry as CoreOpRegistry, OpToken, ReceiveRequest,
+    Slot as CoreSlot, SlotSpec as CoreSlotSpec,
 };
 use veloq_std::{
     boxed::Box,

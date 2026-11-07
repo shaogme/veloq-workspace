@@ -148,7 +148,7 @@ mod loom_tests {
 
     use loom::{sync::Arc, thread};
 
-    use veloq_std::sync::RwLock;
+    use veloq_std::sync::{Mutex, RwLock};
 
     #[test]
     #[cfg(feature = "std")]

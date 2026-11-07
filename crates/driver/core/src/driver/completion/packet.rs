@@ -30,12 +30,6 @@ impl CompletionContinuation {
     }
 }
 
-pub struct CompletionPacket<Spec: SlotSpec> {
-    pub event: UserCompletionEvent,
-    pub input: CompletionInput<Spec>,
-    pub continuation: CompletionContinuation,
-}
-
 pub struct UserCompletion<Spec: SlotSpec> {
     pub payload: Spec::UserPayload,
     pub detail: Option<DriverResult<Spec::Completion, Spec::Error>>,
@@ -57,6 +51,26 @@ pub enum CompletionInput<Spec: SlotSpec> {
     Terminal(TerminalCompletion<Spec>),
 }
 
+pub struct CompletionPacket<Spec: SlotSpec> {
+    event: UserCompletionEvent,
+    input: CompletionInput<Spec>,
+    continuation: CompletionContinuation,
+}
+
+pub struct CompletionPacketParts<Spec: SlotSpec> {
+    pub event: UserCompletionEvent,
+    pub input: CompletionInput<Spec>,
+    pub continuation: CompletionContinuation,
+}
+
+pub struct CompletionRecordParts<Spec: SlotSpec> {
+    pub event: UserCompletionEvent,
+    pub payload: Option<Spec::UserPayload>,
+    pub detail: Option<DriverResult<Spec::Completion, Spec::Error>>,
+    pub cleanup: CompletionCleanupGuard,
+    pub continuation: CompletionContinuation,
+}
+
 impl<Spec: SlotSpec> CompletionInput<Spec> {
     pub fn cleanup_mut(&mut self) -> &mut CompletionCleanupGuard {
         match self {
@@ -71,6 +85,42 @@ impl<Spec: SlotSpec> CompletionInput<Spec> {
 }
 
 impl<Spec: SlotSpec> CompletionPacket<Spec> {
+    pub fn new(
+        event: UserCompletionEvent,
+        input: CompletionInput<Spec>,
+        continuation: CompletionContinuation,
+    ) -> Self {
+        Self {
+            event,
+            input,
+            continuation,
+        }
+    }
+
+    pub const fn event(&self) -> UserCompletionEvent {
+        self.event
+    }
+
+    pub const fn input(&self) -> &CompletionInput<Spec> {
+        &self.input
+    }
+
+    pub fn input_mut(&mut self) -> &mut CompletionInput<Spec> {
+        &mut self.input
+    }
+
+    pub const fn continuation(&self) -> CompletionContinuation {
+        self.continuation
+    }
+
+    pub fn into_parts(self) -> CompletionPacketParts<Spec> {
+        CompletionPacketParts {
+            event: self.event,
+            input: self.input,
+            continuation: self.continuation,
+        }
+    }
+
     pub fn user_event(
         event: UserCompletionEvent,
         payload: Spec::UserPayload,
@@ -140,46 +190,94 @@ impl<Spec: SlotSpec> CompletionPacket<Spec> {
     pub const fn completion_event(&self) -> CompletionEvent {
         self.event.event()
     }
+
+    pub(super) fn run_rejected_cleanup(
+        diagnostics: &DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
+        mut packet: Self,
+    ) {
+        Self::run_completion_cleanup(diagnostics, packet.input.cleanup_mut());
+        drop(packet);
+    }
+
+    pub(super) fn run_completion_cleanup<B>(
+        diagnostics: &DriverCompletionDiagnostics<B>,
+        cleanup: &mut CompletionCleanupGuard,
+    ) -> bool {
+        match cleanup.run() {
+            Ok(ran) => ran,
+            Err(_) => {
+                diagnostics.inc_orphan_cleanup_error();
+                false
+            }
+        }
+    }
 }
 
 pub struct CompletionRecord<Spec: SlotSpec> {
-    pub event: UserCompletionEvent,
+    event: UserCompletionEvent,
     /// `None` 只用于没有可交付资源的终态错误 record。
-    pub payload: Option<Spec::UserPayload>,
-    pub detail: Option<DriverResult<Spec::Completion, Spec::Error>>,
-    pub cleanup: CompletionCleanupGuard,
+    payload: Option<Spec::UserPayload>,
+    detail: Option<DriverResult<Spec::Completion, Spec::Error>>,
+    cleanup: CompletionCleanupGuard,
     /// 取走这条记录之后，该操作是否还会再产出完成。
     ///
     /// 单发操作恒为 [`CompletionContinuation::Final`]，于是 `LocalOp` / `DetachedOp` 的流
     /// 在第一项之后就结束；multishot 靠它判断流到此为止。
-    pub continuation: CompletionContinuation,
+    continuation: CompletionContinuation,
 }
 
 impl<Spec: SlotSpec> CompletionRecord<Spec> {
+    pub fn new(
+        event: UserCompletionEvent,
+        payload: Option<Spec::UserPayload>,
+        detail: Option<DriverResult<Spec::Completion, Spec::Error>>,
+        cleanup: CompletionCleanupGuard,
+        continuation: CompletionContinuation,
+    ) -> Self {
+        Self {
+            event,
+            payload,
+            detail,
+            cleanup,
+            continuation,
+        }
+    }
+
+    pub const fn event(&self) -> UserCompletionEvent {
+        self.event
+    }
+
+    pub fn payload(&self) -> Option<&Spec::UserPayload> {
+        self.payload.as_ref()
+    }
+
+    pub fn detail(&self) -> Option<&DriverResult<Spec::Completion, Spec::Error>> {
+        self.detail.as_ref()
+    }
+
+    pub const fn cleanup(&self) -> &CompletionCleanupGuard {
+        &self.cleanup
+    }
+
+    pub fn cleanup_mut(&mut self) -> &mut CompletionCleanupGuard {
+        &mut self.cleanup
+    }
+
+    pub const fn continuation(&self) -> CompletionContinuation {
+        self.continuation
+    }
+
+    pub fn into_parts(self) -> CompletionRecordParts<Spec> {
+        CompletionRecordParts {
+            event: self.event,
+            payload: self.payload,
+            detail: self.detail,
+            cleanup: self.cleanup,
+            continuation: self.continuation,
+        }
+    }
+
     pub fn disarm_cleanup(&mut self) -> bool {
         self.cleanup.disarm()
-    }
-}
-
-#[inline]
-pub(super) fn run_rejected_cleanup<Spec: SlotSpec>(
-    diagnostics: &DriverCompletionDiagnostics<Spec::CompletionDiagnostics>,
-    mut packet: CompletionPacket<Spec>,
-) {
-    run_completion_cleanup(diagnostics, packet.input.cleanup_mut());
-    drop(packet);
-}
-
-#[inline]
-pub fn run_completion_cleanup<B>(
-    diagnostics: &DriverCompletionDiagnostics<B>,
-    cleanup: &mut CompletionCleanupGuard,
-) -> bool {
-    match cleanup.run() {
-        Ok(ran) => ran,
-        Err(_) => {
-            diagnostics.inc_orphan_cleanup_error();
-            false
-        }
     }
 }

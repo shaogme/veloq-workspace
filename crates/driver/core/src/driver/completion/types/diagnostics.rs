@@ -3,11 +3,13 @@ use veloq_std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use super::anomaly::{
-    AnomalyAttach, AnomalyOutcome, CompletionAnomaly, CompletionAnomalyKind,
-    CompletionAnomalyReason,
+use super::{
+    anomaly::{
+        AnomalyAttach, AnomalyOutcome, CompletionAnomaly, CompletionAnomalyKind,
+        CompletionAnomalyReason,
+    },
+    record::RecordCompletionOutcome,
 };
-use super::record::RecordCompletionOutcome;
 
 #[derive(Debug, Default)]
 struct DriverCompletionDiagnosticsInner<B = ()> {

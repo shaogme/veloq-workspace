@@ -12,8 +12,7 @@ use diagweave::prelude::*;
 use tracing::{debug, trace};
 use veloq_buf::heap::ChunkId;
 use veloq_driver_core::{
-    driver::{CompletionToken, OpToken, SubmitTokenContext},
-    slot::{SlotAccessError, SubmissionGuard},
+    CompletionToken, OpToken, SlotAccessError, SubmissionGuard, SubmitTokenContext,
 };
 use veloq_std::format;
 use veloq_wheel::TimerId;
@@ -25,13 +24,13 @@ impl SlotAccessReporter {
         UringError::InvalidState
             .to_report()
             .push_ctx("scope", scope)
-            .with_ctx("slot_index", err.snapshot.index)
-            .with_ctx("slot_generation", err.snapshot.generation)
-            .with_ctx("slot_status", format!("{:?}", err.snapshot.status))
-            .with_ctx("slot_has_op", err.snapshot.has_op)
-            .with_ctx("slot_has_payload", err.snapshot.has_payload)
-            .with_ctx("slot_access_action", format!("{:?}", err.action))
-            .with_ctx("slot_access_reason", format!("{:?}", err.reason))
+            .with_ctx("slot_index", err.snapshot().index())
+            .with_ctx("slot_generation", err.snapshot().generation())
+            .with_ctx("slot_status", format!("{:?}", err.snapshot().status()))
+            .with_ctx("slot_has_op", err.snapshot().has_op())
+            .with_ctx("slot_has_payload", err.snapshot().has_payload())
+            .with_ctx("slot_access_action", format!("{:?}", err.action()))
+            .with_ctx("slot_access_reason", format!("{:?}", err.reason()))
             .attach_note("slot access failed during uring submission transaction")
     }
 }
@@ -135,19 +134,15 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                 } else {
                     SubmissionPhase::Reserved
                 };
-                let slot = self
-                    .slot_guard
-                    .as_mut()
-                    .and_then(|guard| guard.slot.as_mut())
-                    .ok_or_else(|| {
-                        UringError::InvalidState.report(
-                            "driver.submit_txn.submit_sqe",
-                            "submission guard missing after SQE build",
-                        )
-                    })?;
+                let guard = self.slot_guard.as_mut().ok_or_else(|| {
+                    UringError::InvalidState.report(
+                        "driver.submit_txn.submit_sqe",
+                        "submission guard missing after SQE build",
+                    )
+                })?;
                 self.env.transition_submission_state(
                     self.token,
-                    slot.platform_mut(),
+                    guard.platform_mut(),
                     next_phase,
                     if pushed {
                         "submit transaction staged SQE"
@@ -190,17 +185,13 @@ impl<'a, 'b, 'e, 's> UringSubmitTxn<'a, 'b, 'e, 's> {
                 self.timer_inserted = Some(task_id);
                 self.env.record_timer_insert(self.token, task_id);
 
-                let slot = self
-                    .slot_guard
-                    .as_mut()
-                    .and_then(|guard| guard.slot.as_mut())
-                    .ok_or_else(|| {
-                        UringError::InvalidState.report(
-                            "driver.submit_txn.timer",
-                            "submission guard missing after timer dispatch",
-                        )
-                    })?;
-                let platform = slot.platform_mut();
+                let guard = self.slot_guard.as_mut().ok_or_else(|| {
+                    UringError::InvalidState.report(
+                        "driver.submit_txn.timer",
+                        "submission guard missing after timer dispatch",
+                    )
+                })?;
+                let platform = guard.platform_mut();
                 platform.arm_timer(task_id);
                 self.env.transition_submission_state(
                     self.token,

@@ -13,10 +13,10 @@ pub type SlotEntry<Spec> = CachePadded<SlotData<Spec>>;
 pub type SlotEntries<Spec> = Box<[SlotEntry<Spec>]>;
 
 pub struct SlotTable<Spec: SlotSpec> {
-    pub slots: SlotEntries<Spec>,
-    pub remote_free_head: AtomicUsize,
+    slots: SlotEntries<Spec>,
+    remote_free_head: AtomicUsize,
     ready_completion_count: AtomicUsize,
-    pub(crate) diagnostics: DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
+    diagnostics: DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>>,
 }
 
 impl<Spec: SlotSpec> SlotTable<Spec> {
@@ -41,11 +41,21 @@ impl<Spec: SlotSpec> SlotTable<Spec> {
         self.diagnostics.clone()
     }
 
+    pub fn slots(&self) -> &[SlotEntry<Spec>] {
+        &self.slots
+    }
+
+    pub(crate) fn diagnostics(
+        &self,
+    ) -> &DriverCompletionDiagnostics<SlotCompletionDiagnostics<Spec>> {
+        &self.diagnostics
+    }
+
     pub fn push_free(&self, idx: usize) {
         let slot = &self.slots[idx];
         let mut head = self.remote_free_head.load(Ordering::Relaxed);
         loop {
-            slot.next_free.store(head, Ordering::Relaxed);
+            slot.next_free().store(head, Ordering::Relaxed);
             match self.remote_free_head.compare_exchange_weak(
                 head,
                 idx,

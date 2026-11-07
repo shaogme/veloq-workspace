@@ -1,10 +1,13 @@
 use diagweave::prelude::*;
 use tracing::{debug, trace};
-use veloq_buf::{AnyBufPool, BufferRegistrationRequest, heap::ChunkId};
+use veloq_buf::{AnyBufPool, BufferRegistrationRequest};
 use veloq_io_uring::{
     IoUring, KernelCapabilities, ResourceLayout, RingConfig, SetupFlags, SetupPolicy,
 };
 use veloq_std::{format, io, sync::Arc, vec::Vec};
+
+#[cfg(feature = "test-hooks")]
+use veloq_buf::heap::ChunkId;
 
 use crate::{
     config::{IoFd, IoMode, UringConfig, UringRawHandle},
@@ -26,24 +29,19 @@ use crate::{
     op::{UringOp, UringSlotSpec, UringUserPayload},
 };
 use veloq_driver_core::{
-    driver::{
-        BufferRegistrationStatus, CancelRequest, CancelSubmitOutcome, CompletionToken, DriveMode,
-        DriveOutcome, DriverCompletionDiagnostics, DriverCompletionDiagnosticsSnapshot, DriverRaw,
-        DriverStartup, DriverStartupRequirements, DriverStartupResources, DriverSubmitResult,
-        OpToken, RegisterFd, RemoteCancelSender, RemoteWaker, SharedCompletionTable,
-        SharedSlotTable, SubmitStatus, UdpReceiveOperationBuilder,
-        registry::{OpEntry, OpHandle},
-        sealed,
-    },
-    op::types::UdpRecvMulti,
-    platform::receive_pump::{ReceivePermitNotifier, ReceivePumpState, UdpReceiveConfig},
+    BufferRegistrationStatus, CancelRequest, CancelSubmitOutcome, CompletionToken, DriveMode,
+    DriveOutcome, DriverCompletionDiagnostics, DriverCompletionDiagnosticsSnapshot, DriverRaw,
+    DriverStartup, DriverStartupRequirements, DriverStartupResources, DriverSubmitResult, OpEntry,
+    OpHandle, OpToken, ReceivePermitNotifier, ReceivePumpState, RegisterFd, RemoteCancelSender,
+    RemoteWaker, SharedCompletionTable, SharedSlotTable, SubmitStatus, UdpReceiveConfig,
+    UdpReceiveOperationBuilder, UdpRecvMulti, sealed,
 };
 
 #[cfg(feature = "test-hooks")]
 use veloq_std::string::String;
 
 #[cfg(feature = "test-hooks")]
-use veloq_driver_core::driver::test_hooks::{DriverTestHooks, RegisterFilesUpdateOutcome};
+use veloq_driver_core::{test_hooks::DriverTestHooks, test_hooks::RegisterFilesUpdateOutcome};
 
 mod completion;
 mod context;
@@ -155,7 +153,7 @@ impl<'a> UringDriver<'a> {
 
         let operations = OperationLedger::new(entries as usize);
         let completion_table: SharedCompletionTable<UringSlotSpec> = operations.shared_table();
-        let completion_diagnostics = operations.shared.completion_diagnostics();
+        let completion_diagnostics = operations.shared_slots().completion_diagnostics();
 
         let waker = UringWakerManager::new()?;
         let ring_lifetime = RingLifetimeOwner::new();
@@ -298,7 +296,7 @@ impl RingShutdown {
                 .inc_provided_drop_skipped_unregister();
         } else {
             let pending_completions = if driver.completion.has_pending_cqes()
-                || driver.operations.shared.has_ready_completion()
+                || driver.operations.shared_slots().has_ready_completion()
             {
                 true
             } else {
@@ -438,7 +436,7 @@ impl<'a> DriverRaw for UringDriver<'a> {
     }
 
     fn slot_table_raw(&self) -> SharedSlotTable<Self::SlotSpec> {
-        self.operations.shared.clone()
+        self.operations.shared_slots().clone()
     }
 
     fn remote_cancel_sender_raw(&self) -> RemoteCancelSender {
@@ -569,7 +567,7 @@ impl<'a> DriverRaw for UringDriver<'a> {
 
         Ok(DriveOutcome {
             next_timeout_hint,
-            ready_completion: self.operations.shared.has_ready_completion(),
+            ready_completion: self.operations.shared_slots().has_ready_completion(),
             in_flight: self.operations.has_active_ops(),
             pending_work: report.pending_work,
             budget_exhausted: report.budget_exhausted,

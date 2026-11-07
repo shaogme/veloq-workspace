@@ -14,7 +14,7 @@ use crate::{
     error::{IocpError, IocpResult},
     win32::IoCompletionPort,
 };
-use veloq_driver_core::driver::{CompletionToken, RemoteWaker};
+use veloq_driver_core::{CompletionToken, RemoteWaker};
 
 // ============================================================================
 // Error Context & Logic

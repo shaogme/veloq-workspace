@@ -14,11 +14,9 @@ use crate::{
 use diagweave::prelude::*;
 use veloq_buf::{FixedBuf, heap::ChunkId};
 use veloq_driver_core::{
-    driver::{CompletionCleanupGuard, OpToken, SubmitTokenContext},
-    op::types::UdpRecvMultiBackend,
-    op::{IntoPlatformOp, LostReason, OpCompletion, OpError, OpKind, OpResult, SingleShotOp},
-    platform::receive_pump::{ReceivePumpError, ReceivePumpEvent},
-    slot::{SlotAccess, SlotAccessError},
+    CompletionCleanupGuard, IntoPlatformOp, LostReason, OpCompletion, OpError, OpKind, OpResult,
+    OpToken, ReceivePumpError, ReceivePumpEvent, SingleShotOp, SlotAccess, SlotAccessError,
+    SubmitTokenContext, UdpRecvMultiBackend,
 };
 use veloq_io_uring::{cqueue, squeue};
 use veloq_std::{convert::identity, format, num::NonZeroUsize, pin::Pin, time::Duration};
@@ -372,7 +370,7 @@ fn descriptor_finish_udp_packet(
         drop(delivery);
         return Err(report);
     }
-    let datagram_capacity = user.receive_pump().config().datagram_capacity.get();
+    let datagram_capacity = user.receive_pump().config().datagram_capacity().get();
     let parsed = match pending.lease.as_slice() {
         Some(bytes) => payload::parse_udp_recvmsg(bytes, kernel.message(), datagram_capacity),
         None => Err(UringError::InvalidState.report(SCOPE, "pending UDP lease has no buffer")),
@@ -488,7 +486,7 @@ fn descriptor_record_item_udp_packet(
         return Err(report);
     }
 
-    let datagram_capacity = user.receive_pump().config().datagram_capacity.get();
+    let datagram_capacity = user.receive_pump().config().datagram_capacity().get();
     let parsed = match lease.as_slice() {
         Some(bytes) => payload::parse_udp_recvmsg(
             bytes,
@@ -602,13 +600,13 @@ fn projection_access_report(
             scope,
             "slot access failed during operation payload projection",
         )
-        .with_ctx("slot_index", error.snapshot.index)
-        .with_ctx("slot_generation", error.snapshot.generation)
-        .with_ctx("slot_status", format!("{:?}", error.snapshot.status))
-        .with_ctx("slot_has_op", error.snapshot.has_op)
-        .with_ctx("slot_has_payload", error.snapshot.has_payload)
-        .with_ctx("slot_access_action", format!("{:?}", error.action))
-        .with_ctx("slot_access_reason", format!("{:?}", error.reason));
+        .with_ctx("slot_index", error.snapshot().index())
+        .with_ctx("slot_generation", error.snapshot().generation())
+        .with_ctx("slot_status", format!("{:?}", error.snapshot().status()))
+        .with_ctx("slot_has_op", error.snapshot().has_op())
+        .with_ctx("slot_has_payload", error.snapshot().has_payload())
+        .with_ctx("slot_access_action", format!("{:?}", error.action()))
+        .with_ctx("slot_access_reason", format!("{:?}", error.reason()));
     if let Some(token) = token {
         report = report
             .with_ctx("token_index", token.index())
@@ -952,7 +950,7 @@ macro_rules! impl_uring_operation_descriptor {
                 unsafe {
                     Self::with_projected_access(
                         access,
-                        Some(token.op_token),
+                        Some(token.op_token()),
                         "uring.op.spec.make_sqe",
                         |kernel, user| Self::make_sqe(kernel, user, env, token),
                     )
@@ -2404,13 +2402,9 @@ mod tests {
     use core::ptr::{eq, read_unaligned};
     use veloq_buf::{FixedBuf, heap::ChunkId};
     use veloq_driver_core::{
-        driver::{OpToken, SubmitTokenContext, registry::OpEntry},
-        op::{IntoPlatformOp, OpKind},
-        platform::receive_pump::{ReceivePumpConfig, ReceivePumpState, ReceiveSlot},
-        slot::{
-            CheckedSlotView, Reserved, Slot, SlotAccess, SlotAccessOutcome, SlotRegistryExt,
-            SlotView,
-        },
+        CheckedSlotView, IntoPlatformOp, OpEntry, OpKind, OpToken, ReceivePumpConfig,
+        ReceivePumpState, ReceiveSlot, Reserved, Slot, SlotAccess, SlotAccessOutcome,
+        SlotRegistryExt, SlotView, SubmitTokenContext,
     };
     use veloq_io_uring::squeue;
     use veloq_std::{
@@ -2442,12 +2436,12 @@ mod tests {
     }
 
     fn udp_pump() -> ReceivePumpState {
-        let config = ReceivePumpConfig {
-            kernel_capacity: NonZeroUsize::new(1).expect("depth is non-zero"),
-            queue_capacity: NonZeroUsize::new(1).expect("queue is non-zero"),
-            datagram_capacity: NonZeroUsize::new(16).expect("datagram capacity is non-zero"),
-            close_timeout: Duration::from_secs(1),
-        };
+        let config = ReceivePumpConfig::new(
+            NonZeroUsize::new(1).expect("depth is non-zero"),
+            NonZeroUsize::new(1).expect("queue is non-zero"),
+            NonZeroUsize::new(16).expect("datagram capacity is non-zero"),
+            Duration::from_secs(1),
+        );
         let slots = vec![ReceiveSlot::new(0, buffer(4))].into_boxed_slice();
         ReceivePumpState::try_new(config, slots).expect("test UDP pump should be valid")
     }
@@ -2671,8 +2665,7 @@ mod tests {
             size_of::<UringKernelPayloadStorage>(),
             align_of::<UringKernelPayloadStorage>(),
         );
-        let user_payload_size = if cfg!(target_os = "linux") { 352 } else { 384 };
-        assert_eq!(layout, (224, 8, user_payload_size, 32, 216, 8));
+        assert_eq!(layout, (224, 8, 384, 32, 216, 8));
     }
 
     #[test]

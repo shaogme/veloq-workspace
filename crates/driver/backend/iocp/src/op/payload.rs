@@ -16,9 +16,7 @@ use crate::{
 
 use diagweave::prelude::*;
 use veloq_buf::FixedBuf;
-use veloq_driver_core::{
-    driver::OpToken, platform::receive_pump::ReceivePumpState, slot::Generation,
-};
+use veloq_driver_core::{Generation, OpToken, ReceivePumpState};
 
 pub enum IocpUserPayload {
     ReadFixed(ReadFixed),
@@ -454,7 +452,7 @@ impl PayloadBinding<Open> for OpenPayload {
 #[cfg(test)]
 mod raw_udp_receive_request_tests {
     use super::UdpRecvMultiPayload;
-    use veloq_driver_core::{driver::OpToken, slot::Generation};
+    use veloq_driver_core::{Generation, OpToken};
     use veloq_std::vec::Vec;
 
     #[test]

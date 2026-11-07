@@ -21,11 +21,8 @@ use crate::{
 };
 use diagweave::prelude::*;
 use veloq_driver_core::{
-    driver::{
-        AnomalyAttach, CompletionAnomalyKind, CompletionFlowExt, CompletionIngress, RawCompletion,
-        SharedCompletionTable,
-    },
-    slot::Generation,
+    AnomalyAttach, BackendSlotRef, CompletionAnomalyKind, CompletionFlowExt, CompletionIngress,
+    Generation, RawCompletion, SharedCompletionTable,
 };
 use veloq_std::{mem::zeroed, string::ToString};
 use windows_sys::Win32::Networking::WinSock::{RIO_CORRUPT_CQ, RIORESULT};
@@ -65,9 +62,11 @@ impl RioCompletionAnomaly {
             Self::STALE,
             COMP_BACKEND_RIO,
             raw_context,
-            index,
-            expected_generation,
-            actual_generation,
+            BackendSlotRef {
+                index,
+                expected_generation,
+                actual_generation: Some(actual_generation),
+            },
         )
     }
 }
@@ -292,7 +291,7 @@ mod tests {
     };
     use crate::error::IocpError;
     use diagweave::prelude::*;
-    use veloq_driver_core::platform::receive_pump::ReceivePumpError;
+    use veloq_driver_core::ReceivePumpError;
     use windows_sys::Win32::Networking::WinSock::{WSA_OPERATION_ABORTED, WSAENOBUFS};
 
     fn result(status: i32, bytes: u32) -> RioResultData {

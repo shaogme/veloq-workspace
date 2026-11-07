@@ -26,7 +26,7 @@ use crate::{
     op::{CheckedSlotView, RecordPolicy, SlotView, UringOpRegistryExt, UringSlotSpec},
 };
 
-use veloq_driver_core::driver::{
+use veloq_driver_core::{
     AnomalyAttach, CompletionAnomalyKind, CompletionEnvelope, CompletionFlowExt,
     CompletionFlowOutcome, CompletionIngress, CompletionToken, DriverCompletionDiagnostics,
     OpToken, SharedCompletionTable, SyntheticCompletionSource, UserCompletionEvent,
@@ -146,7 +146,7 @@ impl CompletionScratch {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(feature = "loom")))]
     pub(super) fn prepare_recycle_test(&mut self, capacity: usize) {
         let _ = self.effect_accumulator.take();
         self.pending_effects = Some(UringPostCompletionEffects::with_capacity(capacity));
@@ -186,7 +186,7 @@ pub(crate) struct CompletionBatchProgress {
 
 impl CompletionBatchProgress {
     pub(crate) const fn user_completed(&self) -> usize {
-        self.flow.user_completed
+        self.flow.user_completed_count()
     }
     pub(crate) const fn timer_count(&self) -> usize {
         self.timer_count
@@ -341,7 +341,7 @@ impl<'scratch, 'context> CompletionPorts<'scratch, 'context> {
             );
             if let Err(error) = self
                 .control
-                .settle_staged_completion(envelope.raw.token, !cqueue::more(cqe.flags))
+                .settle_staged_completion(envelope.raw().token(), !cqueue::more(cqe.flags))
             {
                 self.control.quarantine_unpublished_staged();
                 remember_first_error(
@@ -431,7 +431,7 @@ impl<'scratch, 'context> CompletionPorts<'scratch, 'context> {
                 );
                 match outcome {
                     Ok(outcome) => {
-                        let user_completed = outcome.user_completed;
+                        let user_completed = outcome.user_completed_count();
                         progress.merge(outcome);
                         if user_completed == 0 {
                             break;
@@ -517,7 +517,7 @@ impl<'scratch, 'context> CompletionPorts<'scratch, 'context> {
         }
         if let Some((token, true)) = observation
             && let Ok(progress) = &flow_result
-            && (progress.user_completed > 0 || progress.orphan_cleaned > 0)
+            && (progress.user_completed_count() > 0 || progress.orphan_cleaned_count() > 0)
         {
             self.control.release_quarantined_token(token);
         }
@@ -529,7 +529,9 @@ fn completion_observation(
     ingress: &CompletionIngress<UringBackendIngress>,
 ) -> Option<(OpToken, bool)> {
     let (token, flags) = match ingress {
-        CompletionIngress::Kernel(envelope) => (envelope.raw.token.op_token()?, envelope.raw.flags),
+        CompletionIngress::Kernel(envelope) => {
+            (envelope.raw().token().op_token()?, envelope.raw().flags())
+        }
         CompletionIngress::User(event) | CompletionIngress::Synthetic { event, .. } => {
             (event.token(), event.flags())
         }
@@ -550,7 +552,7 @@ fn observe_completion_result(
     let Ok(progress) = result else {
         return;
     };
-    if progress.user_completed == 0 && progress.orphan_cleaned == 0 {
+    if progress.user_completed_count() == 0 && progress.orphan_cleaned_count() == 0 {
         return;
     }
     control.record_completion_observation(token, final_completion);

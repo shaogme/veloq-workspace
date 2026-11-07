@@ -56,8 +56,8 @@ impl fmt::Display for LostReason {
 /// 描述 IO 操作丢失及其原因的结构化错误。
 #[derive(Debug)]
 pub struct OpError<E> {
-    pub reason: LostReason,
-    pub source: DriverReport<E>,
+    reason: LostReason,
+    source: DriverReport<E>,
 }
 
 impl<E> OpError<E> {
@@ -68,6 +68,14 @@ impl<E> OpError<E> {
     /// 如果原因为 GenerationMismatch，则认为该错误是致命的（资源状态不确定）。
     pub fn is_lethal(&self) -> bool {
         matches!(self.reason, LostReason::GenerationMismatch)
+    }
+
+    pub const fn reason(&self) -> LostReason {
+        self.reason
+    }
+
+    pub fn source(&self) -> &DriverReport<E> {
+        &self.source
     }
 }
 
@@ -87,6 +95,18 @@ pub enum OpResult<T, E, R = usize> {
     Completed(DriverResult<R, E>, T),
     /// Operation failed because the resource ownership was lost.
     ResourceLost(OpError<E>),
+}
+
+struct LocalSubmitOutcome<Spec: SlotSpec> {
+    token: OpToken,
+    result: DriverSubmitResult<SlotError<Spec>>,
+    recovered: Option<SlotPayload<Spec>>,
+}
+
+struct LocalSubmitFailure<Spec: SlotSpec, Op, Payload> {
+    report: DriverReport<SlotError<Spec>>,
+    driver_op: Op,
+    payload: Payload,
 }
 
 impl<T, E, R> OpResult<T, E, R>
@@ -114,8 +134,8 @@ where
 /// The completion projection for a submitted operation.
 #[derive(Debug)]
 pub struct OpCompletion<T, E, R = usize> {
-    pub result: DriverResult<R, E>,
-    pub output: T,
+    result: DriverResult<R, E>,
+    output: T,
 }
 
 impl<T, E, R> OpCompletion<T, E, R> {
@@ -125,6 +145,14 @@ impl<T, E, R> OpCompletion<T, E, R> {
 
     pub fn into_parts(self) -> (DriverResult<R, E>, T) {
         (self.result, self.output)
+    }
+
+    pub fn result(&self) -> &DriverResult<R, E> {
+        &self.result
+    }
+
+    pub fn output(&self) -> &T {
+        &self.output
     }
 }
 
@@ -145,6 +173,20 @@ impl<E> OpError<E>
 where
     E: DriverError,
 {
+    pub fn payload_projection_mismatch_report(
+        expected_payload: &'static str,
+        erased_payload: &'static str,
+    ) -> DriverReport<E> {
+        E::from_core_report(
+            DriverCoreError::Internal
+                .to_report()
+                .push_ctx("scope", "driver-core/op/payload_projection")
+                .with_ctx("expected_payload", expected_payload)
+                .with_ctx("erased_payload", erased_payload)
+                .attach_note("operation payload variant mismatch"),
+        )
+    }
+
     #[inline]
     pub(crate) fn payload_missing() -> Self {
         Self::new(
@@ -173,7 +215,7 @@ where
         let mut report = DriverCoreError::Internal
             .to_report()
             .push_ctx("scope", "driver-core/op")
-            .with_ctx("completion_token", attach.token.raw())
+            .with_ctx("completion_token", attach.token().raw())
             .with_ctx("completion_anomaly", format!("{:?}", kind.reason()))
             .attach_note("operation completion became unavailable");
 
@@ -181,21 +223,24 @@ where
             report = report.with_ctx("slot_index", index);
         }
         if let Some(expected_generation) = kind.expected_generation() {
-            report = report.with_ctx("expected_generation", expected_generation);
+            report = report.with_ctx("expected_generation", expected_generation.get());
         }
         if let Some(actual_generation) = kind.actual_generation() {
-            report = report.with_ctx("actual_generation", actual_generation);
+            report = report.with_ctx("actual_generation", actual_generation.get());
         }
         if let Some(status) = kind.status() {
             report = report.with_ctx("slot_status", format!("{status:?}"));
         }
-        if let Some(backend) = kind.backend().or_else(|| attach.raw.map(|raw| raw.backend)) {
+        if let Some(backend) = kind
+            .backend()
+            .or_else(|| attach.raw().map(|raw| raw.backend))
+        {
             report = report.with_ctx("completion_backend", format!("{backend:?}"));
         }
         if let Some(backend_context) = kind.backend_context_value() {
             report = report.with_ctx("completion_backend_context", backend_context);
         }
-        if let Some(raw) = attach.raw {
+        if let Some(raw) = attach.raw() {
             report = report
                 .with_ctx("raw_result", raw.res)
                 .with_ctx("completion_flags", raw.flags);
@@ -224,13 +269,12 @@ where
     Spec: SlotSpec,
     T: IntoPlatformOp<Spec>,
 {
-    let CompletionRecord {
-        event,
-        payload: erased,
-        detail,
-        mut cleanup,
-        continuation,
-    } = record;
+    let parts = record.into_parts();
+    let event = parts.event;
+    let erased = parts.payload;
+    let detail = parts.detail;
+    let mut cleanup = parts.cleanup;
+    let continuation = parts.continuation;
 
     let Some(erased) = erased else {
         let error = match detail {
@@ -307,14 +351,14 @@ where
     Spec: SlotSpec,
     T: IntoPlatformOp<Spec>,
 {
-    pub(crate) completion_table: Option<SharedCompletionTable<Spec>>,
-    pub(crate) cancel_sender: Option<RemoteCancelSender>,
-    pub(crate) cancel_waker: Option<Arc<dyn RemoteWaker<Spec::Error>>>,
-    pub(crate) token: Option<OpToken>,
+    completion_table: Option<SharedCompletionTable<Spec>>,
+    cancel_sender: Option<RemoteCancelSender>,
+    cancel_waker: Option<Arc<dyn RemoteWaker<Spec::Error>>>,
+    token: Option<OpToken>,
     /// 提交阶段就已经定局的那一项（同步失败或资源丢失）。取走它之后就再没有别的来源，
     /// 流随即结束——所以它和 `token` 不会同时是 `Some`。
-    pub(crate) immediate: Option<OpItem<T, Spec>>,
-    pub(crate) _phantom: PhantomData<DetachedOpMarker<T, Spec>>,
+    immediate: Option<OpItem<T, Spec>>,
+    _phantom: PhantomData<DetachedOpMarker<T, Spec>>,
 }
 
 impl<T, Spec> DetachedOp<T, Spec>
@@ -386,6 +430,10 @@ where
         self.token.is_some()
     }
 
+    pub const fn token(&self) -> Option<OpToken> {
+        self.token
+    }
+
     /// 确保该操作已被 Arm。
     pub fn arm(&mut self) -> bool {
         self.is_armed() || self.immediate.is_some()
@@ -440,7 +488,7 @@ where
     }
 }
 
-impl<T, Spec> futures_core::Stream for DetachedOp<T, Spec>
+impl<T, Spec> Stream for DetachedOp<T, Spec>
 where
     Spec: SlotSpec,
     T: IntoPlatformOp<Spec>,
@@ -470,19 +518,13 @@ where
     P: DriverProvider,
     T: IntoPlatformOp<P::SlotSpec>,
 {
-    pub(crate) state: LocalState,
-    pub(crate) data: Option<T>,
-    pub(crate) provider: P,
-    pub(crate) token: Option<OpToken>,
-    pub(crate) immediate: Option<OpItem<T, P::SlotSpec>>,
-    pub(crate) marker: PhantomData<&'a ()>,
+    state: LocalState,
+    data: Option<T>,
+    provider: P,
+    token: Option<OpToken>,
+    immediate: Option<OpItem<T, P::SlotSpec>>,
+    marker: PhantomData<&'a ()>,
 }
-
-type LocalSubmitOutcome<P> = (
-    OpToken,
-    DriverSubmitResult<SlotError<<P as DriverProvider>::SlotSpec>>,
-    Option<SlotPayload<<P as DriverProvider>::SlotSpec>>,
-);
 
 impl<'a, T, P> LocalOp<'a, T, P>
 where
@@ -525,43 +567,62 @@ where
         let data = self.data.take().expect("Op started without data");
         let (driver_op, payload) = data.into_kernel_and_payload();
 
-        let submit_res: Result<LocalSubmitOutcome<P>, _> =
-            self.provider.with_driver(|mut driver| {
-                let mut slot = match driver.reserve_op() {
-                    Ok(v) => v,
-                    Err(e) => return Err((e, driver_op, payload)),
-                };
-                let token = slot.token();
-                slot.set_payload(T::payload_into_erased(payload));
-
-                let mut driver_op_opt = Some(driver_op);
-                let result = slot.submit(&mut driver_op_opt);
-
-                let mut recovered = None;
-                match &result {
-                    DriverSubmitResult::Submitted(_)
-                    | DriverSubmitResult::Failed {
-                        status: SubmitStatus::InFlight,
-                        ..
-                    } => {
-                        let _ = slot.persist();
-                    }
-                    DriverSubmitResult::Failed {
-                        status: SubmitStatus::Void,
-                        ..
-                    } => {
-                        drop(driver_op_opt.take());
-                        recovered = slot.recover_payload();
-                    }
+        let submit_res: Result<
+            LocalSubmitOutcome<P::SlotSpec>,
+            LocalSubmitFailure<P::SlotSpec, _, _>,
+        > = self.provider.with_driver(|mut driver| {
+            let mut slot = match driver.reserve_op() {
+                Ok(v) => v,
+                Err(report) => {
+                    return Err(LocalSubmitFailure {
+                        report,
+                        driver_op,
+                        payload,
+                    });
                 }
-                Ok((token, result, recovered))
-            });
+            };
+            let token = slot.token();
+            slot.set_payload(T::payload_into_erased(payload));
 
-        let (token, result, recovered) = match submit_res {
-            Err((report, driver_op, payload)) => {
-                drop(driver_op);
+            let mut driver_op_opt = Some(driver_op);
+            let result = slot.submit(&mut driver_op_opt);
+
+            let mut recovered = None;
+            match &result {
+                DriverSubmitResult::Submitted(_)
+                | DriverSubmitResult::Failed {
+                    status: SubmitStatus::InFlight,
+                    ..
+                } => {
+                    let _ = slot.persist();
+                }
+                DriverSubmitResult::Failed {
+                    status: SubmitStatus::Void,
+                    ..
+                } => {
+                    drop(driver_op_opt.take());
+                    recovered = slot.recover_payload();
+                }
+            }
+            Ok(LocalSubmitOutcome {
+                token,
+                result,
+                recovered,
+            })
+        });
+
+        let LocalSubmitOutcome {
+            token,
+            result,
+            recovered,
+        } = match submit_res {
+            Err(failure) => {
+                drop(failure.driver_op);
                 self.state = LocalState::Completed;
-                return Some(T::submit_failed(T::payload_into_erased(payload), report));
+                return Some(T::submit_failed(
+                    T::payload_into_erased(failure.payload),
+                    failure.report,
+                ));
             }
             Ok(outcome) => outcome,
         };
@@ -655,7 +716,7 @@ where
     }
 }
 
-impl<'a, T, P> futures_core::Stream for LocalOp<'a, T, P>
+impl<'a, T, P> Stream for LocalOp<'a, T, P>
 where
     P: DriverProvider,
     T: IntoPlatformOp<P::SlotSpec>,
@@ -712,6 +773,7 @@ impl<P> Clone for LocalSubmitter<P> {
         *self
     }
 }
+
 impl<P> Copy for LocalSubmitter<P> {}
 
 impl<P> LocalSubmitter<P> {
@@ -719,6 +781,7 @@ impl<P> LocalSubmitter<P> {
         Self(PhantomData)
     }
 }
+
 impl<P> Default for LocalSubmitter<P> {
     fn default() -> Self {
         Self::new()

@@ -15,10 +15,7 @@ use crate::{
     },
     op::CompletionCleanupHintFn,
 };
-use veloq_driver_core::{
-    driver::{CancelTicket, CompletionToken, OpToken, RawCompletion},
-    slot::Generation,
-};
+use veloq_driver_core::{CancelTicket, CompletionToken, Generation, OpToken, RawCompletion};
 
 /// The completion-side control projection.
 ///

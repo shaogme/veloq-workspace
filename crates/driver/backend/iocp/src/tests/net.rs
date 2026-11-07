@@ -5,12 +5,12 @@ use crate::{
     net::{addr::socket_addr_to_storage, socket::Socket},
     op::{Accept, AcceptMulti, Connect, Recv, RecvMulti, RecvProvided},
     tests::{
-        build_registered_pool, complete_from_record, completion_os_error_code,
-        remote_free_contains, submit_test_op, wait_completion, wait_completion_record,
+        build_registered_pool, complete_from_record, completion_os_error_code, slot_is_idle,
+        submit_test_op, wait_completion, wait_completion_record,
     },
 };
 use veloq_buf::{BufPool, LockedMemoryBudget, UniformSlot};
-use veloq_driver_core::driver::{CancelRequest, DriveMode, Driver, RegisterFd};
+use veloq_driver_core::{CancelRequest, DriveMode, Driver, RegisterFd};
 use veloq_std::{
     io::Write,
     mem,
@@ -107,7 +107,7 @@ fn test_iocp_accept_multi_rearms_after_each_connection() {
     let first_record = wait_completion_record(&mut driver, token, Duration::from_secs(5))
         .expect("first AcceptMulti completion missing");
     assert!(
-        first_record.continuation.is_more(),
+        first_record.continuation().is_more(),
         "AcceptMulti must remain armed after the first completion"
     );
     let first_completion = complete_from_record::<AcceptMulti>(first_record);
@@ -122,7 +122,7 @@ fn test_iocp_accept_multi_rearms_after_each_connection() {
     let second_record = wait_completion_record(&mut driver, token, Duration::from_secs(5))
         .expect("second AcceptMulti completion missing");
     assert!(
-        second_record.continuation.is_more(),
+        second_record.continuation().is_more(),
         "AcceptMulti replacement must remain armed after the second completion"
     );
     let second_completion = complete_from_record::<AcceptMulti>(second_record);
@@ -350,7 +350,7 @@ fn test_iocp_recv_multi_delivers_data_and_eof() {
     let data_record = wait_completion_record(&mut driver, token, Duration::from_secs(5))
         .expect("RecvMulti data completion missing");
     assert!(
-        data_record.continuation.is_more(),
+        data_record.continuation().is_more(),
         "RecvMulti must rearm after a data completion"
     );
     let data_completion = complete_from_record::<RecvMulti>(data_record);
@@ -365,7 +365,7 @@ fn test_iocp_recv_multi_delivers_data_and_eof() {
     let eof_record = wait_completion_record(&mut driver, token, Duration::from_secs(5))
         .expect("RecvMulti EOF completion missing");
     assert!(
-        eof_record.continuation.is_final(),
+        eof_record.continuation().is_final(),
         "RecvMulti EOF must terminate the logical receive operation"
     );
     let eof_completion = complete_from_record::<RecvMulti>(eof_record);
@@ -598,8 +598,8 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
     let _ = driver.cancel_op(CancelRequest::user_visible(token));
 
     assert!(
-        !remote_free_contains(&driver, token.index()),
-        "取消后真实 RIO completion 到来前不应回收槽位"
+        !slot_is_idle(&mut driver, token.index()),
+        "取消后真实 RIO completion 到来前槽位应保持活跃"
     );
 
     let _ = tx_send.send(());
@@ -614,15 +614,15 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
     let drain_start = Instant::now();
     while drain_start.elapsed() < Duration::from_secs(2) {
         let _ = driver.drive(DriveMode::Poll).expect("drive failed");
-        if remote_free_contains(&driver, token.index()) {
+        if slot_is_idle(&mut driver, token.index()) {
             break;
         }
         let _ = thread::sleep(Duration::from_millis(5));
     }
 
     assert!(
-        remote_free_contains(&driver, token.index()),
-        "晚到 RIO completion 到来后槽位仍应保持可复用"
+        slot_is_idle(&mut driver, token.index()),
+        "晚到 RIO completion 到来后槽位应归为空闲"
     );
 
     server_thread.join().unwrap();

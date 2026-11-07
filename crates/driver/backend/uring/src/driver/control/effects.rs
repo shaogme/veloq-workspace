@@ -1,10 +1,7 @@
 use crate::driver::{
     control::PendingCancel, lifecycle::CancellationPhase, registration::OwnedFdOwnershipTicket,
 };
-use veloq_driver_core::{
-    driver::{CancelTicket, OpToken, RawCompletion},
-    slot::Generation,
-};
+use veloq_driver_core::{CancelTicket, Generation, OpToken, RawCompletion};
 use veloq_std::{time::Instant, vec::Vec};
 
 /// A typed post-completion action owned by the uring control plane.

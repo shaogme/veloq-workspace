@@ -120,12 +120,12 @@ pub(super) async fn receive_pump<'rt>(
     stats: Arc<EndpointStats>,
 ) -> Result<()> {
     trace!(target: "veloq_reliable_udp::endpoint", "receive pump started");
-    let mut recv = match socket.receiver(UdpReceiveConfig {
-        kernel_capacity: nz!(1),
-        queue_capacity: config.inbound_capacity,
-        datagram_capacity: config.max_datagram_size,
-        close_timeout: config.close_timeout,
-    }) {
+    let mut recv = match socket.receiver(UdpReceiveConfig::new(
+        nz!(1),
+        config.inbound_capacity,
+        config.max_datagram_size,
+        config.close_timeout,
+    )) {
         Ok(recv) => recv,
         Err(_) => {
             report_pump_failure(&pump_events, PumpEvent::ReceiveFailed(Error::Io)).await;

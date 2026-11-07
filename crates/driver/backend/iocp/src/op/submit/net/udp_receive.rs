@@ -1,10 +1,7 @@
 use diagweave::prelude::*;
 use veloq_driver_core::{
-    driver::CompletionToken,
-    op::types::UdpRecvMultiBackend,
-    platform::receive_pump::{
-        ReceivePermitNotifier, ReceiveReplacementReservation, ReceiveRequest,
-    },
+    CompletionToken, ReceivePermitNotifier, ReceiveReplacementReservation, ReceiveRequest,
+    UdpRecvMultiBackend,
 };
 use veloq_std::{
     format, ptr,
@@ -73,7 +70,7 @@ impl UdpReceiveSubmit {
         // SAFETY: payload.user is bound to the live slot before submission. / 提交前 payload.user 已绑定到活动槽位。
         let (fd, raw, target_depth, all_registered) = {
             let user = unsafe { payload.user.as_ref()? };
-            let fd = user.fd;
+            let fd = user.fd();
             let target_depth = user.receive_pump().snapshot().target_depth;
             let raw = resolve_fd_handle(&fd, &*ctx.registered_slots)?;
             let slot_count = u32::try_from(target_depth).map_err(|_| {
@@ -286,7 +283,7 @@ impl UdpReceiveSubmit {
     ) -> IocpResult<u64> {
         // SAFETY: 提交入口会将用户操作绑定到槽位，直到完成事件完成路由。
         // SAFETY: The submit shim binds the user operation until its completion is routed.
-        let fd = unsafe { payload.user.as_ref()?.fd };
+        let fd = unsafe { payload.user.as_ref()?.fd() };
         let raw = resolve_fd_handle(&fd, &*ctx.registered_slots)?;
         payload.with_bound_parts_mut(|user, requests, request_id, _| {
             let next_request_id = request_id.checked_add(1).ok_or_else(|| {

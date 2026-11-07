@@ -14,15 +14,13 @@ use crate::{
     },
 };
 use diagweave::prelude::*;
-use veloq_driver_core::platform::receive_pump::{ReceivePumpState, ReceiveReplacementReservation};
 use veloq_driver_core::{
-    driver::{
-        AnomalyAttach, CompletionAnomalyKind, CompletionBackendHooks,
-        CompletionBackendIngressAction, CompletionCleanupGuard, CompletionControl,
-        CompletionFailure, CompletionSettlement, CompletionSource, UserCompletionEvent,
-    },
-    slot::{InFlightOrphaned, InFlightWaiting, SlotState, SlotStatus},
+    AnomalyAttach, CompletionAnomalyKind, CompletionBackendHooks, CompletionBackendIngressAction,
+    CompletionCleanupGuard, CompletionControl, CompletionFailure, CompletionSettlement,
+    CompletionSource, InFlightOrphaned, InFlightWaiting, SlotState, SlotStatus,
+    UserCompletionEvent,
 };
+use veloq_driver_core::{ReceivePumpState, ReceiveReplacementReservation};
 use veloq_std::format;
 use windows_sys::Win32::Networking::WinSock::RIORESULT;
 

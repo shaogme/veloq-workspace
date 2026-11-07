@@ -1,6 +1,6 @@
 use veloq_std::sync::atomic::{AtomicU64, Ordering};
 
-use veloq_driver_core::driver::{CompletionAnomaly, DriverCompletionDiagnosticsBackend};
+use veloq_driver_core::{CompletionAnomaly, DriverCompletionDiagnosticsBackend};
 
 /// The minimum Linux kernel version used by the current backend baseline.
 pub const KERNEL_BASELINE: &str = "6.1";

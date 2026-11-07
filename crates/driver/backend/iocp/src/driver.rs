@@ -35,21 +35,17 @@ use crate::{
 };
 
 use veloq_driver_core::{
-    driver::{
-        BufferRegistrationStatus, CancelRequest, CancelSubmitOutcome, CompletionToken, DriveMode,
-        DriveOutcome, DriverRaw, DriverStartup, DriverStartupRequirements, DriverStartupResources,
-        DriverSubmitResult, OpToken, RegisterFd, RemoteCancelSender, RemoteWaker,
-        SharedCompletionTable, SharedSlotTable, SubmitStatus, UdpReceiveOperationBuilder,
-        registry::OpEntry, sealed,
-    },
-    op::types::UdpRecvMulti,
-    platform::receive_pump::{ReceivePumpState, ReceiveSlot, UdpReceiveConfig},
+    BufferRegistrationStatus, CancelRequest, CancelSubmitOutcome, CompletionToken, DriveMode,
+    DriveOutcome, DriverRaw, DriverStartup, DriverStartupRequirements, DriverStartupResources,
+    DriverSubmitResult, OpEntry, OpToken, ReceivePumpState, ReceiveSlot, RegisterFd,
+    RemoteCancelSender, RemoteWaker, SharedCompletionTable, SharedSlotTable, SubmitStatus,
+    UdpReceiveConfig, UdpReceiveOperationBuilder, UdpRecvMulti, sealed,
 };
 
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 
 #[cfg(feature = "test-hooks")]
-use veloq_driver_core::driver::test_hooks::DriverTestHooks;
+use veloq_driver_core::test_hooks::DriverTestHooks;
 
 pub(crate) const RIO_EVENT_TOKEN: CompletionToken = match CompletionToken::encode_control(3, 0) {
     Ok(t) => t,
@@ -204,8 +200,8 @@ impl<'a> IocpDriver<'a> {
     }
 
     #[cfg(test)]
-    pub(crate) fn debug_remote_free_contains(&self, needle: usize) -> bool {
-        self.state().debug_remote_free_contains(needle)
+    pub(crate) fn debug_slot_is_idle(&mut self, index: usize) -> bool {
+        self.state_mut().debug_slot_is_idle(index)
     }
 }
 
@@ -264,22 +260,22 @@ impl<'a> UdpReceiveOperationBuilder for IocpDriver<'a> {
         let pump_config = config.into_pump_config();
         let mut slots = Vec::new();
         slots
-            .try_reserve_exact(pump_config.kernel_capacity.get())
+            .try_reserve_exact(pump_config.kernel_capacity().get())
             .map_err(|error| {
                 IocpError::Submission
                     .report(
                         "iocp.udp_recv_multi.build",
                         "failed to reserve backend receive slots",
                     )
-                    .with_ctx("slot_count", pump_config.kernel_capacity.get())
+                    .with_ctx("slot_count", pump_config.kernel_capacity().get())
                     .attach_note(format!("receive slot allocation failed: {error}"))
             })?;
-        for slot_id in 0..pump_config.kernel_capacity.get() {
+        for slot_id in 0..pump_config.kernel_capacity().get() {
             let buffer = self
                 .state()
                 .buffer_pool()
-                .and_then(|pool| pool.alloc(pump_config.datagram_capacity, 0))
-                .or_else(|| FixedBuf::alloc_heap(pump_config.datagram_capacity, 0).ok())
+                .and_then(|pool| pool.alloc(pump_config.datagram_capacity(), 0))
+                .or_else(|| FixedBuf::alloc_heap(pump_config.datagram_capacity(), 0).ok())
                 .ok_or_else(|| {
                     IocpError::Submission
                         .report(
@@ -287,7 +283,7 @@ impl<'a> UdpReceiveOperationBuilder for IocpDriver<'a> {
                             "failed to allocate backend receive buffer",
                         )
                         .with_ctx("slot_id", slot_id)
-                        .with_ctx("buffer_capacity", pump_config.datagram_capacity.get())
+                        .with_ctx("buffer_capacity", pump_config.datagram_capacity().get())
                 })?;
             slots.push(ReceiveSlot::new(slot_id as u32, buffer));
         }
@@ -327,7 +323,7 @@ impl<'a> DriverRaw for IocpDriver<'a> {
     }
 
     fn slot_table_raw(&self) -> SharedSlotTable<Self::SlotSpec> {
-        self.state().ops().shared.clone()
+        self.state().ops().shared_slots().clone()
     }
 
     fn remote_cancel_sender_raw(&self) -> RemoteCancelSender {
@@ -432,7 +428,7 @@ impl<'a> DriverRaw for IocpDriver<'a> {
                     .completion_diagnostics()
                     .backend()
                     .inc_wait_enter();
-                let wait_timeout = if self.state().ops().shared.has_ready_completion() {
+                let wait_timeout = if self.state().ops().shared_slots().has_ready_completion() {
                     Some(Duration::ZERO)
                 } else {
                     timeout
@@ -456,7 +452,7 @@ impl<'a> DriverRaw for IocpDriver<'a> {
 
         Ok(DriveOutcome {
             next_timeout_hint,
-            ready_completion: self.state().ops().shared.has_ready_completion(),
+            ready_completion: self.state().ops().shared_slots().has_ready_completion(),
             in_flight: self.has_active_ops_internal(),
             pending_work: Default::default(),
             budget_exhausted: false,

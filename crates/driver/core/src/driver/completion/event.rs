@@ -3,12 +3,38 @@ use super::{
     CompletionTokenClass, OpToken,
 };
 
+/// Unified completion event produced by platform drivers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompletionEvent {
+    token: CompletionToken,
+    res: i32,
+    flags: u32,
+}
+
+impl CompletionEvent {
+    pub const fn token(self) -> CompletionToken {
+        self.token
+    }
+
+    pub const fn res(self) -> i32 {
+        self.res
+    }
+
+    pub const fn flags(self) -> u32 {
+        self.flags
+    }
+
+    pub const fn raw_token(self) -> u64 {
+        self.token.raw()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RawCompletion {
-    pub backend: CompletionBackend,
-    pub token: CompletionToken,
-    pub res: i32,
-    pub flags: u32,
+    backend: CompletionBackend,
+    token: CompletionToken,
+    res: i32,
+    flags: u32,
 }
 
 impl RawCompletion {
@@ -32,6 +58,22 @@ impl RawCompletion {
             res: self.res,
             flags: self.flags,
         }
+    }
+
+    pub const fn backend(self) -> CompletionBackend {
+        self.backend
+    }
+
+    pub const fn token(self) -> CompletionToken {
+        self.token
+    }
+
+    pub const fn res(self) -> i32 {
+        self.res
+    }
+
+    pub const fn flags(self) -> u32 {
+        self.flags
     }
 }
 
@@ -102,24 +144,6 @@ impl UserCompletionEvent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompletionDispatch {
-    User {
-        event: UserCompletionEvent,
-    },
-    Waker {
-        id: u64,
-        raw: RawCompletion,
-    },
-    Cancel {
-        ticket: CancelTicket,
-        raw: RawCompletion,
-    },
-    Unknown {
-        envelope: CompletionEnvelope,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionIdentity {
     User(OpToken),
     Waker(u64),
@@ -136,9 +160,27 @@ pub enum CompletionIdentitySource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompletionEnvelope {
-    pub raw: RawCompletion,
-    pub identity: CompletionIdentity,
-    pub source: CompletionIdentitySource,
+    raw: RawCompletion,
+    identity: CompletionIdentity,
+    source: CompletionIdentitySource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionDispatch {
+    User {
+        event: UserCompletionEvent,
+    },
+    Waker {
+        id: u64,
+        raw: RawCompletion,
+    },
+    Cancel {
+        ticket: CancelTicket,
+        raw: RawCompletion,
+    },
+    Unknown {
+        envelope: CompletionEnvelope,
+    },
 }
 
 impl CompletionEnvelope {
@@ -210,45 +252,41 @@ impl CompletionEnvelope {
             source: CompletionIdentitySource::SidecarTokenWithQueueKey { queue_key },
         }
     }
-}
 
-/// Unified completion event produced by platform drivers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CompletionEvent {
-    /// Completion token (generation + slot index, or backend control token).
-    pub token: CompletionToken,
-    /// Completion result code. Non-negative for success, negative for error.
-    pub res: i32,
-    /// Platform-specific completion flags.
-    pub flags: u32,
-}
-
-impl CompletionEvent {
-    pub const fn raw_token(self) -> u64 {
-        self.token.raw()
+    pub const fn raw(self) -> RawCompletion {
+        self.raw
     }
-}
 
-#[inline]
-pub(super) fn dispatch_envelope(envelope: CompletionEnvelope) -> CompletionDispatch {
-    let raw = envelope.raw;
-    match envelope.identity {
-        CompletionIdentity::User(token) => CompletionDispatch::User {
-            event: UserCompletionEvent::from_classified(token, raw),
-        },
-        CompletionIdentity::Waker(id) => CompletionDispatch::Waker { id, raw },
-        CompletionIdentity::Cancel(ticket) => CompletionDispatch::Cancel { ticket, raw },
-        CompletionIdentity::UnknownControl { .. } => CompletionDispatch::Unknown { envelope },
+    pub const fn identity(self) -> CompletionIdentity {
+        self.identity
+    }
+
+    pub const fn source(self) -> CompletionIdentitySource {
+        self.source
+    }
+
+    pub(super) fn dispatch(self) -> CompletionDispatch {
+        let raw = self.raw;
+        match self.identity {
+            CompletionIdentity::User(token) => CompletionDispatch::User {
+                event: UserCompletionEvent::from_classified(token, raw),
+            },
+            CompletionIdentity::Waker(id) => CompletionDispatch::Waker { id, raw },
+            CompletionIdentity::Cancel(ticket) => CompletionDispatch::Cancel { ticket, raw },
+            CompletionIdentity::UnknownControl { .. } => {
+                CompletionDispatch::Unknown { envelope: self }
+            }
+        }
     }
 }
 
 impl CompletionAnomaly {
-    pub fn with_raw_completion(self, raw: super::RawCompletion) -> Self {
+    pub fn with_raw_completion(self, raw: RawCompletion) -> Self {
         use super::CompletionRaw;
-        self.with_token(raw.token).with_raw(CompletionRaw {
-            backend: raw.backend,
-            res: raw.res,
-            flags: raw.flags,
+        self.with_token(raw.token()).with_raw(CompletionRaw {
+            backend: raw.backend(),
+            res: raw.res(),
+            flags: raw.flags(),
         })
     }
 }

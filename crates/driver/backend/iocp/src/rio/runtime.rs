@@ -10,7 +10,7 @@ use crate::{
 
 use diagweave::prelude::*;
 use slotmap::{SlotMap, new_key_type};
-use veloq_driver_core::driver::OpToken;
+use veloq_driver_core::OpToken;
 use veloq_std::collections::{FastHashMap, FastHashSet};
 use windows_sys::Win32::Networking::WinSock::{SD_RECEIVE, SOCKET_ERROR, shutdown};
 
@@ -587,8 +587,8 @@ mod tests {
         config::{IocpHandle, SocketKey},
         rio::core::{RioOpKind, RioRq},
     };
-    use veloq_driver_core::driver::OpToken;
-    use veloq_driver_core::slot::Generation;
+    use veloq_driver_core::Generation;
+    use veloq_driver_core::OpToken;
     use veloq_std::ptr::null_mut;
 
     fn test_runtime() -> RioRuntime {

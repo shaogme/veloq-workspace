@@ -5,30 +5,22 @@ use futures_core::Stream;
 use crate::SockAddrStorage;
 
 use veloq_driver_core::{
-    IoFd as CoreIoFd,
-    op::types::{
-        Accept as CoreAccept, AcceptMulti as CoreAcceptMulti, Close as CoreClose,
-        Connect as CoreConnect, Fallocate as CoreFallocate, FallocateRaw as CoreFallocateRaw,
-        Fsync as CoreFsync, FsyncRaw as CoreFsyncRaw, ReadFixed as CoreReadFixed,
-        ReadRaw as CoreReadRaw, Recv as CoreRecv, RecvMulti as CoreRecvMulti,
-        RecvProvided as CoreRecvProvided, Send as CoreSend, SendTo as CoreSendTo,
-        SyncFileRange as CoreSyncFileRange, SyncFileRangeRaw as CoreSyncFileRangeRaw,
-        UdpConnect as CoreUdpConnect, UdpRecvMulti as CoreUdpRecvMulti, UdpSend as CoreUdpSend,
-        Wakeup as CoreWakeup, WriteFixed as CoreWriteFixed, WriteRaw as CoreWriteRaw,
-    },
+    Accept as CoreAccept, AcceptMulti as CoreAcceptMulti, Close as CoreClose,
+    Connect as CoreConnect, Fallocate as CoreFallocate, FallocateRaw as CoreFallocateRaw,
+    Fsync as CoreFsync, FsyncRaw as CoreFsyncRaw, IoFd as CoreIoFd, ReadFixed as CoreReadFixed,
+    ReadRaw as CoreReadRaw, Recv as CoreRecv, RecvMulti as CoreRecvMulti,
+    RecvProvided as CoreRecvProvided, Send as CoreSend, SendTo as CoreSendTo,
+    SyncFileRange as CoreSyncFileRange, SyncFileRangeRaw as CoreSyncFileRangeRaw,
+    UdpConnect as CoreUdpConnect, UdpRecvMulti as CoreUdpRecvMulti, UdpSend as CoreUdpSend,
+    Wakeup as CoreWakeup, WriteFixed as CoreWriteFixed, WriteRaw as CoreWriteRaw,
 };
 pub use veloq_driver_core::{
-    driver::UdpReceiveOperationBuilder,
-    op::{
-        DetachedOp, DetachedSubmitter, DriverProvider, IntoPlatformOp, LocalOp, LocalSubmitter, Op,
-        OpItem, OpKind, OpResult, OpSubmitter as CoreOpSubmitter, SingleShotOp,
-        types::{
-            AcceptedSocket as CoreAcceptedSocket, Open, ProvidedBuf as CoreProvidedBuf, Timeout,
-            UdpRecvPacket as CoreUdpRecvPacket, UdpRecvPacketBuf,
-        },
-    },
-    platform::receive_pump::{UdpReceiveBuildError, UdpReceiveConfig},
-    slot::{SlotCompletion, SlotError, SlotOp, SlotPayload},
+    AcceptedSocket as CoreAcceptedSocket, DetachedOp, DetachedSubmitter, DriverProvider,
+    IntoPlatformOp, LocalOp, LocalSubmitter, Op, OpItem, OpKind, OpResult,
+    OpSubmitter as CoreOpSubmitter, Open, ProvidedBuf as CoreProvidedBuf, SingleShotOp,
+    SlotCompletion, SlotError, SlotOp, SlotPayload, Timeout, UdpReceiveBuildError,
+    UdpReceiveConfig, UdpReceiveOperationBuilder, UdpRecvPacket as CoreUdpRecvPacket,
+    UdpRecvPacketBuf,
 };
 
 /// The platform's raw handle type, as chosen by the active backend.

@@ -1,12 +1,69 @@
+mod core;
+mod table;
+
 use crate::{
     DriverCoreError, DriverError, DriverResult, SlotSidecar,
     driver::{
-        CompletionValue, DriverCompletionDiagnosticsBackend, OpToken, OpTokenError, PlatformOp,
-        registry::OpRegistry,
+        CompletionValue, DriverCompletionDiagnosticsBackend, OpRegistry, OpToken, OpTokenError,
+        PlatformOp,
     },
 };
 use diagweave::prelude::*;
-use veloq_std::{format, marker::PhantomData, pin::Pin, sync::atomic::Ordering};
+use veloq_std::{fmt, format, marker::PhantomData, pin::Pin, sync::atomic::Ordering};
+
+pub use core::*;
+pub use table::*;
+
+/// Slot ABA counter that keeps the allocation generation separate from the slot index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Generation(u32);
+
+impl Generation {
+    pub const ZERO: Self = Self(0);
+
+    #[inline]
+    pub const fn new(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    #[inline]
+    pub const fn next(self) -> Self {
+        Self(self.0.wrapping_add(1))
+    }
+
+    #[inline]
+    pub const fn is_older_than(self, other: Self) -> bool {
+        (self.0.wrapping_sub(other.0) as i32) < 0
+    }
+
+    #[inline]
+    pub const fn is_newer_than(self, other: Self) -> bool {
+        other.is_older_than(self)
+    }
+}
+
+impl fmt::Display for Generation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl fmt::LowerHex for Generation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::LowerHex::fmt(&self.0, f)
+    }
+}
+
+impl From<Generation> for ContextValue {
+    fn from(value: Generation) -> Self {
+        Self::from(value.0)
+    }
+}
 
 pub trait SlotSpec {
     type Op: PlatformOp;
@@ -30,14 +87,6 @@ pub type SlotCompletionData<Spec> = (
     Option<DriverResult<SlotCompletion<Spec>, SlotError<Spec>>>,
 );
 
-mod core;
-mod generation;
-mod table;
-
-pub use core::*;
-pub use generation::Generation;
-pub use table::*;
-
 pub trait SlotMarker: sealed::Sealed {}
 
 mod sealed {
@@ -58,7 +107,9 @@ mod sealed {
 /// 空」这一独占能力，而不是一个远端可见的相位。远端可见的「完成已发布」由 cell 上的
 /// `ready` 标志位表示（见 [`SlotStatus`]），与本轨完全正交。
 pub struct Reserved;
+
 pub struct InFlightWaiting;
+
 pub struct InFlightOrphaned;
 
 /// 排空视图：持有它意味着 driver 线程已判定该 slot 不再需要提交，可以取走 `op` 与
@@ -66,13 +117,19 @@ pub struct InFlightOrphaned;
 pub struct Draining;
 
 impl sealed::Sealed for Reserved {}
+
 impl sealed::Sealed for InFlightWaiting {}
+
 impl sealed::Sealed for InFlightOrphaned {}
+
 impl sealed::Sealed for Draining {}
 
 impl SlotMarker for Reserved {}
+
 impl SlotMarker for InFlightWaiting {}
+
 impl SlotMarker for InFlightOrphaned {}
+
 impl SlotMarker for Draining {}
 
 pub struct Slot<'a, State: SlotMarker, Spec: SlotSpec> {
@@ -83,6 +140,98 @@ pub struct Slot<'a, State: SlotMarker, Spec: SlotSpec> {
     index: usize,
     _state: PhantomData<State>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotSnapshot {
+    index: usize,
+    generation: Generation,
+    status: SlotStatus,
+    has_op: bool,
+    has_payload: bool,
+}
+
+impl SlotSnapshot {
+    pub const fn new(
+        index: usize,
+        generation: Generation,
+        status: SlotStatus,
+        has_op: bool,
+        has_payload: bool,
+    ) -> Self {
+        Self {
+            index,
+            generation,
+            status,
+            has_op,
+            has_payload,
+        }
+    }
+
+    pub const fn index(self) -> usize {
+        self.index
+    }
+
+    pub const fn generation(self) -> Generation {
+        self.generation
+    }
+
+    pub const fn status(self) -> SlotStatus {
+        self.status
+    }
+
+    pub const fn has_op(self) -> bool {
+        self.has_op
+    }
+
+    pub const fn has_payload(self) -> bool {
+        self.has_payload
+    }
+
+    pub const fn try_token(self) -> Result<OpToken, OpTokenError> {
+        OpToken::from_registry_parts(self.index, self.generation)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotAccessAction {
+    Access,
+    InitOp,
+    ReplaceOp,
+    StartSubmission,
+    OperationAndPayload,
+    TakeOp,
+    TakeCompletionData,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotAccessErrorReason {
+    MissingOp,
+    MissingPayload,
+    UnexpectedOp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotAccessError {
+    action: SlotAccessAction,
+    reason: SlotAccessErrorReason,
+    snapshot: SlotSnapshot,
+}
+
+impl SlotAccessError {
+    pub const fn action(self) -> SlotAccessAction {
+        self.action
+    }
+
+    pub const fn reason(self) -> SlotAccessErrorReason {
+        self.reason
+    }
+
+    pub const fn snapshot(self) -> SlotSnapshot {
+        self.snapshot
+    }
+}
+
+pub type SlotAccessOutcome<T> = Result<T, SlotAccessError>;
 
 /// A non-owning view over the operation and optional submit payload while the slot keeps its
 /// storage in place.
@@ -171,13 +320,13 @@ impl<'a, State: SlotMarker, Spec: SlotSpec> Slot<'a, State, Spec> {
 
     pub fn snapshot(&self) -> SlotSnapshot {
         let core = self.entry.load_core_state(Ordering::Acquire);
-        SlotSnapshot {
-            index: self.index,
-            generation: core.generation(),
-            status: core.status(),
-            has_op: self.op.is_some(),
-            has_payload: self.storage.payload.is_some(),
-        }
+        SlotSnapshot::new(
+            self.index,
+            core.generation(),
+            core.status(),
+            self.op.is_some(),
+            self.storage.payload().is_some(),
+        )
     }
 
     fn access_error(
@@ -224,7 +373,7 @@ impl<'a, State: SlotMarker, Spec: SlotSpec> Slot<'a, State, Spec> {
         // prevents `take_op`, `replace_op`, or slot recycling during `f`; the pin ends when `f`
         // returns.  Only `Draining::take_op` can move the operation after this callback ends.
         let operation = unsafe { Pin::new_unchecked(op) };
-        let payload = self.storage.payload.as_mut();
+        let payload = self.storage.payload_mut();
         let mut access = SlotAccess {
             operation,
             payload,
@@ -233,6 +382,15 @@ impl<'a, State: SlotMarker, Spec: SlotSpec> Slot<'a, State, Spec> {
         Ok(f(&mut access))
     }
 }
+
+type SubmissionRollback<'a, Spec> = fn(&mut Slot<'a, Reserved, Spec>);
+
+pub struct SubmissionGuard<'a, Spec: SlotSpec> {
+    slot: Option<Slot<'a, Reserved, Spec>>,
+    rollback: Option<SubmissionRollback<'a, Spec>>,
+    persisted: bool,
+}
+
 impl<'a, Spec: SlotSpec> Slot<'a, Reserved, Spec> {
     pub(crate) fn try_bind(
         entry: &'a SlotEntry<Spec>,
@@ -351,7 +509,7 @@ impl<'a, Spec: SlotSpec> Slot<'a, Draining, Spec> {
     }
 
     pub fn take_completion_data_checked(&mut self) -> SlotAccessOutcome<SlotCompletionData<Spec>> {
-        if self.storage.payload.is_none() {
+        if self.storage.payload().is_none() {
             return Err(self.access_error(
                 SlotAccessAction::TakeCompletionData,
                 SlotAccessErrorReason::MissingPayload,
@@ -368,14 +526,6 @@ impl<'a, Spec: SlotSpec> Slot<'a, InFlightOrphaned, Spec> {
     }
 }
 
-type SubmissionRollback<'a, Spec> = fn(&mut Slot<'a, Reserved, Spec>);
-
-pub struct SubmissionGuard<'a, Spec: SlotSpec> {
-    pub slot: Option<Slot<'a, Reserved, Spec>>,
-    rollback: Option<SubmissionRollback<'a, Spec>>,
-    persisted: bool,
-}
-
 impl<'a, Spec: SlotSpec> SubmissionGuard<'a, Spec> {
     pub fn with_access_mut<F, X>(&mut self, f: F) -> SlotAccessOutcome<X>
     where
@@ -385,6 +535,13 @@ impl<'a, Spec: SlotSpec> SubmissionGuard<'a, Spec> {
             .as_mut()
             .expect("submission guard slot missing before persist")
             .with_access_mut(f)
+    }
+
+    pub fn platform_mut(&mut self) -> &mut SlotPlatformData<Spec> {
+        self.slot
+            .as_mut()
+            .expect("submission guard slot missing before persist")
+            .platform_mut()
     }
 
     pub fn persist(mut self) -> Slot<'a, InFlightWaiting, Spec> {
@@ -416,48 +573,6 @@ pub enum SlotView<'a, Spec: SlotSpec> {
     InFlightOrphaned(Slot<'a, InFlightOrphaned, Spec>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SlotSnapshot {
-    pub index: usize,
-    pub generation: Generation,
-    pub status: SlotStatus,
-    pub has_op: bool,
-    pub has_payload: bool,
-}
-
-impl SlotSnapshot {
-    pub const fn try_token(self) -> Result<OpToken, OpTokenError> {
-        OpToken::from_registry_parts(self.index, self.generation)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SlotAccessAction {
-    Access,
-    InitOp,
-    ReplaceOp,
-    StartSubmission,
-    OperationAndPayload,
-    TakeOp,
-    TakeCompletionData,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SlotAccessErrorReason {
-    MissingOp,
-    MissingPayload,
-    UnexpectedOp,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SlotAccessError {
-    pub action: SlotAccessAction,
-    pub reason: SlotAccessErrorReason,
-    pub snapshot: SlotSnapshot,
-}
-
-pub type SlotAccessOutcome<T> = Result<T, SlotAccessError>;
-
 pub enum CheckedSlotView<'a, Spec: SlotSpec> {
     Valid(SlotView<'a, Spec>),
     Missing {
@@ -481,22 +596,26 @@ impl<Spec: SlotSpec> SlotRegistryExt<Spec> for OpRegistry<Spec> {
         token: OpToken,
     ) -> Result<CheckedSlotView<'_, Spec>, Report<Spec::Error>> {
         let (index, expected_generation) = token.parts();
-        let Some((entry, op_entry, op, storage)) = self.slot_bundle_by_index_mut(index) else {
+        let Some(bundle) = self.slot_bundle_by_index_mut(index) else {
             return Ok(CheckedSlotView::Missing {
                 index,
                 expected_generation,
             });
         };
+        let entry = bundle.entry;
+        let op_entry = bundle.op_entry;
+        let op = bundle.op;
+        let storage = bundle.storage;
         let core = entry.load_core_state(Ordering::Acquire);
         let generation = core.generation();
         let status = core.status();
-        let snapshot = SlotSnapshot {
+        let snapshot = SlotSnapshot::new(
             index,
             generation,
             status,
-            has_op: op.is_some(),
-            has_payload: storage.payload.is_some(),
-        };
+            op.is_some(),
+            storage.payload().is_some(),
+        );
 
         if generation != expected_generation {
             return Ok(CheckedSlotView::Stale(snapshot));
@@ -505,8 +624,8 @@ impl<Spec: SlotSpec> SlotRegistryExt<Spec> for OpRegistry<Spec> {
         // 只 match 一次：四个生命周期状态各自恰好对应一种视图。`ready` / `finalizing`
         // 都是 cell 信箱的标志位，不参与借出判定——信箱里有没有记录不影响 slot 本身
         // 能否被借出，只影响它能否被重新分配（见 `SlotStatus::is_idle`）。
-        let platform = &mut op_entry.platform_data;
-        match status.state {
+        let platform = op_entry.platform_data_mut();
+        match status.state() {
             SlotState::Idle => Ok(CheckedSlotView::Empty(snapshot)),
             SlotState::Reserved => {
                 Slot::<Reserved, Spec>::try_bind(entry, op, storage, platform, index).map_or_else(
@@ -546,7 +665,7 @@ fn corrupt_slot<E: DriverError>(snapshot: SlotSnapshot, note: &str) -> Report<E>
 fn ensure_in_flight_payload<Spec: SlotSpec>(
     snapshot: SlotSnapshot,
 ) -> Result<(), Report<Spec::Error>> {
-    if snapshot.has_op && snapshot.has_payload {
+    if snapshot.has_op() && snapshot.has_payload() {
         Ok(())
     } else {
         Err(corrupt_slot(snapshot, "in-flight slot lost op or payload"))
@@ -558,13 +677,35 @@ fn ensure_in_flight_payload<Spec: SlotSpec>(
 mod tests {
     use super::*;
     use crate::driver::{
-        CompletionAccess, CompletionBackend, CompletionBackendHooks, CompletionCleanupGuard,
-        CompletionContinuation, CompletionControl, CompletionFlowExt, CompletionIngress,
-        CompletionSettlement, CompletionSource, CompletionToken, HookResult, PlatformOp,
-        PollRecordResult, SharedCompletionTable, UserCompletionEvent,
+        CompletionBackend, CompletionBackendHooks, CompletionCleanupGuard, CompletionContinuation,
+        CompletionControl, CompletionFlowExt, CompletionIngress, CompletionSettlement,
+        CompletionSource, CompletionToken, HookResult, PlatformOp, PollRecordResult,
+        SharedCompletionTable, UserCompletionEvent,
     };
     use crate::{DriverCoreError, DriverError};
     use veloq_std::{error::Error, fmt, marker::PhantomPinned};
+
+    #[test]
+    fn generation_ordering_survives_wraparound() {
+        let zero = Generation::ZERO;
+        let one = Generation::new(1);
+        let max = Generation::new(u32::MAX);
+
+        assert!(zero.is_older_than(one));
+        assert!(one.is_newer_than(zero));
+        assert!(!one.is_older_than(one));
+        assert!(!one.is_newer_than(one));
+        assert!(zero.is_newer_than(max));
+        assert!(one.is_newer_than(Generation::new(u32::MAX - 1)));
+        assert!(max.is_older_than(one));
+        assert!(Generation::new(u32::MAX - 1).is_older_than(zero));
+    }
+
+    #[test]
+    fn generation_next_wraps_at_the_top_of_u32() {
+        assert_eq!(Generation::ZERO.next(), Generation::new(1));
+        assert_eq!(Generation::new(u32::MAX).next(), Generation::ZERO);
+    }
 
     struct DummyPlatformOp(usize, PhantomPinned);
 
@@ -686,7 +827,7 @@ mod tests {
                 .persist();
         }
 
-        let diagnostics = registry.shared.completion_diagnostics();
+        let diagnostics = registry.shared_slots().completion_diagnostics();
         let table: SharedCompletionTable<DummySlotSpec> = registry.shared_table();
         let mut hooks = TestHooks;
         let _ = registry.accept_completion(
@@ -705,15 +846,15 @@ mod tests {
             registry.checked_slot_view(token).unwrap(),
             CheckedSlotView::Empty(_)
         ));
-        let record = match registry.shared.try_take_record(token).unwrap() {
+        let record = match registry.shared_table().try_take_record(token).unwrap() {
             PollRecordResult::Ready(record) => record,
             PollRecordResult::Pending => panic!("completion should be ready"),
             PollRecordResult::Unavailable { kind, .. } => {
                 panic!("completion should be available: {kind:?}")
             }
         };
-        assert_eq!(record.event.completion_token(), completion_token);
-        assert_eq!(record.payload, Some(()));
+        assert_eq!(record.event().completion_token(), completion_token);
+        assert_eq!(record.payload(), Some(&()));
     }
 
     #[test]
@@ -733,8 +874,8 @@ mod tests {
         assert!(matches!(
             registry.checked_slot_view(stale_token).unwrap(),
             CheckedSlotView::Stale(snapshot)
-                if snapshot.index == stale_token.index()
-                    && snapshot.generation == fresh.generation
+                if snapshot.index() == stale_token.index()
+                    && snapshot.generation() == fresh.generation
         ));
     }
 
@@ -750,9 +891,9 @@ mod tests {
         assert!(matches!(
             registry.checked_slot_view(token).unwrap(),
             CheckedSlotView::Empty(snapshot)
-                if snapshot.index == token.index()
-                    && snapshot.generation == token.generation()
-                    && snapshot.status == SlotStatus::of(SlotState::Idle)
+                if snapshot.index() == token.index()
+                    && snapshot.generation() == token.generation()
+                    && snapshot.status() == SlotStatus::of(SlotState::Idle)
         ));
     }
 
@@ -781,7 +922,7 @@ mod tests {
             .expect("reserved slot should start submission")
             .persist();
 
-        let diagnostics = registry.shared.completion_diagnostics();
+        let diagnostics = registry.shared_slots().completion_diagnostics();
         let table: SharedCompletionTable<DummySlotSpec> = registry.shared_table();
         let mut hooks = TestHooks;
         let _ = registry.accept_completion(
@@ -797,16 +938,16 @@ mod tests {
         );
 
         // `accept_completion` 内部走完 record + finalize，slot 已被归还。
-        let status = registry.shared.slots[token.index()].status(Ordering::Acquire);
-        assert_eq!(status.state, SlotState::Idle);
-        assert!(status.ready, "published completion must survive `free`");
+        let status = registry.shared_slots().slots()[token.index()].status(Ordering::Acquire);
+        assert_eq!(status.state(), SlotState::Idle);
+        assert!(status.ready(), "published completion must survive `free`");
         assert!(!status.is_idle(), "a ready slot must not be reallocated");
 
         // 容量为 1 的 registry 在完成被消费前拿不到新 slot。
         assert!(registry.alloc(()).is_err());
 
-        let _ = registry.shared.try_take_record(token);
-        let status = registry.shared.slots[token.index()].status(Ordering::Acquire);
+        let _ = registry.shared_table().try_take_record(token);
+        let status = registry.shared_slots().slots()[token.index()].status(Ordering::Acquire);
         assert!(status.is_idle(), "consuming the record must free the slot");
         assert!(registry.alloc(()).is_ok());
     }
@@ -925,7 +1066,7 @@ mod tests {
             .with_access_mut(|_| ())
             .expect_err("an uninitialized slot must reject access");
         assert_eq!(missing_op.reason, SlotAccessErrorReason::MissingOp);
-        assert!(!missing_op.snapshot.has_op);
+        assert!(!missing_op.snapshot.has_op());
 
         let mut reserved = reserved
             .init_op_with(DummyPlatformOp(1, PhantomPinned), |_| {})
@@ -938,8 +1079,8 @@ mod tests {
             missing_payload.reason,
             SlotAccessErrorReason::MissingPayload
         );
-        assert!(missing_payload.snapshot.has_op);
-        assert!(!missing_payload.snapshot.has_payload);
+        assert!(missing_payload.snapshot.has_op());
+        assert!(!missing_payload.snapshot.has_payload());
     }
 
     #[test]

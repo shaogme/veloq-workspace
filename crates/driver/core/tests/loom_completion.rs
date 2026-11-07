@@ -1,13 +1,7 @@
 #![cfg(feature = "loom")]
 use diagweave::Report;
-use veloq_driver_core::{
-    DriverCoreError, DriverError,
-    driver::{CompletionAccess, registry::OpRegistry, *},
-    slot::{
-        CheckedSlotView, InFlightOrphaned, InFlightWaiting, Slot, SlotRegistryExt, SlotSpec,
-        SlotTable, SlotView,
-    },
-};
+use loom::model;
+use veloq_driver_core::*;
 use veloq_std::{
     error::Error,
     fmt,
@@ -128,11 +122,13 @@ impl CompletionBackendHooks<DummySlotSpec> for TestHooks {
     }
 }
 
-fn active_registry() -> (
-    Arc<Mutex<OpRegistry<DummySlotSpec>>>,
-    SharedCompletionTable<DummySlotSpec>,
-    OpToken,
-) {
+struct ActiveRegistry {
+    registry: Arc<Mutex<OpRegistry<DummySlotSpec>>>,
+    table: SharedCompletionTable<DummySlotSpec>,
+    token: OpToken,
+}
+
+fn active_registry() -> ActiveRegistry {
     let mut registry = OpRegistry::<DummySlotSpec>::new(1);
     let handle = registry.alloc(()).expect("slot allocation failed").handle;
     let token = OpToken::from_registry_parts(handle.index, handle.generation)
@@ -152,8 +148,12 @@ fn active_registry() -> (
         .start_submission_with(None)
         .expect("reserved slot should start submission")
         .persist();
-    let table = to_shared_table(registry.shared.clone());
-    (Arc::new(Mutex::new(registry)), table, token)
+    let table = to_shared_table(registry.shared_slots().clone());
+    ActiveRegistry {
+        registry: Arc::new(Mutex::new(registry)),
+        table,
+        token,
+    }
 }
 
 fn to_shared_table<Spec: SlotSpec + 'static>(
@@ -175,8 +175,8 @@ fn accept_completion_with(
     continuation: CompletionContinuation,
 ) {
     let mut registry = registry.lock().unwrap();
-    let diagnostics = registry.shared.completion_diagnostics();
-    let table = to_shared_table(registry.shared.clone());
+    let diagnostics = registry.shared_slots().completion_diagnostics();
+    let table = to_shared_table(registry.shared_slots().clone());
     let mut hooks = TestHooks::with_continuation(continuation);
     registry
         .accept_completion(
@@ -195,8 +195,12 @@ fn accept_completion_with(
 
 #[test]
 fn test_completion_table_loom() {
-    loom::model(|| {
-        let (registry, table, token) = active_registry();
+    model(|| {
+        let ActiveRegistry {
+            registry,
+            table,
+            token,
+        } = active_registry();
 
         let registry_cloned = registry.clone();
         let producer = thread::spawn(move || {
@@ -210,7 +214,7 @@ fn test_completion_table_loom() {
             match table_cloned.try_take_record(token).unwrap() {
                 PollRecordResult::Ready(record) => {
                     assert_eq!(
-                        record.event.completion_token(),
+                        record.event().completion_token(),
                         CompletionToken::user(token)
                     )
                 }
@@ -228,8 +232,12 @@ fn test_completion_table_loom() {
 
 #[test]
 fn test_detached_drop_race_loom() {
-    loom::model(|| {
-        let (registry, table, token) = active_registry();
+    model(|| {
+        let ActiveRegistry {
+            registry,
+            table,
+            token,
+        } = active_registry();
 
         let registry_cloned = registry.clone();
         let producer = thread::spawn(move || {
@@ -258,8 +266,12 @@ fn test_detached_drop_race_loom() {
 
 #[test]
 fn test_fast_completion_then_waiting_take_loom() {
-    loom::model(|| {
-        let (registry, table, token) = active_registry();
+    model(|| {
+        let ActiveRegistry {
+            registry,
+            table,
+            token,
+        } = active_registry();
 
         accept_completion(&registry, token, 7);
 
@@ -267,10 +279,10 @@ fn test_fast_completion_then_waiting_take_loom() {
         match table.try_take_record(token).unwrap() {
             PollRecordResult::Ready(record) => {
                 assert_eq!(
-                    record.event.completion_token(),
+                    record.event().completion_token(),
                     CompletionToken::user(token)
                 );
-                assert_eq!(record.event.res(), 7);
+                assert_eq!(record.event().res(), 7);
             }
             PollRecordResult::Pending => panic!("expected ready after fast completion"),
             PollRecordResult::Unavailable { kind, .. } => {
@@ -284,8 +296,12 @@ fn test_fast_completion_then_waiting_take_loom() {
 
 #[test]
 fn test_stale_after_generation_advance_loom() {
-    loom::model(|| {
-        let (registry, table, token_g1) = active_registry();
+    model(|| {
+        let ActiveRegistry {
+            registry,
+            table,
+            token: token_g1,
+        } = active_registry();
 
         accept_completion(&registry, token_g1, 1);
         table.mark_waiting(token_g1);
@@ -303,8 +319,12 @@ fn test_stale_after_generation_advance_loom() {
 
 #[test]
 fn test_ready_race_with_mark_orphaned_loom() {
-    loom::model(|| {
-        let (registry, table, token) = active_registry();
+    model(|| {
+        let ActiveRegistry {
+            registry,
+            table,
+            token,
+        } = active_registry();
 
         accept_completion(&registry, token, 3);
 
@@ -329,10 +349,14 @@ fn test_ready_race_with_mark_orphaned_loom() {
 
 #[test]
 fn test_two_consumers_at_most_one_ready_loom() {
-    loom::model(|| {
+    model(|| {
         use loom::sync::atomic::{AtomicUsize, Ordering};
 
-        let (registry, table, token) = active_registry();
+        let ActiveRegistry {
+            registry,
+            table,
+            token,
+        } = active_registry();
         let ready_count = Arc::new(AtomicUsize::new(0));
 
         accept_completion(&registry, token, 9);
@@ -369,10 +393,14 @@ fn test_two_consumers_at_most_one_ready_loom() {
 /// 断言是：两条记录一条都不丢，且终态完成之后 slot 必须回到可复用。
 #[test]
 fn test_multishot_take_races_with_publish_loom() {
-    loom::model(|| {
+    model(|| {
         use loom::sync::atomic::{AtomicUsize, Ordering};
 
-        let (registry, table, token) = active_registry();
+        let ActiveRegistry {
+            registry,
+            table,
+            token,
+        } = active_registry();
         let taken = Arc::new(AtomicUsize::new(0));
 
         // 第一条 `More` 单线程发布，把 cell 带进 streaming 状态。
@@ -409,8 +437,12 @@ fn test_multishot_take_races_with_publish_loom() {
 /// 后续的完成会被判 stale 丢掉，`orphan_cleanup` 永远跑不到。
 #[test]
 fn test_orphan_races_with_multishot_publish_loom() {
-    loom::model(|| {
-        let (registry, table, token) = active_registry();
+    model(|| {
+        let ActiveRegistry {
+            registry,
+            table,
+            token,
+        } = active_registry();
 
         accept_completion_with(&registry, token, 1, CompletionContinuation::More);
 

@@ -5,617 +5,28 @@
 //! request completed, and a replacement request was submitted.  Keeping those transitions here
 //! makes the resource invariants testable without booting a driver or an operating system.
 
+mod config;
+mod datagram;
+mod lifecycle;
+mod permit;
+mod queues;
+mod types;
+
+pub use config::*;
+pub use datagram::*;
+pub use permit::*;
+pub use queues::*;
+pub use types::*;
+
 use crate::{
     driver::CompletionContinuation,
-    op::types::{UdpRecvPacket, UdpRecvPacketBuf},
+    op::{UdpRecvPacket, UdpRecvPacketBuf},
 };
+use datagram::{DatagramQueue, DatagramQueueContext};
+use lifecycle::{DrainContext, FinalizationContext, InvariantContext, PumpLifecycle};
+use queues::PumpQueues;
 use veloq_buf::FixedBuf;
-use veloq_std::{
-    boxed::Box,
-    collections::VecDeque,
-    fmt,
-    net::SocketAddr,
-    num::NonZeroUsize,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
-
-/// The largest datagram capacity accepted by the platform-neutral validation layer.
-pub const MAX_UDP_DATAGRAM_CAPACITY: usize = u16::MAX as usize;
-
-/// Configuration used internally by a backend receive pump.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReceivePumpConfig {
-    pub kernel_capacity: NonZeroUsize,
-    pub queue_capacity: NonZeroUsize,
-    pub datagram_capacity: NonZeroUsize,
-    pub close_timeout: Duration,
-}
-
-/// Platform-neutral configuration accepted by the UDP facade.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct UdpReceiveConfig {
-    pub kernel_capacity: NonZeroUsize,
-    pub queue_capacity: NonZeroUsize,
-    pub datagram_capacity: NonZeroUsize,
-    pub close_timeout: Duration,
-}
-
-/// Errors returned while validating the platform-neutral UDP receive configuration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UdpReceiveBuildError {
-    InvalidConfig,
-}
-
-impl UdpReceiveConfig {
-    /// Validate the only configuration invariants shared by all receive backends.
-    pub fn validate(self) -> Result<Self, UdpReceiveBuildError> {
-        let memory_entries = self
-            .queue_capacity
-            .get()
-            .checked_add(self.kernel_capacity.get());
-        let memory_budget =
-            memory_entries.and_then(|entries| entries.checked_mul(self.datagram_capacity.get()));
-        if self.kernel_capacity.get() > u32::MAX as usize
-            || self.datagram_capacity.get() > MAX_UDP_DATAGRAM_CAPACITY
-            || self.close_timeout.is_zero()
-            || memory_budget.is_none()
-        {
-            return Err(UdpReceiveBuildError::InvalidConfig);
-        }
-        Ok(self)
-    }
-
-    /// Convert the public contract into the backend state-machine configuration.
-    pub const fn into_pump_config(self) -> ReceivePumpConfig {
-        ReceivePumpConfig {
-            kernel_capacity: self.kernel_capacity,
-            queue_capacity: self.queue_capacity,
-            datagram_capacity: self.datagram_capacity,
-            close_timeout: self.close_timeout,
-        }
-    }
-}
-
-impl From<UdpReceiveConfig> for ReceivePumpConfig {
-    fn from(config: UdpReceiveConfig) -> Self {
-        config.into_pump_config()
-    }
-}
-
-/// 非阻塞地通知 owner worker 有 packet permit 已释放。
-///
-/// 通知器只负责唤醒 owner worker，不得在 packet drop 路径中直接访问 driver、slot 或
-/// provided-buffer group。backend 可以据此合并多个通知，并在自己的 worker 上扫描并恢复
-/// pending datagram。
-pub trait ReceivePermitNotifier: Send + Sync {
-    fn notify(&self);
-
-    /// Bind the backend identity used to resume this pump. / 绑定恢复此接收泵所需的后端标识。
-    fn bind_resume_token(&self, _token: u64) {}
-}
-
-impl<F> ReceivePermitNotifier for F
-where
-    F: Fn() + Send + Sync,
-{
-    fn notify(&self) {
-        self();
-    }
-}
-
-impl ReceivePumpConfig {
-    pub fn validate(self, max_outstanding_receive: usize) -> Result<Self, ReceivePumpError> {
-        let public = UdpReceiveConfig {
-            kernel_capacity: self.kernel_capacity,
-            queue_capacity: self.queue_capacity,
-            datagram_capacity: self.datagram_capacity,
-            close_timeout: self.close_timeout,
-        };
-        if self.kernel_capacity.get() > max_outstanding_receive || public.validate().is_err() {
-            return Err(ReceivePumpError::ReceiveConfigInvalid);
-        }
-        Ok(self)
-    }
-
-    /// Maximum payload memory for user-held output buffers plus backend-held pending payloads.
-    pub fn memory_budget_bytes(self) -> Result<usize, ReceivePumpError> {
-        self.queue_capacity
-            .get()
-            .checked_add(self.kernel_capacity.get())
-            .and_then(|entries| entries.checked_mul(self.datagram_capacity.get()))
-            .ok_or(ReceivePumpError::ReceiveConfigInvalid)
-    }
-
-    pub const fn pending_capacity(self) -> usize {
-        self.kernel_capacity.get()
-    }
-}
-
-/// Errors that affect pump transitions or become the terminal error returned after the final
-/// already-completed datagram.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReceivePumpError {
-    ReceiveConfigInvalid,
-    ReceiveAlreadyOwned,
-    ReceiverNotReady,
-    InitialReceiveSubmitFailed,
-    ReplacementSubmitFailed,
-    ReceiveQueueStalled,
-    ReceiveBufferExhausted,
-    ReceiveEof,
-    ReceiveOsError { code: i32 },
-    ReceiveCancelled,
-    ReceiveContextCorrupt,
-    DriverShutdown,
-    InvalidTransition,
-}
-
-impl fmt::Display for ReceivePumpError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ReceiveConfigInvalid => f.write_str("invalid receive configuration"),
-            Self::ReceiveAlreadyOwned => f.write_str("socket receive is already owned"),
-            Self::ReceiverNotReady => f.write_str("receiver is not ready"),
-            Self::InitialReceiveSubmitFailed => f.write_str("initial receive submit failed"),
-            Self::ReplacementSubmitFailed => f.write_str("replacement receive submit failed"),
-            Self::ReceiveQueueStalled => f.write_str("receive queue is stalled"),
-            Self::ReceiveBufferExhausted => f.write_str("receive output buffer is exhausted"),
-            Self::ReceiveEof => f.write_str("receive reached EOF"),
-            Self::ReceiveOsError { code } => write!(f, "receive OS error ({code})"),
-            Self::ReceiveCancelled => f.write_str("receive was cancelled"),
-            Self::ReceiveContextCorrupt => f.write_str("receive request context is corrupt"),
-            Self::DriverShutdown => f.write_str("driver is shutting down"),
-            Self::InvalidTransition => f.write_str("invalid receive pump transition"),
-        }
-    }
-}
-
-/// Logical pump lifecycle.  `RunningWithTerminalError` still permits already-published records
-/// to be consumed; the terminal error is observed only after those records are drained.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReceivePumpPhase {
-    Created,
-    Starting,
-    Running,
-    PausedByBackpressure,
-    /// The previous multishot arm ended, but the logical receiver still owns the operation and
-    /// may submit one replacement after its selected leases have settled.
-    RearmPending,
-    RunningWithTerminalError,
-    Closing,
-    Drained,
-}
-
-/// Lifecycle of one fixed receive buffer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReceiveSlotState {
-    Free,
-    SubmitPending,
-    InFlight,
-    CompletedPending,
-    /// The completion metadata is retained while the backend still owns its payload lease and
-    /// waits for room in the bounded pending queue.
-    LeaseHeld,
-    Retiring,
-}
-
-/// The request identity carried by a backend request context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReceiveRequest {
-    pub request_id: u64,
-    pub slot_id: u32,
-    pub slot_generation: u32,
-}
-
-/// Backend-neutral identity for one completed datagram.
-///
-/// RIO uses a request slot/generation underneath this key while io_uring uses a CQE completion
-/// sequence and a logical rearm generation. Keeping both parts here prevents either backend from
-/// manufacturing a packet from metadata after its payload owner has disappeared.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReceivePendingKey {
-    logical_receiver_generation: u32,
-    completion_sequence: u64,
-}
-
-impl ReceivePendingKey {
-    pub const fn logical_receiver_generation(self) -> u32 {
-        self.logical_receiver_generation
-    }
-
-    pub const fn completion_sequence(self) -> u64 {
-        self.completion_sequence
-    }
-}
-
-/// A slot selected for a submit.  The backend assigns the request id only after its submit
-/// transaction succeeds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReceiveSubmission {
-    pub slot_id: u32,
-    pub slot_generation: u32,
-}
-
-/// A generation reserved for a replacement request before the backend submits it.
-///
-/// The backend must use this value for the request context.  The reservation is also supplied
-/// when the delivery transaction is committed so that the state machine can verify that the
-/// submitted request and the slot state refer to the same replacement.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReceiveReplacementReservation {
-    slot_id: u32,
-    slot_generation: u32,
-}
-
-impl ReceiveReplacementReservation {
-    pub const fn slot_id(self) -> u32 {
-        self.slot_id
-    }
-
-    pub const fn slot_generation(self) -> u32 {
-        self.slot_generation
-    }
-}
-
-/// Result supplied by a backend for one request.
-pub type ReceiveCompletionResult = Result<usize, ReceivePumpError>;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReceiveCompletion {
-    pub request: ReceiveRequest,
-    pub result: ReceiveCompletionResult,
-    pub remote_addr: SocketAddr,
-}
-
-/// Event returned when the backend hands a completion to the state machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReceivePumpEvent {
-    Pending {
-        request: ReceiveRequest,
-        key: ReceivePendingKey,
-    },
-    /// The backend/pump lease ledger retains the datagram because the core pending queue is full.
-    /// No user record exists yet; the owner must call [`ReceivePumpState::resume_pending`] after
-    /// capacity becomes available.
-    Held {
-        request: ReceiveRequest,
-        key: ReceivePendingKey,
-    },
-    /// The current kernel arm ended for an internal reason such as provided-buffer exhaustion.
-    /// The logical receiver remains owned and must be rearmed by the backend.
-    Retained {
-        logical_receiver_generation: u32,
-    },
-    /// The logical receive has ended while actual requests are still in flight.  The backend must
-    /// stop replacement and keep routing every remaining completion until they are drained.
-    Drain,
-    Final {
-        error: ReceivePumpError,
-    },
-    Ignored,
-}
-
-/// Compatibility spelling for callers that describe the input as a completion event.
-pub type ReceiveCompletionEvent = ReceivePumpEvent;
-
-/// Result of a replacement submit attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReplacementSubmit {
-    /// No replacement is submitted because the logical receive pump is already draining.
-    NotSubmitted,
-    Submitted {
-        request_id: u64,
-        reservation: ReceiveReplacementReservation,
-    },
-    Failed {
-        reservation: ReceiveReplacementReservation,
-    },
-}
-
-/// A completion that has a permit and is ready for the backend to copy into an output buffer.
-///
-/// The slot remains unavailable while this value exists.  The backend must call
-/// [`ReceivePumpState::finish_delivery`] after the replacement submit decision, or
-/// [`ReceivePumpState::abort_delivery`] if output-buffer preparation failed.
-pub struct ReceiveDelivery {
-    request: ReceiveRequest,
-    key: ReceivePendingKey,
-    len: usize,
-    remote_addr: SocketAddr,
-    replacement_required: bool,
-    permit: Option<ReceivePermit>,
-}
-
-impl ReceiveDelivery {
-    pub fn request(&self) -> ReceiveRequest {
-        self.request
-    }
-
-    pub fn key(&self) -> ReceivePendingKey {
-        self.key
-    }
-
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    pub fn remote_addr(&self) -> SocketAddr {
-        self.remote_addr
-    }
-
-    pub fn replacement_required(&self) -> bool {
-        self.replacement_required
-    }
-}
-
-/// A packet record ready for publication to the core completion mailbox.
-pub struct ReceiveRecord {
-    pub request: ReceiveRequest,
-    pub key: ReceivePendingKey,
-    pub packet: UdpRecvPacket,
-    pub continuation: CompletionContinuation,
-}
-
-/// A fixed receive slot.  Its buffer never moves while the pump exists.
-pub struct ReceiveSlot {
-    slot_id: u32,
-    generation: u32,
-    data_buf: FixedBuf,
-    state: ReceiveSlotState,
-    completed_len: usize,
-    completed_addr: Option<SocketAddr>,
-    current_request: Option<ReceiveRequest>,
-}
-
-impl ReceiveSlot {
-    pub fn new(slot_id: u32, data_buf: FixedBuf) -> Self {
-        Self {
-            slot_id,
-            generation: 0,
-            data_buf,
-            state: ReceiveSlotState::Free,
-            completed_len: 0,
-            completed_addr: None,
-            current_request: None,
-        }
-    }
-
-    pub fn slot_id(&self) -> u32 {
-        self.slot_id
-    }
-
-    pub fn generation(&self) -> u32 {
-        self.generation
-    }
-
-    pub fn state(&self) -> ReceiveSlotState {
-        self.state
-    }
-
-    pub fn data_buf(&self) -> &FixedBuf {
-        &self.data_buf
-    }
-
-    pub fn data_buf_mut(&mut self) -> &mut FixedBuf {
-        &mut self.data_buf
-    }
-
-    pub fn completed_len(&self) -> Option<usize> {
-        matches!(
-            self.state,
-            ReceiveSlotState::CompletedPending
-                | ReceiveSlotState::LeaseHeld
-                | ReceiveSlotState::SubmitPending
-        )
-        .then_some(self.completed_len)
-    }
-
-    /// View bytes written by the kernel while the slot is no longer in flight.
-    ///
-    /// The RIO receive path writes directly into the fixed buffer and reports the byte count
-    /// separately, so the buffer's logical length is intentionally not changed here.
-    pub fn completed_data(&self) -> Option<&[u8]> {
-        let len = self.completed_len()?;
-        Some(unsafe { core::slice::from_raw_parts(self.data_buf.as_ptr(), len) })
-    }
-
-    pub fn current_request(&self) -> Option<ReceiveRequest> {
-        self.current_request
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PendingCompletion {
-    request: ReceiveRequest,
-    key: ReceivePendingKey,
-    len: usize,
-    remote_addr: SocketAddr,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ReceivePumpStats {
-    pub receive_requests_submitted: usize,
-    pub receive_requests_completed: usize,
-    pub receive_requests_rearmed: usize,
-    pub receive_backpressure_events: usize,
-    pub receive_permit_exhausted: usize,
-    pub receive_context_anomaly: usize,
-    pub receive_logical_rearms: usize,
-}
-
-/// Bounded diagnostics for completions observed by a receive pump.
-///
-/// Backends may receive several real kernel completions after a logical cancellation.  The pump
-/// keeps only aggregate status information so those observations remain available to the final
-/// cancellation report without retaining an unbounded per-completion payload.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ReceiveCompletionDiagnostics {
-    pub completion_count: usize,
-    pub cancelled_completion_count: usize,
-    pub total_bytes: usize,
-    pub first_error_status: Option<i32>,
-    pub last_status: Option<i32>,
-    pub error_count: usize,
-}
-
-/// A bounded permit pool shared by the pump and every packet it publishes.
-#[derive(Clone)]
-pub struct ReceivePermitPool {
-    inner: Arc<PermitState>,
-}
-
-struct PermitState {
-    capacity: usize,
-    available: AtomicUsize,
-    notifier: Option<Arc<dyn ReceivePermitNotifier>>,
-}
-
-impl ReceivePermitPool {
-    pub fn new(capacity: NonZeroUsize) -> Self {
-        Self::new_with_notifier(capacity, None)
-    }
-
-    pub fn new_with_notifier(
-        capacity: NonZeroUsize,
-        notifier: Option<Arc<dyn ReceivePermitNotifier>>,
-    ) -> Self {
-        Self {
-            inner: Arc::new(PermitState {
-                capacity: capacity.get(),
-                available: AtomicUsize::new(capacity.get()),
-                notifier,
-            }),
-        }
-    }
-
-    fn set_notifier(
-        &mut self,
-        notifier: Arc<dyn ReceivePermitNotifier>,
-    ) -> Result<(), ReceivePumpError> {
-        if self.available() != self.capacity() {
-            return Err(ReceivePumpError::InvalidTransition);
-        }
-        let capacity = self.capacity();
-        self.inner = Arc::new(PermitState {
-            capacity,
-            available: AtomicUsize::new(capacity),
-            notifier: Some(notifier),
-        });
-        Ok(())
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.inner.capacity
-    }
-
-    pub fn available(&self) -> usize {
-        self.inner.available.load(Ordering::Acquire)
-    }
-
-    pub fn in_use(&self) -> usize {
-        self.capacity() - self.available()
-    }
-
-    fn acquire(&self) -> Option<ReceivePermit> {
-        let mut available = self.available();
-        loop {
-            if available == 0 {
-                return None;
-            }
-            match self.inner.available.compare_exchange(
-                available,
-                available - 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    return Some(ReceivePermit {
-                        pool: Some(self.inner.clone()),
-                    });
-                }
-                Err(observed) => available = observed,
-            }
-        }
-    }
-
-    fn bind_resume_token(&self, token: u64) {
-        if let Some(notifier) = &self.inner.notifier {
-            notifier.bind_resume_token(token);
-        }
-    }
-}
-
-/// A permit held by one packet or one in-progress delivery.
-pub struct ReceivePermit {
-    pool: Option<Arc<PermitState>>,
-}
-
-impl ReceivePermit {
-    pub(crate) fn detached() -> Self {
-        Self { pool: None }
-    }
-
-    pub fn release(self) {
-        drop(self);
-    }
-}
-
-impl Drop for ReceivePermit {
-    fn drop(&mut self) {
-        if let Some(pool) = self.pool.take() {
-            pool.available.fetch_add(1, Ordering::Release);
-            if let Some(notifier) = &pool.notifier {
-                notifier.notify();
-            }
-        }
-    }
-}
-
-/// 一个 io_uring multishot datagram admission 的身份。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DatagramAdmission {
-    key: ReceivePendingKey,
-}
-
-impl DatagramAdmission {
-    pub const fn key(self) -> ReceivePendingKey {
-        self.key
-    }
-}
-
-/// 已经按 FIFO 顺序取得 permit、等待 backend copy 的 datagram。
-pub struct DatagramDelivery {
-    key: ReceivePendingKey,
-    len: usize,
-    remote_addr: SocketAddr,
-    permit: Option<ReceivePermit>,
-}
-
-impl DatagramDelivery {
-    pub const fn key(&self) -> ReceivePendingKey {
-        self.key
-    }
-
-    pub const fn len(&self) -> usize {
-        self.len
-    }
-
-    pub const fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    pub const fn remote_addr(&self) -> SocketAddr {
-        self.remote_addr
-    }
-}
+use veloq_std::{boxed::Box, collections::VecDeque, net::SocketAddr, sync::Arc};
 
 /// The pure state machine for one logical UDP receive operation.
 pub struct ReceivePumpState {
@@ -630,13 +41,10 @@ pub struct ReceivePumpState {
     ready_packets: usize,
     terminal_error: Option<ReceivePumpError>,
     eof_on_empty: bool,
-    logical_receiver_generation: u32,
-    next_completion_sequence: u64,
     final_emitted: bool,
     stats: ReceivePumpStats,
     completion_diagnostics: ReceiveCompletionDiagnostics,
-    multishot: bool,
-    multishot_pending: VecDeque<PendingCompletion>,
+    datagrams: DatagramQueue,
 }
 
 impl ReceivePumpState {
@@ -674,7 +82,6 @@ impl ReceivePumpState {
         config: ReceivePumpConfig,
         notifier: Option<Arc<dyn ReceivePermitNotifier>>,
     ) -> Result<Self, ReceivePumpError> {
-        config.validate(config.kernel_capacity.get())?;
         Self::try_new_with_options(config, Box::new([]), false, true, notifier)
     }
 
@@ -694,60 +101,23 @@ impl ReceivePumpState {
         multishot: bool,
         notifier: Option<Arc<dyn ReceivePermitNotifier>>,
     ) -> Result<Self, ReceivePumpError> {
-        config.validate(if multishot {
-            config.kernel_capacity.get()
-        } else {
-            slots.len()
-        })?;
-        if !multishot && slots.len() != config.kernel_capacity.get() {
-            return Err(ReceivePumpError::ReceiveConfigInvalid);
-        }
-        if multishot && !slots.is_empty() {
-            return Err(ReceivePumpError::ReceiveConfigInvalid);
-        }
-        for (index, slot) in slots.iter().enumerate() {
-            if slot.data_buf.capacity() < config.datagram_capacity.get() {
-                return Err(ReceivePumpError::ReceiveConfigInvalid);
-            }
-            if slots[..index]
-                .iter()
-                .any(|previous| previous.slot_id == slot.slot_id)
-            {
-                return Err(ReceivePumpError::ReceiveConfigInvalid);
-            }
-        }
-
-        let pending_capacity = config.kernel_capacity.get();
-        let mut pending = VecDeque::new();
-        pending
-            .try_reserve_exact(pending_capacity)
-            .map_err(|_| ReceivePumpError::ReceiveConfigInvalid)?;
-        let mut held = VecDeque::new();
-        held.try_reserve_exact(pending_capacity)
-            .map_err(|_| ReceivePumpError::ReceiveConfigInvalid)?;
-        let mut multishot_pending = VecDeque::new();
-        multishot_pending
-            .try_reserve_exact(pending_capacity)
-            .map_err(|_| ReceivePumpError::ReceiveConfigInvalid)?;
+        let queues = PumpQueues::allocate(config, slots, multishot)?;
         Ok(Self {
             config,
             phase: ReceivePumpPhase::Created,
-            slots,
-            permits: ReceivePermitPool::new_with_notifier(config.queue_capacity, notifier),
-            pending,
-            held,
+            slots: queues.slots,
+            permits: ReceivePermitPool::new_with_notifier(config.queue_capacity(), notifier),
+            pending: queues.pending,
+            held: queues.held,
             prepared: None,
             actual_in_flight: 0,
             ready_packets: 0,
             terminal_error: None,
             eof_on_empty,
-            logical_receiver_generation: 0,
-            next_completion_sequence: 0,
             final_emitted: false,
             stats: ReceivePumpStats::default(),
             completion_diagnostics: ReceiveCompletionDiagnostics::default(),
-            multishot,
-            multishot_pending,
+            datagrams: queues.datagrams,
         })
     }
 
@@ -829,21 +199,12 @@ impl ReceivePumpState {
     }
 
     pub fn is_multishot(&self) -> bool {
-        self.multishot
+        self.datagrams.enabled()
     }
 
     /// Arm the logical multishot receiver after its SQE has been accepted by the backend.
     pub fn arm_multishot(&mut self) -> Result<u32, ReceivePumpError> {
-        if !self.multishot || !matches!(self.phase, ReceivePumpPhase::Created) {
-            return Err(ReceivePumpError::InvalidTransition);
-        }
-        let generation = self
-            .logical_receiver_generation
-            .checked_add(1)
-            .ok_or(ReceivePumpError::ReceiveContextCorrupt)?;
-        self.logical_receiver_generation = generation;
-        self.phase = ReceivePumpPhase::Running;
-        Ok(generation)
+        self.datagrams.arm(&mut self.phase)
     }
 
     /// 将一个完整 datagram 的 metadata 按完成顺序提交到 multishot FIFO。
@@ -852,137 +213,52 @@ impl ReceivePumpState {
         len: usize,
         remote_addr: SocketAddr,
     ) -> Result<DatagramAdmission, ReceivePumpError> {
-        if !self.multishot
-            || !matches!(
-                self.phase,
-                ReceivePumpPhase::Running | ReceivePumpPhase::PausedByBackpressure
-            )
-        {
-            return Err(ReceivePumpError::InvalidTransition);
-        }
-        if len > self.config.datagram_capacity.get()
-            || self.multishot_pending.len() >= self.config.pending_capacity()
-        {
-            self.pause_for_backpressure();
-            return Err(ReceivePumpError::ReceiveQueueStalled);
-        }
-        let completion_sequence = self
-            .next_completion_sequence
-            .checked_add(1)
-            .ok_or(ReceivePumpError::ReceiveContextCorrupt)?;
-        self.next_completion_sequence = completion_sequence;
-        let key = ReceivePendingKey {
-            logical_receiver_generation: self.logical_receiver_generation,
-            completion_sequence,
-        };
-        self.multishot_pending.push_back(PendingCompletion {
-            request: ReceiveRequest {
-                request_id: completion_sequence,
-                slot_id: u32::MAX,
-                slot_generation: self.logical_receiver_generation,
-            },
-            key,
+        self.datagrams.admit(
+            DatagramQueueContext::new(self.config, &mut self.phase, &mut self.stats, &self.permits),
             len,
             remote_addr,
-        });
-        if self.permits.available() == 0 {
-            self.pause_for_backpressure();
-        }
-        Ok(DatagramAdmission { key })
+        )
     }
 
     /// 取得最旧的 multishot metadata 和一个 packet permit。
     pub fn next_datagram_delivery(&mut self) -> Option<DatagramDelivery> {
-        if !self.multishot
-            || !matches!(
-                self.phase,
-                ReceivePumpPhase::Running
-                    | ReceivePumpPhase::PausedByBackpressure
-                    | ReceivePumpPhase::RearmPending
-            )
-        {
-            return None;
-        }
-        if self.multishot_pending.is_empty() {
-            return None;
-        }
-        let permit = match self.permits.acquire() {
-            Some(permit) => permit,
-            None => {
-                self.pause_for_backpressure();
-                return None;
-            }
-        };
-        let pending = self.multishot_pending.pop_front()?;
-        self.resume_if_possible();
-        Some(DatagramDelivery {
-            key: pending.key,
-            len: pending.len,
-            remote_addr: pending.remote_addr,
-            permit: Some(permit),
-        })
+        self.datagrams.next_delivery(DatagramQueueContext::new(
+            self.config,
+            &mut self.phase,
+            &mut self.stats,
+            &self.permits,
+        ))
     }
 
     pub fn finish_datagram_delivery(
         &mut self,
-        mut delivery: DatagramDelivery,
-        mut output: FixedBuf,
+        delivery: DatagramDelivery,
+        output: FixedBuf,
     ) -> Result<UdpRecvPacket, ReceivePumpError> {
-        if output.capacity() < delivery.len {
-            self.multishot_pending.push_front(PendingCompletion {
-                request: ReceiveRequest {
-                    request_id: delivery.key.completion_sequence,
-                    slot_id: u32::MAX,
-                    slot_generation: delivery.key.logical_receiver_generation,
-                },
-                key: delivery.key,
-                len: delivery.len,
-                remote_addr: delivery.remote_addr,
-            });
-            drop(delivery);
-            self.pause_for_backpressure();
-            return Err(ReceivePumpError::ReceiveQueueStalled);
-        }
-        output.set_len(delivery.len);
-        let permit = delivery
-            .permit
-            .take()
-            .ok_or(ReceivePumpError::InvalidTransition)?;
-        Ok(UdpRecvPacket {
-            buf: UdpRecvPacketBuf::from_fixed_buf_with_permit(output, permit),
-            addr: delivery.remote_addr,
-        })
+        self.datagrams.finish_delivery(
+            DatagramQueueContext::new(self.config, &mut self.phase, &mut self.stats, &self.permits),
+            delivery,
+            output,
+        )
     }
 
     pub fn abort_datagram_delivery(
         &mut self,
         delivery: DatagramDelivery,
     ) -> Result<(), ReceivePumpError> {
-        self.multishot_pending.push_front(PendingCompletion {
-            request: ReceiveRequest {
-                request_id: delivery.key.completion_sequence,
-                slot_id: u32::MAX,
-                slot_generation: delivery.key.logical_receiver_generation,
-            },
-            key: delivery.key,
-            len: delivery.len,
-            remote_addr: delivery.remote_addr,
-        });
-        drop(delivery);
-        Ok(())
+        self.datagrams.abort_delivery(delivery)
     }
 
     pub fn pending_datagrams(&self) -> usize {
-        self.multishot_pending.len()
+        self.datagrams.pending_count()
     }
 
     pub fn rearm_pending(&self) -> bool {
-        self.multishot && self.phase == ReceivePumpPhase::RearmPending
+        self.datagrams.rearm_pending(self.phase)
     }
 
     pub fn clear_multishot_pending(&mut self) -> usize {
-        let count = self.multishot_pending.len();
-        self.multishot_pending.clear();
+        let count = self.datagrams.clear_pending();
         self.maybe_drained();
         count
     }
@@ -992,7 +268,7 @@ impl ReceivePumpState {
     }
 
     pub fn logical_receiver_generation(&self) -> u32 {
-        self.logical_receiver_generation
+        self.datagrams.generation()
     }
 
     /// Retain the logical receive operation after a backend arm ended without a user-visible
@@ -1005,11 +281,10 @@ impl ReceivePumpState {
         ) {
             return Err(ReceivePumpError::InvalidTransition);
         }
-        let Some(generation) = self.logical_receiver_generation.checked_add(1) else {
+        let Ok(generation) = self.datagrams.advance_generation() else {
             self.set_terminal(ReceivePumpError::ReceiveContextCorrupt);
             return self.emit_final_or_drain();
         };
-        self.logical_receiver_generation = generation;
         self.phase = ReceivePumpPhase::RearmPending;
         Ok(ReceivePumpEvent::Retained {
             logical_receiver_generation: generation,
@@ -1030,7 +305,7 @@ impl ReceivePumpState {
         self.debug_assert_invariants();
         ReceivePumpSnapshot {
             phase: self.phase,
-            target_depth: self.config.kernel_capacity.get(),
+            target_depth: self.config.kernel_capacity().get(),
             actual_in_flight: self.actual_in_flight,
             pending_completions: self.pending.len(),
             held_completions: self.held.len(),
@@ -1038,7 +313,7 @@ impl ReceivePumpState {
             held_packets: self.held_packets(),
             permits_available: self.permits.available(),
             final_emitted: self.final_emitted,
-            logical_receiver_generation: self.logical_receiver_generation,
+            logical_receiver_generation: self.datagrams.generation(),
         }
     }
 
@@ -1071,19 +346,19 @@ impl ReceivePumpState {
     /// Select the next fixed slot for an initial submit.
     pub fn next_submission(&mut self) -> Option<ReceiveSubmission> {
         if self.phase != ReceivePumpPhase::Starting
-            || self.actual_in_flight >= self.config.kernel_capacity.get()
+            || self.actual_in_flight >= self.config.kernel_capacity().get()
         {
             return None;
         }
         let index = self
             .slots
             .iter()
-            .position(|slot| slot.state == ReceiveSlotState::Free)?;
+            .position(|slot| slot.state() == ReceiveSlotState::Free)?;
         let slot = &mut self.slots[index];
-        slot.state = ReceiveSlotState::SubmitPending;
+        slot.set_state(ReceiveSlotState::SubmitPending);
         Some(ReceiveSubmission {
-            slot_id: slot.slot_id,
-            slot_generation: slot.generation,
+            slot_id: slot.slot_id(),
+            slot_generation: slot.generation(),
         })
     }
 
@@ -1104,8 +379,8 @@ impl ReceivePumpState {
             slot_generation: submission.slot_generation,
         };
         let slot = &mut self.slots[index];
-        slot.state = ReceiveSlotState::InFlight;
-        slot.current_request = Some(request);
+        slot.set_state(ReceiveSlotState::InFlight);
+        slot.set_current_request(Some(request));
         self.actual_in_flight += 1;
         self.stats.receive_requests_submitted += 1;
         self.try_enter_running();
@@ -1122,7 +397,7 @@ impl ReceivePumpState {
             return Err(ReceivePumpError::InvalidTransition);
         }
         let index = self.validate_submission(submission)?;
-        self.slots[index].state = ReceiveSlotState::Retiring;
+        self.slots[index].set_state(ReceiveSlotState::Retiring);
         self.terminal_error = Some(ReceivePumpError::InitialReceiveSubmitFailed);
         self.phase = ReceivePumpPhase::Closing;
         self.emit_final_if_possible()
@@ -1138,8 +413,8 @@ impl ReceivePumpState {
             return Err(ReceivePumpError::ReceiveContextCorrupt);
         };
         let slot = &mut self.slots[index];
-        if slot.state != ReceiveSlotState::InFlight
-            || slot.current_request != Some(completion.request)
+        if slot.state() != ReceiveSlotState::InFlight
+            || slot.current_request() != Some(completion.request)
         {
             self.stats.receive_context_anomaly += 1;
             return Err(ReceivePumpError::ReceiveContextCorrupt);
@@ -1153,7 +428,7 @@ impl ReceivePumpState {
             self.pause_for_backpressure();
             return Err(ReceivePumpError::ReceiveQueueStalled);
         }
-        slot.current_request = None;
+        slot.set_current_request(None);
         self.actual_in_flight -= 1;
         self.stats.receive_requests_completed += 1;
 
@@ -1161,9 +436,9 @@ impl ReceivePumpState {
             self.phase,
             ReceivePumpPhase::Closing | ReceivePumpPhase::RunningWithTerminalError
         ) {
-            slot.state = ReceiveSlotState::Retiring;
-            slot.completed_len = 0;
-            slot.completed_addr = None;
+            slot.set_state(ReceiveSlotState::Retiring);
+            slot.set_completed_len(0);
+            slot.set_completed_addr(None);
             self.promote_held();
             return match self.oldest_pending_event() {
                 Some(event) => Ok(event),
@@ -1171,19 +446,17 @@ impl ReceivePumpState {
             };
         }
         match completion.result {
-            Ok(len) if len <= slot.data_buf.capacity() => {
-                let Some(completion_sequence) = self.next_completion_sequence.checked_add(1) else {
-                    slot.state = ReceiveSlotState::Retiring;
-                    self.set_terminal(ReceivePumpError::ReceiveContextCorrupt);
-                    return self.emit_final_or_drain();
+            Ok(len) if len <= slot.data_buf().capacity() => {
+                let key = match self.datagrams.next_key() {
+                    Ok(key) => key,
+                    Err(error) => {
+                        slot.set_state(ReceiveSlotState::Retiring);
+                        self.set_terminal(error);
+                        return self.emit_final_or_drain();
+                    }
                 };
-                self.next_completion_sequence = completion_sequence;
-                let key = ReceivePendingKey {
-                    logical_receiver_generation: self.logical_receiver_generation,
-                    completion_sequence,
-                };
-                slot.completed_len = len;
-                slot.completed_addr = Some(completion.remote_addr);
+                slot.set_completed_len(len);
+                slot.set_completed_addr(Some(completion.remote_addr));
                 let pending = PendingCompletion {
                     request: completion.request,
                     key,
@@ -1192,7 +465,7 @@ impl ReceivePumpState {
                 };
                 let pending_capacity = self.config.pending_capacity();
                 if self.pending.len() >= pending_capacity {
-                    slot.state = ReceiveSlotState::LeaseHeld;
+                    slot.set_state(ReceiveSlotState::LeaseHeld);
                     self.held.push_back(pending);
                     self.pause_for_backpressure();
                     return Ok(ReceivePumpEvent::Held {
@@ -1200,7 +473,7 @@ impl ReceivePumpState {
                         key,
                     });
                 }
-                slot.state = ReceiveSlotState::CompletedPending;
+                slot.set_state(ReceiveSlotState::CompletedPending);
                 self.pending.push_back(pending);
                 if len == 0 && self.eof_on_empty {
                     self.set_terminal(ReceivePumpError::ReceiveEof);
@@ -1214,7 +487,7 @@ impl ReceivePumpState {
                 })
             }
             Ok(_) => {
-                slot.state = ReceiveSlotState::Retiring;
+                slot.set_state(ReceiveSlotState::Retiring);
                 self.set_terminal(ReceivePumpError::ReceiveContextCorrupt);
                 match self.oldest_pending_event() {
                     Some(event) => Ok(event),
@@ -1222,7 +495,7 @@ impl ReceivePumpState {
                 }
             }
             Err(error) => {
-                slot.state = ReceiveSlotState::Retiring;
+                slot.set_state(ReceiveSlotState::Retiring);
                 self.set_terminal(error);
                 match self.oldest_pending_event() {
                     Some(event) => Ok(event),
@@ -1260,16 +533,16 @@ impl ReceivePumpState {
             return None;
         };
         let slot = &mut self.slots[index];
-        if slot.state != ReceiveSlotState::CompletedPending {
+        if slot.state() != ReceiveSlotState::CompletedPending {
             drop(permit);
             self.stats.receive_context_anomaly += 1;
             self.set_terminal(ReceivePumpError::ReceiveContextCorrupt);
             return None;
         }
-        slot.state = ReceiveSlotState::SubmitPending;
+        slot.set_state(ReceiveSlotState::SubmitPending);
         self.prepared = Some(pending.request);
         self.resume_if_possible();
-        Some(ReceiveDelivery {
+        Some(ReceiveDelivery::new(ReceiveDeliveryParts {
             request: pending.request,
             key: pending.key,
             len: pending.len,
@@ -1278,8 +551,8 @@ impl ReceivePumpState {
                 self.phase,
                 ReceivePumpPhase::Running | ReceivePumpPhase::PausedByBackpressure
             ),
-            permit: Some(permit),
-        })
+            permit,
+        }))
     }
 
     /// Promote retained completion metadata after a backend payload lease becomes eligible for
@@ -1301,26 +574,27 @@ impl ReceivePumpState {
         &mut self,
         delivery: &ReceiveDelivery,
     ) -> Result<ReceiveReplacementReservation, ReceivePumpError> {
-        if self.prepared != Some(delivery.request) {
+        let request = delivery.request();
+        if self.prepared != Some(request) {
             return Err(ReceivePumpError::InvalidTransition);
         }
-        let Some(index) = self.slot_index(delivery.request.slot_id) else {
+        let Some(index) = self.slot_index(request.slot_id) else {
             return Err(ReceivePumpError::ReceiveContextCorrupt);
         };
         let slot = &mut self.slots[index];
-        if slot.state != ReceiveSlotState::SubmitPending
-            || slot.generation != delivery.request.slot_generation
+        if slot.state() != ReceiveSlotState::SubmitPending
+            || slot.generation() != request.slot_generation
         {
             return Err(ReceivePumpError::ReceiveContextCorrupt);
         }
-        let Some(slot_generation) = slot.generation.checked_add(1) else {
+        let Some(slot_generation) = slot.generation().checked_add(1) else {
             return Err(ReceivePumpError::ReceiveContextCorrupt);
         };
-        slot.generation = slot_generation;
-        Ok(ReceiveReplacementReservation {
-            slot_id: slot.slot_id,
+        slot.set_generation(slot_generation);
+        Ok(ReceiveReplacementReservation::new(
+            slot.slot_id(),
             slot_generation,
-        })
+        ))
     }
 
     /// Complete the copy/replacement transaction.  A successful replacement is committed before
@@ -1331,27 +605,31 @@ impl ReceivePumpState {
         mut output: FixedBuf,
         replacement: ReplacementSubmit,
     ) -> Result<ReceiveRecord, ReceivePumpError> {
-        if self.prepared != Some(delivery.request) {
+        let request = delivery.request();
+        let key = delivery.key();
+        let len = delivery.len();
+        let remote_addr = delivery.remote_addr();
+        let replacement_required = delivery.replacement_required();
+        if self.prepared != Some(request) {
             return Err(ReceivePumpError::InvalidTransition);
         }
-        if !delivery.replacement_required && !matches!(replacement, ReplacementSubmit::NotSubmitted)
-        {
+        if !replacement_required && !matches!(replacement, ReplacementSubmit::NotSubmitted) {
             return Err(ReceivePumpError::InvalidTransition);
         }
-        let Some(index) = self.slot_index(delivery.request.slot_id) else {
+        let Some(index) = self.slot_index(request.slot_id) else {
             return Err(ReceivePumpError::ReceiveContextCorrupt);
         };
         let slot = &mut self.slots[index];
-        if slot.state != ReceiveSlotState::SubmitPending {
+        if slot.state() != ReceiveSlotState::SubmitPending {
             return Err(ReceivePumpError::ReceiveContextCorrupt);
         }
         let reservation = match replacement {
             ReplacementSubmit::NotSubmitted => None,
             ReplacementSubmit::Submitted { reservation, .. }
             | ReplacementSubmit::Failed { reservation } => {
-                if reservation.slot_id != slot.slot_id
-                    || reservation.slot_generation != slot.generation
-                    || reservation.slot_generation == delivery.request.slot_generation
+                if reservation.slot_id() != slot.slot_id()
+                    || reservation.slot_generation() != slot.generation()
+                    || reservation.slot_generation() == request.slot_generation
                 {
                     return Err(ReceivePumpError::ReceiveContextCorrupt);
                 }
@@ -1359,29 +637,28 @@ impl ReceivePumpState {
             }
         };
         self.prepared = None;
-        if output.capacity() < delivery.len {
+        if output.capacity() < len {
             if reservation.is_some() {
-                slot.generation = delivery.request.slot_generation;
+                slot.set_generation(request.slot_generation);
             }
-            slot.state = ReceiveSlotState::CompletedPending;
+            slot.set_state(ReceiveSlotState::CompletedPending);
             self.pending.push_front(PendingCompletion {
-                request: delivery.request,
-                key: delivery.key,
-                len: delivery.len,
-                remote_addr: delivery.remote_addr,
+                request,
+                key,
+                len,
+                remote_addr,
             });
             drop(delivery);
             self.pause_for_backpressure();
             return Err(ReceivePumpError::ReceiveQueueStalled);
         }
-        output.set_len(delivery.len);
+        output.set_len(len);
         let permit = delivery
-            .permit
-            .take()
+            .take_permit()
             .ok_or(ReceivePumpError::InvalidTransition)?;
         let packet = UdpRecvPacket {
             buf: UdpRecvPacketBuf::from_fixed_buf_with_permit(output, permit),
-            addr: delivery.remote_addr,
+            addr: remote_addr,
         };
 
         match replacement {
@@ -1389,35 +666,35 @@ impl ReceivePumpState {
                 let reservation = reservation.expect("validated replacement reservation");
                 let request = ReceiveRequest {
                     request_id,
-                    slot_id: slot.slot_id,
-                    slot_generation: reservation.slot_generation,
+                    slot_id: slot.slot_id(),
+                    slot_generation: reservation.slot_generation(),
                 };
-                slot.current_request = Some(request);
-                slot.state = ReceiveSlotState::InFlight;
-                slot.completed_addr = None;
-                slot.completed_len = 0;
+                slot.set_current_request(Some(request));
+                slot.set_state(ReceiveSlotState::InFlight);
+                slot.set_completed_addr(None);
+                slot.set_completed_len(0);
                 self.actual_in_flight += 1;
                 self.stats.receive_requests_submitted += 1;
                 self.stats.receive_requests_rearmed += 1;
                 self.ready_packets += 1;
                 self.resume_if_possible();
                 Ok(ReceiveRecord {
-                    request: delivery.request,
-                    key: delivery.key,
+                    request,
+                    key,
                     packet,
                     continuation: CompletionContinuation::More,
                 })
             }
             ReplacementSubmit::Failed { .. } => {
-                slot.state = ReceiveSlotState::Retiring;
+                slot.set_state(ReceiveSlotState::Retiring);
                 self.set_terminal(ReceivePumpError::ReplacementSubmitFailed);
                 let final_now =
                     self.actual_in_flight == 0 && self.pending.is_empty() && self.held.is_empty();
                 self.final_emitted = final_now;
                 self.ready_packets += 1;
                 Ok(ReceiveRecord {
-                    request: delivery.request,
-                    key: delivery.key,
+                    request,
+                    key,
                     packet,
                     continuation: if final_now {
                         CompletionContinuation::Final
@@ -1427,14 +704,14 @@ impl ReceivePumpState {
                 })
             }
             ReplacementSubmit::NotSubmitted => {
-                slot.state = ReceiveSlotState::Retiring;
+                slot.set_state(ReceiveSlotState::Retiring);
                 let final_now =
                     self.actual_in_flight == 0 && self.pending.is_empty() && self.held.is_empty();
                 self.final_emitted = final_now;
                 self.ready_packets += 1;
                 Ok(ReceiveRecord {
-                    request: delivery.request,
-                    key: delivery.key,
+                    request,
+                    key,
                     packet,
                     continuation: if final_now {
                         CompletionContinuation::Final
@@ -1452,19 +729,20 @@ impl ReceivePumpState {
         delivery: ReceiveDelivery,
         error: ReceivePumpError,
     ) -> Result<(), ReceivePumpError> {
-        if self.prepared != Some(delivery.request) {
+        let request = delivery.request();
+        if self.prepared != Some(request) {
             return Err(ReceivePumpError::InvalidTransition);
         }
         self.prepared = None;
-        let Some(index) = self.slot_index(delivery.request.slot_id) else {
+        let Some(index) = self.slot_index(request.slot_id) else {
             return Err(ReceivePumpError::ReceiveContextCorrupt);
         };
-        self.slots[index].state = ReceiveSlotState::CompletedPending;
+        self.slots[index].set_state(ReceiveSlotState::CompletedPending);
         self.pending.push_front(PendingCompletion {
-            request: delivery.request,
-            key: delivery.key,
-            len: delivery.len,
-            remote_addr: delivery.remote_addr,
+            request,
+            key: delivery.key(),
+            len: delivery.len(),
+            remote_addr: delivery.remote_addr(),
         });
         drop(delivery);
         if matches!(error, ReceivePumpError::ReceiveQueueStalled) {
@@ -1512,16 +790,11 @@ impl ReceivePumpState {
     }
 
     fn slot_index(&self, slot_id: u32) -> Option<usize> {
-        self.slots.iter().position(|slot| slot.slot_id == slot_id)
+        PumpLifecycle::slot_index(&self.slots, slot_id)
     }
 
     fn oldest_pending_event(&self) -> Option<ReceivePumpEvent> {
-        self.pending
-            .front()
-            .map(|pending| ReceivePumpEvent::Pending {
-                request: pending.request,
-                key: pending.key,
-            })
+        PumpLifecycle::oldest_pending_event(&self.pending)
     }
 
     fn promote_held(&mut self) -> usize {
@@ -1536,14 +809,14 @@ impl ReceivePumpState {
                 break;
             };
             let slot = &mut self.slots[index];
-            if slot.state != ReceiveSlotState::LeaseHeld
-                || slot.generation != held.request.slot_generation
+            if slot.state() != ReceiveSlotState::LeaseHeld
+                || slot.generation() != held.request.slot_generation
             {
                 self.stats.receive_context_anomaly += 1;
                 self.set_terminal(ReceivePumpError::ReceiveContextCorrupt);
                 break;
             }
-            slot.state = ReceiveSlotState::CompletedPending;
+            slot.set_state(ReceiveSlotState::CompletedPending);
             self.pending.push_back(held);
             promoted += 1;
         }
@@ -1554,145 +827,82 @@ impl ReceivePumpState {
         &self,
         submission: ReceiveSubmission,
     ) -> Result<usize, ReceivePumpError> {
-        let Some(index) = self.slot_index(submission.slot_id) else {
-            return Err(ReceivePumpError::ReceiveContextCorrupt);
-        };
-        let slot = &self.slots[index];
-        if slot.state != ReceiveSlotState::SubmitPending
-            || slot.generation != submission.slot_generation
-        {
-            return Err(ReceivePumpError::InvalidTransition);
-        }
-        Ok(index)
+        PumpLifecycle::validate_submission(&self.slots, submission)
     }
 
     fn try_enter_running(&mut self) {
-        if self.phase == ReceivePumpPhase::Starting
-            && self.actual_in_flight == self.config.kernel_capacity.get()
-            && !self
-                .slots
-                .iter()
-                .any(|slot| slot.state == ReceiveSlotState::SubmitPending)
-        {
-            self.phase = ReceivePumpPhase::Running;
-        }
+        PumpLifecycle::try_enter_running(
+            &mut self.phase,
+            self.actual_in_flight,
+            self.config.kernel_capacity().get(),
+            &self.slots,
+        );
     }
 
     fn pause_for_backpressure(&mut self) {
-        if self.phase != ReceivePumpPhase::PausedByBackpressure {
-            self.stats.receive_backpressure_events += 1;
-        }
-        self.stats.receive_permit_exhausted += 1;
-        self.phase = ReceivePumpPhase::PausedByBackpressure;
+        PumpLifecycle::pause_for_backpressure(&mut self.phase, &mut self.stats);
     }
 
     fn resume_if_possible(&mut self) {
-        if self.phase == ReceivePumpPhase::PausedByBackpressure && self.permits.available() > 0 {
-            self.phase = ReceivePumpPhase::Running;
-        }
+        PumpLifecycle::resume_if_possible(&mut self.phase, &self.permits);
     }
 
     fn set_terminal(&mut self, error: ReceivePumpError) {
-        if self.terminal_error.is_none() {
-            self.terminal_error = Some(error);
-        }
-        if self.phase != ReceivePumpPhase::Closing {
-            self.phase = ReceivePumpPhase::RunningWithTerminalError;
-        }
+        PumpLifecycle::set_terminal(&mut self.phase, &mut self.terminal_error, error);
     }
 
     fn retire_pending(&mut self) {
-        while let Some(pending) = self.pending.pop_front() {
-            if let Some(index) = self.slot_index(pending.request.slot_id) {
-                self.slots[index].state = ReceiveSlotState::Retiring;
-            }
-        }
-        while let Some(held) = self.held.pop_front() {
-            if let Some(index) = self.slot_index(held.request.slot_id) {
-                self.slots[index].state = ReceiveSlotState::Retiring;
-            }
-        }
+        PumpLifecycle::retire_pending(&mut self.slots, &mut self.pending, &mut self.held);
     }
 
     fn emit_final_if_possible(&mut self) -> Result<ReceivePumpEvent, ReceivePumpError> {
-        if self.final_emitted {
-            return Ok(ReceivePumpEvent::Ignored);
-        }
-        if self.actual_in_flight != 0
-            || !self.pending.is_empty()
-            || !self.held.is_empty()
-            || !self.multishot_pending.is_empty()
-            || self.prepared.is_some()
-        {
-            return Ok(ReceivePumpEvent::Ignored);
-        }
-        self.final_emitted = true;
-        let error = self
-            .terminal_error
-            .unwrap_or(ReceivePumpError::DriverShutdown);
-        Ok(ReceivePumpEvent::Final { error })
+        PumpLifecycle::emit_final_if_possible(FinalizationContext {
+            final_emitted: &mut self.final_emitted,
+            terminal_error: self.terminal_error,
+            actual_in_flight: self.actual_in_flight,
+            pending_count: self.pending.len(),
+            held_count: self.held.len(),
+            datagram_count: self.datagrams.pending_count(),
+            has_prepared: self.prepared.is_some(),
+        })
     }
 
     fn emit_final_or_drain(&mut self) -> Result<ReceivePumpEvent, ReceivePumpError> {
-        let event = self.emit_final_if_possible()?;
-        if matches!(event, ReceivePumpEvent::Ignored)
-            && self.actual_in_flight != 0
-            && matches!(
-                self.phase,
-                ReceivePumpPhase::Closing | ReceivePumpPhase::RunningWithTerminalError
-            )
-        {
-            Ok(ReceivePumpEvent::Drain)
-        } else {
-            Ok(event)
-        }
+        PumpLifecycle::emit_final_or_drain(
+            FinalizationContext {
+                final_emitted: &mut self.final_emitted,
+                terminal_error: self.terminal_error,
+                actual_in_flight: self.actual_in_flight,
+                pending_count: self.pending.len(),
+                held_count: self.held.len(),
+                datagram_count: self.datagrams.pending_count(),
+                has_prepared: self.prepared.is_some(),
+            },
+            self.phase,
+        )
     }
 
     fn maybe_drained(&mut self) {
-        if matches!(
-            self.phase,
-            ReceivePumpPhase::Closing | ReceivePumpPhase::RunningWithTerminalError
-        ) && self.actual_in_flight == 0
-            && self.pending.is_empty()
-            && self.held.is_empty()
-            && self.multishot_pending.is_empty()
-            && self.prepared.is_none()
-            && self.final_emitted
-        {
-            self.phase = ReceivePumpPhase::Drained;
-            for slot in &mut self.slots {
-                if slot.state != ReceiveSlotState::InFlight {
-                    slot.state = ReceiveSlotState::Retiring;
-                }
-            }
-        }
+        PumpLifecycle::maybe_drained(DrainContext {
+            phase: &mut self.phase,
+            actual_in_flight: self.actual_in_flight,
+            pending_count: self.pending.len(),
+            held_count: self.held.len(),
+            datagram_count: self.datagrams.pending_count(),
+            has_prepared: self.prepared.is_some(),
+            final_emitted: self.final_emitted,
+            slots: &mut self.slots,
+        });
     }
 
     fn debug_assert_invariants(&self) {
-        if !self.multishot {
-            let in_flight_slots = self
-                .slots
-                .iter()
-                .filter(|slot| slot.state == ReceiveSlotState::InFlight)
-                .count();
-            debug_assert_eq!(self.actual_in_flight, in_flight_slots);
-            debug_assert!(self.actual_in_flight <= self.config.kernel_capacity.get());
-        }
+        PumpLifecycle::debug_assert_invariants(InvariantContext {
+            multishot: self.datagrams.enabled(),
+            actual_in_flight: self.actual_in_flight,
+            target_depth: self.config.kernel_capacity().get(),
+            slots: &self.slots,
+        });
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReceivePumpSnapshot {
-    pub phase: ReceivePumpPhase,
-    pub target_depth: usize,
-    pub actual_in_flight: usize,
-    pub pending_completions: usize,
-    pub held_completions: usize,
-    pub ready_packets: usize,
-    pub held_packets: usize,
-    pub permits_available: usize,
-    pub final_emitted: bool,
-    pub logical_receiver_generation: u32,
 }
 
 #[cfg(all(test, not(feature = "loom")))]
@@ -1701,17 +911,19 @@ mod tests {
     use crate::driver::CompletionContinuation;
     use veloq_std::{
         net::SocketAddr,
+        num::NonZeroUsize,
         sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
         vec,
     };
 
     fn config(depth: usize, queue: usize) -> ReceivePumpConfig {
-        ReceivePumpConfig {
-            kernel_capacity: NonZeroUsize::new(depth).expect("depth must be non-zero"),
-            queue_capacity: NonZeroUsize::new(queue).expect("queue must be non-zero"),
-            datagram_capacity: NonZeroUsize::new(1024).expect("capacity must be non-zero"),
-            close_timeout: Duration::from_secs(1),
-        }
+        ReceivePumpConfig::new(
+            NonZeroUsize::new(depth).expect("depth must be non-zero"),
+            NonZeroUsize::new(queue).expect("queue must be non-zero"),
+            NonZeroUsize::new(1024).expect("capacity must be non-zero"),
+            Duration::from_secs(1),
+        )
     }
 
     fn pump(depth: usize, queue: usize) -> ReceivePumpState {

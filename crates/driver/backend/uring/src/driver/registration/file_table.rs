@@ -14,7 +14,7 @@
 //! contract. Owned direct descriptors instead use owner identity to reject stale resolve,
 //! unregister, and close operations. See [`FileTable::resolve`].
 //!
-//! [`RegisterFd::Owned`]: veloq_driver_core::driver::RegisterFd::Owned
+//! [`RegisterFd::Owned`]: veloq_driver_core::RegisterFd::Owned
 //! 此表镜像内核固定文件表，并以 generation 或 owner identity 校验描述符；只有 owned direct 描述符由驱动持有。
 
 use crate::{
@@ -23,7 +23,7 @@ use crate::{
 };
 use diagweave::prelude::*;
 use tracing::warn;
-use veloq_driver_core::{DirectOwnerId, RawHandleMeta, driver::OpToken};
+use veloq_driver_core::{DirectOwnerId, OpToken, RawHandleMeta};
 use veloq_std::{collections::HashMap, format, mem, string::ToString, vec, vec::Vec};
 
 const INITIAL_FILE_GENERATION: u64 = 1;
@@ -195,7 +195,7 @@ pub(crate) struct FileTable {
     free_fixed: Vec<u32>,
     /// Handles owned by the driver behind an [`IoFd::OwnedDirect`], keyed by owner identity.
     ///
-    /// Only [`RegisterFd::Owned`](veloq_driver_core::driver::RegisterFd::Owned) registrations
+    /// Only [`RegisterFd::Owned`](veloq_driver_core::RegisterFd::Owned) registrations
     /// that fall back to direct descriptors land here. A borrowed fallback descriptor is
     /// nothing but the number in the `IoFd`.
     /// 仅回退为 direct 的 owned 注册存放于此；借用型回退描述符只在 `IoFd` 中携带 fd 数值。

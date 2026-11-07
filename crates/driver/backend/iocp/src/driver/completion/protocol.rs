@@ -1,10 +1,7 @@
 use veloq_std::num::NonZeroU8;
 
 use diagweave::prelude::*;
-use veloq_driver_core::{
-    driver::{CancelMode, CompletionBackend, UserCompletionEvent},
-    platform::receive_pump::ReceiveRequest,
-};
+use veloq_driver_core::{CancelMode, CompletionBackend, ReceiveRequest, UserCompletionEvent};
 
 use crate::{
     error::{IocpError, IocpResult},

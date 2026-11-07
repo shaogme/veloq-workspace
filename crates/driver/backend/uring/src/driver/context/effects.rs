@@ -425,11 +425,11 @@ impl CompletionEffectExecutor {
             .with_ctx("cancel_ticket", entry.cancel_ticket().raw())
             .with_ctx("expected_index", request.target().index())
             .with_ctx("expected_generation", request.target().generation())
-            .with_ctx("actual_index", snapshot.index)
-            .with_ctx("actual_generation", snapshot.generation)
-            .with_ctx("slot_status", format!("{:?}", snapshot.status))
-            .with_ctx("raw_cqe_res", entry.raw().res)
-            .with_ctx("raw_cqe_flags", entry.raw().flags)
+            .with_ctx("actual_index", snapshot.index())
+            .with_ctx("actual_generation", snapshot.generation())
+            .with_ctx("slot_status", format!("{:?}", snapshot.status()))
+            .with_ctx("raw_cqe_res", entry.raw().res())
+            .with_ctx("raw_cqe_flags", entry.raw().flags())
             .attach_note(
                 "The target was moved to orphan cleanup and will not be reused until its final CQE arrives.",
             ))

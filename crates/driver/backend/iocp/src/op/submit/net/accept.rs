@@ -19,10 +19,7 @@ use crate::{
         },
     },
 };
-use veloq_driver_core::{
-    RawHandleMeta,
-    driver::{CompletionCleanup, CompletionCleanupGuard},
-};
+use veloq_driver_core::{CompletionCleanup, CompletionCleanupGuard, RawHandleMeta};
 
 use super::socket::SocketSubmission;
 

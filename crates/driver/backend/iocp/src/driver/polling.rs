@@ -7,7 +7,7 @@ use veloq_std::{
 };
 
 use diagweave::prelude::*;
-use veloq_driver_core::driver::{
+use veloq_driver_core::{
     AnomalyAttach, CompletionAnomalyKind, CompletionEnvelope, CompletionIdentity, CompletionToken,
     OpToken, RawCompletion, RemoteWaker, SharedCompletionTable, UserCompletionEvent,
 };
@@ -439,7 +439,7 @@ impl<'view, 'state> PollingService<'view, 'state> {
                     .with_ctx("timer_error", format!("{error:?}"))
             })?;
         self.process_timers()?;
-        let ready_completion = self.state().ops.shared.has_ready_completion();
+        let ready_completion = self.state().ops.shared_slots().has_ready_completion();
         let timer_deadline = self.state().timer.next_deadline().map_err(|error| {
             IocpError::InvalidState
                 .report(
@@ -637,14 +637,13 @@ impl<'view, 'state> PollingService<'view, 'state> {
                             "completed UDP child owner refers to an inactive parent slot",
                         );
                 }
-                let Some((_, _, op, _)) = state.ops.slot_bundle_by_index_mut(owner.token.index())
-                else {
+                let Some(bundle) = state.ops.slot_bundle_by_index_mut(owner.token.index()) else {
                     return IocpError::InvalidState
                         .with_ctx("overlapped_ptr", address)
                         .with_ctx("slot_index", owner.token.index())
                         .attach_note("completed UDP child parent slot is missing");
                 };
-                let Some(op) = op.as_ref() else {
+                let Some(op) = bundle.op.as_ref() else {
                     return IocpError::InvalidState
                         .with_ctx("overlapped_ptr", address)
                         .with_ctx("slot_index", owner.token.index())
@@ -688,19 +687,20 @@ impl<'view, 'state> PollingService<'view, 'state> {
                     header.socket_inflight.is_some(),
                 )
             } else if let Some(index) = state.overlapped_registry.root_index(address) {
-                let Some((_, _, _, storage)) = state.ops.slot_bundle_by_index_mut(index) else {
+                let Some(bundle) = state.ops.slot_bundle_by_index_mut(index) else {
                     return IocpError::InvalidState
                         .with_ctx("overlapped_ptr", address)
                         .with_ctx("slot_index", index)
                         .attach_note("completed root OVERLAPPED sidecar is missing");
                 };
-                let entry = &storage.sidecar;
-                (
-                    entry.token,
-                    entry.receive_request,
-                    entry.in_flight,
-                    entry.socket_inflight.is_some(),
-                )
+                bundle.storage.with_mut(|_, _, entry| {
+                    (
+                        entry.token,
+                        entry.receive_request,
+                        entry.in_flight,
+                        entry.socket_inflight.is_some(),
+                    )
+                })
             } else {
                 return Err(IocpError::InvalidState
                     .report(
@@ -854,7 +854,7 @@ fn classify_completion_status(
     } else if !success && key == 0 {
         IocpCompletionStatusKind::NullFailure
     } else if matches!(
-        CompletionEnvelope::from_raw_parts(COMP_BACKEND_IOCP, key as u64, 0, 0).identity,
+        CompletionEnvelope::from_raw_parts(COMP_BACKEND_IOCP, key as u64, 0, 0).identity(),
         CompletionIdentity::Waker(_)
             | CompletionIdentity::Cancel(_)
             | CompletionIdentity::UnknownControl { .. }
@@ -899,7 +899,7 @@ mod tests {
         IocpCompletionStatusKind, RIO_EVENT_KEY, WaitBudget, WaitBudgetSource,
         classify_completion_status, duration_to_wait_ms, wait_budget,
     };
-    use veloq_driver_core::driver::CompletionToken;
+    use veloq_driver_core::CompletionToken;
     use veloq_std::{ptr, time::Duration};
 
     #[test]

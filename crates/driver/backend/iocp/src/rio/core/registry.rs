@@ -27,7 +27,7 @@ use crate::{
 };
 use diagweave::prelude::*;
 use veloq_buf::{BufferRegistrationRequest, FixedBuf, LockedMemoryBudget, LockedMemoryPermit};
-use veloq_driver_core::slot::Generation;
+use veloq_driver_core::Generation;
 use veloq_std::{
     boxed::Box, collections::HashSet, ptr, string::ToString, time::Duration, vec::Vec,
 };

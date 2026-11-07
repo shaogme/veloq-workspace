@@ -1,7 +1,7 @@
 use veloq_std::{collections::HashMap, format, mem, vec, vec::Vec};
 
 use diagweave::prelude::*;
-use veloq_driver_core::driver::RegisterFd;
+use veloq_driver_core::RegisterFd;
 use veloq_io_uring::{KernelCapabilities, Submitter};
 
 use crate::{

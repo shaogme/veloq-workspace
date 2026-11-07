@@ -1,8 +1,16 @@
 pub mod slot {
-    pub use veloq_driver_core::slot::*;
+    pub use veloq_driver_core::{
+        AtomicPackedCoreState, CheckedSlotView, Draining, Generation, InFlightOrphaned,
+        InFlightWaiting, PackedCoreState, Reserved, Slot, SlotAccess, SlotAccessAction,
+        SlotAccessError, SlotAccessErrorReason, SlotAccessOutcome, SlotCompletion,
+        SlotCompletionData, SlotCompletionDiagnostics, SlotData, SlotEntries, SlotEntry, SlotError,
+        SlotMarker, SlotOp, SlotPayload, SlotPlatformData, SlotRegistryExt, SlotSidecarData,
+        SlotSnapshot, SlotSpec, SlotState, SlotStatus, SlotStorage, SlotTable, SlotView,
+        SubmissionGuard,
+    };
 }
 
-pub use veloq_driver_core::driver::{
+pub use veloq_driver_core::{
     BufferRegistrationStatus, ContextDriverProvider, DriveMode, DriveOutcome, Driver, DriverRaw,
     DriverStartup, DriverStartupRequirements, DriverStartupResources, RegisterFd, RemoteWaker,
     RuntimeContextDriver,
@@ -14,7 +22,7 @@ pub type PlatformDriver<'a> = veloq_driver_uring::UringDriver<'a>;
 pub type PlatformOp = veloq_driver_uring::UringOp;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub type PlatformUP = veloq_driver_uring::UringUserPayload;
-/// The active backend's [`veloq_driver_core::slot::SlotSpec`].
+/// The active backend's [`veloq_driver_core::SlotSpec`].
 ///
 /// Both backends spell it as an uninhabited marker type with no lifetime, so unlike
 /// [`PlatformDriver`] this alias takes no parameter — which is what lets facade-level types
@@ -34,4 +42,4 @@ pub type PlatformOp = veloq_driver_iocp::IocpKernelOp;
 pub type PlatformUP = veloq_driver_iocp::IocpUserPayload;
 
 #[cfg(feature = "test-hooks")]
-pub use veloq_driver_core::driver::test_hooks;
+pub use veloq_driver_core::test_hooks;

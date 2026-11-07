@@ -10,7 +10,7 @@ use crate::{
     op::CompletionCleanupHintFn,
 };
 use tracing::trace;
-use veloq_driver_core::driver::{CancelTicket, CompletionToken, OpToken};
+use veloq_driver_core::{CancelTicket, CompletionToken, OpToken};
 use veloq_io_uring::{SubmissionQueue, squeue};
 use veloq_std::{collections::HashMap, format, time::Duration};
 use veloq_wheel::{TimerError, TimerId};

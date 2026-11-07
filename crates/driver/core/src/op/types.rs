@@ -1,5 +1,7 @@
-use crate::platform::receive_pump::{ReceivePermit, ReceivePumpState};
-use crate::{Handle, IoFd, RawHandleMeta, SockAddr};
+use crate::{
+    Handle, IoFd, RawHandleMeta, SockAddr,
+    platform::{ReceivePermit, ReceivePumpState},
+};
 use veloq_buf::FixedBuf;
 use veloq_std::{net::SocketAddr, time::Duration};
 
@@ -201,7 +203,7 @@ pub struct RecvMulti<H: Handle> {
 /// This operation intentionally has no [`SingleShotOp`](crate::op::SingleShotOp) implementation;
 /// it can only be consumed as a completion stream.
 pub struct UdpRecvMulti<H: Handle> {
-    pub fd: IoFd<H>,
+    fd: IoFd<H>,
     pump: ReceivePumpState,
 }
 
@@ -214,6 +216,10 @@ impl<H: Handle> UdpRecvMulti<H> {
     pub fn from_backend(fd: IoFd<H>, pump: ReceivePumpState) -> Self {
         Self { fd, pump }
     }
+
+    pub const fn fd(&self) -> IoFd<H> {
+        self.fd
+    }
 }
 
 /// Backend-only access to the pump carried by [`UdpRecvMulti`].
@@ -223,6 +229,7 @@ impl<H: Handle> UdpRecvMulti<H> {
 /// routing native completions.
 pub trait UdpRecvMultiBackend {
     fn receive_pump(&self) -> &ReceivePumpState;
+
     fn receive_pump_mut(&mut self) -> &mut ReceivePumpState;
 }
 
@@ -287,17 +294,17 @@ pub struct FallocateRaw<H: RawHandleMeta> {
 }
 
 /// A received UDP datagram.
-pub struct UdpRecvPacket {
-    pub buf: UdpRecvPacketBuf,
-    pub addr: SocketAddr,
-}
-
 pub enum UdpRecvPacketBuf {
     Owned(FixedBuf),
     OwnedWithPermit {
         buf: FixedBuf,
         permit: ReceivePermit,
     },
+}
+
+pub struct UdpRecvPacket {
+    pub buf: UdpRecvPacketBuf,
+    pub addr: SocketAddr,
 }
 
 impl UdpRecvPacketBuf {

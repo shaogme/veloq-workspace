@@ -18,7 +18,7 @@ use veloq_buf::{
     AnyBufPool, BufferBackingOwner, BufferRegistrationRequest, LockedMemoryBudget,
     LockedMemoryPermit, heap::ChunkId,
 };
-use veloq_driver_core::driver::BufferRegistrationStatus;
+use veloq_driver_core::BufferRegistrationStatus;
 use veloq_io_uring::{ResourceKind, ResourceRegistration, ResourceRegistrationState, Submitter};
 use veloq_std::{
     boxed::Box, collections::BitSet, format, marker::PhantomData, ptr, sync::Arc, vec, vec::Vec,

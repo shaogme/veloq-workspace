@@ -1,12 +1,10 @@
-use crate::slot;
-use crate::{DriverCoreError, DriverResult};
+use crate::{DriverCoreError, DriverResult, SlotSpec};
 use veloq_std::{
     boxed::Box,
     fmt::{Debug, Formatter, Result},
 };
 
-use super::super::CompletionPacket;
-use super::anomaly::AnomalyOutcome;
+use super::{super::CompletionPacket, anomaly::AnomalyOutcome};
 
 pub struct CompletionCleanup {
     action: Box<dyn FnOnce() -> DriverResult<(), DriverCoreError> + Send + 'static>,
@@ -88,7 +86,7 @@ impl RecordCompletionOutcome {
     }
 }
 
-pub enum RecordCompletionResult<Spec: slot::SlotSpec> {
+pub enum RecordCompletionResult<Spec: SlotSpec> {
     Recorded(RecordCompletionOutcome),
     Rejected {
         outcome: RecordCompletionOutcome,
@@ -96,7 +94,7 @@ pub enum RecordCompletionResult<Spec: slot::SlotSpec> {
     },
 }
 
-impl<Spec: slot::SlotSpec> RecordCompletionResult<Spec> {
+impl<Spec: SlotSpec> RecordCompletionResult<Spec> {
     pub fn outcome(&self) -> &RecordCompletionOutcome {
         match self {
             Self::Recorded(outcome) => outcome,

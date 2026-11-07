@@ -42,26 +42,18 @@ use crate::{
 };
 
 use veloq_driver_core::{
-    driver::{CompletionCleanupGuard, CompletionToken, OpToken, PlatformOp},
-    op::{
-        IntoPlatformOp, LostReason, OpCompletion, OpError, OpResult, SingleShotOp,
-        payload_projection_mismatch_report,
-        types::{
-            Accept as AcceptBase, AcceptMulti as AcceptMultiBase,
-            AcceptedSocket as AcceptedSocketBase, Close as CloseBase, Connect as ConnectBase,
-            Fallocate as FallocateBase, FallocateRaw as FallocateRawBase, Fsync as FsyncBase,
-            FsyncRaw as FsyncRawBase, OpKind, Open as OpenBase, ProvidedBuf,
-            ReadFixed as ReadFixedBase, ReadRaw as ReadRawBase, Recv as RecvBase,
-            RecvMulti as RecvMultiBase, RecvProvided as RecvProvidedBase, Send as OpSendBase,
-            SendTo as SendToBase, SyncFileRange as SyncFileRangeBase,
-            SyncFileRangeRaw as SyncFileRangeRawBase, Timeout as TimeoutBase,
-            UdpConnect as UdpConnectBase, UdpRecvMulti as UdpRecvMultiBase, UdpRecvMultiBackend,
-            UdpRecvPacket as UdpRecvPacketBase, UdpSend as UdpSendBase, Wakeup as WakeupBase,
-            WriteFixed as WriteFixedBase, WriteRaw as WriteRawBase,
-        },
-    },
-    platform::receive_pump::ReceivePumpState,
-    slot::Generation,
+    Accept as AcceptBase, AcceptMulti as AcceptMultiBase, AcceptedSocket as AcceptedSocketBase,
+    Close as CloseBase, CompletionCleanupGuard, CompletionToken, Connect as ConnectBase,
+    Fallocate as FallocateBase, FallocateRaw as FallocateRawBase, Fsync as FsyncBase,
+    FsyncRaw as FsyncRawBase, Generation, IntoPlatformOp, LostReason, OpCompletion, OpError,
+    OpKind, OpResult, OpToken, Open as OpenBase, PlatformOp, ProvidedBuf,
+    ReadFixed as ReadFixedBase, ReadRaw as ReadRawBase, ReceivePumpState, Recv as RecvBase,
+    RecvMulti as RecvMultiBase, RecvProvided as RecvProvidedBase, Send as OpSendBase,
+    SendTo as SendToBase, SingleShotOp, SyncFileRange as SyncFileRangeBase,
+    SyncFileRangeRaw as SyncFileRangeRawBase, Timeout as TimeoutBase, UdpConnect as UdpConnectBase,
+    UdpRecvMulti as UdpRecvMultiBase, UdpRecvMultiBackend, UdpRecvPacket as UdpRecvPacketBase,
+    UdpSend as UdpSendBase, Wakeup as WakeupBase, WriteFixed as WriteFixedBase,
+    WriteRaw as WriteRawBase,
 };
 
 // ============================================================================
@@ -357,7 +349,7 @@ macro_rules! impl_iocp_op_erasure {
             fn try_user_payload(payload: IocpUserPayload) -> IocpResult<Self> {
                 match payload {
                     IocpUserPayload::$user_variant(payload) => Ok(payload),
-                    _ => Err(payload_projection_mismatch_report::<IocpError>(
+                    _ => Err(OpError::<IocpError>::payload_projection_mismatch_report(
                         stringify!($OpType),
                         "IocpUserPayload",
                     )),
@@ -477,7 +469,7 @@ macro_rules! impl_iocp_multishot_op_erasure {
             fn try_record_payload(payload: IocpUserPayload) -> IocpResult<Self::RecordPayload> {
                 match payload {
                     IocpUserPayload::$record_variant(payload) => Ok(payload),
-                    _ => Err(payload_projection_mismatch_report::<IocpError>(
+                    _ => Err(OpError::<IocpError>::payload_projection_mismatch_report(
                         stringify!($record),
                         "IocpUserPayload",
                     )),
@@ -677,19 +669,16 @@ impl_iocp_op_erasure!(Wakeup, Wakeup, Wakeup, usize);
 mod tests {
     use super::*;
     use veloq_buf::FixedBuf;
-    use veloq_driver_core::{
-        op::types::UdpRecvPacketBuf,
-        platform::receive_pump::{ReceivePumpConfig, ReceivePumpState, ReceiveSlot},
-    };
+    use veloq_driver_core::{ReceivePumpConfig, ReceivePumpState, ReceiveSlot, UdpRecvPacketBuf};
     use veloq_std::{net::SocketAddr, num::NonZeroUsize, time::Duration, vec};
 
     fn receive_pump() -> ReceivePumpState {
-        let config = ReceivePumpConfig {
-            kernel_capacity: NonZeroUsize::new(1).expect("non-zero depth"),
-            queue_capacity: NonZeroUsize::new(1).expect("non-zero queue"),
-            datagram_capacity: NonZeroUsize::new(64).expect("non-zero datagram capacity"),
-            close_timeout: Duration::from_secs(1),
-        };
+        let config = ReceivePumpConfig::new(
+            NonZeroUsize::new(1).expect("non-zero depth"),
+            NonZeroUsize::new(1).expect("non-zero queue"),
+            NonZeroUsize::new(64).expect("non-zero datagram capacity"),
+            Duration::from_secs(1),
+        );
         let slots = vec![ReceiveSlot::new(
             0,
             FixedBuf::alloc_heap(NonZeroUsize::new(64).expect("non-zero buffer"), 0)

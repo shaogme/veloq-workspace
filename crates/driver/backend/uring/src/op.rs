@@ -2,8 +2,8 @@
 
 use crate::{diagnostics::UringCompletionDiagnostics, driver::UringOpState, error::UringError};
 use veloq_driver_core::{
-    driver::{CompletionCleanupGuard, PlatformOp, registry::OpRegistry as CoreOpRegistry},
-    slot::{Slot as CoreSlot, SlotSpec as CoreSlotSpec},
+    CompletionCleanupGuard, OpRegistry as CoreOpRegistry, PlatformOp, Slot as CoreSlot,
+    SlotSpec as CoreSlotSpec,
 };
 use veloq_std::pin::Pin;
 
@@ -128,7 +128,7 @@ impl CoreSlotSpec for UringSlotSpec {
 pub(crate) type UringOpRegistry = CoreOpRegistry<UringSlotSpec>;
 pub(crate) type Slot<'a, State> = CoreSlot<'a, State, UringSlotSpec>;
 
-pub(crate) use veloq_driver_core::slot::{
+pub(crate) use veloq_driver_core::{
     CheckedSlotView, Reserved, SlotMarker as SlotState, SlotRegistryExt as UringOpRegistryExt,
     SlotView,
 };

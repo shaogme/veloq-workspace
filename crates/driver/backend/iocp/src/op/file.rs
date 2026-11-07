@@ -8,7 +8,7 @@ use crate::{
     },
 };
 
-use veloq_driver_core::{driver::CompletionCleanupGuard, op::OpKind};
+use veloq_driver_core::{CompletionCleanupGuard, OpKind};
 
 impl IocpOpSpec for ReadFixed {
     type KernelPayload = KernelRef<Self>;

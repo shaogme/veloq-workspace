@@ -25,18 +25,10 @@ use veloq_buf::{
 };
 use veloq_driver_core::DriverResult;
 use veloq_driver_core::{
-    driver::{
-        BufferRegistrationStatus, CompletionRecord, CompletionValue, DriveMode, Driver,
-        DriverSubmitResult, OpToken, PollRecordResult, RegisterFd, test_hooks::DriverTestHooks,
-    },
-    op::{
-        IntoPlatformOp,
-        types::{
-            ReadFixed as CoreReadFixed, ReadRaw as CoreReadRaw, WriteFixed as CoreWriteFixed,
-            WriteRaw as CoreWriteRaw,
-        },
-    },
-    slot::SlotError,
+    BufferRegistrationStatus, CompletionRecord, CompletionRecordParts, CompletionValue, DriveMode,
+    Driver, DriverSubmitResult, IntoPlatformOp, OpToken, PollRecordResult,
+    ReadFixed as CoreReadFixed, ReadRaw as CoreReadRaw, RegisterFd, SlotError,
+    WriteFixed as CoreWriteFixed, WriteRaw as CoreWriteRaw, test_hooks::DriverTestHooks,
 };
 use veloq_driver_uring::{
     IoFd, RawHandle, UringConfig, UringDriveLimits, UringDriver, UringError, UringOp,
@@ -198,12 +190,12 @@ where
     T: IntoPlatformOp<UringSlotSpec, SubmitPayload = T, RecordPayload = T, Output = T>,
 {
     let record = wait_completion(driver, token);
-    let CompletionRecord {
+    let CompletionRecordParts {
         event,
         payload,
         mut cleanup,
         ..
-    } = record;
+    } = record.into_parts();
     cleanup.disarm();
     let payload = T::try_record_from_erased(payload.expect("read completion payload"))
         .expect("unexpected read payload type");
@@ -217,12 +209,12 @@ where
     T: IntoPlatformOp<UringSlotSpec, SubmitPayload = T, RecordPayload = T, Output = T>,
 {
     let record = wait_completion(driver, token);
-    let CompletionRecord {
+    let CompletionRecordParts {
         event,
         payload,
         mut cleanup,
         ..
-    } = record;
+    } = record.into_parts();
     cleanup.disarm();
     let _payload = T::try_record_from_erased(payload.expect("write completion payload"))
         .expect("unexpected write payload type");

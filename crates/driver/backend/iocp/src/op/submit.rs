@@ -420,7 +420,10 @@ impl_get_fd!(get_fd_accept_multi, AcceptMultiPayload, direct_fd);
 impl_get_fd!(get_fd_send_to, SendToPayload, direct_fd);
 impl_get_fd!(get_fd_recv_provided, RecvProvidedPayload, direct_fd);
 impl_get_fd!(get_fd_recv_multi, RecvMultiPayload, direct_fd);
-impl_get_fd!(get_fd_udp_recv_multi, UdpRecvMultiPayload, direct_fd);
+pub(crate) unsafe fn get_fd_udp_recv_multi(payload: &UdpRecvMultiPayload) -> Option<IoFd> {
+    // SAFETY: the caller guarantees that the payload pointer is valid.
+    unsafe { payload.user.as_ref().ok().map(|user| user.fd()) }
+}
 
 impl_get_fd!(get_fd_close, KernelRef<Close>, direct_fd);
 impl_get_fd!(get_fd_fsync, KernelRef<Fsync>, direct_fd);

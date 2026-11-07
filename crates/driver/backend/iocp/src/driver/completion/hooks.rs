@@ -6,15 +6,10 @@ use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 
 use diagweave::prelude::*;
 use veloq_driver_core::{
-    driver::{
-        AnomalyAttach, CompletionBackendHooks, CompletionBackendIngressAction,
-        CompletionCleanupGuard, CompletionContinuation, CompletionControl, CompletionFailure,
-        CompletionSettlement, CompletionSource, CompletionToken, OpToken,
-        SyntheticCompletionSource, UserCompletionEvent,
-    },
-    op::OpKind,
-    op::types::ProvidedBuf,
-    slot::{InFlightOrphaned, InFlightWaiting},
+    AnomalyAttach, CompletionBackendHooks, CompletionBackendIngressAction, CompletionCleanupGuard,
+    CompletionContinuation, CompletionControl, CompletionFailure, CompletionSettlement,
+    CompletionSource, CompletionToken, InFlightOrphaned, InFlightWaiting, OpKind, OpToken,
+    ProvidedBuf, SyntheticCompletionSource, UserCompletionEvent,
 };
 
 use crate::{
@@ -481,7 +476,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
                         };
                     }
                 };
-                if raw.res >= 0 {
+                if raw.res() >= 0 {
                     self.diagnostics.backend().inc_waker_ok();
                     self.diagnostics.backend().inc_wait_waker_return();
                     if rearmed {
@@ -494,7 +489,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
                             IocpError::Internal
                                 .to_report()
                                 .push_ctx("scope", "iocp.driver.completion.waker")
-                                .set_error_code(-raw.res)
+                                .set_error_code(-raw.res())
                                 .attach_note("IOCP waker completion reported an error"),
                             IocpBackendEffect::None,
                         ),
@@ -783,7 +778,7 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
                 Ok(Ok(child)) => child,
                 _ => {
                     return CompletionSettlement::Anomaly {
-                        kind: veloq_driver_core::driver::CompletionAnomalyKind::backend_context(
+                        kind: veloq_driver_core::CompletionAnomalyKind::backend_context(
                             COMP_BACKEND_IOCP,
                             event.token().index() as u64,
                         ),

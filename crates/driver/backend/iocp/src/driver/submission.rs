@@ -9,17 +9,11 @@ use super::{completion::COMP_BACKEND_IOCP, polling::TimerEngine};
 use diagweave::prelude::*;
 use veloq_blocking::{BlockingTask, ThreadPool};
 use veloq_driver_core::{
-    driver::{
-        CompletionBackendHooks, CompletionContinuation, CompletionControl, CompletionFailure,
-        CompletionFlowExt, CompletionIngress, CompletionSettlement, CompletionSource,
-        CompletionToken, DriverSubmitResult, OpToken, PlatformOp, SharedCompletionTable,
-        SubmitStatus, SyntheticCompletionSource, UserCompletionEvent,
-    },
-    op::types::{OpKind, UdpRecvMultiBackend},
-    slot::{
-        CheckedSlotView, InFlightOrphaned, InFlightWaiting, Reserved, SlotAccessError,
-        SlotRegistryExt, SlotView,
-    },
+    CheckedSlotView, CompletionBackendHooks, CompletionContinuation, CompletionControl,
+    CompletionFailure, CompletionFlowExt, CompletionIngress, CompletionSettlement,
+    CompletionSource, CompletionToken, DriverSubmitResult, InFlightOrphaned, InFlightWaiting,
+    OpKind, OpToken, PlatformOp, Reserved, SharedCompletionTable, SlotAccessError, SlotRegistryExt,
+    SlotView, SubmitStatus, SyntheticCompletionSource, UdpRecvMultiBackend, UserCompletionEvent,
 };
 
 use crate::{
@@ -228,13 +222,13 @@ fn slot_access_report(scope: &'static str, err: SlotAccessError) -> Report<IocpE
     IocpError::InvalidState
         .to_report()
         .push_ctx("scope", scope)
-        .with_ctx("slot_index", err.snapshot.index)
-        .with_ctx("slot_generation", err.snapshot.generation)
-        .with_ctx("slot_status", format!("{:?}", err.snapshot.status))
-        .with_ctx("slot_has_op", err.snapshot.has_op)
-        .with_ctx("slot_has_payload", err.snapshot.has_payload)
-        .with_ctx("slot_access_action", format!("{:?}", err.action))
-        .with_ctx("slot_access_reason", format!("{:?}", err.reason))
+        .with_ctx("slot_index", err.snapshot().index())
+        .with_ctx("slot_generation", err.snapshot().generation())
+        .with_ctx("slot_status", format!("{:?}", err.snapshot().status()))
+        .with_ctx("slot_has_op", err.snapshot().has_op())
+        .with_ctx("slot_has_payload", err.snapshot().has_payload())
+        .with_ctx("slot_access_action", format!("{:?}", err.action()))
+        .with_ctx("slot_access_reason", format!("{:?}", err.reason()))
         .attach_note("slot access failed during IOCP submission")
 }
 
@@ -427,12 +421,9 @@ impl SubmissionService<'_, '_> {
                 slot.with_sidecar_mut(|sidecar| sidecar.in_flight = false);
             }))
             .map_err(|err| slot_access_report("iocp.driver.call_op_submit.start", err))?;
-        let close_fd = if let Some(slot) = sub_guard.slot.as_mut() {
-            slot.with_access_mut(|access| close_fd_from_op(access.operation().get_ref()))
-                .map_err(|err| slot_access_report("iocp.driver.call_op_submit.close_fd", err))??
-        } else {
-            None
-        };
+        let close_fd = sub_guard
+            .with_access_mut(|access| close_fd_from_op(access.operation().get_ref()))
+            .map_err(|err| slot_access_report("iocp.driver.call_op_submit.close_fd", err))??;
 
         let result = if let Some(fd) = close_fd {
             let close_result = RegistrationService::close_registered_owned_fd(
@@ -449,16 +440,15 @@ impl SubmissionService<'_, '_> {
                 );
                 completion.store_result(io_result);
 
-                let slot = sub_guard.slot.as_mut().ok_or_else(|| {
-                    IocpError::InvalidState
-                        .report("iocp/driver", "submission guard slot missing during Close")
-                })?;
-                slot.with_access_mut(|access| {
-                    let op = access.operation_mut().get_mut();
-                    op.header.resolved_handle = Some(RawHandle::new(raw_handle));
-                    op.header.blocking_completion = Some(completion);
-                })
-                .map_err(|err| slot_access_report("iocp.driver.call_op_submit.close_op", err))?;
+                sub_guard
+                    .with_access_mut(|access| {
+                        let op = access.operation_mut().get_mut();
+                        op.header.resolved_handle = Some(RawHandle::new(raw_handle));
+                        op.header.blocking_completion = Some(completion);
+                    })
+                    .map_err(|err| {
+                        slot_access_report("iocp.driver.call_op_submit.close_op", err)
+                    })?;
 
                 Ok(SubmissionResult::PostToQueue)
             })
@@ -477,13 +467,8 @@ impl SubmissionService<'_, '_> {
                 rio,
             };
 
-            let slot = sub_guard.slot.as_mut().ok_or_else(|| {
-                IocpError::InvalidState.report(
-                    "iocp/driver",
-                    "submission guard slot missing during submission",
-                )
-            })?;
-            slot.with_access_mut(|access| access.operation_mut().get_mut().submit(&mut ctx))
+            sub_guard
+                .with_access_mut(|access| access.operation_mut().get_mut().submit(&mut ctx))
                 .map_err(|err| slot_access_report("iocp.driver.call_op_submit.submit_op", err))?
         }
         .push_ctx("scope", "iocp/driver")
@@ -491,14 +476,10 @@ impl SubmissionService<'_, '_> {
 
         let socket_pending_without_inflight_token = match &result {
             Ok(SubmissionResult::Pending) => sub_guard
-                .slot
-                .as_mut()
-                .and_then(|slot| {
-                    slot.with_access_mut(|access| {
-                        socket_pending_without_inflight_token(access.operation().get_ref())
-                    })
-                    .ok()
+                .with_access_mut(|access| {
+                    socket_pending_without_inflight_token(access.operation().get_ref())
                 })
+                .ok()
                 .unwrap_or(false),
             _ => false,
         };

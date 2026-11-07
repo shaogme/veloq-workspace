@@ -13,12 +13,9 @@ use crate::{
 };
 use diagweave::prelude::*;
 use veloq_driver_core::{
-    driver::{
-        CompletionCleanupGuard, CompletionContinuation, CompletionFailure, CompletionSettlement,
-        PlatformOp, UserCompletionEvent,
-    },
-    platform::receive_pump::{ReceiveCompletionResult, ReceivePumpError},
-    slot::{InFlightOrphaned, InFlightWaiting},
+    CompletionCleanupGuard, CompletionContinuation, CompletionFailure, CompletionSettlement,
+    InFlightOrphaned, InFlightWaiting, PlatformOp, ReceiveCompletionResult, ReceivePumpError,
+    UserCompletionEvent,
 };
 use veloq_std::mem::take;
 use windows_sys::Win32::{

@@ -1,6 +1,6 @@
 use core::slice;
 
-use veloq_driver_core::driver::{CancelMode, CancelTicket, OpToken};
+use veloq_driver_core::{CancelMode, CancelTicket, OpToken};
 use veloq_std::{vec, vec::Vec};
 
 /// 提交边界的协议回执。每种回执都携带完整的消费证据。
@@ -646,10 +646,7 @@ mod tests {
         CancelSubmitOutcome, LedgerError, StageEntry, StagePhase, StagedLedger, SubmissionError,
         SubmissionReceipt,
     };
-    use veloq_driver_core::{
-        driver::{CancelMode, CancelTicket, OpToken},
-        slot::Generation,
-    };
+    use veloq_driver_core::{CancelMode, CancelTicket, Generation, OpToken};
 
     fn token(index: usize, generation: u32) -> OpToken {
         OpToken::from_registry_parts(index, Generation::new(generation)).expect("test token")

@@ -20,15 +20,12 @@ use crate::{
 use veloq_std::num::NonZeroU8;
 
 use veloq_driver_core::{
-    driver::{
-        AnomalyAttach, CancelMode, CancelTicket, CompletionAnomalyKind, CompletionBackend,
-        CompletionBackendHooks, CompletionBackendIngressAction, CompletionCleanupGuard,
-        CompletionContinuation, CompletionControl, CompletionFailure, CompletionFlowOutcome,
-        CompletionSettlement, CompletionSource, CompletionToken, DriverCompletionDiagnostics,
-        OpToken, RawCompletion, SyntheticCompletionSource, UserCompletionEvent,
-        run_completion_cleanup,
-    },
-    slot::{InFlightOrphaned, InFlightWaiting},
+    AnomalyAttach, CancelMode, CancelTicket, CompletionAnomalyKind, CompletionBackend,
+    CompletionBackendHooks, CompletionBackendIngressAction, CompletionCleanupGuard,
+    CompletionContinuation, CompletionControl, CompletionFailure, CompletionFlowOutcome,
+    CompletionSettlement, CompletionSource, CompletionToken, DriverCompletionDiagnostics,
+    InFlightOrphaned, InFlightWaiting, OpToken, RawCompletion, SyntheticCompletionSource,
+    UserCompletionEvent,
 };
 
 pub(crate) type CompletionProgress = CompletionFlowOutcome;
@@ -172,16 +169,16 @@ impl<'control, 'provided> UringCompletionHooks<'control, 'provided> {
         source: CompletionSource<'_, UringBackendIngress>,
     ) -> CompletionCleanupGuard {
         let raw = event.raw();
-        self.with_cqe_env(|env| env.return_provided_buf(raw.flags));
+        self.with_cqe_env(|env| env.return_provided_buf(raw.flags()));
         let hint = if matches!(source, CompletionSource::Kernel) {
             match self
                 .control
-                .remove_completion_cleanup_hint(raw.token, raw.flags)
+                .remove_completion_cleanup_hint(raw.token(), raw.flags())
             {
                 Some(hint) => {
                     if hint.is_some() {
                         self.diagnostics.backend().inc_corrupt_cleanup_attempt();
-                        if raw.res >= 0 {
+                        if raw.res() >= 0 {
                             self.diagnostics.backend().inc_corrupt_raw_fd_cleanup();
                         }
                     }
@@ -199,13 +196,13 @@ impl<'control, 'provided> UringCompletionHooks<'control, 'provided> {
         };
 
         debug!(
-            completion_token = raw.token.raw(),
-            cqe_result = raw.res,
-            cqe_flags = raw.flags,
+            completion_token = raw.token().raw(),
+            cqe_result = raw.res(),
+            cqe_flags = raw.flags(),
             anomaly = ?kind,
             "corrupt uring completion"
         );
-        hint.map_or_else(CompletionCleanupGuard::default, |hint| hint(raw.res))
+        hint.map_or_else(CompletionCleanupGuard::default, |hint| hint(raw.res()))
     }
 
     pub(super) fn handle_waker_control(
@@ -213,7 +210,7 @@ impl<'control, 'provided> UringCompletionHooks<'control, 'provided> {
         raw: RawCompletion,
     ) -> CompletionSettlement<UringSlotSpec, UringBackendEffect> {
         let generation = self.control.waker_generation();
-        if raw.res == self.control.waker_buf_len() as i32 {
+        if raw.res() == self.control.waker_buf_len() as i32 {
             self.diagnostics.backend().inc_waker_ok();
             self.diagnostics.backend().inc_wait_waker_return();
             CompletionSettlement::ControlHandled {
@@ -222,10 +219,10 @@ impl<'control, 'provided> UringCompletionHooks<'control, 'provided> {
                     generation,
                 },
             }
-        } else if raw.res >= 0 {
+        } else if raw.res() >= 0 {
             self.diagnostics.backend().inc_waker_error();
             warn!(
-                res = raw.res,
+                res = raw.res(),
                 expected = self.control.waker_buf_len(),
                 "eventfd waker read returned unexpected byte count"
             );
@@ -236,11 +233,11 @@ impl<'control, 'provided> UringCompletionHooks<'control, 'provided> {
                             "uring.completion.handle_waker_control",
                             format!(
                                 "eventfd waker read returned {} bytes, expected {}",
-                                raw.res,
+                                raw.res(),
                                 self.control.waker_buf_len()
                             ),
                         )
-                        .with_ctx("completion_result", raw.res),
+                        .with_ctx("completion_result", raw.res()),
                     UringBackendEffect::Waker {
                         recovery: WakerRecovery::RebuildAndRearm,
                         generation,
@@ -249,9 +246,9 @@ impl<'control, 'provided> UringCompletionHooks<'control, 'provided> {
             }
         } else {
             self.diagnostics.backend().inc_waker_error();
-            match -raw.res {
+            match -raw.res() {
                 libc::EAGAIN | libc::EINTR => {
-                    debug!(res = raw.res, "recoverable eventfd waker read completion");
+                    debug!(res = raw.res(), "recoverable eventfd waker read completion");
                     CompletionSettlement::ControlHandled {
                         effect: UringBackendEffect::Waker {
                             recovery: WakerRecovery::Rearm,
@@ -260,7 +257,7 @@ impl<'control, 'provided> UringCompletionHooks<'control, 'provided> {
                     }
                 }
                 errno => {
-                    warn!(res = raw.res, errno, "eventfd waker read failed");
+                    warn!(res = raw.res(), errno, "eventfd waker read failed");
                     CompletionSettlement::TerminalFailure {
                         failure: CompletionFailure::control(
                             UringError::CompletionWait
@@ -301,7 +298,7 @@ impl<'control, 'provided> UringCompletionHooks<'control, 'provided> {
                 ),
             };
         };
-        match raw.res {
+        match raw.res() {
             value if value >= 0 => {
                 self.diagnostics.backend().inc_cancel_ack_ok();
                 trace!(
@@ -430,7 +427,7 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_, '_> {
             },
             CompletionSource::Kernel | CompletionSource::User => {
                 let raw = event.raw();
-                if raw.res == -libc::ENOBUFS {
+                if raw.res() == -libc::ENOBUFS {
                     self.with_cqe_env(|env| env.note_exhausted());
                 }
                 let hint = if matches!(source, CompletionSource::Kernel) {
@@ -455,10 +452,11 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_, '_> {
                     )
                 }) {
                     Ok(outcome) => {
-                        if matches!(source, CompletionSource::Kernel) && !cqueue::more(raw.flags) {
+                        if matches!(source, CompletionSource::Kernel) && !cqueue::more(raw.flags())
+                        {
                             let _ = self.control.remove_completion_cleanup_hint(
                                 event.completion_token(),
-                                raw.flags,
+                                raw.flags(),
                             );
                         }
                         outcome
@@ -466,20 +464,23 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_, '_> {
                     Err(error) => {
                         // 本 hook 可能在取出 selected buffer 前失败；完成事务负责退还该 buffer，操作 cleanup guard 独占操作清理。
                         // The hook can fail before taking the selected buffer; the completion transaction returns it while the operation cleanup guard owns operation cleanup.
-                        self.with_cqe_env(|env| env.return_provided_buf(raw.flags));
+                        self.with_cqe_env(|env| env.return_provided_buf(raw.flags()));
                         if error.fallback_cleanup
                             && let Some(CompletionCleanupHintState::Known(Some(hint))) = hint
                         {
-                            let mut cleanup = hint(raw.res);
-                            let _ = run_completion_cleanup(self.diagnostics, &mut cleanup);
+                            let mut cleanup = hint(raw.res());
+                            if cleanup.run().is_err() {
+                                self.diagnostics.inc_orphan_cleanup_error();
+                            }
                         }
-                        if matches!(source, CompletionSource::Kernel) && !cqueue::more(raw.flags) {
+                        if matches!(source, CompletionSource::Kernel) && !cqueue::more(raw.flags())
+                        {
                             let _ = self.control.remove_completion_cleanup_hint(
                                 event.completion_token(),
-                                raw.flags,
+                                raw.flags(),
                             );
                         }
-                        if cqueue::more(raw.flags) {
+                        if cqueue::more(raw.flags()) {
                             CompletionSettlement::Quarantined {
                                 failure: CompletionFailure::quarantined(
                                     error.report,
@@ -534,22 +535,22 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_, '_> {
             CompletionSource::Synthetic(SyntheticCompletionSource::SubmissionFailure)
             | CompletionSource::Kernel
             | CompletionSource::User
-            | CompletionSource::Backend(_) => event.raw().res,
+            | CompletionSource::Backend(_) => event.raw().res(),
         };
         // 这条完成要被丢弃，但内核已经从环里取走了它选中的 buffer——不还回去就是每次取消
         // 泄漏一个 bid。「取消不等于结束」在 provided buffer 上的具体形态。
         // This completion is discarded after the kernel consumed its selected buffer; returning it prevents each cancellation from leaking a bid.
-        self.with_cqe_env(|env| env.return_provided_buf(event.raw().flags));
+        self.with_cqe_env(|env| env.return_provided_buf(event.raw().flags()));
         // 一个已放弃的 multishot 会继续投递完成，每一条都要跑 cleanup（accept 的话就是
         // 关掉那个内核已经建好的连接），但只有终态那条才能归还 slot。
         // An orphaned multishot still needs cleanup for every completion (including closing accepted sockets); only its final completion releases the slot.
-        let continuation = if cqueue::more(event.raw().flags) {
+        let continuation = if cqueue::more(event.raw().flags()) {
             CompletionContinuation::More
         } else {
             CompletionContinuation::Final
         };
         let hint = if matches!(source, CompletionSource::Kernel) {
-            Some(self.completion_cleanup_hint_for(event.completion_token(), event.raw().flags))
+            Some(self.completion_cleanup_hint_for(event.completion_token(), event.raw().flags()))
         } else {
             None
         };

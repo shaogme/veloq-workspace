@@ -6,10 +6,7 @@ use crate::{
     tests::{complete_from_record, submit_test_op, wait_completion, wait_completion_record},
 };
 use veloq_buf::FixedBuf;
-use veloq_driver_core::{
-    driver::{Driver, DriverSubmitResult, RegisterFd, SubmitStatus},
-    op::IntoPlatformOp,
-};
+use veloq_driver_core::{Driver, DriverSubmitResult, IntoPlatformOp, RegisterFd, SubmitStatus};
 use veloq_std::{
     env, format,
     fs::{File, OpenOptions, remove_file},

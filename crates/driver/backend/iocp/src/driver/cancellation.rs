@@ -1,12 +1,8 @@
 use diagweave::prelude::*;
 use veloq_driver_core::{
-    driver::{
-        AnomalyAttach, CancelMode, CancelRequest, CancelSubmitOutcome, CancelTargetGoneReason,
-        CompletionToken, OpToken, RawCompletion, SyntheticCompletionSource, UserCompletionEvent,
-        cancel_target_kind,
-    },
-    op::types::{OpKind, UdpRecvMultiBackend},
-    slot::{CheckedSlotView, Slot, SlotMarker, SlotRegistryExt, SlotView},
+    AnomalyAttach, CancelMode, CancelRequest, CancelSubmitOutcome, CancelTargetGoneReason,
+    CheckedSlotView, CompletionToken, OpKind, OpToken, RawCompletion, Slot, SlotMarker,
+    SlotRegistryExt, SlotView, SyntheticCompletionSource, UdpRecvMultiBackend, UserCompletionEvent,
 };
 use veloq_std::{format, ptr, string::ToString, sync::Arc};
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
@@ -145,7 +141,7 @@ impl<'view, 'state> CancellationService<'view, 'state> {
         &mut self,
         request: CancelRequest,
     ) -> IocpResult<CancelSubmitOutcome> {
-        let token = request.target;
+        let token = request.target();
 
         let timer_id = match self.state_mut().ops.checked_slot_view(token)? {
             CheckedSlotView::Valid(SlotView::InFlightWaiting(mut slot)) => {
@@ -158,7 +154,7 @@ impl<'view, 'state> CancellationService<'view, 'state> {
         };
         if let Some(tid) = timer_id {
             self.state_mut().timer.cancel(tid);
-            self.complete_local_cancel(token, request.mode)?;
+            self.complete_local_cancel(token, request.mode())?;
             self.state()
                 .completion_diagnostics
                 .backend()
@@ -176,7 +172,7 @@ impl<'view, 'state> CancellationService<'view, 'state> {
                     port,
                     registered_slots: state.handles.registered_slots(),
                 };
-                let status = Self::perform_cancel(ctx, token, request.mode, state.ops);
+                let status = Self::perform_cancel(ctx, token, request.mode(), state.ops);
                 self.record_cancel_status(token, status)
             }
             CheckedSlotView::Valid(SlotView::Reserved(slot)) => {
@@ -191,7 +187,7 @@ impl<'view, 'state> CancellationService<'view, 'state> {
                         )
                     })?;
                     let _ = guard.persist();
-                    self.complete_local_cancel(token, request.mode)?;
+                    self.complete_local_cancel(token, request.mode())?;
                 } else {
                     let _ = self.state_mut().ops.remove(token);
                 }
@@ -204,7 +200,7 @@ impl<'view, 'state> CancellationService<'view, 'state> {
             view @ (CheckedSlotView::Missing { .. }
             | CheckedSlotView::Empty(_)
             | CheckedSlotView::Stale(_)) => {
-                let (reason, kind) = cancel_target_kind(token, view);
+                let (reason, kind) = CancelRequest::target_kind(token, view);
                 self.record_cancel_target_gone(reason);
                 let attach = AnomalyAttach::from_raw_completion(RawCompletion::new(
                     COMP_BACKEND_IOCP,

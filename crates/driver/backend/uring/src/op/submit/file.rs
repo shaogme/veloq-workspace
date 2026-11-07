@@ -11,7 +11,7 @@ use crate::{
 };
 use diagweave::prelude::*;
 use veloq_buf::{RegistrationCapability, heap::ChunkId};
-use veloq_driver_core::driver::SubmitTokenContext;
+use veloq_driver_core::SubmitTokenContext;
 use veloq_io_uring::{opcode, squeue, types};
 use veloq_std::{pin::Pin, string::ToString};
 

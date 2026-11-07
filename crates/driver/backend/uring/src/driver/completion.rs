@@ -4,7 +4,7 @@ use crate::{
     error::{UringResult, uring_report_to_event_res},
 };
 
-use veloq_driver_core::driver::{
+use veloq_driver_core::{
     AnomalyAttach, CompletionAnomalyKind, CompletionFlowOutcome, SyntheticCompletionSource,
     UserCompletionEvent,
 };
@@ -13,8 +13,6 @@ mod hooks;
 mod ports;
 mod slot;
 
-#[cfg(test)]
-pub(crate) use hooks::WakerRecovery;
 pub(super) use hooks::{
     COMP_BACKEND_URING, CompletionProgress, UringBackendEffect, UringBackendIngress,
 };
@@ -98,6 +96,7 @@ impl CompletionEngine {
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use crate::config::UringDriveLimits;
+    use crate::driver::completion::hooks::WakerRecovery;
     use crate::driver::{
         drive::WaitBudget,
         env::{CompletionLedgerParts, CompletionMetadata},
@@ -123,17 +122,17 @@ mod tests {
     use crate::{
         driver::completion::{
             COMP_BACKEND_URING, CompletionEngine, UringBackendEffect, UringCompletionHooks,
-            UringSyntheticCompletion, WakerRecovery,
+            UringSyntheticCompletion,
         },
         error::UringError,
     };
     use libc::{close, fcntl, pipe};
-    use veloq_driver_core::driver::{
+    use veloq_driver_core::Generation;
+    use veloq_driver_core::{
         CancelTicket, CompletionBackendHooks, CompletionEnvelope, CompletionFlowExt,
         CompletionFlowOutcome, CompletionIngress, CompletionSettlement, CompletionToken,
         DriverCompletionDiagnostics, OpToken, RawCompletion, SharedCompletionTable,
     };
-    use veloq_driver_core::slot::Generation;
     use veloq_std::{collections::HashMap, time::Duration};
 
     #[test]
@@ -192,7 +191,7 @@ mod tests {
         result: i32,
         flags: u32,
     ) -> CompletionFlowOutcome {
-        let diagnostics = registry.shared.completion_diagnostics();
+        let diagnostics = registry.shared_slots().completion_diagnostics();
         let table: SharedCompletionTable<UringSlotSpec> = registry.shared_table();
         let mut pending_cancel_cqes = HashMap::default();
         let mut observer = ControlPlaneObserver::default();
@@ -254,7 +253,7 @@ mod tests {
 
         let outcome = hooks.handle_waker_control(raw);
         let (error, effect) = match outcome {
-            CompletionSettlement::TerminalFailure { failure } => (failure.error, failure.effect),
+            CompletionSettlement::TerminalFailure { failure } => failure.into_error_and_effect(),
             _ => panic!("unexpected byte count must produce a failed outcome"),
         };
         hooks
@@ -437,8 +436,9 @@ mod tests {
 
         let err = match outcome {
             CompletionSettlement::TerminalFailure { failure } => {
-                assert!(matches!(failure.effect, UringBackendEffect::None));
-                failure.error
+                let (error, effect) = failure.into_error_and_effect();
+                assert!(matches!(effect, UringBackendEffect::None));
+                error
             }
             _ => panic!("untracked cancel must produce a failed outcome"),
         };
@@ -501,11 +501,15 @@ mod tests {
 
         let outcome = accept_corrupt(&mut registry, &mut sidecar, token, fd, 0);
 
-        assert_eq!(outcome.anomaly, 1);
+        assert_eq!(outcome.anomaly_count(), 1);
         assert!(sidecar.is_empty());
         assert_closed(fd);
         unsafe { close(fd_pair[1]) };
-        let snapshot = registry.shared.completion_diagnostics().snapshot().backend;
+        let snapshot = registry
+            .shared_slots()
+            .completion_diagnostics()
+            .snapshot()
+            .backend;
         assert_eq!(snapshot.corrupt_cleanup_attempts, 1);
         assert_eq!(snapshot.corrupt_raw_fd_cleanups, 1);
         assert_eq!(snapshot.corrupt_cleanup_hint_missing, 0);
@@ -531,7 +535,11 @@ mod tests {
             close(fd_pair[0]);
             close(fd_pair[1]);
         }
-        let snapshot = registry.shared.completion_diagnostics().snapshot().backend;
+        let snapshot = registry
+            .shared_slots()
+            .completion_diagnostics()
+            .snapshot()
+            .backend;
         assert_eq!(snapshot.corrupt_cleanup_attempts, 1);
         assert_eq!(snapshot.corrupt_raw_fd_cleanups, 0);
         assert_eq!(snapshot.corrupt_cleanup_hint_missing, 0);
@@ -542,7 +550,7 @@ mod tests {
         let mut registry = UringOpRegistry::new(1);
         let token = OpToken::from_registry_parts(0, Generation::new(1)).expect("test token");
         let mut sidecar = HashMap::default();
-        let diagnostics = registry.shared.completion_diagnostics();
+        let diagnostics = registry.shared_slots().completion_diagnostics();
         let mut pending_cancel_cqes = HashMap::default();
         let mut observer = ControlPlaneObserver::default();
         let mut post = UringPostCompletionEffects::default();
@@ -574,7 +582,7 @@ mod tests {
             )
             .expect("corrupt completion should be handled");
 
-        assert_eq!(outcome.anomaly, 1);
+        assert_eq!(outcome.anomaly_count(), 1);
         assert_eq!(provided_buffers.stats().returned(), before.returned() + 1);
         assert_eq!(provided_buffers.stats().available(), before.available());
     }
@@ -590,14 +598,18 @@ mod tests {
 
         let outcome = accept_corrupt(&mut registry, &mut sidecar, token, fd, 0);
 
-        assert_eq!(outcome.anomaly, 1);
+        assert_eq!(outcome.anomaly_count(), 1);
         assert!(sidecar.is_empty());
         assert_ne!(unsafe { fcntl(fd, libc::F_GETFD) }, -1);
         unsafe {
             close(fd);
             close(fd_pair[1]);
         }
-        let snapshot = registry.shared.completion_diagnostics().snapshot().backend;
+        let snapshot = registry
+            .shared_slots()
+            .completion_diagnostics()
+            .snapshot()
+            .backend;
         assert_eq!(snapshot.corrupt_cleanup_attempts, 0);
         assert_eq!(snapshot.corrupt_cleanup_hint_missing, 0);
     }
@@ -615,7 +627,11 @@ mod tests {
             close(fd_pair[0]);
             close(fd_pair[1]);
         }
-        let snapshot = registry.shared.completion_diagnostics().snapshot().backend;
+        let snapshot = registry
+            .shared_slots()
+            .completion_diagnostics()
+            .snapshot()
+            .backend;
         assert_eq!(snapshot.corrupt_cleanup_attempts, 0);
         assert_eq!(snapshot.corrupt_raw_fd_cleanups, 0);
         assert_eq!(snapshot.corrupt_cleanup_hint_missing, 1);
@@ -637,19 +653,23 @@ mod tests {
         sidecar.insert(CompletionToken::user(token), Some(hint));
 
         let first = accept_corrupt(&mut registry, &mut sidecar, token, first_pair[0], CQE_MORE);
-        assert_eq!(first.anomaly, 1);
+        assert_eq!(first.anomaly_count(), 1);
         assert_eq!(sidecar.len(), 1);
         assert_closed(first_pair[0]);
 
         let final_outcome = accept_corrupt(&mut registry, &mut sidecar, token, second_pair[0], 0);
-        assert_eq!(final_outcome.anomaly, 1);
+        assert_eq!(final_outcome.anomaly_count(), 1);
         assert!(sidecar.is_empty());
         assert_closed(second_pair[0]);
         unsafe {
             close(first_pair[1]);
             close(second_pair[1]);
         }
-        let snapshot = registry.shared.completion_diagnostics().snapshot().backend;
+        let snapshot = registry
+            .shared_slots()
+            .completion_diagnostics()
+            .snapshot()
+            .backend;
         assert_eq!(snapshot.corrupt_cleanup_attempts, 2);
         assert_eq!(snapshot.corrupt_raw_fd_cleanups, 2);
     }

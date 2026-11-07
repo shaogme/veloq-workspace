@@ -23,8 +23,8 @@ use tracing::{debug, trace};
 pub(crate) use txn::{SlotAccessReporter, UringSubmitTxn};
 use veloq_buf::heap::ChunkId;
 use veloq_driver_core::{
-    driver::{CompletionToken, DriverSubmitResult, OpToken, SubmitStatus, SubmitTokenContext},
-    slot::{CheckedSlotView, InFlightWaiting},
+    CheckedSlotView, CompletionToken, DriverSubmitResult, InFlightWaiting, OpToken, SubmitStatus,
+    SubmitTokenContext,
 };
 use veloq_io_uring::{
     EnterArgs, EnterFlags, opcode, squeue,
