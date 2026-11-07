@@ -4,8 +4,6 @@ use diagweave::prelude::*;
 use tracing::trace;
 use veloq_io_uring::{IoUring, cqueue};
 
-#[cfg(any(test, feature = "test-hooks"))]
-use crate::driver::control::ControlPlaneEvent;
 use crate::{
     config::UringDriveLimits,
     diagnostics::UringCompletionDiagnostics,
@@ -23,14 +21,18 @@ use crate::{
         registration::ProvidedBufPort,
     },
     error::{UringError, UringResult},
-    op::{CheckedSlotView, RecordPolicy, SlotView, UringOpRegistryExt, UringSlotSpec},
+    op::{RecordPolicy, UringSlotSpec},
 };
 
 use veloq_driver_core::{
-    AnomalyAttach, CompletionAnomalyKind, CompletionEnvelope, CompletionFlowExt,
+    AnomalyAttach, CheckedSlotView, CompletionAnomalyKind, CompletionEnvelope, CompletionFlowExt,
     CompletionFlowOutcome, CompletionIngress, CompletionToken, DriverCompletionDiagnostics,
-    OpToken, SharedCompletionTable, SyntheticCompletionSource, UserCompletionEvent,
+    OpToken, SharedCompletionTable, SlotRegistryExt as UringOpRegistryExt, SlotView,
+    SyntheticCompletionSource, UserCompletionEvent,
 };
+
+#[cfg(any(test, feature = "test-hooks"))]
+use crate::driver::control::ControlPlaneEvent;
 
 #[derive(Clone, Copy)]
 struct CqeRecord {
@@ -45,6 +47,37 @@ pub(crate) struct CompletionScratch {
     pending_effects: Option<UringPostCompletionEffects>,
     pending_collector_exhausted: bool,
     limits: UringDriveLimits,
+}
+
+struct CompletionPorts<'scratch, 'context> {
+    scratch: &'scratch mut CompletionScratch,
+    ops: &'context mut OperationLedger,
+    completion_diagnostics: &'context DriverCompletionDiagnostics<UringCompletionDiagnostics>,
+    completion_table: &'context SharedCompletionTable<UringSlotSpec>,
+    control: &'context mut UringControlPlane,
+    ring: &'context mut IoUring,
+    provided_buffers: Option<ProvidedBufPort<'context>>,
+}
+
+#[derive(Debug, Default)]
+struct CqeCollection {
+    count: usize,
+    remaining: usize,
+    collector_exhausted: bool,
+    cqe_budget_hit: bool,
+    emergency: bool,
+    overflow: u32,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct CompletionBatchProgress {
+    flow: CompletionProgress,
+    timer_count: usize,
+    cqe_count: usize,
+    pending_completion: bool,
+    cqe_budget_hit: bool,
+    emergency_drain: bool,
+    cqe_overflow: bool,
 }
 
 impl CompletionScratch {
@@ -153,56 +186,31 @@ impl CompletionScratch {
     }
 }
 
-struct CompletionPorts<'scratch, 'context> {
-    scratch: &'scratch mut CompletionScratch,
-    ops: &'context mut OperationLedger,
-    completion_diagnostics: &'context DriverCompletionDiagnostics<UringCompletionDiagnostics>,
-    completion_table: &'context SharedCompletionTable<UringSlotSpec>,
-    control: &'context mut UringControlPlane,
-    ring: &'context mut IoUring,
-    provided_buffers: Option<ProvidedBufPort<'context>>,
-}
-
-#[derive(Debug, Default)]
-struct CqeCollection {
-    count: usize,
-    remaining: usize,
-    collector_exhausted: bool,
-    cqe_budget_hit: bool,
-    emergency: bool,
-    overflow: u32,
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct CompletionBatchProgress {
-    flow: CompletionProgress,
-    timer_count: usize,
-    cqe_count: usize,
-    pending_completion: bool,
-    cqe_budget_hit: bool,
-    emergency_drain: bool,
-    cqe_overflow: bool,
-}
-
 impl CompletionBatchProgress {
     pub(crate) const fn user_completed(&self) -> usize {
         self.flow.user_completed_count()
     }
+
     pub(crate) const fn timer_count(&self) -> usize {
         self.timer_count
     }
+
     pub(crate) const fn cqe_count(&self) -> usize {
         self.cqe_count
     }
+
     pub(crate) const fn cqe_budget_hit(&self) -> bool {
         self.cqe_budget_hit
     }
+
     pub(crate) const fn emergency_drain(&self) -> bool {
         self.emergency_drain
     }
+
     pub(crate) const fn cqe_overflow(&self) -> bool {
         self.cqe_overflow
     }
+
     pub(crate) const fn pending_work(&self) -> bool {
         self.pending_completion
     }
@@ -251,13 +259,15 @@ impl<'scratch, 'context> CompletionPorts<'scratch, 'context> {
         cq.sync();
         let visible = cq.len();
         collection.overflow = cq.overflow();
-        let normal_limit = visible.min(max_cqes).min(self.scratch.limits.max_cqe_batch);
+        let normal_limit = visible
+            .min(max_cqes)
+            .min(self.scratch.limits.max_cqe_batch());
         let high_water = cq.capacity().saturating_mul(3) / 4;
         let emergency =
             visible > normal_limit && (visible >= high_water.max(1) || collection.overflow != 0);
         let limit = if emergency {
             visible
-                .min(self.scratch.limits.emergency_drain_limit)
+                .min(self.scratch.limits.emergency_drain_limit())
                 .min(self.scratch.cqe_buffer.capacity())
         } else {
             normal_limit

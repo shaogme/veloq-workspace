@@ -4,6 +4,11 @@
 //! SQE 构造同时借用 slot 和提交资源；将非 slot 状态投影为窄视图，由借用检查器保证两侧互不别名。
 //! SQE construction borrows both a slot and submission resources; narrow views let the borrow checker verify they do not alias.
 
+mod completion_control;
+mod cqe;
+mod parts;
+mod submission;
+
 use crate::{
     driver::{
         control::PendingCancel,
@@ -18,11 +23,6 @@ use veloq_driver_core::{CancelTicket, OpToken};
 use veloq_io_uring::squeue;
 use veloq_std::time::Duration;
 use veloq_wheel::TimerId;
-
-mod completion_control;
-mod cqe;
-mod parts;
-mod submission;
 
 pub(crate) use completion_control::{CompletionControlView, CompletionLedgerParts};
 pub(crate) use cqe::CqeEnv;

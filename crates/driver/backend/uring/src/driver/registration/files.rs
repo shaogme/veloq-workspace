@@ -8,11 +8,9 @@ use crate::{
     error::{UringError, UringResult},
 };
 use diagweave::prelude::*;
-use tracing::error;
+use libc::EINVAL;
+use tracing::{debug, error, warn};
 use veloq_driver_core::RegisterFd;
-
-#[cfg(feature = "test-hooks")]
-use veloq_driver_core::test_hooks::RegisterFilesUpdateOutcome;
 use veloq_io_uring::{KernelCapabilities, ResourceLayout, ResourceRegistration, Submitter};
 use veloq_std::{
     io,
@@ -22,6 +20,8 @@ use veloq_std::{
     vec::Vec,
 };
 
+#[cfg(feature = "test-hooks")]
+use veloq_driver_core::test_hooks::RegisterFilesUpdateOutcome;
 #[cfg(feature = "test-hooks")]
 use veloq_std::collections::VecDeque;
 
@@ -115,9 +115,11 @@ impl FixedFileOwner {
     pub(super) fn table(&self) -> &FileTable {
         &self.table
     }
+
     pub(super) fn is_poisoned(&self) -> bool {
         self.table.is_poisoned()
     }
+
     pub(super) fn poisoned_report(
         &self,
         scope: &'static str,
@@ -159,7 +161,7 @@ impl FixedFileOwner {
                     let result = self
                         .registration
                         .as_ref()
-                        .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))
+                        .ok_or_else(|| io::Error::from_raw_os_error(EINVAL))
                         .and_then(|registration| {
                             ports
                                 .submitter
@@ -187,7 +189,7 @@ impl FixedFileOwner {
         let result = self
             .registration
             .as_ref()
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))
+            .ok_or_else(|| io::Error::from_raw_os_error(EINVAL))
             .and_then(|registration| {
                 ports
                     .submitter
@@ -215,7 +217,7 @@ impl FixedFileOwner {
             KernelUpdateOutcome::Rejected(_) => ports.diagnostics.inc_file_table_update_rejected(),
             KernelUpdateOutcome::Unknown(_, _) => ports.diagnostics.inc_file_table_update_unknown(),
         }
-        tracing::debug!(
+        debug!(
             scope = txn.scope(),
             direction = ?txn.direction(),
             start_index = txn.start(),
@@ -769,7 +771,7 @@ impl FixedFileOwner {
                     );
                     if self.table.falls_back_when_unavailable() {
                         self.table.disable_fixed_table();
-                        tracing::warn!(
+                        warn!(
                             requested_slots = capacity,
                             errno = ?error.raw_os_error(),
                             "sparse fixed-file registration unavailable; using raw file descriptors"

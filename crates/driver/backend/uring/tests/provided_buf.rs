@@ -47,10 +47,10 @@ fn new_driver_or_skip(entries: u16, buf_size: usize) -> Option<UringDriver<'stat
     let config = UringConfig::default()
         .with_entries(NonZeroU32::new(64).unwrap())
         .drive_limits(UringDriveLimits::for_entries(64))
-        .provided_buffers(ProvidedBufConfig {
-            entries: NonZeroU16::new(entries).unwrap(),
-            buf_size: NonZeroUsize::new(buf_size).unwrap(),
-        });
+        .provided_buffers(ProvidedBufConfig::new(
+            NonZeroU16::new(entries).unwrap(),
+            NonZeroUsize::new(buf_size).unwrap(),
+        ));
     let mut driver = match UringDriver::new(config) {
         Ok(driver) => driver,
         Err(report) => {

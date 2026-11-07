@@ -1,13 +1,21 @@
+use crate::error::{UringError, UringResult};
+use diagweave::prelude::*;
+use libc::{
+    AF_INET, AF_INET6, close, sa_family_t, sockaddr_in, sockaddr_in6, sockaddr_storage, socklen_t,
+};
 use veloq_buf::LockedMemoryBudget;
 use veloq_driver_core::{
     BorrowedRawHandle as CoreBorrowedRawHandle, IoFd as CoreIoFd,
     OwnedRawHandle as CoreOwnedRawHandle, RawHandle as CoreRawHandle, RawHandleMeta,
+    SocketAddrCodec,
 };
 pub use veloq_driver_core::{DirectOwnerId, RawHandleKind};
 pub use veloq_io_uring::{SetupFlags, SetupPolicy};
 use veloq_std::{
-    mem,
+    mem::{self, MaybeUninit, size_of},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
     num::{NonZeroU16, NonZeroU32, NonZeroUsize},
+    ptr, slice,
     time::Duration,
 };
 
@@ -52,7 +60,7 @@ impl RawHandleMeta for UringRawHandle {
         if fd >= 0 {
             // SAFETY: `fd` is owned by this value.
             unsafe {
-                libc::close(fd);
+                close(fd);
             }
         }
     }
@@ -66,7 +74,137 @@ pub type BorrowedRawHandle<'a> = CoreBorrowedRawHandle<'a, UringRawHandle>;
 
 #[repr(transparent)]
 #[derive(Clone, Copy)]
-pub struct SockAddrStorage(pub libc::sockaddr_storage);
+pub struct SockAddrStorage(sockaddr_storage);
+
+impl SockAddrStorage {
+    pub const fn as_raw(&self) -> &sockaddr_storage {
+        &self.0
+    }
+
+    pub fn as_raw_mut(&mut self) -> &mut sockaddr_storage {
+        &mut self.0
+    }
+
+    pub fn decode(buf: &[u8]) -> UringResult<SocketAddr> {
+        if buf.len() < size_of::<sa_family_t>() {
+            return Err(Report::new(UringError::InvalidInput).attach_note("Invalid address length"));
+        }
+        let mut family_raw = MaybeUninit::<sa_family_t>::uninit();
+        unsafe {
+            ptr::copy_nonoverlapping(
+                buf.as_ptr(),
+                family_raw.as_mut_ptr().cast::<u8>(),
+                size_of::<sa_family_t>(),
+            );
+        }
+        let family = unsafe { family_raw.assume_init() } as i32;
+        match family {
+            AF_INET => {
+                if buf.len() < size_of::<sockaddr_in>() {
+                    return Err(
+                        Report::new(UringError::InvalidInput).attach_note("Invalid address length")
+                    );
+                }
+                let mut address_raw = MaybeUninit::<sockaddr_in>::zeroed();
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        buf.as_ptr(),
+                        address_raw.as_mut_ptr().cast::<u8>(),
+                        size_of::<sockaddr_in>(),
+                    );
+                }
+                let address = unsafe { address_raw.assume_init() };
+                let ip = Ipv4Addr::from(u32::from_be(address.sin_addr.s_addr));
+                let port = u16::from_be(address.sin_port);
+                Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
+            }
+            AF_INET6 => {
+                if buf.len() < size_of::<sockaddr_in6>() {
+                    return Err(
+                        Report::new(UringError::InvalidInput).attach_note("Invalid address length")
+                    );
+                }
+                let mut address_raw = MaybeUninit::<sockaddr_in6>::zeroed();
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        buf.as_ptr(),
+                        address_raw.as_mut_ptr().cast::<u8>(),
+                        size_of::<sockaddr_in6>(),
+                    );
+                }
+                let address = unsafe { address_raw.assume_init() };
+                let ip = Ipv6Addr::from(address.sin6_addr.s6_addr);
+                let port = u16::from_be(address.sin6_port);
+                Ok(SocketAddr::V6(SocketAddrV6::new(
+                    ip,
+                    port,
+                    address.sin6_flowinfo,
+                    address.sin6_scope_id,
+                )))
+            }
+            _ => {
+                Err(Report::new(UringError::InvalidInput).attach_note("Unsupported address family"))
+            }
+        }
+    }
+
+    pub fn from_socket_addr(addr: SocketAddr) -> (Self, socklen_t) {
+        let mut storage = Self::default();
+        let len = match addr {
+            SocketAddr::V4(address) => {
+                let sockaddr = storage.as_raw_mut() as *mut _ as *mut sockaddr_in;
+                unsafe {
+                    (*sockaddr).sin_family = AF_INET as _;
+                    (*sockaddr).sin_port = address.port().to_be();
+                    (*sockaddr).sin_addr.s_addr = u32::from_ne_bytes(address.ip().octets());
+                    size_of::<sockaddr_in>() as socklen_t
+                }
+            }
+            SocketAddr::V6(address) => {
+                let sockaddr = storage.as_raw_mut() as *mut _ as *mut sockaddr_in6;
+                unsafe {
+                    (*sockaddr).sin6_family = AF_INET6 as _;
+                    (*sockaddr).sin6_port = address.port().to_be();
+                    (*sockaddr).sin6_addr.s6_addr = address.ip().octets();
+                    (*sockaddr).sin6_flowinfo = address.flowinfo();
+                    (*sockaddr).sin6_scope_id = address.scope_id();
+                    size_of::<sockaddr_in6>() as socklen_t
+                }
+            }
+        };
+        (storage, len)
+    }
+
+    pub(crate) fn bounded_bytes<'a>(
+        &'a self,
+        len: usize,
+        scope: &'static str,
+    ) -> UringResult<&'a [u8]> {
+        let capacity = size_of::<sockaddr_storage>();
+        if len > capacity {
+            return Err(UringError::InvalidState
+                .report(scope, "socket address length exceeds storage capacity")
+                .with_ctx("address_length", len)
+                .with_ctx("address_capacity", capacity));
+        }
+
+        // SAFETY: `self` is a valid initialized sockaddr buffer and `len` fits its storage.
+        Ok(unsafe { slice::from_raw_parts(self.as_raw() as *const _ as *const u8, len) })
+    }
+}
+
+impl SocketAddrCodec for SockAddrStorage {
+    type Len = socklen_t;
+    type Error = UringError;
+
+    fn to_socket_addr(buf: &[u8]) -> UringResult<SocketAddr> {
+        Self::decode(buf).attach_note("socket_addr.decode")
+    }
+
+    fn socket_addr_to_storage(addr: SocketAddr) -> (Self, Self::Len) {
+        Self::from_socket_addr(addr)
+    }
+}
 
 impl Default for SockAddrStorage {
     fn default() -> Self {
@@ -87,17 +225,17 @@ pub enum IoMode {
 /// visible to the caller's next drive rather than silently dropping work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UringDriveLimits {
-    pub max_control_events: usize,
-    pub max_cancel_actions: usize,
-    pub max_backlog_actions: usize,
-    pub max_submit_rounds: usize,
-    pub max_cqe_batch: usize,
-    pub max_cqes_per_drive: usize,
-    pub max_timer_expirations: usize,
+    max_control_events: usize,
+    max_cancel_actions: usize,
+    max_backlog_actions: usize,
+    max_submit_rounds: usize,
+    max_cqe_batch: usize,
+    max_cqes_per_drive: usize,
+    max_timer_expirations: usize,
     /// Maximum number of CQEs a high-water emergency drain may consume in one batch.
-    pub emergency_drain_limit: usize,
+    emergency_drain_limit: usize,
     /// Maximum time a cancel ENOENT may remain deferred while CQE collection is not exhausted.
-    pub cancel_reconcile_timeout: Duration,
+    cancel_reconcile_timeout: Duration,
 }
 
 impl UringDriveLimits {
@@ -114,6 +252,87 @@ impl UringDriveLimits {
             emergency_drain_limit: entries,
             cancel_reconcile_timeout: Duration::from_secs(1),
         }
+    }
+
+    pub const fn max_control_events(&self) -> usize {
+        self.max_control_events
+    }
+
+    pub const fn max_cancel_actions(&self) -> usize {
+        self.max_cancel_actions
+    }
+
+    pub const fn max_backlog_actions(&self) -> usize {
+        self.max_backlog_actions
+    }
+
+    pub const fn max_submit_rounds(&self) -> usize {
+        self.max_submit_rounds
+    }
+
+    pub const fn max_cqe_batch(&self) -> usize {
+        self.max_cqe_batch
+    }
+
+    pub const fn max_cqes_per_drive(&self) -> usize {
+        self.max_cqes_per_drive
+    }
+
+    pub const fn max_timer_expirations(&self) -> usize {
+        self.max_timer_expirations
+    }
+
+    pub const fn emergency_drain_limit(&self) -> usize {
+        self.emergency_drain_limit
+    }
+
+    pub const fn cancel_reconcile_timeout(&self) -> Duration {
+        self.cancel_reconcile_timeout
+    }
+
+    pub fn with_max_control_events(mut self, value: usize) -> Self {
+        self.max_control_events = value;
+        self
+    }
+
+    pub fn with_max_cancel_actions(mut self, value: usize) -> Self {
+        self.max_cancel_actions = value;
+        self
+    }
+
+    pub fn with_max_backlog_actions(mut self, value: usize) -> Self {
+        self.max_backlog_actions = value;
+        self
+    }
+
+    pub fn with_max_submit_rounds(mut self, value: usize) -> Self {
+        self.max_submit_rounds = value;
+        self
+    }
+
+    pub fn with_max_cqe_batch(mut self, value: usize) -> Self {
+        self.max_cqe_batch = value;
+        self
+    }
+
+    pub fn with_max_cqes_per_drive(mut self, value: usize) -> Self {
+        self.max_cqes_per_drive = value;
+        self
+    }
+
+    pub fn with_max_timer_expirations(mut self, value: usize) -> Self {
+        self.max_timer_expirations = value;
+        self
+    }
+
+    pub fn with_emergency_drain_limit(mut self, value: usize) -> Self {
+        self.emergency_drain_limit = value;
+        self
+    }
+
+    pub fn with_cancel_reconcile_timeout(mut self, value: Duration) -> Self {
+        self.cancel_reconcile_timeout = value;
+        self
     }
 
     pub(crate) fn validate(self, ring_entries: usize) -> Result<(), &'static str> {
@@ -178,13 +397,16 @@ impl FileTableExhaustion {
 pub struct ProvidedBufConfig {
     /// Number of ring entries. Must be a power of two and at most [`MAX_PROVIDED_BUF_ENTRIES`]
     /// — the kernel enforces both, so a bad value simply leaves provided buffers disabled.
-    pub entries: NonZeroU16,
+    entries: NonZeroU16,
     /// Capacity of each buffer.
-    pub buf_size: NonZeroUsize,
+    buf_size: NonZeroUsize,
 }
 
 /// The kernel's hard cap on `ring_entries` for `IORING_REGISTER_PBUF_RING`.
 pub const MAX_PROVIDED_BUF_ENTRIES: u16 = 1 << 15;
+
+/// Matches the historical capacity, which was pinned to the default ring depth.
+const DEFAULT_FILE_TABLE_CAPACITY: u32 = 1024;
 
 impl Default for ProvidedBufConfig {
     fn default() -> Self {
@@ -199,6 +421,14 @@ impl Default for ProvidedBufConfig {
 impl ProvidedBufConfig {
     pub fn new(entries: NonZeroU16, buf_size: NonZeroUsize) -> Self {
         Self { entries, buf_size }
+    }
+
+    pub const fn entries(&self) -> NonZeroU16 {
+        self.entries
+    }
+
+    pub const fn buf_size(&self) -> NonZeroUsize {
+        self.buf_size
     }
 }
 
@@ -244,9 +474,6 @@ impl Default for UringConfig {
         }
     }
 }
-
-/// Matches the historical capacity, which was pinned to the default ring depth.
-const DEFAULT_FILE_TABLE_CAPACITY: u32 = 1024;
 
 impl UringConfig {
     pub const fn mode(&self) -> IoMode {

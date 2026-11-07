@@ -10,8 +10,6 @@ pub(crate) use backlog::{BacklogEntry, BacklogError, SubmissionBacklog};
 pub(crate) use cancellation::{
     CancelIntentError, CancelRequestDisposition, PendingCancel, UringCancelManager,
 };
-#[cfg(test)]
-pub(crate) use effects::UringControlEffect;
 pub(crate) use effects::{
     DeferredCancelReconcile, UringControlEffectKind, UringPostCompletionEffects,
 };
@@ -22,17 +20,19 @@ pub(crate) use waker::UringWakerManager;
 
 use crate::driver::lifecycle::SubmissionPhase;
 use veloq_driver_core::{CancelTicket, CompletionToken, OpToken};
+use veloq_wheel::TimerId;
 
 #[cfg(any(test, feature = "test-hooks"))]
 use veloq_driver_core::SlotSnapshot;
-
 #[cfg(any(test, feature = "test-hooks"))]
 use veloq_std::{
     collections::{HashMap, HashSet, hash_map::Entry},
     mem,
     vec::Vec,
 };
-use veloq_wheel::TimerId;
+
+#[cfg(test)]
+pub(crate) use effects::UringControlEffect;
 
 /// A single observed control-plane transition.
 ///

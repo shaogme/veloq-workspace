@@ -13,17 +13,16 @@ use crate::{
         lifecycle::SubmissionPhase,
     },
     error::UringError,
-    op::{CheckedSlotView, SlotView, UringOpRegistryExt},
 };
 
 #[cfg(any(test, feature = "test-hooks"))]
-use veloq_driver_core::{CancelTicket, CompletionToken, OpToken, SlotSnapshot};
+use veloq_driver_core::{
+    CancelTicket, CheckedSlotView, CompletionToken, OpToken, SlotRegistryExt as UringOpRegistryExt,
+    SlotSnapshot, SlotView,
+};
 
 #[cfg(any(test, feature = "test-hooks"))]
-use veloq_std::{collections::HashSet, vec::Vec};
-
-#[cfg(any(test, feature = "test-hooks"))]
-use veloq_std::format;
+use veloq_std::{collections::HashSet, format, vec::Vec};
 
 #[cfg(any(test, feature = "test-hooks"))]
 use veloq_wheel::TimerId;

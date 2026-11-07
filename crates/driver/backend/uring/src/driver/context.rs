@@ -4,6 +4,12 @@
 //! 它们不持有父门面，用 field-level borrow split 限制组件依赖。
 //! They do not own the parent facade and use field-level borrow splits to limit dependencies.
 
+mod backlog;
+mod cancellation;
+mod effects;
+mod invariants;
+mod ports;
+
 use crate::{
     diagnostics::UringCompletionDiagnostics,
     driver::{
@@ -25,11 +31,6 @@ use veloq_driver_core::{
 use veloq_io_uring::{IoUring, KernelCapabilities};
 use veloq_std::{format, time::Duration};
 
-mod backlog;
-mod cancellation;
-mod effects;
-mod invariants;
-mod ports;
 pub(crate) use backlog::BacklogExecutor;
 pub(crate) use cancellation::CancellationCoordinator;
 pub(crate) use effects::CompletionEffectExecutor;
@@ -38,6 +39,16 @@ pub(crate) use ports::{
     CompletionContext, CompletionOperationBorrowParts, DrivePortAccess, DrivePorts,
     LifecycleContext, SubmitPort, SubmitPortParts,
 };
+
+pub(crate) struct DriveContextParts<'ops, 'registration, 'ring, 'a> {
+    pub(crate) ops: &'ops mut OperationLedger,
+    pub(crate) control: &'ops mut UringControlPlane,
+    pub(crate) registration: &'registration mut RegistrationEngine<'a>,
+    pub(crate) completion_table: &'ops SharedCompletionTable<UringSlotSpec>,
+    pub(crate) diagnostics: &'ops DriverCompletionDiagnostics<UringCompletionDiagnostics>,
+    pub(crate) ring: &'ring mut IoUring,
+    pub(crate) kernel_capabilities: &'ops mut KernelCapabilities,
+}
 
 pub(crate) struct DriveContext<'ops, 'registration, 'ring, 'a> {
     ops: &'ops mut OperationLedger,
@@ -299,14 +310,4 @@ impl<'ops, 'registration, 'ring, 'a> DriveContext<'ops, 'registration, 'ring, 'a
             kernel_capabilities,
         }
     }
-}
-
-pub(crate) struct DriveContextParts<'ops, 'registration, 'ring, 'a> {
-    pub(crate) ops: &'ops mut OperationLedger,
-    pub(crate) control: &'ops mut UringControlPlane,
-    pub(crate) registration: &'registration mut RegistrationEngine<'a>,
-    pub(crate) completion_table: &'ops SharedCompletionTable<UringSlotSpec>,
-    pub(crate) diagnostics: &'ops DriverCompletionDiagnostics<UringCompletionDiagnostics>,
-    pub(crate) ring: &'ring mut IoUring,
-    pub(crate) kernel_capabilities: &'ops mut KernelCapabilities,
 }

@@ -1,7 +1,13 @@
 use core::slice;
 
-use veloq_driver_core::{CancelMode, CancelTicket, OpToken};
+use veloq_driver_core::{CancelMode, CancelTicket, Generation, OpToken};
 use veloq_std::{vec, vec::Vec};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmissionError {
+    KernelRejected,
+    ReceiptUnavailable,
+}
 
 /// 提交边界的协议回执。每种回执都携带完整的消费证据。
 /// Protocol receipts at the submission boundary; each variant carries complete consumption evidence.
@@ -104,12 +110,6 @@ impl SubmissionReceipt {
             error,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SubmissionError {
-    KernelRejected,
-    ReceiptUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -639,267 +639,257 @@ impl CancelReconcileLedger {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        BacklogEntry, BacklogError, BacklogLedger, CancelReconcileLedger, CancelReconcileOutcome,
-        CancelSubmitOutcome, LedgerError, StageEntry, StagePhase, StagedLedger, SubmissionError,
-        SubmissionReceipt,
+fn token(index: usize, generation: u32) -> OpToken {
+    OpToken::from_registry_parts(index, Generation::new(generation)).expect("test token")
+}
+
+fn user(index: usize, generation: u32) -> StageEntry {
+    StageEntry::User(token(index, generation))
+}
+
+#[test]
+fn consumed_receipt_advances_only_the_reported_prefix() {
+    let mut ledger = StagedLedger::new(3);
+    let first = token(0, 1);
+    let second = token(1, 1);
+    let third = token(2, 1);
+    ledger
+        .stage_batch(&[
+            StageEntry::User(first),
+            StageEntry::User(second),
+            StageEntry::User(third),
+        ])
+        .expect("stage batch");
+
+    ledger
+        .apply_receipt(SubmissionReceipt::consumed(3, 2))
+        .expect("partial receipt");
+
+    assert_eq!(ledger.phase_of(first), Some(StagePhase::KernelOutstanding));
+    assert_eq!(ledger.phase_of(second), Some(StagePhase::KernelOutstanding));
+    assert_eq!(ledger.phase_of(third), Some(StagePhase::Staged));
+}
+
+#[test]
+fn zero_and_rejected_receipts_leave_staged_entries_retriable() {
+    let mut ledger = StagedLedger::new(2);
+    let first = token(0, 1);
+    let second = token(1, 1);
+    ledger.stage(user(0, 1)).expect("stage first");
+    ledger
+        .apply_receipt(SubmissionReceipt::no_entries(1))
+        .expect("zero receipt");
+    ledger
+        .apply_receipt(SubmissionReceipt::no_entries_wait(1))
+        .expect("timed wait receipt");
+    ledger
+        .apply_receipt(SubmissionReceipt::rejected(
+            1,
+            SubmissionError::KernelRejected,
+        ))
+        .expect("rejected receipt");
+    assert_eq!(ledger.phase_of(first), Some(StagePhase::Staged));
+
+    ledger.stage(user(1, 1)).expect("stage second");
+    assert_eq!(ledger.phase_of(second), Some(StagePhase::Staged));
+}
+
+#[test]
+fn unknown_receipt_quarantines_entries_instead_of_retrying_them() {
+    let mut ledger = StagedLedger::new(2);
+    let first = token(0, 1);
+    ledger.stage(user(0, 1)).expect("stage first");
+
+    ledger
+        .apply_receipt(SubmissionReceipt::unknown(
+            1,
+            SubmissionError::ReceiptUnavailable,
+        ))
+        .expect("unknown receipt");
+
+    assert_eq!(ledger.phase_of(first), Some(StagePhase::Quarantined));
+    assert_eq!(ledger.quarantined_count(), 1);
+    assert_eq!(
+        ledger.stage(user(0, 1)),
+        Err(LedgerError::DuplicateToken(first))
+    );
+}
+
+#[test]
+fn sqpoll_published_does_not_become_kernel_outstanding_before_cqe() {
+    let mut ledger = StagedLedger::new(1);
+    let first = token(0, 1);
+    ledger.stage(user(0, 1)).expect("stage first");
+
+    ledger
+        .apply_receipt(SubmissionReceipt::published(1, 1))
+        .expect("published receipt");
+
+    assert_eq!(ledger.phase_of(first), Some(StagePhase::Published));
+    ledger.settle_user_cqe(first).expect("published CQE");
+    assert_eq!(ledger.phase_of(first), None);
+}
+
+#[test]
+fn stage_full_rolls_back_the_whole_batch_and_rejects_duplicate_tokens() {
+    let mut ledger = StagedLedger::new(1);
+    let first = token(0, 1);
+    ledger.stage(user(0, 1)).expect("stage first");
+    let before = ledger.snapshot();
+
+    assert_eq!(ledger.stage(user(1, 1)), Err(LedgerError::Capacity));
+    assert_eq!(ledger.snapshot(), before);
+
+    let mut duplicate_ledger = StagedLedger::new(2);
+    duplicate_ledger.stage(user(0, 1)).expect("stage first");
+    assert_eq!(
+        duplicate_ledger.stage(user(0, 1)),
+        Err(LedgerError::DuplicateToken(first))
+    );
+    assert_eq!(duplicate_ledger.snapshot().len(), 1);
+}
+
+#[test]
+fn staged_control_entries_share_the_same_receipt_boundary() {
+    let target = token(0, 1);
+    let ticket = CancelTicket::try_new(1).expect("cancel ticket");
+    let mut ledger = StagedLedger::new(2);
+
+    ledger
+        .stage_batch(&[
+            StageEntry::Cancel { ticket, target },
+            StageEntry::Waker { generation: 1 },
+        ])
+        .expect("control entries should stage atomically");
+    ledger
+        .apply_receipt(SubmissionReceipt::consumed(2, 2))
+        .expect("control receipt");
+    assert_eq!(ledger.snapshot().len(), 2);
+}
+
+#[test]
+fn backlog_remove_is_generation_safe_and_keeps_links_consistent() {
+    let first = token(1, 1);
+    let second = token(2, 1);
+    let replacement = token(1, 2);
+    let mut backlog = BacklogLedger::new(3);
+
+    backlog
+        .insert(BacklogEntry { token: first })
+        .expect("insert first");
+    backlog
+        .insert(BacklogEntry { token: second })
+        .expect("insert second");
+    assert_eq!(backlog.len(), 2);
+    assert_eq!(backlog.peak_len(), 2);
+    assert_eq!(
+        backlog.remove(replacement),
+        Err(BacklogError::GenerationMismatch)
+    );
+    assert_eq!(backlog.remove(first).expect("remove first").token, first);
+    assert_eq!(backlog.pop_front().expect("pop second").token, second);
+    assert_eq!(backlog.len(), 0);
+
+    backlog
+        .insert(BacklogEntry { token: replacement })
+        .expect("reuse index with new generation");
+    assert_eq!(
+        backlog.pop_front().expect("pop replacement").token,
+        replacement
+    );
+}
+
+#[test]
+fn backlog_capacity_is_fixed_and_duplicate_entries_do_not_grow_it() {
+    let first = token(0, 1);
+    let second = token(1, 1);
+    let mut backlog = BacklogLedger::new(1);
+
+    backlog
+        .insert(BacklogEntry { token: first })
+        .expect("insert first");
+    assert_eq!(
+        backlog.insert(BacklogEntry { token: first }),
+        Err(BacklogError::Duplicate)
+    );
+    assert_eq!(
+        backlog.insert(BacklogEntry { token: second }),
+        Err(BacklogError::Capacity)
+    );
+    assert_eq!(backlog.len(), 1);
+    assert_eq!(backlog.peak_len(), 1);
+}
+
+#[test]
+fn repeated_cancel_requests_merge_and_abandon_wins() {
+    let target = token(0, 1);
+    let mut ledger = CancelReconcileLedger::new(1);
+    let first = ledger
+        .request(target, CancelMode::UserVisible)
+        .expect("first cancel");
+    let ticket = match first {
+        CancelSubmitOutcome::Submitted { ticket } => ticket,
+        _ => panic!("first cancel must submit"),
     };
-    use veloq_driver_core::{CancelMode, CancelTicket, Generation, OpToken};
 
-    fn token(index: usize, generation: u32) -> OpToken {
-        OpToken::from_registry_parts(index, Generation::new(generation)).expect("test token")
-    }
+    assert_eq!(
+        ledger.request(target, CancelMode::UserVisible),
+        Ok(CancelSubmitOutcome::AlreadyPending { ticket })
+    );
+    assert_eq!(
+        ledger.request(target, CancelMode::Abandon),
+        Ok(CancelSubmitOutcome::Merged { ticket })
+    );
+    assert_eq!(ledger.mode_for(target), Some(CancelMode::Abandon));
+    assert_eq!(ledger.pending_len(), 1);
+    assert_eq!(ledger.ticket_for(target), Some(ticket));
+}
 
-    fn user(index: usize, generation: u32) -> StageEntry {
-        StageEntry::User(token(index, generation))
-    }
+#[test]
+fn cancel_enoent_waits_for_same_batch_target_cqe_before_resolving() {
+    let target = token(0, 1);
+    let mut ledger = CancelReconcileLedger::new(1);
+    let ticket = match ledger.request(target, CancelMode::Abandon).expect("cancel") {
+        CancelSubmitOutcome::Submitted { ticket } => ticket,
+        _ => panic!("cancel must submit"),
+    };
+    ledger.ack_not_found(ticket).expect("ENOENT ack");
+    assert_eq!(
+        ledger.reconcile(ticket, false),
+        Ok(CancelReconcileOutcome::Deferred)
+    );
 
-    #[test]
-    fn consumed_receipt_advances_only_the_reported_prefix() {
-        let mut ledger = StagedLedger::new(3);
-        let first = token(0, 1);
-        let second = token(1, 1);
-        let third = token(2, 1);
-        ledger
-            .stage_batch(&[
-                StageEntry::User(first),
-                StageEntry::User(second),
-                StageEntry::User(third),
-            ])
-            .expect("stage batch");
+    assert!(ledger.observe_target_completion(target));
+    assert_eq!(
+        ledger.reconcile(ticket, true),
+        Ok(CancelReconcileOutcome::Resolved)
+    );
+    assert_eq!(ledger.pending_len(), 0);
+    assert!(!ledger.quarantined(target));
+}
 
-        ledger
-            .apply_receipt(SubmissionReceipt::consumed(3, 2))
-            .expect("partial receipt");
-
-        assert_eq!(ledger.phase_of(first), Some(StagePhase::KernelOutstanding));
-        assert_eq!(ledger.phase_of(second), Some(StagePhase::KernelOutstanding));
-        assert_eq!(ledger.phase_of(third), Some(StagePhase::Staged));
-    }
-
-    #[test]
-    fn zero_and_rejected_receipts_leave_staged_entries_retriable() {
-        let mut ledger = StagedLedger::new(2);
-        let first = token(0, 1);
-        let second = token(1, 1);
-        ledger.stage(user(0, 1)).expect("stage first");
-        ledger
-            .apply_receipt(SubmissionReceipt::no_entries(1))
-            .expect("zero receipt");
-        ledger
-            .apply_receipt(SubmissionReceipt::no_entries_wait(1))
-            .expect("timed wait receipt");
-        ledger
-            .apply_receipt(SubmissionReceipt::rejected(
-                1,
-                SubmissionError::KernelRejected,
-            ))
-            .expect("rejected receipt");
-        assert_eq!(ledger.phase_of(first), Some(StagePhase::Staged));
-
-        ledger.stage(user(1, 1)).expect("stage second");
-        assert_eq!(ledger.phase_of(second), Some(StagePhase::Staged));
-    }
-
-    #[test]
-    fn unknown_receipt_quarantines_entries_instead_of_retrying_them() {
-        let mut ledger = StagedLedger::new(2);
-        let first = token(0, 1);
-        ledger.stage(user(0, 1)).expect("stage first");
-
-        ledger
-            .apply_receipt(SubmissionReceipt::unknown(
-                1,
-                SubmissionError::ReceiptUnavailable,
-            ))
-            .expect("unknown receipt");
-
-        assert_eq!(ledger.phase_of(first), Some(StagePhase::Quarantined));
-        assert_eq!(ledger.quarantined_count(), 1);
-        assert_eq!(
-            ledger.stage(user(0, 1)),
-            Err(LedgerError::DuplicateToken(first))
-        );
-    }
-
-    #[test]
-    fn sqpoll_published_does_not_become_kernel_outstanding_before_cqe() {
-        let mut ledger = StagedLedger::new(1);
-        let first = token(0, 1);
-        ledger.stage(user(0, 1)).expect("stage first");
-
-        ledger
-            .apply_receipt(SubmissionReceipt::published(1, 1))
-            .expect("published receipt");
-
-        assert_eq!(ledger.phase_of(first), Some(StagePhase::Published));
-        ledger.settle_user_cqe(first).expect("published CQE");
-        assert_eq!(ledger.phase_of(first), None);
-    }
-
-    #[test]
-    fn stage_full_rolls_back_the_whole_batch_and_rejects_duplicate_tokens() {
-        let mut ledger = StagedLedger::new(1);
-        let first = token(0, 1);
-        ledger.stage(user(0, 1)).expect("stage first");
-        let before = ledger.snapshot();
-
-        assert_eq!(ledger.stage(user(1, 1)), Err(LedgerError::Capacity));
-        assert_eq!(ledger.snapshot(), before);
-
-        let mut duplicate_ledger = StagedLedger::new(2);
-        duplicate_ledger.stage(user(0, 1)).expect("stage first");
-        assert_eq!(
-            duplicate_ledger.stage(user(0, 1)),
-            Err(LedgerError::DuplicateToken(first))
-        );
-        assert_eq!(duplicate_ledger.snapshot().len(), 1);
-    }
-
-    #[test]
-    fn staged_control_entries_share_the_same_receipt_boundary() {
-        let target = token(0, 1);
-        let ticket = CancelTicket::try_new(1).expect("cancel ticket");
-        let mut ledger = StagedLedger::new(2);
-
-        ledger
-            .stage_batch(&[
-                StageEntry::Cancel { ticket, target },
-                StageEntry::Waker { generation: 1 },
-            ])
-            .expect("control entries should stage atomically");
-        ledger
-            .apply_receipt(SubmissionReceipt::consumed(2, 2))
-            .expect("control receipt");
-        assert_eq!(ledger.snapshot().len(), 2);
-    }
-
-    #[test]
-    fn backlog_remove_is_generation_safe_and_keeps_links_consistent() {
-        let first = token(1, 1);
-        let second = token(2, 1);
-        let replacement = token(1, 2);
-        let mut backlog = BacklogLedger::new(3);
-
-        backlog
-            .insert(BacklogEntry { token: first })
-            .expect("insert first");
-        backlog
-            .insert(BacklogEntry { token: second })
-            .expect("insert second");
-        assert_eq!(backlog.len(), 2);
-        assert_eq!(backlog.peak_len(), 2);
-        assert_eq!(
-            backlog.remove(replacement),
-            Err(BacklogError::GenerationMismatch)
-        );
-        assert_eq!(backlog.remove(first).expect("remove first").token, first);
-        assert_eq!(backlog.pop_front().expect("pop second").token, second);
-        assert_eq!(backlog.len(), 0);
-
-        backlog
-            .insert(BacklogEntry { token: replacement })
-            .expect("reuse index with new generation");
-        assert_eq!(
-            backlog.pop_front().expect("pop replacement").token,
-            replacement
-        );
-    }
-
-    #[test]
-    fn backlog_capacity_is_fixed_and_duplicate_entries_do_not_grow_it() {
-        let first = token(0, 1);
-        let second = token(1, 1);
-        let mut backlog = BacklogLedger::new(1);
-
-        backlog
-            .insert(BacklogEntry { token: first })
-            .expect("insert first");
-        assert_eq!(
-            backlog.insert(BacklogEntry { token: first }),
-            Err(BacklogError::Duplicate)
-        );
-        assert_eq!(
-            backlog.insert(BacklogEntry { token: second }),
-            Err(BacklogError::Capacity)
-        );
-        assert_eq!(backlog.len(), 1);
-        assert_eq!(backlog.peak_len(), 1);
-    }
-
-    #[test]
-    fn repeated_cancel_requests_merge_and_abandon_wins() {
-        let target = token(0, 1);
-        let mut ledger = CancelReconcileLedger::new(1);
-        let first = ledger
-            .request(target, CancelMode::UserVisible)
-            .expect("first cancel");
-        let ticket = match first {
-            CancelSubmitOutcome::Submitted { ticket } => ticket,
-            _ => panic!("first cancel must submit"),
-        };
-
-        assert_eq!(
-            ledger.request(target, CancelMode::UserVisible),
-            Ok(CancelSubmitOutcome::AlreadyPending { ticket })
-        );
-        assert_eq!(
-            ledger.request(target, CancelMode::Abandon),
-            Ok(CancelSubmitOutcome::Merged { ticket })
-        );
-        assert_eq!(ledger.mode_for(target), Some(CancelMode::Abandon));
-        assert_eq!(ledger.pending_len(), 1);
-        assert_eq!(ledger.ticket_for(target), Some(ticket));
-    }
-
-    #[test]
-    fn cancel_enoent_waits_for_same_batch_target_cqe_before_resolving() {
-        let target = token(0, 1);
-        let mut ledger = CancelReconcileLedger::new(1);
-        let ticket = match ledger.request(target, CancelMode::Abandon).expect("cancel") {
-            CancelSubmitOutcome::Submitted { ticket } => ticket,
-            _ => panic!("cancel must submit"),
-        };
-        ledger.ack_not_found(ticket).expect("ENOENT ack");
-        assert_eq!(
-            ledger.reconcile(ticket, false),
-            Ok(CancelReconcileOutcome::Deferred)
-        );
-
-        assert!(ledger.observe_target_completion(target));
-        assert_eq!(
-            ledger.reconcile(ticket, true),
-            Ok(CancelReconcileOutcome::Resolved)
-        );
-        assert_eq!(ledger.pending_len(), 0);
-        assert!(!ledger.quarantined(target));
-    }
-
-    #[test]
-    fn cancel_enoent_defers_across_drives_then_quarantines_and_accepts_late_cqe() {
-        let target = token(0, 1);
-        let mut ledger = CancelReconcileLedger::new(1);
-        let ticket = match ledger
-            .request(target, CancelMode::UserVisible)
-            .expect("cancel")
-        {
-            CancelSubmitOutcome::Submitted { ticket } => ticket,
-            _ => panic!("cancel must submit"),
-        };
-        ledger.ack_not_found(ticket).expect("ENOENT ack");
-        assert_eq!(
-            ledger.reconcile(ticket, false),
-            Ok(CancelReconcileOutcome::Deferred)
-        );
-        assert_eq!(
-            ledger.reconcile(ticket, true),
-            Ok(CancelReconcileOutcome::Quarantined)
-        );
-        assert!(ledger.quarantined(target));
-        assert_eq!(ledger.pending_len(), 0);
-        assert!(ledger.settle_late_target_completion(target));
-        assert!(!ledger.quarantined(target));
-    }
+#[test]
+fn cancel_enoent_defers_across_drives_then_quarantines_and_accepts_late_cqe() {
+    let target = token(0, 1);
+    let mut ledger = CancelReconcileLedger::new(1);
+    let ticket = match ledger
+        .request(target, CancelMode::UserVisible)
+        .expect("cancel")
+    {
+        CancelSubmitOutcome::Submitted { ticket } => ticket,
+        _ => panic!("cancel must submit"),
+    };
+    ledger.ack_not_found(ticket).expect("ENOENT ack");
+    assert_eq!(
+        ledger.reconcile(ticket, false),
+        Ok(CancelReconcileOutcome::Deferred)
+    );
+    assert_eq!(
+        ledger.reconcile(ticket, true),
+        Ok(CancelReconcileOutcome::Quarantined)
+    );
+    assert!(ledger.quarantined(target));
+    assert_eq!(ledger.pending_len(), 0);
+    assert!(ledger.settle_late_target_completion(target));
+    assert!(!ledger.quarantined(target));
 }

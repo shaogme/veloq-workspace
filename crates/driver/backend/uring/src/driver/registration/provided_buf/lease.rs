@@ -33,6 +33,21 @@ pub(crate) enum ProvidedBufLeaseAction {
     Quarantine,
 }
 
+/// The exclusive owner of a CQE-selected provided buffer.
+///
+/// The lease deliberately owns the [`FixedBuf`] instead of retaining only a bid. A bid is not
+/// enough to reconstruct a datagram after the kernel has removed it from the ring.
+/// lease 独占持有 CQE 选中的 `FixedBuf`；仅记录 bid 无法在内核将其移出 ring 后重建数据报。
+pub(crate) struct ProvidedBufLease {
+    group_id: u16,
+    bid: u16,
+    publish_seq: u64,
+    buf: Option<FixedBuf>,
+    len: usize,
+    phase: ProvidedBufLeasePhase,
+    user_buffer_taken: bool,
+}
+
 /// Completion-side command port for the provided-buffer owner.
 /// 完成处理侧的 provided-buffer 命令端口。
 pub(crate) struct ProvidedBufPort<'a> {
@@ -92,21 +107,6 @@ impl<'a> ProvidedBufPort<'a> {
     pub(crate) fn note_exhausted(&mut self) {
         self.group.note_exhausted();
     }
-}
-
-/// The exclusive owner of a CQE-selected provided buffer.
-///
-/// The lease deliberately owns the [`FixedBuf`] instead of retaining only a bid. A bid is not
-/// enough to reconstruct a datagram after the kernel has removed it from the ring.
-/// lease 独占持有 CQE 选中的 `FixedBuf`；仅记录 bid 无法在内核将其移出 ring 后重建数据报。
-pub(crate) struct ProvidedBufLease {
-    group_id: u16,
-    bid: u16,
-    publish_seq: u64,
-    buf: Option<FixedBuf>,
-    len: usize,
-    phase: ProvidedBufLeasePhase,
-    user_buffer_taken: bool,
 }
 
 /// Ownership carrier for a failed unregister attempt.

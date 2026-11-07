@@ -9,16 +9,16 @@
 //! pending ledger 中，直到 output buffer 和 permit 都可用。
 //! This module owns the provided-buffer ring. A selected BID stays in an explicit lease until settlement; TCP may replace it after delivery, while UDP can retain it in a bounded pending ledger.
 
-use veloq_std::{boxed::Box, collections::BitSet, io, mem, num::NonZeroUsize, vec::Vec};
-
-use tracing::warn;
-use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
-use veloq_io_uring::{Submitter, cqueue, types::BufRingItem};
-
 mod lease;
 mod lifetime;
 mod publication;
 mod snapshot;
+
+use libc::EIO;
+use tracing::{error, warn};
+use veloq_buf::{AnyBufPool, BufPool, FixedBuf};
+use veloq_io_uring::{Submitter, cqueue, types::BufRingItem};
+use veloq_std::{boxed::Box, collections::BitSet, io, mem, num::NonZeroUsize, vec::Vec};
 
 pub(crate) use lease::{
     ProvidedBufInitializationResult, ProvidedBufLease, ProvidedBufLeaseAction,
@@ -26,8 +26,6 @@ pub(crate) use lease::{
     ProvidedBufUnregisterResult,
 };
 use lifetime::RingMappingOwner;
-#[cfg(test)]
-use lifetime::RingMappingOwnerState;
 pub(crate) use lifetime::{PROVIDED_BUF_GROUP_ID, RingLifetimeOwner, RingLifetimeToken};
 use publication::{
     ProvidedBufBidAnomaly, ProvidedBufBidState, ProvidedBufGroupHealth,
@@ -42,6 +40,9 @@ use crate::{
     driver::env::ProvidedBufSqeInfo,
     error::{UringError, UringResult},
 };
+
+#[cfg(test)]
+use lifetime::RingMappingOwnerState;
 
 pub(crate) struct ProvidedBufGroup {
     bgid: u16,
@@ -104,7 +105,7 @@ impl ProvidedBufGroup {
             unregister: |bgid| {
                 submitter
                     .unregister_buf_ring(bgid)
-                    .map_err(|err| err.raw_os_error().unwrap_or(libc::EIO))
+                    .map_err(|err| err.raw_os_error().unwrap_or(EIO))
             },
         })
     }
@@ -131,7 +132,7 @@ impl ProvidedBufGroup {
             publication: ProvidedBufPublication::new(entries),
             selected_bids: BitSet::new(entries as usize),
             selected_bid_count: 0,
-            buf_size: config.buf_size,
+            buf_size: config.buf_size(),
             pool,
             stats: ProvidedBufStats::default(),
             bid_anomalies: 0,
@@ -292,7 +293,7 @@ impl ProvidedBufGroup {
         self.try_unregister_with(|bgid| {
             submitter
                 .unregister_buf_ring(bgid)
-                .map_err(|err| err.raw_os_error().unwrap_or(libc::EIO))
+                .map_err(|err| err.raw_os_error().unwrap_or(EIO))
         })
     }
 
@@ -894,7 +895,7 @@ impl Drop for ProvidedBufGroup {
             // 安全性：注销已成功或所属 io_uring fd 已关闭，内核不再可能解引用这些 buffer owner。
             unsafe { mem::ManuallyDrop::drop(&mut self.bufs) };
         } else {
-            tracing::error!(
+            error!(
                 state = ?self.registration_state,
                 "provided buffer owners may still be referenced; leaking owners as a safety fallback"
             );
@@ -955,17 +956,28 @@ impl ProvidedBufGroup {
 
 #[cfg(test)]
 mod tests {
+    use libc::EIO;
+    use veloq_buf::{BufPool, FixedBuf};
     use veloq_io_uring::{IoUring, types::BufRingItem};
 
     use super::{
-        AnyBufPool, PROVIDED_BUF_GROUP_ID, ProvidedBufConfig, ProvidedBufGroup,
-        ProvidedBufInitializationParams, ProvidedBufPublication, RingLifetimeToken,
-        RingMappingOwner, TestPool,
+        AnyBufPool, PROVIDED_BUF_GROUP_ID, ProvidedBufBidState, ProvidedBufConfig,
+        ProvidedBufGroup, ProvidedBufInitializationParams, ProvidedBufLeaseAction,
+        ProvidedBufPublication, RingLifetimeToken, RingMappingOwner,
     };
     use veloq_std::{
         io,
         num::{NonZeroU16, NonZeroUsize},
     };
+
+    #[derive(Debug, Clone)]
+    struct TestPool;
+
+    impl BufPool for TestPool {
+        fn alloc(&self, cap: NonZeroUsize, len: usize) -> Option<FixedBuf> {
+            FixedBuf::alloc_heap(cap, len).ok()
+        }
+    }
 
     #[test]
     fn failed_unregister_returns_the_group_and_keeps_resources_alive() {
@@ -978,7 +990,7 @@ mod tests {
 
         let failure = match group.try_unregister_with(|bgid| {
             assert_eq!(bgid, PROVIDED_BUF_GROUP_ID);
-            Err(libc::EIO)
+            Err(EIO)
         }) {
             Ok(()) => panic!("injected unregister must fail"),
             Err(failure) => failure,
@@ -988,7 +1000,7 @@ mod tests {
             report
                 .error_code()
                 .and_then(|code| i32::try_from(code).ok()),
-            Some(libc::EIO)
+            Some(EIO)
         );
 
         let mut group = group;
@@ -1022,10 +1034,10 @@ mod tests {
             Err(_) => return,
         };
         let submitter = ring.submitter();
-        let config = ProvidedBufConfig {
-            entries: NonZeroU16::new(2).expect("test entries are non-zero"),
-            buf_size: NonZeroUsize::new(64).expect("test buffer size is non-zero"),
-        };
+        let config = ProvidedBufConfig::new(
+            NonZeroU16::new(2).expect("test entries are non-zero"),
+            NonZeroUsize::new(64).expect("test buffer size is non-zero"),
+        );
 
         let result = ProvidedBufPublication::initialize(ProvidedBufInitializationParams {
             submitter: &submitter,
@@ -1051,10 +1063,10 @@ mod tests {
             Err(_) => return,
         };
         let submitter = ring.submitter();
-        let config = ProvidedBufConfig {
-            entries: NonZeroU16::new(2).expect("test entries are non-zero"),
-            buf_size: NonZeroUsize::new(64).expect("test buffer size is non-zero"),
-        };
+        let config = ProvidedBufConfig::new(
+            NonZeroU16::new(2).expect("test entries are non-zero"),
+            NonZeroUsize::new(64).expect("test buffer size is non-zero"),
+        );
         let result = ProvidedBufPublication::initialize(ProvidedBufInitializationParams {
             submitter: &submitter,
             config,
@@ -1062,9 +1074,9 @@ mod tests {
             ring_lifetime_token: RingLifetimeToken::standalone(),
             allocate: |group: &ProvidedBufGroup| group.alloc_buf(),
             publish: |_: &mut RingMappingOwner, _: &[BufRingItem]| {
-                Err(io::Error::from_raw_os_error(libc::EIO))
+                Err(io::Error::from_raw_os_error(EIO))
             },
-            unregister: |_| Err(libc::EIO),
+            unregister: |_| Err(EIO),
         });
 
         let failure = match result {
@@ -1076,7 +1088,7 @@ mod tests {
             report
                 .error_code()
                 .and_then(|code| i32::try_from(code).ok()),
-            Some(libc::EIO)
+            Some(EIO)
         );
         let mut group = group.expect("failed unregister must retain the registered group");
         assert_eq!(
@@ -1120,7 +1132,7 @@ mod tests {
             return;
         }
 
-        let failure = match group.try_unregister_with(|_| Err(libc::EIO)) {
+        let failure = match group.try_unregister_with(|_| Err(EIO)) {
             Ok(()) => panic!("injected unregister must fail"),
             Err(failure) => failure,
         };
@@ -1230,7 +1242,7 @@ mod tests {
         let mut group = group;
 
         group
-            .settle_selected_lease(&mut lease, super::ProvidedBufLeaseAction::Republish)
+            .settle_selected_lease(&mut lease, ProvidedBufLeaseAction::Republish)
             .expect("republish settlement must succeed");
         assert_eq!(lease.phase(), super::ProvidedBufLeasePhase::Settled);
         assert_eq!(group.stats().available(), before.available());
@@ -1268,7 +1280,7 @@ mod tests {
         assert_eq!(group.stats().pending_udp_leases(), 0);
         assert_eq!(group.stats().delivery_leases(), 1);
         group
-            .settle_selected_lease(&mut lease, super::ProvidedBufLeaseAction::Quarantine)
+            .settle_selected_lease(&mut lease, ProvidedBufLeaseAction::Quarantine)
             .expect("quarantine settlement must be single-shot");
         assert_eq!(lease.phase(), super::ProvidedBufLeasePhase::Quarantined);
         assert_eq!(group.stats().selected_leases(), 0);
@@ -1281,7 +1293,7 @@ mod tests {
         let mut group = ProvidedBufGroup::for_test(4);
         for bid in [0, 1] {
             drop(group.bufs[bid].take());
-            group.set_bid_state(bid as u16, super::ProvidedBufBidState::Vacant);
+            group.set_bid_state(bid as u16, ProvidedBufBidState::Vacant);
             group.note_consumed();
             group.queue_vacant(bid as u16);
             group.queue_vacant(bid as u16);

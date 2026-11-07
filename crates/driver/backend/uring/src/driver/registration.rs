@@ -1,8 +1,15 @@
-pub(crate) use self::file_registration::{
-    FileRegistrationBatch, FileRegistrationRequest, FileUpdateTxn,
+mod buffer;
+mod file_registration;
+mod file_table;
+mod files;
+mod provided_buf;
+mod update;
+
+pub(crate) use self::{
+    file_registration::{FileRegistrationBatch, FileRegistrationRequest, FileUpdateTxn},
+    files::RegistrationPorts,
 };
-use self::files::FixedFileOwner;
-pub(crate) use self::files::RegistrationPorts;
+use files::FixedFileOwner;
 
 use crate::{
     config::{
@@ -11,26 +18,17 @@ use crate::{
     diagnostics::UringCompletionDiagnostics,
     driver::env::{ProvidedBufSqeInfo, SubmitEnvironmentFactory, SubmitResourceView},
     error::{UringError, UringResult},
-    op::{CheckedSlotView, SlotView, UringOpRegistry, UringOpRegistryExt},
+    op::UringOpRegistry,
 };
 use diagweave::prelude::*;
+use tracing::debug;
 use veloq_buf::{AnyBufPool, BufferRegistrationRequest, LockedMemoryBudget};
-use veloq_driver_core::{BufferRegistrationStatus, OpToken, RegisterFd};
+use veloq_driver_core::{
+    BufferRegistrationStatus, CheckedSlotView, OpToken, RegisterFd,
+    SlotRegistryExt as UringOpRegistryExt, SlotView,
+};
 use veloq_io_uring::{KernelCapabilities, ResourceRegistration, Submitter};
 use veloq_std::{time::Duration, vec::Vec};
-
-#[cfg(feature = "test-hooks")]
-use veloq_buf::heap::ChunkId;
-
-#[cfg(feature = "test-hooks")]
-use veloq_driver_core::test_hooks::RegisterFilesUpdateOutcome;
-
-mod buffer;
-mod file_registration;
-mod file_table;
-mod files;
-mod provided_buf;
-mod update;
 
 pub(crate) use buffer::{
     ChunkRegistrationRecord, ChunkRegistrationState, FixedBufferOwner, FixedBufferSubmitPort,
@@ -47,11 +45,10 @@ pub(crate) use provided_buf::{
 };
 pub(crate) use update::{KernelUpdateOutcome, UpdateEvidence, UringRegistrationStats};
 
-pub(crate) struct RegistrationEngine<'a> {
-    fixed_buffers: FixedBufferOwner<'a>,
-    provided_buffers: ProvidedBufferOwner,
-    files: FixedFileOwner,
-}
+#[cfg(feature = "test-hooks")]
+use veloq_buf::heap::ChunkId;
+#[cfg(feature = "test-hooks")]
+use veloq_driver_core::test_hooks::RegisterFilesUpdateOutcome;
 
 /// Owns the optional provided-buffer ring independently from fixed-buffer bookkeeping.
 ///
@@ -63,6 +60,12 @@ pub(crate) struct ProvidedBufferOwner {
     config: Option<ProvidedBufConfig>,
     group: Option<ProvidedBufGroup>,
     failure_errno: Option<i32>,
+}
+
+pub(crate) struct RegistrationEngine<'a> {
+    fixed_buffers: FixedBufferOwner<'a>,
+    provided_buffers: ProvidedBufferOwner,
+    files: FixedFileOwner,
 }
 
 impl ProvidedBufferOwner {
@@ -125,7 +128,7 @@ impl ProvidedBufferOwner {
                 self.failure_errno = report
                     .error_code()
                     .and_then(|code| i32::try_from(code).ok());
-                tracing::debug!(
+                debug!(
                     report = ?report,
                     "provided buffer ring unavailable; continuing without it"
                 );
@@ -258,7 +261,7 @@ impl<'a> RegistrationEngine<'a> {
             selected_bids: self.provided_buffers.has_selected_bids(),
         };
         if !state.is_quiescent() {
-            tracing::debug!(
+            debug!(
                 active_operations = state.active_operations(),
                 armed_provided_multishot = state.armed_provided_multishot(),
                 pending_completions = state.pending_completions(),
@@ -469,6 +472,9 @@ mod tests {
     use super::{FileRegistrationBatch, KernelUpdateOutcome, UpdateEvidence};
     use veloq_std::{vec, vec::Vec};
 
+    #[cfg(feature = "test-hooks")]
+    use libc::EIO;
+
     /// Walks `slots` the way `install_claimed_files` does, collecting one run per syscall.
     /// 按 `install_claimed_files` 的方式遍历 `slots`，为每次系统调用收集一个连续区间。
     fn runs(slots: &[u32]) -> Vec<&[u32]> {
@@ -512,8 +518,8 @@ mod tests {
     #[test]
     fn rejected_and_unknown_updates_do_not_claim_applied_entries() {
         for outcome in [
-            KernelUpdateOutcome::Rejected(libc::EIO),
-            KernelUpdateOutcome::Unknown(Some(libc::EIO), "test evidence"),
+            KernelUpdateOutcome::Rejected(EIO),
+            KernelUpdateOutcome::Unknown(Some(EIO), "test evidence"),
         ] {
             let evidence = UpdateEvidence::new(1, outcome);
             assert_eq!(evidence.updated(), None);

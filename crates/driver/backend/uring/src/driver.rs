@@ -1,13 +1,23 @@
+mod completion;
+mod context;
+mod control;
+mod drive;
+mod env;
+mod lifecycle;
+mod operation;
+mod registration;
+mod submission;
+
+#[cfg(test)]
+mod tests;
+
 use diagweave::prelude::*;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 use veloq_buf::{AnyBufPool, BufferRegistrationRequest};
 use veloq_io_uring::{
     IoUring, KernelCapabilities, ResourceLayout, RingConfig, SetupFlags, SetupPolicy,
 };
 use veloq_std::{format, io, sync::Arc, vec::Vec};
-
-#[cfg(feature = "test-hooks")]
-use veloq_buf::heap::ChunkId;
 
 use crate::{
     config::{IoFd, IoMode, UringConfig, UringRawHandle},
@@ -37,31 +47,19 @@ use veloq_driver_core::{
     UdpReceiveOperationBuilder, UdpRecvMulti, sealed,
 };
 
-#[cfg(feature = "test-hooks")]
-use veloq_std::string::String;
-
-#[cfg(feature = "test-hooks")]
-use veloq_driver_core::{test_hooks::DriverTestHooks, test_hooks::RegisterFilesUpdateOutcome};
-
-mod completion;
-mod context;
-mod control;
-mod drive;
-mod env;
-mod lifecycle;
-mod operation;
-mod registration;
-mod submission;
-
-#[cfg(test)]
-mod tests;
-
 pub(crate) use env::{CqeEnv, SqeEnv};
 pub use lifecycle::UringOpState;
 pub use registration::ProvidedBufferSnapshot;
 pub(crate) use registration::{
     FileTable, ProvidedBufLease, ProvidedBufLeaseAction, RegisteredFileEntry, SqeFd,
 };
+
+#[cfg(feature = "test-hooks")]
+use veloq_buf::heap::ChunkId;
+#[cfg(feature = "test-hooks")]
+use veloq_driver_core::test_hooks::{DriverTestHooks, RegisterFilesUpdateOutcome};
+#[cfg(feature = "test-hooks")]
+use veloq_std::string::String;
 
 fn setup_report(
     kind: UringError,
@@ -182,11 +180,11 @@ impl<'a> UringDriver<'a> {
             lifecycle: LifecycleEngine::new(),
             completion: CompletionEngine::with_capacity(
                 drive_limits
-                    .max_cqe_batch
-                    .max(drive_limits.emergency_drain_limit),
+                    .max_cqe_batch()
+                    .max(drive_limits.emergency_drain_limit()),
                 drive_limits
-                    .max_cqe_batch
-                    .max(drive_limits.emergency_drain_limit)
+                    .max_cqe_batch()
+                    .max(drive_limits.emergency_drain_limit())
                     .saturating_mul(4)
                     .saturating_add(8),
                 drive_limits,
@@ -224,7 +222,7 @@ impl<'a> UringDriver<'a> {
                         errno,
                     );
                 driver.registration.set_fixed_buffers_unavailable(errno);
-                tracing::warn!(
+                warn!(
                     errno = ?errno,
                     fixed_buffers_available = false,
                     error = %e,
@@ -287,7 +285,7 @@ impl RingShutdown {
     fn run<'a>(driver: &mut UringDriver<'a>) {
         let has_provided_buffers = driver.registration.has_provided_buffers();
         if driver.operations.has_active_ops() {
-            tracing::warn!("UringDriver dropped with active in-flight operations");
+            warn!("UringDriver dropped with active in-flight operations");
         }
         if !has_provided_buffers {
             driver
@@ -314,7 +312,7 @@ impl RingShutdown {
                     .registration
                     .release_provided_buffers(&driver.ring.submitter())
                 {
-                    tracing::warn!(
+                    warn!(
                         bgid = PROVIDED_BUF_GROUP_ID,
                         report = ?report,
                         "failed to unregister provided buffer ring; retaining it until io_uring drops"
@@ -325,7 +323,7 @@ impl RingShutdown {
                     .completion_diagnostics
                     .backend()
                     .inc_provided_drop_deferred_unregister();
-                tracing::warn!(
+                warn!(
                     active_operations = quiesce.active_operations(),
                     armed_provided_multishot = quiesce.armed_provided_multishot(),
                     pending_completions = quiesce.pending_completions(),
@@ -336,7 +334,7 @@ impl RingShutdown {
         }
         let outstanding_cancel_tickets = driver.control.cancel_in_flight_len();
         if outstanding_cancel_tickets != 0 {
-            tracing::warn!(
+            warn!(
                 count = outstanding_cancel_tickets,
                 "UringDriver dropped with outstanding cancel tickets"
             );
@@ -409,7 +407,9 @@ impl<'a> UdpReceiveOperationBuilder for UringDriver<'a> {
 
 impl<'a> DriverRaw for UringDriver<'a> {
     type SlotSpec = UringSlotSpec;
+
     type Raw = UringRawHandle;
+
     const BACKEND_NAME: &'static str = "io_uring";
 
     fn reserve_op_raw(&mut self) -> UringResult<OpToken> {

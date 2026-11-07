@@ -16,8 +16,9 @@ use crate::{
         registration::RegistrationPorts,
     },
     error::{UringError, UringResult},
-    op::{CheckedSlotView, RecordPolicy, SlotView, UringOpRegistryExt},
+    op::RecordPolicy,
 };
+use veloq_driver_core::{CheckedSlotView, SlotRegistryExt as UringOpRegistryExt, SlotView};
 
 pub(crate) struct CompletionEffectExecutor;
 
@@ -330,7 +331,7 @@ impl CompletionEffectExecutor {
         collector_exhausted: bool,
         first_error: &mut Option<Report<UringError>>,
     ) {
-        let timeout = completion.drive_limits().cancel_reconcile_timeout;
+        let timeout = completion.drive_limits().cancel_reconcile_timeout();
         let mut index = 0;
         while index < ports.control.deferred_cancel_reconciles().len() {
             let entry = ports.control.deferred_cancel_reconciles()[index];

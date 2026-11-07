@@ -6,14 +6,16 @@ use crate::{
         env::StageResult,
         submission::SlotAccessReporter,
     },
-    error::{UringError, UringResult, uring_report_to_event_res},
-    op::{CheckedSlotView, Slot, SlotState, SlotView, UringOpRegistryExt},
+    error::{UringError, UringResult},
+    op::Slot,
 };
 use diagweave::prelude::*;
+use libc::ECANCELED;
 use tracing::{debug, trace};
 use veloq_driver_core::{
     AnomalyAttach, CancelMode, CancelRequest, CancelSubmitOutcome, CancelTargetGoneReason,
-    CancelTicket, CompletionAnomalyKind, CompletionBackend, CompletionToken, OpToken,
+    CancelTicket, CheckedSlotView, CompletionAnomalyKind, CompletionBackend, CompletionToken,
+    OpToken, SlotMarker as SlotState, SlotRegistryExt as UringOpRegistryExt, SlotView,
     UserCompletionEvent,
 };
 use veloq_io_uring::opcode;
@@ -39,6 +41,14 @@ pub(crate) enum LifecycleCompletionAction {
         kind: CompletionAnomalyKind,
         attach: AnomalyAttach,
     },
+}
+
+pub(crate) enum BacklogAction {
+    SubmitReserved(OpToken),
+    SubmitQueued(OpToken),
+    CancelQueued(OpToken),
+    CancelKernel(OpToken),
+    Drop,
 }
 
 pub(crate) struct LifecycleEngine {
@@ -123,14 +133,6 @@ pub(crate) struct BacklogProgress {
     submitted: usize,
     synthetic: usize,
     still_full: bool,
-}
-
-pub(crate) enum BacklogAction {
-    SubmitReserved(OpToken),
-    SubmitQueued(OpToken),
-    CancelQueued(OpToken),
-    CancelKernel(OpToken),
-    Drop,
 }
 
 impl BacklogProgress {
@@ -312,7 +314,7 @@ impl LifecycleEngine {
         mode: CancelMode,
     ) -> UringResult<()> {
         context.diagnostics().backend().inc_cancel_local_completed();
-        let event = UserCompletionEvent::from_parts(COMP_BACKEND_URING, token, -libc::ECANCELED, 0);
+        let event = UserCompletionEvent::from_parts(COMP_BACKEND_URING, token, -ECANCELED, 0);
         self.completion_actions
             .push(LifecycleCompletionAction::SyntheticCancel { event, mode });
         Ok(())
@@ -638,7 +640,7 @@ impl LifecycleEngine {
         token: OpToken,
         report: Report<UringError>,
     ) -> UringResult<()> {
-        let event_res = uring_report_to_event_res(&report);
+        let event_res = UringError::report_to_event_res(&report);
         let event = UserCompletionEvent::from_parts(COMP_BACKEND_URING, token, event_res, 0);
         self.completion_actions
             .push(LifecycleCompletionAction::SyntheticSubmissionFailure { event, report });

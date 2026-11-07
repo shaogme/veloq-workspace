@@ -3,7 +3,7 @@ use crate::{
     error::{UringError, UringResult},
 };
 use diagweave::prelude::*;
-use libc::{eventfd, write};
+use libc::{EAGAIN, EFD_CLOEXEC, EFD_NONBLOCK, EIO, eventfd, write};
 use veloq_driver_core::RemoteWaker;
 use veloq_std::{
     boxed::Box,
@@ -128,13 +128,13 @@ impl UringWaker {
         let ret = unsafe { write(fd.raw().as_fd(), buf.as_ptr() as *const _, 8) };
         if ret < 0 {
             let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EAGAIN) {
+            if err.raw_os_error() == Some(EAGAIN) {
                 return Ok(());
             }
             return Err(UringError::Internal
                 .to_report()
                 .push_ctx("scope", "uring.driver.waker.wake")
-                .set_error_code(err.raw_os_error().unwrap_or(libc::EIO))
+                .set_error_code(err.raw_os_error().unwrap_or(EIO))
                 .attach_note(err.to_string()));
         }
         if ret != 8 {
@@ -224,7 +224,7 @@ impl UringWakerManager {
     }
 
     pub(crate) fn create_event_fd(scope: &'static str) -> UringResult<Arc<EventFd>> {
-        let fd = unsafe { eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        let fd = unsafe { eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK) };
         if fd < 0 {
             return Err(UringError::DriverInit.io_report(scope, io::Error::last_os_error()));
         }

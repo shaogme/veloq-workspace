@@ -2,11 +2,10 @@ use crate::{
     driver::{
         control::{
             BacklogEntry, BacklogError, CancelIntentError, CancelRequestDisposition,
-            DeferredCancelReconcile, PendingCancel, StagedLedger, StagedLedgerError,
-            SubmissionBacklog, UringCancelManager, UringPostCompletionEffects, UringTimerWheel,
-            UringWakerManager,
+            ControlPlaneEvent, ControlPlaneObserver, DeferredCancelReconcile, PendingCancel,
+            StagedLedger, StagedLedgerError, SubmissionBacklog, UringCancelManager,
+            UringPostCompletionEffects, UringTimerWheel, UringWakerManager,
         },
-        control::{ControlPlaneEvent, ControlPlaneObserver},
         env::{
             CompletionControlParts, CompletionControlView, CompletionLedgerParts,
             CompletionMetadata, SubmissionControlParts, SubmissionLedgerParts,
@@ -27,10 +26,7 @@ use veloq_std::{
 use veloq_wheel::TimerId;
 
 #[cfg(test)]
-use crate::driver::control::StagedEntry;
-
-#[cfg(test)]
-use crate::driver::control::{UringControlEffect, UringControlEffectKind};
+use crate::driver::control::{StagedEntry, UringControlEffect, UringControlEffectKind};
 
 /// The single owner of uring's backend control-plane state.
 /// 该类型集中拥有 uring 后端控制面状态。
@@ -540,11 +536,13 @@ mod tests {
         SubmissionBacklog, UringControlEffect, UringControlEffectKind, UringControlPlane,
         UringPostCompletionEffects, UringWakerManager,
     };
-    use crate::config::IoFd;
-    use crate::driver::{
-        control::{ControlPlaneEvent, PendingCancel},
-        lifecycle::CancellationPhase,
-        registration::OwnedFdOwnershipTicket,
+    use crate::{
+        config::IoFd,
+        driver::{
+            control::{ControlPlaneEvent, PendingCancel},
+            lifecycle::CancellationPhase,
+            registration::OwnedFdOwnershipTicket,
+        },
     };
     use veloq_driver_core::{CancelMode, CancelTicket, CompletionToken, Generation, OpToken};
     use veloq_std::{vec, vec::Vec};

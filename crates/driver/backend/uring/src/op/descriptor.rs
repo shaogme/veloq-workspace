@@ -8,17 +8,16 @@ use veloq_io_uring::squeue;
 use veloq_std::time::Duration;
 
 use super::{
-    UringKernelPayloadStorage, UringSlotSpec, UringUserPayload,
+    SubmissionStrategy, UringKernelPayloadStorage, UringSlotSpec, UringUserPayload,
     spec::{UringOpSpec, UringOperationDescriptor},
 };
 
-#[allow(clippy::large_enum_variant)]
-pub(crate) enum UringRecordItem {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UringRecordItemKind {
     UseSubmitPayload,
     Ignored,
-    New(UringUserPayload),
+    New,
     NewWithRearm {
-        item: UringUserPayload,
         logical_receiver_generation: u32,
     },
     /// The CQE was consumed, but the logical UDP receiver remains addressable and owns its
@@ -26,6 +25,60 @@ pub(crate) enum UringRecordItem {
     Retained {
         logical_receiver_generation: Option<u32>,
     },
+}
+
+pub(crate) struct UringRecordItem {
+    kind: UringRecordItemKind,
+    item: Option<UringUserPayload>,
+}
+
+impl UringRecordItem {
+    pub(crate) const fn use_submit_payload() -> Self {
+        Self {
+            kind: UringRecordItemKind::UseSubmitPayload,
+            item: None,
+        }
+    }
+
+    pub(crate) const fn ignored() -> Self {
+        Self {
+            kind: UringRecordItemKind::Ignored,
+            item: None,
+        }
+    }
+
+    pub(crate) fn new(item: UringUserPayload) -> Self {
+        Self {
+            kind: UringRecordItemKind::New,
+            item: Some(item),
+        }
+    }
+
+    pub(crate) fn new_with_rearm(item: UringUserPayload, logical_receiver_generation: u32) -> Self {
+        Self {
+            kind: UringRecordItemKind::NewWithRearm {
+                logical_receiver_generation,
+            },
+            item: Some(item),
+        }
+    }
+
+    pub(crate) const fn retained(logical_receiver_generation: Option<u32>) -> Self {
+        Self {
+            kind: UringRecordItemKind::Retained {
+                logical_receiver_generation,
+            },
+            item: None,
+        }
+    }
+
+    pub(crate) const fn kind(&self) -> UringRecordItemKind {
+        self.kind
+    }
+
+    pub(crate) fn into_item(self) -> Option<UringUserPayload> {
+        self.item
+    }
 }
 
 /// 描述一次完成是单发还是会继续产生完成。
@@ -87,7 +140,7 @@ pub(crate) type ReceiveGenerationFn =
 /// 所有运行时 dispatch 都从同一个 descriptor 入口读取。
 pub(crate) struct ErasedOperationDescriptor {
     pub(crate) name: &'static str,
-    pub(crate) strategy: super::SubmissionStrategy,
+    pub(crate) strategy: SubmissionStrategy,
     pub(crate) cardinality: CompletionCardinality,
     pub(crate) record_policy: RecordPolicy,
     pub(crate) make_sqe: MakeSqeFn,
@@ -103,6 +156,7 @@ pub(crate) struct ErasedOperationDescriptor {
 }
 
 pub(crate) type NewKernelFn<S> = fn(&S) -> <S as UringOpSpec>::KernelPayload;
+
 /// 一个 operation 的完整静态描述。
 ///
 /// 所有字段均由 `declare_uring_operations!` 的单一 row 生成。typed 字段保留 Rust 关联

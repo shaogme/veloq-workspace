@@ -6,13 +6,13 @@ use crate::{
         submission::ResolvedSqe,
     },
     error::{UringError, UringResult},
-    op::{Reserved, Slot, SubmissionStrategy, UringSlotSpec},
+    op::{Slot, SubmissionStrategy, UringSlotSpec},
 };
 use diagweave::prelude::*;
 use tracing::{debug, trace};
 use veloq_buf::heap::ChunkId;
 use veloq_driver_core::{
-    CompletionToken, OpToken, SlotAccessError, SubmissionGuard, SubmitTokenContext,
+    CompletionToken, OpToken, Reserved, SlotAccessError, SubmissionGuard, SubmitTokenContext,
 };
 use veloq_std::format;
 use veloq_wheel::TimerId;

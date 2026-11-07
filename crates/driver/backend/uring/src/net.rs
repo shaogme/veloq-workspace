@@ -1,18 +1,17 @@
 use crate::{
-    OwnedRawHandle, RawHandle, SockAddrStorage,
-    config::UringRawHandle,
+    OwnedRawHandle, RawHandle,
+    config::{SockAddrStorage, UringRawHandle},
     error::{UringError, UringResult},
 };
 use diagweave::prelude::*;
-use libc::{c_int, sockaddr, sockaddr_in, sockaddr_in6, socklen_t};
-use veloq_driver_core::{PlatformSocket, SocketAddrCodec};
-use veloq_std::{
-    io,
-    mem::{MaybeUninit, size_of, zeroed},
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
-    os::fd::RawFd,
-    ptr, slice,
+use libc::{
+    AF_INET, AF_INET6, IP_TTL, IPPROTO_IP, IPPROTO_TCP, SO_BROADCAST, SO_KEEPALIVE, SO_RCVBUF,
+    SO_REUSEADDR, SO_SNDBUF, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_NONBLOCK, SOCK_STREAM, SOL_SOCKET,
+    TCP_NODELAY, bind, c_int, c_void, connect, getpeername, getsockname, listen, setsockopt,
+    sockaddr, sockaddr_storage, socket, socklen_t,
 };
+use veloq_driver_core::PlatformSocket;
+use veloq_std::{io, mem::size_of, net::SocketAddr, os::fd::RawFd};
 
 pub struct Socket {
     fd: OwnedRawHandle,
@@ -20,7 +19,7 @@ pub struct Socket {
 
 impl Socket {
     fn new_v4(ty: c_int) -> UringResult<Self> {
-        let fd = unsafe { libc::socket(libc::AF_INET, ty, 0) };
+        let fd = unsafe { socket(AF_INET, ty, 0) };
         if fd < 0 {
             return Err(UringError::Socket.io_report("socket.new_v4", io::Error::last_os_error()));
         }
@@ -33,7 +32,7 @@ impl Socket {
     }
 
     fn new_v6(ty: c_int) -> UringResult<Self> {
-        let fd = unsafe { libc::socket(libc::AF_INET6, ty, 0) };
+        let fd = unsafe { socket(AF_INET6, ty, 0) };
         if fd < 0 {
             return Err(UringError::Socket.io_report("socket.new_v6", io::Error::last_os_error()));
         }
@@ -47,11 +46,11 @@ impl Socket {
 
     fn setsockopt<T>(&self, level: c_int, optname: c_int, optval: T) -> UringResult<()> {
         let ret = unsafe {
-            libc::setsockopt(
+            setsockopt(
                 self.fd.raw().as_fd(),
                 level,
                 optname,
-                &optval as *const _ as *const libc::c_void,
+                &optval as *const _ as *const c_void,
                 size_of::<T>() as socklen_t,
             )
         };
@@ -64,27 +63,27 @@ impl Socket {
     }
 
     pub fn new_tcp_v4() -> UringResult<Self> {
-        Self::new_v4(libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK)
+        Self::new_v4(SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK)
     }
 
     pub fn new_tcp_v6() -> UringResult<Self> {
-        Self::new_v6(libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK)
+        Self::new_v6(SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK)
     }
 
     pub fn new_udp_v4() -> UringResult<Self> {
-        Self::new_v4(libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK)
+        Self::new_v4(SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK)
     }
 
     pub fn new_udp_v6() -> UringResult<Self> {
-        Self::new_v6(libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK)
+        Self::new_v6(SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK)
     }
 
     pub fn bind(&self, addr: SocketAddr) -> UringResult<()> {
-        let (raw_addr, raw_addr_len) = socket_addr_to_storage(addr);
+        let (raw_addr, raw_addr_len) = SockAddrStorage::from_socket_addr(addr);
         let ret = unsafe {
-            libc::bind(
+            bind(
                 self.fd.raw().as_fd(),
-                &raw_addr.0 as *const _ as *const sockaddr,
+                raw_addr.as_raw() as *const _ as *const sockaddr,
                 raw_addr_len,
             )
         };
@@ -95,11 +94,11 @@ impl Socket {
     }
 
     pub fn connect(&self, addr: SocketAddr) -> UringResult<()> {
-        let (raw_addr, raw_addr_len) = socket_addr_to_storage(addr);
+        let (raw_addr, raw_addr_len) = SockAddrStorage::from_socket_addr(addr);
         let ret = unsafe {
-            libc::connect(
+            connect(
                 self.fd.raw().as_fd(),
-                &raw_addr.0 as *const _ as *const sockaddr,
+                raw_addr.as_raw() as *const _ as *const sockaddr,
                 raw_addr_len,
             )
         };
@@ -110,7 +109,7 @@ impl Socket {
     }
 
     pub fn listen(&self, backlog: i32) -> UringResult<()> {
-        let ret = unsafe { libc::listen(self.fd.raw().as_fd(), backlog as c_int) };
+        let ret = unsafe { listen(self.fd.raw().as_fd(), backlog as c_int) };
         if ret < 0 {
             return Err(UringError::Socket.io_report("socket.listen", io::Error::last_os_error()));
         }
@@ -132,12 +131,12 @@ impl Socket {
     }
 
     pub fn local_addr(&self) -> UringResult<SocketAddr> {
-        let mut storage: libc::sockaddr_storage = unsafe { zeroed() };
-        let mut len = size_of::<libc::sockaddr_storage>() as socklen_t;
+        let mut storage = SockAddrStorage::default();
+        let mut len = size_of::<sockaddr_storage>() as socklen_t;
         let ret = unsafe {
-            libc::getsockname(
+            getsockname(
                 self.fd.raw().as_fd(),
-                &mut storage as *mut _ as *mut libc::sockaddr,
+                storage.as_raw_mut() as *mut _ as *mut sockaddr,
                 &mut len,
             )
         };
@@ -145,44 +144,67 @@ impl Socket {
             return Err(UringError::Socket
                 .io_report("socket.local_addr.getsockname", io::Error::last_os_error()));
         }
-        to_socket_addr(bounded_sockaddr_bytes(
-            &storage,
-            len as usize,
-            "socket.local_addr.getsockname",
-        )?)
+        SockAddrStorage::decode(
+            storage.bounded_bytes(len as usize, "socket.local_addr.getsockname")?,
+        )
         .attach_note("socket.local_addr.decode")
     }
 
     pub fn peer_addr(&self) -> UringResult<SocketAddr> {
-        peer_addr_of_handle(self.fd.raw())
+        Self::peer_addr_of(self.fd.raw().as_fd())
+    }
+
+    /// Reads the peer address after an accepted descriptor is returned without an address.
+    pub fn peer_addr_of_handle(handle: UringRawHandle) -> UringResult<SocketAddr> {
+        Self::peer_addr_of(handle.as_fd())
+    }
+
+    fn peer_addr_of(fd: RawFd) -> UringResult<SocketAddr> {
+        let mut storage = SockAddrStorage::default();
+        let mut len = size_of::<sockaddr_storage>() as socklen_t;
+        let ret = unsafe {
+            getpeername(
+                fd,
+                storage.as_raw_mut() as *mut _ as *mut sockaddr,
+                &mut len,
+            )
+        };
+        if ret < 0 {
+            return Err(UringError::Socket
+                .io_report("socket.peer_addr.getpeername", io::Error::last_os_error()));
+        }
+        SockAddrStorage::decode(
+            storage.bounded_bytes(len as usize, "socket.peer_addr.getpeername")?,
+        )
+        .attach_note("socket.peer_addr.decode")
     }
 
     pub fn set_nodelay(&self, nodelay: bool) -> UringResult<()> {
-        self.setsockopt(libc::IPPROTO_TCP, libc::TCP_NODELAY, nodelay as c_int)
+        self.setsockopt(IPPROTO_TCP, TCP_NODELAY, nodelay as c_int)
     }
 
     pub fn set_recv_buffer_size(&self, size: usize) -> UringResult<()> {
-        self.setsockopt(libc::SOL_SOCKET, libc::SO_RCVBUF, size as c_int)
+        self.setsockopt(SOL_SOCKET, SO_RCVBUF, size as c_int)
     }
 
     pub fn set_send_buffer_size(&self, size: usize) -> UringResult<()> {
-        self.setsockopt(libc::SOL_SOCKET, libc::SO_SNDBUF, size as c_int)
+        self.setsockopt(SOL_SOCKET, SO_SNDBUF, size as c_int)
     }
 
     pub fn set_reuse_address(&self, reuse: bool) -> UringResult<()> {
-        self.setsockopt(libc::SOL_SOCKET, libc::SO_REUSEADDR, reuse as c_int)
+        self.setsockopt(SOL_SOCKET, SO_REUSEADDR, reuse as c_int)
     }
 
     pub fn set_keepalive(&self, keepalive: bool) -> UringResult<()> {
-        self.setsockopt(libc::SOL_SOCKET, libc::SO_KEEPALIVE, keepalive as c_int)
+        self.setsockopt(SOL_SOCKET, SO_KEEPALIVE, keepalive as c_int)
     }
 
     pub fn set_ttl(&self, ttl: u32) -> UringResult<()> {
-        self.setsockopt(libc::IPPROTO_IP, libc::IP_TTL, ttl as c_int)
+        self.setsockopt(IPPROTO_IP, IP_TTL, ttl as c_int)
     }
 
     pub fn set_broadcast(&self, broadcast: bool) -> UringResult<()> {
-        self.setsockopt(libc::SOL_SOCKET, libc::SO_BROADCAST, broadcast as c_int)
+        self.setsockopt(SOL_SOCKET, SO_BROADCAST, broadcast as c_int)
     }
 }
 
@@ -259,185 +281,32 @@ impl PlatformSocket for Socket {
     }
 }
 
-impl SocketAddrCodec for SockAddrStorage {
-    type Len = socklen_t;
-    type Error = UringError;
-
-    fn to_socket_addr(buf: &[u8]) -> UringResult<SocketAddr> {
-        to_socket_addr(buf).attach_note("socket_addr.decode")
-    }
-
-    fn socket_addr_to_storage(addr: SocketAddr) -> (Self, Self::Len) {
-        socket_addr_to_storage(addr)
-    }
-}
-
-/// 取一个已连接 socket 的对端地址。
-///
-/// multishot accept 不回填地址（`IORING_OP_ACCEPT` 的 multishot 变体没有 addr 字段），
-/// 所以门面层拿到新 fd 之后要用这条同步系统调用补齐。
-pub fn peer_addr_of_handle(handle: UringRawHandle) -> UringResult<SocketAddr> {
-    peer_addr_of(handle.as_fd())
-}
-
-fn peer_addr_of(fd: RawFd) -> UringResult<SocketAddr> {
-    let mut storage: libc::sockaddr_storage = unsafe { zeroed() };
-    let mut len = size_of::<libc::sockaddr_storage>() as socklen_t;
-    let ret =
-        unsafe { libc::getpeername(fd, &mut storage as *mut _ as *mut libc::sockaddr, &mut len) };
-    if ret < 0 {
-        return Err(UringError::Socket
-            .io_report("socket.peer_addr.getpeername", io::Error::last_os_error()));
-    }
-    to_socket_addr(bounded_sockaddr_bytes(
-        &storage,
-        len as usize,
-        "socket.peer_addr.getpeername",
-    )?)
-    .attach_note("socket.peer_addr.decode")
-}
-
-pub fn to_socket_addr(buf: &[u8]) -> UringResult<SocketAddr> {
-    if buf.len() < size_of::<libc::sa_family_t>() {
-        return Err(Report::new(UringError::InvalidInput).attach_note("Invalid address length"));
-    }
-    let mut family_raw = MaybeUninit::<libc::sa_family_t>::uninit();
-    // Copy into properly aligned stack storage before reading, avoiding UB on unaligned input.
-    unsafe {
-        ptr::copy_nonoverlapping(
-            buf.as_ptr(),
-            family_raw.as_mut_ptr() as *mut u8,
-            size_of::<libc::sa_family_t>(),
-        );
-    }
-    let family = unsafe { family_raw.assume_init() } as i32;
-    match family {
-        libc::AF_INET => {
-            if buf.len() < size_of::<sockaddr_in>() {
-                return Err(
-                    Report::new(UringError::InvalidInput).attach_note("Invalid address length")
-                );
-            }
-            let mut sin_raw = MaybeUninit::<sockaddr_in>::zeroed();
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    buf.as_ptr(),
-                    sin_raw.as_mut_ptr() as *mut u8,
-                    size_of::<sockaddr_in>(),
-                );
-            }
-            let sin = unsafe { sin_raw.assume_init() };
-            let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
-            let port = u16::from_be(sin.sin_port);
-            Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
-        }
-        libc::AF_INET6 => {
-            if buf.len() < size_of::<sockaddr_in6>() {
-                return Err(
-                    Report::new(UringError::InvalidInput).attach_note("Invalid address length")
-                );
-            }
-            let mut sin6_raw = MaybeUninit::<sockaddr_in6>::zeroed();
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    buf.as_ptr(),
-                    sin6_raw.as_mut_ptr() as *mut u8,
-                    size_of::<sockaddr_in6>(),
-                );
-            }
-            let sin6 = unsafe { sin6_raw.assume_init() };
-            let ip = Ipv6Addr::from(sin6.sin6_addr.s6_addr);
-            let port = u16::from_be(sin6.sin6_port);
-            Ok(SocketAddr::V6(SocketAddrV6::new(
-                ip,
-                port,
-                sin6.sin6_flowinfo,
-                sin6.sin6_scope_id,
-            )))
-        }
-        _ => Err(Report::new(UringError::InvalidInput).attach_note("Unsupported address family")),
-    }
-}
-
-/// Returns the initialized prefix of a C socket-address buffer.
-///
-/// The length comes from a kernel-written `socklen_t` or from a C socket API. Keep this check
-/// next to the only `from_raw_parts` call so every caller proves that the length fits the storage
-/// object before exposing the bytes to the address decoder.
-pub(crate) fn bounded_sockaddr_bytes<'a>(
-    storage: &'a libc::sockaddr_storage,
-    len: usize,
-    scope: &'static str,
-) -> UringResult<&'a [u8]> {
-    let capacity = size_of::<libc::sockaddr_storage>();
-    if len > capacity {
-        return Err(UringError::InvalidState
-            .report(scope, "socket address length exceeds storage capacity")
-            .with_ctx("address_length", len)
-            .with_ctx("address_capacity", capacity));
-    }
-
-    // SAFETY: `storage` is a valid initialized sockaddr buffer and `len` was checked against its
-    // size immediately above.
-    Ok(unsafe { slice::from_raw_parts(storage as *const _ as *const u8, len) })
-}
-
-pub fn socket_addr_to_storage(addr: SocketAddr) -> (SockAddrStorage, socklen_t) {
-    let mut storage = SockAddrStorage::default();
-    let len = match addr {
-        SocketAddr::V4(a) => {
-            let sin_ptr = &mut storage.0 as *mut _ as *mut sockaddr_in;
-            unsafe {
-                (*sin_ptr).sin_family = libc::AF_INET as _;
-                (*sin_ptr).sin_port = a.port().to_be();
-                (*sin_ptr).sin_addr.s_addr = u32::from_ne_bytes(a.ip().octets());
-                size_of::<sockaddr_in>() as socklen_t
-            }
-        }
-        SocketAddr::V6(a) => {
-            let sin6_ptr = &mut storage.0 as *mut _ as *mut sockaddr_in6;
-            unsafe {
-                (*sin6_ptr).sin6_family = libc::AF_INET6 as _;
-                (*sin6_ptr).sin6_port = a.port().to_be();
-                (*sin6_ptr).sin6_addr.s6_addr = a.ip().octets();
-                (*sin6_ptr).sin6_flowinfo = a.flowinfo();
-                (*sin6_ptr).sin6_scope_id = a.scope_id();
-                size_of::<sockaddr_in6>() as socklen_t
-            }
-        }
-    };
-    (storage, len)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::{SockAddrStorage, UringError};
+    use libc::{AF_INET, sockaddr_in, sockaddr_storage};
     use veloq_std::mem::size_of;
 
-    fn storage() -> libc::sockaddr_storage {
-        let mut storage: libc::sockaddr_storage = unsafe { zeroed() };
-        storage.ss_family = libc::AF_INET as _;
+    fn storage() -> SockAddrStorage {
+        let mut storage = SockAddrStorage::default();
+        storage.as_raw_mut().ss_family = AF_INET as _;
         storage
     }
 
     #[test]
     fn bounded_sockaddr_bytes_accepts_lengths_within_storage() {
         let storage = storage();
-        let bytes = bounded_sockaddr_bytes(
-            &storage,
-            size_of::<libc::sockaddr_in>(),
-            "uring.net.tests.valid_sockaddr",
-        )
-        .expect("a sockaddr_in fits in sockaddr_storage");
-        assert_eq!(bytes.len(), size_of::<libc::sockaddr_in>());
+        let bytes = storage
+            .bounded_bytes(size_of::<sockaddr_in>(), "uring.net.tests.valid_sockaddr")
+            .expect("a sockaddr_in fits in sockaddr_storage");
+        assert_eq!(bytes.len(), size_of::<sockaddr_in>());
     }
 
     #[test]
     fn bounded_sockaddr_bytes_rejects_lengths_beyond_storage() {
         let storage = storage();
-        let result = bounded_sockaddr_bytes(
-            &storage,
-            size_of::<libc::sockaddr_storage>() + 1,
+        let result = storage.bounded_bytes(
+            size_of::<sockaddr_storage>() + 1,
             "uring.net.tests.invalid_sockaddr",
         );
         let Err(report) = result else {

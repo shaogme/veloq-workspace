@@ -26,24 +26,6 @@ pub(crate) enum StagedLedgerError {
     },
 }
 
-/// Fixed-capacity FIFO ledger for SQEs written to the user-space SQ.
-///
-/// The ledger uses an intrusive free-list and an intrusive FIFO.  A completion may remove any
-/// token without shifting or allocating metadata, while staging rollback can still remove the
-/// most recently allocated node in O(1).  The token-indexed user table is only a uniqueness
-/// index; phase transitions are stored with the complete entry and never inferred from a queue
-/// prefix.
-/// 该固定容量账本以侵入式空闲链表和 FIFO 管理已入队 SQE；按 token 索引的表仅用于唯一性校验。
-pub(crate) struct StagedLedger {
-    links: Vec<StagedLink>,
-    free_head: Option<usize>,
-    head: Option<usize>,
-    tail: Option<usize>,
-    len: usize,
-    user_entries: Vec<Option<OpToken>>,
-    capacity: usize,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StagedPhase {
     Staged,
@@ -64,6 +46,24 @@ struct StagedLink {
     prev: Option<usize>,
     next: Option<usize>,
     free_next: Option<usize>,
+}
+
+/// Fixed-capacity FIFO ledger for SQEs written to the user-space SQ.
+///
+/// The ledger uses an intrusive free-list and an intrusive FIFO.  A completion may remove any
+/// token without shifting or allocating metadata, while staging rollback can still remove the
+/// most recently allocated node in O(1).  The token-indexed user table is only a uniqueness
+/// index; phase transitions are stored with the complete entry and never inferred from a queue
+/// prefix.
+/// 该固定容量账本以侵入式空闲链表和 FIFO 管理已入队 SQE；按 token 索引的表仅用于唯一性校验。
+pub(crate) struct StagedLedger {
+    links: Vec<StagedLink>,
+    free_head: Option<usize>,
+    head: Option<usize>,
+    tail: Option<usize>,
+    len: usize,
+    user_entries: Vec<Option<OpToken>>,
+    capacity: usize,
 }
 
 impl StagedLedger {

@@ -191,28 +191,35 @@ impl ProvidedBufStats {
     pub(super) fn available(&self) -> u16 {
         self.available
     }
+
     pub(super) fn note_exhausted(&mut self) {
         self.exhausted = self.exhausted.saturating_add(1);
     }
+
     pub(super) fn note_returned(&mut self) {
         self.returned = self.returned.saturating_add(1);
     }
+
     pub(super) fn note_handed_out(&mut self) {
         self.handed_out = self.handed_out.saturating_add(1);
     }
+
     pub(super) fn note_refill_failed(&mut self) {
         self.refill_failed = self.refill_failed.saturating_add(1);
     }
+
     pub(super) fn note_published(&mut self, published: u16, refilled: u64) {
         self.available = self.available.saturating_add(published);
         self.refilled = self.refilled.saturating_add(refilled);
     }
+
     pub(super) fn note_consumed(&mut self) {
         self.available = self.available.saturating_sub(1);
         if self.available < self.available_low_water {
             self.available_low_water = self.available;
         }
     }
+
     pub(super) fn set_ownership(&mut self, parts: ProvidedBufOwnershipParts) {
         self.selected_leases = parts.selected;
         self.pending_udp_leases = parts.pending;

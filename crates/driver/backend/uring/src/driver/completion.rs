@@ -1,17 +1,17 @@
+mod hooks;
+mod ports;
+mod slot;
+
 use crate::{
     config::UringDriveLimits,
     driver::{context::CompletionContext, control::UringPostCompletionEffects, drive::RoundBudget},
-    error::{UringResult, uring_report_to_event_res},
+    error::{UringError, UringResult},
 };
 
 use veloq_driver_core::{
     AnomalyAttach, CompletionAnomalyKind, CompletionFlowOutcome, SyntheticCompletionSource,
     UserCompletionEvent,
 };
-
-mod hooks;
-mod ports;
-mod slot;
 
 pub(super) use hooks::{
     COMP_BACKEND_URING, CompletionProgress, UringBackendEffect, UringBackendIngress,
@@ -88,7 +88,7 @@ impl CompletionEngine {
     pub(super) fn driver_result_to_event_res(res: &UringResult<usize>) -> i32 {
         match res {
             Ok(value) => (*value).min(i32::MAX as usize) as i32,
-            Err(error) => uring_report_to_event_res(error),
+            Err(error) => UringError::report_to_event_res(error),
         }
     }
 }
@@ -107,7 +107,7 @@ mod tests {
         Accept, AcceptMulti, Open, ReadRaw, Recv, UringOpRegistry, UringOperationDescriptor,
         WriteRaw,
     };
-    use crate::test_alloc::measure;
+    use crate::test_alloc::AllocationCounts;
     use crate::{
         diagnostics::UringCompletionDiagnostics,
         driver::{
@@ -140,13 +140,13 @@ mod tests {
         let mut engine = CompletionEngine::with_capacity(8, 8, UringDriveLimits::for_entries(8));
         engine.scratch.prepare_recycle_test(8);
 
-        let (_, counts) = measure(|| {
+        let (_, counts) = AllocationCounts::measure(|| {
             let (effects, _) = engine.take_effects();
             engine.recycle_effects(effects);
         });
 
         assert_eq!(counts.dynamic_allocations(), 0);
-        assert_eq!(counts.deallocations, 0);
+        assert_eq!(counts.deallocations(), 0);
     }
 
     struct CompletionHookTestParts<'a> {

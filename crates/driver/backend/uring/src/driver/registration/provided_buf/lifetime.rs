@@ -1,6 +1,10 @@
 use core::sync::atomic::{AtomicBool, Ordering as CoreOrdering};
 
-use libc::{madvise, mmap, munmap};
+use libc::{
+    EINVAL, MADV_DONTFORK, MAP_ANONYMOUS, MAP_FAILED, MAP_PRIVATE, PROT_READ, PROT_WRITE, madvise,
+    mmap, munmap,
+};
+use tracing::error;
 use veloq_io_uring::{
     Submitter,
     types::{BufRingEntry, BufRingItem, ProvidedBufRing},
@@ -98,20 +102,20 @@ impl RingMapping {
             mmap(
                 ptr::null_mut(),
                 bytes,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                PROT_READ | PROT_WRITE,
+                MAP_ANONYMOUS | MAP_PRIVATE,
                 -1,
                 0,
             )
         };
-        if raw == libc::MAP_FAILED {
+        if raw == MAP_FAILED {
             return Err(UringError::Registration
                 .io_report("uring.provided_buf.mmap", io::Error::last_os_error()));
         }
         // No errno is downgraded here: without this policy the mapping could be inherited by a
         // forked child while the parent still owns the kernel registration.
         // 不忽略此处 errno：若映射可继承，子进程可能在父进程仍持有内核注册时访问该映射。
-        if unsafe { madvise(raw, bytes, libc::MADV_DONTFORK) } != 0 {
+        if unsafe { madvise(raw, bytes, MADV_DONTFORK) } != 0 {
             let error = io::Error::last_os_error();
             unsafe {
                 let _ = munmap(raw, bytes);
@@ -238,7 +242,7 @@ impl RingMappingOwner {
                 | RingMappingOwnerState::Registered { .. }
                 | RingMappingOwnerState::UnregisterUnknown
         ) {
-            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            return Err(io::Error::from_raw_os_error(EINVAL));
         }
         self.ring.publish(items)
     }
@@ -294,7 +298,7 @@ impl Drop for RingMappingOwner {
             // 安全性：状态机或 ring lifetime token 已证明内核不再引用此映射。
             unsafe { mem::ManuallyDrop::drop(&mut self.mapping) };
         } else {
-            tracing::error!(
+            error!(
                 state = ?self.state,
                 "provided ring mapping may still be referenced; leaking mapping as a safety fallback"
             );

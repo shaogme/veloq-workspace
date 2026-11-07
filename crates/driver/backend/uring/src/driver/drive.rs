@@ -1,4 +1,5 @@
 use diagweave::prelude::*;
+use tracing::trace;
 
 use crate::{
     config::UringDriveLimits,
@@ -77,17 +78,17 @@ pub(crate) struct RoundBudget {
 impl RoundBudget {
     fn new(limits: UringDriveLimits) -> Self {
         let effect_limit = limits
-            .max_cqe_batch
-            .max(limits.emergency_drain_limit)
+            .max_cqe_batch()
+            .max(limits.emergency_drain_limit())
             .saturating_mul(4)
             .saturating_add(8);
         Self {
-            remote_cancels: BudgetCounter::new(limits.max_control_events),
-            lifecycle_actions: BudgetCounter::new(limits.max_cancel_actions),
-            backlog_actions: BudgetCounter::new(limits.max_backlog_actions),
-            sqe_enters: BudgetCounter::new(limits.max_submit_rounds),
-            cqes: BudgetCounter::new(limits.max_cqes_per_drive),
-            timers: BudgetCounter::new(limits.max_timer_expirations),
+            remote_cancels: BudgetCounter::new(limits.max_control_events()),
+            lifecycle_actions: BudgetCounter::new(limits.max_cancel_actions()),
+            backlog_actions: BudgetCounter::new(limits.max_backlog_actions()),
+            sqe_enters: BudgetCounter::new(limits.max_submit_rounds()),
+            cqes: BudgetCounter::new(limits.max_cqes_per_drive()),
+            timers: BudgetCounter::new(limits.max_timer_expirations()),
             effects: BudgetCounter::new(effect_limit),
         }
     }
@@ -430,7 +431,7 @@ impl DriveCoordinator {
                     break;
                 }
             };
-            tracing::trace!(
+            trace!(
                 staged = submit_progress.staged(),
                 kernel_outstanding = submit_progress.kernel_outstanding(),
                 pending_submit = submit_progress.pending_submit(),
@@ -579,21 +580,78 @@ mod tests {
     use crate::config::UringDriveLimits;
     use veloq_driver_core::DrivePendingWork;
 
+    struct PriorityCase {
+        user: bool,
+        waker: bool,
+        timer: bool,
+        zero_timeout: bool,
+        external: bool,
+        expected: WaitPriority,
+    }
+
     #[test]
     fn completion_priority_is_deterministic() {
         let cases = [
-            (true, true, true, true, true, WaitPriority::UserCompletion),
-            (false, true, true, true, true, WaitPriority::WakerCompletion),
-            (false, false, true, true, true, WaitPriority::TimerDeadline),
-            (false, false, false, true, true, WaitPriority::ZeroTimeout),
-            (false, false, false, false, true, WaitPriority::ExternalWait),
-            (false, false, false, false, false, WaitPriority::ProbeWait),
+            PriorityCase {
+                user: true,
+                waker: true,
+                timer: true,
+                zero_timeout: true,
+                external: true,
+                expected: WaitPriority::UserCompletion,
+            },
+            PriorityCase {
+                user: false,
+                waker: true,
+                timer: true,
+                zero_timeout: true,
+                external: true,
+                expected: WaitPriority::WakerCompletion,
+            },
+            PriorityCase {
+                user: false,
+                waker: false,
+                timer: true,
+                zero_timeout: true,
+                external: true,
+                expected: WaitPriority::TimerDeadline,
+            },
+            PriorityCase {
+                user: false,
+                waker: false,
+                timer: false,
+                zero_timeout: true,
+                external: true,
+                expected: WaitPriority::ZeroTimeout,
+            },
+            PriorityCase {
+                user: false,
+                waker: false,
+                timer: false,
+                zero_timeout: false,
+                external: true,
+                expected: WaitPriority::ExternalWait,
+            },
+            PriorityCase {
+                user: false,
+                waker: false,
+                timer: false,
+                zero_timeout: false,
+                external: false,
+                expected: WaitPriority::ProbeWait,
+            },
         ];
 
-        for (user, waker, timer, zero, external, expected) in cases {
+        for case in cases {
             assert_eq!(
-                WaitPriority::resolve(user, waker, timer, zero, external),
-                expected
+                WaitPriority::resolve(
+                    case.user,
+                    case.waker,
+                    case.timer,
+                    case.zero_timeout,
+                    case.external,
+                ),
+                case.expected
             );
         }
     }

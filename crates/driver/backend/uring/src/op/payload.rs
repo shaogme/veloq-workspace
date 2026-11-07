@@ -14,9 +14,10 @@ use crate::{
     config::{SockAddrStorage, UringRawHandle},
     driver::ProvidedBufLease,
     error::{UringError, UringResult},
-    net::{socket_addr_to_storage, to_socket_addr},
+    op::UringUserPayloadStorage,
 };
 use diagweave::prelude::Report;
+use libc::{iovec, msghdr, sockaddr_storage, socklen_t};
 use veloq_buf::BufIoRangeError;
 use veloq_driver_core::ReceivePendingKey;
 use veloq_io_uring::types::Timespec;
@@ -28,6 +29,9 @@ use veloq_std::{
     pin::Pin,
     ptr,
 };
+
+#[cfg(test)]
+use libc::c_void;
 
 pub(crate) type ReadFixed = CoreReadFixed<UringRawHandle>;
 pub(crate) type ReadRaw = CoreReadRaw<UringRawHandle>;
@@ -59,16 +63,18 @@ pub(crate) type Wakeup = CoreWakeup<UringRawHandle>;
 /// operation registry by matching on public variants.
 #[repr(transparent)]
 pub struct UringUserPayload {
-    pub(super) storage: super::spec::UringUserPayloadStorage,
+    pub(super) storage: UringUserPayloadStorage,
 }
 
 pub(crate) struct KernelRef<T> {
-    pub(crate) marker: PhantomData<T>,
+    marker: PhantomData<T>,
 }
 
-pub(crate) fn kernel_ref<T>(_user: &T) -> KernelRef<T> {
-    KernelRef {
-        marker: PhantomData,
+impl<T> KernelRef<T> {
+    pub(crate) fn from_user(_user: &T) -> Self {
+        Self {
+            marker: PhantomData,
+        }
     }
 }
 
@@ -83,10 +89,10 @@ pub(crate) struct AcceptPayload {}
 /// Once populated, this payload MUST NOT be moved in memory until the operation completes
 /// or fails in the kernel. `PhantomPinned` enforces !Unpin in the type system.
 pub(crate) struct SendToPayload {
-    msg_name: libc::sockaddr_storage,
-    msg_namelen: libc::socklen_t,
-    iovec: [libc::iovec; 1],
-    msghdr: libc::msghdr,
+    msg_name: sockaddr_storage,
+    msg_namelen: socklen_t,
+    iovec: [iovec; 1],
+    msghdr: msghdr,
     _pin: PhantomPinned,
 }
 
@@ -95,19 +101,19 @@ pub(crate) struct SendToPayload {
 /// The kernel writes the address, control area, and payload into the selected provided buffer.
 /// The message header is only a stable configuration template; `msg_name` stays null and
 /// `msg_iov` points at an inert zero-length iovec, matching the provided-buffer layout.
-pub(crate) struct UdpRecvMultiPayload {
-    iovec: [libc::iovec; 1],
-    msghdr: libc::msghdr,
-    control: [u8; UDP_RECV_MULTI_CONTROL_LEN],
-    pending: VecDeque<UdpPendingLease>,
-    _pin: PhantomPinned,
-}
-
 pub(crate) struct UdpPendingLease {
     pub(crate) key: ReceivePendingKey,
     pub(crate) addr: SocketAddr,
     pub(crate) len: usize,
     pub(crate) lease: ProvidedBufLease,
+}
+
+pub(crate) struct UdpRecvMultiPayload {
+    iovec: [iovec; 1],
+    msghdr: msghdr,
+    control: [u8; UDP_RECV_MULTI_CONTROL_LEN],
+    pending: VecDeque<UdpPendingLease>,
+    _pin: PhantomPinned,
 }
 
 const UDP_RECV_MULTI_CONTROL_LEN: usize = 0;
@@ -129,24 +135,24 @@ pub(crate) struct ParsedUdpRecvMsg<'a> {
 
 /// A read-only SQE pointer backed by a [`SendToPayload`].
 pub(crate) struct SendMsgView<'a> {
-    msghdr: &'a libc::msghdr,
+    msghdr: &'a msghdr,
 }
 
 impl SendMsgView<'_> {
     #[inline]
-    pub(crate) fn as_ptr(&self) -> *const libc::msghdr {
+    pub(crate) fn as_ptr(&self) -> *const msghdr {
         self.msghdr
     }
 }
 
 /// A writable SQE pointer backed by a UDP `recvmsg` payload.
 pub(crate) struct RecvMsgView<'a> {
-    msghdr: &'a mut libc::msghdr,
+    msghdr: &'a mut msghdr,
 }
 
 impl RecvMsgView<'_> {
     #[inline]
-    pub(crate) fn into_ptr(self) -> *mut libc::msghdr {
+    pub(crate) fn into_ptr(self) -> *mut msghdr {
         self.msghdr
     }
 }
@@ -154,19 +160,19 @@ impl RecvMsgView<'_> {
 pub(crate) struct OpenPayload {}
 
 pub(crate) struct WakeupPayload {
-    pub(crate) buf: [u8; 8],
+    buf: [u8; 8],
 }
 
 pub(crate) struct TimeoutPayload {
-    pub(crate) ts: Timespec,
+    ts: Timespec,
 }
 
-fn zeroed_sockaddr_storage() -> libc::sockaddr_storage {
+fn zeroed_sockaddr_storage() -> sockaddr_storage {
     // C socket storage is intentionally zero-initialized before make_sqe fills it.
     unsafe { mem::zeroed() }
 }
 
-fn zeroed_msghdr() -> libc::msghdr {
+fn zeroed_msghdr() -> msghdr {
     // msghdr pointer fields are populated immediately before submission.
     unsafe { mem::zeroed() }
 }
@@ -184,7 +190,7 @@ impl SendToPayload {
         Self {
             msg_name: zeroed_sockaddr_storage(),
             msg_namelen: 0,
-            iovec: [libc::iovec {
+            iovec: [iovec {
                 iov_base: ptr::null_mut(),
                 iov_len: 0,
             }],
@@ -210,8 +216,8 @@ impl SendToPayload {
         this.iovec[0].iov_base = ptr as *mut _;
         this.iovec[0].iov_len = len as usize;
 
-        let (msg_name, msg_namelen) = socket_addr_to_storage(user.addr);
-        this.msg_name = msg_name.0;
+        let (msg_name, msg_namelen) = SockAddrStorage::from_socket_addr(user.addr);
+        this.msg_name = *msg_name.as_raw();
         this.msg_namelen = msg_namelen;
         this.msghdr.msg_name = ptr::addr_of_mut!(this.msg_name).cast();
         this.msghdr.msg_namelen = this.msg_namelen;
@@ -224,9 +230,7 @@ impl SendToPayload {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_pointers(
-        &mut self,
-    ) -> (*mut libc::c_void, *mut libc::iovec, *const libc::msghdr) {
+    pub(crate) fn test_pointers(&mut self) -> (*mut c_void, *mut iovec, *const msghdr) {
         (
             ptr::addr_of_mut!(self.msg_name).cast(),
             self.iovec.as_mut_ptr(),
@@ -238,7 +242,7 @@ impl SendToPayload {
 impl UdpRecvMultiPayload {
     pub(crate) fn required_buffer_size(datagram_capacity: usize) -> UringResult<usize> {
         mem::size_of::<IoUringRecvMsgOut>()
-            .checked_add(mem::size_of::<libc::sockaddr_storage>())
+            .checked_add(mem::size_of::<sockaddr_storage>())
             .and_then(|size| size.checked_add(UDP_RECV_MULTI_CONTROL_LEN))
             .and_then(|size| size.checked_add(datagram_capacity))
             .ok_or_else(|| {
@@ -254,13 +258,13 @@ impl UdpRecvMultiPayload {
     #[inline]
     pub(crate) fn new() -> Self {
         Self {
-            iovec: [libc::iovec {
+            iovec: [iovec {
                 iov_base: ptr::null_mut(),
                 iov_len: 0,
             }],
-            msghdr: libc::msghdr {
+            msghdr: msghdr {
                 msg_name: ptr::null_mut(),
-                msg_namelen: mem::size_of::<libc::sockaddr_storage>() as _,
+                msg_namelen: mem::size_of::<sockaddr_storage>() as _,
                 msg_iov: ptr::null_mut(),
                 msg_iovlen: 0,
                 msg_control: ptr::null_mut(),
@@ -282,7 +286,7 @@ impl UdpRecvMultiPayload {
         // SAFETY: the pinned receiver guarantees that the header address remains stable.
         let this = unsafe { self.get_unchecked_mut() };
         this.msghdr.msg_name = ptr::null_mut();
-        this.msghdr.msg_namelen = mem::size_of::<libc::sockaddr_storage>() as _;
+        this.msghdr.msg_namelen = mem::size_of::<sockaddr_storage>() as _;
         this.msghdr.msg_iov = this.iovec.as_mut_ptr();
         this.msghdr.msg_iovlen = 0;
         this.msghdr.msg_control = if this.control.is_empty() {
@@ -297,7 +301,7 @@ impl UdpRecvMultiPayload {
         }
     }
 
-    pub(crate) fn message(&self) -> &libc::msghdr {
+    pub(crate) fn message(&self) -> &msghdr {
         &self.msghdr
     }
 
@@ -319,79 +323,97 @@ fn malformed_recvmsg(detail: &'static str) -> Report<UringError> {
 }
 
 /// Parse one kernel-selected `recvmsg` buffer.
-pub(crate) fn parse_udp_recvmsg<'a>(
-    bytes: &'a [u8],
-    message: &libc::msghdr,
-    datagram_capacity: usize,
-) -> UringResult<ParsedUdpRecvMsg<'a>> {
-    let header_len = mem::size_of::<IoUringRecvMsgOut>();
-    if bytes.len() < header_len {
-        return Err(malformed_recvmsg(
-            "selected buffer is shorter than recvmsg metadata",
-        ));
+pub(crate) struct UdpRecvMsgParser;
+
+impl UdpRecvMsgParser {
+    #[cfg(test)]
+    pub(super) fn output_layout() -> [usize; 6] {
+        use veloq_std::mem::{align_of, offset_of, size_of};
+
+        [
+            size_of::<IoUringRecvMsgOut>(),
+            align_of::<IoUringRecvMsgOut>(),
+            offset_of!(IoUringRecvMsgOut, namelen),
+            offset_of!(IoUringRecvMsgOut, controllen),
+            offset_of!(IoUringRecvMsgOut, payloadlen),
+            offset_of!(IoUringRecvMsgOut, flags),
+        ]
     }
 
-    let output = unsafe { ptr::read_unaligned(bytes.as_ptr().cast::<IoUringRecvMsgOut>()) };
-    let name_capacity = usize::try_from(message.msg_namelen)
-        .map_err(|_| malformed_recvmsg("recvmsg name capacity does not fit usize"))?;
-    let control_capacity = message.msg_controllen;
-    if name_capacity > mem::size_of::<libc::sockaddr_storage>() {
-        return Err(malformed_recvmsg(
-            "recvmsg name capacity exceeds sockaddr_storage",
-        ));
-    }
-    let name_start = header_len;
-    let control_start = name_start
-        .checked_add(name_capacity)
-        .ok_or_else(|| malformed_recvmsg("recvmsg name offset overflowed"))?;
-    let payload_start = control_start
-        .checked_add(control_capacity)
-        .ok_or_else(|| malformed_recvmsg("recvmsg control offset overflowed"))?;
-    if payload_start > bytes.len() {
-        return Err(malformed_recvmsg(
-            "recvmsg metadata exceeds selected buffer",
-        ));
-    }
+    pub(crate) fn parse<'a>(
+        bytes: &'a [u8],
+        message: &msghdr,
+        datagram_capacity: usize,
+    ) -> UringResult<ParsedUdpRecvMsg<'a>> {
+        let header_len = mem::size_of::<IoUringRecvMsgOut>();
+        if bytes.len() < header_len {
+            return Err(malformed_recvmsg(
+                "selected buffer is shorter than recvmsg metadata",
+            ));
+        }
 
-    let name_len = usize::try_from(output.namelen)
-        .map_err(|_| malformed_recvmsg("recvmsg name length does not fit usize"))?;
-    let control_len = usize::try_from(output.controllen)
-        .map_err(|_| malformed_recvmsg("recvmsg control length does not fit usize"))?;
-    if name_len > name_capacity {
-        return Err(malformed_recvmsg(
-            "recvmsg name length exceeds configured capacity",
-        ));
-    }
-    if control_len > control_capacity {
-        return Err(malformed_recvmsg(
-            "recvmsg control length exceeds configured capacity",
-        ));
-    }
+        let output = unsafe { ptr::read_unaligned(bytes.as_ptr().cast::<IoUringRecvMsgOut>()) };
+        let name_capacity = usize::try_from(message.msg_namelen)
+            .map_err(|_| malformed_recvmsg("recvmsg name capacity does not fit usize"))?;
+        let control_capacity = message.msg_controllen;
+        if name_capacity > mem::size_of::<sockaddr_storage>() {
+            return Err(malformed_recvmsg(
+                "recvmsg name capacity exceeds sockaddr_storage",
+            ));
+        }
+        let name_start = header_len;
+        let control_start = name_start
+            .checked_add(name_capacity)
+            .ok_or_else(|| malformed_recvmsg("recvmsg name offset overflowed"))?;
+        let payload_start = control_start
+            .checked_add(control_capacity)
+            .ok_or_else(|| malformed_recvmsg("recvmsg control offset overflowed"))?;
+        if payload_start > bytes.len() {
+            return Err(malformed_recvmsg(
+                "recvmsg metadata exceeds selected buffer",
+            ));
+        }
 
-    let payload_len = usize::try_from(output.payloadlen)
-        .map_err(|_| malformed_recvmsg("recvmsg payload length does not fit usize"))?;
-    if payload_len > datagram_capacity {
-        return Err(UringError::InvalidInput
-            .report(
-                "uring.op.payload.recvmsg_multishot",
-                "recvmsg payload exceeds configured datagram capacity",
-            )
-            .with_ctx("payload_length", payload_len)
-            .with_ctx("datagram_capacity", datagram_capacity));
-    }
-    let payload_end = payload_start
-        .checked_add(payload_len)
-        .ok_or_else(|| malformed_recvmsg("recvmsg payload offset overflowed"))?;
-    if payload_end > bytes.len() {
-        return Err(malformed_recvmsg("recvmsg payload exceeds selected buffer"));
-    }
+        let name_len = usize::try_from(output.namelen)
+            .map_err(|_| malformed_recvmsg("recvmsg name length does not fit usize"))?;
+        let control_len = usize::try_from(output.controllen)
+            .map_err(|_| malformed_recvmsg("recvmsg control length does not fit usize"))?;
+        if name_len > name_capacity {
+            return Err(malformed_recvmsg(
+                "recvmsg name length exceeds configured capacity",
+            ));
+        }
+        if control_len > control_capacity {
+            return Err(malformed_recvmsg(
+                "recvmsg control length exceeds configured capacity",
+            ));
+        }
 
-    let addr = to_socket_addr(&bytes[name_start..name_start + name_len])?;
-    Ok(ParsedUdpRecvMsg {
-        addr,
-        payload: &bytes[payload_start..payload_end],
-        flags: output.flags,
-    })
+        let payload_len = usize::try_from(output.payloadlen)
+            .map_err(|_| malformed_recvmsg("recvmsg payload length does not fit usize"))?;
+        if payload_len > datagram_capacity {
+            return Err(UringError::InvalidInput
+                .report(
+                    "uring.op.payload.recvmsg_multishot",
+                    "recvmsg payload exceeds configured datagram capacity",
+                )
+                .with_ctx("payload_length", payload_len)
+                .with_ctx("datagram_capacity", datagram_capacity));
+        }
+        let payload_end = payload_start
+            .checked_add(payload_len)
+            .ok_or_else(|| malformed_recvmsg("recvmsg payload offset overflowed"))?;
+        if payload_end > bytes.len() {
+            return Err(malformed_recvmsg("recvmsg payload exceeds selected buffer"));
+        }
+
+        let addr = SockAddrStorage::decode(&bytes[name_start..name_start + name_len])?;
+        Ok(ParsedUdpRecvMsg {
+            addr,
+            payload: &bytes[payload_start..payload_end],
+            flags: output.flags,
+        })
+    }
 }
 
 impl OpenPayload {
@@ -406,6 +428,10 @@ impl WakeupPayload {
     pub(crate) const fn new() -> Self {
         Self { buf: [0; 8] }
     }
+
+    pub(crate) fn buffer_mut(&mut self) -> &mut [u8; 8] {
+        &mut self.buf
+    }
 }
 
 impl TimeoutPayload {
@@ -415,41 +441,56 @@ impl TimeoutPayload {
             ts: Timespec::new(),
         }
     }
+
+    pub(crate) fn timespec_mut(&mut self) -> &mut Timespec {
+        &mut self.ts
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{UdpRecvMsgParser, UdpRecvMultiPayload};
+    use crate::config::SockAddrStorage;
+    use core::{pin::Pin, ptr::write_unaligned, slice::from_raw_parts};
+    use libc::{MSG_TRUNC, sockaddr_storage};
     use veloq_buf::FixedBuf;
     use veloq_std::{
-        mem::{align_of, offset_of, size_of},
+        mem::size_of,
         net::{Ipv4Addr, SocketAddr, SocketAddrV4},
         num::NonZeroUsize,
     };
 
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct TestRecvMsgOut {
+        namelen: u32,
+        controllen: u32,
+        payloadlen: u32,
+        flags: u32,
+    }
+
     fn recvmsg_buffer(addr: SocketAddr, payload: &[u8], flags: u32) -> FixedBuf {
-        let (storage, addr_len) = socket_addr_to_storage(addr);
-        let name_capacity = size_of::<libc::sockaddr_storage>();
-        let total_len = size_of::<IoUringRecvMsgOut>() + name_capacity + payload.len();
+        let (storage, addr_len) = SockAddrStorage::from_socket_addr(addr);
+        let name_capacity = size_of::<sockaddr_storage>();
+        let total_len = size_of::<TestRecvMsgOut>() + name_capacity + payload.len();
         let mut buffer = FixedBuf::alloc_heap(
             NonZeroUsize::new(total_len.max(1)).expect("fixture capacity is non-zero"),
             total_len,
         )
         .expect("fixture buffer allocation should succeed");
         let bytes = buffer.as_slice_mut();
-        let output = IoUringRecvMsgOut {
+        let output = TestRecvMsgOut {
             namelen: addr_len,
             controllen: 0,
             payloadlen: payload.len() as u32,
             flags,
         };
         unsafe {
-            ptr::write_unaligned(bytes.as_mut_ptr().cast::<IoUringRecvMsgOut>(), output);
+            write_unaligned(bytes.as_mut_ptr().cast::<TestRecvMsgOut>(), output);
         }
-        let name_start = size_of::<IoUringRecvMsgOut>();
-        let name_bytes = unsafe {
-            core::slice::from_raw_parts(ptr::addr_of!(storage.0).cast::<u8>(), name_capacity)
-        };
+        let name_start = size_of::<TestRecvMsgOut>();
+        let name_bytes =
+            unsafe { from_raw_parts(storage.as_raw() as *const _ as *const u8, name_capacity) };
         bytes[name_start..name_start + name_capacity].copy_from_slice(name_bytes);
         bytes[name_start + name_capacity..].copy_from_slice(payload);
         buffer
@@ -457,12 +498,7 @@ mod tests {
 
     #[test]
     fn recvmsg_payload_view_has_kernel_abi_layout() {
-        assert_eq!(size_of::<IoUringRecvMsgOut>(), 16);
-        assert_eq!(align_of::<IoUringRecvMsgOut>(), 4);
-        assert_eq!(offset_of!(IoUringRecvMsgOut, namelen), 0);
-        assert_eq!(offset_of!(IoUringRecvMsgOut, controllen), 4);
-        assert_eq!(offset_of!(IoUringRecvMsgOut, payloadlen), 8);
-        assert_eq!(offset_of!(IoUringRecvMsgOut, flags), 12);
+        assert_eq!(UdpRecvMsgParser::output_layout(), [16, 4, 0, 4, 8, 12]);
     }
 
     #[test]
@@ -474,10 +510,7 @@ mod tests {
         assert!(!message.msg_iov.is_null());
         assert_eq!(message.msg_iovlen, 0);
         assert!(message.msg_control.is_null());
-        assert_eq!(
-            message.msg_namelen as usize,
-            size_of::<libc::sockaddr_storage>()
-        );
+        assert_eq!(message.msg_namelen as usize, size_of::<sockaddr_storage>());
         assert_eq!(message.msg_controllen, 0);
     }
 
@@ -487,8 +520,8 @@ mod tests {
         let buffer = recvmsg_buffer(addr, b"datagram", 0);
         let payload = UdpRecvMultiPayload::new();
         let message = payload.message();
-        let parsed =
-            parse_udp_recvmsg(buffer.as_slice(), message, 1024).expect("valid recvmsg fixture");
+        let parsed = UdpRecvMsgParser::parse(buffer.as_slice(), message, 1024)
+            .expect("valid recvmsg fixture");
         assert_eq!(parsed.addr, addr);
         assert_eq!(parsed.payload, b"datagram");
         assert_eq!(parsed.flags, 0);
@@ -497,23 +530,23 @@ mod tests {
     #[test]
     fn parser_rejects_bad_lengths_and_preserves_truncation_flag() {
         let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9002));
-        let mut buffer = recvmsg_buffer(addr, b"payload", libc::MSG_TRUNC as u32);
+        let mut buffer = recvmsg_buffer(addr, b"payload", MSG_TRUNC as u32);
         let payload = UdpRecvMultiPayload::new();
         let message = payload.message();
-        let parsed =
-            parse_udp_recvmsg(buffer.as_slice(), message, 1024).expect("valid truncated fixture");
-        assert_eq!(parsed.flags, libc::MSG_TRUNC as u32);
+        let parsed = UdpRecvMsgParser::parse(buffer.as_slice(), message, 1024)
+            .expect("valid truncated fixture");
+        assert_eq!(parsed.flags, MSG_TRUNC as u32);
 
         let bytes = buffer.as_slice_mut();
         unsafe {
-            (*bytes.as_mut_ptr().cast::<IoUringRecvMsgOut>()).namelen =
-                (size_of::<libc::sockaddr_storage>() + 1) as u32;
+            (*bytes.as_mut_ptr().cast::<TestRecvMsgOut>()).namelen =
+                (size_of::<sockaddr_storage>() + 1) as u32;
         }
-        assert!(parse_udp_recvmsg(buffer.as_slice(), message, 1024).is_err());
+        assert!(UdpRecvMsgParser::parse(buffer.as_slice(), message, 1024).is_err());
 
         let mut short = recvmsg_buffer(addr, b"payload", 0);
-        short.set_len(size_of::<IoUringRecvMsgOut>());
-        assert!(parse_udp_recvmsg(short.as_slice(), message, 1024).is_err());
+        short.set_len(size_of::<TestRecvMsgOut>());
+        assert!(UdpRecvMsgParser::parse(short.as_slice(), message, 1024).is_err());
     }
 
     #[test]
@@ -522,16 +555,16 @@ mod tests {
         let buffer = recvmsg_buffer(addr, b"payload", 0);
         let payload = UdpRecvMultiPayload::new();
         let message = payload.message();
-        assert!(parse_udp_recvmsg(buffer.as_slice(), message, 3).is_err());
+        assert!(UdpRecvMsgParser::parse(buffer.as_slice(), message, 3).is_err());
 
         let mut overflow = recvmsg_buffer(addr, b"payload", 0);
         unsafe {
             (*overflow
                 .as_slice_mut()
                 .as_mut_ptr()
-                .cast::<IoUringRecvMsgOut>())
+                .cast::<TestRecvMsgOut>())
             .payloadlen = 1000;
         }
-        assert!(parse_udp_recvmsg(overflow.as_slice(), message, 1024).is_err());
+        assert!(UdpRecvMsgParser::parse(overflow.as_slice(), message, 1024).is_err());
     }
 }

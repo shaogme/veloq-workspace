@@ -1,298 +1,320 @@
 use crate::{
     OwnedRawHandle, RawHandle,
-    config::UringRawHandle,
-    driver::{SqeEnv, SqeFd},
+    config::{IoFd, SockAddrStorage, UringRawHandle},
+    driver::{FileTable, SqeEnv, SqeFd},
     error::{UringError, UringResult},
-    net::{bounded_sockaddr_bytes, to_socket_addr},
     op::{
         Accept, AcceptMulti, Connect, OpSend, Recv, RecvMulti, RecvProvided, SendTo, UdpConnect,
         UdpSend,
         payload::{AcceptPayload, KernelRef, SendToPayload, UdpRecvMulti, UdpRecvMultiPayload},
     },
 };
-use veloq_driver_core::SubmitTokenContext;
-use veloq_driver_core::{ReceivePumpPhase, UdpRecvMultiBackend};
+use diagweave::prelude::Report;
+use libc::MSG_TRUNC;
+use veloq_buf::BufIoRangeError;
+use veloq_driver_core::{ReceivePumpPhase, SubmitTokenContext, UdpRecvMultiBackend};
 use veloq_io_uring::{opcode, squeue, types};
-use veloq_std::{format, pin::Pin, ptr};
+use veloq_std::{format, io, pin::Pin, ptr};
 
-use super::{
-    invalid_buf_io_range, opcode_build, resolve_socket_fd, resolve_socket_fd_direct, sqe_with_fd,
-};
+use super::common::SubmissionSupport;
 
-pub(crate) unsafe fn make_sqe_recv(
-    _kernel: Pin<&mut KernelRef<Recv>>,
-    val: &mut Recv,
-    env: &SqeEnv<'_>,
-    _token: SubmitTokenContext,
-) -> UringResult<squeue::Entry> {
-    let (ptr, len) = val
-        .buf
-        .checked_read_range(val.buf_offset)
-        .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_recv", err))?;
-    let fd = resolve_socket_fd(env.file_table(), val.fd, "uring.op.submit.make_sqe_recv")?;
-    opcode_build(
-        "uring.op.submit.recv_opcode",
-        sqe_with_fd!(fd, |f| unsafe { opcode::Recv::new(f, ptr, len) }.build()),
-    )
+pub(crate) struct NetSubmission;
+
+fn opcode_build<T>(scope: &'static str, result: io::Result<T>) -> UringResult<T> {
+    SubmissionSupport::opcode_build(scope, result)
 }
 
-/// A recv whose buffer the kernel picks out of the provided-buffer ring.
-///
-/// `len` is the buffer size rather than `0`: the "0 means use the whole buffer" shortcut only
-/// arrived after 5.19, and on a kernel without it a zero-length recv is exactly what you get.
-/// Every buffer in the ring has the same capacity, so naming it costs nothing and behaves the
-/// same everywhere.
-pub(crate) unsafe fn make_sqe_recv_provided(
-    _kernel: Pin<&mut KernelRef<RecvProvided>>,
-    val: &mut RecvProvided,
-    env: &SqeEnv<'_>,
-    _token: SubmitTokenContext,
-) -> UringResult<squeue::Entry> {
-    const SCOPE: &str = "uring.op.submit.make_sqe_recv_provided";
-    let (bgid, len) = env.provided_buf_info(SCOPE)?;
-    let fd = resolve_socket_fd(env.file_table(), val.fd, SCOPE)?;
-    opcode_build(
-        SCOPE,
-        sqe_with_fd!(fd, |f| unsafe {
-            opcode::Recv::new(f, ptr::null_mut(), len)
-        }
-        .buf_group(bgid)
-        .build()
-        .map(|entry| entry.flags(squeue::Flags::BUFFER_SELECT))),
-    )
+fn invalid_buf_io_range(scope: &'static str, error: BufIoRangeError) -> Report<UringError> {
+    SubmissionSupport::invalid_buf_io_range(scope, error)
 }
 
-/// A recv that stays armed, each completion drawing its own buffer from the ring.
-///
-/// `len` is deliberately left at the opcode's default of `0`, unlike
-/// [`make_sqe_recv_provided`]: multishot completions are sized by the kernel one at a time, so
-/// there is no single length this submission could name.
-///
-/// `RecvMulti::build` sets `IOSQE_BUFFER_SELECT` unconditionally — the kernel refuses a
-/// multishot recv without buffer selection, which is why this operation exists only once a ring
-/// is registered.
-pub(crate) unsafe fn make_sqe_recv_multi(
-    _kernel: Pin<&mut KernelRef<RecvMulti>>,
-    val: &mut RecvMulti,
-    env: &SqeEnv<'_>,
-    _token: SubmitTokenContext,
-) -> UringResult<squeue::Entry> {
-    const SCOPE: &str = "uring.op.submit.make_sqe_recv_multi";
-    let (bgid, _buf_size) = env.provided_buf_info(SCOPE)?;
-    let fd = resolve_socket_fd_direct(env.file_table(), val.fd, SCOPE)?;
-    opcode_build(
-        SCOPE,
-        sqe_with_fd!(fd, |f| opcode::RecvMulti::new(f, bgid).build()),
-    )
+fn resolve_socket_fd(table: &FileTable, fd: IoFd, scope: &'static str) -> UringResult<SqeFd> {
+    SubmissionSupport::resolve_socket_fd(table, fd, scope)
 }
 
-pub(crate) unsafe fn make_sqe_send(
-    _kernel: Pin<&mut KernelRef<OpSend>>,
-    val: &mut OpSend,
-    env: &SqeEnv<'_>,
-    _token: SubmitTokenContext,
-) -> UringResult<squeue::Entry> {
-    let (ptr, len) = val
-        .buf
-        .checked_write_range(val.buf_offset)
-        .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_send", err))?;
-    let fd = resolve_socket_fd(env.file_table(), val.fd, "uring.op.submit.make_sqe_send")?;
-    opcode_build(
-        "uring.op.submit.send_opcode",
-        sqe_with_fd!(fd, |f| unsafe { opcode::Send::new(f, ptr, len) }.build()),
-    )
+fn resolve_socket_fd_direct(
+    table: &FileTable,
+    fd: IoFd,
+    scope: &'static str,
+) -> UringResult<SqeFd> {
+    SubmissionSupport::resolve_socket_fd_direct(table, fd, scope)
 }
 
-pub(crate) unsafe fn make_sqe_udp_send(
-    _kernel: Pin<&mut KernelRef<UdpSend>>,
-    val: &mut UdpSend,
-    env: &SqeEnv<'_>,
-    _token: SubmitTokenContext,
-) -> UringResult<squeue::Entry> {
-    let (ptr, len) = val
-        .buf
-        .checked_write_range(val.buf_offset)
-        .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_udp_send", err))?;
-    let fd = resolve_socket_fd(
-        env.file_table(),
-        val.fd,
-        "uring.op.submit.make_sqe_udp_send",
-    )?;
-    opcode_build(
-        "uring.op.submit.udp_send_opcode",
-        sqe_with_fd!(fd, |f| unsafe { opcode::Send::new(f, ptr, len) }.build()),
-    )
-}
+impl NetSubmission {
+    pub(crate) unsafe fn make_sqe_recv(
+        _kernel: Pin<&mut KernelRef<Recv>>,
+        val: &mut Recv,
+        env: &SqeEnv<'_>,
+        _token: SubmitTokenContext,
+    ) -> UringResult<squeue::Entry> {
+        let (ptr, len) = val
+            .buf
+            .checked_read_range(val.buf_offset)
+            .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_recv", err))?;
+        let fd = resolve_socket_fd(env.file_table(), val.fd, "uring.op.submit.make_sqe_recv")?;
+        opcode_build(
+            "uring.op.submit.recv_opcode",
+            sqe_with_fd!(fd, |f| unsafe { opcode::Recv::new(f, ptr, len) }.build()),
+        )
+    }
 
-pub(crate) unsafe fn make_sqe_connect(
-    _kernel: Pin<&mut KernelRef<Connect>>,
-    val: &mut Connect,
-    env: &SqeEnv<'_>,
-    _token: SubmitTokenContext,
-) -> UringResult<squeue::Entry> {
-    let fd = resolve_socket_fd(env.file_table(), val.fd, "uring.op.submit.make_sqe_connect")?;
-    let addr = &val.addr.0 as *const _ as *const _;
-    opcode_build(
-        "uring.op.submit.connect_opcode",
-        sqe_with_fd!(fd, |f| unsafe {
-            opcode::Connect::new(f, addr, val.addr_len)
-        }
-        .build()),
-    )
-}
+    /// A recv whose buffer the kernel picks out of the provided-buffer ring.
+    ///
+    /// `len` is the buffer size rather than `0`: the "0 means use the whole buffer" shortcut only
+    /// arrived after 5.19, and on a kernel without it a zero-length recv is exactly what you get.
+    /// Every buffer in the ring has the same capacity, so naming it costs nothing and behaves the
+    /// same everywhere.
+    pub(crate) unsafe fn make_sqe_recv_provided(
+        _kernel: Pin<&mut KernelRef<RecvProvided>>,
+        val: &mut RecvProvided,
+        env: &SqeEnv<'_>,
+        _token: SubmitTokenContext,
+    ) -> UringResult<squeue::Entry> {
+        const SCOPE: &str = "uring.op.submit.make_sqe_recv_provided";
+        let (bgid, len) = env.provided_buf_info(SCOPE)?;
+        let fd = resolve_socket_fd(env.file_table(), val.fd, SCOPE)?;
+        opcode_build(
+            SCOPE,
+            sqe_with_fd!(fd, |f| unsafe {
+                opcode::Recv::new(f, ptr::null_mut(), len)
+            }
+            .buf_group(bgid)
+            .build()
+            .map(|entry| entry.flags(squeue::Flags::BUFFER_SELECT))),
+        )
+    }
 
-pub(crate) unsafe fn make_sqe_udp_connect(
-    _kernel: Pin<&mut KernelRef<UdpConnect>>,
-    val: &mut UdpConnect,
-    env: &SqeEnv<'_>,
-    _token: SubmitTokenContext,
-) -> UringResult<squeue::Entry> {
-    let fd = resolve_socket_fd(
-        env.file_table(),
-        val.fd,
-        "uring.op.submit.make_sqe_udp_connect",
-    )?;
-    let addr = &val.addr.0 as *const _ as *const _;
-    opcode_build(
-        "uring.op.submit.udp_connect_opcode",
-        sqe_with_fd!(fd, |f| unsafe {
-            opcode::Connect::new(f, addr, val.addr_len)
-        }
-        .build()),
-    )
-}
+    /// A recv that stays armed, each completion drawing its own buffer from the ring.
+    ///
+    /// `len` is deliberately left at the opcode's default of `0`, unlike
+    /// [`make_sqe_recv_provided`]: multishot completions are sized by the kernel one at a time, so
+    /// there is no single length this submission could name.
+    ///
+    /// `RecvMulti::build` sets `IOSQE_BUFFER_SELECT` unconditionally — the kernel refuses a
+    /// multishot recv without buffer selection, which is why this operation exists only once a ring
+    /// is registered.
+    pub(crate) unsafe fn make_sqe_recv_multi(
+        _kernel: Pin<&mut KernelRef<RecvMulti>>,
+        val: &mut RecvMulti,
+        env: &SqeEnv<'_>,
+        _token: SubmitTokenContext,
+    ) -> UringResult<squeue::Entry> {
+        const SCOPE: &str = "uring.op.submit.make_sqe_recv_multi";
+        let (bgid, _buf_size) = env.provided_buf_info(SCOPE)?;
+        let fd = resolve_socket_fd_direct(env.file_table(), val.fd, SCOPE)?;
+        opcode_build(
+            SCOPE,
+            sqe_with_fd!(fd, |f| opcode::RecvMulti::new(f, bgid).build()),
+        )
+    }
 
-pub(crate) unsafe fn make_sqe_accept(
-    _kernel: Pin<&mut AcceptPayload>,
-    val: &mut Accept,
-    env: &SqeEnv<'_>,
-    _token: SubmitTokenContext,
-) -> UringResult<squeue::Entry> {
-    let fd = resolve_socket_fd(env.file_table(), val.fd, "uring.op.submit.make_sqe_accept")?;
-    let addr = &mut val.addr.0 as *mut _ as *mut _;
-    let addr_len = &mut val.addr_len as *mut _;
-    opcode_build(
-        "uring.op.submit.accept_opcode",
-        sqe_with_fd!(fd, |f| unsafe { opcode::Accept::new(f, addr, addr_len) }
+    pub(crate) unsafe fn make_sqe_send(
+        _kernel: Pin<&mut KernelRef<OpSend>>,
+        val: &mut OpSend,
+        env: &SqeEnv<'_>,
+        _token: SubmitTokenContext,
+    ) -> UringResult<squeue::Entry> {
+        let (ptr, len) = val
+            .buf
+            .checked_write_range(val.buf_offset)
+            .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_send", err))?;
+        let fd = resolve_socket_fd(env.file_table(), val.fd, "uring.op.submit.make_sqe_send")?;
+        opcode_build(
+            "uring.op.submit.send_opcode",
+            sqe_with_fd!(fd, |f| unsafe { opcode::Send::new(f, ptr, len) }.build()),
+        )
+    }
+
+    pub(crate) unsafe fn make_sqe_udp_send(
+        _kernel: Pin<&mut KernelRef<UdpSend>>,
+        val: &mut UdpSend,
+        env: &SqeEnv<'_>,
+        _token: SubmitTokenContext,
+    ) -> UringResult<squeue::Entry> {
+        let (ptr, len) = val
+            .buf
+            .checked_write_range(val.buf_offset)
+            .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_udp_send", err))?;
+        let fd = resolve_socket_fd(
+            env.file_table(),
+            val.fd,
+            "uring.op.submit.make_sqe_udp_send",
+        )?;
+        opcode_build(
+            "uring.op.submit.udp_send_opcode",
+            sqe_with_fd!(fd, |f| unsafe { opcode::Send::new(f, ptr, len) }.build()),
+        )
+    }
+
+    pub(crate) unsafe fn make_sqe_connect(
+        _kernel: Pin<&mut KernelRef<Connect>>,
+        val: &mut Connect,
+        env: &SqeEnv<'_>,
+        _token: SubmitTokenContext,
+    ) -> UringResult<squeue::Entry> {
+        let fd = resolve_socket_fd(env.file_table(), val.fd, "uring.op.submit.make_sqe_connect")?;
+        let addr = val.addr.as_raw() as *const _ as *const _;
+        opcode_build(
+            "uring.op.submit.connect_opcode",
+            sqe_with_fd!(fd, |f| unsafe {
+                opcode::Connect::new(f, addr, val.addr_len)
+            }
             .build()),
-    )
-}
-
-/// 把 accept 完成的结果（一个裸 fd）变成一个拥有所有权的句柄。
-///
-/// 单发 `Accept` 与 multishot `AcceptMulti` 共用，两者的 `Completion` 是同一个东西。
-pub(crate) fn accepted_handle_from_res(res: UringResult<usize>) -> UringResult<OwnedRawHandle> {
-    res.map(|raw| unsafe {
-        OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_socket(raw as i32)))
-    })
-}
-
-pub(crate) unsafe fn make_sqe_accept_multi(
-    _kernel: Pin<&mut KernelRef<AcceptMulti>>,
-    val: &mut AcceptMulti,
-    env: &SqeEnv<'_>,
-    _token: SubmitTokenContext,
-) -> UringResult<squeue::Entry> {
-    let fd = resolve_socket_fd_direct(
-        env.file_table(),
-        val.fd,
-        "uring.op.submit.make_sqe_accept_multi",
-    )?;
-    // `AcceptMulti` 没有 addr/addrlen 字段：内核不回填对端地址，因为多条完成共享一个
-    // 地址缓冲会互相覆盖。地址由门面层在拿到 fd 之后用 `getpeername` 补。
-    opcode_build(
-        "uring.op.submit.accept_multi_opcode",
-        sqe_with_fd!(fd, |f| opcode::AcceptMulti::new(f).build()),
-    )
-}
-
-pub(crate) unsafe fn on_complete_accept(
-    _kernel: Pin<&mut AcceptPayload>,
-    accept_op: &mut Accept,
-    result: i32,
-) -> UringResult<usize> {
-    if result < 0 {
-        return Err(UringError::CompletionWait
-            .report(
-                "uring.op.submit.on_complete_accept",
-                "kernel completion returned error",
-            )
-            .set_error_code(-result));
+        )
     }
 
-    let addr_bytes = bounded_sockaddr_bytes(
-        &accept_op.addr.0,
-        accept_op.addr_len as usize,
-        "uring.op.submit.on_complete_accept",
-    )?;
-    if let Ok(addr) = to_socket_addr(addr_bytes) {
-        accept_op.remote_addr = Some(addr);
-    }
-    Ok(result as usize)
-}
-
-pub(crate) unsafe fn make_sqe_send_to(
-    kernel: Pin<&mut SendToPayload>,
-    user: &mut SendTo,
-    env: &SqeEnv<'_>,
-    _token: SubmitTokenContext,
-) -> UringResult<squeue::Entry> {
-    let msg = unsafe { kernel.init_send_to(user) }
-        .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_send_to", err))?;
-
-    let fd = resolve_socket_fd(
-        env.file_table(),
-        user.fd,
-        "uring.op.submit.make_sqe_send_to",
-    )?;
-    opcode_build(
-        "uring.op.submit.sendmsg_opcode",
-        sqe_with_fd!(fd, |f| unsafe { opcode::SendMsg::new(f, msg.as_ptr()) }
+    pub(crate) unsafe fn make_sqe_udp_connect(
+        _kernel: Pin<&mut KernelRef<UdpConnect>>,
+        val: &mut UdpConnect,
+        env: &SqeEnv<'_>,
+        _token: SubmitTokenContext,
+    ) -> UringResult<squeue::Entry> {
+        let fd = resolve_socket_fd(
+            env.file_table(),
+            val.fd,
+            "uring.op.submit.make_sqe_udp_connect",
+        )?;
+        let addr = val.addr.as_raw() as *const _ as *const _;
+        opcode_build(
+            "uring.op.submit.udp_connect_opcode",
+            sqe_with_fd!(fd, |f| unsafe {
+                opcode::Connect::new(f, addr, val.addr_len)
+            }
             .build()),
-    )
-}
+        )
+    }
 
-pub(crate) unsafe fn make_sqe_udp_recv_multi(
-    kernel: Pin<&mut UdpRecvMultiPayload>,
-    user: &mut UdpRecvMulti,
-    env: &SqeEnv<'_>,
-    _token: SubmitTokenContext,
-) -> UringResult<squeue::Entry> {
-    const SCOPE: &str = "uring.op.submit.make_sqe_udp_recv_multi";
-    let phase = user.receive_pump().phase();
-    let (bgid, buf_size) = env.provided_buf_info(SCOPE)?;
-    let required_size = UdpRecvMultiPayload::required_buffer_size(
-        user.receive_pump().config().datagram_capacity().get(),
-    )?;
-    if required_size > buf_size as usize {
-        return Err(UringError::InvalidInput
-            .report(
-                SCOPE,
-                "provided buffer is too small for UDP recvmsg metadata",
-            )
-            .with_ctx("required_size", required_size)
-            .with_ctx("provided_buffer_size", buf_size));
+    pub(crate) unsafe fn make_sqe_accept(
+        _kernel: Pin<&mut AcceptPayload>,
+        val: &mut Accept,
+        env: &SqeEnv<'_>,
+        _token: SubmitTokenContext,
+    ) -> UringResult<squeue::Entry> {
+        let fd = resolve_socket_fd(env.file_table(), val.fd, "uring.op.submit.make_sqe_accept")?;
+        let addr = val.addr.as_raw_mut() as *mut _ as *mut _;
+        let addr_len = &mut val.addr_len as *mut _;
+        opcode_build(
+            "uring.op.submit.accept_opcode",
+            sqe_with_fd!(fd, |f| unsafe { opcode::Accept::new(f, addr, addr_len) }
+                .build()),
+        )
     }
-    let msg = unsafe { kernel.init_recv_multi() };
-    let fd = resolve_socket_fd_direct(env.file_table(), user.fd(), SCOPE)?;
-    let sqe = opcode_build(
-        SCOPE,
-        sqe_with_fd!(fd, |f| unsafe {
-            opcode::RecvMsgMulti::new(f, msg.into_ptr())
+
+    /// 把 accept 完成的结果（一个裸 fd）变成一个拥有所有权的句柄。
+    ///
+    /// 单发 `Accept` 与 multishot `AcceptMulti` 共用，两者的 `Completion` 是同一个东西。
+    pub(crate) fn accepted_handle_from_res(res: UringResult<usize>) -> UringResult<OwnedRawHandle> {
+        res.map(|raw| unsafe {
+            OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_socket(raw as i32)))
+        })
+    }
+
+    pub(crate) unsafe fn make_sqe_accept_multi(
+        _kernel: Pin<&mut KernelRef<AcceptMulti>>,
+        val: &mut AcceptMulti,
+        env: &SqeEnv<'_>,
+        _token: SubmitTokenContext,
+    ) -> UringResult<squeue::Entry> {
+        let fd = resolve_socket_fd_direct(
+            env.file_table(),
+            val.fd,
+            "uring.op.submit.make_sqe_accept_multi",
+        )?;
+        // `AcceptMulti` 没有 addr/addrlen 字段：内核不回填对端地址，因为多条完成共享一个
+        // 地址缓冲会互相覆盖。地址由门面层在拿到 fd 之后用 `getpeername` 补。
+        opcode_build(
+            "uring.op.submit.accept_multi_opcode",
+            sqe_with_fd!(fd, |f| opcode::AcceptMulti::new(f).build()),
+        )
+    }
+
+    pub(crate) unsafe fn on_complete_accept(
+        _kernel: Pin<&mut AcceptPayload>,
+        accept_op: &mut Accept,
+        result: i32,
+    ) -> UringResult<usize> {
+        if result < 0 {
+            return Err(UringError::CompletionWait
+                .report(
+                    "uring.op.submit.on_complete_accept",
+                    "kernel completion returned error",
+                )
+                .set_error_code(-result));
         }
-        .flags(libc::MSG_TRUNC as u32)
-        .buf_group(bgid)
-        .build()),
-    )?;
-    match phase {
-        ReceivePumpPhase::Created => user.receive_pump_mut().arm_multishot().map(|_| ()),
-        ReceivePumpPhase::RearmPending => user.receive_pump_mut().submit_rearm(),
-        _ => Ok(()),
+
+        let addr_bytes = accept_op.addr.bounded_bytes(
+            accept_op.addr_len as usize,
+            "uring.op.submit.on_complete_accept",
+        )?;
+        if let Ok(addr) = SockAddrStorage::decode(addr_bytes) {
+            accept_op.remote_addr = Some(addr);
+        }
+        Ok(result as usize)
     }
-    .map_err(|error| {
-        UringError::InvalidState
-            .report(SCOPE, "failed to advance UDP multishot receive pump")
-            .with_ctx("receive_pump_error", format!("{error:?}"))
-    })?;
-    Ok(sqe)
+
+    pub(crate) unsafe fn make_sqe_send_to(
+        kernel: Pin<&mut SendToPayload>,
+        user: &mut SendTo,
+        env: &SqeEnv<'_>,
+        _token: SubmitTokenContext,
+    ) -> UringResult<squeue::Entry> {
+        let msg = unsafe { kernel.init_send_to(user) }
+            .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_send_to", err))?;
+
+        let fd = resolve_socket_fd(
+            env.file_table(),
+            user.fd,
+            "uring.op.submit.make_sqe_send_to",
+        )?;
+        opcode_build(
+            "uring.op.submit.sendmsg_opcode",
+            sqe_with_fd!(fd, |f| unsafe { opcode::SendMsg::new(f, msg.as_ptr()) }
+                .build()),
+        )
+    }
+
+    pub(crate) unsafe fn make_sqe_udp_recv_multi(
+        kernel: Pin<&mut UdpRecvMultiPayload>,
+        user: &mut UdpRecvMulti,
+        env: &SqeEnv<'_>,
+        _token: SubmitTokenContext,
+    ) -> UringResult<squeue::Entry> {
+        const SCOPE: &str = "uring.op.submit.make_sqe_udp_recv_multi";
+        let phase = user.receive_pump().phase();
+        let (bgid, buf_size) = env.provided_buf_info(SCOPE)?;
+        let required_size = UdpRecvMultiPayload::required_buffer_size(
+            user.receive_pump().config().datagram_capacity().get(),
+        )?;
+        if required_size > buf_size as usize {
+            return Err(UringError::InvalidInput
+                .report(
+                    SCOPE,
+                    "provided buffer is too small for UDP recvmsg metadata",
+                )
+                .with_ctx("required_size", required_size)
+                .with_ctx("provided_buffer_size", buf_size));
+        }
+        let msg = unsafe { kernel.init_recv_multi() };
+        let fd = resolve_socket_fd_direct(env.file_table(), user.fd(), SCOPE)?;
+        let sqe = opcode_build(
+            SCOPE,
+            sqe_with_fd!(fd, |f| unsafe {
+                opcode::RecvMsgMulti::new(f, msg.into_ptr())
+            }
+            .flags(MSG_TRUNC as u32)
+            .buf_group(bgid)
+            .build()),
+        )?;
+        match phase {
+            ReceivePumpPhase::Created => user.receive_pump_mut().arm_multishot().map(|_| ()),
+            ReceivePumpPhase::RearmPending => user.receive_pump_mut().submit_rearm(),
+            _ => Ok(()),
+        }
+        .map_err(|error| {
+            UringError::InvalidState
+                .report(SCOPE, "failed to advance UDP multishot receive pump")
+                .with_ctx("receive_pump_error", format!("{error:?}"))
+        })?;
+        Ok(sqe)
+    }
 }

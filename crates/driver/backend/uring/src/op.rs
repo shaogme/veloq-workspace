@@ -1,5 +1,10 @@
 //! io_uring Platform-Specific Operation Definitions
 
+mod descriptor;
+mod payload;
+mod spec;
+mod submit;
+
 use crate::{diagnostics::UringCompletionDiagnostics, driver::UringOpState, error::UringError};
 use veloq_driver_core::{
     CompletionCleanupGuard, OpRegistry as CoreOpRegistry, PlatformOp, Slot as CoreSlot,
@@ -7,26 +12,24 @@ use veloq_driver_core::{
 };
 use veloq_std::pin::Pin;
 
-mod descriptor;
-mod payload;
-mod spec;
-mod submit;
-
 pub(crate) use descriptor::{
     CompletionCardinality, CompletionCleanupHintFn, ErasedOperationDescriptor, OperationDescriptor,
-    RecordPolicy, UringRecordItem,
+    RecordPolicy, UringRecordItem, UringRecordItemKind,
 };
 
 pub use payload::UringUserPayload;
 pub(crate) use payload::{
-    Accept, AcceptMulti, AcceptedSocket, Close, Connect, Fallocate, FallocateRaw, Fsync, FsyncRaw,
-    OpSend, Open, ProvidedBuf, ReadFixed, ReadRaw, Recv, RecvMulti, RecvProvided, SendTo,
-    SyncFileRange, SyncFileRangeRaw, Timeout, UdpConnect, UdpRecvMulti, UdpRecvPacket, UdpSend,
-    Wakeup, WriteFixed, WriteRaw,
+    Accept, AcceptMulti, AcceptPayload, AcceptedSocket, Close, Connect, Fallocate, FallocateRaw,
+    Fsync, FsyncRaw, KernelRef, OpSend, Open, OpenPayload, ProvidedBuf, ReadFixed, ReadRaw, Recv,
+    RecvMulti, RecvProvided, SendTo, SendToPayload, SyncFileRange, SyncFileRangeRaw, Timeout,
+    TimeoutPayload, UdpConnect, UdpPendingLease, UdpRecvMsgParser, UdpRecvMulti,
+    UdpRecvMultiPayload, UdpRecvPacket, UdpSend, Wakeup, WakeupPayload, WriteFixed, WriteRaw,
 };
-pub(crate) use spec::{UringKernelPayloadStorage, UringOperationDescriptor};
+pub(crate) use spec::{
+    UringKernelPayloadStorage, UringOperationDescriptor, UringUserPayloadStorage,
+};
 
-pub(crate) use submit::{opcode_build, sqe_with_fd};
+pub(crate) use submit::{FileSubmission, NetSubmission, SubmissionSupport};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SubmissionStrategy {
@@ -39,7 +42,6 @@ pub(crate) enum SubmissionStrategy {
 // ============================================================================
 // UringKernelOp Struct & Payload (Type-Erased)
 // ============================================================================
-
 pub struct UringKernelOp {
     /// Static descriptor used for all runtime dispatch.
     descriptor: &'static ErasedOperationDescriptor,
@@ -112,7 +114,6 @@ pub type UringOp = UringKernelOp;
 // ============================================================================
 // Slot Registry Binding
 // ============================================================================
-
 pub enum UringSlotSpec {}
 
 impl CoreSlotSpec for UringSlotSpec {
@@ -127,8 +128,3 @@ impl CoreSlotSpec for UringSlotSpec {
 
 pub(crate) type UringOpRegistry = CoreOpRegistry<UringSlotSpec>;
 pub(crate) type Slot<'a, State> = CoreSlot<'a, State, UringSlotSpec>;
-
-pub(crate) use veloq_driver_core::{
-    CheckedSlotView, Reserved, SlotMarker as SlotState, SlotRegistryExt as UringOpRegistryExt,
-    SlotView,
-};

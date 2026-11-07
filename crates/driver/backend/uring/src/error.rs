@@ -44,7 +44,7 @@ impl UringError {
     #[inline]
     pub(crate) fn report(self, scope: &'static str, detail: impl ToString) -> Report<Self> {
         self.to_report()
-            .set_error_code(uring_fallback_errno(self))
+            .set_error_code(Self::fallback_errno(self))
             .push_ctx("scope", scope)
             .attach_note(detail.to_string())
     }
@@ -68,6 +68,37 @@ impl UringError {
             report
         }
     }
+
+    pub(crate) fn fallback_errno(kind: Self) -> i32 {
+        match kind {
+            Self::DriverInit => 5,             // EIO
+            Self::PollingUnavailable => 95,    // EOPNOTSUPP
+            Self::CompletionWait => 5,         // EIO
+            Self::Submission => 11,            // EAGAIN
+            Self::Registration => 12,          // ENOMEM
+            Self::ResolveFd => 9,              // EBADF
+            Self::DuplicateOwnedFd => 17,      // EEXIST
+            Self::FileTableQuarantined => 5,   // EIO
+            Self::FileTablePoisoned => 5,      // EIO
+            Self::Socket => 5,                 // EIO
+            Self::InvalidInput => 22,          // EINVAL
+            Self::InvalidState => 5,           // EIO
+            Self::CancelTicketExhausted => 75, // EOVERFLOW
+            Self::Unsupported => 95,           // EOPNOTSUPP
+            Self::Internal => 5,               // EIO
+        }
+    }
+
+    pub(crate) fn report_to_event_res(report: &Report<Self>) -> i32 {
+        if let Some(code) = report
+            .error_code()
+            .and_then(|code| i32::try_from(code).ok())
+            && let Some(res) = neg_code(code)
+        {
+            return res;
+        }
+        -Self::fallback_errno(*report.inner())
+    }
 }
 
 impl DriverError for UringError {
@@ -83,37 +114,4 @@ impl DriverError for UringError {
 #[inline]
 fn neg_code(code: i32) -> Option<i32> {
     (code != 0).then_some(-code.abs())
-}
-
-#[inline]
-pub(crate) fn uring_fallback_errno(kind: UringError) -> i32 {
-    match kind {
-        UringError::DriverInit => 5,             // EIO
-        UringError::PollingUnavailable => 95,    // EOPNOTSUPP
-        UringError::CompletionWait => 5,         // EIO
-        UringError::Submission => 11,            // EAGAIN
-        UringError::Registration => 12,          // ENOMEM
-        UringError::ResolveFd => 9,              // EBADF
-        UringError::DuplicateOwnedFd => 17,      // EEXIST
-        UringError::FileTableQuarantined => 5,   // EIO
-        UringError::FileTablePoisoned => 5,      // EIO
-        UringError::Socket => 5,                 // EIO
-        UringError::InvalidInput => 22,          // EINVAL
-        UringError::InvalidState => 5,           // EIO
-        UringError::CancelTicketExhausted => 75, // EOVERFLOW
-        UringError::Unsupported => 95,           // EOPNOTSUPP
-        UringError::Internal => 5,               // EIO
-    }
-}
-
-#[inline]
-pub(crate) fn uring_report_to_event_res(report: &Report<UringError>) -> i32 {
-    if let Some(code) = report
-        .error_code()
-        .and_then(|code| i32::try_from(code).ok())
-        && let Some(res) = neg_code(code)
-    {
-        return res;
-    }
-    -uring_fallback_errno(*report.inner())
 }

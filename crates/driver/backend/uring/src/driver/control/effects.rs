@@ -4,6 +4,32 @@ use crate::driver::{
 use veloq_driver_core::{CancelTicket, Generation, OpToken, RawCompletion};
 use veloq_std::{time::Instant, vec::Vec};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UringControlEffectKind {
+    CancelAck {
+        cancel_ticket: CancelTicket,
+        phase: CancellationPhase,
+    },
+    CancelReconcile {
+        cancel_ticket: CancelTicket,
+        request: PendingCancel,
+        raw: RawCompletion,
+    },
+    CloseUnregister {
+        ticket: OwnedFdOwnershipTicket,
+    },
+    WakerRebuild {
+        generation: u64,
+    },
+    WakerRearm {
+        generation: u64,
+    },
+    UdpRearm {
+        logical_receiver_generation: u32,
+    },
+    BacklogKick,
+}
+
 /// A typed post-completion action owned by the uring control plane.
 ///
 /// The identity is deliberately carried with the action instead of being reconstructed by the
@@ -51,32 +77,6 @@ impl UringControlEffect {
     pub(crate) const fn token(self) -> Option<OpToken> {
         self.token
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UringControlEffectKind {
-    CancelAck {
-        cancel_ticket: CancelTicket,
-        phase: CancellationPhase,
-    },
-    CancelReconcile {
-        cancel_ticket: CancelTicket,
-        request: PendingCancel,
-        raw: RawCompletion,
-    },
-    CloseUnregister {
-        ticket: OwnedFdOwnershipTicket,
-    },
-    WakerRebuild {
-        generation: u64,
-    },
-    WakerRearm {
-        generation: u64,
-    },
-    UdpRearm {
-        logical_receiver_generation: u32,
-    },
-    BacklogKick,
 }
 
 #[derive(Debug, Clone, Copy)]

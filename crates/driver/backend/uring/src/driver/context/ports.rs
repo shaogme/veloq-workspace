@@ -12,9 +12,12 @@ use crate::{
         registration::{ProvidedBufPort, RegistrationEngine, SqeFd},
     },
     error::UringResult,
-    op::{CheckedSlotView, SlotView, UringOp, UringOpRegistryExt, UringSlotSpec},
+    op::{UringOp, UringSlotSpec},
 };
-use veloq_driver_core::{DriverCompletionDiagnostics, OpToken, RegisterFd, SharedCompletionTable};
+use veloq_driver_core::{
+    CheckedSlotView, DriverCompletionDiagnostics, OpToken, RegisterFd, SharedCompletionTable,
+    SlotRegistryExt as UringOpRegistryExt, SlotView,
+};
 use veloq_io_uring::{
     EnterArgs, IoUring, KernelCapabilities, SubmitError as KernelSubmitError,
     SubmitReceipt as KernelSubmitReceipt, types::SubmitArgs,
@@ -249,6 +252,18 @@ impl<'ops, 'registration, 'ring, 'a> SubmitPort<'ops, 'registration, 'ring, 'a> 
     }
 }
 
+pub(crate) struct CompletionOperationParts<'context> {
+    ops: &'context mut OperationLedger,
+    control: &'context mut UringControlPlane,
+    completion_table: &'context SharedCompletionTable<UringSlotSpec>,
+    diagnostics: &'context DriverCompletionDiagnostics<UringCompletionDiagnostics>,
+}
+
+pub(crate) struct CompletionResourceParts<'context> {
+    ring: &'context mut IoUring,
+    provided_buffers: Option<ProvidedBufPort<'context>>,
+}
+
 pub(crate) struct CompletionContextParts<'context> {
     operation: CompletionOperationParts<'context>,
     resources: CompletionResourceParts<'context>,
@@ -274,13 +289,6 @@ impl<'context> CompletionContextParts<'context> {
     }
 }
 
-pub(crate) struct CompletionOperationParts<'context> {
-    ops: &'context mut OperationLedger,
-    control: &'context mut UringControlPlane,
-    completion_table: &'context SharedCompletionTable<UringSlotSpec>,
-    diagnostics: &'context DriverCompletionDiagnostics<UringCompletionDiagnostics>,
-}
-
 pub(crate) struct CompletionOperationBorrowParts<'context> {
     pub(crate) ops: &'context mut OperationLedger,
     pub(crate) control: &'context mut UringControlPlane,
@@ -297,11 +305,6 @@ impl<'context> CompletionOperationParts<'context> {
             diagnostics: self.diagnostics,
         }
     }
-}
-
-pub(crate) struct CompletionResourceParts<'context> {
-    ring: &'context mut IoUring,
-    provided_buffers: Option<ProvidedBufPort<'context>>,
 }
 
 impl<'context> CompletionResourceParts<'context> {

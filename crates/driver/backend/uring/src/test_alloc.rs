@@ -9,6 +9,7 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+use libc::{free, posix_memalign};
 use veloq_std::thread::Tls;
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -42,7 +43,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
         if tracking_on_current_thread() {
             DEALLOCATIONS.fetch_add(1, Ordering::Relaxed);
         }
-        unsafe { libc::free(ptr.cast()) };
+        unsafe { free(ptr.cast()) };
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
@@ -53,7 +54,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
         if !new_ptr.is_null() {
             unsafe {
                 copy_nonoverlapping(ptr, new_ptr, min(layout.size(), new_size));
-                libc::free(ptr.cast());
+                free(ptr.cast());
             }
         }
         record(&REALLOCATIONS, new_ptr);
@@ -65,7 +66,7 @@ fn allocate(layout: &Layout) -> *mut u8 {
     let size = layout.size().max(1);
     let alignment = layout.align().max(align_of::<*mut u8>());
     let mut ptr = null_mut();
-    let result = unsafe { libc::posix_memalign(&mut ptr, alignment, size) };
+    let result = unsafe { posix_memalign(&mut ptr, alignment, size) };
     if result == 0 { ptr.cast() } else { null_mut() }
 }
 
@@ -81,17 +82,10 @@ fn record(counter: &AtomicUsize, ptr: *mut u8) {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AllocationCounts {
-    pub(crate) allocations: usize,
-    pub(crate) zeroed_allocations: usize,
-    pub(crate) reallocations: usize,
-    pub(crate) deallocations: usize,
-}
-
-impl AllocationCounts {
-    #[inline]
-    pub(crate) const fn dynamic_allocations(self) -> usize {
-        self.allocations + self.zeroed_allocations + self.reallocations
-    }
+    allocations: usize,
+    zeroed_allocations: usize,
+    reallocations: usize,
+    deallocations: usize,
 }
 
 struct TrackingGuard;
@@ -102,30 +96,40 @@ impl Drop for TrackingGuard {
     }
 }
 
-#[inline]
-pub(crate) fn measure<F, R>(operation: F) -> (R, AllocationCounts)
-where
-    F: FnOnce() -> R,
-{
-    let already_tracking = TRACKING.with_or_default(Cell::get);
-    assert!(
-        !already_tracking,
-        "allocation measurements cannot be nested"
-    );
-    TRACKING.with_or_default(|tracking| tracking.set(true));
-    ALLOCATIONS.store(0, Ordering::Relaxed);
-    ZEROED_ALLOCATIONS.store(0, Ordering::Relaxed);
-    REALLOCATIONS.store(0, Ordering::Relaxed);
-    DEALLOCATIONS.store(0, Ordering::Relaxed);
-    let guard = TrackingGuard;
+impl AllocationCounts {
+    #[inline]
+    pub(crate) const fn dynamic_allocations(self) -> usize {
+        self.allocations + self.zeroed_allocations + self.reallocations
+    }
 
-    let result = operation();
-    let counts = AllocationCounts {
-        allocations: ALLOCATIONS.load(Ordering::Relaxed),
-        zeroed_allocations: ZEROED_ALLOCATIONS.load(Ordering::Relaxed),
-        reallocations: REALLOCATIONS.load(Ordering::Relaxed),
-        deallocations: DEALLOCATIONS.load(Ordering::Relaxed),
-    };
-    drop(guard);
-    (result, counts)
+    pub(crate) const fn deallocations(self) -> usize {
+        self.deallocations
+    }
+
+    pub(crate) fn measure<F, R>(operation: F) -> (R, Self)
+    where
+        F: FnOnce() -> R,
+    {
+        let already_tracking = TRACKING.with_or_default(Cell::get);
+        assert!(
+            !already_tracking,
+            "allocation measurements cannot be nested"
+        );
+        TRACKING.with_or_default(|tracking| tracking.set(true));
+        ALLOCATIONS.store(0, Ordering::Relaxed);
+        ZEROED_ALLOCATIONS.store(0, Ordering::Relaxed);
+        REALLOCATIONS.store(0, Ordering::Relaxed);
+        DEALLOCATIONS.store(0, Ordering::Relaxed);
+        let guard = TrackingGuard;
+
+        let result = operation();
+        let counts = Self {
+            allocations: ALLOCATIONS.load(Ordering::Relaxed),
+            zeroed_allocations: ZEROED_ALLOCATIONS.load(Ordering::Relaxed),
+            reallocations: REALLOCATIONS.load(Ordering::Relaxed),
+            deallocations: DEALLOCATIONS.load(Ordering::Relaxed),
+        };
+        drop(guard);
+        (result, counts)
+    }
 }

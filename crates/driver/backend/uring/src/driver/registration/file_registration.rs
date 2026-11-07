@@ -402,12 +402,15 @@ impl FileUpdateTxn {
     pub(super) const fn start(&self) -> u32 {
         self.start
     }
+
     pub(super) fn fds(&self) -> &[i32] {
         &self.fds
     }
+
     pub(super) const fn direction(&self) -> FileUpdateDirection {
         self.direction
     }
+
     pub(super) const fn scope(&self) -> &'static str {
         self.scope
     }

@@ -12,6 +12,15 @@ use crate::{
     error::{UringError, UringResult},
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectedBufferState {
+    Unclaimed,
+    Claimed { bid: u16, publish_seq: u64 },
+    HandedOff { bid: u16, publish_seq: u64 },
+    Settled,
+    Quarantined,
+}
+
 /// The driver state a completion is allowed to reach.
 ///
 /// Mirrors [`SqeEnv`] on the other end of an operation. The completion path holds a slot
@@ -24,15 +33,6 @@ pub(crate) struct CqeEnv<'provided, 'diagnostics> {
     provided: Option<ProvidedBufPort<'provided>>,
     diagnostics: &'diagnostics UringCompletionDiagnostics,
     selected_buffer_state: SelectedBufferState,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SelectedBufferState {
-    Unclaimed,
-    Claimed { bid: u16, publish_seq: u64 },
-    HandedOff { bid: u16, publish_seq: u64 },
-    Settled,
-    Quarantined,
 }
 
 impl<'provided, 'diagnostics> CqeEnv<'provided, 'diagnostics> {

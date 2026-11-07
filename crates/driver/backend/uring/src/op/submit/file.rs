@@ -1,7 +1,7 @@
 use crate::{
     OwnedRawHandle, RawHandle,
     config::{IoFd, UringRawHandle},
-    driver::{RegisteredFileEntry, SqeEnv, SqeFd},
+    driver::{FileTable, RegisteredFileEntry, SqeEnv, SqeFd},
     error::{UringError, UringResult},
     op::{
         Close, Fallocate, FallocateRaw, Fsync, FsyncRaw, Open, ReadFixed, ReadRaw, SyncFileRange,
@@ -10,403 +10,428 @@ use crate::{
     },
 };
 use diagweave::prelude::*;
-use veloq_buf::{RegistrationCapability, heap::ChunkId};
+use libc::AT_FDCWD;
+use veloq_buf::{BufIoRangeError, RegistrationCapability, heap::ChunkId};
 use veloq_driver_core::SubmitTokenContext;
 use veloq_io_uring::{opcode, squeue, types};
-use veloq_std::{pin::Pin, string::ToString};
+use veloq_std::{io, pin::Pin, string::ToString};
 
-use super::{invalid_buf_io_range, opcode_build, resolve_any_fd, resolve_file_fd, sqe_with_fd};
+use super::common::SubmissionSupport;
 
-pub(crate) unsafe fn make_sqe_read_fixed(
-    _kernel: Pin<&mut KernelRef<ReadFixed>>,
-    rw_op: &mut ReadFixed,
-    env: &SqeEnv<'_>,
-    _token: SubmitTokenContext,
-) -> UringResult<squeue::Entry> {
-    let region_info = rw_op.buf.resolve_region_info();
-    let (ptr, len) = rw_op
-        .buf
-        .checked_read_range(rw_op.buf_offset)
-        .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_read_fixed", err))?;
-    let offset = rw_op.offset;
-    let fd = resolve_file_fd(
-        env.file_table(),
-        rw_op.fd,
-        "uring.op.submit.make_sqe_read_fixed",
-    )?;
+pub(crate) struct FileSubmission;
 
-    let fixed_idx = env.fixed_buffer_index(region_info)?;
+fn opcode_build<T>(scope: &'static str, result: io::Result<T>) -> UringResult<T> {
+    SubmissionSupport::opcode_build(scope, result)
+}
 
-    if let Some(fixed_idx) = fixed_idx {
-        opcode_build(
-            "uring.op.submit.read_fixed_opcode",
-            sqe_with_fd!(fd, |f| unsafe {
-                opcode::ReadFixed::new(f, ptr, len, fixed_idx)
-            }
-            .offset(offset)
-            .build()),
-        )
-    } else {
-        opcode_build(
-            "uring.op.submit.read_opcode",
-            sqe_with_fd!(fd, |f| unsafe { opcode::Read::new(f, ptr, len) }
+fn invalid_buf_io_range(scope: &'static str, error: BufIoRangeError) -> Report<UringError> {
+    SubmissionSupport::invalid_buf_io_range(scope, error)
+}
+
+fn resolve_file_fd(table: &FileTable, fd: IoFd, scope: &'static str) -> UringResult<SqeFd> {
+    SubmissionSupport::resolve_file_fd(table, fd, scope)
+}
+
+fn resolve_any_fd(table: &FileTable, fd: IoFd, scope: &'static str) -> UringResult<SqeFd> {
+    SubmissionSupport::resolve_any_fd(table, fd, scope)
+}
+
+impl FileSubmission {
+    pub(crate) unsafe fn make_sqe_read_fixed(
+        _kernel: Pin<&mut KernelRef<ReadFixed>>,
+        rw_op: &mut ReadFixed,
+        env: &SqeEnv<'_>,
+        _token: SubmitTokenContext,
+    ) -> UringResult<squeue::Entry> {
+        let region_info = rw_op.buf.resolve_region_info();
+        let (ptr, len) = rw_op
+            .buf
+            .checked_read_range(rw_op.buf_offset)
+            .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_read_fixed", err))?;
+        let offset = rw_op.offset;
+        let fd = resolve_file_fd(
+            env.file_table(),
+            rw_op.fd,
+            "uring.op.submit.make_sqe_read_fixed",
+        )?;
+
+        let fixed_idx = env.fixed_buffer_index(region_info)?;
+
+        if let Some(fixed_idx) = fixed_idx {
+            opcode_build(
+                "uring.op.submit.read_fixed_opcode",
+                sqe_with_fd!(fd, |f| unsafe {
+                    opcode::ReadFixed::new(f, ptr, len, fixed_idx)
+                }
                 .offset(offset)
                 .build()),
-        )
-    }
-}
-
-pub(crate) unsafe fn make_sqe_read_raw(
-    _kernel: Pin<&mut KernelRef<ReadRaw>>,
-    rw_op: &mut ReadRaw,
-    env: &SqeEnv<'_>,
-    _token: SubmitTokenContext,
-) -> UringResult<squeue::Entry> {
-    let region_info = rw_op.buf.resolve_region_info();
-    let (ptr, len) = rw_op
-        .buf
-        .checked_read_range(rw_op.buf_offset)
-        .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_read_raw", err))?;
-    let fd = rw_op.fd.as_fd();
-
-    let fixed_idx = env.fixed_buffer_index(region_info)?;
-
-    if let Some(fixed_idx) = fixed_idx {
-        opcode_build(
-            "uring.op.submit.read_raw_fixed_opcode",
-            unsafe { opcode::ReadFixed::new(types::Fd(fd), ptr, len, fixed_idx) }
-                .offset(rw_op.offset)
-                .build(),
-        )
-    } else {
-        opcode_build(
-            "uring.op.submit.read_raw_opcode",
-            unsafe { opcode::Read::new(types::Fd(fd), ptr, len) }
-                .offset(rw_op.offset)
-                .build(),
-        )
-    }
-}
-
-pub(crate) unsafe fn make_sqe_write_fixed(
-    _kernel: Pin<&mut KernelRef<WriteFixed>>,
-    rw_op: &mut WriteFixed,
-    env: &SqeEnv<'_>,
-    _token: SubmitTokenContext,
-) -> UringResult<squeue::Entry> {
-    let region_info = rw_op.buf.resolve_region_info();
-    let (ptr, len) = rw_op
-        .buf
-        .checked_write_range(rw_op.buf_offset)
-        .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_write_fixed", err))?;
-    let offset = rw_op.offset;
-    let fd = resolve_file_fd(
-        env.file_table(),
-        rw_op.fd,
-        "uring.op.submit.make_sqe_write_fixed",
-    )?;
-
-    let fixed_idx = env.fixed_buffer_index(region_info)?;
-
-    if let Some(fixed_idx) = fixed_idx {
-        opcode_build(
-            "uring.op.submit.write_fixed_opcode",
-            sqe_with_fd!(fd, |f| unsafe {
-                opcode::WriteFixed::new(f, ptr, len, fixed_idx)
-            }
-            .offset(offset)
-            .build()),
-        )
-    } else {
-        opcode_build(
-            "uring.op.submit.write_opcode",
-            sqe_with_fd!(fd, |f| unsafe { opcode::Write::new(f, ptr, len) }
-                .offset(offset)
-                .build()),
-        )
-    }
-}
-
-pub(crate) unsafe fn make_sqe_write_raw(
-    _kernel: Pin<&mut KernelRef<WriteRaw>>,
-    rw_op: &mut WriteRaw,
-    env: &SqeEnv<'_>,
-    _token: SubmitTokenContext,
-) -> UringResult<squeue::Entry> {
-    let region_info = rw_op.buf.resolve_region_info();
-    let (ptr, len) = rw_op
-        .buf
-        .checked_write_range(rw_op.buf_offset)
-        .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_write_raw", err))?;
-    let fd = rw_op.fd.as_fd();
-
-    let fixed_idx = env.fixed_buffer_index(region_info)?;
-
-    if let Some(fixed_idx) = fixed_idx {
-        opcode_build(
-            "uring.op.submit.write_raw_fixed_opcode",
-            unsafe { opcode::WriteFixed::new(types::Fd(fd), ptr, len, fixed_idx) }
-                .offset(rw_op.offset)
-                .build(),
-        )
-    } else {
-        opcode_build(
-            "uring.op.submit.write_raw_opcode",
-            unsafe { opcode::Write::new(types::Fd(fd), ptr, len) }
-                .offset(rw_op.offset)
-                .build(),
-        )
-    }
-}
-
-pub(crate) unsafe fn make_sqe_close(
-    _kernel: Pin<&mut KernelRef<Close>>,
-    close_op: &mut Close,
-    env: &SqeEnv<'_>,
-    _token: SubmitTokenContext,
-) -> UringResult<squeue::Entry> {
-    let scope = "uring.op.submit.make_sqe_close";
-    // `Close` hands the descriptor to the kernel, so it is only valid where the driver owns
-    // the handle. Which side of the file table the descriptor lives on decides where to look:
-    // a registered one has a slot entry, a direct one is tracked by handle.
-    let owned = match close_op.fd {
-        IoFd::Registered { index, .. } => !matches!(
-            env.file_table().entry(index),
-            Some(RegisteredFileEntry::BorrowedFd { .. })
-        ),
-        IoFd::Direct(_) => false,
-        IoFd::OwnedDirect { .. } => env.file_table().owns_direct(close_op.fd),
-    };
-    if !owned {
-        return Err(UringError::InvalidInput
-            .report(
-                scope,
-                "Close is only valid for owned registered file descriptors",
             )
-            .push_ctx("scope", scope)
-            .with_ctx("fd", close_op.fd.to_string())
-            .attach_note("borrowed fd Close rejected"));
-    }
-    let fd = resolve_any_fd(env.file_table(), close_op.fd, scope)?;
-    opcode_build(scope, sqe_with_fd!(fd, |f| opcode::Close::new(f).build()))
-}
-
-pub(crate) unsafe fn make_sqe_fsync(
-    _kernel: Pin<&mut KernelRef<Fsync>>,
-    fsync_op: &mut Fsync,
-    env: &SqeEnv<'_>,
-    _token: SubmitTokenContext,
-) -> UringResult<squeue::Entry> {
-    let flags = if fsync_op.datasync {
-        types::FsyncFlags::DATASYNC
-    } else {
-        types::FsyncFlags::empty()
-    };
-
-    let fd = resolve_file_fd(
-        env.file_table(),
-        fsync_op.fd,
-        "uring.op.submit.make_sqe_fsync",
-    )?;
-    opcode_build(
-        "uring.op.submit.fsync_opcode",
-        sqe_with_fd!(fd, |f| opcode::Fsync::new(f).flags(flags).build()),
-    )
-}
-
-pub(crate) unsafe fn make_sqe_fsync_raw(
-    _kernel: Pin<&mut KernelRef<FsyncRaw>>,
-    fsync_op: &mut FsyncRaw,
-    _env: &SqeEnv<'_>,
-    _token: SubmitTokenContext,
-) -> UringResult<squeue::Entry> {
-    let flags = if fsync_op.datasync {
-        types::FsyncFlags::DATASYNC
-    } else {
-        types::FsyncFlags::empty()
-    };
-
-    let fd = fsync_op.fd.as_fd();
-    opcode_build(
-        "uring.op.submit.fsync_raw_opcode",
-        opcode::Fsync::new(types::Fd(fd)).flags(flags).build(),
-    )
-}
-
-pub(crate) unsafe fn make_sqe_sync_range(
-    _kernel: Pin<&mut KernelRef<SyncFileRange>>,
-    sync_op: &mut SyncFileRange,
-    env: &SqeEnv<'_>,
-    _token: SubmitTokenContext,
-) -> UringResult<squeue::Entry> {
-    let nbytes = if sync_op.nbytes > u32::MAX as u64 {
-        if sync_op.nbytes == u64::MAX {
-            0
         } else {
-            return UringError::InvalidInput
-                .push_ctx("scope", "uring.op.submit.make_sqe_sync_range")
-                .with_ctx("nbytes", sync_op.nbytes)
-                .with_ctx("max_nbytes", u32::MAX as u64)
-                .attach_note("sync_file_range nbytes exceeds 32-bit limit and is not u64::MAX");
+            opcode_build(
+                "uring.op.submit.read_opcode",
+                sqe_with_fd!(fd, |f| unsafe { opcode::Read::new(f, ptr, len) }
+                    .offset(offset)
+                    .build()),
+            )
         }
-    } else {
-        sync_op.nbytes as u32
-    };
+    }
 
-    let fd = resolve_file_fd(
-        env.file_table(),
-        sync_op.fd,
-        "uring.op.submit.make_sqe_sync_range",
-    )?;
-    opcode_build(
-        "uring.op.submit.sync_range_opcode",
-        sqe_with_fd!(fd, |f| opcode::SyncFileRange::new(f, nbytes)
-            .offset(sync_op.offset)
-            .flags(sync_op.flags)
-            .build()),
-    )
-}
+    pub(crate) unsafe fn make_sqe_read_raw(
+        _kernel: Pin<&mut KernelRef<ReadRaw>>,
+        rw_op: &mut ReadRaw,
+        env: &SqeEnv<'_>,
+        _token: SubmitTokenContext,
+    ) -> UringResult<squeue::Entry> {
+        let region_info = rw_op.buf.resolve_region_info();
+        let (ptr, len) = rw_op
+            .buf
+            .checked_read_range(rw_op.buf_offset)
+            .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_read_raw", err))?;
+        let fd = rw_op.fd.as_fd();
 
-pub(crate) unsafe fn make_sqe_sync_range_raw(
-    _kernel: Pin<&mut KernelRef<SyncFileRangeRaw>>,
-    sync_op: &mut SyncFileRangeRaw,
-    _env: &SqeEnv<'_>,
-    _token: SubmitTokenContext,
-) -> UringResult<squeue::Entry> {
-    let nbytes = if sync_op.nbytes > u32::MAX as u64 {
-        if sync_op.nbytes == u64::MAX {
-            0
+        let fixed_idx = env.fixed_buffer_index(region_info)?;
+
+        if let Some(fixed_idx) = fixed_idx {
+            opcode_build(
+                "uring.op.submit.read_raw_fixed_opcode",
+                unsafe { opcode::ReadFixed::new(types::Fd(fd), ptr, len, fixed_idx) }
+                    .offset(rw_op.offset)
+                    .build(),
+            )
         } else {
-            return UringError::InvalidInput
-                .push_ctx("scope", "uring.op.submit.make_sqe_sync_range_raw")
-                .with_ctx("nbytes", sync_op.nbytes)
-                .with_ctx("max_nbytes", u32::MAX as u64)
-                .attach_note("sync_file_range nbytes exceeds 32-bit limit and is not u64::MAX");
+            opcode_build(
+                "uring.op.submit.read_raw_opcode",
+                unsafe { opcode::Read::new(types::Fd(fd), ptr, len) }
+                    .offset(rw_op.offset)
+                    .build(),
+            )
         }
-    } else {
-        sync_op.nbytes as u32
-    };
-
-    let fd = sync_op.fd.as_fd();
-    opcode_build(
-        "uring.op.submit.sync_range_raw_opcode",
-        opcode::SyncFileRange::new(types::Fd(fd), nbytes)
-            .offset(sync_op.offset)
-            .flags(sync_op.flags)
-            .build(),
-    )
-}
-
-pub(crate) unsafe fn make_sqe_fallocate(
-    _kernel: Pin<&mut KernelRef<Fallocate>>,
-    fallocate_op: &mut Fallocate,
-    env: &SqeEnv<'_>,
-    _token: SubmitTokenContext,
-) -> UringResult<squeue::Entry> {
-    let fd = resolve_file_fd(
-        env.file_table(),
-        fallocate_op.fd,
-        "uring.op.submit.make_sqe_fallocate",
-    )?;
-    opcode_build(
-        "uring.op.submit.fallocate_opcode",
-        sqe_with_fd!(fd, |f| opcode::Fallocate::new(f, fallocate_op.len)
-            .offset(fallocate_op.offset)
-            .mode(fallocate_op.mode)
-            .build()),
-    )
-}
-
-pub(crate) unsafe fn make_sqe_fallocate_raw(
-    _kernel: Pin<&mut KernelRef<FallocateRaw>>,
-    fallocate_op: &mut FallocateRaw,
-    _env: &SqeEnv<'_>,
-    _token: SubmitTokenContext,
-) -> UringResult<squeue::Entry> {
-    let fd = fallocate_op.fd.as_fd();
-    opcode_build(
-        "uring.op.submit.fallocate_raw_opcode",
-        opcode::Fallocate::new(types::Fd(fd), fallocate_op.len)
-            .offset(fallocate_op.offset)
-            .mode(fallocate_op.mode)
-            .build(),
-    )
-}
-
-pub(crate) unsafe fn make_sqe_open(
-    _kernel: Pin<&mut OpenPayload>,
-    user: &mut Open,
-    _env: &SqeEnv<'_>,
-    _token: SubmitTokenContext,
-) -> UringResult<squeue::Entry> {
-    let path_ptr = user.path.as_slice().as_ptr() as *const _;
-    opcode_build(
-        "uring.op.submit.openat_opcode",
-        unsafe { opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path_ptr) }
-            .flags(user.flags)
-            .mode(user.mode)
-            .build(),
-    )
-}
-
-pub(crate) fn opened_handle_from_res(res: UringResult<usize>) -> UringResult<OwnedRawHandle> {
-    res.map(|raw| unsafe {
-        OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_file(raw as i32)))
-    })
-}
-
-pub(crate) fn resolve_chunks_read_fixed(
-    _kernel: Pin<&KernelRef<ReadFixed>>,
-    rw_op: &ReadFixed,
-    chunks: &mut [ChunkId],
-) -> usize {
-    let info = rw_op.buf.resolve_region_info();
-    if let RegistrationCapability::RegisteredChunk(chunk_id) = info.registration {
-        chunks[0] = chunk_id;
-        1
-    } else {
-        0
     }
-}
 
-pub(crate) fn resolve_chunks_read_raw(
-    _kernel: Pin<&KernelRef<ReadRaw>>,
-    rw_op: &ReadRaw,
-    chunks: &mut [ChunkId],
-) -> usize {
-    let info = rw_op.buf.resolve_region_info();
-    if let RegistrationCapability::RegisteredChunk(chunk_id) = info.registration {
-        chunks[0] = chunk_id;
-        1
-    } else {
-        0
+    pub(crate) unsafe fn make_sqe_write_fixed(
+        _kernel: Pin<&mut KernelRef<WriteFixed>>,
+        rw_op: &mut WriteFixed,
+        env: &SqeEnv<'_>,
+        _token: SubmitTokenContext,
+    ) -> UringResult<squeue::Entry> {
+        let region_info = rw_op.buf.resolve_region_info();
+        let (ptr, len) = rw_op
+            .buf
+            .checked_write_range(rw_op.buf_offset)
+            .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_write_fixed", err))?;
+        let offset = rw_op.offset;
+        let fd = resolve_file_fd(
+            env.file_table(),
+            rw_op.fd,
+            "uring.op.submit.make_sqe_write_fixed",
+        )?;
+
+        let fixed_idx = env.fixed_buffer_index(region_info)?;
+
+        if let Some(fixed_idx) = fixed_idx {
+            opcode_build(
+                "uring.op.submit.write_fixed_opcode",
+                sqe_with_fd!(fd, |f| unsafe {
+                    opcode::WriteFixed::new(f, ptr, len, fixed_idx)
+                }
+                .offset(offset)
+                .build()),
+            )
+        } else {
+            opcode_build(
+                "uring.op.submit.write_opcode",
+                sqe_with_fd!(fd, |f| unsafe { opcode::Write::new(f, ptr, len) }
+                    .offset(offset)
+                    .build()),
+            )
+        }
     }
-}
 
-pub(crate) fn resolve_chunks_write_fixed(
-    _kernel: Pin<&KernelRef<WriteFixed>>,
-    rw_op: &WriteFixed,
-    chunks: &mut [ChunkId],
-) -> usize {
-    let info = rw_op.buf.resolve_region_info();
-    if let RegistrationCapability::RegisteredChunk(chunk_id) = info.registration {
-        chunks[0] = chunk_id;
-        1
-    } else {
-        0
+    pub(crate) unsafe fn make_sqe_write_raw(
+        _kernel: Pin<&mut KernelRef<WriteRaw>>,
+        rw_op: &mut WriteRaw,
+        env: &SqeEnv<'_>,
+        _token: SubmitTokenContext,
+    ) -> UringResult<squeue::Entry> {
+        let region_info = rw_op.buf.resolve_region_info();
+        let (ptr, len) = rw_op
+            .buf
+            .checked_write_range(rw_op.buf_offset)
+            .map_err(|err| invalid_buf_io_range("uring.op.submit.make_sqe_write_raw", err))?;
+        let fd = rw_op.fd.as_fd();
+
+        let fixed_idx = env.fixed_buffer_index(region_info)?;
+
+        if let Some(fixed_idx) = fixed_idx {
+            opcode_build(
+                "uring.op.submit.write_raw_fixed_opcode",
+                unsafe { opcode::WriteFixed::new(types::Fd(fd), ptr, len, fixed_idx) }
+                    .offset(rw_op.offset)
+                    .build(),
+            )
+        } else {
+            opcode_build(
+                "uring.op.submit.write_raw_opcode",
+                unsafe { opcode::Write::new(types::Fd(fd), ptr, len) }
+                    .offset(rw_op.offset)
+                    .build(),
+            )
+        }
     }
-}
 
-pub(crate) fn resolve_chunks_write_raw(
-    _kernel: Pin<&KernelRef<WriteRaw>>,
-    rw_op: &WriteRaw,
-    chunks: &mut [ChunkId],
-) -> usize {
-    let info = rw_op.buf.resolve_region_info();
-    if let RegistrationCapability::RegisteredChunk(chunk_id) = info.registration {
-        chunks[0] = chunk_id;
-        1
-    } else {
-        0
+    pub(crate) unsafe fn make_sqe_close(
+        _kernel: Pin<&mut KernelRef<Close>>,
+        close_op: &mut Close,
+        env: &SqeEnv<'_>,
+        _token: SubmitTokenContext,
+    ) -> UringResult<squeue::Entry> {
+        let scope = "uring.op.submit.make_sqe_close";
+        // `Close` hands the descriptor to the kernel, so it is only valid where the driver owns
+        // the handle. Which side of the file table the descriptor lives on decides where to look:
+        // a registered one has a slot entry, a direct one is tracked by handle.
+        let owned = match close_op.fd {
+            IoFd::Registered { index, .. } => !matches!(
+                env.file_table().entry(index),
+                Some(RegisteredFileEntry::BorrowedFd { .. })
+            ),
+            IoFd::Direct(_) => false,
+            IoFd::OwnedDirect { .. } => env.file_table().owns_direct(close_op.fd),
+        };
+        if !owned {
+            return Err(UringError::InvalidInput
+                .report(
+                    scope,
+                    "Close is only valid for owned registered file descriptors",
+                )
+                .push_ctx("scope", scope)
+                .with_ctx("fd", close_op.fd.to_string())
+                .attach_note("borrowed fd Close rejected"));
+        }
+        let fd = resolve_any_fd(env.file_table(), close_op.fd, scope)?;
+        opcode_build(scope, sqe_with_fd!(fd, |f| opcode::Close::new(f).build()))
+    }
+
+    pub(crate) unsafe fn make_sqe_fsync(
+        _kernel: Pin<&mut KernelRef<Fsync>>,
+        fsync_op: &mut Fsync,
+        env: &SqeEnv<'_>,
+        _token: SubmitTokenContext,
+    ) -> UringResult<squeue::Entry> {
+        let flags = if fsync_op.datasync {
+            types::FsyncFlags::DATASYNC
+        } else {
+            types::FsyncFlags::empty()
+        };
+
+        let fd = resolve_file_fd(
+            env.file_table(),
+            fsync_op.fd,
+            "uring.op.submit.make_sqe_fsync",
+        )?;
+        opcode_build(
+            "uring.op.submit.fsync_opcode",
+            sqe_with_fd!(fd, |f| opcode::Fsync::new(f).flags(flags).build()),
+        )
+    }
+
+    pub(crate) unsafe fn make_sqe_fsync_raw(
+        _kernel: Pin<&mut KernelRef<FsyncRaw>>,
+        fsync_op: &mut FsyncRaw,
+        _env: &SqeEnv<'_>,
+        _token: SubmitTokenContext,
+    ) -> UringResult<squeue::Entry> {
+        let flags = if fsync_op.datasync {
+            types::FsyncFlags::DATASYNC
+        } else {
+            types::FsyncFlags::empty()
+        };
+
+        let fd = fsync_op.fd.as_fd();
+        opcode_build(
+            "uring.op.submit.fsync_raw_opcode",
+            opcode::Fsync::new(types::Fd(fd)).flags(flags).build(),
+        )
+    }
+
+    pub(crate) unsafe fn make_sqe_sync_range(
+        _kernel: Pin<&mut KernelRef<SyncFileRange>>,
+        sync_op: &mut SyncFileRange,
+        env: &SqeEnv<'_>,
+        _token: SubmitTokenContext,
+    ) -> UringResult<squeue::Entry> {
+        let nbytes = if sync_op.nbytes > u32::MAX as u64 {
+            if sync_op.nbytes == u64::MAX {
+                0
+            } else {
+                return UringError::InvalidInput
+                    .push_ctx("scope", "uring.op.submit.make_sqe_sync_range")
+                    .with_ctx("nbytes", sync_op.nbytes)
+                    .with_ctx("max_nbytes", u32::MAX as u64)
+                    .attach_note(
+                        "sync_file_range nbytes exceeds 32-bit limit and is not u64::MAX",
+                    );
+            }
+        } else {
+            sync_op.nbytes as u32
+        };
+
+        let fd = resolve_file_fd(
+            env.file_table(),
+            sync_op.fd,
+            "uring.op.submit.make_sqe_sync_range",
+        )?;
+        opcode_build(
+            "uring.op.submit.sync_range_opcode",
+            sqe_with_fd!(fd, |f| opcode::SyncFileRange::new(f, nbytes)
+                .offset(sync_op.offset)
+                .flags(sync_op.flags)
+                .build()),
+        )
+    }
+
+    pub(crate) unsafe fn make_sqe_sync_range_raw(
+        _kernel: Pin<&mut KernelRef<SyncFileRangeRaw>>,
+        sync_op: &mut SyncFileRangeRaw,
+        _env: &SqeEnv<'_>,
+        _token: SubmitTokenContext,
+    ) -> UringResult<squeue::Entry> {
+        let nbytes = if sync_op.nbytes > u32::MAX as u64 {
+            if sync_op.nbytes == u64::MAX {
+                0
+            } else {
+                return UringError::InvalidInput
+                    .push_ctx("scope", "uring.op.submit.make_sqe_sync_range_raw")
+                    .with_ctx("nbytes", sync_op.nbytes)
+                    .with_ctx("max_nbytes", u32::MAX as u64)
+                    .attach_note(
+                        "sync_file_range nbytes exceeds 32-bit limit and is not u64::MAX",
+                    );
+            }
+        } else {
+            sync_op.nbytes as u32
+        };
+
+        let fd = sync_op.fd.as_fd();
+        opcode_build(
+            "uring.op.submit.sync_range_raw_opcode",
+            opcode::SyncFileRange::new(types::Fd(fd), nbytes)
+                .offset(sync_op.offset)
+                .flags(sync_op.flags)
+                .build(),
+        )
+    }
+
+    pub(crate) unsafe fn make_sqe_fallocate(
+        _kernel: Pin<&mut KernelRef<Fallocate>>,
+        fallocate_op: &mut Fallocate,
+        env: &SqeEnv<'_>,
+        _token: SubmitTokenContext,
+    ) -> UringResult<squeue::Entry> {
+        let fd = resolve_file_fd(
+            env.file_table(),
+            fallocate_op.fd,
+            "uring.op.submit.make_sqe_fallocate",
+        )?;
+        opcode_build(
+            "uring.op.submit.fallocate_opcode",
+            sqe_with_fd!(fd, |f| opcode::Fallocate::new(f, fallocate_op.len)
+                .offset(fallocate_op.offset)
+                .mode(fallocate_op.mode)
+                .build()),
+        )
+    }
+
+    pub(crate) unsafe fn make_sqe_fallocate_raw(
+        _kernel: Pin<&mut KernelRef<FallocateRaw>>,
+        fallocate_op: &mut FallocateRaw,
+        _env: &SqeEnv<'_>,
+        _token: SubmitTokenContext,
+    ) -> UringResult<squeue::Entry> {
+        let fd = fallocate_op.fd.as_fd();
+        opcode_build(
+            "uring.op.submit.fallocate_raw_opcode",
+            opcode::Fallocate::new(types::Fd(fd), fallocate_op.len)
+                .offset(fallocate_op.offset)
+                .mode(fallocate_op.mode)
+                .build(),
+        )
+    }
+
+    pub(crate) unsafe fn make_sqe_open(
+        _kernel: Pin<&mut OpenPayload>,
+        user: &mut Open,
+        _env: &SqeEnv<'_>,
+        _token: SubmitTokenContext,
+    ) -> UringResult<squeue::Entry> {
+        let path_ptr = user.path.as_slice().as_ptr() as *const _;
+        opcode_build(
+            "uring.op.submit.openat_opcode",
+            unsafe { opcode::OpenAt::new(types::Fd(AT_FDCWD), path_ptr) }
+                .flags(user.flags)
+                .mode(user.mode)
+                .build(),
+        )
+    }
+
+    pub(crate) fn opened_handle_from_res(res: UringResult<usize>) -> UringResult<OwnedRawHandle> {
+        res.map(|raw| unsafe {
+            OwnedRawHandle::from_raw_owned(RawHandle::new(UringRawHandle::for_file(raw as i32)))
+        })
+    }
+
+    pub(crate) fn resolve_chunks_read_fixed(
+        _kernel: Pin<&KernelRef<ReadFixed>>,
+        rw_op: &ReadFixed,
+        chunks: &mut [ChunkId],
+    ) -> usize {
+        let info = rw_op.buf.resolve_region_info();
+        if let RegistrationCapability::RegisteredChunk(chunk_id) = info.registration {
+            chunks[0] = chunk_id;
+            1
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn resolve_chunks_read_raw(
+        _kernel: Pin<&KernelRef<ReadRaw>>,
+        rw_op: &ReadRaw,
+        chunks: &mut [ChunkId],
+    ) -> usize {
+        let info = rw_op.buf.resolve_region_info();
+        if let RegistrationCapability::RegisteredChunk(chunk_id) = info.registration {
+            chunks[0] = chunk_id;
+            1
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn resolve_chunks_write_fixed(
+        _kernel: Pin<&KernelRef<WriteFixed>>,
+        rw_op: &WriteFixed,
+        chunks: &mut [ChunkId],
+    ) -> usize {
+        let info = rw_op.buf.resolve_region_info();
+        if let RegistrationCapability::RegisteredChunk(chunk_id) = info.registration {
+            chunks[0] = chunk_id;
+            1
+        } else {
+            0
+        }
+    }
+
+    pub(crate) fn resolve_chunks_write_raw(
+        _kernel: Pin<&KernelRef<WriteRaw>>,
+        rw_op: &WriteRaw,
+        chunks: &mut [ChunkId],
+    ) -> usize {
+        let info = rw_op.buf.resolve_region_info();
+        if let RegistrationCapability::RegisteredChunk(chunk_id) = info.registration {
+            chunks[0] = chunk_id;
+            1
+        } else {
+            0
+        }
     }
 }

@@ -18,6 +18,9 @@ mod op;
 #[cfg(test)]
 mod test_alloc;
 
+use libc::socklen_t;
+use veloq_std::net::SocketAddr;
+
 pub use config::{
     BorrowedRawHandle, DirectOwnerId, FileTableExhaustion, IoFd, IoMode, MAX_PROVIDED_BUF_ENTRIES,
     OwnedRawHandle, ProvidedBufConfig, RawHandle, RawHandleKind, SetupFlags, SetupPolicy,
@@ -28,5 +31,17 @@ pub use diagnostics::{
 };
 pub use driver::{ProvidedBufferSnapshot, UringDriver, UringOpState};
 pub use error::{UringError, UringResult};
-pub use net::{Socket, peer_addr_of_handle, socket_addr_to_storage, to_socket_addr};
+pub use net::Socket;
 pub use op::{UringOp, UringSlotSpec, UringUserPayload};
+
+pub fn peer_addr_of_handle(handle: UringRawHandle) -> UringResult<SocketAddr> {
+    Socket::peer_addr_of_handle(handle)
+}
+
+pub fn socket_addr_to_storage(addr: SocketAddr) -> (SockAddrStorage, socklen_t) {
+    SockAddrStorage::from_socket_addr(addr)
+}
+
+pub fn to_socket_addr(buf: &[u8]) -> UringResult<SocketAddr> {
+    SockAddrStorage::decode(buf)
+}

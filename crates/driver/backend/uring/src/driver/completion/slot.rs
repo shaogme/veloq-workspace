@@ -11,7 +11,10 @@ use crate::{
         submission::SlotAccessReporter,
     },
     error::{UringError, UringResult},
-    op::{Close, RecordPolicy, Slot, UringOperationDescriptor, UringRecordItem, UringSlotSpec},
+    op::{
+        Close, RecordPolicy, Slot, UringOperationDescriptor, UringRecordItem, UringRecordItemKind,
+        UringSlotSpec,
+    },
 };
 use veloq_driver_core::{
     CancelMode, CompletionCleanupGuard, CompletionContinuation, CompletionFailure,
@@ -100,11 +103,11 @@ impl CompletionSlotRouter {
                 });
             }
         };
-        match record_item {
-            UringRecordItem::Ignored => Ok(CompletionSettlement::Ignore {
+        match record_item.kind() {
+            UringRecordItemKind::Ignored => Ok(CompletionSettlement::Ignore {
                 effect: UringBackendEffect::None,
             }),
-            UringRecordItem::Retained {
+            UringRecordItemKind::Retained {
                 logical_receiver_generation,
             } => {
                 let effect =
@@ -119,29 +122,46 @@ impl CompletionSlotRouter {
                     effect,
                 })
             }
-            UringRecordItem::NewWithRearm {
-                item,
+            UringRecordItemKind::NewWithRearm {
                 logical_receiver_generation,
-            } => Ok(CompletionSettlement::User {
-                event,
-                payload: item,
-                detail: None,
-                cleanup: CompletionCleanupGuard::default(),
-                continuation: CompletionContinuation::More,
-                effect: UringBackendEffect::UdpRearm {
-                    token: event.token(),
-                    logical_receiver_generation,
-                },
-            }),
-            UringRecordItem::New(item) => Ok(CompletionSettlement::User {
-                event,
-                payload: item,
-                detail: None,
-                cleanup: CompletionCleanupGuard::default(),
-                continuation: CompletionContinuation::More,
-                effect: UringBackendEffect::None,
-            }),
-            UringRecordItem::UseSubmitPayload => Err(KernelCompletionError {
+            } => {
+                let Some(item) = record_item.into_item() else {
+                    return Err(KernelCompletionError {
+                        report: Self::record_item_policy_report(operation_name, event.token()),
+                        fallback_cleanup: false,
+                        cleanup: CompletionCleanupGuard::default(),
+                    });
+                };
+                Ok(CompletionSettlement::User {
+                    event,
+                    payload: item,
+                    detail: None,
+                    cleanup: CompletionCleanupGuard::default(),
+                    continuation: CompletionContinuation::More,
+                    effect: UringBackendEffect::UdpRearm {
+                        token: event.token(),
+                        logical_receiver_generation,
+                    },
+                })
+            }
+            UringRecordItemKind::New => {
+                let Some(item) = record_item.into_item() else {
+                    return Err(KernelCompletionError {
+                        report: Self::record_item_policy_report(operation_name, event.token()),
+                        fallback_cleanup: false,
+                        cleanup: CompletionCleanupGuard::default(),
+                    });
+                };
+                Ok(CompletionSettlement::User {
+                    event,
+                    payload: item,
+                    detail: None,
+                    cleanup: CompletionCleanupGuard::default(),
+                    continuation: CompletionContinuation::More,
+                    effect: UringBackendEffect::None,
+                })
+            }
+            UringRecordItemKind::UseSubmitPayload => Err(KernelCompletionError {
                 report: Self::record_item_policy_report(operation_name, event.token()),
                 fallback_cleanup: false,
                 cleanup: CompletionCleanupGuard::default(),
@@ -214,9 +234,9 @@ impl CompletionSlotRouter {
         // When no specific detail exists, preserve per-CQE routing semantics by using the completion error as detail.
         let mut res_error = final_result.err();
 
-        if let UringRecordItem::Retained {
+        if let UringRecordItemKind::Retained {
             logical_receiver_generation,
-        } = record_item
+        } = record_item.kind()
         {
             let effect =
                 logical_receiver_generation.map_or(UringBackendEffect::None, |generation| {
@@ -228,11 +248,17 @@ impl CompletionSlotRouter {
             return Ok(CompletionSettlement::Retained { cleanup, effect });
         }
 
-        if let UringRecordItem::NewWithRearm {
-            item,
+        if let UringRecordItemKind::NewWithRearm {
             logical_receiver_generation,
-        } = record_item
+        } = record_item.kind()
         {
+            let Some(item) = record_item.into_item() else {
+                return Err(KernelCompletionError {
+                    report: Self::record_item_policy_report(operation_name, token),
+                    fallback_cleanup: false,
+                    cleanup,
+                });
+            };
             return Ok(CompletionSettlement::User {
                 event,
                 payload: item,
@@ -250,18 +276,19 @@ impl CompletionSlotRouter {
             // slot 原地不动：op 与提交 payload 还要给内核后续的完成用，cell 也必须停在
             // `InFlightWaiting` 才能继续路由。
             // Keep the slot in place because the kernel still uses its op and submission payload for later completions.
-            let item = match record_item {
-                UringRecordItem::New(item) => item,
-                UringRecordItem::NewWithRearm { item, .. } => item,
-                UringRecordItem::UseSubmitPayload
-                | UringRecordItem::Ignored
-                | UringRecordItem::Retained { .. } => {
-                    return Err(KernelCompletionError {
-                        report: Self::record_item_policy_report(operation_name, token),
-                        fallback_cleanup: false,
-                        cleanup,
-                    });
-                }
+            let item = match record_item.kind() {
+                UringRecordItemKind::New => record_item.into_item(),
+                UringRecordItemKind::UseSubmitPayload
+                | UringRecordItemKind::Ignored
+                | UringRecordItemKind::NewWithRearm { .. }
+                | UringRecordItemKind::Retained { .. } => None,
+            };
+            let Some(item) = item else {
+                return Err(KernelCompletionError {
+                    report: Self::record_item_policy_report(operation_name, token),
+                    fallback_cleanup: false,
+                    cleanup,
+                });
             };
             return Ok(CompletionSettlement::User {
                 event,
@@ -279,12 +306,21 @@ impl CompletionSlotRouter {
         let (submit_payload, detail) = completed.take_completion_data();
         // multishot 的终态仍产生一条 item，并在此释放提交 payload（例如监听 socket）。
         // A final multishot completion still produces an item and releases its submit payload, such as a listening socket.
-        let payload = match record_item {
-            UringRecordItem::New(item) => {
+        let payload = match record_item.kind() {
+            UringRecordItemKind::New => {
+                let Some(item) = record_item.into_item() else {
+                    drop(submit_payload);
+                    drop(detail);
+                    return Err(KernelCompletionError {
+                        report: Self::record_item_policy_report(operation_name, token),
+                        fallback_cleanup: false,
+                        cleanup,
+                    });
+                };
                 drop(submit_payload);
                 item
             }
-            UringRecordItem::UseSubmitPayload => {
+            UringRecordItemKind::UseSubmitPayload => {
                 let Some(payload) = submit_payload else {
                     drop(detail);
                     return Err(KernelCompletionError {
@@ -298,9 +334,9 @@ impl CompletionSlotRouter {
                 };
                 payload
             }
-            UringRecordItem::Ignored
-            | UringRecordItem::NewWithRearm { .. }
-            | UringRecordItem::Retained { .. } => {
+            UringRecordItemKind::Ignored
+            | UringRecordItemKind::NewWithRearm { .. }
+            | UringRecordItemKind::Retained { .. } => {
                 drop(submit_payload);
                 drop(detail);
                 return Err(KernelCompletionError {

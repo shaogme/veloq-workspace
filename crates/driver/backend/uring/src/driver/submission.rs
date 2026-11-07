@@ -9,12 +9,10 @@ use crate::{
         registration::SqeFd,
     },
     error::{UringError, UringResult},
-    op::{
-        CompletionCleanupHintFn, Reserved, Slot, SlotView, SubmissionStrategy, UringOp,
-        UringOpRegistryExt, opcode_build, sqe_with_fd,
-    },
+    op::{CompletionCleanupHintFn, Slot, SubmissionStrategy, SubmissionSupport, UringOp},
 };
 use diagweave::prelude::*;
+use libc::ETIME;
 pub(crate) use receipt::{
     KernelEnterPlan, SubmissionError, SubmissionReceipt, SubmissionScope, SubmitProgress,
     WaitBudgetSource,
@@ -23,8 +21,8 @@ use tracing::{debug, trace};
 pub(crate) use txn::{SlotAccessReporter, UringSubmitTxn};
 use veloq_buf::heap::ChunkId;
 use veloq_driver_core::{
-    CheckedSlotView, CompletionToken, DriverSubmitResult, InFlightWaiting, OpToken, SubmitStatus,
-    SubmitTokenContext,
+    CheckedSlotView, CompletionToken, DriverSubmitResult, InFlightWaiting, OpToken, Reserved,
+    SlotRegistryExt as UringOpRegistryExt, SlotView, SubmitStatus, SubmitTokenContext,
 };
 use veloq_io_uring::{
     EnterArgs, EnterFlags, opcode, squeue,
@@ -247,10 +245,16 @@ impl SubmissionEngine {
         // eventfd 与其他描述符一样注册；内核表满或禁用时会落入回退区域。
         let sqe_fd = context.resolve_waker_file(waker_fd)?;
         let (buf, len) = context.waker_buffer();
-        let sqe = opcode_build(
+        let sqe = SubmissionSupport::opcode_build(
             "driver.submit_waker.opcode",
-            sqe_with_fd!(sqe_fd, |f| unsafe { opcode::Read::new(f, buf, len) }
-                .build()),
+            match sqe_fd {
+                SqeFd::Fixed(index) => {
+                    unsafe { opcode::Read::new(types::Fixed(index), buf, len) }.build()
+                }
+                SqeFd::Direct(raw) => {
+                    unsafe { opcode::Read::new(types::Fd(raw), buf, len) }.build()
+                }
+            },
         )?
         .user_data(CompletionToken::waker(0).raw());
 
@@ -479,9 +483,7 @@ impl SubmissionEngine {
                     ),
                     false,
                 )),
-                Err(error)
-                    if error.error().raw_os_error() == Some(libc::ETIME) && to_submit == 0 =>
-                {
+                Err(error) if error.error().raw_os_error() == Some(ETIME) && to_submit == 0 => {
                     Ok((
                         SubmissionReceipt::NoEntries {
                             requested: to_submit,

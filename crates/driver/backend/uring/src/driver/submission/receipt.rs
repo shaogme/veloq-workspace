@@ -285,6 +285,7 @@ impl SubmissionReceipt {
             }
         }
     }
+
     pub(crate) fn from_kernel_error(
         error: KernelSubmitError,
         requested: usize,
@@ -326,6 +327,7 @@ impl SubmissionError {
             )
             .attach_note("kernel consumption could not be applied to the control-plane ledger")
     }
+
     pub(crate) fn report(self) -> Report<UringError> {
         match self {
             SubmissionError::Kernel(report) => report,

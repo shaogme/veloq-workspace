@@ -25,31 +25,10 @@ use veloq_std::{
 };
 
 #[cfg(feature = "test-hooks")]
-use veloq_std::time::Instant;
+use veloq_std::{collections::VecDeque, time::Instant};
 
-#[cfg(feature = "test-hooks")]
-use veloq_std::collections::VecDeque;
-
-pub(crate) struct FixedBufferSubmitPort<'r, 'a> {
-    registered_chunks_cache: &'r mut BitSet,
-    chunk_records: &'r mut [Option<ChunkRegistrationRecord>],
-    chunk_owners: &'r mut [Option<BufferRegistrationOwner>],
-    budget: &'r LockedMemoryBudget,
-    _lifetime: PhantomData<&'a ()>,
-    registration_stats: &'r mut UringRegistrationStats,
-    fixed_buffers_available: bool,
-    fixed_buffers_failure_errno: Option<i32>,
-    fixed_buffer_registration: Option<&'r ResourceRegistration>,
-    registration_quarantine: &'r mut Option<BufferRegistrationQuarantine>,
-    #[cfg(feature = "test-hooks")]
-    register_buffers_update_outcomes: &'r mut VecDeque<BufferUpdateInjection>,
-    #[cfg(feature = "test-hooks")]
-    bitset_set_failure: &'r mut bool,
-    provided: Option<ProvidedBufSqeInfo>,
-}
-
-#[cfg(feature = "test-hooks")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "test-hooks")]
 pub(crate) enum BufferUpdateInjection {
     Applied,
     Rejected(i32),
@@ -75,6 +54,24 @@ impl BufferRegistrationOwner {
             _backing_owner: backing_owner,
         }
     }
+}
+
+pub(crate) struct FixedBufferSubmitPort<'r, 'a> {
+    registered_chunks_cache: &'r mut BitSet,
+    chunk_records: &'r mut [Option<ChunkRegistrationRecord>],
+    chunk_owners: &'r mut [Option<BufferRegistrationOwner>],
+    budget: &'r LockedMemoryBudget,
+    _lifetime: PhantomData<&'a ()>,
+    registration_stats: &'r mut UringRegistrationStats,
+    fixed_buffers_available: bool,
+    fixed_buffers_failure_errno: Option<i32>,
+    fixed_buffer_registration: Option<&'r ResourceRegistration>,
+    registration_quarantine: &'r mut Option<BufferRegistrationQuarantine>,
+    #[cfg(feature = "test-hooks")]
+    register_buffers_update_outcomes: &'r mut VecDeque<BufferUpdateInjection>,
+    #[cfg(feature = "test-hooks")]
+    bitset_set_failure: &'r mut bool,
+    provided: Option<ProvidedBufSqeInfo>,
 }
 
 pub(crate) struct FixedBufferOwner<'a> {
@@ -763,8 +760,7 @@ impl FixedBufferSubmitPort<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::{ChunkRegistrationRecord, ChunkRegistrationState, FixedBufferOwner};
-    use veloq_buf::LockedMemoryBudget;
-    use veloq_buf::heap::ChunkId;
+    use veloq_buf::{LockedMemoryBudget, heap::ChunkId};
 
     #[test]
     fn chunk_ledger_and_fast_bitset_agree_only_for_registered_records() {

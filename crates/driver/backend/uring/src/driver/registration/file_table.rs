@@ -256,6 +256,13 @@ impl FileTable {
         matches!(self.health, FileTableHealth::Poisoned(_))
     }
 
+    #[cfg(test)]
+    pub(super) fn is_retired_slot(&self, index: u32) -> bool {
+        self.slots
+            .get(index as usize)
+            .is_some_and(|slot| slot.state == FileSlotState::Retired)
+    }
+
     /// Permanently marks the registered-file table as unusable.
     ///
     /// Existing entries are deliberately retained. The ring must be destroyed before those
@@ -899,13 +906,15 @@ impl FileTable {
 
 #[cfg(test)]
 mod tests {
-    use libc::{close, dup2, eventfd};
+    use libc::{EFD_CLOEXEC, EFD_NONBLOCK, close, dup2, eventfd};
 
-    use super::{FileSlotState, FileTable, FileTablePoisonContext, RegisteredFileEntry, SqeFd};
-    use crate::config::{
-        FileTableExhaustion, IoFd, OwnedRawHandle, RawHandle, RawHandleKind, UringRawHandle,
+    use super::{FileTable, FileTablePoisonContext, RegisteredFileEntry, SqeFd};
+    use crate::{
+        config::{
+            FileTableExhaustion, IoFd, OwnedRawHandle, RawHandle, RawHandleKind, UringRawHandle,
+        },
+        error::UringError,
     };
-    use crate::error::UringError;
     use veloq_std::vec::Vec;
 
     fn borrowed(fd: i32) -> RegisteredFileEntry {
@@ -922,7 +931,7 @@ mod tests {
     }
 
     fn owned_eventfd() -> OwnedRawHandle {
-        let fd = unsafe { eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        let fd = unsafe { eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK) };
         assert!(fd >= 0, "eventfd creation failed");
         // SAFETY: eventfd returns a freshly created descriptor owned by this value.
         // 安全性：eventfd 返回新建描述符，其所有权归当前值。
@@ -1021,7 +1030,7 @@ mod tests {
         let mut table = table(0, FileTableExhaustion::Fallback);
         let first_handle = owned_eventfd();
         let first_fd = first_handle.raw().as_fd();
-        let replacement_source = unsafe { eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        let replacement_source = unsafe { eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK) };
         assert!(replacement_source >= 0);
         let first = table.adopt_direct(first_handle).unwrap();
 
@@ -1186,7 +1195,7 @@ mod tests {
         table.slots[index as usize].generation = u64::MAX;
         table.advance_generation(index);
 
-        assert_eq!(table.slots[index as usize].state, FileSlotState::Retired);
+        assert!(table.is_retired_slot(index));
         assert!(table.free_fixed.is_empty());
         assert!(table.claim(1).is_err());
 

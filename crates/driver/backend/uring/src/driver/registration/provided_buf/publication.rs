@@ -194,7 +194,7 @@ impl ProvidedBufPublication {
             mut publish,
             unregister,
         } = params;
-        let entries = config.entries.get();
+        let entries = config.entries().get();
         if !entries.is_power_of_two() || entries > MAX_PROVIDED_BUF_ENTRIES {
             let report = UringError::InvalidInput
                 .report(
@@ -230,7 +230,7 @@ impl ProvidedBufPublication {
                     "buffer pool could not fill a single provided buffer",
                 )
                 .with_ctx("entries", entries)
-                .with_ctx("buf_size", config.buf_size.get());
+                .with_ctx("buf_size", config.buf_size().get());
             return Err(Box::new(ProvidedBufInitializationFailure::new(
                 report,
                 Some(group),
@@ -279,7 +279,7 @@ impl ProvidedBufPublication {
             bgid = group.group_id(),
             entries,
             filled = group.available_buffers(),
-            buf_size = config.buf_size.get(),
+            buf_size = config.buf_size().get(),
             "registered provided buffer ring"
         );
         Ok(group)

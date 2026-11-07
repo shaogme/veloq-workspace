@@ -1,8 +1,8 @@
-use veloq_std::format;
-
 use diagweave::prelude::*;
+use libc::{EAGAIN, EINTR, ENOBUFS, ENOENT};
 use tracing::{debug, trace, warn};
 use veloq_io_uring::cqueue;
+use veloq_std::{format, num::NonZeroU8};
 
 use crate::{
     config::IoFd,
@@ -17,8 +17,6 @@ use crate::{
     error::{UringError, UringResult},
     op::{CompletionCleanupHintFn, Slot, UringSlotSpec},
 };
-use veloq_std::num::NonZeroU8;
-
 use veloq_driver_core::{
     AnomalyAttach, CancelMode, CancelTicket, CompletionAnomalyKind, CompletionBackend,
     CompletionBackendHooks, CompletionBackendIngressAction, CompletionCleanupGuard,
@@ -29,6 +27,7 @@ use veloq_driver_core::{
 };
 
 pub(crate) type CompletionProgress = CompletionFlowOutcome;
+
 pub(crate) const COMP_BACKEND_URING: CompletionBackend =
     CompletionBackend::Backend(match NonZeroU8::new(2) {
         Some(val) => val,
@@ -40,6 +39,12 @@ pub(crate) enum UringBackendIngress {
         token: OpToken,
         logical_receiver_generation: u32,
     },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum WakerRecovery {
+    Rearm,
+    RebuildAndRearm,
 }
 
 enum CompletionCleanupHintState {
@@ -95,12 +100,6 @@ pub(crate) enum UringBackendEffect {
         token: OpToken,
         logical_receiver_generation: u32,
     },
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum WakerRecovery {
-    Rearm,
-    RebuildAndRearm,
 }
 
 impl Default for UringBackendEffect {
@@ -247,7 +246,7 @@ impl<'control, 'provided> UringCompletionHooks<'control, 'provided> {
         } else {
             self.diagnostics.backend().inc_waker_error();
             match -raw.res() {
-                libc::EAGAIN | libc::EINTR => {
+                EAGAIN | EINTR => {
                     debug!(res = raw.res(), "recoverable eventfd waker read completion");
                     CompletionSettlement::ControlHandled {
                         effect: UringBackendEffect::Waker {
@@ -315,7 +314,7 @@ impl<'control, 'provided> UringCompletionHooks<'control, 'provided> {
                     },
                 }
             }
-            value if value == -libc::ENOENT => {
+            value if value == -ENOENT => {
                 self.diagnostics.backend().inc_cancel_ack_not_found();
                 debug!(
                     cancel_ticket = cancel_ticket.raw(),
@@ -427,7 +426,7 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_, '_> {
             },
             CompletionSource::Kernel | CompletionSource::User => {
                 let raw = event.raw();
-                if raw.res() == -libc::ENOBUFS {
+                if raw.res() == -ENOBUFS {
                     self.with_cqe_env(|env| env.note_exhausted());
                 }
                 let hint = if matches!(source, CompletionSource::Kernel) {
