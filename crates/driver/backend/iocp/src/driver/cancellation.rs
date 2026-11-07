@@ -14,10 +14,9 @@ use crate::{
         state::{CancellationStateView, IocpDriverState},
     },
     error::{IocpError, IocpResult},
-    op,
     op::{
         IocpOpPayload, IocpOpRegistry, IocpSlotSpec, IocpUserPayload,
-        RAW_UDP_RECV_MULTI_RESUME_BYTES, UdpReceiveSubmit,
+        RAW_UDP_RECV_MULTI_RESUME_BYTES, SubmissionOps, UdpReceiveSubmit,
     },
     win32::{CancelRequestResult, IoCompletionPort, Overlapped},
 };
@@ -86,12 +85,12 @@ fn mark_receive_user_cancel<S: SlotMarker>(
 fn has_raw_udp_child_request<S: SlotMarker>(slot: &mut Slot<'_, S, IocpSlotSpec>) -> bool {
     slot.with_access_mut(|access| {
         let op = access.operation().get_ref();
-        let IocpOpPayload::UdpRecvMulti(payload) = &op.payload else {
+        let IocpOpPayload::UdpRecvMulti(payload) = op.payload() else {
             return false;
         };
         payload
             .raw_requests()
-            .is_some_and(|requests| requests.iter().any(|request| request.header().in_flight))
+            .is_some_and(|requests| requests.iter().any(|request| request.header().in_flight()))
     })
     .unwrap_or(false)
 }
@@ -102,16 +101,16 @@ fn cancel_raw_udp_children<S: SlotMarker>(
 ) -> IocpResult<()> {
     slot.with_access_mut(|access| -> IocpResult<()> {
         let op = access.operation_mut().get_mut();
-        let raw = match op.header.resolved_handle {
+        let raw = match op.header().resolved_handle() {
             Some(raw) => Some(raw),
             None => op
                 .get_fd()
-                .and_then(|fd| op::resolve_fd_handle(&fd, registered_slots).ok()),
+                .and_then(|fd| SubmissionOps::resolve_fd_handle(&fd, registered_slots).ok()),
         };
         let Some(raw) = raw else {
             return Ok(());
         };
-        let IocpOpPayload::UdpRecvMulti(payload) = &mut op.payload else {
+        let IocpOpPayload::UdpRecvMulti(payload) = op.payload_mut() else {
             return Ok(());
         };
         UdpReceiveSubmit::cancel_raw_requests(payload, raw);
@@ -330,7 +329,7 @@ impl<'view, 'state> CancellationService<'view, 'state> {
                         CancelTargetState {
                             is_rio: op.uses_rio_backend(),
                             op_kind: op.kind(),
-                            has_kernel_request: op.header.in_flight,
+                            has_kernel_request: op.header().in_flight(),
                         }
                     })
                     .unwrap_or(CancelTargetState {
@@ -376,17 +375,17 @@ impl<'view, 'state> CancellationService<'view, 'state> {
                     let raw_handle = guard
                         .with_access_mut(|access| {
                             let op = access.operation().get_ref();
-                            op.header.resolved_handle.or_else(|| {
+                            op.header().resolved_handle().or_else(|| {
                                 let fd = op.get_fd()?;
-                                op::resolve_fd_handle(&fd, ctx.registered_slots).ok()
+                                SubmissionOps::resolve_fd_handle(&fd, ctx.registered_slots).ok()
                             })
                         })
                         .ok()
                         .flatten();
                     if let Some(raw_handle) = raw_handle {
                         let handle = raw_handle.raw().as_handle();
-                        let overlapped_ptr =
-                            guard.with_sidecar_mut(|sidecar| &mut sidecar.inner as *mut Overlapped);
+                        let overlapped_ptr = guard
+                            .with_sidecar_mut(|sidecar| sidecar.inner_mut() as *mut Overlapped);
                         match unsafe { IoCompletionPort::cancel_request(handle, overlapped_ptr) }? {
                             CancelRequestResult::Submitted => CancelPerformStatus::Submitted,
                             CancelRequestResult::NotFound => CancelPerformStatus::NotFound,
@@ -403,7 +402,7 @@ impl<'view, 'state> CancellationService<'view, 'state> {
                         CancelTargetState {
                             is_rio: op.uses_rio_backend(),
                             op_kind: op.kind(),
-                            has_kernel_request: op.header.in_flight,
+                            has_kernel_request: op.header().in_flight(),
                         }
                     })
                     .unwrap_or(CancelTargetState {
@@ -436,17 +435,17 @@ impl<'view, 'state> CancellationService<'view, 'state> {
                     let raw_handle = guard
                         .with_access_mut(|access| {
                             let op = access.operation().get_ref();
-                            op.header.resolved_handle.or_else(|| {
+                            op.header().resolved_handle().or_else(|| {
                                 let fd = op.get_fd()?;
-                                op::resolve_fd_handle(&fd, ctx.registered_slots).ok()
+                                SubmissionOps::resolve_fd_handle(&fd, ctx.registered_slots).ok()
                             })
                         })
                         .ok()
                         .flatten();
                     if let Some(raw_handle) = raw_handle {
                         let handle = raw_handle.raw().as_handle();
-                        let overlapped_ptr =
-                            guard.with_sidecar_mut(|sidecar| &mut sidecar.inner as *mut Overlapped);
+                        let overlapped_ptr = guard
+                            .with_sidecar_mut(|sidecar| sidecar.inner_mut() as *mut Overlapped);
                         match unsafe { IoCompletionPort::cancel_request(handle, overlapped_ptr) }? {
                             CancelRequestResult::Submitted => CancelPerformStatus::Submitted,
                             CancelRequestResult::NotFound => CancelPerformStatus::NotFound,

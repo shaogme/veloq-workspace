@@ -1,4 +1,4 @@
-use super::addr::{socket_addr_to_storage, to_socket_addr};
+use super::addr::SockAddrStorage;
 use crate::{
     config::{IocpHandle, OwnedRawHandle, RawHandle},
     error::{IocpError, IocpResult},
@@ -33,7 +33,7 @@ impl Socket {
             return Err(IocpError::Socket.io_report("WSASocketW", io::Error::last_os_error()));
         }
         Ok(Self {
-            inner: SafeSocket(s),
+            inner: SafeSocket::new(s),
             rio: flags & WSA_FLAG_REGISTERED_IO != 0,
         })
     }
@@ -113,22 +113,22 @@ impl Socket {
 
     /// Binds the socket to the given address.
     pub fn bind(&self, addr: SocketAddr) -> IocpResult<()> {
-        let (storage, len) = socket_addr_to_storage(addr);
+        let (storage, len) = SockAddrStorage::from_socket_addr(addr);
         // SAFETY: storage is a valid SOCKADDR_STORAGE and we pass its pointer and size.
         unsafe {
             self.inner
-                .bind(&storage.0 as *const _ as *const SOCKADDR, len)
+                .bind(storage.as_raw() as *const _ as *const SOCKADDR, len)
                 .attach_note("socket bind failed")
         }
     }
 
     /// Connects the socket to the given address.
     pub fn connect(&self, addr: SocketAddr) -> IocpResult<()> {
-        let (storage, len) = socket_addr_to_storage(addr);
+        let (storage, len) = SockAddrStorage::from_socket_addr(addr);
         // SAFETY: storage is a valid SOCKADDR_STORAGE and we pass its pointer and size.
         unsafe {
             self.inner
-                .connect(&storage.0 as *const _ as *const SOCKADDR, len)
+                .connect(storage.as_raw() as *const _ as *const SOCKADDR, len)
                 .attach_note("socket connect failed")
         }
     }
@@ -142,7 +142,7 @@ impl Socket {
 
     /// Consumes the Socket and returns an owned handle.
     pub fn into_owned_raw(self) -> OwnedRawHandle {
-        let h = self.inner.0;
+        let h = self.inner.as_raw();
         let rio = self.rio;
         mem::forget(self);
         let handle = if rio {
@@ -160,7 +160,7 @@ impl Socket {
     /// `handle` 必须是有效套接字句柄，且调用方转移所有权给返回值。
     pub unsafe fn from_raw(handle: IocpHandle) -> Self {
         Self {
-            inner: SafeSocket(handle.as_socket()),
+            inner: SafeSocket::new(handle.as_socket()),
             rio: handle.uses_rio(),
         }
     }
@@ -179,7 +179,7 @@ impl Socket {
 
         // SAFETY: storage is a valid SOCKADDR_STORAGE and len is its size.
         let buf = unsafe { slice::from_raw_parts(&storage as *const _ as *const u8, len as usize) };
-        to_socket_addr(buf).attach_note("decode local socket address failed")
+        SockAddrStorage::to_socket_addr(buf).attach_note("decode local socket address failed")
     }
 
     /// Returns the peer address of a connected socket.
@@ -244,6 +244,11 @@ impl Socket {
         self.inner
             .setsockopt(SOL_SOCKET, SO_BROADCAST, &val)
             .attach_note("socket set_broadcast failed")
+    }
+
+    /// Returns the peer address of a connected socket, given only its raw handle.
+    pub fn peer_addr_of_handle(handle: IocpHandle) -> IocpResult<SocketAddr> {
+        peer_addr_of_socket(&SafeSocket::new(handle.as_socket()))
     }
 }
 
@@ -324,14 +329,6 @@ impl PlatformSocket for Socket {
     }
 }
 
-/// Returns the peer address of a connected socket, given only its raw handle.
-///
-/// The facade's accept stream needs this on both platforms: the uring backend because multishot
-/// accept never reports the peer address, and IOCP so that the two paths have one shape.
-pub fn peer_addr_of_handle(handle: IocpHandle) -> IocpResult<SocketAddr> {
-    peer_addr_of_socket(&SafeSocket(handle.as_socket()))
-}
-
 fn peer_addr_of_socket(socket: &SafeSocket) -> IocpResult<SocketAddr> {
     // SAFETY: SOCKADDR_STORAGE is a POD struct and safe to zero-initialize.
     let mut storage = unsafe { mem::zeroed::<SOCKADDR_STORAGE>() };
@@ -345,5 +342,5 @@ fn peer_addr_of_socket(socket: &SafeSocket) -> IocpResult<SocketAddr> {
 
     // SAFETY: storage is a valid SOCKADDR_STORAGE and len is its size.
     let buf = unsafe { slice::from_raw_parts(&storage as *const _ as *const u8, len as usize) };
-    to_socket_addr(buf).attach_note("decode peer socket address failed")
+    SockAddrStorage::to_socket_addr(buf).attach_note("decode peer socket address failed")
 }

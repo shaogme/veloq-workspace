@@ -91,8 +91,18 @@ pub trait IntoPlatformOp<Spec: SlotSpec>: Sized + SendBound {
 /// `await` 一个 multishot 操作等于「取第一条完成然后取消」，那是个陷阱而不是特性，所以让
 /// 它在编译期就不成立。
 ///
-/// 后端为每个单发 op 实现它（宏里一行）；multishot op 不实现。
+/// A backend spec opts an operation into `Future` support by implementing this trait.
+pub trait SingleShotOperation<Op>: SlotSpec {}
+
+/// Marks an operation as awaitable for a backend spec that classifies it as single-shot.
 pub trait SingleShotOp<Spec: SlotSpec>: IntoPlatformOp<Spec> {}
+
+impl<Op, Spec> SingleShotOp<Spec> for Op
+where
+    Op: IntoPlatformOp<Spec>,
+    Spec: SingleShotOperation<Op>,
+{
+}
 
 /// A generic wrapper for IO operation data.
 pub struct Op<T> {

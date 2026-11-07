@@ -10,6 +10,7 @@ use crate::{
 
 use diagweave::prelude::*;
 use slotmap::{SlotMap, new_key_type};
+use tracing::error;
 use veloq_driver_core::OpToken;
 use veloq_std::collections::{FastHashMap, FastHashSet};
 use windows_sys::Win32::Networking::WinSock::{SD_RECEIVE, SOCKET_ERROR, shutdown};
@@ -28,12 +29,6 @@ pub(crate) struct SocketInflightIdentity {
     request_id: u64,
 }
 
-#[must_use = "dropping a SocketInflightGuard releases the acquired socket inflight slot"]
-pub(crate) struct SocketInflightGuard<'a> {
-    runtime: &'a mut RioRuntime,
-    token: Option<SocketInflightToken>,
-}
-
 new_key_type! {
     pub(crate) struct ActorKey;
 }
@@ -43,7 +38,7 @@ pub(crate) struct RioSocketActor {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SocketLifecycleState {
+pub(super) enum SocketLifecycleState {
     Open,
     Closing,
 }
@@ -83,6 +78,12 @@ pub(crate) struct RioRuntime {
     actor_by_handle: FastHashMap<SocketKey, ActorKey>,
     socket_runtime: FastHashMap<SocketKey, SocketRuntimeState>,
     next_request_id: u64,
+}
+
+#[must_use = "dropping a SocketInflightGuard releases the acquired socket inflight slot"]
+pub(crate) struct SocketInflightGuard<'a> {
+    runtime: &'a mut RioRuntime,
+    token: Option<SocketInflightToken>,
 }
 
 impl RioRuntime {
@@ -575,7 +576,7 @@ impl Drop for SocketInflightGuard<'_> {
         if let Some(token) = self.token.take()
             && let Err(e) = self.runtime.release_socket_inflight_token(token)
         {
-            tracing::error!(error = ?e, "failed to release socket inflight token in guard drop");
+            error!(error = ?e, "failed to release socket inflight token in guard drop");
         }
     }
 }
@@ -587,8 +588,7 @@ mod tests {
         config::{IocpHandle, SocketKey},
         rio::core::{RioOpKind, RioRq},
     };
-    use veloq_driver_core::Generation;
-    use veloq_driver_core::OpToken;
+    use veloq_driver_core::{Generation, OpToken};
     use veloq_std::ptr::null_mut;
 
     fn test_runtime() -> RioRuntime {

@@ -83,6 +83,14 @@ pub(crate) struct RioExConfig<'a> {
     pub(crate) context: *const c_void,
 }
 
+pub(crate) struct RioIoArgs<'a> {
+    pub(crate) rq: RioRq,
+    pub(crate) buf: &'a RIO_BUF,
+    pub(crate) num_bufs: u32,
+    pub(crate) flags: u32,
+    pub(crate) context: *const c_void,
+}
+
 pub(crate) trait RioProvider: Send + Sync {
     fn create_cq(
         &self,
@@ -102,23 +110,9 @@ pub(crate) trait RioProvider: Send + Sync {
 
     fn close_cq(&self, cq: RioCq);
 
-    fn receive(
-        &self,
-        rq: RioRq,
-        buf: &RIO_BUF,
-        num_bufs: u32,
-        flags: u32,
-        context: *const c_void,
-    ) -> RioResult<()>;
+    fn receive(&self, args: RioIoArgs<'_>) -> RioResult<()>;
 
-    fn send(
-        &self,
-        rq: RioRq,
-        buf: &RIO_BUF,
-        num_bufs: u32,
-        flags: u32,
-        context: *const c_void,
-    ) -> RioResult<()>;
+    fn send(&self, args: RioIoArgs<'_>) -> RioResult<()>;
 
     fn send_ex(&self, config: RioExConfig<'_>) -> RioResult<()>;
 
@@ -324,16 +318,17 @@ impl RioProvider for RioDispatch {
     }
 
     #[inline]
-    fn receive(
-        &self,
-        rq: RioRq,
-        buf: &RIO_BUF,
-        num_bufs: u32,
-        flags: u32,
-        context: *const c_void,
-    ) -> RioResult<()> {
+    fn receive(&self, args: RioIoArgs<'_>) -> RioResult<()> {
         // SAFETY: Startup verifies this function pointer. / 安全性：启动阶段已验证此函数指针。
-        let ret = unsafe { (self.receive)(rq.0, buf as *const _, num_bufs, flags, context) };
+        let ret = unsafe {
+            (self.receive)(
+                args.rq.0,
+                args.buf as *const _,
+                args.num_bufs,
+                args.flags,
+                args.context,
+            )
+        };
         if ret == 0 {
             return Err(RioKernel::last_wsa_report(RioError::Datapath, "RIOReceive"));
         }
@@ -341,16 +336,17 @@ impl RioProvider for RioDispatch {
     }
 
     #[inline]
-    fn send(
-        &self,
-        rq: RioRq,
-        buf: &RIO_BUF,
-        num_bufs: u32,
-        flags: u32,
-        context: *const c_void,
-    ) -> RioResult<()> {
+    fn send(&self, args: RioIoArgs<'_>) -> RioResult<()> {
         // SAFETY: Startup verifies this function pointer. / 安全性：启动阶段已验证此函数指针。
-        let ret = unsafe { (self.send)(rq.0, buf as *const _, num_bufs, flags, context) };
+        let ret = unsafe {
+            (self.send)(
+                args.rq.0,
+                args.buf as *const _,
+                args.num_bufs,
+                args.flags,
+                args.context,
+            )
+        };
         if ret == 0 {
             return Err(RioKernel::last_wsa_report(RioError::Datapath, "RIOSend"));
         }
@@ -450,7 +446,7 @@ impl RioKernel {
         entries: u32,
         ext: &Extensions,
     ) -> RioResult<Self> {
-        let table = &ext.rio_table;
+        let table = ext.rio_table();
         let dispatch = RioDispatch {
             create_cq: table
                 .RIOCreateCompletionQueue
@@ -560,7 +556,13 @@ impl RioKernel {
             .as_ref()
             .ok_or(RioError::Internal)
             .attach_note("RIO dispatch context lost")?
-            .receive(rq, buf, 1, 0, ctx)
+            .receive(RioIoArgs {
+                rq,
+                buf,
+                num_bufs: 1,
+                flags: 0,
+                context: ctx,
+            })
     }
 
     pub(crate) fn submit_send(
@@ -573,7 +575,13 @@ impl RioKernel {
             .as_ref()
             .ok_or(RioError::Internal)
             .attach_note("RIO dispatch context lost")?
-            .send(rq, buf, 1, 0, ctx)
+            .send(RioIoArgs {
+                rq,
+                buf,
+                num_bufs: 1,
+                flags: 0,
+                context: ctx,
+            })
     }
 
     pub(crate) fn submit_send_ex(

@@ -1,15 +1,15 @@
 use crate::{
     IocpHandle,
     config::RawHandle,
-    diagnostics::IocpCompletionDiagnostics,
-    error::{IocpError, IocpResult},
-    op::{IocpOp, IocpUserPayload},
+    error::IocpResult,
+    op::IocpSlotSpec,
     rio::SocketInflightToken,
     win32::{IoCompletionPort, Overlapped},
 };
+use tracing::error;
 use veloq_driver_core::{
     CompletionToken, Generation, OpRegistry as CoreOpRegistry, OpToken, ReceiveRequest,
-    Slot as CoreSlot, SlotSpec as CoreSlotSpec,
+    Slot as CoreSlot,
 };
 use veloq_std::{
     boxed::Box,
@@ -18,6 +18,7 @@ use veloq_std::{
     time::Instant,
 };
 use veloq_storage::{AtomicOptionPtr, StateOptionPtr};
+use veloq_wheel::TimerId;
 
 pub(crate) type BlockingSuccessCleanup = fn(IocpHandle);
 
@@ -56,7 +57,7 @@ impl BlockingCompletion {
     pub(crate) fn complete(&self, result: IocpResult<usize>) {
         self.store_result(result);
         if let Err(report) = self.port.notify(self.completion_token) {
-            tracing::error!(
+            error!(
                 completion_token = self.completion_token.raw(),
                 report = ?report,
                 "failed to post blocking completion"
@@ -88,24 +89,24 @@ impl Drop for BlockingCompletion {
 #[repr(C)]
 pub struct OverlappedEntry {
     /// The underlying Windows Overlapped structure.
-    pub(crate) inner: Overlapped,
+    inner: Overlapped,
     /// Token associated with the operation.
-    pub(crate) token: OpToken,
+    token: OpToken,
     /// Generation of the request currently represented by this overlapped entry.
     ///
     /// A multishot operation reuses the same `OVERLAPPED` allocation for each replacement
     /// request.  Keeping the request generation beside the slot token makes the replacement
     /// boundary explicit and gives completion hooks one more ownership invariant to validate.
-    pub(crate) request_generation: Generation,
+    request_generation: Generation,
     /// Whether the operation is currently in-flight in the kernel.
-    pub(crate) in_flight: bool,
+    in_flight: bool,
     /// Result of an offloaded blocking operation.
-    pub(crate) blocking_completion: Option<Arc<BlockingCompletion>>,
+    blocking_completion: Option<Arc<BlockingCompletion>>,
     /// Resolved handle captured during submission to avoid re-resolving Fixed fd on hot paths.
-    pub(crate) resolved_handle: Option<RawHandle>,
+    resolved_handle: Option<RawHandle>,
     /// Socket inflight ownership acquired before a kernel-pending socket submit.
-    pub(crate) socket_inflight: Option<SocketInflightToken>,
-    pub(crate) receive_request: Option<ReceiveRequest>,
+    socket_inflight: Option<SocketInflightToken>,
+    receive_request: Option<ReceiveRequest>,
 }
 
 impl OverlappedEntry {
@@ -134,6 +135,62 @@ impl OverlappedEntry {
         self.resolved_handle = None;
         self.socket_inflight = None;
         self.receive_request = None;
+    }
+
+    pub(crate) fn inner(&self) -> &Overlapped {
+        &self.inner
+    }
+
+    pub(crate) fn inner_mut(&mut self) -> &mut Overlapped {
+        &mut self.inner
+    }
+
+    pub(crate) const fn token(&self) -> OpToken {
+        self.token
+    }
+
+    pub(crate) fn request_generation(&self) -> Generation {
+        self.request_generation
+    }
+
+    pub(crate) fn request_generation_mut(&mut self) -> &mut Generation {
+        &mut self.request_generation
+    }
+
+    pub(crate) const fn in_flight(&self) -> bool {
+        self.in_flight
+    }
+
+    pub(crate) fn in_flight_mut(&mut self) -> &mut bool {
+        &mut self.in_flight
+    }
+
+    pub(crate) fn blocking_completion_mut(&mut self) -> &mut Option<Arc<BlockingCompletion>> {
+        &mut self.blocking_completion
+    }
+
+    pub(crate) const fn resolved_handle(&self) -> Option<RawHandle> {
+        self.resolved_handle
+    }
+
+    pub(crate) fn resolved_handle_mut(&mut self) -> &mut Option<RawHandle> {
+        &mut self.resolved_handle
+    }
+
+    pub(crate) fn socket_inflight(&self) -> Option<&SocketInflightToken> {
+        self.socket_inflight.as_ref()
+    }
+
+    pub(crate) fn socket_inflight_mut(&mut self) -> &mut Option<SocketInflightToken> {
+        &mut self.socket_inflight
+    }
+
+    pub(crate) const fn receive_request(&self) -> Option<ReceiveRequest> {
+        self.receive_request
+    }
+
+    pub(crate) fn receive_request_mut(&mut self) -> &mut Option<ReceiveRequest> {
+        &mut self.receive_request
     }
 }
 
@@ -164,7 +221,7 @@ unsafe impl Send for OverlappedEntry {}
 #[derive(Default)]
 pub struct IocpOpState {
     pub(crate) generation: Generation,
-    pub(crate) timer_id: Option<veloq_wheel::TimerId>,
+    pub(crate) timer_id: Option<TimerId>,
     pub(crate) timer_deadline: Option<Instant>,
     pub(crate) is_background: bool,
     /// Whether user-visible cancellation was accepted for this IOCP operation.
@@ -177,18 +234,6 @@ pub struct IocpOpState {
     /// This is a logical operation state only. It does not mean that a cancellation request was
     /// submitted to the RIO kernel, and it must not be used for orphan cleanup.
     pub(crate) rio_user_cancel_requested: bool,
-}
-
-pub enum IocpSlotSpec {}
-
-impl CoreSlotSpec for IocpSlotSpec {
-    type Op = IocpOp;
-    type UserPayload = IocpUserPayload;
-    type PlatformData = IocpOpState;
-    type Sidecar = OverlappedEntry;
-    type Error = IocpError;
-    type Completion = usize;
-    type CompletionDiagnostics = IocpCompletionDiagnostics;
 }
 
 pub(crate) type IocpOpRegistry = CoreOpRegistry<IocpSlotSpec>;

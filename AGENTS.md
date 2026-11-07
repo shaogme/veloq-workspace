@@ -380,7 +380,7 @@ mod service {
 
 ### 4.1 Parameter and Tuple Complexity Limits
 
-* **Function & Method Parameter Ceiling**: Free functions (`fn`) and associated methods (`method`) **must not take more than 5 parameters**. When parameter counts exceed 5, refactor them into a structured parameter object or configuration struct (`Params` / `Options`).
+* **Function & Method Parameter Ceiling**: Free functions (`fn`) and associated methods (`method`) **must not take more than 5 parameters**, except function items with an explicit `extern` modifier, such as `extern fn`, `extern "C" fn`, or `unsafe extern "C" fn`. The exception applies to the function item regardless of its ABI string; closures inside its body still must not take more than 5 parameters. When a non-extern function's parameter count exceeds 5, refactor the inputs into a structured parameter object or configuration struct (`Params` / `Options`).
 * **Closure Parameter Ceiling**: Closures **must not take more than 5 parameters**.
 * **Tuple Capacity Ceiling**: Tuples with more than 2 elements are forbidden. Combinations of 3 or more elements must be packaged into a named struct with distinct, semantic field names.
 

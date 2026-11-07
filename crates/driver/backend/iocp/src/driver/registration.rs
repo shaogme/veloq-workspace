@@ -1,6 +1,7 @@
 use veloq_std::{collections::VecDeque, io, mem, string::ToString, vec::Vec};
 
 use diagweave::prelude::*;
+use tracing::error;
 use veloq_buf::BufferRegistrationRequest;
 use veloq_driver_core::{BufferRegistrationStatus, RegisterFd};
 use windows_sys::Win32::{
@@ -18,7 +19,7 @@ use crate::{
     },
     driver::state::RegistrationStateView,
     error::{IocpError, IocpResult},
-    op::locate_registered_slot,
+    op::SubmissionOps,
     rio::RioState,
 };
 
@@ -143,13 +144,13 @@ impl HandleRegistry {
     }
 
     fn take_for_unregister(&mut self, fd: IoFd) -> Option<(u32, RegisteredHandle)> {
-        let idx = locate_registered_slot(fd, &self.slots).ok()?;
+        let idx = SubmissionOps::locate_registered_slot(fd, &self.slots).ok()?;
         let index = u32::try_from(idx).ok()?;
         self.slots[idx].handle.take().map(|entry| (index, entry))
     }
 
     fn take_owned_for_close(&mut self, fd: IoFd) -> IocpResult<(u32, RegisteredHandle)> {
-        let idx = locate_registered_slot(fd, &self.slots)?;
+        let idx = SubmissionOps::locate_registered_slot(fd, &self.slots)?;
         let index = u32::try_from(idx).map_err(|_| {
             IocpError::Internal
                 .to_report()
@@ -364,7 +365,7 @@ impl RegistrationService<'_, '_> {
                 match cleanup_result {
                     Ok(()) => drop(pending.into_entry()),
                     Err(error) => {
-                        tracing::error!(report = ?error, "failed to forget deferred socket runtime");
+                        error!(report = ?error, "failed to forget deferred socket runtime");
                         state.handles.push_deferred_cleanup(pending);
                     }
                 }

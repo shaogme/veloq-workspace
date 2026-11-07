@@ -3,28 +3,27 @@ use veloq_blocking::ThreadPool;
 use veloq_buf::AnyBufPool;
 use veloq_std::sync::{Arc, mpsc};
 
-use crate::{
-    diagnostics::IocpCompletionDiagnostics,
-    error::{IocpError, IocpResult},
-    ext::Extensions,
-    op::IocpOpRegistry,
-};
-use veloq_driver_core::{
-    CancelRequest, DriverCompletionDiagnostics, RemoteCancelSender, RemoteWaker,
-};
-
-#[cfg(test)]
-use veloq_driver_core::{CheckedSlotView, OpToken, SlotRegistryExt};
-
 use super::{
     lifecycle::{IocpRioRuntime, WinsockGuard},
     overlapped::OverlappedRegistry,
     polling::{CompletionPump, TimerEngine},
     registration::HandleRegistry,
 };
+use crate::{
+    diagnostics::IocpCompletionDiagnostics,
+    error::{IocpError, IocpResult},
+    ext::Extensions,
+    op::IocpOpRegistry,
+};
+
+use veloq_driver_core::{
+    CancelRequest, DriverCompletionDiagnostics, RemoteCancelSender, RemoteWaker,
+};
 
 #[cfg(test)]
 use crate::config::RegisteredHandle;
+#[cfg(test)]
+use veloq_driver_core::{CheckedSlotView, OpToken, SlotRegistryExt};
 #[cfg(test)]
 use veloq_std::sync::atomic::Ordering;
 

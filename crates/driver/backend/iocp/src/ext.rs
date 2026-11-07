@@ -57,12 +57,18 @@ pub(crate) type LpfnGetAcceptExSockaddrs = unsafe extern "system" fn(
     remotesockaddrlength: *mut i32,
 );
 
+struct TraditionalExtensions {
+    accept_ex: LpfnAcceptEx,
+    connect_ex: LpfnConnectEx,
+    get_accept_ex_sockaddrs: LpfnGetAcceptExSockaddrs,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct Extensions {
-    pub(crate) accept_ex: LpfnAcceptEx,
-    pub(crate) connect_ex: LpfnConnectEx,
-    pub(crate) get_accept_ex_sockaddrs: LpfnGetAcceptExSockaddrs,
-    pub(crate) rio_table: RIO_EXTENSION_FUNCTION_TABLE,
+    accept_ex: LpfnAcceptEx,
+    connect_ex: LpfnConnectEx,
+    get_accept_ex_sockaddrs: LpfnGetAcceptExSockaddrs,
+    rio_table: RIO_EXTENSION_FUNCTION_TABLE,
 }
 
 impl fmt::Debug for Extensions {
@@ -74,6 +80,22 @@ impl fmt::Debug for Extensions {
 }
 
 impl Extensions {
+    pub(crate) const fn accept_ex(&self) -> LpfnAcceptEx {
+        self.accept_ex
+    }
+
+    pub(crate) const fn connect_ex(&self) -> LpfnConnectEx {
+        self.connect_ex
+    }
+
+    pub(crate) const fn get_accept_ex_sockaddrs(&self) -> LpfnGetAcceptExSockaddrs {
+        self.get_accept_ex_sockaddrs
+    }
+
+    pub(crate) const fn rio_table(&self) -> &RIO_EXTENSION_FUNCTION_TABLE {
+        &self.rio_table
+    }
+
     pub(crate) fn new() -> IocpResult<Self> {
         // SAFETY: Calling `WSASocketW` to create a new TCP socket. The parameters
         // are standard for a overlapped socket.
@@ -91,7 +113,7 @@ impl Extensions {
                     IocpError::DriverInit.io_report("WSASocketW", io::Error::last_os_error())
                 );
             }
-            SafeSocket(s)
+            SafeSocket::new(s)
         };
 
         let traditional = Self::load_traditional(socket.as_raw());
@@ -99,7 +121,11 @@ impl Extensions {
 
         // SafeSocket will be dropped here and closesocket will be called automatically.
 
-        let (accept_ex, connect_ex, get_accept_ex_sockaddrs) = traditional?;
+        let TraditionalExtensions {
+            accept_ex,
+            connect_ex,
+            get_accept_ex_sockaddrs,
+        } = traditional?;
 
         Ok(Self {
             accept_ex,
@@ -109,14 +135,16 @@ impl Extensions {
         })
     }
 
-    fn load_traditional(
-        socket: SOCKET,
-    ) -> IocpResult<(LpfnAcceptEx, LpfnConnectEx, LpfnGetAcceptExSockaddrs)> {
+    fn load_traditional(socket: SOCKET) -> IocpResult<TraditionalExtensions> {
         let accept_ex = Self::get_extension(socket, WSAID_ACCEPTEX)?;
         let connect_ex = Self::get_extension(socket, WSAID_CONNECTEX)?;
         let get_accept_ex_sockaddrs = Self::get_extension(socket, WSAID_GETACCEPTEXSOCKADDRS)?;
 
-        Ok((accept_ex, connect_ex, get_accept_ex_sockaddrs))
+        Ok(TraditionalExtensions {
+            accept_ex,
+            connect_ex,
+            get_accept_ex_sockaddrs,
+        })
     }
 
     fn load_rio(socket: SOCKET) -> IocpResult<RIO_EXTENSION_FUNCTION_TABLE> {

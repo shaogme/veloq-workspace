@@ -8,8 +8,10 @@ use veloq_std::{
     num::{NonZeroU32, NonZeroUsize},
     nz,
 };
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Networking::WinSock::{INVALID_SOCKET, SOCKET, closesocket};
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE},
+    Networking::WinSock::{INVALID_SOCKET, SOCKET, closesocket},
+};
 
 pub use veloq_driver_core::{DirectOwnerId, RawHandleKind};
 
@@ -94,9 +96,12 @@ pub enum IocpHandle {
     },
 }
 
+pub type SocketKey = IocpHandle;
+
 // SAFETY: Windows HANDLE 可在线程间安全传递。
 // SAFETY: Windows HANDLEs are thread-safe and can be sent across threads.
 unsafe impl Send for IocpHandle {}
+
 // SAFETY: Windows HANDLE 可由多个线程同时访问。
 // SAFETY: Windows HANDLEs can be accessed from multiple threads simultaneously.
 unsafe impl Sync for IocpHandle {}
@@ -200,7 +205,6 @@ impl RawHandleMeta for IocpHandle {
 pub type RawHandle = CoreRawHandle<IocpHandle>;
 pub type OwnedRawHandle = CoreOwnedRawHandle<IocpHandle>;
 pub type BorrowedRawHandle<'a> = CoreBorrowedRawHandle<'a, IocpHandle>;
-pub type SocketKey = IocpHandle;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct IocpAssociation {

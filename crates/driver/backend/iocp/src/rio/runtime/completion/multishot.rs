@@ -7,7 +7,7 @@ use super::{
 };
 use crate::{
     error::{IocpError, IocpResult},
-    net::addr::{SockAddrStorage, to_socket_addr},
+    net::SockAddrStorage,
     op::{IocpSlotSpec, IocpUserPayload, Slot},
     rio::core::{RioOpKind, RioOpRequestInit},
 };
@@ -53,7 +53,7 @@ impl RioMultiShotCompletion {
             .registry_mut()
             .copy_addr_slot_to(addr, &mut storage)
             .trans()?;
-        to_socket_addr(bytes_of(&storage))
+        SockAddrStorage::to_socket_addr(bytes_of(&storage))
     }
 
     pub(super) fn complete_tcp_slot(

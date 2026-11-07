@@ -1,13 +1,10 @@
 use crate::{
-    OwnedRawHandle, RawHandle, SockAddrStorage,
+    OwnedRawHandle, RawHandle, SockAddrStorage, Socket,
     config::{IoFd, IocpConfig, IocpHandle},
     driver::IocpDriver,
-    net::{addr::socket_addr_to_storage, socket::Socket},
     op::{Accept, AcceptMulti, Connect, Recv, RecvMulti, RecvProvided},
-    tests::{
-        build_registered_pool, complete_from_record, completion_os_error_code, slot_is_idle,
-        submit_test_op, wait_completion, wait_completion_record,
-    },
+    socket_addr_to_storage,
+    tests::TestSupport,
 };
 use veloq_buf::{BufPool, LockedMemoryBudget, UniformSlot};
 use veloq_driver_core::{CancelRequest, DriveMode, Driver, RegisterFd};
@@ -60,7 +57,7 @@ fn test_iocp_accept() {
         remote_addr: None,
     };
 
-    let token = submit_test_op(&mut driver, accept_op);
+    let token = TestSupport::submit_test_op(&mut driver, accept_op);
 
     // Connect Client in background
     let _ = thread::spawn(move || {
@@ -68,9 +65,9 @@ fn test_iocp_accept() {
         TcpStream::connect(addr).expect("Client connect failed");
     });
 
-    let record =
-        wait_completion_record(&mut driver, token, Duration::from_secs(5)).expect("Accept failed");
-    let completion = complete_from_record::<Accept>(record);
+    let record = TestSupport::wait_completion_record(&mut driver, token, Duration::from_secs(5))
+        .expect("Accept failed");
+    let completion = TestSupport::complete_from_record::<Accept>(record);
     let (accepted, op) = completion.into_parts();
     let _accepted = accepted.expect("Accept failed");
     assert!(op.remote_addr.is_some(), "Remote addr should be populated");
@@ -97,20 +94,21 @@ fn test_iocp_accept_multi_rearms_after_each_connection() {
         .next()
         .expect("register listener returned empty");
 
-    let token = submit_test_op(&mut driver, AcceptMulti { fd: listen_fd });
+    let token = TestSupport::submit_test_op(&mut driver, AcceptMulti { fd: listen_fd });
 
     let first_client = thread::spawn(move || {
         let _ = thread::sleep(Duration::from_millis(50));
         TcpStream::connect(addr).expect("first client connect failed");
     })
     .expect("first client thread spawn failed");
-    let first_record = wait_completion_record(&mut driver, token, Duration::from_secs(5))
-        .expect("first AcceptMulti completion missing");
+    let first_record =
+        TestSupport::wait_completion_record(&mut driver, token, Duration::from_secs(5))
+            .expect("first AcceptMulti completion missing");
     assert!(
         first_record.continuation().is_more(),
         "AcceptMulti must remain armed after the first completion"
     );
-    let first_completion = complete_from_record::<AcceptMulti>(first_record);
+    let first_completion = TestSupport::complete_from_record::<AcceptMulti>(first_record);
     let (first_result, _first_item) = first_completion.into_parts();
     let _first_accepted = first_result.expect("first AcceptMulti result failed");
     first_client.join().expect("first client thread panicked");
@@ -119,19 +117,20 @@ fn test_iocp_accept_multi_rearms_after_each_connection() {
         TcpStream::connect(addr).expect("second client connect failed");
     })
     .expect("second client thread spawn failed");
-    let second_record = wait_completion_record(&mut driver, token, Duration::from_secs(5))
-        .expect("second AcceptMulti completion missing");
+    let second_record =
+        TestSupport::wait_completion_record(&mut driver, token, Duration::from_secs(5))
+            .expect("second AcceptMulti completion missing");
     assert!(
         second_record.continuation().is_more(),
         "AcceptMulti replacement must remain armed after the second completion"
     );
-    let second_completion = complete_from_record::<AcceptMulti>(second_record);
+    let second_completion = TestSupport::complete_from_record::<AcceptMulti>(second_record);
     let (second_result, _second_item) = second_completion.into_parts();
     let _second_accepted = second_result.expect("second AcceptMulti result failed");
     second_client.join().expect("second client thread panicked");
 
     let _ = driver.cancel_op(CancelRequest::user_visible(token));
-    let cancel_result = wait_completion(&mut driver, token, Duration::from_secs(5));
+    let cancel_result = TestSupport::wait_completion(&mut driver, token, Duration::from_secs(5));
     assert!(
         cancel_result.is_err(),
         "cancelled AcceptMulti must produce a terminal error"
@@ -159,7 +158,7 @@ fn test_iocp_accept_multi_cancel_does_not_rearm_after_completion_race() {
         .next()
         .expect("register listener returned empty");
 
-    let token = submit_test_op(&mut driver, AcceptMulti { fd: listen_fd });
+    let token = TestSupport::submit_test_op(&mut driver, AcceptMulti { fd: listen_fd });
     let client = thread::spawn(move || {
         let _stream = TcpStream::connect(addr).expect("client connect failed");
         let _ = thread::sleep(Duration::from_millis(100));
@@ -171,7 +170,7 @@ fn test_iocp_accept_multi_cancel_does_not_rearm_after_completion_race() {
     // the logical stream without arming another AcceptEx request.
     let _ = thread::sleep(Duration::from_millis(100));
     let _ = driver.cancel_op(CancelRequest::user_visible(token));
-    let result = wait_completion(&mut driver, token, Duration::from_secs(5));
+    let result = TestSupport::wait_completion(&mut driver, token, Duration::from_secs(5));
     assert!(
         result.is_err(),
         "cancelled AcceptMulti completion must not be delivered as a record"
@@ -202,9 +201,9 @@ fn test_iocp_connect() {
         addr_len: addr_len as u32,
     };
 
-    let token = submit_test_op(&mut driver, connect_op);
+    let token = TestSupport::submit_test_op(&mut driver, connect_op);
 
-    let res = wait_completion(&mut driver, token, Duration::from_secs(5));
+    let res = TestSupport::wait_completion(&mut driver, token, Duration::from_secs(5));
     assert!(res.is_ok(), "Connect failed: {:?}", res.err());
 
     driver.unregister_files(vec![client_fd]).unwrap();
@@ -221,7 +220,7 @@ fn test_iocp_recv_with_buffer_pool() {
     let topology = UniformSlot::new(pool_capacity_bytes);
 
     // Build a pool whose chunks are registered before allocation.
-    let reg_pool = build_registered_pool(&mut driver, &topology, budget, 0);
+    let reg_pool = TestSupport::build_registered_pool(&mut driver, &topology, budget, 0);
 
     // Setup server listener
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -236,7 +235,7 @@ fn test_iocp_recv_with_buffer_pool() {
         addr: addr_storage,
         addr_len: addr_len as u32,
     };
-    let connect_token = submit_test_op(&mut driver, connect_op);
+    let connect_token = TestSupport::submit_test_op(&mut driver, connect_op);
 
     let server_thread = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
@@ -250,7 +249,8 @@ fn test_iocp_recv_with_buffer_pool() {
         .expect("Failed to alloc buffer");
 
     // Poll connect completion before issuing recv.
-    let connect_res = wait_completion(&mut driver, connect_token, Duration::from_secs(5));
+    let connect_res =
+        TestSupport::wait_completion(&mut driver, connect_token, Duration::from_secs(5));
     assert!(
         connect_res.is_ok(),
         "Connect failed: {:?}",
@@ -264,11 +264,11 @@ fn test_iocp_recv_with_buffer_pool() {
         buf_offset: 0,
     };
 
-    let token = submit_test_op(&mut driver, recv_op);
+    let token = TestSupport::submit_test_op(&mut driver, recv_op);
 
-    let record = wait_completion_record(&mut driver, token, Duration::from_secs(5))
+    let record = TestSupport::wait_completion_record(&mut driver, token, Duration::from_secs(5))
         .expect("recv completion missing");
-    let completion = complete_from_record::<Recv>(record);
+    let completion = TestSupport::complete_from_record::<Recv>(record);
     let (result, mut op) = completion.into_parts();
     let bytes_read = result.expect("Recv failed");
     assert_eq!(bytes_read, 12);
@@ -294,7 +294,7 @@ fn test_iocp_recv_provided_uses_backend_owned_buffer() {
     let client = Socket::new_tcp_v4().expect("client socket create failed");
     let client_fd = register_owned_socket(&mut driver, client);
     let (addr_storage, addr_len) = socket_addr_to_storage(addr);
-    let connect_token = submit_test_op(
+    let connect_token = TestSupport::submit_test_op(
         &mut driver,
         Connect {
             fd: client_fd,
@@ -302,12 +302,13 @@ fn test_iocp_recv_provided_uses_backend_owned_buffer() {
             addr_len: addr_len as u32,
         },
     );
-    wait_completion(&mut driver, connect_token, Duration::from_secs(5)).expect("Connect failed");
+    TestSupport::wait_completion(&mut driver, connect_token, Duration::from_secs(5))
+        .expect("Connect failed");
 
-    let token = submit_test_op(&mut driver, RecvProvided { fd: client_fd });
-    let record = wait_completion_record(&mut driver, token, Duration::from_secs(5))
+    let token = TestSupport::submit_test_op(&mut driver, RecvProvided { fd: client_fd });
+    let record = TestSupport::wait_completion_record(&mut driver, token, Duration::from_secs(5))
         .expect("RecvProvided completion missing");
-    let completion = complete_from_record::<RecvProvided>(record);
+    let completion = TestSupport::complete_from_record::<RecvProvided>(record);
     let (result, provided) = completion.into_parts();
     let received = result.expect("RecvProvided failed");
     let buffer = provided
@@ -336,7 +337,7 @@ fn test_iocp_recv_multi_delivers_data_and_eof() {
     let client = Socket::new_tcp_v4().expect("client socket create failed");
     let client_fd = register_owned_socket(&mut driver, client);
     let (addr_storage, addr_len) = socket_addr_to_storage(addr);
-    let connect_token = submit_test_op(
+    let connect_token = TestSupport::submit_test_op(
         &mut driver,
         Connect {
             fd: client_fd,
@@ -344,16 +345,18 @@ fn test_iocp_recv_multi_delivers_data_and_eof() {
             addr_len: addr_len as u32,
         },
     );
-    wait_completion(&mut driver, connect_token, Duration::from_secs(5)).expect("Connect failed");
+    TestSupport::wait_completion(&mut driver, connect_token, Duration::from_secs(5))
+        .expect("Connect failed");
 
-    let token = submit_test_op(&mut driver, RecvMulti { fd: client_fd });
-    let data_record = wait_completion_record(&mut driver, token, Duration::from_secs(5))
-        .expect("RecvMulti data completion missing");
+    let token = TestSupport::submit_test_op(&mut driver, RecvMulti { fd: client_fd });
+    let data_record =
+        TestSupport::wait_completion_record(&mut driver, token, Duration::from_secs(5))
+            .expect("RecvMulti data completion missing");
     assert!(
         data_record.continuation().is_more(),
         "RecvMulti must rearm after a data completion"
     );
-    let data_completion = complete_from_record::<RecvMulti>(data_record);
+    let data_completion = TestSupport::complete_from_record::<RecvMulti>(data_record);
     let (data_result, data_payload) = data_completion.into_parts();
     let data_len = data_result.expect("RecvMulti data completion failed");
     let data_buffer = data_payload
@@ -362,13 +365,14 @@ fn test_iocp_recv_multi_delivers_data_and_eof() {
     assert_eq!(data_len, b"Hello Multi".len());
     assert_eq!(data_buffer.as_slice(), b"Hello Multi");
 
-    let eof_record = wait_completion_record(&mut driver, token, Duration::from_secs(5))
-        .expect("RecvMulti EOF completion missing");
+    let eof_record =
+        TestSupport::wait_completion_record(&mut driver, token, Duration::from_secs(5))
+            .expect("RecvMulti EOF completion missing");
     assert!(
         eof_record.continuation().is_final(),
         "RecvMulti EOF must terminate the logical receive operation"
     );
-    let eof_completion = complete_from_record::<RecvMulti>(eof_record);
+    let eof_completion = TestSupport::complete_from_record::<RecvMulti>(eof_record);
     let (eof_result, eof_payload) = eof_completion.into_parts();
     assert_eq!(eof_result.expect("RecvMulti EOF completion failed"), 0);
     assert_eq!(
@@ -399,7 +403,7 @@ fn test_iocp_recv_multi_cancel_returns_aborted() {
     let client = Socket::new_tcp_v4().expect("client socket create failed");
     let client_fd = register_owned_socket(&mut driver, client);
     let (addr_storage, addr_len) = socket_addr_to_storage(addr);
-    let connect_token = submit_test_op(
+    let connect_token = TestSupport::submit_test_op(
         &mut driver,
         Connect {
             fd: client_fd,
@@ -407,18 +411,19 @@ fn test_iocp_recv_multi_cancel_returns_aborted() {
             addr_len: addr_len as u32,
         },
     );
-    wait_completion(&mut driver, connect_token, Duration::from_secs(5)).expect("Connect failed");
+    TestSupport::wait_completion(&mut driver, connect_token, Duration::from_secs(5))
+        .expect("Connect failed");
 
-    let token = submit_test_op(&mut driver, RecvMulti { fd: client_fd });
+    let token = TestSupport::submit_test_op(&mut driver, RecvMulti { fd: client_fd });
     driver
         .cancel_op(CancelRequest::user_visible(token))
         .expect("RecvMulti cancellation request failed");
     let _ = tx_release.send(());
 
-    let result = wait_completion(&mut driver, token, Duration::from_secs(5));
+    let result = TestSupport::wait_completion(&mut driver, token, Duration::from_secs(5));
     let error = result.expect_err("cancelled RecvMulti should return an error");
     assert_eq!(
-        completion_os_error_code(&error),
+        TestSupport::completion_os_error_code(&error),
         Some(ERROR_OPERATION_ABORTED as i32)
     );
 
@@ -428,14 +433,14 @@ fn test_iocp_recv_multi_cancel_returns_aborted() {
 
 #[test]
 fn test_unregister_owned_socket_waits_for_inflight_recv() {
-    super::init_test_logger();
+    TestSupport::init_test_logger();
     let budget = LockedMemoryBudget::new(64 * 1024 * 1024);
     let mut driver =
         IocpDriver::new(IocpConfig::default().locked_memory_budget(budget.clone())).unwrap();
 
     let pool_capacity_bytes = 10 * 4 * 1024 * 1024;
     let topology = UniformSlot::new(pool_capacity_bytes);
-    let reg_pool = build_registered_pool(&mut driver, &topology, budget, 0);
+    let reg_pool = TestSupport::build_registered_pool(&mut driver, &topology, budget, 0);
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -456,8 +461,9 @@ fn test_unregister_owned_socket_waits_for_inflight_recv() {
         addr: addr_storage,
         addr_len: addr_len as u32,
     };
-    let connect_token = submit_test_op(&mut driver, connect_op);
-    wait_completion(&mut driver, connect_token, Duration::from_secs(5)).expect("Connect failed");
+    let connect_token = TestSupport::submit_test_op(&mut driver, connect_op);
+    TestSupport::wait_completion(&mut driver, connect_token, Duration::from_secs(5))
+        .expect("Connect failed");
 
     let buf = reg_pool
         .alloc_full(nz!(8192))
@@ -467,16 +473,16 @@ fn test_unregister_owned_socket_waits_for_inflight_recv() {
         buf,
         buf_offset: 0,
     };
-    let token = submit_test_op(&mut driver, recv_op);
+    let token = TestSupport::submit_test_op(&mut driver, recv_op);
 
     driver
         .unregister_files(vec![client_fd])
         .expect("unregister while recv in flight should defer cleanup");
 
     let _ = tx_send.send(());
-    let record = wait_completion_record(&mut driver, token, Duration::from_secs(5))
+    let record = TestSupport::wait_completion_record(&mut driver, token, Duration::from_secs(5))
         .expect("recv completion missing");
-    let completion = complete_from_record::<Recv>(record);
+    let completion = TestSupport::complete_from_record::<Recv>(record);
     let (result, mut op) = completion.into_parts();
     let bytes_read = result.expect("Recv failed after unregister");
     op.buf.set_len(bytes_read);
@@ -493,7 +499,7 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
 
     let pool_capacity_bytes = 10 * 4 * 1024 * 1024;
     let topology = UniformSlot::new(pool_capacity_bytes);
-    let reg_pool = build_registered_pool(&mut driver, &topology, budget, 0);
+    let reg_pool = TestSupport::build_registered_pool(&mut driver, &topology, budget, 0);
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -514,9 +520,10 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
         addr: addr_storage,
         addr_len: addr_len as u32,
     };
-    let connect_token = submit_test_op(&mut driver, connect_op);
+    let connect_token = TestSupport::submit_test_op(&mut driver, connect_op);
 
-    let connect_res = wait_completion(&mut driver, connect_token, Duration::from_secs(5));
+    let connect_res =
+        TestSupport::wait_completion(&mut driver, connect_token, Duration::from_secs(5));
     assert!(
         connect_res.is_ok(),
         "Connect failed: {:?}",
@@ -531,15 +538,15 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
         buf,
         buf_offset: 0,
     };
-    let token = submit_test_op(&mut driver, recv_op);
+    let token = TestSupport::submit_test_op(&mut driver, recv_op);
 
     let _ = driver.cancel_op(CancelRequest::user_visible(token));
     let _ = tx_send.send(());
 
-    let res = wait_completion(&mut driver, token, Duration::from_secs(5));
+    let res = TestSupport::wait_completion(&mut driver, token, Duration::from_secs(5));
     let err = res.expect_err("cancelled op should return aborted");
     assert_eq!(
-        completion_os_error_code(&err),
+        TestSupport::completion_os_error_code(&err),
         Some(ERROR_OPERATION_ABORTED as i32)
     );
 
@@ -555,7 +562,7 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
 
     let pool_capacity_bytes = 10 * 4 * 1024 * 1024;
     let topology = UniformSlot::new(pool_capacity_bytes);
-    let reg_pool = build_registered_pool(&mut driver, &topology, budget, 0);
+    let reg_pool = TestSupport::build_registered_pool(&mut driver, &topology, budget, 0);
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -576,9 +583,10 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
         addr: addr_storage,
         addr_len: addr_len as u32,
     };
-    let connect_token = submit_test_op(&mut driver, connect_op);
+    let connect_token = TestSupport::submit_test_op(&mut driver, connect_op);
 
-    let connect_res = wait_completion(&mut driver, connect_token, Duration::from_secs(5));
+    let connect_res =
+        TestSupport::wait_completion(&mut driver, connect_token, Duration::from_secs(5));
     assert!(
         connect_res.is_ok(),
         "Connect failed: {:?}",
@@ -593,35 +601,35 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
         buf,
         buf_offset: 0,
     };
-    let token = submit_test_op(&mut driver, recv_op);
+    let token = TestSupport::submit_test_op(&mut driver, recv_op);
 
     let _ = driver.cancel_op(CancelRequest::user_visible(token));
 
     assert!(
-        !slot_is_idle(&mut driver, token.index()),
+        !TestSupport::slot_is_idle(&mut driver, token.index()),
         "取消后真实 RIO completion 到来前槽位应保持活跃"
     );
 
     let _ = tx_send.send(());
 
-    let res = wait_completion(&mut driver, token, Duration::from_secs(5));
+    let res = TestSupport::wait_completion(&mut driver, token, Duration::from_secs(5));
     let err = res.expect_err("cancelled op should return aborted");
     assert_eq!(
-        completion_os_error_code(&err),
+        TestSupport::completion_os_error_code(&err),
         Some(ERROR_OPERATION_ABORTED as i32)
     );
 
     let drain_start = Instant::now();
     while drain_start.elapsed() < Duration::from_secs(2) {
         let _ = driver.drive(DriveMode::Poll).expect("drive failed");
-        if slot_is_idle(&mut driver, token.index()) {
+        if TestSupport::slot_is_idle(&mut driver, token.index()) {
             break;
         }
         let _ = thread::sleep(Duration::from_millis(5));
     }
 
     assert!(
-        slot_is_idle(&mut driver, token.index()),
+        TestSupport::slot_is_idle(&mut driver, token.index()),
         "晚到 RIO completion 到来后槽位应归为空闲"
     );
 

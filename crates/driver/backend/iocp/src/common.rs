@@ -35,6 +35,17 @@ impl fmt::Display for IocpErrorContext {
 
 impl Error for IocpErrorContext {}
 
+impl IocpErrorContext {
+    pub(crate) fn message(self, detail: impl Into<String>) -> Report<IocpError> {
+        let detail = detail.into();
+        IocpError::from(self)
+            .to_report()
+            .push_ctx("scope", "iocp/common")
+            .with_ctx("detail", sanitize_field(&detail))
+            .attach_note(detail)
+    }
+}
+
 impl From<IocpErrorContext> for IocpError {
     fn from(value: IocpErrorContext) -> Self {
         match value {
@@ -47,19 +58,9 @@ fn sanitize_field(s: &str) -> String {
     s.replace('\n', "\\n").replace('\r', "\\r")
 }
 
-pub(crate) fn iocp_msg(ctx: IocpErrorContext, detail: impl Into<String>) -> Report<IocpError> {
-    let detail = detail.into();
-    IocpError::from(ctx)
-        .to_report()
-        .push_ctx("scope", "iocp/common")
-        .with_ctx("detail", sanitize_field(&detail))
-        .attach_note(detail)
-}
-
 // ============================================================================
 // Waker
 // ============================================================================
-
 pub(crate) const WAKER_IDLE: u8 = 0;
 pub(crate) const WAKER_NOTIFIED: u8 = 1;
 pub(crate) const WAKER_PROCESSING: u8 = 2;
@@ -67,8 +68,17 @@ pub(crate) const WAKER_REARM: u8 = 3;
 
 /// A waker that posts a completion status to the port to wake up the event loop.
 pub(crate) struct IocpWaker {
-    pub(crate) port: Arc<IoCompletionPort>,
-    pub(crate) notification_state: Arc<AtomicU8>,
+    port: Arc<IoCompletionPort>,
+    notification_state: Arc<AtomicU8>,
+}
+
+impl IocpWaker {
+    pub(crate) fn new(port: Arc<IoCompletionPort>, notification_state: Arc<AtomicU8>) -> Self {
+        Self {
+            port,
+            notification_state,
+        }
+    }
 }
 
 impl RemoteWaker<IocpError> for IocpWaker {

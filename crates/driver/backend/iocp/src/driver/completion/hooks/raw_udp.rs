@@ -15,9 +15,10 @@ use windows_sys::Win32::{
 use diagweave::prelude::*;
 use veloq_driver_core::{
     AnomalyAttach, CompletionAnomalyKind, CompletionCleanupGuard, CompletionContinuation,
-    CompletionSettlement, CompletionToken, InFlightWaiting, OpToken, ReceiveCompletion,
-    ReceiveDelivery, ReceivePumpError, ReceivePumpEvent, ReceiveReplacementReservation,
-    ReceiveRequest, ReplacementSubmit, UdpRecvMultiBackend, UserCompletionEvent,
+    CompletionSettlement, CompletionToken, InFlightOrphaned, InFlightWaiting, OpToken,
+    ReceiveCompletion, ReceiveDelivery, ReceivePumpError, ReceivePumpEvent, ReceivePumpState,
+    ReceiveReplacementReservation, ReceiveRequest, ReplacementSubmit, UdpRecvMultiBackend,
+    UserCompletionEvent,
 };
 
 use crate::{
@@ -29,10 +30,10 @@ use crate::{
     },
     error::{IocpError, IocpResult},
     ext::Extensions,
-    net::addr::{SockAddrStorage, to_socket_addr},
+    net::SockAddrStorage,
     op::{
         IocpOpPayload, IocpSlotSpec, IocpUserPayload, RAW_UDP_RECV_MULTI_RESUME_BYTES, Slot,
-        SubmitContext, UdpReceiveSubmit, UdpRecvPacket,
+        SubmitContext, UdpReceiveSubmit, UdpRecvMulti, UdpRecvPacket,
     },
     rio::{RioState, SocketInflightToken},
     win32::{IoCompletionPort, Overlapped},
@@ -47,6 +48,11 @@ pub(super) struct RawUdpCompletionServices<'a> {
     pub(super) shutting_down: bool,
 }
 
+pub(super) struct OrphanedRawUdpChild {
+    pub(super) socket_inflight: SocketInflightToken,
+    pub(super) has_active_children: bool,
+}
+
 struct RawUdpPreparedDelivery {
     delivery: ReceiveDelivery,
     output: FixedBuf,
@@ -57,6 +63,12 @@ struct RawUdpChildCompletion {
     address: SockAddrStorage,
     address_len: i32,
     socket_inflight: SocketInflightToken,
+}
+
+struct RawUdpCompletionParts {
+    address: Option<SockAddrStorage>,
+    address_len: i32,
+    effect: IocpBackendEffect,
 }
 
 enum RawUdpWork {
@@ -70,6 +82,55 @@ pub(super) struct RawUdpCompletion<'a> {
 }
 
 impl<'a> RawUdpCompletion<'a> {
+    pub(super) fn take_orphaned_child(
+        slot: &mut Slot<'_, InFlightOrphaned>,
+        request: &ReceiveRequest,
+    ) -> Option<OrphanedRawUdpChild> {
+        slot.with_access_mut(|access| -> IocpResult<OrphanedRawUdpChild> {
+            let op = access.operation_mut().get_mut();
+            let IocpOpPayload::UdpRecvMulti(payload) = op.payload_mut() else {
+                return Err(IocpError::InvalidState
+                    .to_report()
+                    .attach_note("orphaned raw UDP completion has the wrong payload kind"));
+            };
+            let child = payload.raw_request_mut(request.slot_id).ok_or_else(|| {
+                IocpError::InvalidState
+                    .to_report()
+                    .with_ctx("slot_id", request.slot_id)
+                    .attach_note("orphaned raw UDP child request owner is missing")
+            })?;
+            if child.slot_id() != request.slot_id
+                || child.header().receive_request() != Some(*request)
+                || !child.header().in_flight()
+            {
+                return Err(IocpError::InvalidState
+                    .to_report()
+                    .with_ctx("request_id", request.request_id)
+                    .with_ctx("slot_id", request.slot_id)
+                    .with_ctx("slot_generation", request.slot_generation)
+                    .attach_note("orphaned raw UDP child completion identity is stale"));
+            }
+            let header = child.header_mut();
+            let Some(socket_inflight) = header.socket_inflight_mut().take() else {
+                return Err(IocpError::InvalidState
+                    .to_report()
+                    .with_ctx("request_id", request.request_id)
+                    .attach_note("orphaned raw UDP child has no socket inflight token"));
+            };
+            *header.in_flight_mut() = false;
+            *header.receive_request_mut() = None;
+            let has_active_children = payload.raw_requests().is_some_and(|requests| {
+                requests.iter().any(|request| request.header().in_flight())
+            });
+            Ok(OrphanedRawUdpChild {
+                socket_inflight,
+                has_active_children,
+            })
+        })
+        .ok()
+        .and_then(Result::ok)
+    }
+
     pub(super) fn complete(
         event: UserCompletionEvent,
         request: Option<ReceiveRequest>,
@@ -105,23 +166,31 @@ impl<'a> RawUdpCompletion<'a> {
                 }
             }
         };
-        let (completion_address, completion_address_len, effect) = match child_completion {
-            Some(completion) => (
-                Some(completion.address),
-                completion.address_len,
-                IocpBackendEffect::SocketInflight(completion.socket_inflight),
-            ),
-            None => (None, 0, IocpBackendEffect::None),
+        let RawUdpCompletionParts {
+            address: completion_address,
+            address_len: completion_address_len,
+            effect,
+        } = match child_completion {
+            Some(completion) => RawUdpCompletionParts {
+                address: Some(completion.address),
+                address_len: completion.address_len,
+                effect: IocpBackendEffect::SocketInflight(completion.socket_inflight),
+            },
+            None => RawUdpCompletionParts {
+                address: None,
+                address_len: 0,
+                effect: IocpBackendEffect::None,
+            },
         };
 
         let work = slot.with_access_mut(|access| -> IocpResult<RawUdpWork> {
             let op = access.operation_mut().get_mut();
-            let IocpOpPayload::UdpRecvMulti(payload) = &mut op.payload else {
+            let raw = op.header().resolved_handle();
+            let IocpOpPayload::UdpRecvMulti(payload) = op.payload_mut() else {
                 return Err(IocpError::InvalidState
                     .to_report()
                     .attach_note("raw UDP completion has the wrong payload kind"));
             };
-            let raw = op.header.resolved_handle;
             payload.with_bound_parts_mut(|user, requests, _, terminal_error| {
                 let pump = user.receive_pump_mut();
                 if self.services.shutting_down || cancel_requested {
@@ -297,7 +366,7 @@ impl<'a> RawUdpCompletion<'a> {
     ) -> IocpResult<RawUdpChildCompletion> {
         slot.with_access_mut(|access| -> IocpResult<RawUdpChildCompletion> {
             let op = access.operation_mut().get_mut();
-            let IocpOpPayload::UdpRecvMulti(payload) = &mut op.payload else {
+            let IocpOpPayload::UdpRecvMulti(payload) = op.payload_mut() else {
                 return Err(IocpError::InvalidState
                     .to_report()
                     .attach_note("raw UDP completion has the wrong payload kind"));
@@ -309,8 +378,8 @@ impl<'a> RawUdpCompletion<'a> {
                     .attach_note("completed raw UDP child request owner is missing")
             })?;
             if child.slot_id() != request.slot_id
-                || child.header().receive_request != Some(request)
-                || !child.header().in_flight
+                || child.header().receive_request() != Some(request)
+                || !child.header().in_flight()
             {
                 return Err(IocpError::InvalidState
                     .to_report()
@@ -320,14 +389,14 @@ impl<'a> RawUdpCompletion<'a> {
                     .attach_note("raw UDP child completion identity is stale or duplicated"));
             }
             let header = child.header_mut();
-            let Some(socket_inflight) = header.socket_inflight.take() else {
+            let Some(socket_inflight) = header.socket_inflight_mut().take() else {
                 return Err(IocpError::InvalidState
                     .to_report()
                     .with_ctx("request_id", request.request_id)
                     .attach_note("completed raw UDP child has no socket inflight token"));
             };
-            header.in_flight = false;
-            header.receive_request = None;
+            *header.in_flight_mut() = false;
+            *header.receive_request_mut() = None;
             Ok(RawUdpChildCompletion {
                 address: *child.address(),
                 address_len: child.address_len(),
@@ -342,7 +411,7 @@ impl<'a> RawUdpCompletion<'a> {
     }
 
     fn prepare_delivery(
-        user: &mut crate::op::UdpRecvMulti,
+        user: &mut UdpRecvMulti,
         terminal_error: &mut Option<Report<IocpError>>,
         delivery: ReceiveDelivery,
     ) -> IocpResult<RawUdpWork> {
@@ -425,7 +494,7 @@ impl<'a> RawUdpCompletion<'a> {
     }
 
     fn abort_delivery(
-        user: &mut crate::op::UdpRecvMulti,
+        user: &mut UdpRecvMulti,
         terminal_error: &mut Option<Report<IocpError>>,
         delivery: ReceiveDelivery,
         pump_error: ReceivePumpError,
@@ -441,7 +510,7 @@ impl<'a> RawUdpCompletion<'a> {
         Self::poll_final_work(pump)
     }
 
-    fn poll_final_work(pump: &mut veloq_driver_core::ReceivePumpState) -> IocpResult<RawUdpWork> {
+    fn poll_final_work(pump: &mut ReceivePumpState) -> IocpResult<RawUdpWork> {
         let event = pump.poll_final().map_err(Self::receive_pump_report)?;
         match event {
             ReceivePumpEvent::Final { error } => Ok(RawUdpWork::Final(error)),
@@ -484,12 +553,12 @@ impl<'a> RawUdpCompletion<'a> {
         let settled = slot.with_access_mut(
             |access| -> IocpResult<(UdpRecvPacket, CompletionContinuation)> {
                 let op = access.operation_mut().get_mut();
-                let IocpOpPayload::UdpRecvMulti(payload) = &mut op.payload else {
+                let raw = op.header().resolved_handle();
+                let IocpOpPayload::UdpRecvMulti(payload) = op.payload_mut() else {
                     return Err(IocpError::InvalidState
                         .to_report()
                         .attach_note("raw UDP delivery has the wrong payload kind"));
                 };
-                let raw = op.header.resolved_handle;
                 payload.with_bound_parts_mut(|user, requests, _, terminal_error| {
                     if let Some(error) = replacement_error.take()
                         && terminal_error.is_none()
@@ -528,7 +597,7 @@ impl<'a> RawUdpCompletion<'a> {
         let mut terminal_error = Self::take_terminal_error(&mut slot);
         if continuation.is_final() && terminal_error.is_some() {
             let terminal_error = terminal_error.take().expect("terminal error exists");
-            let terminal_res = crate::error::iocp_report_to_event_res(&terminal_error);
+            let terminal_res = IocpError::report_to_event_res(&terminal_error);
             return CompletionSettlement::UserThenTerminal {
                 event: UserCompletionEvent::from_parts(
                     COMP_BACKEND_IOCP,
@@ -573,11 +642,12 @@ impl<'a> RawUdpCompletion<'a> {
         reservation: ReceiveReplacementReservation,
     ) -> IocpResult<u64> {
         self.services.overlapped_registry.reserve_children(1)?;
-        let overlapped = slot.with_sidecar_mut(|sidecar| &mut sidecar.inner as *mut Overlapped);
+        let overlapped = slot.with_sidecar_mut(|sidecar| sidecar.inner_mut() as *mut Overlapped);
         let request_id = slot
             .with_access_mut(|access| {
                 let op = access.operation_mut().get_mut();
-                let IocpOpPayload::UdpRecvMulti(payload) = &mut op.payload else {
+                let (header, erased_payload) = op.header_payload_mut();
+                let IocpOpPayload::UdpRecvMulti(payload) = erased_payload else {
                     return Err(IocpError::InvalidState
                         .to_report()
                         .attach_note("raw UDP receive replacement has the wrong payload kind"));
@@ -593,12 +663,7 @@ impl<'a> RawUdpCompletion<'a> {
                     buffer_pool: None,
                     rio: self.services.rio,
                 };
-                UdpReceiveSubmit::submit_replacement(
-                    &mut op.header,
-                    payload,
-                    &mut context,
-                    reservation,
-                )
+                UdpReceiveSubmit::submit_replacement(header, payload, &mut context, reservation)
             })
             .map_err(|_| {
                 IocpError::InvalidState
@@ -608,7 +673,7 @@ impl<'a> RawUdpCompletion<'a> {
         let registered = slot
             .with_access_mut(|access| {
                 let op = access.operation().get_ref();
-                let IocpOpPayload::UdpRecvMulti(payload) = &op.payload else {
+                let IocpOpPayload::UdpRecvMulti(payload) = op.payload() else {
                     return false;
                 };
                 let Some(child) = payload
@@ -617,10 +682,10 @@ impl<'a> RawUdpCompletion<'a> {
                 else {
                     return false;
                 };
-                child.header().receive_request.is_some_and(|request| {
+                child.header().receive_request().is_some_and(|request| {
                     request.request_id == request_id
                         && self.services.overlapped_registry.register_child(
-                            &child.header().inner,
+                            child.header().inner(),
                             token,
                             request,
                         )
@@ -643,12 +708,12 @@ impl<'a> RawUdpCompletion<'a> {
     fn has_active_children(slot: &mut Slot<'_, InFlightWaiting>) -> bool {
         slot.with_access_mut(|access| {
             let op = access.operation().get_ref();
-            let IocpOpPayload::UdpRecvMulti(payload) = &op.payload else {
+            let IocpOpPayload::UdpRecvMulti(payload) = op.payload() else {
                 return false;
             };
             payload
                 .raw_requests()
-                .is_some_and(|requests| requests.iter().any(|request| request.header().in_flight))
+                .is_some_and(|requests| requests.iter().any(|request| request.header().in_flight()))
         })
         .unwrap_or(true)
     }
@@ -656,13 +721,14 @@ impl<'a> RawUdpCompletion<'a> {
     fn cancel_if_terminal(slot: &mut Slot<'_, InFlightWaiting>) {
         let _ = slot.with_access_mut(|access| {
             let op = access.operation_mut().get_mut();
-            let IocpOpPayload::UdpRecvMulti(payload) = &mut op.payload else {
+            let raw = op.header().resolved_handle();
+            let IocpOpPayload::UdpRecvMulti(payload) = op.payload_mut() else {
                 return;
             };
             // SAFETY: The payload remains bound to this live slot while its active children drain. / 子请求排空期间，该 payload 仍绑定到此活动槽位。
-            let terminal = unsafe { payload.user.as_ref() }
+            let terminal = unsafe { payload.user().as_ref() }
                 .is_ok_and(|user| user.receive_pump().terminal_error().is_some());
-            if terminal && let Some(raw) = op.header.resolved_handle {
+            if terminal && let Some(raw) = raw {
                 UdpReceiveSubmit::cancel_raw_requests(payload, raw);
             }
         });
@@ -671,7 +737,7 @@ impl<'a> RawUdpCompletion<'a> {
     fn take_terminal_error(slot: &mut Slot<'_, InFlightWaiting>) -> Option<Report<IocpError>> {
         slot.with_access_mut(|access| {
             let op = access.operation_mut().get_mut();
-            let IocpOpPayload::UdpRecvMulti(payload) = &mut op.payload else {
+            let IocpOpPayload::UdpRecvMulti(payload) = op.payload_mut() else {
                 return None;
             };
             payload.take_terminal_error()
@@ -694,11 +760,12 @@ impl<'a> RawUdpCompletion<'a> {
         }
         let address_bytes = unsafe {
             from_raw_parts(
-                (&address.0 as *const SOCKADDR_STORAGE).cast::<u8>(),
+                (address.as_raw() as *const SOCKADDR_STORAGE).cast::<u8>(),
                 address_len,
             )
         };
-        to_socket_addr(address_bytes).attach_note("failed to decode raw UDP peer address")
+        SockAddrStorage::to_socket_addr(address_bytes)
+            .attach_note("failed to decode raw UDP peer address")
     }
 
     fn terminal_error(error: ReceivePumpError) -> Report<IocpError> {

@@ -9,7 +9,7 @@ use veloq_std::{
 };
 
 use diagweave::prelude::*;
-use tracing::debug;
+use tracing::{debug, error, warn};
 use veloq_buf::{LockedMemoryBudget, LockedMemoryPermit};
 use veloq_driver_core::{
     CancelRequest, CheckedSlotView, OpToken, SharedCompletionTable, SlotRegistryExt, SlotState,
@@ -22,7 +22,7 @@ use crate::{
     error::{IocpError, IocpResult},
     ext::Extensions,
     op::{IocpOpRegistry, IocpSlotSpec},
-    rio::RioState,
+    rio::{RioState, RioStateArgs},
     win32::IoCompletionPort,
 };
 
@@ -50,6 +50,15 @@ enum ShutdownOpKind {
 
 pub(super) struct IocpRioRuntime {
     state: RioState,
+}
+
+pub(super) struct IocpRioRuntimeArgs<'a> {
+    port: BorrowedRawHandle<'a>,
+    entries: u32,
+    ext: &'a Extensions,
+    diagnostics: IocpDriverCompletionDiagnostics,
+    budget: LockedMemoryBudget,
+    address_permit: Option<LockedMemoryPermit>,
 }
 
 /// 为一个 IOCP driver 持有一次成功的 Winsock startup。
@@ -100,7 +109,7 @@ impl DeferredIocpCleanup {
             result
         };
         if let Err(error) = result {
-            tracing::warn!(error = ?error, "IocpReaper: deferred drain timed out or failed");
+            warn!(error = ?error, "IocpReaper: deferred drain timed out or failed");
             // 内核可能仍持有 OVERLAPPED 或 socket 缓冲区，因此泄漏完整状态以保留其生命周期。
             // The kernel may still own an OVERLAPPED or socket buffer, so leak the full state.
             mem::forget(state);
@@ -123,7 +132,7 @@ fn iocp_reaper_sender() -> Option<&'static mpsc::Sender<DeferredIocpCleanup>> {
             }) {
             Ok(_) => Some(tx),
             Err(error) => {
-                tracing::error!(error = ?error, "failed to spawn veloq-iocp-reaper");
+                error!(error = ?error, "failed to spawn veloq-iocp-reaper");
                 None
             }
         }
@@ -132,19 +141,27 @@ fn iocp_reaper_sender() -> Option<&'static mpsc::Sender<DeferredIocpCleanup>> {
 }
 
 impl IocpRioRuntime {
-    pub(super) fn new(
-        port: BorrowedRawHandle<'_>,
-        entries: u32,
-        ext: &Extensions,
-        diagnostics: IocpDriverCompletionDiagnostics,
-        budget: LockedMemoryBudget,
-        address_permit: Option<LockedMemoryPermit>,
-    ) -> IocpResult<Self> {
-        let state = RioState::new(port, entries, ext, diagnostics, budget, address_permit)
-            .with_ctx("entries", entries)
-            .with_ctx("port_raw", port.raw().as_handle() as usize)
-            .attach_note("failed to initialize RIO state")
-            .trans()?;
+    pub(super) fn new(args: IocpRioRuntimeArgs<'_>) -> IocpResult<Self> {
+        let IocpRioRuntimeArgs {
+            port,
+            entries,
+            ext,
+            diagnostics,
+            budget,
+            address_permit,
+        } = args;
+        let state = RioState::new(RioStateArgs {
+            port,
+            entries,
+            ext,
+            diagnostics,
+            budget,
+            address_permit,
+        })
+        .with_ctx("entries", entries)
+        .with_ctx("port_raw", port.raw().as_handle() as usize)
+        .attach_note("failed to initialize RIO state")
+        .trans()?;
         Ok(Self { state })
     }
 
@@ -212,14 +229,14 @@ impl LifecycleService<'_, '_> {
         let ops = IocpOpRegistry::new(entries as usize);
         let completion_table: SharedCompletionTable<IocpSlotSpec> = ops.shared_table();
         let completion_diagnostics = ops.shared_slots().completion_diagnostics();
-        let rio = IocpRioRuntime::new(
-            RawHandle::new(IocpHandle::for_file(port_handle)).borrow(),
+        let rio = IocpRioRuntime::new(IocpRioRuntimeArgs {
+            port: RawHandle::new(IocpHandle::for_file(port_handle)).borrow(),
             entries,
-            &extensions,
-            completion_diagnostics.clone(),
+            ext: &extensions,
+            diagnostics: completion_diagnostics.clone(),
             budget,
             address_permit,
-        )
+        })
         .attach_note("failed to initialize RIO runtime")?;
         let (remote_cancel_sender, remote_cancel_receiver) = mpsc::channel();
         IocpDriverState::new(IocpDriverStateParts {
@@ -315,7 +332,7 @@ impl LifecycleService<'_, '_> {
         }
         for token in in_flight {
             if let Err(error) = self.cancel_op_internal(CancelRequest::abandon(token)) {
-                tracing::warn!(
+                warn!(
                     slot_index = token.index(),
                     slot_generation = token.generation().get(),
                     report = ?error,
@@ -500,11 +517,11 @@ impl LifecycleService<'_, '_> {
         let task = DeferredIocpCleanup { state };
         if let Some(sender) = iocp_reaper_sender() {
             if let Err(error) = sender.send(task) {
-                tracing::warn!("IocpReaper unavailable; running deferred cleanup inline");
+                warn!("IocpReaper unavailable; running deferred cleanup inline");
                 error.0.run();
             }
         } else {
-            tracing::warn!("IocpReaper thread failed to start; running deferred cleanup inline");
+            warn!("IocpReaper thread failed to start; running deferred cleanup inline");
             task.run();
         }
     }
@@ -519,7 +536,7 @@ impl Drop for WinsockGuard {
             // SAFETY: WSAGetLastError 读取当前线程的 Winsock 错误码。
             // SAFETY: WSAGetLastError reads the calling thread's Winsock error code.
             let code = unsafe { WSAGetLastError() };
-            tracing::error!(error_code = code, "WSACleanup failed");
+            error!(error_code = code, "WSACleanup failed");
         }
     }
 }

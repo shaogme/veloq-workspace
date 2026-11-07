@@ -1,7 +1,7 @@
 use super::single::RioSingleCompletion;
 use crate::{
     driver::COMP_BACKEND_RIO,
-    error::{IocpError, IocpResult, iocp_report_to_event_res},
+    error::{IocpError, IocpResult},
     ext::Extensions,
     op::{IocpSlotSpec, Slot},
     rio::{
@@ -17,10 +17,9 @@ use diagweave::prelude::*;
 use veloq_driver_core::{
     AnomalyAttach, CompletionAnomalyKind, CompletionBackendHooks, CompletionBackendIngressAction,
     CompletionCleanupGuard, CompletionControl, CompletionFailure, CompletionSettlement,
-    CompletionSource, InFlightOrphaned, InFlightWaiting, SlotState, SlotStatus,
-    UserCompletionEvent,
+    CompletionSource, InFlightOrphaned, InFlightWaiting, ReceivePumpState,
+    ReceiveReplacementReservation, SlotState, SlotStatus, UserCompletionEvent,
 };
-use veloq_driver_core::{ReceivePumpState, ReceiveReplacementReservation};
 use veloq_std::format;
 use windows_sys::Win32::Networking::WinSock::RIORESULT;
 
@@ -37,7 +36,7 @@ impl RioCompletionResult {
     pub(super) fn event_code(result: &IocpResult<usize>) -> i32 {
         match result {
             Ok(bytes) => (*bytes).min(i32::MAX as usize) as i32,
-            Err(error) => iocp_report_to_event_res(error),
+            Err(error) => IocpError::report_to_event_res(error),
         }
     }
 }
@@ -143,17 +142,17 @@ pub(super) struct RioIngress {
     pub(super) result: RioResultData,
 }
 
-#[derive(Default)]
-pub(super) struct RioBackendEffect {
-    release: Option<RioReleaseEffect>,
-}
-
 #[derive(Clone, Copy)]
 struct RioReleaseEffect {
     addr: Option<RioAddrReservation>,
     buffer_lease: Option<RioBufferLeaseToken>,
     socket_inflight: SocketInflightIdentity,
     op_kind: RioOpKind,
+}
+
+#[derive(Default)]
+pub(super) struct RioBackendEffect {
+    release: Option<RioReleaseEffect>,
 }
 
 impl RioBackendEffect {

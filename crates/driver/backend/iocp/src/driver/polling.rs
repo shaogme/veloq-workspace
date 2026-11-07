@@ -1,3 +1,5 @@
+mod status;
+
 use veloq_std::{
     format, mem,
     sync::Arc,
@@ -8,15 +10,14 @@ use veloq_std::{
 
 use diagweave::prelude::*;
 use veloq_driver_core::{
-    AnomalyAttach, CompletionAnomalyKind, CompletionEnvelope, CompletionIdentity, CompletionToken,
-    OpToken, RawCompletion, RemoteWaker, SharedCompletionTable, UserCompletionEvent,
+    AnomalyAttach, CompletionAnomalyKind, CompletionEnvelope, CompletionToken, OpToken,
+    RawCompletion, ReceiveRequest, RemoteWaker, SharedCompletionTable, UserCompletionEvent,
 };
 use veloq_wheel::{Expired, TimerError, TimerId, Wheel, WheelConfig};
 
 use crate::{
     common::{
         IocpErrorContext, IocpWaker, WAKER_IDLE, WAKER_NOTIFIED, WAKER_PROCESSING, WAKER_REARM,
-        iocp_msg,
     },
     driver::{
         cancellation::CancellationService,
@@ -30,60 +31,31 @@ use crate::{
     win32::{CompletionBatch, CompletionStatus, IoCompletionPort, Overlapped},
 };
 
-use super::{RIO_EVENT_KEY, RIO_EVENT_TOKEN};
+use super::RIO_EVENT_TOKEN;
+use status::{CompletionStatusClassifier, IocpCompletionStatusKind, WaitBudgetSource};
 
 /// 每次 `GetQueuedCompletionStatusEx` 出队的完成数，与 `MAX_RIO_RESULTS` 一致。
 /// Number of completions dequeued per `GetQueuedCompletionStatusEx`, matching `MAX_RIO_RESULTS`.
 const MAX_IOCP_BATCH: usize = 128;
 const WAKE_FAILURE_PROBE_INTERVAL: Duration = Duration::from_secs(1);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WaitBudgetSource {
-    External,
-    Timer,
-    Probe,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct WaitBudget {
-    duration: Duration,
-    source: WaitBudgetSource,
-}
-
-fn wait_budget(
-    external_timeout: Option<Duration>,
-    internal_timeout: Option<Duration>,
-    probe: Duration,
-) -> WaitBudget {
-    let mut budget = WaitBudget {
-        duration: probe,
-        source: WaitBudgetSource::Probe,
-    };
-
-    if let Some(internal) = internal_timeout
-        && internal <= budget.duration
-    {
-        budget = WaitBudget {
-            duration: internal,
-            source: WaitBudgetSource::Timer,
-        };
-    }
-    if let Some(external) = external_timeout
-        && external <= budget.duration
-    {
-        budget = WaitBudget {
-            duration: external,
-            source: WaitBudgetSource::External,
-        };
-    }
-    budget
-}
-
 pub(super) struct CompletionPump {
     port: Arc<IoCompletionPort>,
     notification_state: Arc<AtomicU8>,
     table: SharedCompletionTable<IocpSlotSpec>,
     batch: CompletionBatch,
+}
+
+enum IocpOverlappedIngress {
+    Kernel(CompletionEnvelope),
+    Backend(IocpBackendIngress),
+}
+
+struct ResolvedOverlappedOwner {
+    token: OpToken,
+    request: Option<ReceiveRequest>,
+    in_flight: bool,
+    has_socket_inflight: bool,
 }
 
 impl CompletionPump {
@@ -225,10 +197,7 @@ impl CompletionPump {
     pub(super) fn create_waker(&self) -> Arc<dyn RemoteWaker<IocpError>> {
         unsafe {
             Arc::new_unsized(
-                IocpWaker {
-                    port: self.port.clone(),
-                    notification_state: self.notification_state.clone(),
-                },
+                IocpWaker::new(self.port.clone(), self.notification_state.clone()),
                 |p| p as *const dyn RemoteWaker<IocpError>,
             )
         }
@@ -238,8 +207,8 @@ impl CompletionPump {
         let waker = CompletionToken::waker(0).raw() as usize;
         for index in 0..count {
             if let Some(status) = self.batch.status(index)
-                && status.overlapped.is_null()
-                && status.key == waker
+                && status.overlapped().is_null()
+                && status.key() == waker
             {
                 self.begin_notification();
             }
@@ -343,7 +312,9 @@ impl<'view, 'state> PollingService<'view, 'state> {
             let count = self
                 .state_mut()
                 .completion
-                .fill_batch(duration_to_wait_ms(deadline.saturating_duration_since(now)))
+                .fill_batch(CompletionStatusClassifier::duration_to_wait_ms(
+                    deadline.saturating_duration_since(now),
+                ))
                 .push_ctx("scope", "iocp/reaper")
                 .attach_note("failed to poll deferred IOCP completion")?;
             for index in 0..count {
@@ -371,19 +342,17 @@ impl<'view, 'state> PollingService<'view, 'state> {
     }
 
     fn handle_orphaned_batch_entry(&mut self, index: usize) -> IocpResult<usize> {
-        let Some(CompletionStatus {
-            bytes,
-            key,
-            overlapped,
-            success,
-            error_code,
-        }) = self.state().completion.status(index)
-        else {
+        let Some(status) = self.state().completion.status(index) else {
             return Ok(0);
         };
-        let res = iocp_status_res(success, error_code, bytes);
-        let flags = iocp_status_flags(success, error_code);
-        match classify_completion_status(key, overlapped, success) {
+        let bytes = status.bytes();
+        let key = status.key();
+        let overlapped = status.overlapped();
+        let success = status.success();
+        let error_code = status.error_code();
+        let res = CompletionStatusClassifier::status_res(success, error_code, bytes);
+        let flags = CompletionStatusClassifier::status_flags(success, error_code);
+        match CompletionStatusClassifier::classify(key, overlapped, success) {
             IocpCompletionStatusKind::RioWake => Ok(0),
             IocpCompletionStatusKind::OverlappedUser { queue_key } => {
                 let ingress =
@@ -391,7 +360,7 @@ impl<'view, 'state> PollingService<'view, 'state> {
                 self.process_overlapped_ingress(ingress)
             }
             IocpCompletionStatusKind::ControlKey | IocpCompletionStatusKind::PostedToken => Ok(0),
-            IocpCompletionStatusKind::NullFailure => Err(iocp_msg(
+            IocpCompletionStatusKind::NullFailure => Err(IocpErrorContext::message(
                 IocpErrorContext::CompletionWait,
                 "deferred IOCP completion reported a failure with null overlapped",
             )
@@ -405,7 +374,7 @@ impl<'view, 'state> PollingService<'view, 'state> {
         let count = self
             .state_mut()
             .completion
-            .fill_batch(duration_to_wait_ms(timeout))
+            .fill_batch(CompletionStatusClassifier::duration_to_wait_ms(timeout))
             .push_ctx("scope", "iocp/driver")
             .attach_note("failed to poll IOCP status")?;
         self.state().completion.mark_waker_notifications(count);
@@ -448,7 +417,11 @@ impl<'view, 'state> PollingService<'view, 'state> {
                 )
                 .with_ctx("timer_error", format!("{error:?}"))
         })?;
-        let budget = wait_budget(timeout, timer_deadline, WAKE_FAILURE_PROBE_INTERVAL);
+        let budget = CompletionStatusClassifier::wait_budget(
+            timeout,
+            timer_deadline,
+            WAKE_FAILURE_PROBE_INTERVAL,
+        );
         let wait_ms = if ready_completion {
             self.state()
                 .completion_diagnostics
@@ -456,7 +429,7 @@ impl<'view, 'state> PollingService<'view, 'state> {
                 .inc_wait_ready_preflight();
             0
         } else {
-            duration_to_wait_ms(budget.duration)
+            CompletionStatusClassifier::duration_to_wait_ms(budget.duration)
         };
         if wait_ms == 0 {
             self.state()
@@ -543,30 +516,21 @@ impl<'view, 'state> PollingService<'view, 'state> {
     /// 路由 completion pump 当前批次中的第 `index` 个条目。
     /// Routes entry `index` in the batch currently held by the completion pump.
     fn handle_batch_entry(&mut self, index: usize) -> IocpResult<usize> {
-        let Some(CompletionStatus {
-            bytes,
-            key,
-            overlapped,
-            success,
-            error_code,
-        }) = self.state().completion.status(index)
-        else {
+        let Some(status) = self.state().completion.status(index) else {
             return Ok(0);
         };
-        self.handle_completion_status(bytes, key, overlapped, success, error_code)
+        self.handle_completion_status(status)
     }
 
-    fn handle_completion_status(
-        &mut self,
-        bytes: u32,
-        key: usize,
-        overlapped: *mut Overlapped,
-        success: bool,
-        error_code: Option<u32>,
-    ) -> IocpResult<usize> {
-        let res = iocp_status_res(success, error_code, bytes);
-        let flags = iocp_status_flags(success, error_code);
-        match classify_completion_status(key, overlapped, success) {
+    fn handle_completion_status(&mut self, status: CompletionStatus) -> IocpResult<usize> {
+        let bytes = status.bytes();
+        let key = status.key();
+        let overlapped = status.overlapped();
+        let success = status.success();
+        let error_code = status.error_code();
+        let res = CompletionStatusClassifier::status_res(success, error_code, bytes);
+        let flags = CompletionStatusClassifier::status_flags(success, error_code);
+        match CompletionStatusClassifier::classify(key, overlapped, success) {
             IocpCompletionStatusKind::RioWake => {
                 let state = self.state_mut();
                 state
@@ -594,7 +558,7 @@ impl<'view, 'state> PollingService<'view, 'state> {
                 self.accept_raw_completion(key as u64, res, flags)?;
                 Ok(1)
             }
-            IocpCompletionStatusKind::NullFailure => Err(iocp_msg(
+            IocpCompletionStatusKind::NullFailure => Err(IocpErrorContext::message(
                 IocpErrorContext::CompletionWait,
                 "GetQueuedCompletionStatusEx reported a failure with null overlapped",
             )
@@ -625,7 +589,7 @@ impl<'view, 'state> PollingService<'view, 'state> {
         flags: u32,
     ) -> IocpResult<IocpOverlappedIngress> {
         let address = overlapped as usize;
-        let (token, request, in_flight, has_socket_inflight) = {
+        let owner = {
             let state = self.state_mut();
             if let Some(owner) = state.overlapped_registry.take_child(address) {
                 if !state.ops.is_current_active(owner.token) {
@@ -649,7 +613,7 @@ impl<'view, 'state> PollingService<'view, 'state> {
                         .with_ctx("slot_index", owner.token.index())
                         .attach_note("completed UDP child parent operation is missing");
                 };
-                let IocpOpPayload::UdpRecvMulti(payload) = &op.payload else {
+                let IocpOpPayload::UdpRecvMulti(payload) = op.payload() else {
                     return IocpError::InvalidState
                         .with_ctx("overlapped_ptr", address)
                         .with_ctx("slot_index", owner.token.index())
@@ -667,11 +631,11 @@ impl<'view, 'state> PollingService<'view, 'state> {
                 };
                 let header = child.header();
                 if child.slot_id() != owner.request.slot_id
-                    || &header.inner as *const Overlapped as usize != address
-                    || header.token != owner.token
-                    || header.receive_request != Some(owner.request)
-                    || !header.in_flight
-                    || header.socket_inflight.is_none()
+                    || header.inner() as *const Overlapped as usize != address
+                    || header.token() != owner.token
+                    || header.receive_request() != Some(owner.request)
+                    || !header.in_flight()
+                    || header.socket_inflight().is_none()
                 {
                     return IocpError::InvalidState
                         .with_ctx("overlapped_ptr", address)
@@ -680,12 +644,12 @@ impl<'view, 'state> PollingService<'view, 'state> {
                         .with_ctx("child_slot_id", owner.request.slot_id)
                         .attach_note("completed UDP child owner identity is stale");
                 }
-                (
-                    header.token,
-                    header.receive_request,
-                    header.in_flight,
-                    header.socket_inflight.is_some(),
-                )
+                ResolvedOverlappedOwner {
+                    token: header.token(),
+                    request: header.receive_request(),
+                    in_flight: header.in_flight(),
+                    has_socket_inflight: header.socket_inflight().is_some(),
+                }
             } else if let Some(index) = state.overlapped_registry.root_index(address) {
                 let Some(bundle) = state.ops.slot_bundle_by_index_mut(index) else {
                     return IocpError::InvalidState
@@ -693,14 +657,14 @@ impl<'view, 'state> PollingService<'view, 'state> {
                         .with_ctx("slot_index", index)
                         .attach_note("completed root OVERLAPPED sidecar is missing");
                 };
-                bundle.storage.with_mut(|_, _, entry| {
-                    (
-                        entry.token,
-                        entry.receive_request,
-                        entry.in_flight,
-                        entry.socket_inflight.is_some(),
-                    )
-                })
+                bundle
+                    .storage
+                    .with_mut(|_, _, entry| ResolvedOverlappedOwner {
+                        token: entry.token(),
+                        request: entry.receive_request(),
+                        in_flight: entry.in_flight(),
+                        has_socket_inflight: entry.socket_inflight().is_some(),
+                    })
             } else {
                 return Err(IocpError::InvalidState
                     .report(
@@ -713,6 +677,12 @@ impl<'view, 'state> PollingService<'view, 'state> {
                     .with_ctx("raw_flags", flags));
             }
         };
+        let ResolvedOverlappedOwner {
+            token,
+            request,
+            in_flight,
+            has_socket_inflight,
+        } = owner;
         let idx = token.index();
         if idx >= self.state().ops.capacity() {
             return Err(IocpError::InvalidState.report(
@@ -826,86 +796,19 @@ impl<'view, 'state> PollingService<'view, 'state> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IocpCompletionStatusKind {
-    RioWake,
-    ControlKey,
-    OverlappedUser { queue_key: usize },
-    PostedToken,
-    NullFailure,
-    Unknown,
-}
-
-enum IocpOverlappedIngress {
-    Kernel(CompletionEnvelope),
-    Backend(IocpBackendIngress),
-}
-
-#[inline]
-fn classify_completion_status(
-    key: usize,
-    overlapped: *mut Overlapped,
-    success: bool,
-) -> IocpCompletionStatusKind {
-    if key == RIO_EVENT_KEY {
-        IocpCompletionStatusKind::RioWake
-    } else if !overlapped.is_null() {
-        IocpCompletionStatusKind::OverlappedUser { queue_key: key }
-    } else if !success && key == 0 {
-        IocpCompletionStatusKind::NullFailure
-    } else if matches!(
-        CompletionEnvelope::from_raw_parts(COMP_BACKEND_IOCP, key as u64, 0, 0).identity(),
-        CompletionIdentity::Waker(_)
-            | CompletionIdentity::Cancel(_)
-            | CompletionIdentity::UnknownControl { .. }
-    ) {
-        IocpCompletionStatusKind::ControlKey
-    } else if key != 0 || success {
-        IocpCompletionStatusKind::PostedToken
-    } else {
-        IocpCompletionStatusKind::Unknown
-    }
-}
-
-fn duration_to_wait_ms(duration: Duration) -> u32 {
-    if duration.is_zero() {
-        0
-    } else {
-        let millis = duration.as_millis();
-        let rounded = millis.saturating_add(u128::from(
-            !duration.subsec_nanos().is_multiple_of(1_000_000),
-        ));
-        rounded.clamp(1, u32::MAX as u128) as u32
-    }
-}
-
-#[inline]
-fn iocp_status_res(success: bool, error_code: Option<u32>, bytes: u32) -> i32 {
-    if success {
-        bytes.min(i32::MAX as u32) as i32
-    } else {
-        -(error_code.unwrap_or(0).min(i32::MAX as u32) as i32)
-    }
-}
-
-#[inline]
-fn iocp_status_flags(success: bool, error_code: Option<u32>) -> u32 {
-    (u32::from(success)) | (error_code.unwrap_or(0).min(u32::MAX >> 1) << 1)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        IocpCompletionStatusKind, RIO_EVENT_KEY, WaitBudget, WaitBudgetSource,
-        classify_completion_status, duration_to_wait_ms, wait_budget,
+    use super::status::{
+        CompletionStatusClassifier, IocpCompletionStatusKind, WaitBudget, WaitBudgetSource,
     };
+    use crate::driver::RIO_EVENT_KEY;
     use veloq_driver_core::CompletionToken;
     use veloq_std::{ptr, time::Duration};
 
     #[test]
     fn null_overlapped_key_zero_failure_is_not_posted_token() {
         assert_eq!(
-            classify_completion_status(0, ptr::null_mut(), false),
+            CompletionStatusClassifier::classify(0, ptr::null_mut(), false),
             IocpCompletionStatusKind::NullFailure
         );
     }
@@ -913,7 +816,7 @@ mod tests {
     #[test]
     fn waker_key_is_classified_before_posted_token() {
         assert_eq!(
-            classify_completion_status(
+            CompletionStatusClassifier::classify(
                 CompletionToken::waker(0).raw() as usize,
                 ptr::null_mut(),
                 true,
@@ -925,7 +828,7 @@ mod tests {
     #[test]
     fn rio_key_is_wake_even_with_notification_overlapped() {
         assert_eq!(
-            classify_completion_status(RIO_EVENT_KEY, ptr::dangling_mut(), true),
+            CompletionStatusClassifier::classify(RIO_EVENT_KEY, ptr::dangling_mut(), true),
             IocpCompletionStatusKind::RioWake
         );
     }
@@ -933,26 +836,35 @@ mod tests {
     #[test]
     fn non_null_overlapped_keeps_queue_key_as_sidecar_context() {
         assert_eq!(
-            classify_completion_status(0, ptr::dangling_mut(), true),
+            CompletionStatusClassifier::classify(0, ptr::dangling_mut(), true),
             IocpCompletionStatusKind::OverlappedUser { queue_key: 0 }
         );
         assert_eq!(
-            classify_completion_status(123, ptr::dangling_mut(), true),
+            CompletionStatusClassifier::classify(123, ptr::dangling_mut(), true),
             IocpCompletionStatusKind::OverlappedUser { queue_key: 123 }
         );
     }
 
     #[test]
     fn external_timeout_rounds_up_to_avoid_early_expiry() {
-        assert_eq!(duration_to_wait_ms(Duration::ZERO), 0);
-        assert_eq!(duration_to_wait_ms(Duration::from_millis(1)), 1);
-        assert_eq!(duration_to_wait_ms(Duration::from_micros(1_001)), 2);
+        assert_eq!(
+            CompletionStatusClassifier::duration_to_wait_ms(Duration::ZERO),
+            0
+        );
+        assert_eq!(
+            CompletionStatusClassifier::duration_to_wait_ms(Duration::from_millis(1)),
+            1
+        );
+        assert_eq!(
+            CompletionStatusClassifier::duration_to_wait_ms(Duration::from_micros(1_001)),
+            2
+        );
     }
 
     #[test]
     fn wait_budget_keeps_the_explicit_deadline_source() {
         assert_eq!(
-            wait_budget(
+            CompletionStatusClassifier::wait_budget(
                 Some(Duration::from_secs(2)),
                 Some(Duration::from_secs(3)),
                 Duration::from_secs(1),
@@ -963,7 +875,7 @@ mod tests {
             }
         );
         assert_eq!(
-            wait_budget(
+            CompletionStatusClassifier::wait_budget(
                 Some(Duration::from_millis(3)),
                 Some(Duration::from_millis(7)),
                 Duration::from_secs(1),
@@ -974,7 +886,11 @@ mod tests {
             }
         );
         assert_eq!(
-            wait_budget(None, Some(Duration::from_millis(5)), Duration::from_secs(1),),
+            CompletionStatusClassifier::wait_budget(
+                None,
+                Some(Duration::from_millis(5)),
+                Duration::from_secs(1),
+            ),
             WaitBudget {
                 duration: Duration::from_millis(5),
                 source: WaitBudgetSource::Timer,

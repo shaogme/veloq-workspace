@@ -23,7 +23,7 @@ use crate::{
         registration::RegistrationService,
         state::{IocpDriverCompletionDiagnostics, SubmissionStateView},
     },
-    error::{IocpError, IocpResult, iocp_fallback_event_res},
+    error::{IocpError, IocpResult},
     op::{
         BlockingCompletion, IocpOp, IocpOpPayload, IocpOpRegistry, IocpSlotSpec, Slot,
         SubmissionResult, SubmitContext,
@@ -178,11 +178,11 @@ impl CompletionBackendHooks<IocpSlotSpec> for SubmissionFailureHooks {
 }
 
 fn close_fd_from_op(op: &IocpOp) -> IocpResult<Option<IoFd>> {
-    match &op.payload {
+    match op.payload() {
         IocpOpPayload::Close(payload) => {
             // SAFETY: 提交开始前已将 payload 绑定到 slot。
             // SAFETY: the payload is bound to the slot before submission starts.
-            Ok(Some(unsafe { payload.user.as_ref()? }.fd))
+            Ok(Some(unsafe { payload.user().as_ref()? }.fd))
         }
         _ => Ok(None),
     }
@@ -190,32 +190,34 @@ fn close_fd_from_op(op: &IocpOp) -> IocpResult<Option<IoFd>> {
 
 fn socket_pending_without_inflight_token(op: &IocpOp) -> bool {
     if op.uses_rio_backend()
-        || !op.header.in_flight
+        || !op.header().in_flight()
         || !op
-            .header
-            .resolved_handle
+            .header()
+            .resolved_handle()
             .is_some_and(|handle| handle.is_socket())
     {
         return false;
     }
     if op.kind() != OpKind::UdpRecvMulti {
-        return op.header.socket_inflight.is_none();
+        return op.header().socket_inflight().is_none();
     }
 
-    let IocpOpPayload::UdpRecvMulti(payload) = &op.payload else {
+    let IocpOpPayload::UdpRecvMulti(payload) = op.payload() else {
         return true;
     };
     // SAFETY: The payload is bound to the reserved operation slot during submission. / 提交期间该 payload 已绑定到操作槽位。
-    let Ok(user) = (unsafe { payload.user.as_ref() }) else {
+    let Ok(user) = (unsafe { payload.user().as_ref() }) else {
         return true;
     };
     let expected = user.receive_pump().actual_in_flight();
     let Some(requests) = payload.raw_requests() else {
         return true;
     };
-    let mut active = requests.iter().filter(|request| request.header().in_flight);
+    let mut active = requests
+        .iter()
+        .filter(|request| request.header().in_flight());
     let active_count = active.clone().count();
-    active_count != expected || active.any(|request| request.header().socket_inflight.is_none())
+    active_count != expected || active.any(|request| request.header().socket_inflight().is_none())
 }
 
 fn slot_access_report(scope: &'static str, err: SlotAccessError) -> Report<IocpError> {
@@ -264,7 +266,7 @@ impl SubmissionService<'_, '_> {
                     slot_access_report("iocp.driver.prep_op_slot.op_payload", err)
                 })?;
                 let op_ref = op_ref.get_mut();
-                op_ref.header.reset_for_token(token);
+                op_ref.header_mut().reset_for_token(token);
                 op_ref.bind_user_payload(user_payload)
             })
             .map_err(|err| slot_access_report("iocp.driver.prep_op_slot.op_payload", err))??;
@@ -281,7 +283,7 @@ impl SubmissionService<'_, '_> {
     ) -> IocpResult<Poll<()>> {
         if blocking_pool.execute(task).is_err() {
             let report = IocpError::Submission.report("iocp/driver", "thread pool overloaded");
-            let event_res = iocp_fallback_event_res(IocpError::Submission);
+            let event_res = IocpError::fallback_event_res(IocpError::Submission);
             let event = UserCompletionEvent::from_parts(COMP_BACKEND_IOCP, token, event_res, 0);
             let mut hooks = SubmissionFailureHooks {
                 report: Some(report),
@@ -414,11 +416,11 @@ impl SubmissionService<'_, '_> {
             .push_ctx("scope", "iocp/driver")
             .attach_note("failed to prepare op slot")?;
 
-        let overlapped = guard.with_sidecar_mut(|sidecar| &mut sidecar.inner as *mut Overlapped);
+        let overlapped = guard.with_sidecar_mut(|sidecar| sidecar.inner_mut() as *mut Overlapped);
 
         let mut sub_guard = guard
             .start_submission_with(Some(|slot| {
-                slot.with_sidecar_mut(|sidecar| sidecar.in_flight = false);
+                slot.with_sidecar_mut(|sidecar| *sidecar.in_flight_mut() = false);
             }))
             .map_err(|err| slot_access_report("iocp.driver.call_op_submit.start", err))?;
         let close_fd = sub_guard
@@ -443,8 +445,8 @@ impl SubmissionService<'_, '_> {
                 sub_guard
                     .with_access_mut(|access| {
                         let op = access.operation_mut().get_mut();
-                        op.header.resolved_handle = Some(RawHandle::new(raw_handle));
-                        op.header.blocking_completion = Some(completion);
+                        *op.header_mut().resolved_handle_mut() = Some(RawHandle::new(raw_handle));
+                        *op.header_mut().blocking_completion_mut() = Some(completion);
                     })
                     .map_err(|err| {
                         slot_access_report("iocp.driver.call_op_submit.close_op", err)

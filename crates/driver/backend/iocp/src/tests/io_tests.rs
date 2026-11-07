@@ -3,7 +3,7 @@ use crate::{
     driver::IocpDriver,
     error::IocpError,
     op::{IocpSlotSpec, ReadFixed, ReadRaw, Timeout, WriteFixed, WriteRaw},
-    tests::{complete_from_record, submit_test_op, wait_completion, wait_completion_record},
+    tests::TestSupport,
 };
 use veloq_buf::FixedBuf;
 use veloq_driver_core::{Driver, DriverSubmitResult, IntoPlatformOp, RegisterFd, SubmitStatus};
@@ -88,8 +88,8 @@ fn submit_registered_write(driver: &mut IocpDriver<'_>, fd: IoFd, offset: u64, b
         offset,
         buf_offset: 0,
     };
-    let token = submit_test_op(driver, op);
-    let written = wait_completion(driver, token, Duration::from_secs(5))
+    let token = TestSupport::submit_test_op(driver, op);
+    let written = TestSupport::wait_completion(driver, token, Duration::from_secs(5))
         .expect("registered write completion failed");
     assert_eq!(written, bytes.len());
 }
@@ -101,10 +101,10 @@ fn read_registered(driver: &mut IocpDriver<'_>, fd: IoFd, offset: u64, len: usiz
         offset,
         buf_offset: 0,
     };
-    let token = submit_test_op(driver, op);
-    let record = wait_completion_record(driver, token, Duration::from_secs(5))
+    let token = TestSupport::submit_test_op(driver, op);
+    let record = TestSupport::wait_completion_record(driver, token, Duration::from_secs(5))
         .expect("registered read completion missing");
-    let completion = complete_from_record::<ReadFixed>(record);
+    let completion = TestSupport::complete_from_record::<ReadFixed>(record);
     let (result, mut op) = completion.into_parts();
     let bytes = result.expect("registered read completion failed");
     op.buf.set_len(bytes);
@@ -118,8 +118,8 @@ fn submit_raw_write(driver: &mut IocpDriver<'_>, handle: IocpHandle, offset: u64
         offset,
         buf_offset: 0,
     };
-    let token = submit_test_op(driver, op);
-    let written = wait_completion(driver, token, Duration::from_secs(5))
+    let token = TestSupport::submit_test_op(driver, op);
+    let written = TestSupport::wait_completion(driver, token, Duration::from_secs(5))
         .expect("raw write completion failed");
     assert_eq!(written, bytes.len());
 }
@@ -150,10 +150,10 @@ fn read_raw(driver: &mut IocpDriver<'_>, handle: IocpHandle, offset: u64, len: u
         offset,
         buf_offset: 0,
     };
-    let token = submit_test_op(driver, op);
-    let record = wait_completion_record(driver, token, Duration::from_secs(5))
+    let token = TestSupport::submit_test_op(driver, op);
+    let record = TestSupport::wait_completion_record(driver, token, Duration::from_secs(5))
         .expect("raw read completion missing");
-    let completion = complete_from_record::<ReadRaw>(record);
+    let completion = TestSupport::complete_from_record::<ReadRaw>(record);
     let (result, mut op) = completion.into_parts();
     let bytes = result.expect("raw read completion failed");
     op.buf.set_len(bytes);
@@ -168,10 +168,10 @@ fn test_iocp_timeout() {
         duration: Duration::from_millis(100),
     };
 
-    let token = submit_test_op(&mut driver, timeout_op);
+    let token = TestSupport::submit_test_op(&mut driver, timeout_op);
 
     let start = Instant::now();
-    let res = wait_completion(&mut driver, token, Duration::from_secs(1));
+    let res = TestSupport::wait_completion(&mut driver, token, Duration::from_secs(1));
     assert!(res.is_ok(), "Timeout should succeed");
     let elapsed = start.elapsed();
     assert!(

@@ -8,13 +8,22 @@ use veloq_driver_core::{
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 
 use crate::{
-    error::{IocpError, IocpResult, iocp_report_to_event_res},
+    error::{IocpError, IocpResult},
     ext::Extensions,
     op::{IocpOp, IocpOpPayload, IocpSlotSpec, IocpUserPayload, Slot},
     rio::SocketInflightToken,
 };
 
 use super::protocol::{COMP_BACKEND_IOCP, IocpBackendEffect, IocpSubmissionFailurePhase};
+
+pub(super) struct MultishotReplacementFailure<'slot> {
+    pub(super) slot: Slot<'slot, InFlightWaiting>,
+    pub(super) event: UserCompletionEvent,
+    pub(super) io_result: IocpResult<usize>,
+    pub(super) payload: IocpUserPayload,
+    pub(super) replacement_error: Report<IocpError>,
+    pub(super) effect: IocpBackendEffect,
+}
 
 pub(super) struct SettlementService;
 
@@ -37,14 +46,14 @@ impl SettlementService {
         let op_res = guard.with_access_mut(|access| {
             let iocp_op = access.operation_mut().get_mut();
             let blocking_res = iocp_op
-                .header
-                .blocking_completion
+                .header_mut()
+                .blocking_completion_mut()
                 .take()
                 .and_then(|completion| completion.take_result());
             if let Some(res) = blocking_res {
                 io_result = res;
             } else if matches!(
-                &iocp_op.payload,
+                iocp_op.payload(),
                 IocpOpPayload::Open(_)
                     | IocpOpPayload::Close(_)
                     | IocpOpPayload::Fsync(_)
@@ -247,7 +256,7 @@ impl SettlementService {
                 IocpSubmissionFailurePhase::Replacement.as_str(),
             )
             .attach_note("multishot replacement submission failed after a record completed");
-        let terminal_res = iocp_report_to_event_res(&replacement_error);
+        let terminal_res = IocpError::report_to_event_res(&replacement_error);
         let mut guard = slot.complete();
         let record_payload = guard
             .with_access_mut(|access| {
@@ -306,20 +315,23 @@ impl SettlementService {
     }
 
     pub(super) fn complete_iocp_multishot_replacement_failure_slot(
-        slot: Slot<'_, InFlightWaiting>,
-        event: UserCompletionEvent,
-        io_result: IocpResult<usize>,
-        payload: IocpUserPayload,
-        replacement_error: Report<IocpError>,
-        effect: IocpBackendEffect,
+        failure: MultishotReplacementFailure<'_>,
     ) -> CompletionSettlement<IocpSlotSpec, IocpBackendEffect> {
+        let MultishotReplacementFailure {
+            slot,
+            event,
+            io_result,
+            payload,
+            replacement_error,
+            effect,
+        } = failure;
         let replacement_error = replacement_error
             .with_ctx(
                 "submission_phase",
                 IocpSubmissionFailurePhase::Replacement.as_str(),
             )
             .attach_note("multishot replacement submission failed after a record completed");
-        let terminal_res = iocp_report_to_event_res(&replacement_error);
+        let terminal_res = IocpError::report_to_event_res(&replacement_error);
         let mut guard = slot.complete();
         let cleanup = guard
             .with_access_mut(|access| {
@@ -516,17 +528,17 @@ impl SettlementService {
 
     #[inline]
     fn take_socket_inflight_from_op(op: &mut IocpOp) -> Option<SocketInflightToken> {
-        if op.header.in_flight {
-            op.header.in_flight = false;
+        if op.header().in_flight() {
+            *op.header_mut().in_flight_mut() = false;
         }
-        op.header.socket_inflight.take()
+        op.header_mut().socket_inflight_mut().take()
     }
 
     #[inline]
     fn io_result_to_event_res(res: &IocpResult<usize>) -> i32 {
         match res {
             Ok(v) => (*v).min(i32::MAX as usize) as i32,
-            Err(e) => iocp_report_to_event_res(e),
+            Err(e) => IocpError::report_to_event_res(e),
         }
     }
 }

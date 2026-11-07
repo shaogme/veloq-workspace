@@ -38,6 +38,13 @@ pub struct IocpCompletionDiagnostics {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RioCompletionDiagnosticsSnapshot {
+    pub malformed_context: u64,
+    pub missing_context: u64,
+    pub stale_context: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct IocpCompletionDiagnosticsSnapshot {
     pub cancel_submitted: u64,
     pub cancel_queued: u64,
@@ -64,13 +71,6 @@ pub struct IocpCompletionDiagnosticsSnapshot {
     pub wait_completion_return: u64,
     pub waker_rearm: u64,
     pub rio: RioCompletionDiagnosticsSnapshot,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct RioCompletionDiagnosticsSnapshot {
-    pub malformed_context: u64,
-    pub missing_context: u64,
-    pub stale_context: u64,
 }
 
 impl IocpCompletionDiagnostics {

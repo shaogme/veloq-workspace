@@ -7,6 +7,12 @@ mod registration;
 mod state;
 mod submission;
 
+#[cfg(test)]
+use crate::RegisteredHandle;
+
+#[cfg(feature = "test-hooks")]
+use veloq_driver_core::test_hooks::DriverTestHooks;
+
 use veloq_std::{
     boxed::Box, format, marker::PhantomData, mem::size_of, num::NonZeroUsize, sync::Arc,
     time::Duration, vec::Vec,
@@ -15,21 +21,21 @@ use veloq_std::{
 use diagweave::prelude::*;
 use veloq_buf::{AnyBufPool, BufPool, BufferRegistrationRequest, FixedBuf};
 
+pub use crate::op::IocpOpState;
+pub(crate) use completion::COMP_BACKEND_RIO;
 use lifecycle::LifecycleService;
 pub(crate) use overlapped::OverlappedRegistry;
 use registration::RegistrationService;
+pub(crate) use state::IocpDriverCompletionDiagnostics;
+use state::IocpDriverState;
 use submission::{SubmissionService, SubmitContextInternal, SubmitResolution};
-use tracing::debug;
+use tracing::{debug, error};
 
-pub(crate) use completion::COMP_BACKEND_RIO;
-
-#[cfg(test)]
-use crate::RegisteredHandle;
 use crate::{
     IocpResult,
     config::{IoFd, IocpConfig, IocpHandle},
     error::IocpError,
-    net::addr::SockAddrStorage,
+    net::SockAddrStorage,
     op::{IocpOp, IocpSlotSpec, IocpUserPayload},
     win32::IoCompletionPort,
 };
@@ -44,25 +50,30 @@ use veloq_driver_core::{
 
 use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 
-#[cfg(feature = "test-hooks")]
-use veloq_driver_core::test_hooks::DriverTestHooks;
-
 pub(crate) const RIO_EVENT_TOKEN: CompletionToken = match CompletionToken::encode_control(3, 0) {
     Ok(t) => t,
     Err(_) => panic!("Failed to encode RIO_EVENT_TOKEN"),
 };
 
 pub(crate) const RIO_EVENT_KEY: usize = RIO_EVENT_TOKEN.raw() as usize;
+
 pub(crate) type PreInit = IoCompletionPort;
 
-pub use crate::op::IocpOpState;
-pub(crate) use state::IocpDriverCompletionDiagnostics;
-use state::IocpDriverState;
+/// driver 或操作的关闭模式。
+/// Closing mode for the driver or operations.
+#[derive(Clone, Copy, Debug)]
+pub enum CloseMode {
+    /// 立即关闭，不等待未完成操作。
+    /// Closes quickly without waiting for pending operations.
+    Fast,
+    /// 等待指定时长以允许未完成操作结束，然后关闭。
+    /// Closes after a specified timeout, allowing pending operations to finish.
+    Strict { timeout: Duration },
+}
 
 // ============================================================================
 // 状态与生命周期类型 / State and lifecycle types
 // ============================================================================
-
 /// 管理 I/O completion port 和操作的 IOCP driver 实现。
 /// Implements the IOCP driver that manages I/O completion ports and operations.
 pub struct IocpDriver<'a> {
@@ -168,21 +179,9 @@ impl Drop for IocpDriver<'_> {
         }
         debug!("Dropping IocpDriver");
         if let Err(error) = self.close_impl(CloseMode::Fast) {
-            tracing::error!(report = ?error, "iocp close_impl fast failed during drop");
+            error!(report = ?error, "iocp close_impl fast failed during drop");
         }
     }
-}
-
-/// driver 或操作的关闭模式。
-/// Closing mode for the driver or operations.
-#[derive(Clone, Copy, Debug)]
-pub enum CloseMode {
-    /// 立即关闭，不等待未完成操作。
-    /// Closes quickly without waiting for pending operations.
-    Fast,
-    /// 等待指定时长以允许未完成操作结束，然后关闭。
-    /// Closes after a specified timeout, allowing pending operations to finish.
-    Strict { timeout: Duration },
 }
 
 impl<'a> IocpDriver<'a> {
@@ -300,6 +299,7 @@ impl<'a> UdpReceiveOperationBuilder for IocpDriver<'a> {
 impl<'a> DriverRaw for IocpDriver<'a> {
     type SlotSpec = IocpSlotSpec;
     type Raw = IocpHandle;
+
     const BACKEND_NAME: &'static str = "iocp";
 
     fn reserve_op_raw(&mut self) -> IocpResult<OpToken> {

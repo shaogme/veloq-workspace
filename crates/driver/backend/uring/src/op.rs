@@ -5,10 +5,8 @@ mod payload;
 mod spec;
 mod submit;
 
-use crate::{diagnostics::UringCompletionDiagnostics, driver::UringOpState, error::UringError};
 use veloq_driver_core::{
     CompletionCleanupGuard, OpRegistry as CoreOpRegistry, PlatformOp, Slot as CoreSlot,
-    SlotSpec as CoreSlotSpec,
 };
 use veloq_std::pin::Pin;
 
@@ -25,6 +23,7 @@ pub(crate) use payload::{
     TimeoutPayload, UdpConnect, UdpPendingLease, UdpRecvMsgParser, UdpRecvMulti,
     UdpRecvMultiPayload, UdpRecvPacket, UdpSend, Wakeup, WakeupPayload, WriteFixed, WriteRaw,
 };
+pub use spec::UringSlotSpec;
 pub(crate) use spec::{
     UringKernelPayloadStorage, UringOperationDescriptor, UringUserPayloadStorage,
 };
@@ -114,17 +113,5 @@ pub type UringOp = UringKernelOp;
 // ============================================================================
 // Slot Registry Binding
 // ============================================================================
-pub enum UringSlotSpec {}
-
-impl CoreSlotSpec for UringSlotSpec {
-    type Op = UringOp;
-    type UserPayload = UringUserPayload;
-    type PlatformData = UringOpState;
-    type Sidecar = ();
-    type Error = UringError;
-    type Completion = usize;
-    type CompletionDiagnostics = UringCompletionDiagnostics;
-}
-
 pub(crate) type UringOpRegistry = CoreOpRegistry<UringSlotSpec>;
 pub(crate) type Slot<'a, State> = CoreSlot<'a, State, UringSlotSpec>;

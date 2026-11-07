@@ -1,5 +1,5 @@
 use crate::{
-    net::addr::SockAddrStorage,
+    net::SockAddrStorage,
     rio::{
         RioEnv,
         core::{RioBufferId, RioProvider},
@@ -313,8 +313,8 @@ impl RioAddressRegistry {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{RioRegistry, RioRegistryTestSupport};
     use super::{
+        super::{RioRegistry, RioRegistryTestSupport},
         AF_INET, AF_INET6, RioError, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_INET,
         SockAddrStorage,
     };
@@ -337,12 +337,12 @@ mod tests {
             .expect_err("negative sockaddr length should fail");
         assert_eq!(*err.inner(), RioError::InvalidInput);
 
-        sockaddr.0.ss_family = AF_INET6;
+        sockaddr.as_raw_mut().ss_family = AF_INET6;
         let err = RioRegistry::validate_send_addr(&sockaddr, size_of::<SOCKADDR>() as i32)
             .expect_err("IPv6 sockaddr shorter than SOCKADDR_IN6 should fail");
         assert_eq!(*err.inner(), RioError::InvalidInput);
 
-        sockaddr.0.ss_family = 0x7fff;
+        sockaddr.as_raw_mut().ss_family = 0x7fff;
         let err = RioRegistry::validate_send_addr(&sockaddr, size_of::<SOCKADDR>() as i32)
             .expect_err("unsupported sockaddr family should fail");
         assert_eq!(*err.inner(), RioError::InvalidInput);
@@ -352,14 +352,14 @@ mod tests {
     fn rio_send_addr_validation_accepts_ipv4_and_ipv6_lengths() {
         // SAFETY: SOCKADDR_IN is POD and the test sets its family. / 安全性：SOCKADDR_IN 是 POD，测试显式设置了地址族。
         let mut ipv4: SockAddrStorage = unsafe { zeroed() };
-        ipv4.0.ss_family = AF_INET;
+        ipv4.as_raw_mut().ss_family = AF_INET;
         let rio_len = RioRegistry::validate_send_addr(&ipv4, size_of::<SOCKADDR_IN>() as i32)
             .expect("valid IPv4 sockaddr should pass");
         assert_eq!(rio_len, size_of::<SOCKADDR_INET>() as u32);
 
         // SAFETY: SOCKADDR_IN6 is POD and the test sets its family. / 安全性：SOCKADDR_IN6 是 POD，测试显式设置了地址族。
         let mut ipv6: SockAddrStorage = unsafe { zeroed() };
-        ipv6.0.ss_family = AF_INET6;
+        ipv6.as_raw_mut().ss_family = AF_INET6;
         let rio_len = RioRegistry::validate_send_addr(&ipv6, size_of::<SOCKADDR_IN6>() as i32)
             .expect("valid IPv6 sockaddr should pass");
         assert_eq!(rio_len, size_of::<SOCKADDR_INET>() as u32);

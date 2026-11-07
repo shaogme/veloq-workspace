@@ -42,10 +42,11 @@ fn write_ipv6_bytes(bytes: &mut [u8], offset: usize, value: [u8; 16]) {
 /// A storage wrapper for socket addresses.
 #[repr(transparent)]
 #[derive(Clone, Copy)]
-pub struct SockAddrStorage(pub SOCKADDR_STORAGE);
+pub struct SockAddrStorage(SOCKADDR_STORAGE);
 
 // SAFETY: SOCKADDR_STORAGE is a Win32 struct that can be zero-initialized.
 unsafe impl Zeroable for SockAddrStorage {}
+
 // SAFETY: SockAddrStorage is repr(transparent) and SOCKADDR_STORAGE is a POD-like struct in Win32.
 unsafe impl Pod for SockAddrStorage {}
 
@@ -55,19 +56,14 @@ impl Default for SockAddrStorage {
     }
 }
 
-impl SockAddrStorage {
-    /// Returns the address family of the stored address.
-    pub fn family(&self) -> u16 {
-        self.0.ss_family
-    }
-}
-
 /// A wrapper for SOCKADDR_IN.
 #[repr(transparent)]
 #[derive(Clone, Copy)]
-pub struct SockAddrIn(pub SOCKADDR_IN);
+pub struct SockAddrIn(SOCKADDR_IN);
+
 // SAFETY: SOCKADDR_IN is a POD struct and can be safely zeroed.
 unsafe impl Zeroable for SockAddrIn {}
+
 // SAFETY: SockAddrIn is repr(transparent) and SOCKADDR_IN is a POD struct.
 unsafe impl Pod for SockAddrIn {}
 
@@ -97,9 +93,11 @@ impl SockAddrIn {
 /// A wrapper for SOCKADDR_IN6.
 #[repr(transparent)]
 #[derive(Clone, Copy)]
-pub struct SockAddrIn6(pub SOCKADDR_IN6);
+pub struct SockAddrIn6(SOCKADDR_IN6);
+
 // SAFETY: SOCKADDR_IN6 is a POD struct and can be safely zeroed.
 unsafe impl Zeroable for SockAddrIn6 {}
+
 // SAFETY: SockAddrIn6 is repr(transparent) and SOCKADDR_IN6 is a POD struct.
 unsafe impl Pod for SockAddrIn6 {}
 
@@ -134,56 +132,67 @@ impl SockAddrIn6 {
     }
 }
 
-/// Converts a byte buffer to a SocketAddr.
-pub fn to_socket_addr(buf: &[u8]) -> IocpResult<SocketAddr> {
-    if buf.len() < 2 {
-        return IocpError::InvalidInput.attach_note("invalid address length");
+impl SockAddrStorage {
+    /// Returns the address family of the stored address.
+    pub fn family(&self) -> u16 {
+        self.0.ss_family
     }
 
-    // Use veloq_pod to cast the family safely if possible, but family is at offset 0.
-    let family = u16::from_ne_bytes([buf[0], buf[1]]);
-
-    match family {
-        AF_INET => {
-            if buf.len() < size_of::<SOCKADDR_IN>() {
-                return IocpError::InvalidInput.attach_note("invalid IPv4 sockaddr length");
-            }
-            let sin_wrapped: &SockAddrIn = from_bytes(&buf[..size_of::<SOCKADDR_IN>()]);
-            Ok(SocketAddr::V4(sin_wrapped.to_std()))
-        }
-        AF_INET6 => {
-            if buf.len() < size_of::<SOCKADDR_IN6>() {
-                return IocpError::InvalidInput.attach_note("invalid IPv6 sockaddr length");
-            }
-            let sin6_wrapped: &SockAddrIn6 = from_bytes(&buf[..size_of::<SOCKADDR_IN6>()]);
-            Ok(SocketAddr::V6(sin6_wrapped.to_std()))
-        }
-        _ => IocpError::InvalidInput.attach_note("unsupported address family"),
+    pub fn as_raw(&self) -> &SOCKADDR_STORAGE {
+        &self.0
     }
-}
 
-/// Converts a SocketAddr to storage and length.
-pub fn socket_addr_to_storage(addr: SocketAddr) -> (SockAddrStorage, i32) {
-    let mut storage = SockAddrStorage::default();
-    let len = match addr {
-        SocketAddr::V4(a) => {
-            let sin = SockAddrIn::new(&a);
-            let sin_ref = from_bytes_mut::<SockAddrIn>(
-                &mut bytes_of_mut(&mut storage)[..size_of::<SOCKADDR_IN>()],
-            );
-            *sin_ref = sin;
-            size_of::<SOCKADDR_IN>() as i32
+    pub fn as_raw_mut(&mut self) -> &mut SOCKADDR_STORAGE {
+        &mut self.0
+    }
+
+    pub fn to_socket_addr(buf: &[u8]) -> IocpResult<SocketAddr> {
+        if buf.len() < 2 {
+            return IocpError::InvalidInput.attach_note("invalid address length");
         }
-        SocketAddr::V6(a) => {
-            let sin6 = SockAddrIn6::new(&a);
-            let sin6_ref = from_bytes_mut::<SockAddrIn6>(
-                &mut bytes_of_mut(&mut storage)[..size_of::<SOCKADDR_IN6>()],
-            );
-            *sin6_ref = sin6;
-            size_of::<SOCKADDR_IN6>() as i32
+
+        let family = u16::from_ne_bytes([buf[0], buf[1]]);
+        match family {
+            AF_INET => {
+                if buf.len() < size_of::<SOCKADDR_IN>() {
+                    return IocpError::InvalidInput.attach_note("invalid IPv4 sockaddr length");
+                }
+                let sin_wrapped: &SockAddrIn = from_bytes(&buf[..size_of::<SOCKADDR_IN>()]);
+                Ok(SocketAddr::V4(sin_wrapped.to_std()))
+            }
+            AF_INET6 => {
+                if buf.len() < size_of::<SOCKADDR_IN6>() {
+                    return IocpError::InvalidInput.attach_note("invalid IPv6 sockaddr length");
+                }
+                let sin6_wrapped: &SockAddrIn6 = from_bytes(&buf[..size_of::<SOCKADDR_IN6>()]);
+                Ok(SocketAddr::V6(sin6_wrapped.to_std()))
+            }
+            _ => IocpError::InvalidInput.attach_note("unsupported address family"),
         }
-    };
-    (storage, len)
+    }
+
+    pub fn from_socket_addr(addr: SocketAddr) -> (Self, i32) {
+        let mut storage = Self::default();
+        let len = match addr {
+            SocketAddr::V4(addr) => {
+                let sin = SockAddrIn::new(&addr);
+                let sin_ref = from_bytes_mut::<SockAddrIn>(
+                    &mut bytes_of_mut(&mut storage)[..size_of::<SOCKADDR_IN>()],
+                );
+                *sin_ref = sin;
+                size_of::<SOCKADDR_IN>() as i32
+            }
+            SocketAddr::V6(addr) => {
+                let sin6 = SockAddrIn6::new(&addr);
+                let sin6_ref = from_bytes_mut::<SockAddrIn6>(
+                    &mut bytes_of_mut(&mut storage)[..size_of::<SOCKADDR_IN6>()],
+                );
+                *sin6_ref = sin6;
+                size_of::<SOCKADDR_IN6>() as i32
+            }
+        };
+        (storage, len)
+    }
 }
 
 impl SocketAddrCodec for SockAddrStorage {
@@ -191,10 +200,10 @@ impl SocketAddrCodec for SockAddrStorage {
     type Error = IocpError;
 
     fn to_socket_addr(buf: &[u8]) -> IocpResult<SocketAddr> {
-        to_socket_addr(buf).attach_note("decode socket address failed")
+        Self::to_socket_addr(buf).attach_note("decode socket address failed")
     }
 
     fn socket_addr_to_storage(addr: SocketAddr) -> (Self, Self::Len) {
-        socket_addr_to_storage(addr)
+        Self::from_socket_addr(addr)
     }
 }

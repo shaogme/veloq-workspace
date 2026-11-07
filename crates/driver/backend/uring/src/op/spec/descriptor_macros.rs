@@ -688,13 +688,13 @@ macro_rules! impl_uring_single_shot_op {
             }
         }
 
-        impl SingleShotOp<UringSlotSpec> for $OpType {}
+        impl SingleShotOperation<$OpType> for UringSlotSpec {}
     };
 }
 
 macro_rules! impl_uring_single_shot_marker {
     (single, $OpType:ty) => {
-        impl SingleShotOp<UringSlotSpec> for $OpType {}
+        impl SingleShotOperation<$OpType> for UringSlotSpec {}
     };
     (multi, $OpType:ty) => {};
 }

@@ -5,367 +5,233 @@ use crate::{
     error::{IocpError, IocpResult},
     ext::Extensions,
     op::{
-        AcceptedSocket, IocpKernelOp, IocpOpPayload, IocpUserPayload, OpVTable, OverlappedEntry,
-        SubmissionResult, SubmitContext,
+        AcceptedSocket, IocpKernelOp, IocpMultiShotErasure, IocpOpErasure, IocpUserPayload,
+        PayloadBinding, SubmissionResult, SubmitContext,
     },
 };
 use diagweave::prelude::*;
-use veloq_driver_core::{CompletionCleanupGuard, CompletionContinuation, OpKind};
+use veloq_driver_core::{CompletionCleanupGuard, CompletionContinuation};
 
-/// Type-erased helpers needed by a backend completion path to create a record without moving the
-/// persistent submit payload out of the slot.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum IocpRecordKind {
-    AcceptedSocket,
-    ProvidedBuf,
-    UdpRecvPacket,
-}
+pub(super) struct IocpSpecDispatch;
 
-pub(crate) struct IocpMultiShotVTable {
-    pub(crate) record_kind: IocpRecordKind,
-    pub(crate) encode_accepted_socket: fn() -> IocpUserPayload,
-    pub(crate) rearm: fn(&mut IocpKernelOp, &mut SubmitContext) -> IocpResult<SubmissionResult>,
-    pub(crate) continuation: fn(&IocpResult<usize>) -> CompletionContinuation,
-}
+impl IocpSpecDispatch {
+    pub(super) fn encode_accepted_socket() -> IocpUserPayload {
+        IocpUserPayload::AcceptedSocket(AcceptedSocket {})
+    }
 
-pub(crate) fn encode_accepted_socket() -> IocpUserPayload {
-    IocpUserPayload::AcceptedSocket(AcceptedSocket {})
-}
-
-pub(crate) fn final_continuation(_result: &IocpResult<usize>) -> CompletionContinuation {
-    CompletionContinuation::Final
-}
-
-pub(crate) fn more_on_success(result: &IocpResult<usize>) -> CompletionContinuation {
-    if result.is_ok() {
-        CompletionContinuation::More
-    } else {
+    pub(super) fn final_continuation(_result: &IocpResult<usize>) -> CompletionContinuation {
         CompletionContinuation::Final
     }
+
+    pub(super) fn more_on_success(result: &IocpResult<usize>) -> CompletionContinuation {
+        if result.is_ok() {
+            CompletionContinuation::More
+        } else {
+            CompletionContinuation::Final
+        }
+    }
 }
 
-pub(crate) trait PayloadBinding<T> {
-    fn bind(&mut self, user: NonNull<T>);
-    fn clear(&mut self);
-}
-
-pub(crate) trait IocpOpSpec: Sized + Send + 'static {
-    type KernelPayload: PayloadBinding<Self>;
-    type Completion;
-
-    const PAYLOAD_KIND: OpKind;
-
-    fn new_kernel_payload(user: &Self) -> Self::KernelPayload;
-
-    fn submit(
-        header: &mut OverlappedEntry,
-        payload: &mut Self::KernelPayload,
+impl IocpSpecDispatch {
+    pub(super) fn submit_shim<S>(
+        op: &mut IocpKernelOp,
         ctx: &mut SubmitContext,
-    ) -> IocpResult<SubmissionResult>;
-
-    unsafe fn on_complete(
-        _header: &mut OverlappedEntry,
-        _payload: &mut Self::KernelPayload,
-        result: usize,
-        _ext: &Extensions,
-    ) -> IocpResult<usize> {
-        Ok(result)
+    ) -> IocpResult<SubmissionResult>
+    where
+        S: IocpOpErasure,
+    {
+        let (header, erased_payload) = op.header_payload_mut();
+        let payload = S::kernel_payload_mut(erased_payload).ok_or_else(|| {
+            IocpError::InvalidState
+                .to_report()
+                .with_ctx("op_type", type_name::<S>())
+                .attach_note("variant mismatch in IocpKernelOp dispatch")
+        })?;
+        S::submit(header, payload, ctx)
     }
 
-    fn completion_cleanup(
-        _payload: &mut Self::KernelPayload,
-        _result: &IocpResult<usize>,
-    ) -> CompletionCleanupGuard {
-        CompletionCleanupGuard::default()
-    }
-
-    fn orphan_cleanup(
-        payload: &mut Self::KernelPayload,
-        result: &IocpResult<usize>,
-    ) -> CompletionCleanupGuard {
-        Self::completion_cleanup(payload, result)
-    }
-
-    unsafe fn get_fd(_payload: &Self::KernelPayload) -> Option<IoFd> {
-        None
-    }
-
-    fn map_completion(payload: &Self, res: IocpResult<usize>) -> IocpResult<Self::Completion>;
-}
-
-/// The operation-erasure contract for a persistent completion stream.
-///
-/// `IocpOpSpec` deliberately models the old one-shot path.  A receive pump has a different
-/// ownership rule: its kernel payload and submit payload remain in the slot while every
-/// datagram is represented by a separate record payload.  Keeping this trait separate makes it
-/// impossible for the one-shot macro to accidentally add `SingleShotOp` to the pump.
-pub(crate) trait IocpMultiShotSpec: Sized + Send + 'static {
-    type KernelPayload: PayloadBinding<Self>;
-    type RecordPayload: Send;
-    type Completion: Send;
-
-    const PAYLOAD_KIND: OpKind;
-
-    fn new_kernel_payload(user: &Self) -> Self::KernelPayload;
-
-    fn submit(
-        header: &mut OverlappedEntry,
-        payload: &mut Self::KernelPayload,
+    pub(super) fn submit_multishot_shim<S>(
+        op: &mut IocpKernelOp,
         ctx: &mut SubmitContext,
-    ) -> IocpResult<SubmissionResult>;
+    ) -> IocpResult<SubmissionResult>
+    where
+        S: IocpMultiShotErasure,
+    {
+        let (header, erased_payload) = op.header_payload_mut();
+        let payload = S::kernel_payload_mut(erased_payload).ok_or_else(|| {
+            IocpError::InvalidState
+                .to_report()
+                .with_ctx("op_type", type_name::<S>())
+                .attach_note("variant mismatch in IOCP multishot submit dispatch")
+        })?;
+        S::submit(header, payload, ctx)
+    }
 
-    unsafe fn on_complete(
-        _header: &mut OverlappedEntry,
-        _payload: &mut Self::KernelPayload,
+    pub(super) unsafe fn on_complete_shim<S>(
+        op: &mut IocpKernelOp,
         result: usize,
-        _ext: &Extensions,
-    ) -> IocpResult<usize> {
-        Ok(result)
+        ext: &Extensions,
+    ) -> IocpResult<usize>
+    where
+        S: IocpOpErasure,
+    {
+        let (header, erased_payload) = op.header_payload_mut();
+        let payload = S::kernel_payload_mut(erased_payload).ok_or_else(|| {
+            IocpError::InvalidState
+                .to_report()
+                .with_ctx("op_type", type_name::<S>())
+                .attach_note("variant mismatch in IocpKernelOp on_complete")
+        })?;
+        unsafe { S::on_complete(header, payload, result, ext) }
     }
 
-    fn completion_cleanup(
-        _payload: &mut Self::KernelPayload,
-        _result: &IocpResult<usize>,
-    ) -> CompletionCleanupGuard {
-        CompletionCleanupGuard::default()
+    pub(super) unsafe fn on_complete_multishot_shim<S>(
+        op: &mut IocpKernelOp,
+        result: usize,
+        ext: &Extensions,
+    ) -> IocpResult<usize>
+    where
+        S: IocpMultiShotErasure,
+    {
+        let (header, erased_payload) = op.header_payload_mut();
+        let payload = S::kernel_payload_mut(erased_payload).ok_or_else(|| {
+            IocpError::InvalidState
+                .to_report()
+                .with_ctx("op_type", type_name::<S>())
+                .attach_note("variant mismatch in IOCP multishot on_complete")
+        })?;
+        unsafe { S::on_complete(header, payload, result, ext) }
     }
 
-    fn orphan_cleanup(
-        payload: &mut Self::KernelPayload,
+    pub(super) unsafe fn completion_cleanup_shim<S>(
+        op: &mut IocpKernelOp,
         result: &IocpResult<usize>,
-    ) -> CompletionCleanupGuard {
-        Self::completion_cleanup(payload, result)
+    ) -> CompletionCleanupGuard
+    where
+        S: IocpOpErasure,
+    {
+        let Some(payload) = S::kernel_payload_mut(op.payload_mut()) else {
+            return CompletionCleanupGuard::default();
+        };
+        S::completion_cleanup(payload, result)
     }
 
-    unsafe fn get_fd(_payload: &Self::KernelPayload) -> Option<IoFd> {
-        None
+    pub(super) unsafe fn completion_cleanup_multishot_shim<S>(
+        op: &mut IocpKernelOp,
+        result: &IocpResult<usize>,
+    ) -> CompletionCleanupGuard
+    where
+        S: IocpMultiShotErasure,
+    {
+        let Some(payload) = S::kernel_payload_mut(op.payload_mut()) else {
+            return CompletionCleanupGuard::default();
+        };
+        S::completion_cleanup(payload, result)
     }
 
-    fn map_completion(
-        payload: &Self::RecordPayload,
-        res: IocpResult<usize>,
-    ) -> IocpResult<Self::Completion>;
-}
-
-pub(crate) trait IocpOpErasure: IocpOpSpec {
-    fn erase_kernel_payload(payload: Self::KernelPayload) -> IocpOpPayload;
-    fn kernel_payload_ref(payload: &IocpOpPayload) -> Option<&Self::KernelPayload>;
-    fn kernel_payload_mut(payload: &mut IocpOpPayload) -> Option<&mut Self::KernelPayload>;
-
-    fn erase_user_payload(payload: Self) -> IocpUserPayload;
-    fn try_user_payload(payload: IocpUserPayload) -> IocpResult<Self>;
-    fn user_payload_mut(payload: &mut IocpUserPayload) -> Option<&mut Self>;
-
-    fn vtable() -> &'static OpVTable;
-}
-
-pub(crate) trait IocpMultiShotErasure: IocpMultiShotSpec {
-    fn erase_kernel_payload(payload: Self::KernelPayload) -> IocpOpPayload;
-    fn kernel_payload_ref(payload: &IocpOpPayload) -> Option<&Self::KernelPayload>;
-    fn kernel_payload_mut(payload: &mut IocpOpPayload) -> Option<&mut Self::KernelPayload>;
-
-    fn erase_user_payload(payload: Self) -> IocpUserPayload;
-    fn user_payload_mut(payload: &mut IocpUserPayload) -> Option<&mut Self>;
-
-    fn try_record_payload(payload: IocpUserPayload) -> IocpResult<Self::RecordPayload>;
-
-    fn vtable() -> &'static OpVTable;
-}
-
-pub(crate) fn submit_shim<S>(
-    op: &mut IocpKernelOp,
-    ctx: &mut SubmitContext,
-) -> IocpResult<SubmissionResult>
-where
-    S: IocpOpErasure,
-{
-    let payload = S::kernel_payload_mut(&mut op.payload).ok_or_else(|| {
-        IocpError::InvalidState
-            .to_report()
-            .with_ctx("op_type", type_name::<S>())
-            .attach_note("variant mismatch in IocpKernelOp dispatch")
-    })?;
-    S::submit(&mut op.header, payload, ctx)
-}
-
-pub(crate) fn submit_multishot_shim<S>(
-    op: &mut IocpKernelOp,
-    ctx: &mut SubmitContext,
-) -> IocpResult<SubmissionResult>
-where
-    S: IocpMultiShotErasure,
-{
-    let payload = S::kernel_payload_mut(&mut op.payload).ok_or_else(|| {
-        IocpError::InvalidState
-            .to_report()
-            .with_ctx("op_type", type_name::<S>())
-            .attach_note("variant mismatch in IOCP multishot submit dispatch")
-    })?;
-    S::submit(&mut op.header, payload, ctx)
-}
-
-pub(crate) unsafe fn on_complete_shim<S>(
-    op: &mut IocpKernelOp,
-    result: usize,
-    ext: &Extensions,
-) -> IocpResult<usize>
-where
-    S: IocpOpErasure,
-{
-    let payload = S::kernel_payload_mut(&mut op.payload).ok_or_else(|| {
-        IocpError::InvalidState
-            .to_report()
-            .with_ctx("op_type", type_name::<S>())
-            .attach_note("variant mismatch in IocpKernelOp on_complete")
-    })?;
-    unsafe { S::on_complete(&mut op.header, payload, result, ext) }
-}
-
-pub(crate) unsafe fn on_complete_multishot_shim<S>(
-    op: &mut IocpKernelOp,
-    result: usize,
-    ext: &Extensions,
-) -> IocpResult<usize>
-where
-    S: IocpMultiShotErasure,
-{
-    let payload = S::kernel_payload_mut(&mut op.payload).ok_or_else(|| {
-        IocpError::InvalidState
-            .to_report()
-            .with_ctx("op_type", type_name::<S>())
-            .attach_note("variant mismatch in IOCP multishot on_complete")
-    })?;
-    unsafe { S::on_complete(&mut op.header, payload, result, ext) }
-}
-
-pub(crate) unsafe fn completion_cleanup_shim<S>(
-    op: &mut IocpKernelOp,
-    result: &IocpResult<usize>,
-) -> CompletionCleanupGuard
-where
-    S: IocpOpErasure,
-{
-    let Some(payload) = S::kernel_payload_mut(&mut op.payload) else {
-        return CompletionCleanupGuard::default();
-    };
-    S::completion_cleanup(payload, result)
-}
-
-pub(crate) unsafe fn completion_cleanup_multishot_shim<S>(
-    op: &mut IocpKernelOp,
-    result: &IocpResult<usize>,
-) -> CompletionCleanupGuard
-where
-    S: IocpMultiShotErasure,
-{
-    let Some(payload) = S::kernel_payload_mut(&mut op.payload) else {
-        return CompletionCleanupGuard::default();
-    };
-    S::completion_cleanup(payload, result)
-}
-
-pub(crate) unsafe fn orphan_cleanup_shim<S>(
-    op: &mut IocpKernelOp,
-    result: &IocpResult<usize>,
-) -> CompletionCleanupGuard
-where
-    S: IocpOpErasure,
-{
-    let Some(payload) = S::kernel_payload_mut(&mut op.payload) else {
-        return CompletionCleanupGuard::default();
-    };
-    S::orphan_cleanup(payload, result)
-}
-
-pub(crate) unsafe fn orphan_cleanup_multishot_shim<S>(
-    op: &mut IocpKernelOp,
-    result: &IocpResult<usize>,
-) -> CompletionCleanupGuard
-where
-    S: IocpMultiShotErasure,
-{
-    let Some(payload) = S::kernel_payload_mut(&mut op.payload) else {
-        return CompletionCleanupGuard::default();
-    };
-    S::orphan_cleanup(payload, result)
-}
-
-pub(crate) unsafe fn get_fd_shim<S>(op: &IocpKernelOp) -> Option<IoFd>
-where
-    S: IocpOpErasure,
-{
-    let payload = S::kernel_payload_ref(&op.payload)?;
-    unsafe { S::get_fd(payload) }
-}
-
-pub(crate) unsafe fn get_fd_multishot_shim<S>(op: &IocpKernelOp) -> Option<IoFd>
-where
-    S: IocpMultiShotErasure,
-{
-    let payload = S::kernel_payload_ref(&op.payload)?;
-    unsafe { S::get_fd(payload) }
-}
-
-pub(crate) fn bind_user_payload_shim<S>(
-    op: &mut IocpKernelOp,
-    erased: &mut IocpUserPayload,
-) -> IocpResult<()>
-where
-    S: IocpOpErasure,
-{
-    let payload = S::kernel_payload_mut(&mut op.payload).ok_or_else(|| {
-        IocpError::InvalidState
-            .to_report()
-            .with_ctx("op_type", type_name::<S>())
-            .attach_note("variant mismatch while binding IOCP kernel payload")
-    })?;
-    let user = S::user_payload_mut(erased).ok_or_else(|| {
-        IocpError::InvalidState
-            .to_report()
-            .with_ctx("op_type", type_name::<S>())
-            .attach_note("variant mismatch while binding IOCP user payload")
-    })?;
-    payload.bind(NonNull::from(user));
-    Ok(())
-}
-
-pub(crate) fn bind_multishot_user_payload_shim<S>(
-    op: &mut IocpKernelOp,
-    erased: &mut IocpUserPayload,
-) -> IocpResult<()>
-where
-    S: IocpMultiShotErasure,
-{
-    let payload = S::kernel_payload_mut(&mut op.payload).ok_or_else(|| {
-        IocpError::InvalidState
-            .to_report()
-            .with_ctx("op_type", type_name::<S>())
-            .attach_note("variant mismatch while binding IOCP multishot kernel payload")
-    })?;
-    let user = S::user_payload_mut(erased).ok_or_else(|| {
-        IocpError::InvalidState
-            .to_report()
-            .with_ctx("op_type", type_name::<S>())
-            .attach_note("variant mismatch while binding IOCP multishot user payload")
-    })?;
-    payload.bind(NonNull::from(user));
-    Ok(())
-}
-
-pub(crate) fn unbind_user_payload_shim<S>(op: &mut IocpKernelOp)
-where
-    S: IocpOpErasure,
-{
-    if let Some(payload) = S::kernel_payload_mut(&mut op.payload) {
-        payload.clear();
+    pub(super) unsafe fn orphan_cleanup_shim<S>(
+        op: &mut IocpKernelOp,
+        result: &IocpResult<usize>,
+    ) -> CompletionCleanupGuard
+    where
+        S: IocpOpErasure,
+    {
+        let Some(payload) = S::kernel_payload_mut(op.payload_mut()) else {
+            return CompletionCleanupGuard::default();
+        };
+        S::orphan_cleanup(payload, result)
     }
-}
 
-pub(crate) fn unbind_multishot_user_payload_shim<S>(op: &mut IocpKernelOp)
-where
-    S: IocpMultiShotErasure,
-{
-    if let Some(payload) = S::kernel_payload_mut(&mut op.payload) {
-        payload.clear();
+    pub(super) unsafe fn orphan_cleanup_multishot_shim<S>(
+        op: &mut IocpKernelOp,
+        result: &IocpResult<usize>,
+    ) -> CompletionCleanupGuard
+    where
+        S: IocpMultiShotErasure,
+    {
+        let Some(payload) = S::kernel_payload_mut(op.payload_mut()) else {
+            return CompletionCleanupGuard::default();
+        };
+        S::orphan_cleanup(payload, result)
+    }
+
+    pub(super) unsafe fn get_fd_shim<S>(op: &IocpKernelOp) -> Option<IoFd>
+    where
+        S: IocpOpErasure,
+    {
+        let payload = S::kernel_payload_ref(op.payload())?;
+        unsafe { S::get_fd(payload) }
+    }
+
+    pub(super) unsafe fn get_fd_multishot_shim<S>(op: &IocpKernelOp) -> Option<IoFd>
+    where
+        S: IocpMultiShotErasure,
+    {
+        let payload = S::kernel_payload_ref(op.payload())?;
+        unsafe { S::get_fd(payload) }
+    }
+
+    pub(super) fn bind_user_payload_shim<S>(
+        op: &mut IocpKernelOp,
+        erased: &mut IocpUserPayload,
+    ) -> IocpResult<()>
+    where
+        S: IocpOpErasure,
+    {
+        let payload = S::kernel_payload_mut(op.payload_mut()).ok_or_else(|| {
+            IocpError::InvalidState
+                .to_report()
+                .with_ctx("op_type", type_name::<S>())
+                .attach_note("variant mismatch while binding IOCP kernel payload")
+        })?;
+        let user = S::user_payload_mut(erased).ok_or_else(|| {
+            IocpError::InvalidState
+                .to_report()
+                .with_ctx("op_type", type_name::<S>())
+                .attach_note("variant mismatch while binding IOCP user payload")
+        })?;
+        payload.bind(NonNull::from(user));
+        Ok(())
+    }
+
+    pub(super) fn bind_multishot_user_payload_shim<S>(
+        op: &mut IocpKernelOp,
+        erased: &mut IocpUserPayload,
+    ) -> IocpResult<()>
+    where
+        S: IocpMultiShotErasure,
+    {
+        let payload = S::kernel_payload_mut(op.payload_mut()).ok_or_else(|| {
+            IocpError::InvalidState
+                .to_report()
+                .with_ctx("op_type", type_name::<S>())
+                .attach_note("variant mismatch while binding IOCP multishot kernel payload")
+        })?;
+        let user = S::user_payload_mut(erased).ok_or_else(|| {
+            IocpError::InvalidState
+                .to_report()
+                .with_ctx("op_type", type_name::<S>())
+                .attach_note("variant mismatch while binding IOCP multishot user payload")
+        })?;
+        payload.bind(NonNull::from(user));
+        Ok(())
+    }
+
+    pub(super) fn unbind_user_payload_shim<S>(op: &mut IocpKernelOp)
+    where
+        S: IocpOpErasure,
+    {
+        if let Some(payload) = S::kernel_payload_mut(op.payload_mut()) {
+            payload.clear();
+        }
+    }
+
+    pub(super) fn unbind_multishot_user_payload_shim<S>(op: &mut IocpKernelOp)
+    where
+        S: IocpMultiShotErasure,
+    {
+        if let Some(payload) = S::kernel_payload_mut(op.payload_mut()) {
+            payload.clear();
+        }
     }
 }

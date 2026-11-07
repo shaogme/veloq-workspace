@@ -7,7 +7,7 @@ use crate::{
     driver::IocpDriver,
     ext::Extensions,
     op::{Close, Fsync, IocpSlotSpec, RecvMulti},
-    tests::{submit_test_op, wait_completion},
+    tests::TestSupport,
 };
 use veloq_driver_core::{Driver, DriverSubmitResult, IntoPlatformOp, RegisterFd, SubmitStatus};
 use veloq_std::{fs::File, mem, time::Duration, vec};
@@ -175,8 +175,8 @@ fn test_close_owned_registered_file_unregisters_and_rejects_stale_fd() {
         .unwrap();
     let idx = fd.fixed_index().expect("registered descriptor") as usize;
 
-    let token = submit_test_op(&mut driver, Close { fd });
-    let closed = wait_completion(&mut driver, token, Duration::from_secs(5))
+    let token = TestSupport::submit_test_op(&mut driver, Close { fd });
+    let closed = TestSupport::wait_completion(&mut driver, token, Duration::from_secs(5))
         .expect("close completion failed");
     assert_eq!(closed, 0);
     assert!(

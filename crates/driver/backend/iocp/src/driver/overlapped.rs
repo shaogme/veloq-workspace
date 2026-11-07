@@ -36,7 +36,7 @@ impl OverlappedRegistry {
             };
             let address = bundle
                 .storage
-                .with_mut(|_, _, sidecar| &sidecar.inner as *const Overlapped as usize);
+                .with_mut(|_, _, sidecar| sidecar.inner() as *const Overlapped as usize);
             roots.insert(address, index);
         }
         Ok(Self {

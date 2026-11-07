@@ -16,6 +16,7 @@ use crate::{
     },
 };
 use diagweave::prelude::*;
+use tracing::error;
 use veloq_std::string::ToString;
 
 pub(crate) struct RioSubmitTxn<'a> {
@@ -450,7 +451,7 @@ impl<'a> RioSubmitTxn<'a> {
             .registry_mut()
             .free_addr_reservation(self.addr.take())
         {
-            tracing::error!(report = ?error, "failed to roll back RIO address lease");
+            error!(report = ?error, "failed to roll back RIO address lease");
         }
     }
 
@@ -548,7 +549,7 @@ impl Drop for RioSubmitTxn<'_> {
             return;
         }
         if let Err(error) = self.rollback_buffer_ref() {
-            tracing::error!(
+            error!(
                 report = ?error,
                 rio_op_kind = self.plan.op_kind.as_str(),
                 rio_request_id = self
@@ -559,7 +560,7 @@ impl Drop for RioSubmitTxn<'_> {
             );
         }
         if let Err(error) = self.rollback_context() {
-            tracing::error!(
+            error!(
                 report = ?error,
                 rio_op_kind = self.plan.op_kind.as_str(),
                 rio_request_id = self
@@ -571,7 +572,7 @@ impl Drop for RioSubmitTxn<'_> {
         }
         self.rollback_address();
         if let Err(error) = self.rollback_socket() {
-            tracing::error!(
+            error!(
                 report = ?error,
                 rio_op_kind = self.plan.op_kind.as_str(),
                 rio_request_id = self
@@ -586,11 +587,13 @@ impl Drop for RioSubmitTxn<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{
-        RioCore, RioKernel, RioRegistry, RioSubmitTxn, registry::RioRegistryTestSupport,
-        submit_ops::RioSubmissionKind,
+    use super::{
+        super::{
+            RioCore, RioKernel, RioRegistry, RioSubmitTxn, registry::RioRegistryTestSupport,
+            submit_ops::RioSubmissionKind,
+        },
+        RioAddressPolicy, RioError, RioOpRequestInit, RioSubmitPlan,
     };
-    use super::{RioAddressPolicy, RioError, RioOpRequestInit, RioSubmitPlan};
     use crate::{
         config::{BorrowedRawHandle, IoFd, IocpHandle, RawHandle},
         rio::{

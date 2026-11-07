@@ -1,11 +1,11 @@
 //! Core context encoding, registry ownership, and kernel dispatch wrappers. / 核心上下文编码、注册表所有权和内核分发表封装。
 
-use diagweave::prelude::*;
-
 mod registry;
 mod request;
 mod submit_ops;
 mod submit_txn;
+
+use diagweave::prelude::*;
 
 pub(crate) use registry::{RioAddrReservation, RioBufferLeaseToken, RioRegistry};
 pub(crate) use request::{
@@ -14,14 +14,14 @@ pub(crate) use request::{
     RioSubmitPlan,
 };
 
-#[cfg(test)]
-pub(crate) use request::RioRequestDiagnostics;
-
 pub(crate) use submit_ops::{
     RioBufferId, RioCq, RioDispatch, RioKernel, RioProvider, RioReceiveReplacementArgs, RioRq,
     RioSendToArgs, RioSubmitOperations, RioTarget,
 };
 pub(crate) use submit_txn::{RioSubmitTxn, RioSubmittedRequest};
+
+#[cfg(test)]
+pub(crate) use request::RioRequestDiagnostics;
 
 #[derive(Clone, Copy)]
 pub(crate) struct RioEnv<'a> {

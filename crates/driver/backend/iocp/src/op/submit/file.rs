@@ -1,9 +1,6 @@
 mod blocking;
 
-pub(crate) use blocking::{
-    completion_cleanup_close_file, submit_close, submit_fallocate, submit_fallocate_raw,
-    submit_fsync, submit_fsync_raw, submit_open, submit_sync_range, submit_sync_range_raw,
-};
+pub(crate) use blocking::BlockingSubmissionOps;
 
 use veloq_buf::{BufIoRangeError, FixedBuf};
 
@@ -15,11 +12,7 @@ use crate::{
     error::{IocpError, IocpResult},
     op::{
         KernelRef, OverlappedEntry, ReadFixed, ReadRaw, SubmitContext, WriteFixed, WriteRaw,
-        submit::{
-            SubmissionResult, ensure_iocp_association, iocp_submit_read, iocp_submit_write,
-            mark_header_in_flight, resolve_fd_handle, resolve_registered_raw_file,
-            unpack_kernel_ref,
-        },
+        submit::{SubmissionOps, SubmissionResult},
     },
 };
 
@@ -65,38 +58,45 @@ macro_rules! submit_io_op {
             ctx: &mut SubmitContext,
         ) -> IocpResult<SubmissionResult> {
             // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
-            let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) }?;
+            let (val, overlapped) =
+                unsafe { SubmissionOps::unpack_kernel_ref(payload, ctx.overlapped) }?;
 
             overlapped.set_offset(val.offset);
 
-            let raw = resolve_fd_handle(&val.fd, &*ctx.registered_slots)?;
-            header.resolved_handle = Some(raw);
-            ensure_iocp_association(&val.fd, raw, ctx.port.as_ref(), &mut *ctx.registered_slots)
-                .push_ctx("scope", stringify!($fn_name))
-                .with_ctx("fd", val.fd.to_string())
-                .with_ctx("handle_raw", raw.raw().as_handle() as usize)
-                .with_ctx("user_data", header.token.index())
-                .with_ctx("generation", header.token.generation())
-                .with_ctx("offset", val.offset)
-                .with_ctx("buffer_length", val.buf.len())
-                .with_ctx("buffer_capacity", val.buf.capacity())?;
+            let raw = SubmissionOps::resolve_fd_handle(&val.fd, &*ctx.registered_slots)?;
+            *header.resolved_handle_mut() = Some(raw);
+            SubmissionOps::ensure_iocp_association(
+                &val.fd,
+                raw,
+                ctx.port.as_ref(),
+                &mut *ctx.registered_slots,
+            )
+            .push_ctx("scope", stringify!($fn_name))
+            .with_ctx("fd", val.fd.to_string())
+            .with_ctx("handle_raw", raw.raw().as_handle() as usize)
+            .with_ctx("user_data", header.token().index())
+            .with_ctx("generation", header.token().generation())
+            .with_ctx("offset", val.offset)
+            .with_ctx("buffer_length", val.buf.len())
+            .with_ctx("buffer_capacity", val.buf.capacity())?;
 
             // Depending on ReadFile/WriteFile sig: (handle, buf, len, bytes, overlapped)
             let (ptr, len) = $range_fn(&mut val.buf, val.buf_offset, stringify!($fn_name))?;
             let handle = raw.borrow();
             // SAFETY: Calling Win32 ReadFile/WriteFile via wrapper with valid parameters.
-            let submit_res = unsafe { $wrapper_fn(handle, ptr as _, len, ctx.overlapped) }
-                .push_ctx("scope", stringify!($fn_name))
-                .with_ctx("fd", val.fd.to_string())
-                .with_ctx("handle_raw", raw.raw().as_handle() as usize)
-                .with_ctx("user_data", header.token.index())
-                .with_ctx("generation", header.token.generation())
-                .with_ctx("offset", val.offset)
-                .with_ctx("buffer_offset", val.buf_offset)
-                .with_ctx("buffer_length", len)
-                .with_ctx("buffer_capacity", val.buf.capacity())
-                .attach_note("file syscall submit failed");
-            mark_header_in_flight(header, submit_res)
+            let submit_res =
+                unsafe { SubmissionOps::$wrapper_fn(handle, ptr as _, len, ctx.overlapped) }
+                    .push_ctx("scope", stringify!($fn_name))
+                    .with_ctx("fd", val.fd.to_string())
+                    .with_ctx("handle_raw", raw.raw().as_handle() as usize)
+                    .with_ctx("user_data", header.token().index())
+                    .with_ctx("generation", header.token().generation())
+                    .with_ctx("offset", val.offset)
+                    .with_ctx("buffer_offset", val.buf_offset)
+                    .with_ctx("buffer_length", len)
+                    .with_ctx("buffer_capacity", val.buf.capacity())
+                    .attach_note("file syscall submit failed");
+            SubmissionOps::mark_header_in_flight(header, submit_res)
         }
     };
 }
@@ -109,35 +109,43 @@ macro_rules! submit_raw_io_op {
             ctx: &mut SubmitContext,
         ) -> IocpResult<SubmissionResult> {
             // SAFETY: vtable submit shim guarantees payload/overlapped pointer validity.
-            let (val, overlapped) = unsafe { unpack_kernel_ref(payload, ctx.overlapped) }?;
+            let (val, overlapped) =
+                unsafe { SubmissionOps::unpack_kernel_ref(payload, ctx.overlapped) }?;
 
             overlapped.set_offset(val.offset);
 
-            let (fd, raw) = resolve_registered_raw_file(val.fd, &*ctx.registered_slots)?;
-            header.resolved_handle = Some(raw);
-            ensure_iocp_association(&fd, raw, ctx.port.as_ref(), &mut *ctx.registered_slots)
-                .push_ctx("scope", stringify!($fn_name))
-                .with_ctx("fd", fd.to_string())
-                .with_ctx("handle_raw", raw.raw().as_handle() as usize)
-                .with_ctx("user_data", header.token.index())
-                .with_ctx("generation", header.token.generation())
-                .with_ctx("offset", val.offset)
-                .with_ctx("buffer_length", val.buf.len())
-                .with_ctx("buffer_capacity", val.buf.capacity())?;
+            let (fd, raw) =
+                SubmissionOps::resolve_registered_raw_file(val.fd, &*ctx.registered_slots)?;
+            *header.resolved_handle_mut() = Some(raw);
+            SubmissionOps::ensure_iocp_association(
+                &fd,
+                raw,
+                ctx.port.as_ref(),
+                &mut *ctx.registered_slots,
+            )
+            .push_ctx("scope", stringify!($fn_name))
+            .with_ctx("fd", fd.to_string())
+            .with_ctx("handle_raw", raw.raw().as_handle() as usize)
+            .with_ctx("user_data", header.token().index())
+            .with_ctx("generation", header.token().generation())
+            .with_ctx("offset", val.offset)
+            .with_ctx("buffer_length", val.buf.len())
+            .with_ctx("buffer_capacity", val.buf.capacity())?;
 
             let (ptr, len) = $range_fn(&mut val.buf, val.buf_offset, stringify!($fn_name))?;
             let handle = raw.borrow();
-            let submit_res = unsafe { $wrapper_fn(handle, ptr as _, len, ctx.overlapped) }
-                .push_ctx("scope", stringify!($fn_name))
-                .with_ctx("handle_raw", raw.raw().as_handle() as usize)
-                .with_ctx("user_data", header.token.index())
-                .with_ctx("generation", header.token.generation())
-                .with_ctx("offset", val.offset)
-                .with_ctx("buffer_offset", val.buf_offset)
-                .with_ctx("buffer_length", len)
-                .with_ctx("buffer_capacity", val.buf.capacity())
-                .attach_note("file syscall submit failed");
-            mark_header_in_flight(header, submit_res)
+            let submit_res =
+                unsafe { SubmissionOps::$wrapper_fn(handle, ptr as _, len, ctx.overlapped) }
+                    .push_ctx("scope", stringify!($fn_name))
+                    .with_ctx("handle_raw", raw.raw().as_handle() as usize)
+                    .with_ctx("user_data", header.token().index())
+                    .with_ctx("generation", header.token().generation())
+                    .with_ctx("offset", val.offset)
+                    .with_ctx("buffer_offset", val.buf_offset)
+                    .with_ctx("buffer_length", len)
+                    .with_ctx("buffer_capacity", val.buf.capacity())
+                    .attach_note("file syscall submit failed");
+            SubmissionOps::mark_header_in_flight(header, submit_res)
         }
     };
 }
@@ -146,32 +154,36 @@ macro_rules! submit_raw_io_op {
 // Read/Write Implementation
 // ============================================================================
 
-submit_io_op!(
-    submit_read_fixed,
-    ReadFixed,
-    iocp_submit_read,
-    offset,
-    checked_file_read_range
-);
-submit_raw_io_op!(
-    submit_read_raw,
-    ReadRaw,
-    iocp_submit_read,
-    offset,
-    checked_file_read_range
-);
+pub(crate) struct FileSubmissionOps;
 
-submit_io_op!(
-    submit_write_fixed,
-    WriteFixed,
-    iocp_submit_write,
-    offset,
-    checked_file_write_range
-);
-submit_raw_io_op!(
-    submit_write_raw,
-    WriteRaw,
-    iocp_submit_write,
-    offset,
-    checked_file_write_range
-);
+impl FileSubmissionOps {
+    submit_io_op!(
+        submit_read_fixed,
+        ReadFixed,
+        iocp_submit_read,
+        offset,
+        checked_file_read_range
+    );
+    submit_raw_io_op!(
+        submit_read_raw,
+        ReadRaw,
+        iocp_submit_read,
+        offset,
+        checked_file_read_range
+    );
+
+    submit_io_op!(
+        submit_write_fixed,
+        WriteFixed,
+        iocp_submit_write,
+        offset,
+        checked_file_write_range
+    );
+    submit_raw_io_op!(
+        submit_write_raw,
+        WriteRaw,
+        iocp_submit_write,
+        offset,
+        checked_file_write_range
+    );
+}

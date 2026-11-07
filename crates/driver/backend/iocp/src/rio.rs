@@ -7,10 +7,6 @@ mod core;
 mod lifecycle;
 mod runtime;
 
-mod error {
-    pub(crate) use super::core::{RioError, RioResult};
-}
-
 use crate::{
     IocpResult,
     config::{BorrowedRawHandle, SocketKey},
@@ -19,12 +15,15 @@ use crate::{
     op::{IocpKernelOp, IocpUserPayload, SubmissionResult},
 };
 use diagweave::prelude::*;
+use tracing::error;
 use veloq_buf::{BufferRegistrationRequest, FixedBuf, LockedMemoryBudget, LockedMemoryPermit};
 use veloq_driver_core::{BufferRegistrationStatus, ReceivePumpState};
 use veloq_std::{time::Duration, vec::Vec};
 
-use self::core::{RioKernel, RioRegistry, RioSubmitOperations};
-use self::lifecycle::{DeferredRioCleanup, RioLifecycle, RioLifecycleResources};
+use self::{
+    core::{RioKernel, RioRegistry, RioSubmitOperations},
+    lifecycle::{DeferredRioCleanup, RioLifecycle, RioLifecycleResources},
+};
 
 pub(crate) use self::{
     core::{RioCore, RioEnv, RioError, RioOpKind, RioResult, RioSendToArgs, RioTarget},
@@ -34,11 +33,24 @@ pub(crate) use self::{
     },
 };
 
+mod error {
+    pub(crate) use super::core::{RioError, RioResult};
+}
+
 pub(crate) struct RioState {
     core: RioCore,
     runtime: RioRuntime,
     lifecycle: RioLifecycleResources,
     diagnostics: IocpDriverCompletionDiagnostics,
+}
+
+pub(crate) struct RioStateArgs<'a> {
+    pub(crate) port: BorrowedRawHandle<'a>,
+    pub(crate) entries: u32,
+    pub(crate) ext: &'a Extensions,
+    pub(crate) diagnostics: IocpDriverCompletionDiagnostics,
+    pub(crate) budget: LockedMemoryBudget,
+    pub(crate) address_permit: Option<LockedMemoryPermit>,
 }
 
 impl RioState {
@@ -62,14 +74,15 @@ impl RioState {
         RioCompletionService::process_completions(&mut self.core, &mut self.runtime, args)
     }
 
-    pub(crate) fn new(
-        port: BorrowedRawHandle<'_>,
-        entries: u32,
-        ext: &Extensions,
-        diagnostics: IocpDriverCompletionDiagnostics,
-        budget: LockedMemoryBudget,
-        address_permit: Option<LockedMemoryPermit>,
-    ) -> RioResult<Self> {
+    pub(crate) fn new(args: RioStateArgs<'_>) -> RioResult<Self> {
+        let RioStateArgs {
+            port,
+            entries,
+            ext,
+            diagnostics,
+            budget,
+            address_permit,
+        } = args;
         let kernel = RioKernel::from_extensions(port, entries, ext)?;
         let rq_depth = entries.clamp(32, 64);
 
@@ -236,7 +249,7 @@ impl Drop for RioState {
         self.stop_accepting_new_submissions();
         if self.runtime_ready_for_forget() {
             if let Err(error) = self.finalize_cleanup() {
-                tracing::error!(report = ?error, "failed to finalize drained RIO state");
+                error!(report = ?error, "failed to finalize drained RIO state");
             }
             return;
         }
@@ -247,7 +260,7 @@ impl Drop for RioState {
         }
 
         if let Err(error) = self.finalize_cleanup() {
-            tracing::error!(report = ?error, "failed to finalize RIO state during drop");
+            error!(report = ?error, "failed to finalize RIO state during drop");
         }
     }
 }

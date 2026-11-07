@@ -4,7 +4,7 @@ use super::{
 };
 use crate::{
     config::{BorrowedRawHandle, IoFd, SocketKey},
-    net::addr::SockAddrStorage,
+    net::SockAddrStorage,
     rio::{SocketInflightToken, error::RioError},
 };
 use core::ffi::c_void;
@@ -140,6 +140,15 @@ pub(crate) struct RioOpRequestInit {
     pub(crate) diagnostics: RioRequestDiagnostics,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RioCompletedRequestContext;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RioRequestContextId {
+    index: usize,
+    generation: Generation,
+}
+
 pub(crate) enum RioCompletionKind {
     Op {
         init: RioOpRequestInit,
@@ -165,12 +174,6 @@ const RIO_REQUEST_CONTEXT_MAGIC: u64 = 0xA7;
 const RIO_REQUEST_CONTEXT_MAGIC_SHIFT: u32 = 56;
 const RIO_REQUEST_CONTEXT_INDEX_SHIFT: u32 = 32;
 const RIO_REQUEST_CONTEXT_INDEX_MASK: u64 = 0x00ff_ffff;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct RioRequestContextId {
-    index: usize,
-    generation: Generation,
-}
 
 impl RioRequestContextId {
     #[inline]
@@ -221,9 +224,6 @@ pub(crate) struct RioPreparedRequestContext {
 pub(crate) struct RioSubmittedRequestContext {
     id: RioRequestContextId,
 }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct RioCompletedRequestContext;
 
 impl RioPreparedRequestContext {
     #[inline]
@@ -432,8 +432,10 @@ impl RioPreparedRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::super::registry::RioRegistry;
-    use super::{RioCompletionKind, RioOpKind, RioOpRequestInit, RioRequestDiagnostics};
+    use super::{
+        super::registry::RioRegistry, RioCompletionKind, RioOpKind, RioOpRequestInit,
+        RioRequestDiagnostics,
+    };
     use crate::{config::IocpHandle, rio::SocketInflightToken};
     use veloq_driver_core::{Generation, OpToken};
     use veloq_std::ptr;

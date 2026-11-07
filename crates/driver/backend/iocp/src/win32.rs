@@ -5,8 +5,8 @@ use veloq_driver_core::CompletionToken;
 use veloq_pod::{Pod, Zeroable, zeroed};
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS, RtlNtStatusToDosError,
-        WAIT_TIMEOUT,
+        CloseHandle, ERROR_NOT_FOUND, GetLastError, HANDLE, INVALID_HANDLE_VALUE, NTSTATUS,
+        RtlNtStatusToDosError, WAIT_TIMEOUT,
     },
     Networking::WinSock::{
         INVALID_SOCKET, SOCKADDR, SOCKET, bind, closesocket, connect, getpeername, getsockname,
@@ -29,14 +29,14 @@ fn from_raw_os_error(err: i32) -> IoError {
 // ============================================================================
 // Overlapped
 // ============================================================================
-
 /// A safe wrapper for the Windows OVERLAPPED structure.
 #[repr(transparent)]
 #[derive(Clone, Copy)]
-pub struct Overlapped(pub OVERLAPPED);
+pub struct Overlapped(OVERLAPPED);
 
 // SAFETY: OVERLAPPED is a Win32 POD struct and can be safely zero-initialized.
 unsafe impl Zeroable for Overlapped {}
+
 // SAFETY: Overlapped is repr(transparent) and OVERLAPPED is a POD struct.
 unsafe impl Pod for Overlapped {}
 
@@ -82,7 +82,7 @@ impl Default for Overlapped {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::win32::Overlapped;
     use veloq_std::mem::{offset_of, size_of};
     use windows_sys::Win32::System::IO::{OVERLAPPED, OVERLAPPED_0_0};
 
@@ -98,17 +98,22 @@ mod tests {
         let mut overlapped = Overlapped::zeroed();
         let internal = usize::MAX;
         let internal_high = usize::MAX - 1;
-        overlapped.0.Internal = internal;
-        overlapped.0.InternalHigh = internal_high;
+        unsafe {
+            (*overlapped.as_mut_ptr()).Internal = internal;
+            (*overlapped.as_mut_ptr()).InternalHigh = internal_high;
+        }
 
         overlapped.set_offset(0x99aa_bbcc_ddee_ff00);
 
-        assert_eq!(overlapped.0.Internal, internal);
-        assert_eq!(overlapped.0.InternalHigh, internal_high);
+        assert_eq!(unsafe { (*overlapped.as_ptr()).Internal }, internal);
+        assert_eq!(
+            unsafe { (*overlapped.as_ptr()).InternalHigh },
+            internal_high
+        );
         assert_eq!(overlapped.offset(), 0x99aa_bbcc_ddee_ff00);
 
         // SAFETY: The test verifies the same documented file-offset union view used by set_offset.
-        let parts = unsafe { overlapped.0.Anonymous.Anonymous };
+        let parts = unsafe { (*overlapped.as_ptr()).Anonymous.Anonymous };
         assert_eq!(parts.Offset, 0xddee_ff00);
         assert_eq!(parts.OffsetHigh, 0x99aa_bbcc);
     }
@@ -120,9 +125,13 @@ mod tests {
 
 /// A safe wrapper around a Win32 HANDLE that ensures it is closed when dropped.
 #[derive(Debug)]
-pub struct OwnedHandle(pub HANDLE);
+pub struct OwnedHandle(HANDLE);
 
 impl OwnedHandle {
+    pub(crate) const fn new(handle: HANDLE) -> Self {
+        Self(handle)
+    }
+
     /// Returns the raw HANDLE.
     pub fn as_raw(&self) -> HANDLE {
         self.0
@@ -147,18 +156,22 @@ impl Drop for OwnedHandle {
 
 // SAFETY: Windows HANDLEs are pointers but can be safely transferred between threads.
 unsafe impl Send for OwnedHandle {}
+
 // SAFETY: Windows HANDLEs are pointers but can be safely shared between threads.
 unsafe impl Sync for OwnedHandle {}
 
 // ============================================================================
 // SafeSocket
 // ============================================================================
-
 /// A safe wrapper around a Win32 SOCKET that ensures it is closed when dropped.
 #[derive(Debug)]
-pub struct SafeSocket(pub SOCKET);
+pub struct SafeSocket(SOCKET);
 
 impl SafeSocket {
+    pub(crate) const fn new(socket: SOCKET) -> Self {
+        Self(socket)
+    }
+
     /// Returns the raw SOCKET.
     pub fn as_raw(&self) -> SOCKET {
         self.0
@@ -279,12 +292,28 @@ impl Drop for SafeSocket {
 
 // SAFETY: Windows SOCKETs are handles that can be safely transferred between threads.
 unsafe impl Send for SafeSocket {}
+
 // SAFETY: Windows SOCKETs can be safely shared between threads.
 unsafe impl Sync for SafeSocket {}
 
 // ============================================================================
 // IoCompletionPort
 // ============================================================================
+/// Reusable buffer of `OVERLAPPED_ENTRY` slots backing [`IoCompletionPort::get_status_batch`].
+pub struct CompletionBatch {
+    entries: Box<[OVERLAPPED_ENTRY]>,
+    len: usize,
+}
+
+/// Represents the status of a completed I/O operation.
+#[derive(Clone, Copy)]
+pub struct CompletionStatus {
+    bytes: u32,
+    key: usize,
+    overlapped: *mut Overlapped,
+    success: bool,
+    error_code: Option<u32>,
+}
 
 /// A safe wrapper for an I/O Completion Port.
 pub struct IoCompletionPort(OwnedHandle);
@@ -376,7 +405,7 @@ impl IoCompletionPort {
         if res == 0 {
             // SAFETY: GetLastError is safe to call after a failed Win32 API call.
             let err = unsafe { GetLastError() };
-            if err == windows_sys::Win32::Foundation::ERROR_NOT_FOUND {
+            if err == ERROR_NOT_FOUND {
                 return Ok(CancelRequestResult::NotFound);
             }
             return Err(IocpError::Win32.io_report("CancelIoEx", from_raw_os_error(err as i32)));
@@ -430,12 +459,6 @@ impl IoCompletionPort {
     }
 }
 
-/// Reusable buffer of `OVERLAPPED_ENTRY` slots backing [`IoCompletionPort::get_status_batch`].
-pub struct CompletionBatch {
-    entries: Box<[OVERLAPPED_ENTRY]>,
-    len: usize,
-}
-
 impl CompletionBatch {
     /// Creates a batch buffer able to hold `capacity` (at least one) completion entries.
     pub fn with_capacity(capacity: usize) -> Self {
@@ -456,17 +479,27 @@ impl CompletionBatch {
     }
 }
 
-/// Represents the status of a completed I/O operation.
-#[derive(Clone, Copy)]
-pub struct CompletionStatus {
-    pub bytes: u32,
-    pub key: usize,
-    pub overlapped: *mut Overlapped,
-    pub success: bool,
-    pub error_code: Option<u32>,
-}
-
 impl CompletionStatus {
+    pub fn bytes(&self) -> u32 {
+        self.bytes
+    }
+
+    pub fn key(&self) -> usize {
+        self.key
+    }
+
+    pub fn overlapped(&self) -> *mut Overlapped {
+        self.overlapped
+    }
+
+    pub fn success(&self) -> bool {
+        self.success
+    }
+
+    pub fn error_code(&self) -> Option<u32> {
+        self.error_code
+    }
+
     /// Rebuilds the `GetQueuedCompletionStatus` view of a batched `OVERLAPPED_ENTRY`.
     ///
     /// `GetQueuedCompletionStatusEx` reports no per-entry error: the operation's `NTSTATUS`
@@ -474,7 +507,7 @@ impl CompletionStatus {
     /// through `RtlNtStatusToDosError` is exactly what `GetQueuedCompletionStatus` does before
     /// returning `FALSE`. Entries posted by `PostQueuedCompletionStatus` carry no OVERLAPPED
     /// and therefore no status, matching the `TRUE` those posts get from the non-Ex call.
-    fn from_entry(entry: &OVERLAPPED_ENTRY) -> Self {
+    pub(super) fn from_entry(entry: &OVERLAPPED_ENTRY) -> Self {
         let overlapped = entry.lpOverlapped.cast::<Overlapped>();
         let status = if overlapped.is_null() {
             0
@@ -502,9 +535,11 @@ impl CompletionStatus {
 
 #[cfg(test)]
 mod completion_status_tests {
-    use super::*;
-    use windows_sys::Win32::Foundation::{
-        ERROR_OPERATION_ABORTED, STATUS_CANCELLED, STATUS_PENDING,
+    use crate::win32::{CompletionBatch, CompletionStatus, Overlapped};
+    use veloq_std::ptr;
+    use windows_sys::Win32::{
+        Foundation::{ERROR_OPERATION_ABORTED, STATUS_CANCELLED, STATUS_PENDING},
+        System::IO::{OVERLAPPED, OVERLAPPED_ENTRY},
     };
 
     fn entry_with(overlapped: *mut OVERLAPPED, bytes: u32, key: usize) -> OVERLAPPED_ENTRY {
@@ -520,20 +555,22 @@ mod completion_status_tests {
     fn posted_entry_without_overlapped_is_a_success() {
         let status = CompletionStatus::from_entry(&entry_with(ptr::null_mut(), 0, 42));
 
-        assert!(status.success);
-        assert_eq!(status.error_code, None);
-        assert_eq!(status.key, 42);
+        assert!(status.success());
+        assert_eq!(status.error_code(), None);
+        assert_eq!(status.key(), 42);
     }
 
     #[test]
     fn successful_overlapped_entry_reports_transferred_bytes() {
         let mut overlapped = Overlapped::zeroed();
-        overlapped.0.Internal = STATUS_PENDING as u32 as usize;
+        unsafe {
+            (*overlapped.as_mut_ptr()).Internal = STATUS_PENDING as u32 as usize;
+        }
         let status = CompletionStatus::from_entry(&entry_with(overlapped.as_mut_ptr(), 1024, 7));
 
-        assert!(status.success, "a non-negative NTSTATUS is NT_SUCCESS");
-        assert_eq!(status.error_code, None);
-        assert_eq!(status.bytes, 1024);
+        assert!(status.success(), "a non-negative NTSTATUS is NT_SUCCESS");
+        assert_eq!(status.error_code(), None);
+        assert_eq!(status.bytes(), 1024);
     }
 
     #[test]
@@ -541,11 +578,13 @@ mod completion_status_tests {
         let mut overlapped = Overlapped::zeroed();
         // The kernel stores the operation's NTSTATUS in `OVERLAPPED::Internal`; this is the
         // same source `GetQueuedCompletionStatus` converts into its `GetLastError` value.
-        overlapped.0.Internal = STATUS_CANCELLED as u32 as usize;
+        unsafe {
+            (*overlapped.as_mut_ptr()).Internal = STATUS_CANCELLED as u32 as usize;
+        }
         let status = CompletionStatus::from_entry(&entry_with(overlapped.as_mut_ptr(), 0, 7));
 
-        assert!(!status.success);
-        assert_eq!(status.error_code, Some(ERROR_OPERATION_ABORTED));
+        assert!(!status.success());
+        assert_eq!(status.error_code(), Some(ERROR_OPERATION_ABORTED));
     }
 
     #[test]

@@ -13,10 +13,10 @@ use windows_sys::Win32::Networking::WinSock::{
 use crate::{
     config::{IoFd, RawHandle},
     error::{IocpError, IocpResult},
-    net::addr::SockAddrStorage,
+    net::SockAddrStorage,
     op::{
         OverlappedEntry, SubmitContext,
-        submit::{SubmissionResult, ensure_iocp_association, mark_header_in_flight},
+        submit::{SubmissionOps, SubmissionResult},
     },
     rio::{RioError, SocketInflightGuard},
     win32::{Overlapped, SafeSocket},
@@ -24,21 +24,28 @@ use crate::{
 
 pub(super) struct SocketSubmission;
 
-pub(super) fn invalid_buffer_range(
-    operation: &'static str,
-    error: BufIoRangeError,
-) -> Report<IocpError> {
-    IocpError::InvalidInput
-        .report(operation, error.note())
-        .with_ctx("buffer_offset", error.buffer_offset())
-        .with_ctx("buffer_length", error.buffer_length())
-        .with_ctx("buffer_capacity", error.buffer_capacity())
-        .with_ctx("buffer_bound", error.buffer_bound())
-        .with_ctx("buffer_bound_kind", error.buffer_bound_kind().name())
-        .with_ctx("submission_length", error.submission_length())
+pub(super) struct RawSocketRequest<'request, 'ctx> {
+    header: &'request mut OverlappedEntry,
+    fd: IoFd,
+    raw: RawHandle,
+    ctx: &'request mut SubmitContext<'ctx>,
 }
 
 impl SocketSubmission {
+    pub(super) fn invalid_buffer_range(
+        operation: &'static str,
+        error: BufIoRangeError,
+    ) -> Report<IocpError> {
+        IocpError::InvalidInput
+            .report(operation, error.note())
+            .with_ctx("buffer_offset", error.buffer_offset())
+            .with_ctx("buffer_length", error.buffer_length())
+            .with_ctx("buffer_capacity", error.buffer_capacity())
+            .with_ctx("buffer_bound", error.buffer_bound())
+            .with_ctx("buffer_bound_kind", error.buffer_bound_kind().name())
+            .with_ctx("submission_length", error.submission_length())
+    }
+
     pub(super) fn uses_rio(raw: RawHandle, buffer: &FixedBuf) -> bool {
         raw.raw().uses_rio()
             && matches!(
@@ -51,7 +58,7 @@ impl SocketSubmission {
         raw: SOCKET,
         f: impl FnOnce(&SafeSocket) -> IocpResult<T>,
     ) -> IocpResult<T> {
-        let socket = ManuallyDrop::new(SafeSocket(raw));
+        let socket = ManuallyDrop::new(SafeSocket::new(raw));
         f(&socket)
     }
 
@@ -60,13 +67,13 @@ impl SocketSubmission {
         inflight: SocketInflightGuard<'_>,
         res: IocpResult<SubmissionResult>,
     ) -> IocpResult<SubmissionResult> {
-        let res = mark_header_in_flight(header, res);
+        let res = SubmissionOps::mark_header_in_flight(header, res);
         if matches!(res, Ok(SubmissionResult::Pending)) {
             debug_assert!(
-                header.socket_inflight.is_none(),
+                header.socket_inflight().is_none(),
                 "socket inflight token already attached to op header"
             );
-            header.socket_inflight = Some(inflight.commit());
+            *header.socket_inflight_mut() = Some(inflight.commit());
         }
         res
     }
@@ -94,7 +101,7 @@ impl SocketSubmission {
     ) -> IocpResult<SubmissionResult> {
         let (ptr, len) = buffer
             .checked_read_range(offset)
-            .map_err(|error| invalid_buffer_range(operation, error))?;
+            .map_err(|error| Self::invalid_buffer_range(operation, error))?;
         let wsabuf = WSABUF { len, buf: ptr };
         request.submit(|socket, overlapped| {
             let mut bytes_received = 0;
@@ -122,7 +129,7 @@ impl SocketSubmission {
     ) -> IocpResult<SubmissionResult> {
         let (ptr, len) = buffer
             .checked_write_range(offset)
-            .map_err(|error| invalid_buffer_range(operation, error))?;
+            .map_err(|error| Self::invalid_buffer_range(operation, error))?;
         let wsabuf = WSABUF {
             len,
             buf: ptr.cast_mut(),
@@ -152,7 +159,7 @@ impl SocketSubmission {
     ) -> IocpResult<SubmissionResult> {
         let (ptr, len) = buffer
             .checked_read_range(0)
-            .map_err(|error| invalid_buffer_range("udp_recv_multi", error))?;
+            .map_err(|error| Self::invalid_buffer_range("udp_recv_multi", error))?;
         let wsabuf = WSABUF { len, buf: ptr };
         *address = SockAddrStorage::default();
         *address_len = size_of::<SOCKADDR_STORAGE>() as i32;
@@ -165,7 +172,7 @@ impl SocketSubmission {
                     1,
                     ptr::null_mut(),
                     &mut flags,
-                    &mut address.0 as *mut SOCKADDR_STORAGE as *mut SOCKADDR,
+                    address.as_raw_mut() as *mut SOCKADDR_STORAGE as *mut SOCKADDR,
                     address_len,
                     overlapped.cast(),
                     None,
@@ -174,13 +181,6 @@ impl SocketSubmission {
             Self::wsa_submit_result(result, "udp_recv_multi")
         })
     }
-}
-
-pub(super) struct RawSocketRequest<'request, 'ctx> {
-    header: &'request mut OverlappedEntry,
-    fd: IoFd,
-    raw: RawHandle,
-    ctx: &'request mut SubmitContext<'ctx>,
 }
 
 impl<'request, 'ctx> RawSocketRequest<'request, 'ctx> {
@@ -203,7 +203,7 @@ impl<'request, 'ctx> RawSocketRequest<'request, 'ctx> {
         submit: impl FnOnce(SOCKET, *mut Overlapped) -> IocpResult<SubmissionResult>,
     ) -> IocpResult<SubmissionResult> {
         Self::validate_overlapped_socket(self.raw)?;
-        ensure_iocp_association(
+        SubmissionOps::ensure_iocp_association(
             &self.fd,
             self.raw,
             self.ctx.port.as_ref(),
@@ -241,12 +241,12 @@ mod tests {
         rio::RioError,
     };
     use veloq_buf::FixedBuf;
-    use veloq_std::num::NonZeroUsize;
+    use veloq_std::{num::NonZeroUsize, ptr::null_mut};
 
     #[test]
     fn unregistered_buffer_uses_overlapped_only_for_regular_socket() {
-        let regular = RawHandle::new(IocpHandle::for_socket(core::ptr::null_mut()));
-        let rio = RawHandle::new(IocpHandle::for_rio_socket(core::ptr::null_mut()));
+        let regular = RawHandle::new(IocpHandle::for_socket(null_mut()));
+        let rio = RawHandle::new(IocpHandle::for_rio_socket(null_mut()));
         let buffer = FixedBuf::alloc_heap(NonZeroUsize::new(8).expect("non-zero capacity"), 0)
             .expect("heap buffer allocation should succeed");
 

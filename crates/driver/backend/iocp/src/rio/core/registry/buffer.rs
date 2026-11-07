@@ -546,8 +546,8 @@ impl RioBufferRegistry {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{RioRegistry, RioRegistryTestSupport};
     use super::{
+        super::{RioRegistry, RioRegistryTestSupport},
         ChunkId, RioBufferId, RioBufferLeaseToken, RioBufferRegistration, RioChunkRegistration,
         RioChunkRegistrationKey,
     };

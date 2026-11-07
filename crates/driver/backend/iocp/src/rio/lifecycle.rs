@@ -10,6 +10,7 @@ use crate::{
     },
 };
 use diagweave::prelude::*;
+use tracing::{error, warn};
 use veloq_driver_core::{AnomalyAttach, RawCompletion};
 use veloq_std::{
     mem::{self, zeroed},
@@ -21,18 +22,18 @@ use veloq_std::{
 };
 use windows_sys::Win32::Networking::WinSock::{RIO_CORRUPT_CQ, RIORESULT};
 
-const RIO_REAPER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) struct RioLifecycleResources {
+    pub(crate) deferred_kernel_ops: Vec<IocpKernelOp>,
+    pub(crate) deferred_payloads: Vec<IocpUserPayload>,
+}
+
+pub(super) const RIO_REAPER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct DeferredRioCleanup {
     core: RioCore,
     runtime: RioRuntime,
     resources: RioLifecycleResources,
     diagnostics: IocpDriverCompletionDiagnostics,
-}
-
-pub(crate) struct RioLifecycleResources {
-    pub(crate) deferred_kernel_ops: Vec<IocpKernelOp>,
-    pub(crate) deferred_payloads: Vec<IocpUserPayload>,
 }
 
 pub(super) struct RioLifecycle;
@@ -68,13 +69,13 @@ impl DeferredRioCleanup {
             &mut self.diagnostics,
             RIO_REAPER_DRAIN_TIMEOUT,
         ) {
-            tracing::warn!(error = ?e, "RioReaper: background drain timed out");
+            warn!(error = ?e, "RioReaper: background drain timed out");
         }
         if !self
             .runtime
             .runtime_ready_for_forget(self.core.outstanding_count())
         {
-            tracing::warn!(
+            warn!(
                 rio_outstanding_count = self.core.outstanding_count(),
                 socket_inflight = self.runtime.socket_inflight_count(),
                 "RioReaper: leaking deferred RIO state to keep in-flight resources alive"
@@ -83,7 +84,7 @@ impl DeferredRioCleanup {
             return;
         }
         if let Err(error) = RioLifecycle::finalize(&mut self.core, &mut self.runtime) {
-            tracing::error!(report = ?error, "RioReaper: failed to finalize drained RIO state");
+            error!(report = ?error, "RioReaper: failed to finalize drained RIO state");
             mem::forget(self);
             return;
         }
@@ -104,7 +105,7 @@ fn reaper_sender() -> Option<&'static mpsc::Sender<DeferredRioCleanup>> {
             }) {
             Ok(_) => Some(tx),
             Err(e) => {
-                tracing::error!("failed to spawn veloq-rio-reaper: {e}");
+                error!("failed to spawn veloq-rio-reaper: {e}");
                 None
             }
         }
@@ -219,7 +220,7 @@ impl RioLifecycle {
                     context: _completed_context,
                 } = *kind;
                 if let Err(error) = core.registry_mut().free_addr_reservation(addr) {
-                    tracing::error!(report = ?error, "failed to release drained RIO address lease");
+                    error!(report = ?error, "failed to release drained RIO address lease");
                 }
                 release_result = core
                     .registry_mut()
@@ -266,7 +267,7 @@ impl RioLifecycle {
         } else {
             // A malformed identity cannot name its leases, so outstanding ownership is retained.
             // 无法识别的请求上下文不能定位租约，因此必须保留 outstanding 所有权。
-            tracing::warn!(
+            warn!(
                 request_context = result.RequestContext,
                 rio_outstanding_count = core.outstanding_count(),
                 "keeping RIO state alive after an unidentifiable drained completion"
@@ -289,11 +290,11 @@ impl RioLifecycle {
     pub(super) fn submit_deferred(task: DeferredRioCleanup) {
         if let Some(tx) = reaper_sender() {
             if let Err(err) = tx.send(task) {
-                tracing::warn!("RioReaper unavailable, falling back to inline cleanup");
+                warn!("RioReaper unavailable, falling back to inline cleanup");
                 err.0.run();
             }
         } else {
-            tracing::warn!("RioReaper thread failed to start, falling back to inline cleanup");
+            warn!("RioReaper thread failed to start, falling back to inline cleanup");
             task.run();
         }
     }

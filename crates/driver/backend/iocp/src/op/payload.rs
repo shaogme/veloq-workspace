@@ -5,12 +5,12 @@ use windows_sys::Win32::Networking::WinSock::SOCKADDR_STORAGE;
 use crate::{
     config::OwnedRawHandle,
     error::{IocpError, IocpResult},
-    net::addr::SockAddrStorage,
+    net::SockAddrStorage,
     op::{
         Accept, AcceptMulti, AcceptedSocket, Close, Connect, Fallocate, FallocateRaw, Fsync,
-        FsyncRaw, OpSend, Open, ProvidedBuf, ReadFixed, ReadRaw, Recv, RecvMulti, RecvProvided,
-        SendTo, SyncFileRange, SyncFileRangeRaw, Timeout, UdpConnect, UdpRecvMulti, UdpRecvPacket,
-        UdpSend, Wakeup, WriteFixed, WriteRaw, spec::PayloadBinding,
+        FsyncRaw, OpSend, Open, OverlappedEntry, PayloadBinding, ProvidedBuf, ReadFixed, ReadRaw,
+        Recv, RecvMulti, RecvProvided, SendTo, SyncFileRange, SyncFileRangeRaw, Timeout,
+        UdpConnect, UdpRecvMulti, UdpRecvPacket, UdpSend, Wakeup, WriteFixed, WriteRaw,
     },
 };
 
@@ -51,34 +51,6 @@ pub enum IocpUserPayload {
     AcceptMulti(AcceptMulti),
     RecvProvided(RecvProvided),
     RecvMulti(RecvMulti),
-}
-
-pub(crate) enum IocpOpPayload {
-    Read(KernelRef<ReadFixed>),
-    ReadRaw(KernelRef<ReadRaw>),
-    Write(KernelRef<WriteFixed>),
-    WriteRaw(KernelRef<WriteRaw>),
-    Recv(KernelRef<Recv>),
-    Send(KernelRef<OpSend>),
-    UdpSend(KernelRef<UdpSend>),
-    Close(KernelRef<Close>),
-    Fsync(KernelRef<Fsync>),
-    FsyncRaw(KernelRef<FsyncRaw>),
-    SyncRange(KernelRef<SyncFileRange>),
-    SyncRangeRaw(KernelRef<SyncFileRangeRaw>),
-    Fallocate(KernelRef<Fallocate>),
-    FallocateRaw(KernelRef<FallocateRaw>),
-    Timeout(KernelRef<Timeout>),
-    Connect(KernelRef<Connect>),
-    UdpConnect(KernelRef<UdpConnect>),
-    Accept(AcceptPayload),
-    AcceptMulti(AcceptMultiPayload),
-    SendTo(SendToPayload),
-    RecvProvided(RecvProvidedPayload),
-    RecvMulti(RecvMultiPayload),
-    UdpRecvMulti(UdpRecvMultiPayload),
-    Open(OpenPayload),
-    Wakeup(KernelRef<Wakeup>),
 }
 
 /// Reference to a kernel operation.
@@ -128,7 +100,23 @@ impl<T> PayloadRef<T> {
 }
 
 pub(crate) struct KernelRef<T> {
-    pub(crate) user: PayloadRef<T>,
+    user: PayloadRef<T>,
+}
+
+impl<T> KernelRef<T> {
+    pub(crate) fn new(_user: &T) -> Self {
+        Self {
+            user: PayloadRef::unbound(),
+        }
+    }
+
+    pub(crate) fn user(&self) -> &PayloadRef<T> {
+        &self.user
+    }
+
+    pub(crate) fn user_mut(&mut self) -> &mut PayloadRef<T> {
+        &mut self.user
+    }
 }
 
 /// Payload for the socket accept operation.
@@ -136,9 +124,43 @@ pub(crate) const ACCEPT_EX_ADDR_SECTION_LEN: usize = size_of::<SOCKADDR_STORAGE>
 pub(crate) const ACCEPT_EX_OUTPUT_BUFFER_LEN: usize = ACCEPT_EX_ADDR_SECTION_LEN * 2;
 
 pub(crate) struct AcceptPayload {
-    pub(crate) user: PayloadRef<Accept>,
-    pub(crate) accept_buffer: [u8; ACCEPT_EX_OUTPUT_BUFFER_LEN],
-    pub(crate) accept_socket: Option<OwnedRawHandle>,
+    user: PayloadRef<Accept>,
+    accept_buffer: [u8; ACCEPT_EX_OUTPUT_BUFFER_LEN],
+    accept_socket: Option<OwnedRawHandle>,
+}
+
+impl AcceptPayload {
+    pub(crate) fn new() -> Self {
+        Self {
+            user: PayloadRef::unbound(),
+            accept_buffer: [0; ACCEPT_EX_OUTPUT_BUFFER_LEN],
+            accept_socket: None,
+        }
+    }
+
+    pub(crate) fn user(&self) -> &PayloadRef<Accept> {
+        &self.user
+    }
+
+    pub(crate) fn user_mut(&mut self) -> &mut PayloadRef<Accept> {
+        &mut self.user
+    }
+
+    pub(crate) fn accept_buffer(&self) -> &[u8; ACCEPT_EX_OUTPUT_BUFFER_LEN] {
+        &self.accept_buffer
+    }
+
+    pub(crate) fn accept_buffer_mut(&mut self) -> &mut [u8; ACCEPT_EX_OUTPUT_BUFFER_LEN] {
+        &mut self.accept_buffer
+    }
+
+    pub(crate) fn accept_socket(&self) -> Option<&OwnedRawHandle> {
+        self.accept_socket.as_ref()
+    }
+
+    pub(crate) fn accept_socket_mut(&mut self) -> &mut Option<OwnedRawHandle> {
+        &mut self.accept_socket
+    }
 }
 
 /// Persistent kernel state for an `AcceptMulti` operation.
@@ -148,10 +170,10 @@ pub(crate) struct AcceptPayload {
 /// fields; keeping them in a dedicated payload now prevents the multishot path from falling back
 /// to the one-shot `AcceptPayload` shape.
 pub(crate) struct AcceptMultiPayload {
-    pub(crate) user: PayloadRef<AcceptMulti>,
-    pub(crate) accept_buffer: [u8; ACCEPT_EX_OUTPUT_BUFFER_LEN],
-    pub(crate) accept_socket: Option<OwnedRawHandle>,
-    pub(crate) request_generation: Generation,
+    user: PayloadRef<AcceptMulti>,
+    accept_buffer: [u8; ACCEPT_EX_OUTPUT_BUFFER_LEN],
+    accept_socket: Option<OwnedRawHandle>,
+    request_generation: Generation,
 }
 
 impl AcceptMultiPayload {
@@ -163,6 +185,38 @@ impl AcceptMultiPayload {
             request_generation: Generation::ZERO,
         }
     }
+
+    pub(crate) fn user(&self) -> &PayloadRef<AcceptMulti> {
+        &self.user
+    }
+
+    pub(crate) fn user_mut(&mut self) -> &mut PayloadRef<AcceptMulti> {
+        &mut self.user
+    }
+
+    pub(crate) fn accept_buffer(&self) -> &[u8; ACCEPT_EX_OUTPUT_BUFFER_LEN] {
+        &self.accept_buffer
+    }
+
+    pub(crate) fn accept_buffer_mut(&mut self) -> &mut [u8; ACCEPT_EX_OUTPUT_BUFFER_LEN] {
+        &mut self.accept_buffer
+    }
+
+    pub(crate) fn accept_socket(&self) -> Option<&OwnedRawHandle> {
+        self.accept_socket.as_ref()
+    }
+
+    pub(crate) fn accept_socket_mut(&mut self) -> &mut Option<OwnedRawHandle> {
+        &mut self.accept_socket
+    }
+
+    pub(crate) const fn request_generation(&self) -> Generation {
+        self.request_generation
+    }
+
+    pub(crate) fn set_request_generation(&mut self, generation: Generation) {
+        self.request_generation = generation;
+    }
 }
 
 /// Persistent state for a one-record provided receive request.
@@ -171,9 +225,9 @@ impl AcceptMultiPayload {
 /// stage allocates and binds it, so construction cannot accidentally claim a buffer that the
 /// kernel has not been given.
 pub(crate) struct RecvProvidedPayload {
-    pub(crate) user: PayloadRef<RecvProvided>,
-    pub(crate) buffer: Option<FixedBuf>,
-    pub(crate) request_generation: Generation,
+    user: PayloadRef<RecvProvided>,
+    buffer: Option<FixedBuf>,
+    request_generation: Generation,
 }
 
 impl RecvProvidedPayload {
@@ -184,6 +238,30 @@ impl RecvProvidedPayload {
             request_generation: Generation::ZERO,
         }
     }
+
+    pub(crate) fn user(&self) -> &PayloadRef<RecvProvided> {
+        &self.user
+    }
+
+    pub(crate) fn user_mut(&mut self) -> &mut PayloadRef<RecvProvided> {
+        &mut self.user
+    }
+
+    pub(crate) fn buffer(&self) -> Option<&FixedBuf> {
+        self.buffer.as_ref()
+    }
+
+    pub(crate) fn buffer_mut(&mut self) -> &mut Option<FixedBuf> {
+        &mut self.buffer
+    }
+
+    pub(crate) const fn request_generation(&self) -> Generation {
+        self.request_generation
+    }
+
+    pub(crate) fn set_request_generation(&mut self, generation: Generation) {
+        self.request_generation = generation;
+    }
 }
 
 /// Persistent state for the TCP receive pump behind `RecvMulti`.
@@ -191,9 +269,9 @@ impl RecvProvidedPayload {
 /// Request depth, leases and terminal state are deliberately owned by this payload rather than
 /// by the facade.  The concrete pump transitions are added by the receive implementation stage.
 pub(crate) struct RecvMultiPayload {
-    pub(crate) user: PayloadRef<RecvMulti>,
-    pub(crate) pump: Option<ReceivePumpState>,
-    pub(crate) raw_buffer: Option<FixedBuf>,
+    user: PayloadRef<RecvMulti>,
+    pump: Option<ReceivePumpState>,
+    raw_buffer: Option<FixedBuf>,
 }
 
 impl RecvMultiPayload {
@@ -204,13 +282,59 @@ impl RecvMultiPayload {
             raw_buffer: None,
         }
     }
+
+    pub(crate) fn user(&self) -> &PayloadRef<RecvMulti> {
+        &self.user
+    }
+
+    pub(crate) fn user_mut(&mut self) -> &mut PayloadRef<RecvMulti> {
+        &mut self.user
+    }
+
+    pub(crate) fn pump(&self) -> Option<&ReceivePumpState> {
+        self.pump.as_ref()
+    }
+
+    pub(crate) fn pump_mut(&mut self) -> &mut Option<ReceivePumpState> {
+        &mut self.pump
+    }
+
+    pub(crate) fn raw_buffer(&self) -> Option<&FixedBuf> {
+        self.raw_buffer.as_ref()
+    }
+
+    pub(crate) fn raw_buffer_mut(&mut self) -> &mut Option<FixedBuf> {
+        &mut self.raw_buffer
+    }
 }
 
 /// Payload for the socket send-to operation.
 pub(crate) struct SendToPayload {
-    pub(crate) user: PayloadRef<SendTo>,
-    pub(crate) addr: SockAddrStorage,
-    pub(crate) addr_len: i32,
+    user: PayloadRef<SendTo>,
+    addr: SockAddrStorage,
+    addr_len: i32,
+}
+
+impl SendToPayload {
+    pub(crate) fn new(addr: SockAddrStorage, addr_len: i32) -> Self {
+        Self {
+            user: PayloadRef::unbound(),
+            addr,
+            addr_len,
+        }
+    }
+
+    pub(crate) fn user(&self) -> &PayloadRef<SendTo> {
+        &self.user
+    }
+
+    pub(crate) fn addr(&self) -> &SockAddrStorage {
+        &self.addr
+    }
+
+    pub(crate) const fn addr_len(&self) -> i32 {
+        self.addr_len
+    }
 }
 
 /// Kernel-side binding for the persistent UDP receive pump.
@@ -218,25 +342,25 @@ pub(crate) struct SendToPayload {
 /// The receive pump is kept in the slot's submit payload for the complete lifetime of the
 /// logical operation.  Individual datagrams are represented by [`IocpUserPayload::UdpRecvPacket`]
 /// and never borrow this binding.
-pub(crate) struct UdpRecvMultiPayload {
-    pub(crate) user: PayloadRef<UdpRecvMulti>,
-    pub(crate) request_id: u64,
-    raw_requests: Option<Vec<RawUdpReceiveRequest>>,
-    terminal_error: Option<Report<IocpError>>,
-}
-
 pub(crate) struct RawUdpReceiveRequest {
     slot_id: u32,
-    header: crate::op::OverlappedEntry,
+    header: OverlappedEntry,
     address: SockAddrStorage,
     address_len: i32,
+}
+
+pub(crate) struct UdpRecvMultiPayload {
+    user: PayloadRef<UdpRecvMulti>,
+    request_id: u64,
+    raw_requests: Option<Vec<RawUdpReceiveRequest>>,
+    terminal_error: Option<Report<IocpError>>,
 }
 
 impl RawUdpReceiveRequest {
     pub(crate) fn new(slot_id: u32, token: OpToken) -> Self {
         Self {
             slot_id,
-            header: crate::op::OverlappedEntry::new(token),
+            header: OverlappedEntry::new(token),
             address: SockAddrStorage::default(),
             address_len: 0,
         }
@@ -246,11 +370,11 @@ impl RawUdpReceiveRequest {
         self.slot_id
     }
 
-    pub(crate) fn header_mut(&mut self) -> &mut crate::op::OverlappedEntry {
+    pub(crate) fn header_mut(&mut self) -> &mut OverlappedEntry {
         &mut self.header
     }
 
-    pub(crate) fn header(&self) -> &crate::op::OverlappedEntry {
+    pub(crate) fn header(&self) -> &OverlappedEntry {
         &self.header
     }
 
@@ -264,7 +388,7 @@ impl RawUdpReceiveRequest {
 
     pub(crate) fn with_submit_fields<T>(
         &mut self,
-        submit: impl FnOnce(&mut crate::op::OverlappedEntry, &mut SockAddrStorage, &mut i32) -> T,
+        submit: impl FnOnce(&mut OverlappedEntry, &mut SockAddrStorage, &mut i32) -> T,
     ) -> T {
         submit(&mut self.header, &mut self.address, &mut self.address_len)
     }
@@ -278,6 +402,14 @@ impl UdpRecvMultiPayload {
             raw_requests: None,
             terminal_error: None,
         }
+    }
+
+    pub(crate) fn user(&self) -> &PayloadRef<UdpRecvMulti> {
+        &self.user
+    }
+
+    pub(crate) fn user_mut(&mut self) -> &mut PayloadRef<UdpRecvMulti> {
+        &mut self.user
     }
 
     pub(crate) fn try_allocate_raw_requests(
@@ -360,13 +492,47 @@ impl UdpRecvMultiPayload {
 
 /// Payload for the file open operation.
 pub(crate) struct OpenPayload {
-    pub(crate) user: PayloadRef<Open>,
+    user: PayloadRef<Open>,
 }
 
-pub(crate) fn kernel_ref<T>(_user: &T) -> KernelRef<T> {
-    KernelRef {
-        user: PayloadRef::unbound(),
+impl OpenPayload {
+    pub(crate) fn new() -> Self {
+        Self {
+            user: PayloadRef::unbound(),
+        }
     }
+
+    pub(crate) fn user(&self) -> &PayloadRef<Open> {
+        &self.user
+    }
+}
+
+pub(crate) enum IocpOpPayload {
+    Read(KernelRef<ReadFixed>),
+    ReadRaw(KernelRef<ReadRaw>),
+    Write(KernelRef<WriteFixed>),
+    WriteRaw(KernelRef<WriteRaw>),
+    Recv(KernelRef<Recv>),
+    Send(KernelRef<OpSend>),
+    UdpSend(KernelRef<UdpSend>),
+    Close(KernelRef<Close>),
+    Fsync(KernelRef<Fsync>),
+    FsyncRaw(KernelRef<FsyncRaw>),
+    SyncRange(KernelRef<SyncFileRange>),
+    SyncRangeRaw(KernelRef<SyncFileRangeRaw>),
+    Fallocate(KernelRef<Fallocate>),
+    FallocateRaw(KernelRef<FallocateRaw>),
+    Timeout(KernelRef<Timeout>),
+    Connect(KernelRef<Connect>),
+    UdpConnect(KernelRef<UdpConnect>),
+    Accept(AcceptPayload),
+    AcceptMulti(AcceptMultiPayload),
+    SendTo(SendToPayload),
+    RecvProvided(RecvProvidedPayload),
+    RecvMulti(RecvMultiPayload),
+    UdpRecvMulti(UdpRecvMultiPayload),
+    Open(OpenPayload),
+    Wakeup(KernelRef<Wakeup>),
 }
 
 impl<T> PayloadBinding<T> for KernelRef<T> {
@@ -466,7 +632,7 @@ mod raw_udp_receive_request_tests {
 
         let overlapped_addresses = requests
             .iter()
-            .map(|request| &request.header.inner as *const _ as usize)
+            .map(|request| request.header.inner() as *const _ as usize)
             .collect::<Vec<_>>();
         let peer_address_addresses = requests
             .iter()

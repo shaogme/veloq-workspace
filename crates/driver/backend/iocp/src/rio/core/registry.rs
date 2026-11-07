@@ -13,19 +13,17 @@ use self::{addr::RioAddressRegistry, buffer::RioBufferRegistry};
 pub(crate) use addr::RioAddrReservation;
 pub(crate) use buffer::{ResolvedRioBuffer, RioBufferLeaseToken};
 
-#[cfg(test)]
-pub(super) use test_helpers::RioRegistryTestSupport;
-
 use crate::{
     IoFd,
     config::BorrowedRawHandle,
-    net::addr::SockAddrStorage,
+    net::SockAddrStorage,
     rio::{
         core::RioEnv,
         error::{RioError, RioResult},
     },
 };
 use diagweave::prelude::*;
+use tracing::error;
 use veloq_buf::{BufferRegistrationRequest, FixedBuf, LockedMemoryBudget, LockedMemoryPermit};
 use veloq_driver_core::Generation;
 use veloq_std::{
@@ -33,14 +31,16 @@ use veloq_std::{
 };
 use windows_sys::Win32::Networking::WinSock::RIO_BUF;
 
-#[cfg(test)]
-use veloq_std::mem::size_of;
-
 use super::{
     RioCompletedRequestContext, RioCompletionKind, RioOpRequestInit, RioPreparedRequestContext,
     RioRequestContextDecode, RioRequestContextId,
     submit_ops::{RioProvider, RioRq, RioRqConfig},
 };
+
+#[cfg(test)]
+pub(super) use test_helpers::RioRegistryTestSupport;
+#[cfg(test)]
+use veloq_std::mem::size_of;
 
 pub(crate) const REGISTER_FAILURE_RETRY_COOLDOWN: Duration = Duration::from_millis(250);
 
@@ -58,19 +58,19 @@ pub(crate) struct RioRegistrationStats {
     pub(crate) chunk_register_skipped_recent_failure: u64,
 }
 
+#[derive(Default)]
+struct RioRequestContextSlot {
+    generation: Generation,
+    init: Option<RioOpRequestInit>,
+    in_use: bool,
+}
+
 pub(crate) struct RioRegistry {
     addresses: RioAddressRegistry,
     buffers: RioBufferRegistry,
     rq_depth: u32,
     request_contexts: Vec<RioRequestContextSlot>,
     request_context_free: Vec<usize>,
-}
-
-#[derive(Default)]
-struct RioRequestContextSlot {
-    generation: Generation,
-    init: Option<RioOpRequestInit>,
-    in_use: bool,
 }
 
 impl RioRegistry {
@@ -356,7 +356,7 @@ impl RioRegistry {
             || self.request_contexts.iter().any(|slot| slot.in_use)
             || self.has_active_buffer_leases()
         {
-            tracing::error!(
+            error!(
                 active_addr_slots,
                 active_request_contexts = self
                     .request_contexts
@@ -629,8 +629,10 @@ mod test_helpers {
 
 #[cfg(test)]
 mod tests {
-    use super::super::submit_ops::RioSubmissionKind;
-    use super::{RioError, RioRegistry, test_helpers::RioRegistryTestSupport};
+    use super::{
+        super::submit_ops::RioSubmissionKind, RioError, RioRegistry,
+        test_helpers::RioRegistryTestSupport,
+    };
 
     struct SubmissionCase {
         kind: RioSubmissionKind,

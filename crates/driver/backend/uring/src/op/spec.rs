@@ -6,27 +6,40 @@ mod storage_macros;
 
 use crate::{
     OwnedRawHandle,
-    driver::{CqeEnv, SqeEnv},
+    diagnostics::UringCompletionDiagnostics,
+    driver::{CqeEnv, SqeEnv, UringOpState},
     error::{UringError, UringResult},
     op::{
         Accept, AcceptMulti, AcceptedSocket, Close, CompletionCardinality, Connect,
         ErasedOperationDescriptor, Fallocate, FallocateRaw, Fsync, FsyncRaw, OpSend, Open,
         OperationDescriptor, ProvidedBuf, ReadFixed, ReadRaw, RecordPolicy, Recv, RecvMulti,
         RecvProvided, SendTo, SubmissionStrategy, SyncFileRange, SyncFileRangeRaw, Timeout,
-        UdpConnect, UdpRecvMulti, UdpRecvPacket, UdpSend, UringKernelOp, UringRecordItem,
-        UringSlotSpec, UringUserPayload, Wakeup, WriteFixed, WriteRaw,
+        UdpConnect, UdpRecvMulti, UdpRecvPacket, UdpSend, UringKernelOp, UringOp, UringRecordItem,
+        UringUserPayload, Wakeup, WriteFixed, WriteRaw,
     },
 };
 use diagweave::prelude::*;
 use veloq_buf::heap::ChunkId;
 use veloq_driver_core::{
-    IntoPlatformOp, LostReason, OpCompletion, OpError, OpKind, OpResult, OpToken, SingleShotOp,
-    SlotAccess, SlotAccessError, SubmitTokenContext,
+    IntoPlatformOp, LostReason, OpCompletion, OpError, OpKind, OpResult, OpToken,
+    SingleShotOperation, SlotAccess, SlotAccessError, SlotSpec as CoreSlotSpec, SubmitTokenContext,
 };
 use veloq_io_uring::squeue;
 use veloq_std::{convert::identity, format, pin::Pin, time::Duration};
 
 use callbacks::{DescriptorCallbacks, RecordItemContext};
+
+pub enum UringSlotSpec {}
+
+impl CoreSlotSpec for UringSlotSpec {
+    type Op = UringOp;
+    type UserPayload = UringUserPayload;
+    type PlatformData = UringOpState;
+    type Sidecar = ();
+    type Error = UringError;
+    type Completion = usize;
+    type CompletionDiagnostics = UringCompletionDiagnostics;
+}
 
 mod payload {
     pub(super) use crate::op::{

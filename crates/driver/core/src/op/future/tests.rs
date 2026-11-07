@@ -16,7 +16,7 @@ use crate::{
         CompletionMutationOutcome, CompletionPacket, CompletionWritePermit, PlatformOp,
         RecordCompletionResult, UserCompletionEvent,
     },
-    op::{IntoPlatformOp, OpKind},
+    op::{IntoPlatformOp, OpKind, SingleShotOperation},
     slot::{self, Generation},
 };
 use veloq_std::{
@@ -94,7 +94,7 @@ impl IntoPlatformOp<DummySlotSpec> for DummyOp {
     }
 }
 
-impl SingleShotOp<DummySlotSpec> for DummyOp {}
+impl SingleShotOperation<DummyOp> for DummySlotSpec {}
 
 /// 只回答 `try_take_record` 与 `mark_orphaned` 的最小完成表：前者按「还剩几条记录」回答
 /// 「已就绪 / 仍在途」，后者数一下自己被调用了几次。

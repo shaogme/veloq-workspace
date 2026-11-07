@@ -6,10 +6,10 @@ use windows_sys::Win32::Foundation::ERROR_OPERATION_ABORTED;
 
 use diagweave::prelude::*;
 use veloq_driver_core::{
-    AnomalyAttach, CompletionBackendHooks, CompletionBackendIngressAction, CompletionCleanupGuard,
-    CompletionContinuation, CompletionControl, CompletionFailure, CompletionSettlement,
-    CompletionSource, CompletionToken, InFlightOrphaned, InFlightWaiting, OpKind, OpToken,
-    ProvidedBuf, SyntheticCompletionSource, UserCompletionEvent,
+    AnomalyAttach, CompletionAnomalyKind, CompletionBackendHooks, CompletionBackendIngressAction,
+    CompletionCleanupGuard, CompletionContinuation, CompletionControl, CompletionFailure,
+    CompletionSettlement, CompletionSource, CompletionToken, InFlightOrphaned, InFlightWaiting,
+    OpKind, OpToken, ProvidedBuf, SyntheticCompletionSource, UserCompletionEvent,
 };
 
 use crate::{
@@ -28,15 +28,10 @@ use super::{
         COMP_BACKEND_IOCP, IocpBackendEffect, IocpBackendIngress, IocpPostCompletionEffects,
         IocpSyntheticCompletion,
     },
-    settlement::SettlementService,
+    settlement::{MultishotReplacementFailure, SettlementService},
 };
 
 use raw_udp::{RawUdpCompletion, RawUdpCompletionServices};
-
-struct OrphanedRawUdpChild {
-    socket_inflight: SocketInflightToken,
-    has_active_children: bool,
-}
 
 pub(super) struct IocpCompletionHooks<'a> {
     ext: &'a Extensions,
@@ -98,7 +93,7 @@ impl<'a> IocpCompletionHooks<'a> {
                     .attach_note("completed AcceptMulti request has no socket inflight token")
             })?;
 
-        let overlapped = slot.with_sidecar_mut(|sidecar| &mut sidecar.inner as *mut Overlapped);
+        let overlapped = slot.with_sidecar_mut(|sidecar| sidecar.inner_mut() as *mut Overlapped);
         let result = slot.with_access_mut(|access| -> IocpResult<()> {
             let op = access.operation_mut().get_mut();
             if op.kind() != OpKind::AcceptMulti {
@@ -154,9 +149,9 @@ impl<'a> IocpCompletionHooks<'a> {
                 let release: Report<IocpError> = release.trans();
                 let restored = slot
                     .with_access_mut(|access| {
-                        let header = &mut access.operation_mut().get_mut().header;
-                        if header.socket_inflight.is_none() {
-                            header.socket_inflight = Some(SocketInflightToken::new(
+                        let header = access.operation_mut().get_mut().header_mut();
+                        if header.socket_inflight().is_none() {
+                            *header.socket_inflight_mut() = Some(SocketInflightToken::new(
                                 previous_identity.socket_key(),
                                 previous_identity.request_id(),
                             ));
@@ -185,7 +180,7 @@ impl<'a> IocpCompletionHooks<'a> {
         slot: &mut Slot<'_, InFlightWaiting>,
         token: OpToken,
     ) -> IocpResult<SubmissionResult> {
-        let overlapped = slot.with_sidecar_mut(|sidecar| &mut sidecar.inner as *mut Overlapped);
+        let overlapped = slot.with_sidecar_mut(|sidecar| sidecar.inner_mut() as *mut Overlapped);
         slot.with_access_mut(|access| {
             let op = access.operation_mut().get_mut();
             let Some(vtable) = op.multishot_vtable() else {
@@ -243,12 +238,12 @@ impl<'a> IocpCompletionHooks<'a> {
         if io_result == 0 {
             let output = match slot.with_access_mut(|access| -> IocpResult<FixedBuf> {
                 let op = access.operation_mut().get_mut();
-                let IocpOpPayload::RecvMulti(payload) = &mut op.payload else {
+                let IocpOpPayload::RecvMulti(payload) = op.payload_mut() else {
                     return Err(IocpError::InvalidState
                         .to_report()
                         .attach_note("raw RecvMulti EOF has the wrong payload kind"));
                 };
-                let mut buffer = payload.raw_buffer.take().ok_or_else(|| {
+                let mut buffer = payload.raw_buffer_mut().take().ok_or_else(|| {
                     IocpError::InvalidState
                         .to_report()
                         .attach_note("raw RecvMulti EOF has no backend buffer")
@@ -309,12 +304,12 @@ impl<'a> IocpCompletionHooks<'a> {
 
         let output = match slot.with_access_mut(|access| -> IocpResult<FixedBuf> {
             let op = access.operation().get_ref();
-            let IocpOpPayload::RecvMulti(payload) = &op.payload else {
+            let IocpOpPayload::RecvMulti(payload) = op.payload() else {
                 return Err(IocpError::InvalidState
                     .to_report()
                     .attach_note("raw RecvMulti completion has the wrong payload kind"));
             };
-            let buffer = payload.raw_buffer.as_ref().ok_or_else(|| {
+            let buffer = payload.raw_buffer().ok_or_else(|| {
                 IocpError::InvalidState
                     .to_report()
                     .attach_note("raw RecvMulti completion has no backend buffer")
@@ -423,22 +418,26 @@ impl<'a> IocpCompletionHooks<'a> {
                 effect,
             },
             Ok(_) => SettlementService::complete_iocp_multishot_replacement_failure_slot(
-                slot,
-                event,
-                Ok(io_result),
-                record,
-                IocpError::InvalidState
-                    .to_report()
-                    .attach_note("raw RecvMulti replacement returned a non-pending state"),
-                effect,
+                MultishotReplacementFailure {
+                    slot,
+                    event,
+                    io_result: Ok(io_result),
+                    payload: record,
+                    replacement_error: IocpError::InvalidState
+                        .to_report()
+                        .attach_note("raw RecvMulti replacement returned a non-pending state"),
+                    effect,
+                },
             ),
             Err(error) => SettlementService::complete_iocp_multishot_replacement_failure_slot(
-                slot,
-                event,
-                Ok(io_result),
-                record,
-                error,
-                effect,
+                MultishotReplacementFailure {
+                    slot,
+                    event,
+                    io_result: Ok(io_result),
+                    payload: record,
+                    replacement_error: error,
+                    effect,
+                },
             ),
         }
     }
@@ -733,60 +732,16 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
         source: CompletionSource<'_, Self::BackendIngress>,
     ) -> CompletionSettlement<IocpSlotSpec, Self::BackendEffect> {
         if let CompletionSource::Backend(IocpBackendIngress::UdpReceive { request, .. }) = source {
-            let child = slot.with_access_mut(|access| -> IocpResult<OrphanedRawUdpChild> {
-                let op = access.operation_mut().get_mut();
-                let IocpOpPayload::UdpRecvMulti(payload) = &mut op.payload else {
-                    return Err(IocpError::InvalidState
-                        .to_report()
-                        .attach_note("orphaned raw UDP completion has the wrong payload kind"));
+            let Some(child) = RawUdpCompletion::take_orphaned_child(&mut slot, request) else {
+                return CompletionSettlement::Anomaly {
+                    kind: CompletionAnomalyKind::backend_context(
+                        COMP_BACKEND_IOCP,
+                        event.token().index() as u64,
+                    ),
+                    attach: AnomalyAttach::from_raw_completion(event.raw()),
+                    cleanup: CompletionCleanupGuard::default(),
+                    effect: IocpBackendEffect::None,
                 };
-                let child = payload.raw_request_mut(request.slot_id).ok_or_else(|| {
-                    IocpError::InvalidState
-                        .to_report()
-                        .with_ctx("slot_id", request.slot_id)
-                        .attach_note("orphaned raw UDP child request owner is missing")
-                })?;
-                if child.slot_id() != request.slot_id
-                    || child.header().receive_request != Some(*request)
-                    || !child.header().in_flight
-                {
-                    return Err(IocpError::InvalidState
-                        .to_report()
-                        .with_ctx("request_id", request.request_id)
-                        .with_ctx("slot_id", request.slot_id)
-                        .with_ctx("slot_generation", request.slot_generation)
-                        .attach_note("orphaned raw UDP child completion identity is stale"));
-                }
-                let header = child.header_mut();
-                let Some(socket_inflight) = header.socket_inflight.take() else {
-                    return Err(IocpError::InvalidState
-                        .to_report()
-                        .with_ctx("request_id", request.request_id)
-                        .attach_note("orphaned raw UDP child has no socket inflight token"));
-                };
-                header.in_flight = false;
-                header.receive_request = None;
-                let has_active_children = payload.raw_requests().is_some_and(|requests| {
-                    requests.iter().any(|request| request.header().in_flight)
-                });
-                Ok(OrphanedRawUdpChild {
-                    socket_inflight,
-                    has_active_children,
-                })
-            });
-            let child = match child {
-                Ok(Ok(child)) => child,
-                _ => {
-                    return CompletionSettlement::Anomaly {
-                        kind: veloq_driver_core::CompletionAnomalyKind::backend_context(
-                            COMP_BACKEND_IOCP,
-                            event.token().index() as u64,
-                        ),
-                        attach: AnomalyAttach::from_raw_completion(event.raw()),
-                        cleanup: CompletionCleanupGuard::default(),
-                        effect: IocpBackendEffect::None,
-                    };
-                }
             };
             let effect = IocpBackendEffect::SocketInflight(child.socket_inflight);
             if child.has_active_children || self.overlapped_registry.has_children_for(event.token())
@@ -812,11 +767,11 @@ impl CompletionBackendHooks<IocpSlotSpec> for IocpCompletionHooks<'_> {
                 if op.kind() != OpKind::UdpRecvMulti || op.uses_rio_backend() {
                     return false;
                 }
-                let IocpOpPayload::UdpRecvMulti(payload) = &op.payload else {
+                let IocpOpPayload::UdpRecvMulti(payload) = op.payload() else {
                     return false;
                 };
                 payload.raw_requests().is_some_and(|requests| {
-                    requests.iter().any(|request| request.header().in_flight)
+                    requests.iter().any(|request| request.header().in_flight())
                 })
             })
             .unwrap_or(true);

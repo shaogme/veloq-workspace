@@ -46,7 +46,7 @@ impl IocpError {
         detail: impl Display + Send + Sync + 'static,
     ) -> Report<Self> {
         self.to_report()
-            .set_error_code(iocp_fallback_errno(self))
+            .set_error_code(Self::fallback_errno(self))
             .push_ctx("scope", scope)
             .attach_note(detail)
     }
@@ -63,6 +63,36 @@ impl IocpError {
         } else {
             report
         }
+    }
+
+    pub(crate) fn fallback_errno(kind: Self) -> i32 {
+        match kind {
+            Self::DriverInit => 5,
+            Self::CompletionWait => 110,
+            Self::Submission => 11,
+            Self::Registration => 12,
+            Self::Rio(RioError::InvalidInput | RioError::BufferRegistrationRequired) => 22,
+            Self::Rio(_) => 5,
+            Self::ResolveFd => 9,
+            Self::Socket | Self::Win32 | Self::InvalidState | Self::Internal => 5,
+            Self::InvalidInput => 22,
+            Self::Unsupported => 95,
+        }
+    }
+
+    pub(crate) fn fallback_event_res(kind: Self) -> i32 {
+        -Self::fallback_errno(kind)
+    }
+
+    pub(crate) fn report_to_event_res(report: &Report<Self>) -> i32 {
+        if let Some(code) = report
+            .error_code()
+            .and_then(|code| i32::try_from(code).ok())
+            && let Some(res) = neg_code(code)
+        {
+            return res;
+        }
+        Self::fallback_event_res(*report.inner())
     }
 }
 
@@ -81,51 +111,16 @@ fn neg_code(code: i32) -> Option<i32> {
     (code != 0).then_some(-code.abs())
 }
 
-#[inline]
-pub(crate) fn iocp_fallback_errno(kind: IocpError) -> i32 {
-    match kind {
-        IocpError::DriverInit => 5,                                 // EIO
-        IocpError::CompletionWait => 110,                           // ETIMEDOUT
-        IocpError::Submission => 11,                                // EAGAIN
-        IocpError::Registration => 12,                              // ENOMEM
-        IocpError::Rio(RioError::InvalidInput) => 22,               // EINVAL
-        IocpError::Rio(RioError::BufferRegistrationRequired) => 22, // EINVAL
-        IocpError::Rio(_) => 5,                                     // EIO
-        IocpError::ResolveFd => 9,                                  // EBADF
-        IocpError::Socket => 5,                                     // EIO
-        IocpError::Win32 => 5,                                      // EIO
-        IocpError::InvalidInput => 22,                              // EINVAL
-        IocpError::InvalidState => 5,                               // EIO
-        IocpError::Unsupported => 95,                               // EOPNOTSUPP
-        IocpError::Internal => 5,                                   // EIO
-    }
-}
-
-#[inline]
-pub(crate) fn iocp_fallback_event_res(kind: IocpError) -> i32 {
-    -iocp_fallback_errno(kind)
-}
-
-#[inline]
-pub(crate) fn iocp_report_to_event_res(report: &Report<IocpError>) -> i32 {
-    if let Some(code) = report
-        .error_code()
-        .and_then(|code| i32::try_from(code).ok())
-        && let Some(res) = neg_code(code)
-    {
-        return res;
-    }
-    iocp_fallback_event_res(*report.inner())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::rio::RioError;
+
+    use super::IocpError;
 
     #[test]
     fn rio_invalid_input_falls_back_to_einval() {
         assert_eq!(
-            iocp_fallback_errno(IocpError::Rio(RioError::InvalidInput)),
+            IocpError::fallback_errno(IocpError::Rio(RioError::InvalidInput)),
             22
         );
     }
@@ -133,7 +128,7 @@ mod tests {
     #[test]
     fn rio_buffer_registration_required_falls_back_to_einval() {
         assert_eq!(
-            iocp_fallback_errno(IocpError::Rio(RioError::BufferRegistrationRequired)),
+            IocpError::fallback_errno(IocpError::Rio(RioError::BufferRegistrationRequired)),
             22
         );
     }

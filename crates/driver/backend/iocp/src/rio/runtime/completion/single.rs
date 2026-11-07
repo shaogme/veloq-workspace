@@ -86,8 +86,8 @@ impl RioSingleCompletion {
 
         let _ = slot.with_access_mut(|access| {
             let iocp_op = access.operation_mut().get_mut();
-            if iocp_op.header.in_flight {
-                iocp_op.header.in_flight = false;
+            if iocp_op.header().in_flight() {
+                *iocp_op.header_mut().in_flight_mut() = false;
             }
             if !cancelled && let Ok(bytes) = completion.as_ref().copied() {
                 completion = iocp_op

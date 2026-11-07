@@ -1,4 +1,5 @@
 use diagweave::prelude::*;
+use tracing::error;
 use veloq_driver_core::{
     CompletionToken, ReceivePermitNotifier, ReceiveReplacementReservation, ReceiveRequest,
     UdpRecvMultiBackend,
@@ -16,8 +17,9 @@ use crate::{
     config::RawHandle,
     error::{IocpError, IocpResult},
     op::{
-        OverlappedEntry, RAW_UDP_RECV_MULTI_RESUME_BYTES, SubmitContext, UdpRecvMultiPayload,
-        submit::{SubmissionResult, mark_header_in_flight, resolve_fd_handle},
+        OverlappedEntry, RAW_UDP_RECV_MULTI_RESUME_BYTES, RawUdpReceiveRequest, SubmitContext,
+        UdpRecvMultiPayload,
+        submit::{SubmissionOps, SubmissionResult},
     },
     rio::{RioError, RioOpKind, RioTarget},
     win32::{CancelRequestResult, IoCompletionPort, Overlapped},
@@ -69,17 +71,17 @@ impl UdpReceiveSubmit {
     ) -> IocpResult<SubmissionResult> {
         // SAFETY: payload.user is bound to the live slot before submission. / 提交前 payload.user 已绑定到活动槽位。
         let (fd, raw, target_depth, all_registered) = {
-            let user = unsafe { payload.user.as_ref()? };
+            let user = unsafe { payload.user().as_ref()? };
             let fd = user.fd();
             let target_depth = user.receive_pump().snapshot().target_depth;
-            let raw = resolve_fd_handle(&fd, &*ctx.registered_slots)?;
+            let raw = SubmissionOps::resolve_fd_handle(&fd, &*ctx.registered_slots)?;
             let slot_count = u32::try_from(target_depth).map_err(|_| {
                 IocpError::InvalidInput
                     .to_report()
                     .with_ctx("target_depth", target_depth)
                     .attach_note("UDP receive depth exceeds the supported slot id range")
             })?;
-            header.resolved_handle = Some(raw);
+            *header.resolved_handle_mut() = Some(raw);
             let mut all_registered = true;
             for slot_id in 0..slot_count {
                 let Some(slot) = user.receive_pump().slot(slot_id) else {
@@ -172,7 +174,7 @@ impl UdpReceiveSubmit {
                     }
                     child.header_mut().reset_for_token(token);
                     let result = child.with_submit_fields(|child_header, address, address_len| {
-                        ctx.overlapped = &mut child_header.inner;
+                        ctx.overlapped = child_header.inner_mut();
                         SocketSubmission::submit_wsa_recv_from(
                             RawSocketRequest::new(child_header, fd, raw, ctx),
                             buffer,
@@ -194,9 +196,10 @@ impl UdpReceiveSubmit {
                                     break;
                                 }
                             };
-                            child.header_mut().receive_request = Some(request);
+                            *child.header_mut().receive_request_mut() = Some(request);
                             let child_header = child.header_mut();
-                            child_header.request_generation = child_header.request_generation.next();
+                            *child_header.request_generation_mut() =
+                                child_header.request_generation().next();
                             *request_id = next_request_id;
                         }
                         Ok(_) => {
@@ -213,7 +216,7 @@ impl UdpReceiveSubmit {
                         }
                     }
                 }
-                ctx.overlapped = &mut header.inner;
+                ctx.overlapped = header.inner_mut();
                 if let Some(error) = startup_error {
                     if pump.actual_in_flight() == 0 {
                         return Err(error);
@@ -222,7 +225,7 @@ impl UdpReceiveSubmit {
                         *terminal_error = Some(error);
                     }
                     Self::cancel_raw_request_slice(requests, raw);
-                    header.in_flight = true;
+                    *header.in_flight_mut() = true;
                     return Ok(SubmissionResult::Pending);
                 }
                 if !pump.is_ready() {
@@ -231,7 +234,7 @@ impl UdpReceiveSubmit {
                         .with_ctx("target_depth", target_depth)
                         .attach_note("raw UDP receive startup did not reach the configured depth");
                 }
-                header.in_flight = true;
+                *header.in_flight_mut() = true;
                 Ok(SubmissionResult::Pending)
             })?;
             let registry = ctx.overlapped_registry.as_deref_mut().ok_or_else(|| {
@@ -241,17 +244,17 @@ impl UdpReceiveSubmit {
             })?;
             for child in payload.raw_requests().into_iter().flatten() {
                 let child_header = child.header();
-                if child_header.in_flight
-                    && let Some(request) = child_header.receive_request
+                if child_header.in_flight()
+                    && let Some(request) = child_header.receive_request()
                 {
-                    debug_assert!(registry.register_child(&child_header.inner, token, request));
+                    debug_assert!(registry.register_child(child_header.inner(), token, request));
                 }
             }
             return Ok(result);
         }
-        let user = unsafe { payload.user.as_mut()? };
+        let user = unsafe { payload.user_mut().as_mut()? };
         let handle = raw.borrow();
-        mark_header_in_flight(
+        SubmissionOps::mark_header_in_flight(
             header,
             ctx.rio
                 .try_submit_recv_multi_initial(
@@ -283,8 +286,8 @@ impl UdpReceiveSubmit {
     ) -> IocpResult<u64> {
         // SAFETY: 提交入口会将用户操作绑定到槽位，直到完成事件完成路由。
         // SAFETY: The submit shim binds the user operation until its completion is routed.
-        let fd = unsafe { payload.user.as_ref()?.fd() };
-        let raw = resolve_fd_handle(&fd, &*ctx.registered_slots)?;
+        let fd = unsafe { payload.user().as_ref()?.fd() };
+        let raw = SubmissionOps::resolve_fd_handle(&fd, &*ctx.registered_slots)?;
         payload.with_bound_parts_mut(|user, requests, request_id, _| {
             let next_request_id = request_id.checked_add(1).ok_or_else(|| {
                 IocpError::InvalidState
@@ -314,10 +317,10 @@ impl UdpReceiveSubmit {
                     .with_ctx("slot_id", reservation.slot_id())
                     .attach_note("UDP replacement child request owner does not match its slot");
             }
-            let request_generation = child.header().request_generation.next();
+            let request_generation = child.header().request_generation().next();
             child.header_mut().reset_for_token(ctx.op_token);
             let result = child.with_submit_fields(|child_header, address, address_len| {
-                ctx.overlapped = &mut child_header.inner;
+                ctx.overlapped = child_header.inner_mut();
                 SocketSubmission::submit_wsa_recv_from(
                     RawSocketRequest::new(child_header, fd, raw, ctx),
                     buffer,
@@ -329,14 +332,14 @@ impl UdpReceiveSubmit {
                 return IocpError::InvalidState
                     .attach_note("overlapped UDP receive replacement was not submitted");
             }
-            child.header_mut().receive_request = Some(ReceiveRequest {
+            *child.header_mut().receive_request_mut() = Some(ReceiveRequest {
                 request_id: next_request_id,
                 slot_id: reservation.slot_id(),
                 slot_generation: reservation.slot_generation(),
             });
             *request_id = next_request_id;
-            child.header_mut().request_generation = request_generation;
-            header.in_flight = true;
+            *child.header_mut().request_generation_mut() = request_generation;
+            *header.in_flight_mut() = true;
             Ok(next_request_id)
         })
     }
@@ -348,20 +351,17 @@ impl UdpReceiveSubmit {
         Self::cancel_raw_request_slice(requests, raw);
     }
 
-    pub(crate) fn cancel_raw_request_slice(
-        requests: &mut [crate::op::RawUdpReceiveRequest],
-        raw: RawHandle,
-    ) {
+    pub(crate) fn cancel_raw_request_slice(requests: &mut [RawUdpReceiveRequest], raw: RawHandle) {
         for request in requests {
             let slot_id = request.slot_id();
             let header = request.header_mut();
-            if !header.in_flight {
+            if !header.in_flight() {
                 continue;
             }
-            let overlapped = &mut header.inner as *mut Overlapped;
+            let overlapped = header.inner_mut() as *mut Overlapped;
             match unsafe { IoCompletionPort::cancel_request(raw.raw().as_handle(), overlapped) } {
                 Ok(CancelRequestResult::Submitted | CancelRequestResult::NotFound) => {}
-                Err(error) => tracing::error!(
+                Err(error) => error!(
                     error = ?error,
                     slot_id,
                     "failed to cancel raw UDP receive child"

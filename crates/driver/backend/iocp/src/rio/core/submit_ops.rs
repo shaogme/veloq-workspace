@@ -3,21 +3,23 @@
 //! This module defines operation inputs and delegates Windows calls to `dispatch`.
 //! 本模块定义操作输入，并将 Windows 调用委托给 `dispatch`。
 
+mod dispatch;
+
 use super::{
     RioAddressPolicy, RioCore, RioError, RioOpKind, RioPreparedRequest, RioResult, RioSubmitPlan,
     RioSubmitTxn, RioSubmittedRequest,
 };
 use crate::{
-    IoFd, config::BorrowedRawHandle, net::addr::SockAddrStorage, op::SubmissionResult,
-    rio::RioRuntime,
+    IoFd, config::BorrowedRawHandle, net::SockAddrStorage, op::SubmissionResult, rio::RioRuntime,
 };
 use diagweave::prelude::*;
+use tracing::error;
 use veloq_buf::FixedBuf;
-use veloq_driver_core::OpToken;
-use veloq_driver_core::{ReceivePumpError, ReceivePumpState, ReceiveReplacementReservation};
+use veloq_driver_core::{
+    OpToken, ReceivePumpError, ReceivePumpState, ReceiveReplacementReservation,
+};
 use veloq_std::string::ToString;
 
-mod dispatch;
 pub(crate) use dispatch::{
     RioBufferId, RioCq, RioDispatch, RioKernel, RioProvider, RioRq, RioRqConfig,
 };
@@ -396,7 +398,7 @@ impl<'a> RioSubmitOperations<'a> {
                         .runtime
                         .request_socket_receive_shutdown_for_cleanup(socket_key)
                     {
-                        tracing::error!(
+                        error!(
                             report = ?cancel_error,
                             socket_raw = socket_key.as_handle() as usize,
                             "failed to request cancellation after partial RIO receive startup"
