@@ -17,9 +17,7 @@ x-podman-engine: &podman-engine
     - SYS_RESOURCE
     - DAC_READ_SEARCH
     - AUDIT_WRITE
-  security_opt:
-    - seccomp:unconfined
-    - systempaths:unconfined
+  security_opt: ["seccomp:unconfined", "systempaths:unconfined", "label=disable"]
   group_add:
     - "${PODMAN_SOCKET_GID:-1000}"
   devices:
@@ -49,7 +47,7 @@ x-app-base: &app-base
   cap_add: [NET_ADMIN, SYS_ADMIN, SYS_PTRACE]
   group_add:
     - "${PODMAN_SOCKET_GID:-1000}"
-  security_opt: ["seccomp:unconfined", "apparmor:unconfined"]
+  security_opt: ["seccomp:unconfined", "apparmor:unconfined", "systempaths:unconfined", "label=disable"]
   devices:
     - /dev/kvm:/dev/kvm # QEMU KVM acceleration
     - /dev/net/tun:/dev/net/tun # QEMU TAP networking

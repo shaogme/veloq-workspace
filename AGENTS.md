@@ -2,49 +2,42 @@
 
 When making modifications to this repository, please adhere strictly to the following requirements. Failure to run and pass these checks will result in a Continuous Integration (CI) failure.
 
-**重要提示 (IMPORTANT):** 与用户沟通、提供解释及编写代码注释时，必须始终使用**简体中文**。
-
 ---
 
-## 1. 核心原则 (Core Principles)
+## 1. Core Principles
 
-### 1.1 交互与沟通语言
+### 1.1 Facts Before Edits (Read-Before-Modify Principle)
 
-所有交互、解释与答复必须使用**简体中文**。
+Inferring code logic, dependency chains, or file contents without verification is strictly prohibited. Before performing any code changes, architectural design, or issue troubleshooting, **you must thoroughly inspect all relevant source code and context files first**.
 
-### 1.2 事实先于修改（读取验证原则）
+### 1.2 Duty to Proactively Report Defects
 
-严禁凭空推断代码逻辑、依赖关系或文件内容。在进行任何代码修改、方案设计或问题解答之前，**必须先完整读取相关代码与上下文文件**。
+If you encounter latent logical flaws, security vulnerabilities, performance bottlenecks, or unhandled edge cases while reviewing or analyzing code, you must report them explicitly. Never conceal or ignore them.
 
-### 1.3 缺陷主动报告责任
+### 1.3 Comment Standards
 
-在阅读或分析代码过程中，若发现潜在逻辑漏洞、安全隐患、性能瓶颈或边界处理不当，必须主动指出并报告，不得隐瞒或忽略。
-
-### 1.4 注释规范
-
-* **语言要求**：代码注释必须使用中英双语。
-* **内容原则**：
-* 禁止无意义的废话注释（即“代码已经表达清楚的事情无需用中文重复一遍”）。
-* 仅用于解释复杂的业务意图、边界条件或算法关键设计。
-* **严禁将注释当作工作日志、技术方案草稿、重构备忘录或 PR 记录**。
+* **Content Principles**:
+* Prohibit redundant or trivial comments (i.e., do not state what the code already clearly expresses).
+* Use comments exclusively to explain complex business intent, edge-case handling, or critical algorithmic decisions.
+* **Never use comments as work logs, technical draft spaces, refactoring memos, or PR change records**.
 
 ```rust
-// Bad: 无意义描述，或夹带方案/重构历史说明
-// 定义一个计数器变量
+// Bad: Redundant description, or mixed with refactoring/history notes
+// Define a counter variable
 let mut count = 0;
-// 【重构方案第2步】：因旧逻辑会导致内存泄漏，临时保留该方案，后续引入 Arc 替换
+// [Refactoring Step 2]: Temporarily retained because the old logic caused memory leaks; replace with Arc later.
 
-// Good: 准确阐述业务意图与设计权衡
-// 采用指数退避重试机制，防止上游服务雪崩
+// Good: Clearly explains business rationale and engineering trade-offs
+// Use exponential backoff retry to prevent upstream service cascading failures
 let delay = base_delay * 2u32.pow(attempts);
 
 ```
 
-### 1.5 跨平台执行统一入口
+### 1.4 Unified Entry Point for Cross-Platform Execution
 
-所有 Linux/Windows 目标的 `test / clippy / check` **一律交给 `xtest-runner`**，并通过 `.cargo/config.toml` 别名调用，禁止自行拼接跨平台脚本命令。
+All `test / clippy / check` commands targeting Linux/Windows **must be delegated exclusively to `xtest-runner**` and invoked via `.cargo/config.toml` aliases. Manually composing custom cross-platform script commands is strictly prohibited.
 
-当前统一入口如下：
+The current unified entry points are as follows:
 
 ```toml
 xtest-linux
@@ -53,41 +46,41 @@ xclippy-linux
 xclippy-windows
 xcheck-linux
 xcheck-windows
+
 ```
 
-#### 平台路由强制规则 (Platform Routing Rules)
+#### Platform Routing Rules (Mandatory)
 
-1. **Windows 主机 -> Linux 目标**：
-   - Linux 相关命令一律在 Docker 内执行。
-   - 不允许在 Windows 主机直接原生运行 Linux 目标的编译/检查/测试。
+1. **Windows Host -> Linux Target**:
+    * All Linux-related commands must be executed inside Docker.
+    * Compiling, checking, or testing for Linux targets directly and natively on a Windows host is not permitted.
 
-2. **Linux 主机 -> Windows 目标**：
-   - Windows 相关命令一律通过 **QEMU Windows 虚拟机** 执行（当前使用 QEMU 而非 `cross`）。
-   - 不允许在 Linux 主机直接用 `cargo` 原生跑 Windows 目标。
-   - 由 `xtest-runner` 统一管理 QEMU 虚拟机的生命周期、SSH 等待、工作区同步及在虚拟机内部的原生执行。
-
+2. **Linux Host -> Windows Target**:
+    * All Windows-related commands must be executed via a **QEMU Windows Virtual Machine** (currently using QEMU rather than `cross`).
+    * Running Windows targets directly and natively with `cargo` on a Linux host is not permitted.
+    * `xtest-runner` centrally manages the QEMU VM lifecycle, SSH availability checks, workspace synchronization, and native execution inside the virtual machine.
 
 ---
 
-## 2. 格式与代码风格 (Code Style)
+## 2. Code Style
 
-### 2.1 模块文件组织（Strict Rust 2018+）
+### 2.1 Module File Organization (Strict Rust 2018+)
 
-**严禁使用遗留的 `mod.rs` 命名规范**，必须严格遵循 Rust 2018 Edition 及更高版本的模块目录结构：
+**Legacy `mod.rs` conventions are strictly forbidden.** All module layouts must adhere to the Rust 2018 Edition hierarchy:
 
-* 模块 `foo` 的入口定义必须位于 `foo.rs`。
-* 若 `foo` 拥有子模块，创建同名目录 `foo/`，子模块文件置于 `foo/` 内。
-* 父模块逻辑保留在 `foo.rs`，严禁使用 `foo/mod.rs`。
+* The entry definition for module `foo` must reside at `foo.rs`.
+* If `foo` defines child modules, create a matching directory named `foo/`, and place submodule files inside `foo/`.
+* The parent module's implementation logic remains in `foo.rs`; never use `foo/mod.rs`.
 
 ```text
-# Bad (Rust 2015 遗留风格)
+# Bad (Legacy Rust 2015 layout)
 src/
 ├── main.rs
 └── foo/
     ├── mod.rs
     └── sub.rs
 
-# Good (Rust 2018+ 规范风格)
+# Good (Idiomatic Rust 2018+ layout)
 src/
 ├── main.rs
 ├── foo.rs
@@ -96,16 +89,16 @@ src/
 
 ```
 
-### 2.2 禁止绕过 Lint（零容忍放宽属性）
+### 2.2 No Lint Bypassing (Zero-Tolerance Policy on Permissive Attributes)
 
-严禁添加全局或局部的放宽属性（如 `#[allow(...)]`、`#![allow(...)]`）来规避 Clippy 或编译器警告。**必须从代码设计层面根治问题**。
+Never introduce global or scoped bypass attributes (such as `#[allow(...)]` or `#![allow(...)]`) to silence Clippy or rustc compiler warnings. **Fix the root cause through proper code design.**
 
 ```rust
-// Bad: 通过 allow 绕过警告
+// Bad: Suppressing warnings with allow
 #[allow(clippy::too_many_arguments)]
 fn process_order(id: u64, user: String, item: String, qty: u32, price: f64, addr: String) {}
 
-// Good: 重构数据结构解决参数过多问题
+// Good: Refactoring data structures to eliminate excessive arguments
 struct OrderParams {
     id: u64,
     user: String,
@@ -119,23 +112,22 @@ fn process_order(params: OrderParams) {}
 
 ```
 
-### 2.3 顶级/同层级定义空行隔离
+### 2.3 Blank Line Isolation for Top-Level and Sibling Definitions
 
-同一层级的作用域内，结构体（`struct`）、枚举（`enum`）、函数（`fn`）、特征（`trait`）、常量（`const`）之间，**无论相邻类型是否相同，必须使用单个空行显式分隔**。
+Within the same immediate scope, `item_spacing` compares adjacent definitions of these kinds: `struct`, `enum`, `union`, type alias, trait, constant, `static`, function, and `impl` block. Every checked pair must have exactly one blank line, including an `impl` block next to any other checked kind and two adjacent `impl` blocks, except for the repeated same-kind definitions described below.
+
+**Exceptions:** Two consecutive constants, two consecutive `static` items, or two consecutive type aliases of the same AST kind may have zero or one blank line between them. `const fn` declarations are functions, not constants, so they require exactly one blank line next to every checked kind, including another function. All other checked pairs require exactly one blank line. These rules apply in both directions; for example, both `struct` followed by `impl` and `impl` followed by `struct` require one blank line. Items outside the listed kinds remain structural boundaries: comparisons do not skip over them to reach a later checked item. Pairs whose `cfg` conditions are provably mutually exclusive are not compared.
 
 ```rust
-// Bad: 顶层定义紧凑无空行
-struct User {
-    id: u64,
-}
-struct Role {
-    name: String,
-}
-fn get_user() -> User {
-    User { id: 1 }
-}
+const FIRST: u8 = 1;
+const SECOND: u8 = 2;
 
-// Good: 同层级定义之间以单空行分隔
+static FIRST_STATIC: u8 = 1;
+static SECOND_STATIC: u8 = 2;
+
+type FirstAlias = u8;
+type SecondAlias = u8;
+
 struct User {
     id: u64,
 }
@@ -152,56 +144,61 @@ fn get_user() -> User {
 
 ---
 
-## 3. 架构与模块约束 (Module & Architecture Constraints)
+## 3. Module & Architecture Constraints
 
-### 3.1 子模块可见性与依赖流向
+### 3.1 Submodule Visibility and Dependency Direction
 
-* **子模块声明私有化**：父模块声明子模块时，必须声明为私有（`mod child;`），**严禁声明为 `pub mod child;` 或 `pub(crate) mod child;**`。
-* **单向依赖控制**：
-* 允许同级子模块之间相互引用（`use crate::parent::sibling;`）。
-* **严禁子模块反向依赖父模块的私有实现**：禁止在子模块内使用 `super::*` 或绝对路径读取父模块的内部未公开实现；必要的数据与状态应通过参数向下传递。
+* **Submodules Are Private by Default**: When a parent module registers a submodule, it must default to private visibility (`mod child;`). `pub` or `pub(crate)` is permitted only if the submodule consists exclusively of module declarations, private/`pub`/`pub(crate)` `use` imports, `macro_rules!` definitions, type aliases, structs, enums, traits, unions, constants, or static variables. Submodules containing functions, `impl` blocks, `extern crate`, scoped imports like `pub(super)` / `pub(in path)`, macro invocations, or unrecognized items do not qualify for this exception.
+* **Unidirectional Dependency Control**:
+* Sibling submodules may import one another (`use crate::parent::sibling;`).
+* **Submodules must never depend backward on private implementations of parent modules**: Do not use `super::*` or absolute crate paths inside a submodule to read unexposed internal details from the parent module. Supply all required context and state explicitly downward via function arguments.
 
 ```rust
-// ===== 父模块 (parent.rs) =====
+// ===== Parent Module (parent.rs) =====
 
-// Bad: 公开暴露子模块
+// Bad: Exposing a submodule containing executable implementations
 pub mod child;
 
-// Good: 子模块必须完全私有
+// Good: Default private submodule
 mod child;
+
+// Good: A submodule containing purely declarative definitions may be public
+pub mod declarations {
+    pub struct Record;
+}
 
 ```
 
 ```rust
-// ===== 子模块 (parent/child.rs) =====
+// ===== Submodule (parent/child.rs) =====
 
-// Bad: 反向引用父模块的私有上下文
+// Bad: Reverse reference to private parent context
 use super::ParentContext;
 
-// Good: 仅依赖同级模块或公共抽象，状态通过入参传入
+// Good: Depend only on siblings or public abstractions; pass state via arguments
 use crate::sibling::SiblingService;
 
 ```
 
-### 3.2 子模块代码行数限制
+### 3.2 Submodule Line Count Bounds
 
-在运行 `cargo fmt` 格式化后，单个子模块源文件的**有效代码行数**必须满足：**70 行 ≤ 有效行数 ≤ 800 行**。
+After applying `cargo fmt`, any individual submodule source file must satisfy the following **effective lines of code (ELOC)** threshold: **70 lines ≤ ELOC ≤ 800 lines**.
 
-* **统计规则**：剔除纯空行、单行/多行注释、以及测试代码块（即 `#[cfg(test)]` 标记的模块或代码）。
-* **处理要求**：低于 70 行应考虑与同类小模块合并；超过 800 行必须按单一职责拆分子模块。
+* **Measurement Rules**: Blank lines, single/multi-line comment blocks, and test scopes (annotated via `#[cfg(test)]`) are excluded from this count.
+* **Remediation**: Files below 70 lines should be merged into related modules; files exceeding 800 lines must be split into dedicated submodules following the Single Responsibility Principle.
 
-### 3.3 模块实现（Impl）作用域隔离
+### 3.3 Module Implementation (`impl`) Scope Isolation
 
-模块内部仅允许为**当前文件所定义的结构体或枚举**编写 `impl` 块。
+An `impl` block inside a module may only target **structs or enums defined within that immediate file**.
 
-* 严禁跨文件/跨模块为父模块、同级模块或外部 crate 的类型提供固有实现（Inherent impl）。
-* **语言内置类型与标准库类型例外**：为 Rust 语言内置类型（如 `bool`、整数、浮点数和数组）或标准库类型（包括 `std`、`core`、`alloc` 中的类型，如 `String`、`Option<T>`、`Vec<T>`、`BTreeMap<K, V>`、`HashMap<K, V>`）实现 Trait 时，不受“类型定义必须位于当前文件”的限制。
-* 该例外仅适用于符合 Rust 孤儿规则的 **Trait impl**，不允许为内置类型或标准库类型添加固有实现，也不扩展到仓库自定义类型或第三方 crate 类型；其他结构、可见性和导入规范仍须遵守。
+* Never write inherent implementations (`impl`) across files or modules for types defined in parent modules, sibling modules, or external crates.
+* **Primitive and Standard Library Type Exceptions**: Implementing traits on Rust primitive types (e.g., `bool`, numeric types, floats, arrays) or standard library types from `std`, `core`, and `alloc` (e.g., `String`, `Option<T>`, `Vec<T>`, `BTreeMap<K, V>`, `HashMap<K, V>`) is exempt from the requirement that the target type be declared in the current file.
+* This exception strictly applies to **Trait implementations** conforming to Rust's orphan rules. It does not allow inherent implementations on primitive/standard library types, nor does it extend to project-defined types or external crate types located in other modules. Visibility, structural integrity, and import conventions must still be maintained.
 
 ```rust
-// ===== 当前模块 (service.rs) =====
+// ===== Current Module (service.rs) =====
 
-// Bad: 跨模块为外部/父级类型实现方法
+// Bad: Implementing methods on external or parent types across module boundaries
 impl super::ParentState {
     fn update(&mut self) {}
 }
@@ -210,7 +207,7 @@ impl crate::other::ExternalType {
     fn handle(&self) {}
 }
 
-// Good: 仅为当前模块内声明的类型编写实现
+// Good: Only write implementations for types declared in the current module
 struct LocalService;
 
 impl LocalService {
@@ -219,18 +216,18 @@ impl LocalService {
 
 ```
 
-### 3.4 字段私有化与函数可见性
+### 3.4 Field Encapsulation and Function Visibility
 
-* **结构体字段私有化**：
-* **纯数据结构（DTO）**：仅当结构体**没有任何 `impl` 实现**（包括固有实现与 Trait 实现）时，其成员字段才允许设为 `pub` 或 `pub(crate)`。
-* **业务逻辑结构**：凡是存在 `impl` 实现的结构体，**所有成员变量必须保持私有（private）**，外部访问必须通过方法暴露。
+* **Struct Field Encapsulation**:
+* **Pure Data Transfer Objects (DTOs)**: Member fields may only be marked `pub` or `pub(crate)` if the struct contains **no `impl` blocks of any kind** (neither inherent nor trait implementations).
+* **Domain / Logic Structures**: Any struct carrying an `impl` block must keep **all member fields strictly private**. Expose state externally exclusively through accessor methods.
 
-* **独立函数可见性**：子模块内部严禁定义非私有的独立函数（禁止 `pub fn helper()`）。如需对外暴露能力，应将其定义为结构体的关联函数（Associated Functions）或方法。
+* **Standalone Function Visibility**: Independent functions in submodules must not be public (no `pub fn helper()`). Expose functional capabilities via associated functions or methods attached to a struct instead.
 
 ```rust
-// ===== 子模块内部 (child.rs) =====
+// ===== Inside Submodule (child.rs) =====
 
-// Bad: 包含 impl 的结构体对外暴露了公有成员变量
+// Bad: Struct with an impl block exposes public fields
 pub struct Worker {
     pub task_id: u64,
 }
@@ -241,18 +238,18 @@ impl Worker {
     }
 }
 
-// Bad: 子模块内暴露公开的独立函数
+// Bad: Standalone public function exposed from a submodule
 pub fn calculate_hash(data: &[u8]) -> u64 {
     // ...
 }
 
-// Good: 无任何 impl 的纯 DTO 允许暴露字段
+// Good: Pure DTO without any impl blocks exposes fields directly
 pub struct DataDto {
     pub id: u64,
     pub name: String,
 }
 
-// Good: 包含业务行为的结构体字段严格私有，通过方法暴露
+// Good: Struct with domain logic keeps fields private and exposes accessor methods
 pub struct Worker {
     task_id: u64,
 }
@@ -269,21 +266,129 @@ impl Worker {
 
 ```
 
----
+### 3.5 Declaration Before Use
 
-## 4. 类型与接口质量约束 (Type & Interface Quality)
-
-### 4.1 参数与元组复杂度限制
-
-* **函数与方法参数上限**：独立函数（`fn`）与关联方法（`method`）的入参总数**严禁超过 5 个**。超过 5 个必须重构为配置对象或参数结构体（Params / Options）。
-* **闭包参数上限**：闭包参数**严禁超过 5 个**。
-* **元组（Tuple）容量上限**：严禁定义超过 2 个成员的元组。包含 3 个或以上元素的组合必须封装为具有明确语义的具名结构体。
+Within a single module, **every type declaration (including `struct`, `enum`, `type` aliases, `trait`, `const`, etc.) must appear prior to where it is consumed**. Instantiating, calling, or referencing a type before its declaration statement is strictly forbidden. The file must be structured so that definitions sit on top, with consumers and logic placed below.
 
 ```rust
-// Bad: 函数参数超过 5 个
+// Bad: Referenced in a function/variable before being declared
+fn process_payload(payload: RequestPayload) {
+    let _timeout = DEFAULT_TIMEOUT_MS;
+    // ...
+}
+
+const DEFAULT_TIMEOUT_MS: u64 = 5000;
+
+struct RequestPayload {
+    data: String,
+}
+
+// Good: All types and constants are declared before being used
+const DEFAULT_TIMEOUT_MS: u64 = 5000;
+
+struct RequestPayload {
+    data: String,
+}
+
+fn process_payload(payload: RequestPayload) {
+    let _timeout = DEFAULT_TIMEOUT_MS;
+    // ...
+}
+
+```
+
+### 3.6 External Module Paths Must Not Traverse Parent Directories
+
+In external module declarations (i.e., `mod name;` ending with a semicolon), the `#[path]` string literal, once decoded per Rust string literal rules, must not contain a `..` parent-directory component. Both `/` and `\` are treated as path separators. Names such as `foo..rs` or `.../child.rs` are not considered parent-directory components. Even if a path resolves inside the base directory after canonicalization, the explicit presence of a `..` component is strictly prohibited.
+
+This constraint also applies to nested `path` attributes inside `cfg_attr`, regardless of whether the target configuration, target platform, or feature flag is active. It does not apply to inline modules (defined with braces: `mod name { ... }`).
+
+```rust
+// Bad: The path contains a parent-directory component
+#[path = "../shared.rs"]
+mod shared;
+
+// Good: The path resolves strictly within the current directory
+#[path = "shared.rs"]
+mod shared;
+
+```
+
+### 3.7 Avoid Unnecessary Crate Visibility
+
+Give an item or associated item `pub(crate)` only if it is referenced from outside its declaring module and that module's descendants, or if another crate-visible API signature that must remain available refers to it. If its references are confined to its declaring module tree, use private visibility instead.
+
+This rule applies only to named declarations whose visibility is exactly `pub(crate)`: module declarations (`mod`); `extern crate` names and individual `use` aliases; structs, enums, unions, type aliases, traits, functions, constants, and statics; foreign functions and statics; and associated functions, type aliases, constants, or statics in traits and `impl` blocks. It does not report `pub`, `pub(super)`, or other `pub(in path)` visibility, struct fields, enum variants, or glob imports themselves.
+
+```rust
+// Bad: Both items are used only within their private module.
+mod parser {
+    pub(crate) struct State;
+    pub(crate) fn reset() {}
+
+    fn parse() {
+        let _ = State;
+        reset();
+    }
+}
+
+// Good: A sibling module uses State, so it needs crate visibility.
+mod parser {
+    pub(crate) struct State;
+}
+
+mod driver {
+    use crate::parser::State;
+
+    fn run(_: State) {}
+}
+```
+
+When a crate-visible API declaration must remain accessible, types and other items referenced by its signature may also need `pub(crate)`. Do not reduce visibility based on an incomplete view: unresolved syntax or macro invocations can hide references, so retain visibility when usage cannot be determined reliably.
+
+### 3.8 Explicit Path-Restricted Visibility Is Forbidden
+
+Never use explicit `pub(in path)` visibility on items, `use` imports, foreign items, fields, or associated declarations. Choose private visibility, `pub`, `pub(crate)`, `pub(super)`, or `pub(self)` according to the intended access boundary. If these forms cannot express the required boundary, restructure the module or API.
+
+```rust
+// Bad: Explicit path-restricted visibility
+mod service {
+    pub(in crate::service) struct Request;
+
+    pub(in crate::service) use crate::model::Record;
+
+    pub struct Response {
+        pub(in crate::service) status: u16,
+    }
+}
+
+// Good: Use supported visibility forms
+mod service {
+    pub(crate) struct Request;
+
+    pub(super) use crate::model::Record;
+
+    pub struct Response {
+        pub(self) status: u16,
+    }
+}
+```
+
+---
+
+## 4. Type & Interface Quality
+
+### 4.1 Parameter and Tuple Complexity Limits
+
+* **Function & Method Parameter Ceiling**: Free functions (`fn`) and associated methods (`method`) **must not take more than 5 parameters**. When parameter counts exceed 5, refactor them into a structured parameter object or configuration struct (`Params` / `Options`).
+* **Closure Parameter Ceiling**: Closures **must not take more than 5 parameters**.
+* **Tuple Capacity Ceiling**: Tuples with more than 2 elements are forbidden. Combinations of 3 or more elements must be packaged into a named struct with distinct, semantic field names.
+
+```rust
+// Bad: Function exceeds 5 parameters
 fn query_logs(app: &str, level: u8, start: u64, end: u64, limit: usize, offset: usize) {}
 
-// Good: 超过 5 个参数收敛为结构体
+// Good: Parameters consolidated into a dedicated struct
 struct LogFilter<'a> {
     app: &'a str,
     level: u8,
@@ -295,35 +400,35 @@ struct LogFilter<'a> {
 
 fn query_logs(filter: LogFilter) {}
 
-// Bad: 元组超过 2 个成员
+// Bad: Tuple with more than 2 members
 type Point3D = (f64, f64, f64);
 
-// Good: 多于 2 个成员使用具名结构体
+// Good: Use a named struct for multi-element data
 struct Point3D {
     x: f64,
     y: f64,
     z: f64,
 }
 
-// Good: 允许最多 2 个元素的简单元组（如键值对）
+// Good: Simple 2-element tuples (e.g., key-value pairs) are permitted
 type KeyValue = (String, Vec<u8>);
 
 ```
 
 ---
 
-## 5. 引用与导入规范 (Import & Use Directives)
+## 5. Import & Use Directives
 
-### 5.1 禁止行内全限定命名空间调用
+### 5.1 Prohibit Inline Fully-Qualified Namespace Calls
 
-严禁在业务代码中直接使用绝对路径调用类型或函数。必须先在文件顶部使用 `use` 显式导入后再调用。
+Direct invocations using inline fully-qualified paths in business logic are strictly forbidden. Always import the target symbol explicitly with a `use` statement at the top of the file before invoking it.
 
 ```rust
-// Bad: 行内使用全限定路径
+// Bad: Inline fully-qualified path call
 let file = std::fs::File::open("config.json")?;
 let duration = std::time::Duration::from_secs(5);
 
-// Good: 先导入后使用
+// Good: Import first, then consume
 use std::{fs::File, time::Duration};
 
 let file = File::open("config.json")?;
@@ -331,18 +436,18 @@ let duration = Duration::from_secs(5);
 
 ```
 
-### 5.2 合并同前缀导入
+### 5.2 Merge Imports with Shared Prefixes
 
-相同根路径或前缀的导入项，必须使用花括号合并为单条 `use` 语句，禁止重复书写相同前缀。
+Imports sharing the same root path or prefix must be unified into a single grouped `use` statement using nested braces. Do not repeat identical prefixes across multiple statements.
 
 ```rust
-// Bad: 重复前缀
+// Bad: Repeated prefixes
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::path::Path;
 use std::path::PathBuf;
 
-// Good: 前缀合并
+// Good: Consolidated prefixes
 use std::{
     fs::{File, OpenOptions},
     path::{Path, PathBuf},
@@ -350,12 +455,12 @@ use std::{
 
 ```
 
-### 5.3 `use` 声明集中置顶
+### 5.3 Consolidate `use` Statements at the Top
 
-当前文件或作用域内的所有 `use` 语句必须**统一集中放置在文件顶部区域**。严禁将 `use` 语句穿插在常量定义、结构体、函数或业务实现逻辑之间。
+All `use` declarations in a file or scope must be **grouped cleanly at the top of the file**. Never interleave `use` statements between constants, structs, functions, or implementation code.
 
 ```rust
-// Bad: use 语句散落穿插在代码中
+// Bad: use statements scattered throughout the file
 use std::collections::HashMap;
 
 const DEFAULT_TIMEOUT: u64 = 30;
@@ -367,7 +472,7 @@ pub struct Client;
 ```
 
 ```rust
-// Good: 所有 use 语句严格置顶，且与后续代码块以单空行分隔
+// Good: All use statements placed at the top, isolated by an empty line
 use std::{
     collections::HashMap,
     sync::Arc,
@@ -382,20 +487,20 @@ pub struct Client {
 
 ```
 
-### 5.4 条件编译 `cfg` 导入隔离
+### 5.4 Conditional Compilation (`cfg`) Import Isolation
 
-* **禁止括号内嵌套 `cfg**`：严禁在 `use { ... }` 内部嵌套使用 `#[cfg(...)]`。
-* **按编译条件分组**：相同 `#[cfg(...)]` 条件的 `use` 语句归为一组；不同编译条件的分组之间、以及条件组与无条件导入组之间，必须以**单空行显式分隔**。
+* **No Inlined `cfg` Inside Braces**: Never nest `#[cfg(...)]` attributes inside a braced `use { ... }` group.
+* **Group by Compilation Predicates**: Place `use` statements sharing the same `#[cfg(...)]` condition into distinct groups. Separate conditional blocks from one another and from unconditional imports with **exactly one blank line**.
 
 ```rust
-// Bad: 大括号内部嵌套 cfg 属性
+// Bad: Inlined cfg inside curly braces
 use std::{
     collections::HashMap,
     #[cfg(unix)]
     os::unix::fs::PermissionsExt,
 };
 
-// Good: 拆解为外层独立 cfg 语句，并按条件隔离分块
+// Good: Split into top-level statements grouped by target cfg
 use std::collections::HashMap;
 
 #[cfg(target_os = "linux")]
@@ -406,6 +511,32 @@ use std::os::windows::fs::MetadataExt as WinMetadataExt;
 
 ```
 
+### 5.5 Module Scope Declaration Order
+
+Top-level declarations in a module scope must adhere strictly to this sequence: `extern crate` statements, external module declarations (`mod name;`), `use` import blocks, followed by the remaining items. Each group may contain zero or more declarations. Outer attributes like `#[cfg(...)]` or `#[path = "..."]` remain attached to their respective declaration. Inline modules (`mod name { ... }`) are categorized as general items, and nested `use` statements within blocks follow standard block-level import rules.
+
+```rust
+extern crate legacy_dep;
+extern crate another_dep as alias;
+
+mod alpha;
+mod beta;
+
+use crate::alpha::Alpha;
+use alias::Thing;
+
+fn run() {}
+```
+
+```rust
+mod alpha;
+extern crate legacy_dep;
+
+use crate::alpha::Alpha;
+fn run() {}
+use crate::beta::Beta;
+```
+
 ---
 
-> **提交准则**：在提交代码（Commit/PR）之前，必须在本地完整运行测试与检查（包括 `cargo fmt --check`、`cargo clippy -- -D warnings` 与 `cargo test`）。如任一检查未通过，必须修复后方可提交。
+> **Submission Guidelines**: Prior to committing code or opening a pull request, run all verification suites locally (including `cargo fmt --check`, `cargo clippy -- -D warnings`, and `cargo test`). If any check fails, resolve the issues completely before pushing.
