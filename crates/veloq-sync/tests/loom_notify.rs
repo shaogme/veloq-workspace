@@ -3,7 +3,7 @@
 use loom::future::block_on;
 use loom::sync::Arc;
 use loom::thread;
-use veloq_sync::notify::Notify;
+use veloq_sync::Notify;
 
 #[test]
 fn loom_notify_one_basic() {

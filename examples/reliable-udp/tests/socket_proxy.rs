@@ -26,9 +26,8 @@ use veloq::{
         vec::Vec,
     },
     sync::{
-        TryRecvError, TrySendError,
-        mpmc::{BoundedReceiver, BoundedSender, bounded},
-        oneshot,
+        Mpmc as mpmc, MpmcBoundedReceiver as BoundedReceiver, MpmcBoundedSender as BoundedSender,
+        Oneshot as oneshot, OneshotReceiver, OneshotSender, TryRecvError, TrySendError,
     },
     time::sleep,
 };
@@ -219,14 +218,14 @@ pub struct ProxyDriver<'rt> {
     server_to_client: VecDeque<ProxyRule>,
     stats: [Arc<ProxyStats>; 2],
     action_observed: BoundedSender<()>,
-    ready: oneshot::Sender<Result<(), ProxyError>>,
-    shutdown: oneshot::Receiver<()>,
+    ready: OneshotSender<Result<(), ProxyError>>,
+    shutdown: OneshotReceiver<()>,
 }
 
 pub struct ProxyHandle {
-    ready: Option<oneshot::Receiver<Result<(), ProxyError>>>,
+    ready: Option<OneshotReceiver<Result<(), ProxyError>>>,
     action_observed: Option<BoundedReceiver<()>>,
-    shutdown: Option<oneshot::Sender<()>>,
+    shutdown: Option<OneshotSender<()>>,
 }
 
 impl ProxyHandle {
@@ -255,7 +254,7 @@ impl<'rt> SocketProxy<'rt> {
     pub fn bind(ctx: Ctx<'rt>, max_datagram_size: NonZeroUsize) -> Result<Self, ProxyError> {
         let client_side = UdpSocket::bind(ctx, "127.0.0.1:0").map_err(|_| ProxyError::Io)?;
         let server_side = UdpSocket::bind(ctx, "127.0.0.1:0").map_err(|_| ProxyError::Io)?;
-        let (action_observed, action_receiver) = bounded(1);
+        let (action_observed, action_receiver) = mpmc::bounded(1);
         Ok(Self {
             ctx,
             max_datagram_size,
@@ -344,13 +343,13 @@ impl ProxyDriver<'_> {
         } = self;
 
         let result = {
-            let (driver_events, mut driver_event_receiver) = bounded(EVENT_CAPACITY);
-            let (client_inbound, client_inbound_receiver) = bounded(CHANNEL_CAPACITY);
-            let (client_outbound, client_outbound_receiver) = bounded(CHANNEL_CAPACITY);
-            let (client_completions, client_completion_receiver) = bounded(CHANNEL_CAPACITY);
-            let (server_inbound, server_inbound_receiver) = bounded(CHANNEL_CAPACITY);
-            let (server_outbound, server_outbound_receiver) = bounded(CHANNEL_CAPACITY);
-            let (server_completions, server_completion_receiver) = bounded(CHANNEL_CAPACITY);
+            let (driver_events, mut driver_event_receiver) = mpmc::bounded(EVENT_CAPACITY);
+            let (client_inbound, client_inbound_receiver) = mpmc::bounded(CHANNEL_CAPACITY);
+            let (client_outbound, client_outbound_receiver) = mpmc::bounded(CHANNEL_CAPACITY);
+            let (client_completions, client_completion_receiver) = mpmc::bounded(CHANNEL_CAPACITY);
+            let (server_inbound, server_inbound_receiver) = mpmc::bounded(CHANNEL_CAPACITY);
+            let (server_outbound, server_outbound_receiver) = mpmc::bounded(CHANNEL_CAPACITY);
+            let (server_completions, server_completion_receiver) = mpmc::bounded(CHANNEL_CAPACITY);
 
             let scoped = scope!(ctx, async |scope| {
                 let mut tasks = ProxyTasks {
@@ -564,7 +563,7 @@ enum DriverEvent {
 async fn wait_for_startup(
     ctx: Ctx<'_>,
     events: &mut DriverEventReceiver,
-    shutdown: &mut oneshot::Receiver<()>,
+    shutdown: &mut OneshotReceiver<()>,
 ) -> Result<(), ProxyError> {
     let mut ready = [[false; 3]; 2];
     while !(ready[0].iter().all(|value| *value) && ready[1].iter().all(|value| *value)) {

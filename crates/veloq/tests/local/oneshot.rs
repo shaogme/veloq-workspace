@@ -1,7 +1,7 @@
 use veloq_std::ops::AsyncFnOnce;
 
 use veloq::{
-    local::oneshot,
+    local::{Oneshot, TryRecvError},
     nz,
     runtime::{Runtime, context::Ctx, scope_local},
 };
@@ -20,7 +20,7 @@ where
 #[test]
 fn test_send_recv() {
     run_test(async |ctx| {
-        oneshot::with_borrowed_channel(async |tx, rx| {
+        Oneshot::with_borrowed_channel(async |tx, rx| {
             scope_local!(ctx, async |s| {
                 s.spawn_boxed_local(async move {
                     tx.send(42).unwrap();
@@ -38,7 +38,7 @@ fn test_send_recv() {
 #[test]
 fn test_tx_closed() {
     run_test(async |_ctx| {
-        oneshot::with_borrowed_channel::<i32, _, _>(async |tx, rx| {
+        Oneshot::with_borrowed_channel::<i32, _, _>(async |tx, rx| {
             drop(tx);
             assert!(rx.await.is_err());
         })
@@ -49,7 +49,7 @@ fn test_tx_closed() {
 #[test]
 fn test_rx_closed() {
     run_test(async |_ctx| {
-        oneshot::with_borrowed_channel::<i32, _, _>(async |tx, rx| {
+        Oneshot::with_borrowed_channel::<i32, _, _>(async |tx, rx| {
             assert!(!tx.is_closed());
             drop(rx);
             assert!(tx.is_closed());
@@ -64,14 +64,14 @@ fn test_rx_closed() {
 #[test]
 fn test_try_recv() {
     run_test(async |_ctx| {
-        oneshot::with_borrowed_channel(async |tx, rx| {
-            assert_eq!(rx.try_recv(), Err(oneshot::TryRecvError::Empty));
+        Oneshot::with_borrowed_channel(async |tx, rx| {
+            assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
 
             tx.send(100).unwrap();
 
             assert_eq!(rx.try_recv(), Ok(100));
 
-            assert_eq!(rx.try_recv(), Err(oneshot::TryRecvError::Closed));
+            assert_eq!(rx.try_recv(), Err(TryRecvError::Closed));
         })
         .await;
     });
@@ -80,7 +80,7 @@ fn test_try_recv() {
 #[test]
 fn test_drop_tx_notify() {
     run_test(async |ctx| {
-        oneshot::with_borrowed_channel::<i32, _, _>(async |tx, rx| {
+        Oneshot::with_borrowed_channel::<i32, _, _>(async |tx, rx| {
             scope_local!(ctx, async |s| {
                 let handle = s.spawn_boxed_local(rx);
 
@@ -100,7 +100,7 @@ fn test_drop_tx_notify() {
 #[test]
 fn test_send_before_recv() {
     run_test(async |_ctx| {
-        oneshot::with_borrowed_channel(async |tx, rx| {
+        Oneshot::with_borrowed_channel(async |tx, rx| {
             tx.send("hello").unwrap();
             assert_eq!(rx.await.unwrap(), "hello");
         })
@@ -111,7 +111,7 @@ fn test_send_before_recv() {
 #[test]
 fn test_owned_oneshot() {
     run_test(async |ctx| {
-        let (tx, rx) = oneshot::channel();
+        let (tx, rx) = Oneshot::channel();
 
         scope_local!(ctx, async |s| {
             s.spawn_boxed_local(async move {

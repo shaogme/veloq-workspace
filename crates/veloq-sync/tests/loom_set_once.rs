@@ -8,7 +8,7 @@ use veloq_std::future::Future;
 use veloq_std::pin::pin;
 use veloq_std::ptr;
 use veloq_std::task::{Context, RawWaker, RawWakerVTable, Waker};
-use veloq_sync::set_once::SetOnce;
+use veloq_sync::SetOnce;
 
 fn noop_waker() -> Waker {
     unsafe fn clone(_: *const ()) -> RawWaker {

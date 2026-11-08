@@ -1,17 +1,21 @@
 #![cfg(not(feature = "loom"))]
-use std::task::{Context, RawWaker, RawWakerVTable, Waker};
+use std::{
+    ptr::null,
+    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+};
+use tokio::{spawn, time::sleep};
 
 use veloq_std::{future::Future, sync::Arc, time::Duration};
-use veloq_sync::rwlock::RwLock;
+use veloq_sync::RwLock;
 
 fn noop_waker() -> Waker {
     unsafe fn clone(_: *const ()) -> RawWaker {
-        RawWaker::new(std::ptr::null(), &VTABLE)
+        RawWaker::new(null(), &VTABLE)
     }
 
     static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, |_| {}, |_| {}, |_| {});
 
-    unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    unsafe { Waker::from_raw(RawWaker::new(null(), &VTABLE)) }
 }
 
 #[tokio::test]
@@ -35,7 +39,7 @@ async fn test_rwlock_contention() {
     // Writers
     for _ in 0..10 {
         let lock = lock.clone();
-        tasks.push(tokio::spawn(async move {
+        tasks.push(spawn(async move {
             for _ in 0..100 {
                 let mut guard = lock.write().await;
                 *guard += 1;
@@ -46,7 +50,7 @@ async fn test_rwlock_contention() {
     // Readers
     for _ in 0..10 {
         let lock = lock.clone();
-        tasks.push(tokio::spawn(async move {
+        tasks.push(spawn(async move {
             for _ in 0..100 {
                 let guard = lock.read().await;
                 assert!(*guard >= 0);
@@ -71,14 +75,14 @@ async fn test_rwlock_downgrade() {
 
     // 2. Spawn a reader that waits
     let lock_clone = lock.clone();
-    let reader_handle = tokio::spawn(async move {
+    let reader_handle = spawn(async move {
         // This should block until downgrade or unlock
         let guard = lock_clone.read().await;
         *guard
     });
 
     // Ensure reader spawns and likely hits the lock
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    sleep(Duration::from_millis(50)).await;
 
     // 3. Downgrade
     // This transitions from Write -> Read and should wake the reader.
@@ -166,11 +170,11 @@ trait PollExt<T> {
     fn unwrap_ready(self) -> T;
 }
 
-impl<T> PollExt<T> for std::task::Poll<T> {
+impl<T> PollExt<T> for Poll<T> {
     fn unwrap_ready(self) -> T {
         match self {
-            std::task::Poll::Ready(value) => value,
-            std::task::Poll::Pending => panic!("future did not become ready"),
+            Poll::Ready(value) => value,
+            Poll::Pending => panic!("future did not become ready"),
         }
     }
 }

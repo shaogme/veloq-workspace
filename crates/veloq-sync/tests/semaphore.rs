@@ -1,12 +1,27 @@
 #![cfg(not(feature = "loom"))]
 
-use std::sync::Arc as StdArc;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::time::Duration;
-use tokio::time::sleep;
-use veloq_std::sync::Arc;
-use veloq_std::task::{Context, RawWaker, RawWakerVTable, Waker};
-use veloq_sync::semaphore::{AcquireError, AddPermitsError, Semaphore, TryAcquireError};
+use std::{
+    pin::Pin,
+    sync::{
+        Arc as StdArc,
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    },
+    task::Poll,
+    time::Duration,
+};
+use tokio::{
+    spawn,
+    sync::{Mutex as TokioMutex, oneshot::channel as oneshot_channel},
+    task::yield_now,
+    time::sleep,
+};
+use veloq_std::{
+    sync::Arc,
+    task::{Context, RawWaker, RawWakerVTable, Waker},
+};
+use veloq_sync::{
+    AcquireError, AddPermitsError, Semaphore, SemaphoreAcquireFuture, TryAcquireError,
+};
 
 struct ReentrantWakeData {
     semaphore: StdArc<Semaphore>,
@@ -44,15 +59,9 @@ fn reentrant_waker(data: StdArc<ReentrantWakeData>) -> Waker {
     unsafe { Waker::from_raw(RawWaker::new(data, &VTABLE)) }
 }
 
-fn poll_pending<'a>(
-    future: &mut std::pin::Pin<Box<veloq_sync::semaphore::SemaphoreAcquireFuture<'a>>>,
-    waker: &Waker,
-) {
+fn poll_pending<'a>(future: &mut Pin<Box<SemaphoreAcquireFuture<'a>>>, waker: &Waker) {
     let mut cx = Context::from_waker(waker);
-    assert!(matches!(
-        future.as_mut().poll(&mut cx),
-        std::task::Poll::Pending
-    ));
+    assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
 }
 
 #[tokio::test]
@@ -101,7 +110,7 @@ fn test_semaphore_permit_wake_reenters_after_unlock() {
     assert_eq!(data.wakes.load(AtomicOrdering::SeqCst), 1);
     let mut cx = Context::from_waker(&waker);
     let permit = match future.as_mut().poll(&mut cx) {
-        std::task::Poll::Ready(Ok(permit)) => permit,
+        Poll::Ready(Ok(permit)) => permit,
         other => panic!("unexpected poll result: {other:?}"),
     };
     assert_eq!(permit.num_permits(), 1);
@@ -125,7 +134,7 @@ fn test_semaphore_close_wake_reenters_after_unlock() {
     let mut cx = Context::from_waker(&waker);
     assert!(matches!(
         future.as_mut().poll(&mut cx),
-        std::task::Poll::Ready(Err(AcquireError::Closed))
+        Poll::Ready(Err(AcquireError::Closed))
     ));
 }
 
@@ -163,7 +172,7 @@ async fn test_semaphore_contention() {
     for _ in 0..10 {
         let sem = sem.clone();
         let active = active.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(spawn(async move {
             for _ in 0..20 {
                 let permit = sem.acquire().await.unwrap();
                 let count = active.fetch_add(1, AtomicOrdering::SeqCst) + 1;
@@ -190,21 +199,21 @@ async fn test_semaphore_contention() {
 #[tokio::test]
 async fn test_semaphore_fifo_order() {
     let sem = Arc::new(Semaphore::new(0));
-    let order = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let order = Arc::new(TokioMutex::new(Vec::new()));
     let mut handles = Vec::new();
 
     for i in 1..=3 {
         let sem = sem.clone();
         let order = order.clone();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        handles.push(tokio::spawn(async move {
+        let (tx, rx) = oneshot_channel();
+        handles.push(spawn(async move {
             let fut = sem.acquire();
             let _ = tx.send(());
             let _permit = fut.await.unwrap();
             order.lock().await.push(i);
         }));
         rx.await.unwrap();
-        tokio::task::yield_now().await;
+        yield_now().await;
     }
 
     // Sequentially release permits
@@ -228,19 +237,19 @@ async fn test_semaphore_cancellation_waiting() {
     let guard = sem.acquire().await.unwrap();
 
     let sem1 = sem.clone();
-    let (tx1, rx1) = tokio::sync::oneshot::channel();
-    let t1 = tokio::spawn(async move {
+    let (tx1, rx1) = oneshot_channel();
+    let t1 = spawn(async move {
         let fut = sem1.acquire();
         let _ = tx1.send(());
         fut.await.unwrap();
     });
 
     rx1.await.unwrap();
-    tokio::task::yield_now().await;
+    yield_now().await;
 
     let sem2 = sem.clone();
-    let (tx2, rx2) = tokio::sync::oneshot::channel();
-    let t2 = tokio::spawn(async move {
+    let (tx2, rx2) = oneshot_channel();
+    let t2 = spawn(async move {
         let fut = sem2.acquire();
         let _ = tx2.send(());
         let permit = fut.await.unwrap();
@@ -248,7 +257,7 @@ async fn test_semaphore_cancellation_waiting() {
     });
 
     rx2.await.unwrap();
-    tokio::task::yield_now().await;
+    yield_now().await;
 
     // t1 is waiting, cancel it
     t1.abort();
@@ -269,25 +278,25 @@ async fn test_semaphore_cancellation_granted() {
     let sem1 = sem.clone();
     let sem2 = sem.clone();
 
-    let (tx1, rx1) = tokio::sync::oneshot::channel();
-    let t1 = tokio::spawn(async move {
+    let (tx1, rx1) = oneshot_channel();
+    let t1 = spawn(async move {
         let fut = sem1.acquire();
         let _ = tx1.send(());
         fut.await.unwrap();
     });
 
     rx1.await.unwrap();
-    tokio::task::yield_now().await;
+    yield_now().await;
 
-    let (tx2, rx2) = tokio::sync::oneshot::channel();
-    let t2 = tokio::spawn(async move {
+    let (tx2, rx2) = oneshot_channel();
+    let t2 = spawn(async move {
         let fut = sem2.acquire();
         let _ = tx2.send(());
         let _permit = fut.await.unwrap();
     });
 
     rx2.await.unwrap();
-    tokio::task::yield_now().await;
+    yield_now().await;
 
     // Dropping guard grants permit to t1
     drop(guard);
@@ -306,19 +315,19 @@ async fn test_semaphore_cancellation_head_unblocks_tail() {
     let sem = Arc::new(Semaphore::new(0));
 
     let sem1 = sem.clone();
-    let (tx1, rx1) = tokio::sync::oneshot::channel();
-    let t1 = tokio::spawn(async move {
+    let (tx1, rx1) = oneshot_channel();
+    let t1 = spawn(async move {
         let fut = sem1.acquire_many(5);
         let _ = tx1.send(());
         fut.await.unwrap();
     });
 
     rx1.await.unwrap();
-    tokio::task::yield_now().await;
+    yield_now().await;
 
     let sem2 = sem.clone();
-    let (tx2, rx2) = tokio::sync::oneshot::channel();
-    let t2 = tokio::spawn(async move {
+    let (tx2, rx2) = oneshot_channel();
+    let t2 = spawn(async move {
         let fut = sem2.acquire_many(2);
         let _ = tx2.send(());
         let permit = fut.await.unwrap();
@@ -326,7 +335,7 @@ async fn test_semaphore_cancellation_head_unblocks_tail() {
     });
 
     rx2.await.unwrap();
-    tokio::task::yield_now().await;
+    yield_now().await;
 
     // Add 3 permits: not enough for t1 (needs 5), but enough for t2 (needs 2)
     sem.add_permits(3).unwrap();
@@ -348,9 +357,9 @@ async fn test_semaphore_close() {
     let permit = sem.acquire().await.unwrap();
 
     let sem1 = sem.clone();
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let (tx_res, rx_res) = tokio::sync::oneshot::channel();
-    let t1 = tokio::spawn(async move {
+    let (tx, rx) = oneshot_channel();
+    let (tx_res, rx_res) = oneshot_channel();
+    let t1 = spawn(async move {
         let fut = sem1.acquire();
         let _ = tx.send(());
         let res = fut.await;
@@ -358,7 +367,7 @@ async fn test_semaphore_close() {
     });
 
     rx.await.unwrap();
-    tokio::task::yield_now().await;
+    yield_now().await;
 
     // Close the semaphore
     sem.close();
@@ -396,7 +405,7 @@ async fn test_semaphore_add_permits() {
     let sem = Arc::new(Semaphore::new(0));
     let sem2 = sem.clone();
 
-    let handle = tokio::spawn(async move {
+    let handle = spawn(async move {
         let permit = sem2.acquire_many(3).await.unwrap();
         assert_eq!(permit.num_permits(), 3);
     });
@@ -415,23 +424,11 @@ async fn test_semaphore_capacity_and_overflow_boundaries() {
     assert_eq!(sem.capacity(), 3);
     assert_eq!(sem.available_permits(), 0);
     assert_eq!(sem.add_permits(3), Ok(()));
-    assert_eq!(
-        sem.add_permits(1),
-        Err(AddPermitsError {
-            requested: 1,
-            remaining: 0,
-        })
-    );
+    assert_eq!(sem.add_permits(1), Err(AddPermitsError::new(1, 0)));
     assert_eq!(sem.available_permits(), 3);
 
     let max = Semaphore::new(usize::MAX);
-    assert_eq!(
-        max.add_permits(1),
-        Err(AddPermitsError {
-            requested: 1,
-            remaining: 0,
-        })
-    );
+    assert_eq!(max.add_permits(1), Err(AddPermitsError::new(1, 0)));
 
     let near_max = Semaphore::with_capacity_and_permits(usize::MAX, usize::MAX - 1).unwrap();
     let permit = near_max.try_acquire().unwrap();

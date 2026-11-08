@@ -2,7 +2,7 @@
 
 use loom::future::block_on;
 use loom::thread;
-use veloq_sync::mpsc;
+use veloq_sync::Mpsc as mpsc;
 
 #[test]
 fn loom_mpsc_unbounded_recv_async() {

@@ -1,4 +1,6 @@
-use veloq_sync::{broadcast, mpmc, mpsc, oneshot, watch};
+use veloq_sync::{
+    Broadcast as broadcast, Mpmc as mpmc, Mpsc as mpsc, Oneshot as oneshot, Watch as watch,
+};
 
 async fn run() {
     let res = oneshot::with_borrowed_channel(async |tx, rx| {

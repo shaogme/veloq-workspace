@@ -1,9 +1,9 @@
 use std::{cell::Cell, future::pending, pin::pin, rc::Rc, time::Duration};
 use tokio::{
-    task::{LocalSet, yield_now},
-    time::sleep,
+    task::{LocalSet, spawn_local, yield_now},
+    time::{sleep, timeout},
 };
-use veloq_local::semaphore::{AcquireError, AddPermitsError, Semaphore, TryAcquireError};
+use veloq_local::{AcquireError, Semaphore, TryAcquireError};
 
 #[tokio::test]
 async fn test_local_semaphore_basic() {
@@ -72,7 +72,7 @@ async fn test_local_semaphore_contention() {
             for _ in 0..10 {
                 let sem = sem.clone();
                 let active = active.clone();
-                handles.push(tokio::task::spawn_local(async move {
+                handles.push(spawn_local(async move {
                     for _ in 0..20 {
                         let permit = sem.acquire().await.unwrap();
                         let count = active.get() + 1;
@@ -112,7 +112,7 @@ async fn test_local_semaphore_fifo_order() {
             for i in 1..=3 {
                 let sem = sem.clone();
                 let order = order.clone();
-                handles.push(tokio::task::spawn_local(async move {
+                handles.push(spawn_local(async move {
                     let _permit = sem.acquire().await.unwrap();
                     let mut list = order.take();
                     list.push(i);
@@ -146,13 +146,13 @@ async fn test_local_semaphore_cancellation_waiting() {
             let guard = sem.acquire().await.unwrap();
 
             let sem1 = sem.clone();
-            let t1 = tokio::task::spawn_local(async move {
+            let t1 = spawn_local(async move {
                 let _permit = sem1.acquire().await.unwrap();
                 pending::<()>().await;
             });
 
             let sem2 = sem.clone();
-            let t2 = tokio::task::spawn_local(async move {
+            let t2 = spawn_local(async move {
                 let permit = sem2.acquire().await.unwrap();
                 permit.num_permits()
             });
@@ -184,14 +184,14 @@ async fn test_local_semaphore_cancellation_granted() {
             let sem1 = sem.clone();
             let sem2 = sem.clone();
 
-            let t1 = tokio::task::spawn_local(async move {
+            let t1 = spawn_local(async move {
                 let fut = sem1.acquire();
                 let mut pinned = pin!(fut);
-                let _ = tokio::time::timeout(Duration::from_millis(5), &mut pinned).await;
+                let _ = timeout(Duration::from_millis(5), &mut pinned).await;
                 pending::<()>().await;
             });
 
-            let t2 = tokio::task::spawn_local(async move {
+            let t2 = spawn_local(async move {
                 let permit = sem2.acquire().await.unwrap();
                 permit.num_permits()
             });
@@ -222,12 +222,12 @@ async fn test_local_semaphore_cancellation_head_unblocks_tail() {
             let sem = Rc::new(Semaphore::new(0));
 
             let sem1 = sem.clone();
-            let t1 = tokio::task::spawn_local(async move {
+            let t1 = spawn_local(async move {
                 let _p = sem1.acquire_many(5).await.unwrap();
             });
 
             let sem2 = sem.clone();
-            let t2 = tokio::task::spawn_local(async move {
+            let t2 = spawn_local(async move {
                 let permit = sem2.acquire_many(2).await.unwrap();
                 permit.num_permits()
             });
@@ -260,7 +260,7 @@ async fn test_local_semaphore_close() {
             let permit = sem.acquire().await.unwrap();
 
             let sem1 = sem.clone();
-            let t1 = tokio::task::spawn_local(async move { sem1.acquire().await.is_err() });
+            let t1 = spawn_local(async move { sem1.acquire().await.is_err() });
 
             sleep(Duration::from_millis(20)).await;
 
@@ -306,7 +306,7 @@ async fn test_local_semaphore_add_permits() {
             let sem = Rc::new(Semaphore::new(0));
             let sem2 = sem.clone();
 
-            let handle = tokio::task::spawn_local(async move {
+            let handle = spawn_local(async move {
                 let permit = sem2.acquire_many(3).await.unwrap();
                 assert_eq!(permit.num_permits(), 3);
             });
@@ -327,23 +327,15 @@ async fn test_local_semaphore_capacity_and_overflow_boundaries() {
     assert_eq!(sem.capacity(), 3);
     assert_eq!(sem.available_permits(), 0);
     assert_eq!(sem.add_permits(3), Ok(()));
-    assert_eq!(
-        sem.add_permits(1),
-        Err(AddPermitsError {
-            requested: 1,
-            remaining: 0,
-        })
-    );
+    let err = sem.add_permits(1).unwrap_err();
+    assert_eq!(err.requested(), 1);
+    assert_eq!(err.remaining(), 0);
     assert_eq!(sem.available_permits(), 3);
 
     let max = Semaphore::new(usize::MAX);
-    assert_eq!(
-        max.add_permits(1),
-        Err(AddPermitsError {
-            requested: 1,
-            remaining: 0,
-        })
-    );
+    let err = max.add_permits(1).unwrap_err();
+    assert_eq!(err.requested(), 1);
+    assert_eq!(err.remaining(), 0);
 
     let near_max = Semaphore::with_capacity_and_permits(usize::MAX, usize::MAX - 1).unwrap();
     let permit = near_max.try_acquire().unwrap();

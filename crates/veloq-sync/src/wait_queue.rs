@@ -1,4 +1,4 @@
-use crate::waker::{WaiterAdapter, WaiterNode};
+use crate::common::{WaiterAdapter, WaiterNode};
 use veloq_intrusive_linklist::LinkedList;
 use veloq_std::{
     fmt,
@@ -55,10 +55,14 @@ impl WakeBatch {
 
 /// A waiter removed from the queue, with ownership of its registered waker.
 pub(crate) struct DetachedWaiter {
-    pub(crate) waker: Option<Waker>,
+    waker: Option<Waker>,
 }
 
 impl DetachedWaiter {
+    pub(crate) fn new(waker: Option<Waker>) -> Self {
+        Self { waker }
+    }
+
     /// Wakes the detached waiter after the queue lock has been released.
     pub(crate) fn wake(self) {
         if let Some(waker) = self.waker {
@@ -73,6 +77,7 @@ pub(crate) struct WaitQueue {
 }
 
 unsafe impl Send for WaitQueue {}
+
 unsafe impl Sync for WaitQueue {}
 
 impl WaitQueue {
@@ -107,7 +112,7 @@ impl WaitQueue {
     pub fn refresh_waker(&self, node: &mut WaiterNode, cx: &mut Context<'_>) -> RefreshResult {
         let linked = {
             let list = self.inner.lock();
-            list.with(|_| node.link.is_linked())
+            list.with(|_| node.link().is_linked())
         };
         if !linked {
             return RefreshResult::Detached(None);
@@ -119,22 +124,12 @@ impl WaitQueue {
 
         let mut list = self.inner.lock();
         list.with_mut(|_| {
-            if node.link.is_linked() {
+            if node.link().is_linked() {
                 RefreshResult::Linked
             } else {
                 RefreshResult::Detached(node.waker.take())
             }
         })
-    }
-
-    /// Enqueues a pinned waiter node into the back of the queue.
-    #[inline]
-    #[allow(dead_code)]
-    pub fn push_back(&self, node: Pin<&mut WaiterNode>) {
-        let mut list = self.inner.lock();
-        list.with_mut(|w| unsafe {
-            w.push_back(node);
-        });
     }
 
     /// Registers the waker from `cx` into `node` and pushes it into the queue.
@@ -157,7 +152,7 @@ impl WaitQueue {
     pub fn remove(&self, node: &WaiterNode) -> bool {
         let mut list = self.inner.lock();
         list.with_mut(|w| {
-            if node.link.is_linked() {
+            if node.link().is_linked() {
                 unsafe {
                     let ptr = NonNull::from(node);
                     let mut cursor = w.cursor_mut_from_ptr(ptr);
@@ -175,9 +170,7 @@ impl WaitQueue {
         let mut list = self.inner.lock();
         list.with_mut(|w| {
             let node = w.pop_front()?;
-            Some(DetachedWaiter {
-                waker: node.as_ref().waker.take(),
-            })
+            Some(DetachedWaiter::new(node.as_ref().waker.take()))
         })
     }
 
@@ -192,9 +185,7 @@ impl WaitQueue {
                 unsafe {
                     f(node.as_mut().get_unchecked_mut());
                 }
-                Some(DetachedWaiter {
-                    waker: node.as_ref().waker.take(),
-                })
+                Some(DetachedWaiter::new(node.as_ref().waker.take()))
             } else {
                 None
             }

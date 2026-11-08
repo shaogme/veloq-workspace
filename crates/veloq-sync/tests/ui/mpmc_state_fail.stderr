@@ -1,5 +1,11 @@
-error[E0433]: cannot find `State` in `mpmc`
- --> tests/ui/mpmc_state_fail.rs:6:23
+error[E0603]: module `mpmc` is private
+ --> tests/ui/mpmc_state_fail.rs:3:17
   |
-6 |     let state = mpmc::State::<i32, mpmc::flavor::Unbounded, _>::new(0);
-  |                       ^^^^^ could not find `State` in `mpmc`
+3 | use veloq_sync::mpmc::Inner;
+  |                 ^^^^ private module
+  |
+note: the module `mpmc` is defined here
+ --> src/lib.rs
+  |
+  | mod mpmc;
+  | ^^^^^^^^

@@ -5,7 +5,7 @@ error: lifetime may not live long enough
   |                                                            --     - ^^ returning this value requires that `'1` must outlive `'2`
   |                                                            |      |
   |                                                            |      return type of async closure `{async closure body@$DIR/tests/ui/windows/watch_escape_fail.rs:6:69: 6:71}` contains a lifetime `'2`
-  |                                                            has type `veloq_sync::watch::BorrowedSender<'1, i32>`
+  |                                                            has type `WatchBorrowedSender<'1, i32>`
 
 error: lifetime may not live long enough
   --> tests/ui/windows/watch_escape_fail.rs:10:69
@@ -14,4 +14,4 @@ error: lifetime may not live long enough
    |                                                            ---    - ^^ returning this value requires that `'1` must outlive `'2`
    |                                                            |      |
    |                                                            |      return type of async closure `{async closure body@$DIR/tests/ui/windows/watch_escape_fail.rs:10:69: 10:71}` contains a lifetime `'2`
-   |                                                            has type `veloq_sync::watch::BorrowedSender<'1, i32>`
+   |                                                            has type `WatchBorrowedSender<'1, i32>`

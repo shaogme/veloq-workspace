@@ -1,9 +1,14 @@
-use std::{future::poll_fn, pin::pin, task::Poll};
+use std::{
+    future::poll_fn,
+    pin::{Pin, pin},
+    task::Poll,
+};
 
 use futures_core::Stream;
-use veloq_local::mpmc;
+use tokio::join;
+use veloq_local::Mpmc;
 
-async fn next<S>(mut stream: std::pin::Pin<&mut S>) -> Option<S::Item>
+async fn next<S>(mut stream: Pin<&mut S>) -> Option<S::Item>
 where
     S: Stream + ?Sized,
 {
@@ -12,22 +17,22 @@ where
 
 #[tokio::test]
 async fn receives_message_sent_after_pending() {
-    let (tx, rx) = mpmc::unbounded();
-    let (received, sent) = tokio::join!(rx.recv(), tx.send(7));
+    let (tx, rx) = Mpmc::unbounded();
+    let (received, sent) = join!(rx.recv(), tx.send(7));
     assert_eq!(sent, Ok(()));
     assert_eq!(received, Some(7));
 }
 
 #[tokio::test]
 async fn receives_message_sent_before_poll() {
-    let (tx, rx) = mpmc::unbounded();
+    let (tx, rx) = Mpmc::unbounded();
     tx.send(11).await.unwrap();
     assert_eq!(rx.recv().await, Some(11));
 }
 
 #[tokio::test]
 async fn borrowed_and_owned_streams_share_receive_protocol() {
-    mpmc::with_borrowed_unbounded(async |tx, rx| {
+    Mpmc::with_borrowed_unbounded(async |tx, rx| {
         let mut borrowed = pin!(rx.stream());
         let pending = poll_fn(|cx| match borrowed.as_mut().poll_next(cx) {
             Poll::Pending => Poll::Ready(()),
@@ -39,7 +44,7 @@ async fn borrowed_and_owned_streams_share_receive_protocol() {
     })
     .await;
 
-    let (tx, rx) = mpmc::unbounded();
+    let (tx, rx) = Mpmc::unbounded();
     let mut owned = pin!(rx.stream());
     let pending = poll_fn(|cx| match owned.as_mut().poll_next(cx) {
         Poll::Pending => Poll::Ready(()),
@@ -52,7 +57,7 @@ async fn borrowed_and_owned_streams_share_receive_protocol() {
 
 #[tokio::test]
 async fn closed_channel_drains_messages_before_disconnect() {
-    let (tx, rx) = mpmc::unbounded();
+    let (tx, rx) = Mpmc::unbounded();
     tx.send(19).await.unwrap();
     drop(tx);
 

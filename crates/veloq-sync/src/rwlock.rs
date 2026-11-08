@@ -1,6 +1,6 @@
 use crate::{
+    common::{WaiterAdapter, WaiterNode},
     wait_queue::{DetachedWaiter, WaitQueue},
-    waker::{WaiterAdapter, WaiterNode},
 };
 use veloq_intrusive_linklist::LinkedList;
 use veloq_std::{
@@ -22,6 +22,7 @@ pub struct RwLock<T: ?Sized> {
 }
 
 unsafe impl<T: ?Sized + Send> Send for RwLock<T> {}
+
 unsafe impl<T: ?Sized + Send + Sync> Sync for RwLock<T> {}
 
 const WRITER_LOCKED: usize = 1 << 0;
@@ -34,6 +35,34 @@ const KIND_WRITER: usize = 1;
 
 const NODE_WAITING: usize = 0;
 const NODE_GRANTED: usize = 1;
+
+pub struct RwLockReadGuard<'a, T: ?Sized> {
+    lock: &'a RwLock<T>,
+}
+
+pub struct RwLockWriteGuard<'a, T: ?Sized> {
+    lock: &'a RwLock<T>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    Initial,
+    Waiting,
+    Granted,
+    Completed,
+}
+
+struct RwLockReadFuture<'a, T: ?Sized> {
+    lock: &'a RwLock<T>,
+    node: WaiterNode,
+    phase: Phase,
+}
+
+struct RwLockWriteFuture<'a, T: ?Sized> {
+    lock: &'a RwLock<T>,
+    node: WaiterNode,
+    phase: Phase,
+}
 
 impl<T> RwLock<T> {
     /// Creates a new `RwLock` with the given data.
@@ -127,12 +156,8 @@ impl<T: ?Sized> RwLock<T> {
     }
 }
 
-/// A RAII guard returned by [`RwLock::read`].
-pub struct RwLockReadGuard<'a, T: ?Sized> {
-    lock: &'a RwLock<T>,
-}
-
 unsafe impl<T: ?Sized + Sync> Sync for RwLockReadGuard<'_, T> {}
+
 unsafe impl<T: ?Sized + Send> Send for RwLockReadGuard<'_, T> {}
 
 impl<T: ?Sized> Deref for RwLockReadGuard<'_, T> {
@@ -164,12 +189,8 @@ impl<T: ?Sized> Drop for RwLockReadGuard<'_, T> {
     }
 }
 
-/// A RAII guard returned by [`RwLock::write`].
-pub struct RwLockWriteGuard<'a, T: ?Sized> {
-    lock: &'a RwLock<T>,
-}
-
 unsafe impl<T: ?Sized + Sync> Sync for RwLockWriteGuard<'_, T> {}
+
 unsafe impl<T: ?Sized + Send> Send for RwLockWriteGuard<'_, T> {}
 
 impl<T: ?Sized> Deref for RwLockWriteGuard<'_, T> {
@@ -219,20 +240,6 @@ impl<T: ?Sized> Drop for RwLockWriteGuard<'_, T> {
             detached.wake();
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Phase {
-    Initial,
-    Waiting,
-    Granted,
-    Completed,
-}
-
-struct RwLockReadFuture<'a, T: ?Sized> {
-    lock: &'a RwLock<T>,
-    node: WaiterNode,
-    phase: Phase,
 }
 
 impl<'a, T: ?Sized> Future for RwLockReadFuture<'a, T> {
@@ -328,7 +335,7 @@ impl<T: ?Sized> Drop for RwLockReadFuture<'_, T> {
             Phase::Waiting => self.lock.waiters.with_lock(|waiters| {
                 if self.node.state == NODE_GRANTED {
                     cancel_granted_locked(self.lock, waiters, &self.node)
-                } else if self.node.state == NODE_WAITING && self.node.link.is_linked() {
+                } else if self.node.state == NODE_WAITING && self.node.link().is_linked() {
                     remove_waiting_locked(self.lock, waiters, &self.node)
                 } else {
                     None
@@ -339,12 +346,6 @@ impl<T: ?Sized> Drop for RwLockReadFuture<'_, T> {
             detached.wake();
         }
     }
-}
-
-struct RwLockWriteFuture<'a, T: ?Sized> {
-    lock: &'a RwLock<T>,
-    node: WaiterNode,
-    phase: Phase,
 }
 
 impl<'a, T: ?Sized> Future for RwLockWriteFuture<'a, T> {
@@ -430,7 +431,7 @@ impl<T: ?Sized> Drop for RwLockWriteFuture<'_, T> {
             Phase::Waiting => self.lock.waiters.with_lock(|waiters| {
                 if self.node.state == NODE_GRANTED {
                     cancel_granted_locked(self.lock, waiters, &self.node)
-                } else if self.node.state == NODE_WAITING && self.node.link.is_linked() {
+                } else if self.node.state == NODE_WAITING && self.node.link().is_linked() {
                     remove_waiting_locked(self.lock, waiters, &self.node)
                 } else {
                     None
@@ -530,7 +531,7 @@ fn grant_front_locked<T: ?Sized>(
         }
         let waker = node_mut.waker.take();
         store_state_for_queue(lock, waiters, state);
-        Some(DetachedWaiter { waker })
+        Some(DetachedWaiter::new(waker))
     } else {
         store_state_for_queue(lock, waiters, state);
         None

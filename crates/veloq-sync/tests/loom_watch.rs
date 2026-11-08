@@ -1,7 +1,7 @@
 #![cfg(feature = "loom")]
 
 use loom::{future::block_on, thread};
-use veloq_sync::watch;
+use veloq_sync::Watch as watch;
 
 #[test]
 fn loom_watch_send_recv() {

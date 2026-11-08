@@ -1,11 +1,9 @@
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use veloq_local::spsc;
+use tokio::{join, runtime::Builder};
+use veloq_local::Spsc;
 
 fn bench_spsc_bounded(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
 
     let mut group = c.benchmark_group("spsc_bounded");
 
@@ -13,7 +11,7 @@ fn bench_spsc_bounded(c: &mut Criterion) {
         group.throughput(Throughput::Elements(size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
             b.to_async(&rt).iter(|| async {
-                let (tx, rx) = spsc::bounded(size);
+                let (tx, rx) = Spsc::bounded(size);
 
                 let rx_fut = async move {
                     let mut count = 0;
@@ -30,7 +28,7 @@ fn bench_spsc_bounded(c: &mut Criterion) {
                     drop(tx);
                 };
 
-                let (_, count) = tokio::join!(tx_fut, rx_fut);
+                let (_, count) = join!(tx_fut, rx_fut);
                 assert_eq!(count, size);
             });
         });
@@ -39,10 +37,7 @@ fn bench_spsc_bounded(c: &mut Criterion) {
 }
 
 fn bench_spsc_unbounded(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
 
     let mut group = c.benchmark_group("spsc_unbounded");
 
@@ -52,7 +47,7 @@ fn bench_spsc_unbounded(c: &mut Criterion) {
 
     group.bench_function("send_recv_10k", |b| {
         b.to_async(&rt).iter(|| async {
-            let (tx, rx) = spsc::unbounded();
+            let (tx, rx) = Spsc::unbounded();
 
             let rx_fut = async move {
                 let mut c = 0;
@@ -69,7 +64,7 @@ fn bench_spsc_unbounded(c: &mut Criterion) {
                 drop(tx);
             };
 
-            let (_, c) = tokio::join!(tx_fut, rx_fut);
+            let (_, c) = join!(tx_fut, rx_fut);
             assert_eq!(c, count);
         });
     });

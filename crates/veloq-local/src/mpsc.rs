@@ -13,11 +13,87 @@ use veloq_std::{
 pub use crate::common::{ChannelCapacity, SendError, TryRecvError};
 use crate::notify::{Notified, Notify};
 
+pub struct Mpsc;
+
+#[derive(Debug)]
+struct ChannelState<T> {
+    capacity: ChannelCapacity,
+    channel: VecDeque<T>,
+    tx_count: usize,
+    is_closed: bool,
+}
+
 #[derive(Debug)]
 struct Inner<T> {
     inner: RefCell<ChannelState<T>>,
     send_notify: Notify,
     recv_notify: Notify,
+}
+
+#[derive(Debug)]
+pub struct BorrowedSender<'a, T> {
+    state: &'a Inner<T>,
+}
+
+#[derive(Debug)]
+pub struct BorrowedReceiver<'a, T> {
+    state: &'a Inner<T>,
+}
+
+pub struct BorrowedChannelStream<'a, T> {
+    state: &'a Inner<T>,
+    notified: Option<Notified<'a>>,
+}
+
+pub struct Sender<T> {
+    state: Rc<Inner<T>>,
+}
+
+pub struct Receiver<T> {
+    state: Rc<Inner<T>>,
+}
+
+pub struct ChannelStream<T> {
+    state: Rc<Inner<T>>,
+    notified: Option<Notified<'static>>,
+}
+
+impl Mpsc {
+    pub fn channel<T>(capacity: ChannelCapacity) -> (Sender<T>, Receiver<T>) {
+        let state = Rc::new(Inner::new(capacity));
+        (
+            Sender {
+                state: state.clone(),
+            },
+            Receiver { state },
+        )
+    }
+
+    pub fn bounded<T>(size: usize) -> (Sender<T>, Receiver<T>) {
+        Self::channel(ChannelCapacity::Bounded(size))
+    }
+
+    pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
+        Self::channel(ChannelCapacity::Unbounded)
+    }
+
+    pub async fn with_borrowed_bounded<T, F, R>(size: usize, f: F) -> R
+    where
+        F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
+    {
+        let state = Inner::bounded(size);
+        let (tx, rx) = state.split();
+        f(tx, rx).await
+    }
+
+    pub async fn with_borrowed_unbounded<T, F, R>(f: F) -> R
+    where
+        F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
+    {
+        let state = Inner::unbounded();
+        let (tx, rx) = state.split();
+        f(tx, rx).await
+    }
 }
 
 impl<T> Inner<T> {
@@ -59,46 +135,6 @@ impl<T> Inner<T> {
             BorrowedReceiver { state: self },
         )
     }
-}
-
-/// Creates a new borrowed bounded MPSC channel and runs the provided asynchronous closure with it.
-pub async fn with_borrowed_bounded<T, F, R>(size: usize, f: F) -> R
-where
-    F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
-{
-    let state = Inner::bounded(size);
-    let (tx, rx) = state.split();
-    f(tx, rx).await
-}
-
-/// Creates a new borrowed unbounded MPSC channel and runs the provided asynchronous closure with it.
-pub async fn with_borrowed_unbounded<T, F, R>(f: F) -> R
-where
-    F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
-{
-    let state = Inner::unbounded();
-    let (tx, rx) = state.split();
-    f(tx, rx).await
-}
-
-/// 本地通道的发送端（借用）
-#[derive(Debug)]
-pub struct BorrowedSender<'a, T> {
-    state: &'a Inner<T>,
-}
-
-/// 本地通道的接收端（借用）
-#[derive(Debug)]
-pub struct BorrowedReceiver<'a, T> {
-    state: &'a Inner<T>,
-}
-
-#[derive(Debug)]
-struct ChannelState<T> {
-    capacity: ChannelCapacity,
-    channel: VecDeque<T>,
-    tx_count: usize,
-    is_closed: bool,
 }
 
 impl<T> ChannelState<T> {
@@ -205,11 +241,6 @@ impl<'a, T> Drop for BorrowedReceiver<'a, T> {
     }
 }
 
-pub struct BorrowedChannelStream<'a, T> {
-    state: &'a Inner<T>,
-    notified: Option<Notified<'a>>,
-}
-
 impl<'a, T> BorrowedChannelStream<'a, T> {
     fn new(state: &'a Inner<T>) -> Self {
         BorrowedChannelStream {
@@ -306,37 +337,6 @@ impl<'a, T> BorrowedReceiver<'a, T> {
     }
 }
 
-/// MPSC channel sender.
-pub struct Sender<T> {
-    state: Rc<Inner<T>>,
-}
-
-/// MPSC channel receiver.
-pub struct Receiver<T> {
-    state: Rc<Inner<T>>,
-}
-
-/// Creates a new MPSC channel.
-pub fn channel<T>(capacity: ChannelCapacity) -> (Sender<T>, Receiver<T>) {
-    let state = Rc::new(Inner::new(capacity));
-    (
-        Sender {
-            state: state.clone(),
-        },
-        Receiver { state },
-    )
-}
-
-/// Creates a new bounded MPSC channel.
-pub fn bounded<T>(size: usize) -> (Sender<T>, Receiver<T>) {
-    channel(ChannelCapacity::Bounded(size))
-}
-
-/// Creates a new unbounded MPSC channel.
-pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
-    channel(ChannelCapacity::Unbounded)
-}
-
 impl<T> Clone for Sender<T> {
     fn clone(&self) -> Self {
         let sender = ManuallyDrop::new(BorrowedSender { state: &self.state });
@@ -408,12 +408,6 @@ impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         drop(BorrowedReceiver { state: &self.state });
     }
-}
-
-/// A stream of messages from an MPSC channel.
-pub struct ChannelStream<T> {
-    state: Rc<Inner<T>>,
-    notified: Option<Notified<'static>>,
 }
 
 impl<T> ChannelStream<T> {

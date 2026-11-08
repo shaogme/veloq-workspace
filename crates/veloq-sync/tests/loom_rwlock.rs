@@ -6,7 +6,7 @@ use veloq_std::future::Future;
 use veloq_std::pin::Pin;
 use veloq_std::ptr;
 use veloq_std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-use veloq_sync::rwlock::RwLock;
+use veloq_sync::RwLock;
 
 fn dummy_waker() -> Waker {
     unsafe { Waker::from_raw(RawWaker::new(ptr::null(), &VTABLE)) }

@@ -14,7 +14,9 @@ use veloq_std::{
 };
 
 pub use crate::common::TryRecvError;
-use crate::common::update_waker;
+use crate::waker::WaiterNode;
+
+pub struct Oneshot;
 
 /// 接收端已关闭错误
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -28,7 +30,7 @@ impl fmt::Display for RecvError {
 
 impl Error for RecvError {}
 
-struct Inner<T> {
+pub(super) struct Inner<T> {
     value: UnsafeCell<Option<T>>,
     waker: UnsafeCell<Option<Waker>>,
     is_tx_closed: Cell<bool>,
@@ -70,16 +72,6 @@ impl<T> Inner<T> {
             BorrowedReceiver { state: self },
         )
     }
-}
-
-/// 创建一个新的借用 oneshot 通道并运行异步闭包
-pub async fn with_borrowed_channel<T, F, R>(f: F) -> R
-where
-    F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
-{
-    let state = Inner::new();
-    let (tx, rx) = state.borrowed_parts();
-    f(tx, rx).await
 }
 
 impl<'a, T> BorrowedSender<'a, T> {
@@ -150,7 +142,7 @@ impl<'a, T> Future for BorrowedReceiver<'a, T> {
         }
 
         let waker_slot = unsafe { &mut *state.waker.get() };
-        update_waker(waker_slot, cx.waker());
+        WaiterNode::update_waker_slot(waker_slot, cx.waker());
         Poll::Pending
     }
 }
@@ -206,15 +198,25 @@ pub struct Receiver<T> {
     state: Rc<Inner<T>>,
 }
 
-/// Creates a new oneshot channel.
-pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
-    let state = Rc::new(Inner::new());
-    (
-        Sender {
-            state: ManuallyDrop::new(state.clone()),
-        },
-        Receiver { state },
-    )
+impl Oneshot {
+    pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
+        let state = Rc::new(Inner::new());
+        (
+            Sender {
+                state: ManuallyDrop::new(state.clone()),
+            },
+            Receiver { state },
+        )
+    }
+
+    pub async fn with_borrowed_channel<T, F, R>(f: F) -> R
+    where
+        F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
+    {
+        let state = Inner::new();
+        let (tx, rx) = state.borrowed_parts();
+        f(tx, rx).await
+    }
 }
 
 impl<T> Sender<T> {

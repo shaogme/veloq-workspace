@@ -6,9 +6,17 @@ use veloq_std::{
 
 use crate::notify::Notify;
 
+pub struct Broadcast;
+
 /// Error produced when sending a value fails because all receivers have been dropped.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct SendError<T>(pub T);
+pub struct SendError<T>(T);
+
+impl<T> SendError<T> {
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
 
 impl<T> fmt::Debug for SendError<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -231,6 +239,12 @@ pub struct BorrowedSender<'a, T> {
     state: &'a Inner<T>,
 }
 
+/// The receiver half of a borrowed local broadcast channel.
+pub struct BorrowedReceiver<'a, T> {
+    state: &'a Inner<T>,
+    next_seq: u64,
+}
+
 impl<'a, T> BorrowedSender<'a, T> {
     /// Sends a value to all active receivers.
     ///
@@ -321,12 +335,6 @@ impl<T> fmt::Debug for BorrowedSender<'_, T> {
     }
 }
 
-/// The receiver half of a borrowed local broadcast channel.
-pub struct BorrowedReceiver<'a, T> {
-    state: &'a Inner<T>,
-    next_seq: u64,
-}
-
 impl<'a, T> BorrowedReceiver<'a, T> {
     /// Asynchronously receives the next value for this receiver.
     pub async fn recv(&mut self) -> Result<T, RecvError>
@@ -407,6 +415,39 @@ impl<T> fmt::Debug for BorrowedReceiver<'_, T> {
 /// A sender for a local broadcast channel.
 pub struct Sender<T> {
     state: Rc<Inner<T>>,
+}
+
+/// A receiver for a local broadcast channel.
+pub struct Receiver<T> {
+    state: Rc<Inner<T>>,
+    next_seq: u64,
+}
+
+impl Broadcast {
+    pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+        let state = Rc::new(Inner::new(capacity, 1, 1));
+        let next_seq = state.inner.borrow().tail;
+        (
+            Sender {
+                state: state.clone(),
+            },
+            Receiver { state, next_seq },
+        )
+    }
+
+    pub async fn with_borrowed_channel<T, F, R>(capacity: usize, f: F) -> R
+    where
+        F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
+    {
+        let state = Inner::new(capacity, 1, 1);
+        let next_seq = state.inner.borrow().tail;
+        let tx = BorrowedSender { state: &state };
+        let rx = BorrowedReceiver {
+            state: &state,
+            next_seq,
+        };
+        f(tx, rx).await
+    }
 }
 
 impl<T> Sender<T> {
@@ -501,12 +542,6 @@ impl<T> fmt::Debug for Sender<T> {
     }
 }
 
-/// A receiver for a local broadcast channel.
-pub struct Receiver<T> {
-    state: Rc<Inner<T>>,
-    next_seq: u64,
-}
-
 impl<T> Receiver<T> {
     /// Asynchronously receives the next value for this receiver.
     pub async fn recv(&mut self) -> Result<T, RecvError>
@@ -582,31 +617,4 @@ impl<T> fmt::Debug for Receiver<T> {
             .field("len", &self.len())
             .finish()
     }
-}
-
-/// Creates a new broadcast channel returning a sender and receiver pair.
-pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
-    let state = Rc::new(Inner::new(capacity, 1, 1));
-    let next_seq = state.inner.borrow().tail;
-    (
-        Sender {
-            state: state.clone(),
-        },
-        Receiver { state, next_seq },
-    )
-}
-
-/// Creates a new borrowed broadcast channel and runs the provided asynchronous closure with it.
-pub async fn with_borrowed_channel<T, F, R>(capacity: usize, f: F) -> R
-where
-    F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
-{
-    let state = Inner::new(capacity, 1, 1);
-    let next_seq = state.inner.borrow().tail;
-    let tx = BorrowedSender { state: &state };
-    let rx = BorrowedReceiver {
-        state: &state,
-        next_seq,
-    };
-    f(tx, rx).await
 }

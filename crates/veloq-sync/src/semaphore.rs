@@ -1,3 +1,5 @@
+use core::cmp::min;
+
 use crate::wait_queue::WakeBatch;
 use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 use veloq_std::{
@@ -66,9 +68,23 @@ impl Error for TryAcquireError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapacityError {
     /// The configured capacity.
-    pub capacity: usize,
+    capacity: usize,
     /// The requested initial number of permits.
-    pub initial: usize,
+    initial: usize,
+}
+
+impl CapacityError {
+    pub fn new(capacity: usize, initial: usize) -> Self {
+        Self { capacity, initial }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn initial(&self) -> usize {
+        self.initial
+    }
 }
 
 impl fmt::Display for CapacityError {
@@ -83,9 +99,26 @@ impl Error for CapacityError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AddPermitsError {
     /// The requested number of new permits.
-    pub requested: usize,
+    requested: usize,
     /// The remaining capacity at the time of the request.
-    pub remaining: usize,
+    remaining: usize,
+}
+
+impl AddPermitsError {
+    pub fn new(requested: usize, remaining: usize) -> Self {
+        Self {
+            requested,
+            remaining,
+        }
+    }
+
+    pub fn requested(&self) -> usize {
+        self.requested
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.remaining
+    }
 }
 
 impl fmt::Display for AddPermitsError {
@@ -135,7 +168,21 @@ pub struct Semaphore {
     waiters: SpinLock<LinkedList<SemaphoreWaiterAdapter>>,
 }
 
+pub struct SemaphorePermit<'a> {
+    semaphore: &'a Semaphore,
+    permits: usize,
+}
+
+pub struct SemaphoreAcquireFuture<'a> {
+    semaphore: &'a Semaphore,
+    node: SemaphoreWaiterNode,
+    permits: usize,
+    queued: bool,
+    _pin: PhantomPinned,
+}
+
 unsafe impl Send for Semaphore {}
+
 unsafe impl Sync for Semaphore {}
 
 impl Semaphore {
@@ -288,7 +335,7 @@ impl Semaphore {
     pub fn forget_permits(&self, n: usize) {
         let _waiters = self.waiters.lock();
         let current = self.permits.load(Ordering::Relaxed);
-        let removed = core::cmp::min(n, current);
+        let removed = min(n, current);
         let total = self.total_permits.load(Ordering::Relaxed);
         let new_total = total
             .checked_sub(removed)
@@ -426,13 +473,8 @@ impl fmt::Debug for Semaphore {
     }
 }
 
-/// A RAII guard representing one or more permits acquired from a `Semaphore`.
-pub struct SemaphorePermit<'a> {
-    semaphore: &'a Semaphore,
-    permits: usize,
-}
-
 unsafe impl Send for SemaphorePermit<'_> {}
+
 unsafe impl Sync for SemaphorePermit<'_> {}
 
 impl<'a> SemaphorePermit<'a> {
@@ -467,16 +509,8 @@ impl fmt::Debug for SemaphorePermit<'_> {
     }
 }
 
-/// A future that resolves to a `SemaphorePermit`.
-pub struct SemaphoreAcquireFuture<'a> {
-    semaphore: &'a Semaphore,
-    node: SemaphoreWaiterNode,
-    permits: usize,
-    queued: bool,
-    _pin: PhantomPinned,
-}
-
 unsafe impl Send for SemaphoreAcquireFuture<'_> {}
+
 unsafe impl Sync for SemaphoreAcquireFuture<'_> {}
 
 impl<'a> Future for SemaphoreAcquireFuture<'a> {

@@ -10,7 +10,7 @@ use veloq_std::{
     pin::pin,
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
-use veloq_sync::{TryRecvError, mpmc};
+use veloq_sync::{Mpmc as mpmc, TryRecvError};
 
 unsafe fn clone_counter(data: *const ()) -> RawWaker {
     let counter =

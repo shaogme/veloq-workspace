@@ -1,13 +1,13 @@
 use crate::{
     SendError, TryRecvError, TrySendError,
+    common::{ConcurrentWaiterAdapter, ConcurrentWaiterNode},
     notify::Notify,
-    shim::queue::{ArrayQueue, Queue, SegQueue},
-    waker::{ConcurrentWaiterAdapter, ConcurrentWaiterNode},
 };
 use futures_core::stream::Stream;
 use veloq_intrusive_linklist::ConcurrentLinkedList;
 use veloq_std::{
     future::Future,
+    marker::PhantomData,
     mem::ManuallyDrop,
     ops::AsyncFnOnce,
     pin::{Pin, pin},
@@ -19,119 +19,274 @@ use veloq_std::{
     task::{Context, Poll},
 };
 
-pub mod flavor {
-    use super::*;
+#[cfg(not(feature = "loom"))]
+pub use crossbeam_queue::{ArrayQueue, SegQueue};
 
-    pub trait ChannelFlavor: Send + Sync {
-        fn new() -> Self;
-        fn release(&self);
-        fn notify_all_senders(&self);
-        fn wait_send(&self, is_full: impl Fn() -> bool + Send) -> impl Future<Output = ()> + Send;
+#[cfg(feature = "loom")]
+use veloq_std::{collections::VecDeque, sync::Mutex};
+
+pub trait Queue<T>: Send + Sync {
+    fn new(capacity: usize) -> Self;
+
+    fn push(&self, value: T) -> Result<(), T>;
+
+    fn pop(&self) -> Option<T>;
+
+    fn is_full(&self) -> bool;
+}
+
+#[cfg(not(feature = "loom"))]
+impl<T: Send> Queue<T> for SegQueue<T> {
+    fn new(_capacity: usize) -> Self {
+        Self::new()
     }
 
-    pub struct Unbounded;
-
-    impl ChannelFlavor for Unbounded {
-        fn new() -> Self {
-            Unbounded
-        }
-        fn release(&self) {}
-        fn notify_all_senders(&self) {}
-        async fn wait_send(&self, _is_full: impl Fn() -> bool + Send) {}
+    fn push(&self, value: T) -> Result<(), T> {
+        self.push(value);
+        Ok(())
     }
 
-    pub struct Bounded {
-        notify: Notify,
+    fn pop(&self) -> Option<T> {
+        self.pop()
     }
 
-    unsafe impl Send for Bounded {}
-    unsafe impl Sync for Bounded {}
-
-    impl ChannelFlavor for Bounded {
-        fn new() -> Self {
-            Self {
-                notify: Notify::new(),
-            }
-        }
-
-        fn release(&self) {
-            self.notify.notify_one();
-        }
-
-        fn notify_all_senders(&self) {
-            self.notify.notify_waiters();
-        }
-
-        async fn wait_send(&self, is_full: impl Fn() -> bool + Send) {
-            let mut notified = pin!(self.notify.notified());
-            notified.as_mut().enable();
-            if !is_full() {
-                return;
-            }
-            notified.await;
-        }
+    fn is_full(&self) -> bool {
+        false
     }
 }
 
-use flavor::{Bounded, ChannelFlavor, Unbounded};
+#[cfg(not(feature = "loom"))]
+impl<T: Send> Queue<T> for ArrayQueue<T> {
+    fn new(capacity: usize) -> Self {
+        Self::new(capacity)
+    }
 
-// --- API ---
+    fn push(&self, value: T) -> Result<(), T> {
+        self.push(value)
+    }
 
-// Type Aliases to maintain API compatibility
+    fn pop(&self) -> Option<T> {
+        self.pop()
+    }
+
+    fn is_full(&self) -> bool {
+        self.is_full()
+    }
+}
+
+#[cfg(feature = "loom")]
+pub struct SegQueue<T> {
+    inner: Mutex<VecDeque<T>>,
+}
+
+#[cfg(feature = "loom")]
+impl<T> SegQueue<T> {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    fn push(&self, value: T) {
+        self.inner.lock().unwrap().push_back(value);
+    }
+
+    fn pop(&self) -> Option<T> {
+        self.inner.lock().unwrap().pop_front()
+    }
+}
+
+#[cfg(feature = "loom")]
+impl<T: Send> Queue<T> for SegQueue<T> {
+    fn new(_capacity: usize) -> Self {
+        Self::new()
+    }
+
+    fn push(&self, value: T) -> Result<(), T> {
+        self.push(value);
+        Ok(())
+    }
+
+    fn pop(&self) -> Option<T> {
+        self.pop()
+    }
+
+    fn is_full(&self) -> bool {
+        false
+    }
+}
+
+#[cfg(feature = "loom")]
+pub struct ArrayQueue<T> {
+    inner: Mutex<VecDeque<T>>,
+    capacity: usize,
+}
+
+#[cfg(feature = "loom")]
+impl<T> ArrayQueue<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            inner: Mutex::new(VecDeque::new()),
+            capacity,
+        }
+    }
+
+    fn push(&self, value: T) -> Result<(), T> {
+        let mut queue = self.inner.lock().unwrap();
+        if queue.len() >= self.capacity {
+            return Err(value);
+        }
+        queue.push_back(value);
+        Ok(())
+    }
+
+    fn pop(&self) -> Option<T> {
+        self.inner.lock().unwrap().pop_front()
+    }
+
+    fn is_full(&self) -> bool {
+        self.inner.lock().unwrap().len() >= self.capacity
+    }
+}
+
+#[cfg(feature = "loom")]
+impl<T: Send> Queue<T> for ArrayQueue<T> {
+    fn new(capacity: usize) -> Self {
+        Self::new(capacity)
+    }
+
+    fn push(&self, value: T) -> Result<(), T> {
+        self.push(value)
+    }
+
+    fn pop(&self) -> Option<T> {
+        self.pop()
+    }
+
+    fn is_full(&self) -> bool {
+        self.is_full()
+    }
+}
+
+pub struct Mpmc;
+
+pub trait ChannelFlavor: Send + Sync {
+    fn new() -> Self;
+
+    fn release(&self);
+
+    fn notify_all_senders(&self);
+
+    fn wait_send(&self, is_full: impl Fn() -> bool + Send) -> impl Future<Output = ()> + Send;
+}
+
+pub struct Unbounded;
+
+impl ChannelFlavor for Unbounded {
+    fn new() -> Self {
+        Unbounded
+    }
+
+    fn release(&self) {}
+
+    fn notify_all_senders(&self) {}
+
+    async fn wait_send(&self, _is_full: impl Fn() -> bool + Send) {}
+}
+
+pub struct Bounded {
+    notify: Notify,
+}
+
+unsafe impl Send for Bounded {}
+
+unsafe impl Sync for Bounded {}
+
+impl ChannelFlavor for Bounded {
+    fn new() -> Self {
+        Self {
+            notify: Notify::new(),
+        }
+    }
+
+    fn release(&self) {
+        self.notify.notify_one();
+    }
+
+    fn notify_all_senders(&self) {
+        self.notify.notify_waiters();
+    }
+
+    async fn wait_send(&self, is_full: impl Fn() -> bool + Send) {
+        let mut notified = pin!(self.notify.notified());
+        notified.as_mut().enable();
+        if !is_full() {
+            return;
+        }
+        notified.await;
+    }
+}
+
+struct Inner<T, F: ChannelFlavor, Q: Queue<T>> {
+    queue: Q,
+
+    // 接收协调锁同时保护队列检查、等待节点注册和节点摘除。
+    recv_coord: SpinLock<ConcurrentLinkedList<ConcurrentWaiterAdapter>>,
+
+    is_closed: AtomicBool,
+    sender_count: AtomicUsize,
+    receiver_count: AtomicUsize,
+
+    flavor: F,
+    _marker: PhantomData<T>,
+}
+
+pub struct GenericBorrowedSender<'a, T, F: ChannelFlavor, Q: Queue<T>> {
+    state: &'a Inner<T, F, Q>,
+}
+
+pub struct GenericBorrowedReceiver<'a, T, F: ChannelFlavor, Q: Queue<T>> {
+    state: &'a Inner<T, F, Q>,
+}
+
+struct RecvFuture<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> {
+    receiver: &'b GenericBorrowedReceiver<'a, T, F, Q>,
+    node: ConcurrentWaiterNode,
+}
+
+pub struct BorrowedReceiverStream<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> {
+    receiver: &'b GenericBorrowedReceiver<'a, T, F, Q>,
+    node: ConcurrentWaiterNode,
+}
+
+pub struct GenericSender<T, F: ChannelFlavor, Q: Queue<T>> {
+    state: Arc<Inner<T, F, Q>>,
+}
+
+pub struct GenericReceiver<T, F: ChannelFlavor, Q: Queue<T>> {
+    state: Arc<Inner<T, F, Q>>,
+}
+
+pub struct ReceiverStream<'a, T, F: ChannelFlavor, Q: Queue<T>> {
+    state: &'a Inner<T, F, Q>,
+    node: ConcurrentWaiterNode,
+}
+
 pub type BorrowedSender<'a, T> = GenericBorrowedSender<'a, T, Unbounded, SegQueue<T>>;
 pub type BorrowedReceiver<'a, T> = GenericBorrowedReceiver<'a, T, Unbounded, SegQueue<T>>;
 pub type BorrowedBoundedSender<'a, T> = GenericBorrowedSender<'a, T, Bounded, ArrayQueue<T>>;
 pub type BorrowedBoundedReceiver<'a, T> = GenericBorrowedReceiver<'a, T, Bounded, ArrayQueue<T>>;
-
 pub type BoundedBorrowedSender<'a, T> = BorrowedBoundedSender<'a, T>;
 pub type BoundedBorrowedReceiver<'a, T> = BorrowedBoundedReceiver<'a, T>;
-
 pub type BorrowedGenericSender<'a, T, F, Q> = GenericBorrowedSender<'a, T, F, Q>;
 pub type BorrowedGenericReceiver<'a, T, F, Q> = GenericBorrowedReceiver<'a, T, F, Q>;
-
 pub type Sender<T> = GenericSender<T, Unbounded, SegQueue<T>>;
 pub type Receiver<T> = GenericReceiver<T, Unbounded, SegQueue<T>>;
 pub type BoundedSender<T> = GenericSender<T, Bounded, ArrayQueue<T>>;
 pub type BoundedReceiver<T> = GenericReceiver<T, Bounded, ArrayQueue<T>>;
 
-/// Creates a new borrowed unbounded MPMC channel and runs the provided asynchronous closure with it.
-pub async fn with_borrowed_unbounded<T: Send, F, R>(f: F) -> R
-where
-    F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
-{
-    let state = Inner::new(0);
-    let (tx, rx) = state.split();
-    f(tx, rx).await
-}
-
-/// Creates a new borrowed bounded MPMC channel and runs the provided asynchronous closure with it.
-pub async fn with_borrowed_bounded<T: Send, F, R>(capacity: usize, f: F) -> R
-where
-    F: for<'a> AsyncFnOnce(BorrowedBoundedSender<'a, T>, BorrowedBoundedReceiver<'a, T>) -> R,
-{
-    assert!(capacity > 0);
-    let state = Inner::new(capacity);
-    let (tx, rx) = state.split();
-    f(tx, rx).await
-}
-
-// --- Inner ---
-
-struct Inner<T, F: ChannelFlavor, Q: Queue<T>> {
-    pub(crate) queue: Q,
-
-    // 接收协调锁同时保护队列检查、等待节点注册和节点摘除。
-    pub(crate) recv_coord: SpinLock<ConcurrentLinkedList<ConcurrentWaiterAdapter>>,
-
-    pub(crate) is_closed: AtomicBool,
-    pub(crate) sender_count: AtomicUsize,
-    pub(crate) receiver_count: AtomicUsize,
-
-    pub(crate) flavor: F,
-    _marker: veloq_std::marker::PhantomData<T>,
-}
-
 unsafe impl<T: Send, F: ChannelFlavor, Q: Queue<T>> Send for Inner<T, F, Q> {}
+
 unsafe impl<T: Send, F: ChannelFlavor, Q: Queue<T>> Sync for Inner<T, F, Q> {}
 
 impl<T, F: ChannelFlavor, Q: Queue<T>> Inner<T, F, Q> {
@@ -143,7 +298,7 @@ impl<T, F: ChannelFlavor, Q: Queue<T>> Inner<T, F, Q> {
             sender_count: AtomicUsize::new(1),
             receiver_count: AtomicUsize::new(1),
             flavor: F::new(),
-            _marker: veloq_std::marker::PhantomData,
+            _marker: PhantomData,
         }
     }
 
@@ -217,12 +372,6 @@ impl<T, F: ChannelFlavor, Q: Queue<T>> Inner<T, F, Q> {
     }
 }
 
-// --- Borrowed Structs ---
-
-pub struct GenericBorrowedSender<'a, T, F: ChannelFlavor, Q: Queue<T>> {
-    state: &'a Inner<T, F, Q>,
-}
-
 impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Clone for GenericBorrowedSender<'a, T, F, Q> {
     fn clone(&self) -> Self {
         self.state.sender_count.fetch_add(1, Ordering::Relaxed);
@@ -236,10 +385,6 @@ impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Drop for GenericBorrowedSender<'a, T,
             self.state.close();
         }
     }
-}
-
-pub struct GenericBorrowedReceiver<'a, T, F: ChannelFlavor, Q: Queue<T>> {
-    state: &'a Inner<T, F, Q>,
 }
 
 impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Clone for GenericBorrowedReceiver<'a, T, F, Q> {
@@ -257,7 +402,6 @@ impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Drop for GenericBorrowedReceiver<'a, 
         }
     }
 }
-
 // --- Implementations ---
 
 impl<'a, T: Send, F: ChannelFlavor, Q: Queue<T>> GenericBorrowedSender<'a, T, F, Q> {
@@ -278,12 +422,12 @@ impl<'a, T: Send, F: ChannelFlavor, Q: Queue<T>> GenericBorrowedSender<'a, T, F,
     pub async fn send(&self, mut msg: T) -> Result<(), SendError<T>> {
         loop {
             if self.state.is_closed.load(Ordering::Relaxed) {
-                return Err(SendError(msg));
+                return Err(SendError::new(msg));
             }
 
             match self.try_send(msg) {
                 Ok(_) => return Ok(()),
-                Err(TrySendError::Closed(m)) => return Err(SendError(m)),
+                Err(TrySendError::Closed(m)) => return Err(SendError::new(m)),
                 Err(TrySendError::Full(m)) => {
                     msg = m;
                 }
@@ -325,13 +469,7 @@ impl<'a, T, F: ChannelFlavor, Q: Queue<T>> GenericBorrowedReceiver<'a, T, F, Q> 
         }
     }
 }
-
 // --- Futures ---
-
-struct RecvFuture<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> {
-    receiver: &'b GenericBorrowedReceiver<'a, T, F, Q>,
-    node: ConcurrentWaiterNode,
-}
 
 impl<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> Future for RecvFuture<'a, 'b, T, F, Q> {
     type Output = Result<T, TryRecvError>;
@@ -396,7 +534,7 @@ fn poll_recv<T, F: ChannelFlavor, Q: Queue<T>>(
                 return Poll::Ready(Err(TryRecvError::Disconnected));
             }
 
-            if !node_ref.link.is_linked() {
+            if !node_ref.link().is_linked() {
                 unsafe {
                     waiters.push_back_ptr(NonNull::from(node_ref));
                 }
@@ -415,7 +553,7 @@ fn unlink_waiter_locked(
     waiters: &mut ConcurrentLinkedList<ConcurrentWaiterAdapter>,
     node: &ConcurrentWaiterNode,
 ) {
-    if node.link.is_linked() {
+    if node.link().is_linked() {
         unsafe {
             let ptr = NonNull::from(node);
             let mut cursor = waiters.cursor_mut_from_ptr(ptr);
@@ -432,18 +570,13 @@ fn remove_recv_waiter<T, F: ChannelFlavor, Q: Queue<T>>(
     {
         let mut lock = state.recv_coord.lock();
         lock.with_mut(|waiters| {
-            if node.link.is_linked() {
+            if node.link().is_linked() {
                 unlink_waiter_locked(waiters, node);
                 pending_waker = node.waker.take();
             }
         });
     }
     drop(pending_waker);
-}
-
-pub struct BorrowedReceiverStream<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> {
-    receiver: &'b GenericBorrowedReceiver<'a, T, F, Q>,
-    node: ConcurrentWaiterNode,
 }
 
 impl<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> Stream for BorrowedReceiverStream<'a, 'b, T, F, Q> {
@@ -464,16 +597,6 @@ impl<'a, 'b, T, F: ChannelFlavor, Q: Queue<T>> Drop for BorrowedReceiverStream<'
     fn drop(&mut self) {
         remove_recv_waiter(self.receiver.state, &self.node);
     }
-}
-
-// --- Owned Structs ---
-
-pub struct GenericSender<T, F: ChannelFlavor, Q: Queue<T>> {
-    state: Arc<Inner<T, F, Q>>,
-}
-
-pub struct GenericReceiver<T, F: ChannelFlavor, Q: Queue<T>> {
-    state: Arc<Inner<T, F, Q>>,
 }
 
 impl<T, F: ChannelFlavor, Q: Queue<T>> Clone for GenericSender<T, F, Q> {
@@ -544,11 +667,6 @@ impl<T, F: ChannelFlavor, Q: Queue<T>> GenericReceiver<T, F, Q> {
     }
 }
 
-pub struct ReceiverStream<'a, T, F: ChannelFlavor, Q: Queue<T>> {
-    state: &'a Inner<T, F, Q>,
-    node: ConcurrentWaiterNode,
-}
-
 impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Stream for ReceiverStream<'a, T, F, Q> {
     type Item = T;
 
@@ -569,23 +687,44 @@ impl<'a, T, F: ChannelFlavor, Q: Queue<T>> Drop for ReceiverStream<'a, T, F, Q> 
     }
 }
 
-pub fn unbounded<T: Send>() -> (Sender<T>, Receiver<T>) {
-    let state = Arc::new(Inner::new(0));
-    (
-        GenericSender {
-            state: state.clone(),
-        },
-        GenericReceiver { state },
-    )
-}
+impl Mpmc {
+    pub async fn with_borrowed_unbounded<T: Send, F, R>(f: F) -> R
+    where
+        F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
+    {
+        let state = Inner::new(0);
+        let (tx, rx) = state.split();
+        f(tx, rx).await
+    }
 
-pub fn bounded<T: Send>(capacity: usize) -> (BoundedSender<T>, BoundedReceiver<T>) {
-    assert!(capacity > 0);
-    let state = Arc::new(Inner::new(capacity));
-    (
-        GenericSender {
-            state: state.clone(),
-        },
-        GenericReceiver { state },
-    )
+    pub async fn with_borrowed_bounded<T: Send, F, R>(capacity: usize, f: F) -> R
+    where
+        F: for<'a> AsyncFnOnce(BorrowedBoundedSender<'a, T>, BorrowedBoundedReceiver<'a, T>) -> R,
+    {
+        assert!(capacity > 0);
+        let state = Inner::new(capacity);
+        let (tx, rx) = state.split();
+        f(tx, rx).await
+    }
+
+    pub fn unbounded<T: Send>() -> (Sender<T>, Receiver<T>) {
+        let state = Arc::new(Inner::new(0));
+        (
+            GenericSender {
+                state: state.clone(),
+            },
+            GenericReceiver { state },
+        )
+    }
+
+    pub fn bounded<T: Send>(capacity: usize) -> (BoundedSender<T>, BoundedReceiver<T>) {
+        assert!(capacity > 0);
+        let state = Arc::new(Inner::new(capacity));
+        (
+            GenericSender {
+                state: state.clone(),
+            },
+            GenericReceiver { state },
+        )
+    }
 }

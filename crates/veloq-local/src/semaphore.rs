@@ -1,6 +1,7 @@
 use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
 use veloq_std::{
     cell::{Cell, RefCell},
+    cmp::min,
     error::Error,
     fmt,
     future::Future,
@@ -11,7 +12,7 @@ use veloq_std::{
     vec::Vec,
 };
 
-use crate::common::update_waker;
+use crate::waker::WaiterNode as IntrusiveWaiterNode;
 
 const STATE_WAITING: usize = 0;
 const STATE_GRANTED: usize = 1;
@@ -64,9 +65,19 @@ impl Error for TryAcquireError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CapacityError {
     /// The configured capacity.
-    pub capacity: usize,
+    capacity: usize,
     /// The requested initial number of permits.
-    pub initial: usize,
+    initial: usize,
+}
+
+impl CapacityError {
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn initial(&self) -> usize {
+        self.initial
+    }
 }
 
 impl fmt::Display for CapacityError {
@@ -81,9 +92,19 @@ impl Error for CapacityError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AddPermitsError {
     /// The requested number of new permits.
-    pub requested: usize,
+    requested: usize,
     /// The remaining capacity at the time of the request.
-    pub remaining: usize,
+    remaining: usize,
+}
+
+impl AddPermitsError {
+    pub fn requested(&self) -> usize {
+        self.requested
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.remaining
+    }
 }
 
 impl fmt::Display for AddPermitsError {
@@ -153,6 +174,21 @@ pub struct Semaphore {
     capacity: usize,
     closed: Cell<bool>,
     waiters: RefCell<LinkedList<WaiterAdapter>>,
+}
+
+/// A RAII guard representing one or more permits acquired from a local `Semaphore`.
+pub struct SemaphorePermit<'a> {
+    semaphore: &'a Semaphore,
+    permits: usize,
+}
+
+/// A future that resolves to a `SemaphorePermit` in local contexts.
+pub struct SemaphoreAcquireFuture<'a> {
+    semaphore: &'a Semaphore,
+    node: WaiterNode,
+    permits: usize,
+    queued: bool,
+    _pin: PhantomPinned,
 }
 
 impl Semaphore {
@@ -303,7 +339,7 @@ impl Semaphore {
     /// Forgotten permits reduce the total capacity available for future adds.
     pub fn forget_permits(&self, n: usize) {
         let current = self.permits.get();
-        let removed = core::cmp::min(n, current);
+        let removed = min(n, current);
         let total = self.total_permits.get();
         let new_total = total
             .checked_sub(removed)
@@ -439,12 +475,6 @@ impl fmt::Debug for Semaphore {
     }
 }
 
-/// A RAII guard representing one or more permits acquired from a local `Semaphore`.
-pub struct SemaphorePermit<'a> {
-    semaphore: &'a Semaphore,
-    permits: usize,
-}
-
 impl<'a> SemaphorePermit<'a> {
     /// Returns a reference to the `Semaphore` this permit was acquired from.
     pub fn semaphore(&self) -> &'a Semaphore {
@@ -477,15 +507,6 @@ impl fmt::Debug for SemaphorePermit<'_> {
     }
 }
 
-/// A future that resolves to a `SemaphorePermit` in local contexts.
-pub struct SemaphoreAcquireFuture<'a> {
-    semaphore: &'a Semaphore,
-    node: WaiterNode,
-    permits: usize,
-    queued: bool,
-    _pin: PhantomPinned,
-}
-
 impl<'a> Future for SemaphoreAcquireFuture<'a> {
     type Output = Result<SemaphorePermit<'a>, AcquireError>;
 
@@ -516,7 +537,7 @@ impl<'a> Future for SemaphoreAcquireFuture<'a> {
         }
 
         if this.queued {
-            update_waker(&mut this.node.waker.borrow_mut(), cx.waker());
+            IntrusiveWaiterNode::update_waker_slot(&mut this.node.waker.borrow_mut(), cx.waker());
             return Poll::Pending;
         }
 
@@ -540,7 +561,7 @@ impl<'a> Future for SemaphoreAcquireFuture<'a> {
 
         this.node.needed.set(this.permits);
         this.node.state.set(STATE_WAITING);
-        update_waker(&mut this.node.waker.borrow_mut(), cx.waker());
+        IntrusiveWaiterNode::update_waker_slot(&mut this.node.waker.borrow_mut(), cx.waker());
         unsafe {
             let node_pin = Pin::new_unchecked(&mut this.node);
             this.semaphore.waiters.borrow_mut().push_back(node_pin);

@@ -1,6 +1,6 @@
 //! BorrowedSender and BorrowedReceiver cannot escape with_borrowed_channel closure.
 
-use veloq_sync::watch;
+use veloq_sync::Watch as watch;
 
 async fn test_tx_escape() {
     let _escaped = watch::with_borrowed_channel(42, async |tx, _rx| tx).await;

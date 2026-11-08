@@ -1,5 +1,19 @@
-error[E0433]: cannot find `State` in `mpmc`
- --> tests/ui/mpmc_state_fail.rs:6:23
+error[E0432]: unresolved import `veloq_local::mpmc::State`
+ --> tests/ui/mpmc_state_fail.rs:3:5
   |
-6 |     let state = mpmc::State::<i32>::unbounded();
-  |                       ^^^^^ could not find `State` in `mpmc`
+3 | use veloq_local::mpmc::State;
+  |     ^^^^^^^^^^^^^^^^^^^-----
+  |                        |
+  |                        no `State` in `mpmc`
+
+error[E0603]: module `mpmc` is private
+ --> tests/ui/mpmc_state_fail.rs:3:18
+  |
+3 | use veloq_local::mpmc::State;
+  |                  ^^^^ private module
+  |
+note: the module `mpmc` is defined here
+ --> src/lib.rs
+  |
+  | mod mpmc;
+  | ^^^^^^^^

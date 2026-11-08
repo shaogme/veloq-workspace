@@ -1,106 +1,71 @@
 #![no_std]
 
-pub mod broadcast;
-pub mod condvar;
-pub mod mpmc;
-pub mod mpsc;
-pub mod mutex;
-pub mod notify;
-pub mod oneshot;
-pub mod rwlock;
-pub mod semaphore;
-pub mod set_once;
-pub(crate) mod shim;
-pub(crate) mod wait_queue;
-pub(crate) mod waker;
-pub mod watch;
+mod broadcast;
+mod common;
+mod condvar;
+mod mpmc;
+mod mpsc;
+mod mutex;
+mod notify;
+mod oneshot;
+mod rwlock;
+mod semaphore;
+mod set_once;
+mod wait_queue;
+mod watch;
 
+pub use broadcast::{
+    BorrowedReceiver as BroadcastBorrowedReceiver, BorrowedSender as BroadcastBorrowedSender,
+    Broadcast, Receiver as BroadcastReceiver, RecvError as BroadcastRecvError,
+    Sender as BroadcastSender, TryRecvError as BroadcastTryRecvError,
+};
+pub use common::{
+    RecvError, RecvError as WatchRecvError, SendError, SendError as BroadcastSendError,
+    SendError as WatchSendError, TryRecvError, TrySendError,
+};
 pub use condvar::{Condvar, Wait};
+pub use mpmc::{
+    ArrayQueue as MpmcArrayQueue, BorrowedBoundedReceiver as MpmcBorrowedBoundedReceiver,
+    BorrowedBoundedSender as MpmcBorrowedBoundedSender,
+    BorrowedGenericReceiver as MpmcBorrowedGenericReceiver,
+    BorrowedGenericSender as MpmcBorrowedGenericSender, BorrowedReceiver as MpmcBorrowedReceiver,
+    BorrowedReceiverStream as MpmcBorrowedReceiverStream, BorrowedSender as MpmcBorrowedSender,
+    Bounded as MpmcBoundedFlavor, BoundedBorrowedReceiver as MpmcBoundedBorrowedReceiver,
+    BoundedBorrowedSender as MpmcBoundedBorrowedSender, BoundedReceiver as MpmcBoundedReceiver,
+    BoundedSender as MpmcBoundedSender, ChannelFlavor as MpmcChannelFlavor,
+    GenericBorrowedReceiver as MpmcGenericBorrowedReceiver,
+    GenericBorrowedSender as MpmcGenericBorrowedSender, GenericReceiver as MpmcGenericReceiver,
+    GenericSender as MpmcGenericSender, Mpmc, Queue as MpmcQueue, Receiver as MpmcReceiver,
+    ReceiverStream as MpmcReceiverStream, SegQueue as MpmcSegQueue, Sender as MpmcSender,
+    Unbounded as MpmcUnboundedFlavor,
+};
+pub use mpsc::{
+    BorrowedBoundedReceiver as MpscBorrowedBoundedReceiver,
+    BorrowedBoundedSender as MpscBorrowedBoundedSender,
+    BorrowedGenericReceiver as MpscBorrowedGenericReceiver,
+    BorrowedGenericSender as MpscBorrowedGenericSender, BorrowedReceiver as MpscBorrowedReceiver,
+    BorrowedSender as MpscBorrowedSender, BoundedBorrowedReceiver as MpscBoundedBorrowedReceiver,
+    BoundedBorrowedSender as MpscBoundedBorrowedSender, BoundedReceiver as MpscBoundedReceiver,
+    BoundedSender as MpscBoundedSender, BoundedStrategy as MpscBoundedStrategy,
+    ChannelStrategy as MpscChannelStrategy, GenericBorrowedReceiver as MpscGenericBorrowedReceiver,
+    GenericBorrowedSender as MpscGenericBorrowedSender, GenericReceiver as MpscGenericReceiver,
+    GenericSender as MpscGenericSender, Mpsc, Receiver as MpscReceiver, Sender as MpscSender,
+    UnboundedStrategy as MpscUnboundedStrategy,
+};
 pub use mutex::{Mutex, MutexGuard};
 pub use notify::{Notified, Notify};
+pub use oneshot::{
+    BorrowedReceiver as OneshotBorrowedReceiver, BorrowedSender as OneshotBorrowedSender, Oneshot,
+    Receiver as OneshotReceiver, RecvError as OneshotRecvError, Sender as OneshotSender,
+    TryRecvError as OneshotTryRecvError,
+};
+pub use rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 pub use semaphore::{
     AcquireError, AddPermitsError, CapacityError, Semaphore, SemaphoreAcquireFuture,
     SemaphorePermit, TryAcquireError,
 };
 pub use set_once::{SetOnce, SetOnceError, SetOnceWait};
-
-use veloq_std::fmt;
-
-/// Error returned when sending to a closed channel.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct SendError<T>(pub T);
-
-impl<T> fmt::Debug for SendError<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SendError").finish_non_exhaustive()
-    }
-}
-
-impl<T> fmt::Display for SendError<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "sending on a closed channel")
-    }
-}
-
-impl<T> veloq_std::error::Error for SendError<T> {}
-
-/// Error returned when trying to send to a full or closed channel.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum TrySendError<T> {
-    /// The channel is full.
-    Full(T),
-    /// The channel is closed.
-    Closed(T),
-}
-
-impl<T> fmt::Debug for TrySendError<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TrySendError::Full(_) => f.debug_tuple("Full").finish_non_exhaustive(),
-            TrySendError::Closed(_) => f.debug_tuple("Closed").finish_non_exhaustive(),
-        }
-    }
-}
-
-impl<T> fmt::Display for TrySendError<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TrySendError::Full(_) => write!(f, "sending on a full channel"),
-            TrySendError::Closed(_) => write!(f, "sending on a closed channel"),
-        }
-    }
-}
-
-impl<T> veloq_std::error::Error for TrySendError<T> {}
-
-/// Error returned when trying to receive from an empty or closed channel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TryRecvError {
-    /// The channel is empty.
-    Empty,
-    /// The channel is closed.
-    Disconnected,
-}
-
-impl fmt::Display for TryRecvError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TryRecvError::Empty => write!(f, "receiving on an empty channel"),
-            TryRecvError::Disconnected => write!(f, "receiving on a closed channel"),
-        }
-    }
-}
-
-impl veloq_std::error::Error for TryRecvError {}
-
-/// Error returned when receiving from a closed channel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RecvError;
-
-impl fmt::Display for RecvError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "receiving on a closed channel")
-    }
-}
-
-impl veloq_std::error::Error for RecvError {}
+pub use watch::{
+    BorrowedReceiver as WatchBorrowedReceiver, BorrowedSender as WatchBorrowedSender,
+    Receiver as WatchReceiver, Ref as WatchRef, Sender as WatchSender, Watch,
+};

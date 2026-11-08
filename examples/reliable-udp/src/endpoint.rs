@@ -21,8 +21,8 @@ use veloq::{
         time::Duration,
     },
     sync::{
-        mpmc::{BoundedReceiver, bounded},
-        oneshot,
+        Mpmc as mpmc, MpmcBoundedReceiver as BoundedReceiver, Oneshot as oneshot, OneshotReceiver,
+        OneshotSender,
     },
 };
 
@@ -39,7 +39,7 @@ use self::{io::CommandSender, state::ProtocolState, stats::EndpointStats};
 static NEXT_CONNECTION_ID: NativeAtomicU64 = NativeAtomicU64::new(0x9e37_79b9_7f4a_7c15);
 
 pub(crate) type ConnectionCommandSender = CommandSender;
-pub(crate) type Reply<T> = oneshot::Sender<Result<T>>;
+pub(crate) type Reply<T> = OneshotSender<Result<T>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct ConnectionKey {
@@ -149,7 +149,7 @@ impl<'rt> Endpoint<'rt> {
         let socket = UdpSocket::bind(ctx, addr).map_err(|_| Error::Io)?;
         let local_addr = socket.local_addr().map_err(|_| Error::Io)?;
         let (command, command_rx) = io::channel(config.command_capacity.get());
-        let (accept_tx, accept_rx) = bounded(config.accept_capacity.get());
+        let (accept_tx, accept_rx) = mpmc::bounded(config.accept_capacity.get());
         let (ready, ready_receiver) = oneshot::channel();
         let stats = Arc::new(EndpointStats::new());
         let endpoint = Self {
@@ -247,7 +247,7 @@ impl<'rt> EndpointDriver<'rt> {
 }
 
 pub struct EndpointReady {
-    receiver: Option<oneshot::Receiver<Result<()>>>,
+    receiver: Option<OneshotReceiver<Result<()>>>,
 }
 
 impl EndpointReady {

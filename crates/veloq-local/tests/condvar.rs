@@ -1,12 +1,10 @@
 use std::{cell::Cell, collections::VecDeque, future::pending, pin::pin, rc::Rc, time::Duration};
 use tokio::{
+    select,
     task::{LocalSet, spawn_local},
     time::sleep,
 };
-use veloq_local::{
-    condvar::Condvar,
-    mutex::{Mutex, MutexGuard},
-};
+use veloq_local::{Condvar, Mutex, MutexGuard};
 
 #[tokio::test]
 async fn test_local_condvar_simple() {
@@ -236,7 +234,7 @@ async fn test_local_condvar_cancellation_waiting() {
                 let (lock, cvar) = &*pair2;
                 let guard = lock.lock().await;
                 let mut wait_fut = pin!(cvar.wait(guard));
-                tokio::select! {
+                select! {
                     _ = &mut wait_fut => panic!("should not complete"),
                     _ = sleep(Duration::from_millis(15)) => {}
                 }
@@ -288,7 +286,7 @@ async fn test_local_condvar_cancellation_transfer_notify() {
                 let guard = lock.lock().await;
                 started1_c.set(true);
                 let mut wait_fut = pin!(cvar.wait(guard));
-                tokio::select! {
+                select! {
                     _ = &mut wait_fut => 1,
                     _ = pending::<()>() => 0,
                 }

@@ -16,7 +16,7 @@ use veloq::{
     net::{TcpListener, TcpStream},
     nz,
     runtime::{Runtime, context::Ctx, scope},
-    sync::mpsc,
+    sync::Mpsc as mpsc,
 };
 use veloq_buf::{FixedBuf, UniformSlot};
 use veloq_runtime::{select, yield_now};

@@ -1,10 +1,12 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use veloq_local::mpsc;
-use veloq_std::future::Future;
-use veloq_std::task::{Context, Waker};
+use veloq_local::Mpsc;
+use veloq_std::{
+    future::Future,
+    task::{Context, Waker},
+};
 
 fn bench_poll_pending(c: &mut Criterion) {
-    let (_tx, rx) = mpsc::unbounded::<i32>();
+    let (_tx, rx) = Mpsc::unbounded::<i32>();
     let recv_fut = rx.recv();
     let mut pinned = Box::pin(recv_fut);
     let waker = Waker::noop();
@@ -19,7 +21,7 @@ fn bench_poll_pending(c: &mut Criterion) {
 
 fn bench_stream_poll_pending(c: &mut Criterion) {
     use futures_core::Stream;
-    let (_tx, rx) = mpsc::unbounded::<i32>();
+    let (_tx, rx) = Mpsc::unbounded::<i32>();
     let stream = rx.stream();
     let mut pinned = Box::pin(stream);
     let waker = Waker::noop();

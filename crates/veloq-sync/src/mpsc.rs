@@ -1,11 +1,12 @@
 use crate::{
     SendError, TryRecvError,
+    mpmc::{ArrayQueue, Queue, SegQueue},
     notify::Notify,
-    shim::queue::{ArrayQueue, Queue, SegQueue},
 };
 use futures_core::stream::Stream;
 use veloq_std::{
     future::Future,
+    marker::PhantomData,
     mem::ManuallyDrop,
     ops::AsyncFnOnce,
     pin::{Pin, pin},
@@ -17,12 +18,32 @@ use veloq_std::{
 };
 use veloq_waker::MwsrWaker;
 
+pub struct Mpsc;
+
+struct ChannelState {
+    rx_waker: MwsrWaker,
+    sender_count: AtomicUsize,
+    receiver_active: AtomicBool,
+}
+
+pub trait ChannelStrategy: Send + Sync {
+    fn on_rx_drop(&self);
+
+    fn on_msg_recv(&self);
+}
+
+pub struct UnboundedStrategy;
+
+pub struct BoundedStrategy {
+    notify: Notify,
+}
+
 /// A multi-producer, single-consumer channel state.
 struct Inner<T, S, Q> {
-    pub(crate) queue: Q,
-    pub(crate) state: ChannelState,
-    pub(crate) strategy: S,
-    _marker: veloq_std::marker::PhantomData<fn() -> T>,
+    queue: Q,
+    state: ChannelState,
+    strategy: S,
+    _marker: PhantomData<fn() -> T>,
 }
 
 impl<T> Inner<T, UnboundedStrategy, SegQueue<T>> {
@@ -31,7 +52,7 @@ impl<T> Inner<T, UnboundedStrategy, SegQueue<T>> {
             queue: SegQueue::new(),
             state: ChannelState::new(),
             strategy: UnboundedStrategy,
-            _marker: veloq_std::marker::PhantomData,
+            _marker: PhantomData,
         }
     }
 }
@@ -43,79 +64,11 @@ impl<T> Inner<T, BoundedStrategy, ArrayQueue<T>> {
             queue: ArrayQueue::new(capacity),
             state: ChannelState::new(),
             strategy: BoundedStrategy::new(capacity),
-            _marker: veloq_std::marker::PhantomData,
+            _marker: PhantomData,
         }
     }
 }
-
-impl<T, S: ChannelStrategy, Q> Inner<T, S, Q> {
-    fn split(
-        &self,
-    ) -> (
-        GenericBorrowedSender<'_, T, S, Q>,
-        GenericBorrowedReceiver<'_, T, S, Q>,
-    ) {
-        self.state.sender_count.store(1, Ordering::SeqCst);
-        self.state.receiver_active.store(true, Ordering::SeqCst);
-        (
-            GenericBorrowedSender {
-                state: self,
-                _marker: veloq_std::marker::PhantomData,
-            },
-            GenericBorrowedReceiver {
-                state: self,
-                _marker: veloq_std::marker::PhantomData,
-            },
-        )
-    }
-}
-
-/// Creates a new borrowed unbounded channel and runs the provided asynchronous closure with it.
-pub async fn with_borrowed_unbounded<T, F, R>(f: F) -> R
-where
-    F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
-{
-    let state = Inner::unbounded();
-    let (tx, rx) = state.split();
-    f(tx, rx).await
-}
-
-/// Creates a new borrowed bounded channel and runs the provided asynchronous closure with it.
-pub async fn with_borrowed_bounded<T, F, R>(capacity: usize, f: F) -> R
-where
-    F: for<'a> AsyncFnOnce(BorrowedBoundedSender<'a, T>, BorrowedBoundedReceiver<'a, T>) -> R,
-{
-    let state = Inner::bounded(capacity);
-    let (tx, rx) = state.split();
-    f(tx, rx).await
-}
-
-// Type Aliases to maintain API compatibility
-pub type BorrowedSender<'a, T> = GenericBorrowedSender<'a, T, UnboundedStrategy, SegQueue<T>>;
-pub type BorrowedReceiver<'a, T> = GenericBorrowedReceiver<'a, T, UnboundedStrategy, SegQueue<T>>;
-pub type BorrowedBoundedSender<'a, T> =
-    GenericBorrowedSender<'a, T, BoundedStrategy, ArrayQueue<T>>;
-pub type BorrowedBoundedReceiver<'a, T> =
-    GenericBorrowedReceiver<'a, T, BoundedStrategy, ArrayQueue<T>>;
-
-pub type BoundedBorrowedSender<'a, T> = BorrowedBoundedSender<'a, T>;
-pub type BoundedBorrowedReceiver<'a, T> = BorrowedBoundedReceiver<'a, T>;
-
-pub type Sender<T> = GenericSender<T, UnboundedStrategy, SegQueue<T>>;
-pub type Receiver<T> = GenericReceiver<T, UnboundedStrategy, SegQueue<T>>;
-pub type BoundedSender<T> = GenericSender<T, BoundedStrategy, ArrayQueue<T>>;
-pub type BoundedReceiver<T> = GenericReceiver<T, BoundedStrategy, ArrayQueue<T>>;
-
 // --- Core Inner Logic ---
-
-pub(crate) struct ChannelState {
-    rx_waker: MwsrWaker,
-    /// Number of active senders. Used to determine when to wake the receiver
-    /// upon the last sender disconnecting.
-    sender_count: AtomicUsize,
-    /// Indicates if the receiver is still active.
-    receiver_active: AtomicBool,
-}
 
 impl ChannelState {
     fn new() -> Self {
@@ -148,23 +101,12 @@ impl ChannelState {
         }
     }
 }
-
 // --- Strategies ---
-
-pub trait ChannelStrategy: Send + Sync {
-    fn on_rx_drop(&self);
-    fn on_msg_recv(&self);
-}
-
-pub struct UnboundedStrategy;
 
 impl ChannelStrategy for UnboundedStrategy {
     fn on_rx_drop(&self) {}
-    fn on_msg_recv(&self) {}
-}
 
-pub struct BoundedStrategy {
-    notify: Notify,
+    fn on_msg_recv(&self) {}
 }
 
 impl BoundedStrategy {
@@ -184,33 +126,72 @@ impl ChannelStrategy for BoundedStrategy {
         self.notify.notify_one();
     }
 }
-
 // --- Generic Structures ---
 
 pub struct GenericBorrowedSender<'a, T, S: ChannelStrategy, Q> {
     state: &'a Inner<T, S, Q>,
-    _marker: veloq_std::marker::PhantomData<fn() -> T>,
+    _marker: PhantomData<fn() -> T>,
 }
 
 pub type BorrowedGenericSender<'a, T, S, Q> = GenericBorrowedSender<'a, T, S, Q>;
 
 pub struct GenericBorrowedReceiver<'a, T, S: ChannelStrategy, Q> {
     state: &'a Inner<T, S, Q>,
-    _marker: veloq_std::marker::PhantomData<fn() -> T>,
+    _marker: PhantomData<fn() -> T>,
 }
 
 pub type BorrowedGenericReceiver<'a, T, S, Q> = GenericBorrowedReceiver<'a, T, S, Q>;
 
 pub struct GenericSender<T, S: ChannelStrategy, Q> {
     state: Arc<Inner<T, S, Q>>,
-    _marker: veloq_std::marker::PhantomData<fn() -> T>,
+    _marker: PhantomData<fn() -> T>,
 }
 
 pub struct GenericReceiver<T, S: ChannelStrategy, Q> {
     state: Arc<Inner<T, S, Q>>,
-    _marker: veloq_std::marker::PhantomData<fn() -> T>,
+    _marker: PhantomData<fn() -> T>,
 }
 
+pub type BorrowedSender<'a, T> = GenericBorrowedSender<'a, T, UnboundedStrategy, SegQueue<T>>;
+pub type BorrowedReceiver<'a, T> = GenericBorrowedReceiver<'a, T, UnboundedStrategy, SegQueue<T>>;
+pub type BorrowedBoundedSender<'a, T> =
+    GenericBorrowedSender<'a, T, BoundedStrategy, ArrayQueue<T>>;
+pub type BorrowedBoundedReceiver<'a, T> =
+    GenericBorrowedReceiver<'a, T, BoundedStrategy, ArrayQueue<T>>;
+
+pub type BoundedBorrowedSender<'a, T> = BorrowedBoundedSender<'a, T>;
+pub type BoundedBorrowedReceiver<'a, T> = BorrowedBoundedReceiver<'a, T>;
+
+pub type Sender<T> = GenericSender<T, UnboundedStrategy, SegQueue<T>>;
+pub type Receiver<T> = GenericReceiver<T, UnboundedStrategy, SegQueue<T>>;
+pub type BoundedSender<T> = GenericSender<T, BoundedStrategy, ArrayQueue<T>>;
+pub type BoundedReceiver<T> = GenericReceiver<T, BoundedStrategy, ArrayQueue<T>>;
+
+struct RecvFuture<'a, 'b, T, S: ChannelStrategy, Q: Queue<T>> {
+    receiver: &'b mut GenericBorrowedReceiver<'a, T, S, Q>,
+}
+
+impl<T, S: ChannelStrategy, Q> Inner<T, S, Q> {
+    fn split(
+        &self,
+    ) -> (
+        GenericBorrowedSender<'_, T, S, Q>,
+        GenericBorrowedReceiver<'_, T, S, Q>,
+    ) {
+        self.state.sender_count.store(1, Ordering::SeqCst);
+        self.state.receiver_active.store(true, Ordering::SeqCst);
+        (
+            GenericBorrowedSender {
+                state: self,
+                _marker: PhantomData,
+            },
+            GenericBorrowedReceiver {
+                state: self,
+                _marker: PhantomData,
+            },
+        )
+    }
+}
 // --- Implementations ---
 
 impl<'a, T, S: ChannelStrategy, Q> Clone for GenericBorrowedSender<'a, T, S, Q> {
@@ -218,7 +199,7 @@ impl<'a, T, S: ChannelStrategy, Q> Clone for GenericBorrowedSender<'a, T, S, Q> 
         self.state.state.inc_sender();
         Self {
             state: self.state,
-            _marker: veloq_std::marker::PhantomData,
+            _marker: PhantomData,
         }
     }
 }
@@ -243,7 +224,7 @@ impl<'a, T> GenericBorrowedSender<'a, T, UnboundedStrategy, SegQueue<T>> {
     /// Sends a value to the channel.
     pub fn send(&self, val: T) -> Result<(), SendError<T>> {
         if !self.state.state.is_rx_active() {
-            return Err(SendError(val));
+            return Err(SendError::new(val));
         }
 
         self.state.queue.push(val);
@@ -258,7 +239,7 @@ impl<'a, T> GenericBorrowedSender<'a, T, BoundedStrategy, ArrayQueue<T>> {
     pub async fn send(&self, mut val: T) -> Result<(), SendError<T>> {
         loop {
             if !self.state.state.is_rx_active() {
-                return Err(SendError(val));
+                return Err(SendError::new(val));
             }
 
             match self.state.queue.push(val) {
@@ -275,7 +256,7 @@ impl<'a, T> GenericBorrowedSender<'a, T, BoundedStrategy, ArrayQueue<T>> {
             notified.as_mut().enable();
 
             if !self.state.state.is_rx_active() {
-                return Err(SendError(val));
+                return Err(SendError::new(val));
             }
             if !self.state.queue.is_full() {
                 continue;
@@ -310,10 +291,6 @@ impl<'a, T, S: ChannelStrategy, Q: Queue<T>> GenericBorrowedReceiver<'a, T, S, Q
             Err(TryRecvError::Empty)
         }
     }
-}
-
-struct RecvFuture<'a, 'b, T, S: ChannelStrategy, Q: Queue<T>> {
-    receiver: &'b mut GenericBorrowedReceiver<'a, T, S, Q>,
 }
 
 impl<'a, 'b, T, S: ChannelStrategy, Q: Queue<T>> Future for RecvFuture<'a, 'b, T, S, Q> {
@@ -351,47 +328,66 @@ impl<'a, T, S: ChannelStrategy, Q: Queue<T>> Stream for GenericBorrowedReceiver<
         Poll::Pending
     }
 }
-
 // --- Channel Implementations ---
 
-pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
-    let state = Arc::new(Inner::unbounded());
-    (
-        GenericSender {
-            state: state.clone(),
-            _marker: veloq_std::marker::PhantomData,
-        },
-        GenericReceiver {
-            state,
-            _marker: veloq_std::marker::PhantomData,
-        },
-    )
-}
+impl Mpsc {
+    pub async fn with_borrowed_unbounded<T, F, R>(f: F) -> R
+    where
+        F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
+    {
+        let state = Inner::unbounded();
+        let (tx, rx) = state.split();
+        f(tx, rx).await
+    }
 
-pub fn bounded<T>(capacity: usize) -> (BoundedSender<T>, BoundedReceiver<T>) {
-    let state = Arc::new(Inner::bounded(capacity));
-    (
-        GenericSender {
-            state: state.clone(),
-            _marker: veloq_std::marker::PhantomData,
-        },
-        GenericReceiver {
-            state,
-            _marker: veloq_std::marker::PhantomData,
-        },
-    )
+    pub async fn with_borrowed_bounded<T, F, R>(capacity: usize, f: F) -> R
+    where
+        F: for<'a> AsyncFnOnce(BorrowedBoundedSender<'a, T>, BorrowedBoundedReceiver<'a, T>) -> R,
+    {
+        let state = Inner::bounded(capacity);
+        let (tx, rx) = state.split();
+        f(tx, rx).await
+    }
+
+    pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
+        let state = Arc::new(Inner::unbounded());
+        (
+            GenericSender {
+                state: state.clone(),
+                _marker: PhantomData,
+            },
+            GenericReceiver {
+                state,
+                _marker: PhantomData,
+            },
+        )
+    }
+
+    pub fn bounded<T>(capacity: usize) -> (BoundedSender<T>, BoundedReceiver<T>) {
+        let state = Arc::new(Inner::bounded(capacity));
+        (
+            GenericSender {
+                state: state.clone(),
+                _marker: PhantomData,
+            },
+            GenericReceiver {
+                state,
+                _marker: PhantomData,
+            },
+        )
+    }
 }
 
 impl<T, S: ChannelStrategy, Q> Clone for GenericSender<T, S, Q> {
     fn clone(&self) -> Self {
         let sender = ManuallyDrop::new(GenericBorrowedSender {
             state: &self.state,
-            _marker: veloq_std::marker::PhantomData,
+            _marker: PhantomData,
         });
         let _cloned = ManuallyDrop::new(sender.clone());
         GenericSender {
             state: self.state.clone(),
-            _marker: veloq_std::marker::PhantomData,
+            _marker: PhantomData,
         }
     }
 }
@@ -400,7 +396,7 @@ impl<T, S: ChannelStrategy, Q> Drop for GenericSender<T, S, Q> {
     fn drop(&mut self) {
         drop(GenericBorrowedSender {
             state: &self.state,
-            _marker: veloq_std::marker::PhantomData,
+            _marker: PhantomData,
         });
     }
 }
@@ -409,7 +405,7 @@ impl<T, S: ChannelStrategy, Q> Drop for GenericReceiver<T, S, Q> {
     fn drop(&mut self) {
         drop(GenericBorrowedReceiver {
             state: &self.state,
-            _marker: veloq_std::marker::PhantomData,
+            _marker: PhantomData,
         });
     }
 }
@@ -418,7 +414,7 @@ impl<T> GenericSender<T, UnboundedStrategy, SegQueue<T>> {
     pub fn send(&self, val: T) -> Result<(), SendError<T>> {
         let sender = ManuallyDrop::new(GenericBorrowedSender {
             state: &self.state,
-            _marker: veloq_std::marker::PhantomData,
+            _marker: PhantomData,
         });
         sender.send(val)
     }
@@ -428,7 +424,7 @@ impl<T> GenericSender<T, BoundedStrategy, ArrayQueue<T>> {
     pub async fn send(&self, val: T) -> Result<(), SendError<T>> {
         let sender = ManuallyDrop::new(GenericBorrowedSender {
             state: &self.state,
-            _marker: veloq_std::marker::PhantomData,
+            _marker: PhantomData,
         });
         sender.send(val).await
     }
@@ -438,7 +434,7 @@ impl<T, S: ChannelStrategy, Q: Queue<T>> GenericReceiver<T, S, Q> {
     pub async fn recv(&mut self) -> Option<T> {
         let mut receiver = ManuallyDrop::new(GenericBorrowedReceiver {
             state: &self.state,
-            _marker: veloq_std::marker::PhantomData,
+            _marker: PhantomData,
         });
         receiver.recv().await
     }
@@ -446,7 +442,7 @@ impl<T, S: ChannelStrategy, Q: Queue<T>> GenericReceiver<T, S, Q> {
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
         let mut receiver = ManuallyDrop::new(GenericBorrowedReceiver {
             state: &self.state,
-            _marker: veloq_std::marker::PhantomData,
+            _marker: PhantomData,
         });
         receiver.try_recv()
     }
@@ -459,7 +455,7 @@ impl<T, S: ChannelStrategy, Q: Queue<T>> Stream for GenericReceiver<T, S, Q> {
         let this = unsafe { self.get_unchecked_mut() };
         let mut receiver = ManuallyDrop::new(GenericBorrowedReceiver {
             state: &this.state,
-            _marker: veloq_std::marker::PhantomData,
+            _marker: PhantomData,
         });
         Pin::new(&mut *receiver).poll_next(cx)
     }

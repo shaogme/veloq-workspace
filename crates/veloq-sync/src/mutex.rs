@@ -1,10 +1,11 @@
 use crate::{
+    common::WaiterNode,
     wait_queue::{DetachedWaiter, WaitQueue},
-    waker::WaiterNode,
 };
 use veloq_std::{
     cell::UnsafeCell,
     future::Future,
+    hint::spin_loop,
     marker::PhantomPinned,
     ops::{Deref, DerefMut},
     pin::Pin,
@@ -20,7 +21,26 @@ pub struct Mutex<T: ?Sized> {
     data: UnsafeCell<T>,
 }
 
+pub struct MutexGuard<'a, T: ?Sized> {
+    lock: &'a Mutex<T>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    Initial,
+    Waiting,
+    Completed,
+}
+
+pub(crate) struct MutexLockFuture<'a, T: ?Sized> {
+    lock: &'a Mutex<T>,
+    node: WaiterNode,
+    phase: Phase,
+    _pin: PhantomPinned,
+}
+
 unsafe impl<T: ?Sized + Send> Send for Mutex<T> {}
+
 unsafe impl<T: ?Sized + Send> Sync for Mutex<T> {}
 
 impl<T> Mutex<T> {
@@ -106,13 +126,9 @@ impl<T: ?Sized> Mutex<T> {
     }
 }
 
-/// A RAII guard returned by `Mutex::lock` and `Mutex::try_lock`.
-pub struct MutexGuard<'a, T: ?Sized> {
-    lock: &'a Mutex<T>,
-}
-
 // SAFETY: MutexGuard gives exclusive access to the underlying data.
 unsafe impl<T: ?Sized + Sync> Sync for MutexGuard<'_, T> {}
+
 unsafe impl<T: ?Sized + Send> Send for MutexGuard<'_, T> {}
 
 impl<'a, T: ?Sized> MutexGuard<'a, T> {
@@ -124,6 +140,7 @@ impl<'a, T: ?Sized> MutexGuard<'a, T> {
 
 impl<T: ?Sized> Deref for MutexGuard<'_, T> {
     type Target = T;
+
     fn deref(&self) -> &Self::Target {
         // SAFETY: We hold the lock.
         unsafe { &*self.lock.data.with(|ptr| ptr as *const T) }
@@ -145,9 +162,7 @@ impl<T: ?Sized> Drop for MutexGuard<'_, T> {
                 unsafe {
                     node.as_mut().get_unchecked_mut().state = STATE_GRANTED;
                 }
-                Some(DetachedWaiter {
-                    waker: node.as_ref().waker.take(),
-                })
+                Some(DetachedWaiter::new(node.as_ref().waker.take()))
             } else {
                 self.lock.state.store(UNLOCKED, Ordering::Release);
                 None
@@ -157,21 +172,6 @@ impl<T: ?Sized> Drop for MutexGuard<'_, T> {
             detached.wake();
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Phase {
-    Initial,
-    Waiting,
-    Completed,
-}
-
-/// A future that resolves to a `MutexGuard`.
-pub(crate) struct MutexLockFuture<'a, T: ?Sized> {
-    lock: &'a Mutex<T>,
-    node: WaiterNode,
-    phase: Phase,
-    _pin: PhantomPinned,
 }
 
 impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
@@ -194,69 +194,69 @@ impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
             return Poll::Ready(MutexGuard { lock: this.lock });
         }
 
-        #[cfg(not(feature = "loom"))]
-        let mut spin_count = 0;
+        // Fast path: try to acquire if unlocked (queue is empty when UNLOCKED).
+        if this
+            .lock
+            .state
+            .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            this.phase = Phase::Completed;
+            return Poll::Ready(MutexGuard { lock: this.lock });
+        }
 
-        #[cfg_attr(feature = "loom", allow(clippy::never_loop))]
-        loop {
-            // Fast path: try to acquire if unlocked (queue is empty when UNLOCKED).
-            if this
-                .lock
-                .state
-                .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
+        // Optimization: Bounded Spinning
+        #[cfg(not(feature = "loom"))]
+        for _ in 0..100 {
+            spin_loop();
+            if this.lock.state.load(Ordering::Relaxed) == UNLOCKED
+                && this
+                    .lock
+                    .state
+                    .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
             {
                 this.phase = Phase::Completed;
                 return Poll::Ready(MutexGuard { lock: this.lock });
             }
-
-            // Optimization: Bounded Spinning
-            #[cfg(not(feature = "loom"))]
-            if spin_count < 100 {
-                spin_count += 1;
-                veloq_std::hint::spin_loop();
-                if this.lock.state.load(Ordering::Relaxed) == UNLOCKED {
-                    continue;
-                }
-            }
-
-            let mut acquired = false;
-            let mut stale_waker = None;
-            unsafe {
-                this.node.waker.register(cx.waker());
-            }
-            this.lock.waiters.with_lock(|w| {
-                // Double check: if it became unlocked while acquiring waiters lock
-                let is_empty = w.is_empty();
-                if is_empty
-                    && this
-                        .lock
-                        .state
-                        .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
-                        .is_ok()
-                {
-                    acquired = true;
-                    return;
-                }
-
-                this.node.state = STATE_WAITING;
-                unsafe {
-                    let node_pin = Pin::new_unchecked(&mut this.node);
-                    w.push_back(node_pin);
-                }
-                this.phase = Phase::Waiting;
-            });
-            if acquired {
-                stale_waker = this.node.waker.take();
-            }
-            drop(stale_waker);
-
-            if acquired {
-                this.phase = Phase::Completed;
-                return Poll::Ready(MutexGuard { lock: this.lock });
-            }
-            return Poll::Pending;
         }
+
+        let mut acquired = false;
+        let mut stale_waker = None;
+        unsafe {
+            this.node.waker.register(cx.waker());
+        }
+        this.lock.waiters.with_lock(|w| {
+            // Double check: if it became unlocked while acquiring waiters lock
+            let is_empty = w.is_empty();
+            if is_empty
+                && this
+                    .lock
+                    .state
+                    .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            {
+                acquired = true;
+                return;
+            }
+
+            this.node.state = STATE_WAITING;
+            unsafe {
+                let node_pin = Pin::new_unchecked(&mut this.node);
+                w.push_back(node_pin);
+            }
+            this.phase = Phase::Waiting;
+        });
+        if acquired {
+            stale_waker = this.node.waker.take();
+        }
+        drop(stale_waker);
+
+        if acquired {
+            this.phase = Phase::Completed;
+            return Poll::Ready(MutexGuard { lock: this.lock });
+        }
+        Poll::Pending
     }
 }
 
@@ -273,14 +273,12 @@ impl<'a, T: ?Sized> Drop for MutexLockFuture<'a, T> {
                     unsafe {
                         next_node.as_mut().get_unchecked_mut().state = STATE_GRANTED;
                     }
-                    Some(DetachedWaiter {
-                        waker: next_node.as_ref().waker.take(),
-                    })
+                    Some(DetachedWaiter::new(next_node.as_ref().waker.take()))
                 } else {
                     self.lock.state.store(UNLOCKED, Ordering::Release);
                     None
                 }
-            } else if self.node.link.is_linked() {
+            } else if self.node.link().is_linked() {
                 // SAFETY: The node is pinned in this future and linked in this list.
                 unsafe {
                     let ptr = NonNull::from(&self.node);

@@ -1,12 +1,16 @@
 #![cfg(not(feature = "loom"))]
 
-use std::pin::pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::task::{Context, Waker};
-use std::time::Duration;
-use tokio::time::sleep;
-use veloq_sync::set_once::{SetOnce, SetOnceError};
+use std::{
+    pin::pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
+    },
+    task::{Context, Waker},
+    time::Duration,
+};
+use tokio::{select, spawn, time::sleep};
+use veloq_sync::{SetOnce, SetOnceError};
 
 #[derive(Clone)]
 struct DropCounter {
@@ -50,7 +54,7 @@ fn test_set_once_duplicate_set() {
     assert!(cell.set("hello").is_ok());
 
     let err = cell.set("world").unwrap_err();
-    assert_eq!(err, SetOnceError("world"));
+    assert_eq!(err, SetOnceError::new("world"));
     assert_eq!(err.into_inner(), "world");
     assert_eq!(cell.get(), Some(&"hello"));
 }
@@ -153,8 +157,8 @@ async fn test_set_once_async_wait() {
     let cell2 = cell.clone();
     let cell3 = cell.clone();
 
-    let h1 = tokio::spawn(async move { *cell2.wait().await });
-    let h2 = tokio::spawn(async move { *cell3.wait().await });
+    let h1 = spawn(async move { *cell2.wait().await });
+    let h2 = spawn(async move { *cell3.wait().await });
 
     sleep(Duration::from_millis(20)).await;
     assert!(cell.set(777).is_ok());
@@ -179,8 +183,8 @@ async fn test_set_once_cancellation() {
     let completed_clone = completed.clone();
 
     // Task 1: cancelled early via select
-    let h1 = tokio::spawn(async move {
-        tokio::select! {
+    let h1 = spawn(async move {
+        select! {
             _ = cell2.wait() => {
                 completed_clone.store(true, Ordering::Release);
             }
@@ -189,7 +193,7 @@ async fn test_set_once_cancellation() {
     });
 
     // Task 2: keeps waiting
-    let h2 = tokio::spawn(async move { *cell3.wait().await });
+    let h2 = spawn(async move { *cell3.wait().await });
 
     h1.await.unwrap();
     assert!(!completed.load(Ordering::Acquire));
@@ -210,7 +214,7 @@ async fn test_set_once_concurrent_set() {
     for i in 0..10 {
         let cell = cell.clone();
         let success_count = success_count.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(spawn(async move {
             if cell.set(i).is_ok() {
                 success_count.fetch_add(1, Ordering::Relaxed);
             }

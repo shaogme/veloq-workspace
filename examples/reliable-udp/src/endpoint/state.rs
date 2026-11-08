@@ -2,9 +2,8 @@ use veloq::{
     runtime::context::Ctx,
     std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration, vec::Vec},
     sync::{
+        MpmcBoundedReceiver as BoundedReceiver, MpmcBoundedSender as BoundedSender, OneshotSender,
         TrySendError,
-        mpmc::{BoundedReceiver, BoundedSender},
-        oneshot,
     },
 };
 
@@ -343,4 +342,4 @@ pub(super) fn key_from_packet(peer: SocketAddr, connection_id: ConnectionId) -> 
     ConnectionKey::new(peer, connection_id)
 }
 
-pub(super) type ReadySender = oneshot::Sender<Result<()>>;
+pub(super) type ReadySender = OneshotSender<Result<()>>;

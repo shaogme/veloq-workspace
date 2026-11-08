@@ -21,6 +21,13 @@ pub struct Notify {
     waiters: WaitQueue,
 }
 
+pub struct Notified<'a> {
+    notify: &'a Notify,
+    node: WaiterNode,
+    queued: bool,
+    _pin: PhantomPinned,
+}
+
 impl Notify {
     /// Creates a new `Notify` in the empty state.
     #[cfg(not(feature = "loom"))]
@@ -50,7 +57,7 @@ impl Notify {
         }
 
         let detached = self.waiters.take_front_with(|node| {
-            node.state = NOTIFIED_ONE;
+            node.set_state(NOTIFIED_ONE);
         });
         if let Some(detached) = detached {
             detached.wake();
@@ -93,29 +100,21 @@ impl fmt::Debug for Notify {
     }
 }
 
-/// A future that waits for a notification from a `Notify`.
-pub struct Notified<'a> {
-    notify: &'a Notify,
-    node: WaiterNode,
-    queued: bool,
-    _pin: PhantomPinned,
-}
-
 impl<'a> Notified<'a> {
     /// Pre-registers this waiter in the notification queue.
     pub fn enable(self: Pin<&mut Self>) {
         let this = unsafe { self.get_unchecked_mut() };
-        if this.queued || this.node.state == NOTIFIED_CONSUMED {
+        if this.queued || this.node.state() == NOTIFIED_CONSUMED {
             return;
         }
 
         if this.notify.has_permit.get() {
             this.notify.has_permit.set(false);
-            this.node.state = NOTIFIED_CONSUMED;
+            this.node.set_state(NOTIFIED_CONSUMED);
             return;
         }
 
-        this.node.state = NOT_NOTIFIED;
+        this.node.set_state(NOT_NOTIFIED);
         unsafe {
             let node_pin = Pin::new_unchecked(&mut this.node);
             this.notify.waiters.push_back(node_pin);
@@ -130,7 +129,7 @@ impl<'a> Future for Notified<'a> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.get_unchecked_mut() };
 
-        if this.node.state == NOTIFIED_CONSUMED {
+        if this.node.state() == NOTIFIED_CONSUMED {
             return Poll::Ready(());
         }
 
@@ -142,7 +141,7 @@ impl<'a> Future for Notified<'a> {
                 .detached()
             {
                 this.queued = false;
-                this.node.state = NOTIFIED_CONSUMED;
+                this.node.set_state(NOTIFIED_CONSUMED);
                 return Poll::Ready(());
             }
             return Poll::Pending;
@@ -150,11 +149,11 @@ impl<'a> Future for Notified<'a> {
 
         if this.notify.has_permit.get() {
             this.notify.has_permit.set(false);
-            this.node.state = NOTIFIED_CONSUMED;
+            this.node.set_state(NOTIFIED_CONSUMED);
             return Poll::Ready(());
         }
 
-        this.node.state = NOT_NOTIFIED;
+        this.node.set_state(NOT_NOTIFIED);
         unsafe {
             let node_pin = Pin::new_unchecked(&mut this.node);
             this.notify.waiters.register_and_push(node_pin, cx);
@@ -166,14 +165,16 @@ impl<'a> Future for Notified<'a> {
 
 impl<'a> Drop for Notified<'a> {
     fn drop(&mut self) {
-        if self.node.state == NOTIFIED_CONSUMED {
+        if self.node.state() == NOTIFIED_CONSUMED {
             return;
         }
 
-        if self.queued && !self.notify.waiters.remove(&self.node) && self.node.state == NOTIFIED_ONE
+        if self.queued
+            && !self.notify.waiters.remove(&self.node)
+            && self.node.state() == NOTIFIED_ONE
         {
             let detached = self.notify.waiters.take_front_with(|next| {
-                next.state = NOTIFIED_ONE;
+                next.set_state(NOTIFIED_ONE);
             });
             if let Some(detached) = detached {
                 detached.wake();

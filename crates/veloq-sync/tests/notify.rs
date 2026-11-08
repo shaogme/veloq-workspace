@@ -1,19 +1,19 @@
 #![cfg(not(feature = "loom"))]
 
-use std::future::pending;
-use std::pin::pin;
-use std::time::Duration;
-use tokio::time::sleep;
-use veloq_std::sync::Arc;
-use veloq_std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use veloq_sync::notify::Notify;
+use std::{future::pending, pin::pin, time::Duration};
+use tokio::{spawn, task::yield_now, time::sleep};
+use veloq_std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
+use veloq_sync::Notify;
 
 #[tokio::test]
 async fn test_notify_one_basic() {
     let notify = Arc::new(Notify::new());
     let notify2 = notify.clone();
 
-    let handle = tokio::spawn(async move {
+    let handle = spawn(async move {
         notify2.notified().await;
         42
     });
@@ -53,7 +53,7 @@ async fn test_notify_one_single_permit() {
     let completed = Arc::new(AtomicBool::new(false));
     let completed2 = completed.clone();
 
-    let handle = tokio::spawn(async move {
+    let handle = spawn(async move {
         notify2.notified().await;
         completed2.store(true, Ordering::Release);
     });
@@ -76,7 +76,7 @@ async fn test_notify_multi_waiters_fifo() {
     for i in 0..3 {
         let n = notify.clone();
         let c = counter.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(spawn(async move {
             n.notified().await;
             c.store(i + 1, Ordering::Release);
         }));
@@ -110,7 +110,7 @@ async fn test_notify_waiters() {
     for _ in 0..5 {
         let n = notify.clone();
         let c = count.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(spawn(async move {
             n.notified().await;
             c.fetch_add(1, Ordering::Relaxed);
         }));
@@ -137,7 +137,7 @@ async fn test_notify_waiters_no_permit() {
     let completed = Arc::new(AtomicBool::new(false));
     let completed2 = completed.clone();
 
-    let handle = tokio::spawn(async move {
+    let handle = spawn(async move {
         n2.notified().await;
         completed2.store(true, Ordering::Release);
     });
@@ -160,7 +160,7 @@ async fn test_notify_drop_notified_transfer() {
     let second_woken2 = second_woken.clone();
 
     // Task 1 will be cancelled
-    let t1 = tokio::spawn(async move {
+    let t1 = spawn(async move {
         let notified = n1.notified();
         let mut pinned = pin!(notified);
         pinned.as_mut().enable();
@@ -169,7 +169,7 @@ async fn test_notify_drop_notified_transfer() {
     });
 
     // Task 2 will wait
-    let t2 = tokio::spawn(async move {
+    let t2 = spawn(async move {
         n2.notified().await;
         second_woken2.store(true, Ordering::Release);
     });
@@ -193,7 +193,7 @@ async fn test_notify_drop_notified_restore_permit() {
     let notify = Arc::new(Notify::new());
     let n1 = notify.clone();
 
-    let t1 = tokio::spawn(async move {
+    let t1 = spawn(async move {
         let notified = n1.notified();
         let mut pinned = pin!(notified);
         pinned.as_mut().enable();
@@ -231,7 +231,7 @@ async fn test_notify_concurrent() {
 
     for _ in 0..10 {
         let n = notify.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(spawn(async move {
             for _ in 0..50 {
                 n.notified().await;
             }
@@ -240,7 +240,7 @@ async fn test_notify_concurrent() {
 
     for _ in 0..500 {
         notify.notify_one();
-        tokio::task::yield_now().await;
+        yield_now().await;
     }
 
     for h in handles {

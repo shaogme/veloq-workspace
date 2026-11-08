@@ -28,6 +28,34 @@ pub struct RwLock<T: ?Sized> {
     data: UnsafeCell<T>,
 }
 
+pub struct RwLockReadGuard<'a, T: ?Sized> {
+    lock: &'a RwLock<T>,
+}
+
+pub struct RwLockWriteGuard<'a, T: ?Sized> {
+    lock: &'a RwLock<T>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    Initial,
+    Waiting,
+    Granted,
+    Completed,
+}
+
+struct RwLockReadFuture<'a, T: ?Sized> {
+    lock: &'a RwLock<T>,
+    node: WaiterNode,
+    phase: Phase,
+}
+
+struct RwLockWriteFuture<'a, T: ?Sized> {
+    lock: &'a RwLock<T>,
+    node: WaiterNode,
+    phase: Phase,
+}
+
 impl<T> RwLock<T> {
     /// Creates a new `RwLock` in an unlocked state with the given data.
     #[cfg(not(feature = "loom"))]
@@ -150,11 +178,6 @@ impl<T> From<T> for RwLock<T> {
     }
 }
 
-/// A RAII guard returned by [`RwLock::read`].
-pub struct RwLockReadGuard<'a, T: ?Sized> {
-    lock: &'a RwLock<T>,
-}
-
 impl<T: ?Sized> Deref for RwLockReadGuard<'_, T> {
     type Target = T;
 
@@ -191,11 +214,6 @@ impl<T: ?Sized + fmt::Display> fmt::Display for RwLockReadGuard<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&**self, f)
     }
-}
-
-/// A RAII guard returned by [`RwLock::write`].
-pub struct RwLockWriteGuard<'a, T: ?Sized> {
-    lock: &'a RwLock<T>,
 }
 
 impl<T: ?Sized> Deref for RwLockWriteGuard<'_, T> {
@@ -259,20 +277,6 @@ impl<T: ?Sized + fmt::Display> fmt::Display for RwLockWriteGuard<'_, T> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Phase {
-    Initial,
-    Waiting,
-    Granted,
-    Completed,
-}
-
-struct RwLockReadFuture<'a, T: ?Sized> {
-    lock: &'a RwLock<T>,
-    node: WaiterNode,
-    phase: Phase,
-}
-
 impl<'a, T: ?Sized> Future for RwLockReadFuture<'a, T> {
     type Output = RwLockReadGuard<'a, T>;
 
@@ -285,7 +289,7 @@ impl<'a, T: ?Sized> Future for RwLockReadFuture<'a, T> {
             if this.lock.waiters.refresh_waker(&mut this.node, cx).linked() {
                 return Poll::Pending;
             }
-            assert_eq!(this.node.state, NODE_GRANTED);
+            assert_eq!(this.node.state(), NODE_GRANTED);
             this.phase = Phase::Granted;
         }
         if this.phase == Phase::Granted {
@@ -310,11 +314,11 @@ impl<'a, T: ?Sized> Future for RwLockReadFuture<'a, T> {
             acquired = true;
         } else {
             let new_waker = cx.waker().clone();
-            let old_waker = this.node.waker.replace(new_waker);
+            let old_waker = this.node.replace_waker(new_waker);
             drop(old_waker);
             this.lock.waiters.with_lock(|waiters| {
                 unsafe {
-                    this.node.state = NODE_WAITING;
+                    this.node.set_state(NODE_WAITING);
                     let node_pin = Pin::new_unchecked(&mut this.node);
                     waiters.push_back(node_pin);
                 }
@@ -337,9 +341,9 @@ impl<T: ?Sized> Drop for RwLockReadFuture<'_, T> {
             Phase::Initial | Phase::Completed => None,
             Phase::Granted => cancel_granted(self.lock, &self.node),
             Phase::Waiting => self.lock.waiters.with_lock(|waiters| {
-                if self.node.state == NODE_GRANTED {
+                if self.node.state() == NODE_GRANTED {
                     cancel_granted_locked(self.lock, waiters, &self.node)
-                } else if self.node.state == NODE_WAITING && self.node.link.is_linked() {
+                } else if self.node.state() == NODE_WAITING && self.node.is_linked() {
                     remove_waiting_locked(self.lock, waiters, &self.node)
                 } else {
                     None
@@ -350,12 +354,6 @@ impl<T: ?Sized> Drop for RwLockReadFuture<'_, T> {
             detached.wake();
         }
     }
-}
-
-struct RwLockWriteFuture<'a, T: ?Sized> {
-    lock: &'a RwLock<T>,
-    node: WaiterNode,
-    phase: Phase,
 }
 
 impl<'a, T: ?Sized> Future for RwLockWriteFuture<'a, T> {
@@ -370,7 +368,7 @@ impl<'a, T: ?Sized> Future for RwLockWriteFuture<'a, T> {
             if this.lock.waiters.refresh_waker(&mut this.node, cx).linked() {
                 return Poll::Pending;
             }
-            assert_eq!(this.node.state, NODE_GRANTED);
+            assert_eq!(this.node.state(), NODE_GRANTED);
             this.phase = Phase::Granted;
         }
         if this.phase == Phase::Granted {
@@ -387,11 +385,11 @@ impl<'a, T: ?Sized> Future for RwLockWriteFuture<'a, T> {
             acquired = true;
         } else {
             let new_waker = cx.waker().clone();
-            let old_waker = this.node.waker.replace(new_waker);
+            let old_waker = this.node.replace_waker(new_waker);
             drop(old_waker);
             this.lock.waiters.with_lock(|waiters| {
                 unsafe {
-                    this.node.state = NODE_WAITING;
+                    this.node.set_state(NODE_WAITING);
                     let node_pin = Pin::new_unchecked(&mut this.node);
                     waiters.push_back(node_pin);
                 }
@@ -414,9 +412,9 @@ impl<T: ?Sized> Drop for RwLockWriteFuture<'_, T> {
             Phase::Initial | Phase::Completed => None,
             Phase::Granted => cancel_granted(self.lock, &self.node),
             Phase::Waiting => self.lock.waiters.with_lock(|waiters| {
-                if self.node.state == NODE_GRANTED {
+                if self.node.state() == NODE_GRANTED {
                     cancel_granted_locked(self.lock, waiters, &self.node)
-                } else if self.node.state == NODE_WAITING && self.node.link.is_linked() {
+                } else if self.node.state() == NODE_WAITING && self.node.is_linked() {
                     remove_waiting_locked(self.lock, waiters, &self.node)
                 } else {
                     None
@@ -439,7 +437,7 @@ fn cancel_granted_locked<T: ?Sized>(
     waiters: &mut LinkedList<WaiterAdapter>,
     node: &WaiterNode,
 ) -> Option<DetachedWaiter> {
-    if node.kind == KIND_READER {
+    if node.kind() == KIND_READER {
         let readers = lock.reader_count.get();
         assert!(readers > 0, "RwLock reader count underflow");
         lock.reader_count.set(readers - 1);
@@ -456,7 +454,7 @@ fn remove_waiting_locked<T: ?Sized>(
     waiters: &mut LinkedList<WaiterAdapter>,
     node: &WaiterNode,
 ) -> Option<DetachedWaiter> {
-    let kind = node.kind;
+    let kind = node.kind();
     unsafe {
         let ptr = NonNull::from(node);
         let mut cursor = waiters.cursor_mut_from_ptr(ptr);
@@ -476,7 +474,7 @@ fn grant_front_locked<T: ?Sized>(
 ) -> Option<DetachedWaiter> {
     let readers = lock.reader_count.get();
     let writer_locked = lock.writer_locked.get();
-    let kind = waiters.front_mut().get().map(|node| node.kind);
+    let kind = waiters.front_mut().get().map(WaiterNode::kind);
     let can_grant = match kind {
         Some(KIND_WRITER) => !writer_locked && readers == 0,
         Some(KIND_READER) => !writer_locked && (readers == 0 || allow_reader_with_active_readers),
@@ -488,7 +486,7 @@ fn grant_front_locked<T: ?Sized>(
 
     let mut node = waiters.pop_front().expect("wait queue front disappeared");
     let node_mut = unsafe { node.as_mut().get_unchecked_mut() };
-    node_mut.state = NODE_GRANTED;
+    node_mut.set_state(NODE_GRANTED);
     match kind {
         Some(KIND_WRITER) => lock.writer_locked.set(true),
         Some(KIND_READER) => {
@@ -499,6 +497,6 @@ fn grant_front_locked<T: ?Sized>(
         }
         _ => unreachable!(),
     }
-    let waker = node_mut.waker.take();
-    Some(DetachedWaiter { waker })
+    let waker = node_mut.take_waker();
+    Some(DetachedWaiter::new(waker))
 }

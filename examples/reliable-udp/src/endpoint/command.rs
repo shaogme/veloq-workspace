@@ -4,8 +4,7 @@ use veloq::{
     runtime::context::Ctx,
     std::num::NonZeroUsize,
     sync::{
-        TrySendError,
-        mpmc::{BoundedReceiver, BoundedSender},
+        MpmcBoundedReceiver as BoundedReceiver, MpmcBoundedSender as BoundedSender, TrySendError,
     },
 };
 

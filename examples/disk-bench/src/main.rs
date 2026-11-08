@@ -6,7 +6,7 @@ use veloq::{
     io::buffer::FixedBuf,
     nz,
     runtime::{Runtime, context::Ctx, scope},
-    sync::mpsc,
+    sync::Mpsc as mpsc,
 };
 use veloq_std::{
     cmp::Ordering,

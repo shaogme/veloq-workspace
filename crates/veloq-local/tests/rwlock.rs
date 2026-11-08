@@ -1,7 +1,7 @@
 use std::{cell::Cell, future::pending, pin::pin, rc::Rc, time::Duration};
 use tokio::{
-    task::{LocalSet, yield_now},
-    time::sleep,
+    task::{LocalSet, spawn_local, yield_now},
+    time::{sleep, timeout},
 };
 use veloq_local::RwLock;
 
@@ -78,7 +78,7 @@ async fn test_rwlock_concurrent_readers() {
                 let l = lock.clone();
                 let a = active_readers.clone();
                 let m = max_readers.clone();
-                handles.push(tokio::task::spawn_local(async move {
+                handles.push(spawn_local(async move {
                     let guard = l.read().await;
                     let current = a.get() + 1;
                     a.set(current);
@@ -114,7 +114,7 @@ async fn test_rwlock_contention() {
             // 5 writers
             for _ in 0..5 {
                 let l = lock.clone();
-                handles.push(tokio::task::spawn_local(async move {
+                handles.push(spawn_local(async move {
                     for _ in 0..20 {
                         let mut guard = l.write().await;
                         let val = *guard;
@@ -127,7 +127,7 @@ async fn test_rwlock_contention() {
             // 5 readers
             for _ in 0..5 {
                 let l = lock.clone();
-                handles.push(tokio::task::spawn_local(async move {
+                handles.push(spawn_local(async move {
                     for _ in 0..20 {
                         let guard = l.read().await;
                         assert!(*guard >= 0);
@@ -156,7 +156,7 @@ async fn test_rwlock_downgrade() {
             *w_guard = 42;
 
             let l_clone = lock.clone();
-            let reader_handle = tokio::task::spawn_local(async move {
+            let reader_handle = spawn_local(async move {
                 let guard = l_clone.read().await;
                 *guard
             });
@@ -192,7 +192,7 @@ async fn test_rwlock_writer_fairness() {
             // 2. Writer tries to acquire and queues
             let l_w = lock.clone();
             let o_w = order.clone();
-            let writer_handle = tokio::task::spawn_local(async move {
+            let writer_handle = spawn_local(async move {
                 let mut guard = l_w.write().await;
                 *guard = 1;
                 let mut list = o_w.take();
@@ -205,7 +205,7 @@ async fn test_rwlock_writer_fairness() {
             // 3. Second reader tries to acquire - should be queued behind writer to prevent starvation
             let l_r = lock.clone();
             let o_r = order.clone();
-            let reader_handle = tokio::task::spawn_local(async move {
+            let reader_handle = spawn_local(async move {
                 let guard = l_r.read().await;
                 assert_eq!(*guard, 1);
                 let mut list = o_r.take();
@@ -236,13 +236,13 @@ async fn test_rwlock_cancellation_waiting_reader() {
             let w_guard = lock.write().await;
 
             let l1 = lock.clone();
-            let t1 = tokio::task::spawn_local(async move {
+            let t1 = spawn_local(async move {
                 let _g = l1.read().await;
                 pending::<()>().await;
             });
 
             let l2 = lock.clone();
-            let t2 = tokio::task::spawn_local(async move {
+            let t2 = spawn_local(async move {
                 let g = l2.read().await;
                 *g
             });
@@ -271,13 +271,13 @@ async fn test_rwlock_cancellation_waiting_writer() {
             let r_guard = lock.read().await;
 
             let l1 = lock.clone();
-            let t1 = tokio::task::spawn_local(async move {
+            let t1 = spawn_local(async move {
                 let mut _g = l1.write().await;
                 pending::<()>().await;
             });
 
             let l2 = lock.clone();
-            let t2 = tokio::task::spawn_local(async move {
+            let t2 = spawn_local(async move {
                 let g = l2.read().await;
                 *g
             });
@@ -309,15 +309,15 @@ async fn test_rwlock_cancellation_granted_reader() {
             let w_guard = lock.write().await;
 
             let l1 = lock.clone();
-            let t1 = tokio::task::spawn_local(async move {
+            let t1 = spawn_local(async move {
                 let fut = l1.read();
                 let mut pinned = pin!(fut);
-                let _ = tokio::time::timeout(Duration::from_millis(5), &mut pinned).await;
+                let _ = timeout(Duration::from_millis(5), &mut pinned).await;
                 pending::<()>().await;
             });
 
             let l2 = lock.clone();
-            let t2 = tokio::task::spawn_local(async move {
+            let t2 = spawn_local(async move {
                 let mut g = l2.write().await;
                 *g = 20;
             });
@@ -348,15 +348,15 @@ async fn test_rwlock_cancellation_granted_writer() {
             let r_guard = lock.read().await;
 
             let l1 = lock.clone();
-            let t1 = tokio::task::spawn_local(async move {
+            let t1 = spawn_local(async move {
                 let fut = l1.write();
                 let mut pinned = pin!(fut);
-                let _ = tokio::time::timeout(Duration::from_millis(5), &mut pinned).await;
+                let _ = timeout(Duration::from_millis(5), &mut pinned).await;
                 pending::<()>().await;
             });
 
             let l2 = lock.clone();
-            let t2 = tokio::task::spawn_local(async move {
+            let t2 = spawn_local(async move {
                 let g = l2.read().await;
                 *g
             });

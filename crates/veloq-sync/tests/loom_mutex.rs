@@ -7,7 +7,7 @@ use veloq_std::{
     ptr,
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
-use veloq_sync::mutex::Mutex;
+use veloq_sync::Mutex;
 
 fn dummy_waker() -> Waker {
     unsafe { Waker::from_raw(RawWaker::new(ptr::null(), &VTABLE)) }

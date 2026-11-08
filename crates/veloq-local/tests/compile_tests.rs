@@ -1,6 +1,8 @@
+use trybuild::TestCases;
+
 #[test]
 fn compile_tests() {
-    let t = trybuild::TestCases::new();
+    let t = TestCases::new();
     #[cfg(not(windows))]
     {
         t.compile_fail("tests/ui/oneshot_escape_fail.rs");

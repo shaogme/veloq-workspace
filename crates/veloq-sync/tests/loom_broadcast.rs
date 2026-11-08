@@ -1,7 +1,7 @@
 #![cfg(feature = "loom")]
 
 use loom::{future::block_on, thread};
-use veloq_sync::broadcast::{self, RecvError};
+use veloq_sync::{Broadcast as broadcast, BroadcastRecvError as RecvError};
 
 #[test]
 fn loom_broadcast_send_recv() {

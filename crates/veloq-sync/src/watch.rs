@@ -1,4 +1,4 @@
-use core::ops::Deref;
+use core::{ops::Deref, ptr::eq};
 
 use veloq_std::{
     fmt,
@@ -35,7 +35,32 @@ struct Inner<T> {
     tx_notify: Notify,
 }
 
+pub struct Ref<'a, T> {
+    inner: UnpoisonedRwLockReadGuard<'a, WatchState<T>>,
+}
+
+pub struct Watch;
+
+pub struct BorrowedSender<'a, T> {
+    state: &'a Inner<T>,
+}
+
+pub struct BorrowedReceiver<'a, T> {
+    state: &'a Inner<T>,
+    version: usize,
+}
+
+pub struct Sender<T> {
+    state: Arc<Inner<T>>,
+}
+
+pub struct Receiver<T> {
+    state: Arc<Inner<T>>,
+    version: usize,
+}
+
 unsafe impl<T: Send + Sync> Send for Inner<T> {}
+
 unsafe impl<T: Send + Sync> Sync for Inner<T> {}
 
 impl<T> Inner<T> {
@@ -53,7 +78,7 @@ impl<T> Inner<T> {
         {
             let mut state = self.state.write();
             if state.receiver_count == 0 {
-                return Err(SendError(value));
+                return Err(SendError::new(value));
             }
             state.value = value;
             state.version = state.version.wrapping_add(1);
@@ -236,14 +261,6 @@ impl<T> Inner<T> {
     }
 }
 
-/// A borrowed reference to a value in a watch channel.
-///
-/// This read guard protects the complete channel state. Holding it can delay
-/// sends, subscriptions, receiver destruction, and sender shutdown.
-pub struct Ref<'a, T> {
-    inner: UnpoisonedRwLockReadGuard<'a, WatchState<T>>,
-}
-
 impl<T> Deref for Ref<'_, T> {
     type Target = T;
 
@@ -265,12 +282,8 @@ impl<T: fmt::Display> fmt::Display for Ref<'_, T> {
     }
 }
 
-/// The sender half of a borrowed watch channel.
-pub struct BorrowedSender<'a, T> {
-    state: &'a Inner<T>,
-}
-
 unsafe impl<T: Send + Sync> Send for BorrowedSender<'_, T> {}
+
 unsafe impl<T: Send + Sync> Sync for BorrowedSender<'_, T> {}
 
 impl<'a, T> BorrowedSender<'a, T> {
@@ -340,13 +353,8 @@ impl<T> fmt::Debug for BorrowedSender<'_, T> {
     }
 }
 
-/// The receiver half of a borrowed watch channel.
-pub struct BorrowedReceiver<'a, T> {
-    state: &'a Inner<T>,
-    version: usize,
-}
-
 unsafe impl<T: Send + Sync> Send for BorrowedReceiver<'_, T> {}
+
 unsafe impl<T: Send + Sync> Sync for BorrowedReceiver<'_, T> {}
 
 impl<'a, T> BorrowedReceiver<'a, T> {
@@ -382,7 +390,7 @@ impl<'a, T> BorrowedReceiver<'a, T> {
 
     /// Returns `true` if both receivers belong to the same channel.
     pub fn same_channel(&self, other: &Self) -> bool {
-        veloq_std::ptr::eq(self.state, other.state)
+        eq(self.state, other.state)
     }
 }
 
@@ -410,12 +418,8 @@ impl<T> fmt::Debug for BorrowedReceiver<'_, T> {
     }
 }
 
-/// A sender for a watch channel.
-pub struct Sender<T> {
-    state: Arc<Inner<T>>,
-}
-
 unsafe impl<T: Send + Sync> Send for Sender<T> {}
+
 unsafe impl<T: Send + Sync> Sync for Sender<T> {}
 
 impl<T> Sender<T> {
@@ -485,13 +489,8 @@ impl<T> fmt::Debug for Sender<T> {
     }
 }
 
-/// A receiver for a watch channel.
-pub struct Receiver<T> {
-    state: Arc<Inner<T>>,
-    version: usize,
-}
-
 unsafe impl<T: Send + Sync> Send for Receiver<T> {}
+
 unsafe impl<T: Send + Sync> Sync for Receiver<T> {}
 
 impl<T> Receiver<T> {
@@ -555,24 +554,24 @@ impl<T> fmt::Debug for Receiver<T> {
     }
 }
 
-/// Creates a new watch channel returning a sender and receiver pair.
-pub fn channel<T>(init: T) -> (Sender<T>, Receiver<T>) {
-    let state = Arc::new(Inner::new(init));
-    let version = state.current_version();
-    (
-        Sender {
-            state: state.clone(),
-        },
-        Receiver { state, version },
-    )
-}
+impl Watch {
+    pub fn channel<T>(init: T) -> (Sender<T>, Receiver<T>) {
+        let state = Arc::new(Inner::new(init));
+        let version = state.current_version();
+        (
+            Sender {
+                state: state.clone(),
+            },
+            Receiver { state, version },
+        )
+    }
 
-/// Creates a new borrowed watch channel and runs the provided asynchronous closure with it.
-pub async fn with_borrowed_channel<T, F, R>(init: T, f: F) -> R
-where
-    F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
-{
-    let state = Inner::new(init);
-    let (tx, rx) = state.borrowed_parts();
-    f(tx, rx).await
+    pub async fn with_borrowed_channel<T, F, R>(init: T, f: F) -> R
+    where
+        F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
+    {
+        let state = Inner::new(init);
+        let (tx, rx) = state.borrowed_parts();
+        f(tx, rx).await
+    }
 }

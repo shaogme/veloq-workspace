@@ -1,11 +1,11 @@
 use core::cell::UnsafeCell;
-use futures_core::Future;
-use futures_core::stream::Stream;
+use futures_core::{Future, stream::Stream};
 
 use veloq_std::{
     alloc::{Layout, alloc, dealloc, handle_alloc_error},
     fmt, mem,
     mem::ManuallyDrop,
+    ops::AsyncFnOnce,
     pin::Pin,
     ptr::{self, NonNull},
     rc::Rc,
@@ -15,6 +15,8 @@ use veloq_std::{
 pub use crate::common::{ChannelCapacity, SendError, TryRecvError};
 use crate::notify::{Notified, Notify};
 
+pub struct Spsc;
+
 struct ChannelState<T> {
     buffer: NonNull<T>,
     capacity: usize,
@@ -23,6 +25,101 @@ struct ChannelState<T> {
     tail: usize,
     is_closed: bool,
     is_bounded: bool,
+}
+
+struct Inner<T> {
+    inner: UnsafeCell<ChannelState<T>>,
+    not_empty: Notify,
+    not_full: Notify,
+}
+
+#[derive(Debug)]
+pub struct Sender<'a, T> {
+    inner: &'a Inner<T>,
+}
+
+#[derive(Debug)]
+pub struct Receiver<'a, T> {
+    inner: &'a Inner<T>,
+}
+
+pub struct SendFuture<'a, 'b, T> {
+    sender: &'b Sender<'a, T>,
+    item: Option<T>,
+    notified: Option<Notified<'a>>,
+}
+
+pub struct RecvFuture<'a, 'b, T> {
+    receiver: &'b Receiver<'a, T>,
+    notified: Option<Notified<'a>>,
+}
+
+pub struct ChannelStream<'a, 'b, T> {
+    receiver: &'b Receiver<'a, T>,
+    notified: Option<Notified<'a>>,
+}
+
+pub struct OwnedSender<T> {
+    inner: Rc<Inner<T>>,
+}
+
+pub struct OwnedReceiver<T> {
+    inner: Rc<Inner<T>>,
+}
+
+pub struct OwnedChannelStream<T> {
+    receiver: OwnedReceiver<T>,
+    notified: Option<Notified<'static>>,
+}
+
+impl Spsc {
+    pub fn channel<T>(capacity: ChannelCapacity) -> (OwnedSender<T>, OwnedReceiver<T>) {
+        let state = Rc::new(Inner::new(capacity));
+        (
+            OwnedSender {
+                inner: state.clone(),
+            },
+            OwnedReceiver { inner: state },
+        )
+    }
+
+    pub fn bounded<T>(size: usize) -> (OwnedSender<T>, OwnedReceiver<T>) {
+        Self::channel(ChannelCapacity::Bounded(size))
+    }
+
+    pub fn unbounded<T>() -> (OwnedSender<T>, OwnedReceiver<T>) {
+        Self::channel(ChannelCapacity::Unbounded)
+    }
+
+    pub async fn with_borrowed_bounded<T, F, R>(size: usize, f: F) -> R
+    where
+        F: for<'a> AsyncFnOnce(Sender<'a, T>, Receiver<'a, T>) -> R,
+    {
+        let state = Inner::bounded(size);
+        let (tx, rx) = state.split();
+        f(tx, rx).await
+    }
+
+    pub async fn with_borrowed_unbounded<T, F, R>(f: F) -> R
+    where
+        F: for<'a> AsyncFnOnce(Sender<'a, T>, Receiver<'a, T>) -> R,
+    {
+        let state = Inner::unbounded();
+        let (tx, rx) = state.split();
+        f(tx, rx).await
+    }
+
+    pub fn owned_channel<T>(capacity: ChannelCapacity) -> (OwnedSender<T>, OwnedReceiver<T>) {
+        Self::channel(capacity)
+    }
+
+    pub fn owned_bounded<T>(size: usize) -> (OwnedSender<T>, OwnedReceiver<T>) {
+        Self::bounded(size)
+    }
+
+    pub fn owned_unbounded<T>() -> (OwnedSender<T>, OwnedReceiver<T>) {
+        Self::unbounded()
+    }
 }
 
 impl<T> ChannelState<T> {
@@ -171,12 +268,6 @@ impl<T> Drop for ChannelState<T> {
     }
 }
 
-struct Inner<T> {
-    inner: UnsafeCell<ChannelState<T>>,
-    not_empty: Notify,
-    not_full: Notify,
-}
-
 impl<T> fmt::Debug for Inner<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Inner").finish_non_exhaustive()
@@ -207,48 +298,6 @@ impl<T> Inner<T> {
     fn split<'a>(&'a self) -> (Sender<'a, T>, Receiver<'a, T>) {
         (Sender { inner: self }, Receiver { inner: self })
     }
-}
-
-/// Creates a new bounded SPSC channel.
-pub fn bounded<T>(size: usize) -> (OwnedSender<T>, OwnedReceiver<T>) {
-    owned_bounded(size)
-}
-
-/// Creates a new unbounded SPSC channel.
-pub fn unbounded<T>() -> (OwnedSender<T>, OwnedReceiver<T>) {
-    owned_unbounded()
-}
-
-/// Creates a new borrowed bounded SPSC channel and runs the provided closure.
-pub async fn with_borrowed_bounded<T, F, R>(size: usize, f: F) -> R
-where
-    F: for<'a> veloq_std::ops::AsyncFnOnce(Sender<'a, T>, Receiver<'a, T>) -> R,
-{
-    let state = Inner::bounded(size);
-    let (tx, rx) = state.split();
-    f(tx, rx).await
-}
-
-/// Creates a new borrowed unbounded SPSC channel and runs the provided closure.
-pub async fn with_borrowed_unbounded<T, F, R>(f: F) -> R
-where
-    F: for<'a> veloq_std::ops::AsyncFnOnce(Sender<'a, T>, Receiver<'a, T>) -> R,
-{
-    let state = Inner::unbounded();
-    let (tx, rx) = state.split();
-    f(tx, rx).await
-}
-
-/// SPSC Channel Sender
-#[derive(Debug)]
-pub struct Sender<'a, T> {
-    inner: &'a Inner<T>,
-}
-
-/// SPSC Channel Receiver
-#[derive(Debug)]
-pub struct Receiver<'a, T> {
-    inner: &'a Inner<T>,
 }
 
 impl<'a, T> Drop for Sender<'a, T> {
@@ -315,12 +364,6 @@ impl<'a, T> Sender<'a, T> {
         let inner = unsafe { &*self.inner.inner.get() };
         inner.is_empty()
     }
-}
-
-pub struct SendFuture<'a, 'b, T> {
-    sender: &'b Sender<'a, T>,
-    item: Option<T>,
-    notified: Option<Notified<'a>>,
 }
 
 impl<T> Unpin for SendFuture<'_, '_, T> {}
@@ -416,11 +459,6 @@ impl<'a, T> Receiver<'a, T> {
     }
 }
 
-pub struct RecvFuture<'a, 'b, T> {
-    receiver: &'b Receiver<'a, T>,
-    notified: Option<Notified<'a>>,
-}
-
 impl<'a, 'b, T> Future for RecvFuture<'a, 'b, T> {
     type Output = Option<T>;
 
@@ -465,11 +503,6 @@ impl<'a, 'b, T> Future for RecvFuture<'a, 'b, T> {
     }
 }
 
-pub struct ChannelStream<'a, 'b, T> {
-    receiver: &'b Receiver<'a, T>,
-    notified: Option<Notified<'a>>,
-}
-
 impl<'a, 'b, T> Stream for ChannelStream<'a, 'b, T> {
     type Item = T;
 
@@ -512,37 +545,6 @@ impl<'a, 'b, T> Stream for ChannelStream<'a, 'b, T> {
             }
         }
     }
-}
-
-/// Owned SPSC channel sender.
-pub struct OwnedSender<T> {
-    inner: Rc<Inner<T>>,
-}
-
-/// Owned SPSC channel receiver.
-pub struct OwnedReceiver<T> {
-    inner: Rc<Inner<T>>,
-}
-
-/// Creates a new owned SPSC channel.
-pub fn owned_channel<T>(capacity: ChannelCapacity) -> (OwnedSender<T>, OwnedReceiver<T>) {
-    let state = Rc::new(Inner::new(capacity));
-    (
-        OwnedSender {
-            inner: state.clone(),
-        },
-        OwnedReceiver { inner: state },
-    )
-}
-
-/// Creates a new bounded owned SPSC channel.
-pub fn owned_bounded<T>(size: usize) -> (OwnedSender<T>, OwnedReceiver<T>) {
-    owned_channel(ChannelCapacity::Bounded(size))
-}
-
-/// Creates a new unbounded owned SPSC channel.
-pub fn owned_unbounded<T>() -> (OwnedSender<T>, OwnedReceiver<T>) {
-    owned_channel(ChannelCapacity::Unbounded)
 }
 
 impl<T> OwnedSender<T> {
@@ -611,12 +613,6 @@ impl<T> Drop for OwnedReceiver<T> {
     fn drop(&mut self) {
         drop(Receiver { inner: &self.inner });
     }
-}
-
-/// A stream of messages from an owned SPSC channel.
-pub struct OwnedChannelStream<T> {
-    receiver: OwnedReceiver<T>,
-    notified: Option<Notified<'static>>,
 }
 
 impl<T> Stream for OwnedChannelStream<T> {

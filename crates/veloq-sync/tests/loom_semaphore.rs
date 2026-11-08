@@ -1,7 +1,7 @@
 #![cfg(feature = "loom")]
 
 use loom::{future::block_on, sync::Arc, thread};
-use veloq_sync::semaphore::{AcquireError, AddPermitsError, Semaphore, TryAcquireError};
+use veloq_sync::{AcquireError, AddPermitsError, Semaphore, TryAcquireError};
 
 #[test]
 fn test_loom_semaphore_exclusion() {
@@ -208,10 +208,7 @@ fn test_loom_semaphore_failed_add_and_release() {
         let t1 = thread::spawn(move || {
             assert_eq!(
                 s1.add_permits(usize::MAX),
-                Err(AddPermitsError {
-                    requested: usize::MAX,
-                    remaining: usize::MAX - 1,
-                })
+                Err(AddPermitsError::new(usize::MAX, usize::MAX - 1))
             );
         });
 

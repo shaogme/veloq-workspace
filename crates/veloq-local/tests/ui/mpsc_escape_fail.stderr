@@ -1,35 +1,35 @@
 error: lifetime may not live long enough
  --> tests/ui/mpsc_escape_fail.rs:6:79
   |
-6 |     let _escaped = mpsc::with_borrowed_unbounded::<i32, _, _>(async |tx, _rx| tx).await;
+6 |     let _escaped = Mpsc::with_borrowed_unbounded::<i32, _, _>(async |tx, _rx| tx).await;
   |                                                                      --     - ^^ returning this value requires that `'1` must outlive `'2`
   |                                                                      |      |
-  |                                                                      |      return type of async closure is veloq_local::mpsc::BorrowedSender<'2, i32>
-  |                                                                      has type `veloq_local::mpsc::BorrowedSender<'1, i32>`
+  |                                                                      |      return type of async closure is MpscBorrowedSender<'2, i32>
+  |                                                                      has type `MpscBorrowedSender<'1, i32>`
 
 error: lifetime may not live long enough
   --> tests/ui/mpsc_escape_fail.rs:10:79
    |
-10 |     let _escaped = mpsc::with_borrowed_unbounded::<i32, _, _>(async |_tx, rx| rx).await;
+10 |     let _escaped = Mpsc::with_borrowed_unbounded::<i32, _, _>(async |_tx, rx| rx).await;
    |                                                                      ---    - ^^ returning this value requires that `'1` must outlive `'2`
    |                                                                      |      |
-   |                                                                      |      return type of async closure is veloq_local::mpsc::BorrowedReceiver<'2, i32>
-   |                                                                      has type `veloq_local::mpsc::BorrowedSender<'1, i32>`
+   |                                                                      |      return type of async closure is MpscBorrowedReceiver<'2, i32>
+   |                                                                      has type `MpscBorrowedSender<'1, i32>`
 
 error: lifetime may not live long enough
   --> tests/ui/mpsc_escape_fail.rs:14:80
    |
-14 |     let _escaped = mpsc::with_borrowed_bounded::<i32, _, _>(1, async |tx, _rx| tx).await;
+14 |     let _escaped = Mpsc::with_borrowed_bounded::<i32, _, _>(1, async |tx, _rx| tx).await;
    |                                                                       --     - ^^ returning this value requires that `'1` must outlive `'2`
    |                                                                       |      |
-   |                                                                       |      return type of async closure is veloq_local::mpsc::BorrowedSender<'2, i32>
-   |                                                                       has type `veloq_local::mpsc::BorrowedSender<'1, i32>`
+   |                                                                       |      return type of async closure is MpscBorrowedSender<'2, i32>
+   |                                                                       has type `MpscBorrowedSender<'1, i32>`
 
 error: lifetime may not live long enough
   --> tests/ui/mpsc_escape_fail.rs:18:80
    |
-18 |     let _escaped = mpsc::with_borrowed_bounded::<i32, _, _>(1, async |_tx, rx| rx).await;
+18 |     let _escaped = Mpsc::with_borrowed_bounded::<i32, _, _>(1, async |_tx, rx| rx).await;
    |                                                                       ---    - ^^ returning this value requires that `'1` must outlive `'2`
    |                                                                       |      |
-   |                                                                       |      return type of async closure is veloq_local::mpsc::BorrowedReceiver<'2, i32>
-   |                                                                       has type `veloq_local::mpsc::BorrowedSender<'1, i32>`
+   |                                                                       |      return type of async closure is MpscBorrowedReceiver<'2, i32>
+   |                                                                       has type `MpscBorrowedSender<'1, i32>`

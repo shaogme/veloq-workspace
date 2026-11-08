@@ -7,19 +7,16 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
-use tokio::time::sleep;
+use tokio::{select, spawn, time::sleep};
 use veloq_std::sync::Arc;
-use veloq_sync::{
-    condvar::Condvar,
-    mutex::{Mutex, MutexGuard},
-};
+use veloq_sync::{Condvar, Mutex, MutexGuard};
 
 #[tokio::test]
 async fn test_condvar_simple() {
     let pair = Arc::new((Mutex::new(false), Condvar::new()));
     let pair2 = pair.clone();
 
-    let handle = tokio::spawn(async move {
+    let handle = spawn(async move {
         let (lock, cvar) = &*pair2;
         let mut guard = lock.lock().await;
         while !*guard {
@@ -54,7 +51,7 @@ async fn test_condvar_notify_before_wait() {
     let completed = Arc::new(AtomicBool::new(false));
     let completed2 = completed.clone();
 
-    let handle = tokio::spawn(async move {
+    let handle = spawn(async move {
         let (lock, cvar) = &*pair2;
         let mut guard = lock.lock().await;
         while !*guard {
@@ -83,7 +80,7 @@ async fn test_condvar_notify_all() {
 
     for _ in 0..5 {
         let pair2 = pair.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(spawn(async move {
             let (lock, cvar) = &*pair2;
             let mut val = lock.lock().await;
             while *val < 10 {
@@ -113,7 +110,7 @@ async fn test_condvar_wait_while() {
     let pair = Arc::new((Mutex::new(false), Condvar::new()));
     let pair2 = pair.clone();
 
-    let handle = tokio::spawn(async move {
+    let handle = spawn(async move {
         let (lock, cvar) = &*pair2;
         let guard = lock.lock().await;
         let mut guard = cvar.wait_while(guard, |flag| !*flag).await;
@@ -139,7 +136,7 @@ async fn test_condvar_wait_while_async() {
     let pair = Arc::new((Mutex::new(0usize), Condvar::new()));
     let pair2 = pair.clone();
 
-    let handle = tokio::spawn(async move {
+    let handle = spawn(async move {
         let (lock, cvar) = &*pair2;
         let guard = lock.lock().await;
         let guard = cvar
@@ -182,7 +179,7 @@ async fn test_condvar_bounded_queue() {
     let mut consumers = vec![];
     for _ in 0..3 {
         let q2 = q.clone();
-        consumers.push(tokio::spawn(async move {
+        consumers.push(spawn(async move {
             let mut sum = 0;
             loop {
                 let mut guard = q2.queue.lock().await;
@@ -201,7 +198,7 @@ async fn test_condvar_bounded_queue() {
     }
 
     let q3 = q.clone();
-    let producer = tokio::spawn(async move {
+    let producer = spawn(async move {
         for i in 1..=50 {
             let mut guard = q3.queue.lock().await;
             while guard.len() >= q3.capacity {
@@ -233,11 +230,11 @@ async fn test_condvar_cancellation_waiting() {
     let pair = Arc::new((Mutex::new(false), Condvar::new()));
     let pair2 = pair.clone();
 
-    let handle = tokio::spawn(async move {
+    let handle = spawn(async move {
         let (lock, cvar) = &*pair2;
         let guard = lock.lock().await;
         let mut wait_fut = pin!(cvar.wait(guard));
-        tokio::select! {
+        select! {
             _ = &mut wait_fut => panic!("should not complete"),
             _ = sleep(Duration::from_millis(15)) => {}
         }
@@ -247,7 +244,7 @@ async fn test_condvar_cancellation_waiting() {
 
     let (lock, cvar) = &*pair;
     let pair3 = pair.clone();
-    let handle2 = tokio::spawn(async move {
+    let handle2 = spawn(async move {
         let (lock, cvar) = &*pair3;
         let mut guard = lock.lock().await;
         while !*guard {
@@ -278,18 +275,18 @@ async fn test_condvar_cancellation_transfer_notify() {
     let started2 = Arc::new(AtomicBool::new(false));
     let started2_c = started2.clone();
 
-    let h1 = tokio::spawn(async move {
+    let h1 = spawn(async move {
         let (lock, cvar) = &*pair1;
         let guard = lock.lock().await;
         started1_c.store(true, Ordering::Release);
         let mut wait_fut = pin!(cvar.wait(guard));
-        tokio::select! {
+        select! {
             _ = &mut wait_fut => 1,
             _ = pending::<()>() => 0,
         }
     });
 
-    let h2 = tokio::spawn(async move {
+    let h2 = spawn(async move {
         let (lock, cvar) = &*pair2;
         let guard = lock.lock().await;
         started2_c.store(true, Ordering::Release);

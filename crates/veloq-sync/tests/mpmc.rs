@@ -1,12 +1,20 @@
 #![cfg(not(feature = "loom"))]
 
-use std::{future::poll_fn, pin::pin, task::Poll};
+use std::{
+    future::poll_fn,
+    pin::{Pin, pin},
+    task::Poll,
+};
 
 use futures_core::Stream;
-use tokio::time::{Duration, timeout};
-use veloq_sync::mpmc;
+use tokio::{
+    spawn,
+    task::yield_now,
+    time::{Duration, timeout},
+};
+use veloq_sync::Mpmc as mpmc;
 
-async fn next<S>(mut stream: std::pin::Pin<&mut S>) -> Option<S::Item>
+async fn next<S>(mut stream: Pin<&mut S>) -> Option<S::Item>
 where
     S: Stream + ?Sized,
 {
@@ -16,9 +24,9 @@ where
 #[tokio::test]
 async fn receives_message_sent_after_pending() {
     let (tx, rx) = mpmc::unbounded();
-    let task = tokio::spawn(async move { rx.recv().await });
+    let task = spawn(async move { rx.recv().await });
 
-    tokio::task::yield_now().await;
+    yield_now().await;
     tx.send(7).await.unwrap();
 
     assert_eq!(

@@ -1,18 +1,15 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use futures_core::Stream;
-use tokio::pin;
-use veloq_local::mpsc;
+use tokio::{pin, runtime::Builder};
+use veloq_local::Mpsc;
 use veloq_std::future::poll_fn;
 
 fn bench_stream_creation(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
 
     c.bench_function("stream_creation_and_poll", |b| {
         b.to_async(&rt).iter(|| async {
-            mpsc::with_borrowed_unbounded(async |tx, rx| {
+            Mpsc::with_borrowed_unbounded(async |tx, rx| {
                 tx.send(1).await.unwrap();
 
                 let stream = rx.stream();

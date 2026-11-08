@@ -4,8 +4,8 @@ error: lifetime may not live long enough
 6 |     let _escaped = watch::with_borrowed_channel(42, async |tx, _rx| tx).await;
   |                                                            --     - ^^ returning this value requires that `'1` must outlive `'2`
   |                                                            |      |
-  |                                                            |      return type of async closure is veloq_sync::watch::BorrowedSender<'2, i32>
-  |                                                            has type `veloq_sync::watch::BorrowedSender<'1, i32>`
+  |                                                            |      return type of async closure is WatchBorrowedSender<'2, i32>
+  |                                                            has type `WatchBorrowedSender<'1, i32>`
 
 error: lifetime may not live long enough
   --> tests/ui/watch_escape_fail.rs:10:69
@@ -13,5 +13,5 @@ error: lifetime may not live long enough
 10 |     let _escaped = watch::with_borrowed_channel(42, async |_tx, rx| rx).await;
    |                                                            ---    - ^^ returning this value requires that `'1` must outlive `'2`
    |                                                            |      |
-   |                                                            |      return type of async closure is veloq_sync::watch::BorrowedReceiver<'2, i32>
-   |                                                            has type `veloq_sync::watch::BorrowedSender<'1, i32>`
+   |                                                            |      return type of async closure is WatchBorrowedReceiver<'2, i32>
+   |                                                            has type `WatchBorrowedSender<'1, i32>`

@@ -1,5 +1,5 @@
-use veloq_std::task::Waker;
-use veloq_std::{error::Error, fmt};
+use veloq_intrusive_linklist::{Link, intrusive_adapter};
+use veloq_std::{error::Error, fmt, marker::PhantomPinned, task::Waker};
 
 /// Channel capacity configuration
 #[derive(Debug, Clone, Copy)]
@@ -55,10 +55,72 @@ impl fmt::Display for TryRecvError {
 
 impl Error for TryRecvError {}
 
-/// Updates the stored waker if it does not match the current context waker.
-pub fn update_waker(waker_slot: &mut Option<Waker>, new_waker: &Waker) {
-    if waker_slot.as_ref().is_some_and(|w| w.will_wake(new_waker)) {
-        return;
+pub(crate) struct WaiterNode {
+    waker: Option<Waker>,
+    link: Link,
+    kind: usize,
+    state: usize,
+    _p: PhantomPinned,
+}
+
+impl WaiterNode {
+    pub(crate) fn new() -> Self {
+        Self::new_with_kind(0)
     }
-    *waker_slot = Some(new_waker.clone());
+
+    pub(crate) fn new_with_kind(kind: usize) -> Self {
+        Self {
+            waker: None,
+            link: Link::new(),
+            kind,
+            state: 0,
+            _p: PhantomPinned,
+        }
+    }
+
+    pub(crate) fn state(&self) -> usize {
+        self.state
+    }
+
+    pub(crate) fn set_state(&mut self, state: usize) {
+        self.state = state;
+    }
+
+    pub(crate) fn kind(&self) -> usize {
+        self.kind
+    }
+
+    pub(crate) fn is_linked(&self) -> bool {
+        self.link.is_linked()
+    }
+
+    pub(crate) fn replace_waker(&mut self, new_waker: Waker) -> Option<Waker> {
+        self.waker.replace(new_waker)
+    }
+
+    pub(crate) fn take_waker(&mut self) -> Option<Waker> {
+        self.waker.take()
+    }
+
+    pub(crate) fn update_waker_slot(waker_slot: &mut Option<Waker>, new_waker: &Waker) {
+        if waker_slot
+            .as_ref()
+            .is_some_and(|waker| waker.will_wake(new_waker))
+        {
+            return;
+        }
+        *waker_slot = Some(new_waker.clone());
+    }
+}
+
+impl Default for WaiterNode {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+intrusive_adapter!(pub(crate) WaiterAdapter = WaiterNode { link: Link });
+
+impl WaiterAdapter {
+    pub(crate) const NEW: Self = Self;
 }

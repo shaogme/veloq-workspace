@@ -2,13 +2,13 @@ use std::time::Duration;
 
 use tokio::{
     task::{LocalSet, spawn_local},
-    time::sleep,
+    time::{sleep, timeout},
 };
-use veloq_local::watch::{self, RecvError, SendError};
+use veloq_local::{Watch, WatchRecvError as RecvError};
 
 #[tokio::test]
 async fn test_local_watch_basic() {
-    let (tx, mut rx) = watch::channel(10);
+    let (tx, mut rx) = Watch::channel(10);
     assert_eq!(*rx.borrow(), 10);
     assert_eq!(*tx.borrow(), 10);
     assert!(!rx.has_changed().unwrap());
@@ -23,7 +23,7 @@ async fn test_local_watch_basic() {
 
 #[tokio::test]
 async fn test_local_watch_borrow_and_update() {
-    let (tx, mut rx) = watch::channel("hello");
+    let (tx, mut rx) = Watch::channel("hello");
     tx.send("world").unwrap();
 
     assert_eq!(*rx.borrow_and_update(), "world");
@@ -32,7 +32,7 @@ async fn test_local_watch_borrow_and_update() {
 
 #[tokio::test]
 async fn test_local_watch_mark_changed_unchanged() {
-    let (_tx, mut rx) = watch::channel(100);
+    let (_tx, mut rx) = Watch::channel(100);
     assert!(!rx.has_changed().unwrap());
 
     rx.mark_changed();
@@ -44,7 +44,7 @@ async fn test_local_watch_mark_changed_unchanged() {
 
 #[tokio::test]
 async fn test_local_watch_send_modify() {
-    let (tx, mut rx) = watch::channel(5);
+    let (tx, mut rx) = Watch::channel(5);
 
     let old = tx.send_modify(|val| {
         let prev = *val;
@@ -80,7 +80,7 @@ async fn test_local_watch_send_modify() {
 
 #[tokio::test]
 async fn test_local_watch_multi_receiver() {
-    let (tx, mut rx1) = watch::channel(1);
+    let (tx, mut rx1) = Watch::channel(1);
     let mut rx2 = rx1.clone();
     let mut rx3 = tx.subscribe();
 
@@ -105,7 +105,7 @@ async fn test_local_watch_multi_receiver() {
 
 #[tokio::test]
 async fn test_local_watch_sender_drop() {
-    let (tx, mut rx) = watch::channel(10);
+    let (tx, mut rx) = Watch::channel(10);
     tx.send(20).unwrap();
     drop(tx);
 
@@ -122,7 +122,7 @@ async fn test_local_watch_all_receivers_dropped() {
 
     local
         .run_until(async {
-            let (mut tx, rx) = watch::channel(1);
+            let (mut tx, rx) = Watch::channel(1);
             assert!(!tx.is_closed());
 
             let handle = spawn_local(async move {
@@ -135,7 +135,7 @@ async fn test_local_watch_all_receivers_dropped() {
             handle.await.unwrap();
 
             let err = tx.send(99).unwrap_err();
-            assert_eq!(err, SendError(99));
+            assert_eq!(err.into_inner(), 99);
         })
         .await;
 }
@@ -146,7 +146,7 @@ async fn test_local_watch_concurrent() {
 
     local
         .run_until(async {
-            let (tx, mut rx) = watch::channel(0);
+            let (tx, mut rx) = Watch::channel(0);
 
             let sender_handle = spawn_local(async move {
                 for i in 1..=50 {
@@ -177,7 +177,7 @@ async fn test_local_watch_concurrent() {
 
 #[tokio::test]
 async fn test_local_watch_borrowed_state() {
-    let (tx, mut rx) = watch::channel(100);
+    let (tx, mut rx) = Watch::channel(100);
     assert_eq!(*rx.borrow(), 100);
 
     let mut rx2 = rx.clone();
@@ -202,14 +202,13 @@ async fn test_local_watch_cancellation() {
 
     local
         .run_until(async {
-            let (tx, mut rx) = watch::channel(1);
+            let (tx, mut rx) = Watch::channel(1);
 
-            tokio::select! {
-                _ = rx.changed() => {
-                    panic!("should not resolve");
-                }
-                _ = sleep(Duration::from_millis(10)) => {}
-            }
+            assert!(
+                timeout(Duration::from_millis(10), rx.changed())
+                    .await
+                    .is_err()
+            );
 
             tx.send(2).unwrap();
             rx.changed().await.unwrap();
@@ -220,16 +219,16 @@ async fn test_local_watch_cancellation() {
 
 #[test]
 fn test_local_watch_send_without_receivers_preserves_value() {
-    let (tx, rx) = watch::channel(1);
+    let (tx, rx) = Watch::channel(1);
     drop(rx);
 
-    assert_eq!(tx.send(2), Err(SendError(2)));
+    assert_eq!(tx.send(2).unwrap_err().into_inner(), 2);
     assert_eq!(*tx.borrow(), 1);
 }
 
 #[test]
 fn test_local_watch_modify_without_receivers_preserves_value_without_version() {
-    let (tx, rx) = watch::channel(1);
+    let (tx, rx) = Watch::channel(1);
     drop(rx);
 
     assert_eq!(
@@ -251,14 +250,14 @@ fn test_local_watch_modify_without_receivers_preserves_value_without_version() {
 
 #[tokio::test]
 async fn test_local_watch_borrowed_channel_initializes_once() {
-    let result = watch::with_borrowed_channel(1, async |tx, rx| {
+    let result = Watch::with_borrowed_channel(1, async |tx, rx| {
         assert_eq!(tx.receiver_count(), 1);
         let rx2 = tx.subscribe();
         assert_eq!(tx.receiver_count(), 2);
         drop(rx);
         drop(rx2);
         assert!(tx.is_closed());
-        assert_eq!(tx.send(2), Err(SendError(2)));
+        assert_eq!(tx.send(2).unwrap_err().into_inner(), 2);
         *tx.borrow()
     })
     .await;

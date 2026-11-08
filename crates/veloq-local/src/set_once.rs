@@ -1,6 +1,7 @@
 use crate::{wait_queue::WaitQueue, waker::WaiterNode};
 use veloq_std::{
     cell::{Cell, UnsafeCell},
+    error::Error,
     fmt,
     future::Future,
     marker::PhantomPinned,
@@ -10,7 +11,7 @@ use veloq_std::{
 
 /// Error returned when setting a value on an already initialized `SetOnce`.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct SetOnceError<T>(pub T);
+pub struct SetOnceError<T>(T);
 
 impl<T> SetOnceError<T> {
     /// Consumes the error, returning the value that failed to be set.
@@ -31,7 +32,7 @@ impl<T> fmt::Display for SetOnceError<T> {
     }
 }
 
-impl<T> veloq_std::error::Error for SetOnceError<T> {}
+impl<T> Error for SetOnceError<T> {}
 
 /// A single-threaded asynchronous cell that can be written to at most once
 /// and awaited asynchronously by multiple readers.
@@ -40,6 +41,16 @@ pub struct SetOnce<T> {
     waiters: WaitQueue,
     value: UnsafeCell<Option<T>>,
 }
+
+/// A future that waits for a `SetOnce` to be initialized.
+pub struct Wait<'a, T> {
+    set_once: &'a SetOnce<T>,
+    node: WaiterNode,
+    queued: bool,
+    _pin: PhantomPinned,
+}
+
+pub type SetOnceWait<'a, T> = Wait<'a, T>;
 
 impl<T> SetOnce<T> {
     /// Creates a new uninitialized `SetOnce`.
@@ -168,16 +179,6 @@ impl<T> SetOnce<T> {
         }
     }
 }
-
-/// A future that waits for a `SetOnce` to be initialized.
-pub struct Wait<'a, T> {
-    set_once: &'a SetOnce<T>,
-    node: WaiterNode,
-    queued: bool,
-    _pin: PhantomPinned,
-}
-
-pub type SetOnceWait<'a, T> = Wait<'a, T>;
 
 impl<'a, T> Future for Wait<'a, T> {
     type Output = &'a T;

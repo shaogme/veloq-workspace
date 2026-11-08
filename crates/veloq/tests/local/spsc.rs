@@ -1,7 +1,7 @@
 use veloq_std::ops::AsyncFnOnce;
 
 use veloq::{
-    local::spsc,
+    local::{SendError, Spsc, TryRecvError},
     nz,
     runtime::{Runtime, context::Ctx, scope_local},
 };
@@ -21,7 +21,7 @@ where
 #[test]
 fn test_unbounded_basic() {
     run_test(async |ctx| {
-        let (tx, rx) = spsc::unbounded();
+        let (tx, rx) = Spsc::unbounded();
 
         scope_local!(ctx, async |s| {
             s.spawn_boxed_local(async move {
@@ -45,7 +45,7 @@ fn test_unbounded_basic() {
 #[test]
 fn test_bounded_basic() {
     run_test(async |ctx| {
-        let (tx, rx) = spsc::bounded(5);
+        let (tx, rx) = Spsc::bounded(5);
 
         scope_local!(ctx, async |s| {
             s.spawn_boxed_local(async move {
@@ -68,7 +68,7 @@ fn test_bounded_basic() {
 #[test]
 fn test_sender_drop_closes_channel() {
     run_test(async |ctx| {
-        let (tx, rx) = spsc::unbounded::<()>();
+        let (tx, rx) = Spsc::unbounded::<()>();
         scope_local!(ctx, async |s| {
             s.spawn_boxed_local(async move {
                 drop(tx);
@@ -84,7 +84,7 @@ fn test_sender_drop_closes_channel() {
 #[test]
 fn test_receiver_drop_errors_sender() {
     run_test(async |ctx| {
-        let (tx, rx) = spsc::bounded::<i32>(1);
+        let (tx, rx) = Spsc::bounded::<i32>(1);
 
         tx.send(1).await.unwrap();
 
@@ -96,7 +96,7 @@ fn test_receiver_drop_errors_sender() {
             yield_now().await;
 
             match tx.send(2).await {
-                Err(spsc::SendError::Closed(val)) => assert_eq!(val, 2),
+                Err(SendError::Closed(val)) => assert_eq!(val, 2),
                 _ => panic!("Should return Closed error"),
             }
         })
@@ -108,7 +108,7 @@ fn test_receiver_drop_errors_sender() {
 #[test]
 fn test_bounded_backpressure() {
     run_test(async |ctx| {
-        let (tx, rx) = spsc::bounded(1);
+        let (tx, rx) = Spsc::bounded(1);
 
         scope_local!(ctx, async |s| {
             s.spawn_boxed_local(async move {
@@ -137,7 +137,7 @@ fn test_stream_conversion() {
     use veloq_std::pin::Pin;
 
     run_test(async |ctx| {
-        let (tx, rx) = spsc::unbounded();
+        let (tx, rx) = Spsc::unbounded();
 
         scope_local!(ctx, async |s| {
             s.spawn_boxed_local(async move {
@@ -164,7 +164,7 @@ fn test_stream_conversion() {
 #[test]
 fn test_zst() {
     run_test(async |ctx| {
-        let (tx, rx) = spsc::unbounded::<()>();
+        let (tx, rx) = Spsc::unbounded::<()>();
 
         scope_local!(ctx, async |s| {
             s.spawn_boxed_local(async move {
@@ -186,27 +186,27 @@ fn test_zst() {
 #[test]
 fn test_try_recv() {
     run_test(async |_ctx| {
-        let (tx, rx) = spsc::unbounded();
+        let (tx, rx) = Spsc::unbounded();
 
-        assert_eq!(rx.try_recv(), Err(spsc::TryRecvError::Empty));
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
 
         tx.send(100).await.unwrap();
 
         assert_eq!(rx.try_recv(), Ok(100));
 
         // After consuming, it should be empty again
-        assert_eq!(rx.try_recv(), Err(spsc::TryRecvError::Empty));
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
 
         drop(tx);
         // After drop, it should be closed
-        assert_eq!(rx.try_recv(), Err(spsc::TryRecvError::Closed));
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Closed));
     });
 }
 
 #[test]
 fn test_owned_spsc() {
     run_test(async |ctx| {
-        let (tx, rx) = spsc::owned_bounded(5);
+        let (tx, rx) = Spsc::owned_bounded(5);
 
         scope_local!(ctx, async |s| {
             s.spawn_boxed_local(async move {

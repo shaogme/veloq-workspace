@@ -3,13 +3,14 @@ use std::sync::{
     Arc as StdArc,
     atomic::{AtomicUsize, Ordering},
 };
+use tokio::{spawn, sync::oneshot::channel, task::yield_now};
 
-use veloq_std::sync::Arc;
 use veloq_std::{
     future::Future,
+    sync::Arc,
     task::{Context, RawWaker, RawWakerVTable, Waker},
 };
-use veloq_sync::mutex::Mutex;
+use veloq_sync::Mutex;
 
 struct WakeData {
     wakes: AtomicUsize,
@@ -67,7 +68,7 @@ async fn test_mutex_contention() {
 
     for _ in 0..10 {
         let m = m.clone();
-        tasks.push(tokio::spawn(async move {
+        tasks.push(spawn(async move {
             for _ in 0..100 {
                 let mut guard = m.lock().await;
                 *guard += 1;
@@ -90,7 +91,7 @@ async fn test_mutex_try_lock() {
     let guard = m.try_lock().unwrap();
 
     // Contention
-    let t = tokio::spawn(async move {
+    let t = spawn(async move {
         assert!(m2.try_lock().is_none());
     });
     t.await.unwrap();
@@ -190,18 +191,18 @@ async fn test_mutex_cancel_cascading() {
     let m1 = m.clone();
     let m2 = m.clone();
 
-    let (tx1, rx1) = tokio::sync::oneshot::channel();
-    let t1 = tokio::spawn(async move {
+    let (tx1, rx1) = channel();
+    let t1 = spawn(async move {
         let fut = m1.lock();
         let _ = tx1.send(());
         fut.await;
     });
 
     rx1.await.unwrap();
-    tokio::task::yield_now().await;
+    yield_now().await;
 
-    let (tx2, rx2) = tokio::sync::oneshot::channel();
-    let t2 = tokio::spawn(async move {
+    let (tx2, rx2) = channel();
+    let t2 = spawn(async move {
         let fut = m2.lock();
         let _ = tx2.send(());
         let mut g = fut.await;
@@ -209,7 +210,7 @@ async fn test_mutex_cancel_cascading() {
     });
 
     rx2.await.unwrap();
-    tokio::task::yield_now().await;
+    yield_now().await;
 
     // Drop guard, granting lock to t1
     drop(guard);
@@ -230,15 +231,15 @@ async fn test_mutex_cancel_reset_unlocked() {
     let guard = m.lock().await;
 
     let m1 = m.clone();
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let t1 = tokio::spawn(async move {
+    let (tx, rx) = channel();
+    let t1 = spawn(async move {
         let fut = m1.lock();
         let _ = tx.send(());
         fut.await;
     });
 
     rx.await.unwrap();
-    tokio::task::yield_now().await;
+    yield_now().await;
 
     // Drop guard, granting lock to t1
     drop(guard);

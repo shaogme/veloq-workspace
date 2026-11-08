@@ -5,8 +5,8 @@ use veloq::{
     nz,
     std::{net::SocketAddr, sync::Arc},
     sync::{
+        Mpmc as mpmc, MpmcBoundedReceiver as BoundedReceiver, MpmcBoundedSender as BoundedSender,
         TrySendError,
-        mpmc::{BoundedReceiver, BoundedSender, bounded},
     },
 };
 
@@ -28,7 +28,7 @@ pub(super) type OutboundSender = BoundedSender<OutboundDatagram>;
 pub(super) type OutboundReceiver = BoundedReceiver<OutboundDatagram>;
 
 pub(super) fn channel(capacity: usize) -> (CommandSender, CommandReceiver) {
-    bounded(capacity)
+    mpmc::bounded(capacity)
 }
 
 pub(super) struct InboundDatagram {

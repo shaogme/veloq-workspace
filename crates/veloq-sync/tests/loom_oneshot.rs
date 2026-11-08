@@ -3,7 +3,7 @@ use loom::thread;
 use veloq_std::future::Future;
 use veloq_std::ptr;
 use veloq_std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-use veloq_sync::oneshot;
+use veloq_sync::{Oneshot as oneshot, OneshotTryRecvError};
 
 // --- Helper for manual polling (Same as loom_mpsc.rs) ---
 fn noop_waker() -> Waker {
@@ -105,10 +105,10 @@ fn loom_oneshot_try_recv() {
                     assert_eq!(v, 123);
                     break;
                 }
-                Err(oneshot::error::TryRecvError::Empty) => {
+                Err(OneshotTryRecvError::Empty) => {
                     thread::yield_now();
                 }
-                Err(oneshot::error::TryRecvError::Closed) => {
+                Err(OneshotTryRecvError::Closed) => {
                     panic!("Should not be closed without value");
                 }
             }

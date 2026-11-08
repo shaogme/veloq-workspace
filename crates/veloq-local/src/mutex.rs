@@ -23,6 +23,26 @@ pub struct Mutex<T: ?Sized> {
     data: UnsafeCell<T>,
 }
 
+/// A RAII guard returned by `Mutex::lock` and `Mutex::try_lock`.
+pub struct MutexGuard<'a, T: ?Sized> {
+    lock: &'a Mutex<T>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    Initial,
+    Waiting,
+    Completed,
+}
+
+/// A future that resolves to a `MutexGuard`.
+pub(crate) struct MutexLockFuture<'a, T: ?Sized> {
+    lock: &'a Mutex<T>,
+    node: WaiterNode,
+    phase: Phase,
+    _pin: PhantomPinned,
+}
+
 impl<T> Mutex<T> {
     /// Creates a new `Mutex` in an unlocked state with the given data.
     #[cfg(not(feature = "loom"))]
@@ -119,11 +139,6 @@ impl<T> From<T> for Mutex<T> {
     }
 }
 
-/// A RAII guard returned by `Mutex::lock` and `Mutex::try_lock`.
-pub struct MutexGuard<'a, T: ?Sized> {
-    lock: &'a Mutex<T>,
-}
-
 impl<'a, T: ?Sized> MutexGuard<'a, T> {
     /// Returns a reference to the [`Mutex`] that this guard was acquired from.
     pub fn mutex(guard: &Self) -> &'a Mutex<T> {
@@ -148,7 +163,7 @@ impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
 impl<T: ?Sized> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
         let detached = self.lock.waiters.take_front_with(|next| {
-            next.state = STATE_GRANTED;
+            next.set_state(STATE_GRANTED);
         });
         if let Some(detached) = detached {
             detached.wake();
@@ -168,21 +183,6 @@ impl<T: ?Sized + fmt::Display> fmt::Display for MutexGuard<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&**self, f)
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Phase {
-    Initial,
-    Waiting,
-    Completed,
-}
-
-/// A future that resolves to a `MutexGuard`.
-pub(crate) struct MutexLockFuture<'a, T: ?Sized> {
-    lock: &'a Mutex<T>,
-    node: WaiterNode,
-    phase: Phase,
-    _pin: PhantomPinned,
 }
 
 impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
@@ -210,7 +210,7 @@ impl<'a, T: ?Sized> Future for MutexLockFuture<'a, T> {
             return Poll::Ready(MutexGuard { lock: this.lock });
         }
 
-        this.node.state = STATE_WAITING;
+        this.node.set_state(STATE_WAITING);
         unsafe {
             let node_pin = Pin::new_unchecked(&mut this.node);
             this.lock.waiters.register_and_push(node_pin, cx);
@@ -227,19 +227,22 @@ impl<'a, T: ?Sized> Drop for MutexLockFuture<'a, T> {
         }
 
         let detached = self.lock.waiters.with_lock(|w| {
-            if self.node.state == STATE_GRANTED {
+            if self.node.state() == STATE_GRANTED {
                 if let Some(mut next_node) = w.pop_front() {
                     unsafe {
-                        next_node.as_mut().get_unchecked_mut().state = STATE_GRANTED;
+                        next_node
+                            .as_mut()
+                            .get_unchecked_mut()
+                            .set_state(STATE_GRANTED);
                     }
-                    Some(DetachedWaiter {
-                        waker: unsafe { next_node.as_mut().get_unchecked_mut().waker.take() },
-                    })
+                    Some(DetachedWaiter::new(unsafe {
+                        next_node.as_mut().get_unchecked_mut().take_waker()
+                    }))
                 } else {
                     self.lock.locked.set(false);
                     None
                 }
-            } else if self.node.link.is_linked() {
+            } else if self.node.is_linked() {
                 unsafe {
                     let ptr = NonNull::from(&self.node);
                     let mut cursor = w.cursor_mut_from_ptr(ptr);

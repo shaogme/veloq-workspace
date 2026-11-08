@@ -1,4 +1,4 @@
-use crate::{wait_queue::WaitQueue, waker::WaiterNode};
+use crate::{common::WaiterNode, wait_queue::WaitQueue};
 use veloq_std::{
     fmt,
     future::Future,
@@ -25,7 +25,16 @@ pub struct Notify {
     waiters: WaitQueue,
 }
 
+pub struct Notified<'a> {
+    notify: &'a Notify,
+    node: WaiterNode,
+    queued: bool,
+    completed: bool,
+    _pin: PhantomPinned,
+}
+
 unsafe impl Send for Notify {}
+
 unsafe impl Sync for Notify {}
 
 impl Notify {
@@ -111,15 +120,6 @@ impl fmt::Debug for Notify {
             .field("state", &self.state.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
-}
-
-/// A future that waits for a notification from a `Notify`.
-pub struct Notified<'a> {
-    notify: &'a Notify,
-    node: WaiterNode,
-    queued: bool,
-    completed: bool,
-    _pin: PhantomPinned,
 }
 
 impl<'a> Notified<'a> {
@@ -240,7 +240,7 @@ impl<'a> Drop for Notified<'a> {
 
         if self.queued {
             let waker = self.notify.waiters.with_lock(|w| {
-                if self.node.link.is_linked() {
+                if self.node.link().is_linked() {
                     unsafe {
                         let ptr = NonNull::from(&self.node);
                         let mut cursor = w.cursor_mut_from_ptr(ptr);

@@ -1,17 +1,15 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use veloq_local::oneshot;
+use tokio::runtime::Builder;
+use veloq_local::Oneshot;
 
 fn bench_oneshot_send_recv(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
 
     let mut group = c.benchmark_group("oneshot");
 
     group.bench_function("send_recv", |b| {
         b.to_async(&rt).iter(|| async {
-            oneshot::with_borrowed_channel(async |tx, rx| {
+            Oneshot::with_borrowed_channel(async |tx, rx| {
                 tx.send(1).unwrap();
                 rx.await.unwrap();
             })

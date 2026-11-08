@@ -1,7 +1,7 @@
 use veloq_std::ops::AsyncFnOnce;
 
 use veloq::{
-    local::mpmc,
+    local::{Mpmc, SendError, TryRecvError},
     nz,
     runtime::{Runtime, context::Ctx, scope_local},
 };
@@ -21,7 +21,7 @@ where
 #[test]
 fn test_unbounded_basic() {
     run_test(async |ctx| {
-        mpmc::with_borrowed_unbounded(async |tx, rx| {
+        Mpmc::with_borrowed_unbounded(async |tx, rx| {
             scope_local!(ctx, async |s| {
                 s.spawn_boxed_local(async move {
                     for i in 0..10 {
@@ -48,7 +48,7 @@ fn test_unbounded_basic() {
 #[test]
 fn test_bounded_basic() {
     run_test(async |ctx| {
-        mpmc::with_borrowed_bounded(5, async |tx, rx| {
+        Mpmc::with_borrowed_bounded(5, async |tx, rx| {
             scope_local!(ctx, async |s| {
                 s.spawn_boxed_local(async move {
                     for i in 0..10 {
@@ -71,7 +71,7 @@ fn test_bounded_basic() {
 #[test]
 fn test_multiple_producers_consumers() {
     run_test(async |ctx| {
-        mpmc::with_borrowed_bounded(2, async |tx, rx| {
+        Mpmc::with_borrowed_bounded(2, async |tx, rx| {
             use veloq_std::{cell::RefCell, rc::Rc};
             let results = Rc::new(RefCell::new(Vec::new()));
 
@@ -128,7 +128,7 @@ fn test_multiple_producers_consumers() {
 #[test]
 fn test_sender_drop_closes_channel() {
     run_test(async |ctx| {
-        mpmc::with_borrowed_unbounded::<(), _, _>(async |tx, rx| {
+        Mpmc::with_borrowed_unbounded::<(), _, _>(async |tx, rx| {
             scope_local!(ctx, async |s| {
                 s.spawn_boxed_local(async move {
                     drop(tx);
@@ -146,7 +146,7 @@ fn test_sender_drop_closes_channel() {
 #[test]
 fn test_receiver_drop_errors_sender() {
     run_test(async |ctx| {
-        mpmc::with_borrowed_bounded::<i32, _, _>(1, async |tx, rx| {
+        Mpmc::with_borrowed_bounded::<i32, _, _>(1, async |tx, rx| {
             tx.send(1).await.unwrap();
 
             scope_local!(ctx, async |s| {
@@ -157,7 +157,7 @@ fn test_receiver_drop_errors_sender() {
                 yield_now().await;
 
                 match tx.send(2).await {
-                    Err(mpmc::SendError::Closed(val)) => assert_eq!(val, 2),
+                    Err(SendError::Closed(val)) => assert_eq!(val, 2),
                     _ => panic!("Should return Closed error"),
                 }
             })
@@ -171,7 +171,7 @@ fn test_receiver_drop_errors_sender() {
 #[test]
 fn test_bounded_backpressure() {
     run_test(async |ctx| {
-        mpmc::with_borrowed_bounded(1, async |tx, rx| {
+        Mpmc::with_borrowed_bounded(1, async |tx, rx| {
             scope_local!(ctx, async |s| {
                 let tx_clone = tx.clone();
                 s.spawn_boxed_local(async move {
@@ -200,7 +200,7 @@ fn test_stream_conversion() {
     use veloq_std::pin::Pin;
 
     run_test(async |ctx| {
-        mpmc::with_borrowed_unbounded(async |tx, rx| {
+        Mpmc::with_borrowed_unbounded(async |tx, rx| {
             scope_local!(ctx, async |s| {
                 s.spawn_boxed_local(async move {
                     tx.send(100).await.unwrap();
@@ -228,16 +228,16 @@ fn test_stream_conversion() {
 #[test]
 fn test_try_recv() {
     run_test(async |_ctx| {
-        mpmc::with_borrowed_unbounded(async |tx, rx| {
-            assert_eq!(rx.try_recv(), Err(mpmc::TryRecvError::Empty));
+        Mpmc::with_borrowed_unbounded(async |tx, rx| {
+            assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
 
             tx.send(100).await.unwrap();
 
             assert_eq!(rx.try_recv(), Ok(100));
-            assert_eq!(rx.try_recv(), Err(mpmc::TryRecvError::Empty));
+            assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
 
             drop(tx);
-            assert_eq!(rx.try_recv(), Err(mpmc::TryRecvError::Closed));
+            assert_eq!(rx.try_recv(), Err(TryRecvError::Closed));
         })
         .await;
     });
@@ -246,7 +246,7 @@ fn test_try_recv() {
 #[test]
 fn test_owned_mpmc() {
     run_test(async |ctx| {
-        let (tx, rx) = mpmc::bounded(5);
+        let (tx, rx) = Mpmc::bounded(5);
 
         scope_local!(ctx, async |s| {
             // Clone sender and receiver

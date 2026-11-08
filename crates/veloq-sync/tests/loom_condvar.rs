@@ -1,7 +1,7 @@
 #![cfg(feature = "loom")]
 
 use loom::{future::block_on, sync::Arc, thread};
-use veloq_sync::{condvar::Condvar, mutex::Mutex};
+use veloq_sync::{Condvar, Mutex};
 
 #[test]
 fn loom_condvar_notify_one() {

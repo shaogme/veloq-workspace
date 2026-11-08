@@ -3,11 +3,13 @@ use veloq_waker::MwsrWaker;
 use crate::notify::{Notified, Notify};
 use veloq_std::{
     cell::UnsafeCell,
+    error::Error,
     fmt,
     future::Future,
     mem::ManuallyDrop,
     ops::AsyncFnOnce,
     pin::{Pin, pin},
+    ptr::read,
     sync::atomic::Ordering,
     sync::{Arc, atomic::AtomicUsize},
     task::{
@@ -16,15 +18,38 @@ use veloq_std::{
     },
 };
 
-/// Creates a new borrowed one-shot channel and runs the provided asynchronous closure with it.
-pub async fn with_borrowed_channel<T, F, R>(f: F) -> R
-where
-    F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
-{
-    let state = Inner::new();
-    let (tx, rx) = state.borrowed_parts();
-    f(tx, rx).await
+const SEND_CLAIMED: usize = 0b00001;
+const VALUE_SENT: usize = 0b00010;
+const CLOSED: usize = 0b00100;
+const SENDER_DONE: usize = 0b01000;
+
+#[derive(Debug, Eq, PartialEq, Clone)]
+pub struct RecvError;
+
+#[derive(Debug, Eq, PartialEq, Clone)]
+pub enum TryRecvError {
+    Empty,
+    Closed,
 }
+
+impl fmt::Display for RecvError {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(fmt, "channel closed")
+    }
+}
+
+impl Error for RecvError {}
+
+impl fmt::Display for TryRecvError {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TryRecvError::Empty => write!(fmt, "channel empty"),
+            TryRecvError::Closed => write!(fmt, "channel closed"),
+        }
+    }
+}
+
+impl Error for TryRecvError {}
 
 struct Inner<T> {
     /// Manages the state of the inner cell.
@@ -43,6 +68,15 @@ struct Inner<T> {
 
 #[derive(Clone, Copy)]
 struct StateVal(usize);
+
+pub struct BorrowedSender<'a, T> {
+    state: &'a Inner<T>,
+    closed_notified: Option<Notified<'a>>,
+}
+
+pub struct BorrowedReceiver<'a, T> {
+    state: Option<&'a Inner<T>>,
+}
 
 impl<T> Default for Inner<T> {
     fn default() -> Self {
@@ -188,6 +222,7 @@ impl<T> Inner<T> {
 }
 
 unsafe impl<T: Send> Send for Inner<T> {}
+
 unsafe impl<T: Send> Sync for Inner<T> {}
 
 impl<T> Drop for Inner<T> {
@@ -210,54 +245,6 @@ impl<T: fmt::Debug> fmt::Debug for Inner<T> {
             .finish()
     }
 }
-
-pub struct BorrowedSender<'a, T> {
-    state: &'a Inner<T>,
-    closed_notified: Option<Notified<'a>>,
-}
-
-pub struct BorrowedReceiver<'a, T> {
-    state: Option<&'a Inner<T>>,
-}
-
-pub mod error {
-    use veloq_std::fmt;
-
-    /// Error returned by the `Future` implementation for `Receiver`.
-    #[derive(Debug, Eq, PartialEq, Clone)]
-    pub struct RecvError(pub ());
-
-    /// Error returned by the `try_recv` function on `Receiver`.
-    #[derive(Debug, Eq, PartialEq, Clone)]
-    pub enum TryRecvError {
-        /// The send half of the channel has not yet sent a value.
-        Empty,
-        /// The send half of the channel was dropped without sending a value.
-        Closed,
-    }
-
-    impl fmt::Display for RecvError {
-        fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(fmt, "channel closed")
-        }
-    }
-
-    impl veloq_std::error::Error for RecvError {}
-
-    impl fmt::Display for TryRecvError {
-        fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-            match self {
-                TryRecvError::Empty => write!(fmt, "channel empty"),
-                TryRecvError::Closed => write!(fmt, "channel closed"),
-            }
-        }
-    }
-
-    impl veloq_std::error::Error for TryRecvError {}
-}
-
-use self::error::*;
-
 // ===== impl BorrowedSender =====
 
 impl<'a, T> BorrowedSender<'a, T> {
@@ -348,7 +335,6 @@ impl<'a, T> Drop for BorrowedSender<'a, T> {
         self.state.drop_sender();
     }
 }
-
 // ===== impl BorrowedReceiver =====
 
 impl<'a, T> BorrowedReceiver<'a, T> {
@@ -450,14 +436,14 @@ impl<'a, T> Future for BorrowedReceiver<'a, T> {
                 }
                 None => {
                     self.state = None;
-                    Ready(Err(RecvError(())))
+                    Ready(Err(RecvError))
                 }
             };
         }
 
         if state_val.is_closed() || state_val.is_sender_done() {
             self.state = None;
-            return Ready(Err(RecvError(())));
+            return Ready(Err(RecvError));
         }
 
         // Register waker
@@ -475,12 +461,12 @@ impl<'a, T> Future for BorrowedReceiver<'a, T> {
                 }
                 None => {
                     self.state = None;
-                    Ready(Err(RecvError(())))
+                    Ready(Err(RecvError))
                 }
             }
         } else if state_val.is_closed() || state_val.is_sender_done() {
             self.state = None;
-            Ready(Err(RecvError(())))
+            Ready(Err(RecvError))
         } else {
             Pending
         }
@@ -508,15 +494,28 @@ pub struct Receiver<T> {
     state: Option<Arc<Inner<T>>>,
 }
 
-pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
-    let state = Arc::new(Inner::new());
-    (
-        Sender {
-            state: ManuallyDrop::new(state.clone()),
-            closed_notified: None,
-        },
-        Receiver { state: Some(state) },
-    )
+pub struct Oneshot;
+
+impl Oneshot {
+    pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
+        let state = Arc::new(Inner::new());
+        (
+            Sender {
+                state: ManuallyDrop::new(state.clone()),
+                closed_notified: None,
+            },
+            Receiver { state: Some(state) },
+        )
+    }
+
+    pub async fn with_borrowed_channel<T, F, R>(f: F) -> R
+    where
+        F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
+    {
+        let state = Inner::new();
+        let (tx, rx) = state.borrowed_parts();
+        f(tx, rx).await
+    }
 }
 
 impl<T> Sender<T> {
@@ -524,7 +523,7 @@ impl<T> Sender<T> {
     pub fn send(mut self, t: T) -> Result<(), T> {
         self.closed_notified = None;
         let this = ManuallyDrop::new(self);
-        let state = unsafe { veloq_std::ptr::read(&*this.state) };
+        let state = unsafe { read(&*this.state) };
         let sender = BorrowedSender {
             state: &state,
             closed_notified: None,
@@ -688,13 +687,7 @@ impl<T> fmt::Debug for Receiver<T> {
         f.debug_struct("Receiver").finish()
     }
 }
-
 // ===== StateVal Management =====
-
-const SEND_CLAIMED: usize = 0b00001;
-const VALUE_SENT: usize = 0b00010;
-const CLOSED: usize = 0b00100;
-const SENDER_DONE: usize = 0b01000;
 
 impl StateVal {
     const fn new() -> StateVal {
@@ -743,25 +736,22 @@ impl fmt::Debug for StateVal {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::Inner;
+#[test]
+fn duplicate_senders_cannot_write_twice() {
+    #[cfg(feature = "loom")]
+    loom::model(duplicate_senders_cannot_write_twice_inner);
 
-    #[test]
-    fn duplicate_senders_cannot_write_twice() {
-        #[cfg(feature = "loom")]
-        loom::model(duplicate_senders_cannot_write_twice_inner);
+    #[cfg(not(feature = "loom"))]
+    duplicate_senders_cannot_write_twice_inner();
+}
 
-        #[cfg(not(feature = "loom"))]
-        duplicate_senders_cannot_write_twice_inner();
-    }
+#[cfg(test)]
+fn duplicate_senders_cannot_write_twice_inner() {
+    let state = Inner::<usize>::new();
+    let (tx1, mut rx1) = state.borrowed_parts();
+    let (tx2, _rx2) = state.borrowed_parts();
 
-    fn duplicate_senders_cannot_write_twice_inner() {
-        let state = Inner::<usize>::new();
-        let (tx1, mut rx1) = state.borrowed_parts();
-        let (tx2, _rx2) = state.borrowed_parts();
-
-        assert_eq!(tx1.send(1), Ok(()));
-        assert_eq!(tx2.send(2), Err(2));
-        assert_eq!(rx1.try_recv(), Ok(1));
-    }
+    assert_eq!(tx1.send(1), Ok(()));
+    assert_eq!(tx2.send(2), Err(2));
+    assert_eq!(rx1.try_recv(), Ok(1));
 }

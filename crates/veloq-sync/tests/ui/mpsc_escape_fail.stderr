@@ -4,8 +4,8 @@ error: lifetime may not live long enough
 6 |     let _escaped = mpsc::with_borrowed_unbounded::<i32, _, _>(async |tx, _rx| tx).await;
   |                                                                      --     - ^^ returning this value requires that `'1` must outlive `'2`
   |                                                                      |      |
-  |                                                                      |      return type of async closure is veloq_sync::mpsc::GenericBorrowedSender<'2, i32, UnboundedStrategy, crossbeam_queue::seg_queue::SegQueue<i32>>
-  |                                                                      has type `veloq_sync::mpsc::GenericBorrowedSender<'1, i32, UnboundedStrategy, crossbeam_queue::seg_queue::SegQueue<i32>>`
+  |                                                                      |      return type of async closure is MpscGenericBorrowedSender<'2, i32, MpscUnboundedStrategy, MpmcSegQueue<i32>>
+  |                                                                      has type `MpscGenericBorrowedSender<'1, i32, MpscUnboundedStrategy, MpmcSegQueue<i32>>`
 
 error: lifetime may not live long enough
   --> tests/ui/mpsc_escape_fail.rs:10:79
@@ -13,8 +13,8 @@ error: lifetime may not live long enough
 10 |     let _escaped = mpsc::with_borrowed_unbounded::<i32, _, _>(async |_tx, rx| rx).await;
    |                                                                      ---    - ^^ returning this value requires that `'1` must outlive `'2`
    |                                                                      |      |
-   |                                                                      |      return type of async closure is veloq_sync::mpsc::GenericBorrowedReceiver<'2, i32, UnboundedStrategy, crossbeam_queue::seg_queue::SegQueue<i32>>
-   |                                                                      has type `veloq_sync::mpsc::GenericBorrowedSender<'1, i32, UnboundedStrategy, crossbeam_queue::seg_queue::SegQueue<i32>>`
+   |                                                                      |      return type of async closure is MpscGenericBorrowedReceiver<'2, i32, MpscUnboundedStrategy, MpmcSegQueue<i32>>
+   |                                                                      has type `MpscGenericBorrowedSender<'1, i32, MpscUnboundedStrategy, MpmcSegQueue<i32>>`
 
 error: lifetime may not live long enough
   --> tests/ui/mpsc_escape_fail.rs:14:80
@@ -22,8 +22,8 @@ error: lifetime may not live long enough
 14 |     let _escaped = mpsc::with_borrowed_bounded::<i32, _, _>(1, async |tx, _rx| tx).await;
    |                                                                       --     - ^^ returning this value requires that `'1` must outlive `'2`
    |                                                                       |      |
-   |                                                                       |      return type of async closure is veloq_sync::mpsc::GenericBorrowedSender<'2, i32, BoundedStrategy, crossbeam_queue::array_queue::ArrayQueue<i32>>
-   |                                                                       has type `veloq_sync::mpsc::GenericBorrowedSender<'1, i32, BoundedStrategy, crossbeam_queue::array_queue::ArrayQueue<i32>>`
+   |                                                                       |      return type of async closure is MpscGenericBorrowedSender<'2, i32, MpscBoundedStrategy, MpmcArrayQueue<i32>>
+   |                                                                       has type `MpscGenericBorrowedSender<'1, i32, MpscBoundedStrategy, MpmcArrayQueue<i32>>`
 
 error: lifetime may not live long enough
   --> tests/ui/mpsc_escape_fail.rs:18:80
@@ -31,5 +31,5 @@ error: lifetime may not live long enough
 18 |     let _escaped = mpsc::with_borrowed_bounded::<i32, _, _>(1, async |_tx, rx| rx).await;
    |                                                                       ---    - ^^ returning this value requires that `'1` must outlive `'2`
    |                                                                       |      |
-   |                                                                       |      return type of async closure is veloq_sync::mpsc::GenericBorrowedReceiver<'2, i32, BoundedStrategy, crossbeam_queue::array_queue::ArrayQueue<i32>>
-   |                                                                       has type `veloq_sync::mpsc::GenericBorrowedSender<'1, i32, BoundedStrategy, crossbeam_queue::array_queue::ArrayQueue<i32>>`
+   |                                                                       |      return type of async closure is MpscGenericBorrowedReceiver<'2, i32, MpscBoundedStrategy, MpmcArrayQueue<i32>>
+   |                                                                       has type `MpscGenericBorrowedSender<'1, i32, MpscBoundedStrategy, MpmcArrayQueue<i32>>`

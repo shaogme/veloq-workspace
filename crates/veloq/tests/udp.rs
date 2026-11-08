@@ -15,7 +15,7 @@ use veloq::{
     net::{UdpReceiveConfig, UdpSocket},
     nz,
     runtime::{Runtime, context::Ctx, scope},
-    sync::mpsc,
+    sync::Mpsc as mpsc,
     time::timeout_at,
 };
 use veloq_buf::{FixedBuf, UniformSlot};

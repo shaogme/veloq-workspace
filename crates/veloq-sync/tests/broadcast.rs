@@ -1,13 +1,21 @@
 #![cfg(not(feature = "loom"))]
 
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
-use std::time::Duration;
 
-use tokio::time::sleep;
-use veloq_sync::broadcast::{self, RecvError, SendError, TryRecvError};
+use tokio::{
+    spawn,
+    time::{sleep, timeout},
+};
+use veloq_sync::{
+    Broadcast as broadcast, BroadcastRecvError as RecvError, BroadcastSender,
+    BroadcastTryRecvError as TryRecvError, SendError,
+};
 
 #[tokio::test]
 async fn test_broadcast_basic() {
@@ -115,7 +123,7 @@ async fn test_broadcast_no_receiver() {
 
     assert!(tx.is_closed());
     let err = tx.send(999).unwrap_err();
-    assert_eq!(err, SendError(999));
+    assert_eq!(err, SendError::new(999));
 
     // Subscribing again allows sends
     let mut new_rx = tx.subscribe();
@@ -169,14 +177,14 @@ async fn test_broadcast_concurrent() {
     let mut rx2 = tx.subscribe();
 
     let tx_clone = tx.clone();
-    let sender_handle = tokio::spawn(async move {
+    let sender_handle = spawn(async move {
         for i in 1..=50 {
             let _ = tx_clone.send(i);
             sleep(Duration::from_millis(1)).await;
         }
     });
 
-    let receiver1_handle = tokio::spawn(async move {
+    let receiver1_handle = spawn(async move {
         let mut count = 0;
         while count < 50 {
             match rx1.recv().await {
@@ -188,7 +196,7 @@ async fn test_broadcast_concurrent() {
         count
     });
 
-    let receiver2_handle = tokio::spawn(async move {
+    let receiver2_handle = spawn(async move {
         let mut count = 0;
         while count < 50 {
             match rx2.recv().await {
@@ -209,12 +217,7 @@ async fn test_broadcast_concurrent() {
 async fn test_broadcast_cancellation() {
     let (tx, mut rx) = broadcast::channel(16);
 
-    tokio::select! {
-        _ = rx.recv() => {
-            panic!("should not resolve");
-        }
-        _ = sleep(Duration::from_millis(10)) => {}
-    }
+    assert!(timeout(Duration::from_millis(10), rx.recv()).await.is_err());
 
     tx.send(777).unwrap();
     assert_eq!(rx.recv().await.unwrap(), 777);
@@ -239,7 +242,7 @@ async fn test_broadcast_send_count_after_receiver_drop() {
     let (tx, rx) = broadcast::channel::<i32>(8);
     drop(rx);
 
-    assert_eq!(tx.send(1), Err(SendError(1)));
+    assert_eq!(tx.send(1), Err(SendError::new(1)));
     assert_eq!(tx.len(), 0);
 
     let mut rx = tx.subscribe();
@@ -263,7 +266,7 @@ async fn test_broadcast_borrowed_send_count() {
 
 #[derive(Clone)]
 struct ReentrantDrop {
-    sender: Arc<Mutex<Option<broadcast::Sender<ReentrantDrop>>>>,
+    sender: Arc<Mutex<Option<BroadcastSender<ReentrantDrop>>>>,
     fired: Arc<AtomicBool>,
 }
 

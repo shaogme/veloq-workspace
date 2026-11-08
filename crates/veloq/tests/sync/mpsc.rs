@@ -5,7 +5,7 @@ use veloq::{
 use veloq_buf::UniformSlot;
 use veloq_runtime::yield_now;
 use veloq_std::ops::AsyncFnOnce;
-use veloq_sync::mpsc;
+use veloq_sync::Mpsc as mpsc;
 
 fn run_test<F, R>(f: F) -> R
 where

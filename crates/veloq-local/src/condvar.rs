@@ -22,6 +22,17 @@ pub struct Condvar {
     waiters: WaitQueue,
 }
 
+/// A future returned by [`Condvar::wait`] that waits for a notification and re-acquires the lock.
+pub struct Wait<'c, 'a, T: ?Sized> {
+    cvar: &'c Condvar,
+    lock: &'a Mutex<T>,
+    guard: Option<MutexGuard<'a, T>>,
+    node: WaiterNode,
+    lock_fut: Option<MutexLockFuture<'a, T>>,
+    queued: bool,
+    _pin: PhantomPinned,
+}
+
 impl Condvar {
     /// Creates a new condition variable.
     #[cfg(not(feature = "loom"))]
@@ -43,7 +54,7 @@ impl Condvar {
     /// If there are no waiting tasks, this call has no effect.
     pub fn notify_one(&self) {
         let detached = self.waiters.take_front_with(|node| {
-            node.state = NOTIFIED_ONE;
+            node.set_state(NOTIFIED_ONE);
         });
         if let Some(detached) = detached {
             detached.wake();
@@ -101,17 +112,6 @@ impl fmt::Debug for Condvar {
     }
 }
 
-/// A future returned by [`Condvar::wait`] that waits for a notification and re-acquires the lock.
-pub struct Wait<'c, 'a, T: ?Sized> {
-    cvar: &'c Condvar,
-    lock: &'a Mutex<T>,
-    guard: Option<MutexGuard<'a, T>>,
-    node: WaiterNode,
-    lock_fut: Option<MutexLockFuture<'a, T>>,
-    queued: bool,
-    _pin: PhantomPinned,
-}
-
 impl<'c, 'a, T: ?Sized> Future for Wait<'c, 'a, T> {
     type Output = MutexGuard<'a, T>;
 
@@ -123,7 +123,7 @@ impl<'c, 'a, T: ?Sized> Future for Wait<'c, 'a, T> {
             let res = unsafe { Pin::new_unchecked(lock_fut) }.poll(cx);
             if let Poll::Ready(new_guard) = res {
                 this.lock_fut = None;
-                this.node.state = NOT_NOTIFIED;
+                this.node.set_state(NOT_NOTIFIED);
                 return Poll::Ready(new_guard);
             }
             return Poll::Pending;
@@ -131,7 +131,7 @@ impl<'c, 'a, T: ?Sized> Future for Wait<'c, 'a, T> {
 
         // 2. Initial poll: register waker, enqueue into cvar, and release mutex
         if !this.queued {
-            this.node.state = NOT_NOTIFIED;
+            this.node.set_state(NOT_NOTIFIED);
             unsafe {
                 let node_pin = Pin::new_unchecked(&mut this.node);
                 this.cvar.waiters.register_and_push(node_pin, cx);
@@ -159,7 +159,7 @@ impl<'c, 'a, T: ?Sized> Future for Wait<'c, 'a, T> {
             let res = unsafe { Pin::new_unchecked(lock_fut) }.poll(cx);
             if let Poll::Ready(new_guard) = res {
                 this.lock_fut = None;
-                this.node.state = NOT_NOTIFIED;
+                this.node.set_state(NOT_NOTIFIED);
                 return Poll::Ready(new_guard);
             }
             Poll::Pending
@@ -177,20 +177,20 @@ impl<'c, 'a, T: ?Sized> Drop for Wait<'c, 'a, T> {
         }
 
         if self.queued {
-            if !self.cvar.waiters.remove(&self.node) && self.node.state == NOTIFIED_ONE {
-                self.node.state = NOT_NOTIFIED;
+            if !self.cvar.waiters.remove(&self.node) && self.node.state() == NOTIFIED_ONE {
+                self.node.set_state(NOT_NOTIFIED);
                 let detached = self.cvar.waiters.take_front_with(|next| {
-                    next.state = NOTIFIED_ONE;
+                    next.set_state(NOTIFIED_ONE);
                 });
                 if let Some(detached) = detached {
                     detached.wake();
                 }
             }
             self.queued = false;
-        } else if self.node.state == NOTIFIED_ONE {
-            self.node.state = NOT_NOTIFIED;
+        } else if self.node.state() == NOTIFIED_ONE {
+            self.node.set_state(NOT_NOTIFIED);
             let detached = self.cvar.waiters.take_front_with(|next| {
-                next.state = NOTIFIED_ONE;
+                next.set_state(NOTIFIED_ONE);
             });
             if let Some(detached) = detached {
                 detached.wake();

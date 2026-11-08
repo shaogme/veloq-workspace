@@ -1,11 +1,16 @@
-use std::cell::Cell;
-use std::pin::pin;
-use std::rc::Rc;
-use std::task::{Context, Waker};
-use std::time::Duration;
-use tokio::task::LocalSet;
-use tokio::time::sleep;
-use veloq_local::set_once::{SetOnce, SetOnceError};
+use std::{
+    cell::Cell,
+    pin::pin,
+    rc::Rc,
+    task::{Context, Waker},
+    time::Duration,
+};
+use tokio::{
+    select,
+    task::{LocalSet, spawn_local},
+    time::sleep,
+};
+use veloq_local::SetOnce;
 
 #[derive(Clone)]
 struct DropCounter {
@@ -49,7 +54,6 @@ fn test_local_set_once_duplicate_set() {
     assert!(cell.set("hello").is_ok());
 
     let err = cell.set("world").unwrap_err();
-    assert_eq!(err, SetOnceError("world"));
     assert_eq!(err.into_inner(), "world");
     assert_eq!(cell.get(), Some(&"hello"));
 }
@@ -156,8 +160,8 @@ async fn test_local_set_once_multiple_waiters() {
             let c1 = cell.clone();
             let c2 = cell.clone();
 
-            let h1 = tokio::task::spawn_local(async move { *c1.wait().await });
-            let h2 = tokio::task::spawn_local(async move { *c2.wait().await });
+            let h1 = spawn_local(async move { *c1.wait().await });
+            let h2 = spawn_local(async move { *c2.wait().await });
 
             sleep(Duration::from_millis(10)).await;
             assert!(cell.set(777).is_ok());
@@ -187,8 +191,8 @@ async fn test_local_set_once_cancellation() {
             let completed = Rc::new(Cell::new(false));
             let completed_clone = completed.clone();
 
-            let h1 = tokio::task::spawn_local(async move {
-                tokio::select! {
+            let h1 = spawn_local(async move {
+                select! {
                     _ = c1.wait() => {
                         completed_clone.set(true);
                     }
@@ -196,7 +200,7 @@ async fn test_local_set_once_cancellation() {
                 }
             });
 
-            let h2 = tokio::task::spawn_local(async move { *c2.wait().await });
+            let h2 = spawn_local(async move { *c2.wait().await });
 
             h1.await.unwrap();
             assert!(!completed.get());

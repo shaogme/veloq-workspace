@@ -1,6 +1,6 @@
 //! BorrowedSender and BorrowedReceiver cannot escape with_borrowed_unbounded/bounded closures.
 
-use veloq_sync::mpsc;
+use veloq_sync::Mpsc as mpsc;
 
 async fn test_unbounded_tx_escape() {
     let _escaped = mpsc::with_borrowed_unbounded::<i32, _, _>(async |tx, _rx| tx).await;

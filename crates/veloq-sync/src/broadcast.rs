@@ -86,7 +86,28 @@ struct Inner<T> {
     rx_notify: Notify,
 }
 
+pub struct Broadcast;
+
+pub struct BorrowedSender<'a, T> {
+    state: &'a Inner<T>,
+}
+
+pub struct BorrowedReceiver<'a, T> {
+    state: &'a Inner<T>,
+    next_seq: u64,
+}
+
+pub struct Sender<T> {
+    state: Arc<Inner<T>>,
+}
+
+pub struct Receiver<T> {
+    state: Arc<Inner<T>>,
+    next_seq: u64,
+}
+
 unsafe impl<T: Send> Send for Inner<T> {}
+
 unsafe impl<T: Send> Sync for Inner<T> {}
 
 impl<T> Inner<T> {
@@ -140,7 +161,7 @@ impl<T> Inner<T> {
         let (rx_count, evicted) = {
             let mut state = self.state.lock();
             if state.receiver_count == 0 {
-                return Err(SendError(value));
+                return Err(SendError::new(value));
             }
 
             let evicted = if state.queue.len() == state.capacity {
@@ -219,12 +240,8 @@ impl<T> Inner<T> {
     }
 }
 
-/// The sender half of a borrowed broadcast channel.
-pub struct BorrowedSender<'a, T> {
-    state: &'a Inner<T>,
-}
-
 unsafe impl<T: Send> Send for BorrowedSender<'_, T> {}
+
 unsafe impl<T: Send> Sync for BorrowedSender<'_, T> {}
 
 impl<'a, T> BorrowedSender<'a, T> {
@@ -319,13 +336,8 @@ impl<T> fmt::Debug for BorrowedSender<'_, T> {
     }
 }
 
-/// The receiver half of a borrowed broadcast channel.
-pub struct BorrowedReceiver<'a, T> {
-    state: &'a Inner<T>,
-    next_seq: u64,
-}
-
 unsafe impl<T: Send> Send for BorrowedReceiver<'_, T> {}
+
 unsafe impl<T: Send> Sync for BorrowedReceiver<'_, T> {}
 
 impl<'a, T> BorrowedReceiver<'a, T> {
@@ -405,12 +417,8 @@ impl<T> fmt::Debug for BorrowedReceiver<'_, T> {
     }
 }
 
-/// A sender for a broadcast channel.
-pub struct Sender<T> {
-    state: Arc<Inner<T>>,
-}
-
 unsafe impl<T: Send> Send for Sender<T> {}
+
 unsafe impl<T: Send> Sync for Sender<T> {}
 
 impl<T> Sender<T> {
@@ -507,13 +515,8 @@ impl<T> fmt::Debug for Sender<T> {
     }
 }
 
-/// A receiver for a broadcast channel.
-pub struct Receiver<T> {
-    state: Arc<Inner<T>>,
-    next_seq: u64,
-}
-
 unsafe impl<T: Send> Send for Receiver<T> {}
+
 unsafe impl<T: Send> Sync for Receiver<T> {}
 
 impl<T> Receiver<T> {
@@ -593,29 +596,29 @@ impl<T> fmt::Debug for Receiver<T> {
     }
 }
 
-/// Creates a new broadcast channel returning a sender and receiver pair.
-pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
-    let state = Arc::new(Inner::new(capacity, 1, 1));
-    let next_seq = state.state.lock().tail;
-    (
-        Sender {
-            state: state.clone(),
-        },
-        Receiver { state, next_seq },
-    )
-}
+impl Broadcast {
+    pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
+        let state = Arc::new(Inner::new(capacity, 1, 1));
+        let next_seq = state.state.lock().tail;
+        (
+            Sender {
+                state: state.clone(),
+            },
+            Receiver { state, next_seq },
+        )
+    }
 
-/// Creates a new borrowed broadcast channel and runs the provided asynchronous closure with it.
-pub async fn with_borrowed_channel<T, F, R>(capacity: usize, f: F) -> R
-where
-    F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
-{
-    let state = Inner::new(capacity, 1, 1);
-    let next_seq = state.state.lock().tail;
-    let tx = BorrowedSender { state: &state };
-    let rx = BorrowedReceiver {
-        state: &state,
-        next_seq,
-    };
-    f(tx, rx).await
+    pub async fn with_borrowed_channel<T, F, R>(capacity: usize, f: F) -> R
+    where
+        F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
+    {
+        let state = Inner::new(capacity, 1, 1);
+        let next_seq = state.state.lock().tail;
+        let tx = BorrowedSender { state: &state };
+        let rx = BorrowedReceiver {
+            state: &state,
+            next_seq,
+        };
+        f(tx, rx).await
+    }
 }

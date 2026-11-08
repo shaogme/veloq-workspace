@@ -3,7 +3,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use veloq::{
     buf::FixedBuf,
     std::{marker::PhantomData, net::SocketAddr, sync::Arc, vec::Vec},
-    sync::{mpmc::BoundedSender, oneshot},
+    sync::{MpmcBoundedSender as BoundedSender, Oneshot as oneshot, OneshotSender},
 };
 
 use crate::{
@@ -14,7 +14,7 @@ use crate::{
 };
 
 type CommandSender = BoundedSender<Command>;
-type Reply<T> = oneshot::Sender<Result<T>>;
+type Reply<T> = OneshotSender<Result<T>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shutdown {

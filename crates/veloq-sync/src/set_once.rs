@@ -1,6 +1,7 @@
-use crate::{wait_queue::WaitQueue, waker::WaiterNode};
+use crate::{common::WaiterNode, wait_queue::WaitQueue};
 use veloq_std::{
     cell::UnsafeCell,
+    error::Error,
     fmt,
     future::Future,
     marker::PhantomPinned,
@@ -14,9 +15,13 @@ const INITIALIZED: usize = 1;
 
 /// Error returned when setting a value on an already initialized `SetOnce`.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct SetOnceError<T>(pub T);
+pub struct SetOnceError<T>(T);
 
 impl<T> SetOnceError<T> {
+    pub fn new(value: T) -> Self {
+        Self(value)
+    }
+
     /// Consumes the error, returning the value that failed to be set.
     pub fn into_inner(self) -> T {
         self.0
@@ -35,7 +40,7 @@ impl<T> fmt::Display for SetOnceError<T> {
     }
 }
 
-impl<T> veloq_std::error::Error for SetOnceError<T> {}
+impl<T> Error for SetOnceError<T> {}
 
 /// A thread-safe synchronization primitive that can be written to at most once
 /// and awaited asynchronously by multiple readers.
@@ -46,6 +51,7 @@ pub struct SetOnce<T> {
 }
 
 unsafe impl<T: Send> Send for SetOnce<T> {}
+
 unsafe impl<T: Send + Sync> Sync for SetOnce<T> {}
 
 impl<T> SetOnce<T> {
@@ -115,12 +121,12 @@ impl<T> SetOnce<T> {
     /// Returns `Err(SetOnceError(value))` if the `SetOnce` was already initialized.
     pub fn set(&self, value: T) -> Result<(), SetOnceError<T>> {
         if self.state.load(Ordering::Acquire) == INITIALIZED {
-            return Err(SetOnceError(value));
+            return Err(SetOnceError::new(value));
         }
 
         self.waiters.with_lock(|_| {
             if self.state.load(Ordering::Relaxed) == INITIALIZED {
-                return Err(SetOnceError(value));
+                return Err(SetOnceError::new(value));
             }
 
             // SAFETY: Under the lock, no other thread can concurrently write to `value`.
@@ -173,7 +179,17 @@ impl<T> SetOnce<T> {
             None
         }
     }
+}
 
+/// A future that waits for a `SetOnce` to be initialized.
+pub struct Wait<'a, T> {
+    set_once: &'a SetOnce<T>,
+    node: WaiterNode,
+    queued: bool,
+    _pin: PhantomPinned,
+}
+
+impl<T> SetOnce<T> {
     /// Returns a future that resolves to a reference to the contained value once set.
     pub fn wait(&self) -> Wait<'_, T> {
         Wait {
@@ -185,17 +201,10 @@ impl<T> SetOnce<T> {
     }
 }
 
-/// A future that waits for a `SetOnce` to be initialized.
-pub struct Wait<'a, T> {
-    set_once: &'a SetOnce<T>,
-    node: WaiterNode,
-    queued: bool,
-    _pin: PhantomPinned,
-}
-
 pub type SetOnceWait<'a, T> = Wait<'a, T>;
 
 unsafe impl<T: Sync> Send for Wait<'_, T> {}
+
 unsafe impl<T: Sync> Sync for Wait<'_, T> {}
 
 impl<'a, T> Future for Wait<'a, T> {

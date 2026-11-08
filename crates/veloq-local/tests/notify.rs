@@ -1,11 +1,9 @@
-use std::cell::Cell;
-use std::future::pending;
-use std::pin::pin;
-use std::rc::Rc;
-use std::time::Duration;
-use tokio::task::LocalSet;
-use tokio::time::sleep;
-use veloq_local::notify::Notify;
+use std::{cell::Cell, future::pending, pin::pin, rc::Rc, time::Duration};
+use tokio::{
+    task::{LocalSet, spawn_local},
+    time::sleep,
+};
+use veloq_local::Notify;
 
 #[tokio::test]
 async fn test_local_notify_one_basic() {
@@ -16,7 +14,7 @@ async fn test_local_notify_one_basic() {
             let notify = Rc::new(Notify::new());
             let n2 = notify.clone();
 
-            let handle = tokio::task::spawn_local(async move {
+            let handle = spawn_local(async move {
                 n2.notified().await;
                 42
             });
@@ -62,7 +60,7 @@ async fn test_local_notify_one_single_permit() {
             let completed = Rc::new(Cell::new(false));
             let completed2 = completed.clone();
 
-            let handle = tokio::task::spawn_local(async move {
+            let handle = spawn_local(async move {
                 n2.notified().await;
                 completed2.set(true);
             });
@@ -91,7 +89,7 @@ async fn test_local_notify_multi_waiters_fifo() {
             for i in 0..3 {
                 let n = notify.clone();
                 let c = counter.clone();
-                handles.push(tokio::task::spawn_local(async move {
+                handles.push(spawn_local(async move {
                     n.notified().await;
                     c.set(i + 1);
                 }));
@@ -130,7 +128,7 @@ async fn test_local_notify_waiters() {
             for _ in 0..5 {
                 let n = notify.clone();
                 let c = count.clone();
-                handles.push(tokio::task::spawn_local(async move {
+                handles.push(spawn_local(async move {
                     n.notified().await;
                     c.set(c.get() + 1);
                 }));
@@ -163,7 +161,7 @@ async fn test_local_notify_waiters_no_permit() {
             let completed = Rc::new(Cell::new(false));
             let completed2 = completed.clone();
 
-            let handle = tokio::task::spawn_local(async move {
+            let handle = spawn_local(async move {
                 n2.notified().await;
                 completed2.set(true);
             });
@@ -192,7 +190,7 @@ async fn test_local_notify_drop_notified_transfer() {
             let second_woken2 = second_woken.clone();
 
             // Task 1 will be cancelled
-            let t1 = tokio::task::spawn_local(async move {
+            let t1 = spawn_local(async move {
                 let notified = n1.notified();
                 let mut pinned = pin!(notified);
                 pinned.as_mut().enable();
@@ -200,7 +198,7 @@ async fn test_local_notify_drop_notified_transfer() {
             });
 
             // Task 2 will wait
-            let t2 = tokio::task::spawn_local(async move {
+            let t2 = spawn_local(async move {
                 n2.notified().await;
                 second_woken2.set(true);
             });
@@ -230,7 +228,7 @@ async fn test_local_notify_drop_notified_restore_permit() {
             let notify = Rc::new(Notify::new());
             let n1 = notify.clone();
 
-            let t1 = tokio::task::spawn_local(async move {
+            let t1 = spawn_local(async move {
                 let notified = n1.notified();
                 let mut pinned = pin!(notified);
                 pinned.as_mut().enable();

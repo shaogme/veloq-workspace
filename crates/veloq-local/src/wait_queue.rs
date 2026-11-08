@@ -25,10 +25,14 @@ impl RefreshResult {
 
 /// A waiter removed from the queue, with ownership of its registered waker.
 pub(crate) struct DetachedWaiter {
-    pub(crate) waker: Option<Waker>,
+    waker: Option<Waker>,
 }
 
 impl DetachedWaiter {
+    pub(crate) fn new(waker: Option<Waker>) -> Self {
+        Self { waker }
+    }
+
     /// Wakes the detached waiter after the queue borrow has ended.
     pub(crate) fn wake(self) {
         if let Some(waker) = self.waker {
@@ -65,13 +69,6 @@ impl WaitQueue {
         self.inner.borrow().is_empty()
     }
 
-    /// Checks whether the given node is currently linked in the wait queue.
-    #[inline]
-    #[allow(dead_code)]
-    pub fn is_linked(&self, node: &WaiterNode) -> bool {
-        node.link.is_linked()
-    }
-
     /// Checks if the node is linked in the wait queue, and if so, registers the waker from `cx`
     /// while checking linked status to prevent lost wakeups.
     ///
@@ -79,16 +76,16 @@ impl WaitQueue {
     /// [`RefreshResult::Detached`] after another operation dequeued the node.
     #[inline]
     pub fn refresh_waker(&self, node: &mut WaiterNode, cx: &mut Context<'_>) -> RefreshResult {
-        if !node.link.is_linked() {
+        if !node.is_linked() {
             return RefreshResult::Detached;
         }
 
         let new_waker = cx.waker().clone();
-        let old_waker = node.waker.replace(new_waker);
+        let old_waker = node.replace_waker(new_waker);
         drop(old_waker);
 
         let _list = self.inner.borrow_mut();
-        if node.link.is_linked() {
+        if node.is_linked() {
             RefreshResult::Linked
         } else {
             RefreshResult::Detached
@@ -107,7 +104,7 @@ impl WaitQueue {
     #[inline]
     pub fn register_and_push(&self, mut node: Pin<&mut WaiterNode>, cx: &mut Context<'_>) {
         let new_waker = cx.waker().clone();
-        let old_waker = unsafe { node.as_mut().get_unchecked_mut().waker.replace(new_waker) };
+        let old_waker = unsafe { node.as_mut().get_unchecked_mut().replace_waker(new_waker) };
         drop(old_waker);
         let mut list = self.inner.borrow_mut();
         unsafe {
@@ -119,7 +116,7 @@ impl WaitQueue {
     ///
     /// Returns `true` if the node was found and removed, or `false` if it was already dequeued.
     pub fn remove(&self, node: &WaiterNode) -> bool {
-        if node.link.is_linked() {
+        if node.is_linked() {
             unsafe {
                 let ptr = NonNull::from(node);
                 let mut list = self.inner.borrow_mut();
@@ -136,7 +133,7 @@ impl WaitQueue {
     pub fn take_front(&self) -> Option<DetachedWaiter> {
         let mut list = self.inner.borrow_mut();
         let mut node = list.pop_front()?;
-        let waker = unsafe { node.as_mut().get_unchecked_mut().waker.take() };
+        let waker = unsafe { node.as_mut().get_unchecked_mut().take_waker() };
         Some(DetachedWaiter { waker })
     }
 
@@ -150,7 +147,7 @@ impl WaitQueue {
         let node_mut = unsafe { node.as_mut().get_unchecked_mut() };
         f(node_mut);
         Some(DetachedWaiter {
-            waker: node_mut.waker.take(),
+            waker: node_mut.take_waker(),
         })
     }
 

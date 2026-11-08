@@ -4,7 +4,7 @@ use veloq::{
 };
 use veloq_buf::UniformSlot;
 use veloq_std::ops::AsyncFnOnce;
-use veloq_sync::oneshot;
+use veloq_sync::{Oneshot as oneshot, OneshotRecvError as RecvError};
 
 fn run_test<F, R>(f: F) -> R
 where
@@ -44,7 +44,7 @@ fn test_sync_oneshot_drop_sender() {
                 });
 
                 let err = rx.await.unwrap_err();
-                assert!(matches!(err, oneshot::error::RecvError(_)));
+                assert!(matches!(err, RecvError));
             })
             .await
             .unwrap();
@@ -57,12 +57,12 @@ fn test_sync_oneshot_drop_sender() {
 fn test_sync_oneshot_try_recv() {
     run_test(async |_ctx| {
         oneshot::with_borrowed_channel(async |tx, mut rx| {
-            assert_eq!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+            assert_eq!(rx.try_recv(), Err(veloq_sync::OneshotTryRecvError::Empty));
 
             tx.send(100).unwrap();
 
             assert_eq!(rx.try_recv(), Ok(100));
-            assert_eq!(rx.try_recv(), Err(oneshot::error::TryRecvError::Closed));
+            assert_eq!(rx.try_recv(), Err(veloq_sync::OneshotTryRecvError::Closed));
         })
         .await;
     });

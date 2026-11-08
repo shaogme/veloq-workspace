@@ -1,7 +1,7 @@
 use crate::{
+    common::WaiterNode,
     mutex::{Mutex, MutexGuard, MutexLockFuture},
     wait_queue::WaitQueue,
-    waker::WaiterNode,
 };
 use futures_core::Future;
 use veloq_std::{
@@ -23,7 +23,18 @@ pub struct Condvar {
     waiters: WaitQueue,
 }
 
+pub struct Wait<'c, 'a, T: ?Sized> {
+    cvar: &'c Condvar,
+    lock: &'a Mutex<T>,
+    guard: Option<MutexGuard<'a, T>>,
+    node: WaiterNode,
+    lock_fut: Option<MutexLockFuture<'a, T>>,
+    queued: bool,
+    _pin: PhantomPinned,
+}
+
 unsafe impl Send for Condvar {}
+
 unsafe impl Sync for Condvar {}
 
 impl Condvar {
@@ -121,18 +132,8 @@ impl fmt::Debug for Condvar {
     }
 }
 
-/// A future returned by [`Condvar::wait`] that waits for a notification and re-acquires the lock.
-pub struct Wait<'c, 'a, T: ?Sized> {
-    cvar: &'c Condvar,
-    lock: &'a Mutex<T>,
-    guard: Option<MutexGuard<'a, T>>,
-    node: WaiterNode,
-    lock_fut: Option<MutexLockFuture<'a, T>>,
-    queued: bool,
-    _pin: PhantomPinned,
-}
-
 unsafe impl<'c, 'a, T: ?Sized + Send> Send for Wait<'c, 'a, T> {}
+
 unsafe impl<'c, 'a, T: ?Sized + Sync> Sync for Wait<'c, 'a, T> {}
 
 impl<'c, 'a, T: ?Sized> Future for Wait<'c, 'a, T> {

@@ -1,12 +1,20 @@
 use core::{cell::Ref as CoreRef, ops::Deref};
 
-use veloq_std::{cell::RefCell, error::Error, fmt, ops::AsyncFnOnce, pin::pin, rc::Rc};
+use veloq_std::{cell::RefCell, error::Error, fmt, ops::AsyncFnOnce, pin::pin, ptr, rc::Rc};
 
 use crate::notify::Notify;
 
+pub struct Watch;
+
 /// Error produced when sending a value fails because all receivers have been dropped.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct SendError<T>(pub T);
+pub struct SendError<T>(T);
+
+impl<T> SendError<T> {
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
 
 impl<T> fmt::Debug for SendError<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -58,6 +66,50 @@ struct Inner<T> {
     state: RefCell<WatchState<T>>,
     rx_notify: Notify,
     tx_notify: Notify,
+}
+
+pub struct Ref<'a, T> {
+    inner: CoreRef<'a, WatchState<T>>,
+}
+
+pub struct BorrowedSender<'a, T> {
+    state: &'a Inner<T>,
+}
+
+pub struct BorrowedReceiver<'a, T> {
+    state: &'a Inner<T>,
+    version: usize,
+}
+
+pub struct Sender<T> {
+    state: Rc<Inner<T>>,
+}
+
+pub struct Receiver<T> {
+    state: Rc<Inner<T>>,
+    version: usize,
+}
+
+impl Watch {
+    pub fn channel<T>(init: T) -> (Sender<T>, Receiver<T>) {
+        let state = Rc::new(Inner::new(init));
+        let version = state.current_version();
+        (
+            Sender {
+                state: state.clone(),
+            },
+            Receiver { state, version },
+        )
+    }
+
+    pub async fn with_borrowed_channel<T, F, R>(init: T, f: F) -> R
+    where
+        F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
+    {
+        let state = Inner::new(init);
+        let (tx, rx) = state.borrowed_parts();
+        f(tx, rx).await
+    }
 }
 
 impl<T> Inner<T> {
@@ -262,10 +314,6 @@ impl<T> Inner<T> {
 ///
 /// This borrow protects the complete channel state. Holding it can delay
 /// sends, subscriptions, receiver destruction, and sender shutdown.
-pub struct Ref<'a, T> {
-    inner: CoreRef<'a, WatchState<T>>,
-}
-
 impl<T> Deref for Ref<'_, T> {
     type Target = T;
 
@@ -285,11 +333,6 @@ impl<T: fmt::Display> fmt::Display for Ref<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&**self, f)
     }
-}
-
-/// The sender half of a borrowed watch channel.
-pub struct BorrowedSender<'a, T> {
-    state: &'a Inner<T>,
 }
 
 impl<'a, T> BorrowedSender<'a, T> {
@@ -359,12 +402,6 @@ impl<T> fmt::Debug for BorrowedSender<'_, T> {
     }
 }
 
-/// The receiver half of a borrowed watch channel.
-pub struct BorrowedReceiver<'a, T> {
-    state: &'a Inner<T>,
-    version: usize,
-}
-
 impl<'a, T> BorrowedReceiver<'a, T> {
     /// Borrows the current value without updating the seen version.
     pub fn borrow(&self) -> Ref<'_, T> {
@@ -398,7 +435,7 @@ impl<'a, T> BorrowedReceiver<'a, T> {
 
     /// Returns `true` if both receivers belong to the same channel.
     pub fn same_channel(&self, other: &Self) -> bool {
-        veloq_std::ptr::eq(self.state, other.state)
+        ptr::eq(self.state, other.state)
     }
 }
 
@@ -424,11 +461,6 @@ impl<T> fmt::Debug for BorrowedReceiver<'_, T> {
             .field("version", &self.version)
             .finish()
     }
-}
-
-/// A sender for a watch channel.
-pub struct Sender<T> {
-    state: Rc<Inner<T>>,
 }
 
 impl<T> Sender<T> {
@@ -498,12 +530,6 @@ impl<T> fmt::Debug for Sender<T> {
     }
 }
 
-/// A receiver for a watch channel.
-pub struct Receiver<T> {
-    state: Rc<Inner<T>>,
-    version: usize,
-}
-
 impl<T> Receiver<T> {
     /// Borrows the current value without updating the seen version.
     pub fn borrow(&self) -> Ref<'_, T> {
@@ -563,26 +589,4 @@ impl<T> fmt::Debug for Receiver<T> {
             .field("version", &self.version)
             .finish()
     }
-}
-
-/// Creates a new watch channel returning a sender and receiver pair.
-pub fn channel<T>(init: T) -> (Sender<T>, Receiver<T>) {
-    let state = Rc::new(Inner::new(init));
-    let version = state.current_version();
-    (
-        Sender {
-            state: state.clone(),
-        },
-        Receiver { state, version },
-    )
-}
-
-/// Creates a new borrowed watch channel and runs the provided asynchronous closure with it.
-pub async fn with_borrowed_channel<T, F, R>(init: T, f: F) -> R
-where
-    F: for<'a> AsyncFnOnce(BorrowedSender<'a, T>, BorrowedReceiver<'a, T>) -> R,
-{
-    let state = Inner::new(init);
-    let (tx, rx) = state.borrowed_parts();
-    f(tx, rx).await
 }

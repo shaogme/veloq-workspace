@@ -1,7 +1,7 @@
 use std::{cell::Cell, future::pending, pin::pin, rc::Rc, time::Duration};
 use tokio::{
-    task::{LocalSet, yield_now},
-    time::sleep,
+    task::{LocalSet, spawn_local, yield_now},
+    time::{sleep, timeout},
 };
 use veloq_local::Mutex;
 
@@ -46,7 +46,7 @@ async fn test_mutex_contention() {
 
             for _ in 0..10 {
                 let m = mutex.clone();
-                handles.push(tokio::task::spawn_local(async move {
+                handles.push(spawn_local(async move {
                     for _ in 0..50 {
                         let mut guard = m.lock().await;
                         let val = *guard;
@@ -80,7 +80,7 @@ async fn test_mutex_fifo_order() {
             for i in 1..=3 {
                 let m = mutex.clone();
                 let o = order.clone();
-                handles.push(tokio::task::spawn_local(async move {
+                handles.push(spawn_local(async move {
                     let _g = m.lock().await;
                     let mut list = o.take();
                     list.push(i);
@@ -110,13 +110,13 @@ async fn test_mutex_cancellation_waiting() {
             let guard = mutex.lock().await;
 
             let m1 = mutex.clone();
-            let t1 = tokio::task::spawn_local(async move {
+            let t1 = spawn_local(async move {
                 let _g = m1.lock().await;
                 pending::<()>().await;
             });
 
             let m2 = mutex.clone();
-            let t2 = tokio::task::spawn_local(async move {
+            let t2 = spawn_local(async move {
                 let mut g = m2.lock().await;
                 *g = 42;
             });
@@ -150,17 +150,17 @@ async fn test_mutex_cancellation_granted() {
             let guard = mutex.lock().await;
 
             // t1 waits for the lock
-            let t1 = tokio::task::spawn_local(async move {
+            let t1 = spawn_local(async move {
                 let lock_fut = m1.lock();
                 let mut pinned = pin!(lock_fut);
                 // First poll to register in waiter list
-                let _ = tokio::time::timeout(Duration::from_millis(5), &mut pinned).await;
+                let _ = timeout(Duration::from_millis(5), &mut pinned).await;
                 // Wait until aborted
                 pending::<()>().await;
             });
 
             // t2 also waits for the lock
-            let t2 = tokio::task::spawn_local(async move {
+            let t2 = spawn_local(async move {
                 let mut g = m2.lock().await;
                 *g = 99;
             });

@@ -1,15 +1,17 @@
-use std::time::Duration;
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, rc::Rc, time::Duration};
 
 use tokio::{
     task::{LocalSet, spawn_local},
-    time::sleep,
+    time::{sleep, timeout},
 };
-use veloq_local::broadcast::{self, RecvError, SendError, TryRecvError};
+use veloq_local::{
+    Broadcast, BroadcastRecvError as RecvError, BroadcastSender,
+    BroadcastTryRecvError as TryRecvError,
+};
 
 #[tokio::test]
 async fn test_local_broadcast_basic() {
-    let (tx, mut rx) = broadcast::channel(16);
+    let (tx, mut rx) = Broadcast::channel(16);
     assert_eq!(tx.capacity(), 16);
     assert_eq!(tx.receiver_count(), 1);
     assert_eq!(tx.sender_count(), 1);
@@ -30,7 +32,7 @@ async fn test_local_broadcast_basic() {
 
 #[tokio::test]
 async fn test_local_broadcast_multi_receiver() {
-    let (tx, mut rx1) = broadcast::channel(16);
+    let (tx, mut rx1) = Broadcast::channel(16);
     let mut rx2 = tx.subscribe();
     let mut rx3 = rx1.clone();
 
@@ -52,7 +54,7 @@ async fn test_local_broadcast_multi_receiver() {
 
 #[tokio::test]
 async fn test_local_broadcast_lagged() {
-    let (tx, mut rx) = broadcast::channel(2);
+    let (tx, mut rx) = Broadcast::channel(2);
 
     tx.send(1).unwrap();
     tx.send(2).unwrap();
@@ -68,7 +70,7 @@ async fn test_local_broadcast_lagged() {
 
 #[tokio::test]
 async fn test_local_broadcast_try_recv() {
-    let (tx, mut rx) = broadcast::channel(2);
+    let (tx, mut rx) = Broadcast::channel(2);
 
     assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
 
@@ -90,7 +92,7 @@ async fn test_local_broadcast_try_recv() {
 
 #[tokio::test]
 async fn test_local_broadcast_sender_drop() {
-    let (tx, mut rx) = broadcast::channel(16);
+    let (tx, mut rx) = Broadcast::channel(16);
     tx.send(100).unwrap();
     tx.send(200).unwrap();
     drop(tx);
@@ -104,12 +106,12 @@ async fn test_local_broadcast_sender_drop() {
 
 #[tokio::test]
 async fn test_local_broadcast_no_receiver() {
-    let (tx, rx) = broadcast::channel::<i32>(16);
+    let (tx, rx) = Broadcast::channel::<i32>(16);
     drop(rx);
 
     assert!(tx.is_closed());
     let err = tx.send(999).unwrap_err();
-    assert_eq!(err, SendError(999));
+    assert_eq!(err.into_inner(), 999);
 
     let mut new_rx = tx.subscribe();
     assert!(!tx.is_closed());
@@ -119,7 +121,7 @@ async fn test_local_broadcast_no_receiver() {
 
 #[tokio::test]
 async fn test_local_broadcast_resubscribe_and_clone() {
-    let (tx, mut rx1) = broadcast::channel(16);
+    let (tx, mut rx1) = Broadcast::channel(16);
     tx.send(1).unwrap();
     tx.send(2).unwrap();
 
@@ -139,7 +141,7 @@ async fn test_local_broadcast_resubscribe_and_clone() {
 
 #[tokio::test]
 async fn test_local_broadcast_borrowed_state() {
-    let (tx, mut rx) = broadcast::channel(16);
+    let (tx, mut rx) = Broadcast::channel(16);
 
     let mut rx2 = tx.subscribe();
     let mut rx3 = rx.clone();
@@ -160,7 +162,7 @@ async fn test_local_broadcast_concurrent() {
 
     local
         .run_until(async {
-            let (tx, mut rx1) = broadcast::channel(100);
+            let (tx, mut rx1) = Broadcast::channel(100);
             let mut rx2 = tx.subscribe();
 
             let tx_clone = tx.clone();
@@ -208,14 +210,9 @@ async fn test_local_broadcast_cancellation() {
 
     local
         .run_until(async {
-            let (tx, mut rx) = broadcast::channel(16);
+            let (tx, mut rx) = Broadcast::channel(16);
 
-            tokio::select! {
-                _ = rx.recv() => {
-                    panic!("should not resolve");
-                }
-                _ = sleep(Duration::from_millis(10)) => {}
-            }
+            assert!(timeout(Duration::from_millis(10), rx.recv()).await.is_err());
 
             tx.send(777).unwrap();
             assert_eq!(rx.recv().await.unwrap(), 777);
@@ -225,7 +222,7 @@ async fn test_local_broadcast_cancellation() {
 
 #[tokio::test]
 async fn test_local_broadcast_send_count_linearization_order() {
-    let (tx, mut rx) = broadcast::channel(8);
+    let (tx, mut rx) = Broadcast::channel(8);
 
     assert_eq!(tx.send(1).unwrap(), 1);
     let mut late = tx.subscribe();
@@ -239,10 +236,10 @@ async fn test_local_broadcast_send_count_linearization_order() {
 
 #[tokio::test]
 async fn test_local_broadcast_send_count_after_receiver_drop() {
-    let (tx, rx) = broadcast::channel::<i32>(8);
+    let (tx, rx) = Broadcast::channel::<i32>(8);
     drop(rx);
 
-    assert_eq!(tx.send(1), Err(SendError(1)));
+    assert_eq!(tx.send(1).unwrap_err().into_inner(), 1);
     assert_eq!(tx.len(), 0);
 
     let mut rx = tx.subscribe();
@@ -252,7 +249,7 @@ async fn test_local_broadcast_send_count_after_receiver_drop() {
 
 #[tokio::test]
 async fn test_local_broadcast_borrowed_send_count() {
-    broadcast::with_borrowed_channel(8, async |tx, mut rx| {
+    Broadcast::with_borrowed_channel(8, async |tx, mut rx| {
         let mut cloned = rx.clone();
         let mut resubscribed = rx.resubscribe();
         assert_eq!(tx.receiver_count(), 3);
@@ -266,7 +263,7 @@ async fn test_local_broadcast_borrowed_send_count() {
 
 #[derive(Clone)]
 struct ReentrantDrop {
-    sender: Rc<RefCell<Option<broadcast::Sender<ReentrantDrop>>>>,
+    sender: Rc<RefCell<Option<BroadcastSender<ReentrantDrop>>>>,
     fired: Rc<RefCell<bool>>,
 }
 
@@ -292,7 +289,7 @@ impl Drop for ReentrantDrop {
 
 #[test]
 fn test_local_broadcast_evicted_drop_reenters_after_state_unlock() {
-    let (tx, _rx) = broadcast::channel(1);
+    let (tx, _rx) = Broadcast::channel(1);
     let sender = Rc::new(RefCell::new(None));
     let fired = Rc::new(RefCell::new(false));
     *sender.borrow_mut() = Some(tx.clone());

@@ -12,7 +12,7 @@ use veloq::{
 };
 use veloq_buf::UniformSlot;
 use veloq_runtime::yield_now;
-use veloq_sync::mpmc;
+use veloq_sync::Mpmc as mpmc;
 
 fn run_test<F, R>(f: F) -> R
 where

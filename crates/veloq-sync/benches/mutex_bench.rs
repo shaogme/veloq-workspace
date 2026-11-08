@@ -1,12 +1,10 @@
 use criterion::{Criterion, criterion_group, criterion_main};
+use tokio::runtime::Builder;
 use veloq_std::{hint::black_box, sync::Arc};
-use veloq_sync::mutex::Mutex;
+use veloq_sync::Mutex;
 
 fn bench_mutex_uncontended(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
 
     let mutex = Arc::new(Mutex::new(0));
 

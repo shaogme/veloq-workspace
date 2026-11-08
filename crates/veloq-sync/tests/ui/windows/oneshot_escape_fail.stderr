@@ -5,7 +5,7 @@ error: lifetime may not live long enough
   |                                                                       --     - ^^ returning this value requires that `'1` must outlive `'2`
   |                                                                       |      |
   |                                                                       |      return type of async closure `{async closure body@$DIR/tests/ui/windows/oneshot_escape_fail.rs:6:80: 6:82}` contains a lifetime `'2`
-  |                                                                       has type `veloq_sync::oneshot::BorrowedSender<'1, i32>`
+  |                                                                       has type `OneshotBorrowedSender<'1, i32>`
 
 error: lifetime may not live long enough
   --> tests/ui/windows/oneshot_escape_fail.rs:10:80
@@ -14,4 +14,4 @@ error: lifetime may not live long enough
    |                                                                       ---    - ^^ returning this value requires that `'1` must outlive `'2`
    |                                                                       |      |
    |                                                                       |      return type of async closure `{async closure body@$DIR/tests/ui/windows/oneshot_escape_fail.rs:10:80: 10:82}` contains a lifetime `'2`
-   |                                                                       has type `veloq_sync::oneshot::BorrowedSender<'1, i32>`
+   |                                                                       has type `OneshotBorrowedSender<'1, i32>`

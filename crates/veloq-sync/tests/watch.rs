@@ -6,8 +6,11 @@ use std::{
     time::Duration,
 };
 
-use tokio::time::sleep;
-use veloq_sync::{RecvError, SendError, watch};
+use tokio::{
+    spawn,
+    time::{sleep, timeout},
+};
+use veloq_sync::{RecvError, SendError, Watch as watch};
 
 #[tokio::test]
 async fn test_watch_basic() {
@@ -129,7 +132,7 @@ async fn test_watch_all_receivers_dropped() {
     let (mut tx, rx) = watch::channel(1);
     assert!(!tx.is_closed());
 
-    let handle = tokio::spawn(async move {
+    let handle = spawn(async move {
         sleep(Duration::from_millis(20)).await;
         drop(rx);
     });
@@ -139,21 +142,21 @@ async fn test_watch_all_receivers_dropped() {
     handle.await.unwrap();
 
     let err = tx.send(99).unwrap_err();
-    assert_eq!(err, SendError(99));
+    assert_eq!(err, SendError::new(99));
 }
 
 #[tokio::test]
 async fn test_watch_concurrent() {
     let (tx, mut rx) = watch::channel(0);
 
-    let sender_handle = tokio::spawn(async move {
+    let sender_handle = spawn(async move {
         for i in 1..=50 {
             let _ = tx.send(i);
             sleep(Duration::from_millis(1)).await;
         }
     });
 
-    let receiver_handle = tokio::spawn(async move {
+    let receiver_handle = spawn(async move {
         let mut last_seen = 0;
         while last_seen < 50 {
             if rx.changed().await.is_err() {
@@ -197,12 +200,11 @@ async fn test_watch_cancellation() {
     let (tx, mut rx) = watch::channel(1);
 
     // Start waiting, then cancel the future
-    tokio::select! {
-        _ = rx.changed() => {
-            panic!("should not resolve");
-        }
-        _ = sleep(Duration::from_millis(10)) => {}
-    }
+    assert!(
+        timeout(Duration::from_millis(10), rx.changed())
+            .await
+            .is_err()
+    );
 
     // Now send and wait again; must still successfully receive
     tx.send(2).unwrap();
@@ -215,7 +217,7 @@ fn test_watch_send_without_receivers_preserves_value() {
     let (tx, rx) = watch::channel(1);
     drop(rx);
 
-    assert_eq!(tx.send(2), Err(SendError(2)));
+    assert_eq!(tx.send(2), Err(SendError::new(2)));
     assert_eq!(*tx.borrow(), 1);
 }
 
@@ -270,7 +272,7 @@ async fn test_watch_borrowed_channel_initializes_once() {
         drop(rx);
         drop(rx2);
         assert!(tx.is_closed());
-        assert_eq!(tx.send(2), Err(SendError(2)));
+        assert_eq!(tx.send(2), Err(SendError::new(2)));
         *tx.borrow()
     })
     .await;
