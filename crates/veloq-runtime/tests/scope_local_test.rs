@@ -1,13 +1,7 @@
 use veloq_std::convert::Infallible;
 
 use veloq_runtime::{
-    Outcome,
-    runtime::Runtime,
-    scope,
-    scope::JoinOutcome,
-    scope_local,
-    task::{TaskError, yield_now},
-    task_local,
+    JoinOutcome, Outcome, Runtime, TaskError, scope, scope_local, task_local, yield_now,
 };
 
 #[test]

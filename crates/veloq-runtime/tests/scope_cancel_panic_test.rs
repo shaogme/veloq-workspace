@@ -1,8 +1,4 @@
-use veloq_runtime::{
-    Outcome,
-    runtime::{DefaultWorkerFactoryFor, RuntimeBuilder},
-    scope, scope_local,
-};
+use veloq_runtime::{DefaultWorkerFactoryFor, Outcome, RuntimeBuilder, scope, scope_local};
 use veloq_std::{
     future::Future,
     num::NonZeroUsize,
@@ -22,6 +18,7 @@ struct Park;
 
 impl Future for Park {
     type Output = ();
+
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
         Poll::Pending
     }

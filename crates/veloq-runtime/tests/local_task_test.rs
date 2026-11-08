@@ -9,12 +9,7 @@ use veloq_std::{
     thread::{scope, yield_now as thread_yield},
 };
 
-use veloq_runtime::{
-    runtime::Runtime,
-    scope, scope_local,
-    task::{RuntimeContextExt, yield_now},
-    task_local,
-};
+use veloq_runtime::{Runtime, RuntimeContextExt, scope, scope_local, task_local, yield_now};
 
 #[test]
 fn test_local_task_execution() {

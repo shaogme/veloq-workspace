@@ -914,6 +914,7 @@ mod tests {
             FileTableExhaustion, IoFd, OwnedRawHandle, RawHandle, RawHandleKind, UringRawHandle,
         },
         error::UringError,
+        test_serial::FD_TEST_LOCK,
     };
     use veloq_std::vec::Vec;
 
@@ -1003,6 +1004,7 @@ mod tests {
 
     #[test]
     fn owned_direct_entries_are_keyed_by_distinct_owner_identities() {
+        let _test_lock = FD_TEST_LOCK.lock();
         let mut table = table(0, FileTableExhaustion::Fallback);
         let first = table.adopt_direct(owned_eventfd()).unwrap();
         let second = table.adopt_direct(owned_eventfd()).unwrap();
@@ -1027,6 +1029,7 @@ mod tests {
 
     #[test]
     fn releasing_an_old_owner_does_not_remove_a_reused_raw_fd_owner() {
+        let _test_lock = FD_TEST_LOCK.lock();
         let mut table = table(0, FileTableExhaustion::Fallback);
         let first_handle = owned_eventfd();
         let first_fd = first_handle.raw().as_fd();
@@ -1059,6 +1062,7 @@ mod tests {
 
     #[test]
     fn fixed_owned_index_survives_take_install_and_replace() {
+        let _test_lock = FD_TEST_LOCK.lock();
         let mut table = table(1, FileTableExhaustion::Fail);
         let owned = owned_eventfd();
         let raw_fd = owned.raw().as_fd();

@@ -76,7 +76,7 @@ pub struct File<'rt> {
 
 impl<'rt> Drop for LocalFile<'rt> {
     fn drop(&mut self) {
-        self.ctx.runtime_ctx.shared().extra_tls.with(|extra| {
+        self.ctx.runtime_ctx.shared().extra_tls().with(|extra| {
             let mut driver = extra.driver.borrow_mut();
             let _ = driver.unregister_files(vec![self.fd]);
         });
@@ -88,7 +88,7 @@ impl<'rt> Drop for File<'rt> {
     fn drop(&mut self) {
         let current_worker_id = self.ctx.runtime_ctx.worker_id();
         if current_worker_id == self.owner_worker_id {
-            self.ctx.runtime_ctx.shared().extra_tls.with(|extra| {
+            self.ctx.runtime_ctx.shared().extra_tls().with(|extra| {
                 let mut driver = extra.driver.borrow_mut();
                 let _ = driver.unregister_files(vec![self.fd]);
             });

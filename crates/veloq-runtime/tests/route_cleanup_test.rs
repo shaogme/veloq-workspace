@@ -2,7 +2,7 @@
 use veloq_std::future::Ready;
 
 #[cfg(feature = "std")]
-use veloq_runtime::{error::RuntimeError, runtime::Runtime};
+use veloq_runtime::{Runtime, RuntimeError};
 
 #[test]
 #[cfg(feature = "std")]

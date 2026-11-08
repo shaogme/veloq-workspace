@@ -21,10 +21,7 @@ use veloq_std::{
 };
 
 use veloq_runtime::{
-    Outcome,
-    runtime::{DefaultWorkerFactoryFor, RuntimeBuilder, RuntimeCtx},
-    scope, select,
-    task::yield_now,
+    DefaultWorkerFactoryFor, Outcome, RuntimeBuilder, RuntimeCtx, scope, select, yield_now,
 };
 
 fn with_workers(count: usize) -> RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
@@ -36,6 +33,7 @@ struct ReadyAfter(u32);
 
 impl Future for ReadyAfter {
     type Output = u32;
+
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u32> {
         if self.0 == 0 {
             return Poll::Ready(7);

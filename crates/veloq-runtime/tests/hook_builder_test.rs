@@ -9,11 +9,7 @@ use veloq_std::{
 };
 
 use veloq_runtime::{
-    error::Result,
-    runtime::{
-        RuntimeBuilder, RuntimeShared,
-        context::{IdleDecision, IdleWaitStrategy},
-    },
+    IdleDecision, IdleWaitStrategy, Result, RuntimeBuilder, RuntimeShared, WorkerFactoryResult,
 };
 
 struct HookState {
@@ -28,7 +24,7 @@ fn wait_for_work(_: &RuntimeShared<Extra>) -> Result<IdleDecision> {
 }
 
 fn wake_after_park(shared: &RuntimeShared<Extra>, _: IdleWaitStrategy) -> Result<()> {
-    let waker = shared.extra_tls.with(|state| {
+    let waker = shared.extra_tls().with(|state| {
         let previous = state.park_calls.fetch_add(1, Ordering::AcqRel);
         if previous == 0 {
             state
@@ -48,10 +44,7 @@ fn wake_after_park(shared: &RuntimeShared<Extra>, _: IdleWaitStrategy) -> Result
 
 fn run_until_park<F, H>(builder: RuntimeBuilder<Extra, F, H>, state: Arc<HookState>) -> usize
 where
-    F: for<'rt> Fn(
-            usize,
-            &'rt RuntimeShared<Extra>,
-        ) -> veloq_runtime::runtime::WorkerFactoryResult<Extra>
+    F: for<'rt> Fn(usize, &'rt RuntimeShared<Extra>) -> WorkerFactoryResult<Extra>
         + Send
         + Sync
         + 'static,
@@ -82,7 +75,7 @@ where
 
 fn worker_factory(
     state: Arc<HookState>,
-) -> impl Fn(usize, &RuntimeShared<Extra>) -> veloq_runtime::runtime::WorkerFactoryResult<Extra> {
+) -> impl Fn(usize, &RuntimeShared<Extra>) -> WorkerFactoryResult<Extra> {
     move |_, _| Ok(state.clone())
 }
 

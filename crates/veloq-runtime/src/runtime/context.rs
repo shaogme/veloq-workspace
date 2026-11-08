@@ -1,9 +1,11 @@
 use veloq_std::{
     boxed::Box,
+    cell::UnsafeCell,
     future::{Future, poll_fn},
     marker::PhantomData,
     mem::replace,
     num::NonZeroUsize,
+    panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
     ptr::NonNull,
     string::String,
@@ -24,10 +26,35 @@ use crate::{
 
 use crossbeam_deque::Worker;
 use diagweave::prelude::*;
-use veloq_std::cell::UnsafeCell;
-use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
 use veloq_storage::{AtomicLock, AtomicStorage, StateLock};
 use veloq_waker::MwsrWaker;
+
+#[cfg(test)]
+use veloq_std::{
+    future::{Ready, ready},
+    mem::ManuallyDrop,
+    sync::atomic::{NativeAtomicBool as AtomicBool, Ordering},
+    task::{RawWaker, RawWakerVTable},
+};
+
+#[cfg(all(test, feature = "loom"))]
+use loom::{model as loom_model, sync::Arc as LoomArc, thread::spawn as loom_spawn};
+
+enum RouteCellState<T> {
+    Pending,
+    Published(Result<T>),
+    Consumed,
+}
+
+pub(crate) struct RouteCell<T> {
+    state: AtomicLock<RouteCellState<T>>,
+    waker: MwsrWaker,
+}
+
+pub struct RoutedFuture<F> {
+    slot: Arc<RouteCell<F>>,
+    inner: Option<F>,
+}
 
 /// Worker 空闲时的等待策略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +142,7 @@ pub struct RuntimeCtx<'rt, T> {
 // 语义与被替换掉的 `&'rt RuntimeShared<T>` 完全一致：共享引用可跨线程当且仅当被指对象
 // 是 `Sync`。
 unsafe impl<'rt, T> Send for RuntimeCtx<'rt, T> where RuntimeShared<T>: Sync {}
+
 unsafe impl<'rt, T> Sync for RuntimeCtx<'rt, T> where RuntimeShared<T>: Sync {}
 
 impl<'rt, T> Copy for RuntimeCtx<'rt, T> {}
@@ -314,7 +342,7 @@ impl<'rt, T> RuntimeCtx<'rt, T> {
 
     /// Checks if the runtime is shutting down.
     pub(crate) fn is_shutdown(&self) -> bool {
-        self.shared().base.shutdown.is_shutdown()
+        self.shared().base().is_shutdown()
     }
 
     /// Returns the shared runtime state.
@@ -328,8 +356,8 @@ impl<'rt, T> RuntimeCtx<'rt, T> {
     #[doc(hidden)]
     pub fn select_poll_start(&self, branches: u32) -> u32 {
         self.shared()
-            .base
-            .tls
+            .base()
+            .tls()
             .with(|ctx| ctx.rand.next_u32(branches))
     }
 
@@ -350,7 +378,7 @@ impl<'rt, T> RuntimeCtx<'rt, T> {
         let task = Box::new(RouteJobTask {
             header: TaskHeader::new(
                 RouteJobTask::<'scope_ref, F, Fut>::VTABLE,
-                &self.shared().base,
+                self.shared().base(),
                 worker_id,
                 ScopeRef::<AtomicStorage>::dummy(),
             ),
@@ -409,7 +437,15 @@ impl<'rt, T> RuntimeCtx<'rt, T> {
     }
 
     pub(crate) fn try_worker_id(&self) -> Option<usize> {
-        self.shared().base.tls.try_with(|ctx| ctx.worker_id).ok()
+        self.shared()
+            .base()
+            .tls()
+            .try_with(|ctx| ctx.worker_id)
+            .ok()
+    }
+
+    pub async fn current_scope() -> Option<AnyScopeRef> {
+        poll_fn(|cx| Poll::Ready(cx.scope_completion())).await
     }
 }
 
@@ -417,28 +453,14 @@ impl<'rt, T> RuntimeCtx<'rt, T> {
 ///
 /// `scope!` / `scope_local!` 宏共用这一步：父作用域只能从当前任务的 waker 上取，
 /// 两边不能各写一份。
-#[doc(hidden)]
-pub async fn current_scope() -> Option<AnyScopeRef> {
-    poll_fn(|cx| Poll::Ready(cx.scope_completion())).await
-}
-
 /// Worker 空闲时调用的 hook。
 ///
 /// Hook 接收与 worker factory 使用同一个 `T` 的 [`RuntimeShared`]，因此可以通过
 /// [`RuntimeShared::extra_tls`] 访问类型安全的 worker extra 状态。
 pub type IdleHook<T> = fn(&RuntimeShared<T>) -> Result<IdleDecision>;
+
+pub type ParkHook<T> = fn(&RuntimeShared<T>, IdleWaitStrategy) -> Result<()>;
 pub(crate) type WorkerTickHook = fn();
-
-enum RouteCellState<T> {
-    Pending,
-    Published(Result<T>),
-    Consumed,
-}
-
-pub(crate) struct RouteCell<T> {
-    state: AtomicLock<RouteCellState<T>>,
-    waker: MwsrWaker,
-}
 
 impl<T> RouteCell<T> {
     pub(crate) fn new() -> Arc<Self> {
@@ -504,11 +526,6 @@ impl<T> RouteCell<T> {
             self.waker.register(waker);
         }
     }
-}
-
-pub struct RoutedFuture<F> {
-    slot: Arc<RouteCell<F>>,
-    inner: Option<F>,
 }
 
 impl<F> RoutedFuture<F> {
@@ -603,178 +620,174 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use veloq_std::{
-        mem::ManuallyDrop,
-        sync::{
-            NativeArc as Arc,
-            atomic::{NativeAtomicBool as AtomicBool, Ordering},
-        },
-        task::{RawWaker, RawWakerVTable, Waker},
-        time::Duration,
+struct ReentrantWake {
+    slot: Arc<RouteCell<usize>>,
+    took_value: AtomicBool,
+}
+
+#[cfg(test)]
+static REENTRANT_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    clone_reentrant,
+    wake_reentrant,
+    wake_reentrant_by_ref,
+    drop_reentrant,
+);
+
+#[cfg(test)]
+unsafe fn clone_reentrant(data: *const ()) -> RawWaker {
+    unsafe {
+        Arc::increment_strong_count(data as *const ReentrantWake);
+    }
+    RawWaker::new(data, &REENTRANT_WAKER_VTABLE)
+}
+
+#[cfg(test)]
+unsafe fn wake_reentrant(data: *const ()) {
+    let state = unsafe { Arc::from_raw(data as *const ReentrantWake) };
+    state
+        .took_value
+        .store(state.slot.take().is_some(), Ordering::Release);
+}
+
+#[cfg(test)]
+unsafe fn wake_reentrant_by_ref(data: *const ()) {
+    let state = ManuallyDrop::new(unsafe { Arc::from_raw(data as *const ReentrantWake) });
+    state
+        .took_value
+        .store(state.slot.take().is_some(), Ordering::Release);
+}
+
+#[cfg(test)]
+unsafe fn drop_reentrant(data: *const ()) {
+    unsafe {
+        drop(Arc::from_raw(data as *const ReentrantWake));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn idle_decision_continue_marks_continue() {
+    assert!(IdleDecision::continue_now().is_continue());
+}
+
+#[cfg(test)]
+#[test]
+fn idle_decision_wait_wraps_strategy() {
+    let decision = IdleDecision::wait(IdleWaitStrategy::timeout(Duration::from_millis(5)));
+    assert_eq!(
+        decision.into_wait_strategy(),
+        Some(IdleWaitStrategy::Timeout(Duration::from_millis(5)))
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn route_cell_consumed_state_is_not_pending() {
+    let slot = RouteCell::new();
+
+    assert!(!slot.is_populated());
+    assert!(slot.publish(7));
+    assert!(slot.is_populated());
+    assert_eq!(slot.take().and_then(|result| result.ok()), Some(7));
+    assert!(!slot.is_populated());
+    assert!(
+        !slot
+            .publish_error_if_pending(
+                route_error("context::tests", "result was already consumed",)
+            )
+    );
+    assert!(slot.take().is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn route_cell_wakes_after_releasing_state_lock() {
+    let slot = RouteCell::new();
+    let state = Arc::new(ReentrantWake {
+        slot: slot.clone(),
+        took_value: AtomicBool::new(false),
+    });
+    let raw = Arc::into_raw(state.clone()) as *const ();
+    let waker = unsafe { Waker::from_raw(RawWaker::new(raw, &REENTRANT_WAKER_VTABLE)) };
+
+    slot.register(&waker);
+    assert!(slot.publish(11));
+    assert!(state.took_value.load(Ordering::Acquire));
+    drop(waker);
+}
+
+#[cfg(test)]
+#[test]
+fn route_job_drop_publishes_shutdown_error() {
+    type Job = fn() -> Ready<()>;
+
+    let slot = RouteCell::<Ready<()>>::new();
+    let task = RouteJobTask::<Job, Ready<()>> {
+        header: GenericTaskHeader::new_placeholder(RouteJobTask::<Job, Ready<()>>::VTABLE),
+        job: UnsafeCell::new(Some(|| ready(()))),
+        slot: slot.clone(),
+        marker: PhantomData,
     };
 
-    struct ReentrantWake {
-        slot: Arc<RouteCell<usize>>,
-        took_value: AtomicBool,
-    }
+    drop(task);
 
-    unsafe fn clone_reentrant(data: *const ()) -> RawWaker {
-        unsafe {
-            Arc::increment_strong_count(data as *const ReentrantWake);
-        }
-        RawWaker::new(data, &REENTRANT_WAKER_VTABLE)
-    }
+    let error = slot
+        .take()
+        .expect("route drop must publish a result")
+        .expect_err("route drop must publish a shutdown error");
+    assert!(matches!(
+        error.inner(),
+        RuntimeError::ShutdownBeforeCompletion
+    ));
+}
 
-    unsafe fn wake_reentrant(data: *const ()) {
-        let state = unsafe { Arc::from_raw(data as *const ReentrantWake) };
-        state
-            .took_value
-            .store(state.slot.take().is_some(), Ordering::Release);
-    }
+#[cfg(test)]
+#[test]
+fn route_finalizer_drop_finishes_header_and_slot() {
+    type Job = fn() -> Ready<()>;
 
-    unsafe fn wake_reentrant_by_ref(data: *const ()) {
-        let state = ManuallyDrop::new(unsafe { Arc::from_raw(data as *const ReentrantWake) });
-        state
-            .took_value
-            .store(state.slot.take().is_some(), Ordering::Release);
-    }
+    let slot = RouteCell::<Ready<()>>::new();
+    let header = GenericTaskHeader::new_placeholder(RouteJobTask::<Job, Ready<()>>::VTABLE);
+    let mut finalizer = RouteTaskFinalizer::new(&header, &slot);
+    finalizer.publish_err(route_error(
+        "context::tests",
+        "synthetic route finalizer failure",
+    ));
+    drop(finalizer);
 
-    unsafe fn drop_reentrant(data: *const ()) {
-        unsafe {
-            drop(Arc::from_raw(data as *const ReentrantWake));
-        }
-    }
+    assert!(header.is_reclaimable());
+    assert!(slot.take().is_some());
+}
 
-    static REENTRANT_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
-        clone_reentrant,
-        wake_reentrant,
-        wake_reentrant_by_ref,
-        drop_reentrant,
-    );
+#[cfg(all(test, feature = "loom"))]
+#[test]
+fn loom_route_cell_publish_and_take_have_one_terminal_value() {
+    loom_model(|| {
+        let slot = LoomArc::new(RouteCell::new());
+        let published = LoomArc::new(AtomicBool::new(false));
+        let consumed = LoomArc::new(AtomicBool::new(false));
 
-    #[test]
-    fn idle_decision_continue_marks_continue() {
-        assert!(IdleDecision::continue_now().is_continue());
-    }
-
-    #[test]
-    fn idle_decision_wait_wraps_strategy() {
-        let decision = IdleDecision::wait(IdleWaitStrategy::timeout(Duration::from_millis(5)));
-        assert_eq!(
-            decision.into_wait_strategy(),
-            Some(IdleWaitStrategy::Timeout(Duration::from_millis(5)))
-        );
-    }
-
-    #[test]
-    fn route_cell_consumed_state_is_not_pending() {
-        let slot = RouteCell::new();
-
-        assert!(!slot.is_populated());
-        assert!(slot.publish(7));
-        assert!(slot.is_populated());
-        assert_eq!(slot.take().and_then(|result| result.ok()), Some(7));
-        assert!(!slot.is_populated());
-        assert!(!slot.publish_error_if_pending(route_error(
-            "context::tests",
-            "result was already consumed",
-        )));
-        assert!(slot.take().is_none());
-    }
-
-    #[test]
-    fn route_cell_wakes_after_releasing_state_lock() {
-        let slot = RouteCell::new();
-        let state = Arc::new(ReentrantWake {
-            slot: slot.clone(),
-            took_value: AtomicBool::new(false),
-        });
-        let raw = Arc::into_raw(state.clone()) as *const ();
-        let waker = unsafe { Waker::from_raw(RawWaker::new(raw, &REENTRANT_WAKER_VTABLE)) };
-
-        slot.register(&waker);
-        assert!(slot.publish(11));
-        assert!(state.took_value.load(Ordering::Acquire));
-        drop(waker);
-    }
-
-    #[test]
-    fn route_job_drop_publishes_shutdown_error() {
-        type Job = fn() -> veloq_std::future::Ready<()>;
-
-        let slot = RouteCell::<veloq_std::future::Ready<()>>::new();
-        let task = RouteJobTask::<Job, veloq_std::future::Ready<()>> {
-            header: GenericTaskHeader::new_placeholder(
-                RouteJobTask::<Job, veloq_std::future::Ready<()>>::VTABLE,
-            ),
-            job: UnsafeCell::new(Some(|| veloq_std::future::ready(()))),
-            slot: slot.clone(),
-            marker: PhantomData,
-        };
-
-        drop(task);
-
-        let error = slot
-            .take()
-            .expect("route drop must publish a result")
-            .expect_err("route drop must publish a shutdown error");
-        assert!(matches!(
-            error.inner(),
-            RuntimeError::ShutdownBeforeCompletion
-        ));
-    }
-
-    #[test]
-    fn route_finalizer_drop_finishes_header_and_slot() {
-        type Job = fn() -> veloq_std::future::Ready<()>;
-
-        let slot = RouteCell::<veloq_std::future::Ready<()>>::new();
-        let header = GenericTaskHeader::new_placeholder(
-            RouteJobTask::<Job, veloq_std::future::Ready<()>>::VTABLE,
-        );
-        let mut finalizer = RouteTaskFinalizer::new(&header, &slot);
-        finalizer.publish_err(route_error(
-            "context::tests",
-            "synthetic route finalizer failure",
-        ));
-        drop(finalizer);
-
-        assert!(header.is_reclaimable());
-        assert!(slot.take().is_some());
-    }
-
-    #[cfg(feature = "loom")]
-    #[test]
-    fn loom_route_cell_publish_and_take_have_one_terminal_value() {
-        loom::model(|| {
-            let slot = Arc::new(RouteCell::new());
-            let published = Arc::new(AtomicBool::new(false));
-            let consumed = Arc::new(AtomicBool::new(false));
-
-            let publisher_slot = slot.clone();
-            let publisher_published = published.clone();
-            let publisher = loom::thread::spawn(move || {
-                if publisher_slot.publish(17) {
-                    publisher_published.store(true, Ordering::Release);
-                }
-            });
-
-            let consumer_slot = slot.clone();
-            let consumer_consumed = consumed.clone();
-            let consumer = loom::thread::spawn(move || {
-                if consumer_slot.take().is_some() {
-                    consumer_consumed.store(true, Ordering::Release);
-                }
-            });
-
-            publisher.join().unwrap();
-            consumer.join().unwrap();
-            if !consumed.load(Ordering::Acquire) {
-                assert!(slot.take().is_some());
+        let publisher_slot = slot.clone();
+        let publisher_published = published.clone();
+        let publisher = loom_spawn(move || {
+            if publisher_slot.publish(17) {
+                publisher_published.store(true, Ordering::Release);
             }
-            assert!(published.load(Ordering::Acquire));
         });
-    }
+
+        let consumer_slot = slot.clone();
+        let consumer_consumed = consumed.clone();
+        let consumer = loom_spawn(move || {
+            if consumer_slot.take().is_some() {
+                consumer_consumed.store(true, Ordering::Release);
+            }
+        });
+
+        publisher.join().unwrap();
+        consumer.join().unwrap();
+        if !consumed.load(Ordering::Acquire) {
+            assert!(slot.take().is_some());
+        }
+        assert!(published.load(Ordering::Acquire));
+    });
 }

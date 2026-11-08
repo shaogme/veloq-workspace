@@ -19,7 +19,7 @@ use veloq::{
     time::timeout_at,
 };
 use veloq_buf::{FixedBuf, UniformSlot};
-use veloq_runtime::{select, task::yield_now};
+use veloq_runtime::{select, yield_now};
 use veloq_std::time::{Duration, Instant};
 
 fn run_test<F, R>(f: F) -> R

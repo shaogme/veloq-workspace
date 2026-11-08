@@ -9,7 +9,7 @@ union! {
         veloq_driver_native::error::Error as Driver |
         veloq_buf::BufError as Buf |
         FsError as Fs |
-        veloq_runtime::error::RuntimeError as Runtime
+        veloq_runtime::RuntimeError as Runtime
 }
 
 pub type Result<T> = StdResult<T, Report<Error>>;

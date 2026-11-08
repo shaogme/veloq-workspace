@@ -13,15 +13,10 @@ use veloq_std::{
     task::Poll,
 };
 
+use veloq_runtime::{RuntimeBuilder, RuntimeShared, RuntimeWakeError, RuntimeWaker, scope};
+
 #[cfg(feature = "std")]
 use veloq_std::hint::spin_loop;
-
-use veloq_runtime::{
-    error::RuntimeWakeError,
-    runtime::primitives::RuntimeWaker,
-    runtime::{RuntimeBuilder, RuntimeShared},
-    scope,
-};
 
 struct ControlledWaker {
     fail: Arc<AtomicBool>,
@@ -30,12 +25,12 @@ struct ControlledWaker {
 impl RuntimeWaker for ControlledWaker {
     fn wake(&self) -> Result<(), RuntimeWakeError> {
         if self.fail.load(Ordering::Acquire) {
-            Err(RuntimeWakeError {
-                backend: "test",
-                worker_id: 0,
-                operation: "global-injector-shutdown",
-                detail: "injected wake failure".into(),
-            })
+            Err(RuntimeWakeError::new(
+                "test",
+                0,
+                "global-injector-shutdown",
+                "injected wake failure",
+            ))
         } else {
             Ok(())
         }

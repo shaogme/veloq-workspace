@@ -11,6 +11,52 @@ use veloq_std::{
 };
 use veloq_storage::{StateInt, StateLock, StateOptionPtr, Storage, ThreadSafeStorage};
 
+/// 不可复制的 arena 回收令牌。
+pub trait ArenaAllocation {
+    fn data_ptr(&self) -> NonNull<u8>;
+
+    /// # Safety
+    /// The object at [`Self::data_ptr`] must have been initialized with the type described by the
+    /// allocation's drop function. Consuming a token without initializing its object is invalid.
+    unsafe fn reclaim(self);
+}
+
+pub(crate) struct GenericChunk<S: Storage> {
+    link: Link,
+    ptr: NonNull<u8>,
+    layout: Layout,
+    used: S::Usize,
+    drop_list: S::Lock<LinkedList<DropAdapter<S>>>,
+}
+
+struct FreeBlock {
+    ptr: NonNull<u8>,
+    chunk: NonNull<u8>,
+    layout: Layout,
+}
+
+pub(crate) struct GenericDropNode<S: Storage> {
+    link: Link,
+    data_ptr: *mut u8,
+    drop_fn: S::Usize,
+    chunk: *const GenericChunk<S>,
+}
+
+pub struct GenericArena<S: Storage> {
+    active_chunk: S::OptionPtr<GenericChunk<S>>,
+    chunks: S::Lock<LinkedList<ChunkAdapter<S>>>,
+    free_list: S::Lock<Vec<FreeBlock>>,
+}
+
+/// `alloc_managed` 返回的、带有 arena 生命周期的回收令牌。
+pub struct ManagedAllocation<'arena, S: Storage> {
+    data_ptr: NonNull<u8>,
+    node: NonNull<GenericDropNode<S>>,
+    layout: Layout,
+    arena: &'arena GenericArena<S>,
+    marker: PhantomData<&'arena S>,
+}
+
 /// 一个高性能的、块分配器接口。
 pub trait Arena {
     type Allocation<'arena>: ArenaAllocation
@@ -26,19 +72,6 @@ pub trait Arena {
         layout: Layout,
         drop_fn: unsafe fn(*mut u8),
     ) -> Option<Self::Allocation<'arena>>;
-}
-
-/// 不可复制的 arena 回收令牌。
-///
-/// 令牌由带 `DropNode` 的分配产生，并且只能按值消费一次。普通字节分配不产生此令牌，
-/// 因而不能被传给对象回收路径。
-pub trait ArenaAllocation {
-    fn data_ptr(&self) -> NonNull<u8>;
-
-    /// # Safety
-    /// The object at [`Self::data_ptr`] must have been initialized with the type described by the
-    /// allocation's drop function. Consuming a token without initializing its object is invalid.
-    unsafe fn reclaim(self);
 }
 
 /// One-shot owner for an arena-backed task node.
@@ -69,41 +102,9 @@ impl<A: ArenaAllocation> Drop for TaskLease<A> {
 ///
 /// Chunk 的所有权持续到 arena 析构；对象释放后，完整分配块会进入 free-list 供后续
 /// 同布局分配复用。
-pub struct GenericArena<S: Storage> {
-    // 活跃块，支持无锁快速路径分配
-    active_chunk: S::OptionPtr<GenericChunk<S>>,
-    // 所有块的拥有者，使用侵入式链表管理
-    chunks: S::Lock<LinkedList<ChunkAdapter<S>>>,
-    // 慢速路径复用已经释放的同布局对象
-    free_list: S::Lock<Vec<FreeBlock>>,
-}
-
-pub(crate) struct GenericChunk<S: Storage> {
-    link: Link, // 用于 Arena 的 chunks 链表
-    ptr: NonNull<u8>,
-    layout: Layout,
-    // 该块已使用的字节数
-    used: S::Usize,
-    // 该块拥有的析构函数链表，采用双向链表结构，并在锁保护下操作
-    drop_list: S::Lock<LinkedList<DropAdapter<S>>>,
-}
-
-struct FreeBlock {
-    ptr: NonNull<u8>,
-    chunk: NonNull<u8>,
-    layout: Layout,
-}
-
 unsafe impl Send for FreeBlock {}
-unsafe impl Sync for FreeBlock {}
 
-pub(crate) struct GenericDropNode<S: Storage> {
-    link: Link,
-    data_ptr: *mut u8, // 重排字段以优化对齐
-    drop_fn: S::Usize,
-    // 所属的 Chunk，用于回收
-    chunk: *const GenericChunk<S>,
-}
+unsafe impl Sync for FreeBlock {}
 
 intrusive_adapter!(pub(crate) ChunkAdapter<S> = GenericChunk<S> { link: Link } where S: Storage);
 intrusive_adapter!(pub(crate) DropAdapter<S> = GenericDropNode<S> { link: Link } where S: Storage);
@@ -350,15 +351,6 @@ impl<S: Storage> Arena for GenericArena<S> {
     }
 }
 
-/// `alloc_managed` 返回的、带有 arena 生命周期的回收令牌。
-pub struct ManagedAllocation<'arena, S: Storage> {
-    data_ptr: NonNull<u8>,
-    node: NonNull<GenericDropNode<S>>,
-    layout: Layout,
-    arena: &'arena GenericArena<S>,
-    marker: PhantomData<&'arena S>,
-}
-
 impl<S: Storage> ArenaAllocation for ManagedAllocation<'_, S> {
     fn data_ptr(&self) -> NonNull<u8> {
         self.data_ptr
@@ -401,6 +393,7 @@ impl<S: Storage> ArenaAllocation for ManagedAllocation<'_, S> {
 }
 
 unsafe impl<S: ThreadSafeStorage> Send for ManagedAllocation<'_, S> {}
+
 unsafe impl<S: ThreadSafeStorage> Sync for ManagedAllocation<'_, S> {}
 
 // 安全性：GenericArena 的 Send/Sync 性质取决于 Storage 的实现
@@ -411,6 +404,7 @@ where
     S::Lock<Vec<FreeBlock>>: Send,
 {
 }
+
 unsafe impl<S: ThreadSafeStorage> Sync for GenericArena<S>
 where
     S::OptionPtr<GenericChunk<S>>: Sync,
@@ -423,6 +417,7 @@ unsafe impl<S: ThreadSafeStorage> Send for GenericChunk<S> where
     S::Lock<LinkedList<DropAdapter<S>>>: Send
 {
 }
+
 unsafe impl<S: ThreadSafeStorage> Sync for GenericChunk<S> where
     S::Lock<LinkedList<DropAdapter<S>>>: Sync
 {
@@ -431,12 +426,15 @@ unsafe impl<S: ThreadSafeStorage> Sync for GenericChunk<S> where
 #[cfg(test)]
 mod tests {
     use super::{ArenaAllocation, DropAdapter, GenericArena, GenericChunk};
-    use veloq_intrusive_linklist::LinkedList;
+    use veloq_intrusive_linklist::{Link, LinkedList};
     use veloq_std::{
         alloc::Layout,
         num::NonZeroUsize,
         ptr::{self, NonNull},
-        sync::atomic::{NativeAtomicUsize as AtomicUsize, Ordering},
+        sync::{
+            NativeMutex,
+            atomic::{NativeAtomicUsize as AtomicUsize, Ordering},
+        },
     };
     use veloq_storage::{AtomicStorage, StateLock, Storage};
 
@@ -449,6 +447,7 @@ mod tests {
     }
 
     static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static DROP_COUNT_LOCK: NativeMutex<()> = NativeMutex::new(());
 
     unsafe fn count_drop(_ptr: *mut u8) {
         DROP_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -456,6 +455,7 @@ mod tests {
 
     #[test]
     fn reuses_freed_block_after_active_chunk_is_full() {
+        let _drop_count_lock = DROP_COUNT_LOCK.lock();
         DROP_COUNT.store(0, Ordering::Relaxed);
         let arena = GenericArena::<AtomicStorage>::new();
         let layout = Layout::from_size_align(9000, 8).unwrap();
@@ -475,6 +475,7 @@ mod tests {
 
     #[test]
     fn arena_reclaims_live_managed_allocation_on_drop() {
+        let _drop_count_lock = DROP_COUNT_LOCK.lock();
         DROP_COUNT.store(0, Ordering::Relaxed);
         {
             let arena = GenericArena::<AtomicStorage>::new();
@@ -488,6 +489,7 @@ mod tests {
 
     #[test]
     fn byte_allocation_does_not_enter_managed_free_list() {
+        let _drop_count_lock = DROP_COUNT_LOCK.lock();
         let arena = GenericArena::<AtomicStorage>::new();
         let layout = Layout::from_size_align(9000, 8).unwrap();
         let first = unsafe { arena.alloc_managed(layout, count_drop) }.unwrap();
@@ -506,6 +508,7 @@ mod tests {
 
     #[test]
     fn managed_allocation_supports_zero_and_high_alignment() {
+        let _drop_count_lock = DROP_COUNT_LOCK.lock();
         let arena = GenericArena::<AtomicStorage>::new();
 
         let zero = unsafe { arena.alloc_managed(Layout::new::<()>(), count_drop) }.unwrap();
@@ -531,6 +534,7 @@ mod tests {
 
     #[test]
     fn layout_extension_failure_returns_none() {
+        let _drop_count_lock = DROP_COUNT_LOCK.lock();
         let arena = GenericArena::<AtomicStorage>::new();
         let oversized = Layout::from_size_align(isize::MAX as usize, 1).unwrap();
         assert!(unsafe { arena.alloc_managed(oversized, count_drop) }.is_none());
@@ -540,7 +544,7 @@ mod tests {
     fn try_alloc_rejects_address_arithmetic_overflow() {
         let layout = Layout::from_size_align(8, 8).unwrap();
         let base_overflow = GenericChunk::<AtomicStorage> {
-            link: veloq_intrusive_linklist::Link::new(),
+            link: Link::new(),
             ptr: NonNull::without_provenance(NonZeroUsize::new(0x1000).unwrap()),
             layout,
             used: <AtomicStorage as Storage>::Usize::new(usize::MAX),
@@ -551,7 +555,7 @@ mod tests {
         assert!(base_overflow.try_alloc(layout).is_null());
 
         let alignment_overflow = GenericChunk::<AtomicStorage> {
-            link: veloq_intrusive_linklist::Link::new(),
+            link: Link::new(),
             ptr: NonNull::without_provenance(NonZeroUsize::new(usize::MAX).unwrap()),
             layout,
             used: <AtomicStorage as Storage>::Usize::new(0),

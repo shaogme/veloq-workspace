@@ -19,12 +19,12 @@ use veloq_std::{
 use crate::{
     error::Result,
     runtime::{
-        primitives::{BlockOnSignal, create_block_on_waker, create_unpark_waker},
+        primitives::BlockOnSignal,
         shared::{RuntimeShared, infra::RuntimeProgressCoordinator},
     },
     scope::{GenericScopeCompletion, ScopeCompletionRegistration},
     task::ScopeStorage,
-    utils::ownership::Ownership,
+    utils::Ownership,
 };
 
 /// 循环的退出条件，以及「循环存在的理由」本身要推进的那点工作。
@@ -107,7 +107,7 @@ pub(crate) struct BlockOnController<'a, F: Future> {
 
 impl<'a, F: Future> BlockOnController<'a, F> {
     pub(crate) fn new(future: Pin<&'a mut F>, signal: Arc<BlockOnSignal>) -> Self {
-        let waker = create_block_on_waker(signal.clone());
+        let waker = BlockOnSignal::create_waker(signal.clone());
         Self {
             future,
             signal,
@@ -148,55 +148,60 @@ impl<'a, F: Future> LoopController for BlockOnController<'a, F> {
 }
 
 /// 驱动当前线程所属 worker 的调度循环，直到 `controller` 宣布目标达成或运行时关停。
-pub(crate) fn run_worker_loop<T, C: LoopController>(
-    shared: &RuntimeShared<T>,
-    controller: &mut C,
-) -> Result<()> {
-    let base = &shared.base;
-    base.tls.with(|ctx| -> Result<()> {
-        let worker_id = ctx.worker_id;
-        let waker = create_unpark_waker(base.unparker(worker_id).clone());
-        let worker_tick_hook = base.worker_tick_hook;
-        let mut tick = 0u32;
-        let mut loop_error = None;
+pub(crate) struct WorkerLoop;
 
-        while !base.shutdown.is_shutdown() {
-            if let Some(hook) = worker_tick_hook {
-                hook();
-            }
+impl WorkerLoop {
+    pub(crate) fn run<T, C: LoopController>(
+        shared: &RuntimeShared<T>,
+        controller: &mut C,
+    ) -> Result<()> {
+        let base = shared.base();
+        base.tls.with(|ctx| -> Result<()> {
+            let worker_id = ctx.worker_id;
+            let waker = base.unparker(worker_id).clone().into_waker();
+            let worker_tick_hook = base.worker_tick_hook;
+            let mut tick = 0u32;
+            let mut loop_error = None;
 
-            match controller.poll_progress() {
-                Ok(true) => return Ok(()),
-                Ok(false) => {}
-                Err(err) => {
+            while !base.shutdown.is_shutdown() {
+                if let Some(hook) = worker_tick_hook {
+                    hook();
+                }
+
+                match controller.poll_progress() {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {}
+                    Err(err) => {
+                        loop_error = Some(err);
+                        base.shutdown();
+                        break;
+                    }
+                }
+
+                tick = tick.wrapping_add(1);
+                match base.poll_next_task(worker_id, tick, &ctx.rand) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(err) => {
+                        loop_error = Some(err);
+                        base.shutdown();
+                        break;
+                    }
+                }
+
+                controller.arm(&waker);
+                if let Err(err) = RuntimeProgressCoordinator::new(shared, worker_id).run(controller)
+                {
                     loop_error = Some(err);
                     base.shutdown();
                     break;
                 }
             }
 
-            tick = tick.wrapping_add(1);
-            match base.poll_next_task(worker_id, tick, &ctx.rand) {
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(err) => {
-                    loop_error = Some(err);
-                    base.shutdown();
-                    break;
-                }
-            }
-
-            controller.arm(&waker);
-            if let Err(err) = RuntimeProgressCoordinator::new(shared, worker_id).run(controller) {
-                loop_error = Some(err);
-                base.shutdown();
-                break;
-            }
-        }
-
-        base.complete_shutdown(worker_id);
-        loop_error
-            .or_else(|| base.fatal_error())
-            .map_or(Ok(()), Err)
-    })
+            base.complete_shutdown(worker_id);
+            loop_error
+                .or_else(|| base.fatal_error())
+                .map_or(Ok(()), Err)
+        })
+    }
 }

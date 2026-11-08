@@ -357,6 +357,7 @@ fn begin_processing(state: &AtomicU8) {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_serial::FD_TEST_LOCK;
     use libc::read;
 
     use super::{EventFd, UringWakerManager};
@@ -377,6 +378,7 @@ mod tests {
 
     #[test]
     fn pending_notification_is_migrated_to_the_replaced_eventfd() {
+        let _test_lock = FD_TEST_LOCK.lock();
         let manager = UringWakerManager::new().expect("eventfd should be created");
         let remote_waker = manager.create_waker();
         let old_fd = manager.state.current();
@@ -407,6 +409,7 @@ mod tests {
 
     #[test]
     fn waker_rearm_is_bound_to_one_arm_generation() {
+        let _test_lock = FD_TEST_LOCK.lock();
         let mut manager = UringWakerManager::new().expect("eventfd should be created");
         let first = manager.arm();
         assert_eq!(manager.hooks_view().generation, first);

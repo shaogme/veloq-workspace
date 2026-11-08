@@ -1,4 +1,4 @@
-use veloq_runtime::{runtime::Runtime, scope, scope::JoinOutcome, select, task::TaskError};
+use veloq_runtime::{JoinOutcome, Runtime, TaskError, scope, select};
 use veloq_std::{
     future::Future,
     pin::Pin,
@@ -6,8 +6,10 @@ use veloq_std::{
 };
 
 struct ReadyFuture<T>(Option<T>);
+
 impl<T: Unpin + Copy> Future for ReadyFuture<T> {
     type Output = T;
+
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         if let Some(v) = self.0.take() {
             Poll::Ready(v)
@@ -22,8 +24,10 @@ fn ready<T>(t: T) -> ReadyFuture<T> {
 }
 
 struct PendingFuture;
+
 impl Future for PendingFuture {
     type Output = i32;
+
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         Poll::Pending
     }

@@ -6,35 +6,256 @@ mod wake;
 
 pub(crate) use arena::TaskLease;
 pub use arena::{Arena, ArenaAllocation, GenericArena, ManagedAllocation};
-pub(crate) use header::GenericWakerNode;
-pub use header::{GenericTaskHeader, PollStatus, TaskVTable};
-pub(crate) use header::{INTRUSIVE_WAKER_VTABLE, LOCAL_INTRUSIVE_WAKER_VTABLE};
+pub use header::{GenericTaskHeader, PollStatus};
+pub(crate) use header::{GenericWakerNode, INTRUSIVE_WAKER_VTABLE, LOCAL_INTRUSIVE_WAKER_VTABLE};
 pub(crate) use nodes::{DeferredFuture, GenericTaskNode, TaskBounds, TaskStorage};
 pub use nodes::{LocalBoxedTaskNode, LocalTaskNode, SendBoxedTaskNode, SendTaskNode};
-pub use scope::{
-    AnyScopeRef, AnySendScopeRef, ErasedCancellationToken, OpaqueScope, OpaqueToken, RawScope,
-    ScopeParent, ScopeRef, ScopeStorage,
-};
 pub(crate) use scope::{CancellationWaiter, CancellationWaiterAdapter};
-pub(crate) use wake::{LocalWakeHeaderGuard, LocalWakeTarget, TaskWakeToken};
+pub use scope::{ErasedCancellationToken, OpaqueScope, OpaqueToken, RawScope, ScopeRef};
+pub(crate) use wake::{LocalWakeHeaderGuard, TaskWakeToken};
 
-use crate::error::Result as RuntimeResult;
-use veloq_std::panic::{AssertUnwindSafe, PanicPayload, catch_unwind};
+use crate::{
+    error::Result as RuntimeResult,
+    runtime::{CancelWaiterLinkResult, EventCount, Unparker},
+};
+use crossbeam_queue::SegQueue;
 use veloq_std::{
     fmt::{Debug, Formatter, Result as FmtResult},
     future::Future,
     marker::PhantomData,
+    panic::{AssertUnwindSafe, PanicPayload, catch_unwind},
     pin::Pin,
     ptr::NonNull,
-    task::{Context, Poll},
+    sync::NativeArc as Arc,
+    task::{Context, Poll, Waker},
 };
 use veloq_storage::{AtomicStorage, LocalStorage, StateLock, Storage};
 
 pub type TaskHeader = GenericTaskHeader<AtomicStorage>;
 pub type LocalTaskHeader = GenericTaskHeader<LocalStorage>;
 
-// --- 任务错误与结果扩展 ---
+pub struct TaskVTable<S: Storage> {
+    pub wake: unsafe fn(data: NonNull<GenericTaskHeader<S>>),
+    pub wake_by_ref: unsafe fn(data: &GenericTaskHeader<S>),
+    pub poll: unsafe fn(data: &GenericTaskHeader<S>, worker_id: usize) -> RuntimeResult<bool>,
+    pub drop: unsafe fn(data: NonNull<GenericTaskHeader<S>>),
+    pub drop_after_poll: bool,
+}
 
+pub(crate) struct LocalWakeTarget {
+    requests: SegQueue<Arc<TaskWakeToken<LocalStorage>>>,
+    unparker: Unparker,
+    event_count: Arc<EventCount>,
+    worker_id: usize,
+}
+
+impl LocalWakeTarget {
+    pub(crate) fn new(worker_id: usize, unparker: Unparker, event_count: Arc<EventCount>) -> Self {
+        Self {
+            requests: SegQueue::new(),
+            unparker,
+            event_count,
+            worker_id,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn push(&self, token: Arc<TaskWakeToken<LocalStorage>>) {
+        self.requests.push(token);
+        self.event_count.notify();
+        if self.unparker.unpark().is_err() {
+            // Wake failures are stored in the runtime's fatal error channel.
+        }
+    }
+
+    #[inline]
+    pub(crate) fn pop(&self) -> Option<Arc<TaskWakeToken<LocalStorage>>> {
+        self.requests.pop()
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.requests.is_empty()
+    }
+
+    #[inline]
+    pub(crate) fn worker_id(&self) -> usize {
+        self.worker_id
+    }
+}
+
+#[derive(Debug)]
+pub struct AnySendScopeRef(ScopeRef<AtomicStorage>);
+
+#[derive(Debug)]
+pub enum AnyScopeRef {
+    Local(ScopeRef<LocalStorage>),
+    Send(AnySendScopeRef),
+}
+
+unsafe impl Send for AnySendScopeRef {}
+
+unsafe impl Sync for AnySendScopeRef {}
+
+impl Clone for AnySendScopeRef {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl AnySendScopeRef {
+    pub fn new(scope: ScopeRef<AtomicStorage>) -> Self {
+        Self(scope)
+    }
+
+    pub fn as_scope_ref(&self) -> &ScopeRef<AtomicStorage> {
+        &self.0
+    }
+
+    pub fn into_any(self) -> AnyScopeRef {
+        AnyScopeRef::Send(self)
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.is_cancelled()
+    }
+
+    pub(crate) fn try_link_child(&self, child_token: &ErasedCancellationToken) -> bool {
+        unsafe { self.0.as_ref().try_link_child(child_token) }
+    }
+
+    pub(crate) fn parent_send(&self) -> Option<Self> {
+        self.0.parent().and_then(|parent| parent.as_send())
+    }
+
+    pub(crate) unsafe fn link_cancel_waiter(
+        &self,
+        waiter: NonNull<CancellationWaiter>,
+        waker: &Waker,
+    ) -> CancelWaiterLinkResult {
+        unsafe { self.0.link_cancel_waiter(waiter, waker) }
+    }
+
+    pub(crate) unsafe fn unlink_cancel_waiter(&self, waiter: NonNull<CancellationWaiter>) {
+        unsafe { self.0.unlink_cancel_waiter(waiter) }
+    }
+
+    pub fn report_panic(&self, payload: PanicPayload) {
+        self.0.report_panic(payload);
+    }
+}
+
+impl Clone for AnyScopeRef {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Local(scope) => Self::Local(scope.clone()),
+            Self::Send(scope) => Self::Send(scope.clone()),
+        }
+    }
+}
+
+impl AnyScopeRef {
+    pub fn as_send(&self) -> Option<AnySendScopeRef> {
+        match self {
+            Self::Local(_) => None,
+            Self::Send(scope) => Some(scope.clone()),
+        }
+    }
+
+    pub fn into_send(self) -> Option<AnySendScopeRef> {
+        match self {
+            Self::Local(_) => None,
+            Self::Send(scope) => Some(scope),
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        match self {
+            Self::Local(scope) => unsafe { scope.as_ref().is_cancelled() },
+            Self::Send(scope) => scope.is_cancelled(),
+        }
+    }
+
+    pub(crate) fn try_link_child(&self, child_token: &ErasedCancellationToken) -> bool {
+        match self {
+            Self::Local(scope) => unsafe { scope.as_ref().try_link_child(child_token) },
+            Self::Send(scope) => scope.try_link_child(child_token),
+        }
+    }
+
+    pub fn report_panic(&self, payload: PanicPayload) {
+        match self {
+            Self::Local(scope) => scope.report_panic(payload),
+            Self::Send(scope) => scope.report_panic(payload),
+        }
+    }
+}
+
+pub trait ScopeParent: Clone + 'static {
+    fn from_any(parent: Option<AnyScopeRef>) -> Self;
+
+    fn as_any(&self) -> Option<AnyScopeRef>;
+
+    fn as_send(&self) -> Option<AnySendScopeRef>;
+
+    fn is_cancelled(&self) -> bool;
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalScopeParent(Option<AnyScopeRef>);
+
+impl ScopeParent for LocalScopeParent {
+    fn from_any(parent: Option<AnyScopeRef>) -> Self {
+        Self(parent)
+    }
+
+    fn as_any(&self) -> Option<AnyScopeRef> {
+        self.0.clone()
+    }
+
+    fn as_send(&self) -> Option<AnySendScopeRef> {
+        self.0.as_ref().and_then(AnyScopeRef::as_send)
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.0.as_ref().is_some_and(AnyScopeRef::is_cancelled)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ThreadSafeScopeParent(Option<AnySendScopeRef>);
+
+impl ScopeParent for ThreadSafeScopeParent {
+    fn from_any(parent: Option<AnyScopeRef>) -> Self {
+        Self(parent.and_then(AnyScopeRef::into_send))
+    }
+
+    fn as_any(&self) -> Option<AnyScopeRef> {
+        self.0.clone().map(AnySendScopeRef::into_any)
+    }
+
+    fn as_send(&self) -> Option<AnySendScopeRef> {
+        self.0.clone()
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.0.as_ref().is_some_and(AnySendScopeRef::is_cancelled)
+    }
+}
+
+pub trait ScopeStorage: Storage {
+    type Parent: ScopeParent;
+}
+
+impl ScopeStorage for LocalStorage {
+    type Parent = LocalScopeParent;
+}
+
+impl ScopeStorage for AtomicStorage {
+    type Parent = ThreadSafeScopeParent;
+}
+
+// --- 任务错误与结果扩展 ---
 pub enum TaskError {
     /// 任务在执行过程中发生了 Panic
     Panic,
@@ -53,6 +274,7 @@ impl Debug for TaskError {
 
 pub trait RuntimeContextExt {
     fn is_cancelled(&self) -> bool;
+
     fn scope_completion(&self) -> Option<AnyScopeRef>;
 }
 
@@ -86,9 +308,19 @@ impl RuntimeContextExt for Context<'_> {
     }
 }
 
+pub trait RawTask {
+    type Storage: Storage;
+
+    fn poll_raw(&self, worker_id: usize) -> RuntimeResult<bool>;
+
+    fn header(&self) -> &GenericTaskHeader<Self::Storage>;
+}
+
 pub trait TaskHandleRef: Copy {
     type Storage: Storage;
+
     fn header(&self) -> &GenericTaskHeader<Self::Storage>;
+
     /// # Safety
     /// The `header` pointer must be a valid pointer to a `GenericTaskHeader`.
     unsafe fn from_header(header: *const GenericTaskHeader<Self::Storage>) -> Self;
@@ -103,21 +335,18 @@ pub trait TaskHandleRef: Copy {
         U: RawTask<Storage = Self::Storage>;
 }
 
-pub trait RawTask {
-    type Storage: Storage;
-    fn poll_raw(&self, worker_id: usize) -> RuntimeResult<bool>;
-    fn header(&self) -> &GenericTaskHeader<Self::Storage>;
-}
-
 pub trait Task<T>: RawTask {
     fn poll_task(&self, cx: &mut Context<'_>) -> bool;
+
     fn take_result(&self) -> Option<Result<T, TaskError>>;
 }
 
 pub trait LocalTask<T>: Task<T, Storage = LocalStorage> {}
+
 impl<T, U: Task<T, Storage = LocalStorage> + ?Sized> LocalTask<T> for U {}
 
 pub trait SendTask<T>: Task<T, Storage = AtomicStorage> + Send {}
+
 impl<T, U: Task<T, Storage = AtomicStorage> + Send + ?Sized> SendTask<T> for U {}
 
 pub trait TaskLock<T> {
@@ -129,6 +358,10 @@ impl<T, L: StateLock<T>> TaskLock<T> for L {
     fn lock_mut<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         f(&mut *self.lock())
     }
+}
+
+pub trait TaskResultSetter<T> {
+    fn set_result(&self, res: Result<T, TaskError>);
 }
 
 pub struct LifecycleManager<'a, S: Storage> {
@@ -157,10 +390,20 @@ impl<'a, S: Storage> LifecycleManager<'a, S> {
         }
         self.header.exit_poll_to_pending()
     }
-}
 
-pub trait TaskResultSetter<T> {
-    fn set_result(&self, res: Result<T, TaskError>);
+    pub(crate) fn poll_task_internal<T, R, F>(
+        header: &GenericTaskHeader<S>,
+        result_setter: &R,
+        cx: &mut Context<'_>,
+        poll_fn: F,
+        is_local: bool,
+    ) -> bool
+    where
+        R: TaskResultSetter<T>,
+        F: FnMut(&mut Context<'_>) -> Poll<T>,
+    {
+        poll_task_internal(header, result_setter, cx, poll_fn, is_local)
+    }
 }
 
 pub struct TaskFinalizer<'a, T, R, S: Storage>
@@ -231,7 +474,7 @@ where
     }
 }
 
-pub(crate) fn poll_task_internal<T, R, F, S: Storage>(
+fn poll_task_internal<T, R, F, S: Storage>(
     header: &GenericTaskHeader<S>,
     result_setter: &R,
     cx: &mut Context<'_>,
@@ -285,12 +528,12 @@ where
 }
 
 // --- 任务引用基础结构 (Direct Implementation) ---
-
 pub struct LocalTaskRef {
     header: NonNull<GenericTaskHeader<LocalStorage>>,
 }
 
 impl Copy for LocalTaskRef {}
+
 impl Clone for LocalTaskRef {
     fn clone(&self) -> Self {
         *self
@@ -334,6 +577,7 @@ pub struct SendTaskRef {
 }
 
 impl Copy for SendTaskRef {}
+
 impl Clone for SendTaskRef {
     fn clone(&self) -> Self {
         *self
@@ -373,6 +617,7 @@ impl TaskHandleRef for SendTaskRef {
 }
 
 unsafe impl Send for SendTaskRef {}
+
 unsafe impl Sync for SendTaskRef {}
 
 pub trait TaskJoinGate<T> {
@@ -387,15 +632,17 @@ impl<T, S: Task<T>> TaskJoinGate<T> for S {
 }
 
 // --- 实用工具与宏 (Public API) ---
+pub struct YieldNow(bool);
 
-pub fn yield_now() -> YieldNow {
-    YieldNow(false)
+impl YieldNow {
+    pub(crate) fn new() -> Self {
+        Self(false)
+    }
 }
-
-pub struct YieldNow(pub bool);
 
 impl Future for YieldNow {
     type Output = ();
+
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         if cx.is_cancelled() {
             return Poll::Ready(());
@@ -415,7 +662,7 @@ macro_rules! task_local {
     ($name:ident, $future_expr:expr) => {
         let mut __fut = $future_expr;
         let mut __fut = unsafe { core::pin::Pin::new_unchecked(&mut __fut) };
-        let $name = $crate::task::LocalTaskNode::new(__fut);
+        let $name = $crate::LocalTaskNode::new(__fut);
     };
 }
 #[macro_export]
@@ -423,6 +670,6 @@ macro_rules! task {
     ($name:ident, $future_expr:expr) => {
         let mut __fut = $future_expr;
         let mut __fut = unsafe { core::pin::Pin::new_unchecked(&mut __fut) };
-        let $name = $crate::task::SendTaskNode::new(__fut);
+        let $name = $crate::SendTaskNode::new(__fut);
     };
 }

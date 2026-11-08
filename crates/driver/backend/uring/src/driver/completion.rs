@@ -95,43 +95,36 @@ impl CompletionEngine {
 
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
-    use crate::config::UringDriveLimits;
-    use crate::driver::completion::hooks::WakerRecovery;
-    use crate::driver::{
-        drive::WaitBudget,
-        env::{CompletionLedgerParts, CompletionMetadata},
-        registration::{ProvidedBufGroup, ProvidedBufPort},
-        submission::WaitBudgetSource,
-    };
-    use crate::op::{
-        Accept, AcceptMulti, Open, ReadRaw, Recv, UringOpRegistry, UringOperationDescriptor,
-        WriteRaw,
-    };
-    use crate::test_alloc::AllocationCounts;
     use crate::{
+        config::UringDriveLimits,
         diagnostics::UringCompletionDiagnostics,
         driver::{
+            completion::{
+                COMP_BACKEND_URING, CompletionEngine, UringBackendEffect, UringCompletionHooks,
+                UringSyntheticCompletion, hooks::WakerRecovery,
+            },
             control::{
                 ControlPlaneEvent, ControlPlaneObserver, PendingCancel, UringControlEffectKind,
                 UringPostCompletionEffects,
             },
-            env::CompletionControlView,
-        },
-        op::{CompletionCleanupHintFn, UringSlotSpec},
-    };
-    use crate::{
-        driver::completion::{
-            COMP_BACKEND_URING, CompletionEngine, UringBackendEffect, UringCompletionHooks,
-            UringSyntheticCompletion,
+            drive::WaitBudget,
+            env::{CompletionControlView, CompletionLedgerParts, CompletionMetadata},
+            registration::{ProvidedBufGroup, ProvidedBufPort},
+            submission::WaitBudgetSource,
         },
         error::UringError,
+        op::{
+            Accept, AcceptMulti, CompletionCleanupHintFn, Open, ReadRaw, Recv, UringOpRegistry,
+            UringOperationDescriptor, UringSlotSpec, WriteRaw,
+        },
+        test_alloc::AllocationCounts,
+        test_serial::FD_TEST_LOCK,
     };
-    use libc::{close, fcntl, pipe};
-    use veloq_driver_core::Generation;
+    use libc::{EAGAIN, ECANCELED, EINTR, F_GETFD, close, fcntl, pipe};
     use veloq_driver_core::{
         CancelTicket, CompletionBackendHooks, CompletionEnvelope, CompletionFlowExt,
         CompletionFlowOutcome, CompletionIngress, CompletionSettlement, CompletionToken,
-        DriverCompletionDiagnostics, OpToken, RawCompletion, SharedCompletionTable,
+        DriverCompletionDiagnostics, Generation, OpToken, RawCompletion, SharedCompletionTable,
     };
     use veloq_std::{collections::HashMap, time::Duration};
 
@@ -231,7 +224,7 @@ mod tests {
     }
 
     fn assert_closed(fd: i32) {
-        assert_eq!(unsafe { fcntl(fd, libc::F_GETFD) }, -1);
+        assert_eq!(unsafe { fcntl(fd, F_GETFD) }, -1);
     }
 
     #[test]
@@ -320,7 +313,7 @@ mod tests {
     #[test]
     fn recoverable_waker_errors_still_rearm() {
         let diagnostics = DriverCompletionDiagnostics::<UringCompletionDiagnostics>::default();
-        for res in [-libc::EAGAIN, -libc::EINTR] {
+        for res in [-EAGAIN, -EINTR] {
             let mut pending_cancel_cqes = HashMap::default();
             let mut completion_cleanup_hints = HashMap::default();
             let mut observer = ControlPlaneObserver::default();
@@ -488,6 +481,7 @@ mod tests {
 
     #[test]
     fn stale_fd_completion_is_closed_and_final_hint_is_removed() {
+        let _test_lock = FD_TEST_LOCK.lock();
         let mut registry = UringOpRegistry::new(1);
         let token = OpToken::from_registry_parts(0, Generation::new(1)).expect("test token");
         let fd_pair = open_test_fds();
@@ -517,6 +511,7 @@ mod tests {
 
     #[test]
     fn negative_fd_completion_does_not_close_or_retain_hint() {
+        let _test_lock = FD_TEST_LOCK.lock();
         let mut registry = UringOpRegistry::new(1);
         let token = OpToken::from_registry_parts(0, Generation::new(1)).expect("test token");
         let fd_pair = open_test_fds();
@@ -527,10 +522,10 @@ mod tests {
         let mut sidecar = HashMap::default();
         sidecar.insert(CompletionToken::user(token), Some(hint));
 
-        accept_corrupt(&mut registry, &mut sidecar, token, -libc::ECANCELED, 0);
+        accept_corrupt(&mut registry, &mut sidecar, token, -ECANCELED, 0);
 
         assert!(sidecar.is_empty());
-        assert_ne!(unsafe { fcntl(fd_pair[0], libc::F_GETFD) }, -1);
+        assert_ne!(unsafe { fcntl(fd_pair[0], F_GETFD) }, -1);
         unsafe {
             close(fd_pair[0]);
             close(fd_pair[1]);
@@ -589,6 +584,7 @@ mod tests {
 
     #[test]
     fn stale_non_fd_completion_does_not_close_a_positive_result() {
+        let _test_lock = FD_TEST_LOCK.lock();
         let mut registry = UringOpRegistry::new(1);
         let token = OpToken::from_registry_parts(0, Generation::new(1)).expect("test token");
         let fd_pair = open_test_fds();
@@ -600,7 +596,7 @@ mod tests {
 
         assert_eq!(outcome.anomaly_count(), 1);
         assert!(sidecar.is_empty());
-        assert_ne!(unsafe { fcntl(fd, libc::F_GETFD) }, -1);
+        assert_ne!(unsafe { fcntl(fd, F_GETFD) }, -1);
         unsafe {
             close(fd);
             close(fd_pair[1]);
@@ -616,13 +612,14 @@ mod tests {
 
     #[test]
     fn missing_fd_cleanup_hint_does_not_guess_close() {
+        let _test_lock = FD_TEST_LOCK.lock();
         let mut registry = UringOpRegistry::new(1);
         let token = OpToken::from_registry_parts(0, Generation::new(1)).expect("test token");
         let fd_pair = open_test_fds();
 
         accept_corrupt(&mut registry, &mut HashMap::default(), token, fd_pair[0], 0);
 
-        assert_ne!(unsafe { fcntl(fd_pair[0], libc::F_GETFD) }, -1);
+        assert_ne!(unsafe { fcntl(fd_pair[0], F_GETFD) }, -1);
         unsafe {
             close(fd_pair[0]);
             close(fd_pair[1]);
@@ -641,6 +638,7 @@ mod tests {
     fn multishot_corrupt_completions_close_each_fd_and_retain_hint_until_final() {
         const CQE_MORE: u32 = 2;
 
+        let _test_lock = FD_TEST_LOCK.lock();
         let mut registry = UringOpRegistry::new(1);
         let token = OpToken::from_registry_parts(0, Generation::new(1)).expect("test token");
         let first_pair = open_test_fds();
@@ -676,6 +674,7 @@ mod tests {
 
     #[test]
     fn generation_reuse_keeps_old_and_new_cleanup_hints_separate() {
+        let _test_lock = FD_TEST_LOCK.lock();
         let mut registry = UringOpRegistry::new(1);
         let old_token = OpToken::from_registry_parts(0, Generation::new(1)).expect("old token");
         let new_token = OpToken::from_registry_parts(0, Generation::new(2)).expect("new token");

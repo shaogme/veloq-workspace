@@ -2,25 +2,21 @@
 
 use veloq_std::{
     future::{Future, poll_fn},
+    num::NonZeroUsize,
     pin::Pin,
     result::Result,
     sync::{
         NativeArc as Arc, NativeCondvar as Condvar, NativeMutex as Mutex,
         atomic::{NativeAtomicBool as AtomicBool, NativeAtomicUsize as AtomicUsize, Ordering},
     },
-    task::{Context, Poll, Waker},
+    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
     time::{Duration, Instant},
     vec,
 };
 
 use veloq_runtime::{
-    error::{Result as RuntimeResult, RuntimeWakeError},
-    runtime::{
-        RuntimeBuilder, RuntimeShared,
-        context::{IdleDecision, IdleWaitStrategy},
-        primitives::RuntimeWaker,
-    },
-    scope,
+    IdleDecision, IdleWaitStrategy, Result as RuntimeResult, RuntimeBuilder, RuntimeShared,
+    RuntimeWakeError, RuntimeWaker, scope,
 };
 
 const A_STARTED_BIT: usize = 1 << 0;
@@ -72,6 +68,19 @@ impl StartupRendezvous {
             Poll::Pending
         }
     }
+}
+
+struct OtherGroupState {
+    parked: usize,
+    wake_permits: usize,
+    resumed: usize,
+    released: bool,
+}
+
+struct GlobalFallbackTestState {
+    other_group: Mutex<OtherGroupState>,
+    other_group_condvar: Condvar,
+    wake_calls: Arc<[AtomicUsize]>,
 }
 
 struct RecordingWaker {
@@ -141,19 +150,6 @@ fn wakeable_future(
     }
 }
 
-struct OtherGroupState {
-    parked: usize,
-    wake_permits: usize,
-    resumed: usize,
-    released: bool,
-}
-
-struct GlobalFallbackTestState {
-    other_group: Mutex<OtherGroupState>,
-    other_group_condvar: Condvar,
-    wake_calls: Arc<[AtomicUsize]>,
-}
-
 type TestExtra = Arc<GlobalFallbackTestState>;
 
 const STAGE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -178,7 +174,7 @@ impl GlobalFallbackTestState {
 
 fn keep_target_group_active(shared: &RuntimeShared<TestExtra>) -> RuntimeResult<IdleDecision> {
     let worker_id = shared.worker_id();
-    shared.extra_tls.with(|_| {
+    shared.extra_tls().with(|_| {
         if worker_id < 2 {
             Ok(IdleDecision::continue_now())
         } else {
@@ -191,7 +187,7 @@ fn hold_other_group_workers(
     shared: &RuntimeShared<TestExtra>,
     _wait_strategy: IdleWaitStrategy,
 ) -> RuntimeResult<()> {
-    let fixture = shared.extra_tls.with(Arc::clone);
+    let fixture = shared.extra_tls().with(Arc::clone);
     let worker_bit = 1 << shared.worker_id();
     let mut state = fixture
         .other_group
@@ -318,8 +314,8 @@ fn global_fallback_wakes_an_idle_worker_in_another_group() {
     let factory_fixture = fixture.clone();
     let scope_fixture = fixture.clone();
     let result = RuntimeBuilder::new()
-        .with_worker_count(veloq_std::num::NonZeroUsize::new(4))
-        .with_queue_capacity(veloq_std::num::NonZeroUsize::new(1).expect("queue capacity"))
+        .with_worker_count(NonZeroUsize::new(4))
+        .with_queue_capacity(NonZeroUsize::new(1).expect("queue capacity"))
         .with_test_topology(vec![0, 0, 1, 1])
         .with_idle_hook(keep_target_group_active)
         .with_park_hook(hold_other_group_workers)
@@ -407,117 +403,111 @@ fn global_fallback_wakes_an_idle_worker_in_another_group() {
 #[test]
 fn rejects_invalid_synthetic_topology() {
     let length_mismatch = RuntimeBuilder::new()
-        .with_worker_count(veloq_std::num::NonZeroUsize::new(2))
+        .with_worker_count(NonZeroUsize::new(2))
         .with_test_topology(vec![0])
         .scope(async |_ctx| ());
     assert!(length_mismatch.is_err());
 
     let invalid_group = RuntimeBuilder::new()
-        .with_worker_count(veloq_std::num::NonZeroUsize::new(2))
+        .with_worker_count(NonZeroUsize::new(2))
         .with_test_topology(vec![0, 2])
         .scope(async |_ctx| ());
     assert!(invalid_group.is_err());
 }
 
-#[cfg(test)]
-mod startup_rendezvous_tests {
-    use super::*;
+struct WakerCounters {
+    wakes: AtomicUsize,
+}
 
-    struct WakerCounters {
-        wakes: AtomicUsize,
-    }
+static COUNTING_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+    |ptr| unsafe {
+        Arc::increment_strong_count(ptr as *const WakerCounters);
+        RawWaker::new(ptr, &COUNTING_WAKER_VTABLE)
+    },
+    |ptr| unsafe {
+        let counters = Arc::from_raw(ptr as *const WakerCounters);
+        counters.wakes.fetch_add(1, Ordering::Relaxed);
+    },
+    |ptr| unsafe {
+        let counters = &*(ptr as *const WakerCounters);
+        counters.wakes.fetch_add(1, Ordering::Relaxed);
+    },
+    |ptr| unsafe {
+        drop(Arc::from_raw(ptr as *const WakerCounters));
+    },
+);
 
-    static COUNTING_WAKER_VTABLE: veloq_std::task::RawWakerVTable =
-        veloq_std::task::RawWakerVTable::new(
-            |ptr| unsafe {
-                Arc::increment_strong_count(ptr as *const WakerCounters);
-                veloq_std::task::RawWaker::new(ptr, &COUNTING_WAKER_VTABLE)
-            },
-            |ptr| unsafe {
-                let counters = Arc::from_raw(ptr as *const WakerCounters);
-                counters.wakes.fetch_add(1, Ordering::Relaxed);
-            },
-            |ptr| unsafe {
-                let counters = &*(ptr as *const WakerCounters);
-                counters.wakes.fetch_add(1, Ordering::Relaxed);
-            },
-            |ptr| unsafe {
-                drop(Arc::from_raw(ptr as *const WakerCounters));
-            },
-        );
+fn counting_waker(counters: &Arc<WakerCounters>) -> Waker {
+    let raw = Arc::into_raw(Arc::clone(counters)) as *const ();
+    unsafe { Waker::from_raw(RawWaker::new(raw, &COUNTING_WAKER_VTABLE)) }
+}
 
-    fn counting_waker(counters: &Arc<WakerCounters>) -> Waker {
-        let raw = Arc::into_raw(Arc::clone(counters)) as *const ();
-        unsafe { Waker::from_raw(veloq_std::task::RawWaker::new(raw, &COUNTING_WAKER_VTABLE)) }
-    }
+fn poll_startup(rendezvous: &StartupRendezvous, waker: &Waker) -> Poll<()> {
+    rendezvous.poll_until_started(&Context::from_waker(waker))
+}
 
-    fn poll_startup(rendezvous: &StartupRendezvous, waker: &Waker) -> Poll<()> {
-        rendezvous.poll_until_started(&Context::from_waker(waker))
-    }
+#[test]
+fn waiter_is_woken_when_second_bit_arrives() {
+    let rendezvous = StartupRendezvous::new(REQUIRED_STARTED_MASK);
+    let counters = Arc::new(WakerCounters {
+        wakes: AtomicUsize::new(0),
+    });
+    let waker = counting_waker(&counters);
 
-    #[test]
-    fn waiter_is_woken_when_second_bit_arrives() {
-        let rendezvous = StartupRendezvous::new(REQUIRED_STARTED_MASK);
-        let counters = Arc::new(WakerCounters {
-            wakes: AtomicUsize::new(0),
-        });
-        let waker = counting_waker(&counters);
+    assert_eq!(poll_startup(&rendezvous, &waker), Poll::Pending);
+    let waiter = rendezvous.mark_started(B_STARTED_BIT);
+    assert!(waiter.is_none());
+    let waiter = rendezvous.mark_started(A_STARTED_BIT).expect("waiter");
+    waiter.wake();
+    assert_eq!(counters.wakes.load(Ordering::Relaxed), 1);
+}
 
-        assert_eq!(poll_startup(&rendezvous, &waker), Poll::Pending);
-        let waiter = rendezvous.mark_started(B_STARTED_BIT);
-        assert!(waiter.is_none());
-        let waiter = rendezvous.mark_started(A_STARTED_BIT).expect("waiter");
-        waiter.wake();
-        assert_eq!(counters.wakes.load(Ordering::Relaxed), 1);
-    }
+#[test]
+fn completed_bits_make_later_poll_ready() {
+    let rendezvous = StartupRendezvous::new(REQUIRED_STARTED_MASK);
+    assert!(rendezvous.mark_started(A_STARTED_BIT).is_none());
+    assert!(rendezvous.mark_started(B_STARTED_BIT).is_none());
+    assert_eq!(poll_startup(&rendezvous, Waker::noop()), Poll::Ready(()));
+}
 
-    #[test]
-    fn completed_bits_make_later_poll_ready() {
-        let rendezvous = StartupRendezvous::new(REQUIRED_STARTED_MASK);
-        assert!(rendezvous.mark_started(A_STARTED_BIT).is_none());
-        assert!(rendezvous.mark_started(B_STARTED_BIT).is_none());
-        assert_eq!(poll_startup(&rendezvous, Waker::noop()), Poll::Ready(()));
-    }
+#[test]
+fn waiter_registered_between_the_two_bits_is_woken() {
+    let rendezvous = StartupRendezvous::new(REQUIRED_STARTED_MASK);
+    assert!(rendezvous.mark_started(A_STARTED_BIT).is_none());
+    let waker = Waker::noop().clone();
+    assert_eq!(poll_startup(&rendezvous, &waker), Poll::Pending);
+    assert!(rendezvous.mark_started(B_STARTED_BIT).is_some());
+}
 
-    #[test]
-    fn waiter_registered_between_the_two_bits_is_woken() {
-        let rendezvous = StartupRendezvous::new(REQUIRED_STARTED_MASK);
-        assert!(rendezvous.mark_started(A_STARTED_BIT).is_none());
-        let waker = Waker::noop().clone();
-        assert_eq!(poll_startup(&rendezvous, &waker), Poll::Pending);
-        assert!(rendezvous.mark_started(B_STARTED_BIT).is_some());
-    }
+#[test]
+fn duplicate_bit_does_not_wake_twice() {
+    let rendezvous = StartupRendezvous::new(REQUIRED_STARTED_MASK);
+    assert!(rendezvous.mark_started(A_STARTED_BIT).is_none());
+    assert!(rendezvous.mark_started(A_STARTED_BIT).is_none());
+    assert_eq!(poll_startup(&rendezvous, Waker::noop()), Poll::Pending);
+    assert!(rendezvous.mark_started(B_STARTED_BIT).is_some());
+    assert!(rendezvous.mark_started(B_STARTED_BIT).is_none());
+}
 
-    #[test]
-    fn duplicate_bit_does_not_wake_twice() {
-        let rendezvous = StartupRendezvous::new(REQUIRED_STARTED_MASK);
-        assert!(rendezvous.mark_started(A_STARTED_BIT).is_none());
-        assert!(rendezvous.mark_started(A_STARTED_BIT).is_none());
-        assert_eq!(poll_startup(&rendezvous, Waker::noop()), Poll::Pending);
-        assert!(rendezvous.mark_started(B_STARTED_BIT).is_some());
-        assert!(rendezvous.mark_started(B_STARTED_BIT).is_none());
-    }
+#[test]
+fn latest_waiter_replaces_stale_waiter() {
+    let rendezvous = StartupRendezvous::new(REQUIRED_STARTED_MASK);
+    assert!(rendezvous.mark_started(A_STARTED_BIT).is_none());
+    let first = Arc::new(WakerCounters {
+        wakes: AtomicUsize::new(0),
+    });
+    let second = Arc::new(WakerCounters {
+        wakes: AtomicUsize::new(0),
+    });
+    let first_waker = counting_waker(&first);
+    let second_waker = counting_waker(&second);
 
-    #[test]
-    fn latest_waiter_replaces_stale_waiter() {
-        let rendezvous = StartupRendezvous::new(REQUIRED_STARTED_MASK);
-        assert!(rendezvous.mark_started(A_STARTED_BIT).is_none());
-        let first = Arc::new(WakerCounters {
-            wakes: AtomicUsize::new(0),
-        });
-        let second = Arc::new(WakerCounters {
-            wakes: AtomicUsize::new(0),
-        });
-        let first_waker = counting_waker(&first);
-        let second_waker = counting_waker(&second);
-
-        assert_eq!(poll_startup(&rendezvous, &first_waker), Poll::Pending);
-        assert_eq!(poll_startup(&rendezvous, &second_waker), Poll::Pending);
-        rendezvous
-            .mark_started(B_STARTED_BIT)
-            .expect("latest waiter")
-            .wake();
-        assert_eq!(first.wakes.load(Ordering::Relaxed), 0);
-        assert_eq!(second.wakes.load(Ordering::Relaxed), 1);
-    }
+    assert_eq!(poll_startup(&rendezvous, &first_waker), Poll::Pending);
+    assert_eq!(poll_startup(&rendezvous, &second_waker), Poll::Pending);
+    rendezvous
+        .mark_started(B_STARTED_BIT)
+        .expect("latest waiter")
+        .wake();
+    assert_eq!(first.wakes.load(Ordering::Relaxed), 0);
+    assert_eq!(second.wakes.load(Ordering::Relaxed), 1);
 }

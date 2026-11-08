@@ -1,4 +1,4 @@
-use veloq_runtime::{join, runtime::Runtime};
+use veloq_runtime::{join, Runtime};
 
 struct NotCopy(&'static str);
 

@@ -1,5 +1,5 @@
 #[cfg(feature = "std")]
-use veloq_runtime::{runtime::Runtime, scope, task::yield_now};
+use veloq_runtime::{Runtime, scope, yield_now};
 
 #[cfg(feature = "std")]
 use veloq_std::{

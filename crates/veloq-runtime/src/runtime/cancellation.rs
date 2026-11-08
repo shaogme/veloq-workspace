@@ -1,21 +1,21 @@
 use veloq_std::{
     boxed::Box,
+    cell::UnsafeCell,
     future::Future,
     marker::PhantomPinned,
     pin::Pin,
     ptr::NonNull,
-    sync::atomic::Ordering,
+    sync::atomic::{AtomicBool, Ordering},
     task::{Context, Poll, Waker},
     vec::Vec,
 };
 
 use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
-use veloq_std::cell::UnsafeCell;
 use veloq_storage::{StateInt, StateLock, Storage};
 
 use crate::{
     task::{AnySendScopeRef, CancellationWaiter, CancellationWaiterAdapter, OpaqueToken},
-    utils::ownership::Ownership,
+    utils::Ownership,
 };
 
 /// 任务取消等待节点的注册结果。
@@ -29,9 +29,9 @@ pub enum CancelWaiterLinkResult {
 }
 
 pub(crate) type ChildList<S, O> = <S as Storage>::Lock<LinkedList<CancellationTokenAdapter<S, O>>>;
-pub(crate) type ParentSlot<S, O> =
-    <S as Storage>::Lock<Option<<O as Ownership>::Weak<GenericCancellationTokenInner<S, O>>>>;
 pub(crate) type CancelWaiterList<S> = <S as Storage>::Lock<LinkedList<CancellationWaiterAdapter>>;
+type OwnershipWeak<O, T> = <O as Ownership>::Weak<T>;
+type ParentLink<S, O, T> = <S as Storage>::Lock<Option<OwnershipWeak<O, T>>>;
 
 pub struct GenericCancellationTokenInner<S: Storage, O: Ownership> {
     cancelled: S::Usize,
@@ -39,7 +39,7 @@ pub struct GenericCancellationTokenInner<S: Storage, O: Ownership> {
     waiters: CancelWaiterList<S>,
     children: ChildList<S, O>,
     link: Link,
-    parent: ParentSlot<S, O>,
+    parent: ParentLink<S, O, GenericCancellationTokenInner<S, O>>,
     cross_parent: Option<AnySendScopeRef>,
 }
 
@@ -109,10 +109,14 @@ impl<S: Storage, O: Ownership> GenericCancellationTokenInner<S, O> {
     }
 }
 
+pub struct GenericCancellationToken<S: Storage, O: Ownership> {
+    inner: O::Shared<GenericCancellationTokenInner<S, O>>,
+}
+
 /// 一个 future 在单个跨 scope parent 上的稳定注册。
 pub(crate) struct AncestorRegistration {
-    pub(crate) scope: AnySendScopeRef,
-    pub(crate) node: Pin<Box<CancellationWaiter>>,
+    scope: AnySendScopeRef,
+    node: Pin<Box<CancellationWaiter>>,
 }
 
 impl AncestorRegistration {
@@ -137,9 +141,15 @@ impl AncestorRegistration {
 /// `CancelledFuture` 对当前 token 和完整跨 scope parent 链的 RAII 注册。
 pub(crate) struct CancellationRegistration {
     /// 本地节点地址在注册期间必须保持稳定，因此不放入 `UnsafeCell`。
-    pub(crate) local: CancellationWaiter,
-    pub(crate) ancestors: UnsafeCell<Vec<AncestorRegistration>>,
-    armed: veloq_std::sync::atomic::AtomicBool,
+    local: CancellationWaiter,
+    ancestors: UnsafeCell<Vec<AncestorRegistration>>,
+    armed: AtomicBool,
+}
+
+pub struct CancelledFuture<S: Storage, O: Ownership> {
+    token: GenericCancellationToken<S, O>,
+    registration: CancellationRegistration,
+    _pin: PhantomPinned,
 }
 
 impl CancellationRegistration {
@@ -147,7 +157,7 @@ impl CancellationRegistration {
         Self {
             local: CancellationWaiter::new(),
             ancestors: UnsafeCell::new(Vec::new()),
-            armed: veloq_std::sync::atomic::AtomicBool::new(false),
+            armed: AtomicBool::new(false),
         }
     }
 
@@ -220,10 +230,6 @@ impl CancellationRegistration {
         }
         self.armed.store(false, Ordering::Relaxed);
     }
-}
-
-pub struct GenericCancellationToken<S: Storage, O: Ownership> {
-    pub(crate) inner: O::Shared<GenericCancellationTokenInner<S, O>>,
 }
 
 impl<S: Storage, O: Ownership> Default for GenericCancellationToken<S, O> {
@@ -307,7 +313,7 @@ impl<S: Storage, O: Ownership> GenericCancellationToken<S, O> {
         unsafe {
             let waiter_ref = waiter.as_ref();
             waiter_ref.set_waker(waker);
-            if !waiter_ref.link.is_linked() {
+            if !waiter_ref.is_linked() {
                 waiters.push_back_ptr(waiter);
             }
         }
@@ -319,7 +325,7 @@ impl<S: Storage, O: Ownership> GenericCancellationToken<S, O> {
     /// `waiter` 必须是先前传给 `link_cancel_waiter` 的同一个节点。
     pub(crate) unsafe fn unlink_cancel_waiter(&self, waiter: NonNull<CancellationWaiter>) {
         let mut waiters = self.inner.waiters.lock();
-        if unsafe { waiter.as_ref().link.is_linked() } {
+        if unsafe { waiter.as_ref().is_linked() } {
             unsafe {
                 let mut cursor = waiters.cursor_mut_from_ptr(waiter);
                 cursor.remove_ptr();
@@ -411,12 +417,6 @@ impl<S: Storage, O: Ownership> Clone for GenericCancellationToken<S, O> {
     }
 }
 
-pub struct CancelledFuture<S: Storage, O: Ownership> {
-    token: GenericCancellationToken<S, O>,
-    registration: CancellationRegistration,
-    _pin: PhantomPinned,
-}
-
 impl<S: Storage, O: Ownership> Future for CancelledFuture<S, O> {
     type Output = ();
 
@@ -452,18 +452,27 @@ impl<S: Storage, O: Ownership> Drop for CancelledFuture<S, O> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::{
+        runtime::{CancelWaiterLinkResult, GenericCancellationToken},
         scope::GenericScopeCompletion,
-        task::{AnySendScopeRef, RawScope, ScopeRef},
-        utils::ownership::ArcOwnership,
+        task::{AnySendScopeRef, CancellationWaiter, RawScope, ScopeRef},
+        utils::ArcOwnership,
     };
     use veloq_std::{
+        future::Future,
         mem::ManuallyDrop,
-        sync::{NativeArc as Arc, atomic::AtomicUsize},
-        task::{Context, RawWaker, RawWakerVTable},
+        pin::pin,
+        ptr::NonNull,
+        sync::{
+            NativeArc as Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
     };
-    use veloq_storage::AtomicStorage;
+    use veloq_storage::{AtomicStorage, StateLock};
+
+    #[cfg(feature = "loom")]
+    use loom::{model as loom_model, sync::Arc as LoomArc, thread::spawn as loom_spawn};
 
     fn new_cancel_waiter() -> CancellationWaiter {
         CancellationWaiter::new()
@@ -479,7 +488,7 @@ mod tests {
         let result = unsafe { token.link_cancel_waiter(waiter_ptr, Waker::noop()) };
 
         assert_eq!(result, CancelWaiterLinkResult::RejectedByCancellation);
-        assert!(!waiter.link.is_linked());
+        assert!(!waiter.is_linked());
         assert!(token.inner.waiters.lock().is_empty());
 
         unsafe {
@@ -498,12 +507,12 @@ mod tests {
             unsafe { token.link_cancel_waiter(waiter_ptr, Waker::noop()) },
             CancelWaiterLinkResult::Linked
         );
-        assert!(waiter.link.is_linked());
+        assert!(waiter.is_linked());
         assert_eq!(token.inner.waiters.lock().len(), 1);
 
         token.cancel();
 
-        assert!(!waiter.link.is_linked());
+        assert!(!waiter.is_linked());
         assert!(token.inner.waiters.lock().is_empty());
         unsafe {
             token.unlink_cancel_waiter(waiter_ptr);
@@ -523,7 +532,7 @@ mod tests {
             CancelWaiterLinkResult::RejectedByCancellation
         );
 
-        assert!(!waiter.link.is_linked());
+        assert!(!waiter.is_linked());
         assert!(token.inner.waiters.lock().is_empty());
     }
 
@@ -544,7 +553,7 @@ mod tests {
         assert_eq!(token.inner.waiters.lock().len(), 1);
 
         unsafe { token.unlink_cancel_waiter(waiter_ptr) };
-        assert!(!waiter.link.is_linked());
+        assert!(!waiter.is_linked());
     }
 
     #[test]
@@ -554,7 +563,7 @@ mod tests {
         let mut cx = Context::from_waker(waker);
 
         {
-            let mut future = veloq_std::pin::pin!(token.cancelled());
+            let mut future = pin!(token.cancelled());
             assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
             assert_eq!(token.inner.waiters.lock().len(), 1);
         }
@@ -564,7 +573,7 @@ mod tests {
     #[test]
     fn repeated_poll_keeps_one_waiter_and_refreshes_waker() {
         let token = GenericCancellationToken::<AtomicStorage, ArcOwnership>::new();
-        let mut future = veloq_std::pin::pin!(token.cancelled());
+        let mut future = pin!(token.cancelled());
         let first = Waker::noop().clone();
         let second = Waker::noop().clone();
         let mut first_cx = Context::from_waker(&first);
@@ -581,7 +590,7 @@ mod tests {
     #[test]
     fn ready_future_disarms_before_it_is_dropped() {
         let token = GenericCancellationToken::<AtomicStorage, ArcOwnership>::new();
-        let mut future = veloq_std::pin::pin!(token.cancelled());
+        let mut future = pin!(token.cancelled());
         let mut cx = Context::from_waker(Waker::noop());
 
         assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
@@ -631,7 +640,7 @@ mod tests {
             let waker = counting_waker(&counters);
             let mut cx = Context::from_waker(&waker);
             {
-                let mut future = veloq_std::pin::pin!(token.cancelled());
+                let mut future = pin!(token.cancelled());
                 assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
                 assert_eq!(token.inner.waiters.lock().len(), 1);
             }
@@ -655,7 +664,7 @@ mod tests {
             wakes: AtomicUsize::new(0),
             drops: AtomicUsize::new(0),
         });
-        let mut future = veloq_std::pin::pin!(token.cancelled());
+        let mut future = pin!(token.cancelled());
         let first_waker = counting_waker(&first);
         let second_waker = counting_waker(&second);
         let mut first_cx = Context::from_waker(&first_waker);
@@ -676,11 +685,11 @@ mod tests {
     #[test]
     fn independent_futures_have_independent_registrations() {
         let token = GenericCancellationToken::<AtomicStorage, ArcOwnership>::new();
-        let mut second = veloq_std::pin::pin!(token.cancelled());
+        let mut second = pin!(token.cancelled());
         let mut cx = Context::from_waker(Waker::noop());
 
         {
-            let mut first = veloq_std::pin::pin!(token.cancelled());
+            let mut first = pin!(token.cancelled());
             assert!(matches!(first.as_mut().poll(&mut cx), Poll::Pending));
             assert!(matches!(second.as_mut().poll(&mut cx), Poll::Pending));
             assert_eq!(token.inner.waiters.lock().len(), 2);
@@ -700,7 +709,7 @@ mod tests {
         let token = GenericCancellationToken::<AtomicStorage, ArcOwnership>::new_with_parent(Some(
             scope_ref(&parent),
         ));
-        let mut future = veloq_std::pin::pin!(token.cancelled());
+        let mut future = pin!(token.cancelled());
         let mut cx = Context::from_waker(Waker::noop());
 
         assert!(matches!(future.as_mut().poll(&mut cx), Poll::Ready(())));
@@ -726,7 +735,7 @@ mod tests {
         let token = GenericCancellationToken::<AtomicStorage, ArcOwnership>::new_with_parent(Some(
             scope_ref(&parent),
         ));
-        let mut future = veloq_std::pin::pin!(token.cancelled());
+        let mut future = pin!(token.cancelled());
         let mut cx = Context::from_waker(Waker::noop());
 
         assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
@@ -747,7 +756,7 @@ mod tests {
         let token = GenericCancellationToken::<AtomicStorage, ArcOwnership>::new_with_parent(Some(
             scope_ref(&parent),
         ));
-        let mut future = veloq_std::pin::pin!(token.cancelled());
+        let mut future = pin!(token.cancelled());
         let mut cx = Context::from_waker(Waker::noop());
 
         assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
@@ -767,7 +776,7 @@ mod tests {
         ));
 
         {
-            let mut future = veloq_std::pin::pin!(token.cancelled());
+            let mut future = pin!(token.cancelled());
             let mut cx = Context::from_waker(Waker::noop());
             assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
             assert_eq!(parent.cancel_token().inner.waiters.lock().len(), 1);
@@ -787,20 +796,19 @@ mod tests {
         unsafe impl Send for SharedWaiter {}
         unsafe impl Sync for SharedWaiter {}
 
-        loom::model(|| {
-            let token = loom::sync::Arc::new(
-                GenericCancellationToken::<AtomicStorage, ArcOwnership>::new(),
-            );
-            let waiter = loom::sync::Arc::new(SharedWaiter(new_cancel_waiter()));
+        loom_model(|| {
+            let token =
+                LoomArc::new(GenericCancellationToken::<AtomicStorage, ArcOwnership>::new());
+            let waiter = LoomArc::new(SharedWaiter(new_cancel_waiter()));
             let register_token = token.clone();
             let register_waiter = waiter.clone();
-            let register = loom::thread::spawn(move || {
+            let register = loom_spawn(move || {
                 let waiter_ptr = NonNull::from(&register_waiter.0);
                 unsafe { register_token.link_cancel_waiter(waiter_ptr, Waker::noop()) }
             });
 
             let cancel_token = token.clone();
-            let cancel = loom::thread::spawn(move || {
+            let cancel = loom_spawn(move || {
                 cancel_token.cancel();
             });
 
@@ -811,7 +819,7 @@ mod tests {
                 result,
                 CancelWaiterLinkResult::Linked | CancelWaiterLinkResult::RejectedByCancellation
             ));
-            assert!(!waiter.0.link.is_linked());
+            assert!(!waiter.0.is_linked());
             assert!(token.inner.waiters.lock().is_empty());
         });
     }

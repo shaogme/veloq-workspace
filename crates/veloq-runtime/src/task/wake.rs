@@ -1,6 +1,5 @@
-use super::header::GenericTaskHeader;
-use crate::runtime::primitives::{EventCount, Unparker, WaitError, sys};
-use crossbeam_queue::SegQueue;
+use super::{LocalWakeTarget, header::GenericTaskHeader};
+use crate::runtime::{Sys, WaitError};
 use veloq_std::{
     hint::spin_loop,
     marker::PhantomData,
@@ -21,53 +20,6 @@ const WAKE_TOKEN_ACTIVE_SHIFT: u32 = 2;
 const WAKE_TOKEN_ACTIVE_UNIT: u32 = 1 << WAKE_TOKEN_ACTIVE_SHIFT;
 const SPIN_LIMIT: u32 = 6;
 
-/// Owner worker 的 local wake mailbox。
-///
-/// mailbox 只跨线程传递 token，不传递 `LocalTaskRef` 或 local header。队列中的 token
-/// 可能在任务释放后继续存活，但 token 的 `ALIVE` 位会使 owner dispatch 安全地丢弃它。
-pub(crate) struct LocalWakeTarget {
-    requests: SegQueue<Arc<TaskWakeToken<LocalStorage>>>,
-    pub(crate) unparker: Unparker,
-    pub(crate) event_count: Arc<EventCount>,
-    pub(crate) worker_id: usize,
-}
-
-impl LocalWakeTarget {
-    pub(crate) fn new(worker_id: usize, unparker: Unparker, event_count: Arc<EventCount>) -> Self {
-        Self {
-            requests: SegQueue::new(),
-            unparker,
-            event_count,
-            worker_id,
-        }
-    }
-
-    #[inline]
-    pub(crate) fn push(&self, token: Arc<TaskWakeToken<LocalStorage>>) {
-        self.requests.push(token);
-        // 请求先入队，再发布事件和 unpark，避免 worker 观察到事件却看不到请求。
-        self.event_count.notify();
-        if self.unparker.unpark().is_err() {
-            // Unparker 已将错误记录到共享 fatal 通道；raw Waker 没有返回错误的 ABI。
-        }
-    }
-
-    #[inline]
-    pub(crate) fn pop(&self) -> Option<Arc<TaskWakeToken<LocalStorage>>> {
-        self.requests.pop()
-    }
-
-    #[inline]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.requests.is_empty()
-    }
-
-    #[inline]
-    pub(crate) fn worker_id(&self) -> usize {
-        self.worker_id
-    }
-}
-
 /// 任务 waker 的 token。
 ///
 /// send task 使用 token 的 header 直接唤醒路径；local task 使用同一套生命周期保护，
@@ -82,6 +34,7 @@ pub(crate) struct TaskWakeToken<S: Storage> {
 }
 
 unsafe impl Send for TaskWakeToken<LocalStorage> {}
+
 unsafe impl Sync for TaskWakeToken<LocalStorage> {}
 
 pub(crate) struct TaskWakeGuard<'a, S: Storage> {
@@ -203,7 +156,7 @@ impl<S: Storage> TaskWakeToken<S> {
                 }
                 spin_count += 1;
             } else {
-                match unsafe { sys::wait(&self.state, curr) } {
+                match unsafe { Sys::wait(&self.state, curr) } {
                     Ok(()) => {}
                     Err(error) => self.record_wait_error(error),
                 }
@@ -332,7 +285,7 @@ impl<S: Storage> Drop for TaskWakeGuard<'_, S> {
             .state
             .fetch_sub(WAKE_TOKEN_ACTIVE_UNIT, Ordering::AcqRel);
         if prev == WAKE_TOKEN_ACTIVE_UNIT {
-            unsafe { sys::wake_all(&self.token.state) }
+            unsafe { Sys::wake_all(&self.token.state) }
                 .unwrap_or_else(|error| panic!("runtime futex wake_all failed: {error:?}"));
         }
 
@@ -355,9 +308,16 @@ impl<S: Storage> TaskWakeGuard<'_, S> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use veloq_std::sync::{Barrier, mpsc::sync_channel};
-    use veloq_std::thread::ThreadErrorKind;
+    use crate::{
+        runtime::{EventCount, Unparker},
+        task::{LocalWakeTarget, TaskWakeToken},
+    };
+    use veloq_std::{
+        sync::{Barrier, NativeArc as Arc, mpsc::sync_channel},
+        thread::{self, ThreadErrorKind},
+        time::Duration,
+    };
+    use veloq_storage::LocalStorage;
 
     fn assert_send_sync<T: Send + Sync>() {}
 
@@ -420,14 +380,12 @@ mod tests {
 
         barrier.wait();
         assert!(
-            done_rx
-                .recv_timeout(veloq_std::time::Duration::from_millis(20))
-                .is_err(),
+            done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
             "deactivation must wait while a wake callback is active"
         );
         drop(active);
         done_rx
-            .recv_timeout(veloq_std::time::Duration::from_millis(200))
+            .recv_timeout(Duration::from_millis(200))
             .expect("deactivation must finish after callback quiescence");
         thread
             .expect("wake waiter failed to spawn")
@@ -455,14 +413,12 @@ mod tests {
         barrier.wait();
         thread.abort().expect("wake waiter abort must succeed");
         assert!(
-            done_rx
-                .recv_timeout(veloq_std::time::Duration::from_millis(20))
-                .is_err(),
+            done_rx.recv_timeout(Duration::from_millis(20)).is_err(),
             "aborting the waiter must not skip the active callback"
         );
         drop(active);
         done_rx
-            .recv_timeout(veloq_std::time::Duration::from_millis(200))
+            .recv_timeout(Duration::from_millis(200))
             .expect("deactivation must finish after callback quiescence");
         let error = thread
             .join()

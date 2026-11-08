@@ -1,7 +1,7 @@
 use super::{AsyncScope, CancelTokenSlot, LocalAsyncScope, ScopeProvider};
 use crate::{
     error::{EnqueueError, Result as RuntimeResult, RuntimeError},
-    runtime::cancellation::{CancelledFuture, GenericCancellationToken},
+    runtime::{CancelledFuture, GenericCancellationToken},
     task::{
         Arena, GenericTaskHeader, GenericWakerNode, LocalTaskRef, SendTaskRef, TaskError,
         TaskHandleRef, TaskJoinGate, TaskLease,
@@ -41,6 +41,7 @@ impl<T> JoinOutcome<T> {
             Self::RuntimeErr(err) => panic!("runtime error: {err}"),
         }
     }
+
     pub fn expect(self, msg: &str) -> T {
         match self {
             Self::Ok(value) => value,
@@ -78,14 +79,14 @@ pub struct JoinHandle<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider + 'scope
 where
     S::Arena: 'scope_ref,
 {
-    pub(crate) source: JoinSource<'scope_ref, T, R>,
-    pub(crate) scope: &'scope_ref S,
-    pub(crate) cancel_token: CancelTokenSlot<S::Storage, S::Ownership>,
-    pub(crate) waker_node: Option<GenericWakerNode<R::Storage>>,
-    pub(crate) allocation: Option<<S::Arena as Arena>::Allocation<'scope_ref>>,
-    pub(crate) _extra: PhantomData<fn() -> S::Extra>,
-    pub(crate) _not_sync: PhantomData<Cell<()>>,
-    pub(crate) _pin: PhantomPinned,
+    source: JoinSource<'scope_ref, T, R>,
+    scope: &'scope_ref S,
+    cancel_token: CancelTokenSlot<S::Storage, S::Ownership>,
+    waker_node: Option<GenericWakerNode<R::Storage>>,
+    allocation: Option<<S::Arena as Arena>::Allocation<'scope_ref>>,
+    _extra: PhantomData<fn() -> S::Extra>,
+    _not_sync: PhantomData<Cell<()>>,
+    _pin: PhantomPinned,
 }
 
 // Safety: a send join handle is moved as one value between threads. Once moved, the
@@ -191,7 +192,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider + 'scope_ref>
         Self {
             source: JoinSource::Direct { task, gate },
             scope,
-            cancel_token: super::new_cancel_slot::<S::Storage, S::Ownership>(),
+            cancel_token: S::empty_cancel_token_slot(),
             waker_node: None,
             allocation,
             _extra: PhantomData,
@@ -206,7 +207,7 @@ impl<'scope_ref, T, R: TaskHandleRef, S: ScopeProvider + 'scope_ref>
                 outcome: Some(JoinOutcome::RuntimeErr(error)),
             },
             scope,
-            cancel_token: super::new_cancel_slot::<S::Storage, S::Ownership>(),
+            cancel_token: S::empty_cancel_token_slot(),
             waker_node: None,
             allocation: None,
             _extra: PhantomData,

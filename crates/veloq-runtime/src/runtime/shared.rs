@@ -1,47 +1,41 @@
-use veloq_std::vec;
+mod infra;
+mod runtime;
+mod worker_loop;
+
+pub use runtime::RuntimeShared;
+pub(crate) use runtime::{Receivers, RuntimeSharedConfig};
+
+use diagweave::prelude::*;
 use veloq_std::{
     boxed::Box,
     hint::spin_loop,
     num::NonZeroUsize,
+    panic::{AssertUnwindSafe, catch_unwind},
     ptr::NonNull,
     string::String,
     sync::{
-        NativeArc as Arc, UnpoisonedMutex, UnpoisonedMutexGuard, atomic::AtomicUsize,
-        atomic::Ordering,
+        NativeArc as Arc, UnpoisonedMutex, UnpoisonedMutexGuard,
+        atomic::{AtomicUsize, Ordering},
     },
-    vec::Vec,
 };
-
-use crossbeam_deque::Worker;
-use crossbeam_queue::ArrayQueue;
-use diagweave::prelude::*;
-use numaperf_topo::Topology;
-use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
 use veloq_storage::StateOptionPtr;
 use veloq_tls::Tls;
 
-use super::context::{IdleHook, IdleWaitStrategy, RuntimeTlsInner, WorkerTickHook};
+use super::context::{RuntimeTlsInner, WorkerTickHook};
 use crate::{
     error::{EnqueueError, Result, RuntimeError},
-    runtime::primitives::{
-        EventCount, ShutdownCoordinator, ShutdownPhase, Unparker, WakeFailureState,
+    runtime::{
+        EventCount, Unparker,
+        primitives::{ShutdownCoordinator, ShutdownPhase, WakeFailureState},
     },
-    scope::{GenericScopeCompletion, ScopeBlockingWaiter},
-    task::{
-        GenericTaskHeader, LocalTaskRef, LocalWakeTarget, ScopeStorage, SendTaskRef, TaskHandleRef,
-    },
-    utils::{FastRand, ownership::Ownership},
+    task::{GenericTaskHeader, LocalTaskRef, LocalWakeTarget, SendTaskRef, TaskHandleRef},
+    utils::FastRand,
 };
-
-pub(crate) mod infra;
-pub(crate) mod worker_loop;
 
 use infra::{
-    IdleController, IdleSlots, IdleStack, NUMAGroup, TaskScheduler, TopologyContext, WorkerQueue,
-    WorkerRegistry,
+    IdleController, IdleStack, StealSendParams, TaskScheduler, TopologyContext, WorkerRegistry,
 };
-pub(crate) use worker_loop::{BlockOnController, run_worker_loop};
-use worker_loop::{ScopeJoinController, ShutdownController};
+pub(crate) use worker_loop::{BlockOnController, WorkerLoop};
 
 /// 每隔多少轮循环先看一次全局队列。
 ///
@@ -66,201 +60,111 @@ pub enum EnqueuePinnedOutcome {
     Rejected(EnqueueError),
 }
 
-pub struct RuntimeSharedBase {
-    pub(crate) registry: WorkerRegistry,
-    pub(crate) topo: TopologyContext,
-    pub(crate) scheduler: TaskScheduler,
-    pub(crate) idle: IdleController,
-    pub(crate) shutdown: Arc<ShutdownCoordinator>,
-    pub(crate) wake_failure: Arc<WakeFailureState>,
-    worker_abort: AtomicUsize,
-    wait_failure: UnpoisonedMutex<Option<WaitFailure>>,
-    pub(crate) local_wake_targets: Box<[Arc<LocalWakeTarget>]>,
-    pub(crate) worker_tick_hook: Option<WorkerTickHook>,
-    /// Worker 线程核心上下文（不含用户 extra 状态）。
-    pub(crate) tls: Tls<RuntimeTlsInner>,
-}
-
 #[derive(Clone)]
 struct WaitFailure {
     worker_id: usize,
     detail: String,
 }
 
-/// Worker 进入 idle 等待阶段时调用的 hook。
-///
-/// Hook 接收与 worker factory 使用同一个 `T` 的 [`RuntimeShared`]，并获得运行时选定的
-/// [`IdleWaitStrategy`]。它必须实现实际的等待/驱动 park 逻辑，并通过同一个 runtime
-/// 的 `Unparker` 支持唤醒。
-pub type ParkHook<T> = fn(&RuntimeShared<T>, IdleWaitStrategy) -> Result<()>;
-
-pub struct RuntimeShared<T> {
-    pub base: RuntimeSharedBase,
-    pub(crate) idle_hook: Option<IdleHook<T>>,
-    pub(crate) park_hook: Option<ParkHook<T>>,
-    /// Worker 线程用户自定义 extra 状态。
-    pub extra_tls: Tls<T>,
+pub struct RuntimeSharedBase {
+    registry: WorkerRegistry,
+    topo: TopologyContext,
+    scheduler: TaskScheduler,
+    idle: IdleController,
+    shutdown: Arc<ShutdownCoordinator>,
+    wake_failure: Arc<WakeFailureState>,
+    worker_abort: AtomicUsize,
+    wait_failure: UnpoisonedMutex<Option<WaitFailure>>,
+    local_wake_targets: Box<[Arc<LocalWakeTarget>]>,
+    worker_tick_hook: Option<WorkerTickHook>,
+    /// Worker 线程核心上下文（不含用户 extra 状态）。
+    tls: Tls<RuntimeTlsInner>,
 }
 
-pub(crate) struct Receivers {
-    pub(crate) deques: Vec<Worker<SendTaskRef>>,
+pub(crate) struct RuntimeBaseConfig {
+    pub(crate) registry: WorkerRegistry,
+    pub(crate) topology: TopologyContext,
+    pub(crate) worker_count: NonZeroUsize,
+    pub(crate) worker_tick_hook: Option<WorkerTickHook>,
 }
 
 /// 运行时支持的 worker 数量上界（不含）：worker id 需要能被编码进 idle 栈的低 32 位。
 pub(crate) const MAX_WORKER_COUNT: usize = IdleStack::MAX_WORKERS;
 
-#[cfg(test)]
-pub(crate) fn init_runtime_components(
-    worker_count: NonZeroUsize,
-    queue_capacity: NonZeroUsize,
-) -> (WorkerRegistry, TopologyContext, Receivers) {
-    init_runtime_components_with_topology(worker_count, queue_capacity, None)
-}
-
-pub(crate) fn init_runtime_components_with_topology(
-    worker_count: NonZeroUsize,
-    queue_capacity: NonZeroUsize,
-    topology_override: Option<&[usize]>,
-) -> (WorkerRegistry, TopologyContext, Receivers) {
-    let worker_count_val = worker_count.get();
-    let shutdown = Arc::new(ShutdownCoordinator::new(worker_count_val));
-    let wake_failure = Arc::new(WakeFailureState::new(Arc::downgrade(&shutdown)));
-    let mut unparkers = Vec::with_capacity(worker_count_val);
-    let mut deques = Vec::with_capacity(worker_count_val);
-    let mut workers = Vec::with_capacity(worker_count_val);
-
-    for _ in 0..worker_count_val {
-        unparkers.push(Unparker::with_failure_state(wake_failure.clone()));
-
-        let remote_queue = ArrayQueue::new(queue_capacity.get());
-        let pinned_queue = ArrayQueue::new(queue_capacity.get());
-        let local_queue = ArrayQueue::new(queue_capacity.get());
-
-        let worker_deque = Worker::new_lifo();
-        let stealer = worker_deque.stealer();
-        deques.push(worker_deque);
-
-        workers.push(WorkerQueue::new(
-            remote_queue,
-            pinned_queue,
-            local_queue,
-            queue_capacity.get(),
-            stealer,
-        ));
-    }
-    shutdown.install_shutdown_targets(unparkers.clone().into());
-
-    let topology = if let Some(worker_to_group) = topology_override {
-        TopologyContext::from_worker_to_group(worker_to_group)
-    } else {
-        // NUMA detection
-        let topo_info = Topology::discover().ok();
-        let mut groups = Vec::new();
-        let mut worker_to_group = vec![0; worker_count_val];
-
-        match topo_info {
-            Some(t) if t.node_count() > 0 => {
-                let node_count = t.node_count();
-                let mut node_to_workers: Vec<Vec<usize>> = vec![Vec::new(); node_count];
-
-                for i in 0..worker_count_val {
-                    let node_idx = i % node_count;
-                    node_to_workers[node_idx].push(i);
-                }
-
-                for worker_ids in node_to_workers.into_iter() {
-                    if !worker_ids.is_empty() {
-                        let group_idx = groups.len();
-                        for &worker_id in &worker_ids {
-                            worker_to_group[worker_id] = group_idx;
-                        }
-                        groups.push(NUMAGroup {
-                            worker_ids,
-                            idle_stack: IdleStack::new(),
-                        });
-                    }
-                }
-            }
-            _ => {
-                groups.push(NUMAGroup {
-                    worker_ids: (0..worker_count_val).collect(),
-                    idle_stack: IdleStack::new(),
-                });
-            }
-        }
-        TopologyContext {
-            groups,
-            worker_to_group,
-            group_idle_slots: IdleSlots::new(worker_count_val),
-        }
-    };
-
-    (
-        WorkerRegistry {
-            workers: workers.into_boxed_slice(),
-            unparkers: unparkers.into_boxed_slice(),
-            wake_failure,
-            shutdown,
-        },
-        topology,
-        Receivers { deques },
-    )
-}
-
-impl<T> RuntimeShared<T> {
-    pub fn base(&self) -> &RuntimeSharedBase {
-        &self.base
-    }
-
-    pub(crate) fn new(
-        registry: WorkerRegistry,
-        topo: TopologyContext,
-        worker_count: NonZeroUsize,
-        idle_hook: Option<IdleHook<T>>,
-        park_hook: Option<ParkHook<T>>,
-        worker_tick_hook: Option<WorkerTickHook>,
-    ) -> Self {
-        let shutdown = registry.shutdown.clone();
-        let wake_failure = registry.wake_failure.clone();
+impl RuntimeSharedBase {
+    pub(crate) fn new(config: RuntimeBaseConfig) -> Self {
+        let RuntimeBaseConfig {
+            registry,
+            topology: topo,
+            worker_count,
+            worker_tick_hook,
+        } = config;
+        let shutdown = registry.shutdown().clone();
+        let wake_failure = registry.wake_failure().clone();
         let event_count = Arc::new(EventCount::new());
         let local_wake_targets = (0..worker_count.get())
             .map(|worker_id| {
                 Arc::new(LocalWakeTarget::new(
                     worker_id,
-                    registry.unparkers[worker_id].clone(),
+                    registry.unparkers()[worker_id].clone(),
                     event_count.clone(),
                 ))
             })
             .collect();
         Self {
-            base: RuntimeSharedBase {
-                registry,
-                topo,
-                scheduler: TaskScheduler::new(),
-                idle: IdleController::new(worker_count.get(), event_count),
-                shutdown,
-                wake_failure,
-                worker_abort: AtomicUsize::new(usize::MAX),
-                wait_failure: UnpoisonedMutex::new(None),
-                local_wake_targets,
-                worker_tick_hook,
-                tls: Tls::new(),
-            },
-            idle_hook,
-            park_hook,
-            extra_tls: Tls::new(),
+            registry,
+            topo,
+            scheduler: TaskScheduler::new(),
+            idle: IdleController::new(worker_count.get(), event_count),
+            shutdown,
+            wake_failure,
+            worker_abort: AtomicUsize::new(usize::MAX),
+            wait_failure: UnpoisonedMutex::new(None),
+            local_wake_targets,
+            worker_tick_hook,
+            tls: Tls::new(),
         }
     }
-}
 
-impl RuntimeSharedBase {
+    pub(crate) fn registry(&self) -> &WorkerRegistry {
+        &self.registry
+    }
+
+    pub(crate) fn topology(&self) -> &TopologyContext {
+        &self.topo
+    }
+
+    pub(crate) fn scheduler(&self) -> &TaskScheduler {
+        &self.scheduler
+    }
+
+    pub(crate) fn idle_controller(&self) -> &IdleController {
+        &self.idle
+    }
+
+    pub(crate) fn shutdown_coordinator(&self) -> &Arc<ShutdownCoordinator> {
+        &self.shutdown
+    }
+
+    pub(crate) fn tls(&self) -> &Tls<RuntimeTlsInner> {
+        &self.tls
+    }
+
+    pub(crate) fn is_shutdown(&self) -> bool {
+        self.shutdown.is_shutdown()
+    }
+
+    pub(crate) fn notify_event_count(&self) {
+        self.idle_controller().event_count().notify();
+    }
+
     pub fn unparkers(&self) -> &[Unparker] {
-        &self.registry.unparkers
+        self.registry.unparkers()
     }
 
     #[inline]
     pub(crate) fn unparker(&self, worker_id: usize) -> &Unparker {
-        &self.registry.unparkers[worker_id]
+        &self.registry.unparkers()[worker_id]
     }
 
     pub(crate) fn record_thread_abort(&self, worker_id: usize) {
@@ -318,7 +222,7 @@ impl RuntimeSharedBase {
 
     #[inline]
     pub fn worker_count(&self) -> NonZeroUsize {
-        if let Some(count) = NonZeroUsize::new(self.registry.workers.len()) {
+        if let Some(count) = NonZeroUsize::new(self.registry.workers().len()) {
             count
         } else {
             // runtime 初始化路径保证至少 1 个 worker，回退仅用于防御式容错。
@@ -416,10 +320,10 @@ impl RuntimeSharedBase {
     /// 析构责任的自定义任务则由这里按 vtable 回收。
     pub(crate) fn abandon_owned_backlog(&self, worker_id: usize) {
         self.drain_local_wake_mailbox(worker_id);
-        let worker = &self.registry.workers[worker_id];
+        let worker = self.registry.worker(worker_id);
         let mut failed = false;
 
-        if let Some(header) = worker.lifo.swap(None, Ordering::AcqRel) {
+        if let Some(header) = worker.lifo().swap(None, Ordering::AcqRel) {
             failed |= Self::abandon_queued_task_and_drop(&unsafe {
                 SendTaskRef::from_header(header.as_ptr())
             });
@@ -427,16 +331,16 @@ impl RuntimeSharedBase {
         while let Ok(Some(task)) = self.tls.try_with(|ctx| ctx.worker.pop()) {
             failed |= Self::abandon_queued_task_and_drop(&task);
         }
-        while let Some(task) = worker.pinned_queue.pop() {
-            worker.pinned_count.fetch_sub(1, Ordering::Release);
+        while let Some(task) = worker.pinned_queue().pop() {
+            worker.pinned_count().fetch_sub(1, Ordering::Release);
             failed |= Self::abandon_queued_task_and_drop(&task);
         }
-        while let Some(task) = worker.local_queue.pop() {
-            worker.local_count.fetch_sub(1, Ordering::Release);
+        while let Some(task) = worker.local_queue().pop() {
+            worker.local_count().fetch_sub(1, Ordering::Release);
             failed |= Self::abandon_queued_task_and_drop(&task);
         }
-        while let Some(task) = worker.remote_queue.pop() {
-            worker.remote_count.fetch_sub(1, Ordering::Release);
+        while let Some(task) = worker.remote_queue().pop() {
+            worker.remote_count().fetch_sub(1, Ordering::Release);
             failed |= Self::abandon_queued_task_and_drop(&task);
         }
         // shutdown 期间 foreign wake 仍可能在第一次 drain 后到达；再次 drain 后，
@@ -509,10 +413,10 @@ impl RuntimeSharedBase {
                 rejected = true;
                 false
             } else if task.header().try_mark_queued() {
-                let worker = &self.registry.workers[worker_id];
-                worker.local_count.fetch_add(1, Ordering::Release);
-                if let Err(task) = worker.local_queue.push(task) {
-                    worker.local_count.fetch_sub(1, Ordering::Release);
+                let worker = self.registry.worker(worker_id);
+                worker.local_count().fetch_add(1, Ordering::Release);
+                if let Err(task) = worker.local_queue().push(task) {
+                    worker.local_count().fetch_sub(1, Ordering::Release);
                     queue_rejected = Some((
                         task,
                         EnqueueError::LocalQueueFull {
@@ -598,10 +502,10 @@ impl RuntimeSharedBase {
                 rejected = true;
                 EnqueuePinnedOutcome::AbortedAcknowledged
             } else if header.try_mark_queued() {
-                let worker = &self.registry.workers[worker_id];
-                worker.pinned_count.fetch_add(1, Ordering::Release);
-                if let Err(task) = worker.pinned_queue.push(task) {
-                    worker.pinned_count.fetch_sub(1, Ordering::Release);
+                let worker = self.registry.worker(worker_id);
+                worker.pinned_count().fetch_add(1, Ordering::Release);
+                if let Err(task) = worker.pinned_queue().push(task) {
+                    worker.pinned_count().fetch_sub(1, Ordering::Release);
                     let reason = EnqueueError::PinnedQueueFull {
                         worker_id,
                         capacity: worker.pinned_capacity(),
@@ -632,7 +536,7 @@ impl RuntimeSharedBase {
         }
         if outcome == EnqueuePinnedOutcome::Enqueued {
             // 序列号只能在任务**已经可见之后**递增，见 `EventCount::notify`。
-            self.idle.event_count.notify();
+            self.idle.event_count().notify();
             if self.wake_worker(worker_id).is_err() {
                 // 任务已可见；唤醒失败由共享 fatal 通道终止 runtime。
             }
@@ -660,28 +564,30 @@ impl RuntimeSharedBase {
     }
 
     pub(crate) fn fn_pop_send(&self, worker_id: usize) -> Option<SendTaskRef> {
-        let worker = &self.registry.workers[worker_id];
-        if let Some(header) = worker.lifo.swap(None, Ordering::AcqRel) {
+        let worker = self.registry.worker(worker_id);
+        if let Some(header) = worker.lifo().swap(None, Ordering::AcqRel) {
             return Some(unsafe { SendTaskRef::from_header(header.as_ptr()) });
         }
         self.tls.with(|ctx| ctx.worker.pop())
     }
 
     pub(crate) fn fn_pop_pinned(&self, worker_id: usize) -> Option<SendTaskRef> {
-        let res = self.registry.workers[worker_id].pinned_queue.pop();
+        let res = self.registry.worker(worker_id).pinned_queue().pop();
         if res.is_some() {
-            self.registry.workers[worker_id]
-                .pinned_count
+            self.registry
+                .worker(worker_id)
+                .pinned_count()
                 .fetch_sub(1, Ordering::Release);
         }
         res
     }
 
     pub(crate) fn fn_pop_local(&self, worker_id: usize) -> Option<LocalTaskRef> {
-        let res = self.registry.workers[worker_id].local_queue.pop();
+        let res = self.registry.worker(worker_id).local_queue().pop();
         if res.is_some() {
-            self.registry.workers[worker_id]
-                .local_count
+            self.registry
+                .worker(worker_id)
+                .local_count()
                 .fetch_sub(1, Ordering::Release);
         }
         res
@@ -693,8 +599,13 @@ impl RuntimeSharedBase {
 
     fn steal_send(&self, thief_id: usize, rand: &FastRand) -> Option<SendTaskRef> {
         self.tls.with(|ctx| {
-            self.scheduler
-                .steal_send(thief_id, &self.registry, &self.topo, rand, &ctx.worker)
+            self.scheduler.steal_send(StealSendParams {
+                thief_id,
+                registry: &self.registry,
+                topo: &self.topo,
+                rand,
+                thief_worker: &ctx.worker,
+            })
         })
     }
 
@@ -757,7 +668,7 @@ impl RuntimeSharedBase {
     ) {
         self.scheduler.push_global(task);
         drop(publication_gate);
-        self.idle.event_count.notify();
+        self.idle.event_count().notify();
         let _ = self
             .idle
             .wake_for_global_work(target_group, &self.topo, &self.registry);
@@ -783,12 +694,12 @@ impl RuntimeSharedBase {
                 rejected = true;
                 None
             } else if task.header().try_mark_queued() {
-                let worker = &self.registry.workers[worker_id];
+                let worker = self.registry.worker(worker_id);
                 // 计数必须先于发布队列元素，避免 worker 先弹出任务再对零计数执行减法。
-                worker.remote_count.fetch_add(1, Ordering::Release);
-                if let Err(task) = worker.remote_queue.push(task) {
-                    worker.remote_count.fetch_sub(1, Ordering::Release);
-                    let target_group = self.topo.worker_to_group[worker_id];
+                worker.remote_count().fetch_add(1, Ordering::Release);
+                if let Err(task) = worker.remote_queue().push(task) {
+                    worker.remote_count().fetch_sub(1, Ordering::Release);
+                    let target_group = self.topo.worker_to_group()[worker_id];
                     self.publish_global(task, target_group, publication_gate);
                     return;
                 } else {
@@ -807,7 +718,7 @@ impl RuntimeSharedBase {
             return;
         }
         if let Some(()) = destination {
-            self.idle.event_count.notify();
+            self.idle.event_count().notify();
             if self.wake_worker(worker_id).is_err() {
                 // 任务已可见；唤醒失败由共享 fatal 通道终止 runtime。
             }
@@ -866,9 +777,10 @@ impl RuntimeSharedBase {
             return Ok(true);
         }
 
-        if let Some(task) = self.registry.workers[worker_id].remote_queue.pop() {
-            self.registry.workers[worker_id]
-                .remote_count
+        if let Some(task) = self.registry.worker(worker_id).remote_queue().pop() {
+            self.registry
+                .worker(worker_id)
+                .remote_count()
                 .fetch_sub(1, Ordering::Release);
             self.poll_send_task(worker_id, task)?;
             return Ok(true);
@@ -886,225 +798,42 @@ impl RuntimeSharedBase {
     }
 }
 
-impl<T> RuntimeShared<T> {
-    pub fn worker_id(&self) -> usize {
-        self.base
-            .tls
-            .try_with(|ctx| ctx.worker_id)
-            .unwrap_or(usize::MAX)
-    }
-
-    pub fn unparkers(&self) -> &[Unparker] {
-        self.base.unparkers()
-    }
-
-    pub(crate) fn choose_worker(&self) -> usize {
-        let current = self
-            .base
-            .tls
-            .try_with(|ctx| ctx.worker_id)
-            .unwrap_or(usize::MAX);
-        self.base
-            .topo
-            .choose_worker_with_current(&self.base.scheduler.next_worker, current)
-    }
-
-    #[inline]
-    pub fn worker_count(&self) -> NonZeroUsize {
-        self.base.worker_count()
-    }
-
-    #[inline]
-    pub fn validate_worker_id(&self, worker_id: usize) -> Result<()> {
-        self.base.validate_worker_id(worker_id)
-    }
-
-    pub(crate) fn enqueue_local(&self, worker_id: usize, task: LocalTaskRef) -> Result<()> {
-        self.base.enqueue_local(worker_id, task)
-    }
-
-    pub(crate) fn has_work(&self, worker_id: usize) -> bool {
-        let worker = &self.base.registry.workers[worker_id];
-        let local_wake_has_work = !self.base.local_wake_target(worker_id).is_empty();
-        let local_has_work = worker.local_count.load(Ordering::Acquire) > 0;
-        worker.lifo.load(Ordering::Acquire).is_some()
-            || worker.remote_count.load(Ordering::Acquire) > 0
-            || !worker.stealer.is_empty()
-            || local_has_work
-            || local_wake_has_work
-            || worker.pinned_count.load(Ordering::Acquire) > 0
-            || self.base.scheduler.has_global_work()
-    }
-
-    pub fn global_queue_backlog(&self) -> usize {
-        self.base.global_queue_backlog()
-    }
-
-    pub fn enqueue_pinned(&self, worker_id: usize, task: SendTaskRef) -> EnqueuePinnedOutcome {
-        self.base.enqueue_pinned(worker_id, task)
-    }
-
-    #[inline]
-    pub(crate) fn wake_worker(&self, worker_id: usize) -> Result<()> {
-        self.base.wake_worker(worker_id)
-    }
-
-    pub(crate) fn enqueue_send(&self, worker_id: usize, task: SendTaskRef) {
-        let current = self
-            .base
-            .tls
-            .try_with(|ctx| ctx.worker_id)
-            .unwrap_or(usize::MAX);
-
-        if current == worker_id {
-            let mut rejected = false;
-            let mut handled = false;
-            let enqueued = {
-                let _gate = self.base.shutdown.lock_publication();
-                if self.base.validate_worker_id(worker_id).is_err() {
-                    false
-                } else if task.header().is_result_ready() {
-                    handled = true;
-                    false
-                } else if !self.base.shutdown.is_running() {
-                    rejected = true;
-                    handled = true;
-                    false
-                } else if task.header().try_mark_queued() {
-                    handled = true;
-                    let worker = &self.base.registry.workers[worker_id];
-                    let header_ptr = task.header() as *const _ as *mut _;
-                    if worker
-                        .lifo
-                        .compare_exchange(
-                            None,
-                            NonNull::new(header_ptr),
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_err()
-                    {
-                        self.base.tls.with(|ctx| {
-                            ctx.worker.push(task);
-                        });
-                    }
-                    true
-                } else {
-                    false
-                }
-            };
-            if rejected {
-                task.header().abandon_before_enqueue();
-            }
-            if enqueued {
-                // 任务已进入 lifo 槽或本地 deque，此刻才可以 bump 序列号。
-                self.base.idle.event_count.notify();
-                if self.wake_worker(worker_id).is_err() {
-                    // 任务已可见；唤醒失败由共享 fatal 通道终止 runtime。
-                }
-                return;
-            }
-            if handled {
-                return;
-            }
-        }
-
-        self.base.enqueue_send(worker_id, task);
-    }
-
-    pub(crate) fn shutdown(&self) {
-        self.base.shutdown();
-    }
-
-    /// 阻塞直到 `completion` 的全部子任务真正结束。
-    ///
-    /// 这是结构化并发的最后一道保证：作用域析构时不能带着仍在运行的子任务返回，否则子
-    /// 任务持有的 `'env` 借用会悬垂。因此这里**没有**提前退出的出口 —— 与
-    /// `thread::scope` 在 `Drop` 里阻塞 join 同理，宁可挂住也不能放行。
-    ///
-    /// 正常情况下复用统一的调度循环（含 work stealing 与 idle/park 协调）；运行时正在关停
-    /// 时循环会立刻返回，退化为「排空自己的队列 + 阻塞等待任务或 completion 唤醒」，而
-    /// 关停路径上每个 worker 退出前都会放弃自己队列里的积压任务并结算义务，因此仍能收敛。
-    pub(crate) fn join_scope<S: ScopeStorage, O: Ownership + 'static>(
-        &self,
-        completion: &O::Shared<GenericScopeCompletion<S, O>>,
-    ) -> Result<()> {
-        if self.base.tls.try_with(|ctx| ctx.worker_id).is_err() {
-            // 非 worker 线程上无法驱动调度器，只能等别的 worker 把子任务跑完。
-            let mut waiter = ScopeBlockingWaiter::new(&**completion, Unparker::new());
-            while !completion.is_done() {
-                waiter.arm();
-                if completion.is_done() {
-                    break;
-                }
-                waiter.park(usize::MAX)?;
-            }
-            return self.base.fatal_error().map_or(Ok(()), Err);
-        }
-
-        let worker_id = self.base.tls.with(|ctx| ctx.worker_id);
-        let mut waiter =
-            ScopeBlockingWaiter::new(&**completion, self.base.unparker(worker_id).clone());
-        let mut first_error = None;
-        while !completion.is_done() {
-            if !self.base.shutdown.is_shutdown() {
-                let mut controller = ScopeJoinController::new(&**completion);
-                if let Err(err) = run_worker_loop(self, &mut controller) {
-                    if first_error.is_none() {
-                        first_error = Some(err);
-                    }
-                    self.base.shutdown();
-                }
-            } else {
-                self.base.complete_shutdown(worker_id);
-                while !completion.is_done() {
-                    waiter.arm();
-                    if completion.is_done() {
-                        break;
-                    }
-                    waiter.park(worker_id)?;
-                }
-            }
-        }
-
-        first_error
-            .or_else(|| self.base.fatal_error())
-            .map_or(Ok(()), Err)
-    }
-
-    /// worker 线程的调度循环入口：一直跑到运行时关停。
-    pub(crate) fn run_worker(&self) -> Result<()> {
-        run_worker_loop(self, &mut ShutdownController)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        RuntimeShared, RuntimeSharedConfig, infra::TopologyContext, runtime::RuntimeComponents,
+    };
+    use crate::{
+        error::{RuntimeError, RuntimeWakeError},
+        runtime::RuntimeWaker,
+        runtime::primitives::ShutdownPhase,
+        scope::GenericScopeCompletion,
+        task::{GenericTaskHeader, ScopeRef, SendTaskRef, TaskHandleRef, TaskVTable},
+        utils::ArcOwnership,
+    };
+    use veloq_std::{
+        num::NonZeroUsize,
+        ptr::NonNull,
+        result::Result as StdResult,
+        sync::{
+            NativeArc as Arc,
+            atomic::{NativeAtomicUsize as AtomicUsize, Ordering},
+        },
+        vec::Vec,
+    };
+    use veloq_storage::AtomicStorage;
+
     #[cfg(feature = "std")]
     use crate::task::GenericWakerNode;
-    use crate::{error::RuntimeWakeError, runtime::primitives::RuntimeWaker};
-    use crate::{
-        scope::GenericScopeCompletion,
-        task::{ScopeRef, TaskVTable},
-        utils::ownership::ArcOwnership,
-    };
     #[cfg(feature = "std")]
     use veloq_intrusive_linklist::Link;
     #[cfg(feature = "std")]
     use veloq_std::{
         marker::{PhantomData, PhantomPinned},
         pin::Pin,
-        task::{RawWaker, Waker},
+        ptr::null,
+        task::{RawWaker, RawWakerVTable, Waker},
     };
-    use veloq_std::{
-        result::Result as StdResult,
-        sync::{
-            NativeArc as Arc,
-            atomic::{NativeAtomicUsize as AtomicUsize, Ordering},
-        },
-    };
-    use veloq_storage::AtomicStorage;
 
     struct RecordingWaker {
         calls: Arc<[AtomicUsize]>,
@@ -1119,13 +848,12 @@ mod tests {
     }
 
     #[cfg(feature = "std")]
-    static PANIC_WAKER_VTABLE: veloq_std::task::RawWakerVTable =
-        veloq_std::task::RawWakerVTable::new(
-            |_| veloq_std::task::RawWaker::new(veloq_std::ptr::null(), &PANIC_WAKER_VTABLE),
-            |_| panic!("completion waker panic"),
-            |_| {},
-            |_| {},
-        );
+    static PANIC_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |_| RawWaker::new(null(), &PANIC_WAKER_VTABLE),
+        |_| panic!("completion waker panic"),
+        |_| {},
+        |_| {},
+    );
 
     static GLOBAL_DRAIN_DROPS: AtomicUsize = AtomicUsize::new(0);
 
@@ -1148,19 +876,33 @@ mod tests {
     fn test_shared() -> RuntimeShared<()> {
         let worker_count = NonZeroUsize::new(1).expect("one worker");
         let queue_capacity = NonZeroUsize::new(1).expect("one queue slot");
-        let (registry, topo, _) = init_runtime_components(worker_count, queue_capacity);
-        RuntimeShared::new(registry, topo, worker_count, None, None, None)
+        let RuntimeComponents {
+            registry,
+            topology: topo,
+            ..
+        } = RuntimeShared::<()>::initialize_components(worker_count, queue_capacity, None);
+        RuntimeShared::new(RuntimeSharedConfig {
+            registry,
+            topology: topo,
+            worker_count,
+            idle_hook: None,
+            park_hook: None,
+            worker_tick_hook: None,
+        })
     }
 
     #[test]
     fn worker_abort_is_recorded_as_fatal_runtime_error() {
         let shared = test_shared();
 
-        shared.base.record_thread_abort(0);
+        shared.base().record_thread_abort(0);
 
-        assert_eq!(shared.base.shutdown.phase(), ShutdownPhase::StopRequested);
+        assert_eq!(
+            shared.base().shutdown_coordinator().phase(),
+            ShutdownPhase::StopRequested
+        );
         let report = shared
-            .base
+            .base()
             .fatal_error()
             .expect("worker abort must be observable");
         assert!(matches!(
@@ -1178,21 +920,21 @@ mod tests {
 
         let scope = ScopeRef::from_shared::<ArcOwnership>(&completion);
         let header = GenericTaskHeader::new_placeholder(&DROP_AFTER_POLL_VTABLE);
-        unsafe { header.initialize(&shared.base, 0, scope) };
+        unsafe { header.initialize(shared.base(), 0, scope) };
         header.claim_scope_obligation();
         assert!(header.try_mark_queued());
 
         let task = unsafe { SendTaskRef::from_header(&header) };
-        shared.base.scheduler.push_global(task);
-        assert_eq!(shared.base.global_queue_backlog(), 1);
-        shared.base.complete_shutdown(0);
-        shared.base.complete_shutdown(0);
+        shared.base().scheduler().push_global(task);
+        assert_eq!(shared.base().global_queue_backlog(), 1);
+        shared.base().complete_shutdown(0);
+        shared.base().complete_shutdown(0);
 
         assert!(header.is_result_ready());
         assert!(header.is_reclaimable());
         assert!(completion.is_done());
         assert_eq!(GLOBAL_DRAIN_DROPS.load(Ordering::Acquire), 1);
-        assert_eq!(shared.base.global_queue_backlog(), 0);
+        assert_eq!(shared.base().global_queue_backlog(), 0);
     }
 
     #[test]
@@ -1204,10 +946,9 @@ mod tests {
 
         let scope = ScopeRef::from_shared::<ArcOwnership>(&completion);
         let header = GenericTaskHeader::new_placeholder(&DROP_AFTER_POLL_VTABLE);
-        unsafe { header.initialize(&shared.base, 0, scope) };
+        unsafe { header.initialize(shared.base(), 0, scope) };
         header.claim_scope_obligation();
-        let panic_waker =
-            unsafe { Waker::from_raw(RawWaker::new(veloq_std::ptr::null(), &PANIC_WAKER_VTABLE)) };
+        let panic_waker = unsafe { Waker::from_raw(RawWaker::new(null(), &PANIC_WAKER_VTABLE)) };
         let mut node = GenericWakerNode {
             waker: panic_waker.clone(),
             link: Link::new(),
@@ -1219,30 +960,38 @@ mod tests {
         assert!(header.try_mark_queued());
 
         let task = unsafe { SendTaskRef::from_header(&header) };
-        shared.base.scheduler.push_global(task);
-        assert_eq!(shared.base.global_queue_backlog(), 1);
-        shared.base.complete_shutdown(0);
+        shared.base().scheduler().push_global(task);
+        assert_eq!(shared.base().global_queue_backlog(), 1);
+        shared.base().complete_shutdown(0);
 
         assert!(header.is_reclaimable());
         assert!(completion.is_done());
         assert!(header.waker_panicked());
-        assert!(shared.base.fatal_error().is_some());
-        assert_eq!(shared.base.global_queue_backlog(), 0);
+        assert!(shared.base().fatal_error().is_some());
+        assert_eq!(shared.base().global_queue_backlog(), 0);
     }
 
     #[test]
     fn global_publication_wakes_idle_worker_from_other_group() {
         let worker_count = NonZeroUsize::new(4).expect("workers");
         let queue_capacity = NonZeroUsize::new(1).expect("queue capacity");
-        let (registry, _, _) = init_runtime_components(worker_count, queue_capacity);
-        let topo = infra::TopologyContext::from_worker_to_group(&[0, 0, 1, 1]);
-        let shared = RuntimeShared::<()>::new(registry, topo, worker_count, None, None, None);
+        let RuntimeComponents { registry, .. } =
+            RuntimeShared::<()>::initialize_components(worker_count, queue_capacity, None);
+        let topo = TopologyContext::from_worker_to_group(&[0, 0, 1, 1]);
+        let shared = RuntimeShared::<()>::new(RuntimeSharedConfig {
+            registry,
+            topology: topo,
+            worker_count,
+            idle_hook: None,
+            park_hook: None,
+            worker_tick_hook: None,
+        });
 
         let calls: Arc<[AtomicUsize]> = (0..worker_count.get())
             .map(|_| AtomicUsize::new(0))
             .collect::<Vec<_>>()
             .into();
-        shared.base.registry.unparkers[2]
+        shared.base().registry().unparkers()[2]
             .bind(unsafe {
                 Arc::new_unsized(
                     RecordingWaker {
@@ -1253,27 +1002,30 @@ mod tests {
                 )
             })
             .expect("recording waker must bind once");
-        shared.base.idle.enter_idle(2, &shared.base.topo);
+        shared
+            .base()
+            .idle_controller()
+            .enter_idle(2, shared.base().topology());
 
         let header_in_queue = GenericTaskHeader::new_placeholder(&DROP_AFTER_POLL_VTABLE);
         unsafe {
-            header_in_queue.initialize(&shared.base, 0, ScopeRef::dummy());
+            header_in_queue.initialize(shared.base(), 0, ScopeRef::dummy());
         }
         assert!(header_in_queue.try_mark_queued());
         let queued_task = unsafe { SendTaskRef::from_header(&header_in_queue) };
-        let worker = &shared.base.registry.workers[0];
-        worker.remote_count.fetch_add(1, Ordering::Release);
-        assert!(worker.remote_queue.push(queued_task).is_ok());
+        let worker = shared.base().registry().worker(0);
+        worker.remote_count().fetch_add(1, Ordering::Release);
+        assert!(worker.remote_queue().push(queued_task).is_ok());
 
         let global_header = GenericTaskHeader::new_placeholder(&DROP_AFTER_POLL_VTABLE);
         unsafe {
-            global_header.initialize(&shared.base, 0, ScopeRef::dummy());
+            global_header.initialize(shared.base(), 0, ScopeRef::dummy());
         }
         let global_task = unsafe { SendTaskRef::from_header(&global_header) };
 
-        shared.base.enqueue_send(0, global_task);
+        shared.base().enqueue_send(0, global_task);
 
-        assert_eq!(shared.base.global_queue_backlog(), 1);
+        assert_eq!(shared.base().global_queue_backlog(), 1);
         assert_eq!(calls[2].load(Ordering::Relaxed), 1);
         assert_eq!(
             calls
@@ -1283,17 +1035,17 @@ mod tests {
             1
         );
 
-        let queued_task = worker.remote_queue.pop().expect("queued task");
-        worker.remote_count.fetch_sub(1, Ordering::Release);
+        let queued_task = worker.remote_queue().pop().expect("queued task");
+        worker.remote_count().fetch_sub(1, Ordering::Release);
         shared
-            .base
+            .base()
             .poll_send_task(0, queued_task)
             .expect("remote task");
-        let global_task = shared.base.pop_global().expect("global task");
+        let global_task = shared.base().pop_global().expect("global task");
         shared
-            .base
+            .base()
             .poll_send_task(2, global_task)
             .expect("global task");
-        assert_eq!(shared.base.global_queue_backlog(), 0);
+        assert_eq!(shared.base().global_queue_backlog(), 0);
     }
 }

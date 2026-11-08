@@ -1,13 +1,14 @@
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_queue::ArrayQueue;
-use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
-use veloq_std::vec;
 use veloq_std::{
     boxed::Box,
+    panic::{AssertUnwindSafe, catch_unwind},
     result::Result as StdResult,
-    sync::NativeArc as Arc,
-    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    thread,
+    sync::{
+        NativeArc as Arc,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
+    thread, vec,
     vec::Vec,
 };
 use veloq_storage::{AtomicOptionPtr, StateOptionPtr};
@@ -16,10 +17,7 @@ use crate::{
     error::{Result, RuntimeWakeError},
     runtime::{
         context::{IdleDecision, IdleWaitStrategy},
-        primitives::{
-            EventCount, ShutdownCoordinator, Unparker, WaitError, WakeFailureState,
-            wait_error_to_runtime,
-        },
+        primitives::{EventCount, ShutdownCoordinator, Unparker, WaitError, WakeFailureState},
         shared::{RuntimeShared, worker_loop::LoopController},
     },
     task::{LocalTaskRef, SendTaskRef, TaskHeader},
@@ -27,18 +25,18 @@ use crate::{
 };
 
 pub(crate) struct WorkerQueue {
-    pub(crate) remote_queue: ArrayQueue<SendTaskRef>,
-    pub(crate) pinned_queue: ArrayQueue<SendTaskRef>,
-    pub(crate) local_queue: ArrayQueue<LocalTaskRef>,
+    remote_queue: ArrayQueue<SendTaskRef>,
+    pinned_queue: ArrayQueue<SendTaskRef>,
+    local_queue: ArrayQueue<LocalTaskRef>,
     local_capacity: usize,
-    pub(crate) remote_count: AtomicUsize,
-    pub(crate) pinned_count: AtomicUsize,
-    pub(crate) local_count: AtomicUsize,
+    remote_count: AtomicUsize,
+    pinned_count: AtomicUsize,
+    local_count: AtomicUsize,
     pinned_capacity: usize,
     /// LIFO slot for high-priority task (cache locality)
-    pub(crate) lifo: AtomicOptionPtr<TaskHeader>,
+    lifo: AtomicOptionPtr<TaskHeader>,
     /// Stealer for work-stealing
-    pub(crate) stealer: Stealer<SendTaskRef>,
+    stealer: Stealer<SendTaskRef>,
 }
 
 impl WorkerQueue {
@@ -72,10 +70,53 @@ impl WorkerQueue {
     pub(crate) fn pinned_capacity(&self) -> usize {
         self.pinned_capacity
     }
+
+    pub(crate) fn remote_queue(&self) -> &ArrayQueue<SendTaskRef> {
+        &self.remote_queue
+    }
+
+    pub(crate) fn pinned_queue(&self) -> &ArrayQueue<SendTaskRef> {
+        &self.pinned_queue
+    }
+
+    pub(crate) fn local_queue(&self) -> &ArrayQueue<LocalTaskRef> {
+        &self.local_queue
+    }
+
+    pub(crate) fn remote_count(&self) -> &AtomicUsize {
+        &self.remote_count
+    }
+
+    pub(crate) fn pinned_count(&self) -> &AtomicUsize {
+        &self.pinned_count
+    }
+
+    pub(crate) fn local_count(&self) -> &AtomicUsize {
+        &self.local_count
+    }
+
+    pub(crate) fn lifo(&self) -> &AtomicOptionPtr<TaskHeader> {
+        &self.lifo
+    }
+
+    pub(crate) fn stealer(&self) -> &Stealer<SendTaskRef> {
+        &self.stealer
+    }
 }
 
 unsafe impl Send for WorkerQueue {}
+
 unsafe impl Sync for WorkerQueue {}
+
+/// NUMA 组内的 idle worker 栈：Treiber 栈，节点就是 worker 自身。
+pub(crate) struct IdleStack {
+    /// 高 32 位是**单调递增**的 generation（防 ABA），低 32 位是栈顶 worker id。
+    head: AtomicU64,
+}
+
+pub(crate) struct AtomicBitset {
+    bits: Box<[AtomicU64]>,
+}
 
 pub(crate) struct NUMAGroup {
     pub(crate) worker_ids: Vec<usize>,
@@ -116,12 +157,6 @@ impl IdleSlots {
     fn mark_removed(&self, worker_id: usize) {
         self.in_stack.clear(worker_id);
     }
-}
-
-/// NUMA 组内的 idle worker 栈：Treiber 栈，节点就是 worker 自身。
-pub(crate) struct IdleStack {
-    /// 高 32 位是**单调递增**的 generation（防 ABA），低 32 位是栈顶 worker id。
-    head: AtomicU64,
 }
 
 impl IdleStack {
@@ -259,10 +294,6 @@ impl IdleStack {
     }
 }
 
-pub(crate) struct AtomicBitset {
-    bits: Box<[AtomicU64]>,
-}
-
 impl AtomicBitset {
     pub(crate) fn new(size: usize) -> Self {
         let num_u64 = size.div_ceil(64);
@@ -297,13 +328,47 @@ impl AtomicBitset {
 }
 
 pub(crate) struct WorkerRegistry {
-    pub(crate) workers: Box<[WorkerQueue]>,
-    pub(crate) unparkers: Box<[Unparker]>,
-    pub(crate) wake_failure: Arc<WakeFailureState>,
-    pub(crate) shutdown: Arc<ShutdownCoordinator>,
+    workers: Box<[WorkerQueue]>,
+    unparkers: Box<[Unparker]>,
+    wake_failure: Arc<WakeFailureState>,
+    shutdown: Arc<ShutdownCoordinator>,
 }
 
 impl WorkerRegistry {
+    pub(crate) fn new(
+        workers: Box<[WorkerQueue]>,
+        unparkers: Box<[Unparker]>,
+        wake_failure: Arc<WakeFailureState>,
+        shutdown: Arc<ShutdownCoordinator>,
+    ) -> Self {
+        Self {
+            workers,
+            unparkers,
+            wake_failure,
+            shutdown,
+        }
+    }
+
+    pub(crate) fn worker(&self, worker_id: usize) -> &WorkerQueue {
+        &self.workers[worker_id]
+    }
+
+    pub(crate) fn workers(&self) -> &[WorkerQueue] {
+        &self.workers
+    }
+
+    pub(crate) fn unparkers(&self) -> &[Unparker] {
+        &self.unparkers
+    }
+
+    pub(crate) fn wake_failure(&self) -> &Arc<WakeFailureState> {
+        &self.wake_failure
+    }
+
+    pub(crate) fn shutdown(&self) -> &Arc<ShutdownCoordinator> {
+        &self.shutdown
+    }
+
     #[inline]
     pub(crate) fn unpark(&self, worker_id: usize) -> StdResult<(), RuntimeWakeError> {
         self.unparkers[worker_id].unpark()
@@ -311,12 +376,28 @@ impl WorkerRegistry {
 }
 
 pub(crate) struct TopologyContext {
-    pub(crate) groups: Vec<NUMAGroup>,
-    pub(crate) worker_to_group: Vec<usize>,
-    pub(crate) group_idle_slots: IdleSlots,
+    groups: Vec<NUMAGroup>,
+    worker_to_group: Vec<usize>,
+    group_idle_slots: IdleSlots,
 }
 
 impl TopologyContext {
+    pub(crate) fn worker_to_group(&self) -> &[usize] {
+        &self.worker_to_group
+    }
+
+    pub(crate) fn from_groups(
+        groups: Vec<NUMAGroup>,
+        worker_to_group: Vec<usize>,
+        worker_count: usize,
+    ) -> Self {
+        Self {
+            groups,
+            worker_to_group,
+            group_idle_slots: IdleSlots::new(worker_count),
+        }
+    }
+
     pub(crate) fn from_worker_to_group(worker_to_group: &[usize]) -> Self {
         let worker_count = worker_to_group.len();
         let group_count = worker_to_group
@@ -431,10 +512,22 @@ impl GlobalInjector {
 
 pub(crate) struct TaskScheduler {
     injector: GlobalInjector,
-    pub(crate) next_worker: AtomicUsize,
+    next_worker: AtomicUsize,
+}
+
+pub(crate) struct StealSendParams<'a> {
+    pub(crate) thief_id: usize,
+    pub(crate) registry: &'a WorkerRegistry,
+    pub(crate) topo: &'a TopologyContext,
+    pub(crate) rand: &'a FastRand,
+    pub(crate) thief_worker: &'a Worker<SendTaskRef>,
 }
 
 impl TaskScheduler {
+    pub(crate) fn next_worker(&self) -> &AtomicUsize {
+        &self.next_worker
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             injector: GlobalInjector::new(),
@@ -466,14 +559,14 @@ impl TaskScheduler {
         self.injector.is_empty()
     }
 
-    pub(crate) fn steal_send(
-        &self,
-        thief_id: usize,
-        registry: &WorkerRegistry,
-        topo: &TopologyContext,
-        rand: &FastRand,
-        thief_worker: &Worker<SendTaskRef>,
-    ) -> Option<SendTaskRef> {
+    pub(crate) fn steal_send(&self, params: StealSendParams<'_>) -> Option<SendTaskRef> {
+        let StealSendParams {
+            thief_id,
+            registry,
+            topo,
+            rand,
+            thief_worker,
+        } = params;
         let num_workers = registry.workers.len();
         if num_workers <= 1 {
             return self.pop_global();
@@ -565,8 +658,8 @@ impl TaskScheduler {
 }
 
 pub(crate) struct IdleController {
-    pub(crate) idle_mask: AtomicBitset,
-    pub(crate) event_count: Arc<EventCount>,
+    idle_mask: AtomicBitset,
+    event_count: Arc<EventCount>,
     global_idle_stack: IdleStack,
     global_idle_slots: IdleSlots,
     global_scan_cursor: AtomicUsize,
@@ -579,6 +672,10 @@ pub(crate) enum WakeResult {
 }
 
 impl IdleController {
+    pub(crate) fn event_count(&self) -> &Arc<EventCount> {
+        &self.event_count
+    }
+
     pub(crate) fn new(worker_count: usize, event_count: Arc<EventCount>) -> Self {
         Self {
             idle_mask: AtomicBitset::new(worker_count),
@@ -672,18 +769,17 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
     }
 
     pub(crate) fn run<C: LoopController>(&self, controller: &C) -> Result<()> {
-        let idle_decision = match self.shared.idle_hook {
+        let idle_decision = match self.shared.idle_hook() {
             Some(h) => h(self.shared)?,
             None => IdleDecision::wait(IdleWaitStrategy::Block),
         };
         let Some(wait_strategy) = idle_decision.into_wait_strategy() else {
-            thread::yield_now().map_err(|error| {
-                wait_error_to_runtime(WaitError::Aborted(error), self.worker_id)
-            })?;
+            thread::yield_now()
+                .map_err(|error| WaitError::Aborted(error).into_runtime_error(self.worker_id))?;
             return Ok(());
         };
 
-        let base = &self.shared.base;
+        let base = self.shared.base();
         let seq = base.idle.event_count.load();
         base.idle.enter_idle(self.worker_id, &base.topo);
 
@@ -704,7 +800,7 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
     }
 
     fn should_retry<C: LoopController>(&self, seq: usize, controller: &C) -> bool {
-        let base = &self.shared.base;
+        let base = self.shared.base();
         base.idle.event_count.load() != seq
             || self.shared.has_work(self.worker_id)
             || base.shutdown.is_shutdown()
@@ -718,17 +814,17 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
     /// [`Unparker`] 自带一个 futex / `WaitOnAddress` 信号，缺省时就阻塞在它上面 ——
     /// 而 `wake_worker` 一律走同一个 `Unparker`，唤醒路径无需分叉。
     fn park(&self, wait_strategy: IdleWaitStrategy) -> Result<()> {
-        if let Some(park_hook) = self.shared.park_hook {
+        if let Some(park_hook) = self.shared.park_hook() {
             park_hook(self.shared, wait_strategy)?;
             return Ok(());
         }
 
-        let unparker = self.shared.base.unparker(self.worker_id);
+        let unparker = self.shared.base().unparker(self.worker_id);
         match wait_strategy {
             IdleWaitStrategy::Block => unparker.park(),
             IdleWaitStrategy::Timeout(timeout) => unparker.park_timeout(timeout).map(|_| ()),
         }
-        .map_err(|error| wait_error_to_runtime(error, self.worker_id))
+        .map_err(|error| error.into_runtime_error(self.worker_id))
     }
 
     /// 离开 idle 状态。
@@ -737,23 +833,40 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
     /// 摘不掉时条目会作为陈旧条目留在栈里，由 `pop_idle` 惰性丢弃 —— `IdleSlots` 的
     /// `in_stack` 位保证它不会被重复入栈。
     fn leave_idle(&self) {
-        let base = &self.shared.base;
+        let base = self.shared.base();
         base.idle.leave_idle(self.worker_id, &base.topo);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use veloq_std::sync::{
-        NativeArc as Arc,
-        atomic::{NativeAtomicUsize as AtomicUsize, Ordering},
+    use super::{
+        AtomicBitset, EventCount, IdleController, IdleSlots, IdleStack, RuntimeShared,
+        TopologyContext, WakeResult, WorkerRegistry,
     };
-    use veloq_std::vec::Vec;
+    use crate::{error::RuntimeWakeError, runtime::RuntimeWaker};
+    use veloq_std::{
+        num::NonZeroUsize,
+        result::Result as StdResult,
+        sync::{
+            NativeArc as Arc,
+            atomic::{NativeAtomicUsize as AtomicUsize, Ordering},
+        },
+        vec::Vec,
+    };
 
-    use super::{AtomicBitset, EventCount, IdleController, IdleSlots, IdleStack, WakeResult};
-    use crate::runtime::shared::init_runtime_components;
-    use crate::{error::RuntimeWakeError, runtime::primitives::RuntimeWaker};
-    use veloq_std::result::Result as StdResult;
+    struct WakeFixture {
+        idle: IdleController,
+        topo: TopologyContext,
+        registry: WorkerRegistry,
+        calls: Arc<[AtomicUsize]>,
+    }
+
+    struct IdleFixture {
+        stack: IdleStack,
+        slots: IdleSlots,
+        mask: AtomicBitset,
+    }
 
     struct RecordingWaker {
         worker_id: usize,
@@ -767,21 +880,18 @@ mod tests {
         }
     }
 
-    fn wake_fixture() -> (
-        IdleController,
-        super::TopologyContext,
-        super::WorkerRegistry,
-        Arc<[AtomicUsize]>,
-    ) {
+    fn wake_fixture() -> WakeFixture {
         let worker_count = 4;
-        let worker_count_nz = veloq_std::num::NonZeroUsize::new(worker_count).expect("workers");
-        let queue_capacity = veloq_std::num::NonZeroUsize::new(1).expect("queue capacity");
-        let (registry, _, _) = init_runtime_components(worker_count_nz, queue_capacity);
+        let worker_count_nz = NonZeroUsize::new(worker_count).expect("workers");
+        let queue_capacity = NonZeroUsize::new(1).expect("queue capacity");
+        let components =
+            RuntimeShared::<()>::initialize_components(worker_count_nz, queue_capacity, None);
+        let registry = components.registry;
         let calls: Arc<[AtomicUsize]> = (0..worker_count)
             .map(|_| AtomicUsize::new(0))
             .collect::<Vec<_>>()
             .into();
-        for (worker_id, unparker) in registry.unparkers.iter().enumerate() {
+        for (worker_id, unparker) in registry.unparkers().iter().enumerate() {
             unparker
                 .bind(unsafe {
                     Arc::new_unsized(
@@ -794,22 +904,27 @@ mod tests {
                 })
                 .expect("recording waker must bind once");
         }
-        let topo = super::TopologyContext::from_worker_to_group(&[0, 0, 1, 1]);
+        let topo = TopologyContext::from_worker_to_group(&[0, 0, 1, 1]);
         let idle = IdleController::new(worker_count, Arc::new(EventCount::new()));
-        (idle, topo, registry, calls)
+        WakeFixture {
+            idle,
+            topo,
+            registry,
+            calls,
+        }
     }
 
-    fn fixture(worker_count: usize) -> (IdleStack, IdleSlots, AtomicBitset) {
-        (
-            IdleStack::new(),
-            IdleSlots::new(worker_count),
-            AtomicBitset::new(worker_count),
-        )
+    fn fixture(worker_count: usize) -> IdleFixture {
+        IdleFixture {
+            stack: IdleStack::new(),
+            slots: IdleSlots::new(worker_count),
+            mask: AtomicBitset::new(worker_count),
+        }
     }
 
     #[test]
     fn idle_stack_pops_in_lifo_order() {
-        let (stack, slots, mask) = fixture(3);
+        let IdleFixture { stack, slots, mask } = fixture(3);
         for id in 0..3 {
             assert!(mask.try_set(id));
             stack.push(id, &slots);
@@ -823,7 +938,7 @@ mod tests {
 
     #[test]
     fn idle_stack_pop_idle_skips_stale_entries() {
-        let (stack, slots, mask) = fixture(3);
+        let IdleFixture { stack, slots, mask } = fixture(3);
         for id in 0..3 {
             assert!(mask.try_set(id));
             stack.push(id, &slots);
@@ -838,7 +953,7 @@ mod tests {
 
     #[test]
     fn idle_stack_try_pop_self_only_removes_top() {
-        let (stack, slots, mask) = fixture(2);
+        let IdleFixture { stack, slots, mask } = fixture(2);
         assert!(mask.try_set(0));
         stack.push(0, &slots);
         assert!(mask.try_set(1));
@@ -854,7 +969,7 @@ mod tests {
     /// 回归用例：验证陈旧条目 + 重复入栈不会把链表变成环，避免 `pop_idle` 陷入死循环。
     #[test]
     fn idle_stack_stale_entry_never_forms_cycle() {
-        let (stack, slots, mask) = fixture(2);
+        let IdleFixture { stack, slots, mask } = fixture(2);
 
         // 1) worker 0 进入 idle。
         assert!(mask.try_set(0));
@@ -880,7 +995,7 @@ mod tests {
     fn idle_stack_generation_never_resets_on_empty() {
         use veloq_std::sync::atomic::Ordering;
 
-        let (stack, slots, _mask) = fixture(1);
+        let IdleFixture { stack, slots, .. } = fixture(1);
         stack.push(0, &slots);
         assert_eq!(stack.pop(&slots), Some(0));
 
@@ -894,7 +1009,7 @@ mod tests {
 
     #[test]
     fn idle_stack_push_is_idempotent_while_entry_is_linked() {
-        let (stack, slots, mask) = fixture(1);
+        let IdleFixture { stack, slots, mask } = fixture(1);
         assert!(mask.try_set(0));
         stack.push(0, &slots);
         stack.push(0, &slots);
@@ -905,7 +1020,7 @@ mod tests {
 
     #[test]
     fn idle_worker_has_independent_group_and_global_membership() {
-        let (idle, topo, _registry, _calls) = wake_fixture();
+        let WakeFixture { idle, topo, .. } = wake_fixture();
         idle.enter_idle(0, &topo);
 
         assert_eq!(
@@ -924,7 +1039,12 @@ mod tests {
 
     #[test]
     fn global_wake_prefers_target_group() {
-        let (idle, topo, registry, calls) = wake_fixture();
+        let WakeFixture {
+            idle,
+            topo,
+            registry,
+            calls,
+        } = wake_fixture();
         idle.enter_idle(0, &topo);
         idle.enter_idle(2, &topo);
 
@@ -938,7 +1058,12 @@ mod tests {
 
     #[test]
     fn global_wake_falls_back_to_other_group() {
-        let (idle, topo, registry, calls) = wake_fixture();
+        let WakeFixture {
+            idle,
+            topo,
+            registry,
+            calls,
+        } = wake_fixture();
         idle.enter_idle(2, &topo);
 
         assert_eq!(
@@ -957,7 +1082,12 @@ mod tests {
 
     #[test]
     fn global_wake_cleans_stale_entries_and_terminates() {
-        let (idle, topo, registry, _calls) = wake_fixture();
+        let WakeFixture {
+            idle,
+            topo,
+            registry,
+            ..
+        } = wake_fixture();
         idle.enter_idle(0, &topo);
         idle.enter_idle(1, &topo);
         idle.leave_idle(0, &topo);
@@ -973,7 +1103,12 @@ mod tests {
 
     #[test]
     fn repeated_idle_lifecycle_is_idempotent() {
-        let (idle, topo, registry, calls) = wake_fixture();
+        let WakeFixture {
+            idle,
+            topo,
+            registry,
+            calls,
+        } = wake_fixture();
         idle.enter_idle(0, &topo);
         idle.enter_idle(0, &topo);
         idle.leave_idle(0, &topo);

@@ -20,12 +20,17 @@ use veloq_buf::{BufError, PoolInitContext, PoolTopology};
 use veloq_driver_native::driver::{
     Driver, DriverRaw, DriverStartup, DriverStartupResources, PlatformDriver, RemoteWaker,
 };
-use veloq_runtime::{
-    error::{RuntimeError, RuntimeWakeError},
-    runtime::{self as async_runtime, primitives::RuntimeWaker},
-};
+use veloq_runtime::{self as async_runtime, RuntimeError, RuntimeWakeError, RuntimeWaker};
 
 pub use veloq_runtime::{IntoOutcome, Outcome, join, scope, scope_local, select, task};
+
+pub mod scope {
+    pub use veloq_runtime::{JoinHandle, ScopeProvider};
+}
+
+pub mod task {
+    pub use veloq_runtime::TaskHandleRef;
+}
 
 use crate::{
     config::{BlockingPoolConfig, Config},
@@ -225,15 +230,17 @@ impl<T: PoolTopology> Runtime<T> {
                             E: Error + Send + Sync + 'static,
                         {
                             fn wake(&self) -> Result<(), RuntimeWakeError> {
-                                self.waker.wake().map_err(|err| RuntimeWakeError {
-                                    backend: self.backend,
-                                    worker_id: self.worker_id,
-                                    operation: "remote_waker.wake",
-                                    detail: format!("{err:#}"),
+                                self.waker.wake().map_err(|err| {
+                                    RuntimeWakeError::new(
+                                        self.backend,
+                                        self.worker_id,
+                                        "remote_waker.wake",
+                                        format!("{err:#}"),
+                                    )
                                 })
                             }
                         }
-                        shared.base.unparkers()[worker_id]
+                        shared.base().unparkers()[worker_id]
                             .bind(unsafe {
                                 NativeArc::new_unsized(
                                     DriverWakerWrapper {
@@ -244,11 +251,13 @@ impl<T: PoolTopology> Runtime<T> {
                                     |p| p as *const dyn RuntimeWaker,
                                 )
                             })
-                            .map_err(|source| RuntimeWakeError {
-                                backend: "runtime",
-                                worker_id,
-                                operation: "bind_worker_remote_waker",
-                                detail: format!("{source}"),
+                            .map_err(|source| {
+                                RuntimeWakeError::new(
+                                    "runtime",
+                                    worker_id,
+                                    "bind_worker_remote_waker",
+                                    format!("{source}"),
+                                )
                             })
                             .map_err(|source| RuntimeError::WakeFailed { source })
                             .trans()?;

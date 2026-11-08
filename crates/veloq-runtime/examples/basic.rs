@@ -1,10 +1,5 @@
 use veloq_runtime::{
-    runtime::{Runtime, RuntimeCtx},
-    scope,
-    scope::JoinOutcome,
-    task,
-    task::{TaskError, yield_now},
-    task_local,
+    JoinOutcome, Runtime, RuntimeCtx, TaskError, scope, task, task_local, yield_now,
 };
 use veloq_std::{
     format, println,
@@ -26,6 +21,7 @@ async fn work(ctx: RuntimeCtx<'_, ()>, id: String, steps: u32) -> String {
     }
     format!("Result from {}", id)
 }
+
 fn main() {
     Runtime::scope(async |ctx| {
         println!("--- 安全异步作用域执行开始 ---");

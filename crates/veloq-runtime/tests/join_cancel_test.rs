@@ -1,15 +1,12 @@
-use veloq_std::sync::{
-    NativeArc as Arc, NativeBarrier as Barrier,
-    atomic::{NativeAtomicBool as AtomicBool, Ordering},
+use veloq_std::{
+    nz,
+    sync::{
+        NativeArc as Arc, NativeBarrier as Barrier,
+        atomic::{NativeAtomicBool as AtomicBool, Ordering},
+    },
 };
 
-use veloq_runtime::{
-    runtime::{Runtime, RuntimeBuilder},
-    scope,
-    scope::JoinOutcome,
-    task::{TaskError, yield_now},
-};
-use veloq_std::nz;
+use veloq_runtime::{JoinOutcome, Runtime, RuntimeBuilder, TaskError, scope, yield_now};
 
 #[test]
 fn test_join_handle_waits_for_task_completion_on_cancel() {

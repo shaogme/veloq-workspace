@@ -1,12 +1,15 @@
+mod completion;
+mod join;
+
 use crate::{
     error::{Result, RuntimeError},
-    runtime::{RuntimeCtx, RuntimeShared, cancellation::GenericCancellationToken},
+    runtime::{GenericCancellationToken, RuntimeCtx, RuntimeShared},
     task::{
         AnyScopeRef, Arena, ArenaAllocation, DeferredFuture, ErasedCancellationToken, GenericArena,
-        GenericTaskNode, LocalTask, LocalTaskRef, RawTask, ScopeRef, ScopeStorage, SendTask,
-        SendTaskRef, Task, TaskBounds, TaskHandleRef, TaskStorage,
+        GenericTaskHeader, GenericTaskNode, LocalTask, LocalTaskRef, ScopeRef, ScopeStorage,
+        SendTask, SendTaskRef, Task, TaskBounds, TaskHandleRef, TaskStorage,
     },
-    utils::ownership::{ArcOwnership, Ownership, RcOwnership},
+    utils::{ArcOwnership, Ownership, RcOwnership},
 };
 use diagweave::prelude::*;
 use veloq_std::{
@@ -14,45 +17,75 @@ use veloq_std::{
     future::Future,
     marker::PhantomData,
     ops::AsyncFnOnce,
-    ptr::{drop_in_place, write},
-};
-use veloq_std::{
     panic::resume_unwind,
+    ptr::{drop_in_place, write},
     thread::{PanicState, panic_state},
 };
 use veloq_storage::{AtomicStorage, LocalStorage, StateLock, Storage};
-
-mod completion;
-mod guard;
-mod join;
 
 pub use completion::{GenericScopeCompletion, LocalScopeCompletion, ScopeCompletion};
 pub(crate) use completion::{ScopeBlockingWaiter, ScopeCompletionRegistration, ScopeJoinFuture};
 pub use join::{JoinHandle, JoinOutcome, LocalAsyncJoinHandle, LocalJoinHandle, SendJoinHandle};
 
-use guard::ScopeTaskGuard;
+struct ScopeTaskGuard<S: ScopeStorage, O: Ownership> {
+    completion: O::Shared<GenericScopeCompletion<S, O>>,
+    armed: bool,
+}
+
+impl<S: ScopeStorage, O: Ownership> ScopeTaskGuard<S, O> {
+    fn new(completion: &O::Shared<GenericScopeCompletion<S, O>>) -> Self {
+        completion.register_task();
+        Self {
+            completion: completion.clone(),
+            armed: true,
+        }
+    }
+
+    fn handoff_to<H: Storage>(&mut self, header: &GenericTaskHeader<H>) {
+        debug_assert!(self.armed, "scope guard already disarmed");
+        header.claim_scope_obligation();
+        self.armed = false;
+    }
+
+    fn settle(&mut self) {
+        if self.armed {
+            self.armed = false;
+            self.completion.settle_task();
+        }
+    }
+}
+
+impl<S: ScopeStorage, O: Ownership> Drop for ScopeTaskGuard<S, O> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.completion.settle_task();
+        }
+    }
+}
+
+pub(crate) type CancelTokenSlot<S, O> =
+    <S as Storage>::Lock<Option<GenericCancellationToken<S, O>>>;
 
 pub trait ScopeProvider {
     type Extra;
     type Storage: ScopeStorage;
     type Ownership: Ownership;
     type Arena: Arena;
+
     fn runtime(&self) -> &RuntimeShared<Self::Extra>;
+
     fn arena(&self) -> &Self::Arena;
+
     fn completion(
         &self,
     ) -> &<Self::Ownership as Ownership>::Shared<
         GenericScopeCompletion<Self::Storage, Self::Ownership>,
     >;
-}
 
-pub(crate) fn new_cancel_slot<S: Storage, O: Ownership>()
--> S::Lock<Option<GenericCancellationToken<S, O>>> {
-    S::Lock::new(None)
+    fn empty_cancel_token_slot() -> CancelTokenSlot<Self::Storage, Self::Ownership> {
+        <Self::Storage as Storage>::Lock::new(None)
+    }
 }
-
-pub(crate) type CancelTokenSlot<S, O> =
-    <S as Storage>::Lock<Option<GenericCancellationToken<S, O>>>;
 
 /// 通用的作用域实现，支持通过 Storage 策略切换线程安全或本地分配。
 pub struct GenericAsyncScope<
@@ -117,14 +150,17 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra> ScopePr
     type Storage = S;
     type Ownership = O;
     type Arena = GenericArena<S>;
+
     #[inline]
     fn runtime(&self) -> &RuntimeShared<TExtra> {
         self.context.shared()
     }
+
     #[inline]
     fn arena(&self) -> &Self::Arena {
         &self.arena
     }
+
     #[inline]
     fn completion(&self) -> &O::Shared<GenericScopeCompletion<S, O>> {
         &self.completion
@@ -222,7 +258,11 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra>
             self.completion.cancel();
             return self.context.shared().join_scope::<S, O>(&self.completion);
         }
-        self.context.shared().base.fatal_error().map_or(Ok(()), Err)
+        self.context
+            .shared()
+            .base()
+            .fatal_error()
+            .map_or(Ok(()), Err)
     }
 
     unsafe fn spawn_task_impl<'scope_ref, T, H, TTask>(
@@ -241,7 +281,7 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra>
             let scope_ref = self.scope_completion_ref().cast::<H::Storage>();
             task_ref
                 .header()
-                .initialize(&self.context.shared().base, worker_id, scope_ref);
+                .initialize(self.context.shared().base(), worker_id, scope_ref);
         }
         guard.handoff_to(task_ref.header());
         if let Err(err) = enqueue_fn(self.context.shared(), worker_id, task_ref) {
@@ -271,8 +311,8 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra>
         let scope_ref = self.scope_completion_ref().cast::<H::Storage>();
         let node = GenericTaskNode::<H::Storage, T, F>::new(future);
         unsafe {
-            node.header
-                .initialize(&self.context.shared().base, worker_id, scope_ref);
+            node.header()
+                .initialize(self.context.shared().base(), worker_id, scope_ref);
         }
         let layout = Layout::new::<GenericTaskNode<H::Storage, T, F>>();
         let allocation = unsafe {
@@ -382,7 +422,7 @@ impl<'rt, 'scope, 'env, TExtra>
         let scope_ref = self.scope_completion_ref();
         unsafe {
             task.header()
-                .initialize(&self.context.shared().base, worker_id, scope_ref);
+                .initialize(self.context.shared().base(), worker_id, scope_ref);
         }
         task.header().set_pinned();
 
@@ -458,8 +498,8 @@ impl<'rt, 'scope, 'env, TExtra>
         };
         let node = GenericTaskNode::<AtomicStorage, T, DeferredFuture<F, Fut>>::new(deferred);
         unsafe {
-            node.header.initialize(
-                &self.context.shared().base,
+            node.header().initialize(
+                self.context.shared().base(),
                 worker_id,
                 self.scope_completion_ref(),
             );
@@ -468,7 +508,7 @@ impl<'rt, 'scope, 'env, TExtra>
             as *mut GenericTaskNode<AtomicStorage, T, DeferredFuture<F, Fut>>;
         unsafe { write(node_ptr, node) };
         let node_ref = unsafe { &*node_ptr };
-        node_ref.header.set_pinned();
+        node_ref.header().set_pinned();
         guard.handoff_to(node_ref.header());
 
         let task_ref = unsafe { SendTaskRef::from_concrete(node_ptr) };

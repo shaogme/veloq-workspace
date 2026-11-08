@@ -1,7 +1,7 @@
 error[E0308]: mismatched types
-  --> tests/ui/runtime_builder_hook_order_fail.rs:22:25
+  --> tests/ui/runtime_builder_hook_order_fail.rs:18:25
    |
-22 |         .with_idle_hook(idle_custom);
+18 |         .with_idle_hook(idle_custom);
    |          -------------- ^^^^^^^^^^^ expected fn pointer, found fn item
    |          |
    |          arguments to this method are incorrect

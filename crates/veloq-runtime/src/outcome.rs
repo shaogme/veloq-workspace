@@ -311,7 +311,8 @@ impl<T, E> IntoOutcome for Outcome<T, E> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{IntoOutcome, Outcome};
+    use veloq_std::result::Result as StdResult;
 
     #[test]
     fn converts_unit_to_ok() {

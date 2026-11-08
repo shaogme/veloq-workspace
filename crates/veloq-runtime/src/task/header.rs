@@ -1,12 +1,11 @@
 use crate::{
     error::{EnqueueError, Result, RuntimeError},
     runtime::{
-        EnqueuePinnedOutcome, RuntimeSharedBase,
-        cancellation::{AncestorRegistration, CancelWaiterLinkResult},
+        AncestorRegistration, CancelWaiterLinkResult, EnqueuePinnedOutcome, RuntimeSharedBase,
     },
     task::{
         CancellationWaiter, LocalWakeHeaderGuard, RawScope, ScopeRef, SendTaskRef, TaskHandleRef,
-        TaskWakeToken, nodes::TaskStorage,
+        TaskVTable, TaskWakeToken, nodes::TaskStorage,
     },
 };
 use diagweave::prelude::*;
@@ -45,19 +44,12 @@ pub(crate) const STATE_FINALIZATION_DEFERRED: usize = 1 << 12;
 pub(crate) const STATE_WAKER_PANICKED: usize = 1 << 13;
 /// Terminal notification is in progress; reclaim must wait until the notifier releases the bit.
 pub(crate) const STATE_TERMINALIZING: usize = 1 << 14;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PollStatus {
     Proceed,
     Yield,
     Complete,
-}
-
-pub struct TaskVTable<S: Storage> {
-    pub wake: unsafe fn(data: NonNull<GenericTaskHeader<S>>),
-    pub wake_by_ref: unsafe fn(data: &GenericTaskHeader<S>),
-    pub poll: unsafe fn(data: &GenericTaskHeader<S>, worker_id: usize) -> Result<bool>,
-    pub drop: unsafe fn(data: NonNull<GenericTaskHeader<S>>),
-    pub drop_after_poll: bool,
 }
 
 pub(crate) struct GenericWakerNode<S: Storage> {
@@ -90,6 +82,7 @@ pub struct GenericTaskHeader<S: Storage> {
 }
 
 unsafe impl<S: ThreadSafeStorage> Send for GenericTaskHeader<S> {}
+
 unsafe impl<S: ThreadSafeStorage> Sync for GenericTaskHeader<S> {}
 
 impl<S: Storage> GenericTaskHeader<S> {
@@ -719,7 +712,7 @@ impl<S: Storage> GenericTaskHeader<S> {
     #[inline]
     pub(crate) fn notify_runtime_active(&self) -> Result<()> {
         self.with_runtime(|runtime| {
-            runtime.idle.event_count.notify();
+            runtime.notify_event_count();
             runtime.wake_worker(self.worker_id())
         })?
     }
@@ -890,11 +883,27 @@ impl<S: Storage> Drop for GenericTaskHeader<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    #[cfg(not(feature = "loom"))]
-    use crate::{scope::GenericScopeCompletion, utils::ownership::ArcOwnership};
+    use super::{STATE_CANCEL_ARMED, STATE_FINALIZED, STATE_RESULT_READY, STATE_SCOPE_ACKED};
+    use crate::{
+        error::EnqueueError,
+        task::{GenericTaskHeader, GenericWakerNode, INTRUSIVE_WAKER_VTABLE, ScopeRef, TaskVTable},
+    };
     use veloq_intrusive_linklist::Link;
-    use veloq_std::sync::atomic::NativeAtomicU32 as AtomicU32;
+    use veloq_std::{
+        marker::{PhantomData, PhantomPinned},
+        mem::ManuallyDrop,
+        pin::Pin,
+        ptr::NonNull,
+        sync::{
+            NativeArc as Arc,
+            atomic::{NativeAtomicU32 as AtomicU32, Ordering},
+        },
+        task::{RawWaker, RawWakerVTable, Waker},
+    };
+    use veloq_storage::AtomicStorage;
+
+    #[cfg(not(feature = "loom"))]
+    use crate::{scope::GenericScopeCompletion, utils::ArcOwnership};
 
     static TEST_VTABLE: TaskVTable<AtomicStorage> = TaskVTable {
         wake: |_| {},
@@ -1081,7 +1090,7 @@ mod tests {
 
         assert!(!header.arm_scope_cancel_waiter(Waker::noop()));
         assert_eq!(header.state.load(Ordering::Acquire) & STATE_CANCEL_ARMED, 0);
-        assert!(!header.cancel_waiter.link.is_linked());
+        assert!(!header.cancel_waiter.is_linked());
     }
 
     #[cfg(not(feature = "loom"))]
@@ -1095,12 +1104,12 @@ mod tests {
         }
 
         assert!(header.arm_scope_cancel_waiter(Waker::noop()));
-        assert!(header.cancel_waiter.link.is_linked());
+        assert!(header.cancel_waiter.is_linked());
 
         header.disarm_scope_cancel_waiter();
         header.disarm_scope_cancel_waiter();
 
         assert_eq!(header.state.load(Ordering::Acquire) & STATE_CANCEL_ARMED, 0);
-        assert!(!header.cancel_waiter.link.is_linked());
+        assert!(!header.cancel_waiter.is_linked());
     }
 }

@@ -16,16 +16,10 @@ use veloq_driver_native::{
     op::{DetachedSubmitter, DriverProvider, IntoPlatformOp, IoFd, Op, OpSubmitter, SingleShotOp},
 };
 use veloq_runtime::{
-    error::{Result as RuntimeResult, RuntimeDriverError, RuntimeError},
-    runtime::{
-        EnqueuePinnedOutcome, IdleDecision, IdleWaitStrategy, IntoRuntimeCtx, RuntimeCtx,
-        RuntimeShared,
-    },
-    storage::AtomicStorage,
-    task::{
-        GenericTaskHeader, RawTask, ScopeRef, SendTaskRef, TaskHandleRef, TaskHeader, TaskVTable,
-        yield_now,
-    },
+    EnqueuePinnedOutcome, GenericTaskHeader, IdleDecision, IdleWaitStrategy, IntoRuntimeCtx,
+    RawTask, Result as RuntimeResult, RuntimeCtx, RuntimeDriverError, RuntimeError, RuntimeShared,
+    ScopeRef, SendTaskRef, TaskHandleRef, TaskHeader, TaskVTable, storage::AtomicStorage,
+    yield_now,
 };
 
 use crate::error::Result as VeloqResult;
@@ -47,7 +41,7 @@ impl<'rt> DriverRegistrar<'rt> {
 
     fn extra<R>(&self, f: impl FnOnce(&WorkerState<'rt>) -> R) -> R {
         self.shared
-            .extra_tls
+            .extra_tls()
             .try_with(|extra| f(extra))
             .expect("Ctx accessed outside of a worker thread")
     }
@@ -135,7 +129,7 @@ impl<'rt> Ctx<'rt> {
     fn extra<R>(&self, f: impl FnOnce(&WorkerState<'rt>) -> R) -> R {
         self.runtime_ctx
             .shared()
-            .extra_tls
+            .extra_tls()
             .try_with(|extra| f(extra))
             .expect("Ctx accessed outside of a worker thread")
     }
@@ -265,7 +259,7 @@ pub fn poll_current_driver<'rt>(
     shared: &RuntimeShared<WorkerState<'rt>>,
 ) -> RuntimeResult<IdleDecision> {
     shared
-        .extra_tls
+        .extra_tls()
         .try_with(|extra| {
             let mut driver = extra.driver.borrow_mut();
 
@@ -307,7 +301,7 @@ pub(crate) fn submit_control_task<'rt>(
 
         fn poll_raw(&self, _worker_id: usize) -> RuntimeResult<bool> {
             let shared = unsafe { &*self.shared_ptr };
-            let _ = shared.extra_tls.try_with(|extra| {
+            let _ = shared.extra_tls().try_with(|extra| {
                 let mut driver = extra.driver.borrow_mut();
                 let _ = driver.unregister_files(vec![self.fd]);
             });
@@ -339,7 +333,7 @@ pub(crate) fn submit_control_task<'rt>(
     let task = Box::new(UnregisterFileTask {
         header: TaskHeader::new(
             UnregisterFileTask::<'rt>::VTABLE,
-            &shared.base,
+            shared.base(),
             worker_id,
             ScopeRef::<AtomicStorage>::dummy(),
         ),
@@ -353,7 +347,7 @@ pub(crate) fn submit_control_task<'rt>(
     let task_ref = unsafe { SendTaskRef::from_concrete(ptr) };
     match shared.enqueue_pinned(worker_id, task_ref) {
         EnqueuePinnedOutcome::Enqueued | EnqueuePinnedOutcome::AlreadyQueued => {
-            if shared.base.unparkers()[worker_id].unpark().is_err() {
+            if shared.base().unparkers()[worker_id].unpark().is_err() {
                 // Unparker 已将 backend 错误写入 runtime fatal 通道。
             }
         }
@@ -369,7 +363,7 @@ pub fn park_current_driver<'rt>(
     shared: &RuntimeShared<WorkerState<'rt>>,
     wait_strategy: IdleWaitStrategy,
 ) -> RuntimeResult<()> {
-    let res = shared.extra_tls.try_with(|extra| {
+    let res = shared.extra_tls().try_with(|extra| {
         let mut driver = extra.driver.borrow_mut();
 
         // Block on the OS event driver
@@ -416,19 +410,19 @@ where
     E: Display,
 {
     RuntimeError::DriverFailed {
-        source: RuntimeDriverError {
-            backend: if cfg!(target_os = "linux") {
+        source: RuntimeDriverError::new(
+            if cfg!(target_os = "linux") {
                 "io_uring"
             } else if cfg!(target_os = "windows") {
                 "iocp"
             } else {
                 "unknown"
             },
-            worker_id: shared.worker_id(),
+            shared.worker_id(),
             phase,
             operation,
-            detail: format!("{error:#}"),
-        },
+            format!("{error:#}"),
+        ),
     }
     .to_report()
 }

@@ -2,13 +2,13 @@ use crate::{
     error::Result as RuntimeResult,
     runtime::RuntimeSharedBase,
     task::{
-        GenericTaskHeader, INTRUSIVE_WAKER_VTABLE, LOCAL_INTRUSIVE_WAKER_VTABLE, LocalTaskRef,
-        RawTask, SendTaskRef, Task, TaskError, TaskHandleRef, TaskResultSetter, TaskVTable,
-        poll_task_internal,
+        GenericTaskHeader, INTRUSIVE_WAKER_VTABLE, LOCAL_INTRUSIVE_WAKER_VTABLE, LifecycleManager,
+        LocalTaskRef, RawTask, SendTaskRef, Task, TaskError, TaskHandleRef, TaskResultSetter,
+        TaskVTable,
     },
 };
-use veloq_std::cell::UnsafeCell;
 use veloq_std::{
+    cell::UnsafeCell,
     future::Future,
     pin::Pin,
     ptr::NonNull,
@@ -25,6 +25,7 @@ const STATUS_EMPTY: usize = 2;
 pub trait TaskStorage: Storage + Sized {
     const IS_LOCAL: bool;
     const WAKER_VTABLE: &'static RawWakerVTable;
+
     fn enqueue(
         runtime: &RuntimeSharedBase,
         worker_id: usize,
@@ -35,6 +36,7 @@ pub trait TaskStorage: Storage + Sized {
 impl TaskStorage for LocalStorage {
     const IS_LOCAL: bool = true;
     const WAKER_VTABLE: &'static RawWakerVTable = &LOCAL_INTRUSIVE_WAKER_VTABLE;
+
     fn enqueue(
         runtime: &RuntimeSharedBase,
         worker_id: usize,
@@ -49,6 +51,7 @@ impl TaskStorage for LocalStorage {
 impl TaskStorage for AtomicStorage {
     const IS_LOCAL: bool = false;
     const WAKER_VTABLE: &'static RawWakerVTable = &INTRUSIVE_WAKER_VTABLE;
+
     fn enqueue(
         runtime: &RuntimeSharedBase,
         worker_id: usize,
@@ -63,17 +66,19 @@ impl TaskStorage for AtomicStorage {
 
 /// 任务约束特性，用于在编译期区分 Local 和 Send 任务的 Bound。
 pub trait TaskBounds<T, F> {}
+
 impl<T, F> TaskBounds<T, F> for LocalStorage {}
+
 impl<T, F> TaskBounds<T, F> for AtomicStorage where T: Send {}
 
 #[repr(C)]
 pub struct GenericTaskNode<S: TaskStorage, T, F> {
-    pub(crate) header: GenericTaskHeader<S>,
-    pub(crate) status: S::Usize,
+    header: GenericTaskHeader<S>,
+    status: S::Usize,
     /// 只在任务 poll 或终态清理协议允许的阶段访问。
-    pub(crate) future: UnsafeCell<Option<F>>,
+    future: UnsafeCell<Option<F>>,
     /// 只在结果发布/消费协议允许的阶段访问。
-    pub(crate) result: UnsafeCell<Option<Result<T, TaskError>>>,
+    result: UnsafeCell<Option<Result<T, TaskError>>>,
 }
 
 unsafe impl<S: TaskStorage, T, F> Send for GenericTaskNode<S, T, F>
@@ -99,6 +104,10 @@ where
     S: TaskBounds<T, F>,
     F: Future<Output = T>,
 {
+    pub(crate) fn header(&self) -> &GenericTaskHeader<S> {
+        &self.header
+    }
+
     /// 优化 VTable 的定义，确保其作为静态引用在编译期完全内联。
     const VTABLE: &'static TaskVTable<S> = &TaskVTable {
         wake: |data| unsafe {
@@ -170,7 +179,7 @@ where
     F: Future<Output = T>,
 {
     fn poll_task(&self, cx: &mut Context<'_>) -> bool {
-        poll_task_internal(
+        LifecycleManager::poll_task_internal(
             self.header(),
             self,
             cx,

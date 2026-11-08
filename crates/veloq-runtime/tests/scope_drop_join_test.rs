@@ -6,9 +6,7 @@
 //! 超时兜底：只要 join 或取消唤醒任何一环缺失，它们就会挂住或断言失败。**
 
 use veloq_runtime::{
-    runtime::{DefaultWorkerFactoryFor, RuntimeBuilder},
-    scope, select, task,
-    task::{RawTask, Task, TaskError},
+    DefaultWorkerFactoryFor, RawTask, RuntimeBuilder, Task, TaskError, scope, select, task,
 };
 use veloq_std::{
     future::Future,
@@ -20,9 +18,10 @@ use veloq_std::{
 };
 
 #[cfg(feature = "std")]
-use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
-#[cfg(feature = "std")]
-use veloq_std::string::String;
+use veloq_std::{
+    panic::{AssertUnwindSafe, catch_unwind},
+    string::String,
+};
 
 fn with_workers(count: usize) -> RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
     RuntimeBuilder::new().with_worker_count(NonZeroUsize::new(count))
@@ -33,6 +32,7 @@ struct Park;
 
 impl Future for Park {
     type Output = ();
+
     fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
         Poll::Pending
     }
@@ -43,6 +43,7 @@ struct ReadyAfter(u32);
 
 impl Future for ReadyAfter {
     type Output = u32;
+
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u32> {
         if self.0 == 0 {
             return Poll::Ready(1);

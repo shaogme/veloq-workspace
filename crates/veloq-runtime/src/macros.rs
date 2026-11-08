@@ -1,5 +1,3 @@
-pub mod helpers;
-
 /// Polls multiple futures concurrently until every branch completes.
 ///
 /// Each argument is converted with [`IntoFuture`](core::future::IntoFuture) exactly once and
@@ -74,7 +72,7 @@ macro_rules! join {
         use $crate::__veloq_std::future::{poll_fn, Future, IntoFuture};
         use $crate::__veloq_std::pin::Pin;
         use $crate::__veloq_std::task::Poll;
-        use $crate::task::RuntimeContextExt;
+        use $crate::RuntimeContextExt;
 
         let mut __futures = ($($crate::join!(@into_future $fut),)+);
         let mut __futures = &mut __futures;
@@ -252,7 +250,7 @@ macro_rules! select {
             use $crate::__veloq_std::future::{poll_fn, Future, IntoFuture};
             use $crate::__veloq_std::pin::Pin;
             use $crate::__veloq_std::task::Poll;
-            use $crate::task::RuntimeContextExt;
+            use $crate::RuntimeContextExt;
 
             const BRANCHES: usize = $crate::select!(@branch_len $pat = $fut => $handler $(, $r_pat = $r_fut => $r_handler)*);
 
@@ -285,7 +283,7 @@ macro_rules! select {
             use $crate::__veloq_std::future::{poll_fn, Future, IntoFuture};
             use $crate::__veloq_std::pin::Pin;
             use $crate::__veloq_std::task::Poll;
-            use $crate::task::RuntimeContextExt;
+            use $crate::RuntimeContextExt;
 
             const BRANCHES: usize = $crate::select!(@branch_len $pat = $fut => $handler $(, $r_pat = $r_fut => $r_handler)*);
 
@@ -402,14 +400,18 @@ macro_rules! select {
 macro_rules! scope {
     ($ctx:expr, $closure:expr) => {
         async {
-            use $crate::macros::helpers::{_constrain, _constrain_result, run_scope_eval};
-            use $crate::scope::AsyncScope;
+            use $crate::AsyncScope;
+            use $crate::MacroHelpers as __MacroHelpers;
 
-            let __ctx = $crate::runtime::IntoRuntimeCtx::into_runtime_ctx($ctx);
-            let __parent = $crate::runtime::current_scope().await;
+            let __ctx = $crate::IntoRuntimeCtx::into_runtime_ctx($ctx);
+            let __parent = $crate::RuntimeCtx::<()>::current_scope().await;
             let scope = AsyncScope::new(__ctx, __parent);
-            let res = run_scope_eval(&scope, _constrain($closure)(&scope)).await?;
-            _constrain_result(Ok(res))
+            let res = __MacroHelpers::run_scope_eval(
+                &scope,
+                __MacroHelpers::_constrain($closure)(&scope),
+            )
+            .await?;
+            __MacroHelpers::_constrain_result(Ok(res))
         }
     };
 }
@@ -420,14 +422,18 @@ macro_rules! scope {
 macro_rules! scope_local {
     ($ctx:expr, $closure:expr) => {
         async {
-            use $crate::macros::helpers::{_constrain_local, _constrain_result, run_scope_eval};
-            use $crate::scope::LocalAsyncScope;
+            use $crate::LocalAsyncScope;
+            use $crate::MacroHelpers as __MacroHelpers;
 
-            let __ctx = $crate::runtime::IntoRuntimeCtx::into_runtime_ctx($ctx);
-            let __parent = $crate::runtime::current_scope().await;
+            let __ctx = $crate::IntoRuntimeCtx::into_runtime_ctx($ctx);
+            let __parent = $crate::RuntimeCtx::<()>::current_scope().await;
             let scope = LocalAsyncScope::new(__ctx, __parent);
-            let res = run_scope_eval(&scope, _constrain_local($closure)(&scope)).await?;
-            _constrain_result(Ok(res))
+            let res = __MacroHelpers::run_scope_eval(
+                &scope,
+                __MacroHelpers::_constrain_local($closure)(&scope),
+            )
+            .await?;
+            __MacroHelpers::_constrain_result(Ok(res))
         }
     };
 }

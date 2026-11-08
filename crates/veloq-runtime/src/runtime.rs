@@ -1,31 +1,41 @@
-use veloq_std::vec;
+mod cancellation;
+mod context;
+mod primitives;
+mod shared;
+
 use veloq_std::{
-    boxed::Box, error::Error, format, marker::PhantomData, num::NonZeroUsize, ops::AsyncFnOnce,
-    pin::pin, ptr, thread, vec::Vec,
+    boxed::Box,
+    error::Error,
+    format,
+    marker::PhantomData,
+    num::NonZeroUsize,
+    ops::AsyncFnOnce,
+    panic::{AssertUnwindSafe, catch_unwind},
+    pin::pin,
+    ptr,
+    result::Result as StdResult,
+    sync::{Mutex, mpsc},
+    thread, vec,
+    vec::Vec,
 };
+use veloq_tls::Tls;
 
 use crate::{
     error::{Result, RuntimeError, WorkerFactorySource},
     utils::FastRand,
 };
 use diagweave::prelude::*;
-use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
-use veloq_std::sync::{Mutex, mpsc};
-
-pub mod cancellation;
-pub mod context;
-pub mod primitives;
-pub mod shared;
 
 pub use cancellation::GenericCancellationToken;
-pub use context::{
-    IdleDecision, IdleHook, IdleWaitStrategy, IntoRuntimeCtx, RuntimeCtx, current_scope,
-};
+pub(crate) use cancellation::{AncestorRegistration, CancelWaiterLinkResult, CancelledFuture};
+pub use context::{IdleDecision, IdleHook, IdleWaitStrategy, IntoRuntimeCtx, ParkHook, RuntimeCtx};
 pub(crate) use context::{RuntimeTlsInner, WorkerTickHook};
-pub use shared::{EnqueuePinnedOutcome, ParkHook, RuntimeShared, RuntimeSharedBase};
+pub use primitives::RuntimeWaker;
+pub(crate) use primitives::{EventCount, Sys, Unparker, WaitError};
+pub use shared::{EnqueuePinnedOutcome, RuntimeShared, RuntimeSharedBase};
 
 use primitives::BlockOnSignal;
-use shared::{BlockOnController, MAX_WORKER_COUNT, Receivers, run_worker_loop};
+use shared::{BlockOnController, MAX_WORKER_COUNT, Receivers, RuntimeSharedConfig, WorkerLoop};
 
 pub struct Runtime<'rt, 'env: 'rt, T, WF: 'rt> {
     shared: RuntimeShared<T>,
@@ -34,11 +44,36 @@ pub struct Runtime<'rt, 'env: 'rt, T, WF: 'rt> {
     _marker: PhantomData<fn(&'rt ()) -> &'env ()>,
 }
 
-pub type WorkerFactoryResult<T> = veloq_std::result::Result<T, Box<dyn Error + Send + Sync>>;
+pub type WorkerFactoryResult<T> = StdResult<T, Box<dyn Error + Send + Sync>>;
 
 pub type DefaultWorkerFactory = fn(usize, &RuntimeShared<()>) -> WorkerFactoryResult<()>;
 
 pub type DefaultWorkerFactoryFor<T> = fn(usize, &RuntimeShared<T>) -> WorkerFactoryResult<T>;
+
+/// 表示尚未配置 idle 或 park hook 的 builder 状态。
+#[doc(hidden)]
+pub struct HooksUnconfigured;
+
+/// 表示至少配置了一个 idle 或 park hook 的 builder 状态。
+#[doc(hidden)]
+pub struct HooksConfigured;
+
+/// 用于配置并创建运行时的 builder。
+///
+/// `H` 是隐藏的 hook 配置状态参数。新 builder 处于 [`HooksUnconfigured`] 状态，首次
+/// 设置 idle 或 park hook 时可以选择 worker extra 类型；设置任意一个 hook 后，builder
+/// 处于 [`HooksConfigured`] 状态，后续 hook setter 只能接受相同的 `T`。因此，两个 hook
+/// 始终与 [`RuntimeShared<T>`] 使用相同的类型，配置顺序不会静默丢弃 park hook。
+pub struct RuntimeBuilder<T, WF, H = HooksUnconfigured> {
+    worker_count: Option<NonZeroUsize>,
+    queue_capacity: NonZeroUsize,
+    topology_override: Option<Box<[usize]>>,
+    worker_factory: Option<WF>,
+    idle_hook: Option<IdleHook<T>>,
+    park_hook: Option<ParkHook<T>>,
+    worker_tick_hook: Option<WorkerTickHook>,
+    _hook_state: PhantomData<fn() -> H>,
+}
 
 impl<'rt, 'env: 'rt> Runtime<'rt, 'env, (), DefaultWorkerFactoryFor<()>> {
     pub fn scope<F, R>(f: F) -> Result<R>
@@ -70,7 +105,7 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
         WF: Fn(usize, &'rt RuntimeShared<T>) -> WorkerFactoryResult<T> + Send + Sync,
         F: for<'a> AsyncFnOnce(RuntimeCtx<'a, T>) -> R,
     {
-        struct TlsCleanupGuard<'a, T>(&'a veloq_tls::Tls<T>);
+        struct TlsCleanupGuard<'a, T>(&'a Tls<T>);
         impl<'a, T> Drop for TlsCleanupGuard<'a, T> {
             fn drop(&mut self) {
                 let _ = self.0.take();
@@ -78,7 +113,7 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
         }
 
         struct MainTlsCleanupGuard<'a, T> {
-            tls: &'a veloq_tls::Tls<RuntimeTlsInner>,
+            tls: &'a Tls<RuntimeTlsInner>,
             shared: &'a RuntimeShared<T>,
             completed: bool,
         }
@@ -91,7 +126,7 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
             fn drop(&mut self) {
                 if !self.completed {
                     self.shared.shutdown();
-                    self.shared.base.complete_shutdown(0);
+                    self.shared.base().complete_shutdown(0);
                 }
                 let _ = self.tls.take();
             }
@@ -116,9 +151,9 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
         // 主线程的唤醒信号必须在 worker 线程启动**之前**建好：worker 初始化失败时要靠
         // 它把主线程从 park 里叫回来，否则错误永远不会被报告。
         // Build the main-thread wake signal before spawning workers so initialization failures can wake a parked main thread.
-        let signal = BlockOnSignal::new(shared_ref.base.unparker(0).clone());
+        let signal = BlockOnSignal::new(shared_ref.base().unparker(0).clone());
 
-        let res: Result<R> = veloq_std::thread::scope(|scope| {
+        let res: Result<R> = thread::scope(|scope| {
             struct ShutdownGuard<'rt, T>(&'rt RuntimeShared<T>);
             impl<'rt, T> Drop for ShutdownGuard<'rt, T> {
                 fn drop(&mut self) {
@@ -137,10 +172,10 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                     Some(d) => d,
                     None => {
                         shared_ref.shutdown();
-                        shared_ref.base.mark_workers_unavailable(
+                        shared_ref.base().mark_workers_unavailable(
                             (1..worker_count.get()).filter(|id| !started_workers[*id]),
                         );
-                        shared_ref.base.complete_shutdown(0);
+                        shared_ref.base().complete_shutdown(0);
                         return RuntimeError::DequesExhausted { worker_id }.trans();
                     }
                 };
@@ -157,15 +192,17 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                 };
 
                 if let Err(e) = scope.spawn(move || {
-                    let _tls_cleanup = TlsCleanupGuard(&shared_ref.base.tls);
-                    let _extra_cleanup = TlsCleanupGuard(&shared_ref.extra_tls);
+                    let _tls_cleanup = TlsCleanupGuard(shared_ref.base().tls());
+                    let _extra_cleanup = TlsCleanupGuard(shared_ref.extra_tls());
                     let init_res = catch_unwind(AssertUnwindSafe::new(|| {
-                        shared_ref.base.tls.set_owned(context).map_err(|source| {
-                            RuntimeError::TlsSetOwnedFailed {
+                        shared_ref
+                            .base()
+                            .tls()
+                            .set_owned(context)
+                            .map_err(|source| RuntimeError::TlsSetOwnedFailed {
                                 worker_id,
                                 source: source.kind(),
-                            }
-                        })?;
+                            })?;
                         let worker_extra =
                             worker_factory_ref(worker_id, shared_ref).map_err(|source| {
                                 RuntimeError::WorkerFactoryFailed {
@@ -175,7 +212,7 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                                 .to_report()
                             })?;
                         shared_ref
-                            .extra_tls
+                            .extra_tls()
                             .set_owned(worker_extra)
                             .map_err(|source| RuntimeError::TlsSetOwnedFailed {
                                 worker_id,
@@ -204,7 +241,7 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                         drop(guard);
                         signal_ref.notify();
                         shared_ref.shutdown();
-                        shared_ref.base.complete_shutdown(worker_id);
+                        shared_ref.base().complete_shutdown(worker_id);
                     };
 
                     if let Err(err) = init_res {
@@ -215,12 +252,12 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
 
                     if ready_sender.send((worker_id, true)).is_err() {
                         shared_ref.shutdown();
-                        shared_ref.base.complete_shutdown(worker_id);
+                        shared_ref.base().complete_shutdown(worker_id);
                         return;
                     }
                     if !matches!(start_receiver.recv(), Ok(true)) {
                         shared_ref.shutdown();
-                        shared_ref.base.complete_shutdown(worker_id);
+                        shared_ref.base().complete_shutdown(worker_id);
                         return;
                     }
 
@@ -237,10 +274,10 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                     }
                 }) {
                     shared_ref.shutdown();
-                    shared_ref.base.mark_workers_unavailable(
+                    shared_ref.base().mark_workers_unavailable(
                         (1..worker_count.get()).filter(|id| !started_workers[*id]),
                     );
-                    shared_ref.base.complete_shutdown(0);
+                    shared_ref.base().complete_shutdown(0);
                     return RuntimeError::ThreadSpawnFailed { source: e }.trans();
                 }
                 start_senders.push(start_sender);
@@ -251,10 +288,10 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                 Some(deque) => deque,
                 None => {
                     shared_ref.shutdown();
-                    shared_ref.base.mark_workers_unavailable(
+                    shared_ref.base().mark_workers_unavailable(
                         (1..worker_count.get()).filter(|id| !started_workers[*id]),
                     );
-                    shared_ref.base.complete_shutdown(0);
+                    shared_ref.base().complete_shutdown(0);
                     return RuntimeError::MainWorkerDequeExhausted.trans();
                 }
             };
@@ -264,15 +301,15 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                 rand: FastRand::new(0),
                 worker: deque0,
             };
-            let _tls_cleanup = TlsCleanupGuard(&shared_ref.base.tls);
-            let _extra_cleanup = TlsCleanupGuard(&shared_ref.extra_tls);
+            let _tls_cleanup = TlsCleanupGuard(shared_ref.base().tls());
+            let _extra_cleanup = TlsCleanupGuard(shared_ref.extra_tls());
             let mut main_cleanup = MainTlsCleanupGuard {
-                tls: &shared_ref.base.tls,
+                tls: shared_ref.base().tls(),
                 shared: shared_ref,
                 completed: false,
             };
 
-            if let Err(source) = shared_ref.base.tls.set_owned(context) {
+            if let Err(source) = shared_ref.base().tls().set_owned(context) {
                 return RuntimeError::TlsSetOwnedFailed {
                     worker_id: 0,
                     source: source.kind(),
@@ -297,7 +334,7 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                         .trans();
                     }
                 };
-            if let Err(source) = shared_ref.extra_tls.set_owned(main_extra) {
+            if let Err(source) = shared_ref.extra_tls().set_owned(main_extra) {
                 return RuntimeError::TlsSetOwnedFailed {
                     worker_id: 0,
                     source: source.kind(),
@@ -359,12 +396,12 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
             // Worker 0 passes the outer future to the shared scheduler loop as its exit condition instead of duplicating the pop chain.
             let mut fut = pin!(f(ctx));
             let mut controller = BlockOnController::new(fut.as_mut(), signal.clone());
-            let loop_res = run_worker_loop(shared_ref, &mut controller);
+            let loop_res = WorkerLoop::run(shared_ref, &mut controller);
 
             // 主 worker 无论外层 future 正常结束还是被 shutdown 中断，都会负责最终屏障和全局排空。
             // The main worker owns the final barrier and global drain whether the outer future completed normally or shutdown interrupted it.
             shared_ref.shutdown();
-            shared_ref.base.complete_shutdown(0);
+            shared_ref.base().complete_shutdown(0);
             main_cleanup.mark_completed();
 
             // worker 线程的致命错误优先于循环自身的退出原因：循环正是被它触发的 shutdown
@@ -390,31 +427,6 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
 
         res
     }
-}
-
-/// 表示尚未配置 idle 或 park hook 的 builder 状态。
-#[doc(hidden)]
-pub struct HooksUnconfigured;
-
-/// 表示至少配置了一个 idle 或 park hook 的 builder 状态。
-#[doc(hidden)]
-pub struct HooksConfigured;
-
-/// 用于配置并创建运行时的 builder。
-///
-/// `H` 是隐藏的 hook 配置状态参数。新 builder 处于 [`HooksUnconfigured`] 状态，首次
-/// 设置 idle 或 park hook 时可以选择 worker extra 类型；设置任意一个 hook 后，builder
-/// 处于 [`HooksConfigured`] 状态，后续 hook setter 只能接受相同的 `T`。因此，两个 hook
-/// 始终与 [`RuntimeShared<T>`] 使用相同的类型，配置顺序不会静默丢弃 park hook。
-pub struct RuntimeBuilder<T, WF, H = HooksUnconfigured> {
-    worker_count: Option<NonZeroUsize>,
-    queue_capacity: NonZeroUsize,
-    topology_override: Option<Box<[usize]>>,
-    worker_factory: Option<WF>,
-    idle_hook: Option<IdleHook<T>>,
-    park_hook: Option<ParkHook<T>>,
-    worker_tick_hook: Option<WorkerTickHook>,
-    _hook_state: PhantomData<fn() -> H>,
 }
 
 impl Default for RuntimeBuilder<(), DefaultWorkerFactoryFor<()>, HooksUnconfigured> {
@@ -567,22 +579,22 @@ impl<T, WF, H> RuntimeBuilder<T, WF, H> {
             }
             .trans();
         }
-        let (registry, topo, receivers) = shared::init_runtime_components_with_topology(
+        let components = RuntimeShared::<T>::initialize_components(
             worker_count,
             self.queue_capacity,
             self.topology_override.as_deref(),
         );
-        let shared = RuntimeShared::new(
-            registry,
-            topo,
+        let shared = RuntimeShared::new(RuntimeSharedConfig {
+            registry: components.registry,
+            topology: components.topology,
             worker_count,
-            self.idle_hook,
-            self.park_hook,
-            self.worker_tick_hook,
-        );
+            idle_hook: self.idle_hook,
+            park_hook: self.park_hook,
+            worker_tick_hook: self.worker_tick_hook,
+        });
         let rt = Runtime {
             shared,
-            receivers: Some(receivers),
+            receivers: Some(components.receivers),
             worker_factory: self.worker_factory,
             _marker: PhantomData,
         };

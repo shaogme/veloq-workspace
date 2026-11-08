@@ -19,7 +19,7 @@ use veloq::{
     sync::mpsc,
 };
 use veloq_buf::{FixedBuf, UniformSlot};
-use veloq_runtime::{select, task::yield_now};
+use veloq_runtime::{select, yield_now};
 
 fn run_test<F, R>(f: F) -> R
 where

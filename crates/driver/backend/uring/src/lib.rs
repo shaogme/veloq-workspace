@@ -45,3 +45,10 @@ pub fn socket_addr_to_storage(addr: SocketAddr) -> (SockAddrStorage, socklen_t) 
 pub fn to_socket_addr(buf: &[u8]) -> UringResult<SocketAddr> {
     SockAddrStorage::decode(buf)
 }
+
+#[cfg(test)]
+pub(crate) mod test_serial {
+    use veloq_std::sync::NativeMutex;
+
+    pub(crate) static FD_TEST_LOCK: NativeMutex<()> = NativeMutex::new(());
+}

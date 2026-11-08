@@ -1,10 +1,4 @@
-use veloq_runtime::{
-    join,
-    runtime::Runtime,
-    scope,
-    scope::JoinOutcome,
-    task::{TaskError, yield_now},
-};
+use veloq_runtime::{JoinOutcome, Runtime, TaskError, join, scope, yield_now};
 use veloq_std::{
     future::{Future, IntoFuture},
     pin::Pin,

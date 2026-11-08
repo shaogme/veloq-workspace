@@ -1,21 +1,18 @@
 use crate::{
     error::Result,
-    runtime::{
-        cancellation::{CancelWaiterLinkResult, GenericCancellationToken},
-        primitives::{Unparker, create_unpark_waker, wait_error_to_runtime},
-    },
+    runtime::{CancelWaiterLinkResult, GenericCancellationToken, Unparker},
     task::{
         AnyScopeRef, AnySendScopeRef, CancellationWaiter, ErasedCancellationToken, RawScope,
         ScopeParent, ScopeStorage,
     },
-    utils::ownership::{ArcOwnership, Ownership, RcOwnership},
+    utils::{ArcOwnership, Ownership, RcOwnership},
 };
 use veloq_intrusive_linklist::{Link, LinkedList, intrusive_adapter};
-use veloq_std::panic::{AssertUnwindSafe, PanicPayload, catch_unwind};
 use veloq_std::{
     boxed::Box,
     future::Future,
     marker::{PhantomData, PhantomPinned},
+    panic::{AssertUnwindSafe, PanicPayload, catch_unwind},
     pin::Pin,
     ptr::NonNull,
     sync::atomic::Ordering,
@@ -26,9 +23,18 @@ use veloq_storage::{
     AtomicStorage, LocalStorage, StateInt, StateLock, StateOptionBox, StrategyType,
 };
 
+/// 作用域级别的完成通知：所有子任务完成后唤醒等待者。
+pub struct GenericScopeCompletion<S: ScopeStorage, O: Ownership> {
+    remaining: S::Usize,
+    wakers: S::Lock<LinkedList<ScopeWakerAdapter<S>>>,
+    cancel_token: GenericCancellationToken<S, O>,
+    panic_info: S::OptionBox<PanicPayload>,
+    parent: S::Parent,
+}
+
 pub(crate) struct ScopeWakerNode<S: ScopeStorage> {
-    pub(crate) waker: Waker,
-    pub(crate) link: Link,
+    waker: Waker,
+    link: Link,
     marker: PhantomData<S>,
 }
 
@@ -89,7 +95,7 @@ pub(crate) struct ScopeBlockingWaiter<'a, S: ScopeStorage, O: Ownership> {
 
 impl<'a, S: ScopeStorage, O: Ownership> ScopeBlockingWaiter<'a, S, O> {
     pub(crate) fn new(completion: &'a GenericScopeCompletion<S, O>, unparker: Unparker) -> Self {
-        let waker = create_unpark_waker(unparker.clone());
+        let waker = unparker.clone().into_waker();
         let registration = ScopeCompletionRegistration::new(completion, &waker);
         Self {
             registration,
@@ -107,7 +113,7 @@ impl<'a, S: ScopeStorage, O: Ownership> ScopeBlockingWaiter<'a, S, O> {
     pub(crate) fn park(&self, worker_id: usize) -> Result<()> {
         self.unparker
             .park()
-            .map_err(|error| wait_error_to_runtime(error, worker_id))
+            .map_err(|error| error.into_runtime_error(worker_id))
     }
 }
 
@@ -159,15 +165,6 @@ impl<S: ScopeStorage, O: Ownership> Drop for ScopeJoinFuture<'_, S, O> {
     fn drop(&mut self) {
         unsafe { self.completion.remove_waiter(NonNull::from(&self.node)) };
     }
-}
-
-/// 作用域级别的完成通知：所有子任务完成后唤醒等待者。
-pub struct GenericScopeCompletion<S: ScopeStorage, O: Ownership> {
-    remaining: S::Usize,
-    wakers: S::Lock<LinkedList<ScopeWakerAdapter<S>>>,
-    cancel_token: GenericCancellationToken<S, O>,
-    panic_info: S::OptionBox<PanicPayload>,
-    parent: S::Parent,
 }
 
 pub type ScopeCompletion = GenericScopeCompletion<AtomicStorage, ArcOwnership>;
@@ -351,12 +348,14 @@ impl<S: ScopeStorage, O: Ownership + 'static> RawScope for GenericScopeCompletio
 
     #[inline]
     fn try_link_child(&self, child_token: &ErasedCancellationToken) -> bool {
-        if child_token.s_type != S::strategy_type() || child_token.o_type != O::strategy_type() {
+        if child_token.storage_strategy() != S::strategy_type()
+            || child_token.ownership_strategy() != O::strategy_type()
+        {
             return false;
         }
         unsafe {
             self.cancel_token()
-                .try_link_child_raw(child_token.ptr.as_ptr());
+                .try_link_child_raw(child_token.token_ptr().as_ptr());
         }
         true
     }
@@ -401,10 +400,15 @@ impl<S: ScopeStorage, O: Ownership + 'static> RawScope for GenericScopeCompletio
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::utils::ownership::ArcOwnership;
-    use veloq_std::sync::{NativeArc as Arc, NativeBarrier as Barrier, mpsc::sync_channel};
-    use veloq_std::thread;
+    use crate::{
+        runtime::Unparker,
+        scope::{GenericScopeCompletion, ScopeBlockingWaiter},
+        utils::ArcOwnership,
+    };
+    use veloq_std::{
+        sync::{NativeArc as Arc, NativeBarrier as Barrier, mpsc::sync_channel},
+        thread,
+    };
     use veloq_storage::AtomicStorage;
 
     #[test]

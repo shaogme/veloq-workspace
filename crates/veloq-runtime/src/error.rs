@@ -41,10 +41,42 @@ impl Error for EnqueueError {}
 /// 后端报告的文本快照，避免把只能在 driver 线程使用的报告对象跨线程或跨 crate 保存。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeWakeError {
-    pub backend: &'static str,
-    pub worker_id: usize,
-    pub operation: &'static str,
-    pub detail: String,
+    backend: &'static str,
+    worker_id: usize,
+    operation: &'static str,
+    detail: String,
+}
+
+impl RuntimeWakeError {
+    pub fn new(
+        backend: &'static str,
+        worker_id: usize,
+        operation: &'static str,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            backend,
+            worker_id,
+            operation,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn backend(&self) -> &'static str {
+        self.backend
+    }
+
+    pub fn worker_id(&self) -> usize {
+        self.worker_id
+    }
+
+    pub fn operation(&self) -> &'static str {
+        self.operation
+    }
+
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
 }
 
 impl fmt::Display for RuntimeWakeError {
@@ -65,11 +97,49 @@ impl Error for RuntimeWakeError {}
 /// 使 worker loop、`block_on` 和 scope join 可以沿用同一错误类型观察失败。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeDriverError {
-    pub backend: &'static str,
-    pub worker_id: usize,
-    pub phase: &'static str,
-    pub operation: &'static str,
-    pub detail: String,
+    backend: &'static str,
+    worker_id: usize,
+    phase: &'static str,
+    operation: &'static str,
+    detail: String,
+}
+
+impl RuntimeDriverError {
+    pub fn new(
+        backend: &'static str,
+        worker_id: usize,
+        phase: &'static str,
+        operation: &'static str,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            backend,
+            worker_id,
+            phase,
+            operation,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn backend(&self) -> &'static str {
+        self.backend
+    }
+
+    pub fn worker_id(&self) -> usize {
+        self.worker_id
+    }
+
+    pub fn phase(&self) -> &'static str {
+        self.phase
+    }
+
+    pub fn operation(&self) -> &'static str {
+        self.operation
+    }
+
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
 }
 
 impl fmt::Display for RuntimeDriverError {

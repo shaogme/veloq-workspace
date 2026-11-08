@@ -1,14 +1,13 @@
-use veloq_runtime::runtime::Runtime;
-use veloq_runtime::{task, task_local, scope};
+use veloq_runtime::{Runtime, scope, task, task_local};
 
 fn main() {
     Runtime::<(), _>::scope(async |ctx| {
         scope!(ctx, async |s| {
             task_local!(t, async {
-                veloq_runtime::task::yield_now().await;
-                veloq_runtime::task::yield_now().await;
-                veloq_runtime::task::yield_now().await;
-                veloq_runtime::task::yield_now().await;
+                veloq_runtime::yield_now().await;
+                veloq_runtime::yield_now().await;
+                veloq_runtime::yield_now().await;
+                veloq_runtime::yield_now().await;
                 42
             });
             let _ = s.spawn_local(&t);
@@ -17,10 +16,10 @@ fn main() {
         .unwrap();
         scope!(ctx, async |s| {
             task!(t, async {
-                veloq_runtime::task::yield_now().await;
-                veloq_runtime::task::yield_now().await;
-                veloq_runtime::task::yield_now().await;
-                veloq_runtime::task::yield_now().await;
+                veloq_runtime::yield_now().await;
+                veloq_runtime::yield_now().await;
+                veloq_runtime::yield_now().await;
+                veloq_runtime::yield_now().await;
                 42
             });
             let _ = s.spawn(&t);

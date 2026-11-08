@@ -1,9 +1,5 @@
 use veloq_runtime::{
-    error::Result,
-    runtime::{
-        context::{IdleDecision, IdleWaitStrategy},
-        RuntimeBuilder, RuntimeShared,
-    },
+    IdleDecision, IdleWaitStrategy, Result, RuntimeBuilder, RuntimeShared,
 };
 
 struct CustomExtra;

@@ -1,5 +1,4 @@
-use veloq_runtime::runtime::Runtime;
-use veloq_runtime::scope;
+use veloq_runtime::{Runtime, scope};
 
 fn main() {
     Runtime::<(), _>::scope(async |ctx| {

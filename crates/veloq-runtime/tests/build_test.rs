@@ -1,7 +1,4 @@
-use veloq_runtime::{
-    runtime::{Runtime, RuntimeBuilder},
-    scope, scope_local,
-};
+use veloq_runtime::{Runtime, RuntimeBuilder, scope, scope_local};
 use veloq_std::num::NonZeroUsize;
 
 #[test]

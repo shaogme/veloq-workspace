@@ -6,19 +6,22 @@ use veloq_std::{
     fs::File,
     mem,
     num::NonZeroU32,
+    sync::NativeMutex,
     thread,
     time::{Duration, Instant},
     vec,
     vec::Vec,
 };
 
-use veloq_driver_core::{
-    CancelRequest, CompletionRecordParts, CompletionValue, DriveMode, Driver, DriverSubmitResult,
-    PollRecordResult, RegisterFd, SubmitStatus,
-};
+use libc::{ECANCELED, F_GETFD, fcntl};
+
+#[cfg(feature = "test-hooks")]
+use libc::{EIO, dup2};
 
 use veloq_driver_core::{
-    Close as CoreClose, Fsync as CoreFsync, IntoPlatformOp, Timeout as CoreTimeout,
+    CancelRequest, Close as CoreClose, CompletionRecordParts, CompletionValue, DriveMode, Driver,
+    DriverSubmitResult, Fsync as CoreFsync, IntoPlatformOp, OpToken, PollRecordResult, RegisterFd,
+    SubmitStatus, Timeout as CoreTimeout,
 };
 #[cfg(feature = "test-hooks")]
 use veloq_driver_core::{test_hooks::DriverTestHooks, test_hooks::RegisterFilesUpdateOutcome};
@@ -30,6 +33,8 @@ use veloq_driver_uring::{
 type Close = CoreClose<UringRawHandle>;
 type Fsync = CoreFsync<UringRawHandle>;
 type Timeout = CoreTimeout;
+
+static FD_TEST_LOCK: NativeMutex<()> = NativeMutex::new(());
 
 fn new_driver_or_skip() -> Option<UringDriver<'static>> {
     match UringDriver::new(UringConfig::default()) {
@@ -43,6 +48,7 @@ fn new_driver_or_skip() -> Option<UringDriver<'static>> {
 
 #[test]
 fn software_timer_stays_out_of_sq_backlog_when_sq_is_full_and_cancelled() {
+    let _fd_test_lock = FD_TEST_LOCK.lock();
     let config = UringConfig::default()
         .with_entries(NonZeroU32::new(1).expect("non-zero SQ capacity"))
         .drive_limits(UringDriveLimits::for_entries(1));
@@ -76,7 +82,7 @@ fn software_timer_stays_out_of_sq_backlog_when_sq_is_full_and_cancelled() {
             }
         };
         if let Some(mut record) = record {
-            assert_eq!(record.event().res(), -libc::ECANCELED);
+            assert_eq!(record.event().res(), -ECANCELED);
             record.cleanup_mut().disarm();
             break;
         }
@@ -151,6 +157,7 @@ fn register_borrowed_files(driver: &mut UringDriver<'static>, files: &[File]) ->
 
 #[test]
 fn stale_registered_fd_generation_rejected_on_submit() {
+    let _fd_test_lock = FD_TEST_LOCK.lock();
     let Some(mut driver) = new_driver_or_skip() else {
         return;
     };
@@ -262,6 +269,7 @@ fn assert_close_is_rejected_with(
 
 #[test]
 fn unknown_single_registration_poisoned_file_table_is_fail_stop() {
+    let _fd_test_lock = FD_TEST_LOCK.lock();
     let Some(mut driver) = new_driver_with_file_table_or_skip(4, FileTableExhaustion::Fail) else {
         return;
     };
@@ -281,6 +289,7 @@ fn unknown_single_registration_poisoned_file_table_is_fail_stop() {
 #[cfg(feature = "test-hooks")]
 #[test]
 fn partial_batch_registration_rolls_back_successful_prefix() {
+    let _fd_test_lock = FD_TEST_LOCK.lock();
     let Some(mut driver) = new_driver_with_file_table_or_skip(4, FileTableExhaustion::Fail) else {
         return;
     };
@@ -311,6 +320,7 @@ fn partial_batch_registration_rolls_back_successful_prefix() {
 #[cfg(feature = "test-hooks")]
 #[test]
 fn rejected_registration_releases_batch_without_rollback() {
+    let _fd_test_lock = FD_TEST_LOCK.lock();
     let Some(mut driver) = new_driver_with_file_table_or_skip(2, FileTableExhaustion::Fallback)
     else {
         return;
@@ -320,7 +330,7 @@ fn rejected_registration_releases_batch_without_rollback() {
     let raw = raw_file(&file);
     {
         let hooks = &mut driver as &mut dyn DriverTestHooks;
-        hooks.debug_inject_register_files_update_failure(libc::EIO);
+        hooks.debug_inject_register_files_update_failure(EIO);
     }
 
     let report = driver
@@ -349,6 +359,7 @@ fn rejected_registration_releases_batch_without_rollback() {
 #[cfg(feature = "test-hooks")]
 #[test]
 fn short_registration_then_rollback_failure_uses_the_same_terminal_error() {
+    let _fd_test_lock = FD_TEST_LOCK.lock();
     let Some(mut driver) = new_driver_with_file_table_or_skip(3, FileTableExhaustion::Fail) else {
         return;
     };
@@ -363,7 +374,7 @@ fn short_registration_then_rollback_failure_uses_the_same_terminal_error() {
         let hooks = &mut driver as &mut dyn DriverTestHooks;
         hooks.debug_inject_register_files_update_sequence(&[
             RegisterFilesUpdateOutcome::Updated(1),
-            RegisterFilesUpdateOutcome::Error(libc::EIO),
+            RegisterFilesUpdateOutcome::Error(EIO),
         ]);
     }
 
@@ -384,6 +395,7 @@ fn short_registration_then_rollback_failure_uses_the_same_terminal_error() {
 #[cfg(feature = "test-hooks")]
 #[test]
 fn successful_batch_rollback_keeps_the_file_table_healthy() {
+    let _fd_test_lock = FD_TEST_LOCK.lock();
     let Some(mut driver) = new_driver_with_file_table_or_skip(2, FileTableExhaustion::Fail) else {
         return;
     };
@@ -393,7 +405,7 @@ fn successful_batch_rollback_keeps_the_file_table_healthy() {
     {
         let hooks = &mut driver as &mut dyn DriverTestHooks;
         hooks.debug_inject_register_files_update_sequence(&[
-            RegisterFilesUpdateOutcome::Error(libc::EIO),
+            RegisterFilesUpdateOutcome::Error(EIO),
             RegisterFilesUpdateOutcome::Actual,
         ]);
     }
@@ -414,6 +426,7 @@ fn successful_batch_rollback_keeps_the_file_table_healthy() {
 #[cfg(feature = "test-hooks")]
 #[test]
 fn failed_registered_unregister_poison_keeps_owned_entry_until_driver_drop() {
+    let _fd_test_lock = FD_TEST_LOCK.lock();
     let Some(mut driver) = new_driver_with_file_table_or_skip(2, FileTableExhaustion::Fail) else {
         return;
     };
@@ -432,7 +445,7 @@ fn failed_registered_unregister_poison_keeps_owned_entry_until_driver_drop() {
 
     {
         let hooks = &mut driver as &mut dyn DriverTestHooks;
-        hooks.debug_inject_register_files_update_failure(libc::EIO);
+        hooks.debug_inject_register_files_update_failure(EIO);
     }
     let report = driver
         .unregister_files(vec![fd])
@@ -447,13 +460,13 @@ fn failed_registered_unregister_poison_keeps_owned_entry_until_driver_drop() {
         1
     );
     assert!(
-        unsafe { libc::fcntl(raw_fd, libc::F_GETFD) } >= 0,
+        unsafe { fcntl(raw_fd, F_GETFD) } >= 0,
         "owned entry must remain live while the poisoned driver exists"
     );
 
     drop(driver);
     assert_eq!(
-        unsafe { libc::fcntl(raw_fd, libc::F_GETFD) },
+        unsafe { fcntl(raw_fd, F_GETFD) },
         -1,
         "owned entry must be released after the ring is dropped"
     );
@@ -462,6 +475,7 @@ fn failed_registered_unregister_poison_keeps_owned_entry_until_driver_drop() {
 #[cfg(feature = "test-hooks")]
 #[test]
 fn poisoned_file_table_rejects_old_registered_sqes_before_kernel_submission() {
+    let _fd_test_lock = FD_TEST_LOCK.lock();
     let Some(mut driver) = new_driver_with_file_table_or_skip(4, FileTableExhaustion::Fail) else {
         return;
     };
@@ -484,7 +498,7 @@ fn poisoned_file_table_rejects_old_registered_sqes_before_kernel_submission() {
         let hooks = &mut driver as &mut dyn DriverTestHooks;
         hooks.debug_inject_register_files_update_sequence(&[
             RegisterFilesUpdateOutcome::Updated(1),
-            RegisterFilesUpdateOutcome::Error(libc::EIO),
+            RegisterFilesUpdateOutcome::Error(EIO),
         ]);
     }
     driver
@@ -497,6 +511,7 @@ fn poisoned_file_table_rejects_old_registered_sqes_before_kernel_submission() {
 #[cfg(feature = "test-hooks")]
 #[test]
 fn a_close_already_in_flight_forgets_owned_entry_after_poison() {
+    let _fd_test_lock = FD_TEST_LOCK.lock();
     let Some(mut driver) = new_driver_with_file_table_or_skip(4, FileTableExhaustion::Fail) else {
         return;
     };
@@ -524,7 +539,7 @@ fn a_close_already_in_flight_forgets_owned_entry_after_poison() {
         let hooks = &mut driver as &mut dyn DriverTestHooks;
         hooks.debug_inject_register_files_update_sequence(&[
             RegisterFilesUpdateOutcome::Updated(1),
-            RegisterFilesUpdateOutcome::Error(libc::EIO),
+            RegisterFilesUpdateOutcome::Error(EIO),
         ]);
     }
     driver
@@ -545,6 +560,7 @@ fn a_close_already_in_flight_forgets_owned_entry_after_poison() {
 
 #[test]
 fn exhausted_batch_registration_does_not_partially_register() {
+    let _fd_test_lock = FD_TEST_LOCK.lock();
     let Some(mut driver) = new_driver_with_file_table_or_skip(4, FileTableExhaustion::Fail) else {
         return;
     };
@@ -572,11 +588,7 @@ fn register_borrowed_files_result(
     driver.register_files(registrations)
 }
 
-fn wait_completion(
-    driver: &mut UringDriver<'static>,
-    token: veloq_driver_core::OpToken,
-    timeout: Duration,
-) -> usize {
+fn wait_completion(driver: &mut UringDriver<'static>, token: OpToken, timeout: Duration) -> usize {
     let start = Instant::now();
     loop {
         if start.elapsed() > timeout {
@@ -612,7 +624,7 @@ fn wait_completion(
 #[cfg(feature = "test-hooks")]
 fn wait_completion_with_driver_error(
     driver: &mut UringDriver<'static>,
-    token: veloq_driver_core::OpToken,
+    token: OpToken,
     timeout: Duration,
 ) -> (usize, Option<UringError>) {
     let start = Instant::now();
@@ -650,7 +662,7 @@ fn wait_completion_with_driver_error(
     }
 }
 
-fn submit_test_op<T>(driver: &mut UringDriver<'static>, data: T) -> veloq_driver_core::OpToken
+fn submit_test_op<T>(driver: &mut UringDriver<'static>, data: T) -> OpToken
 where
     T: IntoPlatformOp<UringSlotSpec>,
 {
@@ -669,6 +681,7 @@ where
 
 #[test]
 fn close_owned_registered_file() {
+    let _fd_test_lock = FD_TEST_LOCK.lock();
     let Some(mut driver) = new_driver_or_skip() else {
         return;
     };
@@ -709,6 +722,7 @@ fn close_owned_registered_file() {
 #[cfg(feature = "test-hooks")]
 #[test]
 fn close_cleanup_error_quarantines_registered_owned_slot() {
+    let _fd_test_lock = FD_TEST_LOCK.lock();
     let Some(mut driver) = new_driver_with_file_table_or_skip(2, FileTableExhaustion::Fail) else {
         return;
     };
@@ -726,7 +740,7 @@ fn close_cleanup_error_quarantines_registered_owned_slot() {
         .unwrap();
 
     let hooks = &mut driver as &mut dyn DriverTestHooks;
-    hooks.debug_inject_register_files_update_failure(libc::EIO);
+    hooks.debug_inject_register_files_update_failure(EIO);
     let token = submit_test_op(&mut driver, Close { fd });
     let (closed, cleanup_error) =
         wait_completion_with_driver_error(&mut driver, token, Duration::from_secs(5));
@@ -746,6 +760,7 @@ fn close_cleanup_error_quarantines_registered_owned_slot() {
 #[cfg(feature = "test-hooks")]
 #[test]
 fn close_cleanup_short_update_quarantines_without_releasing_slot() {
+    let _fd_test_lock = FD_TEST_LOCK.lock();
     let Some(mut driver) = new_driver_with_file_table_or_skip(2, FileTableExhaustion::Fail) else {
         return;
     };
@@ -780,6 +795,7 @@ fn close_cleanup_short_update_quarantines_without_releasing_slot() {
 #[cfg(feature = "test-hooks")]
 #[test]
 fn quarantined_slot_uses_direct_fallback_when_fixed_capacity_is_degraded() {
+    let _fd_test_lock = FD_TEST_LOCK.lock();
     let Some(mut driver) = new_driver_with_file_table_or_skip(2, FileTableExhaustion::Fallback)
     else {
         return;
@@ -798,7 +814,7 @@ fn quarantined_slot_uses_direct_fallback_when_fixed_capacity_is_degraded() {
         .unwrap();
 
     let hooks = &mut driver as &mut dyn DriverTestHooks;
-    hooks.debug_inject_register_files_update_failure(libc::EIO);
+    hooks.debug_inject_register_files_update_failure(EIO);
     let token = submit_test_op(&mut driver, Close { fd });
     let (closed, cleanup_error) =
         wait_completion_with_driver_error(&mut driver, token, Duration::from_secs(5));
@@ -820,6 +836,7 @@ fn quarantined_slot_uses_direct_fallback_when_fixed_capacity_is_degraded() {
 #[cfg(feature = "test-hooks")]
 #[test]
 fn close_cleanup_failure_does_not_close_reused_raw_fd_on_driver_drop() {
+    let _fd_test_lock = FD_TEST_LOCK.lock();
     let Some(mut driver) = new_driver_with_file_table_or_skip(2, FileTableExhaustion::Fail) else {
         return;
     };
@@ -837,7 +854,7 @@ fn close_cleanup_failure_does_not_close_reused_raw_fd_on_driver_drop() {
         .unwrap();
 
     let hooks = &mut driver as &mut dyn DriverTestHooks;
-    hooks.debug_inject_register_files_update_failure(libc::EIO);
+    hooks.debug_inject_register_files_update_failure(EIO);
     let token = submit_test_op(&mut driver, Close { fd });
     let (closed, cleanup_error) =
         wait_completion_with_driver_error(&mut driver, token, Duration::from_secs(5));
@@ -845,7 +862,7 @@ fn close_cleanup_failure_does_not_close_reused_raw_fd_on_driver_drop() {
     assert_eq!(cleanup_error, Some(UringError::FileTableQuarantined));
 
     let replacement = File::open("Cargo.toml").unwrap();
-    let duplicate = unsafe { libc::dup2(replacement.as_raw_fd(), raw_fd) };
+    let duplicate = unsafe { dup2(replacement.as_raw_fd(), raw_fd) };
     assert_eq!(duplicate, raw_fd);
     drop(driver);
     replacement
@@ -873,6 +890,7 @@ fn register_one_beyond(driver: &mut UringDriver<'static>) -> (File, IoFd) {
 
 #[test]
 fn a_full_file_table_falls_back_to_unregistered_descriptors() {
+    let _fd_test_lock = FD_TEST_LOCK.lock();
     // Capacity 1 is entirely consumed by the waker, so any user file overflows.
     let Some(mut driver) = new_driver_with_file_table_or_skip(1, FileTableExhaustion::Fallback)
     else {
@@ -896,6 +914,7 @@ fn a_full_file_table_falls_back_to_unregistered_descriptors() {
 
 #[test]
 fn a_disabled_file_table_serves_every_descriptor_as_a_raw_fd() {
+    let _fd_test_lock = FD_TEST_LOCK.lock();
     // Capacity 0 means even the waker eventfd is submitted unregistered.
     let Some(mut driver) = new_driver_with_file_table_or_skip(0, FileTableExhaustion::Fallback)
     else {
@@ -929,6 +948,7 @@ fn a_disabled_file_table_serves_every_descriptor_as_a_raw_fd() {
 /// could catch, which is exactly why direct descriptors carry no use-after-close protection.
 #[test]
 fn a_fallback_descriptor_has_no_generation_to_invalidate() {
+    let _fd_test_lock = FD_TEST_LOCK.lock();
     let Some(mut driver) = new_driver_with_file_table_or_skip(1, FileTableExhaustion::Fallback)
     else {
         return;
@@ -957,6 +977,7 @@ fn a_fallback_descriptor_has_no_generation_to_invalidate() {
 
 #[test]
 fn close_owned_fallback_file() {
+    let _fd_test_lock = FD_TEST_LOCK.lock();
     let Some(mut driver) = new_driver_with_file_table_or_skip(1, FileTableExhaustion::Fallback)
     else {
         return;
@@ -994,6 +1015,7 @@ fn close_owned_fallback_file() {
 
 #[test]
 fn duplicate_owned_direct_registration_preserves_the_existing_owner() {
+    let _fd_test_lock = FD_TEST_LOCK.lock();
     let Some(mut driver) = new_driver_with_file_table_or_skip(0, FileTableExhaustion::Fallback)
     else {
         return;
@@ -1016,14 +1038,15 @@ fn duplicate_owned_direct_registration_preserves_the_existing_owner() {
         .expect_err("the same raw fd must not receive a second owned registration");
     assert_eq!(*report.inner(), UringError::DuplicateOwnedFd);
     assert!(report.context().contains_key("raw_fd"));
-    assert!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) } >= 0);
+    assert!(unsafe { fcntl(raw_fd, F_GETFD) } >= 0);
 
     driver.unregister_files(vec![first]).unwrap();
-    assert_eq!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }, -1);
+    assert_eq!(unsafe { fcntl(raw_fd, F_GETFD) }, -1);
 }
 
 #[test]
 fn duplicate_owned_fixed_registration_preserves_the_existing_owner() {
+    let _fd_test_lock = FD_TEST_LOCK.lock();
     let Some(mut driver) = new_driver_with_file_table_or_skip(2, FileTableExhaustion::Fail) else {
         return;
     };
@@ -1044,14 +1067,15 @@ fn duplicate_owned_fixed_registration_preserves_the_existing_owner() {
         .expect_err("a fixed owner must reject a second owned registration");
     assert_eq!(*report.inner(), UringError::DuplicateOwnedFd);
     assert!(report.context().contains_key("existing_file_index"));
-    assert!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) } >= 0);
+    assert!(unsafe { fcntl(raw_fd, F_GETFD) } >= 0);
 
     driver.unregister_files(vec![first]).unwrap();
-    assert_eq!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }, -1);
+    assert_eq!(unsafe { fcntl(raw_fd, F_GETFD) }, -1);
 }
 
 #[test]
 fn borrowed_and_owned_descriptors_may_share_a_raw_fd() {
+    let _fd_test_lock = FD_TEST_LOCK.lock();
     let Some(mut driver) = new_driver_with_file_table_or_skip(0, FileTableExhaustion::Fallback)
     else {
         return;
@@ -1072,11 +1096,12 @@ fn borrowed_and_owned_descriptors_may_share_a_raw_fd() {
     assert!(descriptors[1].direct_owner().is_some());
 
     driver.unregister_files(descriptors).unwrap();
-    assert_eq!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }, -1);
+    assert_eq!(unsafe { fcntl(raw_fd, F_GETFD) }, -1);
 }
 
 #[test]
 fn stale_owned_direct_descriptor_cannot_unregister_or_submit_to_a_reused_fd() {
+    let _fd_test_lock = FD_TEST_LOCK.lock();
     let Some(mut driver) = new_driver_with_file_table_or_skip(0, FileTableExhaustion::Fallback)
     else {
         return;
@@ -1097,7 +1122,7 @@ fn stale_owned_direct_descriptor_cannot_unregister_or_submit_to_a_reused_fd() {
     driver.unregister_files(vec![first]).unwrap();
 
     assert_eq!(
-        unsafe { libc::dup2(replacement_source.as_raw_fd(), raw_fd) },
+        unsafe { dup2(replacement_source.as_raw_fd(), raw_fd) },
         raw_fd
     );
     drop(replacement_source);
@@ -1108,19 +1133,20 @@ fn stale_owned_direct_descriptor_cannot_unregister_or_submit_to_a_reused_fd() {
         .next()
         .unwrap();
     assert_ne!(first.direct_owner(), replacement.direct_owner());
-    assert!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) } >= 0);
+    assert!(unsafe { fcntl(raw_fd, F_GETFD) } >= 0);
 
     driver.unregister_files(vec![first]).unwrap();
-    assert!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) } >= 0);
+    assert!(unsafe { fcntl(raw_fd, F_GETFD) } >= 0);
     assert_stale_fsync_is_rejected(&mut driver, first);
     assert_close_is_rejected_with(&mut driver, first, UringError::InvalidInput);
 
     driver.unregister_files(vec![replacement]).unwrap();
-    assert_eq!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }, -1);
+    assert_eq!(unsafe { fcntl(raw_fd, F_GETFD) }, -1);
 }
 
 #[test]
 fn duplicate_owned_batch_is_rejected_before_claiming_fixed_slots() {
+    let _fd_test_lock = FD_TEST_LOCK.lock();
     let Some(mut driver) = new_driver_with_file_table_or_skip(2, FileTableExhaustion::Fail) else {
         return;
     };
@@ -1135,7 +1161,7 @@ fn duplicate_owned_batch_is_rejected_before_claiming_fixed_slots() {
         ])
         .expect_err("a duplicate owned fd in one batch must be rejected");
     assert_eq!(*report.inner(), UringError::DuplicateOwnedFd);
-    assert_eq!(unsafe { libc::fcntl(duplicate_fd, libc::F_GETFD) }, -1);
+    assert_eq!(unsafe { fcntl(duplicate_fd, F_GETFD) }, -1);
 
     let valid_file = File::open("Cargo.toml").unwrap();
     let valid_fd = valid_file.as_raw_fd();
@@ -1151,11 +1177,12 @@ fn duplicate_owned_batch_is_rejected_before_claiming_fixed_slots() {
         "the rejected batch must not claim a slot"
     );
     driver.unregister_files(vec![valid]).unwrap();
-    assert_eq!(unsafe { libc::fcntl(valid_fd, libc::F_GETFD) }, -1);
+    assert_eq!(unsafe { fcntl(valid_fd, F_GETFD) }, -1);
 }
 
 #[test]
 fn close_borrowed_registered_file_is_rejected() {
+    let _fd_test_lock = FD_TEST_LOCK.lock();
     let Some(mut driver) = new_driver_or_skip() else {
         return;
     };
