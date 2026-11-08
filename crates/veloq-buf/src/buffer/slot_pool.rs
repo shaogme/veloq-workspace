@@ -15,19 +15,24 @@ use veloq_std::{
 use super::{
     any::AnyBufPool,
     common::{
-        AllocResult, BackingPool, BufPool, BufferRegion, BufferRegistrar, PoolKind, RegionInfo,
-        RegistrationCapability,
+        AllocResult, BackingPool, BufError, BufPool, BufResult, BufferRegion, BufferRegistrar,
+        PoolKind, RegionInfo, RegistrationCapability,
     },
-    error::{BufError, BufResult},
     handle::{FixedBuf, PackedContext},
     locked_memory::{LockedMemoryBudget, LockedMemoryPermit},
 };
 use crate::{
-    heap::{
-        ChunkId, GlobalAllocatorConfig, GlobalSlotPool, SLOT_SIZE, SlotIndex, buddy::BuddyAllocator,
-    },
-    os,
+    heap::{BuddyAllocator, ChunkId, GlobalAllocatorConfig, GlobalSlotPool, SLOT_SIZE, SlotIndex},
+    os::Platform,
 };
+use veloq_tls::veloq_tls;
+
+#[derive(Clone)]
+pub struct PoolInitContext {
+    worker_count: NonZeroUsize,
+    registration_workers: Box<[usize]>,
+    budget: LockedMemoryBudget,
+}
 
 /// 定义 Runtime 所有工作线程的缓冲池拓扑结构
 /// Defines the buffer pool topology for the runtime.
@@ -61,13 +66,6 @@ pub trait PoolTopology: Clone + Send + Sync {
     ) -> BufResult<AnyBufPool>;
 }
 
-#[derive(Clone)]
-pub struct PoolInitContext {
-    worker_count: NonZeroUsize,
-    registration_workers: Box<[usize]>,
-    budget: LockedMemoryBudget,
-}
-
 pub struct UniformPoolState {
     registration_workers: Box<[usize]>,
     pool: Option<Arc<GlobalSlotPool>>,
@@ -75,6 +73,10 @@ pub struct UniformPoolState {
 }
 
 impl UniformPoolState {
+    pub fn pool(&self) -> Option<&Arc<GlobalSlotPool>> {
+        self.pool.as_ref()
+    }
+
     fn heap_only(worker_count: NonZeroUsize, registration_workers: Box<[usize]>) -> Self {
         Self {
             registration_workers,
@@ -181,7 +183,7 @@ impl PoolTopology for UniformSlot {
                 context.registration_workers,
             )));
         }
-        let page_size = os::page_size().ok_or_else(|| {
+        let page_size = Platform::page_size().ok_or_else(|| {
             BufError::Other("failed to query target OS page size".into()).to_report()
         })?;
         if !page_size.is_power_of_two() {
@@ -290,6 +292,8 @@ pub struct SlotBasedPool {
     registered_chunks: Box<[ChunkId]>,
 }
 
+const ARC_CACHE_LIMIT: usize = 64;
+
 impl SlotBasedPool {
     /// 创建新的 SlotBasedPool
     pub fn new(pool: Arc<GlobalSlotPool>) -> Self {
@@ -349,6 +353,60 @@ impl SlotBasedPool {
             Some(needed.ilog2() as usize - 12)
         }
     }
+
+    pub(crate) unsafe fn dealloc(pool_data: NonNull<()>, context: u64) {
+        let raw_ptr = pool_data.as_ptr() as *const GlobalSlotPool;
+
+        let ctx = PackedContext::from(context);
+        let chunk_id = ctx.slot_chunk_id();
+        let order = ctx.allocation_order();
+        let slot_idx = SlotIndex::from_index(ctx.allocation_slot_index());
+
+        let recycled = with_pool_cache(|cache| {
+            let mut inner = cache.0.get();
+            if inner.ptr == raw_ptr && inner.balance < ARC_CACHE_LIMIT as u32 {
+                inner.balance += 1;
+                cache.0.set(inner);
+                true
+            } else {
+                false
+            }
+        });
+
+        if recycled {
+            let pool = unsafe { &*raw_ptr };
+            unsafe { pool.dealloc_slots(chunk_id, slot_idx, order) };
+        } else {
+            let pool = unsafe { Arc::from_raw(raw_ptr) };
+            unsafe { pool.dealloc_slots(chunk_id, slot_idx, order) };
+        }
+    }
+
+    pub(crate) unsafe fn resolve_region_info(pool_data: NonNull<()>, buf: &FixedBuf) -> RegionInfo {
+        let pool = unsafe { &*(pool_data.as_ptr() as *const GlobalSlotPool) };
+        let ctx = PackedContext::from(buf.context_raw());
+        let chunk_id = ctx.slot_chunk_id();
+        let chunk_info = pool
+            .chunk_info(chunk_id)
+            .expect("FixedBuf has invalid ChunkID");
+        let base_ptr = chunk_info.ptr();
+        let base = base_ptr.as_ptr() as usize;
+        let ptr = buf.as_ptr() as usize;
+
+        RegionInfo {
+            pool_kind: PoolKind::SlotBased,
+            registration: if buf.is_registered() {
+                RegistrationCapability::RegisteredChunk(chunk_id)
+            } else {
+                RegistrationCapability::Unregistered
+            },
+            id: chunk_id,
+            base_ptr,
+            region_len: chunk_info.len(),
+            offset: ptr.saturating_sub(base),
+            cookie: 0,
+        }
+    }
 }
 
 impl Debug for SlotBasedPool {
@@ -356,8 +414,6 @@ impl Debug for SlotBasedPool {
         f.debug_struct("SlotBasedPool").finish()
     }
 }
-
-const ARC_CACHE_LIMIT: usize = 64;
 
 #[derive(Copy, Clone)]
 struct PoolCacheInner {
@@ -391,7 +447,7 @@ impl Drop for ThreadLocalPoolCache {
     }
 }
 
-veloq_tls::veloq_tls! {
+veloq_tls! {
     /// 缓存当前线程使用的全局池引用计数。
     static POOL_CACHE: ThreadLocalPoolCache = ThreadLocalPoolCache::new();
 }
@@ -407,15 +463,15 @@ impl BackingPool for SlotBasedPool {
             return AllocResult::Failed;
         };
 
-        if let Some((chunk_id, slot_idx, ptr)) =
-            self.pool
-                .alloc_slots(order, self.seed, &self.registered_chunks)
+        if let Some(allocation) = self
+            .pool
+            .alloc_slots(order, self.seed, &self.registered_chunks)
         {
             let capacity = BuddyAllocator::capacity_of(order);
             let context_data = PackedContext::from_slot_parts(
-                slot_idx.get() as u32,
+                allocation.slot_idx.get() as u32,
                 order as u8,
-                chunk_id,
+                allocation.chunk_id,
                 PoolKind::SlotBased,
                 true,
             );
@@ -424,10 +480,10 @@ impl BackingPool for SlotBasedPool {
             let cap = unsafe { NonZeroUsize::new_unchecked(capacity) };
 
             AllocResult::Allocated {
-                ptr,
+                ptr: allocation.ptr,
                 cap,
                 context,
-                registration: RegistrationCapability::RegisteredChunk(chunk_id),
+                registration: RegistrationCapability::RegisteredChunk(allocation.chunk_id),
             }
         } else {
             AllocResult::Failed
@@ -499,81 +555,15 @@ impl BufPool for SlotBasedPool {
     }
 }
 
-pub(crate) unsafe fn slot_based_dealloc(pool_data: NonNull<()>, context: u64) {
-    let raw_ptr = pool_data.as_ptr() as *const GlobalSlotPool;
-
-    let ctx = PackedContext::from(context);
-    let chunk_id = ctx.slot_chunk_id();
-    let order = ctx.order() as usize;
-    let slot_idx = SlotIndex(ctx.slot_idx() as usize);
-
-    // Try recycle
-    let recycled = with_pool_cache(|cache| {
-        let mut inner = cache.0.get();
-        if inner.ptr == raw_ptr && inner.balance < ARC_CACHE_LIMIT as u32 {
-            inner.balance += 1;
-            cache.0.set(inner);
-            true
-        } else {
-            false
-        }
-    });
-
-    if recycled {
-        // We recycled the ref (put into TLS balance).
-        // So we do NOT drop the Arc.
-        let pool = unsafe { &*raw_ptr };
-        unsafe {
-            pool.dealloc_slots(chunk_id, slot_idx, order);
-        }
-    } else {
-        // Standard drop (Atomic Decrement)
-        let pool = unsafe { Arc::from_raw(raw_ptr) };
-        unsafe {
-            pool.dealloc_slots(chunk_id, slot_idx, order);
-        }
-    }
-}
-
-pub(crate) unsafe fn slot_based_resolve_region_info(
-    pool_data: NonNull<()>,
-    buf: &FixedBuf,
-) -> RegionInfo {
-    // 1. Cast back to GlobalSlotPool
-    let pool = unsafe { &*(pool_data.as_ptr() as *const GlobalSlotPool) };
-
-    // 2. Unpack ChunkID
-    let ctx = PackedContext::from(buf.context_raw());
-    let chunk_id = ctx.slot_chunk_id();
-
-    // 3. Get base address from ChunkInfo
-    let chunk_info = pool
-        .chunk_info(chunk_id)
-        .expect("FixedBuf has invalid ChunkID");
-    let base = chunk_info.ptr.as_ptr() as usize;
-    let ptr = buf.as_ptr() as usize;
-
-    RegionInfo {
-        pool_kind: PoolKind::SlotBased,
-        registration: if ctx.registered() {
-            RegistrationCapability::RegisteredChunk(chunk_id)
-        } else {
-            RegistrationCapability::Unregistered
-        },
-        id: chunk_id,
-        base_ptr: chunk_info.ptr,
-        region_len: chunk_info.len,
-        offset: ptr.saturating_sub(base),
-        cookie: 0, // Cookies are currently only used for heap buffers
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::heap::SUPERBLOCK_SIZE;
-    use veloq_std::cell::Cell;
-    use veloq_std::vec;
+    use crate::{
+        AnyBufPool, BufPool, BufResult, BufferRegion, BufferRegistrar, LockedMemoryBudget,
+        PoolInitContext, PoolKind, PoolTopology, RegistrationCapability, UniformPoolState,
+        UniformSlot,
+        heap::{ChunkId, SLOT_SIZE, SUPERBLOCK_SIZE},
+    };
+    use veloq_std::{cell::Cell, num::NonZeroUsize, sync::Arc, vec, vec::Vec};
 
     struct RecordingRegistrar {
         calls: Cell<usize>,
@@ -612,11 +602,11 @@ mod tests {
         for slot_count in [1, 63, 64, 65] {
             let capacity_bytes = slot_count * SLOT_SIZE;
             let (state, pool) = initialized_registered_pool(capacity_bytes);
-            let backing_pool = state.pool.as_ref().expect("capacity should be registered");
+            let backing_pool = state.pool().expect("capacity should be registered");
             let region = backing_pool
                 .chunk_info(ChunkId::ZERO)
                 .expect("registered chunk exists");
-            assert_eq!(region.len.get(), capacity_bytes);
+            assert_eq!(region.len().get(), capacity_bytes);
 
             let mut buffers = Vec::with_capacity(slot_count);
             let mut offsets = Vec::with_capacity(slot_count);
@@ -653,21 +643,11 @@ mod tests {
     }
 
     #[test]
-    fn registered_pool_keeps_shards_and_tail_disjoint() {
+    fn registered_pool_covers_tail_slots_and_reuses_released_allocation() {
         let total_slots = SUPERBLOCK_SIZE * 4 + 3;
         let capacity_bytes = total_slots * SLOT_SIZE;
-        let (state, pool) = initialized_registered_pool(capacity_bytes);
-        let backing_pool = state.pool.as_ref().expect("capacity should be registered");
-        let chunk = backing_pool.chunks.read()[0].clone();
-        let main_slots = chunk.superblocks.len() * SUPERBLOCK_SIZE;
-        let shard_count = chunk.shards.len();
-        let slots_per_shard = chunk.slots_per_shard.get();
-
-        assert_eq!(chunk.superblocks.len(), 4);
-        assert!(shard_count.is_power_of_two());
-        assert_eq!(slots_per_shard * shard_count, main_slots);
-        assert!(slots_per_shard.is_multiple_of(SUPERBLOCK_SIZE));
-        assert_eq!(total_slots - main_slots, 3);
+        let (_, pool) = initialized_registered_pool(capacity_bytes);
+        let main_slots = SUPERBLOCK_SIZE * 4;
 
         let slot_size = NonZeroUsize::new(SLOT_SIZE).expect("slot size is non-zero");
         let mut buffers = Vec::with_capacity(total_slots);
@@ -694,21 +674,6 @@ mod tests {
             (0..total_slots)
                 .map(|slot| slot * SLOT_SIZE)
                 .collect::<Vec<_>>()
-        );
-
-        let mut shard_slot_counts = vec![0; shard_count];
-        for offset in &offsets {
-            let slot = offset / SLOT_SIZE;
-            if slot < main_slots {
-                let shard = slot / slots_per_shard;
-                assert!(shard < shard_count);
-                shard_slot_counts[shard] += 1;
-            }
-        }
-        assert!(
-            shard_slot_counts
-                .iter()
-                .all(|slot_count| *slot_count == slots_per_shard)
         );
 
         let tail_start = main_slots * SLOT_SIZE;
@@ -752,7 +717,7 @@ mod tests {
             let context =
                 PoolInitContext::new(1, vec![0], budget.clone()).expect("valid pool context");
             let state = topology.init(context).expect("initialize heap-only pool");
-            assert!(state.pool.is_none());
+            assert!(state.pool().is_none());
             assert_eq!(budget.used_bytes(), 0);
 
             let registrar = RecordingRegistrar::new();

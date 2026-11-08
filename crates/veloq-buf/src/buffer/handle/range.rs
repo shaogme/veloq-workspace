@@ -20,6 +20,15 @@ pub enum BufIoRangeErrorKind {
     LengthExceedsU32,
 }
 
+pub struct BufIoRangeErrorValues {
+    pub buffer_offset: usize,
+    pub buffer_length: usize,
+    pub buffer_capacity: usize,
+    pub buffer_bound: usize,
+    pub buffer_bound_kind: BufIoRangeBound,
+    pub submission_length: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BufIoRangeError {
     kind: BufIoRangeErrorKind,
@@ -33,23 +42,15 @@ pub struct BufIoRangeError {
 
 impl BufIoRangeError {
     #[inline]
-    pub const fn new(
-        kind: BufIoRangeErrorKind,
-        buffer_offset: usize,
-        buffer_length: usize,
-        buffer_capacity: usize,
-        buffer_bound: usize,
-        buffer_bound_kind: BufIoRangeBound,
-        submission_length: usize,
-    ) -> Self {
+    pub const fn new(kind: BufIoRangeErrorKind, values: BufIoRangeErrorValues) -> Self {
         Self {
             kind,
-            buffer_offset,
-            buffer_length,
-            buffer_capacity,
-            buffer_bound,
-            buffer_bound_kind,
-            submission_length,
+            buffer_offset: values.buffer_offset,
+            buffer_length: values.buffer_length,
+            buffer_capacity: values.buffer_capacity,
+            buffer_bound: values.buffer_bound,
+            buffer_bound_kind: values.buffer_bound_kind,
+            submission_length: values.submission_length,
         }
     }
 

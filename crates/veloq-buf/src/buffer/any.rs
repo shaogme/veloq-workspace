@@ -14,7 +14,7 @@ use super::{common::BufPool, handle::FixedBuf};
 /// 手写 VTable，用于动态分发 BufPool 的方法而不使用 dyn
 pub struct BufPoolVTable {
     pub alloc: unsafe fn(*const u8, NonZeroUsize, usize) -> Option<FixedBuf>,
-    pub clone: unsafe fn(*const u8) -> AnyBufPool,
+    pub clone: unsafe fn(*const u8, *mut [usize; 3]),
     pub drop: unsafe fn(*mut u8),
     pub fmt: unsafe fn(*const u8, &mut Formatter<'_>) -> FmtResult,
 }
@@ -24,7 +24,7 @@ pub struct BufPoolVTable {
 /// Designed with Small Object Optimization (SOO) to eliminate heap allocations
 /// for common pool implementations (like `SlotBasedPool` which is just an `Arc`).
 pub struct AnyBufPool {
-    storage: [usize; 3], // 24 bytes
+    storage: [usize; 3],
     vtable: &'static BufPoolVTable,
 }
 
@@ -55,16 +55,17 @@ impl AnyBufPool {
             }
         }
 
-        unsafe fn clone_shim<P: BufPool + Clone>(ptr: *const u8) -> AnyBufPool {
+        unsafe fn clone_shim<P: BufPool + Clone>(ptr: *const u8, output: *mut [usize; 3]) {
             const STORAGE_SIZE: usize = mem::size_of::<[usize; 3]>();
             if mem::size_of::<P>() <= STORAGE_SIZE
                 && mem::align_of::<P>() <= mem::align_of::<usize>()
             {
                 let pool = unsafe { &*(ptr as *const P) };
-                AnyBufPool::new(pool.clone())
+                unsafe { ptr::write((*output).as_mut_ptr() as *mut P, pool.clone()) };
             } else {
                 let pool = unsafe { &**(ptr as *const *const P) };
-                AnyBufPool::new(pool.clone())
+                let clone = Box::into_raw(Box::new(pool.clone()));
+                unsafe { ptr::write((*output).as_mut_ptr(), clone as usize) };
             }
         }
 
@@ -129,7 +130,14 @@ impl BufPool for AnyBufPool {
 
 impl Clone for AnyBufPool {
     fn clone(&self) -> Self {
-        unsafe { (self.vtable.clone)(self.storage.as_ptr() as *const u8) }
+        let mut storage = [0usize; 3];
+        unsafe {
+            (self.vtable.clone)(self.storage.as_ptr() as *const u8, &mut storage);
+        }
+        Self {
+            storage,
+            vtable: self.vtable,
+        }
     }
 }
 

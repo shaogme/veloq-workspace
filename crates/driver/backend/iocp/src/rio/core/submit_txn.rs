@@ -622,11 +622,11 @@ mod tests {
         // SAFETY: the shared test pool owns this exact chunk for the full registry lifetime. / 安全性：共享测试池拥有该 chunk，并覆盖注册表的完整生命周期。
         let mut region = unsafe {
             BufferRegion::new(
-                chunk.id,
-                chunk.ptr,
-                chunk.len,
+                chunk.id(),
+                chunk.ptr(),
+                chunk.len(),
                 RioRegistryTestSupport::chunk_owner(),
-                chunk.allocation_strategy,
+                chunk.allocation_strategy(),
             )
         };
         core.registry_mut()

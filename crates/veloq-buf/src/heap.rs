@@ -11,10 +11,11 @@
 //! Runtime pools create their chunks during initialization and do not grow on exhaustion.
 //! 运行时 pool 在初始化期间创建全部 chunk，耗尽后不会扩容。
 
-pub mod buddy;
+mod buddy;
 mod cache;
 mod pool;
 mod units;
 
+pub use buddy::{BuddyAllocator, BuddyError, MAX_ORDER, MIN_ORDER};
 pub use pool::*;
 pub use units::*;

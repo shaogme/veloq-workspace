@@ -1,6 +1,9 @@
+use core_affinity::{CoreId, get_core_ids, set_for_current};
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use veloq_buf::heap::{GlobalAllocatorConfig, GlobalSlotPool};
-use veloq_buf::{BufPool, SlotBasedPool};
+use veloq_buf::{
+    BufPool, SlotBasedPool,
+    heap::{GlobalAllocatorConfig, GlobalSlotPool},
+};
 use veloq_std::{
     hint::black_box,
     num::NonZeroUsize,
@@ -29,8 +32,8 @@ fn bench_alloc(c: &mut Criterion) {
     group.finish();
 }
 
-fn find_fastest_cores(count: usize) -> Vec<core_affinity::CoreId> {
-    let core_ids = core_affinity::get_core_ids().unwrap_or_default();
+fn find_fastest_cores(count: usize) -> Vec<CoreId> {
+    let core_ids = get_core_ids().unwrap_or_default();
     if core_ids.is_empty() {
         return Vec::new();
     }
@@ -39,7 +42,7 @@ fn find_fastest_cores(count: usize) -> Vec<core_affinity::CoreId> {
     for id in core_ids {
         let start = Instant::now();
         let handle = spawn(move || {
-            core_affinity::set_for_current(id);
+            set_for_current(id);
             let mut sum = 0u64;
             // A simple computation to stress the core
             for i in 0..1_000_000 {
@@ -92,7 +95,7 @@ fn bench_threaded(c: &mut Criterion) {
 
                 handles.push(spawn(move || {
                     if let Some(core) = core_id {
-                        core_affinity::set_for_current(core);
+                        set_for_current(core);
                     }
                     let mut warmup_bufs = Vec::with_capacity(1024);
                     // Warm up: trigger page faults and populate superblocks

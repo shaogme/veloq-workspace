@@ -1,7 +1,10 @@
 //! Core Buffer handle and views.
 
+mod range;
+pub use range::{BufIoRangeBound, BufIoRangeError, BufIoRangeErrorKind, BufIoRangeErrorValues};
+
 use veloq_std::{
-    mem::{align_of, size_of},
+    mem::{ManuallyDrop, align_of, size_of},
     num::NonZeroUsize,
     ops::Range,
     ptr::NonNull,
@@ -11,34 +14,53 @@ use veloq_std::{
 
 use bilge::prelude::*;
 
-mod range;
-pub use range::{BufIoRangeBound, BufIoRangeError, BufIoRangeErrorKind};
-
 use super::{
-    common::{PoolKind, RegionInfo, RegistrationCapability},
-    error::{BufError, BufResult},
-    slot_pool::{slot_based_dealloc, slot_based_resolve_region_info},
+    common::{BufError, BufResult, PoolKind, RegionInfo, RegistrationCapability},
+    slot_pool::SlotBasedPool,
 };
-use crate::{
-    heap::ChunkId,
-    os::{alloc_pages, free_pages},
-};
+use crate::{heap::ChunkId, os::Platform};
 use diagweave::prelude::*;
 
 #[bitsize(64)]
 #[derive(FromBits, DebugBits, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PackedContext {
-    pub slot_idx: u32,
-    pub order: u8,
-    pub chunk_id: u16,
-    pub registered: bool,
-    pub reserved: u6,
-    pub pool_kind: PoolKind,
+    slot_idx: u32,
+    order: u8,
+    chunk_id: u16,
+    registered: bool,
+    reserved: u6,
+    pool_kind: PoolKind,
 }
 
 #[repr(C, align(4096))]
 pub(crate) struct HeapControlBlock {
-    pub(crate) total_size: NonZeroUsize,
+    total_size: NonZeroUsize,
+}
+
+#[derive(Debug)]
+#[repr(C, align(32))]
+pub struct FixedBuf {
+    ptr: NonNull<u8>,
+    pool_data: NonNull<()>,
+    context: PackedContext,
+    len: u32,
+    cap: u32,
+}
+
+pub struct FixedBufSpec {
+    pub ptr: NonNull<u8>,
+    pub cap: NonZeroUsize,
+    pub len: usize,
+    pub pool_data: NonNull<()>,
+    pub pool_kind: PoolKind,
+    pub context: u64,
+    pub registration: RegistrationCapability,
+}
+
+#[derive(Debug, Clone)]
+pub struct FixedBufView<'a> {
+    buf: &'a FixedBuf,
+    range: Range<usize>,
 }
 
 impl PackedContext {
@@ -53,24 +75,20 @@ impl PackedContext {
         pool_kind: PoolKind,
         registered: bool,
     ) -> Self {
-        Self::new(slot_idx, order, chunk_id.0, registered, pool_kind)
+        Self::new(slot_idx, order, chunk_id.raw(), registered, pool_kind)
     }
 
     pub(crate) fn slot_chunk_id(&self) -> ChunkId {
         ChunkId::from_raw(self.chunk_id())
     }
-}
 
-#[derive(Debug)]
-#[repr(C, align(32))]
-pub struct FixedBuf {
-    pub(crate) ptr: NonNull<u8>,
-    // Metadata moved from Heap Header to Handle
-    pub(crate) pool_data: NonNull<()>,
-    pub(crate) context: PackedContext, // [pool_kind:1 | reserved:6 | registered:1 | context_payload:56]
-    pub(crate) len: u32,
-    /// The actual capacity of this specific handle/view.
-    pub(crate) cap: u32,
+    pub(crate) fn allocation_order(&self) -> usize {
+        self.order() as usize
+    }
+
+    pub(crate) fn allocation_slot_index(&self) -> usize {
+        self.slot_idx() as usize
+    }
 }
 
 const _: [(); 32] = [(); size_of::<FixedBuf>()];
@@ -78,6 +96,7 @@ const _: [(); 32] = [(); align_of::<FixedBuf>()];
 
 // Safety: FixedBuf 拥有其底层内存的所有权。
 unsafe impl Send for FixedBuf {}
+
 // Safety: shared access only exposes immutable reads; mutation requires `&mut FixedBuf`.
 unsafe impl Sync for FixedBuf {}
 
@@ -92,6 +111,10 @@ impl FixedBuf {
 
     pub(crate) fn capacity_usize(&self) -> usize {
         self.cap as usize
+    }
+
+    pub(crate) fn is_registered(&self) -> bool {
+        self.context.registered()
     }
 
     pub(crate) unsafe fn from_parts(
@@ -118,51 +141,25 @@ impl FixedBuf {
 
     /// # Safety
     /// `ptr` must be valid and allocated by the pool associated with `pool_kind`.
-    pub unsafe fn new(
-        ptr: NonNull<u8>,
-        cap: NonZeroUsize,
-        len: usize,
-        pool_data: NonNull<()>,
-        pool_kind: PoolKind,
-        context: u64,
-    ) -> Self {
-        unsafe {
-            Self::new_with_registration(
-                ptr,
-                cap,
-                len,
-                pool_data,
-                pool_kind,
-                context,
-                RegistrationCapability::Unregistered,
-            )
-        }
-    }
-
-    pub(crate) unsafe fn new_with_registration(
-        ptr: NonNull<u8>,
-        cap: NonZeroUsize,
-        len: usize,
-        pool_data: NonNull<()>,
-        pool_kind: PoolKind,
-        context: u64,
-        registration: RegistrationCapability,
-    ) -> Self {
-        assert!(len <= cap.get(), "len must be <= capacity");
+    pub unsafe fn new(spec: FixedBufSpec) -> Self {
+        assert!(spec.len <= spec.cap.get(), "len must be <= capacity");
         assert!(
-            cap.get() <= u32::MAX as usize,
+            spec.cap.get() <= u32::MAX as usize,
             "FixedBuf only supports capacity <= u32::MAX"
         );
 
-        let mut context = PackedContext::from(context);
-        context.set_pool_kind(pool_kind);
-        let registered = matches!(registration, RegistrationCapability::RegisteredChunk(_));
+        let mut context = PackedContext::from(spec.context);
+        context.set_pool_kind(spec.pool_kind);
+        let registered = matches!(
+            spec.registration,
+            RegistrationCapability::RegisteredChunk(_)
+        );
         context.set_registered(registered);
-        if let RegistrationCapability::RegisteredChunk(chunk_id) = registration {
+        if let RegistrationCapability::RegisteredChunk(chunk_id) = spec.registration {
             assert_eq!(context.chunk_id(), chunk_id.raw());
         }
 
-        unsafe { Self::from_parts(ptr, pool_data, context, len, cap.get()) }
+        unsafe { Self::from_parts(spec.ptr, spec.pool_data, context, spec.len, spec.cap.get()) }
     }
 
     /// Resolve which region this buffer belongs to and its offset.
@@ -171,10 +168,12 @@ impl FixedBuf {
     /// The interpretation of the region index is pool-dependent.
     pub fn resolve_region_info(&self) -> RegionInfo {
         let mut info = match self.pool_kind() {
-            PoolKind::SlotBased => unsafe { slot_based_resolve_region_info(self.pool_data, self) },
-            PoolKind::Heap => heap_resolve_region_info(self),
+            PoolKind::SlotBased => unsafe {
+                SlotBasedPool::resolve_region_info(self.pool_data, self)
+            },
+            PoolKind::Heap => self.heap_resolve_region_info(),
         };
-        info.registration = if self.context.registered() {
+        info.registration = if self.is_registered() {
             RegistrationCapability::RegisteredChunk(info.id)
         } else {
             RegistrationCapability::Unregistered
@@ -244,7 +243,7 @@ impl FixedBuf {
         assert!(end <= self.len(), "sub-buffer end must be <= buffer len");
 
         let len = end - start;
-        let this = veloq_std::mem::ManuallyDrop::new(self);
+        let this = ManuallyDrop::new(self);
         // SAFETY: `start..end` is within the initialized length, therefore the
         // derived pointer and range are within the allocation owned by `this`.
         // `this` is wrapped in `ManuallyDrop`, so only the returned handle runs
@@ -296,12 +295,14 @@ impl FixedBuf {
         if buf_offset > bound {
             return Err(BufIoRangeError::new(
                 BufIoRangeErrorKind::OffsetOutOfBounds,
-                buf_offset,
-                self.len(),
-                self.capacity(),
-                bound,
-                bound_kind,
-                0,
+                BufIoRangeErrorValues {
+                    buffer_offset: buf_offset,
+                    buffer_length: self.len(),
+                    buffer_capacity: self.capacity(),
+                    buffer_bound: bound,
+                    buffer_bound_kind: bound_kind,
+                    submission_length: 0,
+                },
             ));
         }
 
@@ -309,12 +310,14 @@ impl FixedBuf {
         u32::try_from(submission_length).map_err(|_| {
             BufIoRangeError::new(
                 BufIoRangeErrorKind::LengthExceedsU32,
-                buf_offset,
-                self.len(),
-                self.capacity(),
-                bound,
-                bound_kind,
-                submission_length,
+                BufIoRangeErrorValues {
+                    buffer_offset: buf_offset,
+                    buffer_length: self.len(),
+                    buffer_capacity: self.capacity(),
+                    buffer_bound: bound,
+                    buffer_bound_kind: bound_kind,
+                    submission_length,
+                },
             )
         })
     }
@@ -336,7 +339,7 @@ impl FixedBuf {
         let total_size = cap.get().checked_add(4096).ok_or(BufError::Oom)?;
         let total_size_nz = unsafe { NonZeroUsize::new_unchecked(total_size) };
 
-        let base_ptr = unsafe { alloc_pages(total_size_nz) }.trans()?;
+        let base_ptr = unsafe { Platform::alloc_pages(total_size_nz) }.trans()?;
 
         // Initialize the control block in the first page
         let control = unsafe { &mut *(base_ptr as *mut HeapControlBlock) };
@@ -348,22 +351,48 @@ impl FixedBuf {
         let cookie = HEAP_BUF_COOKIE_GEN.fetch_add(1, Ordering::Relaxed) & 0x00FFFFFFFFFFFFFF;
 
         Ok(unsafe {
-            Self::new(
+            Self::new(FixedBufSpec {
                 ptr,
                 cap,
                 len,
-                NonNull::new_unchecked(base_ptr as *mut ()),
-                PoolKind::Heap,
-                cookie,
-            )
+                pool_data: NonNull::new_unchecked(base_ptr as *mut ()),
+                pool_kind: PoolKind::Heap,
+                context: cookie,
+                registration: RegistrationCapability::Unregistered,
+            })
         })
     }
-}
 
-#[derive(Debug, Clone)]
-pub struct FixedBufView<'a> {
-    pub(crate) buf: &'a FixedBuf,
-    pub(crate) range: Range<usize>,
+    #[inline(always)]
+    unsafe fn heap_dealloc(pool_data: NonNull<()>) {
+        let base_ptr = pool_data.as_ptr() as *mut u8;
+        let control_ptr = base_ptr as *const HeapControlBlock;
+        let total_size = unsafe { (*control_ptr).total_size };
+        unsafe { Platform::free_pages(NonNull::new_unchecked(base_ptr), total_size) };
+    }
+
+    #[inline(always)]
+    fn heap_resolve_region_info(&self) -> RegionInfo {
+        let base = self.pool_data.as_ptr() as usize + 4096;
+        let ptr = self.as_ptr() as usize;
+
+        RegionInfo {
+            pool_kind: PoolKind::Heap,
+            registration: RegistrationCapability::Unregistered,
+            id: ChunkId::ZERO,
+            base_ptr: unsafe { NonNull::new_unchecked(base as *mut u8) },
+            region_len: unsafe {
+                NonZeroUsize::new_unchecked(
+                    (*((self.pool_data.as_ptr()) as *const HeapControlBlock))
+                        .total_size
+                        .get()
+                        - 4096,
+                )
+            },
+            offset: ptr.saturating_sub(base),
+            cookie: self.context_raw(),
+        }
+    }
 }
 
 impl<'a> FixedBufView<'a> {
@@ -418,46 +447,12 @@ impl Drop for FixedBuf {
         unsafe {
             match self.pool_kind() {
                 PoolKind::SlotBased => {
-                    slot_based_dealloc(self.pool_data, self.context_raw());
+                    SlotBasedPool::dealloc(self.pool_data, self.context_raw());
                 }
                 PoolKind::Heap => {
-                    heap_dealloc(self.pool_data);
+                    Self::heap_dealloc(self.pool_data);
                 }
             }
         }
-    }
-}
-
-#[inline(always)]
-pub(crate) unsafe fn heap_dealloc(pool_data: NonNull<()>) {
-    let base_ptr = pool_data.as_ptr() as *mut u8;
-    let control_ptr = base_ptr as *const HeapControlBlock;
-    let total_size = unsafe { (*control_ptr).total_size };
-    unsafe {
-        free_pages(NonNull::new_unchecked(base_ptr), total_size);
-    }
-}
-
-#[inline(always)]
-pub(crate) fn heap_resolve_region_info(buf: &FixedBuf) -> RegionInfo {
-    // Heap-allocated payload starts after the 4KB control block.
-    let base = buf.pool_data.as_ptr() as usize + 4096;
-    let ptr = buf.as_ptr() as usize;
-
-    RegionInfo {
-        pool_kind: PoolKind::Heap,
-        registration: RegistrationCapability::Unregistered,
-        id: ChunkId::ZERO,
-        base_ptr: unsafe { NonNull::new_unchecked(base as *mut u8) },
-        region_len: unsafe {
-            NonZeroUsize::new_unchecked(
-                (*((buf.pool_data.as_ptr()) as *const HeapControlBlock))
-                    .total_size
-                    .get()
-                    - 4096,
-            )
-        },
-        offset: ptr.saturating_sub(base),
-        cookie: buf.context_raw(),
     }
 }

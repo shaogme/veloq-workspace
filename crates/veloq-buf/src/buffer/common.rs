@@ -4,18 +4,63 @@ use veloq_std::{
     fmt::{Debug, Formatter, Result as FmtResult},
     num::{NonZeroU16, NonZeroUsize},
     ptr::NonNull,
+    string::String,
     sync::Arc,
     vec::Vec,
 };
 
 use bilge::prelude::*;
+use diagweave::{report::Report, set};
 
 use super::{
-    error::BufResult,
-    handle::FixedBuf,
+    handle::{FixedBuf, FixedBufSpec},
     locked_memory::{LockedMemoryBudget, LockedMemoryError, LockedMemoryPermit},
 };
 use crate::heap::{ChunkId, ChunkInfo, PageAllocationStrategy};
+
+set! {
+    pub SystemError = {
+        #[display("OS error {0}")]
+        Os(i32),
+    }
+
+    pub BufError = {
+        #[display("Layout error: {0}")]
+        Layout(#[from] veloq_std::alloc::LayoutError),
+
+        #[display("Out of memory")]
+        Oom,
+
+        #[display("System error: {0}")]
+        System(#[from] SystemError),
+
+        #[display("Other error: {0}")]
+        Other(String),
+
+        #[display("Allocation failed: {0}")]
+        AllocFailed(String),
+
+        #[display("Chunk memory size too small for sharding")]
+        ChunkTooSmall,
+
+        #[display("Chunk memory size must be page aligned: {size}")]
+        PageUnaligned { size: usize },
+
+        #[display("Chunk {chunk_id} missing")]
+        ChunkMissing { chunk_id: ChunkId },
+
+        #[display("FixedBuf has invalid ChunkID")]
+        InvalidChunkId,
+
+        #[display("GlobalSlotPool ID overflow")]
+        IdOverflow,
+
+        #[display("Buffer pool size calculation overflow")]
+        SizeOverflow,
+    }
+}
+
+pub type BufResult<T> = Result<T, Report<BufError>>;
 
 #[bitsize(1)]
 #[derive(FromBits, Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +138,39 @@ pub enum AllocResult {
     Failed,
 }
 
+pub trait BackingPool: Debug + Send + Sync {
+    /// Allocate memory without registration context.
+    /// Returns allocation result containing ptr, capacity, and header context.
+    /// The `global_index` in the result should be ignored or None.
+    fn alloc_mem(&self, size: NonZeroUsize) -> AllocResult;
+
+    /// Get pool kind for compact deallocation/dispatch.
+    fn pool_kind(&self) -> PoolKind;
+
+    /// Get the raw pool data pointer.
+    fn pool_data(&self) -> NonNull<()>;
+}
+
+pub trait BufferBackingOwner: Debug + Send + Sync {}
+
+impl<T> BufferBackingOwner for T where T: Debug + Send + Sync {}
+
+#[derive(Debug, Clone, Copy)]
+struct LockedMemoryRange {
+    ptr: NonNull<u8>,
+    len: NonZeroUsize,
+}
+
+pub struct BufferRegistrationRequest {
+    id: ChunkId,
+    ptr: NonNull<u8>,
+    len: NonZeroUsize,
+    backing_owner: Arc<dyn BufferBackingOwner>,
+    locked_footprint: Option<LockedMemoryRange>,
+    requires_locked_footprint: bool,
+    permit: Option<LockedMemoryPermit>,
+}
+
 impl AllocResult {
     pub fn into_buf(self, pool: &dyn BackingPool, len: usize) -> Option<FixedBuf> {
         match self {
@@ -102,24 +180,20 @@ impl AllocResult {
                 context,
                 registration,
             } => unsafe {
-                Some(FixedBuf::new_with_registration(
+                Some(FixedBuf::new(FixedBufSpec {
                     ptr,
                     cap,
                     len,
-                    pool.pool_data(),
-                    pool.pool_kind(),
+                    pool_data: pool.pool_data(),
+                    pool_kind: pool.pool_kind(),
                     context,
                     registration,
-                ))
+                }))
             },
             AllocResult::Failed => None,
         }
     }
 }
-
-pub trait BufferBackingOwner: Debug + Send + Sync {}
-
-impl<T> BufferBackingOwner for T where T: Debug + Send + Sync {}
 
 #[derive(Debug)]
 pub struct BufferRegion {
@@ -130,12 +204,6 @@ pub struct BufferRegion {
     locked_footprint: Option<LockedMemoryRange>,
     requires_locked_footprint: bool,
     permit: Option<LockedMemoryPermit>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct LockedMemoryRange {
-    ptr: NonNull<u8>,
-    len: NonZeroUsize,
 }
 
 impl BufferRegion {
@@ -183,11 +251,11 @@ impl BufferRegion {
     {
         unsafe {
             Self::new(
-                info.id,
-                info.ptr,
-                info.len,
+                info.id(),
+                info.ptr(),
+                info.len(),
                 backing_owner,
-                info.allocation_strategy,
+                info.allocation_strategy(),
             )
         }
     }
@@ -247,16 +315,6 @@ impl BufferRegion {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-}
-
-pub struct BufferRegistrationRequest {
-    id: ChunkId,
-    ptr: NonNull<u8>,
-    len: NonZeroUsize,
-    backing_owner: Arc<dyn BufferBackingOwner>,
-    locked_footprint: Option<LockedMemoryRange>,
-    requires_locked_footprint: bool,
-    permit: Option<LockedMemoryPermit>,
 }
 
 impl BufferRegistrationRequest {
@@ -346,22 +404,6 @@ impl BufferRegistrar for NoopRegistrar {
     fn register(&self, _regions: &mut [BufferRegion]) -> BufResult<Vec<ChunkId>> {
         Ok(Vec::new())
     }
-}
-
-/// Memory pool implementation providing raw memory allocation.
-/// This trait manages memory layout, allocation algorithms, and deallocation.
-/// It does NOT handle driver registration.
-pub trait BackingPool: Debug + Send + Sync {
-    /// Allocate memory without registration context.
-    /// Returns allocation result containing ptr, capacity, and header context.
-    /// The `global_index` in the result should be ignored or None.
-    fn alloc_mem(&self, size: NonZeroUsize) -> AllocResult;
-
-    /// Get pool kind for compact deallocation/dispatch.
-    fn pool_kind(&self) -> PoolKind;
-
-    /// Get the raw pool data pointer.
-    fn pool_data(&self) -> NonNull<()>;
 }
 
 /// High-level Buffer Pool trait.

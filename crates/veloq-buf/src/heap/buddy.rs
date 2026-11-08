@@ -4,6 +4,9 @@ use veloq_std::{
     array::from_fn, collections::BitSet, fmt, mem::ManuallyDrop, pin::Pin, ptr::NonNull,
 };
 
+#[cfg(test)]
+use veloq_std::alloc::{Layout, alloc, dealloc};
+
 /// Buddy System Constants
 pub const MIN_ORDER: usize = 0; // 4KB
 pub const MAX_ORDER: usize = 18; // 2^18 * 4KB = 1GB (Maximum single allocation supported)
@@ -67,6 +70,7 @@ pub struct BuddyAllocator {
 
 // SAFETY: BuddyAllocator is Send/Sync as long as we synchronize access (which Mutex in GlobalSlotPool will do)
 unsafe impl Send for BuddyAllocator {}
+
 unsafe impl Sync for BuddyAllocator {}
 
 impl BuddyAllocator {
@@ -96,7 +100,7 @@ impl BuddyAllocator {
     }
 
     fn ptr_from_index(&self, index: SlotIndex) -> NonNull<u8> {
-        assert!(index.0 < self.total_slots, "Slot index out of bounds");
+        assert!(index.get() < self.total_slots, "Slot index out of bounds");
         // SAFETY: base_ptr is valid for total_slots, index is checked above.
         unsafe { NonNull::new_unchecked(self.base_ptr.as_ptr().add(index.offset())) }
     }
@@ -117,7 +121,7 @@ impl BuddyAllocator {
 
     fn buddy_index(&self, index: SlotIndex, order: usize) -> SlotIndex {
         // Buddy index is XORed by the size of the block (in slots)
-        SlotIndex(index.0 ^ (1 << order))
+        SlotIndex::from_index(index.get() ^ (1 << order))
     }
 
     /// Initialize the free lists by breaking down the total slots into maximal power-of-two blocks
@@ -134,7 +138,7 @@ impl BuddyAllocator {
             let order = order_by_size.min(MAX_ORDER);
 
             unsafe {
-                self.add_to_free_list(SlotIndex(start_idx), order);
+                self.add_to_free_list(SlotIndex::from_index(start_idx), order);
             }
 
             let block_size = 1 << order;
@@ -213,7 +217,7 @@ impl BuddyAllocator {
 
         while curr_order > order {
             curr_order -= 1;
-            let buddy_idx = SlotIndex(curr_idx.0 + (1 << curr_order));
+            let buddy_idx = SlotIndex::from_index(curr_idx.get() + (1 << curr_order));
 
             // Add buddy to free list
             unsafe {
@@ -223,7 +227,7 @@ impl BuddyAllocator {
 
         // 4. Mark allocated (Head only)
         // Ignoring error (OutOfBounds) because we know index is valid
-        let _ = self.allocated.set(curr_idx.0);
+        let _ = self.allocated.set(curr_idx.get());
 
         Some(curr_idx)
     }
@@ -242,10 +246,10 @@ impl BuddyAllocator {
         let mut curr_order = order;
 
         // 1. Verify Allocation State
-        match self.allocated.get(curr_idx.0) {
+        match self.allocated.get(curr_idx.get()) {
             Ok(true) => {
                 // Good, it is allocated. Mark as Free.
-                let _ = self.allocated.clear(curr_idx.0);
+                let _ = self.allocated.clear(curr_idx.get());
             }
             Ok(false) => return Err(BuddyError::DoubleFree),
             Err(_) => return Err(BuddyError::InvalidFree), // Out of bounds
@@ -268,7 +272,7 @@ impl BuddyAllocator {
             // marked in the bitset at a higher alignment, and it wouldn't be 'free' at this level.
             // If it's part of a SMALLER allocated block, its head (one of the slots)
             // inside the buddy range will be marked.
-            if self.allocated.get(buddy_idx.0).unwrap_or(true) {
+            if self.allocated.get(buddy_idx.get()).unwrap_or(true) {
                 // Buddy is allocated (or OOB), cannot merge
                 break;
             }
@@ -334,64 +338,55 @@ impl Drop for BuddyAllocator {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use veloq_std::alloc::{Layout, alloc, dealloc};
+struct TestMemory {
+    ptr: NonNull<u8>,
+    layout: Layout,
+}
 
-    struct TestMemory {
-        ptr: NonNull<u8>,
-        layout: Layout,
+#[cfg(test)]
+impl TestMemory {
+    fn new(size: usize) -> Self {
+        let layout = Layout::from_size_align(size, 4096).unwrap();
+        let ptr = unsafe { NonNull::new(alloc(layout)).unwrap() };
+        unsafe { ptr.as_ptr().write_bytes(0, size) };
+        Self { ptr, layout }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestMemory {
+    fn drop(&mut self) {
+        unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn test_buddy_alloc_basic() {
+    let mem_size = 1024 * 1024;
+    let memory = TestMemory::new(mem_size);
+
+    let mut buddy = unsafe { BuddyAllocator::new(memory.ptr, mem_size) };
+
+    let idx1 = buddy.alloc(0).unwrap();
+
+    let idx2 = buddy.alloc(1).unwrap();
+
+    assert!(idx1.offset() < mem_size);
+    assert!(idx2.offset() < mem_size);
+    assert_ne!(idx1, idx2);
+
+    unsafe {
+        buddy.dealloc(idx1, 0).unwrap();
+        buddy.dealloc(idx2, 1).unwrap();
     }
 
-    impl TestMemory {
-        fn new(size: usize) -> Self {
-            let layout = Layout::from_size_align(size, 4096).unwrap();
-            let ptr = unsafe { NonNull::new(alloc(layout)).unwrap() };
-            unsafe { ptr.as_ptr().write_bytes(0, size) };
-            Self { ptr, layout }
-        }
-    }
+    let _idx3 = buddy
+        .alloc(MAX_ORDER)
+        .unwrap_or(SlotIndex::from_index(usize::MAX));
+    let idx_fail = buddy.alloc(18);
+    assert!(idx_fail.is_none());
 
-    impl Drop for TestMemory {
-        fn drop(&mut self) {
-            unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
-        }
-    }
-
-    #[test]
-    fn test_buddy_alloc_basic() {
-        // 1MB = 256 Slots
-        let mem_size = 1024 * 1024;
-        let memory = TestMemory::new(mem_size);
-
-        let mut buddy = unsafe { BuddyAllocator::new(memory.ptr, mem_size) };
-
-        // Alloc 4KB (Order 0)
-        let idx1 = buddy.alloc(0).unwrap();
-
-        // Alloc 8KB (Order 1)
-        let idx2 = buddy.alloc(1).unwrap();
-
-        // Valid Indices
-        assert!(idx1.offset() < mem_size);
-        assert!(idx2.offset() < mem_size);
-        assert_ne!(idx1, idx2);
-
-        // Dealloc
-        unsafe {
-            buddy.dealloc(idx1, 0).unwrap();
-            buddy.dealloc(idx2, 1).unwrap();
-        }
-
-        // Re-alloc should succeed
-        let _idx3 = buddy.alloc(MAX_ORDER).unwrap_or(SlotIndex(usize::MAX));
-        // Max order for 1MB??
-        // 1MB = 256 * 4096 = 2^8 * 4096.
-        // So max order is 8.
-        let idx_fail = buddy.alloc(18);
-        assert!(idx_fail.is_none());
-
-        let idx_full = buddy.alloc(8); // 1MB
-        assert!(idx_full.is_some());
-    }
+    let idx_full = buddy.alloc(8);
+    assert!(idx_full.is_some());
 }

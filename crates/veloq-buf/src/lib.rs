@@ -1,7 +1,7 @@
 #![no_std]
 
 mod buffer;
-mod os;
+pub(crate) mod os;
 
 pub mod heap;
 

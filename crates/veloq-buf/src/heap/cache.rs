@@ -2,7 +2,7 @@
 
 use super::{
     pool::Chunk,
-    units::{ChunkId, SlotIndex, SuperblockIndex, SuperblockState},
+    units::{ChunkId, SlotAllocation, SlotIndex, SuperblockIndex, SuperblockState},
 };
 use veloq_std::{
     cell::{Cell, RefCell},
@@ -10,17 +10,27 @@ use veloq_std::{
     ptr::{self, NonNull},
     sync::Arc,
 };
+use veloq_tls::veloq_tls;
 
 pub(crate) struct LocalCacheEntry {
-    pub(crate) chunk: Arc<Chunk>,
-    pub(crate) sb_idx: SuperblockIndex,
-    pub(crate) chunk_id: ChunkId,
+    chunk: Arc<Chunk>,
+    sb_idx: SuperblockIndex,
+    chunk_id: ChunkId,
+}
+
+impl LocalCacheEntry {
+    pub(crate) fn new(chunk: Arc<Chunk>, sb_idx: SuperblockIndex, chunk_id: ChunkId) -> Self {
+        Self {
+            chunk,
+            sb_idx,
+            chunk_id,
+        }
+    }
 }
 
 impl Drop for LocalCacheEntry {
     fn drop(&mut self) {
-        // Retire active superblock on thread exit
-        let should_free = self.chunk.superblocks[self.sb_idx.get()].set_inactive();
+        let should_free = self.chunk.superblock_state(self.sb_idx).set_inactive();
         if should_free {
             self.chunk.dealloc_superblock(self.sb_idx);
         }
@@ -33,18 +43,18 @@ pub(crate) type PoolId = usize;
 /// Internal structure to manage the "hot" Fast Path of the TLS cache.
 /// Uses individual Cells to ensure zero-cost register-friendly access.
 pub(crate) struct HotSegment {
-    pub(crate) pool_id: Cell<PoolId>,
+    pool_id: Cell<PoolId>,
 
     // --- Fast Path Flattened Primitives ---
     // These pointers/values are updated whenever `owner` is set.
-    pub(crate) sb_state: Cell<*const SuperblockState>,
-    pub(crate) chunk_base: Cell<*const u8>,
-    pub(crate) sb_idx: Cell<SuperblockIndex>,
-    pub(crate) chunk_id: Cell<ChunkId>,
+    sb_state: Cell<*const SuperblockState>,
+    chunk_base: Cell<*const u8>,
+    sb_idx: Cell<SuperblockIndex>,
+    chunk_id: Cell<ChunkId>,
 
     // Ownership preservation.
     // Setting this to None will automatically trigger Superblock retirement via `LocalCacheEntry::drop`.
-    pub(crate) owner: Cell<Option<LocalCacheEntry>>,
+    owner: Cell<Option<LocalCacheEntry>>,
 }
 
 impl HotSegment {
@@ -62,9 +72,9 @@ impl HotSegment {
     /// Update the hot segment with a new entry.
     pub(crate) fn set(&self, pool_id: PoolId, entry: LocalCacheEntry) {
         // Mirror metadata to primitive cells for fast access
-        let sb_ref = &*entry.chunk.superblocks[entry.sb_idx.get()];
+        let sb_ref = entry.chunk.superblock_state(entry.sb_idx);
         self.sb_state.set(sb_ref as *const SuperblockState);
-        self.chunk_base.set(entry.chunk.memory.as_ptr());
+        self.chunk_base.set(entry.chunk.memory_base_ptr());
         self.sb_idx.set(entry.sb_idx);
         self.chunk_id.set(entry.chunk_id);
         self.pool_id.set(pool_id);
@@ -88,9 +98,9 @@ impl HotSegment {
 }
 
 pub(crate) struct LocalCache {
-    pub(crate) hot: HotSegment,
+    hot: HotSegment,
     // Fallback for multi-pool scenarios (rare)
-    pub(crate) others: RefCell<HashMap<(PoolId, ChunkId), LocalCacheEntry>>,
+    others: RefCell<HashMap<(PoolId, ChunkId), LocalCacheEntry>>,
 }
 
 impl LocalCache {
@@ -98,7 +108,7 @@ impl LocalCache {
         &self,
         pool_id: PoolId,
         allowed_chunks: &[ChunkId],
-    ) -> Option<(ChunkId, SlotIndex, NonNull<u8>)> {
+    ) -> Option<SlotAllocation> {
         let sb_ptr = self.hot.sb_state.get();
         let hot_chunk = self.hot.chunk_id.get();
 
@@ -121,7 +131,11 @@ impl LocalCache {
                     )
                 };
 
-                return Some((chunk_id, global_idx, ptr));
+                return Some(SlotAllocation {
+                    chunk_id,
+                    slot_idx: global_idx,
+                    ptr,
+                });
             }
 
             // Superblock Full! Clear hot segment to retire it and trigger global dealloc if empty.
@@ -135,7 +149,7 @@ impl LocalCache {
         &self,
         pool_id: PoolId,
         allowed_chunks: &[ChunkId],
-    ) -> Option<(ChunkId, SlotIndex, NonNull<u8>)> {
+    ) -> Option<SlotAllocation> {
         let mut others = self.others.borrow_mut();
         let entry = allowed_chunks
             .iter()
@@ -183,7 +197,7 @@ impl TlsCacheWrapper {
     }
 }
 
-veloq_tls::veloq_tls! {
+veloq_tls! {
     static TLS_CACHE_INNER: LocalCache = LocalCache {
         hot: HotSegment::new(),
         others: RefCell::new(HashMap::default()),

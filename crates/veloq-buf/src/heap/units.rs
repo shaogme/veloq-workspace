@@ -7,6 +7,14 @@ use veloq_std::{
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
+/// Standard Slot Size: 4KB
+/// Aligned with the physical page size of most architectures (x86_64/AArch64)
+pub(crate) const SLOT_SIZE: usize = 4096;
+/// Order of the Superblock (64 Slots = 2^6)
+pub(crate) const SUPERBLOCK_ORDER: usize = 6;
+/// Number of slots in a Superblock
+pub(crate) const SUPERBLOCK_SIZE: usize = 1 << SUPERBLOCK_ORDER;
+
 /// Configuration for GlobalSlotPool
 #[derive(Debug, Clone)]
 pub struct GlobalAllocatorConfig {
@@ -23,28 +31,79 @@ pub enum PageAllocationStrategy {
 /// Chunk identifier within a [`GlobalSlotPool`](crate::heap::GlobalSlotPool).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 #[repr(transparent)]
-pub struct ChunkId(pub(crate) u16);
+pub struct ChunkId(u16);
+
+/// Information about a memory chunk.
+#[derive(Debug, Clone, Copy)]
+pub struct ChunkInfo {
+    id: ChunkId,
+    ptr: NonNull<u8>,
+    len: NonZeroUsize,
+    allocation_strategy: PageAllocationStrategy,
+}
+
+/// A non-zero byte count that is aligned to the slot/page size.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct PageAlignedBytes(NonZeroUsize);
+
+/// Number of slots.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(transparent)]
+pub struct SlotCount(usize);
+
+/// Shard index inside a chunk.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(transparent)]
+pub(crate) struct ShardIndex(usize);
+
+/// Slot Index
+///
+/// Represents the index of a Slot in the global continuous memory area (Arena).
+/// Range: [0, total_slots)
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub(crate) struct SlotIndex(usize);
+
+pub(crate) struct SlotAllocation {
+    pub(crate) chunk_id: ChunkId,
+    pub(crate) slot_idx: SlotIndex,
+    pub(crate) ptr: NonNull<u8>,
+}
+
+/// Superblock index inside a chunk.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(transparent)]
+pub(crate) struct SuperblockIndex(usize);
+
+/// State of a Superblock
+///
+/// Tracks allocation status and ownership state.
+///
+/// # Concurrency
+/// Uses `SeqCst` ordering to prevent race conditions between "Retiring a Superblock"
+/// and "Last Slot Deallocation".
+#[derive(Debug)]
+pub struct SuperblockState {
+    free_mask: AtomicU64,
+    is_active: AtomicBool,
+    is_released: AtomicBool,
+}
 
 impl ChunkId {
     pub const ZERO: Self = Self(0);
 
-    #[cfg(not(debug_assertions))]
-    pub(crate) const fn from_raw(value: u16) -> Self {
+    pub const fn from_raw(value: u16) -> Self {
         Self(value)
     }
 
-    #[cfg(debug_assertions)]
-    pub const fn from_raw(raw: u16) -> Self {
-        Self(raw)
-    }
-
     #[inline]
-    pub fn raw(&self) -> u16 {
+    pub const fn raw(self) -> u16 {
         self.0
     }
 
     #[inline]
-    pub fn as_usize(&self) -> usize {
+    pub const fn as_usize(self) -> usize {
         self.0 as usize
     }
 }
@@ -61,29 +120,42 @@ impl fmt::Display for ChunkId {
     }
 }
 
-/// Information about a memory chunk (God View)
-#[derive(Debug, Clone, Copy)]
-pub struct ChunkInfo {
-    pub id: ChunkId,
-    pub ptr: NonNull<u8>,
-    pub len: NonZeroUsize,
-    pub allocation_strategy: PageAllocationStrategy,
+impl ChunkInfo {
+    pub(crate) fn new(
+        id: ChunkId,
+        ptr: NonNull<u8>,
+        len: NonZeroUsize,
+        allocation_strategy: PageAllocationStrategy,
+    ) -> Self {
+        Self {
+            id,
+            ptr,
+            len,
+            allocation_strategy,
+        }
+    }
+
+    pub const fn id(&self) -> ChunkId {
+        self.id
+    }
+
+    pub const fn ptr(&self) -> NonNull<u8> {
+        self.ptr
+    }
+
+    pub const fn len(&self) -> NonZeroUsize {
+        self.len
+    }
+
+    pub const fn allocation_strategy(&self) -> PageAllocationStrategy {
+        self.allocation_strategy
+    }
 }
 
-// Guarantee thread safety for the info pointing to shared memory
+// Guarantee thread safety for the info pointing to shared memory.
 unsafe impl Send for ChunkInfo {}
+
 unsafe impl Sync for ChunkInfo {}
-
-// --- From slot.rs ---
-
-/// Standard Slot Size: 4KB
-/// Aligned with the physical page size of most architectures (x86_64/AArch64)
-pub(crate) const SLOT_SIZE: usize = 4096;
-
-/// A non-zero byte count that is aligned to the slot/page size.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(transparent)]
-pub struct PageAlignedBytes(NonZeroUsize);
 
 impl PageAlignedBytes {
     #[inline]
@@ -122,11 +194,6 @@ impl fmt::Debug for PageAlignedBytes {
     }
 }
 
-/// Number of slots.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-#[repr(transparent)]
-pub struct SlotCount(usize);
-
 impl SlotCount {
     #[inline]
     pub(crate) const fn from_slots(slots: usize) -> Self {
@@ -155,11 +222,6 @@ impl fmt::Debug for SlotCount {
     }
 }
 
-/// Shard index inside a chunk.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-#[repr(transparent)]
-pub(crate) struct ShardIndex(usize);
-
 impl ShardIndex {
     #[inline]
     pub(crate) const fn new(value: usize) -> Self {
@@ -178,33 +240,22 @@ impl fmt::Debug for ShardIndex {
     }
 }
 
-/// Slot Index
-///
-/// Represents the index of a Slot in the global continuous memory area (Arena).
-/// Range: [0, total_slots)
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(transparent)]
-pub(crate) struct SlotIndex(pub usize);
-
-impl fmt::Debug for SlotIndex {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Slot(#{})", self.0)
-    }
-}
-
 impl SlotIndex {
+    #[inline]
+    pub(crate) const fn from_index(index: usize) -> Self {
+        Self(index)
+    }
+
     #[inline]
     pub(crate) const fn get(self) -> usize {
         self.0
     }
 
-    /// Calculate the memory offset (byte offset) corresponding to the Slot
     #[inline]
     pub(crate) fn offset(&self) -> usize {
         self.0 * SLOT_SIZE
     }
 
-    /// Convert from byte offset to Slot Index
     #[inline]
     pub(crate) fn from_offset(offset: usize) -> Self {
         Self(offset / SLOT_SIZE)
@@ -243,17 +294,11 @@ impl SlotIndex {
     }
 }
 
-// --- From superblock.rs ---
-
-/// Order of the Superblock (64 Slots = 2^6)
-pub(crate) const SUPERBLOCK_ORDER: usize = 6;
-/// Number of slots in a Superblock
-pub(crate) const SUPERBLOCK_SIZE: usize = 1 << SUPERBLOCK_ORDER;
-
-/// Superblock index inside a chunk.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-#[repr(transparent)]
-pub(crate) struct SuperblockIndex(usize);
+impl fmt::Debug for SlotIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Slot(#{})", self.0)
+    }
+}
 
 impl SuperblockIndex {
     #[inline]
@@ -278,25 +323,6 @@ impl fmt::Debug for SuperblockIndex {
     }
 }
 
-/// State of a Superblock
-///
-/// Tracks allocation status and ownership state.
-///
-/// # Concurrency
-/// Uses `SeqCst` ordering to prevent race conditions between "Retiring a Superblock"
-/// and "Last Slot Deallocation".
-#[derive(Debug)]
-pub struct SuperblockState {
-    /// Bitmap of free slots. 1 = Free, 0 = Used.
-    pub free_mask: AtomicU64,
-    /// Indicates if a thread is currently holding this superblock as its active allocation buffer.
-    /// If true, the superblock cannot be returned to the global buddy system even if empty.
-    pub is_active: AtomicBool,
-    /// Prevents a retired superblock from being returned to the buddy allocator more than once.
-    /// 防止已退休的 superblock 被重复归还给 buddy allocator。
-    pub is_released: AtomicBool,
-}
-
 impl Default for SuperblockState {
     fn default() -> Self {
         Self::new()
@@ -307,10 +333,6 @@ impl SuperblockState {
     #[cfg(not(feature = "loom"))]
     pub(crate) const fn new() -> Self {
         Self {
-            // Initialize to 0 (All Used).
-            // This is "safe" because the superblock is Inactive.
-            // It effectively treats the uninitialized state as "Full and Inactive".
-            // The actual state is set to "All Free" in `init()` when acquired from Buddy.
             free_mask: AtomicU64::new(0),
             is_active: AtomicBool::new(false),
             is_released: AtomicBool::new(true),
@@ -320,17 +342,12 @@ impl SuperblockState {
     #[cfg(feature = "loom")]
     pub(crate) fn new() -> Self {
         Self {
-            // Initialize to 0 (All Used).
-            // This is "safe" because the superblock is Inactive.
-            // It effectively treats the uninitialized state as "Full and Inactive".
-            // The actual state is set to "All Free" in `init()` when acquired from Buddy.
             free_mask: AtomicU64::new(0),
             is_active: AtomicBool::new(false),
             is_released: AtomicBool::new(true),
         }
     }
 
-    /// Reset state for reuse (Called when acquiring from Buddy)
     pub(crate) fn init(&self) {
         self.free_mask.store(u64::MAX, Ordering::Release);
         self.is_released.store(false, Ordering::Release);
@@ -343,7 +360,6 @@ impl SuperblockState {
             .is_ok()
     }
 
-    /// Try to allocate one slot `(0..63)`.
     pub(crate) fn alloc_one(&self) -> Option<u16> {
         let mut old = self.free_mask.load(Ordering::Relaxed);
         loop {
@@ -364,35 +380,25 @@ impl SuperblockState {
         }
     }
 
-    /// Mark a slot as free.
-    /// Returns `true` if the superblock is NOW eligible for return to Buddy System.
-    /// (i.e., it is Empty AND Not Active).
     pub(crate) fn free_one(&self, idx: u16) -> bool {
         let mask = 1u64 << idx;
-
-        // SeqCst is required here to synchronize with `set_inactive`.
-        // We need to ensure that if we see active=true, the Retiring thread
-        // will definitely see our bit update.
         let prev = self.free_mask.fetch_or(mask, Ordering::SeqCst);
-
         let new_mask = prev | mask;
-
         if new_mask == u64::MAX {
-            // It is empty. Check if it is active.
             !self.is_active.load(Ordering::SeqCst)
         } else {
             false
         }
     }
 
-    /// Mark the superblock as inactive (Thread gave up on it).
-    /// Returns `true` if the superblock is Empty and should be returned to Buddy System.
     pub(crate) fn set_inactive(&self) -> bool {
-        // SeqCst required.
         self.is_active.store(false, Ordering::SeqCst);
+        self.free_mask.load(Ordering::SeqCst) == u64::MAX
+    }
 
-        // internal check
-        let mask = self.free_mask.load(Ordering::SeqCst);
-        mask == u64::MAX
+    pub(crate) fn try_release(&self) -> bool {
+        !self.is_active.load(Ordering::SeqCst)
+            && self.free_mask.load(Ordering::SeqCst) == u64::MAX
+            && self.try_mark_released()
     }
 }

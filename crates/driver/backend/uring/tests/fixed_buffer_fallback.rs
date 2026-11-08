@@ -94,7 +94,11 @@ fn slot_backing_pool() -> &'static Arc<GlobalSlotPool> {
 
 fn slot_buffers(count: usize, len: usize) -> Vec<FixedBuf> {
     let pool = slot_backing_pool().clone();
-    let registered_chunks = pool.chunk_infos().into_iter().map(|info| info.id).collect();
+    let registered_chunks = pool
+        .chunk_infos()
+        .into_iter()
+        .map(|info| info.id())
+        .collect();
     let slot_pool = SlotBasedPool::with_registered_chunks(pool, 0, registered_chunks)
         .expect("registered chunks belong to the pool");
     (0..count)

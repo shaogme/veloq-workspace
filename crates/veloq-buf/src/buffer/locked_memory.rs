@@ -7,7 +7,7 @@ use veloq_std::{
     vec::Vec,
 };
 
-use crate::os;
+use crate::os::Platform;
 
 const DEFAULT_LOCKED_MEMORY_LIMIT: usize = 8 * 1024 * 1024;
 
@@ -46,6 +46,11 @@ pub struct LockedMemoryBudget {
     state: Arc<BudgetState>,
 }
 
+pub struct LockedMemoryPermit {
+    state: Arc<BudgetState>,
+    charge: usize,
+}
+
 impl LockedMemoryBudget {
     pub fn new(limit_bytes: usize) -> Self {
         Self {
@@ -73,7 +78,7 @@ impl LockedMemoryBudget {
     }
 
     pub fn required_charge(&self, ptr: *const u8, len: usize) -> Result<usize, LockedMemoryError> {
-        let page_size = os::page_size().ok_or(LockedMemoryError::InvalidPageSize)?;
+        let page_size = Platform::page_size().ok_or(LockedMemoryError::InvalidPageSize)?;
         Self::range_charge(ptr as usize, len, page_size)
     }
 
@@ -121,7 +126,7 @@ impl LockedMemoryBudget {
         region_len: usize,
         count: usize,
     ) -> Result<Option<Vec<LockedMemoryPermit>>, LockedMemoryError> {
-        let page_size = os::page_size().ok_or(LockedMemoryError::InvalidPageSize)?;
+        let page_size = Platform::page_size().ok_or(LockedMemoryError::InvalidPageSize)?;
         let charge = Self::worst_case_range_charge(region_len, page_size)?;
         self.try_reserve_repeated(charge, count)
     }
@@ -217,11 +222,6 @@ impl fmt::Debug for LockedMemoryBudget {
             .field("used_bytes", &self.used_bytes())
             .finish()
     }
-}
-
-pub struct LockedMemoryPermit {
-    state: Arc<BudgetState>,
-    charge: usize,
 }
 
 impl LockedMemoryPermit {

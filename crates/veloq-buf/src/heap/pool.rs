@@ -5,13 +5,13 @@ use super::{
     cache::{LocalCacheEntry, TLS_CACHE},
     units::{
         ChunkId, ChunkInfo, GlobalAllocatorConfig, PageAlignedBytes, PageAllocationStrategy,
-        SLOT_SIZE, SUPERBLOCK_ORDER, SUPERBLOCK_SIZE, ShardIndex, SlotCount, SlotIndex,
-        SuperblockIndex, SuperblockState,
+        SLOT_SIZE, SUPERBLOCK_ORDER, SUPERBLOCK_SIZE, ShardIndex, SlotAllocation, SlotCount,
+        SlotIndex, SuperblockIndex, SuperblockState,
     },
 };
 use crate::{
     buffer::{BufError, BufResult},
-    os::{alloc_huge_pages, alloc_pages, free_huge_pages, free_pages},
+    os::Platform,
 };
 use crossbeam_utils::CachePadded;
 use diagweave::prelude::*;
@@ -23,7 +23,7 @@ use veloq_std::{
     num::NonZeroUsize,
     ptr::NonNull,
     string::ToString,
-    sync::{Arc, UnpoisonedMutex, UnpoisonedRwLock, atomic::Ordering},
+    sync::{Arc, UnpoisonedMutex, UnpoisonedRwLock},
     thread::{available_parallelism, current_id},
     vec,
     vec::Vec,
@@ -33,21 +33,22 @@ use veloq_std::{
 /// Responsible for actual OS memory allocation and deallocation.
 #[derive(Debug)]
 pub struct MemoryChunk {
-    pub(crate) ptr: NonNull<u8>,
-    pub(crate) size: NonZeroUsize,
+    ptr: NonNull<u8>,
+    size: NonZeroUsize,
     allocation_strategy: PageAllocationStrategy,
 }
 
 // Guarantee MemoryChunk can be shared across threads (needed for Arc internals)
 unsafe impl Send for MemoryChunk {}
+
 unsafe impl Sync for MemoryChunk {}
 
 impl MemoryChunk {
     pub fn new(size: NonZeroUsize, allocation_strategy: PageAllocationStrategy) -> BufResult<Self> {
         let allocated = unsafe {
             match allocation_strategy {
-                PageAllocationStrategy::Standard => alloc_pages(size),
-                PageAllocationStrategy::Huge => alloc_huge_pages(size),
+                PageAllocationStrategy::Standard => Platform::alloc_pages(size),
+                PageAllocationStrategy::Huge => Platform::alloc_huge_pages(size),
             }
         }
         .trans()?;
@@ -88,8 +89,8 @@ impl Drop for MemoryChunk {
     fn drop(&mut self) {
         unsafe {
             match self.allocation_strategy {
-                PageAllocationStrategy::Standard => free_pages(self.ptr, self.size),
-                PageAllocationStrategy::Huge => free_huge_pages(self.ptr, self.size),
+                PageAllocationStrategy::Standard => Platform::free_pages(self.ptr, self.size),
+                PageAllocationStrategy::Huge => Platform::free_huge_pages(self.ptr, self.size),
             }
         }
     }
@@ -97,7 +98,7 @@ impl Drop for MemoryChunk {
 
 /// A Managed Chunk of memory with its own Allocator(s).
 pub struct Chunk {
-    pub id: ChunkId,
+    id: ChunkId,
 
     /// The sharded buddy allocators
     ///
@@ -106,7 +107,7 @@ pub struct Chunk {
     /// `BuddyAllocator` accesses the raw pointers in `memory` during its Drop implementation.
     /// Rust drops fields in declaration order, so `shards` will be dropped first, allowing
     /// safe access to `memory`.
-    pub(crate) shards: Box<[CachePadded<UnpoisonedMutex<BuddyAllocator>>]>,
+    shards: Box<[CachePadded<UnpoisonedMutex<BuddyAllocator>>]>,
 
     /// 管理最后一个完整 superblock 之后的槽位。 / Manages slots after the last complete superblock.
     tail_allocator: Option<CachePadded<UnpoisonedMutex<BuddyAllocator>>>,
@@ -118,20 +119,51 @@ pub struct Chunk {
     ///
     /// # Drop Order
     /// Should also be dropped before `memory`.
-    pub(crate) superblocks: Box<[CachePadded<SuperblockState>]>,
+    superblocks: Box<[CachePadded<SuperblockState>]>,
 
     /// 每个 shard 管理的槽位数。 / Number of slots managed by each shard.
-    pub(crate) slots_per_shard: SlotCount,
+    slots_per_shard: SlotCount,
 
     /// Ownership of the underlying memory.
     ///
     /// # Drop Order (CRITICAL)
     /// This field MUST be defined LAST to ensure it is dropped AFTER all other fields
     /// that might access the memory (like `shards` and `superblocks`).
-    pub(crate) memory: Arc<MemoryChunk>,
+    memory: Arc<MemoryChunk>,
+}
+
+pub(crate) struct SmallAlloc {
+    pub(crate) chunk: Arc<Chunk>,
+    pub(crate) chunk_id: ChunkId,
+    pub(crate) sb_idx: SuperblockIndex,
+    pub(crate) slot_idx: SlotIndex,
+    pub(crate) ptr: NonNull<u8>,
+}
+
+pub(crate) struct LargeAlloc {
+    pub(crate) chunk_id: ChunkId,
+    pub(crate) slot_idx: SlotIndex,
+    pub(crate) ptr: NonNull<u8>,
+}
+
+pub(crate) enum ChunkAlloc {
+    Small(SmallAlloc),
+    Large(LargeAlloc),
 }
 
 impl Chunk {
+    pub fn id(&self) -> ChunkId {
+        self.id
+    }
+
+    pub(crate) fn superblock_state(&self, index: SuperblockIndex) -> &SuperblockState {
+        &self.superblocks[index.get()]
+    }
+
+    pub(crate) fn memory_base_ptr(&self) -> *const u8 {
+        self.memory.as_ptr()
+    }
+
     pub fn new(id: ChunkId, size: PageAlignedBytes) -> BufResult<Self> {
         Self::new_with_page_strategy(id, size, PageAllocationStrategy::Standard)
     }
@@ -289,7 +321,7 @@ impl Chunk {
     fn alloc_tail(&self, order: usize) -> Option<(SlotIndex, NonNull<u8>)> {
         let mut allocator = self.tail_allocator.as_ref()?.lock();
         let local_idx = allocator.alloc(order)?;
-        let global_idx = SlotIndex(self.main_slots + local_idx.get());
+        let global_idx = SlotIndex::from_index(self.main_slots + local_idx.get());
         Some((global_idx, allocator.ptr_of(local_idx)))
     }
 
@@ -366,7 +398,7 @@ impl Chunk {
     /// Deallocates a block of slots.
     pub(crate) unsafe fn dealloc_slots(&self, index: SlotIndex, order: usize) {
         if index.get() >= self.main_slots {
-            let local_idx = SlotIndex(index.get() - self.main_slots);
+            let local_idx = SlotIndex::from_index(index.get() - self.main_slots);
             let Some(tail) = self.tail_allocator.as_ref() else {
                 return;
             };
@@ -406,10 +438,7 @@ impl Chunk {
         let (shard_idx, local_idx) = self.shard_for_index(base_slot);
         let mut buddy = self.shards[shard_idx.get()].lock();
         let state = &self.superblocks[sb_idx.get()];
-        if state.is_active.load(Ordering::SeqCst)
-            || state.free_mask.load(Ordering::SeqCst) != u64::MAX
-            || !state.try_mark_released()
-        {
+        if !state.try_release() {
             return;
         }
         unsafe {
@@ -448,32 +477,13 @@ impl Chunk {
     }
 }
 
-pub(crate) struct SmallAlloc {
-    pub(crate) chunk: Arc<Chunk>,
-    pub(crate) chunk_id: ChunkId,
-    pub(crate) sb_idx: SuperblockIndex,
-    pub(crate) slot_idx: SlotIndex,
-    pub(crate) ptr: NonNull<u8>,
-}
-
-pub(crate) struct LargeAlloc {
-    pub(crate) chunk_id: ChunkId,
-    pub(crate) slot_idx: SlotIndex,
-    pub(crate) ptr: NonNull<u8>,
-}
-
-pub(crate) enum ChunkAlloc {
-    Small(SmallAlloc),
-    Large(LargeAlloc),
-}
-
 /// Global Slot Pool
 ///
 /// Manages a large contiguous memory arena using a sharded Buddy System.
 /// The basic unit is a 4KB `Slot`.
 pub struct GlobalSlotPool {
     /// Active chunks
-    pub(crate) chunks: CachePadded<UnpoisonedRwLock<Vec<Arc<Chunk>>>>,
+    chunks: CachePadded<UnpoisonedRwLock<Vec<Arc<Chunk>>>>,
 }
 
 impl GlobalSlotPool {
@@ -514,7 +524,7 @@ impl GlobalSlotPool {
         order: usize,
         seed: Option<usize>,
         registered_chunks: &[ChunkId],
-    ) -> Option<(ChunkId, SlotIndex, NonNull<u8>)> {
+    ) -> Option<SlotAllocation> {
         // --- Phase 0: Lockless TLS Fast Path (Order 0) ---
         if order == 0 {
             let pool_id = self as *const _ as usize;
@@ -546,7 +556,7 @@ impl GlobalSlotPool {
         None
     }
 
-    fn finish_alloc(&self, alloc: ChunkAlloc) -> (ChunkId, SlotIndex, NonNull<u8>) {
+    fn finish_alloc(&self, alloc: ChunkAlloc) -> SlotAllocation {
         match alloc {
             ChunkAlloc::Small(alloc) => {
                 let chunk_id = alloc.chunk_id;
@@ -556,16 +566,20 @@ impl GlobalSlotPool {
                 TLS_CACHE.with(|cache| {
                     cache.insert(
                         pool_id,
-                        LocalCacheEntry {
-                            chunk: alloc.chunk,
-                            sb_idx: alloc.sb_idx,
-                            chunk_id,
-                        },
+                        LocalCacheEntry::new(alloc.chunk, alloc.sb_idx, chunk_id),
                     );
                 });
-                (chunk_id, slot_idx, ptr)
+                SlotAllocation {
+                    chunk_id,
+                    slot_idx,
+                    ptr,
+                }
             }
-            ChunkAlloc::Large(alloc) => (alloc.chunk_id, alloc.slot_idx, alloc.ptr),
+            ChunkAlloc::Large(alloc) => SlotAllocation {
+                chunk_id: alloc.chunk_id,
+                slot_idx: alloc.slot_idx,
+                ptr: alloc.ptr,
+            },
         }
     }
 
@@ -575,7 +589,7 @@ impl GlobalSlotPool {
     /// - `chunk_id`, `index`, and `order` must match a previous allocation.
     pub(crate) unsafe fn dealloc_slots(&self, chunk_id: ChunkId, index: SlotIndex, order: usize) {
         let chunks = self.chunks.read();
-        if let Some(chunk) = chunks.get(chunk_id.0 as usize) {
+        if let Some(chunk) = chunks.get(chunk_id.as_usize()) {
             // Verify ID just in case
             debug_assert_eq!(chunk.id, chunk_id);
             unsafe {
@@ -590,11 +604,13 @@ impl GlobalSlotPool {
     /// Get Memory Info for a Chunk
     pub fn chunk_info(&self, chunk_id: ChunkId) -> Option<ChunkInfo> {
         let chunks = self.chunks.read();
-        chunks.get(chunk_id.0 as usize).map(|c| ChunkInfo {
-            id: c.id,
-            ptr: c.memory.ptr,
-            len: c.memory.size,
-            allocation_strategy: c.memory.allocation_strategy,
+        chunks.get(chunk_id.as_usize()).map(|chunk| {
+            ChunkInfo::new(
+                chunk.id,
+                chunk.memory.ptr,
+                chunk.memory.size,
+                chunk.memory.allocation_strategy,
+            )
         })
     }
 
@@ -603,11 +619,13 @@ impl GlobalSlotPool {
         let chunks = self.chunks.read();
         chunks
             .iter()
-            .map(|c| ChunkInfo {
-                id: c.id,
-                ptr: c.memory.ptr,
-                len: c.memory.size,
-                allocation_strategy: c.memory.allocation_strategy,
+            .map(|chunk| {
+                ChunkInfo::new(
+                    chunk.id,
+                    chunk.memory.ptr,
+                    chunk.memory.size,
+                    chunk.memory.allocation_strategy,
+                )
             })
             .collect()
     }
@@ -629,129 +647,131 @@ impl Debug for GlobalSlotPool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+fn test_chunk(total_slots: usize) -> Arc<Chunk> {
+    let bytes = total_slots * SLOT_SIZE;
+    let size = PageAlignedBytes::from_usize(bytes).expect("test chunk size is slot aligned");
+    Arc::new(
+        Chunk::new_with_parallelism(ChunkId::ZERO, size, PageAllocationStrategy::Standard, 4)
+            .expect("create test chunk"),
+    )
+}
 
-    fn test_chunk(total_slots: usize) -> Arc<Chunk> {
-        let bytes = total_slots * SLOT_SIZE;
-        let size = PageAlignedBytes::from_usize(bytes).expect("test chunk size is slot aligned");
-        Arc::new(
-            Chunk::new_with_parallelism(ChunkId::ZERO, size, PageAllocationStrategy::Standard, 4)
-                .expect("create test chunk"),
-        )
-    }
+#[cfg(test)]
+#[test]
+fn shard_boundaries_and_tail_allocations_do_not_overlap() {
+    let total_slots = SUPERBLOCK_SIZE * 4 + 3;
+    let chunk = test_chunk(total_slots);
+    assert_eq!(chunk.shards.len(), 4);
+    assert_eq!(chunk.slots_per_shard.get(), SUPERBLOCK_SIZE);
 
-    #[test]
-    fn shard_boundaries_and_tail_allocations_do_not_overlap() {
-        let total_slots = SUPERBLOCK_SIZE * 4 + 3;
-        let chunk = test_chunk(total_slots);
-        assert_eq!(chunk.shards.len(), 4);
-        assert_eq!(chunk.slots_per_shard.get(), SUPERBLOCK_SIZE);
+    let main_slots = chunk.main_slots;
+    let mut occupied = Vec::with_capacity(total_slots);
+    occupied.resize(total_slots, false);
+    let mut main_indices = Vec::with_capacity(4);
 
-        let main_slots = chunk.main_slots;
-        let mut occupied = Vec::with_capacity(total_slots);
-        occupied.resize(total_slots, false);
-        let mut main_indices = Vec::with_capacity(4);
+    for shard in 0..chunk.shards.len() {
+        let seed = shard;
+        let (index, ptr) = chunk
+            .alloc_global(SUPERBLOCK_ORDER, Some(seed), |_| {})
+            .expect("each shard has one superblock available");
+        assert_eq!(index.get(), shard * SUPERBLOCK_SIZE);
+        assert_eq!(ptr, chunk.resolve_ptr(index));
 
-        for shard in 0..chunk.shards.len() {
-            let seed = shard;
-            let (index, ptr) = chunk
-                .alloc_global(SUPERBLOCK_ORDER, Some(seed), |_| {})
-                .expect("each shard has one superblock available");
-            assert_eq!(index.get(), shard * SUPERBLOCK_SIZE);
-            assert_eq!(ptr, chunk.resolve_ptr(index));
-
-            let block = &mut occupied[index.get()..index.get() + SUPERBLOCK_SIZE];
-            assert!(
-                block.iter().all(|slot| !slot),
-                "shard allocations must not overlap"
-            );
-            block.fill(true);
-            main_indices.push(index);
-        }
-
-        assert!(occupied[..main_slots].iter().all(|slot| *slot));
-        assert!(occupied[main_slots..].iter().all(|slot| !slot));
-
-        let mut tail_indices = Vec::with_capacity(total_slots - main_slots);
-        for _ in main_slots..total_slots {
-            let allocation = Chunk::alloc_slots(&chunk, 0, Some(0))
-                .expect("order-zero allocation should use the tail after main exhaustion");
-            let ChunkAlloc::Large(tail) = allocation else {
-                panic!("tail allocation should use the buddy allocator");
-            };
-            assert!(tail.slot_idx.get() >= main_slots);
-            assert_eq!(tail.ptr, chunk.resolve_ptr(tail.slot_idx));
-            assert!(!occupied[tail.slot_idx.get()]);
-            occupied[tail.slot_idx.get()] = true;
-            tail_indices.push(tail.slot_idx);
-        }
-
-        assert!(Chunk::alloc_slots(&chunk, 0, Some(0)).is_none());
-        assert!(occupied.iter().all(|slot| *slot));
-        tail_indices.sort_unstable();
-        assert_eq!(
-            tail_indices,
-            (main_slots..total_slots).map(SlotIndex).collect::<Vec<_>>()
+        let block = &mut occupied[index.get()..index.get() + SUPERBLOCK_SIZE];
+        assert!(
+            block.iter().all(|slot| !slot),
+            "shard allocations must not overlap"
         );
-
-        let released_tail = tail_indices[0];
-        unsafe {
-            chunk.dealloc_slots(released_tail, 0);
-        }
-        let replacement =
-            Chunk::alloc_slots(&chunk, 0, Some(0)).expect("a freed tail slot should be reusable");
-        let ChunkAlloc::Large(replacement) = replacement else {
-            panic!("reallocated tail slot should use the buddy allocator");
-        };
-        assert_eq!(replacement.slot_idx, released_tail);
-        tail_indices[0] = replacement.slot_idx;
-
-        for index in tail_indices {
-            unsafe {
-                chunk.dealloc_slots(index, 0);
-            }
-        }
-        for index in main_indices {
-            unsafe {
-                chunk.dealloc_slots(index, SUPERBLOCK_ORDER);
-            }
-        }
+        block.fill(true);
+        main_indices.push(index);
     }
 
-    #[test]
-    fn order_zero_path_allocates_and_releases_a_superblock() {
-        let chunk = test_chunk(SUPERBLOCK_SIZE);
+    assert!(occupied[..main_slots].iter().all(|slot| *slot));
+    assert!(occupied[main_slots..].iter().all(|slot| !slot));
+
+    let mut tail_indices = Vec::with_capacity(total_slots - main_slots);
+    for _ in main_slots..total_slots {
         let allocation = Chunk::alloc_slots(&chunk, 0, Some(0))
-            .expect("order-zero allocation should initialize a superblock");
-        let ChunkAlloc::Small(first) = allocation else {
-            panic!("a full superblock should use the small-allocation path");
+            .expect("order-zero allocation should use the tail after main exhaustion");
+        let ChunkAlloc::Large(tail) = allocation else {
+            panic!("tail allocation should use the buddy allocator");
         };
-        let superblock_index = first.sb_idx;
-        let mut indices = Vec::with_capacity(SUPERBLOCK_SIZE);
-        indices.push(first.slot_idx);
-
-        for _ in 1..SUPERBLOCK_SIZE {
-            let offset = chunk.superblocks[superblock_index.get()]
-                .alloc_one()
-                .expect("remaining superblock slots should be available");
-            indices.push(SlotIndex::from_superblock_offset(superblock_index, offset));
-        }
-
-        indices.sort_unstable();
-        assert_eq!(
-            indices,
-            (0..SUPERBLOCK_SIZE).map(SlotIndex).collect::<Vec<_>>()
-        );
-
-        for index in indices {
-            unsafe {
-                chunk.dealloc_slots(index, 0);
-            }
-        }
-        assert!(chunk.superblocks[superblock_index.get()].set_inactive());
-        chunk.dealloc_superblock(superblock_index);
-
-        assert!(Chunk::alloc_slots(&chunk, 0, Some(0)).is_some());
+        assert!(tail.slot_idx.get() >= main_slots);
+        assert_eq!(tail.ptr, chunk.resolve_ptr(tail.slot_idx));
+        assert!(!occupied[tail.slot_idx.get()]);
+        occupied[tail.slot_idx.get()] = true;
+        tail_indices.push(tail.slot_idx);
     }
+
+    assert!(Chunk::alloc_slots(&chunk, 0, Some(0)).is_none());
+    assert!(occupied.iter().all(|slot| *slot));
+    tail_indices.sort_unstable();
+    assert_eq!(
+        tail_indices,
+        (main_slots..total_slots)
+            .map(SlotIndex::from_index)
+            .collect::<Vec<_>>()
+    );
+
+    let released_tail = tail_indices[0];
+    unsafe {
+        chunk.dealloc_slots(released_tail, 0);
+    }
+    let replacement =
+        Chunk::alloc_slots(&chunk, 0, Some(0)).expect("a freed tail slot should be reusable");
+    let ChunkAlloc::Large(replacement) = replacement else {
+        panic!("reallocated tail slot should use the buddy allocator");
+    };
+    assert_eq!(replacement.slot_idx, released_tail);
+    tail_indices[0] = replacement.slot_idx;
+
+    for index in tail_indices {
+        unsafe {
+            chunk.dealloc_slots(index, 0);
+        }
+    }
+    for index in main_indices {
+        unsafe {
+            chunk.dealloc_slots(index, SUPERBLOCK_ORDER);
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn order_zero_path_allocates_and_releases_a_superblock() {
+    let chunk = test_chunk(SUPERBLOCK_SIZE);
+    let allocation = Chunk::alloc_slots(&chunk, 0, Some(0))
+        .expect("order-zero allocation should initialize a superblock");
+    let ChunkAlloc::Small(first) = allocation else {
+        panic!("a full superblock should use the small-allocation path");
+    };
+    let superblock_index = first.sb_idx;
+    let mut indices = Vec::with_capacity(SUPERBLOCK_SIZE);
+    indices.push(first.slot_idx);
+
+    for _ in 1..SUPERBLOCK_SIZE {
+        let offset = chunk.superblocks[superblock_index.get()]
+            .alloc_one()
+            .expect("remaining superblock slots should be available");
+        indices.push(SlotIndex::from_superblock_offset(superblock_index, offset));
+    }
+
+    indices.sort_unstable();
+    assert_eq!(
+        indices,
+        (0..SUPERBLOCK_SIZE)
+            .map(SlotIndex::from_index)
+            .collect::<Vec<_>>()
+    );
+
+    for index in indices {
+        unsafe {
+            chunk.dealloc_slots(index, 0);
+        }
+    }
+    assert!(chunk.superblocks[superblock_index.get()].set_inactive());
+    chunk.dealloc_superblock(superblock_index);
+
+    assert!(Chunk::alloc_slots(&chunk, 0, Some(0)).is_some());
 }
