@@ -19,7 +19,7 @@ use veloq_std::{
 
 #[cfg(feature = "std")]
 use veloq_std::{
-    panic::{AssertUnwindSafe, catch_unwind},
+    panic::{AssertUnwindSafe, Panic},
     string::String,
 };
 
@@ -105,7 +105,7 @@ fn dropping_a_scope_joins_a_parked_child() {
 #[test]
 #[cfg(feature = "std")]
 fn panic_survives_a_dropped_scope() {
-    let result = catch_unwind(AssertUnwindSafe::new(|| {
+    let result = Panic::catch_unwind(AssertUnwindSafe::new(|| {
         with_workers(1)
             .scope(async |ctx| {
                 scope!(ctx, async |outer| {

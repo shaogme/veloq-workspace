@@ -7,6 +7,7 @@ use crate::{
     alloc_crate as alloc,
     io::{Error, Result},
 };
+use libc::{F_DUPFD_CLOEXEC, close, fcntl};
 
 use alloc::{boxed::Box, rc::Rc, sync::Arc};
 
@@ -17,18 +18,18 @@ use std::{
     os::fd::AsRawFd as StdAsRawFd,
 };
 
+/// An owned file descriptor.
+#[repr(transparent)]
+pub struct OwnedFd {
+    fd: RawFd,
+}
+
 /// A borrowed file descriptor.
 #[derive(Copy, Clone)]
 #[repr(transparent)]
 pub struct BorrowedFd<'fd> {
     fd: RawFd,
     _phantom: PhantomData<&'fd OwnedFd>,
-}
-
-/// An owned file descriptor.
-#[repr(transparent)]
-pub struct OwnedFd {
-    fd: RawFd,
 }
 
 /// A trait to borrow the file descriptor from an underlying object.
@@ -61,7 +62,7 @@ impl BorrowedFd<'_> {
     /// Creates a new `OwnedFd` instance that shares the same underlying file
     /// description as the existing `BorrowedFd` instance.
     pub fn try_clone_to_owned(&self) -> Result<OwnedFd> {
-        let fd = unsafe { libc::fcntl(self.fd, libc::F_DUPFD_CLOEXEC, 0) };
+        let fd = unsafe { fcntl(self.fd, F_DUPFD_CLOEXEC, 0) };
         if fd < 0 {
             Err(Error::last_os_error())
         } else {
@@ -83,14 +84,17 @@ impl Drop for OwnedFd {
     #[inline]
     fn drop(&mut self) {
         unsafe {
-            let _ = libc::close(self.fd);
+            let _ = close(self.fd);
         }
     }
 }
 
 unsafe impl Send for OwnedFd {}
+
 unsafe impl Sync for OwnedFd {}
+
 unsafe impl Send for BorrowedFd<'_> {}
+
 unsafe impl Sync for BorrowedFd<'_> {}
 
 impl fmt::Debug for BorrowedFd<'_> {

@@ -151,10 +151,13 @@ impl<T: ?Sized> Pointer for NativeWeak<T> {
 }
 
 unsafe impl<T: ?Sized + Sync + Send> Send for NativeWeak<T> {}
+
 unsafe impl<T: ?Sized + Sync + Send> Sync for NativeWeak<T> {}
 
 impl<T: ?Sized + RefUnwindSafe> RefUnwindSafe for NativeWeak<T> {}
+
 impl<T: ?Sized + RefUnwindSafe> UnwindSafe for NativeWeak<T> {}
+
 impl<T: ?Sized> Unpin for NativeWeak<T> {}
 
 impl<T: ?Sized> From<AllocWeak<T>> for NativeWeak<T> {

@@ -8,8 +8,10 @@ use core::{
     pin::Pin,
 };
 
-use crate::alloc_crate::{boxed::Box, string::String, sync::Arc as AllocArc, vec::Vec};
-use crate::sync::weak::NativeWeak;
+use crate::{
+    alloc_crate::{boxed::Box, string::String, sync::Arc as AllocArc, vec::Vec},
+    sync::weak::NativeWeak,
+};
 
 #[cfg(feature = "loom")]
 use core::{mem::ManuallyDrop, ptr::NonNull};
@@ -328,10 +330,13 @@ impl<T: ?Sized + Hash> Hash for NativeArc<T> {
 }
 
 unsafe impl<T: ?Sized + Sync + Send> Send for NativeArc<T> {}
+
 unsafe impl<T: ?Sized + Sync + Send> Sync for NativeArc<T> {}
 
 impl<T: ?Sized + RefUnwindSafe> RefUnwindSafe for NativeArc<T> {}
+
 impl<T: ?Sized + RefUnwindSafe> UnwindSafe for NativeArc<T> {}
+
 impl<T: ?Sized> Unpin for NativeArc<T> {}
 
 #[cfg(feature = "loom")]

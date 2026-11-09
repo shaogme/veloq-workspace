@@ -7,7 +7,7 @@ mod normal_tests {
             NativeOnce, Once,
             atomic::{NativeAtomicU32, Ordering},
         },
-        thread,
+        thread::ThreadApi,
         time::Duration,
     };
 
@@ -25,7 +25,7 @@ mod normal_tests {
         static ONCE: NativeOnce = NativeOnce::new();
         static CALL_COUNT: NativeAtomicU32 = NativeAtomicU32::new(0);
 
-        thread::scope(|s| {
+        ThreadApi::scope(|s| {
             for _ in 0..10 {
                 s.spawn(|| {
                     ONCE.call_once(|| {
@@ -99,10 +99,10 @@ mod normal_tests {
     #[test]
     fn test_once_wait() {
         let once = Once::new();
-        thread::scope(|s| {
+        ThreadApi::scope(|s| {
             s.spawn(|| {
                 once.call_once(|| {
-                    thread::sleep(Duration::from_millis(50)).unwrap();
+                    ThreadApi::sleep(Duration::from_millis(50)).unwrap();
                 });
             })
             .unwrap();
@@ -131,9 +131,9 @@ mod normal_tests {
         assert!(res.is_err());
 
         // Spawn a thread to initialize it and wake up wait_force
-        thread::scope(|s| {
+        ThreadApi::scope(|s| {
             s.spawn(|| {
-                thread::sleep(Duration::from_millis(50)).unwrap();
+                ThreadApi::sleep(Duration::from_millis(50)).unwrap();
                 once.call_once_force(|state| {
                     assert!(state.is_poisoned());
                 });

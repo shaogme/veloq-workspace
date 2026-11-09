@@ -54,6 +54,7 @@ impl<T> NativeQueuePtr<T> {
 }
 
 unsafe impl<T> Send for NativeQueuePtr<T> {}
+
 unsafe impl<T> Sync for NativeQueuePtr<T> {}
 
 #[cfg(feature = "loom")]
@@ -631,12 +632,12 @@ impl_condvar!(
     unpoisoned_guard: NativeUnpoisonedMutexGuard,
     mutex: NativeMutex,
     mutex_guard: NativeMutexGuard,
-    wait_once: |s, expected| native::wait_on_address(&s.state, expected),
-    wait_timeout_sub: |s, remaining| native::wait_on_address_timeout(&s.state, WAITING, Some(remaining)),
+    wait_once: |s, expected| native::Platform::wait_on_address(&s.state, expected),
+    wait_timeout_sub: |s, remaining| native::Platform::wait_on_address_timeout(&s.state, WAITING, Some(remaining)),
     finish_notify: |s| {
         let previous = s.state.swap(NOTIFIED, Ordering::AcqRel);
         debug_assert_eq!(previous, NOTIFYING);
-        native::wake_by_address(&s.state);
+        native::Platform::wake_by_address(&s.state);
     },
     const_new: const
 );
@@ -679,29 +680,3 @@ pub type Condvar = LoomCondvar;
 
 #[cfg(feature = "loom")]
 pub type UnpoisonedCondvar = LoomUnpoisonedCondvar;
-
-/// 创建可用于静态初始化的原生条件变量。
-#[inline]
-pub const fn const_native_condvar() -> NativeCondvar {
-    NativeCondvar::new()
-}
-
-/// 创建可用于静态初始化的原生非中毒条件变量。
-#[inline]
-pub const fn const_native_unpoisoned_condvar() -> NativeUnpoisonedCondvar {
-    NativeUnpoisonedCondvar::new()
-}
-
-#[cfg(not(feature = "loom"))]
-/// 创建当前配置下的条件变量。
-#[inline]
-pub const fn const_condvar() -> Condvar {
-    const_native_condvar()
-}
-
-#[cfg(not(feature = "loom"))]
-/// 创建当前配置下的非中毒条件变量。
-#[inline]
-pub const fn const_unpoisoned_condvar() -> UnpoisonedCondvar {
-    const_native_unpoisoned_condvar()
-}

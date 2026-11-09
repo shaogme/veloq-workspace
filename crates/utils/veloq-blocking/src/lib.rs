@@ -3,7 +3,7 @@
 use crossbeam_queue::SegQueue;
 use veloq_std::{
     boxed::Box,
-    panic::{AssertUnwindSafe, catch_unwind},
+    panic::{AssertUnwindSafe, Panic},
     sync::{
         Arc, UnpoisonedCondvar, UnpoisonedMutex,
         atomic::{AtomicUsize, Ordering},
@@ -202,7 +202,7 @@ impl ThreadPool {
             };
 
             if let Some(task) = task {
-                let _ = catch_unwind(AssertUnwindSafe::new(|| task.run()));
+                let _ = Panic::catch_unwind(AssertUnwindSafe::new(|| task.run()));
             }
         }
     }

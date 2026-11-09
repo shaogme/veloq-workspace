@@ -253,7 +253,7 @@ where
     fn new(table: Arc<MockTable>) -> Self {
         let token = test_token();
         let waker = Arc::new(CountingWaker::default());
-        let (tx, cancels) = mpsc::channel();
+        let (tx, cancels) = mpsc::Mpsc::channel();
         let op = DetachedOp::armed(
             unsafe {
                 Arc::cast_unsized(table.clone(), |p| {

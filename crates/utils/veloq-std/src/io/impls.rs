@@ -1,4 +1,4 @@
-use core::{cmp, fmt};
+use core::{cmp, fmt, mem::take};
 
 use crate::alloc_crate as alloc;
 use crate::io::{Error, IoSlice, IoSliceMut, Read, Result, Seek, SeekFrom, Write};
@@ -32,7 +32,7 @@ impl Write for &mut [u8] {
     #[inline]
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
         let amt = cmp::min(buf.len(), self.len());
-        let (a, b) = core::mem::take(self).split_at_mut(amt);
+        let (a, b) = take(self).split_at_mut(amt);
         a.copy_from_slice(&buf[..amt]);
         *self = b;
         Ok(amt)
@@ -45,25 +45,6 @@ impl Write for &mut [u8] {
         } else {
             Err(Error::WRITE_ZERO)
         }
-    }
-
-    #[inline]
-    fn flush(&mut self) -> Result<()> {
-        Ok(())
-    }
-}
-
-impl Write for Vec<u8> {
-    #[inline]
-    fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        self.extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    #[inline]
-    fn write_all(&mut self, buf: &[u8]) -> Result<()> {
-        self.extend_from_slice(buf);
-        Ok(())
     }
 
     #[inline]

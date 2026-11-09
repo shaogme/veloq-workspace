@@ -10,7 +10,7 @@ use veloq_std::{
     boxed::Box,
     hint::spin_loop,
     num::NonZeroUsize,
-    panic::{AssertUnwindSafe, catch_unwind},
+    panic::{AssertUnwindSafe, Panic},
     ptr::NonNull,
     string::String,
     sync::{
@@ -303,7 +303,7 @@ impl RuntimeSharedBase {
         let mut failed = header.waker_panicked();
         if header.drop_after_poll()
             && header.is_reclaimable()
-            && catch_unwind(AssertUnwindSafe::new(|| unsafe {
+            && Panic::catch_unwind(AssertUnwindSafe::new(|| unsafe {
                 GenericTaskHeader::drop_task(NonNull::from(header))
             }))
             .is_err()

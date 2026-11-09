@@ -1,11 +1,8 @@
 use veloq_std::{
-    env::{
-        args, args_os, consts, current_dir, home_dir, join_paths, remove_var, set_var, split_paths,
-        temp_dir, var, var_os, vars, vars_os,
-    },
+    env::{Env, consts},
     ffi::OsString,
     path::PathBuf,
-    process::{Command, ExitCode, ExitStatus, id},
+    process::{Command, ExitCode, ExitStatus, Process},
     string::String,
     vec,
     vec::Vec,
@@ -13,19 +10,18 @@ use veloq_std::{
 
 #[cfg(unix)]
 use veloq_std::os::unix::process::ExitStatusExt as UnixExitStatusExt;
-
 #[cfg(windows)]
 use veloq_std::os::windows::process::ExitStatusExt as WinExitStatusExt;
 
 #[test]
 fn test_env_dirs() {
-    let cur = current_dir().expect("current directory must exist");
+    let cur = Env::current_dir().expect("current directory must exist");
     assert!(!cur.as_os_str().is_empty());
 
-    let tmp = temp_dir();
+    let tmp = Env::temp_dir();
     assert!(!tmp.as_os_str().is_empty());
 
-    let _ = home_dir();
+    let _ = Env::home_dir();
 }
 
 #[test]
@@ -33,27 +29,27 @@ fn test_env_var_lifecycle() {
     let key = "VELOQ_INTEGRATION_TEST_KEY_123";
     let val = "veloq_integration_test_val_456";
 
-    assert_eq!(var_os(key), None);
-    assert!(var(key).is_err());
+    assert_eq!(Env::var_os(key), None);
+    assert!(Env::var(key).is_err());
 
     unsafe {
-        set_var(key, val);
+        Env::set_var(key, val);
     }
 
-    assert_eq!(var_os(key), Some(OsString::from(val)));
-    assert_eq!(var(key).unwrap(), String::from(val));
+    assert_eq!(Env::var_os(key), Some(OsString::from(val)));
+    assert_eq!(Env::var(key).unwrap(), String::from(val));
 
-    let found = vars().any(|(k, v)| k == key && v == val);
+    let found = Env::vars().any(|(k, v)| k == key && v == val);
     assert!(found);
 
-    let found_os = vars_os().any(|(k, v)| k == key && v == val);
+    let found_os = Env::vars_os().any(|(k, v)| k == key && v == val);
     assert!(found_os);
 
     unsafe {
-        remove_var(key);
+        Env::remove_var(key);
     }
-    assert_eq!(var_os(key), None);
-    assert!(var(key).is_err());
+    assert_eq!(Env::var_os(key), None);
+    assert!(Env::var(key).is_err());
 }
 
 #[test]
@@ -62,8 +58,8 @@ fn test_env_split_join_paths() {
     let p2 = PathBuf::from("dir2");
     let p3 = PathBuf::from("dir3");
 
-    let joined = join_paths(vec![&p1, &p2, &p3]).expect("join paths");
-    let split: Vec<_> = split_paths(&joined).collect();
+    let joined = Env::join_paths(vec![&p1, &p2, &p3]).expect("join paths");
+    let split: Vec<_> = Env::split_paths(&joined).collect();
     assert_eq!(split.len(), 3);
     assert_eq!(split[0], p1);
     assert_eq!(split[1], p2);
@@ -72,8 +68,8 @@ fn test_env_split_join_paths() {
 
 #[test]
 fn test_env_args_and_consts() {
-    let os_args: Vec<_> = args_os().collect();
-    let str_args: Vec<_> = args().collect();
+    let os_args: Vec<_> = Env::args_os().collect();
+    let str_args: Vec<_> = Env::args().collect();
     assert!(!os_args.is_empty());
     assert_eq!(os_args.len(), str_args.len());
 
@@ -84,7 +80,7 @@ fn test_env_args_and_consts() {
 
 #[test]
 fn test_process_basics() {
-    let pid = id();
+    let pid = Process::id();
     assert!(pid > 0);
 
     assert_eq!(ExitCode::SUCCESS.as_i32(), 0);

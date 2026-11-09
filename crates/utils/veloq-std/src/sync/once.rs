@@ -4,24 +4,16 @@ use crate::{
     cell::Cell,
     fmt,
     sync::{
+        Wait,
         atomic::{
             NativeAtomicU32,
             Ordering::{Acquire, Relaxed, Release},
-        },
-        sys::native::{
-            wait_on_address as native_wait_on_address,
-            wake_all_by_address as native_wake_all_by_address,
         },
     },
 };
 
 #[cfg(feature = "loom")]
-use crate::sync::{
-    atomic::LoomAtomicU32,
-    sys::loom_sys::{
-        wait_on_address as loom_wait_on_address, wake_all_by_address as loom_wake_all_by_address,
-    },
-};
+use crate::sync::{Wait, atomic::LoomAtomicU32};
 
 const INCOMPLETE: u32 = 3;
 const POISONED: u32 = 2;
@@ -306,8 +298,8 @@ impl_once!(
     struct NativeOnce,
     atomic: NativeAtomicU32,
     guard: NativeCompletionGuard,
-    wait_fn: native_wait_on_address,
-    wake_fn: native_wake_all_by_address,
+    wait_fn: Wait::wait_on_address,
+    wake_fn: Wait::wake_all_by_address,
     exclusive_load: |s| *s.state_and_queued.get_mut(),
     const_new: const
 );
@@ -318,8 +310,8 @@ impl_once!(
     struct LoomOnce,
     atomic: LoomAtomicU32,
     guard: LoomCompletionGuard,
-    wait_fn: loom_wait_on_address,
-    wake_fn: loom_wake_all_by_address,
+    wait_fn: Wait::wait_on_address,
+    wake_fn: Wait::wake_all_by_address,
     exclusive_load: |s| s.state_and_queued.load(Acquire),
     const_new: non_const
 );

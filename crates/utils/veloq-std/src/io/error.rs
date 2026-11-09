@@ -2,19 +2,16 @@ use core::error::Error as StdError;
 use core::fmt::{self, Debug, Display, Formatter};
 use core::result::Result as CoreResult;
 
-use crate::alloc_crate as alloc;
-use crate::io::{
-    ErrorKind,
-    os_error::{self, RawOsError},
+use crate::{
+    alloc_crate::boxed::Box,
+    io::{
+        ErrorKind,
+        os_error::{self, RawOsError},
+    },
 };
 
 #[cfg(feature = "std")]
 use std::io::{Error as StdIoError, ErrorKind as StdErrorKind};
-
-use alloc::boxed::Box;
-
-/// A specialized [`Result`] type for I/O operations.
-pub type Result<T> = CoreResult<T, Error>;
 
 /// A constant message representation of an I/O error without heap allocation.
 #[repr(align(4))]
@@ -51,6 +48,9 @@ enum Repr {
 pub struct Error {
     repr: Repr,
 }
+
+/// A specialized [`Result`] type for I/O operations.
+pub type Result<T> = CoreResult<T, Error>;
 
 impl Error {
     /// Constant error for invalid UTF-8 byte sequences.
@@ -108,7 +108,7 @@ impl Error {
     #[must_use]
     #[inline]
     pub fn last_os_error() -> Self {
-        Self::from_raw_os_error(os_error::last_os_error())
+        Self::from_raw_os_error(os_error::Platform::last_os_error())
     }
 
     /// Creates an instance of [`Error`] from a particular OS error code.
@@ -144,7 +144,7 @@ impl Error {
     #[inline]
     pub fn kind(&self) -> ErrorKind {
         match &self.repr {
-            Repr::Os(code) => os_error::decode_error_kind(*code),
+            Repr::Os(code) => os_error::Platform::decode_error_kind(*code),
             Repr::Simple(kind) => *kind,
             Repr::SimpleMessage(msg) => msg.kind,
             Repr::Custom(c) => c.kind,
@@ -219,7 +219,7 @@ impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match &self.repr {
             Repr::Os(code) => {
-                let detail = os_error::error_string(*code);
+                let detail = os_error::Platform::error_string(*code);
                 write!(f, "{detail} (os error {code})")
             }
             Repr::Simple(kind) => Display::fmt(kind, f),
@@ -235,8 +235,8 @@ impl Debug for Error {
             Repr::Os(code) => f
                 .debug_struct("Os")
                 .field("code", code)
-                .field("kind", &os_error::decode_error_kind(*code))
-                .field("message", &os_error::error_string(*code))
+                .field("kind", &os_error::Platform::decode_error_kind(*code))
+                .field("message", &os_error::Platform::error_string(*code))
                 .finish(),
             Repr::Simple(kind) => f.debug_tuple("Kind").field(kind).finish(),
             Repr::SimpleMessage(msg) => f

@@ -23,7 +23,7 @@ use veloq_std::{
     fmt::{Debug, Formatter, Result as FmtResult},
     future::Future,
     marker::PhantomData,
-    panic::{AssertUnwindSafe, PanicPayload, catch_unwind},
+    panic::{AssertUnwindSafe, Panic, PanicPayload},
     pin::Pin,
     ptr::NonNull,
     sync::NativeArc as Arc,
@@ -500,7 +500,7 @@ where
             return true;
         }
 
-        let res = catch_unwind(AssertUnwindSafe::new(|| poll_fn(cx)));
+        let res = Panic::catch_unwind(AssertUnwindSafe::new(|| poll_fn(cx)));
         match res {
             Ok(Poll::Ready(val)) => {
                 finalizer.complete(Ok(val), is_local);

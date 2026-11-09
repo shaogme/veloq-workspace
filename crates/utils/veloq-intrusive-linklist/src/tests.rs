@@ -4,7 +4,7 @@ use veloq_std::boxed::Box;
 #[cfg(feature = "std")]
 use veloq_std::{
     mem::ManuallyDrop,
-    panic::{AssertUnwindSafe, catch_unwind},
+    panic::{AssertUnwindSafe, Panic},
 };
 
 struct TestNode {
@@ -199,7 +199,7 @@ fn test_readonly_cursor_traversal() {
 #[test]
 #[cfg(feature = "std")]
 fn linked_node_drop_panics_on_a_normal_path() {
-    let result = catch_unwind(AssertUnwindSafe::new(|| {
+    let result = Panic::catch_unwind(AssertUnwindSafe::new(|| {
         let mut list = ManuallyDrop::new(LinkedList::new(TestAdapter));
         let mut node = Box::pin(TestNode {
             val: 99,
@@ -216,7 +216,7 @@ fn linked_node_drop_panics_on_a_normal_path() {
 #[test]
 #[cfg(feature = "std")]
 fn linked_node_drop_is_suppressed_during_panic_unwind() {
-    let result = catch_unwind(AssertUnwindSafe::new(|| {
+    let result = Panic::catch_unwind(AssertUnwindSafe::new(|| {
         let mut list = ManuallyDrop::new(LinkedList::new(TestAdapter));
         let mut node = Box::pin(TestNode {
             val: 100,

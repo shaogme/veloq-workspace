@@ -13,3 +13,5 @@ pub use raw::{
     RawHandle, RawSocket,
 };
 pub use socket::{AsSocket, BorrowedSocket, OwnedSocket};
+
+pub(crate) use socket::Winsock;

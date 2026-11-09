@@ -6,6 +6,7 @@ use crate::{
     alloc_crate as alloc,
     io::{Stderr, Stdin, Stdout},
 };
+use libc::{STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO};
 
 use alloc::{boxed::Box, rc::Rc, sync::Arc};
 
@@ -198,21 +199,21 @@ impl IntoRawFd for StdUdpSocket {
 impl AsRawFd for Stdin {
     #[inline]
     fn as_raw_fd(&self) -> RawFd {
-        libc::STDIN_FILENO
+        STDIN_FILENO
     }
 }
 
 impl AsRawFd for Stdout {
     #[inline]
     fn as_raw_fd(&self) -> RawFd {
-        libc::STDOUT_FILENO
+        STDOUT_FILENO
     }
 }
 
 impl AsRawFd for Stderr {
     #[inline]
     fn as_raw_fd(&self) -> RawFd {
-        libc::STDERR_FILENO
+        STDERR_FILENO
     }
 }
 
@@ -220,7 +221,7 @@ impl AsRawFd for Stderr {
 impl AsRawFd for StdStdin {
     #[inline]
     fn as_raw_fd(&self) -> RawFd {
-        libc::STDIN_FILENO
+        STDIN_FILENO
     }
 }
 
@@ -228,7 +229,7 @@ impl AsRawFd for StdStdin {
 impl AsRawFd for StdStdout {
     #[inline]
     fn as_raw_fd(&self) -> RawFd {
-        libc::STDOUT_FILENO
+        STDOUT_FILENO
     }
 }
 
@@ -236,6 +237,6 @@ impl AsRawFd for StdStdout {
 impl AsRawFd for StdStderr {
     #[inline]
     fn as_raw_fd(&self) -> RawFd {
-        libc::STDERR_FILENO
+        STDERR_FILENO
     }
 }

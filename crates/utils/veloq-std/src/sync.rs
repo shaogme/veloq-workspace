@@ -1,60 +1,51 @@
-pub mod arc;
+mod arc;
+pub mod atomic;
 mod barrier;
 mod condvar;
 mod lazy_lock;
-pub mod mutex;
+pub mod mpsc;
+mod mutex;
 mod once;
 mod once_lock;
 mod poison;
 mod reentrant_mutex;
-pub mod rwlock;
+mod rwlock;
 mod spin_lock;
-pub(crate) mod sys;
-pub mod unpoisoned_mutex;
-pub mod unpoisoned_rwlock;
-pub mod weak;
+mod unpoisoned_mutex;
+mod unpoisoned_rwlock;
+mod weak;
 
-pub mod atomic;
-pub mod mpsc;
+mod sys;
 
-pub use barrier::{BarrierWaitResult, NativeBarrier, const_native_barrier};
-pub use condvar::{
-    NativeCondvar, NativeUnpoisonedCondvar, WaitTimeoutResult, const_native_condvar,
-    const_native_unpoisoned_condvar,
-};
+pub(crate) use sys::Wait;
+
+pub use barrier::{BarrierWaitResult, NativeBarrier};
+pub use condvar::{NativeCondvar, NativeUnpoisonedCondvar, WaitTimeoutResult};
 pub use lazy_lock::{LazyLock, NativeLazyLock};
 pub use once::{NativeOnce, Once, OnceState};
 pub use once_lock::{NativeOnceLock, OnceLock};
 pub use poison::{LockResult, PoisonError, TryLockError, TryLockResult};
-pub use reentrant_mutex::{
-    NativeReentrantMutex, NativeReentrantMutexGuard, const_native_reentrant_mutex,
-};
-pub use spin_lock::{NativeSpinLock, NativeSpinLockGuard, const_native_spin_lock};
+pub use reentrant_mutex::{NativeReentrantMutex, NativeReentrantMutexGuard};
+pub use spin_lock::{NativeSpinLock, NativeSpinLockGuard};
 
 pub use arc::NativeArc;
 pub use weak::NativeWeak;
 
-pub use mutex::raw::NativeRawMutex;
-pub use mutex::{NativeMutex, NativeMutexGuard, const_native_mutex};
+pub use mutex::{NativeMutex, NativeMutexGuard, NativeRawMutex};
 
-pub use rwlock::raw::NativeRawRwLock;
-pub use rwlock::{
-    NativeRwLock, NativeRwLockReadGuard, NativeRwLockWriteGuard, const_native_rwlock,
-};
+pub use rwlock::{NativeRawRwLock, NativeRwLock, NativeRwLockReadGuard, NativeRwLockWriteGuard};
 
-pub use unpoisoned_mutex::const_native_unpoisoned_mutex;
 pub use unpoisoned_mutex::{NativeUnpoisonedMutex, NativeUnpoisonedMutexGuard};
 
 pub use unpoisoned_rwlock::{
     NativeUnpoisonedRwLock, NativeUnpoisonedRwLockReadGuard, NativeUnpoisonedRwLockWriteGuard,
-    const_native_unpoisoned_rwlock,
 };
 
 #[cfg(not(feature = "loom"))]
-pub use mutex::{Mutex, MutexGuard, raw::RawMutex};
+pub use mutex::{Mutex, MutexGuard, RawMutex};
 
 #[cfg(not(feature = "loom"))]
-pub use rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard, raw::RawRwLock};
+pub use rwlock::{RawRwLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[cfg(not(feature = "loom"))]
 pub use unpoisoned_mutex::{UnpoisonedMutex, UnpoisonedMutexGuard};
@@ -65,28 +56,16 @@ pub use unpoisoned_rwlock::{
 };
 
 #[cfg(not(feature = "loom"))]
-pub use barrier::{Barrier, const_barrier};
+pub use barrier::Barrier;
 
 #[cfg(not(feature = "loom"))]
-pub use condvar::{Condvar, UnpoisonedCondvar, const_condvar, const_unpoisoned_condvar};
+pub use condvar::{Condvar, UnpoisonedCondvar};
 
 #[cfg(not(feature = "loom"))]
-pub use reentrant_mutex::{ReentrantMutex, ReentrantMutexGuard, const_reentrant_mutex};
+pub use reentrant_mutex::{ReentrantMutex, ReentrantMutexGuard};
 
 #[cfg(not(feature = "loom"))]
-pub use spin_lock::{SpinLock, SpinLockGuard, const_spin_lock};
-
-#[cfg(not(feature = "loom"))]
-pub use mutex::const_mutex;
-
-#[cfg(not(feature = "loom"))]
-pub use rwlock::const_rwlock;
-
-#[cfg(not(feature = "loom"))]
-pub use unpoisoned_mutex::const_unpoisoned_mutex;
-
-#[cfg(not(feature = "loom"))]
-pub use unpoisoned_rwlock::const_unpoisoned_rwlock;
+pub use spin_lock::{SpinLock, SpinLockGuard};
 
 #[cfg(not(feature = "loom"))]
 pub use arc::Arc;
@@ -101,16 +80,16 @@ pub use arc::{Arc, LoomArc};
 pub use weak::{LoomWeak, Weak};
 
 #[cfg(feature = "loom")]
-pub use mutex::{LoomMutex, LoomMutexGuard, raw::LoomRawMutex};
+pub use mutex::{LoomMutex, LoomMutexGuard, LoomRawMutex};
 
 #[cfg(feature = "loom")]
-pub use mutex::{Mutex, MutexGuard, raw::RawMutex};
+pub use mutex::{Mutex, MutexGuard, RawMutex};
 
 #[cfg(feature = "loom")]
-pub use rwlock::{LoomRwLock, LoomRwLockReadGuard, LoomRwLockWriteGuard, raw::LoomRawRwLock};
+pub use rwlock::{LoomRawRwLock, LoomRwLock, LoomRwLockReadGuard, LoomRwLockWriteGuard};
 
 #[cfg(feature = "loom")]
-pub use rwlock::{RwLock, RwLockReadGuard, RwLockWriteGuard, raw::RawRwLock};
+pub use rwlock::{RawRwLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[cfg(feature = "loom")]
 pub use unpoisoned_mutex::{LoomUnpoisonedMutex, LoomUnpoisonedMutexGuard};

@@ -4,29 +4,40 @@ use crate::alloc_crate as alloc;
 use crate::io::{ErrorKind, os_error::RawOsError};
 
 use alloc::{format, string::String};
+use libc::{
+    E2BIG, EACCES, EADDRINUSE, EADDRNOTAVAIL, EAGAIN, EBUSY, ECONNABORTED, ECONNREFUSED,
+    ECONNRESET, EDEADLK, EDQUOT, EEXIST, EFBIG, EHOSTUNREACH, EINPROGRESS, EINTR, EINVAL, EISDIR,
+    ELOOP, EMFILE, EMLINK, ENAMETOOLONG, ENETDOWN, ENETUNREACH, ENFILE, ENOENT, ENOMEM, ENOSPC,
+    ENOSYS, ENOTCONN, ENOTDIR, ENOTEMPTY, EOPNOTSUPP, EPERM, EPIPE, EROFS, ESPIPE, ESTALE,
+    ETIMEDOUT, ETXTBSY, EWOULDBLOCK, EXDEV, c_char, c_int, strerror_r,
+};
+
+#[cfg(target_os = "linux")]
+mod linux_errno {
+    pub use libc::__errno_location as current;
+}
+
+#[cfg(target_os = "android")]
+mod android_errno {
+    pub use libc::__errno as current;
+}
 
 #[inline]
-pub fn last_os_error() -> RawOsError {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+fn last_os_error() -> RawOsError {
+    #[cfg(target_os = "linux")]
     unsafe {
-        *libc::__errno_location() as RawOsError
+        *linux_errno::current() as RawOsError
     }
 
     #[cfg(target_os = "android")]
     unsafe {
-        *libc::__errno() as RawOsError
+        *android_errno::current() as RawOsError
     }
 }
 
-pub fn error_string(errno: RawOsError) -> String {
+fn error_string(errno: RawOsError) -> String {
     let mut buf = [0u8; 256];
-    let ret = unsafe {
-        libc::strerror_r(
-            errno as libc::c_int,
-            buf.as_mut_ptr() as *mut libc::c_char,
-            buf.len(),
-        )
-    };
+    let ret = unsafe { strerror_r(errno as c_int, buf.as_mut_ptr() as *mut c_char, buf.len()) };
     if ret == 0
         && let Ok(s) = CStr::from_bytes_until_nul(&buf)
         && let Ok(valid_str) = s.to_str()
@@ -36,47 +47,63 @@ pub fn error_string(errno: RawOsError) -> String {
     format!("OS error {errno}")
 }
 
-pub fn decode_error_kind(errno: RawOsError) -> ErrorKind {
+fn decode_error_kind(errno: RawOsError) -> ErrorKind {
     match errno {
-        libc::E2BIG => ErrorKind::ArgumentListTooLong,
-        libc::EACCES | libc::EPERM => ErrorKind::PermissionDenied,
-        libc::EADDRINUSE => ErrorKind::AddrInUse,
-        libc::EADDRNOTAVAIL => ErrorKind::AddrNotAvailable,
-        libc::EBUSY => ErrorKind::ResourceBusy,
-        libc::ECONNABORTED => ErrorKind::ConnectionAborted,
-        libc::ECONNREFUSED => ErrorKind::ConnectionRefused,
-        libc::ECONNRESET => ErrorKind::ConnectionReset,
-        libc::EDEADLK => ErrorKind::Deadlock,
-        libc::EDQUOT => ErrorKind::QuotaExceeded,
-        libc::EEXIST => ErrorKind::AlreadyExists,
-        libc::EFBIG => ErrorKind::FileTooLarge,
-        libc::EHOSTUNREACH => ErrorKind::HostUnreachable,
-        libc::EINTR => ErrorKind::Interrupted,
-        libc::EINVAL => ErrorKind::InvalidInput,
-        libc::EISDIR => ErrorKind::IsADirectory,
-        libc::ELOOP => ErrorKind::FilesystemLoop,
-        libc::EMFILE | libc::ENFILE => ErrorKind::TooManyOpenFiles,
-        libc::EMLINK => ErrorKind::TooManyLinks,
-        libc::ENAMETOOLONG => ErrorKind::InvalidFilename,
-        libc::ENETDOWN => ErrorKind::NetworkDown,
-        libc::ENETUNREACH => ErrorKind::NetworkUnreachable,
-        libc::ENOENT => ErrorKind::NotFound,
-        libc::ENOMEM => ErrorKind::OutOfMemory,
-        libc::ENOSPC => ErrorKind::StorageFull,
-        libc::ENOSYS => ErrorKind::Unsupported,
-        libc::ENOTCONN => ErrorKind::NotConnected,
-        libc::ENOTDIR => ErrorKind::NotADirectory,
-        libc::ENOTEMPTY => ErrorKind::DirectoryNotEmpty,
-        libc::EPIPE => ErrorKind::BrokenPipe,
-        libc::EROFS => ErrorKind::ReadOnlyFilesystem,
-        libc::ESPIPE => ErrorKind::NotSeekable,
-        libc::ESTALE => ErrorKind::StaleNetworkFileHandle,
-        libc::ETIMEDOUT => ErrorKind::TimedOut,
-        libc::ETXTBSY => ErrorKind::ExecutableFileBusy,
-        libc::EXDEV => ErrorKind::CrossesDevices,
-        libc::EINPROGRESS => ErrorKind::InProgress,
-        libc::EOPNOTSUPP => ErrorKind::Unsupported,
-        x if x == libc::EAGAIN || x == libc::EWOULDBLOCK => ErrorKind::WouldBlock,
+        E2BIG => ErrorKind::ArgumentListTooLong,
+        EACCES | EPERM => ErrorKind::PermissionDenied,
+        EADDRINUSE => ErrorKind::AddrInUse,
+        EADDRNOTAVAIL => ErrorKind::AddrNotAvailable,
+        EBUSY => ErrorKind::ResourceBusy,
+        ECONNABORTED => ErrorKind::ConnectionAborted,
+        ECONNREFUSED => ErrorKind::ConnectionRefused,
+        ECONNRESET => ErrorKind::ConnectionReset,
+        EDEADLK => ErrorKind::Deadlock,
+        EDQUOT => ErrorKind::QuotaExceeded,
+        EEXIST => ErrorKind::AlreadyExists,
+        EFBIG => ErrorKind::FileTooLarge,
+        EHOSTUNREACH => ErrorKind::HostUnreachable,
+        EINTR => ErrorKind::Interrupted,
+        EINVAL => ErrorKind::InvalidInput,
+        EISDIR => ErrorKind::IsADirectory,
+        ELOOP => ErrorKind::FilesystemLoop,
+        EMFILE | ENFILE => ErrorKind::TooManyOpenFiles,
+        EMLINK => ErrorKind::TooManyLinks,
+        ENAMETOOLONG => ErrorKind::InvalidFilename,
+        ENETDOWN => ErrorKind::NetworkDown,
+        ENETUNREACH => ErrorKind::NetworkUnreachable,
+        ENOENT => ErrorKind::NotFound,
+        ENOMEM => ErrorKind::OutOfMemory,
+        ENOSPC => ErrorKind::StorageFull,
+        ENOSYS => ErrorKind::Unsupported,
+        ENOTCONN => ErrorKind::NotConnected,
+        ENOTDIR => ErrorKind::NotADirectory,
+        ENOTEMPTY => ErrorKind::DirectoryNotEmpty,
+        EPIPE => ErrorKind::BrokenPipe,
+        EROFS => ErrorKind::ReadOnlyFilesystem,
+        ESPIPE => ErrorKind::NotSeekable,
+        ESTALE => ErrorKind::StaleNetworkFileHandle,
+        ETIMEDOUT => ErrorKind::TimedOut,
+        ETXTBSY => ErrorKind::ExecutableFileBusy,
+        EXDEV => ErrorKind::CrossesDevices,
+        EINPROGRESS => ErrorKind::InProgress,
+        EOPNOTSUPP => ErrorKind::Unsupported,
+        x if x == EAGAIN || x == EWOULDBLOCK => ErrorKind::WouldBlock,
         _ => ErrorKind::Uncategorized,
+    }
+}
+
+pub(crate) struct Platform;
+
+impl Platform {
+    pub(crate) fn last_os_error() -> RawOsError {
+        last_os_error()
+    }
+
+    pub(crate) fn error_string(errno: RawOsError) -> String {
+        error_string(errno)
+    }
+
+    pub(crate) fn decode_error_kind(errno: RawOsError) -> ErrorKind {
+        decode_error_kind(errno)
     }
 }

@@ -444,7 +444,7 @@ mod tests {
     fn wait_is_woken_by_wake() {
         let value = Arc::new(AtomicU32::new(0));
         let waiter_value = Arc::clone(&value);
-        let waiter = thread::spawn(move || unsafe {
+        let waiter = thread::ThreadApi::spawn(move || unsafe {
             wait(
                 waiter_value.as_ref() as *const AtomicU32 as *const u32,
                 0,
@@ -458,7 +458,7 @@ mod tests {
             if woken > 0 {
                 break woken;
             }
-            thread::yield_now().expect("thread yield failed");
+            thread::ThreadApi::yield_now().expect("thread yield failed");
         };
         assert_eq!(woken, 1);
         assert_eq!(

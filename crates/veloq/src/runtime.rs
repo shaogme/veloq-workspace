@@ -98,7 +98,7 @@ impl<T: PoolTopology> RuntimeBuilder<T> {
         F: for<'s> AsyncFnOnce(Ctx<'s>) -> R,
     {
         let worker_count = self.config.get_worker_threads_opt().unwrap_or_else(|| {
-            thread::available_parallelism()
+            thread::ThreadApi::available_parallelism()
                 .unwrap_or_else(|_| NonZeroUsize::new(1).expect("1 is non-zero"))
         });
 

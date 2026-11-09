@@ -89,7 +89,7 @@ impl BitSet {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::collections::bitset::{BitSet, BitSetError};
 
     #[test]
     fn test_bitset_basic() {

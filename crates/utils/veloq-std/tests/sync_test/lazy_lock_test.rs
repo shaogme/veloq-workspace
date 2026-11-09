@@ -4,10 +4,10 @@ mod normal_tests {
 
     use veloq_std::{
         sync::{
-            LazyLock, NativeLazyLock,
+            Arc, LazyLock, NativeLazyLock,
             atomic::{NativeAtomicU32, Ordering},
         },
-        thread,
+        thread::ThreadApi,
     };
 
     static STATIC_NATIVE_LAZY: NativeLazyLock<i32> = NativeLazyLock::new(|| 7);
@@ -24,14 +24,14 @@ mod normal_tests {
 
     #[test]
     fn test_lazy_lock_initializes_once_concurrently() {
-        let count = veloq_std::sync::Arc::new(NativeAtomicU32::new(0));
+        let count = Arc::new(NativeAtomicU32::new(0));
         let init_count = count.clone();
         let lazy = LazyLock::new(move || {
             init_count.fetch_add(1, Ordering::SeqCst);
             42
         });
 
-        thread::scope(|scope| {
+        ThreadApi::scope(|scope| {
             for _ in 0..10 {
                 scope
                     .spawn(|| {
@@ -92,7 +92,7 @@ mod normal_tests {
     fn test_lazy_lock_default_debug_and_drop() {
         let lazy: LazyLock<Vec<i32>> = Default::default();
         assert!(format!("{lazy:?}").contains("<uninit>"));
-        assert_eq!(&*lazy, &[]);
+        assert!((*lazy).is_empty());
         assert!(format!("{lazy:?}").contains("[]"));
 
         static DROP_COUNT: NativeAtomicU32 = NativeAtomicU32::new(0);

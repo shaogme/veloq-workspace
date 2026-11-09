@@ -108,14 +108,14 @@ mod normal_tests {
 
         let aw1 = atomic_waker.clone();
         let waker1_clone = waker1.clone();
-        let t1 = thread::spawn(move || {
+        let t1 = thread::ThreadApi::spawn(move || {
             aw1.register(&waker1_clone);
         })
         .expect("thread spawn failed");
 
         let aw2 = atomic_waker.clone();
         let waker2_clone = waker2.clone();
-        let t2 = thread::spawn(move || {
+        let t2 = thread::ThreadApi::spawn(move || {
             aw2.register(&waker2_clone);
         })
         .expect("thread spawn failed");
@@ -208,7 +208,7 @@ mod normal_tests {
 
         let register_slot = atomic_waker.clone();
         let register_barrier = barrier.clone();
-        let register_handle = thread::spawn(move || {
+        let register_handle = thread::ThreadApi::spawn(move || {
             register_barrier.wait();
             register_slot.register(&replacement_waker);
         })
@@ -216,7 +216,7 @@ mod normal_tests {
 
         let take_slot = atomic_waker.clone();
         let take_barrier = barrier.clone();
-        let take_handle = thread::spawn(move || {
+        let take_handle = thread::ThreadApi::spawn(move || {
             take_barrier.wait();
             if let Some(waker) = take_slot.take() {
                 waker.wake();
@@ -226,7 +226,7 @@ mod normal_tests {
 
         let second_take_slot = atomic_waker.clone();
         let second_take_barrier = barrier.clone();
-        let second_take_handle = thread::spawn(move || {
+        let second_take_handle = thread::ThreadApi::spawn(move || {
             second_take_barrier.wait();
             if let Some(waker) = second_take_slot.take() {
                 waker.wake();
@@ -375,14 +375,14 @@ mod loom_tests {
 
             let aw1 = atomic_waker.clone();
             let waker1_clone = waker1.clone();
-            let t1 = thread::spawn(move || {
+            let t1 = thread::ThreadApi::spawn(move || {
                 aw1.register(&waker1_clone);
             })
             .expect("thread spawn failed");
 
             let aw2 = atomic_waker.clone();
             let waker2_clone = waker2.clone();
-            let t2 = thread::spawn(move || {
+            let t2 = thread::ThreadApi::spawn(move || {
                 aw2.register(&waker2_clone);
             })
             .expect("thread spawn failed");
@@ -409,7 +409,7 @@ mod loom_tests {
             let custom_waker = Waker::from(StdArc::new(TestWaker(woken.clone())));
 
             let waker_clone = atomic_waker.clone();
-            let handle = thread::spawn(move || {
+            let handle = thread::ThreadApi::spawn(move || {
                 waker_clone.wake();
             })
             .expect("thread spawn failed");
@@ -436,7 +436,7 @@ mod loom_tests {
             let replacement_waker = Waker::from(StdArc::new(CountWaker(replacement_count.clone())));
 
             let take_slot = atomic_waker.clone();
-            let take_handle = thread::spawn(move || {
+            let take_handle = thread::ThreadApi::spawn(move || {
                 if let Some(waker) = take_slot.take() {
                     waker.wake();
                 }
@@ -444,14 +444,14 @@ mod loom_tests {
             .expect("thread spawn failed");
 
             let second_take_slot = atomic_waker.clone();
-            let second_take_handle = thread::spawn(move || {
+            let second_take_handle = thread::ThreadApi::spawn(move || {
                 if let Some(waker) = second_take_slot.take() {
                     waker.wake();
                 }
             })
             .expect("thread spawn failed");
 
-            thread::yield_now().unwrap();
+            thread::ThreadApi::yield_now().unwrap();
             atomic_waker.register(&replacement_waker);
             take_handle.join().unwrap();
             second_take_handle.join().unwrap();
@@ -506,7 +506,7 @@ mod loom_tests {
 
             let replacement = Waker::noop().clone();
             let take_slot = atomic_waker.clone();
-            let take_handle = thread::spawn(move || {
+            let take_handle = thread::ThreadApi::spawn(move || {
                 let _ = take_slot.take();
             })
             .expect("thread spawn failed");

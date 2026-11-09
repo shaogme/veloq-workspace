@@ -12,6 +12,11 @@ use lock_api::{
 
 #[cfg(feature = "loom")]
 use crate::sync::{atomic::LoomAtomicU32, sys::loom::WaitChannel};
+#[cfg(all(test, feature = "std", not(feature = "loom")))]
+use std::{
+    sync::{Arc, mpsc::channel},
+    thread,
+};
 
 const READER_MASK: u32 = 0x0000_FFFF;
 const WRITER_WAITING_SHIFT: u32 = 16;
@@ -505,10 +510,10 @@ impl_raw_rwlock!(
     #[derive(Debug)]
     struct NativeRawRwLock,
     atomic: NativeAtomicU32,
-    wake_all: |s| native::wake_all_by_address(&s.state),
-    wait: |s, obs| native::wait_on_address(&s.state, obs),
+    wake_all: |s| native::Platform::wake_all_by_address(&s.state),
+    wait: |s, obs| native::Platform::wait_on_address(&s.state, obs),
     wait_timeout: |s, obs, rem| {
-        native::wait_on_address_timeout(&s.state, obs, Some(rem))
+        native::Platform::wait_on_address_timeout(&s.state, obs, Some(rem))
     },
     const_new: const
 );
@@ -630,189 +635,175 @@ pub type RawRwLock = NativeRawRwLock;
 #[cfg(feature = "loom")]
 pub type RawRwLock = LoomRawRwLock;
 
-#[cfg(all(test, feature = "std"))]
-mod tests {
-    use super::*;
+#[cfg(all(test, feature = "std", not(feature = "loom")))]
+#[test]
+fn failed_reader_cas_uses_actual_state() {
+    let lock = RawRwLock::new();
+    assert!(lock.try_lock_shared());
+    unsafe { lock.unlock_shared() };
 
-    #[cfg(not(feature = "loom"))]
-    use std::{
-        sync::{Arc, mpsc::channel},
-        thread,
-    };
+    let actual = lock.state.load(Ordering::Acquire);
+    assert_eq!(actual, 0);
+    assert!(lock.try_lock_shared());
+    unsafe { lock.unlock_shared() };
+}
 
-    #[cfg(not(feature = "loom"))]
-    #[test]
-    fn failed_reader_cas_uses_actual_state() {
-        let lock = RawRwLock::new();
-        assert!(lock.try_lock_shared());
-        unsafe { lock.unlock_shared() };
+/// Fixes the exact stale-expected interleaving from the diagnosis: the reader
+/// observes a writer, another reader briefly changes the state back to zero,
+/// and the reader's CAS then fails with `actual == 0`. It must retry the new
+/// value instead of waiting on the old writer state forever.
+#[cfg(all(test, feature = "std", not(feature = "loom")))]
+#[test]
+fn reader_progresses_after_stale_cas_observation() {
+    let lock = Arc::new(RawRwLock::new());
+    assert!(lock.try_lock_exclusive());
+    let stale = lock.state.load(Ordering::Acquire);
+    let control = Arc::clone(&lock);
+    let (done_tx, done_rx) = channel();
 
-        let actual = lock.state.load(Ordering::Acquire);
-        assert_eq!(actual, 0);
-        assert!(lock.try_lock_shared());
-        unsafe { lock.unlock_shared() };
-    }
-
-    /// Fixes the exact stale-expected interleaving from the diagnosis: the reader
-    /// observes a writer, another reader briefly changes the state back to zero,
-    /// and the reader's CAS then fails with `actual == 0`. It must retry the new
-    /// value instead of waiting on the old writer state forever.
-    #[cfg(not(feature = "loom"))]
-    #[test]
-    fn reader_progresses_after_stale_cas_observation() {
-        let lock = Arc::new(RawRwLock::new());
-        assert!(lock.try_lock_exclusive());
-        let stale = lock.state.load(Ordering::Acquire);
-        let control = Arc::clone(&lock);
-        let (done_tx, done_rx) = channel();
-
-        let reader = thread::spawn(move || {
-            let acquired = control.lock_shared_from_observed(stale, None);
-            done_tx.send(acquired).unwrap();
-            if acquired {
-                control.release_shared();
-            }
-        });
-
-        unsafe { lock.unlock_exclusive() };
-        assert!(lock.try_lock_shared());
-        unsafe { lock.unlock_shared() };
-
-        let completed = done_rx
-            .recv_timeout(Duration::from_millis(200))
-            .expect("reader must report its result");
-        if !completed {
-            assert!(lock.try_lock_exclusive());
-            unsafe { lock.unlock_exclusive() };
+    let reader = thread::ThreadApi::spawn(move || {
+        let acquired = control.lock_shared_from_observed(stale, None);
+        done_tx.send(acquired).unwrap();
+        if acquired {
+            control.release_shared();
         }
-        assert!(completed, "reader must not sleep on stale state");
-        reader.join().unwrap();
-    }
+    });
 
-    /// The timed reader uses the same CAS loop and must not spend its whole
-    /// deadline waiting after a competing transition made the lock available.
-    #[cfg(not(feature = "loom"))]
-    #[test]
-    fn timed_reader_retries_after_stale_cas_observation() {
-        let lock = Arc::new(RawRwLock::new());
+    unsafe { lock.unlock_exclusive() };
+    assert!(lock.try_lock_shared());
+    unsafe { lock.unlock_shared() };
+
+    let completed = done_rx
+        .recv_timeout(Duration::from_millis(200))
+        .expect("reader must report its result");
+    if !completed {
         assert!(lock.try_lock_exclusive());
-        let stale = lock.state.load(Ordering::Acquire);
-        let control = Arc::clone(&lock);
-        let (done_tx, done_rx) = channel();
-
-        let reader = thread::spawn(move || {
-            let acquired = control.lock_shared_from_observed(
-                stale,
-                Some(Instant::now() + Duration::from_millis(500)),
-            );
-            done_tx.send(acquired).unwrap();
-            if acquired {
-                control.release_shared();
-            }
-        });
-
         unsafe { lock.unlock_exclusive() };
-        assert!(lock.try_lock_shared());
-        unsafe { lock.unlock_shared() };
+    }
+    assert!(completed, "reader must not sleep on stale state");
+    reader.join().unwrap();
+}
 
-        let completed = done_rx
-            .recv_timeout(Duration::from_millis(200))
-            .expect("timed reader must report its result");
-        if !completed {
-            assert!(lock.try_lock_exclusive());
-            unsafe { lock.unlock_exclusive() };
+/// The timed reader uses the same CAS loop and must not spend its whole
+/// deadline waiting after a competing transition made the lock available.
+#[cfg(all(test, feature = "std", not(feature = "loom")))]
+#[test]
+fn timed_reader_retries_after_stale_cas_observation() {
+    let lock = Arc::new(RawRwLock::new());
+    assert!(lock.try_lock_exclusive());
+    let stale = lock.state.load(Ordering::Acquire);
+    let control = Arc::clone(&lock);
+    let (done_tx, done_rx) = channel();
+
+    let reader = thread::ThreadApi::spawn(move || {
+        let acquired = control
+            .lock_shared_from_observed(stale, Some(Instant::now() + Duration::from_millis(500)));
+        done_tx.send(acquired).unwrap();
+        if acquired {
+            control.release_shared();
         }
-        assert!(completed, "timed reader must retry immediately");
-        reader.join().unwrap();
-    }
+    });
 
-    #[cfg(not(feature = "loom"))]
-    #[test]
-    fn timed_writer_unregisters_and_wakes_readers() {
-        let lock = RawRwLock::new();
+    unsafe { lock.unlock_exclusive() };
+    assert!(lock.try_lock_shared());
+    unsafe { lock.unlock_shared() };
+
+    let completed = done_rx
+        .recv_timeout(Duration::from_millis(200))
+        .expect("timed reader must report its result");
+    if !completed {
         assert!(lock.try_lock_exclusive());
-        let waiter_state = lock.register_exclusive_waiter();
-        assert_eq!(RawRwLock::writer_waiter_count(waiter_state), 1);
-        lock.unregister_exclusive_waiter();
-        assert_eq!(lock.state.load(Ordering::Acquire), WRITER_BIT);
         unsafe { lock.unlock_exclusive() };
-        assert!(lock.try_lock_shared());
-        unsafe { lock.unlock_shared() };
     }
+    assert!(completed, "timed reader must retry immediately");
+    reader.join().unwrap();
+}
 
-    /// A reader blocked by writer preference must be woken when the last timed
-    /// writer unregisters, and again when the writer releases the lock. This
-    /// catches the old missing-notification path without relying on a sleep.
-    #[cfg(not(feature = "loom"))]
-    #[test]
-    fn timed_writer_unregistration_wakes_blocked_reader() {
-        let lock = Arc::new(RawRwLock::new());
-        assert!(lock.try_lock_exclusive());
-        let registered_state = lock.register_exclusive_waiter();
-        assert_eq!(RawRwLock::writer_waiter_count(registered_state), 1);
+#[cfg(all(test, feature = "std", not(feature = "loom")))]
+#[test]
+fn timed_writer_unregisters_and_wakes_readers() {
+    let lock = RawRwLock::new();
+    assert!(lock.try_lock_exclusive());
+    let waiter_state = lock.register_exclusive_waiter();
+    assert_eq!(RawRwLock::writer_waiter_count(waiter_state), 1);
+    lock.unregister_exclusive_waiter();
+    assert_eq!(lock.state.load(Ordering::Acquire), WRITER_BIT);
+    unsafe { lock.unlock_exclusive() };
+    assert!(lock.try_lock_shared());
+    unsafe { lock.unlock_shared() };
+}
 
-        let reader_lock = Arc::clone(&lock);
-        let (started_tx, started_rx) = channel();
-        let (done_tx, done_rx) = channel();
-        let reader = thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            let acquired =
-                reader_lock.lock_shared_until(Some(Instant::now() + Duration::from_secs(1)));
-            done_tx.send(acquired).unwrap();
-            if acquired {
-                reader_lock.release_shared();
-            }
+/// A reader blocked by writer preference must be woken when the last timed
+/// writer unregisters, and again when the writer releases the lock. This
+/// catches the old missing-notification path without relying on a sleep.
+#[cfg(all(test, feature = "std", not(feature = "loom")))]
+#[test]
+fn timed_writer_unregistration_wakes_blocked_reader() {
+    let lock = Arc::new(RawRwLock::new());
+    assert!(lock.try_lock_exclusive());
+    let registered_state = lock.register_exclusive_waiter();
+    assert_eq!(RawRwLock::writer_waiter_count(registered_state), 1);
+
+    let reader_lock = Arc::clone(&lock);
+    let (started_tx, started_rx) = channel();
+    let (done_tx, done_rx) = channel();
+    let reader = thread::ThreadApi::spawn(move || {
+        started_tx.send(()).unwrap();
+        let acquired = reader_lock.lock_shared_until(Some(Instant::now() + Duration::from_secs(1)));
+        done_tx.send(acquired).unwrap();
+        if acquired {
+            reader_lock.release_shared();
+        }
+    });
+
+    started_rx.recv().unwrap();
+    lock.unregister_exclusive_waiter();
+    assert!(done_rx.try_recv().is_err(), "writer still owns the lock");
+    unsafe { lock.unlock_exclusive() };
+
+    assert!(
+        done_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("reader must be woken after writer release")
+    );
+    reader.join().unwrap();
+}
+
+#[cfg(all(test, feature = "std", not(feature = "loom")))]
+#[test]
+#[should_panic(expected = "RwLock reader count overflow")]
+fn reader_count_overflow_is_rejected() {
+    let lock = RawRwLock::new();
+    lock.state.store(READER_MASK, Ordering::Relaxed);
+    let _ = lock.try_lock_shared();
+}
+
+#[cfg(all(test, feature = "std", not(feature = "loom")))]
+#[test]
+#[should_panic(expected = "RwLock writer waiter count overflow")]
+fn writer_waiter_overflow_is_rejected() {
+    let lock = RawRwLock::new();
+    lock.state.store(WRITER_WAITING_MASK, Ordering::Relaxed);
+    let _ = lock.register_exclusive_waiter();
+}
+
+#[cfg(all(test, feature = "std", feature = "loom"))]
+#[test]
+fn loom_uses_production_raw_lock() {
+    loom::model(|| {
+        let lock = loom::sync::Arc::new(RawRwLock::new());
+        let reader_lock = lock.clone();
+        let reader = loom::thread::spawn(move || {
+            reader_lock.lock_shared();
+            unsafe { reader_lock.unlock_shared() };
         });
-
-        started_rx.recv().unwrap();
-        lock.unregister_exclusive_waiter();
-        assert!(done_rx.try_recv().is_err(), "writer still owns the lock");
-        unsafe { lock.unlock_exclusive() };
-
-        assert!(
-            done_rx
-                .recv_timeout(Duration::from_millis(200))
-                .expect("reader must be woken after writer release")
-        );
+        let writer_lock = lock.clone();
+        let writer = loom::thread::spawn(move || {
+            writer_lock.lock_exclusive();
+            unsafe { writer_lock.unlock_exclusive() };
+        });
         reader.join().unwrap();
-    }
-
-    #[cfg(not(feature = "loom"))]
-    #[test]
-    #[should_panic(expected = "RwLock reader count overflow")]
-    fn reader_count_overflow_is_rejected() {
-        let lock = RawRwLock::new();
-        lock.state.store(READER_MASK, Ordering::Relaxed);
-        let _ = lock.try_lock_shared();
-    }
-
-    #[cfg(not(feature = "loom"))]
-    #[test]
-    #[should_panic(expected = "RwLock writer waiter count overflow")]
-    fn writer_waiter_overflow_is_rejected() {
-        let lock = RawRwLock::new();
-        lock.state.store(WRITER_WAITING_MASK, Ordering::Relaxed);
-        let _ = lock.register_exclusive_waiter();
-    }
-
-    #[cfg(feature = "loom")]
-    #[test]
-    fn loom_uses_production_raw_lock() {
-        loom::model(|| {
-            let lock = loom::sync::Arc::new(RawRwLock::new());
-            let reader_lock = lock.clone();
-            let reader = loom::thread::spawn(move || {
-                reader_lock.lock_shared();
-                unsafe { reader_lock.unlock_shared() };
-            });
-            let writer_lock = lock.clone();
-            let writer = loom::thread::spawn(move || {
-                writer_lock.lock_exclusive();
-                unsafe { writer_lock.unlock_exclusive() };
-            });
-            reader.join().unwrap();
-            writer.join().unwrap();
-            assert!(!lock.is_locked());
-        });
-    }
+        writer.join().unwrap();
+        assert!(!lock.is_locked());
+    });
 }

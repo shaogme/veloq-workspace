@@ -7,7 +7,7 @@ use veloq_std::{
     ptr::NonNull,
     sync::atomic::{AtomicU32, Ordering},
     sync::{NativeArc as Arc, NativeWeak as Weak, OnceLock},
-    thread::{self, ThreadId, yield_now},
+    thread::{ThreadApi, ThreadId},
 };
 use veloq_storage::{AtomicOptionPtr, LocalStorage, StateOptionPtr, Storage};
 
@@ -81,7 +81,7 @@ impl<S: Storage> TaskWakeToken<S> {
     #[inline]
     pub(crate) fn bind_local_target(&self, target: &Arc<LocalWakeTarget>) {
         let target_result = self.local_target.set(Arc::downgrade(target));
-        let owner_result = self.owner_thread.set(thread::current_id());
+        let owner_result = self.owner_thread.set(ThreadApi::current_id());
         debug_assert!(target_result.is_ok(), "local wake target is bound twice");
         debug_assert!(owner_result.is_ok(), "local wake owner is bound twice");
     }
@@ -150,7 +150,7 @@ impl<S: Storage> TaskWakeToken<S> {
                 spin_loop();
                 spin_count += 1;
             } else if spin_count == SPIN_LIMIT {
-                match yield_now() {
+                match ThreadApi::yield_now() {
                     Ok(_) => {}
                     Err(error) => self.record_wait_error(WaitError::Aborted(error)),
                 }
@@ -236,7 +236,7 @@ impl TaskWakeToken<LocalStorage> {
         let Some(owner) = self.owner_thread.get().copied() else {
             return;
         };
-        if thread::current_id() != owner {
+        if ThreadApi::current_id() != owner {
             return;
         }
 
@@ -264,7 +264,7 @@ impl TaskWakeToken<LocalStorage> {
     /// 仅供 owner-side `RuntimeContextExt` 反查；foreign thread 一律返回 `None`。
     pub(crate) fn local_header_on_owner(&self) -> Option<LocalWakeHeaderGuard<'_>> {
         let owner = self.owner_thread.get().copied()?;
-        if thread::current_id() != owner {
+        if ThreadApi::current_id() != owner {
             return None;
         }
 
@@ -313,8 +313,8 @@ mod tests {
         task::{LocalWakeTarget, TaskWakeToken},
     };
     use veloq_std::{
-        sync::{Barrier, NativeArc as Arc, mpsc::sync_channel},
-        thread::{self, ThreadErrorKind},
+        sync::{Barrier, NativeArc as Arc, mpsc},
+        thread::{ThreadApi, ThreadErrorKind},
         time::Duration,
     };
     use veloq_storage::LocalStorage;
@@ -369,10 +369,10 @@ mod tests {
         let token = Arc::new(TaskWakeToken::<LocalStorage>::new());
         let active = token.try_acquire().expect("token must start alive");
         let barrier = Arc::new(Barrier::new(2));
-        let (done_tx, done_rx) = sync_channel(0);
+        let (done_tx, done_rx) = mpsc::Mpsc::sync_channel(0);
         let token_for_thread = Arc::clone(&token);
         let barrier_for_thread = Arc::clone(&barrier);
-        let thread = thread::spawn(move || {
+        let thread = ThreadApi::spawn(move || {
             barrier_for_thread.wait();
             token_for_thread.deactivate_and_wait();
             done_tx.send(()).unwrap();
@@ -398,10 +398,10 @@ mod tests {
         let token = Arc::new(TaskWakeToken::<LocalStorage>::new());
         let active = token.try_acquire().expect("token must start alive");
         let barrier = Arc::new(Barrier::new(2));
-        let (done_tx, done_rx) = sync_channel(0);
+        let (done_tx, done_rx) = mpsc::Mpsc::sync_channel(0);
         let token_for_thread = Arc::clone(&token);
         let barrier_for_thread = Arc::clone(&barrier);
-        let thread = thread::spawn(move || {
+        let thread = ThreadApi::spawn(move || {
             barrier_for_thread.wait();
             token_for_thread.deactivate_and_wait();
             done_tx

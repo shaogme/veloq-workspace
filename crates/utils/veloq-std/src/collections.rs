@@ -1,12 +1,13 @@
-pub use alloc_crate::collections::*;
+mod bitset;
 
-pub mod bitset;
-pub use bitset::{BitSet, BitSetError};
-
+use hashbrown::{HashMap as HashMapImpl, HashSet as HashSetImpl};
 use veloq_hash::{VeloqBuildHasher, VeloqFastBuildHasher};
 
+pub use alloc_crate::collections::*;
+pub use bitset::{BitSet, BitSetError};
+
 /// `HashMap` using `VeloqBuildHasher` as the build hasher.
-pub type HashMap<K, V> = hashbrown::HashMap<K, V, VeloqBuildHasher>;
+pub type HashMap<K, V> = HashMapImpl<K, V, VeloqBuildHasher>;
 
 /// `FastHashMap` using `VeloqFastBuildHasher` as the build hasher.
 ///
@@ -14,14 +15,9 @@ pub type HashMap<K, V> = hashbrown::HashMap<K, V, VeloqBuildHasher>;
 ///
 /// This uses a non-cryptographically secure, collision-prone fast hasher.
 /// It should only be used for trusted, internal data.
-pub type FastHashMap<K, V> = hashbrown::HashMap<K, V, VeloqFastBuildHasher>;
+pub type FastHashMap<K, V> = HashMapImpl<K, V, VeloqFastBuildHasher>;
 
-pub mod hash_map {
-    pub use hashbrown::hash_map::{
-        Entry, IntoIter, IntoKeys, IntoValues, Iter, IterMut, Keys, OccupiedEntry, VacantEntry,
-        Values, ValuesMut,
-    };
-
+mod default_hasher {
     use crate::hash::Hasher;
     use veloq_hash::VeloqHasher;
 
@@ -88,7 +84,7 @@ pub mod hash_map {
 }
 
 /// `HashSet` using `VeloqBuildHasher` as the build hasher.
-pub type HashSet<T> = hashbrown::HashSet<T, VeloqBuildHasher>;
+pub type HashSet<T> = HashSetImpl<T, VeloqBuildHasher>;
 
 /// `FastHashSet` using `VeloqFastBuildHasher` as the build hasher.
 ///
@@ -96,19 +92,27 @@ pub type HashSet<T> = hashbrown::HashSet<T, VeloqBuildHasher>;
 ///
 /// This uses a non-cryptographically secure, collision-prone fast hasher.
 /// It should only be used for trusted, internal data.
-pub type FastHashSet<T> = hashbrown::HashSet<T, VeloqFastBuildHasher>;
+pub type FastHashSet<T> = HashSetImpl<T, VeloqFastBuildHasher>;
+
+pub mod hash_map {
+    pub use super::default_hasher::DefaultHasher;
+    pub use hashbrown::hash_map::{
+        Entry, IntoIter, IntoKeys, IntoValues, Iter, IterMut, Keys, OccupiedEntry, VacantEntry,
+        Values, ValuesMut,
+    };
+}
 
 pub mod hash_set {
     pub use hashbrown::hash_set::{
         Difference, Intersection, IntoIter, Iter, SymmetricDifference, Union,
     };
 
-    pub use super::hash_map::DefaultHasher;
+    pub use super::default_hasher::DefaultHasher;
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::collections::{FastHashMap, FastHashSet, HashMap, HashSet};
 
     #[test]
     fn test_hashmap_basic() {

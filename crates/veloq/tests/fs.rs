@@ -2,7 +2,7 @@
 
 use veloq_std::{
     env,
-    fs::remove_file,
+    fs::Fs,
     num::NonZeroUsize,
     ops::AsyncFnOnce,
     path::{Path, PathBuf},
@@ -30,7 +30,7 @@ impl CleanupGuard {
     fn new(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref().to_path_buf();
         if path.exists() {
-            let _ = remove_file(&path);
+            let _ = Fs::remove_file(&path);
         }
         Self(path)
     }
@@ -39,7 +39,7 @@ impl CleanupGuard {
 impl Drop for CleanupGuard {
     fn drop(&mut self) {
         if self.0.exists() {
-            let _ = remove_file(&self.0);
+            let _ = Fs::remove_file(&self.0);
         }
     }
 }
@@ -56,7 +56,7 @@ where
 
 fn temp_file_path(label: &str) -> PathBuf {
     let id = TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
-    env::temp_dir().join(format!("veloq-{label}-{}-{id}.tmp", process::id()))
+    env::Env::temp_dir().join(format!("veloq-{label}-{}-{id}.tmp", process::Process::id()))
 }
 
 #[test]

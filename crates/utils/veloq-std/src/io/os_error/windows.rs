@@ -4,33 +4,35 @@ use crate::alloc_crate as alloc;
 use crate::io::{ErrorKind, os_error::RawOsError};
 
 use alloc::{format, string::String};
-use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_BAD_NET_NAME, ERROR_BAD_NETPATH,
-    ERROR_BAD_PATHNAME, ERROR_BROKEN_PIPE, ERROR_BUSY, ERROR_CALL_NOT_IMPLEMENTED,
-    ERROR_CANT_RESOLVE_FILENAME, ERROR_DIR_NOT_EMPTY, ERROR_DIRECTORY, ERROR_DISK_FULL,
-    ERROR_DISK_QUOTA_EXCEEDED, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_FILE_TOO_LARGE,
-    ERROR_FILENAME_EXCED_RANGE, ERROR_HANDLE_DISK_FULL, ERROR_HOST_UNREACHABLE,
-    ERROR_INVALID_DRIVE, ERROR_INVALID_NAME, ERROR_INVALID_PARAMETER, ERROR_NETWORK_UNREACHABLE,
-    ERROR_NO_DATA, ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_SAME_DEVICE, ERROR_OPERATION_ABORTED,
-    ERROR_OUTOFMEMORY, ERROR_PATH_NOT_FOUND, ERROR_POSSIBLE_DEADLOCK, ERROR_SEEK_ON_DEVICE,
-    ERROR_SEM_TIMEOUT, ERROR_TIMEOUT, ERROR_TOO_MANY_LINKS, ERROR_TOO_MANY_OPEN_FILES,
-    ERROR_WRITE_PROTECT, GetLastError, WAIT_TIMEOUT,
-};
-use windows_sys::Win32::Networking::WinSock::{
-    WSAEACCES, WSAEADDRINUSE, WSAEADDRNOTAVAIL, WSAECONNABORTED, WSAECONNREFUSED, WSAECONNRESET,
-    WSAEDQUOT, WSAEHOSTUNREACH, WSAEINVAL, WSAEMFILE, WSAENETDOWN, WSAENETUNREACH, WSAENOTCONN,
-    WSAESHUTDOWN, WSAETIMEDOUT, WSAEWOULDBLOCK,
-};
-use windows_sys::Win32::System::Diagnostics::Debug::{
-    FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS, FormatMessageW,
+use windows_sys::Win32::{
+    Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_BAD_NET_NAME, ERROR_BAD_NETPATH,
+        ERROR_BAD_PATHNAME, ERROR_BROKEN_PIPE, ERROR_BUSY, ERROR_CALL_NOT_IMPLEMENTED,
+        ERROR_CANT_RESOLVE_FILENAME, ERROR_DIR_NOT_EMPTY, ERROR_DIRECTORY, ERROR_DISK_FULL,
+        ERROR_DISK_QUOTA_EXCEEDED, ERROR_FILE_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_FILE_TOO_LARGE,
+        ERROR_FILENAME_EXCED_RANGE, ERROR_HANDLE_DISK_FULL, ERROR_HOST_UNREACHABLE,
+        ERROR_INVALID_DRIVE, ERROR_INVALID_NAME, ERROR_INVALID_PARAMETER,
+        ERROR_NETWORK_UNREACHABLE, ERROR_NO_DATA, ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_SAME_DEVICE,
+        ERROR_OPERATION_ABORTED, ERROR_OUTOFMEMORY, ERROR_PATH_NOT_FOUND, ERROR_POSSIBLE_DEADLOCK,
+        ERROR_SEEK_ON_DEVICE, ERROR_SEM_TIMEOUT, ERROR_TIMEOUT, ERROR_TOO_MANY_LINKS,
+        ERROR_TOO_MANY_OPEN_FILES, ERROR_WRITE_PROTECT, GetLastError, WAIT_TIMEOUT,
+    },
+    Networking::WinSock::{
+        WSAEACCES, WSAEADDRINUSE, WSAEADDRNOTAVAIL, WSAECONNABORTED, WSAECONNREFUSED,
+        WSAECONNRESET, WSAEDQUOT, WSAEHOSTUNREACH, WSAEINVAL, WSAEMFILE, WSAENETDOWN,
+        WSAENETUNREACH, WSAENOTCONN, WSAESHUTDOWN, WSAETIMEDOUT, WSAEWOULDBLOCK,
+    },
+    System::Diagnostics::Debug::{
+        FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS, FormatMessageW,
+    },
 };
 
 #[inline]
-pub fn last_os_error() -> RawOsError {
+fn last_os_error() -> RawOsError {
     unsafe { GetLastError() as RawOsError }
 }
 
-pub fn error_string(code: RawOsError) -> String {
+fn error_string(code: RawOsError) -> String {
     let mut buf = [0u16; 1024];
     let flags = FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS;
     let res = unsafe {
@@ -59,7 +61,7 @@ pub fn error_string(code: RawOsError) -> String {
     }
 }
 
-pub fn decode_error_kind(errno: RawOsError) -> ErrorKind {
+fn decode_error_kind(errno: RawOsError) -> ErrorKind {
     match errno as u32 {
         ERROR_ACCESS_DENIED => ErrorKind::PermissionDenied,
         ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS => ErrorKind::AlreadyExists,
@@ -109,5 +111,21 @@ pub fn decode_error_kind(errno: RawOsError) -> ErrorKind {
             WSAESHUTDOWN => ErrorKind::BrokenPipe,
             _ => ErrorKind::Uncategorized,
         },
+    }
+}
+
+pub(crate) struct Platform;
+
+impl Platform {
+    pub(crate) fn last_os_error() -> RawOsError {
+        last_os_error()
+    }
+
+    pub(crate) fn error_string(code: RawOsError) -> String {
+        error_string(code)
+    }
+
+    pub(crate) fn decode_error_kind(errno: RawOsError) -> ErrorKind {
+        decode_error_kind(errno)
     }
 }

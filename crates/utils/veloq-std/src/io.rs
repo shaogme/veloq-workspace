@@ -1,22 +1,18 @@
-pub mod cursor;
-pub mod error;
-pub mod impls;
-pub mod kind;
-pub mod os_error;
-pub mod stdio;
-pub mod traits;
+mod cursor;
+mod error;
+mod impls;
+mod kind;
+mod os_error;
+mod stdio;
+mod traits;
 
 pub use cursor::Cursor;
 pub use error::{Error, Result, SimpleMessage};
 pub use kind::ErrorKind;
 pub use os_error::RawOsError;
-pub use stdio::{
-    _eprint, _print, Stderr, StderrLock, Stdin, StdinLock, Stdout, StdoutLock, stderr, stdin,
-    stdout,
-};
+pub use stdio::{Stderr, StderrLock, Stdin, StdinLock, Stdout, StdoutLock};
 pub use traits::{
-    Bytes, Chain, Empty, IoSlice, IoSliceMut, Read, Repeat, Seek, SeekFrom, Sink, Take, Write,
-    copy, empty, repeat, sink,
+    Bytes, Chain, Empty, Io, IoSlice, IoSliceMut, Read, Repeat, Seek, SeekFrom, Sink, Take, Write,
 };
 
 /// Creates a new I/O error from a known kind of error and a constant string literal.

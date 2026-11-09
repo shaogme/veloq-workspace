@@ -4,25 +4,26 @@ use core::{
     fmt,
     marker::PhantomData,
     mem::{self, forget},
+    sync::atomic::{
+        AtomicBool,
+        Ordering::{AcqRel, Relaxed},
+    },
 };
 
 use super::raw::{AsRawSocket, FromRawSocket, IntoRawSocket, RawSocket};
 use crate::{
     alloc_crate as alloc,
     io::{Error, Result},
-    os::{
-        cvt::{cvt, cvt_socket},
-        windows::net,
-    },
+    os::Cvt,
 };
 
 use alloc::{boxed::Box, rc::Rc, sync::Arc};
 use windows_sys::Win32::{
     Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation},
     Networking::WinSock::{
-        INVALID_SOCKET, SOCKET, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED,
-        WSADuplicateSocketW, WSAEINVAL, WSAEPROTOTYPE, WSAGetLastError, WSAPROTOCOL_INFOW,
-        WSASocketW, closesocket,
+        INVALID_SOCKET, SOCKET, WSA_FLAG_NO_HANDLE_INHERIT, WSA_FLAG_OVERLAPPED, WSACleanup,
+        WSADATA, WSADuplicateSocketW, WSAEINVAL, WSAEPROTOTYPE, WSAGetLastError, WSAPROTOCOL_INFOW,
+        WSASocketW, WSAStartup, closesocket,
     },
     System::Threading::GetCurrentProcessId,
 };
@@ -33,18 +34,41 @@ use std::{
     os::windows::io::AsRawSocket as StdAsRawSocket,
 };
 
-/// A borrowed Windows socket.
-#[derive(Copy, Clone)]
-#[repr(transparent)]
-pub struct BorrowedSocket<'socket> {
-    socket: RawSocket,
-    _phantom: PhantomData<&'socket OwnedSocket>,
+static WSA_STARTED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) struct Winsock;
+
+impl Winsock {
+    pub(crate) fn init() {
+        if !WSA_STARTED.load(Relaxed) {
+            unsafe {
+                let mut data: WSADATA = mem::zeroed();
+                let ret = WSAStartup(0x0202, &mut data);
+                assert_eq!(ret, 0, "failed to initialize winsock");
+                if WSA_STARTED.swap(true, AcqRel) {
+                    let _ = WSACleanup();
+                }
+            }
+        }
+    }
+
+    pub(crate) fn last_error() -> Error {
+        Error::from_raw_os_error(unsafe { WSAGetLastError() })
+    }
 }
 
 /// An owned Windows socket.
 #[repr(transparent)]
 pub struct OwnedSocket {
     socket: RawSocket,
+}
+
+/// A borrowed Windows socket.
+#[derive(Copy, Clone)]
+#[repr(transparent)]
+pub struct BorrowedSocket<'socket> {
+    socket: RawSocket,
+    _phantom: PhantomData<&'socket OwnedSocket>,
 }
 
 /// A trait to borrow the socket from an underlying object.
@@ -54,8 +78,11 @@ pub trait AsSocket {
 }
 
 unsafe impl Send for OwnedSocket {}
+
 unsafe impl Sync for OwnedSocket {}
+
 unsafe impl Send for BorrowedSocket<'_> {}
+
 unsafe impl Sync for BorrowedSocket<'_> {}
 
 impl BorrowedSocket<'_> {
@@ -75,7 +102,7 @@ impl BorrowedSocket<'_> {
     /// Creates a new `OwnedSocket` instance that shares the same underlying
     /// object as the existing `BorrowedSocket` instance.
     pub fn try_clone_to_owned(&self) -> Result<OwnedSocket> {
-        net::init();
+        Winsock::init();
         let mut info = unsafe { mem::zeroed::<WSAPROTOCOL_INFOW>() };
         let result = unsafe {
             WSADuplicateSocketW(
@@ -84,7 +111,7 @@ impl BorrowedSocket<'_> {
                 &mut info,
             )
         };
-        cvt_socket(result)?;
+        Cvt::cvt_socket(result)?;
         let socket = unsafe {
             WSASocketW(
                 info.iAddressFamily,
@@ -117,7 +144,7 @@ impl BorrowedSocket<'_> {
             };
 
             if socket == INVALID_SOCKET {
-                return Err(net::last_error());
+                return Err(Error::from_raw_os_error(unsafe { WSAGetLastError() }));
             }
 
             let owned = unsafe { OwnedSocket::from_raw_socket(socket as RawSocket) };
@@ -136,7 +163,7 @@ impl OwnedSocket {
     }
 
     pub(crate) fn set_no_inherit(&self) -> Result<()> {
-        cvt(unsafe {
+        Cvt::cvt(unsafe {
             SetHandleInformation(self.socket as usize as HANDLE, HANDLE_FLAG_INHERIT, 0)
         })?;
         Ok(())

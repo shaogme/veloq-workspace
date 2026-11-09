@@ -17,9 +17,9 @@ use veloq_std::{
     future::Future,
     marker::PhantomData,
     ops::AsyncFnOnce,
-    panic::resume_unwind,
+    panic::Panic,
     ptr::{drop_in_place, write},
-    thread::{PanicState, panic_state},
+    thread::PanicState,
 };
 use veloq_storage::{AtomicStorage, LocalStorage, StateLock, Storage};
 
@@ -238,7 +238,7 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra>
     pub async fn wait_all(&self) -> Result<()> {
         ScopeJoinFuture::new(&*self.completion).await;
         if let Some(panic_info) = self.completion.take_panic() {
-            resume_unwind(panic_info);
+            Panic::resume_unwind(panic_info);
         }
         Ok(())
     }
@@ -373,7 +373,9 @@ impl<'rt, 'scope, 'env, S: ScopeStorage, O: Ownership + 'static, TExtra> Drop
         if let Some(payload) = self.completion.take_panic() {
             match self.completion.parent() {
                 Some(parent) => parent.report_panic(payload),
-                None if matches!(panic_state(), PanicState::NotPanicking) => resume_unwind(payload),
+                None if matches!(PanicState::current(), PanicState::NotPanicking) => {
+                    Panic::resume_unwind(payload)
+                }
                 None => {}
             }
         }

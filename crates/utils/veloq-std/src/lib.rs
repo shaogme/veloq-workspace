@@ -5,37 +5,20 @@
 pub(crate) extern crate alloc as alloc_crate;
 
 #[doc(hidden)]
-pub mod __private {
-    use crate::{string::String, vec::Vec};
-
-    pub use core::{concat, format_args};
-
-    pub fn format(args: core::fmt::Arguments<'_>) -> String {
-        alloc_crate::fmt::format(args)
-    }
-
-    pub fn vec_from_array<T, const N: usize>(items: [T; N]) -> Vec<T> {
-        items.into_iter().collect()
-    }
-
-    pub fn vec_repeat<T: Clone>(item: T, count: usize) -> Vec<T> {
-        let mut items = Vec::with_capacity(count);
-        for _ in 0..count {
-            items.push(item.clone());
-        }
-        items
-    }
-}
-
+pub mod __private;
 pub mod cell;
 pub mod collections;
 pub mod env;
+pub mod ffi;
 pub mod fs;
 pub mod io;
-pub mod macros;
+pub mod net;
+pub mod os;
+pub mod panic;
 pub mod path;
 pub mod process;
 pub mod sync;
+pub mod task;
 pub mod thread;
 pub mod time;
 
@@ -84,13 +67,9 @@ pub mod result {
     pub use core::result::*;
 }
 
-pub mod task;
-
 pub mod error {
     pub use core::error::*;
 }
-
-pub mod ffi;
 
 pub mod fmt {
     pub use core::fmt::*;
@@ -128,8 +107,6 @@ pub mod num {
     pub use core::num::*;
 }
 
-pub mod net;
-
 pub mod boxed {
     pub use alloc_crate::boxed::*;
 }
@@ -149,7 +126,3 @@ pub mod str {
 pub mod string {
     pub use alloc_crate::string::*;
 }
-
-pub mod os;
-
-pub mod panic;

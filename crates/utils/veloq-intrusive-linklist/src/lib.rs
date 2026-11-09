@@ -82,7 +82,7 @@ impl Link {
 
 impl Drop for Link {
     fn drop(&mut self) {
-        if self.is_linked() && !veloq_std::thread::panicking() {
+        if self.is_linked() && !veloq_std::thread::ThreadApi::panicking() {
             panic!("dropped a node that is still linked");
         }
     }
@@ -219,7 +219,7 @@ impl ConcurrentLink {
 
 impl Drop for ConcurrentLink {
     fn drop(&mut self) {
-        if self.is_linked() && !veloq_std::thread::panicking() {
+        if self.is_linked() && !veloq_std::thread::ThreadApi::panicking() {
             panic!("dropped a node that is still linked");
         }
     }

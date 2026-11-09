@@ -1,12 +1,18 @@
+#[cfg(not(windows))]
+use veloq_std::net::TcpStream as SystemTcpStream;
+
+#[cfg(windows)]
+use std::net::TcpStream as SystemTcpStream;
+
 use veloq_std::{
-    net::{SocketAddr, TcpStream as StdTcpStream},
+    net::SocketAddr,
     num::NonZeroUsize,
     ops::AsyncFnOnce,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    thread::spawn,
+    thread::ThreadApi,
 };
 
 use futures_util::StreamExt;
@@ -546,9 +552,9 @@ fn a_local_listener_streams_connections_without_a_detached_op() {
         let listener = LocalTcpListener::bind(ctx, "127.0.0.1:0").expect("Failed to bind listener");
         let listen_addr = listener.local_addr().expect("Failed to get local address");
 
-        let clients = spawn(move || {
+        let clients = ThreadApi::spawn(move || {
             for _ in 0..CONNECTIONS {
-                let stream = StdTcpStream::connect(listen_addr).expect("Failed to connect");
+                let stream = SystemTcpStream::connect(listen_addr).expect("Failed to connect");
                 drop(stream);
             }
         })

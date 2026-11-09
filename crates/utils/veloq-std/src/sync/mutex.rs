@@ -1,4 +1,9 @@
-pub mod raw;
+mod raw;
+
+pub use self::raw::{NativeRawMutex, RawMutex};
+
+#[cfg(feature = "loom")]
+pub use self::raw::LoomRawMutex;
 
 use core::{
     fmt,
@@ -16,16 +21,11 @@ use crate::{
     time::{Duration, Instant},
 };
 
-use self::raw::NativeRawMutex;
-
 #[cfg(feature = "loom")]
 use crate::{
     cell::LoomUnsafeCell,
     sync::unpoisoned_mutex::{LoomUnpoisonedMutex, LoomUnpoisonedMutexGuard},
 };
-
-#[cfg(feature = "loom")]
-use self::raw::LoomRawMutex;
 
 #[cfg(feature = "loom")]
 use crate::sync::poison::LoomPoisonState;
@@ -210,7 +210,7 @@ macro_rules! impl_mutex {
         impl<T: ?Sized> Drop for $guard_name<'_, T> {
             #[inline]
             fn drop(&mut self) {
-                if thread::panicking() {
+                if thread::ThreadApi::panicking() {
                     self.mutex.poison.poison();
                 }
             }
@@ -283,14 +283,3 @@ pub type Mutex<T> = LoomMutex<T>;
 
 #[cfg(feature = "loom")]
 pub type MutexGuard<'a, T> = LoomMutexGuard<'a, T>;
-
-#[inline]
-pub const fn const_native_mutex<T>(value: T) -> NativeMutex<T> {
-    NativeMutex::new(value)
-}
-
-#[cfg(not(feature = "loom"))]
-#[inline]
-pub const fn const_mutex<T>(value: T) -> Mutex<T> {
-    const_native_mutex(value)
-}

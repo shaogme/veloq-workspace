@@ -12,7 +12,7 @@ use veloq_std::{
     cmp::Ordering,
     fmt::{self, Display, Formatter},
     format,
-    fs::remove_file,
+    fs::Fs,
     io,
     num::NonZeroUsize,
     path::PathBuf,
@@ -186,7 +186,7 @@ async fn prepare_files_for_thread<'rt>(
 ) {
     let path = get_file_path(t_idx);
     if path.exists() {
-        let _ = remove_file(&path);
+        let _ = Fs::remove_file(&path);
     }
 
     let file = OpenOptions::new()
@@ -211,7 +211,7 @@ fn cleanup_files(threads: usize) {
     for t_idx in 0..threads {
         let path = get_file_path(t_idx);
         if path.exists() {
-            let _ = remove_file(&path);
+            let _ = Fs::remove_file(&path);
         }
     }
 }

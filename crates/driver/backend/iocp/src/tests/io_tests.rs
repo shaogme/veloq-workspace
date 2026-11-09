@@ -9,7 +9,7 @@ use veloq_buf::FixedBuf;
 use veloq_driver_core::{Driver, DriverSubmitResult, IntoPlatformOp, RegisterFd, SubmitStatus};
 use veloq_std::{
     env, format,
-    fs::{File, OpenOptions, remove_file},
+    fs::{File, Fs, OpenOptions},
     num::NonZeroUsize,
     os::windows::fs::OpenOptionsExt,
     path::PathBuf,
@@ -29,8 +29,8 @@ fn new_driver() -> IocpDriver<'static> {
 
 fn temp_file_path(label: &str) -> PathBuf {
     let id = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
-    let pid = process::id();
-    let mut path = env::temp_dir();
+    let pid = process::Process::id();
+    let mut path = env::Env::temp_dir();
     let filename = format!("veloq-iocp-{label}-{pid}-{id}.tmp");
     path.push(filename.as_str());
     path
@@ -51,7 +51,7 @@ fn open_overlapped_temp_file(label: &str) -> (PathBuf, File) {
 
 fn remove_temp_file(path: PathBuf, file: File) {
     drop(file);
-    remove_file(&path).unwrap_or_else(|err| {
+    Fs::remove_file(&path).unwrap_or_else(|err| {
         panic!("remove temp file {path} failed: {err}");
     });
 }

@@ -163,7 +163,7 @@ fn arm_recv_multi(driver: &mut UringDriver<'static>, fd: IoFd) -> Option<OpToken
         driver.drive(DriveMode::Poll).expect("drive failed");
         match driver.completion_table().try_take_record(token).unwrap() {
             PollRecordResult::Pending => {
-                let _ = thread::sleep(Duration::from_millis(1));
+                let _ = thread::ThreadApi::sleep(Duration::from_millis(1));
             }
             PollRecordResult::Ready(record) => {
                 assert_eq!(
@@ -208,7 +208,7 @@ fn drain_cancelled(driver: &mut UringDriver<'static>, token: OpToken) {
             Instant::now() < deadline,
             "the cancelled operation never settled"
         );
-        let _ = thread::sleep(Duration::from_millis(1));
+        let _ = thread::ThreadApi::sleep(Duration::from_millis(1));
     }
 }
 
@@ -241,7 +241,7 @@ fn take_completion(driver: &mut UringDriver<'static>, token: OpToken) -> (i32, O
                 panic!("completion record unavailable: {kind:?}")
             }
             PollRecordResult::Pending => {
-                let _ = thread::sleep(Duration::from_millis(2));
+                let _ = thread::ThreadApi::sleep(Duration::from_millis(2));
             }
         }
     }
@@ -416,7 +416,7 @@ fn a_discarded_completion_returns_its_buffer_to_the_ring() {
             Instant::now() < deadline,
             "the orphaned completion never arrived"
         );
-        let _ = thread::sleep(Duration::from_millis(2));
+        let _ = thread::ThreadApi::sleep(Duration::from_millis(2));
     }
 
     // 环没被削短：后面的 recv 照常拿得到 buffer。
@@ -537,7 +537,7 @@ fn a_cancelled_recv_multi_returns_its_buffer_to_the_ring() {
                 Instant::now() < deadline,
                 "orphaned completion {expected_returns} never arrived"
             );
-            let _ = thread::sleep(Duration::from_millis(2));
+            let _ = thread::ThreadApi::sleep(Duration::from_millis(2));
         }
     }
 

@@ -8,10 +8,10 @@ use crate::{
     time::{Duration, Instant},
 };
 
-use super::rwlock::raw::NativeRawRwLock;
+use super::rwlock::NativeRawRwLock;
 
 #[cfg(feature = "loom")]
-use crate::{cell::LoomUnsafeCell, sync::rwlock::raw::LoomRawRwLock};
+use crate::{cell::LoomUnsafeCell, sync::rwlock::LoomRawRwLock};
 
 /// 不会记录 panic 中毒状态的读写锁。
 ///
@@ -319,17 +319,6 @@ pub type UnpoisonedRwLockReadGuard<'a, T> = LoomUnpoisonedRwLockReadGuard<'a, T>
 #[cfg(feature = "loom")]
 pub type UnpoisonedRwLockWriteGuard<'a, T> = LoomUnpoisonedRwLockWriteGuard<'a, T>;
 
-#[inline]
-pub const fn const_native_unpoisoned_rwlock<T>(value: T) -> NativeUnpoisonedRwLock<T> {
-    NativeUnpoisonedRwLock::new(value)
-}
-
-#[cfg(not(feature = "loom"))]
-#[inline]
-pub const fn const_unpoisoned_rwlock<T>(value: T) -> UnpoisonedRwLock<T> {
-    const_native_unpoisoned_rwlock(value)
-}
-
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use core::time::Duration;
@@ -365,7 +354,7 @@ mod tests {
 
         for _ in 0..num_threads {
             let lock = lock.clone();
-            let handle = thread::spawn(move || {
+            let handle = thread::ThreadApi::spawn(move || {
                 for _ in 0..100 {
                     let mut writer = lock.write();
                     *writer += 1;
@@ -388,7 +377,7 @@ mod tests {
         let worker_lock = lock.clone();
         let guard = lock.write();
 
-        let handle = thread::spawn(move || {
+        let handle = thread::ThreadApi::spawn(move || {
             let start = Instant::now();
             let result = worker_lock.try_read_for(Duration::from_millis(10));
             assert!(result.is_none());

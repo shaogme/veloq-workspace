@@ -14,7 +14,7 @@ use veloq_std::{
     cell::UnsafeCell,
     marker::{PhantomData, PhantomPinned},
     mem::ManuallyDrop,
-    panic::{AssertUnwindSafe, catch_unwind},
+    panic::{AssertUnwindSafe, Panic},
     pin::Pin,
     ptr::{self, NonNull},
     sync::{NativeArc as Arc, atomic::Ordering},
@@ -488,7 +488,7 @@ impl<S: Storage> GenericTaskHeader<S> {
         }
 
         for waker in ready {
-            if catch_unwind(AssertUnwindSafe::new(|| waker.wake())).is_err() {
+            if Panic::catch_unwind(AssertUnwindSafe::new(|| waker.wake())).is_err() {
                 self.state.fetch_or(STATE_WAKER_PANICKED, Ordering::Release);
             }
         }
@@ -559,7 +559,7 @@ impl<S: Storage> GenericTaskHeader<S> {
                     }
                     let mut waker_panicked = false;
                     for waker in ready {
-                        if catch_unwind(AssertUnwindSafe::new(|| waker.wake())).is_err() {
+                        if Panic::catch_unwind(AssertUnwindSafe::new(|| waker.wake())).is_err() {
                             waker_panicked = true;
                         }
                     }

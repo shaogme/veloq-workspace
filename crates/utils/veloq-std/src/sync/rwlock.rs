@@ -1,4 +1,9 @@
-pub mod raw;
+mod raw;
+
+pub use self::raw::{NativeRawRwLock, RawRwLock};
+
+#[cfg(feature = "loom")]
+pub use self::raw::LoomRawRwLock;
 
 use core::{
     fmt,
@@ -19,8 +24,6 @@ use crate::{
     time::{Duration, Instant},
 };
 
-use self::raw::NativeRawRwLock;
-
 #[cfg(feature = "loom")]
 use crate::{
     cell::LoomUnsafeCell,
@@ -30,12 +33,7 @@ use crate::{
 };
 
 #[cfg(feature = "loom")]
-use self::raw::LoomRawRwLock;
-
-#[cfg(feature = "loom")]
 use crate::sync::poison::LoomPoisonState;
-
-pub use self::raw::RawRwLock;
 
 /// A reader-writer lock with poisoning behavior compatible with
 /// `std::sync::RwLock`.
@@ -315,7 +313,7 @@ macro_rules! impl_rwlock {
         impl<T: ?Sized> Drop for $write_guard_name<'_, T> {
             #[inline]
             fn drop(&mut self) {
-                if self.inner.is_some() && thread::panicking() {
+                if self.inner.is_some() && thread::ThreadApi::panicking() {
                     self.rwlock.poison.poison();
                 }
             }
@@ -416,14 +414,3 @@ pub type RwLockReadGuard<'a, T> = LoomRwLockReadGuard<'a, T>;
 
 #[cfg(feature = "loom")]
 pub type RwLockWriteGuard<'a, T> = LoomRwLockWriteGuard<'a, T>;
-
-#[inline]
-pub const fn const_native_rwlock<T>(value: T) -> NativeRwLock<T> {
-    NativeRwLock::new(value)
-}
-
-#[cfg(not(feature = "loom"))]
-#[inline]
-pub const fn const_rwlock<T>(value: T) -> RwLock<T> {
-    const_native_rwlock(value)
-}

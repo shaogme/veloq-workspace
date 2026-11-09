@@ -176,7 +176,7 @@ mod normal_tests {
             let custom_waker = Waker::from(Arc::new(TestWaker::new(woken.clone(), count.clone())));
 
             let waker_clone = mpsc_waker.clone();
-            let handle = thread::spawn(move || {
+            let handle = thread::ThreadApi::spawn(move || {
                 wake(&waker_clone);
             })
             .expect("thread spawn failed");
@@ -212,7 +212,7 @@ mod normal_tests {
 
         let register_slot = mpsc_waker.clone();
         let register_barrier = barrier.clone();
-        let register_handle = thread::spawn(move || {
+        let register_handle = thread::ThreadApi::spawn(move || {
             register_barrier.wait();
             unsafe {
                 register_slot.register(&replacement_waker);
@@ -222,7 +222,7 @@ mod normal_tests {
 
         let take_slot = mpsc_waker.clone();
         let take_barrier = barrier.clone();
-        let take_handle = thread::spawn(move || {
+        let take_handle = thread::ThreadApi::spawn(move || {
             take_barrier.wait();
             wake(&take_slot);
         })
@@ -230,7 +230,7 @@ mod normal_tests {
 
         let second_take_slot = mpsc_waker.clone();
         let second_take_barrier = barrier.clone();
-        let second_take_handle = thread::spawn(move || {
+        let second_take_handle = thread::ThreadApi::spawn(move || {
             second_take_barrier.wait();
             wake(&second_take_slot);
         })
@@ -380,7 +380,7 @@ mod loom_tests {
             let custom_waker = Waker::from(StdArc::new(TestWaker(woken.clone())));
 
             let waker_clone = mpsc_waker.clone();
-            let handle = thread::spawn(move || {
+            let handle = thread::ThreadApi::spawn(move || {
                 wake(&waker_clone);
             })
             .expect("thread spawn failed");
@@ -407,7 +407,7 @@ mod loom_tests {
             }
 
             let waker_clone = mpsc_waker.clone();
-            let handle = thread::spawn(move || {
+            let handle = thread::ThreadApi::spawn(move || {
                 if let Some(w) = waker_clone.take() {
                     w.wake();
                 }
@@ -460,18 +460,18 @@ mod loom_tests {
             let replacement_waker = Waker::from(StdArc::new(CountWaker(replacement_count.clone())));
 
             let take_slot = mpsc_waker.clone();
-            let take_handle = thread::spawn(move || {
+            let take_handle = thread::ThreadApi::spawn(move || {
                 wake(&take_slot);
             })
             .expect("thread spawn failed");
 
             let second_take_slot = mpsc_waker.clone();
-            let second_take_handle = thread::spawn(move || {
+            let second_take_handle = thread::ThreadApi::spawn(move || {
                 wake(&second_take_slot);
             })
             .expect("thread spawn failed");
 
-            thread::yield_now().unwrap();
+            thread::ThreadApi::yield_now().unwrap();
             unsafe {
                 mpsc_waker.register(&replacement_waker);
             }
@@ -531,7 +531,7 @@ mod loom_tests {
 
             let replacement = Waker::noop().clone();
             let take_slot = mpsc_waker.clone();
-            let take_handle = thread::spawn(move || {
+            let take_handle = thread::ThreadApi::spawn(move || {
                 let _ = take_slot.take();
             })
             .expect("thread spawn failed");

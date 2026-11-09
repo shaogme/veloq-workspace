@@ -16,7 +16,7 @@ use veloq_std::{
         atomic::{NativeAtomicBool as AtomicBool, Ordering},
     },
     task::{Context, Poll, Waker},
-    thread::{scope, sleep, yield_now as thread_yield},
+    thread::ThreadApi,
     time::Duration,
 };
 
@@ -187,18 +187,19 @@ fn a_parked_worker_wakes_on_a_foreign_thread_wake() {
     let slot: Mutex<Option<Waker>> = Mutex::new(None);
     let fired = AtomicBool::new(false);
 
-    scope(|threads| {
+    ThreadApi::scope(|threads| {
         threads
             .spawn(|| {
                 loop {
                     let waker = slot.lock().expect("waker slot").take();
                     if let Some(waker) = waker {
-                        sleep(Duration::from_millis(50)).expect("foreign wake thread aborted");
+                        ThreadApi::sleep(Duration::from_millis(50))
+                            .expect("foreign wake thread aborted");
                         fired.store(true, Ordering::Release);
                         waker.wake();
                         return;
                     }
-                    thread_yield().expect("foreign wake thread aborted");
+                    ThreadApi::yield_now().expect("foreign wake thread aborted");
                 }
             })
             .expect("foreign wake thread failed to spawn");

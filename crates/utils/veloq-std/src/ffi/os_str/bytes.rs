@@ -16,13 +16,13 @@ use crate::alloc_crate::{
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct Buf {
-    pub(crate) inner: Vec<u8>,
+    inner: Vec<u8>,
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct Slice {
-    pub(crate) inner: [u8],
+    inner: [u8],
 }
 
 impl fmt::Debug for Buf {
@@ -203,6 +203,16 @@ impl Buf {
 }
 
 impl Slice {
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
     #[inline]
     pub fn as_encoded_bytes(&self) -> &[u8] {
         &self.inner

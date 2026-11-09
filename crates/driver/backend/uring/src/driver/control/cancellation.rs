@@ -90,7 +90,7 @@ pub(crate) struct UringCancelManager {
 
 impl UringCancelManager {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::Mpsc::channel();
         Self {
             intents: vec![None; capacity],
             pending_head: None,

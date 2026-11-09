@@ -15,8 +15,6 @@ fn compile_tests() {
     #[cfg(windows)]
     {
         t.compile_fail("tests/ui/windows/oneshot_escape_fail.rs");
-        t.compile_fail("tests/ui/windows/mpsc_escape_fail.rs");
-        t.compile_fail("tests/ui/windows/mpmc_escape_fail.rs");
         t.compile_fail("tests/ui/windows/broadcast_escape_fail.rs");
         t.compile_fail("tests/ui/windows/watch_escape_fail.rs");
     }

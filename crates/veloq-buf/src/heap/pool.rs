@@ -24,7 +24,7 @@ use veloq_std::{
     ptr::NonNull,
     string::ToString,
     sync::{Arc, UnpoisonedMutex, UnpoisonedRwLock},
-    thread::{available_parallelism, current_id},
+    thread::ThreadApi,
     vec,
     vec::Vec,
 };
@@ -173,7 +173,9 @@ impl Chunk {
         size: PageAlignedBytes,
         allocation_strategy: PageAllocationStrategy,
     ) -> BufResult<Self> {
-        let parallelism = available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let parallelism = ThreadApi::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
         Self::new_with_parallelism(id, size, allocation_strategy, parallelism)
     }
 
@@ -343,7 +345,7 @@ impl Chunk {
             // (s * 0x27bb2ee687b0b0fd) is a simple way to spread bits if needed, but s is usually small
             s.wrapping_mul(0x27bb2ee687b0b0fd)
         } else {
-            let thread_id = current_id();
+            let thread_id = ThreadApi::current_id();
             let mut hasher = DefaultHasher::new();
             thread_id.hash(&mut hasher);
             hasher.finish() as usize

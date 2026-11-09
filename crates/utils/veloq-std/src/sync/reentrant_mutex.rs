@@ -4,21 +4,19 @@ use crate::{
     cell::NativeUnsafeCell,
     sync::{
         atomic::{NativeAtomicU64, NativeAtomicUsize, Ordering},
-        mutex::raw::NativeRawMutex,
+        mutex::NativeRawMutex,
     },
-    thread::native_current_id,
+    thread::ThreadApi,
     time::{Duration, Instant},
 };
 
 #[cfg(feature = "loom")]
-use crate::thread::current_id;
-
 #[cfg(feature = "loom")]
 use crate::{
     cell::LoomUnsafeCell,
     sync::{
         atomic::{LoomAtomicU64, LoomAtomicUsize},
-        mutex::raw::LoomRawMutex,
+        mutex::LoomRawMutex,
     },
 };
 
@@ -31,7 +29,7 @@ macro_rules! impl_reentrant_mutex {
         atomic_u64: $atomic_u64_ty:ident,
         atomic_usize: $atomic_usize_ty:ident,
         cell: $cell_ty:ident,
-        current_id: $current_id:ident,
+        current_id: $current_id:path,
         new: $new:item
     ) => {
         $(#[$meta])*
@@ -65,7 +63,7 @@ macro_rules! impl_reentrant_mutex {
 
             /// 获取锁；同一线程可重复获取该锁。
             pub fn lock(&self) -> $guard_name<'_, T> {
-                let current_thread = $current_id().as_u64();
+                let current_thread = ($current_id)().as_u64();
                 if self.owner.load(Ordering::Relaxed) == current_thread {
                     let cur = self.count.load(Ordering::Relaxed);
                     self.count.store(
@@ -82,7 +80,7 @@ macro_rules! impl_reentrant_mutex {
 
             /// 尝试获取锁；同一线程重复获取时始终成功。
             pub fn try_lock(&self) -> Option<$guard_name<'_, T>> {
-                let current_thread = $current_id().as_u64();
+                let current_thread = ($current_id)().as_u64();
                 if self.owner.load(Ordering::Relaxed) == current_thread {
                     let cur = self.count.load(Ordering::Relaxed);
                     self.count.store(
@@ -101,7 +99,7 @@ macro_rules! impl_reentrant_mutex {
 
             /// 在指定时长内尝试获取锁；同一线程重复获取时始终成功。
             pub fn try_lock_for(&self, timeout: Duration) -> Option<$guard_name<'_, T>> {
-                let current_thread = $current_id().as_u64();
+                let current_thread = ($current_id)().as_u64();
                 if self.owner.load(Ordering::Relaxed) == current_thread {
                     let cur = self.count.load(Ordering::Relaxed);
                     self.count.store(
@@ -120,7 +118,7 @@ macro_rules! impl_reentrant_mutex {
 
             /// 截止指定时刻前尝试获取锁；同一线程重复获取时始终成功。
             pub fn try_lock_until(&self, timeout: Instant) -> Option<$guard_name<'_, T>> {
-                let current_thread = $current_id().as_u64();
+                let current_thread = ($current_id)().as_u64();
                 if self.owner.load(Ordering::Relaxed) == current_thread {
                     let cur = self.count.load(Ordering::Relaxed);
                     self.count.store(
@@ -144,7 +142,7 @@ macro_rules! impl_reentrant_mutex {
 
             #[inline]
             pub fn is_owned_by_current_thread(&self) -> bool {
-                self.owner.load(Ordering::Relaxed) == $current_id().as_u64()
+                self.owner.load(Ordering::Relaxed) == ($current_id)().as_u64()
             }
 
             #[inline]
@@ -258,7 +256,7 @@ impl_reentrant_mutex!(
     atomic_u64: NativeAtomicU64,
     atomic_usize: NativeAtomicUsize,
     cell: NativeUnsafeCell,
-    current_id: native_current_id,
+    current_id: ThreadApi::current_id,
     new: #[inline]
     pub const fn new(val: T) -> Self {
         Self {
@@ -279,7 +277,7 @@ impl_reentrant_mutex!(
     atomic_u64: LoomAtomicU64,
     atomic_usize: LoomAtomicUsize,
     cell: LoomUnsafeCell,
-    current_id: current_id,
+    current_id: ThreadApi::current_id,
     new: #[inline]
     #[track_caller]
     pub fn new(val: T) -> Self {
@@ -303,16 +301,3 @@ pub type ReentrantMutex<T> = LoomReentrantMutex<T>;
 
 #[cfg(feature = "loom")]
 pub type ReentrantMutexGuard<'a, T> = LoomReentrantMutexGuard<'a, T>;
-
-/// 创建可用于静态初始化的原生可重入互斥锁。
-#[inline]
-pub const fn const_native_reentrant_mutex<T>(val: T) -> NativeReentrantMutex<T> {
-    NativeReentrantMutex::new(val)
-}
-
-#[cfg(not(feature = "loom"))]
-/// 创建当前配置下的可重入互斥锁。
-#[inline]
-pub const fn const_reentrant_mutex<T>(val: T) -> ReentrantMutex<T> {
-    const_native_reentrant_mutex(val)
-}

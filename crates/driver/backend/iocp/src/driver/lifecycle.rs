@@ -122,7 +122,7 @@ impl DeferredIocpCleanup {
 fn iocp_reaper_sender() -> Option<&'static mpsc::Sender<DeferredIocpCleanup>> {
     static SENDER: OnceLock<Option<mpsc::Sender<DeferredIocpCleanup>>> = OnceLock::new();
     let sender = SENDER.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<DeferredIocpCleanup>();
+        let (tx, rx) = mpsc::Mpsc::channel::<DeferredIocpCleanup>();
         match Builder::new()
             .name("veloq-iocp-reaper".into())
             .spawn(move || {
@@ -238,7 +238,7 @@ impl LifecycleService<'_, '_> {
             address_permit,
         })
         .attach_note("failed to initialize RIO runtime")?;
-        let (remote_cancel_sender, remote_cancel_receiver) = mpsc::channel();
+        let (remote_cancel_sender, remote_cancel_receiver) = mpsc::Mpsc::channel();
         IocpDriverState::new(IocpDriverStateParts {
             completion: CompletionPump::new(port_val, completion_table),
             ops,
@@ -518,7 +518,7 @@ impl LifecycleService<'_, '_> {
         if let Some(sender) = iocp_reaper_sender() {
             if let Err(error) = sender.send(task) {
                 warn!("IocpReaper unavailable; running deferred cleanup inline");
-                error.0.run();
+                error.into_inner().run();
             }
         } else {
             warn!("IocpReaper thread failed to start; running deferred cleanup inline");

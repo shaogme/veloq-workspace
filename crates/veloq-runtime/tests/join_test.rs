@@ -10,7 +10,7 @@ use veloq_std::{
 };
 
 #[cfg(feature = "std")]
-use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
+use veloq_std::panic::{AssertUnwindSafe, Panic};
 
 struct ReadyFuture<T>(Option<T>);
 
@@ -194,7 +194,7 @@ fn join_drops_unfinished_branches_when_task_is_cancelled() {
 #[test]
 #[cfg(feature = "std")]
 fn join_propagates_branch_panics_through_task_outcome() {
-    let result = catch_unwind(AssertUnwindSafe::new(|| {
+    let result = Panic::catch_unwind(AssertUnwindSafe::new(|| {
         Runtime::<(), _>::scope(async |_| {
             join!(async { panic!("join branch panic") }, async { 2usize });
         })

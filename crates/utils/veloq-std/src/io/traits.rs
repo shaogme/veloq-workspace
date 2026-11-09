@@ -1,7 +1,10 @@
 use core::{
     cmp, fmt,
     marker::PhantomData,
+    mem::take,
     ops::{Deref, DerefMut},
+    slice::from_mut,
+    str::from_utf8,
 };
 
 use crate::alloc_crate as alloc;
@@ -49,7 +52,7 @@ impl<'a> IoSliceMut<'a> {
             n <= self.vec.len(),
             "advancing IoSliceMut beyond its length"
         );
-        let rest = core::mem::take(&mut self.vec);
+        let rest = take(&mut self.vec);
         let (_, rest) = rest.split_at_mut(n);
         self.vec = rest;
     }
@@ -123,6 +126,27 @@ impl fmt::Debug for IoSlice<'_> {
     }
 }
 
+/// An iterator over `u8` values of a reader.
+#[derive(Debug)]
+pub struct Bytes<R> {
+    inner: R,
+}
+
+/// Adaptor chaining two readers together.
+#[derive(Debug)]
+pub struct Chain<T, U> {
+    first: T,
+    second: U,
+    done_first: bool,
+}
+
+/// Reader adaptor which limits the bytes read from an underlying reader.
+#[derive(Debug)]
+pub struct Take<T> {
+    inner: T,
+    limit: u64,
+}
+
 /// The `Read` trait allows for reading bytes from a source.
 pub trait Read {
     /// Pull some bytes from this source into the specified buffer, returning how many bytes were read.
@@ -163,7 +187,7 @@ pub trait Read {
     fn read_to_string(&mut self, buf: &mut String) -> Result<usize> {
         let mut bytes = Vec::new();
         let n = self.read_to_end(&mut bytes)?;
-        match core::str::from_utf8(&bytes) {
+        match from_utf8(&bytes) {
             Ok(s) => {
                 buf.push_str(s);
                 Ok(n)
@@ -313,6 +337,25 @@ pub trait Write {
     }
 }
 
+impl Write for Vec<u8> {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> Result<usize> {
+        self.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    #[inline]
+    fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+        self.extend_from_slice(buf);
+        Ok(())
+    }
+
+    #[inline]
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// The `Seek` trait provides a cursor which can be moved within a stream of bytes.
 pub trait Seek {
     /// Seek to an offset, in bytes, in a stream.
@@ -342,19 +385,13 @@ pub trait Seek {
     }
 }
 
-/// An iterator over `u8` values of a reader.
-#[derive(Debug)]
-pub struct Bytes<R> {
-    inner: R,
-}
-
 impl<R: Read> Iterator for Bytes<R> {
     type Item = Result<u8>;
 
     fn next(&mut self) -> Option<Result<u8>> {
         let mut byte = 0;
         loop {
-            return match self.inner.read(core::slice::from_mut(&mut byte)) {
+            return match self.inner.read(from_mut(&mut byte)) {
                 Ok(0) => None,
                 Ok(..) => Some(Ok(byte)),
                 Err(ref e) if e.is_interrupted() => continue,
@@ -362,14 +399,6 @@ impl<R: Read> Iterator for Bytes<R> {
             };
         }
     }
-}
-
-/// Adaptor chaining two readers together.
-#[derive(Debug)]
-pub struct Chain<T, U> {
-    first: T,
-    second: U,
-    done_first: bool,
 }
 
 impl<T, U> Chain<T, U> {
@@ -402,13 +431,6 @@ impl<T: Read, U: Read> Read for Chain<T, U> {
         }
         self.second.read(buf)
     }
-}
-
-/// Reader adaptor which limits the bytes read from an underlying reader.
-#[derive(Debug)]
-pub struct Take<T> {
-    inner: T,
-    limit: u64,
 }
 
 impl<T> Take<T> {
@@ -456,19 +478,26 @@ impl<T: Read> Read for Take<T> {
     }
 }
 
-/// Copies the entire contents of a reader into a writer.
-pub fn copy<R: ?Sized + Read, W: ?Sized + Write>(reader: &mut R, writer: &mut W) -> Result<u64> {
-    let mut buf = [0u8; 8192];
-    let mut written = 0;
-    loop {
-        let len = match reader.read(&mut buf) {
-            Ok(0) => return Ok(written),
-            Ok(len) => len,
-            Err(ref e) if e.is_interrupted() => continue,
-            Err(e) => return Err(e),
-        };
-        writer.write_all(&buf[..len])?;
-        written += len as u64;
+pub struct Io;
+
+impl Io {
+    /// Copies the entire contents of a reader into a writer.
+    pub fn copy<R: ?Sized + Read, W: ?Sized + Write>(
+        reader: &mut R,
+        writer: &mut W,
+    ) -> Result<u64> {
+        let mut buf = [0u8; 8192];
+        let mut written = 0;
+        loop {
+            let len = match reader.read(&mut buf) {
+                Ok(0) => return Ok(written),
+                Ok(len) => len,
+                Err(ref e) if e.is_interrupted() => continue,
+                Err(e) => return Err(e),
+            };
+            writer.write_all(&buf[..len])?;
+            written += len as u64;
+        }
     }
 }
 
@@ -477,11 +506,12 @@ pub fn copy<R: ?Sized + Read, W: ?Sized + Write>(reader: &mut R, writer: &mut W)
 #[non_exhaustive]
 pub struct Sink;
 
-/// Creates an instance of a writer which will successfully consume all data.
-#[inline]
-#[must_use]
-pub const fn sink() -> Sink {
-    Sink
+impl Sink {
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
 }
 
 impl Write for Sink {
@@ -502,11 +532,12 @@ pub struct Empty {
     _priv: (),
 }
 
-/// Creates a value that is always at EOF for reads.
-#[inline]
-#[must_use]
-pub const fn empty() -> Empty {
-    Empty { _priv: () }
+impl Empty {
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { _priv: () }
+    }
 }
 
 impl Read for Empty {
@@ -539,11 +570,12 @@ pub struct Repeat {
     byte: u8,
 }
 
-/// Creates an instance of a reader that infinitely repeats one byte.
-#[inline]
-#[must_use]
-pub const fn repeat(byte: u8) -> Repeat {
-    Repeat { byte }
+impl Repeat {
+    #[inline]
+    #[must_use]
+    pub const fn new(byte: u8) -> Self {
+        Self { byte }
+    }
 }
 
 impl Read for Repeat {

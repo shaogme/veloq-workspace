@@ -12,11 +12,11 @@ use veloq_std::{
     cmp::min,
     collections::VecDeque,
     env,
-    fs::remove_file,
+    fs::Fs,
     io::Error as IoError,
     num::NonZeroUsize,
     path::{Path, PathBuf},
-    process::id,
+    process::Process,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -42,7 +42,7 @@ impl CleanupGuard {
     fn new(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         if path.exists() {
-            let _ = remove_file(&path);
+            let _ = Fs::remove_file(&path);
         }
         Self(path)
     }
@@ -51,13 +51,13 @@ impl CleanupGuard {
 impl Drop for CleanupGuard {
     fn drop(&mut self) {
         if self.0.exists() {
-            let _ = remove_file(&self.0);
+            let _ = Fs::remove_file(&self.0);
         }
     }
 }
 
 fn bench_buffering_mode() -> BufferingMode {
-    let raw = env::var("VELOQ_BENCH_BUFFERING").unwrap_or_else(|_| "directsync".to_string());
+    let raw = env::Env::var("VELOQ_BENCH_BUFFERING").unwrap_or_else(|_| "directsync".to_string());
     match raw.to_ascii_lowercase().as_str() {
         "buffered" => BufferingMode::Buffered,
         "direct" => BufferingMode::Direct,
@@ -67,7 +67,7 @@ fn bench_buffering_mode() -> BufferingMode {
 }
 
 fn bench_sync_mode() -> BenchSyncMode {
-    let raw = env::var("VELOQ_BENCH_SYNC").unwrap_or_else(|_| "sync_range".to_string());
+    let raw = env::Env::var("VELOQ_BENCH_SYNC").unwrap_or_else(|_| "sync_range".to_string());
     match raw.to_ascii_lowercase().as_str() {
         "none" => BenchSyncMode::None,
         "sync_range" => BenchSyncMode::SyncRange,
@@ -78,7 +78,7 @@ fn bench_sync_mode() -> BenchSyncMode {
 }
 
 fn bench_phase() -> BenchPhase {
-    let raw = env::var("VELOQ_BENCH_PHASE").unwrap_or_else(|_| "total".to_string());
+    let raw = env::Env::var("VELOQ_BENCH_PHASE").unwrap_or_else(|_| "total".to_string());
     match raw.to_ascii_lowercase().as_str() {
         "total" => BenchPhase::Total,
         "write" => BenchPhase::Write,
@@ -88,14 +88,15 @@ fn bench_phase() -> BenchPhase {
 }
 
 fn bench_case_name() -> String {
-    let buffering = env::var("VELOQ_BENCH_BUFFERING").unwrap_or_else(|_| "directsync".to_string());
-    let sync = env::var("VELOQ_BENCH_SYNC").unwrap_or_else(|_| "sync_range".to_string());
-    let phase = env::var("VELOQ_BENCH_PHASE").unwrap_or_else(|_| "total".to_string());
+    let buffering =
+        env::Env::var("VELOQ_BENCH_BUFFERING").unwrap_or_else(|_| "directsync".to_string());
+    let sync = env::Env::var("VELOQ_BENCH_SYNC").unwrap_or_else(|_| "sync_range".to_string());
+    let phase = env::Env::var("VELOQ_BENCH_PHASE").unwrap_or_else(|_| "total".to_string());
     format!("{buffering}_{sync}_{phase}")
 }
 
 fn bench_base_dir() -> PathBuf {
-    env::var("VELOQ_BENCH_DIR")
+    env::Env::var("VELOQ_BENCH_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
 }
@@ -156,7 +157,7 @@ async fn run_1gb_iteration<'rt>(
     const CHUNK_SIZE: NonZeroUsize = nz!(4 * 1024 * 1024);
 
     let base_dir = bench_base_dir();
-    let file_path = bench_file_path(&base_dir, format!("bench_1gb_{}.tmp", id()));
+    let file_path = bench_file_path(&base_dir, format!("bench_1gb_{}.tmp", Process::id()));
     let _guard = CleanupGuard::new(&file_path);
 
     let total_start = matches!(phase, BenchPhase::Total).then(Instant::now);
@@ -403,7 +404,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                     .scope(async |ctx| {
                         let start = Instant::now();
                         let base_dir = bench_base_dir();
-                        let pid = id();
+                        let pid = Process::id();
 
                         scope!(ctx, async |s| {
                             let mut prepare_handles = Vec::with_capacity(WORKER_COUNT.get());
@@ -423,7 +424,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                                         let mut files = Vec::with_capacity(FILES_PER_WORKER);
                                         for path in &prepare_path_names {
                                             if path.exists() {
-                                                let _ = remove_file(path);
+                                                let _ = Fs::remove_file(path);
                                             }
 
                                             let file = open_and_fallocate(
@@ -446,7 +447,7 @@ fn benchmark_32_files_write(c: &mut Criterion) {
                                         .await;
 
                                         for path in prepare_path_names {
-                                            let _ = remove_file(path);
+                                            let _ = Fs::remove_file(path);
                                         }
 
                                         Ok::<u64, IoError>(bytes)

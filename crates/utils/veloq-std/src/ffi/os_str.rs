@@ -1,12 +1,11 @@
-use core::{
-    borrow::Borrow,
-    cmp,
-    convert::Infallible,
-    fmt,
-    hash::{Hash, Hasher},
-    ops::{self, RangeBounds, RangeFull},
-    str::FromStr,
-};
+#[cfg(windows)]
+mod wtf8;
+
+#[cfg(not(windows))]
+mod bytes;
+
+#[cfg(test)]
+mod tests;
 
 use crate::alloc_crate::{
     borrow::{Cow, ToOwned},
@@ -17,30 +16,65 @@ use crate::alloc_crate::{
     sync::Arc,
     vec::Vec,
 };
-
-#[cfg(windows)]
-pub(crate) mod wtf8;
-
-#[cfg(not(windows))]
-mod bytes;
+use core::{
+    borrow::Borrow,
+    cmp,
+    convert::Infallible,
+    fmt,
+    hash::{Hash, Hasher},
+    ops::{self, RangeBounds, RangeFull},
+    str::{FromStr, Utf8Error},
+};
 
 #[cfg(not(windows))]
 pub(crate) use bytes::{Buf, Slice};
-
+#[cfg(windows)]
+pub use wtf8::EncodeWide;
 #[cfg(windows)]
 pub(crate) use wtf8::{Buf, Slice};
 
-#[cfg(test)]
-mod tests;
-
 #[derive(Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct OsString {
-    pub(crate) inner: Buf,
+    inner: Buf,
 }
 
 #[repr(transparent)]
 pub struct OsStr {
-    pub(crate) inner: Slice,
+    inner: Slice,
+}
+
+pub struct Display<'a> {
+    os_str: &'a OsStr,
+}
+
+#[cfg(windows)]
+pub trait OsStringExt {
+    /// Creates an `OsString` from a potentially ill-formed UTF-16 slice.
+    fn from_wide(wide: &[u16]) -> Self;
+}
+
+#[cfg(windows)]
+pub trait OsStrExt {
+    /// Re-encodes an `OsStr` as a potentially ill-formed UTF-16 sequence.
+    fn encode_wide(&self) -> EncodeWide<'_>;
+}
+
+#[cfg(windows)]
+impl OsStringExt for OsString {
+    #[inline]
+    fn from_wide(wide: &[u16]) -> Self {
+        Self {
+            inner: Buf::from_wide(wide),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl OsStrExt for OsStr {
+    #[inline]
+    fn encode_wide(&self) -> EncodeWide<'_> {
+        self.inner.encode_wide()
+    }
 }
 
 impl OsString {
@@ -205,13 +239,13 @@ impl OsStr {
     #[must_use]
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.inner.inner.is_empty()
+        self.inner.is_empty()
     }
 
     #[must_use]
     #[inline]
     pub fn len(&self) -> usize {
-        self.inner.inner.len()
+        self.inner.len()
     }
 
     #[must_use = "`self` will be dropped if the result is not used"]
@@ -325,10 +359,6 @@ impl OsStr {
     pub const fn as_os_str(&self) -> &OsStr {
         self
     }
-}
-
-pub struct Display<'a> {
-    os_str: &'a OsStr,
 }
 
 impl fmt::Debug for Display<'_> {
@@ -654,7 +684,7 @@ impl<'a> From<Cow<'a, OsStr>> for OsString {
 }
 
 impl<'a> TryFrom<&'a OsStr> for &'a str {
-    type Error = core::str::Utf8Error;
+    type Error = Utf8Error;
 
     #[inline]
     fn try_from(value: &'a OsStr) -> Result<Self, Self::Error> {

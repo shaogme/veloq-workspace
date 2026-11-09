@@ -2,13 +2,14 @@ use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use crossbeam_queue::ArrayQueue;
 use veloq_std::{
     boxed::Box,
-    panic::{AssertUnwindSafe, catch_unwind},
+    panic::{AssertUnwindSafe, Panic},
     result::Result as StdResult,
     sync::{
         NativeArc as Arc,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
-    thread, vec,
+    thread::ThreadApi,
+    vec,
     vec::Vec,
 };
 use veloq_storage::{AtomicOptionPtr, StateOptionPtr};
@@ -498,7 +499,7 @@ impl GlobalInjector {
         let mut panicked = false;
         while let Some(task) = self.pop() {
             drained += 1;
-            if catch_unwind(AssertUnwindSafe::new(|| f(task))).is_err() {
+            if Panic::catch_unwind(AssertUnwindSafe::new(|| f(task))).is_err() {
                 panicked = true;
             }
         }
@@ -774,7 +775,7 @@ impl<'a, T> RuntimeProgressCoordinator<'a, T> {
             None => IdleDecision::wait(IdleWaitStrategy::Block),
         };
         let Some(wait_strategy) = idle_decision.into_wait_strategy() else {
-            thread::yield_now()
+            ThreadApi::yield_now()
                 .map_err(|error| WaitError::Aborted(error).into_runtime_error(self.worker_id))?;
             return Ok(());
         };

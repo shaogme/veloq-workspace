@@ -3,7 +3,7 @@ use veloq_runtime::{Runtime, scope, yield_now};
 
 #[cfg(feature = "std")]
 use veloq_std::{
-    panic::{AssertUnwindSafe, catch_unwind},
+    panic::{AssertUnwindSafe, Panic},
     println,
     string::String,
 };
@@ -11,7 +11,7 @@ use veloq_std::{
 #[test]
 #[cfg(feature = "std")]
 fn test_panic_propagation() {
-    let result = catch_unwind(AssertUnwindSafe::new(|| {
+    let result = Panic::catch_unwind(AssertUnwindSafe::new(|| {
         Runtime::<(), _>::scope(async |ctx| {
             println!("开始测试 Panic 传播...");
             scope!(ctx, async |s| -> () {

@@ -6,7 +6,7 @@ use veloq_std::{
         atomic::{NativeAtomicBool as AtomicBool, NativeAtomicUsize as AtomicUsize, Ordering},
     },
     task::{Context, Poll, Waker},
-    thread::{scope, yield_now as thread_yield},
+    thread::ThreadApi,
 };
 
 use veloq_runtime::{Runtime, RuntimeContextExt, scope, scope_local, task_local, yield_now};
@@ -82,13 +82,13 @@ fn local_task_foreign_wake_uses_owner_mailbox() {
     let foreign_context_has_scope = AtomicBool::new(true);
     let stale_waker = Mutex::new(None);
 
-    scope(|threads| {
+    ThreadApi::scope(|threads| {
         threads
             .spawn(|| {
                 loop {
                     let waker = waker_slot.lock().expect("local waker slot").take();
                     let Some(waker) = waker else {
-                        thread_yield().expect("foreign wake thread aborted");
+                        ThreadApi::yield_now().expect("foreign wake thread aborted");
                         continue;
                     };
 

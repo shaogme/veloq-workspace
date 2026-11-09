@@ -1,25 +1,83 @@
-#[cfg(unix)]
-pub mod unix;
-
 #[cfg(windows)]
-pub mod windows;
+mod windows;
 
 #[cfg(not(any(unix, windows)))]
-pub mod generic;
+mod generic;
 
 use core::fmt;
 
-use crate::io::{IoSlice, IoSliceMut, Read, Result, Write};
-use crate::sync::{NativeReentrantMutex, NativeReentrantMutexGuard};
-
-#[cfg(unix)]
-use unix as sys;
-
-#[cfg(windows)]
-use windows as sys;
+use crate::{
+    io::{IoSlice, IoSliceMut, Read, Result, Write},
+    sync::{NativeReentrantMutex, NativeReentrantMutexGuard},
+};
 
 #[cfg(not(any(unix, windows)))]
 use generic as sys;
+#[cfg(unix)]
+use unix as sys;
+#[cfg(windows)]
+use windows as sys;
+
+#[cfg(unix)]
+mod unix {
+    use core::cmp;
+
+    use crate::io::{Error, Result};
+    use libc::{STDERR_FILENO, STDIN_FILENO, STDOUT_FILENO, read, write};
+
+    pub(crate) struct Platform;
+
+    impl Platform {
+        pub(crate) fn read_stdin(buf: &mut [u8]) -> Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            let len = cmp::min(buf.len(), isize::MAX as usize);
+            let ret = unsafe { read(STDIN_FILENO, buf.as_mut_ptr().cast(), len) };
+            if ret < 0 {
+                Err(Error::last_os_error())
+            } else {
+                Ok(ret as usize)
+            }
+        }
+
+        pub(crate) fn write_stdout(buf: &[u8]) -> Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            let len = cmp::min(buf.len(), isize::MAX as usize);
+            let ret = unsafe { write(STDOUT_FILENO, buf.as_ptr().cast(), len) };
+            if ret < 0 {
+                Err(Error::last_os_error())
+            } else {
+                Ok(ret as usize)
+            }
+        }
+
+        pub(crate) fn write_stderr(buf: &[u8]) -> Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            let len = cmp::min(buf.len(), isize::MAX as usize);
+            let ret = unsafe { write(STDERR_FILENO, buf.as_ptr().cast(), len) };
+            if ret < 0 {
+                Err(Error::last_os_error())
+            } else {
+                Ok(ret as usize)
+            }
+        }
+
+        #[inline]
+        pub(crate) fn flush_stdout() -> Result<()> {
+            Ok(())
+        }
+
+        #[inline]
+        pub(crate) fn flush_stderr() -> Result<()> {
+            Ok(())
+        }
+    }
+}
 
 fn stdin_mutex() -> &'static NativeReentrantMutex<()> {
     static LOCK: NativeReentrantMutex<()> = NativeReentrantMutex::new(());
@@ -48,14 +106,13 @@ pub struct StdinLock<'a> {
     _guard: NativeReentrantMutexGuard<'a, ()>,
 }
 
-/// Constructs a new handle to the standard input of the current process.
-#[inline]
-#[must_use]
-pub fn stdin() -> Stdin {
-    Stdin { _priv: () }
-}
-
 impl Stdin {
+    #[inline]
+    #[must_use]
+    pub fn new() -> Self {
+        Self { _priv: () }
+    }
+
     /// Locks this handle to the standard input stream, returning a [`StdinLock`].
     #[inline]
     pub fn lock(&self) -> StdinLock<'static> {
@@ -102,7 +159,7 @@ impl Read for &Stdin {
 impl Read for StdinLock<'_> {
     #[inline]
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        sys::read_stdin(buf)
+        sys::Platform::read_stdin(buf)
     }
 
     #[inline]
@@ -110,7 +167,7 @@ impl Read for StdinLock<'_> {
         let Some(buf) = bufs.iter_mut().find(|buf| !buf.is_empty()) else {
             return Ok(0);
         };
-        sys::read_stdin(buf)
+        sys::Platform::read_stdin(buf)
     }
 }
 
@@ -138,14 +195,13 @@ pub struct StdoutLock<'a> {
     _guard: NativeReentrantMutexGuard<'a, ()>,
 }
 
-/// Constructs a new handle to the standard output of the current process.
-#[inline]
-#[must_use]
-pub fn stdout() -> Stdout {
-    Stdout { _priv: () }
-}
-
 impl Stdout {
+    #[inline]
+    #[must_use]
+    pub fn new() -> Self {
+        Self { _priv: () }
+    }
+
     /// Locks this handle to the standard output stream, returning a [`StdoutLock`].
     #[inline]
     pub fn lock(&self) -> StdoutLock<'static> {
@@ -212,12 +268,12 @@ impl Write for &Stdout {
 impl Write for StdoutLock<'_> {
     #[inline]
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        sys::write_stdout(buf)
+        sys::Platform::write_stdout(buf)
     }
 
     #[inline]
     fn flush(&mut self) -> Result<()> {
-        sys::flush_stdout()
+        sys::Platform::flush_stdout()
     }
 
     #[inline]
@@ -225,7 +281,7 @@ impl Write for StdoutLock<'_> {
         let Some(buf) = bufs.iter().find(|buf| !buf.is_empty()) else {
             return Ok(0);
         };
-        sys::write_stdout(buf)
+        sys::Platform::write_stdout(buf)
     }
 }
 
@@ -253,14 +309,13 @@ pub struct StderrLock<'a> {
     _guard: NativeReentrantMutexGuard<'a, ()>,
 }
 
-/// Constructs a new handle to the standard error of the current process.
-#[inline]
-#[must_use]
-pub fn stderr() -> Stderr {
-    Stderr { _priv: () }
-}
-
 impl Stderr {
+    #[inline]
+    #[must_use]
+    pub fn new() -> Self {
+        Self { _priv: () }
+    }
+
     /// Locks this handle to the standard error stream, returning a [`StderrLock`].
     #[inline]
     pub fn lock(&self) -> StderrLock<'static> {
@@ -327,12 +382,12 @@ impl Write for &Stderr {
 impl Write for StderrLock<'_> {
     #[inline]
     fn write(&mut self, buf: &[u8]) -> Result<usize> {
-        sys::write_stderr(buf)
+        sys::Platform::write_stderr(buf)
     }
 
     #[inline]
     fn flush(&mut self) -> Result<()> {
-        sys::flush_stderr()
+        sys::Platform::flush_stderr()
     }
 
     #[inline]
@@ -340,7 +395,7 @@ impl Write for StderrLock<'_> {
         let Some(buf) = bufs.iter().find(|buf| !buf.is_empty()) else {
             return Ok(0);
         };
-        sys::write_stderr(buf)
+        sys::Platform::write_stderr(buf)
     }
 }
 
@@ -356,18 +411,22 @@ impl fmt::Debug for StderrLock<'_> {
     }
 }
 
-#[doc(hidden)]
-#[inline]
-pub fn _print(args: fmt::Arguments<'_>) {
-    if let Err(error) = stdout().write_fmt(args) {
-        panic!("failed printing to stdout: {error}");
+impl Stdout {
+    #[doc(hidden)]
+    #[inline]
+    pub fn print(args: fmt::Arguments<'_>) {
+        if let Err(error) = Self::new().write_fmt(args) {
+            panic!("failed printing to stdout: {error}");
+        }
     }
 }
 
-#[doc(hidden)]
-#[inline]
-pub fn _eprint(args: fmt::Arguments<'_>) {
-    if let Err(error) = stderr().write_fmt(args) {
-        panic!("failed printing to stderr: {error}");
+impl Stderr {
+    #[doc(hidden)]
+    #[inline]
+    pub fn print(args: fmt::Arguments<'_>) {
+        if let Err(error) = Self::new().write_fmt(args) {
+            panic!("failed printing to stderr: {error}");
+        }
     }
 }

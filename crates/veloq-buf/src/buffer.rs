@@ -63,7 +63,7 @@ mod tests {
     use veloq_std::num::NonZeroUsize;
 
     #[cfg(feature = "std")]
-    use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
+    use veloq_std::panic::{AssertUnwindSafe, Panic};
 
     #[test]
     fn heap_view_preserves_borrow_semantics() {
@@ -122,7 +122,7 @@ mod tests {
 
         let start = 3;
         let end = 2;
-        let result = catch_unwind(AssertUnwindSafe::new(|| buf.view(start..end)));
+        let result = Panic::catch_unwind(AssertUnwindSafe::new(|| buf.view(start..end)));
         assert!(result.is_err());
 
         drop(buf);

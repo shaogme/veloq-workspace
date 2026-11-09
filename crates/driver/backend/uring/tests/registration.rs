@@ -617,7 +617,7 @@ fn wait_completion(driver: &mut UringDriver<'static>, token: OpToken, timeout: D
             }
             PollRecordResult::Pending => {}
         }
-        let _ = thread::sleep(Duration::from_millis(5));
+        let _ = thread::ThreadApi::sleep(Duration::from_millis(5));
     }
 }
 
@@ -658,7 +658,7 @@ fn wait_completion_with_driver_error(
             }
             PollRecordResult::Pending => {}
         }
-        let _ = thread::sleep(Duration::from_millis(5));
+        let _ = thread::ThreadApi::sleep(Duration::from_millis(5));
     }
 }
 

@@ -10,7 +10,7 @@ use veloq_std::{
     marker::PhantomData,
     num::NonZeroUsize,
     ops::AsyncFnOnce,
-    panic::{AssertUnwindSafe, catch_unwind},
+    panic::{AssertUnwindSafe, Panic},
     pin::pin,
     ptr,
     result::Result as StdResult,
@@ -147,13 +147,13 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
         let mut deques = receivers.deques;
 
         let thread_errors = Mutex::new(None);
-        let (ready_sender, ready_receiver) = mpsc::channel::<(usize, bool)>();
+        let (ready_sender, ready_receiver) = mpsc::Mpsc::channel::<(usize, bool)>();
         // 主线程的唤醒信号必须在 worker 线程启动**之前**建好：worker 初始化失败时要靠
         // 它把主线程从 park 里叫回来，否则错误永远不会被报告。
         // Build the main-thread wake signal before spawning workers so initialization failures can wake a parked main thread.
         let signal = BlockOnSignal::new(shared_ref.base().unparker(0).clone());
 
-        let res: Result<R> = thread::scope(|scope| {
+        let res: Result<R> = thread::ThreadApi::scope(|scope| {
             struct ShutdownGuard<'rt, T>(&'rt RuntimeShared<T>);
             impl<'rt, T> Drop for ShutdownGuard<'rt, T> {
                 fn drop(&mut self) {
@@ -183,7 +183,7 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                 let thread_errors_ref = &thread_errors;
                 let signal_ref = &signal;
                 let ready_sender = ready_sender.clone();
-                let (start_sender, start_receiver) = mpsc::channel::<bool>();
+                let (start_sender, start_receiver) = mpsc::Mpsc::channel::<bool>();
 
                 let context = RuntimeTlsInner {
                     worker_id,
@@ -194,7 +194,7 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                 if let Err(e) = scope.spawn(move || {
                     let _tls_cleanup = TlsCleanupGuard(shared_ref.base().tls());
                     let _extra_cleanup = TlsCleanupGuard(shared_ref.extra_tls());
-                    let init_res = catch_unwind(AssertUnwindSafe::new(|| {
+                    let init_res = Panic::catch_unwind(AssertUnwindSafe::new(|| {
                         shared_ref
                             .base()
                             .tls()
@@ -261,7 +261,7 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                         return;
                     }
 
-                    match catch_unwind(AssertUnwindSafe::new(|| shared_ref.run_worker())) {
+                    match Panic::catch_unwind(AssertUnwindSafe::new(|| shared_ref.run_worker())) {
                         Ok(Ok(())) => {}
                         Ok(Err(err)) => report_fatal(err),
                         Err(_) => report_fatal(
@@ -316,24 +316,25 @@ impl<'rt, 'env: 'rt, T, WF> Runtime<'rt, 'env, T, WF> {
                 }
                 .trans();
             }
-            let main_extra =
-                match catch_unwind(AssertUnwindSafe::new(|| worker_factory(0, shared_ref))) {
-                    Ok(Ok(extra)) => extra,
-                    Ok(Err(source)) => {
-                        return RuntimeError::WorkerFactoryFailed {
-                            worker_id: 0,
-                            source: WorkerFactorySource::new(source),
-                        }
-                        .trans();
+            let main_extra = match Panic::catch_unwind(AssertUnwindSafe::new(|| {
+                worker_factory(0, shared_ref)
+            })) {
+                Ok(Ok(extra)) => extra,
+                Ok(Err(source)) => {
+                    return RuntimeError::WorkerFactoryFailed {
+                        worker_id: 0,
+                        source: WorkerFactorySource::new(source),
                     }
-                    Err(_) => {
-                        return RuntimeError::InvariantViolation {
-                            site: "worker-initialization",
-                            detail: "worker factory panicked".into(),
-                        }
-                        .trans();
+                    .trans();
+                }
+                Err(_) => {
+                    return RuntimeError::InvariantViolation {
+                        site: "worker-initialization",
+                        detail: "worker factory panicked".into(),
                     }
-                };
+                    .trans();
+                }
+            };
             if let Err(source) = shared_ref.extra_tls().set_owned(main_extra) {
                 return RuntimeError::TlsSetOwnedFailed {
                     worker_id: 0,
@@ -555,9 +556,9 @@ impl<T, WF, H> RuntimeBuilder<T, WF, H> {
         WF: Fn(usize, &'rt RuntimeShared<T>) -> WorkerFactoryResult<T> + Send + Sync + 'rt,
         F: for<'a> AsyncFnOnce(RuntimeCtx<'a, T>) -> R,
     {
-        let worker_count = self
-            .worker_count
-            .unwrap_or_else(|| thread::available_parallelism().unwrap_or(NonZeroUsize::MIN));
+        let worker_count = self.worker_count.unwrap_or_else(|| {
+            thread::ThreadApi::available_parallelism().unwrap_or(NonZeroUsize::MIN)
+        });
         // worker id 会被编码进 idle 栈 head 的低 32 位，必须在构造期就拒绝越界的规模，
         // 而不是让 `IdleStack` 静默截断。
         if worker_count.get() > MAX_WORKER_COUNT - 1 {

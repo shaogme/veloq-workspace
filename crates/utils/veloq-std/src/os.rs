@@ -4,13 +4,19 @@
 //! I/O handles, file descriptors, and extension traits that operate without depending
 //! on the standard library.
 
-pub mod cvt;
+#[cfg(windows)]
+mod cvt;
 
 #[cfg(unix)]
 pub mod unix;
 
-#[cfg(unix)]
-pub use unix::fd;
-
 #[cfg(windows)]
 pub mod windows;
+
+#[cfg(windows)]
+pub(crate) use cvt::Cvt;
+#[cfg(unix)]
+pub(crate) use unix::Cvt;
+
+#[cfg(unix)]
+pub use unix::fd;

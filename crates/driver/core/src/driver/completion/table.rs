@@ -21,7 +21,7 @@ use super::{
 use veloq_std::string::String;
 
 #[cfg(feature = "loom")]
-use veloq_std::thread::yield_now;
+use veloq_std::thread::ThreadApi;
 
 #[cfg(not(feature = "loom"))]
 use veloq_std::hint::spin_loop;
@@ -90,7 +90,7 @@ enum SettleTarget {
 #[inline(always)]
 fn spin_yield() {
     #[cfg(feature = "loom")]
-    let _ = yield_now();
+    let _ = ThreadApi::yield_now();
     #[cfg(not(feature = "loom"))]
     spin_loop();
 }

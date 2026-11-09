@@ -5,7 +5,7 @@ mod normal_tests {
             NativeOnceLock, OnceLock,
             atomic::{NativeAtomicU32, Ordering},
         },
-        thread,
+        thread::ThreadApi,
         time::Duration,
     };
 
@@ -23,7 +23,7 @@ mod normal_tests {
         static LOCK: NativeOnceLock<usize> = NativeOnceLock::new();
         static CALL_COUNT: NativeAtomicU32 = NativeAtomicU32::new(0);
 
-        thread::scope(|s| {
+        ThreadApi::scope(|s| {
             for i in 0..10 {
                 s.spawn(move || {
                     let val = LOCK.get_or_init(|| {
@@ -140,10 +140,10 @@ mod normal_tests {
     #[test]
     fn test_once_lock_wait() {
         let lock = OnceLock::new();
-        thread::scope(|s| {
+        ThreadApi::scope(|s| {
             s.spawn(|| {
                 lock.get_or_init(|| {
-                    thread::sleep(Duration::from_millis(50)).unwrap();
+                    ThreadApi::sleep(Duration::from_millis(50)).unwrap();
                     42
                 });
             })

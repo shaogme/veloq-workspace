@@ -1,8 +1,9 @@
 #![cfg(feature = "std")]
 
+use std::{env, process::id};
 use veloq_std::{
     ffi::OsStr,
-    fs::{File, FileTimes, OpenOptions, read, read_to_string, remove_file, write},
+    fs::{File, FileTimes, Fs, OpenOptions},
     io::{ErrorKind, IoSlice, IoSliceMut, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::atomic::{NativeAtomicUsize, Ordering},
@@ -17,7 +18,6 @@ use veloq_std::os::unix::{
         OpenOptionsExt as UnixOpenOptionsExt, PermissionsExt as UnixPermissionsExt,
     },
 };
-
 #[cfg(windows)]
 use veloq_std::os::windows::{
     fs::{
@@ -25,9 +25,6 @@ use veloq_std::os::windows::{
     },
     io::{AsHandle, AsRawHandle, FromRawHandle, IntoRawHandle},
 };
-
-#[cfg(feature = "std")]
-use std::{env, process::id};
 
 static TEST_COUNTER: NativeAtomicUsize = NativeAtomicUsize::new(0);
 
@@ -39,7 +36,7 @@ impl TempFileGuard {
     fn new(name: &str) -> Self {
         let count = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "std")]
-        let base = env::temp_dir().to_str().unwrap().to_string();
+        let base = env::Env::temp_dir().to_str().unwrap().to_string();
         #[cfg(not(feature = "std"))]
         let base = String::from("target");
 
@@ -48,7 +45,7 @@ impl TempFileGuard {
         path.push(filename.as_str());
 
         // Remove if exists
-        let _ = remove_file(path.as_path());
+        let _ = Fs::remove_file(path.as_path());
 
         Self { path }
     }
@@ -60,7 +57,7 @@ impl TempFileGuard {
 
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
-        let _ = remove_file(self.path.as_path());
+        let _ = Fs::remove_file(self.path.as_path());
     }
 }
 
@@ -194,12 +191,12 @@ fn test_path_exists() {
     let path = guard.path();
 
     assert!(!path.exists());
-    assert!(env::temp_dir().as_path().exists());
+    assert!(env::Env::temp_dir().as_path().exists());
 
-    write(path, b"path exists").expect("write test file failed");
+    Fs::write(path, b"path exists").expect("write test file failed");
     assert!(path.exists());
 
-    remove_file(path).expect("remove test file failed");
+    Fs::remove_file(path).expect("remove test file failed");
     assert!(!path.exists());
     assert!(!Path::new("invalid\0path").exists());
 }
@@ -251,12 +248,12 @@ fn test_convenience_functions() {
     let guard = TempFileGuard::new("convenience");
     let path = guard.path();
 
-    write(path, "convenience test content").expect("write failed");
+    Fs::write(path, "convenience test content").expect("write failed");
 
-    let text = read_to_string(path).expect("read_to_string failed");
+    let text = Fs::read_to_string(path).expect("read_to_string failed");
     assert_eq!(text, "convenience test content");
 
-    let bytes = read(path).expect("read failed");
+    let bytes = Fs::read(path).expect("read failed");
     assert_eq!(bytes, b"convenience test content");
 }
 
@@ -366,27 +363,27 @@ fn test_remove_file() {
     let path = guard.path();
 
     // 1. Write file and verify existence
-    write(path, b"hello remove_file").expect("write test file failed");
-    assert_eq!(read(path).unwrap(), b"hello remove_file");
+    Fs::write(path, b"hello remove_file").expect("write test file failed");
+    assert_eq!(Fs::read(path).unwrap(), b"hello remove_file");
 
     // 2. Remove file
-    remove_file(path).expect("remove_file should succeed");
+    Fs::remove_file(path).expect("remove_file should succeed");
 
     // 3. Verify it no longer exists
     let err = File::open(path).expect_err("file should no longer exist");
     assert_eq!(err.kind(), ErrorKind::NotFound);
 
     // 4. Repeated removal returns NotFound
-    let err = remove_file(path).expect_err("second remove_file should fail");
+    let err = Fs::remove_file(path).expect_err("second remove_file should fail");
     assert_eq!(err.kind(), ErrorKind::NotFound);
 
     // 5. Non-existent path returns NotFound
     let non_existent = Path::new("definitely_non_existent_file_123456.tmp");
-    let err = remove_file(non_existent).expect_err("non-existent file removal should fail");
+    let err = Fs::remove_file(non_existent).expect_err("non-existent file removal should fail");
     assert_eq!(err.kind(), ErrorKind::NotFound);
 
     // 6. Path containing null byte returns InvalidInput
     let invalid_path = Path::new("invalid\0file.tmp");
-    let err = remove_file(invalid_path).expect_err("null-byte path removal should fail");
+    let err = Fs::remove_file(invalid_path).expect_err("null-byte path removal should fail");
     assert_eq!(err.kind(), ErrorKind::InvalidInput);
 }

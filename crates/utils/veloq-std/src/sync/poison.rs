@@ -1,4 +1,4 @@
-use core::fmt;
+use core::{error::Error as CoreError, fmt};
 
 use crate::sync::atomic::{NativeAtomicBool, Ordering};
 
@@ -44,14 +44,11 @@ impl<T> fmt::Display for PoisonError<T> {
     }
 }
 
-impl<T> core::error::Error for PoisonError<T> {}
+impl<T> CoreError for PoisonError<T> {}
 
 /// The result of acquiring a lock, including the guard when the lock is
 /// poisoned.
 pub type LockResult<T> = Result<T, PoisonError<T>>;
-
-/// The result of attempting to acquire a lock without blocking.
-pub type TryLockResult<T> = Result<T, TryLockError<T>>;
 
 /// An error returned by a non-blocking or timed lock operation.
 pub enum TryLockError<T> {
@@ -60,6 +57,9 @@ pub enum TryLockError<T> {
     /// The lock was acquired, but its poison flag is set.
     Poisoned(PoisonError<T>),
 }
+
+/// The result of attempting to acquire a lock without blocking.
+pub type TryLockResult<T> = Result<T, TryLockError<T>>;
 
 impl<T> TryLockError<T> {
     /// Returns the guard or value carried by a poisoned-lock error.
@@ -89,7 +89,7 @@ impl<T> fmt::Display for TryLockError<T> {
     }
 }
 
-impl<T> core::error::Error for TryLockError<T> {}
+impl<T> CoreError for TryLockError<T> {}
 
 pub(crate) struct NativePoisonState {
     poisoned: NativeAtomicBool,

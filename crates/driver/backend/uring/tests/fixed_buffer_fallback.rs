@@ -7,7 +7,7 @@
 
 use veloq_std::{
     env,
-    fs::{File, OpenOptions, remove_file},
+    fs::{File, Fs, OpenOptions},
     io::{Read, Write},
     num::{NonZeroU32, NonZeroUsize},
     path::{Path, PathBuf},
@@ -47,11 +47,11 @@ struct CleanupFile(PathBuf);
 impl CleanupFile {
     fn new(label: &str) -> Self {
         let id = TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
-        let path = env::temp_dir().join(format!(
+        let path = env::Env::temp_dir().join(format!(
             "veloq-uring-buffer-{label}-{}-{id}.tmp",
-            process::id()
+            process::Process::id()
         ));
-        let _ = remove_file(&path);
+        let _ = Fs::remove_file(&path);
         Self(path)
     }
 
@@ -62,7 +62,7 @@ impl CleanupFile {
 
 impl Drop for CleanupFile {
     fn drop(&mut self) {
-        let _ = remove_file(&self.0);
+        let _ = Fs::remove_file(&self.0);
     }
 }
 

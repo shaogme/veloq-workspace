@@ -3,9 +3,9 @@ mod normal_tests {
     use core::cell::Cell;
 
     use veloq_std::{
-        io::{_eprint, _print, stderr, stdout},
+        io::{Stderr, Stdout},
         sync::{Arc, ReentrantMutex},
-        thread,
+        thread::ThreadApi,
         time::{Duration, Instant},
     };
 
@@ -71,7 +71,7 @@ mod normal_tests {
 
         for _ in 0..num_threads {
             let m = m.clone();
-            let h = thread::spawn(move || {
+            let h = ThreadApi::spawn(move || {
                 for _ in 0..iters {
                     let g1 = m.lock();
                     let g2 = m.lock();
@@ -104,7 +104,7 @@ mod normal_tests {
 
         // 异线程 try_lock 互斥排他失败
         let m_clone = m.clone();
-        let handle = thread::spawn(move || {
+        let handle = ThreadApi::spawn(move || {
             let res = m_clone.try_lock();
             assert!(res.is_none());
         })
@@ -115,7 +115,7 @@ mod normal_tests {
 
         // 释放后异线程成功获取
         let m_clone = m.clone();
-        let handle = thread::spawn(move || {
+        let handle = ThreadApi::spawn(move || {
             let res = m_clone.try_lock();
             assert!(res.is_some());
         })
@@ -135,7 +135,7 @@ mod normal_tests {
 
         // 异线程超时返回 None
         let m_clone = m.clone();
-        let handle = thread::spawn(move || {
+        let handle = ThreadApi::spawn(move || {
             let start = Instant::now();
             let res = m_clone.try_lock_for(Duration::from_millis(50));
             assert!(res.is_none());
@@ -150,18 +150,18 @@ mod normal_tests {
     fn test_reentrant_mutex_stdio_reentrant() {
         // 嵌套获取 stdout lock 并输出
         {
-            let lock1 = stdout().lock();
-            let lock2 = stdout().lock();
-            _print(format_args!("testing stdout reentrancy\n"));
+            let lock1 = Stdout::new().lock();
+            let lock2 = Stdout::new().lock();
+            Stdout::print(format_args!("testing stdout reentrancy\n"));
             drop(lock2);
             drop(lock1);
         }
 
         // 嵌套获取 stderr lock 并输出
         {
-            let lock1 = stderr().lock();
-            let lock2 = stderr().lock();
-            _eprint(format_args!("testing stderr reentrancy\n"));
+            let lock1 = Stderr::new().lock();
+            let lock2 = Stderr::new().lock();
+            Stderr::print(format_args!("testing stderr reentrancy\n"));
             drop(lock2);
             drop(lock1);
         }

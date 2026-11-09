@@ -14,7 +14,7 @@ use veloq_std::{
     net::{TcpListener, TcpStream},
     nz,
     sync::mpsc,
-    thread,
+    thread::ThreadApi,
     time::{Duration, Instant},
     vec,
 };
@@ -60,8 +60,8 @@ fn test_iocp_accept() {
     let token = TestSupport::submit_test_op(&mut driver, accept_op);
 
     // Connect Client in background
-    let _ = thread::spawn(move || {
-        let _ = thread::sleep(Duration::from_millis(50));
+    let _ = ThreadApi::spawn(move || {
+        let _ = ThreadApi::sleep(Duration::from_millis(50));
         TcpStream::connect(addr).expect("Client connect failed");
     });
 
@@ -96,8 +96,8 @@ fn test_iocp_accept_multi_rearms_after_each_connection() {
 
     let token = TestSupport::submit_test_op(&mut driver, AcceptMulti { fd: listen_fd });
 
-    let first_client = thread::spawn(move || {
-        let _ = thread::sleep(Duration::from_millis(50));
+    let first_client = ThreadApi::spawn(move || {
+        let _ = ThreadApi::sleep(Duration::from_millis(50));
         TcpStream::connect(addr).expect("first client connect failed");
     })
     .expect("first client thread spawn failed");
@@ -113,7 +113,7 @@ fn test_iocp_accept_multi_rearms_after_each_connection() {
     let _first_accepted = first_result.expect("first AcceptMulti result failed");
     first_client.join().expect("first client thread panicked");
 
-    let second_client = thread::spawn(move || {
+    let second_client = ThreadApi::spawn(move || {
         TcpStream::connect(addr).expect("second client connect failed");
     })
     .expect("second client thread spawn failed");
@@ -159,16 +159,16 @@ fn test_iocp_accept_multi_cancel_does_not_rearm_after_completion_race() {
         .expect("register listener returned empty");
 
     let token = TestSupport::submit_test_op(&mut driver, AcceptMulti { fd: listen_fd });
-    let client = thread::spawn(move || {
+    let client = ThreadApi::spawn(move || {
         let _stream = TcpStream::connect(addr).expect("client connect failed");
-        let _ = thread::sleep(Duration::from_millis(100));
+        let _ = ThreadApi::sleep(Duration::from_millis(100));
     })
     .expect("client thread spawn failed");
 
     // Let the AcceptEx completion reach the kernel completion queue before cancellation. Depending
     // on timing, CancelIoEx reports either Submitted or ERROR_NOT_FOUND; both paths must settle
     // the logical stream without arming another AcceptEx request.
-    let _ = thread::sleep(Duration::from_millis(100));
+    let _ = ThreadApi::sleep(Duration::from_millis(100));
     let _ = driver.cancel_op(CancelRequest::user_visible(token));
     let result = TestSupport::wait_completion(&mut driver, token, Duration::from_secs(5));
     assert!(
@@ -237,7 +237,7 @@ fn test_iocp_recv_with_buffer_pool() {
     };
     let connect_token = TestSupport::submit_test_op(&mut driver, connect_op);
 
-    let server_thread = thread::spawn(move || {
+    let server_thread = ThreadApi::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         stream.write_all(b"Hello Buffer").unwrap();
     })
@@ -285,7 +285,7 @@ fn test_iocp_recv_provided_uses_backend_owned_buffer() {
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let server_thread = thread::spawn(move || {
+    let server_thread = ThreadApi::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         stream.write_all(b"Hello Provided").unwrap();
     })
@@ -328,7 +328,7 @@ fn test_iocp_recv_multi_delivers_data_and_eof() {
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let server_thread = thread::spawn(move || {
+    let server_thread = ThreadApi::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         stream.write_all(b"Hello Multi").unwrap();
     })
@@ -393,8 +393,8 @@ fn test_iocp_recv_multi_cancel_returns_aborted() {
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let (tx_release, rx_release) = mpsc::channel::<()>();
-    let server_thread = thread::spawn(move || {
+    let (tx_release, rx_release) = mpsc::Mpsc::channel::<()>();
+    let server_thread = ThreadApi::spawn(move || {
         let (_stream, _) = listener.accept().unwrap();
         let _ = rx_release.recv();
     })
@@ -444,9 +444,9 @@ fn test_unregister_owned_socket_waits_for_inflight_recv() {
 
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let (tx_send, rx_send) = mpsc::channel::<()>();
+    let (tx_send, rx_send) = mpsc::Mpsc::channel::<()>();
 
-    let server_thread = thread::spawn(move || {
+    let server_thread = ThreadApi::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let _ = rx_send.recv();
         stream.write_all(b"recv-after-unregister").unwrap();
@@ -504,8 +504,8 @@ fn test_rio_cancel_poll_returns_aborted_without_hang() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let (tx_send, rx_send) = mpsc::channel::<()>();
-    let server_thread = thread::spawn(move || {
+    let (tx_send, rx_send) = mpsc::Mpsc::channel::<()>();
+    let server_thread = ThreadApi::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let _ = rx_send.recv();
         stream.write_all(b"late").unwrap();
@@ -567,8 +567,8 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let (tx_send, rx_send) = mpsc::channel::<()>();
-    let server_thread = thread::spawn(move || {
+    let (tx_send, rx_send) = mpsc::Mpsc::channel::<()>();
+    let server_thread = ThreadApi::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let _ = rx_send.recv();
         stream.write_all(b"late").unwrap();
@@ -625,7 +625,7 @@ fn test_rio_cancel_late_completion_recycles_slot_after_drain() {
         if TestSupport::slot_is_idle(&mut driver, token.index()) {
             break;
         }
-        let _ = thread::sleep(Duration::from_millis(5));
+        let _ = ThreadApi::sleep(Duration::from_millis(5));
     }
 
     assert!(

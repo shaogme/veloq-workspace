@@ -5,14 +5,20 @@ mod normal_tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
-    use veloq_std::sync::mpsc;
-    use veloq_std::thread;
-    use veloq_std::time::Duration;
-    use veloq_std::vec;
+    use veloq_std::{sync::mpsc, thread::ThreadApi, time::Duration, vec};
+
+    #[derive(Debug)]
+    struct DropProbe(Arc<AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 
     #[test]
     fn test_mpsc_basic() {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::Mpsc::channel();
         tx.send(1).unwrap();
         tx.send(2).unwrap();
         assert_eq!(rx.recv(), Ok(1));
@@ -21,7 +27,7 @@ mod normal_tests {
 
     #[test]
     fn test_sync_channel_basic_and_try_send() {
-        let (tx, rx) = mpsc::sync_channel(1);
+        let (tx, rx) = mpsc::Mpsc::sync_channel(1);
         tx.send(1).unwrap();
         assert_eq!(tx.try_send(2), Err(mpsc::TrySendError::Full(2)));
         assert_eq!(rx.recv(), Ok(1));
@@ -34,12 +40,12 @@ mod normal_tests {
 
     #[test]
     fn test_sync_channel_send_blocks_until_capacity_is_available() {
-        let (tx, rx) = mpsc::sync_channel(1);
+        let (tx, rx) = mpsc::Mpsc::sync_channel(1);
         tx.send(1).unwrap();
-        let (started_tx, started_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::Mpsc::channel();
+        let (done_tx, done_rx) = mpsc::Mpsc::channel();
 
-        let handle = thread::spawn(move || {
+        let handle = ThreadApi::spawn(move || {
             started_tx.send(()).unwrap();
             tx.send(2).unwrap();
             done_tx.send(()).unwrap();
@@ -56,11 +62,11 @@ mod normal_tests {
 
     #[test]
     fn test_sync_channel_zero_bound_is_rendezvous() {
-        let (tx, rx) = mpsc::sync_channel(0);
-        let (started_tx, started_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
+        let (tx, rx) = mpsc::Mpsc::sync_channel(0);
+        let (started_tx, started_rx) = mpsc::Mpsc::channel();
+        let (done_tx, done_rx) = mpsc::Mpsc::channel();
 
-        let handle = thread::spawn(move || {
+        let handle = ThreadApi::spawn(move || {
             started_tx.send(()).unwrap();
             tx.send(7).unwrap();
             done_tx.send(()).unwrap();
@@ -76,11 +82,11 @@ mod normal_tests {
 
     #[test]
     fn test_sync_channel_zero_bound_try_send_requires_waiting_receiver() {
-        let (tx, rx) = mpsc::sync_channel(0);
+        let (tx, rx) = mpsc::Mpsc::sync_channel(0);
         assert_eq!(tx.try_send(1), Err(mpsc::TrySendError::Full(1)));
 
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let handle = thread::spawn(move || {
+        let (ready_tx, ready_rx) = mpsc::Mpsc::channel();
+        let handle = ThreadApi::spawn(move || {
             ready_tx.send(()).unwrap();
             assert_eq!(rx.recv(), Ok(2));
         })
@@ -93,7 +99,7 @@ mod normal_tests {
                 Ok(()) => break,
                 Err(mpsc::TrySendError::Full(next)) => {
                     value = next;
-                    let _ = thread::yield_now();
+                    let _ = ThreadApi::yield_now();
                 }
                 Err(mpsc::TrySendError::Disconnected(_)) => {
                     panic!("receiver disconnected before try_send succeeded")
@@ -105,10 +111,10 @@ mod normal_tests {
 
     #[test]
     fn test_sync_channel_blocked_sender_returns_value_after_receiver_drop() {
-        let (tx, rx) = mpsc::sync_channel(1);
+        let (tx, rx) = mpsc::Mpsc::sync_channel(1);
         tx.send(1).unwrap();
-        let (started_tx, started_rx) = mpsc::channel();
-        let handle = thread::spawn(move || {
+        let (started_tx, started_rx) = mpsc::Mpsc::channel();
+        let handle = ThreadApi::spawn(move || {
             started_tx.send(()).unwrap();
             tx.send(2)
         })
@@ -117,7 +123,7 @@ mod normal_tests {
         started_rx.recv().unwrap();
         drop(rx);
         match handle.join().unwrap() {
-            Err(mpsc::SendError(value)) => assert_eq!(value, 2),
+            Err(error) => assert_eq!(error.into_inner(), 2),
             Ok(()) => panic!("blocked send unexpectedly succeeded"),
         }
     }
@@ -125,7 +131,7 @@ mod normal_tests {
     #[test]
     fn test_sync_channel_receiver_drop_drains_queue_without_holding_lock() {
         let drops = Arc::new(AtomicUsize::new(0));
-        let (tx, rx) = mpsc::sync_channel(2);
+        let (tx, rx) = mpsc::Mpsc::sync_channel(2);
 
         for _ in 0..2 {
             tx.send(DropProbe(drops.clone())).unwrap();
@@ -138,15 +144,15 @@ mod normal_tests {
 
     #[test]
     fn test_mpsc_threads() {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::Mpsc::channel();
         let tx1 = tx.clone();
 
-        let t1 = thread::spawn(move || {
+        let t1 = ThreadApi::spawn(move || {
             tx1.send(1).unwrap();
         })
         .unwrap();
 
-        let t2 = thread::spawn(move || {
+        let t2 = ThreadApi::spawn(move || {
             tx.send(2).unwrap();
         })
         .unwrap();
@@ -161,7 +167,7 @@ mod normal_tests {
 
     #[test]
     fn test_mpsc_recv_timeout() {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::Mpsc::channel();
         assert!(matches!(
             rx.recv_timeout(Duration::from_millis(10)),
             Err(mpsc::RecvTimeoutError::Timeout)
@@ -173,7 +179,7 @@ mod normal_tests {
 
     #[test]
     fn test_mpsc_try_recv() {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::Mpsc::channel();
         assert_eq!(rx.try_recv(), Err(mpsc::TryRecvError::Empty));
         tx.send(42).unwrap();
         assert_eq!(rx.try_recv(), Ok(42));
@@ -183,28 +189,19 @@ mod normal_tests {
 
     #[test]
     fn test_mpsc_send_after_receiver_drop_returns_value() {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::Mpsc::channel();
         drop(rx);
 
         match tx.send(42) {
-            Err(mpsc::SendError(value)) => assert_eq!(value, 42),
+            Err(error) => assert_eq!(error.into_inner(), 42),
             Ok(()) => panic!("sending after receiver close unexpectedly succeeded"),
-        }
-    }
-
-    #[derive(Debug)]
-    struct DropProbe(Arc<AtomicUsize>);
-
-    impl Drop for DropProbe {
-        fn drop(&mut self) {
-            self.0.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     #[test]
     fn test_mpsc_receiver_drop_drains_queue() {
         let drops = Arc::new(AtomicUsize::new(0));
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::Mpsc::channel();
 
         for _ in 0..3 {
             tx.send(DropProbe(drops.clone())).unwrap();
@@ -233,7 +230,7 @@ mod normal_tests {
     #[test]
     fn test_mpsc_receiver_drop_drops_messages_without_holding_lifecycle_lock() {
         let dropped = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = mpsc::channel::<Option<Box<ReentrantDrop>>>();
+        let (tx, rx) = mpsc::Mpsc::channel::<Option<Box<ReentrantDrop>>>();
         tx.send(Some(Box::new(ReentrantDrop {
             sender: tx.clone(),
             dropped: dropped.clone(),
@@ -260,7 +257,7 @@ mod normal_tests {
     #[test]
     fn test_sync_channel_receiver_drop_drops_messages_without_holding_lock() {
         let dropped = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = mpsc::sync_channel::<Option<Box<ReentrantSyncDrop>>>(1);
+        let (tx, rx) = mpsc::Mpsc::sync_channel::<Option<Box<ReentrantSyncDrop>>>(1);
         tx.send(Some(Box::new(ReentrantSyncDrop {
             sender: tx.clone(),
             dropped: dropped.clone(),
@@ -277,8 +274,8 @@ mod normal_tests {
     fn test_mpsc_receiver_is_send_but_single_consumer() {
         assert_send::<mpsc::Receiver<usize>>();
 
-        let (tx, rx) = mpsc::channel();
-        let handle = thread::spawn(move || rx.recv().unwrap()).unwrap();
+        let (tx, rx) = mpsc::Mpsc::channel();
+        let handle = ThreadApi::spawn(move || rx.recv().unwrap()).unwrap();
         tx.send(7).unwrap();
         assert_eq!(handle.join().unwrap(), 7);
     }
@@ -300,7 +297,7 @@ mod loom_tests {
         let mut builder = loom::model::Builder::new();
         builder.preemption_bound = Some(2);
         builder.check(|| {
-            let (tx, rx) = mpsc::channel();
+            let (tx, rx) = mpsc::Mpsc::channel();
             let tx1 = tx.clone();
 
             thread::spawn(move || {
@@ -338,7 +335,7 @@ mod loom_tests {
         builder.check(|| {
             let drops = Arc::new(AtomicUsize::new(0));
             let observed_drops = drops.clone();
-            let (tx, rx) = mpsc::channel();
+            let (tx, rx) = mpsc::Mpsc::channel();
             let send_tx = tx.clone();
 
             let send_handle = thread::spawn(move || send_tx.send(DropProbe(drops)));
@@ -347,8 +344,8 @@ mod loom_tests {
             let result = send_handle.join().unwrap();
             close_handle.join().unwrap();
 
-            if let Err(mpsc::SendError(value)) = result {
-                drop(value);
+            if let Err(error) = result {
+                drop(error.into_inner());
             }
             drop(tx);
             assert_eq!(observed_drops.load(Ordering::Relaxed), 1);
@@ -358,11 +355,11 @@ mod loom_tests {
     #[test]
     fn test_loom_mpsc_send_after_close_returns_value() {
         loom::model(|| {
-            let (tx, rx) = mpsc::channel();
+            let (tx, rx) = mpsc::Mpsc::channel();
             drop(rx);
 
             match tx.send(42) {
-                Err(mpsc::SendError(value)) => assert_eq!(value, 42),
+                Err(error) => assert_eq!(error.into_inner(), 42),
                 Ok(()) => panic!("sending after receiver close unexpectedly succeeded"),
             }
         });

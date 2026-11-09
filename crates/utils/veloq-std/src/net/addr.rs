@@ -91,7 +91,7 @@ impl ToSocketAddrs for (&str, u16) {
         if let Ok(addr) = host.parse::<Ipv6Addr>() {
             return Ok(vec![SocketAddr::V6(SocketAddrV6::new(addr, port, 0, 0))].into_iter());
         }
-        sys::lookup_host(host, port).map(|v| v.into_iter())
+        sys::Socket::lookup_host(host, port).map(|v| v.into_iter())
     }
 }
 
@@ -149,23 +149,27 @@ impl ToSocketAddrs for String {
     }
 }
 
-pub(crate) fn each_addr<A: ToSocketAddrs, F, T>(addr: A, mut f: F) -> Result<T>
-where
-    F: FnMut(&SocketAddr) -> Result<T>,
-{
-    let mut last_err = None;
-    for addr in addr.to_socket_addrs()? {
-        match f(&addr) {
-            Ok(l) => return Ok(l),
-            Err(e) => last_err = Some(e),
-        }
-    }
+pub(crate) struct Addr;
 
-    match last_err {
-        Some(err) => Err(err),
-        None => Err(const_io_error!(
-            ErrorKind::InvalidInput,
-            "could not resolve to any addresses"
-        )),
+impl Addr {
+    pub(crate) fn each_addr<A: ToSocketAddrs, F, T>(addr: A, mut f: F) -> Result<T>
+    where
+        F: FnMut(&SocketAddr) -> Result<T>,
+    {
+        let mut last_err = None;
+        for addr in addr.to_socket_addrs()? {
+            match f(&addr) {
+                Ok(l) => return Ok(l),
+                Err(e) => last_err = Some(e),
+            }
+        }
+
+        match last_err {
+            Some(err) => Err(err),
+            None => Err(const_io_error!(
+                ErrorKind::InvalidInput,
+                "could not resolve to any addresses"
+            )),
+        }
     }
 }

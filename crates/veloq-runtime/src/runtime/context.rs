@@ -5,7 +5,7 @@ use veloq_std::{
     marker::PhantomData,
     mem::replace,
     num::NonZeroUsize,
-    panic::{AssertUnwindSafe, catch_unwind},
+    panic::{AssertUnwindSafe, Panic},
     pin::Pin,
     ptr::NonNull,
     string::String,
@@ -257,7 +257,7 @@ where
         }
 
         let mut finalizer = RouteTaskFinalizer::new(&self.header, &self.slot);
-        let operation = catch_unwind(AssertUnwindSafe::new(|| {
+        let operation = Panic::catch_unwind(AssertUnwindSafe::new(|| {
             let job = unsafe { self.job.with_mut(|slot| slot.take()) };
             let Some(job) = job else {
                 finalizer.publish_err(route_error(
@@ -267,7 +267,7 @@ where
                 return;
             };
 
-            match catch_unwind(AssertUnwindSafe::new(job)) {
+            match Panic::catch_unwind(AssertUnwindSafe::new(job)) {
                 Ok(future) => finalizer.publish_ok(future),
                 Err(_) => finalizer.publish_err(route_error(
                     "RuntimeCtx::route_to::RouteJobTask::poll_raw",

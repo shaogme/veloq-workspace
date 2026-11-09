@@ -16,7 +16,7 @@ use veloq_std::{
     mem::{self, zeroed},
     string::ToString,
     sync::{OnceLock, mpsc},
-    thread::{Builder, sleep, yield_now},
+    thread::{Builder, ThreadApi},
     time::{Duration, Instant},
     vec::Vec,
 };
@@ -95,7 +95,7 @@ impl DeferredRioCleanup {
 fn reaper_sender() -> Option<&'static mpsc::Sender<DeferredRioCleanup>> {
     static SENDER: OnceLock<Option<mpsc::Sender<DeferredRioCleanup>>> = OnceLock::new();
     let opt = SENDER.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<DeferredRioCleanup>();
+        let (tx, rx) = mpsc::Mpsc::channel::<DeferredRioCleanup>();
         match Builder::new()
             .name("veloq-rio-reaper".to_string())
             .spawn(move || {
@@ -158,9 +158,9 @@ impl RioLifecycle {
             fn snooze(&mut self) {
                 if self.yields < 10 {
                     self.yields += 1;
-                    let _ = yield_now();
+                    let _ = ThreadApi::yield_now();
                 } else {
-                    let _ = sleep(Duration::from_millis(1));
+                    let _ = ThreadApi::sleep(Duration::from_millis(1));
                 }
             }
         }
@@ -291,7 +291,7 @@ impl RioLifecycle {
         if let Some(tx) = reaper_sender() {
             if let Err(err) = tx.send(task) {
                 warn!("RioReaper unavailable, falling back to inline cleanup");
-                err.0.run();
+                err.into_inner().run();
             }
         } else {
             warn!("RioReaper thread failed to start, falling back to inline cleanup");

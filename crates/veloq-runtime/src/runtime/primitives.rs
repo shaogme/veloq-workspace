@@ -38,7 +38,7 @@ mod sys {
     use veloq_futex::{FutexError, WaitOutcome, wait as futex_wait, wake as futex_wake};
 
     #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
-    use veloq_std::thread;
+    use veloq_std::thread::ThreadApi;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum WaitError {
@@ -163,7 +163,9 @@ mod sys {
 
         #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
         pub(crate) unsafe fn wait(_addr: &AtomicU32, _expected: u32) -> StdResult<(), WaitError> {
-            thread::yield_now().map(|_| ()).map_err(WaitError::Aborted)
+            ThreadApi::yield_now()
+                .map(|_| ())
+                .map_err(WaitError::Aborted)
         }
 
         #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
@@ -172,7 +174,7 @@ mod sys {
             _expected: u32,
             timeout: Duration,
         ) -> StdResult<(), WaitError> {
-            thread::sleep(timeout).map_err(WaitError::Aborted)
+            ThreadApi::sleep(timeout).map_err(WaitError::Aborted)
         }
 
         #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
@@ -641,7 +643,7 @@ mod tests {
             NativeArc as Arc,
             atomic::{AtomicUsize, Ordering},
         },
-        thread::{AbortedError, scope, sleep, yield_now},
+        thread::{AbortedError, ThreadApi},
         time::Duration,
     };
 
@@ -678,10 +680,10 @@ mod tests {
         // 消耗掉可能存在的初始状态，确保真的会睡下去。
         assert!(!unparker.signal_is_notified());
 
-        scope(|threads| {
+        ThreadApi::scope(|threads| {
             threads
                 .spawn(|| {
-                    sleep(Duration::from_millis(20)).expect("sleep failed");
+                    ThreadApi::sleep(Duration::from_millis(20)).expect("sleep failed");
                     unparker.unpark().expect("unpark failed");
                 })
                 .expect("sleep worker failed to spawn");
@@ -789,10 +791,10 @@ mod tests {
         let coordinator = Arc::new(ShutdownCoordinator::new(1));
         let gate = coordinator.lock_publication();
 
-        scope(|threads| {
+        ThreadApi::scope(|threads| {
             let coordinator_for_thread = coordinator.clone();
             let handle = threads.spawn(move || coordinator_for_thread.request_shutdown());
-            yield_now().expect("yield failed");
+            ThreadApi::yield_now().expect("yield failed");
             assert_eq!(coordinator.phase(), ShutdownPhase::Running);
             drop(gate);
             handle

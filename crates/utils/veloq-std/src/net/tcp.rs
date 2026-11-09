@@ -1,17 +1,15 @@
-use core::{fmt, net::SocketAddr, time::Duration};
-
 use crate::{
     io::{Error, IoSlice, IoSliceMut, Read, Result, Write},
     net::{
         Shutdown,
-        addr::{ToSocketAddrs, each_addr},
+        addr::{Addr, ToSocketAddrs},
         sys,
     },
 };
+use core::{fmt, net::SocketAddr, time::Duration};
 
 #[cfg(unix)]
 use crate::os::unix::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
-
 #[cfg(windows)]
 use crate::os::windows::io::{
     AsRawSocket, AsSocket, BorrowedSocket, FromRawSocket, IntoRawSocket, OwnedSocket, RawSocket,
@@ -19,12 +17,12 @@ use crate::os::windows::io::{
 
 /// A TCP stream between a local and a remote socket.
 pub struct TcpStream {
-    pub(crate) inner: sys::Socket,
+    inner: sys::Socket,
 }
 
 /// A TCP socket server, listening for incoming connections.
 pub struct TcpListener {
-    pub(crate) inner: sys::Socket,
+    inner: sys::Socket,
 }
 
 /// An iterator that infinitely [`accept`]s connections on a [`TcpListener`].
@@ -36,7 +34,7 @@ pub struct Incoming<'a> {
 impl TcpStream {
     /// Opens a TCP connection to a remote host.
     pub fn connect<A: ToSocketAddrs>(addr: A) -> Result<Self> {
-        each_addr(addr, |addr| {
+        Addr::each_addr(addr, |addr| {
             let sock = sys::Socket::new_tcp(addr)?;
             sock.connect(addr)?;
             Ok(Self { inner: sock })
@@ -438,7 +436,7 @@ impl TcpListener {
     /// Creates a new `TcpListener` which will be bound to the specified
     /// address.
     pub fn bind<A: ToSocketAddrs>(addr: A) -> Result<Self> {
-        each_addr(addr, |addr| {
+        Addr::each_addr(addr, |addr| {
             let sock = sys::Socket::new_tcp(addr)?;
             sock.bind(addr)?;
             sock.listen(128)?;

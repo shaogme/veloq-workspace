@@ -1,16 +1,18 @@
 #![cfg(feature = "std")]
 
-use veloq_std::panic::{AssertUnwindSafe, PanicResult, catch_unwind, resume_unwind};
+use std::panic::panic_any;
+use veloq_std::panic::{AssertUnwindSafe, Panic, PanicPayload, PanicResult};
 
 #[test]
 fn catch_unwind_captures_and_downcasts_payloads() {
-    let result: PanicResult<()> = catch_unwind(AssertUnwindSafe::new(|| panic!("&str payload")));
+    let result: PanicResult<()> =
+        Panic::catch_unwind(AssertUnwindSafe::new(|| panic!("&str payload")));
     let payload = result.expect_err("the closure should panic");
     assert_eq!(payload.downcast_ref::<&str>(), Some(&"&str payload"));
     assert!(payload.as_any().is::<&str>());
 
-    let result = catch_unwind(AssertUnwindSafe::new(|| {
-        std::panic::panic_any(String::from("String payload"));
+    let result = Panic::catch_unwind(AssertUnwindSafe::new(|| {
+        panic_any(String::from("String payload"));
     }));
     let payload = result.expect_err("the closure should panic");
     assert_eq!(
@@ -21,9 +23,9 @@ fn catch_unwind_captures_and_downcasts_payloads() {
 
 #[test]
 fn resume_unwind_preserves_the_original_payload() {
-    let caught = catch_unwind(AssertUnwindSafe::new(|| panic!("original payload")))
+    let caught = Panic::catch_unwind(AssertUnwindSafe::new(|| panic!("original payload")))
         .expect_err("the first closure should panic");
-    let resumed = catch_unwind(AssertUnwindSafe::new(|| resume_unwind(caught)));
+    let resumed = Panic::catch_unwind(AssertUnwindSafe::new(|| Panic::resume_unwind(caught)));
     let payload = resumed.expect_err("resume_unwind should panic");
     assert_eq!(payload.downcast_ref::<&str>(), Some(&"original payload"));
 }
@@ -31,8 +33,8 @@ fn resume_unwind_preserves_the_original_payload() {
 #[test]
 fn panic_result_has_a_single_public_error_type() {
     fn assert_send<T: Send>() {}
-    assert_send::<veloq_std::panic::PanicPayload>();
+    assert_send::<PanicPayload>();
 
-    let result: PanicResult<i32> = catch_unwind(AssertUnwindSafe::new(|| 42));
+    let result: PanicResult<i32> = Panic::catch_unwind(AssertUnwindSafe::new(|| 42));
     assert_eq!(result.expect("the closure should return normally"), 42);
 }

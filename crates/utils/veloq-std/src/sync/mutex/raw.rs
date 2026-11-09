@@ -214,11 +214,11 @@ impl_raw_mutex!(
     #[derive(Debug)]
     struct NativeRawMutex,
     atomic: NativeAtomicU32,
-    wait: |s, obs| native::wait_on_address(&s.state, obs),
+    wait: |s, obs| native::Platform::wait_on_address(&s.state, obs),
     wait_timeout: |s, obs, rem| {
-        native::wait_on_address_timeout(&s.state, obs, Some(rem))
+        native::Platform::wait_on_address_timeout(&s.state, obs, Some(rem))
     },
-    wake_one: |s| native::wake_by_address(&s.state),
+    wake_one: |s| native::Platform::wake_by_address(&s.state),
     const_new: const
 );
 

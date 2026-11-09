@@ -8,7 +8,7 @@ use veloq_std::{
 };
 
 #[cfg(feature = "std")]
-use veloq_std::panic::{AssertUnwindSafe, catch_unwind};
+use veloq_std::panic::{AssertUnwindSafe, Panic};
 
 fn with_workers(count: usize) -> RuntimeBuilder<(), DefaultWorkerFactoryFor<()>> {
     RuntimeBuilder::new().with_worker_count(NonZeroUsize::new(count))
@@ -29,7 +29,7 @@ impl Future for Park {
 fn panic_in_scope_cancels_and_joins_child_tasks() {
     let child_cancelled = AtomicBool::new(false);
 
-    let result = catch_unwind(AssertUnwindSafe::new(|| {
+    let result = Panic::catch_unwind(AssertUnwindSafe::new(|| {
         with_workers(2)
             .scope(async |ctx| {
                 scope!(ctx, async |s| -> () {

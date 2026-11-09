@@ -319,7 +319,7 @@ mod tests {
 
     #[test]
     fn test_thread_isolation() {
-        thread::spawn(move || {
+        thread::ThreadApi::spawn(move || {
             TEST_TLS
                 .try_with_or_init(
                     |v| {

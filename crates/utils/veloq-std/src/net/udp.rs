@@ -1,21 +1,19 @@
+use crate::{
+    const_io_error,
+    io::{Error, ErrorKind, Result},
+    net::{
+        addr::{Addr, ToSocketAddrs},
+        sys,
+    },
+};
 use core::{
     fmt,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     time::Duration,
 };
 
-use crate::{
-    const_io_error,
-    io::{Error, ErrorKind, Result},
-    net::{
-        addr::{ToSocketAddrs, each_addr},
-        sys,
-    },
-};
-
 #[cfg(unix)]
 use crate::os::unix::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
-
 #[cfg(windows)]
 use crate::os::windows::io::{
     AsRawSocket, AsSocket, BorrowedSocket, FromRawSocket, IntoRawSocket, OwnedSocket, RawSocket,
@@ -23,13 +21,13 @@ use crate::os::windows::io::{
 
 /// A UDP socket.
 pub struct UdpSocket {
-    pub(crate) inner: sys::Socket,
+    inner: sys::Socket,
 }
 
 impl UdpSocket {
     /// Creates a UDP socket from the given address.
     pub fn bind<A: ToSocketAddrs>(addr: A) -> Result<Self> {
-        each_addr(addr, |addr| {
+        Addr::each_addr(addr, |addr| {
             let sock = sys::Socket::new_udp(addr)?;
             sock.bind(addr)?;
             Ok(Self { inner: sock })
@@ -197,7 +195,7 @@ impl UdpSocket {
     /// Connects this UDP socket to a remote address, allowing the `send` and
     /// `recv` syscalls to be used to send and receive data.
     pub fn connect<A: ToSocketAddrs>(&self, addr: A) -> Result<()> {
-        each_addr(addr, |addr| self.inner.connect(addr))
+        Addr::each_addr(addr, |addr| self.inner.connect(addr))
     }
 
     /// Sends data on the socket to the remote address to which it is connected.

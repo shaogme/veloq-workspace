@@ -1,9 +1,14 @@
-use core::fmt::{self, Display, Formatter};
+use core::{
+    error::Error as CoreError,
+    fmt::{self, Display, Formatter},
+};
 
-use veloq_std::const_io_error;
-use veloq_std::io::{
-    Cursor, Error, ErrorKind, IoSlice, IoSliceMut, RawOsError, Read, Result, Seek, SeekFrom,
-    SimpleMessage, Stderr, Stdin, Stdout, Write, copy, empty, repeat, sink, stderr, stdin, stdout,
+use veloq_std::{
+    const_io_error,
+    io::{
+        Cursor, Empty, Error, ErrorKind, Io, IoSlice, IoSliceMut, RawOsError, Read, Repeat, Result,
+        Seek, SeekFrom, SimpleMessage, Sink, Stderr, Stdin, Stdout, Write,
+    },
 };
 
 #[cfg(feature = "std")]
@@ -20,7 +25,7 @@ impl Display for CustomTestError {
     }
 }
 
-impl core::error::Error for CustomTestError {}
+impl CoreError for CustomTestError {}
 
 #[test]
 fn test_error_from_kind() {
@@ -245,19 +250,19 @@ fn test_copy_sink_empty_repeat() {
 
     let mut src: &[u8] = b"hello";
     let mut dst = Vec::new();
-    let n = copy(&mut src, &mut dst).unwrap();
+    let n = Io::copy(&mut src, &mut dst).unwrap();
     assert_eq!(n, 5);
     assert_eq!(dst, b"hello");
 
-    let mut s = sink();
+    let mut s = Sink::new();
     assert_eq!(s.write(b"drop me").unwrap(), 7);
 
-    let mut e = empty();
+    let mut e = Empty::new();
     let mut b = [0u8; 4];
     assert_eq!(e.read(&mut b).unwrap(), 0);
     assert_eq!(e.seek(SeekFrom::Start(10)).unwrap(), 0);
 
-    let mut r = repeat(42);
+    let mut r = Repeat::new(42);
     let mut r_buf = [0u8; 4];
     assert_eq!(r.read(&mut r_buf).unwrap(), 4);
     assert_eq!(r_buf, [42, 42, 42, 42]);
@@ -306,17 +311,17 @@ fn test_stdio() {
     assert_types::<Stdin, Stdout>();
     assert_types::<Stdin, Stderr>();
 
-    let mut out: Stdout = stdout();
+    let mut out: Stdout = Stdout::new();
     out.write_all(b"").unwrap();
     out.flush().unwrap();
     let _out_lock = out.lock();
 
-    let mut err: Stderr = stderr();
+    let mut err: Stderr = Stderr::new();
     err.write_all(b"").unwrap();
     err.flush().unwrap();
     let _err_lock = err.lock();
 
-    let in_handle: Stdin = stdin();
+    let in_handle: Stdin = Stdin::new();
     let _in_lock = in_handle.lock();
 }
 
@@ -325,9 +330,9 @@ fn test_stdio() {
 fn test_stdio_unix_raw_fd() {
     use veloq_std::os::fd::AsRawFd;
 
-    let in_handle = stdin();
-    let out_handle = stdout();
-    let err_handle = stderr();
+    let in_handle = Stdin::new();
+    let out_handle = Stdout::new();
+    let err_handle = Stderr::new();
 
     assert_eq!(in_handle.as_raw_fd(), libc::STDIN_FILENO);
     assert_eq!(out_handle.as_raw_fd(), libc::STDOUT_FILENO);
@@ -339,9 +344,9 @@ fn test_stdio_unix_raw_fd() {
 fn test_stdio_windows_raw_handle() {
     use veloq_std::os::windows::io::AsRawHandle;
 
-    let in_handle = stdin();
-    let out_handle = stdout();
-    let err_handle = stderr();
+    let in_handle = Stdin::new();
+    let out_handle = Stdout::new();
+    let err_handle = Stderr::new();
 
     let _ = in_handle.as_raw_handle();
     let _ = out_handle.as_raw_handle();

@@ -12,7 +12,7 @@ use veloq_std::{
     boxed::Box,
     future::Future,
     marker::{PhantomData, PhantomPinned},
-    panic::{AssertUnwindSafe, PanicPayload, catch_unwind},
+    panic::{AssertUnwindSafe, Panic, PanicPayload},
     pin::Pin,
     ptr::NonNull,
     sync::atomic::Ordering,
@@ -200,7 +200,7 @@ impl<S: ScopeStorage, O: Ownership> GenericScopeCompletion<S, O> {
         }
 
         for waker in ready {
-            let _ = catch_unwind(AssertUnwindSafe::new(|| waker.wake()));
+            let _ = Panic::catch_unwind(AssertUnwindSafe::new(|| waker.wake()));
         }
     }
 
@@ -406,8 +406,8 @@ mod tests {
         utils::ArcOwnership,
     };
     use veloq_std::{
-        sync::{NativeArc as Arc, NativeBarrier as Barrier, mpsc::sync_channel},
-        thread,
+        sync::{NativeArc as Arc, NativeBarrier as Barrier, mpsc},
+        thread::ThreadApi,
     };
     use veloq_storage::AtomicStorage;
 
@@ -425,10 +425,10 @@ mod tests {
     fn blocking_waiter_returns_when_completion_settles() {
         let completion = GenericScopeCompletion::<AtomicStorage, ArcOwnership>::new(None);
         completion.register_task();
-        let (armed_tx, armed_rx) = sync_channel(0);
+        let (armed_tx, armed_rx) = mpsc::Mpsc::sync_channel(0);
         let completion_for_thread = completion.clone();
 
-        let waiter_thread = thread::spawn(move || {
+        let waiter_thread = ThreadApi::spawn(move || {
             let mut waiter = ScopeBlockingWaiter::new(&completion_for_thread, Unparker::new());
             waiter.arm();
             armed_tx.send(()).expect("waiter did not arm");
@@ -485,7 +485,7 @@ mod tests {
         completion.register_task();
         let barrier = Arc::new(Barrier::new(3));
 
-        thread::scope(|scope| {
+        ThreadApi::scope(|scope| {
             for _ in 0..2 {
                 let completion_for_thread = completion.clone();
                 let barrier_for_thread = barrier.clone();

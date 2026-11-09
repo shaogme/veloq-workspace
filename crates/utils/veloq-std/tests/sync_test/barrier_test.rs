@@ -7,7 +7,7 @@ mod normal_tests {
             Arc, Barrier,
             atomic::{AtomicUsize, Ordering},
         },
-        thread,
+        thread::ThreadApi,
     };
 
     #[test]
@@ -24,7 +24,7 @@ mod normal_tests {
             let passed = passed.clone();
             let ready_tx = ready_tx.clone();
             handles.push(
-                thread::spawn(move || {
+                ThreadApi::spawn(move || {
                     ready_tx.send(()).unwrap();
                     let result = barrier.wait();
                     passed.fetch_add(1, Ordering::Release);
@@ -42,7 +42,7 @@ mod normal_tests {
         let barrier_for_last = barrier.clone();
         let passed_for_last = passed.clone();
         handles.push(
-            thread::spawn(move || {
+            ThreadApi::spawn(move || {
                 let result = barrier_for_last.wait();
                 passed_for_last.fetch_add(1, Ordering::Release);
                 result.is_leader()
@@ -83,7 +83,7 @@ mod normal_tests {
             let passed = passed.clone();
             let leaders = leaders.clone();
             handles.push(
-                thread::spawn(move || {
+                ThreadApi::spawn(move || {
                     for generation in 0..GENERATIONS {
                         let result = barrier.wait();
                         passed[generation].fetch_add(1, Ordering::Release);
@@ -137,7 +137,7 @@ mod normal_tests {
     fn barrier_state_is_not_poisoned_by_a_panicking_participant() {
         let barrier = Arc::new(Barrier::new(2));
         let barrier_for_worker = barrier.clone();
-        let worker = thread::spawn(move || {
+        let worker = ThreadApi::spawn(move || {
             barrier_for_worker.wait();
             panic!("participant failed after crossing the barrier");
         })
@@ -147,7 +147,7 @@ mod normal_tests {
         assert!(worker.join().is_err());
 
         let barrier_for_next_round = barrier.clone();
-        let next_round = thread::spawn(move || barrier_for_next_round.wait()).unwrap();
+        let next_round = ThreadApi::spawn(move || barrier_for_next_round.wait()).unwrap();
         barrier.wait();
         next_round.join().unwrap();
     }
@@ -174,7 +174,7 @@ mod loom_tests {
             let barrier_for_thread = barrier.clone();
             let leaders_for_thread = leaders.clone();
 
-            let handle = thread::spawn(move || {
+            let handle = ThreadApi::spawn(move || {
                 if barrier_for_thread.wait().is_leader() {
                     leaders_for_thread.fetch_add(1, Ordering::Release);
                 }
@@ -199,7 +199,7 @@ mod loom_tests {
             let barrier_for_thread = barrier.clone();
             let leaders_for_thread = leaders.clone();
 
-            let handle = thread::spawn(move || {
+            let handle = ThreadApi::spawn(move || {
                 for _ in 0..2 {
                     if barrier_for_thread.wait().is_leader() {
                         leaders_for_thread.fetch_add(1, Ordering::Release);

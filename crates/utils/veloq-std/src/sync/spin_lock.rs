@@ -14,7 +14,13 @@ pub struct NativeSpinLock<T> {
     data: NativeUnsafeCell<T>,
 }
 
+/// 原生自旋锁守卫。
+pub struct NativeSpinLockGuard<'a, T> {
+    lock: &'a NativeSpinLock<T>,
+}
+
 unsafe impl<T: Send> Send for NativeSpinLock<T> {}
+
 unsafe impl<T: Send> Sync for NativeSpinLock<T> {}
 
 impl<T> NativeSpinLock<T> {
@@ -54,11 +60,6 @@ impl<T> NativeSpinLock<T> {
     pub fn is_locked(&self) -> bool {
         self.locked.load(Ordering::Relaxed)
     }
-}
-
-/// 原生自旋锁守卫。
-pub struct NativeSpinLockGuard<'a, T> {
-    lock: &'a NativeSpinLock<T>,
 }
 
 impl<T> Drop for NativeSpinLockGuard<'_, T> {
@@ -208,16 +209,3 @@ pub type SpinLock<T> = LoomSpinLock<T>;
 
 #[cfg(feature = "loom")]
 pub type SpinLockGuard<'a, T> = LoomSpinLockGuard<'a, T>;
-
-/// 创建可用于静态初始化的原生自旋锁。
-#[inline]
-pub const fn const_native_spin_lock<T>(data: T) -> NativeSpinLock<T> {
-    NativeSpinLock::new(data)
-}
-
-#[cfg(not(feature = "loom"))]
-/// 创建当前配置下的自旋锁。
-#[inline]
-pub const fn const_spin_lock<T>(data: T) -> SpinLock<T> {
-    const_native_spin_lock(data)
-}

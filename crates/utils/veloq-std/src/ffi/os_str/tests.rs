@@ -1,5 +1,10 @@
-use super::*;
-use crate::alloc_crate::{borrow::ToOwned, boxed::Box, format, rc::Rc, sync::Arc, vec};
+use crate::{
+    alloc_crate::{borrow::ToOwned, boxed::Box, format, rc::Rc, string::String, sync::Arc, vec},
+    ffi::{OsStr, OsStrJoin, OsString},
+};
+
+#[cfg(windows)]
+use crate::vec::Vec;
 
 #[test]
 fn test_os_string_with_capacity() {

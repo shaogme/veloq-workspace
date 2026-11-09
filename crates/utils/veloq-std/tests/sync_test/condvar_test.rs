@@ -1,11 +1,10 @@
 #[cfg(not(feature = "loom"))]
 mod normal_tests {
-    use std::sync::mpsc::channel;
-    use std::vec::Vec;
+    use std::{sync::mpsc::channel, vec::Vec};
 
     use veloq_std::{
         sync::{Arc, Condvar, Mutex},
-        thread,
+        thread::ThreadApi,
         time::Duration,
     };
 
@@ -14,7 +13,7 @@ mod normal_tests {
         let pair = Arc::new((Mutex::new(false), Condvar::new()));
         let pair2 = pair.clone();
 
-        thread::spawn(move || {
+        ThreadApi::spawn(move || {
             let (lock, cvar) = &*pair2;
             let mut started = lock.lock().unwrap();
             *started = true;
@@ -40,7 +39,7 @@ mod normal_tests {
         let (done_tx, done_rx) = channel();
         let pair2 = pair.clone();
 
-        let handle = thread::spawn(move || {
+        let handle = ThreadApi::spawn(move || {
             let (lock, cvar) = &*pair2;
             let guard = lock.lock().unwrap();
             ready_tx.send(()).unwrap();
@@ -65,7 +64,7 @@ mod normal_tests {
         let pair = Arc::new((Mutex::new(false), Condvar::new()));
         let pair2 = pair.clone();
 
-        let handle = thread::spawn(move || {
+        let handle = ThreadApi::spawn(move || {
             let (lock, cvar) = &*pair2;
             let mut started = lock.lock().unwrap();
             *started = true;
@@ -103,7 +102,7 @@ mod normal_tests {
         let (done_tx, done_rx) = channel();
         let pair2 = pair.clone();
 
-        let handle = thread::spawn(move || {
+        let handle = ThreadApi::spawn(move || {
             let (lock, cvar) = &*pair2;
             let guard = lock.lock().unwrap();
             ready_tx.send(()).unwrap();
@@ -131,7 +130,7 @@ mod normal_tests {
         for _ in 0..3 {
             let pair_clone = pair.clone();
             let ready_tx = ready_tx.clone();
-            let handle = thread::spawn(move || {
+            let handle = ThreadApi::spawn(move || {
                 let (lock, cvar) = &*pair_clone;
                 let mut count = lock.lock().unwrap();
                 ready_tx.send(()).unwrap();
@@ -181,7 +180,7 @@ mod loom_tests {
             let pair = Arc::new((Mutex::new(false), Condvar::new()));
             let pair2 = pair.clone();
 
-            let handle = thread::spawn(move || {
+            let handle = ThreadApi::spawn(move || {
                 let (lock, cvar) = &*pair2;
                 let mut started = lock.lock().unwrap();
                 *started = true;
@@ -213,7 +212,7 @@ mod loom_tests {
             let first_ready_tx1 = first_ready_tx.clone();
             let returned_tx1 = returned_tx.clone();
             let returned1 = returned.clone();
-            let first = thread::spawn(move || {
+            let first = ThreadApi::spawn(move || {
                 let (lock, cvar) = &*pair1;
                 let guard = lock.lock().unwrap();
                 first_ready_tx1.send(()).unwrap();
@@ -227,7 +226,7 @@ mod loom_tests {
             let second_ready_tx2 = second_ready_tx.clone();
             let returned_tx2 = returned_tx.clone();
             let returned2 = returned.clone();
-            let second = thread::spawn(move || {
+            let second = ThreadApi::spawn(move || {
                 let (lock, cvar) = &*pair2;
                 let guard = lock.lock().unwrap();
                 second_ready_tx2.send(()).unwrap();

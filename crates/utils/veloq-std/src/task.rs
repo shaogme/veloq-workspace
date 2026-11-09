@@ -1,59 +1,106 @@
-use core::{marker::PhantomData, mem::ManuallyDrop};
+pub use impls::*;
 
-use crate::sync::NativeArc;
+mod impls {
+    use core::{marker::PhantomData, mem::ManuallyDrop};
 
-pub use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use crate::sync::NativeArc;
 
-/// 可转换为任务唤醒器的用户回调。
-///
-/// 回调只借用实现对象，所有权由 `veloq_std` 内部的 `NativeArc` 管理，
-/// 因此该接口不会要求调用方接触 `alloc::sync::Arc`。
-pub trait Wake: Send + Sync + 'static {
-    fn wake(&self);
+    pub use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-    fn wake_by_ref(&self) {
-        self.wake();
+    /// 可转换为任务唤醒器的用户回调。
+    ///
+    /// 回调只借用实现对象，所有权由 `veloq_std` 内部的 `NativeArc` 管理，
+    /// 因此该接口不会要求调用方接触 `alloc::sync::Arc`。
+    pub trait Wake: Send + Sync + 'static {
+        fn wake(&self);
+
+        fn wake_by_ref(&self) {
+            self.wake();
+        }
+
+        fn into_waker(waker: NativeArc<Self>) -> Waker
+        where
+            Self: Sized,
+        {
+            waker.into()
+        }
     }
-}
 
-struct WakeVTable<W>(PhantomData<fn() -> W>);
+    pub struct WakeFn<F> {
+        callback: F,
+    }
 
-impl<W: Wake> WakeVTable<W> {
-    const VTABLE: RawWakerVTable = RawWakerVTable::new(
-        clone_waker::<W>,
-        wake_waker::<W>,
-        wake_by_ref_waker::<W>,
-        drop_waker::<W>,
-    );
-}
+    impl<F> WakeFn<F> {
+        pub fn new(callback: F) -> Self {
+            Self { callback }
+        }
 
-fn wake_vtable<W: Wake>() -> &'static RawWakerVTable {
-    &WakeVTable::<W>::VTABLE
-}
+        pub fn callback(&self) -> &F {
+            &self.callback
+        }
 
-unsafe fn clone_waker<W: Wake>(data: *const ()) -> RawWaker {
-    unsafe { NativeArc::<W>::increment_strong_count(data.cast()) };
-    RawWaker::new(data, wake_vtable::<W>())
-}
+        pub fn into_inner(self) -> F {
+            self.callback
+        }
+    }
 
-unsafe fn wake_waker<W: Wake>(data: *const ()) {
-    let waker = unsafe { NativeArc::<W>::from_raw(data.cast()) };
-    waker.wake();
-}
+    impl<F> WakeFn<F>
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        pub fn into_waker(self) -> Waker {
+            NativeArc::new(self).into()
+        }
+    }
 
-unsafe fn wake_by_ref_waker<W: Wake>(data: *const ()) {
-    let waker = ManuallyDrop::new(unsafe { NativeArc::<W>::from_raw(data.cast()) });
-    waker.wake_by_ref();
-}
+    impl<F> Wake for WakeFn<F>
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        fn wake(&self) {
+            (self.callback)();
+        }
+    }
 
-unsafe fn drop_waker<W: Wake>(data: *const ()) {
-    drop(unsafe { NativeArc::<W>::from_raw(data.cast()) });
-}
+    struct WakeVTable<W>(PhantomData<fn() -> W>);
 
-impl<W: Wake> From<NativeArc<W>> for Waker {
-    fn from(waker: NativeArc<W>) -> Self {
-        let data = NativeArc::into_raw(waker).cast();
-        let raw = RawWaker::new(data, wake_vtable::<W>());
-        unsafe { Waker::from_raw(raw) }
+    impl<W: Wake> WakeVTable<W> {
+        const VTABLE: RawWakerVTable = RawWakerVTable::new(
+            clone_waker::<W>,
+            wake_waker::<W>,
+            wake_by_ref_waker::<W>,
+            drop_waker::<W>,
+        );
+    }
+
+    fn wake_vtable<W: Wake>() -> &'static RawWakerVTable {
+        &WakeVTable::<W>::VTABLE
+    }
+
+    unsafe fn clone_waker<W: Wake>(data: *const ()) -> RawWaker {
+        unsafe { NativeArc::<W>::increment_strong_count(data.cast()) };
+        RawWaker::new(data, wake_vtable::<W>())
+    }
+
+    unsafe fn wake_waker<W: Wake>(data: *const ()) {
+        let waker = unsafe { NativeArc::<W>::from_raw(data.cast()) };
+        waker.wake();
+    }
+
+    unsafe fn wake_by_ref_waker<W: Wake>(data: *const ()) {
+        let waker = ManuallyDrop::new(unsafe { NativeArc::<W>::from_raw(data.cast()) });
+        waker.wake_by_ref();
+    }
+
+    unsafe fn drop_waker<W: Wake>(data: *const ()) {
+        drop(unsafe { NativeArc::<W>::from_raw(data.cast()) });
+    }
+
+    impl<W: Wake> From<NativeArc<W>> for Waker {
+        fn from(waker: NativeArc<W>) -> Self {
+            let data = NativeArc::into_raw(waker).cast();
+            let raw = RawWaker::new(data, wake_vtable::<W>());
+            unsafe { Waker::from_raw(raw) }
+        }
     }
 }

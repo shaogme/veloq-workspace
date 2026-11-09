@@ -26,16 +26,19 @@ use crate::{
     io::{Error, ErrorKind, IoSlice, IoSliceMut, Result},
     net::Shutdown,
     os::{
-        cvt::{cvt_gai, cvt_socket},
+        Cvt,
         windows::{
             io::{
                 AsRawSocket, AsSocket, BorrowedSocket, FromRawSocket, IntoRawSocket, OwnedSocket,
                 RawSocket,
             },
-            net,
+            net::NetApi,
         },
     },
 };
+
+#[derive(Debug)]
+pub struct Socket(OwnedSocket);
 
 #[repr(C)]
 pub union SocketAddrCRepr {
@@ -50,7 +53,7 @@ impl SocketAddrCRepr {
     }
 }
 
-pub fn socket_addr_to_c(addr: &SocketAddr) -> (SocketAddrCRepr, i32) {
+fn socket_addr_to_c(addr: &SocketAddr) -> (SocketAddrCRepr, i32) {
     match addr {
         SocketAddr::V4(a) => {
             let sin = SOCKADDR_IN {
@@ -92,7 +95,7 @@ pub fn socket_addr_to_c(addr: &SocketAddr) -> (SocketAddrCRepr, i32) {
 /// # Safety
 ///
 /// `storage` must point to a valid and readable `SOCKADDR` structure with at least `len` bytes.
-pub unsafe fn socket_addr_from_c(storage: *const SOCKADDR, len: usize) -> Result<SocketAddr> {
+unsafe fn socket_addr_from_c(storage: *const SOCKADDR, len: usize) -> Result<SocketAddr> {
     match unsafe { (*storage).sa_family } {
         AF_INET => {
             if len < size_of::<SOCKADDR_IN>() {
@@ -136,7 +139,7 @@ pub unsafe fn socket_addr_from_c(storage: *const SOCKADDR, len: usize) -> Result
 /// # Safety
 ///
 /// The option value and type must be valid for the given socket option.
-pub unsafe fn setsockopt<T>(
+unsafe fn setsockopt<T>(
     sock: &Socket,
     level: i32,
     option_name: i32,
@@ -152,7 +155,7 @@ pub unsafe fn setsockopt<T>(
             option_len,
         )
     };
-    cvt_socket(ret)?;
+    Cvt::cvt_socket(ret)?;
     Ok(())
 }
 
@@ -161,7 +164,7 @@ pub unsafe fn setsockopt<T>(
 /// # Safety
 ///
 /// The socket option must be compatible with type `T`.
-pub unsafe fn getsockopt<T: Copy>(sock: &Socket, level: i32, option_name: i32) -> Result<T> {
+unsafe fn getsockopt<T: Copy>(sock: &Socket, level: i32, option_name: i32) -> Result<T> {
     let mut option_value = MaybeUninit::<T>::zeroed();
     let mut option_len = size_of::<T>() as i32;
     let ret = unsafe {
@@ -173,16 +176,13 @@ pub unsafe fn getsockopt<T: Copy>(sock: &Socket, level: i32, option_name: i32) -
             &mut option_len,
         )
     };
-    cvt_socket(ret)?;
+    Cvt::cvt_socket(ret)?;
     Ok(unsafe { option_value.assume_init() })
 }
 
-#[derive(Debug)]
-pub struct Socket(pub(crate) OwnedSocket);
-
 impl Socket {
     pub fn new(family: i32, ty: i32) -> Result<Self> {
-        net::init();
+        NetApi::init();
         let socket = unsafe {
             WSASocketW(
                 family,
@@ -205,7 +205,7 @@ impl Socket {
             let socket =
                 unsafe { WSASocketW(family, ty, 0, ptr::null_mut(), 0, WSA_FLAG_OVERLAPPED) };
             if socket == INVALID_SOCKET {
-                return Err(net::last_error());
+                return Err(NetApi::last_error());
             }
             let owned = unsafe { OwnedSocket::from_raw_socket(socket as RawSocket) };
             owned.set_no_inherit()?;
@@ -238,7 +238,7 @@ impl Socket {
                 len,
             )
         };
-        cvt_socket(ret).map(drop)
+        Cvt::cvt_socket(ret).map(drop)
     }
 
     pub fn connect_timeout(&self, addr: &SocketAddr, timeout: Duration) -> Result<()> {
@@ -276,7 +276,7 @@ impl Socket {
                         &timeout_tv,
                     )
                 };
-                cvt_socket(count)?;
+                Cvt::cvt_socket(count)?;
 
                 if count == 0 {
                     return Err(const_io_error!(ErrorKind::TimedOut, "connection timed out"));
@@ -303,12 +303,12 @@ impl Socket {
                 len,
             )
         };
-        cvt_socket(ret).map(drop)
+        Cvt::cvt_socket(ret).map(drop)
     }
 
     pub fn listen(&self, backlog: i32) -> Result<()> {
         let ret = unsafe { listen(self.0.as_raw_socket() as usize as SOCKET, backlog) };
-        cvt_socket(ret).map(drop)
+        Cvt::cvt_socket(ret).map(drop)
     }
 
     pub fn accept(&self) -> Result<(Self, SocketAddr)> {
@@ -322,7 +322,7 @@ impl Socket {
             )
         };
         if sock == INVALID_SOCKET {
-            return Err(net::last_error());
+            return Err(NetApi::last_error());
         }
         let owned = unsafe { OwnedSocket::from_raw_socket(sock as RawSocket) };
         owned.set_no_inherit()?;
@@ -405,7 +405,7 @@ impl Socket {
                 0,
             )
         };
-        cvt_socket(ret).map(|n| n as usize)
+        Cvt::cvt_socket(ret).map(|n| n as usize)
     }
 
     pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> Result<usize> {
@@ -432,7 +432,7 @@ impl Socket {
                 None,
             )
         };
-        cvt_socket(ret)?;
+        Cvt::cvt_socket(ret)?;
         Ok(nwritten as usize)
     }
 
@@ -546,7 +546,7 @@ impl Socket {
                 len,
             )
         };
-        cvt_socket(ret).map(|n| n as usize)
+        Cvt::cvt_socket(ret).map(|n| n as usize)
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr> {
@@ -559,7 +559,7 @@ impl Socket {
                 &mut len,
             )
         };
-        cvt_socket(ret)?;
+        Cvt::cvt_socket(ret)?;
         unsafe { socket_addr_from_c((&raw const storage) as *const SOCKADDR, len as usize) }
     }
 
@@ -573,7 +573,7 @@ impl Socket {
                 &mut len,
             )
         };
-        cvt_socket(ret)?;
+        Cvt::cvt_socket(ret)?;
         unsafe { socket_addr_from_c((&raw const storage) as *const SOCKADDR, len as usize) }
     }
 
@@ -584,7 +584,7 @@ impl Socket {
             Shutdown::Both => SD_BOTH,
         };
         let ret = unsafe { shutdown(self.0.as_raw_socket() as usize as SOCKET, flag) };
-        cvt_socket(ret).map(drop)
+        Cvt::cvt_socket(ret).map(drop)
     }
 
     pub fn set_nonblocking(&self, nonblocking: bool) -> Result<()> {
@@ -596,7 +596,7 @@ impl Socket {
                 &mut mode,
             )
         };
-        cvt_socket(ret).map(drop)
+        Cvt::cvt_socket(ret).map(drop)
     }
 
     pub fn take_error(&self) -> Result<Option<Error>> {
@@ -828,8 +828,8 @@ impl Socket {
     }
 }
 
-pub fn lookup_host(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
-    net::init();
+fn lookup_host(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+    NetApi::init();
     let mut wide_host: Vec<u16> = host.encode_utf16().collect();
     wide_host.push(0);
 
@@ -837,7 +837,7 @@ pub fn lookup_host(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
     hints.ai_socktype = SOCK_STREAM;
 
     let mut res = ptr::null_mut();
-    cvt_gai(unsafe { GetAddrInfoW(wide_host.as_ptr(), ptr::null(), &hints, &mut res) })?;
+    Cvt::cvt_gai(unsafe { GetAddrInfoW(wide_host.as_ptr(), ptr::null(), &hints, &mut res) })?;
 
     struct AddrInfoGuard(*mut ADDRINFOW);
     impl Drop for AddrInfoGuard {
@@ -860,4 +860,10 @@ pub fn lookup_host(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
         cur = info.ai_next;
     }
     Ok(addrs)
+}
+
+impl Socket {
+    pub(crate) fn lookup_host(host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+        lookup_host(host, port)
+    }
 }

@@ -1,3 +1,5 @@
+use core::fmt::Write;
+
 use veloq_std::{
     borrow::Cow,
     boxed::Box,
@@ -148,7 +150,6 @@ fn test_formatting_and_display() {
     assert_eq!(format!("{disp:?}"), "\"hello display\"");
     assert_eq!(format!("{os_str:?}"), "\"hello display\"");
 
-    use core::fmt::Write;
     let mut buf = OsString::new();
     write!(buf, "fmt write test {}", 42).unwrap();
     assert_eq!(buf, "fmt write test 42");

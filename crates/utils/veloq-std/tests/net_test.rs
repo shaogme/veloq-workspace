@@ -1,5 +1,4 @@
 use core::time::Duration;
-
 use veloq_std::{
     io::{Read, Write},
     net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket},
@@ -7,7 +6,6 @@ use veloq_std::{
 
 #[cfg(unix)]
 use veloq_std::os::unix::io::{AsFd, AsRawFd};
-
 #[cfg(windows)]
 use veloq_std::os::windows::io::{AsRawSocket, AsSocket};
 

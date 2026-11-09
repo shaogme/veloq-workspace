@@ -122,16 +122,3 @@ pub type Barrier = NativeBarrier;
 
 #[cfg(feature = "loom")]
 pub type Barrier = LoomBarrier;
-
-/// 创建可用于静态初始化的原生屏障。
-#[inline]
-pub const fn const_native_barrier(n: usize) -> NativeBarrier {
-    NativeBarrier::new(n)
-}
-
-#[cfg(not(feature = "loom"))]
-/// 创建当前配置下的屏障。
-#[inline]
-pub const fn const_barrier(n: usize) -> Barrier {
-    const_native_barrier(n)
-}

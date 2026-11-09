@@ -8,10 +8,10 @@ use crate::{
     time::{Duration, Instant},
 };
 
-use super::mutex::raw::NativeRawMutex;
+use super::mutex::NativeRawMutex;
 
 #[cfg(feature = "loom")]
-use crate::{cell::LoomUnsafeCell, sync::mutex::raw::LoomRawMutex};
+use crate::{cell::LoomUnsafeCell, sync::mutex::LoomRawMutex};
 
 /// 不会记录 panic 中毒状态的互斥锁。
 ///
@@ -216,17 +216,6 @@ pub type UnpoisonedMutex<T> = LoomUnpoisonedMutex<T>;
 #[cfg(feature = "loom")]
 pub type UnpoisonedMutexGuard<'a, T> = LoomUnpoisonedMutexGuard<'a, T>;
 
-#[inline]
-pub const fn const_native_unpoisoned_mutex<T>(value: T) -> NativeUnpoisonedMutex<T> {
-    NativeUnpoisonedMutex::new(value)
-}
-
-#[cfg(not(feature = "loom"))]
-#[inline]
-pub const fn const_unpoisoned_mutex<T>(value: T) -> UnpoisonedMutex<T> {
-    const_native_unpoisoned_mutex(value)
-}
-
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use crate::{
@@ -255,7 +244,7 @@ mod tests {
 
         for _ in 0..num_threads {
             let mutex = mutex.clone();
-            let handle = thread::spawn(move || {
+            let handle = thread::ThreadApi::spawn(move || {
                 for _ in 0..100 {
                     let mut guard = mutex.lock();
                     *guard += 1;
@@ -278,7 +267,7 @@ mod tests {
         let worker_mutex = mutex.clone();
         let guard = mutex.lock();
 
-        let handle = thread::spawn(move || {
+        let handle = thread::ThreadApi::spawn(move || {
             let start = Instant::now();
             let result = worker_mutex.try_lock_for(Duration::from_millis(10));
             assert!(result.is_none());

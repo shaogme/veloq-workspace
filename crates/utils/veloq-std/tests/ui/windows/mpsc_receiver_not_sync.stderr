@@ -9,7 +9,7 @@ error[E0277]: `Cell<()>` cannot be shared between threads safely
 note: required because it appears within the type `PhantomData<Cell<()>>`
  --> $RUST/core/src/marker.rs
 note: required because it appears within the type `veloq_std::sync::mpsc::Receiver<usize>`
- --> src/sync/mpsc.rs
+ --> src/sync/mpsc/impls.rs
   |
   | pub struct Receiver<T> {
   |            ^^^^^^^^

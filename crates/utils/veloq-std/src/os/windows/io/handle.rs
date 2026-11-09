@@ -1,10 +1,12 @@
 //! Owned and borrowed Windows handles.
 
 use core::{
+    error::Error as CoreError,
     fmt,
     marker::PhantomData,
     mem::forget,
     ptr::{eq, null_mut},
+    result::Result as CoreResult,
 };
 
 use super::raw::{AsRawHandle, FromRawHandle, IntoRawHandle, RawHandle};
@@ -24,18 +26,18 @@ use windows_sys::Win32::{
 #[cfg(feature = "std")]
 use std::{fs::File as StdFile, os::windows::io::AsRawHandle as StdAsRawHandle};
 
+/// An owned Windows handle.
+#[repr(transparent)]
+pub struct OwnedHandle {
+    handle: RawHandle,
+}
+
 /// A borrowed Windows handle.
 #[derive(Copy, Clone)]
 #[repr(transparent)]
 pub struct BorrowedHandle<'handle> {
     handle: RawHandle,
     _phantom: PhantomData<&'handle OwnedHandle>,
-}
-
-/// An owned Windows handle.
-#[repr(transparent)]
-pub struct OwnedHandle {
-    handle: RawHandle,
 }
 
 /// A trait to borrow the handle from an underlying object.
@@ -54,7 +56,7 @@ impl fmt::Display for NullHandleError {
     }
 }
 
-impl core::error::Error for NullHandleError {}
+impl CoreError for NullHandleError {}
 
 /// FFI type for handles in return values or out parameters, where `NULL` is used as sentry.
 #[repr(transparent)]
@@ -71,7 +73,7 @@ impl fmt::Display for InvalidHandleError {
     }
 }
 
-impl core::error::Error for InvalidHandleError {}
+impl CoreError for InvalidHandleError {}
 
 /// FFI type for handles in return values or out parameters, where `INVALID_HANDLE_VALUE` is used as sentry.
 #[repr(transparent)]
@@ -79,12 +81,19 @@ impl core::error::Error for InvalidHandleError {}
 pub struct HandleOrInvalid(RawHandle);
 
 unsafe impl Send for OwnedHandle {}
+
 unsafe impl Sync for OwnedHandle {}
+
 unsafe impl Send for BorrowedHandle<'_> {}
+
 unsafe impl Sync for BorrowedHandle<'_> {}
+
 unsafe impl Send for HandleOrNull {}
+
 unsafe impl Sync for HandleOrNull {}
+
 unsafe impl Send for HandleOrInvalid {}
+
 unsafe impl Sync for HandleOrInvalid {}
 
 impl BorrowedHandle<'_> {
@@ -176,7 +185,7 @@ impl HandleOrNull {
 
     /// Converts into an `OwnedHandle` if not null.
     #[inline]
-    pub fn try_into_handle(self) -> core::result::Result<OwnedHandle, NullHandleError> {
+    pub fn try_into_handle(self) -> CoreResult<OwnedHandle, NullHandleError> {
         self.try_into()
     }
 }
@@ -185,7 +194,7 @@ impl TryFrom<HandleOrNull> for OwnedHandle {
     type Error = NullHandleError;
 
     #[inline]
-    fn try_from(handle: HandleOrNull) -> core::result::Result<Self, Self::Error> {
+    fn try_from(handle: HandleOrNull) -> CoreResult<Self, Self::Error> {
         if handle.is_null() {
             Err(NullHandleError)
         } else {
@@ -226,7 +235,7 @@ impl HandleOrInvalid {
 
     /// Converts into an `OwnedHandle` if not invalid.
     #[inline]
-    pub fn try_into_handle(self) -> core::result::Result<OwnedHandle, InvalidHandleError> {
+    pub fn try_into_handle(self) -> CoreResult<OwnedHandle, InvalidHandleError> {
         self.try_into()
     }
 }
@@ -235,7 +244,7 @@ impl TryFrom<HandleOrInvalid> for OwnedHandle {
     type Error = InvalidHandleError;
 
     #[inline]
-    fn try_from(handle: HandleOrInvalid) -> core::result::Result<Self, Self::Error> {
+    fn try_from(handle: HandleOrInvalid) -> CoreResult<Self, Self::Error> {
         if handle.is_invalid() {
             Err(InvalidHandleError)
         } else {

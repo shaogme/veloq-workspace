@@ -8,7 +8,7 @@ use veloq_std::{
     hint::black_box,
     num::NonZeroUsize,
     sync::{Arc, Barrier},
-    thread::spawn,
+    thread::ThreadApi,
     time::Instant,
 };
 
@@ -41,7 +41,7 @@ fn find_fastest_cores(count: usize) -> Vec<CoreId> {
     let mut results = Vec::new();
     for id in core_ids {
         let start = Instant::now();
-        let handle = spawn(move || {
+        let handle = ThreadApi::spawn(move || {
             set_for_current(id);
             let mut sum = 0u64;
             // A simple computation to stress the core
@@ -93,7 +93,7 @@ fn bench_threaded(c: &mut Criterion) {
                     None
                 };
 
-                handles.push(spawn(move || {
+                handles.push(ThreadApi::spawn(move || {
                     if let Some(core) = core_id {
                         set_for_current(core);
                     }

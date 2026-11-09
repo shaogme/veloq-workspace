@@ -1,5 +1,3 @@
-pub type RawOsError = i32;
-
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod unix;
 
@@ -10,10 +8,12 @@ mod windows;
 mod generic;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub use unix::{decode_error_kind, error_string, last_os_error};
+pub(crate) use unix::Platform;
 
 #[cfg(target_os = "windows")]
-pub use windows::{decode_error_kind, error_string, last_os_error};
+pub(crate) use windows::Platform;
 
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "windows")))]
-pub use generic::{decode_error_kind, error_string, last_os_error};
+pub(crate) use generic::Platform;
+
+pub type RawOsError = i32;

@@ -15,7 +15,7 @@ use veloq_std::{
     convert::TryFrom,
     format, io,
     sync::OnceLock,
-    thread,
+    thread::ThreadApi,
     time::{Duration, Instant},
     vec,
     vec::Vec,
@@ -161,7 +161,7 @@ impl TestSupport {
                 }
                 PollRecordResult::Pending => {}
             }
-            let _ = thread::sleep(Duration::from_millis(5));
+            let _ = ThreadApi::sleep(Duration::from_millis(5));
         }
     }
 
