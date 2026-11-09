@@ -1,5 +1,6 @@
-use super::cmd::{create_overlay_image, print_output};
-use crate::RunnerError;
+use super::cmd::CommandSpec;
+use crate::cli::RunnerError;
+use num_cpus::get;
 use std::{
     fs,
     io::{Error, ErrorKind},
@@ -11,16 +12,16 @@ use std::{
 };
 
 #[derive(Debug, Clone)]
-pub struct WindowsVmConfig {
-    pub base_image_path: PathBuf,
-    pub overlay_image_path: PathBuf,
-    pub username: String,
-    pub password: String,
-    pub ssh_port: u16,
+pub(super) struct WindowsVmConfig {
+    base_image_path: PathBuf,
+    overlay_image_path: PathBuf,
+    username: String,
+    password: String,
+    ssh_port: u16,
 }
 
 impl WindowsVmConfig {
-    pub fn from_workspace(workspace_root: &Path) -> Result<Self, RunnerError> {
+    pub(super) fn from_workspace(workspace_root: &Path) -> Result<Self, RunnerError> {
         let json_path = workspace_root.join("image/win2025-core-rust-gnu.json");
         let mut base_image_path = workspace_root.join("image/win2025-core-rust-gnu.qcow2");
         let mut overlay_image_path = None;
@@ -76,7 +77,7 @@ impl WindowsVmConfig {
         })
     }
 
-    pub fn ensure_overlay_image(
+    pub(super) fn ensure_overlay_image(
         &self,
         workspace_root: &Path,
         quiet: bool,
@@ -104,7 +105,7 @@ impl WindowsVmConfig {
         if !quiet {
             eprintln!("[xtest-runner] 正在执行 qemu-img create 创建差分镜像...");
         }
-        create_overlay_image(&self.base_image_path, &self.overlay_image_path)?;
+        CommandSpec::create_overlay_image(&self.base_image_path, &self.overlay_image_path)?;
 
         let build_res = (|| -> Result<(), RunnerError> {
             if !quiet {
@@ -128,7 +129,7 @@ impl WindowsVmConfig {
             let fetch_output = vm.run_powershell("cargo fetch --locked", quiet)?;
             if !fetch_output.status.success() {
                 if quiet {
-                    print_output(&fetch_output);
+                    CommandSpec::print_output(&fetch_output);
                 }
                 return Err(RunnerError::CargoFetchFailed {
                     code: fetch_output.status.code(),
@@ -182,10 +183,10 @@ fn allocate_free_port() -> Result<u16, Error> {
     Ok(port)
 }
 
-pub struct QemuInstance {
+pub(super) struct QemuInstance {
     child: Child,
-    pub host_port: u16,
-    pub config: WindowsVmConfig,
+    host_port: u16,
+    config: WindowsVmConfig,
 }
 
 impl Drop for QemuInstance {
@@ -196,7 +197,7 @@ impl Drop for QemuInstance {
 }
 
 impl QemuInstance {
-    pub fn start(config: WindowsVmConfig, snapshot: bool) -> Result<Self, RunnerError> {
+    pub(super) fn start(config: WindowsVmConfig, snapshot: bool) -> Result<Self, RunnerError> {
         let host_port = allocate_free_port().map_err(RunnerError::Io)?;
         let mut cmd = Command::new("qemu-system-x86_64");
 
@@ -207,7 +208,7 @@ impl QemuInstance {
             cmd.args(["-accel", "tcg"]);
         }
 
-        let cpus = num_cpus::get().max(1);
+        let cpus = get().max(1);
         cmd.args(["-smp", &cpus.to_string()]);
         cmd.args(["-m", "4096"]);
         cmd.args([
@@ -260,7 +261,7 @@ impl QemuInstance {
         cmd
     }
 
-    pub fn wait_for_ssh(&self) -> Result<(), RunnerError> {
+    pub(super) fn wait_for_ssh(&self) -> Result<(), RunnerError> {
         let start = Instant::now();
         let timeout = Duration::from_secs(60);
         let poll_interval = Duration::from_millis(500);
@@ -282,7 +283,7 @@ impl QemuInstance {
         Err(RunnerError::VmSshTimeout)
     }
 
-    pub fn clean_workspace(&self, quiet: bool) -> Result<(), RunnerError> {
+    pub(super) fn clean_workspace(&self, quiet: bool) -> Result<(), RunnerError> {
         let clean_cmd = "powershell -Command \"Set-Location C:\\; if (Test-Path 'C:\\workspace') { cmd.exe /c rd /s /q C:\\workspace; if (Test-Path 'C:\\workspace') { Remove-Item -Path 'C:\\workspace' -Recurse -Force } }; if (Test-Path 'C:\\workspace') { exit 1 }\"";
         let mut cmd = self.base_ssh_command(2);
         cmd.arg(clean_cmd);
@@ -290,7 +291,7 @@ impl QemuInstance {
         let output = cmd.output()?;
         if !output.status.success() {
             if !quiet {
-                print_output(&output);
+                CommandSpec::print_output(&output);
             }
             return Err(RunnerError::VmCleanWorkspaceFailed {
                 code: output.status.code(),
@@ -300,7 +301,7 @@ impl QemuInstance {
         Ok(())
     }
 
-    pub fn sync_workspace(&self, workspace_root: &Path) -> Result<(), RunnerError> {
+    pub(super) fn sync_workspace(&self, workspace_root: &Path) -> Result<(), RunnerError> {
         let mut tar_child = Command::new("tar")
             .args(["--exclude=image", "--exclude=target", "-cf", "-", "."])
             .current_dir(workspace_root)
@@ -337,7 +338,7 @@ impl QemuInstance {
         Ok(())
     }
 
-    pub fn run_powershell(&self, command: &str, quiet: bool) -> Result<Output, RunnerError> {
+    pub(super) fn run_powershell(&self, command: &str, quiet: bool) -> Result<Output, RunnerError> {
         let vm_cmd = format!(
             "powershell -Command \"Set-Location C:\\workspace; {command}; exit $LASTEXITCODE\""
         );
@@ -357,7 +358,11 @@ impl QemuInstance {
         }
     }
 
-    pub fn run_in_vm(&self, forward_args: &[String], quiet: bool) -> Result<Output, RunnerError> {
+    pub(super) fn run_in_vm(
+        &self,
+        forward_args: &[String],
+        quiet: bool,
+    ) -> Result<Output, RunnerError> {
         let escaped_args = forward_args
             .iter()
             .map(|arg| format!("'{}'", arg.replace('\'', "''")))
@@ -368,7 +373,7 @@ impl QemuInstance {
         self.run_powershell(&inner_cmd, quiet)
     }
 
-    pub fn shutdown_and_wait(mut self, timeout: Duration) -> Result<(), RunnerError> {
+    pub(super) fn shutdown_and_wait(mut self, timeout: Duration) -> Result<(), RunnerError> {
         let mut cmd = self.base_ssh_command(5);
         cmd.arg("shutdown /s /t 0");
         let _ = cmd.status();
