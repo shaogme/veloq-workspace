@@ -1,16 +1,26 @@
 //! Completion queue access for the Linux shared ring.
 
 use core::{marker::PhantomData, mem::size_of, sync::atomic::Ordering};
+use libc::{EINVAL, EOVERFLOW};
 
 use veloq_std::io::{Error, Result};
 
-use crate::{mmap::Mmap, squeue::SharedAtomicU32, sys};
+use crate::{
+    internal::{mmap::Mmap, squeue::SharedAtomicU32},
+    sys,
+};
+
+#[cfg(test)]
+use core::sync::atomic::AtomicU32;
+
+#[cfg(test)]
+use libc::EAGAIN;
 
 /// The 16-byte completion queue entry defined by the Linux ABI.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Entry {
-    pub(crate) inner: sys::IoUringCqe,
+    inner: sys::IoUringCqe,
 }
 
 /// Flags returned in a completion queue entry.
@@ -29,6 +39,22 @@ impl Flags {
     pub const NOTIF: Self = Self(sys::IORING_CQE_F_NOTIF);
     /// More buffers remain in the selected buffer bundle.
     pub const BUF_MORE: Self = Self(sys::IORING_CQE_F_BUF_MORE);
+
+    /// Return the buffer id encoded in CQE flags, if a buffer was selected.
+    #[inline]
+    pub fn buffer_id(flags: u32) -> Option<u16> {
+        if !Self::from_bits_retain(flags).contains(Self::BUFFER) {
+            None
+        } else {
+            Some((flags >> sys::IORING_CQE_BUFFER_SHIFT) as u16)
+        }
+    }
+
+    /// Whether a CQE belongs to a multishot request that remains active.
+    #[inline]
+    pub fn more(flags: u32) -> bool {
+        Self::from_bits_retain(flags).contains(Self::MORE)
+    }
 
     #[inline]
     pub const fn from_bits_retain(bits: u32) -> Self {
@@ -63,22 +89,6 @@ impl Entry {
     }
 }
 
-/// Return the buffer id encoded in CQE flags, if a buffer was selected.
-#[inline]
-pub fn buffer_select(flags: u32) -> Option<u16> {
-    if !Flags::from_bits_retain(flags).contains(Flags::BUFFER) {
-        None
-    } else {
-        Some((flags >> sys::IORING_CQE_BUFFER_SHIFT) as u16)
-    }
-}
-
-/// Whether a CQE belongs to a multishot request that remains active.
-#[inline]
-pub fn more(flags: u32) -> bool {
-    Flags::from_bits_retain(flags).contains(Flags::MORE)
-}
-
 pub(crate) struct Inner {
     head: SharedAtomicU32,
     tail: SharedAtomicU32,
@@ -87,6 +97,14 @@ pub(crate) struct Inner {
     overflow: SharedAtomicU32,
     cqes: *const Entry,
     flags: SharedAtomicU32,
+}
+
+/// A queue-local view of the completion ring.
+pub struct CompletionQueue<'ring> {
+    head: u32,
+    tail: u32,
+    queue: &'ring Inner,
+    _owner: PhantomData<&'ring mut Inner>,
 }
 
 impl Inner {
@@ -115,7 +133,7 @@ impl Inner {
             || ring_entries != params.cq_entries
             || ring_mask != ring_entries - 1
         {
-            return Err(Error::from_raw_os_error(libc::EINVAL));
+            return Err(Error::from_raw_os_error(EINVAL));
         }
         let overflow = unsafe {
             SharedAtomicU32::from_ptr(
@@ -126,7 +144,7 @@ impl Inner {
         };
         let cqes_len = (ring_entries as usize)
             .checked_mul(size_of::<Entry>())
-            .ok_or_else(|| Error::from_raw_os_error(libc::EOVERFLOW))?;
+            .ok_or_else(|| Error::from_raw_os_error(EOVERFLOW))?;
         let cqes = cq_mmap.range(params.cq_off.cqes, cqes_len)?.cast();
         let flags = unsafe {
             SharedAtomicU32::from_ptr(cq_mmap.range(params.cq_off.flags, size_of::<u32>())?.cast())
@@ -152,14 +170,6 @@ impl Inner {
             _owner: PhantomData,
         }
     }
-}
-
-/// A queue-local view of the completion ring.
-pub struct CompletionQueue<'ring> {
-    head: u32,
-    tail: u32,
-    queue: &'ring Inner,
-    _owner: PhantomData<&'ring mut Inner>,
 }
 
 impl CompletionQueue<'_> {
@@ -197,8 +207,7 @@ impl CompletionQueue<'_> {
 
     /// Copy and consume the next CQE.
     #[inline]
-    #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Option<Entry> {
+    fn take_next(&mut self) -> Option<Entry> {
         if self.head == self.tail {
             return None;
         }
@@ -221,7 +230,7 @@ impl Iterator for CompletionQueue<'_> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        CompletionQueue::next(self)
+        self.take_next()
     }
 }
 
@@ -240,81 +249,77 @@ impl Drop for CompletionQueue<'_> {
 }
 
 #[cfg(test)]
-mod tests {
-    use core::sync::atomic::AtomicU32;
+#[test]
+fn next_copies_cqe_and_publishes_consumed_head() {
+    let head = AtomicU32::new(0);
+    let tail = AtomicU32::new(1);
+    let overflow = AtomicU32::new(7);
+    let flags = AtomicU32::new(0);
+    let mut entries = [Entry {
+        inner: sys::IoUringCqe {
+            user_data: 42,
+            result: -EAGAIN,
+            flags: sys::IORING_CQE_F_BUFFER
+                | sys::IORING_CQE_F_MORE
+                | (9 << sys::IORING_CQE_BUFFER_SHIFT),
+            big_cqe: [],
+        },
+    }];
+    let inner = Inner {
+        head: unsafe { SharedAtomicU32::from_ptr(&head) },
+        tail: unsafe { SharedAtomicU32::from_ptr(&tail) },
+        ring_mask: 0,
+        ring_entries: 1,
+        overflow: unsafe { SharedAtomicU32::from_ptr(&overflow) },
+        cqes: entries.as_mut_ptr(),
+        flags: unsafe { SharedAtomicU32::from_ptr(&flags) },
+    };
 
-    use super::*;
+    let mut inner = inner;
+    let mut queue = inner.borrow();
+    let entry = queue.next().expect("one CQE");
+    assert_eq!(entry.user_data(), 42);
+    assert_eq!(entry.result(), -EAGAIN);
+    assert_eq!(Flags::buffer_id(entry.flags()), Some(9));
+    assert!(Flags::more(entry.flags()));
+    assert_eq!(queue.overflow(), 7);
+    assert!(queue.is_empty());
+    drop(queue);
+    assert_eq!(head.load(Ordering::Acquire), 1);
+}
 
-    #[test]
-    fn next_copies_cqe_and_publishes_consumed_head() {
-        let head = AtomicU32::new(0);
-        let tail = AtomicU32::new(1);
-        let overflow = AtomicU32::new(7);
-        let flags = AtomicU32::new(0);
-        let mut entries = [Entry {
-            inner: sys::IoUringCqe {
-                user_data: 42,
-                result: -libc::EAGAIN,
-                flags: sys::IORING_CQE_F_BUFFER
-                    | sys::IORING_CQE_F_MORE
-                    | (9 << sys::IORING_CQE_BUFFER_SHIFT),
-                big_cqe: [],
-            },
-        }];
-        let inner = Inner {
-            head: unsafe { SharedAtomicU32::from_ptr(&head) },
-            tail: unsafe { SharedAtomicU32::from_ptr(&tail) },
-            ring_mask: 0,
-            ring_entries: 1,
-            overflow: unsafe { SharedAtomicU32::from_ptr(&overflow) },
-            cqes: entries.as_mut_ptr(),
-            flags: unsafe { SharedAtomicU32::from_ptr(&flags) },
-        };
+#[cfg(test)]
+#[test]
+fn buffer_helpers_ignore_unrelated_flags() {
+    assert_eq!(Flags::buffer_id(0), None);
+    assert!(!Flags::more(0));
+}
 
-        let mut inner = inner;
-        let mut queue = inner.borrow();
-        let entry = queue.next().expect("one CQE");
-        assert_eq!(entry.user_data(), 42);
-        assert_eq!(entry.result(), -libc::EAGAIN);
-        assert_eq!(buffer_select(entry.flags()), Some(9));
-        assert!(more(entry.flags()));
-        assert_eq!(queue.overflow(), 7);
-        assert!(queue.is_empty());
-        drop(queue);
-        assert_eq!(head.load(Ordering::Acquire), 1);
-    }
+#[cfg(test)]
+#[test]
+fn wraparound_and_overflow_are_visible_without_losing_cqes() {
+    let head = AtomicU32::new(u32::MAX);
+    let tail = AtomicU32::new(1);
+    let overflow = AtomicU32::new(12);
+    let flags = AtomicU32::new(0);
+    let mut entries = [Entry::default(); 2];
+    entries[1].inner.user_data = 99;
+    let mut inner = Inner {
+        head: unsafe { SharedAtomicU32::from_ptr(&head) },
+        tail: unsafe { SharedAtomicU32::from_ptr(&tail) },
+        ring_mask: 1,
+        ring_entries: 2,
+        overflow: unsafe { SharedAtomicU32::from_ptr(&overflow) },
+        cqes: entries.as_mut_ptr(),
+        flags: unsafe { SharedAtomicU32::from_ptr(&flags) },
+    };
 
-    #[test]
-    fn buffer_helpers_ignore_unrelated_flags() {
-        assert_eq!(buffer_select(0), None);
-        assert!(!more(0));
-    }
-
-    #[test]
-    fn wraparound_and_overflow_are_visible_without_losing_cqes() {
-        let head = AtomicU32::new(u32::MAX);
-        let tail = AtomicU32::new(1);
-        let overflow = AtomicU32::new(12);
-        let flags = AtomicU32::new(0);
-        let mut entries = [Entry::default(); 2];
-        entries[1].inner.user_data = 99;
-        let mut inner = Inner {
-            head: unsafe { SharedAtomicU32::from_ptr(&head) },
-            tail: unsafe { SharedAtomicU32::from_ptr(&tail) },
-            ring_mask: 1,
-            ring_entries: 2,
-            overflow: unsafe { SharedAtomicU32::from_ptr(&overflow) },
-            cqes: entries.as_mut_ptr(),
-            flags: unsafe { SharedAtomicU32::from_ptr(&flags) },
-        };
-
-        let mut queue = inner.borrow();
-        assert_eq!(queue.len(), 2);
-        assert_eq!(queue.next().expect("wrapped CQE").user_data(), 99);
-        assert_eq!(queue.next().expect("second CQE").user_data(), 0);
-        assert_eq!(queue.overflow(), 12);
-        assert!(queue.is_empty());
-        drop(queue);
-        assert_eq!(head.load(Ordering::Acquire), 1);
-    }
+    let mut queue = inner.borrow();
+    assert_eq!(queue.len(), 2);
+    assert_eq!(queue.next().expect("wrapped CQE").user_data(), 99);
+    assert_eq!(queue.next().expect("second CQE").user_data(), 0);
+    assert_eq!(queue.overflow(), 12);
+    assert!(queue.is_empty());
+    drop(queue);
+    assert_eq!(head.load(Ordering::Acquire), 1);
 }

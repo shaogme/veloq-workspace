@@ -179,7 +179,7 @@ impl CompletionSlotRouter {
         // `IORING_CQE_F_MORE`：内核声明这个操作还会继续投递完成。flags 的解读到此为止，
         // core 只见 `CompletionContinuation`。
         // `IORING_CQE_F_MORE` means the kernel will continue this operation; only `CompletionContinuation` crosses into core.
-        let continuation = if cqueue::more(raw.flags()) {
+        let continuation = if cqueue::Flags::more(raw.flags()) {
             CompletionContinuation::More
         } else {
             CompletionContinuation::Final

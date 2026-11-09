@@ -60,7 +60,7 @@ impl<'provided, 'diagnostics> CqeEnv<'provided, 'diagnostics> {
         flags: u32,
         res: i32,
     ) -> UringResult<Option<ProvidedBufLease>> {
-        let selected = cqueue::buffer_select(flags).is_some();
+        let selected = cqueue::Flags::buffer_id(flags).is_some();
         match self.provided.as_mut() {
             Some(group) => {
                 let lease = group
@@ -149,7 +149,7 @@ impl<'provided, 'diagnostics> CqeEnv<'provided, 'diagnostics> {
         if !matches!(
             self.selected_buffer_state,
             SelectedBufferState::Unclaimed | SelectedBufferState::Claimed { .. }
-        ) || cqueue::buffer_select(flags).is_none()
+        ) || cqueue::Flags::buffer_id(flags).is_none()
         {
             return;
         }

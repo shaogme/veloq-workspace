@@ -5,15 +5,34 @@
 //! initialized, and at the same address until the kernel has consumed the request and emitted its
 //! CQE (or the request has been otherwise proven to be gone).
 
-use core::convert::TryFrom;
+mod control;
+
+pub use control::{AsyncCancel, Timeout};
+
+use core::{convert::TryFrom, mem::zeroed};
+use libc::{EOPNOTSUPP, EOVERFLOW, MSG_WAITALL, c_char, mode_t, msghdr, sockaddr, socklen_t};
 
 use veloq_std::io::{Error, ErrorKind, Result};
 
 use crate::{
-    squeue::{self, Entry},
+    internal::{
+        squeue::{self, Entry},
+        types::{Fd, FsyncFlags, UseFixed},
+    },
     sys,
-    types::{AsyncCancelFlags, Fd, FsyncFlags, TimeoutFlags, Timespec, UseFixed},
 };
+
+#[cfg(test)]
+use core::{
+    mem::{offset_of, size_of},
+    ptr,
+};
+
+#[cfg(test)]
+use libc::{MSG_TRUNC, sockaddr_storage};
+
+#[cfg(test)]
+use crate::internal::types::{self, AsyncCancelFlags, Fixed, TimeoutFlags, Timespec};
 
 const ACCEPT_FLAGS: u32 = libc::SOCK_CLOEXEC as u32
     | libc::SOCK_NONBLOCK as u32
@@ -28,12 +47,12 @@ fn invalid_input() -> Error {
 
 #[inline]
 fn unsupported() -> Error {
-    Error::from_raw_os_error(libc::EOPNOTSUPP)
+    Error::from_raw_os_error(EOPNOTSUPP)
 }
 
 #[inline]
 fn overflow() -> Error {
-    Error::from_raw_os_error(libc::EOVERFLOW)
+    Error::from_raw_os_error(EOVERFLOW)
 }
 
 #[inline]
@@ -53,7 +72,7 @@ fn validate_accept_flags(flags: i32) -> Result<()> {
 #[inline]
 fn sqe_zeroed() -> sys::IoUringSqe {
     // All SQE fields are integer or byte storage, so zero is a valid bit pattern.
-    unsafe { core::mem::zeroed() }
+    unsafe { zeroed() }
 }
 
 #[inline]
@@ -109,7 +128,7 @@ impl Nop {
         let mut sqe = sqe_zeroed();
         sqe.opcode = Self::CODE;
         sqe.fd = -1;
-        Ok(Entry { inner: sqe })
+        Ok(Entry::from_raw(sqe))
     }
 }
 
@@ -170,7 +189,7 @@ impl<T: UseFixed> Read<T> {
         sqe.off_or_addr2 = self.offset;
         sqe.op_flags = self.rw_flags as u32;
         set_buffer_group(&mut sqe, self.buf_group);
-        Ok(Entry { inner: sqe })
+        Ok(Entry::from_raw(sqe))
     }
 
     pub const CODE: u8 = sys::IORING_OP_READ;
@@ -226,7 +245,7 @@ impl<T: UseFixed> ReadFixed<T> {
         sqe.off_or_addr2 = self.offset;
         sqe.op_flags = self.rw_flags as u32;
         sqe.buf_index_group = self.buf_index.to_ne_bytes();
-        Ok(Entry { inner: sqe })
+        Ok(Entry::from_raw(sqe))
     }
 
     pub const CODE: u8 = sys::IORING_OP_READ_FIXED;
@@ -279,7 +298,7 @@ impl<T: UseFixed> Write<T> {
         sqe.len = self.len;
         sqe.off_or_addr2 = self.offset;
         sqe.op_flags = self.rw_flags as u32;
-        Ok(Entry { inner: sqe })
+        Ok(Entry::from_raw(sqe))
     }
 
     pub const CODE: u8 = sys::IORING_OP_WRITE;
@@ -335,7 +354,7 @@ impl<T: UseFixed> WriteFixed<T> {
         sqe.off_or_addr2 = self.offset;
         sqe.op_flags = self.rw_flags as u32;
         sqe.buf_index_group = self.buf_index.to_ne_bytes();
-        Ok(Entry { inner: sqe })
+        Ok(Entry::from_raw(sqe))
     }
 
     pub const CODE: u8 = sys::IORING_OP_WRITE_FIXED;
@@ -368,7 +387,7 @@ impl<T: UseFixed> Fsync<T> {
         validate_known_flags(self.flags.bits(), sys::IORING_FSYNC_DATASYNC)?;
         let mut sqe = entry_with_fd(Self::CODE, self.fd)?;
         sqe.op_flags = self.flags.bits();
-        Ok(Entry { inner: sqe })
+        Ok(Entry::from_raw(sqe))
     }
 
     pub const CODE: u8 = sys::IORING_OP_FSYNC;
@@ -413,7 +432,7 @@ impl<T: UseFixed> SyncFileRange<T> {
         sqe.len = self.len;
         sqe.off_or_addr2 = self.offset;
         sqe.op_flags = self.flags;
-        Ok(Entry { inner: sqe })
+        Ok(Entry::from_raw(sqe))
     }
 
     pub const CODE: u8 = sys::IORING_OP_SYNC_FILE_RANGE;
@@ -457,7 +476,7 @@ impl<T: UseFixed> Fallocate<T> {
         sqe.addr_or_splice_off_in = self.len;
         sqe.len = self.mode as u32;
         sqe.off_or_addr2 = self.offset;
-        Ok(Entry { inner: sqe })
+        Ok(Entry::from_raw(sqe))
     }
 
     pub const CODE: u8 = sys::IORING_OP_FALLOCATE;
@@ -467,9 +486,9 @@ impl<T: UseFixed> Fallocate<T> {
 #[derive(Debug)]
 pub struct OpenAt {
     dirfd: Fd,
-    pathname: *const libc::c_char,
+    pathname: *const c_char,
     flags: i32,
-    mode: libc::mode_t,
+    mode: mode_t,
 }
 
 impl OpenAt {
@@ -480,7 +499,7 @@ impl OpenAt {
     /// `pathname` must point to a NUL-terminated path that remains valid and unmoved until the
     /// kernel has finished the request.
     #[inline]
-    pub unsafe fn new(dirfd: Fd, pathname: *const libc::c_char) -> Self {
+    pub unsafe fn new(dirfd: Fd, pathname: *const c_char) -> Self {
         Self {
             dirfd,
             pathname,
@@ -496,7 +515,7 @@ impl OpenAt {
     }
 
     #[inline]
-    pub const fn mode(mut self, mode: libc::mode_t) -> Self {
+    pub const fn mode(mut self, mode: mode_t) -> Self {
         self.mode = mode;
         self
     }
@@ -505,11 +524,11 @@ impl OpenAt {
     pub fn build(self) -> Result<Entry> {
         let mut sqe = sqe_zeroed();
         sqe.opcode = Self::CODE;
-        sqe.fd = self.dirfd.0;
+        sqe.fd = self.dirfd.as_raw_fd();
         sqe.addr_or_splice_off_in = self.pathname as usize as u64;
         sqe.len = self.mode;
         sqe.op_flags = self.flags as u32;
-        Ok(Entry { inner: sqe })
+        Ok(Entry::from_raw(sqe))
     }
 
     pub const CODE: u8 = sys::IORING_OP_OPENAT;
@@ -538,7 +557,7 @@ impl<T: UseFixed> Close<T> {
         } else {
             return Err(invalid_input());
         }
-        Ok(Entry { inner: sqe })
+        Ok(Entry::from_raw(sqe))
     }
 
     pub const CODE: u8 = sys::IORING_OP_CLOSE;
@@ -592,7 +611,7 @@ impl<T: UseFixed> Recv<T> {
         sqe.len = self.len;
         sqe.op_flags = self.flags as u32;
         set_buffer_group(&mut sqe, self.buf_group);
-        Ok(Entry { inner: sqe })
+        Ok(Entry::from_raw(sqe))
     }
 
     pub const CODE: u8 = sys::IORING_OP_RECV;
@@ -632,7 +651,7 @@ impl<T: UseFixed> RecvMulti<T> {
 
     #[inline]
     pub fn build(self) -> Result<Entry> {
-        if self.flags & libc::MSG_WAITALL != 0 {
+        if self.flags & MSG_WAITALL != 0 {
             return Err(invalid_input());
         }
         let mut sqe = entry_with_fd(Self::CODE, self.fd)?;
@@ -641,7 +660,7 @@ impl<T: UseFixed> RecvMulti<T> {
         set_buffer_group(&mut sqe, self.buf_group);
         sqe.flags |= squeue::Flags::BUFFER_SELECT.bits();
         sqe.ioprio = sys::IORING_RECV_MULTISHOT as u16;
-        Ok(Entry { inner: sqe })
+        Ok(Entry::from_raw(sqe))
     }
 
     pub const CODE: u8 = sys::IORING_OP_RECV;
@@ -685,7 +704,7 @@ impl<T: UseFixed> Send<T> {
         sqe.addr_or_splice_off_in = self.buf as usize as u64;
         sqe.len = self.len;
         sqe.op_flags = self.flags as u32;
-        Ok(Entry { inner: sqe })
+        Ok(Entry::from_raw(sqe))
     }
 
     pub const CODE: u8 = sys::IORING_OP_SEND;
@@ -695,8 +714,8 @@ impl<T: UseFixed> Send<T> {
 #[derive(Debug)]
 pub struct Connect<T: UseFixed = Fd> {
     fd: T,
-    addr: *const libc::sockaddr,
-    addrlen: libc::socklen_t,
+    addr: *const sockaddr,
+    addrlen: socklen_t,
 }
 
 impl<T: UseFixed> Connect<T> {
@@ -707,7 +726,7 @@ impl<T: UseFixed> Connect<T> {
     /// `addr` must point to an initialized socket address containing at least `addrlen` bytes and
     /// must remain valid and unmoved until the kernel has finished the request.
     #[inline]
-    pub unsafe fn new(fd: T, addr: *const libc::sockaddr, addrlen: libc::socklen_t) -> Self {
+    pub unsafe fn new(fd: T, addr: *const sockaddr, addrlen: socklen_t) -> Self {
         Self { fd, addr, addrlen }
     }
 
@@ -716,7 +735,7 @@ impl<T: UseFixed> Connect<T> {
         let mut sqe = entry_with_fd(Self::CODE, self.fd)?;
         sqe.addr_or_splice_off_in = self.addr as usize as u64;
         sqe.off_or_addr2 = self.addrlen as u64;
-        Ok(Entry { inner: sqe })
+        Ok(Entry::from_raw(sqe))
     }
 
     pub const CODE: u8 = sys::IORING_OP_CONNECT;
@@ -726,8 +745,8 @@ impl<T: UseFixed> Connect<T> {
 #[derive(Debug)]
 pub struct Accept<T: UseFixed = Fd> {
     fd: T,
-    addr: *mut libc::sockaddr,
-    addrlen: *mut libc::socklen_t,
+    addr: *mut sockaddr,
+    addrlen: *mut socklen_t,
     flags: i32,
 }
 
@@ -739,7 +758,7 @@ impl<T: UseFixed> Accept<T> {
     /// `addr` and `addrlen` must point to writable storage valid until the kernel has finished the
     /// request. `addrlen` must be initialized as required by `accept4(2)`.
     #[inline]
-    pub unsafe fn new(fd: T, addr: *mut libc::sockaddr, addrlen: *mut libc::socklen_t) -> Self {
+    pub unsafe fn new(fd: T, addr: *mut sockaddr, addrlen: *mut socklen_t) -> Self {
         Self {
             fd,
             addr,
@@ -761,7 +780,7 @@ impl<T: UseFixed> Accept<T> {
         sqe.addr_or_splice_off_in = self.addr as usize as u64;
         sqe.off_or_addr2 = self.addrlen as usize as u64;
         sqe.op_flags = self.flags as u32;
-        Ok(Entry { inner: sqe })
+        Ok(Entry::from_raw(sqe))
     }
 
     pub const CODE: u8 = sys::IORING_OP_ACCEPT;
@@ -792,7 +811,7 @@ impl<T: UseFixed> AcceptMulti<T> {
         let mut sqe = entry_with_fd(Self::CODE, self.fd)?;
         sqe.ioprio = sys::IORING_ACCEPT_MULTISHOT as u16;
         sqe.op_flags = self.flags as u32;
-        Ok(Entry { inner: sqe })
+        Ok(Entry::from_raw(sqe))
     }
 
     pub const CODE: u8 = sys::IORING_OP_ACCEPT;
@@ -802,7 +821,7 @@ impl<T: UseFixed> AcceptMulti<T> {
 #[derive(Debug)]
 pub struct SendMsg<T: UseFixed = Fd> {
     fd: T,
-    msg: *const libc::msghdr,
+    msg: *const msghdr,
     flags: u32,
 }
 
@@ -814,7 +833,7 @@ impl<T: UseFixed> SendMsg<T> {
     /// `msg` and every buffer reachable through the message must remain initialized, valid, and at
     /// the same addresses until the kernel has finished the request.
     #[inline]
-    pub unsafe fn new(fd: T, msg: *const libc::msghdr) -> Self {
+    pub unsafe fn new(fd: T, msg: *const msghdr) -> Self {
         Self { fd, msg, flags: 0 }
     }
 
@@ -830,7 +849,7 @@ impl<T: UseFixed> SendMsg<T> {
         sqe.addr_or_splice_off_in = self.msg as usize as u64;
         sqe.len = 1;
         sqe.op_flags = self.flags;
-        Ok(Entry { inner: sqe })
+        Ok(Entry::from_raw(sqe))
     }
 
     pub const CODE: u8 = sys::IORING_OP_SENDMSG;
@@ -840,7 +859,7 @@ impl<T: UseFixed> SendMsg<T> {
 #[derive(Debug)]
 pub struct RecvMsg<T: UseFixed = Fd> {
     fd: T,
-    msg: *mut libc::msghdr,
+    msg: *mut msghdr,
     flags: u32,
     buf_group: u16,
 }
@@ -853,7 +872,7 @@ impl<T: UseFixed> RecvMsg<T> {
     /// `msg` and every writable buffer reachable through the message must remain initialized,
     /// valid, and at the same addresses until the kernel has finished the request.
     #[inline]
-    pub unsafe fn new(fd: T, msg: *mut libc::msghdr) -> Self {
+    pub unsafe fn new(fd: T, msg: *mut msghdr) -> Self {
         Self {
             fd,
             msg,
@@ -881,7 +900,7 @@ impl<T: UseFixed> RecvMsg<T> {
         sqe.len = 1;
         sqe.op_flags = self.flags;
         set_buffer_group(&mut sqe, self.buf_group);
-        Ok(Entry { inner: sqe })
+        Ok(Entry::from_raw(sqe))
     }
 
     pub const CODE: u8 = sys::IORING_OP_RECVMSG;
@@ -891,7 +910,7 @@ impl<T: UseFixed> RecvMsg<T> {
 #[derive(Debug)]
 pub struct RecvMsgMulti<T: UseFixed = Fd> {
     fd: T,
-    msg: *mut libc::msghdr,
+    msg: *mut msghdr,
     flags: u32,
     buf_group: u16,
 }
@@ -904,7 +923,7 @@ impl<T: UseFixed> RecvMsgMulti<T> {
     /// `msg` and every writable buffer reachable through the message must remain initialized,
     /// valid, and at the same addresses until the kernel has finished the request.
     #[inline]
-    pub unsafe fn new(fd: T, msg: *mut libc::msghdr) -> Self {
+    pub unsafe fn new(fd: T, msg: *mut msghdr) -> Self {
         Self {
             fd,
             msg,
@@ -930,7 +949,7 @@ impl<T: UseFixed> RecvMsgMulti<T> {
         if self.flags > i32::MAX as u32 {
             return Err(overflow());
         }
-        if self.flags & libc::MSG_WAITALL as u32 != 0 {
+        if self.flags & MSG_WAITALL as u32 != 0 {
             return Err(invalid_input());
         }
         let mut sqe = entry_with_fd(Self::CODE, self.fd)?;
@@ -940,347 +959,211 @@ impl<T: UseFixed> RecvMsgMulti<T> {
         set_buffer_group(&mut sqe, self.buf_group);
         sqe.flags |= squeue::Flags::BUFFER_SELECT.bits();
         sqe.ioprio = sys::IORING_RECV_MULTISHOT as u16;
-        Ok(Entry { inner: sqe })
+        Ok(Entry::from_raw(sqe))
     }
 
     pub const CODE: u8 = sys::IORING_OP_RECVMSG;
 }
 
-/// Register a timeout operation.
-#[derive(Debug)]
-pub struct Timeout {
-    timespec: *const Timespec,
-    count: u32,
-    flags: TimeoutFlags,
-}
-
-impl Timeout {
-    /// Create a timeout request.
-    ///
-    /// # Safety
-    ///
-    /// `timespec` must point to an initialized [`Timespec`] that remains valid and unmoved until
-    /// the kernel has finished the request.
-    #[inline]
-    pub unsafe fn new(timespec: *const Timespec) -> Self {
-        Self {
-            timespec,
-            count: 0,
-            flags: TimeoutFlags::empty(),
-        }
-    }
-
-    #[inline]
-    pub const fn count(mut self, count: u32) -> Self {
-        self.count = count;
-        self
-    }
-
-    #[inline]
-    pub const fn flags(mut self, flags: TimeoutFlags) -> Self {
-        self.flags = flags;
-        self
-    }
-
-    fn validate_flags(flags: TimeoutFlags) -> Result<()> {
-        let bits = flags.bits();
-        let known = sys::IORING_TIMEOUT_ABS
-            | sys::IORING_TIMEOUT_UPDATE
-            | sys::IORING_TIMEOUT_BOOTTIME
-            | sys::IORING_TIMEOUT_REALTIME
-            | sys::IORING_LINK_TIMEOUT_UPDATE
-            | sys::IORING_TIMEOUT_ETIME_SUCCESS
-            | sys::IORING_TIMEOUT_MULTISHOT;
-        validate_known_flags(bits, known)?;
-        if (bits & sys::IORING_TIMEOUT_CLOCK_MASK).count_ones() > 1 {
-            return Err(invalid_input());
-        }
-        if bits & sys::IORING_TIMEOUT_UPDATE_MASK != 0 {
-            return Err(unsupported());
-        }
-        Ok(())
-    }
-
-    #[inline]
-    pub fn build(self) -> Result<Entry> {
-        Self::validate_flags(self.flags)?;
-        let mut sqe = sqe_zeroed();
-        sqe.opcode = Self::CODE;
-        sqe.fd = -1;
-        sqe.addr_or_splice_off_in = self.timespec as usize as u64;
-        sqe.len = 1;
-        sqe.off_or_addr2 = self.count as u64;
-        sqe.op_flags = self.flags.bits();
-        Ok(Entry { inner: sqe })
-    }
-
-    pub const CODE: u8 = sys::IORING_OP_TIMEOUT;
-}
-
-/// Cancel an existing request identified by its user data.
-#[derive(Debug)]
-pub struct AsyncCancel {
-    user_data: u64,
-    flags: AsyncCancelFlags,
-}
-
-impl AsyncCancel {
-    #[inline]
-    pub fn new(user_data: u64) -> Self {
-        Self {
-            user_data,
-            flags: AsyncCancelFlags::empty(),
-        }
-    }
-
-    #[inline]
-    pub const fn flags(mut self, flags: AsyncCancelFlags) -> Self {
-        self.flags = flags;
-        self
-    }
-
-    fn validate_flags(flags: AsyncCancelFlags) -> Result<()> {
-        let bits = flags.bits();
-        let known = sys::IORING_ASYNC_CANCEL_ALL
-            | sys::IORING_ASYNC_CANCEL_FD
-            | sys::IORING_ASYNC_CANCEL_ANY
-            | sys::IORING_ASYNC_CANCEL_FD_FIXED
-            | sys::IORING_ASYNC_CANCEL_USERDATA
-            | sys::IORING_ASYNC_CANCEL_OP;
-        validate_known_flags(bits, known)?;
-        let selectors = sys::IORING_ASYNC_CANCEL_FD
-            | sys::IORING_ASYNC_CANCEL_FD_FIXED
-            | sys::IORING_ASYNC_CANCEL_USERDATA
-            | sys::IORING_ASYNC_CANCEL_OP;
-        if bits & sys::IORING_ASYNC_CANCEL_ANY != 0 && bits & selectors != 0 {
-            return Err(invalid_input());
-        }
-        if bits & sys::IORING_ASYNC_CANCEL_FD != 0 && bits & sys::IORING_ASYNC_CANCEL_FD_FIXED != 0
-        {
-            return Err(invalid_input());
-        }
-        if bits & (sys::IORING_ASYNC_CANCEL_FD | sys::IORING_ASYNC_CANCEL_FD_FIXED) != 0 {
-            // This builder deliberately has no fd selector; accepting these flags would encode
-            // -1 as a real selector and cancel an unrelated request.
-            return Err(unsupported());
-        }
-        Ok(())
-    }
-
-    #[inline]
-    pub fn build(self) -> Result<Entry> {
-        Self::validate_flags(self.flags)?;
-        let mut sqe = sqe_zeroed();
-        sqe.opcode = Self::CODE;
-        sqe.fd = -1;
-        sqe.addr_or_splice_off_in = self.user_data;
-        sqe.op_flags = self.flags.bits();
-        Ok(Entry { inner: sqe })
-    }
-
-    pub const CODE: u8 = sys::IORING_OP_ASYNC_CANCEL;
+#[cfg(test)]
+fn raw(entry: &Entry) -> &sys::IoUringSqe {
+    entry.raw()
 }
 
 #[cfg(test)]
-mod tests {
-    use core::{
-        mem::{offset_of, size_of},
-        ptr,
-    };
+#[test]
+fn nop_has_only_the_kernel_required_fields() {
+    let entry = Nop::new().build().expect("NOP must always build");
+    let sqe = raw(&entry);
+    assert_eq!(sqe.opcode, Nop::CODE);
+    assert_eq!(sqe.fd, -1);
+    assert_eq!(sqe.flags, 0);
+    assert_eq!(sqe.ioprio, 0);
+    assert_eq!(sqe.user_data, 0);
+    assert_eq!(sqe.command, [0, 0]);
+}
 
-    use super::*;
-    use crate::types::{self, Fixed};
+#[cfg(test)]
+#[test]
+fn file_opcode_layouts_match_kernel_fields() {
+    let mut buffer = [0_u8; 32];
+    let entry = unsafe { ReadFixed::new(Fixed::new(7), buffer.as_mut_ptr(), 32, 9) }
+        .offset(11)
+        .build()
+        .expect("valid fixed descriptor");
+    let sqe = raw(&entry);
+    assert_eq!(sqe.opcode, ReadFixed::<types::Fixed>::CODE);
+    assert_eq!(sqe.fd, 7);
+    assert_eq!(sqe.flags, squeue::Flags::FIXED_FILE.bits());
+    assert_eq!(sqe.len, 32);
+    assert_eq!(sqe.off_or_addr2, 11);
+    assert_eq!(sqe.buf_index_group, 9_u16.to_ne_bytes());
+    assert_eq!(offset_of!(sys::IoUringSqe, user_data), 32);
+}
 
-    fn raw(entry: &Entry) -> &sys::IoUringSqe {
-        &entry.inner
-    }
+#[cfg(test)]
+#[test]
+fn fixed_fd_encoding_rejects_values_that_do_not_fit_sqes() {
+    let error = Close::new(Fixed::new(u32::MAX))
+        .build()
+        .expect_err("index overflow");
+    assert_eq!(error.raw_os_error(), Some(EOVERFLOW));
 
-    #[test]
-    fn nop_has_only_the_kernel_required_fields() {
-        let entry = Nop::new().build().expect("NOP must always build");
-        let sqe = raw(&entry);
-        assert_eq!(sqe.opcode, Nop::CODE);
-        assert_eq!(sqe.fd, -1);
-        assert_eq!(sqe.flags, 0);
-        assert_eq!(sqe.ioprio, 0);
-        assert_eq!(sqe.user_data, 0);
-        assert_eq!(sqe.command, [0, 0]);
-    }
+    let mut buffer = [0_u8; 1];
+    let error = unsafe { Read::new(Fixed::new(u32::MAX), buffer.as_mut_ptr(), 0) }
+        .build()
+        .expect_err("index overflow");
+    assert_eq!(error.raw_os_error(), Some(EOVERFLOW));
+}
 
-    #[test]
-    fn file_opcode_layouts_match_kernel_fields() {
-        let mut buffer = [0_u8; 32];
-        let entry = unsafe { ReadFixed::new(Fixed(7), buffer.as_mut_ptr(), 32, 9) }
-            .offset(11)
-            .build()
-            .expect("valid fixed descriptor");
-        let sqe = raw(&entry);
-        assert_eq!(sqe.opcode, ReadFixed::<types::Fixed>::CODE);
-        assert_eq!(sqe.fd, 7);
-        assert_eq!(sqe.flags, squeue::Flags::FIXED_FILE.bits());
-        assert_eq!(sqe.len, 32);
-        assert_eq!(sqe.off_or_addr2, 11);
-        assert_eq!(sqe.buf_index_group, 9_u16.to_ne_bytes());
-        assert_eq!(offset_of!(sys::IoUringSqe, user_data), 32);
-    }
+#[cfg(test)]
+#[test]
+fn multishot_recv_selects_provided_buffers() {
+    let entry = RecvMulti::new(Fd::new(4), 13)
+        .build()
+        .expect("valid multishot request");
+    let sqe = raw(&entry);
+    assert_eq!(sqe.opcode, RecvMulti::<types::Fd>::CODE);
+    assert_eq!(sqe.ioprio, sys::IORING_RECV_MULTISHOT as u16);
+    assert_eq!(sqe.flags, squeue::Flags::BUFFER_SELECT.bits());
+    assert_eq!(sqe.buf_index_group, 13_u16.to_ne_bytes());
+}
 
-    #[test]
-    fn fixed_fd_encoding_rejects_values_that_do_not_fit_sqes() {
-        let error = Close::new(Fixed(u32::MAX))
-            .build()
-            .expect_err("index overflow");
-        assert_eq!(error.raw_os_error(), Some(libc::EOVERFLOW));
+#[cfg(test)]
+#[test]
+fn multishot_recv_rejects_msg_waitall() {
+    let error = RecvMulti::new(Fd::new(4), 13)
+        .flags(MSG_WAITALL)
+        .build()
+        .expect_err("MSG_WAITALL is incompatible with multishot recv");
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+}
 
-        let mut buffer = [0_u8; 1];
-        let error = unsafe { Read::new(Fixed(u32::MAX), buffer.as_mut_ptr(), 0) }
-            .build()
-            .expect_err("index overflow");
-        assert_eq!(error.raw_os_error(), Some(libc::EOVERFLOW));
-    }
+#[cfg(test)]
+#[test]
+fn multishot_recvmsg_selects_provided_buffers_and_preserves_message_pointer() {
+    let mut message: msghdr = unsafe { zeroed() };
+    let entry = unsafe { RecvMsgMulti::new(Fd::new(4), ptr::addr_of_mut!(message)) }
+        .flags(MSG_TRUNC as u32)
+        .buf_group(19)
+        .build()
+        .expect("valid multishot recvmsg request");
+    let sqe = raw(&entry);
+    assert_eq!(sqe.opcode, RecvMsgMulti::<types::Fd>::CODE);
+    assert_eq!(sqe.ioprio, sys::IORING_RECV_MULTISHOT as u16);
+    assert_eq!(sqe.flags, squeue::Flags::BUFFER_SELECT.bits());
+    assert_eq!(sqe.buf_index_group, 19_u16.to_ne_bytes());
+    assert_eq!(
+        sqe.addr_or_splice_off_in,
+        ptr::addr_of_mut!(message) as usize as u64
+    );
+    assert_eq!(sqe.len, 1);
+    assert_eq!(sqe.op_flags, MSG_TRUNC as u32);
+}
 
-    #[test]
-    fn multishot_recv_selects_provided_buffers() {
-        let entry = RecvMulti::new(Fd(4), 13)
-            .build()
-            .expect("valid multishot request");
-        let sqe = raw(&entry);
-        assert_eq!(sqe.opcode, RecvMulti::<types::Fd>::CODE);
-        assert_eq!(sqe.ioprio, sys::IORING_RECV_MULTISHOT as u16);
-        assert_eq!(sqe.flags, squeue::Flags::BUFFER_SELECT.bits());
-        assert_eq!(sqe.buf_index_group, 13_u16.to_ne_bytes());
-    }
+#[cfg(test)]
+#[test]
+fn multishot_recvmsg_rejects_msg_waitall_and_flag_overflow() {
+    let mut message: msghdr = unsafe { zeroed() };
+    let waitall = unsafe { RecvMsgMulti::new(Fd::new(4), ptr::addr_of_mut!(message)) }
+        .flags(MSG_WAITALL as u32)
+        .build()
+        .expect_err("MSG_WAITALL is incompatible with multishot recvmsg");
+    assert_eq!(waitall.kind(), ErrorKind::InvalidInput);
 
-    #[test]
-    fn multishot_recv_rejects_msg_waitall() {
-        let error = RecvMulti::new(Fd(4), 13)
-            .flags(libc::MSG_WAITALL)
-            .build()
-            .expect_err("MSG_WAITALL is incompatible with multishot recv");
-        assert_eq!(error.kind(), ErrorKind::InvalidInput);
-    }
+    let overflow = unsafe { RecvMsgMulti::new(Fd::new(4), ptr::addr_of_mut!(message)) }
+        .flags(i32::MAX as u32 + 1)
+        .build()
+        .expect_err("recvmsg flags must fit the kernel signed field");
+    assert_eq!(overflow.raw_os_error(), Some(EOVERFLOW));
+}
 
-    #[test]
-    fn multishot_recvmsg_selects_provided_buffers_and_preserves_message_pointer() {
-        let mut message: libc::msghdr = unsafe { core::mem::zeroed() };
-        let entry = unsafe { RecvMsgMulti::new(Fd(4), ptr::addr_of_mut!(message)) }
-            .flags(libc::MSG_TRUNC as u32)
-            .buf_group(19)
-            .build()
-            .expect("valid multishot recvmsg request");
-        let sqe = raw(&entry);
-        assert_eq!(sqe.opcode, RecvMsgMulti::<types::Fd>::CODE);
-        assert_eq!(sqe.ioprio, sys::IORING_RECV_MULTISHOT as u16);
-        assert_eq!(sqe.flags, squeue::Flags::BUFFER_SELECT.bits());
-        assert_eq!(sqe.buf_index_group, 19_u16.to_ne_bytes());
-        assert_eq!(
-            sqe.addr_or_splice_off_in,
-            ptr::addr_of_mut!(message) as usize as u64
-        );
-        assert_eq!(sqe.len, 1);
-        assert_eq!(sqe.op_flags, libc::MSG_TRUNC as u32);
-    }
+#[cfg(test)]
+#[test]
+fn timeout_rejects_unknown_and_conflicting_flags() {
+    let timespec = Timespec::new();
+    let unknown = unsafe { Timeout::new(&timespec) }
+        .flags(TimeoutFlags::from_bits_retain(1 << 31))
+        .build()
+        .expect_err("unknown timeout flags");
+    assert_eq!(unknown.kind(), ErrorKind::Unsupported);
 
-    #[test]
-    fn multishot_recvmsg_rejects_msg_waitall_and_flag_overflow() {
-        let mut message: libc::msghdr = unsafe { core::mem::zeroed() };
-        let waitall = unsafe { RecvMsgMulti::new(Fd(4), ptr::addr_of_mut!(message)) }
-            .flags(libc::MSG_WAITALL as u32)
-            .build()
-            .expect_err("MSG_WAITALL is incompatible with multishot recvmsg");
-        assert_eq!(waitall.kind(), ErrorKind::InvalidInput);
+    let clocks = unsafe { Timeout::new(&timespec) }
+        .flags(TimeoutFlags::BOOTTIME.union(TimeoutFlags::REALTIME))
+        .build()
+        .expect_err("two timeout clocks");
+    assert_eq!(clocks.kind(), ErrorKind::InvalidInput);
+}
 
-        let overflow = unsafe { RecvMsgMulti::new(Fd(4), ptr::addr_of_mut!(message)) }
-            .flags(i32::MAX as u32 + 1)
-            .build()
-            .expect_err("recvmsg flags must fit the kernel signed field");
-        assert_eq!(overflow.raw_os_error(), Some(libc::EOVERFLOW));
-    }
+#[cfg(test)]
+#[test]
+fn cancel_rejects_selector_without_a_matching_fd_field() {
+    let error = AsyncCancel::new(42)
+        .flags(AsyncCancelFlags::FD)
+        .build()
+        .expect_err("FD cancellation needs an fd selector");
+    assert_eq!(error.kind(), ErrorKind::Unsupported);
+}
 
-    #[test]
-    fn timeout_rejects_unknown_and_conflicting_flags() {
-        let timespec = Timespec::new();
-        let unknown = unsafe { Timeout::new(&timespec) }
-            .flags(TimeoutFlags::from_bits_retain(1 << 31))
-            .build()
-            .expect_err("unknown timeout flags");
-        assert_eq!(unknown.kind(), ErrorKind::Unsupported);
-
-        let clocks = unsafe { Timeout::new(&timespec) }
-            .flags(TimeoutFlags::BOOTTIME.union(TimeoutFlags::REALTIME))
-            .build()
-            .expect_err("two timeout clocks");
-        assert_eq!(clocks.kind(), ErrorKind::InvalidInput);
-    }
-
-    #[test]
-    fn cancel_rejects_selector_without_a_matching_fd_field() {
-        let error = AsyncCancel::new(42)
-            .flags(AsyncCancelFlags::FD)
-            .build()
-            .expect_err("FD cancellation needs an fd selector");
-        assert_eq!(error.kind(), ErrorKind::Unsupported);
-    }
-
-    #[test]
-    fn every_pointer_builder_starts_with_zero_user_data() {
-        let mut buffer = [0_u8; 8];
-        let path = [0_i8];
-        let mut address: libc::sockaddr_storage = unsafe { core::mem::zeroed() };
-        let mut address_len = core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-        let mut message: libc::msghdr = unsafe { core::mem::zeroed() };
-        let timespec = Timespec::new();
-        let entries = [
-            unsafe { Read::new(Fd(1), buffer.as_mut_ptr(), 0) }
-                .build()
-                .unwrap(),
-            unsafe { Write::new(Fd(1), buffer.as_ptr(), 0) }
-                .build()
-                .unwrap(),
-            Fsync::new(Fd(1)).build().unwrap(),
-            SyncFileRange::new(Fd(1), 0).build().unwrap(),
-            Fallocate::new(Fd(1), 0).build().unwrap(),
-            unsafe { OpenAt::new(Fd(-100), path.as_ptr()) }
-                .build()
-                .unwrap(),
-            Close::new(Fd(1)).build().unwrap(),
-            unsafe { Recv::new(Fd(1), buffer.as_mut_ptr(), 0) }
-                .build()
-                .unwrap(),
-            unsafe { Send::new(Fd(1), buffer.as_ptr(), 0) }
-                .build()
-                .unwrap(),
-            unsafe {
-                Connect::new(
-                    Fd(1),
-                    ptr::addr_of!(address).cast(),
-                    core::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
-                )
-            }
+#[test]
+fn every_pointer_builder_starts_with_zero_user_data() {
+    let mut buffer = [0_u8; 8];
+    let path = [0_i8];
+    let mut address: sockaddr_storage = unsafe { zeroed() };
+    let mut address_len = size_of::<sockaddr_storage>() as socklen_t;
+    let mut message: msghdr = unsafe { zeroed() };
+    let timespec = Timespec::new();
+    let entries = [
+        unsafe { Read::new(Fd::new(1), buffer.as_mut_ptr(), 0) }
             .build()
             .unwrap(),
-            unsafe {
-                Accept::new(
-                    Fd(1),
-                    ptr::addr_of_mut!(address).cast(),
-                    ptr::addr_of_mut!(address_len),
-                )
-            }
+        unsafe { Write::new(Fd::new(1), buffer.as_ptr(), 0) }
             .build()
             .unwrap(),
-            AcceptMulti::new(Fd(1)).build().unwrap(),
-            unsafe { SendMsg::new(Fd(1), ptr::addr_of!(message)) }
-                .build()
-                .unwrap(),
-            unsafe { RecvMsg::new(Fd(1), ptr::addr_of_mut!(message)) }
-                .build()
-                .unwrap(),
-            unsafe { RecvMsgMulti::new(Fd(1), ptr::addr_of_mut!(message)) }
-                .build()
-                .unwrap(),
-            unsafe { Timeout::new(&timespec) }.build().unwrap(),
-            AsyncCancel::new(1).build().unwrap(),
-        ];
-        assert!(entries.iter().all(|entry| entry.get_user_data() == 0));
-        assert_eq!(size_of::<Entry>(), 64);
-    }
+        Fsync::new(Fd::new(1)).build().unwrap(),
+        SyncFileRange::new(Fd::new(1), 0).build().unwrap(),
+        Fallocate::new(Fd::new(1), 0).build().unwrap(),
+        unsafe { OpenAt::new(Fd::new(-100), path.as_ptr()) }
+            .build()
+            .unwrap(),
+        Close::new(Fd::new(1)).build().unwrap(),
+        unsafe { Recv::new(Fd::new(1), buffer.as_mut_ptr(), 0) }
+            .build()
+            .unwrap(),
+        unsafe { Send::new(Fd::new(1), buffer.as_ptr(), 0) }
+            .build()
+            .unwrap(),
+        unsafe {
+            Connect::new(
+                Fd::new(1),
+                ptr::addr_of!(address).cast(),
+                size_of::<sockaddr_storage>() as socklen_t,
+            )
+        }
+        .build()
+        .unwrap(),
+        unsafe {
+            Accept::new(
+                Fd::new(1),
+                ptr::addr_of_mut!(address).cast(),
+                ptr::addr_of_mut!(address_len),
+            )
+        }
+        .build()
+        .unwrap(),
+        AcceptMulti::new(Fd::new(1)).build().unwrap(),
+        unsafe { SendMsg::new(Fd::new(1), ptr::addr_of!(message)) }
+            .build()
+            .unwrap(),
+        unsafe { RecvMsg::new(Fd::new(1), ptr::addr_of_mut!(message)) }
+            .build()
+            .unwrap(),
+        unsafe { RecvMsgMulti::new(Fd::new(1), ptr::addr_of_mut!(message)) }
+            .build()
+            .unwrap(),
+        unsafe { Timeout::new(&timespec) }.build().unwrap(),
+        AsyncCancel::new(1).build().unwrap(),
+    ];
+    assert!(entries.iter().all(|entry| entry.get_user_data() == 0));
+    assert_eq!(size_of::<Entry>(), 64);
 }

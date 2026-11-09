@@ -1,9 +1,10 @@
 #![cfg(target_os = "linux")]
 
+use libc::ECANCELED;
 use std::{env, fs::File, os::fd::AsRawFd, thread};
 
 use veloq_io_uring::{
-    IoUring, SetupFlags, SetupPolicy, SubmitReceipt, cqueue, opcode,
+    IoUring, RingConfig, SetupFlags, SetupPolicy, SubmitReceipt, cqueue, opcode,
     types::{AsyncCancelFlags, Fd, Timespec},
 };
 
@@ -160,7 +161,7 @@ fn short_io_and_async_cancel_complete_under_pressure() {
     let mut buffer = [0_u8; 1];
     let short_read = unsafe {
         opcode::Read::new(
-            Fd(file.as_raw_fd()),
+            Fd::new(file.as_raw_fd()),
             buffer.as_mut_ptr(),
             buffer.len() as u32,
         )
@@ -206,9 +207,9 @@ fn short_io_and_async_cancel_complete_under_pressure() {
     completion.sync();
     let mut saw_timeout_cancel = false;
     let mut saw_cancel_completion = false;
-    while let Some(cqe) = completion.next() {
+    for cqe in completion {
         if cqe.user_data() == TIMEOUT_USER_DATA {
-            saw_timeout_cancel = cqe.result() == -libc::ECANCELED;
+            saw_timeout_cancel = cqe.result() == -ECANCELED;
         } else {
             saw_cancel_completion = true;
         }
@@ -235,7 +236,7 @@ fn default_setup_profile_requires_task_run_flags() {
     let ring = IoUring::new(8).expect("default io_uring setup profile must be supported");
     assert_eq!(ring.params().setup_flags() & required, required);
 
-    let profile = veloq_io_uring::RingConfig::new(8)
+    let profile = RingConfig::new(8)
         .with_setup_policy(SetupPolicy::default().with_disabled(SetupFlags::DEFER_TASKRUN));
     let ring = IoUring::from_config(profile).expect("explicitly disabled setup flag is valid");
     assert_eq!(
@@ -252,6 +253,6 @@ fn provided_buffer_flag_decoder_handles_stress_ids() {
     }
     for bid in [0_u16, 1, 127, u16::MAX] {
         let flags = 1_u32 | (u32::from(bid) << 16);
-        assert_eq!(cqueue::buffer_select(flags), Some(bid));
+        assert_eq!(cqueue::Flags::buffer_id(flags), Some(bid));
     }
 }

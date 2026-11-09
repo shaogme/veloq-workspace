@@ -4,6 +4,7 @@ use core::{
     cmp,
     mem::{ManuallyDrop, align_of, size_of},
 };
+use libc::{EFAULT, EINVAL, EOPNOTSUPP, EOVERFLOW, EPROTO, close};
 
 use veloq_std::{
     io::{Error, Result},
@@ -11,11 +12,14 @@ use veloq_std::{
 };
 
 use crate::{
-    cqueue::{CompletionQueue, Entry as CompletionEntry, Inner as CompletionInner},
-    mmap::Mmap,
-    register::KernelCapabilities,
-    squeue::{Entry as SubmissionEntry, Inner as SubmissionInner, SubmissionQueue},
-    submit::{SubmitResult, Submitter},
+    internal::{
+        cqueue::{CompletionQueue, Entry as CompletionEntry, Inner as CompletionInner},
+        mmap::Mmap,
+        register::KernelCapabilities,
+        squeue::{Entry as SubmissionEntry, Inner as SubmissionInner, SubmissionQueue},
+        submit::{SubmitResult, Submitter},
+        syscalls::Syscalls,
+    },
     sys,
 };
 
@@ -164,7 +168,7 @@ impl SetupPolicy {
             || self.required.difference(KNOWN_SETUP_FLAGS).bits() != 0
             || self.disabled.difference(KNOWN_SETUP_FLAGS).bits() != 0
         {
-            return Err(Error::from_raw_os_error(libc::EINVAL));
+            return Err(Error::from_raw_os_error(EINVAL));
         }
         Ok(())
     }
@@ -180,14 +184,39 @@ impl Default for SetupPolicy {
 /// Configuration for one `io_uring_setup` profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RingConfig {
-    pub entries: u32,
-    pub setup_policy: SetupPolicy,
-    pub sq_thread_idle: u32,
-    pub cq_entries: u32,
-    pub mmap_populate: bool,
+    entries: u32,
+    setup_policy: SetupPolicy,
+    sq_thread_idle: u32,
+    cq_entries: u32,
+    mmap_populate: bool,
 }
 
 impl RingConfig {
+    #[inline]
+    pub const fn entries(self) -> u32 {
+        self.entries
+    }
+
+    #[inline]
+    pub const fn setup_policy(self) -> SetupPolicy {
+        self.setup_policy
+    }
+
+    #[inline]
+    pub const fn sq_thread_idle(self) -> u32 {
+        self.sq_thread_idle
+    }
+
+    #[inline]
+    pub const fn cq_entries(self) -> u32 {
+        self.cq_entries
+    }
+
+    #[inline]
+    pub const fn mmap_populate(self) -> bool {
+        self.mmap_populate
+    }
+
     #[inline]
     pub const fn new(entries: u32) -> Self {
         Self {
@@ -227,9 +256,25 @@ impl RingConfig {
 /// Parameters returned by `io_uring_setup`.
 #[derive(Clone)]
 #[repr(transparent)]
-pub struct Parameters(pub(crate) sys::IoUringParams);
+pub struct Parameters(sys::IoUringParams);
 
 impl Parameters {
+    #[inline]
+    pub(crate) const fn from_raw(raw: sys::IoUringParams) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    #[cfg(test)]
+    pub(crate) fn as_raw_mut(&mut self) -> &mut sys::IoUringParams {
+        &mut self.0
+    }
+
+    #[inline]
+    pub(crate) fn as_raw(&self) -> &sys::IoUringParams {
+        &self.0
+    }
+
     /// Setup flags accepted by the kernel for this ring.
     #[inline]
     pub fn setup_flags(&self) -> u32 {
@@ -291,6 +336,46 @@ impl Default for Builder {
             config: RingConfig::new(0),
         }
     }
+}
+
+/// The validated layout and addresses of the mappings returned by the kernel.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RingLayout {
+    sq_ring_address: usize,
+    cq_ring_address: usize,
+    sqe_address: usize,
+    sq_ring_length: usize,
+    cq_ring_length: usize,
+    sqe_length: usize,
+    sq_entries: u32,
+    cq_entries: u32,
+    sqe_entry_size: usize,
+    cqe_entry_size: usize,
+    single_mmap: bool,
+}
+
+struct MemoryMap {
+    _sq_mmap: Mmap,
+    _cq_mmap: Option<Mmap>,
+    _sqe_mmap: Mmap,
+}
+
+/// An io_uring instance and its mapped submission/completion rings.
+pub struct IoUring {
+    sq: SubmissionInner,
+    cq: CompletionInner,
+    _fd: OwnedFd,
+    params: Parameters,
+    layout: RingLayout,
+    // The mappings must be released while the owning descriptor remains open.
+    memory: ManuallyDrop<MemoryMap>,
+}
+
+/// Borrowed submission and completion views from one ring.
+pub struct RingParts<'ring> {
+    pub submitter: Submitter<'ring>,
+    pub submission: SubmissionQueue<'ring>,
+    pub completion: CompletionQueue<'ring>,
 }
 
 impl Builder {
@@ -380,22 +465,6 @@ impl Builder {
     }
 }
 
-/// The validated layout and addresses of the mappings returned by the kernel.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RingLayout {
-    sq_ring_address: usize,
-    cq_ring_address: usize,
-    sqe_address: usize,
-    sq_ring_length: usize,
-    cq_ring_length: usize,
-    sqe_length: usize,
-    sq_entries: u32,
-    cq_entries: u32,
-    sqe_entry_size: usize,
-    cqe_entry_size: usize,
-    single_mmap: bool,
-}
-
 impl RingLayout {
     /// Address at which the SQ ring mapping starts while the owning ring lives.
     #[inline]
@@ -479,14 +548,14 @@ impl LayoutSpec {
         let unsupported =
             sys::IORING_SETUP_NO_MMAP | sys::IORING_SETUP_SQE128 | sys::IORING_SETUP_CQE32;
         if params.flags & unsupported != 0 {
-            return Err(Error::from_raw_os_error(libc::EOPNOTSUPP));
+            return Err(Error::from_raw_os_error(EOPNOTSUPP));
         }
         if params.sq_entries == 0
             || params.cq_entries == 0
             || !params.sq_entries.is_power_of_two()
             || !params.cq_entries.is_power_of_two()
         {
-            return Err(Error::from_raw_os_error(libc::EINVAL));
+            return Err(Error::from_raw_os_error(EINVAL));
         }
 
         let mut sq_ring_length = 0;
@@ -535,7 +604,7 @@ impl LayoutSpec {
         let cqe_entry_size = size_of::<CompletionEntry>();
         let sqe_length = checked_count_bytes(params.sq_entries, sqe_entry_size)?;
         if sq_ring_length == 0 || cq_ring_length == 0 || sqe_length == 0 {
-            return Err(Error::from_raw_os_error(libc::EOVERFLOW));
+            return Err(Error::from_raw_os_error(EOVERFLOW));
         }
 
         Ok(Self {
@@ -567,24 +636,6 @@ impl LayoutSpec {
     }
 }
 
-/// An io_uring instance and its mapped submission/completion rings.
-pub struct IoUring {
-    sq: SubmissionInner,
-    cq: CompletionInner,
-    _fd: OwnedFd,
-    params: Parameters,
-    layout: RingLayout,
-    // This field is deliberately manually dropped before `fd`; the kernel may
-    // still access the mappings while the ring descriptor is open.
-    memory: ManuallyDrop<MemoryMap>,
-}
-
-struct MemoryMap {
-    _sq_mmap: Mmap,
-    _cq_mmap: Option<Mmap>,
-    _sqe_mmap: Mmap,
-}
-
 impl IoUring {
     #[inline]
     pub fn new(entries: u32) -> Result<Self> {
@@ -601,7 +652,7 @@ impl IoUring {
     pub fn from_config(config: RingConfig) -> Result<Self> {
         config.setup_policy.validate()?;
         if config.entries == 0 {
-            return Err(Error::from_raw_os_error(libc::EINVAL));
+            return Err(Error::from_raw_os_error(EINVAL));
         }
         if config
             .setup_policy
@@ -609,7 +660,7 @@ impl IoUring {
             .intersects(SetupFlags::CQSIZE)
             && config.cq_entries != 0
         {
-            return Err(Error::from_raw_os_error(libc::EINVAL));
+            return Err(Error::from_raw_os_error(EINVAL));
         }
 
         let mut params = sys::IoUringParams {
@@ -622,15 +673,15 @@ impl IoUring {
             params.cq_entries = config.cq_entries;
         }
 
-        let raw_fd = unsafe { sys::io_uring_setup(config.entries, &mut params) }?;
+        let raw_fd = unsafe { Syscalls::setup(config.entries, &mut params) }?;
         let accepted = SetupFlags::from_bits_retain(params.flags);
         if !accepted.contains(config.setup_policy.required())
             || accepted.intersects(config.setup_policy.disabled())
         {
             unsafe {
-                libc::close(raw_fd);
+                close(raw_fd);
             }
-            return Err(Error::from_raw_os_error(libc::EPROTO));
+            return Err(Error::from_raw_os_error(EPROTO));
         }
 
         let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
@@ -673,12 +724,16 @@ impl IoUring {
 
     /// Split the ring into independently usable submission and completion views.
     #[inline]
-    pub fn split(&mut self) -> (Submitter<'_>, SubmissionQueue<'_>, CompletionQueue<'_>) {
+    pub fn split(&mut self) -> RingParts<'_> {
         let sq = self.sq.submitter_parts();
         let submitter = Submitter::new(&self._fd, &self.params, sq);
         let submission = self.sq.borrow();
         let completion = self.cq.borrow();
-        (submitter, submission, completion)
+        RingParts {
+            submitter,
+            submission,
+            completion,
+        }
     }
 
     unsafe fn from_fd_and_params(
@@ -734,7 +789,7 @@ impl IoUring {
             sq,
             cq,
             _fd: fd,
-            params: Parameters(params),
+            params: Parameters::from_raw(params),
             layout,
             memory: ManuallyDrop::new(memory),
         })
@@ -761,7 +816,7 @@ fn checked_count_bytes(entries: u32, element_size: usize) -> Result<usize> {
     (entries as usize)
         .checked_mul(element_size)
         .filter(|length| *length != 0)
-        .ok_or_else(|| Error::from_raw_os_error(libc::EOVERFLOW))
+        .ok_or_else(|| Error::from_raw_os_error(EOVERFLOW))
 }
 
 fn checked_region_end(offset: u32, entries: u32, element_size: usize) -> Result<usize> {
@@ -769,13 +824,13 @@ fn checked_region_end(offset: u32, entries: u32, element_size: usize) -> Result<
     (offset as usize)
         .checked_add(bytes)
         .filter(|length| *length != 0)
-        .ok_or_else(|| Error::from_raw_os_error(libc::EOVERFLOW))
+        .ok_or_else(|| Error::from_raw_os_error(EOVERFLOW))
 }
 
 fn checked_field_end(offset: u32) -> Result<usize> {
     (offset as usize)
         .checked_add(size_of::<u32>())
-        .ok_or_else(|| Error::from_raw_os_error(libc::EOVERFLOW))
+        .ok_or_else(|| Error::from_raw_os_error(EOVERFLOW))
 }
 
 fn max_length(current: usize, candidate: usize) -> usize {
@@ -784,7 +839,7 @@ fn max_length(current: usize, candidate: usize) -> usize {
 
 fn validate_alignment(offset: u32, alignment: usize) -> Result<()> {
     if !(offset as usize).is_multiple_of(alignment) {
-        return Err(Error::from_raw_os_error(libc::EINVAL));
+        return Err(Error::from_raw_os_error(EINVAL));
     }
     Ok(())
 }
@@ -792,146 +847,144 @@ fn validate_alignment(offset: u32, alignment: usize) -> Result<()> {
 fn mapping_address(mapping: &Mmap) -> Result<usize> {
     let address = mapping.as_mut_ptr() as usize;
     if address == 0 {
-        return Err(Error::from_raw_os_error(libc::EFAULT));
+        return Err(Error::from_raw_os_error(EFAULT));
     }
     Ok(address)
 }
 
 #[cfg(test)]
-mod tests {
-    use core::mem::size_of;
+fn valid_params() -> sys::IoUringParams {
+    let mut params = sys::IoUringParams {
+        sq_entries: 8,
+        cq_entries: 16,
+        ..Default::default()
+    };
+    params.sq_off.head = 0;
+    params.sq_off.tail = 4;
+    params.sq_off.ring_mask = 8;
+    params.sq_off.ring_entries = 12;
+    params.sq_off.flags = 16;
+    params.sq_off.dropped = 20;
+    params.sq_off.array = 64;
+    params.cq_off.head = 0;
+    params.cq_off.tail = 4;
+    params.cq_off.ring_mask = 8;
+    params.cq_off.ring_entries = 12;
+    params.cq_off.overflow = 16;
+    params.cq_off.cqes = 64;
+    params.cq_off.flags = 24;
+    params
+}
 
-    use super::*;
+#[cfg(test)]
+#[test]
+fn layout_covers_every_shared_object_and_uses_returned_counts() {
+    let params = valid_params();
+    let spec = LayoutSpec::from_params(&params).expect("fixture layout is valid");
 
-    fn valid_params() -> sys::IoUringParams {
-        let mut params = sys::IoUringParams {
-            sq_entries: 8,
-            cq_entries: 16,
-            ..Default::default()
-        };
-        params.sq_off.head = 0;
-        params.sq_off.tail = 4;
-        params.sq_off.ring_mask = 8;
-        params.sq_off.ring_entries = 12;
-        params.sq_off.flags = 16;
-        params.sq_off.dropped = 20;
-        params.sq_off.array = 64;
-        params.cq_off.head = 0;
-        params.cq_off.tail = 4;
-        params.cq_off.ring_mask = 8;
-        params.cq_off.ring_entries = 12;
-        params.cq_off.overflow = 16;
-        params.cq_off.cqes = 64;
-        params.cq_off.flags = 24;
-        params
-    }
+    assert_eq!(spec.sq_ring_length, 96);
+    assert_eq!(spec.cq_ring_length, 320);
+    assert_eq!(spec.sqe_length, 8 * size_of::<SubmissionEntry>());
+    assert_eq!(spec.sq_entries, 8);
+    assert_eq!(spec.cq_entries, 16);
+    assert!(!spec.single_mmap);
+}
 
-    #[test]
-    fn layout_covers_every_shared_object_and_uses_returned_counts() {
-        let params = valid_params();
-        let spec = LayoutSpec::from_params(&params).expect("fixture layout is valid");
+#[cfg(test)]
+#[test]
+fn single_mmap_is_recorded_without_losing_cq_offsets() {
+    let mut params = valid_params();
+    params.features = sys::IORING_FEAT_SINGLE_MMAP;
+    params.cq_off.cqes = 256;
+    let spec = LayoutSpec::from_params(&params).expect("fixture layout is valid");
 
-        assert_eq!(spec.sq_ring_length, 96);
-        assert_eq!(spec.cq_ring_length, 320);
-        assert_eq!(spec.sqe_length, 8 * size_of::<SubmissionEntry>());
-        assert_eq!(spec.sq_entries, 8);
-        assert_eq!(spec.cq_entries, 16);
-        assert!(!spec.single_mmap);
-    }
+    assert!(spec.single_mmap);
+    assert_eq!(spec.sq_ring_length, 96);
+    assert_eq!(spec.cq_ring_length, 512);
+    assert_eq!(cmp::max(spec.sq_ring_length, spec.cq_ring_length), 512);
+}
 
-    #[test]
-    fn single_mmap_is_recorded_without_losing_cq_offsets() {
+#[cfg(test)]
+#[test]
+fn unsupported_layout_variants_are_rejected_before_mapping() {
+    for flag in [
+        sys::IORING_SETUP_NO_MMAP,
+        sys::IORING_SETUP_SQE128,
+        sys::IORING_SETUP_CQE32,
+    ] {
         let mut params = valid_params();
-        params.features = sys::IORING_FEAT_SINGLE_MMAP;
-        params.cq_off.cqes = 256;
-        let spec = LayoutSpec::from_params(&params).expect("fixture layout is valid");
-
-        assert!(spec.single_mmap);
-        assert_eq!(spec.sq_ring_length, 96);
-        assert_eq!(spec.cq_ring_length, 512);
-        assert_eq!(cmp::max(spec.sq_ring_length, spec.cq_ring_length), 512);
-    }
-
-    #[test]
-    fn unsupported_layout_variants_are_rejected_before_mapping() {
-        for flag in [
-            sys::IORING_SETUP_NO_MMAP,
-            sys::IORING_SETUP_SQE128,
-            sys::IORING_SETUP_CQE32,
-        ] {
-            let mut params = valid_params();
-            params.flags = flag;
-            assert_eq!(
-                LayoutSpec::from_params(&params).unwrap_err().raw_os_error(),
-                Some(libc::EOPNOTSUPP)
-            );
-        }
-    }
-
-    #[test]
-    fn invalid_offsets_and_entry_counts_are_rejected() {
-        let mut unaligned = valid_params();
-        unaligned.sq_off.head = 2;
+        params.flags = flag;
         assert_eq!(
-            LayoutSpec::from_params(&unaligned)
-                .unwrap_err()
-                .raw_os_error(),
-            Some(libc::EINVAL)
-        );
-
-        let mut non_power_of_two = valid_params();
-        non_power_of_two.sq_entries = 3;
-        assert_eq!(
-            LayoutSpec::from_params(&non_power_of_two)
-                .unwrap_err()
-                .raw_os_error(),
-            Some(libc::EINVAL)
+            LayoutSpec::from_params(&params).unwrap_err().raw_os_error(),
+            Some(EOPNOTSUPP)
         );
     }
+}
 
-    #[test]
-    fn checked_layout_arithmetic_reports_overflow() {
-        assert_eq!(
-            checked_region_end(1, 1, usize::MAX)
-                .unwrap_err()
-                .raw_os_error(),
-            Some(libc::EOVERFLOW)
-        );
-    }
+#[cfg(test)]
+#[test]
+fn invalid_offsets_and_entry_counts_are_rejected() {
+    let mut unaligned = valid_params();
+    unaligned.sq_off.head = 2;
+    assert_eq!(
+        LayoutSpec::from_params(&unaligned)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(EINVAL)
+    );
 
-    #[test]
-    fn setup_policy_defaults_to_required_task_run_flags() {
-        let policy = SetupPolicy::default();
-        assert_eq!(
-            policy.required().bits(),
-            SetupFlags::COOP_TASKRUN.bits()
-                | SetupFlags::SINGLE_ISSUER.bits()
-                | SetupFlags::DEFER_TASKRUN.bits()
-        );
-        assert!(policy.validate().is_ok());
+    let mut non_power_of_two = valid_params();
+    non_power_of_two.sq_entries = 3;
+    assert_eq!(
+        LayoutSpec::from_params(&non_power_of_two)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(EINVAL)
+    );
+}
 
-        let polling = policy.with_required(SetupFlags::SQPOLL);
-        assert!(polling.required().contains(SetupFlags::SQPOLL));
-        assert!(polling.validate().is_ok());
+#[cfg(test)]
+#[test]
+fn checked_layout_arithmetic_reports_overflow() {
+    assert_eq!(
+        checked_region_end(1, 1, usize::MAX)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(EOVERFLOW)
+    );
+}
 
-        let basic = SetupPolicy::basic();
-        assert!(basic.required().is_empty());
-        assert!(basic.disabled().contains(SetupFlags::DEFER_TASKRUN));
-        assert!(basic.validate().is_ok());
-    }
+#[cfg(test)]
+#[test]
+fn setup_policy_defaults_to_required_task_run_flags() {
+    let policy = SetupPolicy::default();
+    assert_eq!(
+        policy.required().bits(),
+        SetupFlags::COOP_TASKRUN.bits()
+            | SetupFlags::SINGLE_ISSUER.bits()
+            | SetupFlags::DEFER_TASKRUN.bits()
+    );
+    assert!(policy.validate().is_ok());
 
-    #[test]
-    fn setup_policy_rejects_overlapping_or_unknown_flags() {
-        let overlapping = SetupPolicy::new(SetupFlags::SQPOLL, SetupFlags::SQPOLL);
-        assert_eq!(
-            overlapping.validate().unwrap_err().raw_os_error(),
-            Some(libc::EINVAL)
-        );
+    let polling = policy.with_required(SetupFlags::SQPOLL);
+    assert!(polling.required().contains(SetupFlags::SQPOLL));
+    assert!(polling.validate().is_ok());
 
-        let unknown = SetupPolicy::new(SetupFlags::EMPTY, SetupFlags::from_bits_retain(1 << 31));
-        assert_eq!(
-            unknown.validate().unwrap_err().raw_os_error(),
-            Some(libc::EINVAL)
-        );
-    }
+    let basic = SetupPolicy::basic();
+    assert!(basic.required().is_empty());
+    assert!(basic.disabled().contains(SetupFlags::DEFER_TASKRUN));
+    assert!(basic.validate().is_ok());
+}
+
+#[cfg(test)]
+#[test]
+fn setup_policy_rejects_overlapping_or_unknown_flags() {
+    let overlapping = SetupPolicy::new(SetupFlags::SQPOLL, SetupFlags::SQPOLL);
+    assert_eq!(
+        overlapping.validate().unwrap_err().raw_os_error(),
+        Some(EINVAL)
+    );
+
+    let unknown = SetupPolicy::new(SetupFlags::EMPTY, SetupFlags::from_bits_retain(1 << 31));
+    assert_eq!(unknown.validate().unwrap_err().raw_os_error(), Some(EINVAL));
 }

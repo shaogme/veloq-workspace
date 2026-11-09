@@ -365,7 +365,7 @@ impl DescriptorCallbacks {
             lease,
         });
 
-        let rearm_generation = if !cqueue::more(flags) {
+        let rearm_generation = if !cqueue::Flags::more(flags) {
             let event = user
                 .receive_pump_mut()
                 .retain_for_rearm()

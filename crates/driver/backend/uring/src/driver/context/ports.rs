@@ -72,7 +72,9 @@ impl<'ops, 'registration, 'ring, 'a> SubmitPort<'ops, 'registration, 'ring, 'a> 
             ring,
             ..
         } = self;
-        let (_, submission_queue, completion_queue) = ring.split();
+        let parts = ring.split();
+        let submission_queue = parts.submission;
+        let completion_queue = parts.completion;
         drop(completion_queue);
         let control = control.with_submit_view(submission_queue);
         let resources = registration.build_submit_view();

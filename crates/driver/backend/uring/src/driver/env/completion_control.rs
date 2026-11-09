@@ -88,7 +88,7 @@ impl<'d> CompletionControlView<'d> {
         token: CompletionToken,
         flags: u32,
     ) -> Option<Option<CompletionCleanupHintFn>> {
-        let entry = if cqueue::more(flags) {
+        let entry = if cqueue::Flags::more(flags) {
             self.completion_cleanup_hints.get(&token).copied()
         } else {
             self.completion_cleanup_hints.remove(&token)

@@ -1,6 +1,7 @@
 #![cfg(any(target_os = "linux", target_os = "android"))]
 
 use core::mem::{align_of, size_of};
+use libc::{_exit, c_void, fork, mincore, waitpid};
 
 use veloq_io_uring::{IoUring, SUPPORTED_ABI_ARCHITECTURES, cqueue, squeue};
 
@@ -52,7 +53,7 @@ fn ring_mappings_are_not_inherited_after_fork() {
         (layout.sqe_address(), layout.sqe_length()),
     ];
 
-    let child = unsafe { libc::fork() };
+    let child = unsafe { fork() };
     assert!(
         child >= 0,
         "fork failed: {:?}",
@@ -61,19 +62,13 @@ fn ring_mappings_are_not_inherited_after_fork() {
     if child == 0 {
         let inherited = mappings.iter().any(|&(address, length)| {
             let mut residency = 0_u8;
-            unsafe {
-                libc::mincore(
-                    address as *mut libc::c_void,
-                    length,
-                    &mut residency as *mut u8,
-                ) == 0
-            }
+            unsafe { mincore(address as *mut c_void, length, &mut residency as *mut u8) == 0 }
         });
-        unsafe { libc::_exit(i32::from(inherited)) };
+        unsafe { _exit(i32::from(inherited)) };
     }
 
     let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+    assert_eq!(unsafe { waitpid(child, &mut status, 0) }, child);
     assert!(libc::WIFEXITED(status));
     assert_eq!(libc::WEXITSTATUS(status), 0);
 }

@@ -249,10 +249,10 @@ impl SubmissionEngine {
             "driver.submit_waker.opcode",
             match sqe_fd {
                 SqeFd::Fixed(index) => {
-                    unsafe { opcode::Read::new(types::Fixed(index), buf, len) }.build()
+                    unsafe { opcode::Read::new(types::Fixed::new(index), buf, len) }.build()
                 }
                 SqeFd::Direct(raw) => {
-                    unsafe { opcode::Read::new(types::Fd(raw), buf, len) }.build()
+                    unsafe { opcode::Read::new(types::Fd::new(raw), buf, len) }.build()
                 }
             },
         )?

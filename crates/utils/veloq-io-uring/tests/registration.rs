@@ -1,5 +1,6 @@
 #![cfg(target_os = "linux")]
 
+use libc::iovec;
 use std::{fs::File, os::fd::AsRawFd};
 
 use veloq_io_uring::{IoUring, ResourceKind, ResourceLayout, ResourceRegistrationState};
@@ -27,7 +28,7 @@ fn sparse_buffer_registration_has_a_bounded_update_range() {
     assert_eq!(registration.capacity(), 4);
 
     let mut buffer = [0_u8; 8];
-    let iovec = libc::iovec {
+    let iovec = iovec {
         iov_base: buffer.as_mut_ptr().cast(),
         iov_len: buffer.len(),
     };

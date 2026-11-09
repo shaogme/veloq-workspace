@@ -377,7 +377,7 @@ fn bench_fixed_buffer_lookup(c: &mut Criterion) {
             BenchmarkId::from_parameter(bid),
             &flags,
             |bencher, &flags| {
-                bencher.iter(|| black_box(cqueue::buffer_select(black_box(flags))));
+                bencher.iter(|| black_box(cqueue::Flags::buffer_id(black_box(flags))));
             },
         );
     }
@@ -392,7 +392,7 @@ fn bench_fixed_buffer_sqe(c: &mut Criterion) {
         bencher.iter(|| {
             let entry = unsafe {
                 opcode::ReadFixed::new(
-                    Fd(file.as_raw_fd()),
+                    Fd::new(file.as_raw_fd()),
                     buffer.as_mut_ptr(),
                     buffer.len() as u32,
                     7,

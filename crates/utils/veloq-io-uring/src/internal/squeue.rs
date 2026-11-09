@@ -4,18 +4,21 @@ use core::{
     fmt,
     marker::PhantomData,
     mem::size_of,
+    ptr::null_mut,
+    result::Result as CoreResult,
     sync::atomic::{self, AtomicU32, Ordering},
 };
+use libc::{EINVAL, EOVERFLOW};
 
 use veloq_std::io::{Error, Result};
 
-use crate::{mmap::Mmap, sys};
+use crate::{internal::mmap::Mmap, sys};
 
 /// The 64-byte submission queue entry defined by the Linux ABI.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Entry {
-    pub(crate) inner: sys::IoUringSqe,
+    inner: sys::IoUringSqe,
 }
 
 /// An atomic field in the kernel-owned shared ring memory.
@@ -118,6 +121,17 @@ impl Flags {
 
 impl Entry {
     #[inline]
+    pub(crate) const fn from_raw(inner: sys::IoUringSqe) -> Self {
+        Self { inner }
+    }
+
+    #[inline]
+    #[cfg(test)]
+    pub(crate) const fn raw(&self) -> &sys::IoUringSqe {
+        &self.inner
+    }
+
+    #[inline]
     pub fn flags(mut self, flags: Flags) -> Self {
         debug_assert!(flags.is_known());
         self.inner.flags |= flags.bits();
@@ -152,6 +166,22 @@ pub(crate) struct Inner {
     sqes: *mut Entry,
 }
 
+/// The shared SQ state consumed by the submitter.
+#[derive(Clone, Copy)]
+pub(crate) struct SubmissionState {
+    head: SharedAtomicU32,
+    tail: SharedAtomicU32,
+    flags: SharedAtomicU32,
+}
+
+/// A queue-local view of the submission ring.
+pub struct SubmissionQueue<'ring> {
+    head: u32,
+    tail: u32,
+    queue: &'ring Inner,
+    _owner: PhantomData<&'ring mut Inner>,
+}
+
 impl Inner {
     /// Bind queue pointers to kernel-provided offsets in the mapped ring.
     pub(crate) unsafe fn new(
@@ -182,7 +212,7 @@ impl Inner {
             || ring_entries != params.sq_entries
             || ring_mask != ring_entries - 1
         {
-            return Err(Error::from_raw_os_error(libc::EINVAL));
+            return Err(Error::from_raw_os_error(EINVAL));
         }
         let flags = unsafe {
             SharedAtomicU32::from_ptr(sq_mmap.range(params.sq_off.flags, size_of::<u32>())?.cast())
@@ -197,14 +227,14 @@ impl Inner {
         let array = if params.flags & sys::IORING_SETUP_NO_SQARRAY == 0 {
             let array_len = (ring_entries as usize)
                 .checked_mul(size_of::<u32>())
-                .ok_or_else(|| Error::from_raw_os_error(libc::EOVERFLOW))?;
+                .ok_or_else(|| Error::from_raw_os_error(EOVERFLOW))?;
             sq_mmap.range(params.sq_off.array, array_len)?.cast::<u32>()
         } else {
-            core::ptr::null_mut()
+            null_mut()
         };
         let sqe_len = (ring_entries as usize)
             .checked_mul(size_of::<Entry>())
-            .ok_or_else(|| Error::from_raw_os_error(libc::EOVERFLOW))?;
+            .ok_or_else(|| Error::from_raw_os_error(EOVERFLOW))?;
         let sqes = sqe_mmap.range(0, sqe_len)?.cast();
 
         if !array.is_null() {
@@ -245,14 +275,6 @@ impl Inner {
     }
 }
 
-/// The shared SQ state consumed by the submitter.
-#[derive(Clone, Copy)]
-pub(crate) struct SubmissionState {
-    head: SharedAtomicU32,
-    tail: SharedAtomicU32,
-    flags: SharedAtomicU32,
-}
-
 impl SubmissionState {
     #[inline]
     pub(crate) fn len(self) -> usize {
@@ -265,14 +287,6 @@ impl SubmissionState {
     pub(crate) fn flags(self, ordering: Ordering) -> u32 {
         self.flags.load(ordering)
     }
-}
-
-/// A queue-local view of the submission ring.
-pub struct SubmissionQueue<'ring> {
-    head: u32,
-    tail: u32,
-    queue: &'ring Inner,
-    _owner: PhantomData<&'ring mut Inner>,
 }
 
 /// Returned when the submission ring has no free slot.
@@ -339,7 +353,7 @@ impl SubmissionQueue<'_> {
     /// kernel has consumed and completed the corresponding request. The queue
     /// must not outlive the `IoUring` that owns its mapped memory.
     #[inline]
-    pub unsafe fn push(&mut self, entry: &Entry) -> core::result::Result<(), PushError> {
+    pub unsafe fn push(&mut self, entry: &Entry) -> CoreResult<(), PushError> {
         if self.is_full() {
             return Err(PushError);
         }
@@ -362,106 +376,102 @@ impl Drop for SubmissionQueue<'_> {
 }
 
 #[cfg(test)]
-mod tests {
-    use core::sync::atomic::AtomicU32;
+#[test]
+fn push_publishes_tail_and_rejects_full_queue() {
+    let head = AtomicU32::new(0);
+    let tail = AtomicU32::new(0);
+    let flags = AtomicU32::new(0);
+    let dropped = AtomicU32::new(0);
+    let mut array = [0_u32; 2];
+    let mut sqes = [Entry::default(); 2];
+    let inner = Inner {
+        head: unsafe { SharedAtomicU32::from_ptr(&head) },
+        tail: unsafe { SharedAtomicU32::from_ptr(&tail) },
+        ring_mask: 1,
+        ring_entries: 2,
+        flags: unsafe { SharedAtomicU32::from_ptr(&flags) },
+        dropped: unsafe { SharedAtomicU32::from_ptr(&dropped) },
+        array: array.as_mut_ptr(),
+        sqes: sqes.as_mut_ptr(),
+    };
 
-    use super::*;
+    let mut inner = inner;
+    let mut queue = inner.borrow();
+    let first = Entry::default().user_data(11);
+    let second = Entry::default().user_data(22);
+    assert!(unsafe { queue.push(&first) }.is_ok());
+    assert!(unsafe { queue.push(&second) }.is_ok());
+    assert!(unsafe { queue.push(&first) }.is_err());
+    assert_eq!(queue.len(), 2);
+    drop(queue);
 
-    #[test]
-    fn push_publishes_tail_and_rejects_full_queue() {
-        let head = AtomicU32::new(0);
-        let tail = AtomicU32::new(0);
-        let flags = AtomicU32::new(0);
-        let dropped = AtomicU32::new(0);
-        let mut array = [0_u32; 2];
-        let mut sqes = [Entry::default(); 2];
-        let inner = Inner {
-            head: unsafe { SharedAtomicU32::from_ptr(&head) },
-            tail: unsafe { SharedAtomicU32::from_ptr(&tail) },
-            ring_mask: 1,
-            ring_entries: 2,
-            flags: unsafe { SharedAtomicU32::from_ptr(&flags) },
-            dropped: unsafe { SharedAtomicU32::from_ptr(&dropped) },
-            array: array.as_mut_ptr(),
-            sqes: sqes.as_mut_ptr(),
-        };
+    assert_eq!(tail.load(Ordering::Acquire), 2);
+    assert_eq!(array, [0, 1]);
+    assert_eq!(sqes[0].get_user_data(), 11);
+    assert_eq!(sqes[1].get_user_data(), 22);
+}
 
-        let mut inner = inner;
-        let mut queue = inner.borrow();
-        let first = Entry::default().user_data(11);
-        let second = Entry::default().user_data(22);
-        assert!(unsafe { queue.push(&first) }.is_ok());
-        assert!(unsafe { queue.push(&second) }.is_ok());
-        assert!(unsafe { queue.push(&first) }.is_err());
-        assert_eq!(queue.len(), 2);
-        drop(queue);
+#[cfg(test)]
+#[test]
+fn sync_refreshes_head_after_kernel_consumes_entries() {
+    let head = AtomicU32::new(0);
+    let tail = AtomicU32::new(1);
+    let flags = AtomicU32::new(sys::IORING_SQ_NEED_WAKEUP | sys::IORING_SQ_CQ_OVERFLOW);
+    let dropped = AtomicU32::new(3);
+    let mut sqes = [Entry::default(); 2];
+    let inner = Inner {
+        head: unsafe { SharedAtomicU32::from_ptr(&head) },
+        tail: unsafe { SharedAtomicU32::from_ptr(&tail) },
+        ring_mask: 1,
+        ring_entries: 2,
+        flags: unsafe { SharedAtomicU32::from_ptr(&flags) },
+        dropped: unsafe { SharedAtomicU32::from_ptr(&dropped) },
+        array: null_mut(),
+        sqes: sqes.as_mut_ptr(),
+    };
 
-        assert_eq!(tail.load(Ordering::Acquire), 2);
-        assert_eq!(array, [0, 1]);
-        assert_eq!(sqes[0].get_user_data(), 11);
-        assert_eq!(sqes[1].get_user_data(), 22);
-    }
+    let mut inner = inner;
+    let mut queue = inner.borrow();
+    assert_eq!(queue.len(), 1);
+    assert!(queue.need_wakeup());
+    assert!(queue.cq_overflow());
+    assert_eq!(queue.dropped(), 3);
+    head.store(1, Ordering::Release);
+    queue.sync();
+    assert!(queue.is_empty());
+}
 
-    #[test]
-    fn sync_refreshes_head_after_kernel_consumes_entries() {
-        let head = AtomicU32::new(0);
-        let tail = AtomicU32::new(1);
-        let flags = AtomicU32::new(sys::IORING_SQ_NEED_WAKEUP | sys::IORING_SQ_CQ_OVERFLOW);
-        let dropped = AtomicU32::new(3);
-        let mut sqes = [Entry::default(); 2];
-        let inner = Inner {
-            head: unsafe { SharedAtomicU32::from_ptr(&head) },
-            tail: unsafe { SharedAtomicU32::from_ptr(&tail) },
-            ring_mask: 1,
-            ring_entries: 2,
-            flags: unsafe { SharedAtomicU32::from_ptr(&flags) },
-            dropped: unsafe { SharedAtomicU32::from_ptr(&dropped) },
-            array: core::ptr::null_mut(),
-            sqes: sqes.as_mut_ptr(),
-        };
+#[cfg(test)]
+#[test]
+fn wraparound_preserves_full_and_empty_protocol() {
+    let head = AtomicU32::new(u32::MAX - 1);
+    let tail = AtomicU32::new(u32::MAX - 1);
+    let flags = AtomicU32::new(0);
+    let dropped = AtomicU32::new(0);
+    let mut array = [0_u32; 2];
+    let mut sqes = [Entry::default(); 2];
+    let mut inner = Inner {
+        head: unsafe { SharedAtomicU32::from_ptr(&head) },
+        tail: unsafe { SharedAtomicU32::from_ptr(&tail) },
+        ring_mask: 1,
+        ring_entries: 2,
+        flags: unsafe { SharedAtomicU32::from_ptr(&flags) },
+        dropped: unsafe { SharedAtomicU32::from_ptr(&dropped) },
+        array: array.as_mut_ptr(),
+        sqes: sqes.as_mut_ptr(),
+    };
 
-        let mut inner = inner;
-        let mut queue = inner.borrow();
-        assert_eq!(queue.len(), 1);
-        assert!(queue.need_wakeup());
-        assert!(queue.cq_overflow());
-        assert_eq!(queue.dropped(), 3);
-        head.store(1, Ordering::Release);
-        queue.sync();
-        assert!(queue.is_empty());
-    }
+    let mut queue = inner.borrow();
+    assert!(queue.is_empty());
+    assert!(unsafe { queue.push(&Entry::default()) }.is_ok());
+    assert!(unsafe { queue.push(&Entry::default()) }.is_ok());
+    assert!(queue.is_full());
+    assert!(unsafe { queue.push(&Entry::default()) }.is_err());
+    drop(queue);
 
-    #[test]
-    fn wraparound_preserves_full_and_empty_protocol() {
-        let head = AtomicU32::new(u32::MAX - 1);
-        let tail = AtomicU32::new(u32::MAX - 1);
-        let flags = AtomicU32::new(0);
-        let dropped = AtomicU32::new(0);
-        let mut array = [0_u32; 2];
-        let mut sqes = [Entry::default(); 2];
-        let mut inner = Inner {
-            head: unsafe { SharedAtomicU32::from_ptr(&head) },
-            tail: unsafe { SharedAtomicU32::from_ptr(&tail) },
-            ring_mask: 1,
-            ring_entries: 2,
-            flags: unsafe { SharedAtomicU32::from_ptr(&flags) },
-            dropped: unsafe { SharedAtomicU32::from_ptr(&dropped) },
-            array: array.as_mut_ptr(),
-            sqes: sqes.as_mut_ptr(),
-        };
-
-        let mut queue = inner.borrow();
-        assert!(queue.is_empty());
-        assert!(unsafe { queue.push(&Entry::default()) }.is_ok());
-        assert!(unsafe { queue.push(&Entry::default()) }.is_ok());
-        assert!(queue.is_full());
-        assert!(unsafe { queue.push(&Entry::default()) }.is_err());
-        drop(queue);
-
-        head.store(0, Ordering::Release);
-        let mut queue = inner.borrow();
-        queue.sync();
-        assert_eq!(queue.len(), 0);
-        assert!(queue.is_empty());
-    }
+    head.store(0, Ordering::Release);
+    let mut queue = inner.borrow();
+    queue.sync();
+    assert_eq!(queue.len(), 0);
+    assert!(queue.is_empty());
 }

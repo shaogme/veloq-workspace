@@ -8,6 +8,7 @@ use core::{
     ptr::NonNull,
     sync::atomic::{AtomicU16, Ordering},
 };
+use libc::sigset_t;
 
 use veloq_std::{
     io::{Error, ErrorKind, Result},
@@ -17,15 +18,42 @@ use veloq_std::{
 
 use crate::sys;
 
+#[cfg(test)]
+use core::mem::offset_of;
+
 /// A raw file descriptor that has not been registered with the ring.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(transparent)]
-pub struct Fd(pub RawFd);
+pub struct Fd(RawFd);
 
 /// An index into the ring's registered file table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(transparent)]
-pub struct Fixed(pub u32);
+pub struct Fixed(u32);
+
+impl Fd {
+    #[inline]
+    pub const fn new(fd: RawFd) -> Self {
+        Self(fd)
+    }
+
+    #[inline]
+    pub const fn as_raw_fd(self) -> RawFd {
+        self.0
+    }
+}
+
+impl Fixed {
+    #[inline]
+    pub const fn new(index: u32) -> Self {
+        Self(index)
+    }
+
+    #[inline]
+    pub const fn index(self) -> u32 {
+        self.0
+    }
+}
 
 /// A descriptor selector accepted by opcodes that support fixed files.
 pub trait UseFixed: Copy {
@@ -190,7 +218,7 @@ impl AsyncCancelFlags {
 /// The Linux `__kernel_timespec` used by extended enter waits.
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(transparent)]
-pub struct Timespec(pub(crate) sys::KernelTimespec);
+pub struct Timespec(sys::KernelTimespec);
 
 impl Timespec {
     #[inline]
@@ -236,7 +264,7 @@ impl TryFrom<Duration> for Timespec {
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(transparent)]
 pub struct SubmitArgs<'prev: 'now, 'now> {
-    pub(crate) args: sys::IoUringGeteventsArg,
+    args: sys::IoUringGeteventsArg,
     prev: PhantomData<&'prev ()>,
     now: PhantomData<&'now ()>,
 }
@@ -262,10 +290,10 @@ impl<'prev, 'now> SubmitArgs<'prev, 'now> {
     /// Set the signal mask used while waiting.
     #[inline]
     #[must_use]
-    pub fn sigmask<'next>(self, sigmask: &'next libc::sigset_t) -> SubmitArgs<'now, 'next> {
+    pub fn sigmask<'next>(self, sigmask: &'next sigset_t) -> SubmitArgs<'now, 'next> {
         let mut args = self.args;
         args.sigmask = ptr::from_ref(sigmask) as u64;
-        args.sigmask_size = core::mem::size_of::<libc::sigset_t>() as u32;
+        args.sigmask_size = size_of::<sigset_t>() as u32;
         SubmitArgs {
             args,
             prev: PhantomData,
@@ -301,11 +329,11 @@ impl<'prev, 'now> SubmitArgs<'prev, 'now> {
         if (self.args.sigmask == 0) != (self.args.sigmask_size == 0) {
             return Err(Error::from(ErrorKind::InvalidInput));
         }
-        if self.args.sigmask != 0 && self.args.sigmask_size != size_of::<libc::sigset_t>() as u32 {
+        if self.args.sigmask != 0 && self.args.sigmask_size != size_of::<sigset_t>() as u32 {
             return Err(Error::from(ErrorKind::InvalidInput));
         }
         if self.args.sigmask != 0
-            && !(self.args.sigmask as usize).is_multiple_of(align_of::<libc::sigset_t>())
+            && !(self.args.sigmask as usize).is_multiple_of(align_of::<sigset_t>())
         {
             return Err(Error::from(ErrorKind::InvalidInput));
         }
@@ -318,30 +346,6 @@ impl<'prev, 'now> SubmitArgs<'prev, 'now> {
     }
 }
 
-/// An entry in a provided-buffer ring.
-#[derive(Clone, Copy, Debug, Default)]
-#[repr(transparent)]
-pub struct BufRingEntry(sys::IoUringBuf);
-
-impl BufRingEntry {
-    #[inline]
-    fn write(&mut self, item: BufRingItem) {
-        self.0.addr = item.addr;
-        self.0.len = item.len;
-        self.0.bid = item.bid;
-    }
-
-    #[cfg(test)]
-    #[inline]
-    fn read(&self) -> BufRingItem {
-        BufRingItem {
-            addr: self.0.addr,
-            len: self.0.len,
-            bid: self.0.bid,
-        }
-    }
-}
-
 /// A validated buffer descriptor ready to be published to a provided-buffer ring.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BufRingItem {
@@ -350,7 +354,6 @@ pub struct BufRingItem {
     bid: u16,
 }
 
-#[allow(clippy::len_without_is_empty)]
 impl BufRingItem {
     /// Create a descriptor for a non-empty buffer with a non-null address.
     ///
@@ -377,8 +380,37 @@ impl BufRingItem {
     }
 
     #[inline]
+    pub const fn is_empty(self) -> bool {
+        false
+    }
+
+    #[inline]
     pub fn bid(self) -> u16 {
         self.bid
+    }
+}
+
+/// An entry in a provided-buffer ring.
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(transparent)]
+pub struct BufRingEntry(sys::IoUringBuf);
+
+impl BufRingEntry {
+    #[inline]
+    fn write(&mut self, item: BufRingItem) {
+        self.0.addr = item.addr;
+        self.0.len = item.len;
+        self.0.bid = item.bid;
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn read(&self) -> BufRingItem {
+        BufRingItem {
+            addr: self.0.addr,
+            len: self.0.len,
+            bid: self.0.bid,
+        }
     }
 }
 
@@ -478,91 +510,89 @@ impl ProvidedBufRing {
 }
 
 #[cfg(test)]
-mod tests {
-    use core::mem::{align_of, offset_of, size_of};
+#[test]
+fn public_types_match_kernel_layouts() {
+    assert_eq!(size_of::<Timespec>(), 16);
+    assert_eq!(align_of::<Timespec>(), 8);
+    assert_eq!(size_of::<SubmitArgs<'static, 'static>>(), 24);
+    assert_eq!(size_of::<BufRingEntry>(), 16);
+    assert_eq!(align_of::<BufRingEntry>(), 8);
+    assert_eq!(offset_of!(sys::IoUringBuf, len), 8);
+    assert_eq!(offset_of!(sys::IoUringBuf, bid), 12);
+    assert_eq!(offset_of!(sys::IoUringBuf, resv), 14);
+}
 
-    use super::*;
+#[cfg(test)]
+#[test]
+fn timespec_accepts_veloq_duration() {
+    let timespec = Timespec::try_from(Duration::new(3, 17)).unwrap();
+    assert_eq!(timespec.0.tv_sec, 3);
+    assert_eq!(timespec.0.tv_nsec, 17);
+}
 
-    #[test]
-    fn public_types_match_kernel_layouts() {
-        assert_eq!(size_of::<Timespec>(), 16);
-        assert_eq!(align_of::<Timespec>(), 8);
-        assert_eq!(size_of::<SubmitArgs<'static, 'static>>(), 24);
-        assert_eq!(size_of::<BufRingEntry>(), 16);
-        assert_eq!(align_of::<BufRingEntry>(), 8);
-        assert_eq!(offset_of!(sys::IoUringBuf, len), 8);
-        assert_eq!(offset_of!(sys::IoUringBuf, bid), 12);
-        assert_eq!(offset_of!(sys::IoUringBuf, resv), 14);
-    }
+#[cfg(test)]
+#[test]
+fn timespec_rejects_values_that_do_not_fit_kernel_abi() {
+    assert!(Timespec::new().sec(u64::MAX).is_err());
+    assert!(Timespec::new().nsec(1_000_000_000).is_err());
+}
 
-    #[test]
-    fn timespec_accepts_veloq_duration() {
-        let timespec = Timespec::try_from(Duration::new(3, 17)).unwrap();
-        assert_eq!(timespec.0.tv_sec, 3);
-        assert_eq!(timespec.0.tv_nsec, 17);
-    }
+#[cfg(test)]
+#[test]
+fn submit_args_reject_invalid_pointer_fields() {
+    let mut missing_size = SubmitArgs::new();
+    missing_size.args.sigmask = 1;
+    assert!(missing_size.validate().is_err());
 
-    #[test]
-    fn timespec_rejects_values_that_do_not_fit_kernel_abi() {
-        assert!(Timespec::new().sec(u64::MAX).is_err());
-        assert!(Timespec::new().nsec(1_000_000_000).is_err());
-    }
+    let mut misaligned_sigmask = SubmitArgs::new();
+    misaligned_sigmask.args.sigmask = 1;
+    misaligned_sigmask.args.sigmask_size = size_of::<sigset_t>() as u32;
+    assert!(misaligned_sigmask.validate().is_err());
 
-    #[test]
-    fn submit_args_reject_invalid_pointer_fields() {
-        let mut missing_size = SubmitArgs::new();
-        missing_size.args.sigmask = 1;
-        assert!(missing_size.validate().is_err());
+    let mut misaligned_timespec = SubmitArgs::new();
+    misaligned_timespec.args.timespec = 1;
+    assert!(misaligned_timespec.validate().is_err());
+}
 
-        let mut misaligned_sigmask = SubmitArgs::new();
-        misaligned_sigmask.args.sigmask = 1;
-        misaligned_sigmask.args.sigmask_size = size_of::<libc::sigset_t>() as u32;
-        assert!(misaligned_sigmask.validate().is_err());
+#[cfg(test)]
+#[test]
+fn provided_ring_publishes_a_batch_with_one_tail_advance() {
+    let mut storage = [BufRingEntry::default(); 4];
+    let mut backing = [0_u8; 256];
+    let mut ring = unsafe {
+        ProvidedBufRing::from_raw_parts(storage.as_mut_ptr(), 4)
+            .expect("aligned test storage must be accepted")
+    };
+    let items = [
+        unsafe { BufRingItem::new(backing.as_mut_ptr() as u64, 64, 2) }.expect("valid item"),
+        unsafe { BufRingItem::new(backing.as_mut_ptr().wrapping_add(128) as u64, 128, 3) }
+            .expect("valid item"),
+    ];
 
-        let mut misaligned_timespec = SubmitArgs::new();
-        misaligned_timespec.args.timespec = 1;
-        assert!(misaligned_timespec.validate().is_err());
-    }
+    ring.publish(&items)
+        .expect("batch publication must succeed");
 
-    #[test]
-    fn provided_ring_publishes_a_batch_with_one_tail_advance() {
-        let mut storage = [BufRingEntry::default(); 4];
-        let mut backing = [0_u8; 256];
-        let mut ring = unsafe {
-            ProvidedBufRing::from_raw_parts(storage.as_mut_ptr(), 4)
-                .expect("aligned test storage must be accepted")
-        };
-        let items = [
-            unsafe { BufRingItem::new(backing.as_mut_ptr() as u64, 64, 2) }.expect("valid item"),
-            unsafe { BufRingItem::new(backing.as_mut_ptr().wrapping_add(128) as u64, 128, 3) }
-                .expect("valid item"),
-        ];
+    assert_eq!(ring.tail(), 2);
+    assert_eq!(ring.entry(0), Some(items[0]));
+    assert_eq!(ring.entry(1), Some(items[1]));
+}
 
-        ring.publish(&items)
-            .expect("batch publication must succeed");
+#[cfg(test)]
+#[test]
+fn provided_ring_rejects_invalid_descriptors_and_oversized_batches() {
+    let mut backing = [0_u8; 3];
+    let address = backing.as_mut_ptr() as u64;
+    assert!(unsafe { BufRingItem::new(0, 64, 0) }.is_err());
+    assert!(unsafe { BufRingItem::new(address, 0, 0) }.is_err());
 
-        assert_eq!(ring.tail(), 2);
-        assert_eq!(ring.entry(0), Some(items[0]));
-        assert_eq!(ring.entry(1), Some(items[1]));
-    }
-
-    #[test]
-    fn provided_ring_rejects_invalid_descriptors_and_oversized_batches() {
-        let mut backing = [0_u8; 3];
-        let address = backing.as_mut_ptr() as u64;
-        assert!(unsafe { BufRingItem::new(0, 64, 0) }.is_err());
-        assert!(unsafe { BufRingItem::new(address, 0, 0) }.is_err());
-
-        let mut storage = [BufRingEntry::default(); 2];
-        let mut ring = unsafe {
-            ProvidedBufRing::from_raw_parts(storage.as_mut_ptr(), 2).expect("valid ring")
-        };
-        let items = [
-            unsafe { BufRingItem::new(address, 1, 0) }.unwrap(),
-            unsafe { BufRingItem::new(address + 1, 1, 1) }.unwrap(),
-            unsafe { BufRingItem::new(address + 2, 1, 2) }.unwrap(),
-        ];
-        assert!(ring.publish(&items).is_err());
-        assert_eq!(ring.tail(), 0);
-    }
+    let mut storage = [BufRingEntry::default(); 2];
+    let mut ring =
+        unsafe { ProvidedBufRing::from_raw_parts(storage.as_mut_ptr(), 2).expect("valid ring") };
+    let items = [
+        unsafe { BufRingItem::new(address, 1, 0) }.unwrap(),
+        unsafe { BufRingItem::new(address + 1, 1, 1) }.unwrap(),
+        unsafe { BufRingItem::new(address + 2, 1, 2) }.unwrap(),
+    ];
+    assert!(ring.publish(&items).is_err());
+    assert_eq!(ring.tail(), 0);
 }

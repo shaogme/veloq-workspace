@@ -150,7 +150,7 @@ impl<'control, 'provided> UringCompletionHooks<'control, 'provided> {
         token: CompletionToken,
         flags: u32,
     ) -> CompletionCleanupHintState {
-        let entry = if cqueue::more(flags) {
+        let entry = if cqueue::Flags::more(flags) {
             self.control.peek_completion_cleanup_hint(token)
         } else {
             self.control.remove_completion_cleanup_hint(token, flags)
@@ -451,7 +451,8 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_, '_> {
                     )
                 }) {
                     Ok(outcome) => {
-                        if matches!(source, CompletionSource::Kernel) && !cqueue::more(raw.flags())
+                        if matches!(source, CompletionSource::Kernel)
+                            && !cqueue::Flags::more(raw.flags())
                         {
                             let _ = self.control.remove_completion_cleanup_hint(
                                 event.completion_token(),
@@ -472,14 +473,15 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_, '_> {
                                 self.diagnostics.inc_orphan_cleanup_error();
                             }
                         }
-                        if matches!(source, CompletionSource::Kernel) && !cqueue::more(raw.flags())
+                        if matches!(source, CompletionSource::Kernel)
+                            && !cqueue::Flags::more(raw.flags())
                         {
                             let _ = self.control.remove_completion_cleanup_hint(
                                 event.completion_token(),
                                 raw.flags(),
                             );
                         }
-                        if cqueue::more(raw.flags()) {
+                        if cqueue::Flags::more(raw.flags()) {
                             CompletionSettlement::Quarantined {
                                 failure: CompletionFailure::quarantined(
                                     error.report,
@@ -543,7 +545,7 @@ impl CompletionBackendHooks<UringSlotSpec> for UringCompletionHooks<'_, '_> {
         // 一个已放弃的 multishot 会继续投递完成，每一条都要跑 cleanup（accept 的话就是
         // 关掉那个内核已经建好的连接），但只有终态那条才能归还 slot。
         // An orphaned multishot still needs cleanup for every completion (including closing accepted sockets); only its final completion releases the slot.
-        let continuation = if cqueue::more(event.raw().flags()) {
+        let continuation = if cqueue::Flags::more(event.raw().flags()) {
             CompletionContinuation::More
         } else {
             CompletionContinuation::Final

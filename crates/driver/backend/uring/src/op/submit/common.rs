@@ -21,11 +21,11 @@ macro_rules! sqe_with_fd {
     ($fd:expr, |$name:ident| $build:expr) => {
         match $fd {
             SqeFd::Fixed(index) => {
-                let $name = types::Fixed(index);
+                let $name = types::Fixed::new(index);
                 $build
             }
             SqeFd::Direct(raw) => {
-                let $name = types::Fd(raw);
+                let $name = types::Fd::new(raw);
                 $build
             }
         }

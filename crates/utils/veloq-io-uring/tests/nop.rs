@@ -1,6 +1,6 @@
 #![cfg(target_os = "linux")]
 
-use veloq_io_uring::{IoUring, SubmitReceipt, opcode, squeue};
+use veloq_io_uring::{IoUring, RingParts, SubmitReceipt, opcode, squeue};
 
 #[test]
 fn nop_produces_a_real_completion() {
@@ -12,7 +12,11 @@ fn nop_produces_a_real_completion() {
         }
     };
 
-    let (submitter, mut submission, mut completion) = ring.split();
+    let RingParts {
+        submitter,
+        mut submission,
+        mut completion,
+    } = ring.split();
     let entry = opcode::Nop::new()
         .build()
         .expect("NOP has no fallible fields")

@@ -1,6 +1,7 @@
 //! Public opcode probe and private register ABI helpers.
 
-use core::fmt;
+use core::{fmt, ptr::from_mut};
+use libc::EINVAL;
 
 use veloq_std::{
     io::{Error, Result},
@@ -8,6 +9,12 @@ use veloq_std::{
 };
 
 use crate::sys;
+
+#[cfg(test)]
+use core::mem::{align_of, size_of};
+
+#[cfg(test)]
+use libc::EIO;
 
 #[cfg(target_os = "android")]
 const TARGET_OS: &str = "android";
@@ -70,6 +77,52 @@ pub enum ResourceRegistrationState {
     UnregisterUnknown { errno: Option<i32> },
     /// The kernel accepted unregistration.
     Unregistered,
+}
+
+/// Registration facts included in [`KernelCapabilities`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResourceRegistrationCapability {
+    /// No registration attempt has been made for this resource kind.
+    NotAttempted,
+    /// The kernel accepted a table with the requested slot count.
+    Registered {
+        kind: ResourceKind,
+        slots: u32,
+        layout: ResourceLayout,
+        tagged: bool,
+    },
+    /// A registration syscall failed; `slots` is the requested table size.
+    Failed {
+        kind: ResourceKind,
+        slots: u32,
+        layout: ResourceLayout,
+        tagged: bool,
+        errno: Option<i32>,
+    },
+    /// Unregistration failed, so the table must not be reused.
+    UnregisterUnknown {
+        kind: ResourceKind,
+        slots: u32,
+        layout: ResourceLayout,
+        tagged: bool,
+        errno: Option<i32>,
+    },
+    /// The kernel accepted unregistration.
+    Unregistered {
+        kind: ResourceKind,
+        slots: u32,
+        layout: ResourceLayout,
+        tagged: bool,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RegistrationUpdate {
+    pub(crate) owner_fd: RawFd,
+    pub(crate) kind: ResourceKind,
+    pub(crate) offset: u32,
+    pub(crate) count: u32,
+    pub(crate) tagged: bool,
 }
 
 /// Metadata and lifecycle token for one registered resource table.
@@ -178,24 +231,18 @@ impl ResourceRegistration {
         self.state = ResourceRegistrationState::UnregisterUnknown { errno };
     }
 
-    pub(crate) fn validate_update(
-        &self,
-        owner_fd: RawFd,
-        kind: ResourceKind,
-        offset: u32,
-        count: u32,
-        tagged: bool,
-    ) -> Result<()> {
-        if self.owner_fd != owner_fd
-            || self.kind != kind
+    pub(crate) fn validate_update(&self, update: RegistrationUpdate) -> Result<()> {
+        if self.owner_fd != update.owner_fd
+            || self.kind != update.kind
             || self.state != ResourceRegistrationState::Registered
-            || self.tagged != tagged
-            || count == 0
-            || offset
-                .checked_add(count)
+            || self.tagged != update.tagged
+            || update.count == 0
+            || update
+                .offset
+                .checked_add(update.count)
                 .is_none_or(|end| end > self.capacity)
         {
-            return Err(Error::from_raw_os_error(libc::EINVAL));
+            return Err(Error::from_raw_os_error(EINVAL));
         }
         Ok(())
     }
@@ -204,43 +251,6 @@ impl ResourceRegistration {
     pub(crate) const fn owner_matches(&self, owner_fd: RawFd) -> bool {
         self.owner_fd == owner_fd
     }
-}
-
-/// Registration facts included in [`KernelCapabilities`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ResourceRegistrationCapability {
-    /// No registration attempt has been made for this resource kind.
-    NotAttempted,
-    /// The kernel accepted a table with the requested slot count.
-    Registered {
-        kind: ResourceKind,
-        slots: u32,
-        layout: ResourceLayout,
-        tagged: bool,
-    },
-    /// A registration syscall failed; `slots` is the requested table size.
-    Failed {
-        kind: ResourceKind,
-        slots: u32,
-        layout: ResourceLayout,
-        tagged: bool,
-        errno: Option<i32>,
-    },
-    /// Unregistration failed, so the table must not be reused.
-    UnregisterUnknown {
-        kind: ResourceKind,
-        slots: u32,
-        layout: ResourceLayout,
-        tagged: bool,
-        errno: Option<i32>,
-    },
-    /// The kernel accepted unregistration.
-    Unregistered {
-        kind: ResourceKind,
-        slots: u32,
-        layout: ResourceLayout,
-        tagged: bool,
-    },
 }
 
 impl ResourceRegistrationCapability {
@@ -261,16 +271,6 @@ impl ResourceRegistrationCapability {
     }
 }
 
-#[inline]
-pub(crate) fn execute(
-    fd: RawFd,
-    opcode: u32,
-    arg: *const libc::c_void,
-    nr_args: u32,
-) -> Result<i64> {
-    unsafe { sys::io_uring_register(fd, opcode, arg, nr_args) }
-}
-
 /// State of the optional opcode probe operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProbeStatus {
@@ -283,15 +283,40 @@ pub enum ProbeStatus {
 }
 
 /// Information about the opcodes supported by the running kernel.
+const PROBE_CAPACITY: usize = 256;
+
+#[repr(C)]
+struct ProbeAndOps(sys::IoUringProbe, [sys::IoUringProbeOp; PROBE_CAPACITY]);
+
+#[repr(transparent)]
 pub struct Probe(ProbeAndOps);
 
 /// Fixed-size diagnostic snapshot of an opcode probe.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct OpcodeProbeSnapshot {
     /// Highest opcode index reported by the kernel.
-    pub last_op: u8,
+    last_op: u8,
     /// Bitset of supported opcodes, indexed by opcode number.
-    pub supported: [u64; 4],
+    supported: [u64; 4],
+}
+
+impl OpcodeProbeSnapshot {
+    #[inline]
+    pub const fn last_op(self) -> u8 {
+        self.last_op
+    }
+
+    #[inline]
+    pub const fn supported_words(&self) -> &[u64; 4] {
+        &self.supported
+    }
+
+    /// Return whether the kernel probe reported `opcode` as supported.
+    #[inline]
+    pub const fn is_supported(self, opcode: u8) -> bool {
+        opcode <= self.last_op
+            && self.supported[opcode as usize / 64] & (1u64 << (opcode as usize % 64)) != 0
+    }
 }
 
 /// Immutable capability facts observed for one ring.
@@ -302,24 +327,64 @@ pub struct OpcodeProbeSnapshot {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KernelCapabilities {
     /// Operating-system target used to build the ABI.
-    pub target_os: &'static str,
+    target_os: &'static str,
     /// CPU architecture used to build the ABI.
-    pub target_arch: &'static str,
+    target_arch: &'static str,
     /// Setup flags accepted by the kernel for this ring.
-    pub setup_flags: u32,
+    setup_flags: u32,
     /// Feature bits returned by `io_uring_setup`.
-    pub features: u32,
+    features: u32,
     /// Result of registering the opcode probe.
-    pub probe_status: ProbeStatus,
+    probe_status: ProbeStatus,
     /// Fixed-size opcode support snapshot, if probing succeeded.
-    pub opcode_probe: Option<OpcodeProbeSnapshot>,
+    opcode_probe: Option<OpcodeProbeSnapshot>,
     /// Observed registered-buffer resource state.
-    pub buffer_registration: ResourceRegistrationCapability,
+    buffer_registration: ResourceRegistrationCapability,
     /// Observed registered-file resource state.
-    pub file_registration: ResourceRegistrationCapability,
+    file_registration: ResourceRegistrationCapability,
 }
 
 impl KernelCapabilities {
+    #[inline]
+    pub const fn target_os(self) -> &'static str {
+        self.target_os
+    }
+
+    #[inline]
+    pub const fn target_arch(self) -> &'static str {
+        self.target_arch
+    }
+
+    #[inline]
+    pub const fn setup_flags(self) -> u32 {
+        self.setup_flags
+    }
+
+    #[inline]
+    pub const fn features(self) -> u32 {
+        self.features
+    }
+
+    #[inline]
+    pub const fn probe_status(self) -> ProbeStatus {
+        self.probe_status
+    }
+
+    #[inline]
+    pub const fn opcode_probe(self) -> Option<OpcodeProbeSnapshot> {
+        self.opcode_probe
+    }
+
+    #[inline]
+    pub const fn buffer_registration(self) -> ResourceRegistrationCapability {
+        self.buffer_registration
+    }
+
+    #[inline]
+    pub const fn file_registration(self) -> ResourceRegistrationCapability {
+        self.file_registration
+    }
+
     pub(crate) const fn from_setup(setup_flags: u32, features: u32) -> Self {
         Self {
             target_os: TARGET_OS,
@@ -447,20 +512,8 @@ impl KernelCapabilities {
     }
 }
 
-impl OpcodeProbeSnapshot {
-    /// Return whether the kernel probe reported `opcode` as supported.
-    #[inline]
-    pub const fn is_supported(self, opcode: u8) -> bool {
-        opcode <= self.last_op
-            && self.supported[opcode as usize / 64] & (1u64 << (opcode as usize % 64)) != 0
-    }
-}
-
-#[repr(C)]
-struct ProbeAndOps(sys::IoUringProbe, [sys::IoUringProbeOp; Probe::COUNT]);
-
 impl Probe {
-    pub(crate) const COUNT: usize = 256;
+    pub(crate) const COUNT: usize = PROBE_CAPACITY;
 
     /// Create an empty opcode probe.
     #[must_use]
@@ -473,7 +526,7 @@ impl Probe {
 
     #[inline]
     pub(crate) fn as_mut_ptr(&mut self) -> *mut sys::IoUringProbe {
-        core::ptr::from_mut(&mut self.0.0)
+        from_mut(&mut self.0.0)
     }
 
     /// Return whether `opcode` is supported by the kernel.
@@ -524,122 +577,135 @@ impl fmt::Debug for Probe {
 }
 
 #[cfg(test)]
-mod tests {
-    use core::mem::{align_of, size_of};
+#[test]
+fn probe_storage_matches_kernel_probe_capacity() {
+    assert_eq!(size_of::<Probe>(), size_of::<sys::IoUringProbe>() + 256 * 8);
+    assert_eq!(align_of::<Probe>(), align_of::<sys::IoUringProbe>());
+}
 
-    use super::*;
+#[cfg(test)]
+#[test]
+fn empty_probe_reports_no_supported_opcode() {
+    let probe = Probe::new();
+    assert!(!probe.is_supported(0));
+    assert!(!probe.is_supported(u8::MAX));
+}
 
-    #[test]
-    fn probe_storage_matches_kernel_probe_capacity() {
-        assert_eq!(
-            size_of::<ProbeAndOps>(),
-            size_of::<sys::IoUringProbe>() + 256 * 8
-        );
-        assert_eq!(align_of::<ProbeAndOps>(), align_of::<sys::IoUringProbe>());
-    }
+#[cfg(test)]
+#[test]
+fn empty_probe_snapshot_is_stable() {
+    let snapshot = Probe::new().snapshot();
+    assert_eq!(snapshot.last_op, 0);
+    assert_eq!(snapshot.supported, [0; 4]);
+    assert!(!snapshot.is_supported(0));
+    assert!(!snapshot.is_supported(u8::MAX));
+}
 
-    #[test]
-    fn empty_probe_reports_no_supported_opcode() {
-        let probe = Probe::new();
-        assert!(!probe.is_supported(0));
-        assert!(!probe.is_supported(u8::MAX));
-    }
+#[cfg(test)]
+#[test]
+fn capabilities_distinguish_probe_failure_from_unsupported_opcode() {
+    let capabilities = KernelCapabilities::from_setup(0x100, 0x200);
+    assert_eq!(capabilities.probe_status, ProbeStatus::NotAttempted);
+    assert!(!capabilities.supports_opcode(sys::IORING_OP_NOP));
+    assert!(capabilities.supports_setup_flag(0x100));
+    assert!(capabilities.supports_feature(0x200));
 
-    #[test]
-    fn empty_probe_snapshot_is_stable() {
-        let snapshot = Probe::new().snapshot();
-        assert_eq!(snapshot.last_op, 0);
-        assert_eq!(snapshot.supported, [0; 4]);
-        assert!(!snapshot.is_supported(0));
-        assert!(!snapshot.is_supported(u8::MAX));
-    }
+    let failed = capabilities.with_probe_error(EINVAL);
+    assert_eq!(failed.probe_status, ProbeStatus::Failed { errno: EINVAL });
+    assert!(!failed.supports_opcode(sys::IORING_OP_NOP));
+}
 
-    #[test]
-    fn capabilities_distinguish_probe_failure_from_unsupported_opcode() {
-        let capabilities = KernelCapabilities::from_setup(0x100, 0x200);
-        assert_eq!(capabilities.probe_status, ProbeStatus::NotAttempted);
-        assert!(!capabilities.supports_opcode(sys::IORING_OP_NOP));
-        assert!(capabilities.supports_setup_flag(0x100));
-        assert!(capabilities.supports_feature(0x200));
-
-        let failed = capabilities.with_probe_error(libc::EINVAL);
-        assert_eq!(
-            failed.probe_status,
-            ProbeStatus::Failed {
-                errno: libc::EINVAL
-            }
-        );
-        assert!(!failed.supports_opcode(sys::IORING_OP_NOP));
-    }
-
-    #[test]
-    fn resource_registration_tracks_shape_capacity_and_lifecycle() {
-        let mut registration =
-            ResourceRegistration::new(17, ResourceKind::Buffers, ResourceLayout::Sparse, 8, false);
-        assert_eq!(registration.kind(), ResourceKind::Buffers);
-        assert_eq!(registration.layout(), ResourceLayout::Sparse);
-        assert_eq!(registration.capacity(), 8);
-        assert!(!registration.is_tagged());
-        assert_eq!(registration.state(), ResourceRegistrationState::Registered);
-        assert!(
-            registration
-                .validate_update(17, ResourceKind::Buffers, 7, 1, false)
-                .is_ok()
-        );
-        assert!(
-            registration
-                .validate_update(17, ResourceKind::Buffers, 8, 1, false)
-                .is_err()
-        );
-        assert!(
-            registration
-                .validate_update(17, ResourceKind::Files, 0, 1, false)
-                .is_err()
-        );
-
-        registration.mark_unregister_unknown(Some(libc::EIO));
-        assert_eq!(
-            registration.state(),
-            ResourceRegistrationState::UnregisterUnknown {
-                errno: Some(libc::EIO)
-            }
-        );
-        assert!(
-            registration
-                .validate_update(17, ResourceKind::Buffers, 0, 1, false)
-                .is_err()
-        );
-        registration.mark_unregistered();
-        assert_eq!(
-            registration.capability(),
-            ResourceRegistrationCapability::Unregistered {
+#[cfg(test)]
+#[test]
+fn resource_registration_tracks_shape_capacity_and_lifecycle() {
+    let mut registration =
+        ResourceRegistration::new(17, ResourceKind::Buffers, ResourceLayout::Sparse, 8, false);
+    assert_eq!(registration.kind(), ResourceKind::Buffers);
+    assert_eq!(registration.layout(), ResourceLayout::Sparse);
+    assert_eq!(registration.capacity(), 8);
+    assert!(!registration.is_tagged());
+    assert_eq!(registration.state(), ResourceRegistrationState::Registered);
+    assert!(
+        registration
+            .validate_update(RegistrationUpdate {
+                owner_fd: 17,
                 kind: ResourceKind::Buffers,
-                slots: 8,
-                layout: ResourceLayout::Sparse,
+                offset: 7,
+                count: 1,
                 tagged: false,
-            }
-        );
-    }
-
-    #[test]
-    fn capability_records_registration_failures_without_fallback() {
-        let capabilities = KernelCapabilities::from_setup(0, 0).with_buffer_registration_error(
-            8,
-            ResourceLayout::Sparse,
-            false,
-            Some(libc::EINVAL),
-        );
-        assert_eq!(
-            capabilities.buffer_registration,
-            ResourceRegistrationCapability::Failed {
+            })
+            .is_ok()
+    );
+    assert!(
+        registration
+            .validate_update(RegistrationUpdate {
+                owner_fd: 17,
                 kind: ResourceKind::Buffers,
-                slots: 8,
-                layout: ResourceLayout::Sparse,
+                offset: 8,
+                count: 1,
                 tagged: false,
-                errno: Some(libc::EINVAL),
-            }
-        );
-        assert_eq!(capabilities.buffer_registration.slots(), Some(8));
-        assert!(!capabilities.buffer_registration.is_registered());
-    }
+            })
+            .is_err()
+    );
+    assert!(
+        registration
+            .validate_update(RegistrationUpdate {
+                owner_fd: 17,
+                kind: ResourceKind::Files,
+                offset: 0,
+                count: 1,
+                tagged: false,
+            })
+            .is_err()
+    );
+
+    registration.mark_unregister_unknown(Some(EIO));
+    assert_eq!(
+        registration.state(),
+        ResourceRegistrationState::UnregisterUnknown { errno: Some(EIO) }
+    );
+    assert!(
+        registration
+            .validate_update(RegistrationUpdate {
+                owner_fd: 17,
+                kind: ResourceKind::Buffers,
+                offset: 0,
+                count: 1,
+                tagged: false,
+            })
+            .is_err()
+    );
+    registration.mark_unregistered();
+    assert_eq!(
+        registration.capability(),
+        ResourceRegistrationCapability::Unregistered {
+            kind: ResourceKind::Buffers,
+            slots: 8,
+            layout: ResourceLayout::Sparse,
+            tagged: false,
+        }
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn capability_records_registration_failures_without_fallback() {
+    let capabilities = KernelCapabilities::from_setup(0, 0).with_buffer_registration_error(
+        8,
+        ResourceLayout::Sparse,
+        false,
+        Some(EINVAL),
+    );
+    assert_eq!(
+        capabilities.buffer_registration,
+        ResourceRegistrationCapability::Failed {
+            kind: ResourceKind::Buffers,
+            slots: 8,
+            layout: ResourceLayout::Sparse,
+            tagged: false,
+            errno: Some(EINVAL),
+        }
+    );
+    assert_eq!(capabilities.buffer_registration.slots(), Some(8));
+    assert!(!capabilities.buffer_registration.is_registered());
 }

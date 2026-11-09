@@ -94,14 +94,14 @@ impl FileSubmission {
         if let Some(fixed_idx) = fixed_idx {
             opcode_build(
                 "uring.op.submit.read_raw_fixed_opcode",
-                unsafe { opcode::ReadFixed::new(types::Fd(fd), ptr, len, fixed_idx) }
+                unsafe { opcode::ReadFixed::new(types::Fd::new(fd), ptr, len, fixed_idx) }
                     .offset(rw_op.offset)
                     .build(),
             )
         } else {
             opcode_build(
                 "uring.op.submit.read_raw_opcode",
-                unsafe { opcode::Read::new(types::Fd(fd), ptr, len) }
+                unsafe { opcode::Read::new(types::Fd::new(fd), ptr, len) }
                     .offset(rw_op.offset)
                     .build(),
             )
@@ -165,14 +165,14 @@ impl FileSubmission {
         if let Some(fixed_idx) = fixed_idx {
             opcode_build(
                 "uring.op.submit.write_raw_fixed_opcode",
-                unsafe { opcode::WriteFixed::new(types::Fd(fd), ptr, len, fixed_idx) }
+                unsafe { opcode::WriteFixed::new(types::Fd::new(fd), ptr, len, fixed_idx) }
                     .offset(rw_op.offset)
                     .build(),
             )
         } else {
             opcode_build(
                 "uring.op.submit.write_raw_opcode",
-                unsafe { opcode::Write::new(types::Fd(fd), ptr, len) }
+                unsafe { opcode::Write::new(types::Fd::new(fd), ptr, len) }
                     .offset(rw_op.offset)
                     .build(),
             )
@@ -249,7 +249,7 @@ impl FileSubmission {
         let fd = fsync_op.fd.as_fd();
         opcode_build(
             "uring.op.submit.fsync_raw_opcode",
-            opcode::Fsync::new(types::Fd(fd)).flags(flags).build(),
+            opcode::Fsync::new(types::Fd::new(fd)).flags(flags).build(),
         )
     }
 
@@ -314,7 +314,7 @@ impl FileSubmission {
         let fd = sync_op.fd.as_fd();
         opcode_build(
             "uring.op.submit.sync_range_raw_opcode",
-            opcode::SyncFileRange::new(types::Fd(fd), nbytes)
+            opcode::SyncFileRange::new(types::Fd::new(fd), nbytes)
                 .offset(sync_op.offset)
                 .flags(sync_op.flags)
                 .build(),
@@ -350,7 +350,7 @@ impl FileSubmission {
         let fd = fallocate_op.fd.as_fd();
         opcode_build(
             "uring.op.submit.fallocate_raw_opcode",
-            opcode::Fallocate::new(types::Fd(fd), fallocate_op.len)
+            opcode::Fallocate::new(types::Fd::new(fd), fallocate_op.len)
                 .offset(fallocate_op.offset)
                 .mode(fallocate_op.mode)
                 .build(),
@@ -366,7 +366,7 @@ impl FileSubmission {
         let path_ptr = user.path.as_slice().as_ptr() as *const _;
         opcode_build(
             "uring.op.submit.openat_opcode",
-            unsafe { opcode::OpenAt::new(types::Fd(AT_FDCWD), path_ptr) }
+            unsafe { opcode::OpenAt::new(types::Fd::new(AT_FDCWD), path_ptr) }
                 .flags(user.flags)
                 .mode(user.mode)
                 .build(),

@@ -351,7 +351,7 @@ impl<'scratch, 'context> CompletionPorts<'scratch, 'context> {
             );
             if let Err(error) = self
                 .control
-                .settle_staged_completion(envelope.raw().token(), !cqueue::more(cqe.flags))
+                .settle_staged_completion(envelope.raw().token(), !cqueue::Flags::more(cqe.flags))
             {
                 self.control.quarantine_unpublished_staged();
                 remember_first_error(
@@ -547,7 +547,7 @@ fn completion_observation(
         }
         CompletionIngress::Backend(_) | CompletionIngress::Anomaly { .. } => return None,
     };
-    Some((token, !cqueue::more(flags)))
+    Some((token, !cqueue::Flags::more(flags)))
 }
 
 #[cfg(any(test, feature = "test-hooks"))]

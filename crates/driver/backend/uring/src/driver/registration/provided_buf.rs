@@ -220,7 +220,7 @@ impl ProvidedBufGroup {
         flags: u32,
         res: i32,
     ) -> Result<Option<ProvidedBufLease>, ProvidedBufLeaseError> {
-        let Some(bid) = cqueue::buffer_select(flags) else {
+        let Some(bid) = cqueue::Flags::buffer_id(flags) else {
             return Ok(None);
         };
         if !self.is_usable() {
@@ -260,7 +260,7 @@ impl ProvidedBufGroup {
     /// buffer remains in the group and is republished by the same settlement transaction.
     /// 丢弃此完成时不接管 payload；buffer 继续由 group 持有，并在同一结算事务中重新发布。
     pub(crate) fn discard_selected(&mut self, flags: u32) -> bool {
-        let Some(bid) = cqueue::buffer_select(flags) else {
+        let Some(bid) = cqueue::Flags::buffer_id(flags) else {
             return false;
         };
         if !self.is_usable() {
