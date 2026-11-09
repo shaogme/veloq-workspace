@@ -3,6 +3,7 @@ use alloc::boxed::Box;
 use core::{
     ffi::c_void,
     hint::spin_loop,
+    marker::PhantomData,
     sync::atomic::{AtomicU32, Ordering},
 };
 use windows_sys::Win32::{
@@ -53,14 +54,15 @@ impl Key {
     }
 }
 
-pub(crate) struct AtomicKey<T>(AtomicU32, core::marker::PhantomData<fn() -> T>);
+pub(crate) struct AtomicKey<T>(AtomicU32, PhantomData<fn() -> T>);
 
 unsafe impl<T> Send for AtomicKey<T> {}
+
 unsafe impl<T> Sync for AtomicKey<T> {}
 
 impl<T> AtomicKey<T> {
     pub const fn new() -> Self {
-        Self(AtomicU32::new(0), core::marker::PhantomData)
+        Self(AtomicU32::new(0), PhantomData)
     }
 
     #[inline]

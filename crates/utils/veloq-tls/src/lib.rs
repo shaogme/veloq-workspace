@@ -3,17 +3,56 @@
 extern crate alloc;
 
 mod error;
-mod shared;
 mod sys;
 mod tls;
 
-// Re-export internal items for submodules
-pub(crate) use shared::{ResetGuard, is_sentinel, sentinel_ptr};
+use core::ptr::null_mut;
+
 pub(crate) use sys::{AtomicKey, Key, SystemKey};
 
 // Public exports
 pub use error::{TlsError, TlsErrorKind};
 pub use tls::Tls;
+
+/// Checks whether a TLS pointer marks an in-progress initialization.
+#[inline(always)]
+pub(crate) fn is_sentinel<T>(ptr: *const T) -> bool {
+    ptr as usize == 1
+}
+
+/// Creates the pointer used to mark an in-progress TLS initialization.
+#[inline(always)]
+pub(crate) fn sentinel_ptr<T>() -> *mut T {
+    1 as *mut T
+}
+
+pub(crate) struct ResetGuard {
+    key: Key,
+    active: bool,
+}
+
+impl ResetGuard {
+    #[inline(always)]
+    pub(crate) fn new(key: Key) -> Self {
+        Self { key, active: true }
+    }
+
+    #[inline(always)]
+    pub(crate) fn cancel(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for ResetGuard {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if self.active {
+            unsafe {
+                let _ = self.key.set_value::<()>(null_mut());
+            }
+        }
+    }
+}
 
 /// A macro for declaring thread-local variables using the platform-native `Tls`.
 ///

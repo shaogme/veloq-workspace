@@ -1,5 +1,5 @@
 use alloc::boxed::Box;
-use core::fmt;
+use core::{error::Error, fmt};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TlsErrorKind {
@@ -27,7 +27,7 @@ impl fmt::Display for TlsErrorKind {
     }
 }
 
-impl core::error::Error for TlsErrorKind {}
+impl Error for TlsErrorKind {}
 
 pub enum TlsError<T> {
     AllocationFailed { val: Box<T> },
@@ -75,7 +75,7 @@ impl<T> fmt::Display for TlsError<T> {
     }
 }
 
-impl<T> core::error::Error for TlsError<T> {}
+impl<T> Error for TlsError<T> {}
 
 impl<T> PartialEq for TlsError<T> {
     fn eq(&self, other: &Self) -> bool {

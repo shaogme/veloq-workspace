@@ -5,14 +5,12 @@ mod macros;
 
 mod atomic;
 mod local;
-mod transfer;
 
 pub use atomic::{
     AtomicLock, AtomicNonNullPtr, AtomicOptionArc, AtomicOptionBox, AtomicOptionPtr, AtomicStorage,
-    GenericAtomicOption, PointerStrategy,
+    GenericAtomicOption, PointerStrategy, StaticTransfer,
 };
 pub use local::{LocalLock, LocalStorage, NonNullPtr, OptionArc, OptionBox, OptionPtr, Usize};
-pub use transfer::StaticTransfer;
 
 use veloq_std::{
     boxed::Box,
@@ -21,18 +19,148 @@ use veloq_std::{
     sync::{Arc, atomic::Ordering},
 };
 
+pub(crate) mod sealed {
+    pub trait Sealed {}
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StrategyType {
     Local,
     Atomic,
 }
 
-mod sealed {
-    pub trait Sealed {}
+pub trait StateInt {
+    fn new(val: usize) -> Self;
+
+    fn load(&self, order: Ordering) -> usize;
+
+    fn store(&self, val: usize, order: Ordering);
+
+    fn fetch_add(&self, val: usize, order: Ordering) -> usize;
+
+    fn fetch_sub(&self, val: usize, order: Ordering) -> usize;
+
+    fn fetch_and(&self, val: usize, order: Ordering) -> usize;
+
+    fn fetch_or(&self, val: usize, order: Ordering) -> usize;
+
+    fn compare_exchange(
+        &self,
+        current: usize,
+        new: usize,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<usize, usize>;
+
+    fn compare_exchange_weak(
+        &self,
+        current: usize,
+        new: usize,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<usize, usize>;
+}
+
+pub trait StateOptionPtr<T> {
+    fn new(ptr: Option<NonNull<T>>) -> Self;
+
+    fn load(&self, order: Ordering) -> Option<NonNull<T>>;
+
+    fn store(&self, ptr: Option<NonNull<T>>, order: Ordering);
+
+    fn swap(&self, ptr: Option<NonNull<T>>, order: Ordering) -> Option<NonNull<T>>;
+
+    fn compare_exchange(
+        &self,
+        current: Option<NonNull<T>>,
+        new: Option<NonNull<T>>,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<Option<NonNull<T>>, Option<NonNull<T>>>;
+
+    fn compare_exchange_weak(
+        &self,
+        current: Option<NonNull<T>>,
+        new: Option<NonNull<T>>,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<Option<NonNull<T>>, Option<NonNull<T>>>;
+}
+
+pub trait StateNonNullPtr<T> {
+    fn new(ptr: NonNull<T>) -> Self;
+
+    fn load(&self, order: Ordering) -> NonNull<T>;
+
+    fn store(&self, ptr: NonNull<T>, order: Ordering);
+
+    fn swap(&self, ptr: NonNull<T>, order: Ordering) -> NonNull<T>;
+
+    fn compare_exchange(
+        &self,
+        current: NonNull<T>,
+        new: NonNull<T>,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<NonNull<T>, NonNull<T>>;
+
+    fn compare_exchange_weak(
+        &self,
+        current: NonNull<T>,
+        new: NonNull<T>,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<NonNull<T>, NonNull<T>>;
+}
+
+pub trait StateLock<T> {
+    type Guard<'a>: DerefMut<Target = T>
+    where
+        Self: 'a,
+        T: 'a;
+
+    fn new(val: T) -> Self;
+
+    fn lock(&self) -> Self::Guard<'_>;
+}
+
+pub trait StateOptionBox<T: ?Sized + Send> {
+    fn new(opt: Option<Box<T>>) -> Self;
+
+    fn take(&self, order: Ordering) -> Option<Box<T>>;
+
+    fn swap(&self, new: Option<Box<T>>, order: Ordering) -> Option<Box<T>>;
+
+    fn store(&self, val: Option<Box<T>>, order: Ordering);
+
+    fn compare_exchange_none(
+        &self,
+        new: Box<T>,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<(), Box<T>>;
+}
+
+pub trait StateOptionArc<T: ?Sized + Send + Sync> {
+    fn new(opt: Option<Arc<T>>) -> Self;
+
+    fn take(&self, order: Ordering) -> Option<Arc<T>>;
+
+    fn store(&self, opt: Option<Arc<T>>, order: Ordering);
+
+    fn load_clone(&self, order: Ordering) -> Option<Arc<T>>;
+
+    fn compare_exchange_none(
+        &self,
+        new: Arc<T>,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<(), Arc<T>>;
 }
 
 pub trait Storage: 'static {
     fn strategy_type() -> StrategyType;
+
     type Usize: StateInt;
     type OptionPtr<T>: StateOptionPtr<T>;
     type NonNullPtr<T>: StateNonNullPtr<T>;
@@ -52,104 +180,3 @@ pub trait ThreadSafeStorage: Storage + Send + Sync + sealed::Sealed {}
 ///
 /// 该 trait 被 sealed，用于把本地策略从跨线程 API 中排除。
 pub trait LocalOnlyStorage: Storage + sealed::Sealed {}
-
-pub trait StateInt {
-    fn new(val: usize) -> Self;
-    fn load(&self, order: Ordering) -> usize;
-    fn store(&self, val: usize, order: Ordering);
-    fn fetch_add(&self, val: usize, order: Ordering) -> usize;
-    fn fetch_sub(&self, val: usize, order: Ordering) -> usize;
-    fn fetch_and(&self, val: usize, order: Ordering) -> usize;
-    fn fetch_or(&self, val: usize, order: Ordering) -> usize;
-    fn compare_exchange(
-        &self,
-        current: usize,
-        new: usize,
-        success: Ordering,
-        failure: Ordering,
-    ) -> Result<usize, usize>;
-    fn compare_exchange_weak(
-        &self,
-        current: usize,
-        new: usize,
-        success: Ordering,
-        failure: Ordering,
-    ) -> Result<usize, usize>;
-}
-
-pub trait StateOptionPtr<T> {
-    fn new(ptr: Option<NonNull<T>>) -> Self;
-    fn load(&self, order: Ordering) -> Option<NonNull<T>>;
-    fn store(&self, ptr: Option<NonNull<T>>, order: Ordering);
-    fn swap(&self, ptr: Option<NonNull<T>>, order: Ordering) -> Option<NonNull<T>>;
-    fn compare_exchange(
-        &self,
-        current: Option<NonNull<T>>,
-        new: Option<NonNull<T>>,
-        success: Ordering,
-        failure: Ordering,
-    ) -> Result<Option<NonNull<T>>, Option<NonNull<T>>>;
-    fn compare_exchange_weak(
-        &self,
-        current: Option<NonNull<T>>,
-        new: Option<NonNull<T>>,
-        success: Ordering,
-        failure: Ordering,
-    ) -> Result<Option<NonNull<T>>, Option<NonNull<T>>>;
-}
-
-pub trait StateNonNullPtr<T> {
-    fn new(ptr: NonNull<T>) -> Self;
-    fn load(&self, order: Ordering) -> NonNull<T>;
-    fn store(&self, ptr: NonNull<T>, order: Ordering);
-    fn swap(&self, ptr: NonNull<T>, order: Ordering) -> NonNull<T>;
-    fn compare_exchange(
-        &self,
-        current: NonNull<T>,
-        new: NonNull<T>,
-        success: Ordering,
-        failure: Ordering,
-    ) -> Result<NonNull<T>, NonNull<T>>;
-    fn compare_exchange_weak(
-        &self,
-        current: NonNull<T>,
-        new: NonNull<T>,
-        success: Ordering,
-        failure: Ordering,
-    ) -> Result<NonNull<T>, NonNull<T>>;
-}
-
-pub trait StateLock<T> {
-    type Guard<'a>: DerefMut<Target = T>
-    where
-        Self: 'a,
-        T: 'a;
-    fn new(val: T) -> Self;
-    fn lock(&self) -> Self::Guard<'_>;
-}
-
-pub trait StateOptionBox<T: ?Sized + Send> {
-    fn new(opt: Option<Box<T>>) -> Self;
-    fn take(&self, order: Ordering) -> Option<Box<T>>;
-    fn swap(&self, new: Option<Box<T>>, order: Ordering) -> Option<Box<T>>;
-    fn store(&self, val: Option<Box<T>>, order: Ordering);
-    fn compare_exchange_none(
-        &self,
-        new: Box<T>,
-        success: Ordering,
-        failure: Ordering,
-    ) -> Result<(), Box<T>>;
-}
-
-pub trait StateOptionArc<T: ?Sized + Send + Sync> {
-    fn new(opt: Option<Arc<T>>) -> Self;
-    fn take(&self, order: Ordering) -> Option<Arc<T>>;
-    fn store(&self, opt: Option<Arc<T>>, order: Ordering);
-    fn load_clone(&self, order: Ordering) -> Option<Arc<T>>;
-    fn compare_exchange_none(
-        &self,
-        new: Arc<T>,
-        success: Ordering,
-        failure: Ordering,
-    ) -> Result<(), Arc<T>>;
-}

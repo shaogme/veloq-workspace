@@ -279,6 +279,7 @@ impl<T> Tls<T> {
 }
 
 unsafe impl<T> Send for Tls<T> {}
+
 unsafe impl<T> Sync for Tls<T> {}
 
 impl<T> Drop for Tls<T> {
@@ -293,8 +294,7 @@ impl<T> Drop for Tls<T> {
 
 #[cfg(all(test, not(feature = "loom")))]
 mod tests {
-    use super::*;
-    use crate::veloq_tls;
+    use crate::{Tls, TlsErrorKind, veloq_tls};
     use alloc::string::{String, ToString};
     use veloq_std::thread;
 

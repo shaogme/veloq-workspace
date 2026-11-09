@@ -2,6 +2,7 @@ use crate::{SystemKey, TlsErrorKind, is_sentinel};
 use alloc::boxed::Box;
 use core::{
     hint::spin_loop,
+    marker::PhantomData,
     sync::atomic::{AtomicU32, Ordering},
 };
 use libc::{
@@ -49,9 +50,10 @@ impl Key {
     }
 }
 
-pub(crate) struct AtomicKey<T>(AtomicU32, core::marker::PhantomData<fn() -> T>);
+pub(crate) struct AtomicKey<T>(AtomicU32, PhantomData<fn() -> T>);
 
 unsafe impl<T> Send for AtomicKey<T> {}
+
 unsafe impl<T> Sync for AtomicKey<T> {}
 
 #[cfg(target_os = "android")]
@@ -66,7 +68,7 @@ fn key_to_raw(key: pthread_key_t) -> Option<u32> {
 
 impl<T> AtomicKey<T> {
     pub const fn new() -> Self {
-        Self(AtomicU32::new(0), core::marker::PhantomData)
+        Self(AtomicU32::new(0), PhantomData)
     }
 
     #[inline]

@@ -12,32 +12,23 @@ use crate::{
 };
 
 pub struct LocalStorage(PhantomData<Rc<()>>);
+
 impl sealed::Sealed for LocalStorage {}
+
 impl LocalOnlyStorage for LocalStorage {}
 
-impl Storage for LocalStorage {
-    fn strategy_type() -> StrategyType {
-        StrategyType::Local
-    }
-    type Usize = Usize;
-    type OptionPtr<T> = OptionPtr<T>;
-    type NonNullPtr<T> = NonNullPtr<T>;
-    type Lock<T> = LocalLock<T>;
-    type OptionBox<T: Send> = OptionBox<T>;
-    type OptionFatBox<T: ?Sized + Send> = OptionBox<T>;
-    type OptionArc<T: Send + Sync> = OptionArc<T>;
-    type OptionFatArc<T: ?Sized + Send + Sync> = OptionArc<T>;
-}
-
 pub struct LocalLock<T>(RefCell<T>);
+
 impl<T> StateLock<T> for LocalLock<T> {
     type Guard<'a>
         = RefMut<'a, T>
     where
         T: 'a;
+
     fn new(val: T) -> Self {
         Self(RefCell::new(val))
     }
+
     fn lock(&self) -> Self::Guard<'_> {
         self.0.borrow_mut()
     }
@@ -88,6 +79,7 @@ impl_state_int!(
 fn opt_to_raw<T>(ptr: Option<NonNull<T>>) -> *mut T {
     ptr.map(|p| p.as_ptr()).unwrap_or(null_mut())
 }
+
 fn opt_from_raw<T>(ptr: *mut T) -> Option<NonNull<T>> {
     NonNull::new(ptr)
 }
@@ -153,4 +145,19 @@ impl<T: ?Sized + Send + Sync> StateOptionArc<T> for OptionArc<T> {
         self.0.set(opt);
         cloned
     }
+}
+
+impl Storage for LocalStorage {
+    fn strategy_type() -> StrategyType {
+        StrategyType::Local
+    }
+
+    type Usize = Usize;
+    type OptionPtr<T> = OptionPtr<T>;
+    type NonNullPtr<T> = NonNullPtr<T>;
+    type Lock<T> = LocalLock<T>;
+    type OptionBox<T: Send> = OptionBox<T>;
+    type OptionFatBox<T: ?Sized + Send> = OptionBox<T>;
+    type OptionArc<T: Send + Sync> = OptionArc<T>;
+    type OptionFatArc<T: ?Sized + Send + Sync> = OptionArc<T>;
 }

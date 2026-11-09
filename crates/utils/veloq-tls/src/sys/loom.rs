@@ -2,6 +2,7 @@ use crate::{SystemKey, TlsErrorKind, is_sentinel};
 use alloc::{boxed::Box, vec::Vec};
 use core::{
     cell::RefCell,
+    marker::PhantomData,
     ptr::null_mut,
     sync::atomic::{AtomicU32, Ordering},
 };
@@ -13,6 +14,7 @@ static NEXT_KEY: AtomicU32 = AtomicU32::new(0);
 struct SendPtr(*mut ());
 
 unsafe impl Send for SendPtr {}
+
 unsafe impl Sync for SendPtr {}
 
 type DestructorFn = unsafe fn(*mut ());
@@ -33,7 +35,7 @@ impl Drop for ThreadValue {
 static THREAD_VALUES: loom::thread::LocalKey<RefCell<Vec<Option<ThreadValue>>>> =
     loom::thread::LocalKey {
         init: (|| RefCell::new(Vec::new())) as fn() -> RefCell<Vec<Option<ThreadValue>>>,
-        _p: core::marker::PhantomData,
+        _p: PhantomData,
     };
 
 unsafe fn tls_destructor_shim<T>(ptr: *mut ()) {
@@ -107,14 +109,15 @@ impl SystemKey for Key {
     }
 }
 
-pub(crate) struct AtomicKey<T>(AtomicU32, core::marker::PhantomData<fn() -> T>);
+pub(crate) struct AtomicKey<T>(AtomicU32, PhantomData<fn() -> T>);
 
 unsafe impl<T> Send for AtomicKey<T> {}
+
 unsafe impl<T> Sync for AtomicKey<T> {}
 
 impl<T> AtomicKey<T> {
     pub const fn new() -> Self {
-        Self(AtomicU32::new(0), core::marker::PhantomData)
+        Self(AtomicU32::new(0), PhantomData)
     }
 
     #[inline]
